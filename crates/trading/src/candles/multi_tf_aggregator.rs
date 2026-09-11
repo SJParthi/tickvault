@@ -406,11 +406,46 @@ impl Default for MultiTfAggregator {
 /// # Complexity
 /// O(1) — three compares, one negate, one byte written. Zero allocation. Runs
 /// ONCE per tick, never once per timeframe.
+/// A backwards step in the vendor's day-cumulative volume at or beyond this
+/// size is a counter RESTART (a `u32` wrap, or a day rollover), never a stale
+/// packet — and the two need opposite remedies. See the call site in
+/// [`MultiTfAggregator::consume_tick_with_prices`] for why refusing a restart
+/// silently kills the instrument for the rest of the session.
+///
+/// Half the `u32` range. Chosen because it is the largest floor that cannot
+/// produce a false positive — a stale packet is behind by the volume traded
+/// between two packets we received, and no plausible gap approaches 2^31 — and
+/// the smallest that cannot produce a false negative, since a wrap from just
+/// below `u32::MAX` back to just above zero is a drop of nearly the full `u32`
+/// range, and a day rollover drops the entire previous day's volume.
+const CUMULATIVE_RESTART_DROP_FLOOR: u64 = 1 << 31;
+
 #[inline]
 #[must_use]
-fn classify_tick_volume(prev: f64, price: f64, delta: u64, carry: &mut i8) -> i64 {
-    if delta == 0 || !price.is_finite() || price <= 0.0 {
-        return 0;
+fn classify_tick_volume(prev: f64, price: f64, delta: u64, carry: &mut i8) -> Option<i64> {
+    // ⚠ 2026-09-11: this returned a bare `i64` and answered `0` to FOUR
+    // different questions — "nothing traded", "the price is unusable", "no
+    // previous price", and "real volume whose side is unknown". The call site
+    // then wrapped every one of them in `Some(..)`, so `net_volume_classified`
+    // was `true` on every live bar and the `None` arm the fold already carries
+    // (`aggregator_cell::fold_in_bucket`) was UNREACHABLE from the live path.
+    //
+    // The consequence is the one this column exists to prevent: a bar whose
+    // volume was entirely unclassifiable published `Some(0)` — "buy and sell
+    // flow were perfectly balanced" — about flow nobody measured. `Some(0)` and
+    // `None` are now two different answers, which is what the storage layer,
+    // the spill format and `net_volume()` were all already built to expect.
+    if delta == 0 {
+        // GENUINELY ZERO, not unclassifiable: no volume traded between this
+        // packet and the last accepted one, so there is no flow to attribute
+        // and the bar stays fully classified. Duplicate packets (the same
+        // update delivered twice, which this feed does routinely) land here.
+        return Some(0);
+    }
+    if !price.is_finite() || price <= 0.0 {
+        // Real volume arrived under a price we cannot read — a Ticker-mode
+        // `0.0` sentinel or a corrupt field. Unclassifiable, never zero.
+        return None;
     }
     // Saturate BEFORE the sign: `-(u64 as i64)` past `i64::MAX` wraps POSITIVE,
     // which would record a sell as a buy. Same hazard, same handling, as the
@@ -421,20 +456,22 @@ fn classify_tick_volume(prev: f64, price: f64, delta: u64, carry: &mut i8) -> i6
         // price to compare against, so the delta is real but unclassifiable.
         // The carry is deliberately NOT written — inventing a direction here
         // would then propagate to every zero tick that follows.
-        return 0;
+        return None;
     }
     if price > prev {
         *carry = 1;
-        magnitude
+        Some(magnitude)
     } else if price < prev {
         *carry = -1;
-        -magnitude
+        Some(-magnitude)
     } else {
         match *carry {
-            1 => magnitude,
-            -1 => -magnitude,
-            // No side has ever revealed itself for this instrument.
-            _ => 0,
+            1 => Some(magnitude),
+            -1 => Some(-magnitude),
+            // Real volume, price unchanged, and no side has EVER revealed
+            // itself for this instrument. This is the opening-bar case: the
+            // honest answer is "we do not know", never "balanced".
+            _ => None,
         }
     }
 }
@@ -1206,7 +1243,27 @@ impl MultiTfAggregator {
         // Captured BEFORE the overwrite below — this is the tick rule's whole
         // input, and it is available at exactly one instant in this function.
         let prev_ltp = slot.last_ltp;
-        slot.last_ltp = prices.last_traded_price;
+        // STALE-PACKET GATE (2026-09-11). A packet whose day-cumulative is
+        // BELOW the previous accepted one is stale — a cumulative counter
+        // cannot legitimately go down within a day. Its delta is already
+        // neutralised downstream (`saturating_sub` yields 0), but until today
+        // its PRICE was still adopted as `last_ltp` on the line below, and
+        // that price is the tick rule's entire input for the NEXT packet.
+        //
+        // The failure it caused: 102 -> [stale 105] -> 103 classified the 103
+        // as a DOWNTICK and latched `carry = -1`, inverting that tick's sign
+        // and every flat tick after it until the next real move. MEASURED on
+        // the live box 2026-09-11: security 68407 took 5 cumulative
+        // regressions before 09:40 IST, one of them (09:15:07 -> 09:15:08,
+        // 40,820 -> 40,690) carrying a price that moved the opposite way.
+        //
+        // A stale packet is refused as an INPUT to the rule, not merely
+        // discounted in the output.
+        let is_stale_packet =
+            slot.volume_baseline_seeded && cumulative_volume < slot.last_cumulative;
+        if !is_stale_packet {
+            slot.last_ltp = prices.last_traded_price;
+        }
         if !slot.volume_baseline_seeded {
             slot.volume_baseline_seeded = true;
             slot.last_cumulative = cumulative_volume;
@@ -1243,12 +1300,21 @@ impl MultiTfAggregator {
         // the net and the gross count exactly the same trades — which is what
         // makes `net_volume().abs() <= volume` hold rather than merely be
         // hoped for.
-        let signed_tick_volume = classify_tick_volume(
-            prev_ltp,
-            prices.last_traded_price,
-            cumulative_volume.saturating_sub(baseline),
-            &mut slot.last_tick_sign,
-        );
+        let signed_tick_volume = if is_stale_packet {
+            // A stale packet traded nothing new (its delta off the monotonic
+            // baseline is 0) and reveals no direction. `Some(0)` — genuinely
+            // nothing — and deliberately NOT `None`, which would poison an
+            // otherwise fully-classified bar over a packet that added no
+            // volume for the bar to be ignorant of.
+            Some(0)
+        } else {
+            classify_tick_volume(
+                prev_ltp,
+                prices.last_traded_price,
+                cumulative_volume.saturating_sub(baseline),
+                &mut slot.last_tick_sign,
+            )
+        };
 
         for tf in TfIndex::ALL {
             match slot.cell.consume_tick_with_extremes(
@@ -1259,7 +1325,11 @@ impl MultiTfAggregator {
                 strategy,
                 cumulative_volume,
                 extremes,
-                Some(signed_tick_volume),
+                // Passed THROUGH, not re-wrapped. Until 2026-09-11 this read
+                // `Some(signed_tick_volume)`, which made every live bar
+                // "classified" by construction and left the fold's own `None`
+                // arm dead code.
+                signed_tick_volume,
                 // Derived ONCE at :748, above this loop — the same hoisting
                 // contract as `prices` and `cumulative_volume`. Passing it
                 // down rather than recomputing it saves 48 conversions per
@@ -1330,9 +1400,51 @@ impl MultiTfAggregator {
         if cumulative_volume > slot.last_cumulative {
             slot.last_cumulative = cumulative_volume;
         } else if cumulative_volume < slot.last_cumulative {
-            crate::candles::fold_counters::fold_counters()
-                .cumulative_regression
-                .increment(1);
+            // TWO different events reach this arm and they need OPPOSITE
+            // remedies. Until 2026-09-11 both were treated as "stale packet",
+            // which is correct for one of them and catastrophic for the other.
+            //
+            //   STALE PACKET — a small backwards step. Refuse it: a cumulative
+            //   counter cannot legitimately go down, so a smaller value is
+            //   stale, never news.
+            //
+            //   COUNTER RESTART — an ENORMOUS backwards step. Two causes:
+            //     * `ParsedTick.volume` is `u32`, so the vendor's day-cumulative
+            //       WRAPS past 4,294,967,295 back to a small number;
+            //     * a day rollover restarts the counter near zero in a process
+            //       that outlived `force_seal_all`.
+            //   Refusing this one freezes `last_cumulative` at the high-water
+            //   mark FOREVER. Every later `saturating_sub` then yields 0, so
+            //   every bar reports `volume 0` and `net_volume` NULL for the rest
+            //   of the session — silently, while `tick_count` keeps rising.
+            //   The guard that prevents double-counting becomes the thing that
+            //   kills the instrument.
+            //
+            // MEASURED 2026-09-11, 25 minutes into the session: the busiest
+            // instrument on the box (81245, NSE_FNO) had already reached a
+            // cumulative volume of 250,519,875 — the same order of magnitude as
+            // the `u32` ceiling once extrapolated across a full session. This
+            // is a reachable event, not a theoretical one.
+            //
+            // The two are separated by MAGNITUDE, which is the only signal
+            // available: no real stale packet is behind by half the `u32`
+            // range, and every wrap and every rollover is.
+            let backwards_by = slot.last_cumulative - cumulative_volume;
+            if backwards_by >= CUMULATIVE_RESTART_DROP_FLOOR {
+                // RE-ANCHOR on the new value rather than refusing it. This
+                // costs exactly one tick's delta (the wrapping tick's own
+                // volume is unattributable — its true delta spans the wrap and
+                // cannot be recovered from a truncated counter) and keeps the
+                // instrument alive for the remainder of the session.
+                slot.last_cumulative = cumulative_volume;
+                crate::candles::fold_counters::fold_counters()
+                    .cumulative_reanchored
+                    .increment(1);
+            } else {
+                crate::candles::fold_counters::fold_counters()
+                    .cumulative_regression
+                    .increment(1);
+            }
         }
         stats
     }
@@ -1665,7 +1777,7 @@ mod tests {
     /// Guessing here would propagate: the carry would then sign every
     /// subsequent flat tick on a direction nobody observed.
     #[test]
-    fn a_flat_tick_with_no_carry_yet_contributes_nothing() {
+    fn a_flat_tick_with_no_carry_yet_makes_the_bar_unclassified_not_balanced() {
         let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
         let sink = |_: Feed, _: u64, _: u8, _: TfIndex, _: LiveCandleState| {};
         let base = OPEN;
@@ -1688,11 +1800,19 @@ mod tests {
             .snapshot(Feed::Dhan, 77, SEG_IDX, TfIndex::M1)
             .expect("open");
         assert_eq!(bar.volume, 600, "the gross still counts it");
+        // ⚠ 2026-09-11: this asserted `Some(0)` with the rationale "traded but
+        // unclassifiable nets to zero — a real reading". That rationale was the
+        // defect written down as a test. `Some(0)` on this column means "buy
+        // and sell flow were measured and were equal"; here nothing was
+        // measured at all — the price never moved and no direction has ever
+        // been observed for this instrument, so the 600 units have no known
+        // side. Publishing `0` made an unmeasured bar indistinguishable from a
+        // genuinely balanced one.
         assert_eq!(
             bar.net_volume(),
-            Some(0),
-            "traded but unclassifiable nets to zero — the bar DID trade, so \
-             this is a real reading, not the None of an untraded bar"
+            None,
+            "the bar traded 600 units whose side is unknown — that is NULL, \
+             never a measured zero"
         );
     }
 
@@ -1878,36 +1998,82 @@ mod tests {
     fn classify_tick_volume_refuses_every_input_it_cannot_read() {
         let mut carry = 0i8;
 
-        // Nothing traded: nothing to classify.
-        assert_eq!(classify_tick_volume(100.0, 101.0, 0, &mut carry), 0);
+        // NOTHING TRADED is `Some(0)`, not `None`. This is the distinction the
+        // 2026-09-11 change exists to make: no volume moved, so the bar is not
+        // ignorant of anything and must stay fully classified. A duplicate
+        // packet — which this feed delivers routinely — lands here, and
+        // returning `None` would let one duplicate NULL an otherwise complete
+        // bar.
+        assert_eq!(classify_tick_volume(100.0, 101.0, 0, &mut carry), Some(0));
         assert_eq!(carry, 0, "a refused tick must not move the carry");
 
         // No previous price (the first tick): real delta, unclassifiable.
-        assert_eq!(classify_tick_volume(f64::NAN, 101.0, 500, &mut carry), 0);
+        assert_eq!(
+            classify_tick_volume(f64::NAN, 101.0, 500, &mut carry),
+            None,
+            "real volume with no previous price is UNKNOWN, never balanced"
+        );
         assert_eq!(
             carry, 0,
             "inventing a direction here would sign every following flat tick"
         );
 
-        // Absent-price sentinel and poisoned prices on the current side.
-        assert_eq!(classify_tick_volume(100.0, 0.0, 500, &mut carry), 0);
-        assert_eq!(classify_tick_volume(100.0, f64::NAN, 500, &mut carry), 0);
+        // Absent-price sentinel and poisoned prices on the current side: real
+        // volume arrived under a price we cannot read.
+        assert_eq!(classify_tick_volume(100.0, 0.0, 500, &mut carry), None);
+        assert_eq!(classify_tick_volume(100.0, f64::NAN, 500, &mut carry), None);
         assert_eq!(
             classify_tick_volume(100.0, f64::INFINITY, 500, &mut carry),
-            0
+            None
         );
 
-        // Flat with no carry: no side has revealed itself.
-        assert_eq!(classify_tick_volume(100.0, 100.0, 500, &mut carry), 0);
+        // Flat with no carry: real volume, and no side has EVER revealed
+        // itself. The opening-bar case, and the one that used to publish
+        // `Some(0)` = "perfectly balanced" about flow nobody measured.
+        assert_eq!(
+            classify_tick_volume(100.0, 100.0, 500, &mut carry),
+            None,
+            "real volume with no known direction must never read as balanced"
+        );
 
         // Now the classifying cases.
-        assert_eq!(classify_tick_volume(100.0, 101.0, 500, &mut carry), 500);
+        assert_eq!(
+            classify_tick_volume(100.0, 101.0, 500, &mut carry),
+            Some(500)
+        );
         assert_eq!(carry, 1, "an uptick sets the carry to buy");
-        assert_eq!(classify_tick_volume(101.0, 101.0, 300, &mut carry), 300);
+        assert_eq!(
+            classify_tick_volume(101.0, 101.0, 300, &mut carry),
+            Some(300)
+        );
         assert_eq!(carry, 1, "a flat tick READS the carry, never rewrites it");
-        assert_eq!(classify_tick_volume(101.0, 99.0, 700, &mut carry), -700);
+        assert_eq!(
+            classify_tick_volume(101.0, 99.0, 700, &mut carry),
+            Some(-700)
+        );
         assert_eq!(carry, -1, "a downtick sets the carry to sell");
-        assert_eq!(classify_tick_volume(99.0, 99.0, 200, &mut carry), -200);
+        assert_eq!(
+            classify_tick_volume(99.0, 99.0, 200, &mut carry),
+            Some(-200)
+        );
+    }
+
+    /// The distinction the `Option` exists for, stated as its own test so it
+    /// cannot be collapsed back by a future refactor: a genuinely-zero tick and
+    /// an unclassifiable tick must NOT compare equal.
+    #[test]
+    fn a_balanced_tick_and_an_unclassifiable_tick_are_different_answers() {
+        let mut carry = 0i8;
+        let nothing_traded = classify_tick_volume(100.0, 101.0, 0, &mut carry);
+        let traded_but_unknown = classify_tick_volume(100.0, 100.0, 500, &mut carry);
+
+        assert_eq!(nothing_traded, Some(0));
+        assert_eq!(traded_but_unknown, None);
+        assert_ne!(
+            nothing_traded, traded_but_unknown,
+            "collapsing these two is the defect: one means no flow existed, the \
+             other means flow existed and we could not read its side"
+        );
     }
 
     /// `-(u64 as i64)` past `i64::MAX` wraps POSITIVE, which would record a
@@ -1915,7 +2081,8 @@ mod tests {
     #[test]
     fn classify_tick_volume_saturates_instead_of_wrapping_a_sell_into_a_buy() {
         let mut carry = -1i8;
-        let signed = classify_tick_volume(100.0, 99.0, u64::MAX, &mut carry);
+        let signed = classify_tick_volume(100.0, 99.0, u64::MAX, &mut carry)
+            .expect("a downtick with a readable price classifies");
         assert!(signed < 0, "a downtick must never classify as buy volume");
         assert_eq!(signed, -i64::MAX);
     }
@@ -1932,7 +2099,7 @@ mod tests {
         let mut carry = -1i8;
         assert_eq!(
             classify_tick_volume(clean, clean, 900, &mut carry),
-            -900,
+            Some(-900),
             "identical decimal-clean prices must compare EQUAL and take the \
              carry, not read as a rise"
         );

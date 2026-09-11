@@ -56,6 +56,11 @@ pub(crate) struct FoldCounters {
     pub(crate) oi_zero_ignored: metrics::Counter,
     pub(crate) volume_regression_suppressed: metrics::Counter,
     pub(crate) cumulative_regression: metrics::Counter,
+    /// A cumulative counter that fell so far it cannot be a stale packet:
+    /// a `u32` wrap past `u32::MAX`, or a day rollover restarting near zero.
+    /// Counted SEPARATELY from `cumulative_regression` because the remedy is
+    /// the opposite one — re-anchor, never refuse.
+    pub(crate) cumulative_reanchored: metrics::Counter,
     pub(crate) slot_exhausted: metrics::Counter,
     pub(crate) slot_volume_baseline_seeded: metrics::Counter,
     /// `tick_refused` carries a `reason` label with **SEVEN** distinct values.
@@ -156,6 +161,7 @@ impl FoldCounters {
                 "tv_candle_volume_regression_suppressed_total"
             ),
             cumulative_regression: metrics::counter!("tv_aggregator_cumulative_regression_total"),
+            cumulative_reanchored: metrics::counter!("tv_aggregator_cumulative_reanchored_total"),
             slot_exhausted: metrics::counter!("tv_aggregator_slot_exhausted_total"),
             slot_volume_baseline_seeded: metrics::counter!(
                 "tv_aggregator_slot_volume_baseline_seeded_total"

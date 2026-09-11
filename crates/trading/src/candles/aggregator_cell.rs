@@ -867,9 +867,35 @@ impl AggregatorCell {
             // Session extremes keep arriving through the first bucket's life,
             // so re-adopt on every tick of it — `day_high` at the bucket's LAST
             // tick is the one that matters, and max/min converge to it.
-            if self.last_sealed[ord].is_uninitialised()
-                && is_days_first_session_bucket(tf, open_start)
-            {
+            // ⚠ 2026-09-11: the `last_sealed[ord].is_uninitialised()` conjunct
+            // was REMOVED, because the 2026-08-28 grid move silently turned it
+            // into a permanent `false` for every continuously-quoted instrument.
+            //
+            // It meant "no bar of this timeframe has sealed yet today", which
+            // was equivalent to "this is the day's first bucket" only while the
+            // grid STARTED at the market open. Since the grid moved to 09:00,
+            // any instrument that ticks during the pre-open seals a bucket
+            // BEFORE 09:15 arrives — so by the time the market-open bucket
+            // opens, `last_sealed` is initialised and the two conditions became
+            // mutually exclusive. The exchange's official day open / high / low
+            // were then never adopted by any bar at all.
+            //
+            // MEASURED on the live box 2026-09-11: security 68407 sealed a
+            // pre-open bucket at 09:09:15, and its 09:15:00 bar carried
+            // high 23,335.0 while the exchange's published day high was already
+            // 23,347.9 — 12.9 points of real session range attributed to no bar
+            // in the table.
+            //
+            // `is_days_first_session_bucket` is already the precise predicate:
+            // it is true for exactly the bucket CONTAINING the market open, on
+            // every timeframe, and it derives the day from `bucket_start`, so it
+            // is self-limiting per day and needs no sealed-state companion. The
+            // 09:15 anchor is deliberately UNCHANGED — the grid question ("where
+            // do buckets start?") and the attribution question ("which bar owns
+            // the day's official open?") have different answers, and the
+            // function's own comment explains why conflating them mis-stamps
+            // the opening bar.
+            if is_days_first_session_bucket(tf, open_start) {
                 adopt_exchange_day_extremes(&mut self.slots[ord], tick);
             } else if attributable {
                 adopt_session_extreme_delta(&mut self.slots[ord], extremes);

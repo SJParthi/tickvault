@@ -5245,3 +5245,105 @@ labelled as such.
 **STILL NOT delivered** (unchanged from Item 24): the accumulator does not
 survive a disk spill, so a replayed bar persists NULL. That needs a spill
 format bump plus a mixed-stride reader.
+
+---
+
+## Item 22 — the net-volume column: four defects, found by reading the live tape (2026-09-11)
+
+**Operator authorization (2026-09-11, typed directly in-session, in DIRECT
+response to an enumerated four-row table):** *"Go ahead fix all of these dude
+okay?"* — the §28.2/§28.3 shape this repository already accepts: a general
+go-ahead answering an ENUMERATED ask selects the enumerated work. Follow-up the
+same session: *"Especially cover all kinds of extreme permuations combiantions
+of excpeitons errors situations conditions bugs scenarios ideas etc etc etc
+inclduign out of box also"*.
+
+**How they were found:** the operator compared `candles_5s.net_volume` for
+NIFTY SEP FUT (security 68407) against the Net Volume indicator on Dhan's own
+chart and asked why they disagree. Reconciling our stored bar against the raw
+`ticks` rows — on the live box, mid-session — proved our arithmetic exactly
+right and surfaced four separate defects on the way.
+
+### Design
+
+| # | Defect | Fix |
+|---|---|---|
+| 1 | A cumulative-volume drop was ALWAYS read as a stale packet. A `u32` wrap (`ParsedTick.volume` is `u32`) or a day rollover in a long-lived process therefore froze `last_cumulative` at the high-water mark FOREVER — every later `saturating_sub` yields 0, so every bar reports `volume 0` / `net_volume` NULL for the rest of the session, silently, while `tick_count` keeps rising. | Separate the two by MAGNITUDE. A drop ≥ `CUMULATIVE_RESTART_DROP_FLOOR` (2^31) is a RESTART → re-anchor the baseline and count `tv_aggregator_cumulative_reanchored_total`. A smaller drop keeps the existing refusal. |
+| 2 | `adopt_exchange_day_extremes` — the path that gives the day's first bar the exchange's official open/high/low — was gated on `last_sealed[ord].is_uninitialised() && is_days_first_session_bucket(..)`. The 2026-08-28 grid move to 09:00 made those two MUTUALLY EXCLUSIVE for any instrument that ticks in the pre-open: it seals a bucket before 09:15, so `last_sealed` is initialised by the time the market-open bucket opens. The path had been dead for two weeks. | Drop the `is_uninitialised()` conjunct. `is_days_first_session_bucket` is already the precise predicate and is self-limiting per day. The 09:15 anchor is UNCHANGED. |
+| 3 | A stale packet's delta was correctly neutralised, but its PRICE was still adopted into `slot.last_ltp` — the tick rule's entire input for the NEXT packet. `102 → [stale 105] → 103` classified the 103 as a DOWNTICK and latched `carry = -1`, inverting that tick and every flat tick after it. | Gate the `last_ltp` adoption on `!is_stale_packet`, and skip classification for a stale packet (contributing `Some(0)` — it traded nothing new). |
+| 4 | `classify_tick_volume` returned a bare `i64` and answered `0` to FOUR different questions; the call site wrapped every one in `Some(..)`. `net_volume_classified` was therefore `true` on every live bar and the fold's own `None` arm was unreachable. A bar whose volume was entirely unclassifiable published `Some(0)` — "perfectly balanced" — about flow nobody measured. | Return `Option<i64>`. `Some(0)` = nothing traded (duplicates land here). `None` = real volume, unreadable side. Pass through un-rewrapped. |
+
+### Edge Cases
+
+Duplicate packets (this feed delivers them routinely — MEASURED: near-every
+tick of security 68407 arrives twice, ms apart, with identical ts/ltp/volume)
+produce `delta == 0` and must classify `Some(0)`, never `None` — otherwise one
+duplicate NULLs an otherwise complete bar. A stale packet likewise contributes
+`Some(0)`. The opening bar of an instrument, whose first tick has no previous
+price, is now legitimately `None`.
+
+### Failure Modes
+
+Fix 1 costs exactly one tick's delta at a restart (the wrapping tick's true
+delta spans the wrap and is unrecoverable from a truncated counter) and keeps
+the instrument alive for the rest of the session — against the previous
+behaviour of losing every remaining bar. Fix 4 makes the day's first
+volume-bearing bar per instrument read NULL where it previously read a
+fabricated number; that is ~1 bar per instrument per day and it is the honest
+answer.
+
+### Test Plan
+
+`cargo test -p tickvault-trading --lib` → **1,743 passed, 0 failed, 2 ignored**.
+New test `a_balanced_tick_and_an_unclassifiable_tick_are_different_answers`
+pins the distinction as its own assertion so a refactor cannot collapse it.
+`classify_tick_volume_refuses_every_input_it_cannot_read` rewritten to assert
+`Some(0)` vs `None` per arm. One pre-existing test
+(`a_flat_tick_with_no_carry_yet_…`) asserted `Some(0)` for a bar that traded
+600 units of unknown direction with the rationale *"this is a real reading"* —
+that rationale WAS the defect written down as a test; it now asserts `None` and
+is renamed.
+
+### Rollback
+
+Four independent edits in two files, each revertable alone. No schema change,
+no new metric name shipped to CloudWatch, no alarm, no config flag.
+
+### Observability
+
+One NEW counter, `tv_aggregator_cumulative_reanchored_total`, on the local
+`/metrics` exporter ONLY. Deliberately **not** EMF-selected and **not**
+alarmed: an EMF name is ~$0.30/mo against a September forecast of $166.35 with
+the automatic `STOP_EC2_INSTANCES` line at $135.00, and §2.3n of
+`dhan-rest-only-noise-lock-2026-07-14.md` requires a LEVER, not a cost note,
+for the next addition. Recorded as an operator decision, not taken here.
+
+### Honest envelope
+
+100% inside the tested envelope, with ratcheted regression coverage: the
+classifier's every arm is pinned, the balanced-vs-unknown distinction has its
+own test, and the full trading-crate suite is green. **NOT claimed:** that
+`net_volume` is now precise. It is the tick rule — an INFERENCE — and Dhan's
+feed carries no aggressor flag and no trade-by-trade tape (zero hits for
+aggressor/trade-side/tape across all 21 vendor reference docs). MEASURED
+2026-09-11: we receive ~2 snapshots per exchange second, and a single snapshot
+carried 191 lots against a largest-single-trade of 1 lot — roughly 191 separate
+trades bundled into one up-or-down decision. **NOT claimed:** that our bars can
+match the vendor chart's bars — theirs are cut on exchange time, ours on the
+receipt clock (measured lag p50 1.38 s, p99 46.37 s), and their indicator signs
+the WHOLE bar by its direction while ours signs each snapshot. They are
+different quantities, not two estimates of one. **NOT claimed:** clippy — the
+`clippy` component is not installed in this container; CI runs it.
+
+### Per-Item Guarantee Matrix
+
+Carries the 15-row + 7-row matrix of
+`.claude/rules/project/per-wave-guarantee-matrix.md` by cross-reference.
+Rows materially exercised here: code coverage (3 tests added/rewritten),
+testing coverage (unit + edge + regression-against-the-real-2026-09-11-shape),
+code checks (fmt clean, banned-pattern clean), functionalities covering (the
+one changed pub-crate fn has tests and its single production call site),
+bug fixing (four live defects), extreme check (the new distinction test is the
+ratchet). Hot-path rows: zero allocation unchanged, O(1) per tick unchanged —
+the classifier is still three compares and one negate, and the new restart
+check is one subtract and one compare on an arm that already existed.
