@@ -1,7 +1,8 @@
-//! The depth-20 NAME board: top 7 stock underlyings by absolute percentage
+//! The depth-20 NAME board: top 6 stock underlyings by absolute percentage
 //! move, plus NIFTY and BANKNIFTY unconditionally (operator, 2026-09-11).
 //!
-//! Authorized by the "2026-09-11 (THIRD)" section of
+//! Authorized by the "2026-09-11 (THIRD)" section of, and amended by the
+//! "2026-09-11 (FOURTH)" section of,
 //! `.claude/rules/project/websocket-connection-scope-lock.md`, which carries
 //! the operator's verbatim words. Two of them decide the shape of this module:
 //!
@@ -60,14 +61,21 @@ use tickvault_common::types::ExchangeSegment;
 
 /// How many STOCK underlyings enter the board.
 ///
-/// The operator's number, verbatim: *"pcik the top 7"*.
-pub const DEPTH20_NAME_ENTRY_RANK: usize = 7;
+/// The operator's number, verbatim: *"top 6 alone dude"* (2026-09-11 FOURTH).
+/// It was 7 until the index window widened to ±11.
+///
+/// **Six is FORCED, not chosen.** Two independent pieces of arithmetic land on
+/// it: the budget (`2 × 47 + 7 × 24 = 262` against 250), and the fact that the
+/// freed index slots can buy neither a wider stock ladder (`2 × 47 + 6 × 28 =
+/// 262`) nor a seventh name. Spot is the only thing that fits the room ±11
+/// creates.
+pub const DEPTH20_NAME_ENTRY_RANK: usize = 6;
 
 /// How far a held name may slip before it loses its slots.
 ///
 /// A held name is KEPT while its rank is `<= DEPTH20_NAME_EXIT_RANK`, so it
 /// must fall out of the top 12 (~6% of the ~208 live F&O underlyings) before
-/// its 23 contracts are given away.
+/// its 24 contracts are given away.
 ///
 /// **This band is the remedy the 2026-09-07 lock prescribes in advance**, not
 /// an invention: *"If the swap budget is hit routinely, the answer is a longer
@@ -75,7 +83,9 @@ pub const DEPTH20_NAME_ENTRY_RANK: usize = 7;
 /// percentage-move key re-orders in BOTH directions every minute, unlike
 /// cumulative volume which only ever rises — and moving ONE name costs 23 of
 /// the 20 swaps a minute affords, so a board that re-ordered freely could never
-/// catch up to its own ranking.
+/// catch up to its own ranking. (The band is unchanged at 12 by the
+/// 2026-09-11 FOURTH amendment; only the entry set narrowed, so the band is
+/// now six ranks deep rather than five.)
 ///
 /// **NOT derived.** No measurement of minute-to-minute rank drift on this key
 /// exists, because no session has ever ranked on it. 12 is the first value with
@@ -87,17 +97,23 @@ pub const DEPTH20_NAME_EXIT_RANK: usize = 12;
 /// Strikes each side of at-the-money for a STOCK name.
 ///
 /// **This is an arithmetic CEILING, not a preference.** The board is
-/// `2 × (1 + 21 × 2) + 7 × (1 + (2N+1) × 2)` against a hard 250. At `N = 5`
-/// that is 247; at `N = 6` it is 275, and `plan_pool` refuses the WHOLE pool
-/// fail-closed rather than truncating — a session-ending failure, not a
-/// degraded one.
+/// `2 × slots_for_index_name(11) + 6 × slots_for_stock_name(N)` against a hard
+/// 250. At `N = 5` that is 238; at `N = 6` it is 262, and `plan_pool` refuses
+/// the WHOLE pool fail-closed rather than truncating — a session-ending
+/// failure, not a degraded one.
 pub const DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE: usize = 5;
 
 /// Strikes each side of at-the-money for NIFTY and BANKNIFTY.
 ///
-/// The operator's number, verbatim: *"for index only nifty and bankn ifty
-/// futures and its repscetive options atm plus or min us 10"*.
-pub const DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE: usize = 10;
+/// The operator's number, verbatim: *"instea dof atm plus or minus 10 can we go
+/// ahead with plus or minus 11"* (2026-09-11 FOURTH). It was 10, quoted from
+/// the THIRD authorization, until he spent the wasted index slots.
+///
+/// **±11 is the SOCKET ceiling.** An index name is
+/// `slots_for_index_name(N)` and one depth-20 connection admits
+/// [`DEPTH20_PER_SOCKET`]: ±11 is 47 of 50, and ±12 is 51 — over on its own,
+/// before the rest of the board is even counted.
+pub const DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE: usize = 11;
 
 /// The depth-20 instrument budget: 5 sockets × 50.
 pub const DEPTH20_INSTRUMENT_BUDGET: usize = 250;
@@ -307,22 +323,55 @@ impl NameBoard {
     }
 }
 
-/// Slots one name consumes: its nearest-expiry future, plus both legs of every
-/// strike in its window.
+/// Instruments one depth-20 connection admits, per Dhan.
+///
+/// *"you can subscribe upto 50 instruments in a single connection"* —
+/// `docs/dhan-ref/04-full-market-depth-websocket.md`. Mirrors
+/// `MAX_INSTRUMENTS_PER_TWENTY_DEPTH_CONNECTION`; kept here so the per-socket
+/// ceiling below reads against a named number rather than a literal.
+pub const DEPTH20_PER_SOCKET: usize = 50;
+
+/// Slots one INDEX name consumes: its nearest-expiry future, plus both legs of
+/// every strike in its window.
 ///
 /// `1 + (2N+1) × 2`. Every unique F&O contract is one subscription — a future
 /// costs exactly what an option costs, because the pool dedups on the I-P1-11
 /// composite and instrument class is invisible to the subscribe path.
+///
+/// **There is no index SPOT term, and there never can be.** An index is
+/// `IDX_I`, and `subscription_builder::validate_depth_segment` REFUSES every
+/// segment but `NSE_EQ` and `NSE_FNO` — so a NIFTY spot cannot reach a depth
+/// socket even if someone asked for it. That refusal is the vendor's own
+/// contract (*"Only NSE Equity and Derivatives segments supported"*), not our
+/// preference.
 #[must_use]
-pub const fn slots_for_name(strikes_each_side: usize) -> usize {
+pub const fn slots_for_index_name(strikes_each_side: usize) -> usize {
     1 + (2 * strikes_each_side + 1) * 2
+}
+
+/// Slots one STOCK name consumes: its `NSE_EQ` SPOT, its nearest-expiry
+/// future, plus both legs of every strike in its window.
+///
+/// The spot term is the 2026-09-11 (FOURTH) grant — *"in that top 6 try ot add
+/// its udnerlying spot also"*. It is admissible where an index spot is not
+/// because a cash equity is `NSE_EQ`, which Dhan documents as supported and
+/// uses as its own subscribe example.
+///
+/// **Honest value: it buys levels 6–20 and nothing below them.** The main feed
+/// runs Full mode and `append_inline_depth` already persists 5 levels of every
+/// equity book, so levels 1–5 arrive today at no cost. What makes the trade
+/// worth taking is that the freed slots can buy nothing else: a wider stock
+/// ladder is 262 and a seventh name is 262, both over the 250 budget.
+#[must_use]
+pub const fn slots_for_stock_name(strikes_each_side: usize) -> usize {
+    1 + slots_for_index_name(strikes_each_side)
 }
 
 /// The whole board's slot cost: two index names plus the stock entry set.
 #[must_use]
 pub const fn board_slot_cost() -> usize {
-    2 * slots_for_name(DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE)
-        + DEPTH20_NAME_ENTRY_RANK * slots_for_name(DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE)
+    2 * slots_for_index_name(DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE)
+        + DEPTH20_NAME_ENTRY_RANK * slots_for_stock_name(DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE)
 }
 
 /// The authorized shape must fit the socket budget — at compile time, because
@@ -331,7 +380,17 @@ pub const fn board_slot_cost() -> usize {
 const _: () = assert!(
     board_slot_cost() <= DEPTH20_INSTRUMENT_BUDGET,
     "the depth-20 name board must fit 250 instruments; widen the stock ATM \
-     window and it does not — 247 at ±5, 275 at ±6"
+     window and it does not — 238 at ±5, 262 at ±6"
+);
+
+/// An INDEX name must fit ONE socket, or its ladder is split across two
+/// connections and no single line carries the whole book.
+///
+/// This is the ceiling that makes ±11 the operator's maximum rather than his
+/// preference: 47 of 50 at ±11, 51 at ±12 — over before the board is counted.
+const _: () = assert!(
+    slots_for_index_name(DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE) <= DEPTH20_PER_SOCKET,
+    "an index name must fit one depth-20 socket: 47 at ±11, 51 at ±12"
 );
 
 /// The band must be strictly wider than the entry set, or there is no
@@ -534,8 +593,8 @@ mod tests {
     }
 
     #[test]
-    fn a_name_that_slips_out_of_the_top_seven_keeps_its_slots_inside_the_band() {
-        // THE hysteresis test. Moving one name costs 23 of the 20 swaps a
+    fn a_name_that_slips_out_of_the_entry_set_keeps_its_slots_inside_the_band() {
+        // THE hysteresis test. Moving one name costs 24 of the 20 swaps a
         // minute affords, so a board that evicted on a single-rank slip could
         // never catch up to its own ranking.
         let ranked = rank_names((1..=30).map(|i| n(i, 1_000 - i as i64)).collect());
@@ -574,35 +633,43 @@ mod tests {
     }
 
     #[test]
-    fn the_authorized_shape_is_247_of_250() {
+    fn the_authorized_shape_is_238_of_250() {
         // The operator asked directly: "will it sit under 250 slots". This is
         // the answer, and the const-assert above makes it a build failure
         // rather than a runtime pool refusal.
-        assert_eq!(slots_for_name(DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE), 43);
-        assert_eq!(slots_for_name(DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE), 23);
-        assert_eq!(board_slot_cost(), 247);
+        assert_eq!(
+            slots_for_index_name(DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE),
+            47
+        );
+        assert_eq!(
+            slots_for_stock_name(DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE),
+            24
+        );
+        assert_eq!(board_slot_cost(), 238);
         assert!(board_slot_cost() <= DEPTH20_INSTRUMENT_BUDGET);
     }
 
     #[test]
     fn widening_the_stock_window_by_one_would_breach_the_budget() {
-        // Why ±5 is a CEILING and not a preference. At ±6 the board is 275
+        // Why ±5 is a CEILING and not a preference. At ±6 the board is 262
         // against 250, and plan_pool refuses the WHOLE pool fail-closed - a
         // session with no depth at all, not a narrower one.
-        let at_six = 2 * slots_for_name(DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE)
-            + DEPTH20_NAME_ENTRY_RANK * slots_for_name(6);
-        assert_eq!(at_six, 275);
+        let at_six = 2 * slots_for_index_name(DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE)
+            + DEPTH20_NAME_ENTRY_RANK * slots_for_stock_name(6);
+        assert_eq!(at_six, 262);
         assert!(at_six > DEPTH20_INSTRUMENT_BUDGET);
     }
 
     #[test]
     fn moving_one_name_costs_more_swaps_than_a_minute_affords() {
-        // The honest cost, pinned so it cannot be forgotten. 23 contracts leave
-        // and 23 arrive when a name rotates; the pool can move 20 slots a
-        // minute (4 per socket x 5). So one rotation spans two minutes - which
-        // is exactly why the band above exists.
+        // The honest cost, pinned so it cannot be forgotten. 24 contracts leave
+        // and 24 arrive when a name rotates; the pool can move 20 slots a
+        // minute (4 per socket x 5), and ONE socket only 4 - so a rotation
+        // confined to one line spans six minutes. That figure is the whole
+        // argument for raising the swap budget, recorded in the 2026-09-11
+        // (FOURTH) scope-lock section, and it is why the band above exists.
         const SWAPS_PER_MINUTE: usize = 20;
-        assert!(slots_for_name(DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE) > SWAPS_PER_MINUTE);
+        assert!(slots_for_stock_name(DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE) > SWAPS_PER_MINUTE);
     }
 
     #[test]
@@ -661,11 +728,48 @@ mod tests {
     #[test]
     fn slots_for_name_counts_one_future_and_both_option_legs() {
         // A name is not one instrument. Getting this wrong understates the
-        // budget by a factor of twenty-three and the error surfaces only as a
+        // budget by a factor of twenty-four and the error surfaces only as a
         // refused pool on a live morning.
-        assert_eq!(slots_for_name(0), 3, "future + one CE + one PE");
-        assert_eq!(slots_for_name(5), 1 + 11 * 2);
-        assert_eq!(slots_for_name(10), 1 + 21 * 2);
+        assert_eq!(slots_for_index_name(0), 3, "future + one CE + one PE");
+        assert_eq!(slots_for_index_name(5), 1 + 11 * 2);
+        assert_eq!(slots_for_index_name(11), 1 + 23 * 2);
+    }
+
+    #[test]
+    fn a_stock_name_carries_its_spot_and_an_index_name_does_not() {
+        // The one structural difference between the two formulae, pinned. An
+        // index spot is IDX_I and validate_depth_segment refuses it outright,
+        // so the index term can never grow this slot - a future reader adding
+        // "symmetry" here would be asking for an instrument the wire rejects.
+        for n in 0..=12 {
+            assert_eq!(
+                slots_for_stock_name(n),
+                slots_for_index_name(n) + 1,
+                "a stock name is its index shape plus exactly one NSE_EQ spot"
+            );
+        }
+    }
+
+    #[test]
+    fn an_index_window_of_twelve_would_not_fit_one_socket() {
+        // Why +/-11 is the operator's ceiling rather than his preference. This
+        // is a SOCKET bound, independent of the 250 budget: at +/-12 one index
+        // name needs 51 of a connection's 50, so its ladder would split across
+        // two lines and neither would carry the whole book.
+        assert_eq!(slots_for_index_name(11), 47);
+        assert_eq!(slots_for_index_name(12), 51);
+        assert!(slots_for_index_name(12) > DEPTH20_PER_SOCKET);
+    }
+
+    #[test]
+    fn a_seventh_name_would_breach_the_budget() {
+        // Why SIX is forced. The board carried seven names at index +/-10; at
+        // +/-11 with the spot term a seventh is 262 against 250, and plan_pool
+        // refuses the WHOLE pool fail-closed. Six is arithmetic, not taste.
+        let at_seven = 2 * slots_for_index_name(DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE)
+            + 7 * slots_for_stock_name(DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE);
+        assert_eq!(at_seven, 262);
+        assert!(at_seven > DEPTH20_INSTRUMENT_BUDGET);
     }
 
     #[test]
@@ -673,8 +777,8 @@ mod tests {
         // Re-derived here rather than quoted, so a change to either window
         // moves this test with it instead of leaving a stale literal that
         // agrees with nothing.
-        let expected = 2 * slots_for_name(DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE)
-            + DEPTH20_NAME_ENTRY_RANK * slots_for_name(DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE);
+        let expected = 2 * slots_for_index_name(DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE)
+            + DEPTH20_NAME_ENTRY_RANK * slots_for_stock_name(DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE);
         assert_eq!(board_slot_cost(), expected);
         assert!(board_slot_cost() <= DEPTH20_INSTRUMENT_BUDGET);
     }
