@@ -127,6 +127,20 @@ use tickvault_trading::candles::multi_tf_aggregator::AGGREGATOR_MAX_SLOTS;
 use tickvault_trading::candles::{BufferedSeal, ConsumeStats, FeedStrategy, MultiTfAggregator};
 use tracing::{error, info, warn};
 
+/// The segment label used when a ghost log line has no instrument recorded.
+///
+/// DERIVED, never spelled out: `segment_code_to_str` is a `const fn` whose
+/// `_` arm returns the literal that `depth_segment_label` refuses on, so
+/// evaluating it at an unmapped code gives exactly that literal at compile
+/// time. Writing `"UNKNOWN"` by hand here would let the two drift silently —
+/// and a drifted sentinel is one that reads as a real segment.
+///
+/// The sentinel is unreachable by construction (the Ghost arm records the
+/// label before `outcome.ghost` can exceed zero); it exists so a future
+/// refactor that breaks the invariant reports the break rather than panicking
+/// on the drain.
+const DEPTH_SEGMENT_UNKNOWN: &str = tickvault_common::segment::segment_code_to_str(u8::MAX);
+
 /// Environment opt-in that must be `1` for the lane to run, on top of
 /// `[feeds] dhan_enabled`. Absent means OFF, which is the whole point.
 pub const DHAN_LIVE_FEED_ENV: &str = "TICKVAULT_DHAN_LIVE_FEED";
@@ -5463,8 +5477,8 @@ async fn run_frame_drain(
                                             // always records the id before
                                             // `outcome.ghost` can exceed zero)
                                             // and are spelled out rather than
-                                            // unwrapped: a 0 security_id and a
-                                            // u8::MAX segment are both values
+                                            // unwrapped: a 0 security_id and an
+                                            // "UNKNOWN" segment are both values
                                             // this codebase already reads as
                                             // "absent", so a future refactor
                                             // that breaks the invariant reports
@@ -5472,7 +5486,7 @@ async fn run_frame_drain(
                                             // the drain.
                                             let (ghost_security_id, ghost_segment) = outcome
                                                 .ghost_instrument
-                                                .unwrap_or((0_u64, u8::MAX));
+                                                .unwrap_or((0_u64, DEPTH_SEGMENT_UNKNOWN));
                                             error!(
                                                 code = ErrorCode::WsGapSubscriptionBatching.code_str(),
                                                 source = "unsubscribe_ignored",
@@ -5481,11 +5495,15 @@ async fn run_frame_drain(
                                                 security_id = ghost_security_id,
                                                 segment = ghost_segment,
                                                 ghost_packets = outcome.ghost,
+                                                ghost_instrument_shared = outcome.ghost_instrument_shared,
                                                 redials_taken = ghost_redials_taken(frame.connection_index),
                                                 "a depth socket is still delivering an instrument it was told to \
                                                  unsubscribe more than the grace ago -- the unsubscribe was ignored \
                                                  or lost, so the socket is asked to redial and replay its current \
-                                                 set (log-sink only; counted under `ghost` on the depth counter)"
+                                                 set. `security_id` is the FIRST ghost in this frame; \
+                                                 `ghost_packets` counts EVERY ghost packet in it, so the two are \
+                                                 the same instrument only when `ghost_instrument_shared` is false \
+                                                 (log-sink only; counted under `ghost` on the depth counter)"
                                             );
                                         }
                                         // Said ONCE per socket per session: after the
@@ -5495,11 +5513,26 @@ async fn run_frame_drain(
                                             if ghost_ceiling_first_hit(frame.connection_index) =>
                                         {
                                             c.depth_ghost_exhausted.increment(1);
+                                            // The id is in hand here too, and this is
+                                            // the arm that most needs it: MEASURED
+                                            // 2026-09-11, every socket reached the
+                                            // ceiling by 10:22 IST and 78.5% of the
+                                            // session's 5,345,436 ghost packets arrived
+                                            // AFTER that. Logging the instrument only on
+                                            // the redial arm names four fifths of the
+                                            // evidence not at all.
+                                            let (ghost_security_id, ghost_segment) = outcome
+                                                .ghost_instrument
+                                                .unwrap_or((0_u64, DEPTH_SEGMENT_UNKNOWN));
                                             error!(
                                                 code = ErrorCode::WsGapSubscriptionBatching.code_str(),
                                                 source = "ghost_redial_exhausted",
                                                 connection_index = frame.connection_index,
                                                 endpoint = frame.endpoint.as_str(),
+                                                security_id = ghost_security_id,
+                                                segment = ghost_segment,
+                                                ghost_packets = outcome.ghost,
+                                                ghost_instrument_shared = outcome.ghost_instrument_shared,
                                                 ceiling = GHOST_REDIAL_SESSION_CEILING,
                                                 "a depth socket has been redialled the session ceiling of times \
                                                  for a ghost instrument and STILL delivers it -- the unsubscribe \
@@ -6671,7 +6704,7 @@ pub struct DepthFrameOutcome {
     /// (`DepthFrameClass::Ghost`). Non-zero asks the socket to redial.
     pub ghost: u64,
     /// The FIRST ghosting instrument in this frame, as `(security_id,
-    /// exchange_segment_code)`.
+    /// segment_label)`.
     ///
     /// WHY THIS EXISTS. Across the two full sessions that proved Dhan ignores
     /// the depth unsubscribe — code 25 on 2026-09-10, code 24 on 2026-09-11,
@@ -6683,23 +6716,49 @@ pub struct DepthFrameOutcome {
     /// "precise contract labels … SecurityId for every contract cited", and
     /// that requirement could not be met from our own telemetry.
     ///
-    /// It also settles the question the log could not answer: whether the
+    /// It also helps with the question the log could not answer: whether the
     /// same contract survived eight redials, or eight different contracts
     /// were each newly ignored. Those have opposite diagnoses and the
-    /// existing counters cannot distinguish them.
+    /// existing counters cannot distinguish them. `ghost_instrument_shared`
+    /// below is what makes that reading safe rather than assumed.
     ///
     /// FIRST, not all: a frame stacks packets, and holding every ghosting id
-    /// would need a collection on the drain. One `Option<(u64, u8)>` is
-    /// `Copy`, sits in the outcome the frame already returns, and costs the
-    /// hot path a single move. The `error!` it feeds is itself throttled to
-    /// once per socket per 180 s cooldown, so a second id in the same frame
-    /// would have nowhere to go.
+    /// would need a collection on the drain. One `Option<(u64, &'static
+    /// str)>` is `Copy`, sits in the outcome the frame already returns, and
+    /// costs the hot path a single move. The `error!` it feeds is itself
+    /// throttled to once per socket per 180 s cooldown, so a second id in
+    /// the same frame would have nowhere to go.
+    ///
+    /// The segment is the LABEL (`"NSE_FNO"`), not the wire byte, and that
+    /// is the whole point of the field rather than a stylistic choice. This
+    /// line exists to be PAIRED — against `depth_unsubscribe_sent`, which
+    /// logs `drop_this.segment.as_str()`, and against `market_depth.segment`,
+    /// which is a SYMBOL column written from this very `depth_segment_label`
+    /// call. A raw `2` here would join to neither, and `security_id` ALONE is
+    /// not unique (I-P1-11) — so a numeric segment would leave the pairing
+    /// ambiguous in exactly the case the field was added to disambiguate.
+    /// The label is already in scope above, refused rather than guessed for
+    /// an unknown code, so this costs nothing.
     ///
     /// `u64`, not `u32`: the §28.1 lift widened the shared id space, and a
     /// narrower field here would reintroduce exactly the silent truncation
     /// that widening removed — the same reasoning `SubscribeInstrument`
     /// records at its own `security_id`.
-    pub ghost_instrument: Option<(u64, u8)>,
+    pub ghost_instrument: Option<(u64, &'static str)>,
+    /// True when a SECOND, DIFFERENT instrument also ghosted in this frame.
+    ///
+    /// Without it, `security_id` beside `ghost_packets` reads as "this
+    /// contract ghosted N times" — and that is false whenever two contracts
+    /// ghost in one frame, which is the expected case: a depth-20 socket
+    /// drops up to four contracts a minute and every one of them can ghost
+    /// concurrently for the next ten minutes. A vendor ticket built on the
+    /// wrong reading is a dismissed ticket.
+    ///
+    /// One `bool` and one comparison per ghost packet, on a branch that is
+    /// already taken. It does not name the others — naming them needs the
+    /// collection this field exists to avoid — it says only whether the id
+    /// on the line accounts for the count on the line.
+    pub ghost_instrument_shared: bool,
     /// Packets for an instrument dropped inside the grace window.
     pub unsubscribed_grace: u64,
 }
@@ -7403,13 +7462,26 @@ fn drain_depth_frame(
                 crate::depth_subscription_view::DepthFrameClass::Ghost => {
                     out.ghost = out.ghost.saturating_add(1);
                     c.depth_ghost.increment(1);
-                    // FIRST ghost of the frame wins, so the id reported is the
-                    // one whose packet earned the redial rather than whichever
-                    // packet happened to be last in the frame. `get_or_insert`
-                    // rather than assignment for exactly that reason.
-                    let _ = out
-                        .ghost_instrument
-                        .get_or_insert((header.security_id, header.exchange_segment_code));
+                    // FIRST ghost of the frame wins rather than the last, so
+                    // the id on the line is stable across a re-read of the
+                    // same frame instead of depending on packet order.
+                    //
+                    // The redial is requested ONCE per frame on the aggregate
+                    // `outcome.ghost > 0`, so no individual packet earns it —
+                    // first-vs-last is a determinism choice, not a causal one,
+                    // and `ghost_instrument_shared` is what tells the reader
+                    // whether this id accounts for the whole count.
+                    //
+                    // `segment` is the LABEL bound above, refused already if
+                    // the code is unknown: the same value `market_depth.segment`
+                    // is written from, so the log line and the stored rows join.
+                    match out.ghost_instrument {
+                        None => out.ghost_instrument = Some((header.security_id, segment)),
+                        Some((first_id, _)) if first_id != header.security_id => {
+                            out.ghost_instrument_shared = true;
+                        }
+                        Some(_) => {}
+                    }
                 }
                 crate::depth_subscription_view::DepthFrameClass::RecentlyDropped => {
                     out.unsubscribed_grace = out.unsubscribed_grace.saturating_add(1);
