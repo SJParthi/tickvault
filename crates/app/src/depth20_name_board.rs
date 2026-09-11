@@ -121,8 +121,52 @@ pub const DEPTH20_RANK_ABSOLUTE_MOVE: bool = true;
 /// session.
 pub const MAX_PLAUSIBLE_MOVE_BPS: i64 = 100_000;
 
+/// The largest FALL this board will rank, in basis points (−50% = −5,000 bp).
+///
+/// **A separate floor exists because the ceiling above can NEVER fire on a
+/// fall — not rarely, never.** A spot cannot go below zero, so the most
+/// negative move arithmetically expressible is −10,000 bp (−100%), and
+/// [`MAX_PLAUSIBLE_MOVE_BPS`] is 100,000. The entire downside range therefore
+/// fits under the ceiling by a factor of ten, and with
+/// [`DEPTH20_RANK_ABSOLUTE_MOVE`] on, a spot of one paise against a ₹1,000
+/// previous close reads as **9,999 bp and takes rank 1 for the minute**. The
+/// asymmetry is structural: an up-move is unbounded, so a ceiling bounds it; a
+/// down-move is already bounded, so only a floor bounds it.
+///
+/// **−50% is not a guess at "corrupt".** It is the point past which the
+/// reading is not a price move at all:
+///
+/// * a 1:2 split or a 1:1 bonus prints the spot at half the un-adjusted
+///   previous close — a legitimate, RECURRING −50% that is not a move, and
+///   would hand the ex-date name rank 1 every time;
+/// * a 1:10 split prints −90%;
+/// * NSE halts the whole market on a 20% index fall, and individual F&O
+///   underlyings trade inside an exchange-set operating range, so a real
+///   −50% session in an underlying is not a state the market stays open in.
+///
+/// The floor cannot separate a corporate action from a corrupt tick by
+/// magnitude — and does not need to. In both cases the name must not rank,
+/// because in both cases the number is not a move.
+pub const MIN_PLAUSIBLE_MOVE_BPS: i64 = -5_000;
+
 /// Basis points per unit ratio.
 const BPS_SCALE: i128 = 10_000;
+
+/// The floor must be TIGHTER than the mathematical minimum, or it is dead
+/// code in exactly the way the ceiling was.
+///
+/// A spot of zero is already refused, so the most negative move reachable is
+/// `-BPS_SCALE` (−100%). A floor at or below that can never fire — which is
+/// the whole defect this constant was added to fix, so it is made
+/// unrepresentable rather than left to a comment.
+const _: () = assert!(
+    MIN_PLAUSIBLE_MOVE_BPS > -(BPS_SCALE as i64),
+    "a floor at or below -100% can never fire: the spot is already gated positive"
+);
+const _: () = assert!(
+    MIN_PLAUSIBLE_MOVE_BPS < 0 && MAX_PLAUSIBLE_MOVE_BPS > 0,
+    "the band must straddle a flat move, or a flat name is unrankable"
+);
 
 /// The absolute move of one underlying, in integer basis points.
 ///
@@ -132,7 +176,10 @@ const BPS_SCALE: i128 = 10_000;
 ///   Ticker-mode sentinel, and dividing by it is the defect this signature
 ///   exists to make unrepresentable);
 /// * the spot is absent or non-positive;
-/// * the computed move exceeds [`MAX_PLAUSIBLE_MOVE_BPS`].
+/// * the computed move is outside
+///   `[MIN_PLAUSIBLE_MOVE_BPS, MAX_PLAUSIBLE_MOVE_BPS]` — checked on the
+///   SIGNED move, before any `abs()`, because after the `abs()` the sign that
+///   decides which bound applies is gone.
 ///
 /// **Ranking a missing price as `0` would be the false-OK**: it ties a name
 /// nobody has a price for with a name that is genuinely flat, and between
@@ -152,16 +199,21 @@ pub fn move_bps(spot_paise: Option<i64>, prev_close_paise: Option<i64>) -> Optio
     }
     let delta = i128::from(spot) - i128::from(prev);
     let signed_bps = (delta * BPS_SCALE) / i128::from(prev);
+    // Gate the SIGNED move, BEFORE the abs. Order is the safety property here:
+    // `abs()` first would discard the sign that decides which bound applies,
+    // and a -9,999 bp corrupt tick would pass a ceiling of 100,000 and take
+    // rank 1. See MIN_PLAUSIBLE_MOVE_BPS.
+    if signed_bps > i128::from(MAX_PLAUSIBLE_MOVE_BPS)
+        || signed_bps < i128::from(MIN_PLAUSIBLE_MOVE_BPS)
+    {
+        return None;
+    }
+    // Bounded back into i64 by the gate above, so the cast cannot truncate.
     let bps = if DEPTH20_RANK_ABSOLUTE_MOVE {
         signed_bps.abs()
     } else {
         signed_bps
     };
-    // Bounded back into i64 by the plausibility gate, so the cast cannot
-    // truncate: anything that would not fit is far past the ceiling.
-    if bps > i128::from(MAX_PLAUSIBLE_MOVE_BPS) || bps < -i128::from(MAX_PLAUSIBLE_MOVE_BPS) {
-        return None;
-    }
     i64::try_from(bps).ok()
 }
 
@@ -349,6 +401,72 @@ mod tests {
                 Some(10_000)
             ),
             Some(MAX_PLAUSIBLE_MOVE_BPS)
+        );
+    }
+
+    /// The ceiling cannot bound a FALL, and with absolute ranking a fall is
+    /// what reaches rank 1.
+    ///
+    /// Found by the 2026-09-11 adversarial sweep of this module. A spot of one
+    /// paise against a ₹1,000 previous close is -9,999 bp; `abs()` makes it
+    /// 9,999; the ceiling is 100,000; so before the floor existed this corrupt
+    /// tick PASSED and took the top of the board for the minute.
+    #[test]
+    fn a_near_zero_spot_is_refused_and_never_takes_rank_one() {
+        // One paise against 1,000 rupees: -99.99%, the worst a spot can print
+        // without being non-positive (which is already refused above).
+        assert_eq!(
+            move_bps(Some(1), Some(100_000)),
+            None,
+            "a -99.99% tick passed the ceiling and ranked first"
+        );
+    }
+
+    /// A 1:10 split prints the spot at a tenth of the UN-ADJUSTED previous
+    /// close. That is a real, recurring, non-corrupt -90% that is not a move.
+    #[test]
+    fn an_ex_split_price_is_not_ranked_as_a_ninety_percent_faller() {
+        assert_eq!(move_bps(Some(10_000), Some(100_000)), None);
+        // A 1:2 split / 1:1 bonus lands NEAR -5,000 bp, and anything past the
+        // floor is refused.
+        assert_eq!(move_bps(Some(49_000), Some(100_000)), None);
+        // Exactly ON the floor is ADMITTED, deliberately - the same rule as
+        // the ceiling one test above, which admits exactly 100,000. Both
+        // bounds mean "outside is refused"; making one of them
+        // inclusive-refuse would be an asymmetry a reader has to remember,
+        // and an auction equilibrium landing on the exact paise is not a
+        // case worth that. The ex-date protection is the -90% arm above.
+        assert_eq!(
+            move_bps(Some(50_000), Some(100_000)),
+            Some(MIN_PLAUSIBLE_MOVE_BPS.abs())
+        );
+    }
+
+    /// The floor must be REACHABLE, which is the exact property the ceiling
+    /// lacked on this side.
+    #[test]
+    fn the_floor_is_tighter_than_the_worst_fall_a_positive_spot_can_print() {
+        // A spot of 1 paise against a huge close is the most negative reading
+        // obtainable, and it must be OUTSIDE the band - otherwise the floor is
+        // dead code exactly as the ceiling was.
+        let worst = -(BPS_SCALE as i64) + 1;
+        assert!(
+            worst < MIN_PLAUSIBLE_MOVE_BPS,
+            "the worst expressible fall is inside the band: the floor can never fire"
+        );
+    }
+
+    /// A genuine big faller still ranks - the floor must not eat the signal
+    /// the board exists to find.
+    #[test]
+    fn a_real_eight_percent_faller_still_ranks_and_ties_with_an_eight_percent_riser() {
+        let faller = move_bps(Some(92_000), Some(100_000));
+        let riser = move_bps(Some(108_000), Some(100_000));
+        assert_eq!(faller, Some(800), "a -8% session must stay rankable");
+        assert_eq!(riser, Some(800));
+        assert_eq!(
+            faller, riser,
+            "absolute ranking: a faller ranks with a riser of the same size"
         );
     }
 

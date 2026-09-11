@@ -393,26 +393,50 @@ pub const FEED_REQUEST_TWENTY_DEPTH: u8 = 23;
 
 /// Unsubscription request code for full market depth feed (both 20 and 200 level).
 ///
-/// **24 since 2026-09-10 — `subscribe_code + 1`, the same rule Ticker (15→16),
-/// Quote (17→18) and Full (21→22) follow above.** This shipped as 25 from the
-/// depth revival until 2026-09-10 on the strength of the portal annexure export
-/// and a citation of the vendor reference client; the classic annexure page
-/// and that client's own `subscribe_code + 1` derivation both say 24
-/// (`docs/dhan-ref/08-annexure-enums.md` §(b) records the cross-surface split).
+/// **25 — the vendor's own value, restored 2026-09-11 after 24 was proven to be
+/// a code Dhan does not publish anywhere.**
 ///
-/// The live session of 2026-09-10 settled it in the direction the WIRE answered:
-/// with 25 on every unsubscribe frame, the ghost detector logged **20**
-/// `unsubscribe_ignored` events and armed **10** ghost redials inside the first
-/// thirty minutes, and **8** distinct instruments were streaming depth-200 on
-/// the 5 single-instrument sockets — Dhan did not honour one code-25
-/// unsubscribe. 24 is the ONLY other value either vendor surface names.
+/// # The history, because this constant has now moved twice
 ///
-/// 24 is itself UNVERIFIED-LIVE until a session reads `ghost = 0` with
-/// `unsubscribed_grace > 0` on `tv_dhan_feed_depth_total`; the detector that
-/// caught 25 is the same instrument that verifies 24. Dated record:
-/// `websocket-connection-scope-lock.md` "2026-09-10 — THE DEPTH UNSUBSCRIBE
-/// REQUESTCODE IS SETTLED LIVE".
-pub const FEED_UNSUBSCRIBE_TWENTY_DEPTH: u8 = 24;
+/// It shipped as 25 from the depth revival. On 2026-09-10 a live session proved
+/// 25 was IGNORED on the wire and it was changed to 24, on the strength of a
+/// claim that "the classic annexure page lists 24" and of the
+/// `subscribe_code + 1` rule Ticker (15→16), Quote (17→18) and Full (21→22)
+/// follow. On 2026-09-11 the operator supplied a fresh full pull of the Dhan v2
+/// documentation, and it refutes that claim outright:
+///
+/// * the Feed Request Code table lists `23 Subscribe — Full Market Depth` and
+///   `25 Unsubscribe — Full Market Depth`, and **skips 24 entirely**;
+/// * `grep` for the literal `24` as a request code across all 10,263 lines of
+///   the complete v2 documentation returns **ZERO**;
+/// * the Full Market Depth guide itself documents only `23` (subscribe) and
+///   `12` (disconnect the whole socket) — it shows **no unsubscribe at all**.
+///
+/// So the 2026-09-11 session shipped an UNDOCUMENTED code, and Dhan ignored it
+/// with a failure signature byte-identical to 25's: 80 `unsubscribe_ignored`
+/// lines, split 40/40 across depth-20 and depth-200, on all ten sockets, every
+/// socket reaching `GHOST_REDIAL_SESSION_CEILING`. Two codes failing
+/// IDENTICALLY is the evidence that the code is not the variable.
+///
+/// # Why 25 rather than leaving 24 in place
+///
+/// Neither works. When neither works the value's job stops being "make it
+/// work" and becomes "make the vendor ticket unarguable" — and a ticket that
+/// says *"we send the code your own annexure documents and you ignore it"* is
+/// unarguable, while one that says *"we send 24"* invites the answer "24 is not
+/// a code". Shipping the documented value is also the only position that
+/// survives Dhan implementing the unsubscribe later without us noticing.
+///
+/// # What is NOT claimed
+///
+/// That 25 works. It does not, and this change does not make the ghosts stop —
+/// the depth sockets will keep receiving contracts this process unsubscribed
+/// until Dhan honours the request or the redial rebuilds the socket. The
+/// verdict instrument is unchanged: a session reading `ghost = 0` with
+/// `unsubscribed_grace > 0` on `tv_dhan_feed_depth_total`. Dated record:
+/// `websocket-connection-scope-lock.md` "2026-09-11 (SECOND) — THE VENDOR
+/// DOCUMENTATION SETTLES THE UNSUBSCRIBE CODE".
+pub const FEED_UNSUBSCRIBE_TWENTY_DEPTH: u8 = 25;
 
 // ---------------------------------------------------------------------------
 // Deep Depth Protocol — Header Byte Offsets
@@ -4561,17 +4585,28 @@ mod tests {
     // --- Unsubscribe code for depth ---
 
     #[test]
-    fn test_depth_unsubscribe_code_is_24_and_is_subscribe_plus_one() {
-        // 2026-09-10: 25 was proven IGNORED on the wire (20 unsubscribe_ignored
-        // events, 10 ghost redials, 8 instruments on 5 depth-200 sockets in the
-        // first 30 minutes). 24 is the classic-annexure value and the same
-        // `subscribe_code + 1` rule every other unsubscribe code obeys.
-        assert_eq!(FEED_UNSUBSCRIBE_TWENTY_DEPTH, 24);
-        assert_eq!(FEED_UNSUBSCRIBE_TWENTY_DEPTH, FEED_REQUEST_TWENTY_DEPTH + 1);
+    fn test_depth_unsubscribe_code_is_the_value_dhan_documents() {
+        // 2026-09-11: the operator's fresh full pull of the Dhan v2 docs lists
+        // `23 Subscribe - Full Market Depth` and `25 Unsubscribe - Full Market
+        // Depth`, SKIPPING 24 - and the literal 24 appears as a request code
+        // nowhere in all 10,263 lines. The 2026-09-10 change to 24 therefore
+        // shipped a code the vendor does not publish, and Dhan ignored it with
+        // a signature byte-identical to 25's (80 lines, 40/40 across the two
+        // endpoints, all ten sockets).
+        assert_eq!(FEED_UNSUBSCRIBE_TWENTY_DEPTH, 25);
         assert_ne!(
-            FEED_UNSUBSCRIBE_TWENTY_DEPTH, 25,
-            "25 is the code Dhan ignored live on 2026-09-10; reverting it needs a \
-             dated live reading in websocket-connection-scope-lock.md first"
+            FEED_UNSUBSCRIBE_TWENTY_DEPTH, 24,
+            "24 is not a Dhan request code - it appears in no vendor surface. \
+             Re-shipping it needs a dated vendor citation in \
+             websocket-connection-scope-lock.md first"
+        );
+        // Depth is the ONE family that does NOT follow subscribe_code + 1.
+        // Pinned so a future reader cannot 'restore the pattern' and silently
+        // reintroduce 24.
+        assert_ne!(
+            FEED_UNSUBSCRIBE_TWENTY_DEPTH,
+            FEED_REQUEST_TWENTY_DEPTH + 1,
+            "depth breaks the +1 rule by the vendor's own table: 23 -> 25"
         );
     }
 

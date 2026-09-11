@@ -45,14 +45,14 @@ paths:
 
 11. **Order update field names differ from REST.** Single-char codes (`C`=CNC, `B`=Buy, etc.), PascalCase keys, `MsgCode: 42`.
 
-12. **Unsubscribe depth = code 24 (since 2026-09-10).** This rule said "25, NOT 24 — the SDK has a bug" until the live session of 2026-09-10 proved Dhan IGNORES code 25 (measured 2026-09-11 by re-query: **80** `unsubscribe_ignored` lines, 40 depth-20 + 40 depth-200, across **all ten** depth sockets, redials exhausted at the session ceiling of 8 — the "20 ignored / 10 redials" figure recorded on 2026-09-10 matches no window and is withdrawn). 24 = `subscribe_code + 1`, the rule every other unsubscribe code obeys. Dated record: `websocket-connection-scope-lock.md` "2026-09-10 — THE DEPTH UNSUBSCRIBE REQUESTCODE IS SETTLED LIVE".
-    **⚠ 2026-09-11: code 24 is ALSO ignored, and identically** — 80 lines, 40/40 across both endpoints, all ten sockets, ceiling reached. Two codes producing the same failure signature is evidence the RequestCode may not be the variable. Do NOT ship a third guess; the scope lock's instruction is a vendor ticket.
+12. **Unsubscribe depth = code 25 — the vendor's own documented value, restored 2026-09-11.** This rule said "25, NOT 24 — the SDK has a bug", then flipped to 24 on 2026-09-10 when a live session proved Dhan IGNORES code 25 (measured 2026-09-11 by re-query: **80** `unsubscribe_ignored` lines, 40 depth-20 + 40 depth-200, across **all ten** depth sockets, redials exhausted at the session ceiling of 8 — the "20 ignored / 10 redials" figure recorded on 2026-09-10 matches no window and is withdrawn). **Code 24 was then ALSO ignored on 2026-09-11, identically** — 80 lines, 40/40, all ten sockets, ceiling reached. Two codes producing a byte-identical failure signature is evidence the RequestCode is NOT the variable.
+    **⚠ 2026-09-11 — the operator's fresh full pull of the Dhan v2 documentation settles which value to SHIP:** the Feed Request Code table reads `23 Subscribe — Full Market Depth` then `25 Unsubscribe — Full Market Depth`, **skipping 24**, and the literal 24 appears as a request code **nowhere in all 10,263 lines**. The Full Market Depth guide itself documents only `23` (subscribe) and `12` (disconnect the socket) and shows **no unsubscribe at all**. So 24 was an undocumented guess. Depth is the ONE family that breaks the `subscribe_code + 1` rule; that asymmetry is the vendor's and must not be "corrected". Do NOT ship a third guess — the next step is a vendor ticket citing their own annexure. Dated record: `websocket-connection-scope-lock.md` "2026-09-11 (SECOND) — THE VENDOR DOCUMENTATION SETTLES THE UNSUBSCRIBE CODE".
 
 ## Depth Rebalancing Rules (added 2026-04-16)
 
 13. **Depth rebalancing uses command channel — NEVER disconnect+reconnect for ATM swap.**
     - `DepthCommand::Swap20` for 20-level, `DepthCommand::Swap200` for 200-level
-    - Sends RequestCode 24 (unsub old — was 25 until 2026-09-10, see rule 12) then 23 (sub new) on same WebSocket
+    - Sends RequestCode 25 (unsub old — the vendor-documented value; 25 -> 24 -> 25, see rule 12) then 23 (sub new) on same WebSocket
     - Zero disconnect, zero reconnect, zero tick gap, O(1) latency
 
 14. **Depth connections cap at 60 retry attempts.** No infinite retry loops.

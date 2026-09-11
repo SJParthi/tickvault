@@ -3182,6 +3182,76 @@ stopped redialling after `GHOST_REDIAL_SESSION_CEILING` and kept their working
 set. **The apply cadence still does NOT move**: the FOURTH-quote ordering binds
 on a clean read, and this read is the opposite of clean.
 
+#### ⚠ RE-MEASURED 2026-09-11 (same evening) — three of the numbers above are LOW, the provenance is wrong by 17 minutes, and the REDIAL BOUGHT NOTHING
+
+The table above says *"Read from the running box at 15:46 IST."* It was read at
+**15:29 IST** — the running cumulative crosses all three claimed values at that
+minute — and the session had not finished: ghost kept accruing to **15:43** and
+rows to **16:01**. Re-queried from `/tickvault/prod/metrics`, the EMF log group
+(`tv_dhan_feed_depth_total` in CloudWatch carries only a `host` dimension — it
+folds `outcome` away, so the per-outcome split is **not verifiable from
+CloudWatch metrics at all** and the EMF group is the only source):
+
+| counter | table above | MEASURED session total | low by |
+|---|---:|---:|---:|
+| `ghost` | 5,250,076 | **5,345,436** | 95,360 (1.8%) |
+| `unsubscribed_grace` | 1,664,266 | **1,686,468** | 22,202 (1.3%) |
+| `rows` | 793,936,720 | **793,936,960** | 240 |
+| `ghost_redial` | 80 | 80 | — |
+| `ghost_exhausted` | 10 | 10 | — |
+
+The derived tail is unchanged in substance: 5,345,436 / 1,686,468 = 3.170 ⇒
+**T ≈ 375 s** against the 374 s recorded above.
+
+**The finding that matters is not the 1.8%.** `GHOST_REDIAL_SESSION_CEILING`
+is 8 and there are ten depth sockets, so **80 is the arithmetic maximum** — the
+number is a saturated ceiling, not a measurement of ghost frequency. Every
+socket hit it: all five depth-20 exhausted by **09:43 IST**, all five depth-200
+by **10:22 IST**, firing at the 180 s cooldown floor back to back (conn 5:
+09:19:18 → 09:22:18 → 09:25:38 → 09:28:38 → …), a fresh ghost verdict at the
+earliest legal instant, eight times.
+
+| ghost packets | count | share |
+|---|---:|---:|
+| before the last exhaustion (10:22 IST) | 1,151,204 | 21.5% |
+| **after** | **4,194,232** | **78.5%** |
+
+**Four fifths of the session's ghosting happened with no redial budget left**,
+flat across five hours (hourly IST: 09h 624,792 · 10h 1,326,090 · 11h 963,876 ·
+12h 746,296 · 13h 684,950 · 14h 634,604 · 15h 364,828). The remedy shipped on
+2026-09-08 to make a wrong unsubscribe code self-healing **did not heal it**;
+it spent its budget in the first hour and then watched.
+
+**⚠ A CLAIM MADE IN THIS SESSION IS REFUTED AND IS WITHDRAWN: "every ordinary
+swap arms a socket re-dial."** Measured: depth-20 **7,662 swaps → 40 redials =
+0.52%**; depth-200 **1,799 → 40 = 2.22%**; combined **9,461 → 80 = 0.85%**.
+It is wrong by two orders of magnitude and was stated without checking the
+arithmetic against the swap counters that were already in hand. **And the
+refutation must not be read the other way either** — 91% of all swaps
+(depth-20: 7,122 of 7,662; depth-200: 1,502 of 1,799) happened AFTER that
+pool's redial budget was already spent, so they could not have armed one
+whatever they did. The honest statement is that **the ghost detector was
+budget-blind for most of the session**, and the swap-to-ghost rate is unknown.
+
+**Also measured, and it is the reassuring half:** `SubscriptionRejected`,
+`ParkReason`, `InstrumentsExceedLimit`, `FatalDisconnect` and `parked` each
+return **0 events**; `tv_dhan_ws_park_total` is 0 on all four reasons across
+8,640 EMF records; `tv_depth_rebalance_swaps_refused_total` is 0 on all five
+reasons. **No socket parked.** The wrong unsubscribe code costs redial churn
+and stale books, not sockets.
+
+**Still Unknown, and the gap is the one already flagged:** no `WS-GAP-02` line
+carries an instrument id (`{ $.fields.security_id = * && $.fields.code =
+"WS-GAP-02" }` → **0 events**), so the per-contract tail cannot be measured
+directly and the 375 s figure remains a ratio derivation assuming a steady
+packet rate. Adding `security_id` + `segment` to the ghost line is the
+prerequisite, and it is also what a Dhan support ticket needs.
+
+**Two counters this session quoted are in NO CloudWatch metric at all** —
+`tv_depth_rebalance_swaps_sent_total` and `tv_depth20_track_swaps_sent_total`
+exist only in the EMF log group and the local exporter. They are correct
+(1,799 and 7,662, verified exactly); they are simply not alarmable today.
+
 #### ⚠ CORRECTED in the same pass — "804 parks the socket" is STALE in TWO places
 
 The 2026-09-09 section's blocker list says *"804 parks the socket and the redial
@@ -3729,3 +3799,103 @@ defensible question for a depth capture. Recorded so the trade is on the record.
 - Reports the pool as enabled while its instrument set is empty — including the
   09:00–09:07 window, where most equities have not printed.
 - Changes depth-200 under cover of this quote.
+
+### 2026-09-11 (SECOND) — THE VENDOR DOCUMENTATION SETTLES THE UNSUBSCRIBE CODE: it is 25, and 24 exists nowhere
+
+**The operator's instruction (2026-09-11, with four Dhan PDFs and a complete
+10,263-line documentation dump attached — preserve EXACTLY, typos included):**
+
+> "even take this also for reference and cross verification dude okay? i dont have the confidnece how wdo you assur eme dude i ene dth real tiem proevn gauarbteed assured verificatio n dude okay?"
+
+He supplied the vendor's own current documentation and asked for cross
+verification rather than assertion. This section is that cross verification, and
+it **overturns the 2026-09-10 change made by this repository.**
+
+#### What the vendor's own documentation says
+
+Pulled from `docs.dhanhq.co` on 2026-09-11 at 9:05 PM and supplied by the
+operator. The Annexure's **Feed Request Code** table, verbatim and complete:
+
+| Code | Action |
+|---|---|
+| 11 | Connect Feed |
+| 12 | Disconnect Feed |
+| 15 / 16 | Subscribe / Unsubscribe — Ticker Packet |
+| 17 / 18 | Subscribe / Unsubscribe — Quote Packet |
+| 21 / 22 | Subscribe / Unsubscribe — Full Packet |
+| **23** | **Subscribe — Full Market Depth** |
+| **25** | **Unsubscribe — Full Market Depth** |
+
+**The table skips 24.** And a search for the literal `24` as a request code
+across **all 10,263 lines** of the complete v2 documentation returns **ZERO**.
+
+The Full Market Depth guide itself is narrower still: it documents
+`RequestCode 23` (subscribe, in two payload shapes — the 20-level LIST form and
+the 200-level FLAT form) and `RequestCode 12` (**Feed Disconnect** — close the
+whole socket). It shows **no unsubscribe example at all**, and its own "Response
+Fields" tables list `Values: 23` and nothing else.
+
+#### What this overturns
+
+The 2026-09-10 section above changed the constant 25 → 24 and justified it:
+*"24 is not a guess: it is the ONLY other value either vendor surface names. The
+classic annexure page (stable across every crawl since 2026-06-02) lists
+`24 | Unsubscribe - Full Market Depth`."* **The operator's fresh pull refutes
+that.** 24 is named by no vendor surface in the documentation he supplied, and
+what shipped on 2026-09-10 was therefore an **undocumented code**.
+
+The constant is restored to **25** in the same change as this section, along
+with the three rule files and the builder docblock that carried the 24 claim.
+
+#### Why the restore is right even though 25 does not work either
+
+Both codes are now proven ignored, and — the load-bearing fact — **they fail
+IDENTICALLY**: 80 `unsubscribe_ignored` lines, split 40/40 across depth-20 and
+depth-200, on all ten sockets, every socket reaching
+`GHOST_REDIAL_SESSION_CEILING`, on each of two consecutive sessions. A code that
+was merely *wrong* would be expected to differ from another wrong code in at
+least one dimension. **Two byte-identical signatures is the evidence that the
+RequestCode is not the variable.**
+
+When neither value works, the value's job changes. It stops being *"make it
+work"* and becomes *"make the vendor ticket unarguable"* — and
+*"we send the code your own annexure documents, and you ignore it"* is
+unarguable, while *"we send 24"* invites the reply *"24 is not a code"*. Shipping
+the documented value is also the only position that survives Dhan implementing
+the unsubscribe later without us noticing.
+
+#### Two further facts from the same documents, recorded because they close open questions
+
+1. **Depth breaks the `subscribe_code + 1` rule, by the vendor's own table.**
+   Ticker 15→16, Quote 17→18, Full 21→22, but depth 23→**25**. That asymmetry is
+   the vendor's, is now pinned by test, and must not be "corrected" back to 24 by
+   a future reader restoring the pattern.
+2. **Dhan documents no per-instrument depth unsubscribe in the depth guide at
+   all** — only `12`, which closes the socket. That is consistent with the wire
+   behaviour we measured, and it means **disconnect-and-resubscribe may be the
+   only mechanism the vendor actually implements** for changing a depth socket's
+   set. That bears directly on the socket-layout question and is recorded here
+   rather than left to be rediscovered.
+
+#### ⚠ What is NOT claimed
+
+That 25 works. It does not. This change does not stop a single ghost packet, and
+the depth sockets will keep receiving contracts this process unsubscribed until
+Dhan honours the request or the redial rebuilds the socket. The verdict
+instrument is unchanged: a session reading `ghost = 0` with
+`unsubscribed_grace > 0` on `tv_dhan_feed_depth_total`.
+
+**The apply cadence still does NOT move**, and the vendor ticket remains the
+only real remedy — now with the vendor's own annexure as its first exhibit.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Ships 24, or any other value absent from the vendor's Feed Request Code table.
+- "Restores" the `subscribe_code + 1` pattern for depth — the vendor's table
+  goes 23 → 25, and a test pins the asymmetry.
+- Ships a third guessed code instead of opening the vendor ticket.
+- Cites the 2026-09-10 section's "the classic annexure lists 24" claim without
+  re-pulling the documentation — that claim is refuted by the operator's own
+  2026-09-11 full-doc pull.
+- Reports the restore as a fix for the ghosts. It is a correctness fix for what
+  we SEND, not a repair of what Dhan DOES.
