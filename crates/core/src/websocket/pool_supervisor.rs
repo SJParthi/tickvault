@@ -1611,13 +1611,28 @@ impl ConnectionSupervisor {
     ///
     /// # Bounded by DATA, not by a branch that cannot be taken
     ///
-    /// Today [`ParkReason::allows_one_respawn`] answers `false` for every
-    /// reason, so the respawn arm is unreachable in production and the counter
-    /// below registers no series at all (see `PoolSupervisor::new`, which
-    /// pre-registers only reasons that can actually emit — the same discipline
-    /// that keeps `FlapVerdict::Ladder` off the damper counter). That is the
-    /// honest shape: the eligibility TABLE is empty, the mechanism is not
-    /// broken, and nothing publishes a metric that can never move.
+    /// The eligibility TABLE is the bound, not a branch that cannot be taken:
+    /// `PoolSupervisor::new` pre-registers only reasons that can actually emit
+    /// — the same discipline that keeps `FlapVerdict::Ladder` off the damper
+    /// counter — so the counter below never publishes a series that can never
+    /// move.
+    ///
+    /// ⚠ CORRECTED 2026-09-11. This paragraph read: *"Today
+    /// `allows_one_respawn` answers `false` for every reason, so the respawn
+    /// arm is unreachable in production and the counter below registers no
+    /// series at all."* That was true when written and stopped being true on
+    /// **2026-09-10**, when 804 left the Fatal arm:
+    /// [`ParkReason::SubscriptionRejected`] now answers `true` and is the one
+    /// eligible reason in this tree. So the respawn arm IS reachable, and
+    /// exactly one `RESPAWN_METRIC` series per endpoint registers its
+    /// baseline.
+    ///
+    /// The DESIGN is untouched and it worked exactly as the old text promised
+    /// — the pre-registration loop is data-driven, so the baseline appeared
+    /// with no further edit the day a reason became eligible. Only the
+    /// present-tense claim was stale, and it was stale in the reassuring
+    /// direction: a reader checking whether a respawn is observable would have
+    /// concluded it is not, and gone to build a counter that already exists.
     fn park(&mut self, reason: ParkReason, now: Instant) -> SupervisorAction {
         if respawn_budget_allows(reason.allows_one_respawn(), self.respawn_used) {
             // One-shot: consumed BEFORE the redial, so a second fatal on this
@@ -3278,14 +3293,22 @@ impl PoolSupervisor {
                 .increment(0);
             }
             // Same baseline discipline for the respawn counter, and the same
-            // carve-out: only reasons that can ACTUALLY emit are registered.
-            // `allows_one_respawn` answers `false` for every reason today, so
-            // this registers nothing at all — which is the correct outcome, not
-            // a gap. A pre-registered `tv_dhan_ws_park_respawn_total` sitting
-            // at zero forever would be a series that can never move, the exact
-            // lie the `FlapVerdict::Ladder` carve-out below refuses to tell.
-            // The day a reason becomes eligible, its baseline appears here with
-            // no further edit.
+            // carve-out: only reasons that can ACTUALLY emit are registered. A
+            // pre-registered `tv_dhan_ws_park_respawn_total` sitting at zero
+            // forever would be a series that can never move, the exact lie the
+            // `FlapVerdict::Ladder` carve-out below refuses to tell.
+            //
+            // ⚠ CORRECTED 2026-09-11. This comment read "`allows_one_respawn`
+            // answers `false` for every reason today, so this registers nothing
+            // at all", and closed "the day a reason becomes eligible, its
+            // baseline appears here with no further edit". That day was
+            // 2026-09-10: 804 left the Fatal arm and
+            // `ParkReason::SubscriptionRejected` now answers `true`. The
+            // promise held — this loop is data-driven, so exactly one series
+            // per endpoint began registering with no code change. The only
+            // thing that went stale is the sentence, and it went stale in the
+            // reassuring direction, telling a reader the counter can never
+            // move at the moment it started moving.
             for reason in ParkReason::ALL {
                 if reason.allows_one_respawn() {
                     metrics::counter!(
