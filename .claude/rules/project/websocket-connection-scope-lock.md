@@ -2959,6 +2959,41 @@ swaps from 09:16 IST) is that probe, and it answered in the OTHER direction:
 > SecurityId for every contract cited", and today that requirement cannot be met
 > from our telemetry. Adding `security_id` + `segment` to the ghost line is the
 > prerequisite for a ticket that names contracts; it is NOT fixed here.
+>
+> > ##### ✅ RESOLVED 2026-09-11 (same day) — and it was TWO sites, not one
+> >
+> > The paragraph above names the ghost line. Acting on it found the gap has a
+> > second half, and the second half is the one that mattered more:
+> >
+> > | Site | Logged before | What its silence cost |
+> > |---|---|---|
+> > | the ghost `error!` (`dhan_feed_stack.rs`) | connection, endpoint, `ghost_packets`, `redials_taken` | which contract was still arriving |
+> > | the unsubscribe **SUCCESS** arm (`pool_supervisor.rs`) | **nothing at all** | which contract we asked to drop, and *when*, and *with which request code* |
+> >
+> > Only the REFUSAL arm named an instrument — and a refusal is the case that
+> > did not happen. **All 160 ignored unsubscribes across the code-25 and
+> > code-24 sessions took the silent path**, so there was no record of the ask
+> > to pair the ghost against.
+> >
+> > Both now carry `security_id` + `segment`; the success arm additionally
+> > carries `request_code`, because **25 and 24 have BOTH shipped** and a
+> > session's evidence is worthless if the reader has to guess which binary
+> > produced it. Pinned by
+> > `crates/app/tests/ghost_instrument_named_guard.rs` (5 tests, both sites
+> > bite-proven in both directions).
+> >
+> > **It also answers the question the log could not.** The 2026-09-10 record
+> > states plainly that the log *"CANNOT distinguish (a) the same contract
+> > surviving 8 reconnects from (b) 8 different contracts each newly ignored"* —
+> > opposite diagnoses, and no counter separates them. A named id does.
+> >
+> > **NOT claimed:** that this stops a ghost, changes a request code, or makes
+> > Dhan honour an unsubscribe. It makes the failure *reportable*. The vendor
+> > ticket the section above calls for stays the remedy; this is the evidence
+> > it needs. Cost: zero new metric, zero alarm, zero EMF name — one `info!`
+> > at the measured swap rate (~9,500 lines a session, ~24 a minute) and two
+> > fields on an `error!` that is already throttled to once per socket per
+> > 180 s cooldown.
 
 A socket that was told to drop a contract kept receiving it past the 90 s grace,
 on every socket that swapped, every time. **Dhan did not honour a single code-25

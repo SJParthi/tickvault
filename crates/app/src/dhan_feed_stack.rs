@@ -5458,11 +5458,28 @@ async fn run_frame_drain(
                                     ) {
                                         Ok(()) => {
                                             c.depth_ghost_redials.increment(1);
+                                            // The two sentinels are unreachable
+                                            // by construction (the Ghost arm
+                                            // always records the id before
+                                            // `outcome.ghost` can exceed zero)
+                                            // and are spelled out rather than
+                                            // unwrapped: a 0 security_id and a
+                                            // u8::MAX segment are both values
+                                            // this codebase already reads as
+                                            // "absent", so a future refactor
+                                            // that breaks the invariant reports
+                                            // the break instead of panicking on
+                                            // the drain.
+                                            let (ghost_security_id, ghost_segment) = outcome
+                                                .ghost_instrument
+                                                .unwrap_or((0_u64, u8::MAX));
                                             error!(
                                                 code = ErrorCode::WsGapSubscriptionBatching.code_str(),
                                                 source = "unsubscribe_ignored",
                                                 connection_index = frame.connection_index,
                                                 endpoint = frame.endpoint.as_str(),
+                                                security_id = ghost_security_id,
+                                                segment = ghost_segment,
                                                 ghost_packets = outcome.ghost,
                                                 redials_taken = ghost_redials_taken(frame.connection_index),
                                                 "a depth socket is still delivering an instrument it was told to \
@@ -6653,6 +6670,36 @@ pub struct DepthFrameOutcome {
     /// Packets for an instrument this process dropped whose grace elapsed
     /// (`DepthFrameClass::Ghost`). Non-zero asks the socket to redial.
     pub ghost: u64,
+    /// The FIRST ghosting instrument in this frame, as `(security_id,
+    /// exchange_segment_code)`.
+    ///
+    /// WHY THIS EXISTS. Across the two full sessions that proved Dhan ignores
+    /// the depth unsubscribe — code 25 on 2026-09-10, code 24 on 2026-09-11,
+    /// 80 `unsubscribe_ignored` lines each, split 40/40 across both depth
+    /// endpoints and all ten sockets — this process could not say WHICH
+    /// contract ghosted. The log line carried `connection_index`,
+    /// `endpoint`, `ghost_packets` and `redials_taken`, and no instrument
+    /// identifier at all. The operator's own Dhan-support workflow requires
+    /// "precise contract labels … SecurityId for every contract cited", and
+    /// that requirement could not be met from our own telemetry.
+    ///
+    /// It also settles the question the log could not answer: whether the
+    /// same contract survived eight redials, or eight different contracts
+    /// were each newly ignored. Those have opposite diagnoses and the
+    /// existing counters cannot distinguish them.
+    ///
+    /// FIRST, not all: a frame stacks packets, and holding every ghosting id
+    /// would need a collection on the drain. One `Option<(u64, u8)>` is
+    /// `Copy`, sits in the outcome the frame already returns, and costs the
+    /// hot path a single move. The `error!` it feeds is itself throttled to
+    /// once per socket per 180 s cooldown, so a second id in the same frame
+    /// would have nowhere to go.
+    ///
+    /// `u64`, not `u32`: the §28.1 lift widened the shared id space, and a
+    /// narrower field here would reintroduce exactly the silent truncation
+    /// that widening removed — the same reasoning `SubscribeInstrument`
+    /// records at its own `security_id`.
+    pub ghost_instrument: Option<(u64, u8)>,
     /// Packets for an instrument dropped inside the grace window.
     pub unsubscribed_grace: u64,
 }
@@ -7356,6 +7403,13 @@ fn drain_depth_frame(
                 crate::depth_subscription_view::DepthFrameClass::Ghost => {
                     out.ghost = out.ghost.saturating_add(1);
                     c.depth_ghost.increment(1);
+                    // FIRST ghost of the frame wins, so the id reported is the
+                    // one whose packet earned the redial rather than whichever
+                    // packet happened to be last in the frame. `get_or_insert`
+                    // rather than assignment for exactly that reason.
+                    let _ = out
+                        .ghost_instrument
+                        .get_or_insert((header.security_id, header.exchange_segment_code));
                 }
                 crate::depth_subscription_view::DepthFrameClass::RecentlyDropped => {
                     out.unsubscribed_grace = out.unsubscribed_grace.saturating_add(1);
