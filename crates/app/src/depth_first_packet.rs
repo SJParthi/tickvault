@@ -7,7 +7,7 @@
 //! does that take?* Every number this repository could offer was a BUDGET, not
 //! a measurement — [`SWAP_WIRE_BUDGET`] is a one-second ceiling per side, the
 //! transport's own send timeout is ten seconds, and the per-socket pending gate
-//! holds the real rate to one swap per socket per minute. None of those is the
+//! holds the real rate to at most 4 swaps per socket per minute on depth-20 (`DEPTH_SWAP_COMMAND_CHANNEL_DEPTH`) and 5 pool-wide per minute on depth-200. None of those is the
 //! answer. They bound how long we WAIT; they say nothing about how long Dhan
 //! takes to start delivering the new book.
 //!
@@ -59,7 +59,14 @@
 //!
 //! * [`DepthFirstPacketTracker::observe_at`] — the hot path, once per depth
 //!   PACKET, never per level. **One relaxed atomic load** when nothing is
-//!   pending, which is the overwhelming majority of the session. While a swap
+//!   pending. ⚠ Do NOT read that as "almost always": the gate is a single
+//!   PROCESS-WIDE counter, an entry lives up to `FIRST_PACKET_WINDOW_SECS`
+//!   (120 s) and the sweep runs only once a minute, so at the measured
+//!   2026-09-11 rate (9,461 swaps over ~385 min ≈ 24.6/min) the pending set
+//!   is expected to be NON-EMPTY for most of a trading session — and after
+//!   the measured 09:50 delivery cliff, when no new contract delivered at
+//!   all, permanently so. The honest statement is that the idle path is
+//!   cheap, not that it is the common one. While a swap
 //!   is outstanding it is that load plus exactly ONE `papaya` probe — the
 //!   removal IS the read, so the packet that resolves a subscribe costs the
 //!   same single probe as one that does not. Zero allocation on every arm.
@@ -68,11 +75,15 @@
 //! * [`DepthFirstPacketTracker::sweep_expired_at`] — O(pending), bounded by
 //!   [`MAX_PENDING`], once a minute on the steering task. Never on the drain.
 //!
-//! The metric emissions sit on the swap path, not the packet path: the
-//! histogram fires once per resolved subscribe (a handful per minute), so the
-//! `record_ws_lag` lesson — a label value that is not a literal drops
-//! `metrics::histogram!` to its allocating arm — is not load-bearing here, and
-//! every label value below is a `&'static str` regardless.
+//! ⚠ The `arrived` counter and the histogram emit from `observe_at`, i.e. ON
+//! THE DRAIN — an earlier version of this header said they "sit on the swap
+//! path, not the packet path", which is false and pointed an auditor away
+//! from the hot path. What is true is the RATE, and that is what makes it
+//! safe: they fire only on the single packet that RESOLVES a subscribe (a
+//! handful per minute), never per packet. Both label values are string
+//! LITERALS, so the `record_ws_lag` trap — a non-literal label value dropping
+//! `metrics::histogram!` to its allocating arm, ~36M allocations/hour — does
+//! not apply here.
 //!
 //! # Observability boundary (deliberate, and it is a cost decision)
 //!
@@ -89,11 +100,32 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use papaya::HashMap as PapayaHashMap;
 use tickvault_common::types::ExchangeSegment;
+use tickvault_core::parser::depth::DepthFeedKind;
 
-/// The I-P1-11 composite key, as the wire byte so it is `Copy` — the same
-/// shape `depth_subscription_view` uses, so a contract hashes identically in
-/// both and the two cannot disagree about what instrument a packet is.
-type Key = (u64, u8);
+/// The I-P1-11 composite key: `(security_id, WIRE segment code, pool)`.
+///
+/// The segment byte MUST be [`ExchangeSegment::binary_code`], never
+/// `segment as u8`. Dhan's annexure has **no enum 6 or 7** — `BSE_FNO` is
+/// `8` — so declaration order and the wire code diverge for the last two
+/// variants (`BseCurrency` 6 vs 7, `BseFno` 7 vs 8). The drain looks a packet
+/// up by `header.exchange_segment_code`, the wire byte, so a stamp keyed on
+/// the discriminant could never be resolved for those segments. Pinned by
+/// `the_stamp_key_is_the_wire_code_for_every_segment`.
+///
+/// The POOL byte is what stops depth-200's already-streaming packet from
+/// resolving depth-20's fresh subscribe: the two pools draw from the same
+/// gainer-ordered list, so the same contract is routinely held by both, and
+/// without this byte the first arrival on EITHER socket would answer the
+/// other's stamp and record a fabricated near-zero latency.
+type Key = (u64, u8, u8);
+
+/// Pool byte for [`Key`]. Values are arbitrary but must be distinct and stable.
+const fn pool_code(kind: DepthFeedKind) -> u8 {
+    match kind {
+        DepthFeedKind::Twenty => 20,
+        DepthFeedKind::TwoHundred => 200,
+    }
+}
 
 /// Nanoseconds in a second, as the signed type both clocks are carried in.
 const NANOS_PER_SEC: i64 = 1_000_000_000;
@@ -130,7 +162,7 @@ pub const FIRST_PACKET_WINDOW_SECS: i64 = 120;
 
 /// Fail-closed bound on the pending map.
 ///
-/// The real rate is one swap per socket per minute across ten depth sockets
+/// The real rate is at most 4 swaps per socket per minute on depth-20 (`DEPTH_SWAP_COMMAND_CHANNEL_DEPTH`) and 5 pool-wide per minute on depth-200 across ten depth sockets
 /// (the unreconciled-ack gate in `depth20_track` and its depth-200 twin), and
 /// an entry lives at most [`FIRST_PACKET_WINDOW_SECS`], so the expected
 /// occupancy is tens. 1,024 is a bound against a shape nobody has designed,
@@ -155,6 +187,17 @@ pub struct DepthFirstPacketTracker {
     pending_count: AtomicUsize,
 }
 
+/// Nanoseconds to milliseconds as a FLOAT.
+///
+/// `(elapsed / NANOS_PER_MILLI) as f64` — the form this replaced — divides as
+/// INTEGERS and only then widens, so every arrival under one millisecond
+/// records as `0.0`. The fast end is the end this instrument exists to see,
+/// so the truncation destroyed exactly the resolution that matters. Pinned by
+/// `elapsed_nanos_to_millis_keeps_sub_millisecond_resolution`.
+fn elapsed_nanos_to_millis(elapsed_nanos: i64) -> f64 {
+    elapsed_nanos as f64 / NANOS_PER_MILLI as f64
+}
+
 impl DepthFirstPacketTracker {
     /// An empty tracker.
     #[must_use]
@@ -173,9 +216,16 @@ impl DepthFirstPacketTracker {
     /// arrival the next packet answers, and keeping the older stamp would
     /// report a latency spanning a window the contract was not even subscribed
     /// for.
-    pub fn record_subscribe_at(&self, security_id: u64, segment: ExchangeSegment, at_nanos: i64) {
+    pub fn record_subscribe_at(
+        &self,
+        security_id: u64,
+        segment: ExchangeSegment,
+        pool: DepthFeedKind,
+        at_nanos: i64,
+    ) {
         let pinned = self.pending.pin();
-        let key = (security_id, segment as u8);
+        // `binary_code()`, NOT `segment as u8` — see the `Key` docblock.
+        let key = (security_id, segment.binary_code(), pool_code(pool));
         if pinned.get(&key).is_none() && self.pending_count.load(Ordering::Relaxed) >= MAX_PENDING {
             metrics::counter!(FIRST_PACKET_OUTCOME, "outcome" => "refused").increment(1);
             return;
@@ -191,7 +241,13 @@ impl DepthFirstPacketTracker {
     /// resolves it, and `None` on every other packet — which is almost all of
     /// them. The caller does not have to do anything with the value; the
     /// histogram is emitted here so no call site can forget it.
-    pub fn observe_at(&self, security_id: u64, segment_code: u8, at_nanos: i64) -> Option<i64> {
+    pub fn observe_at(
+        &self,
+        security_id: u64,
+        segment_code: u8,
+        pool: DepthFeedKind,
+        at_nanos: i64,
+    ) -> Option<i64> {
         // The whole point of this load: a session with no swap outstanding
         // pays exactly this and returns.
         if self.pending_count.load(Ordering::Relaxed) == 0 {
@@ -205,7 +261,7 @@ impl DepthFirstPacketTracker {
         // arrival, so a second thread cannot double-count it. A `get` first
         // would let both threads read the stamp and then have one lose the
         // claim, which costs a probe and buys nothing.
-        let subscribed_at = *pinned.remove(&(security_id, segment_code))?;
+        let subscribed_at = *pinned.remove(&(security_id, segment_code, pool_code(pool)))?;
         self.pending_count.fetch_sub(1, Ordering::Relaxed);
         // Saturating, and a backward clock step yields zero rather than a
         // negative latency. A negative sample in a histogram is not a small
@@ -214,7 +270,10 @@ impl DepthFirstPacketTracker {
         // for.
         let elapsed = at_nanos.saturating_sub(subscribed_at).max(0);
         metrics::counter!(FIRST_PACKET_OUTCOME, "outcome" => "arrived").increment(1);
-        metrics::histogram!(FIRST_PACKET_LATENCY_MS).record((elapsed / NANOS_PER_MILLI) as f64);
+        // FLOAT division. `(elapsed / NANOS_PER_MILLI) as f64` divides as
+        // INTEGERS first, so every sub-millisecond arrival records as 0.0 —
+        // and the fast end is the end this instrument exists to see.
+        metrics::histogram!(FIRST_PACKET_LATENCY_MS).record(elapsed_nanos_to_millis(elapsed));
         Some(elapsed)
     }
 
@@ -288,7 +347,12 @@ mod tests {
     fn observe_at_measures_nothing_for_an_unawaited_contract() {
         let tracker = DepthFirstPacketTracker::new();
         assert_eq!(
-            tracker.observe_at(1, ExchangeSegment::NseFno as u8, T0),
+            tracker.observe_at(
+                1,
+                ExchangeSegment::NseFno.binary_code(),
+                DepthFeedKind::Twenty,
+                T0
+            ),
             None
         );
         assert_eq!(tracker.pending_len(), 0);
@@ -297,11 +361,12 @@ mod tests {
     #[test]
     fn observe_at_yields_the_interval_on_the_first_packet_after_a_subscribe() {
         let tracker = DepthFirstPacketTracker::new();
-        tracker.record_subscribe_at(42, ExchangeSegment::NseFno, T0);
+        tracker.record_subscribe_at(42, ExchangeSegment::NseFno, DepthFeedKind::Twenty, T0);
         assert_eq!(tracker.pending_len(), 1);
         let measured = tracker.observe_at(
             42,
-            ExchangeSegment::NseFno as u8,
+            ExchangeSegment::NseFno.binary_code(),
+            DepthFeedKind::Twenty,
             T0 + 350 * NANOS_PER_MILLI,
         );
         assert_eq!(measured, Some(350 * NANOS_PER_MILLI));
@@ -311,15 +376,25 @@ mod tests {
     #[test]
     fn only_the_first_packet_measures_and_the_rest_are_free() {
         let tracker = DepthFirstPacketTracker::new();
-        tracker.record_subscribe_at(42, ExchangeSegment::NseFno, T0);
+        tracker.record_subscribe_at(42, ExchangeSegment::NseFno, DepthFeedKind::Twenty, T0);
         assert!(
             tracker
-                .observe_at(42, ExchangeSegment::NseFno as u8, T0 + NANOS_PER_MILLI)
+                .observe_at(
+                    42,
+                    ExchangeSegment::NseFno.binary_code(),
+                    DepthFeedKind::Twenty,
+                    T0 + NANOS_PER_MILLI
+                )
                 .is_some()
         );
         for _ in 0..5 {
             assert_eq!(
-                tracker.observe_at(42, ExchangeSegment::NseFno as u8, T0 + NANOS_PER_SEC),
+                tracker.observe_at(
+                    42,
+                    ExchangeSegment::NseFno.binary_code(),
+                    DepthFeedKind::Twenty,
+                    T0 + NANOS_PER_SEC
+                ),
                 None,
                 "a second measurement would double-count one arrival"
             );
@@ -331,9 +406,14 @@ mod tests {
         // I-P1-11: Dhan reuses the same number across segments. A packet for
         // the BSE contract must not resolve the NSE one's subscribe.
         let tracker = DepthFirstPacketTracker::new();
-        tracker.record_subscribe_at(27, ExchangeSegment::NseFno, T0);
+        tracker.record_subscribe_at(27, ExchangeSegment::NseFno, DepthFeedKind::Twenty, T0);
         assert_eq!(
-            tracker.observe_at(27, ExchangeSegment::BseFno as u8, T0 + NANOS_PER_SEC),
+            tracker.observe_at(
+                27,
+                ExchangeSegment::BseFno.binary_code(),
+                DepthFeedKind::Twenty,
+                T0 + NANOS_PER_SEC
+            ),
             None
         );
         assert_eq!(
@@ -343,7 +423,12 @@ mod tests {
         );
         assert!(
             tracker
-                .observe_at(27, ExchangeSegment::NseFno as u8, T0 + NANOS_PER_SEC)
+                .observe_at(
+                    27,
+                    ExchangeSegment::NseFno.binary_code(),
+                    DepthFeedKind::Twenty,
+                    T0 + NANOS_PER_SEC
+                )
                 .is_some()
         );
     }
@@ -351,7 +436,7 @@ mod tests {
     #[test]
     fn sweep_expired_at_gives_up_on_a_contract_dark_past_the_window() {
         let tracker = DepthFirstPacketTracker::new();
-        tracker.record_subscribe_at(7, ExchangeSegment::NseFno, T0);
+        tracker.record_subscribe_at(7, ExchangeSegment::NseFno, DepthFeedKind::Twenty, T0);
         assert_eq!(
             tracker.sweep_expired_at(T0 + (FIRST_PACKET_WINDOW_SECS - 1) * NANOS_PER_SEC),
             0,
@@ -367,11 +452,20 @@ mod tests {
     #[test]
     fn record_subscribe_at_restamps_rather_than_keeping_the_older_clock() {
         let tracker = DepthFirstPacketTracker::new();
-        tracker.record_subscribe_at(7, ExchangeSegment::NseFno, T0);
-        tracker.record_subscribe_at(7, ExchangeSegment::NseFno, T0 + 10 * NANOS_PER_SEC);
+        tracker.record_subscribe_at(7, ExchangeSegment::NseFno, DepthFeedKind::Twenty, T0);
+        tracker.record_subscribe_at(
+            7,
+            ExchangeSegment::NseFno,
+            DepthFeedKind::Twenty,
+            T0 + 10 * NANOS_PER_SEC,
+        );
         assert_eq!(tracker.pending_len(), 1, "one contract, one entry");
-        let measured =
-            tracker.observe_at(7, ExchangeSegment::NseFno as u8, T0 + 11 * NANOS_PER_SEC);
+        let measured = tracker.observe_at(
+            7,
+            ExchangeSegment::NseFno.binary_code(),
+            DepthFeedKind::Twenty,
+            T0 + 11 * NANOS_PER_SEC,
+        );
         assert_eq!(
             measured,
             Some(NANOS_PER_SEC),
@@ -382,9 +476,14 @@ mod tests {
     #[test]
     fn a_backward_clock_step_yields_zero_never_a_negative_sample() {
         let tracker = DepthFirstPacketTracker::new();
-        tracker.record_subscribe_at(7, ExchangeSegment::NseFno, T0);
+        tracker.record_subscribe_at(7, ExchangeSegment::NseFno, DepthFeedKind::Twenty, T0);
         assert_eq!(
-            tracker.observe_at(7, ExchangeSegment::NseFno as u8, T0 - NANOS_PER_SEC),
+            tracker.observe_at(
+                7,
+                ExchangeSegment::NseFno.binary_code(),
+                DepthFeedKind::Twenty,
+                T0 - NANOS_PER_SEC
+            ),
             Some(0)
         );
     }
@@ -393,7 +492,7 @@ mod tests {
     fn record_subscribe_at_is_bounded_and_the_refusal_is_counted() {
         let tracker = DepthFirstPacketTracker::new();
         for id in 0..(MAX_PENDING as u64 + 50) {
-            tracker.record_subscribe_at(id, ExchangeSegment::NseFno, T0);
+            tracker.record_subscribe_at(id, ExchangeSegment::NseFno, DepthFeedKind::Twenty, T0);
         }
         assert_eq!(
             tracker.pending_len(),
@@ -409,12 +508,22 @@ mod tests {
         // contract on a stale clock.
         let tracker = DepthFirstPacketTracker::new();
         for id in 0..MAX_PENDING as u64 {
-            tracker.record_subscribe_at(id, ExchangeSegment::NseFno, T0);
+            tracker.record_subscribe_at(id, ExchangeSegment::NseFno, DepthFeedKind::Twenty, T0);
         }
-        tracker.record_subscribe_at(0, ExchangeSegment::NseFno, T0 + 5 * NANOS_PER_SEC);
+        tracker.record_subscribe_at(
+            0,
+            ExchangeSegment::NseFno,
+            DepthFeedKind::Twenty,
+            T0 + 5 * NANOS_PER_SEC,
+        );
         assert_eq!(tracker.pending_len(), MAX_PENDING);
         assert_eq!(
-            tracker.observe_at(0, ExchangeSegment::NseFno as u8, T0 + 6 * NANOS_PER_SEC),
+            tracker.observe_at(
+                0,
+                ExchangeSegment::NseFno.binary_code(),
+                DepthFeedKind::Twenty,
+                T0 + 6 * NANOS_PER_SEC
+            ),
             Some(NANOS_PER_SEC),
             "the re-stamp took effect"
         );
@@ -430,10 +539,15 @@ mod tests {
     fn pending_len_counts_awaited_subscribes_and_falls_as_they_resolve() {
         let tracker = DepthFirstPacketTracker::new();
         assert_eq!(tracker.pending_len(), 0);
-        tracker.record_subscribe_at(1, ExchangeSegment::NseFno, T0);
-        tracker.record_subscribe_at(2, ExchangeSegment::NseFno, T0);
+        tracker.record_subscribe_at(1, ExchangeSegment::NseFno, DepthFeedKind::Twenty, T0);
+        tracker.record_subscribe_at(2, ExchangeSegment::NseFno, DepthFeedKind::Twenty, T0);
         assert_eq!(tracker.pending_len(), 2);
-        tracker.observe_at(1, ExchangeSegment::NseFno as u8, T0 + NANOS_PER_MILLI);
+        tracker.observe_at(
+            1,
+            ExchangeSegment::NseFno.binary_code(),
+            DepthFeedKind::Twenty,
+            T0 + NANOS_PER_MILLI,
+        );
         assert_eq!(tracker.pending_len(), 1);
     }
     #[test]
@@ -452,5 +566,90 @@ mod tests {
         assert!(FIRST_PACKET_OUTCOMES.contains(&"silent_window"));
         assert!(FIRST_PACKET_OUTCOMES.contains(&"refused"));
         pre_register_first_packet_counters();
+    }
+
+    /// The bug this pins: `record_subscribe_at` keyed on `segment as u8`
+    /// while the drain looks a packet up by `header.exchange_segment_code`,
+    /// the WIRE byte. Dhan's annexure has no enum 6 or 7 — `BSE_FNO` is 8 —
+    /// so the two diverge for the last two variants and a BSE_FNO subscribe
+    /// could NEVER be resolved. The old I-P1-11 test used `as u8` on both
+    /// sides, so it compared 7 against 7 and asserted a self-consistent
+    /// falsehood.
+    #[test]
+    fn the_stamp_key_is_the_wire_code_for_every_segment() {
+        for segment in [
+            ExchangeSegment::IdxI,
+            ExchangeSegment::NseEquity,
+            ExchangeSegment::NseFno,
+            ExchangeSegment::NseCurrency,
+            ExchangeSegment::BseEquity,
+            ExchangeSegment::McxComm,
+            ExchangeSegment::BseCurrency,
+            ExchangeSegment::BseFno,
+        ] {
+            let tracker = DepthFirstPacketTracker::new();
+            tracker.record_subscribe_at(7, segment, DepthFeedKind::Twenty, T0);
+            assert_eq!(
+                tracker.observe_at(
+                    7,
+                    segment.binary_code(),
+                    DepthFeedKind::Twenty,
+                    T0 + NANOS_PER_MILLI
+                ),
+                Some(NANOS_PER_MILLI),
+                "a {segment:?} packet must resolve a {segment:?} subscribe — \
+                 the stamp must key on binary_code(), never the discriminant"
+            );
+        }
+    }
+
+    /// Both depth pools draw from the same gainer-ordered list, so one
+    /// contract is routinely held by depth-200 while depth-20 is subscribing
+    /// it. Without the pool byte the already-streaming socket's next packet
+    /// would answer the other pool's fresh stamp and record a fabricated
+    /// near-zero latency — an error in the reassuring direction.
+    #[test]
+    fn a_packet_on_the_other_pool_does_not_resolve_this_pools_subscribe() {
+        let tracker = DepthFirstPacketTracker::new();
+        tracker.record_subscribe_at(42, ExchangeSegment::NseFno, DepthFeedKind::Twenty, T0);
+        assert_eq!(
+            tracker.observe_at(
+                42,
+                ExchangeSegment::NseFno.binary_code(),
+                DepthFeedKind::TwoHundred,
+                T0 + NANOS_PER_MILLI
+            ),
+            None,
+            "a depth-200 packet must not resolve a depth-20 subscribe"
+        );
+        assert_eq!(
+            tracker.pending_len(),
+            1,
+            "the depth-20 subscribe is still awaited"
+        );
+        assert_eq!(
+            tracker.observe_at(
+                42,
+                ExchangeSegment::NseFno.binary_code(),
+                DepthFeedKind::Twenty,
+                T0 + NANOS_PER_MILLI
+            ),
+            Some(NANOS_PER_MILLI),
+            "its own pool still resolves it"
+        );
+    }
+
+    #[test]
+    fn elapsed_nanos_to_millis_keeps_sub_millisecond_resolution() {
+        // The integer form recorded every one of these as 0.0.
+        assert!((elapsed_nanos_to_millis(999_999) - 0.999_999).abs() < 1e-9);
+        assert!((elapsed_nanos_to_millis(1_000) - 0.001).abs() < 1e-12);
+        assert!(
+            elapsed_nanos_to_millis(500_000) > 0.0,
+            "a half-millisecond arrival must not read as zero"
+        );
+        // and the ordinary range is unchanged
+        assert!((elapsed_nanos_to_millis(350 * NANOS_PER_MILLI) - 350.0).abs() < 1e-9);
+        assert_eq!(elapsed_nanos_to_millis(0), 0.0);
     }
 }

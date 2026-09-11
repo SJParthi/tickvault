@@ -535,6 +535,7 @@ pub fn apply_depth20_plan(sockets: &mut [Depth20LiveSocket], plan: &Depth20Plan)
                         .record_subscribe_at(
                             take.security_id,
                             take.segment,
+                            tickvault_core::parser::depth::DepthFeedKind::Twenty,
                             chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
                         );
                     metrics::counter!(DEPTH20_SWAPS_SENT).increment(1);

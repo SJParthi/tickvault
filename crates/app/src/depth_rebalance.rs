@@ -1022,6 +1022,7 @@ fn send_swap(socket: &mut RebalanceSocket, swap: &PlannedSwap) -> bool {
             crate::depth_first_packet::global_depth_first_packet_tracker().record_subscribe_at(
                 swap.new.security_id,
                 swap.new.segment,
+                tickvault_core::parser::depth::DepthFeedKind::TwoHundred,
                 chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
             );
             metrics::counter!(REBALANCE_SWAPS_SENT).increment(1);
