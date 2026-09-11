@@ -3161,3 +3161,130 @@ smaller than written.
 - Repeats "804 parks the socket for the session" without the one-respawn
   correction.
 - Reports the 5,250,076 ghosts as data loss. They are written.
+
+### 2026-09-11 (SECOND) — the depth-200 hysteresis band widens 3 → 15, under the remedy the 2026-09-07 lock already prescribes
+
+**No new authorization is claimed, and none is needed.** The 2026-09-07 section
+legislates for this exact condition in advance, verbatim: *"If the swap budget
+is hit routinely, the answer is a longer window or a hysteresis band on
+entry/exit — NOT reverting to cumulative."* The swap budget is being hit
+routinely. This is that remedy, applied to the pool that is hitting it.
+
+#### The measurement that triggers it
+
+Read from the box, 2026-09-11, one continuous session (process up 08:30:49 IST,
+`NRestarts=0`):
+
+| reading | value |
+|---|---:|
+| `tv_depth_rebalance_swaps_sent_total` — **depth-200 pool, 5 sockets** | **1,799** |
+| Steering cycles in the capture window (23,100 s ÷ 60) | 385 |
+| Swaps per cycle, against `MAX_RANKED_SWAPS_PER_MINUTE` = 5 | **4.67 — 93.5% of the cap** |
+| Mean hold per depth-200 contract | **1.07 minutes** |
+| `tv_depth_rebalance_swaps_refused_total{*}` | **0 for every reason** |
+
+A deep socket held a contract for about one minute all session, and the pool sat
+pressed against its own safety valve. Every refusal counter reads zero — the
+machinery is not misbehaving; it is doing exactly what it was told, 1,799 times.
+
+#### ⚠ A correction to this file's own arithmetic, recorded because it was quoted
+
+The 2026-09-11 depth-subscription review quoted 1,799 as the whole system's swap
+count. **It is the depth-200 pool alone.** depth-20 keeps a separate counter that
+had never been read. Read the same day:
+
+| counter | value |
+|---|---:|
+| `tv_depth20_track_swaps_sent_total` | **7,662** |
+| `tv_depth20_ranked_swaps_total{outcome="planned"}` | 7,662 |
+| `tv_depth20_ranked_swaps_total{outcome="capped"}` | **24,607** |
+| `tv_depth20_ranked_swaps_total{outcome="unplaced"}` | 13,386 |
+| `tv_depth20_ranked_swaps_total{outcome="unfunded_departure"}` | 121 |
+| `tv_depth20_track_swaps_refused_total{*}` | 0 for every reason |
+
+**Both pools together: 9,461 swaps performed against 32,269 wanted — the caps
+refused 76% of the system's own appetite.** Each of the 250 depth-20 slots
+changed contract ~31 times (mean hold ~12.6 minutes), which is far calmer than
+depth-200's 1.07 minutes and is why this change touches depth-200 only.
+
+#### What changes
+
+`DEPTH200_HYSTERESIS_RANKS` 3 → **15**, so `DEPTH200_EXIT_UNDERLYINGS` moves
+8 → **20**. Entry is unchanged at the socket budget of 5.
+
+| | entry | exit | share of the ~208 live F&O underlyings |
+|---|---:|---:|---|
+| before | top 5 | top 8 | a held name lost its socket on falling out of the top **3.8%** |
+| after | top 5 | top 20 | it must fall out of the top **~10%** |
+
+**Nothing else moves.** The socket budget is 5, the instrument budget is 250 + 5,
+the per-minute swap cap is unchanged, placement still comes from the ENTRY set
+only, the ranking cadence is still 5 s and the apply cadence is still once a
+minute. Stock-options-only stands; index options and futures remain banned.
+
+#### Why 15, and the honest limit of the choice
+
+**It is not derived.** Nobody has measured how far an underlying's rank drifts
+between five-second windows — that is the number that would set this exactly,
+and it does not exist. 15 is the first value with a defensible MEANING: *entered
+as one of the five busiest names, keeps its socket until it is no longer among
+the busiest tenth.* Top-8-of-208 is not a statement about a name being busy; at a
+five-second sampling window on stock-option books this file already calls
+*"thinner than FINNIFTY's"*, it is rank noise — and 93.5% of cap is what rank
+noise looks like from the outside.
+
+**The depth-20 ratio is deliberately NOT the model.** That pool enters at 250 and
+exits at 300 — a 1.2× band — and copying the ratio would give depth-200 a band of
+ONE, which is worse than today. The pools differ in the COST of being wrong, not
+in proportion: losing a contract costs depth-20 one slot in 250 and costs
+depth-200 **one socket in five**, on a feed with **no snapshot-on-subscribe**, so
+the replacement book is silent until its next update.
+
+**The cost of being too wide, stated plainly:** the pool can hold names ranked
+16–20 while 6–15 sit unheld, because placement only happens into a socket whose
+contract has left the list entirely. Every such name entered as a top-five, so
+the set is "recently busiest", never arbitrary — and against a measured
+one-minute hold on a book that starts silent, a continuous hold on a
+recently-top-five name is very likely the better capture. **That is a judgement,
+and it is labelled as one.**
+
+#### NOT fixed by this, and it is a second churn source
+
+The published list carries **one contract per underlying**, and the planner keeps
+a socket only while that exact contract is still the list's pick for its name. If
+the underlying stays busy but its busiest STRIKE moves, the held contract falls
+off and the socket swaps — **even though the NAME never left the band.** Widening
+the band does nothing for that case. Keying the keep-test on the underlying
+rather than the contract is a semantic change to what a depth-200 socket
+promises, and it deserves its own decision rather than riding along here.
+
+#### NOT claimed
+
+That this fixes the churn. It is the first measured step, and
+`tv_depth200_ranked_swaps_total{outcome}` against the 1.07-minute mean hold is
+what tunes it: still near the cap next session means still too narrow; swaps
+collapsing to near zero with a stale held set means too wide. **Nothing may be
+reported as fixed until those move.** It also does nothing about the
+unsubscribe-code failure recorded in the section above — ghosts are a property of
+Dhan ignoring the instruction, not of how often we send it, though fewer swaps
+does mean fewer ghosts.
+
+#### The ratchet
+
+`depth200_candidates::tests::the_hysteresis_band_stays_wide_enough_to_mean_the_name_is_still_busy`
+asserts a FLOOR (`DEPTH200_HYSTERESIS_RANKS >= 2 × DEPTH_200_SOCKET_BUDGET`),
+never equality — tuning upward on the next measurement must not fail the build,
+narrowing back toward 3 must. Bite-proven in both directions on 2026-09-11:
+reverting the constant to 3 fails it; restoring 15 passes 85 depth-200 tests and
+the full 2,134-test app suite.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Narrows the band below the ratchet floor without a measurement showing rank
+  drift is small.
+- Widens the band by widening the ENTRY set — entry is the socket budget and
+  stays there; only the keep-test moves.
+- Changes the socket or instrument budgets under cover of this change.
+- Applies the same widening to depth-20, whose 50-rank band measured a 12.6-minute
+  mean hold and zero refusals.
+- Reports the churn as fixed before `tv_depth200_ranked_swaps_total` says so.
