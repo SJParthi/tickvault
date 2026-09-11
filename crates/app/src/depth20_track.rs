@@ -527,6 +527,16 @@ pub fn apply_depth20_plan(sockets: &mut [Depth20LiveSocket], plan: &Depth20Plan)
                     // scan of at most fifty items once a minute is the price
                     // of not depending on that staying true.
                     socket.held.retain(|h| *h != *release);
+                    // Start the dark-window clock for the ARRIVING contract
+                    // (2026-09-11). Stamped here, on the Ok arm only: the
+                    // refused arms below never reach the wire, so a stamp
+                    // there would age out into a false `silent_window`.
+                    crate::depth_first_packet::global_depth_first_packet_tracker()
+                        .record_subscribe_at(
+                            take.security_id,
+                            take.segment,
+                            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                        );
                     metrics::counter!(DEPTH20_SWAPS_SENT).increment(1);
                     sent = sent.saturating_add(1);
                 }

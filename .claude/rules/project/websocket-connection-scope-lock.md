@@ -3288,3 +3288,114 @@ the full 2,134-test app suite.
 - Applies the same widening to depth-20, whose 50-rank band measured a 12.6-minute
   mean hold and zero refusals.
 - Reports the churn as fixed before `tv_depth200_ranked_swaps_total` says so.
+
+### 2026-09-11 — THE DARK WINDOW AFTER A SUBSCRIBE IS MEASURED FOR THE FIRST TIME
+
+**The verbatim operator authorization (2026-09-11, typed directly in-session):**
+
+> "go ahead and add the time to first packet measurement dude okay?"
+
+Given in DIRECT response to a report whose "what I would do next" list opened
+with, verbatim: *"**Measure time-to-first-packet after every subscribe.** One
+timestamp on swap, one on the first depth frame for that contract, one
+histogram."* That is the §28.2/§28.3 authorization shape this repository
+already accepts — a general go-ahead answering an ENUMERATED ask selects the
+enumerated work. Recorded HERE, in the same change as the code, per the
+rule-file-first law.
+
+#### The gap it closes
+
+The operator asked how long a depth-20 resubscribe takes during a swap. Every
+number this repository could offer was a **BUDGET, not a measurement**:
+
+| Number | What it actually is |
+|---|---|
+| `SWAP_WIRE_BUDGET` = 1 s per side | the ceiling we WAIT before giving up |
+| `SUBSCRIBE_SEND_TIMEOUT` = 10 s | the transport's own send ceiling |
+| 1 swap/socket/minute | the rate the unreconciled-ack gate permits |
+
+None answers the question. They bound how long we wait; they say nothing about
+how long Dhan takes to start delivering the new book — and the India feed has
+**no snapshot-on-subscribe** (the "First Tick Snapshot" is documented only on
+the US global-stocks socket), so a freshly subscribed contract is not merely
+late, it is **BLANK until the book next changes**, and nothing in this process
+measured that window.
+
+#### What ships
+
+`crates/app/src/depth_first_packet.rs` — one tracker, four call sites:
+
+| Site | Cadence | Cost |
+|---|---|---|
+| depth-20 dispatch, `Ok(())` arm only | ≤ 5/min | O(1) |
+| depth-200 dispatch, `Ok(())` arm only | ≤ 5/min | O(1) |
+| frame drain, beside the ghost check, **before the level loop** | per depth PACKET | **one relaxed atomic load** when idle; + one hash probe while a swap is outstanding |
+| per-minute sweep, beside the swap-ack reconcile | 1/min | O(pending), capped at `MAX_PENDING` = 1,024 |
+
+Series (local `/metrics` only — see the budget row below):
+`tv_depth_first_packet_latency_ms` (histogram) and
+`tv_depth_first_packet_total{outcome="arrived"|"silent_window"|"refused"}`,
+all three seeded at zero at boot.
+
+#### ⚠ What the number composes — it is NOT a network round-trip
+
+The clock starts when the steering task successfully QUEUES the swap and stops
+at the first depth packet for that contract. Four terms, and only the first two
+are ours: queue wait · the connection task's wire writes · Dhan applying the
+subscription · **time until the contract's book next changes**. The fourth is
+the market's, and on a thin stock option it can be the whole figure. It is
+deliberately the UPPER bound — *how long until data flows again after we decide
+to swap* — because that is the number a fill depends on.
+
+Measuring from DISPATCH rather than from the wire write is also what keeps this
+an app-crate change: the wire write happens on the connection task in `core`,
+and reaching it would thread a clock through the transport for a term already
+bounded by `SWAP_WIRE_BUDGET`.
+
+#### ⚠ Why `silent_window` is not called a failure
+
+A contract with no depth packet inside `FIRST_PACKET_WINDOW_SECS` (120 s) may
+simply not have traded. Naming that "never arrived" would be a claim in the
+ALARMING direction about a book doing nothing wrong — the mislabel class this
+file keeps correcting. What it IS good for is the shape nobody could see
+before: a swap that acknowledged and then delivered nothing at all. With the
+unsubscribe code proven ignored on both 25 (2026-09-10) and 24 (2026-09-11),
+the arrival half is the only half left to check.
+
+#### ⚠ Budget: LOCAL ONLY, and that is the decision not an oversight
+
+No EMF selector entry, no CloudWatch alarm, **$0.00/mo**. The September
+forecast read live 2026-09-06 is **$142.24** against an automatic
+`STOP_EC2_INSTANCES` action line of **$135.00**, and §2.3n of
+`dhan-rest-only-noise-lock-2026-07-14.md` requires the next addition to arrive
+with a LEVER, not a cost note. This change carries no lever, so it carries no
+CloudWatch cost. It is the number an operator reads AFTER an existing page.
+
+#### ⚠ What this does NOT do (Rule 11)
+
+- **It does not make a swap faster.** It reports how long the new contract
+  stays dark. The remedies — a fixed universe that never resubscribes, or a
+  vendor answer on the unsubscribe code — are unchanged.
+- **It does not measure the OTHER 49 instruments' exposure.** While a swap's
+  two wire calls run on the connection task, that task is not polling `recv()`,
+  so every instrument on that socket queues kernel-side. That is a separate
+  measurement and is NOT claimed here.
+- **No live reading exists yet.** The first session with this build is the
+  measurement; until then "a swap takes N ms" is not a claim this repository
+  can make, and the 2 s figure remains a CEILING that has never been observed.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Moves the observation INSIDE the depth level loop (a depth-200 frame carries
+  200 levels; the question has one answer per packet).
+- Drops the `connection_index != u8::MAX` gate (a replayed WAL frame reports a
+  latency against a clock that never ran).
+- Stamps the clock on a REFUSED dispatch arm (ages into a false
+  `silent_window`).
+- Runs the O(pending) sweep on the frame drain.
+- Removes the sweep (a dark contract is never counted, AND the hot-path gate
+  stays above zero for the session, so every depth packet pays a probe).
+- Quotes the histogram as a network round-trip, or as proof a swap is fast —
+  term 4 above is the market's, not ours.
+- Adds an EMF name or alarm for these series without a LEVER in the same
+  change.
