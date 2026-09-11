@@ -529,6 +529,42 @@ impl AggregatorCell {
         if s.is_uninitialised() { None } else { Some(s) }
     }
 
+    /// Re-base every OPEN bucket after the vendor's cumulative counter
+    /// RESTARTED, so a bucket spanning the restart keeps accumulating.
+    ///
+    /// A bucket's volume is `cumulative − bucket_start_cumulative`, and
+    /// `bucket_start_cumulative` is written ONCE, at bucket open. So when the
+    /// counter restarts near zero mid-bucket, that subtraction saturates to 0
+    /// for the rest of the bucket: the widening-only guard below suppresses
+    /// every later value as a regression and the bar's volume FREEZES at its
+    /// pre-restart figure while `tick_count` keeps climbing. On an M60 bucket
+    /// that is up to 59 minutes of volume silently missing from one bar.
+    ///
+    /// Re-anchoring the SLOT's baseline (which is what
+    /// `MultiTfAggregator::consume_tick` does) is necessary and not
+    /// sufficient: it fixes the NEXT bucket and leaves every currently-open
+    /// one frozen. This is the other half.
+    ///
+    /// The new start is `cumulative − volume`, deliberately NOT `cumulative`:
+    /// the bucket has already counted `volume` units and those trades really
+    /// happened, so anchoring at `cumulative` would ERASE them. This choice
+    /// preserves exactly what was counted and lets the bucket keep rising —
+    /// it invents nothing and loses nothing.
+    ///
+    /// Uninitialised slots are skipped: they have no bucket to re-base, and
+    /// the one they open next reads the already-re-anchored baseline.
+    ///
+    /// # Complexity
+    /// O(`TF_COUNT`) — one pass over a fixed-size array, no allocation. Runs
+    /// only on a restart, which is a once-per-session event at most.
+    pub fn rebase_open_buckets(&mut self, cumulative_volume: u64) {
+        for state in &mut self.slots {
+            if state.is_uninitialised() {
+                continue;
+            }
+            state.bucket_start_cumulative = cumulative_volume.saturating_sub(state.volume);
+        }
+    }
     /// Folds one tick into ONE timeframe slot.
     ///
     /// `bucket_start_cumulative` is the instrument's cumulative day volume as
@@ -867,9 +903,35 @@ impl AggregatorCell {
             // Session extremes keep arriving through the first bucket's life,
             // so re-adopt on every tick of it — `day_high` at the bucket's LAST
             // tick is the one that matters, and max/min converge to it.
-            if self.last_sealed[ord].is_uninitialised()
-                && is_days_first_session_bucket(tf, open_start)
-            {
+            // ⚠ 2026-09-11: the `last_sealed[ord].is_uninitialised()` conjunct
+            // was REMOVED, because the 2026-08-28 grid move silently turned it
+            // into a permanent `false` for every continuously-quoted instrument.
+            //
+            // It meant "no bar of this timeframe has sealed yet today", which
+            // was equivalent to "this is the day's first bucket" only while the
+            // grid STARTED at the market open. Since the grid moved to 09:00,
+            // any instrument that ticks during the pre-open seals a bucket
+            // BEFORE 09:15 arrives — so by the time the market-open bucket
+            // opens, `last_sealed` is initialised and the two conditions became
+            // mutually exclusive. The exchange's official day open / high / low
+            // were then never adopted by any bar at all.
+            //
+            // MEASURED on the live box 2026-09-11: security 68407 sealed a
+            // pre-open bucket at 09:09:15, and its 09:15:00 bar carried
+            // high 23,335.0 while the exchange's published day high was already
+            // 23,347.9 — 12.9 points of real session range attributed to no bar
+            // in the table.
+            //
+            // `is_days_first_session_bucket` is already the precise predicate:
+            // it is true for exactly the bucket CONTAINING the market open, on
+            // every timeframe, and it derives the day from `bucket_start`, so it
+            // is self-limiting per day and needs no sealed-state companion. The
+            // 09:15 anchor is deliberately UNCHANGED — the grid question ("where
+            // do buckets start?") and the attribution question ("which bar owns
+            // the day's official open?") have different answers, and the
+            // function's own comment explains why conflating them mis-stamps
+            // the opening bar.
+            if is_days_first_session_bucket(tf, open_start) {
                 adopt_exchange_day_extremes(&mut self.slots[ord], tick);
             } else if attributable {
                 adopt_session_extreme_delta(&mut self.slots[ord], extremes);
@@ -1959,6 +2021,67 @@ mod tests {
             volume: cum_volume,
             ..ParsedTick::default()
         }
+    }
+
+    /// `rebase_open_buckets` keeps what a bucket already counted and lets it
+    /// keep rising across a cumulative RESTART.
+    ///
+    /// BITE PROOF: without the rebase, the second assertion below reads 900
+    /// instead of 50,900 — the bucket freezes at its pre-restart figure and
+    /// never counts another unit for the rest of its life.
+    ///
+    /// The rebase anchors at `cumulative − volume`, never at `cumulative`:
+    /// those 900 units really traded, so anchoring at the restarted counter
+    /// would erase them.
+    #[test]
+    fn rebase_open_buckets_preserves_counted_volume_and_resumes_counting() {
+        let mut cell = AggregatorCell::empty();
+        let strategy = FeedStrategy::DEFAULT;
+
+        // A bucket that has counted 900 units against a near-ceiling counter.
+        cell.consume_tick(
+            TfIndex::M1,
+            &tick_at(OPEN, 100.0, 4_000_000_000),
+            3_999_999_100,
+            strategy,
+            4_000_000_000,
+        );
+        assert_eq!(cell.snapshot(TfIndex::M1).volume, 900);
+
+        // THE RESTART: the vendor's counter comes back near zero.
+        cell.rebase_open_buckets(100_000);
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).volume,
+            900,
+            "the units already counted must survive the rebase"
+        );
+
+        // 50,000 more trade off the RESTARTED counter, in the same bucket.
+        cell.consume_tick(
+            TfIndex::M1,
+            &tick_at(OPEN + 5, 101.0, 150_000),
+            100_000,
+            strategy,
+            150_000,
+        );
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).volume,
+            50_900,
+            "900 before the restart plus 50,000 after it; a frozen bucket \
+             would still read 900"
+        );
+    }
+
+    /// An UNINITIALISED slot has no bucket to re-base, and touching one would
+    /// fabricate a bucket that never opened.
+    #[test]
+    fn rebase_open_buckets_skips_slots_that_have_never_opened() {
+        let mut cell = AggregatorCell::empty();
+        cell.rebase_open_buckets(100_000);
+        assert!(
+            cell.snapshot(TfIndex::M1).is_uninitialised(),
+            "a slot that never opened must stay uninitialised"
+        );
     }
 
     #[test]
