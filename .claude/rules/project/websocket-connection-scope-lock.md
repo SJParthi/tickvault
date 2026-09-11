@@ -3055,3 +3055,109 @@ table, and is therefore deliberately not started here.
   the other direction.
 - Moves `TICK_PERSIST_START_SECS_OF_DAY_IST` off 09:00 under cover of this
   quote — the operator chose the option that leaves the window alone.
+
+### 2026-09-11 — THE CODE-24 VERDICT IS IN, AND IT IS NEGATIVE: Dhan IGNORES 24 TOO
+
+**No new authorization is claimed.** This records the live reading the
+2026-09-10 section explicitly asked for, in the exact terms it set, plus one
+stale claim it carries.
+
+#### The verdict instrument, and what it read
+
+The 2026-09-10 section set the acceptance test verbatim: *"a session that ends
+with `ghost = 0` and `unsubscribed_grace > 0` is the evidence that 24 works."*
+
+Read from the running box at 15:46 IST on 2026-09-11, the first full session on
+the code-24 build:
+
+| counter | value |
+|---|---:|
+| `tv_dhan_feed_depth_total{outcome="ghost"}` | **5,250,076** |
+| `tv_dhan_feed_depth_total{outcome="unsubscribed_grace"}` | 1,664,266 |
+| `tv_dhan_feed_depth_total{outcome="ghost_redial"}` | 80 |
+| `tv_dhan_feed_depth_total{outcome="ghost_exhausted"}` | **10** |
+| `tv_dhan_feed_depth_total{outcome="rows"}` | 793,936,720 |
+
+**`ghost` is not 0. It is 5,250,076. On the stated test, code 24 is ignored.**
+
+#### The caveat that section named is CLOSED — the box genuinely ran the 24 build
+
+The 2026-09-08 (THIRD) section's residual 4 and the 2026-09-10 section both
+leave open whether the running binary carried the flip. Verified:
+
+| check | reading |
+|---|---|
+| `/tickvault/prod/deploy/binary-git-sha` | `23701dfca0cbaa02710e55003054948b57ca2ca7` |
+| `git merge-base --is-ancestor ad778aa50 23701dfca` | **true** — the build CONTAINS the 25 → 24 flip |
+| `systemctl show tickvault -p NRestarts` | **0** |
+| process start | **08:30:49 IST**, running 7h40m at the time of reading |
+
+One continuous session, no restarts, on a build that contains code 24.
+
+#### The derived streaming tail
+
+Grace is `GHOST_GRACE_SECS` = 90 s and the dropped map remembers for
+`DROPPED_RETENTION_SECS` = 600 s, so the ghost window is 510 s and the
+never-honoured ceiling ratio is 510/90 = 5.67. Observed ratio:
+5,250,076 / 1,664,266 = **3.155**. Solving `(T − 90)/90 = 3.155` gives
+**T ≈ 374 s** — the average unsubscribed contract kept streaming for about
+**six minutes** after we told Dhan to stop. Approximate: it assumes a steady
+packet rate and ignores contracts that re-entered the top 250 and reverted to
+`Held`.
+
+At 20 levels per depth-20 packet that is ≈ **105 million stored rows, ~13.2% of
+the session's 793,936,720**, for contracts this process had unsubscribed. Waste,
+never loss — `dhan_feed_stack.rs` writes them by design and says so.
+
+#### What this means, and what it does NOT
+
+**Two codes have now been proven ignored on two consecutive sessions**, and the
+vendor's own annexure contradicts itself about which is correct. Per the
+2026-09-10 section's own instruction, **the honest next step is a support ticket
+with both sessions' evidence, not a third guess.** No local strategy choice
+repairs it.
+
+**NOT claimed:** that a third code exists to try. **NOT claimed:** that anything
+was lost — ghost rows are written, `ghost_exhausted = 10` means ten sockets
+stopped redialling after `GHOST_REDIAL_SESSION_CEILING` and kept their working
+set. **The apply cadence still does NOT move**: the FOURTH-quote ordering binds
+on a clean read, and this read is the opposite of clean.
+
+#### ⚠ CORRECTED in the same pass — "804 parks the socket" is STALE in TWO places
+
+The 2026-09-09 section's blocker list says *"804 parks the socket and the redial
+cannot reach a parked socket"*, and the 2026-09-08 (SECOND) section says a
+depth-200 over-subscribe is *"804, Fatal, parked for the session."*
+
+**Both were true until 2026-09-10 and are now wrong.** `classify_disconnect`
+maps `DisconnectCode::InstrumentsExceedLimit` to
+`DisconnectClass::SubscriptionRejected`, and `ParkReason::SubscriptionRejected`
+is the **only** reason in the tree whose `allows_one_respawn()` returns `true`.
+Its own docblock records the reasoning: neither overflow nor credential, the
+worst case of being wrong is one wasted dial on that slot alone, and *"a fresh
+connection resets the vendor's count"*.
+
+So 804 costs **one bounded respawn — riding the normal backoff ladder, the
+per-slot stagger and the flap floor — and then a park**, not an instant
+session-ending park.
+
+**This matters because the overstatement has already cost work:** the
+2026-09-09 section used the permanent-park reading to WITHDRAW the claim that
+the ghost detector makes a wrong unsubscribe code self-healing. That withdrawal
+was correct about a socket that has already parked and wrong about the blast
+radius. The blocker list itself STANDS — the cadence raise is still blocked by
+the per-call swap caps, the unguarded `send_swap` pending slot, the two QuestDB
+queries per iteration and the stall threshold — but the 804 row in it is
+smaller than written.
+
+**Both passages are left in place per house convention and corrected here.**
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Ships a third unsubscribe RequestCode on a guess, without a vendor answer or a
+  live reading that distinguishes it.
+- Raises the apply cadence citing this section — the read is negative, so the
+  FOURTH-quote ordering binds harder, not less.
+- Repeats "804 parks the socket for the session" without the one-respawn
+  correction.
+- Reports the 5,250,076 ghosts as data loss. They are written.
