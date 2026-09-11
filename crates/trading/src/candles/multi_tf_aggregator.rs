@@ -1437,6 +1437,14 @@ impl MultiTfAggregator {
                 // cannot be recovered from a truncated counter) and keeps the
                 // instrument alive for the remainder of the session.
                 slot.last_cumulative = cumulative_volume;
+                // Re-anchoring the SLOT baseline alone is NOT sufficient: every
+                // bucket that is already OPEN still holds a
+                // `bucket_start_cumulative` from before the restart, so its
+                // volume would freeze for the rest of the bucket (up to 59
+                // minutes on M60) while `tick_count` kept rising. The cell
+                // re-bases those in the same breath, preserving what each has
+                // already counted.
+                slot.cell.rebase_open_buckets(cumulative_volume);
                 crate::candles::fold_counters::fold_counters()
                     .cumulative_reanchored
                     .increment(1);
@@ -1772,6 +1780,179 @@ mod tests {
         );
     }
 
+    /// A cumulative RESTART re-anchors the baseline instead of freezing it.
+    ///
+    /// The vendor's day-cumulative can restart near zero (a counter wrap, or a
+    /// session restart on the exchange side). Without the re-anchor the
+    /// advance-only rule reads every later tick as a regression, so the
+    /// instrument reports `volume 0` for the rest of the session while its
+    /// `tick_count` keeps rising — wrong, and silent.
+    ///
+    /// The three outcomes are deliberately far apart so this test cannot pass
+    /// by accident: 51,000 is the re-anchored answer, 1,000 is the frozen one.
+    #[test]
+    fn a_cumulative_restart_re_anchors_the_baseline_instead_of_freezing() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let sink = |_: Feed, _: u64, _: u8, _: TfIndex, _: LiveCandleState| {};
+        let base = OPEN;
+
+        // Seed the baseline near the top of the u32 range.
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(91, SEG_IDX, base, 100.0, 4_000_000_000),
+            None,
+            sink,
+        );
+        // A normal uptick of 1,000.
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(91, SEG_IDX, base + 1, 101.0, 4_000_001_000),
+            None,
+            sink,
+        );
+        // THE RESTART: a backwards step of ~4e9, far past the floor. This tick
+        // itself adds nothing (it traded nothing new), but it must MOVE the
+        // baseline.
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(91, SEG_IDX, base + 2, 102.0, 100_000),
+            None,
+            sink,
+        );
+        // The proof tick: 50,000 above the RESTARTED counter.
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(91, SEG_IDX, base + 3, 103.0, 150_000),
+            None,
+            sink,
+        );
+
+        let open = agg
+            .snapshot(Feed::Dhan, 91, SEG_IDX, TfIndex::M1)
+            .expect("open bucket");
+        assert_eq!(
+            open.net_volume(),
+            Some(51_000),
+            "1,000 before the restart plus 50,000 after it; a frozen baseline \
+             would report 1,000 and lose the rest of the session"
+        );
+        assert_eq!(
+            open.volume, 51_000,
+            "gross must count exactly the same trades as net"
+        );
+    }
+
+    /// A small backwards step is a STALE PACKET, not a restart: it must not
+    /// re-anchor, and it must not poison the next tick's direction.
+    ///
+    /// MEASURED on the live box 2026-09-11: security 68407 took five
+    /// cumulative regressions before 09:40 IST — 09:15:07 -> 09:15:08 went
+    /// 40,820 -> 40,690 while the price moved the OTHER way. An out-of-order
+    /// snapshot is an older view, so it is refused as an INPUT to the tick
+    /// rule rather than merely discounted in the output.
+    ///
+    /// Three outcomes discriminate all three branches at once:
+    ///   11,000 — correct
+    ///    9,000 — the stale price was allowed to set the direction
+    ///   12,000 — the stale packet wrongly re-anchored the baseline
+    #[test]
+    fn a_stale_packet_neither_re_anchors_nor_sets_the_next_ticks_direction() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let sink = |_: Feed, _: u64, _: u8, _: TfIndex, _: LiveCandleState| {};
+        let base = OPEN;
+
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(92, SEG_IDX, base, 100.0, 10_000),
+            None,
+            sink,
+        );
+        // UPTICK 10,000 — the real flow, and it sets the last accepted price
+        // to 101.0.
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(92, SEG_IDX, base + 1, 101.0, 20_000),
+            None,
+            sink,
+        );
+        // THE STALE PACKET: cumulative goes BACKWARDS by 1,000 (far under the
+        // restart floor) and carries a HIGHER price. If that price were
+        // allowed through, the next tick would read as a downtick.
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(92, SEG_IDX, base + 2, 103.0, 19_000),
+            None,
+            sink,
+        );
+        // The proof tick: 102.0 is ABOVE the last genuinely accepted price
+        // (101.0) and BELOW the stale one (103.0).
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(92, SEG_IDX, base + 3, 102.0, 21_000),
+            None,
+            sink,
+        );
+
+        let open = agg
+            .snapshot(Feed::Dhan, 92, SEG_IDX, TfIndex::M1)
+            .expect("open bucket");
+        assert_eq!(
+            open.net_volume(),
+            Some(11_000),
+            "10,000 up, nothing from the stale packet, 1,000 up off the \
+             high-water baseline"
+        );
+    }
+
+    /// A stale packet leaves the bar CLASSIFIED, and that distinction is the
+    /// whole point of `Some(0)` rather than `None`.
+    ///
+    /// It traded nothing new, so there is no flow for the bar to be ignorant
+    /// of. Returning `None` would NULL an otherwise fully-classified bar over
+    /// a packet that added no volume — a duplicate or an out-of-order snapshot
+    /// would silently erase a good reading.
+    #[test]
+    fn a_stale_packet_contributes_zero_and_never_unclassifies_the_bar() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let sink = |_: Feed, _: u64, _: u8, _: TfIndex, _: LiveCandleState| {};
+        let base = OPEN;
+
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(93, SEG_IDX, base, 100.0, 5_000),
+            None,
+            sink,
+        );
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(93, SEG_IDX, base + 1, 101.0, 6_000),
+            None,
+            sink,
+        );
+        let before = agg
+            .snapshot(Feed::Dhan, 93, SEG_IDX, TfIndex::M1)
+            .expect("open bucket")
+            .net_volume();
+        assert_eq!(before, Some(1_000), "a clean uptick of 1,000");
+
+        // The out-of-order snapshot.
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(93, SEG_IDX, base + 2, 99.0, 5_500),
+            None,
+            sink,
+        );
+
+        let after = agg
+            .snapshot(Feed::Dhan, 93, SEG_IDX, TfIndex::M1)
+            .expect("open bucket");
+        assert_eq!(
+            after.net_volume(),
+            Some(1_000),
+            "unchanged — the stale packet added no volume and no direction"
+        );
+        assert_eq!(after.volume, 1_000, "and it added nothing to gross either");
+    }
     /// Before any direction has revealed itself, a flat tick is UNCLASSIFIED.
     ///
     /// Guessing here would propagate: the carry would then sign every

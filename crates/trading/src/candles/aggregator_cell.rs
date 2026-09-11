@@ -529,6 +529,42 @@ impl AggregatorCell {
         if s.is_uninitialised() { None } else { Some(s) }
     }
 
+    /// Re-base every OPEN bucket after the vendor's cumulative counter
+    /// RESTARTED, so a bucket spanning the restart keeps accumulating.
+    ///
+    /// A bucket's volume is `cumulative − bucket_start_cumulative`, and
+    /// `bucket_start_cumulative` is written ONCE, at bucket open. So when the
+    /// counter restarts near zero mid-bucket, that subtraction saturates to 0
+    /// for the rest of the bucket: the widening-only guard below suppresses
+    /// every later value as a regression and the bar's volume FREEZES at its
+    /// pre-restart figure while `tick_count` keeps climbing. On an M60 bucket
+    /// that is up to 59 minutes of volume silently missing from one bar.
+    ///
+    /// Re-anchoring the SLOT's baseline (which is what
+    /// `MultiTfAggregator::consume_tick` does) is necessary and not
+    /// sufficient: it fixes the NEXT bucket and leaves every currently-open
+    /// one frozen. This is the other half.
+    ///
+    /// The new start is `cumulative − volume`, deliberately NOT `cumulative`:
+    /// the bucket has already counted `volume` units and those trades really
+    /// happened, so anchoring at `cumulative` would ERASE them. This choice
+    /// preserves exactly what was counted and lets the bucket keep rising —
+    /// it invents nothing and loses nothing.
+    ///
+    /// Uninitialised slots are skipped: they have no bucket to re-base, and
+    /// the one they open next reads the already-re-anchored baseline.
+    ///
+    /// # Complexity
+    /// O(`TF_COUNT`) — one pass over a fixed-size array, no allocation. Runs
+    /// only on a restart, which is a once-per-session event at most.
+    pub fn rebase_open_buckets(&mut self, cumulative_volume: u64) {
+        for state in &mut self.slots {
+            if state.is_uninitialised() {
+                continue;
+            }
+            state.bucket_start_cumulative = cumulative_volume.saturating_sub(state.volume);
+        }
+    }
     /// Folds one tick into ONE timeframe slot.
     ///
     /// `bucket_start_cumulative` is the instrument's cumulative day volume as
