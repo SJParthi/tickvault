@@ -3899,3 +3899,167 @@ only real remedy — now with the vendor's own annexure as its first exhibit.
   2026-09-11 full-doc pull.
 - Reports the restore as a fix for the ghosts. It is a correctness fix for what
   we SEND, not a repair of what Dhan DOES.
+
+### 2026-09-11 (FOURTH) — SIX MOVERS WITH THEIR SPOT, INDEX AT ATM ±11; AND THE SOCKET HANG-UP IS REFUSED ON MEASURED EVIDENCE
+
+**The verbatim operator demands (2026-09-11, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+**Quote A (the shape):**
+> "sso can we goa head with as per your reocmmedation dude which is top 6 alone dude see in that top 6 try ot add its udnerlying spot also dude okay? so now can we can duretcly disocnenct and reocnnect the ntire socket within a seocnd rigth dude for evry minute chekc rigth dude am i rgith dude see that too frehsly you can check this precisley on tuesdya rigth dude am i rgith dude tell me dude okay? ... see meanwhile to fill uo th entire index slots can we add one which is instea dof atm plus or minus 10 can we go ahead with plus or minus 11 dude okay?"
+
+**Quote B (the authorization):**
+> "whatve ror whichevr is reocmmended from your side go ahea ddude okay?"
+
+Quote B was given in DIRECT response to a message that ended with exactly one
+enumerated question — *"drop the socket hang-up and raise the swap budget
+instead — yes or no?"* — after the five findings below were put to him in full.
+That is the §28.2/§28.3 authorization shape this repository already accepts: a
+general go-ahead answering an ENUMERATED ask selects the enumerated work.
+Recorded HERE, before the code, per the rule-file-first law.
+
+#### What this AUTHORIZES
+
+| Surface | 2026-09-11 (THIRD) | Now |
+|---|---|---|
+| Stock movers | **7** | **6** (`DEPTH20_NAME_ENTRY_RANK`) |
+| Per stock name | future + options ATM±5 = **23** | **spot + future + options ATM±5 = 24** |
+| Stock spot segment | banned (`NSE_FNO only`) | **`NSE_EQ` ADMITTED for the six movers** |
+| Index ATM window | ±10 → 43 slots | **±11 → 47 slots** |
+| Board cost | 247 of 250 | **238 of 250**, 12 spare |
+| Apply cadence | once a minute | **unchanged — once a minute** |
+
+Everything else in the (THIRD) contract STANDS unchanged: NIFTY and BANKNIFTY
+unconditional and never displaced; ranking on the ABSOLUTE percentage move of
+the UNDERLYING in integer basis points; the name-level hysteresis band at
+`DEPTH20_NAME_EXIT_RANK = 12`; NSE_FNO for every contract; no BSE; no index
+spot; no hardcoded contract ids; `dry_run` true; §28 frozen.
+
+#### ⚠ The arithmetic makes the three changes ONE change
+
+`slots_for_name(N) = 1 + (2N+1) × 2` (`depth20_name_board.rs:317`).
+
+| Shape | Board cost | Verdict |
+|---|---|---|
+| index ±10, 7 stocks ±5 (authorized) | 2×43 + 7×23 = **247** | fits |
+| **index ±11, 7 stocks kept** | 2×47 + 7×23 = **255** | ❌ **the compile-time assert at `:331` FAILS THE BUILD** |
+| index ±11, 6 stocks, no spot | 2×47 + 6×23 = **232** | fits, 18 spare |
+| **index ±11, 6 stocks + spot** | 2×47 + 6×24 = **238** | ✅ fits, 12 spare |
+| index ±12 + future | `slots_for_name(12)` = **51** | ❌ one socket over on its own |
+
+So ±11 cannot ship with seven names, and the freed slots cannot buy a wider
+stock ladder either (6 × 27 + 94 = 256) or a seventh name (7 × 24 + 94 = 262).
+**Spot is the only thing that fits in the room ±11 creates.** Six is forced by
+the budget, not chosen.
+
+**Honest note on direction:** ±11 is a step UP from the (THIRD) authorization
+(±10) and a step DOWN from what is LIVE today — `depth20_layout.rs:58` runs
+`DEPTH_20_INDEX_STRIKES_EACH_SIDE = 12` with **no index future** (50 option legs
+filling the socket). Against the live shape this trades 2 strikes each side for
+the index future that centres the ATM window under the 2026-09-09 lock.
+
+#### ⚠ WHAT THIS REFUSES — the socket hang-up, and why
+
+Quote A proposes replacing the vendor-ignored per-instrument unsubscribe by
+CLOSING a depth socket and re-dialling it with a changed set, once a minute.
+**That is REFUSED**, and the refusal is the substance of Quote B. Five findings,
+all measured or in source:
+
+| # | Severity | Finding | Evidence |
+|---|---|---|---|
+| 1 | **FATAL** | No deliberate-close concept exists. `ConnEvent` has 11 variants; none means "our set changed" | `pool_supervisor.rs:614-647` |
+| 2 | **FATAL** | Every redial is recorded as a flap, with no way to mark one intentional — `enter_backoff` is the single site and records unconditionally | `pool_supervisor.rs:1569-1577` |
+| 3 | **HIGH** | Once a minute sits at 5 of a ceiling of 6. One vendor drop that minute breaches it → forced 30 s floor, socket classed pathological | `reconnect_ladder.rs:159,182,188` |
+| 4 | **HIGH** | A rebuilt socket counts as healthy only once a FRAME arrives — not on dial, not on ack. A thin book silent for 30 s makes the NEXT rebuild a short-session flap | `reconnect_ladder.rs:140,321-325` |
+| 5 | **HIGH** | The blind window is NOT the 0.31 s transport redial. The India feed has **no snapshot-on-subscribe**, so a re-subscribed contract is BLANK until its book next changes; the tracker gives up at `FIRST_PACKET_WINDOW_SECS = 120`, and a 09:50 delivery cliff where no new contract delivered at all is already measured | `depth_first_packet.rs:14-17,177` |
+
+**And the vendor evidence points the same way, harder.** Dhan documents 805 as
+*"Too many requests or connections. Further requests may result in the user
+being blocked"* (`docs/dhan-ref/08-annexure-enums.md:348`), our code parks a
+805'd socket PERMANENTLY (`pool_supervisor.rs:534,1285`), and
+`docs/dhan-support/2026-06-01-live-feed-429-from-cloud-ip.md:52` records this
+very account being refused with **HTTP 429** on the feed, our own hypothesis
+being *"our reconnect logic retried too aggressively"* — with the question *"is
+there a cap on new connection attempts per minute per dhanClientId?"* sent to
+Dhan and **never answered**. Hanging up five sockets once a minute is ~300
+connection attempts per session against that unknown.
+
+**A PR that adds a deliberate-close-and-redial path for depth is a REJECT**
+without its own fresh dated quote that engages findings 1-5 by name.
+
+#### The REPLACEMENT, authorized in its place
+
+The problem Quote A was solving is real and measured: **moving one name takes
+six minutes.** A name is 24 contracts and the per-socket budget is
+`MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE = 4`
+(`depth20_ranked_steer.rs:87`), which is not a wire limit — it is const-asserted
+equal to `DEPTH_SWAP_COMMAND_CHANNEL_DEPTH`, a queue depth. **Raising both so a
+whole name moves in one minute is authorized**, with three binding conditions:
+
+1. **It ships WITH the name board, never before it.** The current volume-keyed
+   contract board already refuses 24,607 swaps a session against 7,662
+   performed (MEASURED 2026-09-11) — raising the cap under THAT board
+   multiplies ghosts fourfold for nothing.
+2. **The cap stays const-asserted `<=` the channel depth.** A cap above the
+   queue is not a cap.
+3. **Socket-affinity is NOT adopted.** It was only ever needed to make hanging
+   up cheap; with hang-up refused it actively harms, because a name confined to
+   one socket draws on one 4-swap budget while a freely-packed name draws on
+   several. `plan_pool`'s flat `chunks()` shard (`dhan_feed_stack.rs:848-852`)
+   therefore stays as it is.
+
+**Why more ghosts is the safe direction, MEASURED across two full sessions:**
+sockets carried 50 wanted + ~25 ghosts = 75 against a documented cap of 50, for
+6.4 hours, and `tv_dhan_ws_park_total` was **0 on every reason**,
+`tv_dhan_ws_subscribe_failed_total` **0 on all eight reasons including all four
+`unsubscribe_*`**, with zero 804 and zero 805. Ghost cost is ~13.5% of depth
+rows ≈ 2.5% of the session's disk burn.
+
+#### ⚠ Honest envelope (mandatory per operator-charter §F)
+
+- **The 09:00 pre-open requirement CANNOT be met, and no code can meet it.**
+  MEASURED (`:2072`, 2026-08-27): equities deliver one stale ~08:30 snapshot
+  carrying YESTERDAY's timestamp — hard-refused since 2026-09-10 — and then
+  **nothing until the 09:07 auction print**. That print carries the LTP and the
+  previous close on the SAME packet, so ~208 names become rankable together at
+  ~09:07, eight minutes before the bell. 09:00-09:07 the pools hold the
+  previous session's validated seed (`depth_rebalance.rs:1673`, reason
+  `seed_until_first_ranking`) — which is already built and already wired, and
+  is the correct behaviour, not a gap.
+- **A name with a missing price ranks `None`, NEVER 0%** (`:194`, pinned by
+  `a_missing_price_is_not_rankable_and_is_never_zero`). Between 09:00 and 09:07
+  that is most of the equity universe, and ranking them 0 would tie them with
+  genuinely flat names.
+- **NSE_EQ depth is UNVERIFIED-LIVE.** Dhan documents it as supported and uses
+  it as their own subscribe example (`04-full-market-depth-websocket.md:13,274`
+  and the `"NSE_EQ","SecurityId":"1333"` samples at `:84,:96`); our guards
+  already admit it (`subscription_builder.rs:437-462`); the parser stores the
+  segment byte raw and `segment` is in the depth DEDUP key. **But no session has
+  ever sent one.** `IDX_I` by contrast is REFUSED at build time by our own
+  guard, which is why index SPOT can never join a depth socket.
+- **Stock spot depth is an INCREMENT, not new coverage.** The main feed runs
+  Full mode and already persists 5 levels of every equity's book via
+  `append_inline_depth` (`dhan_feed_stack.rs:6375`). This buys levels 6-20.
+- **Name-board churn is UNMEASURED** — the board has never run, so how often the
+  top 6 changes behind a band at rank 12 is Unknown. The swap counters are the
+  read-out and **they reach no AWS surface at all** (MEASURED: absent from the
+  namespace AND from the EMF group), so today they are unalarmable.
+- **NOT claimed:** that any of this improves capture. The unsubscribe remains
+  broken on the vendor's side; the fix is the support ticket, which is itself
+  blocked because no ghost log line carries a `security_id`.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Adds a deliberate socket close-and-redial path for depth without a fresh dated
+  quote engaging findings 1-5 by name.
+- Ships index ±11 while keeping seven movers (the build fails; do not "fix" it
+  by raising `DEPTH20_INSTRUMENT_BUDGET`, which is 5 sockets × 50 and is the
+  vendor's number).
+- Puts an `IDX_I` instrument on a depth socket, or a BSE segment.
+- Raises the swap cap before the name board is wired, or above the command
+  channel depth, or without keeping the const-assert.
+- Adopts socket-affine packing for depth-20 on the strength of this section.
+- Ranks a name with a missing price as 0%.
+- Presents the board as rankable at 09:00, or reports an empty 09:00 board as a
+  defect rather than as the exchange's own timetable.
+- Claims NSE_EQ depth works before a session has actually delivered one.
