@@ -5410,9 +5410,12 @@ mod tests {
     /// planner refuses the WHOLE pool rather than truncating. So when Dhan
     /// answers 804, the count that is over the cap is THEIRS, not ours — an
     /// unsubscribe they ignored leaves them holding instruments we no longer
-    /// count. Measured 2026-09-10: 20 ignored unsubscribes and 10 ghost
-    /// redials in 30 minutes, on the very code (25) that was proven wrong the
-    /// same day.
+    /// count. Measured 2026-09-11 by re-query of the 2026-09-10 session: 80
+    /// ignored unsubscribes and 80 ghost redials between 09:20:09 and 10:46:11
+    /// IST, across ALL TEN depth sockets and BOTH endpoints, on the very code
+    /// (25) that was proven wrong the same day. (An earlier version of this
+    /// comment said "20 ... and 10 ... in 30 minutes" — that figure matches no
+    /// window and is withdrawn.)
     ///
     /// A FRESH connection resets the vendor's per-connection count. That is
     /// precisely the thing the old reasoning said could not change, and it is

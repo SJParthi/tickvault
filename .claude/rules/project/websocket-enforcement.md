@@ -45,7 +45,8 @@ paths:
 
 11. **Order update field names differ from REST.** Single-char codes (`C`=CNC, `B`=Buy, etc.), PascalCase keys, `MsgCode: 42`.
 
-12. **Unsubscribe depth = code 24 (since 2026-09-10).** This rule said "25, NOT 24 — the SDK has a bug" until the live session of 2026-09-10 proved Dhan IGNORES code 25 (20 ignored unsubscribes, 10 ghost redials, 8 instruments on 5 depth-200 sockets in 30 minutes). 24 = `subscribe_code + 1`, the rule every other unsubscribe code obeys. Dated record: `websocket-connection-scope-lock.md` "2026-09-10 — THE DEPTH UNSUBSCRIBE REQUESTCODE IS SETTLED LIVE".
+12. **Unsubscribe depth = code 24 (since 2026-09-10).** This rule said "25, NOT 24 — the SDK has a bug" until the live session of 2026-09-10 proved Dhan IGNORES code 25 (measured 2026-09-11 by re-query: **80** `unsubscribe_ignored` lines, 40 depth-20 + 40 depth-200, across **all ten** depth sockets, redials exhausted at the session ceiling of 8 — the "20 ignored / 10 redials" figure recorded on 2026-09-10 matches no window and is withdrawn). 24 = `subscribe_code + 1`, the rule every other unsubscribe code obeys. Dated record: `websocket-connection-scope-lock.md` "2026-09-10 — THE DEPTH UNSUBSCRIBE REQUESTCODE IS SETTLED LIVE".
+    **⚠ 2026-09-11: code 24 is ALSO ignored, and identically** — 80 lines, 40/40 across both endpoints, all ten sockets, ceiling reached. Two codes producing the same failure signature is evidence the RequestCode may not be the variable. Do NOT ship a third guess; the scope lock's instruction is a vendor ticket.
 
 ## Depth Rebalancing Rules (added 2026-04-16)
 
