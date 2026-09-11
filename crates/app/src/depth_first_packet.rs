@@ -69,7 +69,17 @@
 //!   cheap, not that it is the common one. While a swap
 //!   is outstanding it is that load plus exactly ONE `papaya` probe — the
 //!   removal IS the read, so the packet that resolves a subscribe costs the
-//!   same single probe as one that does not. Zero allocation on every arm.
+//!   same single probe as one that does not.
+//!
+//! ⚠ **NOT zero-allocation in the DEALLOCATION direction**, corrected
+//! 2026-09-11 after a hot-path audit. This line used to end "Zero allocation
+//! on every arm", which is true of the allocating direction and false of the
+//! freeing one: `pin()` returns a `seize` guard whose DROP runs that
+//! collector's deferred reclamation, so the drain — which pins far more often
+//! than the steering task — performs essentially all of this map's frees. The
+//! honest statement is that no arm ALLOCATES; the resolving arm may FREE.
+//! Recorded rather than removed because a header asserting zero allocation on
+//! the frame drain is exactly what stops the next auditor looking.
 //! * [`DepthFirstPacketTracker::record_subscribe_at`] — O(1), a few times a
 //!   minute on the steering task.
 //! * [`DepthFirstPacketTracker::sweep_expired_at`] — O(pending), bounded by
@@ -141,14 +151,20 @@ pub const FIRST_PACKET_LATENCY_MS: &str = "tv_depth_first_packet_latency_ms";
 /// Counter, labelled `outcome`: how each awaited subscribe resolved.
 pub const FIRST_PACKET_OUTCOME: &str = "tv_depth_first_packet_total";
 
-/// Every `outcome` label value, so all three series exist at zero from boot.
+/// Every `outcome` label value, so all five series exist at zero from boot.
 ///
 /// The CloudWatch agent drops the first sample of a series it has never seen,
 /// and these are local-only today — but a counter whose FIRST increment is the
 /// event it exists to report is the seeding defect this repository has already
 /// paid for once (`tv_depth_rows_spilled_total`, 2026-08-28), and pre-seeding
 /// costs nothing.
-pub const FIRST_PACKET_OUTCOMES: [&str; 3] = ["arrived", "silent_window", "refused"];
+pub const FIRST_PACKET_OUTCOMES: [&str; 5] = [
+    "arrived",
+    "silent_window",
+    "refused",
+    "unmeasurable",
+    "reordered",
+];
 
 /// How long a subscribed contract may stay dark before the wait is given up
 /// and counted as [`FIRST_PACKET_OUTCOMES`]`[1]`.
@@ -216,13 +232,40 @@ impl DepthFirstPacketTracker {
     /// arrival the next packet answers, and keeping the older stamp would
     /// report a latency spanning a window the contract was not even subscribed
     /// for.
+    /// `may_already_be_streaming` is the CRITICAL gate, added 2026-09-11 after
+    /// a hostile permutation sweep. [`Key`] carries the pool byte but NOT the
+    /// socket, so a contract this process dropped — and that Dhan is still
+    /// streaming because it ignored the unsubscribe (proven for code 25 on
+    /// 2026-09-10 and code 24 on 2026-09-11, mean ghost tail ~374 s) — can be
+    /// re-taken onto a DIFFERENT socket of the same pool, and the very next
+    /// ghost packet from the OLD socket then resolves the fresh stamp. The
+    /// sample recorded is ~0 ms for a socket that has delivered nothing: a
+    /// fabricated zero, biasing the instrument toward zero at exactly the end
+    /// it exists to measure. Same class as the pool-byte defect one level
+    /// down, and the reason the pool byte alone is not sufficient.
+    ///
+    /// The caller answers it from
+    /// `DepthSubscriptionView::classify_raw` — anything other than `Unknown`
+    /// means this process has a recent record of the contract on a depth
+    /// socket, so a packet for it cannot be trusted to be the new socket's
+    /// first. Refusing costs ONE sample and is counted; measuring anyway costs
+    /// the series' credibility. It deliberately OVER-refuses the harmless
+    /// cross-pool case (`classify_raw` is pool-blind, so depth-20 holding a
+    /// contract refuses a depth-200 stamp the pool byte would already have
+    /// protected) because over-refusing loses a sample and under-refusing
+    /// writes a number that is wrong in the reassuring direction.
     pub fn record_subscribe_at(
         &self,
         security_id: u64,
         segment: ExchangeSegment,
         pool: DepthFeedKind,
         at_nanos: i64,
+        may_already_be_streaming: bool,
     ) {
+        if may_already_be_streaming {
+            metrics::counter!(FIRST_PACKET_OUTCOME, "outcome" => "unmeasurable").increment(1);
+            return;
+        }
         let pinned = self.pending.pin();
         // `binary_code()`, NOT `segment as u8` — see the `Key` docblock.
         let key = (security_id, segment.binary_code(), pool_code(pool));
@@ -233,6 +276,34 @@ impl DepthFirstPacketTracker {
         if pinned.insert(key, at_nanos).is_none() {
             self.pending_count.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Drops a stamp for a swap the WIRE refused, so it never ages into a
+    /// false `silent_window`. Returns whether an entry was actually dropped.
+    ///
+    /// The stamp sites fire on the `Ok(())` arm of `try_send`, which means the
+    /// command reached a CHANNEL — not that the connection took it. The
+    /// verdict arrives a minute later through the swap-ack reconcile, and on
+    /// `NotHeld`/refused/sender-dropped the believed hold is reverted because
+    /// the contract was never subscribed. Before this (found 2026-09-11) the
+    /// stamp survived that revert and was swept at
+    /// [`FIRST_PACKET_WINDOW_SECS`] into `silent_window` — a label whose own
+    /// docs say the contract "may simply not have traded", reporting a dark
+    /// window for a subscribe that never happened.
+    ///
+    /// Called from the reconcile, i.e. once a minute on the steering task,
+    /// never from the drain.
+    pub fn forget(&self, security_id: u64, segment: ExchangeSegment, pool: DepthFeedKind) -> bool {
+        let pinned = self.pending.pin();
+        // `binary_code()`, NOT `segment as u8` — see the `Key` docblock.
+        if pinned
+            .remove(&(security_id, segment.binary_code(), pool_code(pool)))
+            .is_some()
+        {
+            self.pending_count.fetch_sub(1, Ordering::Relaxed);
+            return true;
+        }
+        false
     }
 
     /// The hot-path arm: does this packet resolve an awaited subscribe?
@@ -268,7 +339,27 @@ impl DepthFirstPacketTracker {
         // error — it is an unbounded one, because the bucket it lands in is
         // whatever the exporter does with a value it was never given a bucket
         // for.
-        let elapsed = at_nanos.saturating_sub(subscribed_at).max(0);
+        // A packet whose receipt instant PRECEDES the subscribe is not a fast
+        // arrival, it is an out-of-order one, and counting it as a 0 ms
+        // `arrived` is the second fabricated-zero class this module had (found
+        // 2026-09-11, same sweep as the ghost gate above).
+        //
+        // It is a ROUTINE path, not an NTP edge case: the drain's
+        // `received_at_nanos` is deliberately BACK-DATED by ring dwell
+        // (`dhan_feed_stack.rs` — `Utc::now()` minus `frame.received_at
+        // .elapsed()`), while the stamp is a raw `Utc::now()`. Ring dwell has
+        // its own alarm at 2,000 ms, so under any backlog a packet received
+        // before the dispatch but drained after lands here. The old code
+        // clamped it to zero with `.max(0)` and still counted `arrived`.
+        //
+        // The entry is CONSUMED either way — the contract has delivered a
+        // packet, so it is not dark and must not later age into
+        // `silent_window`; only the measurement is refused.
+        if at_nanos < subscribed_at {
+            metrics::counter!(FIRST_PACKET_OUTCOME, "outcome" => "reordered").increment(1);
+            return None;
+        }
+        let elapsed = at_nanos.saturating_sub(subscribed_at);
         metrics::counter!(FIRST_PACKET_OUTCOME, "outcome" => "arrived").increment(1);
         // FLOAT division. `(elapsed / NANOS_PER_MILLI) as f64` divides as
         // INTEGERS first, so every sub-millisecond arrival records as 0.0 —
@@ -361,7 +452,13 @@ mod tests {
     #[test]
     fn observe_at_yields_the_interval_on_the_first_packet_after_a_subscribe() {
         let tracker = DepthFirstPacketTracker::new();
-        tracker.record_subscribe_at(42, ExchangeSegment::NseFno, DepthFeedKind::Twenty, T0);
+        tracker.record_subscribe_at(
+            42,
+            ExchangeSegment::NseFno,
+            DepthFeedKind::Twenty,
+            T0,
+            false,
+        );
         assert_eq!(tracker.pending_len(), 1);
         let measured = tracker.observe_at(
             42,
@@ -376,7 +473,13 @@ mod tests {
     #[test]
     fn only_the_first_packet_measures_and_the_rest_are_free() {
         let tracker = DepthFirstPacketTracker::new();
-        tracker.record_subscribe_at(42, ExchangeSegment::NseFno, DepthFeedKind::Twenty, T0);
+        tracker.record_subscribe_at(
+            42,
+            ExchangeSegment::NseFno,
+            DepthFeedKind::Twenty,
+            T0,
+            false,
+        );
         assert!(
             tracker
                 .observe_at(
@@ -406,7 +509,13 @@ mod tests {
         // I-P1-11: Dhan reuses the same number across segments. A packet for
         // the BSE contract must not resolve the NSE one's subscribe.
         let tracker = DepthFirstPacketTracker::new();
-        tracker.record_subscribe_at(27, ExchangeSegment::NseFno, DepthFeedKind::Twenty, T0);
+        tracker.record_subscribe_at(
+            27,
+            ExchangeSegment::NseFno,
+            DepthFeedKind::Twenty,
+            T0,
+            false,
+        );
         assert_eq!(
             tracker.observe_at(
                 27,
@@ -436,7 +545,7 @@ mod tests {
     #[test]
     fn sweep_expired_at_gives_up_on_a_contract_dark_past_the_window() {
         let tracker = DepthFirstPacketTracker::new();
-        tracker.record_subscribe_at(7, ExchangeSegment::NseFno, DepthFeedKind::Twenty, T0);
+        tracker.record_subscribe_at(7, ExchangeSegment::NseFno, DepthFeedKind::Twenty, T0, false);
         assert_eq!(
             tracker.sweep_expired_at(T0 + (FIRST_PACKET_WINDOW_SECS - 1) * NANOS_PER_SEC),
             0,
@@ -452,12 +561,13 @@ mod tests {
     #[test]
     fn record_subscribe_at_restamps_rather_than_keeping_the_older_clock() {
         let tracker = DepthFirstPacketTracker::new();
-        tracker.record_subscribe_at(7, ExchangeSegment::NseFno, DepthFeedKind::Twenty, T0);
+        tracker.record_subscribe_at(7, ExchangeSegment::NseFno, DepthFeedKind::Twenty, T0, false);
         tracker.record_subscribe_at(
             7,
             ExchangeSegment::NseFno,
             DepthFeedKind::Twenty,
             T0 + 10 * NANOS_PER_SEC,
+            false,
         );
         assert_eq!(tracker.pending_len(), 1, "one contract, one entry");
         let measured = tracker.observe_at(
@@ -473,10 +583,17 @@ mod tests {
         );
     }
 
+    /// ⚠ REPLACES `a_backward_clock_step_yields_zero_never_a_negative_sample`
+    /// (2026-09-11). That test asserted `Some(0)` — it pinned the CLAMP, and
+    /// the clamp is the defect: the drain's clock is deliberately back-dated
+    /// by ring dwell while the stamp is a raw `now()`, so a packet received
+    /// before the dispatch and drained after is ROUTINE under a backlog, and
+    /// counting it as a 0 ms `arrived` fabricates the fastest possible sample
+    /// on the instrument's own fast end.
     #[test]
-    fn a_backward_clock_step_yields_zero_never_a_negative_sample() {
+    fn a_receipt_that_precedes_the_subscribe_is_refused_not_recorded_as_zero() {
         let tracker = DepthFirstPacketTracker::new();
-        tracker.record_subscribe_at(7, ExchangeSegment::NseFno, DepthFeedKind::Twenty, T0);
+        tracker.record_subscribe_at(7, ExchangeSegment::NseFno, DepthFeedKind::Twenty, T0, false);
         assert_eq!(
             tracker.observe_at(
                 7,
@@ -484,15 +601,82 @@ mod tests {
                 DepthFeedKind::Twenty,
                 T0 - NANOS_PER_SEC
             ),
-            Some(0)
+            None,
+            "a back-dated receipt is an out-of-order sample, never a 0 ms arrival"
         );
+        // CONSUMED regardless: the contract HAS delivered a packet, so it is
+        // not dark and must never later age into `silent_window`.
+        assert_eq!(tracker.pending_len(), 0);
+        assert_eq!(
+            tracker.sweep_expired_at(T0 + (FIRST_PACKET_WINDOW_SECS + 1) * NANOS_PER_SEC),
+            0,
+            "a reordered arrival must not also be swept as a silent window"
+        );
+    }
+
+    /// The CRITICAL from the 2026-09-11 permutation sweep: `Key` carries the
+    /// pool byte but not the SOCKET, so a contract still streaming from the
+    /// socket it was dropped from — Dhan ignored the unsubscribe, proven for
+    /// both codes — answers its own fresh stamp with a fabricated ~0 ms.
+    #[test]
+    fn a_contract_that_may_still_be_streaming_is_not_measured_at_all() {
+        let tracker = DepthFirstPacketTracker::new();
+        tracker.record_subscribe_at(7, ExchangeSegment::NseFno, DepthFeedKind::Twenty, T0, true);
+        assert_eq!(
+            tracker.pending_len(),
+            0,
+            "no stamp may exist for a contract a live ghost stream could answer"
+        );
+        assert_eq!(
+            tracker.observe_at(
+                7,
+                ExchangeSegment::NseFno.binary_code(),
+                DepthFeedKind::Twenty,
+                T0 + NANOS_PER_SEC
+            ),
+            None,
+            "the very next packet must resolve nothing"
+        );
+    }
+
+    /// A swap that reached a CHANNEL but that the wire then refused was
+    /// stamped and left to age into `silent_window` — a dark-window report for
+    /// a subscribe that never happened.
+    #[test]
+    fn forget_stops_a_wire_refused_swap_aging_into_a_false_silent_window() {
+        let tracker = DepthFirstPacketTracker::new();
+        tracker.record_subscribe_at(7, ExchangeSegment::NseFno, DepthFeedKind::Twenty, T0, false);
+        assert!(tracker.forget(7, ExchangeSegment::NseFno, DepthFeedKind::Twenty));
+        assert_eq!(tracker.pending_len(), 0);
+        assert_eq!(
+            tracker.sweep_expired_at(T0 + (FIRST_PACKET_WINDOW_SECS + 1) * NANOS_PER_SEC),
+            0
+        );
+        // Idempotent: a second reconcile of the same ack must not underflow
+        // the advisory count.
+        assert!(!tracker.forget(7, ExchangeSegment::NseFno, DepthFeedKind::Twenty));
+        // And it is keyed on the WIRE code like every other entry point.
+        tracker.record_subscribe_at(
+            9,
+            ExchangeSegment::BseFno,
+            DepthFeedKind::TwoHundred,
+            T0,
+            false,
+        );
+        assert!(tracker.forget(9, ExchangeSegment::BseFno, DepthFeedKind::TwoHundred));
     }
 
     #[test]
     fn record_subscribe_at_is_bounded_and_the_refusal_is_counted() {
         let tracker = DepthFirstPacketTracker::new();
         for id in 0..(MAX_PENDING as u64 + 50) {
-            tracker.record_subscribe_at(id, ExchangeSegment::NseFno, DepthFeedKind::Twenty, T0);
+            tracker.record_subscribe_at(
+                id,
+                ExchangeSegment::NseFno,
+                DepthFeedKind::Twenty,
+                T0,
+                false,
+            );
         }
         assert_eq!(
             tracker.pending_len(),
@@ -508,13 +692,20 @@ mod tests {
         // contract on a stale clock.
         let tracker = DepthFirstPacketTracker::new();
         for id in 0..MAX_PENDING as u64 {
-            tracker.record_subscribe_at(id, ExchangeSegment::NseFno, DepthFeedKind::Twenty, T0);
+            tracker.record_subscribe_at(
+                id,
+                ExchangeSegment::NseFno,
+                DepthFeedKind::Twenty,
+                T0,
+                false,
+            );
         }
         tracker.record_subscribe_at(
             0,
             ExchangeSegment::NseFno,
             DepthFeedKind::Twenty,
             T0 + 5 * NANOS_PER_SEC,
+            false,
         );
         assert_eq!(tracker.pending_len(), MAX_PENDING);
         assert_eq!(
@@ -539,8 +730,8 @@ mod tests {
     fn pending_len_counts_awaited_subscribes_and_falls_as_they_resolve() {
         let tracker = DepthFirstPacketTracker::new();
         assert_eq!(tracker.pending_len(), 0);
-        tracker.record_subscribe_at(1, ExchangeSegment::NseFno, DepthFeedKind::Twenty, T0);
-        tracker.record_subscribe_at(2, ExchangeSegment::NseFno, DepthFeedKind::Twenty, T0);
+        tracker.record_subscribe_at(1, ExchangeSegment::NseFno, DepthFeedKind::Twenty, T0, false);
+        tracker.record_subscribe_at(2, ExchangeSegment::NseFno, DepthFeedKind::Twenty, T0, false);
         assert_eq!(tracker.pending_len(), 2);
         tracker.observe_at(
             1,
@@ -561,10 +752,15 @@ mod tests {
     fn pre_register_first_packet_counters_seeds_every_outcome_label() {
         // The guard is the LIST, not the call: a new outcome added to the
         // emit sites without joining this array ships an unseeded series.
-        assert_eq!(FIRST_PACKET_OUTCOMES.len(), 3);
+        assert_eq!(FIRST_PACKET_OUTCOMES.len(), 5);
         assert!(FIRST_PACKET_OUTCOMES.contains(&"arrived"));
         assert!(FIRST_PACKET_OUTCOMES.contains(&"silent_window"));
         assert!(FIRST_PACKET_OUTCOMES.contains(&"refused"));
+        // The two added 2026-09-11 with the fabricated-zero fixes. Both are
+        // emitted INSTEAD of a sample, so an unseeded series would make "we
+        // declined to measure" indistinguishable from "nothing happened".
+        assert!(FIRST_PACKET_OUTCOMES.contains(&"unmeasurable"));
+        assert!(FIRST_PACKET_OUTCOMES.contains(&"reordered"));
         pre_register_first_packet_counters();
     }
 
@@ -588,7 +784,7 @@ mod tests {
             ExchangeSegment::BseFno,
         ] {
             let tracker = DepthFirstPacketTracker::new();
-            tracker.record_subscribe_at(7, segment, DepthFeedKind::Twenty, T0);
+            tracker.record_subscribe_at(7, segment, DepthFeedKind::Twenty, T0, false);
             assert_eq!(
                 tracker.observe_at(
                     7,
@@ -611,7 +807,13 @@ mod tests {
     #[test]
     fn a_packet_on_the_other_pool_does_not_resolve_this_pools_subscribe() {
         let tracker = DepthFirstPacketTracker::new();
-        tracker.record_subscribe_at(42, ExchangeSegment::NseFno, DepthFeedKind::Twenty, T0);
+        tracker.record_subscribe_at(
+            42,
+            ExchangeSegment::NseFno,
+            DepthFeedKind::Twenty,
+            T0,
+            false,
+        );
         assert_eq!(
             tracker.observe_at(
                 42,
