@@ -1025,11 +1025,13 @@ fn send_swap(socket: &mut RebalanceSocket, swap: &PlannedSwap) -> bool {
             // stamp with a fabricated ~0 ms. See `record_subscribe_at`.
             let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
             let may_already_be_streaming =
-                crate::depth_subscription_view::global_depth_subscription_view().classify_raw(
-                    swap.new.security_id,
-                    swap.new.segment.binary_code(),
-                    now_nanos / 1_000_000_000,
-                ) != crate::depth_subscription_view::DepthFrameClass::Unknown;
+                crate::depth_subscription_view::global_depth_subscription_view()
+                    .may_already_be_streaming(
+                        swap.new.security_id,
+                        swap.new.segment.binary_code(),
+                        tickvault_core::parser::depth::DepthFeedKind::TwoHundred,
+                        now_nanos / 1_000_000_000,
+                    );
             crate::depth_first_packet::global_depth_first_packet_tracker().record_subscribe_at(
                 swap.new.security_id,
                 swap.new.segment,

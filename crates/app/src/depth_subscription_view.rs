@@ -82,6 +82,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use tickvault_core::parser::depth::DepthFeedKind;
 
 use arc_swap::ArcSwap;
 use tickvault_common::types::ExchangeSegment;
@@ -306,6 +307,70 @@ impl DepthSubscriptionView {
             Some(_) => DepthFrameClass::Ghost,
             None => DepthFrameClass::Unknown,
         }
+    }
+
+    /// Could a packet for this contract ALREADY be in flight on THIS pool?
+    ///
+    /// The gate on the first-packet instrument. Its key carries no socket
+    /// identity, so an in-flight packet from the socket a contract was DROPPED
+    /// from answers the stamp of a fresh subscribe on a DIFFERENT socket, at a
+    /// fabricated ~0 ms.
+    ///
+    /// ⚠ This exists because using [`Self::classify_raw`] for the same job was
+    /// MEASURED to disable one pool outright (2026-09-11, two independent
+    /// agents, from different directions). `classify_raw` answers `Held` from
+    /// the UNION of both pools — and both boards are cut from ONE
+    /// volume-ordered slice, so depth-200's entry set (top 5 distinct
+    /// underlyings) is by construction almost always inside depth-20's top
+    /// 250. Roughly **19 of every 20 depth-200 stamps** were refused as
+    /// "already held" while `arrived` and `silent_window` read healthy: the
+    /// same false-OK shape as the fabricated zero it replaced, one level up.
+    /// The docblock calling that over-refusal "harmless" was wrong — it was
+    /// TOTAL for one pool.
+    ///
+    /// So the held check is PER POOL. The dropped check deliberately is not:
+    /// a drop is recorded without the pool that made it, and a contract still
+    /// streaming after an ignored unsubscribe is unsafe to measure whichever
+    /// pool dropped it.
+    ///
+    /// **HONEST LIMIT — the ghost tail outlives this answer.** The dropped map
+    /// evicts at [`DROPPED_RETENTION_SECS`], and a socket that reaches its
+    /// ghost-redial session ceiling stands down and lets the contract stream
+    /// for the REST OF THE SESSION (measured 2026-09-10 and 2026-09-11:
+    /// redials exhausted ~10:21–10:46 IST, ghosts continuing ~5 h). Past that
+    /// retention this returns `false` and the fabricated zero is reachable
+    /// again. Closing it needs state this process does not keep — the socket
+    /// index in the stamp key, or a longer-lived "known ghosting" set — and is
+    /// RECORDED rather than guessed at a third time.
+    ///
+    /// O(1): one `Acquire` load, one `ArcSwap` load per side, one set probe
+    /// and one map probe. No allocation. Steering task only, never the drain.
+    #[must_use]
+    pub fn may_already_be_streaming(
+        &self,
+        security_id: u64,
+        segment_code: u8,
+        pool: DepthFeedKind,
+        now_secs: i64,
+    ) -> bool {
+        if !self
+            .published_once
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return false;
+        }
+        let key = (security_id, segment_code);
+        let held_here = match pool {
+            DepthFeedKind::Twenty => self.depth20.load().contains(&key),
+            DepthFeedKind::TwoHundred => self.depth200.load().contains(&key),
+        };
+        if held_here {
+            return true;
+        }
+        matches!(
+            self.dropped.load().get(&key),
+            Some(dropped_at) if now_secs.saturating_sub(*dropped_at) < DROPPED_RETENTION_SECS
+        )
     }
 
     /// How many instruments the dropped map currently remembers. For tests
@@ -817,6 +882,86 @@ mod tests {
         view.publish_depth20_at(big, T0);
         view.publish_depth20_at(std::iter::empty(), T0 + 60);
         assert_eq!(view.dropped_count(), MAX_DROPPED_TRACKED);
+    }
+
+    /// THE regression this method exists for. `classify_raw` answers `Held`
+    /// from the UNION of both pools, and both depth boards are cut from ONE
+    /// volume-ordered slice — so depth-200's top-5 entry set is almost always
+    /// inside depth-20's top 250. Gating depth-200 stamps on `classify_raw`
+    /// refused ~19 of every 20 of them (MEASURED 2026-09-11 by two
+    /// independent agents) and disabled that half of the instrument while its
+    /// counters read healthy.
+    #[test]
+    fn may_already_be_streaming_is_per_pool_so_the_other_pools_holding_never_blocks_a_stamp() {
+        let view = DepthSubscriptionView::new();
+        // The normal live shape: the depth-200 pick is also in depth-20's 250.
+        view.publish_depth20_at([(42, NSE_FNO)], T0);
+        view.publish_depth200_at(std::iter::empty(), T0);
+
+        assert!(
+            view.may_already_be_streaming(42, NSE_FNO.binary_code(), DepthFeedKind::Twenty, T0),
+            "depth-20 holds it, so a depth-20 stamp must still be refused"
+        );
+        assert!(
+            !view.may_already_be_streaming(
+                42,
+                NSE_FNO.binary_code(),
+                DepthFeedKind::TwoHundred,
+                T0
+            ),
+            "depth-20 holding it says NOTHING about a depth-200 subscribe — the \
+             pool byte in the stamp key already separates them, and refusing \
+             here is what silently disabled the depth-200 half"
+        );
+        // And the pool-blind answer it replaced would have refused both.
+        assert_eq!(
+            view.classify_raw(42, NSE_FNO.binary_code(), T0),
+            DepthFrameClass::Held,
+            "pinning WHY classify_raw is the wrong question for this gate"
+        );
+    }
+
+    /// The defence that must survive the pool split: a contract this process
+    /// DROPPED may still be streaming (Dhan ignores the unsubscribe), so it is
+    /// unmeasurable for EITHER pool — a drop is recorded without the pool that
+    /// made it.
+    #[test]
+    fn a_recently_dropped_contract_is_unmeasurable_for_both_pools() {
+        let view = DepthSubscriptionView::new();
+        view.publish_depth20_at([(7, NSE_FNO)], T0);
+        view.publish_depth20_at(std::iter::empty(), T0 + 60); // drops 7
+
+        for pool in [DepthFeedKind::Twenty, DepthFeedKind::TwoHundred] {
+            assert!(
+                view.may_already_be_streaming(7, NSE_FNO.binary_code(), pool, T0 + 61),
+                "a dropped contract may still be on the wire, whichever pool re-takes it"
+            );
+        }
+        // ...and the honest limit: past the retention this process has
+        // genuinely forgotten, and the ghost tail outlives that.
+        assert!(
+            !view.may_already_be_streaming(
+                7,
+                NSE_FNO.binary_code(),
+                DepthFeedKind::Twenty,
+                T0 + 60 + DROPPED_RETENTION_SECS + 1
+            ),
+            "recorded, not hidden: the measured ghost tail outlives this window"
+        );
+    }
+
+    #[test]
+    fn a_never_seen_contract_is_always_measurable() {
+        let view = DepthSubscriptionView::new();
+        view.publish_depth20_at([(1, NSE_FNO)], T0);
+        assert!(!view.may_already_be_streaming(
+            999,
+            NSE_FNO.binary_code(),
+            DepthFeedKind::Twenty,
+            T0
+        ));
+        // I-P1-11: the same number on another segment is another instrument.
+        assert!(!view.may_already_be_streaming(1, IDX.binary_code(), DepthFeedKind::Twenty, T0));
     }
 
     #[test]
