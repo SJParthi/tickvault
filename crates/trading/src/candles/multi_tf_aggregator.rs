@@ -2482,6 +2482,28 @@ mod tests {
             (120, 5_000),
             (119, 4_800), // LATE again
             (180, 6_000),
+            // ADDED 2026-09-11 — the shape this invariant could NOT see.
+            //
+            // Both LATE ticks above carry a SMALLER cumulative than the tick
+            // before them, so they are stale packets: their delta off the
+            // monotonic baseline is zero, and a frame that refuses them loses
+            // nothing. That made every refusal in this sequence free, and the
+            // invariant passed while the fold was losing volume in
+            // production.
+            //
+            // A late tick can equally carry a LARGER cumulative — it is a
+            // reading we had not seen, arriving out of order — and then the
+            // refusing frame IS told about real units. Before the
+            // unattributed carry, the 1s and 1m frames dropped these 1,000
+            // units on the floor while the day frame (whose bucket is still
+            // open, so `cumulative − bucket_start` sweeps them up) counted
+            // them: `left: 6000, right: 5000`, verified by running it.
+            //
+            // MEASURED on the live box the same day, security 68407:
+            // `candles_1s` 1,068,340 against `candles_5s` and `candles_1m`
+            // 1,071,330 — short by 2,990 gross and 650 of net, on the same
+            // ticks, for exactly this reason.
+            (30, 7_000), // LATE, and carrying NEWS
         ];
 
         let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
@@ -2510,7 +2532,7 @@ mod tests {
         // Ground truth: the highest cumulative observed minus the first one.
         // Volume traded before our first tick is unattributable to any bucket
         // we own, so it is excluded from BOTH sides — never invented.
-        let expected = 6_000_u64 - 1_000;
+        let expected = 7_000_u64 - 1_000;
         assert_eq!(
             total(TfIndex::S1),
             expected,
@@ -2524,6 +2546,231 @@ mod tests {
         assert_eq!(total(TfIndex::D1), expected, "the day bar is the same day");
         assert_eq!(total(TfIndex::S1), total(TfIndex::M1));
         assert_eq!(total(TfIndex::M1), total(TfIndex::D1));
+    }
+
+    /// The unattributed carry must be settled ONCE — the sharpest edge in the
+    /// mechanism, and the one the invariant test above cannot reach.
+    ///
+    /// A bucket's volume is recomputed on every in-bucket fold as
+    /// `cumulative − bucket_start_cumulative`, a span that ALREADY contains
+    /// any tick this frame refused since the bucket opened. So the moment a
+    /// tick lands in the same bucket as a refusal, the gross is settled by
+    /// arithmetic — and a carry left standing would be applied a SECOND time
+    /// at the next bucket open, inventing volume that never traded.
+    ///
+    /// That is the opposite failure from the one the carry exists to fix, it
+    /// is silent in exactly the same way, and the invariant sequence above
+    /// never produces it: none of its refusals is followed by a tick in the
+    /// same bucket of the refusing frame.
+    ///
+    /// BITE PROOF: making `settle_carry_into_open_bucket` a no-op leaves the
+    /// 1m total at 6,000 against a ground truth of 5,000 — the carry counted
+    /// twice.
+    #[test]
+    fn an_unattributed_carry_swept_up_in_bucket_is_never_settled_a_second_time() {
+        // (offset from the open, cumulative). Chosen so the 1m frame refuses a
+        // tick, then receives one INSIDE the same bucket, then rolls:
+        //
+        //   0   opens 1m bucket 0
+        //   60  rolls  — seals bucket 0, opens bucket 60
+        //   10  LATE for 1m (its bucket 0 already sealed) — carries 1,000
+        //   70  IN bucket 60 — `cumulative − bucket_start` sweeps the carry up
+        //   120 rolls  — must NOT apply the carry again
+        const SEQ: &[(u32, u32)] = &[
+            (0, 1_000),
+            (60, 2_000),
+            (10, 3_000), // LATE, carrying NEWS
+            (70, 4_000), // same 1m bucket as the roll above
+            (120, 5_000),
+        ];
+
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let mut bars: std::collections::HashMap<(TfIndex, u32), u64> =
+            std::collections::HashMap::new();
+        for (off, cum) in SEQ {
+            let t = tick(13, SEG_IDX, OPEN + off, 100.0, *cum);
+            let _ = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, tf, st| {
+                bars.insert((tf, st.bucket_start_ist_secs), st.volume);
+            });
+        }
+        agg.force_seal_all(|_, _, _, tf, st| {
+            bars.insert((tf, st.bucket_start_ist_secs), st.volume);
+        });
+
+        let total = |want: TfIndex| -> u64 {
+            bars.iter()
+                .filter(|((tf, _), _)| *tf == want)
+                .map(|(_, v)| *v)
+                .sum()
+        };
+
+        // Ground truth, the same rule the invariant above uses: the highest
+        // cumulative observed minus the first, because volume traded before
+        // our first tick belongs to no bucket we own.
+        let expected = 5_000_u64 - 1_000;
+        assert_eq!(
+            total(TfIndex::M1),
+            expected,
+            "the carry was swept up in-bucket; applying it again at the next \
+             open would invent volume"
+        );
+        // The day frame never refuses anything, so it is the independent
+        // witness: if the 1m total exceeds it, the extra units are fabricated.
+        assert_eq!(total(TfIndex::D1), expected);
+        assert_eq!(total(TfIndex::S1), expected);
+    }
+
+    /// The carried SIGN travels with the carried units, so the bar that
+    /// receives them counts the same trades twice over — once gross, once net.
+    ///
+    /// This is the half a gross-only fix silently leaves broken. `volume` and
+    /// `net_volume` are two readings of ONE set of trades, and
+    /// `net_volume().abs() <= volume` is a structural fact only while both are
+    /// fed from the same deltas. Settling the gross alone would hand the
+    /// receiving bar units whose direction it never learned, while
+    /// `net_volume_classified` still reported the bar fully classified — a
+    /// confident answer over volume nobody signed.
+    ///
+    /// BITE PROOF: dropping `carry.net` from the bucket-open seed leaves this
+    /// bar at `Some(1000)` against a gross of 2,000 — half its flow missing,
+    /// and nothing anywhere saying so.
+    #[test]
+    fn a_settled_carry_brings_its_sign_with_it_not_just_its_units() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let sink = |_: Feed, _: u64, _: u8, _: TfIndex, _: LiveCandleState| {};
+
+        // Every tick is an UPTICK, so every delta is buy-initiated and the
+        // arithmetic stays readable: net must equal gross throughout.
+        for (off, cum, px) in [
+            (0_u32, 1_000_u32, 100.0_f32), // seeds the baseline (unclassified)
+            (60, 2_000, 101.0),            // rolls 1m: opens bucket 60
+            (10, 3_000, 102.0),            // LATE for 1m — carries +1,000
+            (120, 4_000, 103.0),           // rolls 1m: opens bucket 120
+        ] {
+            let _ = agg.consume_tick(
+                Feed::Dhan,
+                &tick(77, SEG_IDX, OPEN + off, px, cum),
+                None,
+                sink,
+            );
+        }
+
+        let bar = agg
+            .snapshot(Feed::Dhan, 77, SEG_IDX, TfIndex::M1)
+            .expect("bucket 120 is open");
+        assert_eq!(
+            bar.volume, 2_000,
+            "its own 1,000 plus the 1,000 the late tick brought"
+        );
+        assert_eq!(
+            bar.net_volume(),
+            Some(2_000),
+            "both deltas were buy-initiated, so the net must account for the \
+             carried units too — a net short of the gross here means the \
+             carry arrived unsigned"
+        );
+    }
+
+    /// A bar that settles units nobody could SIGN inherits the ignorance —
+    /// it does not report a confident net over volume it never classified.
+    ///
+    /// The unclassifiable case is reachable on the live path and is not the
+    /// first-tick one: `classify_tick_volume` also refuses when real volume
+    /// arrives at an UNCHANGED price and no side has ever revealed itself for
+    /// that instrument, which is the ordinary state of an instrument whose
+    /// opening prints all match. A late tick of that shape carries units and
+    /// no direction.
+    ///
+    /// Settling its gross while leaving `net_volume_classified` true would
+    /// publish a net computed from a strict subset of the bar's own volume and
+    /// assert it complete — the exact false-OK the column exists to refuse.
+    ///
+    /// BITE PROOF: dropping `&& !carry.unclassified` from the bucket-open seed
+    /// turns the assertion below into `Some(1000)` against a gross of 2,000.
+    #[test]
+    fn a_bar_that_settles_unsignable_units_refuses_to_report_a_net() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let sink = |_: Feed, _: u64, _: u8, _: TfIndex, _: LiveCandleState| {};
+
+        for (off, cum, px) in [
+            // Flat opening prints: no side ever reveals itself, so every
+            // delta below is real volume with no readable direction.
+            (0_u32, 1_000_u32, 100.0_f32), // first tick — unclassifiable
+            (60, 2_000, 100.0),            // flat, carry still 0 — unclassifiable
+            (10, 3_000, 100.0),            // LATE for 1m, and UNSIGNABLE
+            (120, 4_000, 101.0),           // first real move: rolls 1m, classifiable
+        ] {
+            let _ = agg.consume_tick(
+                Feed::Dhan,
+                &tick(77, SEG_IDX, OPEN + off, px, cum),
+                None,
+                sink,
+            );
+        }
+
+        let bar = agg
+            .snapshot(Feed::Dhan, 77, SEG_IDX, TfIndex::M1)
+            .expect("bucket 120 is open");
+        assert_eq!(
+            bar.volume, 2_000,
+            "the units are still counted — ignorance of direction is not a \
+             reason to lose the trades"
+        );
+        assert_eq!(
+            bar.net_volume(),
+            None,
+            "1,000 of this bar's 2,000 units arrived with no readable side, \
+             so the honest answer is NULL rather than a net over half of it"
+        );
+    }
+
+    /// A carry outstanding at the DAY BOUNDARY is settled into that day's
+    /// final bar of its timeframe, never carried into tomorrow.
+    ///
+    /// Tomorrow's slot baseline is re-seeded from tomorrow's first tick, so a
+    /// carry measured against today's cumulative would describe a span that no
+    /// longer exists — applying it across the boundary is a WRONG answer, not
+    /// an imprecise one. Settling it here is the carry's own rule ("the next
+    /// bucket this frame touches") reaching its last opportunity of the day.
+    #[test]
+    fn a_carry_outstanding_at_the_day_boundary_lands_in_todays_final_bar() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let mut m1: Vec<(u32, u64)> = Vec::new();
+
+        // 0 opens 1m bucket 0; 60 rolls it; 10 is LATE for 1m and carries
+        // 1,000 with no further tick to sweep it up. The boundary is next.
+        for (off, cum) in [(0_u32, 1_000_u32), (60, 2_000), (10, 3_000)] {
+            let t = tick(13, SEG_IDX, OPEN + off, 100.0, cum);
+            let _ = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, tf, st| {
+                if tf == TfIndex::M1 {
+                    m1.push((st.bucket_start_ist_secs, st.volume));
+                }
+            });
+        }
+        agg.force_seal_all(|_, _, _, tf, st| {
+            if tf == TfIndex::M1 {
+                m1.push((st.bucket_start_ist_secs, st.volume));
+            }
+        });
+
+        // Last emission per bucket wins — a Refold amend re-emits its bucket.
+        let mut by_bucket: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+        for (start, vol) in m1 {
+            by_bucket.insert(start, vol);
+        }
+        let total: u64 = by_bucket.values().sum();
+        assert_eq!(
+            total,
+            3_000 - 1_000,
+            "the day's 1m bars must still tile the day — the carry lands in \
+             the final bar rather than being forfeited at the boundary"
+        );
+        assert_eq!(
+            by_bucket.get(&(OPEN + 60)).copied(),
+            Some(2_000),
+            "bucket 60 holds its own 1,000 plus the 1,000 the late tick \
+             brought and no frame had yet placed"
+        );
     }
 
     /// Collects `(feed, sid, seg, tf, bucket_start, o, h, l, c)` for

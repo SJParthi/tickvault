@@ -55,6 +55,17 @@ pub(crate) struct FoldCounters {
     pub(crate) session_low_recovered: metrics::Counter,
     pub(crate) oi_zero_ignored: metrics::Counter,
     pub(crate) volume_regression_suppressed: metrics::Counter,
+    /// UNITS (not events) a timeframe was told about by a tick it could not
+    /// fold, now owed to the next bucket that frame touches. Incremented by
+    /// the DELTA precisely so it is directly comparable to the gap it closes:
+    /// the seconds frame was measured 2,990 units short of the minute frame on
+    /// 2026-09-11 for exactly this reason, and an event count would have said
+    /// "some ticks were late" rather than "this much volume is in flight".
+    ///
+    /// Rising is NORMAL — ~10% of live ticks arrive late — so this is a
+    /// magnitude gauge, never a defect signal. It is the SETTLEMENT that makes
+    /// the units land; see `aggregator_cell::UnattributedCarry`.
+    pub(crate) volume_carried_unattributed: metrics::Counter,
     pub(crate) cumulative_regression: metrics::Counter,
     /// A cumulative counter that fell so far it cannot be a stale packet:
     /// a `u32` wrap past `u32::MAX`, or a day rollover restarting near zero.
@@ -159,6 +170,9 @@ impl FoldCounters {
             oi_zero_ignored: metrics::counter!("tv_candle_oi_zero_ignored_total"),
             volume_regression_suppressed: metrics::counter!(
                 "tv_candle_volume_regression_suppressed_total"
+            ),
+            volume_carried_unattributed: metrics::counter!(
+                "tv_candle_volume_carried_unattributed_total"
             ),
             cumulative_regression: metrics::counter!("tv_aggregator_cumulative_regression_total"),
             cumulative_reanchored: metrics::counter!("tv_aggregator_cumulative_reanchored_total"),
