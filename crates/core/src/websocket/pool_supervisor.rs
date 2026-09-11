@@ -71,6 +71,7 @@
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use tickvault_common::constants::FEED_UNSUBSCRIBE_TWENTY_DEPTH;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::types::{ExchangeSegment, SecurityId};
 use tickvault_storage::ws_frame_spill::{
@@ -4277,7 +4278,61 @@ where
                                 )
                                 .await
                                 {
-                                    Ok(Ok(())) => unsubscribe_succeeded = true,
+                                    Ok(Ok(())) => {
+                                        unsubscribe_succeeded = true;
+                                        // THE OTHER HALF OF THE GHOST EVIDENCE.
+                                        //
+                                        // Until 2026-09-11 this arm logged
+                                        // NOTHING. Only the refusal arm below
+                                        // named an instrument, so every one of
+                                        // the 160 unsubscribes Dhan ignored
+                                        // across the code-25 and code-24
+                                        // sessions took the SILENT path: we
+                                        // could see a socket still delivering a
+                                        // contract we had dropped, and we could
+                                        // not say which contract, nor when we
+                                        // had asked, nor with which request
+                                        // code.
+                                        //
+                                        // `Ok` here means the frame reached the
+                                        // wire, NOT that Dhan honoured it —
+                                        // `send_unsubscribe` is fire-and-forget
+                                        // and the vendor sends no ack. That is
+                                        // precisely why this line is worth
+                                        // writing: paired against the
+                                        // `unsubscribe_ignored` line on the
+                                        // drain, and against `market_depth`
+                                        // rows stamped after this instant, it
+                                        // is what turns "the socket is still
+                                        // delivering something" into a named
+                                        // contract with a request time and a
+                                        // request code — the shape a vendor
+                                        // ticket needs, and the shape our own
+                                        // telemetry could not produce.
+                                        //
+                                        // `request_code` is carried explicitly
+                                        // rather than left to be inferred from
+                                        // the build: 25 and 24 have BOTH now
+                                        // shipped, and a session's evidence is
+                                        // worthless if the reader has to guess
+                                        // which binary produced it.
+                                        //
+                                        // ~9,500 lines a session at the
+                                        // measured swap rate — about 24 a
+                                        // minute, and only while swaps are
+                                        // actually being planned.
+                                        info!(
+                                            source = "depth_unsubscribe_sent",
+                                            endpoint = supervisor.slot().endpoint.as_str(),
+                                            pool_index = supervisor.slot().pool_index,
+                                            security_id = drop_this.security_id,
+                                            segment = drop_this.segment.as_str(),
+                                            request_code = FEED_UNSUBSCRIBE_TWENTY_DEPTH,
+                                            "depth unsubscribe written to the wire — the vendor \
+                                             sends no acknowledgement, so this records only that \
+                                             we asked, and when"
+                                        );
+                                    }
                                     Ok(Err(_)) => {
                                         wire_failed = true;
                                         // The wire REFUSED the unsubscribe: nothing
