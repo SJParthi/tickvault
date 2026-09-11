@@ -1213,3 +1213,53 @@ UNCHANGED and byte-full, so a spilled-and-replayed bar persists `net_volume =
 NULL` rather than carrying the accumulator — recorded as outstanding in
 `seal_spill.rs`, because a format bump plus a mixed-stride reader is not a
 change to make beside a hot-path one.
+
+## RAM NOTE 2026-09-11 — unattributed volume carry (+10.8 MB host RAM, +$0.00/mo)
+
+**Why this note exists.** `MAX_AGGREGATOR_CELL_BYTES` in
+`crates/trading/src/candles/aggregator_cell.rs` carries the instruction
+*"update aws-budget.md before raising"*, and it FIRED on this change. This is
+that update — the same discipline as the 2026-09-10 note above, and the second
+time in two days that assert has turned an invisible per-field cost into a
+measured fleet number before the change shipped rather than after.
+
+**The change.** `AggregatorCell` gains a per-timeframe carry for volume a
+frame was told about by a tick it could not fold — `[u64; TF_COUNT]` gross,
+`[i64; TF_COUNT]` signed, `[bool; TF_COUNT]` unclassified — so a late tick's
+units land in a bar instead of no bar at all. Plus one more
+`[bool; TF_COUNT]`: a per-frame flag recording that a cumulative-counter
+restart has broken that frame's right-endpoint chain, so the next bucket it
+opens anchors on the live counter rather than on a number from the erased axis.
+
+| Budget | Was | Now | Fleet delta |
+|---|---|---|---|
+| `MAX_AGGREGATOR_CELL_BYTES` | `TF_COUNT × 136 × 2 + TF_COUNT × 4 + 160` = 6,784 B allowed, **6,568 B actual** | `TF_COUNT × 136 × 2 + TF_COUNT × 21 + 160` = 7,192 B allowed, **7,000 B actual** | ~164 MB → **~175 MB** at `AGGREGATOR_MAX_SLOTS` (25,000) |
+
+Both actuals are MEASURED with `size_of`, not estimated. Against the
+r8g.xlarge's 32 GiB (operator Quote 13) the delta is **0.03%** of the host.
+`BufferedSeal` and `SEAL_BUFFER_CAPACITY` are UNCHANGED — the carry lives on
+the cell and never enters a sealed bar or the spill record.
+
+**What it buys, measured rather than argued.** Security 68407, 2026-09-11:
+`candles_1s` gross 1,068,340 against `candles_5s` and `candles_1m` 1,071,330 —
+the seconds frame **2,990 units and 650 of net short** of the minute frame, on
+the same ticks, because a frame that refused a late tick had nowhere to put its
+volume. 10 MB for conservation across all 24 frames is the cheapest line in
+this budget.
+
+**Dollar cost: ZERO.** No instance change, no EBS change, no new alarm, no new
+EMF name. `tv_candle_volume_carried_unattributed_total` is deliberately local
+`/metrics` only: a rising value is NORMAL (~10% of live ticks arrive late) and
+it measures the mechanism WORKING, so a series would chart ordinary behaviour
+at ~$0.30/mo. The September position is unmoved and is restated rather than
+inherited — read live 2026-09-06, `limit_amount` **$150**, the 90%
+`STOP_EC2_INSTANCES` action line **$135.00**, forecast **$142.24**, already
+$7.24 over that line. This change neither helps nor worsens it, and the noise
+lock's standing rule (the next addition arrives with a LEVER, not a cost note)
+is the reason no EMF name ships here.
+
+**What is NOT claimed.** A RAM note, not a disk note: no candle column is added
+and the on-disk seal-spill record is unchanged in size and format. The carry is
+process state only — it never crosses the day boundary, and a counter restart
+drops it deliberately, because it is a difference measured against a baseline
+the restart erased.
