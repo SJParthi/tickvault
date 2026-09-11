@@ -26,7 +26,7 @@
 //! | Instruments per depth-200 CONNECTION | 1 | `docs/dhan-ref/04-full-market-depth-websocket.md:91`, `:270` |
 //! | `SecurityId` JSON type | **string** | `docs/dhan-ref/03-live-market-feed-websocket.md:72` |
 //! | Depth segments | NSE only | `docs/dhan-ref/04-full-market-depth-websocket.md:13`, `:274` |
-//! | Depth unsubscribe code | **24** (25 was proven IGNORED live on 2026-09-10) | `docs/dhan-ref/04-full-market-depth-websocket.md:280`, `docs/dhan-ref/08-annexure-enums.md` §(b) |
+//! | Depth unsubscribe code | **25** — the vendor table goes 23 -> 25; 24 appears in NO Dhan surface (operator full-doc pull, 2026-09-11). BOTH codes were proven ignored live; see `FEED_UNSUBSCRIBE_TWENTY_DEPTH` | Dhan v2 Annexure "Feed Request Code" |
 //!
 //! # Why 5 + 5 + 5 + 1 = 16 is legal
 //!
@@ -319,21 +319,22 @@ pub fn build_twenty_depth_subscription_messages(
     ))
 }
 
-/// Builds batched 20-level depth unsubscribe messages (RequestCode **24**).
+/// Builds batched 20-level depth unsubscribe messages (RequestCode **25**).
 ///
-/// 24, NOT 25 — since 2026-09-10. This function sent 25 until then, on the
-/// belief that the vendor reference client's `subscribe_code + 1` derivation
-/// (= 24) was a bug in that client. The live session of 2026-09-10 proved the
-/// opposite: every code-25 unsubscribe was ignored by Dhan (20
-/// `unsubscribe_ignored` events, 10 ghost redials, 8 instruments on 5
-/// depth-200 sockets in thirty minutes). The client was right; the portal
-/// export was wrong. `FEED_UNSUBSCRIBE_TWENTY_DEPTH` carries the evidence and
-/// the scope lock carries the dated record.
+/// **25 is the vendor's documented value and was restored 2026-09-11.** This
+/// function sent 25 until 2026-09-10, was changed to 24 when 25 was proven
+/// ignored on the wire, and is back at 25 because the operator's fresh full
+/// pull of the Dhan v2 docs shows the Feed Request Code table going
+/// `23 Subscribe` → `25 Unsubscribe` with **no 24 anywhere in 10,263 lines**.
+/// 24 was undocumented, and was ignored with a signature byte-identical to
+/// 25's — which is what says the code is not the variable.
 ///
-/// (The vendor client's language is named in the referenced doc, not here —
-/// `rust-only-forever-lock-2026-07-19.md` keeps the interpreted-runtime's
-/// name out of Rust source, and the guard that enforces it does not care
-/// that the mention was descriptive.)
+/// **Depth is the ONE family that breaks the `subscribe_code + 1` rule**
+/// Ticker (15→16), Quote (17→18) and Full (21→22) follow. That asymmetry is
+/// the vendor's, is pinned by test, and must not be "corrected".
+///
+/// `FEED_UNSUBSCRIBE_TWENTY_DEPTH` carries the full evidence and the scope
+/// lock carries the dated record.
 pub fn build_twenty_depth_unsubscription_messages(
     instruments: &[InstrumentSubscription],
     batch_size: usize,
@@ -367,13 +368,13 @@ pub fn build_two_hundred_depth_subscription_message(
 }
 
 /// Builds the 200-level depth unsubscribe message (RequestCode 24 — see the
-/// depth-20 sibling above for why 25 was retired on 2026-09-10).
+/// depth-20 sibling above for the 25 -> 24 -> 25 history and the vendor citation).
 pub fn build_two_hundred_depth_unsubscription_message(
     segment: ExchangeSegment,
     security_id: u64,
 ) -> Result<String, String> {
     build_two_hundred_depth_message(
-        tickvault_common::constants::FEED_UNSUBSCRIBE_TWENTY_DEPTH, // 24 for both 20- and 200-level
+        tickvault_common::constants::FEED_UNSUBSCRIBE_TWENTY_DEPTH, // 25 for both 20- and 200-level (vendor table: 23 -> 25)
         segment,
         security_id,
     )
@@ -770,17 +771,22 @@ mod tests {
     }
 
     #[test]
-    fn test_twenty_depth_unsubscribe_is_code_24_not_25() {
-        // Inverted 2026-09-10: this test pinned 25 and called the vendor
-        // client's 24 "a BUG". The live wire ignored 25 twenty times in
-        // thirty minutes; 24 is `subscribe_code + 1`, the rule every other
-        // unsubscribe code in this file already obeys.
+    fn test_twenty_depth_unsubscribe_is_the_documented_code_25() {
+        // Restored 2026-09-11. This pinned 25, was inverted to 24 on
+        // 2026-09-10 when 25 was proven ignored on the wire, and is back at
+        // 25 because the vendor's Feed Request Code table goes 23 -> 25 and
+        // NO Dhan surface names 24 at all. BOTH codes were ignored, with a
+        // byte-identical failure signature - so the code is not the variable,
+        // and we ship the value the vendor documents.
         let messages = build_twenty_depth_unsubscription_messages(&make_instruments(3), 100);
         assert!(
-            messages[0].contains("\"RequestCode\":24"),
-            "2026-09-10 live verdict — code 25 is ignored by Dhan; 24 ships"
+            messages[0].contains("\"RequestCode\":25"),
+            "the vendor table documents 25 for Unsubscribe - Full Market Depth"
         );
-        assert!(!messages[0].contains("\"RequestCode\":25"));
+        assert!(
+            !messages[0].contains("\"RequestCode\":24"),
+            "24 is a request code Dhan publishes nowhere"
+        );
     }
 
     #[test]
@@ -829,13 +835,13 @@ mod tests {
     }
 
     #[test]
-    fn test_two_hundred_depth_unsubscribe_is_code_24() {
+    fn test_two_hundred_depth_unsubscribe_is_the_documented_code_25() {
         let msg = build_two_hundred_depth_unsubscription_message(ExchangeSegment::NseEquity, 2885)
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
         assert_eq!(
-            parsed["RequestCode"], 24,
-            "2026-09-10 live verdict: 25 is ignored"
+            parsed["RequestCode"], 25,
+            "the vendor table documents 25; 24 appears in no Dhan surface"
         );
         assert_eq!(parsed["SecurityId"], "2885");
     }
