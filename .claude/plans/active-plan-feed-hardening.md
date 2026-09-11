@@ -5563,3 +5563,106 @@ per the standing rule, and none is needed here.
 - It is not measured — it is a targeted config change against a measured
   mechanism, and the next session is the verdict. Nothing here may be reported
   as fixed until `tv_questdb_wal_apply_lag_max` says so.
+
+---
+
+### Item 42 — CORRECTION BLOCK, 2026-09-11 (same day, hours later)
+
+Three claims in the block above are WRONG. Recorded as corrections rather than
+edited in place, per the house convention, because in every case the reasoning
+that produced the wrong claim is the reusable part.
+
+#### Correction 1 — the spill CAUSE is queue saturation, not ILP timeouts
+
+Item 42 attributes the 29.2% spill rate to flushes hitting the 5,000 ms
+`request_timeout`. The counters that separate the two causes were then read on
+the box and they refute it:
+
+| counter | value |
+|---|---:|
+| `tv_depth_flush_retries_skipped_total` (genuine timeouts) | **13** |
+| `tv_depth_flush_queue_full_total` | **68,838** |
+| `tv_depth_flush_width_capped_total` (the rescues) | **22,488** |
+| `tv_depth_flush_offloaded_total` | 107,778 |
+
+It is `DEPTH_FLUSH_QUEUE_DEPTH = 4` saturating, not the timeout firing.
+
+**This kills Fix 2 of Item 42 outright.** Raising the ILP `request_timeout`
+5 s → 15 s was ranked as the deeper fix and deferred only because
+`SHUTDOWN_GRACE_MARGIN_SECS` is derived from it behind a compile-time assert.
+It is now REFUTED on its own merits: the timeout fires 13 times a session, so
+raising it changes nothing. The coupling was never the real blocker.
+
+**Independently, the premise was also false.** questdb-rs applies
+`request_min_throughput` (default 102,400 B/s) which EXTENDS the effective
+deadline by `bytes / min_throughput`. A 10,000-row depth batch already gets
+~20.6 s, not 5 s. Two independent refutations of the same fix.
+
+#### Correction 2 — the shipped Fix 1 is INERT, and the sentence that says why was written as a reassurance
+
+The shipped comment reads: *"Memory does not grow with the window:
+`QDB_CAIRO_MAX_UNCOMMITTED_ROWS` above caps the lag buffer in ROWS."* True —
+and it is exactly why `o3MaxLag = 600s` cannot take effect.
+
+QuestDB commits on whichever limit binds first. Verified live, all 26 tables:
+`o3MaxLag = 60000000000`, `maxUncommittedRows = 2000000`.
+
+For a 600 s window to be reached the rate must stay below
+`2,000,000 / 600 = 3,333 rows/s`. Measured: **793,936,720 depth rows over
+~26,280 s = ~30,200 rows/s**, so the row cap fires at **~66 s — about 9×
+sooner**. The setting is correct in direction and currently cannot move a
+number.
+
+**A limitation written down as a reassurance, in the same commit that shipped
+the change it undermines.** That is the `day_ohlc_tracker` failure shape, in
+my own comment, hours old.
+
+**The missing half, deliberately NOT shipped:** `QDB_CAIRO_MAX_UNCOMMITTED_ROWS`
+is SERVER-WIDE across all 26 tables. Raising it 10× buys ~1.4 GB of QuestDB
+working set for `market_depth` alone (20M × 72 B) against a 12 GiB limit
+measured at 4.17 GiB, plus whatever the other 25 tables take. The surgical form
+is per-table `ALTER TABLE market_depth SET PARAM maxUncommittedRows = …` in the
+boot DDL — and `grep -rn "SET PARAM" crates/` returns **zero**, so that is a new
+mechanism with its own guard test and self-heal path, not a line edit. It lands
+measured, not at pace, and not on a Friday evening against a production
+database whose failure mode is a data-availability event.
+
+#### Correction 3 — the disk WAS saturated; the published "not the limit" is withdrawn
+
+Item 42 and the published diagnosis both state that throughput peaked at
+152 MB/s against 500 MB/s provisioned and was therefore not the limit.
+Re-measured across the whole day (`AWS/EBS VolumeWriteBytes`, 300 s periods,
+`vol-0c6ab6e593e39d8c8`, 600 GB / 6000 IOPS / 500 MB/s):
+
+| window (UTC) | write throughput |
+|---|---:|
+| 03:55 – 05:15 | **498.9 → 524.6 MB/s, continuously for 85 minutes** |
+| 05:20 – 05:25 | 342.7 → 154.8 MB/s |
+| 05:25 – 07:25 | ~130–155 MB/s |
+| 07:25 – 10:35 | ~65–130 MB/s |
+| **total, 02:55 – 10:45** | **5,020.2 GB = 5.02 TB** |
+
+The 152 MB/s figure was the **post-saturation plateau**, not the peak. The
+volume was pinned at and slightly above its provisioned ceiling for 85 minutes.
+
+**Against ~80 GB of logical rows (793,936,720 depth × 72 B + 71,076,745 ticks ×
+144 B + candles), 5.02 TB is ~63× write amplification.**
+
+**The CONCLUSION of Item 42 survives and is strengthened:** a wider pipe buys
+nothing when 98% of what goes through it is the same data re-written. But the
+sentence "nothing was saturated" was false, and it was the headline of the
+published page.
+
+#### What this leaves
+
+| | |
+|---|---|
+| Shipped | `o3MaxLag` 60 s → 600 s — correct direction, currently inert |
+| Required next | raise the row cap for `market_depth` only, per-table, in boot DDL (new mechanism) |
+| Refuted | raising the ILP `request_timeout` (13 timeouts all session; and `request_min_throughput` already extends it) |
+| Candidate, unproven | deeper `DEPTH_FLUSH_QUEUE_DEPTH` — cheap in memory now that replay batches are size-capped, but this morning's saturation was sustained for 85 minutes, not bursty, so a deeper queue would fill too |
+| Rejected | gating replay to outside market hours — nothing else drains `data/spill/depth`, so it risks the measured 2026-09-01 loss of 238,615,500 rows |
+
+**Nothing may be reported as fixed until these move:** backlog 55,060 → ;
+depth rows re-written 228,215,136 → ; disk reads 78 MB/s → ; total bytes
+written 5.02 TB → .
