@@ -255,8 +255,48 @@ services:
       #     would let one table hold the WAL apply job while the other ~25
       #     starved.
       QDB_CAIRO_MAX_UNCOMMITTED_ROWS: "2000000"
-      # O3 max lag: 60s. Tighter out-of-order merge window.
-      QDB_CAIRO_O3_MAX_LAG: "60000000"
+      # O3 max lag: 600s — QuestDB's own documented default.
+      #
+      # RAISED 2026-09-11 from 60s (see Item 42 of
+      # .claude/plans/active-plan-feed-hardening.md for the full measurement).
+      # The old value carried the comment "Tighter out-of-order merge window"
+      # and no measurement at all. Measured live, mid-session, 15:27 IST:
+      #
+      #   tv_dhan_feed_depth_total{outcome="rows"}   773,624,120
+      #   tv_depth_rows_spilled_total{feed="dhan"}   228,215,136  (29.5%)
+      #   tv_depth_rows_dropped_total{feed="dhan"}   228,215,136  (identical
+      #                                              => zero loss, all rescued)
+      #   tv_tick_spill_replayed_bytes_total          47,053,504,733 (47 GB)
+      #   tv_questdb_wal_apply_lag_max                55,060
+      #
+      # Nearly a THIRD of every depth row this session is written twice: once
+      # into a flush that hit its 5,000 ms client request_timeout on a device
+      # at 93.2% utilisation, and again from data/spill/depth/ at least
+      # REPLAY_INTERVAL_SECS = 300 later — carrying its ORIGINAL timestamp,
+      # because tick_spill_replay::retain_lines_in_open_window copies each
+      # line byte-for-byte and never re-stamps it.
+      #
+      # At 60s every one of those replayed rows was 5x to 400x OUTSIDE the
+      # merge window, so QuestDB could not absorb it in memory and had to
+      # rewrite the partition — which is the 78 MB/s of READS observed on a
+      # write-only workload, and the 93.2% device utilisation, which makes the
+      # NEXT flush more likely to time out. A spiral, and the tight window was
+      # feeding it.
+      #
+      # 600s covers the 300s replay cadence plus round duration with margin.
+      # Memory does not grow with the window: QDB_CAIRO_MAX_UNCOMMITTED_ROWS
+      # above caps the lag buffer in ROWS, and QuestDB measured 4.17 of its
+      # 12 GiB limit.
+      #
+      # NOT claimed: that this stops rows spilling. 29.5% still take that path
+      # until the depth ILP request_timeout is raised (Fix 2 in Item 42, which
+      # is coupled to SHUTDOWN_GRACE_MARGIN_SECS behind a compile-time assert
+      # and deliberately deferred). This treats the O3 COST, not the spill
+      # CAUSE.
+      #
+      # REVERT: set back to "60000000" and restart the container. No schema
+      # change, no data migration, no code path altered.
+      QDB_CAIRO_O3_MAX_LAG: "600000000"
       # --- Crash Recovery & Stability ---
       # Writer append page size: 16MB (QuestDB's default).
       #

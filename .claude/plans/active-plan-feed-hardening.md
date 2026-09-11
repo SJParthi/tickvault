@@ -5347,3 +5347,219 @@ bug fixing (four live defects), extreme check (the new distinction test is the
 ratchet). Hot-path rows: zero allocation unchanged, O(1) per tick unchanged —
 the classifier is still three compares and one negate, and the new restart
 check is one subtract and one compare on an arm that already existed.
+
+---
+
+## Item 42 — the depth WAL backlog: measured to a spiral, and the first fix is one config line (2026-09-11)
+
+**Status:** ROOT-CAUSED LIVE 2026-09-11 15:27 IST, mid-session, read-only.
+Authority: the operator's 2026-09-11 instruction *"fix this db backlog issue
+dude"*, then *"go ahead write the plan and fix it dude"*, given in direct
+response to a message that enumerated three candidate fixes and said a plan
+had to come first. That is the §28.2/§28.3 authorization shape this repository
+already accepts — a general go-ahead answering an ENUMERATED ask selects the
+enumerated work.
+
+### The question the operator actually asked
+
+*"is this the probelm with iops or ebs or data trasfer dude what coudl be the
+issue dude thats my main quesiton"* — and the answer, measured, is **none of
+those three**.
+
+| Resource | Provisioned | Peak used | Verdict |
+|---|---:|---:|---|
+| IOPS | 6,000 | 1,025 | **17% — not the limit** |
+| Throughput | 500 MB/s | 152 MB/s | **30% — not the limit** |
+| CPU | 4 vCPU | 37.7% idle | **not the limit** |
+| QuestDB RAM | 12 GiB | 4.17 GiB | **not the limit** |
+| Disk free | 600 GB | 464 GB free (23% used) | **not the limit** |
+| **iowait** | — | **59.66%** | **THE SYMPTOM** |
+| **Device util** | — | **93.2%**, queue 7.43 | **THE SYMPTOM** |
+| **READS on a write-only workload** | — | **78 MB/s** | **THE CAUSE — the database is rewriting, not appending** |
+
+So no instance upgrade, no IOPS raise, no throughput raise and no r8gd helps.
+A bigger pipe does not fix a database that is reading 78 MB/s in order to
+rewrite partitions it already wrote.
+
+### The measurement that settles it (live, 2026-09-11 15:27 IST)
+
+| Counter | Value |
+|---|---:|
+| `tv_dhan_feed_depth_total{outcome="rows"}` | 773,624,120 |
+| `tv_depth_rows_dropped_total{feed="dhan"}` | **228,215,136** |
+| `tv_depth_rows_spilled_total{feed="dhan"}` | **228,215,136** — identical, so ZERO loss |
+| **Share of depth rows that took the spill path** | **29.5%** |
+| `tv_tick_spill_replayed_bytes_total` | **47,053,504,733 (47 GB replayed today)** |
+| `tv_ticks_dropped_total` / `tv_ticks_spilled_total` | 9,632,844 / 9,632,844 (14% of 69,350,927 ticks) |
+| `tv_questdb_wal_apply_lag_max` | **55,060** |
+| `data/spill/depth/depth-dhan-496977.ilp` (current hour) | **1,932,125,394 bytes, still growing at 15:26:53** |
+| Previous hours' depth spill files | **0 bytes** — the drain empties each one |
+
+**Nearly a third of every depth row this session was written twice**: once
+into a flush that timed out, then again from disk, at least 300 seconds later,
+carrying its ORIGINAL timestamp.
+
+### The spiral, each step measured or cited
+
+1. Depth ILP flush carries `request_timeout = 5000` ms
+   (`depth_persistence.rs:512,520`, `ILP_REQUEST_TIMEOUT_SECS = 5`).
+2. The device sits at 93.2% utilisation, so a flush sometimes exceeds 5 s.
+3. The client gives up and RESCUES the batch to `data/spill/depth/` —
+   **228,215,136 rows, 29.5% of the session.**
+4. `run_replay_loop` re-POSTs those bytes **verbatim** every
+   `REPLAY_INTERVAL_SECS = 300` (`tick_spill_replay.rs:1034`). The filter
+   `retain_lines_in_open_window` copies lines byte-for-byte
+   (`:394`) — it FILTERS, it never re-stamps. The window test is
+   seconds-of-day, not staleness (`session_window.rs:253-276`), so a row up to
+   a full session old is admitted.
+5. **`QDB_CAIRO_O3_MAX_LAG` is `60000000` µs = 60 seconds**
+   (`docker-compose.yml:259`). Every replayed row is therefore **at minimum 5×
+   and potentially 400× outside the out-of-order merge window**, so QuestDB
+   cannot absorb it in memory and must rewrite the partition.
+6. Partition rewrites are the 78 MB/s of reads and the 93.2% util — which
+   makes the next flush more likely to exceed 5 s. **Back to step 2.**
+
+Observed partition splits of the 11:00 hour: 11:37:53, 11:43:06, 11:44:42,
+11:49:12, 11:54:33 — inter-split gaps of **313 s, 96 s, 270 s, 321 s**. Three
+of four cluster on 300 s = `REPLAY_INTERVAL_SECS`. Correlation, n=4, stated as
+such.
+
+**A feedback term nobody had written down:** `request_timeout` is a
+CLIENT-side timeout. The rescue log asserts the rows are "NOT in QuestDB yet",
+but on a device at 93.2% util the server may well have committed the batch —
+so part of that 47 GB of replay is re-writing rows that already exist, paying
+the full 8-column dedup comparison AND an O3 merge for no new data.
+
+### What was REFUTED — including my own first hypothesis
+
+| Hypothesis | Verdict | Why |
+|---|---|---|
+| IOPS / EBS / throughput / instance size | **REFUTED** | 17% / 30% / 37.7% idle — measured above |
+| `market_depth` has 974 rows per timestamp vs `ticks` 44, so dedup width is the cause | **REFUTED as sufficient** | 974 is the arithmetic shadow of `received_at_nanos` being computed ONCE PER FRAME (`dhan_feed_stack.rs:7037`). At a ~16 KB TCP read, d5 (10 rows/pkt), d20 (20) and d200 (200) each independently land on ~974. It carries no information. And `ticks` has a far WORSE out-of-order profile — ~10% of a session's rows arrive more than an hour late BY DESIGN, because `ticks.ts` is the exchange last-trade time (`tick_persistence.rs:1584`, `partition_archive.rs:436-442`) — yet `ticks` lag is 880 against depth's 55,060. A 63:1 ratio in the wrong direction. |
+| Cross-socket frame reordering on the shared mpsc | **REFUTED as material** | Real (`pool_supervisor.rs:3111` stamps before `:3191` sends, 16 tasks into one ring) but millisecond-scale — ~60,000× INSIDE the 60 s window |
+| Regression of the 2026-08-28 two-ILP-buffer bug | **REFUTED** | Fixed and build-guarded (`dhan_feed_stack.rs:14484-14512`) |
+| 16 MiB `WRITER_DATA_APPEND_PAGE_SIZE` amplification | **Unknown** | Would hit `ticks` equally; explains neither the reads nor the splits |
+
+### THE FIX — ranked, and only the first one ships here
+
+**Fix 1 (SHIPPING): `QDB_CAIRO_O3_MAX_LAG` 60 s → 600 s.**
+
+One line in `deploy/docker/docker-compose.yml`. Zero code. Reversible by a
+revert. It attacks step 5 directly: at 600 s the replayed rows land INSIDE the
+merge window and are absorbed in memory instead of forcing a partition
+rewrite.
+
+- **600 is not invented** — it is QuestDB's own documented default
+  (`600000000` µs). We are currently at **one tenth** of the vendor default,
+  and the comment justifying that (`"O3 max lag: 60s. Tighter out-of-order
+  merge window."`) carries no measurement.
+- **Memory is bounded independently** by `QDB_CAIRO_MAX_UNCOMMITTED_ROWS =
+  2000000` (`:257`), which caps the lag buffer in ROWS regardless of the time
+  window. QuestDB is using 4.17 of 12 GiB, so there is 8 GiB of headroom.
+- **It covers the whole replay cadence with margin**: 300 s interval + round
+  duration, inside 600 s.
+- Nothing in `crates/` pins this value (verified: `grep -rn "QDB_CAIRO"
+  crates/ --include=*.rs` returns nothing), so it needs no lockstep edit.
+
+**Fix 2 (DEFERRED, needs its own measurement): depth `ILP_REQUEST_TIMEOUT_SECS`
+5 → 15.** Attacks step 3 — stops 29.5% of rows entering the spill path at all.
+A 5-second client timeout against a device at 93.2% util is asking the rescue
+tier to handle a SLOW database when it exists for a DEAD one. Safe in
+principle now that the depth writer is off the drain task
+(`split_for_offload`, 2026-08-28), so a longer flush no longer stalls the fold.
+**Deferred because it is coupled**: `SHUTDOWN_GRACE_MARGIN_SECS` is DERIVED
+from `ILP_REQUEST_TIMEOUT_SECS` behind a compile-time assert
+(`main.rs:4137-4143`), and `DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS = 30` would
+have to rise in lockstep (15 + 15 + 12 = 42, so a budget near 50, still far
+inside systemd's `TimeoutStopSec=120`). That is a change to shutdown
+semantics and deserves to land after Fix 1 has been measured, not beside it.
+
+**Fix 3 (REJECTED AS DESIGNED — recorded so it is not re-proposed): gate the
+depth spill replay to outside market hours.** This was my own leading
+candidate and the adversarial pass killed it:
+
+- **It would risk the exact incident of 2026-09-01.** Nothing else ever empties
+  `data/spill/depth/` — `prune_spill_files_at` filters on `extension == "bin"`
+  and is non-recursive (`seal_spill.rs:920-1015`), and depth spill is `.ilp` in
+  a subdirectory. The drain's truncate is the only thing that empties it. At
+  the measured ~1.9 GB per hour, a gated session accumulates **~14 GB** against
+  a cap of ~18.75 GB (`depth_persistence.rs:613,654`) and a per-write free
+  floor of 16 GiB. `depth_persistence.rs:778-784` records what happens next,
+  verbatim: *"MEASURED IN PRODUCTION 2026-09-01: this exact arm fired 48 times
+  … and 238,615,500 depth rows were permanently discarded."*
+- **The unconditional boot round has it backwards.** `RESUME_OFFSETS` is
+  process-local (`tick_spill_replay.rs:292-300`), so a mid-session restart
+  re-POSTs the entire accumulated backlog from byte 0 — the very O3 storm the
+  gate exists to prevent, concentrated into one event. The repository records
+  **seven restarts on 2026-09-03**, two inside market hours.
+- The one fear that turned out to be unfounded: a deferred replay is NOT
+  refused by its own window filter. `line_is_positively_out_of_window` judges
+  the LINE's timestamp, never the wall clock — zero wall-clock reads on that
+  path.
+
+### Design
+
+Change `QDB_CAIRO_O3_MAX_LAG` from `"60000000"` to `"600000000"` in
+`deploy/docker/docker-compose.yml`, replacing the unmeasured "tighter is
+better" comment with the measured reasoning and the revert instruction.
+
+### Edge Cases
+
+- **Replay round longer than 600 s** — the row falls outside the window again
+  and behaves exactly as it does today. Strictly no worse.
+- **A restart mid-session** replays the whole backlog; rows older than 600 s
+  still force rewrites. Fix 1 narrows the problem, it does not remove it.
+- **Memory** — bounded by `MAX_UNCOMMITTED_ROWS = 2000000`, not by the time
+  window; 8 GiB of QuestDB headroom measured.
+- **A quiet table** (low row rate) holds its lag buffer longer before
+  committing. Acceptable: apply lag on those tables is already ~0.
+- **Weekend / holiday** — no feed, no writes, no effect.
+
+### Failure Modes
+
+- **QuestDB RSS grows past 12 GiB** → container `mem_limit` kills it →
+  `tv_questdb_wal_suspended_tables` and the QuestDB health poller fire. Revert
+  the one line. Bounded by `MAX_UNCOMMITTED_ROWS` in the first place.
+- **No improvement** → apply lag stays ~55,000. Then the cause is Fix 2's
+  timeout or the 16 MiB page granularity, and Fix 1 has cost nothing and is
+  reverted.
+- **Improvement that masks the spill rate** → 29.5% of rows still take the
+  spill path; Fix 2 remains necessary. Fix 1 treats the O3 cost, not the
+  spill cause. Stated plainly.
+
+### Test Plan
+
+- No Rust code changes, so no unit test can cover this. Stated rather than
+  faked.
+- `cargo test -p tickvault-storage` and `-p tickvault-app` must stay green
+  (nothing references the constant).
+- **The real test is the next session**, and it is pre-specified so it cannot
+  be rationalised afterwards:
+  `tv_questdb_wal_apply_lag_max`, `tv_depth_rows_spilled_total`, EBS
+  `VolumeReadBytes`, and the partition-split cadence, compared against today's
+  55,060 / 228,215,136 / 78 MB/s / ~300 s.
+
+### Rollback
+
+`git revert` the one-line change and redeploy, or set the env var back on the
+box. QuestDB reads it at container start; no data migration, no schema change,
+no code path altered.
+
+### Observability
+
+No new metric and no new alarm — deliberately, and this is a cost decision
+rather than an oversight. Every signal needed to judge this change already
+ships: `tv_questdb_wal_apply_lag_max` (alarmed),
+`tv_depth_rows_spilled_total` / `_dropped_total` (both seeded and shipped),
+`tv_tick_spill_replayed_bytes_total`, and CloudWatch's own `VolumeReadBytes`.
+The September forecast is $142.24 against a $135.00 automatic
+`STOP_EC2_INSTANCES` line, so a new EMF name (~$0.30/mo) would need a lever
+per the standing rule, and none is needed here.
+
+### What this does NOT claim
+
+- It does not stop rows spilling. 29.5% still take that path until Fix 2.
+- It does not make the disk faster.
+- It is not measured — it is a targeted config change against a measured
+  mechanism, and the next session is the verdict. Nothing here may be reported
+  as fixed until `tv_questdb_wal_apply_lag_max` says so.
