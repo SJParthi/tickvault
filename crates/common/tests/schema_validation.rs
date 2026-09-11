@@ -158,13 +158,31 @@ fn schema_response_codes_are_distinct() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn schema_feed_unsubscribe_is_subscribe_plus_one() {
+fn schema_feed_unsubscribe_is_subscribe_plus_one_except_depth() {
     assert_eq!(FEED_UNSUBSCRIBE_TICKER, FEED_REQUEST_TICKER + 1);
     assert_eq!(FEED_UNSUBSCRIBE_QUOTE, FEED_REQUEST_QUOTE + 1);
     assert_eq!(FEED_UNSUBSCRIBE_FULL, FEED_REQUEST_FULL + 1);
-    // Depth joined this rule on 2026-09-10, when the live wire proved the
-    // portal-export value (25) is ignored by Dhan. See constants.rs.
-    assert_eq!(FEED_UNSUBSCRIBE_TWENTY_DEPTH, FEED_REQUEST_TWENTY_DEPTH + 1);
+
+    // DEPTH IS THE ONE FAMILY THAT BREAKS THE RULE, and the break is the
+    // vendor's, not ours. Dhan's own Feed Request Code table reads
+    // `23 Subscribe - Full Market Depth` then `25 Unsubscribe - Full Market
+    // Depth`, SKIPPING 24 -- and the literal 24 appears as a request code
+    // nowhere in their v2 documentation (operator's full pull, 2026-09-11).
+    //
+    // This assertion inverted on 2026-09-10 to `+ 1` on the theory that the
+    // portal value was an export bug. A live session then proved code 24 is
+    // ignored EXACTLY as 25 was -- 80 unsubscribe_ignored lines, 40 depth-20
+    // and 40 depth-200, across all ten sockets, both days. Two codes failing
+    // identically is evidence the RequestCode is not the variable, so we ship
+    // the value the vendor documents and take the question to a ticket.
+    //
+    // Do NOT "correct" this asymmetry back to + 1: that is a third guess.
+    assert_eq!(FEED_UNSUBSCRIBE_TWENTY_DEPTH, 25);
+    assert_ne!(
+        FEED_UNSUBSCRIBE_TWENTY_DEPTH,
+        FEED_REQUEST_TWENTY_DEPTH + 1,
+        "depth breaks subscribe+1 by Dhan's own table: 23 -> 25, 24 unused"
+    );
 }
 
 // ---------------------------------------------------------------------------
