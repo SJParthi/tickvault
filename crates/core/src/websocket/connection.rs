@@ -960,6 +960,23 @@ impl DhanSocketParams {
             "not_connected",
             "unsubscribe_payload",
             "unsubscribe_send",
+            // ⚠ VACUOUS IN PRODUCTION — seeded anyway, deliberately.
+            //
+            // `send_unsubscribe` has ONE production call site and it wraps this
+            // function in `SWAP_WIRE_BUDGET` (1 s), while the write below is
+            // bounded by `SUBSCRIBE_SEND_TIMEOUT` (10 s). The outer budget
+            // always elapses first and drops this future, so the timeout arm
+            // never runs and this reason can never increment from the swap.
+            //
+            // It stays seeded rather than removed for two reasons: the arm IS
+            // reachable if the function is ever called unwrapped, and deleting
+            // the series would make it unseeded — and therefore invisible on
+            // its first real increment — the day the budgets change. What must
+            // NOT happen is citing a zero here as evidence that an unsubscribe
+            // reached the wire; that claim rests on the three reachable
+            // `unsubscribe_*` reasons and the coded `WS-GAP-02` log lines.
+            // Pinned by
+            // `pool_supervisor::tests::the_swap_budget_wins_so_the_inner_unsubscribe_timeout_is_vacuous`.
             "unsubscribe_timeout",
             "unsubscribe_not_connected",
         ] {

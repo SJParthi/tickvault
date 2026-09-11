@@ -3073,6 +3073,97 @@ swaps from 09:16 IST) is that probe, and it answered in the OTHER direction:
 > > never told to drop. Only `tv_dhan_ws_subscribe_failed_total{unsubscribe_*}`
 > > = 0 excludes this, and that must be re-read PER REASON, not as a rollup.
 > >
+> > ##### ✅ STEP 2 DONE 2026-09-11 (same evening) — the wire-failure alternative is EXCLUDED, but the instrument named above is one-quarter tautology
+> >
+> > The paragraph above says *"Only `tv_dhan_ws_subscribe_failed_total{unsubscribe_*}`
+> > = 0 excludes this, and that must be re-read PER REASON, not as a rollup."*
+> > It was re-read per reason. The answer is **zero on every reason on both
+> > days** — and the instruction was RIGHT to insist on per-reason, because
+> > the raw EMF records carry `endpoint` and `reason` as fields even though
+> > the CloudWatch METRIC folds them to `host` alone. The split is readable
+> > from `filter-log-events`; it is not readable from `get-metric-statistics`.
+> >
+> > | endpoint × reason (8 reasons × 3 endpoints) | 10 Sep · code 25 | 11 Sep · code 24 |
+> > |---|---:|---:|
+> > | every one of the 24 series | **0** | **0** |
+> > | samples per series | 537–538 | 537–538 |
+> >
+> > 537 samples at zero is a *reporting* zero, not an absent series — these
+> > are seeded in `DhanSocketParams::new`, so the first-sample rule that hid
+> > `tv_depth_rows_spilled_total` does not apply here.
+> >
+> > **But one of the four unsubscribe reasons could not have been anything
+> > but zero.** `send_unsubscribe` has exactly ONE production call site
+> > (`pool_supervisor.rs`, the swap) and it is wrapped in
+> > `tokio::time::timeout(SWAP_WIRE_BUDGET, ..)` — **1 second** — while the
+> > socket write inside `send_unsubscribe_in_mode` is bounded by
+> > `SUBSCRIBE_SEND_TIMEOUT` — **10 seconds**. The outer budget always
+> > elapses first and drops the inner future, so the inner timeout arm never
+> > runs and `reason="unsubscribe_timeout"` **can never increment in
+> > production**. Citing four zeros is citing three measurements and a
+> > tautology. That is the `capped`-counter class of the same day's
+> > findings list, arriving in a second file.
+> >
+> > **So the claim rests on three reachable reasons plus a fourth
+> > instrument** — and finding that fourth is what closed the hole. The
+> > outer-timeout arm sets `wire_failed` and emits a coded `WS-GAP-02` line
+> > with `source = "swap_wire_failed"` (or `"swap_emptied_socket"`), and
+> > `origin/main` carried that `source` field during BOTH sessions, so it
+> > would have been emitted had the arm fired:
+> >
+> > | app-log query, both schemas | 10 Sep | 11 Sep |
+> > |---|---:|---:|
+> > | `$.fields.source = "swap_wire_failed"` | **0** | **0** |
+> > | `$.fields.source = "swap_emptied_socket"` | **0** | **0** |
+> >
+> > **Every arm of the unsubscribe chain is now covered by a live instrument,
+> > and every one reads zero.** Across **7,780** (code 25) and **9,461**
+> > (code 24) depth unsubscribes, not one failed on our side: the payload
+> > built, the socket was connected, the write succeeded, and it completed
+> > inside the one-second budget. **The wire-failure alternative is
+> > EXCLUDED** — the ghosts are not our unsubscribes failing to reach the
+> > socket.
+> >
+> > **⚠ The honest limit, which is narrow and real.** `send_unsubscribe` is
+> > fire-and-forget and Dhan sends no ack: `Ok` means the bytes were written
+> > into the sink and flushed, not that the vendor processed them. This
+> > proves our side did its job up to the socket boundary and no further. A
+> > TCP-level failure on a live connection WOULD have surfaced as
+> > `unsubscribe_send`, and that is zero — so the remaining gap is bytes
+> > written to a healthy socket that the vendor then ignored, which is
+> > precisely the vendor ticket's claim.
+> >
+> > **⚠ A second defect found on the way, and it is the one that could have
+> > bitten silently.** The whole swap wire-outcome family —
+> > `tv_dhan_ws_swap_{total,refused,failed,timeout,emptied_socket,guard_reverted}_total`
+> > — is in NEITHER the EMF selector NOR seeded, so none of the six had ever
+> > reached CloudWatch. Their absence was not a zero, and the arm that can
+> > manufacture a FALSE ghost (the 1-second budget elapsing, where the guard
+> > is deliberately NOT reverted because the frame may have landed) was
+> > readable only by luck — the coded log line beside the counter. §2.3m of
+> > `dhan-rest-only-noise-lock-2026-07-14.md` alarmed `swap_emptied_socket`
+> > and left `swap_wire_failed` unalarmed.
+> >
+> > **FIXED the same evening**, free: six named consts replace the literal
+> > emit sites, all six are seeded at zero in `PoolSupervisor::new`, and
+> > `unsubscribe_timeout` is annotated at its seed site with why a zero there
+> > proves nothing. Three guards, each bite-proven in both directions
+> > (`the_swap_budget_wins_so_the_inner_unsubscribe_timeout_is_vacuous`,
+> > `every_swap_wire_outcome_counter_is_seeded_from_its_own_const`). **NOT
+> > fixed:** none of the six is EMF-selected, so none is alarmable — that is
+> > ~$0.30/mo each against a September forecast of $142.24 and a $135
+> > automatic-stop line, so §2.3n's lever requirement is unmet and is not
+> > assumed.
+> >
+> > **The reusable half, and it is about the guard rather than the code:**
+> > the seeding guard was itself VACUOUS on first write — it searched the
+> > source for the seeding line and found its own assertion message, so
+> > deleting the baseline left it green. Caught by bite-proving it, which is
+> > the only thing that could have caught it. A guard that quotes the text it
+> > searches for is a guard that cannot fail, and this file has now recorded
+> > the same shape three times: a saturated ceiling, an unreachable counter,
+> > and a self-satisfying scan.
+> >
 > > The reusable half is the one this file keeps recording, now about a
 > > measurement rather than a constant: **before citing a number as evidence,
 > > ask what its maximum is.** This one had been written down three times,
