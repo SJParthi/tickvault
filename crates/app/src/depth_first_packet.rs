@@ -60,8 +60,9 @@
 //! * [`DepthFirstPacketTracker::observe_at`] — the hot path, once per depth
 //!   PACKET, never per level. **One relaxed atomic load** when nothing is
 //!   pending, which is the overwhelming majority of the session. While a swap
-//!   is outstanding it is that load plus one `papaya` probe, and one removal on
-//!   the single packet that resolves it. Zero allocation on every arm.
+//!   is outstanding it is that load plus exactly ONE `papaya` probe — the
+//!   removal IS the read, so the packet that resolves a subscribe costs the
+//!   same single probe as one that does not. Zero allocation on every arm.
 //! * [`DepthFirstPacketTracker::record_subscribe_at`] — O(1), a few times a
 //!   minute on the steering task.
 //! * [`DepthFirstPacketTracker::sweep_expired_at`] — O(pending), bounded by
@@ -197,13 +198,14 @@ impl DepthFirstPacketTracker {
             return None;
         }
         let pinned = self.pending.pin();
-        let subscribed_at = *pinned.get(&(security_id, segment_code))?;
-        if pinned.remove(&(security_id, segment_code)).is_none() {
-            // Another thread resolved the same contract first. It emitted the
-            // measurement; emitting a second one would double-count a single
-            // arrival.
-            return None;
-        }
+        // ONE probe, not a `get` followed by a `remove`. `remove` hands back
+        // the value it took, so the read and the claim are the same operation
+        // — and that is also what makes the race safe rather than merely
+        // survivable: exactly one thread can receive `Some` for a given
+        // arrival, so a second thread cannot double-count it. A `get` first
+        // would let both threads read the stamp and then have one lose the
+        // claim, which costs a probe and buys nothing.
+        let subscribed_at = *pinned.remove(&(security_id, segment_code))?;
         self.pending_count.fetch_sub(1, Ordering::Relaxed);
         // Saturating, and a backward clock step yields zero rather than a
         // negative latency. A negative sample in a histogram is not a small
