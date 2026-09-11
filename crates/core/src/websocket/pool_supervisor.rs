@@ -302,6 +302,58 @@ pub const PARK_METRIC: &str = "tv_dhan_ws_park_total";
 /// not have and does not assume. It is a local `/metrics` series only.
 pub const RESPAWN_METRIC: &str = "tv_dhan_ws_park_respawn_total";
 
+/// Counter: a live subscription swap failed on the wire. No labels.
+///
+/// ⚠ THIS IS THE ARM THAT CAN MANUFACTURE A FALSE GHOST, and until
+/// 2026-09-11 it was the only failure path in the whole unsubscribe chain
+/// with no live instrument behind it.
+///
+/// The swap wraps `send_unsubscribe` in [`SWAP_WIRE_BUDGET`] (1 s) while the
+/// transport's own `SUBSCRIBE_SEND_TIMEOUT` is 10 s, so the OUTER budget
+/// always elapses first and the inner future is dropped BEFORE it can
+/// increment `tv_dhan_ws_subscribe_failed_total{reason="unsubscribe_timeout"}`.
+/// On that arm the guard is deliberately NOT reverted (the frame may have
+/// landed), so `held` keeps its advanced belief, the view publishes the
+/// contract as dropped, and a stream that continues reads as a GHOST — one
+/// we caused, not one the vendor caused.
+///
+/// A 2026-09-11 two-session read found these three counters are in NEITHER
+/// the EMF selector NOR seeded, so they had never reached CloudWatch at all.
+/// Their absence was therefore not a zero (the `tv_depth_rows_spilled_total`
+/// lesson, `dhan-rest-only-noise-lock-2026-07-14.md` §2.3o) and the arm was
+/// readable only by luck: the coded `WS-GAP-02` log line beside them.
+/// Seeding is free and is done in `PoolSupervisor::new`; an EMF name is
+/// ~$0.30/mo and needs an operator lever under §2.3n, so it is NOT taken here.
+pub const SWAP_FAILED_METRIC: &str = "tv_dhan_ws_swap_failed_total";
+
+/// Counter: the swap wire failure above was the 1-second budget elapsing.
+///
+/// A strict subset of [`SWAP_FAILED_METRIC`]. Separated because the two mean
+/// different things: a write ERROR is a socket that answered, a TIMEOUT is a
+/// socket that did not — and only the timeout leaves it genuinely unknown
+/// whether Dhan received the unsubscribe. That distinction is what decides
+/// whether a later ghost for the same instrument is vendor evidence or ours.
+pub const SWAP_TIMEOUT_METRIC: &str = "tv_dhan_ws_swap_timeout_total";
+
+/// Counter: the swap unsubscribed successfully and then failed to subscribe,
+/// so the socket is carrying LESS than it should — on depth-200, nothing.
+///
+/// The one member of this family that IS alarmed
+/// (`tv-<env>-errcode-ws-gap-02-swap-emptied-socket`, §2.3m) — and it is
+/// alarmed via its coded LOG line, not via this counter.
+pub const SWAP_EMPTIED_SOCKET_METRIC: &str = "tv_dhan_ws_swap_emptied_socket_total";
+
+/// Counter: a live subscription swap completed both wire calls. No labels.
+///
+/// The SUCCESS member of the swap family, seeded beside its failures so the
+/// pair is a ratio rather than a bare count: failures alone cannot say whether
+/// a quiet session meant a healthy one or a steering loop that never ran.
+pub const SWAP_TOTAL_METRIC: &str = "tv_dhan_ws_swap_total";
+
+/// Counter: a swap was refused before any wire call (budget, ack pending,
+/// unknown socket). No labels.
+pub const SWAP_REFUSED_METRIC: &str = "tv_dhan_ws_swap_refused_total";
+
 /// Counter: frame captured but the bounded ring refused it — the frame is
 /// durable in the WAL, the downstream consumer is behind. Label: `endpoint`.
 pub const RING_FULL_METRIC: &str = "tv_dhan_ws_ring_full_total";
@@ -3335,6 +3387,38 @@ impl PoolSupervisor {
                 }
             }
         }
+        // The SWAP WIRE-OUTCOME family, seeded 2026-09-11 after a two-session
+        // read found the WHOLE family had never reached CloudWatch.
+        //
+        // These six carry no labels, so they are seeded once rather than per
+        // endpoint. None is in the EMF selector, so seeding does not make them
+        // alarmable — it makes them HONEST at the local `/metrics` endpoint and
+        // at the scrape boundary, where an unseeded counter's first increment
+        // is the sample the agent discards.
+        //
+        // Why this family specifically. `SWAP_FAILED_METRIC` and
+        // `SWAP_TIMEOUT_METRIC` sit on the one arm that can manufacture a FALSE
+        // ghost: the swap bounds `send_unsubscribe` at `SWAP_WIRE_BUDGET` (1 s)
+        // while the transport's own `SUBSCRIBE_SEND_TIMEOUT` is 10 s, so the
+        // outer budget always wins and the inner future is dropped before it
+        // can increment
+        // `tv_dhan_ws_subscribe_failed_total{reason="unsubscribe_timeout"}`.
+        // That reason is therefore VACUOUS in production — a zero on it is a
+        // tautology, not a measurement, and it must never be cited as evidence
+        // that an unsubscribe reached the wire. The three reachable
+        // `unsubscribe_*` reasons and the coded `WS-GAP-02` log lines are what
+        // carry that claim.
+        for metric in [
+            SWAP_TOTAL_METRIC,
+            SWAP_REFUSED_METRIC,
+            SWAP_FAILED_METRIC,
+            SWAP_TIMEOUT_METRIC,
+            SWAP_EMPTIED_SOCKET_METRIC,
+            SWAP_GUARD_REVERTED_METRIC,
+        ] {
+            // SWAP_WIRE_SEED_ANCHOR — deleting this line deletes the baseline.
+            metrics::counter!(metric).increment(0);
+        }
         Self {
             budget: PoolBudget::new(),
             // Pre-sized to the hard ceiling rather than left unsized: the pool
@@ -4593,7 +4677,7 @@ where
                                      emptied, because a redial is idempotent and an empty socket is \
                                      not)."
                                 );
-                                metrics::counter!("tv_dhan_ws_swap_failed_total").increment(1);
+                                metrics::counter!(SWAP_FAILED_METRIC).increment(1);
                                 if wire_timed_out {
                                     // Separated from an ordinary write error
                                     // because they mean different things: a
@@ -4601,11 +4685,10 @@ where
                                     // a timeout is a socket that did not —
                                     // and the second is the one that also
                                     // cost the drain a full second.
-                                    metrics::counter!("tv_dhan_ws_swap_timeout_total").increment(1);
+                                    metrics::counter!(SWAP_TIMEOUT_METRIC).increment(1);
                                 }
                                 if lost_instruments {
-                                    metrics::counter!("tv_dhan_ws_swap_emptied_socket_total")
-                                        .increment(1);
+                                    metrics::counter!(SWAP_EMPTIED_SOCKET_METRIC).increment(1);
                                     // Told BEFORE the return, or the ack would
                                     // be dropped unanswered and the caller
                                     // would read that as "the task died".
@@ -4642,7 +4725,7 @@ where
                                     "live subscription swapped — this socket now carries the \
                                      current at-the-money contract without a re-dial"
                                 );
-                                metrics::counter!("tv_dhan_ws_swap_total").increment(1);
+                                metrics::counter!(SWAP_TOTAL_METRIC).increment(1);
                                 answer_swap(ack, SwapOutcome::Held);
                             }
                         }
@@ -4670,7 +4753,7 @@ where
                                  it has. That strike is no longer at-the-money and nothing \
                                  downstream can tell."
                             );
-                            metrics::counter!("tv_dhan_ws_swap_refused_total").increment(1);
+                            metrics::counter!(SWAP_REFUSED_METRIC).increment(1);
                         }
                     }
                 }
@@ -9652,5 +9735,75 @@ mod tests {
                  one early storm mute every socket for the rest of the session"
             );
         }
+    }
+
+    /// The swap's outer budget wins, which makes one failure reason VACUOUS —
+    /// and this test exists so nobody cites that reason as evidence again.
+    ///
+    /// `send_unsubscribe` has exactly ONE production call site and it is
+    /// wrapped in `tokio::time::timeout(SWAP_WIRE_BUDGET, ..)`. Inside,
+    /// `send_unsubscribe_in_mode` wraps its socket write in
+    /// `SUBSCRIBE_SEND_TIMEOUT`. With 1 s outside and 10 s inside, the outer
+    /// always elapses first and the inner future is DROPPED before its timeout
+    /// arm can run — so
+    /// `tv_dhan_ws_subscribe_failed_total{reason="unsubscribe_timeout"}` can
+    /// never increment from the swap path.
+    ///
+    /// That matters because on 2026-09-11 a two-session read used those four
+    /// reasons to exclude "our unsubscribe never reached the wire" as the cause
+    /// of the depth ghosts. Three of the four are real measurements. The fourth
+    /// is a tautology, and a tautology quoted as a zero is the `capped`-counter
+    /// class this repository has already recorded twice.
+    ///
+    /// The ordering itself is CORRECT and is not the defect: a socket that
+    /// cannot write a few hundred bytes in a second is sick, and holding the
+    /// drain for nine more seconds to prove it is worse. The defect was that
+    /// nothing said so, and that the arm which DOES fire had no seeded counter.
+    #[test]
+    fn the_swap_budget_wins_so_the_inner_unsubscribe_timeout_is_vacuous() {
+        assert!(
+            SWAP_WIRE_BUDGET < crate::websocket::connection::SUBSCRIBE_SEND_TIMEOUT,
+            "SWAP_WIRE_BUDGET ({:?}) must stay BELOW SUBSCRIBE_SEND_TIMEOUT ({:?}) — it is what \
+             keeps a sick socket from holding the drain for ten seconds. If this ever inverts, \
+             the `unsubscribe_timeout` reason becomes reachable and the comment in \
+             `PoolSupervisor::new` calling it vacuous must be corrected in the same change.",
+            SWAP_WIRE_BUDGET,
+            crate::websocket::connection::SUBSCRIBE_SEND_TIMEOUT,
+        );
+    }
+
+    /// Every swap wire-outcome counter is seeded, and seeded by NAME from the
+    /// same const the emit site uses — so a rename cannot silently orphan one.
+    ///
+    /// Found 2026-09-11: all six had never reached CloudWatch, and none was
+    /// seeded, so their absence was not a zero (the `tv_depth_rows_spilled_total`
+    /// lesson). A drop counter without its discriminator is the shape
+    /// `loss_series_seeding_guard` already forbids one file over.
+    #[test]
+    fn every_swap_wire_outcome_counter_is_seeded_from_its_own_const() {
+        let src = include_str!("pool_supervisor.rs");
+        for metric in [
+            SWAP_TOTAL_METRIC,
+            SWAP_REFUSED_METRIC,
+            SWAP_FAILED_METRIC,
+            SWAP_TIMEOUT_METRIC,
+            SWAP_EMPTIED_SOCKET_METRIC,
+            SWAP_GUARD_REVERTED_METRIC,
+        ] {
+            assert!(
+                !metric.is_empty() && metric.starts_with("tv_dhan_ws_swap"),
+                "unexpected swap metric name: {metric}"
+            );
+            assert!(
+                !src.contains(&format!("metrics::counter!(\"{metric}\")")),
+                "{metric} is emitted as a STRING LITERAL somewhere — point the emit site at the \
+                 const so the seeding list and the emit site cannot drift apart"
+            );
+        }
+        assert!(
+            src.contains(concat!("SWAP_WIRE_", "SEED_ANCHOR —")),
+            "the swap wire-outcome seeding loop is gone — an unseeded counter's first increment \
+             is the sample the CloudWatch agent discards, which is the one that matters"
+        );
     }
 }
