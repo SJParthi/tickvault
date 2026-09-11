@@ -539,12 +539,12 @@ pub fn apply_depth20_plan(sockets: &mut [Depth20LiveSocket], plan: &Depth20Plan)
                     let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
                     let may_already_be_streaming =
                         crate::depth_subscription_view::global_depth_subscription_view()
-                            .classify_raw(
+                            .may_already_be_streaming(
                                 take.security_id,
                                 take.segment.binary_code(),
+                                tickvault_core::parser::depth::DepthFeedKind::Twenty,
                                 now_nanos / 1_000_000_000,
-                            )
-                            != crate::depth_subscription_view::DepthFrameClass::Unknown;
+                            );
                     crate::depth_first_packet::global_depth_first_packet_tracker()
                         .record_subscribe_at(
                             take.security_id,
