@@ -367,8 +367,19 @@ pub fn build_two_hundred_depth_subscription_message(
     )
 }
 
-/// Builds the 200-level depth unsubscribe message (RequestCode 24 — see the
-/// depth-20 sibling above for the 25 -> 24 -> 25 history and the vendor citation).
+/// Builds the 200-level depth unsubscribe message (RequestCode 25 — the value
+/// Dhan's own Annexure documents; see the depth-20 sibling above for the
+/// 25 -> 24 -> 25 history).
+///
+/// HONEST LIMIT, measured 2026-09-11: the Full Market Depth guide documents NO
+/// unsubscribe at all — it has an "Adding Instruments" section and a "Feed
+/// Disconnect" section (RequestCode 12) and nothing between them, and its own
+/// field table pins RequestCode to "Values: 23". The unsubscribe codes live only
+/// in the Annexure code table. The ONLY worked unsubscribe payload in the whole
+/// v2 corpus belongs to the Global Stocks feed (INX_EQ, a different host). Both
+/// 25 and 24 were measured IGNORED on the wire, byte-identically, which is what
+/// you would expect if the Indian depth service implements no unsubscribe
+/// handler. We send the documented value and take the question to a ticket.
 pub fn build_two_hundred_depth_unsubscription_message(
     segment: ExchangeSegment,
     security_id: u64,
