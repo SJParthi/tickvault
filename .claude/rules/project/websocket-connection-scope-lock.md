@@ -2641,7 +2641,7 @@ unsubscribed contract "is not detected". It is now:
 **This is the safety net the FOURTH-quote section said must exist before the
 apply cadence is raised.** If code 25 is wrong for an endpoint, every swap
 becomes an add, the ghost shows within 90 s, and the socket is rebuilt within
-the cooldown instead of sitting at 804 for the session. *(⚠ 2026-09-10: this is exactly what happened — 20 ignored unsubscribes, 10 redials, no socket parked. Code 25 WAS wrong; 24 ships since the 2026-09-10 section.)*
+the cooldown instead of sitting at 804 for the session. *(⚠ 2026-09-10: this is exactly what happened — no socket parked. Code 25 WAS wrong; 24 ships since the 2026-09-10 section. **⚠ The counts once given here, "20 ignored unsubscribes, 10 redials", are WRONG — measured 2026-09-11 the session carried 80 lines across all ten sockets and both endpoints; see the dated correction under the 2026-09-10 section.**)*
 
 #### Also delivered: the two per-cadence faces of `top_volume_rank`
 
@@ -2670,7 +2670,8 @@ faces gives that without writing every row twice.
 4. **The unsubscribe RequestCode is still UNVERIFIED-LIVE.** The ghost counter
    is now the instrument that verifies it: a session with `ghost = 0` and
    `unsubscribed_grace > 0` is the evidence that 25 works. *(⚠ 2026-09-10: the
-   session read the OPPOSITE — 20 ignored, 10 redials, so 25 does NOT work and
+   session read the OPPOSITE — every code-25 unsubscribe ignored, so 25 does NOT
+work and
    24 now ships; the same counter pair is the verdict instrument for 24. See
    "2026-09-10 — THE DEPTH UNSUBSCRIBE REQUESTCODE IS SETTLED LIVE".)*
 
@@ -2900,6 +2901,64 @@ swaps from 09:16 IST) is that probe, and it answered in the OTHER direction:
 | Ghost redials armed (`outcome = "ghost_redial"`) | **10** |
 | Distinct instruments streaming depth-200 | **8**, on **5** single-instrument sockets |
 | Code on the wire for every one of those unsubscribes | **25** (`FEED_UNSUBSCRIBE_TWENTY_DEPTH`) |
+
+> ### ⚠ CORRECTED 2026-09-11 — the "20" and the "10" in the table above are BOTH WRONG, and the real numbers make the verdict STRONGER, not weaker
+>
+> Re-queried today against the source rather than carried forward
+> (`aws logs filter-log-events --log-group-name /tickvault/prod/app
+> --filter-pattern '{ $.fields.source = "unsubscribe_ignored" }'`), because this
+> table is the evidence a vendor support ticket will cite and a number quoted
+> from a quote is not a measurement:
+>
+> | 2026-09-10, code 25 | table said | MEASURED 2026-09-11 |
+> |---|---:|---:|
+> | `unsubscribe_ignored` ERROR lines, full session | 20 | **80** |
+> | …inside the table's own 09:16–09:46 window | 20 | **48** |
+> | Ghost redials armed | 10 | **80** (one per line; `redials_taken` reaches **8**, the session ceiling, on every socket) |
+> | Endpoints affected | depth-200 implied | **40 depth-200 AND 40 depth-20** |
+> | Distinct sockets affected | 5 implied | **10** — `connection_index` 5 through 14, i.e. EVERY depth socket |
+> | First / last line | — | 09:20:09.059 / 10:46:11.440 IST |
+>
+> **20 matches no window.** It is not the session total and it is not the
+> 30-minute total; where it came from is unrecoverable, which is exactly why it
+> should never have been written without the query beside it.
+>
+> **The same query for 2026-09-11 (code 24) returns the SAME SHAPE:** 80 lines,
+> 40/40 across both endpoints, all ten sockets, `redials_taken` max 8, first
+> 09:18:38.073 and last 10:21:39.074 IST, `ghost_packets` 1–24.
+>
+> #### Why this is the most important line in the section
+>
+> The two codes do not merely both fail — **they fail IDENTICALLY**: same line
+> count, same even split across two different endpoints, same ten sockets, same
+> exhaustion of the redial ceiling roughly an hour into the session. A code that
+> was simply *wrong* would be expected to differ from another wrong code in at
+> least one of those dimensions. **That both produce a byte-identical failure
+> signature is evidence the problem may not be the RequestCode at all** — and it
+> is the single strongest thing to put in front of Dhan engineering, which the
+> "20 vs 10" framing was too small to show.
+>
+> **Why the lines stop around 10:21–10:46 and not at the 15:40 close:** every
+> socket reaches `GHOST_REDIAL_SESSION_CEILING` (8) and stands down by design.
+> The ghosts kept streaming for the remaining ~5 hours with no further redial —
+> which is where the session's 5,250,076 `ghost` packets come from. Silence in
+> the log after 10:46 is the ceiling working, NOT the problem resolving.
+>
+> **NOT re-verified:** the "8 distinct instruments on 5 sockets" row. These log
+> lines carry `connection_index`, `endpoint`, `ghost_packets` and
+> `redials_taken` and **no instrument identifier at all** — see the flagged gap
+> below. That row stands as originally recorded and was not re-checked.
+>
+> #### ⚠ A REAL GAP this re-query exposed: no ghost can be NAMED
+>
+> The successful depth-swap path logs **no `security_id`** — `depth20_track.rs`
+> increments `DEPTH20_SWAPS_SENT` and logs only on the REFUSAL arms, which carry
+> `socket`, not the instrument. So across two full sessions of a confirmed
+> vendor-side failure, **this process cannot say which contract ghosted.** The
+> operator's own Dhan-support workflow requires "precise contract labels …
+> SecurityId for every contract cited", and today that requirement cannot be met
+> from our telemetry. Adding `security_id` + `segment` to the ghost line is the
+> prerequisite for a ticket that names contracts; it is NOT fixed here.
 
 A socket that was told to drop a contract kept receiving it past the 90 s grace,
 on every socket that swapped, every time. **Dhan did not honour a single code-25
