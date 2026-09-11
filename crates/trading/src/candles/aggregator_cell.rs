@@ -326,17 +326,43 @@ pub struct AggregatorCell {
     /// the left endpoint of the interval a session-extreme delta describes,
     /// and it is what makes attribution exact rather than assumed.
     last_observed_ts: u32,
-    /// Gross volume this timeframe has been TOLD ABOUT but has not yet put in
-    /// any bar — see [`UnattributedCarry`] for why it exists and how it is
-    /// settled. `0` in the steady state.
-    carried_gross: [u64; TF_COUNT],
-    /// Signed counterpart of [`Self::carried_gross`], carried alongside it so
+    /// The highest day-cumulative this timeframe has been TOLD ABOUT by a tick
+    /// it could not fold. `0` = nothing outstanding. See [`UnattributedCarry`].
+    ///
+    /// An ABSOLUTE cumulative, deliberately not a delta. A delta has to be
+    /// tracked against how much of it a later in-bucket fold happened to sweep
+    /// up, and a stale packet sweeps only part of it — which is exactly how the
+    /// first version of this carry lost 150 of 200 units in a case the hostile
+    /// suite reproduced. An absolute high-water mark makes the settlement
+    /// `volume = max(volume, carried_upto − bucket_start)`, which is idempotent
+    /// and cannot double-count or half-count whatever the fold already did.
+    carried_upto: [u64; TF_COUNT],
+    /// Signed counterpart of [`Self::carried_upto`], carried alongside it so
     /// the net and the gross always count the SAME trades.
     carried_net: [i64; TF_COUNT],
     /// Set when a carried tick could not be classified, so the bar that
     /// finally receives the carry inherits the ignorance rather than reporting
     /// a confident net it never earned.
     carried_unclassified: [bool; TF_COUNT],
+    /// Set on a CUMULATIVE-COUNTER RESTART, cleared when this frame next opens
+    /// a bucket: "the previous bar's right endpoint is on an axis that no
+    /// longer exists — do not chain to it."
+    ///
+    /// Right-endpoint chaining is what makes the frames tile
+    /// ([`Self::next_bucket_start_cumulative`]), and it is meaningful only
+    /// while the vendor's day-cumulative runs forward on ONE axis. A `u32`
+    /// wrap or a day rollover shifts that axis by an unknown amount, and the
+    /// endpoint of a pre-restart bar is then a number the post-restart counter
+    /// may not reach for hours — during which every new bar of that frame
+    /// would compute `cumulative − start` as zero and report 0 volume with a
+    /// rising tick count. That is precisely the "the guard that prevents
+    /// double-counting becomes the thing that kills the instrument" failure
+    /// the restart handling exists to prevent, so the chain is BROKEN rather
+    /// than followed across it.
+    ///
+    /// A per-frame flag and not a shared one: frames roll at different times,
+    /// so each must anchor on the first bucket IT opens after the restart.
+    chain_broken: [bool; TF_COUNT],
 }
 
 /// Volume a timeframe was told about by a tick it could not fold into a
@@ -379,12 +405,48 @@ pub struct AggregatorCell {
 /// trade a provable invariant for an UPSERT storm.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct UnattributedCarry {
-    /// Gross units owed to the next bucket this frame touches.
-    gross: u64,
-    /// Their signed sum under the tick rule.
+    /// Highest day-cumulative the frame was told about and has not accounted
+    /// for. `0` = nothing outstanding.
+    upto: u64,
+    /// Signed sum of the refused ticks, under the tick rule.
     net: i64,
-    /// At least one carried tick carried no classification.
+    /// At least one refused tick carried no classification.
     unclassified: bool,
+}
+
+impl UnattributedCarry {
+    /// Settle this carry into the bar that is about to be sealed.
+    ///
+    /// The gross is a `max`, not an add, and that is what makes it safe: the
+    /// bar's volume may ALREADY cover the carried cumulative (an in-bucket
+    /// fold after the refusal sweeps it up by arithmetic), may cover PART of
+    /// it (a stale packet widens only as far as its own smaller cumulative),
+    /// or may cover NONE of it (the bucket sealed first). One `max` is
+    /// correct in all three and cannot double-count in any — which a delta
+    /// could not manage without tracking how much had been swept.
+    ///
+    /// The SIGN is an add and is applied unconditionally, because the
+    /// in-bucket fold accumulates only the sign of the tick it was given; a
+    /// refused tick's sign reaches the bar through here or not at all. Net
+    /// and gross therefore land in the SAME bar, which is what keeps
+    /// `net_volume().abs() <= volume` structural rather than hopeful.
+    ///
+    /// # Complexity
+    /// O(1).
+    #[inline]
+    fn settle_into(self, state: &mut LiveCandleState) {
+        if self == Self::default() {
+            return;
+        }
+        let owed = self.upto.saturating_sub(state.bucket_start_cumulative);
+        if owed > state.volume {
+            state.volume = owed;
+        }
+        state.net_volume_signed = state.net_volume_signed.saturating_add(self.net);
+        if self.unclassified {
+            state.net_volume_classified = false;
+        }
+    }
 }
 
 /// The session extremes that moved between the previous observed packet and
@@ -439,21 +501,27 @@ impl AggregatorCell {
             last_seen_day_high: 0.0,
             last_seen_day_low: 0.0,
             last_observed_ts: 0,
-            carried_gross: [0; TF_COUNT],
+            carried_upto: [0; TF_COUNT],
             carried_net: [0; TF_COUNT],
             carried_unclassified: [false; TF_COUNT],
+            chain_broken: [false; TF_COUNT],
         }
     }
 
-    /// Remember a tick's delta that timeframe `ord` could not fold, so the
-    /// next bucket it touches can settle it. See [`UnattributedCarry`].
+    /// Remember that timeframe `ord` was TOLD ABOUT a cumulative it could not
+    /// fold, so the next bar it seals can account for it. See
+    /// [`UnattributedCarry`].
     ///
-    /// A ZERO delta is still recorded when the tick was unclassified: the
-    /// units are nil but the IGNORANCE is real, and a bar that inherits it
-    /// must not claim a net it never earned.
+    /// Records the ABSOLUTE cumulative, not a delta — see the field docs on
+    /// [`Self::carried_upto`] for why a delta cannot be settled correctly
+    /// against a bar a stale packet has partially widened.
+    ///
+    /// A tick that traded NOTHING new is still recorded when it was
+    /// unclassified: the units are nil but the IGNORANCE is real, and a bar
+    /// that inherits it must not claim a net it never earned.
     ///
     /// # Complexity
-    /// O(1) — three array writes, no allocation.
+    /// O(1) — at most three array writes, no allocation.
     #[inline]
     fn carry_unattributed(
         &mut self,
@@ -462,24 +530,25 @@ impl AggregatorCell {
         cumulative_volume: u64,
         signed_tick_volume: Option<i64>,
     ) {
-        // `saturating_sub`, not a subtraction: a STALE packet reaches these
-        // same late arms carrying a SMALLER cumulative, and it traded nothing
-        // new. Saturating to 0 is the honest answer for it; anything else
-        // would manufacture volume out of arrival order.
-        let delta = cumulative_volume.saturating_sub(bucket_start_cumulative);
-        if delta == 0 && signed_tick_volume.is_some() {
+        // A STALE packet reaches these same late arms carrying a SMALLER
+        // cumulative and traded nothing new, so it can never LOWER the
+        // high-water mark — `max`, never assignment.
+        let news = cumulative_volume > bucket_start_cumulative;
+        if !news && signed_tick_volume.is_some() {
             return;
         }
-        self.carried_gross[ord] = self.carried_gross[ord].saturating_add(delta);
+        if news && cumulative_volume > self.carried_upto[ord] {
+            self.carried_upto[ord] = cumulative_volume;
+            crate::candles::fold_counters::fold_counters()
+                .volume_carried_unattributed
+                .increment(cumulative_volume - bucket_start_cumulative);
+        }
         match signed_tick_volume {
             Some(signed) => {
                 self.carried_net[ord] = self.carried_net[ord].saturating_add(signed);
             }
             None => self.carried_unclassified[ord] = true,
         }
-        crate::candles::fold_counters::fold_counters()
-            .volume_carried_unattributed
-            .increment(delta);
     }
 
     /// Hand the carry to the caller and clear it, in one step so it can never
@@ -490,36 +559,56 @@ impl AggregatorCell {
     #[inline]
     fn take_carry(&mut self, ord: usize) -> UnattributedCarry {
         let carry = UnattributedCarry {
-            gross: self.carried_gross[ord],
+            upto: self.carried_upto[ord],
             net: self.carried_net[ord],
             unclassified: self.carried_unclassified[ord],
         };
-        self.carried_gross[ord] = 0;
+        self.carried_upto[ord] = 0;
         self.carried_net[ord] = 0;
         self.carried_unclassified[ord] = false;
         carry
     }
 
-    /// Settle a carry into the bucket that is ALREADY open for `ord`.
+    /// Where the NEXT bucket of timeframe `ord` must start counting: the exact
+    /// right endpoint of the bar before it.
     ///
-    /// Only the SIGNED half is applied here, and that asymmetry is the whole
-    /// point: the open bucket's volume is `cumulative − bucket_start`, a span
-    /// that already contains the refused tick, so adding the gross again would
-    /// count it twice. The sign is the half the in-bucket fold never saw.
+    /// This is the property that makes the frames tile. A bar covers the
+    /// cumulative span `[bucket_start_cumulative, bucket_start_cumulative +
+    /// volume]`, so the next bar starting anywhere else leaves a gap (volume
+    /// that reached no bar) or an overlap (volume counted twice). Chaining the
+    /// endpoints makes conservation arithmetic rather than something the fold
+    /// has to remember to preserve.
+    ///
+    /// `last_sealed` is the right source and not merely a convenient one: it
+    /// is written by EVERY seal path — the intraday roll, `catch_up_seal`'s
+    /// watermark drain, and nothing else — and it is CLEARED by `force_seal`,
+    /// so the day boundary falls back to the fresh baseline on its own.
+    ///
+    /// Falls back to the caller's slot baseline when this frame has sealed
+    /// nothing today, which is the day's first bar.
     ///
     /// # Complexity
-    /// O(1).
+    /// O(1) — one array read and, at most once per frame per restart, one
+    /// flag swap.
     #[inline]
-    fn settle_carry_into_open_bucket(&mut self, ord: usize) {
-        let carry = self.take_carry(ord);
-        if carry == UnattributedCarry::default() {
-            return;
+    fn next_bucket_start_cumulative(
+        &mut self,
+        ord: usize,
+        slot_baseline: u64,
+        live_cumulative: u64,
+    ) -> u64 {
+        // CHAIN BROKEN by a counter restart — see [`Self::chain_broken`].
+        // Anchor on the LIVE cumulative instead of a pre-restart endpoint, and
+        // consume the flag so only the first bucket this frame opens after the
+        // restart pays for it.
+        if std::mem::replace(&mut self.chain_broken[ord], false) {
+            return live_cumulative;
         }
-        let state = &mut self.slots[ord];
-        state.net_volume_signed = state.net_volume_signed.saturating_add(carry.net);
-        if carry.unclassified {
-            state.net_volume_classified = false;
+        let last = self.last_sealed[ord];
+        if last.is_uninitialised() {
+            return slot_baseline;
         }
+        last.bucket_start_cumulative.saturating_add(last.volume)
     }
 
     /// Observes this packet's exchange-published session extremes and records
@@ -703,14 +792,25 @@ impl AggregatorCell {
             }
             state.bucket_start_cumulative = cumulative_volume.saturating_sub(state.volume);
         }
-        // Any unattributed carry died with the old counter. It is a DIFFERENCE
-        // measured against a baseline the restart erased, so settling it into
-        // a post-restart bucket would add units from a span that no longer
-        // exists. Dropped, for the same reason and with the same bounded cost
-        // as the wrapping tick's own delta the caller already forfeits.
-        self.carried_gross = [0; TF_COUNT];
+        // Any unattributed carry died with the old counter. It is a cumulative
+        // on a counter the restart erased, so settling it into a post-restart
+        // bucket would widen that bar to a number from a span that no longer
+        // exists — a WRONG answer, where dropping it is a bounded one, with
+        // the same cost as the wrapping tick's own delta the caller already
+        // forfeits.
+        self.carried_upto = [0; TF_COUNT];
         self.carried_net = [0; TF_COUNT];
         self.carried_unclassified = [false; TF_COUNT];
+        // BREAK THE CHAIN. Every open bucket above kept the volume it had
+        // already counted, which is right — but its right endpoint is now a
+        // number on the OLD axis, and the post-restart counter may not reach
+        // it for hours. Chaining the next bucket to it would make that frame
+        // report 0 volume with a rising tick count until it did. The next
+        // bucket each frame opens therefore anchors on the live cumulative
+        // instead, forfeiting the wrapping tick's own delta — the same bounded
+        // cost this function already accepts, and the same one the caller
+        // documents.
+        self.chain_broken = [true; TF_COUNT];
     }
     /// Folds one tick into ONE timeframe slot.
     ///
@@ -995,26 +1095,53 @@ impl AggregatorCell {
             // the seal path it is read from.
             let first_bucket_of_day = self.last_sealed[ord].is_uninitialised()
                 && is_days_first_session_bucket(tf, bucket_start);
-            // Taken into a local BEFORE the call: `take_carry` needs `&mut
-            // self` and the call's result is assigned into `self.slots`, so
-            // inlining it would hold two mutable borrows at once. It is also
-            // the clearer reading — the carry is consumed exactly once, here.
-            let carry = self.take_carry(ord);
+            // Taken into locals BEFORE the call: both need `&mut self`/`&self`
+            // and the call's result is assigned into `self.slots`, so inlining
+            // either would hold overlapping borrows. It is also the clearer
+            // reading — the carry is consumed exactly once, here.
+            //
+            // CHAINED, not baselined. This bucket starts where this frame's
+            // previous bar ENDED, so the two abut exactly. The slot baseline
+            // is only the fallback for the day's first bar, when there is no
+            // previous bar to chain to. Using the baseline unconditionally is
+            // what left a gap whenever this frame had refused a tick: the
+            // baseline had advanced past the refusal and the sealed bar had
+            // not.
+            let chained_start =
+                self.next_bucket_start_cumulative(ord, bucket_start_cumulative, cumulative_volume);
             self.slots[ord] = open_bucket(
                 tick,
                 prices,
                 bucket_start,
-                bucket_start_cumulative,
+                chained_start,
                 BucketOpenContext {
                     use_day_open,
                     first_bucket_of_day,
                     prev_close: net_volume_baseline(&self.last_sealed[ord], bucket_start),
-                    carry,
                 },
                 cumulative_volume,
                 signed_tick_volume,
                 fold_secs,
             );
+            // SETTLE AFTER the open, never SEEDED into it.
+            //
+            // This is the one seal-less shape the carry can reach: the slot
+            // was drained by `catch_up_seal` (or has never opened today) and
+            // then refused a tick before another one opened it, so there was
+            // no bar to settle into. `settle_into` is the SAME idempotent
+            // `max` every seal site uses.
+            //
+            // Running it HERE rather than seeding `open_bucket` is what stops
+            // a carry surviving a counter restart. Seeding happened inside the
+            // timeframe loop, while the restart was only detected after it, so
+            // a bar could take a sign measured against a counter the rebase
+            // was about to erase — `volume 200, net_signed -800` in
+            // `hostile_a_carried_sign_across_a_restart_inverts_the_published_net`.
+            // The detection is now hoisted above the loop
+            // (`multi_tf_aggregator`, search `let restarted =`), so by the time
+            // this line runs the carry from an erased counter is already gone.
+            let carry = self.take_carry(ord);
+            carry.settle_into(&mut self.slots[ord]);
             return ConsumeOutcome::Updated;
         }
 
@@ -1066,17 +1193,23 @@ impl AggregatorCell {
                 signed_tick_volume,
                 fold_secs,
             );
-            // SETTLEMENT, in-bucket form — and it MUST run here, not only at
-            // an open. `fold_in_bucket` recomputes volume as
-            // `cumulative − bucket_start_cumulative`, a span that already
-            // contains any tick this frame refused since the bucket opened, so
-            // the gross is settled by arithmetic the moment a tick lands in
-            // the same bucket. Leaving the carry standing would then apply it
-            // a SECOND time at the next open — the double-count that makes
-            // this the sharpest edge in the whole mechanism. Only the sign is
-            // still owed, and `settle_carry_into_open_bucket` applies exactly
-            // that, then clears.
-            self.settle_carry_into_open_bucket(ord);
+            // NO settlement here, deliberately — the in-bucket path leaves the
+            // carry standing for the SEAL to settle.
+            //
+            // An earlier version of this change settled it here, reasoning
+            // that `cumulative − bucket_start` already contains any refused
+            // tick so only the sign was still owed. That is true of a tick
+            // whose cumulative is at or above the carried one and FALSE of a
+            // stale packet, which widens the bucket only as far as its own
+            // smaller reading — so the settle cleared a carry the bucket had
+            // swept only part of, and the remainder reached no bar. The
+            // hostile suite reproduced it losing 150 of 200 units
+            // (`hostile_a_stale_in_bucket_packet_clears_a_carry_it_never_swept`).
+            //
+            // Settling at the seal instead makes the question disappear rather
+            // than answering it: `UnattributedCarry::settle_into` is a `max`
+            // against an ABSOLUTE cumulative, so it is idempotent whether the
+            // bucket swept all, part, or none of the carry.
             // Session extremes keep arriving through the first bucket's life,
             // so re-adopt on every tick of it — `day_high` at the bucket's LAST
             // tick is the one that matters, and max/min converge to it.
@@ -1136,19 +1269,41 @@ impl AggregatorCell {
             // The day gate still applies — a bucket crossing can itself be a
             // day boundary when `force_seal_all` did not run overnight.
             let prev_close_for_new_bucket = net_volume_baseline(&self.slots[ord], bucket_start);
-            // Captured BEFORE the `mem::replace` for the same borrow reason as
-            // `prev_close_for_new_bucket` above. This is the site the whole
-            // carry exists for: a frame that refused a late tick and then
-            // ROLLED would otherwise seal the old bar short and start the new
-            // one past the gap, leaving the units in no bar at all.
+            // SETTLE FIRST, then chain — order is the whole correctness of
+            // this site, and `mem::replace` makes it easy to get wrong: it
+            // evaluates its second argument (the new bucket) BEFORE swapping,
+            // so anything read from the old slot inside that expression sees
+            // the UNSETTLED bar. Both values are therefore computed here, in
+            // this order: the carry widens the outgoing bar, and only then is
+            // its right endpoint read as the incoming bar's start.
+            //
+            // This is the site the carry exists for. A frame that refused a
+            // late tick and then rolled used to seal the old bar short AND
+            // start the new one past the gap — the units fell between two bars
+            // and reached neither, which is the 2,990-unit seconds-frame
+            // shortfall measured on the box.
             let carry = self.take_carry(ord);
+            carry.settle_into(&mut self.slots[ord]);
+            // CHAIN BROKEN by a counter restart — see [`Self::chain_broken`].
+            // The bar being sealed here kept the volume it counted on the OLD
+            // axis, so its right endpoint is a number the post-restart counter
+            // may not reach for hours. Anchor the incoming bar on the live
+            // cumulative instead, and consume the flag so only the first
+            // bucket this frame opens after the restart pays for it.
+            let chained_start = if std::mem::replace(&mut self.chain_broken[ord], false) {
+                cumulative_volume
+            } else {
+                self.slots[ord]
+                    .bucket_start_cumulative
+                    .saturating_add(self.slots[ord].volume)
+            };
             let mut sealed_state = std::mem::replace(
                 &mut self.slots[ord],
                 open_bucket(
                     tick,
                     prices,
                     bucket_start,
-                    bucket_start_cumulative,
+                    chained_start,
                     BucketOpenContext {
                         use_day_open: false,
                         // An intraday crossing is never the day's first bar,
@@ -1156,7 +1311,6 @@ impl AggregatorCell {
                         // here — the scope guarantee of plan Item 6.
                         first_bucket_of_day: false,
                         prev_close: prev_close_for_new_bucket,
-                        carry,
                     },
                     cumulative_volume,
                     signed_tick_volume,
@@ -1250,14 +1404,7 @@ impl AggregatorCell {
         if self.slots[ord].is_uninitialised() {
             return None;
         }
-        if carry != UnattributedCarry::default() {
-            let state = &mut self.slots[ord];
-            state.volume = state.volume.saturating_add(carry.gross);
-            state.net_volume_signed = state.net_volume_signed.saturating_add(carry.net);
-            if carry.unclassified {
-                state.net_volume_classified = false;
-            }
-        }
+        carry.settle_into(&mut self.slots[ord]);
         let mut sealed = std::mem::replace(&mut self.slots[ord], LiveCandleState::empty());
         // SEAL SITE 2 of 5 (see `stamp_seal_percentages`).
         sealed.stamp_seal_percentages();
@@ -1298,6 +1445,15 @@ impl AggregatorCell {
         {
             return None;
         }
+        // Settle before the drain, exactly as the roll and the day boundary
+        // do. Without it a carry outstanding when the watermark drains this
+        // bucket survives on an UNINITIALISED slot, and if the day ends before
+        // another tick opens one, `force_seal` returns early and forfeits it —
+        // reproduced by
+        // `hostile_a_carry_is_forfeited_when_catch_up_seal_drained_the_slot`,
+        // which lost 200 of 500 units.
+        let carry = self.take_carry(ord);
+        carry.settle_into(&mut self.slots[ord]);
         let mut sealed = std::mem::replace(&mut self.slots[ord], LiveCandleState::empty());
         // SEAL SITE 3 of 5 (see `stamp_seal_percentages`). Stamped before
         // `last_sealed` so a subsequent late refold amends a stamped bar.
@@ -1459,16 +1615,13 @@ fn open_bucket(
         use_day_open,
         first_bucket_of_day,
         prev_close: bucket_open_prev_close,
-        carry,
     } = ctx;
-    // SETTLEMENT, gross half. Starting this bucket's baseline LOWER by the
-    // carried units is what puts them in a bar: `volume` below is
-    // `cumulative − bucket_start_cumulative`, so widening the span on the left
-    // by exactly the units a previous frame-refusal skipped makes this bucket
-    // count them, once. `saturating_sub` because the carry can never exceed
-    // the baseline it was measured against, and a saturate is the honest
-    // answer if a counter restart ever makes it appear to.
-    let bucket_start_cumulative = bucket_start_cumulative.saturating_sub(carry.gross);
+    // `bucket_start_cumulative` arrives ALREADY CHAINED to the right endpoint
+    // of this frame's previous bar (`next_bucket_start_cumulative`, or the
+    // open slot's own endpoint at a roll), so nothing is settled here:
+    // consecutive bars of a frame abut exactly, and conservation is arithmetic
+    // rather than bookkeeping. The carry — gross AND sign — is applied only by
+    // `UnattributedCarry::settle_into`, and only to a bar that already exists.
     let price = prices.last_traded_price;
     // `day_open` is already `0.0` unless the raw field was strictly positive
     // (NaN included), so this test carries the original `> 0.0` semantics.
@@ -1490,21 +1643,23 @@ fn open_bucket(
         // net-volume column cannot see. On a 1-second frame that is a large
         // share of every bar.
         //
-        // SETTLEMENT, signed half. The carried sign travels with the carried
-        // gross so the two always describe the SAME trades — which is what
-        // keeps `net_volume().abs() <= volume` a structural fact rather than a
-        // hope. Settling the gross alone would have made every carrying bar
-        // understate its flow while still reporting itself fully classified.
-        net_volume_signed: signed_tick_volume.unwrap_or(0).saturating_add(carry.net),
+        // NO carry is applied here. Every settlement now happens through
+        // `UnattributedCarry::settle_into` on a bar that already EXISTS — at
+        // each seal, and immediately after this call on the one seal-less
+        // shape. Seeding a bucket at open was the mechanism by which a sign
+        // measured against a pre-restart counter reached a post-restart bar,
+        // and removing the seed removes the class rather than guarding it.
+        net_volume_signed: signed_tick_volume.unwrap_or(0),
         // The LIVE fold is the one place that classifies. Every other producer
         // of a `LiveCandleState` — `new()`, the spill decoder — leaves this
         // `false`, so `net_volume()` refuses rather than reporting a bar it
         // never classified as perfectly balanced.
-        // `&& !carry.unclassified` — a bucket that settles units it cannot
-        // sign inherits the ignorance. Reporting a confident net over volume
-        // whose direction was never established is the false-OK this whole
-        // column exists to avoid.
-        net_volume_classified: signed_tick_volume.is_some() && !carry.unclassified,
+        //
+        // A bucket that later SETTLES units it cannot sign inherits the
+        // ignorance through `settle_into`, which clears this flag. Reporting a
+        // confident net over volume whose direction was never established is
+        // the false-OK this whole column exists to avoid.
+        net_volume_classified: signed_tick_volume.is_some(),
         bucket_start_cumulative,
         oi: i64::from(tick.open_interest),
         tick_count: 1,
@@ -1575,10 +1730,6 @@ struct BucketOpenContext {
     /// Close of the previous sealed bar of this timeframe; `0.0` means "no
     /// baseline" and makes [`LiveCandleState::net_volume`] report `None`.
     prev_close: f64,
-    /// Volume this timeframe was told about by ticks it could not fold, which
-    /// this bucket now settles. Zero in the steady state — see
-    /// [`UnattributedCarry`].
-    carry: UnattributedCarry,
 }
 
 /// The baseline a bar's net-volume sign is measured against: the close of the
