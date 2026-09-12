@@ -3065,9 +3065,14 @@ impl LiveIngest {
                 segment,
                 underlying_id: owner.underlying_id,
                 volume: tick.volume,
-                // Rank-output only: `observe` ignores it and `rank` overwrites
-                // it. Set here it would be a value nothing reads.
+                // Rank-output only: `observe` ignores them and `rank`
+                // overwrites all three. Set here they would be values nothing
+                // reads — `delta_units` in particular is measured against a
+                // per-cadence baseline that only `rank` holds, so this path
+                // could not compute it even if it wanted to.
                 window_lots_milli: 0,
+                delta_units: 0,
+                lot_size: 0,
             },
             owner.family,
         );

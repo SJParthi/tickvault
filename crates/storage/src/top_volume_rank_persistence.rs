@@ -37,7 +37,8 @@
 //! CREATE TABLE IF NOT EXISTS top_volume_rank (
 //!     ts TIMESTAMP, tf SYMBOL, family SYMBOL, feed SYMBOL,
 //!     segment SYMBOL, rank LONG, security_id LONG,
-//!     underlying_id LONG, volume LONG, window_lots_milli LONG,
+//!     underlying_id LONG, volume LONG, delta_units LONG,
+//!     lot_size LONG, window_lots_milli LONG,
 //!     gain_pct DOUBLE,
 //!     subscribed BOOLEAN
 //! ) timestamp(ts) PARTITION BY HOUR
@@ -64,10 +65,15 @@
 //!
 //! At the authorized 250 contracts per family, both families, 09:15-15:39:
 //! 500 rows/second x 22,440 s = ~11.2M rows for the `1s` stream plus ~2.2M
-//! for `5s` -- ~13.4M rows, ~970 MB per session at the ~72 B row width (the
-//! `window_lots_milli` LONG added 8 B/row on 2026-09-09; the figure was ~860
-//! MB at 64 B and is restated rather than left stale). A session already
-//! writes ~307 GB, so this is ~0.32% -- real, and small.
+//! for `5s` -- ~13.4M rows, ~1.19 GB per session at the ~88 B row width (the
+//! `window_lots_milli` LONG added 8 B/row on 2026-09-09 taking 64 B to 72;
+//! `delta_units` and `lot_size` added 16 B/row on 2026-09-12 taking 72 B to
+//! 88, ~970 MB to ~1.19 GB. Each figure is restated rather than left
+//! stale). A session already writes ~307 GB, so this is ~0.39% -- real, and
+//! small. The 2026-09-12 pair is the one addition here that buys back more
+//! than it costs: without it the two INPUTS of the rank division are absent
+//! from the row and unrecoverable, so the column that exists to make the
+//! ordering "checkable from the table alone" could not actually be checked.
 //! The `5s` rows are numerically a subset of the `1s` rows and are kept
 //! anyway because they mean something different: a `5s` row is the ranking
 //! that ACTUALLY DROVE a re-steer decision, which is the row an audit wants.
@@ -190,6 +196,39 @@ pub struct TopVolumeRankRow {
     pub underlying_id: i64,
     /// Cumulative day volume as observed, AFTER the monotonicity gate.
     pub volume: i64,
+    /// Traded UNITS inside the window that just closed — the NUMERATOR of
+    /// the rank key, and the number an operator calls "net volume".
+    ///
+    /// Added 2026-09-12. Until then the table stored the cumulative
+    /// `volume` and the derived `window_lots_milli`, and NEITHER input of
+    /// the division was present: a reader looking at a row could not see
+    /// the traded quantity the rank was computed from, and could not
+    /// recover it, because `window_lots_milli = delta * 1000 / lot_size`
+    /// is one equation in two unknowns. Consecutive rows do not rescue it
+    /// either — a contract only appears while it is inside the top
+    /// `TOP_VOLUME_RANK_PER_FAMILY`, so the `volume` series for any one
+    /// contract has holes exactly where it stopped being interesting.
+    ///
+    /// `u32` at the source (the vendor's counter width); a value that
+    /// cannot fit `i64` is impossible, but the projection converts rather
+    /// than casts so the impossibility is enforced rather than assumed.
+    pub delta_units: i64,
+    /// Units per contract, from the day's master — the DENOMINATOR of the
+    /// rank key.
+    ///
+    /// Added 2026-09-12, for the same reason as `delta_units` above: it is
+    /// the other half of the division and it was not recoverable from the
+    /// stored row. Sourced from the `LOT_SIZE` column of Dhan's
+    /// `api-scrip-master-detailed.csv` and carried on `ContractOwner`, so
+    /// it is the SAME value the ranking divided by rather than a re-lookup
+    /// that could disagree with it.
+    ///
+    /// Guaranteed non-zero: a leg whose master row carries no lot size is
+    /// refused at the map build (`LegRefusal::MissingLotSize`) and again in
+    /// `window_lots_milli`, which returns `None` rather than dividing. So a
+    /// zero in this column would mean the guarantee broke, and is worth
+    /// seeing.
+    pub lot_size: i64,
     /// **The RANK KEY**: lots traded in the window that just closed, x 1000.
     ///
     /// Added 2026-09-09. Until then the table stored only `volume`, the
@@ -232,6 +271,8 @@ pub fn top_volume_rank_create_ddl() -> String {
             security_id   LONG, \
             underlying_id LONG, \
             volume        LONG, \
+            delta_units   LONG, \
+            lot_size      LONG, \
             window_lots_milli LONG, \
             gain_pct      DOUBLE, \
             subscribed    BOOLEAN\
@@ -251,6 +292,8 @@ const TOP_VOLUME_RANK_COLUMNS: &[(&str, &str)] = &[
     ("security_id", "LONG"),
     ("underlying_id", "LONG"),
     ("volume", "LONG"),
+    ("delta_units", "LONG"),
+    ("lot_size", "LONG"),
     ("window_lots_milli", "LONG"),
     ("gain_pct", "DOUBLE"),
     ("subscribed", "BOOLEAN"),
@@ -487,6 +530,10 @@ impl TopVolumeRankWriter {
             .context("underlying_id")?
             .column_i64("volume", r.volume)
             .context("volume")?
+            .column_i64("delta_units", r.delta_units)
+            .context("delta_units")?
+            .column_i64("lot_size", r.lot_size)
+            .context("lot_size")?
             .column_i64("window_lots_milli", r.window_lots_milli)
             .context("window_lots_milli")?
             .column_f64("gain_pct", r.gain_pct)
@@ -966,6 +1013,12 @@ mod tests {
             security_id: 44_321,
             underlying_id: 2885,
             volume: 117_567_970,
+            // The two inputs REPRODUCE the key beside them: 8,500 units on a
+            // 200-unit lot is 8,500 * 1000 / 200 = 42,500 milli-lots. A
+            // fixture whose inputs do not divide back to its own output would
+            // let a broken projection look right here.
+            delta_units: 8_500,
+            lot_size: 200,
             window_lots_milli: 42_500,
             gain_pct: 4.25,
             subscribed: true,
@@ -1079,18 +1132,101 @@ mod tests {
     /// that column fails forever.
     #[test]
     fn every_created_column_is_also_in_the_self_heal_manifest() {
+        // Both directions, and the name is the direction that was MISSING.
+        //
+        // Until 2026-09-12 this test iterated the MANIFEST and looked for each
+        // entry in the CREATE — the opposite of what its name promises, and
+        // the harmless direction. A column added to the CREATE and forgotten
+        // in the manifest passed green, which is the direction that actually
+        // bites: an ALREADY-CREATED table on the box never receives the
+        // `ADD COLUMN`, so the first ILP write auto-creates it at whatever
+        // type the wire value infers. Dev and prod then hold the same column
+        // at different types from the same binary — exactly the drift
+        // `table_schema_lockstep_guard`'s header describes.
+        //
+        // The type half was near-vacuous too: `ddl.contains("LONG")` is true
+        // for any table with one LONG column anywhere, so it could not catch a
+        // manifest that declared the wrong type. It now compares the type
+        // parsed from the column's OWN position in the DDL.
         let ddl = top_volume_rank_create_ddl();
+        let created = ddl_columns(&ddl);
+
         for (col, ty) in TOP_VOLUME_RANK_COLUMNS {
-            assert!(
-                ddl.contains(&format!("{col}        ").trim_end().to_string())
-                    || ddl.contains(*col),
-                "column {col} is in the manifest but not in the CREATE"
-            );
-            assert!(
-                ddl.contains(ty),
-                "type {ty} for column {col} is absent from the CREATE"
+            let found = created
+                .iter()
+                .find(|(name, _)| name == col)
+                .unwrap_or_else(|| panic!("column {col} is in the manifest but not in the CREATE"));
+            assert_eq!(
+                &found.1, ty,
+                "column {col} is {} in the CREATE and {ty} in the manifest",
+                found.1
             );
         }
+
+        for (name, ty) in &created {
+            // The designated timestamp is deliberately absent: a table's
+            // designated column cannot be added by `ALTER ADD COLUMN`, so it
+            // has no place in a self-heal manifest.
+            if name == "ts" {
+                continue;
+            }
+            let declared = TOP_VOLUME_RANK_COLUMNS
+                .iter()
+                .find(|(col, _)| col == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "column {name} is in the CREATE but NOT in the self-heal manifest — a \
+                         box that already has this table would never receive it"
+                    )
+                });
+            assert_eq!(
+                declared.1, ty,
+                "column {name} is {ty} in the CREATE and {} in the manifest",
+                declared.1
+            );
+        }
+    }
+
+    /// The column list of a `CREATE TABLE` as `(name, type)` pairs.
+    fn ddl_columns(ddl: &str) -> Vec<(String, String)> {
+        let open = ddl.find('(').expect("the CREATE opens a column list");
+        let close = ddl
+            .find(") timestamp(")
+            .expect("the CREATE closes its column list before the designated clause");
+        ddl[open + 1..close]
+            .split(',')
+            .filter_map(|part| {
+                let mut it = part.split_whitespace();
+                let name = it.next()?;
+                let ty = it.next()?;
+                Some((name.to_string(), ty.to_string()))
+            })
+            .collect()
+    }
+
+    /// The parser above must actually see every column, or the test that
+    /// depends on it passes by reading an empty list.
+    #[test]
+    fn the_ddl_column_parser_reads_the_whole_list_and_not_a_prefix() {
+        let created = ddl_columns(&top_volume_rank_create_ddl());
+        assert_eq!(
+            created.len(),
+            TOP_VOLUME_RANK_COLUMNS.len() + 1,
+            "parsed {created:?} — expected the manifest plus the designated `ts`"
+        );
+        assert_eq!(created.first().map(|c| c.0.as_str()), Some("ts"));
+        assert!(
+            created
+                .iter()
+                .any(|(n, t)| n == "delta_units" && t == "LONG"),
+            "parsed {created:?}"
+        );
+        assert!(
+            created
+                .iter()
+                .any(|(n, t)| n == "subscribed" && t == "BOOLEAN"),
+            "the LAST column must parse, or the closing bracket was mis-located: {created:?}"
+        );
     }
 
     /// A row that fails PART-WAY must not poison the writer.
@@ -1152,12 +1288,53 @@ mod tests {
             "rank=1i",
             "security_id=44321i",
             "window_lots_milli=42500i",
+            "delta_units=8500i",
+            "lot_size=200i",
             "underlying_id=2885i",
             "volume=117567970i",
             "subscribed=t",
         ] {
             assert!(line.contains(expected), "missing {expected} in: {line}");
         }
+    }
+
+    /// The wire line must carry EVERY declared column, not merely the ones a
+    /// reviewer remembered to list above.
+    ///
+    /// The `.contains()` loop is additive: a column dropped from `write_row`
+    /// keeps that test green unless someone also thinks to add it to the
+    /// array. This one derives its expectation from the manifest, so a new
+    /// column is covered the moment it is declared.
+    #[test]
+    fn every_declared_column_actually_reaches_the_wire() {
+        let mut w = TopVolumeRankWriter::for_test();
+        w.append_row(&row()).expect("append");
+        let line = w.buffer_utf8();
+        for (col, _) in TOP_VOLUME_RANK_COLUMNS {
+            assert!(
+                line.contains(&format!("{col}=")) || line.contains(&format!(",{col}=")),
+                "declared column {col} never reached the ILP line: {line}"
+            );
+        }
+    }
+
+    /// The stored inputs must DIVIDE BACK to the stored key.
+    ///
+    /// `window_lots_milli` is the number the board was ordered by;
+    /// `delta_units` and `lot_size` are the two numbers it was computed from.
+    /// If the row can carry a trio that does not satisfy its own arithmetic,
+    /// the column added "so the ordering is checkable from the table alone"
+    /// does not make it checkable.
+    #[test]
+    fn the_stored_inputs_reproduce_the_stored_rank_key() {
+        let r = row();
+        assert_eq!(r.lot_size, 200, "the fixture's denominator");
+        assert_eq!(r.delta_units, 8_500, "the fixture's numerator");
+        assert_eq!(
+            r.delta_units * 1_000 / r.lot_size,
+            r.window_lots_milli,
+            "8,500 units on a 200-unit lot is 42,500 milli-lots"
+        );
     }
 
     #[test]

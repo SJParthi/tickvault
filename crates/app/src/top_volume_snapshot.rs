@@ -228,6 +228,14 @@ where
             // u32 -> i64 is lossless; no saturation is possible and none is
             // written, so a future widening of the field cannot hide here.
             volume: i64::from(contract.volume),
+            // The two inputs of the rank division, both `u32` at the source,
+            // so `i64::from` is lossless exactly as `volume` above is. They
+            // need no refusal arm of their own: neither can overflow, and a
+            // `lot_size` of 0 is already impossible here — `rank` only reaches
+            // this projection for contracts whose `window_lots_milli` divided,
+            // and `window_lots_milli` returns `None` on a zero lot.
+            delta_units: i64::from(contract.delta_units),
+            lot_size: i64::from(contract.lot_size),
             window_lots_milli,
             gain_pct,
             subscribed: is_subscribed(contract.security_id, contract.segment),
@@ -256,6 +264,19 @@ mod tests {
             // A rank key distinct from `volume`, so a test that asserts the
             // stored key cannot pass by accidentally reading the volume.
             window_lots_milli: u64::from(volume) * 3,
+            // Self-consistent with the key above: `delta * 1000 / 1000` is
+            // `delta`, so `delta_units = volume * 3` reproduces exactly the
+            // `window_lots_milli` beside it. Both are distinct from `volume`
+            // itself, so a test asserting either cannot pass by reading the
+            // wrong field.
+            //
+            // `saturating_mul` because one test deliberately feeds `u32::MAX`
+            // to prove the volume widening is lossless; above `u32::MAX / 3`
+            // this fixture saturates and the reproduce-the-key property no
+            // longer holds — which is a property of the FIXTURE's arithmetic,
+            // not of the projection, and no test asserts it up there.
+            delta_units: volume.saturating_mul(3),
+            lot_size: 1_000,
         }
     }
 
@@ -337,6 +358,38 @@ mod tests {
         );
         assert!(p.rows[0].subscribed);
         assert!(!p.rows[1].subscribed);
+    }
+
+    /// The projection carries the rank division's two INPUTS, not just its
+    /// result — and carries them per contract, never a blanket value.
+    #[test]
+    fn project_snapshot_carries_the_rank_inputs_per_contract() {
+        let ranked = [contract(10, 1, 500), contract(11, 1, 400)];
+        let p = project_snapshot(
+            NANOS_PER_SECOND,
+            SnapshotCadence::OneSecond,
+            OptionFamily::Stock,
+            &ranked,
+            |_| 2.0,
+            |_, _| true,
+        );
+        assert_eq!(p.rows.len(), 2);
+
+        for (row, src) in p.rows.iter().zip(ranked.iter()) {
+            assert_eq!(row.delta_units, i64::from(src.delta_units));
+            assert_eq!(row.lot_size, i64::from(src.lot_size));
+            // The stored trio must close on its own arithmetic, or the column
+            // that exists to make the ordering checkable cannot check it.
+            assert_eq!(
+                row.delta_units * 1_000 / row.lot_size,
+                row.window_lots_milli
+            );
+        }
+
+        // Per contract, not blanket: the two rows differ.
+        assert_ne!(p.rows[0].delta_units, p.rows[1].delta_units);
+        // And neither is the cumulative volume, which is a separate column.
+        assert_ne!(p.rows[0].delta_units, p.rows[0].volume);
     }
 
     #[test]

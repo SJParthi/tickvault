@@ -447,6 +447,11 @@ mod tests {
             underlying_id,
             volume: 12_345,
             window_lots_milli: lots,
+            // Self-consistent with `lots`: at a 1,000-unit lot the milli-lot
+            // key equals the traded units exactly, so the fixture cannot
+            // encode a division that `rank` would never produce.
+            delta_units: u32::try_from(lots).unwrap_or(u32::MAX),
+            lot_size: 1_000,
         }
     }
 
