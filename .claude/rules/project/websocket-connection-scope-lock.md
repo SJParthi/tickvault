@@ -4371,3 +4371,181 @@ rows ≈ 2.5% of the session's disk burn.
 - Presents the board as rankable at 09:00, or reports an empty 09:00 board as a
   defect rather than as the exchange's own timetable.
 - Claims NSE_EQ depth works before a session has actually delivered one.
+
+### 2026-09-12 — THE TWO-ARMED UNSUBSCRIBE PROBE: code 25 CONFIRMED, a deliberate close is AUTHORIZED for the probe only, and a vendor report is drafted on failure
+
+**The verbatim operator demands (2026-09-12, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+**Quote A (the methodological point, which is the authority for the two-armed shape):**
+> "Why bro youdidnf include so key disconnect and reconnect dude because of we don't check both of them then nowhere we will easily identify which one is working right dude"
+
+**Quote B (the authorization, the code decision, and the vendor-report ask):**
+> "Yescheck everything dude so whenever something fails especially for unsubscribe we will clearly drop an email and drop the message even in madefortrade also to them dude okay? Meanwhile lets us check all these dude see for unsubscribe clearly note dude which is only 25 dude so we need to check socket disconnect and reconnect dude okay?"
+
+Quote B was given in DIRECT response to a message that enumerated the two-armed
+probe, named its one real piece of work (the deliberate close that must not
+record a flap), priced its cost at **one extra connection attempt rather than
+~300**, and asked for his word before building. That is the §28.2/§28.3
+authorization shape this repository already accepts. This dated section is the
+rule-file edit the section above demands **by name** — its REJECT list reads
+*"Adds a deliberate socket close-and-redial path for depth without a fresh dated
+quote engaging findings 1-5 by name"* — and §5 of this file's own law. Recorded
+BEFORE the code.
+
+#### Part 1 — the unsubscribe RequestCode is CONFIRMED at 25
+
+Quote B settles the decision that has blocked PR #1909: *"for unsubscribe
+clearly note dude which is only 25"*. `FEED_UNSUBSCRIBE_TWENTY_DEPTH = 25`
+stands, matching the vendor's own Feed Request Code table (23 subscribe → 25
+unsubscribe, skipping 24), and the 2026-09-10 flip to the undocumented 24 stays
+retired. **No third code may be guessed at.**
+
+#### Part 2 — WHY the operator is right, and what the one-armed design got wrong
+
+The executor proposed a ONE-armed probe (unsubscribe only). Quote A rejects it,
+correctly: a negative result on unsubscribe alone says *"this mechanism failed"*
+and cannot say *"the other one would have worked"*. Two mechanisms, one test
+each, or the session produces a third negative result and no decision.
+
+**And the executor's own prior answer was WRONG in a way this section corrects.**
+A previous turn told the operator that disconnect/reconnect "does not exist" and
+would not run on Tuesday. False: `ReconnectReason::GhostInstrument`
+(`pool_supervisor.rs`) is exactly disconnect-and-reconnect as a removal
+mechanism, it is wired, and it has already run ~80 times per session on two
+sessions. What was REFUSED in the section above is disconnect/reconnect as the
+**routine swap mechanism** — 5 sockets x every minute x 375 minutes, ~300
+connection attempts a session against a 429 question Dhan has never answered.
+Conflating a bounded test with an unbounded mechanism is what produced the wrong
+answer, and the distinction is load-bearing for everything below.
+
+#### Part 3 — the contract (LOCKED)
+
+| Aspect | Locked value |
+|---|---|
+| Shape | **TWO arms, one shot each, one session.** Arm A = unsubscribe and do not re-subscribe. Arm B = remove from the retained set, deliberately close, redial so the replay excludes it |
+| Scope | **depth-200 only**, because a depth-200 socket holds **exactly one** instrument, so nothing on that socket can mask the verdict. Never depth-20 |
+| Sockets | **two**, one per arm, so the arms cannot contaminate each other |
+| Runs | **ONCE per session**, operator-armed, never scheduled, never automatic |
+| Default | **OFF.** Serde default false; an absent section means the probe does not exist |
+| Restore | each arm **re-subscribes its instrument** when its watch window closes, so the pool is never left short for the session |
+| Verdict | four outcomes (A silent/not x B silent/not), each recorded with the contract id, the mechanism, the baseline and the observed counts |
+
+#### Part 4 — findings 1-5 of the refusal, engaged BY NAME as that REJECT row requires
+
+| # | The finding (verbatim shape) | Why it does not apply at probe scale, or how it is neutralised |
+|---|---|---|
+| **1** | *No deliberate-close concept exists. `ConnEvent` has no variant meaning "our set changed"* | **This probe ADDS one, and its scope is the probe.** A new reason variant exists solely so a probe close is distinguishable from a fault. It does NOT become available to the steering loop, and wiring it into a swap path is a REJECT below |
+| **2** | *Every redial is recorded as a flap; `enter_backoff` is the single site and records unconditionally* | **This is the one real piece of work.** The probe close must reach `enter_backoff` WITHOUT calling `record_redial`, or a deliberate close poisons the damper and the next genuine fault is mis-damped. The single-choke-point property of `enter_backoff` is PRESERVED — the flap recording becomes conditional on the reason, never a second bypassing path |
+| **3** | *Once a minute sits at 5 of a ceiling of 6* | **The probe is once per SESSION, not once per minute — 1 of 6, not 5 of 6.** And with finding 2 neutralised it is 0 of 6. The arithmetic that made the routine mechanism fatal is precisely what makes the one-shot safe |
+| **4** | *A rebuilt socket counts healthy only once a frame arrives; a thin book silent for 30 s makes the NEXT rebuild a short-session flap* | **Silence is the probe's SUCCESS signal, so "not proven healthy" is expected, not a defect.** The residual is real and is handled: the socket carries a not-proven-healthy state after Arm B, so the restore step must re-subscribe and the probe must not run inside the last 30 minutes of the session, where a lingering not-healthy state would meet the close |
+| **5** | *The blind window is not the transport redial; with no snapshot-on-subscribe a contract is BLANK until its book next changes* | **This is the probe's central measurement hazard and it is designed for, not waved away.** Silence after the action could mean the mechanism worked OR that the book simply went quiet. Therefore each arm MUST measure a **BASELINE FIRST** — frames observed on that socket in the N seconds before the action — and a verdict is only admissible when the baseline proves the book was active. A thin book disqualifies the run, and the probe reports `inconclusive_thin_book` rather than a false positive |
+
+**Finding 5 is the one that decides whether the probe is worth anything.** A
+contract delivering 100 frames a minute before the action and 0 after is
+evidence. A contract delivering 2 frames a minute is noise wearing the costume
+of evidence, and reporting it as a verdict would be the false-OK class this file
+exists to stop.
+
+#### Part 5 — the vendor report on failure (Quote B)
+
+When a run ends with a failing verdict, the operator wants Dhan told: *"we will
+clearly drop an email and drop the message even in madefortrade also to them"*.
+
+| Surface | What ships | What does NOT ship |
+|---|---|---|
+| Evidence | the probe writes a complete, committed support draft under `docs/dhan-support/` from the house `TEMPLATE.md`, filled from the REAL run: contract labels, SecurityId per contract, microsecond IST timestamps, the baseline and post-action frame counts, the request code sent, and the verbatim log lines | — |
+| Delivery | the verdict is a coded log line and the draft is a committed file; the operator reads both and sends | **No automated send, and NO new Telegram page.** The process does NOT email Dhan, does NOT post to MadeForTrade, and does NOT add a fifth Dhan-scoped alert family |
+
+**Why delivery is NOT automated, stated plainly rather than quietly omitted.**
+Three reasons, and none of them is capability: (a) `docs/dhan-support/README.md`
+mandates that every technical email is a committed markdown file shared as a
+GitHub rendered link, *"never as pasted plain text in Gmail"* — an auto-send
+would break the house workflow the operator himself wrote; (b) a message to a
+broker's support desk and a public post in their community are **outward-facing
+and irreversible**, and a false positive from a thin-book run would spam the
+vendor with a defect that does not exist, which costs exactly the credibility
+the ticket needs; (c) the draft is worth more than the send — the reason two
+prior sessions produced no ticket is that no log line named a contract, not that
+nobody could open Gmail.
+
+**If the operator wants the send automated as well, that is its own dated quote
+in this section**, and it should arrive only after the first draft has been read
+and judged accurate.
+
+#### Part 6 — honest envelope (mandatory per operator-charter §F)
+
+> "The probe answers ONE question: on this account, on this endpoint, does an
+> unsubscribe stop the stream, and does a close-and-redial stop it? Four outcomes,
+> each decisive in a different direction, each recorded with the contract id and
+> the baseline that makes it admissible. **NOT claimed:** that either mechanism
+> works — the probe is built precisely because nobody knows. **NOT claimed:** that
+> a silent socket proves the mechanism, absent a baseline that proves the book was
+> active; a thin-book run reports `inconclusive_thin_book` and no verdict. **NOT
+> claimed:** that one session generalises — one run on two sockets on one account
+> at one time of day is one data point, and a vendor may behave differently under
+> load. **NOT claimed:** that the probe fixes anything. It produces evidence and a
+> draft; the remedy is still Dhan's. **NOT claimed:** that `RequestCode 12` is
+> covered — the only stop mechanism the vendor's depth guide documents still has
+> zero production callers and is NOT in this probe."
+
+#### Part 7 — what a PR that violates this section looks like (REJECT)
+
+- Makes the deliberate-close reason available to the steering loop, the swap
+  path, or anything other than the probe — finding 2 of the refusal is
+  neutralised **for the probe**, never lifted.
+- Adds a second path that bypasses `enter_backoff` instead of making the flap
+  recording conditional inside it — that destroys the single-choke-point
+  property the guard pins.
+- Ships the probe enabled by default, on a schedule, or more than once per
+  session.
+- Runs either arm on a depth-20 socket (50 instruments mask the verdict).
+- Reports a verdict without a baseline, or reports a thin-book run as anything
+  other than `inconclusive_thin_book`.
+- Leaves an instrument unsubscribed after the watch window — each arm restores.
+- Runs inside the last 30 minutes of the session (finding 4's residual).
+- **Auto-sends an email to Dhan or auto-posts to MadeForTrade** without its own
+  fresh dated quote here.
+- Ships a support draft missing any identifier `CLAUDE.md` makes mandatory
+  (Client ID, Name, UCC, per-contract SecurityId, microsecond IST timestamps).
+- Guesses a third unsubscribe RequestCode.
+- Changes the socket or instrument budgets, `dry_run`, or the §28 frozen area
+  under cover of this quote.
+
+**Why no Telegram page, stated rather than silently omitted.** A "draft is
+ready" page would be a FIFTH Dhan-scoped alert family, and
+`dhan-rest-only-noise-lock-2026-07-14.md` §3 makes that a REJECT without its own
+dated quote in THAT file — *"Adds ANY new Dhan-scoped Telegram page outside the
+§2 4-item set"*. It would also cost ~$0.10/mo against a September forecast of
+**$142.24** and an automatic `STOP_EC2_INSTANCES` line at **$135.00**, where
+§2.3n requires a LEVER and this carries none. And it buys nothing: the probe is
+ONE-SHOT and OPERATOR-ARMED, so the operator already knows it ran. The four-item
+Dhan family is UNCHANGED by this section.
+
+#### Part 8 — the collision the design had to be changed for (MEASURED in source, not assumed)
+
+The first design of Arm A would have been **silently contaminated by Arm B**,
+and the mechanism is worth recording because nothing about it is visible from
+the call site.
+
+`DepthSubscriptionView` classifies an instrument this process dropped, still
+arriving past `GHOST_GRACE_SECS` (**90 s**), as a ghost; the drain then calls
+`request_ghost_redial(frame.connection_index, …)`. Arm A unsubscribes and
+deliberately does NOT re-subscribe — which is **exactly** the shape that
+classifies as a ghost. So ninety seconds into Arm A's watch window the ghost
+detector would close and redial Arm A's socket, applying **Arm B's mechanism to
+Arm A's measurement**, and the resulting silence would prove nothing about
+either.
+
+**The fix is a constraint, not a flag:** Arm A's watch window is
+const-asserted **strictly shorter than `GHOST_GRACE_SECS`**, so the ghost
+machinery can never engage during it. A suppression flag was rejected as the
+weaker form — a flag can drift out of lockstep with the grace constant and the
+failure would be silent, whereas an assert fails the build.
+
+This is also why the window is short enough to be scientifically sound only
+against a baseline: a liquid depth-200 contract delivers on the order of a
+hundred thousand rows a minute, so tens of seconds of true silence is
+overwhelming evidence, while the same window on a thin book is worth nothing.
+That is finding 5, and it is why Part 4 makes the baseline admissibility a
+condition rather than a nicety.
