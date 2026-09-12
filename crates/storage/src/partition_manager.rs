@@ -810,10 +810,21 @@ mod tests {
     /// two entries while its body asserts three teaches the next reader
     /// something false without them ever opening it.
     ///
-    /// `top_volume_rank` earns the HOUR list on volume, not on kind: ~13.4M
-    /// rows and ~860 MB per session at the authorized 250-contract ceiling
-    /// across both option families. That is the same order as the other two,
-    /// and an order above every table in the DAY list. The quiet mistake
+    /// `top_volume_rank` earns the HOUR list on volume, not on kind.
+    ///
+    /// ⚠ CORRECTED 2026-09-12 — this read "~13.4M rows and ~860 MB per
+    /// session at the authorized 250-contract ceiling across both option
+    /// families", and BOTH halves of that basis are gone. The operator's
+    /// 2026-09-12 directive removed the 250-per-family cut (every traded
+    /// option contract is persisted) and took the cadence count from two to
+    /// four (1s, 3s, 5s, 1m). The figure is therefore withdrawn rather than
+    /// rescaled: the new bound is market-dependent, is derived in
+    /// `top_volume_rank_persistence`'s own header, and is ASSUMED there
+    /// pending the measuring query that header names. What is unchanged, and
+    /// is the only thing this row needs, is the DIRECTION: the new figure is
+    /// larger, so the HOUR-list placement is more right than before, not less.
+    ///
+    /// The quiet mistake
     /// available here was `RETENTION_EXEMPT_TABLES` — exempt means never
     /// swept, and a never-swept table that grows most of a gigabyte a day is
     /// the disk-fill class that cost 2026-09-04 an entire trading session.

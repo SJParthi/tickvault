@@ -2216,10 +2216,7 @@ wording, `docs/dhan-ref/08-annexure-enums.md:348` — *may*, which this line pre
 asserted flatly as "an account block"). **The RANKING runs every 5 seconds (⚠ CORRECTED: this said "measured ~70 µs,
 0.0014%". That was the `scan_silence` constant borrowed from a LINEAR scan and
 applied to a `sort_unstable_by` — an invalid transfer, and it was the number used to
-argue the heap design away. Actually MEASURED at 900 µs, a 0.018% duty cycle, by
-`rank_sweep_cost_at_the_authorized_ceiling`. The CONCLUSION is unchanged — 0.018% is
-still negligible and the heap's threshold-poisoning is still catastrophic — but the
-evidence for it was overstated 15x and is now real); the SUBSCRIPTION moves only the delta, edge-triggered and capped per
+argue the heap design away. ⚠ CORRECTED AGAIN 2026-09-12: the replacement figure "900 µs, a 0.018% duty cycle" was ALSO not a measurement — that harness was timing an EMPTY sort under a constant lot stub. Re-measured with the harness repaired and asserting a filled board: 2.95 ms at the ceiling where every contract traded, 123 µs at the assumed realistic shape. The CONCLUSION is unchanged twice over — even 2.95 ms is a 0.295% duty at 1 s and the heap's threshold-poisoning is still catastrophic — but the number was first understated 15x, then overstated 3.3x, and is now real); the SUBSCRIPTION moves only the delta, edge-triggered and capped per
 window**, which is the shape the existing re-fit already uses and for these reasons.
 
 **NOT claimed — that this improves capture.** 2026-09-04 captured ZERO ticks and
@@ -2660,7 +2657,7 @@ faces gives that without writing every row twice.
    the ghost redial above makes a wrong code SELF-HEALING rather than fatal,
    which is what makes the raise safe to do next, but the raise itself needs
    its own dated row and is not smuggled in here.
-2. **A swap is not O(1) on the wire.** Ranking is O(n log n) at 900 µs; the
+2. **A swap is not O(1) on the wire.** Ranking is O(n log n) at 123 µs realistic / 2.95 ms at the ceiling (MEASURED 2026-09-12; the "900 µs" this line carried came from a harness timing an empty sort); the
    subscription CHANGE is one unsubscribe + one subscribe per swap with a 2 s
    wire budget, serialised per socket. The honest claim is "delta-only, capped
    per socket, edge-triggered" — never "O(1) resubscribe".
@@ -4576,3 +4573,234 @@ hundred thousand rows a minute, so tens of seconds of true silence is
 overwhelming evidence, while the same window on a thin book is worth nothing.
 That is finding 5, and it is why Part 4 makes the baseline admissibility a
 condition rather than a nicety.
+
+### 2026-09-12 — FOUR CADENCES, EVERY TRADED OPTION CONTRACT, RANKED ON VOLUME-PERCENTAGE CHANGE
+
+**The verbatim operator demands (2026-09-12, typed directly in-session — preserve
+EXACTLY, typos and expletives included):**
+
+**Quote A (the cadences and the cut):**
+> "Bro try to have 1s, 3s and even 5s also dude okay? Do you understand what I'm even asking dude. See if memory is not at all a big deal then have all these dude don't pick top 250 ick the entire options contracts dude okay?"
+
+**Quote B (the fourth cadence, and the latency requirement):**
+> "see whatever it is i need O(1) tracking latency espeicllay for this top volume rank dude thta too cosnider to take 1s,3s,5s and even inclduign one minute also dude okay? make eveythign as 100 percentage common runtime dynamic incremental scalable approach"
+
+**Quote C (the ranking key — first statement):**
+> "see clealry n toe have the lots and normal price prcenatage chnage but purely do thtis top volume rank purely absed on one an donly with this volume percnetage dude okay?"
+
+**Quote D (the ranking key — sharpened minutes later):**
+> "but i dont want this lots dude i just need this volume percentage chnage alone dude okay? but still let us keep this lots and normal price percnetage change dude okay?"
+
+**Quote E (the authorization):**
+> "go ahead with this ank on volume-percentage alone for all tehe ntire options contartcs enitlrey that too for every 1s,3s,5s and even 1m inclduign as well dude okay? taht too achieveign this O(1) dude okay?"
+
+Quote E was given in DIRECT response to a published ledger that enumerated this
+work, priced it, named the three defects that block it, and stated plainly that
+per-sweep O(1) is impossible. That is the §28.2/§28.3 authorization shape this
+repository already accepts. Recorded HERE before any code, per the
+rule-file-first law.
+
+#### What this authorizes
+
+| Surface | Before | After |
+|---|---|---|
+| Snapshot cadences | 2 — `1s`, `5s` | **4 — `1s`, `3s`, `5s`, `1m`** |
+| Persisted set per family per sweep | top 250 by rank | **every option contract that traded in the window** |
+| Named ranking key | `window_lots_milli` (lots ×1000) | **volume-percentage change**, persisted as its own integer column |
+| `window_lots_milli` | the key | **KEPT as a column** (Quote D) |
+| `gain_pct` (the UNDERLYING's price move) | a column | **KEPT as a column** (Quote D) |
+| Sweep iteration | every tracked contract | **only the contracts that traded in that window** |
+| Everything else | — | UNCHANGED |
+
+#### ⚠ The ordering does not change, and that is the point
+
+The volume-percentage change and the lots figure are **monotone transforms of one
+another** — `net_volume_chg_pct = window_lots_milli / 10 − 100`, so the two differ
+by a fixed scale and offset and rank identically on every row. Ranking "purely on
+volume percentage" therefore produces the **byte-identical order** that ships
+today. What changes is that the figure is named, stored, and ranked-by in the
+table rather than derived only in a view.
+
+**The comparator MUST keep sorting the integer.** This file's own REJECT list bans
+a float in a sort key — *"a non-finite comparator is non-transitive and corrupts a
+sort wholesale"* — and `gain_pct` is an `f64` produced by dividing by a previous
+close. Because the two forms are monotone transforms, sorting the integer and
+naming the result by the percentage is not a compromise: it is the same answer,
+reached safely. The persisted percentage column is likewise an INTEGER
+(milli-percent), never a float.
+
+#### ⚠ O(1): what is granted, and what is arithmetically impossible
+
+Quote B asks for "O(1) tracking latency" and Quote E for "achieving this O(1)".
+Three operations hide under that phrase and they do not have the same answer:
+
+| Layer | Runs | Complexity | Verdict |
+|---|---|---|---|
+| **Track** — record one contract's volume | per tick | **O(1)**, one hash probe, zero allocation, map pre-sized so it cannot resize | **already met, and four cadences do not change it** |
+| **Collect** — which contracts traded in this window | per sweep | O(tracked) today → **O(traded)** | **this is the work** |
+| **Order** — assign a rank | per sweep | O(m log m) | inherent |
+
+**Per-sweep O(1) is impossible and is NOT claimed anywhere.** The sweep's output
+is one row per contract that traded; producing m rows costs at least m. Any design
+that claims otherwise is silently reintroducing a top-k cut, which is exactly what
+Quote A removes.
+
+**What IS granted and delivered: O(1) in the size of the universe.** The sweep
+stops scaling with how many contracts EXIST and scales only with how many TRADED.
+Adding 20,000 quiet contracts costs nothing. The mechanism is a per-window dirty
+set: the tick marks a contract when its volume actually advances (a bit test and a
+bounded push on the accepted arm only, allocation-free because the buffers are
+pre-sized and the bitmask caps them at one push per contract per window), and the
+sweep drains only that buffer.
+
+**The correctness invariant this rests on, stated because it was written down
+nowhere:** a zero delta means the baseline already equals the volume, so the
+sweep's baseline write for an untraded contract is a no-op. It holds because every
+path that writes volume also settles the baseline. **It must be pinned by a test
+in the same change**, or a later unrelated edit can break it and the dirty-set
+sweep starts silently dropping contracts from the board.
+
+#### ⚠ CORRECTION — the 900 µs figure this file and CLAUDE.md both cite is not a measurement
+
+`rank_sweep_cost_at_the_authorized_ceiling` seeds its contracts through `observe`,
+which sets every baseline equal to the contract's volume. Every subsequent `rank`
+therefore computes a zero delta, which is dropped before the sort — **the sort ran
+over an empty list on all fifty measured rounds.** The harness additionally passes
+a constant stub where production performs an atomic load plus a hash probe per
+contract per sweep to fetch the lot size.
+
+So the 900 µs omits **both the sort and the per-contract probe** — the two costs a
+wider window and an uncapped set increase. The true sweep cost is higher by an
+unknown factor. Two further errors in CLAUDE.md's O(1) table, found alongside: it
+states the measurement was taken at **25,000** contracts when the harness uses
+**20,220**, and it states the database appends are "inside the measured 900 µs"
+when the harness executes no append at all.
+
+**The harness must be repaired in the same change** so it ranks contracts that
+actually traded and uses a real lot-size lookup. No duty-cycle claim may cite the
+old number.
+
+#### ✅ REPAIRED AND MEASURED 2026-09-12 — and the true ceiling is 3.3× WORSE
+
+`rank_sweep_cost_at_the_authorized_ceiling` now advances contracts before every
+timed round, probes a real lot-size `HashMap` per contract (production resolves
+through `global_contract_underlying_map().owner_of(..)` — a global load plus a
+probe, which the constant `lot1` stub let the optimiser delete), times ONLY the
+sweep, and **ASSERTS it filled the board** — so it can no longer report a number
+from an empty sort. Release, x86 dev container, 20,220 tracked contracts:
+
+| contracts that TRADED in the window | sweep | duty at 1 s |
+|---|---:|---:|
+| 20,220 — every one (the ceiling) | **2.95 ms** | 0.295% |
+| 2,000 (Assumed realistic) | **123 µs** | 0.012% |
+| 500 | 28.7 µs | 0.003% |
+| 100 | 6.4 µs | 0.0006% |
+| 20,220, full rank + distinct(5) | 2.50 ms | 0.050% at 5 s |
+
+**The withdrawn figure was optimistic by 3.3×, not pessimistic.** Two separate
+omissions compounded: the empty sort, and the folded-away lot probe — which
+alone accounts for 1.78 ms → 2.95 ms, measured by running the repaired harness
+once with the stub and once with the probe.
+
+**What the dirty sets buy, on these numbers:** 2.95 ms → 123 µs at the assumed
+realistic shape, a **24× reduction**, and 460× at 100 traded. The worst SECOND —
+all four cadence arms landing together, both families, every contract trading —
+is 8 sweeps ≈ **23.6 ms, a 2.4% duty cycle** on the drain task; at the realistic
+shape it is ~1 ms, ~0.1%.
+
+**Still Assumed:** the 2,000-traded row. Nobody has measured how many of ~20,000
+strikes trade in one second; the measuring query is named in
+`top_volume_rank_persistence`'s header. It is SWEPT here rather than asserted,
+so a reader sees the shape instead of one number they would then quote.
+
+#### ⚠ The defects that must be fixed BEFORE a cadence is added
+
+1. **The compile error trains you to write the bug.** Adding a cadence correctly
+   fails to compile at the cadence→slot mapping. The obvious fix — map the new one
+   to slot 2 — compiles, while the per-contract baseline array is still sized from
+   a SEPARATE hand-written `ALL` list nobody was forced to touch. The result is an
+   out-of-range write on the frame drain; the release profile aborts rather than
+   unwinds, so the process dies mid-session and takes tick capture with it.
+2. **The guard for it cannot catch it.** `every_cadence_is_in_the_all_list`
+   iterates `ALL` — the very list that would be missing the variant — and matches
+   on the wire label rather than on the type. Its own comment claims it fails the
+   exhaustive match. It does not.
+3. **The views are on a separate wire.** `console_views::TopVolumeCadence` is a
+   SECOND cadence enum with its own hand-written `ALL`, linked to
+   `SnapshotCadence` by nothing. A new cadence would write rows whose view is
+   never created, and the guarding test passes green because it checks its own
+   list against itself.
+4. **A missing timer arm is caught by nothing.** Forget a `select!` arm and that
+   cadence simply never fires — no error, no counter, no log.
+5. **The tracked/ranked gauges carry no cadence label**, so four cadences alias
+   into one series, last writer wins.
+
+**The sanctioned fix for 1–4 is ONE shape: a single declaration list from which
+the enum, `ALL`, the labels, the interval seconds, the array index and the view
+name are all generated**, so the compiler enforces agreement instead of three
+hand-written lists and tests that check each against itself. Adding a cadence must
+become a one-line edit.
+
+#### What this does NOT authorize
+
+- **Any change to depth steering.** `TOP_VOLUME_RANK_PER_FAMILY` is ALSO
+  `DEPTH20_ENTRY_RANKS`. The persistence cut is removed by changing the
+  PERSISTENCE bound; the constant itself stays pinned at 250 and depth-20 keeps
+  entry 250 / exit 300. Depth-200 is untouched, as every prior section states.
+- Any change to the socket or instrument budgets (250 + 5 remain).
+- Any change to the depth apply cadence — Quote A of 2026-09-11 (THIRD) withdrew
+  that ask and it stays withdrawn.
+- Live order fire; `dry_run` stays true.
+- Any edit to the §28 frozen indicator/strategy area.
+- Any deletion of SEBI or audit rows.
+- Any new CloudWatch metric name or alarm. This pipeline's nine counters reach no
+  deployment surface today, and adding one costs ~$0.30/mo against a September
+  forecast of $142.24 with an automatic `STOP_EC2_INSTANCES` line at $135.00.
+  §2.3n of `dhan-rest-only-noise-lock-2026-07-14.md` requires a LEVER, not a cost
+  note. The observability gap is RECORDED here and deliberately NOT closed.
+
+#### Honest envelope (mandatory per operator-charter §F)
+
+> "100% inside the tested envelope, with ratcheted regression coverage: the
+> per-tick path is O(1) and allocation-free, pinned by a build-failing DHAT gate;
+> the cadence list, its labels, its intervals, its array index and its view names
+> are generated from one declaration so they cannot drift; the zero-delta
+> invariant the dirty set depends on is pinned by its own test; the persisted
+> percentage column is an integer and the comparator stays integer-only.
+> **NOT claimed:** per-sweep O(1) — impossible, and the honest floor is Θ(traded).
+> **NOT claimed:** any duty-cycle figure derived from the old 900 µs harness —
+> withdrawn, and replaced by the repaired harness's measured 2.95 ms ceiling /
+> 123 µs realistic. **NOT claimed:** that the 2,000-traded figure those
+> realistic numbers assume is measured — it is not, and it is swept rather than
+> asserted for exactly that reason.
+> **NOT claimed:** measured row counts for the 3s, 5s or 1m windows without the
+> cut — those are modelled from one session's distinct-instrument count; only the
+> 1-second case was ever read from the database. **NOT claimed:** that any of this
+> has run at a market open with four cadences. **NOT claimed:** that the pipeline
+> is observable outside the box — all nine of its counters reach zero deployment
+> surfaces, and three of its failure modes are entirely silent."
+
+#### ⚠ The 1-minute boundary, decided rather than discovered
+
+The sweep timers start when the drain starts, not on a window boundary. At one
+second the resulting quantisation error is at most one second. **At sixty seconds
+the first in-window row can measure from up to 59 seconds before the open, and the
+last 0–59 seconds before the capture cutoff land in NO one-minute row at all** —
+the next sweep is out of window and rolls the baseline away. This is accepted as
+the cost of a fixed-interval timer, it is recorded here so it is not later
+reported as a defect, and a future change may align the 1-minute timer to the
+wall-clock minute under its own note.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Sorts on a float, or persists the percentage as a float.
+- Changes `TOP_VOLUME_RANK_PER_FAMILY`, or otherwise moves depth-20 entry/exit.
+- Adds a cadence without the single-source declaration, or leaves either the
+  second cadence enum or the self-referential guard in place.
+- Ships a dirty-set sweep without a test pinning the zero-delta invariant.
+- Cites the old 900 µs figure as a measurement, or ships the cadences without
+  repairing the harness.
+- Claims per-sweep O(1) anywhere, in code, comment, commit message or PR body.
+- Removes the persistence bound entirely rather than raising it — the write path
+  has no spill tier, and a batch too wide is DROPPED.
+- Adds a CloudWatch metric name or alarm without a lever, per §2.3n.

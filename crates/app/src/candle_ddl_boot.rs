@@ -228,7 +228,7 @@ pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
         let ticks_ok = tickvault_storage::tick_persistence::ensure_ticks_table(questdb).await;
         let depth_ok =
             tickvault_storage::depth_persistence::ensure_market_depth_table(questdb).await;
-        // top_volume_rank — the 1 s / 5 s volume-ranking snapshot table
+        // top_volume_rank — the 1s/3s/5s/1m volume-ranking snapshot table
         // (2026-09-06). Its offload writer appends every second from the
         // first ranking sweep; until 2026-09-08 NOTHING ensured the table,
         // so on a fresh volume the first ILP row would have auto-created it

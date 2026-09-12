@@ -29,13 +29,43 @@
 //! > can ever beat. The depth set freezes for the rest of the session. No error
 //! > fires, no counter moves, every dashboard stays green.
 //!
-//! A full sweep costs **900 µs** at 20,220 contracts — a **0.018% duty cycle**
-//! at the 5-second cadence. The heap was premature optimisation against a cost
-//! that measurement shows is negligible, and it bought the single worst failure
-//! mode in the design. So
+//! The heap was premature optimisation against a cost that measurement shows
+//! is small, and it bought the single worst failure mode in the design. So
 //! this module holds no threshold: [`VolumeLeaderboard::rank`] recomputes from
 //! current state, and one bad value affects one contract instead of the whole
 //! set.
+//!
+//! # What a sweep actually costs (MEASURED 2026-09-12, release, x86 dev container)
+//!
+//! `rank_sweep_cost_at_the_authorized_ceiling`, 20,220 tracked contracts, a
+//! real lot-size hash probe per contract, and a board the harness now ASSERTS
+//! it filled:
+//!
+//! | contracts that TRADED in the window | sweep | duty at 1 s |
+//! |---|---|---|
+//! | 20,220 — every one (the ceiling) | **2.95 ms** | 0.295% |
+//! | 2,000 (Assumed realistic) | **123 µs** | 0.012% |
+//! | 500 | 28.7 µs | 0.003% |
+//! | 100 | 6.4 µs | 0.0006% |
+//!
+//! The worst SECOND is the one where all four cadence arms land together, for
+//! both families: 8 sweeps ≈ **23.6 ms**, a **2.4% duty cycle** on the drain
+//! task. At the assumed realistic shape it is ~1 ms, ~0.1%.
+//!
+//! ⚠ **This header said "A full sweep costs 900 µs at 20,220 contracts — a
+//! 0.018% duty cycle" until 2026-09-12, and that number was never measured.**
+//! The harness that produced it seeded every baseline to the contract's own
+//! volume and then timed fifty sorts of an EMPTY vector, under a single
+//! `< 1 s` assertion an empty sort passes trivially. It was quoted onward into
+//! a rule file, a plan, `CLAUDE.md`'s O(1) table and this module's own `rank`
+//! doc. The true ceiling is **3.3× worse** than the figure it replaced — a
+//! stale claim in the reassuring direction, which is the expensive one, inside
+//! the harness whose whole purpose was to stop exactly that. The harness now
+//! refuses to report a number from a board it did not fill.
+//!
+//! The 2,000-traded row is **Assumed**: nobody has measured how many of ~20,000
+//! strikes trade in one second. The query that would is named in
+//! `top_volume_rank_persistence`'s header.
 //!
 //! **CORRECTED 2026-09-06, and the correction is the point.** This paragraph
 //! used to end "and it self-corrects the moment a good value arrives". That was
@@ -152,11 +182,39 @@ use tracing::{error, warn};
 /// would move the stock figure.
 pub const MAX_TRACKED_CONTRACTS: usize = 25_000;
 
+/// The persistence cut is this cap, and this pins them together.
+///
+/// `TOP_VOLUME_PERSIST_PER_FAMILY` means "every traded contract" — which is
+/// only TRUE while it is at or above the number of contracts the ranking can
+/// hold. Lowering this cap without lowering that one leaves a constant whose
+/// doc says "every" and whose value silently cuts; raising this one without
+/// raising that one turns the cut back on without anyone editing the cut.
+const _: () = assert!(
+    tickvault_common::constants::TOP_VOLUME_PERSIST_PER_FAMILY >= MAX_TRACKED_CONTRACTS,
+    "the persistence cut sits below the tracked-contract cap, so it is a real \
+     cut again — but its doc claims every traded contract is persisted. Move \
+     both or neither."
+);
+
 /// Counter: observations refused, labelled by reason.
 pub const REFUSED_COUNTER: &str = "tv_volume_leaderboard_refused_total";
-/// Gauge: contracts currently tracked, per family.
+/// Gauge: contracts currently tracked, per family and cadence.
 pub const TRACKED_GAUGE: &str = "tv_volume_leaderboard_tracked";
-/// Gauge: size of the last materialised ranking, per family.
+/// Gauge: size of the last materialised ranking, per family and CADENCE.
+///
+/// ⚠ The cadence label arrived 2026-09-12, with the third and fourth
+/// cadences. Before it the label set was `family` alone, so all cadences
+/// wrote the SAME series and the reading was whichever one fired last — on a
+/// second where the 1s, 5s and 1m arms all land, three different windows
+/// overwrite one number and the operator reads a figure belonging to none of
+/// the boards they are looking at. Two cadences aliasing was already wrong;
+/// four made it unreadable.
+///
+/// Costs nothing to fix: neither gauge appears in any file under `deploy/`,
+/// so they are served on the local `/metrics` exporter and ship to no
+/// CloudWatch series. Going from two series to eight is therefore $0.00/mo
+/// and needs no lever under §2.3n of the noise lock — which is also the
+/// honest limit of what these gauges are: readable on the box, unalarmable.
 pub const RANKED_GAUGE: &str = "tv_volume_leaderboard_ranked";
 
 /// Which option family a contract belongs to.
@@ -324,13 +382,21 @@ pub const RELATCH_AFTER_CONSECUTIVE_LOWER: u16 = 32;
 /// One tracked contract plus the state the re-latch needs.
 ///
 /// `Copy`. Its payload is the 40-byte contract, the 2-byte run counter and
-/// one `u32` baseline per cadence, so with padding it is ~56 bytes; the map
-/// entry adds the 16-byte composite key and the hash table's own overhead,
-/// so at the 25,000-per-family cap the structure is ~1.5–2 MB per family,
-/// ~4 MB in all. (An earlier version of this comment said "8 bytes wider than
-/// the contract, ~200 KB per family", which counted neither the baselines
-/// nor the map.) It buys the difference between a transient mis-ranking and
-/// a socket frozen for the session.
+/// one `u32` baseline per cadence plus the one-byte dirty mask, which MEASURES
+/// 64 bytes with padding. hashbrown stores the `(key, value)` pair INLINE, so
+/// an entry is 16 + 64 = 80 bytes, and the table rounds 25,000 up to 32,768
+/// buckets: **~2.6 MB per family, ~5.3 MB in all**, plus ~3.2 MB of work lists
+/// (see `Family::dirty`).
+///
+/// (An earlier version said "8 bytes wider than the contract, ~200 KB per
+/// family", counting neither the baselines nor the map. A later one said
+/// "~56 bytes … ~1.5–2 MB per family, ~4 MB in all" — closer, but it still
+/// missed that hashbrown rounds the bucket count to a power of two, so it
+/// understated by ~30%. Corrected 2026-09-12 with the size measured rather
+/// than estimated.)
+///
+/// It buys the difference between a transient mis-ranking and a socket frozen
+/// for the session.
 #[derive(Debug, Clone, Copy)]
 struct Tracked {
     contract: RankedContract,
@@ -338,10 +404,12 @@ struct Tracked {
     consecutive_lower: u16,
     /// Cumulative volume as of this contract's last snapshot, PER CADENCE.
     ///
-    /// One entry per window because the 1s and 5s boards measure different
+    /// One entry per window because the four boards measure different
     /// intervals: sharing a baseline would make whichever cadence fired last
-    /// steal the other's window, and both boards would report a figure neither
-    /// interval actually traded.
+    /// steal the others' windows, and every board would report a figure no
+    /// interval actually traded. The pressure is worse at four cadences than
+    /// it was at two — on a second where the 1 s, 5 s and 1 m arms all land,
+    /// a shared baseline would give two of the three a window of zero.
     ///
     /// Seeded to the contract's CURRENT volume when it is first tracked, never
     /// to 0. A 0 seed makes the first window report the whole day so far, which
@@ -349,14 +417,88 @@ struct Tracked {
     /// depth socket on its first appearance — the "stale high" shape this
     /// module already refuses one level up.
     baseline: [u32; WINDOW_COUNT],
+    /// Which windows this contract has traded in since their last sweep.
+    ///
+    /// One BIT per cadence slot. Set on an accepted ADVANCE (and only there —
+    /// see `ALL_WINDOWS_DIRTY`), cleared by the sweep that consumes it. The
+    /// sweep walks only the contracts whose bit is set, which is what stops the
+    /// per-sweep cost scaling with the size of the UNIVERSE instead of with the
+    /// number of contracts that actually traded.
+    ///
+    /// FREE in memory: `Tracked` is 40 B of contract + 2 B of run counter +
+    /// `WINDOW_COUNT` u32 baselines, so at four cadences it already pads to 64
+    /// and this byte lands in the padding.
+    dirty: u8,
 }
 
 /// Distinct snapshot cadences, and therefore baselines per contract.
 ///
-/// Derived from the cadence enum rather than written as a literal: adding a
-/// third cadence must fail to compile here rather than silently index out of
-/// range or, worse, alias two cadences onto one baseline.
+/// Derived from the cadence enum rather than written as a literal, so the
+/// array and the enum widen together.
+///
+/// ⚠ CORRECTED 2026-09-12 — the previous doc here read "adding a third
+/// cadence must fail to compile here rather than silently index out of range
+/// or, worse, alias two cadences onto one baseline." **It did not**, and the
+/// sentence was reassuring in the one direction that costs a session: a
+/// variant added to `SnapshotCadence` but not to `SnapshotCadence::ALL`
+/// compiled cleanly, left this constant at its old value, and indexed
+/// `baseline[2]` into a `[u32; 2]` on the frame drain — `overflow-checks`
+/// on, `panic = "abort"`, process gone mid-session. The compile error the
+/// sentence was describing came from the SEPARATE `window_index` match, and
+/// the obvious way to silence that error is precisely the edit that arms the
+/// abort.
+///
+/// What holds now: the slot is the `#[repr(u8)]` discriminant, the
+/// const-assert beside `ALL` proves the list is dense and in order, and
+/// `window_slot` bounds-checks the residual case rather than trusting it.
 pub const WINDOW_COUNT: usize = SnapshotCadence::ALL.len();
+
+/// Every window bit set — what an accepted advance marks.
+///
+/// An advance sets ALL of them at once, not just the window that is about to
+/// fire, because the contract has traded and therefore has a non-zero delta in
+/// EVERY open window simultaneously. The 1s sweep clears only its own bit; the
+/// 1m sweep, 59 seconds later, still sees the mark.
+const ALL_WINDOWS_DIRTY: u8 = ((1u16 << WINDOW_COUNT) - 1) as u8;
+
+const _: () = assert!(
+    WINDOW_COUNT <= 8,
+    "the per-contract dirty mask is a u8, one bit per cadence. A ninth cadence \
+     needs a wider mask — and silently overflowing it would drop a whole \
+     cadence's marks, so its board would report only the contracts that some \
+     OTHER cadence happened to mark."
+);
+
+/// MEASURED, not assumed: 40 B of contract + 2 B of run counter + four `u32`
+/// baselines + the 1 B mask = 59, padded to 64. The mask is genuinely free —
+/// it landed in padding that already existed.
+///
+/// The assert is `<=`, not `==`, so it pins a BOUND rather than today's
+/// number: a sixth cadence pushes `Tracked` to 72 and fires it, at which point
+/// packing the baselines versus accepting the growth is a decision someone
+/// makes rather than one that happens.
+///
+/// ⚠ CORRECTED 2026-09-12, hours after it was written, by the hot-path panel.
+/// This assert's message read "past 64 bytes that is two cache lines instead
+/// of one", and that justification is UNSOUND. `HashMap<ContractKey, Tracked>`
+/// is hashbrown, which stores the `(K, V)` PAIR inline: 16 + 64 = 80 bytes at
+/// align 8, packed contiguously and not 64-aligned. A probe therefore already
+/// straddles two lines for most entries, so the single-line benefit the
+/// sentence promised was never delivered.
+///
+/// The assert is KEPT — as a size ratchet it is worth having, because growth
+/// here is multiplied by 25,000 entries per family — but it is kept for that
+/// reason and not for the one it originally claimed. Recorded rather than
+/// silently reworded: a plausible-sounding performance rationale that does not
+/// survive contact with the container is exactly the shape this file's header
+/// keeps recording.
+const _: () = assert!(
+    size_of::<Tracked>() <= 64,
+    "Tracked is stored 25,000 times per family; growth here is multiplied by \
+     that. Decide deliberately before raising this. (NOT a cache-line bound — \
+     hashbrown stores the 16-byte key inline beside it, so an entry is already \
+     80 bytes and already straddles.)"
+);
 
 /// Fixed-point scale on the rank key. 1000 = three decimal places of a lot.
 pub const LOTS_SCALE: u64 = 1_000;
@@ -369,12 +511,51 @@ const _: () = assert!(
 );
 
 /// Which baseline slot a cadence owns.
-const fn window_index(cadence: SnapshotCadence) -> usize {
-    match cadence {
-        SnapshotCadence::OneSecond => 0,
-        SnapshotCadence::FiveSecond => 1,
+///
+/// ⚠ This was a hand-written `match` until 2026-09-12, and the pairing of
+/// that match with `WINDOW_COUNT = SnapshotCadence::ALL.len()` was a live
+/// process-abort waiting for a third cadence. The enum doc two screens up
+/// claimed a new cadence "must fail to compile here" — it does, and that is
+/// exactly the trap: the compiler points at the missing arm, the obvious fix
+/// is to write `SnapshotCadence::ThreeSecond => 2`, and THAT compiles while
+/// `ALL` still has two entries. `baseline: [u32; 2]` is then written at index
+/// 2 on the frame drain, and the release profile is `overflow-checks = true`
+/// with `panic = "abort"` — the trading box dies mid-session, on a tick.
+///
+/// The slot is now the `#[repr(u8)]` discriminant, bounds-checked against
+/// `ALL` by [`SnapshotCadence::slot`]. There is no match to keep in step, and
+/// the residual case the const-assert cannot rule out (a variant the enum has
+/// and `ALL` does not) is a counted refusal instead of an abort.
+fn window_slot(cadence: SnapshotCadence) -> Option<usize> {
+    let slot = cadence.slot();
+    if slot.is_none() {
+        // Cold by construction: reaching this means the enum gained a variant
+        // that `SnapshotCadence::ALL` does not list, which is a build-time
+        // mistake that shipped. Counted and named rather than silent, because
+        // the visible symptom would otherwise be one cadence's board quietly
+        // never updating.
+        metrics::counter!(
+            UNSLOTTED_CADENCE_COUNTER,
+            "cadence" => cadence.as_str(),
+        )
+        .increment(1);
+        error!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            source = "cadence_without_baseline_slot",
+            cadence = cadence.as_str(),
+            window_count = WINDOW_COUNT,
+            "a snapshot cadence has no baseline slot — it is in SnapshotCadence \
+             but not in SnapshotCadence::ALL, so every per-cadence array is one \
+             slot short. That cadence's board will not update; nothing else is \
+             affected."
+        );
     }
+    slot
 }
+
+/// Counter for the refusal above. Zero on every healthy build — a non-zero
+/// reading is a build mistake, not a market condition.
+const UNSLOTTED_CADENCE_COUNTER: &str = "tv_volume_leaderboard_unslotted_cadence_total";
 
 /// Lots traded in a window, × [`LOTS_SCALE`], from raw units and a lot size.
 ///
@@ -398,6 +579,32 @@ pub const fn window_lots_milli(delta_units: u32, lot_size: u32) -> Option<u64> {
 #[derive(Debug)]
 struct Family {
     volumes: HashMap<ContractKey, Tracked>,
+    /// Keys that have TRADED since each window's last sweep — the work list.
+    ///
+    /// One list per cadence slot, holding exactly the contracts whose
+    /// `Tracked::dirty` bit for that slot is set. The sweep walks this instead
+    /// of the whole map, which is what makes the per-sweep cost scale with the
+    /// number of contracts that TRADED rather than with the number that EXIST.
+    ///
+    /// **The invariant, and it is the whole correctness argument:** for every
+    /// window `w`, `dirty[w]` contains a key AT MOST ONCE, and contains it if
+    /// and only if `volumes[key].dirty & (1 << w) != 0`. Every writer of
+    /// `Tracked` upholds it — insert seeds the mask to 0 and pushes nothing,
+    /// an accepted advance pushes into exactly the lists whose bit was clear,
+    /// a re-latch preserves the mask and pushes nothing, a refusal touches
+    /// neither, and a sweep clears its own bit as it drains its own list.
+    ///
+    /// Pre-sized at construction for the same reason `volumes` is: a list that
+    /// grows from empty to the authorized ceiling reallocates and copies ~15
+    /// times, and every one of those lands on the per-tick path. The cost is
+    /// `WINDOW_COUNT × MAX_TRACKED_CONTRACTS × 16 B` ≈ 1.6 MB per family and
+    /// ~3.2 MB in all, committed at boot — stated rather than buried, though
+    /// it is small beside the ~5.3 MB the maps already commit (~2.6 MB per
+    /// family: hashbrown stores the 16-byte key INLINE beside the 64-byte
+    /// `Tracked`, so an entry is 80 B, and 25,000 rounds up to 32,768 buckets
+    /// — 32,768 × 80 B ≈ 2.6 MB. An earlier version of this line said "~4 MB",
+    /// which counted the value and not the inline key).
+    dirty: [Vec<ContractKey>; WINDOW_COUNT],
     non_monotonic: u64,
     at_capacity: u64,
     relatched: u64,
@@ -414,14 +621,19 @@ struct Family {
     /// per-tick path.
     refused_non_monotonic: metrics::Counter,
     refused_capacity: metrics::Counter,
-    /// Gauge handles, resolved for the SAME reason as the counters above.
+    /// Gauge handles, resolved for the SAME reason as the counters above, and
+    /// now ONE PER CADENCE SLOT.
     ///
-    /// These sit on the 5-second cadence rather than the per-tick path, so the
-    /// allocating arm would have cost three `Vec`s per sweep — real but small.
+    /// These sit on the sweep arms rather than the per-tick path, so the
+    /// allocating arm would have cost a `Vec` per sweep — real but small.
     /// Resolved anyway because a module whose doc explains this exact mechanism
     /// and then does it is a file the next reader stops trusting.
-    tracked_gauge: metrics::Gauge,
-    ranked_gauge: metrics::Gauge,
+    ///
+    /// Indexed by the cadence's own slot, so the array widens with
+    /// `SnapshotCadence::ALL` and a cadence cannot silently share another's
+    /// series (see `RANKED_GAUGE`).
+    tracked_gauge: [metrics::Gauge; WINDOW_COUNT],
+    ranked_gauge: [metrics::Gauge; WINDOW_COUNT],
 }
 
 impl Family {
@@ -438,13 +650,31 @@ impl Family {
         let refused_capacity =
             metrics::counter!(REFUSED_COUNTER, "family" => label, "reason" => "capacity");
         refused_capacity.increment(0);
-        let tracked_gauge = metrics::gauge!(TRACKED_GAUGE, "family" => label);
-        let ranked_gauge = metrics::gauge!(RANKED_GAUGE, "family" => label);
+        // One handle per cadence slot, resolved from `ALL` so the arrays widen
+        // with the enum. `from_index` cannot fail for an index below
+        // `ALL.len()` — the const-assert beside `ALL` proves the list is dense
+        // and in order — but it is matched rather than unwrapped because this
+        // runs at boot and an `unwrap` here is a panic on the boot path.
+        let tracked_gauge = std::array::from_fn(|i| match SnapshotCadence::from_index(i) {
+            Some(cadence) => {
+                metrics::gauge!(TRACKED_GAUGE, "family" => label, "cadence" => cadence.as_str())
+            }
+            None => metrics::gauge!(TRACKED_GAUGE, "family" => label, "cadence" => "unknown"),
+        });
+        let ranked_gauge = std::array::from_fn(|i| match SnapshotCadence::from_index(i) {
+            Some(cadence) => {
+                metrics::gauge!(RANKED_GAUGE, "family" => label, "cadence" => cadence.as_str())
+            }
+            None => metrics::gauge!(RANKED_GAUGE, "family" => label, "cadence" => "unknown"),
+        });
         Self {
             // Pre-sized: an unsized map reallocates and rehashes ~15 times on
             // its way to the authorized universe, and every one of those lands
             // on the per-tick path.
             volumes: HashMap::with_capacity(MAX_TRACKED_CONTRACTS),
+            // Pre-sized for the same reason, and `from_fn` rather than an
+            // array literal because a `Vec` is not `Copy`.
+            dirty: std::array::from_fn(|_| Vec::with_capacity(MAX_TRACKED_CONTRACTS)),
             non_monotonic: 0,
             at_capacity: 0,
             relatched: 0,
@@ -460,6 +690,14 @@ impl Family {
     /// and pay the growth again every session.
     fn clear(&mut self) {
         self.volumes.clear();
+        // Cleared WITH the map, and it must be: a work list naming keys that
+        // no longer exist would have the next sweep probe a cleared map for
+        // every one of them — harmless in outcome (`get_mut` misses) but it
+        // re-creates the whole-universe walk this list exists to avoid, on the
+        // first sweep after every daily reset.
+        for window in &mut self.dirty {
+            window.clear();
+        }
         self.non_monotonic = 0;
         self.at_capacity = 0;
         self.relatched = 0;
@@ -563,6 +801,16 @@ impl VolumeLeaderboard {
                         // wrong. Its first window after a re-latch reports
                         // nothing, which is the honest answer.
                         baseline: [contract.volume; WINDOW_COUNT],
+                        // PRESERVED, and nothing is pushed. The mask and the
+                        // work lists are one structure (see `Family::dirty`),
+                        // so clearing the mask here without also removing the
+                        // key from the lists would let the NEXT advance push a
+                        // second copy and the lists would grow past the map.
+                        // Preserving costs at most one wasted visit per
+                        // re-latch, and that visit computes a delta of 0
+                        // because the baseline above was just reseeded to the
+                        // very volume it is measured against.
+                        dirty: existing.dirty,
                     };
                     slot.relatched = slot.relatched.saturating_add(1);
                     let relatched_total = slot.relatched;
@@ -632,6 +880,7 @@ impl VolumeLeaderboard {
             // id can be reused across days, and holding a stale underlying
             // would put the contract under the wrong name in the depth-200
             // distinct-underlying constraint.
+            let was_dirty = existing.dirty;
             *existing = Tracked {
                 contract,
                 consecutive_lower: 0,
@@ -640,7 +889,31 @@ impl VolumeLeaderboard {
                 // the delta on every accepted tick and every window would
                 // report 0, which is the whole feature silently doing nothing.
                 baseline: existing.baseline,
+                // EVERY window at once, not just the one about to fire. This
+                // contract now has a non-zero delta in all of them
+                // simultaneously; marking only the nearest cadence would leave
+                // the 1-minute board reporting whichever contracts the
+                // 1-second sweep happened not to have cleared yet.
+                dirty: ALL_WINDOWS_DIRTY,
             };
+            // THE ONLY SITE THAT ADDS WORK. `existing` borrows `volumes` and
+            // the lists sit beside it on the same struct, so the mask is
+            // copied out above and the borrow ends here before the push.
+            //
+            // Guarded on the whole mask first: a contract that trades many
+            // times between two sweeps is already marked in every window, and
+            // that is the COMMON case on a liquid strike — one `u8` compare
+            // per tick instead of a loop.
+            if was_dirty != ALL_WINDOWS_DIRTY {
+                for (window, pending) in slot.dirty.iter_mut().enumerate() {
+                    // Push only where the bit was CLEAR, which is what keeps
+                    // each key in each list at most once and therefore keeps
+                    // the lists bounded by the map they index.
+                    if was_dirty & (1u8 << window) == 0 {
+                        pending.push(key);
+                    }
+                }
+            }
             return Observation::Accepted;
         }
 
@@ -682,6 +955,14 @@ impl VolumeLeaderboard {
                 // session so far — the largest figure it will ever show, on a
                 // board whose top entries take depth sockets.
                 baseline: [contract.volume; WINDOW_COUNT],
+                // CLEAN, and nothing is pushed. The baseline one line above is
+                // this contract's own current volume, so its delta in every
+                // window is structurally zero until it advances — a sweep that
+                // visited it would rank nothing and write a baseline it
+                // already holds. Marking it here would put every contract in
+                // the universe on the work list at attach and hand back the
+                // whole-universe walk on the first sweep of the session.
+                dirty: 0,
             },
         );
         Observation::Accepted
@@ -709,9 +990,22 @@ impl VolumeLeaderboard {
     /// `tv_volume_leaderboard_ranked` reports the number of contracts that
     /// TRADED in the window (the sorted population), not the 250 or 5 the
     /// depth pools were handed; the handed counts are on the steering side.
-    /// The sort is O(n log n) in that traded population — MEASURED at 900 µs
-    /// for the 20,220-contract worst case by
-    /// `rank_sweep_cost_at_the_authorized_ceiling`.
+    ///
+    /// The sort is O(n log n) in that traded population, and since 2026-09-12
+    /// so is the WALK that feeds it — the sweep drains `Family::dirty[idx]`
+    /// rather than the whole map, so neither half scales with the size of the
+    /// universe. That is the achievable form of the operator's O(1) ask:
+    /// per-sweep O(1) is arithmetically impossible, because the output is one
+    /// row per traded contract and Ω(traded) is a floor; O(1) in the size of
+    /// the UNIVERSE is what a work list can deliver, and is what this does.
+    ///
+    /// ⚠ This doc read "MEASURED at 900 µs for the 20,220-contract worst
+    /// case" until 2026-09-12. It was not measured: the harness it cited
+    /// seeded every baseline to the contract's own volume and then timed fifty
+    /// sorts of an empty vector. Run
+    /// `rank_sweep_cost_at_the_authorized_ceiling` — which now REFUSES to
+    /// report a number from a board it did not fill — rather than quoting one
+    /// from here.
     /// Rolls ONE cadence's baselines forward to the contracts' current
     /// cumulative volume, without ranking.
     ///
@@ -737,13 +1031,27 @@ impl VolumeLeaderboard {
     /// converts a property that currently holds because of exchange
     /// microstructure into one that holds by construction.
     ///
-    /// O(tracked) integer writes, no sort and no allocation — the same walk
+    /// O(traded) integer writes, no sort and no allocation — the same walk
     /// `rank` already makes, without the ranking half.
     pub fn roll_baselines(&mut self, family: OptionFamily, cadence: SnapshotCadence) {
-        let idx = window_index(cadence);
-        for tracked in self.family_mut(family).volumes.values_mut() {
+        let Some(idx) = window_slot(cadence) else {
+            // Refused and counted in `window_slot`. Rolling nothing is the
+            // safe half: a baseline that is never rolled makes that cadence
+            // report a growing window, which is visible; an out-of-bounds
+            // write aborts the process.
+            return;
+        };
+        let slot = self.family_mut(family);
+        let mut pending = std::mem::take(&mut slot.dirty[idx]);
+        for key in pending.drain(..) {
+            let Some(tracked) = slot.volumes.get_mut(&key) else {
+                continue;
+            };
+            tracked.dirty &= !(1u8 << idx);
             tracked.baseline[idx] = tracked.contract.volume;
         }
+        // Drained, so this hands the CAPACITY back, not the contents.
+        slot.dirty[idx] = pending;
     }
 
     pub fn rank<F, L>(
@@ -758,7 +1066,13 @@ impl VolumeLeaderboard {
         F: Fn(&RankedContract) -> bool,
         L: Fn(&RankedContract) -> Option<u32>,
     {
-        let idx = window_index(cadence);
+        let Some(idx) = window_slot(cadence) else {
+            // Refused and counted in `window_slot`. An empty ranking is the
+            // honest answer — the alternative is indexing a baseline array
+            // that is one slot short, on the frame drain, under
+            // `panic = "abort"`.
+            return &[];
+        };
         // `take` rather than a direct fill: the buffer and the family map both
         // live on `self`, so filling one from the other needs two borrows. Take
         // moves the Vec out WITH its capacity, so the allocation is still made
@@ -766,16 +1080,60 @@ impl VolumeLeaderboard {
         let mut scratch = std::mem::take(&mut self.scratch);
         scratch.clear();
 
-        // ONE pass, and it does three things that must not be split apart:
-        // computes each contract's delta against ITS baseline, pushes the
-        // eligible ones, and rolls EVERY baseline forward.
+        // ONE pass over the contracts that TRADED in this window, and it does
+        // three things that must not be split apart: computes each contract's
+        // delta against ITS baseline, pushes the eligible ones, and rolls
+        // EVERY TRADED baseline forward — ranked or not.
         //
-        // "Every" is the load-bearing word. Rolling forward only the ranked
-        // contracts would let an ineligible one accumulate across windows and
-        // arrive with a delta measuring minutes the moment it became eligible —
-        // it would take a depth socket on a number no other contract on the
-        // board was measured over.
-        for tracked in self.family_mut(family).volumes.values_mut() {
+        // "Every traded, ranked or not" is the load-bearing phrase, and the
+        // baseline roll below sits ABOVE the eligibility test for exactly that
+        // reason. Rolling forward only the RANKED contracts would let an
+        // ineligible one accumulate across windows and arrive with a delta
+        // measuring minutes the moment it became eligible — it would take a
+        // depth socket on a number no other contract on the board was measured
+        // over.
+        //
+        // ⚠ 2026-09-12 — this comment said "rolls EVERY baseline forward" and
+        // the loop walked the whole map. It now walks the work list, and the
+        // two are EQUIVALENT rather than merely close:
+        //
+        //   a contract is absent from `dirty[idx]` ⟺ its bit for `idx` is
+        //   clear ⟺ no accepted advance since this window's last sweep ⟹
+        //   `baseline[idx] == volume` ⟹ `delta == 0` ⟹ `lots == 0` ⟹ the
+        //   loop would have `continue`d, after writing a baseline it already
+        //   held.
+        //
+        // The arrows are DIRECTIONAL past the third step and that is not a
+        // typographic nicety — the last two do not hold in reverse.
+        // `lots == delta * 1000 / lot_size` is an integer division, so a
+        // delta of 1 on a 2,000-unit lot yields `lots == 0` with `delta != 0`;
+        // and the loop also `continue`s when the lot size is MISSING, whatever
+        // the delta. Neither reverse direction is needed: the claim being
+        // proven is one-way — absent from the list ⟹ the old walk would have
+        // skipped it — so left-to-right is the whole proof. (Stated because an
+        // earlier version of this comment wrote ⟺ throughout, which asserts
+        // two things that are false and would mislead anyone auditing the
+        // skip by reading the chain rather than the code.)
+        //
+        // The middle step is what every writer of `Tracked` is arranged to
+        // keep true: insert seeds the baseline to the current volume, an
+        // accepted advance marks the bit, a re-latch reseeds the baseline AND
+        // preserves the mask, and a refusal changes neither the volume nor the
+        // baseline. So skipping an unmarked contract is not an approximation
+        // of the old walk — it produces the same board, byte for byte, and
+        // the same stored baselines. Pinned by
+        // `a_contract_that_traded_is_never_skipped_by_the_sweep_that_follows`.
+        let slot = self.family_mut(family);
+        let mut pending = std::mem::take(&mut slot.dirty[idx]);
+        for key in pending.drain(..) {
+            // A key on the list whose entry is gone can only mean a daily
+            // reset landed between the mark and the sweep, and `clear` empties
+            // both halves together — so this is the defensive arm, and it
+            // skips rather than re-inserting a contract the reset removed.
+            let Some(tracked) = slot.volumes.get_mut(&key) else {
+                continue;
+            };
+            tracked.dirty &= !(1u8 << idx);
             let delta = tracked
                 .contract
                 .volume
@@ -823,6 +1181,8 @@ impl VolumeLeaderboard {
                 scratch.push(row);
             }
         }
+        // Drained, so this hands the CAPACITY back, not the contents.
+        slot.dirty[idx] = pending;
 
         // Most lots traded in the window first, then a DETERMINISTIC tiebreak
         // on the composite identity. Without the tiebreak, equal keys order by
@@ -830,6 +1190,18 @@ impl VolumeLeaderboard {
         // sweeps and the caller swaps subscriptions for nothing — and equal
         // keys are COMMON now in a way they were not under a cumulative key:
         // every contract that traded nothing in the window is exactly 0.
+        //
+        // THIS IS THE VOLUME-PERCENTAGE ORDER (operator 2026-09-12: "rank on
+        // volume-percentage alone"). The key is `window_lots_milli` and the
+        // percentage the operator reads is
+        // `net_volume_chg_pct = window_lots_milli / 10 - 100` — a strictly
+        // increasing affine transform, so the two produce the SAME sequence,
+        // row for row, including every tie. Sorting on the percentage instead
+        // would change nothing except to put a float in a comparator, and a
+        // non-finite comparator is non-transitive: one NaN corrupts the whole
+        // sort rather than misplacing one row. Integer key, percentage
+        // presentation. Pinned by
+        // `ranking_by_volume_percentage_is_the_same_order_as_ranking_by_lots`.
         scratch.sort_unstable_by(|a, b| {
             b.window_lots_milli
                 .cmp(&a.window_lots_milli)
@@ -841,8 +1213,10 @@ impl VolumeLeaderboard {
 
         let ranked_len = self.scratch.len();
         let slot = self.family_ref(family);
-        slot.tracked_gauge.set(slot.volumes.len() as f64);
-        slot.ranked_gauge.set(ranked_len as f64);
+        // Indexed by THIS sweep's slot. Sharing one handle across cadences
+        // made the reading whichever arm fired last — see `RANKED_GAUGE`.
+        slot.tracked_gauge[idx].set(slot.volumes.len() as f64);
+        slot.ranked_gauge[idx].set(ranked_len as f64);
         &self.scratch
     }
 
@@ -1311,29 +1685,513 @@ mod tests {
         );
     }
 
-    /// The roll is per CADENCE. Rolling the 1s baseline must not disturb the 5s
-    /// one — they measure different windows and share only the contract.
+    /// The operator's requirement is that the board be ranked "purely based on
+    /// volume percentage". It already is, and this proves it rather than
+    /// asserting it.
+    ///
+    /// `net_volume_chg_pct = window_lots_milli / 10 - 100` is strictly
+    /// increasing, so ordering by it and ordering by the stored integer key
+    /// produce the same sequence — including ties, which are common (every
+    /// contract that traded nothing in a window is exactly 0 lots). This test
+    /// ranks a board, then independently re-sorts the SAME rows by the
+    /// percentage as a float, and requires the two orders to be identical.
+    ///
+    /// It is what lets the module claim the percentage ordering without
+    /// putting a float in the comparator, and it is the reason no redundant
+    /// percentage COLUMN is stored: a second copy of a total function of an
+    /// existing column would cost ~8 B on every one of the millions of rows a
+    /// session now writes, on a box whose disk burn already caused a
+    /// zero-capture day, to record a number the view derives exactly.
     #[test]
-    fn roll_baselines_for_one_cadence_leaves_the_other_alone() {
+    fn ranking_by_volume_percentage_is_the_same_order_as_ranking_by_lots() {
         let mut lb = VolumeLeaderboard::new();
-        lb.observe(stock(1, 100, 1_000), OptionFamily::Stock);
-        lb.observe(stock(1, 100, 10_000), OptionFamily::Stock);
-
-        lb.roll_baselines(OptionFamily::Stock, S1);
-        lb.observe(stock(1, 100, 10_400), OptionFamily::Stock);
-
-        let one = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
-        assert_eq!(
-            one[0].window_lots_milli, 400_000,
-            "the rolled 1s baseline measures only the 400 units since the roll"
+        // A spread that exercises both sides of the +-0% crossing: under one
+        // lot is NEGATIVE percent, exactly one lot is 0%, above is positive.
+        // Ties included deliberately — the tiebreak must survive the transform.
+        // Lot size 200, so a window delta BELOW 200 units is less than one lot
+        // and reads as a negative change. Seeded non-zero: a contract is first
+        // tracked at the volume it is first seen with, so a 0 seed would make
+        // every delta 0 and the board empty.
+        let lot200 = |_: &RankedContract| Some(200_u32);
+        for (id, delta) in [
+            (1_u64, 50_u32), // a quarter lot  -> -75%
+            (2, 200),        // exactly one lot ->   0%
+            (3, 200),        // tie with 2
+            (4, 6_400),      // 32 lots        -> +3100%
+            (5, 1),          // one unit       -> -99.5%
+            (6, 0),          // never traded   -> dropped at the zero-lot skip
+            (7, 500),        // 2.5 lots       -> +150%
+            (8, 6_400),      // tie with 4
+        ] {
+            lb.observe(stock(id, 100, 1_000), OptionFamily::Stock);
+            lb.observe(stock(id, 100, 1_000 + delta), OptionFamily::Stock);
+        }
+        let by_lots = lb
+            .rank(OptionFamily::Stock, S1, usize::MAX, lot200, all)
+            .to_vec();
+        assert!(
+            by_lots.len() >= 6,
+            "the fixture must produce a real board, got {}",
+            by_lots.len()
         );
 
-        let five = lb.rank(OptionFamily::Stock, S5, 10, lot1, all);
+        // The exact expression `console_views` puts in the view.
+        fn chg_pct(milli: u64) -> f64 {
+            milli as f64 / 10.0 - 100.0
+        }
+
+        let mut by_pct = by_lots.clone();
+        by_pct.sort_by(|a, b| {
+            chg_pct(b.window_lots_milli)
+                .partial_cmp(&chg_pct(a.window_lots_milli))
+                .expect("the fixture contains no NaN — which is the point")
+                .then_with(|| a.security_id.cmp(&b.security_id))
+                .then_with(|| (a.segment as u8).cmp(&(b.segment as u8)))
+        });
+
+        let lots_order: Vec<u64> = by_lots.iter().map(|r| r.security_id).collect();
+        let pct_order: Vec<u64> = by_pct.iter().map(|r| r.security_id).collect();
         assert_eq!(
-            five[0].window_lots_milli, 9_400_000,
-            "the 5s baseline was NOT rolled, so it still measures from its own \
-             seed — 10,400 - 1,000"
+            lots_order, pct_order,
+            "ordering by the stored lots key and by the displayed volume \
+             percentage must be the SAME sequence; if they ever differ, the \
+             claim that the board is ranked on volume percentage is false"
         );
+
+        // And the percentage really is a CHANGE from one lot, not a ratio of
+        // one lot: half a lot must read negative, not a reassuring 50%.
+        let half = by_lots
+            .iter()
+            .find(|r| r.security_id == 1)
+            .expect("the half-lot contract must be on the board");
+        assert!(
+            chg_pct(half.window_lots_milli) < 0.0,
+            "half a lot must read as a NEGATIVE change, got {}",
+            chg_pct(half.window_lots_milli)
+        );
+    }
+
+    /// Asserts `Family::dirty`'s invariant directly, on every family, over
+    /// every shape `observe` can leave behind.
+    ///
+    /// For each window `w`: the work list holds each key AT MOST ONCE, holds
+    /// it if and only if the contract's bit for `w` is set, and every tracked
+    /// contract ABSENT from the list has `baseline[w] == volume`.
+    ///
+    /// That last clause is the whole correctness argument for walking the list
+    /// instead of the map — it says the sweep's visit to a skipped contract
+    /// would have computed a delta of zero and written back a baseline it
+    /// already held.
+    fn assert_dirty_invariant(lb: &VolumeLeaderboard, family: OptionFamily, note: &str) {
+        let slot = lb.family_ref(family);
+        for (window, pending) in slot.dirty.iter().enumerate() {
+            let bit = 1u8 << window;
+            let mut seen = std::collections::HashSet::new();
+            for key in pending {
+                assert!(
+                    seen.insert(*key),
+                    "{note}: {family:?} window {window} lists {key:?} twice — the lists \
+                     would grow past the map they index"
+                );
+                // Not `if let Some(..)`: an entry on the list whose map entry
+                // is GONE is exactly the "lists grow past the map" failure the
+                // duplicate check above names, and a conditional would accept
+                // it in silence. Unreachable today — `volumes` has no `remove`
+                // and `clear` empties both halves together — so this asserts a
+                // property rather than guarding a live path, which is what a
+                // test helper is for.
+                let tracked = slot.volumes.get(key).unwrap_or_else(|| {
+                    panic!(
+                        "{note}: {family:?} window {window} lists {key:?} with no map entry \
+                         — the list has outlived the map it indexes"
+                    )
+                });
+                assert_ne!(
+                    tracked.dirty & bit,
+                    0,
+                    "{note}: {family:?} window {window} lists {key:?} but its bit is clear"
+                );
+            }
+            for (key, tracked) in &slot.volumes {
+                if tracked.dirty & bit != 0 {
+                    assert!(
+                        seen.contains(key),
+                        "{note}: {family:?} window {window} has {key:?} marked but NOT on the \
+                         work list — the sweep would never visit it and its traded volume \
+                         would be folded into a later window"
+                    );
+                    continue;
+                }
+                assert_eq!(
+                    tracked.baseline[window], tracked.contract.volume,
+                    "{note}: {family:?} window {window} skips {key:?}, so its delta must be \
+                     structurally zero — a non-zero delta here is volume the board silently \
+                     loses"
+                );
+            }
+        }
+    }
+
+    /// The work list has exactly ONE producer, and the sweeps are the only
+    /// consumers.
+    ///
+    /// `assert_dirty_invariant` proves the structure is consistent after the
+    /// operations the tests drive. It cannot prove that some FUTURE call site
+    /// does not push from somewhere else — and a second producer is precisely
+    /// how the "at most once" half breaks, because the bit guard that keeps a
+    /// key unique lives at the one site that owns it. So the site count is
+    /// pinned in the source.
+    ///
+    /// Also pins the per-cadence gauges: sharing one handle across cadences is
+    /// invisible at runtime (every `set` succeeds) and makes the reading
+    /// whichever arm fired last, which is a wrong number rather than a missing
+    /// one.
+    #[test]
+    fn the_work_list_has_one_producer_and_the_gauges_are_per_cadence() {
+        let src = include_str!("volume_leaderboard.rs");
+        let production = src
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("production text precedes the first test module");
+
+        assert_eq!(
+            production.matches(".push(key)").count(),
+            1,
+            "exactly ONE site may add to the work list — the accepted-advance arm, which is \
+             the only place that checks the bit before pushing. A second producer breaks the \
+             at-most-once half of the invariant and the lists grow past the map they index"
+        );
+        // ⚠ The assertion above counts ONE SPELLING, and a hostile review of
+        // this change pointed out that `pending.push(k)` or `list.push(*key)`
+        // walks straight past it. So the TOTAL push count is pinned too: any
+        // new `.push(` anywhere in the production half fails this test and the
+        // author has to come here and say which list they are pushing into.
+        //
+        // The five are: the work-list producer (the only one that matters
+        // here), `scratch.push(row)` in `rank`, `seen.push`/`out.push` in
+        // `distinct_underlying_over`, and `out.push` in `gainer_eligible` —
+        // the last four all push into function-local `Vec`s that die at the
+        // end of the call and index nothing.
+        assert_eq!(
+            production.matches(".push(").count(),
+            5,
+            "a new `.push(` appeared in the production half. If it pushes into a work list \
+             it is a SECOND PRODUCER and breaks the at-most-once invariant; if it pushes \
+             into a function-local buffer it is harmless — decide which, then update this \
+             count and the list above. The spelling-specific assertion directly above \
+             cannot see a push written any other way, which is why this one is here"
+        );
+        // And that site is guarded on the bit, which is what makes it
+        // at-most-once rather than merely rare.
+        assert!(
+            production.contains("if was_dirty & (1u8 << window) == 0 {"),
+            "the push must be guarded on the window's bit being CLEAR"
+        );
+        // Exactly two drains: `rank` and `roll_baselines`. A third consumer
+        // that takes the list without clearing the matching bits would leave
+        // contracts marked-but-unlisted, which is a trade silently folded into
+        // a later window.
+        assert_eq!(
+            production
+                .matches("std::mem::take(&mut slot.dirty[idx])")
+                .count(),
+            2,
+            "only `rank` and `roll_baselines` may drain a work list"
+        );
+        // Same evasion, same close: the assertion above matches one spelling,
+        // so `slot.dirty[i]` or `slot.dirty[idx].drain(..)` would be a THIRD
+        // consumer it cannot see. Pinning every access to a work-list slot
+        // catches any of them. The four are the take and the restore inside
+        // each of the two drains.
+        assert_eq!(
+            production.matches("slot.dirty[").count(),
+            4,
+            "a new access to a work-list slot appeared. Only `rank` and `roll_baselines` may \
+             touch one, and each does exactly twice — take, then restore. A third consumer \
+             that drains without clearing the matching bits leaves contracts marked-but-\
+             unlisted, which is a trade silently folded into a later window"
+        );
+        assert_eq!(
+            production
+                .matches("tracked.dirty &= !(1u8 << idx);")
+                .count(),
+            2,
+            "and each drain must clear the bit it consumes, or the contract stays marked \
+             with nothing on the list to visit it"
+        );
+
+        // Scoped to the gauge macros, not to the bare label text — the
+        // unslotted-cadence counter carries the same label for its own reasons
+        // and must not be what satisfies this.
+        for gauge in ["TRACKED_GAUGE", "RANKED_GAUGE"] {
+            assert_eq!(
+                production
+                    .matches(&format!("{gauge}, \"family\" => label, \"cadence\" =>"))
+                    .count(),
+                2,
+                "{gauge} must carry a cadence label on BOTH resolution arms; without it four \
+                 cadences write one series and the operator reads whichever arm fired last"
+            );
+        }
+        assert!(
+            production.contains("slot.tracked_gauge[idx].set(")
+                && production.contains("slot.ranked_gauge[idx].set("),
+            "and each sweep must write the handle for ITS OWN cadence slot"
+        );
+    }
+
+    /// The sweep walks the work list rather than the map, and this is why that
+    /// is sound rather than merely cheap.
+    ///
+    /// Drives every state `observe` can leave a contract in — freshly
+    /// inserted, advanced, advanced-then-swept, refused as non-monotonic,
+    /// unchanged, and re-latched — and checks the invariant after each, on
+    /// every cadence, so an off-by-one in the slot arithmetic cannot hide in
+    /// the cadence a pairwise test did not name.
+    #[test]
+    fn a_contract_that_traded_is_never_skipped_by_the_sweep_that_follows() {
+        let mut lb = VolumeLeaderboard::new();
+
+        // Freshly inserted: baseline seeded to its own volume, nothing marked.
+        lb.observe(stock(1, 100, 5_000), OptionFamily::Stock);
+        assert_dirty_invariant(&lb, OptionFamily::Stock, "after insert");
+        assert!(
+            lb.family_ref(OptionFamily::Stock).dirty[0].is_empty(),
+            "an insert must not put the contract on the work list — doing so hands back the \
+             whole-universe walk on the first sweep of the session"
+        );
+
+        // Advanced: marked in EVERY window at once.
+        lb.observe(stock(1, 100, 5_400), OptionFamily::Stock);
+        assert_dirty_invariant(&lb, OptionFamily::Stock, "after advance");
+        for window in 0..WINDOW_COUNT {
+            assert_eq!(
+                lb.family_ref(OptionFamily::Stock).dirty[window].len(),
+                1,
+                "an advance marks window {window} too, not just the cadence about to fire"
+            );
+        }
+
+        // Advancing again must NOT push a second copy.
+        lb.observe(stock(1, 100, 5_900), OptionFamily::Stock);
+        assert_dirty_invariant(&lb, OptionFamily::Stock, "after a second advance");
+        assert_eq!(
+            lb.family_ref(OptionFamily::Stock).dirty[0].len(),
+            1,
+            "a contract that trades repeatedly between sweeps must stay on the list once"
+        );
+
+        // Swept on ONE cadence: cleared there, still pending everywhere else.
+        let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
+        assert_eq!(ranked.len(), 1, "the traded contract must be on the board");
+        assert_eq!(
+            ranked[0].delta_units, 900,
+            "and it must carry the window it actually traded"
+        );
+        assert_dirty_invariant(&lb, OptionFamily::Stock, "after the 1s sweep");
+        assert!(
+            lb.family_ref(OptionFamily::Stock).dirty[0].is_empty(),
+            "the swept window's list is drained"
+        );
+        assert_eq!(
+            lb.family_ref(OptionFamily::Stock).dirty[1].len(),
+            1,
+            "and the OTHER windows still hold it — the 1m board must not lose a trade \
+             because the 1s board swept first"
+        );
+
+        // PARTIALLY marked, and this is the state production spends almost all
+        // its time in: the 1s sweep has just cleared bit 0 while the 3s, 5s and
+        // 1m bits are still set, and then the contract trades again. The push
+        // must land in the ONE list that lost it and nowhere else — a push into
+        // all four would duplicate it in three of them, and the lists would
+        // grow past the map they index. (Added 2026-09-12: the first version of
+        // this test advanced only from the fully-clear and fully-marked states,
+        // so removing the per-window bit guard passed it.)
+        lb.observe(stock(1, 100, 6_500), OptionFamily::Stock);
+        assert_dirty_invariant(
+            &lb,
+            OptionFamily::Stock,
+            "after advancing while partly marked",
+        );
+        for window in 0..WINDOW_COUNT {
+            assert_eq!(
+                lb.family_ref(OptionFamily::Stock).dirty[window].len(),
+                1,
+                "advancing from a PARTLY marked state must leave window {window} holding the \
+                 contract exactly once"
+            );
+        }
+        // Consume it again so the states below start from a swept window.
+        let _ = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
+
+        // Unchanged and refused: neither may touch the lists.
+        lb.observe(stock(1, 100, 5_900), OptionFamily::Stock);
+        lb.observe(stock(1, 100, 10), OptionFamily::Stock);
+        assert_dirty_invariant(&lb, OptionFamily::Stock, "after unchanged + refused");
+        assert!(
+            lb.family_ref(OptionFamily::Stock).dirty[0].is_empty(),
+            "an unchanged or refused observation records nothing, so it marks nothing"
+        );
+
+        // Re-latched: the mask is preserved, so the lists stay exact.
+        for _ in 0..RELATCH_AFTER_CONSECUTIVE_LOWER {
+            lb.observe(stock(1, 100, 10), OptionFamily::Stock);
+        }
+        assert_eq!(
+            lb.relatches(OptionFamily::Stock),
+            1,
+            "the fixture must actually reach the re-latch it is testing"
+        );
+        assert_dirty_invariant(&lb, OptionFamily::Stock, "after relatch");
+
+        // And a sweep of every cadence, in turn, leaves it consistent.
+        for cadence in SnapshotCadence::ALL {
+            lb.observe(stock(2, 200, 1), OptionFamily::Stock);
+            lb.observe(stock(2, 200, 7_000), OptionFamily::Stock);
+            let _ = lb.rank(OptionFamily::Stock, cadence, 10, lot1, all);
+            assert_dirty_invariant(&lb, OptionFamily::Stock, "after a full-cadence sweep");
+            lb.roll_baselines(OptionFamily::Stock, cadence);
+            assert_dirty_invariant(&lb, OptionFamily::Stock, "after a roll");
+        }
+
+        // The daily reset empties both halves together. Trade FIRST, so there
+        // is something on the lists for the reset to forget — without this the
+        // assertion below holds whether `clear` empties them or not, which is
+        // how the first version of this test passed with the reset's list-clear
+        // deleted (2026-09-12).
+        lb.observe(stock(3, 300, 400), OptionFamily::Stock);
+        lb.observe(stock(3, 300, 900), OptionFamily::Stock);
+        assert!(
+            !lb.family_ref(OptionFamily::Stock).dirty[0].is_empty(),
+            "the fixture must leave work pending, or the reset assertion below proves nothing"
+        );
+        lb.reset_daily();
+        assert_dirty_invariant(&lb, OptionFamily::Stock, "after reset");
+        assert!(
+            lb.family_ref(OptionFamily::Stock).dirty[0].is_empty(),
+            "a work list naming keys the reset removed re-creates the whole-universe probe"
+        );
+    }
+
+    /// The dirty-set sweep must produce the SAME board as a walk over every
+    /// tracked contract — not a close one.
+    ///
+    /// Builds a population that is mostly quiet (the realistic shape: a few
+    /// hundred of ~20,000 strikes trade in any one second), sweeps it, and
+    /// compares against the board recomputed by hand from every contract in
+    /// the map. Byte for byte, including the tiebreak order.
+    #[test]
+    fn the_dirty_sweep_ranks_exactly_what_a_full_walk_would() {
+        let mut lb = VolumeLeaderboard::new();
+        // 400 contracts attach; only every seventh one then trades.
+        for id in 0..400u64 {
+            lb.observe(stock(id, id % 20, 1_000 + id as u32), OptionFamily::Stock);
+        }
+        // One sweep to establish steady state, so the comparison is not run
+        // against the special first-sweep case.
+        let _ = lb.rank(OptionFamily::Stock, S1, usize::MAX, lot1, all);
+
+        let mut traded = 0usize;
+        for id in (0..400u64).step_by(7) {
+            lb.observe(
+                stock(id, id % 20, 1_000 + id as u32 + (id as u32 % 13) + 1),
+                OptionFamily::Stock,
+            );
+            traded += 1;
+        }
+        assert!(traded > 20, "the fixture must trade a real fraction");
+
+        // What a FULL walk over the map would have ranked, computed here.
+        let mut expected: Vec<RankedContract> = lb
+            .family_ref(OptionFamily::Stock)
+            .volumes
+            .values()
+            .filter_map(|t| {
+                let delta = t.contract.volume.saturating_sub(t.baseline[0]);
+                let lots = window_lots_milli(delta, 1)?;
+                if lots == 0 {
+                    return None;
+                }
+                let mut row = t.contract;
+                row.window_lots_milli = lots;
+                row.delta_units = delta;
+                row.lot_size = 1;
+                Some(row)
+            })
+            .collect();
+        expected.sort_unstable_by(|a, b| {
+            b.window_lots_milli
+                .cmp(&a.window_lots_milli)
+                .then_with(|| a.security_id.cmp(&b.security_id))
+                .then_with(|| (a.segment as u8).cmp(&(b.segment as u8)))
+        });
+
+        let actual = lb
+            .rank(OptionFamily::Stock, S1, usize::MAX, lot1, all)
+            .to_vec();
+        assert_eq!(
+            actual.len(),
+            traded,
+            "the board must hold exactly the contracts that traded"
+        );
+        assert_eq!(
+            actual, expected,
+            "the work-list sweep and a full-map walk must produce the same board"
+        );
+    }
+
+    /// The roll is per CADENCE. Rolling one cadence's baseline must not
+    /// disturb ANY other — they measure different windows and share only the
+    /// contract.
+    ///
+    /// Driven from `SnapshotCadence::ALL`, not from a named 1s/5s pair: with
+    /// two cadences a pairwise test was the whole space, and with four it is
+    /// one sixth of it. The shape this catches is an off-by-one in the slot
+    /// arithmetic, which a test of slots 0 and 2 alone can easily miss.
+    #[test]
+    fn roll_baselines_for_one_cadence_leaves_every_other_alone() {
+        for rolled in SnapshotCadence::ALL {
+            let mut lb = VolumeLeaderboard::new();
+            lb.observe(stock(1, 100, 1_000), OptionFamily::Stock);
+            lb.observe(stock(1, 100, 10_000), OptionFamily::Stock);
+
+            lb.roll_baselines(OptionFamily::Stock, rolled);
+            lb.observe(stock(1, 100, 10_400), OptionFamily::Stock);
+
+            // The rolled cadence measures only what traded since ITS roll.
+            let after = lb.rank(OptionFamily::Stock, rolled, 10, lot1, all);
+            assert_eq!(
+                after[0].window_lots_milli,
+                400_000,
+                "{}: the rolled baseline must measure only the 400 units since \
+                 the roll",
+                rolled.as_str()
+            );
+
+            // Every OTHER cadence still measures from its own seed. Ranking
+            // one rolls it, so each is read on a freshly built board to keep
+            // the cadences independent of the order this loop reads them in.
+            for other in SnapshotCadence::ALL {
+                if other == rolled {
+                    continue;
+                }
+                let mut lb2 = VolumeLeaderboard::new();
+                lb2.observe(stock(1, 100, 1_000), OptionFamily::Stock);
+                lb2.observe(stock(1, 100, 10_000), OptionFamily::Stock);
+                lb2.roll_baselines(OptionFamily::Stock, rolled);
+                lb2.observe(stock(1, 100, 10_400), OptionFamily::Stock);
+                let untouched = lb2.rank(OptionFamily::Stock, other, 10, lot1, all);
+                assert_eq!(
+                    untouched[0].window_lots_milli,
+                    9_400_000,
+                    "rolling {} disturbed {}: an unrolled baseline must still \
+                     measure from its own seed — 10,400 - 1,000",
+                    rolled.as_str(),
+                    other.as_str()
+                );
+            }
+        }
     }
 
     const S1: SnapshotCadence = SnapshotCadence::OneSecond;
@@ -1992,6 +2850,51 @@ mod tests {
         assert_eq!(five[0].security_id, 50);
     }
 
+    /// Advance `traded` of the `contracts` contracts, then time ONLY the
+    /// sweep. Returns `(per-sweep duration, contracts the sweep ranked)`.
+    ///
+    /// The second value exists so the caller can REFUSE a vacuous measurement.
+    ///
+    /// The advance loop is deliberately outside the timer: it is the per-tick
+    /// path, gated by its own DHAT test, and folding it in would report a cost
+    /// the sweep does not pay. What it does for the timer is leave the work
+    /// list at the length the sweep must then walk — the variable this harness
+    /// exists to sweep across.
+    fn timed_sweep_round(
+        lb: &mut VolumeLeaderboard,
+        lots: &std::collections::HashMap<ContractKey, u32>,
+        contracts: u64,
+        traded: u64,
+        round: u64,
+        k: usize,
+    ) -> (std::time::Duration, usize) {
+        for step in 0..traded {
+            // Spread the traded set across the population rather than taking a
+            // prefix, so the sweep's map probes are scattered exactly as they
+            // are in production.
+            let id = (step * contracts / traded.max(1)) % contracts;
+            let volume = base_volume(id) + (round as u32 + 1) * (1 + (id as u32 % 97));
+            lb.observe(stock(id, id % 220, volume), OptionFamily::Stock);
+        }
+        let start = std::time::Instant::now();
+        let ranked = lb.rank(
+            OptionFamily::Stock,
+            S1,
+            k,
+            |c| lots.get(&(c.security_id, c.segment)).copied(),
+            all,
+        );
+        let len = ranked.len();
+        std::hint::black_box(len);
+        (start.elapsed(), len)
+    }
+
+    /// Deliberately NOT pre-sorted: a sort's cost depends on the input order,
+    /// and a pre-sorted input measures the best case.
+    fn base_volume(id: u64) -> u32 {
+        ((id.wrapping_mul(2_654_435_761)) % 5_000_000) as u32 + 1
+    }
+
     /// MEASURES the real sweep cost at the authorized ceiling.
     ///
     /// `#[ignore]`d deliberately, the same shape as
@@ -2007,56 +2910,183 @@ mod tests {
     /// a slot array. This is a `sort_unstable_by` over the filtered set --
     /// O(n log n) with a three-key comparator -- so the transfer was invalid and
     /// the figure was an underestimate. Run this instead of quoting it.
+    ///
+    /// # ⚠ CORRECTED 2026-09-12 — the figure it replaced was ALSO fiction
+    ///
+    /// The version of this harness that produced "900 us at the authorized
+    /// ceiling" seeded each contract with ONE `observe` and then ranked fifty
+    /// times without trading again. `observe` seeds `baseline = [volume; N]`,
+    /// so every delta was zero, every contract hit the `lots == 0` `continue`,
+    /// and all fifty rounds sorted an EMPTY vector. Its only assertion was
+    /// `< 1s`, which an empty sort passes trivially.
+    ///
+    /// That 900 us was then quoted as a measurement in a rule file, a plan and
+    /// this module's own `rank` doc — the shape this repository keeps
+    /// recording, arriving in the harness whose whole job is to stop it. It is
+    /// withdrawn; the numbers below come from a sweep that is now ASSERTED to
+    /// have ranked a full board, and the shape it measures is a sweep over
+    /// the work list rather than over the map.
+    ///
+    /// # What it measures now
+    ///
+    /// The per-sweep cost against the variable that actually drives it: how
+    /// many contracts TRADED in the window. The worst case (every contract
+    /// traded, so the work list is the universe) bounds it; the swept
+    /// realistic fractions are what the dirty sets buy. The advance loop sits
+    /// OUTSIDE the timer — it is the per-tick path, gated by DHAT elsewhere.
+    ///
+    /// The lot-size lookup is a real HASH PROBE, not a constant. Production
+    /// resolves it through `global_contract_underlying_map().owner_of(..)` —
+    /// a global load plus a probe, once per contract per sweep — and the
+    /// harness that produced the withdrawn figure passed `lot1`, a closure
+    /// returning `Some(1)`, which the optimiser can fold away entirely.
     #[test]
     #[ignore = "wall-clock measurement, not a gate"]
     fn rank_sweep_cost_at_the_authorized_ceiling() {
         // The measured 2026-08-22 stock-option universe.
         const CONTRACTS: u64 = 20_220;
         const DEPTH_20: usize = 250;
+        const ROUNDS: u64 = 50;
+
+        // A real lot-size map, probed once per contract per sweep. Production
+        // resolves this through a global map lookup; a constant closure would
+        // let the optimiser delete the probe the sweep actually pays for.
+        let lots: std::collections::HashMap<ContractKey, u32> = (0..CONTRACTS)
+            .map(|id| ((id, ExchangeSegment::NseFno), 1 + (id as u32 % 4) * 25))
+            .collect();
 
         let mut lb = VolumeLeaderboard::new();
         for id in 0..CONTRACTS {
-            // Volumes deliberately NOT pre-sorted: a sort's cost depends on the
-            // input order, and a pre-sorted input measures the best case.
-            let volume = ((id.wrapping_mul(2_654_435_761)) % 5_000_000) as u32 + 1;
-            lb.observe(stock(id, id % 220, volume), OptionFamily::Stock);
+            lb.observe(stock(id, id % 220, base_volume(id)), OptionFamily::Stock);
         }
         assert_eq!(lb.tracked(OptionFamily::Stock), CONTRACTS as usize);
 
         // Warm, so the first-call map/vec growth is not in the number.
-        let _ = lb.rank(OptionFamily::Stock, S1, DEPTH_20, lot1, all);
+        let _ = timed_sweep_round(&mut lb, &lots, CONTRACTS, CONTRACTS, 0, DEPTH_20);
 
-        const ROUNDS: u32 = 50;
-        let start = std::time::Instant::now();
-        for _ in 0..ROUNDS {
-            let top = lb.rank(OptionFamily::Stock, S1, DEPTH_20, lot1, all);
-            std::hint::black_box(top.len());
+        // WORST CASE: every contract in the universe traded in the window, so
+        // the work list IS the universe and the sweep degenerates to the walk
+        // the dirty sets exist to avoid.
+        let mut worst = std::time::Duration::ZERO;
+        let mut worst_ranked = 0usize;
+        for round in 1..=ROUNDS {
+            let (elapsed, ranked) =
+                timed_sweep_round(&mut lb, &lots, CONTRACTS, CONTRACTS, round, DEPTH_20);
+            worst += elapsed;
+            worst_ranked = ranked;
         }
-        let per_sweep = start.elapsed() / ROUNDS;
+        let per_worst = worst / u32::try_from(ROUNDS).unwrap_or(u32::MAX);
+
+        // REALISTIC: a 1-second window on ~20,000 strikes. The traded count is
+        // ASSUMED — nobody has measured it, and the query that would is named
+        // in `top_volume_rank_persistence`'s header. It is swept here rather
+        // than asserted, so the reader sees the shape instead of one number.
+        let mut realistic = Vec::new();
+        for traded in [100u64, 500, 2_000] {
+            let mut total = std::time::Duration::ZERO;
+            let mut ranked_len = 0usize;
+            for round in 1..=ROUNDS {
+                let (elapsed, ranked) =
+                    timed_sweep_round(&mut lb, &lots, CONTRACTS, traded, ROUNDS + round, DEPTH_20);
+                total += elapsed;
+                ranked_len = ranked;
+            }
+            realistic.push((
+                traded,
+                total / u32::try_from(ROUNDS).unwrap_or(u32::MAX),
+                ranked_len,
+            ));
+        }
 
         // The depth-200 path: ONE full-population sort (k = usize::MAX) and
         // the greedy distinct pass over it — the production 5-second arm shape.
-        let start5 = std::time::Instant::now();
-        for _ in 0..ROUNDS {
-            let five = distinct_over_full_rank(&mut lb, 5);
-            std::hint::black_box(five.len());
+        let mut distinct = std::time::Duration::ZERO;
+        let mut distinct_len = 0usize;
+        for round in 1..=ROUNDS {
+            for step in 0..CONTRACTS {
+                let volume = base_volume(step) + (300 + round as u32) * (1 + (step as u32 % 97));
+                lb.observe(stock(step, step % 220, volume), OptionFamily::Stock);
+            }
+            let start = std::time::Instant::now();
+            // Inlined rather than `distinct_over_full_rank`, which passes the
+            // constant `lot1` stub — the same probe the sweeps above pay.
+            let ordered = lb.rank(
+                OptionFamily::Stock,
+                S1,
+                usize::MAX,
+                |c| lots.get(&(c.security_id, c.segment)).copied(),
+                all,
+            );
+            let five = distinct_underlying_over(ordered, 5);
+            distinct += start.elapsed();
+            distinct_len = five.len();
+            std::hint::black_box(distinct_len);
         }
-        let per_distinct = start5.elapsed() / ROUNDS;
+        let per_distinct = distinct / u32::try_from(ROUNDS).unwrap_or(u32::MAX);
 
-        // 5-second cadence.
-        let duty = per_sweep.as_secs_f64() / 5.0 * 100.0;
+        // ONE `println!`, not one per row. `crates/app/src/lib.rs` carries an
+        // UNCONDITIONAL `#![deny(clippy::print_stdout)]`, and `#[cfg(test)]`
+        // code escapes it only because neither the CI clippy job nor the
+        // documented `make` target passes `--all-targets`. That is a repo-wide
+        // pre-existing condition (the sibling harnesses in `multi_tf_aggregator`
+        // and `tick_gap_detector` print the same way), not something to fix
+        // here — but a harness that quietly quadrupled the count would make it
+        // worse for whoever does. The report is assembled, then printed once.
+        let duty = per_worst.as_secs_f64() * 100.0;
         let duty5 = per_distinct.as_secs_f64() / 5.0 * 100.0;
-        println!(
-            "MEASURED at {CONTRACTS} contracts:\n  \
-             rank(top {DEPTH_20})        = {per_sweep:?}  -> {duty:.4}% duty at 5s\n  \
-             full rank + distinct(5)    = {per_distinct:?}  -> {duty5:.4}% duty at 5s"
+        let mut report = format!(
+            "MEASURED at {CONTRACTS} tracked contracts:\n  \
+             every contract traded   rank(top {DEPTH_20}) = {per_worst:?} \
+             -> {duty:.4}% duty at 1s   (ranked {worst_ranked})"
+        );
+        for (traded, per, len) in &realistic {
+            let d = per.as_secs_f64() * 100.0;
+            report.push_str(&format!(
+                "\n  {traded:>5} traded           rank(top {DEPTH_20}) = {per:?} \
+                 -> {d:.4}% duty at 1s   (ranked {len})"
+            ));
+        }
+        report.push_str(&format!(
+            "\n  every contract traded   full rank + distinct(5) = {per_distinct:?} \
+             -> {duty5:.4}% duty at 5s  (distinct {distinct_len})"
+        ));
+        println!("{report}");
+
+        // ⚠ THE ANTI-VACUITY GATE, and it is the reason this harness was
+        // rewritten on 2026-09-12.
+        //
+        // Until then it seeded each contract with ONE `observe`, which sets
+        // `baseline = [volume; N]`, and then ranked 50 times without trading
+        // again. Every delta was 0, every contract hit the `lots == 0`
+        // `continue`, and all fifty rounds sorted an EMPTY vector. The only
+        // assertion was `per_sweep < 1s`, which an empty sort passes trivially
+        // — so the "900 us at the authorized ceiling" figure this repository
+        // quoted in a rule file, a plan and a module header was measuring
+        // nothing at all. The dirty sets would have made it vacuous a second
+        // way (rounds 2..50 draining an empty work list), which is how it was
+        // found.
+        assert_eq!(
+            worst_ranked, DEPTH_20,
+            "the sweep must actually rank a full board, or this harness is timing an empty \
+             sort and its number is fiction"
+        );
+        for (traded, _, len) in &realistic {
+            assert!(
+                *len > 0,
+                "the {traded}-traded round ranked nothing — a vacuous measurement"
+            );
+        }
+        assert_eq!(
+            distinct_len, 5,
+            "the distinct pass must fill its five slots"
         );
 
         // Not a gate on the number -- a gate on the SHAPE. A sweep that took a
-        // whole cadence would starve the drain arm it shares a task with.
+        // whole cadence would starve the drain arm it shares a task with, and
+        // the tightest cadence is now 1 second, not 5.
         assert!(
-            per_sweep < std::time::Duration::from_secs(1),
-            "a sweep must not approach the 5s cadence: {per_sweep:?}"
+            per_worst < std::time::Duration::from_millis(200),
+            "a sweep must not approach the 1s cadence: {per_worst:?}"
         );
     }
 

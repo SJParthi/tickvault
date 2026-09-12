@@ -23,11 +23,17 @@ and the replacement is both simpler and safer:
 |---|---|---|
 | per-tick work | 1 compare, or ~8 ops on a re-sift, plus a side index from instrument to slot | 1 map update |
 | poisoned by one bad value | **yes, permanently** — a garbage volume near `u32::MAX` pins the threshold and nothing can ever beat it again; the set freezes for the session, green | **no** — the sweep recomputes from current state, so one bad value affects one instrument and self-corrects on its next good tick |
-| cost of a sweep | avoided | **900 µs MEASURED** (`rank_sweep_cost_at_the_authorized_ceiling`, release, 20,220 contracts), a **0.018% duty cycle** at 5 s |
+| cost of a sweep | avoided | ⚠ **CORRECTED 2026-09-12.** This read "**900 µs MEASURED** … a **0.018% duty cycle** at 5 s". That figure is WITHDRAWN — the harness seeded every contract's volume equal to its own baseline, so every row was skipped before the comparator and the sort it timed was a sort of an EMPTY slice. Re-measured at the same 20,220-contract ceiling: **~2.9–3.3 ms** when every contract traded (**0.29 % duty at 1 s**), **123 µs** at the realistic 2,000-traded shape. **~3.3× worse, not better** |
 | code | heap + slot index + re-sift + tie policy | one scan into a reusable buffer |
 
 The heap was premature optimisation against a cost that measurement shows is free,
 and it bought the single worst failure mode in the whole design. It is not built.
+
+*(The verdict SURVIVES its own evidence being corrected, and that is worth stating
+rather than quietly re-asserting: at 0.29 % duty in a market that cannot occur and
+0.012 % in the one that does, the sweep is still far cheaper than the failure mode
+the heap introduced — a threshold that one garbage value freezes for the session.
+The conclusion was right for a reason the number never carried.)*
 
 **The monotonicity gate is also the overflow guard.** `ParsedTick.volume` is `u32`
 and the wire value wraps at the vendor, which we cannot observe directly — but a wrap
@@ -67,12 +73,15 @@ monotonic and therefore stable — which is what keeps the re-subscribe delta sm
 ## Test Plan
 
 - `monotonic_volume_updates_are_accepted_and_ranked`
-- `a_falling_volume_is_refused_and_the_high_is_retained` — the wrap case
+- ~~`a_falling_volume_is_refused_and_the_high_is_retained`~~ → shipped as
+  **`non_monotonic_refusals_retain_the_stored_high_when_volume_falls`** — the wrap case
 - `a_wrapped_counter_is_refused_by_the_same_gate_that_catches_replay`
-- `the_map_refuses_a_new_instrument_at_the_cap_and_keeps_serving_the_tracked_ones`
+- ~~`the_map_refuses_a_new_instrument_at_the_cap_and_keeps_serving_the_tracked_ones`~~ →
+  shipped as **`capacity_refusals_refuse_new_contracts_but_keep_serving_the_tracked_ones`**
 - `index_and_stock_options_are_ranked_in_separate_leaderboards`
 - `a_blended_ranking_would_return_zero_stock_options` — the negative control that proves the split earns its place
-- `a_non_finite_previous_close_never_reaches_the_comparator`
+- ~~`a_non_finite_previous_close_never_reaches_the_comparator`~~ → shipped as
+  **`eligible_gain_pct_refuses_a_non_finite_or_zero_previous_close`**
 - `top_k_returns_empty_when_every_volume_is_zero` — the pre-open rule
 - `ties_break_deterministically_on_the_composite_key`
 - `reset_daily_clears_both_families`
@@ -95,8 +104,8 @@ backfill and no table repair.
 | Signal | Meaning |
 |---|---|
 | `tv_volume_leaderboard_refused_total{reason}` | a tick refused — `non_monotonic` (wrap/replay/reset) or `capacity` |
-| `tv_volume_leaderboard_tracked` | instruments currently tracked, per family |
-| `tv_volume_leaderboard_ranked` | size of the last materialised set, per family |
+| `tv_volume_leaderboard_tracked` | instruments currently tracked, per family AND cadence |
+| `tv_volume_leaderboard_ranked` | size of the last materialised set, per family AND cadence — the cadence label arrived 2026-09-12 with the third and fourth cadences; without it four arms wrote one series and the reading was whichever fired last. Costs $0.00: neither gauge appears in any file under `deploy/`, so both are local-`/metrics` only and unalarmable |
 | Coded log | `VOLUME-MONO-01` on a non-monotonic refusal, power-of-two throttled per family so a storm cannot flood the sink |
 
 Counters are seeded at construction with `increment(0)` so the CloudWatch agent's
@@ -129,7 +138,11 @@ rather than hidden.
   - Tests: `plan_depth20_ranked_minute_*` (incl. the exit-band and inclusive-edge
     tests), `a_gainer_ranked_below_the_top_250_by_volume_still_qualifies_for_depth`,
     `gainer_eligible_stops_at_the_limit_and_tallies_only_what_it_visited`,
-    `rebaseline_all_makes_the_next_window_measure_only_live_trading`,
+    ~~`rebaseline_all_makes_the_next_window_measure_only_live_trading`~~ (⚠ **2026-09-12:**
+    no such test, and no such function — `rebaseline_all` was REMOVED and is now
+    BANNED by a source guard: `dhan_feed_stack.rs` asserts the body does not contain
+    it, because a post-replay rebaseline seeds from the same stale value it was meant
+    to correct. The line named a delivered test for a function the tree forbids),
     `a_newly_tracked_contract_reports_nothing_until_it_trades_in_a_window`, the
     `depth_rebalance_wiring_tests` publish tests, and the DHAT ingest-seam gate now
     covering `observe`
@@ -141,9 +154,12 @@ rather than hidden.
     `crates/app/src/depth200_candidates.rs`, `crates/app/src/depth200_ranked_steer.rs`,
     `crates/app/src/depth_rebalance.rs` — `depth200_atm.rs` survives only as the
     pre-first-ranking fallback
-  - Tests: `rank_distinct_underlying_takes_the_heaviest_contract_per_name`,
+  - Tests (⚠ **2026-09-12:** the two `rank_distinct_underlying_*` names below were
+    RENAMED when that method was replaced by the free function `distinct_underlying_over`
+    on 2026-09-08 — corrected here so the list names tests that exist):
+    `distinct_over_the_full_rank_takes_the_heaviest_contract_per_name`,
     `multiple_strikes_of_one_symbol_collapse_to_one_and_the_next_names_fill_in`,
-    `rank_distinct_underlying_returns_fewer_than_k_rather_than_repeating_a_name`,
+    `distinct_over_the_full_rank_returns_fewer_than_k_rather_than_repeating_a_name`,
     `the_five_second_pass_publishes_the_depth200_steering_candidates`, the
     `plan_ranked_minute` suite in `depth200_ranked_steer.rs`
   - **Landed 2026-09-08** (PR #1890 wired the swap engine; the gainer filter, the
@@ -154,7 +170,16 @@ rather than hidden.
 
 - [ ] Item 5 — 2026-09-10 open-item sweep, ordered by the operator ("Fix and resolve everything I don't want any open items dude okay?", given against the enumerated live-health report of 2026-09-10)
   - Files: `crates/common/src/constants.rs` (`FEED_UNSUBSCRIBE_TWENTY_DEPTH` 25 → 24 — Dhan ignored every code-25 unsubscribe live on 2026-09-10; dated record in `websocket-connection-scope-lock.md` "2026-09-10 — THE DEPTH UNSUBSCRIBE REQUESTCODE IS SETTLED LIVE"), `crates/core/src/websocket/subscription_builder.rs`, `crates/common/tests/schema_validation.rs`, `crates/core/tests/subscription_builder_properties.rs`; `crates/app/src/contract_underlying_map.rs` (`order_selected_first` — the 25,000-entry map is filled from the SUBSCRIBED legs first, not artifact order), `crates/app/src/dhan_contract_universe.rs` (publish AFTER selection), `crates/app/tests/contract_map_selected_first_guard.rs`; `crates/app/src/dhan_feed_stack.rs` (`report_dead_classes` judged only inside the continuous session — the 08:33 IST RISK-GAP-03 false page); `crates/aws-lambdas/src/dhan_token_minter.rs` (ONE in-invocation retry with the next TOTP step on a TOTP rejection, `MAX_TOTP_ATTEMPTS = 2`), `deploy/aws/terraform/dhan-token-minter-lambda.tf` (timeout 60 → 120 s for the retry budget); `crates/storage/src/ws_frame_spill.rs` (`refusal_line_due` — the three WAL refusal `error!` lines ran once PER REFUSED FRAME on the socket reader task; 2,000,238 on 2026-09-04; now the 1st and every power of two, counters unchanged, the WS-SPILL-02 filter still fires at 1 — fast-lane attack sweep finding 1)
-  - Tests: `test_depth_unsubscribe_code_is_24_and_is_subscribe_plus_one`, `test_twenty_depth_unsubscribe_is_code_24_not_25`, `test_two_hundred_depth_unsubscribe_is_code_24`, `schema_feed_unsubscribe_is_subscribe_plus_one`; `order_selected_first_keeps_subscribed_contracts_ahead_and_stable`, `order_selected_first_matches_the_composite_key_never_the_id_alone`, `a_subscribed_contract_listed_last_in_the_artifact_is_mapped_before_the_cap`, `the_map_is_published_after_the_selection_with_selected_legs_first`, `the_pre_selection_rationale_is_gone`; `ist_secs_of_day_from_millis_is_total_and_ist_shifted`, `the_dead_class_verdict_is_deferred_until_the_continuous_session`, `leaving_the_session_clears_the_dead_class_latch`; `mint_token_retries_once_with_the_next_step_after_a_totp_rejection`, `mint_token_does_not_retry_a_pin_rejection`, `mint_token_maps_a_repeated_totp_rejection_to_dhan_rejected`, `test_is_totp_rejection_matches_dhans_wording_and_nothing_else`, `test_secs_to_sleep_for_next_totp_step_always_crosses_the_boundary`, `test_max_totp_attempts_is_exactly_one_retry`; `refusal_line_due_logs_the_first_and_every_power_of_two`
+  - Tests (⚠ **CORRECTED 2026-09-12** — the first four names were the CODE-24 era and
+    are stale in the DANGEROUS direction: code 24 was proven ignored on the wire on
+    2026-09-11 and the constant was restored to the vendor-documented **25** the same
+    day, so a reader following these names would go looking for tests that assert the
+    value the tree deliberately abandoned. Renamed here to what shipped):
+    `test_depth_unsubscribe_code_is_the_value_dhan_documents`,
+    `test_twenty_depth_unsubscribe_is_the_documented_code_25`,
+    `test_two_hundred_depth_unsubscribe_is_the_documented_code_25`,
+    `schema_feed_unsubscribe_is_subscribe_plus_one_except_depth`;
+    `order_selected_first_keeps_subscribed_contracts_ahead_and_stable`, `order_selected_first_matches_the_composite_key_never_the_id_alone`, `a_subscribed_contract_listed_last_in_the_artifact_is_mapped_before_the_cap`, `the_map_is_published_after_the_selection_with_selected_legs_first`, `the_pre_selection_rationale_is_gone`; `ist_secs_of_day_from_millis_is_total_and_ist_shifted`, `the_dead_class_verdict_is_deferred_until_the_continuous_session`, `leaving_the_session_clears_the_dead_class_latch`; `mint_token_retries_once_with_the_next_step_after_a_totp_rejection`, `mint_token_does_not_retry_a_pin_rejection`, `mint_token_maps_a_repeated_totp_rejection_to_dhan_rejected`, `test_is_totp_rejection_matches_dhans_wording_and_nothing_else`, `test_secs_to_sleep_for_next_totp_step_always_crosses_the_boundary`, `test_max_totp_attempts_is_exactly_one_retry`; `refusal_line_due_logs_the_first_and_every_power_of_two`
   - Honest envelope: code 24 is itself UNVERIFIED-LIVE until a session reads `ghost = 0` with `unsubscribed_grace > 0`; the map reorder does not raise the 25,000 cap (subscribed option legs ≈ 21.5k, so every one fits today); the session gate defers the dead-class verdict, it does not weaken it; the minter retry is exactly one, so a wrong secret still fails the invocation and still pages.
 
 - [x] Item 6 — the top-volume board shows the LOTS and BOTH percentages, ordered by the operator on 2026-09-12 ("see if you match this claucaltion precilsey then go ahead with the same implementation espeiclaly for top volume atbels dude okay? ... we need to add these lots also dude in our top volumes table ... meanwhiel clealry note to have the percnetge change also dude okay? see which is net volume percnetge change and normal movers percnetage change dude okay?"), given with a RapidTables screenshot pinning 200 -> 3200 = 1500%
@@ -206,8 +231,9 @@ The cadence sits on the drain task deliberately, for the reason CLAUDE.md's O(1)
 table already records for `catch_up_seal_all`: moving a sweep off that task needs a
 lock or a channel around a `&mut`, and both are strictly worse for the hot path than
 a bounded pause. That row measures its own 5-second sweep at **9.67 ms, a 0.2% duty
-cycle**; this one MEASURES 900 µs, **0.018%** — an order of magnitude cheaper than the
-sweep already running beside it.
+cycle**; this one MEASURES **123 µs at the assumed realistic shape (0.012%)** and
+**2.95 ms where every contract traded (0.295%)** — still cheaper than the sweep
+already running beside it, though by less than the withdrawn 900 µs implied.
 
 ### Decision B — where index-vs-stock classification comes from: the contract artifact, at attach
 
@@ -263,12 +289,203 @@ bare id.
 
 100% inside the tested envelope, with ratcheted regression coverage: the ranking is
 pure, fail-closed at its cap, allocation-free on the per-tick path after
-construction (⚠ `rank_distinct_underlying` DOES allocate two `Vec`s per call — the
+construction (⚠ `distinct_underlying_over` DOES allocate two `Vec`s per call — the
 depth-200 path, once per cadence, not per tick; an earlier version of this line said
-"allocation-free after construction" without that qualifier), and cannot be
+"allocation-free after construction" without that qualifier, and the version before
+2026-09-12 named `rank_distinct_underlying`, which was DELETED on 2026-09-08 —
+`distinct_underlying_over` is the surviving function and carries the same
+allocation), and cannot be
 poisoned by a single bad value because it holds no threshold. **NOT claimed:** that
 stock-option 200-level books are worth capturing — the 2026-08-26 evidence (800
 rows/minute against 100,800, and 112/210 redials against 19) says many will be
 near-empty. **NOT claimed:** that this improves capture on Monday; 2026-09-04 lost
 2,000,238 frames before the write-ahead log because the disk was full, which sits
 upstream of everything here.
+
+---
+
+# WAVE 2 — 2026-09-12: four cadences, every traded contract, volume-percentage key, O(1) in universe size
+
+**Status:** APPROVED
+**Date:** 2026-09-12
+**Approved by:** Parthiban — verbatim, in-session: *"go ahead with this ank on volume-percentage alone for all tehe ntire options contartcs enitlrey that too for every 1s,3s,5s and even 1m inclduign as well dude okay? taht too achieveign this O(1) dude okay?"*
+**Authority:** `.claude/rules/project/websocket-connection-scope-lock.md` § "2026-09-12 — FOUR CADENCES, EVERY TRADED OPTION CONTRACT, RANKED ON VOLUME-PERCENTAGE CHANGE" (landed FIRST, per the rule-file-first law).
+**Crates touched:** `crates/storage`, `crates/app`, `crates/common`.
+
+## Design
+
+> **⚠ CORRECTED 2026-09-12 — this section was written BEFORE the work and two of
+> its mechanisms are not what shipped.** Corrections are inline below rather than
+> a rewrite, so the plan-vs-outcome delta stays readable.
+
+One declaration list becomes the single source for the cadence set.
+~~A `macro_rules!` block generates~~ **a plain `#[repr(u8)]` enum with EXPLICIT
+discriminants declares** `SnapshotCadence`'s variants, its `ALL` array, its
+`COUNT`, its wire label, its interval seconds and its view name;
+~~`#[repr(usize)]` plus `self as usize`~~ **`#[repr(u8)]` plus a `slot()`
+accessor** supplies the per-cadence array index, so the index can never disagree
+with the declaration order. *(Why no macro: the enum has four variants and six
+accessors. A declarative macro would have hidden every one of them from `grep`
+and from rust-analyzer's go-to-definition, to save writing four lines. The
+ordering property the macro was for is instead pinned by a const assertion that
+`ALL` is in discriminant order — the same guarantee, visible in the source.
+`TfIndex` in the trading crate is the precedent followed.)*
+The second cadence enum in `console_views` is DELETED and the view DDL is driven
+from `SnapshotCadence`, which removes the drift rather than testing for it.
+
+~~The ranking gains a persisted integer column carrying the volume-percentage
+change — `window_lots_milli * 100 - 100_000`, in milli-percent, exactly the figure
+the view already derives.~~ **NO column was added, and that resolves W2-2 rather
+than skipping it.** The figure the operator asked to rank on,
+`net_volume_chg_pct = window_lots_milli / 10 - 100`, is a strictly increasing
+affine transform of the integer already stored, so the two orderings are IDENTICAL
+byte for byte — ranking "on volume-percentage" and ranking on `window_lots_milli`
+are the same ranking, and the percentage is already exposed to the operator by
+`console_views` as a derived view column (`net_volume_chg_pct`, alongside
+`window_lots` and `underlying_chg_pct`). Storing it again would be a second copy
+of a derived value that can drift from its own inputs, at ~8 B × every row of the
+largest observability table in the process. **The comparator is unchanged and
+still sorts the integer lots**, because this repo bans a float in a sort key.
+`window_lots_milli` and `gain_pct` both remain columns (operator Quote D).
+
+The per-family persistence cut moves off `TOP_VOLUME_RANK_PER_FAMILY` — which is
+also `DEPTH20_ENTRY_RANKS` and must stay pinned at 250 — onto its own constant,
+raised so that every contract that traded is persisted.
+
+The sweep stops walking the tracked population. Each window gets a pre-sized dirty
+buffer and a per-contract bit; `observe` marks on the arms where volume actually
+advances, and `rank` drains that window's buffer instead of iterating the map.
+Per-sweep cost becomes Θ(traded) instead of Θ(tracked) — the honest form of the
+operator's O(1) ask, since Θ(traded) is a hard floor when every traded contract is
+an output row.
+
+## Edge Cases
+
+- A contract that trades in one window but not another: marked per-window, so each
+  window's buffer is independent.
+- A contract already marked for this window: the bitmask makes the push idempotent,
+  which is what bounds the buffer at one entry per contract and lets it be pre-sized.
+- Zero delta: still dropped before the sort, unchanged.
+- Lot size zero or missing: still refused, unchanged.
+- Less than one lot traded: the new percentage column is NEGATIVE by design — the
+  change form's zero means exactly one lot.
+- Out-of-window sweeps: drain and clear the window's buffer, rolling only those
+  baselines; an untraded contract's baseline is already correct.
+- Daily reset and per-family clear must empty the buffers and the bits.
+- First sweep after a restart: baselines seed to the current volume, so the delta is
+  zero and nothing is emitted — unchanged.
+- WAL replay: the observer is skipped for the backlog, unchanged.
+- The 1-minute boundary: quantisation against the capture window is accepted and
+  recorded in the rule file rather than fixed here.
+
+## Failure Modes
+
+- A cadence added to the enum but not to `ALL` — made impossible: one macro list
+  generates both.
+- A cadence with no timer arm — caught by a new source guard asserting one arm per
+  cadence.
+- A cadence with no view — made impossible: the view set is generated from the same
+  list.
+- The zero-delta invariant broken by an unrelated edit, silently dropping contracts
+  from the board — caught by a new test that pins it directly.
+- A batch too wide for the write path: rows are DROPPED with no spill tier, so the
+  producer byte budget is re-derived for the new row rate in the same change.
+- Overflow computing the percentage column: checked arithmetic, saturating, with the
+  bound asserted at compile time.
+
+## Test Plan
+
+- The macro generates a cadence whose label, interval and index agree — pinned for
+  every cadence by iterating the generated `ALL`.
+- Adding a variant cannot under-size the baseline array — asserted at compile time.
+- One timer arm per cadence — source guard.
+- One view per cadence — generated, plus a test that the generated set matches.
+- The zero-delta invariant: a contract that does not trade is not emitted, and its
+  baseline is unchanged after a sweep that skips it.
+- Dirty-set equivalence: a randomised sequence of observes produces the identical
+  ranked output under the dirty sweep and a full-scan reference sweep.
+- The percentage column equals the view's derived expression for every row.
+- The percentage column's order is identical to the lots order, ties included.
+- The repaired cost harness ranks a non-empty set and uses a real lot lookup.
+- Daily reset and family clear empty the buffers.
+- DHAT: the per-tick path still allocates nothing with the marking added.
+
+## Rollback
+
+Every change is additive or behind a constant. Reverting the commit restores two
+cadences, the 250 cut and the full-scan sweep; the new column remains in the table
+and is simply not written, which QuestDB tolerates. No data is destroyed and no
+schema is dropped.
+
+## Observability
+
+The tracked and ranked gauges gain a cadence label so four cadences stop aliasing
+into one series. The existing counters are unchanged. **No new CloudWatch metric
+name and no new alarm** — this pipeline reaches zero deployment surfaces today and
+closing that gap needs a lever per the noise lock, so it is recorded in the rule
+file as an open item rather than closed here.
+
+## Plan Items (Wave 2)
+
+- [x] W2-1 Single-source cadence declaration; delete the second enum; add 3s and 1m
+  - Files: `crates/storage/src/top_volume_rank_persistence.rs`, `crates/storage/src/console_views.rs`
+  - Tests: cadence label/interval/index agreement, generated view set, compile-time index bound
+- [x] W2-2 Volume-percentage column — RESOLVED BY NOT STORING ONE
+  - Files: `crates/app/src/volume_leaderboard.rs` (the proof, not a column)
+  - Tests: `ranking_by_volume_percentage_is_the_same_order_as_ranking_by_lots`
+  - `net_volume_chg_pct = window_lots_milli / 10 - 100` is a strictly increasing
+    affine transform of the stored key, so the two produce the SAME sequence row
+    for row including every tie. Storing it would add a second source of truth
+    that disagrees with the view at the ±0 crossing (the integer form `100x -
+    100_000` gives -100 where the float gives -99.99999999999432), and ~656 MB a
+    session of redundancy on a box whose disk burn cost 2026-09-04 an entire
+    trading day. Equivalence is PROVEN instead; the view computes the percentage.
+- [x] W2-3 Persistence cut onto its own constant; depth constant untouched
+  - Files: `crates/common/src/constants.rs`, `crates/app/src/dhan_feed_stack.rs`
+  - Tests: depth entry/exit unchanged, persistence bound separate
+- [x] W2-4 Per-window dirty sets; sweep becomes Θ(traded)
+  - Files: `crates/app/src/volume_leaderboard.rs`
+  - Tests: `a_contract_that_traded_is_never_skipped_by_the_sweep_that_follows`
+    (the invariant, over every state `observe` can leave behind, on every
+    cadence), `the_dirty_sweep_ranks_exactly_what_a_full_walk_would` (byte-for-byte
+    board equivalence), `the_work_list_has_one_producer_and_the_gauges_are_per_cadence`
+    (source guard: one push site, bit-guarded; two drains, each clearing its bit)
+  - Bite-proven in SIX directions. Two of the six exposed gaps in the tests
+    themselves — an unconditional push passed until the test covered advancing
+    from a PARTIALLY marked state (the state production is in almost always,
+    right after a 1 s sweep), and deleting the reset's list-clear passed until
+    the fixture left work pending at reset. Both closed, then both bit.
+- [x] W2-5 Timer arms for 3s and 1m; one-arm-per-cadence source guard; cadence-labelled gauges
+  - Files: `crates/app/src/dhan_feed_stack.rs`, `crates/app/src/volume_leaderboard.rs`
+  - Tests: source guard asserts an arm per cadence
+- [x] W2-6 Repair the cost harness so it ranks a non-empty set with a real lot lookup
+  - Files: `crates/app/src/volume_leaderboard.rs`
+  - Tests: the harness ASSERTS it filled the board (`worst_ranked == DEPTH_20`)
+    and that every realistic round ranked more than zero
+  - MEASURED, release, x86 dev container, 20,220 tracked: 2.95 ms where every
+    contract traded, 123 µs at an assumed-realistic 2,000, 28.7 µs at 500,
+    6.4 µs at 100. The withdrawn "900 µs" was optimistic by 3.3x — it timed an
+    empty sort under a constant lot stub. Both defects fixed; the lot lookup is
+    now a real hash probe, which alone accounts for 1.78 ms -> 2.95 ms.
+
+## Z+ 15-row and 7-row guarantee matrices
+
+Carried by reference from this plan's Wave 1 section above; every row applies
+unchanged to Wave 2, with these deltas: **code performance** — the DHAT gate covers
+the new per-tick marking, and the repaired cost harness replaces a measurement that
+measured nothing; **monitoring** — the gauges gain a cadence label, and the absence
+of any CloudWatch surface for this pipeline is recorded as an open item rather than
+claimed closed; **scenarios** — the dirty/full-scan equivalence test is the new
+extreme-case gate.
+
+## Honest 100% claim
+
+100% inside the tested envelope, with ratcheted regression coverage: the per-tick
+path is O(1) and allocation-free under a build-failing DHAT gate; the cadence set is
+generated from one declaration so its labels, intervals, array index and views
+cannot drift; the zero-delta invariant is pinned by its own test; the ranking
+comparator stays integer-only. NOT claimed: per-sweep O(1), which is arithmetically
+impossible when every traded contract is an output row — the honest floor is
+Θ(traded). NOT claimed: any duty-cycle figure from the old harness. NOT claimed:
+measured uncapped row counts at 3s, 5s or 1m. NOT claimed: that this pipeline is
+observable outside the box.
