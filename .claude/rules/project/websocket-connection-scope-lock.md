@@ -4281,6 +4281,33 @@ all measured or in source:
 | 4 | **HIGH** | A rebuilt socket counts as healthy only once a FRAME arrives — not on dial, not on ack. A thin book silent for 30 s makes the NEXT rebuild a short-session flap | `reconnect_ladder.rs:140,321-325` |
 | 5 | **HIGH** | The blind window is NOT the 0.31 s transport redial. The India feed has **no snapshot-on-subscribe**, so a re-subscribed contract is BLANK until its book next changes; the tracker gives up at `FIRST_PACKET_WINDOW_SECS = 120`, and a 09:50 delivery cliff where no new contract delivered at all is already measured | `depth_first_packet.rs:14-17,177` |
 
+> **⚠ CORRECTED 2026-09-12 — finding 1's variant COUNT was wrong, and it is the
+> one number in this table a reader can check in a second.** `ConnEvent` had
+> **12** variants when this table was written, not 11 — and has **13** since the
+> probe added `ProbeCloseRequested`. Counted rather than quoted:
+> `BeginDial · DialSucceeded · DialFailed · SubscribeAcked · SubscribeFailed ·
+> FrameReceived · KeepAliveReceived · Disconnected · IdleElapsed ·
+> FrameSilenceElapsed · GhostInstrumentDetected · ProbeCloseRequested ·
+> ShutdownRequested`. The line:column citation is also stale — the enum has
+> moved since.
+>
+> **The FINDING is UNCHANGED and is re-verified in source**: no variant meant
+> "our set changed", which is what makes the refusal correct. Only the count was
+> wrong, and it was wrong in the direction that looks careless rather than the
+> direction that misleads — but this file has now recorded the same shape five
+> times (the byte budget, the $130 ceiling, the September forecast, the
+> AccessDenied flag, the 80/40/40 signature), and the lesson each time is the
+> same: **a count is a measurement, and a measurement quoted from memory is not
+> one.** `awk '/^pub enum ConnEvent/,/^}/'` answers it.
+>
+> **What the 2026-09-12 probe section changes about finding 1, precisely:** it
+> ADDS the deliberate-close variant this finding says does not exist — scoped to
+> the probe alone, unreachable from the steering loop, and a REJECT to widen.
+> The refusal of the ROUTINE mechanism stands untouched: what it refuses is five
+> sockets every minute for 375 minutes, and the probe is one close per socket per
+> session, which is finding 3's own arithmetic read the other way (1 of 6, not
+> 5 of 6 — and 0 of 6 once finding 2 is neutralised by the `records_flap()`
+> condition INSIDE `enter_backoff`, never a bypass of it).
 **And the vendor evidence points the same way, harder.** Dhan documents 805 as
 *"Too many requests or connections. Further requests may result in the user
 being blocked"* (`docs/dhan-ref/08-annexure-enums.md:348`), our code parks a
