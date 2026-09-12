@@ -152,6 +152,84 @@ pub const fn floor_to_second(ts_nanos: i64) -> i64 {
     ts_nanos - rem
 }
 
+/// The IST second-of-day the candle grid is anchored on: 09:00.
+///
+/// MIRRORS `tickvault_trading::candles::tf_index::CANDLE_SESSION_OPEN_SECS_OF_DAY_IST`,
+/// which is `pub(crate)` there and so cannot be imported. Pinned to the same
+/// literal by `the_snapshot_grid_anchor_matches_the_candle_grid_anchor`, for
+/// the reason the whole alignment exists: a snapshot that lands on a different
+/// grid from the candles cannot be joined to them, and the failure is silent —
+/// the query simply returns fewer rows.
+pub const SNAPSHOT_GRID_ANCHOR_SECS_OF_DAY_IST: i64 = 32_400;
+
+/// Nanoseconds from `now` to the NEXT boundary of a `period_secs` grid.
+///
+/// # Why a grid at all
+///
+/// Until 2026-09-12 the four cadence timers were built with
+/// `tokio::time::interval(period)`, whose first tick resolves IMMEDIATELY —
+/// so the grid was anchored on whatever instant the drain happened to start,
+/// and every later fire inherited that offset plus accumulated scheduling
+/// drift. A 5-second sweep firing at 09:20:07.3 stamped 09:20:07, which is on
+/// no 5-second grid point at all. Rows a query cannot line up on a boundary
+/// cannot be joined to the candle of the same window, and nothing about the
+/// table says so.
+///
+/// # Why the anchor is 09:00 and not the epoch
+///
+/// The candle grid rebases every day at 09:00 IST
+/// (`TfIndex::bucket_start`: `session_open + ((t - session_open) / secs) * secs`),
+/// NOT at midnight. For the four cadences shipped today — 1 s, 3 s, 5 s, 1 m —
+/// both 86,400 and 32,400 are divisible by every period, so an epoch modulo
+/// would give the identical answer and the distinction looks academic. It is
+/// not: a fifth cadence with `32_400 % period != 0` (7 s, 45 s, 90 s) would
+/// silently land on a grid the candles never touch. Anchoring on the session
+/// open makes that unrepresentable instead of merely unlikely.
+///
+/// # The return is always > 0
+///
+/// A boundary EXACTLY at `now` returns a full period, never zero. `interval_at`
+/// with a start instant already in the past fires immediately, and an immediate
+/// fire measures a zero-length window — one row claiming a window that did not
+/// happen.
+#[must_use]
+pub const fn nanos_to_next_grid_boundary(now_ist_nanos: i64, period_secs: u64) -> u64 {
+    // A zero period is not reachable (`TOP_VOLUME_SNAPSHOT_INTERVALS` is built
+    // from `interval_secs`, and `tokio::time::interval` panics on zero anyway),
+    // and is handled rather than divided by.
+    if period_secs == 0 {
+        return 0;
+    }
+    // `period_secs` is `SnapshotCadence::interval_secs`, whose largest value is
+    // 60 -- eighteen orders of magnitude below `i64::MAX`, so the wrap this
+    // lint guards cannot occur. `i64::try_from` is not `const`, and this must
+    // stay `const` so the grid arithmetic is testable without a runtime.
+    // APPROVED: 60 cannot wrap i64; try_from is not const.
+    #[allow(clippy::cast_possible_wrap)]
+    let period = period_secs as i64;
+    const SECS_PER_DAY: i64 = 86_400;
+    let secs = now_ist_nanos.div_euclid(NANOS_PER_SECOND);
+    // `div_euclid` so a pre-epoch instant floors DOWN rather than toward zero.
+    let day_start = secs.div_euclid(SECS_PER_DAY) * SECS_PER_DAY;
+    let anchor = day_start + SNAPSHOT_GRID_ANCHOR_SECS_OF_DAY_IST;
+    // `rem_euclid` so an instant BEFORE 09:00 — the whole pre-open, when the
+    // drain actually starts — lands on the same grid running backwards rather
+    // than on a negative remainder that would push the boundary into the past.
+    let rem = (secs - anchor).rem_euclid(period);
+    let boundary_secs = secs + (period - rem);
+    // Strictly positive: `period - rem` is at least 1 whole second and the
+    // sub-second part of `now` is under one second.
+    let delta = boundary_secs * NANOS_PER_SECOND - now_ist_nanos;
+    // `delta` is proven STRICTLY POSITIVE two lines up -- `period - rem` is at
+    // least one whole second and the sub-second part of `now` is under one
+    // second -- and bounded above by one period (60 s), so there is no sign to
+    // lose. `u64::try_from` is not `const`.
+    // APPROVED: proven strictly positive above; try_from is not const.
+    #[allow(clippy::cast_sign_loss)]
+    let out = delta as u64;
+    out
+}
+
 /// Whether a snapshot stamped at this instant may be CAPTURED at all.
 ///
 /// Pure, O(1), and the gate the caller must consult BEFORE ranking — not
@@ -800,6 +878,104 @@ mod tests {
         // And ALL is complete: an array sized from its length must have a slot
         // for every reason the projection can produce.
         assert_eq!(SnapshotRefusal::ALL.len(), 4);
+    }
+
+    /// Our grid anchor must be the CANDLE grid anchor, or the two tables sit
+    /// on grids that never touch and the join silently returns fewer rows.
+    #[test]
+    fn the_snapshot_grid_anchor_matches_the_candle_grid_anchor() {
+        // `tf_index::CANDLE_SESSION_OPEN_SECS_OF_DAY_IST` is `pub(crate)` in
+        // the trading crate, so this pins the same literal that file's own
+        // test pins. 09:00 IST, NOT 09:15 and NOT midnight.
+        assert_eq!(SNAPSHOT_GRID_ANCHOR_SECS_OF_DAY_IST, 32_400);
+    }
+
+    /// Every fire must land on a multiple of its period from 09:00.
+    ///
+    /// This is the bite for the 2026-09-12 alignment. Before it the timers
+    /// were `tokio::time::interval(period)`, whose first tick resolves
+    /// immediately, so the grid was anchored on the drain's start instant and
+    /// a 5-second sweep could stamp ...:02, ...:07, ...:12 forever.
+    #[test]
+    fn the_next_boundary_is_always_on_the_session_anchored_grid() {
+        const DAY: i64 = 86_400;
+        // A Friday, 09:20:07.312 IST -- deliberately off every grid.
+        let day_start = 1_757_000_000_i64.div_euclid(DAY) * DAY;
+        let now = (day_start + 9 * 3_600 + 20 * 60 + 7) * NANOS_PER_SECOND + 312_000_000;
+
+        for period in [1_u64, 3, 5, 60] {
+            let delta = nanos_to_next_grid_boundary(now, period);
+            assert!(
+                delta > 0,
+                "period {period}: a boundary must be in the FUTURE"
+            );
+            let boundary = now + i64::try_from(delta).expect("bounded by one period");
+            assert_eq!(
+                boundary % NANOS_PER_SECOND,
+                0,
+                "period {period}: a boundary must be a whole second"
+            );
+            let secs_since_anchor =
+                boundary / NANOS_PER_SECOND - (day_start + SNAPSHOT_GRID_ANCHOR_SECS_OF_DAY_IST);
+            assert_eq!(
+                secs_since_anchor.rem_euclid(i64::try_from(period).expect("small")),
+                0,
+                "period {period}: boundary is not a multiple of the period from 09:00"
+            );
+            assert!(
+                delta <= period * 1_000_000_000,
+                "period {period}: the wait must never exceed one period"
+            );
+        }
+    }
+
+    /// A boundary EXACTLY at `now` must return a FULL period, never zero.
+    ///
+    /// `interval_at` with a start instant already in the past fires
+    /// immediately, and an immediate fire measures a zero-length window -- one
+    /// row claiming a window that did not happen.
+    #[test]
+    fn a_boundary_exactly_now_waits_a_whole_period_rather_than_firing_twice() {
+        const DAY: i64 = 86_400;
+        let day_start = 1_757_000_000_i64.div_euclid(DAY) * DAY;
+        // Exactly 09:20:00.000 -- on the grid for all four periods.
+        let on_grid = (day_start + 9 * 3_600 + 20 * 60) * NANOS_PER_SECOND;
+        for period in [1_u64, 3, 5, 60] {
+            assert_eq!(
+                nanos_to_next_grid_boundary(on_grid, period),
+                period * 1_000_000_000,
+                "period {period}: an on-grid instant must wait a FULL period"
+            );
+        }
+    }
+
+    /// The drain starts in the PRE-OPEN, before the 09:00 anchor. A naive
+    /// remainder would go negative there and put the boundary in the past.
+    #[test]
+    fn a_pre_open_start_still_lands_on_the_same_grid() {
+        const DAY: i64 = 86_400;
+        let day_start = 1_757_000_000_i64.div_euclid(DAY) * DAY;
+        // 08:31:02.4 IST -- the ordinary drain start, 29 minutes before the
+        // anchor.
+        let now = (day_start + 8 * 3_600 + 31 * 60 + 2) * NANOS_PER_SECOND + 400_000_000;
+        for period in [1_u64, 3, 5, 60] {
+            let delta = nanos_to_next_grid_boundary(now, period);
+            assert!(delta > 0, "period {period}");
+            let boundary_secs = (now + i64::try_from(delta).expect("bounded")) / NANOS_PER_SECOND;
+            let since_anchor = boundary_secs - (day_start + SNAPSHOT_GRID_ANCHOR_SECS_OF_DAY_IST);
+            assert_eq!(
+                since_anchor.rem_euclid(i64::try_from(period).expect("small")),
+                0,
+                "period {period}: a pre-open start must use the same grid, \
+                 running backwards from 09:00"
+            );
+        }
+    }
+
+    /// A zero period is unreachable in production and must not divide by zero.
+    #[test]
+    fn a_zero_period_returns_zero_rather_than_dividing() {
+        assert_eq!(nanos_to_next_grid_boundary(NANOS_PER_SECOND, 0), 0);
     }
 
     #[test]
