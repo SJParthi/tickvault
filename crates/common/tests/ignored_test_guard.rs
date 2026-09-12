@@ -116,10 +116,10 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
     // Added 2026-09-06 with the volume-leaderboard ranking sweep it measures.
     //
     // SAME SHAPE as the three wall-clock harnesses above, and added for the
-    // same reason: it times a full `rank` + `rank_distinct_underlying` pass
-    // over 20,220 stock-option contracts -- the measured live count -- and
-    // prints the number. A wall-clock figure on a shared CI runner is a flake,
-    // and a flaky gate teaches people to ignore gates.
+    // same reason: it times a full `rank` pass over 20,220 stock-option
+    // contracts -- the measured live count -- and prints the number. A
+    // wall-clock figure on a shared CI runner is a flake, and a flaky gate
+    // teaches people to ignore gates.
     //
     // It exists because the number it produces was WRONG in the design notes
     // before it was written. The cost had been asserted as "~60 us, 0.0012%
@@ -127,10 +127,38 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
     // `scan_silence` harness above -- a LINEAR scan -- and applying it to a
     // `sort_unstable_by`. That is an invalid transfer between two different
     // complexity classes, and it was the number used to argue a min-heap
-    // design away. Measured here instead: 900.406 us for `rank(top 250)` and
-    // 899.543 us for `rank_distinct_underlying(5)`, a 0.018% duty cycle at
-    // the 5-second cadence -- so the conclusion survived and the evidence for
-    // it was overstated 15x.
+    // design away.
+    //
+    // ⚠ CORRECTED 2026-09-12 -- the figures this paragraph carried were
+    // THEMSELVES wrong, and wrong in the reassuring direction. It read
+    // "Measured here instead: 900.406 us for `rank(top 250)` and 899.543 us
+    // for `rank_distinct_underlying(5)`, a 0.018% duty cycle at the 5-second
+    // cadence -- so the conclusion survived and the evidence for it was
+    // overstated 15x." Both numbers are WITHDRAWN. The harness that produced
+    // them seeded every tracked contract with the SAME volume as its
+    // baseline, so every row had a window delta of zero, every row was
+    // skipped before the comparator, and the sort it timed was a sort of an
+    // EMPTY slice. It also called `rank_distinct_underlying`, which was
+    // DELETED on 2026-09-08 -- so the second figure names a function that no
+    // longer exists.
+    //
+    // Re-measured 2026-09-12 with the harness repaired (contracts actually
+    // trade before the sweep, and the lot lookup is a real hash probe rather
+    // than a constant stub), at the 20,220-contract ceiling:
+    //
+    //   every contract traded  -> 2.95 ms  (0.29% duty at the 1 s cadence)
+    //              2,000 traded -> 123 us  (0.012% duty)
+    //                500 traded ->  29 us
+    //
+    // An independent re-run of the ceiling case reproduced ~3.24 ms, about
+    // 10% higher, so read the ceiling as a ~2.9-3.3 ms BAND rather than a
+    // point -- 2.95 sits at the optimistic edge of what this container
+    // produces.
+    //
+    // So the true ceiling is ~3.3x WORSE than the withdrawn figure, not
+    // better. The design conclusion is unchanged and is now actually
+    // supported: 2.95 ms once per second is a 0.29% duty cycle, and the
+    // every-contract-traded case is not a market that exists.
     //
     // It is NOT the merge condition for any behaviour. The ranking, the
     // family split, the monotonicity gate, the capacity cap and the

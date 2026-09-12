@@ -1408,6 +1408,38 @@ pub const TICK_PERSIST_END_SECS_OF_DAY_IST: u32 = 56_400;
 /// 2026-09-06 requirement and the reason the family column exists.
 pub const TOP_VOLUME_RANK_PER_FAMILY: usize = 250;
 
+/// How many ranked contracts per family are PERSISTED to `top_volume_rank`.
+///
+/// Every contract that traded in the window (operator 2026-09-12: "dont pick
+/// top 250 pick the entire options contracts").
+///
+/// The value is the TRACKED-CONTRACT CAP, not `usize::MAX`. Those mean the
+/// same thing here — a board can never hold more contracts than the ranking
+/// tracks — but the cap is the truthful bound, keeps the cut site meaningful
+/// rather than a no-op clippy asks to delete, and leaves ONE line to edit if a
+/// real cap is ever wanted again. Deleting the cut site instead would leave
+/// nothing to edit and no constant to grep.
+///
+/// ⚠ SEPARATE from [`TOP_VOLUME_RANK_PER_FAMILY`], and the separation is the
+/// whole point of this constant existing. Until 2026-09-12 the persistence
+/// cut WAS that constant — and so is `DEPTH20_ENTRY_RANKS`
+/// (`depth20_ranked_steer.rs`), which sets `DEPTH20_EXIT_RANKS = ENTRY + 50`.
+/// Raising the number of rows we STORE in place would therefore have widened
+/// the depth-20 pool's entry band from 250 to whatever the new figure was,
+/// silently re-steering a live subscription set as a side effect of a
+/// persistence change. One number, two unrelated jobs.
+///
+/// The depth budget stays pinned at 250 by the vendor's own socket capacity
+/// (5 sockets × 50 instruments). It is not a preference and it does not move
+/// with this one.
+///
+/// The honest cost: the row count per sweep stops being
+/// bounded by a constant and becomes bounded by the market — every contract
+/// with a non-zero window delta. `MAX_TRACKED_CONTRACTS` (25,000 per family)
+/// is the hard ceiling; the realistic figure is the traded population, which
+/// is far smaller and is what the sweep now walks.
+pub const TOP_VOLUME_PERSIST_PER_FAMILY: usize = 25_000;
+
 pub const TOP_VOLUME_CAPTURE_START_SECS_OF_DAY_IST: u32 = 33_300;
 
 /// Seconds-of-day (IST) at which top-volume snapshot capture ends:

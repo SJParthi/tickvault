@@ -88,6 +88,8 @@ use tracing::{error, info, warn};
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::QUESTDB_TABLE_TICKS;
 
+use crate::top_volume_rank_persistence::SnapshotCadence;
+
 /// Wire-format name of the human-readable ticks console view.
 pub const VIEW_TICKS_NAMED: &str = "ticks_named";
 /// Wire-format name of the human-readable 1m-candles console view.
@@ -108,54 +110,18 @@ pub const VIEW_DEPTH_NAMED: &str = "market_depth_named";
 /// `depth_persistence::MARKET_DEPTH_TABLE`; equality is pinned by
 /// `test_depth_base_matches_persistence_const`.
 const NAMED_VIEW_DEPTH_BASE: &str = "market_depth";
-/// Wire-format names of the two per-cadence top-volume views (operator
-/// 2026-09-08: "1s table and 5s tables also separately"). ONE table stores
-/// both cadences under the `tf` column; these views are the separate faces of
-/// it, so the two cadences can be queried as their own tables without storing
-/// every row twice.
-pub const VIEW_TOP_VOLUME_1S: &str = "top_volume_rank_1s";
-pub const VIEW_TOP_VOLUME_5S: &str = "top_volume_rank_5s";
 /// Top-volume base table. Mirrors `top_volume_rank_persistence::TOP_VOLUME_RANK_TABLE`;
 /// equality is pinned by `test_top_volume_base_matches_persistence_const`.
-const NAMED_VIEW_TOP_VOLUME_BASE: &str = "top_volume_rank";
-
-/// The two stored ranking cadences, each with its own named view.
 ///
-/// The DDL builder takes this ENUM rather than free strings so the view
-/// name and the `tf` literal it filters on can only ever be one of these two
-/// compile-time pairs — a caller cannot reach the `format!` with a quote in
-/// either position. Pinned by
-/// `test_top_volume_cadence_view_and_tf_are_the_pinned_literals`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TopVolumeCadence {
-    /// The 1-second sweep.
-    OneSecond,
-    /// The 5-second sweep.
-    FiveSeconds,
-}
-
-impl TopVolumeCadence {
-    /// Both cadences, in the order the views are created at boot.
-    pub const ALL: [Self; 2] = [Self::OneSecond, Self::FiveSeconds];
-
-    /// The named view this cadence is read through.
-    #[must_use]
-    pub const fn view(self) -> &'static str {
-        match self {
-            Self::OneSecond => VIEW_TOP_VOLUME_1S,
-            Self::FiveSeconds => VIEW_TOP_VOLUME_5S,
-        }
-    }
-
-    /// The `tf` SYMBOL value the writer stamps for this cadence.
-    #[must_use]
-    pub const fn tf(self) -> &'static str {
-        match self {
-            Self::OneSecond => "1s",
-            Self::FiveSeconds => "5s",
-        }
-    }
-}
+/// ⚠ The per-cadence view NAMES used to live here, beside a SECOND cadence
+/// enum (`TopVolumeCadence`) that duplicated `SnapshotCadence` variant for
+/// variant — same two labels, written out twice, in two crates' worth of
+/// `match` arms. The only thing holding them together was a hand-enumerated
+/// test asserting the 1s and 5s pairs by name, which a variant added to one
+/// enum and not the other passed unchanged. Both the names and the labels now
+/// come from `SnapshotCadence` (`view_name()` / `as_str()`), so the view's
+/// name and the `tf` value it filters on are one declaration.
+const NAMED_VIEW_TOP_VOLUME_BASE: &str = "top_volume_rank";
 /// DDL HTTP timeout (same value as every other boot-DDL ensure site).
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
@@ -307,9 +273,9 @@ pub fn depth_named_view_ddl() -> String {
 /// The base table keeps the name `gain_pct`; only this display surface
 /// renames it, because `gain_pct` beside a volume percentage reads as though
 /// the two were the same kind of number.
-pub fn top_volume_cadence_view_ddl(cadence: TopVolumeCadence) -> String {
-    let view = cadence.view();
-    let tf = cadence.tf();
+pub fn top_volume_cadence_view_ddl(cadence: SnapshotCadence) -> String {
+    let view = cadence.view_name();
+    let tf = cadence.as_str();
     let dim = lifecycle_dim_subquery();
     format!(
         "CREATE OR REPLACE VIEW {view} AS \
@@ -457,23 +423,27 @@ pub async fn ensure_named_views(questdb_config: &QuestDbConfig) {
         &depth_named_view_ddl(),
     )
     .await;
-    // The two per-cadence top-volume faces (2026-09-08). Same posture as
-    // depth: attempted last and independently, warn-fail on a box where
-    // `top_volume_rank` has not been created yet.
-    run_view_ddl(
-        &client,
-        &base_url,
-        VIEW_TOP_VOLUME_1S,
-        &top_volume_cadence_view_ddl(TopVolumeCadence::OneSecond),
-    )
-    .await;
-    run_view_ddl(
-        &client,
-        &base_url,
-        VIEW_TOP_VOLUME_5S,
-        &top_volume_cadence_view_ddl(TopVolumeCadence::FiveSeconds),
-    )
-    .await;
+    // The per-cadence top-volume faces (2026-09-08; four cadences since
+    // 2026-09-12). Same posture as depth: attempted last and independently,
+    // warn-fail on a box where `top_volume_rank` has not been created yet.
+    //
+    // A LOOP over `SnapshotCadence::ALL`, not one hand-written call per
+    // cadence. The unrolled form was the single most dangerous line in the
+    // four-cadence change: a cadence added to the enum, the labels, the
+    // timers and the docs but NOT to this block produces a fully green build,
+    // writes its rows to the base table all session, and answers every
+    // `SELECT * FROM top_volume_rank_3s` with "table does not exist". Nothing
+    // in the tree would have caught it — no guard derives this call set from
+    // the enum.
+    for cadence in SnapshotCadence::ALL {
+        run_view_ddl(
+            &client,
+            &base_url,
+            cadence.view_name(),
+            &top_volume_cadence_view_ddl(cadence),
+        )
+        .await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -489,33 +459,39 @@ mod tests {
     // carries all THREE console views, and every new view must join it or the
     // shared invariants (single statement, LEFT JOIN, dry-run isolation) would
     // silently not apply to it.
-    fn both_ddls() -> [(&'static str, String); 5] {
-        [
+    fn both_ddls() -> Vec<(&'static str, String)> {
+        // A `Vec`, not a fixed-size array, since 2026-09-12: the top-volume
+        // half is now `SnapshotCadence::ALL`, so the count moves with the
+        // enum. The array form had to be hand-widened for every cadence, and
+        // a forgotten widen dropped that cadence's view out of every shared
+        // invariant below (single statement, LEFT JOIN, dry-run isolation)
+        // while still compiling.
+        let mut ddls: Vec<(&'static str, String)> = vec![
             ("ticks_named", ticks_named_view_ddl()),
             ("candles_named", candles_named_view_ddl()),
             ("market_depth_named", depth_named_view_ddl()),
-            (
-                "top_volume_rank_1s",
-                top_volume_cadence_view_ddl(TopVolumeCadence::OneSecond),
-            ),
-            (
-                "top_volume_rank_5s",
-                top_volume_cadence_view_ddl(TopVolumeCadence::FiveSeconds),
-            ),
-        ]
+        ];
+        for cadence in SnapshotCadence::ALL {
+            ddls.push((cadence.view_name(), top_volume_cadence_view_ddl(cadence)));
+        }
+        ddls
     }
 
     #[test]
-    fn test_top_volume_cadence_view_ddl_filters_on_the_two_stored_cadences() {
+    fn test_top_volume_cadence_view_ddl_filters_on_its_own_stored_cadence() {
         // Each view must be ONE statement, read the one base table, and
         // filter on exactly its own cadence literal — the wire strings
         // `SnapshotCadence` writes. A view that forgot the WHERE would show
-        // both cadences interleaved, which is the shape the operator asked to
+        // every cadence interleaved, which is the shape the operator asked to
         // be rid of.
-        for (view, cadence, c) in [
-            (VIEW_TOP_VOLUME_1S, "1s", TopVolumeCadence::OneSecond),
-            (VIEW_TOP_VOLUME_5S, "5s", TopVolumeCadence::FiveSeconds),
-        ] {
+        //
+        // Driven from `ALL` rather than a hand-listed pair: the pre-2026-09-12
+        // form listed `(view, "1s", variant)` and `(view, "5s", variant)` by
+        // hand, so a third cadence was simply not tested — its view could
+        // filter on the wrong label, or on none, and this test stayed green.
+        for c in SnapshotCadence::ALL {
+            let view = c.view_name();
+            let cadence = c.as_str();
             let ddl = top_volume_cadence_view_ddl(c);
             assert_eq!(ddl.matches(';').count(), 1, "{view}: one statement");
             assert!(
@@ -560,16 +536,11 @@ mod tests {
         crate::top_volume_rank_persistence::SnapshotCadence::OneSecond.as_str()
     }
 
-    /// The enum is what keeps a quote character out of the `format!`: its
-    /// `view()` and `tf()` are compile-time literals, and `tf()` must be the
-    /// SAME wire string the writer stamps — otherwise the view filters on a
-    /// value no row carries and reads empty all day.
-    #[test]
     /// The two stored inputs and the three derived columns are all present,
     /// on BOTH cadence views.
     #[test]
     fn the_top_volume_views_expose_the_inputs_and_the_two_percentages() {
-        for cadence in TopVolumeCadence::ALL {
+        for cadence in SnapshotCadence::ALL {
             let ddl = top_volume_cadence_view_ddl(cadence);
             for expected in [
                 // Stored, because neither is derivable from the row.
@@ -585,7 +556,7 @@ mod tests {
                 assert!(
                     ddl.contains(expected),
                     "{expected} missing from {}: {ddl}",
-                    cadence.view()
+                    cadence.view_name()
                 );
             }
         }
@@ -610,7 +581,7 @@ mod tests {
     /// `cast(ts as long)`.
     #[test]
     fn the_derived_percentages_cast_before_dividing_a_long() {
-        for cadence in TopVolumeCadence::ALL {
+        for cadence in SnapshotCadence::ALL {
             let ddl = top_volume_cadence_view_ddl(cadence);
             assert!(
                 ddl.contains("cast(t.window_lots_milli AS DOUBLE) / 1000.0"),
@@ -671,25 +642,28 @@ mod tests {
             );
         }
     }
-
+    /// The enum is what keeps a quote character out of the `format!`: its
+    /// `view_name()` and `as_str()` are compile-time literals, and the label
+    /// must be the SAME wire string the writer stamps — otherwise the view
+    /// filters on a value no row carries and reads empty all day.
+    ///
+    /// ⚠ Until 2026-09-12 this test pinned a SECOND cadence enum
+    /// (`TopVolumeCadence`) against `SnapshotCadence` by hand, pair by named
+    /// pair. It could not fail for a cadence it did not name, so a variant
+    /// added to one enum and not the other passed it unchanged — the reason
+    /// the second enum is now deleted rather than kept in step by a test.
     #[test]
     fn test_top_volume_cadence_view_and_tf_are_the_pinned_literals() {
-        use crate::top_volume_rank_persistence::SnapshotCadence;
-        assert_eq!(TopVolumeCadence::ALL.len(), 2);
-        assert_eq!(TopVolumeCadence::ALL[0], TopVolumeCadence::OneSecond);
-        assert_eq!(TopVolumeCadence::ALL[1], TopVolumeCadence::FiveSeconds);
-        assert_eq!(TopVolumeCadence::OneSecond.view(), VIEW_TOP_VOLUME_1S);
-        assert_eq!(TopVolumeCadence::FiveSeconds.view(), VIEW_TOP_VOLUME_5S);
-        assert_eq!(
-            TopVolumeCadence::OneSecond.tf(),
-            SnapshotCadence::OneSecond.as_str()
-        );
-        assert_eq!(
-            TopVolumeCadence::FiveSeconds.tf(),
-            SnapshotCadence::FiveSecond.as_str()
-        );
-        for c in TopVolumeCadence::ALL {
-            for s in [c.view(), c.tf()] {
+        for c in SnapshotCadence::ALL {
+            // The view name carries its own label, so a view called
+            // `top_volume_rank_3s` that filters `tf = '5s'` fails here
+            // rather than reading empty in production.
+            assert_eq!(
+                c.view_name(),
+                format!("top_volume_rank_{}", c.as_str()),
+                "the view name and the cadence label are one claim"
+            );
+            for s in [c.view_name(), c.as_str()] {
                 assert!(
                     !s.contains('\'') && !s.contains('"') && !s.contains(';'),
                     "{s}: a quote or terminator in a DDL literal is an injection surface"
@@ -704,9 +678,18 @@ mod tests {
             NAMED_VIEW_TOP_VOLUME_BASE,
             crate::top_volume_rank_persistence::TOP_VOLUME_RANK_TABLE
         );
-        assert_eq!(VIEW_TOP_VOLUME_1S, "top_volume_rank_1s");
-        assert_eq!(VIEW_TOP_VOLUME_5S, "top_volume_rank_5s");
+        assert_eq!(SnapshotCadence::OneSecond.view_name(), "top_volume_rank_1s");
+        assert_eq!(
+            SnapshotCadence::ThreeSecond.view_name(),
+            "top_volume_rank_3s"
+        );
+        assert_eq!(
+            SnapshotCadence::FiveSecond.view_name(),
+            "top_volume_rank_5s"
+        );
+        assert_eq!(SnapshotCadence::OneMinute.view_name(), "top_volume_rank_1m");
     }
+
     #[test]
     fn test_depth_named_view_ddl_is_single_terminated_statement() {
         let ddl = depth_named_view_ddl();

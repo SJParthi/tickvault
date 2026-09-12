@@ -63,29 +63,55 @@
 //!
 //! ## Honest volume
 //!
-//! At the authorized 250 contracts per family, both families, 09:15-15:39:
-//! 500 rows/second x 22,440 s = ~11.2M rows for the `1s` stream plus ~2.2M
-//! for `5s` -- ~13.4M rows, ~1.19 GB per session at the ~88 B row width (the
-//! `window_lots_milli` LONG added 8 B/row on 2026-09-09 taking 64 B to 72;
-//! `delta_units` and `lot_size` added 16 B/row on 2026-09-12 taking 72 B to
-//! 88, ~970 MB to ~1.19 GB. Each figure is restated rather than left
-//! stale). A session already writes ~307 GB, so this is ~0.39% -- real, and
-//! small. The 2026-09-12 pair is the one addition here that buys back more
-//! than it costs: without it the two INPUTS of the rank division are absent
-//! from the row and unrecoverable, so the column that exists to make the
-//! ordering "checkable from the table alone" could not actually be checked.
+//! ⚠ EVERY FIGURE IN THIS SECTION WAS RE-DERIVED 2026-09-12, and the previous
+//! ones are recorded rather than deleted because all of them shared one
+//! premise that the operator's own change removed.
+//!
+//! They read: "At the authorized 250 contracts per family, both families,
+//! 09:15-15:39: 500 rows/second x 22,440 s = ~11.2M rows for the `1s` stream
+//! plus ~2.2M for `5s` -- ~13.4M rows, ~1.19 GB per session at the ~88 B row
+//! width ... ~14.5 GB resident over the 15-day window." Two of the three terms
+//! moved on 2026-09-12: the per-family cut is GONE (every traded contract is
+//! persisted) and there are FOUR cadences, not two.
+//!
+//! What replaces them is a BOUND and a range, not a point estimate, because
+//! the row count is now a property of the market rather than of a constant:
+//!
+//! * Per sweep: one row per contract with a NON-ZERO window delta. A contract
+//!   that did not trade in the window is skipped at the zero-lot check, so the
+//!   count is the TRADED population, not the tracked one.
+//! * Hard ceiling per sweep: `TOP_VOLUME_MAX_ROWS_PER_SWEEP` (50,000 =
+//!   25,000/family x 2 families), the tracked-contract cap. Reaching it needs
+//!   every tracked contract of both families to trade inside one second.
+//! * Per session: the four cadences fire 22,440 + 7,480 + 4,488 + 374 = ~34,782
+//!   times over 09:15-15:39. At an ASSUMED mean of 2,000 traded contracts per
+//!   sweep that is ~70M rows, ~6.1 GB at the ~88 B row width — roughly 5x the
+//!   old figure and ~2% of the ~307 GB a session already writes.
+//!
+//! **The 2,000 figure is Assumed and is the one number here worth measuring.**
+//! It has never been read: the 1-second traded population was measured once
+//! (3,187,232 rows for a whole session under the 250 cut, which tells us
+//! nothing about the uncut count), and the 3s/5s/1m figures were never
+//! measured at all because the source partitions were archived to S3 and
+//! dropped from EBS before they could be. `SELECT tf, count(*) FROM
+//! top_volume_rank WHERE ts IN today() GROUP BY tf` on the first session with
+//! this build is what turns the range into a number.
+//!
 //! The `5s` rows are numerically a subset of the `1s` rows and are kept
 //! anyway because they mean something different: a `5s` row is the ranking
 //! that ACTUALLY DROVE a re-steer decision, which is the row an audit wants.
+//! The same now holds for `3s` and `1m` against the boards they describe.
 //!
 //! RETENTION, stated because it is a standing commitment and not a one-day
 //! cost: `HOUR_PARTITIONED_TABLES` membership puts this table in
 //! `RetentionClass::MarketData`, whose window is `market_data_hot_days`
-//! (default 15). ~970 MB/session x 15 sessions is roughly **14.5 GB resident**
-//! on the 600 GB volume -- about 2.4%. That is the deliberate trade: 15 days of
-//! "was the busiest contract actually watched?" for 2.4% of the disk. It is
-//! NOT exempt from the sweep; an exempt table growing most of a gigabyte a
-//! day is the disk-fill class that cost 2026-09-04 an entire session.
+//! (default 15). At the ~6.1 GB/session estimate above that is roughly **92 GB
+//! resident** on the 600 GB volume — about 15%, up from the 2.4% the old
+//! figures claimed. That is a materially larger commitment and it is stated
+//! plainly rather than left to be discovered: if the measured row count lands
+//! near the top of the range, `market_data_hot_days` for this table is the
+//! lever, and the 2026-09-04 zero-capture day is what happens when a table
+//! growing at this rate is not watched. It is NOT exempt from the sweep.
 
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
@@ -114,13 +140,30 @@ pub const DEDUP_KEY_TOP_VOLUME_RANK: &str = "ts, tf, family, feed, security_id, 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
 /// Snapshot cadence label — the `tf` SYMBOL column. Stable wire strings.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+///
+/// `#[repr(u8)]` with EXPLICIT discriminants, following `TfIndex` (the
+/// workspace's other ordinal-indexed enum): the discriminant IS the array
+/// slot, so [`Self::index`] is a repr cast rather than a hand-written
+/// `match` that can disagree with [`Self::ALL`]. The previous shape kept a
+/// separate `window_index` match in the ranking crate, and the two could
+/// drift with nothing failing until a row landed in the wrong window.
+///
+/// Discriminants are FROZEN. They are the `baseline` array slot for every
+/// tracked contract; renumbering them re-points every in-flight window at
+/// another cadence's baseline mid-session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(u8)]
 pub enum SnapshotCadence {
     /// Every whole second — the fine-grained record.
-    OneSecond,
+    OneSecond = 0,
+    /// Every three seconds (operator 2026-09-12).
+    ThreeSecond = 1,
     /// Every five seconds — the boundary at which the depth set is re-steered,
     /// so these rows are the ones that actually drove a subscription decision.
-    FiveSecond,
+    FiveSecond = 2,
+    /// Every minute (operator 2026-09-12) — the coarse frame, and the only one
+    /// whose window spans a depth re-steer rather than coinciding with one.
+    OneMinute = 3,
 }
 
 impl SnapshotCadence {
@@ -132,15 +175,68 @@ impl SnapshotCadence {
     /// under-count, and the ranking's per-cadence baselines are sized from
     /// `ALL.len()` — an under-count there would alias two cadences onto one
     /// baseline and make both boards report a window neither one measured.
-    /// `every_cadence_is_in_the_all_list` pins that this stays whole.
-    pub const ALL: [Self; 2] = [Self::OneSecond, Self::FiveSecond];
+    ///
+    /// The const assert below proves this list is in ordinal order with no
+    /// gaps and no duplicates. It does NOT prove the list is COMPLETE: no
+    /// stable-Rust construct counts an enum's variants (`variant_count` is
+    /// nightly), so a fifth variant added here and nowhere else still
+    /// compiles. What stops that reaching production is
+    /// [`Self::slot`] — a checked index that REFUSES an unlisted cadence and
+    /// counts the refusal, instead of indexing out of bounds on the frame
+    /// drain, where `panic = "abort"` would take the process down mid-session.
+    pub const ALL: [Self; 4] = [
+        Self::OneSecond,
+        Self::ThreeSecond,
+        Self::FiveSecond,
+        Self::OneMinute,
+    ];
+
+    /// The array slot for this cadence — the `#[repr(u8)]` discriminant.
+    ///
+    /// Structural: there is no `match` to keep in step with [`Self::ALL`].
+    /// Callers that index a `[_; ALL.len()]` array must go through
+    /// [`Self::slot`], which bounds-checks this value.
+    #[inline]
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// The array slot, bounds-checked against [`Self::ALL`].
+    ///
+    /// `None` means a variant exists that `ALL` does not list — the one
+    /// failure the ordinal-order assert cannot rule out. Every caller that
+    /// would otherwise write `array[cadence.index()]` uses this, so that
+    /// mistake becomes a counted refusal on a cold path instead of an
+    /// out-of-bounds index on the frame drain.
+    #[inline]
+    #[must_use]
+    pub const fn slot(self) -> Option<usize> {
+        let i = self as usize;
+        if i < Self::ALL.len() { Some(i) } else { None }
+    }
+
+    /// Decodes an array slot back to a cadence. `None` for out-of-range.
+    #[inline]
+    #[must_use]
+    pub const fn from_index(index: usize) -> Option<Self> {
+        match index {
+            0 => Some(Self::OneSecond),
+            1 => Some(Self::ThreeSecond),
+            2 => Some(Self::FiveSecond),
+            3 => Some(Self::OneMinute),
+            _ => None,
+        }
+    }
 
     /// Stable wire label. Never reworded — it is a persisted SYMBOL value.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::OneSecond => "1s",
+            Self::ThreeSecond => "3s",
             Self::FiveSecond => "5s",
+            Self::OneMinute => "1m",
         }
     }
 
@@ -155,10 +251,49 @@ impl SnapshotCadence {
     pub const fn interval_secs(self) -> u64 {
         match self {
             Self::OneSecond => 1,
+            Self::ThreeSecond => 3,
             Self::FiveSecond => 5,
+            Self::OneMinute => 60,
+        }
+    }
+
+    /// The named QuestDB view this cadence is read through.
+    ///
+    /// Lives HERE, beside the label it filters on, because the view's `WHERE
+    /// t.tf = '<label>'` clause and the view's own name are one claim: a view
+    /// called `top_volume_rank_3s` that filters `tf = '5s'` is wrong in a way
+    /// no reader of either file alone could see. `console_views` builds the
+    /// DDL from this pair rather than from a second enum of its own, which is
+    /// what the deleted `TopVolumeCadence` was.
+    #[must_use]
+    pub const fn view_name(self) -> &'static str {
+        match self {
+            Self::OneSecond => "top_volume_rank_1s",
+            Self::ThreeSecond => "top_volume_rank_3s",
+            Self::FiveSecond => "top_volume_rank_5s",
+            Self::OneMinute => "top_volume_rank_1m",
         }
     }
 }
+
+/// `ALL` is in ordinal order, with no gaps and no duplicates — so
+/// `ALL[i].index() == i` for every slot, and `index()` can be used as an
+/// array subscript without a lookup. Adding a variant in the middle, or
+/// listing one twice, fails the BUILD rather than silently re-pointing one
+/// cadence's baselines at another's.
+const _: () = {
+    let mut i = 0;
+    while i < SnapshotCadence::ALL.len() {
+        assert!(
+            SnapshotCadence::ALL[i].index() == i,
+            "SnapshotCadence::ALL must be in #[repr(u8)] discriminant order: \
+             the ranking indexes its per-cadence baseline array by the raw \
+             discriminant, so a list out of order points a cadence at another \
+             cadence's window."
+        );
+        i += 1;
+    }
+};
 
 /// One ranked contract at one snapshot boundary, ready for ILP write.
 #[derive(Clone, Debug, PartialEq)]
@@ -166,7 +301,7 @@ pub struct TopVolumeRankRow {
     /// Designated timestamp — the SNAPSHOT boundary in IST nanoseconds.
     /// A whole second, so a re-emit UPSERTs in place.
     pub snapshot_ts_ist_nanos: i64,
-    /// Snapshot cadence (`1s` / `5s`).
+    /// Snapshot cadence (`1s` / `3s` / `5s` / `1m`).
     pub cadence: SnapshotCadence,
     /// Option family — stock and index options are ranked in SEPARATE
     /// leaderboards, and the column records which one this row came from.
@@ -796,35 +931,94 @@ impl TopVolumeRankWriter {
 /// and the three writer paths sharing a shape is what stops them drifting into
 /// different failure semantics.
 ///
-/// What four batches actually buy here is far more than on the depth path,
-/// because the volume is not comparable. Depth is a MEASURED ~63,800 rows/s;
-/// this table emits one snapshot per FAMILY per cadence — up to 250 rows for
-/// each of the two option families on BOTH the 1 s and the 5 s sweep, so
-/// ~600 rows/s at most (500/s from the 1 s arm, ~100/s from the 5 s arm),
-/// roughly 100x less. Four batches is therefore ~1 second of stall absorbed
-/// rather than depth's ~600 ms. (Until 2026-09-08 this line read "250 rows at
-/// 1 s and 5 at 5 s, ~255 rows/s" — the 5 s figure was the depth-200 SOCKET
-/// count, not the row count, and the index family was not counted at all.)
-/// The queue should never fill in practice; bounded is still bounded.
+/// ⚠ The rows/s figure this doc used to carry is RETIRED, not updated. It
+/// read "~600 rows/s at most (500/s from the 1 s arm, ~100/s from the 5 s
+/// arm)", which was 250 x 2 families x 2 cadences — every term of which the
+/// 2026-09-12 change moved: the per-family cut is gone and there are four
+/// cadences. There is no longer a constant to quote. The row count per sweep
+/// is one per contract that TRADED in the window, bounded above by
+/// `TOP_VOLUME_MAX_ROWS_PER_SWEEP` and in practice by the market.
+///
+/// (Until 2026-09-08 the line before that read "250 rows at 1 s and 5 at 5 s,
+/// ~255 rows/s" — the 5 s figure was the depth-200 SOCKET count, not the row
+/// count, and the index family was not counted at all. Three versions, three
+/// wrong figures; the fourth is a derivation instead.)
+///
+/// What four batches buy is therefore stated as a SHAPE, not a duration: four
+/// sweeps of stall absorbed before the producer starts retaining, and
+/// `MAX_TOP_VOLUME_PRODUCER_BUFFER_BYTES` worth after that. The queue should
+/// never fill in practice; bounded is still bounded.
 pub const TOP_VOLUME_FLUSH_QUEUE_DEPTH: usize = 4;
 
 /// Consecutive full-queue flushes the producer may RETAIN before it stops
 /// widening the buffer and drops instead.
 ///
-/// TWO, matching [`crate::depth_persistence::MAX_TOP_VOLUME_RETAINED_FLUSH_SPANS`]'s
-/// sibling for the same reason as the queue depth.
+/// TWO, matching [`crate::depth_persistence::MAX_DEPTH_RETAINED_FLUSH_SPANS`]
+/// for the same reason as the queue depth: one shape across the three writer
+/// paths is what stops them drifting into different failure semantics.
+///
+/// ⚠ RE-DERIVED 2026-09-12 for the cadence expansion, and the intra-doc link
+/// above was BROKEN — it read `depth_persistence::MAX_TOP_VOLUME_RETAINED_FLUSH_SPANS`,
+/// a path that does not exist, so the "matching" claim pointed at nothing.
+///
+/// The CONSTANT does not move; what moved is what it buys in WALL-CLOCK time,
+/// and that is worth stating because the number is a SPAN count and reads like
+/// a duration. A span is one flush attempt that found the queue full, so the
+/// tolerance is `spans ÷ flush rate`, and the flush rate is the cadence count:
+///
+/// | | flushes in the worst second | tolerance past a full queue |
+/// |---|---|---|
+/// | 2 cadences (1 s, 5 s), before 2026-09-12 | 2 | ~3 s |
+/// | 4 cadences (1 s, 3 s, 5 s, 1 m), now | 4 | ~2.2 s |
+///
+/// One flush per `snapshot_top_volume` call, NOT one per family — the flush
+/// sits outside the family loop (`dhan_feed_stack::snapshot_top_volume`), so
+/// the four arms coinciding at the minute mark is four attempts, not eight.
+/// Verified in source 2026-09-12 rather than assumed; a hostile review of this
+/// change asserted the per-family doubling and it is not there.
+///
+/// So the stall a healthy queue absorbs shrank from ~7 s to ~6.2 s
+/// (4 queued batches + the retained spans). That is a REDUCTION and it is not
+/// raised here, for two reasons stated plainly rather than waved past: the
+/// failure it guards is a QuestDB stall, which this repository has on record
+/// at the 2026-08-25 and 2026-09-02 scale — MINUTES, not seconds, so neither 6
+/// nor 7 saves the snapshot; and what is lost when it fires is one snapshot of
+/// a leaderboard that is rebuilt from RAM a second later, never a tick. Raising
+/// it trades a bounded, logged, tickless hole for unbounded producer memory on
+/// the drain, which is the worse side of that trade.
 pub const MAX_TOP_VOLUME_RETAINED_FLUSH_SPANS: u32 = 2;
 
 /// Byte ceiling on the buffer the producer retains while the writer is behind.
 ///
-/// 4 MiB, EIGHT TIMES TIGHTER than the depth path's 32 MiB, and that is the
-/// point rather than an oversight: a single depth-200 snapshot is 400 rows and
-/// a burst can breach a byte ceiling inside one span, whereas a top-volume
-/// snapshot is a bounded ~600 rows/s of ~120 B ILP ≈ 72 KB/s. 4 MiB is ~58
-/// seconds of backlog at that rate — an eternity for a table whose next
-/// snapshot supersedes the last one. A ceiling sized for depth's traffic would
-/// hold minutes of stale rankings that nothing downstream wants.
-pub const MAX_TOP_VOLUME_PRODUCER_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+/// ⚠ RE-DERIVED 2026-09-12, and the previous value was a live row-drop.
+///
+/// It was a flat 4 MiB, justified as "~58 seconds of backlog" at a rate of
+/// "~600 rows/s of ~120 B ILP ≈ 72 KB/s". Both halves of that came from the
+/// top-250-per-family cut. With the cut removed (operator: "pick the entire
+/// options contracts") a SINGLE worst-case sweep is
+/// [`TOP_VOLUME_MAX_ROWS_PER_SWEEP`] rows — 6 MB — so one sweep alone breached
+/// a 4 MiB ceiling. Past the ceiling this producer DROPS: there is no spill
+/// tier for this table, unlike ticks and depth. The stale figure was not a
+/// stale comment; it was the number the drop decision was made against.
+///
+/// Now DERIVED from the population rather than asserted, so removing a cut
+/// cannot silently invalidate it again. Still well under the depth path's
+/// 32 MiB, which is the property the sizing test pins.
+const TOP_VOLUME_MAX_ROWS_PER_SWEEP: usize = 25_000 * 2;
+/// Measured ILP line width for one `top_volume_rank` row, rounded up.
+const TOP_VOLUME_ILP_ROW_BYTES: usize = 120;
+/// Worst-case sweeps the producer may hold before it drops.
+const TOP_VOLUME_SWEEPS_HELD: usize = 2;
+pub const MAX_TOP_VOLUME_PRODUCER_BUFFER_BYTES: usize =
+    TOP_VOLUME_MAX_ROWS_PER_SWEEP * TOP_VOLUME_ILP_ROW_BYTES * TOP_VOLUME_SWEEPS_HELD;
+
+const _: () = assert!(
+    MAX_TOP_VOLUME_PRODUCER_BUFFER_BYTES
+        >= TOP_VOLUME_MAX_ROWS_PER_SWEEP * TOP_VOLUME_ILP_ROW_BYTES,
+    "the producer ceiling must hold at least ONE worst-case sweep. Below that, \
+     a single sweep drops rows even with a perfectly healthy writer — and this \
+     table has no spill tier, so a dropped row is gone."
+);
 
 /// One ILP payload on its way from the drain to the writer thread.
 pub struct TopVolumeFlushBatch {
@@ -972,7 +1166,6 @@ impl TopVolumeRankWriterSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn every_cadence_is_in_the_all_list() {
         // `ALL.len()` sizes the ranking's per-contract baselines, one slot per
@@ -980,25 +1173,62 @@ mod tests {
         // and two cadences would then share a baseline — each board reporting
         // a window neither one measured, with nothing erroring.
         //
-        // Asserted by round-tripping the wire label, so a variant added
-        // without being listed here fails the exhaustive match below rather
-        // than passing a length check that was hand-updated to agree.
-        for cadence in SnapshotCadence::ALL {
-            let label = cadence.as_str();
-            let round_tripped = match label {
-                "1s" => SnapshotCadence::OneSecond,
-                "5s" => SnapshotCadence::FiveSecond,
-                other => panic!("cadence {other} is in ALL but not in this match"),
-            };
-            assert_eq!(round_tripped, cadence);
+        // ⚠ The 2026-09-06 version of this test could not detect that. It
+        // iterated `ALL` and matched on the label with a `_ => panic!` arm —
+        // but a variant absent from `ALL` is never YIELDED by that loop, so
+        // the arm it was supposed to trip could not be reached. It asserted
+        // against itself and passed vacuously.
+        //
+        // What actually bites, in three parts:
+        //   1. `from_index` is an exhaustive-by-construction decode — the
+        //      slot a new variant takes must be spelled there or it decodes
+        //      to `None` below;
+        //   2. every slot `0..ALL.len()` must round-trip through
+        //      `from_index` → `index`, which catches a gap or a duplicate;
+        //   3. `slot()` must be `Some` for every listed cadence and the
+        //      first UNLISTED slot must decode to `None`, which is the
+        //      boundary a fifth variant crosses.
+        for (expected_slot, cadence) in SnapshotCadence::ALL.iter().enumerate() {
+            assert_eq!(
+                cadence.index(),
+                expected_slot,
+                "{} sits at ALL[{expected_slot}] but its discriminant is {}",
+                cadence.as_str(),
+                cadence.index()
+            );
+            assert_eq!(
+                SnapshotCadence::from_index(expected_slot),
+                Some(*cadence),
+                "slot {expected_slot} must decode back to {}",
+                cadence.as_str()
+            );
+            assert_eq!(
+                cadence.slot(),
+                Some(expected_slot),
+                "{} must be in bounds of the baseline array",
+                cadence.as_str()
+            );
         }
-        // And the length is what the baselines are sized from, so it is pinned
-        // rather than left to the array literal.
-        assert_eq!(SnapshotCadence::ALL.len(), 2);
-        assert_ne!(
-            SnapshotCadence::ALL[0],
-            SnapshotCadence::ALL[1],
-            "a duplicated entry would silently halve the real cadence count"
+        assert_eq!(
+            SnapshotCadence::from_index(SnapshotCadence::ALL.len()),
+            None,
+            "the slot one past the end must not decode — if it does, a \
+             variant exists that ALL does not list, and every array sized \
+             from ALL.len() is one slot short"
+        );
+
+        // Labels are distinct: two cadences sharing a `tf` SYMBOL would
+        // collide in the DEDUP key and silently overwrite each other.
+        let mut labels: Vec<&str> = SnapshotCadence::ALL.iter().map(|c| c.as_str()).collect();
+        labels.sort_unstable();
+        let distinct = labels.len();
+        labels.dedup();
+        assert_eq!(
+            labels.len(),
+            distinct,
+            "two cadences share a wire label; the DEDUP key is \
+             (ts, tf, family, feed, security_id, segment), so their rows \
+             would overwrite one another"
         );
     }
 
@@ -1340,7 +1570,9 @@ mod tests {
     #[test]
     fn the_cadence_labels_are_the_stable_wire_strings() {
         assert_eq!(SnapshotCadence::OneSecond.as_str(), "1s");
+        assert_eq!(SnapshotCadence::ThreeSecond.as_str(), "3s");
         assert_eq!(SnapshotCadence::FiveSecond.as_str(), "5s");
+        assert_eq!(SnapshotCadence::OneMinute.as_str(), "1m");
     }
 
     /// The label and the interval are two halves of the same claim: a row
@@ -1349,20 +1581,33 @@ mod tests {
     /// one from being edited without the other — and the drift would be
     /// invisible, because a wrongly-paced snapshot still writes a
     /// well-formed row under a label that reads correct.
+    ///
+    /// ⚠ The pre-2026-09-12 form of this test did
+    /// `as_str().trim_end_matches('s').parse::<u64>()`, which reads `"1m"` as
+    /// `"1m"` and PANICS. It was written when every label happened to end in
+    /// `s`, and it would have failed the build the moment a minute cadence
+    /// arrived — as a parse panic naming nothing, not as a drift report. The
+    /// unit suffix is now part of what is checked.
     #[test]
     fn interval_secs_agrees_with_the_label_it_is_stored_under() {
-        for cadence in [SnapshotCadence::OneSecond, SnapshotCadence::FiveSecond] {
-            let from_label: u64 = cadence
-                .as_str()
-                .trim_end_matches('s')
+        for cadence in SnapshotCadence::ALL {
+            let label = cadence.as_str();
+            let (digits, unit) = label.split_at(label.len() - 1);
+            let count: u64 = digits
                 .parse()
-                .expect("every cadence label is <n>s");
+                .unwrap_or_else(|_| panic!("cadence label {label} must be <n><unit>"));
+            let from_label = match unit {
+                "s" => count,
+                "m" => count * 60,
+                other => panic!(
+                    "cadence label {label} ends in {other:?}; only 's' and 'm' \
+                     have a defined seconds-per-unit here"
+                ),
+            };
             assert_eq!(
                 cadence.interval_secs(),
                 from_label,
-                "{} claims {}s in its label but fires every {}s",
-                cadence.as_str(),
-                from_label,
+                "{label} claims {from_label}s in its label but fires every {}s",
                 cadence.interval_secs()
             );
         }
@@ -1585,9 +1830,11 @@ mod tests {
     #[test]
     fn the_producer_byte_ceiling_is_far_tighter_than_the_depth_path() {
         // Not a style preference — a sizing claim, pinned so it cannot drift
-        // into depth's 32 MiB by copy-paste. This table emits ~600 rows/s
-        // against depth's measured ~63,800, so a ceiling sized for depth would
-        // hold minutes of stale rankings nothing downstream wants.
+        // into depth's 32 MiB by copy-paste. Depth is a MEASURED ~63,800
+        // rows/s and bursts 400 rows in ONE depth-200 snapshot; this table
+        // emits at most one row per traded contract per sweep. A ceiling
+        // sized for depth would hold minutes of stale rankings nothing
+        // downstream wants — every sweep supersedes the last.
         assert!(
             MAX_TOP_VOLUME_PRODUCER_BUFFER_BYTES
                 < crate::depth_persistence::MAX_DEPTH_PRODUCER_BUFFER_BYTES,
