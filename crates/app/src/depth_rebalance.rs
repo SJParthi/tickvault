@@ -483,7 +483,35 @@ pub fn chain_minutes_from_candidates(candidates: &[DepthCandidate]) -> Vec<Owned
 ///
 /// # Complexity
 ///
-/// O(candidates). Called once a minute for one stock.
+/// **THREE full passes over `candidates` per call** — `nearest_expiry_for`,
+/// `consensus_spot`, and the loop below — each comparing `c.underlying` as a
+/// string.
+///
+/// ⚠ **CORRECTED 2026-09-12. This read "O(candidates). Called once a minute
+/// for one stock", and the second sentence was false at the call site.**
+/// `depth20_layout::build_depth20_layout` calls it inside
+/// `for stock in ranked`, where `ranked` is `MOVER_STOCKS_TOTAL` = **75**, and
+/// `index_window` calls it twice more. So the real shape is
+/// **O(movers × candidates)** ≈ 75 × 3 × |candidates|, and at the measured
+/// universe (~21,500–23,300 legs) that is roughly **5 million row-visits per
+/// invocation**.
+///
+/// Reachable in production today, on the steering task: the per-minute loop
+/// takes this path from loop start until the first volume ranking publishes
+/// (~09:16), and again after any intra-day restart before a ranking exists;
+/// `attach_depth_when_available` takes it once per 60-second attach retry.
+///
+/// **Flagged, not fixed** — the repair is the decorate-index-lookup shape this
+/// repository already applied to `select_depth_universe` (2026-08-21) and
+/// `fit_atm_window`: one `HashMap<&str, Vec<&DepthCandidate>>` built in a
+/// single O(candidates) pass turns 5M into ~22k plus 75 small lookups. Left
+/// undone here because it is a change to the steering path's data flow rather
+/// than to this function, and it deserves its own measurement.
+///
+/// The reusable half is why the old line read as safe: **a complexity claim on
+/// a callee is a claim about one call.** The cost lives at the call site, and
+/// no docstring here can reveal a loop written there — the same shape this
+/// repository records for a scan inside a comparator.
 #[must_use]
 pub fn atm_pair_for(candidates: &[DepthCandidate], underlying: &str) -> Option<StrikePair> {
     let mut pairs: HashMap<i64, (Option<i64>, Option<i64>)> = HashMap::new();

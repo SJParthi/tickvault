@@ -121,9 +121,80 @@ const NAMED_VIEW_DEPTH_BASE: &str = "market_depth";
 /// enum and not the other passed unchanged. Both the names and the labels now
 /// come from `SnapshotCadence` (`view_name()` / `as_str()`), so the view's
 /// name and the `tf` value it filters on are one declaration.
-const NAMED_VIEW_TOP_VOLUME_BASE: &str = "top_volume_rank";
+const NAMED_VIEW_TOP_VOLUME_BASE: &str = "top_volume";
+
+/// The FOUR per-cadence view names this table's views carried BEFORE the
+/// 2026-09-12 `top_volume_rank` → `top_volume` rename.
+///
+/// # Why this list exists at all, and why it is not cosmetic
+///
+/// A QuestDB view is stored as its SQL TEXT and resolved at query time, so
+/// renaming the base table does not carry its views across: after the rename
+/// these four still name `top_volume_rank`, a table that no longer exists.
+/// Left alone they are four permanently-broken surfaces sitting in the table
+/// list beside the four working ones, each answering `SELECT * FROM
+/// top_volume_rank_1s` with a resolution error — created by this repository,
+/// on this repository's own box, by a rename this repository performed.
+///
+/// It is also a possible PRECONDITION for the rename, which is the reason the
+/// sweep runs where it does. Whether QuestDB REFUSES to rename a table that
+/// views depend on is **UNVERIFIED** — no QuestDB is reachable from a dev
+/// container, so this could not be probed. If it does refuse, a rename
+/// attempted with these views still present fails every boot forever and the
+/// history stays stranded under the legacy name. Dropping them first removes
+/// that failure mode whether or not it exists; dropping them second would not.
+/// `ensure_named_views` runs BEFORE `ensure_top_volume_rank_table` on the boot
+/// path, so the ordering this needs is the ordering already there.
+///
+/// # An explicit four-name list, never a prefix match
+///
+/// `top_volume_rank` — the legacy TABLE, which holds every ranking row
+/// written before the rename — is a strict prefix of all four names here. A
+/// sweep written as "drop everything starting `top_volume_rank`" would
+/// therefore have the legacy table's own name in its blast radius, and
+/// `shadow_persistence` already records what that costs: a table carrying
+/// real tick volume whose name sat in a `DROP TABLE IF EXISTS` sweep. These
+/// are four literals, and `the_legacy_view_sweep_can_never_name_a_table`
+/// fails the build if any of them is ever a table name.
+///
+/// # Bounded and self-terminating
+///
+/// `DROP VIEW IF EXISTS` on an absent view is a no-op, so from the second
+/// boot after the deploy this is four cheap statements that do nothing. It is
+/// deliberately NOT made conditional on a probe: a probe is a second round
+/// trip that can itself fail, and the statement it would guard is already the
+/// idempotent form. `run_view_ddl` counts the outcome and warns on non-2xx
+/// rather than panicking, so a QuestDB that does not accept the statement at
+/// all degrades to a warn instead of blocking every other view behind it.
+///
+/// Fixed at four entries FOREVER: this is a historical fact about what was
+/// once created, not a mirror of `SnapshotCadence`. A fifth cadence added
+/// tomorrow never had a `top_volume_rank_*` view, so it must NOT appear here
+/// — which is why this is a literal array and not derived from the enum, and
+/// why `the_legacy_view_list_is_history_not_a_mirror_of_the_enum` pins it.
+const LEGACY_TOP_VOLUME_VIEWS: [&str; 4] = [
+    "top_volume_rank_1s",
+    "top_volume_rank_3s",
+    "top_volume_rank_5s",
+    "top_volume_rank_1m",
+];
+
 /// DDL HTTP timeout (same value as every other boot-DDL ensure site).
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
+
+/// DDL that removes one pre-rename top-volume view.
+///
+/// A FUNCTION rather than a `format!` inline at the call site, and the
+/// distinction is the whole reason this exists: the first draft of
+/// `the_legacy_view_drop_is_idempotent_and_one_statement` built its own copy
+/// of this string, so deleting `IF EXISTS` from the production site left the
+/// test green. A guard that constructs the artefact it is checking is testing
+/// itself — the same vacuous shape as the `2X >= X` assert this PR replaces,
+/// written by the same hands on the same day. Both the sweep and the test now
+/// read this one function.
+fn legacy_top_volume_view_drop_ddl(view: &str) -> String {
+    format!("DROP VIEW IF EXISTS {view};")
+}
 
 /// The shared lifecycle dimension subquery both view DDLs join against.
 ///
@@ -204,8 +275,8 @@ pub fn depth_named_view_ddl() -> String {
     )
 }
 
-/// DDL for one per-cadence top-volume view (`top_volume_rank_1s` /
-/// `top_volume_rank_5s`): the ranking rows of ONE cadence, joined to the
+/// DDL for one per-cadence top-volume view (`top_volume_1s` /
+/// `top_volume_5s`): the ranking rows of ONE cadence, joined to the
 /// instrument master so `symbol_name` reads beside the rank.
 ///
 /// `cadence` is the `tf` SYMBOL literal (`1s` / `5s`) — the same wire strings
@@ -300,22 +371,22 @@ pub fn top_volume_cadence_view_ddl(cadence: SnapshotCadence) -> String {
 /// GET-only (POST 405s per the #T1a regression note); 2xx → `info!`,
 /// non-2xx → `warn!` (retries next boot — idempotent), transport
 /// `Err` → `error!`.
-async fn run_view_ddl(client: &Client, base_url: &str, view: &str, ddl: &str) {
+async fn run_view_ddl(client: &Client, base_url: &str, view: &str, action: &str, ddl: &str) {
     match client.get(base_url).query(&[("query", ddl)]).send().await {
         Ok(resp) if resp.status().is_success() => {
             metrics::counter!(VIEW_DDL_COUNTER, "outcome" => "ok").increment(1);
-            info!(view, "named console view ready");
+            info!(view, action, "named console view DDL accepted");
         }
         Ok(resp) => {
             metrics::counter!(VIEW_DDL_COUNTER, "outcome" => "non_2xx").increment(1);
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             let body_prefix: String = body.chars().take(200).collect();
-            warn!(view, %status, body = %body_prefix, "named view DDL non-2xx — retries next boot");
+            warn!(view, action, %status, body = %body_prefix, "named view DDL non-2xx — retries next boot");
         }
         Err(err) => {
             metrics::counter!(VIEW_DDL_COUNTER, "outcome" => "transport").increment(1);
-            error!(view, ?err, "named view DDL request failed");
+            error!(view, action, ?err, "named view DDL request failed");
         }
     }
 }
@@ -324,7 +395,7 @@ async fn run_view_ddl(client: &Client, base_url: &str, view: &str, ddl: &str) {
 /// `non_2xx`, `transport`).
 ///
 /// Added 2026-09-08 after the hostile sweep found a refused view DDL was a
-/// `warn!` and nothing else — a `top_volume_rank_1s` view absent for a whole
+/// `warn!` and nothing else — a `top_volume_1s` view absent for a whole
 /// session had no number behind it. A view is a READ projection, so its
 /// absence loses no data (the base table keeps every row) and this is
 /// deliberately NOT loss-shaped and NOT EMF-selected: the operator's
@@ -402,6 +473,7 @@ pub async fn ensure_named_views(questdb_config: &QuestDbConfig) {
         &client,
         &base_url,
         VIEW_TICKS_NAMED,
+        "create",
         &ticks_named_view_ddl(),
     )
     .await;
@@ -409,6 +481,7 @@ pub async fn ensure_named_views(questdb_config: &QuestDbConfig) {
         &client,
         &base_url,
         VIEW_CANDLES_NAMED,
+        "create",
         &candles_named_view_ddl(),
     )
     .await;
@@ -420,19 +493,35 @@ pub async fn ensure_named_views(questdb_config: &QuestDbConfig) {
         &client,
         &base_url,
         VIEW_DEPTH_NAMED,
+        "create",
         &depth_named_view_ddl(),
     )
     .await;
+    // The pre-rename faces, dropped BEFORE the four CREATEs below and before
+    // `ensure_top_volume_rank_table` renames the base table later in the same
+    // boot. See `LEGACY_TOP_VOLUME_VIEWS` for why the ordering is the point
+    // and why this is four literals rather than a prefix sweep.
+    for legacy in LEGACY_TOP_VOLUME_VIEWS {
+        run_view_ddl(
+            &client,
+            &base_url,
+            legacy,
+            "drop_legacy",
+            &legacy_top_volume_view_drop_ddl(legacy),
+        )
+        .await;
+    }
+
     // The per-cadence top-volume faces (2026-09-08; four cadences since
     // 2026-09-12). Same posture as depth: attempted last and independently,
-    // warn-fail on a box where `top_volume_rank` has not been created yet.
+    // warn-fail on a box where `top_volume` has not been created yet.
     //
     // A LOOP over `SnapshotCadence::ALL`, not one hand-written call per
     // cadence. The unrolled form was the single most dangerous line in the
     // four-cadence change: a cadence added to the enum, the labels, the
     // timers and the docs but NOT to this block produces a fully green build,
     // writes its rows to the base table all session, and answers every
-    // `SELECT * FROM top_volume_rank_3s` with "table does not exist". Nothing
+    // `SELECT * FROM top_volume_3s` with "table does not exist". Nothing
     // in the tree would have caught it — no guard derives this call set from
     // the enum.
     for cadence in SnapshotCadence::ALL {
@@ -440,6 +529,7 @@ pub async fn ensure_named_views(questdb_config: &QuestDbConfig) {
             &client,
             &base_url,
             cadence.view_name(),
+            "create",
             &top_volume_cadence_view_ddl(cadence),
         )
         .await;
@@ -477,6 +567,97 @@ mod tests {
         ddls
     }
 
+    /// The sweep can never name a TABLE — the one way a drop list destroys
+    /// data rather than tidying a surface.
+    ///
+    /// `top_volume_rank` (the legacy table, holding every ranking row written
+    /// before the rename) and `top_volume` (the current one) are both
+    /// prefixes or near-neighbours of the four view names, so a sweep written
+    /// as a prefix match, or a fifth entry added carelessly, lands on real
+    /// data. `shadow_persistence` records the precedent in its own words: a
+    /// table carrying real tick volume whose name sat in a `DROP TABLE IF
+    /// EXISTS` sweep.
+    #[test]
+    fn the_legacy_view_sweep_can_never_name_a_table() {
+        for name in LEGACY_TOP_VOLUME_VIEWS {
+            assert_ne!(
+                name,
+                crate::top_volume_rank_persistence::LEGACY_TOP_VOLUME_RANK_TABLE,
+                "the legacy TABLE is in the drop sweep — this destroys the \
+                 pre-rename ranking history"
+            );
+            assert_ne!(
+                name,
+                crate::top_volume_rank_persistence::TOP_VOLUME_RANK_TABLE,
+                "the CURRENT table is in the drop sweep"
+            );
+            assert_ne!(name, NAMED_VIEW_TOP_VOLUME_BASE, "base table in the sweep");
+            // Every other table this crate ensures is out of range by
+            // construction, but the two above share a prefix with all four
+            // entries, which is exactly why the sweep is a literal list.
+            assert!(
+                name.starts_with("top_volume_rank_"),
+                "{name}: a legacy view name, not something else"
+            );
+        }
+    }
+
+    /// The sweep can never drop a view the current code is about to CREATE.
+    ///
+    /// Both loops run in the same function, the drop first. An entry that
+    /// collided with a current `view_name()` would drop the view and then
+    /// immediately recreate it — harmless today, and a silent way to make the
+    /// sweep look busy while achieving nothing. More importantly it would mean
+    /// the rename had not actually changed that view's name, which is the
+    /// premise the whole sweep rests on.
+    #[test]
+    fn the_legacy_view_sweep_never_collides_with_a_current_view() {
+        for legacy in LEGACY_TOP_VOLUME_VIEWS {
+            for c in SnapshotCadence::ALL {
+                assert_ne!(legacy, c.view_name(), "legacy name equals a live view");
+            }
+            for live in [VIEW_TICKS_NAMED, VIEW_CANDLES_NAMED, VIEW_DEPTH_NAMED] {
+                assert_ne!(legacy, live, "legacy name equals a live console view");
+            }
+        }
+    }
+
+    /// The list is HISTORY, not a mirror of the enum.
+    ///
+    /// It is fixed at the four faces that were once created under the old base
+    /// name. A fifth cadence added tomorrow never had a `top_volume_rank_*`
+    /// view, so it must not be swept — and the tempting "derive it from
+    /// `SnapshotCadence`" refactor would add one, issuing a `DROP VIEW IF
+    /// EXISTS` for a name that never existed. Harmless in effect, wrong in
+    /// meaning, and it would quietly make this list unfalsifiable.
+    #[test]
+    fn the_legacy_view_list_is_history_not_a_mirror_of_the_enum() {
+        assert_eq!(LEGACY_TOP_VOLUME_VIEWS.len(), 4, "fixed at four, forever");
+        let mut sorted = LEGACY_TOP_VOLUME_VIEWS;
+        sorted.sort_unstable();
+        for pair in sorted.windows(2) {
+            assert_ne!(pair[0], pair[1], "duplicate entry in the sweep");
+        }
+    }
+
+    /// The statement is the idempotent form, so the second boot is a no-op.
+    ///
+    /// Without `IF EXISTS` this warns on every boot from the second onward —
+    /// the "one error per boot, forever" shape the sibling rename comment
+    /// already records as the thing that trains an operator to discount a
+    /// counter.
+    #[test]
+    fn the_legacy_view_drop_is_idempotent_and_one_statement() {
+        for legacy in LEGACY_TOP_VOLUME_VIEWS {
+            let ddl = legacy_top_volume_view_drop_ddl(legacy);
+            assert!(ddl.contains("IF EXISTS"), "{legacy}: not idempotent");
+            assert_eq!(ddl.matches(';').count(), 1, "{legacy}: one statement");
+            assert!(
+                !ddl.contains("TABLE"),
+                "{legacy}: drops a VIEW, never a table"
+            );
+        }
+    }
     #[test]
     fn test_top_volume_cadence_view_ddl_filters_on_its_own_stored_cadence() {
         // Each view must be ONE statement, read the one base table, and
@@ -656,11 +837,11 @@ mod tests {
     fn test_top_volume_cadence_view_and_tf_are_the_pinned_literals() {
         for c in SnapshotCadence::ALL {
             // The view name carries its own label, so a view called
-            // `top_volume_rank_3s` that filters `tf = '5s'` fails here
+            // `top_volume_3s` that filters `tf = '5s'` fails here
             // rather than reading empty in production.
             assert_eq!(
                 c.view_name(),
-                format!("top_volume_rank_{}", c.as_str()),
+                format!("top_volume_{}", c.as_str()),
                 "the view name and the cadence label are one claim"
             );
             for s in [c.view_name(), c.as_str()] {
@@ -678,16 +859,10 @@ mod tests {
             NAMED_VIEW_TOP_VOLUME_BASE,
             crate::top_volume_rank_persistence::TOP_VOLUME_RANK_TABLE
         );
-        assert_eq!(SnapshotCadence::OneSecond.view_name(), "top_volume_rank_1s");
-        assert_eq!(
-            SnapshotCadence::ThreeSecond.view_name(),
-            "top_volume_rank_3s"
-        );
-        assert_eq!(
-            SnapshotCadence::FiveSecond.view_name(),
-            "top_volume_rank_5s"
-        );
-        assert_eq!(SnapshotCadence::OneMinute.view_name(), "top_volume_rank_1m");
+        assert_eq!(SnapshotCadence::OneSecond.view_name(), "top_volume_1s");
+        assert_eq!(SnapshotCadence::ThreeSecond.view_name(), "top_volume_3s");
+        assert_eq!(SnapshotCadence::FiveSecond.view_name(), "top_volume_5s");
+        assert_eq!(SnapshotCadence::OneMinute.view_name(), "top_volume_1m");
     }
 
     #[test]

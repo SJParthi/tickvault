@@ -4804,3 +4804,111 @@ wall-clock minute under its own note.
 - Removes the persistence bound entirely rather than raising it — the write path
   has no spill tier, and a batch too wide is DROPPED.
 - Adds a CloudWatch metric name or alarm without a lever, per §2.3n.
+
+### 2026-09-12 (SAME DAY, LATER) — THE TABLE IS `top_volume`, AND ITS FOUR ORPHANED VIEWS ARE SWEPT
+
+**The verbatim operator demand (2026-09-12, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "dotnt make it as top volume rank table meake the table name as top volume alone dude okay?"
+
+This dated row is the rule-file record the rule-file-first law requires for a
+persisted-table name change. It is recorded here rather than in a new section
+because the section above is the one that governs this table, and a wire name
+that lives in two places is a wire name that drifts.
+
+#### What moved
+
+| Surface | Was | Now |
+|---|---|---|
+| The table | `top_volume_rank` | **`top_volume`** |
+| Its four per-cadence views | `top_volume_rank_{1s,3s,5s,1m}` | **`top_volume_{1s,3s,5s,1m}`** |
+| `HOUR_PARTITIONED_TABLES` | the old name | the new one, so it is still swept |
+| `RETENTION_EXEMPT_TABLES` | — | gains the LEGACY name, so the coverage guard demands a decision about it rather than silently ignoring it |
+
+#### What deliberately did NOT move
+
+The module, function and type names (`top_volume_rank_persistence`,
+`ensure_top_volume_rank_table`, `TopVolumeRankWriter`) are Rust identifiers, not
+wire names, and renaming them would churn the codebase-map guard for nothing.
+The six `tv_top_volume_rank_*_total` metric names likewise stay: verified
+against `deploy/`, they have **zero** hits — local `/metrics` only, in no EMF
+selector and no alarm — so renaming them breaks nothing, buys nothing, and
+would churn a rule-file row that names one of them verbatim. A metric name is
+its own namespace and need not track a table name.
+
+#### The history is CARRIED, not abandoned
+
+A one-shot `RENAME TABLE` at boot, issued **BEFORE** the CREATE DDL loop. The
+ordering is the whole safety property: a `CREATE TABLE IF NOT EXISTS
+top_volume` against a box already holding `top_volume_rank` rows succeeds
+against an EMPTY new table, and QuestDB then refuses the rename **forever** —
+stranding the old table outside `HOUR_PARTITIONED_TABLES`, never swept, growing
+on a volume this repository has already filled to zero twice. The `Split`
+verdict (both tables present) is escalated as a coded error rather than
+discarded; an earlier draft swallowed it with a bare `let _ =`, which made a
+halved history SILENT.
+
+#### The four orphaned views, and why the sweep runs where it does
+
+A QuestDB view is stored as its SQL **text** and resolved at query time, so the
+rename does not carry its views across: the four old faces still named a table
+that no longer exists. Left alone they are four permanently-broken surfaces in
+the table list beside the four working ones — created by this repository, on
+this repository's own box, by a rename this repository performed.
+`ensure_named_views` now issues `DROP VIEW IF EXISTS` for exactly those four
+names, and it runs **before** `ensure_top_volume_rank_table` on the boot path,
+so the sweep lands before the rename is attempted.
+
+**That ordering is a possible PRECONDITION, not tidiness.** Whether QuestDB
+REFUSES to rename a table that views depend on is **UNVERIFIED** — no QuestDB
+was reachable (no docker daemon in the dev container), so it could not be
+probed. If it does refuse, a rename attempted with those views present fails
+every boot forever and the pre-rename history stays stranded. Dropping them
+first removes that failure mode whether or not it exists; dropping them second
+would not.
+
+The sweep is **four literals, never a prefix match**: `top_volume_rank` — the
+legacy TABLE, holding every ranking row written before the rename — is a strict
+prefix of all four view names, so a prefix sweep would have the legacy table's
+own name in its blast radius. `shadow_persistence` already records what that
+costs, in its own words: a table carrying real tick volume whose name sat in a
+`DROP TABLE IF EXISTS` sweep. The list is fixed at four FOREVER — it is a
+historical fact about what was once created, not a mirror of `SnapshotCadence`,
+so a fifth cadence must never be added to it.
+
+#### ⚠ The measuring query in the sibling docs changed with it
+
+`CLAUDE.md`'s storage-map row carried the settling query naming the old table —
+a statement an operator would paste, which would now fail. Corrected there with
+its own dated note. **The reusable half is narrower than "names go stale":** a
+stale prose name costs a reader one grep; a stale name inside a *runnable
+command* costs them a failed query and a doubt about the whole row. A
+copy-pasteable statement in a document is an executable claim and goes stale
+like any other.
+
+#### ⚠ NOT claimed
+
+That the rename, the drop sweep, or `DROP VIEW IF EXISTS` has been executed
+against a live QuestDB. The drop syntax is the one
+`docs/runbooks/questdb-console-queries.md` already documents as the rollback
+for these same console views on the pinned 9.3.5, and `run_view_ddl` degrades a
+refusal to a counted warn rather than blocking the four CREATEs behind it — but
+no probe was possible, and the first boot after deploy is the measurement.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Writes the table name as a literal anywhere instead of reading
+  `TOP_VOLUME_RANK_TABLE` — the rename exists precisely because the wire name
+  had to move in one place.
+- Issues the `CREATE TABLE IF NOT EXISTS` before the `RENAME` (makes the rename
+  permanently impossible and strands the history outside the retention sweep).
+- Discards the `Split` verdict, or downgrades it below a coded error.
+- Turns the legacy-view sweep into a prefix match, or derives it from
+  `SnapshotCadence` — either one puts the legacy TABLE, or a name that never
+  existed, into a DROP statement.
+- Drops the `IF EXISTS`, which makes the sweep warn on every boot from the
+  second onward — the "one error per boot, forever" shape that trains an
+  operator to discount a counter.
+- Renames the module, the functions, the types or the six metric names in the
+  name of consistency: they are not wire names, and the churn buys nothing.

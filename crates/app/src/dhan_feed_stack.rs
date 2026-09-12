@@ -919,6 +919,25 @@ pub const PREV_CLOSE_WRONG_DAY_COUNTER: &str = "tv_prev_close_store_wrong_day_to
 /// the whole signal.
 pub const TOP_VOLUME_APPEND_FAILURE_COUNTER: &str = "tv_top_volume_rank_append_failed_total";
 
+/// Contracts a snapshot could not project into a storable row, by reason.
+///
+/// Labelled `reason` with one series per [`SnapshotRefusal`], each pre-resolved
+/// and seeded at zero, because the Prometheus exporter renders no series it has
+/// never seen and each LABEL VALUE is its own series -- an unseeded reason is
+/// absent from `/metrics` until its first occurrence, which is the one moment
+/// an operator needs it already there.
+///
+/// Local `/metrics` only, like its two neighbours: no EMF name and no alarm,
+/// per the September budget position (forecast $142.24 against the $135.00
+/// automatic-stop line, where a new EMF name is ~$0.30/mo and the standing
+/// rule requires a LEVER rather than a cost note).
+///
+/// **`gain_unavailable` is EXPECTED to be non-zero** and is not a defect: it
+/// means the row was stored with a NULL `gain_pct` because the underlying had
+/// not printed yet. The other three reasons are zero on a healthy session and
+/// DO drop the row.
+pub const TOP_VOLUME_SNAPSHOT_REFUSAL_COUNTER: &str = "tv_top_volume_snapshot_refused_total";
+
 /// Narrows a WAL frame sequence onto the `i64` `ticks.capture_seq` column.
 ///
 /// # Why this function exists at all — the two-atomic hazard
@@ -1222,6 +1241,34 @@ pub struct LiveIngest {
     top_volume_append_failures: u64,
     /// Pre-resolved handle for [`TOP_VOLUME_APPEND_FAILURE_COUNTER`].
     top_volume_append_failure_counter: metrics::Counter,
+    /// Contracts refused by the snapshot projection this session, PER REASON,
+    /// indexed by `SnapshotRefusal::index`.
+    ///
+    /// # Why per reason and not one cumulative total (2026-09-12)
+    ///
+    /// It shipped as a single `u64` and that number gated the throttled
+    /// `warn!` for all four reasons at once. Three of the four DELETE the row
+    /// and are zero on a healthy session; the fourth, `gain_unavailable`, is
+    /// the EXPECTED state near the open — before a spot price and a previous
+    /// close exist, every contract refuses.
+    ///
+    /// So on an ordinary morning the benign reason drove the shared counter
+    /// past 2²⁰ within a minute, and a later `RankOutOfRange` or
+    /// `LotsOutOfRange` — each of which loses a row permanently — would next be
+    /// logged at the following power of two, i.e. plausibly never that session.
+    /// The per-reason metrics are local `/metrics` with no alarm, so the log IS
+    /// the surface, and a benign flood was hiding the surface for the reasons
+    /// that matter.
+    ///
+    /// Throttling per reason costs three extra `u64`s and makes each reason's
+    /// FIRST occurrence loud regardless of what the others are doing.
+    top_volume_snapshot_refusals: [u64; crate::top_volume_snapshot::SnapshotRefusal::ALL.len()],
+    /// Pre-resolved handle per reason for
+    /// [`TOP_VOLUME_SNAPSHOT_REFUSAL_COUNTER`], indexed by
+    /// `SnapshotRefusal::index`. An array rather than a labelled macro call
+    /// per refusal, because a non-literal label drops `metrics::counter!` to
+    /// its allocating arm on a path that runs per contract per cadence.
+    top_volume_snapshot_refusal_counters: [metrics::Counter; 4],
     /// Edge latch for the "every gainer verdict was Unknown" line: once per
     /// session, because the condition persists for a whole session when it
     /// happens at all and a line per 5-second sweep would be 4,680 of them.
@@ -1565,12 +1612,45 @@ impl LiveIngest {
                         spot_prices.latest_paise(underlying_id, segment),
                         prev_close.get(underlying_id, segment),
                     )
-                    .unwrap_or(f64::NAN)
                 },
                 |security_id, segment| view.is_subscribed(security_id, segment),
             );
 
             refused = refused.saturating_add(projection.refusal_count());
+            for (security_id, reason) in &projection.refusals {
+                let idx = reason.index();
+                self.top_volume_snapshot_refusal_counters[idx].increment(1);
+                self.top_volume_snapshot_refusals[idx] =
+                    self.top_volume_snapshot_refusals[idx].saturating_add(1);
+                let seen = self.top_volume_snapshot_refusals[idx];
+                // `counter` is a FIELD, not decoration: an operator who greps
+                // the counter name lands here, and the loss-counter visibility
+                // guard can only SEE that a loss-shaped counter has a surface
+                // if its name appears beside a log. Throttled on powers of two
+                // because the open can refuse many contracts at once -- the
+                // 1st, 2nd, 4th ... of the session is logged, which reports the
+                // onset immediately and the MAGNITUDE without flooding.
+                //
+                // PER REASON since 2026-09-12 — see the field's own doc. A
+                // shared counter let the benign `gain_unavailable` flood at the
+                // open suppress the first occurrence of the three reasons that
+                // actually lose a row.
+                if seen.is_power_of_two() {
+                    tracing::warn!(
+                        code = tickvault_common::error_code::ErrorCode::WsGapConnectionState
+                            .code_str(),
+                        counter = TOP_VOLUME_SNAPSHOT_REFUSAL_COUNTER,
+                        source = "top_volume_snapshot_refused",
+                        reason = reason.as_str(),
+                        security_id = *security_id,
+                        // THIS REASON's count, not the session total across
+                        // reasons — a shared number here would read as though
+                        // this reason had fired that many times.
+                        refusals = seen,
+                        "top_volume: a contract was refused by the snapshot projection. `gain_unavailable` is EXPECTED near the open and after a restart -- the row is still stored, with a NULL underlying-change column, so no volume is lost. Any OTHER reason drops the row and is zero on a healthy session."
+                    );
+                }
+            }
             let Some(writer) = self.top_volume.as_mut() else {
                 return (appended, refused);
             };
@@ -1642,14 +1722,24 @@ impl LiveIngest {
         // sweep. `flush` itself early-returns when `pending == 0`, so an idle
         // sweep still costs nothing.
         //
-        // NOT fixed by this, and stated because it was VERIFIED in source
-        // rather than assumed: an `append_row` that fails PART-WAY leaves the
-        // questdb-rs buffer in `TableWritten` state, which refuses every later
-        // row. `pending` is incremented only AFTER every `?` in `append_row`,
-        // so that case leaves `pending == 0` -- this gate reads false, and
-        // `flush` would early-return on `pending == 0` regardless. Recovering
-        // it needs the buffer cleared in `append_row`'s own error path, which
-        // is a separate change in the storage crate.
+        // ⚠ CORRECTED 2026-09-12 -- this paragraph used to close with
+        // "Recovering it needs the buffer cleared in `append_row`'s own error
+        // path, which is a separate change in the storage crate." **That
+        // change already existed when the sentence was written**, under the
+        // heading "# Why the marker (2026-09-09)" in
+        // `top_volume_rank_persistence::append_row`: it sets a MARKER before
+        // the row, `rewind_to_marker`s on any error, and falls back to
+        // `discard_pending()` if the rewind itself fails. So a half-written row
+        // cannot poison the buffer, and there is no storage-crate follow-up to
+        // open. Recorded rather than deleted because the cost of a stale
+        // "NOT fixed" note is the `day_ohlc_tracker` (2026-08-12) one: the next
+        // reader opens work that is already done.
+        //
+        // What the paragraph got RIGHT and is still worth keeping: `pending` is
+        // incremented only AFTER every `?` in `append_row`, so a failed append
+        // leaves `pending == 0` -- this gate reads false and `flush` would
+        // early-return regardless. That is now harmless rather than a leak,
+        // because the rewind already restored the buffer.
         if let Some(writer) = self.top_volume.as_mut()
             && (appended > 0 || writer.pending() > 0)
         {
@@ -1793,6 +1883,18 @@ impl LiveIngest {
                 c.increment(0);
                 c
             },
+            top_volume_snapshot_refusals: [0; crate::top_volume_snapshot::SnapshotRefusal::ALL
+                .len()],
+            top_volume_snapshot_refusal_counters: crate::top_volume_snapshot::SnapshotRefusal::ALL
+                .map(|reason| {
+                    let c = metrics::counter!(
+                        TOP_VOLUME_SNAPSHOT_REFUSAL_COUNTER,
+                        "reason" => reason.as_str(),
+                    );
+                    // Seeded so the series EXISTS before the first refusal.
+                    c.increment(0);
+                    c
+                }),
             gainer_all_unknown_reported: false,
             leaderboard: crate::volume_leaderboard::VolumeLeaderboard::new(),
             replaying_wal: false,
@@ -5301,26 +5403,55 @@ async fn run_frame_drain(
     // is `(ts, tf, family, feed, security_id, segment)` — so the burst
     // collapses into one row and the window it claims to measure never
     // happened.
-    let mut snapshot_1s_timer = tokio::time::interval(
-        TOP_VOLUME_SNAPSHOT_INTERVALS
-            [tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond.index()],
+    //
+    // ⚠ AND the grid it fires on (2026-09-12). `tokio::time::interval` resolves
+    // its FIRST tick immediately, so the grid was anchored on whatever instant
+    // this drain happened to start and every later fire carried that offset
+    // plus accumulated scheduling drift. A 5-second sweep starting at
+    // 08:31:02.4 stamped ...:02, ...:07, ...:12 — on no 5-second grid point at
+    // all, so its rows could never be lined up against the candle of the same
+    // window. `interval_at` at the next 09:00-anchored boundary puts every fire
+    // ON the grid, and `Skip` — not `Delay` — is what keeps it there after a
+    // stall: `Delay` re-bases to `now + period` and abandons the grid
+    // permanently, while `Skip` re-snaps to the next multiple of the period
+    // from the start instant. (Verified in tokio 1.53.1 `interval.rs`
+    // `next_timeout`: `Delay => now + period`, `Skip => now + period -
+    // ((now - timeout) % period)`.)
+    //
+    // Neither drops a window's DATA: both fire ONCE after a stall, and `rank`
+    // computes `volume - baseline[idx]` over the whole gap either way, so the
+    // merged window is measured end to end. Only `Burst` would split it, and
+    // Burst writes the current board under past timestamps.
+    let snapshot_timer_at =
+        |cadence: tickvault_storage::top_volume_rank_persistence::SnapshotCadence| {
+            let period = TOP_VOLUME_SNAPSHOT_INTERVALS[cadence.index()];
+            let delay = std::time::Duration::from_nanos(
+                crate::top_volume_snapshot::nanos_to_next_grid_boundary(
+                    now_ist_nanos(),
+                    cadence.interval_secs(),
+                ),
+            );
+            // `Instant::now()` and `now_ist_nanos()` are read one after the other,
+            // so the alignment is as good as the gap between them (sub-microsecond).
+            // The pairing is deliberate: the DELAY comes from the wall clock, which
+            // is what the grid is defined on, while the DEADLINE is monotonic, which
+            // is what tokio schedules on and what cannot be moved by an NTP step.
+            let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + delay, period);
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            timer
+        };
+    let mut snapshot_1s_timer = snapshot_timer_at(
+        tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond,
     );
-    snapshot_1s_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut snapshot_3s_timer = tokio::time::interval(
-        TOP_VOLUME_SNAPSHOT_INTERVALS
-            [tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ThreeSecond.index()],
+    let mut snapshot_3s_timer = snapshot_timer_at(
+        tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ThreeSecond,
     );
-    snapshot_3s_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut snapshot_5s_timer = tokio::time::interval(
-        TOP_VOLUME_SNAPSHOT_INTERVALS
-            [tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond.index()],
+    let mut snapshot_5s_timer = snapshot_timer_at(
+        tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond,
     );
-    snapshot_5s_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut snapshot_1m_timer = tokio::time::interval(
-        TOP_VOLUME_SNAPSHOT_INTERVALS
-            [tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneMinute.index()],
+    let mut snapshot_1m_timer = snapshot_timer_at(
+        tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneMinute,
     );
-    snapshot_1m_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Consecutive alarm-worthy scans, and whether we have already paged for
     // this episode. Edge-triggered per audit Rule 4: the rising edge fires
     // once, the falling edge logs recovery at info and re-arms.
@@ -17211,6 +17342,101 @@ mod tests {
         assert_eq!(ingest.top_volume_append_failures(), 0);
     }
 
+    /// Every refusal reason must get its own PRE-SEEDED counter series.
+    ///
+    /// The Prometheus exporter renders no series it has never seen, and each
+    /// LABEL VALUE is its own series -- so an unseeded reason is absent from
+    /// `/metrics` until its first occurrence, which is the one moment an
+    /// operator goes looking for it. Building the array by mapping over
+    /// `SnapshotRefusal::ALL` is what makes "one per reason" structural rather
+    /// than a list somebody must remember to extend; this pins that shape.
+    #[test]
+    fn every_snapshot_refusal_reason_is_seeded_at_zero() {
+        let src = include_str!("dhan_feed_stack.rs");
+        // Anchored on a SIBLING field's initialiser, not on the array's own
+        // name -- the name appears first in the struct DECLARATION, so
+        // splitting on it would window over the field's doc comment and assert
+        // nothing about the init. Anchoring outside the array also keeps the
+        // two assertions below non-vacuous: neither string is in the anchor.
+        //
+        // The anchor moved 2026-09-12: it used to be
+        // `top_volume_snapshot_refusals: 0,`, and that field became a per-reason
+        // ARRAY, so the old anchor no longer exists. A guard anchored on a
+        // literal that can be edited away fails loudly rather than silently, and
+        // this one did.
+        let init = src
+            .split_once("top_volume_append_failures: 0,")
+            .expect("the refusal-counter array must be initialised")
+            .1;
+        let init = &init[..init.len().min(600)];
+        assert!(
+            init.contains("SnapshotRefusal::ALL"),
+            "the array must be built from ALL, so a new reason cannot ship \
+             without its own series"
+        );
+        assert!(
+            init.contains("c.increment(0)"),
+            "each series must be SEEDED at zero, or it does not exist in \
+             /metrics until the first refusal"
+        );
+
+        // The THROTTLE must be per reason too, or a benign flood suppresses
+        // the first occurrence of a reason that actually loses a row.
+        assert!(
+            src.contains("self.top_volume_snapshot_refusals[idx]"),
+            "the session tally must be indexed BY REASON. A shared counter let \
+             `gain_unavailable` -- expected for every contract near the open -- \
+             push the throttle past 2^20 in a minute, so the next \
+             `RankOutOfRange` (which DELETES a row) logged only at the \
+             following power of two."
+        );
+
+        // And a fresh ingest has counted nothing, on every reason.
+        let ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        assert_eq!(
+            ingest.top_volume_snapshot_refusals,
+            [0; crate::top_volume_snapshot::SnapshotRefusal::ALL.len()]
+        );
+        assert_eq!(
+            ingest.top_volume_snapshot_refusal_counters.len(),
+            crate::top_volume_snapshot::SnapshotRefusal::ALL.len(),
+            "one handle per reason, or `index()` reaches past the end"
+        );
+        assert_eq!(
+            ingest.top_volume_snapshot_refusals.len(),
+            ingest.top_volume_snapshot_refusal_counters.len(),
+            "the tally and the handles must stay the same length -- `index()` \
+             addresses both"
+        );
+    }
+
+    /// The loss-shaped counter must keep its LOG, which is its only operator
+    /// surface -- it is deliberately not EMF-selected.
+    #[test]
+    fn the_snapshot_refusal_counter_is_logged_beside_its_emit() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let emit = src
+            .split_once("top_volume_snapshot_refusal_counters[reason.index()].increment(1)")
+            .expect("the per-reason increment must exist")
+            .1;
+        let window = &emit[..emit.len().min(1_600)];
+        assert!(
+            window.contains("tracing::warn!"),
+            "a counter whose name ends `_refused_total` and reaches no \
+             CloudWatch metric must reach the LOG, or the loss is measured and \
+             the measurement discarded"
+        );
+        assert!(
+            window.contains("counter = TOP_VOLUME_SNAPSHOT_REFUSAL_COUNTER"),
+            "the counter NAME must be a field on that line, so an operator \
+             grepping the name lands on it"
+        );
+        assert!(
+            window.contains("is_power_of_two()"),
+            "throttled, or one bad open floods the sink"
+        );
+    }
+
     /// A packet stamped for a different trading day must not latch the
     /// session's previous close, and an INDEX underlying must be recorded.
     ///
@@ -23460,16 +23686,63 @@ mod late_seed_tests {
         }
     }
 
+    /// The four cadence timers must fire ON the 09:00-anchored grid and stay
+    /// on it after a stall.
+    #[test]
+    fn the_snapshot_timers_fire_on_the_grid_and_stay_there_after_a_stall() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let drain = src
+            .split_once("async fn run_frame_drain")
+            .expect("the drain must exist")
+            .1;
+        let builder = drain
+            .split_once("let snapshot_timer_at =")
+            .expect(
+                "the four cadence timers must be built through ONE aligned \
+                 constructor -- four hand-written `interval(..)` calls is the \
+                 shape that drifted, and the one easiest to half-revert",
+            )
+            .1;
+        let builder = &builder[..builder.len().min(1_200)];
+
+        assert!(
+            builder.contains("interval_at("),
+            "`tokio::time::interval` resolves its FIRST tick immediately, which \
+             anchors the grid on the drain's start instant -- every fire then \
+             carries that offset and the rows land on no cadence boundary at \
+             all. It must be `interval_at` at the next grid point."
+        );
+        assert!(
+            builder.contains("nanos_to_next_grid_boundary("),
+            "the start instant must come from the 09:00-anchored grid, not \
+             from `Instant::now()`"
+        );
+        assert!(
+            builder.contains("MissedTickBehavior::Skip"),
+            "`Delay` re-bases to `now + period` after a stall and abandons the \
+             grid PERMANENTLY; only `Skip` re-snaps to it. `Burst` is worse \
+             still -- it fires the backlog and writes the current board under \
+             past timestamps."
+        );
+        assert!(
+            !builder.contains("MissedTickBehavior::Delay"),
+            "a `Delay` left anywhere in the snapshot timer constructor silently \
+             un-aligns the cadence it applies to"
+        );
+    }
+
     /// A cadence with no `select!` arm is the one four-cadence mistake that
     /// ships fully green: the enum, the labels, the views, the intervals and
     /// the docs can all name it while the drain never fires it, and the only
     /// symptom is a `tf` value that is absent from a table nobody reads until
     /// they need it.
     ///
-    /// Three things must line up per cadence, and this asserts all three
-    /// against `SnapshotCadence::ALL` rather than a hand-written list:
-    /// a timer built from the interval array, its `MissedTickBehavior::Delay`,
-    /// and a `select!` arm naming the variant.
+    /// Two things must line up per cadence, and this asserts both against
+    /// `SnapshotCadence::ALL` rather than a hand-written list: a timer built
+    /// through the aligned constructor, and a `select!` arm naming the
+    /// variant. The `MissedTickBehavior` moved into that constructor on
+    /// 2026-09-12 and is asserted ONCE by the test above rather than four
+    /// times here.
     #[test]
     fn every_snapshot_cadence_has_a_timer_arm_in_the_drain() {
         let src = include_str!("dhan_feed_stack.rs");
@@ -23481,21 +23754,14 @@ mod late_seed_tests {
             let label = cadence.as_str();
             let timer = format!("snapshot_{label}_timer");
             assert!(
-                drain.contains(&format!("let mut {timer} = tokio::time::interval(")),
+                drain.contains(&format!("let mut {timer} = snapshot_timer_at(")),
                 "cadence {label} has no timer: it is in SnapshotCadence::ALL, so \
                  its view and its label exist, but nothing ever fires a snapshot \
-                 for it and `top_volume_rank` will hold no `tf = '{label}'` row \
-                 for the life of the process"
-            );
-            assert!(
-                drain.contains(&format!(
-                    "{timer}.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay)"
-                )),
-                "cadence {label}'s timer is missing MissedTickBehavior::Delay. The \
-                 tokio default is Burst: after any pause the backlog fires back to \
-                 back, several snapshots land on the same `ts`, and the DEDUP key \
-                 (ts, tf, family, feed, security_id, segment) collapses them into \
-                 one row — a window that reads as measured and never happened"
+                 for it and `top_volume` will hold no `tf = '{label}'` row for \
+                 the life of the process. It must be built through \
+                 `snapshot_timer_at`, which is what puts it on the grid — a bare \
+                 `tokio::time::interval` fires its first tick immediately and \
+                 anchors that cadence on the drain's start instant instead."
             );
             assert!(
                 drain.contains(&format!("_ = {timer}.tick() =>")),
