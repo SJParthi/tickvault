@@ -121,7 +121,25 @@ use tickvault_common::config::QuestDbConfig;
 use tickvault_common::error_code::ErrorCode;
 
 /// QuestDB table name — one row per (snapshot, timeframe, family, contract).
-pub const TOP_VOLUME_RANK_TABLE: &str = "top_volume_rank";
+///
+/// ⚠ RENAMED 2026-09-12 from `top_volume_rank` to `top_volume` (operator:
+/// "dotnt make it as top volume rank table meake the table name as top volume
+/// alone"). The rows already written under the old name are CARRIED FORWARD by
+/// [`LEGACY_TOP_VOLUME_RANK_TABLE`] below, never abandoned — a second table
+/// holding half the history is the split this repo's own rename helper exists
+/// to detect and report.
+pub const TOP_VOLUME_RANK_TABLE: &str = "top_volume";
+
+/// The name this table was created under until 2026-09-12.
+///
+/// `ensure_top_volume_rank_table` runs a one-shot `RENAME TABLE` from this to
+/// [`TOP_VOLUME_RANK_TABLE`] BEFORE its CREATE, so a box that already holds
+/// rows carries them into the new name instead of stranding them in a table
+/// that is no longer swept by the partition manager. The rename fails on every
+/// boot after the first, and that failure is EXPECTED and not an error — see
+/// `try_rename_legacy_table`, which additionally reports a SPLIT if both names
+/// somehow exist at once.
+pub const LEGACY_TOP_VOLUME_RANK_TABLE: &str = "top_volume_rank";
 
 /// DEDUP key. Designated `ts` FIRST (2026-04-28 regression rule); `segment`
 /// alongside `security_id` (I-P1-11 — the bare id is reused across segments
@@ -261,17 +279,17 @@ impl SnapshotCadence {
     ///
     /// Lives HERE, beside the label it filters on, because the view's `WHERE
     /// t.tf = '<label>'` clause and the view's own name are one claim: a view
-    /// called `top_volume_rank_3s` that filters `tf = '5s'` is wrong in a way
+    /// called `top_volume_3s` that filters `tf = '5s'` is wrong in a way
     /// no reader of either file alone could see. `console_views` builds the
     /// DDL from this pair rather than from a second enum of its own, which is
     /// what the deleted `TopVolumeCadence` was.
     #[must_use]
     pub const fn view_name(self) -> &'static str {
         match self {
-            Self::OneSecond => "top_volume_rank_1s",
-            Self::ThreeSecond => "top_volume_rank_3s",
-            Self::FiveSecond => "top_volume_rank_5s",
-            Self::OneMinute => "top_volume_rank_1m",
+            Self::OneSecond => "top_volume_1s",
+            Self::ThreeSecond => "top_volume_3s",
+            Self::FiveSecond => "top_volume_5s",
+            Self::OneMinute => "top_volume_1m",
         }
     }
 }
@@ -493,6 +511,59 @@ pub async fn ensure_top_volume_rank_table(questdb_config: &QuestDbConfig) -> boo
             return false;
         }
     };
+    // BEFORE the CREATE, deliberately. A `CREATE TABLE IF NOT EXISTS
+    // top_volume` on a box that already holds `top_volume_rank` rows would
+    // succeed against an EMPTY new table and strand the old one: no longer in
+    // `HOUR_PARTITIONED_TABLES`, no longer swept, growing forever on a volume
+    // this repository has already filled twice. Renaming first carries the
+    // history across.
+    //
+    // The refusal is the NORMAL case from the second boot onward, which is why
+    // this goes through `try_rename_legacy_table` rather than the DDL loop
+    // below — that loop fires a coded error and increments a persist-error
+    // counter, and an error whose steady state is "one per boot, forever"
+    // trains the operator to discount the counter. The helper additionally
+    // probes whether the legacy table still exists on a refusal and reports a
+    // SPLIT, which is the only case here that needs a human.
+    //
+    // The `== Split` arm is NOT optional, and an earlier draft of this call
+    // discarded the verdict with `let _ =`. Both tables present means the
+    // history is halved — new rows in `top_volume`, everything before the
+    // rename stranded in `top_volume_rank`, which is no longer in
+    // `HOUR_PARTITIONED_TABLES` and so is never swept. That is the exact
+    // failure the comment above is about, and swallowing the verdict made it
+    // SILENT. Same shape as the three sibling renames
+    // (`spot_1m_rest_persistence`, `option_chain_1m_persistence`,
+    // `option_contract_1m_rest_persistence`): the helper deliberately does not
+    // log `Split` because the caller owns the coded error.
+    if crate::http_client::try_rename_legacy_table(
+        &client,
+        &base_url,
+        LEGACY_TOP_VOLUME_RANK_TABLE,
+        TOP_VOLUME_RANK_TABLE,
+    )
+    .await
+        == crate::http_client::LegacyRenameOutcome::Split
+    {
+        metrics::counter!(
+            "tv_top_volume_rank_rows_discarded_total",
+            "stage" => "legacy_table_split"
+        )
+        .increment(0);
+        error!(
+            code = "STORAGE-GAP-03",
+            stage = "legacy_table_split",
+            legacy_table = LEGACY_TOP_VOLUME_RANK_TABLE,
+            current_table = TOP_VOLUME_RANK_TABLE,
+            "STORAGE-GAP-03: both the legacy and current top-volume tables exist \
+             — the ranking history is SPLIT across two tables. New rows land in \
+             the current name; everything written before the rename stays in the \
+             legacy one, which is NOT in the hour-partitioned retention list and \
+             is therefore never swept. Neither is dropped; merging is an operator \
+             decision"
+        );
+    }
+
     let mut all_accepted = true;
     for ddl in &top_volume_rank_ensure_statements() {
         match client
@@ -1510,7 +1581,10 @@ mod tests {
         assert_eq!(w.pending(), 1);
         let line = w.buffer_utf8();
         for expected in [
-            "top_volume_rank",
+            // The TRAILING COMMA is the assertion. An ILP table name ends at
+            // the first comma, so "top_volume," rejects the pre-2026-09-12
+            // "top_volume_rank," that a bare "top_volume" would accept.
+            "top_volume,",
             "tf=5s",
             "family=stock_option",
             "feed=dhan",
