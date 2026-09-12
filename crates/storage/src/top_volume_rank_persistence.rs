@@ -1115,7 +1115,23 @@ pub const MAX_TOP_VOLUME_RETAINED_FLUSH_SPANS: u32 = 2;
 /// Now DERIVED from the population rather than asserted, so removing a cut
 /// cannot silently invalidate it again. Still well under the depth path's
 /// 32 MiB, which is the property the sizing test pins.
-const TOP_VOLUME_MAX_ROWS_PER_SWEEP: usize = 25_000 * 2;
+///
+/// ⚠ **DERIVED since 2026-09-12 — both terms used to be bare literals.**
+/// `25_000 * 2` restated the per-family cap and the family count with nothing
+/// linking either to its source, so raising `MAX_TRACKED_CONTRACTS` or adding
+/// a third family would have silently under-sized the drop ceiling on a table
+/// with no spill tier. The per-family term now comes from
+/// `tickvault_common::constants::TOP_VOLUME_PERSIST_PER_FAMILY`, which
+/// `volume_leaderboard.rs` already const-asserts is at least
+/// `MAX_TRACKED_CONTRACTS`.
+///
+/// The family count stays a named literal: `OptionFamily` lives in the `app`
+/// crate, which `storage` cannot import (the dependency runs the other way).
+/// Naming it is the honest middle — a third family is now a visible edit here
+/// rather than an invisible factor inside an arithmetic expression.
+const OPTION_FAMILIES: usize = 2;
+const TOP_VOLUME_MAX_ROWS_PER_SWEEP: usize =
+    tickvault_common::constants::TOP_VOLUME_PERSIST_PER_FAMILY * OPTION_FAMILIES;
 /// Worst-case ILP line width for one `top_volume` row, DERIVED below.
 ///
 /// # ⚠ CORRECTED 2026-09-12 — this was `120`, and it was wrong by ~2.2×
