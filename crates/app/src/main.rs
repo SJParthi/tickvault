@@ -2894,6 +2894,11 @@ async fn async_main() -> Result<()> {
             // quiet on NSE holidays. EventBridge starts this box MON-FRI, which
             // includes them (2026-08-14).
             calendar: std::sync::Arc::clone(&trading_calendar),
+            // The operator-armed unsubscribe probe, DEFAULT OFF (scope lock,
+            // 2026-09-12). An absent `[depth_unsubscribe_probe]` section reads
+            // as every flag false, so a default build never empties a
+            // depth-200 socket to measure anything.
+            depth_unsubscribe_probe: config.depth_unsubscribe_probe,
             dhan_enabled: config.feeds.dhan_enabled,
             instance_lock_held: std::sync::Arc::clone(&dhan_instance_lock_held),
             // Frames a previous session captured but died before folding. The

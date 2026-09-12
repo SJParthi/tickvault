@@ -8345,6 +8345,15 @@ pub struct DhanFeedStackParams {
     /// Where folded ticks are written. Taken by value rather than as a built
     /// `TickWriter` so the writer is constructed on the lane's own task and a
     /// disabled boot never builds one.
+    /// `[depth_unsubscribe_probe]` — the operator-armed, one-shot, two-armed
+    /// unsubscribe probe (scope lock, 2026-09-12). DEFAULT OFF; an absent
+    /// section means every flag false and the probe never touches a socket.
+    ///
+    /// Carried on the params rather than read from a global inside the depth
+    /// attach because the attach is where the depth-200 command senders are
+    /// created, and config that reaches a decision through a global is config
+    /// a test cannot set.
+    pub depth_unsubscribe_probe: tickvault_common::config::DepthUnsubscribeProbeConfig,
     pub questdb: QuestDbConfig,
     /// The process-wide write-ahead log every captured frame lands in BEFORE
     /// it is visible to the fold. `None` refuses the lane: capture-at-receipt
@@ -9396,6 +9405,10 @@ async fn attach_depth_when_available(
     seed_tx: tokio::sync::mpsc::Sender<
         Vec<tickvault_core::websocket::pool_supervisor::SubscribeInstrument>,
     >,
+    // The operator-armed unsubscribe probe's config (scope lock, 2026-09-12),
+    // carried from AppConfig to the ONE place that owns the depth-200 command
+    // senders. Three bools, Copy, DEFAULT OFF.
+    probe_cfg: tickvault_common::config::DepthUnsubscribeProbeConfig,
 ) {
     // Publish a 0 for every contract-failure reason BEFORE the first attempt.
     //
@@ -9504,11 +9517,7 @@ async fn attach_depth_when_available(
     // swap travels down and the instruments that connection was dialed with.
     // Collected here rather than derived later because only the dial knows
     // which connection the pool gave which instruments to.
-    let mut depth_commands: Vec<(
-        DhanEndpointType,
-        tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
-        Vec<SubscribeInstrument>,
-    )> = Vec::new();
+    let mut depth_commands: DialedDepthCommands = Vec::new();
     let mut live_topups: Vec<(tokio::sync::mpsc::Sender<LiveSubscriptionCommand>, usize)> =
         Vec::new();
     // Top-ups queued but not yet answered by their connection task. Read at
@@ -10440,6 +10449,7 @@ async fn attach_depth_when_available(
                     &spot_prices,
                     &today_date,
                     std::mem::take(&mut depth_commands),
+                    probe_cfg,
                 );
                 return;
             }
@@ -10469,14 +10479,10 @@ async fn attach_depth_when_available(
 /// untracked and the socket ordering wrong for every underlying after it.
 #[must_use]
 pub fn depth200_rebalance_sockets(
-    dialed: Vec<(
-        DhanEndpointType,
-        tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
-        Vec<SubscribeInstrument>,
-    )>,
+    dialed: DialedDepthCommands,
 ) -> Vec<crate::depth_rebalance::RebalanceSocket> {
     let mut out = Vec::new();
-    for (endpoint, tx, instruments) in dialed {
+    for (endpoint, connection_index, tx, instruments) in dialed {
         if endpoint != DhanEndpointType::Depth200 {
             continue;
         }
@@ -10491,6 +10497,7 @@ pub fn depth200_rebalance_sockets(
         };
         out.push(crate::depth_rebalance::RebalanceSocket {
             tx,
+            connection_index,
             held: Some(only),
             pending: None,
         });
@@ -10508,19 +10515,15 @@ pub fn depth200_rebalance_sockets(
 /// guard anyway.
 #[must_use]
 pub fn depth20_track_sockets(
-    dialed: &[(
-        DhanEndpointType,
-        tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
-        Vec<SubscribeInstrument>,
-    )],
+    dialed: &[DialedDepthCommand],
 ) -> Vec<crate::depth20_track::Depth20LiveSocket> {
     dialed
         .iter()
-        .filter(|(endpoint, _, instruments)| {
+        .filter(|(endpoint, _, _, instruments)| {
             *endpoint == DhanEndpointType::Depth20 && !instruments.is_empty()
         })
         .map(
-            |(_, tx, instruments)| crate::depth20_track::Depth20LiveSocket {
+            |(_, _, tx, instruments)| crate::depth20_track::Depth20LiveSocket {
                 tx: tx.clone(),
                 held: instruments.clone(),
                 pending: Vec::new(),
@@ -10534,11 +10537,10 @@ fn spawn_depth_rebalance(
     questdb: &tickvault_common::config::QuestDbConfig,
     spot_prices: &Arc<crate::spot_price_store::SpotPriceStore>,
     date_ist: &str,
-    dialed: Vec<(
-        DhanEndpointType,
-        tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
-        Vec<SubscribeInstrument>,
-    )>,
+    dialed: DialedDepthCommands,
+    // The operator-armed unsubscribe probe's config, threaded from the stack's
+    // own AppConfig. Three bools, Copy, DEFAULT OFF.
+    probe_cfg: tickvault_common::config::DepthUnsubscribeProbeConfig,
 ) {
     let depth20 = depth20_track_sockets(&dialed);
     let sockets = depth200_rebalance_sockets(dialed);
@@ -10558,19 +10560,19 @@ fn spawn_depth_rebalance(
     }
     let questdb = questdb.clone();
     let date_ist = date_ist.to_owned();
-    let today_ymd = ymd_from_ist_date(&date_ist);
-    let today_micros = crate::dhan_universe::ist_midnight_nanos(&date_ist) / 1_000;
     tokio::spawn(crate::depth_rebalance::run_depth_rebalance(
         questdb,
         Arc::clone(spot_prices),
         date_ist,
-        today_ymd,
-        today_micros,
         sockets,
         depth20,
         // The spawn boundary is where the global is read. The loop itself takes
         // the view as a parameter so it stays testable against a private one.
         Arc::clone(crate::depth_subscription_view::global_depth_subscription_view()),
+        // The probe's config, read at the spawn boundary like the view above.
+        // DEFAULT OFF: a default build reads an absent `[depth_unsubscribe_probe]`
+        // section as every flag false, and the loop never touches a socket.
+        probe_cfg,
     ));
 }
 /// How long to wait before the next late-attach attempt, given the IST second.
@@ -10588,6 +10590,28 @@ pub fn preopen_retry_secs(now_ist_secs: u32) -> u64 {
         DEPTH_ATTACH_RETRY_SECS
     }
 }
+
+/// What the dial hands back for ONE depth connection it opened.
+///
+/// A named alias rather than the tuple spelled out at each of its six sites
+/// (2026-09-12): clippy called the tuple "very complex", and it was right for
+/// a reason worth fixing rather than silencing -- a four-element positional
+/// tuple repeated six times is six chances for two of them to disagree about
+/// which slot holds the connection index, and that index is what the probe
+/// uses to decide WHICH socket to tear down.
+///
+/// The elements, in order: which endpoint the connection serves, the
+/// pool-wide slot it occupies, the channel a swap travels down, and the
+/// instruments it was dialed holding.
+type DialedDepthCommand = (
+    DhanEndpointType,
+    u8,
+    tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
+    Vec<SubscribeInstrument>,
+);
+
+/// The whole collection, as the dial returns it.
+type DialedDepthCommands = Vec<DialedDepthCommand>;
 
 /// Dial every connection in `plan`, returning how many sockets were opened.
 ///
@@ -10632,13 +10656,7 @@ struct DialContext<'a> {
     /// The instruments come back with the sender because a swap must name the
     /// OLD one, and only the dial knows which connection got which. Deriving
     /// it later from the selection would be guessing at the pool's packing.
-    out_depth_commands: Option<
-        &'a mut Vec<(
-            DhanEndpointType,
-            tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
-            Vec<SubscribeInstrument>,
-        )>,
-    >,
+    out_depth_commands: Option<&'a mut DialedDepthCommands>,
 }
 
 fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize {
@@ -10657,6 +10675,14 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
     let mut dialed = 0usize;
     for planned in plan.connections {
         let endpoint = planned.slot.endpoint;
+        // The pool-wide slot number this connection occupies, captured beside
+        // the endpoint because the probe register that Arm B of the
+        // unsubscribe probe arms is indexed by it (scope lock, 2026-09-12).
+        // Carried out with the command sender rather than derived later: the
+        // depth-200 pool's packing is the dial's business, and re-deriving it
+        // downstream would be guessing at exactly the mapping that decides
+        // WHICH socket gets torn down.
+        let depth_global_index = planned.slot.global_index;
         let Some(base_url) = base_url_for(endpoint) else {
             error!(
                 code = ErrorCode::WsGapConnectionState.code_str(),
@@ -10763,7 +10789,7 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
                     crate::depth20_ranked_steer::DEPTH_SWAP_COMMAND_CHANNEL_DEPTH,
                 );
                 let held: Vec<SubscribeInstrument> = guard.batches().flatten().copied().collect();
-                depth_vec.push((endpoint, tx, held));
+                depth_vec.push((endpoint, depth_global_index, tx, held));
                 Some(rx)
             }
             (_, existing, _) => existing,
@@ -12764,6 +12790,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             spot_topup,
             ws_audit_tx.clone(),
             seed_tx.clone(),
+            params.depth_unsubscribe_probe,
         ));
     }
 
@@ -14763,6 +14790,12 @@ mod tests {
             LiveSubscriptionCommand::Swap { .. } => {
                 panic!("a top-up sent a Swap — it must only ever Extend")
             }
+            LiveSubscriptionCommand::ProbeUnsubscribe { .. } => {
+                panic!(
+                    "a top-up sent a ProbeUnsubscribe — that command belongs to the\
+                        operator-armed probe on a depth-200 socket, never to a top-up"
+                )
+            }
         }
     }
 
@@ -14783,6 +14816,12 @@ mod tests {
             }
             LiveSubscriptionCommand::Swap { .. } => {
                 panic!("a top-up sent a Swap — it must only ever Extend")
+            }
+            LiveSubscriptionCommand::ProbeUnsubscribe { .. } => {
+                panic!(
+                    "a top-up sent a ProbeUnsubscribe — that command belongs to the\
+                        operator-armed probe on a depth-200 socket, never to a top-up"
+                )
             }
         }
     }
@@ -15864,6 +15903,7 @@ mod tests {
         // The default state on every boot since 2026-07-13: no task, no
         // socket, no behaviour change.
         let handle = spawn_dhan_feed_stack(DhanFeedStackParams {
+            depth_unsubscribe_probe: Default::default(),
             dhan_enabled: false,
             instance_lock_held: Arc::new(AtomicBool::new(false)),
             // A disabled lane never reaches the re-fold, which is exactly why
@@ -23448,16 +23488,12 @@ mod depth_rebalance_wiring_tests {
     fn dialed(
         endpoint: DhanEndpointType,
         instruments: Vec<SubscribeInstrument>,
-    ) -> (
-        DhanEndpointType,
-        tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
-        Vec<SubscribeInstrument>,
-    ) {
+    ) -> DialedDepthCommand {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         // Keep the receiver alive for the life of the test so a closed channel
         // never masquerades as a filtered one.
         std::mem::forget(rx);
-        (endpoint, tx, instruments)
+        (endpoint, 0, tx, instruments)
     }
 
     /// One end-to-end pass: a folded tick reaches the board, and a snapshot in

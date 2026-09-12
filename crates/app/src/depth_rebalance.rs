@@ -851,6 +851,15 @@ pub fn plan_minute(
 pub struct RebalanceSocket {
     /// Where a swap travels.
     pub tx: tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
+    /// The pool-wide slot number of the connection behind `tx`.
+    ///
+    /// Carried from the dial rather than derived from this vector's position:
+    /// the depth-200 pool's packing is the dial's business, and a probe that
+    /// tears down the WRONG socket because the mapping was guessed is worse
+    /// than one that never runs. Used only by the operator-armed unsubscribe
+    /// probe's Arm B (scope lock, 2026-09-12), which closes one socket and
+    /// watches whether the replay comes back without the instrument.
+    pub connection_index: u8,
     /// What this connection holds. A depth-200 connection holds exactly one
     /// instrument; `None` only before its first subscription.
     pub held: Option<SubscribeInstrument>,
@@ -1338,8 +1347,6 @@ pub async fn run_depth_rebalance(
     // strike the contract set does not carry.
     spot_store: std::sync::Arc<crate::spot_price_store::SpotPriceStore>,
     date_ist: String,
-    today_ymd: u32,
-    today_ist_micros: i64,
     mut sockets: Vec<RebalanceSocket>,
     mut depth20: Vec<crate::depth20_track::Depth20LiveSocket>,
     // What the pools hold, published for the tick drain to read.
@@ -1351,6 +1358,10 @@ pub async fn run_depth_rebalance(
     // the column's own docs make worse than useless: it is the difference
     // between "we ranked it first" and "we were watching it".
     subscription_view: std::sync::Arc<crate::depth_subscription_view::DepthSubscriptionView>,
+    // The operator-armed unsubscribe probe's config (scope lock, 2026-09-12).
+    // Taken by value because it is three bools and this loop outlives every
+    // borrow anyone could hand it. DEFAULT OFF -- see the struct.
+    probe_cfg: tickvault_common::config::DepthUnsubscribeProbeConfig,
 ) {
     if sockets.is_empty() && depth20.is_empty() {
         tracing::error!(
@@ -1361,6 +1372,15 @@ pub async fn run_depth_rebalance(
         );
         return;
     }
+    // Derived here rather than taken as parameters (2026-09-12).
+    //
+    // Both are pure functions of `date_ist`, so passing them in gave the
+    // caller three values that could disagree with one another -- and a
+    // `today_ymd` from one date beside a `date_ist` from another selects
+    // today's contracts against yesterday's expiry set. Deriving them at the
+    // single place that consumes them makes that disagreement unrepresentable.
+    let today_ymd = crate::dhan_feed_stack::ymd_from_ist_date(&date_ist);
+    let today_ist_micros = crate::dhan_universe::ist_midnight_nanos(&date_ist) / 1_000;
     pre_register_rebalance_counters();
     crate::depth20_track::pre_register_depth20_counters();
     // Seed all three first-packet outcome series at zero (2026-09-11), so a
@@ -1420,6 +1440,10 @@ pub async fn run_depth_rebalance(
         );
     }
 
+    // The probe fires at most ONCE per process, armed or not: a second run
+    // would empty a second depth-200 socket, and the arming register in the
+    // supervisor refuses Arm B a second time anyway.
+    let mut probe_run = false;
     let mut post_close_logged = false;
     let mut no_ranking_reported = false;
     let mut gainer_board_empty_reported = false;
@@ -1466,6 +1490,36 @@ pub async fn run_depth_rebalance(
         // the legacy at-the-money engine has to centre the boot dial before
         // 09:15, and the ranked engine cannot exist before then anyway.
         let secs_of_day = crate::dhan_feed_stack::ist_second_of_day_now();
+
+        // ---- the operator-armed unsubscribe probe (scope lock, 2026-09-12) ----
+        //
+        // ONCE per session, in-session, and OFF by default. Placed here rather
+        // than before the loop because the probe's baseline needs a live book:
+        // run at 08:35 it would find a contract that has not traded yet,
+        // report `inconclusive_thin_book`, and burn the session's one shot on
+        // a market that was not open.
+        //
+        // The window is the one this loop already reasons about — from the
+        // ranking deadline (09:20) to the capture end — so the probe cannot
+        // run in the pre-open or after the close, and needs no second
+        // market-hours notion of its own.
+        //
+        // ⚠ IT BLOCKS THIS LOOP for roughly two minutes when armed, and that
+        // is deliberate: the at-the-money strikes go stale for a minute or
+        // two, once, on a session an operator chose to spend on a
+        // measurement. The alternative — a spawned task holding a cloned
+        // sender — cannot stop the steering from swapping the socket
+        // underneath the measurement, which would contaminate the one thing
+        // the probe exists to produce.
+        if !probe_run
+            && probe_cfg.enabled
+            && (RANKING_PUBLISH_DEADLINE_SECS_OF_DAY_IST
+                ..tickvault_common::constants::TOP_VOLUME_CAPTURE_END_SECS_OF_DAY_IST)
+                .contains(&secs_of_day)
+        {
+            probe_run = true;
+            crate::depth_unsubscribe_probe::run_configured(&probe_cfg, &mut sockets).await;
+        }
         // ---- "no ranking by 09:20" (2026-09-08) ----
         //
         // Once per session, coded, log-sink only (no CloudWatch filter reads
@@ -2789,6 +2843,7 @@ mod apply_tests {
         let (tx, rx) = tokio::sync::mpsc::channel(capacity);
         (
             RebalanceSocket {
+                connection_index: 0,
                 tx,
                 held: Some(instrument(held, ExchangeSegment::NseFno)),
                 pending: None,
@@ -2841,6 +2896,7 @@ mod apply_tests {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
         let mut sockets = vec![RebalanceSocket {
+            connection_index: 0,
             tx,
             held: Some(instrument(1_000, ExchangeSegment::NseFno)),
             pending: None,
@@ -3039,6 +3095,7 @@ mod apply_tests {
         })
         .expect("fills the channel");
         let mut sockets = vec![RebalanceSocket {
+            connection_index: 0,
             tx,
             held: Some(instrument(1_000, ExchangeSegment::NseFno)),
             pending: None,
