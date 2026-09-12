@@ -121,7 +121,7 @@ const NAMED_VIEW_DEPTH_BASE: &str = "market_depth";
 /// enum and not the other passed unchanged. Both the names and the labels now
 /// come from `SnapshotCadence` (`view_name()` / `as_str()`), so the view's
 /// name and the `tf` value it filters on are one declaration.
-const NAMED_VIEW_TOP_VOLUME_BASE: &str = "top_volume_rank";
+const NAMED_VIEW_TOP_VOLUME_BASE: &str = "top_volume";
 /// DDL HTTP timeout (same value as every other boot-DDL ensure site).
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
@@ -204,8 +204,8 @@ pub fn depth_named_view_ddl() -> String {
     )
 }
 
-/// DDL for one per-cadence top-volume view (`top_volume_rank_1s` /
-/// `top_volume_rank_5s`): the ranking rows of ONE cadence, joined to the
+/// DDL for one per-cadence top-volume view (`top_volume_1s` /
+/// `top_volume_5s`): the ranking rows of ONE cadence, joined to the
 /// instrument master so `symbol_name` reads beside the rank.
 ///
 /// `cadence` is the `tf` SYMBOL literal (`1s` / `5s`) — the same wire strings
@@ -324,7 +324,7 @@ async fn run_view_ddl(client: &Client, base_url: &str, view: &str, ddl: &str) {
 /// `non_2xx`, `transport`).
 ///
 /// Added 2026-09-08 after the hostile sweep found a refused view DDL was a
-/// `warn!` and nothing else — a `top_volume_rank_1s` view absent for a whole
+/// `warn!` and nothing else — a `top_volume_1s` view absent for a whole
 /// session had no number behind it. A view is a READ projection, so its
 /// absence loses no data (the base table keeps every row) and this is
 /// deliberately NOT loss-shaped and NOT EMF-selected: the operator's
@@ -425,14 +425,14 @@ pub async fn ensure_named_views(questdb_config: &QuestDbConfig) {
     .await;
     // The per-cadence top-volume faces (2026-09-08; four cadences since
     // 2026-09-12). Same posture as depth: attempted last and independently,
-    // warn-fail on a box where `top_volume_rank` has not been created yet.
+    // warn-fail on a box where `top_volume` has not been created yet.
     //
     // A LOOP over `SnapshotCadence::ALL`, not one hand-written call per
     // cadence. The unrolled form was the single most dangerous line in the
     // four-cadence change: a cadence added to the enum, the labels, the
     // timers and the docs but NOT to this block produces a fully green build,
     // writes its rows to the base table all session, and answers every
-    // `SELECT * FROM top_volume_rank_3s` with "table does not exist". Nothing
+    // `SELECT * FROM top_volume_3s` with "table does not exist". Nothing
     // in the tree would have caught it — no guard derives this call set from
     // the enum.
     for cadence in SnapshotCadence::ALL {
@@ -656,11 +656,11 @@ mod tests {
     fn test_top_volume_cadence_view_and_tf_are_the_pinned_literals() {
         for c in SnapshotCadence::ALL {
             // The view name carries its own label, so a view called
-            // `top_volume_rank_3s` that filters `tf = '5s'` fails here
+            // `top_volume_3s` that filters `tf = '5s'` fails here
             // rather than reading empty in production.
             assert_eq!(
                 c.view_name(),
-                format!("top_volume_rank_{}", c.as_str()),
+                format!("top_volume_{}", c.as_str()),
                 "the view name and the cadence label are one claim"
             );
             for s in [c.view_name(), c.as_str()] {
@@ -678,16 +678,10 @@ mod tests {
             NAMED_VIEW_TOP_VOLUME_BASE,
             crate::top_volume_rank_persistence::TOP_VOLUME_RANK_TABLE
         );
-        assert_eq!(SnapshotCadence::OneSecond.view_name(), "top_volume_rank_1s");
-        assert_eq!(
-            SnapshotCadence::ThreeSecond.view_name(),
-            "top_volume_rank_3s"
-        );
-        assert_eq!(
-            SnapshotCadence::FiveSecond.view_name(),
-            "top_volume_rank_5s"
-        );
-        assert_eq!(SnapshotCadence::OneMinute.view_name(), "top_volume_rank_1m");
+        assert_eq!(SnapshotCadence::OneSecond.view_name(), "top_volume_1s");
+        assert_eq!(SnapshotCadence::ThreeSecond.view_name(), "top_volume_3s");
+        assert_eq!(SnapshotCadence::FiveSecond.view_name(), "top_volume_5s");
+        assert_eq!(SnapshotCadence::OneMinute.view_name(), "top_volume_1m");
     }
 
     #[test]
