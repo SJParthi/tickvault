@@ -1151,8 +1151,25 @@ impl VolumeLeaderboard {
             // division actually used, and the persisted row carries it. Both
             // arms still `continue`, so the short-circuit behaviour is
             // byte-identical to the chained form it replaced.
-            let Some(lot) = lot_of(&row) else {
-                continue;
+            // CARRIED, not probed. The drain populates this from the
+            // `ContractOwner` it already looks up on every tick, so in
+            // production the sweep never goes back to the global map for it —
+            // which is ~40% of the ceiling sweep (1.78 ms without the probe,
+            // 2.95 ms with it, at 20,220 traded).
+            //
+            // Zero means nothing carried one, and the probe is the FALLBACK
+            // rather than a skip: a caller that does not populate the field
+            // behaves exactly as it did before this became an input. Both
+            // arms still `continue` on a missing lot, so the short-circuit is
+            // unchanged.
+            let lot = match row.lot_size {
+                0 => {
+                    let Some(probed) = lot_of(&row) else {
+                        continue;
+                    };
+                    probed
+                }
+                carried => carried,
             };
             let Some(lots) = window_lots_milli(delta, lot) else {
                 continue;
@@ -3411,6 +3428,103 @@ mod tests {
         assert_eq!(
             window_lots_milli(u32::MAX, 1),
             Some(u64::from(u32::MAX) * LOTS_SCALE)
+        );
+    }
+
+    #[test]
+    fn the_lot_size_the_tick_carried_is_used_and_the_sweep_never_probes_for_it() {
+        // The drain populates `lot_size` from the `ContractOwner` it ALREADY
+        // looks up on every tick, so the sweep must not go back to the global
+        // map for it — that probe is ~40% of the ceiling sweep (1.78 ms
+        // without it, 2.95 ms with it, at 20,220 traded).
+        //
+        // The closure PANICS rather than counting calls. A counter would still
+        // pass if the probe merely moved somewhere else in the loop; a panic
+        // is the only assertion that means "this is not called at all".
+        let mut lb = VolumeLeaderboard::new();
+        let carried = |volume: u32| RankedContract {
+            lot_size: 200,
+            ..stock(1, 100, volume)
+        };
+        lb.observe(carried(1), OptionFamily::Stock);
+        let never = |_: &RankedContract| -> Option<u32> {
+            panic!("the sweep probed for a lot size the tick had already carried")
+        };
+        let _ = lb.rank(OptionFamily::Stock, S1, 10, never, all);
+        lb.observe(carried(20_001), OptionFamily::Stock);
+        let ranked = lb.rank(OptionFamily::Stock, S1, 10, never, all);
+        assert_eq!(ranked.len(), 1);
+        // 20,000 units on a 200-unit lot is exactly 100 lots.
+        assert_eq!(ranked[0].window_lots_milli, 100 * LOTS_SCALE);
+        assert_eq!(
+            ranked[0].lot_size, 200,
+            "the persisted row must record the denominator the division used"
+        );
+    }
+
+    #[test]
+    fn a_tick_that_carried_no_lot_size_still_falls_back_to_the_probe() {
+        // Zero means "nothing carried one", and the probe is the FALLBACK
+        // rather than a skip — so a caller that does not populate the field
+        // behaves exactly as it did before this became an input. Every other
+        // test in this module rides that arm, which is why it is asserted
+        // explicitly here rather than left as an assumption.
+        let mut lb = VolumeLeaderboard::new();
+        assert_eq!(
+            stock(1, 100, 1).lot_size,
+            0,
+            "the fixture must carry none, or this test proves nothing"
+        );
+        lb.observe(stock(1, 100, 1), OptionFamily::Stock);
+        let _ = lb.rank(OptionFamily::Stock, S1, 10, lot_of_fixture, all);
+        lb.observe(stock(1, 100, 20_001), OptionFamily::Stock);
+        let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot_of_fixture, all);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(
+            ranked[0].lot_size, 200,
+            "supplied by the probe, because the tick carried nothing"
+        );
+        assert_eq!(ranked[0].window_lots_milli, 100 * LOTS_SCALE);
+    }
+
+    #[test]
+    fn a_carried_lot_size_overrides_a_probe_that_would_disagree() {
+        // The two sources must never BOTH be consulted for one division: the
+        // persisted row records one denominator, and a row whose `lot_size`
+        // disagreed with what was actually divided by would be a plausible
+        // lie rather than a record. The carried value wins, and the row says
+        // so.
+        let mut lb = VolumeLeaderboard::new();
+        let carried = |volume: u32| RankedContract {
+            lot_size: 200,
+            ..stock(1, 100, volume)
+        };
+        let disagrees = |_: &RankedContract| Some(50_u32);
+        lb.observe(carried(1), OptionFamily::Stock);
+        let _ = lb.rank(OptionFamily::Stock, S1, 10, disagrees, all);
+        lb.observe(carried(20_001), OptionFamily::Stock);
+        let ranked = lb.rank(OptionFamily::Stock, S1, 10, disagrees, all);
+        assert_eq!(ranked[0].lot_size, 200, "the carried lot, not the probe's");
+        assert_eq!(
+            ranked[0].window_lots_milli,
+            100 * LOTS_SCALE,
+            "divided by 200; the probe's 50 would have given 400 lots"
+        );
+    }
+
+    #[test]
+    fn the_drain_carries_the_lot_size_it_already_probed_for() {
+        // The whole saving depends on the CALL SITE populating the field —
+        // the fallback above means a drain that stopped doing so would still
+        // rank correctly, silently, while paying the probe 20,220 times a
+        // sweep again. Nothing else in this module can see that regression,
+        // so it is pinned here on the production source.
+        let drain = include_str!("dhan_feed_stack.rs");
+        assert!(
+            drain.contains("lot_size: owner.lot_size,"),
+            "observe_for_ranking must carry the lot size from the owner probe \
+             it already pays for; without it the sweep re-probes the global \
+             map once per contract per sweep"
         );
     }
 

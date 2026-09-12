@@ -3080,13 +3080,33 @@ impl LiveIngest {
                 underlying_id: owner.underlying_id,
                 volume: tick.volume,
                 // Rank-output only: `observe` ignores them and `rank`
-                // overwrites all three. Set here they would be values nothing
+                // overwrites both. Set here they would be values nothing
                 // reads — `delta_units` in particular is measured against a
                 // per-cadence baseline that only `rank` holds, so this path
                 // could not compute it even if it wanted to.
                 window_lots_milli: 0,
                 delta_units: 0,
-                lot_size: 0,
+                // NOT a rank output — an INPUT, and the one that takes the
+                // sweep off the global map. `owner` above is ALREADY the
+                // result of a probe this path pays on every tick, and the
+                // lot size rides on that same value, so carrying it here
+                // costs nothing and saves `rank` a
+                // `global_contract_underlying_map()` load plus a hash probe
+                // PER CONTRACT PER SWEEP.
+                //
+                // MEASURED: that probe alone is the difference between
+                // 1.78 ms and 2.95 ms on the 20,220-contract ceiling sweep —
+                // ~40% of it — and it is paid up to 8 times a second once
+                // four cadences run across two families.
+                //
+                // It can never be stale: `observe` copies the whole contract
+                // on every accepted advance, so the stored lot size is the
+                // one that arrived with this contract's last trade, which is
+                // exactly as fresh as the probe it replaces. `ContractOwner`
+                // already documents this as the intent — "the ranking path
+                // pays ONE hash probe for owner, family and multiplier
+                // together" — it was the implementation that paid two.
+                lot_size: owner.lot_size,
             },
             owner.family,
         );
