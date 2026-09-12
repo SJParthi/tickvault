@@ -255,8 +255,93 @@ services:
       #     would let one table hold the WAL apply job while the other ~25
       #     starved.
       QDB_CAIRO_MAX_UNCOMMITTED_ROWS: "2000000"
-      # O3 max lag: 60s. Tighter out-of-order merge window.
-      QDB_CAIRO_O3_MAX_LAG: "60000000"
+      # O3 max lag: 600s — QuestDB's own documented default.
+      #
+      # RAISED 2026-09-11 from 60s (see Item 42 of
+      # .claude/plans/active-plan-feed-hardening.md for the full measurement).
+      # The old value carried the comment "Tighter out-of-order merge window"
+      # and no measurement at all. Measured live, mid-session, 15:27 IST:
+      #
+      #   tv_dhan_feed_depth_total{outcome="rows"}   773,624,120
+      #   tv_depth_rows_spilled_total{feed="dhan"}   228,215,136  (29.5%)
+      #   tv_depth_rows_dropped_total{feed="dhan"}   228,215,136  (identical
+      #                                              => zero loss, all rescued)
+      #   tv_tick_spill_replayed_bytes_total          47,053,504,733 (47 GB)
+      #   tv_questdb_wal_apply_lag_max                55,060
+      #
+      # Nearly a THIRD of every depth row this session is written twice: once
+      # into a batch the offload writer's hand-off queue could not accept, and
+      # again from data/spill/depth/ at least REPLAY_INTERVAL_SECS = 300 later
+      # — carrying its ORIGINAL timestamp, because
+      # tick_spill_replay::retain_lines_in_open_window copies each line
+      # byte-for-byte and never re-stamps it.
+      #
+      # ⚠ CORRECTED 2026-09-11, hours after this comment was first written: the
+      # sentence above said the rescue came from "a flush that hit its 5,000 ms
+      # client request_timeout". The counters that separate the two causes were
+      # then read on the box and they REFUTE it:
+      #
+      #   tv_depth_flush_retries_skipped_total         13   <- genuine timeouts
+      #   tv_depth_flush_queue_full_total          68,838   <- the real cause
+      #   tv_depth_flush_width_capped_total        22,488   <- the rescues
+      #   tv_depth_flush_offloaded_total          107,778
+      #
+      # It is QUEUE SATURATION (DEPTH_FLUSH_QUEUE_DEPTH = 4), not timeouts.
+      # That matters beyond bookkeeping: the follow-up this comment originally
+      # named -- raising the ILP request_timeout -- would have changed NOTHING,
+      # because the timeout is not what fires. Recorded rather than silently
+      # swapped, per the house rule that a wrong theory which dies quietly is
+      # the expensive kind.
+      #
+      # At 60s every one of those replayed rows was 5x to 400x OUTSIDE the
+      # merge window, so QuestDB could not absorb it in memory and had to
+      # rewrite the partition — which is the 78 MB/s of READS observed on a
+      # write-only workload, and the 93.2% device utilisation, which makes the
+      # NEXT flush more likely to time out. A spiral, and the tight window was
+      # feeding it.
+      #
+      # 600s covers the 300s replay cadence plus round duration with margin.
+      #
+      # ⚠⚠ THIS CHANGE IS INERT ON ITS OWN, AND THE SENTENCE THAT USED TO SIT
+      # HERE IS WHY. It read: "Memory does not grow with the window:
+      # QDB_CAIRO_MAX_UNCOMMITTED_ROWS above caps the lag buffer in ROWS."
+      # That is TRUE, and it is exactly the reason the window is never reached
+      # — a LIMITATION written down as a REASSURANCE, in the same commit that
+      # shipped the change it undermines.
+      #
+      # QuestDB commits on whichever limit binds FIRST. The row cap above is
+      # 2,000,000. For a 600s window to be reached, the table's ingest rate
+      # must stay under 2,000,000 / 600 = 3,333 rows/s. MEASURED this session:
+      # 793,936,720 depth rows over ~26,280s = ~30,200 rows/s average, so the
+      # row cap fires at roughly 66 SECONDS — about 9x sooner than the window.
+      # The 600s setting is therefore correct in DIRECTION and currently
+      # cannot change a single number.
+      #
+      # The missing half is a HIGHER ROW CAP, and it is deliberately NOT
+      # shipped here: this key is SERVER-WIDE across all 26 tables, so raising
+      # it 10x buys ~1.4 GB of QuestDB working set for market_depth alone
+      # (20M rows x 72 B) plus whatever the rest take, against a 12 GiB limit
+      # measured at 4.17 GiB. The surgical form is a PER-TABLE
+      # `ALTER TABLE market_depth SET PARAM maxUncommittedRows = ...` in the
+      # boot DDL — a mechanism this tree does not have yet (grep: zero
+      # `SET PARAM` anywhere), so it is new code with its own guard, not a
+      # line edit, and it should land measured rather than at pace.
+      #
+      # NOT claimed: that this stops rows spilling. 29.5% still take that path.
+      # This treats the O3 COST, not the spill CAUSE — and until the row cap
+      # moves, it does not yet treat the O3 cost either.
+      #
+      # THE SCALE OF THE PROBLEM, measured 2026-09-11 across the full day:
+      # the volume wrote 5.02 TB to store roughly 80 GB of logical rows
+      # (~63x amplification) and sat at 520-525 MB/s against a 500 MB/s
+      # provisioned ceiling CONTINUOUSLY from 03:55 to 05:15 UTC. An earlier
+      # read of this same metric said "152 MB/s, 30% of provisioned, not the
+      # limit" — that read caught the post-saturation plateau, not the peak,
+      # and is withdrawn.
+      #
+      # REVERT: set back to "60000000" and restart the container. No schema
+      # change, no data migration, no code path altered.
+      QDB_CAIRO_O3_MAX_LAG: "600000000"
       # --- Crash Recovery & Stability ---
       # Writer append page size: 16MB (QuestDB's default).
       #

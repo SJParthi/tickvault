@@ -108,7 +108,7 @@ const _: () = assert!(
 );
 
 /// How many DISTINCT-underlying contracts the ranking publishes: the five
-/// ENTRY slots plus a hysteresis band of three.
+/// ENTRY slots plus the hysteresis band.
 ///
 /// The 2026-09-07 lock names a hysteresis band as the remedy for a churning
 /// per-window board, and until 2026-09-08 (SECOND) depth-200 had none: the
@@ -119,17 +119,86 @@ const _: () = assert!(
 ///
 /// The rule is the depth-20 one, scaled to five sockets: a contract ENTERS
 /// only from the first [`DEPTH_200_SOCKET_BUDGET`] ranks; a contract already
-/// held is KEPT while it stays anywhere inside this longer list. Three ranks
-/// of band, not one, because the distinct-underlying pass makes rank 6 a
-/// different STOCK from rank 5, and a stock that is the sixth-busiest one
-/// window and the fifth the next is precisely the churn a band exists for.
+/// held is KEPT while it stays anywhere inside this longer list.
 ///
-/// Derived from the budget rather than written as `8`, so a change to the
-/// socket count moves the band with it.
+/// Derived from the budget rather than written as a literal, so a change to
+/// the socket count moves the band with it.
 pub const DEPTH200_EXIT_UNDERLYINGS: usize = DEPTH_200_SOCKET_BUDGET + DEPTH200_HYSTERESIS_RANKS;
 
 /// The band width — see [`DEPTH200_EXIT_UNDERLYINGS`].
-pub const DEPTH200_HYSTERESIS_RANKS: usize = 3;
+///
+/// # WIDENED 2026-09-11, 3 → 15, on the first measurement of what it costs
+///
+/// The band shipped at 3 on 2026-09-08 with no measurement behind it. The
+/// first session that measured the pool says 3 is nowhere near enough:
+///
+/// | reading, 2026-09-11, one session | value |
+/// |---|---:|
+/// | `tv_depth_rebalance_swaps_sent_total` (this pool, 5 sockets) | **1,799** |
+/// | steering cycles in the capture window (23,100 s ÷ 60) | 385 |
+/// | swaps per cycle, against a [`MAX_RANKED_SWAPS_PER_MINUTE`] of 5 | **4.67 — 93.5% of the cap** |
+/// | mean hold per contract | **1.07 minutes** |
+///
+/// [`MAX_RANKED_SWAPS_PER_MINUTE`]: crate::depth200_ranked_steer::MAX_RANKED_SWAPS_PER_MINUTE
+///
+/// A deep socket held a contract for about ONE MINUTE, and the pool spent the
+/// session pressed against its own safety cap. That is the exact condition the
+/// 2026-09-07 lock legislates for in advance — *"if the swap budget is hit
+/// routinely, the answer is a longer window or a hysteresis band on entry/exit"*
+/// — so widening the band is the prescribed remedy and needs no fresh quote.
+///
+/// ## Why 15, and the honest limit of that choice
+///
+/// The ranking is over DISTINCT UNDERLYINGS, and the live F&O population is
+/// ~208 underlyings with ladders. So the band sets the eviction bar:
+///
+/// | | entry | exit | as a share of ~208 underlyings |
+/// |---|---:|---:|---|
+/// | before | top 5 | top 8 | a held name lost its socket on falling out of the top **3.8%** |
+/// | after | top 5 | top 20 | it must fall out of the top **~10%** |
+///
+/// "Entered as one of the five busiest, keeps its socket until it is no longer
+/// among the busiest tenth" is a statement about the NAME being persistently
+/// busy. Top-8-of-208 is not: at a five-second sampling window on stock-option
+/// books the repo already calls *"thinner than FINNIFTY's"*, that bar is rank
+/// noise, and the 93.5% figure is what rank noise looks like from the outside.
+///
+/// **The depth-20 ratio is deliberately NOT the model here.** That pool enters
+/// at 250 and exits at 300 — a 1.2× band — and copying the ratio would give
+/// depth-200 a band of ONE, which is worse than today. The two pools differ in
+/// the cost of being wrong, not in the proportion: losing a contract costs
+/// depth-20 one slot in 250 and costs depth-200 **one socket in five**, on a
+/// feed with no snapshot-on-subscribe, so the replacement book stays silent
+/// until its next update. The band is therefore sized by the COST of a swap,
+/// not by symmetry with the wide pool.
+///
+/// **What 15 is NOT:** derived. Nobody has measured how far an underlying's
+/// rank drifts between windows — that is the number that would set this
+/// exactly, and it does not exist. 15 is the first value with a defensible
+/// MEANING rather than a defensible derivation, and
+/// `tv_depth200_ranked_swaps_total{outcome}` against the mean hold above is
+/// what tunes it. If the pool still sits near its cap next session, the band
+/// is still too narrow; if swaps collapse to near zero and the held set goes
+/// stale, it is too wide.
+///
+/// **The cost of being too wide, stated plainly:** the pool can end up holding
+/// names ranked 16–20 while 6–15 sit unheld, because placement only happens
+/// into a socket whose contract has left the list entirely. Every such name
+/// entered as a top-five, so the set is "recently busiest", never "arbitrary" —
+/// and against the measured alternative of a one-minute hold on a book that
+/// starts silent, a continuous hold on a recently-top-five name is very likely
+/// the better capture. That is a judgement, and it is labelled as one.
+///
+/// **NOT addressed by this band, and it is a second churn source:** the
+/// published list carries ONE CONTRACT per underlying, and the planner keeps a
+/// socket only when that exact contract is still the list's pick. If the
+/// underlying stays busy but its busiest STRIKE moves, the held contract falls
+/// off the list and the socket swaps — even though the NAME never left the
+/// band. Widening the band does nothing for that case. Recorded rather than
+/// fixed: keying the keep-test on the underlying instead of the contract is a
+/// semantic change to what a depth-200 socket promises, and it deserves its own
+/// decision.
+pub const DEPTH200_HYSTERESIS_RANKS: usize = 15;
 
 const _: () = assert!(
     DEPTH200_EXIT_UNDERLYINGS > DEPTH_200_SOCKET_BUDGET,
@@ -378,6 +447,11 @@ mod tests {
             underlying_id,
             volume: 12_345,
             window_lots_milli: lots,
+            // Self-consistent with `lots`: at a 1,000-unit lot the milli-lot
+            // key equals the traded units exactly, so the fixture cannot
+            // encode a division that `rank` would never produce.
+            delta_units: u32::try_from(lots).unwrap_or(u32::MAX),
+            lot_size: 1_000,
         }
     }
 
@@ -545,6 +619,41 @@ mod tests {
         let short = [candidate(1, 10, 9), candidate(2, 20, 8)];
         assert_eq!(entry_set(&short).len(), 2);
         assert!(entry_set(&[]).is_empty());
+    }
+
+    /// The band must stay WIDE, and this is a ratchet rather than a value pin.
+    ///
+    /// It deliberately asserts a FLOOR, not equality: tuning the band upward
+    /// on the next session's measurement is the intended direction and must
+    /// not fail the build, while narrowing it back toward the 2026-09-08 value
+    /// of 3 must.
+    ///
+    /// The floor is 2× the socket budget because that is the threshold below
+    /// which the band stops meaning "this NAME is still busy" and starts
+    /// meaning "this name is still in the same handful": with five entry slots
+    /// over a live population of ~208 F&O underlyings, an exit bar inside the
+    /// top ten is rank noise at a five-second sampling window — which is what
+    /// the 2026-09-11 session measured as 93.5% of the swap cap and a 1.07
+    /// minute mean hold.
+    #[test]
+    fn the_hysteresis_band_stays_wide_enough_to_mean_the_name_is_still_busy() {
+        assert!(
+            DEPTH200_HYSTERESIS_RANKS >= 2 * DEPTH_200_SOCKET_BUDGET,
+            "the depth-200 band is {DEPTH200_HYSTERESIS_RANKS}, narrower than the \
+             {} floor. A band this tight evicts on rank noise: measured 2026-09-11, \
+             a band of 3 put the pool at 93.5% of its swap cap with a 1.07-minute \
+             mean hold on a feed that sends NO snapshot on subscribe, so much of \
+             each hold is a silent book. Widening is fine; narrowing needs the \
+             measurement that says rank drift is small.",
+            2 * DEPTH_200_SOCKET_BUDGET
+        );
+        // And the band is the larger half: a published list that is mostly
+        // entry slots is a list with almost no memory.
+        assert!(
+            DEPTH200_EXIT_UNDERLYINGS >= 3 * DEPTH_200_SOCKET_BUDGET,
+            "entry {DEPTH_200_SOCKET_BUDGET}, exit {DEPTH200_EXIT_UNDERLYINGS} — \
+             a held contract should have to fall a long way, not one place"
+        );
     }
 
     #[test]

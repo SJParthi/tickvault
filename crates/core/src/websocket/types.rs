@@ -232,8 +232,14 @@ pub struct SubscriptionRequest {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TwoHundredDepthSubscriptionRequest {
-    /// Feed request code (23 = subscribe, 24 = unsubscribe — 25 was proven IGNORED
-    /// live on 2026-09-10; see `FEED_UNSUBSCRIBE_TWENTY_DEPTH`).
+    /// Feed request code (23 = subscribe, 25 = unsubscribe).
+    ///
+    /// 25 is the value Dhan's Annexure documents (its table reads 23 then 25,
+    /// skipping 24). A 2026-09-10 session proved 25 IGNORED on the wire; 24 was
+    /// then tried on 2026-09-11 and was ignored IDENTICALLY — 80 lines, 40/40
+    /// across both endpoints, all ten sockets. Two codes failing the same way is
+    /// evidence the code is not the variable, so we ship the documented one.
+    /// See `FEED_UNSUBSCRIBE_TWENTY_DEPTH`.
     #[serde(rename = "RequestCode")]
     pub request_code: u8,
     /// Exchange segment string (e.g., "NSE_EQ", "NSE_FNO").
@@ -868,17 +874,19 @@ mod tests {
     }
 
     #[test]
-    fn test_two_hundred_depth_unsubscribe_request_code_24() {
-        // 25 was the value here until 2026-09-10, when a live session proved
-        // Dhan ignores it (20 unsubscribes, 0 honoured). 24 = subscribe + 1.
+    fn test_two_hundred_depth_unsubscribe_request_code_is_the_documented_25() {
+        // 25 -> 24 (2026-09-10, when 25 was proven ignored) -> 25 again
+        // (2026-09-11, when the vendor's own Feed Request Code table was shown
+        // to go 23 -> 25 with no 24 anywhere in 10,263 lines of v2 docs).
+        // Both codes were ignored identically; we ship the documented one.
         let request = TwoHundredDepthSubscriptionRequest {
             request_code: tickvault_common::constants::FEED_UNSUBSCRIBE_TWENTY_DEPTH,
             exchange_segment: "NSE_EQ".to_string(),
             security_id: "2885".to_string(),
         };
         let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("\"RequestCode\":24"));
-        assert!(!json.contains("\"RequestCode\":25"));
+        assert!(json.contains("\"RequestCode\":25"));
+        assert!(!json.contains("\"RequestCode\":24"));
     }
 
     #[test]

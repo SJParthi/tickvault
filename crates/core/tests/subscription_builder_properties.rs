@@ -28,7 +28,7 @@
 //! - tested: `build_twenty_depth_subscription_messages` — `prop_twenty_depth_preserves_every_instrument`,
 //!   `test_depth_caps_are_fifty_and_one`
 //! - tested: `build_twenty_depth_unsubscription_messages` — `test_depth_caps_are_fifty_and_one`
-//!   (unsubscribe uses request code 24 = `subscribe_code + 1` — 25 was proven ignored live on 2026-09-10)
+//!   (unsubscribe uses request code 25 — the vendor table goes 23 -> 25 and names no 24; BOTH codes were proven ignored live, 25 on 2026-09-10 and 24 on 2026-09-11)
 //! - tested: `build_two_hundred_depth_subscription_message` — `test_two_hundred_depth_is_single_instrument_nse_only`
 //! - tested: `build_two_hundred_depth_unsubscription_message` — `test_two_hundred_depth_is_single_instrument_nse_only`
 //! - tested: `build_disconnect_message` — module tests in `subscription_builder.rs`

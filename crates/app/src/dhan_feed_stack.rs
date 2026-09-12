@@ -127,6 +127,20 @@ use tickvault_trading::candles::multi_tf_aggregator::AGGREGATOR_MAX_SLOTS;
 use tickvault_trading::candles::{BufferedSeal, ConsumeStats, FeedStrategy, MultiTfAggregator};
 use tracing::{error, info, warn};
 
+/// The segment label used when a ghost log line has no instrument recorded.
+///
+/// DERIVED, never spelled out: `segment_code_to_str` is a `const fn` whose
+/// `_` arm returns the literal that `depth_segment_label` refuses on, so
+/// evaluating it at an unmapped code gives exactly that literal at compile
+/// time. Writing `"UNKNOWN"` by hand here would let the two drift silently —
+/// and a drifted sentinel is one that reads as a real segment.
+///
+/// The sentinel is unreachable by construction (the Ghost arm records the
+/// label before `outcome.ghost` can exceed zero); it exists so a future
+/// refactor that breaks the invariant reports the break rather than panicking
+/// on the drain.
+const DEPTH_SEGMENT_UNKNOWN: &str = tickvault_common::segment::segment_code_to_str(u8::MAX);
+
 /// Environment opt-in that must be `1` for the lane to run, on top of
 /// `[feeds] dhan_enabled`. Absent means OFF, which is the whole point.
 pub const DHAN_LIVE_FEED_ENV: &str = "TICKVAULT_DHAN_LIVE_FEED";
@@ -3051,9 +3065,14 @@ impl LiveIngest {
                 segment,
                 underlying_id: owner.underlying_id,
                 volume: tick.volume,
-                // Rank-output only: `observe` ignores it and `rank` overwrites
-                // it. Set here it would be a value nothing reads.
+                // Rank-output only: `observe` ignores them and `rank`
+                // overwrites all three. Set here they would be values nothing
+                // reads — `delta_units` in particular is measured against a
+                // per-cadence baseline that only `rank` holds, so this path
+                // could not compute it even if it wanted to.
                 window_lots_milli: 0,
+                delta_units: 0,
+                lot_size: 0,
             },
             owner.family,
         );
@@ -5458,17 +5477,38 @@ async fn run_frame_drain(
                                     ) {
                                         Ok(()) => {
                                             c.depth_ghost_redials.increment(1);
+                                            // The two sentinels are unreachable
+                                            // by construction (the Ghost arm
+                                            // always records the id before
+                                            // `outcome.ghost` can exceed zero)
+                                            // and are spelled out rather than
+                                            // unwrapped: a 0 security_id and an
+                                            // "UNKNOWN" segment are both values
+                                            // this codebase already reads as
+                                            // "absent", so a future refactor
+                                            // that breaks the invariant reports
+                                            // the break instead of panicking on
+                                            // the drain.
+                                            let (ghost_security_id, ghost_segment) = outcome
+                                                .ghost_instrument
+                                                .unwrap_or((0_u64, DEPTH_SEGMENT_UNKNOWN));
                                             error!(
                                                 code = ErrorCode::WsGapSubscriptionBatching.code_str(),
                                                 source = "unsubscribe_ignored",
                                                 connection_index = frame.connection_index,
                                                 endpoint = frame.endpoint.as_str(),
+                                                security_id = ghost_security_id,
+                                                segment = ghost_segment,
                                                 ghost_packets = outcome.ghost,
+                                                ghost_instrument_shared = outcome.ghost_instrument_shared,
                                                 redials_taken = ghost_redials_taken(frame.connection_index),
                                                 "a depth socket is still delivering an instrument it was told to \
                                                  unsubscribe more than the grace ago -- the unsubscribe was ignored \
                                                  or lost, so the socket is asked to redial and replay its current \
-                                                 set (log-sink only; counted under `ghost` on the depth counter)"
+                                                 set. `security_id` is the FIRST ghost in this frame; \
+                                                 `ghost_packets` counts EVERY ghost packet in it, so the two are \
+                                                 the same instrument only when `ghost_instrument_shared` is false \
+                                                 (log-sink only; counted under `ghost` on the depth counter)"
                                             );
                                         }
                                         // Said ONCE per socket per session: after the
@@ -5478,11 +5518,26 @@ async fn run_frame_drain(
                                             if ghost_ceiling_first_hit(frame.connection_index) =>
                                         {
                                             c.depth_ghost_exhausted.increment(1);
+                                            // The id is in hand here too, and this is
+                                            // the arm that most needs it: MEASURED
+                                            // 2026-09-11, every socket reached the
+                                            // ceiling by 10:22 IST and 78.5% of the
+                                            // session's 5,345,436 ghost packets arrived
+                                            // AFTER that. Logging the instrument only on
+                                            // the redial arm names four fifths of the
+                                            // evidence not at all.
+                                            let (ghost_security_id, ghost_segment) = outcome
+                                                .ghost_instrument
+                                                .unwrap_or((0_u64, DEPTH_SEGMENT_UNKNOWN));
                                             error!(
                                                 code = ErrorCode::WsGapSubscriptionBatching.code_str(),
                                                 source = "ghost_redial_exhausted",
                                                 connection_index = frame.connection_index,
                                                 endpoint = frame.endpoint.as_str(),
+                                                security_id = ghost_security_id,
+                                                segment = ghost_segment,
+                                                ghost_packets = outcome.ghost,
+                                                ghost_instrument_shared = outcome.ghost_instrument_shared,
                                                 ceiling = GHOST_REDIAL_SESSION_CEILING,
                                                 "a depth socket has been redialled the session ceiling of times \
                                                  for a ghost instrument and STILL delivers it -- the unsubscribe \
@@ -6653,6 +6708,62 @@ pub struct DepthFrameOutcome {
     /// Packets for an instrument this process dropped whose grace elapsed
     /// (`DepthFrameClass::Ghost`). Non-zero asks the socket to redial.
     pub ghost: u64,
+    /// The FIRST ghosting instrument in this frame, as `(security_id,
+    /// segment_label)`.
+    ///
+    /// WHY THIS EXISTS. Across the two full sessions that proved Dhan ignores
+    /// the depth unsubscribe — code 25 on 2026-09-10, code 24 on 2026-09-11,
+    /// 80 `unsubscribe_ignored` lines each, split 40/40 across both depth
+    /// endpoints and all ten sockets — this process could not say WHICH
+    /// contract ghosted. The log line carried `connection_index`,
+    /// `endpoint`, `ghost_packets` and `redials_taken`, and no instrument
+    /// identifier at all. The operator's own Dhan-support workflow requires
+    /// "precise contract labels … SecurityId for every contract cited", and
+    /// that requirement could not be met from our own telemetry.
+    ///
+    /// It also helps with the question the log could not answer: whether the
+    /// same contract survived eight redials, or eight different contracts
+    /// were each newly ignored. Those have opposite diagnoses and the
+    /// existing counters cannot distinguish them. `ghost_instrument_shared`
+    /// below is what makes that reading safe rather than assumed.
+    ///
+    /// FIRST, not all: a frame stacks packets, and holding every ghosting id
+    /// would need a collection on the drain. One `Option<(u64, &'static
+    /// str)>` is `Copy`, sits in the outcome the frame already returns, and
+    /// costs the hot path a single move. The `error!` it feeds is itself
+    /// throttled to once per socket per 180 s cooldown, so a second id in
+    /// the same frame would have nowhere to go.
+    ///
+    /// The segment is the LABEL (`"NSE_FNO"`), not the wire byte, and that
+    /// is the whole point of the field rather than a stylistic choice. This
+    /// line exists to be PAIRED — against `depth_unsubscribe_sent`, which
+    /// logs `drop_this.segment.as_str()`, and against `market_depth.segment`,
+    /// which is a SYMBOL column written from this very `depth_segment_label`
+    /// call. A raw `2` here would join to neither, and `security_id` ALONE is
+    /// not unique (I-P1-11) — so a numeric segment would leave the pairing
+    /// ambiguous in exactly the case the field was added to disambiguate.
+    /// The label is already in scope above, refused rather than guessed for
+    /// an unknown code, so this costs nothing.
+    ///
+    /// `u64`, not `u32`: the §28.1 lift widened the shared id space, and a
+    /// narrower field here would reintroduce exactly the silent truncation
+    /// that widening removed — the same reasoning `SubscribeInstrument`
+    /// records at its own `security_id`.
+    pub ghost_instrument: Option<(u64, &'static str)>,
+    /// True when a SECOND, DIFFERENT instrument also ghosted in this frame.
+    ///
+    /// Without it, `security_id` beside `ghost_packets` reads as "this
+    /// contract ghosted N times" — and that is false whenever two contracts
+    /// ghost in one frame, which is the expected case: a depth-20 socket
+    /// drops up to four contracts a minute and every one of them can ghost
+    /// concurrently for the next ten minutes. A vendor ticket built on the
+    /// wrong reading is a dismissed ticket.
+    ///
+    /// One `bool` and one comparison per ghost packet, on a branch that is
+    /// already taken. It does not name the others — naming them needs the
+    /// collection this field exists to avoid — it says only whether the id
+    /// on the line accounts for the count on the line.
+    pub ghost_instrument_shared: bool,
     /// Packets for an instrument dropped inside the grace window.
     pub unsubscribed_grace: u64,
 }
@@ -7328,6 +7439,25 @@ fn drain_depth_frame(
         // The rows are STILL written -- the levels arrived, and "capture
         // everything" is not suspended for an instrument we did not want;
         // the verdict only counts, and asks the socket to redial.
+        // Time-to-first-packet (2026-09-11). The hot-path arm is ONE relaxed
+        // atomic load whenever no swap is outstanding, which is almost every
+        // packet of a session; only while a subscribe is awaited does it cost
+        // a hash probe, and only the single packet that resolves it does any
+        // work at all. Placed beside the ghost check because both are
+        // per-PACKET questions about the same key, and for the same reason:
+        // before the level loop, so neither costs anything per row.
+        //
+        // Replayed frames are skipped on the same grounds the ghost check
+        // skips them -- a WAL frame captured before the subscribe would
+        // report a latency measured against a clock it never ran on.
+        if frame.connection_index != u8::MAX {
+            crate::depth_first_packet::global_depth_first_packet_tracker().observe_at(
+                header.security_id,
+                header.exchange_segment_code,
+                kind,
+                received_at_nanos,
+            );
+        }
         if frame.connection_index != u8::MAX {
             match crate::depth_subscription_view::global_depth_subscription_view().classify_raw(
                 header.security_id,
@@ -7337,6 +7467,26 @@ fn drain_depth_frame(
                 crate::depth_subscription_view::DepthFrameClass::Ghost => {
                     out.ghost = out.ghost.saturating_add(1);
                     c.depth_ghost.increment(1);
+                    // FIRST ghost of the frame wins rather than the last, so
+                    // the id on the line is stable across a re-read of the
+                    // same frame instead of depending on packet order.
+                    //
+                    // The redial is requested ONCE per frame on the aggregate
+                    // `outcome.ghost > 0`, so no individual packet earns it —
+                    // first-vs-last is a determinism choice, not a causal one,
+                    // and `ghost_instrument_shared` is what tells the reader
+                    // whether this id accounts for the whole count.
+                    //
+                    // `segment` is the LABEL bound above, refused already if
+                    // the code is unknown: the same value `market_depth.segment`
+                    // is written from, so the log line and the stored rows join.
+                    match out.ghost_instrument {
+                        None => out.ghost_instrument = Some((header.security_id, segment)),
+                        Some((first_id, _)) if first_id != header.security_id => {
+                            out.ghost_instrument_shared = true;
+                        }
+                        Some(_) => {}
+                    }
                 }
                 crate::depth_subscription_view::DepthFrameClass::RecentlyDropped => {
                     out.unsubscribed_grace = out.unsubscribed_grace.saturating_add(1);
@@ -8195,6 +8345,15 @@ pub struct DhanFeedStackParams {
     /// Where folded ticks are written. Taken by value rather than as a built
     /// `TickWriter` so the writer is constructed on the lane's own task and a
     /// disabled boot never builds one.
+    /// `[depth_unsubscribe_probe]` — the operator-armed, one-shot, two-armed
+    /// unsubscribe probe (scope lock, 2026-09-12). DEFAULT OFF; an absent
+    /// section means every flag false and the probe never touches a socket.
+    ///
+    /// Carried on the params rather than read from a global inside the depth
+    /// attach because the attach is where the depth-200 command senders are
+    /// created, and config that reaches a decision through a global is config
+    /// a test cannot set.
+    pub depth_unsubscribe_probe: tickvault_common::config::DepthUnsubscribeProbeConfig,
     pub questdb: QuestDbConfig,
     /// The process-wide write-ahead log every captured frame lands in BEFORE
     /// it is visible to the fold. `None` refuses the lane: capture-at-receipt
@@ -9246,6 +9405,10 @@ async fn attach_depth_when_available(
     seed_tx: tokio::sync::mpsc::Sender<
         Vec<tickvault_core::websocket::pool_supervisor::SubscribeInstrument>,
     >,
+    // The operator-armed unsubscribe probe's config (scope lock, 2026-09-12),
+    // carried from AppConfig to the ONE place that owns the depth-200 command
+    // senders. Three bools, Copy, DEFAULT OFF.
+    probe_cfg: tickvault_common::config::DepthUnsubscribeProbeConfig,
 ) {
     // Publish a 0 for every contract-failure reason BEFORE the first attempt.
     //
@@ -9354,11 +9517,7 @@ async fn attach_depth_when_available(
     // swap travels down and the instruments that connection was dialed with.
     // Collected here rather than derived later because only the dial knows
     // which connection the pool gave which instruments to.
-    let mut depth_commands: Vec<(
-        DhanEndpointType,
-        tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
-        Vec<SubscribeInstrument>,
-    )> = Vec::new();
+    let mut depth_commands: DialedDepthCommands = Vec::new();
     let mut live_topups: Vec<(tokio::sync::mpsc::Sender<LiveSubscriptionCommand>, usize)> =
         Vec::new();
     // Top-ups queued but not yet answered by their connection task. Read at
@@ -10290,6 +10449,7 @@ async fn attach_depth_when_available(
                     &spot_prices,
                     &today_date,
                     std::mem::take(&mut depth_commands),
+                    probe_cfg,
                 );
                 return;
             }
@@ -10319,14 +10479,10 @@ async fn attach_depth_when_available(
 /// untracked and the socket ordering wrong for every underlying after it.
 #[must_use]
 pub fn depth200_rebalance_sockets(
-    dialed: Vec<(
-        DhanEndpointType,
-        tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
-        Vec<SubscribeInstrument>,
-    )>,
+    dialed: DialedDepthCommands,
 ) -> Vec<crate::depth_rebalance::RebalanceSocket> {
     let mut out = Vec::new();
-    for (endpoint, tx, instruments) in dialed {
+    for (endpoint, connection_index, tx, instruments) in dialed {
         if endpoint != DhanEndpointType::Depth200 {
             continue;
         }
@@ -10341,6 +10497,7 @@ pub fn depth200_rebalance_sockets(
         };
         out.push(crate::depth_rebalance::RebalanceSocket {
             tx,
+            connection_index,
             held: Some(only),
             pending: None,
         });
@@ -10358,19 +10515,15 @@ pub fn depth200_rebalance_sockets(
 /// guard anyway.
 #[must_use]
 pub fn depth20_track_sockets(
-    dialed: &[(
-        DhanEndpointType,
-        tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
-        Vec<SubscribeInstrument>,
-    )],
+    dialed: &[DialedDepthCommand],
 ) -> Vec<crate::depth20_track::Depth20LiveSocket> {
     dialed
         .iter()
-        .filter(|(endpoint, _, instruments)| {
+        .filter(|(endpoint, _, _, instruments)| {
             *endpoint == DhanEndpointType::Depth20 && !instruments.is_empty()
         })
         .map(
-            |(_, tx, instruments)| crate::depth20_track::Depth20LiveSocket {
+            |(_, _, tx, instruments)| crate::depth20_track::Depth20LiveSocket {
                 tx: tx.clone(),
                 held: instruments.clone(),
                 pending: Vec::new(),
@@ -10384,11 +10537,10 @@ fn spawn_depth_rebalance(
     questdb: &tickvault_common::config::QuestDbConfig,
     spot_prices: &Arc<crate::spot_price_store::SpotPriceStore>,
     date_ist: &str,
-    dialed: Vec<(
-        DhanEndpointType,
-        tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
-        Vec<SubscribeInstrument>,
-    )>,
+    dialed: DialedDepthCommands,
+    // The operator-armed unsubscribe probe's config, threaded from the stack's
+    // own AppConfig. Three bools, Copy, DEFAULT OFF.
+    probe_cfg: tickvault_common::config::DepthUnsubscribeProbeConfig,
 ) {
     let depth20 = depth20_track_sockets(&dialed);
     let sockets = depth200_rebalance_sockets(dialed);
@@ -10408,19 +10560,19 @@ fn spawn_depth_rebalance(
     }
     let questdb = questdb.clone();
     let date_ist = date_ist.to_owned();
-    let today_ymd = ymd_from_ist_date(&date_ist);
-    let today_micros = crate::dhan_universe::ist_midnight_nanos(&date_ist) / 1_000;
     tokio::spawn(crate::depth_rebalance::run_depth_rebalance(
         questdb,
         Arc::clone(spot_prices),
         date_ist,
-        today_ymd,
-        today_micros,
         sockets,
         depth20,
         // The spawn boundary is where the global is read. The loop itself takes
         // the view as a parameter so it stays testable against a private one.
         Arc::clone(crate::depth_subscription_view::global_depth_subscription_view()),
+        // The probe's config, read at the spawn boundary like the view above.
+        // DEFAULT OFF: a default build reads an absent `[depth_unsubscribe_probe]`
+        // section as every flag false, and the loop never touches a socket.
+        probe_cfg,
     ));
 }
 /// How long to wait before the next late-attach attempt, given the IST second.
@@ -10438,6 +10590,28 @@ pub fn preopen_retry_secs(now_ist_secs: u32) -> u64 {
         DEPTH_ATTACH_RETRY_SECS
     }
 }
+
+/// What the dial hands back for ONE depth connection it opened.
+///
+/// A named alias rather than the tuple spelled out at each of its six sites
+/// (2026-09-12): clippy called the tuple "very complex", and it was right for
+/// a reason worth fixing rather than silencing -- a four-element positional
+/// tuple repeated six times is six chances for two of them to disagree about
+/// which slot holds the connection index, and that index is what the probe
+/// uses to decide WHICH socket to tear down.
+///
+/// The elements, in order: which endpoint the connection serves, the
+/// pool-wide slot it occupies, the channel a swap travels down, and the
+/// instruments it was dialed holding.
+type DialedDepthCommand = (
+    DhanEndpointType,
+    u8,
+    tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
+    Vec<SubscribeInstrument>,
+);
+
+/// The whole collection, as the dial returns it.
+type DialedDepthCommands = Vec<DialedDepthCommand>;
 
 /// Dial every connection in `plan`, returning how many sockets were opened.
 ///
@@ -10482,13 +10656,7 @@ struct DialContext<'a> {
     /// The instruments come back with the sender because a swap must name the
     /// OLD one, and only the dial knows which connection got which. Deriving
     /// it later from the selection would be guessing at the pool's packing.
-    out_depth_commands: Option<
-        &'a mut Vec<(
-            DhanEndpointType,
-            tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
-            Vec<SubscribeInstrument>,
-        )>,
-    >,
+    out_depth_commands: Option<&'a mut DialedDepthCommands>,
 }
 
 fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize {
@@ -10507,6 +10675,14 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
     let mut dialed = 0usize;
     for planned in plan.connections {
         let endpoint = planned.slot.endpoint;
+        // The pool-wide slot number this connection occupies, captured beside
+        // the endpoint because the probe register that Arm B of the
+        // unsubscribe probe arms is indexed by it (scope lock, 2026-09-12).
+        // Carried out with the command sender rather than derived later: the
+        // depth-200 pool's packing is the dial's business, and re-deriving it
+        // downstream would be guessing at exactly the mapping that decides
+        // WHICH socket gets torn down.
+        let depth_global_index = planned.slot.global_index;
         let Some(base_url) = base_url_for(endpoint) else {
             error!(
                 code = ErrorCode::WsGapConnectionState.code_str(),
@@ -10613,7 +10789,7 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
                     crate::depth20_ranked_steer::DEPTH_SWAP_COMMAND_CHANNEL_DEPTH,
                 );
                 let held: Vec<SubscribeInstrument> = guard.batches().flatten().copied().collect();
-                depth_vec.push((endpoint, tx, held));
+                depth_vec.push((endpoint, depth_global_index, tx, held));
                 Some(rx)
             }
             (_, existing, _) => existing,
@@ -12614,6 +12790,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             spot_topup,
             ws_audit_tx.clone(),
             seed_tx.clone(),
+            params.depth_unsubscribe_probe,
         ));
     }
 
@@ -14613,6 +14790,12 @@ mod tests {
             LiveSubscriptionCommand::Swap { .. } => {
                 panic!("a top-up sent a Swap — it must only ever Extend")
             }
+            LiveSubscriptionCommand::ProbeUnsubscribe { .. } => {
+                panic!(
+                    "a top-up sent a ProbeUnsubscribe — that command belongs to the\
+                        operator-armed probe on a depth-200 socket, never to a top-up"
+                )
+            }
         }
     }
 
@@ -14633,6 +14816,12 @@ mod tests {
             }
             LiveSubscriptionCommand::Swap { .. } => {
                 panic!("a top-up sent a Swap — it must only ever Extend")
+            }
+            LiveSubscriptionCommand::ProbeUnsubscribe { .. } => {
+                panic!(
+                    "a top-up sent a ProbeUnsubscribe — that command belongs to the\
+                        operator-armed probe on a depth-200 socket, never to a top-up"
+                )
             }
         }
     }
@@ -15714,6 +15903,7 @@ mod tests {
         // The default state on every boot since 2026-07-13: no task, no
         // socket, no behaviour change.
         let handle = spawn_dhan_feed_stack(DhanFeedStackParams {
+            depth_unsubscribe_probe: Default::default(),
             dhan_enabled: false,
             instance_lock_held: Arc::new(AtomicBool::new(false)),
             // A disabled lane never reaches the re-fold, which is exactly why
@@ -23298,16 +23488,12 @@ mod depth_rebalance_wiring_tests {
     fn dialed(
         endpoint: DhanEndpointType,
         instruments: Vec<SubscribeInstrument>,
-    ) -> (
-        DhanEndpointType,
-        tokio::sync::mpsc::Sender<LiveSubscriptionCommand>,
-        Vec<SubscribeInstrument>,
-    ) {
+    ) -> DialedDepthCommand {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         // Keep the receiver alive for the life of the test so a closed channel
         // never masquerades as a filtered one.
         std::mem::forget(rx);
-        (endpoint, tx, instruments)
+        (endpoint, 0, tx, instruments)
     }
 
     /// One end-to-end pass: a folded tick reaches the board, and a snapshot in

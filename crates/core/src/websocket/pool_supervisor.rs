@@ -71,6 +71,7 @@
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use tickvault_common::constants::FEED_UNSUBSCRIBE_TWENTY_DEPTH;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::types::{ExchangeSegment, SecurityId};
 use tickvault_storage::ws_frame_spill::{
@@ -301,6 +302,58 @@ pub const PARK_METRIC: &str = "tv_dhan_ws_park_total";
 /// not have and does not assume. It is a local `/metrics` series only.
 pub const RESPAWN_METRIC: &str = "tv_dhan_ws_park_respawn_total";
 
+/// Counter: a live subscription swap failed on the wire. No labels.
+///
+/// ⚠ THIS IS THE ARM THAT CAN MANUFACTURE A FALSE GHOST, and until
+/// 2026-09-11 it was the only failure path in the whole unsubscribe chain
+/// with no live instrument behind it.
+///
+/// The swap wraps `send_unsubscribe` in [`SWAP_WIRE_BUDGET`] (1 s) while the
+/// transport's own `SUBSCRIBE_SEND_TIMEOUT` is 10 s, so the OUTER budget
+/// always elapses first and the inner future is dropped BEFORE it can
+/// increment `tv_dhan_ws_subscribe_failed_total{reason="unsubscribe_timeout"}`.
+/// On that arm the guard is deliberately NOT reverted (the frame may have
+/// landed), so `held` keeps its advanced belief, the view publishes the
+/// contract as dropped, and a stream that continues reads as a GHOST — one
+/// we caused, not one the vendor caused.
+///
+/// A 2026-09-11 two-session read found these three counters are in NEITHER
+/// the EMF selector NOR seeded, so they had never reached CloudWatch at all.
+/// Their absence was therefore not a zero (the `tv_depth_rows_spilled_total`
+/// lesson, `dhan-rest-only-noise-lock-2026-07-14.md` §2.3o) and the arm was
+/// readable only by luck: the coded `WS-GAP-02` log line beside them.
+/// Seeding is free and is done in `PoolSupervisor::new`; an EMF name is
+/// ~$0.30/mo and needs an operator lever under §2.3n, so it is NOT taken here.
+pub const SWAP_FAILED_METRIC: &str = "tv_dhan_ws_swap_failed_total";
+
+/// Counter: the swap wire failure above was the 1-second budget elapsing.
+///
+/// A strict subset of [`SWAP_FAILED_METRIC`]. Separated because the two mean
+/// different things: a write ERROR is a socket that answered, a TIMEOUT is a
+/// socket that did not — and only the timeout leaves it genuinely unknown
+/// whether Dhan received the unsubscribe. That distinction is what decides
+/// whether a later ghost for the same instrument is vendor evidence or ours.
+pub const SWAP_TIMEOUT_METRIC: &str = "tv_dhan_ws_swap_timeout_total";
+
+/// Counter: the swap unsubscribed successfully and then failed to subscribe,
+/// so the socket is carrying LESS than it should — on depth-200, nothing.
+///
+/// The one member of this family that IS alarmed
+/// (`tv-<env>-errcode-ws-gap-02-swap-emptied-socket`, §2.3m) — and it is
+/// alarmed via its coded LOG line, not via this counter.
+pub const SWAP_EMPTIED_SOCKET_METRIC: &str = "tv_dhan_ws_swap_emptied_socket_total";
+
+/// Counter: a live subscription swap completed both wire calls. No labels.
+///
+/// The SUCCESS member of the swap family, seeded beside its failures so the
+/// pair is a ratio rather than a bare count: failures alone cannot say whether
+/// a quiet session meant a healthy one or a steering loop that never ran.
+pub const SWAP_TOTAL_METRIC: &str = "tv_dhan_ws_swap_total";
+
+/// Counter: a swap was refused before any wire call (budget, ack pending,
+/// unknown socket). No labels.
+pub const SWAP_REFUSED_METRIC: &str = "tv_dhan_ws_swap_refused_total";
+
 /// Counter: frame captured but the bounded ring refused it — the frame is
 /// durable in the WAL, the downstream consumer is behind. Label: `endpoint`.
 pub const RING_FULL_METRIC: &str = "tv_dhan_ws_ring_full_total";
@@ -473,6 +526,19 @@ pub const SUBSCRIBE_DUPLICATE_METRIC: &str = "tv_dhan_ws_subscribe_duplicate_tot
 /// ([`SubscribeGuard::undo_swap`]). In-process only — not EMF-selected; the
 /// coded `warn!` beside the increment is the operator surface.
 pub const SWAP_GUARD_REVERTED_METRIC: &str = "tv_dhan_ws_swap_guard_reverted_total";
+/// Counter: outcomes of the operator-armed unsubscribe probe's Arm A
+/// ([`LiveSubscriptionCommand::ProbeUnsubscribe`]). Label: `outcome`
+/// (`dropped` | `refused` | `wire_failed`).
+///
+/// In-process only — deliberately NOT EMF-selected and deliberately NOT
+/// alarmed. The probe is armed by hand, at most once per socket per session,
+/// and its verdict is read from the support draft it writes; a CloudWatch
+/// series would cost ~$0.30/mo against a September forecast of $142.24 with
+/// the automatic `STOP_EC2_INSTANCES` line at $135.00, and the noise lock's
+/// §2.3n rule requires a LEVER for a new series, not a cost note. Adding one
+/// later is a config-free change; the counter exists now so the number is
+/// there when someone has a lever to spend.
+pub const PROBE_UNSUBSCRIBE_METRIC: &str = "tv_dhan_ws_probe_unsubscribe_total";
 
 // ---------------------------------------------------------------------------
 // Disconnect classification (WS-GAP-01)
@@ -642,6 +708,11 @@ pub enum ConnEvent {
     /// (or never received) the unsubscribe. See [`request_ghost_redial`].
     /// Only meaningful in [`ConnPhase::Live`].
     GhostInstrumentDetected,
+    /// The operator-armed unsubscribe probe asked this socket to close and
+    /// re-dial so the replay can be observed WITHOUT the probed instrument
+    /// ([`request_probe_close`]). Live sockets only; at most once per socket
+    /// per process. Scope lock 2026-09-12, Arm B.
+    ProbeCloseRequested,
     /// Orderly shutdown.
     ShutdownRequested,
 }
@@ -808,6 +879,86 @@ pub fn take_ghost_redial(connection_index: u8) -> bool {
         .is_some_and(|p| p.swap(false, std::sync::atomic::Ordering::AcqRel))
 }
 
+/// A probe close is PENDING for this slot.
+static PROBE_CLOSE_PENDING: [std::sync::atomic::AtomicBool; GHOST_REDIAL_SLOTS] =
+    [const { std::sync::atomic::AtomicBool::new(false) }; GHOST_REDIAL_SLOTS];
+
+/// This slot has ALREADY spent its one probe close this process lifetime.
+///
+/// Never cleared — that is what makes "at most once per socket per session" a
+/// property of the code rather than of a caller's discipline, the same shape
+/// `respawn_budget_allows` uses for the one-respawn budget.
+static PROBE_CLOSE_ARMED: [std::sync::atomic::AtomicBool; GHOST_REDIAL_SLOTS] =
+    [const { std::sync::atomic::AtomicBool::new(false) }; GHOST_REDIAL_SLOTS];
+
+/// Why a probe-close request was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeCloseRefusal {
+    /// The index is past the register (never a panic — counted by the caller).
+    OutOfRange,
+    /// This slot already spent its one probe close this process lifetime.
+    AlreadyArmed,
+}
+
+impl ProbeCloseRefusal {
+    /// Stable lowercase tag for logs and metric labels.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OutOfRange => "out_of_range",
+            Self::AlreadyArmed => "already_armed",
+        }
+    }
+}
+
+/// Asks the connection at `connection_index` to close and re-dial because the
+/// operator-armed unsubscribe probe (scope lock 2026-09-12, Arm B) wants to
+/// observe the replay WITHOUT the probed instrument.
+///
+/// # Why this is a register and not a command
+///
+/// The same reason the ghost redial is: the connection task owns the socket
+/// and is parked on `recv`, so the only way in that does not add a `select!`
+/// arm is a flag it already polls on its one-second idle tick. One relaxed
+/// swap, no allocation, no lock, O(1).
+///
+/// # Why it can fire at most once per socket per process
+///
+/// [`PROBE_CLOSE_ARMED`] is never cleared. The probe is a diagnostic, not a
+/// mechanism: a bug that called this in a loop would otherwise close a
+/// production socket repeatedly, and — because `ReconnectReason::ProbeClose`
+/// is exempt from the flap record — the damper would not slow it down. The
+/// one-shot latch is what makes that exemption safe to grant.
+pub fn request_probe_close(connection_index: u8) -> Result<(), ProbeCloseRefusal> {
+    let idx = usize::from(connection_index);
+    let (Some(pending), Some(armed)) = (PROBE_CLOSE_PENDING.get(idx), PROBE_CLOSE_ARMED.get(idx))
+    else {
+        return Err(ProbeCloseRefusal::OutOfRange);
+    };
+    if armed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return Err(ProbeCloseRefusal::AlreadyArmed);
+    }
+    pending.store(true, std::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+/// Takes (and clears) a pending probe close for `connection_index`.
+#[must_use]
+pub fn take_probe_close(connection_index: u8) -> bool {
+    PROBE_CLOSE_PENDING
+        .get(usize::from(connection_index))
+        .is_some_and(|p| p.swap(false, std::sync::atomic::Ordering::AcqRel))
+}
+
+/// Whether this slot has spent its one probe close. Read-only; `false` for an
+/// out-of-range index.
+#[must_use]
+pub fn probe_close_spent(connection_index: u8) -> bool {
+    PROBE_CLOSE_ARMED
+        .get(usize::from(connection_index))
+        .is_some_and(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Why a connection stopped permanently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParkReason {
@@ -957,17 +1108,26 @@ pub enum ReconnectReason {
     /// ([`ConnEvent::GhostInstrumentDetected`]); the redial replays the
     /// guard's set so the vendor's view matches ours again.
     GhostInstrument,
+    /// The operator-armed unsubscribe probe asked for this socket to be closed
+    /// and re-dialed so the replay can be observed WITHOUT the probed
+    /// instrument (scope lock, 2026-09-12, Arm B).
+    ///
+    /// This is the ONLY reason that is not a fault, and it is the only one
+    /// [`ReconnectReason::records_flap`] answers `false` for. See that method
+    /// for why that exemption exists and why it is deliberately narrow.
+    ProbeClose,
 }
 
 impl ReconnectReason {
     /// Every reason, for pre-registration and the label-uniqueness pin.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::DialFailed,
         Self::SubscribeFailed,
         Self::Disconnected,
         Self::TokenStale,
         Self::IdleSilence,
         Self::GhostInstrument,
+        Self::ProbeClose,
     ];
 
     /// Stable lowercase tag for logs and metric labels.
@@ -980,7 +1140,37 @@ impl ReconnectReason {
             Self::TokenStale => "token_stale",
             Self::IdleSilence => "idle_silence",
             Self::GhostInstrument => "ghost_instrument",
+            Self::ProbeClose => "probe_close",
         }
+    }
+
+    /// Whether a redial for this reason enters the socket's flap history.
+    ///
+    /// # Why this exists, and why exactly one reason is exempt
+    ///
+    /// `ConnectionSupervisor::enter_backoff` is the ONE site every redial
+    /// passes through, and until 2026-09-12 it recorded a flap
+    /// unconditionally — correct, because until then every redial was a
+    /// FAULT, and the damper exists to slow a socket that keeps faulting.
+    ///
+    /// [`Self::ProbeClose`] is the first redial that is not a fault: the
+    /// operator armed it, it happens once per session, and it is the
+    /// measurement rather than a symptom. Recording it would spend one of the
+    /// six slots in [`crate::websocket::reconnect_ladder::FLAP_WINDOW_MS`] on
+    /// something we asked for, so a genuine fault minutes later would be
+    /// damped by our own diagnostic — the damper would be reacting to the
+    /// observer.
+    ///
+    /// The exemption is deliberately expressed HERE rather than as a second
+    /// code path around `enter_backoff`: the single-choke-point property is
+    /// what makes the audit row agree with the counter, and a bypass would
+    /// destroy it. Everything else about a probe redial is unchanged — the
+    /// attempt counter advances, the phase drops to backoff, health is
+    /// reset, and the reconnect counter increments under `probe_close`, so
+    /// the redial is never invisible.
+    #[must_use]
+    pub const fn records_flap(self) -> bool {
+        !matches!(self, Self::ProbeClose)
     }
 }
 
@@ -1440,6 +1630,29 @@ impl ConnectionSupervisor {
                 );
                 self.schedule_redial(ReconnectReason::GhostInstrument, now)
             }
+
+            ConnEvent::ProbeCloseRequested => {
+                // Same liveness gate as the ghost arm, for the same reason: a
+                // socket that is not Live has nothing to stop delivering, so
+                // closing it would measure nothing and would still cost a
+                // dial.
+                if self.phase != ConnPhase::Live {
+                    return SupervisorAction::Continue;
+                }
+                // Deliberately NOT counted in `self.reconnects`: that figure
+                // is the socket's fault history, and this close is the
+                // operator's measurement. It is still visible — the reconnect
+                // counter increments under `probe_close` in `enter_backoff`.
+                info!(
+                    endpoint = self.slot.endpoint.as_str(),
+                    pool_index = self.slot.pool_index,
+                    source = "probe_close",
+                    frames_on_this_connection = self.frames,
+                    "operator-armed unsubscribe probe is closing this socket so the replay can \
+                     be observed without the probed instrument"
+                );
+                self.schedule_redial(ReconnectReason::ProbeClose, now)
+            }
         }
     }
 
@@ -1574,7 +1787,21 @@ impl ConnectionSupervisor {
         self.phase = ConnPhase::Backoff;
         self.proven_healthy = false;
         self.healthy_since = None;
-        self.record_redial(now);
+        // The flap history records FAULTS, not everything that dials. Every
+        // reason but one is a fault and is recorded; the operator-armed probe
+        // close is the measurement itself, and charging it to the damper would
+        // let a diagnostic slow down the recovery of a genuine failure minutes
+        // later. The test is a `const fn` on the reason rather than a branch
+        // spelled out here, so a future reason cannot quietly inherit the
+        // exemption by resembling this one.
+        //
+        // This stays INSIDE `enter_backoff` on purpose: it is the one site
+        // every redial passes through, and a second path that skipped it to
+        // avoid the record would break the property that makes the audit row
+        // and the counter agree.
+        if reason.records_flap() {
+            self.record_redial(now);
+        }
         metrics::counter!(
             RECONNECT_METRIC,
             "endpoint" => self.slot.endpoint.as_str(),
@@ -1611,13 +1838,28 @@ impl ConnectionSupervisor {
     ///
     /// # Bounded by DATA, not by a branch that cannot be taken
     ///
-    /// Today [`ParkReason::allows_one_respawn`] answers `false` for every
-    /// reason, so the respawn arm is unreachable in production and the counter
-    /// below registers no series at all (see `PoolSupervisor::new`, which
-    /// pre-registers only reasons that can actually emit — the same discipline
-    /// that keeps `FlapVerdict::Ladder` off the damper counter). That is the
-    /// honest shape: the eligibility TABLE is empty, the mechanism is not
-    /// broken, and nothing publishes a metric that can never move.
+    /// The eligibility TABLE is the bound, not a branch that cannot be taken:
+    /// `PoolSupervisor::new` pre-registers only reasons that can actually emit
+    /// — the same discipline that keeps `FlapVerdict::Ladder` off the damper
+    /// counter — so the counter below never publishes a series that can never
+    /// move.
+    ///
+    /// ⚠ CORRECTED 2026-09-11. This paragraph read: *"Today
+    /// `allows_one_respawn` answers `false` for every reason, so the respawn
+    /// arm is unreachable in production and the counter below registers no
+    /// series at all."* That was true when written and stopped being true on
+    /// **2026-09-10**, when 804 left the Fatal arm:
+    /// [`ParkReason::SubscriptionRejected`] now answers `true` and is the one
+    /// eligible reason in this tree. So the respawn arm IS reachable, and
+    /// exactly one `RESPAWN_METRIC` series per endpoint registers its
+    /// baseline.
+    ///
+    /// The DESIGN is untouched and it worked exactly as the old text promised
+    /// — the pre-registration loop is data-driven, so the baseline appeared
+    /// with no further edit the day a reason became eligible. Only the
+    /// present-tense claim was stale, and it was stale in the reassuring
+    /// direction: a reader checking whether a respawn is observable would have
+    /// concluded it is not, and gone to build a counter that already exists.
     fn park(&mut self, reason: ParkReason, now: Instant) -> SupervisorAction {
         if respawn_budget_allows(reason.allows_one_respawn(), self.respawn_used) {
             // One-shot: consumed BEFORE the redial, so a second fatal on this
@@ -2410,6 +2652,39 @@ pub enum LiveSubscriptionCommand {
         /// the answer; a dropped receiver is ignored.
         ack: Option<tokio::sync::oneshot::Sender<SwapOutcome>>,
     },
+    /// Unsubscribe ONE instrument and put NOTHING in its place — the
+    /// operator-armed unsubscribe probe, Arm A (scope lock, 2026-09-12).
+    ///
+    /// This is deliberately NOT a [`Self::Swap`] with an absent `new`.
+    /// A swap replaces; this EMPTIES, and the difference is the whole
+    /// measurement: Arm A asks whether Dhan honours request code
+    /// [`FEED_UNSUBSCRIBE_TWENTY_DEPTH`] at all, and the only way to read
+    /// that answer is silence on a socket that should now be carrying
+    /// nothing. A replacement instrument would keep frames flowing and make
+    /// the question unanswerable.
+    ///
+    /// It is depth-200-only BY CONSTRUCTION rather than by a caller's
+    /// discipline: the handler refuses unless the guard holds EXACTLY ONE
+    /// instrument and that instrument IS `drop_this`. A depth-20 socket
+    /// holds up to 50, so it cannot satisfy that condition, and a main-feed
+    /// socket holds thousands. Nothing has to remember the rule.
+    ///
+    /// There is no matching `ProbeRestore`: the restore is an ordinary
+    /// [`Self::Extend`] of the same instrument, which already exists, is
+    /// already acked, and already goes through `try_extend`'s cap check.
+    ProbeUnsubscribe {
+        /// The one instrument to drop. Must be the ONLY instrument this
+        /// connection holds, or the command is refused fail-closed and
+        /// nothing reaches the wire.
+        drop_this: SubscribeInstrument,
+        /// Where the connection reports what actually happened.
+        ///
+        /// Unlike `Extend` and `Swap` this is not optional in practice — a
+        /// probe whose outcome nobody reads has measured nothing — but it is
+        /// typed `Option` for the same reason theirs are: tests that only
+        /// care about the wire effect should not have to build a channel.
+        ack: Option<tokio::sync::oneshot::Sender<ProbeUnsubscribeOutcome>>,
+    },
 }
 
 /// What a [`LiveSubscriptionCommand::Swap`] actually did to the socket.
@@ -2506,6 +2781,111 @@ fn answer_swap(ack: Option<tokio::sync::oneshot::Sender<SwapOutcome>>, outcome: 
     {
         // Receiver gone: the caller stopped waiting. Nothing to do and
         // nothing lost — the guard is the truth and it is unchanged by this.
+    }
+}
+
+/// What a [`LiveSubscriptionCommand::ProbeUnsubscribe`] actually did.
+///
+/// The probe's whole value is that its verdict is admissible, so this type
+/// distinguishes the three outcomes a caller must treat differently rather
+/// than collapsing them into a bool:
+///
+/// | Outcome | Socket now holds | Restore needed | Watch admissible |
+/// |---|---|---|---|
+/// | `Dropped` | nothing (per the guard) | YES | yes |
+/// | `Refused` | what it held before | no | NO — nothing was sent |
+/// | `WireFailed` | what it held before | no | NO — nothing landed |
+///
+/// `Refused` and `WireFailed` are both clean no-ops, and that is deliberate:
+/// the handler sends the frame BEFORE it touches the guard, so a wire failure
+/// cannot leave the guard claiming an empty socket that is still subscribed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeUnsubscribeOutcome {
+    /// The unsubscribe frame reached the wire and the guard was emptied.
+    ///
+    /// This says the REQUEST went out — never that Dhan honoured it. Whether
+    /// it did is exactly what the watch window measures, and the reason the
+    /// probe exists: `send_unsubscribe` is fire-and-forget and the vendor
+    /// sends no acknowledgement.
+    Dropped,
+    /// The handler refused before touching the wire. `reason` is one of the
+    /// `ProbeUnsubscribeOutcome::REASON_*` constants.
+    ///
+    /// Nothing was sent and nothing changed, so the caller must NOT run a
+    /// restore and must NOT record a verdict.
+    Refused { reason: &'static str },
+    /// The frame did not reach the wire (the socket answered with an error,
+    /// or the write did not finish inside [`SWAP_WIRE_BUDGET`]).
+    ///
+    /// The guard is UNCHANGED, so the socket's subscription is whatever it
+    /// was and a redial replays it. No restore, no verdict.
+    WireFailed {
+        /// True when the write TIMED OUT rather than answering an error.
+        ///
+        /// Carried because the two are not the same fact: an error means the
+        /// frame demonstrably did not go, while a timeout means it MAY have
+        /// landed late — and a probe that later sees silence after a timeout
+        /// cannot tell "Dhan honoured a frame we thought failed" from "the
+        /// book went quiet". Either way the verdict is inadmissible; this
+        /// says which kind of inadmissible, so the support draft can say so.
+        timed_out: bool,
+    },
+}
+
+impl ProbeUnsubscribeOutcome {
+    /// The guard does not hold exactly one instrument.
+    ///
+    /// This is what makes the command depth-200-only without a flag: a
+    /// depth-20 socket holds up to 50 and a main-feed socket thousands, so
+    /// neither can ever pass. Also the state a socket is in mid-redial, when
+    /// its set has been replayed but not confirmed.
+    pub const REASON_NOT_EXACTLY_ONE: &'static str = "not_exactly_one";
+    /// The one instrument this socket holds is NOT the one the probe named.
+    ///
+    /// The ranked steering swaps depth-200 sockets every minute, so between
+    /// arming the probe and this command being drained the socket can
+    /// legitimately be carrying a different contract. Refusing is the only
+    /// safe answer: dropping whatever happens to be there would measure one
+    /// contract while the probe's baseline was taken on another.
+    pub const REASON_DIFFERENT_INSTRUMENT: &'static str = "different_instrument";
+
+    /// Whether the caller must run the restore step.
+    ///
+    /// Exactly one outcome leaves the socket emptied, and spelling it as a
+    /// method rather than leaving each caller to match keeps a future fourth
+    /// variant from silently defaulting to "no restore" — which would strand
+    /// a depth-200 socket carrying nothing for the rest of the session.
+    #[must_use]
+    pub const fn needs_restore(&self) -> bool {
+        matches!(self, Self::Dropped)
+    }
+
+    /// Whether a watch window started after this outcome can produce a
+    /// verdict at all.
+    ///
+    /// The same condition as [`Self::needs_restore`] today, and deliberately
+    /// a SEPARATE method: they answer different questions, and a future
+    /// outcome could need one without the other.
+    #[must_use]
+    pub const fn verdict_admissible(&self) -> bool {
+        matches!(self, Self::Dropped)
+    }
+}
+
+/// Delivers a probe unsubscribe's verdict to whoever armed it.
+///
+/// Same contract as [`answer_swap`]: a dropped receiver is not an error.
+fn answer_probe_unsubscribe(
+    ack: Option<tokio::sync::oneshot::Sender<ProbeUnsubscribeOutcome>>,
+    outcome: ProbeUnsubscribeOutcome,
+) {
+    if let Some(ack) = ack
+        && ack.send(outcome).is_err()
+    {
+        // Receiver gone: the probe was abandoned. The guard is already
+        // truthful either way, and the restore is the caller's to run — a
+        // caller that stopped listening has, by construction, not started a
+        // watch window to invalidate.
     }
 }
 
@@ -3278,14 +3658,22 @@ impl PoolSupervisor {
                 .increment(0);
             }
             // Same baseline discipline for the respawn counter, and the same
-            // carve-out: only reasons that can ACTUALLY emit are registered.
-            // `allows_one_respawn` answers `false` for every reason today, so
-            // this registers nothing at all — which is the correct outcome, not
-            // a gap. A pre-registered `tv_dhan_ws_park_respawn_total` sitting
-            // at zero forever would be a series that can never move, the exact
-            // lie the `FlapVerdict::Ladder` carve-out below refuses to tell.
-            // The day a reason becomes eligible, its baseline appears here with
-            // no further edit.
+            // carve-out: only reasons that can ACTUALLY emit are registered. A
+            // pre-registered `tv_dhan_ws_park_respawn_total` sitting at zero
+            // forever would be a series that can never move, the exact lie the
+            // `FlapVerdict::Ladder` carve-out below refuses to tell.
+            //
+            // ⚠ CORRECTED 2026-09-11. This comment read "`allows_one_respawn`
+            // answers `false` for every reason today, so this registers nothing
+            // at all", and closed "the day a reason becomes eligible, its
+            // baseline appears here with no further edit". That day was
+            // 2026-09-10: 804 left the Fatal arm and
+            // `ParkReason::SubscriptionRejected` now answers `true`. The
+            // promise held — this loop is data-driven, so exactly one series
+            // per endpoint began registering with no code change. The only
+            // thing that went stale is the sentence, and it went stale in the
+            // reassuring direction, telling a reader the counter can never
+            // move at the moment it started moving.
             for reason in ParkReason::ALL {
                 if reason.allows_one_respawn() {
                     metrics::counter!(
@@ -3310,6 +3698,38 @@ impl PoolSupervisor {
                     .increment(0);
                 }
             }
+        }
+        // The SWAP WIRE-OUTCOME family, seeded 2026-09-11 after a two-session
+        // read found the WHOLE family had never reached CloudWatch.
+        //
+        // These six carry no labels, so they are seeded once rather than per
+        // endpoint. None is in the EMF selector, so seeding does not make them
+        // alarmable — it makes them HONEST at the local `/metrics` endpoint and
+        // at the scrape boundary, where an unseeded counter's first increment
+        // is the sample the agent discards.
+        //
+        // Why this family specifically. `SWAP_FAILED_METRIC` and
+        // `SWAP_TIMEOUT_METRIC` sit on the one arm that can manufacture a FALSE
+        // ghost: the swap bounds `send_unsubscribe` at `SWAP_WIRE_BUDGET` (1 s)
+        // while the transport's own `SUBSCRIBE_SEND_TIMEOUT` is 10 s, so the
+        // outer budget always wins and the inner future is dropped before it
+        // can increment
+        // `tv_dhan_ws_subscribe_failed_total{reason="unsubscribe_timeout"}`.
+        // That reason is therefore VACUOUS in production — a zero on it is a
+        // tautology, not a measurement, and it must never be cited as evidence
+        // that an unsubscribe reached the wire. The three reachable
+        // `unsubscribe_*` reasons and the coded `WS-GAP-02` log lines are what
+        // carry that claim.
+        for metric in [
+            SWAP_TOTAL_METRIC,
+            SWAP_REFUSED_METRIC,
+            SWAP_FAILED_METRIC,
+            SWAP_TIMEOUT_METRIC,
+            SWAP_EMPTIED_SOCKET_METRIC,
+            SWAP_GUARD_REVERTED_METRIC,
+        ] {
+            // SWAP_WIRE_SEED_ANCHOR — deleting this line deletes the baseline.
+            metrics::counter!(metric).increment(0);
         }
         Self {
             budget: PoolBudget::new(),
@@ -4254,7 +4674,61 @@ where
                                 )
                                 .await
                                 {
-                                    Ok(Ok(())) => unsubscribe_succeeded = true,
+                                    Ok(Ok(())) => {
+                                        unsubscribe_succeeded = true;
+                                        // THE OTHER HALF OF THE GHOST EVIDENCE.
+                                        //
+                                        // Until 2026-09-11 this arm logged
+                                        // NOTHING. Only the refusal arm below
+                                        // named an instrument, so every one of
+                                        // the 160 unsubscribes Dhan ignored
+                                        // across the code-25 and code-24
+                                        // sessions took the SILENT path: we
+                                        // could see a socket still delivering a
+                                        // contract we had dropped, and we could
+                                        // not say which contract, nor when we
+                                        // had asked, nor with which request
+                                        // code.
+                                        //
+                                        // `Ok` here means the frame reached the
+                                        // wire, NOT that Dhan honoured it —
+                                        // `send_unsubscribe` is fire-and-forget
+                                        // and the vendor sends no ack. That is
+                                        // precisely why this line is worth
+                                        // writing: paired against the
+                                        // `unsubscribe_ignored` line on the
+                                        // drain, and against `market_depth`
+                                        // rows stamped after this instant, it
+                                        // is what turns "the socket is still
+                                        // delivering something" into a named
+                                        // contract with a request time and a
+                                        // request code — the shape a vendor
+                                        // ticket needs, and the shape our own
+                                        // telemetry could not produce.
+                                        //
+                                        // `request_code` is carried explicitly
+                                        // rather than left to be inferred from
+                                        // the build: 25 and 24 have BOTH now
+                                        // shipped, and a session's evidence is
+                                        // worthless if the reader has to guess
+                                        // which binary produced it.
+                                        //
+                                        // ~9,500 lines a session at the
+                                        // measured swap rate — about 24 a
+                                        // minute, and only while swaps are
+                                        // actually being planned.
+                                        info!(
+                                            source = "depth_unsubscribe_sent",
+                                            endpoint = supervisor.slot().endpoint.as_str(),
+                                            pool_index = supervisor.slot().pool_index,
+                                            security_id = drop_this.security_id,
+                                            segment = drop_this.segment.as_str(),
+                                            request_code = FEED_UNSUBSCRIBE_TWENTY_DEPTH,
+                                            "depth unsubscribe written to the wire — the vendor \
+                                             sends no acknowledgement, so this records only that \
+                                             we asked, and when"
+                                        );
+                                    }
                                     Ok(Err(_)) => {
                                         wire_failed = true;
                                         // The wire REFUSED the unsubscribe: nothing
@@ -4286,6 +4760,36 @@ where
                                     Err(_elapsed) => {
                                         wire_failed = true;
                                         wire_timed_out = true;
+                                        // THE AMBIGUOUS ARM, and until now the
+                                        // silent one.
+                                        //
+                                        // A timeout is deliberately NOT reverted
+                                        // above because the frame MAY have landed.
+                                        // That is exactly why it needs a record: a
+                                        // landed-then-ignored unsubscribe produces
+                                        // a ghost, and without this line that ghost
+                                        // has no ask to pair against and reads as
+                                        // the vendor ignoring a request we cannot
+                                        // show we made.
+                                        //
+                                        // `warn!`, not `info!`: unlike the success
+                                        // arm this is a degraded outcome, and it is
+                                        // rare — the budget is a full second and
+                                        // the measured swap rate is ~24 a minute.
+                                        warn!(
+                                            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                                            source = "depth_unsubscribe_timed_out",
+                                            endpoint = supervisor.slot().endpoint.as_str(),
+                                            pool_index = supervisor.slot().pool_index,
+                                            security_id = drop_this.security_id,
+                                            segment = drop_this.segment.as_str(),
+                                            request_code = FEED_UNSUBSCRIBE_TWENTY_DEPTH,
+                                            "depth unsubscribe timed out on the wire — it MAY have \
+                                             landed, so the guard is deliberately not reverted and \
+                                             this instrument may or may not still be subscribed; a \
+                                             later ghost for it is not evidence the vendor ignored \
+                                             a request we know was sent"
+                                        );
                                     }
                                 }
                             }
@@ -4485,7 +4989,7 @@ where
                                      emptied, because a redial is idempotent and an empty socket is \
                                      not)."
                                 );
-                                metrics::counter!("tv_dhan_ws_swap_failed_total").increment(1);
+                                metrics::counter!(SWAP_FAILED_METRIC).increment(1);
                                 if wire_timed_out {
                                     // Separated from an ordinary write error
                                     // because they mean different things: a
@@ -4493,11 +4997,10 @@ where
                                     // a timeout is a socket that did not —
                                     // and the second is the one that also
                                     // cost the drain a full second.
-                                    metrics::counter!("tv_dhan_ws_swap_timeout_total").increment(1);
+                                    metrics::counter!(SWAP_TIMEOUT_METRIC).increment(1);
                                 }
                                 if lost_instruments {
-                                    metrics::counter!("tv_dhan_ws_swap_emptied_socket_total")
-                                        .increment(1);
+                                    metrics::counter!(SWAP_EMPTIED_SOCKET_METRIC).increment(1);
                                     // Told BEFORE the return, or the ack would
                                     // be dropped unanswered and the caller
                                     // would read that as "the task died".
@@ -4534,7 +5037,7 @@ where
                                     "live subscription swapped — this socket now carries the \
                                      current at-the-money contract without a re-dial"
                                 );
-                                metrics::counter!("tv_dhan_ws_swap_total").increment(1);
+                                metrics::counter!(SWAP_TOTAL_METRIC).increment(1);
                                 answer_swap(ack, SwapOutcome::Held);
                             }
                         }
@@ -4562,8 +5065,180 @@ where
                                  it has. That strike is no longer at-the-money and nothing \
                                  downstream can tell."
                             );
-                            metrics::counter!("tv_dhan_ws_swap_refused_total").increment(1);
+                            metrics::counter!(SWAP_REFUSED_METRIC).increment(1);
                         }
+                    }
+                }
+                Ok(LiveSubscriptionCommand::ProbeUnsubscribe { drop_this, ack }) => {
+                    // ARM A OF THE UNSUBSCRIBE PROBE (scope lock, 2026-09-12).
+                    //
+                    // Written as nested `if`/`else` rather than early
+                    // `continue`s ON PURPOSE: a `continue` here re-enters the
+                    // drain without reaching the `tokio::select!` below, and
+                    // that select is the only thing polling `recv()` — which
+                    // is what emits the automatic pong. Skipping it once is
+                    // harmless and skipping it in a shape someone later
+                    // copies is not, so this arm falls through like every
+                    // other arm in the match.
+                    //
+                    // FAIL-CLOSED FIRST, and the condition is what makes this
+                    // depth-200-only without a flag anywhere: the guard must
+                    // hold EXACTLY ONE instrument and it must be the one the
+                    // probe named. A depth-20 socket holds up to 50 and a
+                    // main-feed socket thousands, so neither can pass; and on
+                    // a depth-200 socket the ranked steering can legitimately
+                    // have swapped the strike between the operator arming the
+                    // probe and this command being drained, which the second
+                    // half catches.
+                    //
+                    // Dropping "whatever this socket happens to hold" would
+                    // measure a contract the baseline was never taken on —
+                    // and a probe with an inadmissible baseline is worse than
+                    // no probe, because it still produces a verdict.
+                    let held_one = guard.len() == 1;
+                    let holds_named = guard
+                        .batches()
+                        .flatten()
+                        .next()
+                        .copied()
+                        .is_some_and(|held| held == drop_this);
+                    if held_one && holds_named {
+                        // WIRE FIRST, GUARD SECOND — the opposite order from
+                        // `try_swap`, and deliberately so.
+                        //
+                        // A swap records its intent in the guard BEFORE the
+                        // wire moves, because the guard IS the reconnect
+                        // replay and a swap wants the redial to land the NEW
+                        // strike. This command has no new strike: if the frame
+                        // does not reach the wire there is nothing to replay
+                        // and nothing to recover, so the only correct outcome
+                        // is a clean no-op — which is exactly what leaving the
+                        // guard untouched gives.
+                        //
+                        // Emptying the guard first would invert the failure: a
+                        // refused write would leave the guard claiming an empty
+                        // socket that is in fact still subscribed, the restore
+                        // would then `try_extend` an instrument the socket
+                        // already holds, and Dhan answers a duplicate subscribe
+                        // with 804 — which costs the slot its one re-dial and
+                        // can park it for the session. The probe would have
+                        // broken the socket it was measuring.
+                        let mut timed_out = false;
+                        let sent = match tokio::time::timeout(
+                            SWAP_WIRE_BUDGET,
+                            socket.send_unsubscribe(&[drop_this]),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => true,
+                            Ok(Err(_)) => false,
+                            Err(_elapsed) => {
+                                timed_out = true;
+                                false
+                            }
+                        };
+                        if sent {
+                            // The frame is out. Empty the guard so this
+                            // socket's subscription intent matches what was
+                            // just asked for.
+                            //
+                            // ⚠ THE CONSEQUENCE THE CALLER MUST HANDLE, stated
+                            // here because it is the one way Arm A can lie:
+                            // the guard IS the reconnect replay, so if this
+                            // socket redials during the watch window it comes
+                            // back holding NOTHING, and the silence that
+                            // follows is OUR doing rather than the vendor's —
+                            // a false "the unsubscribe worked".
+                            //
+                            // The alternative is worse, which is why this is
+                            // the choice: leaving the guard naming the
+                            // instrument makes a redial RE-SUBSCRIBE it,
+                            // frames resume, and the probe reports "the vendor
+                            // ignored our unsubscribe" when in fact our own
+                            // replay undid it. That is the negative finding a
+                            // vendor ticket would be built on, manufactured by
+                            // our own code.
+                            //
+                            // Both need the same defence and the caller owns
+                            // it: record `guard.generation()` when the probe is
+                            // armed and invalidate the verdict if it moved.
+                            // `generation` bumps on every confirmed subscribe,
+                            // so a redial is visible.
+                            guard.truncate_to(0);
+                            answer_probe_unsubscribe(ack, ProbeUnsubscribeOutcome::Dropped);
+                            metrics::counter!(PROBE_UNSUBSCRIBE_METRIC, "outcome" => "dropped")
+                                .increment(1);
+                            // `info!`, not `warn!`: an emptied depth-200 socket
+                            // is alarming everywhere else in this file and is
+                            // the INTENDED state here, for the length of the
+                            // watch window. The line carries the request code
+                            // explicitly for the reason the swap's does — 25
+                            // and 24 have both shipped, and evidence a reader
+                            // has to date-match to a binary is not evidence.
+                            info!(
+                                source = "probe_unsubscribe_sent",
+                                endpoint = supervisor.slot().endpoint.as_str(),
+                                pool_index = supervisor.slot().pool_index,
+                                security_id = drop_this.security_id,
+                                segment = drop_this.segment.as_str(),
+                                request_code = FEED_UNSUBSCRIBE_TWENTY_DEPTH,
+                                generation = guard.generation(),
+                                "unsubscribe probe: frame written to the wire and this socket's \
+                                 subscription set emptied. Frames arriving for this instrument \
+                                 from now on are the vendor ignoring the request — that is the \
+                                 measurement."
+                            );
+                        } else {
+                            answer_probe_unsubscribe(
+                                ack,
+                                ProbeUnsubscribeOutcome::WireFailed { timed_out },
+                            );
+                            metrics::counter!(PROBE_UNSUBSCRIBE_METRIC, "outcome" => "wire_failed")
+                                .increment(1);
+                            // NO redial is scheduled here, and that is the
+                            // difference from the swap's `swap_emptied_socket`
+                            // arm. That arm redials because the socket was left
+                            // holding NOTHING and would otherwise pong its way
+                            // through the session delivering no data. Here the
+                            // guard was never touched: the socket holds what it
+                            // held, is still delivering it, and a redial would
+                            // cost a real gap to fix a problem that does not
+                            // exist.
+                            warn!(
+                                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                                source = "probe_unsubscribe_wire_failed",
+                                endpoint = supervisor.slot().endpoint.as_str(),
+                                pool_index = supervisor.slot().pool_index,
+                                security_id = drop_this.security_id,
+                                segment = drop_this.segment.as_str(),
+                                timed_out,
+                                "unsubscribe probe could not put its frame on the wire — the \
+                                 guard is unchanged, this socket still carries the instrument, \
+                                 and no verdict may be recorded. A TIMEOUT is not proof the \
+                                 frame never landed, which is itself why the verdict is \
+                                 inadmissible."
+                            );
+                        }
+                    } else {
+                        let reason = if held_one {
+                            ProbeUnsubscribeOutcome::REASON_DIFFERENT_INSTRUMENT
+                        } else {
+                            ProbeUnsubscribeOutcome::REASON_NOT_EXACTLY_ONE
+                        };
+                        answer_probe_unsubscribe(ack, ProbeUnsubscribeOutcome::Refused { reason });
+                        metrics::counter!(PROBE_UNSUBSCRIBE_METRIC, "outcome" => "refused")
+                            .increment(1);
+                        warn!(
+                            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                            source = "probe_unsubscribe_refused",
+                            endpoint = supervisor.slot().endpoint.as_str(),
+                            pool_index = supervisor.slot().pool_index,
+                            held = guard.len(),
+                            reason,
+                            "unsubscribe probe REFUSED before the wire — this socket does not \
+                             hold exactly the one instrument the probe named, so nothing was \
+                             sent and nothing changed. No verdict may be recorded from this."
+                        );
                     }
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
@@ -4751,6 +5426,17 @@ where
                     && take_ghost_redial(supervisor.slot().global_index)
                 {
                     action = supervisor.on_event(ConnEvent::GhostInstrumentDetected, Instant::now());
+                }
+                // The probe-close register, read on the same tick and AFTER
+                // the ghost register on purpose: if a socket has both pending,
+                // the ghost is the one that matters — it is a real vendor
+                // failure, while the probe is a diagnostic that can be re-armed
+                // on the next session. Taking the probe first would let a
+                // measurement pre-empt a fault.
+                if action == SupervisorAction::Continue
+                    && take_probe_close(supervisor.slot().global_index)
+                {
+                    action = supervisor.on_event(ConnEvent::ProbeCloseRequested, Instant::now());
                 }
             }
         }
@@ -5387,9 +6073,12 @@ mod tests {
     /// planner refuses the WHOLE pool rather than truncating. So when Dhan
     /// answers 804, the count that is over the cap is THEIRS, not ours — an
     /// unsubscribe they ignored leaves them holding instruments we no longer
-    /// count. Measured 2026-09-10: 20 ignored unsubscribes and 10 ghost
-    /// redials in 30 minutes, on the very code (25) that was proven wrong the
-    /// same day.
+    /// count. Measured 2026-09-11 by re-query of the 2026-09-10 session: 80
+    /// ignored unsubscribes and 80 ghost redials between 09:20:09 and 10:46:11
+    /// IST, across ALL TEN depth sockets and BOTH endpoints, on the very code
+    /// (25) that was proven wrong the same day. (An earlier version of this
+    /// comment said "20 ... and 10 ... in 30 minutes" — that figure matches no
+    /// window and is withdrawn.)
     ///
     /// A FRESH connection resets the vendor's per-connection count. That is
     /// precisely the thing the old reasoning said could not change, and it is
@@ -5711,6 +6400,150 @@ mod tests {
         assert_eq!(
             delay, 0,
             "a recovered socket gets its instant retry back once the window has passed"
+        );
+    }
+
+    /// The operator-armed probe close must not spend the damper's budget.
+    ///
+    /// Scope lock 2026-09-12, finding 2 of the Phase F refusal: `enter_backoff`
+    /// recorded a flap unconditionally, so a deliberate diagnostic close would
+    /// charge itself to the ceiling and damp a GENUINE fault minutes later.
+    #[test]
+    fn a_probe_close_redial_never_enters_the_flap_history() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::Depth200, 0, now);
+
+        // Far more probe closes than the ceiling would ever tolerate, all
+        // inside one window — the damper must still see an empty history.
+        for _ in 0..=(FLAP_REDIAL_CEILING + 2) {
+            let _ = s.schedule_redial(ReconnectReason::ProbeClose, now);
+        }
+
+        assert_eq!(
+            s.recent_redial_count(now),
+            0,
+            "a probe close is the measurement, not a fault; charging it to the flap window \
+             would let a diagnostic slow the recovery of a real failure"
+        );
+    }
+
+    /// The inverse, so the test above cannot pass vacuously: every OTHER
+    /// reason still records, and still reaches the ceiling.
+    #[test]
+    fn every_reason_except_the_probe_close_still_records_a_flap() {
+        let now = t0();
+        for reason in ReconnectReason::ALL {
+            if reason == ReconnectReason::ProbeClose {
+                continue;
+            }
+            let mut s = sup(DhanEndpointType::Depth200, 0, now);
+            let _ = s.schedule_redial(reason, now);
+            assert_eq!(
+                s.recent_redial_count(now),
+                1,
+                "{} is a fault and MUST be recorded",
+                reason.as_str()
+            );
+        }
+    }
+
+    /// A probe close mixed into real faults must not erase or mask them —
+    /// the exemption applies to its own redial and to nothing else.
+    #[test]
+    fn a_probe_close_does_not_hide_the_faults_around_it() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::Depth200, 0, now);
+
+        let _ = s.schedule_redial(ReconnectReason::Disconnected, now);
+        let _ = s.schedule_redial(ReconnectReason::ProbeClose, now);
+        let _ = s.schedule_redial(ReconnectReason::IdleSilence, now);
+
+        assert_eq!(
+            s.recent_redial_count(now),
+            2,
+            "two faults happened and must both still be visible to the damper; only the \
+             probe close in between is exempt"
+        );
+    }
+
+    /// Exactly one reason is exempt, and it is the probe close. A future
+    /// reason must not inherit the exemption by resembling this one.
+    #[test]
+    fn exactly_one_reconnect_reason_is_exempt_from_the_flap_record() {
+        let exempt: Vec<&'static str> = ReconnectReason::ALL
+            .into_iter()
+            .filter(|r| !r.records_flap())
+            .map(ReconnectReason::as_str)
+            .collect();
+        assert_eq!(
+            exempt,
+            vec!["probe_close"],
+            "the flap exemption is deliberately narrow — adding a reason to it needs its own \
+             dated quote in websocket-connection-scope-lock.md"
+        );
+    }
+
+    /// The single-choke-point property survives the exemption.
+    ///
+    /// The exemption had to be expressed as a condition INSIDE `enter_backoff`
+    /// rather than as a second path that skips it — a bypass would let the
+    /// audit row and the reconnect counter disagree, which is the property the
+    /// function's own comment says it exists to guarantee. This is a source
+    /// scan because no runtime assertion can see a path that does not exist.
+    #[test]
+    fn the_flap_record_is_only_ever_written_from_enter_backoff() {
+        let src = include_str!("pool_supervisor.rs");
+
+        // Scan the PRODUCTION half only. The first draft of this test scanned
+        // the whole file and failed against correct code, because the
+        // assertion strings below contain the very text they search for — a
+        // guard that quotes its own needle counts itself. The repo has
+        // recorded that shape before (a seeding guard that found its own
+        // assertion message and could therefore never fail); here it showed up
+        // as a false POSITIVE, which is the survivable direction, but the fix
+        // is the same: never let the test module be part of the corpus.
+        let production = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("split always yields a first element");
+        assert!(
+            production.len() < src.len(),
+            "the test-module boundary moved; this scan is now reading its own assertions"
+        );
+        assert!(
+            production.contains("fn enter_backoff("),
+            "the production half must still contain enter_backoff, or this scan is vacuous"
+        );
+
+        let stripped: String = production
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // The definition plus exactly one call site.
+        let definition = stripped.matches("fn record_redial(").count();
+        let calls = stripped.matches("self.record_redial(").count();
+        assert_eq!(definition, 1, "record_redial is defined exactly once");
+        assert_eq!(
+            calls, 1,
+            "record_redial must have exactly ONE call site. A second one would be a path \
+             around enter_backoff, and enter_backoff being the single site every redial \
+             passes through is what makes the audit row agree with the counter."
+        );
+
+        let enter = stripped
+            .split("fn enter_backoff(")
+            .nth(1)
+            .and_then(|s| s.split("\n    fn ").next())
+            .expect("enter_backoff must exist");
+        assert!(
+            enter.contains("if reason.records_flap()"),
+            "the one call site must sit behind the reason test, inside enter_backoff:\n{enter}"
+        );
+        assert!(
+            enter.contains("self.record_redial(now);"),
+            "enter_backoff must still be the writer:\n{enter}"
         );
     }
 
@@ -9541,5 +10374,545 @@ mod tests {
                  one early storm mute every socket for the rest of the session"
             );
         }
+    }
+
+    /// The swap's outer budget wins, which makes one failure reason VACUOUS —
+    /// and this test exists so nobody cites that reason as evidence again.
+    ///
+    /// `send_unsubscribe` has exactly ONE production call site and it is
+    /// wrapped in `tokio::time::timeout(SWAP_WIRE_BUDGET, ..)`. Inside,
+    /// `send_unsubscribe_in_mode` wraps its socket write in
+    /// `SUBSCRIBE_SEND_TIMEOUT`. With 1 s outside and 10 s inside, the outer
+    /// always elapses first and the inner future is DROPPED before its timeout
+    /// arm can run — so
+    /// `tv_dhan_ws_subscribe_failed_total{reason="unsubscribe_timeout"}` can
+    /// never increment from the swap path.
+    ///
+    /// That matters because on 2026-09-11 a two-session read used those four
+    /// reasons to exclude "our unsubscribe never reached the wire" as the cause
+    /// of the depth ghosts. Three of the four are real measurements. The fourth
+    /// is a tautology, and a tautology quoted as a zero is the `capped`-counter
+    /// class this repository has already recorded twice.
+    ///
+    /// The ordering itself is CORRECT and is not the defect: a socket that
+    /// cannot write a few hundred bytes in a second is sick, and holding the
+    /// drain for nine more seconds to prove it is worse. The defect was that
+    /// nothing said so, and that the arm which DOES fire had no seeded counter.
+    #[test]
+    fn the_swap_budget_wins_so_the_inner_unsubscribe_timeout_is_vacuous() {
+        assert!(
+            SWAP_WIRE_BUDGET < crate::websocket::connection::SUBSCRIBE_SEND_TIMEOUT,
+            "SWAP_WIRE_BUDGET ({:?}) must stay BELOW SUBSCRIBE_SEND_TIMEOUT ({:?}) — it is what \
+             keeps a sick socket from holding the drain for ten seconds. If this ever inverts, \
+             the `unsubscribe_timeout` reason becomes reachable and the comment in \
+             `PoolSupervisor::new` calling it vacuous must be corrected in the same change.",
+            SWAP_WIRE_BUDGET,
+            crate::websocket::connection::SUBSCRIBE_SEND_TIMEOUT,
+        );
+    }
+
+    /// Every swap wire-outcome counter is seeded, and seeded by NAME from the
+    /// same const the emit site uses — so a rename cannot silently orphan one.
+    ///
+    /// Found 2026-09-11: all six had never reached CloudWatch, and none was
+    /// seeded, so their absence was not a zero (the `tv_depth_rows_spilled_total`
+    /// lesson). A drop counter without its discriminator is the shape
+    /// `loss_series_seeding_guard` already forbids one file over.
+    #[test]
+    fn every_swap_wire_outcome_counter_is_seeded_from_its_own_const() {
+        let src = include_str!("pool_supervisor.rs");
+        for metric in [
+            SWAP_TOTAL_METRIC,
+            SWAP_REFUSED_METRIC,
+            SWAP_FAILED_METRIC,
+            SWAP_TIMEOUT_METRIC,
+            SWAP_EMPTIED_SOCKET_METRIC,
+            SWAP_GUARD_REVERTED_METRIC,
+        ] {
+            assert!(
+                !metric.is_empty() && metric.starts_with("tv_dhan_ws_swap"),
+                "unexpected swap metric name: {metric}"
+            );
+            assert!(
+                !src.contains(&format!("metrics::counter!(\"{metric}\")")),
+                "{metric} is emitted as a STRING LITERAL somewhere — point the emit site at the \
+                 const so the seeding list and the emit site cannot drift apart"
+            );
+        }
+        assert!(
+            src.contains(concat!("SWAP_WIRE_", "SEED_ANCHOR —")),
+            "the swap wire-outcome seeding loop is gone — an unseeded counter's first increment \
+             is the sample the CloudWatch agent discards, which is the one that matters"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // The operator-armed unsubscribe probe (scope lock, 2026-09-12).
+    //
+    // Two arms, and the tests below exist because a probe whose own
+    // mechanism is untested cannot produce an admissible verdict — the
+    // whole point of the exercise is a finding a vendor ticket can be
+    // built on.
+    //
+    // ARM A — `ProbeUnsubscribe`: drop the instrument, put nothing back,
+    // and see whether frames keep arriving.
+    // ARM B — `ProbeClose`: close the socket and let the replay come back
+    // WITHOUT the instrument, which tests a different mechanism entirely.
+    // ------------------------------------------------------------------
+
+    /// FAIL-CLOSED, and this is what makes Arm A depth-200-only without a
+    /// flag: a socket holding more than one instrument can never satisfy
+    /// the condition, so a depth-20 socket (up to 50) and a main-feed
+    /// socket (thousands) are both refused by construction.
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_unsubscribe_is_refused_unless_the_socket_holds_exactly_one() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: one_scripted_frame(),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        // Two instruments: a depth-20-shaped socket.
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth20, vec![si(1), si(2)])
+            .expect("inside cap");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(LiveSubscriptionCommand::ProbeUnsubscribe {
+            drop_this: si(1),
+            ack: Some(ack_tx),
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let _ = run_connection_with_commands(
+            fake(&st),
+            sup(DhanEndpointType::Depth20, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        let outcome = ack_rx.try_recv().expect("the probe arm must answer");
+        assert_eq!(
+            outcome,
+            ProbeUnsubscribeOutcome::Refused {
+                reason: ProbeUnsubscribeOutcome::REASON_NOT_EXACTLY_ONE,
+            }
+        );
+        assert!(!outcome.needs_restore(), "nothing was dropped");
+        assert!(
+            !outcome.verdict_admissible(),
+            "a refused probe sent no frame — silence after it means nothing"
+        );
+        let s = st.lock().expect("fake state");
+        assert_eq!(
+            s.unsubscribes, 0,
+            "a refused probe must not reach the wire at all"
+        );
+    }
+
+    /// The steering swaps depth-200 sockets every minute, so between the
+    /// operator arming the probe and this command being drained the socket
+    /// can legitimately be carrying a different contract. Dropping it
+    /// anyway would measure a contract the baseline was never taken on.
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_unsubscribe_is_refused_when_the_socket_moved_to_another_contract() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: one_scripted_frame(),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(7)])
+            .expect("one instrument");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(LiveSubscriptionCommand::ProbeUnsubscribe {
+            // The probe named 1; the socket moved to 7.
+            drop_this: si(1),
+            ack: Some(ack_tx),
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let _ = run_connection_with_commands(
+            fake(&st),
+            sup(DhanEndpointType::Depth200, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        assert_eq!(
+            ack_rx.try_recv().expect("the probe arm must answer"),
+            ProbeUnsubscribeOutcome::Refused {
+                reason: ProbeUnsubscribeOutcome::REASON_DIFFERENT_INSTRUMENT,
+            }
+        );
+        let s = st.lock().expect("fake state");
+        assert_eq!(
+            s.unsubscribes, 0,
+            "the wrong contract must never be dropped"
+        );
+    }
+
+    /// The happy path, and the assertion that matters is the WIRE SHAPE:
+    /// exactly one unsubscribe and NO subscribe after it. A swap would have
+    /// put something back; Arm A must not, because a replacement instrument
+    /// keeps frames flowing and makes the measurement unreadable.
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_unsubscribe_drops_the_instrument_and_puts_nothing_back() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: one_scripted_frame(),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(LiveSubscriptionCommand::ProbeUnsubscribe {
+            drop_this: si(1),
+            ack: Some(ack_tx),
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let _ = run_connection_with_commands(
+            fake(&st),
+            sup(DhanEndpointType::Depth200, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        let outcome = ack_rx.try_recv().expect("the probe arm must answer");
+        assert_eq!(outcome, ProbeUnsubscribeOutcome::Dropped);
+        assert!(
+            outcome.needs_restore(),
+            "the socket is now empty — a probe that forgets to restore strands it"
+        );
+        assert!(outcome.verdict_admissible());
+        let s = st.lock().expect("fake state");
+        assert_eq!(
+            s.wire_calls,
+            vec!["subscribe", "unsubscribe"],
+            "Arm A must NOT subscribe anything after the drop — a replacement \
+             instrument keeps frames flowing and makes the measurement unreadable"
+        );
+        assert_eq!(s.connects, 1, "Arm A must never re-dial — that is Arm B");
+    }
+
+    /// A script that ends in a RECONNECTABLE close, so the loop actually
+    /// re-dials once and replays the guard before the dry script's fatal
+    /// terminator parks it.
+    ///
+    /// This matters more than it looks: the default terminator is
+    /// `AuthenticationFailed`, which is FATAL and parks WITHOUT replaying.
+    /// A "the replay carries nothing" test written against the default
+    /// script passes because no replay ever happens — vacuously green
+    /// against correct AND incorrect code. Hence the explicit transient
+    /// close, and the `connects == 2` assertion in every test that uses it.
+    fn one_frame_then_a_reconnectable_close() -> VecDeque<SocketEvent> {
+        VecDeque::from(vec![
+            SocketEvent::Frame(Bytes::from_static(b"aaaaaaaa")),
+            SocketEvent::Closed {
+                code: Some(DisconnectCode::InternalServerError),
+            },
+        ])
+    }
+
+    /// THE GUARD SIDE of the drop, asserted through behaviour rather than
+    /// by peeking at private state: the guard IS the reconnect replay, so a
+    /// socket that redials after a successful probe unsubscribe must come
+    /// back subscribing NOTHING.
+    ///
+    /// If the guard were left naming the instrument, the replay would
+    /// re-subscribe it, frames would resume, and the probe would report
+    /// "the vendor ignored our unsubscribe" — a negative finding
+    /// manufactured by our own code, on the exact question a vendor ticket
+    /// would be built on.
+    #[tokio::test(start_paused = true)]
+    async fn after_a_probe_unsubscribe_a_redial_replays_nothing() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: one_frame_then_a_reconnectable_close(),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(LiveSubscriptionCommand::ProbeUnsubscribe {
+            drop_this: si(1),
+            ack: None,
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let _ = run_connection_with_commands(
+            fake(&st),
+            sup(DhanEndpointType::Depth200, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        let s = st.lock().expect("fake state");
+        assert_eq!(
+            s.connects, 2,
+            "ANTI-VACUITY: without a real re-dial the subscribe assertion below is \
+             green whatever the guard holds"
+        );
+        assert_eq!(
+            s.subscribes, 1,
+            "exactly ONE subscribe — the initial dispatch. The re-dial's replay must \
+             carry nothing: replaying the dropped instrument would make the watch \
+             window read OUR behaviour as the vendor's"
+        );
+    }
+
+    /// THE MIRROR, and the bite-proof for the wire-first ordering: when the
+    /// unsubscribe does NOT reach the wire the guard must be untouched, so
+    /// the very same re-dial replays the instrument.
+    ///
+    /// Emptying the guard before the wire call would make this replay carry
+    /// nothing, stranding a socket whose subscription was never actually
+    /// cancelled — and the restore would then re-subscribe what Dhan still
+    /// holds, which is an 804 and the slot's one re-dial spent.
+    #[tokio::test(start_paused = true)]
+    async fn after_a_failed_probe_unsubscribe_the_redial_still_replays_the_instrument() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: one_frame_then_a_reconnectable_close(),
+            unsubscribe_results: VecDeque::from(vec![false]),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(LiveSubscriptionCommand::ProbeUnsubscribe {
+            drop_this: si(1),
+            ack: None,
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let _ = run_connection_with_commands(
+            fake(&st),
+            sup(DhanEndpointType::Depth200, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        let s = st.lock().expect("fake state");
+        assert_eq!(
+            s.connects, 2,
+            "ANTI-VACUITY: the re-dial must actually happen"
+        );
+        assert_eq!(
+            s.subscribes, 2,
+            "the initial dispatch AND the replay. A failed unsubscribe must leave the \
+             guard naming the instrument the socket still carries"
+        );
+    }
+
+    /// A wire failure must be a CLEAN NO-OP: nothing dropped, nothing to
+    /// restore, and — the part that would otherwise bite — no verdict.
+    ///
+    /// The guard is untouched, so the socket still carries the instrument.
+    /// Had the handler emptied the guard first, the restore would have
+    /// `try_extend`ed an instrument the socket already holds, and Dhan
+    /// answers a duplicate subscribe with 804 — spending the slot's one
+    /// re-dial and potentially parking it for the session. The probe would
+    /// have broken the socket it was measuring.
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_unsubscribe_that_fails_on_the_wire_changes_nothing() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: one_scripted_frame(),
+            unsubscribe_results: VecDeque::from(vec![false]),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(LiveSubscriptionCommand::ProbeUnsubscribe {
+            drop_this: si(1),
+            ack: Some(ack_tx),
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let _ = run_connection_with_commands(
+            fake(&st),
+            sup(DhanEndpointType::Depth200, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        let outcome = ack_rx.try_recv().expect("the probe arm must answer");
+        assert_eq!(
+            outcome,
+            ProbeUnsubscribeOutcome::WireFailed { timed_out: false },
+            "the socket ANSWERED with an error — that is not the same fact as a timeout"
+        );
+        assert!(
+            !outcome.needs_restore(),
+            "nothing was dropped, so a restore would re-subscribe what the socket holds — 804"
+        );
+        assert!(
+            !outcome.verdict_admissible(),
+            "no frame landed, so silence afterwards would say nothing about the vendor"
+        );
+    }
+
+    /// The outcome type's two questions are answered ONLY by `Dropped`.
+    /// Spelled as a test because a future fourth variant defaulting to
+    /// "no restore" would strand a depth-200 socket carrying nothing for
+    /// the rest of the session.
+    #[test]
+    fn only_a_dropped_probe_needs_a_restore_or_yields_a_verdict() {
+        for outcome in [
+            ProbeUnsubscribeOutcome::Refused {
+                reason: ProbeUnsubscribeOutcome::REASON_NOT_EXACTLY_ONE,
+            },
+            ProbeUnsubscribeOutcome::Refused {
+                reason: ProbeUnsubscribeOutcome::REASON_DIFFERENT_INSTRUMENT,
+            },
+            ProbeUnsubscribeOutcome::WireFailed { timed_out: false },
+            ProbeUnsubscribeOutcome::WireFailed { timed_out: true },
+        ] {
+            assert!(
+                !outcome.needs_restore(),
+                "{outcome:?} left the socket holding what it held"
+            );
+            assert!(
+                !outcome.verdict_admissible(),
+                "{outcome:?} put no frame on the wire, so nothing it is followed by is evidence"
+            );
+        }
+        assert!(ProbeUnsubscribeOutcome::Dropped.needs_restore());
+        assert!(ProbeUnsubscribeOutcome::Dropped.verdict_admissible());
+    }
+
+    // --- Arm B: the probe-close register ------------------------------
+
+    /// ONE probe close per socket per session, and the latch is never
+    /// cleared — that is what makes "at most once" a property of the code
+    /// rather than of a caller's discipline. An operator who arms twice
+    /// gets a refusal, not a second socket teardown.
+    ///
+    /// Split across three tests named for the three functions (2026-09-12)
+    /// so `pub-fn-test-guard` can find the coverage by name — the house
+    /// convention its sibling `request_ghost_redial_*` tests already use.
+    /// Each owns its OWN slot index: the register is process-global and
+    /// deliberately never cleared, so a shared index would make one test's
+    /// pass depend on another's execution order.
+    #[test]
+    fn request_probe_close_arms_a_slot_once_and_refuses_every_arm_after() {
+        let idx = 29_u8;
+        assert!(!probe_close_spent(idx), "fresh slot");
+        assert_eq!(request_probe_close(idx), Ok(()));
+        assert_eq!(
+            request_probe_close(idx),
+            Err(ProbeCloseRefusal::AlreadyArmed),
+            "the second arm must be refused even though the first was never taken"
+        );
+        assert!(take_probe_close(idx), "the first arm is still pending");
+        assert_eq!(
+            request_probe_close(idx),
+            Err(ProbeCloseRefusal::AlreadyArmed),
+            "taking the request does NOT re-arm the socket"
+        );
+    }
+
+    /// The take is one-shot: the connection task polls it on every idle
+    /// tick, so a take that kept returning true would close the socket
+    /// once a second for the rest of the session.
+    #[test]
+    fn take_probe_close_takes_a_pending_arm_exactly_once() {
+        let idx = 28_u8;
+        assert!(!take_probe_close(idx), "nothing armed yet");
+        assert_eq!(request_probe_close(idx), Ok(()));
+        assert!(take_probe_close(idx), "the arm is pending");
+        assert!(!take_probe_close(idx), "and it is one-shot");
+    }
+
+    /// `probe_close_spent` reports the LATCH, not the pending flag — so it
+    /// stays true after the take. It is what lets a caller ask "has this
+    /// socket already been used for the session's one probe?" without
+    /// consuming anything.
+    #[test]
+    fn probe_close_spent_stays_true_once_armed_even_after_the_take() {
+        let idx = 27_u8;
+        assert!(!probe_close_spent(idx), "fresh slot");
+        assert_eq!(request_probe_close(idx), Ok(()));
+        assert!(probe_close_spent(idx), "armed");
+        assert!(take_probe_close(idx));
+        assert!(
+            probe_close_spent(idx),
+            "the latch survives the take — that is what makes it a session-long record"
+        );
+    }
+
+    /// Out of range refuses rather than panicking. The register is sized
+    /// for the authorized socket budget; a caller with a bad index is a
+    /// bug, and a bug that takes the process down mid-session is worse
+    /// than one that returns an error.
+    #[test]
+    fn request_probe_close_refuses_an_unknown_socket_rather_than_panicking() {
+        let out_of_range = u8::try_from(GHOST_REDIAL_SLOTS).unwrap_or(u8::MAX);
+        assert_eq!(
+            request_probe_close(out_of_range),
+            Err(ProbeCloseRefusal::OutOfRange)
+        );
+        assert!(!take_probe_close(out_of_range));
+        assert!(!probe_close_spent(out_of_range));
+    }
+
+    /// A ghost redial and a probe close can both be pending on one socket.
+    /// The ghost must win: it is a FAULT and the probe is a MEASUREMENT,
+    /// and letting a measurement pre-empt a fault would delay the
+    /// remediation by a whole cooldown.
+    #[test]
+    fn the_ghost_redial_is_taken_before_the_probe_close() {
+        let src = include_str!("pool_supervisor.rs");
+        let production = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map_or(src, |(before, _)| before);
+        assert!(
+            production.contains("fn take_probe_close("),
+            "anti-vacuity: the production half must contain the take fn"
+        );
+        let ghost = production
+            .find("take_ghost_redial(supervisor.slot().global_index)")
+            .expect("the connection task must take ghost redials");
+        let probe = production
+            .find("take_probe_close(supervisor.slot().global_index)")
+            .expect("the connection task must take probe closes");
+        assert!(
+            ghost < probe,
+            "the ghost take must come FIRST: a ghost is a fault and a probe close is a \
+             measurement, and a measurement must never pre-empt a remediation"
+        );
     }
 }

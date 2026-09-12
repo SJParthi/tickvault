@@ -2641,7 +2641,7 @@ unsubscribed contract "is not detected". It is now:
 **This is the safety net the FOURTH-quote section said must exist before the
 apply cadence is raised.** If code 25 is wrong for an endpoint, every swap
 becomes an add, the ghost shows within 90 s, and the socket is rebuilt within
-the cooldown instead of sitting at 804 for the session. *(⚠ 2026-09-10: this is exactly what happened — 20 ignored unsubscribes, 10 redials, no socket parked. Code 25 WAS wrong; 24 ships since the 2026-09-10 section.)*
+the cooldown instead of sitting at 804 for the session. *(⚠ 2026-09-10: this is exactly what happened — no socket parked. Code 25 WAS wrong; 24 ships since the 2026-09-10 section. **⚠ The counts once given here, "20 ignored unsubscribes, 10 redials", are WRONG — measured 2026-09-11 the session carried 80 lines across all ten sockets and both endpoints; see the dated correction under the 2026-09-10 section.**)*
 
 #### Also delivered: the two per-cadence faces of `top_volume_rank`
 
@@ -2670,7 +2670,8 @@ faces gives that without writing every row twice.
 4. **The unsubscribe RequestCode is still UNVERIFIED-LIVE.** The ghost counter
    is now the instrument that verifies it: a session with `ghost = 0` and
    `unsubscribed_grace > 0` is the evidence that 25 works. *(⚠ 2026-09-10: the
-   session read the OPPOSITE — 20 ignored, 10 redials, so 25 does NOT work and
+   session read the OPPOSITE — every code-25 unsubscribe ignored, so 25 does NOT
+work and
    24 now ships; the same counter pair is the verdict instrument for 24. See
    "2026-09-10 — THE DEPTH UNSUBSCRIBE REQUESTCODE IS SETTLED LIVE".)*
 
@@ -2901,6 +2902,330 @@ swaps from 09:16 IST) is that probe, and it answered in the OTHER direction:
 | Distinct instruments streaming depth-200 | **8**, on **5** single-instrument sockets |
 | Code on the wire for every one of those unsubscribes | **25** (`FEED_UNSUBSCRIBE_TWENTY_DEPTH`) |
 
+> ### ⚠ CORRECTED 2026-09-11 — the "20" and the "10" in the table above are BOTH WRONG, and the real numbers make the verdict STRONGER, not weaker
+>
+> Re-queried today against the source rather than carried forward
+> (`aws logs filter-log-events --log-group-name /tickvault/prod/app
+> --filter-pattern '{ $.fields.source = "unsubscribe_ignored" }'`), because this
+> table is the evidence a vendor support ticket will cite and a number quoted
+> from a quote is not a measurement:
+>
+> | 2026-09-10, code 25 | table said | MEASURED 2026-09-11 |
+> |---|---:|---:|
+> | `unsubscribe_ignored` ERROR lines, full session | 20 | **80** |
+> | …inside the table's own 09:16–09:46 window | 20 | **48** |
+> | Ghost redials armed | 10 | **80** (one per line; `redials_taken` reaches **8**, the session ceiling, on every socket) |
+> | Endpoints affected | depth-200 implied | **40 depth-200 AND 40 depth-20** |
+> | Distinct sockets affected | 5 implied | **10** — `connection_index` 5 through 14, i.e. EVERY depth socket |
+> | First / last line | — | 09:20:09.059 / 10:46:11.440 IST |
+>
+> **20 matches no window.** It is not the session total and it is not the
+> 30-minute total; where it came from is unrecoverable, which is exactly why it
+> should never have been written without the query beside it.
+>
+> **The same query for 2026-09-11 (code 24) returns the SAME SHAPE:** 80 lines,
+> 40/40 across both endpoints, all ten sockets, `redials_taken` max 8, first
+> 09:18:38.073 and last 10:21:39.074 IST, `ghost_packets` 1–24.
+>
+> #### Why this is the most important line in the section
+>
+> The two codes do not merely both fail — **they fail IDENTICALLY**: same line
+> count, same even split across two different endpoints, same ten sockets, same
+> exhaustion of the redial ceiling roughly an hour into the session. A code that
+> was simply *wrong* would be expected to differ from another wrong code in at
+> least one of those dimensions. **That both produce a byte-identical failure
+> signature is evidence the problem may not be the RequestCode at all** — and it
+> is the single strongest thing to put in front of Dhan engineering, which the
+> "20 vs 10" framing was too small to show.
+>
+> > ##### ⚠ CORRECTED 2026-09-11 (same day, by an adversarial re-read) — "byte-identical" is TRUE and is NOT EVIDENCE OF ANYTHING. 80 is our own ceiling, and this section refutes itself two paragraphs down.
+> >
+> > The paragraph above calls the identical signature "the single strongest
+> > thing to put in front of Dhan engineering." **It is the weakest, because
+> > every number in it is pinned by OUR code and could not have come out any
+> > other way.**
+> >
+> > | "signature" dimension | what actually fixes it |
+> > |---|---|
+> > | **80** lines | `GHOST_REDIAL_SESSION_CEILING` = 8 × **10** depth sockets = **80**. Arithmetic maximum. |
+> > | **40 / 40** split | 5 depth-20 + 5 depth-200 sockets × 8 = 40 each. Forced. |
+> > | **all ten** sockets | there are exactly ten. |
+> > | ceiling reached ~1 h in | the line is emitted ONLY inside the `Ok(())` arm of `request_ghost_redial`, which returns `Err(SessionCeiling)` past 8. |
+> >
+> > So the two sessions did not produce the same number because Dhan behaved
+> > the same way — **they produced the same number because a counter that
+> > saturates at 80 reported 80 twice.** A vendor that honoured code 24 on
+> > 30% of frames and ignored 25 entirely would still print 80/40/40 as long
+> > as *any* ghost survived per socket. **A metric that can only report one
+> > value is not evidence**, and the section immediately below this one says
+> > so without noticing: *"every socket reaches `GHOST_REDIAL_SESSION_CEILING`
+> > (8) and stands down by design."*
+> >
+> > **What IS non-forced, and is therefore the real evidence:** `ghost`
+> > (5,345,436) and `unsubscribed_grace` (1,686,468) have no ceiling. No
+> > 2026-09-10 counterparts were recorded, so the one comparison that could
+> > discriminate between the two codes was never taken.
+> >
+> > ##### ✅ STEP 1 DONE 2026-09-11 (same evening) — the 09-10 counters WERE still recoverable, and the two days are NOT alike
+> >
+> > The block above says the 2026-09-10 counterparts "were never recorded, so
+> > the one comparison that could discriminate between the two codes was never
+> > taken." That was true of what anyone had written down, and **false of what
+> > still existed**: the CloudWatch EMF group keeps the per-outcome split, and
+> > `filter-log-events` can still read it. It was taken.
+> >
+> > **Method, and why it is trustworthy.** The EMF record carries a **delta per
+> > scrape**, not a cumulative, so a session total is the SUM of ~538 samples.
+> > `logs:StartQuery` is denied to `claude-code-agent`, so the aggregation is
+> > client-side over `filter-log-events`. **The method validates itself:** run
+> > against 2026-09-11 it reproduces every already-known figure EXACTLY — ghost
+> > 5,345,436 · grace 1,686,468 · rows 793,936,960 · depth-20 swaps 7,662 ·
+> > depth-200 swaps 1,799. A method that reproduces five known numbers to the
+> > unit is trusted for the sixth.
+> >
+> > | Full session, one continuous run each | **2026-09-10 · code 25** | **2026-09-11 · code 24** | ratio |
+> > |---|---:|---:|---:|
+> > | boots inside the window | 1 | 1 | — |
+> > | depth-20 swaps sent | 6,068 | 7,662 | 1.26x |
+> > | depth-200 swaps sent | 1,712 | 1,799 | 1.05x |
+> > | **total unsubscribes** | **7,780** | **9,461** | **1.22x** |
+> > | depth rows stored | 226,667,920 | 793,936,960 | 3.50x |
+> > | **ghost packets** | **110,114** | **5,345,436** | **48.5x** |
+> > | **unsubscribed_grace** | **55,160** | **1,686,468** | **30.6x** |
+> > | ghost_redial | 80 | 80 | **1.00 — the ceiling** |
+> > | ghost_exhausted | 10 | 10 | **1.00 — the ceiling** |
+> >
+> > **The only two numbers that matched are the only two that COULD NOT differ.**
+> > That is the circularity above, now demonstrated with data rather than
+> > arithmetic: `ghost_redial` is 8 x 10 sockets on both days, and everything
+> > without a ceiling differs by one to two orders of magnitude.
+> >
+> > **Three independent normalisations, because ghost scales with traffic:**
+> >
+> > | normalised measure | 09-10 (25) | 09-11 (24) | ratio |
+> > |---|---:|---:|---:|
+> > | ghost packets per unsubscribe | 14.2 | 565.0 | **40x** |
+> > | ghost packets per 1M depth rows | 486 | 6,733 | **13.9x** |
+> > | **ghost / grace — traffic-independent** | **1.996** | **3.170** | **1.59x** |
+> > | implied mean streaming tail, `T = 90(1+r)` | **~270 s** | **~375 s** | |
+> > | ratio if NEVER honoured (`510/90`) | **4.667 ⇒ 510 s** | same | |
+> >
+> > The `ghost / grace` row is the one to lead with: it is two counters over the
+> > SAME packet stream in two different windows, so it cancels traffic by
+> > construction. All three point the same way.
+> >
+> > **What this DOES establish:**
+> > 1. **The byte-identical argument is refuted by measurement, not only by
+> >    arithmetic.** The days differ enormously wherever a ceiling does not
+> >    forbid it. This needs no causal claim at all.
+> > 2. **Neither code is fully honoured** — ghost > 0 on both days.
+> > 3. **Neither code is fully IGNORED either**, which is new: both ratios sit
+> >    BELOW the never-honoured ceiling of 4.667, so some unsubscribes are
+> >    taking effect. "Dhan ignores it" is too strong for either day.
+> >
+> > **⚠ What this does NOT establish — the cause.** Four other PRs merged
+> > between the two deployed builds (`55126249b`, `ad778aa50`, `16190ce2a`,
+> > `61f6e448e`, `0e6f95fc8`), and `ad778aa50` carried a "subscribed-first
+> > contract map" alongside the code flip. **Depth traffic also differed 3.50x
+> > between the two days and that difference is itself unexplained.** So the
+> > honest statement is *"the two sessions behaved very differently and code 25
+> > ghosted far less on every normalisation"*, NOT *"code 25 is better because
+> > it is 25"*. The one-socket probe (step 2) is still what settles cause,
+> > and it is still unrun.
+> >
+> > **One bounded measurement caveat, stated because it cuts the convenient
+> > way.** `55126249b` ("seed the depth ghost family ... so the unsubscribe-code
+> > verdict is readable") merged at 08:52 IST on 09-10, twenty-two minutes AFTER
+> > that session booted — so 09-10 ran unseeded, and the agent drops the FIRST
+> > sample of a series it has never seen. That under-counts **09-10**, the day
+> > with fewer ghosts, so correcting it would NARROW the gap. It is bounded at
+> > one sample of 538 (~0.2%), far too small to move any row above.
+> >
+> > **This is not a claim that 24 or 25 works.** Both were almost certainly
+> > ignored. It is a claim that **the argument as recorded cannot survive
+> > vendor scrutiny**, and a ticket built on it invites "we cannot reproduce;
+> > send a capture."
+> >
+> > **What the next session must do instead, in order:**
+> >
+> > 1. **Record the unbounded counters on BOTH days** — those are the numbers
+> >    that can differ.
+> > 2. **Run the one-socket probe.** A depth-200 socket holds **exactly one**
+> >    instrument, so "did the stream stop?" has nothing to mask it: send the
+> >    unsubscribe, **do not re-subscribe**, watch that `connection_index` for
+> >    frame silence (`FrameSilenceElapsed` already measures it). Silence ⇒ 25
+> >    works and the ghost verdict is OURS. Continued delivery ⇒ vendor-side,
+> >    decisively, from one socket and about four minutes.
+> > 3. **Try `RequestCode 12`.** The vendor's own depth guide documents only
+> >    `23` (subscribe) and `12` (disconnect) — **no per-instrument
+> >    unsubscribe at all** — and `build_disconnect_message` exists with
+> >    **ZERO production callers** (`FEED_REQUEST_DISCONNECT` appears only in
+> >    `constants.rs` and two test files). The only stop mechanism the vendor
+> >    documents has never been sent.
+> > 4. **Ask the right question.** Not *"why is 25 ignored?"* but **"what is
+> >    the supported way to stop a depth stream for one instrument — is 25
+> >    implemented on the Indian feed, or is 12 the only mechanism?"**
+> >
+> > **Also not ruled out, and it is ours:** a wire-FAILED unsubscribe still
+> > produces a ghost. `held` advances on `try_send` Ok — command *queued*,
+> > not sent — and reconcile KEEPS that advanced belief on both wire-failure
+> > arms, so the view publishes a contract as dropped that the socket was
+> > never told to drop. Only `tv_dhan_ws_subscribe_failed_total{unsubscribe_*}`
+> > = 0 excludes this, and that must be re-read PER REASON, not as a rollup.
+> >
+> > ##### ✅ STEP 2 DONE 2026-09-11 (same evening) — the wire-failure alternative is EXCLUDED, but the instrument named above is one-quarter tautology
+> >
+> > The paragraph above says *"Only `tv_dhan_ws_subscribe_failed_total{unsubscribe_*}`
+> > = 0 excludes this, and that must be re-read PER REASON, not as a rollup."*
+> > It was re-read per reason. The answer is **zero on every reason on both
+> > days** — and the instruction was RIGHT to insist on per-reason, because
+> > the raw EMF records carry `endpoint` and `reason` as fields even though
+> > the CloudWatch METRIC folds them to `host` alone. The split is readable
+> > from `filter-log-events`; it is not readable from `get-metric-statistics`.
+> >
+> > | endpoint × reason (8 reasons × 3 endpoints) | 10 Sep · code 25 | 11 Sep · code 24 |
+> > |---|---:|---:|
+> > | every one of the 24 series | **0** | **0** |
+> > | samples per series | 537–538 | 537–538 |
+> >
+> > 537 samples at zero is a *reporting* zero, not an absent series — these
+> > are seeded in `DhanSocketParams::new`, so the first-sample rule that hid
+> > `tv_depth_rows_spilled_total` does not apply here.
+> >
+> > **But one of the four unsubscribe reasons could not have been anything
+> > but zero.** `send_unsubscribe` has exactly ONE production call site
+> > (`pool_supervisor.rs`, the swap) and it is wrapped in
+> > `tokio::time::timeout(SWAP_WIRE_BUDGET, ..)` — **1 second** — while the
+> > socket write inside `send_unsubscribe_in_mode` is bounded by
+> > `SUBSCRIBE_SEND_TIMEOUT` — **10 seconds**. The outer budget always
+> > elapses first and drops the inner future, so the inner timeout arm never
+> > runs and `reason="unsubscribe_timeout"` **can never increment in
+> > production**. Citing four zeros is citing three measurements and a
+> > tautology. That is the `capped`-counter class of the same day's
+> > findings list, arriving in a second file.
+> >
+> > **So the claim rests on three reachable reasons plus a fourth
+> > instrument** — and finding that fourth is what closed the hole. The
+> > outer-timeout arm sets `wire_failed` and emits a coded `WS-GAP-02` line
+> > with `source = "swap_wire_failed"` (or `"swap_emptied_socket"`), and
+> > `origin/main` carried that `source` field during BOTH sessions, so it
+> > would have been emitted had the arm fired:
+> >
+> > | app-log query, both schemas | 10 Sep | 11 Sep |
+> > |---|---:|---:|
+> > | `$.fields.source = "swap_wire_failed"` | **0** | **0** |
+> > | `$.fields.source = "swap_emptied_socket"` | **0** | **0** |
+> >
+> > **Every arm of the unsubscribe chain is now covered by a live instrument,
+> > and every one reads zero.** Across **7,780** (code 25) and **9,461**
+> > (code 24) depth unsubscribes, not one failed on our side: the payload
+> > built, the socket was connected, the write succeeded, and it completed
+> > inside the one-second budget. **The wire-failure alternative is
+> > EXCLUDED** — the ghosts are not our unsubscribes failing to reach the
+> > socket.
+> >
+> > **⚠ The honest limit, which is narrow and real.** `send_unsubscribe` is
+> > fire-and-forget and Dhan sends no ack: `Ok` means the bytes were written
+> > into the sink and flushed, not that the vendor processed them. This
+> > proves our side did its job up to the socket boundary and no further. A
+> > TCP-level failure on a live connection WOULD have surfaced as
+> > `unsubscribe_send`, and that is zero — so the remaining gap is bytes
+> > written to a healthy socket that the vendor then ignored, which is
+> > precisely the vendor ticket's claim.
+> >
+> > **⚠ A second defect found on the way, and it is the one that could have
+> > bitten silently.** The whole swap wire-outcome family —
+> > `tv_dhan_ws_swap_{total,refused,failed,timeout,emptied_socket,guard_reverted}_total`
+> > — is in NEITHER the EMF selector NOR seeded, so none of the six had ever
+> > reached CloudWatch. Their absence was not a zero, and the arm that can
+> > manufacture a FALSE ghost (the 1-second budget elapsing, where the guard
+> > is deliberately NOT reverted because the frame may have landed) was
+> > readable only by luck — the coded log line beside the counter. §2.3m of
+> > `dhan-rest-only-noise-lock-2026-07-14.md` alarmed `swap_emptied_socket`
+> > and left `swap_wire_failed` unalarmed.
+> >
+> > **FIXED the same evening**, free: six named consts replace the literal
+> > emit sites, all six are seeded at zero in `PoolSupervisor::new`, and
+> > `unsubscribe_timeout` is annotated at its seed site with why a zero there
+> > proves nothing. Three guards, each bite-proven in both directions
+> > (`the_swap_budget_wins_so_the_inner_unsubscribe_timeout_is_vacuous`,
+> > `every_swap_wire_outcome_counter_is_seeded_from_its_own_const`). **NOT
+> > fixed:** none of the six is EMF-selected, so none is alarmable — that is
+> > ~$0.30/mo each against a September forecast of $142.24 and a $135
+> > automatic-stop line, so §2.3n's lever requirement is unmet and is not
+> > assumed.
+> >
+> > **The reusable half, and it is about the guard rather than the code:**
+> > the seeding guard was itself VACUOUS on first write — it searched the
+> > source for the seeding line and found its own assertion message, so
+> > deleting the baseline left it green. Caught by bite-proving it, which is
+> > the only thing that could have caught it. A guard that quotes the text it
+> > searches for is a guard that cannot fail, and this file has now recorded
+> > the same shape three times: a saturated ceiling, an unreachable counter,
+> > and a self-satisfying scan.
+> >
+> > The reusable half is the one this file keeps recording, now about a
+> > measurement rather than a constant: **before citing a number as evidence,
+> > ask what its maximum is.** This one had been written down three times,
+> > beside its own ceiling, without anyone computing 8 × 10.
+>
+> **Why the lines stop around 10:21–10:46 and not at the 15:40 close:** every
+> socket reaches `GHOST_REDIAL_SESSION_CEILING` (8) and stands down by design.
+> The ghosts kept streaming for the remaining ~5 hours with no further redial —
+> which is where the session's 5,250,076 `ghost` packets come from. Silence in
+> the log after 10:46 is the ceiling working, NOT the problem resolving.
+>
+> **NOT re-verified:** the "8 distinct instruments on 5 sockets" row. These log
+> lines carry `connection_index`, `endpoint`, `ghost_packets` and
+> `redials_taken` and **no instrument identifier at all** — see the flagged gap
+> below. That row stands as originally recorded and was not re-checked.
+>
+> #### ⚠ A REAL GAP this re-query exposed: no ghost can be NAMED
+>
+> The successful depth-swap path logs **no `security_id`** — `depth20_track.rs`
+> increments `DEPTH20_SWAPS_SENT` and logs only on the REFUSAL arms, which carry
+> `socket`, not the instrument. So across two full sessions of a confirmed
+> vendor-side failure, **this process cannot say which contract ghosted.** The
+> operator's own Dhan-support workflow requires "precise contract labels …
+> SecurityId for every contract cited", and today that requirement cannot be met
+> from our telemetry. Adding `security_id` + `segment` to the ghost line is the
+> prerequisite for a ticket that names contracts; it is NOT fixed here.
+>
+> > ##### ✅ RESOLVED 2026-09-11 (same day) — and it was TWO sites, not one
+> >
+> > The paragraph above names the ghost line. Acting on it found the gap has a
+> > second half, and the second half is the one that mattered more:
+> >
+> > | Site | Logged before | What its silence cost |
+> > |---|---|---|
+> > | the ghost `error!` (`dhan_feed_stack.rs`) | connection, endpoint, `ghost_packets`, `redials_taken` | which contract was still arriving |
+> > | the unsubscribe **SUCCESS** arm (`pool_supervisor.rs`) | **nothing at all** | which contract we asked to drop, and *when*, and *with which request code* |
+> >
+> > Only the REFUSAL arm named an instrument — and a refusal is the case that
+> > did not happen. **All 160 ignored unsubscribes across the code-25 and
+> > code-24 sessions took the silent path**, so there was no record of the ask
+> > to pair the ghost against.
+> >
+> > Both now carry `security_id` + `segment`; the success arm additionally
+> > carries `request_code`, because **25 and 24 have BOTH shipped** and a
+> > session's evidence is worthless if the reader has to guess which binary
+> > produced it. Pinned by
+> > `crates/app/tests/ghost_instrument_named_guard.rs` (5 tests, both sites
+> > bite-proven in both directions).
+> >
+> > **It also answers the question the log could not.** The 2026-09-10 record
+> > states plainly that the log *"CANNOT distinguish (a) the same contract
+> > surviving 8 reconnects from (b) 8 different contracts each newly ignored"* —
+> > opposite diagnoses, and no counter separates them. A named id does.
+> >
+> > **NOT claimed:** that this stops a ghost, changes a request code, or makes
+> > Dhan honour an unsubscribe. It makes the failure *reportable*. The vendor
+> > ticket the section above calls for stays the remedy; this is the evidence
+> > it needs. Cost: zero new metric, zero alarm, zero EMF name — one `info!`
+> > at the measured swap rate (~9,500 lines a session, ~24 a minute) and two
+> > fields on an `error!` that is already throttled to once per socket per
+> > 180 s cooldown.
+
 A socket that was told to drop a contract kept receiving it past the 90 s grace,
 on every socket that swapped, every time. **Dhan did not honour a single code-25
 unsubscribe.** The ghost detector did exactly what the 2026-09-08 (THIRD) section
@@ -3055,3 +3380,1199 @@ table, and is therefore deliberately not started here.
   the other direction.
 - Moves `TICK_PERSIST_START_SECS_OF_DAY_IST` off 09:00 under cover of this
   quote — the operator chose the option that leaves the window alone.
+
+### 2026-09-11 — THE CODE-24 VERDICT IS IN, AND IT IS NEGATIVE: Dhan IGNORES 24 TOO
+
+**No new authorization is claimed.** This records the live reading the
+2026-09-10 section explicitly asked for, in the exact terms it set, plus one
+stale claim it carries.
+
+#### The verdict instrument, and what it read
+
+The 2026-09-10 section set the acceptance test verbatim: *"a session that ends
+with `ghost = 0` and `unsubscribed_grace > 0` is the evidence that 24 works."*
+
+Read from the running box at 15:46 IST on 2026-09-11, the first full session on
+the code-24 build:
+
+| counter | value |
+|---|---:|
+| `tv_dhan_feed_depth_total{outcome="ghost"}` | **5,250,076** |
+| `tv_dhan_feed_depth_total{outcome="unsubscribed_grace"}` | 1,664,266 |
+| `tv_dhan_feed_depth_total{outcome="ghost_redial"}` | 80 |
+| `tv_dhan_feed_depth_total{outcome="ghost_exhausted"}` | **10** |
+| `tv_dhan_feed_depth_total{outcome="rows"}` | 793,936,720 |
+
+**`ghost` is not 0. It is 5,250,076. On the stated test, code 24 is ignored.**
+
+#### The caveat that section named is CLOSED — the box genuinely ran the 24 build
+
+The 2026-09-08 (THIRD) section's residual 4 and the 2026-09-10 section both
+leave open whether the running binary carried the flip. Verified:
+
+| check | reading |
+|---|---|
+| `/tickvault/prod/deploy/binary-git-sha` | `23701dfca0cbaa02710e55003054948b57ca2ca7` |
+| `git merge-base --is-ancestor ad778aa50 23701dfca` | **true** — the build CONTAINS the 25 → 24 flip |
+| `systemctl show tickvault -p NRestarts` | **0** |
+| process start | **08:30:49 IST**, running 7h40m at the time of reading |
+
+One continuous session, no restarts, on a build that contains code 24.
+
+#### The derived streaming tail
+
+Grace is `GHOST_GRACE_SECS` = 90 s and the dropped map remembers for
+`DROPPED_RETENTION_SECS` = 600 s, so the ghost window is 510 s and the
+never-honoured ceiling ratio is 510/90 = 5.67. Observed ratio:
+5,250,076 / 1,664,266 = **3.155**. Solving `(T − 90)/90 = 3.155` gives
+**T ≈ 374 s** — the average unsubscribed contract kept streaming for about
+**six minutes** after we told Dhan to stop. Approximate: it assumes a steady
+packet rate and ignores contracts that re-entered the top 250 and reverted to
+`Held`.
+
+At 20 levels per depth-20 packet that is ≈ **105 million stored rows, ~13.2% of
+the session's 793,936,720**, for contracts this process had unsubscribed. Waste,
+never loss — `dhan_feed_stack.rs` writes them by design and says so.
+
+#### What this means, and what it does NOT
+
+**Two codes have now been proven ignored on two consecutive sessions**, and the
+vendor's own annexure contradicts itself about which is correct. Per the
+2026-09-10 section's own instruction, **the honest next step is a support ticket
+with both sessions' evidence, not a third guess.** No local strategy choice
+repairs it.
+
+**NOT claimed:** that a third code exists to try. **NOT claimed:** that anything
+was lost — ghost rows are written, `ghost_exhausted = 10` means ten sockets
+stopped redialling after `GHOST_REDIAL_SESSION_CEILING` and kept their working
+set. **The apply cadence still does NOT move**: the FOURTH-quote ordering binds
+on a clean read, and this read is the opposite of clean.
+
+#### ⚠ RE-MEASURED 2026-09-11 (same evening) — three of the numbers above are LOW, the provenance is wrong by 17 minutes, and the REDIAL BOUGHT NOTHING
+
+The table above says *"Read from the running box at 15:46 IST."* It was read at
+**15:29 IST** — the running cumulative crosses all three claimed values at that
+minute — and the session had not finished: ghost kept accruing to **15:43** and
+rows to **16:01**. Re-queried from `/tickvault/prod/metrics`, the EMF log group
+(`tv_dhan_feed_depth_total` in CloudWatch carries only a `host` dimension — it
+folds `outcome` away, so the per-outcome split is **not verifiable from
+CloudWatch metrics at all** and the EMF group is the only source):
+
+| counter | table above | MEASURED session total | low by |
+|---|---:|---:|---:|
+| `ghost` | 5,250,076 | **5,345,436** | 95,360 (1.8%) |
+| `unsubscribed_grace` | 1,664,266 | **1,686,468** | 22,202 (1.3%) |
+| `rows` | 793,936,720 | **793,936,960** | 240 |
+| `ghost_redial` | 80 | 80 | — |
+| `ghost_exhausted` | 10 | 10 | — |
+
+The derived tail is unchanged in substance: 5,345,436 / 1,686,468 = 3.170 ⇒
+**T ≈ 375 s** against the 374 s recorded above.
+
+**The finding that matters is not the 1.8%.** `GHOST_REDIAL_SESSION_CEILING`
+is 8 and there are ten depth sockets, so **80 is the arithmetic maximum** — the
+number is a saturated ceiling, not a measurement of ghost frequency. Every
+socket hit it: all five depth-20 exhausted by **09:43 IST**, all five depth-200
+by **10:22 IST**, firing at the 180 s cooldown floor back to back (conn 5:
+09:19:18 → 09:22:18 → 09:25:38 → 09:28:38 → …), a fresh ghost verdict at the
+earliest legal instant, eight times.
+
+| ghost packets | count | share |
+|---|---:|---:|
+| before the last exhaustion (10:22 IST) | 1,151,204 | 21.5% |
+| **after** | **4,194,232** | **78.5%** |
+
+**Four fifths of the session's ghosting happened with no redial budget left**,
+flat across five hours (hourly IST: 09h 624,792 · 10h 1,326,090 · 11h 963,876 ·
+12h 746,296 · 13h 684,950 · 14h 634,604 · 15h 364,828). The remedy shipped on
+2026-09-08 to make a wrong unsubscribe code self-healing **did not heal it**;
+it spent its budget in the first hour and then watched.
+
+**⚠ A CLAIM MADE IN THIS SESSION IS REFUTED AND IS WITHDRAWN: "every ordinary
+swap arms a socket re-dial."** Measured: depth-20 **7,662 swaps → 40 redials =
+0.52%**; depth-200 **1,799 → 40 = 2.22%**; combined **9,461 → 80 = 0.85%**.
+It is wrong by two orders of magnitude and was stated without checking the
+arithmetic against the swap counters that were already in hand. **And the
+refutation must not be read the other way either** — 91% of all swaps
+(depth-20: 7,122 of 7,662; depth-200: 1,502 of 1,799) happened AFTER that
+pool's redial budget was already spent, so they could not have armed one
+whatever they did. The honest statement is that **the ghost detector was
+budget-blind for most of the session**, and the swap-to-ghost rate is unknown.
+
+**Also measured, and it is the reassuring half:** `SubscriptionRejected`,
+`ParkReason`, `InstrumentsExceedLimit`, `FatalDisconnect` and `parked` each
+return **0 events**; `tv_dhan_ws_park_total` is 0 on all four reasons across
+8,640 EMF records; `tv_depth_rebalance_swaps_refused_total` is 0 on all five
+reasons. **No socket parked.** The wrong unsubscribe code costs redial churn
+and stale books, not sockets.
+
+**Still Unknown, and the gap is the one already flagged:** no `WS-GAP-02` line
+carries an instrument id (`{ $.fields.security_id = * && $.fields.code =
+"WS-GAP-02" }` → **0 events**), so the per-contract tail cannot be measured
+directly and the 375 s figure remains a ratio derivation assuming a steady
+packet rate. Adding `security_id` + `segment` to the ghost line is the
+prerequisite, and it is also what a Dhan support ticket needs.
+
+**Two counters this session quoted are in NO CloudWatch metric at all** —
+`tv_depth_rebalance_swaps_sent_total` and `tv_depth20_track_swaps_sent_total`
+exist only in the EMF log group and the local exporter. They are correct
+(1,799 and 7,662, verified exactly); they are simply not alarmable today.
+
+#### ⚠ CORRECTED in the same pass — "804 parks the socket" is STALE in TWO places
+
+The 2026-09-09 section's blocker list says *"804 parks the socket and the redial
+cannot reach a parked socket"*, and the 2026-09-08 (SECOND) section says a
+depth-200 over-subscribe is *"804, Fatal, parked for the session."*
+
+**Both were true until 2026-09-10 and are now wrong.** `classify_disconnect`
+maps `DisconnectCode::InstrumentsExceedLimit` to
+`DisconnectClass::SubscriptionRejected`, and `ParkReason::SubscriptionRejected`
+is the **only** reason in the tree whose `allows_one_respawn()` returns `true`.
+Its own docblock records the reasoning: neither overflow nor credential, the
+worst case of being wrong is one wasted dial on that slot alone, and *"a fresh
+connection resets the vendor's count"*.
+
+So 804 costs **one bounded respawn — riding the normal backoff ladder, the
+per-slot stagger and the flap floor — and then a park**, not an instant
+session-ending park.
+
+**This matters because the overstatement has already cost work:** the
+2026-09-09 section used the permanent-park reading to WITHDRAW the claim that
+the ghost detector makes a wrong unsubscribe code self-healing. That withdrawal
+was correct about a socket that has already parked and wrong about the blast
+radius. The blocker list itself STANDS — the cadence raise is still blocked by
+the per-call swap caps, the unguarded `send_swap` pending slot, the two QuestDB
+queries per iteration and the stall threshold — but the 804 row in it is
+smaller than written.
+
+**Both passages are left in place per house convention and corrected here.**
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Ships a third unsubscribe RequestCode on a guess, without a vendor answer or a
+  live reading that distinguishes it.
+- Raises the apply cadence citing this section — the read is negative, so the
+  FOURTH-quote ordering binds harder, not less.
+- Repeats "804 parks the socket for the session" without the one-respawn
+  correction.
+- Reports the 5,250,076 ghosts as data loss. They are written.
+- Cites the 80/40/40 "byte-identical signature" as evidence about the vendor —
+  it is `GHOST_REDIAL_SESSION_CEILING` × socket count and could report no other
+  number (see the CORRECTED block above).
+
+#### ⚠ 2026-09-11 — five traps in reading the NEXT session's data, found before it was read
+
+A ghost line and an ask line are now both instrumented, but a naive join of
+them (or of either against `market_depth`) returns a **clean-looking wrong
+answer**. Each of these was verified in source; none is a defect in the lane,
+and all five are properties of how the evidence must be QUERIED.
+
+| # | Trap | Why a naive read is wrong |
+|---|---|---|
+| 1 | **`Held` short-circuits over the UNION of both pools** (`depth_subscription_view.rs`: `depth20.contains \|\| depth200.contains` is tested BEFORE `dropped`) | A contract dropped from depth-200 while depth-20 still holds it classifies `Held`, never `Ghost`, and is never logged. That file's own docblock measures depth-200's entry set as *"by construction almost always inside depth-20's top 250 — roughly 19 of every 20."* **So depth-200 unsubscribes are nearly INVISIBLE to the ghost test, and their absence reads as "depth-200 unsubscribes worked."** The short-circuit is CORRECT for its real job — never redial a socket for a contract we legitimately hold elsewhere — so it must not be "fixed"; the reading must account for it. |
+| 2 | **`d5` rows are not depth-socket rows** | `market_depth` holds three `depth_kind`s, and `d5` comes from Full-mode MAIN-FEED packets. Since the 2026-09-11 FOURTH board puts SPOT on depth-20, and every spot is also a main-feed Full instrument, `d5` rows keep arriving after a spot unsubscribe — innocently, forever. **Filter `depth_kind IN ('d20','d200')` or every spot unsubscribe is unfalsifiable.** |
+| 3 | **Timestamp frames differ** | `market_depth.ts` is `received_at_nanos + IST_UTC_OFFSET_NANOS` — naive IST in a UTC-typed column — while the log timer emits a real `+05:30` offset. Comparing the log stamp as an instant against `ts` as UTC is out by **5 h 30 m**, so every row reads as "after" every ask. |
+| 4 | **Ring dwell back-dates rows** | `received_at_nanos = Utc::now() − frame.received_at.elapsed()`, so a row that physically arrived AFTER the ask can be stamped BEFORE it by up to the ring dwell (alarmed only at 2,000 ms, worst at the open). Early post-ask rows go missing from a strict `ts > ask` window. |
+| 5 | **`top_volume_rank` cannot defeat the re-subscribe confound for the contracts under test** | It persists only the top `TOP_VOLUME_RANK_PER_FAMILY` (250), and a contract is dropped *because* it fell off the board — so it usually has **no row at all**, not a `subscribed=false` row. `subscribed` also comes from the per-MINUTE publish while snapshots write at 1 s/5 s, so a re-subscribed contract reads `false` for up to 60 s. |
+
+**Two worst cases that are byte-identical to success, and must be excluded
+before any conclusion:** (a) a session where nothing left the top 250 produces
+zero asks AND zero ghosts — indistinguishable from "unsubscribe now works";
+the only separator is `unsubscribed_grace > 0`. (b) The deploy not shipping
+produces ghost lines with no ids — identical to 2026-09-10/11; **verify the
+binary sha before trusting a null result.**
+
+**What survives all five:** the ASK record (`depth_unsubscribe_sent`) has no
+redial ceiling, so it is the only surface covering the 78.5% of ghosting that
+happens after every socket exhausts its redials — and the one-socket depth-200
+probe in the CORRECTED block above needs none of these joins at all.
+
+### 2026-09-11 (SECOND) — the depth-200 hysteresis band widens 3 → 15, under the remedy the 2026-09-07 lock already prescribes
+
+**No new authorization is claimed, and none is needed.** The 2026-09-07 section
+legislates for this exact condition in advance, verbatim: *"If the swap budget
+is hit routinely, the answer is a longer window or a hysteresis band on
+entry/exit — NOT reverting to cumulative."* The swap budget is being hit
+routinely. This is that remedy, applied to the pool that is hitting it.
+
+#### The measurement that triggers it
+
+Read from the box, 2026-09-11, one continuous session (process up 08:30:49 IST,
+`NRestarts=0`):
+
+| reading | value |
+|---|---:|
+| `tv_depth_rebalance_swaps_sent_total` — **depth-200 pool, 5 sockets** | **1,799** |
+| Steering cycles in the capture window (23,100 s ÷ 60) | 385 |
+| Swaps per cycle, against `MAX_RANKED_SWAPS_PER_MINUTE` = 5 | **4.67 — 93.5% of the cap** |
+| Mean hold per depth-200 contract | **1.07 minutes** |
+| `tv_depth_rebalance_swaps_refused_total{*}` | **0 for every reason** |
+
+A deep socket held a contract for about one minute all session, and the pool sat
+pressed against its own safety valve. Every refusal counter reads zero — the
+machinery is not misbehaving; it is doing exactly what it was told, 1,799 times.
+
+#### ⚠ A correction to this file's own arithmetic, recorded because it was quoted
+
+The 2026-09-11 depth-subscription review quoted 1,799 as the whole system's swap
+count. **It is the depth-200 pool alone.** depth-20 keeps a separate counter that
+had never been read. Read the same day:
+
+| counter | value |
+|---|---:|
+| `tv_depth20_track_swaps_sent_total` | **7,662** |
+| `tv_depth20_ranked_swaps_total{outcome="planned"}` | 7,662 |
+| `tv_depth20_ranked_swaps_total{outcome="capped"}` | **24,607** |
+| `tv_depth20_ranked_swaps_total{outcome="unplaced"}` | 13,386 |
+| `tv_depth20_ranked_swaps_total{outcome="unfunded_departure"}` | 121 |
+| `tv_depth20_track_swaps_refused_total{*}` | 0 for every reason |
+
+**Both pools together: 9,461 swaps performed against 32,269 wanted — the caps
+refused 76% of the system's own appetite.** Each of the 250 depth-20 slots
+changed contract ~31 times (mean hold ~12.6 minutes), which is far calmer than
+depth-200's 1.07 minutes and is why this change touches depth-200 only.
+
+#### What changes
+
+`DEPTH200_HYSTERESIS_RANKS` 3 → **15**, so `DEPTH200_EXIT_UNDERLYINGS` moves
+8 → **20**. Entry is unchanged at the socket budget of 5.
+
+| | entry | exit | share of the ~208 live F&O underlyings |
+|---|---:|---:|---|
+| before | top 5 | top 8 | a held name lost its socket on falling out of the top **3.8%** |
+| after | top 5 | top 20 | it must fall out of the top **~10%** |
+
+**Nothing else moves.** The socket budget is 5, the instrument budget is 250 + 5,
+the per-minute swap cap is unchanged, placement still comes from the ENTRY set
+only, the ranking cadence is still 5 s and the apply cadence is still once a
+minute. Stock-options-only stands; index options and futures remain banned.
+
+#### Why 15, and the honest limit of the choice
+
+**It is not derived.** Nobody has measured how far an underlying's rank drifts
+between five-second windows — that is the number that would set this exactly,
+and it does not exist. 15 is the first value with a defensible MEANING: *entered
+as one of the five busiest names, keeps its socket until it is no longer among
+the busiest tenth.* Top-8-of-208 is not a statement about a name being busy; at a
+five-second sampling window on stock-option books this file already calls
+*"thinner than FINNIFTY's"*, it is rank noise — and 93.5% of cap is what rank
+noise looks like from the outside.
+
+**The depth-20 ratio is deliberately NOT the model.** That pool enters at 250 and
+exits at 300 — a 1.2× band — and copying the ratio would give depth-200 a band of
+ONE, which is worse than today. The pools differ in the COST of being wrong, not
+in proportion: losing a contract costs depth-20 one slot in 250 and costs
+depth-200 **one socket in five**, on a feed with **no snapshot-on-subscribe**, so
+the replacement book is silent until its next update.
+
+**The cost of being too wide, stated plainly:** the pool can hold names ranked
+16–20 while 6–15 sit unheld, because placement only happens into a socket whose
+contract has left the list entirely. Every such name entered as a top-five, so
+the set is "recently busiest", never arbitrary — and against a measured
+one-minute hold on a book that starts silent, a continuous hold on a
+recently-top-five name is very likely the better capture. **That is a judgement,
+and it is labelled as one.**
+
+#### NOT fixed by this, and it is a second churn source
+
+The published list carries **one contract per underlying**, and the planner keeps
+a socket only while that exact contract is still the list's pick for its name. If
+the underlying stays busy but its busiest STRIKE moves, the held contract falls
+off and the socket swaps — **even though the NAME never left the band.** Widening
+the band does nothing for that case. Keying the keep-test on the underlying
+rather than the contract is a semantic change to what a depth-200 socket
+promises, and it deserves its own decision rather than riding along here.
+
+#### NOT claimed
+
+That this fixes the churn. It is the first measured step, and
+`tv_depth200_ranked_swaps_total{outcome}` against the 1.07-minute mean hold is
+what tunes it: still near the cap next session means still too narrow; swaps
+collapsing to near zero with a stale held set means too wide. **Nothing may be
+reported as fixed until those move.** It also does nothing about the
+unsubscribe-code failure recorded in the section above — ghosts are a property of
+Dhan ignoring the instruction, not of how often we send it, though fewer swaps
+does mean fewer ghosts.
+
+#### The ratchet
+
+`depth200_candidates::tests::the_hysteresis_band_stays_wide_enough_to_mean_the_name_is_still_busy`
+asserts a FLOOR (`DEPTH200_HYSTERESIS_RANKS >= 2 × DEPTH_200_SOCKET_BUDGET`),
+never equality — tuning upward on the next measurement must not fail the build,
+narrowing back toward 3 must. Bite-proven in both directions on 2026-09-11:
+reverting the constant to 3 fails it; restoring 15 passes 85 depth-200 tests and
+the full 2,134-test app suite.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Narrows the band below the ratchet floor without a measurement showing rank
+  drift is small.
+- Widens the band by widening the ENTRY set — entry is the socket budget and
+  stays there; only the keep-test moves.
+- Changes the socket or instrument budgets under cover of this change.
+- Applies the same widening to depth-20, whose 50-rank band measured a 12.6-minute
+  mean hold and zero refusals.
+- Reports the churn as fixed before `tv_depth200_ranked_swaps_total` says so.
+
+### 2026-09-11 — THE DARK WINDOW AFTER A SUBSCRIBE IS MEASURED FOR THE FIRST TIME
+
+**The verbatim operator authorization (2026-09-11, typed directly in-session):**
+
+> "go ahead and add the time to first packet measurement dude okay?"
+
+Given in DIRECT response to a report whose "what I would do next" list opened
+with, verbatim: *"**Measure time-to-first-packet after every subscribe.** One
+timestamp on swap, one on the first depth frame for that contract, one
+histogram."* That is the §28.2/§28.3 authorization shape this repository
+already accepts — a general go-ahead answering an ENUMERATED ask selects the
+enumerated work. Recorded HERE, in the same change as the code, per the
+rule-file-first law.
+
+#### The gap it closes
+
+The operator asked how long a depth-20 resubscribe takes during a swap. Every
+number this repository could offer was a **BUDGET, not a measurement**:
+
+| Number | What it actually is |
+|---|---|
+| `SWAP_WIRE_BUDGET` = 1 s per side | the ceiling we WAIT before giving up |
+| `SUBSCRIBE_SEND_TIMEOUT` = 10 s | the transport's own send ceiling |
+| 1 swap/socket/minute | the rate the unreconciled-ack gate permits |
+
+None answers the question. They bound how long we wait; they say nothing about
+how long Dhan takes to start delivering the new book — and the India feed has
+**no snapshot-on-subscribe** (the "First Tick Snapshot" is documented only on
+the US global-stocks socket), so a freshly subscribed contract is not merely
+late, it is **BLANK until the book next changes**, and nothing in this process
+measured that window.
+
+#### What ships
+
+`crates/app/src/depth_first_packet.rs` — one tracker, four call sites:
+
+| Site | Cadence | Cost |
+|---|---|---|
+| depth-20 dispatch, `Ok(())` arm only | ≤ 20/min | O(1) |
+| depth-200 dispatch, `Ok(())` arm only | ≤ 5/min | O(1) |
+| frame drain, beside the ghost check, **before the level loop** | per depth PACKET | **one relaxed atomic load** when idle; + one hash probe while a swap is outstanding |
+| per-minute sweep, beside the swap-ack reconcile | 1/min | O(pending), capped at `MAX_PENDING` = 1,024 |
+
+> **⚠ CORRECTED 2026-09-11 — the depth-20 cadence in the table above read
+> “≤ 5/min” and the real figure is ≤ 20/min, four times higher.** Found by the
+> same 6-agent sweep that found the three code bugs in this module, and it is
+> the identical mistake this file records elsewhere in prose: the depth-200
+> cap IS five a minute pool-wide (`MAX_RANKED_SWAPS_PER_MINUTE` =
+> `DEPTH_200_SOCKET_BUDGET`, one per socket × five sockets, and its own
+> docblock says so in those words), and that figure was carried across to the
+> depth-20 row where it does not hold. depth-20 permits
+> `MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE` = 4 per socket
+> (`DEPTH_SWAP_COMMAND_CHANNEL_DEPTH`, const-asserted ≤ the channel depth
+> because “a cap above the depth is not a cap”) across five sockets.
+>
+> **Read the depth-200 row as correct and unchanged.** Only the depth-20 cell
+> moved.
+>
+> **What the wrong number understated:** the stamp rate into the pending set,
+> which is the input to the `MAX_PENDING` = 1,024 ceiling and to the
+> per-minute sweep's O(pending) cost. Neither conclusion changes — at 25
+> stamps a minute against a 120 s lifetime the set holds on the order of 50,
+> two orders of magnitude under the cap — but a reader sizing that ceiling
+> from this table would have been working from a quarter of the real rate.
+>
+> The reusable half is the one this file keeps recording: **a per-socket
+> figure and a pool-wide figure are different claims, and the two depth pools
+> express their caps in different units.** Quoting one pool's number into the
+> other pool's row is how they get conflated — and the two rows sitting
+> adjacent with the same value is exactly what made it look checked.
+
+Series (local `/metrics` only — see the budget row below):
+`tv_depth_first_packet_latency_ms` (histogram) and
+`tv_depth_first_packet_total{outcome="arrived"|"silent_window"|"refused"}`,
+all three seeded at zero at boot.
+
+#### ⚠ What the number composes — it is NOT a network round-trip
+
+The clock starts when the steering task successfully QUEUES the swap and stops
+at the first depth packet for that contract. Four terms, and only the first two
+are ours: queue wait · the connection task's wire writes · Dhan applying the
+subscription · **time until the contract's book next changes**. The fourth is
+the market's, and on a thin stock option it can be the whole figure. It is
+deliberately the UPPER bound — *how long until data flows again after we decide
+to swap* — because that is the number a fill depends on.
+
+Measuring from DISPATCH rather than from the wire write is also what keeps this
+an app-crate change: the wire write happens on the connection task in `core`,
+and reaching it would thread a clock through the transport for a term already
+bounded by `SWAP_WIRE_BUDGET`.
+
+#### ⚠ Why `silent_window` is not called a failure
+
+A contract with no depth packet inside `FIRST_PACKET_WINDOW_SECS` (120 s) may
+simply not have traded. Naming that "never arrived" would be a claim in the
+ALARMING direction about a book doing nothing wrong — the mislabel class this
+file keeps correcting. What it IS good for is the shape nobody could see
+before: a swap that acknowledged and then delivered nothing at all. With the
+unsubscribe code proven ignored on both 25 (2026-09-10) and 24 (2026-09-11),
+the arrival half is the only half left to check.
+
+#### ⚠ Budget: LOCAL ONLY, and that is the decision not an oversight
+
+No EMF selector entry, no CloudWatch alarm, **$0.00/mo**. The September
+forecast read live 2026-09-06 is **$142.24** against an automatic
+`STOP_EC2_INSTANCES` action line of **$135.00**, and §2.3n of
+`dhan-rest-only-noise-lock-2026-07-14.md` requires the next addition to arrive
+with a LEVER, not a cost note. This change carries no lever, so it carries no
+CloudWatch cost. It is the number an operator reads AFTER an existing page.
+
+#### ⚠ CORRECTED 2026-09-11 (same day) — the instrument had TWO fabricated-zero paths, and both biased it toward zero
+
+A six-agent adversarial sweep of this module, run hours after it landed and
+before it had ever produced a live reading, found two independent ways for it
+to record a **0 ms arrival that never happened**. Both are fixed; both are
+bite-proven in each direction. They are recorded rather than quietly patched
+because they are the same class as the pool-byte defect this section already
+carries — and because an instrument that is wrong toward zero is wrong in the
+direction that reads as good news.
+
+| # | Defect | Why it fires | Fix |
+|---|---|---|---|
+| **1** | A **ghost stream answers a fresh stamp.** `Key` is `(security_id, wire_segment, pool)` — the pool byte separates depth-20 from depth-200, but **nothing separates socket 3 from socket 7 inside one pool.** | Dhan ignores the unsubscribe (proven for code 25 on 2026-09-10 and code 24 on 2026-09-11; mean ghost tail ~374 s). A dropped contract keeps streaming from the OLD socket, leaves `held_anywhere`, is legally re-taken onto a DIFFERENT socket, and the next in-flight ghost packet resolves the new stamp at ~0 ms for a socket that has delivered nothing. | `record_subscribe_at` gains `may_already_be_streaming`, answered at both dispatch sites from `DepthSubscriptionView::classify_raw`. Anything but `Unknown` means this process has a recent record of the contract on a depth socket → refuse the measurement and count `unmeasurable`. |
+| **2** | A **back-dated receipt clamped to zero and counted as `arrived`.** | NOT an NTP edge case. The drain's `received_at_nanos` is deliberately back-dated by ring dwell (`Utc::now()` minus `frame.received_at.elapsed()`) while the stamp is a raw `Utc::now()`. Ring dwell has its own alarm at 2,000 ms, so under any backlog a packet received before the dispatch and drained after lands here. The old code did `.max(0)` and still counted `arrived`. | A receipt preceding its subscribe is counted `reordered` and records NO sample. The entry is still CONSUMED — the contract has delivered a packet, so it must not also age into `silent_window`. |
+| **3** | A **wire-REFUSED swap aged into a false `silent_window`.** | The stamp fires on the `Ok(())` arm of `try_send`, which proves the command reached a CHANNEL, not that the connection took it. On a `NotHeld`/refused/sender-dropped ack the believed hold is reverted — but the stamp survived and was swept at 120 s as a dark window for a subscribe that never happened. | `forget()`, called from both reconcile revert arms. Idempotent. |
+
+**Two honest limits, stated rather than left to be found.** The gate
+deliberately OVER-refuses the harmless cross-pool case, because `classify_raw`
+is pool-blind — depth-20 holding a contract now refuses a depth-200 stamp the
+pool byte would already have protected. Over-refusing costs one sample;
+under-refusing costs the series' credibility. And the module header's claim of
+*"Zero allocation on every arm"* was **false in the deallocation direction**
+and is corrected in place: `pin()` returns a `seize` guard whose drop runs that
+collector's deferred reclamation, so the drain — which pins far more often than
+the steering task — performs essentially all of this map's frees.
+
+**Also hardened in the same change, and it closes a finding in both
+directions:** `depth_first_packet_wiring_guard.rs` was the only guard of its
+family scanning RAW source while ten siblings strip comments first, so a
+deleted call site left behind as `// record_subscribe_at(...)` would have kept
+every assertion green. The inverse is not theoretical either — the explanatory
+sentence added to a dispatch site the same day moved the scan's anchor and
+turned a placement test RED against correct code. It now strips comments,
+anchors on the CALL rather than the bare name, carries a `guard_self_test`
+bite-proving it can fail, and drops an assertion that was **vacuous**
+(`level_loop > 0`, an offset that cannot be zero once the `find` succeeded).
+
+#### ⚠ What this does NOT do (Rule 11)
+
+- **It does not make a swap faster.** It reports how long the new contract
+  stays dark. The remedies — a fixed universe that never resubscribes, or a
+  vendor answer on the unsubscribe code — are unchanged.
+- **It does not measure the OTHER 49 instruments' exposure.** While a swap's
+  two wire calls run on the connection task, that task is not polling `recv()`,
+  so every instrument on that socket queues kernel-side. That is a separate
+  measurement and is NOT claimed here.
+- **No live reading exists yet.** The first session with this build is the
+  measurement; until then "a swap takes N ms" is not a claim this repository
+  can make, and the 2 s figure remains a CEILING that has never been observed.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Moves the observation INSIDE the depth level loop (a depth-200 frame carries
+  200 levels; the question has one answer per packet).
+- Drops the `connection_index != u8::MAX` gate (a replayed WAL frame reports a
+  latency against a clock that never ran).
+- Stamps the clock on a REFUSED dispatch arm (ages into a false
+  `silent_window`).
+- Runs the O(pending) sweep on the frame drain.
+- Removes the sweep (a dark contract is never counted, AND the hot-path gate
+  stays above zero for the session, so every depth packet pays a probe).
+- Quotes the histogram as a network round-trip, or as proof a swap is fast —
+  term 4 above is the market's, not ours.
+- Adds an EMF name or alarm for these series without a LEVER in the same
+  change.
+
+### 2026-09-11 (THIRD) — DEPTH-20 IS TOP 7 UNDERLYINGS BY PERCENTAGE MOVE, FUTURES + OPTIONS, FROM PRE-OPEN — and the 5-second cadence ask is WITHDRAWN
+
+**The verbatim operator demands (2026-09-11, typed directly in-session — preserve
+EXACTLY, expletives and typos included):**
+
+**Quote A (the withdrawal — this is what unblocks everything else):**
+> "yes go ahead with thsi newer requiremente which i have sated clealry dude okay firget the fucking dpeth 20 seconds level resuscoirbe bro okay? just go ehad wiht this newer mintue level resubscrbe newer requirmeen t aloen dude okay? do you really udnerstadn ddue okay?"
+
+**Quote B (the requirement):**
+> "see its simplembro just pcik the percnetage mvoe dude to fidn the top 7 that too startign pre oprn itself shodu lbe spotted dude okay? so after evry one minute also it shodu lobe chekd dude okay? do you understand my ppioitn dude okay? nwo did you get my point dude okay? i clelaury told yo uto pick top 7 futures startign pre makret based on percnetage change dude see that too after 9.15 am also startign 9l.16 am always check the same top 7 percnetage change current expiry futures dude and its repsective options of atm plus or minus also rigth for btoh calla nd ptu dude okay? and then for index only nifty and bankn ifty futures and its repscetive options atm plus or min us 10 rigth dude now chekc this and tell me will it sit udner 250 slots and how will yo usubscibre this also dude see because evry unique fno shouslbe be subscirbe dspeartely rigth dide becuase if you need to swap with subscirbe reusbscirbe emans then tell me dude okay?"
+
+**Quote A was given in DIRECT response to a message that had just reported the
+capacity arithmetic (247/250 at ATM±5), the swap-clock blocker (23 swaps to move
+one name against a 20/minute budget), and the five REJECT rows this reverses —
+and that closed by asking for his words on the record before any code. He
+answered by authorizing the design AND withdrawing the cadence ask that was the
+hardest blocker.** Recorded HERE, before the code, per the rule-file-first law.
+
+#### What Quote A RETIRES — and this is the most consequential line in this section
+
+The 5-second apply cadence has been asked for four times (2026-09-06 Quote A,
+the 2026-09-06 FOURTH quote, 2026-09-08, 2026-09-09) and refused four times for
+reasons recorded above: the per-call swap caps hold no cross-call state, the
+unguarded `send_swap` pending slot, two QuestDB queries per iteration against a
+5-second tick, and the 180 s stall threshold written for a 60 s loop.
+
+**Quote A withdraws it: "forget the … depth 20 seconds level resubscribe …
+just go ahead with this newer minute level resubscribe."** The apply cadence is
+therefore **ONE MINUTE, by the operator's own instruction**, and the four
+blockers above are moot rather than deferred. The FOURTH-quote ordering ("probe
+the unsubscribe code FIRST, then raise the cadence") is likewise moot for THIS
+design: there is no raise. It stands unchanged for any FUTURE cadence proposal.
+
+#### What this SUPERSEDES
+
+This reverses the 2026-09-06 depth lock on three of its four axes, and the
+2026-09-07 sort-key lock on one. Recorded rather than overwritten:
+
+| Surface | 2026-09-06 / 09-07 locked value | 2026-09-11 (THIRD) |
+|---|---|---|
+| Instrument class | stock options ONLY (`OPTSTK`); *"No underlying spot or futures or indices or indices fmo"* | **stock options + STOCK FUTURES + INDEX futures + INDEX options** (NIFTY/BANKNIFTY only) |
+| Selection unit | individual CONTRACTS, top 250 by volume | **top 7 UNDERLYINGS**, each contributing its future + ladder |
+| Sort key | `window_lots_milli` (lots traded in the window) | **absolute percentage move of the UNDERLYING**, in integer basis points |
+| Gainer role | eligibility FILTER, never the sort key | **the sort key itself** — and it is the ABSOLUTE move, so a faller ranks equally with a riser |
+| Ranking start | 09:15 (`within_capture_window`) | **09:00 — pre-open** |
+| Apply cadence | once a minute at :08 | **unchanged, once a minute** |
+| depth-200 | unchanged by this quote | **UNCHANGED** — top 5 distinct underlyings by lots-in-window, band of 20 |
+
+**depth-200 is NOT touched by this quote.** Quote B says *"this is purely
+related to depth 20"* in its 2026-09-06 ancestor and says nothing about the deep
+pool here. The 2026-09-11 (SECOND) band widening stands, the volume key stands,
+and stock-options-only stands for depth-200.
+
+#### The contract (LOCKED)
+
+| Aspect | Locked value |
+|---|---|
+| Selection unit | **UNDERLYING**, not contract |
+| Sort key | `move_bps = ((ltp_paise − prev_close_paise).abs() × 10_000) / prev_close_paise` — **i64, integer, no float anywhere on the path** |
+| Direction | **ABSOLUTE.** A −8% faller and a +8% riser rank identically. This follows the operator's 2026-09-06 words *"top 7 among between top gainers losers combined"*; it is the one place this section ASSUMES rather than quotes, and it is a one-constant flip (`DEPTH20_RANK_ABSOLUTE_MOVE`) if he means gainers only |
+| Inputs | `SpotPriceStore` (ltp) and `PrevCloseStore` (prev close) — both integer paise, both already live from 09:00, both already the gainer filter's own inputs |
+| Stock names | **top 7** by `move_bps` |
+| Per stock name | its **nearest-expiry FUTURE** (1 slot) + its options **ATM ± `DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE` = 5**, CE and PE (22 slots) = **23** |
+| Index names | **NIFTY and BANKNIFTY only**, unconditionally — never ranked, never displaced |
+| Per index name | its **nearest-expiry FUTURE** (1 slot) + its options **ATM ± `DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE` = 10**, CE and PE (42 slots) = **43** |
+| Total | 2 × 43 + 7 × 23 = **247 of 250** |
+| Ranking cadence | every minute, from **09:00** |
+| Apply cadence | every minute at :08 — **UNCHANGED** (Quote A) |
+| Entry / exit | enter at rank ≤ 7; **keep until rank > `DEPTH20_NAME_EXIT_RANK` = 12** |
+| Budget | 250 depth-20 instruments, 5 sockets × 50. UNCHANGED |
+| Segment | `NSE_FNO` only. SENSEX / BANKEX remain structurally impossible (BSE_FNO, Dhan serves depth on NSE alone) |
+| Contract source | the daily master artifact. Hardcoding contract ids remains a REJECT — they expire |
+
+#### The capacity arithmetic, and why ATM±5 is a CEILING not a preference
+
+| Block | Contracts | Slots |
+|---|---|---:|
+| NIFTY future | 1 | 1 |
+| BANKNIFTY future | 1 | 1 |
+| NIFTY options ATM±10 | 21 strikes × CE+PE | 42 |
+| BANKNIFTY options ATM±10 | 21 strikes × CE+PE | 42 |
+| 7 stock futures | 7 | 7 |
+| 7 stock ladders ATM±5 | 11 strikes × CE+PE × 7 | 154 |
+| **Total** | | **247** |
+| Ceiling (`5 × 50`) | | 250 |
+| **Spare** | | **3** |
+
+ATM±6 for stocks gives 275 — **over by 25**, and `plan_pool` refuses the WHOLE
+pool fail-closed rather than truncating, which is a session-ending failure. So
+±5 is the arithmetic ceiling in the operator's stated shape, not a judgement.
+
+**⚠ The packing caveat, stated because it changes the answer.** 250 is
+`5 sockets × 50` and a contract cannot straddle a socket. Under FREE packing
+(contracts fill any socket) 247 fits. Under SOCKET-AFFINE packing (all of one
+name's contracts on one socket, so a rotation touches one socket) NIFTY takes 43
+of 50 and BANKNIFTY takes 43 of 50, stranding 14 slots, and 7 × 23 = 161 does not
+fit the remaining 150 — ATM±4 (19/name → 133) does. **Free packing is what
+ships**, because the wider ladder is worth more than the cheaper swap at a
+one-minute cadence, and `plan_pool` already packs the main feed this way.
+
+#### ⚠ The swap clock — the honest cost, and why the band exists
+
+| Fact | Value |
+|---|---:|
+| Swaps per socket per minute | 4 (`MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE`, const-asserted = channel depth) |
+| Pool-wide per minute | **20** |
+| One stock name rotating out | 23 out + 23 in = **23 swaps** |
+| Minutes to apply ONE name change | **2** |
+| Whole board turning over | 250 ÷ 20 = **12.5 minutes** |
+
+A percentage-move key re-orders in BOTH directions every minute, unlike
+cumulative volume which only ever rises. **Without a band the board would chase a
+list it can never match**, and that is not a hypothetical: the 2026-09-11 (SECOND)
+section measured depth-200 at 93.5% of its swap cap with a 1.07-minute mean hold,
+on a key that at least rises monotonically.
+
+`DEPTH20_NAME_EXIT_RANK = 12` is the remedy the 2026-09-07 lock already
+prescribes verbatim — *"the answer is a longer window or a hysteresis band on
+entry/exit"* — applied at the NAME level: a name entered as a top-7 keeps its 23
+slots until it falls out of the top 12 (~6% of the ~208 live F&O underlyings).
+It is the same shape as depth-20's existing 250/300 contract band and
+depth-200's 5/20 name band, and it is **not derived** — no measurement of
+minute-to-minute rank drift on this key exists, because no session has ever
+ranked on it. `tv_depth20_name_swaps_total{outcome}` is the read-out that tunes
+it.
+
+#### ⚠ The honest envelope (mandatory per operator-charter §F)
+
+**Pre-open ranking is the cleanest part of this design and the operator is right
+about it.** Volume is zero for everything before 09:15, which is exactly why the
+2026-09-06 lock's own REJECT row calls a pre-open volume ranking *"meaningless"*.
+A percentage-move ranking has no such failure mode: both its inputs are live from
+09:00. The `within_capture_window` gate that starts at 09:15 exists to stop a
+midnight-spanning process publishing YESTERDAY's volumes — a volume-specific
+hazard — so opening the percentage ranking earlier is a narrow, reasoned unlock
+and NOT a weakening of that gate, which stays exactly as it is for the volume
+board.
+
+**NOT claimed — pre-open coverage is partial, and by how much is measured.** The
+2026-08-28 measurement in this file records that ~750 equities deliver one stale
+snapshot at ~08:30 (rejected, outside the window) and then **nothing until the
+09:07 auction print**. So between 09:00 and 09:07 most stock underlyings have no
+spot price and cannot be ranked at all; the board fills from whatever HAS printed
+and completes after the auction. An instrument with no spot must rank NOTHING —
+never zero, which would tie it with a genuinely flat name and hand it a socket.
+
+**NOT claimed — that this improves capture.** 2026-09-10 and 2026-09-11 both
+ended with every depth socket at `GHOST_REDIAL_SESSION_CEILING` and 5,250,076
+ghost packets still arriving, because Dhan ignored the unsubscribe on BOTH code
+25 and code 24. **Every swap this design performs is a swap whose unsubscribe the
+vendor is currently proven to ignore.** Fewer swaps means fewer ghosts, and a
+name-level band means far fewer swaps than a contract-level board — so this
+design is strictly better for that failure than what it replaces. It does not fix
+it, and the support ticket the 2026-09-11 section calls for remains the only
+real remedy.
+
+**NOT claimed — that a thin stock has a ±5 ladder.** 81 of 210 underlyings
+measured 2026-08-27 have ladders where ±25 already takes EVERY strike that
+exists. ±5 is 11 strikes, well inside that, so it is almost always available —
+but `fit_atm_window` returning fewer strikes than asked must fill the remainder
+from the next-ranked name, never leave slots idle and never silently narrow
+another name's window.
+
+**NOT claimed — that percentage move is the right key.** It is the operator's
+key. The measured argument for volume was that it finds the BUSIEST book;
+percentage move finds the most MOVED name, which is a different and equally
+defensible question for a depth capture. Recorded so the trade is on the record.
+
+#### ⚠ What this quote does NOT authorize
+
+- **Any change to depth-200.** Its key, band, budget and stock-options-only
+  restriction are untouched.
+- **Any deletion of SEBI or audit rows** — `instrument_lifecycle`,
+  `instrument_lifecycle_audit`, `index_constituency`, `order_audit`,
+  `order_update_events`, `position_update_events`, `ws_event_audit`. A general
+  "go ahead" is exactly the shape §5-class REJECT lists name as insufficient.
+- Any change to the socket or instrument budget (250 + 5 remain).
+- Any fifth Dhan endpoint type, or more than 16 total connections.
+- Raising the apply cadence — Quote A withdraws that ask outright.
+- Live order fire; `dry_run` stays true.
+- Any edit to the §28 frozen indicator/strategy area.
+- Widening `PrevCloseStore` to `NseFno` — the 2026-09-09 section's one
+  never-open row. The ranking uses the UNDERLYING's prev close, which is
+  `NseEquity` and already written.
+- Depth on `BSE_FNO`.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Uses a **float** anywhere in the sort key. The 2026-09-07 lock's reasoning
+  binds unchanged: a non-finite comparator is non-transitive and corrupts a sort
+  wholesale, and `prev_close = 0` is a proven NaN source in this repository.
+  Integer basis points remove the failure mode rather than guard against it.
+- Ranks a name whose spot or prev close is missing as 0% — that ties it with a
+  genuinely flat name and hands it a socket it did not earn.
+- Divides by a zero or non-positive prev close without refusing and counting.
+- Removes the name-level exit band, or lets a name lose its 23 slots on a single
+  minute in which it slipped to rank 8.
+- Applies the ranking from the frame drain, or more than once a minute.
+- Raises the apply cadence citing this section — Quote A withdraws the ask.
+- Lets a stock name displace NIFTY or BANKNIFTY, which are unconditional.
+- Ships ATM±6 or wider for stocks (275 > 250, and the pool is refused whole).
+- Hardcodes contract security-ids.
+- Reports the pool as enabled while its instrument set is empty — including the
+  09:00–09:07 window, where most equities have not printed.
+- Changes depth-200 under cover of this quote.
+
+### 2026-09-11 (SECOND) — THE VENDOR DOCUMENTATION SETTLES THE UNSUBSCRIBE CODE: it is 25, and 24 exists nowhere
+
+**The operator's instruction (2026-09-11, with four Dhan PDFs and a complete
+10,263-line documentation dump attached — preserve EXACTLY, typos included):**
+
+> "even take this also for reference and cross verification dude okay? i dont have the confidnece how wdo you assur eme dude i ene dth real tiem proevn gauarbteed assured verificatio n dude okay?"
+
+He supplied the vendor's own current documentation and asked for cross
+verification rather than assertion. This section is that cross verification, and
+it **overturns the 2026-09-10 change made by this repository.**
+
+#### What the vendor's own documentation says
+
+Pulled from `docs.dhanhq.co` on 2026-09-11 at 9:05 PM and supplied by the
+operator. The Annexure's **Feed Request Code** table, verbatim and complete:
+
+| Code | Action |
+|---|---|
+| 11 | Connect Feed |
+| 12 | Disconnect Feed |
+| 15 / 16 | Subscribe / Unsubscribe — Ticker Packet |
+| 17 / 18 | Subscribe / Unsubscribe — Quote Packet |
+| 21 / 22 | Subscribe / Unsubscribe — Full Packet |
+| **23** | **Subscribe — Full Market Depth** |
+| **25** | **Unsubscribe — Full Market Depth** |
+
+**The table skips 24.** And a search for the literal `24` as a request code
+across **all 10,263 lines** of the complete v2 documentation returns **ZERO**.
+
+The Full Market Depth guide itself is narrower still: it documents
+`RequestCode 23` (subscribe, in two payload shapes — the 20-level LIST form and
+the 200-level FLAT form) and `RequestCode 12` (**Feed Disconnect** — close the
+whole socket). It shows **no unsubscribe example at all**, and its own "Response
+Fields" tables list `Values: 23` and nothing else.
+
+#### What this overturns
+
+The 2026-09-10 section above changed the constant 25 → 24 and justified it:
+*"24 is not a guess: it is the ONLY other value either vendor surface names. The
+classic annexure page (stable across every crawl since 2026-06-02) lists
+`24 | Unsubscribe - Full Market Depth`."* **The operator's fresh pull refutes
+that.** 24 is named by no vendor surface in the documentation he supplied, and
+what shipped on 2026-09-10 was therefore an **undocumented code**.
+
+The constant is restored to **25** in the same change as this section, along
+with the three rule files and the builder docblock that carried the 24 claim.
+
+#### Why the restore is right even though 25 does not work either
+
+Both codes are now proven ignored, and — the load-bearing fact — **they fail
+IDENTICALLY**: 80 `unsubscribe_ignored` lines, split 40/40 across depth-20 and
+depth-200, on all ten sockets, every socket reaching
+`GHOST_REDIAL_SESSION_CEILING`, on each of two consecutive sessions. A code that
+was merely *wrong* would be expected to differ from another wrong code in at
+least one dimension. **Two byte-identical signatures is the evidence that the
+RequestCode is not the variable.**
+
+> **⚠ CORRECTED 2026-09-11 (same day) — the "byte-identical signature" argument
+> is CIRCULAR and must not be put in a vendor ticket.** 80 = `GHOST_REDIAL_
+> SESSION_CEILING` (8) × 10 depth sockets, and the 40/40 split is 5+5 sockets ×
+> 8: the line is emitted only inside the `Ok(())` arm of `request_ghost_redial`,
+> which refuses past the ceiling. Two saturated ceilings are identical by
+> construction, whatever the vendor did. The unbounded counters (`ghost`,
+> `unsubscribed_grace`) are the only discriminating numbers and were recorded
+> for one day only. **The CONCLUSION may well be right; the evidence offered
+> cannot support it.** Full correction, the one-socket probe that settles it in
+> ~4 minutes, and the untried `RequestCode 12`: see the dated block under
+> "⚠ RE-MEASURED 2026-09-11" above.
+
+When neither value works, the value's job changes. It stops being *"make it
+work"* and becomes *"make the vendor ticket unarguable"* — and
+*"we send the code your own annexure documents, and you ignore it"* is
+unarguable, while *"we send 24"* invites the reply *"24 is not a code"*. Shipping
+the documented value is also the only position that survives Dhan implementing
+the unsubscribe later without us noticing.
+
+#### Two further facts from the same documents, recorded because they close open questions
+
+1. **Depth breaks the `subscribe_code + 1` rule, by the vendor's own table.**
+   Ticker 15→16, Quote 17→18, Full 21→22, but depth 23→**25**. That asymmetry is
+   the vendor's, is now pinned by test, and must not be "corrected" back to 24 by
+   a future reader restoring the pattern.
+2. **Dhan documents no per-instrument depth unsubscribe in the depth guide at
+   all** — only `12`, which closes the socket. That is consistent with the wire
+   behaviour we measured, and it means **disconnect-and-resubscribe may be the
+   only mechanism the vendor actually implements** for changing a depth socket's
+   set. That bears directly on the socket-layout question and is recorded here
+   rather than left to be rediscovered.
+
+#### ⚠ What is NOT claimed
+
+That 25 works. It does not. This change does not stop a single ghost packet, and
+the depth sockets will keep receiving contracts this process unsubscribed until
+Dhan honours the request or the redial rebuilds the socket. The verdict
+instrument is unchanged: a session reading `ghost = 0` with
+`unsubscribed_grace > 0` on `tv_dhan_feed_depth_total`.
+
+**The apply cadence still does NOT move**, and the vendor ticket remains the
+only real remedy — now with the vendor's own annexure as its first exhibit.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Ships 24, or any other value absent from the vendor's Feed Request Code table.
+- "Restores" the `subscribe_code + 1` pattern for depth — the vendor's table
+  goes 23 → 25, and a test pins the asymmetry.
+- Ships a third guessed code instead of opening the vendor ticket.
+- Cites the 2026-09-10 section's "the classic annexure lists 24" claim without
+  re-pulling the documentation — that claim is refuted by the operator's own
+  2026-09-11 full-doc pull.
+- Reports the restore as a fix for the ghosts. It is a correctness fix for what
+  we SEND, not a repair of what Dhan DOES.
+
+### 2026-09-11 (FOURTH) — SIX MOVERS WITH THEIR SPOT, INDEX AT ATM ±11; AND THE SOCKET HANG-UP IS REFUSED ON MEASURED EVIDENCE
+
+**The verbatim operator demands (2026-09-11, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+**Quote A (the shape):**
+> "sso can we goa head with as per your reocmmedation dude which is top 6 alone dude see in that top 6 try ot add its udnerlying spot also dude okay? so now can we can duretcly disocnenct and reocnnect the ntire socket within a seocnd rigth dude for evry minute chekc rigth dude am i rgith dude see that too frehsly you can check this precisley on tuesdya rigth dude am i rgith dude tell me dude okay? ... see meanwhile to fill uo th entire index slots can we add one which is instea dof atm plus or minus 10 can we go ahead with plus or minus 11 dude okay?"
+
+**Quote B (the authorization):**
+> "whatve ror whichevr is reocmmended from your side go ahea ddude okay?"
+
+Quote B was given in DIRECT response to a message that ended with exactly one
+enumerated question — *"drop the socket hang-up and raise the swap budget
+instead — yes or no?"* — after the five findings below were put to him in full.
+That is the §28.2/§28.3 authorization shape this repository already accepts: a
+general go-ahead answering an ENUMERATED ask selects the enumerated work.
+Recorded HERE, before the code, per the rule-file-first law.
+
+#### What this AUTHORIZES
+
+| Surface | 2026-09-11 (THIRD) | Now |
+|---|---|---|
+| Stock movers | **7** | **6** (`DEPTH20_NAME_ENTRY_RANK`) |
+| Per stock name | future + options ATM±5 = **23** | **spot + future + options ATM±5 = 24** |
+| Stock spot segment | banned (`NSE_FNO only`) | **`NSE_EQ` ADMITTED for the six movers** |
+| Index ATM window | ±10 → 43 slots | **±11 → 47 slots** |
+| Board cost | 247 of 250 | **238 of 250**, 12 spare |
+| Apply cadence | once a minute | **unchanged — once a minute** |
+
+Everything else in the (THIRD) contract STANDS unchanged: NIFTY and BANKNIFTY
+unconditional and never displaced; ranking on the ABSOLUTE percentage move of
+the UNDERLYING in integer basis points; the name-level hysteresis band at
+`DEPTH20_NAME_EXIT_RANK = 12`; NSE_FNO for every contract; no BSE; no index
+spot; no hardcoded contract ids; `dry_run` true; §28 frozen.
+
+#### ⚠ The arithmetic makes the three changes ONE change
+
+`slots_for_name(N) = 1 + (2N+1) × 2` (`depth20_name_board.rs:317`).
+
+| Shape | Board cost | Verdict |
+|---|---|---|
+| index ±10, 7 stocks ±5 (authorized) | 2×43 + 7×23 = **247** | fits |
+| **index ±11, 7 stocks kept** | 2×47 + 7×23 = **255** | ❌ **the compile-time assert at `:331` FAILS THE BUILD** |
+| index ±11, 6 stocks, no spot | 2×47 + 6×23 = **232** | fits, 18 spare |
+| **index ±11, 6 stocks + spot** | 2×47 + 6×24 = **238** | ✅ fits, 12 spare |
+| index ±12 + future | `slots_for_name(12)` = **51** | ❌ one socket over on its own |
+
+So ±11 cannot ship with seven names, and the freed slots cannot buy a wider
+stock ladder either (6 × 27 + 94 = 256) or a seventh name (7 × 24 + 94 = 262).
+**Spot is the only thing that fits in the room ±11 creates.** Six is forced by
+the budget, not chosen.
+
+**Honest note on direction:** ±11 is a step UP from the (THIRD) authorization
+(±10) and a step DOWN from what is LIVE today — `depth20_layout.rs:58` runs
+`DEPTH_20_INDEX_STRIKES_EACH_SIDE = 12` with **no index future** (50 option legs
+filling the socket). Against the live shape this trades 2 strikes each side for
+the index future that centres the ATM window under the 2026-09-09 lock.
+
+#### ⚠ WHAT THIS REFUSES — the socket hang-up, and why
+
+Quote A proposes replacing the vendor-ignored per-instrument unsubscribe by
+CLOSING a depth socket and re-dialling it with a changed set, once a minute.
+**That is REFUSED**, and the refusal is the substance of Quote B. Five findings,
+all measured or in source:
+
+| # | Severity | Finding | Evidence |
+|---|---|---|---|
+| 1 | **FATAL** | No deliberate-close concept exists. `ConnEvent` has 11 variants; none means "our set changed" | `pool_supervisor.rs:614-647` |
+| 2 | **FATAL** | Every redial is recorded as a flap, with no way to mark one intentional — `enter_backoff` is the single site and records unconditionally | `pool_supervisor.rs:1569-1577` |
+| 3 | **HIGH** | Once a minute sits at 5 of a ceiling of 6. One vendor drop that minute breaches it → forced 30 s floor, socket classed pathological | `reconnect_ladder.rs:159,182,188` |
+| 4 | **HIGH** | A rebuilt socket counts as healthy only once a FRAME arrives — not on dial, not on ack. A thin book silent for 30 s makes the NEXT rebuild a short-session flap | `reconnect_ladder.rs:140,321-325` |
+| 5 | **HIGH** | The blind window is NOT the 0.31 s transport redial. The India feed has **no snapshot-on-subscribe**, so a re-subscribed contract is BLANK until its book next changes; the tracker gives up at `FIRST_PACKET_WINDOW_SECS = 120`, and a 09:50 delivery cliff where no new contract delivered at all is already measured | `depth_first_packet.rs:14-17,177` |
+
+> **⚠ CORRECTED 2026-09-12 — finding 1's variant COUNT was wrong, and it is the
+> one number in this table a reader can check in a second.** `ConnEvent` had
+> **12** variants when this table was written, not 11 — and has **13** since the
+> probe added `ProbeCloseRequested`. Counted rather than quoted:
+> `BeginDial · DialSucceeded · DialFailed · SubscribeAcked · SubscribeFailed ·
+> FrameReceived · KeepAliveReceived · Disconnected · IdleElapsed ·
+> FrameSilenceElapsed · GhostInstrumentDetected · ProbeCloseRequested ·
+> ShutdownRequested`. The line:column citation is also stale — the enum has
+> moved since.
+>
+> **The FINDING is UNCHANGED and is re-verified in source**: no variant meant
+> "our set changed", which is what makes the refusal correct. Only the count was
+> wrong, and it was wrong in the direction that looks careless rather than the
+> direction that misleads — but this file has now recorded the same shape five
+> times (the byte budget, the $130 ceiling, the September forecast, the
+> AccessDenied flag, the 80/40/40 signature), and the lesson each time is the
+> same: **a count is a measurement, and a measurement quoted from memory is not
+> one.** `awk '/^pub enum ConnEvent/,/^}/'` answers it.
+>
+> **What the 2026-09-12 probe section changes about finding 1, precisely:** it
+> ADDS the deliberate-close variant this finding says does not exist — scoped to
+> the probe alone, unreachable from the steering loop, and a REJECT to widen.
+> The refusal of the ROUTINE mechanism stands untouched: what it refuses is five
+> sockets every minute for 375 minutes, and the probe is one close per socket per
+> session, which is finding 3's own arithmetic read the other way (1 of 6, not
+> 5 of 6 — and 0 of 6 once finding 2 is neutralised by the `records_flap()`
+> condition INSIDE `enter_backoff`, never a bypass of it).
+**And the vendor evidence points the same way, harder.** Dhan documents 805 as
+*"Too many requests or connections. Further requests may result in the user
+being blocked"* (`docs/dhan-ref/08-annexure-enums.md:348`), our code parks a
+805'd socket PERMANENTLY (`pool_supervisor.rs:534,1285`), and
+`docs/dhan-support/2026-06-01-live-feed-429-from-cloud-ip.md:52` records this
+very account being refused with **HTTP 429** on the feed, our own hypothesis
+being *"our reconnect logic retried too aggressively"* — with the question *"is
+there a cap on new connection attempts per minute per dhanClientId?"* sent to
+Dhan and **never answered**. Hanging up five sockets once a minute is ~300
+connection attempts per session against that unknown.
+
+**A PR that adds a deliberate-close-and-redial path for depth is a REJECT**
+without its own fresh dated quote that engages findings 1-5 by name.
+
+#### The REPLACEMENT, authorized in its place
+
+The problem Quote A was solving is real and measured: **moving one name takes
+six minutes.** A name is 24 contracts and the per-socket budget is
+`MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE = 4`
+(`depth20_ranked_steer.rs:87`), which is not a wire limit — it is const-asserted
+equal to `DEPTH_SWAP_COMMAND_CHANNEL_DEPTH`, a queue depth. **Raising both so a
+whole name moves in one minute is authorized**, with three binding conditions:
+
+1. **It ships WITH the name board, never before it.** The current volume-keyed
+   contract board already refuses 24,607 swaps a session against 7,662
+   performed (MEASURED 2026-09-11) — raising the cap under THAT board
+   multiplies ghosts fourfold for nothing.
+2. **The cap stays const-asserted `<=` the channel depth.** A cap above the
+   queue is not a cap.
+3. **Socket-affinity is NOT adopted.** It was only ever needed to make hanging
+   up cheap; with hang-up refused it actively harms, because a name confined to
+   one socket draws on one 4-swap budget while a freely-packed name draws on
+   several. `plan_pool`'s flat `chunks()` shard (`dhan_feed_stack.rs:848-852`)
+   therefore stays as it is.
+
+**Why more ghosts is the safe direction, MEASURED across two full sessions:**
+sockets carried 50 wanted + ~25 ghosts = 75 against a documented cap of 50, for
+6.4 hours, and `tv_dhan_ws_park_total` was **0 on every reason**,
+`tv_dhan_ws_subscribe_failed_total` **0 on all eight reasons including all four
+`unsubscribe_*`**, with zero 804 and zero 805. Ghost cost is ~13.5% of depth
+rows ≈ 2.5% of the session's disk burn.
+
+#### ⚠ Honest envelope (mandatory per operator-charter §F)
+
+- **The 09:00 pre-open requirement CANNOT be met, and no code can meet it.**
+  MEASURED (`:2072`, 2026-08-27): equities deliver one stale ~08:30 snapshot
+  carrying YESTERDAY's timestamp — hard-refused since 2026-09-10 — and then
+  **nothing until the 09:07 auction print**. That print carries the LTP and the
+  previous close on the SAME packet, so ~208 names become rankable together at
+  ~09:07, eight minutes before the bell. 09:00-09:07 the pools hold the
+  previous session's validated seed (`depth_rebalance.rs:1673`, reason
+  `seed_until_first_ranking`) — which is already built and already wired, and
+  is the correct behaviour, not a gap.
+- **A name with a missing price ranks `None`, NEVER 0%** (`:194`, pinned by
+  `a_missing_price_is_not_rankable_and_is_never_zero`). Between 09:00 and 09:07
+  that is most of the equity universe, and ranking them 0 would tie them with
+  genuinely flat names.
+- **NSE_EQ depth is UNVERIFIED-LIVE.** Dhan documents it as supported and uses
+  it as their own subscribe example (`04-full-market-depth-websocket.md:13,274`
+  and the `"NSE_EQ","SecurityId":"1333"` samples at `:84,:96`); our guards
+  already admit it (`subscription_builder.rs:437-462`); the parser stores the
+  segment byte raw and `segment` is in the depth DEDUP key. **But no session has
+  ever sent one.** `IDX_I` by contrast is REFUSED at build time by our own
+  guard, which is why index SPOT can never join a depth socket.
+- **Stock spot depth is an INCREMENT, not new coverage.** The main feed runs
+  Full mode and already persists 5 levels of every equity's book via
+  `append_inline_depth` (`dhan_feed_stack.rs:6375`). This buys levels 6-20.
+- **Name-board churn is UNMEASURED** — the board has never run, so how often the
+  top 6 changes behind a band at rank 12 is Unknown. The swap counters are the
+  read-out and **they reach no AWS surface at all** (MEASURED: absent from the
+  namespace AND from the EMF group), so today they are unalarmable.
+- **NOT claimed:** that any of this improves capture. The unsubscribe remains
+  broken on the vendor's side; the fix is the support ticket, which is itself
+  blocked because no ghost log line carries a `security_id`.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Adds a deliberate socket close-and-redial path for depth without a fresh dated
+  quote engaging findings 1-5 by name.
+- Ships index ±11 while keeping seven movers (the build fails; do not "fix" it
+  by raising `DEPTH20_INSTRUMENT_BUDGET`, which is 5 sockets × 50 and is the
+  vendor's number).
+- Puts an `IDX_I` instrument on a depth socket, or a BSE segment.
+- Raises the swap cap before the name board is wired, or above the command
+  channel depth, or without keeping the const-assert.
+- Adopts socket-affine packing for depth-20 on the strength of this section.
+- Ranks a name with a missing price as 0%.
+- Presents the board as rankable at 09:00, or reports an empty 09:00 board as a
+  defect rather than as the exchange's own timetable.
+- Claims NSE_EQ depth works before a session has actually delivered one.
+
+### 2026-09-12 — THE TWO-ARMED UNSUBSCRIBE PROBE: code 25 CONFIRMED, a deliberate close is AUTHORIZED for the probe only, and a vendor report is drafted on failure
+
+**The verbatim operator demands (2026-09-12, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+**Quote A (the methodological point, which is the authority for the two-armed shape):**
+> "Why bro youdidnf include so key disconnect and reconnect dude because of we don't check both of them then nowhere we will easily identify which one is working right dude"
+
+**Quote B (the authorization, the code decision, and the vendor-report ask):**
+> "Yescheck everything dude so whenever something fails especially for unsubscribe we will clearly drop an email and drop the message even in madefortrade also to them dude okay? Meanwhile lets us check all these dude see for unsubscribe clearly note dude which is only 25 dude so we need to check socket disconnect and reconnect dude okay?"
+
+Quote B was given in DIRECT response to a message that enumerated the two-armed
+probe, named its one real piece of work (the deliberate close that must not
+record a flap), priced its cost at **one extra connection attempt rather than
+~300**, and asked for his word before building. That is the §28.2/§28.3
+authorization shape this repository already accepts. This dated section is the
+rule-file edit the section above demands **by name** — its REJECT list reads
+*"Adds a deliberate socket close-and-redial path for depth without a fresh dated
+quote engaging findings 1-5 by name"* — and §5 of this file's own law. Recorded
+BEFORE the code.
+
+#### Part 1 — the unsubscribe RequestCode is CONFIRMED at 25
+
+Quote B settles the decision that has blocked PR #1909: *"for unsubscribe
+clearly note dude which is only 25"*. `FEED_UNSUBSCRIBE_TWENTY_DEPTH = 25`
+stands, matching the vendor's own Feed Request Code table (23 subscribe → 25
+unsubscribe, skipping 24), and the 2026-09-10 flip to the undocumented 24 stays
+retired. **No third code may be guessed at.**
+
+#### Part 2 — WHY the operator is right, and what the one-armed design got wrong
+
+The executor proposed a ONE-armed probe (unsubscribe only). Quote A rejects it,
+correctly: a negative result on unsubscribe alone says *"this mechanism failed"*
+and cannot say *"the other one would have worked"*. Two mechanisms, one test
+each, or the session produces a third negative result and no decision.
+
+**And the executor's own prior answer was WRONG in a way this section corrects.**
+A previous turn told the operator that disconnect/reconnect "does not exist" and
+would not run on Tuesday. False: `ReconnectReason::GhostInstrument`
+(`pool_supervisor.rs`) is exactly disconnect-and-reconnect as a removal
+mechanism, it is wired, and it has already run ~80 times per session on two
+sessions. What was REFUSED in the section above is disconnect/reconnect as the
+**routine swap mechanism** — 5 sockets x every minute x 375 minutes, ~300
+connection attempts a session against a 429 question Dhan has never answered.
+Conflating a bounded test with an unbounded mechanism is what produced the wrong
+answer, and the distinction is load-bearing for everything below.
+
+#### Part 3 — the contract (LOCKED)
+
+| Aspect | Locked value |
+|---|---|
+| Shape | **TWO arms, one shot each, one session.** Arm A = unsubscribe and do not re-subscribe. Arm B = remove from the retained set, deliberately close, redial so the replay excludes it |
+| Scope | **depth-200 only**, because a depth-200 socket holds **exactly one** instrument, so nothing on that socket can mask the verdict. Never depth-20 |
+| Sockets | **two**, one per arm, so the arms cannot contaminate each other |
+| Runs | **ONCE per session**, operator-armed, never scheduled, never automatic |
+| Default | **OFF.** Serde default false; an absent section means the probe does not exist |
+| Restore | each arm **re-subscribes its instrument** when its watch window closes, so the pool is never left short for the session |
+| Verdict | four outcomes (A silent/not x B silent/not), each recorded with the contract id, the mechanism, the baseline and the observed counts |
+
+#### Part 4 — findings 1-5 of the refusal, engaged BY NAME as that REJECT row requires
+
+| # | The finding (verbatim shape) | Why it does not apply at probe scale, or how it is neutralised |
+|---|---|---|
+| **1** | *No deliberate-close concept exists. `ConnEvent` has no variant meaning "our set changed"* | **This probe ADDS one, and its scope is the probe.** A new reason variant exists solely so a probe close is distinguishable from a fault. It does NOT become available to the steering loop, and wiring it into a swap path is a REJECT below |
+| **2** | *Every redial is recorded as a flap; `enter_backoff` is the single site and records unconditionally* | **This is the one real piece of work.** The probe close must reach `enter_backoff` WITHOUT calling `record_redial`, or a deliberate close poisons the damper and the next genuine fault is mis-damped. The single-choke-point property of `enter_backoff` is PRESERVED — the flap recording becomes conditional on the reason, never a second bypassing path |
+| **3** | *Once a minute sits at 5 of a ceiling of 6* | **The probe is once per SESSION, not once per minute — 1 of 6, not 5 of 6.** And with finding 2 neutralised it is 0 of 6. The arithmetic that made the routine mechanism fatal is precisely what makes the one-shot safe |
+| **4** | *A rebuilt socket counts healthy only once a frame arrives; a thin book silent for 30 s makes the NEXT rebuild a short-session flap* | **Silence is the probe's SUCCESS signal, so "not proven healthy" is expected, not a defect.** The residual is real and is handled: the socket carries a not-proven-healthy state after Arm B, so the restore step must re-subscribe and the probe must not run inside the last 30 minutes of the session, where a lingering not-healthy state would meet the close |
+| **5** | *The blind window is not the transport redial; with no snapshot-on-subscribe a contract is BLANK until its book next changes* | **This is the probe's central measurement hazard and it is designed for, not waved away.** Silence after the action could mean the mechanism worked OR that the book simply went quiet. Therefore each arm MUST measure a **BASELINE FIRST** — frames observed on that socket in the N seconds before the action — and a verdict is only admissible when the baseline proves the book was active. A thin book disqualifies the run, and the probe reports `inconclusive_thin_book` rather than a false positive |
+
+**Finding 5 is the one that decides whether the probe is worth anything.** A
+contract delivering 100 frames a minute before the action and 0 after is
+evidence. A contract delivering 2 frames a minute is noise wearing the costume
+of evidence, and reporting it as a verdict would be the false-OK class this file
+exists to stop.
+
+#### Part 5 — the vendor report on failure (Quote B)
+
+When a run ends with a failing verdict, the operator wants Dhan told: *"we will
+clearly drop an email and drop the message even in madefortrade also to them"*.
+
+| Surface | What ships | What does NOT ship |
+|---|---|---|
+| Evidence | the probe writes a complete, committed support draft under `docs/dhan-support/` from the house `TEMPLATE.md`, filled from the REAL run: contract labels, SecurityId per contract, microsecond IST timestamps, the baseline and post-action frame counts, the request code sent, and the verbatim log lines | — |
+| Delivery | the verdict is a coded log line and the draft is a committed file; the operator reads both and sends | **No automated send, and NO new Telegram page.** The process does NOT email Dhan, does NOT post to MadeForTrade, and does NOT add a fifth Dhan-scoped alert family |
+
+**Why delivery is NOT automated, stated plainly rather than quietly omitted.**
+Three reasons, and none of them is capability: (a) `docs/dhan-support/README.md`
+mandates that every technical email is a committed markdown file shared as a
+GitHub rendered link, *"never as pasted plain text in Gmail"* — an auto-send
+would break the house workflow the operator himself wrote; (b) a message to a
+broker's support desk and a public post in their community are **outward-facing
+and irreversible**, and a false positive from a thin-book run would spam the
+vendor with a defect that does not exist, which costs exactly the credibility
+the ticket needs; (c) the draft is worth more than the send — the reason two
+prior sessions produced no ticket is that no log line named a contract, not that
+nobody could open Gmail.
+
+**If the operator wants the send automated as well, that is its own dated quote
+in this section**, and it should arrive only after the first draft has been read
+and judged accurate.
+
+#### Part 6 — honest envelope (mandatory per operator-charter §F)
+
+> "The probe answers ONE question: on this account, on this endpoint, does an
+> unsubscribe stop the stream, and does a close-and-redial stop it? Four outcomes,
+> each decisive in a different direction, each recorded with the contract id and
+> the baseline that makes it admissible. **NOT claimed:** that either mechanism
+> works — the probe is built precisely because nobody knows. **NOT claimed:** that
+> a silent socket proves the mechanism, absent a baseline that proves the book was
+> active; a thin-book run reports `inconclusive_thin_book` and no verdict. **NOT
+> claimed:** that one session generalises — one run on two sockets on one account
+> at one time of day is one data point, and a vendor may behave differently under
+> load. **NOT claimed:** that the probe fixes anything. It produces evidence and a
+> draft; the remedy is still Dhan's. **NOT claimed:** that `RequestCode 12` is
+> covered — the only stop mechanism the vendor's depth guide documents still has
+> zero production callers and is NOT in this probe."
+
+#### Part 7 — what a PR that violates this section looks like (REJECT)
+
+- Makes the deliberate-close reason available to the steering loop, the swap
+  path, or anything other than the probe — finding 2 of the refusal is
+  neutralised **for the probe**, never lifted.
+- Adds a second path that bypasses `enter_backoff` instead of making the flap
+  recording conditional inside it — that destroys the single-choke-point
+  property the guard pins.
+- Ships the probe enabled by default, on a schedule, or more than once per
+  session.
+- Runs either arm on a depth-20 socket (50 instruments mask the verdict).
+- Reports a verdict without a baseline, or reports a thin-book run as anything
+  other than `inconclusive_thin_book`.
+- Leaves an instrument unsubscribed after the watch window — each arm restores.
+- Runs inside the last 30 minutes of the session (finding 4's residual).
+- **Auto-sends an email to Dhan or auto-posts to MadeForTrade** without its own
+  fresh dated quote here.
+- Ships a support draft missing any identifier `CLAUDE.md` makes mandatory
+  (Client ID, Name, UCC, per-contract SecurityId, microsecond IST timestamps).
+- Guesses a third unsubscribe RequestCode.
+- Changes the socket or instrument budgets, `dry_run`, or the §28 frozen area
+  under cover of this quote.
+
+**Why no Telegram page, stated rather than silently omitted.** A "draft is
+ready" page would be a FIFTH Dhan-scoped alert family, and
+`dhan-rest-only-noise-lock-2026-07-14.md` §3 makes that a REJECT without its own
+dated quote in THAT file — *"Adds ANY new Dhan-scoped Telegram page outside the
+§2 4-item set"*. It would also cost ~$0.10/mo against a September forecast of
+**$142.24** and an automatic `STOP_EC2_INSTANCES` line at **$135.00**, where
+§2.3n requires a LEVER and this carries none. And it buys nothing: the probe is
+ONE-SHOT and OPERATOR-ARMED, so the operator already knows it ran. The four-item
+Dhan family is UNCHANGED by this section.
+
+#### Part 8 — the collision the design had to be changed for (MEASURED in source, not assumed)
+
+The first design of Arm A would have been **silently contaminated by Arm B**,
+and the mechanism is worth recording because nothing about it is visible from
+the call site.
+
+`DepthSubscriptionView` classifies an instrument this process dropped, still
+arriving past `GHOST_GRACE_SECS` (**90 s**), as a ghost; the drain then calls
+`request_ghost_redial(frame.connection_index, …)`. Arm A unsubscribes and
+deliberately does NOT re-subscribe — which is **exactly** the shape that
+classifies as a ghost. So ninety seconds into Arm A's watch window the ghost
+detector would close and redial Arm A's socket, applying **Arm B's mechanism to
+Arm A's measurement**, and the resulting silence would prove nothing about
+either.
+
+**The fix is a constraint, not a flag:** Arm A's watch window is
+const-asserted **strictly shorter than `GHOST_GRACE_SECS`**, so the ghost
+machinery can never engage during it. A suppression flag was rejected as the
+weaker form — a flag can drift out of lockstep with the grace constant and the
+failure would be silent, whereas an assert fails the build.
+
+This is also why the window is short enough to be scientifically sound only
+against a baseline: a liquid depth-200 contract delivers on the order of a
+hundred thousand rows a minute, so tens of seconds of true silence is
+overwhelming evidence, while the same window on a thin book is worth nothing.
+That is finding 5, and it is why Part 4 makes the baseline admissibility a
+condition rather than a nicety.

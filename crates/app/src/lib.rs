@@ -112,11 +112,16 @@ pub mod depth200_atm;
 pub mod depth200_candidates;
 pub mod depth200_ranked_steer;
 pub mod depth20_layout;
+pub mod depth20_name_board;
 pub mod depth20_ranked_steer;
 pub mod depth20_track;
+pub mod depth_first_packet;
 pub mod depth_rebalance;
 pub mod depth_seed;
 pub mod depth_subscription_view;
+/// The operator-armed, one-shot, two-armed unsubscribe probe (scope lock,
+/// 2026-09-12). DEFAULT OFF — see `DepthUnsubscribeProbeConfig`.
+pub mod depth_unsubscribe_probe;
 /// `[groww_universe]` process-global daily Groww watch-set + shared-master
 /// rider (2026-07-15 live-feed retirement re-home of the activation daily
 /// build loop + the sole persist_groww_instruments caller).

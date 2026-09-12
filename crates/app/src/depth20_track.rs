@@ -527,6 +527,32 @@ pub fn apply_depth20_plan(sockets: &mut [Depth20LiveSocket], plan: &Depth20Plan)
                     // scan of at most fifty items once a minute is the price
                     // of not depending on that staying true.
                     socket.held.retain(|h| *h != *release);
+                    // Start the dark-window clock for the ARRIVING contract
+                    // (2026-09-11). Stamped here, on the Ok arm only: the
+                    // refused arms below never reach the wire, so a stamp
+                    // there would age out into a false `silent_window`.
+                    // Refuse the measurement when this process has a recent
+                    // record of the contract on a depth socket: an ignored
+                    // unsubscribe leaves it streaming from the OLD socket, and
+                    // that packet would answer this stamp with a fabricated
+                    // ~0 ms. See `record_subscribe_at`.
+                    let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                    let may_already_be_streaming =
+                        crate::depth_subscription_view::global_depth_subscription_view()
+                            .may_already_be_streaming(
+                                take.security_id,
+                                take.segment.binary_code(),
+                                tickvault_core::parser::depth::DepthFeedKind::Twenty,
+                                now_nanos / 1_000_000_000,
+                            );
+                    crate::depth_first_packet::global_depth_first_packet_tracker()
+                        .record_subscribe_at(
+                            take.security_id,
+                            take.segment,
+                            tickvault_core::parser::depth::DepthFeedKind::Twenty,
+                            now_nanos,
+                            may_already_be_streaming,
+                        );
                     metrics::counter!(DEPTH20_SWAPS_SENT).increment(1);
                     sent = sent.saturating_add(1);
                 }
@@ -594,6 +620,14 @@ pub fn reconcile_pending_depth20_swaps(sockets: &mut [Depth20LiveSocket]) -> usi
                 } else {
                     held.push(p.release);
                 }
+                // The wire never took it, so its dark-window clock must stop
+                // here — otherwise it is swept at 120 s into `silent_window`,
+                // reporting a dark socket for a subscribe that never happened.
+                crate::depth_first_packet::global_depth_first_packet_tracker().forget(
+                    p.take.security_id,
+                    p.take.segment,
+                    tickvault_core::parser::depth::DepthFeedKind::Twenty,
+                );
                 unmarked = unmarked.saturating_add(1);
             }
             false

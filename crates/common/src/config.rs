@@ -118,6 +118,16 @@ pub struct ApplicationConfig {
     /// pipeline disabled + probe-and-report ON.
     #[serde(default)]
     pub option_chain_1m: OptionChain1mConfig,
+    /// `[depth_unsubscribe_probe]` — the operator-armed, one-shot, two-armed
+    /// unsubscribe probe (scope lock, 2026-09-12).
+    ///
+    /// DEFAULT OFF, and an absent section means off. A run EMPTIES one
+    /// depth-200 socket for about a minute and stalls the per-minute depth
+    /// steering for the length of the measurement; neither is something a
+    /// default build should ever do. Flipping the DEFAULT needs a fresh
+    /// dated operator quote in the scope lock, never a config edit alone.
+    #[serde(default)]
+    pub depth_unsubscribe_probe: DepthUnsubscribeProbeConfig,
     /// `[groww_option_chain_1m]` — Groww per-minute option-chain REST leg
     /// `[tf_consistency]` — daily timeframe-consistency verifier (operator
     /// directive 2026-07-13: *"how will you guarantee that all our defined
@@ -1461,6 +1471,36 @@ pub struct OptionChain1mConfig {
 /// serde default for [`OptionChain1mConfig::probe_and_report`] — ON.
 fn default_chain_1m_probe_and_report() -> bool {
     true
+}
+
+/// `[depth_unsubscribe_probe]` — the two-armed unsubscribe probe.
+///
+/// Every field defaults to FALSE, so an absent section, an empty section, and
+/// a section with only comments in it all mean the same thing: the probe does
+/// not run. That is deliberate — a run empties a depth-200 socket for about a
+/// minute, and the fail-safe direction for "somebody forgot to finish the
+/// config" is "measure nothing".
+///
+/// The two arms are separate flags rather than one enum because the honest
+/// answer needs BOTH on the same day and the operator may want to stage them.
+/// They land on DIFFERENT sockets when both are on: Arm A leaves the guard
+/// empty and Arm B measures the replay of that guard, so one socket for both
+/// measures neither.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+pub struct DepthUnsubscribeProbeConfig {
+    /// Master switch. With this false NEITHER arm runs, whatever the two
+    /// flags below say — one place to turn the whole thing off in a hurry.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Arm A: send the depth unsubscribe for ONE contract and watch whether
+    /// the vendor honours it.
+    #[serde(default)]
+    pub unsubscribe_arm: bool,
+    /// Arm B: close ONE socket and watch whether the re-dial's replay stops
+    /// the stream. The control for Arm A: if frames never stop even here,
+    /// the request code was never the variable.
+    #[serde(default)]
+    pub socket_close_arm: bool,
 }
 
 impl Default for OptionChain1mConfig {
@@ -4136,6 +4176,7 @@ mod tests {
             oms_reconcile: OmsReconcileConfig::default(),
             dhan_data_api: DhanDataApiConfig::default(),
             option_chain_1m: OptionChain1mConfig::default(),
+            depth_unsubscribe_probe: DepthUnsubscribeProbeConfig::default(),
             tf_consistency: TfConsistencyConfig::default(),
             rest_candle_fold: RestCandleFoldConfig::default(),
             market_ram_store: MarketRamStoreConfig::default(),
