@@ -919,6 +919,25 @@ pub const PREV_CLOSE_WRONG_DAY_COUNTER: &str = "tv_prev_close_store_wrong_day_to
 /// the whole signal.
 pub const TOP_VOLUME_APPEND_FAILURE_COUNTER: &str = "tv_top_volume_rank_append_failed_total";
 
+/// Contracts a snapshot could not project into a storable row, by reason.
+///
+/// Labelled `reason` with one series per [`SnapshotRefusal`], each pre-resolved
+/// and seeded at zero, because the Prometheus exporter renders no series it has
+/// never seen and each LABEL VALUE is its own series -- an unseeded reason is
+/// absent from `/metrics` until its first occurrence, which is the one moment
+/// an operator needs it already there.
+///
+/// Local `/metrics` only, like its two neighbours: no EMF name and no alarm,
+/// per the September budget position (forecast $142.24 against the $135.00
+/// automatic-stop line, where a new EMF name is ~$0.30/mo and the standing
+/// rule requires a LEVER rather than a cost note).
+///
+/// **`gain_unavailable` is EXPECTED to be non-zero** and is not a defect: it
+/// means the row was stored with a NULL `gain_pct` because the underlying had
+/// not printed yet. The other three reasons are zero on a healthy session and
+/// DO drop the row.
+pub const TOP_VOLUME_SNAPSHOT_REFUSAL_COUNTER: &str = "tv_top_volume_snapshot_refused_total";
+
 /// Narrows a WAL frame sequence onto the `i64` `ticks.capture_seq` column.
 ///
 /// # Why this function exists at all — the two-atomic hazard
@@ -1222,6 +1241,14 @@ pub struct LiveIngest {
     top_volume_append_failures: u64,
     /// Pre-resolved handle for [`TOP_VOLUME_APPEND_FAILURE_COUNTER`].
     top_volume_append_failure_counter: metrics::Counter,
+    /// Contracts refused by the snapshot projection this session, all reasons.
+    top_volume_snapshot_refusals: u64,
+    /// Pre-resolved handle per reason for
+    /// [`TOP_VOLUME_SNAPSHOT_REFUSAL_COUNTER`], indexed by
+    /// `SnapshotRefusal::index`. An array rather than a labelled macro call
+    /// per refusal, because a non-literal label drops `metrics::counter!` to
+    /// its allocating arm on a path that runs per contract per cadence.
+    top_volume_snapshot_refusal_counters: [metrics::Counter; 4],
     /// Edge latch for the "every gainer verdict was Unknown" line: once per
     /// session, because the condition persists for a whole session when it
     /// happens at all and a line per 5-second sweep would be 4,680 of them.
@@ -1565,12 +1592,35 @@ impl LiveIngest {
                         spot_prices.latest_paise(underlying_id, segment),
                         prev_close.get(underlying_id, segment),
                     )
-                    .unwrap_or(f64::NAN)
                 },
                 |security_id, segment| view.is_subscribed(security_id, segment),
             );
 
             refused = refused.saturating_add(projection.refusal_count());
+            for (security_id, reason) in &projection.refusals {
+                self.top_volume_snapshot_refusal_counters[reason.index()].increment(1);
+                self.top_volume_snapshot_refusals =
+                    self.top_volume_snapshot_refusals.saturating_add(1);
+                // `counter` is a FIELD, not decoration: an operator who greps
+                // the counter name lands here, and the loss-counter visibility
+                // guard can only SEE that a loss-shaped counter has a surface
+                // if its name appears beside a log. Throttled on powers of two
+                // because the open can refuse many contracts at once -- the
+                // 1st, 2nd, 4th ... of the session is logged, which reports the
+                // onset immediately and the MAGNITUDE without flooding.
+                if self.top_volume_snapshot_refusals.is_power_of_two() {
+                    tracing::warn!(
+                        code = tickvault_common::error_code::ErrorCode::WsGapConnectionState
+                            .code_str(),
+                        counter = TOP_VOLUME_SNAPSHOT_REFUSAL_COUNTER,
+                        source = "top_volume_snapshot_refused",
+                        reason = reason.as_str(),
+                        security_id = *security_id,
+                        refusals = self.top_volume_snapshot_refusals,
+                        "top_volume: a contract was refused by the snapshot projection. `gain_unavailable` is EXPECTED near the open and after a restart -- the row is still stored, with a NULL underlying-change column, so no volume is lost. Any OTHER reason drops the row and is zero on a healthy session."
+                    );
+                }
+            }
             let Some(writer) = self.top_volume.as_mut() else {
                 return (appended, refused);
             };
@@ -1642,14 +1692,24 @@ impl LiveIngest {
         // sweep. `flush` itself early-returns when `pending == 0`, so an idle
         // sweep still costs nothing.
         //
-        // NOT fixed by this, and stated because it was VERIFIED in source
-        // rather than assumed: an `append_row` that fails PART-WAY leaves the
-        // questdb-rs buffer in `TableWritten` state, which refuses every later
-        // row. `pending` is incremented only AFTER every `?` in `append_row`,
-        // so that case leaves `pending == 0` -- this gate reads false, and
-        // `flush` would early-return on `pending == 0` regardless. Recovering
-        // it needs the buffer cleared in `append_row`'s own error path, which
-        // is a separate change in the storage crate.
+        // ⚠ CORRECTED 2026-09-12 -- this paragraph used to close with
+        // "Recovering it needs the buffer cleared in `append_row`'s own error
+        // path, which is a separate change in the storage crate." **That
+        // change already existed when the sentence was written**, under the
+        // heading "# Why the marker (2026-09-09)" in
+        // `top_volume_rank_persistence::append_row`: it sets a MARKER before
+        // the row, `rewind_to_marker`s on any error, and falls back to
+        // `discard_pending()` if the rewind itself fails. So a half-written row
+        // cannot poison the buffer, and there is no storage-crate follow-up to
+        // open. Recorded rather than deleted because the cost of a stale
+        // "NOT fixed" note is the `day_ohlc_tracker` (2026-08-12) one: the next
+        // reader opens work that is already done.
+        //
+        // What the paragraph got RIGHT and is still worth keeping: `pending` is
+        // incremented only AFTER every `?` in `append_row`, so a failed append
+        // leaves `pending == 0` -- this gate reads false and `flush` would
+        // early-return regardless. That is now harmless rather than a leak,
+        // because the rewind already restored the buffer.
         if let Some(writer) = self.top_volume.as_mut()
             && (appended > 0 || writer.pending() > 0)
         {
@@ -1793,6 +1853,17 @@ impl LiveIngest {
                 c.increment(0);
                 c
             },
+            top_volume_snapshot_refusals: 0,
+            top_volume_snapshot_refusal_counters: crate::top_volume_snapshot::SnapshotRefusal::ALL
+                .map(|reason| {
+                    let c = metrics::counter!(
+                        TOP_VOLUME_SNAPSHOT_REFUSAL_COUNTER,
+                        "reason" => reason.as_str(),
+                    );
+                    // Seeded so the series EXISTS before the first refusal.
+                    c.increment(0);
+                    c
+                }),
             gainer_all_unknown_reported: false,
             leaderboard: crate::volume_leaderboard::VolumeLeaderboard::new(),
             replaying_wal: false,
@@ -17209,6 +17280,75 @@ mod tests {
         // the counter handle is resolved at construction.
         let ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
         assert_eq!(ingest.top_volume_append_failures(), 0);
+    }
+
+    /// Every refusal reason must get its own PRE-SEEDED counter series.
+    ///
+    /// The Prometheus exporter renders no series it has never seen, and each
+    /// LABEL VALUE is its own series -- so an unseeded reason is absent from
+    /// `/metrics` until its first occurrence, which is the one moment an
+    /// operator goes looking for it. Building the array by mapping over
+    /// `SnapshotRefusal::ALL` is what makes "one per reason" structural rather
+    /// than a list somebody must remember to extend; this pins that shape.
+    #[test]
+    fn every_snapshot_refusal_reason_is_seeded_at_zero() {
+        let src = include_str!("dhan_feed_stack.rs");
+        // Anchored on the SIBLING field's initialiser, not on the array's own
+        // name -- the name appears first in the struct DECLARATION, so
+        // splitting on it would window over the field's doc comment and assert
+        // nothing about the init. Anchoring outside the array also keeps the
+        // two assertions below non-vacuous: neither string is in the anchor.
+        let init = src
+            .split_once("top_volume_snapshot_refusals: 0,")
+            .expect("the refusal-counter array must be initialised")
+            .1;
+        let init = &init[..init.len().min(600)];
+        assert!(
+            init.contains("SnapshotRefusal::ALL"),
+            "the array must be built from ALL, so a new reason cannot ship \
+             without its own series"
+        );
+        assert!(
+            init.contains("c.increment(0)"),
+            "each series must be SEEDED at zero, or it does not exist in \
+             /metrics until the first refusal"
+        );
+
+        // And a fresh ingest has counted nothing.
+        let ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        assert_eq!(ingest.top_volume_snapshot_refusals, 0);
+        assert_eq!(
+            ingest.top_volume_snapshot_refusal_counters.len(),
+            crate::top_volume_snapshot::SnapshotRefusal::ALL.len(),
+            "one handle per reason, or `index()` reaches past the end"
+        );
+    }
+
+    /// The loss-shaped counter must keep its LOG, which is its only operator
+    /// surface -- it is deliberately not EMF-selected.
+    #[test]
+    fn the_snapshot_refusal_counter_is_logged_beside_its_emit() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let emit = src
+            .split_once("top_volume_snapshot_refusal_counters[reason.index()].increment(1)")
+            .expect("the per-reason increment must exist")
+            .1;
+        let window = &emit[..emit.len().min(1_600)];
+        assert!(
+            window.contains("tracing::warn!"),
+            "a counter whose name ends `_refused_total` and reaches no \
+             CloudWatch metric must reach the LOG, or the loss is measured and \
+             the measurement discarded"
+        );
+        assert!(
+            window.contains("counter = TOP_VOLUME_SNAPSHOT_REFUSAL_COUNTER"),
+            "the counter NAME must be a field on that line, so an operator \
+             grepping the name lands on it"
+        );
+        assert!(
+            window.contains("is_power_of_two()"),
+            "throttled, or one bad open floods the sink"
+        );
     }
 
     /// A packet stamped for a different trading day must not latch the

@@ -396,9 +396,28 @@ pub struct TopVolumeRankRow {
     /// cannot fit `i64` is refused by the projection rather than wrapped
     /// negative.
     pub window_lots_milli: i64,
-    /// Percentage change from the previous close. Already proven finite by
-    /// the ranking layer's `eligible_gain_pct` refusal.
-    pub gain_pct: f64,
+    /// The UNDERLYING's percentage change from its previous close, or `None`
+    /// when that is not knowable yet.
+    ///
+    /// `None` is written as an ABSENT ILP field, which QuestDB stores as NULL
+    /// — the `tick_persistence` per-feed-optional-column precedent. It is a
+    /// real state, not a defect: both inputs live in RAM stores fed only by
+    /// ticks (`SpotPriceStore`, `PrevCloseStore`), so an underlying that has
+    /// not printed since boot has neither. Equities give one stale ~08:30
+    /// snapshot and then nothing until the 09:07 auction print, and a
+    /// mid-session redeploy restarts both stores empty.
+    ///
+    /// # Why NULL and not a dropped row (2026-09-12)
+    ///
+    /// Until today an unknown gain DELETED the whole row. `gain_pct` is a leaf
+    /// DISPLAY column: it is not in the DEDUP key, the views pass it through
+    /// with no arithmetic, and nothing orders by it. So a `None` cost the
+    /// table the contract's VOLUME — the one thing it exists to record —
+    /// because a column beside it could not be computed.
+    ///
+    /// `Some` is still proven FINITE by the projection; a `NaN` never reaches
+    /// this field, it becomes `None` and is counted.
+    pub gain_pct: Option<f64>,
     /// Whether this contract actually held a depth subscription at this
     /// snapshot. The column that makes the table an audit rather than trivia.
     ///
@@ -741,9 +760,17 @@ impl TopVolumeRankWriter {
             .column_i64("lot_size", r.lot_size)
             .context("lot_size")?
             .column_i64("window_lots_milli", r.window_lots_milli)
-            .context("window_lots_milli")?
-            .column_f64("gain_pct", r.gain_pct)
-            .context("gain_pct")?
+            .context("window_lots_milli")?;
+        // OPTIONAL column -- omitted (NULL) when the underlying's gain is not
+        // knowable yet. Absent-field-is-NULL is the `tick_persistence`
+        // per-feed-optional precedent, and the row still carries 4 symbols and
+        // 7 fields so it can never become field-less.
+        if let Some(gain_pct) = r.gain_pct {
+            buffer
+                .column_f64("gain_pct", gain_pct)
+                .context("gain_pct")?;
+        }
+        buffer
             .column_bool("subscribed", r.subscribed)
             .context("subscribed")?
             .at(TimestampNanos::new(r.snapshot_ts_ist_nanos))
@@ -1321,7 +1348,7 @@ mod tests {
             delta_units: 8_500,
             lot_size: 200,
             window_lots_milli: 42_500,
-            gain_pct: 4.25,
+            gain_pct: Some(4.25),
             subscribed: true,
         }
     }
@@ -1722,6 +1749,56 @@ mod tests {
             w.buffer_utf8().contains("subscribed=f"),
             "a false must be recorded, or the audit cannot tell 'we missed it' \
              from 'no row was written'"
+        );
+    }
+
+    /// An unknown underlying gain must OMIT the ILP field (QuestDB NULL) and
+    /// leave every other column of the row intact.
+    ///
+    /// This is the bite for the 2026-09-12 fix. Before it, `gain_pct` was a
+    /// bare `f64` and an unknown gain took the ENTIRE row out of the table --
+    /// so the assertion that matters is not the absence of `gain_pct=`, it is
+    /// the PRESENCE of `volume=` beside it.
+    #[test]
+    fn append_row_omits_gain_pct_when_it_is_unknown() {
+        let mut w = TopVolumeRankWriter::for_test();
+        let mut r = row();
+        r.gain_pct = None;
+        w.append_row(&r).expect("append");
+        let line = w.buffer_utf8();
+        assert!(
+            !line.contains("gain_pct="),
+            "an unknown gain must be an ABSENT field (NULL), never a written \
+             value -- a 0.0 there reads as a flat underlying: {line}"
+        );
+        assert!(
+            line.contains(&format!("volume={}i", r.volume)),
+            "the row must still carry its volume -- that is the column this \
+             table exists for, and the whole reason the gain no longer drops \
+             it: {line}"
+        );
+        assert!(
+            line.contains(&format!("window_lots_milli={}i", r.window_lots_milli)),
+            "and the ranking key, or the ordering is uncheckable: {line}"
+        );
+        // No `flush` assertion: `for_test` has no sender, so a NON-EMPTY
+        // flush is an error BY DESIGN (see
+        // `a_flush_without_a_sender_discards_and_reports`). The proof that the
+        // line is well-formed is that `append_row` returned `Ok` -- it commits
+        // the marker only after the whole chain, `at()` included, succeeded.
+    }
+
+    /// The complement: a known gain is still written.
+    #[test]
+    fn append_row_writes_gain_pct_when_it_is_known() {
+        let mut w = TopVolumeRankWriter::for_test();
+        let mut r = row();
+        r.gain_pct = Some(-3.5);
+        w.append_row(&r).expect("append");
+        let line = w.buffer_utf8();
+        assert!(
+            line.contains("gain_pct=-3.5"),
+            "a known gain must be stored verbatim, negatives included: {line}"
         );
     }
 
