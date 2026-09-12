@@ -2216,10 +2216,7 @@ wording, `docs/dhan-ref/08-annexure-enums.md:348` — *may*, which this line pre
 asserted flatly as "an account block"). **The RANKING runs every 5 seconds (⚠ CORRECTED: this said "measured ~70 µs,
 0.0014%". That was the `scan_silence` constant borrowed from a LINEAR scan and
 applied to a `sort_unstable_by` — an invalid transfer, and it was the number used to
-argue the heap design away. Actually MEASURED at 900 µs, a 0.018% duty cycle, by
-`rank_sweep_cost_at_the_authorized_ceiling`. The CONCLUSION is unchanged — 0.018% is
-still negligible and the heap's threshold-poisoning is still catastrophic — but the
-evidence for it was overstated 15x and is now real); the SUBSCRIPTION moves only the delta, edge-triggered and capped per
+argue the heap design away. ⚠ CORRECTED AGAIN 2026-09-12: the replacement figure "900 µs, a 0.018% duty cycle" was ALSO not a measurement — that harness was timing an EMPTY sort under a constant lot stub. Re-measured with the harness repaired and asserting a filled board: 2.95 ms at the ceiling where every contract traded, 123 µs at the assumed realistic shape. The CONCLUSION is unchanged twice over — even 2.95 ms is a 0.295% duty at 1 s and the heap's threshold-poisoning is still catastrophic — but the number was first understated 15x, then overstated 3.3x, and is now real); the SUBSCRIPTION moves only the delta, edge-triggered and capped per
 window**, which is the shape the existing re-fit already uses and for these reasons.
 
 **NOT claimed — that this improves capture.** 2026-09-04 captured ZERO ticks and
@@ -2660,7 +2657,7 @@ faces gives that without writing every row twice.
    the ghost redial above makes a wrong code SELF-HEALING rather than fatal,
    which is what makes the raise safe to do next, but the raise itself needs
    its own dated row and is not smuggled in here.
-2. **A swap is not O(1) on the wire.** Ranking is O(n log n) at 900 µs; the
+2. **A swap is not O(1) on the wire.** Ranking is O(n log n) at 123 µs realistic / 2.95 ms at the ceiling (MEASURED 2026-09-12; the "900 µs" this line carried came from a harness timing an empty sort); the
    subscription CHANGE is one unsubscribe + one subscribe per swap with a 2 s
    wire budget, serialised per socket. The honest claim is "delta-only, capped
    per socket, edge-triggered" — never "O(1) resubscribe".
@@ -4683,6 +4680,39 @@ when the harness executes no append at all.
 actually traded and uses a real lot-size lookup. No duty-cycle claim may cite the
 old number.
 
+#### ✅ REPAIRED AND MEASURED 2026-09-12 — and the true ceiling is 3.3× WORSE
+
+`rank_sweep_cost_at_the_authorized_ceiling` now advances contracts before every
+timed round, probes a real lot-size `HashMap` per contract (production resolves
+through `global_contract_underlying_map().owner_of(..)` — a global load plus a
+probe, which the constant `lot1` stub let the optimiser delete), times ONLY the
+sweep, and **ASSERTS it filled the board** — so it can no longer report a number
+from an empty sort. Release, x86 dev container, 20,220 tracked contracts:
+
+| contracts that TRADED in the window | sweep | duty at 1 s |
+|---|---:|---:|
+| 20,220 — every one (the ceiling) | **2.95 ms** | 0.295% |
+| 2,000 (Assumed realistic) | **123 µs** | 0.012% |
+| 500 | 28.7 µs | 0.003% |
+| 100 | 6.4 µs | 0.0006% |
+| 20,220, full rank + distinct(5) | 2.50 ms | 0.050% at 5 s |
+
+**The withdrawn figure was optimistic by 3.3×, not pessimistic.** Two separate
+omissions compounded: the empty sort, and the folded-away lot probe — which
+alone accounts for 1.78 ms → 2.95 ms, measured by running the repaired harness
+once with the stub and once with the probe.
+
+**What the dirty sets buy, on these numbers:** 2.95 ms → 123 µs at the assumed
+realistic shape, a **24× reduction**, and 460× at 100 traded. The worst SECOND —
+all four cadence arms landing together, both families, every contract trading —
+is 8 sweeps ≈ **23.6 ms, a 2.4% duty cycle** on the drain task; at the realistic
+shape it is ~1 ms, ~0.1%.
+
+**Still Assumed:** the 2,000-traded row. Nobody has measured how many of ~20,000
+strikes trade in one second; the measuring query is named in
+`top_volume_rank_persistence`'s header. It is SWEPT here rather than asserted,
+so a reader sees the shape instead of one number they would then quote.
+
 #### ⚠ The defects that must be fixed BEFORE a cadence is added
 
 1. **The compile error trains you to write the bug.** Adding a cadence correctly
@@ -4738,7 +4768,11 @@ become a one-line edit.
 > invariant the dirty set depends on is pinned by its own test; the persisted
 > percentage column is an integer and the comparator stays integer-only.
 > **NOT claimed:** per-sweep O(1) — impossible, and the honest floor is Θ(traded).
-> **NOT claimed:** any duty-cycle figure derived from the old 900 µs harness.
+> **NOT claimed:** any duty-cycle figure derived from the old 900 µs harness —
+> withdrawn, and replaced by the repaired harness's measured 2.95 ms ceiling /
+> 123 µs realistic. **NOT claimed:** that the 2,000-traded figure those
+> realistic numbers assume is measured — it is not, and it is swept rather than
+> asserted for exactly that reason.
 > **NOT claimed:** measured row counts for the 3s, 5s or 1m windows without the
 > cut — those are modelled from one session's distinct-instrument count; only the
 > 1-second case was ever read from the database. **NOT claimed:** that any of this

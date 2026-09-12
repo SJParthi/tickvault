@@ -953,8 +953,39 @@ pub const TOP_VOLUME_FLUSH_QUEUE_DEPTH: usize = 4;
 /// Consecutive full-queue flushes the producer may RETAIN before it stops
 /// widening the buffer and drops instead.
 ///
-/// TWO, matching [`crate::depth_persistence::MAX_TOP_VOLUME_RETAINED_FLUSH_SPANS`]'s
-/// sibling for the same reason as the queue depth.
+/// TWO, matching [`crate::depth_persistence::MAX_DEPTH_RETAINED_FLUSH_SPANS`]
+/// for the same reason as the queue depth: one shape across the three writer
+/// paths is what stops them drifting into different failure semantics.
+///
+/// ⚠ RE-DERIVED 2026-09-12 for the cadence expansion, and the intra-doc link
+/// above was BROKEN — it read `depth_persistence::MAX_TOP_VOLUME_RETAINED_FLUSH_SPANS`,
+/// a path that does not exist, so the "matching" claim pointed at nothing.
+///
+/// The CONSTANT does not move; what moved is what it buys in WALL-CLOCK time,
+/// and that is worth stating because the number is a SPAN count and reads like
+/// a duration. A span is one flush attempt that found the queue full, so the
+/// tolerance is `spans ÷ flush rate`, and the flush rate is the cadence count:
+///
+/// | | flushes in the worst second | tolerance past a full queue |
+/// |---|---|---|
+/// | 2 cadences (1 s, 5 s), before 2026-09-12 | 2 | ~3 s |
+/// | 4 cadences (1 s, 3 s, 5 s, 1 m), now | 4 | ~2.2 s |
+///
+/// One flush per `snapshot_top_volume` call, NOT one per family — the flush
+/// sits outside the family loop (`dhan_feed_stack::snapshot_top_volume`), so
+/// the four arms coinciding at the minute mark is four attempts, not eight.
+/// Verified in source 2026-09-12 rather than assumed; a hostile review of this
+/// change asserted the per-family doubling and it is not there.
+///
+/// So the stall a healthy queue absorbs shrank from ~7 s to ~6.2 s
+/// (4 queued batches + the retained spans). That is a REDUCTION and it is not
+/// raised here, for two reasons stated plainly rather than waved past: the
+/// failure it guards is a QuestDB stall, which this repository has on record
+/// at the 2026-08-25 and 2026-09-02 scale — MINUTES, not seconds, so neither 6
+/// nor 7 saves the snapshot; and what is lost when it fires is one snapshot of
+/// a leaderboard that is rebuilt from RAM a second later, never a tick. Raising
+/// it trades a bounded, logged, tickless hole for unbounded producer memory on
+/// the drain, which is the worse side of that trade.
 pub const MAX_TOP_VOLUME_RETAINED_FLUSH_SPANS: u32 = 2;
 
 /// Byte ceiling on the buffer the producer retains while the writer is behind.

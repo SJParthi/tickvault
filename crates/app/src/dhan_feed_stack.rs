@@ -1344,8 +1344,12 @@ impl LiveIngest {
         // of the table a silent degrade of the depth pool.
         //
         // The early exit is kept for the case where NEITHER wants anything,
-        // because ranking to discover that would pay the ~900 us sort on the
-        // 1-second arm for nothing.
+        // because ranking to discover that would pay the sweep on the 1-second
+        // arm for nothing -- MEASURED 2026-09-12 at 123 us in the assumed
+        // realistic shape and 2.95 ms at the ceiling where every contract
+        // traded. (This comment said "~900 us" until then; that figure came
+        // from a harness that was timing an empty sort -- see
+        // `volume_leaderboard`'s header.)
         let wants_rows = self.top_volume.is_some();
         let wants_candidates =
             cadence == tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond;
@@ -8860,14 +8864,19 @@ pub const DEPTH_ATTACH_HARD_STOP_IST_SECS: u32 =
 /// against the previous value, and a number cannot be compared wrongly by
 /// locale, padding or separator. Floor division, so a pre-1970 clock (a box
 /// with no NTP yet) still moves monotonically instead of wrapping.
-/// The two top-volume snapshot cadences, per the operator's 2026-09-06 ask for
-/// 1-second and 5-second granularity.
+/// The top-volume snapshot cadences: 1 s, 3 s, 5 s and 1 m, per the operator's
+/// 2026-09-12 ask ("for every 1s,3s,5s and even 1m inclduign as well").
+///
+/// ⚠ This read "The two top-volume snapshot cadences, per the operator's
+/// 2026-09-06 ask for 1-second and 5-second granularity" until 2026-09-12.
+/// Two became four; the doc is corrected rather than left to be read as a
+/// statement of the current set.
 ///
 /// The five-second boundary is the one the depth set is re-steered on, so those
-/// rows are the ones that actually drove a subscription decision; the
-/// one-second rows are the finer record underneath them. Both are written --
-/// deriving the 5s rows from the 1s rows at query time would work only while
-/// every second is present, and the whole point of the `subscribed` column is
+/// rows are the ones that actually drove a subscription decision; the others
+/// are the finer and coarser record around them. Every cadence is written --
+/// deriving one from another at query time would work only while every
+/// interval is present, and the whole point of the `subscribed` column is
 /// to audit sessions where something was missing.
 ///
 /// Both periods are DERIVED from the cadence enum's own `interval_secs`, not
@@ -12086,7 +12095,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             Ok(_handle) => {
                 ingest = ingest.with_top_volume_writer(producer);
                 info!(
-                    "top-volume snapshots enabled — 1s and 5s rankings will be written off                      the drain"
+                    "top-volume snapshots enabled — 1s, 3s, 5s and 1m rankings will be written                      off the drain"
                 );
             }
             Err(err) => {

@@ -33,11 +33,32 @@ tests) except the two documented one-shots above.
 
 | Sweep | Cadence | Measured | Harness | Status |
 |---|---|---|---|---|
-| `VolumeLeaderboard::rank` | 1 s + 5 s, both families | 900 µs | `rank_sweep_cost_at_the_authorized_ceiling` | Verified |
+| `VolumeLeaderboard::rank` | 1 s + 3 s + 5 s + 1 m, both families | ~2.9–3.3 ms | `rank_sweep_cost_at_the_authorized_ceiling` | **⚠ CORRECTED 2026-09-12** |
 | `catch_up_seal_all` | 5 s | 9.67 ms (0.2 % duty) | `catch_up_seal_all_sweep_cost_at_the_authorized_ceiling` | Verified |
 | `scan_silence` | 30 s | 69.8 µs | `scan_silence_sweep_cost_at_the_authorized_ceiling` | Verified |
 | `gainer_eligible` | 5 s | harness present | `gainer_eligible_sweep_cost_at_the_authorized_ceiling` | Verified |
-| `snapshot_top_volume` (≤ 500 ILP appends) | 1 s + 5 s | CLAUDE.md says "inside the measured 900 µs" — the sort harness does NOT cover the append | — | **Assumed** |
+| `snapshot_top_volume` (ILP appends) | 1 s + 3 s + 5 s + 1 m | the sort harness does NOT cover the append; the "inside the measured 900 µs" wording it quoted is WITHDRAWN (see below) | — | **Assumed** |
+
+> **⚠ CORRECTED 2026-09-12 — the 900 µs in the two rows above is WITHDRAWN, and it
+> was wrong in the REASSURING direction.** The harness that produced it seeded every
+> tracked contract with a volume equal to its own baseline, so every row had a window
+> delta of zero, every row was skipped before the comparator, and the "sort" it timed
+> was a sort of an EMPTY slice. It also timed `rank_distinct_underlying`, deleted
+> 2026-09-08.
+>
+> Re-measured 2026-09-12 with the harness repaired (contracts actually trade first,
+> and the lot lookup is a real hash probe rather than a constant stub), at the
+> 20,220-contract ceiling: **2.95 ms** when every contract traded, **123 µs** at 2,000
+> traded, **29 µs** at 500. An independent re-run of the ceiling case gave ~3.24 ms, so
+> read it as a **~2.9–3.3 ms band**, not a point.
+>
+> So the true ceiling is **~3.3× WORSE**, not better. The verdict is unchanged and is
+> now actually supported: 2.95 ms once per second is a 0.29 % duty cycle, and
+> every-contract-traded is not a market that exists. The realistic 123 µs is 0.012 %.
+>
+> The cadence column also moved: this audit was written when there were TWO cadences
+> (1 s, 5 s). There are now FOUR — the four arms coincide once a minute, so the worst
+> SECOND carries four sweeps, not two.
 | `drain_main_feed_frame` end to end at 12,500 pkt/s | continuous | no Criterion, no DHAT | — | **Unknown** |
 
 ## 3. Stale against the code in CLAUDE.md's table
