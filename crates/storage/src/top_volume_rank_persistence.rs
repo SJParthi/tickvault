@@ -1103,16 +1103,124 @@ pub const MAX_TOP_VOLUME_RETAINED_FLUSH_SPANS: u32 = 2;
 /// cannot silently invalidate it again. Still well under the depth path's
 /// 32 MiB, which is the property the sizing test pins.
 const TOP_VOLUME_MAX_ROWS_PER_SWEEP: usize = 25_000 * 2;
-/// Measured ILP line width for one `top_volume_rank` row, rounded up.
-const TOP_VOLUME_ILP_ROW_BYTES: usize = 120;
+/// Worst-case ILP line width for one `top_volume` row, DERIVED below.
+///
+/// # ⚠ CORRECTED 2026-09-12 — this was `120`, and it was wrong by ~2.2×
+///
+/// The old value was labelled "measured … rounded up" and no test measured it.
+/// Counted against the real `write_row` line — 4 symbols, 7 `i64` fields, an
+/// optional `f64`, a bool and a 19-digit nanosecond stamp — a worst-case row is
+/// **~265 B** by hand and a typical one ~233 B:
+///
+/// ```text
+///   top_volume                                       11
+///   ,tf=1m,family=stock,feed=dhan,segment=NSE_FNO    ~45
+///   rank=…i, security_id=…i, underlying_id=…i,      ~ 79
+///   volume=…i, delta_units=…i, lot_size=…i,         ~ 58
+///   window_lots_milli=…i,                            ~33
+///   gain_pct=-12.345678901234567,                    ~27
+///   subscribed=t                                      13
+///   <19-digit nanos>\n                                20
+/// ```
+///
+/// The consequence was not cosmetic. `MAX_TOP_VOLUME_PRODUCER_BUFFER_BYTES` is
+/// this number times the sweep size times [`TOP_VOLUME_SWEEPS_HELD`], and past
+/// that ceiling this producer **DROPS** — this table has no spill tier, so a
+/// dropped row is gone. At 120 B the ceiling claimed to hold two worst-case
+/// sweeps while actually holding less than one.
+///
+/// ⚠ **And the hand-derivation above was ITSELF short.** A first pass at this
+/// correction set the constant to 300 on the strength of that ~265 count, and
+/// `the_assumed_ilp_row_width_covers_a_real_worst_case_line` — written in the
+/// same change — immediately failed it: a real worst-case line **measures
+/// 324 B**. The count under-estimated the `i64::MAX` fields, which are 19
+/// digits each across four columns.
+///
+/// So the original constant was wrong by **2.7×**, not the 2.2× the hand count
+/// suggested, and the reusable half is that **a width is a measurement**: two
+/// successive careful derivations both came in low, and only running the line
+/// through `write_row` settled it. That is why the guard is a test that builds
+/// the widest row this writer can emit, not another literal.
+///
+/// 384 rather than 324: headroom for a longer symbol value or a wider `f64`
+/// repr without a third under-count, and the cost is only reserved address
+/// space in a buffer that is flushed every sweep.
+const TOP_VOLUME_ILP_ROW_BYTES: usize = 384;
 /// Worst-case sweeps the producer may hold before it drops.
-const TOP_VOLUME_SWEEPS_HELD: usize = 2;
+///
+/// # ⚠ 2 → 1, forced by the corrected width above (2026-09-12)
+///
+/// This was `2`, and at the wrong 120 B width the ceiling it produced —
+/// 12 MB — could not hold even **one** worst-case sweep (50,000 × 324 B =
+/// 16.2 MB). So the declared "two sweeps" was never what shipped; the real
+/// behaviour was ~0.74 of one, and the vacuous assert could not say so.
+///
+/// At the corrected width a true two sweeps is 32.4 MB, which collides with
+/// the sizing relationship `the_producer_byte_ceiling_is_far_tighter_than_the_depth_path`
+/// pins against depth's 32 MiB. One sweep at 384 B is **19.2 MB** — still 60%
+/// MORE capacity than shipped today, comfortably under depth, and it satisfies
+/// the const-assert's actual requirement: hold at least one worst-case sweep.
+///
+/// Both cuts stay live, which is the point of having two. Under a few HUGE
+/// sweeps the byte cut fires first; under many SMALL ones (a typical ~2,000
+/// traded contracts is 0.65 MB, so three retained spans is ~1.9 MB) the byte
+/// ceiling is nowhere near and [`MAX_TOP_VOLUME_RETAINED_FLUSH_SPANS`] is what
+/// fires. Lowering this to 1 does not make the spans cut unreachable.
+const TOP_VOLUME_SWEEPS_HELD: usize = 1;
 pub const MAX_TOP_VOLUME_PRODUCER_BUFFER_BYTES: usize =
     TOP_VOLUME_MAX_ROWS_PER_SWEEP * TOP_VOLUME_ILP_ROW_BYTES * TOP_VOLUME_SWEEPS_HELD;
 
+// ⚠ THE ASSERT THAT USED TO STAND HERE WAS VACUOUS, and that is why the wrong
+// constant above survived.
+//
+// It read `MAX_TOP_VOLUME_PRODUCER_BUFFER_BYTES >= ROWS * BYTES`, where the
+// left-hand side is defined as `ROWS * BYTES * 2`. So it asserted `2X >= X` —
+// TRUE FOR EVERY VALUE OF `BYTES`, including a value off by a factor of ten. Its
+// message named a real hazard ("a single sweep drops rows … a dropped row is
+// gone") and it could not detect that hazard, which is worse than no assert: it
+// reads, in review, as though the hazard were checked.
+//
+// This is the third self-satisfying guard this repository has recorded (after a
+// saturated ceiling and an unreachable counter). The rule it costs: an assert
+// whose two sides are built from the same term proves arithmetic, not a fact.
+// Both replacements below compare against something INDEPENDENT.
+
+// (1) The wedge guard both sibling writers carry and this one did not.
+//     `tick_persistence.rs` and `depth_persistence.rs` each assert the producer
+//     ceiling sits at or below half the questdb-rs `max_buf_size`; a grep for
+//     the same shape here returned nothing. Independent term: the vendor limit.
+const _: () = assert!(
+    MAX_TOP_VOLUME_PRODUCER_BUFFER_BYTES * 2 <= crate::tick_persistence::QUESTDB_MAX_BUF_SIZE_BYTES,
+    "the top_volume producer ceiling must sit at or below half the questdb-rs \
+     max_buf_size wedge, matching the tick and depth writers"
+);
+
+// (2) The width itself, against the hand-derived worst case above. Independent
+//     term: a literal that changes only when someone re-derives the line.
+const _: () = assert!(
+    TOP_VOLUME_ILP_ROW_BYTES >= MEASURED_WORST_CASE_ILP_ROW_BYTES,
+    "the assumed ILP row width must cover the MEASURED worst-case line (see \
+     the_assumed_ilp_row_width_covers_a_real_worst_case_line). Below it, one \
+     sweep overruns the producer ceiling and this table — which has NO spill \
+     tier — drops rows."
+);
+
+/// The worst-case ILP line width MEASURED by
+/// `the_assumed_ilp_row_width_covers_a_real_worst_case_line`.
+///
+/// Separate from [`TOP_VOLUME_ILP_ROW_BYTES`] on purpose: that one is the
+/// ASSUMPTION the ceiling is sized from, this one is the OBSERVATION it must
+/// cover. Two independent terms are what make the asserts below capable of
+/// failing — the vacuous assert this replaced compared the ceiling to a factor
+/// of itself.
+const MEASURED_WORST_CASE_ILP_ROW_BYTES: usize = 324;
+
+// (3) The requirement the ORIGINAL assert's message named and its arithmetic
+//     could not check: the ceiling must hold at least one worst-case sweep at
+//     the MEASURED width, not at the assumed one.
 const _: () = assert!(
     MAX_TOP_VOLUME_PRODUCER_BUFFER_BYTES
-        >= TOP_VOLUME_MAX_ROWS_PER_SWEEP * TOP_VOLUME_ILP_ROW_BYTES,
+        >= TOP_VOLUME_MAX_ROWS_PER_SWEEP * MEASURED_WORST_CASE_ILP_ROW_BYTES,
     "the producer ceiling must hold at least ONE worst-case sweep. Below that, \
      a single sweep drops rows even with a perfectly healthy writer — and this \
      table has no spill tier, so a dropped row is gone."
@@ -1786,6 +1894,63 @@ mod tests {
         // `a_flush_without_a_sender_discards_and_reports`). The proof that the
         // line is well-formed is that `append_row` returned `Ok` -- it commits
         // the marker only after the whole chain, `at()` included, succeeded.
+    }
+
+    /// The assumed ILP row width must cover a REAL worst-case line.
+    ///
+    /// # The guard the old constant did not have
+    ///
+    /// `TOP_VOLUME_ILP_ROW_BYTES` was `120` and labelled "measured", and
+    /// nothing measured it — the only assert over it compared `2X >= X`, which
+    /// is true for every value. This test builds the widest line `write_row`
+    /// can actually emit (every integer at its column's extreme, a full-width
+    /// `f64` gain, the longest real symbol values) and measures the bytes.
+    ///
+    /// It matters because past the producer ceiling this writer DROPS, and
+    /// this table has no spill tier: an under-counted width means a single
+    /// sweep silently loses rows with a perfectly healthy writer.
+    #[test]
+    fn the_assumed_ilp_row_width_covers_a_real_worst_case_line() {
+        let mut w = TopVolumeRankWriter::for_test();
+        let r = TopVolumeRankRow {
+            snapshot_ts_ist_nanos: i64::MAX / 2,
+            cadence: SnapshotCadence::OneMinute,
+            family: "stock",
+            feed: "dhan",
+            segment: "NSE_FNO",
+            rank: i64::MAX,
+            security_id: i64::MAX,
+            underlying_id: i64::MAX,
+            volume: i64::from(u32::MAX),
+            delta_units: i64::from(u32::MAX),
+            lot_size: i64::MAX,
+            window_lots_milli: i64::MAX,
+            // A full-width shortest-repr f64 with a sign, so the widest
+            // `gain_pct` field this column can carry.
+            gain_pct: Some(-1.234_567_890_123_456_7_f64),
+            subscribed: true,
+        };
+        w.append_row(&r).expect("append");
+        let width = w.buffer_utf8().len();
+
+        assert!(
+            width <= MEASURED_WORST_CASE_ILP_ROW_BYTES,
+            "one worst-case row measured {width} B against an assumed \
+             {MEASURED_WORST_CASE_ILP_ROW_BYTES} B. The producer ceiling is derived from \
+             the assumption, and past it this writer DROPS with no spill tier — \
+             so an under-count is silent row loss. Raise the constant (and the \
+             literal in its sibling assert) to cover the measurement."
+        );
+        // Non-vacuous in the other direction: if a future change made rows tiny
+        // this test would pass while the constant stayed wildly oversized, so
+        // pin that the measurement is in the right order of magnitude too.
+        assert!(
+            width > TOP_VOLUME_ILP_ROW_BYTES / 4,
+            "a worst-case row measured only {width} B against an assumed \
+             {TOP_VOLUME_ILP_ROW_BYTES} B. Either the row shrank dramatically \
+             (re-derive the constant down) or this test stopped building a \
+             worst-case row and is no longer measuring anything."
+        );
     }
 
     /// The complement: a known gain is still written.

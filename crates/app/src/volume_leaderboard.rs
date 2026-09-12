@@ -882,20 +882,46 @@ impl VolumeLeaderboard {
                     };
                     slot.relatched = slot.relatched.saturating_add(1);
                     let relatched_total = slot.relatched;
-                    warn!(
-                        metric = REFUSED_COUNTER,
-                        family = label,
-                        security_id = contract.security_id,
-                        ?contract.segment,
-                        abandoned_high = stored,
-                        adopted = contract.volume,
-                        consecutive_lower = run,
-                        relatched_total,
-                        "abandoning a stored volume high after a sustained run of lower \
-                         observations — treating it as a real restart (32-bit wrap or a \
-                         missed session reset) rather than a replayed frame. Refusing \
-                         forever would hold this contract's depth slot for the session."
-                    );
+                    // THROTTLED to powers of two, matching every sibling arm in
+                    // this function (`non_monotonic`, `resynced`, `zero_lot`).
+                    //
+                    // # Why this arm needed it too (2026-09-12)
+                    //
+                    // It shipped UNTHROTTLED on the reasoning that a re-latch is
+                    // rare — it takes `RELATCH_AFTER_CONSECUTIVE_LOWER` (32)
+                    // consecutive lower observations to reach. That reasoning
+                    // holds for a ONE-WAY wrap and fails for an OSCILLATION: a
+                    // vendor counter that advances, then reports 32 lowers, then
+                    // advances again re-latches once per 33 ticks PER CONTRACT,
+                    // and at the 25,000-contract ceiling that is thousands of
+                    // formatted events per second on the FRAME DRAIN, where the
+                    // fmt subscriber allocates per event. That is precisely the
+                    // flood the neighbouring arms were throttled for.
+                    //
+                    // The MAGNITUDE survives the throttle because the line
+                    // carries `relatched_total` — the exact cumulative count —
+                    // so the 64th line reports 64 even though lines 33..63 were
+                    // suppressed. What is lost is the per-contract identity of
+                    // the suppressed ones, which is the same trade every sibling
+                    // already makes.
+                    if relatched_total.is_power_of_two() {
+                        warn!(
+                            metric = REFUSED_COUNTER,
+                            family = label,
+                            security_id = contract.security_id,
+                            ?contract.segment,
+                            abandoned_high = stored,
+                            adopted = contract.volume,
+                            consecutive_lower = run,
+                            relatched_total,
+                            "abandoning a stored volume high after a sustained run of lower \
+                             observations — treating it as a real restart (32-bit wrap or a \
+                             missed session reset) rather than a replayed frame. Refusing \
+                             forever would hold this contract's depth slot for the session. \
+                             THROTTLED to powers of two — `relatched_total` is the exact \
+                             count, so a gap between lines is suppression, never a reset."
+                        );
+                    }
                     return Observation::Relatched {
                         abandoned: stored,
                         adopted: contract.volume,
@@ -973,6 +999,44 @@ impl VolumeLeaderboard {
             // and falling through keeps one producer, and the advance arm's
             // own `baseline: existing.baseline` then carries the ceiling
             // forward unchanged.
+            // ⚠ KNOWN RESIDUAL — a STAIRCASE recovery still publishes a phantom
+            // on its first stage, and the obvious fix is WORSE (2026-09-12).
+            //
+            // `>=` consumes the ceiling only on an observation that CROSSES it
+            // in ONE step. A dip that recovers in stages — 0.5·V, 0.8·V, V —
+            // never crosses in a single step, so the first stage falls through
+            // to the advance arm with the baseline still at the re-latched low,
+            // and the next sweep publishes `0.5V − 0.1V` on all four cadences.
+            // That is a real phantom, bounded by `ceiling − low`.
+            //
+            // THE FIX THAT LOOKS RIGHT AND IS NOT: absorb EVERY sub-ceiling
+            // advance (reseed the baseline to `contract.volume`, stay armed).
+            // It was written, and two existing tests rejected it immediately —
+            // `a_contract_latched_at_the_ceiling_recovers_instead_of_owning_a_socket_forever`
+            // and `a_relatch_refreshes_the_underlying_so_depth_200_groups_it_correctly`.
+            //
+            // The reason is the RE-LATCH'S OWN PRIMARY CAUSE. Its `warn!` names
+            // it: "a 32-bit wrap or a missed session reset". In the wrap case
+            // the abandoned high is `u32::MAX` — a value the contract can NEVER
+            // climb back to — so absorbing everything below it mutes the
+            // contract for the rest of the session. That re-creates the one-way
+            // ratchet the re-latch exists to break, pointing the other way:
+            // instead of a contract that outranks everything forever, one that
+            // can never rank at all. This module's header calls the ratchet the
+            // failure that killed the min-heap design.
+            //
+            // The two causes are not separable from a single observation: a
+            // stage of a dip-recovery and a climb after a wrap are both "below
+            // an armed ceiling". `>=` distinguishes them by OUTCOME instead —
+            // it absorbs only when the contract actually REACHES the abandoned
+            // high, which is the signature of a recovery and something a
+            // wrapped counter never does.
+            //
+            // So the phantom is ACCEPTED, and it is the bounded error of the
+            // two: `ceiling − low` once, against muting a real contract for a
+            // session. Recorded rather than fixed, and recorded HERE rather
+            // than in a plan, because the next reader will see the same gap and
+            // reach for the same wrong remedy.
             let resynced_from =
                 if existing.resync_ceiling != 0 && contract.volume >= existing.resync_ceiling {
                     let ceiling = existing.resync_ceiling;
@@ -1447,11 +1511,21 @@ impl VolumeLeaderboard {
     ///
     /// Deliberately NOT a new metric name. A re-latch is the RESOLUTION of a
     /// run of refusals that `tv_volume_leaderboard_refused_total` has already
-    /// counted, and the event itself carries a `warn!` naming the contract, the
+    /// counted, and the event carries a `warn!` naming the contract, the
     /// abandoned high and the adopted value. Adding a second series would cost
     /// ~$0.30/mo against a September forecast of $142.24 with the automatic
     /// `STOP_EC2_INSTANCES` line at $135.00, to report something the log
     /// already says.
+    ///
+    /// ⚠ **QUALIFIED 2026-09-12 — that `warn!` is now POWER-OF-TWO THROTTLED**
+    /// (the emit site explains why: an oscillating vendor counter re-latches
+    /// once per 33 ticks per contract, which floods the frame drain at the
+    /// 25,000-contract ceiling). The argument above still holds, because the
+    /// throttled line carries `relatched_total` — the exact cumulative count
+    /// this getter returns — so the MAGNITUDE reaches the log even when the
+    /// individual events do not. What a reader loses is the identity of the
+    /// suppressed contracts, and that is a weaker surface than the sentence
+    /// above implies: stated rather than left for the next reader to discover.
     #[must_use]
     pub const fn relatches(&self, family: OptionFamily) -> u64 {
         self.family_ref(family).relatched
@@ -1781,23 +1855,51 @@ where
 /// refusal.
 pub const GAINER_MEMO_CAPACITY: usize = 256;
 
+/// The three verdict handles, resolved ONCE.
+///
+/// # Why a `OnceLock` and not `metrics::counter!` at the call site
+///
+/// `metrics::counter!(NAME, "k" => v)` with a NON-LITERAL label value drops to
+/// the macro's ALLOCATING arm — it builds a `Vec<Label>` per call. This module
+/// already documents that hazard twice (the `record_ws_lag` class, ~36M
+/// allocations an hour), and `record_gainer_tally` was the one site left doing
+/// it: three allocations per 5-second pass per family, on the drain's timer arm.
+///
+/// Small — ~0.6 allocations a second, not the 36M/hour the header warns about —
+/// and fixed anyway, because the cost of being inconsistent here is that the
+/// next reader takes the call site as permission rather than the doc as the
+/// rule. Resolution is one `OnceLock` read; the handles themselves are atomics.
+static GAINER_VERDICT_COUNTERS: std::sync::OnceLock<[metrics::Counter; 3]> =
+    std::sync::OnceLock::new();
+
+/// Resolves (once) the three verdict handles, in [`GAINER_VERDICT_LABELS`]
+/// order.
+fn gainer_verdict_counters() -> &'static [metrics::Counter; 3] {
+    GAINER_VERDICT_COUNTERS.get_or_init(|| {
+        GAINER_VERDICT_LABELS
+            .map(|label| metrics::counter!(GAINER_FILTER_COUNTER, "verdict" => label))
+    })
+}
+
 /// Publishes one pass's tally onto [`GAINER_FILTER_COUNTER`].
 pub fn record_gainer_tally(tally: GainerTally) {
-    for (label, n) in [
-        ("gainer", tally.gainer),
-        ("not_gainer", tally.not_gainer),
-        ("unknown", tally.unknown),
-    ] {
-        metrics::counter!(GAINER_FILTER_COUNTER, "verdict" => label)
-            .increment(u64::try_from(n).unwrap_or(u64::MAX));
+    // Positional, matching `GAINER_VERDICT_LABELS` — pinned by
+    // `the_gainer_tally_fields_line_up_with_their_labels` so a reordered label
+    // array can never silently credit one verdict's count to another.
+    let counters = gainer_verdict_counters();
+    for (counter, n) in counters
+        .iter()
+        .zip([tally.gainer, tally.not_gainer, tally.unknown])
+    {
+        counter.increment(u64::try_from(n).unwrap_or(u64::MAX));
     }
 }
 
 /// Seeds every verdict series at zero so its first real sample is not the
 /// one the agent drops.
 pub fn pre_register_gainer_filter_counter() {
-    for label in GAINER_VERDICT_LABELS {
-        metrics::counter!(GAINER_FILTER_COUNTER, "verdict" => label).increment(0);
+    for counter in gainer_verdict_counters() {
+        counter.increment(0);
     }
 }
 /// Percent change against the previous close, or `None` when it cannot be
@@ -2662,6 +2764,76 @@ mod tests {
             7_500 * LOTS_SCALE,
             "the excess above the ceiling is real trading and must be ranked; \
              only the recovery TO the ceiling is absorbed"
+        );
+    }
+
+    /// The STAIRCASE residual, pinned so the wrong remedy is caught here.
+    ///
+    /// # What this asserts, and why it asserts the phantom rather than its
+    /// # absence
+    ///
+    /// A dip that recovers in STAGES publishes a phantom on its first stage:
+    /// `>=` consumes the ceiling only on an observation that crosses it in one
+    /// step, so a sub-ceiling stage falls through with the baseline still at
+    /// the re-latched low. That is real, and it is DELIBERATELY NOT FIXED — the
+    /// pre-step's own comment carries the analysis.
+    ///
+    /// The remedy that looks obvious (absorb every sub-ceiling advance) mutes a
+    /// WRAPPED contract for the whole session, because its abandoned high is
+    /// `u32::MAX` and it can never climb back to it. Two other tests catch that
+    /// directly. This one records the accepted cost in the opposite direction,
+    /// so a future reader sees both halves of the trade in one place instead of
+    /// discovering the phantom and "fixing" it into the worse failure.
+    ///
+    /// Change the `else` branch of the resync pre-step to reseed the baseline
+    /// and this test fails — which is the intent.
+    #[test]
+    fn a_staircase_recovery_publishes_its_first_stage_and_that_is_the_accepted_cost() {
+        let mut lb = VolumeLeaderboard::new();
+        // Abandoned high 1,000,000; re-latched down to 100,000.
+        relatch_to(&mut lb, 1, 100, 1_000_000, 100_000);
+        let _ = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
+
+        // Stage 1 of the climb back — strictly BELOW the ceiling, so the
+        // ceiling is NOT consumed and the stage ranks.
+        assert_eq!(
+            lb.observe(stock(1, 100, 500_000), OptionFamily::Stock),
+            Observation::Accepted,
+            "a sub-ceiling stage is an ordinary advance, not a resync"
+        );
+        let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
+        assert_eq!(
+            ranked[0].window_lots_milli,
+            400_000 * LOTS_SCALE,
+            "THE ACCEPTED PHANTOM. This is volume already counted before the \
+             re-latch, published as if it were this window's trading. It is \
+             kept because the alternative — absorbing every sub-ceiling \
+             advance — silences a 32-bit-wrapped contract for the session, \
+             which is the one-way ratchet this module was built to break."
+        );
+
+        // Reaching the abandoned high consumes the ceiling, and the recovery
+        // TO it is absorbed — that half works and must keep working.
+        assert!(
+            matches!(
+                lb.observe(stock(1, 100, 1_000_000), OptionFamily::Stock),
+                Observation::ResyncedToCeiling { .. }
+            ),
+            "the ceiling is consumed when the climb finally reaches it"
+        );
+        assert!(
+            lb.rank(OptionFamily::Stock, S1, 10, lot1, all).is_empty(),
+            "arriving exactly at the abandoned high is zero NEW trading"
+        );
+
+        // And genuine trading past the old high ranks at face value.
+        let _ = lb.observe(stock(1, 100, 1_003_000), OptionFamily::Stock);
+        let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
+        assert_eq!(
+            ranked[0].window_lots_milli,
+            3_000 * LOTS_SCALE,
+            "past the ceiling is real trading -- absorbing it too would make \
+             the ceiling a permanent discount"
         );
     }
 

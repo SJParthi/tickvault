@@ -146,10 +146,16 @@ impl SnapshotProjection {
 /// reachable here, but a `%` that rounds toward zero would put two adjacent
 /// pre-epoch instants on the same grid point in one direction and different
 /// ones in the other, which is the kind of asymmetry nobody re-derives later.
+/// `saturating_sub` rather than `-`: `rem_euclid` is NON-NEGATIVE by
+/// definition, so at `i64::MIN` the subtraction underflows. The release
+/// profile sets `overflow-checks = true` with `panic = "abort"`, which makes
+/// that a process death rather than a wrong timestamp — on a function that is
+/// `pub const` and therefore callable from anywhere. Saturating costs one
+/// instruction and is exact for every reachable input.
 #[must_use]
 pub const fn floor_to_second(ts_nanos: i64) -> i64 {
     let rem = ts_nanos.rem_euclid(NANOS_PER_SECOND);
-    ts_nanos - rem
+    ts_nanos.saturating_sub(rem)
 }
 
 /// The IST second-of-day the candle grid is anchored on: 09:00.
@@ -217,9 +223,25 @@ pub const fn nanos_to_next_grid_boundary(now_ist_nanos: i64, period_secs: u64) -
     // than on a negative remainder that would push the boundary into the past.
     let rem = (secs - anchor).rem_euclid(period);
     let boundary_secs = secs + (period - rem);
+    // CHECKED, and it is the only multiply in this function that can leave the
+    // i64 range. `boundary_secs` is up to one period past `now / 1e9`, so at a
+    // clock near `i64::MAX` the product exceeds `i64::MAX` and the release
+    // profile — `overflow-checks = true`, `panic = "abort"` — turns that into a
+    // PROCESS DEATH on the frame drain rather than a wrong delay.
+    //
+    // Not reachable today: `now_ist_nanos()` is `timestamp_nanos_opt()`, whose
+    // `Some` range ends 2262-04-11. It is checked anyway because this is
+    // `pub const`, because every other step here already documents its
+    // `div_euclid`/`rem_euclid`/sign-loss reasoning, and because the fallback
+    // is free: a zero delay makes `interval_at` fire immediately, which is the
+    // UNALIGNED behaviour this function replaced — degraded, never fatal.
+    let boundary_nanos = match boundary_secs.checked_mul(NANOS_PER_SECOND) {
+        Some(nanos) => nanos,
+        None => return 0,
+    };
     // Strictly positive: `period - rem` is at least 1 whole second and the
     // sub-second part of `now` is under one second.
-    let delta = boundary_secs * NANOS_PER_SECOND - now_ist_nanos;
+    let delta = boundary_nanos - now_ist_nanos;
     // `delta` is proven STRICTLY POSITIVE two lines up -- `period - rem` is at
     // least one whole second and the sub-second part of `now` is under one
     // second -- and bounded above by one period (60 s), so there is no sign to
@@ -311,7 +333,16 @@ where
 {
     let ts = floor_to_second(snapshot_ts_ist_nanos);
     let mut rows = Vec::with_capacity(ranked.len());
-    let mut refusals = Vec::new();
+    // PRE-SIZED like `rows`, and for a reason the empty `Vec::new()` it
+    // replaces got backwards: the refusal that dominates this buffer is
+    // `GainUnavailable`, and that one is the EXPECTED state near the open —
+    // before a spot price and a previous close exist for an underlying, EVERY
+    // row refuses. `Vec::new()` grows geometrically, so the common pre-open
+    // case paid ~15 reallocations and memcpys per family per sweep, on the
+    // frame drain. One allocation of a buffer that is usually empty by 09:20
+    // is the cheaper side of that trade, and it makes the projection's
+    // allocation count a constant 2 rather than a function of the market.
+    let mut refusals = Vec::with_capacity(ranked.len());
 
     for (idx, contract) in ranked.iter().enumerate() {
         let Ok(security_id) = i64::try_from(contract.security_id) else {
@@ -976,6 +1007,43 @@ mod tests {
     #[test]
     fn a_zero_period_returns_zero_rather_than_dividing() {
         assert_eq!(nanos_to_next_grid_boundary(NANOS_PER_SECOND, 0), 0);
+    }
+
+    /// An extreme clock DEGRADES; it does not abort the process.
+    ///
+    /// The release profile is `overflow-checks = true` with `panic = "abort"`,
+    /// so an unchecked multiply at `i64::MAX` would kill the frame drain rather
+    /// than return a wrong number. That input is not reachable through
+    /// `now_ist_nanos()` — `timestamp_nanos_opt()` stops at 2262-04-11 — but
+    /// both of these are `pub const`, and the whole point of the checks is that
+    /// nobody has to re-derive reachability before calling them.
+    ///
+    /// In debug (where these tests run) an overflow panics, so a regression
+    /// here fails loudly rather than silently wrapping.
+    #[test]
+    fn the_extremes_of_the_clock_degrade_instead_of_aborting() {
+        for period in [1_u64, 3, 5, 60] {
+            // Far future: the boundary in nanos leaves the i64 range, so the
+            // function falls back to "fire now" rather than multiplying.
+            assert_eq!(
+                nanos_to_next_grid_boundary(i64::MAX, period),
+                0,
+                "i64::MAX must fall back, not overflow (period {period})"
+            );
+            // Far past: no overflow, and the answer must still be a real delay
+            // on the grid rather than zero or a wrap.
+            let past = nanos_to_next_grid_boundary(i64::MIN, period);
+            assert!(
+                past > 0 && past <= period * NANOS_PER_SECOND as u64,
+                "i64::MIN must yield a bounded positive delay, got {past} (period {period})"
+            );
+        }
+
+        // `floor_to_second` saturates rather than underflowing: `rem_euclid` is
+        // non-negative, so `i64::MIN - rem` would go below the range.
+        assert_eq!(floor_to_second(i64::MIN), i64::MIN);
+        // And it is still exact everywhere it is actually used.
+        assert_eq!(floor_to_second(1_500_000_000), 1_000_000_000);
     }
 
     #[test]
