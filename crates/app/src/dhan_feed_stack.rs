@@ -5372,26 +5372,55 @@ async fn run_frame_drain(
     // is `(ts, tf, family, feed, security_id, segment)` — so the burst
     // collapses into one row and the window it claims to measure never
     // happened.
-    let mut snapshot_1s_timer = tokio::time::interval(
-        TOP_VOLUME_SNAPSHOT_INTERVALS
-            [tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond.index()],
+    //
+    // ⚠ AND the grid it fires on (2026-09-12). `tokio::time::interval` resolves
+    // its FIRST tick immediately, so the grid was anchored on whatever instant
+    // this drain happened to start and every later fire carried that offset
+    // plus accumulated scheduling drift. A 5-second sweep starting at
+    // 08:31:02.4 stamped ...:02, ...:07, ...:12 — on no 5-second grid point at
+    // all, so its rows could never be lined up against the candle of the same
+    // window. `interval_at` at the next 09:00-anchored boundary puts every fire
+    // ON the grid, and `Skip` — not `Delay` — is what keeps it there after a
+    // stall: `Delay` re-bases to `now + period` and abandons the grid
+    // permanently, while `Skip` re-snaps to the next multiple of the period
+    // from the start instant. (Verified in tokio 1.53.1 `interval.rs`
+    // `next_timeout`: `Delay => now + period`, `Skip => now + period -
+    // ((now - timeout) % period)`.)
+    //
+    // Neither drops a window's DATA: both fire ONCE after a stall, and `rank`
+    // computes `volume - baseline[idx]` over the whole gap either way, so the
+    // merged window is measured end to end. Only `Burst` would split it, and
+    // Burst writes the current board under past timestamps.
+    let snapshot_timer_at =
+        |cadence: tickvault_storage::top_volume_rank_persistence::SnapshotCadence| {
+            let period = TOP_VOLUME_SNAPSHOT_INTERVALS[cadence.index()];
+            let delay = std::time::Duration::from_nanos(
+                crate::top_volume_snapshot::nanos_to_next_grid_boundary(
+                    now_ist_nanos(),
+                    cadence.interval_secs(),
+                ),
+            );
+            // `Instant::now()` and `now_ist_nanos()` are read one after the other,
+            // so the alignment is as good as the gap between them (sub-microsecond).
+            // The pairing is deliberate: the DELAY comes from the wall clock, which
+            // is what the grid is defined on, while the DEADLINE is monotonic, which
+            // is what tokio schedules on and what cannot be moved by an NTP step.
+            let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + delay, period);
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            timer
+        };
+    let mut snapshot_1s_timer = snapshot_timer_at(
+        tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond,
     );
-    snapshot_1s_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut snapshot_3s_timer = tokio::time::interval(
-        TOP_VOLUME_SNAPSHOT_INTERVALS
-            [tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ThreeSecond.index()],
+    let mut snapshot_3s_timer = snapshot_timer_at(
+        tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ThreeSecond,
     );
-    snapshot_3s_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut snapshot_5s_timer = tokio::time::interval(
-        TOP_VOLUME_SNAPSHOT_INTERVALS
-            [tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond.index()],
+    let mut snapshot_5s_timer = snapshot_timer_at(
+        tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond,
     );
-    snapshot_5s_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut snapshot_1m_timer = tokio::time::interval(
-        TOP_VOLUME_SNAPSHOT_INTERVALS
-            [tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneMinute.index()],
+    let mut snapshot_1m_timer = snapshot_timer_at(
+        tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneMinute,
     );
-    snapshot_1m_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Consecutive alarm-worthy scans, and whether we have already paged for
     // this episode. Edge-triggered per audit Rule 4: the rising edge fires
     // once, the falling edge logs recovery at info and re-arms.
@@ -23600,16 +23629,63 @@ mod late_seed_tests {
         }
     }
 
+    /// The four cadence timers must fire ON the 09:00-anchored grid and stay
+    /// on it after a stall.
+    #[test]
+    fn the_snapshot_timers_fire_on_the_grid_and_stay_there_after_a_stall() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let drain = src
+            .split_once("async fn run_frame_drain")
+            .expect("the drain must exist")
+            .1;
+        let builder = drain
+            .split_once("let snapshot_timer_at =")
+            .expect(
+                "the four cadence timers must be built through ONE aligned \
+                 constructor -- four hand-written `interval(..)` calls is the \
+                 shape that drifted, and the one easiest to half-revert",
+            )
+            .1;
+        let builder = &builder[..builder.len().min(1_200)];
+
+        assert!(
+            builder.contains("interval_at("),
+            "`tokio::time::interval` resolves its FIRST tick immediately, which \
+             anchors the grid on the drain's start instant -- every fire then \
+             carries that offset and the rows land on no cadence boundary at \
+             all. It must be `interval_at` at the next grid point."
+        );
+        assert!(
+            builder.contains("nanos_to_next_grid_boundary("),
+            "the start instant must come from the 09:00-anchored grid, not \
+             from `Instant::now()`"
+        );
+        assert!(
+            builder.contains("MissedTickBehavior::Skip"),
+            "`Delay` re-bases to `now + period` after a stall and abandons the \
+             grid PERMANENTLY; only `Skip` re-snaps to it. `Burst` is worse \
+             still -- it fires the backlog and writes the current board under \
+             past timestamps."
+        );
+        assert!(
+            !builder.contains("MissedTickBehavior::Delay"),
+            "a `Delay` left anywhere in the snapshot timer constructor silently \
+             un-aligns the cadence it applies to"
+        );
+    }
+
     /// A cadence with no `select!` arm is the one four-cadence mistake that
     /// ships fully green: the enum, the labels, the views, the intervals and
     /// the docs can all name it while the drain never fires it, and the only
     /// symptom is a `tf` value that is absent from a table nobody reads until
     /// they need it.
     ///
-    /// Three things must line up per cadence, and this asserts all three
-    /// against `SnapshotCadence::ALL` rather than a hand-written list:
-    /// a timer built from the interval array, its `MissedTickBehavior::Delay`,
-    /// and a `select!` arm naming the variant.
+    /// Two things must line up per cadence, and this asserts both against
+    /// `SnapshotCadence::ALL` rather than a hand-written list: a timer built
+    /// through the aligned constructor, and a `select!` arm naming the
+    /// variant. The `MissedTickBehavior` moved into that constructor on
+    /// 2026-09-12 and is asserted ONCE by the test above rather than four
+    /// times here.
     #[test]
     fn every_snapshot_cadence_has_a_timer_arm_in_the_drain() {
         let src = include_str!("dhan_feed_stack.rs");
@@ -23621,21 +23697,14 @@ mod late_seed_tests {
             let label = cadence.as_str();
             let timer = format!("snapshot_{label}_timer");
             assert!(
-                drain.contains(&format!("let mut {timer} = tokio::time::interval(")),
+                drain.contains(&format!("let mut {timer} = snapshot_timer_at(")),
                 "cadence {label} has no timer: it is in SnapshotCadence::ALL, so \
                  its view and its label exist, but nothing ever fires a snapshot \
-                 for it and `top_volume_rank` will hold no `tf = '{label}'` row \
-                 for the life of the process"
-            );
-            assert!(
-                drain.contains(&format!(
-                    "{timer}.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay)"
-                )),
-                "cadence {label}'s timer is missing MissedTickBehavior::Delay. The \
-                 tokio default is Burst: after any pause the backlog fires back to \
-                 back, several snapshots land on the same `ts`, and the DEDUP key \
-                 (ts, tf, family, feed, security_id, segment) collapses them into \
-                 one row — a window that reads as measured and never happened"
+                 for it and `top_volume` will hold no `tf = '{label}'` row for \
+                 the life of the process. It must be built through \
+                 `snapshot_timer_at`, which is what puts it on the grid — a bare \
+                 `tokio::time::interval` fires its first tick immediately and \
+                 anchors that cadence on the drain's start instant instead."
             );
             assert!(
                 drain.contains(&format!("_ = {timer}.tick() =>")),
