@@ -1172,7 +1172,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn tally_refusals_orders_by_count_descending_so_the_dominant_cause_is_first() {
         let refusals = vec![
             (1, LegRefusal::UnresolvedUnderlyingSymbol),
@@ -1265,6 +1264,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn pre_register_contract_underlying_counters_never_panics_without_a_recorder() {
         // Not-panicking IS the whole property here, and the name says so: with
         // no recorder installed there is nothing observable to assert against.

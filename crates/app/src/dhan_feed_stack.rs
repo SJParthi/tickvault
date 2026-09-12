@@ -1241,8 +1241,28 @@ pub struct LiveIngest {
     top_volume_append_failures: u64,
     /// Pre-resolved handle for [`TOP_VOLUME_APPEND_FAILURE_COUNTER`].
     top_volume_append_failure_counter: metrics::Counter,
-    /// Contracts refused by the snapshot projection this session, all reasons.
-    top_volume_snapshot_refusals: u64,
+    /// Contracts refused by the snapshot projection this session, PER REASON,
+    /// indexed by `SnapshotRefusal::index`.
+    ///
+    /// # Why per reason and not one cumulative total (2026-09-12)
+    ///
+    /// It shipped as a single `u64` and that number gated the throttled
+    /// `warn!` for all four reasons at once. Three of the four DELETE the row
+    /// and are zero on a healthy session; the fourth, `gain_unavailable`, is
+    /// the EXPECTED state near the open — before a spot price and a previous
+    /// close exist, every contract refuses.
+    ///
+    /// So on an ordinary morning the benign reason drove the shared counter
+    /// past 2²⁰ within a minute, and a later `RankOutOfRange` or
+    /// `LotsOutOfRange` — each of which loses a row permanently — would next be
+    /// logged at the following power of two, i.e. plausibly never that session.
+    /// The per-reason metrics are local `/metrics` with no alarm, so the log IS
+    /// the surface, and a benign flood was hiding the surface for the reasons
+    /// that matter.
+    ///
+    /// Throttling per reason costs three extra `u64`s and makes each reason's
+    /// FIRST occurrence loud regardless of what the others are doing.
+    top_volume_snapshot_refusals: [u64; crate::top_volume_snapshot::SnapshotRefusal::ALL.len()],
     /// Pre-resolved handle per reason for
     /// [`TOP_VOLUME_SNAPSHOT_REFUSAL_COUNTER`], indexed by
     /// `SnapshotRefusal::index`. An array rather than a labelled macro call
@@ -1598,9 +1618,11 @@ impl LiveIngest {
 
             refused = refused.saturating_add(projection.refusal_count());
             for (security_id, reason) in &projection.refusals {
-                self.top_volume_snapshot_refusal_counters[reason.index()].increment(1);
-                self.top_volume_snapshot_refusals =
-                    self.top_volume_snapshot_refusals.saturating_add(1);
+                let idx = reason.index();
+                self.top_volume_snapshot_refusal_counters[idx].increment(1);
+                self.top_volume_snapshot_refusals[idx] =
+                    self.top_volume_snapshot_refusals[idx].saturating_add(1);
+                let seen = self.top_volume_snapshot_refusals[idx];
                 // `counter` is a FIELD, not decoration: an operator who greps
                 // the counter name lands here, and the loss-counter visibility
                 // guard can only SEE that a loss-shaped counter has a surface
@@ -1608,7 +1630,12 @@ impl LiveIngest {
                 // because the open can refuse many contracts at once -- the
                 // 1st, 2nd, 4th ... of the session is logged, which reports the
                 // onset immediately and the MAGNITUDE without flooding.
-                if self.top_volume_snapshot_refusals.is_power_of_two() {
+                //
+                // PER REASON since 2026-09-12 — see the field's own doc. A
+                // shared counter let the benign `gain_unavailable` flood at the
+                // open suppress the first occurrence of the three reasons that
+                // actually lose a row.
+                if seen.is_power_of_two() {
                     tracing::warn!(
                         code = tickvault_common::error_code::ErrorCode::WsGapConnectionState
                             .code_str(),
@@ -1616,7 +1643,10 @@ impl LiveIngest {
                         source = "top_volume_snapshot_refused",
                         reason = reason.as_str(),
                         security_id = *security_id,
-                        refusals = self.top_volume_snapshot_refusals,
+                        // THIS REASON's count, not the session total across
+                        // reasons — a shared number here would read as though
+                        // this reason had fired that many times.
+                        refusals = seen,
                         "top_volume: a contract was refused by the snapshot projection. `gain_unavailable` is EXPECTED near the open and after a restart -- the row is still stored, with a NULL underlying-change column, so no volume is lost. Any OTHER reason drops the row and is zero on a healthy session."
                     );
                 }
@@ -1853,7 +1883,8 @@ impl LiveIngest {
                 c.increment(0);
                 c
             },
-            top_volume_snapshot_refusals: 0,
+            top_volume_snapshot_refusals: [0; crate::top_volume_snapshot::SnapshotRefusal::ALL
+                .len()],
             top_volume_snapshot_refusal_counters: crate::top_volume_snapshot::SnapshotRefusal::ALL
                 .map(|reason| {
                     let c = metrics::counter!(
@@ -17322,13 +17353,19 @@ mod tests {
     #[test]
     fn every_snapshot_refusal_reason_is_seeded_at_zero() {
         let src = include_str!("dhan_feed_stack.rs");
-        // Anchored on the SIBLING field's initialiser, not on the array's own
+        // Anchored on a SIBLING field's initialiser, not on the array's own
         // name -- the name appears first in the struct DECLARATION, so
         // splitting on it would window over the field's doc comment and assert
         // nothing about the init. Anchoring outside the array also keeps the
         // two assertions below non-vacuous: neither string is in the anchor.
+        //
+        // The anchor moved 2026-09-12: it used to be
+        // `top_volume_snapshot_refusals: 0,`, and that field became a per-reason
+        // ARRAY, so the old anchor no longer exists. A guard anchored on a
+        // literal that can be edited away fails loudly rather than silently, and
+        // this one did.
         let init = src
-            .split_once("top_volume_snapshot_refusals: 0,")
+            .split_once("top_volume_append_failures: 0,")
             .expect("the refusal-counter array must be initialised")
             .1;
         let init = &init[..init.len().min(600)];
@@ -17343,13 +17380,33 @@ mod tests {
              /metrics until the first refusal"
         );
 
-        // And a fresh ingest has counted nothing.
+        // The THROTTLE must be per reason too, or a benign flood suppresses
+        // the first occurrence of a reason that actually loses a row.
+        assert!(
+            src.contains("self.top_volume_snapshot_refusals[idx]"),
+            "the session tally must be indexed BY REASON. A shared counter let \
+             `gain_unavailable` -- expected for every contract near the open -- \
+             push the throttle past 2^20 in a minute, so the next \
+             `RankOutOfRange` (which DELETES a row) logged only at the \
+             following power of two."
+        );
+
+        // And a fresh ingest has counted nothing, on every reason.
         let ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
-        assert_eq!(ingest.top_volume_snapshot_refusals, 0);
+        assert_eq!(
+            ingest.top_volume_snapshot_refusals,
+            [0; crate::top_volume_snapshot::SnapshotRefusal::ALL.len()]
+        );
         assert_eq!(
             ingest.top_volume_snapshot_refusal_counters.len(),
             crate::top_volume_snapshot::SnapshotRefusal::ALL.len(),
             "one handle per reason, or `index()` reaches past the end"
+        );
+        assert_eq!(
+            ingest.top_volume_snapshot_refusals.len(),
+            ingest.top_volume_snapshot_refusal_counters.len(),
+            "the tally and the handles must stay the same length -- `index()` \
+             addresses both"
         );
     }
 
