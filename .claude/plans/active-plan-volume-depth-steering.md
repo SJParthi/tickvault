@@ -272,3 +272,149 @@ rows/minute against 100,800, and 112/210 redials against 19) says many will be
 near-empty. **NOT claimed:** that this improves capture on Monday; 2026-09-04 lost
 2,000,238 frames before the write-ahead log because the disk was full, which sits
 upstream of everything here.
+
+---
+
+# WAVE 2 — 2026-09-12: four cadences, every traded contract, volume-percentage key, O(1) in universe size
+
+**Status:** APPROVED
+**Date:** 2026-09-12
+**Approved by:** Parthiban — verbatim, in-session: *"go ahead with this ank on volume-percentage alone for all tehe ntire options contartcs enitlrey that too for every 1s,3s,5s and even 1m inclduign as well dude okay? taht too achieveign this O(1) dude okay?"*
+**Authority:** `.claude/rules/project/websocket-connection-scope-lock.md` § "2026-09-12 — FOUR CADENCES, EVERY TRADED OPTION CONTRACT, RANKED ON VOLUME-PERCENTAGE CHANGE" (landed FIRST, per the rule-file-first law).
+**Crates touched:** `crates/storage`, `crates/app`, `crates/common`.
+
+## Design
+
+One declaration list becomes the single source for the cadence set. A
+`macro_rules!` block generates `SnapshotCadence`'s variants, its `ALL` array, its
+`COUNT`, its wire label, its interval seconds and its view name from one line per
+cadence; `#[repr(usize)]` plus `self as usize` supplies the per-cadence array index
+for free, so the index can never disagree with the declaration order. The second
+cadence enum in `console_views` is DELETED and the view DDL is driven from
+`SnapshotCadence`, which removes the drift rather than testing for it.
+
+The ranking gains a persisted integer column carrying the volume-percentage change
+— `window_lots_milli * 100 - 100_000`, in milli-percent, exactly the figure the
+view already derives. **The comparator is unchanged and still sorts the integer
+lots**, because the two are monotone transforms and this repo bans a float in a
+sort key. `window_lots_milli` and `gain_pct` both remain columns (operator Quote D).
+
+The per-family persistence cut moves off `TOP_VOLUME_RANK_PER_FAMILY` — which is
+also `DEPTH20_ENTRY_RANKS` and must stay pinned at 250 — onto its own constant,
+raised so that every contract that traded is persisted.
+
+The sweep stops walking the tracked population. Each window gets a pre-sized dirty
+buffer and a per-contract bit; `observe` marks on the arms where volume actually
+advances, and `rank` drains that window's buffer instead of iterating the map.
+Per-sweep cost becomes Θ(traded) instead of Θ(tracked) — the honest form of the
+operator's O(1) ask, since Θ(traded) is a hard floor when every traded contract is
+an output row.
+
+## Edge Cases
+
+- A contract that trades in one window but not another: marked per-window, so each
+  window's buffer is independent.
+- A contract already marked for this window: the bitmask makes the push idempotent,
+  which is what bounds the buffer at one entry per contract and lets it be pre-sized.
+- Zero delta: still dropped before the sort, unchanged.
+- Lot size zero or missing: still refused, unchanged.
+- Less than one lot traded: the new percentage column is NEGATIVE by design — the
+  change form's zero means exactly one lot.
+- Out-of-window sweeps: drain and clear the window's buffer, rolling only those
+  baselines; an untraded contract's baseline is already correct.
+- Daily reset and per-family clear must empty the buffers and the bits.
+- First sweep after a restart: baselines seed to the current volume, so the delta is
+  zero and nothing is emitted — unchanged.
+- WAL replay: the observer is skipped for the backlog, unchanged.
+- The 1-minute boundary: quantisation against the capture window is accepted and
+  recorded in the rule file rather than fixed here.
+
+## Failure Modes
+
+- A cadence added to the enum but not to `ALL` — made impossible: one macro list
+  generates both.
+- A cadence with no timer arm — caught by a new source guard asserting one arm per
+  cadence.
+- A cadence with no view — made impossible: the view set is generated from the same
+  list.
+- The zero-delta invariant broken by an unrelated edit, silently dropping contracts
+  from the board — caught by a new test that pins it directly.
+- A batch too wide for the write path: rows are DROPPED with no spill tier, so the
+  producer byte budget is re-derived for the new row rate in the same change.
+- Overflow computing the percentage column: checked arithmetic, saturating, with the
+  bound asserted at compile time.
+
+## Test Plan
+
+- The macro generates a cadence whose label, interval and index agree — pinned for
+  every cadence by iterating the generated `ALL`.
+- Adding a variant cannot under-size the baseline array — asserted at compile time.
+- One timer arm per cadence — source guard.
+- One view per cadence — generated, plus a test that the generated set matches.
+- The zero-delta invariant: a contract that does not trade is not emitted, and its
+  baseline is unchanged after a sweep that skips it.
+- Dirty-set equivalence: a randomised sequence of observes produces the identical
+  ranked output under the dirty sweep and a full-scan reference sweep.
+- The percentage column equals the view's derived expression for every row.
+- The percentage column's order is identical to the lots order, ties included.
+- The repaired cost harness ranks a non-empty set and uses a real lot lookup.
+- Daily reset and family clear empty the buffers.
+- DHAT: the per-tick path still allocates nothing with the marking added.
+
+## Rollback
+
+Every change is additive or behind a constant. Reverting the commit restores two
+cadences, the 250 cut and the full-scan sweep; the new column remains in the table
+and is simply not written, which QuestDB tolerates. No data is destroyed and no
+schema is dropped.
+
+## Observability
+
+The tracked and ranked gauges gain a cadence label so four cadences stop aliasing
+into one series. The existing counters are unchanged. **No new CloudWatch metric
+name and no new alarm** — this pipeline reaches zero deployment surfaces today and
+closing that gap needs a lever per the noise lock, so it is recorded in the rule
+file as an open item rather than closed here.
+
+## Plan Items (Wave 2)
+
+- [ ] W2-1 Single-source cadence declaration; delete the second enum; add 3s and 1m
+  - Files: `crates/storage/src/top_volume_rank_persistence.rs`, `crates/storage/src/console_views.rs`
+  - Tests: cadence label/interval/index agreement, generated view set, compile-time index bound
+- [ ] W2-2 Volume-percentage column, persisted as integer milli-percent
+  - Files: `crates/storage/src/top_volume_rank_persistence.rs`, `crates/storage/src/console_views.rs`, `crates/app/src/top_volume_snapshot.rs`
+  - Tests: equals the view expression, identical order to lots, overflow bound
+- [ ] W2-3 Persistence cut onto its own constant; depth constant untouched
+  - Files: `crates/common/src/constants.rs`, `crates/app/src/dhan_feed_stack.rs`
+  - Tests: depth entry/exit unchanged, persistence bound separate
+- [ ] W2-4 Per-window dirty sets; sweep becomes Θ(traded)
+  - Files: `crates/app/src/volume_leaderboard.rs`
+  - Tests: zero-delta invariant, dirty/full-scan equivalence, clears empty the buffers, DHAT unchanged
+- [ ] W2-5 Timer arms for 3s and 1m; one-arm-per-cadence source guard; cadence-labelled gauges
+  - Files: `crates/app/src/dhan_feed_stack.rs`, `crates/app/src/volume_leaderboard.rs`
+  - Tests: source guard asserts an arm per cadence
+- [ ] W2-6 Repair the cost harness so it ranks a non-empty set with a real lot lookup
+  - Files: `crates/app/src/volume_leaderboard.rs`
+  - Tests: the harness asserts it ranked more than zero rows
+
+## Z+ 15-row and 7-row guarantee matrices
+
+Carried by reference from this plan's Wave 1 section above; every row applies
+unchanged to Wave 2, with these deltas: **code performance** — the DHAT gate covers
+the new per-tick marking, and the repaired cost harness replaces a measurement that
+measured nothing; **monitoring** — the gauges gain a cadence label, and the absence
+of any CloudWatch surface for this pipeline is recorded as an open item rather than
+claimed closed; **scenarios** — the dirty/full-scan equivalence test is the new
+extreme-case gate.
+
+## Honest 100% claim
+
+100% inside the tested envelope, with ratcheted regression coverage: the per-tick
+path is O(1) and allocation-free under a build-failing DHAT gate; the cadence set is
+generated from one declaration so its labels, intervals, array index and views
+cannot drift; the zero-delta invariant is pinned by its own test; the ranking
+comparator stays integer-only. NOT claimed: per-sweep O(1), which is arithmetically
+impossible when every traded contract is an output row — the honest floor is
+Θ(traded). NOT claimed: any duty-cycle figure from the old harness. NOT claimed:
+measured uncapped row counts at 3s, 5s or 1m. NOT claimed: that this pipeline is
+observable outside the box.

@@ -1454,12 +1454,22 @@ impl LiveIngest {
             } else {
                 None
             };
-            // The persisted rows: the busiest `TOP_VOLUME_RANK_PER_FAMILY`
-            // whether or not their stock rose. COPIED out before the closures
-            // below need `self` again; the copy is bounded by the budget.
+            // The persisted rows: every contract that traded in the window
+            // (`TOP_VOLUME_PERSIST_PER_FAMILY`, operator 2026-09-12), whether
+            // or not their stock rose. COPIED out because the closures below
+            // need `self` again.
+            //
+            // ⚠ HONEST COST of removing the 250 cut, stated rather than
+            // absorbed: this copy used to be bounded by a constant — 250 rows
+            // × 40 B ≈ 10 KB per sweep. It is now bounded by the MARKET: one
+            // entry per contract with a non-zero window delta, hard-capped
+            // only by `MAX_TRACKED_CONTRACTS` (25,000/family ≈ 1 MB). It is on
+            // the drain's TIMER arm, not the per-tick path, and the allocation
+            // reuses no buffer. If the sweep cost moves, this line is one of
+            // the two places to look; the other is the sort in `rank`.
             let ranked: Vec<crate::volume_leaderboard::RankedContract> = ranked_all[..ranked_all
                 .len()
-                .min(tickvault_common::constants::TOP_VOLUME_RANK_PER_FAMILY)]
+                .min(tickvault_common::constants::TOP_VOLUME_PERSIST_PER_FAMILY)]
                 .to_vec();
 
             if let Some((gainers, tally)) = steering {
@@ -5253,10 +5263,40 @@ async fn run_frame_drain(
     // back, and a snapshot is a SAMPLE of a leaderboard that lives in RAM --
     // replaying a missed second would write the CURRENT ranking under a PAST
     // timestamp, which is worse than the missing row it is trying to repair.
-    let mut snapshot_1s_timer = tokio::time::interval(TOP_VOLUME_SNAPSHOT_1S_INTERVAL);
+    // One timer per snapshot cadence. `tokio::select!` takes literal arms, so
+    // these cannot be a loop — which is exactly why
+    // `every_snapshot_cadence_has_a_timer_arm_in_the_drain` exists: it derives
+    // the required arm set from `SnapshotCadence::ALL` and fails the build for
+    // a cadence with no arm. Before that guard, a cadence added to the enum,
+    // the labels, the views and the docs but not to this block produced a
+    // fully green build and an empty `tf` in production all session.
+    //
+    // `MissedTickBehavior::Delay` on every one: the default is `Burst`, which
+    // after any pause fires the backlog back to back. Four snapshots stamped
+    // inside the same millisecond all carry the same `ts`, and the DEDUP key
+    // is `(ts, tf, family, feed, security_id, segment)` — so the burst
+    // collapses into one row and the window it claims to measure never
+    // happened.
+    let mut snapshot_1s_timer = tokio::time::interval(
+        TOP_VOLUME_SNAPSHOT_INTERVALS
+            [tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond.index()],
+    );
     snapshot_1s_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut snapshot_5s_timer = tokio::time::interval(TOP_VOLUME_SNAPSHOT_5S_INTERVAL);
+    let mut snapshot_3s_timer = tokio::time::interval(
+        TOP_VOLUME_SNAPSHOT_INTERVALS
+            [tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ThreeSecond.index()],
+    );
+    snapshot_3s_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut snapshot_5s_timer = tokio::time::interval(
+        TOP_VOLUME_SNAPSHOT_INTERVALS
+            [tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond.index()],
+    );
     snapshot_5s_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut snapshot_1m_timer = tokio::time::interval(
+        TOP_VOLUME_SNAPSHOT_INTERVALS
+            [tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneMinute.index()],
+    );
+    snapshot_1m_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Consecutive alarm-worthy scans, and whether we have already paged for
     // this episode. Edge-triggered per audit Rule 4: the rising edge fires
     // once, the falling edge logs recovery at info and re-arms.
@@ -5284,8 +5324,13 @@ async fn run_frame_drain(
     // Snapshot accounting, reported as a DELTA by the 30s arm for the same
     // reason the refusal counts are: a cumulative that only grows reads as
     // alarming forever after one bad minute.
-    let mut snapshot_rows_1s: u64 = 0;
-    let mut snapshot_rows_5s: u64 = 0;
+    // An ARRAY indexed by the cadence's own slot, not one named variable per
+    // cadence: the 30s read-out then loops `SnapshotCadence::ALL`, so a new
+    // cadence appears in the log line for free. The named-variable form
+    // reported only `rows_1s` and `rows_5s`, so a third cadence could have
+    // been writing all session and the only operator surface said nothing.
+    let mut snapshot_rows: [u64; crate::volume_leaderboard::WINDOW_COUNT] =
+        [0; crate::volume_leaderboard::WINDOW_COUNT];
     let mut snapshot_refused: u64 = 0;
     // A CLOSED seed channel is `Poll::Ready(None)` immediately and FOREVER.
     // Under `biased;` that arm would then win every poll and permanently
@@ -5709,24 +5754,50 @@ async fn run_frame_drain(
                     seed_closed = true;
                 }
             }
-            // Both snapshot arms sit AFTER the frame arm's `biased` priority, so
+            // The snapshot arms sit AFTER the frame arm's `biased` priority, so
             // a snapshot can never preempt draining queued frames. They touch
             // the leaderboard and the aggregator read-only-ish and cannot
-            // starve each other: both are timers, not queues.
+            // starve each other: all four are timers, not queues.
+            //
+            // One arm per cadence, because `tokio::select!` is a macro over
+            // literal arms and cannot be driven from `SnapshotCadence::ALL`.
+            // `every_snapshot_cadence_has_a_timer_arm_in_the_drain` is what
+            // makes that safe: it reads THIS source and requires an arm named
+            // for every cadence the enum lists.
             _ = snapshot_1s_timer.tick() => {
-                let (rows, refused) = ingest.snapshot_top_volume(
-                    now_ist_nanos(),
-                    tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond,
-                );
-                snapshot_rows_1s = snapshot_rows_1s.saturating_add(rows as u64);
+                let cadence =
+                    tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond;
+                let (rows, refused) = ingest.snapshot_top_volume(now_ist_nanos(), cadence);
+                if let Some(slot) = cadence.slot() {
+                    snapshot_rows[slot] = snapshot_rows[slot].saturating_add(rows as u64);
+                }
+                snapshot_refused = snapshot_refused.saturating_add(refused as u64);
+            }
+            _ = snapshot_3s_timer.tick() => {
+                let cadence =
+                    tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ThreeSecond;
+                let (rows, refused) = ingest.snapshot_top_volume(now_ist_nanos(), cadence);
+                if let Some(slot) = cadence.slot() {
+                    snapshot_rows[slot] = snapshot_rows[slot].saturating_add(rows as u64);
+                }
                 snapshot_refused = snapshot_refused.saturating_add(refused as u64);
             }
             _ = snapshot_5s_timer.tick() => {
-                let (rows, refused) = ingest.snapshot_top_volume(
-                    now_ist_nanos(),
-                    tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond,
-                );
-                snapshot_rows_5s = snapshot_rows_5s.saturating_add(rows as u64);
+                let cadence =
+                    tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond;
+                let (rows, refused) = ingest.snapshot_top_volume(now_ist_nanos(), cadence);
+                if let Some(slot) = cadence.slot() {
+                    snapshot_rows[slot] = snapshot_rows[slot].saturating_add(rows as u64);
+                }
+                snapshot_refused = snapshot_refused.saturating_add(refused as u64);
+            }
+            _ = snapshot_1m_timer.tick() => {
+                let cadence =
+                    tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneMinute;
+                let (rows, refused) = ingest.snapshot_top_volume(now_ist_nanos(), cadence);
+                if let Some(slot) = cadence.slot() {
+                    snapshot_rows[slot] = snapshot_rows[slot].saturating_add(rows as u64);
+                }
                 snapshot_refused = snapshot_refused.saturating_add(refused as u64);
             }
             _ = silence_timer.tick() => {
@@ -5742,15 +5813,29 @@ async fn run_frame_drain(
                 // "bounded by the deploy schedule, not by the code" as
                 // insufficient (the Groww per-contract map and the intent
                 // ledger both carry that note, and neither was ever fixed).
-                if snapshot_rows_1s > 0 || snapshot_rows_5s > 0 || snapshot_refused > 0 {
+                if snapshot_rows.iter().any(|&n| n > 0) || snapshot_refused > 0 {
+                    // One field per cadence, built from `SnapshotCadence::ALL`
+                    // rather than hand-written: `tracing` takes literal field
+                    // names, so the per-cadence figures go into ONE rendered
+                    // field instead of four named ones. That is the trade for
+                    // a read-out that cannot silently omit a cadence — and
+                    // omitting one is exactly what the previous `rows_1s=`
+                    // / `rows_5s=` pair would have done.
+                    let by_cadence = tickvault_storage::top_volume_rank_persistence::
+                        SnapshotCadence::ALL
+                            .iter()
+                            .map(|c| {
+                                let n = c.slot().map_or(0, |slot| snapshot_rows[slot]);
+                                format!("{}={n}", c.as_str())
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ");
                     info!(
-                        rows_1s = snapshot_rows_1s,
-                        rows_5s = snapshot_rows_5s,
+                        rows_by_cadence = %by_cadence,
                         refused = snapshot_refused,
                         "top-volume snapshots written in the last 30s"
                     );
-                    snapshot_rows_1s = 0;
-                    snapshot_rows_5s = 0;
+                    snapshot_rows = [0; crate::volume_leaderboard::WINDOW_COUNT];
                     snapshot_refused = 0;
                 }
                 let today = ist_day_number_now();
@@ -8789,12 +8874,27 @@ pub const DEPTH_ATTACH_HARD_STOP_IST_SECS: u32 =
 /// written as literals here. The enum also supplies the `cadence` SYMBOL each
 /// row is stored under, so the pace a snapshot is taken at and the label it is
 /// filed beneath come from one place and cannot drift apart.
-const TOP_VOLUME_SNAPSHOT_1S_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
-    tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond.interval_secs(),
-);
-const TOP_VOLUME_SNAPSHOT_5S_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
-    tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond.interval_secs(),
-);
+///
+/// An ARRAY indexed by the cadence's own slot since 2026-09-12, rather than
+/// one named const per cadence: four hand-written consts is a fourth list to
+/// keep in step with `SnapshotCadence::ALL`, and the one that is easiest to
+/// half-update.
+const TOP_VOLUME_SNAPSHOT_INTERVALS: [std::time::Duration;
+    crate::volume_leaderboard::WINDOW_COUNT] = {
+    use tickvault_storage::top_volume_rank_persistence::SnapshotCadence;
+    // `ZERO` as the placeholder, not a plausible-looking 1 s: every slot is
+    // overwritten by the loop below, and if one ever were not,
+    // `tokio::time::interval` PANICS on a zero period. A loud failure at boot
+    // beats a cadence that silently fires at the wrong rate under a label
+    // saying otherwise.
+    let mut out = [std::time::Duration::ZERO; crate::volume_leaderboard::WINDOW_COUNT];
+    let mut i = 0;
+    while i < SnapshotCadence::ALL.len() {
+        out[i] = std::time::Duration::from_secs(SnapshotCadence::ALL[i].interval_secs());
+        i += 1;
+    }
+    out
+};
 
 /// Wall clock in IST nanoseconds — the snapshot boundary stamp.
 ///
@@ -23308,18 +23408,94 @@ mod late_seed_tests {
             "nothing sets the seed latch, so `if !seed_closed` can never become \
              false and the guard above is decorative"
         );
-        for below in [
-            "snapshot_1s_timer.tick()",
-            "snapshot_5s_timer.tick()",
-            "silence_timer.tick()",
-        ] {
+        // Derived from the enum, NOT hand-listed. The pre-2026-09-12 form
+        // spelled out `"snapshot_1s_timer.tick()"` and
+        // `"snapshot_5s_timer.tick()"` as literals, so it pinned the ORDER of
+        // the two arms that existed and was structurally blind to a cadence
+        // whose arm was never written — which is the whole failure mode.
+        let mut required: Vec<String> =
+            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ALL
+                .iter()
+                .map(|c| format!("snapshot_{}_timer.tick()", c.as_str()))
+                .collect();
+        required.push("silence_timer.tick()".to_string());
+        for below in required {
             let at = drain
-                .find(below)
+                .find(&below)
                 .unwrap_or_else(|| panic!("the drain must have a `{below}` arm"));
             assert!(
                 seed_arm < at,
                 "`{below}` sits ABOVE the seed arm; if it is ever moved below one \
                  that can go permanently ready, it stops running entirely"
+            );
+        }
+    }
+
+    /// A cadence with no `select!` arm is the one four-cadence mistake that
+    /// ships fully green: the enum, the labels, the views, the intervals and
+    /// the docs can all name it while the drain never fires it, and the only
+    /// symptom is a `tf` value that is absent from a table nobody reads until
+    /// they need it.
+    ///
+    /// Three things must line up per cadence, and this asserts all three
+    /// against `SnapshotCadence::ALL` rather than a hand-written list:
+    /// a timer built from the interval array, its `MissedTickBehavior::Delay`,
+    /// and a `select!` arm naming the variant.
+    #[test]
+    fn every_snapshot_cadence_has_a_timer_arm_in_the_drain() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let drain = src
+            .split_once("async fn run_frame_drain")
+            .expect("the drain must exist")
+            .1;
+        for cadence in tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ALL {
+            let label = cadence.as_str();
+            let timer = format!("snapshot_{label}_timer");
+            assert!(
+                drain.contains(&format!("let mut {timer} = tokio::time::interval(")),
+                "cadence {label} has no timer: it is in SnapshotCadence::ALL, so \
+                 its view and its label exist, but nothing ever fires a snapshot \
+                 for it and `top_volume_rank` will hold no `tf = '{label}'` row \
+                 for the life of the process"
+            );
+            assert!(
+                drain.contains(&format!(
+                    "{timer}.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay)"
+                )),
+                "cadence {label}'s timer is missing MissedTickBehavior::Delay. The \
+                 tokio default is Burst: after any pause the backlog fires back to \
+                 back, several snapshots land on the same `ts`, and the DEDUP key \
+                 (ts, tf, family, feed, security_id, segment) collapses them into \
+                 one row — a window that reads as measured and never happened"
+            );
+            assert!(
+                drain.contains(&format!("_ = {timer}.tick() =>")),
+                "cadence {label} has a timer but no select! arm, so the timer is \
+                 constructed and never polled"
+            );
+        }
+    }
+
+    /// Depth-200 steering reads the 5-SECOND board and only that one.
+    ///
+    /// With four cadences this stopped being obvious. Wiring the 1s board into
+    /// `wants_candidates` would re-steer the deep pool 60 times a minute
+    /// against a per-minute swap budget of 5; wiring the 1m board in would
+    /// steer it off a window that spans a re-steer. Neither is a compile error
+    /// and neither shows up in any counter until the swap-refusal count moves.
+    #[test]
+    fn only_the_five_second_cadence_drives_depth_steering() {
+        let src = include_str!("dhan_feed_stack.rs");
+        assert!(
+            src.contains(
+                "cadence == tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond"
+            ),
+            "the depth-200 candidate publish must be gated on FiveSecond alone"
+        );
+        for other in ["SnapshotCadence::ThreeSecond", "SnapshotCadence::OneMinute"] {
+            assert!(
+                !src.contains(&format!("wants_candidates =\n            cadence == tickvault_storage::top_volume_rank_persistence::{other}")),
+                "{other} must not gate the depth-200 candidate publish"
             );
         }
     }

@@ -152,6 +152,20 @@ use tracing::{error, warn};
 /// would move the stock figure.
 pub const MAX_TRACKED_CONTRACTS: usize = 25_000;
 
+/// The persistence cut is this cap, and this pins them together.
+///
+/// `TOP_VOLUME_PERSIST_PER_FAMILY` means "every traded contract" — which is
+/// only TRUE while it is at or above the number of contracts the ranking can
+/// hold. Lowering this cap without lowering that one leaves a constant whose
+/// doc says "every" and whose value silently cuts; raising this one without
+/// raising that one turns the cut back on without anyone editing the cut.
+const _: () = assert!(
+    tickvault_common::constants::TOP_VOLUME_PERSIST_PER_FAMILY >= MAX_TRACKED_CONTRACTS,
+    "the persistence cut sits below the tracked-contract cap, so it is a real \
+     cut again — but its doc claims every traded contract is persisted. Move \
+     both or neither."
+);
+
 /// Counter: observations refused, labelled by reason.
 pub const REFUSED_COUNTER: &str = "tv_volume_leaderboard_refused_total";
 /// Gauge: contracts currently tracked, per family.
@@ -353,9 +367,24 @@ struct Tracked {
 
 /// Distinct snapshot cadences, and therefore baselines per contract.
 ///
-/// Derived from the cadence enum rather than written as a literal: adding a
-/// third cadence must fail to compile here rather than silently index out of
-/// range or, worse, alias two cadences onto one baseline.
+/// Derived from the cadence enum rather than written as a literal, so the
+/// array and the enum widen together.
+///
+/// ⚠ CORRECTED 2026-09-12 — the previous doc here read "adding a third
+/// cadence must fail to compile here rather than silently index out of range
+/// or, worse, alias two cadences onto one baseline." **It did not**, and the
+/// sentence was reassuring in the one direction that costs a session: a
+/// variant added to `SnapshotCadence` but not to `SnapshotCadence::ALL`
+/// compiled cleanly, left this constant at its old value, and indexed
+/// `baseline[2]` into a `[u32; 2]` on the frame drain — `overflow-checks`
+/// on, `panic = "abort"`, process gone mid-session. The compile error the
+/// sentence was describing came from the SEPARATE `window_index` match, and
+/// the obvious way to silence that error is precisely the edit that arms the
+/// abort.
+///
+/// What holds now: the slot is the `#[repr(u8)]` discriminant, the
+/// const-assert beside `ALL` proves the list is dense and in order, and
+/// `window_slot` bounds-checks the residual case rather than trusting it.
 pub const WINDOW_COUNT: usize = SnapshotCadence::ALL.len();
 
 /// Fixed-point scale on the rank key. 1000 = three decimal places of a lot.
@@ -369,12 +398,51 @@ const _: () = assert!(
 );
 
 /// Which baseline slot a cadence owns.
-const fn window_index(cadence: SnapshotCadence) -> usize {
-    match cadence {
-        SnapshotCadence::OneSecond => 0,
-        SnapshotCadence::FiveSecond => 1,
+///
+/// ⚠ This was a hand-written `match` until 2026-09-12, and the pairing of
+/// that match with `WINDOW_COUNT = SnapshotCadence::ALL.len()` was a live
+/// process-abort waiting for a third cadence. The enum doc two screens up
+/// claimed a new cadence "must fail to compile here" — it does, and that is
+/// exactly the trap: the compiler points at the missing arm, the obvious fix
+/// is to write `SnapshotCadence::ThreeSecond => 2`, and THAT compiles while
+/// `ALL` still has two entries. `baseline: [u32; 2]` is then written at index
+/// 2 on the frame drain, and the release profile is `overflow-checks = true`
+/// with `panic = "abort"` — the trading box dies mid-session, on a tick.
+///
+/// The slot is now the `#[repr(u8)]` discriminant, bounds-checked against
+/// `ALL` by [`SnapshotCadence::slot`]. There is no match to keep in step, and
+/// the residual case the const-assert cannot rule out (a variant the enum has
+/// and `ALL` does not) is a counted refusal instead of an abort.
+fn window_slot(cadence: SnapshotCadence) -> Option<usize> {
+    let slot = cadence.slot();
+    if slot.is_none() {
+        // Cold by construction: reaching this means the enum gained a variant
+        // that `SnapshotCadence::ALL` does not list, which is a build-time
+        // mistake that shipped. Counted and named rather than silent, because
+        // the visible symptom would otherwise be one cadence's board quietly
+        // never updating.
+        metrics::counter!(
+            UNSLOTTED_CADENCE_COUNTER,
+            "cadence" => cadence.as_str(),
+        )
+        .increment(1);
+        error!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            source = "cadence_without_baseline_slot",
+            cadence = cadence.as_str(),
+            window_count = WINDOW_COUNT,
+            "a snapshot cadence has no baseline slot — it is in SnapshotCadence \
+             but not in SnapshotCadence::ALL, so every per-cadence array is one \
+             slot short. That cadence's board will not update; nothing else is \
+             affected."
+        );
     }
+    slot
 }
+
+/// Counter for the refusal above. Zero on every healthy build — a non-zero
+/// reading is a build mistake, not a market condition.
+const UNSLOTTED_CADENCE_COUNTER: &str = "tv_volume_leaderboard_unslotted_cadence_total";
 
 /// Lots traded in a window, × [`LOTS_SCALE`], from raw units and a lot size.
 ///
@@ -740,7 +808,13 @@ impl VolumeLeaderboard {
     /// O(tracked) integer writes, no sort and no allocation — the same walk
     /// `rank` already makes, without the ranking half.
     pub fn roll_baselines(&mut self, family: OptionFamily, cadence: SnapshotCadence) {
-        let idx = window_index(cadence);
+        let Some(idx) = window_slot(cadence) else {
+            // Refused and counted in `window_slot`. Rolling nothing is the
+            // safe half: a baseline that is never rolled makes that cadence
+            // report a growing window, which is visible; an out-of-bounds
+            // write aborts the process.
+            return;
+        };
         for tracked in self.family_mut(family).volumes.values_mut() {
             tracked.baseline[idx] = tracked.contract.volume;
         }
@@ -758,7 +832,13 @@ impl VolumeLeaderboard {
         F: Fn(&RankedContract) -> bool,
         L: Fn(&RankedContract) -> Option<u32>,
     {
-        let idx = window_index(cadence);
+        let Some(idx) = window_slot(cadence) else {
+            // Refused and counted in `window_slot`. An empty ranking is the
+            // honest answer — the alternative is indexing a baseline array
+            // that is one slot short, on the frame drain, under
+            // `panic = "abort"`.
+            return &[];
+        };
         // `take` rather than a direct fill: the buffer and the family map both
         // live on `self`, so filling one from the other needs two borrows. Take
         // moves the Vec out WITH its capacity, so the allocation is still made
@@ -830,6 +910,18 @@ impl VolumeLeaderboard {
         // sweeps and the caller swaps subscriptions for nothing — and equal
         // keys are COMMON now in a way they were not under a cumulative key:
         // every contract that traded nothing in the window is exactly 0.
+        //
+        // THIS IS THE VOLUME-PERCENTAGE ORDER (operator 2026-09-12: "rank on
+        // volume-percentage alone"). The key is `window_lots_milli` and the
+        // percentage the operator reads is
+        // `net_volume_chg_pct = window_lots_milli / 10 - 100` — a strictly
+        // increasing affine transform, so the two produce the SAME sequence,
+        // row for row, including every tie. Sorting on the percentage instead
+        // would change nothing except to put a float in a comparator, and a
+        // non-finite comparator is non-transitive: one NaN corrupts the whole
+        // sort rather than misplacing one row. Integer key, percentage
+        // presentation. Pinned by
+        // `ranking_by_volume_percentage_is_the_same_order_as_ranking_by_lots`.
         scratch.sort_unstable_by(|a, b| {
             b.window_lots_milli
                 .cmp(&a.window_lots_milli)
@@ -1311,29 +1403,143 @@ mod tests {
         );
     }
 
-    /// The roll is per CADENCE. Rolling the 1s baseline must not disturb the 5s
-    /// one — they measure different windows and share only the contract.
+    /// The operator's requirement is that the board be ranked "purely based on
+    /// volume percentage". It already is, and this proves it rather than
+    /// asserting it.
+    ///
+    /// `net_volume_chg_pct = window_lots_milli / 10 - 100` is strictly
+    /// increasing, so ordering by it and ordering by the stored integer key
+    /// produce the same sequence — including ties, which are common (every
+    /// contract that traded nothing in a window is exactly 0 lots). This test
+    /// ranks a board, then independently re-sorts the SAME rows by the
+    /// percentage as a float, and requires the two orders to be identical.
+    ///
+    /// It is what lets the module claim the percentage ordering without
+    /// putting a float in the comparator, and it is the reason no redundant
+    /// percentage COLUMN is stored: a second copy of a total function of an
+    /// existing column would cost ~8 B on every one of the millions of rows a
+    /// session now writes, on a box whose disk burn already caused a
+    /// zero-capture day, to record a number the view derives exactly.
     #[test]
-    fn roll_baselines_for_one_cadence_leaves_the_other_alone() {
+    fn ranking_by_volume_percentage_is_the_same_order_as_ranking_by_lots() {
         let mut lb = VolumeLeaderboard::new();
-        lb.observe(stock(1, 100, 1_000), OptionFamily::Stock);
-        lb.observe(stock(1, 100, 10_000), OptionFamily::Stock);
-
-        lb.roll_baselines(OptionFamily::Stock, S1);
-        lb.observe(stock(1, 100, 10_400), OptionFamily::Stock);
-
-        let one = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
-        assert_eq!(
-            one[0].window_lots_milli, 400_000,
-            "the rolled 1s baseline measures only the 400 units since the roll"
+        // A spread that exercises both sides of the +-0% crossing: under one
+        // lot is NEGATIVE percent, exactly one lot is 0%, above is positive.
+        // Ties included deliberately — the tiebreak must survive the transform.
+        // Lot size 200, so a window delta BELOW 200 units is less than one lot
+        // and reads as a negative change. Seeded non-zero: a contract is first
+        // tracked at the volume it is first seen with, so a 0 seed would make
+        // every delta 0 and the board empty.
+        let lot200 = |_: &RankedContract| Some(200_u32);
+        for (id, delta) in [
+            (1_u64, 50_u32), // a quarter lot  -> -75%
+            (2, 200),        // exactly one lot ->   0%
+            (3, 200),        // tie with 2
+            (4, 6_400),      // 32 lots        -> +3100%
+            (5, 1),          // one unit       -> -99.5%
+            (6, 0),          // never traded   -> dropped at the zero-lot skip
+            (7, 500),        // 2.5 lots       -> +150%
+            (8, 6_400),      // tie with 4
+        ] {
+            lb.observe(stock(id, 100, 1_000), OptionFamily::Stock);
+            lb.observe(stock(id, 100, 1_000 + delta), OptionFamily::Stock);
+        }
+        let by_lots = lb
+            .rank(OptionFamily::Stock, S1, usize::MAX, lot200, all)
+            .to_vec();
+        assert!(
+            by_lots.len() >= 6,
+            "the fixture must produce a real board, got {}",
+            by_lots.len()
         );
 
-        let five = lb.rank(OptionFamily::Stock, S5, 10, lot1, all);
+        // The exact expression `console_views` puts in the view.
+        fn chg_pct(milli: u64) -> f64 {
+            milli as f64 / 10.0 - 100.0
+        }
+
+        let mut by_pct = by_lots.clone();
+        by_pct.sort_by(|a, b| {
+            chg_pct(b.window_lots_milli)
+                .partial_cmp(&chg_pct(a.window_lots_milli))
+                .expect("the fixture contains no NaN — which is the point")
+                .then_with(|| a.security_id.cmp(&b.security_id))
+                .then_with(|| (a.segment as u8).cmp(&(b.segment as u8)))
+        });
+
+        let lots_order: Vec<u64> = by_lots.iter().map(|r| r.security_id).collect();
+        let pct_order: Vec<u64> = by_pct.iter().map(|r| r.security_id).collect();
         assert_eq!(
-            five[0].window_lots_milli, 9_400_000,
-            "the 5s baseline was NOT rolled, so it still measures from its own \
-             seed — 10,400 - 1,000"
+            lots_order, pct_order,
+            "ordering by the stored lots key and by the displayed volume \
+             percentage must be the SAME sequence; if they ever differ, the \
+             claim that the board is ranked on volume percentage is false"
         );
+
+        // And the percentage really is a CHANGE from one lot, not a ratio of
+        // one lot: half a lot must read negative, not a reassuring 50%.
+        let half = by_lots
+            .iter()
+            .find(|r| r.security_id == 1)
+            .expect("the half-lot contract must be on the board");
+        assert!(
+            chg_pct(half.window_lots_milli) < 0.0,
+            "half a lot must read as a NEGATIVE change, got {}",
+            chg_pct(half.window_lots_milli)
+        );
+    }
+
+    /// The roll is per CADENCE. Rolling one cadence's baseline must not
+    /// disturb ANY other — they measure different windows and share only the
+    /// contract.
+    ///
+    /// Driven from `SnapshotCadence::ALL`, not from a named 1s/5s pair: with
+    /// two cadences a pairwise test was the whole space, and with four it is
+    /// one sixth of it. The shape this catches is an off-by-one in the slot
+    /// arithmetic, which a test of slots 0 and 2 alone can easily miss.
+    #[test]
+    fn roll_baselines_for_one_cadence_leaves_every_other_alone() {
+        for rolled in SnapshotCadence::ALL {
+            let mut lb = VolumeLeaderboard::new();
+            lb.observe(stock(1, 100, 1_000), OptionFamily::Stock);
+            lb.observe(stock(1, 100, 10_000), OptionFamily::Stock);
+
+            lb.roll_baselines(OptionFamily::Stock, rolled);
+            lb.observe(stock(1, 100, 10_400), OptionFamily::Stock);
+
+            // The rolled cadence measures only what traded since ITS roll.
+            let after = lb.rank(OptionFamily::Stock, rolled, 10, lot1, all);
+            assert_eq!(
+                after[0].window_lots_milli,
+                400_000,
+                "{}: the rolled baseline must measure only the 400 units since \
+                 the roll",
+                rolled.as_str()
+            );
+
+            // Every OTHER cadence still measures from its own seed. Ranking
+            // one rolls it, so each is read on a freshly built board to keep
+            // the cadences independent of the order this loop reads them in.
+            for other in SnapshotCadence::ALL {
+                if other == rolled {
+                    continue;
+                }
+                let mut lb2 = VolumeLeaderboard::new();
+                lb2.observe(stock(1, 100, 1_000), OptionFamily::Stock);
+                lb2.observe(stock(1, 100, 10_000), OptionFamily::Stock);
+                lb2.roll_baselines(OptionFamily::Stock, rolled);
+                lb2.observe(stock(1, 100, 10_400), OptionFamily::Stock);
+                let untouched = lb2.rank(OptionFamily::Stock, other, 10, lot1, all);
+                assert_eq!(
+                    untouched[0].window_lots_milli,
+                    9_400_000,
+                    "rolling {} disturbed {}: an unrolled baseline must still \
+                     measure from its own seed — 10,400 - 1,000",
+                    rolled.as_str(),
+                    other.as_str()
+                );
+            }
+        }
     }
 
     const S1: SnapshotCadence = SnapshotCadence::OneSecond;

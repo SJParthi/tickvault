@@ -112,6 +112,28 @@ const _: () = assert!(
     "the exit band must sit BELOW the entry cut or it is no band at all"
 );
 
+/// The depth-20 entry band and the PERSISTENCE cut are separate numbers, and
+/// this fails the build if anyone re-aliases them.
+///
+/// They were one constant until 2026-09-12. Removing the top-250 persistence
+/// cut in place — the obvious way to do what the operator asked — would have
+/// carried `DEPTH20_ENTRY_RANKS` with it and re-steered a LIVE subscription
+/// set as a side effect of a storage change: the pool would have tried to
+/// enter from a band of `usize::MAX`, and `DEPTH20_EXIT_RANKS = ENTRY + 50`
+/// would have overflowed in the same expression. Nothing in the tree caught
+/// that shape; this does.
+const _: () = assert!(
+    DEPTH20_ENTRY_RANKS != tickvault_common::constants::TOP_VOLUME_PERSIST_PER_FAMILY,
+    "the depth-20 entry band has been re-aliased to the persistence cut. The \
+     depth budget is the vendor's socket capacity (5 sockets x 50 instruments) \
+     and does not move with how many rows we choose to STORE."
+);
+const _: () = assert!(
+    DEPTH20_ENTRY_RANKS == 250,
+    "the depth-20 entry band is the pool's instrument budget and is pinned at \
+     250 by the vendor socket capacity, not by any persistence decision"
+);
+
 const _: () = assert!(
     MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE <= DEPTH_SWAP_COMMAND_CHANNEL_DEPTH,
     "a per-minute cap above the command channel depth asks for swaps the wire refuses"
