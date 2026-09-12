@@ -17,11 +17,18 @@
 //! |---|---|
 //! | a snapshot timestamp not on a whole second | the row's own DEDUP key stops collapsing a re-emit, so one contract holds several rows for one snapshot |
 //! | a `security_id` or `underlying_id` above `i64::MAX` | QuestDB `LONG` is signed; a namespace-banded id would WRAP to a negative and be stored as a different instrument |
-//! | a non-finite `gain_pct` | the §28.4 NaN-poisoning class, one table over — a NaN written to `DOUBLE` makes every later comparison on the column false |
+//! | a non-finite `gain_pct` | the §28.4 NaN-poisoning class, one table over — a NaN written to `DOUBLE` makes every later comparison on the column false. **Since 2026-09-12 this refusal NULLs the column and KEEPS the row** — see [`SnapshotRefusal::GainUnavailable`] |
 //! | a rank that does not fit `i64` | arithmetic that cannot happen at k ≤ 250, refused rather than wrapped, because a silently negative rank reads as a valid row |
 //!
-//! Each refusal is COUNTED and the row dropped. Dropping one observability
-//! row costs no tick; writing a wrong one costs the trust in the whole table.
+//! Each refusal is COUNTED. Three of them DROP the row, and must: they
+//! protect a column the row is KEYED or ORDERED by, so a wrong value there is
+//! stored as a different instrument or as the reason a contract ranked first.
+//! The fourth, `GainUnavailable`, NULLs one leaf column and keeps everything
+//! else — because dropping the row there threw away the contract's VOLUME,
+//! the one thing this table exists to record, over a display column beside
+//! it. Dropping one observability row costs no tick; writing a wrong one
+//! costs the trust in the whole table; and dropping the RIGHT row for the
+//! wrong reason costs the record itself.
 
 use tickvault_common::types::ExchangeSegment;
 use tickvault_storage::top_volume_rank_persistence::{SnapshotCadence, TopVolumeRankRow};
@@ -41,8 +48,22 @@ pub const SNAPSHOT_FEED: &str = "dhan";
 pub enum SnapshotRefusal {
     /// The id does not fit a signed 64-bit column.
     IdTooLargeForSignedColumn,
-    /// `gain_pct` was NaN or infinite.
-    NonFiniteGain,
+    /// The UNDERLYING's percentage change was not knowable — no spot price
+    /// yet, no previous close yet, or a value `eligible_gain_pct` refuses as
+    /// implausible.
+    ///
+    /// # This one does NOT drop the row (2026-09-12)
+    ///
+    /// It is the only refusal whose column is neither in the DEDUP key nor in
+    /// the ordering: the views select `gain_pct` with no arithmetic and
+    /// nothing else reads it. Until today it `continue`d like the other three,
+    /// so an underlying that had not yet printed took every one of its
+    /// contracts' volume rows out of the table with it — worst at the open and
+    /// after a mid-session redeploy, exactly when the record matters most.
+    ///
+    /// The name changed with the behaviour: it no longer describes a value
+    /// that was non-finite, it describes a column that is NULL.
+    GainUnavailable,
     /// The 1-based rank overflowed `i64` — unreachable at any real `k`, and
     /// refused anyway rather than wrapped.
     RankOutOfRange,
@@ -54,12 +75,46 @@ pub enum SnapshotRefusal {
 }
 
 impl SnapshotRefusal {
+    /// Every reason, so the caller can PRE-REGISTER one counter series per
+    /// label at zero.
+    ///
+    /// The Prometheus exporter renders no series it has never seen, and each
+    /// LABEL VALUE is its own series — so an unseeded reason is simply absent
+    /// from `/metrics` until its first occurrence, which is the one moment an
+    /// operator needs it to already be there. Same reasoning as
+    /// `pre_register_gainer_filter_counter`.
+    pub const ALL: [Self; 4] = [
+        Self::IdTooLargeForSignedColumn,
+        Self::GainUnavailable,
+        Self::RankOutOfRange,
+        Self::LotsOutOfRange,
+    ];
+
+    /// Position in [`Self::ALL`], so a caller can hold one pre-resolved
+    /// counter handle per reason in a fixed array rather than building a
+    /// labelled counter per refusal.
+    ///
+    /// That is not tidiness: `metrics::counter!(NAME, "reason" => label)` with
+    /// a non-literal label drops to the ALLOCATING arm, which is the
+    /// `record_ws_lag` class this repository measured at ~36M allocations an
+    /// hour. Four reasons x four cadences x two families over a population the
+    /// 2026-09-12 cut removal made market-bounded is not a path to allocate on.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::IdTooLargeForSignedColumn => 0,
+            Self::GainUnavailable => 1,
+            Self::RankOutOfRange => 2,
+            Self::LotsOutOfRange => 3,
+        }
+    }
+
     /// Stable label for the refusal counter.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::IdTooLargeForSignedColumn => "id_too_large",
-            Self::NonFiniteGain => "non_finite_gain",
+            Self::GainUnavailable => "gain_unavailable",
             Self::RankOutOfRange => "rank_out_of_range",
             Self::LotsOutOfRange => "lots_out_of_range",
         }
@@ -173,7 +228,7 @@ pub fn project_snapshot<G, S>(
     is_subscribed: S,
 ) -> SnapshotProjection
 where
-    G: Fn(u64) -> f64,
+    G: Fn(u64) -> Option<f64>,
     S: Fn(u64, ExchangeSegment) -> bool,
 {
     let ts = floor_to_second(snapshot_ts_ist_nanos);
@@ -210,10 +265,17 @@ where
         };
 
         // The UNDERLYING's move, keyed on the underlying — see the fn doc.
-        let gain_pct = gain_pct_of(contract.underlying_id);
-        if !gain_pct.is_finite() {
-            refusals.push((contract.security_id, SnapshotRefusal::NonFiniteGain));
-            continue;
+        //
+        // The `is_finite` filter SURVIVES the closure becoming an `Option`,
+        // and that is deliberate rather than belt-and-braces: the signature
+        // permits `Some(NaN)`, and a future caller that computes a gain
+        // in-line rather than through `eligible_gain_pct` would hand one over.
+        // A NaN must never reach `column_f64`, so it is mapped to `None` here
+        // and counted under the same reason — the column is NULL either way,
+        // and the row LIVES either way.
+        let gain_pct = gain_pct_of(contract.underlying_id).filter(|g| g.is_finite());
+        if gain_pct.is_none() {
+            refusals.push((contract.security_id, SnapshotRefusal::GainUnavailable));
         }
 
         rows.push(TopVolumeRankRow {
@@ -314,7 +376,7 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_| 1.5,
+            |_| Some(1.5),
             |_, _| false,
         );
         assert_eq!(p.rows.len(), 3);
@@ -333,7 +395,7 @@ mod tests {
             SnapshotCadence::FiveSecond,
             OptionFamily::Index,
             &ranked,
-            |_| 0.0,
+            |_| Some(0.0),
             |_, _| true,
         );
         assert!(
@@ -353,7 +415,7 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_| 2.0,
+            |_| Some(2.0),
             |sid, _| sid == 10,
         );
         assert!(p.rows[0].subscribed);
@@ -370,7 +432,7 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_| 2.0,
+            |_| Some(2.0),
             |_, _| true,
         );
         assert_eq!(p.rows.len(), 2);
@@ -400,7 +462,7 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_| 0.0,
+            |_| Some(0.0),
             |_, _| false,
         );
         let index = project_snapshot(
@@ -408,7 +470,7 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Index,
             &ranked,
-            |_| 0.0,
+            |_| Some(0.0),
             |_, _| false,
         );
         assert_eq!(stock.rows[0].family, "stock");
@@ -427,7 +489,7 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_| 0.0,
+            |_| Some(0.0),
             |_, _| false,
         );
         assert_eq!(p.rows.len(), 1);
@@ -448,7 +510,7 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_| 0.0,
+            |_| Some(0.0),
             |_, _| false,
         );
         assert!(p.rows.is_empty());
@@ -473,20 +535,38 @@ mod tests {
             OptionFamily::Stock,
             &ranked,
             |underlying_id| match underlying_id {
-                91 => f64::NAN,
-                92 => f64::INFINITY,
-                _ => 3.25,
+                // A caller that computes a gain in-line rather than through
+                // `eligible_gain_pct` CAN hand over a `Some(NaN)`. The
+                // signature permits it, so the projection must still refuse
+                // it -- these two arms are that case, not dead weight.
+                91 => Some(f64::NAN),
+                92 => Some(f64::INFINITY),
+                _ => Some(3.25),
             },
             |_, _| false,
         );
-        assert_eq!(p.rows.len(), 1);
-        assert_eq!(p.rows[0].security_id, 12);
-        assert!((p.rows[0].gain_pct - 3.25).abs() < f64::EPSILON);
+        // ALL THREE rows survive. Until 2026-09-12 this asserted ONE, because
+        // a non-finite gain deleted the whole row -- taking the contract's
+        // volume, the column the table exists for, out with a display column
+        // beside it.
+        assert_eq!(p.rows.len(), 3);
+        assert_eq!(p.rows[0].security_id, 10);
+        assert_eq!(p.rows[1].security_id, 11);
+        assert_eq!(p.rows[2].security_id, 12);
+        assert_eq!(p.rows[0].gain_pct, None, "NaN is NULLed, not stored");
+        assert_eq!(p.rows[1].gain_pct, None, "Inf is NULLed, not stored");
+        assert!(
+            p.rows[2]
+                .gain_pct
+                .is_some_and(|g| (g - 3.25).abs() < f64::EPSILON)
+        );
+        // Still COUNTED -- the column being NULL is a fact an operator can
+        // read, and the counter is what says how often it happens.
         assert_eq!(p.refusal_count(), 2);
         assert!(
             p.refusals
                 .iter()
-                .all(|(_, r)| *r == SnapshotRefusal::NonFiniteGain)
+                .all(|(_, r)| *r == SnapshotRefusal::GainUnavailable)
         );
     }
 
@@ -513,7 +593,7 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_| 0.0,
+            |_| Some(0.0),
             |_, _| false,
         );
         let ranks: Vec<i64> = p.rows.iter().map(|r| r.rank).collect();
@@ -533,7 +613,7 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_| 1.0,
+            |_| Some(1.0),
             |_, _| false,
         );
         assert_eq!(p.rows.len(), 2);
@@ -552,7 +632,7 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &[c],
-            |_| 1.0,
+            |_| Some(1.0),
             |_, _| false,
         );
         assert!(p.rows.is_empty());
@@ -564,7 +644,7 @@ mod tests {
         // The 2026-09-09 defect in one assertion: the closure used to be
         // handed the CONTRACT id and segment, and no previous close is ever
         // stored for an NSE_FNO contract, so every row was refused as
-        // NonFiniteGain and the table stayed empty all session.
+        // a non-finite gain and the table stayed empty all session.
         let ranked = [contract(4_431, 2_885, 500)];
         let p = project_snapshot(
             NANOS_PER_SECOND,
@@ -573,12 +653,16 @@ mod tests {
             &ranked,
             |id| {
                 assert_eq!(id, 2_885, "the gain closure must receive the UNDERLYING id");
-                7.5
+                Some(7.5)
             },
             |_, _| false,
         );
         assert_eq!(p.rows.len(), 1);
-        assert!((p.rows[0].gain_pct - 7.5).abs() < f64::EPSILON);
+        assert!(
+            p.rows[0]
+                .gain_pct
+                .is_some_and(|g| (g - 7.5).abs() < f64::EPSILON)
+        );
     }
 
     #[test]
@@ -589,7 +673,7 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_| 0.0,
+            |_| Some(0.0),
             |_, _| false,
         );
         assert_eq!(p.rows[0].volume, i64::from(u32::MAX));
@@ -602,7 +686,7 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &[],
-            |_| 0.0,
+            |_| Some(0.0),
             |_, _| false,
         );
         assert!(p.rows.is_empty());
@@ -624,19 +708,105 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |underlying_id| if underlying_id == 92 { f64::NAN } else { 1.0 },
+            |underlying_id| {
+                if underlying_id == 92 { None } else { Some(1.0) }
+            },
             |_, _| false,
         );
-        assert_eq!(p.rows.len(), 1);
+        // TWO rows, not one: the oversized id DROPS its row (that column is in
+        // the DEDUP key), the unknown gain KEEPS its row with a NULL column.
+        // Both are counted, and the count is still the caller's single number
+        // for "how much of this snapshot needed a refusal".
+        assert_eq!(p.rows.len(), 2);
+        assert_eq!(p.rows[0].security_id, 10);
+        assert_eq!(p.rows[0].gain_pct, None);
+        assert_eq!(p.rows[1].security_id, 11);
         assert_eq!(p.refusal_count(), 2);
         assert_eq!(p.refusal_count(), p.refusals.len());
+    }
+
+    /// The bite for the 2026-09-12 fix: an underlying whose gain is simply
+    /// not known yet must NOT cost the contract its volume row.
+    ///
+    /// `None` rather than `Some(NaN)` on purpose -- this is the shape the
+    /// PRODUCTION caller produces (`underlying_gain_pct` returns `Option`, and
+    /// the `.unwrap_or(f64::NAN)` that used to flatten it is gone). The NaN
+    /// path is a separate test because it is a separate hazard.
+    #[test]
+    fn a_row_with_an_unknown_gain_still_carries_its_volume() {
+        let ranked = [contract(4_431, 2_885, 987_654)];
+        let p = project_snapshot(
+            NANOS_PER_SECOND,
+            SnapshotCadence::OneSecond,
+            OptionFamily::Stock,
+            &ranked,
+            // Neither store has heard from this underlying yet -- the ordinary
+            // state at the open, and after any mid-session restart.
+            |_| None,
+            |_, _| true,
+        );
+        assert_eq!(
+            p.rows.len(),
+            1,
+            "an unknown gain must NULL one column, never delete the row"
+        );
+        assert_eq!(p.rows[0].security_id, 4_431);
+        assert_eq!(p.rows[0].volume, 987_654);
+        assert_eq!(p.rows[0].rank, 1);
+        assert!(p.rows[0].subscribed);
+        assert_eq!(p.rows[0].gain_pct, None);
+        // Counted, because a NULL nobody counts is a NULL nobody notices.
+        assert_eq!(
+            p.refusals,
+            vec![(4_431, SnapshotRefusal::GainUnavailable)],
+            "the NULL must still be attributable to a reason"
+        );
+    }
+
+    /// The three refusals that guard a KEY or ORDERING column must still
+    /// delete the row. Only the gain changed on 2026-09-12.
+    #[test]
+    fn an_id_or_rank_or_lots_refusal_still_deletes_the_row() {
+        let oversized = [contract(u64::MAX, 2_885, 500)];
+        let p = project_snapshot(
+            NANOS_PER_SECOND,
+            SnapshotCadence::OneSecond,
+            OptionFamily::Stock,
+            &oversized,
+            |_| Some(1.0),
+            |_, _| false,
+        );
+        assert!(
+            p.rows.is_empty(),
+            "an id that would wrap the signed column is stored as a DIFFERENT \
+             instrument -- that row must never be written"
+        );
+        assert_eq!(p.refusal_count(), 1);
+    }
+
+    /// `index()` must agree with `ALL`, or a caller's pre-resolved counter
+    /// array attributes a refusal to the wrong reason -- silently, since both
+    /// are valid slots.
+    #[test]
+    fn every_refusal_index_is_its_own_position_in_all() {
+        for (slot, reason) in SnapshotRefusal::ALL.iter().enumerate() {
+            assert_eq!(
+                reason.index(),
+                slot,
+                "{reason:?} reports slot {} but ALL lists it at {slot}",
+                reason.index()
+            );
+        }
+        // And ALL is complete: an array sized from its length must have a slot
+        // for every reason the projection can produce.
+        assert_eq!(SnapshotRefusal::ALL.len(), 4);
     }
 
     #[test]
     fn as_str_labels_are_distinct_for_every_refusal_reason() {
         let labels = [
             SnapshotRefusal::IdTooLargeForSignedColumn.as_str(),
-            SnapshotRefusal::NonFiniteGain.as_str(),
+            SnapshotRefusal::GainUnavailable.as_str(),
             SnapshotRefusal::RankOutOfRange.as_str(),
             SnapshotRefusal::LotsOutOfRange.as_str(),
         ];

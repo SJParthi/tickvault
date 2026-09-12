@@ -653,6 +653,14 @@ struct Family {
     relatched: u64,
     /// Recoveries absorbed after a re-latch. See `Tracked::resync_ceiling`.
     resynced: u64,
+    /// Contracts the sweep put on the work list and then LEFT OFF the board
+    /// because their window key truncated to zero milli-lots.
+    ///
+    /// Added 2026-09-12 by an adversarial sweep, which found this the only
+    /// remaining membership filter on `top_volume` with no instrument at all.
+    /// See the emit site for what a non-zero reading means -- it is the one
+    /// signal that would falsify the unit premise the key rests on.
+    zero_lot: u64,
     /// PRE-RESOLVED counter handles.
     ///
     /// `metrics::counter!` selects its zero-allocation arm on the label value
@@ -666,6 +674,7 @@ struct Family {
     /// per-tick path.
     refused_non_monotonic: metrics::Counter,
     refused_capacity: metrics::Counter,
+    refused_zero_lot: metrics::Counter,
     /// Gauge handles, resolved for the SAME reason as the counters above, and
     /// now ONE PER CADENCE SLOT.
     ///
@@ -695,6 +704,9 @@ impl Family {
         let refused_capacity =
             metrics::counter!(REFUSED_COUNTER, "family" => label, "reason" => "capacity");
         refused_capacity.increment(0);
+        let refused_zero_lot =
+            metrics::counter!(REFUSED_COUNTER, "family" => label, "reason" => "zero_lot_window");
+        refused_zero_lot.increment(0);
         // One handle per cadence slot, resolved from `ALL` so the arrays widen
         // with the enum. `from_index` cannot fail for an index below
         // `ALL.len()` — the const-assert beside `ALL` proves the list is dense
@@ -724,8 +736,10 @@ impl Family {
             at_capacity: 0,
             relatched: 0,
             resynced: 0,
+            zero_lot: 0,
             refused_non_monotonic,
             refused_capacity,
+            refused_zero_lot,
             tracked_gauge,
             ranked_gauge,
         }
@@ -748,6 +762,7 @@ impl Family {
         self.at_capacity = 0;
         self.relatched = 0;
         self.resynced = 0;
+        self.zero_lot = 0;
     }
 }
 
@@ -1304,17 +1319,66 @@ impl VolumeLeaderboard {
             let Some(lots) = window_lots_milli(delta, lot) else {
                 continue;
             };
-            // A contract that traded NOTHING in the window is not "top volume"
-            // and is left OFF the board — the same treatment as a missing lot
-            // size, for the same reason. Under the window key a zero is the
-            // COMMON value (every quiet contract, every first sweep after a
-            // boot or restart, every thin 1-second window), so ranking zeros
-            // would pad the tail of a 250-deep board with contracts ordered by
-            // nothing but their security_id, and the depth pools would swap
-            // sockets onto strikes that traded nothing. Found by the
-            // 2026-09-08 adversarial sweep; before it, the first sweep after
-            // every boot published up to 250 zero-lot "top" contracts.
+            // A contract whose window key truncates to ZERO milli-lots is not
+            // "top volume" and is left OFF the board — the same treatment as a
+            // missing lot size, for the same reason: ranking zeros would pad
+            // the tail of a 250-deep board with contracts ordered by nothing
+            // but their security_id, and the depth pools would swap sockets
+            // onto strikes that traded nothing. Found by the 2026-09-08
+            // adversarial sweep; before it, the first sweep after every boot
+            // published up to 250 zero-lot "top" contracts.
+            //
+            // ⚠ CORRECTED 2026-09-12 — this comment used to justify the skip
+            // by saying a zero is "the COMMON value (every quiet contract,
+            // every first sweep after a boot)". That was true of the
+            // whole-map walk it was written for and is FALSE of the work-list
+            // drain that replaced it: a quiet contract has a CLEAR dirty bit
+            // and never reaches this line. Everything on this list traded.
+            //
+            // So a zero here is now RARE, and its two remaining causes are
+            // both worth seeing:
+            //
+            //   (a) `delta × 1000 < lot_size` — the division truncated. On a
+            //       1,800-unit lot that needs delta < 2 units, which should be
+            //       vanishingly rare IF `volume` is in the same unit as
+            //       `lot_size`. **That premise is an INFERENCE, not a vendor
+            //       fact**: the Dhan doc gives the field as `| 23-26 | int32 |
+            //       4 | Volume |` with no unit, and this module's header flags
+            //       the CUMULATIVE premise at length while never flagging the
+            //       UNIT one. If volume actually arrives in LOTS, this key
+            //       becomes roughly `lots / lot_size` — a systematic penalty on
+            //       large-lot contracts, with every downstream surface still
+            //       green. A SUSTAINED non-zero count here, concentrated on
+            //       large-lot contracts, is that signature.
+            //   (b) a resync that adopted EXACTLY the abandoned ceiling, so
+            //       every window delta is genuinely zero for one sweep.
+            //
+            // The counter is what lets the next live session tell (a) from (b)
+            // and from "the filter never fires". The settling measurement is
+            // one query on a live box, and it is stated at the warn below.
             if lots == 0 {
+                slot.zero_lot = slot.zero_lot.saturating_add(1);
+                slot.refused_zero_lot.increment(1);
+                let zero_lot_total = slot.zero_lot;
+                // Throttled on powers of two: a session can hit this many
+                // times, and the 1st/2nd/4th... report both the ONSET and the
+                // MAGNITUDE without flooding the sink. The counter NAME is a
+                // field so an operator grepping it lands here — and so the
+                // loss-counter visibility guard can see this loss-shaped
+                // counter has a surface at all.
+                if zero_lot_total.is_power_of_two() {
+                    warn!(
+                        metric = REFUSED_COUNTER,
+                        family = family.as_str(),
+                        reason = "zero_lot_window",
+                        security_id = key.0,
+                        segment = ?key.1,
+                        delta_units = delta,
+                        lot_size = lot,
+                        zero_lot_total,
+                        "volume_leaderboard: a contract that TRADED in this window ranked zero milli-lots and was left off the board. Rare by design. If this is sustained and concentrated on large lot sizes, the ranking key's unit premise is wrong -- settle it on a live box with: SELECT delta_units, lot_size FROM top_volume WHERE tf='1s' LIMIT 50. delta_units a multiple of lot_size means volume arrives in LOTS and the key is inverted; unrelated small values mean the premise holds."
+                    );
+                }
                 continue;
             }
             row.window_lots_milli = lots;
