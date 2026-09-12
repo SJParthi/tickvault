@@ -245,6 +245,68 @@ pub fn depth_named_view_ddl() -> String {
 /// `cadence` is the `tf` SYMBOL literal (`1s` / `5s`) — the same wire strings
 /// `SnapshotCadence::as_str` writes, pinned by
 /// `test_top_volume_cadence_view_ddl_filters_on_the_two_stored_cadences`.
+///
+/// # The three derived columns (added 2026-09-12)
+///
+/// `window_lots`, `net_volume_chg_pct` and `underlying_chg_pct` are computed
+/// HERE and stored nowhere. A view costs no bytes and cannot drift from its
+/// inputs, so a value that is a pure function of a stored column belongs in
+/// the view rather than in the table — the opposite call from `delta_units`
+/// and `lot_size`, which are stored precisely because they are NOT derivable
+/// from anything the row already carries.
+///
+/// | column | is | example |
+/// |---|---|---|
+/// | `delta_units` | units traded in the window (stored) | `3200` |
+/// | `lot_size` | units per contract (stored) | `200` |
+/// | `window_lots` | `cast(window_lots_milli AS DOUBLE) / 1000.0` | `16.0` |
+/// | `net_volume_chg_pct` | `cast(window_lots_milli AS DOUBLE) / 10.0 - 100` | `1500` |
+/// | `underlying_chg_pct` | the UNDERLYING's move vs its previous close | `2.4` |
+///
+/// The casts are load-bearing, not decoration — see
+/// `the_derived_percentages_cast_before_dividing_a_long`. ONE probe settles
+/// whether they were strictly necessary, and it has not been run because no
+/// QuestDB is reachable from a dev container:
+///
+/// ```text
+/// curl -sG 'http://localhost:9000/exec' --data-urlencode \
+///   "query=SELECT cast(42500 AS LONG)/1000.0 a, 42500/1000.0 b"
+/// ```
+///
+/// Both columns `42.5` means the promotion happens and the cast is belt-and-
+/// braces; `b` reading `42` means the un-cast form was silently truncating and
+/// the cast is the only reason this view is right.
+///
+/// `net_volume_chg_pct` is a percentage CHANGE measured from ONE LOT, not a
+/// percentage OF one lot: 3200 units against a 200 lot is `+1500%`, because
+/// `(3200 - 200) / 200 = 15`. The two readings differ by exactly 100 for
+/// every row, so they rank identically — the change form is used because its
+/// zero means something: `0` is exactly one lot, and a contract that traded
+/// LESS than one lot reads NEGATIVE rather than as a plausible `75%`.
+///
+/// # First boot after a deploy that adds a column
+///
+/// `ensure_named_views` runs TWICE per boot, and the first call lands BEFORE
+/// `ensure_top_volume_rank_table` has ALTERed the new columns in. On the first
+/// boot after a deploy that widens this table, that first `CREATE OR REPLACE`
+/// therefore REFUSES — the view names a column the table does not yet have —
+/// and the second call, after the ALTER, succeeds. Fail-soft by design
+/// (`run_view_ddl` counts and warns, never panics), and the same thing
+/// happened when `window_lots_milli` was added on 2026-09-09. Expected, not a
+/// defect; the reasoning for the double call rather than a re-order is at
+/// `candle_ddl_boot`'s own comment ("Additive beats re-ordering"). The honest
+/// residual: if the live-table DDL exhausts all its attempts, the second call
+/// never runs that boot and the view stays at its previous definition until
+/// the next one.
+///
+/// The two percentages answer different questions and are named apart on
+/// purpose. `net_volume_chg_pct` is about the CONTRACT's traded quantity;
+/// `underlying_chg_pct` is the stored `gain_pct` column, which is the
+/// UNDERLYING STOCK's price move and is what the gainer filter reads. A row
+/// can be `+4400%` on volume and `-2%` on the underlying at the same time.
+/// The base table keeps the name `gain_pct`; only this display surface
+/// renames it, because `gain_pct` beside a volume percentage reads as though
+/// the two were the same kind of number.
 pub fn top_volume_cadence_view_ddl(cadence: TopVolumeCadence) -> String {
     let view = cadence.view();
     let tf = cadence.tf();
@@ -252,7 +314,11 @@ pub fn top_volume_cadence_view_ddl(cadence: TopVolumeCadence) -> String {
     format!(
         "CREATE OR REPLACE VIEW {view} AS \
          SELECT t.ts, t.rank, il.symbol_name, il.display_name, il.instrument_type, t.family, \
-         t.volume, t.window_lots_milli, t.gain_pct, t.subscribed, t.underlying_id, \
+         t.delta_units, t.lot_size, \
+         cast(t.window_lots_milli AS DOUBLE) / 1000.0 AS window_lots, \
+         cast(t.window_lots_milli AS DOUBLE) / 10.0 - 100 AS net_volume_chg_pct, \
+         t.gain_pct AS underlying_chg_pct, \
+         t.subscribed, t.volume, t.window_lots_milli, t.underlying_id, \
          t.feed, t.segment, t.security_id, t.tf \
          FROM {NAMED_VIEW_TOP_VOLUME_BASE} t \
          LEFT JOIN {dim} \
@@ -498,6 +564,114 @@ mod tests {
     /// `view()` and `tf()` are compile-time literals, and `tf()` must be the
     /// SAME wire string the writer stamps — otherwise the view filters on a
     /// value no row carries and reads empty all day.
+    #[test]
+    /// The two stored inputs and the three derived columns are all present,
+    /// on BOTH cadence views.
+    #[test]
+    fn the_top_volume_views_expose_the_inputs_and_the_two_percentages() {
+        for cadence in TopVolumeCadence::ALL {
+            let ddl = top_volume_cadence_view_ddl(cadence);
+            for expected in [
+                // Stored, because neither is derivable from the row.
+                "t.delta_units",
+                "t.lot_size",
+                // Derived here, because both are pure functions of a stored
+                // column and a view cannot drift from its own inputs.
+                "cast(t.window_lots_milli AS DOUBLE) / 1000.0 AS window_lots",
+                "cast(t.window_lots_milli AS DOUBLE) / 10.0 - 100 AS net_volume_chg_pct",
+                // The UNDERLYING's move, named apart from the volume one.
+                "t.gain_pct AS underlying_chg_pct",
+            ] {
+                assert!(
+                    ddl.contains(expected),
+                    "{expected} missing from {}: {ddl}",
+                    cadence.view()
+                );
+            }
+        }
+    }
+
+    /// The two derived percentages must CAST before they divide.
+    ///
+    /// `window_lots_milli` is a LONG. `LONG / 1000.0` relies on the engine
+    /// promoting the integer to a double, and this repository has no in-repo
+    /// evidence that QuestDB 9.3.5 does — there is no other SQL string in the
+    /// tree that divides a LONG by a decimal literal. What the tree DOES have
+    /// is `docs/analysis/obi-backtest-queries.md`, whose ratio of two integer
+    /// columns casts BOTH sides to DOUBLE first; an author casts both sides of
+    /// a ratio only when the un-cast form is wrong.
+    ///
+    /// If the promotion does not happen, `42500 / 1000.0` is integer division:
+    /// `window_lots` reads 42 instead of 42.5, and `net_volume_chg_pct` reads
+    /// 4150 against a true 4150.0 — plausible numbers, quietly truncated, on
+    /// the surface the operator reads to decide what the board did. `cast(...)`
+    /// is correct under either semantics, costs nothing, and uses the same
+    /// syntax already proven live by `feed_scoreboard_boot`'s
+    /// `cast(ts as long)`.
+    #[test]
+    fn the_derived_percentages_cast_before_dividing_a_long() {
+        for cadence in TopVolumeCadence::ALL {
+            let ddl = top_volume_cadence_view_ddl(cadence);
+            assert!(
+                ddl.contains("cast(t.window_lots_milli AS DOUBLE) / 1000.0"),
+                "window_lots must cast before dividing: {ddl}"
+            );
+            assert!(
+                ddl.contains("cast(t.window_lots_milli AS DOUBLE) / 10.0"),
+                "net_volume_chg_pct must cast before dividing: {ddl}"
+            );
+            // And the un-cast form must not survive anywhere in the statement.
+            assert!(
+                !ddl.contains("t.window_lots_milli / "),
+                "an un-cast LONG division reappeared: {ddl}"
+            );
+        }
+    }
+
+    /// `net_volume_chg_pct` is a percentage CHANGE measured from one lot.
+    ///
+    /// The worked example is the operator's own, cross-checked against an
+    /// independent percentage calculator on 2026-09-12: a contract whose lot
+    /// is 200 units and which traded 3,200 units in the window reads
+    /// **+1500%**, because `(3200 - 200) / 200 = 15`.
+    ///
+    /// The rival reading — 3,200 as a percentage OF 200 — gives 1600%. The two
+    /// differ by exactly 100 for EVERY row, so they rank identically; the
+    /// change form is stored because its zero carries meaning that the ratio
+    /// form's does not.
+    #[test]
+    fn net_volume_chg_pct_is_a_change_from_one_lot_not_a_ratio_of_one_lot() {
+        // The same arithmetic the view performs, in Rust, so the SQL's
+        // semantics are pinned by a value and not only by its own text.
+        fn chg_pct(window_lots_milli: i64) -> f64 {
+            window_lots_milli as f64 / 10.0 - 100.0
+        }
+        fn milli(delta_units: i64, lot_size: i64) -> i64 {
+            delta_units * 1_000 / lot_size
+        }
+
+        // The operator's example.
+        assert!((chg_pct(milli(3_200, 200)) - 1_500.0).abs() < f64::EPSILON);
+
+        // Exactly one lot is the ZERO of this scale — the property the ratio
+        // form cannot express, where one lot reads as a plausible "100%".
+        assert!((chg_pct(milli(200, 200)) - 0.0).abs() < f64::EPSILON);
+
+        // Less than one lot is NEGATIVE, not a reassuring 75%.
+        assert!((chg_pct(milli(150, 200)) + 25.0).abs() < f64::EPSILON);
+
+        // The gap to the ratio reading is exactly 100, at every magnitude, so
+        // the ordering is a rigid shift and the board is unchanged by it.
+        for (delta, lot) in [(3_200_i64, 200_i64), (9_000, 200), (20_000, 225), (1, 15)] {
+            let m = milli(delta, lot);
+            let ratio_pct = m as f64 / 10.0;
+            assert!(
+                (ratio_pct - chg_pct(m) - 100.0).abs() < 1e-9,
+                "delta {delta} lot {lot}"
+            );
+        }
+    }
+
     #[test]
     fn test_top_volume_cadence_view_and_tf_are_the_pinned_literals() {
         use crate::top_volume_rank_persistence::SnapshotCadence;

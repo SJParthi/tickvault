@@ -228,6 +228,26 @@ pub struct RankedContract {
     /// tie-break rather than a measurement. See the 2026-09-07 scope-lock
     /// section.
     pub window_lots_milli: u64,
+    /// The rank key's NUMERATOR: units traded in the window that just closed.
+    ///
+    /// **Written by [`VolumeLeaderboard::rank`], ignored by
+    /// [`VolumeLeaderboard::observe`]** — the same contract as
+    /// `window_lots_milli` above, for the same reason: it is an output of
+    /// the ranking pass, not an observation, and a value set on the way IN
+    /// is overwritten.
+    ///
+    /// Carried so the persisted row can show the division rather than only
+    /// its result. `delta` is computed inside `rank` against the cadence's
+    /// own baseline and was previously discarded one line later.
+    pub delta_units: u32,
+    /// The rank key's DENOMINATOR: units per contract, as the ranking used
+    /// it.
+    ///
+    /// Also written by `rank`, from the SAME `lot_of` probe that fed the
+    /// division — never a second lookup, which could disagree with the
+    /// number actually divided by and would make the stored row a plausible
+    /// lie rather than a record.
+    pub lot_size: u32,
 }
 
 /// What happened to one observation.
@@ -767,7 +787,16 @@ impl VolumeLeaderboard {
             // join refuses it — so this is the defensive arm, and it SKIPS
             // rather than ranking the contract at 0, which would put it in an
             // arbitrary tie at the bottom of the board instead of out of it.
-            let Some(lots) = lot_of(&row).and_then(|lot| window_lots_milli(delta, lot)) else {
+            //
+            // Split into two `let-else` steps rather than one `and_then` so
+            // the lot size SURVIVES the expression: it is the denominator the
+            // division actually used, and the persisted row carries it. Both
+            // arms still `continue`, so the short-circuit behaviour is
+            // byte-identical to the chained form it replaced.
+            let Some(lot) = lot_of(&row) else {
+                continue;
+            };
+            let Some(lots) = window_lots_milli(delta, lot) else {
                 continue;
             };
             // A contract that traded NOTHING in the window is not "top volume"
@@ -784,6 +813,12 @@ impl VolumeLeaderboard {
                 continue;
             }
             row.window_lots_milli = lots;
+            // The two inputs the key was computed from, recorded beside it so
+            // a reader of the table can redo the division instead of trusting
+            // it. Set from the same `delta` and `lot` the line above divided —
+            // not re-derived, which could drift from what was ranked.
+            row.delta_units = delta;
+            row.lot_size = lot;
             if eligible(&row) {
                 scratch.push(row);
             }
@@ -1215,6 +1250,8 @@ mod tests {
             underlying_id: underlying,
             volume,
             window_lots_milli: 0,
+            delta_units: 0,
+            lot_size: 0,
         }
     }
 
@@ -1782,6 +1819,8 @@ mod tests {
             underlying_id: underlying,
             volume: 0,
             window_lots_milli: 0,
+            delta_units: 0,
+            lot_size: 0,
         };
 
         // Distinctness: five strikes of one name yield ONE entry.
@@ -2096,6 +2135,8 @@ mod tests {
         lb.observe(
             RankedContract {
                 window_lots_milli: 0,
+                delta_units: 0,
+                lot_size: 0,
                 security_id: 13,
                 segment: ExchangeSegment::NseFno,
                 underlying_id: 1,
@@ -2106,6 +2147,8 @@ mod tests {
         lb.observe(
             RankedContract {
                 window_lots_milli: 0,
+                delta_units: 0,
+                lot_size: 0,
                 security_id: 13,
                 segment: ExchangeSegment::BseFno,
                 underlying_id: 2,
@@ -2185,6 +2228,73 @@ mod tests {
         assert_eq!(ranked[1].window_lots_milli, 20 * LOTS_SCALE);
         // And the raw units say the opposite, which is the whole point.
         assert!(ranked[1].volume > ranked[0].volume);
+    }
+
+    /// `rank` records the two numbers it actually divided, not a re-derivation.
+    ///
+    /// The persisted row exists so the ordering is "checkable from the table
+    /// alone". That only holds if `delta_units` and `lot_size` are the values
+    /// the division consumed — a second lookup could return a lot size that
+    /// has since changed and produce a row whose own arithmetic does not close.
+    #[test]
+    fn rank_records_the_numerator_and_denominator_it_divided() {
+        // `lot_of_fixture` gives security_id 1 a 200-unit lot — the operator's
+        // own worked example, so the numbers below are his: 3,200 units traded
+        // in the window against a 200-unit lot.
+        let mut lb = VolumeLeaderboard::new();
+        lb.observe(stock(1, 100, 50_000), OptionFamily::Stock);
+        let opening = lb.rank(OptionFamily::Stock, S1, 10, lot_of_fixture, all);
+        assert!(
+            opening.is_empty(),
+            "the first sweep sets the baseline and ranks nothing"
+        );
+
+        lb.observe(stock(1, 100, 50_000 + 3_200), OptionFamily::Stock);
+        let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot_of_fixture, all);
+
+        assert_eq!(ranked.len(), 1);
+        let row = ranked[0];
+        assert_eq!(row.delta_units, 3_200, "units traded INSIDE the window");
+        assert_eq!(row.lot_size, 200, "the denominator the division used");
+        assert_eq!(row.volume, 53_200, "cumulative, and NOT the numerator");
+        assert_eq!(row.window_lots_milli, 16 * LOTS_SCALE, "16 lots");
+
+        // The trio closes: the two recorded inputs reproduce the recorded key.
+        assert_eq!(
+            u64::from(row.delta_units) * LOTS_SCALE / u64::from(row.lot_size),
+            row.window_lots_milli
+        );
+
+        // And the operator's percentage falls straight out of it: 1500%.
+        assert!(
+            ((row.window_lots_milli as f64 / 10.0 - 100.0) - 1_500.0).abs() < f64::EPSILON,
+            "3,200 units on a 200-unit lot is a +1500% change from one lot"
+        );
+    }
+
+    /// A contract observed but never ranked still gets its baseline rolled, so
+    /// `delta_units` can never accumulate several windows into one.
+    #[test]
+    fn delta_units_measures_one_window_even_after_a_sweep_that_ranked_nothing() {
+        let mut lb = VolumeLeaderboard::new();
+        lb.observe(stock(1, 100, 1_000), OptionFamily::Stock);
+        let _ = lb.rank(OptionFamily::Stock, S1, 10, lot_of_fixture, all);
+
+        // Window A: 2,000 units. Ranked.
+        lb.observe(stock(1, 100, 3_000), OptionFamily::Stock);
+        let a = lb.rank(OptionFamily::Stock, S1, 10, lot_of_fixture, all);
+        assert_eq!(a[0].delta_units, 2_000);
+
+        // Window B: nothing traded — the contract leaves the board entirely.
+        let b = lb.rank(OptionFamily::Stock, S1, 10, lot_of_fixture, all);
+        assert!(b.is_empty(), "a zero-lot window is not 'top volume'");
+
+        // Window C: 400 units. `delta_units` must be 400 — NOT 2,400, which is
+        // what it would read if the quiet window had failed to roll forward.
+        lb.observe(stock(1, 100, 3_400), OptionFamily::Stock);
+        let c = lb.rank(OptionFamily::Stock, S1, 10, lot_of_fixture, all);
+        assert_eq!(c[0].delta_units, 400);
+        assert_eq!(c[0].volume, 3_400, "cumulative keeps climbing regardless");
     }
 
     #[test]
