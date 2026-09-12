@@ -158,6 +158,45 @@ pub const fn floor_to_second(ts_nanos: i64) -> i64 {
     ts_nanos.saturating_sub(rem)
 }
 
+/// Truncates a timestamp DOWN to its cadence grid cell, on the 09:00 anchor.
+///
+/// The companion of [`nanos_to_next_grid_boundary`]: that one says when the
+/// next boundary IS, this one says which boundary a given instant belongs to.
+/// Together they make a snapshot's timestamp a property of the window rather
+/// than of when the scheduler happened to run the arm — which is what lets a
+/// `top_volume` row and a `candles_<tf>` row share a `ts` and be joined.
+///
+/// `period_secs == 1` reduces to [`floor_to_second`], and a zero period is
+/// handled rather than divided by.
+#[must_use]
+pub const fn floor_to_grid(ts_nanos: i64, period_secs: u64) -> i64 {
+    if period_secs <= 1 {
+        return floor_to_second(ts_nanos);
+    }
+    // `period_secs` is `SnapshotCadence::interval_secs`, whose largest value is
+    // 60. `i64::try_from` is not `const`.
+    // APPROVED: 60 cannot wrap i64; try_from is not const.
+    #[allow(clippy::cast_possible_wrap)]
+    let period = period_secs as i64;
+    const SECS_PER_DAY: i64 = 86_400;
+    let secs = ts_nanos.div_euclid(NANOS_PER_SECOND);
+    let day_start = secs.div_euclid(SECS_PER_DAY) * SECS_PER_DAY;
+    let anchor = day_start + SNAPSHOT_GRID_ANCHOR_SECS_OF_DAY_IST;
+    // `rem_euclid` so an instant BEFORE the 09:00 anchor lands on the same grid
+    // running backwards, rather than on a negative remainder that would floor
+    // it UPWARD into a cell that has not happened.
+    let rem = (secs - anchor).rem_euclid(period);
+    // Saturating for the same reason `floor_to_second` saturates: release is
+    // `overflow-checks = true` with `panic = "abort"`, and this is `pub const`.
+    let cell_secs = secs.saturating_sub(rem);
+    match cell_secs.checked_mul(NANOS_PER_SECOND) {
+        Some(nanos) => nanos,
+        // Unreachable through `now_ist_nanos()`, and degrading to the plain
+        // second beats aborting the drain.
+        None => floor_to_second(ts_nanos),
+    }
+}
+
 /// The IST second-of-day the candle grid is anchored on: 09:00.
 ///
 /// MIRRORS `tickvault_trading::candles::tf_index::CANDLE_SESSION_OPEN_SECS_OF_DAY_IST`,
@@ -331,7 +370,29 @@ where
     G: Fn(u64) -> Option<f64>,
     S: Fn(u64, ExchangeSegment) -> bool,
 {
-    let ts = floor_to_second(snapshot_ts_ist_nanos);
+    // FLOORED TO THE CADENCE GRID, not merely to the second.
+    //
+    // # The stall that put a row where no candle can see it (2026-09-12)
+    //
+    // The stamp is `now` at the instant the timer arm RUNS, and a timer is not
+    // a promise about when that is. `MissedTickBehavior::Skip` re-snaps the
+    // NEXT deadline to the grid, but it resolves the currently-pending tick
+    // IMMEDIATELY when the stall ends — so after any pause longer than one
+    // period (a QuestDB stall, an IO hiccup) one fire executes at an arbitrary
+    // instant. `floor_to_second` then stamped it on an arbitrary second, and
+    // for the 3s, 5s and 1m cadences an arbitrary second is a row no candle
+    // row shares a timestamp with. That is the silent failure the grid
+    // alignment exists to prevent, surviving inside the fix for it.
+    //
+    // Flooring to the cadence grid makes the stamp a property of the WINDOW
+    // rather than of the scheduler. Two consecutive fires cannot collide into
+    // one grid cell — `Skip` guarantees the next deadline is a fresh boundary,
+    // and a late fire floors to the cell it belongs to — so the DEDUP key
+    // stays one row per contract per snapshot.
+    //
+    // For the 1-second cadence this is exactly `floor_to_second`, so nothing
+    // about that board changes.
+    let ts = floor_to_grid(snapshot_ts_ist_nanos, cadence.interval_secs());
     let mut rows = Vec::with_capacity(ranked.len());
     // PRE-SIZED like `rows`, and for a reason the empty `Vec::new()` it
     // replaces got backwards: the refusal that dominates this buffer is
@@ -499,18 +560,31 @@ mod tests {
     #[test]
     fn project_snapshot_puts_every_row_of_one_snapshot_on_the_same_second() {
         let ranked = [contract(10, 1, 500), contract(11, 1, 400)];
+        let fired_at = 7 * NANOS_PER_SECOND + 123_456_789;
         let p = project_snapshot(
-            7 * NANOS_PER_SECOND + 123_456_789,
+            fired_at,
             SnapshotCadence::FiveSecond,
             OptionFamily::Index,
             &ranked,
             |_| Some(0.0),
             |_, _| true,
         );
-        assert!(
-            p.rows
-                .iter()
-                .all(|r| r.snapshot_ts_ist_nanos == 7 * NANOS_PER_SECOND)
+        // ONE stamp for the whole snapshot — the property this test is named
+        // for, and the reason the DEDUP key can collapse a re-emit.
+        let stamp = p.rows[0].snapshot_ts_ist_nanos;
+        assert!(p.rows.iter().all(|r| r.snapshot_ts_ist_nanos == stamp));
+
+        // UPDATED 2026-09-12: that stamp is the CADENCE GRID cell, not merely
+        // the whole second the arm ran in. It used to assert `7s` here, which
+        // was the sub-second truncation of the fire instant; a 5-second board
+        // now floors to its own grid so a late fire cannot land on a second no
+        // candle row shares. The sub-second part is still gone, which is what
+        // the DEDUP key needs.
+        assert_eq!(stamp, floor_to_grid(fired_at, 5));
+        assert_eq!(
+            stamp % NANOS_PER_SECOND,
+            0,
+            "a snapshot stamp must never carry a sub-second remainder"
         );
     }
 
@@ -1007,6 +1081,46 @@ mod tests {
     #[test]
     fn a_zero_period_returns_zero_rather_than_dividing() {
         assert_eq!(nanos_to_next_grid_boundary(NANOS_PER_SECOND, 0), 0);
+    }
+
+    /// A LATE fire still stamps the row on the grid a candle can be joined to.
+    ///
+    /// # The permutation this closes
+    ///
+    /// `MissedTickBehavior::Skip` re-snaps the NEXT deadline to the grid, but
+    /// it resolves the currently-pending tick immediately when a stall ends. So
+    /// one fire per stall per cadence executes at an arbitrary instant. Stamped
+    /// with `floor_to_second` that row landed on an arbitrary second — for the
+    /// 3s/5s/1m boards, a second no candle row shares, making the row invisible
+    /// to the join the whole grid alignment exists to serve.
+    #[test]
+    fn a_late_fire_still_lands_on_the_cadence_grid() {
+        // 09:00:00 IST on an arbitrary day, as the anchor sees it.
+        let anchor = SNAPSHOT_GRID_ANCHOR_SECS_OF_DAY_IST * NANOS_PER_SECOND;
+        for period in [3_u64, 5, 60] {
+            let p = i64::try_from(period).expect("small");
+            // A fire that should have happened at the boundary one period in,
+            // but actually ran 2.5 s late because the drain was stalled.
+            let boundary = anchor + p * NANOS_PER_SECOND;
+            let late = boundary + 2_500_000_000;
+            assert_eq!(
+                floor_to_grid(late, period),
+                boundary,
+                "a fire {period}s-cadence late must be stamped on the boundary \
+                 it belongs to, not on the second it happened to run in"
+            );
+            // And the NEXT fire lands on the following cell, so two fires can
+            // never collapse onto one DEDUP key.
+            let next = boundary + p * NANOS_PER_SECOND;
+            assert_ne!(
+                floor_to_grid(next, period),
+                floor_to_grid(late, period),
+                "consecutive fires must stay in distinct grid cells"
+            );
+        }
+        // The 1-second board is unchanged by construction.
+        let t = anchor + 7 * NANOS_PER_SECOND + 123_456_789;
+        assert_eq!(floor_to_grid(t, 1), floor_to_second(t));
     }
 
     /// An extreme clock DEGRADES; it does not abort the process.

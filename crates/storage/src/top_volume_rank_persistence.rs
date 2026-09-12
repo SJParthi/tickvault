@@ -83,10 +83,16 @@
 //! * Hard ceiling per sweep: `TOP_VOLUME_MAX_ROWS_PER_SWEEP` (50,000 =
 //!   25,000/family x 2 families), the tracked-contract cap. Reaching it needs
 //!   every tracked contract of both families to trade inside one second.
-//! * Per session: the four cadences fire 22,440 + 7,480 + 4,488 + 374 = ~34,782
+//! * Per session: the four cadences fire 23,100 + 7,700 + 4,620 + 385 = **35,805**
 //!   times over 09:15-15:39. At an ASSUMED mean of 2,000 traded contracts per
-//!   sweep that is ~70M rows, ~6.1 GB at the ~88 B row width — roughly 5x the
-//!   old figure and ~2% of the ~307 GB a session already writes.
+//!   sweep that is **71.6M rows, ~6.30 GB** at the ~88 B row width — roughly 5x
+//!   the old figure and ~2% of the ~307 GB a session already writes.
+//!
+//!   ⚠ CORRECTED 2026-09-12: this read "22,440 + 7,480 + 4,488 + 374 = ~34,782",
+//!   which is a 22,440-second window — i.e. a 15:29 close. The window is
+//!   `TICK_PERSIST_END` 56,400 − `TICK_PERSIST_START` 33,300 = **23,100 s**, as
+//!   `the_capture_window_closes_after_the_1539_minute` pins. Understated 2.9%.
+//!   Small, and corrected because every figure below is derived from it.
 //!
 //! **The 2,000 figure is Assumed and is the one number here worth measuring.**
 //! It has never been read: the 1-second traded population was measured once
@@ -105,9 +111,16 @@
 //! RETENTION, stated because it is a standing commitment and not a one-day
 //! cost: `HOUR_PARTITIONED_TABLES` membership puts this table in
 //! `RetentionClass::MarketData`, whose window is `market_data_hot_days`
-//! (default 15). At the ~6.1 GB/session estimate above that is roughly **92 GB
-//! resident** on the 600 GB volume — about 15%, up from the 2.4% the old
-//! figures claimed. That is a materially larger commitment and it is stated
+//! (default 15). ⚠ CORRECTED 2026-09-12: this said "**92 GB resident** … about
+//! 15%", which multiplied the per-session figure by 15. `market_data_hot_days`
+//! is 15 CALENDAR days, and 15 calendar days is roughly **11 trading
+//! sessions** — the volume writes nothing on a weekend. At the corrected
+//! ~6.30 GB/session that is **≈69 GB resident** on the 600 GB volume, about
+//! **11.5%**, still well up from the 2.4% the old figures claimed. Wrong in
+//! the SAFE direction (it over-stated the commitment by ~33%), and corrected
+//! anyway: a sizing figure nobody can reproduce is a figure the next reader
+//! either re-derives or, worse, quotes. That is a materially larger commitment than the old
+//! figures implied and it is stated
 //! plainly rather than left to be discovered: if the measured row count lands
 //! near the top of the range, `market_data_hot_days` for this table is the
 //! lever, and the 2026-09-04 zero-capture day is what happens when a table

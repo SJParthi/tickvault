@@ -1069,9 +1069,19 @@ impl VolumeLeaderboard {
                 // the 1-minute board reporting whichever contracts the
                 // 1-second sweep happened not to have cleared yet.
                 dirty: ALL_WINDOWS_DIRTY,
-                // PRESERVED. A normal advance neither arms nor consumes a
-                // ceiling; the arm that consumes it sits ABOVE this one and
-                // has already returned if it fired.
+                // CARRIED FORWARD from `existing`, which the resync PRE-STEP
+                // above has already zeroed if it fired.
+                //
+                // ⚠ This read "the arm that consumes it sits ABOVE this one and
+                // has already RETURNED if it fired" until 2026-09-12, and that
+                // was wrong in a way that matters to anyone reasoning about
+                // this line: the resync is a fall-through pre-step, not an arm,
+                // and it NEVER returns — the whole point of its own comment is
+                // that it mutates in place so the single work-list producer
+                // below stays single. A reader who believed the old sentence
+                // would take this line as unreachable after a resync and
+                // conclude the ceiling is never carried, when in fact this line
+                // is exactly what carries the zeroed ceiling forward.
                 resync_ceiling: existing.resync_ceiling,
             };
             // THE ONLY SITE THAT ADDS WORK. `existing` borrows `volumes` and
