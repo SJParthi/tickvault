@@ -1010,17 +1010,26 @@ pub enum ReconnectReason {
     /// ([`ConnEvent::GhostInstrumentDetected`]); the redial replays the
     /// guard's set so the vendor's view matches ours again.
     GhostInstrument,
+    /// The operator-armed unsubscribe probe asked for this socket to be closed
+    /// and re-dialed so the replay can be observed WITHOUT the probed
+    /// instrument (scope lock, 2026-09-12, Arm B).
+    ///
+    /// This is the ONLY reason that is not a fault, and it is the only one
+    /// [`ReconnectReason::records_flap`] answers `false` for. See that method
+    /// for why that exemption exists and why it is deliberately narrow.
+    ProbeClose,
 }
 
 impl ReconnectReason {
     /// Every reason, for pre-registration and the label-uniqueness pin.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::DialFailed,
         Self::SubscribeFailed,
         Self::Disconnected,
         Self::TokenStale,
         Self::IdleSilence,
         Self::GhostInstrument,
+        Self::ProbeClose,
     ];
 
     /// Stable lowercase tag for logs and metric labels.
@@ -1033,7 +1042,37 @@ impl ReconnectReason {
             Self::TokenStale => "token_stale",
             Self::IdleSilence => "idle_silence",
             Self::GhostInstrument => "ghost_instrument",
+            Self::ProbeClose => "probe_close",
         }
+    }
+
+    /// Whether a redial for this reason enters the socket's flap history.
+    ///
+    /// # Why this exists, and why exactly one reason is exempt
+    ///
+    /// `ConnectionSupervisor::enter_backoff` is the ONE site every redial
+    /// passes through, and until 2026-09-12 it recorded a flap
+    /// unconditionally — correct, because until then every redial was a
+    /// FAULT, and the damper exists to slow a socket that keeps faulting.
+    ///
+    /// [`Self::ProbeClose`] is the first redial that is not a fault: the
+    /// operator armed it, it happens once per session, and it is the
+    /// measurement rather than a symptom. Recording it would spend one of the
+    /// six slots in [`crate::websocket::reconnect_ladder::FLAP_WINDOW_MS`] on
+    /// something we asked for, so a genuine fault minutes later would be
+    /// damped by our own diagnostic — the damper would be reacting to the
+    /// observer.
+    ///
+    /// The exemption is deliberately expressed HERE rather than as a second
+    /// code path around `enter_backoff`: the single-choke-point property is
+    /// what makes the audit row agree with the counter, and a bypass would
+    /// destroy it. Everything else about a probe redial is unchanged — the
+    /// attempt counter advances, the phase drops to backoff, health is
+    /// reset, and the reconnect counter increments under `probe_close`, so
+    /// the redial is never invisible.
+    #[must_use]
+    pub const fn records_flap(self) -> bool {
+        !matches!(self, Self::ProbeClose)
     }
 }
 
@@ -1627,7 +1666,21 @@ impl ConnectionSupervisor {
         self.phase = ConnPhase::Backoff;
         self.proven_healthy = false;
         self.healthy_since = None;
-        self.record_redial(now);
+        // The flap history records FAULTS, not everything that dials. Every
+        // reason but one is a fault and is recorded; the operator-armed probe
+        // close is the measurement itself, and charging it to the damper would
+        // let a diagnostic slow down the recovery of a genuine failure minutes
+        // later. The test is a `const fn` on the reason rather than a branch
+        // spelled out here, so a future reason cannot quietly inherit the
+        // exemption by resembling this one.
+        //
+        // This stays INSIDE `enter_backoff` on purpose: it is the one site
+        // every redial passes through, and a second path that skipped it to
+        // avoid the record would break the property that makes the audit row
+        // and the counter agree.
+        if reason.records_flap() {
+            self.record_redial(now);
+        }
         metrics::counter!(
             RECONNECT_METRIC,
             "endpoint" => self.slot.endpoint.as_str(),
@@ -5905,6 +5958,150 @@ mod tests {
         assert_eq!(
             delay, 0,
             "a recovered socket gets its instant retry back once the window has passed"
+        );
+    }
+
+    /// The operator-armed probe close must not spend the damper's budget.
+    ///
+    /// Scope lock 2026-09-12, finding 2 of the Phase F refusal: `enter_backoff`
+    /// recorded a flap unconditionally, so a deliberate diagnostic close would
+    /// charge itself to the ceiling and damp a GENUINE fault minutes later.
+    #[test]
+    fn a_probe_close_redial_never_enters_the_flap_history() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::Depth200, 0, now);
+
+        // Far more probe closes than the ceiling would ever tolerate, all
+        // inside one window — the damper must still see an empty history.
+        for _ in 0..=(FLAP_REDIAL_CEILING + 2) {
+            let _ = s.schedule_redial(ReconnectReason::ProbeClose, now);
+        }
+
+        assert_eq!(
+            s.recent_redial_count(now),
+            0,
+            "a probe close is the measurement, not a fault; charging it to the flap window \
+             would let a diagnostic slow the recovery of a real failure"
+        );
+    }
+
+    /// The inverse, so the test above cannot pass vacuously: every OTHER
+    /// reason still records, and still reaches the ceiling.
+    #[test]
+    fn every_reason_except_the_probe_close_still_records_a_flap() {
+        let now = t0();
+        for reason in ReconnectReason::ALL {
+            if reason == ReconnectReason::ProbeClose {
+                continue;
+            }
+            let mut s = sup(DhanEndpointType::Depth200, 0, now);
+            let _ = s.schedule_redial(reason, now);
+            assert_eq!(
+                s.recent_redial_count(now),
+                1,
+                "{} is a fault and MUST be recorded",
+                reason.as_str()
+            );
+        }
+    }
+
+    /// A probe close mixed into real faults must not erase or mask them —
+    /// the exemption applies to its own redial and to nothing else.
+    #[test]
+    fn a_probe_close_does_not_hide_the_faults_around_it() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::Depth200, 0, now);
+
+        let _ = s.schedule_redial(ReconnectReason::Disconnected, now);
+        let _ = s.schedule_redial(ReconnectReason::ProbeClose, now);
+        let _ = s.schedule_redial(ReconnectReason::IdleSilence, now);
+
+        assert_eq!(
+            s.recent_redial_count(now),
+            2,
+            "two faults happened and must both still be visible to the damper; only the \
+             probe close in between is exempt"
+        );
+    }
+
+    /// Exactly one reason is exempt, and it is the probe close. A future
+    /// reason must not inherit the exemption by resembling this one.
+    #[test]
+    fn exactly_one_reconnect_reason_is_exempt_from_the_flap_record() {
+        let exempt: Vec<&'static str> = ReconnectReason::ALL
+            .into_iter()
+            .filter(|r| !r.records_flap())
+            .map(ReconnectReason::as_str)
+            .collect();
+        assert_eq!(
+            exempt,
+            vec!["probe_close"],
+            "the flap exemption is deliberately narrow — adding a reason to it needs its own \
+             dated quote in websocket-connection-scope-lock.md"
+        );
+    }
+
+    /// The single-choke-point property survives the exemption.
+    ///
+    /// The exemption had to be expressed as a condition INSIDE `enter_backoff`
+    /// rather than as a second path that skips it — a bypass would let the
+    /// audit row and the reconnect counter disagree, which is the property the
+    /// function's own comment says it exists to guarantee. This is a source
+    /// scan because no runtime assertion can see a path that does not exist.
+    #[test]
+    fn the_flap_record_is_only_ever_written_from_enter_backoff() {
+        let src = include_str!("pool_supervisor.rs");
+
+        // Scan the PRODUCTION half only. The first draft of this test scanned
+        // the whole file and failed against correct code, because the
+        // assertion strings below contain the very text they search for — a
+        // guard that quotes its own needle counts itself. The repo has
+        // recorded that shape before (a seeding guard that found its own
+        // assertion message and could therefore never fail); here it showed up
+        // as a false POSITIVE, which is the survivable direction, but the fix
+        // is the same: never let the test module be part of the corpus.
+        let production = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("split always yields a first element");
+        assert!(
+            production.len() < src.len(),
+            "the test-module boundary moved; this scan is now reading its own assertions"
+        );
+        assert!(
+            production.contains("fn enter_backoff("),
+            "the production half must still contain enter_backoff, or this scan is vacuous"
+        );
+
+        let stripped: String = production
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // The definition plus exactly one call site.
+        let definition = stripped.matches("fn record_redial(").count();
+        let calls = stripped.matches("self.record_redial(").count();
+        assert_eq!(definition, 1, "record_redial is defined exactly once");
+        assert_eq!(
+            calls, 1,
+            "record_redial must have exactly ONE call site. A second one would be a path \
+             around enter_backoff, and enter_backoff being the single site every redial \
+             passes through is what makes the audit row agree with the counter."
+        );
+
+        let enter = stripped
+            .split("fn enter_backoff(")
+            .nth(1)
+            .and_then(|s| s.split("\n    fn ").next())
+            .expect("enter_backoff must exist");
+        assert!(
+            enter.contains("if reason.records_flap()"),
+            "the one call site must sit behind the reason test, inside enter_backoff:\n{enter}"
+        );
+        assert!(
+            enter.contains("self.record_redial(now);"),
+            "enter_backoff must still be the writer:\n{enter}"
         );
     }
 
