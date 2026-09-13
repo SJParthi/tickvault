@@ -159,11 +159,15 @@ fn the_probe_is_one_shot_and_in_session_only() {
     );
 
     // The latch is PERSISTED, so a restart cannot re-arm it.
-    assert!(
-        rebalance.contains("probe_already_ran_today(&probe_latch, probe_day)"),
+    assert_eq!(
+        count_in(&rebalance, "probe_already_ran_today("),
+        1,
         "the latch is seeded from `false` again — that is once per PROCESS, and a deploy \
          or OOM restart would arm the probe a second time on the same day"
     );
+    let seeded_at = rebalance
+        .find("probe_already_ran_today(")
+        .expect("counted exactly one above");
     assert_eq!(
         count_in(&rebalance, "mark_probe_ran_today(&probe_latch, probe_day)"),
         1,
@@ -184,6 +188,33 @@ fn the_probe_is_one_shot_and_in_session_only() {
         "the day latch is written AFTER the arm runs — a crash mid-probe would then leave \
          the day unspent and the next restart would empty a second socket. Fail-closed is \
          the other order: mark first, measure second."
+    );
+
+    // ADDED 2026-09-13 — the day the latch is MARKED with is read at ARM time,
+    // never captured at boot.
+    //
+    // The seed runs once at boot and the arm can run many hours later. A single
+    // `probe_day` binding hoisted above the loop reads correct and is wrong
+    // across IST midnight: the box would mark yesterday.s date as spent, leave
+    // today.s unspent, and arm a second time. The seed therefore sits BEFORE
+    // the gate and the `probe_day` binding the mark uses sits INSIDE it.
+    let probe_day_at = rebalance
+        .find("let probe_day = ")
+        .expect("the arm must bind the day it marks");
+    assert_eq!(
+        count_in(&rebalance, "let probe_day = "),
+        1,
+        "two `probe_day` bindings means the mark and the window can disagree about \
+         which day the probe just spent"
+    );
+    assert!(
+        seeded_at < gate_at,
+        "the persisted latch must be read once at boot, before the gate"
+    );
+    assert!(
+        gate_at < probe_day_at && probe_day_at < mark_at,
+        "`probe_day` is captured outside the gate — across IST midnight the box would \
+         mark yesterday as spent and arm the probe a second time today"
     );
 
     let window = rebalance

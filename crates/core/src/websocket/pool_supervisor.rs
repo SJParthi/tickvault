@@ -994,6 +994,22 @@ fn bump_dial_generation(connection_index: u8) {
 /// UNCHANGED, Arm B requires it to have MOVED. The `ProbeUnsubscribe` handler
 /// has carried a comment naming this defence — "the caller owns it" — since
 /// the probe was written; this is the accessor that lets the caller own it.
+///
+/// # ⚠ An out-of-range index makes the comparison VACUOUS, not loud
+///
+/// This reads `0` for any index ≥ [`GHOST_REDIAL_SLOTS`] rather than failing,
+/// and [`bump_dial_generation`] is the matching silent no-op. So for such an
+/// index BOTH reads return `0`, `after == before`, and the probe concludes "no
+/// re-dial happened" — Arm A's `Silent` then yields `Honoured` on a check that
+/// proved nothing, which is the false vendor-blaming finding the whole defence
+/// exists to prevent.
+///
+/// It is unreachable today: the authorized 16 sockets index `0..16` against 32
+/// slots. It becomes reachable the moment the connection count is raised past
+/// the slot count, and it would fail SILENTLY and in the reassuring direction.
+/// A future session that raises the socket budget must raise
+/// [`GHOST_REDIAL_SLOTS`] in the same change. Pinned by
+/// `dial_generation_out_of_range_makes_the_probe_check_vacuous`.
 #[must_use]
 pub fn dial_generation(connection_index: u8) -> u64 {
     DIAL_GENERATION
@@ -11063,6 +11079,194 @@ mod tests {
             dial_generation(b),
             b0,
             "a dial on one slot advanced another slot's generation"
+        );
+    }
+
+    /// The PRODUCTION WIRING of [`bump_dial_generation`], driven through the
+    /// real state machine (2026-09-13).
+    ///
+    /// The two tests above call `bump_dial_generation` DIRECTLY. Nothing drove
+    /// [`ConnEvent::DialSucceeded`], so deleting the single production call
+    /// site left the function still referenced — by tests — and it would not
+    /// even raise `dead_code`, which is what caught an earlier finding of this
+    /// same class. A helper with a test and no caller is the skeleton shape
+    /// `audit-findings-2026-04-17.md` Rule 14 forbids.
+    ///
+    /// The consequence of that regression is silent and severe: the counter
+    /// never moves, so `dials_after == dials_before` FOREVER. Arm A of the
+    /// unsubscribe probe then returns `Honoured` on a socket that genuinely
+    /// re-dialled — the false vendor-blaming finding the generation check
+    /// exists to prevent, on the exact question a vendor ticket is built on —
+    /// and Arm B, which requires the counter to have MOVED, can never return a
+    /// verdict at all.
+    #[test]
+    fn a_dial_succeeded_event_advances_the_slot_generation() {
+        // A slot DISJOINT from every other test that touches this register:
+        // the authorized sockets index 0..16, and the two tests above use
+        // UNUSED_SLOT, UNUSED_SLOT - 3 and UNUSED_SLOT - 2. `DIAL_GENERATION`
+        // is a process-global static and cargo runs the suite in parallel, so
+        // an overlapping slot makes these tests flake each other.
+        const PROD_WIRING_SLOT: u8 = UNUSED_SLOT - 5;
+        let now = t0();
+        let mut s = ConnectionSupervisor::new(
+            ConnectionSlot {
+                endpoint: DhanEndpointType::Depth200,
+                pool_index: 0,
+                global_index: PROD_WIRING_SLOT,
+            },
+            now,
+        );
+        // Relative to a captured baseline, never an absolute — same reason.
+        let before = dial_generation(PROD_WIRING_SLOT);
+
+        let _ = s.on_event(ConnEvent::BeginDial, now);
+        assert_eq!(
+            dial_generation(PROD_WIRING_SLOT),
+            before,
+            "ANTI-VACUITY: a dial that has only BEGUN must not count, or this \
+             test would pass against a bump moved to the wrong arm — and a \
+             dial that hangs forever would read as a completed re-dial"
+        );
+
+        assert_eq!(
+            s.on_event(ConnEvent::DialSucceeded, now),
+            SupervisorAction::Subscribe
+        );
+        assert_eq!(
+            dial_generation(PROD_WIRING_SLOT),
+            before + 1,
+            "the `ConnEvent::DialSucceeded` arm no longer records the dial — \
+             the probe's re-dial defence is dead, and every Arm A verdict \
+             reads `Honoured` whether the socket re-dialled or not"
+        );
+
+        // A SECOND cycle, because the probe reads the counter either side of a
+        // watch window: the register must track EVERY confirmed dial, not just
+        // the first, or a re-dial inside that window is invisible.
+        let later = now + Duration::from_secs(1);
+        let _ = s.on_event(ConnEvent::BeginDial, later);
+        let _ = s.on_event(ConnEvent::DialSucceeded, later);
+        assert_eq!(
+            dial_generation(PROD_WIRING_SLOT),
+            before + 2,
+            "a re-dial inside the watch window must be visible to the probe"
+        );
+    }
+
+    /// The fail-open edge, DOCUMENTED rather than fixed (2026-09-13).
+    ///
+    /// [`dial_generation`] returns `0` for an out-of-range index on BOTH the
+    /// before and the after read, so `redialled` is `false` however many dials
+    /// occurred and Arm A's `Silent` yields `Honoured` from a comparison that
+    /// proved nothing. It is unreachable at 16 authorized sockets against 32
+    /// slots; it becomes reachable the moment the connection count is raised
+    /// past the slot count, and it fails SILENTLY and in the reassuring
+    /// direction. Recorded here, and at [`dial_generation`], so a session that
+    /// raises the budget sees the consequence rather than discovering it.
+    #[test]
+    fn dial_generation_out_of_range_makes_the_probe_check_vacuous() {
+        let out_of_range = u8::try_from(GHOST_REDIAL_SLOTS).unwrap_or(u8::MAX);
+
+        // The probe's own comparison, spelled out: read, re-dial, read.
+        let before = dial_generation(out_of_range);
+        bump_dial_generation(out_of_range);
+        bump_dial_generation(out_of_range);
+        let after = dial_generation(out_of_range);
+
+        assert_eq!(before, 0);
+        assert_eq!(after, 0);
+        assert_eq!(
+            after, before,
+            "DOCUMENTED, NOT DESIRED: two dials happened and the check cannot \
+             see either, so Arm A would report `Honoured` on a socket that \
+             re-dialled"
+        );
+
+        // The invariant that keeps the edge unreachable. If this ever fails,
+        // some authorized socket has no generation slot and its probe verdict
+        // is vacuous — raise GHOST_REDIAL_SLOTS in the same change that raises
+        // the connection budget.
+        assert!(
+            usize::from(MAX_TOTAL_DHAN_CONNECTIONS) <= GHOST_REDIAL_SLOTS,
+            "every authorized socket must have a real generation slot, or the \
+             probe's re-dial defence is vacuous for the ones that do not"
+        );
+    }
+
+    /// Arm B's `send_wire: false` branch at the SUPERVISOR, end to end
+    /// (2026-09-13).
+    ///
+    /// All six `ProbeUnsubscribe` tests before this one passed
+    /// `send_wire: true`; the probe-side test asserts only that the COMMAND
+    /// carries `!send_wire`. Nothing asserted that the supervisor HONOURS it —
+    /// so the `else { true }` branch that empties the guard and sends no frame
+    /// had zero coverage, on the arm whose whole mechanism is the
+    /// close-and-redial.
+    ///
+    /// Both halves matter and they fail in opposite directions:
+    ///
+    /// * a frame that DOES go out makes Arm B into Arm A, measuring the
+    ///   vendor's unsubscribe handling instead of the re-dial replay;
+    /// * a guard that is NOT emptied makes the re-dial re-subscribe the
+    ///   instrument, frames resume, and Arm B measures our own replay.
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_unsubscribe_with_send_wire_false_empties_the_guard_without_a_frame() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: one_frame_then_a_reconnectable_close(),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(LiveSubscriptionCommand::ProbeUnsubscribe {
+            drop_this: si(1),
+            send_wire: false,
+            ack: Some(ack_tx),
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let _ = run_connection_with_commands(
+            fake(&st),
+            sup(DhanEndpointType::Depth200, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        assert_eq!(
+            ack_rx.try_recv().expect("the probe arm must answer"),
+            ProbeUnsubscribeOutcome::Dropped,
+            "Arm B asks for no frame, and that request cannot fail — the \
+             outcome must be `Dropped`, never `WireFailed`"
+        );
+        let s = st.lock().expect("fake state");
+        assert_eq!(
+            s.unsubscribes, 0,
+            "`send_wire: false` means NO unsubscribe frame reaches the wire — \
+             a frame here would make Arm B indistinguishable from Arm A"
+        );
+        assert_eq!(
+            s.wire_calls,
+            vec!["subscribe"],
+            "the initial dispatch and nothing else"
+        );
+        assert_eq!(
+            s.connects, 2,
+            "ANTI-VACUITY: without a real re-dial the replay assertion below \
+             is green whatever the guard holds"
+        );
+        assert_eq!(
+            s.subscribes, 1,
+            "THE GUARD SIDE: emptied without a frame, so the re-dial's replay \
+             carries nothing. Were the branch to leave the guard holding the \
+             instrument, the replay would re-subscribe it and Arm B would be \
+             measuring our own replay rather than the vendor"
         );
     }
 }

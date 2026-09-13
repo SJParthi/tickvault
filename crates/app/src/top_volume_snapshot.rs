@@ -84,10 +84,40 @@ pub enum SnapshotRefusal {
     /// same day. `ALL` therefore stays four long and every fixed-size counter
     /// array sized from it is unchanged.
     LabelUnavailable,
-    /// `window_lots_milli` did not fit a signed 64-bit column. Unreachable at
-    /// any real lot size (it would need ~9.2e15 milli-lots in one window) and
-    /// refused rather than wrapped, because a negative rank key stored as the
-    /// reason a contract ranked first is worse than an absent row.
+    /// `window_lots_milli` did not fit a signed 64-bit column, or its
+    /// percentage form overflowed. Refused rather than wrapped, because a
+    /// negative rank key stored as the reason a contract ranked first is worse
+    /// than an absent row.
+    ///
+    /// # ⚠ BOTH ARMS ARE UNREACHABLE at today's bounds (recorded 2026-09-13)
+    ///
+    /// The prior text said "unreachable … it would need ~9.2e15 milli-lots",
+    /// which conflated the units (9.2e15 *lots* is 9.2e18 *milli*-lots) and
+    /// understated the real headroom by 1000x. The arithmetic, stated so the
+    /// next reader does not re-derive it:
+    ///
+    /// | quantity | value |
+    /// |---|---|
+    /// | `delta_units` ceiling (it is a `u32`) | 4,294,967,295 |
+    /// | `window_lots_milli` = `delta_units * 1000 / lot_size`, worst at `lot_size = 1` | ~**4.29e12** |
+    /// | `i64::try_from` (the KEY arm) fails above `i64::MAX` | ~**9.22e18** — ~2.1 MILLION x above |
+    /// | `checked_mul(100)` (the PCT arm) fails above `i64::MAX / 100` | ~**9.22e16** — ~21,000 x above |
+    ///
+    /// So neither arm can fire, and **this counter reading zero proves
+    /// nothing** — it is the class this repository has recorded three times
+    /// (a saturated redial ceiling, an unreachable `unsubscribe_timeout`, a
+    /// self-satisfying source scan) where an unreachable counter gets cited as
+    /// coverage. The guards STAY: an unreachable guard on arithmetic is
+    /// correct defence, and it is what makes the widening of `delta_units` to
+    /// `u64` a safe future change rather than a silent wrap.
+    ///
+    /// Its three siblings differ, and the difference is the point:
+    /// [`Self::GainUnavailable`] fires routinely (near the open),
+    /// [`Self::LabelUnavailable`] fires on real snapshot drift, and
+    /// [`Self::IdTooLargeForSignedColumn`] is unreachable only because every
+    /// namespace band in use today sits below `2^63` — an id space this
+    /// module does not own, so that one is unreachable by CONVENTION where
+    /// these two are unreachable by ARITHMETIC.
     LotsOutOfRange,
 }
 
@@ -161,6 +191,29 @@ impl SnapshotProjection<'_> {
         self.refusals.len()
     }
 }
+
+/// Entries [`project_snapshot`] reserves in its refusal buffer up front.
+///
+/// A SMALL FIXED capacity, not `ranked.len()`, and the number is derived
+/// rather than round. One entry is `(u64, SnapshotRefusal)` = **16 B** (an 8 B
+/// id plus a one-byte fieldless enum, padded by the `u64`'s alignment), so 64
+/// entries is exactly **1 KiB** — one allocation, page-sized, per family per
+/// cadence.
+///
+/// It is sized for the case that actually happens. On a healthy sweep the
+/// refusal count is **zero**: `IdTooLargeForSignedColumn` and
+/// `LotsOutOfRange` are both unreachable at real bounds (see
+/// [`SnapshotRefusal::LotsOutOfRange`]), and `LabelUnavailable` means the two
+/// artifact-built snapshots have DRIFTED, which is a handful of contracts or
+/// none. 64 covers the drift case with no reallocation at all.
+///
+/// It is deliberately NOT sized for the degraded window (post-open, before the
+/// first underlying is priced, when every row refuses `GainUnavailable`).
+/// Covering that costs ~323 KB of reserved-and-untouched memory on EVERY
+/// sweep, all session, on the frame drain — see the note at the allocation
+/// site. Growing into it instead costs ~10 reallocations inside one transient
+/// window, and `Vec`'s doubling makes the total memcpy amortized O(1).
+const SNAPSHOT_REFUSAL_PREALLOC: usize = 64;
 
 /// Truncates a timestamp DOWN to its whole second.
 ///
@@ -384,10 +437,14 @@ pub const fn secs_of_day_ist(ts_ist_nanos: i64) -> u32 {
 /// contract that traded LESS than one lot reads NEGATIVE, which is the reason
 /// the change form was chosen over a ratio.
 ///
-/// `None` only on an overflow that needs `window_lots_milli` above ~9.2e13 —
-/// unreachable at any real lot size, and refused rather than wrapped, because
-/// a wrapped percentage stored as the reason a contract ranked first is worse
-/// than an absent row.
+/// `None` only on an overflow that needs `window_lots_milli` above
+/// `i64::MAX / 100` ≈ **9.2e16** (⚠ CORRECTED 2026-09-13 — this read `~9.2e13`,
+/// low by 1000x). The real ceiling is `u32::MAX * 1000` ≈ 4.29e12, so the arm
+/// is ~21,000x out of reach and CANNOT FIRE; it is refused rather than wrapped
+/// because a wrapped percentage stored as the reason a contract ranked first
+/// is worse than an absent row, and it is kept so widening `delta_units` stays
+/// a safe change. See [`SnapshotRefusal::LotsOutOfRange`] for the full table
+/// and for why an unreachable counter must never be cited as coverage.
 #[must_use]
 pub const fn net_volume_chg_milli_pct(window_lots_milli: i64) -> Option<i64> {
     match window_lots_milli.checked_mul(100) {
@@ -459,17 +516,47 @@ where
     // For the 1-second cadence this is exactly `floor_to_second`, so nothing
     // about that board changes.
     let ts = floor_to_grid(snapshot_ts_ist_nanos, cadence.interval_secs());
+    // `rows` IS pre-sized: it genuinely fills. Every contract on the board
+    // produces a row — the two refusals that can fire in the common case
+    // (`GainUnavailable`, `LabelUnavailable`) do NOT drop the row, they only
+    // NULL a leaf column — so `ranked.len()` is the exact final length in
+    // every reachable case and one allocation is the whole cost.
     let mut rows = Vec::with_capacity(ranked.len());
-    // PRE-SIZED like `rows`, and for a reason the empty `Vec::new()` it
-    // replaces got backwards: the refusal that dominates this buffer is
-    // `GainUnavailable`, and that one is the EXPECTED state near the open —
-    // before a spot price and a previous close exist for an underlying, EVERY
-    // row refuses. `Vec::new()` grows geometrically, so the common pre-open
-    // case paid ~15 reallocations and memcpys per family per sweep, on the
-    // frame drain. One allocation of a buffer that is usually empty by 09:20
-    // is the cheaper side of that trade, and it makes the projection's
-    // allocation count a constant 2 rather than a function of the market.
-    let mut refusals = Vec::with_capacity(ranked.len());
+    // `refusals` is NOT, and the comment that used to defend pre-sizing it
+    // argued about the allocation COUNT while being silent about the BYTES.
+    //
+    // # ⚠ CORRECTED 2026-09-13 — `Vec::with_capacity(ranked.len())` was a
+    // # multi-hundred-KB allocation per sweep, on the drain, to hold nothing
+    //
+    // The prior text read "it makes the projection's allocation count a
+    // constant 2 rather than a function of the market". True of the count and
+    // false about what it costs. One entry is `(u64, SnapshotRefusal)` — 8 B
+    // of id plus a one-byte fieldless enum, padded to **16 B** by the u64's
+    // alignment. Since the operator's 2026-09-12 directive removed the
+    // top-250-per-family persistence cut, `ranked.len()` is market-bounded
+    // (~20,220 traded option contracts measured, ceiling
+    // `TOP_VOLUME_PERSIST_PER_FAMILY` = 25,000), so that line reserved
+    //
+    //     20,220 x 16 B  =  ~323 KB   per family per cadence
+    //
+    // and the cadences are FOUR since the same directive (1s/3s/5s/1m). In the
+    // second where all four arms land together across both families that is
+    // **8 x ~323 KB = ~2.6 MB allocated and dropped per second** on the frame
+    // drain, for a buffer whose steady-state length is ZERO.
+    //
+    // The count claim did not even hold on its own terms: `LabelUnavailable`
+    // and `GainUnavailable` can BOTH fire for one contract, so the true worst
+    // case is `2 x ranked.len()` entries and `ranked.len()` of capacity would
+    // have reallocated anyway.
+    //
+    // What the prior text got RIGHT, and this keeps: the degraded window is
+    // real. Between the open and the first priced underlying (measured at up
+    // to ~30 minutes on 2026-09-08) the board is full and every row refuses
+    // `GainUnavailable`, so the buffer does fill. A small fixed capacity pays
+    // geometric growth THERE — ~10 reallocations, amortized O(1) in total
+    // memcpy — and pays ~1 KiB once everywhere else. Pre-sizing paid ~323 KB
+    // everywhere, all session, to make that one transient window cheaper.
+    let mut refusals = Vec::with_capacity(SNAPSHOT_REFUSAL_PREALLOC);
 
     for contract in ranked {
         let Ok(security_id) = i64::try_from(contract.security_id) else {
@@ -493,9 +580,22 @@ where
         // The percentage the operator reads, as an INTEGER in milli-percent.
         // Exactly the transform `console_views` renders and
         // `ranking_by_volume_percentage_is_the_same_order_as_ranking_by_lots`
-        // pins, carried out in `i64` so no float ever touches this path. It
-        // shares `window_lots_milli`'s refusal arm because it is a total
-        // function of it: if the key did not fit, neither does the percentage.
+        // pins, carried out in `i64` so no float ever touches this path.
+        //
+        // ⚠ CORRECTED 2026-09-13 — the implication was stated BACKWARDS. This
+        // read "it shares `window_lots_milli`'s refusal arm because it is a
+        // total function of it: if the key did not fit, neither does the
+        // percentage." The percentage limit is `i64::MAX / 100`, which is
+        // **100x TIGHTER** than the key limit of `i64::MAX` — so the true
+        // implication runs the other way (pct fits => key fits), and on paper
+        // a key-fits/pct-fails band exists at 9.22e16 < v <= 9.22e18. Sharing
+        // the arm is still right, because both mean "the volume arithmetic
+        // did not fit a column"; what was wrong is the reason given for it.
+        //
+        // In practice NEITHER arm is reachable: `window_lots_milli` is capped
+        // by `u32::MAX * 1000` ~ 4.29e12, ~21,000x below even the tighter pct
+        // limit. The band above is arithmetic, not a live case — see
+        // `SnapshotRefusal::LotsOutOfRange`.
         let Some(net_volume_chg_milli_pct) = net_volume_chg_milli_pct(window_lots_milli) else {
             refusals.push((contract.security_id, SnapshotRefusal::LotsOutOfRange));
             continue;

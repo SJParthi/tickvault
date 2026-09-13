@@ -32,6 +32,17 @@
 //! 2. every positional `find()` is preceded by an occurrence COUNT, so a
 //!    second match cannot silently move the anchor;
 //! 3. [`guard_self_test`] bite-proves that each scan can FAIL.
+//!
+//! Those three were not enough, and this file supplied the proof. On
+//! 2026-09-13 an adversarial hunt found the **thirteenth** vacuous guard HERE:
+//! the carried-forward test asserted `declared < consumed`, an ordering Rust
+//! already guarantees, so it could not fail for the regression its own message
+//! described. See [`held_names_outlives_the_loop`] for the corrected property
+//! and `guard_self_test` block `(c2)` for the fixture that bite-proves both
+//! the withdrawn assertion's vacuity and the replacement's bite. The fourth
+//! rule the finding adds: **name the property in code, not only in the failure
+//! message** — an assertion whose message describes something stronger than
+//! the expression evaluates is a vacuous guard wearing a correct comment.
 
 use std::fs;
 
@@ -94,6 +105,63 @@ fn offset_of_only(haystack: &str, needle: &str, want: usize) -> usize {
         .unwrap_or_else(|| panic!("{needle:?} not found"))
 }
 
+/// [`offset_of_only`] as a `Result`, so a checker built on it can be
+/// bite-proven against a fixture without `catch_unwind`.
+fn only_offset(haystack: &str, needle: &str) -> Result<usize, String> {
+    let found = haystack.matches(needle).count();
+    if found != 1 {
+        return Err(format!(
+            "expected exactly 1 occurrence of {needle:?}, found {found} — a \
+             positional assertion against a moved or missing anchor proves nothing"
+        ));
+    }
+    haystack
+        .find(needle)
+        .ok_or_else(|| format!("{needle:?} not found"))
+}
+
+/// The carried-forward check, as a pure function over source text so
+/// [`guard_self_test`] can bite-prove it against a fixture in which the
+/// declaration has been moved INSIDE the loop.
+///
+/// # The thirteenth vacuous guard (found and corrected 2026-09-13)
+///
+/// Until today this property was asserted as `declared < consumed` — the
+/// offset of `let mut held_names:` against the offset of `&held_names,`.
+/// **That ordering cannot fail for the regression it names.** Rust already
+/// forbids use-before-declaration, so `declared < consumed` holds whether the
+/// declaration sits above `loop {` or is its first statement. PROVEN: moving
+/// the declaration inside the loop in `depth_rebalance.rs` left all nine tests
+/// green, `guard_self_test` included.
+///
+/// The property is `declared < loop_start` — the declaration must precede the
+/// `loop {` TOKEN, not merely precede its use. `\n    loop {` is the steering
+/// loop's own four-space indentation and occurs exactly once in the scanned
+/// production source; the inner `loop {` of the heartbeat spawn is eight-space
+/// indented and cannot match, which `only_offset`'s count assertion pins.
+fn held_names_outlives_the_loop(body: &str) -> Result<(), String> {
+    let declared = only_offset(body, "let mut held_names:")?;
+    let loop_start = only_offset(body, "\n    loop {")?;
+    let consumed = only_offset(body, "&held_names,")?;
+    if declared >= loop_start {
+        return Err(format!(
+            "`held_names` is declared at byte {declared}, at or after the \
+             steering `loop {{` at byte {loop_start} — declared INSIDE the loop \
+             it is a fresh empty set every minute, `NameBoard::keeps` is handed \
+             nothing, `DEPTH20_NAME_EXIT_RANK` never bites, and the swap \
+             counters report churn control the code does not have"
+        ));
+    }
+    if loop_start >= consumed {
+        return Err(format!(
+            "`&held_names,` at byte {consumed} is not inside the steering loop \
+             that starts at byte {loop_start} — the board is not being told \
+             what it chose last minute"
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // 1. The board is REACHED, and it is PRIMARY.
 // ---------------------------------------------------------------------------
@@ -150,13 +218,12 @@ fn the_exit_band_governs_the_next_minute_because_the_choice_is_carried_forward()
     // swap counters report churn control it does not have.
     let loop_body = production_source("src/depth_rebalance.rs");
     offset_of_only(&loop_body, "held_names = name_plan.chosen_keys();", 1);
-    let declared = offset_of_only(&loop_body, "let mut held_names:", 1);
-    let consumed = offset_of_only(&loop_body, "&held_names,", 1);
-    assert!(
-        declared < consumed,
-        "`held_names` must OUTLIVE the per-minute iteration; declared inside \
-         the loop it would be empty every minute and the band would never bite"
-    );
+    // `declared < consumed` is NOT this property — Rust forbids
+    // use-before-declaration, so that ordering holds on BOTH sides of the
+    // regression. The declaration must precede the `loop {` TOKEN.
+    if let Err(why) = held_names_outlives_the_loop(&loop_body) {
+        panic!("{why}");
+    }
     // A COMPILE-TIME assertion, not a runtime one: both sides are consts, so
     // a runtime `assert!` here could never fail a test run that compiled. This
     // fails the BUILD if someone narrows the band to the entry set - which
@@ -182,6 +249,130 @@ fn the_plan_is_capped_to_what_one_connection_can_queue() {
         loop_body.contains("MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE"),
         "the cap must be the socket's own command-channel depth, never a \
          literal that can drift away from it"
+    );
+}
+
+#[test]
+fn the_band_is_cleared_the_moment_the_board_stops_driving() {
+    // `held_names` is written from the board.s CHOICE, not from the wire. That
+    // is right while the board IS the engine and wrong the instant another one
+    // takes over: a fallback minute rewrites every socket from the volume
+    // ranking, so a name the board chose before the fallback is no longer
+    // subscribed anywhere. Carried forward, the next steerable minute would
+    // PREFER those phantom incumbents over names that genuinely out-moved
+    // them, and the exit band would be protecting contracts nothing holds.
+    //
+    // The property is POSITIONAL and it is the whole test: the clear must sit
+    // on the FALLBACK arm. A `clear()` moved into the steerable arm compiles,
+    // keeps a `contains` assertion green, and destroys the hysteresis outright
+    // by emptying the band on the very minutes it exists to govern.
+    let body = production_source("src/depth_rebalance.rs");
+    let chose = offset_of_only(&body, "held_names = name_plan.chosen_keys();", 1);
+    let steerable_arm_ends = offset_of_only(&body, "(planned, \"name_board\")", 1);
+    let cleared = offset_of_only(&body, "held_names.clear();", 1);
+    let fallback_begins_work = offset_of_only(&body, "match ranking_20.as_deref() {", 1);
+    assert!(
+        chose < steerable_arm_ends,
+        "the carry-forward write must be inside the steerable arm"
+    );
+    assert!(
+        steerable_arm_ends < cleared && cleared < fallback_begins_work,
+        "held_names.clear() must sit on the FALLBACK arm — after the steerable \
+         arm.s own tail expression and before the fallback picks an engine — \
+         or the band is emptied on the minutes it is supposed to govern"
+    );
+}
+
+#[test]
+fn every_planning_minute_reaches_the_name_board_counters() {
+    // The board became the PRIMARY depth-20 engine on 2026-09-13 and shipped
+    // with no metric of its own, while the ranked counters it displaced freeze
+    // the moment it takes over. So the one signal an operator had for depth-20
+    // steering went flat exactly when the engine changed — green by absence.
+    //
+    // Two call sites, not one, and that is the defect this pins. The board is
+    // BUILT every minute and only DRIVES on some; the three counters that
+    // explain a refusal (`names_unresolved`, `index_unresolved`,
+    // `spots_missing`) can therefore only move on a minute it did NOT drive.
+    // Recording just the steerable arm would leave them at their seeded zero
+    // forever — a refusal metric structurally unable to report a refusal.
+    let body = production_source("src/depth_rebalance.rs");
+    offset_of_only(&body, "pre_register_name_board_counters();", 1);
+    let first = offset_of_only(&body, "record_name_board_plan(", 2);
+    let last = body
+        .rfind("record_name_board_plan(")
+        .expect("counted two occurrences above");
+    let steerable_arm_ends = offset_of_only(&body, "(planned, \"name_board\")", 1);
+    assert!(
+        first < steerable_arm_ends,
+        "the steerable minute must record its own plan and swap counts"
+    );
+    assert!(
+        last > steerable_arm_ends,
+        "the FALLBACK minute must record too, or the refusal counters can \
+         never leave zero"
+    );
+}
+
+#[test]
+fn pre_register_name_board_counters_seeds_every_label_the_recorder_can_emit() {
+    // The CloudWatch agent computes a counter as the delta between consecutive
+    // samples and DROPS the first sample of a series it has never seen. A label
+    // the recorder can emit but the seeder never touches therefore loses its
+    // FIRST increment — and for these six that first increment is usually the
+    // only one the day ever produces. The series then reads zero on exactly the
+    // session it was built to explain.
+    //
+    // The reverse direction is checked too: a label seeded and never emitted is
+    // a permanently-flat series an operator reads as "this never happens".
+    let src = production_source("src/depth20_name_board.rs");
+
+    let array = src
+        .split_once("DEPTH20_NAME_BOARD_OUTCOME_LABELS: [&str; 6] = [")
+        .and_then(|(_, rest)| rest.split_once("];"))
+        .map(|(inside, _)| inside.to_owned())
+        .expect("the label array must be a literal the seeder can loop over");
+    let mut seeded: Vec<String> = array
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_owned)
+        .collect();
+
+    let recorder = src
+        .split_once("pub fn record_name_board_plan")
+        .and_then(|(_, rest)| rest.split_once("\n}"))
+        .map(|(body, _)| body.to_owned())
+        .expect("the recorder must be a free function in production source");
+    let mut emitted: Vec<String> = recorder
+        .split("\"outcome\" => \"")
+        .skip(1)
+        .filter_map(|tail| tail.split_once('"').map(|(label, _)| label.to_owned()))
+        .collect();
+
+    // Anti-vacuity: two empty vectors compare equal, so an extractor that
+    // silently matched nothing would pass this test against ANY source.
+    assert_eq!(seeded.len(), 6, "extracted the wrong thing from the array");
+    assert_eq!(
+        emitted.len(),
+        6,
+        "extracted the wrong thing from the recorder body"
+    );
+
+    seeded.sort();
+    emitted.sort();
+    assert_eq!(
+        seeded, emitted,
+        "the seeder and the recorder disagree about the label set: a label only \
+         the recorder knows loses its first sample to the agent's delta rule, and \
+         a label only the seeder knows is a flat series that reads as never-happens"
+    );
+
+    // And the seeder must loop the array rather than spell the six out again —
+    // a second hand-written list is a third place for them to drift.
+    assert!(
+        src.contains("for outcome in DEPTH20_NAME_BOARD_OUTCOME_LABELS"),
+        "the seeding loop must read the same array this test just compared"
     );
 }
 
@@ -469,6 +660,68 @@ fn guard_self_test() {
         "a positional anchor with two matches must fail, not pick one"
     );
     assert_eq!(offset_of_only("a needle b", "needle", 1), 2);
+
+    // (c2) THE THIRTEENTH VACUOUS GUARD, bite-proven in both directions.
+    //
+    //      `held_names` declared as the loop's FIRST STATEMENT is the exact
+    //      regression the carried-forward test names: a fresh empty set every
+    //      minute, so the exit band never bites. Both fixtures below are
+    //      byte-identical apart from where that one line sits.
+    let carried = concat!(
+        "fn steer() {\n",
+        "    let mut held_names: BTreeSet<(u64, u8)> = BTreeSet::new();\n",
+        "    loop {\n",
+        "        let plan = build(\n",
+        "            &held_names,\n",
+        "        );\n",
+        "        held_names = plan.chosen_keys();\n",
+        "    }\n",
+        "}\n",
+    );
+    let relocated = concat!(
+        "fn steer() {\n",
+        "    loop {\n",
+        "        let mut held_names: BTreeSet<(u64, u8)> = BTreeSet::new();\n",
+        "        let plan = build(\n",
+        "            &held_names,\n",
+        "        );\n",
+        "        held_names = plan.chosen_keys();\n",
+        "    }\n",
+        "}\n",
+    );
+    // The WITHDRAWN assertion — `declared < consumed` — is TRUE of the
+    // relocated fixture. That is the whole finding: it could not fail for the
+    // regression its own message described, because Rust forbids
+    // use-before-declaration whichever side of `loop {` the declaration is on.
+    let stale_declared = relocated
+        .find("let mut held_names:")
+        .unwrap_or_else(|| panic!("fixture must declare held_names"));
+    let stale_consumed = relocated
+        .find("&held_names,")
+        .unwrap_or_else(|| panic!("fixture must consume held_names"));
+    assert!(
+        stale_declared < stale_consumed,
+        "the withdrawn assertion must still hold on the relocated fixture — if \
+         it does not, this fixture is not reproducing the 2026-09-13 finding"
+    );
+    // The replacement MUST reject it.
+    assert!(
+        held_names_outlives_the_loop(relocated).is_err(),
+        "a declaration moved inside the steering loop must FAIL the check — \
+         this is the regression the guard exists to catch"
+    );
+    assert!(
+        held_names_outlives_the_loop(carried).is_ok(),
+        "the carried-forward shape must PASS — a guard that rejects correct \
+         code is abandoned, and an abandoned guard enforces nothing"
+    );
+    // ...and a missing anchor must fail rather than silently proving nothing.
+    let no_loop =
+        "fn steer() {\n    let mut held_names: BTreeSet<(u64, u8)> = x;\n    &held_names,\n}\n";
+    assert!(
+        held_names_outlives_the_loop(no_loop).is_err(),
+        "an absent `loop {{` anchor must fail the check, never pass it"
+    );
 
     // (d) The real files must still satisfy what the fixtures describe — so a
     //     scan that can fail is also a scan that currently passes for the

@@ -2077,6 +2077,42 @@ mod tests {
     /// existing column would cost ~8 B on every one of the millions of rows a
     /// session now writes, on a box whose disk burn already caused a
     /// zero-capture day, to record a number the view derives exactly.
+    ///
+    /// # ⚠ CORRECTED 2026-09-13 — the column IS stored, as of PR #1911
+    ///
+    /// The paragraph above is kept verbatim per house convention (annotate,
+    /// never silently rewrite), because a reader of this module was being
+    /// told the opposite of what ships. `TopVolumeRankRow` now carries
+    /// `net_volume_chg_milli_pct` and `top_volume_rank_persistence::write_row`
+    /// writes it on every row. `top_volume_snapshot::net_volume_chg_milli_pct`
+    /// is the transform, computed in `i64` milli-percent — so the ORDERING
+    /// half of the paragraph is unchanged and this test still pins it; only
+    /// the "no redundant column is stored" half is superseded.
+    ///
+    /// **Why:** the operator's 2026-09-12 directive (Quotes C/D, recorded in
+    /// `websocket-connection-scope-lock.md` § "2026-09-12 — FOUR CADENCES"):
+    /// *"purely do thtis top volume rank purely absed on one an donly with
+    /// this volume percnetage"* and *"still let us keep this lots and normal
+    /// price percnetage change"*. Ranking on a named, stored percentage is
+    /// what he asked for; a view-only derivation is not a column he can read.
+    ///
+    /// **⚠ And the disk argument it made was never rebutted — it was
+    /// overruled.** The trade-off did not vanish and must not be reported as
+    /// though it had:
+    ///
+    /// | | before | after |
+    /// |---|---|---|
+    /// | MEASURED worst-case ILP row | 324 B | **401 B (+24%)** |
+    /// | assumed width the producer ceiling is sized from | 384 B | 448 B |
+    ///
+    /// The +77 B is the new column plus the `contract` label that landed with
+    /// it, less the `rank` column that went. It lands on a table whose
+    /// per-family persistence cut was REMOVED the same week (every traded
+    /// option contract is now written, not the top 250), on the volume that
+    /// produced 2026-09-04 — a full trading day that captured, stored and
+    /// rescued nothing on a 100%-full volume. The honest statement is that
+    /// this column costs real bytes on the exact surface that has already
+    /// failed once, and the operator accepted that cost knowingly.
     #[test]
     fn ranking_by_volume_percentage_is_the_same_order_as_ranking_by_lots() {
         let mut lb = VolumeLeaderboard::new();

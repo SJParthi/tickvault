@@ -1610,6 +1610,114 @@ mod tests {
 /// is counted (`SnapshotRefusal::LabelUnavailable`), never silently blank.
 pub const UNLABELLED_CONTRACT: &str = "unmapped";
 
+/// Hard ceiling, in BYTES, on a rendered contract label.
+///
+/// # Why a cap exists at all (2026-09-13)
+///
+/// [`contract_label`] builds its label from `row.u` (the underlying) and
+/// `row.l` (the leg) — verbatim artifact strings, only `trim()`ed. Neither is
+/// length-checked anywhere upstream. The `top_volume` ILP writer sizes its
+/// producer ceiling from `TOP_VOLUME_ILP_ROW_BYTES = 448`, a number MEASURED
+/// against a 46-byte worst-case label
+/// (`MAZAGONDOCKSHIPBUILDERS-25Sep2026-123456.75-CE`, in
+/// `the_assumed_ilp_row_width_covers_a_real_worst_case_line`). So 448 was
+/// presented as a bound and was not one: a long or corrupt artifact symbol
+/// made the row exceed it.
+///
+/// The consequence is bounded and LOUD rather than silent — the writer trips
+/// `WidthCapped` and `bail!`s naming the dropped count — but **that table has
+/// no spill tier**, so those rows are permanently gone. Capping the label
+/// trades a clipped display string for a batch that still lands.
+///
+/// # The derivation
+///
+/// | term | value |
+/// |---|---|
+/// | `TOP_VOLUME_ILP_ROW_BYTES` (the assumed width the ceiling is sized from) | 448 B |
+/// | `MEASURED_WORST_CASE_ILP_ROW_BYTES` (the real line, measured) | 401 B |
+/// | ...of which the label was | 46 B |
+/// | non-label remainder of the line | 401 - 46 = **355 B** |
+/// | therefore the label's budget inside 448 | 448 - 355 = **93 B** |
+///
+/// The cap must sit at or above **46** so no realistic label is ever clipped,
+/// and at or below **93** so no label can overrun the budget. **64** is chosen
+/// inside that band: 18 B of room above today's widest real symbol, and 29 B
+/// left under the ceiling.
+///
+/// Those 29 B are not slack, they are the residual this cap does NOT fully
+/// close: an ILP SYMBOL value escapes `,`, `=` and space with a backslash, so
+/// a label containing them is WIDER on the wire than its byte length here.
+/// Neither 448 nor the 401 measurement ever accounted for that — it applies
+/// equally to the 46-byte label shipping today — so the 29 B absorbs up to 29
+/// escaped characters and the general case is flagged rather than claimed
+/// solved.
+///
+/// The two 448/401 terms are LITERALS in this doc rather than imports: both
+/// are private consts in `tickvault-storage`, and naming them here is the same
+/// honest middle that file already takes with its own `OPTION_FAMILIES` — a
+/// change to either is a visible edit here rather than an invisible drift.
+pub const MAX_CONTRACT_LABEL_BYTES: usize = 64;
+
+/// Appended to a label [`contract_label`] had to shorten.
+///
+/// Truncation must be VISIBLE: a silently shortened symbol reads as a
+/// different (possibly real) contract, which is worse than an obviously
+/// clipped one — and this label is the string `CLAUDE.md`'s DHAN SUPPORT
+/// section has an operator paste into a vendor ticket. Four ASCII bytes, none
+/// of which an ILP SYMBOL value escapes, and greppable as a whole word so a
+/// truncation episode can be counted from the table after the fact.
+const LABEL_TRUNCATION_MARKER: &str = "~cut";
+
+// The marker must fit inside the cap with room to carry some of the label,
+// or truncation would produce a label that is only a marker.
+const _: () = assert!(
+    MAX_CONTRACT_LABEL_BYTES > LABEL_TRUNCATION_MARKER.len() * 2,
+    "the label cap must leave room for real label bytes beside the truncation \
+     marker, or every truncated label renders as the marker alone"
+);
+// Independent term (1): the widest REAL label measured by
+// `the_assumed_ilp_row_width_covers_a_real_worst_case_line`. Below this the
+// cap would start clipping labels that legitimately occur today.
+const _: () = assert!(
+    MAX_CONTRACT_LABEL_BYTES >= 46,
+    "the label cap must cover the widest REAL label (46 B, \
+     MAZAGONDOCKSHIPBUILDERS-25Sep2026-123456.75-CE) or ordinary contracts \
+     start truncating"
+);
+// Independent term (2): the label's budget inside the ILP row width the
+// top_volume producer ceiling is sized from. Above this a row can overrun a
+// ceiling whose table has NO spill tier, so an over-wide row is a lost row.
+const _: () = assert!(
+    MAX_CONTRACT_LABEL_BYTES <= 93,
+    "the label cap must sit inside the 93 B the 448 B assumed ILP row width \
+     leaves for it over the 355 B non-label remainder. Above it, one row can \
+     push a sweep past MAX_TOP_VOLUME_PRODUCER_BUFFER_BYTES and this table \
+     drops rows with no spill tier"
+);
+
+/// Caps a rendered label at [`MAX_CONTRACT_LABEL_BYTES`], on a char boundary.
+///
+/// Deterministic (a given input always yields the same output), never
+/// panicking (`String::truncate` would panic on a non-boundary index, so the
+/// index is walked back to one first), and never splitting a UTF-8 sequence —
+/// an artifact symbol is not guaranteed ASCII, and half a codepoint in a
+/// SYMBOL column is a corrupt row rather than a short one.
+fn cap_label(mut label: String) -> String {
+    if label.len() <= MAX_CONTRACT_LABEL_BYTES {
+        return label;
+    }
+    let mut cut = MAX_CONTRACT_LABEL_BYTES - LABEL_TRUNCATION_MARKER.len();
+    // Walk DOWN to the nearest char boundary. `cut` starts strictly inside the
+    // string (the early return above proves `len` is larger), and 0 is always
+    // a boundary, so this terminates and `truncate` cannot panic.
+    while cut > 0 && !label.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    label.truncate(cut);
+    label.push_str(LABEL_TRUNCATION_MARKER);
+    label
+}
+
 /// Month names for the expiry component, indexed 1..=12.
 const MONTH_ABBREV: [&str; 13] = [
     "???", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -1633,6 +1741,13 @@ const MONTH_ABBREV: [&str; 13] = [
 /// paise divide, with the fraction kept when they do not, because a strike
 /// like 1234.50 is real on low-priced underlyings and rounding it would make
 /// two adjacent strikes print the same label.
+///
+/// The result is CAPPED at [`MAX_CONTRACT_LABEL_BYTES`] and marked when it is
+/// — `underlying` and `leg` are verbatim artifact strings with no length check
+/// anywhere upstream, and an uncapped one made a `top_volume` row exceed the
+/// width its producer ceiling is sized from, on a table with no spill tier.
+/// See that constant for the derivation and for the escaping residual it does
+/// not close.
 #[must_use]
 pub fn contract_label(underlying: &str, expiry_ymd: u32, strike_paise: i64, leg: &str) -> String {
     let year = expiry_ymd / 10_000;
@@ -1661,7 +1776,12 @@ pub fn contract_label(underlying: &str, expiry_ymd: u32, strike_paise: i64, leg:
         out.push('-');
         out.push_str(leg);
     }
-    out
+    // The cap goes at the END, over the WHOLE rendered label, not on each
+    // component: a pathological `underlying`, a pathological `leg` and a
+    // pathological `expiry_ymd` (which renders its digits verbatim by design)
+    // all widen the same row, and one choke point is the only shape that
+    // bounds their sum.
+    cap_label(out)
 }
 
 /// Builds the contract-id -> label table from the day's artifact rows.
@@ -1700,4 +1820,162 @@ pub fn labels_from_artifact(contracts: &[ContractRow]) -> HashMap<ContractKey, A
         );
     }
     labels
+}
+
+#[cfg(test)]
+mod label_cap_tests {
+    use super::{
+        LABEL_TRUNCATION_MARKER, MAX_CONTRACT_LABEL_BYTES, contract_label, labels_from_artifact,
+    };
+
+    /// The expiry/strike/leg tail every fixture below shares, so a test can
+    /// reconstruct what the UNCAPPED render would have been and assert the
+    /// truncation is a real prefix of it.
+    const TAIL: &str = "-25Sep2026-24500-CE";
+
+    /// The widest label the storage-side width harness measures the ILP row
+    /// against. It must survive untouched, or this cap is clipping contracts
+    /// that legitimately trade today.
+    const WIDEST_REAL_LABEL: &str = "MAZAGONDOCKSHIPBUILDERS-25Sep2026-123456.75-CE";
+
+    #[test]
+    fn an_ordinary_label_is_untouched_by_the_cap() {
+        let label = contract_label("NIFTY", 20_260_925, 2_450_000, "CE");
+        assert_eq!(label, "NIFTY-25Sep2026-24500-CE");
+        assert!(
+            !label.contains(LABEL_TRUNCATION_MARKER),
+            "a 24 B label must not be marked as truncated"
+        );
+    }
+
+    /// Non-vacuous in the direction that matters: the cap must not be so tight
+    /// that the REAL worst case trips it. This is the lower bound the
+    /// const-assert pins, proven end to end through `contract_label`.
+    #[test]
+    fn the_widest_real_label_still_renders_in_full() {
+        let label = contract_label("MAZAGONDOCKSHIPBUILDERS", 20_260_925, 12_345_675, "CE");
+        assert_eq!(label, WIDEST_REAL_LABEL);
+        assert_eq!(label.len(), 46, "the measured worst case is 46 B");
+        assert!(label.len() <= MAX_CONTRACT_LABEL_BYTES);
+        assert!(!label.contains(LABEL_TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn an_over_long_label_truncates_within_the_cap_and_says_so() {
+        // A pathological artifact symbol: 200 ASCII bytes where a real one is
+        // at most 23. This is the shape that made a row exceed the ILP width
+        // the `top_volume` producer ceiling is sized from, on a table with no
+        // spill tier — so the row was permanently lost rather than clipped.
+        let underlying = "A".repeat(200);
+        let label = contract_label(&underlying, 20_260_925, 2_450_000, "CE");
+        assert!(
+            label.len() <= MAX_CONTRACT_LABEL_BYTES,
+            "a truncated label measured {} B against a {MAX_CONTRACT_LABEL_BYTES} B cap",
+            label.len()
+        );
+        assert!(
+            label.ends_with(LABEL_TRUNCATION_MARKER),
+            "truncation must be VISIBLE, not a silently shortened symbol: {label}"
+        );
+        // Deterministic: the same input renders the same label every time, so
+        // a DEDUP key carrying this column cannot split one contract in two.
+        assert_eq!(
+            label,
+            contract_label(&underlying, 20_260_925, 2_450_000, "CE")
+        );
+    }
+
+    /// The leg is the OTHER uncapped artifact string, and the cap is applied
+    /// once over the WHOLE rendered label rather than per component.
+    #[test]
+    fn an_over_long_leg_is_capped_by_the_same_choke_point() {
+        let leg = "C".repeat(300);
+        let label = contract_label("NIFTY", 20_260_925, 2_450_000, &leg);
+        assert!(label.len() <= MAX_CONTRACT_LABEL_BYTES);
+        assert!(label.ends_with(LABEL_TRUNCATION_MARKER));
+    }
+
+    /// Truncation must land on a char boundary. `String::truncate` PANICS on a
+    /// byte index inside a UTF-8 sequence and repo law bans a panic on a
+    /// production path — an artifact symbol is not guaranteed ASCII.
+    ///
+    /// The ASCII padding is deliberately FIRST so the cap's byte index lands
+    /// at a different offset within the 3-byte run on each iteration; without
+    /// it every cut would land on an exact multiple of 3 and the boundary walk
+    /// would never execute, leaving this test vacuous.
+    #[test]
+    fn a_multi_byte_label_truncates_on_a_char_boundary_without_panicking() {
+        for pad in 0..6_usize {
+            let underlying = format!("{}{}", "x".repeat(pad), "\u{20b9}".repeat(120));
+            let label = contract_label(&underlying, 20_260_925, 2_450_000, "CE");
+
+            assert!(
+                label.len() <= MAX_CONTRACT_LABEL_BYTES,
+                "pad {pad}: multi-byte label measured {} B",
+                label.len()
+            );
+            assert!(label.ends_with(LABEL_TRUNCATION_MARKER), "pad {pad}");
+
+            // The real proof, and the reason this is not just a "did not
+            // panic" test: strip the marker and what remains must be a
+            // character-aligned PREFIX of the label that would have rendered
+            // uncapped. A split codepoint fails both halves.
+            //
+            // The slice index is safe by the assert above: the marker is
+            // ASCII, so `len - marker.len()` is the boundary it starts at.
+            let kept = &label[..label.len() - LABEL_TRUNCATION_MARKER.len()];
+            let uncapped = format!("{underlying}{TAIL}");
+            assert!(
+                uncapped.starts_with(kept),
+                "pad {pad}: truncation is not a prefix of the full label"
+            );
+            assert!(
+                uncapped.is_char_boundary(kept.len()),
+                "pad {pad}: truncation split a UTF-8 sequence at byte {}",
+                kept.len()
+            );
+        }
+    }
+
+    /// A label so pathological that only the marker could survive must still
+    /// be a label. An empty SYMBOL value is a different failure from a
+    /// truncated one and must not be reachable here.
+    #[test]
+    fn truncation_always_keeps_some_of_the_original_label() {
+        let underlying = "\u{1f600}".repeat(64);
+        let label = contract_label(&underlying, 20_260_925, 2_450_000, "CE");
+        assert!(label.len() > LABEL_TRUNCATION_MARKER.len());
+        assert!(label.ends_with(LABEL_TRUNCATION_MARKER));
+    }
+
+    /// The cap reaches the PUBLISHED snapshot, not just the free function —
+    /// `labels_from_artifact` is the only producer the projection reads, so a
+    /// cap that stopped at `contract_label` would bound nothing in production.
+    #[test]
+    fn the_published_label_snapshot_carries_capped_labels() {
+        use crate::dhan_contract_universe::ContractRow;
+
+        let rows = vec![ContractRow {
+            i: 42,
+            // `EXCH_ID`, which `derivative_segment` maps — "NSE", not the
+            // segment name.
+            x: "NSE".to_owned(),
+            c: "OPTSTK".to_owned(),
+            e: 20_260_925,
+            s: 2_450_000,
+            l: "CE".to_owned(),
+            u: "B".repeat(250),
+            z: 50,
+        }];
+        let labels = labels_from_artifact(&rows);
+        assert_eq!(labels.len(), 1, "the fixture must actually publish a label");
+        for label in labels.values() {
+            assert!(
+                label.len() <= MAX_CONTRACT_LABEL_BYTES,
+                "a published label measured {} B",
+                label.len()
+            );
+            assert!(label.ends_with(LABEL_TRUNCATION_MARKER));
+        }
+    }
 }

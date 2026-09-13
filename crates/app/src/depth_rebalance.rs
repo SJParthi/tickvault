@@ -62,6 +62,23 @@ use crate::movers::StockMove;
 pub const RANKING_PUBLISH_DEADLINE_SECS_OF_DAY_IST: u32 =
     tickvault_common::constants::TOP_VOLUME_CAPTURE_START_SECS_OF_DAY_IST + 5 * 60;
 
+/// How long before the capture window closes the unsubscribe probe refuses to
+/// arm.
+///
+/// The scope lock's 2026-09-12 REJECT list names this outright — *"Runs inside
+/// the last 30 minutes of the session"* — and the reason is finding 4's
+/// residual: an Arm B socket is not proven healthy again until a frame
+/// arrives on it, so a probe that starts near the close can leave a socket in
+/// a not-proven-healthy state that the next close then freezes in place.
+///
+/// It is also a budget: both arms plus their acks and restores run for roughly
+/// four minutes, and a probe armed at 15:38 would still be watching after the
+/// exchange had stopped sending anything to watch — producing a `Silent`
+/// reading that means "the market shut", not "the vendor honoured the
+/// unsubscribe". That is the single worst failure this probe can have: a
+/// confident wrong verdict.
+pub const PROBE_NO_ARM_BEFORE_CLOSE_SECS: u32 = 30 * 60;
+
 /// 10:00 IST — forty-five minutes after the capture window opens.
 ///
 /// A ranking that IS published but carries ZERO gainer-eligible stock-option
@@ -1420,6 +1437,7 @@ pub async fn run_depth_rebalance(
     crate::depth_seed::pre_register_seed_counters();
     crate::dhan_contract_universe::pre_register_spot_backstop_counters();
     crate::depth_subscription_view::pre_register_view_counters();
+    crate::depth20_name_board::pre_register_name_board_counters();
     // The heartbeat, published by a task this loop cannot wedge.
     //
     // Registered BEFORE the first iteration: a loop that dies on its very
@@ -1479,10 +1497,11 @@ pub async fn run_depth_rebalance(
     // differ exactly when it matters: a restart at 11:00 would re-arm a probe
     // that already spent its shot at 09:20 and empty a SECOND depth-200
     // socket. The latch file carries the IST day it was spent on.
-    let probe_day = crate::depth_unsubscribe_probe::today_ymd_ist();
     let probe_latch = crate::depth_unsubscribe_probe::day_latch_path();
-    let mut probe_run =
-        crate::depth_unsubscribe_probe::probe_already_ran_today(&probe_latch, probe_day);
+    let mut probe_run = crate::depth_unsubscribe_probe::probe_already_ran_today(
+        &probe_latch,
+        crate::depth_unsubscribe_probe::today_ymd_ist(),
+    );
     let mut post_close_logged = false;
     let mut no_ranking_reported = false;
     let mut gainer_board_empty_reported = false;
@@ -1499,6 +1518,20 @@ pub async fn run_depth_rebalance(
     // computed and discarded, the board re-orders freely every minute, and
     // the swap counters report controlled churn the whole time.
     let mut future_index: HashMap<String, SubscribeInstrument> = HashMap::new();
+    // Whether the artifact has been READ, which is not the same question as
+    // whether it yielded any futures.
+    //
+    // The retry used to be `if future_index.is_empty()`, so an artifact that
+    // parses to ZERO futures — every contract expired, the one day a rollover
+    // can produce it — was re-read and re-parsed on every one of the session's
+    // 375 iterations, each a blocking `std::fs` read and a ~22,000-row parse on
+    // the async steering task. The docstring beside it claimed the opposite
+    // ("resolved ONCE"), which is how it survived review.
+    //
+    // Retrying while UNREAD keeps the case the old guard was written for: the
+    // artifact legitimately may not exist yet at 09:00, and a permanently
+    // cached empty index would cost every name its future slot for the day.
+    let mut future_index_read = false;
     let mut held_names: BTreeSet<(u64, u8)> = BTreeSet::new();
     loop {
         let second = u64::from(ist_second_of_day_now() % 60);
@@ -1567,15 +1600,46 @@ pub async fn run_depth_rebalance(
         if !probe_run
             && probe_cfg.enabled
             && (RANKING_PUBLISH_DEADLINE_SECS_OF_DAY_IST
-                ..tickvault_common::constants::TOP_VOLUME_CAPTURE_END_SECS_OF_DAY_IST)
+                ..tickvault_common::constants::TOP_VOLUME_CAPTURE_END_SECS_OF_DAY_IST
+                    .saturating_sub(PROBE_NO_ARM_BEFORE_CLOSE_SECS))
                 .contains(&secs_of_day)
         {
             probe_run = true;
+            // The day is resolved HERE, not at boot.
+            //
+            // `today_ymd_ist` documents exactly this: "resolved at the moment
+            // of the call rather than at boot … a process that spans midnight
+            // would mark the wrong day". A boot-time value made that claim
+            // false at its only caller, which is the shape this file keeps
+            // recording — a correct docstring undone by its wiring.
+            let probe_day = crate::depth_unsubscribe_probe::today_ymd_ist();
+            // The stamp, BEFORE the block rather than after it.
+            //
+            // The heartbeat gauge is published by its own task, but the VALUE
+            // it publishes is `now - stamp`, and only this loop writes the
+            // stamp. So a blocking probe does not stop the heartbeat — it
+            // makes the heartbeat report a growing age, which is exactly what
+            // `depth-steering-stalled` alarms on at 180 s. Stamping here
+            // starts that clock at the probe rather than at the END of the
+            // PREVIOUS iteration, which is worth a whole minute of the budget.
+            //
+            // ⚠ RESIDUAL, stated rather than papered over: both arms plus
+            // acks and restores run for roughly four minutes, so the age
+            // still crosses 180 s for the back half of the probe. The alarm
+            // needs TWO consecutive breaching 300 s periods, so a single
+            // probe normally produces one — but an unlucky straddle of two
+            // period boundaries would page. That is a once-a-day,
+            // operator-armed window; the fix if it ever bites is to hand the
+            // probe the stamp, which means widening its signature.
+            heartbeat.store(now_epoch_secs(), std::sync::atomic::Ordering::Relaxed);
             // BEFORE the arm, never after: a crash mid-probe must leave the
             // day spent. Declining a re-run costs one measurement; permitting
             // one costs a second emptied socket on a live steering path.
             crate::depth_unsubscribe_probe::mark_probe_ran_today(&probe_latch, probe_day);
             crate::depth_unsubscribe_probe::run_configured(&probe_cfg, &mut sockets).await;
+            // And again on the way out, so the very next heartbeat tick
+            // reports a fresh age instead of carrying the block forward.
+            heartbeat.store(now_epoch_secs(), std::sync::atomic::Ordering::Relaxed);
         }
         // ---- "no ranking by 09:20" (2026-09-08) ----
         //
@@ -1767,13 +1831,17 @@ pub async fn run_depth_rebalance(
             // is a daily file, so the nearest non-expired future per underlying
             // cannot change under us. Rebuilding it every minute would clone
             // ~22,000 artifact rows 375 times to answer the same question.
-            // Retried while EMPTY rather than while `None`: the artifact can
-            // legitimately not exist yet at 09:00, and an empty index would
-            // otherwise be cached for the session and cost every name its
-            // future slot.
-            if future_index.is_empty() {
+            // Retried while UNREAD, not while EMPTY: the artifact can
+            // legitimately not exist yet at 09:00, so a failed READ must be
+            // retried — but a SUCCESSFUL read that yielded nothing is an
+            // answer, and re-asking it 375 times was the defect this flag
+            // closes. A genuinely all-expired artifact now costs every name
+            // its future slot for the day, loudly and once, instead of
+            // costing the steering task a 22,000-row parse every minute.
+            if !future_index_read {
                 match crate::dhan_contract_universe::read_contract_artifact(&date_ist) {
                     Ok(rows) => {
+                        future_index_read = true;
                         future_index = crate::depth20_name_board::future_index(&rows, today_ymd);
                         if !future_index.is_empty() {
                             tracing::info!(
@@ -1817,6 +1885,11 @@ pub async fn run_depth_rebalance(
                     &mut planned,
                     crate::depth20_ranked_steer::MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE,
                 );
+                crate::depth20_name_board::record_name_board_plan(
+                    &name_plan,
+                    planned.swap_count(),
+                    capped,
+                );
                 if planned.swap_count() > 0 || capped > 0 {
                     tracing::info!(
                         planned = planned.swap_count(),
@@ -1832,6 +1905,26 @@ pub async fn run_depth_rebalance(
                 }
                 (planned, "name_board")
             } else {
+                // The band has no incumbents when the board is not driving.
+                //
+                // `held_names` is written from the board's CHOICE, not from
+                // the wire — which is right while the board IS the engine, and
+                // wrong the moment another one takes over. A fallback minute
+                // rewrites every socket from the volume ranking, so names the
+                // board chose before the fallback are no longer on the wire at
+                // all. Carrying them forward would have the next steerable
+                // minute PREFER phantom incumbents over names that genuinely
+                // out-moved them, and the exit band would be protecting
+                // contracts nothing is subscribed to.
+                held_names.clear();
+                // Recorded on the fallback arm as well, with zero swaps of its
+                // own. The board is built EVERY minute and only DRIVES on some,
+                // so the three counters that explain a refusal
+                // (`names_unresolved`, `index_unresolved`, `spots_missing`) only
+                // ever move on a minute the board did not drive. Recording just
+                // the steerable arm would leave them permanently at their seeded
+                // zero — a refusal metric that cannot report a refusal.
+                crate::depth20_name_board::record_name_board_plan(&name_plan, 0, 0);
                 match ranking_20.as_deref() {
                     Some(ranked) => {
                         let ranked_20 = crate::depth20_ranked_steer::plan_depth20_ranked_minute(

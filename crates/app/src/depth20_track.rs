@@ -140,10 +140,21 @@ impl Depth20Plan {
 /// Greedy by best overlap, each layout socket claimed at most once: two wire
 /// sockets that both partly overlap one layout socket must not both diff
 /// against it, or the loser would be told to take instruments the winner is
-/// already taking. A wire socket sharing NOTHING with any unclaimed layout
-/// socket is left unpaired — refusing to guess is what makes a genuinely
-/// unrecognisable socket hold position rather than churn.
+/// Greedy by best overlap, each layout socket claimed at most once: two wire
+/// sockets that both partly overlap one layout socket must not both diff
+/// against it, or the loser would be told to take instruments the winner is
+/// already taking.
 ///
+/// **Position again, for what is left.** A wire socket sharing NOTHING with
+/// any unclaimed layout socket used to be left unpaired, on the reasoning
+/// that refusing to guess makes an unrecognisable socket hold position
+/// rather than churn. That is right for an AMBIGUOUS socket and wrong for
+/// an unrecognisable one, because holding position there means holding it
+/// for the session: `held` never changes, so the non-match recurs every
+/// minute and a want nobody claimed is never dialled. PASS 3 therefore
+/// assigns leftovers positionally — safe because an unclaimed want has no
+/// rival claimant, and bounded because the per-socket swap cap still paces
+/// the re-aim.
 /// # Complexity
 ///
 /// O(sockets^2 x instruments) — 25 comparisons of at most 50 items, once a
@@ -216,6 +227,44 @@ fn match_sockets_by_overlap(
             claimed[w] = true;
             out[index] = Some(w);
         }
+    }
+
+    // PASS 3 — the leftovers, by position, because an UNCLAIMED want is one
+    // that no socket recognised.
+    //
+    // Passes 1 and 2 both refuse to guess, and that refusal was written for a
+    // socket whose identity is merely ambiguous — there, holding position is
+    // right. It is WRONG for a socket the layout cannot describe at all,
+    // because "hold position" there means hold it FOREVER: `held` never
+    // changes, so the next minute recomputes the identical non-match, and the
+    // want that nobody claimed is never dialled.
+    //
+    // That is not hypothetical — it is the ENGINE HANDOVER. The volume board
+    // is stock options only, and the name board's first two sockets are
+    // NIFTY and BANKNIFTY. Their key sets are structurally disjoint, so
+    // PASS 1 cannot match them (50 held vs 47 wanted) and PASS 2 cannot
+    // either (zero overlap, by construction). Without this pass the two
+    // UNCONDITIONAL index names are never dialled, for the whole session,
+    // while the minute logs `engine="name_board"` and reads healthy.
+    //
+    // Assigning is safe precisely BECAUSE the want is unclaimed: no other
+    // socket has recognised it, so there is no winner to steal from and no
+    // double-subscribe to create. Own index first, then the lowest unclaimed,
+    // so the mapping is deterministic and as positional as it can be.
+    //
+    // The re-aim is not a churn storm: the per-socket swap cap still bounds
+    // it, so a socket turns over at the authorized rate rather than in one
+    // minute.
+    for index in 0..out.len() {
+        if out[index].is_some() {
+            continue;
+        }
+        let own = (index < claimed.len() && !claimed[index]).then_some(index);
+        let Some(w) = own.or_else(|| (0..claimed.len()).find(|w| !claimed[*w])) else {
+            break;
+        };
+        claimed[w] = true;
+        out[index] = Some(w);
     }
     out
 }
@@ -820,6 +869,140 @@ mod tests {
         assert_eq!(plan.sockets.len(), 1, "only the changed socket appears");
         assert_eq!(plan.sockets[0].socket, 0);
     }
+
+    // ---- PASS 3: the engine handover, which used to freeze two sockets ----
+
+    /// The exact shape that froze NIFTY and BANKNIFTY for a whole session.
+    ///
+    /// The volume board holds stock options only; the name board wants two
+    /// INDEX names first. The key sets are disjoint, so PASS 1 cannot match
+    /// (counts differ) and PASS 2 cannot match (zero overlap). Before PASS 3
+    /// those sockets were left unpaired — and because `held` never changed,
+    /// the identical non-match recurred every minute for the rest of the day.
+    #[test]
+    fn a_socket_sharing_nothing_with_any_unclaimed_want_is_still_re_aimed() {
+        // Wire: two sockets carrying stock options the new layout never names.
+        let held = vec![
+            vec![ins(9001), ins(9002), ins(9003)],
+            vec![ins(9004), ins(9005), ins(9006)],
+        ];
+        // Layout: two index names, structurally disjoint from the above.
+        let desired = layout(vec![socket(&[101, 102]), socket(&[201, 202])]);
+
+        let pairing = match_sockets_by_overlap(&held, &desired);
+
+        assert_eq!(
+            pairing,
+            vec![Some(0), Some(1)],
+            "a socket the layout cannot describe must still be re-aimed; leaving it \
+             unpaired means leaving it unpaired FOREVER, because `held` never changes"
+        );
+    }
+
+    /// PASS 3 must never take a want another socket has already recognised.
+    #[test]
+    fn pass_three_only_ever_takes_a_want_nobody_claimed() {
+        // Socket 0 genuinely overlaps want 1 and must keep it.
+        // Socket 1 shares nothing, so it may only have want 0.
+        let held = vec![
+            vec![ins(201), ins(202), ins(203)],
+            vec![ins(9001), ins(9002)],
+        ];
+        let desired = layout(vec![socket(&[101, 102]), socket(&[201, 202, 203])]);
+
+        let pairing = match_sockets_by_overlap(&held, &desired);
+
+        assert_eq!(
+            pairing[0],
+            Some(1),
+            "content must win: socket 0 holds exactly want 1"
+        );
+        assert_eq!(
+            pairing[1],
+            Some(0),
+            "the unrecognisable socket takes the only want left"
+        );
+    }
+
+    /// Fewer wants than sockets: the surplus socket stays unpaired rather
+    /// than being handed a want that does not exist.
+    #[test]
+    fn a_surplus_socket_stays_unpaired_when_every_want_is_claimed() {
+        let held = vec![vec![ins(9001)], vec![ins(9002)], vec![ins(9003)]];
+        let desired = layout(vec![socket(&[101])]);
+
+        let pairing = match_sockets_by_overlap(&held, &desired);
+
+        let taken = pairing.iter().filter(|p| p.is_some()).count();
+        assert_eq!(
+            taken, 1,
+            "one want exists, so exactly one socket may take it"
+        );
+        let mut claimed: Vec<usize> = pairing.iter().flatten().copied().collect();
+        claimed.sort_unstable();
+        claimed.dedup();
+        assert_eq!(claimed.len(), 1, "no want may be handed to two sockets");
+    }
+
+    /// The mapping must be a permutation — the same want may never be given
+    /// to two sockets, or both would diff against it and double-subscribe.
+    #[test]
+    fn pass_three_never_hands_one_want_to_two_sockets() {
+        let held = vec![
+            vec![ins(9001), ins(9002)],
+            vec![ins(9003), ins(9004)],
+            vec![ins(9005), ins(9006)],
+        ];
+        let desired = layout(vec![
+            socket(&[101, 102, 103]),
+            socket(&[201, 202, 203]),
+            socket(&[301, 302, 303]),
+        ]);
+
+        let pairing = match_sockets_by_overlap(&held, &desired);
+
+        let mut claimed: Vec<usize> = pairing.iter().flatten().copied().collect();
+        let before = claimed.len();
+        claimed.sort_unstable();
+        claimed.dedup();
+        assert_eq!(before, 3, "every socket must be paired");
+        assert_eq!(claimed.len(), 3, "every want must be claimed exactly once");
+    }
+
+    /// PASS 3 prefers a socket's OWN index, so the mapping stays as
+    /// positional as it can be and does not shuffle between minutes.
+    #[test]
+    fn pass_three_prefers_the_sockets_own_index() {
+        let held = vec![vec![ins(9001), ins(9002)], vec![ins(9003), ins(9004)]];
+        let desired = layout(vec![socket(&[101, 102, 103]), socket(&[201, 202, 203])]);
+
+        let pairing = match_sockets_by_overlap(&held, &desired);
+
+        assert_eq!(
+            pairing,
+            vec![Some(0), Some(1)],
+            "own index first keeps the mapping stable across minutes"
+        );
+    }
+
+    /// A re-aimed socket is a real plan, not a silent no-op: the handover
+    /// minute must produce swaps rather than incrementing `sockets_left_alone`.
+    #[test]
+    fn the_handover_minute_plans_swaps_instead_of_leaving_the_socket_alone() {
+        let held = vec![vec![ins(9001), ins(9002)]];
+        let desired = layout(vec![socket(&[101, 102, 103])]);
+
+        let plan = plan_depth20_minute(&held, &desired);
+
+        assert_eq!(
+            plan.sockets_left_alone, 0,
+            "the socket is recognisable enough to re-aim, so it must not be skipped"
+        );
+        assert!(
+            !plan.is_quiet(),
+            "a disjoint layout must put swaps on the wire, not report a quiet minute"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1220,17 +1403,46 @@ mod adversarial_tests {
     }
 
     #[test]
-    fn an_unrecognisable_socket_holds_position_rather_than_guessing() {
-        // Different size AND nothing in common: there is no evidence for
-        // what this socket is, and acting on none of it is the safe answer.
+    fn an_unrecognisable_socket_is_re_aimed_at_a_want_nobody_claimed() {
+        // ⚠ WITHDRAWN 2026-09-13 — this test previously asserted the OPPOSITE
+        // (`plan.is_quiet()`, `sockets_left_alone == 1`) under the name
+        // `an_unrecognisable_socket_holds_position_rather_than_guessing`, on
+        // the reasoning that "there is no evidence for what this socket is, and
+        // acting on none of it is the safe answer".
+        //
+        // Holding position is NOT safe here, and the reason is the whole
+        // finding: `plan_depth20_minute` treats an unpaired socket as
+        // `sockets_left_alone += 1; continue`, so the socket is never touched,
+        // `held` never changes, and the identical non-match recurs on every
+        // later minute. Not one quiet minute — frozen for the session.
+        //
+        // It is the ENGINE HANDOVER, not a corner case. The volume board is
+        // stock options only and the name board.s first two sockets are NIFTY
+        // and BANKNIFTY, so their key sets are disjoint BY CONSTRUCTION: the
+        // count pass cannot match them (50 held vs 47 wanted) and the overlap
+        // pass cannot either (zero overlap). Under the old assertion the two
+        // UNCONDITIONAL index names were never dialled, all session, while the
+        // minute logged `engine="name_board"` and every counter read healthy.
+        //
+        // What the old test was right to protect is kept below and is the
+        // reason this is not a guess: an UNCLAIMED want is one that no socket
+        // recognised, so handing it to a socket that no want recognised takes
+        // nothing from anyone. `pass_three_only_ever_takes_a_want_nobody_claimed`
+        // and `pass_three_never_hands_one_want_to_two_sockets` pin that.
         let held = vec![vec![ins(1), ins(2), ins(3)]];
         let want = layout(vec![vec![90, 91]]);
         let plan = plan_depth20_minute(&held, &want);
         assert!(
-            plan.is_quiet(),
-            "guessed an identity it had no evidence for: {plan:?}"
+            !plan.is_quiet(),
+            "an unpaired socket is frozen for the session, not merely quiet \
+             for a minute: {plan:?}"
         );
-        assert_eq!(plan.sockets_left_alone, 1);
+        assert_eq!(plan.sockets_left_alone, 0);
+        assert_eq!(plan.swap_count(), 2, "two held funded the two wanted");
+        // The third holding has nothing to fund and is reported, not dropped
+        // silently — the socket shrinks to the layout it was re-aimed at.
+        assert_eq!(plan.sockets[0].unused_departures, 1);
+        assert_eq!(plan.sockets[0].unfunded_arrivals, 0);
     }
 
     #[test]
