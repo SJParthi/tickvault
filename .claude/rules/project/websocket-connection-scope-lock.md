@@ -5013,3 +5013,135 @@ seeds a metric series inside the arm that detects the event it counts; reseeds
 all cadence baselines on re-latch AND restores saved baselines at resync without
 tracking which windows closed in between (double-counting); or reports any of
 the three flagged items as fixed.
+
+### 2026-09-13 — THE WIRING GO-AHEAD: the top-6 name board becomes the depth-20 engine, and the probe is made able to tell the truth
+
+**The verbatim operator authorization (2026-09-13, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "dude then fix and reosleve vrythign entilrey as peor oru requiremnet dude okay?"
+
+Given in DIRECT response to a message that ENUMERATED six items and said explicitly that
+two of them needed his word because they change behaviour inside this scope-locked module:
+*"Items 1 and 2 change behaviour inside a scope-locked module, so they need a dated record
+in `websocket-connection-scope-lock.md` before the code moves. Say which you want."* He
+answered "everything, as per our requirement". That is the §28.2/§28.3 authorization shape
+this repository already accepts — a general go-ahead answering an ENUMERATED ask selects the
+enumerated work. Recorded HERE before any code, per the rule-file-first law.
+
+The six items, as put to him:
+
+1. Make Arm B of the unsubscribe probe tell the truth.
+2. Wire the top-6 name board, or decide out loud not to.
+3. Close the two verdict-corrupting HIGHs: the generation check and the refused-stamp
+   inversion.
+4. Make the probe once-per-DAY, not once-per-process.
+5. Fix vacuous guard #11, the `break` that loses `kept`, and the depth-20 cap ordering.
+6. Write the Dhan support draft.
+
+#### ⚠ Item 2 is a DELIVERY, not a new scope — and it changes which engine drives depth-20
+
+The shape was already authorized on 2026-09-11: the THIRD quote of that day moved depth-20
+from "top 250 CONTRACTS by volume" to "top N UNDERLYINGS by absolute percentage move", and
+the FOURTH narrowed it to **six** mover stocks (spot + nearest future + options ATM±5) plus
+NIFTY and BANKNIFTY (future + options ATM±11) = **238 of 250**. `depth20_name_board.rs` was
+written that day and has carried **ZERO production call sites** ever since — 785 lines that
+compile, are tested, and never run. The wiring commit was never written.
+
+So this section authorizes no new instrument class and no new socket. What it does
+authorize, and what must be stated because it is not a detail, is the **engine
+precedence**: after this change the name board is the PRIMARY depth-20 engine, and the
+volume ranking no longer drives depth-20. Before it, `depth_rebalance.rs`'s three-branch
+match hands depth-20 to `plan_depth20_ranked_minute` (top 250 by `window_lots_milli`)
+every minute from the first ranking at ~09:15, so wiring the board into the pre-ranking
+`None` arm alone would have run it for about one minute a day and left the 2026-09-11
+requirement undelivered. The band, the exit rank and the slot arithmetic are unchanged
+from the day they were locked.
+
+**depth-200 is NOT touched.** Its volume key, its 5/20 hysteresis band, its
+distinct-underlying rule and its stock-options-only restriction all stand exactly as
+2026-09-06 and 2026-09-11 (SECOND) left them.
+
+#### ⚠ Item 1: the probe's Arm B contradicted the probe's own header, and the header was right
+
+The module header describes Arm B's mechanism as *"close, re-dial, replay a set WITHOUT the
+contract"*. The implementation did the opposite and said so in `act_socket_close`'s own
+docstring: *"The guard is UNTOUCHED, so the replay re-subscribes the same contract."*
+
+Both arms then share one verdict mapping — `if arrived { Ignored } else { Honoured }`. With
+the guard untouched the redial re-subscribes the contract, frames always resume, `arrived`
+is always true, and **Arm B returns `Ignored` whatever Dhan does.** The control built to
+separate the vendor's behaviour from ours could only ever return the vendor-blaming answer.
+A vendor ticket quoting it would be quoting our own replay.
+
+Arm B is therefore rebuilt to the header's design: drop the contract from the retained set
+WITHOUT a wire frame, then close, so the replay comes back without it. Two consequences
+follow and both are handled rather than absorbed — Arm B must now RESTORE like Arm A, and
+silence alone is no longer proof, because a socket that never redialled is also silent. A
+`Honoured` verdict requires a positive liveness witness; without one the run reports
+`InconclusiveNotRedialled` and says nothing about the vendor.
+
+#### ⚠ Item 3: two ways the probe could produce a confident wrong answer
+
+**(a) The generation defence was specified in a code comment and never implemented.** The
+supervisor's own `ProbeUnsubscribe` arm says it verbatim: *"Both need the same defence and
+the caller owns it: record `guard.generation()` when the probe is armed and invalidate the
+verdict if it moved."* The caller never captured it. A redial inside the watch window
+therefore produces a **false `Honoured`** for Arm A — the emptied guard replays nothing, so
+the silence is ours. `finish()` already carries a hand-written warning telling the reader to
+check `ws_event_audit` by hand; a residual an operator must remember to check is not a
+defence.
+
+**(b) A refused stamp read as "a frame arrived".** `any_frame_within` ignored the return of
+`record_subscribe_at` and inferred arrival from `!forget(..)`. When the tracker REFUSES a
+stamp — the pending map at `MAX_PENDING`, or the already-streaming gate — no entry exists,
+`forget` returns false, and the helper reports `true`: *a frame arrived*. In the baseline
+that passes an inadmissible run; in the watch it returns `Ignored`, a false vendor-blaming
+finding, from a measurement that never started.
+
+#### ⚠ Item 4: both probe latches are in-memory
+
+The probe is documented once-per-session and is in fact once-per-PROCESS. `Restart=always`
+plus a mid-session deploy re-arms it, so a day can carry several runs — each costing a
+depth-200 socket two minutes of stale strikes, and each re-closing a socket. It becomes
+once per TRADING DAY.
+
+#### Honest envelope (mandatory per operator-charter §F)
+
+> "The name board's ranking, its band, its slot arithmetic and its refusal to rank a name
+> with a missing price are pure and ratcheted. **NOT claimed: that the board's `move_bps`
+> is fed the inputs it was designed for.** `PrevCloseStore` is owned `&mut` by the frame
+> drain and is not reachable from the steering loop, so the wiring converts the movers
+> table's `close_pct_from_prev_day` to basis points instead. It is the same quantity from a
+> different source with a different lag — QuestDB candles rather than the drain's live
+> pair — and that substitution is recorded here rather than hidden behind a function name.
+> **NOT claimed: that NSE_EQ depth delivers.** The board puts each mover's SPOT on a depth
+> socket; no session has ever sent an `NSE_EQ` depth subscribe on this account, so the six
+> spot slots are UNVERIFIED-LIVE and the first session is the probe. **NOT claimed: that a
+> name rotates inside a minute.** A name is 24 slots against a 4-swap-per-socket-per-minute
+> budget, so one name changing takes several minutes to apply; the board's own test pins
+> this. The operator's 'rotate every minute' is delivered as *the board is RECOMPUTED every
+> minute and the delta is applied under the existing cap*, never as a full set swap.
+> **NOT claimed: that the probe now answers whether code 25 works.** It is armed by an
+> operator, it is default-OFF, and it has never run."
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Restores the shared `if arrived { Ignored } else { Honoured }` mapping for Arm B, or lets
+  Arm B report `Honoured` without a liveness witness.
+- Leaves Arm B without a restore now that it empties the guard — that strands a depth-200
+  socket dark for the session.
+- Infers "a frame arrived" from a stamp whose acceptance was not checked.
+- Ships a probe verdict without comparing the guard generation captured at arm time.
+- Re-runs the probe more than once per TRADING DAY.
+- Gives depth-20's name board a socket or instrument budget other than 250, or a board cost
+  other than the const-asserted 238 — a wider stock window costs 262 and the assert fails
+  the build, which is the intended outcome.
+- Applies the name-level hysteresis band inside the planner rather than when CHOOSING the
+  six names. `plan_depth20_minute` diffs against a desired layout, so a band applied at plan
+  time is inert and the exit rank silently does nothing.
+- Changes depth-200 under cover of this section.
+- Ranks a name whose spot or previous close is missing as 0% — that ties it with a genuinely
+  flat name and hands it 24 slots it did not earn.
+- Auto-sends the Dhan draft to anyone. The 2026-09-12 section's REJECT row stands: the draft
+  is a committed markdown file a human reads and sends.

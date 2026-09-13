@@ -198,8 +198,19 @@ pub fn plan_ranked_minute(
         // `the_per_minute_cap_refuses_and_counts_the_overflow`, which that
         // ordering fails). Peek separates "nothing to give" from "not allowed
         // to give it", which is the distinction both counters exist to make.
+        //
+        // `continue`, NOT `break` (the shape here until 2026-09-13): a LATER
+        // socket may hold a ranked contract and belongs in `kept`. Breaking at
+        // the first off-ranking socket after the queue drains stops examining
+        // every socket behind it, so the `tv_depth200_ranked_sockets_kept`
+        // gauge under-reports — ranked [A,B,C] against held
+        // [off, A, B, C, _] published 0 when the truth was 3, telling an
+        // operator the pool churned when nothing moved. Continuing is
+        // otherwise inert: the socket is still left alone (no swap is pushed),
+        // `to_place` stays empty so no later socket can be funded either, and
+        // the terminal `to_place.count()` is unaffected.
         if to_place.peek().is_none() {
-            break;
+            continue;
         }
         if decision.swaps.len() >= MAX_RANKED_SWAPS_PER_MINUTE {
             decision.capped = decision.capped.saturating_add(1);
@@ -384,6 +395,45 @@ mod tests {
         assert_eq!(d.unplaced, 0);
     }
 
+    /// Draining the arrival queue must not stop the loop: sockets BEHIND the
+    /// first unfunded one are still examined, so a held ranked contract is
+    /// still counted `kept`.
+    ///
+    /// The gauge is the whole reason. `tv_depth200_ranked_sockets_kept` is
+    /// what an operator reads to answer "did the pool churn this minute?" —
+    /// a socket order of [off-ranking, A, B, C, empty] against ranked [A,B,C]
+    /// reported 0 under the `break`, which reads as five sockets swapping out
+    /// on a minute that moved nothing.
+    #[test]
+    fn an_exhausted_arrival_queue_still_counts_later_kept_sockets() {
+        let ranked = [
+            candidate(1, 10, 500),
+            candidate(2, 20, 400),
+            candidate(3, 30, 300),
+        ];
+        // Socket 0 is off the ranking and takes the one unheld entry row
+        // (there is none — A, B and C are all held), so the queue is empty at
+        // socket 0 and the three KEPT sockets sit behind it.
+        let holds = [
+            held(9001, IDX),
+            held(1, FNO),
+            held(2, FNO),
+            held(3, FNO),
+            None,
+        ];
+        let d = plan_ranked_minute(&holds, &ranked);
+        assert!(
+            d.is_quiet(),
+            "nothing is unheld, so the off-ranking socket keeps what it holds"
+        );
+        assert_eq!(
+            d.kept, 3,
+            "sockets 1..3 hold ranked contracts and must be counted even \
+             though socket 0 found the arrival queue empty"
+        );
+        assert_eq!((d.capped, d.unplaced), (0, 0));
+    }
+
     /// The hysteresis band: a held contract that slipped OUT of the entry set
     /// but is still inside the published list is KEPT, not swapped out.
     #[test]
@@ -519,7 +569,7 @@ mod tests {
     /// can fail today.
     ///
     /// What each edge buys:
-    /// * peek before cap — an empty queue must `break`, not report `capped`
+    /// * peek before cap — an empty queue must `continue`, not report `capped`
     ///   (`the_per_minute_cap_refuses_and_counts_the_overflow` fails otherwise)
     /// * cap before consume — a refused candidate must stay in the iterator so
     ///   the terminal `to_place.count()` reports it as `unplaced`
@@ -569,8 +619,8 @@ mod tests {
 
         assert!(
             peek_at < cap_at,
-            "an EMPTY queue must `break`, not count a cap refusal: peek at \
-             {peek_at}, cap at {cap_at}"
+            "an EMPTY queue must skip the socket, not count a cap refusal: \
+             peek at {peek_at}, cap at {cap_at}"
         );
         assert!(
             cap_at < take_at,

@@ -540,6 +540,15 @@ pub fn order_selected_first(
 #[derive(Debug, Clone)]
 pub struct ContractUnderlyingMap {
     inner: Arc<ArcSwap<HashMap<ContractKey, ContractOwner>>>,
+    /// Human-readable contract labels, resolved ONCE per publish.
+    ///
+    /// A SECOND snapshot rather than a field on [`ContractOwner`], and that is
+    /// the load-bearing decision: `owner_of` is the PER-TICK call and
+    /// `ContractOwner` is `Copy`, so putting an `Arc<str>` on it would put a
+    /// refcount bump on every tick. Nothing on the tick path needs a label —
+    /// only the per-sweep projection does — so the label lives in its own
+    /// snapshot that only that path loads.
+    labels: Arc<ArcSwap<HashMap<ContractKey, Arc<str>>>>,
 }
 
 impl Default for ContractUnderlyingMap {
@@ -554,6 +563,7 @@ impl ContractUnderlyingMap {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            labels: Arc::new(ArcSwap::from_pointee(HashMap::new())),
         }
     }
 
@@ -563,6 +573,31 @@ impl ContractUnderlyingMap {
     /// rebuild can never hand the drain a half-built map.
     pub fn publish(&self, snapshot: HashMap<ContractKey, ContractOwner>) {
         self.inner.store(Arc::new(snapshot));
+    }
+
+    /// Replaces the label snapshot, atomically. Built by
+    /// [`labels_from_artifact`] from the SAME `&[ContractRow]` the legs come
+    /// from, so the two cannot describe different contract sets.
+    pub fn publish_labels(&self, snapshot: HashMap<ContractKey, Arc<str>>) {
+        self.labels.store(Arc::new(snapshot));
+    }
+
+    /// The whole label table, for ONE sweep.
+    ///
+    /// Loaded once per projection, never per row: the caller holds this `Arc`
+    /// for the length of the sweep and hands the storage row a `&str` borrowed
+    /// out of it. One atomic load per sweep, one pointer copy per row, zero
+    /// allocation — which is the reason the label is resolved at publish time
+    /// rather than formatted on the frame drain.
+    #[must_use]
+    pub fn label_snapshot(&self) -> Arc<HashMap<ContractKey, Arc<str>>> {
+        arc_swap::Guard::into_inner(self.labels.load())
+    }
+
+    /// How many labels the published snapshot holds.
+    #[must_use]
+    pub fn label_len(&self) -> usize {
+        self.labels.load().len()
     }
 
     /// Builds and publishes in one step, returning what was refused.
@@ -1146,6 +1181,196 @@ mod tests {
         assert!(map.owner_of(13, ExchangeSegment::IdxI).is_none());
     }
 
+    /// The label format is the one `CLAUDE.md`'s DHAN SUPPORT COMMUNICATIONS
+    /// section mandates, so a row of this table can be pasted into a support
+    /// draft unchanged.
+    #[test]
+    fn contract_label_renders_the_mandated_precise_format() {
+        assert_eq!(
+            contract_label("NIFTY", 2026_09_25, 2_450_000, "CE"),
+            "NIFTY-25Sep2026-24500-CE"
+        );
+        assert_eq!(
+            contract_label("RELIANCE", 2026_06_25, 2_800_000, "PE"),
+            "RELIANCE-25Jun2026-28000-PE"
+        );
+        // A single-digit day is zero-padded, so 5 Sep sorts and reads beside
+        // 25 Sep instead of collating between 19 and 20.
+        assert_eq!(
+            contract_label("TCS", 2026_09_05, 400_000, "CE"),
+            "TCS-05Sep2026-4000-CE"
+        );
+        // Whitespace and case come from the master verbatim; the map is built
+        // on a trimmed symbol, so the label must trim the same way or the two
+        // describe the same contract differently.
+        assert_eq!(
+            contract_label("  INFY  ", 2026_12_31, 150_000, " CE "),
+            "INFY-31Dec2026-1500-CE"
+        );
+    }
+
+    /// A fractional strike keeps its paise.
+    ///
+    /// Rounding would make two ADJACENT strikes print the same label on a
+    /// low-priced underlying, which is exactly the ambiguity a precise label
+    /// exists to remove.
+    #[test]
+    fn contract_label_keeps_a_fractional_strike() {
+        assert_eq!(
+            contract_label("IDEA", 2026_09_25, 1_250, "PE"),
+            "IDEA-25Sep2026-12.50-PE"
+        );
+        assert_eq!(
+            contract_label("YESBANK", 2026_09_25, 2_075, "CE"),
+            "YESBANK-25Sep2026-20.75-CE"
+        );
+    }
+
+    /// A nonsense expiry renders its digits VERBATIM rather than being
+    /// dropped or guessed: a wrong-looking expiry in the label is a visible
+    /// defect, a missing one is an invisible one.
+    #[test]
+    fn contract_label_renders_an_implausible_expiry_verbatim() {
+        assert_eq!(
+            contract_label("NIFTY", 0, 2_450_000, "CE"),
+            "NIFTY-0-24500-CE"
+        );
+        assert_eq!(
+            contract_label("NIFTY", 2026_13_45, 2_450_000, "CE"),
+            "NIFTY-20261345-24500-CE"
+        );
+        // A future with no leg has no trailing separator — a dangling `-`
+        // would read as a truncated label.
+        assert_eq!(
+            contract_label("NIFTY", 2026_09_25, 0, ""),
+            "NIFTY-25Sep2026-0"
+        );
+    }
+
+    /// The label map covers exactly the contracts the OWNER map can admit —
+    /// options only, same segment derivation, same zero-id refusal.
+    ///
+    /// A shape difference between the two is what would make a projection-time
+    /// miss ambiguous: `SnapshotRefusal::LabelUnavailable` is supposed to mean
+    /// DRIFT, and it can only mean that if the two passes agree on which
+    /// contracts exist.
+    #[test]
+    fn labels_from_artifact_covers_the_same_contracts_the_legs_do() {
+        let rows = [
+            contract(500, "OPTIDX", "NIFTY", "NSE"),
+            contract(600, "OPTSTK", "RELIANCE", "NSE"),
+            // Not an option — never ranked, so never labelled.
+            contract(800, "FUTIDX", "NIFTY", "NSE"),
+            // BSE derivatives are refused by the leg pass; refused here too.
+            contract(700, "OPTIDX", "NIFTY", "BSE"),
+            // The zero-id sentinel.
+            contract(0, "OPTSTK", "RELIANCE", "NSE"),
+        ];
+        let labels = labels_from_artifact(&rows);
+        let (legs, _) = legs_from_artifact(&rows, &symbol_map());
+
+        assert_eq!(
+            labels.len(),
+            2,
+            "options on NSE with a real id, and only those"
+        );
+        for leg in &legs {
+            let key = (
+                u64::try_from(leg.contract_security_id).expect("positive"),
+                leg.contract_segment,
+            );
+            assert!(
+                labels.contains_key(&key),
+                "every leg the owner map admits must have a label: {key:?}"
+            );
+        }
+        assert!(labels.contains_key(&(500, FNO)));
+        assert!(labels.contains_key(&(600, FNO)));
+        assert!(!labels.contains_key(&(800, FNO)), "futures are not ranked");
+        assert!(!labels.contains_key(&(0, FNO)), "the zero-id sentinel");
+    }
+
+    /// The published snapshot is what the projection reads, and it is
+    /// SEPARATE from the owner snapshot — publishing one must not disturb
+    /// the other, because the two are published in sequence at attach.
+    #[test]
+    fn publish_labels_does_not_disturb_the_owner_snapshot() {
+        let map = ContractUnderlyingMap::new();
+        assert_eq!(map.label_len(), 0, "nothing published yet");
+        assert!(map.label_snapshot().is_empty());
+
+        let rows = [contract(600, "OPTSTK", "RELIANCE", "NSE")];
+        map.publish_labels(labels_from_artifact(&rows));
+        assert_eq!(map.label_len(), 1);
+        // The owner map is untouched by a label publish.
+        assert!(map.owner_of(600, FNO).is_none());
+
+        let (legs, _) = legs_from_artifact(&rows, &symbol_map());
+        map.publish_from_legs(&legs);
+        assert!(map.owner_of(600, FNO).is_some());
+        assert_eq!(
+            map.label_snapshot().get(&(600, FNO)).map(AsRef::as_ref),
+            Some("RELIANCE-25Sep2026-25000-CE"),
+            "an owner publish must not clear the labels"
+        );
+    }
+
+    #[test]
+    fn label_snapshot_starts_empty_and_returns_what_was_published() {
+        let map = ContractUnderlyingMap::new();
+        // Before attach there is no artifact, so the drain must still get a
+        // readable snapshot rather than an unwrap on `None`.
+        assert!(
+            map.label_snapshot().is_empty(),
+            "the label snapshot must be readable before anything is published"
+        );
+
+        let rows = [contract(700, "OPTSTK", "RELIANCE", "NSE")];
+        map.publish_labels(labels_from_artifact(&rows));
+        assert_eq!(
+            map.label_snapshot().get(&(700, FNO)).map(AsRef::as_ref),
+            Some("RELIANCE-25Sep2026-25000-CE")
+        );
+
+        // Two reads must hand back the SAME allocation, not two clones: the
+        // drain loads this once per sweep and borrows row labels out of it.
+        let first = map.label_snapshot();
+        let second = map.label_snapshot();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "each read cloned the map — the per-row borrow would then dangle \
+             or cost an allocation per sweep"
+        );
+    }
+
+    #[test]
+    fn label_len_counts_every_published_label_and_replaces_wholesale() {
+        let map = ContractUnderlyingMap::new();
+        assert_eq!(map.label_len(), 0);
+
+        let two = [
+            contract(800, "OPTSTK", "RELIANCE", "NSE"),
+            contract(801, "OPTSTK", "TCS", "NSE"),
+        ];
+        map.publish_labels(labels_from_artifact(&two));
+        assert_eq!(map.label_len(), 2);
+
+        // An expiry rollover republishes a SMALLER set. The new snapshot must
+        // REPLACE the old one, never merge into it — a merge would leave
+        // yesterday's expired contracts labelled and readable forever.
+        let one = [contract(800, "OPTSTK", "RELIANCE", "NSE")];
+        map.publish_labels(labels_from_artifact(&one));
+        assert_eq!(
+            map.label_len(),
+            1,
+            "a republish merged into the previous snapshot instead of replacing it"
+        );
+        assert!(
+            map.label_snapshot().get(&(801, FNO)).is_none(),
+            "a contract dropped by the new artifact kept its stale label"
+        );
+    }
+
     #[test]
     fn all_variants_are_in_the_seed_list() {
         // An unseeded reason is a series the CloudWatch agent drops on its
@@ -1365,4 +1590,114 @@ mod tests {
         );
         assert_eq!(under(&map, (1, FNO)), Some(13), "leg 1 keeps its slot");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Human-readable contract labels (operator 2026-09-13)
+// ---------------------------------------------------------------------------
+
+/// The label written when a contract has no resolvable one.
+///
+/// A STATIC string, deliberately, and never the id rendered at projection
+/// time: the projection runs on the frame drain over up to
+/// [`MAX_TRACKED_CONTRACTS`] rows x four cadences, and a `format!` there is the
+/// per-row heap allocation `hot-path.md` bans outright. The row still carries
+/// `security_id` and `segment`, so an `unmapped` label costs a join, never the
+/// identity.
+///
+/// Reaching it means the label map and the owner map DISAGREE — they are built
+/// from the same `&[ContractRow]` in the same pass, so a miss is real drift and
+/// is counted (`SnapshotRefusal::LabelUnavailable`), never silently blank.
+pub const UNLABELLED_CONTRACT: &str = "unmapped";
+
+/// Month names for the expiry component, indexed 1..=12.
+const MONTH_ABBREV: [&str; 13] = [
+    "???", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// Renders one contract's full human label: `NIFTY-25Sep2026-24500-CE`.
+///
+/// The format is the one `CLAUDE.md`'s DHAN SUPPORT COMMUNICATIONS section
+/// mandates for every contract cited to the vendor ("precise contract labels
+/// (e.g. `NIFTY-Jun2026-28500-CE`) — NEVER generic"), so a row of this table
+/// can be pasted into a support draft unchanged.
+///
+/// **Cold path, called ONCE per contract per publish** — once a day at attach,
+/// over ~22,000 rows. It allocates; that is the entire point of resolving here
+/// rather than at projection time.
+///
+/// `expiry_ymd` is the master's `YYYYMMDD`. A value that does not parse as a
+/// plausible date renders its digits verbatim rather than being dropped: a
+/// wrong-looking expiry in the label is a visible defect, a missing one is an
+/// invisible one. Strike is in PAISE and renders as rupees — whole when the
+/// paise divide, with the fraction kept when they do not, because a strike
+/// like 1234.50 is real on low-priced underlyings and rounding it would make
+/// two adjacent strikes print the same label.
+#[must_use]
+pub fn contract_label(underlying: &str, expiry_ymd: u32, strike_paise: i64, leg: &str) -> String {
+    let year = expiry_ymd / 10_000;
+    let month = (expiry_ymd / 100) % 100;
+    let day = expiry_ymd % 100;
+    let rupees = strike_paise / 100;
+    let paise = (strike_paise % 100).abs();
+    let mut out = String::with_capacity(40);
+    out.push_str(underlying.trim());
+    out.push('-');
+    if (1..=12).contains(&month) && (1..=31).contains(&day) && year >= 1970 {
+        // `{day:02}` so 5 Sep sorts and reads beside 25 Sep.
+        out.push_str(&format!("{day:02}{}{year}", MONTH_ABBREV[month as usize]));
+    } else {
+        // Verbatim rather than dropped — see the fn doc.
+        out.push_str(&expiry_ymd.to_string());
+    }
+    out.push('-');
+    if paise == 0 {
+        out.push_str(&rupees.to_string());
+    } else {
+        out.push_str(&format!("{rupees}.{paise:02}"));
+    }
+    let leg = leg.trim();
+    if !leg.is_empty() {
+        out.push('-');
+        out.push_str(leg);
+    }
+    out
+}
+
+/// Builds the contract-id -> label table from the day's artifact rows.
+///
+/// Keyed and filtered EXACTLY as [`legs_from_artifact`] is — options only,
+/// same segment derivation, same zero-id refusal — so the two maps cover the
+/// same contracts and a miss at projection time is genuine drift rather than a
+/// shape difference. Anything the owner map refuses for a reason this pass
+/// cannot see (an unresolved underlying symbol, a missing lot size) simply
+/// never reaches the leaderboard, so an extra entry here is harmless.
+///
+/// `Arc<str>` rather than `String`: the projection hands the storage row a
+/// borrowed `&str` out of the published snapshot, so the per-row cost is one
+/// pointer copy and ZERO allocation. `Arc<str>` also stores the length inline
+/// with no spare capacity word, which matters at ~22,000 entries.
+#[must_use]
+pub fn labels_from_artifact(contracts: &[ContractRow]) -> HashMap<ContractKey, Arc<str>> {
+    let mut labels: HashMap<ContractKey, Arc<str>> =
+        HashMap::with_capacity(contracts.len().min(MAX_TRACKED_CONTRACTS));
+    for row in contracts {
+        if !matches!(row.c.as_str(), "OPTIDX" | "OPTSTK") {
+            continue;
+        }
+        if row.i == 0 {
+            continue;
+        }
+        let Some(segment) = crate::dhan_contract_universe::derivative_segment(&row.x) else {
+            continue;
+        };
+        if labels.len() >= MAX_TRACKED_CONTRACTS && !labels.contains_key(&(row.i, segment)) {
+            continue;
+        }
+        labels.insert(
+            (row.i, segment),
+            Arc::from(contract_label(&row.u, row.e, row.s, &row.l).as_str()),
+        );
+    }
+    labels
 }

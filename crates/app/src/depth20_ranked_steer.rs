@@ -293,19 +293,47 @@ pub fn plan_depth20_ranked_minute(
                 decision.kept += 1;
                 continue;
             }
+            // PEEK, then cap, then consume — the depth-200 planner's ordering
+            // (`depth200_ranked_steer::plan_ranked_minute`), and load-bearing
+            // for the same reason.
+            //
+            // `capped` and `unfunded_departures` exist to separate "not
+            // allowed to give it" from "nothing to give", because they have
+            // OPPOSITE remedies: `capped` says raise the per-socket cap or
+            // widen the band, `unfunded_departures` says the ranking is
+            // shorter than the pool and no cap change would help. Testing the
+            // cap FIRST (the shape here until 2026-09-13) reported `capped`
+            // for a departure that arrived at a drained queue, so a socket at
+            // its budget with nothing left to place read as cap pressure and
+            // the documented remedy would have changed nothing at all.
+            //
+            // `continue`, never `break`: later releases on this socket may be
+            // on the ranking and belong in `kept`.
+            if arrivals.peek().is_none() {
+                // Fewer ranked contracts than departures: keep the slot
+                // occupied rather than shrink the socket.
+                socket_plan.unused_departures += 1;
+                decision.unfunded_departures += 1;
+                continue;
+            }
             if socket_plan.swaps.len() >= MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE {
+                // Refused by the cap with a candidate still waiting. Leaving
+                // it in the iterator is what lets the terminal
+                // `arrivals.count()` report it as `unplaced` rather than
+                // deleting it from the plan and from every counter.
                 decision.capped += 1;
                 continue;
             }
-            match arrivals.next() {
-                Some(take) => socket_plan.swaps.push((release, take)),
-                None => {
-                    // Fewer ranked contracts than departures: keep the slot
-                    // occupied rather than shrink the socket.
-                    socket_plan.unused_departures += 1;
-                    decision.unfunded_departures += 1;
-                }
-            }
+            let Some(take) = arrivals.next() else {
+                // Unreachable: the peek above returned `Some` and nothing
+                // between there and here advances the iterator. A `continue`
+                // rather than an `expect` because `panic = "abort"` on the
+                // release profile turns a wrong assumption here into process
+                // death mid-session, and `clippy::expect_used` is denied
+                // outside tests.
+                continue;
+            };
+            socket_plan.swaps.push((release, take));
         }
         if !socket_plan.swaps.is_empty() {
             decision.plan.sockets.push(socket_plan);
@@ -444,6 +472,37 @@ mod tests {
         // The three arrivals the cap refused this minute are counted as
         // unplaced, not silently dropped.
         assert_eq!(d.unplaced, 3);
+    }
+
+    /// An exhausted arrival queue is NOT a cap refusal, even on a socket that
+    /// has already spent its whole per-minute budget.
+    ///
+    /// The two counters exist to separate "not allowed to give it" from
+    /// "nothing to give": `capped` says raise the cap or widen the band,
+    /// `unfunded_departures` says the ranking is shorter than the pool. With
+    /// the cap tested BEFORE the queue (the shape here until 2026-09-13) the
+    /// last departure below reported `capped`, so the documented remedy —
+    /// raising the cap — would have changed nothing at all.
+    #[test]
+    fn an_exhausted_arrival_queue_is_unfunded_not_capped() {
+        let cap = MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE;
+        // Exactly `cap` arrivals, `cap + 1` departures: the first `cap`
+        // departures drain the queue and fill the budget, so the last one hits
+        // an empty queue AND a full budget at the same instant.
+        let departures: Vec<u64> = (700..700 + cap as u64 + 1).collect();
+        let held = vec![held_fno(&departures)];
+        let ranked: Vec<Depth200Candidate> = (1..=cap as u64)
+            .map(|i| candidate(i, i * 10, 1000 - i))
+            .collect();
+        let d = plan_depth20_ranked_minute(&held, &ranked);
+        assert_eq!(d.plan.swap_count(), cap);
+        assert_eq!(
+            d.capped, 0,
+            "the last departure was refused by an empty ranking, not by the cap"
+        );
+        assert_eq!(d.unfunded_departures, 1);
+        assert_eq!(d.plan.sockets[0].unused_departures, 1);
+        assert_eq!(d.unplaced, 0, "every arrival found a home");
     }
 
     #[test]

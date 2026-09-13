@@ -27,18 +27,42 @@
 //! ONE row per (snapshot boundary, timeframe, family, contract). The
 //! designated `ts` is the SNAPSHOT boundary — a whole second — so a
 //! re-emitted snapshot UPSERTs in place rather than duplicating (the
-//! scoreboard mechanic). `rank` is deliberately NOT in the DEDUP key: it is
-//! the value being recorded, and a contract appears at most once per
-//! (snapshot, timeframe, family) already.
+//! scoreboard mechanic). A contract appears at most once per (snapshot,
+//! timeframe, family) already.
+//!
+//! ## ⚠ `rank` was REMOVED 2026-09-13, and an existing table still has it
+//!
+//! Operator: *"i clelary told you to rmeve the rank in top volume"*. The
+//! column is gone from the CREATE, from the ALTER manifest, from the row
+//! struct and from the ILP line, and `console_views` no longer selects it.
+//!
+//! **What happens to a box that already has the table is worth stating
+//! plainly, because it is not what "removed" sounds like.** This module's
+//! self-heal is CREATE → `ADD COLUMN IF NOT EXISTS` → `DEDUP ENABLE`, and it
+//! contains no DROP by design (`top_volume_rank_ensure_statements_never_drop_
+//! and_end_with_dedup_enable` fails the build on one, because a DROP in a path
+//! that runs every boot deletes history on any boot). QuestDB cannot drop a
+//! column through this path at all.
+//!
+//! So on an EXISTING table the `rank` column **stays on disk and simply stops
+//! being written**: every row from 2026-09-13 onward carries NULL there, and
+//! every row before it keeps the value it had. It is not removed from disk, it
+//! is not reclaimed, and nothing here pretends otherwise. Actually dropping it
+//! is a one-line `ALTER TABLE top_volume DROP COLUMN rank` run by an operator
+//! against a table this repository never drops automatically — or it ages out
+//! with the 15-day `RetentionClass::MarketData` window on its own. A FRESH
+//! table (a new box, or after the retention sweep has cycled) never has the
+//! column at all.
 //!
 //! ## Schema
 //!
 //! ```sql
 //! CREATE TABLE IF NOT EXISTS top_volume (
 //!     ts TIMESTAMP, tf SYMBOL, family SYMBOL, feed SYMBOL,
-//!     segment SYMBOL, rank LONG, security_id LONG,
+//!     segment SYMBOL, contract SYMBOL, security_id LONG,
 //!     underlying_id LONG, volume LONG, delta_units LONG,
 //!     lot_size LONG, window_lots_milli LONG,
+//!     net_volume_chg_milli_pct LONG,
 //!     gain_pct DOUBLE,
 //!     subscribed BOOLEAN
 //! ) timestamp(ts) PARTITION BY HOUR
@@ -163,9 +187,11 @@ pub const LEGACY_TOP_VOLUME_RANK_TABLE: &str = "top_volume_rank";
 /// `dedup_segment_meta_guard` discovers keys by scanning for that name
 /// pattern — an inline literal would put this key OUTSIDE the guard.
 ///
-/// `rank` is deliberately ABSENT: it is the recorded value, not part of the
-/// identity, and including it would let one contract occupy several rows in
-/// one snapshot as its rank moved between a retry and its re-emit.
+/// The key is UNCHANGED by the 2026-09-13 column changes: `contract` and
+/// `net_volume_chg_milli_pct` are both leaf display columns, and `contract` in
+/// particular must stay OUT — it is a pure function of `security_id`, so
+/// adding it would widen the key with no new identity while making a stale
+/// label able to duplicate a row.
 pub const DEDUP_KEY_TOP_VOLUME_RANK: &str = "ts, tf, family, feed, security_id, segment";
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
@@ -328,7 +354,7 @@ const _: () = {
 
 /// One ranked contract at one snapshot boundary, ready for ILP write.
 #[derive(Clone, Debug, PartialEq)]
-pub struct TopVolumeRankRow {
+pub struct TopVolumeRankRow<'a> {
     /// Designated timestamp — the SNAPSHOT boundary in IST nanoseconds.
     /// A whole second, so a re-emit UPSERTs in place.
     pub snapshot_ts_ist_nanos: i64,
@@ -354,8 +380,40 @@ pub struct TopVolumeRankRow {
     /// already `&'static str`, so the type was the odd one out as well as the
     /// costly one.
     pub segment: &'static str,
-    /// 1-based position within its family at this snapshot.
-    pub rank: i64,
+    /// The FULL human label for this contract — underlying, expiry, strike and
+    /// leg in one column: `NIFTY-25Sep2026-24500-CE`.
+    ///
+    /// Operator 2026-09-13: *"i need to know the precise symbol anme as well
+    /// dude see suposoe if it has symbol contartc options strieks expriy emasn
+    /// we ened to know evryhtign in a single column also as well"*. Before it,
+    /// answering "which contract is this row" needed a join to
+    /// `instrument_lifecycle` — and `underlying_id` alone cannot distinguish
+    /// two strikes of the same stock.
+    ///
+    /// # Why a borrow and not a `String`
+    ///
+    /// The projection runs on the FRAME-DRAIN task over up to
+    /// `TOP_VOLUME_MAX_ROWS_PER_SWEEP` rows across four cadences. A `String`
+    /// here is one heap allocation per row per sweep — order 80,000 a second
+    /// at the ceiling — on the path whose first principle is zero allocation.
+    /// The label is CONSTANT for a given contract (underlying, expiry, strike
+    /// and leg never change for a security id), so it is rendered ONCE when the
+    /// day's contract map is published and this field borrows it out of that
+    /// snapshot. Per row: one pointer copy, no allocation, no refcount bump.
+    ///
+    /// The lifetime is the label snapshot's. Rows are appended inside the same
+    /// sweep that built them, so it never outlives the `Arc` the caller holds.
+    ///
+    /// Stored as a QuestDB `SYMBOL`, which interns: ~22,000 distinct labels
+    /// against tens of millions of rows a session, so the column costs a small
+    /// integer per row rather than ~25 bytes of repeated text. That is the
+    /// shape SYMBOL exists for; it is also why this must never become a
+    /// per-ROW-unique value.
+    ///
+    /// `contract_underlying_map::UNLABELLED_CONTRACT` when the label snapshot
+    /// has no entry — counted as `SnapshotRefusal::LabelUnavailable`, never
+    /// silently blank, and the row is still written.
+    pub contract: &'a str,
     /// The contract's own security id.
     pub security_id: i64,
     /// The underlying's numeric id. NOT a name — see the module header.
@@ -409,6 +467,24 @@ pub struct TopVolumeRankRow {
     /// cannot fit `i64` is refused by the projection rather than wrapped
     /// negative.
     pub window_lots_milli: i64,
+    /// **The volume-percentage change**, in MILLI-PERCENT (thousandths of a
+    /// percent): `window_lots_milli * 100 - 100_000`.
+    ///
+    /// Added 2026-09-13 on the operator's instruction. `4_150_000` reads
+    /// `+4150.000%`; `0` is exactly one lot traded in the window; a contract
+    /// that traded LESS than one lot reads NEGATIVE.
+    ///
+    /// ⚠ **It is a strictly-increasing affine transform of
+    /// `window_lots_milli`, not independent information.** The two rank
+    /// identically, which is why the comparator still sorts the integer key —
+    /// a float comparator is non-transitive on a NaN and corrupts a whole sort
+    /// rather than misplacing one row. It is stored anyway because the
+    /// operator reads this table directly and should not have to know the
+    /// transform. If the two columns ever disagree, THIS one is wrong.
+    ///
+    /// Integer, never a `DOUBLE`: it is derived from an integer key, and a
+    /// float here could round two distinct keys onto one printed value.
+    pub net_volume_chg_milli_pct: i64,
     /// The UNDERLYING's percentage change from its previous close, or `None`
     /// when that is not knowable yet.
     ///
@@ -452,13 +528,14 @@ pub fn top_volume_rank_create_ddl() -> String {
             family        SYMBOL, \
             feed          SYMBOL, \
             segment       SYMBOL, \
-            rank          LONG, \
+            contract      SYMBOL, \
             security_id   LONG, \
             underlying_id LONG, \
             volume        LONG, \
             delta_units   LONG, \
             lot_size      LONG, \
             window_lots_milli LONG, \
+            net_volume_chg_milli_pct LONG, \
             gain_pct      DOUBLE, \
             subscribed    BOOLEAN\
         ) timestamp(ts) PARTITION BY HOUR \
@@ -473,13 +550,14 @@ const TOP_VOLUME_RANK_COLUMNS: &[(&str, &str)] = &[
     ("family", "SYMBOL"),
     ("feed", "SYMBOL"),
     ("segment", "SYMBOL"),
-    ("rank", "LONG"),
+    ("contract", "SYMBOL"),
     ("security_id", "LONG"),
     ("underlying_id", "LONG"),
     ("volume", "LONG"),
     ("delta_units", "LONG"),
     ("lot_size", "LONG"),
     ("window_lots_milli", "LONG"),
+    ("net_volume_chg_milli_pct", "LONG"),
     ("gain_pct", "DOUBLE"),
     ("subscribed", "BOOLEAN"),
 ];
@@ -798,7 +876,7 @@ impl TopVolumeRankWriter {
     ///
     /// # Errors
     /// Propagates ILP buffer errors (table/column append failure).
-    fn write_row(buffer: &mut Buffer, r: &TopVolumeRankRow) -> Result<()> {
+    fn write_row(buffer: &mut Buffer, r: &TopVolumeRankRow<'_>) -> Result<()> {
         buffer
             .table(TOP_VOLUME_RANK_TABLE)
             .context("table")?
@@ -811,8 +889,10 @@ impl TopVolumeRankWriter {
             .context("feed")?
             .symbol("segment", r.segment)
             .context("segment")?
-            .column_i64("rank", r.rank)
-            .context("rank")?
+            // The human label, as a SYMBOL beside the other four — interned by
+            // QuestDB, so ~22,000 distinct values cost a small integer per row.
+            .symbol("contract", r.contract)
+            .context("contract")?
             .column_i64("security_id", r.security_id)
             .context("security_id")?
             .column_i64("underlying_id", r.underlying_id)
@@ -824,7 +904,9 @@ impl TopVolumeRankWriter {
             .column_i64("lot_size", r.lot_size)
             .context("lot_size")?
             .column_i64("window_lots_milli", r.window_lots_milli)
-            .context("window_lots_milli")?;
+            .context("window_lots_milli")?
+            .column_i64("net_volume_chg_milli_pct", r.net_volume_chg_milli_pct)
+            .context("net_volume_chg_milli_pct")?;
         // OPTIONAL column -- omitted (NULL) when the underlying's gain is not
         // knowable yet. Absent-field-is-NULL is the `tick_persistence`
         // per-feed-optional precedent, and the row still carries 4 symbols and
@@ -868,7 +950,7 @@ impl TopVolumeRankWriter {
     ///
     /// # Errors
     /// Propagates ILP buffer errors (table/column append failure).
-    pub fn append_row(&mut self, r: &TopVolumeRankRow) -> Result<()> {
+    pub fn append_row(&mut self, r: &TopVolumeRankRow<'_>) -> Result<()> {
         // A marker may only be set on an empty buffer or after `at` — i.e.
         // exactly at a row boundary, which is where this always runs. If it is
         // refused the buffer is ALREADY mid-row from some path this reasoning
@@ -1225,7 +1307,9 @@ const TOP_VOLUME_MAX_ROWS_PER_SWEEP: usize =
 /// ```text
 ///   top_volume                                       11
 ///   ,tf=1m,family=stock,feed=dhan,segment=NSE_FNO    ~45
-///   rank=…i, security_id=…i, underlying_id=…i,      ~ 79
+///   ,contract=<UNDERLYING>-25Sep2026-123456.75-CE   ~ 48
+///   security_id=…i, underlying_id=…i,                ~ 53
+///   net_volume_chg_milli_pct=…i,                     ~ 45
 ///   volume=…i, delta_units=…i, lot_size=…i,         ~ 58
 ///   window_lots_milli=…i,                            ~33
 ///   gain_pct=-12.345678901234567,                    ~27
@@ -1255,7 +1339,18 @@ const TOP_VOLUME_MAX_ROWS_PER_SWEEP: usize =
 /// 384 rather than 324: headroom for a longer symbol value or a wider `f64`
 /// repr without a third under-count, and the cost is only reserved address
 /// space in a buffer that is flushed every sweep.
-const TOP_VOLUME_ILP_ROW_BYTES: usize = 384;
+/// ⚠ 384 -> 448 on 2026-09-13, RE-MEASURED not re-derived. The schema change
+/// that day dropped `rank` (~26 B) and added `contract` (a SYMBOL up to ~48 B)
+/// and `net_volume_chg_milli_pct` (~45 B), a net widening the harness measured
+/// at 324 -> 401 B (the harness measures it; the hand count came in at ~393, low
+/// again, which is the third time a width derivation here has under-counted).
+/// 448 keeps the same ~12% headroom the 384 carried over 324.
+///
+/// The ceiling it produces is 50,000 x 448 = 22.4 MB, and the wedge assert
+/// below (2x <= the questdb-rs 100 MB `max_buf_size`) is what caps it: 500 B
+/// would be the arithmetic limit, so there is room for one more column of this
+/// size before that assert, not two.
+const TOP_VOLUME_ILP_ROW_BYTES: usize = 448;
 /// Worst-case sweeps the producer may hold before it drops.
 ///
 /// # ⚠ 2 → 1, forced by the corrected width above (2026-09-12)
@@ -1323,7 +1418,7 @@ const _: () = assert!(
 /// cover. Two independent terms are what make the asserts below capable of
 /// failing — the vacuous assert this replaced compared the ceiling to a factor
 /// of itself.
-const MEASURED_WORST_CASE_ILP_ROW_BYTES: usize = 324;
+const MEASURED_WORST_CASE_ILP_ROW_BYTES: usize = 401;
 
 // (3) The requirement the ORIGINAL assert's message named and its arithmetic
 //     could not check: the ceiling must hold at least one worst-case sweep at
@@ -1548,14 +1643,14 @@ mod tests {
         );
     }
 
-    fn row() -> TopVolumeRankRow {
+    fn row() -> TopVolumeRankRow<'static> {
         TopVolumeRankRow {
             snapshot_ts_ist_nanos: 1_757_000_000_000_000_000,
             cadence: SnapshotCadence::FiveSecond,
             family: "stock_option",
             feed: "dhan",
             segment: "NSE_FNO",
-            rank: 1,
+            contract: "RELIANCE-25Sep2026-1400-CE",
             security_id: 44_321,
             underlying_id: 2885,
             volume: 117_567_970,
@@ -1566,6 +1661,10 @@ mod tests {
             delta_units: 8_500,
             lot_size: 200,
             window_lots_milli: 42_500,
+            // The transform, reproduced: 42_500 * 100 - 100_000 = 4_150_000
+            // milli-percent = +4150.000%. A fixture whose percentage does not
+            // follow from its own key would let a broken projection look right.
+            net_volume_chg_milli_pct: 4_150_000,
             gain_pct: Some(4.25),
             subscribed: true,
         }
@@ -1604,18 +1703,71 @@ mod tests {
         );
     }
 
-    /// `rank` is the recorded VALUE, not part of the row's identity. In the
-    /// key, one contract could occupy several rows in one snapshot as its
-    /// rank moved between an emit and a re-emit — the duplicate the DEDUP
-    /// key exists to prevent.
+    /// The DISPLAY columns stay OUT of the row's identity.
+    ///
+    /// `contract` is a pure function of `security_id`, so it adds no identity
+    /// — but a stale label on a re-emit would make the same contract a
+    /// DIFFERENT key and duplicate the row, which is the collision the key
+    /// exists to prevent. `net_volume_chg_milli_pct` is the recorded value.
+    ///
+    /// `rank` is asserted absent too, and stays asserted after the column was
+    /// removed on 2026-09-13: an existing table still HAS the column (the
+    /// self-heal path has no DROP), so a future change that started writing it
+    /// again must not be able to put it in the key by accident.
     #[test]
-    fn rank_is_deliberately_absent_from_the_dedup_key() {
+    fn the_display_columns_are_deliberately_absent_from_the_dedup_key() {
+        for banned in ["rank", "contract", "net_volume_chg_milli_pct", "gain_pct"] {
+            assert!(
+                !DEDUP_KEY_TOP_VOLUME_RANK
+                    .split(',')
+                    .any(|t| t.trim() == banned),
+                "{banned} in the key lets one contract hold several rows per snapshot"
+            );
+        }
+    }
+
+    /// The `rank` column is gone from every schema surface at once.
+    ///
+    /// Three surfaces, because a column half-removed is worse than one left
+    /// alone: a CREATE without it plus an ALTER manifest with it would re-add
+    /// it on every boot, and an ILP line naming it against a fresh table
+    /// auto-creates the column the CREATE just declined to make.
+    #[test]
+    fn the_rank_column_is_absent_from_the_ddl_the_manifest_and_the_wire() {
         assert!(
-            !DEDUP_KEY_TOP_VOLUME_RANK
-                .split(',')
-                .any(|t| t.trim() == "rank"),
-            "rank in the key lets one contract hold several rows per snapshot"
+            !top_volume_rank_create_ddl().contains("rank "),
+            "the CREATE still declares rank"
         );
+        assert!(
+            !TOP_VOLUME_RANK_COLUMNS.iter().any(|(c, _)| *c == "rank"),
+            "the self-heal manifest still ADDs rank, so it returns every boot"
+        );
+        let mut w = TopVolumeRankWriter::for_test();
+        w.append_row(&row()).expect("append");
+        let line = w.buffer_utf8();
+        assert!(
+            !line.contains("rank="),
+            "the ILP line still writes rank: {line}"
+        );
+    }
+
+    /// The stored percentage must FOLLOW from the stored key, exactly.
+    ///
+    /// It is a monotone transform, not independent information — so the one
+    /// thing worth pinning is that the two never drift, in the direction the
+    /// doc names: if they disagree, the percentage is the wrong one.
+    #[test]
+    fn the_stored_percentage_follows_from_the_stored_key() {
+        let r = row();
+        assert_eq!(
+            r.net_volume_chg_milli_pct,
+            r.window_lots_milli * 100 - 100_000,
+            "net_volume_chg_milli_pct must equal window_lots_milli * 100 - 100_000"
+        );
+        // One lot is exactly zero change; below one lot is NEGATIVE, which is
+        // the whole reason the change form was chosen over a ratio.
+        assert_eq!(1_000_i64 * 100 - 100_000, 0);
+        assert!(500_i64 * 100 - 100_000 < 0);
     }
 
     /// The two cadences must be distinguishable in the key, or the 5s
@@ -1631,9 +1783,8 @@ mod tests {
         );
     }
 
-    /// Families are ranked separately, so both can hold rank 1 in the same
-    /// second for different contracts. Without `family` in the key that is
-    /// still fine (security_id differs) — but a contract listed in BOTH
+    /// Families are ranked separately. Without `family` in the key that is
+    /// usually fine (security_id differs) — but a contract listed in BOTH
     /// families would collide. Pinned so the separation survives a refactor.
     #[test]
     fn the_family_is_in_the_key() {
@@ -1834,7 +1985,8 @@ mod tests {
             "family=stock_option",
             "feed=dhan",
             "segment=NSE_FNO",
-            "rank=1i",
+            "contract=RELIANCE-25Sep2026-1400-CE",
+            "net_volume_chg_milli_pct=4150000i",
             "security_id=44321i",
             "window_lots_milli=42500i",
             "delta_units=8500i",
@@ -2028,13 +2180,16 @@ mod tests {
             family: "stock",
             feed: "dhan",
             segment: "NSE_FNO",
-            rank: i64::MAX,
+            // The widest label this column can realistically carry: a long
+            // underlying, a full date, a fractional strike and a leg.
+            contract: "MAZAGONDOCKSHIPBUILDERS-25Sep2026-123456.75-CE",
             security_id: i64::MAX,
             underlying_id: i64::MAX,
             volume: i64::from(u32::MAX),
             delta_units: i64::from(u32::MAX),
             lot_size: i64::MAX,
             window_lots_milli: i64::MAX,
+            net_volume_chg_milli_pct: i64::MIN,
             // A full-width shortest-repr f64 with a sign, so the widest
             // `gain_pct` field this column can carry.
             gain_pct: Some(-1.234_567_890_123_456_7_f64),

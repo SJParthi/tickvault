@@ -959,6 +959,48 @@ pub fn probe_close_spent(connection_index: u8) -> bool {
         .is_some_and(|a| a.load(std::sync::atomic::Ordering::Relaxed))
 }
 
+/// How many times each slot has completed a dial this process lifetime.
+static DIAL_GENERATION: [std::sync::atomic::AtomicU64; GHOST_REDIAL_SLOTS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; GHOST_REDIAL_SLOTS];
+
+/// Records that `connection_index` just completed a dial.
+///
+/// Called from the ONE place a dial is confirmed
+/// ([`ConnEvent::DialSucceeded`]), so a caller cannot forget it and a test
+/// driving the state machine gets the same bump the socket does.
+fn bump_dial_generation(connection_index: u8) {
+    if let Some(slot) = DIAL_GENERATION.get(usize::from(connection_index)) {
+        slot.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Dials this slot has completed. `0` for an out-of-range index.
+///
+/// # Why the unsubscribe probe cannot produce a verdict without this
+///
+/// A probe measures whether frames stop. A RE-DIAL inside its watch window
+/// changes what "stopped" means, in opposite directions for the two arms, and
+/// neither is visible from the frames alone:
+///
+/// * **Arm A** empties the guard, and the guard IS the reconnect replay. A
+///   re-dial therefore comes back subscribed to NOTHING, the frames stop
+///   because of us, and the probe would report `honoured` — a false finding
+///   that the vendor honoured a request it may well have ignored.
+/// * **Arm B** closes the socket on purpose. Silence afterwards is only
+///   evidence if the socket actually came BACK; a slot still climbing its
+///   backoff ladder is silent for reasons that say nothing about the vendor.
+///
+/// One counter answers both, read either side of the window: Arm A requires it
+/// UNCHANGED, Arm B requires it to have MOVED. The `ProbeUnsubscribe` handler
+/// has carried a comment naming this defence — "the caller owns it" — since
+/// the probe was written; this is the accessor that lets the caller own it.
+#[must_use]
+pub fn dial_generation(connection_index: u8) -> u64 {
+    DIAL_GENERATION
+        .get(usize::from(connection_index))
+        .map_or(0, |g| g.load(std::sync::atomic::Ordering::Acquire))
+}
+
 /// Why a connection stopped permanently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParkReason {
@@ -1403,6 +1445,10 @@ impl ConnectionSupervisor {
                 self.phase = ConnPhase::Subscribing;
                 self.watchdog.record_activity(now);
                 self.last_frame_at = now;
+                // The ONE place a completed dial is recorded, so the
+                // unsubscribe probe's re-dial defence cannot be defeated by a
+                // path that forgot to report. See `dial_generation`.
+                bump_dial_generation(self.slot.global_index);
                 SupervisorAction::Subscribe
             }
 
@@ -2677,6 +2723,24 @@ pub enum LiveSubscriptionCommand {
         /// connection holds, or the command is refused fail-closed and
         /// nothing reaches the wire.
         drop_this: SubscribeInstrument,
+        /// Whether to put an unsubscribe frame on the wire (Arm A), or only
+        /// empty the guard (Arm B).
+        ///
+        /// # Why Arm B needs the guard emptied and NO frame
+        ///
+        /// The guard IS the reconnect replay. Arm B's question is whether a
+        /// stream can be stopped by closing the socket and replaying a set
+        /// WITHOUT the contract — so the set has to actually lose it, and the
+        /// socket is about to be torn down anyway, which makes a frame on a
+        /// dying connection pure noise in the one measurement that must stay
+        /// clean.
+        ///
+        /// Until 2026-09-13 Arm B sent nothing AND left the guard alone, so
+        /// the re-dial faithfully re-subscribed the contract, frames always
+        /// resumed, and the shared verdict mapping returned `Ignored` no
+        /// matter what Dhan did. The control could only ever return the
+        /// vendor-blaming answer, which is worse than having no control.
+        send_wire: bool,
         /// Where the connection reports what actually happened.
         ///
         /// Unlike `Extend` and `Swap` this is not optional in practice — a
@@ -5069,7 +5133,11 @@ where
                         }
                     }
                 }
-                Ok(LiveSubscriptionCommand::ProbeUnsubscribe { drop_this, ack }) => {
+                Ok(LiveSubscriptionCommand::ProbeUnsubscribe {
+                    drop_this,
+                    send_wire,
+                    ack,
+                }) => {
                     // ARM A OF THE UNSUBSCRIBE PROBE (scope lock, 2026-09-12).
                     //
                     // Written as nested `if`/`else` rather than early
@@ -5124,18 +5192,27 @@ where
                         // can park it for the session. The probe would have
                         // broken the socket it was measuring.
                         let mut timed_out = false;
-                        let sent = match tokio::time::timeout(
-                            SWAP_WIRE_BUDGET,
-                            socket.send_unsubscribe(&[drop_this]),
-                        )
-                        .await
-                        {
-                            Ok(Ok(())) => true,
-                            Ok(Err(_)) => false,
-                            Err(_elapsed) => {
-                                timed_out = true;
-                                false
+                        // Arm B asks for no frame: the socket is about to be
+                        // closed, so the only thing that has to change is the
+                        // guard, which is what the re-dial replays. Treating
+                        // that as "sent" is not a fiction — it is the whole
+                        // action this arm requested, and it cannot fail.
+                        let sent = if send_wire {
+                            match tokio::time::timeout(
+                                SWAP_WIRE_BUDGET,
+                                socket.send_unsubscribe(&[drop_this]),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => true,
+                                Ok(Err(_)) => false,
+                                Err(_elapsed) => {
+                                    timed_out = true;
+                                    false
+                                }
                             }
+                        } else {
+                            true
                         };
                         if sent {
                             // The frame is out. Empty the guard so this
@@ -5181,12 +5258,19 @@ where
                                 pool_index = supervisor.slot().pool_index,
                                 security_id = drop_this.security_id,
                                 segment = drop_this.segment.as_str(),
+                                // Meaningful only when a frame actually went
+                                // out; Arm B empties the guard and sends
+                                // nothing, and `wire` is what tells the two
+                                // apart in a log a ticket is written from.
                                 request_code = FEED_UNSUBSCRIBE_TWENTY_DEPTH,
+                                wire = send_wire,
                                 generation = guard.generation(),
-                                "unsubscribe probe: frame written to the wire and this socket's \
-                                 subscription set emptied. Frames arriving for this instrument \
-                                 from now on are the vendor ignoring the request — that is the \
-                                 measurement."
+                                dial_generation = dial_generation(supervisor.slot().global_index),
+                                "unsubscribe probe: this socket's subscription set is now empty. \
+                                 With `wire` true a frame went out and any frame arriving from \
+                                 now on is the vendor ignoring it; with `wire` false nothing was \
+                                 asked of the vendor and the socket is about to be closed, so \
+                                 what follows measures the replay instead."
                             );
                         } else {
                             answer_probe_unsubscribe(
@@ -10478,6 +10562,7 @@ mod tests {
         let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
         tx.send(LiveSubscriptionCommand::ProbeUnsubscribe {
             drop_this: si(1),
+            send_wire: true,
             ack: Some(ack_tx),
         })
         .await
@@ -10531,6 +10616,7 @@ mod tests {
         tx.send(LiveSubscriptionCommand::ProbeUnsubscribe {
             // The probe named 1; the socket moved to 7.
             drop_this: si(1),
+            send_wire: true,
             ack: Some(ack_tx),
         })
         .await
@@ -10577,6 +10663,7 @@ mod tests {
         let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
         tx.send(LiveSubscriptionCommand::ProbeUnsubscribe {
             drop_this: si(1),
+            send_wire: true,
             ack: Some(ack_tx),
         })
         .await
@@ -10651,6 +10738,7 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         tx.send(LiveSubscriptionCommand::ProbeUnsubscribe {
             drop_this: si(1),
+            send_wire: true,
             ack: None,
         })
         .await
@@ -10702,6 +10790,7 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         tx.send(LiveSubscriptionCommand::ProbeUnsubscribe {
             drop_this: si(1),
+            send_wire: true,
             ack: None,
         })
         .await
@@ -10753,6 +10842,7 @@ mod tests {
         let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
         tx.send(LiveSubscriptionCommand::ProbeUnsubscribe {
             drop_this: si(1),
+            send_wire: true,
             ack: Some(ack_tx),
         })
         .await
@@ -10913,6 +11003,66 @@ mod tests {
             ghost < probe,
             "the ghost take must come FIRST: a ghost is a fault and a probe close is a \
              measurement, and a measurement must never pre-empt a remediation"
+        );
+    }
+
+    /// A slot the authorized 16 sockets never use, so this test cannot be
+    /// perturbed by another test driving a real connection index.
+    const UNUSED_SLOT: u8 = (GHOST_REDIAL_SLOTS - 1) as u8;
+
+    #[test]
+    fn dial_generation_counts_dials_and_never_panics_out_of_range() {
+        // Relative to a captured baseline, never an absolute: this register is
+        // a process-global static and the suite runs in parallel.
+        let before = dial_generation(UNUSED_SLOT);
+
+        bump_dial_generation(UNUSED_SLOT);
+        assert_eq!(
+            dial_generation(UNUSED_SLOT),
+            before + 1,
+            "a completed dial must advance the slot's generation"
+        );
+
+        bump_dial_generation(UNUSED_SLOT);
+        assert_eq!(dial_generation(UNUSED_SLOT), before + 2);
+
+        // An out-of-range index reads 0 rather than panicking. The probe calls
+        // this from a live steering path under `panic = "abort"`, so a bad
+        // index must never take the process down.
+        let out_of_range = u8::try_from(GHOST_REDIAL_SLOTS).unwrap_or(u8::MAX);
+        assert_eq!(dial_generation(out_of_range), 0);
+        assert_eq!(dial_generation(u8::MAX), 0);
+
+        // And a bump on an out-of-range index is a silent no-op, not a write
+        // into a neighbouring slot.
+        let neighbour = dial_generation(UNUSED_SLOT);
+        bump_dial_generation(out_of_range);
+        bump_dial_generation(u8::MAX);
+        assert_eq!(
+            dial_generation(UNUSED_SLOT),
+            neighbour,
+            "an out-of-range bump wrote into a real slot"
+        );
+    }
+
+    #[test]
+    fn dial_generation_is_independent_per_slot() {
+        // Arm A requires the generation UNCHANGED and Arm B requires it MOVED,
+        // each on its OWN socket — so a bump on one slot must never be
+        // readable as a bump on the other, or the two arms contaminate.
+        // Slots DISJOINT from the ones the test above bumps: these two tests
+        // share the process-global register and cargo runs them in parallel,
+        // so overlapping slots would make each one flake the other.
+        let a = UNUSED_SLOT - 3;
+        let b = UNUSED_SLOT - 2;
+        let (a0, b0) = (dial_generation(a), dial_generation(b));
+
+        bump_dial_generation(a);
+        assert_eq!(dial_generation(a), a0 + 1);
+        assert_eq!(
+            dial_generation(b),
+            b0,
+            "a dial on one slot advanced another slot's generation"
         );
     }
 }
