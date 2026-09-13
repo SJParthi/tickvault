@@ -1419,6 +1419,7 @@ pub async fn run_depth_rebalance(
     crate::depth20_ranked_steer::pre_register_depth20_ranked_counters();
     crate::depth_seed::pre_register_seed_counters();
     crate::dhan_contract_universe::pre_register_spot_backstop_counters();
+    crate::depth_subscription_view::pre_register_view_counters();
     // The heartbeat, published by a task this loop cannot wedge.
     //
     // Registered BEFORE the first iteration: a loop that dies on its very
