@@ -5319,3 +5319,84 @@ that is the support ticket, not this cap.
 - Adopts socket-affine packing for depth-20 (condition 3, unchanged).
 - Changes the socket or instrument budgets, the name band, or the ATM windows.
 - Reports the 48 s worst case as a measured figure.
+
+### 2026-09-13 — DHAN-ONLY, RESTATED: the Groww token minter, and the false strings the 2026-08-21 removal left behind
+
+**The verbatim operator demand (2026-09-13, typed directly in-session — preserve
+EXACTLY, expletives and typos included):**
+
+> "remove that fuckign groww token mitner also see clealry ntoe in this appllciation we ened to always ahve one an donly dhan related data dude okay? no groww accepatbela t any poitn dude okay?"
+
+**No new scope is claimed.** The 2026-08-21 directive ("2026-08-21 (THIRD quote of
+the day)") already ordered the entire Groww surface removed; this is that directive
+executed on the residue it left, plus the operator naming one AWS resource it never
+covered. Recorded per the rule-file-first law.
+
+#### What was MEASURED, 2026-09-13 — better than expected in code, worse in AWS
+
+| Surface | Reading |
+|---|---|
+| `fetch_groww_access_token` | **does not exist** — the only 3 hits are historical comments |
+| `Feed::Groww` enum variant | **does not exist** — `Feed::ALL` is `[Dhan, Truedata]`; the single textual hit is inside a comment |
+| Groww mentions in `crates/` | 1,765 lines, of which **1,202 are comments** and only **80 are production code** |
+| Tickvault Terraform declaring a Groww resource | **ZERO** — all 13 `.tf` files that mention the word do so in comments |
+| EventBridge rule `groww-token-minter-daily` | **ENABLED**, `cron(35 0 * * ? *)`, and it **minted at 06:05 IST that morning** |
+| `/tickvault/prod/groww/{access-token,api-key,totp-secret}` | present; access-token `LastModifiedDate` = today |
+
+#### ⚠ The minter is NOT tickvault's to delete, and that is the honest blocker
+
+`groww-shared-token-minter-2026-07-02.md` §1 records that the Lambda's Terraform
+lives in the **bruteX repo**, and `brutex-readonly-lock-2026-07-18.md` makes
+tickvault READ-ONLY there. So the rule and the trigger sit in the operator's shared
+AWS account while their source of truth is a repo this session may not write. A
+disable from here is reverted by bruteX's next `terraform apply`, and bruteX loses
+its Groww token in between. The executing identity also lacks `events:DisableRule`
+and every `lambda:*` action (both verified by attempting them).
+
+**It is therefore an operator action, not an executor one**, and it is recorded
+here rather than half-done: EventBridge → Rules → `groww-token-minter-daily` →
+Disable, then delete the three SSM parameters.
+
+#### What WAS fixed in tickvault (the operator-visible half)
+
+Four Telegram/log surfaces stated, in production, that a second broker exists:
+
+| Site | Said | Reachability |
+|---|---|---|
+| `events.rs` `StartupComplete` ×4 arms | "(Groww per-minute legs report separately)" | **every boot** |
+| `events.rs` `Chain1mUnderlyingNotServed` / `…ServedRecovered` | "the second broker (🟢 GROWW) … check the Groww copy" | a §2.1 allowed-family page, live |
+| `events.rs` `DualFeedScorecardAborted` | "the 3:45 PM IST Dhan-vs-Groww scorecard" | live |
+| `order_runtime.rs:1282, :1914` | "Groww marks" / "waiting for the first Groww mark" | **`[order_runtime] enabled = true`, `self_test = true`** — both fire, and the mark producer has been `dhan_cadence_executor` since 2026-08-21, pinned by `cadence_mark_source_guard::test_dhan_cadence_executor_is_now_the_mark_producer`, a test INVERTED that day to assert exactly that |
+
+Every one is corrected, and the tests that asserted the old wording now assert its
+**ABSENCE** (`assert!(!msg.contains("Groww"))`) so it cannot creep back.
+
+**One claim CORRECTED rather than repeated.** A review of this work reported
+`feed_scoreboard_boot.rs:3448` as a live bug — `match feed { Dhan => dhan_on, _ =>
+groww_on }` now routing TrueData through a Groww variable. The call site
+(`main.rs:5409-5411`) passes `(is_enabled(Dhan), is_enabled(Truedata))`, so the
+**VALUE is correct and only the NAME was stale**. Renamed `groww_on` →
+`secondary_on`. Recorded because "misleading name" and "wrong behaviour" are
+different findings and only one of them was true.
+
+#### NOT done, and deliberately
+
+The feed-generic seam stays exactly as the 2026-08-21 REJECT list requires — the
+`Feed` enum, the cadence scheduler, and the `spot_1m_rest` / `option_chain_1m` /
+`rest_fetch_audit` tables and their writers are UNTOUCHED, because GDF and TrueData
+plug into them and their scope locks are unaffected by this quote. The dead
+`*_FEED_GROWW` constants, the dormant `FUTIDX-02` cross-feed comparator, and the
+`groww_symbol` / `groww_minutes` DDL columns are left for a separate change: the
+columns in particular are **not free** to remove, because the self-heal is
+`ADD COLUMN IF NOT EXISTS` and can never drop one, so a live `ALTER TABLE … DROP
+COLUMN` is an operator decision rather than a code edit.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Re-introduces any operator-facing string naming a second broker.
+- Removes the feed-generic seam "because only Dhan is left" (the 2026-08-21 row).
+- Deletes a SEBI/audit row, or a `feed='groww'` row from `instrument_lifecycle`,
+  `instrument_lifecycle_audit` or `index_constituency` — removing the WRITER was
+  authorized, deleting the ROWS never was.
+- Writes to the bruteX repo to remove the minter (read-only lock, 2026-07-18).
+- Reports the minter as removed on the strength of a tickvault-side change.

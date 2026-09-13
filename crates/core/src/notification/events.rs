@@ -1802,34 +1802,30 @@ impl NotificationEvent {
                 // asked "what happened to it?"). Truthful per-leg wording —
                 // a switched-off leg says so.
                 // 2026-07-14 operator broker-tag directive: the capture
-                // line reports the DHAN per-minute REST legs — say so, and
-                // note the Groww per-minute legs report on their own
-                // alerts (they are config-gated in their own modules).
+                // line reports the DHAN per-minute REST legs. Dhan is the
+                // only broker in this system (Groww retired 2026-08-21), so
+                // there is no second-broker leg to point at.
                 let capture_line = match (spot_1m_enabled, chain_1m_enabled) {
                     (true, true) => format!(
                         "\u{2705} Dhan per-minute price capture — armed \
                          (fires 9:16 AM to 3:30 PM IST on trading days): \
                          Dhan spot candles for {spot_1m_indices} indices + \
                          Dhan option chain for {chain_1m_underlyings} \
-                         indices (Groww per-minute legs report separately)"
+                         indices"
                     ),
                     (true, false) => format!(
                         "\u{2705} Dhan per-minute price capture — armed \
                          (fires 9:16 AM to 3:30 PM IST on trading days): \
                          Dhan spot candles for {spot_1m_indices} indices; \
-                         Dhan option chain — switched off (Groww per-minute \
-                         legs report separately)"
+                         Dhan option chain — switched off"
                     ),
                     (false, true) => format!(
                         "\u{2705} Dhan per-minute price capture — armed \
                          (fires 9:16 AM to 3:30 PM IST on trading days): \
                          Dhan option chain for {chain_1m_underlyings} \
-                         indices; Dhan spot candles — switched off (Groww \
-                         per-minute legs report separately)"
+                         indices; Dhan spot candles — switched off"
                     ),
-                    (false, false) => "Dhan per-minute price capture — switched off \
-                         (Groww per-minute legs report separately)"
-                        .to_string(),
+                    (false, false) => "Dhan per-minute price capture — switched off".to_string(),
                 };
                 format!(
                     "<b>tickvault started</b>\nMode: {mode}\nBuild: {build}\n\
@@ -2199,7 +2195,7 @@ impl NotificationEvent {
                 let detail = html_escape(detail);
                 format!(
                     "\u{26a0}\u{fe0f} <b>Daily spot cross-check did NOT run</b>\n\
-                     The 3:47 PM IST check comparing Dhan vs Groww index prices \
+                     The 3:47 PM IST spot cross-verification check \
                      died before finishing.\n\
                      Reason: {detail}\n\
                      What to do RIGHT NOW:\n\
@@ -2375,15 +2371,13 @@ impl NotificationEvent {
                      while the other indices came through fine — the other \
                      indices are unaffected, so this looks like the broker \
                      not serving THIS index's chain, not a general outage.\n\
-                     Live streaming prices are NOT affected — only Dhan's \
+                     Live streaming prices are NOT affected — only the \
                      per-minute option chain record for {underlying} is \
-                     missing; the same minutes may still be coming in from \
-                     the second broker (\u{1f7e2} GROWW), which records into \
-                     the same book with its own label.\n\
+                     missing, and Dhan is the only broker, so nothing else \
+                     covers those minutes.\n\
                      What to do RIGHT NOW:\n\
-                     1. Nothing urgent — the other indices keep recording \
-                     normally, and the Groww copy covers {underlying} for \
-                     these minutes IF Groww is serving it.\n\
+                      1. Nothing urgent — the other indices keep recording \
+                     normally.\n\
                      2. On an expiry day this is usually the broker cutting \
                      off the expiring chain early — it comes back with the \
                      next expiry.\n\
@@ -2400,9 +2394,9 @@ impl NotificationEvent {
                      {underlying} again</b>\n\
                      The per-minute option chain for {underlying} from Dhan \
                      is working again after {empty_minutes} empty minute(s). \
-                     The minutes that were missed stay blank in Dhan's record \
-                     — nothing is made up; check the Groww copy for those \
-                     minutes if they matter."
+                     The minutes that were missed stay blank \
+                     — nothing is made up and nothing is copied in from \
+                     anywhere else."
                 )
             }
             Self::DualFeedDailyScorecard {
@@ -2534,7 +2528,7 @@ impl NotificationEvent {
                 let detail = html_escape(detail);
                 format!(
                     "\u{26a0}\u{fe0f} <b>Daily feed scorecard did NOT run</b>\n\
-                     The 3:45 PM IST Dhan-vs-Groww scorecard died before \
+                     The 3:45 PM IST daily feed scorecard died before \
                      finishing.\n\
                      Reason: {detail}\n\
                      What to do RIGHT NOW:\n\
@@ -4135,10 +4129,10 @@ mod tests {
             "got: {both}"
         );
         assert!(!both.contains("switched off"), "got: {both}");
-        assert!(
-            both.contains("Groww per-minute legs report separately"),
-            "got: {both}"
-        );
+        // Groww was removed 2026-08-21. Asserting its ABSENCE, not a
+        // replacement phrase: a card that names a second broker this
+        // system does not have is a false statement to the operator.
+        assert!(!both.contains("Groww"), "got: {both}");
 
         let chain_off = build(true, false).to_message();
         assert!(
@@ -4166,10 +4160,7 @@ mod tests {
             "got: {both_off}"
         );
         assert!(!both_off.contains("armed"), "got: {both_off}");
-        assert!(
-            both_off.contains("Groww per-minute legs report separately"),
-            "got: {both_off}"
-        );
+        assert!(!both_off.contains("Groww"), "got: {both_off}");
     }
 
     #[test]
@@ -8242,16 +8233,14 @@ mod tests {
         assert!(msg.contains("10 minutes in a row"), "got: {msg}");
         assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
         // Honest scope lines: the live WS pipeline is untouched, the
-        // sibling broker is stated as MAY + the explicit IF (independent
-        // serving state — no false-OK), and nothing crosses feeds.
+        // 2026-09-13: the sibling-broker paragraph is GONE. Dhan is the
+        // only broker, so "the other broker may still have it" was a
+        // false comfort — the honest line is that the minutes are simply
+        // missing. Asserting the absence so it cannot creep back.
         assert!(msg.contains("NOT affected"), "got: {msg}");
-        assert!(msg.contains("may still be coming in"), "got: {msg}");
-        assert!(msg.contains("IF Groww is serving it"), "got: {msg}");
+        assert!(msg.contains("only broker"), "got: {msg}");
         assert!(msg.contains("nothing is made up"), "got: {msg}");
-        assert!(
-            msg.contains("nothing is copied across brokers"),
-            "got: {msg}"
-        );
+        assert!(!msg.contains("Groww"), "got: {msg}");
         // 10-commandment hygiene: no file paths / config extensions.
         assert!(!msg.contains(".rs"), "no file paths in Telegram: {msg}");
         assert!(!msg.contains(".toml"), "no config paths in Telegram: {msg}");
@@ -8272,8 +8261,9 @@ mod tests {
         );
         assert!(msg.contains("12 empty"), "got: {msg}");
         // No false-OK: recovery never claims the missing minutes came
-        // back — the operator is pointed at the Groww copy instead.
+        // back. 2026-09-13 — and it no longer points at a second broker,
+        // because there is not one.
         assert!(msg.contains("nothing is made up"), "got: {msg}");
-        assert!(msg.contains("check the Groww copy"), "got: {msg}");
+        assert!(!msg.contains("Groww"), "got: {msg}");
     }
 }
