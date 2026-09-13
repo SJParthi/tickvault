@@ -61,6 +61,7 @@ use tickvault_common::types::ExchangeSegment;
 use tickvault_core::websocket::pool_supervisor::SubscribeInstrument;
 
 use crate::depth_rebalance::MoverRow;
+use crate::depth200_candidates::NOT_YET_RANKED;
 use crate::dhan_contract_universe::ContractRow;
 use crate::dhan_depth_universe::DepthCandidate;
 
@@ -191,6 +192,31 @@ const _: () = assert!(
 
 /// The absolute move of one underlying, in integer basis points.
 ///
+/// # ⚠ ZERO PRODUCTION CALLERS (recorded 2026-09-13) — read this first
+///
+/// `grep -rn 'move_bps\b' crates/*/src` finds this function's own definition,
+/// the [`NameMove`] field of the same name, the comparator in [`rank_names`]
+/// that orders that field, and these doc links. **It finds no call site.**
+/// The key the board actually ranks on is produced by
+/// [`move_bps_from_pct`], from a QuestDB `close_pct_from_prev_day` column.
+///
+/// It cannot be wired today, and the reason is structural rather than a
+/// missing line: its two inputs live in `SpotPriceStore` and `PrevCloseStore`,
+/// both owned `&mut` by the frame drain. The steering loop that plans this
+/// board has no handle to either and cannot be given one without putting a
+/// lock on the hot path. `move_bps_from_pct`'s own docstring carries the full
+/// substitution table — same question, different source, a minute of lag.
+///
+/// It is kept rather than deleted because it is the TESTED reference for the
+/// integer path the 2026-09-07 lock describes, and the arithmetic below is
+/// what the float boundary in `move_bps_from_pct` is checked against
+/// (`move_bps_from_pct_is_integer_basis_points_and_absolute` asserts the two
+/// agree on the same move). **A reader must not mistake the overflow
+/// reasoning below for a description of the shipped path.** Nothing in
+/// production reaches this `i128` multiply; the live path's cast guard is the
+/// `±1e6` float bound in [`move_bps_from_pct`], which is a different
+/// argument about a different number.
+///
 /// `None` — and the caller must treat it as NOT RANKABLE, never as zero — when:
 ///
 /// * the previous close is absent or non-positive (a zero close is a live
@@ -269,6 +295,23 @@ impl NameMove {
 /// `security_id` tie-break stops being a rare fallback and becomes a
 /// systematic low-id preference among equally-moved names. That is a real
 /// property of this key, it is deterministic, and it is not hidden.
+///
+/// # Complexity
+///
+/// O(1) EXEMPT: **O(n log n)** compares, where `n` is the RANKABLE name count
+/// — at most one entry per row [`name_moves`] kept, so at most
+/// `movers.len()`. The movers query is a `LATEST ON` partition over the live
+/// F&O underlyings (~210 measured 2026-08-21), which puts the real bound at
+/// roughly `210 × log2(210) ≈ 1,600` compares. The two index names are NOT in
+/// this count: they are unconditional under the 2026-09-11 lock and never
+/// ranked.
+///
+/// **Zero allocation, and that is a property of the SIGNATURE rather than of
+/// the body**: taking the `Vec` by value and returning it lets
+/// `sort_unstable_by` work in place, so the whole rank is one move and no
+/// copy. Once a minute on the steering task — a sort this size is free at that
+/// cadence, and the shape is recorded because every other function in this
+/// module declares one and a silent omission reads as "audited and O(1)".
 #[must_use]
 pub fn rank_names(mut names: Vec<NameMove>) -> Vec<NameMove> {
     names.sort_unstable_by(|a, b| {
@@ -686,9 +729,15 @@ pub fn future_index(
 ///
 /// # Complexity
 ///
-/// O(1) EXEMPT: O(EXIT_RANK²) = at most 144 key compares — `DEPTH20_NAME_EXIT_RANK`
-/// is 12 and a linear scan of twelve entries costs less than the `HashSet`
-/// that would replace it. Once a minute, steering task.
+/// O(1) EXEMPT: O(EXIT_RANK × ENTRY_RANK) key compares in each pass, so at
+/// most `12 × 6 + 6 × 12 = 144` in total — `DEPTH20_NAME_EXIT_RANK` is 12,
+/// `DEPTH20_NAME_ENTRY_RANK` is 6, and `out` never exceeds the latter until
+/// step 2. (144 was the documented figure before the step-1 self-dedup landed
+/// on 2026-09-13, when the real bound was half of it; the dedup made the
+/// stated number TRUE rather than raising it.) A linear scan of at most twelve
+/// entries costs less than the `HashSet` that would replace it, and the
+/// `BTreeSet` probe against `held` is the O(log) term that is already there.
+/// Once a minute, steering task.
 #[must_use]
 pub fn choose_names(
     board: &NameBoard,
@@ -697,8 +746,23 @@ pub fn choose_names(
     let mut out: Vec<NameMove> = Vec::with_capacity(DEPTH20_NAME_EXIT_RANK);
     // 1. INCUMBENTS still inside the band, strongest first. This is the
     //    hysteresis: a name that entered at rank 6 keeps its slots at rank 11.
+    //
+    //    The `!out.iter().any(..)` is a SELF-dedup, and it is not symmetry
+    //    with step 2 for its own sake. A duplicated `(security_id, segment)`
+    //    in `movers` survives `name_moves` and `rank_names` as two entries, so
+    //    the band can carry one name twice; without this test both copies are
+    //    pushed. The second copy then reaches `build_name_layout`, resolves
+    //    the SAME symbol, finds every one of its contracts already in `seen`,
+    //    assembles an EMPTY `name_instruments` — and still runs
+    //    `plan.chosen.push(name)`, burning one of six slots on a phantom that
+    //    subscribes nothing. Not reachable today (`instrument_lifecycle`'s
+    //    DEDUP keys make the movers join 1:1), which is exactly why it is
+    //    cheap to make unrepresentable now rather than after a query change.
     for name in &board.band {
-        if held.contains(&name.key()) && out.len() < DEPTH20_NAME_ENTRY_RANK {
+        if held.contains(&name.key())
+            && out.len() < DEPTH20_NAME_ENTRY_RANK
+            && !out.iter().any(|chosen| chosen.key() == name.key())
+        {
             out.push(*name);
         }
     }
@@ -739,8 +803,11 @@ pub fn choose_names(
 /// # Complexity
 ///
 /// O(1) EXEMPT: O(bucket) to group plus O(k log k) to order one underlying's
-/// strikes — at most a few hundred, called at most eight times a minute on the
-/// steering task.
+/// strikes — at most a few hundred. Called at most **14** times a minute on
+/// the steering task, not eight: [`build_name_layout`] calls it once per
+/// ITERATED name, and its own complexity section derives the 14 (2 index
+/// names plus the up-to-12 preference list [`choose_names`] can return).
+/// Corrected 2026-09-13 alongside the same stale figure there.
 #[must_use]
 pub fn strike_window(
     bucket: &[&DepthCandidate],
@@ -889,6 +956,46 @@ impl NameBoardPlan {
     }
 }
 
+/// One underlying's consensus spot — SKIPPED entirely when its bucket is empty.
+///
+/// [`strike_window`] genuinely needs a spot: it centres the window on the
+/// nearest strike, so the price cannot be deferred for a name that HAS
+/// strikes. But a name with no candidate rows at all has no strike pairs
+/// either, so `strike_window` returns an empty window whatever spot it is
+/// handed — while `crate::depth_rebalance::consensus_spot` would scan the
+/// WHOLE candidate slice (~22,000 rows, measured 2026-09-12) to reach that
+/// same answer.
+///
+/// **Behaviour-preserving by construction, not by inspection.** Two things
+/// make the guard safe rather than merely plausible: `NaN` and the true price
+/// produce the identical empty window when there are no pairs to centre on,
+/// and `consensus_spot`'s only side effect — the `tally.len() > 1`
+/// disagreement counter — cannot fire on a tally that would have stayed empty,
+/// because every row it tallies is one this bucket does not contain.
+///
+/// It does NOT lower the worst-case bound in [`build_name_layout`]: a name
+/// with rows but no resolvable PAIR still pays the scan. It removes the cost
+/// of the common unresolvable case — a mover the contract artifact carries no
+/// legs for at all, which is precisely the disagreement `names_unresolved`
+/// exists to count.
+fn spot_for_bucket(
+    candidates: &[DepthCandidate],
+    underlying: &str,
+    bucket: &[&DepthCandidate],
+) -> f64 {
+    if bucket.is_empty() {
+        return f64::NAN;
+    }
+    // CURRENT EXPIRY ONLY, matching `strike_window`'s own filter. `None` — a
+    // bucket where every row is missing an expiry — refuses nothing.
+    let nearest = bucket
+        .iter()
+        .filter(|c| c.expiry_micros > 0)
+        .map(|c| c.expiry_micros)
+        .min();
+    crate::depth_rebalance::consensus_spot(candidates, underlying, nearest).unwrap_or(f64::NAN)
+}
+
 /// Builds the depth-20 layout from the NAME board.
 ///
 /// The order of operations is the contract, and each step is where it is for a
@@ -913,13 +1020,36 @@ impl NameBoardPlan {
 ///
 /// # Complexity
 ///
-/// O(1) EXEMPT: ONE O(candidates) bucketing pass, then O(bucket) per chosen
-/// name — at most eight names. The `consensus_spot` call is O(candidates) and
-/// is made at most eight times, so the whole function is
-/// O(candidates × names) with `names <= 8` rather than the
-/// `O(movers × candidates)` ≈ 5M row-visit shape `atm_pair_for`'s docstring
-/// records for the legacy layout. Cold path, once a minute on the steering
-/// task.
+/// O(1) EXEMPT: ONE O(candidates) bucketing pass, then O(bucket) per name
+/// ITERATED, plus one O(candidates) `consensus_spot` scan per iterated name
+/// whose bucket is non-empty.
+///
+/// **The iterated-name bound is 14, not 8** — corrected 2026-09-13, where this
+/// paragraph said "at most eight" and understated its own worst case by
+/// 1.75×. Derived from the constants in this file rather than counted from
+/// the authorized board size:
+///
+/// * `DEPTH_20_INDEX_UNDERLYINGS.len()` = **2** index names, unconditional;
+/// * [`choose_names`] returns at most `DEPTH20_NAME_ENTRY_RANK` incumbents
+///   (step 1 is capped by `out.len() < DEPTH20_NAME_ENTRY_RANK`) followed by
+///   at most `DEPTH20_NAME_ENTRY_RANK` entry names, so `6 + 6 = ` **12**;
+/// * the loop's `break` fires on `plan.chosen.len() >= DEPTH20_NAME_ENTRY_RANK`
+///   — on names that RESOLVED. A name that does not resolve `continue`s, so
+///   the break caps the CHOSEN set at 6 and does not cap the iteration count
+///   at all. Twelve consecutive unresolvable names is twelve iterations.
+///
+/// `2 + 12 = 14`. The eight this paragraph used to claim was the number of
+/// names on a fully-resolved board (2 index + 6 stock), which is the BEST
+/// case, not the worst.
+///
+/// So the honest shape is O(candidates × iterated) with `iterated <= 14`,
+/// against the `O(movers × candidates)` ≈ 5M row-visit shape `atm_pair_for`'s
+/// docstring records for the legacy layout — still two orders of magnitude
+/// cheaper, which is why the correction changes the number and not the
+/// verdict. `spot_for_bucket` removes the scan for an iterated name with NO
+/// candidate rows, which is the common unresolvable case; it does not lower
+/// the 14, because a name with rows but no resolvable strike PAIR still pays
+/// it. Cold path, once a minute on the steering task.
 #[must_use]
 pub fn build_name_layout(
     candidates: &[DepthCandidate],
@@ -949,13 +1079,7 @@ pub fn build_name_layout(
             None => plan.futures_missing = plan.futures_missing.saturating_add(1),
         }
         let bucket = by_underlying.get(underlying).map_or(&[][..], Vec::as_slice);
-        let nearest = bucket
-            .iter()
-            .filter(|c| c.expiry_micros > 0)
-            .map(|c| c.expiry_micros)
-            .min();
-        let spot = crate::depth_rebalance::consensus_spot(candidates, underlying, nearest)
-            .unwrap_or(f64::NAN);
+        let spot = spot_for_bucket(candidates, underlying, bucket);
         // Fail-CLOSED on an underlying we cannot name a contract segment for,
         // and on one whose segment the vendor refuses depth on. Guessing
         // subscribes a well-formed request for the wrong instrument, which
@@ -1006,13 +1130,7 @@ pub fn build_name_layout(
             continue;
         };
         let bucket = by_underlying.get(symbol).map_or(&[][..], Vec::as_slice);
-        let nearest = bucket
-            .iter()
-            .filter(|c| c.expiry_micros > 0)
-            .map(|c| c.expiry_micros)
-            .min();
-        let spot =
-            crate::depth_rebalance::consensus_spot(candidates, symbol, nearest).unwrap_or(f64::NAN);
+        let spot = spot_for_bucket(candidates, symbol, bucket);
         let options = strike_window(
             bucket,
             spot,
@@ -1099,6 +1217,166 @@ pub fn build_name_layout(
         emitted = emitted.saturating_add(1);
     }
     plan
+}
+
+// ---------------------------------------------------------------------------
+// OBSERVABILITY (2026-09-13): the PRIMARY depth-20 engine was measured by
+// nothing at all.
+// ---------------------------------------------------------------------------
+//
+// Until this section, `grep -c 'metrics::'` over this module returned **0**.
+// Every outcome the board produces — how many names it chose, how many it
+// could not resolve, how many lost a future or a spot, how many swaps the
+// per-socket cap refused — existed ONLY inside the caller's `tracing::info!`,
+// which is a line an operator reads after something ELSE has already told
+// them to look.
+//
+// # Why absent is worse here than merely unmeasured
+//
+// The older `tv_depth20_ranked_*` series are incremented on the FALLBACK arm
+// alone (`depth20_ranked_steer::record_depth20_ranked_decision`). From the
+// minute this board takes over — ~09:07 daily, once the auction print gives
+// the movers query a row to rank — those series FREEZE at whatever the last
+// fallback minute wrote and never move again. A frozen counter and a counter
+// correctly reporting a quiet pool are the same two numbers on a dashboard,
+// so the handover does not merely stop producing signal: it converts the
+// signal that IS there into a lie. That is the false-OK class
+// `audit-findings-2026-04-17.md` Rule 11 forbids, and it is why the name
+// board needs its OWN series rather than a share of the ranked ones.
+//
+// # Why every label value is a `&'static str` literal
+//
+// A non-literal label value drops `metrics::counter!` to its allocating arm.
+// This repository has already paid for that once: `record_ws_lag` built a
+// label with `to_string()` and allocated roughly 36 million times an hour on
+// the path whose own docs called it allocation-free, and the fix
+// (`dhat_ws_lag.rs`) is a build-failing gate precisely because three correct
+// comments had not stopped it shipping. This is a once-a-minute steering
+// path, so an allocation here would be harmless — the literals are used
+// anyway, because the habit is what survives a function being moved.
+//
+// # Local `/metrics` ONLY — a decision, not an omission
+//
+// No EMF selector entry, no dashboard widget, no CloudWatch alarm. Each costs
+// real money against a budget whose 90% line fires an AUTOMATIC
+// `STOP_EC2_INSTANCES` on the trading box, and §2.3n of
+// `dhan-rest-only-noise-lock-2026-07-14.md` makes the next addition of any
+// size an OPERATOR decision that must arrive with a LEVER, never an
+// executor's cost note. So these series reach the local exporter and stop
+// there. They are the numbers an operator reads AFTER an existing page, and
+// nothing here claims they page anyone.
+
+/// Counter: one name-board planning minute, by outcome.
+///
+/// Every label is an EVENT count for the minute just planned, so a quiet
+/// minute increments by zero and the series stays dense rather than sparse.
+pub const DEPTH20_NAME_BOARD_COUNTER: &str = "tv_depth20_name_board_outcomes_total";
+
+/// Gauge: STOCK names the last planning minute actually placed.
+///
+/// A LEVEL, not an event — the size of the board as it now stands, which is
+/// the number a dashboard reads. Pre-registered at
+/// [`NOT_YET_RANKED`] (`-1`)
+/// rather than at zero, because zero is a REAL value here: it is the pre-09:07
+/// state where no equity has printed and
+/// [`NameBoardPlan::is_steerable`] is correctly false. Seeding at zero would
+/// make "the board has never planned" and "the board planned and placed
+/// nothing" the same reading, which is the distinction the whole series
+/// exists to carry.
+pub const DEPTH20_NAME_BOARD_CHOSEN_GAUGE: &str = "tv_depth20_name_board_names_chosen";
+
+/// Every `outcome` label [`DEPTH20_NAME_BOARD_COUNTER`] carries.
+///
+/// Six, and each has a DIFFERENT remedy — which is the only reason they are
+/// separate labels rather than one refusal count:
+///
+/// * `swaps_planned` — handed to the wire. The denominator for the rest.
+/// * `swaps_capped` — refused by the per-socket per-minute budget. Remedy:
+///   raise the cap or widen [`DEPTH20_NAME_EXIT_RANK`]. A standing non-zero
+///   count is the read-out the band's own docstring names as the thing that
+///   must move before that constant does.
+/// * `names_unresolved` — a preferred name had no symbol or no resolvable
+///   option ladder. Remedy: the contract artifact and the candle frames
+///   disagree about which stocks exist; neither cap nor band would help.
+/// * `index_unresolved` — NIFTY or BANKNIFTY had no window. This one alone
+///   makes the plan unsteerable, so a non-zero count explains a minute the
+///   caller fell back.
+/// * `futures_missing` — a name placed without its future slot. Costs ONE
+///   slot, never the name.
+/// * `spots_missing` — a stock name placed without its `NSE_EQ` spot slot.
+pub const DEPTH20_NAME_BOARD_OUTCOME_LABELS: [&str; 6] = [
+    "swaps_planned",
+    "swaps_capped",
+    "names_unresolved",
+    "index_unresolved",
+    "futures_missing",
+    "spots_missing",
+];
+
+/// Registers every name-board series before the first planning minute, so the
+/// CloudWatch agent's dropped-first-sample rule cannot swallow the first real
+/// event.
+///
+/// The counters seed at ZERO; the gauge seeds at [`NOT_YET_RANKED`], because
+/// zero is one of its real values. Said here rather than left to the reader,
+/// since "seeds everything at zero" would be the tidier sentence and the
+/// wrong one.
+///
+/// The agent computes a counter as the DELTA between consecutive samples and
+/// discards the first sample of a series it has never seen. A counter whose
+/// first increment IS the event therefore publishes nothing on the one day it
+/// matters — the shape that hid `tv_depth_rows_spilled_total` on 2026-08-28
+/// and left 104,540 depth rows permanently unclassifiable, and which
+/// `loss_series_seeding_guard.rs` now exists to forbid.
+///
+/// The gauge is deliberately NOT seeded at zero: see
+/// [`DEPTH20_NAME_BOARD_CHOSEN_GAUGE`].
+///
+/// Call once at boot, before the first planning minute.
+pub fn pre_register_name_board_counters() {
+    metrics::gauge!(DEPTH20_NAME_BOARD_CHOSEN_GAUGE).set(NOT_YET_RANKED);
+    for outcome in DEPTH20_NAME_BOARD_OUTCOME_LABELS {
+        metrics::counter!(DEPTH20_NAME_BOARD_COUNTER, "outcome" => outcome).increment(0);
+    }
+}
+
+/// Records one planning minute of the name board.
+///
+/// `swaps_planned` and `swaps_capped` are the CALLER's, not the plan's: this
+/// module ranks names and lays out sockets, and deliberately does not decide
+/// swaps (see the module header). They are taken as arguments rather than
+/// read off `plan` so that the whole minute lands in ONE place — a plan
+/// recorded here and a swap count recorded somewhere else would be two series
+/// that drift apart the first time one call site is added without the other.
+///
+/// **Total**: every arm is a widening `usize` → `u64` cast (`usize` is never
+/// wider than `u64` on any target this ships to), there is no indexing, no
+/// division and no unwrap, so an empty or default
+/// [`NameBoardPlan`] records six zeros and a zero gauge rather than panicking.
+/// That matters because this runs on the steering task under
+/// `panic = "abort"`: a recorder that can die takes the depth pool with it,
+/// and observability must never be able to break the thing it observes.
+pub fn record_name_board_plan(plan: &NameBoardPlan, swaps_planned: usize, swaps_capped: usize) {
+    metrics::gauge!(DEPTH20_NAME_BOARD_CHOSEN_GAUGE).set(plan.chosen.len() as f64);
+    // Six spelled-out calls rather than a loop over `(label, count)` pairs.
+    // A loop reads tidier and is WRONG here: the label value would then be a
+    // binding rather than a literal token at the macro site, which drops
+    // `metrics::counter!` to the arm that builds a `Vec<Label>` per call. The
+    // seeding loop above may do it because it runs once at boot; a per-minute
+    // recorder keeps the literals. (`record_ws_lag`'s ~36M allocations an hour
+    // came from exactly this distinction on a hotter path.)
+    metrics::counter!(DEPTH20_NAME_BOARD_COUNTER, "outcome" => "swaps_planned")
+        .increment(swaps_planned as u64);
+    metrics::counter!(DEPTH20_NAME_BOARD_COUNTER, "outcome" => "swaps_capped")
+        .increment(swaps_capped as u64);
+    metrics::counter!(DEPTH20_NAME_BOARD_COUNTER, "outcome" => "names_unresolved")
+        .increment(plan.names_unresolved as u64);
+    metrics::counter!(DEPTH20_NAME_BOARD_COUNTER, "outcome" => "index_unresolved")
+        .increment(plan.index_unresolved.len() as u64);
+    metrics::counter!(DEPTH20_NAME_BOARD_COUNTER, "outcome" => "futures_missing")
+        .increment(plan.futures_missing as u64);
+    metrics::counter!(DEPTH20_NAME_BOARD_COUNTER, "outcome" => "spots_missing")
+        .increment(plan.spots_missing as u64);
 }
 
 #[cfg(test)]
@@ -2146,5 +2424,142 @@ mod tests {
                 .any(|m| m.key() == (27, ExchangeSegment::NseEquity.binary_code())),
             "the incumbent must be recognised by the key the plan handed back"
         );
+    }
+
+    // ---- FIX 4: choose_names self-dedup ----
+
+    /// One name is ONE entry, however many movers rows produced it.
+    ///
+    /// A duplicated `(security_id, segment)` in `movers` survives
+    /// `name_moves` and `rank_names` as two independent entries, so the band
+    /// can carry the same name twice. Before the step-1 self-dedup, step 1
+    /// pushed BOTH copies; the second then reached `build_name_layout`,
+    /// resolved the same symbol, found every one of its contracts already in
+    /// `seen`, assembled an EMPTY instrument list — and still ran
+    /// `plan.chosen.push(name)`, spending one of six slots on a name that
+    /// subscribes nothing. Unreachable today because `instrument_lifecycle`'s
+    /// DEDUP keys make the movers join 1:1; pinned so a query change cannot
+    /// make it reachable silently.
+    #[test]
+    fn choose_names_never_lists_one_name_twice_from_a_duplicated_row() {
+        let ranked = rank_names(vec![n(7, 900), n(7, 900), n(8, 800)]);
+        let board = split_board(&ranked);
+        assert_eq!(board.band.len(), 3, "the duplicate reaches the band");
+
+        // HELD: the duplicate arrives through step 1, which had no dedup.
+        let held: std::collections::BTreeSet<(u64, u8)> =
+            [(7, EQ.binary_code())].into_iter().collect();
+        let chosen = choose_names(&board, &held);
+        assert_eq!(
+            chosen.iter().filter(|c| c.underlying_id == 7).count(),
+            1,
+            "the incumbent pass must not list one name twice"
+        );
+        assert_eq!(chosen.len(), 2, "and the phantom must not pad the list");
+        assert!(
+            chosen.iter().any(|c| c.underlying_id == 8),
+            "the genuine second name must still be reachable behind it"
+        );
+
+        // NOT held: the duplicate arrives through step 2, which always
+        // deduped. Asserted so the fix cannot be removed on the grounds that
+        // "the other pass covers it" — it covers only this half.
+        let chosen = choose_names(&board, &std::collections::BTreeSet::new());
+        assert_eq!(chosen.iter().filter(|c| c.underlying_id == 7).count(), 1);
+        assert_eq!(chosen.len(), 2);
+    }
+
+    // ---- FIX 1: the name board's own metrics ----
+
+    /// Every `outcome` label is distinct, and the names carry the house shape.
+    ///
+    /// A repeated label would silently merge two outcomes with DIFFERENT
+    /// remedies — `swaps_capped` says raise the cap, `names_unresolved` says
+    /// the contract artifact and the candle frames disagree and no cap change
+    /// would help — into one number an operator cannot act on.
+    #[test]
+    fn the_name_board_outcome_labels_are_distinct_and_the_names_are_house_shaped() {
+        let mut labels: Vec<&str> = DEPTH20_NAME_BOARD_OUTCOME_LABELS.to_vec();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(
+            labels.len(),
+            DEPTH20_NAME_BOARD_OUTCOME_LABELS.len(),
+            "a repeated outcome label merges two different remedies"
+        );
+
+        assert!(DEPTH20_NAME_BOARD_COUNTER.starts_with("tv_depth20_name_board_"));
+        assert!(
+            DEPTH20_NAME_BOARD_COUNTER.ends_with("_total"),
+            "a counter is _total; the suffix is what says it is monotonic"
+        );
+        assert!(DEPTH20_NAME_BOARD_CHOSEN_GAUGE.starts_with("tv_depth20_name_board_"));
+        assert!(
+            !DEPTH20_NAME_BOARD_CHOSEN_GAUGE.ends_with("_total"),
+            "the gauge is a LEVEL and must not wear the counter suffix"
+        );
+    }
+
+    /// The seeding call and the recorder are TOTAL.
+    ///
+    /// Both run on the steering task under `panic = "abort"`, so a recorder
+    /// that could index, divide or unwrap would take the whole depth pool down
+    /// with it — observability must never be able to break the thing it
+    /// observes. The empty-plan arm is not a contrived input: it is the
+    /// pre-09:07 shape, where ~750 equities have not printed and the board
+    /// legitimately places nothing.
+    #[test]
+    fn the_name_board_counters_seed_and_the_recorder_survives_an_empty_plan() {
+        pre_register_name_board_counters();
+        record_name_board_plan(&NameBoardPlan::default(), 0, 0);
+
+        // A default plan must genuinely be the zero case, or the line above
+        // proves nothing about the arms that read real counts.
+        let empty = NameBoardPlan::default();
+        assert!(empty.chosen.is_empty());
+        assert!(empty.index_unresolved.is_empty());
+        assert_eq!(
+            (
+                empty.names_unresolved,
+                empty.futures_missing,
+                empty.spots_missing
+            ),
+            (0, 0, 0)
+        );
+        assert!(!empty.is_steerable(), "and it is the unsteerable shape");
+    }
+
+    /// The recorder on a REAL plan, with an anti-vacuity gate.
+    ///
+    /// Written this way because the obvious version — build a plan, record it,
+    /// assert nothing panicked — passes just as happily against a fixture that
+    /// resolved nothing at all, which is the case the empty-plan test already
+    /// covers. The assertions below make this test measure the arms that carry
+    /// non-zero counts.
+    #[test]
+    fn record_name_board_plan_covers_a_plan_that_actually_placed_names() {
+        pre_register_name_board_counters();
+        let (candidates, movers, future_rows) = board_fixture();
+        let futures = future_index(&future_rows, 20_260_913);
+        let plan = build_name_layout(
+            &candidates,
+            &movers,
+            &futures,
+            &std::collections::BTreeSet::new(),
+        );
+        assert!(
+            plan.is_steerable(),
+            "the fixture must produce a steerable board, or this measures nothing"
+        );
+        assert_eq!(
+            plan.chosen.len(),
+            DEPTH20_NAME_ENTRY_RANK,
+            "a full board is the six the gauge is supposed to report"
+        );
+
+        // `swaps_planned`/`swaps_capped` are the caller's numbers, so they are
+        // exercised with a shape the wire can really produce: moving one name
+        // costs 24 swaps against the 20 a minute affords.
+        record_name_board_plan(&plan, 20, 4);
     }
 }

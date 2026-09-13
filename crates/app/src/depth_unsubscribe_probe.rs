@@ -133,7 +133,31 @@ impl ProbeArm {
 /// What one run concluded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeVerdict {
-    /// Frames STOPPED. The mechanism worked for this contract, this once.
+    /// Frames STOPPED, and the re-dial witness agreed with the arm.
+    ///
+    /// # Exactly what this asserts — and what it does NOT (2026-09-13)
+    ///
+    /// Read narrowly, because a support draft is written from this one word.
+    ///
+    /// * **Arm A** — the socket did NOT re-dial and the frames stopped. That
+    ///   is the vendor honouring `RequestCode` 25 for this contract, once.
+    /// * **Arm B** — the socket DID re-dial and the frames stopped. That is
+    ///   *"the stream stopped after a close"*. It is **NOT** *"a replayed set
+    ///   without the contract works"*, and it must never be quoted as the
+    ///   second thing.
+    ///
+    /// The Arm B narrowing is forced by the only witness available, not
+    /// chosen. [`dial_generation`] is bumped on `ConnEvent::DialSucceeded` —
+    /// when the SOCKET came back, one step BEFORE the subscribe replay is
+    /// even attempted. A socket that dialled and then failed its replay is
+    /// connected-and-blind: it delivers nothing, and it presents here as
+    /// byte-identical to a clean replay that correctly excluded the contract.
+    /// Nothing in this process can separate those two from the frames alone.
+    ///
+    /// The honest fix is therefore this doc rather than a new verdict: the
+    /// counter that would distinguish them is the supervisor's, this module
+    /// does not own that file, and a third verdict value would split a
+    /// two-value finding into three without making either of them truer.
     Honoured,
     /// Frames KEPT ARRIVING for a contract this process had dropped. For Arm
     /// A that is the vendor ignoring `RequestCode` 25; for Arm B it means the
@@ -349,14 +373,33 @@ pub async fn run_arm(socket: &mut RebalanceSocket, arm: ProbeArm) -> ProbeVerdic
     // contract stops the stream. An Arm B that left the guard alone re-dialed
     // straight back into the same subscription, so frames always resumed and
     // the shared mapping below returned `ignored` whatever the vendor did.
-    let acted = match arm {
+    //
+    // The action is split into the DROP and the CLOSE rather than chained,
+    // and the split is structural rather than stylistic (2026-09-13). The
+    // drop is the ONLY step that can leave this socket short, so it is the
+    // only step whose failure may return without restoring — and then only
+    // when its own answer proves the subscription set was never touched.
+    // Past the drop, every exit restores, with no branch left where it does
+    // not. Chained, Arm B could see the drop SUCCEED (guard emptied) and the
+    // close then fail, and the single `Err` return skipped the restore
+    // entirely: the depth-200 socket carried NOTHING for the rest of the
+    // session, with one `probe_close_refused` warn as the only evidence.
+    let dropped = match arm {
         ProbeArm::Unsubscribe => act_drop(socket, instrument, true).await,
-        ProbeArm::SocketClose => match act_drop(socket, instrument, false).await {
-            Ok(()) => act_socket_close(connection_index),
-            Err(verdict) => Err(verdict),
-        },
+        ProbeArm::SocketClose => act_drop(socket, instrument, false).await,
     };
-    if let Err(verdict) = acted {
+    if let Err(failure) = dropped {
+        if failure.needs_restore() {
+            restore(socket, instrument).await;
+        }
+        return finish(arm, connection_index, instrument, failure.verdict());
+    }
+
+    // ─── PAST THIS LINE THE GUARD IS EMPTY. EVERY EXIT RESTORES. ───
+    if arm == ProbeArm::SocketClose
+        && let Err(verdict) = act_socket_close(connection_index)
+    {
+        restore(socket, instrument).await;
         return finish(arm, connection_index, instrument, verdict);
     }
 
@@ -406,7 +449,73 @@ fn verdict_for(
         (ProbeArm::SocketClose, FrameWatch::Silent) if !redialled => {
             ProbeVerdict::InconclusiveNotRedialled
         }
+        // Silence, with the witness each arm needed. ⚠ For Arm B that witness
+        // is a completed DIAL and never a completed SUBSCRIBE: the generation
+        // bumps on `DialSucceeded` and the replay is attempted only after
+        // that, so a socket that came back and then failed its replay is
+        // blind and lands in this arm looking exactly like a clean replay
+        // that excluded the contract. See [`ProbeVerdict::Honoured`] — Arm
+        // B's verdict is narrowed to "the stream stopped after a close" for
+        // precisely this reason, and the emitted line says so too.
         (_, FrameWatch::Silent) => ProbeVerdict::Honoured,
+    }
+}
+
+/// What [`act_drop`] left behind when it did NOT succeed.
+///
+/// # Why a bare verdict was not enough (2026-09-13)
+///
+/// `try_send` succeeds the moment the command is QUEUED. From that instant
+/// the supervisor may drain it and truncate the guard, and nothing this task
+/// does afterwards takes that back. So a failure splits in two, and the split
+/// is what decides whether the caller may return without restoring:
+///
+/// | Failure | The subscription set | `socket.held` | Restore? |
+/// |---|---|---|---|
+/// | the channel would not take the command | untouched — never queued | honest | no |
+/// | [`ProbeUnsubscribeOutcome::Refused`] | untouched — the handler refused before the wire | honest | no |
+/// | [`ProbeUnsubscribeOutcome::WireFailed`] | untouched — the handler writes the WIRE first and the guard second, so a failed write leaves the set exactly as it was | honest | no |
+/// | the ack channel closed | **UNKNOWN** — the command may already have been drained | would LIE | **yes** |
+/// | the ack timed out | **UNKNOWN** — the command is still queued and WILL be drained | would LIE | **yes** |
+///
+/// **A refusal and a timeout are not the same fact, and this is the whole
+/// reason to say so.** A refusal is the supervisor positively declining; a
+/// timeout is the supervisor not having answered YET, on a command it still
+/// holds. Reporting both as one `InconclusiveWireFailed` had the caller
+/// return without restoring on a drop that then went through a second later —
+/// a depth-200 socket carrying nothing for the session, and a `held` naming a
+/// contract the wire no longer carries, which the next steering minute plans
+/// a swap from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropFailure {
+    /// The answer we got PROVES the subscription set was never touched, so
+    /// `socket.held` still names the contract truthfully and there is nothing
+    /// to put back.
+    GuardIntact(ProbeVerdict),
+    /// No answer came back, so whether the set was emptied is UNKNOWN.
+    ///
+    /// Treated as emptied in both directions that matter: `socket.held` is
+    /// cleared, because a `held` that lies is worse than one that is
+    /// conservatively empty; and the caller restores. A restore that turns
+    /// out to have been unnecessary is harmless — `try_extend`'s guard
+    /// "dedups a re-offer of anything it already holds, so re-offering can
+    /// never double-subscribe" (`ExtendOutcome`), and the channel is FIFO,
+    /// so a late-drained drop is always drained BEFORE the restore behind it.
+    GuardMaybeEmptied(ProbeVerdict),
+}
+
+impl DropFailure {
+    /// The verdict to record. The two variants differ in CLEANUP, never in
+    /// what the run concluded — both are the probe declining to answer.
+    const fn verdict(self) -> ProbeVerdict {
+        match self {
+            Self::GuardIntact(verdict) | Self::GuardMaybeEmptied(verdict) => verdict,
+        }
+    }
+
+    /// Whether the caller must put the contract back before it returns.
+    const fn needs_restore(self) -> bool {
+        matches!(self, Self::GuardMaybeEmptied(_))
     }
 }
 
@@ -419,11 +528,15 @@ fn verdict_for(
 /// is deliberate: the fail-closed "this socket must hold EXACTLY the named
 /// contract" check lives in the handler, and an arm with its own path would
 /// be an arm that could skip it.
+///
+/// `Err` carries a [`DropFailure`] rather than a bare verdict so the caller
+/// can tell CERTAINLY-NOT-DROPPED from POSSIBLY-DROPPED; see that type for
+/// why those two must not share an exit.
 async fn act_drop(
     socket: &mut RebalanceSocket,
     instrument: SubscribeInstrument,
     send_wire: bool,
-) -> Result<(), ProbeVerdict> {
+) -> Result<(), DropFailure> {
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
     if socket
         .tx
@@ -434,7 +547,11 @@ async fn act_drop(
         })
         .is_err()
     {
-        return Err(ProbeVerdict::InconclusiveWireFailed);
+        // The command never entered the channel, so it can never be drained
+        // and the subscription set is exactly what it was.
+        return Err(DropFailure::GuardIntact(
+            ProbeVerdict::InconclusiveWireFailed,
+        ));
     }
     // Bounded: the connection answers as soon as it drains the command, and a
     // task that cannot answer inside the wait is one whose verdict would be
@@ -448,9 +565,34 @@ async fn act_drop(
             socket.held = None;
             Ok(())
         }
-        Ok(Ok(ProbeUnsubscribeOutcome::Refused { .. })) => Err(ProbeVerdict::InconclusiveRefused),
-        Ok(Ok(ProbeUnsubscribeOutcome::WireFailed { .. })) | Ok(Err(_)) | Err(_) => {
-            Err(ProbeVerdict::InconclusiveWireFailed)
+        // POSITIVELY declined, before the wire and before the guard. Nothing
+        // moved; `held` is honest; there is nothing to restore.
+        Ok(Ok(ProbeUnsubscribeOutcome::Refused { .. })) => {
+            Err(DropFailure::GuardIntact(ProbeVerdict::InconclusiveRefused))
+        }
+        // The handler writes the WIRE first and the guard SECOND — it says so
+        // at the site, and this branch is what depends on it. A write that
+        // failed therefore left the set naming the instrument, the socket is
+        // still delivering it, and a restore here would be a subscribe for
+        // something already subscribed.
+        Ok(Ok(ProbeUnsubscribeOutcome::WireFailed { .. })) => Err(DropFailure::GuardIntact(
+            ProbeVerdict::InconclusiveWireFailed,
+        )),
+        // ⚠ NO ANSWER — and a non-answer is NOT a refusal.
+        //
+        // `Ok(Err(_))` is the ack sender dropped (the connection task is
+        // gone); `Err(_)` is the wait elapsing on a command the supervisor
+        // still holds and will drain. In both the drop may ALREADY have
+        // happened or may happen a moment from now, so `held` cannot keep
+        // naming the contract and the caller cannot return without restoring.
+        // Clearing `held` is the conservative direction: an empty `held`
+        // costs the next steering minute one re-subscribe, while a `held`
+        // that lies has it plan a swap the guard then refuses.
+        Ok(Err(_)) | Err(_) => {
+            socket.held = None;
+            Err(DropFailure::GuardMaybeEmptied(
+                ProbeVerdict::InconclusiveWireFailed,
+            ))
         }
     }
 }
@@ -482,7 +624,13 @@ fn act_socket_close(connection_index: u8) -> Result<(), ProbeVerdict> {
     }
 }
 
-/// Puts Arm A's contract back on the socket it was taken from.
+/// Puts the probed contract back on the socket it was taken from.
+///
+/// BOTH arms call this, and so does every failure path past the drop — once
+/// the subscription set may be empty, there is no exit that leaves it that
+/// way. Idempotent by construction: `try_extend`'s guard dedups a re-offer of
+/// anything it already holds, so a restore that turns out to have been
+/// unnecessary cannot double-subscribe (which is what would earn an 804).
 ///
 /// A failure here is LOUD and is not folded into the verdict: the measurement
 /// already happened, and what is at stake now is a depth-200 socket left
@@ -569,11 +717,16 @@ fn finish(
             segment = instrument.segment.as_str(),
             baseline_secs = PROBE_BASELINE_SECS,
             watch_secs = PROBE_WATCH_SECS,
-            "unsubscribe probe verdict, and it is quotable as it stands. The contract was \
-             demonstrably arriving during the baseline, so the watch result is admissible; \
-             and the connection's dial counter was compared across the window, so a \
-             re-dial cannot be hiding inside this answer — it would have produced an \
-             inconclusive verdict instead. No manual `ws_event_audit` check is needed."
+            "unsubscribe probe verdict. The contract was demonstrably arriving during the \
+             baseline, so the watch result is admissible; and the connection's dial counter \
+             was compared across the window, so a re-dial cannot be hiding inside this \
+             answer — it would have produced an inconclusive verdict instead. No manual \
+             `ws_event_audit` check is needed. ONE LIMIT, and quote the verdict within it: \
+             the dial counter witnesses a completed DIAL, never a completed SUBSCRIBE \
+             replay, so an `honoured` on the socket_close arm means THE STREAM STOPPED \
+             AFTER A CLOSE and NOT that a replayed set without the contract works — a \
+             socket that re-dialled and then failed its replay is blind and reads the same \
+             here. The unsubscribe arm is unaffected: it requires the counter UNCHANGED."
         );
     } else {
         info!(
@@ -656,6 +809,28 @@ pub const fn arm_enabled(cfg: &DepthUnsubscribeProbeConfig, arm: ProbeArm) -> bo
 //
 // A write that FAILS degrades to exactly today's behaviour — once per process
 // — and says so once. It never degrades to more.
+//
+// ⚠ THE RACE THIS LATCH DOES NOT CLOSE, named rather than implied (2026-09-13).
+//
+// The read and the write are separate syscalls with no `O_EXCL` and no lock,
+// so this is a plain check-then-act: TWO processes could each read "not spent"
+// before either writes, and both would then arm a probe on the same day. It is
+// a TOCTOU window, it is real, and nothing here narrows it.
+//
+// It is left open deliberately, because the thing that actually prevents two
+// tickvault processes from steering the same sockets is not a file — it is the
+// SSM named instance lock (`dual-instance-lock-2026-07-04.md`), acquired long
+// before any steering loop exists. A second process that reaches this code has
+// already defeated that lock, at which point a duplicated probe is the least of
+// what it is doing: it is also planning swaps against the same connections.
+// Inventing a second, weaker mutual-exclusion scheme here would suggest the
+// problem is handled at this layer when it is handled one layer up, and a
+// mechanism that looks like a lock without being one is the class of false-OK
+// this repository keeps retiring.
+//
+// What the latch IS for is the single-process case it does close completely:
+// the same unit restarting mid-day (a deploy, or the OOM loop of 2026-09-02)
+// and re-arming a probe that already spent its one shot.
 
 /// Directory the day latch lives in — the same cache directory the depth seed
 /// uses, so a wipe that clears one clears the other.
@@ -703,6 +878,14 @@ pub fn parse_day_latch(contents: &str) -> Option<u32> {
 /// O(1): one read of an 8-byte file, called once per process. An absent or
 /// unreadable file reads as NOT spent — the same direction `parse_day_latch`
 /// takes, and for the same reason.
+///
+/// ⚠ This read and [`mark_probe_ran_today`]'s write are separate syscalls
+/// with no `O_EXCL` and no lock, so two processes could each read "not spent"
+/// before either wrote. That TOCTOU window is real and is left open on
+/// purpose: what actually keeps two tickvault processes off the same sockets
+/// is the SSM named instance lock, one layer up, and a second mutual-exclusion
+/// scheme here would look like a lock without being one. The full argument is
+/// at the top of this section.
 ///
 /// Takes the latch PATH rather than deriving it, so a test can exercise the
 /// real read against a temporary file. Deriving it internally would force
@@ -903,7 +1086,20 @@ mod tests {
         // and what this pins is that a dead channel can never yield a verdict
         // a ticket could be written from.
         let outcome = act_drop(&mut s, si(1), true).await;
-        assert_eq!(outcome, Err(ProbeVerdict::InconclusiveWireFailed));
+        assert_eq!(
+            outcome,
+            Err(DropFailure::GuardIntact(
+                ProbeVerdict::InconclusiveWireFailed
+            )),
+            "the command never entered the channel, so the subscription set is provably \
+             untouched — classifying it as maybe-emptied would make the caller restore an \
+             instrument the socket never stopped carrying"
+        );
+        assert!(
+            !outcome
+                .expect_err("a dead channel cannot succeed")
+                .needs_restore()
+        );
         assert_eq!(
             s.held,
             Some(si(1)),
@@ -1100,6 +1296,325 @@ mod tests {
             ),
             other => panic!("expected a ProbeUnsubscribe command, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Restore discipline (2026-09-13)
+    // -----------------------------------------------------------------
+    //
+    // Two defects, one shape: a path that emptied a depth-200 socket's
+    // subscription set and then returned without putting the contract back.
+    // The socket delivers nothing for the rest of the session while still
+    // ponging, so every liveness signal reads healthy — the most expensive
+    // failure this module can cause, and neither arm reported it as one.
+
+    /// Consume the probe's pending first-packet stamp the way a real depth
+    /// frame does, so the BASELINE reads `Arrived` and the run is admissible.
+    ///
+    /// `at_nanos = 0` is deliberate: a receipt instant preceding the stamp is
+    /// refused as a MEASUREMENT but still CONSUMES the entry, and consumption
+    /// is exactly the "a frame arrived" fact the watch reads back.
+    fn resolve_watch(instrument: SubscribeInstrument) {
+        let _ = crate::depth_first_packet::global_depth_first_packet_tracker().observe_at(
+            instrument.security_id,
+            instrument.segment.binary_code(),
+            DepthFeedKind::TwoHundred,
+            0,
+        );
+    }
+
+    /// FIX 1 — Arm B must restore when the CLOSE fails after the drop already
+    /// emptied the guard.
+    ///
+    /// # The defect this pins
+    ///
+    /// The action used to be one chained expression: `act_drop(..).and_then(
+    /// act_socket_close)`, with a single `Err` return. So the drop could
+    /// SUCCEED — guard truncated, `held` cleared — and the close then fail,
+    /// and that one early return skipped the restore entirely. The depth-200
+    /// socket carried NOTHING for the rest of the session, with one
+    /// `probe_close_refused` warn as the only evidence anywhere.
+    ///
+    /// Both `request_probe_close` refusals are hard to reach in production,
+    /// which is precisely why this is pinned: latent-and-unreachable is how
+    /// this repository's worst defects have shipped.
+    #[tokio::test(start_paused = true)]
+    async fn arm_b_restores_the_contract_when_the_socket_close_is_refused() {
+        // `GHOST_REDIAL_SLOTS` is 32, so this index is past the register and
+        // `request_probe_close` answers `OutOfRange`. Chosen over
+        // `AlreadyArmed` on purpose: an out-of-range index touches no
+        // register at all, so this test cannot spend a real socket's one
+        // probe close and cannot leak that into another test.
+        const PAST_THE_REGISTER: u8 = 200;
+        let probed = si(6001);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut s = RebalanceSocket {
+            tx,
+            connection_index: PAST_THE_REGISTER,
+            held: Some(probed),
+            pending: None,
+        };
+
+        let responder = tokio::spawn(async move {
+            // The baseline stamp is armed synchronously before `run_arm`
+            // sleeps, so it exists by the time this task is first polled.
+            resolve_watch(probed);
+            let mut saw_drop = false;
+            let mut saw_restore = false;
+            while let Some(cmd) = rx.recv().await {
+                match cmd {
+                    LiveSubscriptionCommand::ProbeUnsubscribe { ack, .. } => {
+                        saw_drop = true;
+                        if let Some(ack) = ack {
+                            let _ = ack.send(ProbeUnsubscribeOutcome::Dropped);
+                        }
+                    }
+                    LiveSubscriptionCommand::Extend { ack, .. } => {
+                        saw_restore = true;
+                        if let Some(ack) = ack {
+                            let _ = ack.send(
+                                tickvault_core::websocket::pool_supervisor::ExtendOutcome::Held,
+                            );
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            (saw_drop, saw_restore)
+        });
+
+        let verdict = run_arm(&mut s, ProbeArm::SocketClose).await;
+        let (saw_drop, saw_restore) = responder.await.expect("the responder task panicked");
+
+        assert!(saw_drop, "the run never reached the drop");
+        assert!(
+            saw_restore,
+            "Arm B emptied the subscription set, failed its close, and returned WITHOUT \
+             queueing a restore — this depth-200 socket is dark for the session"
+        );
+        assert_eq!(
+            s.held,
+            Some(probed),
+            "the contract must be back on the socket the probe borrowed it from"
+        );
+        assert_eq!(
+            verdict,
+            ProbeVerdict::InconclusiveWireFailed,
+            "a close that never armed measures nothing and must never read as a verdict"
+        );
+    }
+
+    /// FIX 2 — a TIMED-OUT drop ack must restore, and must not leave `held`
+    /// naming a contract the wire may no longer carry.
+    ///
+    /// # Why a timeout is not a refusal
+    ///
+    /// `try_send` has ALREADY succeeded by the time this wait starts: the
+    /// supervisor holds the command and will drain it, truncating the guard,
+    /// whenever it gets there. So the wait elapsing says nothing about what
+    /// happened to the subscription set — unlike a `Refused`, which is the
+    /// supervisor positively declining. Folding both into one
+    /// `InconclusiveWireFailed` had the caller return without restoring on a
+    /// drop that then went through a second later.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_drop_ack_restores_the_contract_it_may_have_dropped() {
+        let probed = si(6002);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut s = RebalanceSocket {
+            tx,
+            connection_index: 14,
+            held: Some(probed),
+            pending: None,
+        };
+
+        let responder = tokio::spawn(async move {
+            resolve_watch(probed);
+            // HOLD the ack sender and never answer it. Holding rather than
+            // dropping it is what forces the TIMEOUT arm specifically — a
+            // dropped sender takes the `Ok(Err(_))` arm instead, which is the
+            // same classification by a different route.
+            let mut withheld_ack = None;
+            let mut saw_restore = false;
+            while let Some(cmd) = rx.recv().await {
+                match cmd {
+                    LiveSubscriptionCommand::ProbeUnsubscribe { ack, .. } => withheld_ack = ack,
+                    LiveSubscriptionCommand::Extend { ack, .. } => {
+                        saw_restore = true;
+                        if let Some(ack) = ack {
+                            let _ = ack.send(
+                                tickvault_core::websocket::pool_supervisor::ExtendOutcome::Held,
+                            );
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            drop(withheld_ack);
+            saw_restore
+        });
+
+        let verdict = run_arm(&mut s, ProbeArm::Unsubscribe).await;
+        let saw_restore = responder.await.expect("the responder task panicked");
+
+        assert!(
+            saw_restore,
+            "the drop may already have emptied the guard, so an unanswered ack must still \
+             queue a restore — returning here is how a socket goes dark"
+        );
+        assert_eq!(
+            s.held,
+            Some(probed),
+            "the restore was answered, so believed-held must name the contract again"
+        );
+        assert_eq!(verdict, ProbeVerdict::InconclusiveWireFailed);
+    }
+
+    /// The same timeout, one level down: `act_drop` itself must clear
+    /// believed-held and DEMAND a restore.
+    ///
+    /// A `held` that keeps naming a contract the socket may no longer carry
+    /// is worse than one that is conservatively empty: the next steering
+    /// minute plans a swap FROM it, and the guard refuses that swap.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_drop_clears_believed_held_and_demands_a_restore() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut s = RebalanceSocket {
+            tx,
+            connection_index: 15,
+            held: Some(si(6003)),
+            pending: None,
+        };
+        let responder = tokio::spawn(async move {
+            let cmd = rx
+                .recv()
+                .await
+                .expect("the drop command must reach the supervisor");
+            // Outlive the probe's wait, then let the ack go — a supervisor
+            // that answers LATE, which is the whole point.
+            tokio::time::sleep(Duration::from_secs(ACK_WAIT_SECS * 4)).await;
+            drop(cmd);
+        });
+
+        let outcome = act_drop(&mut s, si(6003), true).await;
+        responder.await.expect("the responder task panicked");
+
+        assert_eq!(
+            outcome,
+            Err(DropFailure::GuardMaybeEmptied(
+                ProbeVerdict::InconclusiveWireFailed
+            )),
+            "an unanswered ack leaves the subscription set UNKNOWN, never known-intact"
+        );
+        assert!(
+            outcome
+                .expect_err("a withheld ack cannot succeed")
+                .needs_restore(),
+            "a maybe-emptied guard must demand a restore from its caller"
+        );
+        assert_eq!(
+            s.held, None,
+            "believed-held must not keep naming a contract the wire may already have dropped"
+        );
+    }
+
+    /// The discrimination, from the other side: a POSITIVE refusal is
+    /// known-intact and must NOT trigger a restore.
+    ///
+    /// Restoring here would subscribe an instrument the socket never stopped
+    /// carrying. It would not corrupt anything — the guard dedups a re-offer
+    /// — but it would spend a wire round trip to undo something that never
+    /// happened, and it would blur the one distinction this type exists for.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_drop_leaves_believed_held_alone_and_needs_no_restore() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut s = RebalanceSocket {
+            tx,
+            connection_index: 16,
+            held: Some(si(6004)),
+            pending: None,
+        };
+        let responder = tokio::spawn(async move {
+            match rx.recv().await.expect("the drop command must arrive") {
+                LiveSubscriptionCommand::ProbeUnsubscribe { ack, .. } => {
+                    if let Some(ack) = ack {
+                        let _ = ack.send(ProbeUnsubscribeOutcome::Refused {
+                            reason: ProbeUnsubscribeOutcome::REASON_DIFFERENT_INSTRUMENT,
+                        });
+                    }
+                }
+                other => panic!("expected a ProbeUnsubscribe command, got {other:?}"),
+            }
+        });
+
+        let outcome = act_drop(&mut s, si(6004), true).await;
+        responder.await.expect("the responder task panicked");
+
+        assert_eq!(
+            outcome,
+            Err(DropFailure::GuardIntact(ProbeVerdict::InconclusiveRefused))
+        );
+        assert!(
+            !outcome
+                .expect_err("a refusal cannot succeed")
+                .needs_restore()
+        );
+        assert_eq!(
+            s.held,
+            Some(si(6004)),
+            "the handler refused before the wire and before the guard — nothing to put back"
+        );
+    }
+
+    /// `WireFailed` is known-intact too, and that rests on ONE property of
+    /// the handler: it writes the WIRE first and the guard SECOND.
+    ///
+    /// Its own comment says so ("WIRE FIRST, GUARD SECOND — the opposite
+    /// order from `try_swap`"), and this branch is what depends on it. If
+    /// that ordering ever inverts, the classification here becomes wrong in
+    /// the expensive direction — a socket left dark with no restore — so the
+    /// dependency is written down here rather than assumed.
+    #[tokio::test(start_paused = true)]
+    async fn a_wire_failed_drop_leaves_believed_held_alone_because_the_wire_goes_first() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut s = RebalanceSocket {
+            tx,
+            connection_index: 17,
+            held: Some(si(6005)),
+            pending: None,
+        };
+        let responder = tokio::spawn(async move {
+            match rx.recv().await.expect("the drop command must arrive") {
+                LiveSubscriptionCommand::ProbeUnsubscribe { ack, .. } => {
+                    if let Some(ack) = ack {
+                        let _ = ack.send(ProbeUnsubscribeOutcome::WireFailed { timed_out: true });
+                    }
+                }
+                other => panic!("expected a ProbeUnsubscribe command, got {other:?}"),
+            }
+        });
+
+        let outcome = act_drop(&mut s, si(6005), true).await;
+        responder.await.expect("the responder task panicked");
+
+        assert_eq!(
+            outcome,
+            Err(DropFailure::GuardIntact(
+                ProbeVerdict::InconclusiveWireFailed
+            )),
+            "the handler answered, and its answer proves the guard was never touched"
+        );
+        assert!(
+            !outcome
+                .expect_err("a wire failure cannot succeed")
+                .needs_restore()
+        );
+        assert_eq!(
+            s.held,
+            Some(si(6005)),
+            "the socket still carries the instrument, so believed-held is already honest"
+        );
     }
 
     /// A scratch latch path unique to this test binary, so the suite never
