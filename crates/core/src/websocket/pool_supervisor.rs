@@ -505,6 +505,53 @@ pub const SUBSCRIBE_DISPATCH_FAILED_METRIC: &str = "tv_dhan_ws_subscribe_dispatc
 /// than assumed — the arithmetic above is a bound, this is the measurement.
 pub const SUBSCRIBE_DISPATCH_MS_METRIC: &str = "tv_dhan_ws_subscribe_dispatch_ms";
 
+/// Histogram: wall-clock milliseconds from `BeginDial` to `DialSucceeded` on
+/// this connection. Labels: `endpoint`.
+///
+/// # Why this exists
+///
+/// [`RECONNECT_METRIC`] counts how MANY times a socket re-dialed and has never
+/// been able to say how LONG any of them took. Both events already reach
+/// `on_event` carrying the caller's own `now: Instant`, so this costs one
+/// stored timestamp and adds no clock read.
+///
+/// Local `/metrics` only, deliberately: an EMF name is ~$0.30/mo against a
+/// September forecast that already sits above the automatic
+/// `STOP_EC2_INSTANCES` line, and the noise lock requires a LEVER rather than
+/// a cost note. This is a number to read AFTER an existing page.
+pub const DIAL_MS_METRIC: &str = "tv_dhan_ws_dial_ms";
+
+/// Histogram: wall-clock milliseconds from `BeginDial` to the FIRST frame that
+/// arrives on the new socket. Labels: `endpoint`.
+///
+/// # Why this is the number that matters, and why it is not the one above
+///
+/// [`DIAL_MS_METRIC`] stops when the transport is up. This one stops when data
+/// actually flows again, so it spans the subscribe dispatch AND Dhan's
+/// no-snapshot-on-subscribe dark period — a freshly subscribed instrument is
+/// BLANK until its book next changes. That is the real blind window of a
+/// reconnect, and nothing in this workspace has ever measured it.
+///
+/// Recorded ONCE per dial, on the first-frame transition only, so it is never
+/// per-frame work on a path that sees every frame.
+pub const RECONNECT_RECOVERY_MS_METRIC: &str = "tv_dhan_ws_reconnect_recovery_ms";
+
+/// Histogram: wall-clock milliseconds ONE leg of a depth swap spent on the
+/// wire. Labels: `endpoint`, `leg` (`unsubscribe` | `subscribe`).
+///
+/// # Why a ceiling was never a measurement
+///
+/// [`SWAP_WIRE_BUDGET`] is a one-second `timeout` per side. It bounds the leg;
+/// it says nothing about how long the leg actually took, and the depth
+/// first-packet module says so in its own header. Recorded on BOTH outcomes —
+/// a leg that ELAPSED its budget is the most interesting sample there is, and
+/// recording only the `Ok` path would report a healthy median while every slow
+/// swap vanished.
+///
+/// At most 20 depth-20 swaps plus 5 depth-200 swaps a minute, so this is cold.
+/// Local `/metrics` only, for the budget reason on [`DIAL_MS_METRIC`].
+pub const SWAP_WIRE_MS_METRIC: &str = "tv_dhan_ws_swap_wire_ms";
+
 /// Counter: instruments the guard REFUSED to put on the wire because the
 /// connection would then have carried the same one twice. Labels: `endpoint`,
 /// `site` (`new` | `extend` | `swap`).
@@ -1313,6 +1360,16 @@ pub struct ConnectionSupervisor {
     /// connection then re-dialled instantly, forever. `healthy_since` answers
     /// the question that actually matters: *for how long* did it carry frames.
     healthy_since: Option<Instant>,
+    /// When the CURRENT dial began. Set on `BeginDial`, READ on `DialSucceeded`,
+    /// and TAKEN on the first frame.
+    ///
+    /// Two measurements share one timestamp because they are two ends of the
+    /// same question. `DialSucceeded` reads it and leaves it in place for the
+    /// transport time; the first frame takes it for the true recovery time.
+    /// Taking it there is what stops a second frame re-recording, and
+    /// `BeginDial` overwriting it is what keeps a failed dial from leaking into
+    /// the next attempt.
+    dial_started_at: Option<Instant>,
     /// Monotonic timestamps of recent re-dials, newest overwriting oldest.
     ///
     /// A fixed inline array, never a `Vec`: this is written on the disconnect
@@ -1354,6 +1411,7 @@ impl ConnectionSupervisor {
             last_frame_at: now,
             proven_healthy: false,
             healthy_since: None,
+            dial_started_at: None,
             redial_history: [None; FLAP_HISTORY_SLOTS],
             redial_cursor: 0,
             frames: 0,
@@ -1450,6 +1508,7 @@ impl ConnectionSupervisor {
                 self.phase = ConnPhase::Dialing;
                 self.proven_healthy = false;
                 self.healthy_since = None;
+                self.dial_started_at = Some(now);
                 // Reset here, not on dial completion: the watchdog must also
                 // cover a dial that hangs forever without ever completing.
                 self.watchdog.record_activity(now);
@@ -1459,6 +1518,14 @@ impl ConnectionSupervisor {
 
             ConnEvent::DialSucceeded => {
                 self.phase = ConnPhase::Subscribing;
+                // READ, never taken: the first frame still needs this stamp for
+                // the recovery measurement. Once per dial, so the label lookup
+                // is cold — this is not the per-tick path `record_ws_lag` had
+                // to pre-resolve handles for.
+                if let Some(started) = self.dial_started_at {
+                    metrics::histogram!(DIAL_MS_METRIC, "endpoint" => self.slot.endpoint.as_str())
+                        .record(now.saturating_duration_since(started).as_secs_f64() * 1000.0);
+                }
                 self.watchdog.record_activity(now);
                 self.last_frame_at = now;
                 // The ONE place a completed dial is recorded, so the
@@ -1499,6 +1566,16 @@ impl ConnectionSupervisor {
                 if !self.proven_healthy {
                     self.proven_healthy = true;
                     self.attempt = 0;
+                    // The true blind window: dial -> subscribe dispatch -> Dhan
+                    // applying it -> the book next changing. TAKEN, so a second
+                    // frame cannot record a second sample for one dial.
+                    if let Some(started) = self.dial_started_at.take() {
+                        metrics::histogram!(
+                            RECONNECT_RECOVERY_MS_METRIC,
+                            "endpoint" => self.slot.endpoint.as_str()
+                        )
+                        .record(now.saturating_duration_since(started).as_secs_f64() * 1000.0);
+                    }
                     // Start the health clock at the FIRST frame. The attempt
                     // reset above is retained for compatibility with the
                     // ladder's own semantics, but it no longer implies an
@@ -4747,6 +4824,10 @@ where
                             // AFTER a successful unsubscribe means it holds nothing.
                             // Only the second is worth tearing the socket down for.
                             let mut unsubscribe_succeeded = false;
+                            // Declared OUTSIDE the `if let` so the record below,
+                            // which must run on every arm including the timeout,
+                            // can still read it.
+                            let unsub_started = tokio::time::Instant::now();
                             if let Some(drop_this) = swap.unsubscribe {
                                 match tokio::time::timeout(
                                     SWAP_WIRE_BUDGET,
@@ -4873,13 +4954,30 @@ where
                                     }
                                 }
                             }
+                            if swap.unsubscribe.is_some() {
+                                metrics::histogram!(
+                                    SWAP_WIRE_MS_METRIC,
+                                    "endpoint" => supervisor.slot().endpoint.as_str(),
+                                    "leg" => "unsubscribe",
+                                )
+                                .record(unsub_started.elapsed().as_secs_f64() * 1000.0);
+                            }
                             if !wire_failed && let Some(add_this) = swap.subscribe {
-                                match tokio::time::timeout(
+                                let sub_started = tokio::time::Instant::now();
+                                let sub_outcome = tokio::time::timeout(
                                     SWAP_WIRE_BUDGET,
                                     socket.send_subscribe(&[add_this]),
                                 )
-                                .await
-                                {
+                                .await;
+                                // Recorded before the match so an elapsed budget
+                                // is sampled too — see `SWAP_WIRE_MS_METRIC`.
+                                metrics::histogram!(
+                                    SWAP_WIRE_MS_METRIC,
+                                    "endpoint" => supervisor.slot().endpoint.as_str(),
+                                    "leg" => "subscribe",
+                                )
+                                .record(sub_started.elapsed().as_secs_f64() * 1000.0);
+                                match sub_outcome {
                                     Ok(Ok(())) => {}
                                     Ok(Err(_)) => wire_failed = true,
                                     Err(_elapsed) => {
@@ -11267,6 +11365,193 @@ mod tests {
              carries nothing. Were the branch to leave the guard holding the \
              instrument, the replay would re-subscribe it and Arm B would be \
              measuring our own replay rather than the vendor"
+        );
+    }
+
+    // ---- reconnect + swap latency (2026-09-13) ---------------------------
+    //
+    // The operator asked for two numbers that did not exist: how long a socket
+    // takes to come back, and how long a resubscribe spends on the wire. Both
+    // were BOUNDED and neither was MEASURED — `SWAP_WIRE_BUDGET` is a timeout,
+    // and `RECONNECT_METRIC` counts re-dials without ever timing one.
+
+    /// The metric names are the operator-facing surface; pin them.
+    #[test]
+    fn the_three_latency_metric_names_are_pinned() {
+        assert_eq!(DIAL_MS_METRIC, "tv_dhan_ws_dial_ms");
+        assert_eq!(
+            RECONNECT_RECOVERY_MS_METRIC,
+            "tv_dhan_ws_reconnect_recovery_ms"
+        );
+        assert_eq!(SWAP_WIRE_MS_METRIC, "tv_dhan_ws_swap_wire_ms");
+        // `observability.rs` buckets on a `_ms` SUFFIX. A rename that drops it
+        // silently re-buckets these into the default (seconds) ladder, where a
+        // 300 ms dial lands in the first bucket forever.
+        for name in [
+            DIAL_MS_METRIC,
+            RECONNECT_RECOVERY_MS_METRIC,
+            SWAP_WIRE_MS_METRIC,
+        ] {
+            assert!(
+                name.ends_with("_ms"),
+                "{name} must keep the _ms suffix the histogram bucketing keys on"
+            );
+        }
+    }
+
+    /// A dial that completes and then delivers records BOTH numbers, and the
+    /// second frame records nothing more.
+    #[test]
+    fn a_dial_records_transport_time_then_recovery_time_once() {
+        let start = Instant::now();
+        let mut conn = sup(DhanEndpointType::MainFeed, 0, start);
+
+        assert!(
+            conn.dial_started_at.is_none(),
+            "an idle supervisor has no dial in flight"
+        );
+
+        conn.on_event(ConnEvent::BeginDial, start);
+        let stamped = conn
+            .dial_started_at
+            .expect("BeginDial must stamp the dial start");
+        assert_eq!(stamped, start);
+
+        // DialSucceeded READS the stamp — it must not consume it, or the
+        // recovery measurement below has nothing left to measure from.
+        conn.on_event(ConnEvent::DialSucceeded, start + Duration::from_millis(120));
+        assert_eq!(
+            conn.dial_started_at,
+            Some(start),
+            "the transport-time record must not take the stamp the recovery record needs"
+        );
+
+        // First frame TAKES it.
+        conn.on_event(ConnEvent::FrameReceived, start + Duration::from_millis(900));
+        assert!(
+            conn.dial_started_at.is_none(),
+            "the first frame must consume the stamp so a second frame cannot record again"
+        );
+
+        // Second frame: nothing left to record.
+        conn.on_event(ConnEvent::FrameReceived, start + Duration::from_millis(950));
+        assert!(conn.dial_started_at.is_none());
+    }
+
+    /// A re-dial must not measure from the PREVIOUS dial. Without the
+    /// overwrite in `BeginDial` a failed dial leaks its stamp forward and the
+    /// next socket reports a recovery time that includes the failure.
+    #[test]
+    fn a_redial_measures_from_its_own_begin_not_the_failed_one() {
+        let start = Instant::now();
+        let mut conn = sup(DhanEndpointType::MainFeed, 0, start);
+
+        conn.on_event(ConnEvent::BeginDial, start);
+        assert_eq!(conn.dial_started_at, Some(start));
+
+        // That dial fails — the stamp is still the old one.
+        conn.on_event(ConnEvent::DialFailed, start + Duration::from_millis(200));
+
+        let second = start + Duration::from_secs(5);
+        conn.on_event(ConnEvent::BeginDial, second);
+        assert_eq!(
+            conn.dial_started_at,
+            Some(second),
+            "a fresh dial must re-stamp, or its recovery time carries the failed attempt"
+        );
+    }
+
+    /// Placement, not existence. Each of these is a way the measurement could
+    /// be present and wrong.
+    #[test]
+    fn the_latency_records_sit_where_they_measure_the_right_thing() {
+        let src = include_str!("pool_supervisor.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src
+            .split_once(&format!("\n{test_marker}"))
+            .map_or(src, |(head, _)| head);
+
+        // Non-vacuity: the scan must be looking at real production text.
+        assert!(
+            production.contains("ConnEvent::BeginDial => {"),
+            "the production slice is empty or mis-cut — every assertion below would pass vacuously"
+        );
+
+        // The recovery record must be INSIDE the first-frame transition. On the
+        // per-frame arm unguarded it would allocate a label set for every frame
+        // of the session, which is the `record_ws_lag` defect (~36M
+        // allocations/hour) arriving in a second place.
+        let first_frame = production
+            .split_once("if !self.proven_healthy {")
+            .expect("the first-frame transition must exist")
+            .1;
+        let (first_frame_block, _) = first_frame
+            .split_once("\n                }")
+            .expect("the first-frame block must close");
+        assert!(
+            first_frame_block.contains(stringify!(RECONNECT_RECOVERY_MS_METRIC)),
+            "the recovery record must sit inside the first-frame transition, never on the \
+             per-frame arm"
+        );
+        assert!(
+            first_frame_block.contains("self.dial_started_at.take()"),
+            "it must TAKE the stamp — reading it would record one sample per frame"
+        );
+
+        // Both swap legs, and the unsubscribe one OUTSIDE its `if let`, so a
+        // leg that ELAPSES its budget is still sampled. Recording only the Ok
+        // path reports a healthy median while every slow swap vanishes.
+        // Count the LEGS, not the symbol: the symbol also appears in a doc
+        // comment, and a count that includes prose lets a deleted leg hide
+        // behind an added sentence.
+        for leg in ["\"leg\" => \"unsubscribe\",", "\"leg\" => \"subscribe\","] {
+            assert_eq!(
+                production.matches(leg).count(),
+                1,
+                "exactly one {leg} emit — a missing leg makes the histogram half-blind, and a \
+                 duplicated one double-counts every swap"
+            );
+        }
+        let hoist = production
+            .find("let unsub_started = tokio::time::Instant::now();")
+            .expect("the unsubscribe stamp must exist");
+        let if_let = production
+            .find("if let Some(drop_this) = swap.unsubscribe {")
+            .expect("the unsubscribe leg must exist");
+        assert!(
+            hoist < if_let,
+            "the unsubscribe stamp must be taken BEFORE the `if let`, or the record cannot run \
+             on the timeout arm"
+        );
+    }
+
+    /// Bite-proof for the scan above: the markers it keys on are real, and a
+    /// guard that can never fail is worse than no guard because it also
+    /// certifies the case is covered.
+    #[test]
+    fn latency_guard_self_test() {
+        let src = include_str!("pool_supervisor.rs");
+        for marker in [
+            "ConnEvent::BeginDial => {",
+            "if !self.proven_healthy {",
+            "self.dial_started_at.take()",
+            "if let Some(drop_this) = swap.unsubscribe {",
+            "let unsub_started = tokio::time::Instant::now();",
+        ] {
+            assert!(
+                src.contains(marker),
+                "guard marker {marker:?} no longer appears — the scan above would pass vacuously"
+            );
+        }
+        // And the assertion messages must not themselves satisfy the scan.
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src
+            .split_once(&format!("\n{test_marker}"))
+            .map_or(src, |(head, _)| head);
+        assert!(
+            production.len() < src.len(),
+            "the production cut must actually remove the test module, or this file's own \
+             assertion text counts as production source"
         );
     }
 }
