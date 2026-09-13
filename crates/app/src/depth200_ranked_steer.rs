@@ -42,8 +42,16 @@
 //!
 //! # Complexity
 //!
-//! O(sockets × ranked) with both bounded at five: at most 25 key compares a
-//! minute, allocation-bounded by [`DEPTH_200_SOCKET_BUDGET`]. Cold path.
+//! O(sockets × ranked): sockets is [`DEPTH_200_SOCKET_BUDGET`] (5) and `ranked`
+//! is the PUBLISHED list, which is the exit set [`DEPTH200_EXIT_UNDERLYINGS`]
+//! (20) — so at most ~125 key compares a minute. Cold path.
+//!
+//! ⚠ CORRECTED 2026-09-13: this read "with both bounded at five: at most 25 key
+//! compares a minute". Only the SOCKET side is five. The ranked side became 20
+//! when `DEPTH200_HYSTERESIS_RANKS` widened 3 → 15 on 2026-09-11, because the
+//! planner reads the whole published band and not just the entry set.
+//! Understated 5x, in the reassuring direction. Still trivially cold — the
+//! correction is to the CLAIM, not to any cost worth acting on.
 
 use crate::depth200_atm::{PlannedSwap, SwitchReason};
 use crate::depth200_candidates::{DEPTH_200_SOCKET_BUDGET, Depth200Candidate};

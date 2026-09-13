@@ -374,3 +374,130 @@ fn every_offload_writer_is_joined_and_labelled_at_shutdown() {
         );
     }
 }
+
+/// The top-volume join is BOUNDED by the deadline, not merely gated on it once.
+///
+/// `JoinHandle::join` has no timeout. Until 2026-09-13 this function tested
+/// `Instant::now() >= deadline` ONCE at entry and then called a bare `join()`,
+/// with a comment that stated the hang hazard verbatim and did it anyway.
+///
+/// A point-in-time check only refuses to START waiting once the budget is
+/// already spent. Enter one millisecond before the deadline with a writer
+/// wedged on a hung socket and it waits forever — and this is the LAST of three
+/// joins against one shared budget, so it routinely enters with almost nothing
+/// left, which is exactly the window where the old test passed and then blocked.
+///
+/// Pinned by ORDER rather than by banning a spelling: the poll loop must come
+/// before the join, so the join only ever runs on a thread that has already
+/// exited. Banning the old spelling would also ban the comment that explains
+/// what was fixed — the lesson the sibling guard above records.
+#[test]
+fn the_top_volume_join_is_bounded_by_the_shared_deadline() {
+    let lane = production_region(&read_src("src/dhan_feed_stack.rs"));
+
+    const FN: &str = "pub fn shutdown_top_volume_writer(&mut self, deadline: std::time::Instant) {";
+    const POLL: &str = "while !handle.is_finished() && std::time::Instant::now() < deadline {";
+    const JOIN: &str = "if handle.join().is_err() {";
+
+    // SLICED to this one function, not searched across the file.
+    //
+    // The first draft counted POLL across the whole production half and
+    // `rfind`-ed it. Both were wrong: the loop legitimately appears THREE times
+    // (here plus two `shutdown_rescue_writer` impls), so the count assertion
+    // failed against correct code, and `rfind` landed on a SIBLING — it would
+    // then have "proved" the ordering of a function this test does not name.
+    // That is the found-the-wrong-occurrence bug this same file already records
+    // once, hit again in the guard written to avoid it.
+    assert_eq!(
+        lane.matches(FN).count(),
+        1,
+        "expected exactly one definition of `shutdown_top_volume_writer` in the \
+         production half — this guard slices on it, so a second definition would \
+         make the slice ambiguous"
+    );
+    let body = {
+        let from = lane.find(FN).expect("counted above");
+        let rest = &lane[from + FN.len()..];
+        // Bounded at the next method, so the slice can never run on into a
+        // sibling's body and borrow its poll loop.
+        let to = rest.find("\n    pub fn ").unwrap_or(rest.len());
+        &rest[..to]
+    };
+
+    let poll_at = body.find(POLL).unwrap_or_else(|| {
+        panic!(
+            "`shutdown_top_volume_writer` must POLL `is_finished()` to the \
+             deadline. A single `Instant::now() >= deadline` test at entry is \
+             NOT a bound — it only refuses to start waiting once the budget is \
+             already spent, and this is the LAST of three joins against one \
+             shared budget"
+        )
+    });
+    let join_at = body
+        .find(JOIN)
+        .expect("the top-volume shutdown must still join the handle");
+
+    assert!(
+        poll_at < join_at,
+        "`shutdown_top_volume_writer` must POLL `is_finished()` to the deadline \
+         BEFORE it joins. Joining first — or gating on a single \
+         `Instant::now() >= deadline` test and then joining — leaves an \
+         unbounded wait on a wedged writer, which hangs the box's shutdown \
+         until systemd SIGKILLs it and kills the two sibling writers' final \
+         flushes with it"
+    );
+}
+
+/// The ranking daily-reset fires ONLY on a real IST midnight crossing.
+///
+/// `ranking_day` starts at 0, so the first 30-second tick of every drain enters
+/// the `ranking_day != today` branch. The `!= 0` sentinel silenced the LOG —
+/// correctly, no midnight was crossed — while the reset sat OUTSIDE it and ran
+/// anyway, wiping the leaderboard, `PrevCloseStore` and `SpotPriceStore` thirty
+/// seconds into every session.
+///
+/// Harmless at the 08:30 boot (the stores are empty at 08:30:30 and the code-6
+/// PrevClose burst arrives with the 09:00 connect). On a MID-SESSION restart the
+/// burst lands within seconds of connect, this wiped it, and code-6 is one-shot
+/// per subscribe — so every gainer verdict read `Unknown` for the rest of the
+/// day, the filter published an empty board, and both depth pools held their
+/// boot dial. The only detector is a log-sink-only latch.
+///
+/// The discriminator is ORDER, because both the correct and the broken form
+/// contain all three statements — only their sequence differs.
+#[test]
+fn the_ranking_daily_reset_fires_only_on_a_real_midnight_crossing() {
+    let lane = production_region(&read_src("src/dhan_feed_stack.rs"));
+
+    const GUARD: &str = "if ranking_day != 0 {";
+    const RESET: &str = "ingest.reset_ranking_daily();";
+    const ADOPT: &str = "ranking_day = today;";
+
+    for (needle, what) in [
+        (GUARD, "the midnight-crossing guard"),
+        (RESET, "the ranking reset call"),
+        (ADOPT, "the day adoption"),
+    ] {
+        assert_eq!(
+            lane.matches(needle).count(),
+            1,
+            "expected exactly one {what} (`{needle}`) in the production half. A \
+             different count means this guard is anchored on the wrong \
+             occurrence and its ordering assertions below prove nothing"
+        );
+    }
+
+    let guard_at = lane.find(GUARD).expect("counted above");
+    let reset_at = lane.find(RESET).expect("counted above");
+    let adopt_at = lane.find(ADOPT).expect("counted above");
+
+    assert!(
+        guard_at < reset_at && reset_at < adopt_at,
+        "`reset_ranking_daily()` must sit INSIDE the `ranking_day != 0` block, \
+         before `ranking_day = today;`. Outside it, the reset runs on the first \
+         30-second tick of every drain and destroys the one-shot code-6 \
+         PrevClose burst on any mid-session restart — leaving every gainer \
+         verdict Unknown and both depth pools frozen on their boot dial for the \
+         rest of the session"
+    );
+}
