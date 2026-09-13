@@ -4289,9 +4289,16 @@ mod tests {
     // Persistence helpers — mock QuestDB /exec (real code paths)
     // ======================================================================
 
-    const MOCK_HTTP_200: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
-    const MOCK_HTTP_500: &str =
-        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 13\r\n\r\n{\"error\":\"x\"}";
+    // `Connection: close` is load-bearing, not decoration. `ensure_ticks_table`
+    // drives TWO DDL statements through ONE `reqwest::Client`, and reqwest pools
+    // the socket between them. This mock answers, then DROPS the stream — so
+    // without the header reqwest reuses a connection the mock has already closed
+    // and the second statement can fail, flipping the verdict to false. It is the
+    // pattern every other mock responder in this workspace already carries
+    // (stats.rs, board.rs, quote.rs, notification/service.rs, ip_monitor.rs).
+    const MOCK_HTTP_200: &str =
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+    const MOCK_HTTP_500: &str = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"error\":\"x\"}";
 
     async fn spawn_mock_http(response: &'static str) -> u16 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
