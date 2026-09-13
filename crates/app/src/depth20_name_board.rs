@@ -58,6 +58,11 @@
 //! them out is what makes every function here a pure function with a real test.
 
 use tickvault_common::types::ExchangeSegment;
+use tickvault_core::websocket::pool_supervisor::SubscribeInstrument;
+
+use crate::depth_rebalance::MoverRow;
+use crate::dhan_contract_universe::ContractRow;
+use crate::dhan_depth_universe::DepthCandidate;
 
 /// How many STOCK underlyings enter the board.
 ///
@@ -399,6 +404,702 @@ const _: () = assert!(
     DEPTH20_NAME_EXIT_RANK > DEPTH20_NAME_ENTRY_RANK,
     "the keep band must be wider than the entry set"
 );
+
+/// Appends one instrument to a socket, if the socket has room and no earlier
+/// socket already claimed it.
+///
+/// Private and taking `seen` by argument rather than being a closure over it:
+/// a closure capturing `seen` mutably cannot coexist with the `&mut plan`
+/// borrows around it, and threading the set through is what keeps ONE running
+/// claim set across the whole layout instead of a per-socket one.
+fn claim_instrument(
+    out: &mut Vec<SubscribeInstrument>,
+    instrument: SubscribeInstrument,
+    seen: &mut std::collections::HashSet<(u64, u8)>,
+) {
+    if out.len() < DEPTH20_PER_SOCKET
+        && instrument.security_id > 0
+        && seen.insert((instrument.security_id, instrument.segment.binary_code()))
+    {
+        out.push(instrument);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// THE WIRING (2026-09-13): from a ranked list of NAMES to a depth-20 LAYOUT.
+// ---------------------------------------------------------------------------
+//
+// Everything above this line ranks names and answers hysteresis questions. It
+// had ZERO production call sites for two days — the skeleton-PR shape
+// `audit-findings-2026-04-17.md` Rule 14 forbids — because nothing turned a
+// name into the contracts a socket can carry. This section is that turn.
+//
+// # Why it emits a [`Depth20Layout`] rather than its own plan type
+//
+// `depth20_track::plan_depth20_minute` already carries the discipline this
+// board needs and must not re-derive: content-based socket pairing (never
+// positional, because `plan_pool` re-shards), paired departures/arrivals so a
+// connection can never exceed its 50, plan-wide dedup so one instrument is
+// never subscribed twice (Dhan answers a duplicate with an 804, which is
+// Fatal), and a deterministic order so a swap the guard refuses once is not
+// refused forever. Reimplementing any of that to carry a different struct
+// would be a second copy of the hardest code in this pool.
+//
+// # The socket shape, and why it is 2 + 3 rather than one name per socket
+//
+// Two index sockets whole, then the stock names FLAT-CHUNKED across the
+// remaining three. The scope lock's 2026-09-11 (FOURTH) section refuses
+// socket-affinity in as many words — *"a name confined to one socket draws on
+// one 4-swap budget while a freely-packed name draws on several"* — so a name
+// deliberately spills across a chunk boundary. The index halves are kept whole
+// because that is also what the legacy layout does, which is what makes the
+// overlap pairing unambiguous at the handover minute.
+
+/// Sockets the stock names are packed across: the pool's five, less the two
+/// the index names hold whole.
+pub const DEPTH20_NAME_STOCK_SOCKETS: usize = 3;
+
+/// The stock half must fit the sockets it is packed into, or the chunking
+/// hands a connection more than it can carry and the excess dies as a
+/// `channel_full` refusal nobody reads.
+const _: () = assert!(
+    DEPTH20_NAME_ENTRY_RANK * slots_for_stock_name(DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE)
+        <= DEPTH20_NAME_STOCK_SOCKETS * DEPTH20_PER_SOCKET,
+    "the six stock names must fit three depth-20 sockets: 144 of 150 at ±5"
+);
+
+/// The board's two index names hold one socket each, so exactly two are
+/// authorized. Asserted rather than assumed because [`board_slot_cost`]
+/// multiplies by a literal 2.
+const _: () = assert!(
+    crate::depth20_layout::DEPTH_20_INDEX_UNDERLYINGS.len() + DEPTH20_NAME_STOCK_SOCKETS
+        == crate::depth20_layout::DEPTH_20_SOCKETS,
+    "two index sockets plus three stock sockets is the depth-20 pool"
+);
+
+/// The absolute move of one underlying, from a MOVERS ROW's percentage.
+///
+/// # ⚠ This is a SUBSTITUTION, and it is not the same source as [`move_bps`]
+///
+/// [`move_bps`] takes a live spot and a live previous close — the pair the
+/// frame drain holds in `SpotPriceStore` and `PrevCloseStore`, and the pair
+/// the drain's own gainer verdict is computed from. **That pair is not
+/// reachable here.** `PrevCloseStore` is owned `&mut` by the drain; the
+/// steering loop has no handle to it and cannot be given one without moving it
+/// behind a lock on the hot path.
+///
+/// What the steering loop does have is [`MoverRow::pct_change`], which is
+/// `close_pct_from_prev_day` read from QuestDB — the LATEST sealed `candles_1m`
+/// row for the underlying, or, before the first candle seals at ~09:16, a
+/// tick-derived pre-open ranking (`build_preopen_movers_query`). So it answers
+/// the same QUESTION from a different source with a different freshness:
+///
+/// | | drain's gainer verdict | this |
+/// |---|---|---|
+/// | spot | last tick, in RAM | last SEALED minute (or a pre-open tick) |
+/// | previous close | `PrevCloseStore`, in RAM | the candle's own column |
+/// | lag | ~0 | up to one minute, plus the query |
+/// | fails when | a price is missing | QuestDB is unreachable |
+///
+/// A minute of lag on a board that is re-planned once a minute is inside the
+/// cadence, so the substitution is defensible — but it is a substitution, and
+/// the two must never be described as one number. Recorded here rather than in
+/// a commit message because the next reader will otherwise find `move_bps` and
+/// this function side by side and assume they share an input.
+///
+/// # Why the float stops here
+///
+/// The 2026-09-07 lock bans a float in the sort key, and the ban is a defect
+/// record rather than a preference: a comparator that can return `NaN` is
+/// non-transitive and `sort_unstable_by` corrupts the slice WHOLESALE. So the
+/// `f64` is converted, gated and discarded at this boundary; nothing downstream
+/// of this function sees one. The band is [`move_bps`]'s own — same ceiling,
+/// same floor, same gate-the-SIGNED-value-before-the-abs order, because a
+/// corrupt previous close reaching the board through the candle column is the
+/// same rank-1 poisoning as one reaching it through the drain.
+#[must_use]
+pub fn move_bps_from_pct(pct_change: f64) -> Option<i64> {
+    if !pct_change.is_finite() {
+        return None;
+    }
+    let scaled = (pct_change * 100.0).round();
+    // Bound in FLOAT, against literals, so the cast below cannot truncate.
+    // Deliberately far wider than the plausibility band: this guard is about
+    // the CAST being exact, and the band below is about the number being a
+    // price move. Conflating them would hide which one refused.
+    if !(-1.0e6..=1.0e6).contains(&scaled) {
+        return None;
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "bounded to ±1e6 on the line above, and .round() made it integral"
+    )]
+    let signed_bps = scaled as i64;
+    // Gate the SIGNED move BEFORE the abs — see MIN_PLAUSIBLE_MOVE_BPS. After
+    // the abs the sign that decides which bound applies is gone, and a -99.99%
+    // corrupt row would pass a ceiling of +100,000 and take rank 1.
+    if !(MIN_PLAUSIBLE_MOVE_BPS..=MAX_PLAUSIBLE_MOVE_BPS).contains(&signed_bps) {
+        return None;
+    }
+    Some(if DEPTH20_RANK_ABSOLUTE_MOVE {
+        signed_bps.abs()
+    } else {
+        signed_bps
+    })
+}
+
+/// Every rankable name in a movers slice, unranked.
+///
+/// A row whose move is not rankable is DROPPED, never carried at zero — the
+/// whole point of [`move_bps_from_pct`] returning `Option`. Dropping is what
+/// keeps an unpriced name out of the board instead of tying it with a
+/// genuinely flat one.
+///
+/// # Complexity
+///
+/// O(1) EXEMPT: O(movers), bounded by the movers query's own `LATEST ON`
+/// partition over the ~210 live F&O underlyings. Once a minute, steering task.
+#[must_use]
+pub fn name_moves(movers: &[MoverRow]) -> Vec<NameMove> {
+    movers
+        .iter()
+        .filter(|row| row.security_id > 0)
+        .filter_map(|row| {
+            Some(NameMove {
+                underlying_id: row.security_id,
+                segment: row.segment,
+                move_bps: move_bps_from_pct(row.pct_change)?,
+            })
+        })
+        .collect()
+}
+
+/// Each underlying's nearest non-expired FUTURE, keyed by upper-cased symbol.
+///
+/// The board gives every name one future slot ([`slots_for_index_name`]'s
+/// leading `1 +`). The contract artifact is the only authorized source: the
+/// option chain carries no futures at all, and a hardcoded contract id expires
+/// — the scope lock's standing REJECT.
+///
+/// Nearest expiry wins; the LOWEST id breaks a tie. Ties need a rule for the
+/// same reason every other grouping here has one: the artifact carries no
+/// `ORDER BY`, so last-write-wins would let two minutes of identical input
+/// choose different contracts and swap the socket back and forth all session
+/// while every counter read healthy.
+///
+/// A BSE future is refused by [`derivative_segment`] and an unsupported
+/// segment by [`segment_supports_depth`] — SENSEX can never have a depth book,
+/// so a SENSEX future here would be a socket that dies on connect.
+///
+/// # Complexity
+///
+/// O(1) EXEMPT: O(rows) over the day's contract artifact (~22,000 legs), of
+/// which the class filter keeps the ~1,300 futures. Built ONCE per session by
+/// the caller — the artifact is a daily file and `today_ymd` is fixed for the
+/// session, so a per-minute rebuild would answer the same question 375 times.
+#[must_use]
+pub fn future_index(
+    rows: &[ContractRow],
+    today_ymd: u32,
+) -> std::collections::HashMap<String, SubscribeInstrument> {
+    let mut best: std::collections::HashMap<String, (u32, u64, ExchangeSegment)> =
+        std::collections::HashMap::new();
+    for row in rows {
+        if !matches!(row.c.as_str(), "FUTSTK" | "FUTIDX") {
+            continue;
+        }
+        // `>=` keeps expiry DAY itself, which is a trading day.
+        if row.e < today_ymd || row.i == 0 {
+            continue;
+        }
+        let Some(segment) = crate::dhan_contract_universe::derivative_segment(&row.x) else {
+            continue;
+        };
+        if !crate::dhan_depth_universe::segment_supports_depth(segment) {
+            continue;
+        }
+        let key = row.u.trim().to_ascii_uppercase();
+        if key.is_empty() {
+            continue;
+        }
+        match best.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut held) => {
+                if (row.e, row.i) < (held.get().0, held.get().1) {
+                    held.insert((row.e, row.i, segment));
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert((row.e, row.i, segment));
+            }
+        }
+    }
+    best.into_iter()
+        .map(|(symbol, (_, security_id, segment))| {
+            (
+                symbol,
+                SubscribeInstrument {
+                    security_id,
+                    segment,
+                },
+            )
+        })
+        .collect()
+}
+
+/// The names this minute WANTS, in preference order — the hysteresis applied.
+///
+/// # Why this exists as its own function
+///
+/// [`NameBoard::keeps`] and [`NameBoard::admits`] are questions; nothing was
+/// asking them. A band that is computed and then ignored is worse than no
+/// band, because the swap counters then report controlled churn while the
+/// board re-orders freely underneath — so the exit rank has to govern the
+/// CHOICE of names, which is here, and not merely be available to a caller
+/// that might consult it.
+///
+/// # ⚠ The tail is ENTRY-SET names only, and that is a real limit
+///
+/// The list is a PREFERENCE, not the answer: it is up to
+/// [`DEPTH20_NAME_ENTRY_RANK`] incumbents followed by the entry set as
+/// fallbacks, and the caller takes the first [`DEPTH20_NAME_ENTRY_RANK`] that
+/// actually resolve to contracts. The tail exists so an INCUMBENT whose ladder
+/// is missing this minute does not leave its slots empty when an entry-set
+/// name could have them.
+///
+/// It does NOT extend past the entry set, so with no incumbents there is no
+/// tail at all: if one of the top six cannot be resolved, the board carries
+/// FIVE names and the sixth's slots stay empty for the minute. That is
+/// deliberate — a band name may be KEPT and never PLACED, so promoting rank 7
+/// into the hole would be the one route by which a name outside the top six
+/// reaches a socket, and it would arrive through the error path rather than
+/// through the ranking. `plan_depth20_minute` leaves an empty desired socket
+/// completely alone, so the wire keeps what it has rather than being stripped
+/// on the strength of a missing chain. Pinned by
+/// `an_unresolvable_entry_name_leaves_its_slots_empty_rather_than_promoting_a_band_name`,
+/// which was first written asserting the opposite and caught.
+///
+/// `held` is what the board CHOSE last minute, not what the wire acked. The
+/// two differ while a swap is in flight — moving one name costs 24 swaps
+/// against a budget of 20 a minute — and choosing from the wire would let a
+/// name the board is still placing read as "not held" and be re-contested
+/// every minute until it landed.
+///
+/// # Complexity
+///
+/// O(1) EXEMPT: O(EXIT_RANK²) = at most 144 key compares — `DEPTH20_NAME_EXIT_RANK`
+/// is 12 and a linear scan of twelve entries costs less than the `HashSet`
+/// that would replace it. Once a minute, steering task.
+#[must_use]
+pub fn choose_names(
+    board: &NameBoard,
+    held: &std::collections::BTreeSet<(u64, u8)>,
+) -> Vec<NameMove> {
+    let mut out: Vec<NameMove> = Vec::with_capacity(DEPTH20_NAME_EXIT_RANK);
+    // 1. INCUMBENTS still inside the band, strongest first. This is the
+    //    hysteresis: a name that entered at rank 6 keeps its slots at rank 11.
+    for name in &board.band {
+        if held.contains(&name.key()) && out.len() < DEPTH20_NAME_ENTRY_RANK {
+            out.push(*name);
+        }
+    }
+    // 2. Then the ENTRY set — for the slots the incumbents left, and as the
+    //    fallback for an incumbent whose ladder does not resolve. A band-only
+    //    name is deliberately absent: it may be KEPT, never PLACED.
+    for name in &board.entry {
+        if !out.iter().any(|held_name| held_name.key() == name.key()) {
+            out.push(*name);
+        }
+    }
+    out
+}
+
+/// One name's ±`each_side` strike window, both legs, ascending by strike.
+///
+/// `bucket` is the candidate rows for ONE underlying — the decorate-index the
+/// caller builds in a single pass, which is what keeps this off the
+/// `O(movers × candidates)` shape `atm_pair_for`'s docstring records.
+///
+/// Everything refused is refused for the same reasons the chain view refuses
+/// it, and each refusal costs a strike rather than inventing one:
+///
+/// * rows outside the underlying's NEAREST expiry — a far-month contract at a
+///   strike chosen from this month's spot quotes almost nothing, and nothing
+///   downstream can tell that subscription from a real one;
+/// * a strike carrying only one leg — the pair is the unit, and a stranded leg
+///   means two sockets reading different books;
+/// * a strike whose two legs share one id — malformed, and honouring it spends
+///   two authorized slots on one instrument;
+/// * a non-positive contract id — instrument 0 is a well-formed subscription
+///   that returns silence forever and looks healthy.
+///
+/// It never PADS. A window short on one side is normal near the edge of a
+/// freshly-listed expiry, and a strike that does not exist cannot be
+/// subscribed.
+///
+/// # Complexity
+///
+/// O(1) EXEMPT: O(bucket) to group plus O(k log k) to order one underlying's
+/// strikes — at most a few hundred, called at most eight times a minute on the
+/// steering task.
+#[must_use]
+pub fn strike_window(
+    bucket: &[&DepthCandidate],
+    spot: f64,
+    each_side: usize,
+    segment: ExchangeSegment,
+) -> Vec<SubscribeInstrument> {
+    if !spot.is_finite() || spot <= 0.0 {
+        return Vec::new();
+    }
+    let Some(spot_paise) = crate::depth_rebalance::strike_paise(spot) else {
+        return Vec::new();
+    };
+    // CURRENT EXPIRY ONLY. `None` — every row missing an expiry — refuses
+    // nothing on that basis, matching `is_nearest_expiry`.
+    let nearest = bucket
+        .iter()
+        .filter(|c| c.expiry_micros > 0)
+        .map(|c| c.expiry_micros)
+        .min();
+    let mut legs: std::collections::HashMap<i64, (Option<i64>, Option<i64>)> =
+        std::collections::HashMap::new();
+    for candidate in bucket {
+        if let Some(expiry) = nearest
+            && candidate.expiry_micros != expiry
+        {
+            continue;
+        }
+        if candidate.contract_security_id <= 0 {
+            continue;
+        }
+        let Some(paise) = crate::depth_rebalance::strike_paise(candidate.strike) else {
+            continue;
+        };
+        let slot = legs.entry(paise).or_insert((None, None));
+        // LOWEST id wins a contested leg, never the last row seen — the query
+        // carries no `ORDER BY`, so last-wins makes the answer depend on
+        // arrival order and the socket flips between two ids all session.
+        match candidate.leg.as_str() {
+            "CE" => {
+                slot.0 = Some(slot.0.map_or(candidate.contract_security_id, |had| {
+                    had.min(candidate.contract_security_id)
+                }));
+            }
+            "PE" => {
+                slot.1 = Some(slot.1.map_or(candidate.contract_security_id, |had| {
+                    had.min(candidate.contract_security_id)
+                }));
+            }
+            _ => {}
+        }
+    }
+    let mut pairs: Vec<(i64, i64, i64)> = legs
+        .iter()
+        .filter_map(|(paise, (ce, pe))| {
+            let (ce, pe) = ((*ce)?, (*pe)?);
+            // One contract cannot be both legs of its own strike.
+            if ce == pe {
+                return None;
+            }
+            Some((*paise, ce, pe))
+        })
+        .collect();
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+    pairs.sort_unstable_by_key(|(paise, _, _)| *paise);
+    // The centre: nearest strike to spot, ties to the LOWER strike. `<` rather
+    // than `<=` over an ascending list is what makes the tie deterministic, so
+    // an exact midpoint does not flip the window between two strikes on
+    // alternating minutes.
+    let mut centre = 0usize;
+    let mut best = i64::MAX;
+    for (index, (paise, _, _)) in pairs.iter().enumerate() {
+        let distance = (paise - spot_paise).abs();
+        if distance < best {
+            best = distance;
+            centre = index;
+        }
+    }
+    let lo = centre.saturating_sub(each_side);
+    let hi = centre
+        .saturating_add(each_side)
+        .min(pairs.len().saturating_sub(1));
+    let mut out = Vec::with_capacity((hi - lo + 1) * 2);
+    for (_, ce, pe) in &pairs[lo..=hi] {
+        for id in [*ce, *pe] {
+            if let Ok(security_id) = u64::try_from(id)
+                && security_id > 0
+            {
+                out.push(SubscribeInstrument {
+                    security_id,
+                    segment,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// What the name board decided this minute, and everything it could not place.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NameBoardPlan {
+    /// The five depth-20 sockets, in dial order: NIFTY, BANKNIFTY, then the
+    /// stock names flat-chunked across three.
+    pub layout: crate::depth20_layout::Depth20Layout,
+    /// The STOCK names that actually took slots, in rank order. The caller
+    /// carries this into the next minute as `held` — see [`choose_names`].
+    pub chosen: Vec<NameMove>,
+    /// Index underlyings whose window could not be resolved this minute.
+    pub index_unresolved: Vec<String>,
+    /// Preferred names whose option window could not be resolved.
+    pub names_unresolved: usize,
+    /// Names — index or stock — with no nearest-expiry future in the artifact.
+    pub futures_missing: usize,
+    /// Stock names whose `NSE_EQ` spot slot was refused.
+    pub spots_missing: usize,
+}
+
+impl NameBoardPlan {
+    /// Whether this plan may STEER, or whether the caller must fall back.
+    ///
+    /// Both conditions are load-bearing and neither is redundant:
+    ///
+    /// * **Both index windows resolved.** NIFTY and BANKNIFTY are
+    ///   unconditional under the 2026-09-11 lock, so a plan missing one is not
+    ///   the authorized board — and steering on it would strip a working index
+    ///   socket on the strength of a chain that did not publish this minute.
+    /// * **At least one stock name placed.** With none, this is the legacy
+    ///   index layout at a different width: it would displace the seed hold
+    ///   and the volume ranking for no gain, in exactly the pre-09:07 window
+    ///   where ~750 equities have not printed at all.
+    ///
+    /// Failing either is the NORMAL pre-open state, not a fault. The caller
+    /// keeps the engine it already had.
+    #[must_use]
+    pub fn is_steerable(&self) -> bool {
+        self.index_unresolved.is_empty() && !self.chosen.is_empty()
+    }
+
+    /// The chosen stock names as I-P1-11 composite keys, for the next minute's
+    /// hysteresis.
+    #[must_use]
+    pub fn chosen_keys(&self) -> std::collections::BTreeSet<(u64, u8)> {
+        self.chosen.iter().map(NameMove::key).collect()
+    }
+}
+
+/// Builds the depth-20 layout from the NAME board.
+///
+/// The order of operations is the contract, and each step is where it is for a
+/// reason a later reader should not have to rediscover:
+///
+/// 1. **Index names first, unconditionally.** NIFTY and BANKNIFTY are never
+///    ranked and can never be displaced by a mover, so they claim their
+///    instruments before any stock is considered — a stock that somehow shared
+///    a contract id could then only lose it, never take it.
+/// 2. **Then the hysteresis choice**, so an incumbent is preferred over a
+///    higher-ranked newcomer.
+/// 3. **Then resolution**, taking names until [`DEPTH20_NAME_ENTRY_RANK`]
+///    RESOLVE — a name that cannot be resolved consumes no slot.
+///
+/// # Deduplication
+///
+/// One running set across the WHOLE layout, index sockets included. A
+/// duplicate across two sockets spends two of the 250 authorized slots on one
+/// book; a duplicate WITHIN one socket is worse, because both copies go out in
+/// the same batch and Dhan answers a duplicate subscribe with an 804, which is
+/// Fatal — the connection drops and does not come back this session.
+///
+/// # Complexity
+///
+/// O(1) EXEMPT: ONE O(candidates) bucketing pass, then O(bucket) per chosen
+/// name — at most eight names. The `consensus_spot` call is O(candidates) and
+/// is made at most eight times, so the whole function is
+/// O(candidates × names) with `names <= 8` rather than the
+/// `O(movers × candidates)` ≈ 5M row-visit shape `atm_pair_for`'s docstring
+/// records for the legacy layout. Cold path, once a minute on the steering
+/// task.
+#[must_use]
+pub fn build_name_layout(
+    candidates: &[DepthCandidate],
+    movers: &[MoverRow],
+    futures: &std::collections::HashMap<String, SubscribeInstrument>,
+    held: &std::collections::BTreeSet<(u64, u8)>,
+) -> NameBoardPlan {
+    let mut plan = NameBoardPlan::default();
+    let mut seen: std::collections::HashSet<(u64, u8)> = std::collections::HashSet::new();
+
+    // The decorate-index: ONE pass, so no later step scans the whole slice
+    // per name.
+    let mut by_underlying: std::collections::HashMap<&str, Vec<&DepthCandidate>> =
+        std::collections::HashMap::new();
+    for candidate in candidates {
+        by_underlying
+            .entry(candidate.underlying.as_str())
+            .or_default()
+            .push(candidate);
+    }
+
+    // ---- 1. the two index names, whole sockets, unconditional ----
+    for underlying in crate::depth20_layout::DEPTH_20_INDEX_UNDERLYINGS {
+        let mut instruments: Vec<SubscribeInstrument> = Vec::with_capacity(DEPTH20_PER_SOCKET);
+        match futures.get(underlying) {
+            Some(future) => claim_instrument(&mut instruments, *future, &mut seen),
+            None => plan.futures_missing = plan.futures_missing.saturating_add(1),
+        }
+        let bucket = by_underlying.get(underlying).map_or(&[][..], Vec::as_slice);
+        let nearest = bucket
+            .iter()
+            .filter(|c| c.expiry_micros > 0)
+            .map(|c| c.expiry_micros)
+            .min();
+        let spot = crate::depth_rebalance::consensus_spot(candidates, underlying, nearest)
+            .unwrap_or(f64::NAN);
+        // Fail-CLOSED on an underlying we cannot name a contract segment for,
+        // and on one whose segment the vendor refuses depth on. Guessing
+        // subscribes a well-formed request for the wrong instrument, which
+        // comes back as silence — indistinguishable from a quiet book.
+        let options = crate::dhan_depth_universe::contract_segment_for_underlying(underlying)
+            .filter(|segment| crate::dhan_depth_universe::segment_supports_depth(*segment))
+            .map_or_else(Vec::new, |segment| {
+                strike_window(bucket, spot, DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE, segment)
+            });
+        if options.is_empty() {
+            plan.index_unresolved.push((*underlying).to_owned());
+        }
+        for instrument in options {
+            claim_instrument(&mut instruments, instrument, &mut seen);
+        }
+        // An index socket is emitted EVEN WHEN EMPTY: its POSITION is its
+        // identity, and declining to emit it would slide a stock chunk into
+        // index position, so the tracker would diff a stock ladder against
+        // BANKNIFTY's held set and swap the whole socket.
+        plan.layout
+            .sockets
+            .push(crate::depth20_layout::Depth20Socket {
+                underlying: Some((*underlying).to_owned()),
+                instruments,
+            });
+    }
+
+    // ---- 2. the ranked stock names, with the band applied to the CHOICE ----
+    let ranked = rank_names(name_moves(movers));
+    let board = split_board(&ranked);
+    let mut symbol_of: std::collections::HashMap<(u64, u8), &str> =
+        std::collections::HashMap::new();
+    for row in movers {
+        symbol_of.insert(
+            (row.security_id, row.segment.binary_code()),
+            row.symbol.as_str(),
+        );
+    }
+
+    let mut stock_instruments: Vec<SubscribeInstrument> =
+        Vec::with_capacity(DEPTH20_NAME_STOCK_SOCKETS * DEPTH20_PER_SOCKET);
+    for name in choose_names(&board, held) {
+        if plan.chosen.len() >= DEPTH20_NAME_ENTRY_RANK {
+            break;
+        }
+        let Some(symbol) = symbol_of.get(&name.key()).copied() else {
+            plan.names_unresolved = plan.names_unresolved.saturating_add(1);
+            continue;
+        };
+        let bucket = by_underlying.get(symbol).map_or(&[][..], Vec::as_slice);
+        let nearest = bucket
+            .iter()
+            .filter(|c| c.expiry_micros > 0)
+            .map(|c| c.expiry_micros)
+            .min();
+        let spot =
+            crate::depth_rebalance::consensus_spot(candidates, symbol, nearest).unwrap_or(f64::NAN);
+        let options = strike_window(
+            bucket,
+            spot,
+            DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE,
+            crate::depth_rebalance::STOCK_OPTION_SEGMENT,
+        );
+        if options.is_empty() {
+            // A name with no resolvable ladder takes no slot, and the next
+            // preferred name gets the chance instead. Counted rather than
+            // silently skipped: a rising count means the contract artifact and
+            // the candle frames disagree about which stocks exist.
+            plan.names_unresolved = plan.names_unresolved.saturating_add(1);
+            continue;
+        }
+        // Assemble the name WHOLE into its own buffer first, then append.
+        // A name that cannot be assembled must leave `seen` untouched, or it
+        // blocks the contracts of the name that replaces it.
+        let mut name_instruments: Vec<SubscribeInstrument> =
+            Vec::with_capacity(slots_for_stock_name(DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE));
+        // The stock's own SPOT — the 2026-09-11 (FOURTH) grant. Admissible
+        // where an index spot is not, because a cash equity is `NSE_EQ`, which
+        // the vendor documents as supported.
+        if crate::dhan_depth_universe::segment_supports_depth(name.segment) {
+            claim_instrument(
+                &mut name_instruments,
+                SubscribeInstrument {
+                    security_id: name.underlying_id,
+                    segment: name.segment,
+                },
+                &mut seen,
+            );
+        } else {
+            plan.spots_missing = plan.spots_missing.saturating_add(1);
+        }
+        match futures.get(&symbol.trim().to_ascii_uppercase()) {
+            Some(future) => claim_instrument(&mut name_instruments, *future, &mut seen),
+            None => plan.futures_missing = plan.futures_missing.saturating_add(1),
+        }
+        for instrument in options {
+            claim_instrument(&mut name_instruments, instrument, &mut seen);
+        }
+        stock_instruments.extend(name_instruments);
+        plan.chosen.push(name);
+    }
+
+    // ---- 3. pack the stock half across the remaining three sockets ----
+    //
+    // FLAT chunking, never one name per socket: the scope lock's 2026-09-11
+    // (FOURTH) section refuses socket-affinity, because a name confined to one
+    // socket draws on that socket's 4-swap budget alone while a name spread
+    // across several draws on several.
+    stock_instruments.truncate(DEPTH20_NAME_STOCK_SOCKETS * DEPTH20_PER_SOCKET);
+    // `chunks(0)` panics, and this release profile aborts rather than unwinds,
+    // so an empty stock half must not reach it. The upper bound is a socket
+    // ceiling that the truncate above already guarantees; it is stated anyway
+    // because "already guaranteed" is a property of the line above, not of
+    // this one. `clamp` is total here: 1 <= DEPTH20_PER_SOCKET is a const fact.
+    let chunk = stock_instruments
+        .len()
+        .div_ceil(DEPTH20_NAME_STOCK_SOCKETS)
+        .clamp(1, DEPTH20_PER_SOCKET);
+    let mut emitted = 0usize;
+    for slice in stock_instruments.chunks(chunk) {
+        if emitted >= DEPTH20_NAME_STOCK_SOCKETS {
+            break;
+        }
+        plan.layout
+            .sockets
+            .push(crate::depth20_layout::Depth20Socket {
+                underlying: None,
+                instruments: slice.to_vec(),
+            });
+        emitted = emitted.saturating_add(1);
+    }
+    // Pad to the full pool. A missing socket would let `plan_depth20_minute`
+    // pair a wire socket against a layout socket that is not its own.
+    while emitted < DEPTH20_NAME_STOCK_SOCKETS {
+        plan.layout
+            .sockets
+            .push(crate::depth20_layout::Depth20Socket {
+                underlying: None,
+                instruments: Vec::new(),
+            });
+        emitted = emitted.saturating_add(1);
+    }
+    plan
+}
 
 #[cfg(test)]
 mod tests {
@@ -781,5 +1482,669 @@ mod tests {
             + DEPTH20_NAME_ENTRY_RANK * slots_for_stock_name(DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE);
         assert_eq!(board_slot_cost(), expected);
         assert!(board_slot_cost() <= DEPTH20_INSTRUMENT_BUDGET);
+    }
+
+    // ---------------------------------------------------------------------
+    // The WIRING (2026-09-13): the glue that turns a ranked name into a
+    // layout. Every test below pins behaviour that had NO production caller
+    // until this change — the skeleton-PR shape Rule 14 forbids.
+    // ---------------------------------------------------------------------
+
+    use crate::dhan_contract_universe::ContractRow;
+    use crate::dhan_depth_universe::DepthCandidate;
+
+    const FNO: ExchangeSegment = ExchangeSegment::NseFno;
+
+    fn mover(id: u64, symbol: &str, pct: f64) -> MoverRow {
+        MoverRow {
+            security_id: id,
+            segment: EQ,
+            symbol: symbol.to_owned(),
+            pct_change: pct,
+        }
+    }
+
+    fn future_row(underlying: &str, expiry: u32, id: u64, class: &str, exch: &str) -> ContractRow {
+        ContractRow {
+            i: id,
+            x: exch.to_owned(),
+            c: class.to_owned(),
+            e: expiry,
+            s: 0,
+            l: String::new(),
+            u: underlying.to_owned(),
+            z: 1,
+        }
+    }
+
+    /// `strikes` steps of `step` rupees centred on `spot`, both legs, ids
+    /// ascending from `id_base`.
+    fn chain(u: &str, spot: f64, step: f64, strikes: i64, id_base: i64) -> Vec<DepthCandidate> {
+        let mut out = Vec::new();
+        let half = strikes / 2;
+        for k in -half..=half {
+            #[expect(clippy::cast_precision_loss, reason = "k is tiny, a strike index")]
+            let strike = (spot / step).round() * step + (k as f64) * step;
+            for (offset, leg) in [(0, "CE"), (1, "PE")] {
+                out.push(DepthCandidate {
+                    underlying: u.to_owned(),
+                    contract_security_id: id_base + k * 2 + offset,
+                    expiry_micros: 1_900_000_000_000_000,
+                    strike,
+                    spot,
+                    leg: leg.to_owned(),
+                    is_index_option: u == "NIFTY" || u == "BANKNIFTY",
+                });
+            }
+        }
+        out
+    }
+
+    fn refs(candidates: &[DepthCandidate]) -> Vec<&DepthCandidate> {
+        candidates.iter().collect()
+    }
+
+    // ---- move_bps_from_pct: the SUBSTITUTION boundary ----
+
+    #[test]
+    fn move_bps_from_pct_is_integer_basis_points_and_absolute() {
+        // 1% is 100 bp, and a faller ranks with a riser of the same size.
+        assert_eq!(move_bps_from_pct(1.0), Some(100));
+        assert_eq!(move_bps_from_pct(-1.0), Some(100));
+        assert_eq!(move_bps_from_pct(0.0), Some(0));
+        // Matches the live-price path for the same move, so the two sources
+        // cannot disagree about the KEY even though they disagree about lag.
+        assert_eq!(
+            move_bps_from_pct(10.0),
+            move_bps(Some(11_000), Some(10_000))
+        );
+    }
+
+    #[test]
+    fn move_bps_from_pct_refuses_the_values_that_would_pin_rank_one() {
+        // NaN is not hypothetical: the quote parser has a test asserting the
+        // wire emits it, and `close_pct_from_prev_day` divides by a close.
+        assert_eq!(move_bps_from_pct(f64::NAN), None);
+        assert_eq!(move_bps_from_pct(f64::INFINITY), None);
+        assert_eq!(move_bps_from_pct(f64::NEG_INFINITY), None);
+        // Past the ceiling: a corrupt previous close, not a stock.
+        assert_eq!(move_bps_from_pct(2_400_000.0), None);
+        // Past the FLOOR: an ex-split print is a real, recurring -90% that is
+        // not a move. With absolute ranking it would otherwise take rank 1.
+        assert_eq!(move_bps_from_pct(-90.0), None);
+        // A real big faller still ranks - the floor must not eat the signal.
+        assert_eq!(move_bps_from_pct(-8.0), Some(800));
+    }
+
+    #[test]
+    fn name_moves_drops_an_unrankable_row_rather_than_ranking_it_zero() {
+        let rows = vec![
+            mover(1, "AAA", 2.0),
+            mover(2, "BBB", f64::NAN),
+            mover(3, "CCC", -90.0),
+            mover(0, "ZERO", 1.0),
+        ];
+        let moves = name_moves(&rows);
+        assert_eq!(
+            moves.iter().map(|m| m.underlying_id).collect::<Vec<_>>(),
+            vec![1],
+            "a NaN move, an ex-split move and a zero id must be dropped, never carried at 0"
+        );
+        assert_eq!(moves[0].move_bps, 200);
+    }
+
+    // ---- future_index ----
+
+    #[test]
+    fn future_index_keeps_the_nearest_non_expired_future_per_underlying() {
+        let rows = vec![
+            future_row("NIFTY", 20_260_925, 101, "FUTIDX", "NSE"),
+            future_row("NIFTY", 20_261_030, 102, "FUTIDX", "NSE"),
+            // Already expired — must never be subscribed.
+            future_row("NIFTY", 20_260_828, 103, "FUTIDX", "NSE"),
+            future_row("RELIANCE", 20_260_925, 201, "FUTSTK", "NSE"),
+            // Not a future at all.
+            future_row("RELIANCE", 20_260_925, 202, "OPTSTK", "NSE"),
+        ];
+        let index = future_index(&rows, 20_260_913);
+        assert_eq!(index.len(), 2);
+        assert_eq!(index["NIFTY"].security_id, 101);
+        assert_eq!(index["NIFTY"].segment, FNO);
+        assert_eq!(index["RELIANCE"].security_id, 201);
+    }
+
+    #[test]
+    fn future_index_refuses_a_segment_the_vendor_serves_no_depth_for() {
+        // SENSEX futures are BSE_FNO and Dhan serves depth on NSE only, so a
+        // SENSEX future here would be a socket that dies on connect.
+        let rows = vec![future_row("SENSEX", 20_260_925, 301, "FUTIDX", "BSE")];
+        assert!(future_index(&rows, 20_260_913).is_empty());
+    }
+
+    #[test]
+    fn future_index_breaks_a_same_expiry_tie_on_the_lowest_id() {
+        // The artifact carries no ORDER BY, so last-write-wins would let two
+        // identical inputs choose different contracts and swap the socket back
+        // and forth all session.
+        let rows = vec![
+            future_row("AAA", 20_260_925, 900, "FUTSTK", "NSE"),
+            future_row("AAA", 20_260_925, 800, "FUTSTK", "NSE"),
+        ];
+        assert_eq!(future_index(&rows, 20_260_913)["AAA"].security_id, 800);
+    }
+
+    // ---- choose_names: THE hysteresis, applied to the CHOICE ----
+
+    #[test]
+    fn choose_names_keeps_an_incumbent_inside_the_band_over_a_higher_ranked_newcomer() {
+        // Ranks 1..=20 by id. Held: the six names now ranked 7..=12 - all
+        // inside the band, none inside the entry set.
+        let ranked = rank_names((1..=20).map(|i| n(i, 1_000 - i as i64)).collect());
+        let board = split_board(&ranked);
+        let held: std::collections::BTreeSet<(u64, u8)> =
+            (7..=12).map(|i| (i, EQ.binary_code())).collect();
+        let chosen = choose_names(&board, &held);
+        assert_eq!(
+            chosen[..DEPTH20_NAME_ENTRY_RANK]
+                .iter()
+                .map(|c| c.underlying_id)
+                .collect::<Vec<_>>(),
+            vec![7, 8, 9, 10, 11, 12],
+            "incumbents inside the band must be preferred over rank-1..6 newcomers - \
+             that IS the band, and a band computed and then ignored is worse than none"
+        );
+    }
+
+    #[test]
+    fn choose_names_drops_an_incumbent_that_fell_out_of_the_band() {
+        let ranked = rank_names((1..=20).map(|i| n(i, 1_000 - i as i64)).collect());
+        let board = split_board(&ranked);
+        // Rank 13 is one past DEPTH20_NAME_EXIT_RANK.
+        let held: std::collections::BTreeSet<(u64, u8)> =
+            [(13_u64, EQ.binary_code())].into_iter().collect();
+        let chosen = choose_names(&board, &held);
+        assert!(
+            !chosen.iter().any(|c| c.underlying_id == 13),
+            "past the band a held name finally gives its slots up"
+        );
+        assert_eq!(chosen[0].underlying_id, 1);
+    }
+
+    #[test]
+    fn choose_names_lists_the_entry_set_behind_the_incumbents_as_a_fallback() {
+        // Six incumbents fill the entry ranks, but the list must NOT stop
+        // there: a name whose ladder does not resolve costs a slot the next
+        // preferred name should get.
+        let ranked = rank_names((1..=20).map(|i| n(i, 1_000 - i as i64)).collect());
+        let board = split_board(&ranked);
+        let held: std::collections::BTreeSet<(u64, u8)> =
+            (7..=12).map(|i| (i, EQ.binary_code())).collect();
+        let chosen = choose_names(&board, &held);
+        assert_eq!(chosen.len(), DEPTH20_NAME_ENTRY_RANK * 2);
+        assert_eq!(
+            chosen[DEPTH20_NAME_ENTRY_RANK].underlying_id, 1,
+            "the entry set follows the incumbents as the fallback tail"
+        );
+        // A band-ONLY name is never in the list to be PLACED.
+        assert!(chosen.iter().all(|c| c.underlying_id <= 12));
+    }
+
+    // ---- strike_window ----
+
+    #[test]
+    fn strike_window_centres_on_spot_and_takes_both_legs() {
+        let candidates = chain("AAA", 100.0, 10.0, 20, 5_000);
+        let window = strike_window(&refs(&candidates), 100.0, 2, FNO);
+        // 5 strikes x 2 legs.
+        assert_eq!(window.len(), 10);
+        assert!(window.iter().all(|i| i.segment == FNO));
+        // The centre strike's CE id is the base; the window spans +/-2 steps.
+        let ids: Vec<u64> = window.iter().map(|i| i.security_id).collect();
+        assert!(
+            ids.contains(&5_000),
+            "the at-the-money CE must be in window"
+        );
+    }
+
+    #[test]
+    fn strike_window_never_pads_a_short_chain() {
+        // Three strikes only. A +/-11 window must hand back three, not 23 -
+        // a strike that does not exist cannot be subscribed, and inventing one
+        // subscribes an id that returns silence forever.
+        let candidates = chain("AAA", 100.0, 10.0, 2, 6_000);
+        let window = strike_window(&refs(&candidates), 100.0, 11, FNO);
+        assert_eq!(window.len(), 6);
+    }
+
+    #[test]
+    fn strike_window_refuses_a_half_listed_strike_and_a_self_paired_one() {
+        let mut candidates = chain("AAA", 100.0, 10.0, 4, 7_000);
+        // Strip one leg from the top strike: the pair is the unit.
+        let top = candidates.iter().map(|c| c.strike).fold(f64::MIN, f64::max);
+        candidates.retain(|c| !(c.strike == top && c.leg == "PE"));
+        // Make the bottom strike's two legs share one id.
+        let bottom = candidates.iter().map(|c| c.strike).fold(f64::MAX, f64::min);
+        for c in &mut candidates {
+            if c.strike == bottom {
+                c.contract_security_id = 7_777;
+            }
+        }
+        let window = strike_window(&refs(&candidates), 100.0, 11, FNO);
+        // Five strikes listed, two refused, three survive.
+        assert_eq!(window.len(), 6);
+        assert!(window.iter().all(|i| i.security_id != 7_777));
+    }
+
+    #[test]
+    fn strike_window_refuses_a_spot_it_cannot_centre_on() {
+        let candidates = chain("AAA", 100.0, 10.0, 4, 8_000);
+        assert!(strike_window(&refs(&candidates), f64::NAN, 2, FNO).is_empty());
+        assert!(strike_window(&refs(&candidates), 0.0, 2, FNO).is_empty());
+        assert!(strike_window(&[], 100.0, 2, FNO).is_empty());
+    }
+
+    #[test]
+    fn strike_window_keeps_only_the_nearest_expiry() {
+        let mut candidates = chain("AAA", 100.0, 10.0, 4, 9_000);
+        // A far month at the SAME strikes. Without the expiry filter it would
+        // share a bucket and a far-month contract would be subscribed at a
+        // strike chosen from this month's spot.
+        let mut far = chain("AAA", 100.0, 10.0, 4, 9_500);
+        for c in &mut far {
+            c.expiry_micros = 2_000_000_000_000_000;
+        }
+        candidates.extend(far);
+        let window = strike_window(&refs(&candidates), 100.0, 11, FNO);
+        assert!(
+            window.iter().all(|i| i.security_id < 9_500),
+            "a far-month contract must never reach the window"
+        );
+    }
+
+    // ---- build_name_layout ----
+
+    /// Two index chains, six stock chains, and the movers that rank them.
+    fn board_fixture() -> (Vec<DepthCandidate>, Vec<MoverRow>, Vec<ContractRow>) {
+        let mut candidates = chain("NIFTY", 24_000.0, 50.0, 40, 100_000);
+        candidates.extend(chain("BANKNIFTY", 52_000.0, 100.0, 40, 200_000));
+        let mut movers = Vec::new();
+        let mut futures = vec![
+            future_row("NIFTY", 20_260_925, 1_001, "FUTIDX", "NSE"),
+            future_row("BANKNIFTY", 20_260_925, 1_002, "FUTIDX", "NSE"),
+        ];
+        for k in 0..8u64 {
+            let symbol = format!("STK{k}");
+            #[expect(clippy::cast_precision_loss, reason = "k is 0..8")]
+            let pct = 9.0 - (k as f64);
+            candidates.extend(chain(
+                &symbol,
+                100.0,
+                5.0,
+                40,
+                300_000 + i64::try_from(k).unwrap_or(0) * 1_000,
+            ));
+            movers.push(mover(700 + k, &symbol, pct));
+            futures.push(future_row(&symbol, 20_260_925, 2_000 + k, "FUTSTK", "NSE"));
+        }
+        (candidates, movers, futures)
+    }
+
+    #[test]
+    fn build_name_layout_emits_the_whole_pool_and_fits_the_budget() {
+        let (candidates, movers, future_rows) = board_fixture();
+        let futures = future_index(&future_rows, 20_260_913);
+        let plan = build_name_layout(
+            &candidates,
+            &movers,
+            &futures,
+            &std::collections::BTreeSet::new(),
+        );
+        assert!(plan.is_steerable());
+        assert_eq!(
+            plan.layout.sockets.len(),
+            crate::depth20_layout::DEPTH_20_SOCKETS,
+            "the pool has five sockets and a short layout would let the tracker \
+             pair a wire socket against a layout socket that is not its own"
+        );
+        assert_eq!(plan.chosen.len(), DEPTH20_NAME_ENTRY_RANK);
+        assert_eq!(plan.layout.instrument_count(), board_slot_cost());
+        assert!(plan.layout.instrument_count() <= DEPTH20_INSTRUMENT_BUDGET);
+        for socket in &plan.layout.sockets {
+            assert!(
+                socket.instruments.len() <= DEPTH20_PER_SOCKET,
+                "a socket wider than the connection spills onto the next one"
+            );
+        }
+    }
+
+    #[test]
+    fn build_name_layout_gives_each_index_name_its_own_socket_and_never_ranks_it() {
+        let (candidates, mut movers, future_rows) = board_fixture();
+        // A stock moving 90% cannot displace NIFTY or BANKNIFTY. (It is
+        // refused by the plausibility band too, which is the point: neither
+        // route reaches the index sockets.)
+        movers.push(mover(999, "HUGE", 90.0));
+        let futures = future_index(&future_rows, 20_260_913);
+        let plan = build_name_layout(
+            &candidates,
+            &movers,
+            &futures,
+            &std::collections::BTreeSet::new(),
+        );
+        assert_eq!(
+            plan.layout.sockets[0].underlying.as_deref(),
+            Some("NIFTY"),
+            "socket 0 is NIFTY by POSITION - the tracker reads that"
+        );
+        assert_eq!(
+            plan.layout.sockets[1].underlying.as_deref(),
+            Some("BANKNIFTY")
+        );
+        assert_eq!(
+            plan.layout.sockets[0].instruments.len(),
+            slots_for_index_name(DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE)
+        );
+        assert_eq!(
+            plan.layout.sockets[1].instruments.len(),
+            slots_for_index_name(DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE)
+        );
+        // The index FUTURE is on the socket, and it leads it.
+        assert_eq!(plan.layout.sockets[0].instruments[0].security_id, 1_001);
+        assert!(plan.chosen.iter().all(|c| c.underlying_id != 999));
+    }
+
+    #[test]
+    fn build_name_layout_carries_each_stock_name_spot_future_and_ladder() {
+        let (candidates, movers, future_rows) = board_fixture();
+        let futures = future_index(&future_rows, 20_260_913);
+        let plan = build_name_layout(
+            &candidates,
+            &movers,
+            &futures,
+            &std::collections::BTreeSet::new(),
+        );
+        let stock: Vec<_> = plan.layout.sockets[2..]
+            .iter()
+            .flat_map(|s| s.instruments.iter().copied())
+            .collect();
+        assert_eq!(
+            stock.len(),
+            DEPTH20_NAME_ENTRY_RANK * slots_for_stock_name(DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE)
+        );
+        // The top mover's own NSE_EQ spot - the 2026-09-11 (FOURTH) grant.
+        assert!(
+            stock
+                .iter()
+                .any(|i| i.security_id == 700 && i.segment == EQ),
+            "a stock name must carry its own spot"
+        );
+        // and its nearest-expiry future.
+        assert!(
+            stock
+                .iter()
+                .any(|i| i.security_id == 2_000 && i.segment == FNO),
+            "a stock name must carry its nearest-expiry future"
+        );
+        assert_eq!(plan.futures_missing, 0);
+        assert_eq!(plan.spots_missing, 0);
+    }
+
+    #[test]
+    fn build_name_layout_never_subscribes_one_instrument_twice() {
+        let (candidates, movers, future_rows) = board_fixture();
+        let futures = future_index(&future_rows, 20_260_913);
+        let plan = build_name_layout(
+            &candidates,
+            &movers,
+            &futures,
+            &std::collections::BTreeSet::new(),
+        );
+        let mut seen = std::collections::HashSet::new();
+        for socket in &plan.layout.sockets {
+            for instrument in &socket.instruments {
+                assert!(
+                    seen.insert((instrument.security_id, instrument.segment.binary_code())),
+                    "a duplicate inside one batch is an 804, which is Fatal: the \
+                     connection drops and does not come back this session"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn build_name_layout_applies_the_band_when_choosing_the_names() {
+        let (candidates, movers, future_rows) = board_fixture();
+        let futures = future_index(&future_rows, 20_260_913);
+        // Held: the two WEAKEST movers, ranked 7th and 8th - inside the band
+        // (12), outside the entry set (6).
+        let held: std::collections::BTreeSet<(u64, u8)> =
+            [(706_u64, EQ.binary_code()), (707_u64, EQ.binary_code())]
+                .into_iter()
+                .collect();
+        let plan = build_name_layout(&candidates, &movers, &futures, &held);
+        let chosen: Vec<u64> = plan.chosen.iter().map(|c| c.underlying_id).collect();
+        assert!(
+            chosen.contains(&706) && chosen.contains(&707),
+            "the exit band must GOVERN the choice: an incumbent at rank 7 keeps \
+             its slots. If this fails the band is decoration and the board \
+             re-orders freely while the swap counters report control."
+        );
+        assert_eq!(chosen.len(), DEPTH20_NAME_ENTRY_RANK);
+        // And the next minute's input is what this minute chose.
+        assert_eq!(plan.chosen_keys().len(), DEPTH20_NAME_ENTRY_RANK);
+        assert!(plan.chosen_keys().contains(&(706, EQ.binary_code())));
+    }
+
+    /// An unresolvable name costs its own slot — it does NOT promote the next
+    /// name in.
+    ///
+    /// Written asserting the opposite and CAUGHT here, which is why it is
+    /// spelled out: only a name in the ENTRY set may ever be placed. Rank 7 is
+    /// a band name, and the band's whole contract is *kept, never placed* —
+    /// letting it fill a hole would be the one route by which a name outside
+    /// the top six reaches a socket, and it would arrive through the error
+    /// path rather than through the ranking.
+    ///
+    /// So the board carries five names and holds the sixth's slots empty for
+    /// the minute. `plan_depth20_minute` leaves an empty desired socket
+    /// completely alone, so the wire keeps what it has rather than being
+    /// stripped on the strength of a missing chain.
+    ///
+    /// The incumbent case is DIFFERENT and is covered by
+    /// `choose_names_lists_the_entry_set_behind_the_incumbents_as_a_fallback`:
+    /// there the fallback is an entry-set name, which is allowed to be placed.
+    #[test]
+    fn an_unresolvable_entry_name_leaves_its_slots_empty_rather_than_promoting_a_band_name() {
+        let (mut candidates, movers, future_rows) = board_fixture();
+        // The top mover's chain vanishes - routine when the artifact and the
+        // candle frames disagree about which stocks exist.
+        candidates.retain(|c| c.underlying != "STK0");
+        let futures = future_index(&future_rows, 20_260_913);
+        let plan = build_name_layout(
+            &candidates,
+            &movers,
+            &futures,
+            &std::collections::BTreeSet::new(),
+        );
+        assert_eq!(plan.names_unresolved, 1);
+        assert_eq!(
+            plan.chosen.len(),
+            DEPTH20_NAME_ENTRY_RANK - 1,
+            "only an ENTRY-set name may be placed; rank 7 must not arrive through \
+             the error path"
+        );
+        assert!(plan.chosen.iter().all(|c| c.underlying_id != 700));
+        // Rank 7 (STK6, id 706) is in the band and stays out of the layout.
+        assert!(plan.chosen.iter().all(|c| c.underlying_id != 706));
+        assert!(plan.is_steerable());
+    }
+
+    #[test]
+    fn an_empty_movers_ranking_is_not_steerable_and_the_caller_must_fall_back() {
+        // The 09:00-09:07 case: ~750 equities have not printed at all, so the
+        // movers query returns nothing. The board must decline rather than
+        // displace the seed hold with an index-only layout.
+        let (candidates, _, future_rows) = board_fixture();
+        let futures = future_index(&future_rows, 20_260_913);
+        let plan = build_name_layout(
+            &candidates,
+            &[],
+            &futures,
+            &std::collections::BTreeSet::new(),
+        );
+        assert!(plan.chosen.is_empty());
+        assert!(
+            !plan.is_steerable(),
+            "with no stock name this is the legacy index layout at a different \
+             width - it must not displace the engine already running"
+        );
+    }
+
+    #[test]
+    fn a_missing_index_chain_is_named_and_makes_the_plan_unsteerable() {
+        let (mut candidates, movers, future_rows) = board_fixture();
+        candidates.retain(|c| c.underlying != "BANKNIFTY");
+        let futures = future_index(&future_rows, 20_260_913);
+        let plan = build_name_layout(
+            &candidates,
+            &movers,
+            &futures,
+            &std::collections::BTreeSet::new(),
+        );
+        assert_eq!(plan.index_unresolved, vec!["BANKNIFTY".to_owned()]);
+        assert!(
+            !plan.is_steerable(),
+            "NIFTY and BANKNIFTY are unconditional, so a plan missing one is not \
+             the authorized board"
+        );
+        // The socket is still EMITTED - its position is its identity.
+        assert_eq!(
+            plan.layout.sockets.len(),
+            crate::depth20_layout::DEPTH_20_SOCKETS
+        );
+        assert_eq!(
+            plan.layout.sockets[1].underlying.as_deref(),
+            Some("BANKNIFTY")
+        );
+    }
+
+    #[test]
+    fn a_missing_future_costs_one_slot_and_never_the_whole_name() {
+        let (candidates, movers, _) = board_fixture();
+        let plan = build_name_layout(
+            &candidates,
+            &movers,
+            &std::collections::HashMap::new(),
+            &std::collections::BTreeSet::new(),
+        );
+        assert!(
+            plan.is_steerable(),
+            "a name without a future is still a name"
+        );
+        // Two index names plus six stock names, each one future short.
+        assert_eq!(plan.futures_missing, 2 + DEPTH20_NAME_ENTRY_RANK);
+        assert_eq!(
+            plan.layout.instrument_count(),
+            board_slot_cost() - (2 + DEPTH20_NAME_ENTRY_RANK)
+        );
+    }
+
+    // ---- NameBoardPlan::is_steerable / chosen_keys ----
+
+    #[test]
+    fn is_steerable_refuses_a_board_that_placed_no_stock_name() {
+        // The SECOND condition, which the index-missing test above cannot
+        // reach: both index windows resolve perfectly, and not one stock name
+        // took a slot. That is the measured 09:00-09:07 shape - indices tick
+        // from the pre-open, ~750 equities deliver nothing until the auction
+        // print - so it is the NORMAL early state, not a fault.
+        //
+        // Steering on it would be actively harmful: the plan is the legacy
+        // index layout at a different width, so it would displace the
+        // validated seed hold and the volume ranking and give back nothing.
+        let (mut candidates, movers, future_rows) = board_fixture();
+        candidates.retain(|c| !c.underlying.starts_with("STK"));
+        let futures = future_index(&future_rows, 20_260_913);
+        let plan = build_name_layout(
+            &candidates,
+            &movers,
+            &futures,
+            &std::collections::BTreeSet::new(),
+        );
+
+        assert!(
+            plan.index_unresolved.is_empty(),
+            "both index windows resolved, so the FIRST condition passes: {:?}",
+            plan.index_unresolved
+        );
+        assert!(
+            plan.chosen.is_empty(),
+            "no stock chain exists this minute, so nothing may be chosen"
+        );
+        assert!(
+            !plan.is_steerable(),
+            "an index-only board must hand back to the engine already running"
+        );
+
+        // And the converse, on the same fixture with the stocks restored -
+        // otherwise this test would pass against a function hardcoded to false.
+        let (candidates, movers, future_rows) = board_fixture();
+        let futures = future_index(&future_rows, 20_260_913);
+        let full = build_name_layout(
+            &candidates,
+            &movers,
+            &futures,
+            &std::collections::BTreeSet::new(),
+        );
+        assert!(full.is_steerable(), "the full board steers");
+    }
+
+    #[test]
+    fn chosen_keys_are_the_composite_identity_and_feed_the_next_minute() {
+        // Two names sharing ONE numeric id across segments. Dhan reuses ids
+        // that way (I-P1-11), so a bare-id key would collapse these to one
+        // entry and the next minute's hysteresis would hold the wrong name.
+        let plan = NameBoardPlan {
+            chosen: vec![
+                NameMove {
+                    underlying_id: 27,
+                    segment: ExchangeSegment::NseEquity,
+                    move_bps: 900,
+                },
+                NameMove {
+                    underlying_id: 27,
+                    segment: ExchangeSegment::IdxI,
+                    move_bps: 800,
+                },
+            ],
+            ..NameBoardPlan::default()
+        };
+
+        let keys = plan.chosen_keys();
+        assert_eq!(keys.len(), 2, "a segment twin is TWO names, never one");
+        assert!(keys.contains(&(27, ExchangeSegment::NseEquity.binary_code())));
+        assert!(keys.contains(&(27, ExchangeSegment::IdxI.binary_code())));
+
+        // The round-trip that makes the exit band mean anything: what the
+        // board chose is exactly what `choose_names` reads back as `held`.
+        // An incumbent inside the band outranks a higher-ranked newcomer, so
+        // if the key shape did not match, the band would silently never bind.
+        let ranked = rank_names(vec![
+            n(99, 5_000), // a newcomer above both incumbents
+            NameMove {
+                underlying_id: 27,
+                segment: ExchangeSegment::NseEquity,
+                move_bps: 900,
+            },
+        ]);
+        let board = split_board(&ranked);
+        let held_next = plan.chosen_keys();
+        let chosen = choose_names(&board, &held_next);
+        assert!(
+            chosen
+                .iter()
+                .any(|m| m.key() == (27, ExchangeSegment::NseEquity.binary_code())),
+            "the incumbent must be recognised by the key the plan handed back"
+        );
     }
 }

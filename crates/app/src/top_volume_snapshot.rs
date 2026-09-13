@@ -18,7 +18,7 @@
 //! | a snapshot timestamp not on a whole second | the row's own DEDUP key stops collapsing a re-emit, so one contract holds several rows for one snapshot |
 //! | a `security_id` or `underlying_id` above `i64::MAX` | QuestDB `LONG` is signed; a namespace-banded id would WRAP to a negative and be stored as a different instrument |
 //! | a non-finite `gain_pct` | the §28.4 NaN-poisoning class, one table over — a NaN written to `DOUBLE` makes every later comparison on the column false. **Since 2026-09-12 this refusal NULLs the column and KEEPS the row** — see [`SnapshotRefusal::GainUnavailable`] |
-//! | a rank that does not fit `i64` | arithmetic that cannot happen at k ≤ 250, refused rather than wrapped, because a silently negative rank reads as a valid row |
+//! | no human label for the contract | the row is WRITTEN with `unmapped` and counted — the label is a display column, and dropping the volume row over it would repeat the `gain_pct` mistake below |
 //!
 //! Each refusal is COUNTED. Three of them DROP the row, and must: they
 //! protect a column the row is KEYED or ORDERED by, so a wrong value there is
@@ -33,6 +33,7 @@
 use tickvault_common::types::ExchangeSegment;
 use tickvault_storage::top_volume_rank_persistence::{SnapshotCadence, TopVolumeRankRow};
 
+use crate::contract_underlying_map::UNLABELLED_CONTRACT;
 use crate::volume_leaderboard::{OptionFamily, RankedContract};
 
 /// Nanoseconds in one second — the snapshot grid.
@@ -64,9 +65,25 @@ pub enum SnapshotRefusal {
     /// The name changed with the behaviour: it no longer describes a value
     /// that was non-finite, it describes a column that is NULL.
     GainUnavailable,
-    /// The 1-based rank overflowed `i64` — unreachable at any real `k`, and
-    /// refused anyway rather than wrapped.
-    RankOutOfRange,
+    /// No human label was resolvable for this contract.
+    ///
+    /// # This one does NOT drop the row either (2026-09-13)
+    ///
+    /// Like [`Self::GainUnavailable`], the label is a leaf DISPLAY column: it
+    /// is not in the DEDUP key and nothing orders by it. The row is written
+    /// with `contract_underlying_map::UNLABELLED_CONTRACT` and still carries
+    /// `security_id` + `segment`, so the contract is identifiable by join.
+    ///
+    /// It should be ZERO on a healthy session: the label snapshot and the
+    /// owner snapshot are built from the same artifact rows in the same pass,
+    /// and only a contract the owner map admitted can reach the leaderboard.
+    /// A non-zero reading means the two snapshots have DRIFTED — the label
+    /// publish failed, or a second producer published one without the other.
+    ///
+    /// It replaced `RankOutOfRange`, which died with the `rank` column on the
+    /// same day. `ALL` therefore stays four long and every fixed-size counter
+    /// array sized from it is unchanged.
+    LabelUnavailable,
     /// `window_lots_milli` did not fit a signed 64-bit column. Unreachable at
     /// any real lot size (it would need ~9.2e15 milli-lots in one window) and
     /// refused rather than wrapped, because a negative rank key stored as the
@@ -86,7 +103,7 @@ impl SnapshotRefusal {
     pub const ALL: [Self; 4] = [
         Self::IdTooLargeForSignedColumn,
         Self::GainUnavailable,
-        Self::RankOutOfRange,
+        Self::LabelUnavailable,
         Self::LotsOutOfRange,
     ];
 
@@ -104,7 +121,7 @@ impl SnapshotRefusal {
         match self {
             Self::IdTooLargeForSignedColumn => 0,
             Self::GainUnavailable => 1,
-            Self::RankOutOfRange => 2,
+            Self::LabelUnavailable => 2,
             Self::LotsOutOfRange => 3,
         }
     }
@@ -115,7 +132,7 @@ impl SnapshotRefusal {
         match self {
             Self::IdTooLargeForSignedColumn => "id_too_large",
             Self::GainUnavailable => "gain_unavailable",
-            Self::RankOutOfRange => "rank_out_of_range",
+            Self::LabelUnavailable => "label_unavailable",
             Self::LotsOutOfRange => "lots_out_of_range",
         }
     }
@@ -123,14 +140,21 @@ impl SnapshotRefusal {
 
 /// A built snapshot: the rows to write, plus what was left out and why.
 #[derive(Debug, Clone, PartialEq)]
-pub struct SnapshotProjection {
+pub struct SnapshotProjection<'a> {
     /// The rows, in rank order.
-    pub rows: Vec<TopVolumeRankRow>,
+    ///
+    /// The lifetime is the LABEL SNAPSHOT's, not decoration: `contract` is a
+    /// `&'a str` borrowed out of the `Arc<HashMap<..>>` the caller loaded once
+    /// for this sweep, which is what makes the per-row label cost one pointer
+    /// copy and zero allocation. The rows are appended inside the same sweep
+    /// that built them, so an owned `String` (an allocation per row, up to
+    /// ~80,000 a second on the frame drain) buys nothing.
+    pub rows: Vec<TopVolumeRankRow<'a>>,
     /// Contracts dropped, with the reason. Never silently discarded.
     pub refusals: Vec<(u64, SnapshotRefusal)>,
 }
 
-impl SnapshotProjection {
+impl SnapshotProjection<'_> {
     /// How many contracts were refused.
     #[must_use]
     pub fn refusal_count(&self) -> usize {
@@ -338,6 +362,40 @@ pub const fn secs_of_day_ist(ts_ist_nanos: i64) -> u32 {
     of_day as u32
 }
 
+/// The stored volume-percentage change, in MILLI-PERCENT, from the rank key.
+///
+/// # It is a monotone transform of `window_lots_milli`, not new information
+///
+/// `net_volume_chg_pct = window_lots_milli / 10 - 100`, so in thousandths of a
+/// percent that is exactly `window_lots_milli * 100 - 100_000`. The two carry
+/// the SAME ordering, row for row, including every tie — which is why the
+/// comparator in `volume_leaderboard::rank` still sorts the integer key and
+/// this column is presentation only. It is STORED anyway, on the operator's
+/// 2026-09-13 instruction ("put the volume percentage chnage column as well
+/// also alwasy to see the rpecise percnetgae chnage"): a reader asking the
+/// table what changed should not have to know the transform. That is a
+/// legitimate reason to store a derived value and it must not be read as the
+/// column being independent — if the two ever disagree, this one is wrong.
+///
+/// MILLI-percent, and integer, for the reason the whole ranking path is
+/// integer: a float in a column derived from an integer key can round two
+/// distinct keys onto one value, and this repository bans a float sort key
+/// outright. `4_150_000` here is `+4150.000%`; `0` is exactly one lot; a
+/// contract that traded LESS than one lot reads NEGATIVE, which is the reason
+/// the change form was chosen over a ratio.
+///
+/// `None` only on an overflow that needs `window_lots_milli` above ~9.2e13 —
+/// unreachable at any real lot size, and refused rather than wrapped, because
+/// a wrapped percentage stored as the reason a contract ranked first is worse
+/// than an absent row.
+#[must_use]
+pub const fn net_volume_chg_milli_pct(window_lots_milli: i64) -> Option<i64> {
+    match window_lots_milli.checked_mul(100) {
+        Some(scaled) => scaled.checked_sub(100_000),
+        None => None,
+    }
+}
+
 /// Projects one family's ranked slice into storable rows.
 ///
 /// `gain_pct_of` is called with the **UNDERLYING's** id, not the contract's.
@@ -364,17 +422,19 @@ pub const fn secs_of_day_ist(ts_ist_nanos: i64) -> u32 {
 /// only by `TOP_VOLUME_PERSIST_PER_FAMILY` (25,000). The claim understated the
 /// slice by up to 100x, in the reassuring direction.
 #[must_use]
-pub fn project_snapshot<G, S>(
+pub fn project_snapshot<'a, G, S, L>(
     snapshot_ts_ist_nanos: i64,
     cadence: SnapshotCadence,
     family: OptionFamily,
     ranked: &[RankedContract],
     gain_pct_of: G,
     is_subscribed: S,
-) -> SnapshotProjection
+    label_of: L,
+) -> SnapshotProjection<'a>
 where
     G: Fn(u64) -> Option<f64>,
     S: Fn(u64, ExchangeSegment) -> bool,
+    L: Fn(u64, ExchangeSegment) -> Option<&'a str>,
 {
     // FLOORED TO THE CADENCE GRID, not merely to the second.
     //
@@ -411,7 +471,7 @@ where
     // allocation count a constant 2 rather than a function of the market.
     let mut refusals = Vec::with_capacity(ranked.len());
 
-    for (idx, contract) in ranked.iter().enumerate() {
+    for contract in ranked {
         let Ok(security_id) = i64::try_from(contract.security_id) else {
             refusals.push((
                 contract.security_id,
@@ -426,19 +486,28 @@ where
             ));
             continue;
         };
-        let Ok(rank_zero_based) = i64::try_from(idx) else {
-            refusals.push((contract.security_id, SnapshotRefusal::RankOutOfRange));
-            continue;
-        };
-        let Some(rank) = rank_zero_based.checked_add(1) else {
-            refusals.push((contract.security_id, SnapshotRefusal::RankOutOfRange));
-            continue;
-        };
-
         let Ok(window_lots_milli) = i64::try_from(contract.window_lots_milli) else {
             refusals.push((contract.security_id, SnapshotRefusal::LotsOutOfRange));
             continue;
         };
+        // The percentage the operator reads, as an INTEGER in milli-percent.
+        // Exactly the transform `console_views` renders and
+        // `ranking_by_volume_percentage_is_the_same_order_as_ranking_by_lots`
+        // pins, carried out in `i64` so no float ever touches this path. It
+        // shares `window_lots_milli`'s refusal arm because it is a total
+        // function of it: if the key did not fit, neither does the percentage.
+        let Some(net_volume_chg_milli_pct) = net_volume_chg_milli_pct(window_lots_milli) else {
+            refusals.push((contract.security_id, SnapshotRefusal::LotsOutOfRange));
+            continue;
+        };
+
+        // ONE hash probe into the snapshot the caller loaded for this sweep,
+        // then a pointer copy. No allocation, no refcount bump, no formatting
+        // on the frame drain — the label was rendered once at attach.
+        let contract_label = label_of(contract.security_id, contract.segment);
+        if contract_label.is_none() {
+            refusals.push((contract.security_id, SnapshotRefusal::LabelUnavailable));
+        }
 
         // The UNDERLYING's move, keyed on the underlying — see the fn doc.
         //
@@ -460,7 +529,7 @@ where
             family: family.as_str(),
             feed: SNAPSHOT_FEED,
             segment: contract.segment.as_str(),
-            rank,
+            contract: contract_label.unwrap_or(UNLABELLED_CONTRACT),
             security_id,
             underlying_id,
             // u32 -> i64 is lossless; no saturation is possible and none is
@@ -475,6 +544,7 @@ where
             delta_units: i64::from(contract.delta_units),
             lot_size: i64::from(contract.lot_size),
             window_lots_milli,
+            net_volume_chg_milli_pct,
             gain_pct,
             subscribed: is_subscribed(contract.security_id, contract.segment),
         });
@@ -486,6 +556,25 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The label closure every test passes unless it is testing the label.
+    ///
+    /// A `const fn` pointer rather than a closure literal at eighteen call
+    /// sites: the point of the tests below is the projection, and a resolvable
+    /// label is the ordinary case.
+    #[allow(clippy::unnecessary_wraps)]
+    const fn test_label(_id: u64, _segment: ExchangeSegment) -> Option<&'static str> {
+        Some("RELIANCE-25Sep2026-1400-CE")
+    }
+    const TEST_LABEL: fn(u64, ExchangeSegment) -> Option<&'static str> = test_label;
+
+    /// The complement: a label snapshot that answers nothing, for the drift
+    /// case. Named rather than inlined so a reader sees which test is about
+    /// the fallback.
+    const fn no_label(_id: u64, _segment: ExchangeSegment) -> Option<&'static str> {
+        None
+    }
+    const NO_LABEL: fn(u64, ExchangeSegment) -> Option<&'static str> = no_label;
 
     /// Like [`contract`], naming the underlying explicitly for the tests that
     /// exercise the gain closure — which is keyed on the UNDERLYING.
@@ -554,13 +643,19 @@ mod tests {
             &ranked,
             |_| Some(1.5),
             |_, _| false,
+            TEST_LABEL,
         );
         assert_eq!(p.rows.len(), 3);
-        assert_eq!(p.rows[0].rank, 1);
-        assert_eq!(p.rows[1].rank, 2);
-        assert_eq!(p.rows[2].rank, 3);
-        assert_eq!(p.rows[0].security_id, 10);
-        assert_eq!(p.rows[2].security_id, 12);
+        // The `rank` COLUMN was removed on 2026-09-13 (operator: "rmeve the
+        // rank in top volume"). The ORDER it recorded is still the property
+        // that matters, and it is still asserted — the projection must emit
+        // rows in the ranked slice's order, so a reader can recover position
+        // from the row order without a stored integer that could disagree
+        // with it.
+        assert_eq!(
+            p.rows.iter().map(|r| r.security_id).collect::<Vec<_>>(),
+            vec![10, 11, 12]
+        );
     }
 
     #[test]
@@ -574,6 +669,7 @@ mod tests {
             &ranked,
             |_| Some(0.0),
             |_, _| true,
+            TEST_LABEL,
         );
         // ONE stamp for the whole snapshot — the property this test is named
         // for, and the reason the DEDUP key can collapse a re-emit.
@@ -606,6 +702,7 @@ mod tests {
             &ranked,
             |_| Some(2.0),
             |sid, _| sid == 10,
+            TEST_LABEL,
         );
         assert!(p.rows[0].subscribed);
         assert!(!p.rows[1].subscribed);
@@ -623,6 +720,7 @@ mod tests {
             &ranked,
             |_| Some(2.0),
             |_, _| true,
+            TEST_LABEL,
         );
         assert_eq!(p.rows.len(), 2);
 
@@ -653,6 +751,7 @@ mod tests {
             &ranked,
             |_| Some(0.0),
             |_, _| false,
+            TEST_LABEL,
         );
         let index = project_snapshot(
             NANOS_PER_SECOND,
@@ -661,6 +760,7 @@ mod tests {
             &ranked,
             |_| Some(0.0),
             |_, _| false,
+            TEST_LABEL,
         );
         assert_eq!(stock.rows[0].family, "stock");
         assert_eq!(index.rows[0].family, "index");
@@ -680,6 +780,7 @@ mod tests {
             &ranked,
             |_| Some(0.0),
             |_, _| false,
+            TEST_LABEL,
         );
         assert_eq!(p.rows.len(), 1);
         assert_eq!(p.rows[0].security_id, 10);
@@ -701,6 +802,7 @@ mod tests {
             &ranked,
             |_| Some(0.0),
             |_, _| false,
+            TEST_LABEL,
         );
         assert!(p.rows.is_empty());
         assert_eq!(p.refusal_count(), 1);
@@ -733,6 +835,7 @@ mod tests {
                 _ => Some(3.25),
             },
             |_, _| false,
+            TEST_LABEL,
         );
         // ALL THREE rows survive. Until 2026-09-12 this asserted ONE, because
         // a non-finite gain deleted the whole row -- taking the contract's
@@ -784,9 +887,17 @@ mod tests {
             &ranked,
             |_| Some(0.0),
             |_, _| false,
+            TEST_LABEL,
         );
-        let ranks: Vec<i64> = p.rows.iter().map(|r| r.rank).collect();
-        assert_eq!(ranks, vec![1, 3]);
+        // The refused row is GONE, and the survivors keep the ranked slice's
+        // ORDER — which is all the removed `rank` column ever recorded. A
+        // stored rank here would have read 1 and 3 (positions in the input),
+        // and that gap was the property being asserted; row order carries it
+        // with nothing that can disagree.
+        assert_eq!(
+            p.rows.iter().map(|r| r.security_id).collect::<Vec<_>>(),
+            vec![10, 12]
+        );
     }
 
     #[test]
@@ -804,6 +915,7 @@ mod tests {
             &ranked,
             |_| Some(1.0),
             |_, _| false,
+            TEST_LABEL,
         );
         assert_eq!(p.rows.len(), 2);
         assert_eq!(p.rows[0].window_lots_milli, 1_500);
@@ -823,6 +935,7 @@ mod tests {
             &[c],
             |_| Some(1.0),
             |_, _| false,
+            TEST_LABEL,
         );
         assert!(p.rows.is_empty());
         assert_eq!(p.refusals, vec![(10, SnapshotRefusal::LotsOutOfRange)]);
@@ -845,6 +958,7 @@ mod tests {
                 Some(7.5)
             },
             |_, _| false,
+            TEST_LABEL,
         );
         assert_eq!(p.rows.len(), 1);
         assert!(
@@ -864,6 +978,7 @@ mod tests {
             &ranked,
             |_| Some(0.0),
             |_, _| false,
+            TEST_LABEL,
         );
         assert_eq!(p.rows[0].volume, i64::from(u32::MAX));
     }
@@ -877,6 +992,7 @@ mod tests {
             &[],
             |_| Some(0.0),
             |_, _| false,
+            TEST_LABEL,
         );
         assert!(p.rows.is_empty());
         assert_eq!(p.refusal_count(), 0);
@@ -901,6 +1017,7 @@ mod tests {
                 if underlying_id == 92 { None } else { Some(1.0) }
             },
             |_, _| false,
+            TEST_LABEL,
         );
         // TWO rows, not one: the oversized id DROPS its row (that column is in
         // the DEDUP key), the unknown gain KEEPS its row with a NULL column.
@@ -933,6 +1050,7 @@ mod tests {
             // state at the open, and after any mid-session restart.
             |_| None,
             |_, _| true,
+            TEST_LABEL,
         );
         assert_eq!(
             p.rows.len(),
@@ -941,7 +1059,6 @@ mod tests {
         );
         assert_eq!(p.rows[0].security_id, 4_431);
         assert_eq!(p.rows[0].volume, 987_654);
-        assert_eq!(p.rows[0].rank, 1);
         assert!(p.rows[0].subscribed);
         assert_eq!(p.rows[0].gain_pct, None);
         // Counted, because a NULL nobody counts is a NULL nobody notices.
@@ -964,6 +1081,7 @@ mod tests {
             &oversized,
             |_| Some(1.0),
             |_, _| false,
+            TEST_LABEL,
         );
         assert!(
             p.rows.is_empty(),
@@ -1166,12 +1284,69 @@ mod tests {
         assert_eq!(floor_to_second(1_500_000_000), 1_000_000_000);
     }
 
+    /// The label reaches the row, and a MISSING one falls back without
+    /// dropping the row.
+    ///
+    /// The fallback is the half worth pinning: the label is a display column,
+    /// so losing the contract's VOLUME row over it would repeat the mistake
+    /// `GainUnavailable` was corrected for on 2026-09-12. It must be COUNTED
+    /// though — the two snapshots are built from the same artifact rows in the
+    /// same pass, so a miss is real drift and nothing else would say so.
+    #[test]
+    fn a_missing_label_falls_back_and_is_counted_but_never_drops_the_row() {
+        let ranked = [contract(10, 1, 500)];
+        let p = project_snapshot(
+            NANOS_PER_SECOND,
+            SnapshotCadence::OneSecond,
+            OptionFamily::Stock,
+            &ranked,
+            |_| Some(1.0),
+            |_, _| true,
+            NO_LABEL,
+        );
+        assert_eq!(p.rows.len(), 1, "a missing label must never delete the row");
+        assert_eq!(p.rows[0].contract, UNLABELLED_CONTRACT);
+        assert_eq!(p.refusals, vec![(10, SnapshotRefusal::LabelUnavailable)]);
+
+        // And the ordinary case: the label is carried through verbatim.
+        let p = project_snapshot(
+            NANOS_PER_SECOND,
+            SnapshotCadence::OneSecond,
+            OptionFamily::Stock,
+            &ranked,
+            |_| Some(1.0),
+            |_, _| true,
+            TEST_LABEL,
+        );
+        assert_eq!(p.rows[0].contract, "RELIANCE-25Sep2026-1400-CE");
+        assert!(p.refusals.is_empty());
+    }
+
+    /// The stored percentage is the exact transform of the stored key, and
+    /// carries the sign that makes the change form worth storing.
+    #[test]
+    fn the_projected_percentage_is_the_transform_of_the_projected_key() {
+        for milli in [0_i64, 500, 1_000, 42_500, 4_294_967_295_000] {
+            assert_eq!(
+                net_volume_chg_milli_pct(milli),
+                Some(milli * 100 - 100_000),
+                "the stored percentage must follow from the stored key"
+            );
+        }
+        // One lot is exactly zero; below one lot is negative.
+        assert_eq!(net_volume_chg_milli_pct(1_000), Some(0));
+        assert!(net_volume_chg_milli_pct(500).is_some_and(|v| v < 0));
+        // Refused rather than wrapped — a wrapped percentage stored as the
+        // reason a contract ranked first is worse than an absent row.
+        assert_eq!(net_volume_chg_milli_pct(i64::MAX), None);
+    }
+
     #[test]
     fn as_str_labels_are_distinct_for_every_refusal_reason() {
         let labels = [
             SnapshotRefusal::IdTooLargeForSignedColumn.as_str(),
             SnapshotRefusal::GainUnavailable.as_str(),
-            SnapshotRefusal::RankOutOfRange.as_str(),
+            SnapshotRefusal::LabelUnavailable.as_str(),
             SnapshotRefusal::LotsOutOfRange.as_str(),
         ];
         let mut sorted = labels;

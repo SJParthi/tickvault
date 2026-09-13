@@ -285,7 +285,15 @@ pub fn depth_named_view_ddl() -> String {
 ///
 /// # The three derived columns (added 2026-09-12)
 ///
-/// `window_lots`, `net_volume_chg_pct` and `underlying_chg_pct` are computed
+/// ⚠ 2026-09-13: `net_volume_chg_pct` is no longer DERIVED here from
+/// `window_lots_milli` — the operator asked for the percentage as a stored
+/// column, so the view now scales the stored `net_volume_chg_milli_pct` and
+/// exposes the raw milli-percent beside it. The value is identical either way
+/// (`window_lots_milli * 100 - 100_000`, then / 1000), so no reading changes;
+/// what changes is that the number exists in the table for a `SELECT *`.
+/// `t.rank` is gone from the projection with the column.
+///
+/// `window_lots` and `underlying_chg_pct` are computed
 /// HERE and stored nowhere. A view costs no bytes and cannot drift from its
 /// inputs, so a value that is a pure function of a stored column belongs in
 /// the view rather than in the table — the opposite call from `delta_units`
@@ -297,7 +305,7 @@ pub fn depth_named_view_ddl() -> String {
 /// | `delta_units` | units traded in the window (stored) | `3200` |
 /// | `lot_size` | units per contract (stored) | `200` |
 /// | `window_lots` | `cast(window_lots_milli AS DOUBLE) / 1000.0` | `16.0` |
-/// | `net_volume_chg_pct` | `cast(window_lots_milli AS DOUBLE) / 10.0 - 100` | `1500` |
+/// | `net_volume_chg_pct` | `cast(net_volume_chg_milli_pct AS DOUBLE) / 1000.0` | `1500` |
 /// | `underlying_chg_pct` | the UNDERLYING's move vs its previous close | `2.4` |
 ///
 /// The casts are load-bearing, not decoration — see
@@ -350,10 +358,11 @@ pub fn top_volume_cadence_view_ddl(cadence: SnapshotCadence) -> String {
     let dim = lifecycle_dim_subquery();
     format!(
         "CREATE OR REPLACE VIEW {view} AS \
-         SELECT t.ts, t.rank, il.symbol_name, il.display_name, il.instrument_type, t.family, \
+         SELECT t.ts, t.contract, il.symbol_name, il.display_name, il.instrument_type, t.family, \
          t.delta_units, t.lot_size, \
          cast(t.window_lots_milli AS DOUBLE) / 1000.0 AS window_lots, \
-         cast(t.window_lots_milli AS DOUBLE) / 10.0 - 100 AS net_volume_chg_pct, \
+         cast(t.net_volume_chg_milli_pct AS DOUBLE) / 1000.0 AS net_volume_chg_pct, \
+         t.net_volume_chg_milli_pct, \
          t.gain_pct AS underlying_chg_pct, \
          t.subscribed, t.volume, t.window_lots_milli, t.underlying_id, \
          t.feed, t.segment, t.security_id, t.tf \
@@ -685,11 +694,17 @@ mod tests {
             );
             assert!(
                 ddl.contains("LEFT JOIN"),
-                "{view}: unmapped ranks must still show"
+                "{view}: unmapped contracts must still show"
             );
             assert!(
-                ddl.contains("t.rank"),
-                "{view}: the rank column is the point of the view"
+                ddl.contains("t.contract"),
+                "{view}: the human contract label is the point of the view — \
+                 `rank` was removed on 2026-09-13 and this replaced it"
+            );
+            assert!(
+                !ddl.contains("t.rank"),
+                "{view}: the rank column was removed from the table on \
+                 2026-09-13, so a view naming it fails to resolve"
             );
         }
         assert_eq!(
@@ -730,7 +745,9 @@ mod tests {
                 // Derived here, because both are pure functions of a stored
                 // column and a view cannot drift from its own inputs.
                 "cast(t.window_lots_milli AS DOUBLE) / 1000.0 AS window_lots",
-                "cast(t.window_lots_milli AS DOUBLE) / 10.0 - 100 AS net_volume_chg_pct",
+                "cast(t.net_volume_chg_milli_pct AS DOUBLE) / 1000.0 AS net_volume_chg_pct",
+                "t.net_volume_chg_milli_pct",
+                "t.contract",
                 // The UNDERLYING's move, named apart from the volume one.
                 "t.gain_pct AS underlying_chg_pct",
             ] {
@@ -769,14 +786,16 @@ mod tests {
                 "window_lots must cast before dividing: {ddl}"
             );
             assert!(
-                ddl.contains("cast(t.window_lots_milli AS DOUBLE) / 10.0"),
+                ddl.contains("cast(t.net_volume_chg_milli_pct AS DOUBLE) / 1000.0"),
                 "net_volume_chg_pct must cast before dividing: {ddl}"
             );
             // And the un-cast form must not survive anywhere in the statement.
-            assert!(
-                !ddl.contains("t.window_lots_milli / "),
-                "an un-cast LONG division reappeared: {ddl}"
-            );
+            for uncast in ["t.window_lots_milli / ", "t.net_volume_chg_milli_pct / "] {
+                assert!(
+                    !ddl.contains(uncast),
+                    "an un-cast LONG division reappeared: {ddl}"
+                );
+            }
         }
     }
 

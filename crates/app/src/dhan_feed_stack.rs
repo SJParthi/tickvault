@@ -1600,6 +1600,14 @@ impl LiveIngest {
 
             let prev_close = &self.prev_close;
             let view = crate::depth_subscription_view::global_depth_subscription_view();
+            // ONE atomic load for the whole sweep. Held across the projection
+            // AND the append loop below, because the rows BORROW their label
+            // out of it — which is what makes the per-row label cost a pointer
+            // copy instead of the `format!` that up to 80,000 rows a second on
+            // this task would otherwise pay. The label itself was rendered once
+            // at contract attach; see `contract_underlying_map::labels_from_artifact`.
+            let labels =
+                crate::contract_underlying_map::global_contract_underlying_map().label_snapshot();
             let projection = crate::top_volume_snapshot::project_snapshot(
                 now_ist_nanos,
                 cadence,
@@ -1635,6 +1643,7 @@ impl LiveIngest {
                     )
                 },
                 |security_id, segment| view.is_subscribed(security_id, segment),
+                |security_id, segment| labels.get(&(security_id, segment)).map(AsRef::as_ref),
             );
 
             refused = refused.saturating_add(projection.refusal_count());

@@ -254,6 +254,21 @@ impl DepthFirstPacketTracker {
     /// contract refuses a depth-200 stamp the pool byte would already have
     /// protected) because over-refusing loses a sample and under-refusing
     /// writes a number that is wrong in the reassuring direction.
+    /// Returns whether the stamp was ACCEPTED — `false` means the tracker
+    /// declined it (already streaming, or the pending map at [`MAX_PENDING`])
+    /// and no watch is armed for this key.
+    ///
+    /// # Why the return value is not decoration
+    ///
+    /// Most callers stamp a subscribe and never look back: a refused stamp
+    /// costs them one latency sample. The unsubscribe probe reads the SAME
+    /// machinery backwards — "is the entry still pending when the window
+    /// closes?" means nothing arrived — and for it a refusal is catastrophic
+    /// rather than lossy: no entry exists, so `forget` returns `false`, and
+    /// the probe reads that as *a frame arrived*. In the baseline that admits
+    /// a run whose book was never proven live; in the watch it returns
+    /// `Ignored`, a vendor-blaming finding produced by a measurement that
+    /// never started. Found 2026-09-13.
     pub fn record_subscribe_at(
         &self,
         security_id: u64,
@@ -261,21 +276,22 @@ impl DepthFirstPacketTracker {
         pool: DepthFeedKind,
         at_nanos: i64,
         may_already_be_streaming: bool,
-    ) {
+    ) -> bool {
         if may_already_be_streaming {
             metrics::counter!(FIRST_PACKET_OUTCOME, "outcome" => "unmeasurable").increment(1);
-            return;
+            return false;
         }
         let pinned = self.pending.pin();
         // `binary_code()`, NOT `segment as u8` — see the `Key` docblock.
         let key = (security_id, segment.binary_code(), pool_code(pool));
         if pinned.get(&key).is_none() && self.pending_count.load(Ordering::Relaxed) >= MAX_PENDING {
             metrics::counter!(FIRST_PACKET_OUTCOME, "outcome" => "refused").increment(1);
-            return;
+            return false;
         }
         if pinned.insert(key, at_nanos).is_none() {
             self.pending_count.fetch_add(1, Ordering::Relaxed);
         }
+        true
     }
 
     /// Drops a stamp for a swap the WIRE refused, so it never ages into a
