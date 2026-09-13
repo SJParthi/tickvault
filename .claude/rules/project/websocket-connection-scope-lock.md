@@ -4912,3 +4912,104 @@ no probe was possible, and the first boot after deploy is the measurement.
   operator to discount a counter.
 - Renames the module, the functions, the types or the six metric names in the
   name of consistency: they are not wire names, and the churn buys nothing.
+
+#### 2026-09-13 — the fourth adversarial round, and the three findings it deliberately did NOT fix
+
+**No new authorization is claimed.** This records an eight-agent parallel attack
+on the 2026-09-12 change, what it found, and — more usefully — the three
+confirmed defects that were FLAGGED rather than repaired, each with the reason
+the obvious fix is worse than the gap.
+
+**Fixed in the same change** (listed so a reader knows which of the eight
+findings are closed): the snapshot timers' boot-only wall/monotonic anchor,
+which at 500 ppm NTP slew collides ~12 windows per session into one grid cell
+where the DEDUP key silently upserts one over the other; three guards on this
+branch that could not fail; the `Split` verdict counter registering itself as
+ZERO inside its own detection arm; the view re-ensure being gated on two
+unrelated tables; the third offload writer having no shutdown accounting; an
+unthrottled `error!` that a dead writer thread turns into ~180,000 lines per
+session.
+
+##### FLAGGED 1 — a re-latch clobbers a LONGER cadence's in-flight window
+
+`volume_leaderboard.rs`. `RELATCH_AFTER_CONSECUTIVE_LOWER` fires after 32
+consecutive lower readings and reseeds `baseline: [contract.volume; WINDOW_COUNT]`
+— **all four cadences at once**, including a 1-minute window that may be only
+seconds old. The genuine trading in that window becomes unrecoverable; after the
+resync restores `[ceiling; 4]` the 1-minute board reports `volume − ceiling`
+rather than `volume − pre_dip_baseline`, under-reporting by the amount traded
+between the window's open and the abandoned high. A genuinely busy contract can
+therefore read `zero_lot` for one minute and lose a depth-200 socket to a
+quieter one. The re-latch comment concedes only that "its first window after a
+re-latch reports nothing", which covers the window it lands in and not the
+clobbering of a longer cadence mid-flight.
+
+**Why the obvious fix is REFUSED.** Saving the pre-dip baselines at re-latch and
+restoring them at resync (`resync_baseline: [u32; WINDOW_COUNT]` in place of the
+scalar `resync_ceiling`) looks clean and is WRONG: sweeps continue to fire
+between the re-latch and the resync, and any sweep that visits the contract
+rolls that cadence's baseline forward. Restoring a saved baseline over a rolled
+one **double-counts** the interval — reporting volume that was already reported.
+Getting it right needs per-slot tracking of which windows have closed since the
+re-latch, which is new state on a hot-path struct with 1 B of real padding left.
+
+Under-reporting one window after a rare 32-consecutive-lower episode is bounded
+and self-correcting on the next window. Double-counting is neither. **The
+current behaviour is the safer error**, and this file's own house rule applies:
+an inherently imperfect step is FLAGGED with its constraint and its chosen
+alternative, never papered over with a subtly-wrong repair at the end of a long
+session.
+
+##### FLAGGED 2 — the ILP writer is live ~900 boot-lines before the RENAME
+
+`main.rs` spawns the feed stack at ~2890; the one-shot
+`RENAME top_volume_rank → top_volume` runs at ~3797. If any snapshot row reaches
+`top_volume` before the rename, QuestDB auto-creates the table and the rename
+returns `Split`: pre-rename history stranded in a table no longer in
+`HOUR_PARTITIONED_TABLES`, plus a new table with no DEDUP key.
+
+The happens-before rests on the 09:15 ranking gate — i.e. on wall-clock luck,
+and a **mid-session restart narrows it to seconds**. It is detected and counted
+(and, as of this change, counted with a number rather than a zero), never
+prevented.
+
+**NOT fixed here** because the shape is PRE-EXISTING — before the rename, the
+same race auto-created `top_volume_rank` without its DEDUP key — and the repair
+is a boot re-order that moves DDL ahead of the lane spawn on a path where
+`ensure_ddl_boot_wiring_guard` already pins four separate orderings for four
+separate reasons. Re-sequencing that at the end of a four-round PR is a larger
+risk than the gap it closes.
+
+##### FLAGGED 3 — `table_exists` reads any non-2xx as "absent"
+
+`http_client.rs` maps every non-success response to `Some(false)`, so a
+WAL-suspended or otherwise erroring legacy table reads as NotNeeded and a real
+Split is never reported. The comment at the site states *"the conservative
+direction is the opposite"* and then ships the non-conservative branch.
+
+**NOT fixed here:** the helper is shared by FOUR table renames
+(`spot_1m_rest`, `option_chain_1m`, `option_contract_1m_rest`, and this one), so
+changing its semantics changes three surfaces this PR never touched. It is
+pre-existing, it suppresses a REPORT rather than losing data, and it deserves
+its own change.
+
+##### ⚠ What this round says about the guards themselves
+
+Three of the eight findings were guards written ON THIS BRANCH that could not
+fail — one anchored on a string occurring only in its own argument, one
+satisfied by a neighbouring field's initialiser, one satisfied by its own
+assertion message. That brings this repository's vacuous-guard tally to
+**eight**, and it is the reusable half of the round: **a source scan run against
+the whole file can always be satisfied by the assertion that names it.** Every
+such scan in the changed files now slices below the first `#[cfg(test)]` and
+asserts an occurrence COUNT before comparing positions. A guard that cannot fail
+is worse than no guard, because it also certifies that the case is covered — the
+same cost this file records for `day_ohlc_tracker` (2026-08-12) and
+`WAL-SUSPEND-01` (2026-08-25).
+
+**What a PR that violates this section looks like (REJECT):** restores a
+whole-file `contains` on a string that also appears in its own assertion text;
+seeds a metric series inside the arm that detects the event it counts; reseeds
+all cadence baselines on re-latch AND restores saved baselines at resync without
+tracking which windows closed in between (double-counting); or reports any of
+the three flagged items as fixed.

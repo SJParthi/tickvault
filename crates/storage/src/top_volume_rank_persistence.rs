@@ -577,11 +577,35 @@ pub async fn ensure_top_volume_rank_table(questdb_config: &QuestDbConfig) -> boo
     .await
         == crate::http_client::LegacyRenameOutcome::Split
     {
+        // `increment(1)`, and the `(0)` it replaced was the FOURTH vacuous
+        // instance found on this branch (2026-09-13, confirmed independently by
+        // two adversarial sweeps).
+        //
+        // A seed belongs at CONSTRUCTION, where it registers the series before
+        // the event. Inside the detection arm it is worse than nothing: the
+        // series comes into existence only when a split occurs, and it comes
+        // into existence reading ZERO. An operator grepping the counter across
+        // the fleet after a rollback-then-rollforward would find the number the
+        // metric exists to report saying nothing happened.
+        //
+        // All three sibling renames already do this correctly
+        // (`spot_1m_rest_persistence`, `option_chain_1m_persistence`,
+        // `option_contract_1m_rest_persistence` each `.increment(1)`); this one
+        // alone disagreed.
+        //
+        // HONEST LIMIT: this reuses a ROW-LOSS counter's name for a
+        // table-topology event, so a fleet-wide `sum()` now spans two label
+        // sets with two meanings. The `stage` label separates them and the
+        // coded `error!` below is the real triage surface; a dedicated metric
+        // name would cost ~$0.30/mo against a September forecast of $142.24
+        // and an automatic `STOP_EC2_INSTANCES` line at $135.00, which §2.3n of
+        // the noise lock says needs a LEVER and not a cost note. Recorded, not
+        // spent.
         metrics::counter!(
             "tv_top_volume_rank_rows_discarded_total",
             "stage" => "legacy_table_split"
         )
-        .increment(0);
+        .increment(1);
         error!(
             code = "STORAGE-GAP-03",
             stage = "legacy_table_split",
@@ -658,6 +682,13 @@ pub struct TopVolumeRankWriter {
     sender: Option<Sender>,
     buffer: Buffer,
     pending: usize,
+    /// Running count of DISCARD EPISODES, for the power-of-two log throttle.
+    ///
+    /// Episodes, not rows: a dead writer thread produces one episode per flush
+    /// forever, and it is the onset and the order of magnitude an operator
+    /// needs, never 180,000 identical lines. Saturating, so a pathological
+    /// session cannot panic under `overflow-checks`.
+    discard_episodes: usize,
     /// Set by [`TopVolumeRankWriter::split_for_offload`]. When present, `flush`
     /// hands the buffer to the writer thread instead of touching the network.
     ///
@@ -694,6 +725,7 @@ impl TopVolumeRankWriter {
                     sender: Some(s),
                     buffer: b,
                     pending: 0,
+                    discard_episodes: 0,
                     offload: None,
                     retained_spans: 0,
                 }
@@ -707,6 +739,7 @@ impl TopVolumeRankWriter {
                     sender: None,
                     buffer: Buffer::new(ProtocolVersion::V1),
                     pending: 0,
+                    discard_episodes: 0,
                     offload: None,
                     retained_spans: 0,
                 }
@@ -722,6 +755,7 @@ impl TopVolumeRankWriter {
             sender: None,
             buffer: Buffer::new(ProtocolVersion::V1),
             pending: 0,
+            discard_episodes: 0,
             offload: None,
             retained_spans: 0,
         }
@@ -1005,25 +1039,55 @@ impl TopVolumeRankWriter {
     }
 
     /// Drops the pending buffer, counts and LOGS the loss, returns the count.
-    fn discard_pending(&mut self) -> usize {
+    /// `pub` since 2026-09-13 so the lane can account for retained rows at
+    /// SHUTDOWN, the one moment nothing else calls it.
+    ///
+    /// On a `QueueFull` the producer keeps its rows and `flush` returns `Ok` —
+    /// correct, that is backpressure, not loss. But if the process then exits
+    /// while rows are still retained, no later flush ever runs, and until this
+    /// was reachable from the lane those rows skipped even the discard counter:
+    /// a real drop with every surface reading green. The tick path has always
+    /// called its own equivalent from `close_offload_queues`; this writer had
+    /// no way to be asked.
+    pub fn discard_pending(&mut self) -> usize {
         let dropped = self.pending;
         if dropped > 0 {
             metrics::counter!("tv_top_volume_rank_rows_discarded_total").increment(dropped as u64);
+            self.discard_episodes = self.discard_episodes.saturating_add(1);
             // The counter is NOT EMF-selected — deliberately. Shipping a new
             // metric name costs ~$0.30/mo against a September forecast of
             // $142.24 with the automatic STOP_EC2_INSTANCES line at $135.00,
             // and this table is an observability record whose loss costs no
             // tick. `loss_counter_visibility_guard` accepts the LOGGED route,
             // and this is it: the error! below sits beside the increment.
-            error!(
-                code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
-                metric = "tv_top_volume_rank_rows_discarded_total",
-                dropped,
-                "STORAGE-GAP-03: top_volume_rank rows discarded after a failed \
-                 flush — the ranking record has a hole for those snapshots. No \
-                 tick is lost by this: the leaderboard is in RAM and the next \
-                 snapshot rebuilds it."
-            );
+            //
+            // THROTTLED to powers of two since 2026-09-13, matching both
+            // app-side counterparts. Unthrottled, a DEAD writer thread makes
+            // every subsequent flush take the `SinkGone` arm, which calls this
+            // — four cadences at roughly two flushes a second is ~8 coded
+            // `error!` lines per second for the rest of the session, order
+            // 180,000 lines, into the `errors.jsonl` stream that 25 CloudWatch
+            // metric filters read. The onset and the magnitude are what an
+            // operator needs; the repetition is what buries them.
+            //
+            // Powers of two rather than a rate limit so the FIRST occurrence
+            // always logs: a sampled throttle can swallow the one event that
+            // opens an episode.
+            if self.discard_episodes.is_power_of_two() {
+                error!(
+                    episodes = self.discard_episodes,
+                    code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+                    metric = "tv_top_volume_rank_rows_discarded_total",
+                    dropped,
+                    "STORAGE-GAP-03: top_volume_rank rows discarded after a \
+                     failed flush — the ranking record has a hole for those \
+                     snapshots. No tick is lost by this: the leaderboard is in \
+                     RAM and the next snapshot rebuilds it. `episodes` is the \
+                     running count for this writer, not the count since the \
+                     last line: the line is throttled to powers of two, so a \
+                     jump from 8 to 16 means eight silent episodes between."
+                );
+            }
         }
         self.buffer.clear();
         self.pending = 0;
@@ -2191,6 +2255,50 @@ mod tests {
             "the queue DEPTH is deliberately the same across writers — one \
              number is one thing to keep true, and a shared shape is what stops \
              the three paths drifting into different failure semantics"
+        );
+    }
+
+    /// `discard_pending` became `pub` on 2026-09-13 so the lane can account for
+    /// retained rows at SHUTDOWN — the one moment nothing else calls it.
+    ///
+    /// On a `QueueFull` the producer keeps its rows and `flush` returns `Ok`,
+    /// which is correct: that is backpressure, not loss. But if the process
+    /// then exits while rows are retained, no later flush ever runs, and until
+    /// this was reachable from the lane those rows skipped even the discard
+    /// counter — a real drop with every surface reading green.
+    #[test]
+    fn discard_pending_clears_the_buffer_and_reports_the_count() {
+        let mut writer = TopVolumeRankWriter::for_test();
+
+        // Nothing pending: zero, no log, no counter movement, and — the part
+        // that matters for a shutdown path called unconditionally — no panic.
+        assert_eq!(
+            writer.discard_pending(),
+            0,
+            "an empty producer must report zero discarded, so the lane's \
+             shutdown can call this unconditionally without inventing a loss"
+        );
+
+        // With rows pending, the count is REPORTED and the buffer is cleared,
+        // so a second call cannot double-count the same rows into the loss
+        // series.
+        let rows = [row(), row(), row()];
+        for row in &rows {
+            writer
+                .append_row(row)
+                .expect("append must accept a valid row");
+        }
+        assert_eq!(
+            writer.discard_pending(),
+            rows.len(),
+            "every retained row must be reported exactly once"
+        );
+        assert_eq!(
+            writer.discard_pending(),
+            0,
+            "the buffer must be CLEARED by the discard — a second call that \
+             re-reported the same rows would inflate the loss series on a \
+             shutdown path that is reached from more than one place"
         );
     }
 }

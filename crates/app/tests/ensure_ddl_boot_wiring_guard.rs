@@ -186,3 +186,191 @@ fn test_production_region_split_excises_test_modules() {
     assert!(region.contains("fn prod"));
     assert!(!region.contains("needle()"));
 }
+
+/// The candle DDL — which carries the LEGACY VIEW SWEEP — must be awaited
+/// BEFORE the live-table DDL, which carries the `top_volume_rank` → `top_volume`
+/// RENAME.
+///
+/// ## Why this ordering is load-bearing, and why nothing pinned it until now
+///
+/// A QuestDB view is stored as its SQL TEXT and resolved at query time, so the
+/// four legacy `top_volume_rank_{1s,3s,5s,1m}` views must be dropped before the
+/// base table they name is renamed away from under them. More sharply: whether
+/// QuestDB REFUSES to rename a table that dependent views reference is
+/// **UNVERIFIED** — no QuestDB was reachable when the rename was written. If it
+/// does refuse, a rename attempted with those views still present fails on
+/// EVERY boot forever, and every ranking row written before the rename stays
+/// stranded in a table that is no longer in `HOUR_PARTITIONED_TABLES` and so is
+/// never swept.
+///
+/// The two calls sit ~47 lines apart in one 4,000-line function. Swapping them
+/// COMPILES GREEN and produces exactly the order the design says is unsafe, and
+/// a 2026-09-13 adversarial sweep found that the existing guards in this file
+/// pin only (a) candle-DDL before the seal-writer spawn, (b) the ordering
+/// INSIDE `candle_ddl_boot.rs`, and (c) that the live-table DDL is called at
+/// all. None of them relates the two to each other.
+///
+/// This is the class this repository keeps recording: a correct ordering held
+/// by convention, in a file where the only thing preserving it is that nobody
+/// has yet had a reason to move a line.
+#[test]
+fn the_legacy_view_sweep_is_awaited_before_the_top_volume_rename() {
+    let main_src = production_region(&read_src("src/main.rs"));
+
+    let sweep = "candle_ddl_boot::run_candle_ddl_at_boot(&config.questdb).await";
+    let rename = "candle_ddl_boot::run_live_table_ddl_at_boot(&config.questdb).await";
+
+    // COUNTED before compared. A `find` on a string that occurs zero times
+    // would panic with a clear message, but one that occurs TWICE would pin the
+    // first occurrence and silently ignore a second call site placed anywhere —
+    // including one placed on the wrong side of the rename.
+    assert_eq!(
+        main_src.matches(sweep).count(),
+        1,
+        "main.rs must await the candle DDL exactly once in production; this \
+         guard compares its position against the rename below, and two call \
+         sites would make that comparison meaningless"
+    );
+    assert_eq!(
+        main_src.matches(rename).count(),
+        1,
+        "main.rs must await the live-table DDL exactly once in production"
+    );
+
+    let sweep_pos = main_src
+        .find(sweep)
+        .expect("counted above, so this cannot fail");
+    let rename_pos = main_src
+        .find(rename)
+        .expect("counted above, so this cannot fail");
+
+    assert!(
+        sweep_pos < rename_pos,
+        "`run_candle_ddl_at_boot` (which drops the four LEGACY \
+         top_volume_rank_* views) must be awaited BEFORE \
+         `run_live_table_ddl_at_boot` (which RENAMES top_volume_rank -> \
+         top_volume). Whether QuestDB refuses a rename with dependent views is \
+         UNVERIFIED; dropping first removes that failure mode whether or not it \
+         exists, and dropping second would not. Found the sweep at byte \
+         {sweep_pos} and the rename at byte {rename_pos}."
+    );
+}
+
+/// The `top_volume` view re-ensure must NOT be gated on the tick or depth DDL.
+///
+/// It sat inside `if ticks_ok && depth_ok && rank_ok` until 2026-09-13, which
+/// made the remedy hostage to two unrelated tables: a `ticks` DDL that failed
+/// every attempt skipped the view pass even though `top_volume` had been
+/// created, leaving the four views absent for the whole session — precisely the
+/// failure the re-ensure exists to fix.
+#[test]
+fn the_view_reensure_is_gated_on_the_rank_table_alone() {
+    let boot = production_region(&read_src("src/candle_ddl_boot.rs"));
+
+    let gate = boot.find("if rank_ok && !views_reensured {").expect(
+        "the view re-ensure must be gated on `rank_ok` ALONE (plus its \
+             once-per-boot latch), never on ticks_ok/depth_ok — coupling a fix \
+             to conditions it does not depend on makes it unavailable in the \
+             case it was written for",
+    );
+    // Searched from the GATE onward, not from the start of the file.
+    // `run_candle_ddl_at_boot` makes the FIRST `ensure_named_views` call ~75
+    // lines earlier, so a plain `find` locates that one and then "proves" the
+    // gate comes after the call it is supposed to guard. The guard was looking
+    // at the wrong occurrence of a string that legitimately appears twice.
+    assert!(
+        boot[gate..].contains("console_views::ensure_named_views(questdb).await"),
+        "the `rank_ok` gate must PRECEDE the re-ensure call it guards — no \
+         re-ensure call was found after the gate"
+    );
+
+    // And the success return stays gated on all three: reaching it means every
+    // live table is ready, which is a different claim from "the views were
+    // re-attempted".
+    assert!(
+        boot.contains("if ticks_ok && depth_ok && rank_ok {"),
+        "the boot-complete return must still require ALL THREE tables — \
+         decoupling the view pass must not also weaken what `true` means"
+    );
+}
+
+/// EVERY offload writer thread the lane spawns must be joined at shutdown and
+/// must have a seeded `writer=` label on the abandonment counter.
+///
+/// ## The gap this closes
+///
+/// The lane spawns THREE writer threads — ticks, depth, and (since 2026-09-07)
+/// top-volume snapshots. The first two have had shutdown accounting since
+/// 2026-08-28: the queue is closed, the thread is joined against a shared
+/// deadline, and a timeout or panic increments
+/// `tv_offload_writer_shutdown_incomplete_total{writer=...}` beside a coded
+/// error. §2.3n of the noise lock was written for exactly that, in its own
+/// words because "a thread that never got to run its drain increments neither"
+/// loss series.
+///
+/// The third writer simply never joined the pattern. It was spawned with
+/// `Ok(_handle) =>` — the handle discarded — so at every 17:30 stop and every
+/// mid-session redeploy up to `TOP_VOLUME_FLUSH_QUEUE_DEPTH` batches plus the
+/// one in flight were abandoned with no counter, no log and no alarm. The
+/// magnitude grew on the branch that removed the top-250 persistence cut, which
+/// made a batch market-bounded rather than <= 500 rows.
+///
+/// This guard is deliberately about SYMMETRY rather than about the third
+/// writer: the defect was not that someone forgot a join, it was that nothing
+/// noticed a new writer arriving without one. A fourth writer now fails the
+/// build until it is accounted for.
+#[test]
+fn every_offload_writer_is_joined_and_labelled_at_shutdown() {
+    let lane = production_region(&read_src("src/dhan_feed_stack.rs"));
+
+    // The labels that must be SEEDED, so the CloudWatch agent's
+    // dropped-first-sample rule cannot swallow a series on the one day it
+    // fires. An unseeded counter publishes NOTHING the first time it moves.
+    for writer in ["tick", "depth", "top_volume"] {
+        let seed = format!(
+            "metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, \"writer\" => \"{writer}\").increment(0)"
+        );
+        assert!(
+            lane.contains(&seed),
+            "the `{writer}` abandonment series must be SEEDED at zero at \
+             construction. The agent drops the first sample of a series it has \
+             never seen, so a counter seeded only by its own first event \
+             reports nothing on the one day it matters"
+        );
+    }
+
+    // A spawned writer whose handle is DISCARDED cannot be joined. The exact
+    // spelling that hid the third writer was `Ok(_handle) =>`.
+    //
+    // Asserted POSITIVELY — that the handle is bound and handed over — rather
+    // than by banning the discard spelling. The first draft did ban the string,
+    // and it went red against CORRECT code: the fix's own explanatory comment
+    // quotes `Ok(_handle)` to say what it replaced, and a source scan cannot
+    // tell prose from code. A guard that forbids naming the defect it prevents
+    // makes the defect undocumentable, which is a bad trade for a pin that the
+    // positive form gives anyway.
+    assert!(
+        lane.contains("with_top_volume_writer(producer, handle)"),
+        "the top-volume writer's JoinHandle must be BOUND at the spawn site and \
+         handed to the lane with its producer. Discarding it (`Ok(_handle) =>`) \
+         means the thread can never be joined at shutdown, so its final batches \
+         die with the process and nothing counts them — the state this writer \
+         shipped in for six days while its two siblings had the accounting"
+    );
+
+    // All three joins must be present, and against the SAME deadline: `main`
+    // gives the whole task ONE flush budget, so independent graces would SUM
+    // past it -- the arithmetic the compile-time assert in main.rs keeps honest.
+    for join in [
+        "ingest.shutdown_offload_writer(offload_deadline)",
+        "ingest.shutdown_depth_offload_writer(offload_deadline)",
+        "ingest.shutdown_top_volume_writer(offload_deadline)",
+    ] {
+        assert!(
+            lane.contains(join),
+            "the shutdown tail must call `{join}` -- every offload queue is \
+             closed before any join begins, so the three threads drain in \
+             parallel and the total wait is the MAX of the three, never the sum"
+        );
+    }
+}

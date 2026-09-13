@@ -464,7 +464,7 @@ struct Tracked {
     /// that happened at the vendor while we were looking at the dip) and the
     /// recovery is absorbed instead of ranked.
     ///
-    /// FREE in memory: `Tracked` was already 64 B with 3 B of tail padding at
+    /// FREE in memory: `Tracked` was already 64 B with 5 B of tail padding at
     /// `WINDOW_COUNT == 4`, and this lands in it. The `size_of` assert below
     /// is what proves that rather than the comment.
     ///
@@ -513,8 +513,17 @@ const _: () = assert!(
 );
 
 /// MEASURED, not assumed: 40 B of contract + 2 B of run counter + four `u32`
-/// baselines + the 1 B mask = 59, padded to 64. The mask is genuinely free —
-/// it landed in padding that already existed.
+/// baselines + the 1 B mask + the 4 B resync ceiling = 63, padded to 64. The
+/// mask is genuinely free — it landed in padding that already existed.
+///
+/// ⚠ The tally read "= 59" and omitted `resync_ceiling` entirely until
+/// 2026-09-13. It was arithmetic nobody re-ran when the field landed on this
+/// same branch, and it understated the struct by the exact size of the newest
+/// member — which is also the member whose "FREE in memory" claim the tally is
+/// supposed to support. The claim survives (63 still pads to 64, and the
+/// assert below is what actually proves it), but a sum that does not include
+/// every field is not a measurement, and the next field to land has only 1 B
+/// of real headroom, not 5.
 ///
 /// The assert is `<=`, not `==`, so it pins a BOUND rather than today's
 /// number: a sixth cadence pushes `Tracked` to 72 and fires it, at which point
@@ -1112,7 +1121,21 @@ impl VolumeLeaderboard {
                 let resynced_total = slot.resynced;
                 if resynced_total.is_power_of_two() {
                     warn!(
-                        metric = REFUSED_COUNTER,
+                        // NO `metric =` field. It carried `REFUSED_COUNTER`
+                        // until 2026-09-13, and that counter has exactly three
+                        // seeded label values — `non_monotonic`, `capacity`,
+                        // `zero_lot_window` — none of which this arm ever
+                        // increments. So the line named a series that this
+                        // event does not move, and an operator grepping the
+                        // name would land here and find a number that never
+                        // changes.
+                        //
+                        // The absorption is deliberately NOT counted: it is a
+                        // correctness decision (absorb the climb rather than
+                        // rank it), not a loss, and a new label would cost a
+                        // series against the budget §2.3n governs. Naming no
+                        // metric is the honest form — the log IS the surface,
+                        // and `resynced_total` below is the magnitude.
                         family = label,
                         security_id = key.0,
                         segment = ?key.1,
