@@ -3445,11 +3445,11 @@ pub async fn run_feed_scoreboard(
         let ticks = feed_numbers
             .get(label)
             .map_or(SCOREBOARD_UNAVAILABLE_SENTINEL, |n| n.ticks);
-        let enabled_now = runtime_enabled_now.map(|(dhan_on, groww_on)| {
+        let enabled_now = runtime_enabled_now.map(|(dhan_on, secondary_on)| {
             if matches!(feed, tickvault_common::feed::Feed::Dhan) {
                 dhan_on
             } else {
-                groww_on
+                secondary_on
             }
         });
         let inferred = up_signals.as_ref().is_some_and(|ups| {

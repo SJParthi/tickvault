@@ -796,6 +796,45 @@ pub const MAPPING_WAIT_NEVER_PAST_IST_SECS: u32 = 9 * 3_600 + 10 * 60;
 /// this is at most 240 `stat` calls total.
 const MAPPING_POLL_INTERVAL_MS: u64 = 500;
 
+/// How long the boot may settle-poll for the NARROWED spot artifact after the
+/// mapping artifact has appeared.
+///
+/// # The race this closes (2026-09-13)
+///
+/// `await_mapping_artifact` waits on `dhan-mapping-<date>.json`, but with
+/// `spot_universe_ntm_only` the consumer -- `resolve_live_universe` -- reads
+/// `dhan-ntm-spot-<date>.json` FIRST. The rider writes BOTH inside a single
+/// `write_mapping_atomic` call, the mapping first and the narrowed sets a few
+/// milliseconds later, so for that brief window the file this function waits
+/// on EXISTS while the file the consumer reads does NOT. The 54 lines between
+/// the wait returning and the read are pure in-memory setup, so the read lands
+/// microseconds later -- there is nothing to absorb the gap.
+///
+/// Losing that race is SILENT: the NTM read fails, the consumer takes its
+/// documented widening fallback, and the session subscribes the full
+/// master-sourced set (~4,565 mapping rows) instead of the operator-locked NTM
+/// set (~870 instruments). It is a widening, so no collapse alarm fires, and
+/// the only signal is a counter that reaches no CloudWatch alarm.
+///
+/// # Why a bounded SETTLE and not a wait on the narrowed artifact itself
+///
+/// The rider deliberately does NOT write the NTM artifact when the list
+/// resolves zero constituents -- refusing to write it is what makes the
+/// consumer fall through loudly instead of accepting an indices-only set that
+/// looks like a successful narrowing. So a plain wait on that path would stall
+/// boot to the 09:10 cutoff on a day the rider behaved correctly. A short
+/// bounded settle fixes the millisecond race without ever paying the deadline
+/// for a legitimately-absent file.
+const NARROWED_ARTIFACT_SETTLE_MAX_MS: u64 = 5_000;
+
+/// Poll cadence inside the settle window.
+///
+/// Deliberately 10x tighter than [`MAPPING_POLL_INTERVAL_MS`]: the gap being
+/// closed is a few milliseconds of one `write_mapping_atomic` call, so a 500 ms
+/// cadence would be most of the window it is meant to cover. At the budget
+/// above this is at most 100 `stat` calls, once per boot, on a cold path.
+const NARROWED_ARTIFACT_POLL_INTERVAL_MS: u64 = 50;
+
 /// The longest this function may stall boot, in seconds. One hour.
 ///
 /// [`mapping_wait_end_ist_secs`] extends the wait to cover the rider's build
@@ -982,6 +1021,81 @@ pub const MAPPING_WAIT_COUNTER: &str = "tv_dhan_live_universe_mapping_wait_total
 // `pub async fn` — the guard reads exactly one line back, and anything inserted
 // between them silently orphans the exemption.
 // TEST-EXEMPT: filesystem polling + wall-clock sleep — see the note above.
+/// Counter for the narrowed-artifact settle (see [`NARROWED_ARTIFACT_SETTLE_MAX_MS`]).
+///
+/// `absent` is the one outcome worth reading: it means the mapping landed, the
+/// config asked for a narrowed spot set, and the narrowed file never appeared
+/// inside the settle window -- so this session widened. That is legitimate on a
+/// zero-constituent day and a defect otherwise, and before this counter existed
+/// the two were indistinguishable.
+pub const NARROWED_SETTLE_COUNTER: &str = "tv_dhan_live_universe_narrowed_settle_total";
+
+/// Settle-poll for the narrowed spot artifact the CONFIG will actually read.
+///
+/// Called only once the mapping artifact is known to exist. Returns as soon as
+/// the selected artifact appears, or after [`NARROWED_ARTIFACT_SETTLE_MAX_MS`],
+/// whichever is first. Never stalls boot past that bound.
+async fn settle_for_narrowed_spot_artifact(
+    cfg: &tickvault_common::config::DhanUniverseConfig,
+    date_ist: &str,
+) {
+    // Mirrors the precedence in `resolve_live_universe`: NTM wins when both
+    // narrowing flags are on (operator 2026-08-22 is later than 2026-08-21).
+    // If that precedence is ever reversed there, reverse it here too -- this
+    // function exists to wait for the file that one READS.
+    let (path, which) = if cfg.spot_universe_ntm_only {
+        (
+            crate::dhan_universe::ntm_spot_artifact_path(date_ist),
+            "ntm",
+        )
+    } else if cfg.spot_universe_fno_underlyings_only {
+        (
+            crate::dhan_universe::fno_underlying_artifact_path(date_ist),
+            "fno",
+        )
+    } else {
+        metrics::counter!(NARROWED_SETTLE_COUNTER, "outcome" => "not_narrowed").increment(1);
+        return;
+    };
+
+    if path.exists() {
+        metrics::counter!(NARROWED_SETTLE_COUNTER, "outcome" => "already_present").increment(1);
+        return;
+    }
+
+    let started = std::time::Instant::now();
+    let budget = std::time::Duration::from_millis(NARROWED_ARTIFACT_SETTLE_MAX_MS);
+    let interval = std::time::Duration::from_millis(NARROWED_ARTIFACT_POLL_INTERVAL_MS);
+
+    while started.elapsed() < budget {
+        tokio::time::sleep(interval).await;
+        if path.exists() {
+            metrics::counter!(NARROWED_SETTLE_COUNTER, "outcome" => "settled").increment(1);
+            tracing::info!(
+                which,
+                settled_ms = started.elapsed().as_millis() as u64,
+                path = %path.display(),
+                "live universe: the narrowed spot artifact landed just after the mapping -- \
+                 waited for it rather than reading a half-written build and widening"
+            );
+            return;
+        }
+    }
+
+    metrics::counter!(NARROWED_SETTLE_COUNTER, "outcome" => "absent").increment(1);
+    // Deliberately NOT an error: the rider refuses to write this file when the
+    // list resolves zero constituents, and that refusal is correct behaviour.
+    // `resolve_live_universe` emits the loud, labelled widening line moments
+    // later; a second line here would double-report one event.
+    tracing::info!(
+        which,
+        settle_ms = NARROWED_ARTIFACT_SETTLE_MAX_MS,
+        path = %path.display(),
+        "live universe: the narrowed spot artifact did not appear within the settle window -- \
+         this session will widen to the master-sourced set and say so"
+    );
+}
+
 pub async fn await_mapping_artifact(
     cfg: &tickvault_common::config::DhanUniverseConfig,
     date_ist: &str,
@@ -1000,6 +1114,9 @@ pub async fn await_mapping_artifact(
             path = %path.display(),
             "live universe: today's mapping artifact is already on disk — no wait needed"
         );
+        // The mapping is not the file the consumer reads when a narrowing flag
+        // is on. Settle for that one too -- see `NARROWED_ARTIFACT_SETTLE_MAX_MS`.
+        settle_for_narrowed_spot_artifact(cfg, date_ist).await;
         return;
     }
 
@@ -1072,6 +1189,10 @@ pub async fn await_mapping_artifact(
                 path = %path.display(),
                 "live universe: mapping artifact is ready — subscribing the widened set"
             );
+            // The mapping landing does NOT mean the narrowed set has landed --
+            // the rider writes them milliseconds apart inside one call, and this
+            // poll can land between the two. See `NARROWED_ARTIFACT_SETTLE_MAX_MS`.
+            settle_for_narrowed_spot_artifact(cfg, date_ist).await;
             return;
         }
     }
@@ -1970,5 +2091,199 @@ mod tests {
 
         let _ = std::fs::remove_file(&malformed);
         let _ = std::fs::remove_file(&good);
+    }
+
+    // ---------------------------------------------------------------
+    // The narrowed-artifact settle (2026-09-13).
+    //
+    // These pin the RACE, not the happy path. `await_mapping_artifact`
+    // waits on the mapping file; `resolve_live_universe` reads the NTM
+    // file. The rider writes them milliseconds apart inside ONE call, so
+    // the wait can return in the gap and the read then widens silently.
+    // ---------------------------------------------------------------
+
+    fn ntm_cfg() -> tickvault_common::config::DhanUniverseConfig {
+        tickvault_common::config::DhanUniverseConfig {
+            spot_universe_ntm_only: true,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_settle_returns_at_once_when_the_narrowed_artifact_is_already_there() {
+        let date = "2099-01-02";
+        let p = crate::dhan_universe::ntm_spot_artifact_path(date);
+        let _ = std::fs::create_dir_all(p.parent().expect("parent"));
+        std::fs::write(&p, b"{}").expect("seed the artifact");
+
+        let t0 = std::time::Instant::now();
+        settle_for_narrowed_spot_artifact(&ntm_cfg(), date).await;
+        let waited = t0.elapsed();
+
+        let _ = std::fs::remove_file(&p);
+        assert!(
+            waited < std::time::Duration::from_millis(NARROWED_ARTIFACT_SETTLE_MAX_MS / 2),
+            "a present artifact must not be waited for; waited {waited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_settle_waits_for_an_ntm_file_that_lands_just_after_the_mapping() {
+        // THE RACE, reproduced: the file is absent when the settle starts and
+        // appears a few hundred ms later, exactly as the rider produces it.
+        // Without the settle the caller would have read the absent file and
+        // widened to the full master-sourced set.
+        let date = "2099-01-03";
+        let p = crate::dhan_universe::ntm_spot_artifact_path(date);
+        let _ = std::fs::create_dir_all(p.parent().expect("parent"));
+        let _ = std::fs::remove_file(&p);
+
+        let writer = {
+            let p = p.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                std::fs::write(&p, b"{}").expect("late write");
+            })
+        };
+
+        let t0 = std::time::Instant::now();
+        settle_for_narrowed_spot_artifact(&ntm_cfg(), date).await;
+        let waited = t0.elapsed();
+        writer.await.expect("writer task");
+
+        let present = p.exists();
+        let _ = std::fs::remove_file(&p);
+
+        assert!(present, "the test's own writer must have produced the file");
+        assert!(
+            waited >= std::time::Duration::from_millis(250),
+            "the settle must actually have waited for the late file; waited {waited:?}"
+        );
+        assert!(
+            waited < std::time::Duration::from_millis(NARROWED_ARTIFACT_SETTLE_MAX_MS),
+            "the settle must return on arrival, not burn the whole budget; waited {waited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_settle_never_stalls_boot_past_its_budget_when_the_rider_skipped_the_file() {
+        // The rider DELIBERATELY does not write the NTM artifact when the list
+        // resolves zero constituents. That is correct behaviour, so the settle
+        // must cost seconds and hand back -- never stall to the 09:10 cutoff.
+        let date = "2099-01-04";
+        let p = crate::dhan_universe::ntm_spot_artifact_path(date);
+        let _ = std::fs::create_dir_all(p.parent().expect("parent"));
+        let _ = std::fs::remove_file(&p);
+
+        let t0 = std::time::Instant::now();
+        settle_for_narrowed_spot_artifact(&ntm_cfg(), date).await;
+        let waited = t0.elapsed();
+
+        assert!(
+            waited >= std::time::Duration::from_millis(NARROWED_ARTIFACT_SETTLE_MAX_MS),
+            "an absent file must be given the full settle window; waited {waited:?}"
+        );
+        assert!(
+            waited < std::time::Duration::from_millis(NARROWED_ARTIFACT_SETTLE_MAX_MS * 3),
+            "and must then RETURN -- boot may not stall on it; waited {waited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_boot_that_narrows_nothing_settles_for_nothing() {
+        let date = "2099-01-05";
+        let t0 = std::time::Instant::now();
+        settle_for_narrowed_spot_artifact(
+            &tickvault_common::config::DhanUniverseConfig::default(),
+            date,
+        )
+        .await;
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(200),
+            "no narrowing flag means no file to wait for"
+        );
+    }
+
+    #[test]
+    fn the_settle_waits_for_the_same_artifact_resolve_live_universe_reads() {
+        // Drift guard. `resolve_live_universe` reads NTM first and falls
+        // through to F&O; if that precedence is ever reversed there and not
+        // here, the settle waits for a file the consumer will not open and the
+        // race re-opens silently.
+        let src = include_str!("dhan_live_universe.rs");
+        let body = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production half of the file");
+
+        let resolve = body
+            // Split so this literal is not itself read as a declaration: the
+            // pub-fn-test guard greps the raw line for that text and would
+            // count this search string as a new untested pub fn.
+            .find(concat!("pub ", "fn resolve_live_universe"))
+            .expect("resolve_live_universe");
+        let r_ntm = body[resolve..]
+            .find("cfg.spot_universe_ntm_only")
+            .expect("resolve checks NTM");
+        let r_fno = body[resolve..]
+            .find("cfg.spot_universe_fno_underlyings_only")
+            .expect("resolve checks F&O");
+        assert!(
+            r_ntm < r_fno,
+            "resolve_live_universe must check NTM before F&O (operator 2026-08-22 > 2026-08-21)"
+        );
+
+        let settle = body
+            .find("async fn settle_for_narrowed_spot_artifact")
+            .expect("settle_for_narrowed_spot_artifact");
+        let s_ntm = body[settle..]
+            .find("cfg.spot_universe_ntm_only")
+            .expect("settle checks NTM");
+        let s_fno = body[settle..]
+            .find("cfg.spot_universe_fno_underlyings_only")
+            .expect("settle checks F&O");
+        assert!(
+            s_ntm < s_fno,
+            "the settle must mirror resolve_live_universe's precedence, NTM before F&O"
+        );
+    }
+
+    #[tokio::test]
+    async fn await_mapping_artifact_returns_at_once_when_master_sourcing_is_off() {
+        // The `not_requested` arm. A lane that is not master-sourced has no
+        // artifact to wait for, so this must never stall boot -- and it must
+        // not consult the filesystem to decide that, because the whole point
+        // of the flag is that the rider's output is irrelevant to this boot.
+        let cfg = tickvault_common::config::DhanUniverseConfig {
+            live_subscription_from_master: false,
+            ..Default::default()
+        };
+        let t0 = std::time::Instant::now();
+        await_mapping_artifact(&cfg, "2099-01-06").await;
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(200),
+            "master sourcing off means nothing to wait for; waited {:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn await_mapping_artifact_does_not_wait_when_the_rider_that_writes_it_is_disabled() {
+        // The `rider_disabled` arm: master sourcing is REQUESTED but the only
+        // writer is switched off, so no amount of waiting can produce the
+        // file. Waiting would burn the whole budget to reach the identical
+        // fallback -- the two flags disagreeing is a config error, not a race.
+        let cfg = tickvault_common::config::DhanUniverseConfig {
+            live_subscription_from_master: true,
+            enabled: false,
+            ..Default::default()
+        };
+        let t0 = std::time::Instant::now();
+        await_mapping_artifact(&cfg, "2099-01-07").await;
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(200),
+            "a disabled rider must fail fast, not stall boot; waited {:?}",
+            t0.elapsed()
+        );
     }
 }
