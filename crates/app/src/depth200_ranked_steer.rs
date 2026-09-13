@@ -171,15 +171,49 @@ pub fn plan_ranked_minute(
             continue;
         }
         // This socket holds something OFF the ranking: it is the next home.
-        let Some(candidate) = to_place.next() else {
-            // Nothing left to place: the socket keeps its off-ranking
-            // contract rather than being emptied (see the module header).
+        //
+        // THREE steps, and the order of all three is load-bearing.
+        //
+        // 1. PEEK first. Nothing left to place means the socket keeps its
+        //    off-ranking contract rather than being emptied (module header) —
+        //    and it is NOT a cap refusal, so `capped` must not move.
+        // 2. THEN the cap. Reached with a candidate still waiting, the socket
+        //    is genuinely refused: count it and leave the candidate in the
+        //    iterator, where the terminal `to_place.count()` reports it as
+        //    `unplaced`.
+        // 3. ONLY THEN consume.
+        //
+        // Pulling before the cap check (the shape here until 2026-09-13)
+        // deletes a candidate from BOTH the plan and `unplaced` whenever the
+        // cap bites with candidates remaining: `capped` counts the SOCKET
+        // while the CONTRACT vanishes with no counter naming it. Unreachable
+        // today only because MAX_RANKED_SWAPS_PER_MINUTE ==
+        // DEPTH_200_SOCKET_BUDGET while the loop iterates exactly that many
+        // sockets — and that constant's own doc invites a LOWER cap as the
+        // expected tuning, which is precisely what would arm it.
+        //
+        // Checking the cap first and consuming second is NOT the fix: with the
+        // queue already empty it reports `capped` for sockets that were never
+        // refused anything (proven by
+        // `the_per_minute_cap_refuses_and_counts_the_overflow`, which that
+        // ordering fails). Peek separates "nothing to give" from "not allowed
+        // to give it", which is the distinction both counters exist to make.
+        if to_place.peek().is_none() {
             break;
-        };
+        }
         if decision.swaps.len() >= MAX_RANKED_SWAPS_PER_MINUTE {
             decision.capped = decision.capped.saturating_add(1);
             continue;
         }
+        let Some(candidate) = to_place.next() else {
+            // Unreachable: the peek two statements up returned `Some`, and
+            // nothing between there and here advances the iterator. Written as
+            // a `break` rather than an `expect` because `panic = "abort"` on
+            // the release profile turns a wrong assumption here into process
+            // death mid-session, and because `clippy::expect_used` is denied
+            // outside tests — the house rule that forbids exactly that trade.
+            break;
+        };
         decision.swaps.push(PlannedSwap {
             socket_index,
             old: *old,
@@ -471,5 +505,78 @@ mod tests {
             unplaced: 1,
         });
         assert_eq!(RANKED_SWAP_OUTCOMES.len(), 3);
+    }
+
+    /// `plan_ranked_minute` PEEKS, then tests the cap, then consumes — in that
+    /// order.
+    ///
+    /// This cannot be a behavioural test. `MAX_RANKED_SWAPS_PER_MINUTE` equals
+    /// `DEPTH_200_SOCKET_BUDGET`, and `entry_set` slices the ranked list to
+    /// that same budget, so `to_place` can never still hold a candidate once
+    /// the cap is reached. The defect is LATENT and arms the moment the cap is
+    /// tuned BELOW the budget — which that constant's own doc names as the
+    /// expected future change. A source-order pin is the only assertion that
+    /// can fail today.
+    ///
+    /// What each edge buys:
+    /// * peek before cap — an empty queue must `break`, not report `capped`
+    ///   (`the_per_minute_cap_refuses_and_counts_the_overflow` fails otherwise)
+    /// * cap before consume — a refused candidate must stay in the iterator so
+    ///   the terminal `to_place.count()` reports it as `unplaced`
+    ///
+    /// Sliced to the FUNCTION, never searched across the file: `continue;` and
+    /// `to_place` both occur elsewhere in this module, and a whole-file `find`
+    /// would happily anchor on a sibling — the mis-anchoring this repository
+    /// has now found nine times.
+    #[test]
+    fn the_planner_peeks_then_caps_then_consumes() {
+        let src = include_str!("depth200_ranked_steer.rs");
+        // Strip the test module, so these very assertions cannot satisfy the
+        // scan that reads them.
+        let prod = src
+            .split_once("\nmod tests {")
+            .map_or(src, |(before, _)| before);
+
+        const FN: &str = "pub fn plan_ranked_minute(";
+        const PEEK: &str = "if to_place.peek().is_none() {";
+        const CAP: &str = "if decision.swaps.len() >= MAX_RANKED_SWAPS_PER_MINUTE {";
+        const TAKE: &str = "let Some(candidate) = to_place.next() else {";
+
+        assert_eq!(
+            prod.matches(FN).count(),
+            1,
+            "expected exactly one definition of `plan_ranked_minute` in the \
+             production region; the slice below assumes it"
+        );
+        let from = prod.find(FN).expect("counted above");
+        let rest = &prod[from + FN.len()..];
+        let to = rest.find("\npub fn ").unwrap_or(rest.len());
+        let body = &rest[..to];
+
+        for (label, needle) in [("peek", PEEK), ("cap", CAP), ("take", TAKE)] {
+            assert_eq!(
+                body.matches(needle).count(),
+                1,
+                "expected exactly one `{label}` site inside \
+                 `plan_ranked_minute`, found {}",
+                body.matches(needle).count()
+            );
+        }
+
+        let peek_at = body.find(PEEK).expect("counted above");
+        let cap_at = body.find(CAP).expect("counted above");
+        let take_at = body.find(TAKE).expect("counted above");
+
+        assert!(
+            peek_at < cap_at,
+            "an EMPTY queue must `break`, not count a cap refusal: peek at \
+             {peek_at}, cap at {cap_at}"
+        );
+        assert!(
+            cap_at < take_at,
+            "the cap must refuse BEFORE the candidate is consumed, or the \
+             refused candidate is deleted from the plan AND from `unplaced` \
+             and no counter names it: cap at {cap_at}, take at {take_at}"
+        );
     }
 }

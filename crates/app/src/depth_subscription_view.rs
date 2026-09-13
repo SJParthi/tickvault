@@ -506,6 +506,23 @@ pub fn global_depth_subscription_view() -> &'static Arc<DepthSubscriptionView> {
     VIEW.get_or_init(|| Arc::new(DepthSubscriptionView::new()))
 }
 
+/// Seeds this module's refusal series at zero, before anything can refuse.
+///
+/// [`DROPPED_REFUSED_COUNTER`] was incremented ONLY inside the arm that
+/// detects the refusal (`record_dropped`'s cap branch) until 2026-09-13, so
+/// its series was ABSENT from the exporter until the first refusal — and an
+/// absent series reads exactly like a healthy zero. If the name is ever
+/// EMF-selected it is worse than that: the CloudWatch agent computes counter
+/// deltas and DROPS the first sample of a series it has never seen, so the one
+/// episode that matters produces no datapoint at all. That rule cost 104,540
+/// depth rows their classification on 2026-08-28.
+///
+/// Called once from the steering loop's boot block, beside the other
+/// `pre_register_*` seeds, so the ordering rule lives in one place.
+pub fn pre_register_view_counters() {
+    metrics::counter!(DROPPED_REFUSED_COUNTER).increment(0);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -847,15 +864,38 @@ mod tests {
         );
     }
 
+    /// The view has exactly ONE publishing task.
+    ///
+    /// The module header's safety argument is "all publishing happens on the
+    /// single `run_depth_rebalance` task". That is only true while there is
+    /// ONE production caller: every write here is a non-atomic
+    /// load-rebuild-store across three `ArcSwap`s, so a second concurrent
+    /// publisher silently loses drops. Splitting the pools onto two tasks
+    /// needs `rcu` FIRST — see the header.
+    ///
+    /// ⚠ WIDENED 2026-09-13. Until today this test counted only
+    /// `publish_depth_subscriptions(` and only inside `depth_rebalance.rs`.
+    /// It never looked for `publish_depth20` / `publish_depth200` ANYWHERE —
+    /// so adding `global_depth_subscription_view().publish_depth20(...)` to
+    /// `dhan_feed_stack.rs`, i.e. on the FRAME DRAIN, a different task, left
+    /// the count at 2 and the test green while creating exactly the second
+    /// concurrent writer the header forbids. `dhan_feed_stack.rs` was even
+    /// loaded here, and searched only for `run_depth_rebalance(`.
+    ///
+    /// That is the tenth guard in this repository found satisfiable by
+    /// something other than the property it names.
+    ///
+    /// HONEST LIMIT, stated rather than implied: `include_str!` takes a
+    /// literal path, so this can only read the files named below. It covers
+    /// the steering loop and the frame drain — the two production tasks that
+    /// could plausibly publish, and the only pairing that is actually
+    /// concurrent. A third task in a third file would still pass. Closing
+    /// that needs a directory walk, which is a different kind of test.
     #[test]
     fn the_view_has_exactly_one_publishing_call_site() {
-        // The module header's safety argument is "all publishing happens on
-        // the single run_depth_rebalance task". That is only true while there
-        // is ONE production caller: every write here is load-rebuild-store on
-        // an `ArcSwap`, so a second concurrent publisher loses drops. Splitting
-        // the pools onto two tasks needs `rcu` FIRST -- see the header.
         let rebalance = include_str!("depth_rebalance.rs");
         let stack = include_str!("dhan_feed_stack.rs");
+
         let calls = rebalance.matches("publish_depth_subscriptions(").count()
             - rebalance.matches("fn publish_depth_subscriptions(").count();
         assert_eq!(
@@ -871,6 +911,26 @@ mod tests {
             "run_depth_rebalance is spawned more than once: the single-writer-task \
              invariant the view relies on would no longer hold"
         );
+
+        // The half that was missing: the pool publishers themselves.
+        for method in ["publish_depth20", "publish_depth200"] {
+            let in_rebalance = rebalance.matches(method).count();
+            assert!(
+                in_rebalance > 0,
+                "`{method}` has no call site in depth_rebalance.rs — either the \
+                 publisher moved (and this guard is now pointed at nothing) or \
+                 the pool stopped being published at all"
+            );
+            assert_eq!(
+                stack.matches(method).count(),
+                0,
+                "`{method}` is called from dhan_feed_stack.rs — that is the FRAME \
+                 DRAIN, a different task from the steering loop. Two concurrent \
+                 publishers race the load-rebuild-store on this view's ArcSwaps \
+                 and silently lose drops. Move it onto the steering loop, or \
+                 convert the view to `rcu` FIRST (module header, concurrency)."
+            );
+        }
     }
 
     #[test]
@@ -987,6 +1047,50 @@ mod tests {
         assert!(
             tickvault_core::websocket::pool_supervisor::GHOST_REDIAL_COOLDOWN_SECS * 2
                 < DROPPED_RETENTION_SECS
+        );
+    }
+
+    /// `pre_register_view_counters` seeds the SAME name the refusal arm
+    /// increments, and it does not panic when called.
+    ///
+    /// The drift this guards is specific: a seed that names a different series
+    /// from the increment is worse than no seed at all, because the exporter
+    /// then carries a permanently-zero series beside an absent one and the
+    /// dashboard shows the wrong thing rather than nothing. Asserting both
+    /// sites go through the same `const` makes that unrepresentable.
+    #[test]
+    fn pre_register_view_counters_seeds_the_name_the_refusal_arm_increments() {
+        // Calling it is half the test: a `pre_register_*` that panics at boot
+        // takes the steering loop down before its first iteration.
+        pre_register_view_counters();
+
+        let src = include_str!("depth_subscription_view.rs");
+        let prod = src
+            .split_once("\n#[cfg(test)]")
+            .map_or(src, |(before, _)| before);
+
+        const SEED: &str = "metrics::counter!(DROPPED_REFUSED_COUNTER).increment(0);";
+        const BUMP: &str = "metrics::counter!(DROPPED_REFUSED_COUNTER).increment(refused);";
+
+        assert_eq!(
+            prod.matches(SEED).count(),
+            1,
+            "expected exactly one seed of DROPPED_REFUSED_COUNTER in the \
+             production region"
+        );
+        assert_eq!(
+            prod.matches(BUMP).count(),
+            1,
+            "expected exactly one increment of DROPPED_REFUSED_COUNTER in the \
+             production region"
+        );
+        // Both go through the const, so a rename moves them together. A
+        // string literal at either site would fail the counts above.
+        assert!(
+            !prod.contains("metrics::counter!(\"tv_depth_view_dropped_refused_total\")"),
+            "this series must be referenced through DROPPED_REFUSED_COUNTER at \
+             every site; a literal at one of them is how a seed and an \
+             increment drift onto two different names"
         );
     }
 }

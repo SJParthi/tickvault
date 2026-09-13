@@ -717,6 +717,23 @@ impl TopVolumeRankWriter {
         // turns that into total silence on the one episode that matters; that
         // rule cost 104,540 depth rows their classification on 2026-08-28.
         metrics::counter!("tv_top_volume_rank_rows_discarded_total").increment(0);
+        // The SAME rule for every other outcome this writer can report. Only
+        // `rows_discarded` was seeded until 2026-09-13; the other four were
+        // registered by their own first increment, which is exactly the shape
+        // the comment above warns about — and `flush_width_capped` is a
+        // ROW-DROPPING arm (it calls `discard_pending`), so its series was
+        // absent from the exporter until the first loss. An operator or a
+        // dashboard asking "has this writer ever capped?" saw no series at
+        // all, which reads identically to health.
+        //
+        // Seeding the SUCCESS arm (`flush_offloaded`) too is deliberate: a
+        // loss counter is only legible beside the denominator it is a fraction
+        // of, and a denominator that appears only after the first success is
+        // the same absence problem one column over.
+        metrics::counter!("tv_top_volume_rank_flush_offloaded_total").increment(0);
+        metrics::counter!("tv_top_volume_rank_flush_queue_full_total").increment(0);
+        metrics::counter!("tv_top_volume_rank_flush_width_capped_total").increment(0);
+        metrics::counter!("tv_top_volume_rank_flush_retries_total").increment(0);
         let conf = top_volume_rank_ilp_http_conf(config);
         match Sender::from_conf(&conf) {
             Ok(s) => {
@@ -2300,5 +2317,70 @@ mod tests {
              re-reported the same rows would inflate the loss series on a \
              shutdown path that is reached from more than one place"
         );
+    }
+
+    /// Every counter this writer can increment is also SEEDED at zero in the
+    /// production constructor.
+    ///
+    /// A counter that is only ever registered by its own first increment is
+    /// ABSENT from the exporter until the event it reports happens — and an
+    /// absent series reads exactly like a healthy zero. Worse, if the name is
+    /// EMF-selected the CloudWatch agent computes counter deltas and DROPS the
+    /// first sample of a series it has never seen, so the one episode that
+    /// matters produces no datapoint at all. That rule cost 104,540 depth rows
+    /// their classification on 2026-08-28.
+    ///
+    /// Until 2026-09-13 exactly ONE of the five names here was seeded. This
+    /// test generalises the rule instead of re-listing it: it DERIVES the name
+    /// set from the increment sites, so a sixth counter added tomorrow fails
+    /// the build unless it is seeded too.
+    ///
+    /// Anti-vacuity: the derived set must be non-empty AND must contain the
+    /// row-dropping arm by name. A scan that silently found nothing would
+    /// otherwise pass.
+    #[test]
+    fn every_writer_counter_is_seeded_at_zero_in_the_constructor() {
+        let src = include_str!("top_volume_rank_persistence.rs");
+        let prod = src
+            .split_once("\n#[cfg(test)]")
+            .map_or(src, |(before, _)| before);
+
+        const OPEN: &str = "metrics::counter!(\"";
+        let mut names: Vec<&str> = Vec::new();
+        let mut rest = prod;
+        while let Some(at) = rest.find(OPEN) {
+            let after = &rest[at + OPEN.len()..];
+            let end = after.find('"').expect("counter! literal must close");
+            let name = &after[..end];
+            if !names.contains(&name) {
+                names.push(name);
+            }
+            rest = &after[end..];
+        }
+
+        assert!(
+            names.len() >= 5,
+            "expected at least the five known writer counters; the scan found \
+             {} — a scan that finds nothing passes vacuously, which is the \
+             failure this assertion exists to prevent: {names:?}",
+            names.len()
+        );
+        assert!(
+            names.contains(&"tv_top_volume_rank_flush_width_capped_total"),
+            "the row-DROPPING arm must be in the derived set, or this test is \
+             not looking where it thinks it is: {names:?}"
+        );
+
+        for name in &names {
+            let seed = format!("metrics::counter!(\"{name}\").increment(0);");
+            assert!(
+                prod.contains(&seed),
+                "`{name}` is incremented somewhere in this writer but is never \
+                 seeded at zero. Add `{seed}` to `TopVolumeRankWriter::new` \
+                 beside the others. An unseeded counter is ABSENT from the \
+                 exporter until its first event, and an absent series reads as \
+                 health — on a loss counter that is a false OK."
+            );
+        }
     }
 }
