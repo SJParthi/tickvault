@@ -46,7 +46,7 @@
 
 use std::fs;
 
-use tickvault_app::depth_rebalance::MoverRow;
+use tickvault_app::depth_rebalance::{MoverRow, REBALANCE_INTERVAL_SECS};
 use tickvault_app::depth20_layout::DEPTH_20_SOCKETS;
 use tickvault_app::depth20_name_board::{
     DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE, DEPTH20_INSTRUMENT_BUDGET, DEPTH20_NAME_ENTRY_RANK,
@@ -55,9 +55,14 @@ use tickvault_app::depth20_name_board::{
     build_name_layout, future_index, move_bps, move_bps_from_pct, name_moves, rank_names,
     slots_for_index_name, slots_for_stock_name,
 };
+use tickvault_app::depth20_ranked_steer::{
+    DEPTH_SWAP_COMMAND_CHANNEL_DEPTH, DEPTH200_SWAP_COMMAND_CHANNEL_DEPTH,
+    MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE,
+};
 use tickvault_app::dhan_contract_universe::ContractRow;
 use tickvault_app::dhan_depth_universe::DepthCandidate;
 use tickvault_common::types::ExchangeSegment;
+use tickvault_core::websocket::pool_supervisor::SWAP_WIRE_BUDGET;
 
 /// Production source only: line comments removed AND the file's own
 /// `#[cfg(test)]` module cut off.
@@ -603,6 +608,96 @@ fn the_rank_key_is_an_integer_and_the_comparator_is_total() {
     assert!(window.contains(".cmp(&a.move_bps)"));
 }
 
+/// How many steering minutes a whole-name rotation takes at a given cap.
+///
+/// A free function rather than an inline expression because the property the
+/// operator asked for — "per minute" — is a NUMBER OF MINUTES, and an
+/// assertion that compares two constants describes something weaker than the
+/// message it carries. This is the fourth rule this file's header records:
+/// name the property in code, not only in the failure message.
+fn minutes_to_rotate_a_name(cap: usize) -> usize {
+    let cost = slots_for_stock_name(DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE);
+    cost.div_ceil(cap.max(1))
+}
+
+/// The operator's requirement expressed as the quantity he named.
+///
+/// The board has recomputed and re-planned every minute since it shipped; what
+/// was not per-minute was the APPLICATION, throttled to four swaps a socket
+/// while a name costs twenty-four. This pins the repaired figure at ONE.
+#[test]
+fn a_name_rotation_takes_exactly_one_steering_minute() {
+    assert_eq!(
+        minutes_to_rotate_a_name(MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE),
+        1,
+        "depth-20 is a per-MINUTE board: a cap below one name's swap cost \
+         leaves the wire minutes behind a board that already chose correctly"
+    );
+    // The regression, named so the assertion above cannot be read as trivially
+    // true of any cap.
+    assert_eq!(
+        minutes_to_rotate_a_name(4),
+        6,
+        "the pre-2026-09-13 cap took six minutes to rotate one name"
+    );
+}
+
+/// The cap must DRAIN inside the interval that planned it.
+///
+/// A cap whose worst case outlives its own minute is a backlog with a number
+/// on it: the next iteration's `try_send` meets a queue that never emptied,
+/// and the pool falls permanently further behind. The const-assert in
+/// `depth20_ranked_steer` fails the build on this; the test states the
+/// arithmetic in the open so the margin is a number somebody can read.
+#[test]
+fn the_per_socket_plan_drains_inside_one_steering_interval() {
+    let worst_case_secs =
+        (MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE as u64) * 2 * SWAP_WIRE_BUDGET.as_secs();
+    assert!(
+        worst_case_secs < REBALANCE_INTERVAL_SECS,
+        "a per-socket plan of {MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE} \
+         swaps is {worst_case_secs}s at the wire ceiling, which does not fit a \
+         {REBALANCE_INTERVAL_SECS}s steering interval"
+    );
+    // 48 of 60 today. Stated rather than asserted loosely, because the next
+    // raise of the cap has to be checked against THIS margin — and because the
+    // figure is a CEILING: `SWAP_WIRE_BUDGET` is a timeout, and this
+    // repository has recorded three times that a bound is not a measurement.
+    assert_eq!(worst_case_secs, 48);
+    assert_eq!(REBALANCE_INTERVAL_SECS, 60);
+}
+
+/// Depth-200 keeps the shallower queue, and the frame stack actually SPLITS.
+///
+/// The two pools shared one constant until 2026-09-13. Raising it for
+/// depth-20's name rotation would have carried depth-200 with it — a pool that
+/// swaps one instrument per socket per minute, whose only use for the depth is
+/// the wedge signal, which a six-times-deeper queue delays six times longer.
+#[test]
+fn depth200_keeps_its_shallow_queue_and_the_stack_picks_by_endpoint() {
+    assert!(
+        DEPTH200_SWAP_COMMAND_CHANNEL_DEPTH < DEPTH_SWAP_COMMAND_CHANNEL_DEPTH,
+        "depth-200's queue exists to surface a wedge, not to hold a plan"
+    );
+    let stack = production_source("src/dhan_feed_stack.rs");
+    offset_of_only(
+        &stack,
+        "crate::depth20_ranked_steer::DEPTH200_SWAP_COMMAND_CHANNEL_DEPTH",
+        1,
+    );
+    let by_endpoint = offset_of_only(
+        &stack,
+        "if matches!(endpoint, DhanEndpointType::Depth20) {",
+        1,
+    );
+    let channel = offset_of_only(&stack, "tokio::sync::mpsc::channel(channel_depth)", 1);
+    assert!(
+        by_endpoint < channel,
+        "the endpoint test must CHOOSE the depth before the channel is built, \
+         or both pools get whichever constant was evaluated"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The bite-proof.
 // ---------------------------------------------------------------------------
@@ -735,4 +830,37 @@ fn guard_self_test() {
     let at_six = 2 * slots_for_index_name(DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE)
         + DEPTH20_NAME_ENTRY_RANK * slots_for_stock_name(6);
     assert!(at_six > DEPTH20_INSTRUMENT_BUDGET);
+
+    // (f) The per-minute cap scans must bite in BOTH directions.
+    //
+    //     The minutes helper is the property the operator named, so it has to
+    //     be sensitive to the cap rather than constant across it — a helper
+    //     that returned 1 for every input would satisfy the assertion above
+    //     while proving nothing.
+    assert_eq!(minutes_to_rotate_a_name(1), 24);
+    assert_eq!(minutes_to_rotate_a_name(12), 2);
+    assert_eq!(minutes_to_rotate_a_name(24), 1);
+    // A cap of zero must not divide by zero — a guard that panics on an
+    // absurd input is a guard someone deletes rather than reads.
+    assert_eq!(minutes_to_rotate_a_name(0), 24);
+
+    // ...and the endpoint-split scan must fail on a stack that shares one
+    //    constant between the pools, which is exactly the pre-2026-09-13 shape.
+    let shared = "let (tx, rx) = tokio::sync::mpsc::channel(\n    crate::depth20_ranked_steer::DEPTH_SWAP_COMMAND_CHANNEL_DEPTH,\n);\n";
+    assert_eq!(
+        shared
+            .matches("tokio::sync::mpsc::channel(channel_depth)")
+            .count(),
+        0,
+        "the pre-split shape must NOT satisfy the endpoint-split scan"
+    );
+    // The real file must satisfy it, so a scan that can fail also currently
+    // passes for the right reason.
+    let stack = production_source("src/dhan_feed_stack.rs");
+    assert_eq!(
+        stack
+            .matches("tokio::sync::mpsc::channel(channel_depth)")
+            .count(),
+        1
+    );
 }
