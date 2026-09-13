@@ -939,6 +939,14 @@ pub struct PendingSwapAck {
 /// session — a bug that would look exactly like normal operation.
 pub const REBALANCE_OFFSET_SECS: u64 = 8;
 
+/// How long one steering iteration has before the next one starts.
+///
+/// Not decoration: `depth20_ranked_steer` const-asserts that a full per-socket
+/// swap plan can DRAIN inside this window at the supervisor's worst-case wire
+/// budget. A cap whose plan cannot finish before the next plan arrives is not a
+/// cap — it is a backlog with a number on it.
+pub const REBALANCE_INTERVAL_SECS: u64 = 60;
+
 /// How often the heartbeat ticker republishes the age.
 ///
 /// Half the alarm's own period, so every window carries a fresh reading
@@ -4276,5 +4284,64 @@ mod expiry_permutation_tests {
         };
         assert_eq!(cap_depth20_socket_swaps(&mut plan, 0), 1);
         assert!(plan.is_quiet());
+    }
+
+    /// The 2026-09-13 operator requirement, as a behavioural assertion rather
+    /// than a comment: a socket carrying a WHOLE NAME's worth of swaps is
+    /// applied whole, in the minute that planned it.
+    ///
+    /// Non-vacuous by construction — the same plan is run through the OLD cap
+    /// of four in the same test, and 20 of its 24 swaps are cut. That is the
+    /// six-minute rotation the operator was complaining about, reproduced, so
+    /// this test fails if the cap is ever walked back.
+    #[test]
+    fn a_whole_name_rotates_in_one_minute_at_the_production_cap() {
+        let name_cost = crate::depth20_ranked_steer::DEPTH20_NAME_SWAP_COST;
+        let swap = |id: u64| {
+            (
+                SubscribeInstrument {
+                    security_id: id,
+                    segment: ExchangeSegment::NseFno,
+                },
+                SubscribeInstrument {
+                    security_id: id + 100_000,
+                    segment: ExchangeSegment::NseFno,
+                },
+            )
+        };
+        let whole_name = || crate::depth20_track::Depth20SocketPlan {
+            socket: 0,
+            swaps: (1..=name_cost as u64).map(swap).collect(),
+            ..crate::depth20_track::Depth20SocketPlan::default()
+        };
+
+        let mut at_production = crate::depth20_track::Depth20Plan {
+            sockets: vec![whole_name()],
+            sockets_left_alone: 0,
+        };
+        let capped = cap_depth20_socket_swaps(
+            &mut at_production,
+            crate::depth20_ranked_steer::MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE,
+        );
+        assert_eq!(
+            capped, 0,
+            "a whole name must reach the wire in ONE minute; anything capped is \
+             a name the board chose and the socket did not take"
+        );
+        assert_eq!(at_production.sockets[0].swaps.len(), name_cost);
+
+        // The regression this replaces, run against the same plan so the
+        // assertion above cannot pass by the plan being empty.
+        let mut at_old_cap = crate::depth20_track::Depth20Plan {
+            sockets: vec![whole_name()],
+            sockets_left_alone: 0,
+        };
+        let old_capped = cap_depth20_socket_swaps(&mut at_old_cap, 4);
+        assert_eq!(
+            old_capped,
+            name_cost - 4,
+            "the pre-2026-09-13 cap of four cut 20 of a name's 24 swaps, which \
+             is the six-minute rotation this change exists to end"
+        );
     }
 }

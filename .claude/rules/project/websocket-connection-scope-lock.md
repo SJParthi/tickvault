@@ -5224,3 +5224,98 @@ lets the probe arm inside the last 30 minutes; removes the heartbeat stamps
 around the probe block; records the name board on the steerable arm only (the
 refusal counters then can never leave zero); or moves the ILP append off the
 drain without its own dated operator line.
+
+### 2026-09-13 (SECOND) — THE PER-MINUTE SWAP BUDGET IS RAISED SO A WHOLE NAME MOVES IN ONE MINUTE
+
+**The verbatim operator demand (2026-09-13, typed directly in-session — preserve
+EXACTLY, expletives and typos included):**
+
+> "why the fuck per mintue depth 20 is not yet implemented mtoherfucker why? fix and reosleve an dimpelemnt this also ddue okay?"
+
+**No NEW authorization is claimed, and none is needed.** The 2026-09-11 (FOURTH)
+section already authorized this work in as many words — *"Raising both so a whole
+name moves in one minute is authorized"* — under three binding conditions, the
+first of which was *"It ships WITH the name board, never before it."* The name
+board shipped **earlier today** (the 2026-09-13 section above makes it the PRIMARY
+depth-20 engine), so condition 1 is now satisfied and the raise is unblocked. This
+dated row records that, and records the operator asking for the half that was
+deliberately deferred.
+
+#### What was already per-minute, and what was not
+
+The complaint is precise and the answer has three parts, only one of which is a gap:
+
+| Stage | Cadence | State |
+|---|---|---|
+| The name board is RECOMPUTED from the movers table | every minute, at `REBALANCE_OFFSET_SECS` (:08) past the boundary | **already per-minute** |
+| The delta against what the sockets hold is PLANNED | every minute, same pass | **already per-minute** |
+| The delta is APPLIED to the wire | **capped at 4 swaps per socket** | **THE GAP** |
+
+A stock name is `slots_for_stock_name(5)` = 1 spot + 1 future + 22 options = **24
+instruments**. Against a per-socket cap of 4 that is **six minutes to rotate one
+name**, and a name leaving mid-list re-chunks the three stock sockets so all three
+carry ~24 swaps at once — still six minutes, because the cap is per socket. So the
+board chose the right six names every minute and the wire took six minutes to
+agree with it.
+
+#### Why the cap was 4, and why that reason has expired
+
+`MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE` was const-asserted equal to
+`DEPTH_SWAP_COMMAND_CHANNEL_DEPTH`, and 4 was the CHANNEL's number, not the wire's
+— the frame stack's own words: *"enough that a busy minute cannot block the
+sender, small enough that a wedged connection surfaces as a refused `try_send` the
+caller LOGS rather than as a queue that hides it."* That figure was chosen for the
+volume-ranked engine, whose healthy minute produced **two** swaps a socket. A name
+board's healthy minute produces **24**. The cap was never a vendor limit and never
+a wire limit; it was a queue depth sized for a different engine.
+
+#### The contract (LOCKED)
+
+| Aspect | Locked value |
+|---|---|
+| Per-socket per-minute cap | **`DEPTH20_NAME_SWAP_COST` = 24** — DERIVED from `slots_for_stock_name(DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE)`, never a literal, so a wider stock ladder moves the cap with it |
+| Channel depth (depth-20) | raised in lockstep to the same 24 — **condition 2 of the 2026-09-11 grant is preserved**: the cap stays const-asserted `<=` the channel depth, because a cap above the queue is not a cap |
+| Channel depth (depth-200) | **UNCHANGED at 4** — its own cap is 1 per socket per minute, so a deeper queue there would only delay its wedge signal for nothing |
+| Wire-time ceiling | const-asserted: `cap x 2 x SWAP_WIRE_BUDGET < REBALANCE_INTERVAL_SECS` — 24 swaps x 2 legs x 1 s = **48 s inside a 60 s minute**, 12 s of margin. A cap that cannot drain inside its own minute is not a cap either |
+| Socket affinity | **NOT adopted** — condition 3 of the 2026-09-11 grant, unchanged. `plan_depth20_minute` still diffs each socket by SET via `match_sockets_by_overlap`, never by position |
+| Everything else | UNCHANGED — 250 + 5 instrument budgets, 5 + 5 sockets, entry 6 / exit 12 name band, ATM±5 stocks / ATM±11 indices, the 238-slot board cost, `dry_run` true, the §28 frozen area |
+
+#### ⚠ The honest cost, stated rather than absorbed
+
+**The wedge signal is one minute later than it was.** At a channel depth of 4 a
+wedged connection refused the fifth `try_send` inside the same minute. At 24 the
+whole minute's plan queues, and the refusal arrives on the NEXT minute's first
+send — still counted as `channel_full`, still logged, one minute delayed. That is
+the price of the operator's requirement and there is no shape that avoids it: a
+queue that can hold a name is a queue that can hide a wedge for a name's worth of
+sends.
+
+**The 48 s figure is a CEILING, not a measurement.** `SWAP_WIRE_BUDGET` is a
+`timeout`, and this repository has now recorded three times that a bound is not a
+measurement. The real per-leg wire time is a socket write and should be
+sub-millisecond, which would make a full name rotation ~50 ms — but nobody has
+measured it, because the histogram that measures it
+(`tv_dhan_ws_swap_wire_ms`, shipped earlier today) has never seen a live session.
+**The first session on this build is the measurement**, and if a leg genuinely
+approaches its budget the cap must come down, not the budget up.
+
+**It does not make Dhan honour the unsubscribe.** Both code 25 and code 24 are
+proven ignored (2026-09-10, 2026-09-11), so every swap this raises the rate of is
+a swap whose unsubscribe the vendor currently discards. Six times the swap rate is
+six times the ghost rate, bounded by the same `GHOST_REDIAL_SESSION_CEILING` and
+counted by the same `tv_dhan_feed_depth_total{outcome="ghost"}`. The remedy for
+that is the support ticket, not this cap.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Raises the cap above the channel depth, or drops the const-assert binding them
+  (condition 2 of the 2026-09-11 grant).
+- Writes the cap as a literal 24 instead of deriving it from
+  `slots_for_stock_name` — a wider ladder would then silently exceed its minute.
+- Raises the cap without the wire-time const-assert, or past the point where the
+  worst case drains inside `REBALANCE_INTERVAL_SECS`.
+- Raises the DEPTH-200 channel depth under cover of this section — its cap is 1
+  per socket per minute and a deeper queue only delays its wedge signal.
+- Adopts socket-affine packing for depth-20 (condition 3, unchanged).
+- Changes the socket or instrument budgets, the name band, or the ATM windows.
+- Reports the 48 s worst case as a measured figure.

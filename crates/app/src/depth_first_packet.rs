@@ -7,7 +7,9 @@
 //! does that take?* Every number this repository could offer was a BUDGET, not
 //! a measurement — [`SWAP_WIRE_BUDGET`] is a one-second ceiling per side, the
 //! transport's own send timeout is ten seconds, and the per-socket pending gate
-//! holds the real rate to at most 4 swaps per socket per minute on depth-20 (`DEPTH_SWAP_COMMAND_CHANNEL_DEPTH`) and 5 pool-wide per minute on depth-200. None of those is the
+//! holds the real rate to at most one whole NAME per socket per minute on
+//! depth-20 (`DEPTH_SWAP_COMMAND_CHANNEL_DEPTH`, raised from four on
+//! 2026-09-13) and 5 pool-wide per minute on depth-200. None of those is the
 //! answer. They bound how long we WAIT; they say nothing about how long Dhan
 //! takes to start delivering the new book.
 //!
@@ -178,11 +180,20 @@ pub const FIRST_PACKET_WINDOW_SECS: i64 = 120;
 
 /// Fail-closed bound on the pending map.
 ///
-/// The real rate is at most 4 swaps per socket per minute on depth-20 (`DEPTH_SWAP_COMMAND_CHANNEL_DEPTH`) and 5 pool-wide per minute on depth-200 across ten depth sockets
-/// (the unreconciled-ack gate in `depth20_track` and its depth-200 twin), and
-/// an entry lives at most [`FIRST_PACKET_WINDOW_SECS`], so the expected
-/// occupancy is tens. 1,024 is a bound against a shape nobody has designed,
-/// never a size that is expected — past it a subscribe is not tracked, is
+/// The real rate is at most one whole NAME per socket per minute on depth-20
+/// (`DEPTH_SWAP_COMMAND_CHANNEL_DEPTH`) and 5 pool-wide per minute on
+/// depth-200, across ten depth sockets (the unreconciled-ack gate in
+/// `depth20_track` and its depth-200 twin), and an entry lives at most
+/// [`FIRST_PACKET_WINDOW_SECS`], so the expected peak occupancy is
+/// `5 x 24 x 2 + 5 x 2` = **250**. 1,024 is a bound against a shape nobody has
+/// designed, never a size that is expected.
+///
+/// ⚠ The margin over that expectation went from ~20x to ~4x when the
+/// depth-20 cap rose from four to a whole name on 2026-09-13. Still a bound
+/// rather than a size, but the next raise of that cap has to be checked
+/// against THIS number rather than against the word "tens".
+///
+/// Past the bound a subscribe is not tracked, is
 /// counted `refused`, and the swap itself proceeds untouched.
 pub const MAX_PENDING: usize = 1_024;
 

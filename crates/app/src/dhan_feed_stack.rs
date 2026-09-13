@@ -11271,15 +11271,25 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
         // session rather than being consumed once. A top-up is a single event
         // — the contract overflow — so its channel is depth 1 and its sender
         // is dropped after. A swap channel must survive every minute of the
-        // day, so the sender is held by the re-selection task and the depth
-        // is 4: enough that a busy minute cannot block the sender, small
-        // enough that a wedged connection surfaces as a refused try_send the
-        // caller LOGS rather than as a queue that hides it.
+        // day, so the sender is held by the re-selection task.
+        //
+        // The two depth pools take DIFFERENT depths, and that is deliberate.
+        // The original figure was four for both: "enough that a busy minute
+        // cannot block the sender, small enough that a wedged connection
+        // surfaces as a refused try_send the caller LOGS rather than as a
+        // queue that hides it". Depth-20 now rotates a whole NAME in one
+        // minute (2026-09-13 (SECOND) scope-lock row), so four would refuse
+        // five sixths of its plan every minute; depth-200 still swaps one
+        // instrument per socket per minute and keeps the original four,
+        // where a wedge surfaces six times sooner.
         let topup_rx = match (endpoint, topup_rx, out_depth_commands.as_deref_mut()) {
             (DhanEndpointType::Depth20 | DhanEndpointType::Depth200, None, Some(depth_vec)) => {
-                let (tx, rx) = tokio::sync::mpsc::channel(
-                    crate::depth20_ranked_steer::DEPTH_SWAP_COMMAND_CHANNEL_DEPTH,
-                );
+                let channel_depth = if matches!(endpoint, DhanEndpointType::Depth20) {
+                    crate::depth20_ranked_steer::DEPTH_SWAP_COMMAND_CHANNEL_DEPTH
+                } else {
+                    crate::depth20_ranked_steer::DEPTH200_SWAP_COMMAND_CHANNEL_DEPTH
+                };
+                let (tx, rx) = tokio::sync::mpsc::channel(channel_depth);
                 let held: Vec<SubscribeInstrument> = guard.batches().flatten().copied().collect();
                 depth_vec.push((endpoint, depth_global_index, tx, held));
                 Some(rx)
