@@ -41,7 +41,7 @@ futures-util = "=0.3.34"
 
 # ---- Section 3: Data Pipeline ----
 papaya = "=0.2.5"
-crossbeam-channel = "=0.5.16"
+crossbeam-channel = "=0.5.17"
 # ringbuf removed 2026-06-10 (operator-approved dead-pin cleanup): zero
 # consumers — hot-path ring buffers use rtrb + crossbeam-channel.
 # Wave 6 Sub-PR #1 (2026-05-10): per-cell mutex for the multi-TF
@@ -99,7 +99,7 @@ governor = "=0.10.4"
 # policy on this project) and explicitly enable: json (REST payloads),
 # rustls (TLS — was `rustls-tls` in 0.12), charset (Response::text() decoder),
 # http2 (Dhan REST uses HTTP/2), query (RequestBuilder::query for QuestDB ILP).
-reqwest = { version = "=0.13.4", features = ["json", "rustls", "charset", "http2", "query"], default-features = false }
+reqwest = { version = "=0.13.5", features = ["json", "rustls", "charset", "http2", "query"], default-features = false }
 
 # ---- Section 8: HTTP Server ----
 axum = { version = "=0.8.9", features = ["macros", "ws"] }
@@ -107,7 +107,7 @@ tower = { version = "=0.5.3", features = ["full"] }
 tower-http = { version = "=0.7.1", features = ["cors", "trace", "compression-gzip", "fs"] }
 
 # ---- Section 9: Configuration ----
-toml = "=1.1.5"
+toml = "=1.1.6"
 figment = { version = "=0.10.19", features = ["toml", "env"] }
 
 # ---- Section 10: Date & Time ----
@@ -147,7 +147,7 @@ zeroize = { version = "=1.9.0", features = ["derive"] }
 # ---- Section 14: TLS — Crypto Provider for rustls ----
 # Both tokio-tungstenite and reqwest depend on rustls 0.23+, which requires
 # an explicit CryptoProvider. We use aws-lc-rs (already in the dep tree).
-rustls = { version = "=0.23.43", default-features = false, features = ["aws_lc_rs"] }
+rustls = { version = "=0.23.44", default-features = false, features = ["aws_lc_rs"] }
 rustls-native-certs = "=0.8.4"
 # 2026-07-04 (Groww native shadow client PR-R1, operator "go" this session):
 # promote aws-lc-rs from transitive (rustls already pulls it — Cargo.lock had
@@ -255,7 +255,7 @@ form_urlencoded = "=1.2.2"
 # ---- Section 16: CLI ----
 
 # ---- Section 17: Unique IDs ----
-uuid = { version = "=1.26.0", features = ["v4", "serde"] }
+uuid = { version = "=1.26.1", features = ["v4", "serde"] }
 
 # ---- Section 18: Telegram Alerts ----
 
