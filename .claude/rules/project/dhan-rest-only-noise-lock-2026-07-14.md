@@ -3724,3 +3724,34 @@ them; they are now coded and therefore greppable and triage-able. They remain
 invisible to the §2.3d-i `WS-GAP-03` alarm by construction — that filter is
 scoped to `$.source = "fell_back_to_indices"`, and widening it to the bare
 code would page on ordinary connection churn across ~50 emit sites.
+
+**Sixth addendum (2026-09-13) — three reconnect/swap latency histograms, LOCAL
+`/metrics` ONLY.** No CloudWatch alarm, no EMF name, no budget lever, no page.
+The September forecast is **$142.24** against a **$135.00** automatic
+`STOP_EC2_INSTANCES` line (measured 2026-09-06), so §2.3n's standing rule binds:
+a new EMF name is ~$0.30/mo and needs a LEVER, not a cost note. These are
+numbers an operator reads AFTER a page from an existing family.
+
+| Metric | Measures | Why it earns no page |
+|---|---|---|
+| `tv_dhan_ws_dial_ms` | `BeginDial` → `DialSucceeded`, labels `endpoint` | `tv_dhan_ws_reconnect_total` has always counted how MANY re-dials a socket made and never how LONG one took. A slow dial is not a fault on its own — the idle watchdog and the flap damper already page on the shapes that are. |
+| `tv_dhan_ws_reconnect_recovery_ms` | `BeginDial` → the FIRST frame on the new socket, labels `endpoint` | The true blind window: it spans the subscribe dispatch AND Dhan's no-snapshot-on-subscribe dark period, so a freshly subscribed instrument is BLANK until its book next changes. **Nothing in this workspace had ever measured it.** Recorded once per dial, on the first-frame transition only — never on the per-frame arm, which is the `record_ws_lag` defect (~36M allocations/hour) it would otherwise reproduce. |
+| `tv_dhan_ws_swap_wire_ms` | one leg of a depth swap on the wire, labels `endpoint`, `leg` (`unsubscribe` \| `subscribe`) | `SWAP_WIRE_BUDGET` (1 s) is a `timeout` CEILING and was the only thing this repository had; `depth_first_packet.rs`'s own header says so verbatim. Recorded on BOTH outcomes — a leg that ELAPSES its budget is the most interesting sample there is, and recording only the `Ok` path would report a healthy median while every slow swap vanished. ≤ 25 swaps/minute, so cold. |
+
+**Why these were absent until now, recorded because it is the reusable half:**
+each was BOUNDED and the bound was mistaken for a measurement. A `timeout` says
+what we will WAIT; it says nothing about what happened. The three constants
+that bounded these paths were all correct and all silent.
+
+**NOT claimed:** that any of this makes a reconnect faster, or that Tuesday's
+session will page on a slow one. It makes three durations readable that were
+previously unknowable. Alarming any of them needs an operator lever in the same
+change, per §2.3n.
+
+**What a PR that violates this addendum looks like (REJECT):** adds an EMF name
+or alarm for any of the three without a lever; moves the recovery record off the
+first-frame transition onto the per-frame arm; records a swap leg on the `Ok`
+path only (reports a healthy median while slow swaps vanish); takes the dial
+stamp in `DialSucceeded` rather than reading it (the recovery measurement then
+has nothing to measure from); or adds a per-INSTRUMENT dimension to any of them
+— the §2.3 cardinality rule stands.

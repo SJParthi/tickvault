@@ -67,23 +67,68 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use tickvault_core::websocket::pool_supervisor::SubscribeInstrument;
 
-/// The depth of every depth socket's swap command channel, as the frame
-/// stack creates it. Pinned here so the per-minute cap below cannot drift
-/// above what `try_send` can actually queue.
+/// What one stock name COSTS to rotate, in swaps.
 ///
-/// Four is the frame stack's own figure: "enough that a busy minute cannot
-/// block the sender, small enough that a wedged connection surfaces as a
-/// refused `try_send` the caller LOGS rather than as a queue that hides it".
-pub const DEPTH_SWAP_COMMAND_CHANNEL_DEPTH: usize = 4;
+/// A name is its spot, its nearest future and its ATM window both legs —
+/// `slots_for_stock_name(DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE)`, 24 today — and
+/// `plan_depth20_minute` pairs each departure with an arrival, so replacing one
+/// name is exactly that many swaps.
+///
+/// DERIVED, never a literal. A wider stock ladder must move this figure with
+/// it, or the cap below silently stops being "one whole name" while still
+/// claiming to be.
+pub const DEPTH20_NAME_SWAP_COST: usize = crate::depth20_name_board::slots_for_stock_name(
+    crate::depth20_name_board::DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE,
+);
 
-/// The per-socket, per-minute swap cap.
+/// The depth of a DEPTH-20 socket's swap command channel, as the frame stack
+/// creates it. Pinned here so the per-minute cap below cannot drift above what
+/// `try_send` can actually queue.
+///
+/// **Raised 4 → one whole name on 2026-09-13** (operator: *"why the fuck per
+/// mintue depth 20 is not yet implemented"*; the grant is the 2026-09-11
+/// (FOURTH) scope-lock section, whose condition 1 — "it ships WITH the name
+/// board, never before it" — the same day's name-board wiring satisfied).
+///
+/// Four was the frame stack's own figure and it was right for the engine it was
+/// written for: *"enough that a busy minute cannot block the sender, small
+/// enough that a wedged connection surfaces as a refused `try_send` the caller
+/// LOGS rather than as a queue that hides it"*. The volume-ranked engine's
+/// healthy minute produced two swaps a socket. A NAME board's healthy minute
+/// produces a whole name, and at a depth of four the wire took six minutes to
+/// agree with a board that had already chosen correctly.
+///
+/// **The honest cost, and there is no shape that avoids it:** a queue that can
+/// hold a name can hide a wedge for a name's worth of sends. The refusal now
+/// arrives on the NEXT minute's first `try_send` instead of this minute's
+/// fifth — still counted as `channel_full`, still logged, one minute late.
+pub const DEPTH_SWAP_COMMAND_CHANNEL_DEPTH: usize = DEPTH20_NAME_SWAP_COST;
+
+/// The depth of a DEPTH-200 socket's swap command channel — deliberately
+/// UNCHANGED at four.
+///
+/// That pool swaps at most one instrument per socket per minute
+/// (`MAX_RANKED_SWAPS_PER_MINUTE` is its five-socket budget, one each), so a
+/// deeper queue buys it nothing and costs it the thing the depth is for: at
+/// four, a wedged depth-200 connection surfaces after four minutes; at
+/// twenty-four it would take twenty-four.
+pub const DEPTH200_SWAP_COMMAND_CHANNEL_DEPTH: usize = 4;
+
+/// The per-socket, per-minute swap cap — one whole name.
 ///
 /// Each swap is an unsubscribe plus a subscribe, each bounded by the
-/// supervisor's one-second wire budget, executed sequentially on the
-/// socket's task. Four swaps is therefore at most ~8 s of a socket's minute
-/// on the wire, and exactly the number the command channel can hold — a
-/// fifth `try_send` would be refused as `channel_full` anyway, so a cap above
-/// the depth is not a cap.
+/// supervisor's one-second wire budget, executed sequentially on the socket's
+/// task. A whole name is therefore at most ~48 s of a socket's minute on the
+/// wire, and exactly the number the command channel can hold — one more
+/// `try_send` would be refused as `channel_full` anyway, so a cap above the
+/// depth is not a cap.
+///
+/// **The ~48 s is a CEILING, not a measurement.** `SWAP_WIRE_BUDGET` is a
+/// `timeout`; the real per-leg cost is a socket write and should be
+/// sub-millisecond, which would put a full rotation near 50 ms. Nobody has
+/// measured it — `tv_dhan_ws_swap_wire_ms` was built for exactly this question
+/// and has never seen a live session. If a leg genuinely approaches its budget,
+/// this cap comes down; the budget does not go up.
 pub const MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE: usize = DEPTH_SWAP_COMMAND_CHANNEL_DEPTH;
 
 /// How many ranked contracts the depth-20 pool ENTERS from: the operator's
@@ -137,6 +182,47 @@ const _: () = assert!(
 const _: () = assert!(
     MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE <= DEPTH_SWAP_COMMAND_CHANNEL_DEPTH,
     "a per-minute cap above the command channel depth asks for swaps the wire refuses"
+);
+
+// The cap must DRAIN inside the minute that planned it.
+//
+// Each swap is two sequential wire calls, each bounded by the supervisor's
+// `SWAP_WIRE_BUDGET`. If the worst case cannot finish before the next steering
+// iteration arrives, the cap is not a cap — it is a backlog with a number on
+// it, and the next minute's `try_send` meets a queue that never emptied.
+//
+// 24 x 2 x 1 s = 48 s inside a 60 s interval. Raising the ladder, the budget or
+// the cap far enough to break this fails the build rather than quietly
+// producing a pool that is permanently one minute behind its own board.
+const _: () = assert!(
+    (MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE as u64)
+        .saturating_mul(2)
+        .saturating_mul(tickvault_core::websocket::pool_supervisor::SWAP_WIRE_BUDGET.as_secs())
+        < crate::depth_rebalance::REBALANCE_INTERVAL_SECS,
+    "a per-socket swap plan that cannot drain inside one steering interval is a \
+     backlog, not a cap: lower the cap or raise the interval"
+);
+
+// One whole name in one minute, which is the 2026-09-13 operator requirement
+// stated as an assertion rather than as a comment.
+//
+// Below this the wire takes more than one minute to agree with a board that
+// already chose correctly — the exact gap the operator named. Above it the cap
+// is buying nothing the board can use, since a name is the largest unit the
+// board ever moves.
+const _: () = assert!(
+    MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE >= DEPTH20_NAME_SWAP_COST,
+    "a cap below one name's swap cost cannot rotate a name in a minute, which is \
+     what the depth-20 name board exists to do"
+);
+
+// Depth-200's channel keeps the frame stack's original wedge-signal figure.
+// Raising it with depth-20's would delay that pool's `channel_full` by six
+// times for a pool that swaps at most once per socket per minute.
+const _: () = assert!(
+    DEPTH200_SWAP_COMMAND_CHANNEL_DEPTH < DEPTH_SWAP_COMMAND_CHANNEL_DEPTH,
+    "depth-200 swaps one instrument per socket per minute; a queue as deep as \
+     depth-20's only delays its wedge signal"
 );
 
 /// The I-P1-11 composite identity, as the depth pools key on it.
@@ -293,19 +379,47 @@ pub fn plan_depth20_ranked_minute(
                 decision.kept += 1;
                 continue;
             }
+            // PEEK, then cap, then consume — the depth-200 planner's ordering
+            // (`depth200_ranked_steer::plan_ranked_minute`), and load-bearing
+            // for the same reason.
+            //
+            // `capped` and `unfunded_departures` exist to separate "not
+            // allowed to give it" from "nothing to give", because they have
+            // OPPOSITE remedies: `capped` says raise the per-socket cap or
+            // widen the band, `unfunded_departures` says the ranking is
+            // shorter than the pool and no cap change would help. Testing the
+            // cap FIRST (the shape here until 2026-09-13) reported `capped`
+            // for a departure that arrived at a drained queue, so a socket at
+            // its budget with nothing left to place read as cap pressure and
+            // the documented remedy would have changed nothing at all.
+            //
+            // `continue`, never `break`: later releases on this socket may be
+            // on the ranking and belong in `kept`.
+            if arrivals.peek().is_none() {
+                // Fewer ranked contracts than departures: keep the slot
+                // occupied rather than shrink the socket.
+                socket_plan.unused_departures += 1;
+                decision.unfunded_departures += 1;
+                continue;
+            }
             if socket_plan.swaps.len() >= MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE {
+                // Refused by the cap with a candidate still waiting. Leaving
+                // it in the iterator is what lets the terminal
+                // `arrivals.count()` report it as `unplaced` rather than
+                // deleting it from the plan and from every counter.
                 decision.capped += 1;
                 continue;
             }
-            match arrivals.next() {
-                Some(take) => socket_plan.swaps.push((release, take)),
-                None => {
-                    // Fewer ranked contracts than departures: keep the slot
-                    // occupied rather than shrink the socket.
-                    socket_plan.unused_departures += 1;
-                    decision.unfunded_departures += 1;
-                }
-            }
+            let Some(take) = arrivals.next() else {
+                // Unreachable: the peek above returned `Some` and nothing
+                // between there and here advances the iterator. A `continue`
+                // rather than an `expect` because `panic = "abort"` on the
+                // release profile turns a wrong assumption here into process
+                // death mid-session, and `clippy::expect_used` is denied
+                // outside tests.
+                continue;
+            };
+            socket_plan.swaps.push((release, take));
         }
         if !socket_plan.swaps.is_empty() {
             decision.plan.sockets.push(socket_plan);
@@ -444,6 +558,37 @@ mod tests {
         // The three arrivals the cap refused this minute are counted as
         // unplaced, not silently dropped.
         assert_eq!(d.unplaced, 3);
+    }
+
+    /// An exhausted arrival queue is NOT a cap refusal, even on a socket that
+    /// has already spent its whole per-minute budget.
+    ///
+    /// The two counters exist to separate "not allowed to give it" from
+    /// "nothing to give": `capped` says raise the cap or widen the band,
+    /// `unfunded_departures` says the ranking is shorter than the pool. With
+    /// the cap tested BEFORE the queue (the shape here until 2026-09-13) the
+    /// last departure below reported `capped`, so the documented remedy —
+    /// raising the cap — would have changed nothing at all.
+    #[test]
+    fn an_exhausted_arrival_queue_is_unfunded_not_capped() {
+        let cap = MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE;
+        // Exactly `cap` arrivals, `cap + 1` departures: the first `cap`
+        // departures drain the queue and fill the budget, so the last one hits
+        // an empty queue AND a full budget at the same instant.
+        let departures: Vec<u64> = (700..700 + cap as u64 + 1).collect();
+        let held = vec![held_fno(&departures)];
+        let ranked: Vec<Depth200Candidate> = (1..=cap as u64)
+            .map(|i| candidate(i, i * 10, 1000 - i))
+            .collect();
+        let d = plan_depth20_ranked_minute(&held, &ranked);
+        assert_eq!(d.plan.swap_count(), cap);
+        assert_eq!(
+            d.capped, 0,
+            "the last departure was refused by an empty ranking, not by the cap"
+        );
+        assert_eq!(d.unfunded_departures, 1);
+        assert_eq!(d.plan.sockets[0].unused_departures, 1);
+        assert_eq!(d.unplaced, 0, "every arrival found a home");
     }
 
     #[test]

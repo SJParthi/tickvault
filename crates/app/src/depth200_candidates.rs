@@ -54,9 +54,12 @@
 //!
 //! # Complexity
 //!
-//! * publish — O(k) in the published list (k = 5), on the drain's 5-second
-//!   timer arm. **Never per packet.** One `Vec` of 5 and one `Arc`, on a path
-//!   that already allocates a 250-row ranking beside it.
+//! * publish — O(k) in the published list. `k` is [`DEPTH200_EXIT_UNDERLYINGS`]
+//!   (20 — the entry budget of 5 plus the 15-rank hysteresis band), on the
+//!   drain's 5-second timer arm. **Never per packet.** One `Vec` of 20 and one
+//!   `Arc`, on a path that already allocates the full ranking beside it.
+//!   *(⚠ CORRECTED 2026-09-13: read "k = 5", stale since the band widened
+//!   3 → 15 on 2026-09-11. The ENTRY set is 5; the PUBLISHED list is the band.)*
 //! * read — O(1): one lock-free `ArcSwap` load plus an `Arc` clone.
 //! * divergence — O(held × k) = O(5 × 5), once per minute, on the steering
 //!   loop's own task.
@@ -346,7 +349,12 @@ impl Divergence {
 ///
 /// Pure, so the interesting cases — an empty ranking, an empty pool, a
 /// same-id-different-segment near miss — are unit tests rather than a live
-/// surprise. O(held × ranked) with both bounded by 5.
+/// surprise. O(held × ranked): `held` is bounded by the socket budget (5) and
+/// `ranked` by the published band [`DEPTH200_EXIT_UNDERLYINGS`] (20), so ~100
+/// composite compares a minute.
+///
+/// ⚠ CORRECTED 2026-09-13: read "with both bounded by 5", stale since the
+/// hysteresis band widened 3 → 15 on 2026-09-11.
 ///
 /// The comparison is on the I-P1-11 COMPOSITE. Keying on the bare id would
 /// report a held index option as "on the ranking" because a stock option

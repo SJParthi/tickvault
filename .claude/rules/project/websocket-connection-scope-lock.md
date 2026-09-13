@@ -4804,3 +4804,518 @@ wall-clock minute under its own note.
 - Removes the persistence bound entirely rather than raising it — the write path
   has no spill tier, and a batch too wide is DROPPED.
 - Adds a CloudWatch metric name or alarm without a lever, per §2.3n.
+
+### 2026-09-12 (SAME DAY, LATER) — THE TABLE IS `top_volume`, AND ITS FOUR ORPHANED VIEWS ARE SWEPT
+
+**The verbatim operator demand (2026-09-12, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "dotnt make it as top volume rank table meake the table name as top volume alone dude okay?"
+
+This dated row is the rule-file record the rule-file-first law requires for a
+persisted-table name change. It is recorded here rather than in a new section
+because the section above is the one that governs this table, and a wire name
+that lives in two places is a wire name that drifts.
+
+#### What moved
+
+| Surface | Was | Now |
+|---|---|---|
+| The table | `top_volume_rank` | **`top_volume`** |
+| Its four per-cadence views | `top_volume_rank_{1s,3s,5s,1m}` | **`top_volume_{1s,3s,5s,1m}`** |
+| `HOUR_PARTITIONED_TABLES` | the old name | the new one, so it is still swept |
+| `RETENTION_EXEMPT_TABLES` | — | gains the LEGACY name, so the coverage guard demands a decision about it rather than silently ignoring it |
+
+#### What deliberately did NOT move
+
+The module, function and type names (`top_volume_rank_persistence`,
+`ensure_top_volume_rank_table`, `TopVolumeRankWriter`) are Rust identifiers, not
+wire names, and renaming them would churn the codebase-map guard for nothing.
+The six `tv_top_volume_rank_*_total` metric names likewise stay: verified
+against `deploy/`, they have **zero** hits — local `/metrics` only, in no EMF
+selector and no alarm — so renaming them breaks nothing, buys nothing, and
+would churn a rule-file row that names one of them verbatim. A metric name is
+its own namespace and need not track a table name.
+
+#### The history is CARRIED, not abandoned
+
+A one-shot `RENAME TABLE` at boot, issued **BEFORE** the CREATE DDL loop. The
+ordering is the whole safety property: a `CREATE TABLE IF NOT EXISTS
+top_volume` against a box already holding `top_volume_rank` rows succeeds
+against an EMPTY new table, and QuestDB then refuses the rename **forever** —
+stranding the old table outside `HOUR_PARTITIONED_TABLES`, never swept, growing
+on a volume this repository has already filled to zero twice. The `Split`
+verdict (both tables present) is escalated as a coded error rather than
+discarded; an earlier draft swallowed it with a bare `let _ =`, which made a
+halved history SILENT.
+
+#### The four orphaned views, and why the sweep runs where it does
+
+A QuestDB view is stored as its SQL **text** and resolved at query time, so the
+rename does not carry its views across: the four old faces still named a table
+that no longer exists. Left alone they are four permanently-broken surfaces in
+the table list beside the four working ones — created by this repository, on
+this repository's own box, by a rename this repository performed.
+`ensure_named_views` now issues `DROP VIEW IF EXISTS` for exactly those four
+names, and it runs **before** `ensure_top_volume_rank_table` on the boot path,
+so the sweep lands before the rename is attempted.
+
+**That ordering is a possible PRECONDITION, not tidiness.** Whether QuestDB
+REFUSES to rename a table that views depend on is **UNVERIFIED** — no QuestDB
+was reachable (no docker daemon in the dev container), so it could not be
+probed. If it does refuse, a rename attempted with those views present fails
+every boot forever and the pre-rename history stays stranded. Dropping them
+first removes that failure mode whether or not it exists; dropping them second
+would not.
+
+The sweep is **four literals, never a prefix match**: `top_volume_rank` — the
+legacy TABLE, holding every ranking row written before the rename — is a strict
+prefix of all four view names, so a prefix sweep would have the legacy table's
+own name in its blast radius. `shadow_persistence` already records what that
+costs, in its own words: a table carrying real tick volume whose name sat in a
+`DROP TABLE IF EXISTS` sweep. The list is fixed at four FOREVER — it is a
+historical fact about what was once created, not a mirror of `SnapshotCadence`,
+so a fifth cadence must never be added to it.
+
+#### ⚠ The measuring query in the sibling docs changed with it
+
+`CLAUDE.md`'s storage-map row carried the settling query naming the old table —
+a statement an operator would paste, which would now fail. Corrected there with
+its own dated note. **The reusable half is narrower than "names go stale":** a
+stale prose name costs a reader one grep; a stale name inside a *runnable
+command* costs them a failed query and a doubt about the whole row. A
+copy-pasteable statement in a document is an executable claim and goes stale
+like any other.
+
+#### ⚠ NOT claimed
+
+That the rename, the drop sweep, or `DROP VIEW IF EXISTS` has been executed
+against a live QuestDB. The drop syntax is the one
+`docs/runbooks/questdb-console-queries.md` already documents as the rollback
+for these same console views on the pinned 9.3.5, and `run_view_ddl` degrades a
+refusal to a counted warn rather than blocking the four CREATEs behind it — but
+no probe was possible, and the first boot after deploy is the measurement.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Writes the table name as a literal anywhere instead of reading
+  `TOP_VOLUME_RANK_TABLE` — the rename exists precisely because the wire name
+  had to move in one place.
+- Issues the `CREATE TABLE IF NOT EXISTS` before the `RENAME` (makes the rename
+  permanently impossible and strands the history outside the retention sweep).
+- Discards the `Split` verdict, or downgrades it below a coded error.
+- Turns the legacy-view sweep into a prefix match, or derives it from
+  `SnapshotCadence` — either one puts the legacy TABLE, or a name that never
+  existed, into a DROP statement.
+- Drops the `IF EXISTS`, which makes the sweep warn on every boot from the
+  second onward — the "one error per boot, forever" shape that trains an
+  operator to discount a counter.
+- Renames the module, the functions, the types or the six metric names in the
+  name of consistency: they are not wire names, and the churn buys nothing.
+
+#### 2026-09-13 — the fourth adversarial round, and the three findings it deliberately did NOT fix
+
+**No new authorization is claimed.** This records an eight-agent parallel attack
+on the 2026-09-12 change, what it found, and — more usefully — the three
+confirmed defects that were FLAGGED rather than repaired, each with the reason
+the obvious fix is worse than the gap.
+
+**Fixed in the same change** (listed so a reader knows which of the eight
+findings are closed): the snapshot timers' boot-only wall/monotonic anchor,
+which at 500 ppm NTP slew collides ~12 windows per session into one grid cell
+where the DEDUP key silently upserts one over the other; three guards on this
+branch that could not fail; the `Split` verdict counter registering itself as
+ZERO inside its own detection arm; the view re-ensure being gated on two
+unrelated tables; the third offload writer having no shutdown accounting; an
+unthrottled `error!` that a dead writer thread turns into ~180,000 lines per
+session.
+
+##### FLAGGED 1 — a re-latch clobbers a LONGER cadence's in-flight window
+
+`volume_leaderboard.rs`. `RELATCH_AFTER_CONSECUTIVE_LOWER` fires after 32
+consecutive lower readings and reseeds `baseline: [contract.volume; WINDOW_COUNT]`
+— **all four cadences at once**, including a 1-minute window that may be only
+seconds old. The genuine trading in that window becomes unrecoverable; after the
+resync restores `[ceiling; 4]` the 1-minute board reports `volume − ceiling`
+rather than `volume − pre_dip_baseline`, under-reporting by the amount traded
+between the window's open and the abandoned high. A genuinely busy contract can
+therefore read `zero_lot` for one minute and lose a depth-200 socket to a
+quieter one. The re-latch comment concedes only that "its first window after a
+re-latch reports nothing", which covers the window it lands in and not the
+clobbering of a longer cadence mid-flight.
+
+**Why the obvious fix is REFUSED.** Saving the pre-dip baselines at re-latch and
+restoring them at resync (`resync_baseline: [u32; WINDOW_COUNT]` in place of the
+scalar `resync_ceiling`) looks clean and is WRONG: sweeps continue to fire
+between the re-latch and the resync, and any sweep that visits the contract
+rolls that cadence's baseline forward. Restoring a saved baseline over a rolled
+one **double-counts** the interval — reporting volume that was already reported.
+Getting it right needs per-slot tracking of which windows have closed since the
+re-latch, which is new state on a hot-path struct with 1 B of real padding left.
+
+Under-reporting one window after a rare 32-consecutive-lower episode is bounded
+and self-correcting on the next window. Double-counting is neither. **The
+current behaviour is the safer error**, and this file's own house rule applies:
+an inherently imperfect step is FLAGGED with its constraint and its chosen
+alternative, never papered over with a subtly-wrong repair at the end of a long
+session.
+
+##### FLAGGED 2 — the ILP writer is live ~900 boot-lines before the RENAME
+
+`main.rs` spawns the feed stack at ~2890; the one-shot
+`RENAME top_volume_rank → top_volume` runs at ~3797. If any snapshot row reaches
+`top_volume` before the rename, QuestDB auto-creates the table and the rename
+returns `Split`: pre-rename history stranded in a table no longer in
+`HOUR_PARTITIONED_TABLES`, plus a new table with no DEDUP key.
+
+The happens-before rests on the 09:15 ranking gate — i.e. on wall-clock luck,
+and a **mid-session restart narrows it to seconds**. It is detected and counted
+(and, as of this change, counted with a number rather than a zero), never
+prevented.
+
+**NOT fixed here** because the shape is PRE-EXISTING — before the rename, the
+same race auto-created `top_volume_rank` without its DEDUP key — and the repair
+is a boot re-order that moves DDL ahead of the lane spawn on a path where
+`ensure_ddl_boot_wiring_guard` already pins four separate orderings for four
+separate reasons. Re-sequencing that at the end of a four-round PR is a larger
+risk than the gap it closes.
+
+##### FLAGGED 3 — `table_exists` reads any non-2xx as "absent"
+
+`http_client.rs` maps every non-success response to `Some(false)`, so a
+WAL-suspended or otherwise erroring legacy table reads as NotNeeded and a real
+Split is never reported. The comment at the site states *"the conservative
+direction is the opposite"* and then ships the non-conservative branch.
+
+**NOT fixed here:** the helper is shared by FOUR table renames
+(`spot_1m_rest`, `option_chain_1m`, `option_contract_1m_rest`, and this one), so
+changing its semantics changes three surfaces this PR never touched. It is
+pre-existing, it suppresses a REPORT rather than losing data, and it deserves
+its own change.
+
+##### ⚠ What this round says about the guards themselves
+
+Three of the eight findings were guards written ON THIS BRANCH that could not
+fail — one anchored on a string occurring only in its own argument, one
+satisfied by a neighbouring field's initialiser, one satisfied by its own
+assertion message. That brings this repository's vacuous-guard tally to
+**eight**, and it is the reusable half of the round: **a source scan run against
+the whole file can always be satisfied by the assertion that names it.** Every
+such scan in the changed files now slices below the first `#[cfg(test)]` and
+asserts an occurrence COUNT before comparing positions. A guard that cannot fail
+is worse than no guard, because it also certifies that the case is covered — the
+same cost this file records for `day_ohlc_tracker` (2026-08-12) and
+`WAL-SUSPEND-01` (2026-08-25).
+
+**What a PR that violates this section looks like (REJECT):** restores a
+whole-file `contains` on a string that also appears in its own assertion text;
+seeds a metric series inside the arm that detects the event it counts; reseeds
+all cadence baselines on re-latch AND restores saved baselines at resync without
+tracking which windows closed in between (double-counting); or reports any of
+the three flagged items as fixed.
+
+### 2026-09-13 — THE WIRING GO-AHEAD: the top-6 name board becomes the depth-20 engine, and the probe is made able to tell the truth
+
+**The verbatim operator authorization (2026-09-13, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "dude then fix and reosleve vrythign entilrey as peor oru requiremnet dude okay?"
+
+Given in DIRECT response to a message that ENUMERATED six items and said explicitly that
+two of them needed his word because they change behaviour inside this scope-locked module:
+*"Items 1 and 2 change behaviour inside a scope-locked module, so they need a dated record
+in `websocket-connection-scope-lock.md` before the code moves. Say which you want."* He
+answered "everything, as per our requirement". That is the §28.2/§28.3 authorization shape
+this repository already accepts — a general go-ahead answering an ENUMERATED ask selects the
+enumerated work. Recorded HERE before any code, per the rule-file-first law.
+
+The six items, as put to him:
+
+1. Make Arm B of the unsubscribe probe tell the truth.
+2. Wire the top-6 name board, or decide out loud not to.
+3. Close the two verdict-corrupting HIGHs: the generation check and the refused-stamp
+   inversion.
+4. Make the probe once-per-DAY, not once-per-process.
+5. Fix vacuous guard #11, the `break` that loses `kept`, and the depth-20 cap ordering.
+6. Write the Dhan support draft.
+
+#### ⚠ Item 2 is a DELIVERY, not a new scope — and it changes which engine drives depth-20
+
+The shape was already authorized on 2026-09-11: the THIRD quote of that day moved depth-20
+from "top 250 CONTRACTS by volume" to "top N UNDERLYINGS by absolute percentage move", and
+the FOURTH narrowed it to **six** mover stocks (spot + nearest future + options ATM±5) plus
+NIFTY and BANKNIFTY (future + options ATM±11) = **238 of 250**. `depth20_name_board.rs` was
+written that day and has carried **ZERO production call sites** ever since — 785 lines that
+compile, are tested, and never run. The wiring commit was never written.
+
+So this section authorizes no new instrument class and no new socket. What it does
+authorize, and what must be stated because it is not a detail, is the **engine
+precedence**: after this change the name board is the PRIMARY depth-20 engine, and the
+volume ranking no longer drives depth-20. Before it, `depth_rebalance.rs`'s three-branch
+match hands depth-20 to `plan_depth20_ranked_minute` (top 250 by `window_lots_milli`)
+every minute from the first ranking at ~09:15, so wiring the board into the pre-ranking
+`None` arm alone would have run it for about one minute a day and left the 2026-09-11
+requirement undelivered. The band, the exit rank and the slot arithmetic are unchanged
+from the day they were locked.
+
+**depth-200 is NOT touched.** Its volume key, its 5/20 hysteresis band, its
+distinct-underlying rule and its stock-options-only restriction all stand exactly as
+2026-09-06 and 2026-09-11 (SECOND) left them.
+
+#### ⚠ Item 1: the probe's Arm B contradicted the probe's own header, and the header was right
+
+The module header describes Arm B's mechanism as *"close, re-dial, replay a set WITHOUT the
+contract"*. The implementation did the opposite and said so in `act_socket_close`'s own
+docstring: *"The guard is UNTOUCHED, so the replay re-subscribes the same contract."*
+
+Both arms then share one verdict mapping — `if arrived { Ignored } else { Honoured }`. With
+the guard untouched the redial re-subscribes the contract, frames always resume, `arrived`
+is always true, and **Arm B returns `Ignored` whatever Dhan does.** The control built to
+separate the vendor's behaviour from ours could only ever return the vendor-blaming answer.
+A vendor ticket quoting it would be quoting our own replay.
+
+Arm B is therefore rebuilt to the header's design: drop the contract from the retained set
+WITHOUT a wire frame, then close, so the replay comes back without it. Two consequences
+follow and both are handled rather than absorbed — Arm B must now RESTORE like Arm A, and
+silence alone is no longer proof, because a socket that never redialled is also silent. A
+`Honoured` verdict requires a positive liveness witness; without one the run reports
+`InconclusiveNotRedialled` and says nothing about the vendor.
+
+#### ⚠ Item 3: two ways the probe could produce a confident wrong answer
+
+**(a) The generation defence was specified in a code comment and never implemented.** The
+supervisor's own `ProbeUnsubscribe` arm says it verbatim: *"Both need the same defence and
+the caller owns it: record `guard.generation()` when the probe is armed and invalidate the
+verdict if it moved."* The caller never captured it. A redial inside the watch window
+therefore produces a **false `Honoured`** for Arm A — the emptied guard replays nothing, so
+the silence is ours. `finish()` already carries a hand-written warning telling the reader to
+check `ws_event_audit` by hand; a residual an operator must remember to check is not a
+defence.
+
+**(b) A refused stamp read as "a frame arrived".** `any_frame_within` ignored the return of
+`record_subscribe_at` and inferred arrival from `!forget(..)`. When the tracker REFUSES a
+stamp — the pending map at `MAX_PENDING`, or the already-streaming gate — no entry exists,
+`forget` returns false, and the helper reports `true`: *a frame arrived*. In the baseline
+that passes an inadmissible run; in the watch it returns `Ignored`, a false vendor-blaming
+finding, from a measurement that never started.
+
+#### ⚠ Item 4: both probe latches are in-memory
+
+The probe is documented once-per-session and is in fact once-per-PROCESS. `Restart=always`
+plus a mid-session deploy re-arms it, so a day can carry several runs — each costing a
+depth-200 socket two minutes of stale strikes, and each re-closing a socket. It becomes
+once per TRADING DAY.
+
+#### Honest envelope (mandatory per operator-charter §F)
+
+> "The name board's ranking, its band, its slot arithmetic and its refusal to rank a name
+> with a missing price are pure and ratcheted. **NOT claimed: that the board's `move_bps`
+> is fed the inputs it was designed for.** `PrevCloseStore` is owned `&mut` by the frame
+> drain and is not reachable from the steering loop, so the wiring converts the movers
+> table's `close_pct_from_prev_day` to basis points instead. It is the same quantity from a
+> different source with a different lag — QuestDB candles rather than the drain's live
+> pair — and that substitution is recorded here rather than hidden behind a function name.
+> **NOT claimed: that NSE_EQ depth delivers.** The board puts each mover's SPOT on a depth
+> socket; no session has ever sent an `NSE_EQ` depth subscribe on this account, so the six
+> spot slots are UNVERIFIED-LIVE and the first session is the probe. **NOT claimed: that a
+> name rotates inside a minute.** A name is 24 slots against a 4-swap-per-socket-per-minute
+> budget, so one name changing takes several minutes to apply; the board's own test pins
+> this. The operator's 'rotate every minute' is delivered as *the board is RECOMPUTED every
+> minute and the delta is applied under the existing cap*, never as a full set swap.
+> **NOT claimed: that the probe now answers whether code 25 works.** It is armed by an
+> operator, it is default-OFF, and it has never run."
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Restores the shared `if arrived { Ignored } else { Honoured }` mapping for Arm B, or lets
+  Arm B report `Honoured` without a liveness witness.
+- Leaves Arm B without a restore now that it empties the guard — that strands a depth-200
+  socket dark for the session.
+- Infers "a frame arrived" from a stamp whose acceptance was not checked.
+- Ships a probe verdict without comparing the guard generation captured at arm time.
+- Re-runs the probe more than once per TRADING DAY.
+- Gives depth-20's name board a socket or instrument budget other than 250, or a board cost
+  other than the const-asserted 238 — a wider stock window costs 262 and the assert fails
+  the build, which is the intended outcome.
+- Applies the name-level hysteresis band inside the planner rather than when CHOOSING the
+  six names. `plan_depth20_minute` diffs against a desired layout, so a band applied at plan
+  time is inert and the exit rank silently does nothing.
+- Changes depth-200 under cover of this section.
+- Ranks a name whose spot or previous close is missing as 0% — that ties it with a genuinely
+  flat name and hands it 24 slots it did not earn.
+- Auto-sends the Dhan draft to anyone. The 2026-09-12 section's REJECT row stands: the draft
+  is a committed markdown file a human reads and sends.
+
+#### ⚠ CORRECTED 2026-09-13 (same day, hours later) — the board was wired and, for the INDEX half, silently never dialled
+
+**No new authorization is claimed.** The section above authorizes this work; this
+records what an adversarial re-audit of it found, and is the correction the
+rule-file-first law expects when a section's own claim turns out to be false in
+practice.
+
+The section above says the name board "becomes the PRIMARY depth-20 engine".
+It was wired, it ran, and it logged `engine="name_board"`. **For NIFTY and
+BANKNIFTY it dialled nothing at all**, for the whole session, and every counter
+read healthy while it did.
+
+#### The mechanism, and why no existing signal could see it
+
+`depth20_track::match_sockets_by_overlap` paired a wire socket to a layout
+socket by equal held-count, then by largest key overlap, and left anything
+matching neither UNPAIRED — a docstring defended that as "refusing to guess".
+`plan_depth20_minute` treats an unpaired socket as
+`sockets_left_alone += 1; continue`, so the socket is never touched, `held`
+never changes, and the identical non-match recurs on every later minute.
+
+That is the HANDOVER, not a corner case. The volume board is stock options only
+(the 2026-09-06 lock) and this section's first two sockets are NIFTY and
+BANKNIFTY, so the two key sets are **disjoint by construction**: the count pass
+cannot match them (50 held vs 47 wanted) and the overlap pass cannot either
+(zero overlap). The two UNCONDITIONAL index names this section makes
+undisplaceable were the exact pair the matcher could never re-aim.
+
+**FIXED** by a third pass that assigns the leftovers by POSITION — an unclaimed
+want is one no socket recognised, so handing it to a socket no want recognised
+takes nothing from anyone. The count-matched and overlap cases are unchanged.
+
+**The test that defended it is WITHDRAWN in place**, not deleted:
+`an_unrecognisable_socket_holds_position_rather_than_guessing` asserted
+`plan.is_quiet()` on exactly this shape. It was the defect, written down and
+guarded, and the reasoning is kept at the site so nobody restores it.
+
+#### Two further findings against THIS section's own contract
+
+* **The probe could arm inside the last 30 minutes.** The 2026-09-12 section's
+  REJECT list says "Runs inside the last 30 minutes of the session" in as many
+  words and **nothing enforced it**. Now `PROBE_NO_ARM_BEFORE_CLOSE_SECS`.
+* **The probe made its own stall alarm fire.** `spawn_rebalance_heartbeat`
+  publishes `now − stamp` from a stamp only the steering loop writes, so a
+  probe blocking past 180 s paged `depth_steering_stalled` about itself. The
+  loop now stamps either side of the probe block. Residual stated at the site:
+  a probe blocking LONGER than 180 s still pages, correctly.
+
+#### ⚠ NOT FIXED, and it is the operator's call
+
+The per-row `top_volume` ILP append still runs **on the frame-drain task** —
+MEASURED **14,932 µs** at the 20,220-row ceiling against the sort's **1,030 µs**,
+i.e. **14.5×** the cost the 2026-09-12 section measured and reported as the
+sweep's dominant term. Moving it off the drain changes the data flow of a
+scope-locked module, so it needs its own dated line here first and is recorded
+rather than taken.
+
+#### The reusable half
+
+This section was written, reviewed and shipped believing the board drove all
+five sockets. What made the gap invisible is that **every signal it had was a
+signal about intent** — the engine label in the log line, the swap counters —
+and none was a signal about the wire. The board also shipped with no metric of
+its own while the ranked counters it displaced freeze at handover, so the one
+depth-20 read-out went flat exactly when the engine changed: green by absence,
+the shape this file has now recorded on `tv_binary_main_sha_mismatch`,
+`tv_depth_rows_spilled_total` and here. **A new engine needs its own counter in
+the same change that makes it primary** — `tv_depth20_name_board_outcomes_total`
+and `tv_depth20_name_board_names_chosen` now exist, seeded at boot, recorded on
+BOTH arms so the refusal labels can report a refusal.
+
+**What a PR that violates this correction looks like (REJECT):** removes the
+third matching pass, or restores a docstring claiming an unpaired socket is
+safely left alone; re-adds a test asserting `is_quiet()` on a disjoint handover;
+lets the probe arm inside the last 30 minutes; removes the heartbeat stamps
+around the probe block; records the name board on the steerable arm only (the
+refusal counters then can never leave zero); or moves the ILP append off the
+drain without its own dated operator line.
+
+### 2026-09-13 (SECOND) — THE PER-MINUTE SWAP BUDGET IS RAISED SO A WHOLE NAME MOVES IN ONE MINUTE
+
+**The verbatim operator demand (2026-09-13, typed directly in-session — preserve
+EXACTLY, expletives and typos included):**
+
+> "why the fuck per mintue depth 20 is not yet implemented mtoherfucker why? fix and reosleve an dimpelemnt this also ddue okay?"
+
+**No NEW authorization is claimed, and none is needed.** The 2026-09-11 (FOURTH)
+section already authorized this work in as many words — *"Raising both so a whole
+name moves in one minute is authorized"* — under three binding conditions, the
+first of which was *"It ships WITH the name board, never before it."* The name
+board shipped **earlier today** (the 2026-09-13 section above makes it the PRIMARY
+depth-20 engine), so condition 1 is now satisfied and the raise is unblocked. This
+dated row records that, and records the operator asking for the half that was
+deliberately deferred.
+
+#### What was already per-minute, and what was not
+
+The complaint is precise and the answer has three parts, only one of which is a gap:
+
+| Stage | Cadence | State |
+|---|---|---|
+| The name board is RECOMPUTED from the movers table | every minute, at `REBALANCE_OFFSET_SECS` (:08) past the boundary | **already per-minute** |
+| The delta against what the sockets hold is PLANNED | every minute, same pass | **already per-minute** |
+| The delta is APPLIED to the wire | **capped at 4 swaps per socket** | **THE GAP** |
+
+A stock name is `slots_for_stock_name(5)` = 1 spot + 1 future + 22 options = **24
+instruments**. Against a per-socket cap of 4 that is **six minutes to rotate one
+name**, and a name leaving mid-list re-chunks the three stock sockets so all three
+carry ~24 swaps at once — still six minutes, because the cap is per socket. So the
+board chose the right six names every minute and the wire took six minutes to
+agree with it.
+
+#### Why the cap was 4, and why that reason has expired
+
+`MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE` was const-asserted equal to
+`DEPTH_SWAP_COMMAND_CHANNEL_DEPTH`, and 4 was the CHANNEL's number, not the wire's
+— the frame stack's own words: *"enough that a busy minute cannot block the
+sender, small enough that a wedged connection surfaces as a refused `try_send` the
+caller LOGS rather than as a queue that hides it."* That figure was chosen for the
+volume-ranked engine, whose healthy minute produced **two** swaps a socket. A name
+board's healthy minute produces **24**. The cap was never a vendor limit and never
+a wire limit; it was a queue depth sized for a different engine.
+
+#### The contract (LOCKED)
+
+| Aspect | Locked value |
+|---|---|
+| Per-socket per-minute cap | **`DEPTH20_NAME_SWAP_COST` = 24** — DERIVED from `slots_for_stock_name(DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE)`, never a literal, so a wider stock ladder moves the cap with it |
+| Channel depth (depth-20) | raised in lockstep to the same 24 — **condition 2 of the 2026-09-11 grant is preserved**: the cap stays const-asserted `<=` the channel depth, because a cap above the queue is not a cap |
+| Channel depth (depth-200) | **UNCHANGED at 4** — its own cap is 1 per socket per minute, so a deeper queue there would only delay its wedge signal for nothing |
+| Wire-time ceiling | const-asserted: `cap x 2 x SWAP_WIRE_BUDGET < REBALANCE_INTERVAL_SECS` — 24 swaps x 2 legs x 1 s = **48 s inside a 60 s minute**, 12 s of margin. A cap that cannot drain inside its own minute is not a cap either |
+| Socket affinity | **NOT adopted** — condition 3 of the 2026-09-11 grant, unchanged. `plan_depth20_minute` still diffs each socket by SET via `match_sockets_by_overlap`, never by position |
+| Everything else | UNCHANGED — 250 + 5 instrument budgets, 5 + 5 sockets, entry 6 / exit 12 name band, ATM±5 stocks / ATM±11 indices, the 238-slot board cost, `dry_run` true, the §28 frozen area |
+
+#### ⚠ The honest cost, stated rather than absorbed
+
+**The wedge signal is one minute later than it was.** At a channel depth of 4 a
+wedged connection refused the fifth `try_send` inside the same minute. At 24 the
+whole minute's plan queues, and the refusal arrives on the NEXT minute's first
+send — still counted as `channel_full`, still logged, one minute delayed. That is
+the price of the operator's requirement and there is no shape that avoids it: a
+queue that can hold a name is a queue that can hide a wedge for a name's worth of
+sends.
+
+**The 48 s figure is a CEILING, not a measurement.** `SWAP_WIRE_BUDGET` is a
+`timeout`, and this repository has now recorded three times that a bound is not a
+measurement. The real per-leg wire time is a socket write and should be
+sub-millisecond, which would make a full name rotation ~50 ms — but nobody has
+measured it, because the histogram that measures it
+(`tv_dhan_ws_swap_wire_ms`, shipped earlier today) has never seen a live session.
+**The first session on this build is the measurement**, and if a leg genuinely
+approaches its budget the cap must come down, not the budget up.
+
+**It does not make Dhan honour the unsubscribe.** Both code 25 and code 24 are
+proven ignored (2026-09-10, 2026-09-11), so every swap this raises the rate of is
+a swap whose unsubscribe the vendor currently discards. Six times the swap rate is
+six times the ghost rate, bounded by the same `GHOST_REDIAL_SESSION_CEILING` and
+counted by the same `tv_dhan_feed_depth_total{outcome="ghost"}`. The remedy for
+that is the support ticket, not this cap.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Raises the cap above the channel depth, or drops the const-assert binding them
+  (condition 2 of the 2026-09-11 grant).
+- Writes the cap as a literal 24 instead of deriving it from
+  `slots_for_stock_name` — a wider ladder would then silently exceed its minute.
+- Raises the cap without the wire-time const-assert, or past the point where the
+  worst case drains inside `REBALANCE_INTERVAL_SECS`.
+- Raises the DEPTH-200 channel depth under cover of this section — its cap is 1
+  per socket per minute and a deeper queue only delays its wedge signal.
+- Adopts socket-affine packing for depth-20 (condition 3, unchanged).
+- Changes the socket or instrument budgets, the name band, or the ATM windows.
+- Reports the 48 s worst case as a measured figure.

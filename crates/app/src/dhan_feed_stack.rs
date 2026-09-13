@@ -919,6 +919,25 @@ pub const PREV_CLOSE_WRONG_DAY_COUNTER: &str = "tv_prev_close_store_wrong_day_to
 /// the whole signal.
 pub const TOP_VOLUME_APPEND_FAILURE_COUNTER: &str = "tv_top_volume_rank_append_failed_total";
 
+/// Contracts a snapshot could not project into a storable row, by reason.
+///
+/// Labelled `reason` with one series per [`SnapshotRefusal`], each pre-resolved
+/// and seeded at zero, because the Prometheus exporter renders no series it has
+/// never seen and each LABEL VALUE is its own series -- an unseeded reason is
+/// absent from `/metrics` until its first occurrence, which is the one moment
+/// an operator needs it already there.
+///
+/// Local `/metrics` only, like its two neighbours: no EMF name and no alarm,
+/// per the September budget position (forecast $142.24 against the $135.00
+/// automatic-stop line, where a new EMF name is ~$0.30/mo and the standing
+/// rule requires a LEVER rather than a cost note).
+///
+/// **`gain_unavailable` is EXPECTED to be non-zero** and is not a defect: it
+/// means the row was stored with a NULL `gain_pct` because the underlying had
+/// not printed yet. The other three reasons are zero on a healthy session and
+/// DO drop the row.
+pub const TOP_VOLUME_SNAPSHOT_REFUSAL_COUNTER: &str = "tv_top_volume_snapshot_refused_total";
+
 /// Narrows a WAL frame sequence onto the `i64` `ticks.capture_seq` column.
 ///
 /// # Why this function exists at all — the two-atomic hazard
@@ -1186,6 +1205,21 @@ pub struct LiveIngest {
     /// rescued and that never reached the spill file — the WAL-shutdown class,
     /// one tier out. Joined on the shutdown path.
     rescue_thread: Option<std::thread::JoinHandle<()>>,
+    /// The top-volume snapshot writer's join handle (2026-09-13).
+    ///
+    /// The THIRD offload thread, and until this field existed the only one
+    /// whose handle was discarded at the spawn site. See
+    /// `with_top_volume_writer` for what that cost; the short version is that
+    /// every shutdown abandoned up to `TOP_VOLUME_FLUSH_QUEUE_DEPTH` batches
+    /// with no counter, no log and no alarm, while its two siblings have both
+    /// had the accounting since 2026-08-28.
+    ///
+    /// Joined DIRECTLY rather than through a done-channel, unlike
+    /// `writer_thread`: this queue carries ranking snapshots, and its sink does
+    /// no rescue-tier work, so the bounded wait it needs is the one the
+    /// deadline already provides. A wedged socket is handled by checking the
+    /// deadline BEFORE joining rather than by a second channel.
+    top_volume_thread: Option<std::thread::JoinHandle<()>>,
     /// Signalled by the writer thread as its LAST act, so shutdown can wait
     /// with a bounded grace instead of a `join` that has no timeout.
     ///
@@ -1222,6 +1256,34 @@ pub struct LiveIngest {
     top_volume_append_failures: u64,
     /// Pre-resolved handle for [`TOP_VOLUME_APPEND_FAILURE_COUNTER`].
     top_volume_append_failure_counter: metrics::Counter,
+    /// Contracts refused by the snapshot projection this session, PER REASON,
+    /// indexed by `SnapshotRefusal::index`.
+    ///
+    /// # Why per reason and not one cumulative total (2026-09-12)
+    ///
+    /// It shipped as a single `u64` and that number gated the throttled
+    /// `warn!` for all four reasons at once. Three of the four DELETE the row
+    /// and are zero on a healthy session; the fourth, `gain_unavailable`, is
+    /// the EXPECTED state near the open — before a spot price and a previous
+    /// close exist, every contract refuses.
+    ///
+    /// So on an ordinary morning the benign reason drove the shared counter
+    /// past 2²⁰ within a minute, and a later `RankOutOfRange` or
+    /// `LotsOutOfRange` — each of which loses a row permanently — would next be
+    /// logged at the following power of two, i.e. plausibly never that session.
+    /// The per-reason metrics are local `/metrics` with no alarm, so the log IS
+    /// the surface, and a benign flood was hiding the surface for the reasons
+    /// that matter.
+    ///
+    /// Throttling per reason costs three extra `u64`s and makes each reason's
+    /// FIRST occurrence loud regardless of what the others are doing.
+    top_volume_snapshot_refusals: [u64; crate::top_volume_snapshot::SnapshotRefusal::ALL.len()],
+    /// Pre-resolved handle per reason for
+    /// [`TOP_VOLUME_SNAPSHOT_REFUSAL_COUNTER`], indexed by
+    /// `SnapshotRefusal::index`. An array rather than a labelled macro call
+    /// per refusal, because a non-literal label drops `metrics::counter!` to
+    /// its allocating arm on a path that runs per contract per cadence.
+    top_volume_snapshot_refusal_counters: [metrics::Counter; 4],
     /// Edge latch for the "every gainer verdict was Unknown" line: once per
     /// session, because the condition persists for a whole session when it
     /// happens at all and a line per 5-second sweep would be 4,680 of them.
@@ -1292,8 +1354,14 @@ impl LiveIngest {
     pub fn with_top_volume_writer(
         mut self,
         writer: tickvault_storage::top_volume_rank_persistence::TopVolumeRankWriter,
+        thread: std::thread::JoinHandle<()>,
     ) -> Self {
         self.top_volume = Some(writer);
+        // Taken together with the producer, never separately: the join is only
+        // meaningful once the queue is closed, and the queue closes when the
+        // producer drops. Holding one without the other is a join that hangs or
+        // a close nobody waits for.
+        self.top_volume_thread = Some(thread);
         self
     }
 
@@ -1532,6 +1600,14 @@ impl LiveIngest {
 
             let prev_close = &self.prev_close;
             let view = crate::depth_subscription_view::global_depth_subscription_view();
+            // ONE atomic load for the whole sweep. Held across the projection
+            // AND the append loop below, because the rows BORROW their label
+            // out of it — which is what makes the per-row label cost a pointer
+            // copy instead of the `format!` that up to 80,000 rows a second on
+            // this task would otherwise pay. The label itself was rendered once
+            // at contract attach; see `contract_underlying_map::labels_from_artifact`.
+            let labels =
+                crate::contract_underlying_map::global_contract_underlying_map().label_snapshot();
             let projection = crate::top_volume_snapshot::project_snapshot(
                 now_ist_nanos,
                 cadence,
@@ -1565,12 +1641,46 @@ impl LiveIngest {
                         spot_prices.latest_paise(underlying_id, segment),
                         prev_close.get(underlying_id, segment),
                     )
-                    .unwrap_or(f64::NAN)
                 },
                 |security_id, segment| view.is_subscribed(security_id, segment),
+                |security_id, segment| labels.get(&(security_id, segment)).map(AsRef::as_ref),
             );
 
             refused = refused.saturating_add(projection.refusal_count());
+            for (security_id, reason) in &projection.refusals {
+                let idx = reason.index();
+                self.top_volume_snapshot_refusal_counters[idx].increment(1);
+                self.top_volume_snapshot_refusals[idx] =
+                    self.top_volume_snapshot_refusals[idx].saturating_add(1);
+                let seen = self.top_volume_snapshot_refusals[idx];
+                // `counter` is a FIELD, not decoration: an operator who greps
+                // the counter name lands here, and the loss-counter visibility
+                // guard can only SEE that a loss-shaped counter has a surface
+                // if its name appears beside a log. Throttled on powers of two
+                // because the open can refuse many contracts at once -- the
+                // 1st, 2nd, 4th ... of the session is logged, which reports the
+                // onset immediately and the MAGNITUDE without flooding.
+                //
+                // PER REASON since 2026-09-12 — see the field's own doc. A
+                // shared counter let the benign `gain_unavailable` flood at the
+                // open suppress the first occurrence of the three reasons that
+                // actually lose a row.
+                if seen.is_power_of_two() {
+                    tracing::warn!(
+                        code = tickvault_common::error_code::ErrorCode::WsGapConnectionState
+                            .code_str(),
+                        counter = TOP_VOLUME_SNAPSHOT_REFUSAL_COUNTER,
+                        source = "top_volume_snapshot_refused",
+                        reason = reason.as_str(),
+                        security_id = *security_id,
+                        // THIS REASON's count, not the session total across
+                        // reasons — a shared number here would read as though
+                        // this reason had fired that many times.
+                        refusals = seen,
+                        "top_volume: a contract was refused by the snapshot projection. `gain_unavailable` is EXPECTED near the open and after a restart -- the row is still stored, with a NULL underlying-change column, so no volume is lost. Any OTHER reason drops the row and is zero on a healthy session."
+                    );
+                }
+            }
             let Some(writer) = self.top_volume.as_mut() else {
                 return (appended, refused);
             };
@@ -1642,14 +1752,24 @@ impl LiveIngest {
         // sweep. `flush` itself early-returns when `pending == 0`, so an idle
         // sweep still costs nothing.
         //
-        // NOT fixed by this, and stated because it was VERIFIED in source
-        // rather than assumed: an `append_row` that fails PART-WAY leaves the
-        // questdb-rs buffer in `TableWritten` state, which refuses every later
-        // row. `pending` is incremented only AFTER every `?` in `append_row`,
-        // so that case leaves `pending == 0` -- this gate reads false, and
-        // `flush` would early-return on `pending == 0` regardless. Recovering
-        // it needs the buffer cleared in `append_row`'s own error path, which
-        // is a separate change in the storage crate.
+        // ⚠ CORRECTED 2026-09-12 -- this paragraph used to close with
+        // "Recovering it needs the buffer cleared in `append_row`'s own error
+        // path, which is a separate change in the storage crate." **That
+        // change already existed when the sentence was written**, under the
+        // heading "# Why the marker (2026-09-09)" in
+        // `top_volume_rank_persistence::append_row`: it sets a MARKER before
+        // the row, `rewind_to_marker`s on any error, and falls back to
+        // `discard_pending()` if the rewind itself fails. So a half-written row
+        // cannot poison the buffer, and there is no storage-crate follow-up to
+        // open. Recorded rather than deleted because the cost of a stale
+        // "NOT fixed" note is the `day_ohlc_tracker` (2026-08-12) one: the next
+        // reader opens work that is already done.
+        //
+        // What the paragraph got RIGHT and is still worth keeping: `pending` is
+        // incremented only AFTER every `?` in `append_row`, so a failed append
+        // leaves `pending == 0` -- this gate reads false and `flush` would
+        // early-return regardless. That is now harmless rather than a leak,
+        // because the rewind already restored the buffer.
         if let Some(writer) = self.top_volume.as_mut()
             && (appended > 0 || writer.pending() > 0)
         {
@@ -1770,6 +1890,7 @@ impl LiveIngest {
             writer_offloaded: false,
             writer_thread: None,
             rescue_thread: None,
+            top_volume_thread: None,
             writer_done: None,
             prev_close: crate::prev_close_store::PrevCloseStore::new(),
             prev_close_disagreements: 0,
@@ -1793,6 +1914,18 @@ impl LiveIngest {
                 c.increment(0);
                 c
             },
+            top_volume_snapshot_refusals: [0; crate::top_volume_snapshot::SnapshotRefusal::ALL
+                .len()],
+            top_volume_snapshot_refusal_counters: crate::top_volume_snapshot::SnapshotRefusal::ALL
+                .map(|reason| {
+                    let c = metrics::counter!(
+                        TOP_VOLUME_SNAPSHOT_REFUSAL_COUNTER,
+                        "reason" => reason.as_str(),
+                    );
+                    // Seeded so the series EXISTS before the first refusal.
+                    c.increment(0);
+                    c
+                }),
             gainer_all_unknown_reported: false,
             leaderboard: crate::volume_leaderboard::VolumeLeaderboard::new(),
             replaying_wal: false,
@@ -2167,6 +2300,26 @@ impl LiveIngest {
         if let Some(depth) = self.depth_sink() {
             depth.close_offload_queue();
         }
+        // The top-volume queue closes when its PRODUCER drops — there is no
+        // `close_offload()` on that writer, because the producer half owns the
+        // only sender. Account for retained rows FIRST: on a `QueueFull` the
+        // producer keeps them and `flush` returns `Ok` (backpressure, not
+        // loss), so at shutdown they are rows nothing will ever flush and,
+        // until 2026-09-13, rows that skipped even the discard counter.
+        if let Some(writer) = self.top_volume.as_mut() {
+            let dropped = writer.discard_pending();
+            if dropped > 0 {
+                warn!(
+                    rows = dropped,
+                    "top-volume ranking rows were still held by the producer at \
+                     shutdown because the writer queue was full — counted on \
+                     the discard series, see the preceding coded line. These \
+                     are ranking SNAPSHOTS, not ticks: nothing a trade depends \
+                     on is lost, and the next session re-ranks from scratch."
+                );
+            }
+        }
+        self.top_volume = None;
     }
     /// Closes the hand-off queue and WAITS for the writer thread to finish.
     ///
@@ -2221,6 +2374,73 @@ impl LiveIngest {
                 code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                 "the tick writer thread PANICKED — the final batch of the session \
                  may not have reached QuestDB. Check the tick spill directory."
+            );
+        }
+    }
+
+    /// Waits for the top-volume snapshot writer to finish its queue.
+    ///
+    /// The THIRD writer to get shutdown accounting, and the last: ticks and
+    /// depth have had it since 2026-08-28, and this one was spawned with its
+    /// handle discarded until 2026-09-13.
+    ///
+    /// Shares the SAME deadline as the other two joins for the reason recorded
+    /// at `shutdown_offload_writer`: `main` gives this whole task ONE
+    /// `DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS`, and independent graces would SUM
+    /// past it — which is the arithmetic the compile-time assert in `main.rs`
+    /// exists to keep honest. All three queues are closed before any join
+    /// begins, so the threads drain in parallel and the total is the MAX of the
+    /// three waits, never the sum. Adding this third join therefore costs zero
+    /// shutdown budget.
+    ///
+    /// Idempotent, and a no-op on a lane whose writer never spawned.
+    pub fn shutdown_top_volume_writer(&mut self, deadline: std::time::Instant) {
+        let Some(handle) = self.top_volume_thread.take() else {
+            return;
+        };
+        // POLLED to the deadline, then joined only once the thread has actually
+        // finished — the `shutdown_rescue_writer` shape, adopted here on
+        // 2026-09-13 because this function did not have it.
+        //
+        // `JoinHandle::join` has no timeout, so a writer wedged on a hung
+        // socket hangs the box's shutdown until systemd's `TimeoutStopSec`
+        // SIGKILLs it — trading lost snapshot rows for a lost shutdown, which
+        // is the worse half of the trade. The previous version stated exactly
+        // that hazard in this comment and then called a bare `join()` anyway,
+        // guarded by a SINGLE `Instant::now() >= deadline` test at entry.
+        //
+        // A point-in-time check is not a bound. It only refuses to START
+        // waiting once the budget is already spent; enter this function one
+        // millisecond before the deadline with a wedged writer and it waits
+        // forever. This is the LAST of the three joins against one shared
+        // budget, so the two before it routinely leave very little — which is
+        // precisely the window in which the old check passed and then blocked.
+        //
+        // `is_finished()` is non-blocking, so the `join()` below cannot block:
+        // it runs only on a thread that has already exited.
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(RESCUE_JOIN_POLL);
+        }
+        if !handle.is_finished() {
+            metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, "writer" => "top_volume")
+                .increment(1);
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                "the top-volume writer was abandoned at shutdown — the lane's \
+                 flush budget was already spent by the tick and depth joins, so \
+                 the final ranking batches of the session may not have reached \
+                 QuestDB. These are ranking SNAPSHOTS, not ticks: no trade data \
+                 is lost and the next session re-ranks from scratch."
+            );
+            return;
+        }
+        if handle.join().is_err() {
+            metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, "writer" => "top_volume")
+                .increment(1);
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                "the top-volume writer thread PANICKED — the final ranking \
+                 batches of the session may not have reached QuestDB."
             );
         }
     }
@@ -3888,6 +4108,13 @@ fn seed_drain_loss_baselines() {
     // same operator action: check the spill directory before the next session.
     metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, "writer" => "tick").increment(0);
     metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, "writer" => "depth").increment(0);
+    // THIRD label, 2026-09-13. The comment above says "both writers"; there are
+    // three, and the third had no label because its thread handle was thrown
+    // away at the spawn site. Seeded here with the other two so the series
+    // exists before the first abandonment — the CloudWatch agent drops the
+    // first sample of a series it has never seen, so an unseeded counter
+    // publishes NOTHING on the one day it matters.
+    metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, "writer" => "top_volume").increment(0);
     // Rescues written WITHOUT a free-space answer, because the `df` probe
     // failed. Both tiers, both label values — a partially-seeded family is a
     // partial blind spot wearing the appearance of a covered one, and the
@@ -5301,26 +5528,100 @@ async fn run_frame_drain(
     // is `(ts, tf, family, feed, security_id, segment)` — so the burst
     // collapses into one row and the window it claims to measure never
     // happened.
-    let mut snapshot_1s_timer = tokio::time::interval(
-        TOP_VOLUME_SNAPSHOT_INTERVALS
-            [tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond.index()],
+    //
+    // ⚠ AND the grid it fires on (2026-09-12). `tokio::time::interval` resolves
+    // its FIRST tick immediately, so the grid was anchored on whatever instant
+    // this drain happened to start and every later fire carried that offset
+    // plus accumulated scheduling drift. A 5-second sweep starting at
+    // 08:31:02.4 stamped ...:02, ...:07, ...:12 — on no 5-second grid point at
+    // all, so its rows could never be lined up against the candle of the same
+    // window. `interval_at` at the next 09:00-anchored boundary puts every fire
+    // ON the grid, and `Skip` — not `Delay` — is what keeps it there after a
+    // stall: `Delay` re-bases to `now + period` and abandons the grid
+    // permanently, while `Skip` re-snaps to the next multiple of the period
+    // from the start instant. (Verified in tokio 1.53.1 `interval.rs`
+    // `next_timeout`: `Delay => now + period`, `Skip => now + period -
+    // ((now - timeout) % period)`.)
+    //
+    // Neither drops a window's DATA: both fire ONCE after a stall, and `rank`
+    // computes `volume - baseline[idx]` over the whole gap either way, so the
+    // merged window is measured end to end. Only `Burst` would split it, and
+    // Burst writes the current board under past timestamps.
+    let snapshot_timer_at =
+        |cadence: tickvault_storage::top_volume_rank_persistence::SnapshotCadence| {
+            let period = TOP_VOLUME_SNAPSHOT_INTERVALS[cadence.index()];
+            let delay = std::time::Duration::from_nanos(
+                crate::top_volume_snapshot::nanos_to_next_grid_boundary(
+                    now_ist_nanos(),
+                    cadence.interval_secs(),
+                ),
+            );
+            // `Instant::now()` and `now_ist_nanos()` are read one after the other,
+            // so the alignment is as good as the gap between them (sub-microsecond).
+            // The pairing is deliberate: the DELAY comes from the wall clock, which
+            // is what the grid is defined on, while the DEADLINE is monotonic, which
+            // is what tokio schedules on and what cannot be moved by an NTP step.
+            //
+            // ⚠ That pairing is only as good as the two clocks staying together,
+            // and they do NOT — see `reanchor_snapshot_timer` below, which is why
+            // this is an ANCHOR and not a one-time alignment.
+            let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + delay, period);
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            timer
+        };
+
+    // Re-take the wall/monotonic anchor for one snapshot timer (2026-09-13).
+    //
+    // `snapshot_timer_at` above derives a MONOTONIC deadline from a WALL-CLOCK
+    // delay, and tokio then advances that deadline by a fixed period forever.
+    // `CLOCK_MONOTONIC` and `CLOCK_REALTIME` separate continuously under NTP
+    // SLEW — up to 500 ppm, i.e. ~1.8 s per hour, ~16 s over a session — so a
+    // BOOT-ONLY anchor drifts off the grid by a margin that GROWS all day.
+    //
+    // The consequence is not a late row, it is a LOST one. `project_snapshot`
+    // stamps `floor_to_grid(now_ist_nanos(), interval)`, and the DEDUP key is
+    // `(ts, tf, family, feed, security_id, segment)`. Once the drift crosses a
+    // boundary, two consecutive fires of the same cadence floor to the SAME
+    // grid cell, the second upserts over the first, and one whole window's
+    // rows vanish inside QuestDB while `appended` counts them as written. At
+    // 500 ppm that is ~12 collisions per session on the 1-second cadence.
+    //
+    // This file already carries the identical fix for the identical shape:
+    // `refresh_receipt_anchor()` on the 30 s silence arm, whose note reads
+    // "a boot-only anchor would file bars in the wrong second by a margin that
+    // GROWS all day. That is the error shape hardest to notice and hardest to
+    // reconstruct afterwards." The four timers added today were precisely a
+    // boot-only anchor, so they join it on the same arm, and the same sizing
+    // applies unchanged: 30 s bounds the drift to ~15 ms at the worst permitted
+    // slew — three orders of magnitude inside a 1-second bucket, and the
+    // re-anchor therefore never moves a fire across a boundary itself.
+    //
+    // `reset_at` and not a rebuild: it keeps the interval's period and its
+    // `Skip` behaviour, and it is the only way to move a live `Interval`
+    // without dropping the one the `select!` arm borrows.
+    let reanchor_snapshot_timer =
+        |timer: &mut tokio::time::Interval,
+         cadence: tickvault_storage::top_volume_rank_persistence::SnapshotCadence| {
+            let delay = std::time::Duration::from_nanos(
+                crate::top_volume_snapshot::nanos_to_next_grid_boundary(
+                    now_ist_nanos(),
+                    cadence.interval_secs(),
+                ),
+            );
+            timer.reset_at(tokio::time::Instant::now() + delay);
+        };
+    let mut snapshot_1s_timer = snapshot_timer_at(
+        tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond,
     );
-    snapshot_1s_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut snapshot_3s_timer = tokio::time::interval(
-        TOP_VOLUME_SNAPSHOT_INTERVALS
-            [tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ThreeSecond.index()],
+    let mut snapshot_3s_timer = snapshot_timer_at(
+        tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ThreeSecond,
     );
-    snapshot_3s_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut snapshot_5s_timer = tokio::time::interval(
-        TOP_VOLUME_SNAPSHOT_INTERVALS
-            [tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond.index()],
+    let mut snapshot_5s_timer = snapshot_timer_at(
+        tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond,
     );
-    snapshot_5s_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut snapshot_1m_timer = tokio::time::interval(
-        TOP_VOLUME_SNAPSHOT_INTERVALS
-            [tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneMinute.index()],
+    let mut snapshot_1m_timer = snapshot_timer_at(
+        tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneMinute,
     );
-    snapshot_1m_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Consecutive alarm-worthy scans, and whether we have already paged for
     // this episode. Edge-triggered per audit Rule 4: the rising edge fires
     // once, the falling edge logs recovery at info and re-arms.
@@ -5825,6 +6126,34 @@ async fn run_frame_drain(
                 snapshot_refused = snapshot_refused.saturating_add(refused as u64);
             }
             _ = silence_timer.tick() => {
+                // Re-anchor the four snapshot timers against the wall clock.
+                //
+                // Beside `refresh_receipt_anchor()` below and for the same
+                // reason: both are monotonic deadlines derived once from a
+                // wall clock that slews away from them. See
+                // `reanchor_snapshot_timer` for the full note — the short
+                // version is that an un-anchored timer eventually fires twice
+                // inside one grid cell and the DEDUP key silently upserts one
+                // window over the other.
+                //
+                // Cost is four `reset_at` calls per 30 s. No syscall beyond the
+                // one `now_ist_nanos()` the arm is about to make anyway.
+                reanchor_snapshot_timer(
+                    &mut snapshot_1s_timer,
+                    tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond,
+                );
+                reanchor_snapshot_timer(
+                    &mut snapshot_3s_timer,
+                    tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ThreeSecond,
+                );
+                reanchor_snapshot_timer(
+                    &mut snapshot_5s_timer,
+                    tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond,
+                );
+                reanchor_snapshot_timer(
+                    &mut snapshot_1m_timer,
+                    tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneMinute,
+                );
                 // Daily rollover for the ranking state, checked on the 30s arm
                 // rather than given a timer of its own: it is a cheap integer
                 // compare, and a whole tokio timer to fire once a day would be
@@ -5871,9 +6200,35 @@ async fn run_frame_drain(
                             "ranking state reset for a new trading day — the process spanned \
                              an IST midnight"
                         );
+                        // INSIDE the `!= 0` guard since 2026-09-13, with the
+                        // log rather than beside it.
+                        //
+                        // `ranking_day` starts at 0, so the first 30-second
+                        // tick of EVERY drain took this branch. The sentinel
+                        // silenced the log — correctly, no midnight was crossed
+                        // — and the reset ran anyway, wiping the leaderboard,
+                        // `PrevCloseStore` and `SpotPriceStore` thirty seconds
+                        // into every session.
+                        //
+                        // Harmless on the 08:30 boot, where the stores are
+                        // still empty at 08:30:30 and the code-6 PrevClose
+                        // burst arrives with the 09:00 connect. NOT harmless on
+                        // a MID-SESSION restart: the burst lands within seconds
+                        // of connect, this wiped it, and code-6 is one-shot per
+                        // subscribe — so every `underlying_gainer_verdict` read
+                        // `Unknown` for the rest of the day, the gainer filter
+                        // published an EMPTY board, and both depth pools held
+                        // their boot dial. Detected only by the
+                        // `gainer_verdicts_all_unknown` latch, which is
+                        // log-sink-only.
+                        //
+                        // Nothing is lost by skipping it: a freshly constructed
+                        // store already belongs to today. The reset exists for a
+                        // real IST midnight crossing, which is what the `!= 0`
+                        // branch now means.
+                        ingest.reset_ranking_daily();
                     }
                     ranking_day = today;
-                    ingest.reset_ranking_daily();
                 }
                 // Re-take the WAL receipt anchor (2026-08-28).
                 //
@@ -6336,6 +6691,14 @@ async fn run_frame_drain(
     // depth thread has usually already drained — the total is the max of the
     // two waits, not the sum.
     ingest.shutdown_depth_offload_writer(offload_deadline);
+    // And the top-volume writer, against the SAME deadline. LAST of the three
+    // deliberately: ticks and depth carry trade data, this one carries ranking
+    // snapshots, so if the budget is short it is the right one to lose — and
+    // when it is lost it now SAYS SO on `writer="top_volume"` instead of
+    // vanishing, which is the whole point of the 2026-09-13 change. Its queue
+    // closed in `close_offload_queues` above, so it has been draining in
+    // parallel with the other two throughout.
+    ingest.shutdown_top_volume_writer(offload_deadline);
     // Both writer threads have joined (or been abandoned, counted): whatever
     // they acked is final for this session. Persist it now rather than trust
     // the once-a-second cadence to have caught the last batch.
@@ -10908,15 +11271,25 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
         // session rather than being consumed once. A top-up is a single event
         // — the contract overflow — so its channel is depth 1 and its sender
         // is dropped after. A swap channel must survive every minute of the
-        // day, so the sender is held by the re-selection task and the depth
-        // is 4: enough that a busy minute cannot block the sender, small
-        // enough that a wedged connection surfaces as a refused try_send the
-        // caller LOGS rather than as a queue that hides it.
+        // day, so the sender is held by the re-selection task.
+        //
+        // The two depth pools take DIFFERENT depths, and that is deliberate.
+        // The original figure was four for both: "enough that a busy minute
+        // cannot block the sender, small enough that a wedged connection
+        // surfaces as a refused try_send the caller LOGS rather than as a
+        // queue that hides it". Depth-20 now rotates a whole NAME in one
+        // minute (2026-09-13 (SECOND) scope-lock row), so four would refuse
+        // five sixths of its plan every minute; depth-200 still swaps one
+        // instrument per socket per minute and keeps the original four,
+        // where a wedge surfaces six times sooner.
         let topup_rx = match (endpoint, topup_rx, out_depth_commands.as_deref_mut()) {
             (DhanEndpointType::Depth20 | DhanEndpointType::Depth200, None, Some(depth_vec)) => {
-                let (tx, rx) = tokio::sync::mpsc::channel(
-                    crate::depth20_ranked_steer::DEPTH_SWAP_COMMAND_CHANNEL_DEPTH,
-                );
+                let channel_depth = if matches!(endpoint, DhanEndpointType::Depth20) {
+                    crate::depth20_ranked_steer::DEPTH_SWAP_COMMAND_CHANNEL_DEPTH
+                } else {
+                    crate::depth20_ranked_steer::DEPTH200_SWAP_COMMAND_CHANNEL_DEPTH
+                };
+                let (tx, rx) = tokio::sync::mpsc::channel(channel_depth);
                 let held: Vec<SubscribeInstrument> = guard.batches().flatten().copied().collect();
                 depth_vec.push((endpoint, depth_global_index, tx, held));
                 Some(rx)
@@ -12112,8 +12485,22 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 }
                 info!("top-volume writer thread exiting — the drain closed its queue");
             }) {
-            Ok(_handle) => {
-                ingest = ingest.with_top_volume_writer(producer);
+            Ok(handle) => {
+                // The handle is RETAINED since 2026-09-13. It used to be
+                // `Ok(_handle)` — discarded — which made this the only one of
+                // the lane's three offload writers with no shutdown accounting
+                // at all: no close, no join, no counter, no log. Up to
+                // `TOP_VOLUME_FLUSH_QUEUE_DEPTH` batches plus the one in flight
+                // died at every 17:30 stop and every mid-session redeploy, and
+                // nothing anywhere said so.
+                //
+                // §2.3n of the noise lock was written for exactly this shape on
+                // the tick and depth writers — "a thread that never got to run
+                // its drain increments neither loss series" — and the third
+                // writer simply never joined the pattern. The magnitude grew on
+                // this branch: removing the top-250 cut made a batch
+                // market-bounded rather than ≤500 rows.
+                ingest = ingest.with_top_volume_writer(producer, handle);
                 info!(
                     "top-volume snapshots enabled — 1s, 3s, 5s and 1m rankings will be written                      off the drain"
                 );
@@ -17211,6 +17598,158 @@ mod tests {
         assert_eq!(ingest.top_volume_append_failures(), 0);
     }
 
+    /// Every refusal reason must get its own PRE-SEEDED counter series.
+    ///
+    /// The Prometheus exporter renders no series it has never seen, and each
+    /// LABEL VALUE is its own series -- so an unseeded reason is absent from
+    /// `/metrics` until its first occurrence, which is the one moment an
+    /// operator goes looking for it. Building the array by mapping over
+    /// `SnapshotRefusal::ALL` is what makes "one per reason" structural rather
+    /// than a list somebody must remember to extend; this pins that shape.
+    #[test]
+    fn every_snapshot_refusal_reason_is_seeded_at_zero() {
+        let src = include_str!("dhan_feed_stack.rs");
+        // Anchored on a SIBLING field's initialiser, not on the array's own
+        // name -- the name appears first in the struct DECLARATION, so
+        // splitting on it would window over the field's doc comment and assert
+        // nothing about the init. Anchoring outside the array also keeps the
+        // two assertions below non-vacuous: neither string is in the anchor.
+        //
+        // The anchor moved 2026-09-12: it used to be
+        // `top_volume_snapshot_refusals: 0,`, and that field became a per-reason
+        // ARRAY, so the old anchor no longer exists. A guard anchored on a
+        // literal that can be edited away fails loudly rather than silently, and
+        // this one did.
+        // ⚠ ANCHORED ON THE ARRAY ITSELF since 2026-09-13. It used to anchor on
+        // the SIBLING field `top_volume_append_failures: 0,` and take a
+        // 600-byte window — but `top_volume_append_failure_counter` sits
+        // between the two, and IT carries a `c.increment(0)` at roughly offset
+        // 144. The array's own seeding is at roughly offset 725, OUTSIDE the
+        // window. So the seeding assertion below was satisfied by a DIFFERENT
+        // FIELD's seed, and deleting the array's `c.increment(0)` left the
+        // guard green — the exact defect it exists to prevent, one field over.
+        //
+        // The window is sized from the array literal now, and widened to 900 so
+        // it spans the `.map(...)` body rather than stopping inside it.
+        // The anchor stops at the FIELD NAME, deliberately. An earlier draft of
+        // this fix anchored on the whole `... : SnapshotRefusal::ALL` initialiser
+        // and then asserted that the window `contains("SnapshotRefusal::ALL")` —
+        // which the anchor had just consumed, so the assertion could only fail.
+        // The inverse of a vacuous guard, found by running it.
+        let init = src
+            .split_once("top_volume_snapshot_refusal_counters: crate")
+            .expect("the refusal-counter array must be initialised")
+            .1;
+        let init = &init[..init.len().min(900)];
+        assert!(
+            init.contains("SnapshotRefusal::ALL"),
+            "the array must be built from ALL, so a new reason cannot ship \
+             without its own series"
+        );
+        assert!(
+            init.contains("c.increment(0)"),
+            "each series must be SEEDED at zero, or it does not exist in \
+             /metrics until the first refusal. This assertion is anchored on \
+             the ARRAY, not on a neighbouring field whose own seed would \
+             satisfy it"
+        );
+
+        // The THROTTLE must be per reason too, or a benign flood suppresses
+        // the first occurrence of a reason that actually loses a row.
+        // ⚠ PRODUCTION-SCOPED since 2026-09-13. This was `src.contains(..)`
+        // over the whole file, and the assertion's own message below contains
+        // the very literal it searches for — so the guard was satisfied by
+        // itself and could not fail. Same class as the two above; three of them
+        // shipped on one branch, which is why the production slice is now the
+        // house shape rather than a one-off.
+        let production = src
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("production text precedes the first test module");
+        assert!(
+            production.contains("self.top_volume_snapshot_refusals[idx]"),
+            "the session tally must be indexed BY REASON. A shared counter let \
+             `gain_unavailable` -- expected for every contract near the open -- \
+             push the throttle past 2^20 in a minute, so the next \
+             `RankOutOfRange` (which DELETES a row) logged only at the \
+             following power of two."
+        );
+
+        // And a fresh ingest has counted nothing, on every reason.
+        let ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        assert_eq!(
+            ingest.top_volume_snapshot_refusals,
+            [0; crate::top_volume_snapshot::SnapshotRefusal::ALL.len()]
+        );
+        assert_eq!(
+            ingest.top_volume_snapshot_refusal_counters.len(),
+            crate::top_volume_snapshot::SnapshotRefusal::ALL.len(),
+            "one handle per reason, or `index()` reaches past the end"
+        );
+        assert_eq!(
+            ingest.top_volume_snapshot_refusals.len(),
+            ingest.top_volume_snapshot_refusal_counters.len(),
+            "the tally and the handles must stay the same length -- `index()` \
+             addresses both"
+        );
+    }
+
+    /// The loss-shaped counter must keep its LOG, which is its only operator
+    /// surface -- it is deliberately not EMF-selected.
+    #[test]
+    fn the_snapshot_refusal_counter_is_logged_beside_its_emit() {
+        // PRODUCTION text only, and an occurrence COUNT before the split.
+        //
+        // ⚠ Both halves were added 2026-09-13 after this guard was found
+        // VACUOUS. It anchored on
+        // `top_volume_snapshot_refusal_counters[reason.index()].increment(1)`,
+        // a string that appears exactly ONCE in this file — in this test's own
+        // argument. Production is `[idx]`, not `[reason.index()]`. So
+        // `split_once` matched the test itself, the three `contains` below hit
+        // its own assertion messages, and deleting the entire production emit
+        // left the guard GREEN.
+        //
+        // That is the vacuous-guard class this repository has now recorded
+        // eight times, and three of those instances were written on this very
+        // branch. The lesson is narrower than "check the anchor": an anchor
+        // scanned against the WHOLE file can always be satisfied by the
+        // assertion that names it, so the scan is scoped below the test module
+        // and the count is asserted first. A guard that cannot fail is worse
+        // than no guard, because it also reports that the case is covered.
+        let production = include_str!("dhan_feed_stack.rs")
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("production text precedes the first test module");
+        const EMIT: &str = "self.top_volume_snapshot_refusal_counters[idx].increment(1)";
+        assert_eq!(
+            production.matches(EMIT).count(),
+            1,
+            "the per-reason increment must exist EXACTLY once in production. \
+             Zero means this guard is vacuous; more than one means two emit \
+             sites and only the first is checked below"
+        );
+        let emit = production
+            .split_once(EMIT)
+            .expect("counted above, so this cannot fail")
+            .1;
+        let window = &emit[..emit.len().min(1_600)];
+        assert!(
+            window.contains("tracing::warn!"),
+            "a counter whose name ends `_refused_total` and reaches no \
+             CloudWatch metric must reach the LOG, or the loss is measured and \
+             the measurement discarded"
+        );
+        assert!(
+            window.contains("counter = TOP_VOLUME_SNAPSHOT_REFUSAL_COUNTER"),
+            "the counter NAME must be a field on that line, so an operator \
+             grepping the name lands on it"
+        );
+        assert!(
+            window.contains("is_power_of_two()"),
+            "throttled, or one bad open floods the sink"
+        );
+    }
+
     /// A packet stamped for a different trading day must not latch the
     /// session's previous close, and an INDEX underlying must be recorded.
     ///
@@ -19345,6 +19884,52 @@ mod tests {
 
         // Idempotent: a second call must not panic on an already-taken handle.
         ingest.shutdown_offload_writer(std::time::Instant::now() + OFFLOAD_SHUTDOWN_GRACE);
+    }
+
+    /// The THIRD writer's join, which did not exist until 2026-09-13.
+    ///
+    /// Its handle was discarded at the spawn site (`Ok(_handle) =>`), so the
+    /// thread could never be waited on: up to `TOP_VOLUME_FLUSH_QUEUE_DEPTH`
+    /// batches plus the one in flight died at every 17:30 stop and every
+    /// mid-session redeploy, with no counter, no log and no alarm — while its
+    /// two siblings had that accounting since 2026-08-28.
+    #[test]
+    fn shutdown_top_volume_writer_joins_the_thread_and_is_idempotent() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+
+        // A thread that has already finished, standing in for the real writer.
+        // The join must RETURN — if `shutdown_top_volume_writer` waited on
+        // something it never closed, this test would hang rather than fail,
+        // which is itself the assertion.
+        ingest = ingest.with_top_volume_writer(
+            tickvault_storage::top_volume_rank_persistence::TopVolumeRankWriter::for_test(),
+            std::thread::spawn(|| {}),
+        );
+
+        // `close_offload_queues` is what drops the producer and so closes the
+        // queue. The join is only meaningful after it, exactly as for the tick
+        // and depth writers, and it must also clear the producer so a late
+        // append cannot reach a queue nobody is draining.
+        ingest.close_offload_queues();
+        assert!(
+            ingest.top_volume.is_none(),
+            "closing the queues must drop the top-volume producer — the thread \
+             exits when its last sender is gone, so a retained producer is a \
+             join that never returns"
+        );
+
+        ingest.shutdown_top_volume_writer(std::time::Instant::now() + OFFLOAD_SHUTDOWN_GRACE);
+
+        // Idempotent: a second call must not panic on an already-taken handle.
+        // The shutdown tail is reached from more than one path, and a panic
+        // here would abort the process under `panic = "abort"` while it was
+        // trying to flush the tail of the session.
+        ingest.shutdown_top_volume_writer(std::time::Instant::now() + OFFLOAD_SHUTDOWN_GRACE);
+
+        // And a lane that never spawned the writer at all — the common case,
+        // since the snapshot writer is only built when QuestDB is configured.
+        let mut bare = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        bare.shutdown_top_volume_writer(std::time::Instant::now() + OFFLOAD_SHUTDOWN_GRACE);
     }
 
     #[test]
@@ -23460,16 +24045,124 @@ mod late_seed_tests {
         }
     }
 
+    /// The four cadence timers must fire ON the 09:00-anchored grid and stay
+    /// on it after a stall.
+    #[test]
+    fn the_snapshot_timers_fire_on_the_grid_and_stay_there_after_a_stall() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let drain = src
+            .split_once("async fn run_frame_drain")
+            .expect("the drain must exist")
+            .1;
+        let builder = drain
+            .split_once("let snapshot_timer_at =")
+            .expect(
+                "the four cadence timers must be built through ONE aligned \
+                 constructor -- four hand-written `interval(..)` calls is the \
+                 shape that drifted, and the one easiest to half-revert",
+            )
+            .1;
+        // Bounded at the NEXT closure, not at a byte count.
+        //
+        // This was `[..1_200]` until 2026-09-13, and adding six lines of
+        // comment inside the constructor pushed `MissedTickBehavior::Skip` past
+        // the end — the guard failed on correct code, which is the honest
+        // direction for a scan to be wrong but still a guard that goes red for
+        // a reason unrelated to what it protects. A fixed byte window on a
+        // region that legitimately grows is a guard with an expiry date.
+        //
+        // The boundary matters in the other direction too: `reanchor_snapshot_timer`
+        // below ALSO calls `nanos_to_next_grid_boundary`, so a window wide
+        // enough to reach it would let the re-anchor satisfy an assertion about
+        // the CONSTRUCTOR. Each is pinned separately, against its own region.
+        let builder = builder
+            .split_once("let reanchor_snapshot_timer =")
+            .map_or(builder, |(constructor, _)| constructor);
+
+        assert!(
+            builder.contains("interval_at("),
+            "`tokio::time::interval` resolves its FIRST tick immediately, which \
+             anchors the grid on the drain's start instant -- every fire then \
+             carries that offset and the rows land on no cadence boundary at \
+             all. It must be `interval_at` at the next grid point."
+        );
+        assert!(
+            builder.contains("nanos_to_next_grid_boundary("),
+            "the start instant must come from the 09:00-anchored grid, not \
+             from `Instant::now()`"
+        );
+        assert!(
+            builder.contains("MissedTickBehavior::Skip"),
+            "`Delay` re-bases to `now + period` after a stall and abandons the \
+             grid PERMANENTLY; only `Skip` re-snaps to it. `Burst` is worse \
+             still -- it fires the backlog and writes the current board under \
+             past timestamps."
+        );
+        assert!(
+            !builder.contains("MissedTickBehavior::Delay"),
+            "a `Delay` left anywhere in the snapshot timer constructor silently \
+             un-aligns the cadence it applies to"
+        );
+
+        // And the grid must be RE-TAKEN, not merely taken once.
+        //
+        // The constructor above derives a MONOTONIC deadline from a WALL-CLOCK
+        // delay, and tokio then advances it by a fixed period forever. The two
+        // clocks separate under NTP slew — up to 500 ppm, ~16 s over a session
+        // — so a boot-only anchor drifts off the grid by a margin that GROWS
+        // all day. Once it crosses a boundary, two consecutive fires of one
+        // cadence floor to the SAME cell and the DEDUP key upserts one window
+        // over the other: rows vanish inside QuestDB while `appended` counts
+        // them as written.
+        //
+        // Everything the constructor gets right is undone by that, which is
+        // why the re-anchor is pinned HERE rather than in a test of its own.
+        let reanchor = drain
+            .split_once("let reanchor_snapshot_timer =")
+            .expect(
+                "the snapshot timers must be RE-ANCHORED against the wall \
+                 clock. Building them on the grid once at boot is not enough — \
+                 see `refresh_receipt_anchor`, the identical fix this file \
+                 already carries for the identical shape",
+            )
+            .1;
+        assert!(
+            reanchor[..reanchor.len().min(900)].contains("reset_at("),
+            "`reset_at` is what moves a LIVE `Interval` without dropping the \
+             one the select! arm borrows, and it keeps the period and the \
+             `Skip` behaviour the constructor set"
+        );
+        // PRODUCTION-scoped, because `drain` runs to the end of the file and
+        // therefore includes this test module. The first draft of this
+        // assertion counted the literal in its OWN argument and read 5 where
+        // production has 4 — the self-satisfying-scan class for the third time
+        // in one session, this time inside the guard written to close the other
+        // two. The pattern is now unmistakable: any source scan that does not
+        // cut the test module can be satisfied, or defeated, by its own text.
+        let production_drain = drain
+            .split_once("\n#[cfg(test)]")
+            .map_or(drain, |(production, _)| production);
+        assert_eq!(
+            production_drain.matches("reanchor_snapshot_timer(").count(),
+            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ALL.len(),
+            "EVERY cadence must be re-anchored, not just the fastest. A cadence \
+             left out drifts alone, and its collisions are the hardest to \
+             attribute precisely because its siblings look correct"
+        );
+    }
+
     /// A cadence with no `select!` arm is the one four-cadence mistake that
     /// ships fully green: the enum, the labels, the views, the intervals and
     /// the docs can all name it while the drain never fires it, and the only
     /// symptom is a `tf` value that is absent from a table nobody reads until
     /// they need it.
     ///
-    /// Three things must line up per cadence, and this asserts all three
-    /// against `SnapshotCadence::ALL` rather than a hand-written list:
-    /// a timer built from the interval array, its `MissedTickBehavior::Delay`,
-    /// and a `select!` arm naming the variant.
+    /// Two things must line up per cadence, and this asserts both against
+    /// `SnapshotCadence::ALL` rather than a hand-written list: a timer built
+    /// through the aligned constructor, and a `select!` arm naming the
+    /// variant. The `MissedTickBehavior` moved into that constructor on
+    /// 2026-09-12 and is asserted ONCE by the test above rather than four
+    /// times here.
     #[test]
     fn every_snapshot_cadence_has_a_timer_arm_in_the_drain() {
         let src = include_str!("dhan_feed_stack.rs");
@@ -23481,21 +24174,14 @@ mod late_seed_tests {
             let label = cadence.as_str();
             let timer = format!("snapshot_{label}_timer");
             assert!(
-                drain.contains(&format!("let mut {timer} = tokio::time::interval(")),
+                drain.contains(&format!("let mut {timer} = snapshot_timer_at(")),
                 "cadence {label} has no timer: it is in SnapshotCadence::ALL, so \
                  its view and its label exist, but nothing ever fires a snapshot \
-                 for it and `top_volume_rank` will hold no `tf = '{label}'` row \
-                 for the life of the process"
-            );
-            assert!(
-                drain.contains(&format!(
-                    "{timer}.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay)"
-                )),
-                "cadence {label}'s timer is missing MissedTickBehavior::Delay. The \
-                 tokio default is Burst: after any pause the backlog fires back to \
-                 back, several snapshots land on the same `ts`, and the DEDUP key \
-                 (ts, tf, family, feed, security_id, segment) collapses them into \
-                 one row — a window that reads as measured and never happened"
+                 for it and `top_volume` will hold no `tf = '{label}'` row for \
+                 the life of the process. It must be built through \
+                 `snapshot_timer_at`, which is what puts it on the grid — a bare \
+                 `tokio::time::interval` fires its first tick immediately and \
+                 anchors that cadence on the drain's start instant instead."
             );
             assert!(
                 drain.contains(&format!("_ = {timer}.tick() =>")),
@@ -23730,8 +24416,17 @@ mod depth_rebalance_wiring_tests {
         ]);
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
         if attach_writer {
+            // A thread that has already finished. The handle is REQUIRED rather
+            // than optional on purpose: the producer and the join handle are
+            // taken together because a join is only meaningful once the queue
+            // is closed, and the queue closes when the producer drops. Making
+            // the handle optional would let a future spawn site hand over the
+            // producer alone and re-create the exact defect the signature
+            // exists to prevent — a writer thread nothing can ever wait for.
+            // Paying one no-op thread per test is the cost of that guarantee.
             ingest = ingest.with_top_volume_writer(
                 tickvault_storage::top_volume_rank_persistence::TopVolumeRankWriter::for_test(),
+                std::thread::spawn(|| {}),
             );
         }
         // A previous close AND a folded tick: `gain_pct` needs both, and the

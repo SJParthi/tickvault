@@ -7,7 +7,9 @@
 //! does that take?* Every number this repository could offer was a BUDGET, not
 //! a measurement — [`SWAP_WIRE_BUDGET`] is a one-second ceiling per side, the
 //! transport's own send timeout is ten seconds, and the per-socket pending gate
-//! holds the real rate to at most 4 swaps per socket per minute on depth-20 (`DEPTH_SWAP_COMMAND_CHANNEL_DEPTH`) and 5 pool-wide per minute on depth-200. None of those is the
+//! holds the real rate to at most one whole NAME per socket per minute on
+//! depth-20 (`DEPTH_SWAP_COMMAND_CHANNEL_DEPTH`, raised from four on
+//! 2026-09-13) and 5 pool-wide per minute on depth-200. None of those is the
 //! answer. They bound how long we WAIT; they say nothing about how long Dhan
 //! takes to start delivering the new book.
 //!
@@ -178,11 +180,20 @@ pub const FIRST_PACKET_WINDOW_SECS: i64 = 120;
 
 /// Fail-closed bound on the pending map.
 ///
-/// The real rate is at most 4 swaps per socket per minute on depth-20 (`DEPTH_SWAP_COMMAND_CHANNEL_DEPTH`) and 5 pool-wide per minute on depth-200 across ten depth sockets
-/// (the unreconciled-ack gate in `depth20_track` and its depth-200 twin), and
-/// an entry lives at most [`FIRST_PACKET_WINDOW_SECS`], so the expected
-/// occupancy is tens. 1,024 is a bound against a shape nobody has designed,
-/// never a size that is expected — past it a subscribe is not tracked, is
+/// The real rate is at most one whole NAME per socket per minute on depth-20
+/// (`DEPTH_SWAP_COMMAND_CHANNEL_DEPTH`) and 5 pool-wide per minute on
+/// depth-200, across ten depth sockets (the unreconciled-ack gate in
+/// `depth20_track` and its depth-200 twin), and an entry lives at most
+/// [`FIRST_PACKET_WINDOW_SECS`], so the expected peak occupancy is
+/// `5 x 24 x 2 + 5 x 2` = **250**. 1,024 is a bound against a shape nobody has
+/// designed, never a size that is expected.
+///
+/// ⚠ The margin over that expectation went from ~20x to ~4x when the
+/// depth-20 cap rose from four to a whole name on 2026-09-13. Still a bound
+/// rather than a size, but the next raise of that cap has to be checked
+/// against THIS number rather than against the word "tens".
+///
+/// Past the bound a subscribe is not tracked, is
 /// counted `refused`, and the swap itself proceeds untouched.
 pub const MAX_PENDING: usize = 1_024;
 
@@ -254,6 +265,21 @@ impl DepthFirstPacketTracker {
     /// contract refuses a depth-200 stamp the pool byte would already have
     /// protected) because over-refusing loses a sample and under-refusing
     /// writes a number that is wrong in the reassuring direction.
+    /// Returns whether the stamp was ACCEPTED — `false` means the tracker
+    /// declined it (already streaming, or the pending map at [`MAX_PENDING`])
+    /// and no watch is armed for this key.
+    ///
+    /// # Why the return value is not decoration
+    ///
+    /// Most callers stamp a subscribe and never look back: a refused stamp
+    /// costs them one latency sample. The unsubscribe probe reads the SAME
+    /// machinery backwards — "is the entry still pending when the window
+    /// closes?" means nothing arrived — and for it a refusal is catastrophic
+    /// rather than lossy: no entry exists, so `forget` returns `false`, and
+    /// the probe reads that as *a frame arrived*. In the baseline that admits
+    /// a run whose book was never proven live; in the watch it returns
+    /// `Ignored`, a vendor-blaming finding produced by a measurement that
+    /// never started. Found 2026-09-13.
     pub fn record_subscribe_at(
         &self,
         security_id: u64,
@@ -261,21 +287,22 @@ impl DepthFirstPacketTracker {
         pool: DepthFeedKind,
         at_nanos: i64,
         may_already_be_streaming: bool,
-    ) {
+    ) -> bool {
         if may_already_be_streaming {
             metrics::counter!(FIRST_PACKET_OUTCOME, "outcome" => "unmeasurable").increment(1);
-            return;
+            return false;
         }
         let pinned = self.pending.pin();
         // `binary_code()`, NOT `segment as u8` — see the `Key` docblock.
         let key = (security_id, segment.binary_code(), pool_code(pool));
         if pinned.get(&key).is_none() && self.pending_count.load(Ordering::Relaxed) >= MAX_PENDING {
             metrics::counter!(FIRST_PACKET_OUTCOME, "outcome" => "refused").increment(1);
-            return;
+            return false;
         }
         if pinned.insert(key, at_nanos).is_none() {
             self.pending_count.fetch_add(1, Ordering::Relaxed);
         }
+        true
     }
 
     /// Drops a stamp for a swap the WIRE refused, so it never ages into a

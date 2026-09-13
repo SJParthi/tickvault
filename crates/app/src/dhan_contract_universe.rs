@@ -1909,6 +1909,15 @@ pub async fn load_contract_universe(
                  set — the ranking cannot see any subscribed contract"
             );
         }
+        // Labels come from the SAME `&[ContractRow]` the legs came from, in the
+        // same pass, so the two snapshots can never describe different contract
+        // sets. Published BEFORE the owner map: the projection only reads a
+        // label for a contract the leaderboard already tracks, and the
+        // leaderboard only tracks what the owner map admits — so this order
+        // means a label is always present by the time anything can ask for it.
+        crate::contract_underlying_map::global_contract_underlying_map().publish_labels(
+            crate::contract_underlying_map::labels_from_artifact(&contracts),
+        );
         let build = crate::contract_underlying_map::global_contract_underlying_map()
             .publish_from_legs(&legs);
         tracing::info!(

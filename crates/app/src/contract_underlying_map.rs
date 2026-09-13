@@ -540,6 +540,15 @@ pub fn order_selected_first(
 #[derive(Debug, Clone)]
 pub struct ContractUnderlyingMap {
     inner: Arc<ArcSwap<HashMap<ContractKey, ContractOwner>>>,
+    /// Human-readable contract labels, resolved ONCE per publish.
+    ///
+    /// A SECOND snapshot rather than a field on [`ContractOwner`], and that is
+    /// the load-bearing decision: `owner_of` is the PER-TICK call and
+    /// `ContractOwner` is `Copy`, so putting an `Arc<str>` on it would put a
+    /// refcount bump on every tick. Nothing on the tick path needs a label —
+    /// only the per-sweep projection does — so the label lives in its own
+    /// snapshot that only that path loads.
+    labels: Arc<ArcSwap<HashMap<ContractKey, Arc<str>>>>,
 }
 
 impl Default for ContractUnderlyingMap {
@@ -554,6 +563,7 @@ impl ContractUnderlyingMap {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            labels: Arc::new(ArcSwap::from_pointee(HashMap::new())),
         }
     }
 
@@ -563,6 +573,31 @@ impl ContractUnderlyingMap {
     /// rebuild can never hand the drain a half-built map.
     pub fn publish(&self, snapshot: HashMap<ContractKey, ContractOwner>) {
         self.inner.store(Arc::new(snapshot));
+    }
+
+    /// Replaces the label snapshot, atomically. Built by
+    /// [`labels_from_artifact`] from the SAME `&[ContractRow]` the legs come
+    /// from, so the two cannot describe different contract sets.
+    pub fn publish_labels(&self, snapshot: HashMap<ContractKey, Arc<str>>) {
+        self.labels.store(Arc::new(snapshot));
+    }
+
+    /// The whole label table, for ONE sweep.
+    ///
+    /// Loaded once per projection, never per row: the caller holds this `Arc`
+    /// for the length of the sweep and hands the storage row a `&str` borrowed
+    /// out of it. One atomic load per sweep, one pointer copy per row, zero
+    /// allocation — which is the reason the label is resolved at publish time
+    /// rather than formatted on the frame drain.
+    #[must_use]
+    pub fn label_snapshot(&self) -> Arc<HashMap<ContractKey, Arc<str>>> {
+        arc_swap::Guard::into_inner(self.labels.load())
+    }
+
+    /// How many labels the published snapshot holds.
+    #[must_use]
+    pub fn label_len(&self) -> usize {
+        self.labels.load().len()
     }
 
     /// Builds and publishes in one step, returning what was refused.
@@ -1146,6 +1181,196 @@ mod tests {
         assert!(map.owner_of(13, ExchangeSegment::IdxI).is_none());
     }
 
+    /// The label format is the one `CLAUDE.md`'s DHAN SUPPORT COMMUNICATIONS
+    /// section mandates, so a row of this table can be pasted into a support
+    /// draft unchanged.
+    #[test]
+    fn contract_label_renders_the_mandated_precise_format() {
+        assert_eq!(
+            contract_label("NIFTY", 2026_09_25, 2_450_000, "CE"),
+            "NIFTY-25Sep2026-24500-CE"
+        );
+        assert_eq!(
+            contract_label("RELIANCE", 2026_06_25, 2_800_000, "PE"),
+            "RELIANCE-25Jun2026-28000-PE"
+        );
+        // A single-digit day is zero-padded, so 5 Sep sorts and reads beside
+        // 25 Sep instead of collating between 19 and 20.
+        assert_eq!(
+            contract_label("TCS", 2026_09_05, 400_000, "CE"),
+            "TCS-05Sep2026-4000-CE"
+        );
+        // Whitespace and case come from the master verbatim; the map is built
+        // on a trimmed symbol, so the label must trim the same way or the two
+        // describe the same contract differently.
+        assert_eq!(
+            contract_label("  INFY  ", 2026_12_31, 150_000, " CE "),
+            "INFY-31Dec2026-1500-CE"
+        );
+    }
+
+    /// A fractional strike keeps its paise.
+    ///
+    /// Rounding would make two ADJACENT strikes print the same label on a
+    /// low-priced underlying, which is exactly the ambiguity a precise label
+    /// exists to remove.
+    #[test]
+    fn contract_label_keeps_a_fractional_strike() {
+        assert_eq!(
+            contract_label("IDEA", 2026_09_25, 1_250, "PE"),
+            "IDEA-25Sep2026-12.50-PE"
+        );
+        assert_eq!(
+            contract_label("YESBANK", 2026_09_25, 2_075, "CE"),
+            "YESBANK-25Sep2026-20.75-CE"
+        );
+    }
+
+    /// A nonsense expiry renders its digits VERBATIM rather than being
+    /// dropped or guessed: a wrong-looking expiry in the label is a visible
+    /// defect, a missing one is an invisible one.
+    #[test]
+    fn contract_label_renders_an_implausible_expiry_verbatim() {
+        assert_eq!(
+            contract_label("NIFTY", 0, 2_450_000, "CE"),
+            "NIFTY-0-24500-CE"
+        );
+        assert_eq!(
+            contract_label("NIFTY", 2026_13_45, 2_450_000, "CE"),
+            "NIFTY-20261345-24500-CE"
+        );
+        // A future with no leg has no trailing separator — a dangling `-`
+        // would read as a truncated label.
+        assert_eq!(
+            contract_label("NIFTY", 2026_09_25, 0, ""),
+            "NIFTY-25Sep2026-0"
+        );
+    }
+
+    /// The label map covers exactly the contracts the OWNER map can admit —
+    /// options only, same segment derivation, same zero-id refusal.
+    ///
+    /// A shape difference between the two is what would make a projection-time
+    /// miss ambiguous: `SnapshotRefusal::LabelUnavailable` is supposed to mean
+    /// DRIFT, and it can only mean that if the two passes agree on which
+    /// contracts exist.
+    #[test]
+    fn labels_from_artifact_covers_the_same_contracts_the_legs_do() {
+        let rows = [
+            contract(500, "OPTIDX", "NIFTY", "NSE"),
+            contract(600, "OPTSTK", "RELIANCE", "NSE"),
+            // Not an option — never ranked, so never labelled.
+            contract(800, "FUTIDX", "NIFTY", "NSE"),
+            // BSE derivatives are refused by the leg pass; refused here too.
+            contract(700, "OPTIDX", "NIFTY", "BSE"),
+            // The zero-id sentinel.
+            contract(0, "OPTSTK", "RELIANCE", "NSE"),
+        ];
+        let labels = labels_from_artifact(&rows);
+        let (legs, _) = legs_from_artifact(&rows, &symbol_map());
+
+        assert_eq!(
+            labels.len(),
+            2,
+            "options on NSE with a real id, and only those"
+        );
+        for leg in &legs {
+            let key = (
+                u64::try_from(leg.contract_security_id).expect("positive"),
+                leg.contract_segment,
+            );
+            assert!(
+                labels.contains_key(&key),
+                "every leg the owner map admits must have a label: {key:?}"
+            );
+        }
+        assert!(labels.contains_key(&(500, FNO)));
+        assert!(labels.contains_key(&(600, FNO)));
+        assert!(!labels.contains_key(&(800, FNO)), "futures are not ranked");
+        assert!(!labels.contains_key(&(0, FNO)), "the zero-id sentinel");
+    }
+
+    /// The published snapshot is what the projection reads, and it is
+    /// SEPARATE from the owner snapshot — publishing one must not disturb
+    /// the other, because the two are published in sequence at attach.
+    #[test]
+    fn publish_labels_does_not_disturb_the_owner_snapshot() {
+        let map = ContractUnderlyingMap::new();
+        assert_eq!(map.label_len(), 0, "nothing published yet");
+        assert!(map.label_snapshot().is_empty());
+
+        let rows = [contract(600, "OPTSTK", "RELIANCE", "NSE")];
+        map.publish_labels(labels_from_artifact(&rows));
+        assert_eq!(map.label_len(), 1);
+        // The owner map is untouched by a label publish.
+        assert!(map.owner_of(600, FNO).is_none());
+
+        let (legs, _) = legs_from_artifact(&rows, &symbol_map());
+        map.publish_from_legs(&legs);
+        assert!(map.owner_of(600, FNO).is_some());
+        assert_eq!(
+            map.label_snapshot().get(&(600, FNO)).map(AsRef::as_ref),
+            Some("RELIANCE-25Sep2026-25000-CE"),
+            "an owner publish must not clear the labels"
+        );
+    }
+
+    #[test]
+    fn label_snapshot_starts_empty_and_returns_what_was_published() {
+        let map = ContractUnderlyingMap::new();
+        // Before attach there is no artifact, so the drain must still get a
+        // readable snapshot rather than an unwrap on `None`.
+        assert!(
+            map.label_snapshot().is_empty(),
+            "the label snapshot must be readable before anything is published"
+        );
+
+        let rows = [contract(700, "OPTSTK", "RELIANCE", "NSE")];
+        map.publish_labels(labels_from_artifact(&rows));
+        assert_eq!(
+            map.label_snapshot().get(&(700, FNO)).map(AsRef::as_ref),
+            Some("RELIANCE-25Sep2026-25000-CE")
+        );
+
+        // Two reads must hand back the SAME allocation, not two clones: the
+        // drain loads this once per sweep and borrows row labels out of it.
+        let first = map.label_snapshot();
+        let second = map.label_snapshot();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "each read cloned the map — the per-row borrow would then dangle \
+             or cost an allocation per sweep"
+        );
+    }
+
+    #[test]
+    fn label_len_counts_every_published_label_and_replaces_wholesale() {
+        let map = ContractUnderlyingMap::new();
+        assert_eq!(map.label_len(), 0);
+
+        let two = [
+            contract(800, "OPTSTK", "RELIANCE", "NSE"),
+            contract(801, "OPTSTK", "TCS", "NSE"),
+        ];
+        map.publish_labels(labels_from_artifact(&two));
+        assert_eq!(map.label_len(), 2);
+
+        // An expiry rollover republishes a SMALLER set. The new snapshot must
+        // REPLACE the old one, never merge into it — a merge would leave
+        // yesterday's expired contracts labelled and readable forever.
+        let one = [contract(800, "OPTSTK", "RELIANCE", "NSE")];
+        map.publish_labels(labels_from_artifact(&one));
+        assert_eq!(
+            map.label_len(),
+            1,
+            "a republish merged into the previous snapshot instead of replacing it"
+        );
+        assert!(
+            map.label_snapshot().get(&(801, FNO)).is_none(),
+            "a contract dropped by the new artifact kept its stale label"
+        );
+    }
+
     #[test]
     fn all_variants_are_in_the_seed_list() {
         // An unseeded reason is a series the CloudWatch agent drops on its
@@ -1171,7 +1396,6 @@ mod tests {
         }
     }
 
-    #[test]
     #[test]
     fn tally_refusals_orders_by_count_descending_so_the_dominant_cause_is_first() {
         let refusals = vec![
@@ -1265,6 +1489,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn pre_register_contract_underlying_counters_never_panics_without_a_recorder() {
         // Not-panicking IS the whole property here, and the name says so: with
         // no recorder installed there is nothing observable to assert against.
@@ -1364,5 +1589,393 @@ mod tests {
             vec![(MAX_TRACKED_CONTRACTS as i64, LegRefusal::AtCapacity)]
         );
         assert_eq!(under(&map, (1, FNO)), Some(13), "leg 1 keeps its slot");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Human-readable contract labels (operator 2026-09-13)
+// ---------------------------------------------------------------------------
+
+/// The label written when a contract has no resolvable one.
+///
+/// A STATIC string, deliberately, and never the id rendered at projection
+/// time: the projection runs on the frame drain over up to
+/// [`MAX_TRACKED_CONTRACTS`] rows x four cadences, and a `format!` there is the
+/// per-row heap allocation `hot-path.md` bans outright. The row still carries
+/// `security_id` and `segment`, so an `unmapped` label costs a join, never the
+/// identity.
+///
+/// Reaching it means the label map and the owner map DISAGREE — they are built
+/// from the same `&[ContractRow]` in the same pass, so a miss is real drift and
+/// is counted (`SnapshotRefusal::LabelUnavailable`), never silently blank.
+pub const UNLABELLED_CONTRACT: &str = "unmapped";
+
+/// Hard ceiling, in BYTES, on a rendered contract label.
+///
+/// # Why a cap exists at all (2026-09-13)
+///
+/// [`contract_label`] builds its label from `row.u` (the underlying) and
+/// `row.l` (the leg) — verbatim artifact strings, only `trim()`ed. Neither is
+/// length-checked anywhere upstream. The `top_volume` ILP writer sizes its
+/// producer ceiling from `TOP_VOLUME_ILP_ROW_BYTES = 448`, a number MEASURED
+/// against a 46-byte worst-case label
+/// (`MAZAGONDOCKSHIPBUILDERS-25Sep2026-123456.75-CE`, in
+/// `the_assumed_ilp_row_width_covers_a_real_worst_case_line`). So 448 was
+/// presented as a bound and was not one: a long or corrupt artifact symbol
+/// made the row exceed it.
+///
+/// The consequence is bounded and LOUD rather than silent — the writer trips
+/// `WidthCapped` and `bail!`s naming the dropped count — but **that table has
+/// no spill tier**, so those rows are permanently gone. Capping the label
+/// trades a clipped display string for a batch that still lands.
+///
+/// # The derivation
+///
+/// | term | value |
+/// |---|---|
+/// | `TOP_VOLUME_ILP_ROW_BYTES` (the assumed width the ceiling is sized from) | 448 B |
+/// | `MEASURED_WORST_CASE_ILP_ROW_BYTES` (the real line, measured) | 401 B |
+/// | ...of which the label was | 46 B |
+/// | non-label remainder of the line | 401 - 46 = **355 B** |
+/// | therefore the label's budget inside 448 | 448 - 355 = **93 B** |
+///
+/// The cap must sit at or above **46** so no realistic label is ever clipped,
+/// and at or below **93** so no label can overrun the budget. **64** is chosen
+/// inside that band: 18 B of room above today's widest real symbol, and 29 B
+/// left under the ceiling.
+///
+/// Those 29 B are not slack, they are the residual this cap does NOT fully
+/// close: an ILP SYMBOL value escapes `,`, `=` and space with a backslash, so
+/// a label containing them is WIDER on the wire than its byte length here.
+/// Neither 448 nor the 401 measurement ever accounted for that — it applies
+/// equally to the 46-byte label shipping today — so the 29 B absorbs up to 29
+/// escaped characters and the general case is flagged rather than claimed
+/// solved.
+///
+/// The two 448/401 terms are LITERALS in this doc rather than imports: both
+/// are private consts in `tickvault-storage`, and naming them here is the same
+/// honest middle that file already takes with its own `OPTION_FAMILIES` — a
+/// change to either is a visible edit here rather than an invisible drift.
+pub const MAX_CONTRACT_LABEL_BYTES: usize = 64;
+
+/// Appended to a label [`contract_label`] had to shorten.
+///
+/// Truncation must be VISIBLE: a silently shortened symbol reads as a
+/// different (possibly real) contract, which is worse than an obviously
+/// clipped one — and this label is the string `CLAUDE.md`'s DHAN SUPPORT
+/// section has an operator paste into a vendor ticket. Four ASCII bytes, none
+/// of which an ILP SYMBOL value escapes, and greppable as a whole word so a
+/// truncation episode can be counted from the table after the fact.
+const LABEL_TRUNCATION_MARKER: &str = "~cut";
+
+// The marker must fit inside the cap with room to carry some of the label,
+// or truncation would produce a label that is only a marker.
+const _: () = assert!(
+    MAX_CONTRACT_LABEL_BYTES > LABEL_TRUNCATION_MARKER.len() * 2,
+    "the label cap must leave room for real label bytes beside the truncation \
+     marker, or every truncated label renders as the marker alone"
+);
+// Independent term (1): the widest REAL label measured by
+// `the_assumed_ilp_row_width_covers_a_real_worst_case_line`. Below this the
+// cap would start clipping labels that legitimately occur today.
+const _: () = assert!(
+    MAX_CONTRACT_LABEL_BYTES >= 46,
+    "the label cap must cover the widest REAL label (46 B, \
+     MAZAGONDOCKSHIPBUILDERS-25Sep2026-123456.75-CE) or ordinary contracts \
+     start truncating"
+);
+// Independent term (2): the label's budget inside the ILP row width the
+// top_volume producer ceiling is sized from. Above this a row can overrun a
+// ceiling whose table has NO spill tier, so an over-wide row is a lost row.
+const _: () = assert!(
+    MAX_CONTRACT_LABEL_BYTES <= 93,
+    "the label cap must sit inside the 93 B the 448 B assumed ILP row width \
+     leaves for it over the 355 B non-label remainder. Above it, one row can \
+     push a sweep past MAX_TOP_VOLUME_PRODUCER_BUFFER_BYTES and this table \
+     drops rows with no spill tier"
+);
+
+/// Caps a rendered label at [`MAX_CONTRACT_LABEL_BYTES`], on a char boundary.
+///
+/// Deterministic (a given input always yields the same output), never
+/// panicking (`String::truncate` would panic on a non-boundary index, so the
+/// index is walked back to one first), and never splitting a UTF-8 sequence —
+/// an artifact symbol is not guaranteed ASCII, and half a codepoint in a
+/// SYMBOL column is a corrupt row rather than a short one.
+fn cap_label(mut label: String) -> String {
+    if label.len() <= MAX_CONTRACT_LABEL_BYTES {
+        return label;
+    }
+    let mut cut = MAX_CONTRACT_LABEL_BYTES - LABEL_TRUNCATION_MARKER.len();
+    // Walk DOWN to the nearest char boundary. `cut` starts strictly inside the
+    // string (the early return above proves `len` is larger), and 0 is always
+    // a boundary, so this terminates and `truncate` cannot panic.
+    while cut > 0 && !label.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    label.truncate(cut);
+    label.push_str(LABEL_TRUNCATION_MARKER);
+    label
+}
+
+/// Month names for the expiry component, indexed 1..=12.
+const MONTH_ABBREV: [&str; 13] = [
+    "???", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// Renders one contract's full human label: `NIFTY-25Sep2026-24500-CE`.
+///
+/// The format is the one `CLAUDE.md`'s DHAN SUPPORT COMMUNICATIONS section
+/// mandates for every contract cited to the vendor ("precise contract labels
+/// (e.g. `NIFTY-Jun2026-28500-CE`) — NEVER generic"), so a row of this table
+/// can be pasted into a support draft unchanged.
+///
+/// **Cold path, called ONCE per contract per publish** — once a day at attach,
+/// over ~22,000 rows. It allocates; that is the entire point of resolving here
+/// rather than at projection time.
+///
+/// `expiry_ymd` is the master's `YYYYMMDD`. A value that does not parse as a
+/// plausible date renders its digits verbatim rather than being dropped: a
+/// wrong-looking expiry in the label is a visible defect, a missing one is an
+/// invisible one. Strike is in PAISE and renders as rupees — whole when the
+/// paise divide, with the fraction kept when they do not, because a strike
+/// like 1234.50 is real on low-priced underlyings and rounding it would make
+/// two adjacent strikes print the same label.
+///
+/// The result is CAPPED at [`MAX_CONTRACT_LABEL_BYTES`] and marked when it is
+/// — `underlying` and `leg` are verbatim artifact strings with no length check
+/// anywhere upstream, and an uncapped one made a `top_volume` row exceed the
+/// width its producer ceiling is sized from, on a table with no spill tier.
+/// See that constant for the derivation and for the escaping residual it does
+/// not close.
+#[must_use]
+pub fn contract_label(underlying: &str, expiry_ymd: u32, strike_paise: i64, leg: &str) -> String {
+    let year = expiry_ymd / 10_000;
+    let month = (expiry_ymd / 100) % 100;
+    let day = expiry_ymd % 100;
+    let rupees = strike_paise / 100;
+    let paise = (strike_paise % 100).abs();
+    let mut out = String::with_capacity(40);
+    out.push_str(underlying.trim());
+    out.push('-');
+    if (1..=12).contains(&month) && (1..=31).contains(&day) && year >= 1970 {
+        // `{day:02}` so 5 Sep sorts and reads beside 25 Sep.
+        out.push_str(&format!("{day:02}{}{year}", MONTH_ABBREV[month as usize]));
+    } else {
+        // Verbatim rather than dropped — see the fn doc.
+        out.push_str(&expiry_ymd.to_string());
+    }
+    out.push('-');
+    if paise == 0 {
+        out.push_str(&rupees.to_string());
+    } else {
+        out.push_str(&format!("{rupees}.{paise:02}"));
+    }
+    let leg = leg.trim();
+    if !leg.is_empty() {
+        out.push('-');
+        out.push_str(leg);
+    }
+    // The cap goes at the END, over the WHOLE rendered label, not on each
+    // component: a pathological `underlying`, a pathological `leg` and a
+    // pathological `expiry_ymd` (which renders its digits verbatim by design)
+    // all widen the same row, and one choke point is the only shape that
+    // bounds their sum.
+    cap_label(out)
+}
+
+/// Builds the contract-id -> label table from the day's artifact rows.
+///
+/// Keyed and filtered EXACTLY as [`legs_from_artifact`] is — options only,
+/// same segment derivation, same zero-id refusal — so the two maps cover the
+/// same contracts and a miss at projection time is genuine drift rather than a
+/// shape difference. Anything the owner map refuses for a reason this pass
+/// cannot see (an unresolved underlying symbol, a missing lot size) simply
+/// never reaches the leaderboard, so an extra entry here is harmless.
+///
+/// `Arc<str>` rather than `String`: the projection hands the storage row a
+/// borrowed `&str` out of the published snapshot, so the per-row cost is one
+/// pointer copy and ZERO allocation. `Arc<str>` also stores the length inline
+/// with no spare capacity word, which matters at ~22,000 entries.
+#[must_use]
+pub fn labels_from_artifact(contracts: &[ContractRow]) -> HashMap<ContractKey, Arc<str>> {
+    let mut labels: HashMap<ContractKey, Arc<str>> =
+        HashMap::with_capacity(contracts.len().min(MAX_TRACKED_CONTRACTS));
+    for row in contracts {
+        if !matches!(row.c.as_str(), "OPTIDX" | "OPTSTK") {
+            continue;
+        }
+        if row.i == 0 {
+            continue;
+        }
+        let Some(segment) = crate::dhan_contract_universe::derivative_segment(&row.x) else {
+            continue;
+        };
+        if labels.len() >= MAX_TRACKED_CONTRACTS && !labels.contains_key(&(row.i, segment)) {
+            continue;
+        }
+        labels.insert(
+            (row.i, segment),
+            Arc::from(contract_label(&row.u, row.e, row.s, &row.l).as_str()),
+        );
+    }
+    labels
+}
+
+#[cfg(test)]
+mod label_cap_tests {
+    use super::{
+        LABEL_TRUNCATION_MARKER, MAX_CONTRACT_LABEL_BYTES, contract_label, labels_from_artifact,
+    };
+
+    /// The expiry/strike/leg tail every fixture below shares, so a test can
+    /// reconstruct what the UNCAPPED render would have been and assert the
+    /// truncation is a real prefix of it.
+    const TAIL: &str = "-25Sep2026-24500-CE";
+
+    /// The widest label the storage-side width harness measures the ILP row
+    /// against. It must survive untouched, or this cap is clipping contracts
+    /// that legitimately trade today.
+    const WIDEST_REAL_LABEL: &str = "MAZAGONDOCKSHIPBUILDERS-25Sep2026-123456.75-CE";
+
+    #[test]
+    fn an_ordinary_label_is_untouched_by_the_cap() {
+        let label = contract_label("NIFTY", 20_260_925, 2_450_000, "CE");
+        assert_eq!(label, "NIFTY-25Sep2026-24500-CE");
+        assert!(
+            !label.contains(LABEL_TRUNCATION_MARKER),
+            "a 24 B label must not be marked as truncated"
+        );
+    }
+
+    /// Non-vacuous in the direction that matters: the cap must not be so tight
+    /// that the REAL worst case trips it. This is the lower bound the
+    /// const-assert pins, proven end to end through `contract_label`.
+    #[test]
+    fn the_widest_real_label_still_renders_in_full() {
+        let label = contract_label("MAZAGONDOCKSHIPBUILDERS", 20_260_925, 12_345_675, "CE");
+        assert_eq!(label, WIDEST_REAL_LABEL);
+        assert_eq!(label.len(), 46, "the measured worst case is 46 B");
+        assert!(label.len() <= MAX_CONTRACT_LABEL_BYTES);
+        assert!(!label.contains(LABEL_TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn an_over_long_label_truncates_within_the_cap_and_says_so() {
+        // A pathological artifact symbol: 200 ASCII bytes where a real one is
+        // at most 23. This is the shape that made a row exceed the ILP width
+        // the `top_volume` producer ceiling is sized from, on a table with no
+        // spill tier — so the row was permanently lost rather than clipped.
+        let underlying = "A".repeat(200);
+        let label = contract_label(&underlying, 20_260_925, 2_450_000, "CE");
+        assert!(
+            label.len() <= MAX_CONTRACT_LABEL_BYTES,
+            "a truncated label measured {} B against a {MAX_CONTRACT_LABEL_BYTES} B cap",
+            label.len()
+        );
+        assert!(
+            label.ends_with(LABEL_TRUNCATION_MARKER),
+            "truncation must be VISIBLE, not a silently shortened symbol: {label}"
+        );
+        // Deterministic: the same input renders the same label every time, so
+        // a DEDUP key carrying this column cannot split one contract in two.
+        assert_eq!(
+            label,
+            contract_label(&underlying, 20_260_925, 2_450_000, "CE")
+        );
+    }
+
+    /// The leg is the OTHER uncapped artifact string, and the cap is applied
+    /// once over the WHOLE rendered label rather than per component.
+    #[test]
+    fn an_over_long_leg_is_capped_by_the_same_choke_point() {
+        let leg = "C".repeat(300);
+        let label = contract_label("NIFTY", 20_260_925, 2_450_000, &leg);
+        assert!(label.len() <= MAX_CONTRACT_LABEL_BYTES);
+        assert!(label.ends_with(LABEL_TRUNCATION_MARKER));
+    }
+
+    /// Truncation must land on a char boundary. `String::truncate` PANICS on a
+    /// byte index inside a UTF-8 sequence and repo law bans a panic on a
+    /// production path — an artifact symbol is not guaranteed ASCII.
+    ///
+    /// The ASCII padding is deliberately FIRST so the cap's byte index lands
+    /// at a different offset within the 3-byte run on each iteration; without
+    /// it every cut would land on an exact multiple of 3 and the boundary walk
+    /// would never execute, leaving this test vacuous.
+    #[test]
+    fn a_multi_byte_label_truncates_on_a_char_boundary_without_panicking() {
+        for pad in 0..6_usize {
+            let underlying = format!("{}{}", "x".repeat(pad), "\u{20b9}".repeat(120));
+            let label = contract_label(&underlying, 20_260_925, 2_450_000, "CE");
+
+            assert!(
+                label.len() <= MAX_CONTRACT_LABEL_BYTES,
+                "pad {pad}: multi-byte label measured {} B",
+                label.len()
+            );
+            assert!(label.ends_with(LABEL_TRUNCATION_MARKER), "pad {pad}");
+
+            // The real proof, and the reason this is not just a "did not
+            // panic" test: strip the marker and what remains must be a
+            // character-aligned PREFIX of the label that would have rendered
+            // uncapped. A split codepoint fails both halves.
+            //
+            // The slice index is safe by the assert above: the marker is
+            // ASCII, so `len - marker.len()` is the boundary it starts at.
+            let kept = &label[..label.len() - LABEL_TRUNCATION_MARKER.len()];
+            let uncapped = format!("{underlying}{TAIL}");
+            assert!(
+                uncapped.starts_with(kept),
+                "pad {pad}: truncation is not a prefix of the full label"
+            );
+            assert!(
+                uncapped.is_char_boundary(kept.len()),
+                "pad {pad}: truncation split a UTF-8 sequence at byte {}",
+                kept.len()
+            );
+        }
+    }
+
+    /// A label so pathological that only the marker could survive must still
+    /// be a label. An empty SYMBOL value is a different failure from a
+    /// truncated one and must not be reachable here.
+    #[test]
+    fn truncation_always_keeps_some_of_the_original_label() {
+        let underlying = "\u{1f600}".repeat(64);
+        let label = contract_label(&underlying, 20_260_925, 2_450_000, "CE");
+        assert!(label.len() > LABEL_TRUNCATION_MARKER.len());
+        assert!(label.ends_with(LABEL_TRUNCATION_MARKER));
+    }
+
+    /// The cap reaches the PUBLISHED snapshot, not just the free function —
+    /// `labels_from_artifact` is the only producer the projection reads, so a
+    /// cap that stopped at `contract_label` would bound nothing in production.
+    #[test]
+    fn the_published_label_snapshot_carries_capped_labels() {
+        use crate::dhan_contract_universe::ContractRow;
+
+        let rows = vec![ContractRow {
+            i: 42,
+            // `EXCH_ID`, which `derivative_segment` maps — "NSE", not the
+            // segment name.
+            x: "NSE".to_owned(),
+            c: "OPTSTK".to_owned(),
+            e: 20_260_925,
+            s: 2_450_000,
+            l: "CE".to_owned(),
+            u: "B".repeat(250),
+            z: 50,
+        }];
+        let labels = labels_from_artifact(&rows);
+        assert_eq!(labels.len(), 1, "the fixture must actually publish a label");
+        for label in labels.values() {
+            assert!(
+                label.len() <= MAX_CONTRACT_LABEL_BYTES,
+                "a published label measured {} B",
+                label.len()
+            );
+            assert!(label.ends_with(LABEL_TRUNCATION_MARKER));
+        }
     }
 }

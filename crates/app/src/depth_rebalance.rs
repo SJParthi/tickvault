@@ -38,7 +38,7 @@
 //! holds no state, so every edge below is a unit test rather than a live
 //! surprise.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use tickvault_common::types::ExchangeSegment;
 use tickvault_core::websocket::pool_supervisor::{
@@ -61,6 +61,23 @@ use crate::movers::StockMove;
 /// once a minute; log-sink detection, not a page.
 pub const RANKING_PUBLISH_DEADLINE_SECS_OF_DAY_IST: u32 =
     tickvault_common::constants::TOP_VOLUME_CAPTURE_START_SECS_OF_DAY_IST + 5 * 60;
+
+/// How long before the capture window closes the unsubscribe probe refuses to
+/// arm.
+///
+/// The scope lock's 2026-09-12 REJECT list names this outright — *"Runs inside
+/// the last 30 minutes of the session"* — and the reason is finding 4's
+/// residual: an Arm B socket is not proven healthy again until a frame
+/// arrives on it, so a probe that starts near the close can leave a socket in
+/// a not-proven-healthy state that the next close then freezes in place.
+///
+/// It is also a budget: both arms plus their acks and restores run for roughly
+/// four minutes, and a probe armed at 15:38 would still be watching after the
+/// exchange had stopped sending anything to watch — producing a `Silent`
+/// reading that means "the market shut", not "the vendor honoured the
+/// unsubscribe". That is the single worst failure this probe can have: a
+/// confident wrong verdict.
+pub const PROBE_NO_ARM_BEFORE_CLOSE_SECS: u32 = 30 * 60;
 
 /// 10:00 IST — forty-five minutes after the capture window opens.
 ///
@@ -163,7 +180,7 @@ impl OwnedChainMinute {
 /// for one strike must never fail to group through float drift. Rounding
 /// rather than truncating: a strike arriving as `24499.999999` is 24500, and
 /// truncation would file it one paise low and split the pair.
-fn strike_paise(strike: f64) -> Option<i64> {
+pub(crate) fn strike_paise(strike: f64) -> Option<i64> {
     if !strike.is_finite() || strike <= 0.0 {
         return None;
     }
@@ -483,7 +500,35 @@ pub fn chain_minutes_from_candidates(candidates: &[DepthCandidate]) -> Vec<Owned
 ///
 /// # Complexity
 ///
-/// O(candidates). Called once a minute for one stock.
+/// **THREE full passes over `candidates` per call** — `nearest_expiry_for`,
+/// `consensus_spot`, and the loop below — each comparing `c.underlying` as a
+/// string.
+///
+/// ⚠ **CORRECTED 2026-09-12. This read "O(candidates). Called once a minute
+/// for one stock", and the second sentence was false at the call site.**
+/// `depth20_layout::build_depth20_layout` calls it inside
+/// `for stock in ranked`, where `ranked` is `MOVER_STOCKS_TOTAL` = **75**, and
+/// `index_window` calls it twice more. So the real shape is
+/// **O(movers × candidates)** ≈ 75 × 3 × |candidates|, and at the measured
+/// universe (~21,500–23,300 legs) that is roughly **5 million row-visits per
+/// invocation**.
+///
+/// Reachable in production today, on the steering task: the per-minute loop
+/// takes this path from loop start until the first volume ranking publishes
+/// (~09:16), and again after any intra-day restart before a ranking exists;
+/// `attach_depth_when_available` takes it once per 60-second attach retry.
+///
+/// **Flagged, not fixed** — the repair is the decorate-index-lookup shape this
+/// repository already applied to `select_depth_universe` (2026-08-21) and
+/// `fit_atm_window`: one `HashMap<&str, Vec<&DepthCandidate>>` built in a
+/// single O(candidates) pass turns 5M into ~22k plus 75 small lookups. Left
+/// undone here because it is a change to the steering path's data flow rather
+/// than to this function, and it deserves its own measurement.
+///
+/// The reusable half is why the old line read as safe: **a complexity claim on
+/// a callee is a claim about one call.** The cost lives at the call site, and
+/// no docstring here can reveal a loop written there — the same shape this
+/// repository records for a scan inside a comparator.
 #[must_use]
 pub fn atm_pair_for(candidates: &[DepthCandidate], underlying: &str) -> Option<StrikePair> {
     let mut pairs: HashMap<i64, (Option<i64>, Option<i64>)> = HashMap::new();
@@ -893,6 +938,14 @@ pub struct PendingSwapAck {
 /// last and the whole loop runs one minute behind the market for the entire
 /// session — a bug that would look exactly like normal operation.
 pub const REBALANCE_OFFSET_SECS: u64 = 8;
+
+/// How long one steering iteration has before the next one starts.
+///
+/// Not decoration: `depth20_ranked_steer` const-asserts that a full per-socket
+/// swap plan can DRAIN inside this window at the supervisor's worst-case wire
+/// budget. A cap whose plan cannot finish before the next plan arrives is not a
+/// cap — it is a backlog with a number on it.
+pub const REBALANCE_INTERVAL_SECS: u64 = 60;
 
 /// How often the heartbeat ticker republishes the age.
 ///
@@ -1391,6 +1444,8 @@ pub async fn run_depth_rebalance(
     crate::depth20_ranked_steer::pre_register_depth20_ranked_counters();
     crate::depth_seed::pre_register_seed_counters();
     crate::dhan_contract_universe::pre_register_spot_backstop_counters();
+    crate::depth_subscription_view::pre_register_view_counters();
+    crate::depth20_name_board::pre_register_name_board_counters();
     // The heartbeat, published by a task this loop cannot wedge.
     //
     // Registered BEFORE the first iteration: a loop that dies on its very
@@ -1443,10 +1498,49 @@ pub async fn run_depth_rebalance(
     // The probe fires at most ONCE per process, armed or not: a second run
     // would empty a second depth-200 socket, and the arming register in the
     // supervisor refuses Arm B a second time anyway.
-    let mut probe_run = false;
+    // Seeded from the PERSISTED day latch, not from `false` (2026-09-13).
+    //
+    // An in-memory flag is once-per-PROCESS, and the scope lock requires once
+    // per SESSION. The unit restarts on deploy and on an OOM kill, so those
+    // differ exactly when it matters: a restart at 11:00 would re-arm a probe
+    // that already spent its shot at 09:20 and empty a SECOND depth-200
+    // socket. The latch file carries the IST day it was spent on.
+    let probe_latch = crate::depth_unsubscribe_probe::day_latch_path();
+    let mut probe_run = crate::depth_unsubscribe_probe::probe_already_ran_today(
+        &probe_latch,
+        crate::depth_unsubscribe_probe::today_ymd_ist(),
+    );
     let mut post_close_logged = false;
     let mut no_ranking_reported = false;
     let mut gainer_board_empty_reported = false;
+    // ---- the NAME board's two pieces of per-session state (2026-09-13) ----
+    //
+    // `future_index` is the day's nearest non-expired future per
+    // underlying. Built lazily from the contract artifact and KEPT: the
+    // artifact is a daily file and `today_ymd` is fixed for the session, so
+    // rebuilding it each minute would clone ~22,000 rows to answer an
+    // unchanged question 375 times.
+    //
+    // `held_names` is what the board CHOSE last minute, and it is what
+    // makes `DEPTH20_NAME_EXIT_RANK` mean anything: without it the band is
+    // computed and discarded, the board re-orders freely every minute, and
+    // the swap counters report controlled churn the whole time.
+    let mut future_index: HashMap<String, SubscribeInstrument> = HashMap::new();
+    // Whether the artifact has been READ, which is not the same question as
+    // whether it yielded any futures.
+    //
+    // The retry used to be `if future_index.is_empty()`, so an artifact that
+    // parses to ZERO futures — every contract expired, the one day a rollover
+    // can produce it — was re-read and re-parsed on every one of the session's
+    // 375 iterations, each a blocking `std::fs` read and a ~22,000-row parse on
+    // the async steering task. The docstring beside it claimed the opposite
+    // ("resolved ONCE"), which is how it survived review.
+    //
+    // Retrying while UNREAD keeps the case the old guard was written for: the
+    // artifact legitimately may not exist yet at 09:00, and a permanently
+    // cached empty index would cost every name its future slot for the day.
+    let mut future_index_read = false;
+    let mut held_names: BTreeSet<(u64, u8)> = BTreeSet::new();
     loop {
         let second = u64::from(ist_second_of_day_now() % 60);
         tokio::time::sleep(std::time::Duration::from_secs(secs_until_next_rebalance(
@@ -1514,11 +1608,46 @@ pub async fn run_depth_rebalance(
         if !probe_run
             && probe_cfg.enabled
             && (RANKING_PUBLISH_DEADLINE_SECS_OF_DAY_IST
-                ..tickvault_common::constants::TOP_VOLUME_CAPTURE_END_SECS_OF_DAY_IST)
+                ..tickvault_common::constants::TOP_VOLUME_CAPTURE_END_SECS_OF_DAY_IST
+                    .saturating_sub(PROBE_NO_ARM_BEFORE_CLOSE_SECS))
                 .contains(&secs_of_day)
         {
             probe_run = true;
+            // The day is resolved HERE, not at boot.
+            //
+            // `today_ymd_ist` documents exactly this: "resolved at the moment
+            // of the call rather than at boot … a process that spans midnight
+            // would mark the wrong day". A boot-time value made that claim
+            // false at its only caller, which is the shape this file keeps
+            // recording — a correct docstring undone by its wiring.
+            let probe_day = crate::depth_unsubscribe_probe::today_ymd_ist();
+            // The stamp, BEFORE the block rather than after it.
+            //
+            // The heartbeat gauge is published by its own task, but the VALUE
+            // it publishes is `now - stamp`, and only this loop writes the
+            // stamp. So a blocking probe does not stop the heartbeat — it
+            // makes the heartbeat report a growing age, which is exactly what
+            // `depth-steering-stalled` alarms on at 180 s. Stamping here
+            // starts that clock at the probe rather than at the END of the
+            // PREVIOUS iteration, which is worth a whole minute of the budget.
+            //
+            // ⚠ RESIDUAL, stated rather than papered over: both arms plus
+            // acks and restores run for roughly four minutes, so the age
+            // still crosses 180 s for the back half of the probe. The alarm
+            // needs TWO consecutive breaching 300 s periods, so a single
+            // probe normally produces one — but an unlucky straddle of two
+            // period boundaries would page. That is a once-a-day,
+            // operator-armed window; the fix if it ever bites is to hand the
+            // probe the stamp, which means widening its signature.
+            heartbeat.store(now_epoch_secs(), std::sync::atomic::Ordering::Relaxed);
+            // BEFORE the arm, never after: a crash mid-probe must leave the
+            // day spent. Declining a re-run costs one measurement; permitting
+            // one costs a second emptied socket on a live steering path.
+            crate::depth_unsubscribe_probe::mark_probe_ran_today(&probe_latch, probe_day);
             crate::depth_unsubscribe_probe::run_configured(&probe_cfg, &mut sockets).await;
+            // And again on the way out, so the very next heartbeat tick
+            // reports a fresh age instead of carrying the block forward.
+            heartbeat.store(now_epoch_secs(), std::sync::atomic::Ordering::Relaxed);
         }
         // ---- "no ranking by 09:20" (2026-09-08) ----
         //
@@ -1678,65 +1807,183 @@ pub async fn run_depth_rebalance(
             }
         }
 
-        // ---- depth-20: the windows and the movers, every minute ----
+        // ---- depth-20: the NAME board first, the older engines behind it ----
         //
-        // Runs BEFORE the depth-200 quiet check, because that check
-        // `continue`s the loop. Placing depth-20 after it would silently tie
-        // depth-20 tracking to depth-200 having something to do — and the
-        // overwhelmingly common minute is one where depth-200 is quiet.
+        // 2026-09-13, wiring the 2026-09-11 (THIRD + FOURTH) authorization.
+        // `depth20_name_board` had been built and tested since 2026-09-11 with
+        // ZERO production call sites — the skeleton-PR shape
+        // `audit-findings-2026-04-17.md` Rule 14 forbids. This is where it
+        // becomes the PRIMARY depth-20 engine.
         //
-        // 2026-09-08: the VOLUME ranking once it exists, the 2026-08-26 layout
-        // until then — the same shape as the depth-200 block below.
-        // `Some(empty)` holds (the ranking ran and selected nothing); `None`
-        // is pre-first-ranking and keeps the legacy layout so the sockets are
-        // not left on a boot dial nobody re-centres.
+        // The precedence, and why the older engines are kept rather than
+        // deleted:
+        //
+        //   1. the NAME board, whenever it can produce a steerable layout —
+        //      six stock movers with their spot, their nearest future and
+        //      their ATM ±5 ladder, plus NIFTY and BANKNIFTY at ±11,
+        //      unconditional and never displaceable by a mover;
+        //   2. otherwise exactly what ran before, unchanged.
+        //
+        // Step 2 is not a courtesy. The board needs a movers ranking AND a
+        // candidate slice AND the day's futures, and between 09:00 and ~09:07
+        // roughly 750 equities have not printed at all — so `is_steerable()`
+        // is legitimately false for the first minutes of every session, which
+        // is precisely the window the seed hold and the legacy layout exist
+        // for. Falling back is the normal path at 09:01, not a failure.
         if !depth20.is_empty() {
             let held_20: Vec<Vec<SubscribeInstrument>> =
                 depth20.iter().map(|s| s.held.clone()).collect();
-            let ranking_20 = crate::depth20_ranked_steer::global_depth20_candidates().latest();
-            let (plan_20, engine_20) = match ranking_20.as_deref() {
-                Some(ranked) => {
-                    let ranked_20 =
-                        crate::depth20_ranked_steer::plan_depth20_ranked_minute(&held_20, ranked);
-                    crate::depth20_ranked_steer::record_depth20_ranked_decision(&ranked_20);
-                    // One line per minute that MOVED anything or could not,
-                    // with every count the counters carry. Nothing on the box
-                    // scrapes `/metrics`, so this line is the only read-out of
-                    // ranked-steering churn that reaches CloudWatch — the
-                    // 2026-09-08 observability audit's gap 1. A quiet minute
-                    // (nothing planned, nothing refused) still logs nothing.
-                    let planned_20 = ranked_20.plan.swap_count();
-                    if planned_20 > 0 || ranked_20.capped > 0 || ranked_20.unplaced > 0 {
-                        tracing::info!(
-                            planned = planned_20,
-                            capped = ranked_20.capped,
-                            unplaced = ranked_20.unplaced,
-                            unfunded_departures = ranked_20.unfunded_departures,
-                            kept = ranked_20.kept,
-                            ranked = ranked.len(),
-                            "depth-20 ranked steering this minute — planned swaps go to the wire; \
-                             capped and unplaced are retried next minute"
+            // The day's futures, resolved ONCE.
+            //
+            // `today_ymd` is fixed for the session and the contract artifact
+            // is a daily file, so the nearest non-expired future per underlying
+            // cannot change under us. Rebuilding it every minute would clone
+            // ~22,000 artifact rows 375 times to answer the same question.
+            // Retried while UNREAD, not while EMPTY: the artifact can
+            // legitimately not exist yet at 09:00, so a failed READ must be
+            // retried — but a SUCCESSFUL read that yielded nothing is an
+            // answer, and re-asking it 375 times was the defect this flag
+            // closes. A genuinely all-expired artifact now costs every name
+            // its future slot for the day, loudly and once, instead of
+            // costing the steering task a 22,000-row parse every minute.
+            if !future_index_read {
+                match crate::dhan_contract_universe::read_contract_artifact(&date_ist) {
+                    Ok(rows) => {
+                        future_index_read = true;
+                        future_index = crate::depth20_name_board::future_index(&rows, today_ymd);
+                        if !future_index.is_empty() {
+                            tracing::info!(
+                                futures = future_index.len(),
+                                "depth-20 name board: nearest-expiry futures resolved for the \
+                                 session"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        // Fail-SOFT and once-ish: a name without a future is a
+                        // name one slot short, never a name that cannot be
+                        // placed. Logged at debug because before the artifact
+                        // is written this is the expected state.
+                        tracing::debug!(
+                            ?err,
+                            "depth-20 name board: no contract artifact yet, so no future slots"
                         );
                     }
-                    (ranked_20.plan, "volume_ranking")
                 }
-                // A pool dialed from yesterday's close HOLDS until the first
-                // ranking: re-planning the layout here would move the seeded
-                // stock options back onto index windows at 09:08, undoing the
-                // seed minutes before the ranking could keep it.
-                None if crate::depth_seed::boot_seeded(crate::depth_seed::SeedPool::Depth20) => (
-                    crate::depth20_track::Depth20Plan {
-                        sockets_left_alone: held_20.len(),
-                        ..crate::depth20_track::Depth20Plan::default()
-                    },
-                    "seed_until_first_ranking",
-                ),
-                None => {
-                    let layout = crate::depth20_layout::build_depth20_layout(&candidates, &movers);
-                    (
-                        crate::depth20_track::plan_depth20_minute(&held_20, &layout),
-                        "layout_until_first_ranking",
-                    )
+            }
+            let name_plan = crate::depth20_name_board::build_name_layout(
+                &candidates,
+                &movers,
+                &future_index,
+                &held_names,
+            );
+            let ranking_20 = crate::depth20_ranked_steer::global_depth20_candidates().latest();
+            let (plan_20, engine_20) = if name_plan.is_steerable() {
+                // Carried into next minute as the hysteresis input: the band at
+                // DEPTH20_NAME_EXIT_RANK governs which names SURVIVE, and it
+                // can only do that against what the board chose last time.
+                // Written from the CHOICE rather than from the wire because a
+                // name costs 24 swaps against a budget of 20 a minute, so a
+                // name still being placed would otherwise read as "not held"
+                // and be re-contested every minute until it landed.
+                held_names = name_plan.chosen_keys();
+                let mut planned =
+                    crate::depth20_track::plan_depth20_minute(&held_20, &name_plan.layout);
+                let capped = cap_depth20_socket_swaps(
+                    &mut planned,
+                    crate::depth20_ranked_steer::MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE,
+                );
+                crate::depth20_name_board::record_name_board_plan(
+                    &name_plan,
+                    planned.swap_count(),
+                    capped,
+                );
+                if planned.swap_count() > 0 || capped > 0 {
+                    tracing::info!(
+                        planned = planned.swap_count(),
+                        capped,
+                        names = name_plan.chosen.len(),
+                        names_unresolved = name_plan.names_unresolved,
+                        futures_missing = name_plan.futures_missing,
+                        spots_missing = name_plan.spots_missing,
+                        instruments = name_plan.layout.instrument_count(),
+                        "depth-20 NAME board steering this minute — six movers plus NIFTY and \
+                         BANKNIFTY; capped swaps are retried next minute"
+                    );
+                }
+                (planned, "name_board")
+            } else {
+                // The band has no incumbents when the board is not driving.
+                //
+                // `held_names` is written from the board's CHOICE, not from
+                // the wire — which is right while the board IS the engine, and
+                // wrong the moment another one takes over. A fallback minute
+                // rewrites every socket from the volume ranking, so names the
+                // board chose before the fallback are no longer on the wire at
+                // all. Carrying them forward would have the next steerable
+                // minute PREFER phantom incumbents over names that genuinely
+                // out-moved them, and the exit band would be protecting
+                // contracts nothing is subscribed to.
+                held_names.clear();
+                // Recorded on the fallback arm as well, with zero swaps of its
+                // own. The board is built EVERY minute and only DRIVES on some,
+                // so the three counters that explain a refusal
+                // (`names_unresolved`, `index_unresolved`, `spots_missing`) only
+                // ever move on a minute the board did not drive. Recording just
+                // the steerable arm would leave them permanently at their seeded
+                // zero — a refusal metric that cannot report a refusal.
+                crate::depth20_name_board::record_name_board_plan(&name_plan, 0, 0);
+                match ranking_20.as_deref() {
+                    Some(ranked) => {
+                        let ranked_20 = crate::depth20_ranked_steer::plan_depth20_ranked_minute(
+                            &held_20, ranked,
+                        );
+                        crate::depth20_ranked_steer::record_depth20_ranked_decision(&ranked_20);
+                        // One line per minute that MOVED anything or could not,
+                        // with every count the counters carry. Nothing on the box
+                        // scrapes `/metrics`, so this line is the only read-out of
+                        // ranked-steering churn that reaches CloudWatch — the
+                        // 2026-09-08 observability audit's gap 1. A quiet minute
+                        // (nothing planned, nothing refused) still logs nothing.
+                        let planned_20 = ranked_20.plan.swap_count();
+                        if planned_20 > 0 || ranked_20.capped > 0 || ranked_20.unplaced > 0 {
+                            tracing::info!(
+                                planned = planned_20,
+                                capped = ranked_20.capped,
+                                unplaced = ranked_20.unplaced,
+                                unfunded_departures = ranked_20.unfunded_departures,
+                                kept = ranked_20.kept,
+                                ranked = ranked.len(),
+                                "depth-20 ranked steering this minute — planned swaps go to the wire; \
+                                 capped and unplaced are retried next minute"
+                            );
+                        }
+                        (ranked_20.plan, "volume_ranking")
+                    }
+                    // A pool dialed from yesterday's close HOLDS until the first
+                    // ranking: re-planning the layout here would move the seeded
+                    // stock options back onto index windows at 09:08, undoing the
+                    // seed minutes before the ranking could keep it.
+                    None if crate::depth_seed::boot_seeded(
+                        crate::depth_seed::SeedPool::Depth20,
+                    ) =>
+                    {
+                        (
+                            crate::depth20_track::Depth20Plan {
+                                sockets_left_alone: held_20.len(),
+                                ..crate::depth20_track::Depth20Plan::default()
+                            },
+                            "seed_until_first_ranking",
+                        )
+                    }
+                    None => {
+                        let layout =
+                            crate::depth20_layout::build_depth20_layout(&candidates, &movers);
+                        (
+                            crate::depth20_track::plan_depth20_minute(&held_20, &layout),
+                            "layout_until_first_ranking",
+                        )
+                    }
                 }
             };
             if !plan_20.is_quiet() {
@@ -1838,6 +2085,49 @@ pub async fn run_depth_rebalance(
             "depth rebalance moved sockets"
         );
     }
+}
+
+/// Trims each socket's swap list to `cap`, returning how many were dropped.
+///
+/// # Why the NAME board needs this and the legacy layout did not have it
+///
+/// `depth20_track::plan_depth20_minute` is uncapped: it diffs a whole layout
+/// and hands over every paired swap. That was survivable for the legacy layout
+/// because a ±12 index window that shifts one strike releases exactly two legs,
+/// so a healthy minute produced two swaps a socket.
+///
+/// A NAME board minute is not that shape. Rotating one stock name is 24
+/// contracts out and 24 in, and the connection's command channel is
+/// [`crate::depth20_ranked_steer::DEPTH_SWAP_COMMAND_CHANNEL_DEPTH`] deep — so
+/// an uncapped plan would push the excess into a `try_send` that answers
+/// `Full`, counted as `channel_full` and dropped. The swap is lost either way;
+/// capping here makes the loss DELIBERATE, deterministic and countable rather
+/// than a queue overflow, and the remainder is simply re-planned next minute
+/// from the same inputs.
+///
+/// Truncation is deterministic because `plan_depth20_minute` orders each
+/// socket's departures and arrivals by `(security_id, segment)` before pairing
+/// — two records of the same minute must produce the same wire traffic, or a
+/// swap the guard refuses once is refused forever.
+///
+/// # Complexity
+///
+/// O(1) EXEMPT: O(sockets) with sockets fixed at five by the endpoint's own
+/// budget. Once a minute, steering task.
+fn cap_depth20_socket_swaps(plan: &mut crate::depth20_track::Depth20Plan, cap: usize) -> usize {
+    let mut capped = 0usize;
+    for socket in &mut plan.sockets {
+        if socket.swaps.len() > cap {
+            capped = capped.saturating_add(socket.swaps.len().saturating_sub(cap));
+            socket.swaps.truncate(cap);
+        }
+    }
+    // A socket left with nothing to send is no longer a socket this plan
+    // moves. Dropping it keeps `is_quiet` and `sockets_moved` honest — a plan
+    // reporting five moved sockets that sends nothing is the false-OK this
+    // repository keeps recording.
+    plan.sockets.retain(|socket| !socket.swaps.is_empty());
+    capped
 }
 
 /// Writes what the depth sockets hold to the seed file the next boot dials
@@ -3909,6 +4199,149 @@ mod expiry_permutation_tests {
         assert!(
             pair.ce_security_id < 900,
             "the at-the-money pick is far-dated"
+        );
+    }
+
+    // ---- the NAME-board wiring's own two helpers (2026-09-13) ----
+
+    /// `strike_paise` became `pub(crate)` so `depth20_name_board::strike_window`
+    /// could use the SAME rounding rule rather than carry a second copy of it.
+    /// A second copy is how two groupings of the same strike drift apart.
+    #[test]
+    fn test_strike_paise_rounds_to_paise_and_refuses_what_cannot_be_one() {
+        assert_eq!(strike_paise(100.0), Some(10_000));
+        // Rounding, never truncation: 24499.999999 is 24500, and truncating
+        // files it one paise low and splits the pair.
+        assert_eq!(strike_paise(24_499.999_999), Some(2_450_000));
+        assert_eq!(strike_paise(0.0), None);
+        assert_eq!(strike_paise(-1.0), None);
+        assert_eq!(strike_paise(f64::NAN), None);
+        assert_eq!(strike_paise(f64::INFINITY), None);
+        // Absurd values would cast to a saturated i64 and compare EQUAL to
+        // another absurd value, silently pairing two different strikes.
+        assert_eq!(strike_paise(1.0e20), None);
+    }
+
+    #[test]
+    fn cap_depth20_socket_swaps_trims_each_socket_and_counts_what_it_dropped() {
+        let swap = |id: u64| {
+            (
+                SubscribeInstrument {
+                    security_id: id,
+                    segment: ExchangeSegment::NseFno,
+                },
+                SubscribeInstrument {
+                    security_id: id + 1_000,
+                    segment: ExchangeSegment::NseFno,
+                },
+            )
+        };
+        let mut plan = crate::depth20_track::Depth20Plan {
+            sockets: vec![
+                crate::depth20_track::Depth20SocketPlan {
+                    socket: 0,
+                    swaps: (1..=10).map(swap).collect(),
+                    ..crate::depth20_track::Depth20SocketPlan::default()
+                },
+                crate::depth20_track::Depth20SocketPlan {
+                    socket: 1,
+                    swaps: vec![swap(50)],
+                    ..crate::depth20_track::Depth20SocketPlan::default()
+                },
+            ],
+            sockets_left_alone: 0,
+        };
+        assert_eq!(cap_depth20_socket_swaps(&mut plan, 4), 6);
+        assert_eq!(plan.sockets[0].swaps.len(), 4);
+        assert_eq!(plan.sockets[1].swaps.len(), 1);
+        // Deterministic: the FIRST four survive, and `plan_depth20_minute`
+        // orders each socket's pairs before handing them over.
+        assert_eq!(plan.sockets[0].swaps[0].0.security_id, 1);
+        assert_eq!(plan.sockets[0].swaps[3].0.security_id, 4);
+    }
+
+    #[test]
+    fn cap_depth20_socket_swaps_drops_a_socket_it_emptied_so_is_quiet_stays_honest() {
+        // A cap of zero is not reachable in production, but a plan that
+        // reports moved sockets while sending nothing is the false-OK this
+        // repository keeps recording — so the emptied socket leaves the plan.
+        let mut plan = crate::depth20_track::Depth20Plan {
+            sockets: vec![crate::depth20_track::Depth20SocketPlan {
+                socket: 0,
+                swaps: vec![(
+                    SubscribeInstrument {
+                        security_id: 1,
+                        segment: ExchangeSegment::NseFno,
+                    },
+                    SubscribeInstrument {
+                        security_id: 2,
+                        segment: ExchangeSegment::NseFno,
+                    },
+                )],
+                ..crate::depth20_track::Depth20SocketPlan::default()
+            }],
+            sockets_left_alone: 0,
+        };
+        assert_eq!(cap_depth20_socket_swaps(&mut plan, 0), 1);
+        assert!(plan.is_quiet());
+    }
+
+    /// The 2026-09-13 operator requirement, as a behavioural assertion rather
+    /// than a comment: a socket carrying a WHOLE NAME's worth of swaps is
+    /// applied whole, in the minute that planned it.
+    ///
+    /// Non-vacuous by construction — the same plan is run through the OLD cap
+    /// of four in the same test, and 20 of its 24 swaps are cut. That is the
+    /// six-minute rotation the operator was complaining about, reproduced, so
+    /// this test fails if the cap is ever walked back.
+    #[test]
+    fn a_whole_name_rotates_in_one_minute_at_the_production_cap() {
+        let name_cost = crate::depth20_ranked_steer::DEPTH20_NAME_SWAP_COST;
+        let swap = |id: u64| {
+            (
+                SubscribeInstrument {
+                    security_id: id,
+                    segment: ExchangeSegment::NseFno,
+                },
+                SubscribeInstrument {
+                    security_id: id + 100_000,
+                    segment: ExchangeSegment::NseFno,
+                },
+            )
+        };
+        let whole_name = || crate::depth20_track::Depth20SocketPlan {
+            socket: 0,
+            swaps: (1..=name_cost as u64).map(swap).collect(),
+            ..crate::depth20_track::Depth20SocketPlan::default()
+        };
+
+        let mut at_production = crate::depth20_track::Depth20Plan {
+            sockets: vec![whole_name()],
+            sockets_left_alone: 0,
+        };
+        let capped = cap_depth20_socket_swaps(
+            &mut at_production,
+            crate::depth20_ranked_steer::MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE,
+        );
+        assert_eq!(
+            capped, 0,
+            "a whole name must reach the wire in ONE minute; anything capped is \
+             a name the board chose and the socket did not take"
+        );
+        assert_eq!(at_production.sockets[0].swaps.len(), name_cost);
+
+        // The regression this replaces, run against the same plan so the
+        // assertion above cannot pass by the plan being empty.
+        let mut at_old_cap = crate::depth20_track::Depth20Plan {
+            sockets: vec![whole_name()],
+            sockets_left_alone: 0,
+        };
+        let old_capped = cap_depth20_socket_swaps(&mut at_old_cap, 4);
+        assert_eq!(
+            old_capped,
+            name_cost - 4,
+            "the pre-2026-09-13 cap of four cut 20 of a name's 24 swaps, which \
+             is the six-minute rotation this change exists to end"
         );
     }
 }

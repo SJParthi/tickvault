@@ -42,8 +42,16 @@
 //!
 //! # Complexity
 //!
-//! O(sockets × ranked) with both bounded at five: at most 25 key compares a
-//! minute, allocation-bounded by [`DEPTH_200_SOCKET_BUDGET`]. Cold path.
+//! O(sockets × ranked): sockets is [`DEPTH_200_SOCKET_BUDGET`] (5) and `ranked`
+//! is the PUBLISHED list, which is the exit set [`DEPTH200_EXIT_UNDERLYINGS`]
+//! (20) — so at most ~125 key compares a minute. Cold path.
+//!
+//! ⚠ CORRECTED 2026-09-13: this read "with both bounded at five: at most 25 key
+//! compares a minute". Only the SOCKET side is five. The ranked side became 20
+//! when `DEPTH200_HYSTERESIS_RANKS` widened 3 → 15 on 2026-09-11, because the
+//! planner reads the whole published band and not just the entry set.
+//! Understated 5x, in the reassuring direction. Still trivially cold — the
+//! correction is to the CLAIM, not to any cost worth acting on.
 
 use crate::depth200_atm::{PlannedSwap, SwitchReason};
 use crate::depth200_candidates::{DEPTH_200_SOCKET_BUDGET, Depth200Candidate};
@@ -163,15 +171,60 @@ pub fn plan_ranked_minute(
             continue;
         }
         // This socket holds something OFF the ranking: it is the next home.
-        let Some(candidate) = to_place.next() else {
-            // Nothing left to place: the socket keeps its off-ranking
-            // contract rather than being emptied (see the module header).
-            break;
-        };
+        //
+        // THREE steps, and the order of all three is load-bearing.
+        //
+        // 1. PEEK first. Nothing left to place means the socket keeps its
+        //    off-ranking contract rather than being emptied (module header) —
+        //    and it is NOT a cap refusal, so `capped` must not move.
+        // 2. THEN the cap. Reached with a candidate still waiting, the socket
+        //    is genuinely refused: count it and leave the candidate in the
+        //    iterator, where the terminal `to_place.count()` reports it as
+        //    `unplaced`.
+        // 3. ONLY THEN consume.
+        //
+        // Pulling before the cap check (the shape here until 2026-09-13)
+        // deletes a candidate from BOTH the plan and `unplaced` whenever the
+        // cap bites with candidates remaining: `capped` counts the SOCKET
+        // while the CONTRACT vanishes with no counter naming it. Unreachable
+        // today only because MAX_RANKED_SWAPS_PER_MINUTE ==
+        // DEPTH_200_SOCKET_BUDGET while the loop iterates exactly that many
+        // sockets — and that constant's own doc invites a LOWER cap as the
+        // expected tuning, which is precisely what would arm it.
+        //
+        // Checking the cap first and consuming second is NOT the fix: with the
+        // queue already empty it reports `capped` for sockets that were never
+        // refused anything (proven by
+        // `the_per_minute_cap_refuses_and_counts_the_overflow`, which that
+        // ordering fails). Peek separates "nothing to give" from "not allowed
+        // to give it", which is the distinction both counters exist to make.
+        //
+        // `continue`, NOT `break` (the shape here until 2026-09-13): a LATER
+        // socket may hold a ranked contract and belongs in `kept`. Breaking at
+        // the first off-ranking socket after the queue drains stops examining
+        // every socket behind it, so the `tv_depth200_ranked_sockets_kept`
+        // gauge under-reports — ranked [A,B,C] against held
+        // [off, A, B, C, _] published 0 when the truth was 3, telling an
+        // operator the pool churned when nothing moved. Continuing is
+        // otherwise inert: the socket is still left alone (no swap is pushed),
+        // `to_place` stays empty so no later socket can be funded either, and
+        // the terminal `to_place.count()` is unaffected.
+        if to_place.peek().is_none() {
+            continue;
+        }
         if decision.swaps.len() >= MAX_RANKED_SWAPS_PER_MINUTE {
             decision.capped = decision.capped.saturating_add(1);
             continue;
         }
+        let Some(candidate) = to_place.next() else {
+            // Unreachable: the peek two statements up returned `Some`, and
+            // nothing between there and here advances the iterator. Written as
+            // a `break` rather than an `expect` because `panic = "abort"` on
+            // the release profile turns a wrong assumption here into process
+            // death mid-session, and because `clippy::expect_used` is denied
+            // outside tests — the house rule that forbids exactly that trade.
+            break;
+        };
         decision.swaps.push(PlannedSwap {
             socket_index,
             old: *old,
@@ -342,6 +395,45 @@ mod tests {
         assert_eq!(d.unplaced, 0);
     }
 
+    /// Draining the arrival queue must not stop the loop: sockets BEHIND the
+    /// first unfunded one are still examined, so a held ranked contract is
+    /// still counted `kept`.
+    ///
+    /// The gauge is the whole reason. `tv_depth200_ranked_sockets_kept` is
+    /// what an operator reads to answer "did the pool churn this minute?" —
+    /// a socket order of [off-ranking, A, B, C, empty] against ranked [A,B,C]
+    /// reported 0 under the `break`, which reads as five sockets swapping out
+    /// on a minute that moved nothing.
+    #[test]
+    fn an_exhausted_arrival_queue_still_counts_later_kept_sockets() {
+        let ranked = [
+            candidate(1, 10, 500),
+            candidate(2, 20, 400),
+            candidate(3, 30, 300),
+        ];
+        // Socket 0 is off the ranking and takes the one unheld entry row
+        // (there is none — A, B and C are all held), so the queue is empty at
+        // socket 0 and the three KEPT sockets sit behind it.
+        let holds = [
+            held(9001, IDX),
+            held(1, FNO),
+            held(2, FNO),
+            held(3, FNO),
+            None,
+        ];
+        let d = plan_ranked_minute(&holds, &ranked);
+        assert!(
+            d.is_quiet(),
+            "nothing is unheld, so the off-ranking socket keeps what it holds"
+        );
+        assert_eq!(
+            d.kept, 3,
+            "sockets 1..3 hold ranked contracts and must be counted even \
+             though socket 0 found the arrival queue empty"
+        );
+        assert_eq!((d.capped, d.unplaced), (0, 0));
+    }
+
     /// The hysteresis band: a held contract that slipped OUT of the entry set
     /// but is still inside the published list is KEPT, not swapped out.
     #[test]
@@ -463,5 +555,78 @@ mod tests {
             unplaced: 1,
         });
         assert_eq!(RANKED_SWAP_OUTCOMES.len(), 3);
+    }
+
+    /// `plan_ranked_minute` PEEKS, then tests the cap, then consumes — in that
+    /// order.
+    ///
+    /// This cannot be a behavioural test. `MAX_RANKED_SWAPS_PER_MINUTE` equals
+    /// `DEPTH_200_SOCKET_BUDGET`, and `entry_set` slices the ranked list to
+    /// that same budget, so `to_place` can never still hold a candidate once
+    /// the cap is reached. The defect is LATENT and arms the moment the cap is
+    /// tuned BELOW the budget — which that constant's own doc names as the
+    /// expected future change. A source-order pin is the only assertion that
+    /// can fail today.
+    ///
+    /// What each edge buys:
+    /// * peek before cap — an empty queue must `continue`, not report `capped`
+    ///   (`the_per_minute_cap_refuses_and_counts_the_overflow` fails otherwise)
+    /// * cap before consume — a refused candidate must stay in the iterator so
+    ///   the terminal `to_place.count()` reports it as `unplaced`
+    ///
+    /// Sliced to the FUNCTION, never searched across the file: `continue;` and
+    /// `to_place` both occur elsewhere in this module, and a whole-file `find`
+    /// would happily anchor on a sibling — the mis-anchoring this repository
+    /// has now found nine times.
+    #[test]
+    fn the_planner_peeks_then_caps_then_consumes() {
+        let src = include_str!("depth200_ranked_steer.rs");
+        // Strip the test module, so these very assertions cannot satisfy the
+        // scan that reads them.
+        let prod = src
+            .split_once("\nmod tests {")
+            .map_or(src, |(before, _)| before);
+
+        const FN: &str = "pub fn plan_ranked_minute(";
+        const PEEK: &str = "if to_place.peek().is_none() {";
+        const CAP: &str = "if decision.swaps.len() >= MAX_RANKED_SWAPS_PER_MINUTE {";
+        const TAKE: &str = "let Some(candidate) = to_place.next() else {";
+
+        assert_eq!(
+            prod.matches(FN).count(),
+            1,
+            "expected exactly one definition of `plan_ranked_minute` in the \
+             production region; the slice below assumes it"
+        );
+        let from = prod.find(FN).expect("counted above");
+        let rest = &prod[from + FN.len()..];
+        let to = rest.find("\npub fn ").unwrap_or(rest.len());
+        let body = &rest[..to];
+
+        for (label, needle) in [("peek", PEEK), ("cap", CAP), ("take", TAKE)] {
+            assert_eq!(
+                body.matches(needle).count(),
+                1,
+                "expected exactly one `{label}` site inside \
+                 `plan_ranked_minute`, found {}",
+                body.matches(needle).count()
+            );
+        }
+
+        let peek_at = body.find(PEEK).expect("counted above");
+        let cap_at = body.find(CAP).expect("counted above");
+        let take_at = body.find(TAKE).expect("counted above");
+
+        assert!(
+            peek_at < cap_at,
+            "an EMPTY queue must skip the socket, not count a cap refusal: \
+             peek at {peek_at}, cap at {cap_at}"
+        );
+        assert!(
+            cap_at < take_at,
+            "the cap must refuse BEFORE the candidate is consumed, or the \
+             refused candidate is deleted from the plan AND from `unplaced` \
+             and no counter names it: cap at {cap_at}, take at {take_at}"
+        );
     }
 }

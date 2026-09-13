@@ -505,6 +505,53 @@ pub const SUBSCRIBE_DISPATCH_FAILED_METRIC: &str = "tv_dhan_ws_subscribe_dispatc
 /// than assumed — the arithmetic above is a bound, this is the measurement.
 pub const SUBSCRIBE_DISPATCH_MS_METRIC: &str = "tv_dhan_ws_subscribe_dispatch_ms";
 
+/// Histogram: wall-clock milliseconds from `BeginDial` to `DialSucceeded` on
+/// this connection. Labels: `endpoint`.
+///
+/// # Why this exists
+///
+/// [`RECONNECT_METRIC`] counts how MANY times a socket re-dialed and has never
+/// been able to say how LONG any of them took. Both events already reach
+/// `on_event` carrying the caller's own `now: Instant`, so this costs one
+/// stored timestamp and adds no clock read.
+///
+/// Local `/metrics` only, deliberately: an EMF name is ~$0.30/mo against a
+/// September forecast that already sits above the automatic
+/// `STOP_EC2_INSTANCES` line, and the noise lock requires a LEVER rather than
+/// a cost note. This is a number to read AFTER an existing page.
+pub const DIAL_MS_METRIC: &str = "tv_dhan_ws_dial_ms";
+
+/// Histogram: wall-clock milliseconds from `BeginDial` to the FIRST frame that
+/// arrives on the new socket. Labels: `endpoint`.
+///
+/// # Why this is the number that matters, and why it is not the one above
+///
+/// [`DIAL_MS_METRIC`] stops when the transport is up. This one stops when data
+/// actually flows again, so it spans the subscribe dispatch AND Dhan's
+/// no-snapshot-on-subscribe dark period — a freshly subscribed instrument is
+/// BLANK until its book next changes. That is the real blind window of a
+/// reconnect, and nothing in this workspace has ever measured it.
+///
+/// Recorded ONCE per dial, on the first-frame transition only, so it is never
+/// per-frame work on a path that sees every frame.
+pub const RECONNECT_RECOVERY_MS_METRIC: &str = "tv_dhan_ws_reconnect_recovery_ms";
+
+/// Histogram: wall-clock milliseconds ONE leg of a depth swap spent on the
+/// wire. Labels: `endpoint`, `leg` (`unsubscribe` | `subscribe`).
+///
+/// # Why a ceiling was never a measurement
+///
+/// [`SWAP_WIRE_BUDGET`] is a one-second `timeout` per side. It bounds the leg;
+/// it says nothing about how long the leg actually took, and the depth
+/// first-packet module says so in its own header. Recorded on BOTH outcomes —
+/// a leg that ELAPSED its budget is the most interesting sample there is, and
+/// recording only the `Ok` path would report a healthy median while every slow
+/// swap vanished.
+///
+/// At most 20 depth-20 swaps plus 5 depth-200 swaps a minute, so this is cold.
+/// Local `/metrics` only, for the budget reason on [`DIAL_MS_METRIC`].
+pub const SWAP_WIRE_MS_METRIC: &str = "tv_dhan_ws_swap_wire_ms";
+
 /// Counter: instruments the guard REFUSED to put on the wire because the
 /// connection would then have carried the same one twice. Labels: `endpoint`,
 /// `site` (`new` | `extend` | `swap`).
@@ -959,6 +1006,64 @@ pub fn probe_close_spent(connection_index: u8) -> bool {
         .is_some_and(|a| a.load(std::sync::atomic::Ordering::Relaxed))
 }
 
+/// How many times each slot has completed a dial this process lifetime.
+static DIAL_GENERATION: [std::sync::atomic::AtomicU64; GHOST_REDIAL_SLOTS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; GHOST_REDIAL_SLOTS];
+
+/// Records that `connection_index` just completed a dial.
+///
+/// Called from the ONE place a dial is confirmed
+/// ([`ConnEvent::DialSucceeded`]), so a caller cannot forget it and a test
+/// driving the state machine gets the same bump the socket does.
+fn bump_dial_generation(connection_index: u8) {
+    if let Some(slot) = DIAL_GENERATION.get(usize::from(connection_index)) {
+        slot.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Dials this slot has completed. `0` for an out-of-range index.
+///
+/// # Why the unsubscribe probe cannot produce a verdict without this
+///
+/// A probe measures whether frames stop. A RE-DIAL inside its watch window
+/// changes what "stopped" means, in opposite directions for the two arms, and
+/// neither is visible from the frames alone:
+///
+/// * **Arm A** empties the guard, and the guard IS the reconnect replay. A
+///   re-dial therefore comes back subscribed to NOTHING, the frames stop
+///   because of us, and the probe would report `honoured` — a false finding
+///   that the vendor honoured a request it may well have ignored.
+/// * **Arm B** closes the socket on purpose. Silence afterwards is only
+///   evidence if the socket actually came BACK; a slot still climbing its
+///   backoff ladder is silent for reasons that say nothing about the vendor.
+///
+/// One counter answers both, read either side of the window: Arm A requires it
+/// UNCHANGED, Arm B requires it to have MOVED. The `ProbeUnsubscribe` handler
+/// has carried a comment naming this defence — "the caller owns it" — since
+/// the probe was written; this is the accessor that lets the caller own it.
+///
+/// # ⚠ An out-of-range index makes the comparison VACUOUS, not loud
+///
+/// This reads `0` for any index ≥ [`GHOST_REDIAL_SLOTS`] rather than failing,
+/// and [`bump_dial_generation`] is the matching silent no-op. So for such an
+/// index BOTH reads return `0`, `after == before`, and the probe concludes "no
+/// re-dial happened" — Arm A's `Silent` then yields `Honoured` on a check that
+/// proved nothing, which is the false vendor-blaming finding the whole defence
+/// exists to prevent.
+///
+/// It is unreachable today: the authorized 16 sockets index `0..16` against 32
+/// slots. It becomes reachable the moment the connection count is raised past
+/// the slot count, and it would fail SILENTLY and in the reassuring direction.
+/// A future session that raises the socket budget must raise
+/// [`GHOST_REDIAL_SLOTS`] in the same change. Pinned by
+/// `dial_generation_out_of_range_makes_the_probe_check_vacuous`.
+#[must_use]
+pub fn dial_generation(connection_index: u8) -> u64 {
+    DIAL_GENERATION
+        .get(usize::from(connection_index))
+        .map_or(0, |g| g.load(std::sync::atomic::Ordering::Acquire))
+}
+
 /// Why a connection stopped permanently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParkReason {
@@ -1255,6 +1360,16 @@ pub struct ConnectionSupervisor {
     /// connection then re-dialled instantly, forever. `healthy_since` answers
     /// the question that actually matters: *for how long* did it carry frames.
     healthy_since: Option<Instant>,
+    /// When the CURRENT dial began. Set on `BeginDial`, READ on `DialSucceeded`,
+    /// and TAKEN on the first frame.
+    ///
+    /// Two measurements share one timestamp because they are two ends of the
+    /// same question. `DialSucceeded` reads it and leaves it in place for the
+    /// transport time; the first frame takes it for the true recovery time.
+    /// Taking it there is what stops a second frame re-recording, and
+    /// `BeginDial` overwriting it is what keeps a failed dial from leaking into
+    /// the next attempt.
+    dial_started_at: Option<Instant>,
     /// Monotonic timestamps of recent re-dials, newest overwriting oldest.
     ///
     /// A fixed inline array, never a `Vec`: this is written on the disconnect
@@ -1296,6 +1411,7 @@ impl ConnectionSupervisor {
             last_frame_at: now,
             proven_healthy: false,
             healthy_since: None,
+            dial_started_at: None,
             redial_history: [None; FLAP_HISTORY_SLOTS],
             redial_cursor: 0,
             frames: 0,
@@ -1392,6 +1508,7 @@ impl ConnectionSupervisor {
                 self.phase = ConnPhase::Dialing;
                 self.proven_healthy = false;
                 self.healthy_since = None;
+                self.dial_started_at = Some(now);
                 // Reset here, not on dial completion: the watchdog must also
                 // cover a dial that hangs forever without ever completing.
                 self.watchdog.record_activity(now);
@@ -1401,8 +1518,20 @@ impl ConnectionSupervisor {
 
             ConnEvent::DialSucceeded => {
                 self.phase = ConnPhase::Subscribing;
+                // READ, never taken: the first frame still needs this stamp for
+                // the recovery measurement. Once per dial, so the label lookup
+                // is cold — this is not the per-tick path `record_ws_lag` had
+                // to pre-resolve handles for.
+                if let Some(started) = self.dial_started_at {
+                    metrics::histogram!(DIAL_MS_METRIC, "endpoint" => self.slot.endpoint.as_str())
+                        .record(now.saturating_duration_since(started).as_secs_f64() * 1000.0);
+                }
                 self.watchdog.record_activity(now);
                 self.last_frame_at = now;
+                // The ONE place a completed dial is recorded, so the
+                // unsubscribe probe's re-dial defence cannot be defeated by a
+                // path that forgot to report. See `dial_generation`.
+                bump_dial_generation(self.slot.global_index);
                 SupervisorAction::Subscribe
             }
 
@@ -1437,6 +1566,16 @@ impl ConnectionSupervisor {
                 if !self.proven_healthy {
                     self.proven_healthy = true;
                     self.attempt = 0;
+                    // The true blind window: dial -> subscribe dispatch -> Dhan
+                    // applying it -> the book next changing. TAKEN, so a second
+                    // frame cannot record a second sample for one dial.
+                    if let Some(started) = self.dial_started_at.take() {
+                        metrics::histogram!(
+                            RECONNECT_RECOVERY_MS_METRIC,
+                            "endpoint" => self.slot.endpoint.as_str()
+                        )
+                        .record(now.saturating_duration_since(started).as_secs_f64() * 1000.0);
+                    }
                     // Start the health clock at the FIRST frame. The attempt
                     // reset above is retained for compatibility with the
                     // ladder's own semantics, but it no longer implies an
@@ -2677,6 +2816,24 @@ pub enum LiveSubscriptionCommand {
         /// connection holds, or the command is refused fail-closed and
         /// nothing reaches the wire.
         drop_this: SubscribeInstrument,
+        /// Whether to put an unsubscribe frame on the wire (Arm A), or only
+        /// empty the guard (Arm B).
+        ///
+        /// # Why Arm B needs the guard emptied and NO frame
+        ///
+        /// The guard IS the reconnect replay. Arm B's question is whether a
+        /// stream can be stopped by closing the socket and replaying a set
+        /// WITHOUT the contract — so the set has to actually lose it, and the
+        /// socket is about to be torn down anyway, which makes a frame on a
+        /// dying connection pure noise in the one measurement that must stay
+        /// clean.
+        ///
+        /// Until 2026-09-13 Arm B sent nothing AND left the guard alone, so
+        /// the re-dial faithfully re-subscribed the contract, frames always
+        /// resumed, and the shared verdict mapping returned `Ignored` no
+        /// matter what Dhan did. The control could only ever return the
+        /// vendor-blaming answer, which is worse than having no control.
+        send_wire: bool,
         /// Where the connection reports what actually happened.
         ///
         /// Unlike `Extend` and `Swap` this is not optional in practice — a
@@ -4667,6 +4824,10 @@ where
                             // AFTER a successful unsubscribe means it holds nothing.
                             // Only the second is worth tearing the socket down for.
                             let mut unsubscribe_succeeded = false;
+                            // Declared OUTSIDE the `if let` so the record below,
+                            // which must run on every arm including the timeout,
+                            // can still read it.
+                            let unsub_started = tokio::time::Instant::now();
                             if let Some(drop_this) = swap.unsubscribe {
                                 match tokio::time::timeout(
                                     SWAP_WIRE_BUDGET,
@@ -4793,13 +4954,30 @@ where
                                     }
                                 }
                             }
+                            if swap.unsubscribe.is_some() {
+                                metrics::histogram!(
+                                    SWAP_WIRE_MS_METRIC,
+                                    "endpoint" => supervisor.slot().endpoint.as_str(),
+                                    "leg" => "unsubscribe",
+                                )
+                                .record(unsub_started.elapsed().as_secs_f64() * 1000.0);
+                            }
                             if !wire_failed && let Some(add_this) = swap.subscribe {
-                                match tokio::time::timeout(
+                                let sub_started = tokio::time::Instant::now();
+                                let sub_outcome = tokio::time::timeout(
                                     SWAP_WIRE_BUDGET,
                                     socket.send_subscribe(&[add_this]),
                                 )
-                                .await
-                                {
+                                .await;
+                                // Recorded before the match so an elapsed budget
+                                // is sampled too — see `SWAP_WIRE_MS_METRIC`.
+                                metrics::histogram!(
+                                    SWAP_WIRE_MS_METRIC,
+                                    "endpoint" => supervisor.slot().endpoint.as_str(),
+                                    "leg" => "subscribe",
+                                )
+                                .record(sub_started.elapsed().as_secs_f64() * 1000.0);
+                                match sub_outcome {
                                     Ok(Ok(())) => {}
                                     Ok(Err(_)) => wire_failed = true,
                                     Err(_elapsed) => {
@@ -5069,7 +5247,11 @@ where
                         }
                     }
                 }
-                Ok(LiveSubscriptionCommand::ProbeUnsubscribe { drop_this, ack }) => {
+                Ok(LiveSubscriptionCommand::ProbeUnsubscribe {
+                    drop_this,
+                    send_wire,
+                    ack,
+                }) => {
                     // ARM A OF THE UNSUBSCRIBE PROBE (scope lock, 2026-09-12).
                     //
                     // Written as nested `if`/`else` rather than early
@@ -5124,18 +5306,27 @@ where
                         // can park it for the session. The probe would have
                         // broken the socket it was measuring.
                         let mut timed_out = false;
-                        let sent = match tokio::time::timeout(
-                            SWAP_WIRE_BUDGET,
-                            socket.send_unsubscribe(&[drop_this]),
-                        )
-                        .await
-                        {
-                            Ok(Ok(())) => true,
-                            Ok(Err(_)) => false,
-                            Err(_elapsed) => {
-                                timed_out = true;
-                                false
+                        // Arm B asks for no frame: the socket is about to be
+                        // closed, so the only thing that has to change is the
+                        // guard, which is what the re-dial replays. Treating
+                        // that as "sent" is not a fiction — it is the whole
+                        // action this arm requested, and it cannot fail.
+                        let sent = if send_wire {
+                            match tokio::time::timeout(
+                                SWAP_WIRE_BUDGET,
+                                socket.send_unsubscribe(&[drop_this]),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => true,
+                                Ok(Err(_)) => false,
+                                Err(_elapsed) => {
+                                    timed_out = true;
+                                    false
+                                }
                             }
+                        } else {
+                            true
                         };
                         if sent {
                             // The frame is out. Empty the guard so this
@@ -5181,12 +5372,19 @@ where
                                 pool_index = supervisor.slot().pool_index,
                                 security_id = drop_this.security_id,
                                 segment = drop_this.segment.as_str(),
+                                // Meaningful only when a frame actually went
+                                // out; Arm B empties the guard and sends
+                                // nothing, and `wire` is what tells the two
+                                // apart in a log a ticket is written from.
                                 request_code = FEED_UNSUBSCRIBE_TWENTY_DEPTH,
+                                wire = send_wire,
                                 generation = guard.generation(),
-                                "unsubscribe probe: frame written to the wire and this socket's \
-                                 subscription set emptied. Frames arriving for this instrument \
-                                 from now on are the vendor ignoring the request — that is the \
-                                 measurement."
+                                dial_generation = dial_generation(supervisor.slot().global_index),
+                                "unsubscribe probe: this socket's subscription set is now empty. \
+                                 With `wire` true a frame went out and any frame arriving from \
+                                 now on is the vendor ignoring it; with `wire` false nothing was \
+                                 asked of the vendor and the socket is about to be closed, so \
+                                 what follows measures the replay instead."
                             );
                         } else {
                             answer_probe_unsubscribe(
@@ -10478,6 +10676,7 @@ mod tests {
         let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
         tx.send(LiveSubscriptionCommand::ProbeUnsubscribe {
             drop_this: si(1),
+            send_wire: true,
             ack: Some(ack_tx),
         })
         .await
@@ -10531,6 +10730,7 @@ mod tests {
         tx.send(LiveSubscriptionCommand::ProbeUnsubscribe {
             // The probe named 1; the socket moved to 7.
             drop_this: si(1),
+            send_wire: true,
             ack: Some(ack_tx),
         })
         .await
@@ -10577,6 +10777,7 @@ mod tests {
         let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
         tx.send(LiveSubscriptionCommand::ProbeUnsubscribe {
             drop_this: si(1),
+            send_wire: true,
             ack: Some(ack_tx),
         })
         .await
@@ -10651,6 +10852,7 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         tx.send(LiveSubscriptionCommand::ProbeUnsubscribe {
             drop_this: si(1),
+            send_wire: true,
             ack: None,
         })
         .await
@@ -10702,6 +10904,7 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         tx.send(LiveSubscriptionCommand::ProbeUnsubscribe {
             drop_this: si(1),
+            send_wire: true,
             ack: None,
         })
         .await
@@ -10753,6 +10956,7 @@ mod tests {
         let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
         tx.send(LiveSubscriptionCommand::ProbeUnsubscribe {
             drop_this: si(1),
+            send_wire: true,
             ack: Some(ack_tx),
         })
         .await
@@ -10913,6 +11117,441 @@ mod tests {
             ghost < probe,
             "the ghost take must come FIRST: a ghost is a fault and a probe close is a \
              measurement, and a measurement must never pre-empt a remediation"
+        );
+    }
+
+    /// A slot the authorized 16 sockets never use, so this test cannot be
+    /// perturbed by another test driving a real connection index.
+    const UNUSED_SLOT: u8 = (GHOST_REDIAL_SLOTS - 1) as u8;
+
+    #[test]
+    fn dial_generation_counts_dials_and_never_panics_out_of_range() {
+        // Relative to a captured baseline, never an absolute: this register is
+        // a process-global static and the suite runs in parallel.
+        let before = dial_generation(UNUSED_SLOT);
+
+        bump_dial_generation(UNUSED_SLOT);
+        assert_eq!(
+            dial_generation(UNUSED_SLOT),
+            before + 1,
+            "a completed dial must advance the slot's generation"
+        );
+
+        bump_dial_generation(UNUSED_SLOT);
+        assert_eq!(dial_generation(UNUSED_SLOT), before + 2);
+
+        // An out-of-range index reads 0 rather than panicking. The probe calls
+        // this from a live steering path under `panic = "abort"`, so a bad
+        // index must never take the process down.
+        let out_of_range = u8::try_from(GHOST_REDIAL_SLOTS).unwrap_or(u8::MAX);
+        assert_eq!(dial_generation(out_of_range), 0);
+        assert_eq!(dial_generation(u8::MAX), 0);
+
+        // And a bump on an out-of-range index is a silent no-op, not a write
+        // into a neighbouring slot.
+        let neighbour = dial_generation(UNUSED_SLOT);
+        bump_dial_generation(out_of_range);
+        bump_dial_generation(u8::MAX);
+        assert_eq!(
+            dial_generation(UNUSED_SLOT),
+            neighbour,
+            "an out-of-range bump wrote into a real slot"
+        );
+    }
+
+    #[test]
+    fn dial_generation_is_independent_per_slot() {
+        // Arm A requires the generation UNCHANGED and Arm B requires it MOVED,
+        // each on its OWN socket — so a bump on one slot must never be
+        // readable as a bump on the other, or the two arms contaminate.
+        // Slots DISJOINT from the ones the test above bumps: these two tests
+        // share the process-global register and cargo runs them in parallel,
+        // so overlapping slots would make each one flake the other.
+        let a = UNUSED_SLOT - 3;
+        let b = UNUSED_SLOT - 2;
+        let (a0, b0) = (dial_generation(a), dial_generation(b));
+
+        bump_dial_generation(a);
+        assert_eq!(dial_generation(a), a0 + 1);
+        assert_eq!(
+            dial_generation(b),
+            b0,
+            "a dial on one slot advanced another slot's generation"
+        );
+    }
+
+    /// The PRODUCTION WIRING of [`bump_dial_generation`], driven through the
+    /// real state machine (2026-09-13).
+    ///
+    /// The two tests above call `bump_dial_generation` DIRECTLY. Nothing drove
+    /// [`ConnEvent::DialSucceeded`], so deleting the single production call
+    /// site left the function still referenced — by tests — and it would not
+    /// even raise `dead_code`, which is what caught an earlier finding of this
+    /// same class. A helper with a test and no caller is the skeleton shape
+    /// `audit-findings-2026-04-17.md` Rule 14 forbids.
+    ///
+    /// The consequence of that regression is silent and severe: the counter
+    /// never moves, so `dials_after == dials_before` FOREVER. Arm A of the
+    /// unsubscribe probe then returns `Honoured` on a socket that genuinely
+    /// re-dialled — the false vendor-blaming finding the generation check
+    /// exists to prevent, on the exact question a vendor ticket is built on —
+    /// and Arm B, which requires the counter to have MOVED, can never return a
+    /// verdict at all.
+    #[test]
+    fn a_dial_succeeded_event_advances_the_slot_generation() {
+        // A slot DISJOINT from every other test that touches this register:
+        // the authorized sockets index 0..16, and the two tests above use
+        // UNUSED_SLOT, UNUSED_SLOT - 3 and UNUSED_SLOT - 2. `DIAL_GENERATION`
+        // is a process-global static and cargo runs the suite in parallel, so
+        // an overlapping slot makes these tests flake each other.
+        const PROD_WIRING_SLOT: u8 = UNUSED_SLOT - 5;
+        let now = t0();
+        let mut s = ConnectionSupervisor::new(
+            ConnectionSlot {
+                endpoint: DhanEndpointType::Depth200,
+                pool_index: 0,
+                global_index: PROD_WIRING_SLOT,
+            },
+            now,
+        );
+        // Relative to a captured baseline, never an absolute — same reason.
+        let before = dial_generation(PROD_WIRING_SLOT);
+
+        let _ = s.on_event(ConnEvent::BeginDial, now);
+        assert_eq!(
+            dial_generation(PROD_WIRING_SLOT),
+            before,
+            "ANTI-VACUITY: a dial that has only BEGUN must not count, or this \
+             test would pass against a bump moved to the wrong arm — and a \
+             dial that hangs forever would read as a completed re-dial"
+        );
+
+        assert_eq!(
+            s.on_event(ConnEvent::DialSucceeded, now),
+            SupervisorAction::Subscribe
+        );
+        assert_eq!(
+            dial_generation(PROD_WIRING_SLOT),
+            before + 1,
+            "the `ConnEvent::DialSucceeded` arm no longer records the dial — \
+             the probe's re-dial defence is dead, and every Arm A verdict \
+             reads `Honoured` whether the socket re-dialled or not"
+        );
+
+        // A SECOND cycle, because the probe reads the counter either side of a
+        // watch window: the register must track EVERY confirmed dial, not just
+        // the first, or a re-dial inside that window is invisible.
+        let later = now + Duration::from_secs(1);
+        let _ = s.on_event(ConnEvent::BeginDial, later);
+        let _ = s.on_event(ConnEvent::DialSucceeded, later);
+        assert_eq!(
+            dial_generation(PROD_WIRING_SLOT),
+            before + 2,
+            "a re-dial inside the watch window must be visible to the probe"
+        );
+    }
+
+    /// The fail-open edge, DOCUMENTED rather than fixed (2026-09-13).
+    ///
+    /// [`dial_generation`] returns `0` for an out-of-range index on BOTH the
+    /// before and the after read, so `redialled` is `false` however many dials
+    /// occurred and Arm A's `Silent` yields `Honoured` from a comparison that
+    /// proved nothing. It is unreachable at 16 authorized sockets against 32
+    /// slots; it becomes reachable the moment the connection count is raised
+    /// past the slot count, and it fails SILENTLY and in the reassuring
+    /// direction. Recorded here, and at [`dial_generation`], so a session that
+    /// raises the budget sees the consequence rather than discovering it.
+    #[test]
+    fn dial_generation_out_of_range_makes_the_probe_check_vacuous() {
+        let out_of_range = u8::try_from(GHOST_REDIAL_SLOTS).unwrap_or(u8::MAX);
+
+        // The probe's own comparison, spelled out: read, re-dial, read.
+        let before = dial_generation(out_of_range);
+        bump_dial_generation(out_of_range);
+        bump_dial_generation(out_of_range);
+        let after = dial_generation(out_of_range);
+
+        assert_eq!(before, 0);
+        assert_eq!(after, 0);
+        assert_eq!(
+            after, before,
+            "DOCUMENTED, NOT DESIRED: two dials happened and the check cannot \
+             see either, so Arm A would report `Honoured` on a socket that \
+             re-dialled"
+        );
+
+        // The invariant that keeps the edge unreachable. If this ever fails,
+        // some authorized socket has no generation slot and its probe verdict
+        // is vacuous — raise GHOST_REDIAL_SLOTS in the same change that raises
+        // the connection budget.
+        assert!(
+            usize::from(MAX_TOTAL_DHAN_CONNECTIONS) <= GHOST_REDIAL_SLOTS,
+            "every authorized socket must have a real generation slot, or the \
+             probe's re-dial defence is vacuous for the ones that do not"
+        );
+    }
+
+    /// Arm B's `send_wire: false` branch at the SUPERVISOR, end to end
+    /// (2026-09-13).
+    ///
+    /// All six `ProbeUnsubscribe` tests before this one passed
+    /// `send_wire: true`; the probe-side test asserts only that the COMMAND
+    /// carries `!send_wire`. Nothing asserted that the supervisor HONOURS it —
+    /// so the `else { true }` branch that empties the guard and sends no frame
+    /// had zero coverage, on the arm whose whole mechanism is the
+    /// close-and-redial.
+    ///
+    /// Both halves matter and they fail in opposite directions:
+    ///
+    /// * a frame that DOES go out makes Arm B into Arm A, measuring the
+    ///   vendor's unsubscribe handling instead of the re-dial replay;
+    /// * a guard that is NOT emptied makes the re-dial re-subscribe the
+    ///   instrument, frames resume, and Arm B measures our own replay.
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_unsubscribe_with_send_wire_false_empties_the_guard_without_a_frame() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: one_frame_then_a_reconnectable_close(),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(LiveSubscriptionCommand::ProbeUnsubscribe {
+            drop_this: si(1),
+            send_wire: false,
+            ack: Some(ack_tx),
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let _ = run_connection_with_commands(
+            fake(&st),
+            sup(DhanEndpointType::Depth200, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        assert_eq!(
+            ack_rx.try_recv().expect("the probe arm must answer"),
+            ProbeUnsubscribeOutcome::Dropped,
+            "Arm B asks for no frame, and that request cannot fail — the \
+             outcome must be `Dropped`, never `WireFailed`"
+        );
+        let s = st.lock().expect("fake state");
+        assert_eq!(
+            s.unsubscribes, 0,
+            "`send_wire: false` means NO unsubscribe frame reaches the wire — \
+             a frame here would make Arm B indistinguishable from Arm A"
+        );
+        assert_eq!(
+            s.wire_calls,
+            vec!["subscribe"],
+            "the initial dispatch and nothing else"
+        );
+        assert_eq!(
+            s.connects, 2,
+            "ANTI-VACUITY: without a real re-dial the replay assertion below \
+             is green whatever the guard holds"
+        );
+        assert_eq!(
+            s.subscribes, 1,
+            "THE GUARD SIDE: emptied without a frame, so the re-dial's replay \
+             carries nothing. Were the branch to leave the guard holding the \
+             instrument, the replay would re-subscribe it and Arm B would be \
+             measuring our own replay rather than the vendor"
+        );
+    }
+
+    // ---- reconnect + swap latency (2026-09-13) ---------------------------
+    //
+    // The operator asked for two numbers that did not exist: how long a socket
+    // takes to come back, and how long a resubscribe spends on the wire. Both
+    // were BOUNDED and neither was MEASURED — `SWAP_WIRE_BUDGET` is a timeout,
+    // and `RECONNECT_METRIC` counts re-dials without ever timing one.
+
+    /// The metric names are the operator-facing surface; pin them.
+    #[test]
+    fn the_three_latency_metric_names_are_pinned() {
+        assert_eq!(DIAL_MS_METRIC, "tv_dhan_ws_dial_ms");
+        assert_eq!(
+            RECONNECT_RECOVERY_MS_METRIC,
+            "tv_dhan_ws_reconnect_recovery_ms"
+        );
+        assert_eq!(SWAP_WIRE_MS_METRIC, "tv_dhan_ws_swap_wire_ms");
+        // `observability.rs` buckets on a `_ms` SUFFIX. A rename that drops it
+        // silently re-buckets these into the default (seconds) ladder, where a
+        // 300 ms dial lands in the first bucket forever.
+        for name in [
+            DIAL_MS_METRIC,
+            RECONNECT_RECOVERY_MS_METRIC,
+            SWAP_WIRE_MS_METRIC,
+        ] {
+            assert!(
+                name.ends_with("_ms"),
+                "{name} must keep the _ms suffix the histogram bucketing keys on"
+            );
+        }
+    }
+
+    /// A dial that completes and then delivers records BOTH numbers, and the
+    /// second frame records nothing more.
+    #[test]
+    fn a_dial_records_transport_time_then_recovery_time_once() {
+        let start = Instant::now();
+        let mut conn = sup(DhanEndpointType::MainFeed, 0, start);
+
+        assert!(
+            conn.dial_started_at.is_none(),
+            "an idle supervisor has no dial in flight"
+        );
+
+        conn.on_event(ConnEvent::BeginDial, start);
+        let stamped = conn
+            .dial_started_at
+            .expect("BeginDial must stamp the dial start");
+        assert_eq!(stamped, start);
+
+        // DialSucceeded READS the stamp — it must not consume it, or the
+        // recovery measurement below has nothing left to measure from.
+        conn.on_event(ConnEvent::DialSucceeded, start + Duration::from_millis(120));
+        assert_eq!(
+            conn.dial_started_at,
+            Some(start),
+            "the transport-time record must not take the stamp the recovery record needs"
+        );
+
+        // First frame TAKES it.
+        conn.on_event(ConnEvent::FrameReceived, start + Duration::from_millis(900));
+        assert!(
+            conn.dial_started_at.is_none(),
+            "the first frame must consume the stamp so a second frame cannot record again"
+        );
+
+        // Second frame: nothing left to record.
+        conn.on_event(ConnEvent::FrameReceived, start + Duration::from_millis(950));
+        assert!(conn.dial_started_at.is_none());
+    }
+
+    /// A re-dial must not measure from the PREVIOUS dial. Without the
+    /// overwrite in `BeginDial` a failed dial leaks its stamp forward and the
+    /// next socket reports a recovery time that includes the failure.
+    #[test]
+    fn a_redial_measures_from_its_own_begin_not_the_failed_one() {
+        let start = Instant::now();
+        let mut conn = sup(DhanEndpointType::MainFeed, 0, start);
+
+        conn.on_event(ConnEvent::BeginDial, start);
+        assert_eq!(conn.dial_started_at, Some(start));
+
+        // That dial fails — the stamp is still the old one.
+        conn.on_event(ConnEvent::DialFailed, start + Duration::from_millis(200));
+
+        let second = start + Duration::from_secs(5);
+        conn.on_event(ConnEvent::BeginDial, second);
+        assert_eq!(
+            conn.dial_started_at,
+            Some(second),
+            "a fresh dial must re-stamp, or its recovery time carries the failed attempt"
+        );
+    }
+
+    /// Placement, not existence. Each of these is a way the measurement could
+    /// be present and wrong.
+    #[test]
+    fn the_latency_records_sit_where_they_measure_the_right_thing() {
+        let src = include_str!("pool_supervisor.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src
+            .split_once(&format!("\n{test_marker}"))
+            .map_or(src, |(head, _)| head);
+
+        // Non-vacuity: the scan must be looking at real production text.
+        assert!(
+            production.contains("ConnEvent::BeginDial => {"),
+            "the production slice is empty or mis-cut — every assertion below would pass vacuously"
+        );
+
+        // The recovery record must be INSIDE the first-frame transition. On the
+        // per-frame arm unguarded it would allocate a label set for every frame
+        // of the session, which is the `record_ws_lag` defect (~36M
+        // allocations/hour) arriving in a second place.
+        let first_frame = production
+            .split_once("if !self.proven_healthy {")
+            .expect("the first-frame transition must exist")
+            .1;
+        let (first_frame_block, _) = first_frame
+            .split_once("\n                }")
+            .expect("the first-frame block must close");
+        assert!(
+            first_frame_block.contains(stringify!(RECONNECT_RECOVERY_MS_METRIC)),
+            "the recovery record must sit inside the first-frame transition, never on the \
+             per-frame arm"
+        );
+        assert!(
+            first_frame_block.contains("self.dial_started_at.take()"),
+            "it must TAKE the stamp — reading it would record one sample per frame"
+        );
+
+        // Both swap legs, and the unsubscribe one OUTSIDE its `if let`, so a
+        // leg that ELAPSES its budget is still sampled. Recording only the Ok
+        // path reports a healthy median while every slow swap vanishes.
+        // Count the LEGS, not the symbol: the symbol also appears in a doc
+        // comment, and a count that includes prose lets a deleted leg hide
+        // behind an added sentence.
+        for leg in ["\"leg\" => \"unsubscribe\",", "\"leg\" => \"subscribe\","] {
+            assert_eq!(
+                production.matches(leg).count(),
+                1,
+                "exactly one {leg} emit — a missing leg makes the histogram half-blind, and a \
+                 duplicated one double-counts every swap"
+            );
+        }
+        let hoist = production
+            .find("let unsub_started = tokio::time::Instant::now();")
+            .expect("the unsubscribe stamp must exist");
+        let if_let = production
+            .find("if let Some(drop_this) = swap.unsubscribe {")
+            .expect("the unsubscribe leg must exist");
+        assert!(
+            hoist < if_let,
+            "the unsubscribe stamp must be taken BEFORE the `if let`, or the record cannot run \
+             on the timeout arm"
+        );
+    }
+
+    /// Bite-proof for the scan above: the markers it keys on are real, and a
+    /// guard that can never fail is worse than no guard because it also
+    /// certifies the case is covered.
+    #[test]
+    fn latency_guard_self_test() {
+        let src = include_str!("pool_supervisor.rs");
+        for marker in [
+            "ConnEvent::BeginDial => {",
+            "if !self.proven_healthy {",
+            "self.dial_started_at.take()",
+            "if let Some(drop_this) = swap.unsubscribe {",
+            "let unsub_started = tokio::time::Instant::now();",
+        ] {
+            assert!(
+                src.contains(marker),
+                "guard marker {marker:?} no longer appears — the scan above would pass vacuously"
+            );
+        }
+        // And the assertion messages must not themselves satisfy the scan.
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src
+            .split_once(&format!("\n{test_marker}"))
+            .map_or(src, |(head, _)| head);
+        assert!(
+            production.len() < src.len(),
+            "the production cut must actually remove the test module, or this file's own \
+             assertion text counts as production source"
         );
     }
 }
