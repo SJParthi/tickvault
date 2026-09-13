@@ -224,6 +224,7 @@ pub const LIVE_TABLE_DDL_BACKOFF_SECS: u64 = 5;
 /// consequence — never a panic, and never a silent continue.
 // TEST-EXEMPT: network I/O orchestration — the retry bound is unit-tested below, the give-up path is exercised against an unreachable port, and the boot call site is pinned by crates/app/tests/ensure_ddl_boot_wiring_guard.rs.
 pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
+    let mut views_reensured = false;
     for attempt in 1..=LIVE_TABLE_DDL_ATTEMPTS {
         let ticks_ok = tickvault_storage::tick_persistence::ensure_ticks_table(questdb).await;
         let depth_ok =
@@ -237,7 +238,29 @@ pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
         let rank_ok =
             tickvault_storage::top_volume_rank_persistence::ensure_top_volume_rank_table(questdb)
                 .await;
-        if ticks_ok && depth_ok && rank_ok {
+        // Re-ensure the named views as soon as the RANK TABLE exists — gated on
+        // `rank_ok` ALONE, never on the other two.
+        //
+        // ⚠ This sat inside `if ticks_ok && depth_ok && rank_ok` until
+        // 2026-09-13, and that made the re-ensure hostage to two UNRELATED
+        // tables. A `ticks` or `market_depth` DDL that failed all
+        // LIVE_TABLE_DDL_ATTEMPTS would skip the view pass even though
+        // `top_volume` had been created successfully — so on a fresh volume the
+        // four `top_volume_*` views would stay ABSENT for the whole session,
+        // which is precisely the failure this re-ensure was added to fix. The
+        // same held when `rank_ok` was false only because the idempotent
+        // `DEDUP ENABLE` was refused after the CREATE had already succeeded.
+        //
+        // Coupling a fix to conditions it does not depend on is how a remedy
+        // becomes unavailable in the case it was written for.
+        if rank_ok && !views_reensured {
+            // ONCE per boot, not once per attempt. Decoupling the pass from
+            // `ticks_ok`/`depth_ok` means it can now be reached on an attempt
+            // that goes on to retry, and the statements are idempotent but not
+            // free — six DROP-and-recreate passes on a boot whose `ticks` DDL
+            // is failing would be noise in the one log an operator reads while
+            // diagnosing that failure.
+            views_reensured = true;
             // Re-ensure the named views now that `top_volume_rank` EXISTS.
             //
             // `run_candle_ddl_at_boot` already ran `ensure_named_views`, and it
@@ -259,6 +282,8 @@ pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
             // `CREATE OR REPLACE`, so a second pass on an already-correct view
             // is free. Additive beats re-ordering on a boot path.
             tickvault_storage::console_views::ensure_named_views(questdb).await;
+        }
+        if ticks_ok && depth_ok && rank_ok {
             info!(
                 attempt,
                 "live-table DDL boot complete — ticks (5-key DEDUP) + market_depth \
