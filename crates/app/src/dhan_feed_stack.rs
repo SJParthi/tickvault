@@ -2389,12 +2389,30 @@ impl LiveIngest {
         let Some(handle) = self.top_volume_thread.take() else {
             return;
         };
-        // Checked BEFORE joining, not after. `JoinHandle::join` has no timeout,
-        // so a writer wedged on a hung socket would hang the box's shutdown —
-        // trading lost snapshot rows for a lost shutdown, which is the worse
-        // half of the trade. If the other two writers have already consumed the
-        // budget, this one is abandoned and SAID SO rather than waited on.
-        if std::time::Instant::now() >= deadline {
+        // POLLED to the deadline, then joined only once the thread has actually
+        // finished — the `shutdown_rescue_writer` shape, adopted here on
+        // 2026-09-13 because this function did not have it.
+        //
+        // `JoinHandle::join` has no timeout, so a writer wedged on a hung
+        // socket hangs the box's shutdown until systemd's `TimeoutStopSec`
+        // SIGKILLs it — trading lost snapshot rows for a lost shutdown, which
+        // is the worse half of the trade. The previous version stated exactly
+        // that hazard in this comment and then called a bare `join()` anyway,
+        // guarded by a SINGLE `Instant::now() >= deadline` test at entry.
+        //
+        // A point-in-time check is not a bound. It only refuses to START
+        // waiting once the budget is already spent; enter this function one
+        // millisecond before the deadline with a wedged writer and it waits
+        // forever. This is the LAST of the three joins against one shared
+        // budget, so the two before it routinely leave very little — which is
+        // precisely the window in which the old check passed and then blocked.
+        //
+        // `is_finished()` is non-blocking, so the `join()` below cannot block:
+        // it runs only on a thread that has already exited.
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(RESCUE_JOIN_POLL);
+        }
+        if !handle.is_finished() {
             metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, "writer" => "top_volume")
                 .increment(1);
             error!(
@@ -6173,9 +6191,35 @@ async fn run_frame_drain(
                             "ranking state reset for a new trading day — the process spanned \
                              an IST midnight"
                         );
+                        // INSIDE the `!= 0` guard since 2026-09-13, with the
+                        // log rather than beside it.
+                        //
+                        // `ranking_day` starts at 0, so the first 30-second
+                        // tick of EVERY drain took this branch. The sentinel
+                        // silenced the log — correctly, no midnight was crossed
+                        // — and the reset ran anyway, wiping the leaderboard,
+                        // `PrevCloseStore` and `SpotPriceStore` thirty seconds
+                        // into every session.
+                        //
+                        // Harmless on the 08:30 boot, where the stores are
+                        // still empty at 08:30:30 and the code-6 PrevClose
+                        // burst arrives with the 09:00 connect. NOT harmless on
+                        // a MID-SESSION restart: the burst lands within seconds
+                        // of connect, this wiped it, and code-6 is one-shot per
+                        // subscribe — so every `underlying_gainer_verdict` read
+                        // `Unknown` for the rest of the day, the gainer filter
+                        // published an EMPTY board, and both depth pools held
+                        // their boot dial. Detected only by the
+                        // `gainer_verdicts_all_unknown` latch, which is
+                        // log-sink-only.
+                        //
+                        // Nothing is lost by skipping it: a freshly constructed
+                        // store already belongs to today. The reset exists for a
+                        // real IST midnight crossing, which is what the `!= 0`
+                        // branch now means.
+                        ingest.reset_ranking_daily();
                     }
                     ranking_day = today;
-                    ingest.reset_ranking_daily();
                 }
                 // Re-take the WAL receipt anchor (2026-08-28).
                 //

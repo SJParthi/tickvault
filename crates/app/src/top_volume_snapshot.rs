@@ -355,8 +355,14 @@ pub const fn secs_of_day_ist(ts_ist_nanos: i64) -> u32 {
 /// depth pool. Passing them in keeps this function pure and keeps the two
 /// lookups the caller's O(1) hash probes rather than a scan here.
 ///
-/// O(k) in the ranked slice, which is 250 at the authorized budget. Per
-/// contract it is O(1): two closure calls and a widening.
+/// O(k) in the ranked slice. Per contract it is O(1): two closure calls and a
+/// widening.
+///
+/// ⚠ CORRECTED 2026-09-13: this read "which is 250 at the authorized budget".
+/// The operator's 2026-09-12 directive REMOVED the top-250 persistence cut —
+/// every traded option contract is projected — so `k` is market-bounded, capped
+/// only by `TOP_VOLUME_PERSIST_PER_FAMILY` (25,000). The claim understated the
+/// slice by up to 100x, in the reassuring direction.
 #[must_use]
 pub fn project_snapshot<G, S>(
     snapshot_ts_ist_nanos: i64,

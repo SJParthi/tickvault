@@ -1626,8 +1626,20 @@ impl VolumeLeaderboard {
 /// `ordered` must already be sorted best-first; this function does not sort and
 /// makes no attempt to check, because the only honest check is the sort itself.
 ///
-/// O(k × distinct-seen) with both bounded by `k`. `k` is 5 on the depth-200
-/// path, so the linear `contains` is cheaper than a set.
+/// O(`ordered.len()` × k) — the outer loop walks `ordered`, and each row costs a
+/// linear `contains` over the underlyings already picked, which is bounded by
+/// `k`. On the depth-200 path `ordered` is the gainer-eligible output (≤ 300)
+/// and `k` is `DEPTH200_EXIT_UNDERLYINGS` (20), so ≈ 6,000 integer compares once
+/// a minute. Still cheaper than building a 20-entry `HashSet`.
+///
+/// ⚠ CORRECTED 2026-09-13: this read "O(k × distinct-seen) with both bounded by
+/// `k`. `k` is 5 on the depth-200 path" — wrong twice. The outer loop is over
+/// `ordered`, not `k`; and `k` became 20 when `DEPTH200_HYSTERESIS_RANKS`
+/// widened 3 → 15 on 2026-09-11. Claimed ~25 compares against a real ~6,000:
+/// understated ~240x, in the reassuring direction. CLAUDE.md's own O(1) table
+/// has carried the correct figure since that widening — this docstring was the
+/// stale copy, which is the direction that matters least to a reader of the
+/// table and most to a reader of the code.
 #[must_use]
 pub fn distinct_underlying_over(ordered: &[RankedContract], k: usize) -> Vec<RankedContract> {
     // CLAMPED before the allocations. `Vec::with_capacity(k)` PANICS on a

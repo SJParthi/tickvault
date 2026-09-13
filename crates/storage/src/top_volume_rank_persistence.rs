@@ -1,4 +1,4 @@
-//! `top_volume_rank` table — a queryable record of WHICH option contracts
+//! `top_volume` table — a queryable record of WHICH option contracts
 //! were the busiest, and whether we were actually watching them.
 //!
 //! Operator directive 2026-09-06: *"ensure to capture the top volume gainers
@@ -34,7 +34,7 @@
 //! ## Schema
 //!
 //! ```sql
-//! CREATE TABLE IF NOT EXISTS top_volume_rank (
+//! CREATE TABLE IF NOT EXISTS top_volume (
 //!     ts TIMESTAMP, tf SYMBOL, family SYMBOL, feed SYMBOL,
 //!     segment SYMBOL, rank LONG, security_id LONG,
 //!     underlying_id LONG, volume LONG, delta_units LONG,
@@ -100,7 +100,7 @@
 //! nothing about the uncut count), and the 3s/5s/1m figures were never
 //! measured at all because the source partitions were archived to S3 and
 //! dropped from EBS before they could be. `SELECT tf, count(*) FROM
-//! top_volume_rank WHERE ts IN today() GROUP BY tf` on the first session with
+//! top_volume WHERE ts IN today() GROUP BY tf` on the first session with
 //! this build is what turns the range into a number.
 //!
 //! The `5s` rows are numerically a subset of the `1s` rows and are kept
