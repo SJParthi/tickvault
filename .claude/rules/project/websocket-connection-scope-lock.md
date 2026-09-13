@@ -5145,3 +5145,82 @@ once per TRADING DAY.
   flat name and hands it 24 slots it did not earn.
 - Auto-sends the Dhan draft to anyone. The 2026-09-12 section's REJECT row stands: the draft
   is a committed markdown file a human reads and sends.
+
+#### ⚠ CORRECTED 2026-09-13 (same day, hours later) — the board was wired and, for the INDEX half, silently never dialled
+
+**No new authorization is claimed.** The section above authorizes this work; this
+records what an adversarial re-audit of it found, and is the correction the
+rule-file-first law expects when a section's own claim turns out to be false in
+practice.
+
+The section above says the name board "becomes the PRIMARY depth-20 engine".
+It was wired, it ran, and it logged `engine="name_board"`. **For NIFTY and
+BANKNIFTY it dialled nothing at all**, for the whole session, and every counter
+read healthy while it did.
+
+#### The mechanism, and why no existing signal could see it
+
+`depth20_track::match_sockets_by_overlap` paired a wire socket to a layout
+socket by equal held-count, then by largest key overlap, and left anything
+matching neither UNPAIRED — a docstring defended that as "refusing to guess".
+`plan_depth20_minute` treats an unpaired socket as
+`sockets_left_alone += 1; continue`, so the socket is never touched, `held`
+never changes, and the identical non-match recurs on every later minute.
+
+That is the HANDOVER, not a corner case. The volume board is stock options only
+(the 2026-09-06 lock) and this section's first two sockets are NIFTY and
+BANKNIFTY, so the two key sets are **disjoint by construction**: the count pass
+cannot match them (50 held vs 47 wanted) and the overlap pass cannot either
+(zero overlap). The two UNCONDITIONAL index names this section makes
+undisplaceable were the exact pair the matcher could never re-aim.
+
+**FIXED** by a third pass that assigns the leftovers by POSITION — an unclaimed
+want is one no socket recognised, so handing it to a socket no want recognised
+takes nothing from anyone. The count-matched and overlap cases are unchanged.
+
+**The test that defended it is WITHDRAWN in place**, not deleted:
+`an_unrecognisable_socket_holds_position_rather_than_guessing` asserted
+`plan.is_quiet()` on exactly this shape. It was the defect, written down and
+guarded, and the reasoning is kept at the site so nobody restores it.
+
+#### Two further findings against THIS section's own contract
+
+* **The probe could arm inside the last 30 minutes.** The 2026-09-12 section's
+  REJECT list says "Runs inside the last 30 minutes of the session" in as many
+  words and **nothing enforced it**. Now `PROBE_NO_ARM_BEFORE_CLOSE_SECS`.
+* **The probe made its own stall alarm fire.** `spawn_rebalance_heartbeat`
+  publishes `now − stamp` from a stamp only the steering loop writes, so a
+  probe blocking past 180 s paged `depth_steering_stalled` about itself. The
+  loop now stamps either side of the probe block. Residual stated at the site:
+  a probe blocking LONGER than 180 s still pages, correctly.
+
+#### ⚠ NOT FIXED, and it is the operator's call
+
+The per-row `top_volume` ILP append still runs **on the frame-drain task** —
+MEASURED **14,932 µs** at the 20,220-row ceiling against the sort's **1,030 µs**,
+i.e. **14.5×** the cost the 2026-09-12 section measured and reported as the
+sweep's dominant term. Moving it off the drain changes the data flow of a
+scope-locked module, so it needs its own dated line here first and is recorded
+rather than taken.
+
+#### The reusable half
+
+This section was written, reviewed and shipped believing the board drove all
+five sockets. What made the gap invisible is that **every signal it had was a
+signal about intent** — the engine label in the log line, the swap counters —
+and none was a signal about the wire. The board also shipped with no metric of
+its own while the ranked counters it displaced freeze at handover, so the one
+depth-20 read-out went flat exactly when the engine changed: green by absence,
+the shape this file has now recorded on `tv_binary_main_sha_mismatch`,
+`tv_depth_rows_spilled_total` and here. **A new engine needs its own counter in
+the same change that makes it primary** — `tv_depth20_name_board_outcomes_total`
+and `tv_depth20_name_board_names_chosen` now exist, seeded at boot, recorded on
+BOTH arms so the refusal labels can report a refusal.
+
+**What a PR that violates this correction looks like (REJECT):** removes the
+third matching pass, or restores a docstring claiming an unpaired socket is
+safely left alone; re-adds a test asserting `is_quiet()` on a disjoint handover;
+lets the probe arm inside the last 30 minutes; removes the heartbeat stamps
+around the probe block; records the name board on the steerable arm only (the
+refusal counters then can never leave zero); or moves the ILP append off the
+drain without its own dated operator line.
