@@ -19823,6 +19823,52 @@ mod tests {
         ingest.shutdown_offload_writer(std::time::Instant::now() + OFFLOAD_SHUTDOWN_GRACE);
     }
 
+    /// The THIRD writer's join, which did not exist until 2026-09-13.
+    ///
+    /// Its handle was discarded at the spawn site (`Ok(_handle) =>`), so the
+    /// thread could never be waited on: up to `TOP_VOLUME_FLUSH_QUEUE_DEPTH`
+    /// batches plus the one in flight died at every 17:30 stop and every
+    /// mid-session redeploy, with no counter, no log and no alarm — while its
+    /// two siblings had that accounting since 2026-08-28.
+    #[test]
+    fn shutdown_top_volume_writer_joins_the_thread_and_is_idempotent() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+
+        // A thread that has already finished, standing in for the real writer.
+        // The join must RETURN — if `shutdown_top_volume_writer` waited on
+        // something it never closed, this test would hang rather than fail,
+        // which is itself the assertion.
+        ingest = ingest.with_top_volume_writer(
+            tickvault_storage::top_volume_rank_persistence::TopVolumeRankWriter::for_test(),
+            std::thread::spawn(|| {}),
+        );
+
+        // `close_offload_queues` is what drops the producer and so closes the
+        // queue. The join is only meaningful after it, exactly as for the tick
+        // and depth writers, and it must also clear the producer so a late
+        // append cannot reach a queue nobody is draining.
+        ingest.close_offload_queues();
+        assert!(
+            ingest.top_volume.is_none(),
+            "closing the queues must drop the top-volume producer — the thread \
+             exits when its last sender is gone, so a retained producer is a \
+             join that never returns"
+        );
+
+        ingest.shutdown_top_volume_writer(std::time::Instant::now() + OFFLOAD_SHUTDOWN_GRACE);
+
+        // Idempotent: a second call must not panic on an already-taken handle.
+        // The shutdown tail is reached from more than one path, and a panic
+        // here would abort the process under `panic = "abort"` while it was
+        // trying to flush the tail of the session.
+        ingest.shutdown_top_volume_writer(std::time::Instant::now() + OFFLOAD_SHUTDOWN_GRACE);
+
+        // And a lane that never spawned the writer at all — the common case,
+        // since the snapshot writer is only built when QuestDB is configured.
+        let mut bare = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        bare.shutdown_top_volume_writer(std::time::Instant::now() + OFFLOAD_SHUTDOWN_GRACE);
+    }
+
     #[test]
     fn test_drain_never_flushes_bare_on_the_async_worker() {
         // The drain task owns the ONLY consumer of the frame ring. Its

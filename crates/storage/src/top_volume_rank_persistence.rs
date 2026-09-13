@@ -2257,4 +2257,48 @@ mod tests {
              the three paths drifting into different failure semantics"
         );
     }
+
+    /// `discard_pending` became `pub` on 2026-09-13 so the lane can account for
+    /// retained rows at SHUTDOWN — the one moment nothing else calls it.
+    ///
+    /// On a `QueueFull` the producer keeps its rows and `flush` returns `Ok`,
+    /// which is correct: that is backpressure, not loss. But if the process
+    /// then exits while rows are retained, no later flush ever runs, and until
+    /// this was reachable from the lane those rows skipped even the discard
+    /// counter — a real drop with every surface reading green.
+    #[test]
+    fn discard_pending_clears_the_buffer_and_reports_the_count() {
+        let mut writer = TopVolumeRankWriter::for_test();
+
+        // Nothing pending: zero, no log, no counter movement, and — the part
+        // that matters for a shutdown path called unconditionally — no panic.
+        assert_eq!(
+            writer.discard_pending(),
+            0,
+            "an empty producer must report zero discarded, so the lane's \
+             shutdown can call this unconditionally without inventing a loss"
+        );
+
+        // With rows pending, the count is REPORTED and the buffer is cleared,
+        // so a second call cannot double-count the same rows into the loss
+        // series.
+        let rows = [row(), row(), row()];
+        for row in &rows {
+            writer
+                .append_row(row)
+                .expect("append must accept a valid row");
+        }
+        assert_eq!(
+            writer.discard_pending(),
+            rows.len(),
+            "every retained row must be reported exactly once"
+        );
+        assert_eq!(
+            writer.discard_pending(),
+            0,
+            "the buffer must be CLEARED by the discard — a second call that \
+             re-reported the same rows would inflate the loss series on a \
+             shutdown path that is reached from more than one place"
+        );
+    }
 }
