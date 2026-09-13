@@ -4290,11 +4290,12 @@ mod tests {
     // ======================================================================
 
     // `Connection: close` is load-bearing, not decoration. `ensure_ticks_table`
-    // drives TWO DDL statements through ONE `reqwest::Client`, and reqwest pools
-    // the socket between them. This mock answers, then DROPS the stream — so
-    // without the header reqwest reuses a connection the mock has already closed
-    // and the second statement can fail, flipping the verdict to false. It is the
-    // pattern every other mock responder in this workspace already carries
+    // drives TWENTY DDL statements through ONE `reqwest::Client` — 1 CREATE plus
+    // one ADD COLUMN per entry in `TICKS_COLUMNS` (19) — and reqwest pools the
+    // socket between them. This mock answers, then DROPS the stream, so without
+    // the header reqwest can reuse a connection the mock has already closed and a
+    // later statement fails, flipping the verdict to false. It is the pattern
+    // every other mock responder in this workspace already carries
     // (stats.rs, board.rs, quote.rs, notification/service.rs, ip_monitor.rs).
     const MOCK_HTTP_200: &str =
         "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
