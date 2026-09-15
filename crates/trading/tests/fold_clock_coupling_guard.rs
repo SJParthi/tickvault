@@ -9,8 +9,10 @@
 //! > bucket they are guarding ... Moving the bucket clock alone leaves ordering
 //! > deciding on one clock and bucketing on another.
 //!
-//! All five now read `fold_secs`, derived once per tick from
-//! `fold_clock_ist_secs`. Nothing pinned that, so a future edit could move any
+//! All five read `fold_secs`, derived once per tick from the feed-specific
+//! `candle_bucket_clock_ist_secs`. Dhan uses validated LTT; TrueData retains
+//! its bounded receipt policy. Observation freshness is separately derived
+//! from the existing bounded receipt helper. A future edit must not move any
 //! single one back to the raw exchange stamp and every existing test would
 //! still pass -- each site is individually correct on either clock, and only
 //! their AGREEMENT is the property.
@@ -36,7 +38,9 @@ fn src(rel: &str) -> String {
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
     // Comments here DISCUSS both clocks at length; scanning raw text would let
     // a rationale block satisfy an assertion about the CODE.
-    strip_rust_comments(&raw)
+    // Whitespace is not part of this wiring contract: rustfmt may wrap an
+    // assignment between '=' and its call without changing the selected clock.
+    strip_rust_comments(&raw).split_whitespace().collect()
 }
 
 /// The fold clock is derived ONCE per tick, above the timeframe loop.
@@ -47,7 +51,7 @@ fn src(rel: &str) -> String {
 #[test]
 fn the_fold_clock_is_derived_once_per_tick_not_per_timeframe() {
     let agg = src("src/candles/multi_tf_aggregator.rs");
-    let derivations = agg.matches("fold_clock_ist_secs(").count();
+    let derivations = agg.matches("candle_bucket_clock_ist_secs(").count();
     assert_eq!(
         derivations, 1,
         "`multi_tf_aggregator` must derive the fold clock EXACTLY once per tick \
@@ -55,6 +59,9 @@ fn the_fold_clock_is_derived_once_per_tick_not_per_timeframe() {
          recomputed inside a loop -- the 48x-per-tick hoisting defect this \
          module has already recorded twice."
     );
+    assert_eq!(agg.matches("fold_clock_ist_secs(").count(), 1);
+    assert!(agg.contains("letobserved_secs=fold_clock_ist_secs("));
+    assert!(agg.contains("slot.last_observed_secs.max(observed_secs)"));
 }
 
 /// The three gates in `consume` all read the derived value.
@@ -63,23 +70,23 @@ fn the_watermark_and_both_session_gates_read_the_fold_clock() {
     let agg = src("src/candles/multi_tf_aggregator.rs");
 
     assert!(
-        agg.contains("let fold_secs = fold_clock_ist_secs("),
+        agg.contains("letfold_secs=candle_bucket_clock_ist_secs("),
         "the per-tick fold clock must be bound to `fold_secs`"
     );
     assert!(
-        agg.contains("if fold_secs > self.watermark_secs"),
+        agg.contains("fold_secs>self.watermark_secs"),
         "the watermark must advance on the FOLD clock. Advancing it on the \
          exchange stamp while the stale-trading-day gate compares a fold-clock \
          value re-opens the midnight-crossing rejection the code comment says \
          it removed."
     );
     assert!(
-        agg.contains("fold_secs / 86_400 < self.watermark_secs / 86_400"),
+        agg.contains("fold_secs/86_400<self.watermark_secs/86_400"),
         "the stale-trading-day gate must compare LIKE WITH LIKE -- a fold-clock \
          day against a fold-clock watermark."
     );
     assert!(
-        agg.contains("let secs_of_day = fold_secs % 86_400"),
+        agg.contains("letsecs_of_day=fold_secs%86_400"),
         "the seconds-of-day session gate must read the fold clock, or a print \
          the bucket accepts is refused here (or the reverse)."
     );
@@ -91,16 +98,16 @@ fn the_bucket_and_the_close_ordering_guards_read_the_fold_clock() {
     let cell = src("src/candles/aggregator_cell.rs");
 
     assert!(
-        cell.contains("fold_clock_ist_secs(tick.exchange_timestamp, tick.received_at_nanos)"),
+        cell.contains("letbucket_start=tf.bucket_start(fold_secs)"),
         "the bucket must be chosen on the fold clock"
     );
     assert!(
-        cell.contains("close_ts_ist_secs: fold_secs"),
+        cell.contains("close_ts_ist_secs:fold_secs"),
         "`close_ts_ist_secs` must be stamped from the fold clock, or the close \
          is owned by a different packet than the bucket believes is last"
     );
     assert!(
-        cell.contains("let tick_is_newest = fold_secs >= state.close_ts_ist_secs"),
+        cell.contains("lettick_is_newest=fold_secs>=state.close_ts_ist_secs"),
         "the close-ordering guard must compare fold clock against fold clock. \
          Comparing an exchange stamp against a receipt-clock `close_ts` makes \
          every late-delivered tick look older than it is, so open interest and \

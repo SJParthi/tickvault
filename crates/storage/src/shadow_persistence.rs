@@ -5,7 +5,7 @@
 //! cascading through the legacy `candles_1s` materialized-view chain and
 //! WITHOUT the interim `_shadow` tables of the Wave 6 design.
 //!
-//! - 5 timeframes (1m / 3m / 5m / 15m / 1d)
+//! - Ten active frames: 1s / 3s / 5s / 1m / 3m / 5m / 10m / 15m / 30m / 60m
 //!   each get their OWN plain QuestDB table — `candles_<tf>`. Names are
 //!   derived from `TfIndex::table_name()` (the single source of truth).
 //! - Every candle table carries DEDUP UPSERT KEYS
@@ -16,7 +16,7 @@
 //!   (operator 2026-06-19, "same tables + feed column") keeps Dhan and
 //!   Groww candles for the same minute/instrument distinct, never merged.
 //!
-//! ## Schema (18 columns)
+//! ## Schema (25 columns)
 //!
 //! ```sql
 //! CREATE TABLE IF NOT EXISTS candles_1m (
@@ -37,7 +37,14 @@
 //!     open_gap_pct             DOUBLE,
 //!     net_volume               LONG,
 //!     total_buy_qty            LONG,
-//!     total_sell_qty           LONG
+//!     total_sell_qty           LONG,
+//!     lot_size                 LONG,
+//!     instrument_definition_version LONG,
+//!     underlying_id            LONG,
+//!     ranking_family           SYMBOL,
+//!     volume_quality           LONG,
+//!     bucket_revision          LONG,
+//!     volume_basis             SYMBOL
 //! ) timestamp(ts) PARTITION BY DAY
 //!   DEDUP UPSERT KEYS(ts, security_id, segment, feed);
 //! ```
@@ -78,10 +85,22 @@ use tickvault_trading::candles::{TF_COUNT, TfIndex};
 
 use crate::shadow_candle_writer::CANDLE_FEED_DHAN;
 
+/// Added to every timeframe table without filling historical NULLs from a
+/// mutable instrument master. Ranking views use these original bucket facts.
+pub const CANDLE_VOLUME_METADATA_COLUMNS: [(&str, &str); 7] = [
+    ("lot_size", "LONG"),
+    ("instrument_definition_version", "LONG"),
+    ("underlying_id", "LONG"),
+    ("ranking_family", "SYMBOL"),
+    ("volume_quality", "LONG"),
+    ("bucket_revision", "LONG"),
+    ("volume_basis", "SYMBOL"),
+];
+
 // ---------------------------------------------------------------------------
 // QuestDB table names — one per timeframe.
 //
-// The TF_COUNT (21) candle table names are derived from `TfIndex::table_name()`
+// The active TF_COUNT candle table names are derived from `TfIndex::table_name()`
 // (the single source of truth in `crates/trading/src/candles/tf_index.rs`).
 // Use `candle_table_names()` below to enumerate them.
 // ---------------------------------------------------------------------------
@@ -89,7 +108,7 @@ use crate::shadow_candle_writer::CANDLE_FEED_DHAN;
 // ---------------------------------------------------------------------------
 // DEDUP UPSERT keys — composite per I-P1-11.
 //
-// All 21 candle tables share the same key shape because they are
+// All active candle tables share the same key shape because they are
 // uniformly partitioned `(ts, security_id, segment)`. The
 // `dedup_segment_meta_guard.rs` workspace meta-guard scans every
 // `DEDUP_KEY_*` constant in `crates/storage/src/` and FAILS the build
@@ -116,11 +135,19 @@ use crate::shadow_candle_writer::CANDLE_FEED_DHAN;
 /// re-enabling DEDUP — so post-migration same-minute re-seals upsert cleanly.
 pub const DEDUP_KEY_CANDLES: &str = "ts, security_id, segment, feed";
 
+/// The old cleanup authorization covered durable IDs 0..24 exclusively.
+/// Adding an active timeframe must not expand that destructive migration.
+const LEGACY_CANDLE_STORAGE_ID_LIMIT: u8 = 24;
+
+const fn has_legacy_candle_cleanup_authority(tf: TfIndex) -> bool {
+    tf.storage_ordinal() < LEGACY_CANDLE_STORAGE_ID_LIMIT
+}
+
 // ---------------------------------------------------------------------------
 // Public helpers — aggregate the table names for downstream consumers.
 // ---------------------------------------------------------------------------
 
-/// All TF_COUNT (21) candle table names in ordinal (seal-spill) order, derived from
+/// All active candle table names in dense runtime array order, derived from
 /// `TfIndex::table_name()`.
 ///
 /// Used by:
@@ -214,16 +241,29 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) -> bool
     };
 
     let mut all_keyed = true;
-    for table in candle_table_names() {
+    for tf in TfIndex::ALL {
+        let table = tf.table_name();
         // Schema self-heal: candle tables created before the
         // security_id LONG fix have `security_id` / `tick_count` typed
         // INT. The ILP seal writer sends them via `column_i64` (LONG);
         // QuestDB rejects every row on the type mismatch, so the table
-        // stays empty. QuestDB cannot ALTER a column's type — drop the
-        // (broken, empty) table and let the corrected CREATE rebuild it.
+        // may remain empty. Never assume that: preserve populated or
+        // unreadable tables for an explicit data-preserving migration.
         if candle_table_has_int_security_id(&client, &base_url, table).await {
-            let drop_ddl = format!("DROP TABLE IF EXISTS {table};");
-            run_drop_ddl(&client, &base_url, table, &drop_ddl).await;
+            if !has_legacy_candle_cleanup_authority(tf) {
+                all_keyed = false;
+                error!(
+                    code =
+                        tickvault_common::error_code::ErrorCode::CandleSchema01Refused.code_str(),
+                    table,
+                    "new active candle table has an incompatible historical schema — preserved for explicit migration"
+                );
+                continue;
+            }
+            if !drop_candle_table_if_confirmed_empty(&client, &base_url, table).await {
+                all_keyed = false;
+                continue;
+            }
             info!(
                 table,
                 "candle table dropped — security_id INT→LONG self-heal"
@@ -248,11 +288,27 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) -> bool
                 open_gap_pct                DOUBLE, \
                 net_volume                  LONG, \
                 total_buy_qty               LONG, \
-                total_sell_qty              LONG\
+                total_sell_qty              LONG, \
+                lot_size                    LONG, \
+                instrument_definition_version LONG, \
+                underlying_id               LONG, \
+                ranking_family              SYMBOL, \
+                volume_quality              LONG, \
+                bucket_revision             LONG, \
+                volume_basis                SYMBOL\
             ) timestamp(ts) PARTITION BY DAY \
             DEDUP UPSERT KEYS({DEDUP_KEY_CANDLES});"
         );
         all_keyed &= run_ddl(&client, &base_url, table, &create_ddl).await;
+
+        // Bucket-pinned definitions are additive. Old rows deliberately keep
+        // NULL: joining today's instrument master would rewrite their meaning.
+        // Fail readiness if any required column could not be established.
+        for (column, column_type) in CANDLE_VOLUME_METADATA_COLUMNS {
+            let ddl =
+                format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {column_type};");
+            all_keyed &= run_ddl(&client, &base_url, table, &ddl).await;
+        }
 
         // Schema self-heal: candle tables created before the
         // close_pct_from_prev_day column existed (pre-2026-05-28 Engine-B
@@ -278,36 +334,11 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) -> bool
         let alter_open_gap_pct =
             format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS open_gap_pct DOUBLE;");
         let _ = run_ddl(&client, &base_url, table, &alter_open_gap_pct).await;
-        // net volume — the bar's SIGNED ORDER FLOW: buy-initiated volume minus
-        // sell-initiated volume, accumulated per tick under the tick rule
-        // (uptick = buy-initiated, downtick = sell-initiated, unchanged price
-        // carries the previous direction). INFERRED, not observed: Dhan
-        // publishes no trade tape and no aggressor flag.
-        //
-        // NULL (never 0) when THIS PROCESS DID NOT CLASSIFY the bar — a
-        // disk-spill replay, a REST-folded bar, or a bar with no ticks or no
-        // volume. `0` would claim perfectly balanced flow about a bar nobody
-        // measured, which is a different fact.
-        //
-        // ⚠ CORRECTED 2026-09-10. This comment sits above the DDL that CREATES
-        // the column, so it is the definition of record — and until today it
-        // read "the bar's volume signed by whether it closed above or below the
-        // bar before it … NULL when there is no previous bar to compare
-        // against, so a first-of-day bar is blank rather than flat". BOTH
-        // halves are now false: the sign is flow, not direction, and a
-        // first-of-day bar with ticks now reports a real value. The arithmetic
-        // was fixed in `live_candle_state` / `multi_tf_aggregator`; this
-        // storage-layer comment was left behind, which is how a reader would
-        // have gone on trusting the retired definition.
-        //
-        // `total_buy_qty` / `total_sell_qty` are the vendor's PENDING
-        // order-book totals at the bar's last observed packet — resting
-        // orders, NOT executed volume. Nothing may treat their difference as
-        // a buy/sell imbalance of trades.
-        //
-        // Additive + idempotent like every self-heal above: an existing table
-        // gains the columns with NULLs for its historical rows, and no
-        // populated table is ever dropped (SEBI retention).
+        // Compatibility signed cache; volume_basis identifies whole-bar
+        // direction versus historical tick-rule estimates. Unknown current
+        // sign persists NULL; an observed unchanged-close bar stays zero.
+        // Book quantities are pending orders and are not executed volume.
+        // The migrations are additive; historical values stay unchanged.
         let alter_net_volume =
             format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS net_volume LONG;");
         let _ = run_ddl(&client, &base_url, table, &alter_net_volume).await;
@@ -377,7 +408,7 @@ async fn candle_table_has_int_security_id(client: &Client, base_url: &str, table
 // ---------------------------------------------------------------------------
 // #T1b — drop legacy candle objects (Engine A + Engine C teardown).
 //
-// The candle-engine re-architecture leaves ONLY Engine B (the 21-TF
+// The candle-engine re-architecture leaves ONLY Engine B (the active
 // in-memory aggregator flushing to plain `candles_<tf>` tables). Engine A
 // (`candles_1s` base table) and Engine C (the 9 `candles_<tf>` materialized
 // views + the 9 legacy `candles_<tf>_shadow` tables) are deleted.
@@ -402,10 +433,10 @@ const LEGACY_CANDLE_TF_SUFFIXES: [&str; 9] =
     ["1m", "5m", "15m", "30m", "1h", "2h", "3h", "4h", "1d"];
 
 /// Legacy candle materialized views whose names do NOT collide with any
-/// of the 21 Engine-B `candles_<tf>` tables — the retired sub-minute and
+/// of the active Engine-B `candles_<tf>` tables — the retired sub-minute and
 /// 7-day aggregations from the pre-#T1 (PR #517-era) candle cascade.
 ///
-/// The 21 Engine-B names ARE swept for stale matviews separately (every
+/// The previously active Engine-B names ARE swept for stale matviews separately (every
 /// one is `DROP MATERIALIZED VIEW IF EXISTS`-ed before the `CREATE TABLE`
 /// loop, in case an old deployment squats the name with a matview — this
 /// is exactly the `candles_2m` / `candles_3m` / `candles_10m` 400 bug).
@@ -634,15 +665,21 @@ pub async fn drop_legacy_candle_objects(questdb_config: &QuestDbConfig) {
     //    table they cascade from, AND before `ensure_shadow_candle_tables`
     //    runs its `CREATE TABLE` loop.
     //
-    //    Every one of the 21 Engine-B `candles_<tf>` names is swept: the
+    //    Previously active Engine-B `candles_<tf>` names may be swept: the
     //    pre-#T1 architecture created matviews under those exact names,
     //    and a matview occupying the name makes `CREATE TABLE IF NOT
     //    EXISTS candles_<tf>` return `400 Bad Request` (the
     //    `candles_2m` / `candles_3m` / `candles_10m` bug). `DROP
     //    MATERIALIZED VIEW IF EXISTS` against a name that is already a
     //    plain table — or absent — is a safe 2xx no-op, so sweeping all
-    //    21 every boot is idempotent.
-    for view in candle_table_names() {
+    //    previously authorized names is idempotent. Newly added names are preserved.
+    for tf in TfIndex::ALL {
+        // The new 10m name was outside the previous active cleanup set.
+        // Preserve an existing object rather than broadening old authority.
+        if !has_legacy_candle_cleanup_authority(tf) {
+            continue;
+        }
+        let view = tf.table_name();
         let ddl = format!("DROP MATERIALIZED VIEW IF EXISTS {view};");
         run_drop_ddl(&client, &base_url, view, &ddl).await;
     }
@@ -653,14 +690,12 @@ pub async fn drop_legacy_candle_objects(questdb_config: &QuestDbConfig) {
         run_drop_ddl(&client, &base_url, view, &ddl).await;
     }
 
-    // 2. Drop the Engine-A `candles_1s` base table.
-    run_drop_ddl(
-        &client,
-        &base_url,
-        "candles_1s",
-        "DROP TABLE IF EXISTS candles_1s;",
-    )
-    .await;
+    // 2. The old Engine-A name is also a live Engine-B table now. Never
+    // erase populated data just because a local migration marker is missing.
+    // An unavailable count preserves the table and leaves the marker unset.
+    if !drop_candle_table_if_confirmed_empty(&client, &base_url, "candles_1s").await {
+        return;
+    }
 
     // 3. Drop the 9 legacy Wave-6 `candles_<tf>_shadow` tables.
     for sfx in LEGACY_CANDLE_TF_SUFFIXES {
@@ -778,6 +813,63 @@ fn marker_records_current_version(content: &str) -> bool {
         >= LEGACY_DROP_SWEEP_VERSION
 }
 
+/// A strict count response, never treating absent/malformed data as zero.
+fn confirmed_empty_count(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    if value.get("error").is_some() {
+        return false;
+    }
+    let Some(rows) = value.get("dataset").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    rows.len() == 1
+        && rows[0]
+            .as_array()
+            .is_some_and(|row| row.len() == 1 && row[0].as_u64() == Some(0))
+}
+
+/// Only called during startup migration, before this process starts candle
+/// producers. A failed count or populated table is preserved, visibly. This
+/// is not a lock against an independent external writer; migrating a shared
+/// database still requires quiescing all writers.
+async fn drop_candle_table_if_confirmed_empty(
+    client: &Client,
+    base_url: &str,
+    table: &str,
+) -> bool {
+    let query = format!("SELECT count() FROM {table}");
+    let empty = match client.get(base_url).query(&[("query", query)]).send().await {
+        Ok(response) if response.status().is_success() => match response.text().await {
+            Ok(body) => confirmed_empty_count(&body),
+            Err(_) => false,
+        },
+        _ => false,
+    };
+    if !empty {
+        metrics::counter!("tv_candle_migration_drop_refused_total", "table" => table.to_string())
+            .increment(1);
+        error!(
+            code = tickvault_common::error_code::ErrorCode::CandleSchema01Refused.code_str(),
+            table,
+            "candle migration DROP REFUSED: table is populated or its emptiness could not be verified; data preserved, explicit migration required"
+        );
+        return false;
+    }
+    let ddl = format!("DROP TABLE IF EXISTS {table};");
+    match client.get(base_url).query(&[("query", ddl)]).send().await {
+        Ok(response) if response.status().is_success() => true,
+        _ => {
+            error!(
+                code = tickvault_common::error_code::ErrorCode::CandleSchema01Refused.code_str(),
+                table, "confirmed-empty candle migration DROP failed; migration not completed"
+            );
+            false
+        }
+    }
+}
+
 /// Issue one DROP DDL statement to QuestDB's `/exec` endpoint.
 ///
 /// Same GET-based transport as [`run_ddl`]. A non-2xx response is logged
@@ -873,7 +965,80 @@ mod tests {
         }
     }
 
-    /// P2c: the 21-table DDL walk (CREATE + DEDUP + self-heal ALTERs)
+    #[test]
+    fn migration_empty_count_is_fail_closed() {
+        assert!(confirmed_empty_count(r#"{"dataset":[[0]]}"#));
+        for body in [
+            r#"{"dataset":[[12]]}"#,
+            r#"{"dataset":[[null]]}"#,
+            r#"{"dataset":[[-1]]}"#,
+            r#"{"dataset":[["0"]]}"#,
+            r#"{"dataset":[]}"#,
+            r#"{"dataset":[[0],[1]]}"#,
+            r#"{"dataset":[[0]],"error":"failed"}"#,
+            "{}",
+            "invalid",
+        ] {
+            assert!(!confirmed_empty_count(body), "must preserve table: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn candle_migration_sends_drop_only_after_successful_empty_count() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (status, body, expect_drop) in [
+            ("200 OK", r#"{"dataset":[[0]]}"#, true),
+            ("200 OK", r#"{"dataset":[[17]]}"#, false),
+            ("200 OK", r#"{"dataset":[[null]]}"#, false),
+            ("200 OK", "malformed", false),
+            ("500 Internal Server Error", r#"{"dataset":[[0]]}"#, false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let captured = requests.clone();
+            let server = tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let mut bytes = [0u8; 4096];
+                    let n = socket.read(&mut bytes).await.unwrap();
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&bytes[..n]).to_string());
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                }
+            });
+            let client = Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap();
+            let dropped = drop_candle_table_if_confirmed_empty(
+                &client,
+                &format!("http://{addr}/exec"),
+                "candles_1s",
+            )
+            .await;
+            server.abort();
+            assert_eq!(dropped, expect_drop);
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), if expect_drop { 2 } else { 1 });
+            assert!(requests[0].contains("SELECT+count"));
+            assert_eq!(
+                requests
+                    .iter()
+                    .any(|request| request.contains("DROP+TABLE")),
+                expect_drop,
+                "populated/failed inspection must NEVER issue destructive DDL"
+            );
+        }
+    }
+
+    /// P2c: the active-table DDL walk (CREATE + DEDUP + self-heal ALTERs)
     /// completes without panic against a 200-everything QuestDB.
     #[tokio::test]
     async fn test_ensure_shadow_candle_tables_with_mock_200() {
@@ -889,6 +1054,101 @@ mod tests {
         ensure_shadow_candle_tables(&p2c_cfg(port)).await;
     }
 
+    #[tokio::test]
+    async fn ensure_candle_ddl_targets_exactly_ten_and_preserves_incompatible_new_10m_history() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for fixture in 0u8..3 {
+            let incompatible_10m = fixture == 1;
+            let existing_view_10m = fixture == 2;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let queries = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured = std::sync::Arc::clone(&queries);
+            let server = tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = [0u8; 8192];
+                    let mut count = 0;
+                    while !request[..count]
+                        .windows(4)
+                        .any(|bytes| bytes == b"\r\n\r\n")
+                    {
+                        assert!(
+                            count < request.len(),
+                            "mock request headers exceed bounded buffer"
+                        );
+                        let read = tokio::time::timeout(
+                            Duration::from_secs(2),
+                            stream.read(&mut request[count..]),
+                        )
+                        .await
+                        .expect("request header deadline")
+                        .unwrap();
+                        assert!(read > 0, "incomplete HTTP request headers");
+                        count += read;
+                    }
+                    let request = String::from_utf8_lossy(&request[..count]);
+                    let path = request.split_whitespace().nth(1).expect("request target");
+                    let url = reqwest::Url::parse(&format!("http://localhost{path}")).unwrap();
+                    let query = url
+                        .query_pairs()
+                        .find_map(|(name, value)| (name == "query").then(|| value.into_owned()))
+                        .expect("SQL query");
+                    let conflict = existing_view_10m
+                        && query.starts_with("CREATE TABLE IF NOT EXISTS candles_10m ");
+                    let body = if conflict {
+                        r#"{"error":"historical view occupies candles_10m"}"#
+                    } else if incompatible_10m
+                        && query
+                            == "SELECT type FROM table_columns('candles_10m') WHERE column = 'security_id'"
+                    {
+                        r#"{"dataset":[["INT"]]}"#
+                    } else {
+                        r#"{"dataset":[["LONG"]]}"#
+                    };
+                    let status = if conflict {
+                        "400 Bad Request"
+                    } else {
+                        "200 OK"
+                    };
+                    captured.lock().unwrap().push(query);
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+            });
+            let ready = ensure_shadow_candle_tables(&p2c_cfg(port)).await;
+            server.abort();
+            assert_eq!(ready, fixture == 0);
+            let queries = queries.lock().unwrap();
+            let created: std::collections::BTreeSet<_> = queries
+                .iter()
+                .filter_map(|query| query.strip_prefix("CREATE TABLE IF NOT EXISTS "))
+                .map(|tail| tail.split_whitespace().next().expect("table name"))
+                .collect();
+            let expected: std::collections::BTreeSet<_> = candle_table_names()
+                .into_iter()
+                .filter(|table| !incompatible_10m || *table != "candles_10m")
+                .collect();
+            assert_eq!(created, expected);
+            assert!(!queries.iter().any(|query| query.starts_with("DROP ")));
+            if incompatible_10m {
+                let new_frame_queries: Vec<_> = queries
+                    .iter()
+                    .filter(|query| query.contains("candles_10m"))
+                    .collect();
+                assert_eq!(
+                    new_frame_queries.len(),
+                    1,
+                    "incompatible history receives inspection only"
+                );
+                assert!(new_frame_queries[0].starts_with("SELECT type "));
+            }
+        }
+    }
+
     /// P2c: legacy-drop marker lifecycle — first run (marker absent) sweeps
     /// every legacy object against the mock and writes the one-shot marker;
     /// second run takes the early-skip arm. Self-cleaning: the cwd-relative
@@ -898,7 +1158,9 @@ mod tests {
         let marker = std::path::Path::new(LEGACY_DROP_MARKER_PATH);
         let _ = std::fs::remove_file(marker);
 
-        let port = p2c_spawn_mock_http(P2C_HTTP_200).await;
+        let port =
+            p2c_spawn_mock_http("HTTP/1.1 200 OK\r\nContent-Length: 17\r\n\r\n{\"dataset\":[[0]]}")
+                .await;
         drop_legacy_candle_objects(&p2c_cfg(port)).await;
         assert!(
             marker.exists(),
@@ -923,7 +1185,25 @@ mod tests {
     #[test]
     fn test_candle_table_names_has_tf_count_entries() {
         assert_eq!(candle_table_names().len(), TF_COUNT);
-        assert_eq!(TF_COUNT, 24);
+        assert_eq!(TF_COUNT, 10);
+    }
+
+    #[test]
+    fn new_active_timeframes_do_not_expand_legacy_cleanup_authority() {
+        assert!(!has_legacy_candle_cleanup_authority(TfIndex::M10));
+        for tf in TfIndex::ALL {
+            assert_eq!(has_legacy_candle_cleanup_authority(tf), tf != TfIndex::M10);
+        }
+        // Retiring candle durations must never add their physical history to
+        // the unrelated legacy table-deletion list.
+        for suffix in [
+            "1d", "2s", "4s", "6s", "7s", "8s", "9s", "10s", "11s", "12s", "13s", "14s", "15s",
+            "30s", "2m",
+        ] {
+            let table = format!("candles_{suffix}");
+            assert!(!RETIRED_QUESTDB_TABLES.contains(&table.as_str()));
+            assert!(!LEGACY_EXTRA_CANDLE_MATVIEW_NAMES.contains(&table.as_str()));
+        }
     }
 
     #[test]
@@ -1262,40 +1542,22 @@ mod tests {
     }
 
     #[test]
-    fn test_candle_table_names_canonical_ordering_1m_to_1d() {
-        let names = candle_table_names();
-        // C3: legacy 5-frame prefix (ordinals 0..=4) byte-stable, the 16
-        // second-scale frames APPENDED after candles_1d (ordinals 5..=20).
-        let expected = [
-            "candles_1m",
-            "candles_3m",
-            "candles_5m",
-            "candles_15m",
-            "candles_1d",
-            "candles_1s",
-            "candles_2s",
-            "candles_3s",
-            "candles_4s",
-            "candles_5s",
-            "candles_6s",
-            "candles_7s",
-            "candles_8s",
-            "candles_9s",
-            "candles_10s",
-            "candles_11s",
-            "candles_12s",
-            "candles_13s",
-            "candles_14s",
-            "candles_15s",
-            "candles_30s",
-            // Appended 2026-08-10 with TfIndex::{M2, M30, M60} — the three
-            // frames of the operator's thirteen (Quote 13, 2026-08-08) that
-            // previously had no enum variant.
-            "candles_2m",
-            "candles_30m",
-            "candles_60m",
-        ];
-        assert_eq!(names, expected);
+    fn test_candle_table_names_are_exactly_the_ten_requested_frames() {
+        assert_eq!(
+            candle_table_names(),
+            [
+                "candles_1s",
+                "candles_3s",
+                "candles_5s",
+                "candles_1m",
+                "candles_3m",
+                "candles_5m",
+                "candles_10m",
+                "candles_15m",
+                "candles_30m",
+                "candles_60m",
+            ]
+        );
     }
 
     /// PR #798 (operator-locked 2026-05-25) — marker constant is set

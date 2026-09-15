@@ -21,13 +21,14 @@
 #
 # NO INTERPRETER survives here by design: the reference side is the frozen table.
 #
-# Fixture matrix shape (88 cases):
+# Fixture matrix shape (108 cases; original 88 preserved):
 #   A) 4 target jobs {commit-lint, design-first-wall, local-runtime-block,
 #      test} x 5 results {success, failure, cancelled, skipped, missing}
 #      x 4 events {pull_request, push, workflow_dispatch, schedule}  = 80
 #   B) 8 extras: empty needs (x2 events), all three PR-only jobs skipped
 #      (x3 events), failure+tolerated-skip, two-skips+cancel on
 #      pull_request, missing-result+failure ordering.
+#   C) Release validation x the same 5 results and 4 events = 20.
 #
 # ABORTS loudly if the marker block is deleted, renamed, or extracts empty.
 # Honest residual (the questdb-console-gate-matrix precedent): the harness
@@ -75,7 +76,7 @@ fi
 # omission. Adding a job that defaults to success does not change any frozen
 # expected stdout (only NON-success jobs are named in the output), so the 88
 # fixtures stand unchanged - verified by running them.
-JOBS_RECORDED=(local-runtime-block commit-lint design-first-wall deploy-lint build-and-verify test security-and-audit coverage-and-perf repo-guards dhat-zero-alloc loom-concurrency)
+JOBS_RECORDED=(local-runtime-block commit-lint design-first-wall deploy-lint build-and-verify test security-and-audit coverage-and-perf repo-guards dhat-zero-alloc loom-concurrency release-validation)
 
 CI_YML="${CI_YML:-.github/workflows/ci.yml}"
 mapfile -t JOBS_LIVE < <(
@@ -162,11 +163,11 @@ done < <(sed -n '/^# FIXTURES-BEGIN/,/^# FIXTURES-END/p' "${BASH_SOURCE[0]}" | g
 
 echo "all-green-equivalence-matrix: ${pass}/${total} fixtures match the frozen expected outputs (${fail} mismatches)"
 # 2026-07-18 ratchet (review round 1): the floor is pinned at the CURRENT
-# fixture count (88) and only moves UP as fixtures are added — deleting any
-# fixture row below 88 fails the guard (the 40-row floor left rows 41..88
+# fixture count (108 after the 2026-09-15 release cases) only moves UP — deleting any
+# fixture row below 108 fails the guard (the 40-row floor left rows 41..88
 # mechanically deletable, a weakening vector on the merge choke point).
-if [ "$total" -lt 88 ]; then
-  echo "FATAL: fixture table shrank below the 88-case ratchet floor (found ${total})" >&2
+if [ "$total" -lt 108 ]; then
+  echo "FATAL: fixture table shrank below the 108-case ratchet floor (found ${total})" >&2
   exit 2
 fi
 [ "$fail" -eq 0 ] || exit 1
@@ -175,8 +176,9 @@ exit 0
 # =============================================================================
 # Frozen fixture table (TAB-separated):
 #   name <TAB> event <TAB> overrides <TAB> expected_exit <TAB> expected_stdout
-# Generated 2026-07-18 from the OLD evaluator; every row byte-verified
-# identical (stdout + stderr + exit) against the new jq program before merge.
+# The original 88 rows were generated 2026-07-18 from the OLD evaluator and
+# byte-verified against the jq port. The 20 dated release cases extend that
+# contract; they are new expected results, not claimed historical executions.
 # Do NOT hand-edit expected outputs — a semantics change needs its own dated
 # merge-gate-lock quote first (§5.1).
 # =============================================================================
@@ -269,4 +271,24 @@ B:all-pr-only-skipped	pull_request	commit-lint=skipped design-first-wall=skipped
 B:fail+tolerated-skip	push	test=failure commit-lint=skipped	1	::error::All Green FAILED — non-success needed jobs: test=failure
 B:two-skips+cancel	pull_request	commit-lint=skipped design-first-wall=skipped test=cancelled	1	::error::All Green FAILED — non-success needed jobs: commit-lint=skipped, design-first-wall=skipped, test=cancelled
 B:missing+failure	push	test=missing build-and-verify=failure	1	::error::All Green FAILED — non-success needed jobs: build-and-verify=failure, test=None
+C:release-validation=success	pull_request	release-validation=success	0	All Green: every needed job succeeded (event=pull_request).
+C:release-validation=success	push	release-validation=success	0	All Green: every needed job succeeded (event=push).
+C:release-validation=success	workflow_dispatch	release-validation=success	0	All Green: every needed job succeeded (event=workflow_dispatch).
+C:release-validation=success	schedule	release-validation=success	0	All Green: every needed job succeeded (event=schedule).
+C:release-validation=failure	pull_request	release-validation=failure	1	::error::All Green FAILED — non-success needed jobs: release-validation=failure
+C:release-validation=failure	push	release-validation=failure	1	::error::All Green FAILED — non-success needed jobs: release-validation=failure
+C:release-validation=failure	workflow_dispatch	release-validation=failure	1	::error::All Green FAILED — non-success needed jobs: release-validation=failure
+C:release-validation=failure	schedule	release-validation=failure	1	::error::All Green FAILED — non-success needed jobs: release-validation=failure
+C:release-validation=cancelled	pull_request	release-validation=cancelled	1	::error::All Green FAILED — non-success needed jobs: release-validation=cancelled
+C:release-validation=cancelled	push	release-validation=cancelled	1	::error::All Green FAILED — non-success needed jobs: release-validation=cancelled
+C:release-validation=cancelled	workflow_dispatch	release-validation=cancelled	1	::error::All Green FAILED — non-success needed jobs: release-validation=cancelled
+C:release-validation=cancelled	schedule	release-validation=cancelled	1	::error::All Green FAILED — non-success needed jobs: release-validation=cancelled
+C:release-validation=skipped	pull_request	release-validation=skipped	1	::error::All Green FAILED — non-success needed jobs: release-validation=skipped
+C:release-validation=skipped	push	release-validation=skipped	1	::error::All Green FAILED — non-success needed jobs: release-validation=skipped
+C:release-validation=skipped	workflow_dispatch	release-validation=skipped	1	::error::All Green FAILED — non-success needed jobs: release-validation=skipped
+C:release-validation=skipped	schedule	release-validation=skipped	1	::error::All Green FAILED — non-success needed jobs: release-validation=skipped
+C:release-validation=missing	pull_request	release-validation=missing	1	::error::All Green FAILED — non-success needed jobs: release-validation=None
+C:release-validation=missing	push	release-validation=missing	1	::error::All Green FAILED — non-success needed jobs: release-validation=None
+C:release-validation=missing	workflow_dispatch	release-validation=missing	1	::error::All Green FAILED — non-success needed jobs: release-validation=None
+C:release-validation=missing	schedule	release-validation=missing	1	::error::All Green FAILED — non-success needed jobs: release-validation=None
 # FIXTURES-END

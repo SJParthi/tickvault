@@ -409,15 +409,20 @@ fn toolchain_scanner_detects_a_planted_runner() {
 /// reject what someone already thought of; an allowlist rejects everything
 /// nobody has justified.
 ///
-/// Each entry below is a real spawn site in the workspace today, and every one
-/// is a system utility or VCS — no language runtime among them.
+/// Each entry below is a real spawn site in the workspace today. The set
+/// includes shell interpreters as well as system utilities and VCS. Existing
+/// operational shell is an explicit gap against literal Rust-only operation,
+/// not frontend code and not proof that the whole deployment runs Rust.
 const SPAWN_ALLOWLIST: &[(&str, &str)] = &[
     (
         "git",
         "build.rs sha resolution + guard tests enumerating tracked files",
     ),
-    ("bash", "test harnesses invoking the repo's own .sh hooks"),
-    ("sh", "same, POSIX form"),
+    (
+        "bash",
+        "operational doctor.sh via logs MCP, plus test/hook harnesses; not Rust",
+    ),
+    ("sh", "existing POSIX shell invocation; not Rust"),
     (
         "docker",
         "compose health checks (infra.rs) + container tests",
@@ -469,11 +474,23 @@ fn spawned_literals(body: &str) -> Vec<String> {
     out
 }
 
+/// Absolute paths pin the same already permitted system shells. Do not use
+/// file_name(): an arbitrary /tmp/bash would then acquire system-shell trust.
+/// The single checksum tool below only validates a synthetic deployment
+/// artifact in an integration test; it is not a production spawn permission.
+fn spawn_is_allowed(path: &str, binary: &str) -> bool {
+    let canonical = match binary {
+        "/bin/bash" => "bash",
+        "/bin/sh" => "sh",
+        name => name,
+    };
+    SPAWN_ALLOWLIST.iter().any(|(name, _)| *name == canonical)
+        || (path == "crates/common/tests/deploy_wal_admission_guard.rs" && binary == "sha256sum")
+}
+
 #[test]
 fn every_spawned_binary_is_on_the_allowlist() {
     let root = repo_root();
-    let allowed: Vec<&str> = SPAWN_ALLOWLIST.iter().map(|(bin, _)| *bin).collect();
-
     let mut violations = Vec::new();
     let mut seen_any = false;
 
@@ -484,7 +501,7 @@ fn every_spawned_binary_is_on_the_allowlist() {
         let body = read_scan_text(&root, &path);
         for bin in spawned_literals(&body) {
             seen_any = true;
-            if !allowed.contains(&bin.as_str()) {
+            if !spawn_is_allowed(&path, &bin) {
                 violations.push(format!("  {path}: Command::new(\"{bin}\")"));
             }
         }
@@ -516,7 +533,7 @@ fn every_spawned_binary_is_on_the_allowlist() {
 }
 
 #[test]
-fn spawn_allowlist_is_documented_and_has_no_language_runtime() {
+fn spawn_allowlist_is_documented_and_frozen_including_existing_shell() {
     for (bin, why) in SPAWN_ALLOWLIST {
         assert!(
             !bin.is_empty() && !why.is_empty(),
@@ -561,8 +578,8 @@ fn spawn_allowlist_is_documented_and_has_no_language_runtime() {
 
     assert_eq!(
         actual, frozen,
-        "SPAWN_ALLOWLIST changed. Every entry is a system utility or VCS today, \
-         and nothing may join them quietly.\n\n\
+        "SPAWN_ALLOWLIST changed. Existing entries include operational shell, \
+         system utilities and VCS; nothing may join them quietly.\n\n\
          If the addition is genuinely required, update FROZEN in the same commit \
          with a stated reason on the entry. If it is a language runtime or a \
          package manager, it does not belong here at all — add a dated operator \
@@ -997,4 +1014,42 @@ fn js_scanners_self_test() {
     assert_eq!(inline_handler_count("let onloaded = 1;"), 0);
     assert_eq!(inline_handler_count("fn on_click_handler() {}"), 0);
     assert_eq!(inline_handler_count("// discusses onclick in prose"), 0);
+}
+
+#[test]
+fn pinned_shell_paths_and_the_checksum_fixture_do_not_widen_spawn_permissions() {
+    for binary in ["/bin/bash", "/bin/sh", "bash", "sh", "git"] {
+        assert!(
+            spawn_is_allowed("crates/common/tests/fixture.rs", binary),
+            "{binary}"
+        );
+    }
+    for binary in [
+        "/tmp/bash",
+        "/usr/local/bin/sh",
+        "/bin/bash-extra",
+        "/bin/../bin/bash",
+        "sha256sum",
+    ] {
+        assert!(
+            !spawn_is_allowed("crates/app/src/runtime.rs", binary),
+            "{binary}"
+        );
+    }
+    let fixture = "crates/common/tests/deploy_wal_admission_guard.rs";
+    assert!(spawn_is_allowed(fixture, "sha256sum"));
+    assert!(!spawn_is_allowed(
+        "crates/common/tests/deploy_wal_admission_guard.rs.extra",
+        "sha256sum"
+    ));
+    assert!(!spawn_is_allowed(fixture, "/tmp/sha256sum"));
+    let body = read_scan_text(&repo_root(), fixture);
+    assert_eq!(
+        spawned_literals(&body)
+            .iter()
+            .filter(|binary| binary.as_str() == "sha256sum")
+            .count(),
+        1,
+        "the documented checksum fixture permission is one real test-only spawn"
+    );
 }

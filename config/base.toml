@@ -204,8 +204,8 @@ retention_days = 90
 # the operator, so the flag is resolved rather than carried forward.
 #
 # What this window still covers, after the 2026-08-19 Intraday split: ONLY
-# the eight minute-and-above candle tables (1m, 2m, 3m, 5m, 15m, 30m, 60m,
-# 1d). Ticks and the sixteen sub-minute tables left this class entirely and
+# the active seven minute candle tables (1m, 3m, 5m, 10m, 15m, 30m, 60m).
+# Ticks and the active three sub-minute tables are separate and
 # are current-day. So this number is now a judgement about how much warmup
 # history indicators and strategies need — not about disk pressure.
 #
@@ -281,8 +281,8 @@ market_data_hot_days = 15
 # make that fit 100 GB. The grow is an out-of-band online command
 # (`aws ec2 modify-volume`), never `terraform apply`.
 depth_hot_days = 1
-# INTRADAY hot window (2026-08-19) — `ticks` + the SIXTEEN sub-minute candle
-# tables (candles_1s..15s, 30s). Its own knob on an operator directive that
+# INTRADAY hot window — `ticks` + active sub-minute candle tables
+# (candles_1s, candles_3s, candles_5s). Its own knob on an operator directive that
 # separates two things the single market-data window used to conflate:
 #
 #   "for depth or whatever it is only current day, worst case busy day ...
@@ -292,7 +292,7 @@ depth_hot_days = 1
 # Why they cannot share `market_data_hot_days = 35`, in numbers: at the
 # 25,000-instrument target `ticks` runs ~14 GB/day (scaled from the measured
 # ~2.5 GB/day at ~4,565 SIDs), so 35 days is ~480 GB on a 200 GB root. The
-# sixteen sub-minute tables are heavier still. Either alone overflows the
+# then-active sixteen sub-minute tables were heavier still. That historical shape overflows the
 # volume, and a full disk stops EVERY table — the same reasoning that gave
 # market_depth its own knob on 2026-08-15, applied one level down.
 #
@@ -612,19 +612,13 @@ realtime_guarantee_score = true
 # PR #4 (2026-05-19): [depth_20.dynamic] and [depth_200.dynamic] sections
 # retired with the pipelines they configured.
 
-# PR #517 (Wave-5 TF reduction) — 9 TFs. Retired the 12 sub-15-minute
-# non-canonical TFs (2m/3m/4m/6m/7m/8m/9m/10m/11m/12m/13m/14m). Re-add
-# only after Groww-API drill-down backtests prove signal value, AND only
-# together with: cascade RAM engine entry + matview DDL entry + Tf enum
-# variant + symmetry ratchet update (see plan §K-L6/L7/L8 + PR #517).
-# NOTE (TF-diet C-lane): this is the INDICATOR-ENGINE TF list only — the
-# candle-TABLE set is the separate 21-frame second-scale contract
-# (1s–15s, 30s, 1m, 3m, 5m, 15m, 1d; legacy frames write-stopped).
+# Active candle contract, 2026-09-14. The shared Rust registry
+# owns this exact set; configuration rejects omissions, duplicates and retired
+# labels. Publication cadences and broker protocol intervals are separate.
+# Top Volume separately uses only 1s, 3s, 5s and 1m from these candles.
 [engine.timeframes]
 list = [
-  "1m", "5m", "15m", "30m",
-  "1h", "2h", "3h", "4h",
-  "1d",
+  "1s", "3s", "5s", "1m", "3m", "5m", "10m", "15m", "30m", "60m",
 ]
 
 # [in_mem.tick_storage] REMOVED 2026-07-19 (dead-code cleanup — BATCH-5):
@@ -649,7 +643,7 @@ list = [
 [cross_verify]
 # Operator-locked 2026-05-18:
 #   - 15:31 IST: 1-minute buffer after market close so final 15:29 bar settles.
-#   - 08:05 IST: morning 1d cross-check; alert-only, does NOT block trading.
+#   - 08:05 IST: historical daily cross-check stub; does not enable a 1d candle.
 #   - Zero-tolerance OHLCV match required (per historical-candles-cross-verify.md).
 intraday_run_ist          = "15:31:00"
 morning_run_ist           = "08:05:00"
@@ -845,10 +839,11 @@ spot_universe_ntm_only = true
 # Daily timeframe-consistency verifier (operator directive 2026-07-13 —
 # "how will you guarantee that all our defined timeframes internally are
 # correct — how do you identify whether any miscalculation or data
-# issues"). At 15:40 IST every trading day, recompute every sealed
-# higher-timeframe candle (3m..15m) from its stored 1-minute constituents
-# and compare exactly — verifying TODAY, which is stable after the
-# 15:30:05 close seal. Findings land in the tf_consistency_audit table +
+# issues"). At 15:40 IST every trading day, recompute the six active
+# higher-minute candles (3m, 5m, 10m, 15m, 30m, 60m) from their stored
+# 1-minute constituents and compare exactly. This audits database visibility
+# at that time; close sweeps, queued writes and amendments may still be pending.
+# Findings land in the tf_consistency_audit table +
 # one Telegram summary (TF-VERIFY-01/02). Cold path; the live candle
 # pipeline is untouched. An ABSENT section = disabled (fail-safe);
 # `enabled = false` is the rollback switch.
@@ -897,16 +892,17 @@ enabled = true
 enabled = true
 
 # ===========================================================================
-# REST-era multi-TF candle derivation (operator directive 2026-07-16:
+# REST-era multi-TF candle derivation (historical directive 2026-07-16:
 # "why the fuck remaining candles 1m till 1day is not yet generated and
 # populated — resolve these"). Folds persist-confirmed spot_1m_rest 1m bars
-# into the 1m-derivable candles_* timeframes (1m/3m/5m/15m/1d of the
-# 21-frame second-scale set) via the shared seal-writer channel, plus
+# into only the seven active minute candles (1m, 3m, 5m, 10m, 15m, 30m, 60m)
+# via the shared seal-writer channel. The other three candle frames (1s, 3s,
+# 5s) cannot be reconstructed from minute bars. This fold also provides
 # a boot catch-up over the last `catchup_days` of stored bars (35 = the
 # operator's one-month spot window + weekend slack, 2026-07-16: "our entire
 # one month should be stored and fetched from questdb even before
-# premarket"). NEVER touches `ticks` (live-feed-purity; rule 10 carries the
-# dated candles_1d edit). Serde default is OFF (fail-safe) — this section
+# premarket"). NEVER touches `ticks`. The active set no longer includes 1d.
+# Serde default is OFF (fail-safe) — this section
 # opts in; `enabled = false` is the rollback switch.
 #
 # 2026-08-11 — DISABLED, forced by the Dhan live-feed flip above. This is a
@@ -946,30 +942,25 @@ enabled = true
 # entire current day ram will not even cross more than max 10 gb — I'm talking
 # about current day").
 #
-# Was 35. The spot rings are VecDeque::with_capacity(bars_per_day x spot_days),
-# allocated EAGERLY when a slot is first created — so capacity is memory the
-# process commits the moment an instrument is seen, not memory it grows into.
-# At the store's own MAX_SPOT_BAR_SLOTS ceiling (25,000) that made 35 days
-# 34.9 GB: the single largest RAM commitment in the process, larger than
-# QuestDB's own 12g cap, and the ONE thing that broke the 10 GB budget.
-# Nothing else came close - the aggregator is 155 MB, indicators 18 MB, and
-# raw ticks cost ZERO (folded then dropped; RAM is O(instruments), not
-# O(ticks), so tick rate does not enter this budget at all).
+# Was 35. Each new slot allocates ten rings: the seven active minute frames
+# reserve bars_per_day x spot_days rows (at least one per ring), while the
+# three second frames keep one row each. The 09:00–15:40 IST capture window
+# has 702 minute-frame buckets per day, including clipped final buckets.
+# For spot_days >= 1, that is 702 x spot_days + 3 requested rows per slot;
+# spot_days = 0 still keeps one row for each of the ten active frames.
 #
-# Nothing reads the depth. A full call-site sweep found the ONLY production
-# reader of this store is the 60s gauge task that reports how deep the store
-# is - self-referential. Indicator warmup takes a &[Candle] slice and has zero
-# production callers; the 15:31 cross-verify reads QuestDB over /exec; the
-# prev-day pct columns are carried on the seal itself; the chain store is
-# sized independently by chain_row_cap. So 35 days bought retention for a
-# consumer that does not exist, at 34 GB.
+# Use SpotBarStore's estimated_capacity_bytes with the actual slot count for
+# requested row-storage bytes. It excludes allocator overhead and all other
+# subsystem memory. Old whole-process estimates for broader timeframe sets
+# are not a capacity guarantee for the current ten-candle/four-Top-Volume build.
+# The chain ring remains independently bounded by chain_row_cap.
 #
 # Cost of this change: depth_days() reports 1, and if [rest_candle_fold] is
 # ever re-enabled with catchup_days = 35 the install emits its existing
 # "spot_days is SHALLOWER than the fold catch-up window" warn and evicts the
 # older fetched days. Raising it back is a one-line config change with no
-# schema impact - but do the arithmetic first: at 25,000 slots each day costs
-# ~1 GB, so the 10 GB budget is spot_days <= 9.
+# schema impact. Check the current estimator and AWS memory measurements
+# before raising retention; a row-storage estimate is not a process RSS bound.
 spot_days = 1
 chain_row_cap = 1000
 

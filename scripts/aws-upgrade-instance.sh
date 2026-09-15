@@ -11,7 +11,7 @@
 # This is READY-TO-FIRE TOOLING, not an actual upgrade. The instance-type
 # LOCK is r8g.xlarge everywhere (Terraform validation +
 # instance_type_lock_guard.rs) per operator Quote 13 (2026-08-08, the
-# 13-timeframe + current-day tick-retention sizing) and CONFIRMED FINAL by
+# then-active 13-timeframe + current-day tick-retention sizing) and CONFIRMED FINAL by
 # Quote 15 (2026-08-12, "this is our finalsied instancue ... just sue this
 # evrywhere neitlrey"). This supersedes the Quote 8 t4g.medium lock the
 # paragraph here used to name, and the 2026-08-07 t4g.large attempt that AWS
@@ -22,6 +22,9 @@
 # instance-type flip (the primary path is
 # .github/workflows/downsize-instance.yml) — the safe defaults below are the
 # current locked types.
+# The current application scope is ten candle frames (1s, 3s, 5s, 1m, 3m,
+# 5m, 10m, 15m, 30m, 60m) and four Top Volume frames (1s, 3s, 5s, 1m).
+# Historical sizing does not establish current memory or latency bounds.
 #
 # The ALLOWLIST below deliberately stays WIDER than the lock. It is the
 # emergency roll-BACK surface: if r8g.xlarge cannot be obtained in any AZ,
@@ -83,7 +86,7 @@ set -euo pipefail
 ENV="${TV_ENV:-prod}"
 REGION="${AWS_REGION:-ap-south-1}"          # ap-south-1 Mumbai per aws-budget.md
 FROM_TYPE="${FROM_TYPE:-t4g.large}"         # the prior locked type to flip FROM (overridable)
-TO_TYPE="${TO_TYPE:-r8g.xlarge}"            # operator lock 2026-08-08 §7 Quote 13 (13-TF + tick retention)
+TO_TYPE="${TO_TYPE:-r8g.xlarge}"            # instance-type lock from 2026-08-08 §7 Quote 13; sizing is historical
 # NOTE (2026-08-08): this script does an IN-PLACE stop/modify/start, which can
 # only ever land in the instance's EXISTING availability zone. It therefore
 # CANNOT deliver the multi-AZ escape that Quote 13 also authorizes — if the

@@ -1,41 +1,24 @@
-//! STAGE-D P7.4 — Chaos: WsFrameSpill saturation / healthy-ops contract.
+//! STAGE-D P7.4 — bounded healthy WAL workload checks.
 //!
-//! The production guarantee we must preserve mechanically:
+//! The 100,000-frame case checks admission, drop accounting and the writer's
+//! persisted-record counter. The 20,000-frame LiveFeed/OrderUpdate case also
+//! compares every replayed payload and type. The 50-instance case checks ten
+//! exact replayed payloads and increasing frame sequences in every directory.
 //!
-//!   > `tv_ws_frame_spill_drop_critical` MUST be zero in healthy ops.
-//!   > Any non-zero increment is a P0 bug.
-//!
-//! This test exercises the WAL under a high-rate burst to prove the
-//! healthy-ops contract holds end-to-end:
-//!
-//!   1. Healthy-ops burst: append 100,000 live-feed frames as fast as
-//!      a tight loop can go. Every frame MUST land in the WAL with
-//!      `AppendOutcome::Spilled`. `drop_critical_count` MUST stay at 0.
-//!      `persisted_count` MUST reach 100,000 within a bounded wait.
-//!
-//!   2. Mixed-type burst: interleave all 4 WsType variants in a single
-//!      burst. Same invariant: zero drops, every frame persisted, every
-//!      frame survives `replay_all` with the correct type tag.
-//!
-//!   3. Rapid-new-spill churn: create+drop WsFrameSpill 50 times in
-//!      quick succession. Verify the writer thread starts and drains
-//!      cleanly each time and the WAL directory does not accumulate
-//!      corrupt segments.
-//!
-//! This is P7.4 Scenario 6 from the plan, scoped to the portable
-//! in-process observable contract (the literal disk-full case requires
-//! root + fs-quota magic that is deliberately out of scope — see the
-//! commit message for follow-up tracking).
-//!
-//! Run cost: ~200-500 ms on a cold laptop. No Docker, no network, no
-//! root required — safe for normal CI.
+//! These are in-process tests on temporary directories. They do not inject
+//! process crashes, measure resource leaks, prove power-loss durability or
+//! establish production latency.
 
 #![cfg(test)]
+
+#[path = "support/owned_wal_replay.rs"]
+mod owned_wal_replay;
+use owned_wal_replay::{assert_complete_replay, claim_wal};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType, replay_all};
+use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType};
 
 fn chaos_tmp(tag: &str) -> std::path::PathBuf {
     let nanos = SystemTime::now()
@@ -143,12 +126,17 @@ fn chaos_mixed_type_burst_preserves_every_frame_across_types() {
         assert_eq!(dropped, 0, "mixed burst must not drop");
         assert_eq!(spill.drop_critical_count(), 0);
 
-        let _ = wait_until_persisted_at_least(&spill, N as u64, Duration::from_secs(10));
+        assert_eq!(
+            wait_until_persisted_at_least(&spill, N as u64, Duration::from_secs(10)),
+            N as u64
+        );
         drop(spill);
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    let recovered = replay_all(&dir).expect("replay_all");
+    let dir_owner = claim_wal(&dir);
+    let recovered_batch = assert_complete_replay(&dir_owner);
+    let recovered = &recovered_batch.frames;
     assert_eq!(
         recovered.len(),
         N,
@@ -159,13 +147,27 @@ fn chaos_mixed_type_burst_preserves_every_frame_across_types() {
     let mut live = 0usize;
     let mut ord = 0usize;
     let mut truedata = 0usize;
-    for rec in &recovered {
+    for (index, rec) in recovered.iter().enumerate() {
+        let expected_type = types[index % types.len()];
+        let mut expected_frame = vec![0u8; 8];
+        expected_frame[0] = expected_type.as_u8();
+        expected_frame[1..5].copy_from_slice(&(index as u32).to_le_bytes());
+        assert_eq!(rec.ws_type, expected_type, "type at FIFO index {index}");
+        assert_eq!(
+            rec.frame, expected_frame,
+            "complete payload at FIFO index {index}"
+        );
         match rec.ws_type {
             WsType::LiveFeed => live += 1,
             WsType::OrderUpdate => ord += 1,
             WsType::TruedataFeed => truedata += 1,
         }
     }
+    assert!(
+        recovered
+            .windows(2)
+            .all(|pair| pair[0].frame_seq < pair[1].frame_seq)
+    );
     assert_eq!(live, 10_000, "LiveFeed count");
     assert_eq!(ord, 10_000, "OrderUpdate count");
     assert_eq!(
@@ -177,35 +179,55 @@ fn chaos_mixed_type_burst_preserves_every_frame_across_types() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// **P7.4 churn** — create and drop 50 WsFrameSpill instances in quick
-/// succession, each with a different temp dir. Verifies the writer
-/// thread lifecycle is clean (spawn + graceful exit on drop) and no
-/// resource leak prevents the next spill from starting. Simulates a
-/// process that crashes and restarts rapidly during a reconnect storm.
+/// Create and close 50 writers in separate temporary directories. Every
+/// cycle must return its complete payloads through owned replay. This tests
+/// repeated ownership handoff, not process crashes or measured resource leaks.
 #[test]
-fn chaos_rapid_spill_churn_50_cycles_no_leak_no_panic() {
+fn chaos_rapid_spill_churn_50_cycles_preserves_every_payload() {
     let root = chaos_tmp("churn");
 
     for cycle in 0..50 {
         let dir = root.join(format!("cycle-{cycle}"));
         let spill = WsFrameSpill::new(&dir).expect("spill new in churn");
-        // Drop a few frames through each cycle so the writer actually
-        // runs its main loop once before exiting.
         for i in 0..10u32 {
-            let frame = i.to_le_bytes().to_vec();
-            let outcome = spill.append(WsType::LiveFeed, frame);
-            assert_eq!(outcome, AppendOutcome::Spilled);
+            assert_eq!(
+                spill.append(WsType::LiveFeed, i.to_le_bytes().to_vec()),
+                AppendOutcome::Spilled
+            );
         }
-        let _ = wait_until_persisted_at_least(&spill, 10, Duration::from_secs(2));
-        // Explicit drop — the writer thread joins as senders drop.
+        assert_eq!(
+            wait_until_persisted_at_least(&spill, 10, Duration::from_secs(2)),
+            10,
+            "cycle {cycle} must flush every admitted record"
+        );
         drop(spill);
-    }
 
-    // Quick sanity: at least one cycle's WAL must be replayable.
-    let first_cycle = root.join("cycle-0");
-    if first_cycle.exists() {
-        let frames = replay_all(&first_cycle).expect("replay first cycle");
-        assert_eq!(frames.len(), 10, "first cycle WAL must replay 10 frames");
+        let owner = claim_wal(&dir);
+        let batch = assert_complete_replay(&owner);
+        assert_eq!(
+            batch.frames.len(),
+            10,
+            "cycle {cycle} must replay ten records"
+        );
+        for (index, record) in batch.frames.iter().enumerate() {
+            assert_eq!(
+                record.ws_type,
+                WsType::LiveFeed,
+                "cycle {cycle}, index {index}"
+            );
+            assert_eq!(
+                record.frame,
+                (index as u32).to_le_bytes(),
+                "complete payload at cycle {cycle}, FIFO index {index}"
+            );
+        }
+        assert!(
+            batch
+                .frames
+                .windows(2)
+                .all(|pair| pair[0].frame_seq < pair[1].frame_seq),
+            "cycle {cycle} must preserve increasing frame identities"
+        );
     }
 
     let _ = std::fs::remove_dir_all(&root);

@@ -191,7 +191,7 @@ use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::QUESTDB_TABLE_MARKET_DEPTH;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
-use tickvault_common::segment::segment_code_to_str;
+use tickvault_common::segment::{segment_code_to_str, segment_str_to_code};
 
 /// The `market_depth` table name.
 pub const MARKET_DEPTH_TABLE: &str = QUESTDB_TABLE_MARKET_DEPTH;
@@ -248,13 +248,12 @@ pub const DEPTH_SIDE_BID: &str = "bid";
 /// `side` SYMBOL value for the sell side (feed response code 51).
 pub const DEPTH_SIDE_ASK: &str = "ask";
 
-// COMPILE-TIME proof that every closed-set ILP label is already safe, so the
-// write paths can pass them through with ZERO runtime work.
+// COMPILE-TIME proof that every permitted ILP label is already safe.
 //
 // Adding a label with a comma, an equals sign, a control byte or a non-ASCII
 // character is a BUILD FAILURE here, not a malformed row discovered in
-// QuestDB. That is what makes it sound for `append_row` to skip the sanitiser
-// for these values — the check did not disappear, it moved to the compiler.
+// QuestDB. `append_row_inner` still checks that the three public string fields
+// are members of these sets; a &'static str lifetime does not prove membership.
 const _: () = {
     assert!(tickvault_common::sanitize::ilp_symbol_is_clean(
         DEPTH_KIND_20
@@ -317,7 +316,7 @@ pub struct DepthRow {
     pub security_id: i64,
     /// Exchange segment wire label (`IDX_I`, `NSE_FNO`, …).
     pub segment: &'static str,
-    /// `d20` or `d200` — see [`DEDUP_KEY_MARKET_DEPTH`] for why this is in the
+    /// `d5`, `d20` or `d200` — see [`DEDUP_KEY_MARKET_DEPTH`] for why this is in the
     /// key.
     pub depth_kind: &'static str,
     /// `bid` or `ask`.
@@ -1286,13 +1285,14 @@ impl DepthWriter {
     /// Appends one prepared [`DepthRow`] to the ILP buffer (no flush).
     ///
     /// ILP requires every SYMBOL before any field column, so the four symbols
-    /// are written first. All four come from closed `&'static str` sets whose
-    /// ILP-safety is proven at COMPILE TIME by the `const _` block near the top
-    /// of this file, so none of them is re-checked per row. See the note at the
-    /// call site for why that mattered.
+    /// are written first. The public segment/kind/side strings must belong to
+    /// the permitted label sets before any buffer mutation. Those sets and the
+    /// typed feed label have compile-time ILP-safety proofs, so their values can
+    /// be written unchanged without sanitizing instrument identity.
     ///
     /// # Errors
-    /// Propagates ILP buffer errors (table/column append failure).
+    /// Refuses unknown segment/kind/side labels in every build profile and
+    /// propagates ILP buffer errors (table/column append failure).
     pub fn append_row(&mut self, row: &DepthRow) -> Result<()> {
         // ---- SESSION-WINDOW GATE ----------------------------------------
         //
@@ -1403,64 +1403,25 @@ impl DepthWriter {
     fn append_row_inner(&mut self, row: &DepthRow) -> Result<()> {
         let feed = self.feed.as_str();
 
-        // The `const _` proof below covers the closed SETS. It cannot cover a
-        // caller — 2026-09-01.
-        //
-        // `DepthRow`'s four symbol fields are `pub &'static str`, so nothing
-        // stops a future construction site assigning a literal that is not a
-        // member of any proven set. That gap is not hypothetical in kind: the
-        // TICK writer's twin optimisation was attempted the same day and its
-        // suite refused it, because `questdb-rs` escapes a newline as a
-        // backslash followed by a REAL newline, which still reaches the wire
-        // and splits one record into two. A forged depth row is the same
-        // class.
-        //
-        // `debug_assert!` is the right instrument and re-adding the sanitiser
-        // is not: this is the highest-volume writer in the process
-        // (~1.53e9 rows/session), the runtime call is exactly what the const
-        // proof was written to delete, and `debug_assert!` compiles to NOTHING
-        // in release. So the optimisation is preserved byte for byte while
-        // every test, every debug run and every CI suite gains a loud failure
-        // the moment a caller introduces a value the proof does not cover.
-        //
-        // `ilp_symbol_is_clean` is a `const fn`, so this is the SAME predicate
-        // the compile-time proof evaluates — not a second, drift-prone copy.
-        debug_assert!(
-            tickvault_common::sanitize::ilp_symbol_is_clean(row.segment),
-            "DepthRow.segment {:?} is not ILP-safe. append_row passes symbols \
-             through unsanitised because the const proof covers the closed sets \
-             — a caller has supplied a value outside them, which would forge a \
-             row on the wire.",
-            row.segment
-        );
-        debug_assert!(
-            tickvault_common::sanitize::ilp_symbol_is_clean(row.depth_kind),
-            "DepthRow.depth_kind {:?} is not ILP-safe — see the segment assert \
-             above; this field is part of the DEDUP key, so a forged value also \
-             corrupts d20/d200 separation.",
-            row.depth_kind
-        );
-        debug_assert!(
-            tickvault_common::sanitize::ilp_symbol_is_clean(row.side),
-            "DepthRow.side {:?} is not ILP-safe — see the segment assert above.",
-            row.side
-        );
-        debug_assert!(
-            tickvault_common::sanitize::ilp_symbol_is_clean(feed),
-            "feed label {feed:?} is not ILP-safe — see the segment assert above."
-        );
-        // Passed through WITHOUT `sanitize_ilp_symbol`, deliberately.
-        //
-        // All four are `&'static str` from CLOSED SETS, and the `const _` block
-        // near the top of this file proves at COMPILE TIME that every member of
-        // every one of those sets is already ILP-safe -- exhaustively, over all
-        // 256 segment codes and every `Feed::ALL` entry. The sanitiser returns
-        // `Cow::Borrowed` for clean input, so it allocated nothing and DHAT
-        // could not see it; what it DID do was walk the characters of the
-        // literal `"bid"` to re-derive an answer fixed when the constant was
-        // written -- four times per row, on a path this module's own header
-        // measures at ~1.53e9 rows per session. The check did not disappear; it
-        // moved to the compiler, which is principle 2 in its literal form.
+        // A public &'static str is not a closed enum. Debug assertions left
+        // release callers able to bypass the constant-label safety proof.
+        // Refuse before .table() changes the buffer, rather than sanitizing a
+        // DEDUP-key label into another identity or panicking on bad input.
+        // These fixed sets bound both comparison count and compared length;
+        // valid rows allocate nothing here, and arbitrarily long input is not
+        // scanned. The feed is already a typed enum covered by the const proof.
+        if segment_str_to_code(row.segment).is_none() {
+            anyhow::bail!("DepthRow.segment must be a known exchange segment");
+        }
+        if !matches!(
+            row.depth_kind,
+            DEPTH_KIND_5 | DEPTH_KIND_20 | DEPTH_KIND_200
+        ) {
+            anyhow::bail!("DepthRow.depth_kind must be d5, d20 or d200");
+        }
+        if !matches!(row.side, DEPTH_SIDE_BID | DEPTH_SIDE_ASK) {
+            anyhow::bail!("DepthRow.side must be bid or ask");
+        }
         self.buffer
             .table(MARKET_DEPTH_TABLE)
             .context("table")?
@@ -1584,6 +1545,12 @@ impl DepthWriter {
         // already installs on every successful hand-off.
         let range = self.take_pending_range();
         if let Some(tx) = self.rescue.as_ref() {
+            // The normal writer can ACK later batches while this independent
+            // queue is stalled. Mark before publication so a crash cannot make
+            // replay skip rows that are still waiting for their rescue write.
+            // The mark survives successful rescue until confirmed replay.
+            crate::wal_applied_watermark::applied_watermark()
+                .note_unapplied_range(range.0, range.1);
             let protocol = self.buffer.protocol_version();
             let batch = DepthRescueBatch {
                 buffer: std::mem::replace(&mut self.buffer, Buffer::new(protocol)),
@@ -3776,53 +3743,105 @@ mod tests {
         );
     }
 
-    /// The unsanitised symbol path is guarded in debug — 2026-09-01.
-    ///
-    /// `append_row` deliberately skips `sanitize_ilp_symbol` because the
-    /// `const _` block proves every member of the closed sets is ILP-safe.
-    /// The proof cannot cover a CALLER, and the four fields are `pub`.
-    ///
-    /// This pins that a value outside the proven sets is caught rather than
-    /// written. It is a `should_panic` on a `debug_assert!`, so it exercises
-    /// exactly the build configuration tests and CI run in — and costs
-    /// nothing in release, which is the point: the highest-volume writer in
-    /// the process keeps the optimisation.
-    #[test]
-    #[should_panic(expected = "is not ILP-safe")]
-    fn a_hostile_segment_is_refused_in_debug_rather_than_forging_a_row() {
+    /// Refusal must leave both the existing ILP rows and their pending range
+    /// intact, and a later valid row must still append. Runs in release too.
+    fn assert_label_refused_without_mutation(mut invalid: DepthRow, field: &str) {
         let mut w = DepthWriter::for_test(Feed::Dhan);
-        let mut r = row();
-        // A raw newline is the specific value that defeats the encoder: it is
-        // escaped as a backslash plus a REAL newline, so it still reaches the
-        // wire and splits one record into two.
-        r.segment = "NSE\nFNO";
-        let _ = w.append_row(&r);
+        w.append_row(&row()).expect("valid row before refusal");
+        let before = w.buffer_utf8();
+        let pending_range = (w.pending_min_seq, w.pending_max_seq);
+        // The fixture has no captured WAL frame. Zero keeps a synthetic
+        // rejection from changing the process-global watermark of other tests.
+        invalid.capture_seq = 0;
+        let error = w.append_row(&invalid).expect_err("invalid label must fail");
+        assert!(error.to_string().starts_with(field));
+        assert_eq!(w.buffer_utf8(), before, "no partial or forged ILP row");
+        assert_eq!(w.pending(), 1, "refusal must not count as an appended row");
+        assert_eq!((w.pending_min_seq, w.pending_max_seq), pending_range);
+
+        let mut next = row();
+        next.capture_seq = 2;
+        w.append_row(&next).expect("valid row after refusal");
+        assert_eq!(w.pending(), 2);
+        assert_eq!((w.pending_min_seq, w.pending_max_seq), (1, 2));
+        assert_eq!(w.buffer_utf8().lines().count(), 2);
+    }
+
+    /// Public string fields need a release check even though current Dhan
+    /// construction sites use the known-label helpers. Stripping a hostile
+    /// string could merge two identities, so refusal is the contract.
+    #[test]
+    fn a_hostile_segment_is_refused_without_forging_a_row() {
+        for segment in [
+            "NSE\nFNO",
+            "NSE\r\nFNO",
+            "x\nmarket_depth,segment=EVIL quantity=1i 1",
+            "NSE,FNO",
+            "NSE=FNO",
+            "NSE\0FNO",
+            "NSE\u{200b}_FNO",
+            "UNKNOWN",
+            "nse_fno",
+            "",
+        ] {
+            let mut r = row();
+            r.segment = segment;
+            assert_label_refused_without_mutation(r, "DepthRow.segment");
+        }
     }
 
     /// Same guard, on the field that is part of the DEDUP key.
     #[test]
-    #[should_panic(expected = "is not ILP-safe")]
-    fn a_hostile_depth_kind_is_refused_in_debug() {
-        let mut w = DepthWriter::for_test(Feed::Dhan);
-        let mut r = row();
-        r.depth_kind = "d20,evil=1";
-        let _ = w.append_row(&r);
+    fn a_hostile_depth_kind_is_refused_without_forging_a_row() {
+        for depth_kind in ["d20,evil=1", "d20\nevil", "d20\r", "d20\0", "d2000", ""] {
+            let mut r = row();
+            r.depth_kind = depth_kind;
+            assert_label_refused_without_mutation(r, "DepthRow.depth_kind");
+        }
+    }
+
+    #[test]
+    fn a_hostile_side_is_refused_without_forging_a_row() {
+        for side in [
+            "bid,evil=1",
+            "bid\nevil",
+            "ask\r",
+            "bid\0",
+            "BID",
+            "bid ",
+            "",
+        ] {
+            let mut r = row();
+            r.side = side;
+            assert_label_refused_without_mutation(r, "DepthRow.side");
+        }
     }
 
     /// And the happy path must still be untouched — a guard that fires on
     /// legitimate input would be worse than none.
     #[test]
     fn every_proven_label_still_appends_cleanly() {
-        let mut w = DepthWriter::for_test(Feed::Dhan);
-        for (kind, side) in [
-            (DEPTH_KIND_5, DEPTH_SIDE_BID),
-            (DEPTH_KIND_20, DEPTH_SIDE_ASK),
-            (DEPTH_KIND_200, DEPTH_SIDE_BID),
-        ] {
-            let mut r = row();
-            r.depth_kind = kind;
-            r.side = side;
-            w.append_row(&r).expect("proven labels must append"); // APPROVED: test-only
+        for &feed in Feed::ALL {
+            let mut w = DepthWriter::for_test(feed);
+            let mut expected_rows = 0;
+            for code in 0..=u8::MAX {
+                let Some(segment) = depth_segment_label(code) else {
+                    continue;
+                };
+                for kind in [DEPTH_KIND_5, DEPTH_KIND_20, DEPTH_KIND_200] {
+                    for side in [DEPTH_SIDE_BID, DEPTH_SIDE_ASK] {
+                        let mut r = row();
+                        r.segment = segment;
+                        r.depth_kind = kind;
+                        r.side = side;
+                        w.append_row(&r).expect("proven labels must append");
+                        expected_rows += 1;
+                    }
+                }
+            }
+            assert!(expected_rows > 0, "valid-label coverage must not be empty");
+            assert_eq!(w.pending(), expected_rows);
+            assert_eq!(w.buffer_utf8().lines().count(), expected_rows);
         }
     }
 

@@ -2388,3 +2388,62 @@ rules:
       auto-retry a mint: Dhan permits ONE active token per account, so a
       retry racing another minter invalidates whichever token currently
       works.
+
+  # -----------------------------------------------------------------------
+  # PR #1914 (2026-09-15): recovery evidence requires operator review.
+  # These rules classify signatures if the triage hook is invoked. They do
+  # not install dedicated CloudWatch paging filters or claim delivered alerts.
+  # No recovery script is selected; retained evidence must be reviewed first.
+  # -----------------------------------------------------------------------
+
+  - name: wal-sequence-01-admission-refused-escalate
+    match:
+      code: WAL-SEQUENCE-01
+    action: escalate
+    runbook_path: .claude/rules/project/runtime-recovery-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 900
+    justification: >-
+      Committed sequence capacity, ownership or reservation sync is unavailable
+      and live capture can stop. The operator must inspect the authority and
+      migration evidence before resuming. Never reset or lower the sequence
+      manifest, reuse identities, or restart automatically to bypass refusal.
+
+  - name: wal-recovery-01-refused-escalate
+    match:
+      code: WAL-RECOVERY-01
+    action: escalate
+    runbook_path: .claude/rules/project/runtime-recovery-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 900
+    justification: >-
+      Replay, directory durability, confirmation or archive evidence was
+      refused. Preserve the original WAL and quarantine files while the
+      operator investigates the named failure. Do not automatically confirm,
+      prune, rewrite recovery evidence or restart into unresolved state.
+
+  - name: candle-schema-01-refused-escalate
+    match:
+      code: CANDLE-SCHEMA-01
+    action: escalate
+    runbook_path: .claude/rules/project/runtime-recovery-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 900
+    justification: >-
+      Required candle schema, projection or migration prerequisites failed.
+      The operator must verify the actual schema and retained data before
+      applying the reviewed migration. Never drop a populated or unverified
+      table, force writer startup or restart automatically to bypass the gate.
+
+  - name: candle-rank-01-refused-escalate
+    match:
+      code: CANDLE-RANK-01
+    action: escalate
+    runbook_path: .claude/rules/project/runtime-recovery-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 900
+    justification: >-
+      Metadata, universe registration or ranking publication was refused,
+      or the current session ranking was invalidated. The operator must
+      inspect the source, reason and generation before decision use resumes.
+      Do not clear the fault, replace evidence or restart automatically.

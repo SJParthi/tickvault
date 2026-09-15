@@ -12,8 +12,8 @@
 //! options — the exact class the lock bans.
 //!
 //! The ranking that computes the right answer — one full-population `rank`
-//! on the 1-second cadence, then
-//! [`crate::volume_leaderboard::distinct_underlying_over`] on that slice —
+//! on the 5-second cadence, then
+//! [`crate::volume_leaderboard::gainer_eligible_for_depth`] on that slice —
 //! needs `&mut self` on the ingest that lives on the frame-drain task, while
 //! `run_depth_rebalance` is a separate `tokio::spawn` with no handle to it. A
 //! `Mutex` on the drain's state is not available: that is the per-packet hot
@@ -239,8 +239,9 @@ pub struct Depth200Candidate {
     /// The underlying's `SecurityId`. Carried so a reader can see WHY two
     /// contracts could not both be picked.
     pub underlying_id: u64,
-    /// The rank key: lots traded in the window that just closed, × 1000.
-    pub window_lots_milli: u64,
+    /// Signed estimated net lots from the canonical candle, ×1000 for
+    /// display. Candidate order comes from the exact unrounded ratio.
+    pub window_lots_milli: i128,
 }
 
 impl Depth200Candidate {
@@ -320,7 +321,7 @@ pub fn candidates_from_ranked(ranked: &[RankedContract]) -> Vec<Depth200Candidat
             security_id: r.security_id,
             segment: r.segment,
             underlying_id: r.underlying_id,
-            window_lots_milli: r.window_lots_milli,
+            window_lots_milli: i128::from(r.window_lots_milli),
         })
         .collect()
 }
@@ -444,7 +445,7 @@ mod tests {
             security_id,
             segment: FNO,
             underlying_id,
-            window_lots_milli: lots,
+            window_lots_milli: i128::from(lots),
         }
     }
 

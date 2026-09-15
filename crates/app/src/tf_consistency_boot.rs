@@ -3,29 +3,17 @@
 //! correct — how do you identify whether any miscalculation or data
 //! issues"*).
 //!
-//! At **15:40 IST** every trading day (after the Dhan 15:30:05 close-time
-//! force-seal + writer drain and the 15:31 cross-verify burst, before the
-//! 15:45 scoreboard), recompute every stored higher-timeframe candle — the
-//! **6** minute-scale TFs `2m`, `3m`, `5m`, `15m`, `30m`, `60m`
-//! (`tf_verify_targets` = `TfIndex::ALL` minus the 16 second-scale frames,
-//! minus `M1` the recompute baseline, minus `D1`, which is excluded by
-//! design: Dhan drops D1 at the write boundary per `live-feed-purity.md`
-//! rule 10) — from its constituent `candles_1m` rows and compare EXACTLY
-//! (integer-paise OHLC, exact i64 volume).
+//! At **15:40 IST** every trading day, recompute the six active higher-minute
+//! frames `3m`, `5m`, `10m`, `15m`, `30m`, `60m` from their constituent
+//! `candles_1m` rows and compare integer-paise OHLC and exact i64 volume.
+//! `tf_verify_targets` derives this set from `TfIndex::ALL`, excluding M1
+//! itself and the three second-scale frames, which cannot be reconstructed
+//! from vendor minute bars. Retired frames are neither queried nor counted
+//! as active exclusions.
 //!
-//! *(**CORRECTED 2026-08-25:** this said "the 3 TFs `3m..15m`". True when
-//! written; `M2`, `M30` and `M60` joined `TfIndex::ALL` afterwards and
-//! `tf_verify_targets` picked them up silently, so the verifier has been
-//! checking SIX frames while its own header advertised three. Cite the
-//! function, not a count: `tf_verify_targets` is derived from `TfIndex::ALL`
-//! and moves with it, which a hand-written number cannot.)*
-//!
-//! One pass per run: `feed='dhan'` verifies **TODAY** (amend-frozen after
-//! the close seal; Dhan finals are covered by the 15:30:05 close-time
-//! force-seal).
-//!
-//! **⚠ "amend-frozen after the close seal" is MEASURED FALSE, and reading
-//! `missing_tf_rows` as data loss is the trap it sets (2026-08-25).** The
+//! One pass per run: `feed='dhan'` verifies **TODAY**. The close-time pass is
+//! a snapshot of database visibility, not proof that all source updates and
+//! amendments have reached storage. Historical evidence (2026-08-25): the
 //! stored set keeps moving for hours after 15:40, so an early pass reports a
 //! shortfall that later passes do not:
 //!
@@ -60,7 +48,7 @@
 //! day before.
 //!
 //! The bucket grid is REIMPLEMENTED here independently (windows
-//! `[33_300 + k*S, min(+S, 55_800))` per trading day) and cross-pinned
+//! `[32_400 + k*S, min(+S, 56_400))` per local observation day) and cross-pinned
 //! against `TfIndex::bucket_start` by a hand-literal TRIPWIRE test below —
 //! the parts of the aggregator that COULD be miscalculated (anchoring,
 //! floor arithmetic) are exactly what this verifier must check, so it never
@@ -94,9 +82,8 @@ use tickvault_storage::tf_consistency_audit_persistence::{
 };
 use tickvault_trading::candles::TfIndex;
 
-/// IST seconds-of-day of the daily trigger (15:40:00) — after the Dhan
-/// 15:30:05 close-time force-seal (+ ~100ms drain cadence) and the 15:31
-/// cross-verify burst, before the 15:45 scoreboard and the 17:30 auto-stop.
+/// IST seconds-of-day of the daily trigger (15:40:00). This is a visibility
+/// audit time, not a promise that the local close sweep or writer has finished.
 pub const TF_VERIFY_TRIGGER_SECS_OF_DAY_IST: u32 = 15 * 3600 + 40 * 60; // 56_400
 
 /// Hard wall-clock budget for the whole run (both passes). Checked between
@@ -114,7 +101,7 @@ const TF_VERIFY_HTTP_TIMEOUT_SECS: u64 = 15;
 pub const TF_VERIFY_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Row CAP on the per-SID `candles_1m` day query. Sized above the
-/// theoretical max (375 rows/day) so a healthy day can never touch it. The
+/// theoretical max (400 rows/day) so a healthy day can never touch it. The
 /// emitted SQL `LIMIT` is `cap + 1` (the 2026-07-18 LIMIT+1 probe — the
 /// #1630 spot_crossverify convention): `returned > cap` is the truncation
 /// TRIPWIRE (read-degraded, never a silent partial compare — QuestDB's
@@ -123,8 +110,8 @@ pub const TF_VERIFY_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 /// legitimately complete.
 pub const TF_VERIFY_1M_ROW_LIMIT: usize = 500;
 
-/// Row CAP on the per-SID 3-way higher-TF UNION query. Sized above the
-/// arithmetic worst case (Σ per-TF daily bucket counts = 225); fetched as
+/// Row CAP on the per-SID six-way higher-TF UNION query. Sized above the
+/// complete grid (134 + 80 + 40 + 27 + 14 + 7 = 302 rows); fetched as
 /// `cap + 1` (LIMIT+1 probe), truncation = `> cap`.
 pub const TF_VERIFY_TF_UNION_ROW_LIMIT: usize = 2_000;
 
@@ -179,7 +166,7 @@ const NANOS_PER_SEC: i64 = 1_000_000_000;
 const MICROS_PER_SEC: i64 = 1_000_000;
 const SECS_PER_DAY: i64 = 86_400;
 
-/// 09:15:00 IST as seconds-of-day. Compile-time drift-pinned against the
+/// 09:00:00 IST as seconds-of-day. Compile-time drift-pinned against the
 /// canonical common-crate G1 gate constants — editing either representation
 /// alone fails the build (the `tf_index.rs` session-constant discipline).
 /// 2026-08-28: 33_300 (09:15) -> 32_400 (09:00). This module walks the same
@@ -191,7 +178,7 @@ const SECS_PER_DAY: i64 = 86_400;
 /// explicit ordering check; `MARKET_OPEN_IST_NANOS` itself is UNCHANGED and
 /// still means 09:15 everywhere else in the tree.
 const SESSION_OPEN_SECS_OF_DAY_IST: u32 = 32_400;
-/// 15:30:00 IST as seconds-of-day (exclusive session close).
+/// 15:40:00 IST as seconds-of-day (exclusive local observation close).
 // 2026-08-07: 55_800 (15:30) -> 56_400 (15:40) with the NSE CAS change of
 // 2026-08-03 (see `MARKET_CLOSE_IST_NANOS`); the assert below pins the drift.
 const SESSION_CLOSE_SECS_OF_DAY_IST: u32 = 56_400;
@@ -351,16 +338,13 @@ pub fn deterministic_run_ts_nanos(day_start_ist_nanos: i64) -> i64 {
 // The verified timeframe set + the independent bucket grid (pure)
 // ---------------------------------------------------------------------------
 
-/// The 3 comparison targets: `TfIndex::ALL` minus `M1` (the recompute
-/// baseline) minus `D1` (excluded by design — Dhan drops D1 at the write
-/// boundary; Groww D1 is a partial-day midnight bucket).
+/// The six active minute frames above M1. M1 is the recompute baseline;
+/// sub-minute paths cannot be recovered from its OHLCV rows.
 #[must_use]
 pub fn tf_verify_targets() -> Vec<TfIndex> {
     TfIndex::ALL
         .into_iter()
-        // Second-scale frames are GDF-feed-gated: never folded from REST 1m; their only future writer is the GDF 1s pipeline.
-        // They hold ZERO rows today, so the REST-derived consistency verifier must never target them.
-        .filter(|tf| !tf.is_second_scale() && !matches!(tf, TfIndex::M1 | TfIndex::D1))
+        .filter(|tf| !tf.is_second_scale() && *tf != TfIndex::M1)
         .collect()
 }
 
@@ -369,8 +353,7 @@ pub fn tf_verify_targets() -> Vec<TfIndex> {
 pub struct BucketWindow {
     /// The bucket OPEN (the stored row's `ts` label).
     pub start_secs_of_day: u32,
-    /// `min(start + S, 15:30:00)` — 1m membership naturally truncates here
-    /// (the aggregator's session gate admits no ≥15:30 tick).
+    /// `min(start + S, 15:40:00)` — 1m membership naturally truncates here.
     pub end_effective_secs_of_day: u32,
     /// The last window of the session (possibly partial).
     pub is_final: bool,
@@ -782,9 +765,9 @@ pub fn select_1m_sql(
     )
 }
 
-/// Per-SID 3-way UNION ALL across `candles_3m..candles_15m`, each arm
-/// tagged with its display label. Pure; excludes `candles_1m` (the
-/// baseline) and `candles_1d` (excluded by design).
+/// Per-SID UNION ALL across the six active higher-minute candle tables, each
+/// arm tagged with its display label. Excludes the M1 recompute baseline,
+/// second frames and every retired frame.
 #[must_use]
 pub fn select_tf_union_sql(
     feed: &str,
@@ -819,7 +802,7 @@ pub fn select_tf_union_sql(
 }
 
 /// Per-feed instrument discovery: DISTINCT (security_id, segment) over a
-/// UNION of `candles_1m` + the 10 higher-TF tables for the day window —
+/// UNION of `candles_1m` + the six active higher-minute tables for the day window —
 /// higher-TF tables INCLUDED so a phantom TF row with no 1m data is still
 /// discovered. Pure.
 #[must_use]
@@ -931,8 +914,8 @@ pub fn parse_tf_union_dataset(
 ) -> Result<(Vec<(TfIndex, CandleRow)>, bool), String> {
     let rows = json_dataset(body)?;
     let truncated = rows.len() > limit;
-    // PERF: the label→TfIndex lookup table is hoisted ABOVE the row loop —
-    // a fresh tf_verify_targets() Vec per ROW allocated quadratically.
+    // The bounded label lookup is hoisted above the row loop, avoiding a
+    // repeated target-vector allocation for every returned row.
     let targets = tf_verify_targets();
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -1362,10 +1345,6 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
     };
     let day_start_nanos = ist_day_start_nanos(p.date);
     let run_ts_nanos = deterministic_run_ts_nanos(day_start_nanos);
-
-    // D1 is excluded by design for BOTH feeds — counted once per pass so
-    // the exclusion is visible, never silent.
-    metrics::counter!("tv_tf_verify_excluded_total", "reason" => "d1").increment(1);
 
     // ── Discovery ──
     let discovery_sql = select_instruments_sql(p.feed, day_start_nanos);
@@ -2427,21 +2406,17 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
-    fn test_tf_verify_targets_are_every_minute_frame_above_1m_except_d1() {
-        // Asserted BY NAME. The old form of this test pinned `len() == 3` with
-        // the comment "5 TFs minus M1 minus D1"; when M2/M30/M60 joined the
-        // frame set it failed on the count alone, which tells you a number
-        // changed but not whether the RIGHT frames are covered. Naming them
-        // means a frame that quietly loses verification coverage — the actual
-        // risk — fails the build too.
+    fn test_tf_verify_targets_are_exactly_the_active_minute_frames_above_1m() {
+        // Naming the set catches both omitted requested frames and accidental
+        // reintroduction of retired frames into a query.
         let targets = tf_verify_targets();
         assert_eq!(
             targets,
             vec![
                 TfIndex::M3,
                 TfIndex::M5,
+                TfIndex::M10,
                 TfIndex::M15,
-                TfIndex::M2,
                 TfIndex::M30,
                 TfIndex::M60,
             ],
@@ -2449,17 +2424,15 @@ mod tests {
         );
 
         // M1 is the baseline the others are recomputed FROM — verifying it
-        // against itself proves nothing. D1 spans the whole session, so its
-        // only window is still open at the 15:40 pass.
+        // against itself proves nothing.
         assert!(!targets.contains(&TfIndex::M1));
-        assert!(!targets.contains(&TfIndex::D1));
 
         // Structural cross-check: every frame the REST fold actually writes,
-        // minus those two, must appear here. This is what catches a NEW frame
+        // minus M1, must appear here. This is what catches a new frame
         // being added to the fold and silently never verified.
         let folded_by_rest: Vec<TfIndex> = TfIndex::ALL
             .into_iter()
-            .filter(|tf| !tf.is_second_scale() && !matches!(tf, TfIndex::M1 | TfIndex::D1))
+            .filter(|tf| !tf.is_second_scale() && *tf != TfIndex::M1)
             .collect();
         assert_eq!(
             targets, folded_by_rest,
@@ -2467,10 +2440,8 @@ mod tests {
         );
     }
 
-    /// C3: second-scale frames are GDF-feed-gated (zero rows arrive from
-    /// the REST 1m fold), and a 30s target's penultimate window
-    /// E=55_770 would sit inside the catchup margin — so the 15:40
-    /// verify pass must stay minute-scale.
+    /// A minute row contains no sub-minute path. The second-scale frames
+    /// require independent live observations, so this verifier excludes them.
     #[test]
     fn test_verify_targets_exclude_second_scale_frames() {
         let targets = tf_verify_targets();
@@ -2483,28 +2454,25 @@ mod tests {
         // them goes stale unnoticed.
     }
 
-    /// Per-TF daily bucket counts pinned as literals — each equals
-    /// ceil(385 / minutes-per-bucket) for the 385-minute session.
-    ///
-    /// 2026-08-07 (NSE CAS change of 2026-08-03, session 375 -> 385 min):
-    /// M3 125 -> 129, M5 75 -> 77, M15 25 -> 26. Note M15 no longer divides
-    /// evenly (385 / 15 = 25.67), so its FINAL window is now a partial
-    /// [15:30, 15:40) bucket where it used to land exactly on the close —
-    /// the `is_final` truncation path, previously exercised only by M3/M5,
-    /// now covers M15 too.
+    /// Independent daily counts for every active comparison frame across
+    /// the 400-minute local observation window.
     #[test]
-    fn test_bucket_grid_daily_counts_all_3_tfs() {
-        // 2026-08-28: 385 -> 400 minute session (09:00 pre-open open).
-        // M3 129->134, M5 77->80, M15 26->27.
-        let expected: [(TfIndex, usize); 3] =
-            [(TfIndex::M3, 134), (TfIndex::M5, 80), (TfIndex::M15, 27)];
+    fn test_bucket_grid_daily_counts_every_active_comparison_frame() {
+        let expected: [(TfIndex, usize); 6] = [
+            (TfIndex::M3, 134),
+            (TfIndex::M5, 80),
+            (TfIndex::M10, 40),
+            (TfIndex::M15, 27),
+            (TfIndex::M30, 14),
+            (TfIndex::M60, 7),
+        ];
         for (tf, count) in expected {
             let grid = bucket_grid(tf.seconds_per_bucket());
             assert_eq!(grid.len(), count, "window count for {}", tf.display_name());
             // ceil(400 / S_minutes) cross-check computed independently.
             let s_min = (tf.seconds_per_bucket() / 60) as usize;
             assert_eq!(count, 400usize.div_ceil(s_min), "{}", tf.display_name());
-            // Exactly the last window is final; every end ≤ 15:30.
+            // Exactly the last window is final; every end ≤ 15:40.
             assert!(grid.last().is_some_and(|w| w.is_final));
             assert_eq!(grid.iter().filter(|w| w.is_final).count(), 1);
             for w in &grid {
@@ -2516,12 +2484,10 @@ mod tests {
 
     #[test]
     fn test_bucket_grid_partial_final_windows_truncate_at_close() {
-        // 2026-08-28: from a 09:00 open the 400-minute session is EVEN, so
-        // M2's last window is now a full two minutes [15:38, 15:40) rather
-        // than the single-minute partial the 09:15/385 grid produced.
-        let m2 = bucket_grid(120);
-        let last = m2.last().expect("windows");
-        assert_eq!(last.start_secs_of_day, 15 * 3600 + 38 * 60);
+        // M10 divides the 400-minute window exactly: [15:30, 15:40).
+        let m10 = bucket_grid(600);
+        let last = m10.last().expect("windows");
+        assert_eq!(last.start_secs_of_day, 15 * 3600 + 30 * 60);
         assert_eq!(
             last.end_effective_secs_of_day,
             SESSION_CLOSE_SECS_OF_DAY_IST
@@ -2535,11 +2501,11 @@ mod tests {
             last.end_effective_secs_of_day,
             SESSION_CLOSE_SECS_OF_DAY_IST
         );
-        // H4's last window is [13:00, 17:00) effective 15:40 — clock-aligned
-        // since 2026-08-28 (was 13:15 on the 09:15-relative grid).
-        let h4 = bucket_grid(14_400);
-        let last = h4.last().expect("windows");
-        assert_eq!(last.start_secs_of_day, 13 * 3600);
+        // M30's final bucket is nominally [15:30, 16:00), ending at 15:40
+        // for this local observation policy.
+        let m30 = bucket_grid(1_800);
+        let last = m30.last().expect("windows");
+        assert_eq!(last.start_secs_of_day, 15 * 3600 + 30 * 60);
         assert_eq!(
             last.end_effective_secs_of_day,
             SESSION_CLOSE_SECS_OF_DAY_IST
@@ -2554,7 +2520,11 @@ mod tests {
     #[test]
     fn test_tripwire_grid_agrees_with_tf_index_bucket_start() {
         let day_start_secs = 20_000_u32 * 86_400;
-        let probes_sod: [u32; 9] = [
+        let probes_sod = [
+            32_400, // 09:00:00
+            32_401, // 09:00:01
+            32_999, // 09:09:59 — last second of the first 10m bucket
+            33_000, // 09:10:00 — first 10m boundary
             33_300, // 09:15:00
             33_301, // 09:15:01
             33_450, // 09:17:30
@@ -2564,6 +2534,8 @@ mod tests {
             54_899, // 15:14:59
             54_900, // 15:15:00
             55_799, // 15:29:59
+            55_800, // 15:30:00
+            56_399, // 15:39:59 — final admitted second
         ];
         for tf in tf_verify_targets() {
             let grid = bucket_grid(tf.seconds_per_bucket());
@@ -2589,6 +2561,11 @@ mod tests {
         assert_eq!(
             TfIndex::M5.bucket_start(day_start_secs + 33_450) - day_start_secs,
             33_300
+        );
+        // 10m @ 09:17:30 → 09:10:00, distinct from the M5 label above.
+        assert_eq!(
+            TfIndex::M10.bucket_start(day_start_secs + 33_450) - day_start_secs,
+            33_000
         );
         // 15m @ 15:20:00 → 15:15:00.
         assert_eq!(
@@ -2873,14 +2850,14 @@ mod tests {
     }
 
     #[test]
-    fn test_compare_tf_final_window_m15_members_stop_at_1529() {
-        // M15 final window [15:15, 15:30) (exact — 375 divides by 15): the
-        // 15:29 minute is a member; nothing ≥ 15:30 can exist.
+    fn test_compare_tf_final_window_m15_includes_the_1539_minute() {
+        // M15's nominal [15:30, 15:45) bucket is truncated to 15:40, so
+        // the 15:39 minute is still a member of its last stored row.
         let ones = vec![
-            row(54_900, 10.0, 11.0, 9.0, 10.5, 5, 2),  // 15:15
-            row(55_740, 10.5, 12.0, 10.0, 11.0, 5, 2), // 15:29
+            row(55_800, 10.0, 11.0, 9.0, 10.5, 5, 2),  // 15:30
+            row(56_340, 10.5, 12.0, 10.0, 11.0, 5, 2), // 15:39
         ];
-        let stored = vec![row(54_900, 10.0, 12.0, 9.0, 11.0, 10, 4)];
+        let stored = vec![row(55_800, 10.0, 12.0, 9.0, 11.0, 10, 4)];
         let (findings, counts) = compare_tf(TfIndex::M15, &ones, &stored, DAY_START);
         assert!(findings.is_empty(), "{findings:?}");
         assert_eq!(counts.buckets_compared, 1);
@@ -2940,7 +2917,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_tf_union_sql_has_one_arm_per_target_and_excludes_1m_and_1d() {
+    fn test_select_tf_union_sql_has_one_arm_per_active_target_and_excludes_baseline() {
         let sql = select_tf_union_sql("groww", 1333, "NSE_EQ", 1_784_005_200_000_000_000);
         // Derived from the target list rather than hardcoded, so adding a
         // frame cannot leave this arm count behind.
@@ -2966,7 +2943,6 @@ mod tests {
             !sql.contains("FROM candles_1m "),
             "1m is the baseline: {sql}"
         );
-        assert!(!sql.contains("candles_1d"), "D1 excluded by design: {sql}");
         assert!(sql.contains("feed = 'groww'"), "{sql}");
         // M4: the LIMIT must bind to the WHOLE union via the wrapped
         // subquery shape (the discovery-builder precedent) — a bare LIMIT
@@ -2993,8 +2969,8 @@ mod tests {
             "1m + one arm per target: {sql}"
         );
         assert!(sql.contains("FROM candles_1m"), "{sql}");
+        assert!(sql.contains("FROM candles_10m"), "{sql}");
         assert!(sql.contains("FROM candles_15m"), "{sql}");
-        assert!(!sql.contains("candles_1d"), "{sql}");
         assert!(sql.contains("feed = 'dhan'"), "{sql}");
         // 2026-07-18 LIMIT+1 probe. RE-BLESSED 2026-08-19: this pinned the
         // literal `LIMIT 3001`, so raising the cap with the universe (3,000 →
@@ -3008,6 +2984,25 @@ mod tests {
             )),
             "{sql}"
         );
+    }
+
+    #[test]
+    fn test_consistency_queries_do_not_read_retired_or_second_frame_tables() {
+        let queries = [
+            select_tf_union_sql("dhan", 13, "IDX_I", DAY_START),
+            select_instruments_sql("dhan", DAY_START),
+        ];
+        for sql in queries {
+            for excluded in [
+                "1s", "2s", "3s", "4s", "5s", "6s", "7s", "8s", "9s", "10s", "11s", "12s", "13s",
+                "14s", "15s", "30s", "2m", "1d",
+            ] {
+                assert!(
+                    !sql.contains(&format!("FROM candles_{excluded} ")),
+                    "{excluded} is outside the active minute consistency set: {sql}"
+                );
+            }
+        }
     }
 
     // -------------------------------------------------------------------
@@ -3058,6 +3053,23 @@ mod tests {
         assert!(!at_cap);
         let (_, truncated) = parse_tf_union_dataset(body, 2).expect("parse");
         assert!(truncated);
+    }
+
+    #[test]
+    fn test_parse_tf_union_accepts_m10_and_refuses_retired_and_second_labels() {
+        let labels = [
+            "2s", "4s", "6s", "7s", "8s", "9s", "10s", "11s", "12s", "13s", "14s", "15s", "30s",
+            "2m", "1d", "1s", "3s", "5s", "1m", "10m",
+        ];
+        let dataset: Vec<_> = labels
+            .into_iter()
+            .map(|label| serde_json::json!([label, 1, 1.0, 1.0, 1.0, 1.0, 1, 1]))
+            .collect();
+        let body = serde_json::json!({"dataset": dataset}).to_string();
+        let (rows, truncated) = parse_tf_union_dataset(&body, 2_000).expect("parse");
+        assert!(!truncated);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, TfIndex::M10);
     }
 
     #[test]

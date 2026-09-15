@@ -120,7 +120,7 @@ permissions:
 
 env:
   TF_VAR_aws_region: ap-south-1
-  TF_VAR_operator_cidr: "0.0.0.0/0" # CI runs from GH IPs; SSH SG is locked by separate operator override
+  TF_VAR_operator_cidr: "${{ secrets.TF_VAR_OPERATOR_CIDR }}" # Empty defaults to SSM-only; never open SSH for hosted runners.
   TF_VAR_operator_email: "sjparthi93@gmail.com" # registered alert destination
   TF_VAR_ami_id: ami-0fa0340d4a8bdd6ee
   # Operator portal: opt prod IN via CI (the terraform variable default stays

@@ -23,8 +23,8 @@
 //! `*_refused_total`, `*_errors_total`, `*_discarded_total`, `*_lost_total`,
 //! `*_failed_total`) must be at least one of:
 //!
-//! 1. **SHIPPED** — present in the EMF `metric_selectors` allowlist, so it
-//!    exists in CloudWatch and can carry an alarm; or
+//! 1. **SHIPPED** — selected by EMF or an exact verified log-metric-filter
+//!    route, so the configured CloudWatch pipeline can expose the counter; or
 //! 2. **LOGGED** — accompanied by an `error!` or `warn!` within a few lines of
 //!    its emit site, so it reaches `errors.jsonl` → CloudWatch Logs and is
 //!    triageable even without a metric; or
@@ -476,17 +476,207 @@ fn scan_emits() -> Vec<Emit> {
         .collect()
 }
 
-/// Names in the deployed EMF `metric_selectors` allowlist.
+/// Names in the deployed EMF selectors or the verified API-auth metric filter.
 fn shipped_names() -> BTreeSet<String> {
     // The deployed agent config. Was embedded in user-data.sh.tftpl until
     // 2026-08-25; that ~1.6 KB duplicate is gone and the template copies this
     // file into place after the Step 5 clone.
     let ud = repo_root().join("deploy/aws/cloudwatch-agent.json");
     let src = fs::read_to_string(&ud).expect("user-data template must be readable");
-    src.lines()
+    let mut names: BTreeSet<String> = src
+        .lines()
         .filter(|l| l.contains("metric_selectors"))
         .flat_map(tv_names_in)
-        .collect()
+        .collect();
+    let auth_filter =
+        fs::read_to_string(repo_root().join("deploy/aws/terraform/auth-failed-alarm.tf"))
+            .expect("the API-auth metric filter must be readable");
+    if api_auth_filter_is_shipped(&src, &auth_filter) {
+        names.insert("tv_api_auth_failed_total".to_string());
+    }
+    names
+}
+
+// The auth counter intentionally stays outside EMF: its existing dedicated
+// filter extracts the unlabelled series from the metrics log group. Adding it
+// to EMF as well would double count rejections, and logging every hostile 401
+// at ERROR would amplify attacker traffic. Recognize the actual reviewed
+// filter shape; comments, another resource, count/for_each, changed values or
+// unknown directives cannot serve as evidence of this route.
+const AUTH_FILTER_HEADER: &str =
+    "resource\"aws_cloudwatch_log_metric_filter\"\"api_auth_failed_fallback\"{";
+const AUTH_FILTER_CONTRACT: &str = r#"
+resource "aws_cloudwatch_log_metric_filter" "api_auth_failed_fallback" {
+  name = "tv-${var.environment}-api-auth-failed-fallback"
+  log_group_name = "/tickvault/${var.environment}/metrics"
+  pattern = "{ $.tv_api_auth_failed_total = * }"
+  metric_transformation {
+    name = "tv_api_auth_failed_total"
+    namespace = "Tickvault/Prod"
+    value = "$.tv_api_auth_failed_total"
+    dimensions = { host = "$.host" }
+  }
+}
+"#;
+
+/// Compact HCL outside quoted strings, removing actual comments only. This
+/// is a deliberately narrow recognizer, not an evaluator of arbitrary HCL.
+fn compact_hcl_route(src: &str) -> Option<String> {
+    let bytes = src.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut quoted = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if quoted {
+            out.push(b);
+            if b == b'\\' {
+                i += 1;
+                out.push(*bytes.get(i)?);
+            } else if b == b'"' {
+                quoted = false;
+            }
+        } else if b == b'"' {
+            quoted = true;
+            out.push(b);
+        } else if b == b'#' || (b == b'/' && bytes.get(i + 1) == Some(&b'/')) {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        } else if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < bytes.len() && &bytes[i..i + 2] != b"*/" {
+                i += 1;
+            }
+            if i + 1 >= bytes.len() {
+                return None;
+            }
+            i += 2;
+            continue;
+        } else if !b.is_ascii_whitespace() {
+            out.push(b);
+        }
+        i += 1;
+    }
+    if quoted {
+        None
+    } else {
+        String::from_utf8(out).ok()
+    }
+}
+
+fn exact_auth_filter_present(compact: &str, expected: &str) -> bool {
+    let bytes = compact.as_bytes();
+    let mut i = 0;
+    let mut depth = 0usize;
+    let mut quoted = false;
+    let mut matches = 0usize;
+    while i < bytes.len() {
+        if !quoted && depth == 0 && bytes[i..].starts_with(AUTH_FILTER_HEADER.as_bytes()) {
+            if !bytes[i..].starts_with(expected.as_bytes()) {
+                return false;
+            }
+            matches += 1;
+        }
+        match bytes[i] {
+            b'\\' if quoted => {
+                i += 1;
+            }
+            b'"' => quoted = !quoted,
+            b'{' if !quoted => depth += 1,
+            b'}' if !quoted => {
+                let Some(next) = depth.checked_sub(1) else {
+                    return false;
+                };
+                depth = next;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    matches == 1 && depth == 0 && !quoted
+}
+
+fn api_auth_filter_is_shipped(agent_json: &str, terraform: &str) -> bool {
+    let Ok(agent) = serde_json::from_str::<serde_json::Value>(agent_json) else {
+        return false;
+    };
+    let source = &agent["logs"]["metrics_collected"]["prometheus"];
+    if source["log_group_name"] != "/tickvault/prod/metrics"
+        || source["emf_processor"]["metric_namespace"] != "Tickvault/Prod"
+    {
+        return false;
+    }
+    let Some(compact) = compact_hcl_route(terraform) else {
+        return false;
+    };
+    let Some(expected) = compact_hcl_route(AUTH_FILTER_CONTRACT) else {
+        return false;
+    };
+    exact_auth_filter_present(&compact, &expected)
+}
+
+#[test]
+fn api_auth_visibility_binds_the_real_agent_and_metric_filter() {
+    let agent = fs::read_to_string(repo_root().join("deploy/aws/cloudwatch-agent.json"))
+        .expect("agent config");
+    let terraform =
+        fs::read_to_string(repo_root().join("deploy/aws/terraform/auth-failed-alarm.tf"))
+            .expect("auth filter config");
+    assert!(api_auth_filter_is_shipped(&agent, &terraform));
+    for changed in [
+        terraform.replace("$.tv_api_auth_failed_total", "$.tv_wrong_total"),
+        terraform.replace(
+            "/tickvault/${var.environment}/metrics",
+            "/tickvault/${var.environment}/wrong",
+        ),
+        terraform.replace(
+            "namespace = \"Tickvault/Prod\"",
+            "namespace = \"Wrong/Prod\"",
+        ),
+        terraform.replace(
+            "api_auth_failed_fallback\" {",
+            "api_auth_failed_fallback\" {\n count = 0",
+        ),
+        terraform.replace(
+            "api_auth_failed_fallback\" {",
+            "api_auth_failed_fallback\" {\n for_each = {}",
+        ),
+        terraform.replace("api_auth_failed_fallback\" {", "unrelated_filter\" {"),
+        format!("/* {terraform} */"),
+        format!("{terraform}\n{AUTH_FILTER_CONTRACT}"),
+    ] {
+        assert_ne!(
+            changed, terraform,
+            "mutation must change actual configuration"
+        );
+        assert!(
+            !api_auth_filter_is_shipped(&agent, &changed),
+            "broken route was accepted"
+        );
+    }
+    assert!(!api_auth_filter_is_shipped(
+        &agent.replace("/tickvault/prod/metrics", "/wrong"),
+        &terraform
+    ));
+    assert!(!api_auth_filter_is_shipped("{}", &terraform));
+}
+
+#[test]
+fn auth_filter_recognizer_ignores_comment_and_nested_resource_decoys() {
+    let contract = compact_hcl_route(AUTH_FILTER_CONTRACT).expect("contract");
+    assert!(exact_auth_filter_present(&contract, &contract));
+    for source in [
+        format!("locals {{ {AUTH_FILTER_CONTRACT} }}"),
+        format!("# {}", AUTH_FILTER_CONTRACT.replace('\n', " ")),
+        format!("// {}", AUTH_FILTER_CONTRACT.replace('\n', " ")),
+    ] {
+        let compact = compact_hcl_route(&source).expect("test HCL");
+        assert!(!exact_auth_filter_present(&compact, &contract));
+    }
+    assert!(compact_hcl_route("/* unterminated").is_none());
+    assert!(compact_hcl_route("\"unterminated").is_none());
 }
 
 #[test]
@@ -505,8 +695,8 @@ fn every_loss_counter_is_shipped_logged_or_allowlisted() {
 
     assert!(
         unreachable.is_empty(),
-        "{} loss counter(s) reach NO operator surface — not in the EMF \
-         allowlist, no error!/warn! near any emit site, and not allowlisted:\n  {}\n\n\
+        "{} loss counter(s) reach NO operator surface — not in EMF or a verified \
+         log metric filter, no error!/warn! near any emit site, and not allowlisted:\n  {}\n\n\
          A counter that measures data loss and reaches nobody is worse than no \
          counter: the loss is measured, the measurement is discarded, and the \
          dashboard stays green. Fix by ONE of:\n\

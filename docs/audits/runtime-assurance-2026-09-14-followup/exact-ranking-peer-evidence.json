@@ -1,0 +1,10 @@
+{
+  "checked_utc": "2026-09-14T04:06:51.380977+00:00",
+  "rows": 26246,
+  "distinct_keys": 25359,
+  "check": "Python Fraction ordering versus coarse/fraction integer key; no unequal ratio collisions",
+  "passed": true,
+  "is_rust_test": false,
+  "file_sha256": "a54d1f11f941d67111279a99d76650f44bbd23fdf61cf8f513aefb97c27867ab",
+  "denominator_limit": 4294967295
+}

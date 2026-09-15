@@ -1,49 +1,22 @@
-//! T3.6 (pragmatic) — Disk I/O failure chaos for `WsFrameSpill`.
+//! WAL constructor refusal and healthy writer ownership/replay checks.
 //!
-//! The production scenario we need to survive is "disk full on WAL
-//! partition": the writer thread cannot create new segment files,
-//! each `write(2)` returns ENOSPC or EFBIG, and the spill channel
-//! eventually disconnects. The observable contract is:
+//! A regular file cannot be a WAL directory. The separate Linux-only procfs
+//! case requires an existing virtual parent that refuses directory creation;
+//! unexpected writability fails instead of becoming a passing "no panic" result.
 //!
-//!   1. No panic in the writer thread
-//!   2. No panic in `append()` callers (they see `AppendOutcome::Dropped`)
-//!   3. No corruption of segments that WERE successfully flushed
-//!   4. `tv_ws_frame_spill_drop_critical` fires on every dropped frame
+//! The surviving-Arc and repeated-cycle cases exercise healthy writer lifetime,
+//! admission, owned replay and complete payload preservation. Dropping one Arc
+//! does not simulate a dead writer while another Arc still owns it.
 //!
-//! A LITERAL disk-full test requires either root (loop device or tmpfs
-//! with quota) or a forked subprocess with `setrlimit(RLIMIT_FSIZE)`
-//! plus SIGXFSZ handling — neither of which is portable across the
-//! macOS-dev + Linux-CI environments tickvault supports.
-//!
-//! Instead, this test reaches the same observable contract via three
-//! portable failure-injection paths:
-//!
-//!   - **Path A — `wal_dir` is a regular file, not a directory.**
-//!     `WsFrameSpill::new` calls `create_dir_all` which fails because
-//!     the target exists as a file. The test asserts `new()` returns
-//!     `Err(...)` with NO panic.
-//!
-//!   - **Path B — `wal_dir` inside a non-existent parent with no
-//!     permission to create it.** Uses `/proc/1/ws_wal_fake` — a path
-//!     under `/proc/1` which cannot have child directories created
-//!     except by the init process owner. Asserts `new()` returns
-//!     `Err(...)` with NO panic.
-//!
-//!   - **Path C — senders dropped mid-flight.** Simulates the state
-//!     where the writer thread has already died (disk full, OOM, etc.)
-//!     by dropping the `WsFrameSpill` while another `Arc<WsFrameSpill>`
-//!     is still alive. Subsequent `append()` calls on the surviving
-//!     Arc encounter a `Disconnected` channel and MUST return
-//!     `AppendOutcome::Dropped` without panic.
-//!
-//! All three paths are portable (no root, no platform-specific syscalls)
-//! and exercise the `Dropped` outcome surface end-to-end.
-//!
-//! The literal-disk-full subprocess approach IS achievable but requires
-//! adding `libc` to `crates/storage/Cargo.toml` — which is a
-//! Parthiban-approval dependency change, tracked separately.
+//! These cases do not fill a filesystem or establish ENOSPC recovery. The real
+//! Unix file-size-limit/EFBIG fixture is in chaos_disk_full_ulimit.rs; neither
+//! fixture establishes power-loss durability.
 
 #![cfg(test)]
+
+#[path = "support/owned_wal_replay.rs"]
+mod owned_wal_replay;
+use owned_wal_replay::{assert_complete_replay, claim_wal};
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -89,42 +62,41 @@ fn chaos_wal_dir_is_regular_file_surfaces_err_without_panic() {
     let _ = std::fs::remove_dir_all(&parent);
 }
 
-/// **Path B** — `wal_dir` parent is unwritable. Uses a path under
-/// `/proc/1` which only the init process can modify. `create_dir_all`
-/// fails with EACCES. `WsFrameSpill::new` surfaces `Err` without panic.
-///
-/// If the test runs as root (CI in Docker often does), /proc/1 may
-/// still reject directory creation because /proc is a pseudo-fs with
-/// no write support. We assert the test is at least observable — if
-/// it unexpectedly succeeds, we log and skip rather than fail noisily.
+/// **Path B** — Linux procfs refuses creating an ordinary WAL directory,
+/// even for root. Require a real procfs parent and fail if the supposedly
+/// unavailable path opens. Other platforms do not execute this Linux fixture.
+#[cfg(target_os = "linux")]
 #[test]
 fn chaos_wal_dir_in_unwritable_parent_surfaces_err_without_panic() {
-    let path = std::path::PathBuf::from("/proc/1/tv_ws_wal_cannot_exist");
+    let parent = std::path::Path::new("/proc/self");
+    assert!(
+        parent.is_dir(),
+        "Linux procfs is required to exercise this directory-creation refusal"
+    );
+    let path = parent.join(format!("tv_ws_wal_refusal_{}", std::process::id()));
+    assert!(
+        !path.exists(),
+        "the isolated refusal path must start absent"
+    );
 
     let outcome = std::panic::catch_unwind(|| WsFrameSpill::new(&path));
     assert!(
         outcome.is_ok(),
-        "WsFrameSpill::new must NEVER panic on an unwritable parent"
+        "WsFrameSpill::new must return an error instead of panicking"
     );
-
-    // Either: Err (normal — /proc is pseudo-fs, mkdir fails)
-    // Or:     Ok (unexpected — some container runtimes bind-mount
-    //              /proc writable; in that case we clean up and pass).
     match outcome.expect("catch_unwind outer") {
         Ok(spill) => {
-            // Unexpected writability — clean up to avoid leaving
-            // artifacts and record the anomaly via a metric.
             drop(spill);
-            let _ = std::fs::remove_dir_all(&path);
-            eprintln!(
-                "note: /proc/1/tv_ws_wal_cannot_exist was writable — \
-                 container runtime may expose /proc as writable. Test \
-                 still passes because the contract 'no panic' held."
+            let cleanup = std::fs::remove_dir_all(&path);
+            panic!(
+                "fault prerequisite was not established: the procfs WAL path opened; \
+                 this is not passing refusal evidence (cleanup={cleanup:?})"
             );
         }
-        Err(_) => {
-            // Expected path.
-        }
+        Err(error) => assert!(
+            format!("{error:#}").contains("exclusive WAL directory ownership unavailable"),
+            "expected directory-creation refusal, got {error:#}"
+        ),
     }
 }
 
@@ -142,27 +114,46 @@ fn chaos_spill_dropped_with_in_flight_arcs_no_panic_on_replay() {
     std::fs::create_dir_all(&dir).expect("create"); // APPROVED: test
     {
         let spill = Arc::new(WsFrameSpill::new(&dir).expect("spill new"));
-        spill.append(WsType::LiveFeed, b"keepalive".to_vec());
+        assert_eq!(
+            spill.append(WsType::LiveFeed, b"keepalive".to_vec()),
+            AppendOutcome::Spilled
+        );
         let clone = Arc::clone(&spill);
         drop(spill);
         // Clone still holds a sender — append must still succeed.
         let outcome = clone.append(WsType::LiveFeed, b"after-drop".to_vec());
         assert!(
-            outcome == AppendOutcome::Spilled || outcome == AppendOutcome::Dropped,
-            "append must return a defined outcome, never panic"
+            outcome == AppendOutcome::Spilled,
+            "a healthy surviving clone must still admit its frame"
         );
         drop(clone);
     }
     // Writer thread drains and exits cleanly.
     std::thread::sleep(Duration::from_millis(100));
 
-    // `replay_all` MUST still work without panic on the segment the
-    // writer managed to flush before exit.
-    let replay_result =
-        std::panic::catch_unwind(|| tickvault_storage::ws_frame_spill::replay_all(&dir));
+    // Take the now-free directory claim and retain the full fenced result.
+    // A refusal or a panic must not be mistaken for an empty recovery.
+    let replay_result = std::panic::catch_unwind(|| {
+        let owner = claim_wal(&dir);
+        let batch = assert_complete_replay(&owner);
+        assert_eq!(
+            batch.frames.len(),
+            2,
+            "both admitted clone payloads must survive"
+        );
+        for (record, expected) in batch
+            .frames
+            .iter()
+            .zip([b"keepalive".as_slice(), b"after-drop".as_slice()])
+        {
+            assert_eq!(record.ws_type, WsType::LiveFeed);
+            assert_eq!(record.frame, expected);
+        }
+        assert!(batch.frames[0].frame_seq < batch.frames[1].frame_seq);
+    });
     assert!(
         replay_result.is_ok(),
-        "replay_all must NEVER panic after a full drop-and-replay cycle"
+        "owned replay must finish all payload checks after the last clone drops"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -182,18 +173,48 @@ fn chaos_rapid_disk_io_cycles_no_panic() {
         let spill = WsFrameSpill::new(&dir).expect("new");
         for i in 0..500 {
             let frame = vec![0u8; 64];
-            let _ = spill.append(
-                if i % 2 == 0 {
-                    WsType::LiveFeed
-                } else {
-                    WsType::OrderUpdate
-                },
-                frame,
+            assert_eq!(
+                spill.append(
+                    if i % 2 == 0 {
+                        WsType::LiveFeed
+                    } else {
+                        WsType::OrderUpdate
+                    },
+                    frame,
+                ),
+                AppendOutcome::Spilled
             );
         }
         drop(spill);
         std::thread::sleep(Duration::from_millis(20));
-        let _ = std::panic::catch_unwind(|| tickvault_storage::ws_frame_spill::replay_all(&dir));
+        let replay_result = std::panic::catch_unwind(|| {
+            let owner = claim_wal(&dir);
+            let batch = assert_complete_replay(&owner);
+            assert_eq!(
+                batch.frames.len(),
+                500,
+                "cycle {cycle} must recover every admitted frame"
+            );
+            for (index, record) in batch.frames.iter().enumerate() {
+                let expected_type = if index % 2 == 0 {
+                    WsType::LiveFeed
+                } else {
+                    WsType::OrderUpdate
+                };
+                assert_eq!(record.ws_type, expected_type);
+                assert_eq!(record.frame, vec![0u8; 64]);
+            }
+            assert!(
+                batch
+                    .frames
+                    .windows(2)
+                    .all(|pair| pair[0].frame_seq < pair[1].frame_seq)
+            );
+        });
+        assert!(
+            replay_result.is_ok(),
+            "cycle {cycle} must not swallow a replay panic or refusal"
+        );
     }
 
     let _ = std::fs::remove_dir_all(&root);

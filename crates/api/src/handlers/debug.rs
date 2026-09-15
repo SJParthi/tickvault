@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// Default logs directory. Mirrors the MCP server's default resolution:
 /// `<repo_root>/data/logs/machine` (2026-07-05 operator directive — every
@@ -217,6 +218,40 @@ const CROSS_VERIFY_SUMMARY_SUFFIX: &str = ".summary.json";
 /// few KB (mismatch rows only); beyond this cap the endpoint serves the
 /// summary with `csv: null` instead of slurping the file into memory.
 const MAX_CROSS_VERIFY_CSV_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_CROSS_VERIFY_SUMMARY_BYTES: u64 = 1024 * 1024;
+const MAX_DEBUG_TEXT_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Enforce the limit on bytes actually consumed, including files that grow
+/// after metadata inspection. One extra byte distinguishes exact-fit from
+/// oversized data; oversized or invalid UTF-8 content is never returned.
+async fn read_bounded_text(
+    reader: impl AsyncRead + Unpin,
+    max_bytes: u64,
+) -> std::io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() as u64 > max_bytes {
+        return Ok(None);
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+}
+
+async fn read_bounded_file(path: &Path, max_bytes: u64) -> std::io::Result<Option<String>> {
+    let file = tokio::fs::File::open(path).await?;
+    read_bounded_text(file, max_bytes).await
+}
+
+async fn read_bounded_summary(path: &Path) -> serde_json::Value {
+    match read_bounded_file(path, MAX_CROSS_VERIFY_SUMMARY_BYTES).await {
+        Ok(Some(body)) => serde_json::from_str(&body).unwrap_or(serde_json::Value::Null),
+        _ => serde_json::Value::Null,
+    }
+}
 
 fn resolve_cross_verify_dir() -> PathBuf {
     if let Ok(custom) = std::env::var(CROSS_VERIFY_DIR_ENV)
@@ -285,25 +320,23 @@ pub async fn cross_verify_latest() -> impl IntoResponse {
     let Some(csv_path) = newest_cross_verify_csv(&dir) else {
         return not_found();
     };
-    // Bounded read (post-impl security review): a pathological mismatch
-    // file is not slurped into RAM — `csv` goes null and the caller falls
-    // back to the sibling summary counts.
+    // Metadata is informational only; the actual read enforces the byte cap
+    // even when the file grows or is replaced between stat and open.
     let csv_bytes = tokio::fs::metadata(&csv_path)
         .await
         .map(|m| m.len())
         .unwrap_or(0);
-    let (csv, mismatch_rows) = if csv_bytes > MAX_CROSS_VERIFY_CSV_BYTES {
-        (serde_json::Value::Null, serde_json::Value::Null)
-    } else {
-        let Ok(csv) = tokio::fs::read_to_string(&csv_path).await else {
-            return not_found();
-        };
-        // The CSV is header + one line per mismatched field-cell.
-        let rows = csv.lines().filter(|l| !l.trim().is_empty()).count() as u64;
-        (
-            serde_json::Value::String(csv),
-            serde_json::json!(rows.saturating_sub(1)),
-        )
+    let (csv, mismatch_rows) = match read_bounded_file(&csv_path, MAX_CROSS_VERIFY_CSV_BYTES).await
+    {
+        Ok(Some(csv)) => {
+            let rows = csv.lines().filter(|l| !l.trim().is_empty()).count() as u64;
+            (
+                serde_json::Value::String(csv),
+                serde_json::json!(rows.saturating_sub(1)),
+            )
+        }
+        Ok(None) => (serde_json::Value::Null, serde_json::Value::Null),
+        Err(_) => return not_found(),
     };
     let file_name = csv_path
         .file_name()
@@ -320,10 +353,7 @@ pub async fn cross_verify_latest() -> impl IntoResponse {
     let summary_path = dir.join(format!(
         "{CROSS_VERIFY_CSV_PREFIX}{date}{CROSS_VERIFY_SUMMARY_SUFFIX}"
     ));
-    let summary: serde_json::Value = match tokio::fs::read_to_string(&summary_path).await {
-        Ok(body) => serde_json::from_str(&body).unwrap_or(serde_json::Value::Null),
-        Err(_) => serde_json::Value::Null,
-    };
+    let summary = read_bounded_summary(&summary_path).await;
     // serde_json builds the body — the CSV payload (newlines, quotes) is
     // escaped correctly by construction, never by hand.
     let body = serde_json::json!({
@@ -361,8 +391,13 @@ async fn read_text_file(
     path: &Path,
     content_type: &'static str,
 ) -> (StatusCode, [(header::HeaderName, &'static str); 1], String) {
-    match tokio::fs::read_to_string(path).await {
-        Ok(body) => (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], body),
+    match read_bounded_file(path, MAX_DEBUG_TEXT_BYTES).await {
+        Ok(Some(body)) => (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], body),
+        Ok(None) => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            [(header::CONTENT_TYPE, "application/json")],
+            "{\"error\":\"file exceeds response byte limit\"}".to_string(),
+        ),
         Err(_) => (
             StatusCode::NOT_FOUND,
             [(header::CONTENT_TYPE, "application/json")],
@@ -424,6 +459,69 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[tokio::test]
+    async fn bounded_text_reads_only_limit_plus_one_and_rejects_invalid_utf8() {
+        let mut input = &b"abcdefghij"[..];
+        assert_eq!(read_bounded_text(&mut input, 4).await.unwrap(), None);
+        assert_eq!(input, b"fghij", "oversized readers must not be drained");
+        assert_eq!(
+            read_bounded_text(&b"abcd"[..], 4).await.unwrap(),
+            Some("abcd".into())
+        );
+        assert_eq!(
+            read_bounded_text(&b""[..], 0).await.unwrap(),
+            Some(String::new())
+        );
+        assert_eq!(read_bounded_text(&b"x"[..], 0).await.unwrap(), None);
+        assert_eq!(
+            read_bounded_text(&[0xff][..], 4).await.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_file_rejects_growth_after_metadata_check() {
+        let tmp = mktemp("bounded-growth");
+        let path = tmp.path().join("growing.csv");
+        fs::write(&path, "ok").unwrap();
+        assert!(fs::metadata(&path).unwrap().len() <= 4);
+        fs::write(&path, "now larger than the limit").unwrap();
+        assert_eq!(read_bounded_file(&path, 4).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn bounded_summary_handles_invalid_missing_and_oversized_json() {
+        let tmp = mktemp("bounded-summary");
+        let path = tmp.path().join("summary.json");
+        assert!(read_bounded_summary(&path).await.is_null());
+        fs::write(&path, "{invalid json").unwrap();
+        assert!(read_bounded_summary(&path).await.is_null());
+        fs::write(&path, r#"{"compared":12}"#).unwrap();
+        assert_eq!(read_bounded_summary(&path).await["compared"], 12);
+        // A valid JSON document that exceeds the cap must still be rejected.
+        let oversized = format!(
+            "{}{}",
+            " ".repeat(MAX_CROSS_VERIFY_SUMMARY_BYTES as usize),
+            "{}"
+        );
+        fs::write(&path, oversized).unwrap();
+        assert!(read_bounded_summary(&path).await.is_null());
+    }
+
+    #[tokio::test]
+    async fn oversized_debug_log_returns_413_without_contents() {
+        let tmp = mktemp("bounded-log");
+        let path = tmp.path().join("errors.jsonl");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(MAX_DEBUG_TEXT_BYTES + 1).unwrap();
+        let (status, _, body) = read_text_file(&path, "application/x-ndjson").await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["error"],
+            "file exceeds response byte limit"
+        );
     }
 
     #[test]

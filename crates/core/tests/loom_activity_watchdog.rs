@@ -1,30 +1,11 @@
-//! T1.3 — Loom concurrency model for the activity watchdog + read loop race.
+//! Bounded Loom models for watchdog atomic patterns.
 //!
-//! Production invariant this test protects:
-//!
-//!   > In every possible interleaving of the WS reader thread and the
-//!   > activity watchdog task, one of the following holds:
-//!   >   (a) The reader bumps the counter forward before the watchdog
-//!   >       observes a stall → watchdog does NOT fire.
-//!   >   (b) The reader stalls completely → watchdog fires EXACTLY once
-//!   >       via `notify_one()`, and the read loop returns `WatchdogFired`
-//!   >       exactly once.
-//!   > No interleaving produces: double-fire, lost-notify, or a reader
-//!   > that continues running after `notify_one()` has been observed.
-//!
-//! This is a tighter companion to `loom_ws_decoupling.rs`. That file
-//! proves the WAL path never blocks the reader; this file proves the
-//! shutdown path (watchdog → Notify → read loop exit) is race-free.
-//!
-//! The loom model collapses the production code to its atomic shape:
-//!
-//!   - `counter: AtomicU64` — the reader bumps, the watchdog reads.
-//!   - `notified: AtomicBool` — a hand-rolled "did the watchdog fire"
-//!     flag. Production uses `tokio::sync::Notify`, which loom cannot
-//!     model directly. An AtomicBool with Acquire/Release semantics is
-//!     semantically equivalent for the notify-once-check-once pattern.
-//!   - `reader_exits: AtomicBool` — set by the reader when it observes
-//!     `notified == true` and decides to stop.
+//! These tests check an already-observed counter advance, single-winner CAS,
+//! and notification visibility after an explicitly joined writer. They use
+//! simplified atomics instead of the production Tokio Notify/read loop, so
+//! they do not prove the production shutdown path race-free or cover a
+//! notification arriving after a reader's final check. That scheduling
+//! boundary remains outside this model.
 //!
 //! Run with:
 //!   cargo test -p tickvault-core --features loom --test loom_activity_watchdog
@@ -73,6 +54,13 @@ mod loom_tests {
                 }
             });
 
+            // Establish the named premise: the reader finished before this
+            // watchdog observation. Concurrent one-shot checks do not imply
+            // that an eventual notification was observed by the reader.
+            reader
+                .join()
+                .expect("reader join before watchdog observation");
+
             // Watchdog: one observation — if counter has advanced, do
             // NOT fire. This is the "fast path" of the production
             // watchdog loop (every 5s).
@@ -85,33 +73,18 @@ mod loom_tests {
                 }
             });
 
-            reader.join().expect("reader join");
             watchdog.join().expect("watchdog join");
-
-            // Either the reader won the race and the counter advanced
-            // BEFORE the watchdog observed it — no fire.
-            // Or the watchdog observed last_seen==0==current BEFORE the
-            // reader bumped — then it fired, but the reader has already
-            // exited cleanly.
-            //
-            // The invariant: if the watchdog fires, the reader MUST
-            // have exited cleanly. Never deadlock, never miss the
-            // notify.
-            let fired = state.notified.load(Ordering::Acquire);
-            let exited = state.reader_exits.load(Ordering::Acquire);
-            if fired {
-                // Either the reader observed the fire and exited, or the
-                // reader had already finished its one-shot iteration and
-                // never checked — both are fine for a one-shot model.
-                let _ = exited; // purely documentary
-            }
+            assert_eq!(state.counter.load(Ordering::Relaxed), 1);
+            assert!(
+                !state.notified.load(Ordering::Acquire),
+                "an already-observed counter advance must not fire the watchdog"
+            );
+            assert!(!state.reader_exits.load(Ordering::Acquire));
         });
     }
 
-    /// **Invariant 2** — the watchdog fires EXACTLY ONCE in any
-    /// interleaving. The production watchdog task calls `notify_one()`
-    /// and returns; a second fire is a bug. Loom's state-space
-    /// exhaustion verifies this across every schedule.
+    /// Two modeled observers of a fixed stale counter produce one CAS winner.
+    /// This checks the primitive pattern, not production task multiplicity.
     #[test]
     fn watchdog_fires_at_most_once_across_interleavings() {
         loom::model(|| {
@@ -157,16 +130,16 @@ mod loom_tests {
 
             // INVARIANT: at most one CAS fire regardless of interleaving.
             let fires = fire_count.load(Ordering::Relaxed);
-            assert!(
-                fires <= 1,
-                "watchdog fired {fires} times — CAS guard broken in interleaving"
+            assert_eq!(
+                fires, 1,
+                "two modeled stale-counter observers must produce exactly one CAS winner"
             );
         });
     }
 
-    /// **Invariant 3** — when the watchdog fires, the reader observes
-    /// the notify on its NEXT check. No lost notifications: the
-    /// Release/Acquire pair guarantees the reader sees the store.
+    /// A reader started after the writer is joined observes its notification.
+    /// Joining establishes ordering; this does not claim that an arbitrary
+    /// earlier concurrent load must see a future Release store.
     #[test]
     fn reader_observes_watchdog_notify_after_release_store() {
         loom::model(|| {
@@ -178,18 +151,17 @@ mod loom_tests {
                 s_watchdog.notified.store(true, Ordering::Release);
             });
 
-            // Reader reads after (scheduler may interleave arbitrarily).
+            watchdog.join().expect("watchdog join before reader starts");
+
+            // The named after-store premise is now established.
             let s_reader = Arc::clone(&state);
             let reader = thread::spawn(move || s_reader.notified.load(Ordering::Acquire));
 
-            watchdog.join().expect("watchdog join");
             let observed = reader.join().expect("reader join");
-
-            // The reader observes either `false` (it ran first) or
-            // `true` (watchdog finished before reader load). The
-            // Release/Acquire pair means there is NO third possibility
-            // — no torn read, no visibility delay.
-            assert!(observed || !observed, "atomic bool is always valid");
+            assert!(
+                observed,
+                "reader after the joined notification must observe true"
+            );
 
             // Final state: the watchdog's store is visible if we read
             // it again after the joins.

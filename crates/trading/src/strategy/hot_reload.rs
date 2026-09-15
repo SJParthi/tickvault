@@ -2,18 +2,21 @@
 //!
 //! Uses the `notify` crate to watch for file changes. When a strategy TOML
 //! file is modified, it re-parses and sends the new definitions through
-//! a bounded channel. The consumer (strategy engine) swaps in the new
-//! definitions on the next tick — no lock contention on the hot path.
+//! one latest-value mailbox. Repeated edits replace the pending snapshot on
+//! the watcher thread. The consumer makes one non-blocking attempt to take
+//! that snapshot; it never drains an unbounded edit queue.
 //!
 //! # Architecture
 //! ```text
 //! [notify watcher] → file changed → parse TOML → validate
-//!                  → send via crossbeam channel → strategy engine receives
+//!                  → replace pending snapshot → strategy engine receives
 //!                  → swap definitions (cold path, between ticks)
 //! ```
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, Weak, mpsc};
+
+use parking_lot::Mutex;
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tracing::{error, info, warn};
@@ -33,6 +36,50 @@ pub struct ReloadEvent {
     pub strategies: Vec<StrategyDefinition>,
     /// Updated indicator parameters.
     pub indicator_params: IndicatorParams,
+}
+
+/// One pending version, regardless of how many edits arrive between ticks.
+/// The sender is weak so dropping the consumer still reports disconnection.
+struct ReloadSender(Weak<Mutex<Option<ReloadEvent>>>);
+struct ReloadReceiver(Arc<Mutex<Option<ReloadEvent>>>);
+
+fn reload_mailbox() -> (ReloadSender, ReloadReceiver) {
+    let slot = Arc::new(Mutex::new(None));
+    (ReloadSender(Arc::downgrade(&slot)), ReloadReceiver(slot))
+}
+
+impl ReloadSender {
+    fn send(&self, event: ReloadEvent) -> Result<(), mpsc::SendError<ReloadEvent>> {
+        let Some(slot) = self.0.upgrade() else {
+            return Err(mpsc::SendError(event));
+        };
+        // Release the lock BEFORE destroying a potentially large old config.
+        // This destruction is on the watcher thread, never the tick consumer.
+        let superseded = slot.lock().replace(event);
+        drop(superseded);
+        Ok(())
+    }
+}
+
+impl ReloadReceiver {
+    fn try_recv(&self) -> Result<ReloadEvent, mpsc::TryRecvError> {
+        let Some(mut slot) = self.0.try_lock() else {
+            return Err(mpsc::TryRecvError::Empty);
+        };
+        slot.take().ok_or(mpsc::TryRecvError::Empty)
+    }
+}
+
+/// Directory watching is needed for atomic file replacement, but unrelated
+/// sibling files must not reparse or reset the strategy configuration.
+fn is_config_event(event: &Event, config_path: &Path) -> bool {
+    matches!(
+        event.kind,
+        EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+    ) && event.paths.iter().any(|path| {
+        path == config_path
+            || std::path::absolute(path).is_ok_and(|absolute| absolute == config_path)
+    })
 }
 
 /// Error type for hot-reload operations.
@@ -59,7 +106,7 @@ pub struct StrategyHotReloader {
     /// The file watcher handle (must be kept alive).
     _watcher: RecommendedWatcher,
     /// Receiver for reload events.
-    reload_receiver: mpsc::Receiver<ReloadEvent>,
+    reload_receiver: ReloadReceiver,
     /// Path being watched (for diagnostics).
     watched_path: PathBuf,
 }
@@ -85,17 +132,15 @@ impl StrategyHotReloader {
         );
 
         // Set up file watcher
-        let (reload_sender, reload_receiver) = mpsc::channel::<ReloadEvent>();
+        let (reload_sender, reload_receiver) = reload_mailbox();
         let watched_path = config_path.to_path_buf();
-        let reload_path = config_path.to_path_buf();
+        let reload_path =
+            std::path::absolute(config_path).unwrap_or_else(|_| config_path.to_path_buf());
 
         let mut watcher = notify::recommended_watcher(
             move |result: Result<Event, notify::Error>| match result {
                 Ok(event) => {
-                    if matches!(
-                        event.kind,
-                        EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
-                    ) {
+                    if is_config_event(&event, &reload_path) {
                         handle_file_change(&reload_path, &reload_sender);
                     }
                 }
@@ -132,14 +177,11 @@ impl StrategyHotReloader {
     /// Returns `Some(ReloadEvent)` if the config file was modified.
     ///
     /// # Performance
-    /// O(1) — `try_recv` is a non-blocking channel check.
+    /// One non-blocking lock attempt and at most one pointer/value move.
+    /// Parsing, replacing and dropping superseded configs occur on the watcher.
+    /// Applying the returned variable-size config is separate, non-O(1) work.
     pub fn try_recv(&self) -> Option<ReloadEvent> {
-        // Drain all pending events, keep only the latest
-        let mut latest = None;
-        while let Ok(event) = self.reload_receiver.try_recv() {
-            latest = Some(event);
-        }
-        latest
+        self.reload_receiver.try_recv().ok()
     }
 
     /// Returns the path being watched.
@@ -149,7 +191,7 @@ impl StrategyHotReloader {
 }
 
 /// Handles a file change event: re-parse and send reload event.
-fn handle_file_change(config_path: &Path, sender: &mpsc::Sender<ReloadEvent>) {
+fn handle_file_change(config_path: &Path, sender: &ReloadSender) {
     match load_strategy_config_file(config_path) {
         Ok((strategies, indicator_params)) => {
             info!(
@@ -185,6 +227,64 @@ fn handle_file_change(config_path: &Path, sender: &mpsc::Sender<ReloadEvent>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mailbox_edit_burst_retains_only_latest_version() {
+        let (sender, receiver) = reload_mailbox();
+        for version in 1..=10_000 {
+            sender
+                .send(ReloadEvent {
+                    strategies: Vec::new(),
+                    indicator_params: IndicatorParams {
+                        ema_fast_period: version,
+                        ..IndicatorParams::default()
+                    },
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            receiver
+                .try_recv()
+                .unwrap()
+                .indicator_params
+                .ema_fast_period,
+            10_000
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "superseded configs must not queue"
+        );
+        let guard = receiver.0.lock();
+        assert!(
+            receiver.try_recv().is_err(),
+            "consumer must not wait for the writer"
+        );
+        drop(guard);
+        drop(receiver);
+        assert!(
+            sender
+                .send(ReloadEvent {
+                    strategies: Vec::new(),
+                    indicator_params: IndicatorParams::default(),
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn config_events_ignore_siblings_but_accept_atomic_replacement() {
+        use notify::event::{ModifyKind, RenameMode};
+        let config = std::path::absolute("config/strategies.toml").unwrap();
+        let sibling = config.with_file_name("unrelated.log");
+        let unrelated = Event::new(EventKind::Modify(ModifyKind::Any)).add_path(sibling);
+        assert!(!is_config_event(&unrelated, &config));
+        let renamed = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(config.with_file_name("strategies.tmp"))
+            .add_path(config.clone());
+        assert!(is_config_event(&renamed, &config));
+        let empty = Event::new(EventKind::Modify(ModifyKind::Any));
+        assert!(!is_config_event(&empty, &config));
+    }
 
     /// Minimal valid strategy TOML that `load_strategy_config_file` accepts.
     const VALID_STRATEGY_TOML: &str = r#"
@@ -421,7 +521,7 @@ threshold = 0.0
         // The sender should NOT receive a ReloadEvent.
         let (dir, file_path) = write_temp_strategy_file("this is [[[ invalid TOML");
 
-        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+        let (sender, receiver) = reload_mailbox();
         handle_file_change(&file_path, &sender);
 
         // No event should be sent because parsing failed
@@ -438,7 +538,7 @@ threshold = 0.0
     fn handle_file_change_valid_toml_sends_event() {
         let (dir, file_path) = write_temp_strategy_file(VALID_STRATEGY_TOML);
 
-        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+        let (sender, receiver) = reload_mailbox();
         handle_file_change(&file_path, &sender);
 
         let event = receiver.try_recv();
@@ -458,7 +558,7 @@ threshold = 0.0
     fn handle_file_change_missing_file_does_not_send_event() {
         let nonexistent = Path::new("/tmp/tv_hot_reload_deleted_file_99999.toml");
 
-        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+        let (sender, receiver) = reload_mailbox();
         handle_file_change(nonexistent, &sender);
 
         // No event should be sent because file does not exist
@@ -473,7 +573,7 @@ threshold = 0.0
     fn handle_file_change_dropped_receiver_does_not_panic() {
         let (dir, file_path) = write_temp_strategy_file(VALID_STRATEGY_TOML);
 
-        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+        let (sender, receiver) = reload_mailbox();
         // Drop receiver before sending
         drop(receiver);
 
@@ -515,7 +615,7 @@ threshold = 0.0
 "#;
         let (dir, file_path) = write_temp_strategy_file(multi_toml);
 
-        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+        let (sender, receiver) = reload_mailbox();
         handle_file_change(&file_path, &sender);
 
         let event = receiver.try_recv().unwrap();
@@ -545,7 +645,7 @@ threshold = 25.0
 "#;
         let (dir, file_path) = write_temp_strategy_file(toml_with_params);
 
-        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+        let (sender, receiver) = reload_mailbox();
         handle_file_change(&file_path, &sender);
 
         let event = receiver.try_recv().unwrap();
@@ -598,7 +698,7 @@ threshold = 25.0
     fn handle_file_change_empty_toml_sends_empty_strategies() {
         let (dir, file_path) = write_temp_strategy_file("");
 
-        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+        let (sender, receiver) = reload_mailbox();
         handle_file_change(&file_path, &sender);
 
         let event = receiver.try_recv().unwrap();
@@ -652,7 +752,7 @@ target_atr_multiplier = 3.0
 "#;
         let (dir, file_path) = write_temp_strategy_file(bad_toml);
 
-        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+        let (sender, receiver) = reload_mailbox();
         handle_file_change(&file_path, &sender);
 
         // Validation error — no event sent
@@ -666,22 +766,22 @@ target_atr_multiplier = 3.0
     }
 
     #[test]
-    fn handle_file_change_multiple_calls_sends_multiple_events() {
+    fn handle_file_change_multiple_calls_coalesces_pending_events() {
         let (dir, file_path) = write_temp_strategy_file(VALID_STRATEGY_TOML);
 
-        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+        let (sender, receiver) = reload_mailbox();
 
         // Call handle_file_change multiple times
         handle_file_change(&file_path, &sender);
         handle_file_change(&file_path, &sender);
         handle_file_change(&file_path, &sender);
 
-        // All three events should be queued
+        // Only the newest event remains pending; edit bursts do not grow a queue.
         let mut count = 0;
         while receiver.try_recv().is_ok() {
             count += 1;
         }
-        assert_eq!(count, 3, "three calls should send three events");
+        assert_eq!(count, 1, "three edits must occupy only one pending slot");
 
         cleanup_temp_dir(&dir);
     }
@@ -691,7 +791,7 @@ target_atr_multiplier = 3.0
         // Specifically tests the warn! path at line 167 (sender.send fails)
         let (dir, file_path) = write_temp_strategy_file(VALID_STRATEGY_TOML);
 
-        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+        let (sender, receiver) = reload_mailbox();
         drop(receiver);
 
         // Valid TOML parses OK, but send() fails because receiver dropped.
@@ -762,7 +862,7 @@ target_atr_multiplier = 3.0
         // Second call: overwrite with invalid TOML -> no event
         // Third call: overwrite with valid TOML -> sends event
         let (dir, file_path) = write_temp_strategy_file(VALID_STRATEGY_TOML);
-        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+        let (sender, receiver) = reload_mailbox();
 
         // First: valid
         handle_file_change(&file_path, &sender);
@@ -821,7 +921,7 @@ target_atr_multiplier = 3.0
         // 2) Overwrite with invalid config → sender gets NO event
         // 3) The consumer still holds the first event (old config preserved)
         let (dir, file_path) = write_temp_strategy_file(VALID_STRATEGY_TOML);
-        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+        let (sender, receiver) = reload_mailbox();
 
         // Initial valid load
         handle_file_change(&file_path, &sender);
@@ -848,7 +948,7 @@ target_atr_multiplier = 3.0
     #[test]
     fn handle_file_change_repeated_sends_on_dropped_receiver_no_panic() {
         let (dir, file_path) = write_temp_strategy_file(VALID_STRATEGY_TOML);
-        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+        let (sender, receiver) = reload_mailbox();
         drop(receiver);
 
         // Multiple calls with valid TOML must not panic despite dropped receiver
@@ -881,7 +981,7 @@ operator = "lt"
 threshold = 0.0
 "#;
         let (dir, file_path) = write_temp_strategy_file(multi);
-        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+        let (sender, receiver) = reload_mailbox();
 
         handle_file_change(&file_path, &sender);
         let event = receiver.try_recv().unwrap();
@@ -951,7 +1051,7 @@ threshold = 25.0
         // Simulate: valid config loaded at startup, then bad TOML on disk,
         // then restored. Old config is retained during the bad window.
         let (dir, file_path) = write_temp_strategy_file(VALID_STRATEGY_TOML);
-        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+        let (sender, receiver) = reload_mailbox();
 
         // Load initial valid config
         handle_file_change(&file_path, &sender);
@@ -987,7 +1087,7 @@ threshold = 25.0
     fn handle_file_change_send_fails_on_dropped_receiver_no_panic() {
         // This tests the warn! branch when sender.send() returns Err.
         let (dir, file_path) = write_temp_strategy_file(VALID_STRATEGY_TOML);
-        let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+        let (sender, receiver) = reload_mailbox();
         drop(receiver); // Drop receiver BEFORE handle_file_change
 
         // Must not panic — the warn! path handles the error
@@ -1039,7 +1139,7 @@ threshold = 25.0
     fn handle_file_change_valid_with_subscriber() {
         with_tracing(|| {
             let (dir, file_path) = write_temp_strategy_file(VALID_STRATEGY_TOML);
-            let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+            let (sender, receiver) = reload_mailbox();
             handle_file_change(&file_path, &sender);
             let event = receiver.try_recv().unwrap();
             assert_eq!(event.strategies.len(), 1);
@@ -1051,7 +1151,7 @@ threshold = 25.0
     fn handle_file_change_invalid_with_subscriber() {
         with_tracing(|| {
             let (dir, file_path) = write_temp_strategy_file("[[[[broken");
-            let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+            let (sender, receiver) = reload_mailbox();
             handle_file_change(&file_path, &sender);
             assert!(receiver.try_recv().is_err());
             cleanup_temp_dir(&dir);
@@ -1062,7 +1162,7 @@ threshold = 25.0
     fn handle_file_change_missing_file_with_subscriber() {
         with_tracing(|| {
             let nonexistent = Path::new("/tmp/tv_nonexistent_subscriber_test.toml");
-            let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+            let (sender, receiver) = reload_mailbox();
             handle_file_change(nonexistent, &sender);
             assert!(receiver.try_recv().is_err());
         });
@@ -1072,7 +1172,7 @@ threshold = 25.0
     fn handle_file_change_dropped_receiver_with_subscriber() {
         with_tracing(|| {
             let (dir, file_path) = write_temp_strategy_file(VALID_STRATEGY_TOML);
-            let (sender, receiver) = mpsc::channel::<ReloadEvent>();
+            let (sender, receiver) = reload_mailbox();
             drop(receiver);
             handle_file_change(&file_path, &sender);
             cleanup_temp_dir(&dir);

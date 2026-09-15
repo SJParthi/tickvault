@@ -136,11 +136,11 @@ impl SubsystemMemoryHandles {
     /// `metrics` crate semantics.
     #[must_use]
     pub fn register() -> Self {
-        // L128 + BUG-L13: pre-warm all 21 TF eviction counters to 0
+        // L128 + BUG-L13: pre-warm the active TF eviction counters to 0
         // so PromQL `sum by (tf)` reports every label from boot.
         let mut eviction_counters = HashMap::with_capacity(Tf::ALL.len());
         for tf in Tf::ALL {
-            let label = tf.as_static_str();
+            let label = tf.display_name();
             // HOT-C2 + SEC-M1: label value is a `&'static str`, no
             // formatting, no allocation.
             let handle: Counter = counter!(IN_MEM_EVICTIONS_COUNTER_NAME, "tf" => label);
@@ -515,11 +515,9 @@ mod tests {
     // ownership / type shape, not the wire-level emit.
 
     #[test]
-    fn handles_register_initializes_all_9_tf_eviction_counters() {
-        // PR #517 (Wave-5 TF reduction, 2026-05-08) reduced the
-        // operator-facing TF set from 21 → 9. The assertion mirrors
-        // `Tf::ALL.len()` so any future symmetric resize (per
-        // `tf_symmetry_guard`) doesn't silently drift.
+    fn handles_register_initializes_all_active_tf_eviction_counters() {
+        // The metric keys must follow the exact active candle registry;
+        // a retired label must not survive through a separate enum.
         let h = SubsystemMemoryHandles::register();
         assert_eq!(
             h.eviction_counters.len(),
@@ -528,8 +526,8 @@ mod tests {
         );
         assert_eq!(
             Tf::ALL.len(),
-            9,
-            "PR #517 pinned the operator-facing TF count at 9; \
+            10,
+            "The current candle contract pins ten timeframe labels; \
              a drift here is a `tf_symmetry_guard` regression."
         );
         for tf in Tf::ALL {

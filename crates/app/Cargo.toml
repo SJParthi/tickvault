@@ -38,6 +38,7 @@ secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 arc-swap = { workspace = true }
+arrayvec = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 rustls = { workspace = true }

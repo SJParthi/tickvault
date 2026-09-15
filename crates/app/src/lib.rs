@@ -95,6 +95,11 @@ pub mod day_ohlc_orchestrator;
 // cross-check retired under 4-IDX_I LOCKED_UNIVERSE (operator lock 2026-05-15).
 // Bhavcopy is NSE_FNO-only; no F&O subscriptions remain to cross-check.
 pub mod boot_helpers;
+/// Exact bucket rankings consuming the canonical candle volume revisions.
+pub mod bucket_top_volume;
+/// Authenticated read-only RAM tables and prepared-winner data checks.
+pub mod candle_top_volume_api;
+pub mod candle_volume_bridge;
 /// The previous close per instrument, fed from the response-code-6 packets
 /// the drain used to decode and discard. Without it the gainer-eligibility
 /// filter has nothing to divide by.
@@ -200,6 +205,8 @@ pub mod rest_candle_fold;
 /// `ShutdownClass`. Fails toward ExternalStop (loud) on any doubt.
 pub mod shutdown_class;
 pub mod spot_price_store;
+/// Timestamped, immutable Top Volume boards for database-free runtime readers.
+pub mod top_volume_runtime;
 /// Projects the in-RAM volume leaderboard into `top_volume_rank` rows —
 /// the pure step between the ranking and the table the operator asked for.
 pub mod top_volume_snapshot;

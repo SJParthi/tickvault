@@ -259,6 +259,10 @@ pub struct ShadowCandleWriter {
     /// and never a seal clock.
     out_of_window: CandleOutOfWindowCounters,
     ilp_conf_string: SecretString,
+    /// SQL reconciliation is used only by the boot recovery owner. Keeping
+    /// this separate from live append prevents per-seal database reads.
+    recovery_exec_url: Option<String>,
+    boot_recovery_exclusive: bool,
 }
 
 impl ShadowCandleWriter {
@@ -292,6 +296,8 @@ impl ShadowCandleWriter {
             pending_count: 0,
             ilp_conf_string: SecretString::from(conf_string),
             out_of_window: CandleOutOfWindowCounters::new(),
+            recovery_exec_url: Some(format!("http://{}:{}/exec", config.host, config.http_port)),
+            boot_recovery_exclusive: false,
         })
     }
 
@@ -308,7 +314,43 @@ impl ShadowCandleWriter {
             pending_count: 0,
             ilp_conf_string: SecretString::from(String::new()),
             out_of_window: CandleOutOfWindowCounters::new(),
+            recovery_exec_url: None,
+            boot_recovery_exclusive: false,
         }
+    }
+
+    /// Only SealWriterRunner::boot_drain may hold this exclusion, before the
+    /// application releases its producer startup barrier. It does not claim
+    /// to exclude independent external database writers.
+    pub(crate) fn set_boot_recovery_exclusive(&mut self, exclusive: bool) {
+        self.boot_recovery_exclusive = exclusive;
+    }
+
+    pub(crate) fn reconcile_recovered_batch(
+        &mut self,
+        seals: &[BufferedSeal],
+    ) -> std::result::Result<
+        crate::seal_recovery_guard::RecoveredBatch,
+        crate::seal_recovery_guard::RecoveryRefusal,
+    > {
+        use crate::seal_recovery_guard::RecoveryRefusal;
+        if !self.boot_recovery_exclusive {
+            return Err(RecoveryRefusal::OrderingUnverified);
+        }
+        let Some(exec_url) = self.recovery_exec_url.clone() else {
+            return Err(RecoveryRefusal::OrderingUnverified);
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return Err(RecoveryRefusal::OrderingUnverified);
+        };
+        if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+            return Err(RecoveryRefusal::OrderingUnverified);
+        }
+        tokio::task::block_in_place(|| {
+            handle.block_on(crate::seal_recovery_guard::reconcile_questdb_batch(
+                self, &exec_url, seals,
+            ))
+        })
     }
 
     /// Returns `true` when the writer holds a live ILP `Sender`.
@@ -452,8 +494,14 @@ impl ShadowCandleWriter {
             .symbol("feed", row.feed)
             .with_context(|| "candle append: symbol(feed) failed")?
             .symbol("segment", row.segment)
-            .with_context(|| "candle append: symbol(segment) failed")?
-            .column_i64("security_id", row.security_id)
+            .with_context(|| "candle append: symbol(segment) failed")?;
+        buf.symbol("volume_basis", row.volume_basis)
+            .with_context(|| "candle append: symbol(volume_basis) failed")?;
+        if let Some(family) = row.ranking_family {
+            buf.symbol("ranking_family", family)
+                .with_context(|| "candle append: symbol(ranking_family) failed")?;
+        }
+        buf.column_i64("security_id", row.security_id)
             .with_context(|| "candle append: column_i64(security_id) failed")?
             .column_f64("open", row.open)
             .with_context(|| "candle append: column_f64(open) failed")?
@@ -488,21 +536,25 @@ impl ShadowCandleWriter {
             .with_context(|| "candle append: column_i64(total_buy_qty) failed")?
             .column_i64("total_sell_qty", row.total_sell_qty)
             .with_context(|| "candle append: column_i64(total_sell_qty) failed")?;
-        // Net volume is the ONE column deliberately omitted rather than
-        // zero-filled when absent. Omitting an ILP column persists NULL, and
-        // NULL is the honest value for "THIS PROCESS DID NOT CLASSIFY THIS
-        // BAR'S FLOW" — a disk-spill replay (the 128-byte record cannot carry
-        // the accumulator), a REST-folded bar, or a bar with no ticks or no
-        // volume. Writing `0` there would claim perfectly balanced buy and sell
-        // flow about a bar nobody measured, and on a chart it draws a FLAT bar
-        // where NULL draws nothing. Two distinct facts, two distinct storages.
-        //
-        // ⚠ CORRECTED 2026-09-10: this said NULL meant "there was no previous
-        // bar to compare against — the day's first bar of this timeframe". That
-        // was true of the retired close-vs-close definition and is false now: a
-        // first bar WITH ticks is classified and reports real flow. The NULL is
-        // a provenance signal, not a calendar one, and reading it as "start of
-        // day" would mislabel every spill-replayed bar in the table.
+        for (column, value) in [
+            ("lot_size", row.lot_size),
+            (
+                "instrument_definition_version",
+                row.instrument_definition_version,
+            ),
+            ("underlying_id", row.underlying_id),
+            ("bucket_revision", row.bucket_revision),
+        ] {
+            if let Some(value) = value {
+                buf.column_i64(column, value)
+                    .with_context(|| format!("candle append: column_i64({column}) failed"))?;
+            }
+        }
+        buf.column_i64("volume_quality", row.volume_quality)
+            .with_context(|| "candle append: column_i64(volume_quality) failed")?;
+        // Unknown sign classification is SQL NULL; zero means a classified
+        // unchanged-close or zero-activity bar. Metadata fields above are likewise
+        // omitted when unavailable, including records recovered from v1/v2.
         if let Some(net_volume) = row.net_volume {
             buf.column_i64("net_volume", net_volume)
                 .with_context(|| "candle append: column_i64(net_volume) failed")?;
@@ -707,7 +759,7 @@ mod tests {
         state.oi = 50_000;
         state.tick_count = 5;
         state.close_pct_from_prev_day = 1.5;
-        state.net_volume_signed = -4_242;
+        state.net_volume_signed = -1234;
         state.net_volume_classified = true;
         state.total_buy_qty = 89_600;
         state.total_sell_qty = 4_800;
@@ -1221,6 +1273,13 @@ mod tests {
         // added later by ONE `Feed` enum edit flows through automatically.
         let mut w = ShadowCandleWriter::for_test();
         let novel_row = ShadowSealRow {
+            volume_basis: tickvault_trading::candles::CANDLE_SIGNED_BAR_VS_ONE_LOT_METRIC,
+            lot_size: None,
+            instrument_definition_version: None,
+            underlying_id: None,
+            ranking_family: None,
+            volume_quality: 1,
+            bucket_revision: None,
             table_name: TfIndex::M1.table_name(),
             timestamp_ist_nanos: 1_716_023_700_i64 * 1_000_000_000,
             security_id: 4242,
@@ -1293,15 +1352,22 @@ mod tests {
     fn test_candle_writer_covers_all_21_tf_tables_for_arbitrary_feed() {
         // OPERATOR SCOPE CLARIFICATION 2026-06-30: the candle path must cover
         // EVERY timeframe table, not just candles_1m — and for ANY feed. Drive one
-        // seal for EVERY TfIndex::ALL (all 21 TFs) tagged an ARBITRARY novel feed
+        // seal for EVERY TfIndex::ALL (all active TFs) tagged an ARBITRARY novel feed
         // and assert each lands in its OWN candles_<tf> table tagged with that feed.
-        // Proves: one common writer → all 21 TF tables, feed stamped verbatim, no
+        // Proves: one common writer → all active TF tables, feed stamped verbatim, no
         // per-TF and no per-feed branch.
         let novel_feed = "future_test_feed";
         let mut seen_tables = std::collections::HashSet::new();
         for tf in TfIndex::ALL {
             let mut w = ShadowCandleWriter::for_test();
             let row = ShadowSealRow {
+                volume_basis: tickvault_trading::candles::CANDLE_SIGNED_BAR_VS_ONE_LOT_METRIC,
+                lot_size: None,
+                instrument_definition_version: None,
+                underlying_id: None,
+                ranking_family: None,
+                volume_quality: 1,
+                bucket_revision: None,
                 table_name: tf.table_name(),
                 timestamp_ist_nanos: 1_716_023_700_i64 * 1_000_000_000,
                 security_id: 4242,
@@ -1335,14 +1401,14 @@ mod tests {
             );
             seen_tables.insert(table);
         }
-        // All 21 distinct candle tables were exercised.
+        // All active candle tables were exercised.
         assert_eq!(
             seen_tables.len(),
             TfIndex::ALL.len(),
-            "every one of the 21 TF candle tables must be covered"
+            "every active TF candle table must be covered"
         );
         assert!(seen_tables.contains("candles_1m"));
-        assert!(seen_tables.contains("candles_1d"));
+        assert!(seen_tables.contains("candles_10m"));
     }
 
     #[test]
@@ -1450,5 +1516,50 @@ mod tests {
             CANDLE_OUT_OF_WINDOW_REASONS[0], CANDLE_OUT_OF_WINDOW_REASONS[1],
             "two reasons must never share a metric label"
         );
+    }
+    #[test]
+    fn wire_persists_bucket_definition_and_preserves_unknown_metadata_as_null() {
+        let mut seal = mk_seal(913, 1, TfIndex::M1, 1_716_023_700, 100.0);
+        let mut unknown = ShadowCandleWriter::for_test();
+        unknown.append_seal(&seal).expect("append unknown");
+        let wire = std::str::from_utf8(unknown.buffer_bytes()).expect("ILP");
+        for absent in [
+            "lot_size=",
+            "instrument_definition_version=",
+            "underlying_id=",
+            "ranking_family=",
+            "bucket_revision=",
+        ] {
+            assert!(
+                !wire.contains(absent),
+                "unknown metadata must remain NULL: {absent}"
+            );
+        }
+        seal.state.metadata = tickvault_trading::candles::CandleMetadata {
+            lot_size: 75,
+            instrument_definition_version: 17,
+            underlying_id: 13,
+            family_code: 2,
+        };
+        seal.state.net_volume_signed = -1234;
+        seal.state.volume_quality = 0;
+        seal.state.bucket_revision = 4;
+        let mut known = ShadowCandleWriter::for_test();
+        known.append_seal(&seal).expect("append pinned");
+        let wire = std::str::from_utf8(known.buffer_bytes()).expect("ILP");
+        for expected in [
+            "ranking_family=index",
+            "volume_basis=signed_bar_volume_vs_one_lot_v3",
+            "lot_size=75i",
+            "instrument_definition_version=17i",
+            "underlying_id=13i",
+            "volume_quality=0i",
+            "bucket_revision=4i",
+        ] {
+            assert!(
+                wire.contains(expected),
+                "missing pinned metadata: {expected}"
+            );
+        }
     }
 }

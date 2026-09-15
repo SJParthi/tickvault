@@ -33,7 +33,8 @@ fi
 # reports: (1) all threshold crates present → must PASS; (2) one threshold
 # crate missing from the report → must FAIL naming it; (3) an extra crate in
 # the report with no explicit floor → must PASS with a WARN naming it;
-# (4) an empty [crates] section → must FAIL (zero-thresholds fail-closed).
+# (4) an empty [crates] section → must FAIL (zero-thresholds fail-closed),
+# followed by measurement-validation and legitimate zero/exact-floor cases.
 # -----------------------------------------------------------------------------
 if [ "${1:-}" = "--self-test" ]; then
   SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
@@ -106,11 +107,48 @@ EOF
     echo "self-test case 4 FAILED: expected non-zero exit + 'parsed 0 entries' (got exit $RC)"; echo "$OUT"; FAILURES=1
   fi
 
+  CASE_COUNT=4
+  expect_measurement() { # <label> <alpha entry> <expected exit: 0 or nonzero>
+    local label="$1" entry="$2" want="$3"
+    CASE_COUNT=$((CASE_COUNT + 1))
+    report "$entry,$(file_entry beta 10 10)" > "$TMP/measurement.json"
+    run_gate "$TMP/measurement.json" "$TMP/thresholds.toml"
+    if { [ "$want" = 0 ] && [ "$RC" -eq 0 ]; } || \
+       { [ "$want" = nonzero ] && [ "$RC" -ne 0 ] && \
+         [[ "$OUT" == *"invalid coverage measurement"* ]]; }; then
+      echo "self-test case $CASE_COUNT ($label): OK"
+    else
+      echo "self-test case $CASE_COUNT FAILED ($label): expected $want, got $RC"
+      echo "$OUT"
+      FAILURES=1
+    fi
+  }
+
+  # Missing counters must never be fabricated as an empty (100%) file.
+  expect_measurement "missing summary rejected" \
+    '{"filename":"/w/crates/alpha/src/lib.rs"}' nonzero
+  expect_measurement "missing count rejected" \
+    '{"filename":"/w/crates/alpha/src/lib.rs","summary":{"lines":{"covered":0}}}' nonzero
+  expect_measurement "missing covered rejected" \
+    '{"filename":"/w/crates/alpha/src/lib.rs","summary":{"lines":{"count":0}}}' nonzero
+  expect_measurement "null count rejected" "$(file_entry alpha null 0)" nonzero
+  expect_measurement "string count rejected" "$(file_entry alpha '"10"' 0)" nonzero
+  expect_measurement "boolean covered rejected" "$(file_entry alpha 10 true)" nonzero
+  expect_measurement "negative total rejected" "$(file_entry alpha -10 0)" nonzero
+  expect_measurement "negative covered rejected" "$(file_entry alpha 10 -1)" nonzero
+  expect_measurement "fractional total rejected" "$(file_entry alpha 10.5 10)" nonzero
+  expect_measurement "fractional covered rejected" "$(file_entry alpha 10 9.5)" nonzero
+  expect_measurement "covered exceeds total rejected" "$(file_entry alpha 10 20)" nonzero
+  expect_measurement "covered on empty file rejected" "$(file_entry alpha 0 1)" nonzero
+  expect_measurement "unsafe integer rejected" "$(file_entry alpha 9007199254740992 0)" nonzero
+  expect_measurement "explicit empty file accepted" "$(file_entry alpha 0 0)" 0
+  expect_measurement "exact threshold accepted" "$(file_entry alpha 10 5)" 0
+
   if [ "$FAILURES" -ne 0 ]; then
     echo "coverage-gate self-test: FAILED"
     exit 1
   fi
-  echo "coverage-gate self-test: all 4 cases passed"
+  echo "coverage-gate self-test: all $CASE_COUNT cases passed"
   exit 0
 fi
 
@@ -166,27 +204,25 @@ fi
 TSV_FILE="$(mktemp)"
 trap 'rm -f "$TSV_FILE"' EXIT
 
-# FAIL CLOSED on a PRESENT null/non-numeric lines.count / lines.covered
-# (review round 2 fix, 2026-07-18): the previous `// 0` turned an explicit
-# JSON null into 0 and let a string ride into awk (where `+0` coerces to 0),
-# so a corrupt report read 100.00% PASS. The old evaluator crashed with a
-# TypeError there (exit 1); restore that fail-closed contract with a named
-# jq error (set -e aborts the gate on jq's non-zero exit). A MISSING key
-# stays 0 — the old evaluator `.get(..., 0)` was equally open there, and the
-# parity contract deliberately keeps missing-key behavior unchanged.
+# Validate before aggregation: missing counters are not empty files, and
+# impossible counts must not cancel out or inflate another file's coverage.
+# Explicit count=covered=0 remains valid for files without executable lines.
+# Bound integers before awk so rounding cannot turn corrupt input into proof.
 jq -r '
-  def req_num($k):
-    (.summary.lines // {}) as $l
-    | if ($l | has($k))
-      then ($l[$k]
-            | if type == "number" then .
-              else error("summary.lines.\($k) is present but \(type) — corrupt coverage JSON; refusing to treat it as 0 (fail closed)") end)
-      else 0 end;
+  def req_count($k):
+    .summary.lines[$k]
+    | if type != "number" then
+        error("invalid coverage measurement: summary.lines.\($k) must be present and numeric")
+      elif . < 0 or . > 9007199254740991 or . != floor then
+        error("invalid coverage measurement: summary.lines.\($k) must be a nonnegative safe integer")
+      else . end;
   (.data // [])[]
   | (.files // [])[]
-  | [ (.filename // ""),
-      req_num("count"),
-      req_num("covered") ]
+  | req_count("count") as $count
+  | req_count("covered") as $covered
+  | if $covered > $count then
+      error("invalid coverage measurement: covered exceeds count for \(.filename)")
+    else [ (.filename // ""), $count, $covered ] end
   | @tsv
 ' "$COVERAGE_JSON" > "$TSV_FILE"
 

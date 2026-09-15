@@ -25,13 +25,13 @@ variable "environment" {
 }
 
 variable "instance_type" {
-  description = "EC2 instance type. MUST be r8g.xlarge per operator lock 2026-08-08 (Graviton4 memory-optimised, 4 vCPU / 32 GiB; see daily-universe-scope-expansion-2026-05-27.md §7 Quote 13, which supersedes the 2026-08-07 t4g.large + 2026-07-15 t4g.medium + 2026-06-30 r8g.large + 2026-05-29 m8g.large locks). Sized for the 13-timeframe (1s/5s/10s/15s/30s + 1m/2m/3m/5m/15m/30m/60m + 1d) current-day workload WITH raw-tick retention at ~25,000 instruments: 13 TF x 128 B LiveCandleState x 25k = 42 MB, seal ring 29 MB, a day of ticks 2.3-7.2 GB, QuestDB 8-16 GB, app+OS 6-12 GB => 14-31 GB in 32 GiB. `r` (8 GiB/vCPU) because the workload is memory-bound: m8g would force buying unused CPU to reach the same RAM, r8gd's local NVMe is WIPED on every stop (the box stops daily), and r8i would force an x86 rebuild of the whole ARM pipeline. NOTE the AZ pin was removed in the same change — see var.availability_zone; the 2026-08-07 type-only flip failed with InsufficientInstanceCapacity precisely because it left the pin in place."
+  description = "EC2 instance type. MUST be r8g.xlarge per operator lock 2026-08-08 (Graviton4 memory-optimised, 4 vCPU / 32 GiB; see daily-universe-scope-expansion-2026-05-27.md §7 Quote 13, which supersedes the 2026-08-07 t4g.large + 2026-07-15 t4g.medium + 2026-06-30 r8g.large + 2026-05-29 m8g.large locks). The current application contract is exactly ten candle frames (1s, 3s, 5s, 1m, 3m, 5m, 10m, 15m, 30m, 60m) and four Top Volume frames (1s, 3s, 5s, 1m), shared with config/base.toml and the Rust registries. The original 13-frame sizing is historical, not a memory or latency guarantee for this build; validate the current workload on AWS before claiming capacity. The existing instance type, architecture and resource limits remain unchanged. NOTE the AZ pin was removed in the original instance-type change — see var.availability_zone; the 2026-08-07 type-only flip failed with InsufficientInstanceCapacity precisely because it left the pin in place."
   type        = string
   default     = "r8g.xlarge"
 
   validation {
     condition     = var.instance_type == "r8g.xlarge"
-    error_message = "Instance type is pinned to r8g.xlarge (Graviton4, 4 vCPU / 32 GiB) per operator lock 2026-08-08 (Quote 13 — the 13-timeframe + current-day tick-retention requirement). This SUPERSEDES the 2026-08-07 t4g.large lock. See daily-universe-scope-expansion-2026-05-27.md section 7."
+    error_message = "Instance type is pinned to r8g.xlarge (Graviton4, 4 vCPU / 32 GiB) per operator lock 2026-08-08 (Quote 13). The current application uses ten candle frames and four Top Volume frames; narrowing those sets does not change this instance-type lock. This SUPERSEDES the 2026-08-07 t4g.large lock. See daily-universe-scope-expansion-2026-05-27.md section 7."
   }
 }
 
@@ -85,9 +85,13 @@ variable "ebs_gp3_size_gb" {
   }
 }
 
-# 2026-08-08 (operator Quote 13) — DEFAULT RAISED 20 -> 100 GB.
+# HISTORICAL sizing note, 2026-08-08 (operator Quote 13) — default then
+# raised 20 -> 100 GB. This is not the current timeframe or capacity contract;
+# current defaults are declared above. Current application scope is ten candle
+# frames and four Top Volume frames, as listed in var.instance_type.
 #
-# Sized for the 13-timeframe (1s/5s/10s/15s/30s + 1m/2m/3m/5m/15m/30m/60m + 1d)
+# The historical estimate used 13 timeframes (1s/5s/10s/15s/30s +
+# 1m/2m/3m/5m/15m/30m/60m + 1d), not the current active set, and a
 # current-day workload WITH raw-tick retention at ~25,000 instruments:
 #   ticks     ~25-80 M rows/day (ASSUMED - swings the estimate 3x) => 44-141 GB/mo
 #   13 TFs    ~46 M rows/day sparse                               => ~61 GB/mo
@@ -133,13 +137,13 @@ variable "key_name" {
 }
 
 variable "operator_cidr" {
-  description = "CIDR that may SSH into the instance. Tighten to your home/office IP."
+  description = "Optional IPv4 CIDR allowed to SSH. Empty disables inbound SSH; use SSM Session Manager. Public /0 access is rejected."
   type        = string
-  default     = "0.0.0.0/0"
+  default     = ""
 
   validation {
-    condition     = length(var.operator_cidr) > 0
-    error_message = "operator_cidr must be a non-empty CIDR (e.g. 203.0.113.42/32)"
+    condition     = var.operator_cidr == "" ? true : try(can(cidrnetmask(var.operator_cidr)) && tonumber(split("/", var.operator_cidr)[1]) > 0, false)
+    error_message = "operator_cidr must be empty (SSM only) or a valid restricted IPv4 CIDR such as 203.0.113.42/32; /0 is prohibited."
   }
 }
 

@@ -47,6 +47,9 @@ fn tick_at(ts: u32, ltp: f32) -> ParsedTick {
         exchange_segment_code: 2,
         exchange_timestamp: ts,
         last_traded_price: ltp,
+        // A live tick carries a real UTC receipt. The no-receipt legacy path
+        // may fold locally but must not seed the shared candle watermark.
+        received_at_nanos: (i64::from(ts) - 19_800) * 1_000_000_000,
         ..Default::default()
     }
 }
@@ -162,25 +165,55 @@ fn a_stale_tick_does_not_move_the_watermark() {
         None,
         |_, _, _, _, _| {},
     );
-    agg.consume_tick(
-        Feed::Dhan,
-        &tick_at(ist_at(TODAY - 10, 11, 0, 0), 50.0),
-        None,
-        |_, _, _, _, _| {},
-    );
+    let mut stale = tick_at(ist_at(TODAY - 10, 11, 0, 0), 50.0);
+    stale.received_at_nanos = 0;
+    let refused = agg.consume_tick(Feed::Dhan, &stale, None, |_, _, _, _, _| {});
+    assert!(refused.stale_trading_day);
 
     // If the watermark had regressed, this second stale tick would now be
     // "current" and would fold.
-    let s = agg.consume_tick(
-        Feed::Dhan,
-        &tick_at(ist_at(TODAY - 9, 11, 0, 0), 51.0),
-        None,
-        |_, _, _, _, _| {},
-    );
+    let mut stale = tick_at(ist_at(TODAY - 9, 11, 0, 0), 51.0);
+    stale.received_at_nanos = 0;
+    let s = agg.consume_tick(Feed::Dhan, &stale, None, |_, _, _, _, _| {});
     assert!(
         s.stale_trading_day,
         "the watermark must not have regressed to the stale tick's day"
     );
+}
+
+#[test]
+fn a_clockless_replay_cannot_seed_a_future_watermark() {
+    let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 8);
+    let mut replay = tick_at(ist_at(TODAY + 1, 11, 0, 0), 99.0);
+    replay.received_at_nanos = 0;
+    let replay_stats = agg.consume_tick(Feed::Dhan, &replay, None, |_, _, _, _, _| {});
+    assert!(
+        replay_stats.folded(),
+        "legacy replay can still fold its local bucket"
+    );
+
+    // A different instrument isolates global watermark poisoning from the
+    // replayed instrument's local out-of-order bucket state.
+    let mut live = tick_at(ist_at(TODAY, 11, 0, 0), 100.0);
+    live.security_id += 1;
+    let s = agg.consume_tick(Feed::Dhan, &live, None, |_, _, _, _, _| {});
+    assert!(
+        s.folded(),
+        "an unverified replay clock must not refuse today's live tick"
+    );
+    assert!(!s.stale_trading_day);
+}
+
+#[test]
+fn a_live_stale_snapshot_is_refused_before_any_watermark_exists() {
+    let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 8);
+    let mut stale = tick_at(ist_at(TODAY - 1, 15, 39, 41), 99.0);
+    stale.received_at_nanos = (i64::from(ist_at(TODAY, 9, 15, 0)) - 19_800) * 1_000_000_000;
+    let s = agg.consume_tick(Feed::Dhan, &stale, None, |_, _, _, _, _| {});
+    assert!(s.stale_trading_day);
+    assert!(!s.folded());
+    assert!(!s.refused_timestamp && !s.refused_price && !s.slot_exhausted);
+    assert_eq!(s.sealed_count, 0);
 }
 
 #[test]
@@ -431,9 +464,25 @@ fn the_late_discard_is_counted_and_not_merely_tallied_into_a_dropped_struct() {
     // assertion rather than to read it.
     let production = src.split("#[cfg(test)]\nmod tests").next().unwrap_or(src);
 
-    let arm = production
-        .find("ConsumeOutcome::DiscardLate =>")
-        .expect("the late-discard arm must exist");
+    // The attribution pre-pass also matches `Updated | DiscardLate => false`.
+    // It is not the accounting arm: select a block immediately after the
+    // arrow, rather than borrowing the next unrelated block in the file.
+    let marker = "ConsumeOutcome::DiscardLate =>";
+    let mut arms = production
+        .match_indices(marker)
+        .filter(|(offset, _)| {
+            production[*offset + marker.len()..]
+                .trim_start()
+                .starts_with('{')
+        })
+        .map(|(offset, _)| offset);
+    let arm = arms
+        .next()
+        .expect("the late-discard accounting block must exist");
+    assert!(
+        arms.next().is_none(),
+        "each additional discard accounting block needs its own metric assertion"
+    );
     // The arm's ACTUAL block, by brace matching — not a fixed byte window.
     //
     // A byte window is a proximity assertion, and proximity is not the

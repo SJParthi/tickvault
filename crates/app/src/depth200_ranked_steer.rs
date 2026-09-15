@@ -270,7 +270,7 @@ mod tests {
             security_id: id,
             segment: FNO,
             underlying_id: underlying,
-            window_lots_milli: lots,
+            window_lots_milli: i128::from(lots),
         }
     }
 

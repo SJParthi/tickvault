@@ -226,6 +226,7 @@ pub mod pnl_audit_persistence;
 pub mod questdb_health;
 pub mod seal_absorption;
 pub mod seal_dlq;
+pub mod seal_recovery_guard;
 pub mod seal_spill;
 pub mod seal_writer_loop;
 pub mod seal_writer_runner;

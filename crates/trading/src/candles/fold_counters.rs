@@ -2,7 +2,7 @@
 //!
 //! # Why this exists
 //!
-//! `AggregatorCell::fold` runs **24 times per tick** — once per timeframe —
+//! `AggregatorCell::fold` runs **TF_COUNT times per tick** — once per timeframe —
 //! and `MultiTfAggregator::consume_tick` drives it from the frame drain. The
 //! anomaly counters inside that fold were calling the `metrics::counter!`
 //! MACRO directly at 16 sites across two files.
@@ -67,11 +67,6 @@ pub(crate) struct FoldCounters {
     /// the units land; see `aggregator_cell::UnattributedCarry`.
     pub(crate) volume_carried_unattributed: metrics::Counter,
     pub(crate) cumulative_regression: metrics::Counter,
-    /// A cumulative counter that fell so far it cannot be a stale packet:
-    /// a `u32` wrap past `u32::MAX`, or a day rollover restarting near zero.
-    /// Counted SEPARATELY from `cumulative_regression` because the remedy is
-    /// the opposite one — re-anchor, never refuse.
-    pub(crate) cumulative_reanchored: metrics::Counter,
     pub(crate) slot_exhausted: metrics::Counter,
     pub(crate) slot_volume_baseline_seeded: metrics::Counter,
     /// `tick_refused` carries a `reason` label with **SEVEN** distinct values.
@@ -117,7 +112,7 @@ pub(crate) struct FoldCounters {
     /// that timeframe's bucket and was dropped.
     ///
     /// Counted per (tick, timeframe) pair, NOT per tick — one tick can be
-    /// placeable in the 1-day bar and hopeless for the 1-second one, and
+    /// placeable in the 60-minute bar and hopeless for the 1-second one, and
     /// collapsing that to a per-tick number would hide exactly which frames
     /// are losing data.
     ///
@@ -175,7 +170,6 @@ impl FoldCounters {
                 "tv_candle_volume_carried_unattributed_total"
             ),
             cumulative_regression: metrics::counter!("tv_aggregator_cumulative_regression_total"),
-            cumulative_reanchored: metrics::counter!("tv_aggregator_cumulative_reanchored_total"),
             slot_exhausted: metrics::counter!("tv_aggregator_slot_exhausted_total"),
             slot_volume_baseline_seeded: metrics::counter!(
                 "tv_aggregator_slot_volume_baseline_seeded_total"
@@ -241,6 +235,10 @@ pub(crate) fn fold_counters() -> &'static FoldCounters {
     static HANDLES: OnceLock<FoldCounters> = OnceLock::new();
     HANDLES.get_or_init(|| {
         let resolved = FoldCounters::resolve();
+        // Retain the retired heuristic's metric name as a zero baseline for
+        // existing dashboards. Counter decreases are now ambiguous, not proof
+        // of a reset, so no live fold handle or synthetic event is warranted.
+        metrics::counter!("tv_aggregator_cumulative_reanchored_total").increment(0);
         // Seed the late-discard series at zero, once, when the fold's handles
         // are first resolved.
         //
@@ -391,7 +389,7 @@ mod tests {
             std::ptr::eq(a, b),
             "fold_counters() must return the SAME cached struct — a fresh \
              resolve per call re-introduces the sharded-registry lookup on \
-             the 24-times-per-tick path"
+             the fixed-timeframe per-tick path"
         );
     }
 

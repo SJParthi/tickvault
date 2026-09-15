@@ -1,0 +1,318 @@
+name: Release Validation
+
+# Runs while a PR is still a draft. Keep it a draft until both this status and
+# CI / All Green pass on its final head. This workflow never deploys anything.
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Exact 40-character commit to validate; never a branch or tag.
+        required: true
+        type: string
+    outputs:
+      source_sha:
+        description: Commit accepted by both release validation jobs.
+        value: ${{ jobs.release-validation.outputs.source_sha }}
+      source_tree:
+        description: Identical source tree accepted by both release validation jobs.
+        value: ${{ jobs.release-validation.outputs.source_tree }}
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Called runs belong to their caller's run, never to the standalone PR
+  # concurrency group (or the CI/deploy caller's own concurrency group).
+  group: release-validation-${{ contains(toJSON(inputs), '"source_sha"') && format('called-{0}', github.run_id) || format('standalone-{0}', github.ref) }}
+  cancel-in-progress: ${{ !contains(toJSON(inputs), '"source_sha"') }}
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_BUILD_JOBS: 2
+  RUST_BACKTRACE: 1
+  SOURCE_SHA: ${{ inputs.source_sha || github.event.pull_request.head.sha || github.sha }}
+  # An explicitly empty workflow_call input must fail, never silently take
+  # the standalone fallback. Only workflow_call declares this input key.
+  SOURCE_INPUT_PRESENT: ${{ contains(toJSON(inputs), '"source_sha"') }}
+  REQUESTED_SOURCE_SHA: ${{ inputs.source_sha || '' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  arm64:
+    name: Release ARM64 Build
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 75
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+      source_tree: ${{ steps.source.outputs.tree }}
+    steps:
+      - name: Checkout the exact candidate commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+
+      - name: Record and verify source identity
+        id: source
+        run: |
+          set -euo pipefail
+          if [ "$SOURCE_INPUT_PRESENT" = true ]; then
+            [[ "$REQUESTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+            test "$SOURCE_SHA" = "$REQUESTED_SOURCE_SHA"
+          fi
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          SOURCE_TREE=$(git rev-parse HEAD^{tree})
+          [[ "$SOURCE_TREE" =~ ^[0-9a-f]{40}$ ]]
+          printf 'sha=%s\ntree=%s\n' "$SOURCE_SHA" "$SOURCE_TREE" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/release-arm64"
+          jq -n --arg sha "$SOURCE_SHA" --arg tree "$SOURCE_TREE" \
+            '{source_sha:$sha,source_tree:$tree,target:"aarch64-unknown-linux-musl"}' \
+            > "$RUNNER_TEMP/release-arm64/source.json"
+
+      - name: Install the release Rust toolchain and musl target
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: '1.95.0'
+          targets: aarch64-unknown-linux-musl
+
+      - name: Install ARM64 release build dependencies
+        # Same packages and mirror fallback as deploy-aws.yml. This changes
+        # only the disposable GitHub runner, never an AWS instance.
+        run: |
+          set -euo pipefail
+          apt_install() {
+            sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=15 \
+              -o Acquire::https::Timeout=15 -o Acquire::ForceIPv4=true update \
+              && sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=15 \
+                -o Acquire::https::Timeout=15 -o Acquire::ForceIPv4=true \
+                install -y --no-install-recommends \
+                cmake build-essential pkg-config musl-tools musl-dev
+          }
+          set_ports_mirror() {
+            local target="$1"
+            for source_file in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
+              if [ -f "$source_file" ]; then
+                sudo sed -i -E "s|https?://(azure\.)?ports\.ubuntu\.com|${target}|g" "$source_file"
+              fi
+            done
+          }
+          if apt_install; then exit 0; fi
+          set_ports_mirror 'http://azure.ports.ubuntu.com'
+          if apt_install; then exit 0; fi
+          set_ports_mirror 'https://ports.ubuntu.com'
+          apt_install
+
+      - name: Cache ARM64 release compilation
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-validation-arm64-musl
+          cache-on-failure: true
+
+      - name: Build all three release binaries from the locked dependency graph
+        env:
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          TICKVAULT_BUILD_GIT_SHA: ${{ env.SOURCE_SHA }}
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --target aarch64-unknown-linux-musl \
+            -p tickvault-app --bin tickvault --bin smoke_test
+          cargo build --locked --release --target aarch64-unknown-linux-musl \
+            -p tickvault-storage --bin tv-wal-sequence-migrate
+
+      - name: Verify ARM64 artifacts and run the isolated config smoke check
+        run: |
+          set -euo pipefail
+          BIN_DIR="$GITHUB_WORKSPACE/target/aarch64-unknown-linux-musl/release"
+          for binary in tickvault smoke_test tv-wal-sequence-migrate; do
+            file "$BIN_DIR/$binary" | tee -a "$RUNNER_TEMP/release-arm64/artifacts.txt"
+            file "$BIN_DIR/$binary" | grep -Eq 'aarch64|ARM'
+            file "$BIN_DIR/$binary" | grep -q 'statically linked'
+            sha256sum "$BIN_DIR/$binary" >> "$RUNNER_TEMP/release-arm64/artifacts.sha256"
+          done
+          test "$(stat -c%s "$BIN_DIR/tickvault")" -le 31457280
+          timeout 10 "$BIN_DIR/tv-wal-sequence-migrate" --help >/dev/null
+          mkdir -p "$RUNNER_TEMP/release-smoke/config"
+          cp config/base.toml config/production.toml "$RUNNER_TEMP/release-smoke/config/"
+          (
+            cd "$RUNNER_TEMP/release-smoke"
+            TV_ENVIRONMENT=prod timeout 40 "$BIN_DIR/smoke_test" --duration 30
+          ) 2>&1 | tee "$RUNNER_TEMP/release-arm64/smoke.log"
+          git diff --exit-code
+          printf 'ARM64 build and isolated config smoke passed for `%s`. No app service was started.\n' \
+            "$SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save ARM64 validation evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-arm64-evidence-${{ env.SOURCE_SHA }}
+          path: ${{ runner.temp }}/release-arm64/
+          if-no-files-found: error
+          retention-days: 7
+
+  questdb:
+    name: Release Isolated QuestDB
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+      source_tree: ${{ steps.source.outputs.tree }}
+    env:
+      QDB_CONTAINER: tickvault-release-questdb
+      VIEW_SQL_FIXTURE: console_views::candle_top_volume_views::tests::candle_top_volume_questdb_duplicate_labels_preserve_one_row_per_candle
+      RECOVERY_SQL_FIXTURE: seal_recovery_guard::tests::isolated_questdb_recovery_inserts_skips_and_refuses_conflicts
+    steps:
+      - name: Checkout the exact candidate commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+
+      - name: Record and verify source identity
+        id: source
+        run: |
+          set -euo pipefail
+          if [ "$SOURCE_INPUT_PRESENT" = true ]; then
+            [[ "$REQUESTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+            test "$SOURCE_SHA" = "$REQUESTED_SOURCE_SHA"
+          fi
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          SOURCE_TREE=$(git rev-parse HEAD^{tree})
+          [[ "$SOURCE_TREE" =~ ^[0-9a-f]{40}$ ]]
+          printf 'sha=%s\ntree=%s\n' "$SOURCE_SHA" "$SOURCE_TREE" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/release-questdb"
+          jq -n --arg sha "$SOURCE_SHA" --arg tree "$SOURCE_TREE" \
+            '{source_sha:$sha,source_tree:$tree,target:"x86_64-unknown-linux-gnu"}' \
+            > "$RUNNER_TEMP/release-questdb/source.json"
+
+      - name: Install the repository Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: '1.95.0'
+
+      - name: Cache SQL fixture compilation
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-validation-questdb
+          cache-on-failure: true
+
+      - name: Compile the explicit ignored SQL fixtures
+        env:
+          TICKVAULT_BUILD_GIT_SHA: ${{ env.SOURCE_SHA }}
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tickvault-storage --lib --no-run
+
+      - name: Start an isolated database from the repository image pin
+        run: |
+          set -euo pipefail
+          # Read the effective literal image, never a comment or a caller URL.
+          QDB_IMAGE=$(awk '$1 == "image:" && $2 ~ /^questdb\/questdb:/ { print $2 }' \
+            deploy/docker/docker-compose.yml)
+          [[ "$QDB_IMAGE" =~ ^questdb/questdb:[0-9]+\.[0-9]+\.[0-9]+@sha256:[0-9a-f]{64}$ ]]
+          printf '%s\n' "$QDB_IMAGE" > "$RUNNER_TEMP/release-questdb/image.txt"
+          docker run --detach --name "$QDB_CONTAINER" --platform linux/amd64 \
+            --publish 127.0.0.1::9000 --memory 2g --cpus 2 \
+            "$QDB_IMAGE"
+          docker inspect --format '{{.Image}}' "$QDB_CONTAINER" \
+            > "$RUNNER_TEMP/release-questdb/image-id.txt"
+          QDB_BINDING=$(docker port "$QDB_CONTAINER" 9000/tcp)
+          [[ "$QDB_BINDING" =~ ^127\.0\.0\.1:[0-9]+$ ]]
+          QDB_EXEC_URL="http://$QDB_BINDING/exec"
+          printf 'TICKVAULT_ISOLATED_QUESTDB_EXEC_URL=%s\n' "$QDB_EXEC_URL" >> "$GITHUB_ENV"
+          ready=false
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error --max-time 2 --get \
+              --data-urlencode 'query=SELECT 1' "$QDB_EXEC_URL" \
+              | jq -e '.dataset == [[1]]' >/dev/null; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = true
+
+      - name: Execute each ignored SQL fixture and require one passing test each
+        run: |
+          set -euo pipefail
+          [[ "$TICKVAULT_ISOLATED_QUESTDB_EXEC_URL" =~ ^http://127\.0\.0\.1:[0-9]+/exec$ ]]
+          fixture_index=0
+          for fixture in "$VIEW_SQL_FIXTURE" "$RECOVERY_SQL_FIXTURE"; do
+            fixture_index=$((fixture_index + 1))
+            fixture_log="$RUNNER_TEMP/release-questdb/fixture-$fixture_index.log"
+            printf 'Running exact isolated fixture: %s\n' "$fixture" | tee "$fixture_log"
+            cargo test --locked -p tickvault-storage --lib "$fixture" \
+              -- --ignored --exact --nocapture --test-threads=1 \
+              2>&1 | tee -a "$fixture_log"
+            grep -Fxq 'running 1 test' "$fixture_log"
+            grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$fixture_log"
+          done
+          test "$fixture_index" = 2
+          git diff --exit-code
+          printf 'The isolated candle-view and recovery SQL fixtures passed for `%s`. This is not a production migration or latency test.\n' \
+            "$SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect and remove only this disposable database
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/release-questdb"
+          if docker container inspect "$QDB_CONTAINER" >/dev/null 2>&1; then
+            docker logs "$QDB_CONTAINER" > "$RUNNER_TEMP/release-questdb/container.log" 2>&1 || true
+            docker rm --force --volumes "$QDB_CONTAINER"
+          fi
+
+      - name: Save isolated SQL validation evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-questdb-evidence-${{ env.SOURCE_SHA }}
+          path: ${{ runner.temp }}/release-questdb/
+          if-no-files-found: error
+          retention-days: 7
+
+  release-validation:
+    name: Release Validation Complete
+    needs: [arm64, questdb]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      source_sha: ${{ steps.accepted.outputs.sha }}
+      source_tree: ${{ steps.accepted.outputs.tree }}
+    steps:
+      - name: Require both successful jobs on the same exact candidate tree
+        id: accepted
+        env:
+          ARM_RESULT: ${{ needs.arm64.result }}
+          QDB_RESULT: ${{ needs.questdb.result }}
+          ARM_SHA: ${{ needs.arm64.outputs.source_sha }}
+          QDB_SHA: ${{ needs.questdb.outputs.source_sha }}
+          ARM_TREE: ${{ needs.arm64.outputs.source_tree }}
+          QDB_TREE: ${{ needs.questdb.outputs.source_tree }}
+        run: |
+          set -euo pipefail
+          # Keep explicit length and failure exits: older Bash may continue
+          # after a failed [[ ... ]] even with errexit enabled.
+          test "${#SOURCE_SHA}" -eq 40
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          test "$ARM_RESULT" = success
+          test "$QDB_RESULT" = success
+          test "$ARM_SHA" = "$SOURCE_SHA"
+          test "$QDB_SHA" = "$SOURCE_SHA"
+          test "${#ARM_TREE}" -eq 40
+          [[ "$ARM_TREE" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          test "$ARM_TREE" = "$QDB_TREE"
+          printf 'sha=%s\ntree=%s\n' "$SOURCE_SHA" "$ARM_TREE" >> "$GITHUB_OUTPUT"
+          printf 'Release validation passed for commit `%s`, tree `%s`: ARM64 static build/config smoke and isolated candle-view/recovery SQL. CI / All Green and remaining release gates are still required.\n' \
+            "$SOURCE_SHA" "$ARM_TREE" >> "$GITHUB_STEP_SUMMARY"

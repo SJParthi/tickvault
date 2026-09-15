@@ -141,12 +141,15 @@ resource "aws_security_group" "tv_app" {
   description = "DLT app: SSH from operator, egress to Dhan + AWS services"
   vpc_id      = aws_vpc.dlt.id
 
-  ingress {
-    description = "SSH from operator"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = [var.operator_cidr]
+  dynamic "ingress" {
+    for_each = var.operator_cidr == "" ? [] : [var.operator_cidr]
+    content {
+      description = "SSH from operator"
+      from_port   = 22
+      to_port     = 22
+      protocol    = "tcp"
+      cidr_blocks = [ingress.value]
+    }
   }
 
   # B4 QuestDB console (questdb-console.tf): the console's VPC back-Lambda

@@ -61,18 +61,23 @@ q "SELECT max(n) peak_ticks_in_one_second
 echo
 echo "-- 3. SECOND BARS: sparse reality vs the dense assumption ------"
 echo "   dense would be instruments x 23,100. Measured is what actually opened."
-for tf in 1 5 10 15 30; do
-  printf '   candles_s%-3s ' "$tf"
+# The active second-level candle frames from the common runtime registry.
+for tf in 1s 3s 5s; do
+  printf '   candles_%-3s ' "$tf"
   q "SELECT count() bars, count_distinct(security_id) instruments
-     FROM candles_s${tf}
+     FROM candles_${tf}
      WHERE ts >= '${FROM}' AND ts <= '${TO}'" || echo "   (table absent)"
 done
 
 echo
 echo "-- 4. MINUTE BARS ----------------------------------------------"
-q "SELECT count() bars_1m, count_distinct(security_id) instruments
-   FROM candles_1m
-   WHERE ts >= '${FROM}' AND ts <= '${TO}' AND feed = 'dhan'"
+# Include every active minute-level frame, including the new 10m frame.
+for tf in 1m 3m 5m 10m 15m 30m 60m; do
+  printf '   candles_%-3s ' "$tf"
+  q "SELECT count() bars, count_distinct(security_id) instruments
+     FROM candles_${tf}
+     WHERE ts >= '${FROM}' AND ts <= '${TO}' AND feed = 'dhan'" || echo "   (table absent)"
+done
 
 echo
 echo "-- 5. DEPTH: the dominant term, and the one never measured -----"
@@ -100,7 +105,7 @@ echo " HOW TO TURN THESE INTO RAM BYTES"
 echo "--------------------------------------------------------------"
 echo " ticks      : total_ticks        x 32 B   (compact record)"
 echo " sec bars   : sum(section 3)     x 48 B   (RamBar, test-pinned)"
-echo " min bars   : bars_1m + coarser  x 48 B"
+echo " min bars   : sum(section 4)     x 48 B"
 echo " depth      : (rows / levels/2)  x 168 B  d5"
 echo "                                 x 648 B  d20"
 echo "                                 x 6400 B d200"

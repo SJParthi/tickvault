@@ -1,0 +1,1802 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-14T04:07:50.834849+00:00",
+  "source_root": "/workspace/scratch/81296451ef3b/tickvault-audit",
+  "baseline_commit": "af77fb0698aeb4414136767e4907593e90ac1ddf",
+  "candidate_state": "Exact-ranking/runtime/SQL follow-up inspected; final source identity and validation are recorded in the current report.",
+  "overall": "Source-grounded architecture dictionary. This is not proof of running AWS behavior, database parity, order execution, every-tick capture or universal O(1).",
+  "conclusions": [
+    "Yes: reading the already-published highest row can avoid the DB and stay constant in board length.",
+    "No: building all rankings, processing all input, emitting all rows and all timeframes cannot be independent of their sizes.",
+    "The current volume percentage uses one lot as baseline; it is not growth versus previous candle.",
+    "Candidate exact ratio ranking resolves rounded ties; display columns remain quantized.",
+    "Four ranking cadences and separate stock/index families;24 computed candle frames but12 emitted frames.",
+    "Snapshot sweep time and candle bucket time are different; precise every-bucket parity remains unimplemented.",
+    "No production automated trading reader, top-volume API or dedicated frontend found."
+  ],
+  "formulas": {
+    "exact_score_pct": "100 * (delta_units / lot_size - 1)",
+    "window_lots_milli": "floor(delta_units * 1000 / lot_size)",
+    "stored_milli_pct": "window_lots_milli * 100 - 100000",
+    "display_pct": "stored_milli_pct / 1000",
+    "different_previous_window_definition": "100 * (current_window_volume - previous_window_volume) / previous_window_volume; undefined when previous_window_volume=0 unless policy says otherwise",
+    "precision_note": "Exact score sorting does not make its rounded display exact. Keep numerator/denominator for audit."
+  },
+  "base_table": {
+    "name": "top_volume",
+    "legacy_name": "top_volume_rank",
+    "column_count": 15,
+    "dedup": [
+      "ts",
+      "tf",
+      "family",
+      "feed",
+      "security_id",
+      "segment"
+    ],
+    "partition": "HOUR",
+    "rank_column": "Not in current create/append/view. Legacy existing column is not automatically dropped.",
+    "fields": [
+      {
+        "name": "ts",
+        "type": "TIMESTAMP",
+        "unit": "IST wall-clock convention; ILP input nanoseconds; values on whole cadence boundary",
+        "purpose": "Identify the published snapshot. It is not the source tick timestamp and not a candle-open timestamp.",
+        "populated_by": "snapshot_top_volume passes now_ist_nanos(); floor_to_grid rounds down to the cadence grid anchored at 09:00 IST. Projection uses the same floor.",
+        "missing_or_edge": "The label does not encode actual observed interval start/end or missed sweeps. A delayed sweep combines deltas since the previous sweep. RAM refuses nonpositive/off-grid/older values; same-boundary replacement is permitted.",
+        "ordering_role": "Newest snapshot DESC before per-family ranking; part of UPSERT identity",
+        "example": "09:15:05 for a 5s snapshot",
+        "source_refs": [
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+            "symbol": "LiveIngest::snapshot_top_volume"
+          },
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/top_volume_snapshot.rs",
+            "symbol": "floor_to_grid"
+          },
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/top_volume_runtime.rs",
+            "symbol": "TopVolumeRuntime::publish_snapshot"
+          }
+        ],
+        "evidence": "source-inspected; live candidate verification pending"
+      },
+      {
+        "name": "tf",
+        "type": "SYMBOL",
+        "unit": "1s, 3s, 5s, 1m",
+        "purpose": "Tell which independent cumulative baseline produced the row.",
+        "populated_by": "SnapshotCadence::as_str; four cadence timers feed four per-contract baseline slots.",
+        "missing_or_edge": "These are the only ranking cadences. The24 candle variants do not automatically create24 ranking boards.",
+        "ordering_role": "Part of UPSERT identity and per-cadence view filter",
+        "example": "5s",
+        "source_refs": [
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/top_volume_rank_persistence.rs",
+            "symbol": "SnapshotCadence"
+          },
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/volume_leaderboard.rs",
+            "symbol": "Tracked.baseline"
+          }
+        ],
+        "evidence": "source-inspected; live candidate verification pending"
+      },
+      {
+        "name": "family",
+        "type": "SYMBOL",
+        "unit": "stock or index",
+        "purpose": "Keep stock and index option populations separate.",
+        "populated_by": "ContractOwner family is passed to VolumeLeaderboard::observe; snapshot loop publishes Index and Stock independently; OptionFamily::as_str stores label.",
+        "missing_or_edge": "There is no combined all-options winner. Family is not a price/volume signal.",
+        "ordering_role": "Family ASC separates boards; part of UPSERT identity",
+        "example": "stock",
+        "source_refs": [
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/volume_leaderboard.rs",
+            "symbol": "OptionFamily"
+          },
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+            "symbol": "LiveIngest::observe_for_ranking"
+          }
+        ],
+        "evidence": "source-inspected; live candidate verification pending"
+      },
+      {
+        "name": "feed",
+        "type": "SYMBOL",
+        "unit": "broker label",
+        "purpose": "Preserve source provenance and avoid identity collisions between brokers.",
+        "populated_by": "SNAPSHOT_FEED constant currently dhan.",
+        "missing_or_edge": "A second feed is not automatically covered. Current producer supplies only Dhan.",
+        "ordering_role": "Part of UPSERT identity; final SQL tie key",
+        "example": "dhan",
+        "source_refs": [
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/top_volume_snapshot.rs",
+            "symbol": "SNAPSHOT_FEED"
+          },
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/top_volume_rank_persistence.rs",
+            "symbol": "DEDUP_KEY_TOP_VOLUME_RANK"
+          }
+        ],
+        "evidence": "source-inspected; live candidate verification pending"
+      },
+      {
+        "name": "segment",
+        "type": "SYMBOL",
+        "unit": "exchange segment",
+        "purpose": "Disambiguate reused security IDs across segments.",
+        "populated_by": "ParsedTick exchange code\u2192ExchangeSegment\u2192as_str; retained with each ranked identity.",
+        "missing_or_edge": "Unknown segments do not enter the owner lookup/ranking. SQL maps recognized segment names to the Rust enum ordinal for ties.",
+        "ordering_role": "True-score tie break after security_id; part of UPSERT identity",
+        "example": "NSE_FNO",
+        "source_refs": [
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+            "symbol": "LiveIngest::observe_for_ranking"
+          },
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/console_views.rs",
+            "symbol": "top_volume_cadence_view_ddl"
+          }
+        ],
+        "evidence": "source-inspected; live candidate verification pending"
+      },
+      {
+        "name": "contract",
+        "type": "SYMBOL",
+        "unit": "full human-readable option label",
+        "purpose": "Show underlying, expiry, strike and CE/PE together without a live join.",
+        "populated_by": "contract_label renders artifact metadata once at map publish; labels_from_artifact builds a composite-ID map; projection borrows the label from one snapshot.",
+        "missing_or_edge": "Missing label writes unmapped and increments label_unavailable; numeric identity survives. Oversized labels are bounded and marked. Invalid expiry is rendered visibly, not invented.",
+        "ordering_role": "Display only; not an UPSERT or sorting key",
+        "example": "NIFTY-25Sep2026-24500-CE",
+        "source_refs": [
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/contract_underlying_map.rs",
+            "symbol": "contract_label"
+          },
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/contract_underlying_map.rs",
+            "symbol": "labels_from_artifact"
+          },
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/top_volume_snapshot.rs",
+            "symbol": "project_snapshot"
+          }
+        ],
+        "evidence": "source-inspected; live candidate verification pending"
+      },
+      {
+        "name": "security_id",
+        "type": "LONG",
+        "unit": "numeric contract ID",
+        "purpose": "Identify the exact option contract; needed for joins/subscriptions.",
+        "populated_by": "ParsedTick.security_id retained by RankedContract; projection checked-converts u64\u2192i64.",
+        "missing_or_edge": "IDs above i64::MAX are refused as id_too_large rather than wrapped negative.",
+        "ordering_role": "True-score tie break ASC; part of UPSERT identity",
+        "example": null,
+        "source_refs": [
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+            "symbol": "LiveIngest::observe_for_ranking"
+          },
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/top_volume_snapshot.rs",
+            "symbol": "project_snapshot"
+          }
+        ],
+        "evidence": "source-inspected; live candidate verification pending"
+      },
+      {
+        "name": "underlying_id",
+        "type": "LONG",
+        "unit": "numeric underlying ID",
+        "purpose": "Connect the option to its equity or index for contextual price gain and distinct-underlying depth selection.",
+        "populated_by": "ContractOwner.underlying_id from artifact map; carried through RankedContract.",
+        "missing_or_edge": "Missing owner means the tick does not enter this ranking. IDs above i64::MAX are refused in projection.",
+        "ordering_role": "Context/grouping for depth200; never primary volume order",
+        "example": null,
+        "source_refs": [
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/contract_underlying_map.rs",
+            "symbol": "ContractOwner"
+          },
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/top_volume_snapshot.rs",
+            "symbol": "project_snapshot"
+          }
+        ],
+        "evidence": "source-inspected; live candidate verification pending"
+      },
+      {
+        "name": "volume",
+        "type": "LONG",
+        "unit": "provider cumulative day-volume counter; source u32",
+        "purpose": "Retain the cumulative observation used to form this snapshot for audit.",
+        "populated_by": "ParsedTick.volume\u2192VolumeLeaderboard::observe monotonicity/re-latch policy\u2192ranked row\u2192i64 conversion.",
+        "missing_or_edge": "First positive observation seeds baselines; it is not all charged to the first window. Zero counters are ignored. Lower values follow the documented32-lower-observation re-latch policy.",
+        "ordering_role": "Not a sort key: would measure busy-since-open, not activity in this observed interval",
+        "example": null,
+        "source_refs": [
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/volume_leaderboard.rs",
+            "symbol": "VolumeLeaderboard::observe"
+          },
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/top_volume_snapshot.rs",
+            "symbol": "project_snapshot"
+          }
+        ],
+        "evidence": "source-inspected; live candidate verification pending"
+      },
+      {
+        "name": "delta_units",
+        "type": "LONG",
+        "unit": "nonnegative incremental provider volume units; source u32",
+        "purpose": "Store the numerator of the volume ratio and the activity observed since this cadence was last swept.",
+        "populated_by": "rank computes latest accepted cumulative minus this contract/cadence baseline using saturating_sub, then advances that baseline.",
+        "missing_or_edge": "Zero delta is omitted. Missing first-history interval, counter reset ambiguity and merged delayed sweeps cannot be inferred away. Provider units must agree with lot_size for the normalization to mean lots.",
+        "ordering_role": "Exact primary ordering numerator (candidate); not signed buy-minus-sell net volume",
+        "example": "120",
+        "source_refs": [
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/volume_leaderboard.rs",
+            "symbol": "VolumeLeaderboard::rank"
+          }
+        ],
+        "evidence": "source-inspected; live candidate verification pending"
+      },
+      {
+        "name": "lot_size",
+        "type": "LONG",
+        "unit": "units per lot; source u32",
+        "purpose": "Normalize different contracts to comparable traded-lot ratios.",
+        "populated_by": "Dhan instrument-master LOT_SIZE\u2192artifact row.z\u2192ContractOwner.lot_size\u2192accepted RankedContract; rank uses carried value and only falls back to lookup when zero.",
+        "missing_or_edge": "Missing/zero lot-size owner rows are refused; divisor never silently defaults to 1. Existing source does not certify live provider volume units from divisibility alone.",
+        "ordering_role": "Exact primary ordering denominator (candidate)",
+        "example": "20",
+        "source_refs": [
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/contract_underlying_map.rs",
+            "symbol": "legs_from_artifact"
+          },
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/volume_leaderboard.rs",
+            "symbol": "VolumeLeaderboard::rank"
+          }
+        ],
+        "evidence": "source-inspected; live candidate verification pending"
+      },
+      {
+        "name": "window_lots_milli",
+        "type": "LONG",
+        "unit": "milli-lots;1000 = 1 lot",
+        "purpose": "Provide a compact fixed-point display of the interval activity and a consistency check on delta/lot.",
+        "populated_by": "floor(delta_units*1000/lot_size), computed with widened arithmetic.",
+        "missing_or_edge": "Quantized downward to 0.001 lot. Candidate keeps a positive sub-milli delta even when this display field is0. Projection checks signed-domain conversion.",
+        "ordering_role": "Coarse radix grouping/display. Exact ratio refinement resolves equal displayed buckets in candidate. Baseline af77 used this as entire primary key.",
+        "example": "6000",
+        "source_refs": [
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/volume_leaderboard.rs",
+            "symbol": "window_lots_milli"
+          },
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/volume_leaderboard.rs",
+            "symbol": "VolumeLeaderboard::rank"
+          }
+        ],
+        "evidence": "source-inspected; live candidate verification pending"
+      },
+      {
+        "name": "net_volume_chg_milli_pct",
+        "type": "LONG",
+        "unit": "thousandths of a percentage point",
+        "purpose": "Expose a stored percentage display that does not require the operator to calculate it.",
+        "populated_by": "window_lots_milli*100-100000; shown as percent after dividing by1000.",
+        "missing_or_edge": "Still quantized to 0.1 percentage-point steps because the input is milli-lots. Positive sub-milli activity can display -100.000%. It is not prior-candle percentage growth and not tick-rule signed net flow.",
+        "ordering_role": "Approximate display of the exact one-lot-baseline score; no longer sufficient for exact ranking ties",
+        "example": "500000 = +500.000%",
+        "source_refs": [
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/top_volume_snapshot.rs",
+            "symbol": "net_volume_chg_milli_pct"
+          }
+        ],
+        "evidence": "source-inspected; live candidate verification pending"
+      },
+      {
+        "name": "gain_pct",
+        "type": "DOUBLE or NULL",
+        "unit": "percentage points of underlying price change from previous close",
+        "purpose": "Show whether the option underlying is up/down today, separately from traded-volume activity.",
+        "populated_by": "underlying_gain_pct reads spot_prices.latest_paise and previous close converted to paise. underlying_segment uses IDX_I for index and NSE_EQ for stock; eligible_gain_pct computes100*(spot-prev_close)/prev_close.",
+        "missing_or_edge": "Missing/nonpositive/nonfinite inputs or implausible magnitude > 1000% give NULL and gain_unavailable count; volume row remains. Stores are latest RAM values, not historical as-of joins per option tick.",
+        "ordering_role": "Context only in full board; positive gain controls separate stock-depth eligibility",
+        "example": null,
+        "source_refs": [
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+            "symbol": "LiveIngest::snapshot_top_volume"
+          },
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/volume_leaderboard.rs",
+            "symbol": "underlying_gain_pct"
+          },
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/volume_leaderboard.rs",
+            "symbol": "eligible_gain_pct"
+          }
+        ],
+        "evidence": "source-inspected; live candidate verification pending"
+      },
+      {
+        "name": "subscribed",
+        "type": "BOOLEAN",
+        "unit": "true/false",
+        "purpose": "Record whether a depth pool last reported holding this exact contract when projected.",
+        "populated_by": "DepthSubscriptionView::is_subscribed probes last-published depth20 OR depth200 membership maps.",
+        "missing_or_edge": "False at initial empty view. This flag is not an upstream acknowledgment, socket freshness, tick receipt or active order. Concurrent membership can change during a sweep; no row carries a membership-version timestamp.",
+        "ordering_role": "Observability only; no primary ordering",
+        "example": "true",
+        "source_refs": [
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/depth_subscription_view.rs",
+            "symbol": "DepthSubscriptionView::is_subscribed"
+          },
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/top_volume_snapshot.rs",
+            "symbol": "project_snapshot"
+          }
+        ],
+        "evidence": "source-inspected; live candidate verification pending"
+      }
+    ]
+  },
+  "views": {
+    "names": [
+      "top_volume_1s",
+      "top_volume_3s",
+      "top_volume_5s",
+      "top_volume_1m"
+    ],
+    "column_order": [
+      "ts",
+      "contract",
+      "symbol_name",
+      "display_name",
+      "instrument_type",
+      "family",
+      "delta_units",
+      "lot_size",
+      "window_lots",
+      "net_volume_chg_pct",
+      "net_volume_chg_milli_pct",
+      "underlying_chg_pct",
+      "subscribed",
+      "volume",
+      "window_lots_milli",
+      "underlying_id",
+      "feed",
+      "segment",
+      "security_id",
+      "tf"
+    ],
+    "extra_or_renamed_columns": [
+      {
+        "name": "symbol_name",
+        "type": "SYMBOL or NULL",
+        "source": "instrument_lifecycle.symbol_name",
+        "meaning": "Current master symbol joined by contract security_id+segment+feed.",
+        "missing": "NULL if no non-dry-run lifecycle row. Because lifecycle is updated in place, a later query of history can show newer metadata.",
+        "source_refs": [
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/console_views.rs",
+            "symbol": "top_volume_cadence_view_ddl"
+          },
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/console_views.rs",
+            "symbol": "lifecycle_dim_subquery"
+          }
+        ]
+      },
+      {
+        "name": "display_name",
+        "type": "STRING or NULL",
+        "source": "instrument_lifecycle.display_name",
+        "meaning": "Current master display label; complements the persisted full contract string.",
+        "missing": "Same LEFT JOIN behavior; no row is removed solely because labels are unavailable.",
+        "source_refs": [
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/console_views.rs",
+            "symbol": "top_volume_cadence_view_ddl"
+          },
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/console_views.rs",
+            "symbol": "lifecycle_dim_subquery"
+          }
+        ]
+      },
+      {
+        "name": "instrument_type",
+        "type": "SYMBOL or NULL",
+        "source": "instrument_lifecycle.instrument_type",
+        "meaning": "Current master type, such as option classification.",
+        "missing": "NULL if no matching non-dry-run metadata.",
+        "source_refs": [
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/console_views.rs",
+            "symbol": "top_volume_cadence_view_ddl"
+          },
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/console_views.rs",
+            "symbol": "lifecycle_dim_subquery"
+          }
+        ]
+      },
+      {
+        "name": "window_lots",
+        "type": "DOUBLE",
+        "source": "cast(window_lots_milli AS DOUBLE)/1000.0",
+        "meaning": "Human units for stored milli-lots; a rounded presentation value.",
+        "missing": "It cannot restore the fraction discarded when milli-lots were calculated.",
+        "source_refs": [
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/console_views.rs",
+            "symbol": "top_volume_cadence_view_ddl"
+          },
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/console_views.rs",
+            "symbol": "lifecycle_dim_subquery"
+          }
+        ]
+      },
+      {
+        "name": "net_volume_chg_pct",
+        "type": "DOUBLE",
+        "source": "cast(net_volume_chg_milli_pct AS DOUBLE)/1000.0",
+        "meaning": "Displayed volume percentage versus one lot.",
+        "missing": "A rounded value, not the exact ratio comparator; can print the same for distinctly ordered rows.",
+        "source_refs": [
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/console_views.rs",
+            "symbol": "top_volume_cadence_view_ddl"
+          },
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/console_views.rs",
+            "symbol": "lifecycle_dim_subquery"
+          }
+        ]
+      },
+      {
+        "name": "underlying_chg_pct",
+        "type": "DOUBLE or NULL",
+        "source": "top_volume.gain_pct",
+        "meaning": "Unambiguous display alias for underlying PRICE percentage.",
+        "missing": "NULL means unavailable, not0% and not a reason to drop the volume row.",
+        "source_refs": [
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/console_views.rs",
+            "symbol": "top_volume_cadence_view_ddl"
+          },
+          {
+            "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/console_views.rs",
+            "symbol": "lifecycle_dim_subquery"
+          }
+        ]
+      }
+    ],
+    "ordering": "tsDESC, familyASC, validratio-domain first, delta/lot exactDESC, security_idASC, segment ordinalASC, segment textASC, feedASC",
+    "caveat": "Live QuestDB DDL/query execution pending. Arbitrary outer queries should use explicit order to guarantee the order they need."
+  },
+  "ram": {
+    "slots": 8,
+    "families": 2,
+    "cadences": 4,
+    "row_fields": [
+      "security_id",
+      "segment",
+      "underlying_id",
+      "volume",
+      "window_lots_milli",
+      "delta_units",
+      "lot_size"
+    ],
+    "snapshot_fields": [
+      "family",
+      "cadence",
+      "ts_nanos",
+      "rows"
+    ],
+    "current_decision_integration": "Accessor provided but no production trading reader found; stock 5s drives separate depth-subscription selection.",
+    "freshness": "Board label age only; no per-instrument completeness guarantee",
+    "source_refs": [
+      {
+        "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/top_volume_runtime.rs",
+        "symbol": "TopVolumeRuntime"
+      },
+      {
+        "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+        "symbol": "LiveIngest::snapshot_top_volume"
+      }
+    ]
+  },
+  "timeframes": [
+    {
+      "timeframe": "1s",
+      "seconds": 1,
+      "candle_computed": true,
+      "candle_emitted": true,
+      "ranking_board": true,
+      "view": "top_volume_1s",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/tf_index.rs",
+          "symbol": "TfIndex::ALL / is_operator_requested"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/top_volume_rank_persistence.rs",
+          "symbol": "SnapshotCadence::ALL"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+          "symbol": "LiveIngest::ingest_tick_at"
+        }
+      ]
+    },
+    {
+      "timeframe": "2s",
+      "seconds": 2,
+      "candle_computed": true,
+      "candle_emitted": false,
+      "ranking_board": false,
+      "view": null,
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/tf_index.rs",
+          "symbol": "TfIndex::ALL / is_operator_requested"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/top_volume_rank_persistence.rs",
+          "symbol": "SnapshotCadence::ALL"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+          "symbol": "LiveIngest::ingest_tick_at"
+        }
+      ]
+    },
+    {
+      "timeframe": "3s",
+      "seconds": 3,
+      "candle_computed": true,
+      "candle_emitted": false,
+      "ranking_board": true,
+      "view": "top_volume_3s",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/tf_index.rs",
+          "symbol": "TfIndex::ALL / is_operator_requested"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/top_volume_rank_persistence.rs",
+          "symbol": "SnapshotCadence::ALL"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+          "symbol": "LiveIngest::ingest_tick_at"
+        }
+      ]
+    },
+    {
+      "timeframe": "4s",
+      "seconds": 4,
+      "candle_computed": true,
+      "candle_emitted": false,
+      "ranking_board": false,
+      "view": null,
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/tf_index.rs",
+          "symbol": "TfIndex::ALL / is_operator_requested"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/top_volume_rank_persistence.rs",
+          "symbol": "SnapshotCadence::ALL"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+          "symbol": "LiveIngest::ingest_tick_at"
+        }
+      ]
+    },
+    {
+      "timeframe": "5s",
+      "seconds": 5,
+      "candle_computed": true,
+      "candle_emitted": true,
+      "ranking_board": true,
+      "view": "top_volume_5s",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/tf_index.rs",
+          "symbol": "TfIndex::ALL / is_operator_requested"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/top_volume_rank_persistence.rs",
+          "symbol": "SnapshotCadence::ALL"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+          "symbol": "LiveIngest::ingest_tick_at"
+        }
+      ]
+    },
+    {
+      "timeframe": "6s",
+      "seconds": 6,
+      "candle_computed": true,
+      "candle_emitted": false,
+      "ranking_board": false,
+      "view": null,
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/tf_index.rs",
+          "symbol": "TfIndex::ALL / is_operator_requested"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/top_volume_rank_persistence.rs",
+          "symbol": "SnapshotCadence::ALL"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+          "symbol": "LiveIngest::ingest_tick_at"
+        }
+      ]
+    },
+    {
+      "timeframe": "7s",
+      "seconds": 7,
+      "candle_computed": true,
+      "candle_emitted": false,
+      "ranking_board": false,
+      "view": null,
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/tf_index.rs",
+          "symbol": "TfIndex::ALL / is_operator_requested"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/top_volume_rank_persistence.rs",
+          "symbol": "SnapshotCadence::ALL"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+          "symbol": "LiveIngest::ingest_tick_at"
+        }
+      ]
+    },
+    {
+      "timeframe": "8s",
+      "seconds": 8,
+      "candle_computed": true,
+      "candle_emitted": false,
+      "ranking_board": false,
+      "view": null,
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/tf_index.rs",
+          "symbol": "TfIndex::ALL / is_operator_requested"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/top_volume_rank_persistence.rs",
+          "symbol": "SnapshotCadence::ALL"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+          "symbol": "LiveIngest::ingest_tick_at"
+        }
+      ]
+    },
+    {
+      "timeframe": "9s",
+      "seconds": 9,
+      "candle_computed": true,
+      "candle_emitted": false,
+      "ranking_board": false,
+      "view": null,
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/tf_index.rs",
+          "symbol": "TfIndex::ALL / is_operator_requested"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/top_volume_rank_persistence.rs",
+          "symbol": "SnapshotCadence::ALL"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+          "symbol": "LiveIngest::ingest_tick_at"
+        }
+      ]
+    },
+    {
+      "timeframe": "10s",
+      "seconds": 10,
+      "candle_computed": true,
+      "candle_emitted": true,
+      "ranking_board": false,
+      "view": null,
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/tf_index.rs",
+          "symbol": "TfIndex::ALL / is_operator_requested"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/top_volume_rank_persistence.rs",
+          "symbol": "SnapshotCadence::ALL"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+          "symbol": "LiveIngest::ingest_tick_at"
+        }
+      ]
+    },
+    {
+      "timeframe": "11s",
+      "seconds": 11,
+      "candle_computed": true,
+      "candle_emitted": false,
+      "ranking_board": false,
+      "view": null,
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/tf_index.rs",
+          "symbol": "TfIndex::ALL / is_operator_requested"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/top_volume_rank_persistence.rs",
+          "symbol": "SnapshotCadence::ALL"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+          "symbol": "LiveIngest::ingest_tick_at"
+        }
+      ]
+    },
+    {
+      "timeframe": "12s",
+      "seconds": 12,
+      "candle_computed": true,
+      "candle_emitted": false,
+      "ranking_board": false,
+      "view": null,
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/tf_index.rs",
+          "symbol": "TfIndex::ALL / is_operator_requested"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/top_volume_rank_persistence.rs",
+          "symbol": "SnapshotCadence::ALL"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+          "symbol": "LiveIngest::ingest_tick_at"
+        }
+      ]
+    },
+    {
+      "timeframe": "13s",
+      "seconds": 13,
+      "candle_computed": true,
+      "candle_emitted": false,
+      "ranking_board": false,
+      "view": null,
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/tf_index.rs",
+          "symbol": "TfIndex::ALL / is_operator_requested"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/top_volume_rank_persistence.rs",
+          "symbol": "SnapshotCadence::ALL"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+          "symbol": "LiveIngest::ingest_tick_at"
+        }
+      ]
+    },
+    {
+      "timeframe": "14s",
+      "seconds": 14,
+      "candle_computed": true,
+      "candle_emitted": false,
+      "ranking_board": false,
+      "view": null,
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/tf_index.rs",
+          "symbol": "TfIndex::ALL / is_operator_requested"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/top_volume_rank_persistence.rs",
+          "symbol": "SnapshotCadence::ALL"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+          "symbol": "LiveIngest::ingest_tick_at"
+        }
+      ]
+    },
+    {
+      "timeframe": "15s",
+      "seconds": 15,
+      "candle_computed": true,
+      "candle_emitted": true,
+      "ranking_board": false,
+      "view": null,
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/tf_index.rs",
+          "symbol": "TfIndex::ALL / is_operator_requested"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/top_volume_rank_persistence.rs",
+          "symbol": "SnapshotCadence::ALL"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+          "symbol": "LiveIngest::ingest_tick_at"
+        }
+      ]
+    },
+    {
+      "timeframe": "30s",
+      "seconds": 30,
+      "candle_computed": true,
+      "candle_emitted": true,
+      "ranking_board": false,
+      "view": null,
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/tf_index.rs",
+          "symbol": "TfIndex::ALL / is_operator_requested"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/top_volume_rank_persistence.rs",
+          "symbol": "SnapshotCadence::ALL"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+          "symbol": "LiveIngest::ingest_tick_at"
+        }
+      ]
+    },
+    {
+      "timeframe": "1m",
+      "seconds": 60,
+      "candle_computed": true,
+      "candle_emitted": true,
+      "ranking_board": true,
+      "view": "top_volume_1m",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/tf_index.rs",
+          "symbol": "TfIndex::ALL / is_operator_requested"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/top_volume_rank_persistence.rs",
+          "symbol": "SnapshotCadence::ALL"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+          "symbol": "LiveIngest::ingest_tick_at"
+        }
+      ]
+    },
+    {
+      "timeframe": "2m",
+      "seconds": 120,
+      "candle_computed": true,
+      "candle_emitted": true,
+      "ranking_board": false,
+      "view": null,
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/tf_index.rs",
+          "symbol": "TfIndex::ALL / is_operator_requested"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/top_volume_rank_persistence.rs",
+          "symbol": "SnapshotCadence::ALL"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+          "symbol": "LiveIngest::ingest_tick_at"
+        }
+      ]
+    },
+    {
+      "timeframe": "3m",
+      "seconds": 180,
+      "candle_computed": true,
+      "candle_emitted": true,
+      "ranking_board": false,
+      "view": null,
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/tf_index.rs",
+          "symbol": "TfIndex::ALL / is_operator_requested"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/top_volume_rank_persistence.rs",
+          "symbol": "SnapshotCadence::ALL"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+          "symbol": "LiveIngest::ingest_tick_at"
+        }
+      ]
+    },
+    {
+      "timeframe": "5m",
+      "seconds": 300,
+      "candle_computed": true,
+      "candle_emitted": true,
+      "ranking_board": false,
+      "view": null,
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/tf_index.rs",
+          "symbol": "TfIndex::ALL / is_operator_requested"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/top_volume_rank_persistence.rs",
+          "symbol": "SnapshotCadence::ALL"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+          "symbol": "LiveIngest::ingest_tick_at"
+        }
+      ]
+    },
+    {
+      "timeframe": "15m",
+      "seconds": 900,
+      "candle_computed": true,
+      "candle_emitted": true,
+      "ranking_board": false,
+      "view": null,
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/tf_index.rs",
+          "symbol": "TfIndex::ALL / is_operator_requested"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/top_volume_rank_persistence.rs",
+          "symbol": "SnapshotCadence::ALL"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+          "symbol": "LiveIngest::ingest_tick_at"
+        }
+      ]
+    },
+    {
+      "timeframe": "30m",
+      "seconds": 1800,
+      "candle_computed": true,
+      "candle_emitted": true,
+      "ranking_board": false,
+      "view": null,
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/tf_index.rs",
+          "symbol": "TfIndex::ALL / is_operator_requested"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/top_volume_rank_persistence.rs",
+          "symbol": "SnapshotCadence::ALL"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+          "symbol": "LiveIngest::ingest_tick_at"
+        }
+      ]
+    },
+    {
+      "timeframe": "60m",
+      "seconds": 3600,
+      "candle_computed": true,
+      "candle_emitted": true,
+      "ranking_board": false,
+      "view": null,
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/tf_index.rs",
+          "symbol": "TfIndex::ALL / is_operator_requested"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/top_volume_rank_persistence.rs",
+          "symbol": "SnapshotCadence::ALL"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+          "symbol": "LiveIngest::ingest_tick_at"
+        }
+      ]
+    },
+    {
+      "timeframe": "1d",
+      "seconds": 86400,
+      "candle_computed": true,
+      "candle_emitted": false,
+      "ranking_board": false,
+      "view": null,
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/tf_index.rs",
+          "symbol": "TfIndex::ALL / is_operator_requested"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/top_volume_rank_persistence.rs",
+          "symbol": "SnapshotCadence::ALL"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+          "symbol": "LiveIngest::ingest_tick_at"
+        }
+      ]
+    }
+  ],
+  "functions": [
+    {
+      "name": "contract_label / labels_from_artifact",
+      "stage": "Cold metadata",
+      "behavior": "Build stable human labels once per artifact publish.",
+      "complexity": "O(metadata and output text)",
+      "limitation": "Allocates on cold path; labels bounded and visibly truncated.",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/contract_underlying_map.rs",
+          "symbol": "contract_label / labels_from_artifact"
+        }
+      ],
+      "evidence": "source-inspected; production execution of candidate pending"
+    },
+    {
+      "name": "ContractUnderlyingMap::owner_of",
+      "stage": "Input identity",
+      "behavior": "Map composite contract ID to family, underlying and lot size.",
+      "complexity": "Expected O(1) hash lookup",
+      "limitation": "Missing owner excludes ranking; expected complexity is not adversarial worst-case proof.",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/contract_underlying_map.rs",
+          "symbol": "ContractUnderlyingMap::owner_of"
+        }
+      ],
+      "evidence": "source-inspected; production execution of candidate pending"
+    },
+    {
+      "name": "LiveIngest::ingest_tick_at",
+      "stage": "Accepted tick pipeline",
+      "behavior": "Validate capture sequence, fold candle engine, persist acceptable tick, then call ranking observer only for fully accepted ticks.",
+      "complexity": "O(pipeline work); candle fold O(T), T=24",
+      "limitation": "Some invalid/stale-day ticks are deliberately refused. Slot-exhausted ticks can persist while not ranking/folding. Not all received packets become ticks rows.",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+          "symbol": "LiveIngest::ingest_tick_at"
+        }
+      ],
+      "evidence": "source-inspected; production execution of candidate pending"
+    },
+    {
+      "name": "LiveIngest::observe_for_ranking",
+      "stage": "Per accepted tick",
+      "behavior": "Skip replay; resolve owner; carry raw cumulative volume and metadata into family board.",
+      "complexity": "Expected O(1) identity lookup plus observer",
+      "limitation": "Does not rebuild historical rankings from raw WAL replay.",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+          "symbol": "LiveIngest::observe_for_ranking"
+        }
+      ],
+      "evidence": "source-inspected; production execution of candidate pending"
+    },
+    {
+      "name": "VolumeLeaderboard::observe",
+      "stage": "Per accepted tick",
+      "behavior": "Insert/advance tracked volume and mark each affected cadence dirty once; unchanged volume no-op; apply lower-volume re-latch policy.",
+      "complexity": "Expected O(1) for fixed 4 cadences; O(T) if cadence count scales",
+      "limitation": "25,000 contracts/family ceiling; new insertion/cold allocations and exceptional logging are not fixed nanosecond work.32-lower policy cannot distinguish all vendor resets/replays.",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/volume_leaderboard.rs",
+          "symbol": "VolumeLeaderboard::observe"
+        }
+      ],
+      "evidence": "source-inspected; production execution of candidate pending"
+    },
+    {
+      "name": "VolumeLeaderboard::roll_baselines",
+      "stage": "Outside capture hours",
+      "behavior": "Consume each cadence dirty list and advance baselines without sorting.",
+      "complexity": "O(D) changed contracts",
+      "limitation": "Keeps pre-open accumulation out of first ranked interval; does not create missing observations.",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/volume_leaderboard.rs",
+          "symbol": "VolumeLeaderboard::roll_baselines"
+        }
+      ],
+      "evidence": "source-inspected; production execution of candidate pending"
+    },
+    {
+      "name": "window_lots_milli",
+      "stage": "Score presentation",
+      "behavior": "Compute floor(delta*1000/lot) with zero-divisor refusal.",
+      "complexity": "O(1) fixed-width arithmetic",
+      "limitation": "Output loses sub-milli fractional detail; candidate exact comparison separately preserves order.",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/volume_leaderboard.rs",
+          "symbol": "window_lots_milli"
+        }
+      ],
+      "evidence": "source-inspected; production execution of candidate pending"
+    },
+    {
+      "name": "VolumeLeaderboard::rank",
+      "stage": "Cadence sweep",
+      "behavior": "Consume dirty indices; compute delta and roll baseline even if ineligible; include positive valid deltas; sort full population; truncate only if caller requests k.",
+      "complexity": "O(D+R) for candidate fixed-width radix/refinement, not O(1)",
+      "limitation": "Actual caller requests all rows. Sweep intervals are processing intervals, not guaranteed candle buckets.",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/volume_leaderboard.rs",
+          "symbol": "VolumeLeaderboard::rank"
+        }
+      ],
+      "evidence": "source-inspected; production execution of candidate pending"
+    },
+    {
+      "name": "compare_ranked_contracts",
+      "stage": "Candidate exact comparator",
+      "behavior": "Compare delta_a*lot_b versus delta_b*lot_a in u128, descending; true ties security_id then segment ordinal ascending.",
+      "complexity": "O(1) per comparison at current widths",
+      "limitation": "Inputs bounded positive u32; whole ranking still scales withR.",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/volume_leaderboard.rs",
+          "symbol": "compare_ranked_contracts"
+        }
+      ],
+      "evidence": "source-inspected; production execution of candidate pending"
+    },
+    {
+      "name": "sort_by_exact_volume_ratio / ranking_sort::sort",
+      "stage": "Candidate whole-board sorting",
+      "behavior": "Sort coarse milli-lot integer groups then refine unequal ratios inside each rounded tie by 64 fraction bits.",
+      "complexity": "O(R) fixed-width keys, with fixed small-group comparison cutoffs",
+      "limitation": "Exactness proof depends on denominator <= u32::MAX. Candidate Rust tests and AWS latency must validate implementation.",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/volume_leaderboard.rs",
+          "symbol": "sort_by_exact_volume_ratio / ranking_sort::sort"
+        }
+      ],
+      "evidence": "source-inspected; production execution of candidate pending"
+    },
+    {
+      "name": "LiveIngest::snapshot_top_volume",
+      "stage": "Cadence publisher",
+      "behavior": "Gate capture hours; rank each family; publish complete immutable RAM board; form stock 5s depth candidates; optionally project and append DB rows.",
+      "complexity": "O(D+R) ranking plus O(R) copy/projection/serialization",
+      "limitation": "Writer absence does not prevent RAM board publication. Timers may merge intervals after lag.",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/dhan_feed_stack.rs",
+          "symbol": "LiveIngest::snapshot_top_volume"
+        }
+      ],
+      "evidence": "source-inspected; production execution of candidate pending"
+    },
+    {
+      "name": "nanos_to_next_grid_boundary / floor_to_grid",
+      "stage": "Time labels",
+      "behavior": "Align cadence timer and snapshot labels on09:00 IST grid.",
+      "complexity": "O(1)",
+      "limitation": "Scheduler delay and NTP movement are separate. A grid label is not proof of interval contents or candle parity.",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/top_volume_snapshot.rs",
+          "symbol": "nanos_to_next_grid_boundary / floor_to_grid"
+        }
+      ],
+      "evidence": "source-inspected; production execution of candidate pending"
+    },
+    {
+      "name": "within_capture_window",
+      "stage": "Session gate",
+      "behavior": "Allow top-volume snapshots09:15:00 inclusive to15:40:00 exclusive.",
+      "complexity": "O(1)",
+      "limitation": "Uses wall-clock session label; does not certify full exchange coverage.",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/top_volume_snapshot.rs",
+          "symbol": "within_capture_window"
+        }
+      ],
+      "evidence": "source-inspected; production execution of candidate pending"
+    },
+    {
+      "name": "underlying_gain_pct / eligible_gain_pct",
+      "stage": "Price context",
+      "behavior": "Compute underlying move versus previous close using current RAM stores.",
+      "complexity": "Expected O(1) lookups; O(1) arithmetic",
+      "limitation": "Not the volume score; missing/implausible values unavailable.",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/volume_leaderboard.rs",
+          "symbol": "underlying_gain_pct / eligible_gain_pct"
+        }
+      ],
+      "evidence": "source-inspected; production execution of candidate pending"
+    },
+    {
+      "name": "gainer_eligible_for_depth",
+      "stage": "Stock 5s depth selection",
+      "behavior": "Preserve volume order while retaining positive underlying gainers; independently fill contract and distinct-underlying candidate lists.",
+      "complexity": "O(R) scan, with expected O(1) per-underlying memo probes",
+      "limitation": "Full persisted/RAM board is unfiltered. Depth20 entry 250 / exit 300; depth200 entry 5 / exit 20. This chooses market-data subscriptions, not trading orders.",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/volume_leaderboard.rs",
+          "symbol": "gainer_eligible_for_depth"
+        }
+      ],
+      "evidence": "source-inspected; production execution of candidate pending"
+    },
+    {
+      "name": "DepthSubscriptionView::is_subscribed",
+      "stage": "Per projected row",
+      "behavior": "Read depth20/depth200 last-published membership.",
+      "complexity": "Expected O(1) two hash probes",
+      "limitation": "Does not prove provider acknowledgment or healthy live data; maps updated concurrently.",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/depth_subscription_view.rs",
+          "symbol": "DepthSubscriptionView::is_subscribed"
+        }
+      ],
+      "evidence": "source-inspected; production execution of candidate pending"
+    },
+    {
+      "name": "TopVolumeRuntime::publish_snapshot",
+      "stage": "RAM publication",
+      "behavior": "Validate grid, exact order, positive delta, valid divisor, score consistency and older-timestamp guard; replace one slot atomically.",
+      "complexity": "O(R) validation",
+      "limitation": "Single serialized writer contract; no cross-slot atomicity or complete-market proof.",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/top_volume_runtime.rs",
+          "symbol": "TopVolumeRuntime::publish_snapshot"
+        }
+      ],
+      "evidence": "source-inspected; production execution of candidate pending"
+    },
+    {
+      "name": "TopVolumeRuntime::load",
+      "stage": "RAM read",
+      "behavior": "Load one immutable family/cadence snapshot handle.",
+      "complexity": "Independent ofR; constant slot lookup",
+      "limitation": "Can return stale or empty board; caller must choose freshness policy.",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/top_volume_runtime.rs",
+          "symbol": "TopVolumeRuntime::load"
+        }
+      ],
+      "evidence": "source-inspected; production execution of candidate pending"
+    },
+    {
+      "name": "TopVolumeRuntime::load_fresh",
+      "stage": "RAM read",
+      "behavior": "Reject missing/empty/future/too-old board or negative age limit.",
+      "complexity": "Independent ofR; constant checks after slot load",
+      "limitation": "Only validates snapshot-label age, not per-instrument freshness, feed health or complete coverage. No production trading reader exists.",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/top_volume_runtime.rs",
+          "symbol": "TopVolumeRuntime::load_fresh"
+        }
+      ],
+      "evidence": "source-inspected; production execution of candidate pending"
+    },
+    {
+      "name": "TopVolumeSnapshot::first",
+      "stage": "RAM decision input",
+      "behavior": "Return first already-sorted row without DB/search/sort.",
+      "complexity": "O(1) inR",
+      "limitation": "Reading a winner does not include computing it, risk checks, network transit or order execution.",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/top_volume_runtime.rs",
+          "symbol": "TopVolumeSnapshot::first"
+        }
+      ],
+      "evidence": "source-inspected; production execution of candidate pending"
+    },
+    {
+      "name": "TopVolumeRuntime::reset_daily",
+      "stage": "Daily reset",
+      "behavior": "Clear eight latest slots while old held Arcs remain valid immutable objects.",
+      "complexity": "Fixed 8 slot operations; O(T) if cadence count grows",
+      "limitation": "No atomic reset of all slots together; serialized owner required.",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/top_volume_runtime.rs",
+          "symbol": "TopVolumeRuntime::reset_daily"
+        }
+      ],
+      "evidence": "source-inspected; production execution of candidate pending"
+    },
+    {
+      "name": "project_snapshot",
+      "stage": "Persistence projection",
+      "behavior": "Apply common grid label, checked ID/score conversion, metadata and subscription context.",
+      "complexity": "O(R), expected O(1) lookups/row",
+      "limitation": "Missing gain/label preserves row; invalid signed IDs or arithmetic range can drop it. Per-sweep buffers allocate.",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/top_volume_snapshot.rs",
+          "symbol": "project_snapshot"
+        }
+      ],
+      "evidence": "source-inspected; production execution of candidate pending"
+    },
+    {
+      "name": "TopVolumeRankWriter::append_row",
+      "stage": "Producer serialization",
+      "behavior": "Write one ILP row transactionally relative to buffer using marker/rewind.",
+      "complexity": "O(serialized row bytes)",
+      "limitation": "Bad row counts/refuses; no whole-snapshot transaction.",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/top_volume_rank_persistence.rs",
+          "symbol": "TopVolumeRankWriter::append_row"
+        }
+      ],
+      "evidence": "source-inspected; production execution of candidate pending"
+    },
+    {
+      "name": "TopVolumeRankWriter::flush / split_for_offload",
+      "stage": "Storage handoff",
+      "behavior": "Hand bounded batch to writer thread; full queue retains pending rows for retry.",
+      "complexity": "Depends on batch bytes and handoff",
+      "limitation": "Width cap/sink gone can discard snapshots. No snapshot spill tier and no zero-loss history guarantee.",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/top_volume_rank_persistence.rs",
+          "symbol": "TopVolumeRankWriter::flush / split_for_offload"
+        }
+      ],
+      "evidence": "source-inspected; production execution of candidate pending"
+    },
+    {
+      "name": "TopVolumeRankWriterSink::write",
+      "stage": "Offload storage",
+      "behavior": "Perform ILP HTTP batch write/ack outside feed-drain network path.",
+      "complexity": "O(batch bytes)+I/O",
+      "limitation": "Database failure can lose periodic snapshot history while RAM selection continues.",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/top_volume_rank_persistence.rs",
+          "symbol": "TopVolumeRankWriterSink::write"
+        }
+      ],
+      "evidence": "source-inspected; production execution of candidate pending"
+    },
+    {
+      "name": "ensure_top_volume_rank_table",
+      "stage": "Boot schema",
+      "behavior": "Rename known legacy table, create/alter missing columns and enable composite UPSERT key.",
+      "complexity": "Fixed schema statements plus remote I/O",
+      "limitation": "Fail-soft retries can leave DEDUP unavailable; old rank column is not automatically dropped.",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/top_volume_rank_persistence.rs",
+          "symbol": "ensure_top_volume_rank_table"
+        }
+      ],
+      "evidence": "source-inspected; production execution of candidate pending"
+    },
+    {
+      "name": "top_volume_cadence_view_ddl",
+      "stage": "Analyst view",
+      "behavior": "Create per-cadence SQL projection with LEFT JOIN labels and deterministic newest/group/exact-volume ordering.",
+      "complexity": "Query work/memory grow with selected population",
+      "limitation": "No automatic ordering guarantee for arbitrary SELECT from base table. SQL engine execution remains a release gate.",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/console_views.rs",
+          "symbol": "top_volume_cadence_view_ddl"
+        }
+      ],
+      "evidence": "source-inspected; production execution of candidate pending"
+    },
+    {
+      "name": "top_volume_exact_ratio_order_sql",
+      "stage": "Candidate SQL exact order",
+      "behavior": "Generate valid-domain flag, integer ratio part and64 fraction bits in signed-safe31 + 31 + 2 limbs, descending.",
+      "complexity": "O(1) arithmetic expressions/row, then SQL sort over selected rows",
+      "limitation": "Exact only positive u32 numerator/denominator; invalid legacy rows remain visible after valid rows in same snapshot/family. No new rank column.",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/console_views.rs",
+          "symbol": "top_volume_exact_ratio_order_sql"
+        }
+      ],
+      "evidence": "source-inspected; production execution of candidate pending"
+    },
+    {
+      "name": "global_top_volume_runtime",
+      "stage": "Shared store access",
+      "behavior": "Return process-wide OnceLock-initialized eight-slot RAM runtime.",
+      "complexity": "Constant slot-store handle access after init",
+      "limitation": "Source search found publication/reset and tests only: no production API/frontend/order-strategy consumer.",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/top_volume_runtime.rs",
+          "symbol": "global_top_volume_runtime"
+        }
+      ],
+      "evidence": "source-inspected; production execution of candidate pending"
+    }
+  ],
+  "candle_fields": [
+    {
+      "name": "ts",
+      "meaning": "Bucket-open timestamp, not snapshot publication timestamp.",
+      "populated_by": "TfIndex::bucket_start(fold_clock_ist_secs(...))*1e9 in seal row",
+      "unit": "IST convention; whole-second grid",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/live_candle_state.rs",
+          "symbol": "LiveCandleState"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/multi_tf_aggregator.rs",
+          "symbol": "MultiTfAggregator::consume_tick_with_prices"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/shadow_seal_columns.rs",
+          "symbol": "ShadowSealRow::from_buffered_seal"
+        }
+      ]
+    },
+    {
+      "name": "open/high/low/close",
+      "meaning": "Prices accumulated by candle engine under its day-extreme/late-amend policy.",
+      "populated_by": "AggregatorCell per-timeframe open/fold/seal state",
+      "unit": "Rupee prices asf64, persisted with row conversion policy",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/live_candle_state.rs",
+          "symbol": "LiveCandleState"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/multi_tf_aggregator.rs",
+          "symbol": "MultiTfAggregator::consume_tick_with_prices"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/shadow_seal_columns.rs",
+          "symbol": "ShadowSealRow::from_buffered_seal"
+        }
+      ]
+    },
+    {
+      "name": "volume",
+      "meaning": "Gross accepted cumulative-volume delta allocated into the bucket.",
+      "populated_by": "Per-instrument seeded previous cumulative plus cell bucket baseline/carry/rebase",
+      "unit": "Provider quantity units; nonnegative",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/live_candle_state.rs",
+          "symbol": "LiveCandleState"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/multi_tf_aggregator.rs",
+          "symbol": "MultiTfAggregator::consume_tick_with_prices"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/shadow_seal_columns.rs",
+          "symbol": "ShadowSealRow::from_buffered_seal"
+        }
+      ]
+    },
+    {
+      "name": "net_volume",
+      "meaning": "Tick-rule signed estimate: sum of classified incremental quantities, not exchange-reported aggressor flow.",
+      "populated_by": "classify_tick_volume once per accepted tick; per-timeframe signed accumulation; LiveCandleState::net_volume at seal",
+      "unit": "Signed provider quantity units; NULL if unclassified/no ticks/zero gross",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/live_candle_state.rs",
+          "symbol": "LiveCandleState"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/multi_tf_aggregator.rs",
+          "symbol": "MultiTfAggregator::consume_tick_with_prices"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/shadow_seal_columns.rs",
+          "symbol": "ShadowSealRow::from_buffered_seal"
+        }
+      ]
+    },
+    {
+      "name": "total_buy_qty / total_sell_qty",
+      "meaning": "Last nonzero resting buy/sell order quantities carried by packet.",
+      "populated_by": "Latest nonzero vendor fields retained in bucket",
+      "unit": "Pending book quantity; not executed buy/sell volume",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/live_candle_state.rs",
+          "symbol": "LiveCandleState"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/multi_tf_aggregator.rs",
+          "symbol": "MultiTfAggregator::consume_tick_with_prices"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/shadow_seal_columns.rs",
+          "symbol": "ShadowSealRow::from_buffered_seal"
+        }
+      ]
+    },
+    {
+      "name": "tick_count",
+      "meaning": "Number of folded source ticks/rows under fold policy.",
+      "populated_by": "Per-bucket cell counters",
+      "unit": "Source observations, not necessarily exchange trades",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/live_candle_state.rs",
+          "symbol": "LiveCandleState"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/multi_tf_aggregator.rs",
+          "symbol": "MultiTfAggregator::consume_tick_with_prices"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/shadow_seal_columns.rs",
+          "symbol": "ShadowSealRow::from_buffered_seal"
+        }
+      ]
+    },
+    {
+      "name": "oi",
+      "meaning": "Open interest context.",
+      "populated_by": "Latest usable source reading retained in bucket",
+      "unit": "Provider open-interest units",
+      "source_refs": [
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/live_candle_state.rs",
+          "symbol": "LiveCandleState"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/trading/src/candles/multi_tf_aggregator.rs",
+          "symbol": "MultiTfAggregator::consume_tick_with_prices"
+        },
+        {
+          "path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/shadow_seal_columns.rs",
+          "symbol": "ShadowSealRow::from_buffered_seal"
+        }
+      ]
+    }
+  ],
+  "scenario_matrix": [
+    {
+      "scenario": "Start mid-session / first positive tick",
+      "behavior": "Baseline seeds to first known cumulative. Earlier activity is unknown; it is not invented as this window volume.",
+      "status": "implemented policy; incomplete first interval"
+    },
+    {
+      "scenario": "Same percentage display, different exact fractions",
+      "behavior": "Candidate compares delta/lot exactly; higher true ratio wins even if both display 42.5%.",
+      "status": "candidate fix; Rust/AWS validation pending"
+    },
+    {
+      "scenario": "Positive amount below 0.001 lot",
+      "behavior": "Candidate retains row even if display milli-lots=0 and displayed percentage=-100%.",
+      "status": "candidate fix; display remains approximate"
+    },
+    {
+      "scenario": "Exactly equal true ratios",
+      "behavior": "security_id then segment enum ordinal ascending only stabilize ties.",
+      "status": "candidate comparator; no other market signal changes primary order"
+    },
+    {
+      "scenario": "Nothing changed in interval",
+      "behavior": "RAM publishes explicit empty board; load_fresh refuses it. DB receives no rows for that empty board.",
+      "status": "implemented; DB absence alone cannot distinguish quiet from failed write"
+    },
+    {
+      "scenario": "Missing lot size or contract owner",
+      "behavior": "Refuse ranking input, count relevant metadata/owner refusals where supported.",
+      "status": "implemented; cannot claim full universe"
+    },
+    {
+      "scenario": "Missing underlying price/previous close",
+      "behavior": "Keep volume row with NULL contextual gain; stock depth candidate is Unknown and excluded.",
+      "status": "implemented"
+    },
+    {
+      "scenario": "Duplicate/equal cumulative packet",
+      "behavior": "Observer treats equal as unchanged; candle incremental delta=0.",
+      "status": "implemented; ticks may still record received snapshots with capture identity"
+    },
+    {
+      "scenario": "Small cumulative drop",
+      "behavior": "Ranking refuses lower values until 32 lower observations trigger re-latch; candle path uses different large-drop restart heuristic.",
+      "status": "known semantic gap; no universal reset inference"
+    },
+    {
+      "scenario": "Counter dip followed by staircase recovery",
+      "behavior": "Ranking source records a residual phantom-delta possibility during staged recovery.",
+      "status": "unresolved policy ambiguity"
+    },
+    {
+      "scenario": "Large counter restart with pending late carry",
+      "behavior": "Phase2 rebase preserves counted pending carry before rebasing open/sealed cell state. Reset tick delta itself is unknown.",
+      "status": "candidate fix; new Rust cases unexecuted in this dictionary"
+    },
+    {
+      "scenario": "Delayed/reordered receipt",
+      "behavior": "Candles prefer bounded-plausible receipt clock; late policy can amend retained bucket or account a discard/carry.",
+      "status": "implemented policy; not perfect exchange-time attribution"
+    },
+    {
+      "scenario": "Timer stalls several intervals",
+      "behavior": "Next rank measures cumulative difference since last actual sweep and labels current grid. Missing individual prior ranks cannot be recovered from latest counter.",
+      "status": "known unmet exact-timeframe requirement"
+    },
+    {
+      "scenario": "Rank timestamp versus candle timestamp",
+      "behavior": "Rank ts labels publication boundary; candle ts labels bucket open. Nominal prior 5s rank at09:15:05 relates to candle09:15:00, not same-ts candle.",
+      "status": "source-confirmed semantic mismatch"
+    },
+    {
+      "scenario": "Wall-clock moves backward/forward",
+      "behavior": "RAM refuses older/future-at-read snapshot; timer reanchor reduces drift. Existing row data still not a formal complete-window proof.",
+      "status": "implemented guards; timing correctness not absolute"
+    },
+    {
+      "scenario": "All stocks falling or gain unavailable",
+      "behavior": "Full volume board still records volume; stock-depth gainer candidate list can be empty and existing held sockets can remain.",
+      "status": "implemented selection policy"
+    },
+    {
+      "scenario": "One underlying owns hundreds of highest rows",
+      "behavior": "Depth200 distinct-underlying selection scans full eligible ranked population independently of depth20 cut.",
+      "status": "phase2 candidate fix; prevents shared-cap truncation"
+    },
+    {
+      "scenario": "Reader wants two timeframes atomically",
+      "behavior": "Eight slots are independently published; each immutable board coherent, multiple loads can be from different sweeps.",
+      "status": "known limit; no cross-cadence transaction"
+    },
+    {
+      "scenario": "A fresh board includes stale individual input",
+      "behavior": "load_fresh checks board timestamp only; it does not prove instrument latest tick age or complete feed state.",
+      "status": "known missing decision-quality gate"
+    },
+    {
+      "scenario": "Database slows or fails",
+      "behavior": "Ranking and latest RAM board do not query DB. Bounded offload snapshots can lose history on width cap/sink failure.",
+      "status": "implemented isolation; no lossless snapshot audit claim"
+    },
+    {
+      "scenario": "Raw frame queue/disk/provider unavailable",
+      "behavior": "Finite queues and disk cannot retain unbounded traffic/outage. Replay protects only surviving captured data; provider gaps may not be replayable.",
+      "status": "fundamental and operational limits"
+    },
+    {
+      "scenario": "Universe exceeds 25,000",
+      "behavior": "Ranking has25,000 slots per family; candle engine25,000 total instrument slots. Some ticks can persist even when candles/ranking excluded by slot exhaustion.",
+      "status": "source-confirmed capacity limit"
+    },
+    {
+      "scenario": "All 24 timeframes requested for top-volume",
+      "behavior": "Current four ranking baseline slots and four SQL views do not cover 20 other candle variants.",
+      "status": "not implemented; needs common bucketed producer and bounded capacity design"
+    },
+    {
+      "scenario": "Millions of viewers",
+      "behavior": "No top-volume HTTP/WebSocket API/frontend consumer found. UI distribution load was not tested.",
+      "status": "not implemented/validated"
+    },
+    {
+      "scenario": "Every source trade requested with never-disconnect promise",
+      "behavior": "Dhan API snapshots are not a guaranteed exchange trade tape. Network/provider outages cannot be prevented universally.",
+      "status": "unsupported guarantee"
+    },
+    {
+      "scenario": "Database query without explicit ORDER BY",
+      "behavior": "Base top_volume has no inherent physical percentage sort; use verified view/explicit bounded query.",
+      "status": "query contract"
+    },
+    {
+      "scenario": "Historical metadata renamed later",
+      "behavior": "View uses current lifecycle labels; base contract string remains written label.",
+      "status": "source-confirmed temporal metadata behavior"
+    },
+    {
+      "scenario": "Candidate exact-SQL data outside positive u32 domain",
+      "behavior": "Rows remain visible after valid domain rows within own timestamp/family; safe substitute divisor prevents zero division.",
+      "status": "candidate policy; live SQL execution pending"
+    }
+  ],
+  "proposed_followups": [
+    {
+      "proposal": "Build rankings from shared per-instrument bucket accumulators keyed by family,timeframe,bucket_start and session.",
+      "reason": "Makes score interval and candle interval explicitly comparable; existing wall-clock sweep deltas do not.",
+      "status": "design proposal, not implemented here"
+    },
+    {
+      "proposal": "Publish immutable board with bucket_start,bucket_end,published_at,feed/coverage status and configuration version.",
+      "reason": "A timestamp alone cannot distinguish full bucket, partial start, late correction, delayed merged sweep or stale instrument.",
+      "status": "design proposal, not existing fields"
+    },
+    {
+      "proposal": "Add a RAM-only signal reader that refuses unready/stale/incomplete snapshots and emits observable decision intents; integrate actual order execution only through established risk/idempotency controls.",
+      "reason": "The current first-row accessor is not an automated trading strategy.",
+      "status": "design proposal; no orders placed or wiring claimed"
+    },
+    {
+      "proposal": "Record a snapshot manifest with expected/appended/acknowledged row counts and completeness.",
+      "reason": "No rows currently means either quiet board or failed snapshot persistence; base row table cannot distinguish.",
+      "status": "design proposal"
+    },
+    {
+      "proposal": "Validate original Dhan volume units, replay limitations and every-packet coverage against raw capture and independent provider contract.",
+      "reason": "A cumulative counter can recover quantity across a gap but not each lost trade price/timestamp/side.",
+      "status": "verification requirement"
+    }
+  ],
+  "primary_sources": [
+    {
+      "url": "https://madefortrade.in/t/from-the-exchange-to-your-screen-how-dhan-built-a-fast-market-data-platform-for-retail-traders/92131",
+      "role": "User-provided Dhan architecture article and image; root fetched article.",
+      "supports": "Provider design separates live ingest/distribution from asynchronous storage. It does not guarantee the retail API delivers every exchange event or provide client access to its internal leased/co-located feed."
+    },
+    {
+      "url": "https://dhanhq.co/docs/v2/live-market-feed/",
+      "role": "Official retail live-feed protocol; root browsed.",
+      "supports": "Retail WebSocket protocol/quotas/heartbeat; no complete exchange-tape or arbitrary historical sequence replay guarantee established."
+    },
+    {
+      "url": "https://questdb.com/docs/query/operators/numeric/",
+      "role": "Official SQL operator contract cited in candidate SQL helper.",
+      "supports": "Integer arithmetic semantics still require live engine validation for the generated DDL."
+    }
+  ],
+  "checks": {
+    "source_only": true,
+    "rust_tests_run_by_this_agent": false,
+    "aws_commands_run_by_this_agent": false,
+    "db_queries_run_by_this_agent": false,
+    "code_changes_by_this_agent": false
+  }
+}

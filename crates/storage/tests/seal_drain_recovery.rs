@@ -94,6 +94,24 @@ impl FakeSink {
 }
 
 impl SealSink for FakeSink {
+    // An isolated transport fixture, not an assertion of production row
+    // reconciliation. Conflicts and WAL visibility are tested in the guard.
+    fn recover_batch(
+        &mut self,
+        seals: &[BufferedSeal],
+    ) -> Result<
+        tickvault_storage::seal_recovery_guard::RecoveredBatch,
+        tickvault_storage::seal_recovery_guard::RecoveryRefusal,
+    > {
+        for seal in seals {
+            self.append_seal(seal)?;
+        }
+        self.flush()?;
+        Ok(tickvault_storage::seal_recovery_guard::RecoveredBatch {
+            inserted: seals.len(),
+            identical: 0,
+        })
+    }
     fn append_seal(&mut self, seal: &BufferedSeal) -> anyhow::Result<()> {
         self.buffered.push((
             seal.security_id,
@@ -308,14 +326,21 @@ fn flush_failure_leaves_file_staged_then_recovers_next_boot() {
     let mut dead = FakeSink::dead();
     let first = drain_recovered_seals(&mut dead, &spill, &dlq, 4);
     assert_eq!(first.files_staged, 1);
-    assert_eq!(first.seals_recovered, 10);
+    assert_eq!(
+        first.seals_recovered, 4,
+        "only the first bounded batch was decoded"
+    );
     assert_eq!(first.seals_reingested, 0, "nothing committed to a dead DB");
     assert_eq!(
         first.files_archived, 0,
         "must NOT archive an unconfirmed file"
     );
     assert_eq!(first.files_left_pending, 1);
-    assert_eq!(first.seals_left_pending, 10, "honest pending count");
+    assert_eq!(first.seals_left_pending, 4, "known decoded pending records");
+    assert!(
+        first.pending_count_unknown,
+        "the unread tail was not counted or assumed empty"
+    );
     assert!(dead.discards >= 1, "poison buffer discarded after failure");
 
     // The bytes are still on disk, parked in staging for the next boot.
@@ -445,15 +470,34 @@ fn corrupt_tail_is_counted_not_silently_lost() {
     let mut sink = FakeSink::healthy();
     let outcome = drain_recovered_seals(&mut sink, &spill, &dlq, 64);
 
-    assert_eq!(outcome.seals_recovered, 4, "the 4 good seals still recover");
-    assert_eq!(outcome.seals_reingested, 4);
+    assert_eq!(
+        outcome.seals_recovered, 4,
+        "preflight counts the 4 valid siblings"
+    );
+    assert_eq!(
+        outcome.seals_reingested, 0,
+        "a damaged original must not replay its old prefix"
+    );
+    assert_eq!(outcome.seals_left_pending, 4);
+    assert_eq!(outcome.files_deferred_invalid, 1);
+    assert!(sink.committed.is_empty());
+    assert!(sink.buffered.is_empty());
+    assert_eq!(sink.flushes, 0);
     assert_eq!(
         outcome.records_undecodable, 1,
         "the legacy-format record is COUNTED, not silently decoded"
     );
-    // The torn tail is not a record at all — it is truncated, so it is not
-    // counted as a decodable-but-bad record. The bytes survive in archive/.
-    assert_eq!(subdir_file_count(&spill, SEAL_ARCHIVE_SUBDIR), 1);
+    // The reader cannot establish record boundaries after the unsupported
+    // version. The entire original, including its valid prefix, stays pending
+    // for repair. It must never touch the sink or archive as a complete replay.
+    assert_eq!(outcome.files_left_pending, 1);
+    assert!(outcome.pending_count_unknown);
+    assert_eq!(subdir_file_count(&spill, SEAL_ARCHIVE_SUBDIR), 0);
+    assert_eq!(subdir_file_count(&spill, SEAL_REPLAYING_SUBDIR), 1);
+    let staged = spill
+        .join(SEAL_REPLAYING_SUBDIR)
+        .join(file_path.file_name().expect("spill file name"));
+    assert_eq!(std::fs::read(staged).expect("retained original"), bytes);
 
     cleanup(&spill, &dlq);
 }

@@ -20,7 +20,7 @@ const STACK_SRC: &str = include_str!("../src/dhan_feed_stack.rs");
 #[test]
 fn dhan_feed_ingest_calls_the_aggregator_fold() {
     assert!(
-        STACK_SRC.contains("aggregator.consume_tick("),
+        STACK_SRC.contains("aggregator.consume_tick_with_context("),
         "LiveIngest must call the aggregator fold. `MultiTfAggregator` compiled \
          and passed its own unit tests with ZERO production callers from \
          2026-07-17 until this lane wired it — existence proves nothing.\n\n\
@@ -127,7 +127,7 @@ fn dhan_feed_gap_detector_observes_before_aggregator_refusal() {
         .find("self.detector.observe(")
         .expect("detector call site");
     let fold = STACK_SRC
-        .find("aggregator.consume_tick(")
+        .find("aggregator.consume_tick_with_context(")
         .expect("aggregator call site");
     assert!(
         observe < fold,

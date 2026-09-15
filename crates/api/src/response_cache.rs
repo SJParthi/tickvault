@@ -10,7 +10,7 @@
 //! std `Mutex` with `PoisonError::into_inner` recovery — a mutex is correct
 //! on this cold path, and there is zero `unwrap`/`expect` in prod code.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -99,15 +99,9 @@ impl SingleSlotTtlCache {
 /// roughly **8% of it**, not headroom above it. A reader trusting the old
 /// text would conclude the cap can never bind. It can.
 ///
-/// What actually keeps it from binding is the **1-second TTL**
-/// (`QUOTE_CACHE_TTL_SECS`), not the key space: reaching the cap with every
-/// entry still fresh requires 2,048 DISTINCT security-ids queried inside one
-/// second. At that point each further new-key `put` pays a full O(cap)
-/// `retain` under the lock and frees nothing, because nothing has expired
-/// yet — see the note on [`BoundedTtlCache::put`]. That is a real
-/// degradation and it is flagged rather than relabelled; it is also
-/// self-limiting, since sustaining it means sustaining 2,048 requests per
-/// second at the endpoint, which is a larger problem than the scan.
+/// The one-second TTL limits residency but does not prevent a burst from
+/// reaching this cap. At saturation, the expiry index checks the oldest entry
+/// and evicts at most one expired key; fresh entries are never displaced.
 pub const QUOTE_CACHE_MAX_ENTRIES: usize = 2048;
 
 /// Per-key TTL cache with a hard entry cap. At cap, NEW keys are
@@ -123,71 +117,97 @@ pub const QUOTE_CACHE_MAX_ENTRIES: usize = 2048;
 // full request identity; no cross-segment entry can be dropped because no
 // segment ever enters the request.
 pub struct BoundedTtlCache {
-    map: Mutex<HashMap<u64, (Instant, String)>>,
+    state: Mutex<BoundedCacheState>,
     ttl: Duration,
     max_entries: usize,
+}
+
+/// The index has exactly one record per resident key, including overwrites.
+/// Unlike an append-only expiry heap, repeated refreshes cannot grow metadata
+/// beyond the cache cap. Timestamps are insertion times, ordered with key ties.
+#[derive(Default)]
+struct BoundedCacheState {
+    map: HashMap<u64, (Instant, String)>,
+    expiry_order: BTreeSet<(Instant, u64)>,
 }
 
 impl BoundedTtlCache {
     /// Creates an empty cache with the given TTL and entry cap.
     pub fn new(ttl: Duration, max_entries: usize) -> Self {
         Self {
-            map: Mutex::new(HashMap::new()),
+            state: Mutex::new(BoundedCacheState::default()),
             ttl,
             max_entries,
         }
     }
 
-    /// Returns the cached body for `key` when fresh. Lazily evicts an
-    /// expired entry for that key so dead entries free their slot.
+    /// Returns a fresh cached body; removes an expired key from both indexes.
+    /// Expected O(1) lookup plus O(body bytes) copying; expired removal is
+    /// O(log cap). Mutex waiting is not a constant-time guarantee.
     pub fn get(&self, key: u64) -> Option<String> {
-        let mut guard = lock_recovering(&self.map);
-        match guard.get(&key) {
-            Some((stored_at, body)) if stored_at.elapsed() < self.ttl => Some(body.clone()),
+        self.get_at(key, None)
+    }
+
+    fn get_at(&self, key: u64, now: Option<Instant>) -> Option<String> {
+        let mut guard = lock_recovering(&self.state);
+        // Read time after acquiring the lock so contention cannot serve stale data.
+        let now = now.unwrap_or_else(Instant::now);
+        match guard.map.get(&key) {
+            Some((stored_at, body)) if now.saturating_duration_since(*stored_at) < self.ttl => {
+                Some(body.clone())
+            }
             Some(_) => {
-                // Expired — free the slot (lazy eviction).
-                guard.remove(&key);
+                if let Some((stored_at, _)) = guard.map.remove(&key) {
+                    guard.expiry_order.remove(&(stored_at, key));
+                }
                 None
             }
             None => None,
         }
     }
 
-    /// Stores a body for `key`. At cap, EXPIRED entries are swept first
-    /// (adversarial-review 2026-07-09 fix: with daily SID churn —
-    /// derivative SecurityIds are unstable per `instrument-master.md`
-    /// rule 3 — dead keys would otherwise accumulate toward the cap and
-    /// permanently skip-insert every new SID, silently self-disabling the
-    /// cache). If still at cap after the sweep, a NEW key is skip-inserted
-    /// (the response was already served fresh — only the cache write is
-    /// skipped); an EXISTING key is always overwritten in place. The sweep
-    /// is O(cap) on this cold path and runs only at the cap boundary.
+    /// Stores a body, refreshing existing keys even at cap. A new key at cap
+    /// replaces only the oldest EXPIRED entry; if every entry is fresh, the
+    /// insertion is skipped. A zero-capacity cache never admits a key.
     ///
-    /// **Honest cost at the boundary (added 2026-09-01).** "Runs only at the
-    /// cap boundary" is true and understates the worst case: once the map is
-    /// AT cap with every entry still inside the 1-second TTL, the sweep frees
-    /// nothing, so EVERY subsequent new-key `put` pays a full O(cap) `retain`
-    /// under the lock and then skip-inserts. It is O(1) amortized in every
-    /// realistic pattern and O(cap) per call in that one, which needs 2,048
-    /// distinct security-ids inside one second to reach — see
-    /// [`QUOTE_CACHE_MAX_ENTRIES`]. Flagged, not relabelled; recorded in
-    /// CLAUDE.md's non-O(1) table so a complexity claim elsewhere cannot
-    /// read as covering it.
+    /// Each mutation performs at most one eviction and O(log cap) ordered
+    /// index work plus expected hash-map work. It never scans the whole map.
+    /// Expired entries not needed for admission remain until lookup or later
+    /// admission, but can never be served. Metadata stays O(cap), including
+    /// when one key is overwritten repeatedly. Hash growth/allocation and
+    /// mutex contention still preclude a strict worst-case O(1) claim.
     pub fn put(&self, key: u64, body: String) {
-        let mut guard = lock_recovering(&self.map);
-        if guard.len() >= self.max_entries && !guard.contains_key(&key) {
-            let ttl = self.ttl;
-            guard.retain(|_, (stored_at, _)| stored_at.elapsed() < ttl);
-            if guard.len() >= self.max_entries {
-                return;
-            }
-        }
-        guard.insert(key, (Instant::now(), body));
+        self.put_at(key, body, None);
     }
 
-    /// Current entry count (tests + observability).
+    fn put_at(&self, key: u64, body: String, now: Option<Instant>) {
+        if self.max_entries == 0 {
+            return;
+        }
+        let mut guard = lock_recovering(&self.state);
+        // Start TTL when the write acquires the lock, not before a queueing delay.
+        let now = now.unwrap_or_else(Instant::now);
+        if let Some((stored_at, _)) = guard.map.get(&key) {
+            let old_expiry = (*stored_at, key);
+            guard.expiry_order.remove(&old_expiry);
+        } else if guard.map.len() >= self.max_entries {
+            let Some(&(oldest_at, oldest_key)) = guard.expiry_order.first() else {
+                // Defensive: do not exceed the cap if state was poisoned.
+                return;
+            };
+            if now.saturating_duration_since(oldest_at) < self.ttl {
+                return;
+            }
+            guard.expiry_order.remove(&(oldest_at, oldest_key));
+            guard.map.remove(&oldest_key);
+        }
+        guard.map.insert(key, (now, body));
+        guard.expiry_order.insert((now, key));
+    }
+
+    /// Resident entry count, including entries awaiting lazy expiration.
     pub fn len(&self) -> usize {
-        lock_recovering(&self.map).len()
+        lock_recovering(&self.state).map.len()
     }
 
     /// Whether the cache holds no entries.
@@ -291,6 +311,75 @@ mod tests {
         cache.put(2, "b2".to_string());
         assert_eq!(cache.get(2).as_deref(), Some("b2"));
         assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn saturated_cache_preserves_fresh_entries_under_new_key_burst() {
+        let at = Instant::now();
+        let cache = BoundedTtlCache::new(Duration::from_secs(10), 2);
+        cache.put_at(1, "a".into(), Some(at));
+        cache.put_at(2, "b".into(), Some(at));
+        for key in 3..10_000 {
+            cache.put_at(key, "uncached".into(), Some(at));
+        }
+        assert_eq!(cache.get_at(1, Some(at)).as_deref(), Some("a"));
+        assert_eq!(cache.get_at(2, Some(at)).as_deref(), Some("b"));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(lock_recovering(&cache.state).expiry_order.len(), 2);
+    }
+
+    #[test]
+    fn refreshed_oldest_key_survives_other_keys_expiration() {
+        let at = Instant::now();
+        let ttl = Duration::from_secs(10);
+        let cache = BoundedTtlCache::new(ttl, 2);
+        cache.put_at(1, "old".into(), Some(at));
+        cache.put_at(2, "expires".into(), Some(at));
+        let refreshed = at + Duration::from_secs(5);
+        cache.put_at(1, "fresh".into(), Some(refreshed));
+        // At the exact TTL boundary key 2 expires; refreshed key 1 does not.
+        cache.put_at(3, "new".into(), Some(at + ttl));
+        assert_eq!(cache.get_at(1, Some(at + ttl)).as_deref(), Some("fresh"));
+        assert!(cache.get_at(2, Some(at + ttl)).is_none());
+        assert_eq!(cache.get_at(3, Some(at + ttl)).as_deref(), Some("new"));
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn overwrite_and_lazy_eviction_keep_expiry_metadata_bounded() {
+        let at = Instant::now();
+        let ttl = Duration::from_secs(10);
+        let cache = BoundedTtlCache::new(ttl, 1);
+        for offset in 0..10_000 {
+            cache.put_at(1, "refresh".into(), Some(at + Duration::from_nanos(offset)));
+        }
+        assert_eq!(lock_recovering(&cache.state).expiry_order.len(), 1);
+        assert!(
+            cache
+                .get_at(1, Some(at + ttl + Duration::from_secs(1)))
+                .is_none()
+        );
+        assert_eq!(lock_recovering(&cache.state).expiry_order.len(), 0);
+        cache.put_at(
+            2,
+            "replacement".into(),
+            Some(at + ttl + Duration::from_secs(1)),
+        );
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn zero_capacity_and_zero_ttl_never_serve_a_body() {
+        let at = Instant::now();
+        let disabled = BoundedTtlCache::new(Duration::from_secs(10), 0);
+        disabled.put_at(1, "a".into(), Some(at));
+        assert!(disabled.is_empty());
+        assert!(lock_recovering(&disabled.state).expiry_order.is_empty());
+        let expired = BoundedTtlCache::new(Duration::ZERO, 1);
+        expired.put_at(1, "a".into(), Some(at));
+        expired.put_at(2, "b".into(), Some(at));
+        assert!(expired.get_at(2, Some(at)).is_none());
+        assert!(expired.is_empty());
     }
 
     #[test]

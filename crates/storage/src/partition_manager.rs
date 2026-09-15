@@ -51,7 +51,7 @@ pub(crate) const HOUR_PARTITIONED_TABLES: &[&str] = &["ticks", "market_depth", "
 
 /// DAY-partitioned **audit + daily-data** tables the retention sweep DETACHes
 /// past the hot window. The 5 live **candle** tables (`candles_1m` …
-/// `candles_1d`) are NOT listed here — they are swept by iterating
+/// `candles_60m`) are NOT listed here — they are swept by iterating
 /// [`crate::shadow_persistence::candle_table_names`] (the single source of
 /// truth, `TfIndex::table_name()`) so the candle names can never drift.
 ///
@@ -444,7 +444,7 @@ impl PartitionManager {
             }
         }
 
-        // The 5 live candle tables (`candles_1m` … `candles_1d`), DAY-partitioned.
+        // The ten active candle tables, DAY-partitioned.
         // Derived from `candle_table_names()` (the single source of truth,
         // `TfIndex::table_name()`) so the swept names can NEVER drift from what is
         // actually created/written. This is the dominant disk-growth source —
@@ -897,10 +897,10 @@ mod tests {
     fn test_candle_tables_are_real_plain_names_not_shadow() {
         // The candle tables swept by detach_old_partitions come from the single
         // source of truth. They MUST be plain `candles_<TF>` (no `_shadow`) and
-        // number 21 (M1/M3/M5/M15/D1 + S1..S15 + S30, TF-diet second-scale) —
+        // number ten (the exact requested active registry) —
         // the exact bug #1022 had (phantom `_shadow` names).
         let names = crate::shadow_persistence::candle_table_names();
-        assert_eq!(names.len(), 24, "expected 24 live candle tables");
+        assert_eq!(names.len(), 10, "expected exactly ten live candle tables");
         for name in names {
             assert!(
                 name.starts_with("candles_"),

@@ -23,6 +23,7 @@
 pub mod always_on;
 pub mod broker_order_events;
 pub mod build_info;
+pub mod candle_timeframes;
 // Dead-code batch 2 (2026-07-18): `candle_fold` DELETED — zero consumers
 // (the app's `rest_candle_fold` is a name-twin with its own types, not a
 // consumer of this module).

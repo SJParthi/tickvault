@@ -27,8 +27,8 @@ fn production(path: &str) -> String {
 fn stage_c_boot_replay_is_the_fenced_form() {
     let src = production("src/main.rs");
     assert!(
-        src.contains("ws_frame_spill::replay_all_fenced("),
-        "STAGE-C must call replay_all_fenced — the disk floor and the per-boot frame cap live there"
+        src.contains("ws_wal_maintenance.replay_fenced()"),
+        "STAGE-C must use the owned maintenance handle's fenced replay"
     );
     assert!(
         !src.contains("ws_frame_spill::replay_all("),
@@ -39,9 +39,12 @@ fn stage_c_boot_replay_is_the_fenced_form() {
 #[test]
 fn the_catchup_drain_is_the_fenced_form() {
     let src = production("src/dhan_feed_stack.rs");
+    // rustfmt may split the receiver and method across lines. Remove only
+    // whitespace; keep the owned receiver and exact fenced method together.
+    let src = src.split_whitespace().collect::<String>();
     assert!(
-        src.contains("ws_frame_spill::replay_all_with_report_fenced("),
-        "every catch-up round must go through replay_all_with_report_fenced"
+        src.contains("wal_maintenance.replay_with_report_fenced("),
+        "every catch-up round must use the same owned maintenance handle"
     );
     assert!(
         !src.contains("ws_frame_spill::replay_all_with_report("),
@@ -59,7 +62,7 @@ fn both_lane_confirms_wait_for_the_writer_ack() {
             ))
             .unwrap_or_else(|| panic!("the {stage} confirm must wait on replay_rows_landed"));
         let confirm = src[wait..]
-            .find("confirm_replayed(")
+            .find("confirm_replayed_generation(")
             .expect("a confirm must follow the ack wait");
         // The confirm is inside the `if` the wait guards: no more than a few
         // lines away, and never before it.
@@ -72,6 +75,39 @@ fn both_lane_confirms_wait_for_the_writer_ack() {
         src.contains("if !replay_rows_landed(&mut ingest, \"catchup\", unlanded_before) {"),
         "a catch-up ack timeout must END the drain rather than re-offer the batch to a sink that is not answering"
     );
+}
+
+/// The allocator's persistence/exhaustion behavior is tested in storage.
+/// This guard pins the production call sites that must use its authority.
+#[test]
+fn socket_capture_requires_a_durable_identity_before_wal_or_ring_admission() {
+    let src = production("../core/src/websocket/pool_supervisor.rs");
+    let body = src
+        .split_once("fn accept(&self, frame: Bytes) -> FrameSinkOutcome {")
+        .expect("production frame accept")
+        .1;
+    let allocation = body
+        .find("let Some(seq) = self.spill.try_next_frame_seq() else {")
+        .expect("socket must allocate from its WAL writer");
+    let refusal = &body[allocation..];
+    let refusal = &refusal[..refusal.find("};").expect("allocation refusal branch")];
+    assert!(refusal.contains("self.spill.record_sequence_refusal(self.ws_type)"));
+    assert!(refusal.contains("self.wal_dropped.increment(1)"));
+    assert!(refusal.contains("return FrameSinkOutcome::WalDropped"));
+    let append = body
+        .find("self.spill.append_with_seq_at(")
+        .expect("WAL admission");
+    let publish = body
+        .find(".try_send(CapturedFrame {")
+        .expect("ring admission");
+    assert!(allocation < append && append < publish);
+    assert!(
+        !src.contains("let seq = next_frame_seq()"),
+        "a process-only sequence must not return to the live socket"
+    );
+    let orders = production("../core/src/websocket/order_update_connection.rs");
+    assert!(orders.contains("spill.append(WsType::OrderUpdate, frame_vec)"));
+    assert!(!orders.contains("ws_frame_spill::next_frame_seq("));
 }
 
 #[test]
@@ -105,17 +141,63 @@ fn every_ring_full_shed_marks_the_frame_unapplied() {
 fn the_segment_listing_excludes_the_open_segment() {
     let src = production("../storage/src/ws_frame_spill.rs");
     let listing = src
-        .find("fn wal_segments_in(dir: &Path) -> Vec<PathBuf> {")
-        .expect("wal_segments_in must exist");
-    let body = &src[listing..listing + 900];
+        .find("fn wal_segments_in_checked(")
+        .expect("strict WAL listing must exist");
+    let body = &src[listing..listing + 1200];
     assert!(
-        body.contains("is_open_segment(p)"),
-        "wal_segments_in must filter the writer's open segment, or a catch-up round can stage the file being appended to"
+        body.contains("same_wal_path(current, &path)"),
+        "strict listing must exclude descriptor aliases of the writer's live segment"
     );
+    assert!(src.contains("fn same_wal_path(") && src.contains("std::fs::canonicalize(left)"));
+    let opening = src
+        .split("fn open_new_segment(")
+        .nth(1)
+        .expect("segment open helper");
+    let register = opening
+        .find("set_open_segment(path.clone())")
+        .expect("register intended path");
+    let create = opening
+        .find(".create_new(true)")
+        .expect("new segment must not replace a file");
     assert!(
-        src.contains("set_open_segment(path);"),
-        "open_new_segment must register the segment it opens"
+        register < create,
+        "the path must be protected before any writable file exists"
     );
+    assert!(opening[..create].contains("guard.ensure_current()?"));
+    assert!(opening[..create].contains("guard.io_path("));
+}
+
+#[test]
+fn production_wal_maintenance_keeps_the_original_directory_claim() {
+    let main = production("src/main.rs");
+    let lane = production("src/dhan_feed_stack.rs");
+    let claim = main
+        .find("lock_wal_dir(&ws_wal_path)")
+        .expect("boot claims the directory");
+    let bind = main
+        .find("WalMaintenance::from_guard(")
+        .expect("maintenance bound to the claim");
+    let replay = main
+        .find("ws_wal_maintenance.replay_fenced()")
+        .expect("owned boot replay");
+    assert!(claim < bind && bind < replay);
+    assert!(main.contains("let ws_wal_prune = ws_wal_maintenance.clone();"));
+    assert!(main.contains("wal_maintenance: Some(ws_wal_maintenance.clone())"));
+    assert!(lane.contains("let Some(wal_maintenance) = params.wal_maintenance else {"));
+    assert!(lane.contains("\"wal_maintenance_missing\""));
+    for source in [&main, &lane] {
+        for unowned in [
+            "ws_frame_spill::replay_all",
+            "ws_frame_spill::confirm_replayed",
+            "ws_frame_spill::prune_archived_segments",
+            "ws_frame_spill::prune_active_segments",
+        ] {
+            assert!(
+                !source.contains(unowned),
+                "production maintenance cannot bypass its held claim: {unowned}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -166,15 +248,18 @@ fn the_unfolded_frames_message_no_longer_claims_the_segments_were_archived() {
 #[test]
 fn a_refused_boot_replay_never_confirms_the_staged_leftovers() {
     let main = production("src/main.rs");
+    let main = main.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
         main.contains(
-            "ws_wal_replay_refused = batch.stopped_for_disk || batch.stopped_for_frame_cap"
+            "ws_wal_replay_refused = batch.stopped_for_disk || batch.stopped_for_frame_cap || batch.stopped_for_memory"
         ),
         "STAGE-C must read the refusal flags off the batch, not infer 'nothing to replay' from an empty frame list"
     );
     assert!(
-        main.contains("} else if ws_wal_replay_refused {"),
-        "the confirm branch must be gated on the refusal — a refused pass leaves `replaying/` untouched"
+        main.contains(
+            "} else if ws_wal_replay_refused || ws_wal_replay_unconsumed_frames > 0 || !ws_wal_replay_live_feed.is_empty() {"
+        ),
+        "refused passes and unconsumed frames must retain the complete staged generation"
     );
 }
 

@@ -489,3 +489,91 @@ impossible when every traded contract is an output row — the honest floor is
 Θ(traded). NOT claimed: any duty-cycle figure from the old harness. NOT claimed:
 measured uncapped row counts at 3s, 5s or 1m. NOT claimed: that this pipeline is
 observable outside the box.
+
+# 2026-09-15 continuation: signed candle quantity and release controls
+
+**Status:** IN_PROGRESS
+
+The current operator instruction is: “then fix resoleve evrythign dude then
+merge and deploy it dude okay?” Earlier instructions in the same conversation
+specify using the candle's existing volume with a positive/negative projection,
+ten candle timeframes and only four Top Volume timeframes. This continuation
+records the concrete correction and outstanding release work. It does not
+backdate approval, claim completion, authorize an unfinished public release,
+or override automatic approval rejections.
+
+## Design
+
+`crates/trading` owns nonnegative incremental traded quantity and a whole-bar
+signed projection against the previous same-timeframe close pinned at opening.
+`crates/app` consumes the resulting revision/quality/lot metadata in RAM;
+`crates/storage` preserves gross quantity and versioned signed provenance.
+Do not independently re-difference or query the database in the live ranking
+path. Retain exact descending one-lot-relative ratios within one bucket, frame
+and instrument family. Keep candles 1s/3s/5s/1m/3m/5m/10m/15m/30m/60m and
+primary Top Volume 1s/3s/5s/1m.
+
+For Dhan, validated Last Trade Time places the candle while bounded receipt
+evidence controls freshness. Count the qualified opening observation once.
+A cumulative jump crossing a frame boundary without enough trade evidence
+retains its gross quantity and marks the affected buckets uncertain. An
+uncertain diagnostic projection cannot qualify as a precise ranked winner.
+
+Use the existing Rust WAL parser for offline retained-history audit. Typed
+receipt verification must bind the preserved receipt to the same namespace
+and validate integer bounds without a floating-point conversion. A persistent
+managed-start guard and an independent systemd drop-in admit only explicitly
+verified artifact hashes after the sequence migration. Reusable release
+validation is required on the exact source before deployment or auto-merge.
+
+## Edge Cases
+
+Cover flat and missing predecessor closes, positive/negative/overflowed
+quantities, zero or missing lot sizes, equal ratios, partial counter baselines,
+late observations and retained-candle amendments, missing/regressing counters,
+session rollover, retired durable timeframe IDs, corrupt/torn/unknown WAL,
+symlink/hardlink aliases, missing authority, mismatched receipts, concurrent
+writers and interrupted guard installation. Legacy rows keep their original
+meaning; a physical field rename cannot manufacture a missing sign baseline.
+
+## Failure Modes
+
+Reject uncertain ranking inputs and leave conflicting recovery bytes pending.
+Refuse startup without schema/projection readiness or a verified sequence
+authority. Missing/unsafe policy, changed artifact, maintenance or incomplete
+local receipt evidence refuse a managed start. Guarded refusal must precede
+the unit's pre-start actions. An empty/stale/failed/cancelled release result
+cannot authorize merge/deploy. No operation may claim upstream losslessness
+or chart parity from cumulative totals alone.
+
+## Test Plan
+
+Run the Rust candle/ranking/storage regressions, strict WAL/receipt tests,
+isolated guard filesystem/process tests and the actual release-gate shell
+against adverse inputs. Record exact source and platform, format and lint,
+then require Linux ARM64/Musl release binaries, isolated production-config
+smoke and pinned QuestDB SQL fixtures. Current private Mac results are evidence
+only for their recorded candidates. Registry/publication approval blocks must
+remain visible; unexecuted release gates cannot inherit a pass.
+
+## Rollback
+
+Before migration, preserve every namespace tier and establish a stopped-writer
+maintenance interval. After migration, the identity floor is forward-only.
+Do not restart an authority-unaware previous binary, restore an older bound,
+delete recovery files or clear the fence as generic deployment cleanup.
+Normal deployment requires pre-existing verified compatibility policy; policy
+issuance remains an explicit fenced operator action. Physical candle-column
+and retired-table cutover still requires a separate data-preserving migration
+and restore validation; the current projection does not satisfy physical removal.
+
+## Observability
+
+Keep quality/refusal reasons and exact candidate/artifact identity visible.
+Audit output distinguishes metadata inspection, retained-byte validation,
+caller-attested external completeness, migration and deployment. Preserve
+receipt, source evidence, conflicting spill bytes and rollback state. Measure
+candidate latency on AWS before publishing a number: fixed work for one
+projection is O(1), exact index maintenance is O(log N), returning K rows is
+O(K), and scanning/migrating history grows with bytes. No finite test campaign
+establishes every possible failure permutation.

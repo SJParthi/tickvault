@@ -95,8 +95,8 @@ fn init_metrics_runs_before_the_wal_replay_that_counts_recovered_frames() {
 
     let install = first_code_offset(&src, "observability::init_metrics")
         .expect("main.rs must call observability::init_metrics");
-    let replay = first_code_offset(&src, "ws_frame_spill::replay_all")
-        .expect("main.rs must call replay_all");
+    let replay = first_code_offset(&src, "ws_wal_maintenance.replay_fenced()")
+        .expect("main.rs must call owned fenced replay");
 
     assert!(
         install < replay,

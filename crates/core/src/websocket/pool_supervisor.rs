@@ -74,9 +74,7 @@ use bytes::Bytes;
 use tickvault_common::constants::FEED_UNSUBSCRIBE_TWENTY_DEPTH;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::types::{ExchangeSegment, SecurityId};
-use tickvault_storage::ws_frame_spill::{
-    AppendOutcome, WalEndpoint, WsFrameSpill, WsType, next_frame_seq,
-};
+use tickvault_storage::ws_frame_spill::{AppendOutcome, WalEndpoint, WsFrameSpill, WsType};
 use tracing::{error, info, warn};
 
 use super::idle_watchdog::{IDLE_RECONNECT_TIMEOUT_SECS, IdleWatchdog};
@@ -3108,9 +3106,9 @@ pub enum FrameSinkOutcome {
     /// doc claiming permanence would now send a reader looking for a data
     /// loss that the watermark already prevents.
     RingFull,
-    /// The WAL refused it AND the ring refused it. The frame reached neither
-    /// disk nor the fold: genuine, immediate capture loss, recoverable by
-    /// nothing.
+    /// The frame reached neither the WAL queue nor the fold: both admissions
+    /// failed, or a durable capture identity could not be allocated before
+    /// either admission. No reused or invented ID is sent to the live ring.
     WalDropped,
     /// The WAL refused it, but the ring took it — so it IS folded into the
     /// database this session, and it is NOT replayable.
@@ -3646,8 +3644,14 @@ impl FrameSink for WalRingSink {
         // work after this line must NOT be charged to the vendor.
         // Monotonic, never wall-clock — see `CapturedFrame::received_at`.
         let received_at = Instant::now();
-        // Minted ONCE, here, at the read instant — see `CapturedFrame`.
-        let seq = next_frame_seq();
+        // Minted ONCE from this writer's synced identity reservation. A cold
+        // reservation refill may be unavailable; refuse explicitly instead
+        // of emitting a reused identity or falling back to a process counter.
+        let Some(seq) = self.spill.try_next_frame_seq() else {
+            self.spill.record_sequence_refusal(self.ws_type);
+            self.wal_dropped.increment(1);
+            return FrameSinkOutcome::WalDropped;
+        };
         // Step 1 — durability. `Bytes` into the WAL is an Arc refcount bump.
         //
         // `append_with_seq_at`, never `append_with_seq`: the receipt is the
@@ -8724,7 +8728,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "tv-ring-budget-leak-{}-{}",
             std::process::id(),
-            next_frame_seq()
+            tickvault_storage::ws_frame_spill::next_frame_seq()
         ));
         let spill = std::sync::Arc::new(
             WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
@@ -8770,7 +8774,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "tv-ring-budget-bytes-{}-{}",
             std::process::id(),
-            next_frame_seq()
+            tickvault_storage::ws_frame_spill::next_frame_seq()
         ));
         let spill = std::sync::Arc::new(
             WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
@@ -10467,23 +10471,34 @@ mod tests {
     /// the error shape hardest to notice and hardest to reconstruct afterwards.
     #[test]
     fn the_receipt_anchor_is_refreshed_off_the_hot_path() {
-        let lane = include_str!("../../../app/src/dhan_feed_stack.rs");
-        let production_half = lane
-            .split_once("#[cfg(test)]")
-            .map_or(lane, |(prod, _)| prod);
-        assert!(
-            production_half.contains("refresh_receipt_anchor()"),
-            "some off-hot-path timer must re-take the receipt anchor; a boot-only anchor \
-             drifts against the wall clock under NTP slew for the whole session"
+        // Inline test instrumentation precedes this production function. The
+        // first #[cfg(test)] is therefore not the end of production code.
+        // Comments must not substitute for an actual refresh call either.
+        let lane = tickvault_common::source_scan::strip_rust_comments(include_str!(
+            "../../../app/src/dhan_feed_stack.rs"
+        ));
+        let drain = lane
+            .split_once("async fn run_frame_drain(")
+            .expect("the production frame drain must exist")
+            .1
+            .split_once("\n}")
+            .expect("the top-level frame drain must have a closing brace")
+            .0;
+        let refresh = "tickvault_storage::ws_frame_spill::refresh_receipt_anchor();";
+        assert_eq!(
+            drain.matches(refresh).count(),
+            1,
+            "the frame drain must contain exactly one executable refresh call"
         );
-        let refresh = production_half
-            .rfind("refresh_receipt_anchor()")
-            .expect("checked above");
-        let silence_arm = production_half
-            .rfind("silence_timer.tick()")
-            .expect("the lane must still have its 30s silence timer");
+        let silence_arm = drain
+            .split_once("_ = silence_timer.tick()")
+            .expect("the lane must still have its 30s silence timer")
+            .1
+            .split_once("\n            }")
+            .expect("the silence select arm must have a closing brace")
+            .0;
         assert!(
-            silence_arm < refresh,
+            silence_arm.contains(refresh),
             "the refresh must sit on the 30s silence arm, never the 500 ms flush arm: it \
              is a wall-clock syscall plus an allocation, and 30 s already bounds the drift \
              to ~15 ms at the worst permitted slew — three orders of magnitude inside a \

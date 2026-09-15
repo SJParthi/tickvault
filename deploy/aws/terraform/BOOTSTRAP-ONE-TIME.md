@@ -45,7 +45,7 @@ git push → GitHub Actions terraform-apply.yml fires
   ├─ terraform plan → 17 resources to create
   ├─ terraform apply → creates EVERYTHING:
   │   ├─ VPC + subnet + IGW
-  │   ├─ Security group (SSH from 0.0.0.0/0 — tighten via TF_VAR_operator_cidr later)
+  │   ├─ Security group (SSM-only by default; optional restricted TF_VAR_operator_cidr)
   │   ├─ IAM role for EC2 instance
   │   ├─ IAM role for GitHub OIDC (this replaces your access key!)
   │   ├─ EC2 r8g.large AL2023 arm64 + EBS gp3 30GB encrypted

@@ -147,7 +147,7 @@ zeroize = { version = "=1.9.0", features = ["derive"] }
 # ---- Section 14: TLS — Crypto Provider for rustls ----
 # Both tokio-tungstenite and reqwest depend on rustls 0.23+, which requires
 # an explicit CryptoProvider. We use aws-lc-rs (already in the dep tree).
-rustls = { version = "=0.23.43", default-features = false, features = ["aws_lc_rs"] }
+rustls = { version = "=0.23.45", default-features = false, features = ["aws_lc_rs"] }
 rustls-native-certs = "=0.8.4"
 # 2026-07-04 (Groww native shadow client PR-R1, operator "go" this session):
 # promote aws-lc-rs from transitive (rustls already pulls it — Cargo.lock had

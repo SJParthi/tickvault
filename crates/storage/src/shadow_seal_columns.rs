@@ -11,7 +11,7 @@
 //! testing. Putting the column-typing logic in a pure function lets us
 //! exhaustively test:
 //!
-//! - timeframe → table name dispatch (all 12 TFs)
+//! - timeframe → table name dispatch (all active TFs)
 //! - segment-code → ILP `symbol` string (all 8 segments + UNKNOWN)
 //! - the `bucket_start_ist_secs * 1_000_000_000` IST-nanos conversion
 //!   (CRITICAL data-integrity rule — the WS LTT carries IST already,
@@ -24,6 +24,10 @@
 use tickvault_common::price_precision::round_to_2dp;
 use tickvault_common::segment::segment_code_to_str;
 use tickvault_trading::candles::BufferedSeal;
+use tickvault_trading::candles::volume_update::VOLUME_QUALITY_LEGACY_BASIS;
+
+/// Historical tick-rule caches are retained under their own explicit basis.
+pub const LEGACY_VOLUME_BASIS: &str = "legacy_tick_rule_or_unknown";
 
 /// Typed row record for the `candles_<tf>` tables written by
 /// [`crate::shadow_persistence::ensure_shadow_candle_tables`].
@@ -59,7 +63,7 @@ use tickvault_trading::candles::BufferedSeal;
 /// hot path.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ShadowSealRow {
-    /// Target table: one of the 21 plain `candles_<tf>` table names
+    /// Target table: one of the ten active plain `candles_<tf>` table names
     /// from `TfIndex::table_name()`. Used by the writer as
     /// `Buffer::table(table_name)`.
     pub table_name: &'static str,
@@ -120,38 +124,11 @@ pub struct ShadowSealRow {
     /// (today's 09:15 open vs yesterday's close). Lands in the
     /// `open_gap_pct` DOUBLE column (operator request 2026-06-02).
     pub open_gap_pct: f64,
-    /// The bar's SIGNED ORDER FLOW — buy-initiated volume minus sell-initiated
-    /// volume, accumulated per tick under the classic tick rule: an uptick is
-    /// buy-initiated, a downtick sell-initiated, and an unchanged price carries
-    /// the previous direction. `|net_volume| <= volume` always holds, because
-    /// both are summed from the same per-tick cumulative delta.
-    ///
-    /// ⚠ **CORRECTED 2026-09-10 — this doc described the OLD, WRONG definition
-    /// until today**, and it is the doc a reader lands on from the type. It
-    /// said "positive when the bar closed above the previous bar, negative when
-    /// below". That was bar DIRECTION applied to the whole bar's volume, which
-    /// inverts exactly when a bar's flow and its close disagree — the case
-    /// somebody consults this column to find. It also claimed the value "costs
-    /// no per-instrument RAM"; it costs 8 bytes on `LiveCandleState`. The
-    /// conversion site below was corrected in the same change that fixed the
-    /// arithmetic; this field doc was not, which is why it is annotated rather
-    /// than quietly rewritten.
-    ///
-    /// **`None` no longer means "the day's first bar".** A first bar with ticks
-    /// IS classified and DOES report flow. `None` now means **this process did
-    /// not classify the bar** — a disk-spill replay (the 128-byte record cannot
-    /// carry the accumulator), a REST-folded bar, a bar with no ticks, or a bar
-    /// with zero volume. That is a data-PROVENANCE fact, not a calendar one.
-    ///
-    /// It lands as a **NULL** column, never as `0`: on a chart `0` draws a flat
-    /// bar and NULL draws nothing, and "perfectly balanced flow" is a different
-    /// claim from "nobody measured the flow".
-    ///
-    /// **INFERRED, not observed.** Dhan publishes no trade tape and no
-    /// aggressor flag, so the side is inferred from the price move. Read from
-    /// [`LiveCandleState::net_volume`](tickvault_trading::candles::LiveCandleState::net_volume),
-    /// which owns every refusal in one place.
+    /// Compatibility cache column. `volume_basis` determines its semantics;
+    /// current values are whole-bar volume signed against the prior close.
+    /// Legacy tick-rule values may survive replay for diagnosis only.
     pub net_volume: Option<i64>,
+    pub volume_basis: &'static str,
     /// `LiveCandleState::total_buy_qty` (`u32`) widened to `i64`. The vendor's
     /// total PENDING BUY-order quantity resting in the book at this bar's last
     /// observed packet — **not executed volume**. `0` is the vendor's ABSENT
@@ -162,6 +139,13 @@ pub struct ShadowSealRow {
     /// `LiveCandleState::total_sell_qty` (`u32`) widened to `i64`. Same
     /// semantics as `total_buy_qty` — pending SELL orders, not trades.
     pub total_sell_qty: i64,
+    /// Bucket-pinned definition; missing historical fields are SQL NULL.
+    pub lot_size: Option<i64>,
+    pub instrument_definition_version: Option<i64>,
+    pub underlying_id: Option<i64>,
+    pub ranking_family: Option<&'static str>,
+    pub volume_quality: i64,
+    pub bucket_revision: Option<i64>,
 }
 
 impl ShadowSealRow {
@@ -185,7 +169,57 @@ impl ShadowSealRow {
         let timestamp_ist_nanos =
             i64::from(seal.state.bucket_start_ist_secs).saturating_mul(1_000_000_000);
         let volume_i64 = i64::try_from(seal.state.volume).unwrap_or(i64::MAX);
+        let metadata = seal.state.metadata;
+        let definition_version = i64::try_from(metadata.instrument_definition_version)
+            .ok()
+            .filter(|version| *version > 0);
+        let underlying_id = i64::try_from(metadata.underlying_id)
+            .ok()
+            .filter(|id| *id > 0);
+        let bucket_revision = i64::try_from(seal.state.bucket_revision)
+            .ok()
+            .filter(|revision| *revision > 0);
+        let legacy_basis = seal.state.volume_quality & VOLUME_QUALITY_LEGACY_BASIS != 0;
+        let net_volume = if legacy_basis {
+            // Preserve the old measured cache without publishing it as the
+            // new quantity. Never derive a prior close missing from v2/v3.
+            seal.state
+                .net_volume_classified
+                .then_some(seal.state.net_volume_signed)
+        } else {
+            seal.state.net_volume()
+        };
+        let mut quality = seal.state.volume_quality;
+        if !metadata.is_known() {
+            quality |= tickvault_trading::candles::volume_update::VOLUME_QUALITY_UNKNOWN_METADATA;
+        }
+        if seal.state.bucket_revision == 0 {
+            quality |= tickvault_trading::candles::volume_update::VOLUME_QUALITY_UNKNOWN_METADATA;
+        } else if bucket_revision.is_none() {
+            quality |= tickvault_trading::candles::volume_update::VOLUME_QUALITY_REVISION_EXHAUSTED;
+        }
+        if seal.state.volume > i64::MAX as u64
+            || seal.state.net_volume_signed.unsigned_abs() > seal.state.volume
+        {
+            // Preserve diagnostic values, but never rank a value whose SQL
+            // representation required saturation or whose flow exceeds gross.
+            quality |= tickvault_trading::candles::volume_update::VOLUME_QUALITY_COUNTER_AMBIGUOUS;
+        }
+        if net_volume.is_none() {
+            quality |= tickvault_trading::candles::volume_update::VOLUME_QUALITY_UNCLASSIFIED_NET;
+        }
         Self {
+            volume_basis: if legacy_basis {
+                LEGACY_VOLUME_BASIS
+            } else {
+                tickvault_trading::candles::CANDLE_SIGNED_BAR_VS_ONE_LOT_METRIC
+            },
+            lot_size: (metadata.lot_size > 0).then_some(i64::from(metadata.lot_size)),
+            instrument_definition_version: definition_version,
+            underlying_id,
+            ranking_family: metadata.ranking_family(),
+            volume_quality: i64::from(quality),
+            bucket_revision,
             table_name: seal.tf.table_name(),
             timestamp_ist_nanos,
             // `seal.security_id` is `u64` (2026-06-29 widening); the LONG column
@@ -210,28 +244,9 @@ impl ShadowSealRow {
             // the per-instrument RAM budget (operator request 2026-06-02).
             change_pct: seal.state.close_pct_from_prev_day,
             open_gap_pct: seal.state.open_gap_pct,
-            // ⚠ CORRECTED 2026-09-10. This comment said "Derived, not stored:
-            // the state carries the two INPUTS (the bar's own volume and the
-            // previous bar's close, snapshotted at bucket open) and this is the
-            // one place they become a signed figure." That was accurate, and
-            // it described a calculation that was WRONG: signing a whole bar's
-            // volume by its close direction is bar DIRECTION, not net volume,
-            // and it inverts precisely when a bar's flow and its close
-            // disagree.
-            //
-            // `net_volume_signed` is now ACCUMULATED per tick by the live fold
-            // under the tick rule, so this is a read rather than a derivation.
-            // The comment's claim that it "costs no per-instrument RAM" is
-            // therefore also retired: it costs 8 bytes on `LiveCandleState`,
-            // ~10 MB across the 25,000-slot ceiling plus ~4.8 MB on the seal
-            // ring, priced at both const-asserts and in aws-budget.md.
-            //
-            // What is UNCHANGED: `net_volume()` still owns every refusal in one
-            // place, and it still returns `None` — persisted as SQL NULL —
-            // rather than a fabricated zero. It gained one: a bar this process
-            // did not classify (a disk-spill replay, a REST bar) reports NULL
-            // instead of claiming perfectly balanced flow.
-            net_volume: seal.state.net_volume(),
+            // The live fold freezes the signed whole-bar cache. Replay copies
+            // that cache; it has no previous-close input to derive it again.
+            net_volume,
             total_buy_qty: i64::from(seal.state.total_buy_qty),
             total_sell_qty: i64::from(seal.state.total_sell_qty),
         }
@@ -335,7 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn test_table_name_dispatches_correctly_for_all_twenty_one_tfs() {
+    fn test_table_name_dispatches_correctly_for_all_active_tfs() {
         for tf in TfIndex::ALL {
             let row = ShadowSealRow::from_buffered_seal(&mk_seal(13, 0, tf, 1_716_000_900, 100.0));
             assert_eq!(
@@ -352,27 +367,16 @@ mod tests {
         // silently change the ILP-emitted table name (which would split
         // candles across two tables — silent data loss class bug).
         let pairs = [
+            (TfIndex::S1, "candles_1s"),
+            (TfIndex::S3, "candles_3s"),
+            (TfIndex::S5, "candles_5s"),
             (TfIndex::M1, "candles_1m"),
             (TfIndex::M3, "candles_3m"),
             (TfIndex::M5, "candles_5m"),
+            (TfIndex::M10, "candles_10m"),
             (TfIndex::M15, "candles_15m"),
-            (TfIndex::D1, "candles_1d"),
-            (TfIndex::S1, "candles_1s"),
-            (TfIndex::S2, "candles_2s"),
-            (TfIndex::S3, "candles_3s"),
-            (TfIndex::S4, "candles_4s"),
-            (TfIndex::S5, "candles_5s"),
-            (TfIndex::S6, "candles_6s"),
-            (TfIndex::S7, "candles_7s"),
-            (TfIndex::S8, "candles_8s"),
-            (TfIndex::S9, "candles_9s"),
-            (TfIndex::S10, "candles_10s"),
-            (TfIndex::S11, "candles_11s"),
-            (TfIndex::S12, "candles_12s"),
-            (TfIndex::S13, "candles_13s"),
-            (TfIndex::S14, "candles_14s"),
-            (TfIndex::S15, "candles_15s"),
-            (TfIndex::S30, "candles_30s"),
+            (TfIndex::M30, "candles_30m"),
+            (TfIndex::M60, "candles_60m"),
         ];
         for (tf, expected) in pairs {
             let row = ShadowSealRow::from_buffered_seal(&mk_seal(13, 0, tf, 1_716_000_900, 100.0));
@@ -583,5 +587,40 @@ mod tests {
         assert_eq!(row.volume, 1_000_000);
         assert_eq!(row.oi, 7_777_777);
         assert_eq!(row.tick_count, 42);
+    }
+    #[test]
+    fn projection_uses_only_pinned_metadata_and_refuses_unrepresentable_definitions() {
+        let mut seal = mk_seal(913, 1, TfIndex::M1, 1_716_000_900, 100.0);
+        let unknown = ShadowSealRow::from_buffered_seal(&seal);
+        assert_eq!(unknown.lot_size, None);
+        assert_eq!(unknown.instrument_definition_version, None);
+        assert_eq!(unknown.underlying_id, None);
+        assert_eq!(unknown.ranking_family, None);
+        assert_eq!(unknown.bucket_revision, None);
+        assert_ne!(unknown.volume_quality, 0);
+        seal.state.metadata = tickvault_trading::candles::CandleMetadata {
+            lot_size: 50,
+            instrument_definition_version: 91,
+            underlying_id: 13,
+            family_code: 2,
+        };
+        seal.state.net_volume_classified = true;
+        seal.state.volume_quality = 0;
+        seal.state.bucket_revision = 12;
+        let valid = ShadowSealRow::from_buffered_seal(&seal);
+        assert_eq!(valid.lot_size, Some(50));
+        assert_eq!(valid.instrument_definition_version, Some(91));
+        assert_eq!(valid.underlying_id, Some(13));
+        assert_eq!(valid.ranking_family, Some("index"));
+        assert_eq!(valid.bucket_revision, Some(12));
+        assert_eq!(valid.volume_quality, 0);
+        seal.state.metadata.instrument_definition_version = u64::MAX;
+        seal.state.metadata.underlying_id = u64::MAX;
+        seal.state.bucket_revision = u64::MAX;
+        let invalid = ShadowSealRow::from_buffered_seal(&seal);
+        assert_eq!(invalid.instrument_definition_version, None);
+        assert_eq!(invalid.underlying_id, None);
+        assert_eq!(invalid.bucket_revision, None);
+        assert_ne!(invalid.volume_quality, 0);
     }
 }

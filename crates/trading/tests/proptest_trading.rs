@@ -31,6 +31,7 @@ fn make_tick(ltp: f32, high: f32, low: f32, close: f32, volume: u32) -> ParsedTi
         received_at_nanos: 0,
         average_traded_price: ltp,
         volume,
+        volume_present: true,
         total_sell_quantity: 0,
         total_buy_quantity: 0,
         day_open: ltp,

@@ -48,6 +48,7 @@ pub fn parse_ticker_packet(
         last_traded_price: ltp,
         exchange_timestamp: ltt,
         received_at_nanos,
+        volume_present: false,
         ..Default::default()
     })
 }
@@ -114,6 +115,7 @@ mod tests {
         let (buf, hdr) = make_ticker_packet(0, 1, 100.0, 100);
         let tick = parse_ticker_packet(&buf, &hdr, 0).unwrap();
         assert_eq!(tick.volume, 0);
+        assert!(!tick.volume_present);
         assert_eq!(tick.open_interest, 0);
         assert_eq!(tick.last_trade_quantity, 0);
         assert_eq!(tick.average_traded_price, 0.0);

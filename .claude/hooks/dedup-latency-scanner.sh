@@ -1,7 +1,11 @@
 #!/bin/bash
-# dedup-latency-scanner.sh — Enforces O(1) latency and deduplication guarantees
+# dedup-latency-scanner.sh — Lexical hot-path policy checks and dedup reminders
 # Called by pre-commit-gate.sh. Exit 2 = block commit.
-# Layer 1 enforcement for data integrity and latency requirements.
+# This is a heuristic over selected paths and spellings, NOT a complexity,
+# allocation, deduplication, or latency proof. It does not follow calls or
+# resolve types, and variable loops / alternative spellings can evade it.
+# crates/app runtime is outside the regex below; a clean result does not cover
+# the complete live decode -> fold -> persistence path. Keep this scope visible.
 
 set -euo pipefail
 
@@ -115,10 +119,10 @@ scan_pattern() {
   done <<< "$files"
 }
 
-echo "=== O(1) Latency & Dedup Scanner ===" >&2
+echo "=== Hot-path lexical policy scan (heuristic, selected paths) ===" >&2
 
 # ─────────────────────────────────────────────
-# O(1) LATENCY VIOLATIONS (hot-path crates only)
+# Selected collection/I/O spellings (not an algorithmic complexity analysis)
 # ─────────────────────────────────────────────
 
 # O(n) collection operations on hot path
@@ -131,7 +135,7 @@ scan_pattern '\.sort_by(' 'O(n log n) sort on hot path — pre-sort or use BTree
 scan_pattern '\.sort_unstable(' 'O(n log n) sort on hot path — pre-sort or use BTreeMap' "$STAGED_FILES" true
 
 # NOTE: Recursion detection removed — structurally impossible with grep.
-# Covered by hot-path-reviewer agent (AST-level review).
+# Human/agent algorithm review is separate; no invocation is established here.
 
 # Blocking I/O on hot path
 scan_pattern 'std::fs::' 'Blocking filesystem I/O on hot path — use async' "$STAGED_FILES" true
@@ -219,12 +223,12 @@ fi
 
 if [ "$VIOLATIONS" -gt 0 ]; then
   echo "" >&2
-  echo "BLOCKED: $VIOLATIONS O(1) latency violation(s) found:" >&2
+  echo "BLOCKED: $VIOLATIONS lexical policy match(es) found:" >&2
   echo -e "$REPORT" >&2
   echo "" >&2
-  echo "All hot-path code must be O(1). Use '// O(1) EXEMPT: <reason>' to justify exceptions." >&2
+  echo "Review the matched operations and their input bounds. Any exemption needs a reason." >&2
   exit 2
 fi
 
-echo "  O(1) latency & dedup scan: CLEAN" >&2
+echo "  Lexical policy scan: CLEAN (no matched patterns; not an O(1) or dedup proof)" >&2
 exit 0

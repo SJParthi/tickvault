@@ -1,277 +1,337 @@
-//! T3.6 REAL — Disk-full chaos via `ulimit -f` subprocess.
+//! WAL file-size-limit failure in an isolated Unix subprocess.
 //!
-//! Literal disk-full testing without root: re-spawn this test binary
-//! under a shell that has set `ulimit -f N` (file-size limit in 1-KB
-//! blocks). Inside the child, the `WsFrameSpill` writer thread hits
-//! the limit on its first segment write and receives EFBIG from
-//! `write(2)` — the exact kernel signal a full disk produces when
-//! `fallocate` isn't in play.
+//! `ulimit -f` produces EFBIG/SIGXFSZ, not ENOSPC. The child ignores SIGXFSZ
+//! so Rust receives an I/O error instead of an expected process kill. A probe
+//! first proves the restriction applies. One marker is batch-flushed before a
+//! frame larger than the limit makes later writes persistently fail. Unflushed
+//! frames remain retry-owned and the writer keeps its directory claim even
+//! after its public handle is dropped. Only child exit releases that ownership.
+//! The parent then uses owned, fenced replay: torn originals must be refused
+//! and retained byte-for-byte, without an ACK or an empty-success claim.
+//! This does not establish zero loss or power-loss durability: accepted records
+//! that remained only in the child queue are not recovered by this fixture.
+//! Every unexpected child exit, including panic, fails.
 //!
-//! # Why this approach
-//!
-//! Three alternatives were rejected:
-//!   - **Root + loop device / tmpfs quota** — needs privileged CI,
-//!     not portable across macOS-dev + Linux-CI.
-//!   - **libc::setrlimit direct** — would add `libc` as a dev-dep on
-//!     `tickvault-storage`, which requires Parthiban approval per
-//!     CLAUDE.md.
-//!   - **`/dev/full`** — a char device, not a filesystem; the WAL
-//!     writer creates regular files under a directory, so the
-//!     character device trick doesn't apply.
-//!
-//! The `ulimit -f` subprocess path is portable, uses only tools
-//! every POSIX system already has, needs no new deps, and exercises
-//! the same kernel code path a real ENOSPC / EFBIG would hit.
-//!
-//! # How the test is wired
-//!
-//! A single `#[test]` function detects via an env var whether it is
-//! the parent (normal `cargo test` invocation) or the child
-//! (re-spawned under ulimit). The child runs the actual chaos and
-//! writes its observations to stdout; the parent spawns the child
-//! via `sh -c 'ulimit -f N && exec <binary> --test-threads=1 --exact
-//! <test-name>'`, reads stdout, and asserts the observations.
-//!
-//! By staying inside ONE `#[test]` function we avoid the cargo-test
-//! test-per-process complication and keep the subprocess invocation
-//! syntactically identical across macOS and Linux.
-//!
-//! # What the child asserts
-//!
-//! 1. `WsFrameSpill::new()` succeeds with a clean temp dir (file
-//!    creation fits within the first few KB).
-//! 2. Appending 200 × 256-byte frames produces a mix of `Spilled` /
-//!    `Dropped` outcomes (at least one `Dropped` is expected because
-//!    the 4-KB file limit is smaller than the 256-KB writer buffer).
-//! 3. The process does NOT panic.
-//! 4. `drop_critical_count()` or persistent outcome data reflects
-//!    the observed disk-full event.
-//!
-//! The parent prints the child's stdout on failure so any panic or
-//! assertion is visible in CI logs.
-//!
-//! # Skip conditions
-//!
-//! Skipped on:
-//!   - Windows (`cfg!(windows)`) — `ulimit` is a POSIX-shell builtin.
-//!   - Environments where `sh` is not on PATH.
-//!   - Environments where the child process cannot be respawned via
-//!     the current exe path (uncommon — covered by `env::current_exe`
-//!     erroring).
-//!
-//! All skip paths log a note and return a passing assertion.
+//! Unix-only: this test does not substantiate Windows behavior. The child has
+//! a 15-second deadline and uses only a parent-owned temporary directory.
 
-#![cfg(test)]
+#![cfg(unix)]
 
+use std::collections::BTreeMap;
 use std::env;
-use std::path::PathBuf;
-use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Env-var name signalling the child-mode execution.
+#[path = "support/owned_wal_replay.rs"]
+pub mod owned_wal_replay;
+
 const CHAOS_MODE_ENV: &str = "TICKVAULT_CHAOS_DISK_FULL_MODE";
-
-/// File-size limit in 1-KB blocks passed to `ulimit -f`. 8 blocks =
-/// 8 KB — large enough to let the WAL segment's first-record write
-/// reach disk for at least one small frame, small enough to trip
-/// EFBIG before the writer has flushed many batches.
+const CHAOS_DIR_ENV: &str = "TICKVAULT_CHAOS_DISK_FULL_DIR";
 const CHILD_FSIZE_BLOCKS: u32 = 8;
+const FRAMES: u32 = 200;
 
-fn chaos_tmp(tag: &str) -> PathBuf {
+fn chaos_tmp() -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let p = env::temp_dir().join(format!(
-        "tv-wal-ulimit-{tag}-{}-{nanos}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&p);
-    std::fs::create_dir_all(&p).expect("create chaos temp dir"); // APPROVED: test
-    p
+        .expect("clock after epoch")
+        .as_nanos();
+    let dir = env::temp_dir().join(format!("tv-wal-ulimit-{}-{nanos}", std::process::id()));
+    std::fs::create_dir(&dir).expect("create isolated chaos dir");
+    dir
 }
 
-/// Child-mode chaos body. Runs under `ulimit -f 8` (8 KB file size
-/// cap). Creates a `WsFrameSpill`, floods it with 200 × 256-byte
-/// frames, and reports observations on stdout so the parent can
-/// assert. Panics and process termination via SIGXFSZ are all
-/// treated as failures — the body must complete cleanly.
-///
-/// Note: with the default SIGXFSZ disposition (terminate), a
-/// `write(2)` past the limit kills the WHOLE process on Linux,
-/// including the main test thread. Therefore this child MUST use
-/// `write(2)` only indirectly via the `WsFrameSpill` writer thread,
-/// which holds its own thread stack and does not take the main
-/// thread down — but BSD-style kernels still raise SIGXFSZ against
-/// the whole process. We mitigate by keeping every write-batch
-/// SMALL (256 bytes) and limiting the burst so the kernel has time
-/// to route the error to the writer thread before the main thread
-/// also attempts any file I/O.
-fn run_child_chaos() {
-    use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType};
+struct Cleanup(PathBuf);
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
-    let dir = chaos_tmp("child");
-
-    // Step 1 — new() MUST succeed. The first segment file is empty,
-    // so the create(2) fits within the 8-KB limit.
-    let spill = match WsFrameSpill::new(&dir) {
-        Ok(s) => s,
-        Err(err) => {
-            println!("CHILD_RESULT new_failed err={err}");
-            return;
+fn original_segments(wal: &Path) -> BTreeMap<OsString, Vec<u8>> {
+    let mut originals = BTreeMap::new();
+    for subdir in ["", "replaying", "quarantine"] {
+        let directory = wal.join(subdir);
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if !subdir.is_empty() && error.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(error) => panic!("cannot inventory fixture originals in {directory:?}: {error}"),
+        };
+        for entry in entries {
+            let entry = entry.expect("read original fixture entry");
+            if entry
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                != Some("wal")
+            {
+                continue;
+            }
+            let bytes = std::fs::read(entry.path()).expect("read original WAL bytes");
+            assert!(
+                originals.insert(entry.file_name(), bytes).is_none(),
+                "a fixture original must exist in exactly one recovery tier"
+            );
         }
-    };
+    }
+    originals
+}
 
-    // Step 2 — flood with 200 × 256-byte frames. The writer thread
-    // buffers up to 256 KB before flushing; the first flush hits
-    // the 8-KB rlimit and the background write(2) returns EFBIG
-    // (or SIGXFSZ terminates the process — if that happens the
-    // parent sees a non-zero exit status which is ALSO an accepted
-    // observation).
-    let mut spilled = 0u64;
+fn frame(marker: u32) -> Vec<u8> {
+    // Marker 1 cannot fit in even a fresh segment under the child restriction.
+    // This keeps failure persistent regardless of background batch scheduling.
+    let size = if marker == 1 { 65_536 } else { 256 };
+    let mut frame = vec![0x5a; size];
+    frame[..4].copy_from_slice(&marker.to_le_bytes());
+    frame
+}
+
+fn run_child_chaos() {
+    use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType, lock_wal_dir};
+
+    let dir = PathBuf::from(env::var_os(CHAOS_DIR_ENV).expect("parent supplied fixture directory"));
+    assert!(dir.is_dir(), "child only uses the parent-owned fixture");
+
+    // Shell ulimit units differ; 64 KiB exceeds eight blocks on the supported
+    // Unix shells. Ignoring SIGXFSZ must leave the actual EFBIG error visible.
+    let error = std::fs::write(dir.join("limit-probe"), vec![0; 65_536])
+        .expect_err("file-size restriction was not applied");
+    assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
+    // libtest may print its `test name ... ` prefix without a newline.
+    println!("\nCHILD_LIMIT verified");
+
+    let wal = dir.join("wal");
+    let spill = WsFrameSpill::new(&wal).expect("new WAL under file-size limit");
+    assert_eq!(
+        spill.append(WsType::LiveFeed, frame(0)),
+        AppendOutcome::Spilled
+    );
+    let flush_deadline = Instant::now() + Duration::from_secs(2);
+    while spill.persisted_count() == 0 && Instant::now() < flush_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        spill.persisted_count(),
+        1,
+        "protect one batch-flushed prefix marker"
+    );
+    assert_eq!(spill.queued_records(), 0);
+    let prefix = original_segments(&wal);
+    assert_eq!(
+        prefix.len(),
+        1,
+        "the protected prefix has one original segment"
+    );
+    let (prefix_name, prefix_bytes) = prefix.first_key_value().expect("protected original");
+    // TVW4 stores a four-byte CRC after the payload. Preserve the complete
+    // preimage, including its original capture identity and checksum.
+    let protected_payload = frame(0);
+    assert!(prefix_bytes.len() >= protected_payload.len() + 4);
+    let crc_at = prefix_bytes.len() - 4;
+    assert_eq!(
+        &prefix_bytes[crc_at - protected_payload.len()..crc_at],
+        protected_payload.as_slice(),
+        "protected marker payload was written"
+    );
+    std::fs::write(dir.join("protected-prefix"), prefix_bytes)
+        .expect("save protected byte preimage");
+    std::fs::write(
+        dir.join("protected-name"),
+        prefix_name.to_str().expect("fixture segment name is UTF-8"),
+    )
+    .expect("save protected segment name");
+
+    assert_eq!(
+        spill.append(WsType::LiveFeed, frame(1)),
+        AppendOutcome::Spilled
+    );
+    let mut spilled = 2u64;
     let mut dropped = 0u64;
-    for i in 0..200u32 {
-        let frame = vec![(i & 0xff) as u8; 256];
-        match spill.append(WsType::LiveFeed, frame) {
+    for marker in 2..FRAMES {
+        match spill.append(WsType::LiveFeed, frame(marker)) {
             AppendOutcome::Spilled => spilled += 1,
             AppendOutcome::Dropped => dropped += 1,
         }
     }
-
-    // Give the writer thread a moment to drain and hit the limit.
-    std::thread::sleep(Duration::from_millis(200));
-
-    let drop_critical = spill.drop_critical_count();
-
-    // Step 3 — emit structured observations on stdout. Each line is
-    // a key=value pair the parent can grep for.
-    println!("CHILD_RESULT completed");
-    println!("CHILD_STAT appended={}", spilled + dropped);
-    println!("CHILD_STAT spilled={spilled}");
-    println!("CHILD_STAT dropped={dropped}");
-    println!("CHILD_STAT drop_critical={drop_critical}");
-
-    // Step 4 — drop the spill so the writer thread exits cleanly.
+    assert_eq!(spilled + dropped, u64::from(FRAMES));
+    assert_eq!(spill.drop_critical_count(), dropped);
+    let queued = spill.shutdown(Duration::from_secs(5));
+    assert!(
+        queued > 0,
+        "persistent EFBIG must not report a complete drain"
+    );
+    assert_eq!(
+        spill.persisted_count(),
+        1,
+        "only the protected prefix was batch-flushed"
+    );
+    assert_eq!(
+        queued as u64,
+        spilled - 1,
+        "every other admitted record remains unflushed"
+    );
+    assert_eq!(
+        spill.queued_records(),
+        queued,
+        "shutdown retains retry accounting"
+    );
     drop(spill);
-    let _ = std::fs::remove_dir_all(&dir);
+    let refusal = lock_wal_dir(&wal).expect_err("retry worker must retain its directory ownership");
+    assert!(
+        refusal.to_string().contains("already owned"),
+        "expected live retry-owner contention, got {refusal:#}"
+    );
+    assert!(
+        std::fs::read(wal.join(prefix_name))
+            .expect("protected segment remains in place")
+            .starts_with(prefix_bytes),
+        "failed writes must preserve the preflushed original prefix"
+    );
+    println!("CHILD_OWNER retry_retained");
+    println!("CHILD_STAT appended={FRAMES}");
+    println!("CHILD_STAT admitted={spilled}");
+    println!("CHILD_STAT preflushed=1");
+    println!("CHILD_STAT unflushed={queued}");
+    println!("CHILD_RESULT completed");
 }
 
-/// Parent-mode test body. Spawns the child via `sh -c 'ulimit -f N;
-/// exec <current_exe> --test-threads=1 --exact
-/// <qualified_test_name>'`, pipes stdout, and asserts the
-/// observations.
+fn assert_originals_retained_after_child(dir: &Path) {
+    let wal = dir.join("wal");
+    let owner = owned_wal_replay::claim_wal(&wal);
+    let original_bytes = original_segments(&wal);
+    assert!(
+        !original_bytes.is_empty(),
+        "the failed writer must leave original evidence"
+    );
+    let prefix_name = OsString::from(
+        std::fs::read_to_string(dir.join("protected-name")).expect("read protected original name"),
+    );
+    let prefix_bytes =
+        std::fs::read(dir.join("protected-prefix")).expect("read protected byte preimage");
+    assert!(
+        original_bytes
+            .get(&prefix_name)
+            .expect("protected segment survives child exit")
+            .starts_with(&prefix_bytes)
+    );
+    // A fence refusal is Ok with a stop flag, so expect_err cannot turn an
+    // unexecuted replay into the expected corrupt-original refusal.
+    let refusal = owner
+        .replay_fenced()
+        .expect_err("the restricted writer's torn original must refuse replay");
+    assert!(
+        refusal.to_string().contains("could not read segment"),
+        "{refusal:#}"
+    );
+    assert_eq!(
+        original_segments(&wal),
+        original_bytes,
+        "refusal/quarantine must retain every original byte, including the protected marker"
+    );
+    assert!(
+        std::fs::read_dir(wal.join("quarantine"))
+            .expect("incomplete original quarantined")
+            .any(|entry| entry
+                .expect("read quarantine entry")
+                .path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                == Some("wal")),
+        "the torn original must be isolated from ordinary replay"
+    );
+    assert!(
+        !wal.join("archive").exists(),
+        "no failed replay receives an ACK or an archive"
+    );
+    // Deliberately no confirmation: no complete generation was returned and
+    // unflushed child-memory records have not been reconstructed or persisted.
+}
+
+fn assert_child_evidence(output: &Output) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "child did not complete successfully: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+    for marker in [
+        "CHILD_LIMIT verified",
+        "CHILD_STAT appended=200",
+        "CHILD_STAT preflushed=1",
+        "CHILD_OWNER retry_retained",
+        "CHILD_RESULT completed",
+    ] {
+        assert!(
+            stdout.lines().any(|line| line == marker),
+            "child lacks {marker:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+}
+
 #[test]
 fn chaos_disk_full_via_ulimit_subprocess() {
-    if env::var(CHAOS_MODE_ENV).is_ok() {
-        // ── CHILD MODE ────────────────────────────────────────────
+    if env::var_os(CHAOS_MODE_ENV).is_some() {
         run_child_chaos();
         return;
     }
-
-    // ── PARENT MODE ──────────────────────────────────────────────
-
-    // Skip on Windows — `ulimit` is a POSIX-shell builtin.
-    if cfg!(windows) {
-        eprintln!("note: ulimit disk-full chaos skipped on Windows");
-        return;
-    }
-
-    // Skip if `sh` is not on PATH (extremely unlikely on Linux/macOS
-    // but guarded for portability).
-    if which_sh().is_none() {
-        eprintln!("note: /bin/sh not found — disk-full chaos skipped");
-        return;
-    }
-
-    // CHANGED 2026-08-10 from a silent `return` to a hard failure.
-    //
-    // `env::current_exe()` failing is not a portability case — it means the
-    // test harness itself is broken. Skipping made a broken harness
-    // indistinguishable from a passing chaos test, and nextest swallows
-    // `eprintln!`, so the "note" nobody saw was the only difference between
-    // "disk-full survival proven" and "nothing ran".
-    let current_exe = env::current_exe().expect(
-        "env::current_exe() failed — the disk-full chaos test cannot respawn \
-         itself. This is a broken harness, not a platform limitation: failing \
-         loudly beats silently reporting that disk-full survival was proven.",
-    );
-
-    // Respawn self under `ulimit -f N`. `cargo test` passes the
-    // test name on argv; use `--exact` + `--test-threads=1` so the
-    // child runs ONLY this test and does not race other tests.
+    let dir = chaos_tmp();
+    let _cleanup = Cleanup(dir.clone());
+    let current_exe = env::current_exe().expect("current test binary");
     let script = format!(
-        "ulimit -f {blocks}; exec \"{exe}\" --test-threads=1 --exact \
-         chaos_disk_full_via_ulimit_subprocess 2>&1",
-        blocks = CHILD_FSIZE_BLOCKS,
-        exe = current_exe.display(),
+        "trap '' XFSZ || exit 125; ulimit -f {CHILD_FSIZE_BLOCKS} || exit 125; \
+         exec \"$1\" --test-threads=1 --exact chaos_disk_full_via_ulimit_subprocess --nocapture"
     );
-
-    let output = match Command::new("sh")
-        .arg("-c")
-        .arg(&script)
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", &script, "tickvault-ulimit"])
+        .arg(current_exe)
         .env(CHAOS_MODE_ENV, "1")
-        .output()
-    {
-        Ok(o) => o,
-        Err(err) => {
-            // CHANGED 2026-08-10 from a silent `return` to a hard failure, same
-            // reasoning as the current_exe arm above: `sh` was already proven
-            // present, so a spawn failure here is a broken environment, not an
-            // unsupported platform. Skipping let a chaos test that never ran
-            // report exactly like one that ran and passed.
+        .env(CHAOS_DIR_ENV, &dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn isolated file-size-limit child");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if child.try_wait().expect("poll child").is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child.wait_with_output().expect("reap timed out child");
             panic!(
-                "failed to spawn the ulimit child ({err}) — the disk-full chaos \
-                 test did NOT run. /bin/sh was already located, so this is a \
-                 broken environment, not a platform gate."
+                "file-size-limit child timed out; no passing evidence\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
             );
         }
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    // Either the child ran to completion (exit code 0 + CHILD_RESULT
-    // line present) OR the child was terminated by SIGXFSZ (exit
-    // status signals 25 on Linux, which is what default SIGXFSZ
-    // action does). Both are valid observations of the disk-full
-    // scenario. What is NOT valid:
-    //   - child panicked cleanly (cargo test reports test failure)
-    //   - child produced output implying corruption
-    //   - child hung past the cargo-test timeout (not our concern —
-    //     cargo would kill it)
-    if output.status.success() {
-        // Happy path — child survived. Verify we see expected tags.
-        assert!(
-            stdout.contains("CHILD_RESULT completed"),
-            "child exited 0 but did not emit completion marker.\n\
-             stdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-        let appended_ok = stdout
-            .lines()
-            .any(|l| l.starts_with("CHILD_STAT appended="));
-        assert!(
-            appended_ok,
-            "child did not report appended count.\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-    } else {
-        // Child was killed (SIGXFSZ) — ALSO a valid observation.
-        // The contract we care about is "no panic in the Rust test
-        // harness itself, which would manifest as a panic message
-        // in stderr". Assert no Rust panic text.
-        assert!(
-            !stderr.contains("RUST_BACKTRACE")
-                && !stderr.contains("thread 'main' panicked")
-                && !stderr.contains("attempted to unwrap"),
-            "child panicked inside Rust code (not a SIGXFSZ kill).\n\
-             stdout:\n{stdout}\nstderr:\n{stderr}"
-        );
+        std::thread::sleep(Duration::from_millis(10));
     }
+    assert_child_evidence(&child.wait_with_output().expect("collect child output"));
+    assert_originals_retained_after_child(&dir);
 }
 
-fn which_sh() -> Option<PathBuf> {
-    let sh = PathBuf::from("/bin/sh");
-    if sh.exists() {
-        return Some(sh);
-    }
-    None
+#[test]
+#[should_panic(expected = "child did not complete successfully")]
+fn child_panic_with_stdout_markers_is_rejected() {
+    use std::os::unix::process::ExitStatusExt;
+    assert_child_evidence(&Output {
+        status: std::process::ExitStatus::from_raw(101 << 8),
+        stdout: b"CHILD_LIMIT verified\nCHILD_STAT appended=200\nCHILD_RESULT completed\nthread panicked\n".to_vec(),
+        stderr: Vec::new(),
+    });
+}
+
+#[test]
+#[should_panic(expected = "child lacks")]
+fn zero_exit_without_executed_fixture_is_rejected() {
+    use std::os::unix::process::ExitStatusExt;
+    assert_child_evidence(&Output {
+        status: std::process::ExitStatus::from_raw(0),
+        stdout: b"test result: ok. 0 passed; 0 failed;\n".to_vec(),
+        stderr: Vec::new(),
+    });
 }

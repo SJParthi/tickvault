@@ -3,7 +3,7 @@
 //!
 //! Production scenario protected here: the full chain from a
 //! running WebSocket server → tungstenite frame → activity counter
-//! bump → WAL append → SIGKILL-equivalent drop → `replay_all` →
+//! bump → WAL append → in-process writer drop → owned fenced replay →
 //! recovered frame with the exact payload. This is the integration
 //! test that proves every Stage-C primitive plays nicely together
 //! against a real async runtime and real socket.
@@ -24,6 +24,10 @@
 
 #![cfg(test)]
 
+#[path = "../../storage/tests/support/owned_wal_replay.rs"]
+mod owned_wal_replay;
+use owned_wal_replay::{assert_complete_replay, claim_wal};
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -35,7 +39,7 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::{WebSocketStream, accept_async, client_async};
 
-use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType, replay_all};
+use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType};
 
 fn chaos_tmp(tag: &str) -> std::path::PathBuf {
     let nanos = SystemTime::now()
@@ -161,11 +165,18 @@ async fn chaos_e2e_200_frames_land_in_wal_in_fifo_order() {
     drop(spill);
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let recovered = replay_all(&dir).expect("replay_all");
+    let dir_owner = claim_wal(&dir);
+    let recovered_batch = assert_complete_replay(&dir_owner);
+    let recovered = &recovered_batch.frames;
     assert_eq!(recovered.len(), 200, "WAL must contain every frame");
 
     for (i, rec) in recovered.iter().enumerate() {
         assert_eq!(rec.ws_type, WsType::LiveFeed);
+        assert_eq!(
+            rec.frame,
+            build_ticker_frame(i as u32),
+            "complete payload at {i}"
+        );
         let sid = u32::from_le_bytes(rec.frame[4..8].try_into().expect("sid slice"));
         assert_eq!(
             sid, i as u32,
@@ -221,11 +232,26 @@ async fn chaos_e2e_silence_window_does_not_break_wal_pipeline() {
     drop(spill);
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let recovered = replay_all(&dir).expect("replay_all");
+    let dir_owner = claim_wal(&dir);
+    let recovered_batch = assert_complete_replay(&dir_owner);
+    let recovered = &recovered_batch.frames;
     assert_eq!(
         recovered.len(),
         20,
         "all 20 frames must survive the silence window"
+    );
+    for (index, record) in recovered.iter().enumerate() {
+        assert_eq!(record.ws_type, WsType::LiveFeed);
+        assert_eq!(
+            record.frame,
+            build_ticker_frame(index as u32),
+            "complete payload at {index}"
+        );
+    }
+    assert!(
+        recovered
+            .windows(2)
+            .all(|pair| pair[0].frame_seq < pair[1].frame_seq)
     );
 
     let _ = server_handle.await;
@@ -267,11 +293,26 @@ async fn chaos_e2e_tcp_drop_preserves_pre_drop_frames_in_wal() {
     drop(spill);
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let recovered = replay_all(&dir).expect("replay_all");
+    let dir_owner = claim_wal(&dir);
+    let recovered_batch = assert_complete_replay(&dir_owner);
+    let recovered = &recovered_batch.frames;
     assert_eq!(
         recovered.len(),
         5,
         "frames sent before TCP drop must all be in WAL"
+    );
+    for (index, record) in recovered.iter().enumerate() {
+        assert_eq!(record.ws_type, WsType::LiveFeed);
+        assert_eq!(
+            record.frame,
+            build_ticker_frame(index as u32),
+            "complete payload at {index}"
+        );
+    }
+    assert!(
+        recovered
+            .windows(2)
+            .all(|pair| pair[0].frame_seq < pair[1].frame_seq)
     );
 
     let _ = server_handle.await;

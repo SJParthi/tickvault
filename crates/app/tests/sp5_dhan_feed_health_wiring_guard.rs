@@ -133,23 +133,51 @@ fn test_sp5_1_drops_dimension_wired_in_spill() {
          a dropped frame — the connected+fresh-but-dropping false-OK has \
          re-opened."
     );
+    let record_call = "self.record_feed_drop_for_health(ws_type);";
     assert_eq!(
-        src.matches("self.record_feed_drop_for_health(ws_type);")
-            .count(),
-        3,
-        "every terminal-loss drop arm must record the drop — losing one arm \
-         silently re-opens the false-OK for that cause only, which is harder \
-         to notice than losing all of them.\n\
-         \n\
-         There are THREE such arms, and the count was raised from 2 to 3 on \
-         2026-09-01 when the byte-budget arm was added: the channel is now \
-         bounded in BYTES as well as records, because `WalRecord.frame` is a \
-         heap buffer the record only points at — so 524,288 records was worth \
-         hundreds of gibibytes of resident payload on a 32 GiB host. That arm \
-         is as terminal a loss as the other two and must attribute to the same \
-         feed. If this count is ever LOWERED to make a build pass, an arm has \
-         stopped reporting and a dropping feed will read `ok`."
+        src.matches(record_call).count(),
+        4,
+        "all four terminal-loss record sites must report feed health: sequence \
+         authority unavailable, channel full, writer disconnected, and byte \
+         budget exhausted. The sequence-admission refusal added the fourth \
+         site; removing any site would hide that cause while the feed looks healthy."
     );
+
+    // A count alone could pass if one branch lost its call and another gained
+    // a duplicate. Pin the call inside each actual terminal-loss block too.
+    fn block_after<'a>(src: &'a str, marker: &str) -> &'a str {
+        let start = src
+            .find(marker)
+            .unwrap_or_else(|| panic!("missing drop site: {marker}"));
+        let open = start + src[start..].find('{').expect("drop site needs a block");
+        let mut depth = 0usize;
+        for (offset, ch) in src[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[open..=open + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unclosed drop site: {marker}");
+    }
+    for marker in [
+        "pub fn record_sequence_refusal(",
+        "Err(TrySendError::Full(_)) =>",
+        "Err(TrySendError::Disconnected(_)) =>",
+        "fn refuse_over_byte_budget(",
+    ] {
+        let body = block_after(&src, marker);
+        assert_eq!(
+            body.matches(record_call).count(),
+            1,
+            "{marker} must report this terminal loss to feed health exactly once"
+        );
+    }
 }
 
 /// SP5.2 — the `connected` dimension, wired 2026-08-26.

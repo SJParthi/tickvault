@@ -1,102 +1,41 @@
-//! Wave 6 Sub-PR #1 item 1.2b — sealed-candle disk-spill primitive.
+//! Versioned sealed-candle spill records used by ring → disk → replay.
 //!
-//! Mirrors the disk-spill machinery in
-//! `crates/storage/src/tick_persistence.rs::TickPersistenceWriter`:
-//! when the in-memory ring (`crates/trading/src/candles/seal_ring.rs`,
-//! merged via PR #557) overflows, the evicted oldest entries flow
-//! through this module and land in
-//! `data/spill/seals-YYYYMMDD.bin` as fixed-size 128-byte binary
-//! records. On recovery, the storage-side writer task re-reads the
-//! spill file and re-attempts the ILP send.
+//! Current v4 records occupy 176 bytes and are written as `seals-*.cseal4`,
+//! which rollback binaries do not discover. Versions 1 and 2 retain their original
+//! 128-byte stride. Every reader examines byte 7 before choosing the record
+//! length, so retained mixed-version files can still be decoded. New writers
+//! use an isolated suffix and never append v4 bytes to a legacy cache file.
+//! Version 0 used a different timeframe ordinal space and remains unsupported.
+//! New recovery accepts all three namespaces; v2 and v3 recovery leave the
+//! new `.cseal4` files untouched across rollback.
 //!
-//! ## What this module ships
+//! Bytes 0..128 preserve the v2 layout: routing, bucket timestamp, tick count,
+//! gross volume, cumulative baseline, OHLC/OI, versioned signed cache,
+//! book quantities and price percentages. Version 1 used bytes 80..88 for a
+//! price; its flow must therefore decode as unclassified, never as that
+//! price's integer bit pattern. `i64::MIN` is only the v2 unclassified sentinel;
+//! v3 stores classification separately so the whole signed domain survives.
 //!
-//! - [`SerializedSeal`] — fixed 128-byte binary record carrying every
-//!   field the trading-side `BufferedSeal` exposes (security_id +
-//!   exchange_segment_code + tf_ordinal + LiveCandleState fields).
-//!   Self-contained; does NOT import `tickvault-trading` so this slice
-//!   adds no new workspace dep edge.
-//! - [`SealSpillWriter`] — append-only file writer with:
-//!   - IST-date file rotation (`seals-2026-05-10.bin`), on a LONG-LIVED
-//!     handle: the file is opened once per IST day, not once per seal
-//!     (2026-08-10 — see [`SealSpillWriter::append_seal`]).
-//!   - Idempotent fixed-record append (`O(1)` per append, ONE `write(2)`).
-//!   - `read_all()` recovery scan for the writer-task drain loop.
-//!   - `set_spill_dir_for_test()` for parallel test isolation
-//!     (mirrors `tick_persistence::TickPersistenceWriter`).
+//! The v3 extension stores the original bucket definition and quality:
 //!
-//! ## Why a separate type vs reusing `BufferedSeal`
+//! | Bytes | Field |
+//! |---|---|
+//! | 128..132 | lot_size: u32 |
+//! | 132..136 | volume_quality: u32 |
+//! | 136..144 | instrument_definition_version: u64 |
+//! | 144..152 | bucket_revision: u64 |
+//! | 152..160 | underlying_id: u64 |
+//! | 160 | family_code: u8 (0 unknown, 1 stock, 2 index) |
+//! | 161 | net_volume_classified: u8 (0 or 1) |
+//! | 162..176 | reserved, zero on write |
 //!
-//! Adding `tickvault-trading = { path = "../trading" }` to storage's
-//! Cargo.toml introduces a new workspace dep edge (currently
-//! storage does NOT depend on trading). Per CLAUDE.md "New dep
-//! additions need Parthiban approval", that needs operator sign-off.
-//! The future glue slice (item 1.2c) will request the dep edge AND
-//! ship a `From<&BufferedSeal>` conversion. This slice keeps the
-//! spill primitive self-contained so it can land + ratchet the
-//! file-format invariants today.
+//! Old records have unknown metadata and cannot borrow today's master lot
+//! size. Unsupported versions and incomplete records fail a scan so an unread
+//! suffix cannot be reported as successfully replayed and then deleted.
 //!
-//! ## Wire format (128 bytes, little-endian)
-//!
-//! | Offset | Size | Field |
-//! |---|---|---|
-//! | 0    | 4 | `security_id` low-32 (legacy/Dhan; full u64 at 120-128) |
-//! | 4    | 1 | `exchange_segment_code: u8`     |
-//! | 5    | 1 | `tf_ordinal: u8` (0..=20 per `TfIndex`; 0..=4 = the legacy 5-frame set, 5..=20 = the C3 GDF-gated second-scale frames) |
-//! | 6    | 1 | `feed_index: u8` (`Feed::index()` — 0=Dhan, 1=Groww; pre-feed records read 0=Dhan) |
-//! | 7    | 1 | `format_version: u8` (=2 since 2026-09-10; 2026-07-21 C2 — 0 = pre-renumber legacy, REFUSED on load; 1 = pre-accumulator, still readable) |
-//! | 8    | 4 | `bucket_start_ist_secs: u32`    |
-//! | 12   | 4 | `tick_count: u32`               |
-//! | 16   | 8 | `volume: u64`                   |
-//! | 24   | 8 | `bucket_start_cumulative: u64`  |
-//! | 32   | 8 | `oi: i64`                       |
-//! | 40   | 8 | `open: f64`                     |
-//! | 48   | 8 | `high: f64`                     |
-//! | 56   | 8 | `low: f64`                      |
-//! | 64   | 8 | `close: f64`                    |
-//! | 72   | 8 | `close_pct_from_prev_day: f64`  |
-//! | 80   | 8 | `net_volume_signed: i64` (**v2**; `i64::MIN` = not classified). **v1 wrote `bucket_open_prev_close: f64` here** — see the version note below |
-//! | 88   | 4 | `total_buy_qty: u32`            |
-//! | 92   | 4 | `total_sell_qty: u32`           |
-//! | 96   | 8 | `open_pct: f64` (§31 Option 2)  |
-//! | 104  | 8 | `change_pct: f64` (2026-06-02)  |
-//! | 112  | 8 | `open_gap_pct: f64` (2026-06-02)|
-//! | 120  | 8 | `security_id: u64` full (2026-06-29; zero in legacy records → low-32 at 0-4) |
-//!
-//! ## Format version 2 (2026-09-10) — bytes 80..88 change MEANING
-//!
-//! Version 1 wrote `bucket_open_prev_close: f64` at bytes 80..88. That field
-//! was the OLD net-volume sign baseline (the previous sealed bar's close), and
-//! the 2026-09-10 tick-rule rewrite stopped reading it: `net_volume` is now
-//! accumulated per tick, and `close_pct_from_prev_day` is drawn from
-//! `prev_day_close`, never from this field. A reference scan found **no
-//! production reader anywhere** — it was written, spilled, and consumed by
-//! nothing.
-//!
-//! Those 8 bytes are therefore reclaimed for `net_volume_signed: i64`, which
-//! is what lets a spill-replayed bar report real flow instead of NULL. The
-//! record does NOT grow.
-//!
-//! **Why this needs the version bump, and why the bump is safe.** A v1 record's
-//! bytes 80..88 hold an `f64` price; decoding those bits as an `i64` would
-//! produce a colossal fabricated net volume (24200.10_f64 reads as
-//! 4_673_285_811_324_502_016). The decoder therefore reads byte 7 FIRST: a
-//! record below version 2 reports "not classified" (SQL NULL), which is
-//! exactly the behaviour those records had when they were written. The load
-//! gate refuses only version 0, so v1 records still replay — nothing on disk
-//! is orphaned by the bump.
-//!
-//! `i64::MIN` is the "not classified" sentinel for v2 records. It cannot
-//! collide with a real value: `LiveCandleState::net_volume` clamps to
-//! `±volume`, so the reachable range is `[-i64::MAX, i64::MAX]` and `i64::MIN`
-//! sits strictly outside it.
-//!
-//! Total: 128 bytes. The trailing 8-byte padding region (bytes 120..128)
-//! is reserved for future field additions WITHOUT a file-format break —
-//! readers that don't recognise additional fields ignore them. Pre-§31
-//! records have zero at bytes 96..104, so they decode `open_pct = 0.0`;
-//! pre-2026-06-02 records have zero at bytes 104..120, so they decode
-//! `change_pct = 0.0` / `open_gap_pct = 0.0` (all backward-compatible).
+//! Encoding is bounded, allocation-free work per record. File writes and
+//! full-file recovery have no constant wall-clock guarantee. `write_all`
+//! reaches the OS cache; it is not a power-loss durability acknowledgement.
 
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
@@ -106,40 +45,33 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{TimeZone, Utc};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
 use tickvault_common::feed::Feed;
-use tickvault_trading::candles::{BufferedSeal, TfIndex};
+use tickvault_trading::candles::volume_update::{
+    VOLUME_QUALITY_LEGACY_BASIS, VOLUME_QUALITY_UNKNOWN_METADATA,
+};
+use tickvault_trading::candles::{BufferedSeal, CandleMetadata, TfIndex};
 
 /// Production spill directory — same parent as `tick_persistence.rs`'s
 /// `TICK_SPILL_DIR` for operational consistency.
 const SEAL_SPILL_DIR: &str = "data/spill";
 
-/// Fixed record size in bytes per the wire-format table in the module
-/// docstring. Bumping this breaks the on-disk format — a forward
-/// migration must be coordinated.
-pub const SEAL_SPILL_RECORD_SIZE: usize = 128;
+/// Current v4 record size (unchanged from v3). Legacy strides remain readable.
+pub const SEAL_SPILL_RECORD_SIZE: usize = 176;
+/// Versions 1 and 2 keep their original stride when read from a mixed file.
+pub const SEAL_SPILL_LEGACY_RECORD_SIZE: usize = 128;
 
-/// On-disk spill-record format version, written at byte 7 (the former
-/// padding byte, zero in every pre-C2 record). The 2026-07-21 C2 frame
-/// retirement RENUMBERED `TfIndex` ordinals (old M2=1 would decode as
-/// new M3=1 — silent TF mis-assignment), so `read_all` REFUSES records
-/// whose byte 7 is 0 (legacy ordinal space) instead of misdecoding them.
-/// **Bumped 1 → 2 on 2026-09-10**: bytes 80..88 stopped being
-/// `bucket_open_prev_close: f64` (dead since the tick-rule rewrite — no
-/// production reader) and became `net_volume_signed: i64`, so a
-/// spill-replayed bar reports real flow instead of NULL. Same byte meaning
-/// read two ways, which is precisely what a version byte is for: `from_bytes`
-/// reads byte 7 before byte 80, and anything below 2 reports "not classified".
-/// The load gate still refuses only version 0, so v1 records on disk replay
-/// exactly as they did before.
-pub const SEAL_SPILL_FORMAT_VERSION: u8 = 2;
+/// Byte 7 selects the format and its record stride.
+pub const SEAL_SPILL_FORMAT_VERSION: u8 = 4;
+/// Historical v3 namespace, retained for discovery and recovery.
+pub const SEAL_SPILL_V3_EXTENSION: &str = "cseal3";
+/// Whole-bar caches are hidden from both v2 and v3 rollback readers.
+pub const SEAL_SPILL_V4_EXTENSION: &str = "cseal4";
 
-/// Sentinel written into bytes 80..88 when a v2 record's bar was never
-/// classified (a REST-folded bar, a zero-tick bar). It cannot collide with a
-/// real reading: `LiveCandleState::net_volume` clamps to `±volume`, so the
-/// reachable range is `[-i64::MAX, i64::MAX]` and this value sits outside it.
+/// Version 2's unclassified sentinel. Version 3 stores classification at
+/// byte161, preserving a real i64::MIN without collision.
 pub const SEAL_SPILL_NET_VOLUME_UNCLASSIFIED: i64 = i64::MIN;
 
 /// First format version whose bytes 80..88 carry `net_volume_signed`.
@@ -147,11 +79,9 @@ pub const SEAL_SPILL_FIRST_NET_VOLUME_VERSION: u8 = 2;
 
 /// Self-contained binary record for spilled sealed bars.
 ///
-/// Field layout matches the wire-format table above. The
-/// `tf_ordinal` field is the `TfIndex::as_ordinal()` value (0..=20)
-/// from the trading crate; the glue slice translates
-/// `BufferedSeal::tf` ↔ `tf_ordinal` via a checked
-/// `TfIndex::from_ordinal` round-trip.
+/// The `tf_ordinal` field is the durable `TfIndex::storage_ordinal()` value.
+/// Dense runtime array indexes must never be written here: retired storage
+/// IDs retain their historical meaning and are never reused for active frames.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SerializedSeal {
     /// `u64` (2026-06-29 widening) — the seal spill carries BOTH Dhan (≤u32)
@@ -180,17 +110,13 @@ pub struct SerializedSeal {
     pub low: f64,
     pub close: f64,
     pub close_pct_from_prev_day: f64,
-    /// Tick-rule signed order flow for this bar — buy-initiated minus
-    /// sell-initiated volume, accumulated per tick by the live fold. Bytes
-    /// 80..88, **format version 2 onward**.
+    /// Cached signed whole-bar quantity in v4, bytes 80..88. Versions 2/3
+    /// stored tick-rule sums; decoding tags those records as legacy basis
+    /// while retaining their diagnostic value and classification flag.
     ///
-    /// Paired with [`Self::net_volume_classified`]: this value is meaningless
-    /// unless that flag is true, and the two travel together precisely so a
-    /// bar nobody classified can never be replayed as "perfectly balanced
-    /// flow". On the wire they are ONE field — `i64::MIN`
-    /// ([`SEAL_SPILL_NET_VOLUME_UNCLASSIFIED`]) encodes the false flag —
-    /// because the record has no spare byte and that value is unreachable for
-    /// a real reading.
+    /// The classification flag is independent in v3 (byte161), preserving
+    /// classified zero and i64::MIN. Version2 used i64::MIN as its unavailable
+    /// sentinel; the decoder retains that historical meaning only for v2.
     ///
     /// ⚠ Bytes 80..88 held `bucket_open_prev_close: f64` in version 1. Reading
     /// those bits as an `i64` fabricates an enormous net volume, which is why
@@ -219,10 +145,14 @@ pub struct SerializedSeal {
     /// yesterday's close). Serialised into bytes 112..120 — pre-2026-06-02
     /// records decode `open_gap_pct = 0.0`, backward-compatible.
     pub open_gap_pct: f64,
+    /// Version 3 pins the definition and quality of the original bucket.
+    pub metadata: CandleMetadata,
+    pub volume_quality: u32,
+    pub bucket_revision: u64,
 }
 
 impl SerializedSeal {
-    /// Serialise to a fixed 128-byte little-endian record.
+    /// Serialise to the current 176-byte little-endian record.
     /// `O(1)`, zero allocation.
     #[must_use]
     pub fn to_bytes(&self) -> [u8; SEAL_SPILL_RECORD_SIZE] {
@@ -249,15 +179,11 @@ impl SerializedSeal {
         buf[56..64].copy_from_slice(&self.low.to_le_bytes());
         buf[64..72].copy_from_slice(&self.close.to_le_bytes());
         buf[72..80].copy_from_slice(&self.close_pct_from_prev_day.to_le_bytes());
-        // Bytes 80..88: net volume (v2). The unclassified sentinel is written
-        // rather than a zero — `0` is a legitimate reading ("balanced flow")
-        // and must stay distinguishable from "nobody measured this bar".
-        let net_on_wire = if self.net_volume_classified {
-            self.net_volume_signed
-        } else {
-            SEAL_SPILL_NET_VOLUME_UNCLASSIFIED
-        };
-        buf[80..88].copy_from_slice(&net_on_wire.to_le_bytes());
+        // Bytes 80..88 carry the cached signed quantity. Since v3 the flag is
+        // separate, preserving unavailable, tie-zero and diagnostic extremes.
+        // v4 changes the basis to whole-bar volume; the legacy quality bit
+        // remains set when forwarding a cache decoded from older records.
+        buf[80..88].copy_from_slice(&self.net_volume_signed.to_le_bytes());
         buf[88..92].copy_from_slice(&self.total_buy_qty.to_le_bytes());
         buf[92..96].copy_from_slice(&self.total_sell_qty.to_le_bytes());
         // §31 Option 2: open_pct in the first 8 reserved bytes.
@@ -269,17 +195,58 @@ impl SerializedSeal {
         // back: non-zero here → full u64; zero → legacy/Dhan record, fall back
         // to the low-32 at bytes 0-4.
         buf[120..128].copy_from_slice(&self.security_id.to_le_bytes());
+        // v3 extension: the old 128-byte prefix is byte-compatible. The
+        // version byte selects the stride, so v1/v2/v3 can share a daily file.
+        buf[128..132].copy_from_slice(&self.metadata.lot_size.to_le_bytes());
+        buf[132..136].copy_from_slice(&self.volume_quality.to_le_bytes());
+        buf[136..144].copy_from_slice(&self.metadata.instrument_definition_version.to_le_bytes());
+        buf[144..152].copy_from_slice(&self.bucket_revision.to_le_bytes());
+        buf[152..160].copy_from_slice(&self.metadata.underlying_id.to_le_bytes());
+        buf[160] = self.metadata.family_code;
+        buf[161] = u8::from(self.net_volume_classified);
         buf
     }
 
-    /// Deserialise from a fixed 128-byte little-endian record.
-    /// Returns `None` if the buffer is shorter than the record size
-    /// (truncated tail) — caller treats this as end-of-file.
+    /// Decode one supported version using its own stride. Short or unsupported
+    /// records return None; callers must retain their file rather than
+    /// confirming a successfully decoded prefix.
     #[must_use]
     pub fn from_bytes(buf: &[u8]) -> Option<Self> {
-        if buf.len() < SEAL_SPILL_RECORD_SIZE {
+        if buf.len() < 8 {
             return None;
         }
+        let record_size = match buf[7] {
+            1 | 2 => SEAL_SPILL_LEGACY_RECORD_SIZE,
+            3 | 4 => SEAL_SPILL_RECORD_SIZE,
+            _ => return None,
+        };
+        if buf.len() < record_size {
+            return None;
+        }
+        let metadata = if buf[7] >= 3 {
+            CandleMetadata {
+                lot_size: u32::from_le_bytes(buf[128..132].try_into().ok()?),
+                instrument_definition_version: u64::from_le_bytes(buf[136..144].try_into().ok()?),
+                underlying_id: u64::from_le_bytes(buf[152..160].try_into().ok()?),
+                family_code: buf[160],
+            }
+        } else {
+            CandleMetadata::UNKNOWN
+        };
+        let mut volume_quality = if buf[7] >= 3 {
+            u32::from_le_bytes(buf[132..136].try_into().ok()?)
+        } else {
+            VOLUME_QUALITY_UNKNOWN_METADATA
+        };
+        if buf[7] < 4 {
+            // v2/v3 cached tick-rule sums, never the current whole-bar basis.
+            volume_quality |= VOLUME_QUALITY_LEGACY_BASIS;
+        }
+        let bucket_revision = if buf[7] >= 3 {
+            u64::from_le_bytes(buf[144..152].try_into().ok()?)
+        } else {
+            0
+        };
         // Byte 6 = Feed::index(); fall back to Dhan for an out-of-range index
         // (pre-feed records have 0 here → Dhan; an unknown future index is
         // never silently mis-attributed to the WRONG known feed — it degrades
@@ -296,11 +263,22 @@ impl SerializedSeal {
         let net_raw = i64::from_le_bytes([
             buf[80], buf[81], buf[82], buf[83], buf[84], buf[85], buf[86], buf[87],
         ]);
-        let carries_net_volume = buf[7] >= SEAL_SPILL_FIRST_NET_VOLUME_VERSION;
-        let net_classified = carries_net_volume && net_raw != SEAL_SPILL_NET_VOLUME_UNCLASSIFIED;
+        let net_classified = match buf[7] {
+            3 | 4 => match buf[161] {
+                0 => false,
+                1 => true,
+                _ => return None,
+            },
+            2 => net_raw != SEAL_SPILL_NET_VOLUME_UNCLASSIFIED,
+            _ => false,
+        };
         // Zero rather than the raw bits when unclassified, so a caller that
         // ignores the flag still cannot read a fabricated magnitude.
-        let net_signed = if net_classified { net_raw } else { 0 };
+        let net_signed = if buf[7] >= 3 || net_classified {
+            net_raw
+        } else {
+            0
+        };
 
         // Full u64 security_id from the reserved 120-128 region (2026-06-29
         // widening). A legacy/Dhan record has zero there → fall back to the
@@ -314,6 +292,9 @@ impl SerializedSeal {
             u64::from(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]))
         };
         Some(Self {
+            metadata,
+            volume_quality,
+            bucket_revision,
             security_id,
             exchange_segment_code: buf[4],
             tf_ordinal: buf[5],
@@ -369,15 +350,11 @@ impl SerializedSeal {
         })
     }
 
-    /// Decode `tf_ordinal` back to a strongly-typed [`TfIndex`].
-    /// Returns `None` if the on-disk record was written with an
-    /// out-of-range ordinal (forward-compat scenario where a future
-    /// shadow-table set adds TFs that this older binary doesn't
-    /// recognise — the writer task drops the record with a `warn!`
-    /// rather than panicking).
+    /// Decode a durable storage ID into an active [`TfIndex`]. Retired and
+    /// unknown IDs return `None`; recovery retains their original file.
     #[must_use]
     pub fn tf(&self) -> Option<TfIndex> {
-        TfIndex::from_ordinal(self.tf_ordinal as usize)
+        TfIndex::from_storage_ordinal(self.tf_ordinal)
     }
 }
 
@@ -405,7 +382,7 @@ impl From<&BufferedSeal> for SerializedSeal {
         Self {
             security_id: b.security_id,
             exchange_segment_code: b.exchange_segment_code,
-            tf_ordinal: b.tf.as_ordinal() as u8,
+            tf_ordinal: b.tf.storage_ordinal(),
             feed: b.feed,
             bucket_start_ist_secs: b.state.bucket_start_ist_secs,
             tick_count: b.state.tick_count,
@@ -425,19 +402,18 @@ impl From<&BufferedSeal> for SerializedSeal {
             // change_pct == close_pct_from_prev_day (derived, not a state field).
             change_pct: b.state.close_pct_from_prev_day,
             open_gap_pct: b.state.open_gap_pct,
+            metadata: b.state.metadata,
+            volume_quality: b.state.volume_quality,
+            bucket_revision: b.state.bucket_revision,
         }
     }
 }
 
 impl SerializedSeal {
     /// Construct a [`BufferedSeal`] from this serialised record.
-    /// Returns `None` if `tf_ordinal` is out of range (forward-compat
-    /// guard per [`Self::tf`]). Used by the writer task on REPLAY
-    /// from disk-spill.
-    ///
-    /// Callers that get `None` MUST log
-    /// `warn!(?tf_ordinal, "spill record skipped — unknown tf_ordinal")`
-    /// and continue draining the rest of the file rather than abort.
+    /// Returns `None` for retired or unknown durable timeframe IDs. Recovery
+    /// counts retired history separately, preserves the original file, and
+    /// continues decoding active siblings without relabelling historical bytes.
     #[must_use]
     pub fn try_into_buffered_seal(&self) -> Option<BufferedSeal> {
         use tickvault_trading::candles::LiveCandleState;
@@ -453,9 +429,8 @@ impl SerializedSeal {
         state.oi = self.oi;
         state.tick_count = self.tick_count;
         state.close_pct_from_prev_day = self.close_pct_from_prev_day;
-        // The accumulator now SURVIVES the spill (format v2), so a replayed bar
-        // reports real flow. A v1 record decodes `classified = false`, which is
-        // the pre-v2 behaviour: `net_volume()` returns None and persists NULL.
+        // Copy the versioned cache; v2/v3 have a legacy quality bit and cannot
+        // become whole-bar volume. Their omitted prior close is never inferred.
         state.net_volume_signed = self.net_volume_signed;
         state.net_volume_classified = self.net_volume_classified;
         state.total_buy_qty = self.total_buy_qty;
@@ -467,6 +442,9 @@ impl SerializedSeal {
         // derived (== close_pct_from_prev_day), so it's not a state field —
         // the replayed close_pct restores it at the next extraction.
         state.open_gap_pct = self.open_gap_pct;
+        state.metadata = self.metadata;
+        state.volume_quality = self.volume_quality;
+        state.bucket_revision = self.bucket_revision;
         Some(BufferedSeal::new(
             self.security_id,
             self.exchange_segment_code,
@@ -477,11 +455,7 @@ impl SerializedSeal {
     }
 }
 
-// Compile-time size check: keep `SerializedSeal` in-memory ≤ 128 bytes
-// so the on-disk record (128 bytes) and the in-memory representation
-// stay aligned. With current fields (4+1+1+padding+4+4+8+8+8+8×9 ≈
-// 110 bytes) the natural alignment puts us at 112; padding to 128 in
-// the wire format leaves 16 bytes of slack for future fields.
+// Fixed-size metadata keeps each wire record and in-memory record bounded.
 const _: () = assert!(
     std::mem::size_of::<SerializedSeal>() <= SEAL_SPILL_RECORD_SIZE,
     "SerializedSeal in-memory size exceeded SEAL_SPILL_RECORD_SIZE — bump record size + plan a forward migration."
@@ -500,7 +474,11 @@ fn ist_date_filename(now_unix_secs: i64) -> String {
         .timestamp_opt(ist_secs, 0)
         .single()
         .unwrap_or_else(|| Utc.timestamp_opt(0, 0).single().unwrap_or_default());
-    dt.format("seals-%Y-%m-%d.bin").to_string()
+    format!(
+        "{}.{}",
+        dt.format("seals-%Y-%m-%d"),
+        SEAL_SPILL_V4_EXTENSION
+    )
 }
 
 /// IST calendar-day number (days since the IST-shifted epoch) for a UTC
@@ -523,6 +501,61 @@ fn ist_day_number(now_unix_secs: i64) -> i64 {
 struct OpenSpillFile {
     ist_day: i64,
     file: File,
+}
+
+/// Cold-path bound for collision-safe recovery names. Exhaustion is an error;
+/// there is no unchecked or undiscoverable `.overflow` fallback.
+pub(crate) const SEAL_MOVE_NAME_ATTEMPTS: u32 = 10_000;
+
+/// Publish a new hard link before removing the source name. `hard_link` refuses
+/// an occupied destination atomically, including a concurrent creator. A crash
+/// between these operations can leave two recoverable names; candle DEDUP
+/// absorbs their replay. It never replaces a destination's existing bytes.
+/// Cross-filesystem moves and exhausted names fail with the source retained.
+pub(crate) fn move_seal_file_no_replace(
+    source: &Path,
+    directory: &Path,
+) -> std::io::Result<PathBuf> {
+    let metadata = std::fs::symlink_metadata(source)?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "seal recovery source is not a regular file",
+        ));
+    }
+    let name = source.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "seal source has no filename",
+        )
+    })?;
+    for suffix in 0..SEAL_MOVE_NAME_ATTEMPTS {
+        let mut candidate_name = name.to_os_string();
+        if suffix != 0 {
+            candidate_name.push(format!(".{suffix}"));
+        }
+        let target = directory.join(candidate_name);
+        match std::fs::hard_link(source, &target) {
+            Ok(()) => {
+                // Persist the discoverable destination before removing the
+                // source name. A failed barrier leaves both names intact.
+                #[cfg(unix)]
+                File::open(directory)?.sync_all()?;
+                std::fs::remove_file(source)?;
+                #[cfg(unix)]
+                if let Some(parent) = source.parent() {
+                    File::open(parent)?.sync_all()?;
+                }
+                return Ok(target);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "all bounded seal recovery names are occupied; source retained",
+    ))
 }
 
 /// Append-only spill writer. One instance lives in the writer task;
@@ -555,6 +588,10 @@ pub struct SealSpillWriter {
     /// affordable.
     err_no_handle: metrics::Counter,
     err_write: metrics::Counter,
+    /// One-shot, instance-local partial-write injection for real cascade tests.
+    /// The production writer has neither this field nor its branch.
+    #[cfg(test)]
+    fail_next_write_after: std::sync::atomic::AtomicUsize,
 }
 
 /// Name of the spill-write failure counter. Both label values are
@@ -570,6 +607,8 @@ impl SealSpillWriter {
             open: Mutex::new(None),
             err_no_handle: metrics::counter!(SPILL_WRITE_ERRORS_COUNTER, "stage" => "no_handle"),
             err_write: metrics::counter!(SPILL_WRITE_ERRORS_COUNTER, "stage" => "write"),
+            #[cfg(test)]
+            fail_next_write_after: std::sync::atomic::AtomicUsize::new(usize::MAX),
         }
     }
 
@@ -594,6 +633,8 @@ impl SealSpillWriter {
             open: Mutex::new(None),
             err_no_handle: metrics::counter!(SPILL_WRITE_ERRORS_COUNTER, "stage" => "no_handle"),
             err_write: metrics::counter!(SPILL_WRITE_ERRORS_COUNTER, "stage" => "write"),
+            #[cfg(test)]
+            fail_next_write_after: std::sync::atomic::AtomicUsize::new(usize::MAX),
         }
     }
 
@@ -607,7 +648,9 @@ impl SealSpillWriter {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Opens (creating as needed) the append handle for `path`.
+    /// Opens a clean append handle. An existing daily file must have complete
+    /// supported framing before another seal may be appended. This cold scan
+    /// also handles a process that died partway through its last write.
     ///
     /// Still calls `create_dir_all` — the chaos suite injects "spill disk
     /// dead" by placing a regular FILE at the spill-dir path, which makes
@@ -617,11 +660,79 @@ impl SealSpillWriter {
     fn open_append_handle(&self, path: &Path) -> Result<File> {
         std::fs::create_dir_all(&self.spill_dir)
             .with_context(|| format!("failed to create spill dir {:?}", self.spill_dir))?;
-        std::fs::OpenOptions::new()
-            .create(true)
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
             .append(true)
             .open(path)
-            .with_context(|| format!("failed to open spill file {path:?}"))
+        {
+            Ok(file) => Ok(file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                anyhow::ensure!(
+                    std::fs::symlink_metadata(path)?.is_file(),
+                    "existing seal spill is not a regular file: {path:?}"
+                );
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .append(true)
+                    .open(path)?;
+                let mut reader = BufReader::new(file.try_clone()?);
+                let mut bytes = [0u8; SEAL_SPILL_RECORD_SIZE];
+                let framing = (|| -> Result<()> {
+                    while let Some(size) = read_full_record(&mut reader, &mut bytes)? {
+                        anyhow::ensure!(
+                            SerializedSeal::from_bytes(&bytes[..size]).is_some(),
+                            "invalid existing seal record"
+                        );
+                    }
+                    Ok(())
+                })();
+                drop(reader);
+                if framing.is_ok() {
+                    return Ok(file);
+                }
+                drop(file);
+                let retained = self.isolate_failed_file(path)?;
+                warn!(?path, ?retained, error = ?framing.err(), "incomplete seal spill isolated before reopening");
+                std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .append(true)
+                    .open(path)
+                    .with_context(|| format!("failed to create clean spill file {path:?}"))
+            }
+            Err(error) => Err(error).with_context(|| format!("failed to open spill file {path:?}")),
+        }
+    }
+
+    /// Keep the original in the existing replay namespace, under a no-replace
+    /// identity. Recovery defers the whole original when its tail is torn;
+    /// replaying a retained prefix could overwrite newer revisions. If
+    /// isolation fails, the bytes remain at the source or recovery
+    /// destination. A surviving daily file must revalidate before reopening,
+    /// so no later accepted seal can hide behind its bad tail.
+    fn isolate_failed_file(&self, path: &Path) -> Result<PathBuf> {
+        let replaying = self
+            .spill_dir
+            .join(crate::seal_writer_task::SEAL_REPLAYING_SUBDIR);
+        std::fs::create_dir_all(&replaying)?;
+        move_seal_file_no_replace(path, &replaying)
+            .with_context(|| {
+                format!("failed to finish isolating incomplete spill {path:?}; bytes retained at source or replay destination")
+            })
+    }
+
+    fn write_record(&self, file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
+        #[cfg(test)]
+        {
+            let cutoff = self
+                .fail_next_write_after
+                .swap(usize::MAX, std::sync::atomic::Ordering::Relaxed);
+            if cutoff != usize::MAX {
+                file.write_all(&bytes[..cutoff.min(bytes.len())])?;
+                return Err(std::io::Error::other("injected partial seal write"));
+            }
+        }
+        file.write_all(bytes)
     }
 
     /// Returns the path of the spill file for the given UTC unix
@@ -631,9 +742,10 @@ impl SealSpillWriter {
         self.spill_dir.join(ist_date_filename(now_unix_secs))
     }
 
-    /// Append one serialised seal to the daily spill file.
-    /// O(1) work per call and, in steady state, **exactly ONE syscall per
-    /// seal** (`write(2)` on a long-lived append handle).
+    /// Append one serialised seal to the daily spill file. Warm framing is
+    /// fixed-size work with a cached descriptor. `write_all` can issue more
+    /// than one syscall after a short write; cold reopening validates existing
+    /// file contents and recovery names are searched under a finite bound.
     ///
     /// ## What changed 2026-08-10 (and what deliberately did NOT)
     ///
@@ -700,7 +812,7 @@ impl SealSpillWriter {
             );
         };
 
-        // ONE `write(2)`. The file is unbuffered by design: the previous
+        // Unbuffered `write_all`. The file is unbuffered by design: the previous
         // implementation's `BufWriter::flush()` bought exactly this syscall
         // (a 128-byte record never fills an 8 KiB buffer, so without the
         // flush nothing reached the kernel at all). Writing through keeps the
@@ -709,14 +821,20 @@ impl SealSpillWriter {
         // what `chaos_seal_sigkill_spill_replay.rs` recovers. Introducing a
         // cross-seal user-space buffer WOULD regress that; see the
         // module-level note on why it is deliberately not done.
-        if let Err(err) = current.file.write_all(&bytes) {
-            // Drop the possibly-broken handle so the next call reopens —
-            // mirrors `ws_frame_spill::persist_record_resilient`. The error
-            // still propagates, so the absorption pipeline escalates THIS
-            // seal to the tier-3 DLQ exactly as before.
+        if let Err(err) = self.write_record(&mut current.file, &bytes) {
+            // Retain the interrupted original separately before a later seal
+            // opens a fresh daily file. The failing seal still returns Err
+            // exactly once to the absorption pipeline for DLQ escalation.
             *open = None;
             self.err_write.increment(1);
             let path = self.spill_path(now_unix_secs);
+            if let Err(isolation) = self.isolate_failed_file(&path) {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to write seal to {path:?}; isolation also failed: {isolation:#}"
+                    )
+                });
+            }
             return Err(err).with_context(|| format!("failed to write seal to {path:?}"));
         }
         Ok(())
@@ -734,63 +852,33 @@ impl SealSpillWriter {
         *self.lock_open() = None;
     }
 
-    /// Drains the daily spill file by reading every full 128-byte
-    /// record into the returned `Vec`. Truncated trailing partial
-    /// records are silently dropped (`from_bytes` returns `None`)
-    /// and a `warn!` is logged so the operator notices.
-    ///
-    /// After successful read the caller (writer task) deletes the
-    /// spill file via [`Self::clear_spill_for_date`].
-    ///
-    /// Returns an empty `Vec` if the spill file does not exist
-    /// (the happy path on a fresh boot).
+    /// Read every complete supported record without changing the file.
+    /// Any truncated/unsupported record fails the whole scan, preventing a
+    /// caller from clearing unread bytes after accepting a successful prefix.
     pub fn read_all(&self, now_unix_secs: i64) -> Result<Vec<SerializedSeal>> {
         let path = self.spill_path(now_unix_secs);
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        let file = std::fs::File::open(&path)
-            .with_context(|| format!("failed to open spill file {path:?}"))?;
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Vec::new());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to open spill file {path:?}"));
+            }
+        };
         let mut reader = BufReader::new(file);
         let mut all = Vec::new();
-        let mut legacy_refused: usize = 0;
         let mut buf = [0u8; SEAL_SPILL_RECORD_SIZE];
         loop {
-            match read_full_record(&mut reader, &mut buf) {
-                Ok(true) => {
-                    // Format-version gate (2026-07-21 C2): a byte-7 of 0 marks a
-                    // pre-renumber record whose tf_ordinal lives in the OLD 12-frame
-                    // ordinal space (old M2=1 would misdecode as new M3=1). Refuse
-                    // the record, keep draining — a daily file can legitimately mix
-                    // legacy + v1 records via append across a deploy boundary.
-                    if buf[7] == 0 {
-                        legacy_refused += 1;
-                        continue;
-                    }
-                    if let Some(seal) = SerializedSeal::from_bytes(&buf) {
-                        all.push(seal);
-                    } else {
-                        warn!(
-                            ?path,
-                            "spill record decode returned None — corrupt tail, stopping read"
-                        );
-                        break;
-                    }
-                }
-                Ok(false) => break, // clean EOF
-                Err(err) => {
-                    warn!(?path, ?err, "partial trailing record discarded");
-                    break;
-                }
-            }
-        }
-        if legacy_refused > 0 {
-            warn!(
-                ?path,
-                legacy_refused,
-                "refused pre-renumber legacy spill records (format_version byte 0 — \
-                 old TfIndex ordinal space; deleted with the file after drain)"
-            );
+            let Some(record_size) = read_full_record(&mut reader, &mut buf).with_context(|| {
+                format!("incomplete or unsupported seal spill at {path:?}; file retained")
+            })?
+            else {
+                break;
+            };
+            let seal = SerializedSeal::from_bytes(&buf[..record_size])
+                .with_context(|| format!("seal spill decode failed at {path:?}; file retained"))?;
+            all.push(seal);
         }
         info!(?path, count = all.len(), "drained spill file");
         Ok(all)
@@ -823,33 +911,37 @@ impl Default for SealSpillWriter {
     }
 }
 
-/// Reads exactly `RECORD_SIZE` bytes into `buf`. Returns:
-/// - `Ok(true)`  — full record read.
-/// - `Ok(false)` — clean EOF (zero bytes available).
-/// - `Err(_)`    — partial trailing record OR underlying I/O error.
-fn read_full_record(
-    reader: &mut BufReader<std::fs::File>,
+/// Read the versioned prefix, then exactly that version's remaining bytes.
+/// Unknown versions and incomplete records fail the whole scan: returning a
+/// successful prefix would let the caller delete an unread suffix.
+pub(crate) fn read_full_record(
+    reader: &mut impl Read,
     buf: &mut [u8; SEAL_SPILL_RECORD_SIZE],
-) -> Result<bool> {
+) -> Result<Option<usize>> {
     let mut read_so_far = 0;
-    while read_so_far < SEAL_SPILL_RECORD_SIZE {
+    while read_so_far < 8 {
         let n = reader
-            .read(&mut buf[read_so_far..])
+            .read(&mut buf[read_so_far..8])
             .with_context(|| "spill file read")?;
         if n == 0 {
-            // EOF: clean if no bytes read this iteration AND none in
-            // the partial accumulation.
             if read_so_far == 0 {
-                return Ok(false);
+                return Ok(None);
             }
-            // Partial trailing record — caller logs + truncates.
-            anyhow::bail!(
-                "spill file ended mid-record (got {read_so_far} of {SEAL_SPILL_RECORD_SIZE} bytes)"
-            );
+            anyhow::bail!("spill file ended mid-header ({read_so_far} of 8 bytes)");
         }
         read_so_far += n;
     }
-    Ok(true)
+    let record_size = match buf[7] {
+        1 | 2 => SEAL_SPILL_LEGACY_RECORD_SIZE,
+        3 | 4 => SEAL_SPILL_RECORD_SIZE,
+        version => {
+            anyhow::bail!("unsupported seal spill version {version}; cannot infer record stride")
+        }
+    };
+    reader
+        .read_exact(&mut buf[8..record_size])
+        .with_context(|| format!("spill file ended mid-record (expected {record_size} bytes)"))?;
+    Ok(Some(record_size))
 }
 
 /// Spill-related I/O timeout in seconds. Held as a named constant so
@@ -873,10 +965,10 @@ pub const SEAL_SPILL_IO_TIMEOUT: Duration = Duration::from_secs(SEAL_SPILL_IO_TI
 pub struct SpillPruneOutcome {
     /// Spill files deleted (older than the retention window).
     pub deleted: usize,
-    /// Of those, how many still held records — i.e. seals that were never
-    /// replayed into QuestDB. NON-ZERO IS AN INCIDENT, not routine cleanup.
+    /// Compatibility counter: this sweep now refuses every nonempty file, so
+    /// this remains zero.
     pub deleted_non_empty: usize,
-    /// Total unreplayed records in the deleted files (bytes / record size).
+    /// Compatibility counter, always zero under the protect-unconfirmed policy.
     pub records_lost: u64,
     /// Files that should have been deleted but could not be.
     pub failed: usize,
@@ -885,37 +977,14 @@ pub struct SpillPruneOutcome {
     /// Files skipped because they are TODAY's file — the one the live writer
     /// may hold an open descriptor to. Never deleted at any age.
     pub skipped_live: usize,
+    /// Nonempty, unconfirmed files retained regardless of age.
+    pub skipped_unconfirmed: usize,
 }
 
-/// Deletes spill files older than `max_age_secs` — pure-testable core over an
-/// injected `now`.
-///
-/// # Why this exists (2026-08-19)
-///
-/// `data/spill/` had **no retention of any kind**. `SPILL_FILE_MAX_AGE_SECS`
-/// was defined, documented and unit-tested, but a workspace scan found ZERO
-/// production consumers, and `clear_spill_for_date` — documented as "called by
-/// the writer task after `read_all` is fully replayed" — has zero production
-/// callers too. The writer chain only ever appends. So spill files accumulated
-/// for the life of the deployment, and a QuestDB outage grew them without any
-/// bound at all.
-///
-/// # Why this deletes LOUDLY, unlike the WAL archive sweep
-///
-/// The WAL archive holds frames already re-injected and durably persisted —
-/// deleting an aged copy loses nothing. Spill is the opposite: it holds seals
-/// that have NOT reached QuestDB. Deleting a non-empty spill file destroys
-/// data.
-///
-/// That is why the age window is generous and every non-empty deletion is
-/// counted and reported. A spill file a week old that still holds records
-/// means the replay path has been broken for a week — an incident that must
-/// be surfaced, never a quiet tidy-up.
-///
-/// The alternative — never deleting — is not the safe choice it appears to be:
-/// an unbounded directory fills the volume, and a full volume stops EVERY
-/// table on the box, including the live writes these seals would be replayed
-/// into. Bounded-and-loud beats unbounded-and-silent.
+/// Removes only aged, empty spill files. Every nonempty active spill remains
+/// unconfirmed until replay succeeds, regardless of its age. Retained bytes
+/// are measured and the existing admission floor handles disk exhaustion;
+/// this sweep never trades acknowledged history for spare capacity.
 #[must_use]
 pub fn prune_spill_files_at(
     spill_dir: &Path,
@@ -952,6 +1021,9 @@ pub fn prune_spill_files_at(
             .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
             .unwrap_or(0),
     );
+    let live_legacy_name = live_name
+        .rsplit_once('.')
+        .map(|(stem, _)| format!("{stem}.bin"));
     // O(1) EXEMPT: periodic cold retention sweep, never the per-seal append
     let Ok(entries) = std::fs::read_dir(spill_dir) else {
         return outcome; // missing dir — nothing to prune
@@ -962,12 +1034,16 @@ pub fn prune_spill_files_at(
         // Only our own spill records. Anything else in the directory is left
         // strictly alone — deleting a file we did not write, to satisfy our
         // own budget, would be indefensible.
-        if path.extension().and_then(|s| s.to_str()) != Some("bin") {
+        if !matches!(
+            path.extension().and_then(|s| s.to_str()),
+            Some("bin" | SEAL_SPILL_V3_EXTENSION | SEAL_SPILL_V4_EXTENSION)
+        ) {
             continue;
         }
         // The live-writer guard. Cheap, and it fails SAFE: an unreadable file
         // name is treated as live and kept, never deleted on uncertainty.
-        if path.file_name().and_then(|n| n.to_str()) != Some(live_name.as_str()) {
+        let name = path.file_name().and_then(|n| n.to_str());
+        if name != Some(live_name.as_str()) && name != live_legacy_name.as_deref() {
             // not today's file — eligible, fall through to the age check
         } else {
             outcome.skipped_live += 1;
@@ -980,6 +1056,16 @@ pub fn prune_spill_files_at(
             continue; // unreadable metadata — keep, never delete on uncertainty
         };
         let len = meta.len();
+        // Age is not a persistence acknowledgement. Only replay confirmation
+        // may move nonempty data to archive; the active spill directory has
+        // no commit receipt proving these bytes are disposable. The existing
+        // free-space admission gate must refuse/escalate new writes instead
+        // of destroying unconfirmed history to manufacture capacity.
+        if len > 0 {
+            outcome.skipped_unconfirmed += 1;
+            outcome.bytes_after = outcome.bytes_after.saturating_add(len);
+            continue;
+        }
         let aged_out = meta
             .modified()
             .ok()
@@ -993,12 +1079,6 @@ pub fn prune_spill_files_at(
         match std::fs::remove_file(&path) {
             Ok(()) => {
                 outcome.deleted += 1;
-                if len > 0 {
-                    outcome.deleted_non_empty += 1;
-                    outcome.records_lost = outcome
-                        .records_lost
-                        .saturating_add(len / SEAL_SPILL_RECORD_SIZE as u64);
-                }
             }
             Err(err) => {
                 outcome.failed += 1;
@@ -1017,7 +1097,7 @@ pub fn prune_spill_files_at(
 /// Wall-clock wrapper over [`prune_spill_files_at`]. Cold path — called from
 /// the periodic retention task in `main.rs`.
 ///
-/// Reports at `error!` with a code when a deleted file still held records,
+/// Reports retained unconfirmed data with a code and its byte count,
 /// because that is unreplayed data leaving the box.
 // TEST-EXEMPT: thin wall-clock wrapper — all deletion and accounting logic is
 // covered by the six spill_sweep_* tests against prune_spill_files_at; this
@@ -1026,16 +1106,13 @@ pub fn prune_spill_files_at(
 #[must_use]
 pub fn prune_spill_files(spill_dir: &Path, max_age_secs: u64) -> SpillPruneOutcome {
     let outcome = prune_spill_files_at(spill_dir, max_age_secs, std::time::SystemTime::now());
-    if outcome.deleted_non_empty > 0 {
-        error!(
+    if outcome.skipped_unconfirmed > 0 {
+        warn!(
             code = "SPILL-RETENTION-01",
-            files = outcome.deleted_non_empty,
-            records_lost = outcome.records_lost,
+            files = outcome.skipped_unconfirmed,
+            bytes_after = outcome.bytes_after,
             max_age_secs,
-            "spill files aged out while STILL HOLDING unreplayed seals — the \
-             replay path has been broken for longer than the retention window. \
-             This is data loss, reported rather than hidden; investigate why \
-             the writer never drained these."
+            "unconfirmed candle spill retained; restore replay before the free-space admission floor is reached"
         );
     } else if outcome.deleted > 0 {
         info!(
@@ -1055,6 +1132,10 @@ mod tests {
 
     fn mk_seal(sid: u64, seg: u8, tf: u8, bucket: u32, close: f64) -> SerializedSeal {
         SerializedSeal {
+            metadata: tickvault_trading::candles::CandleMetadata::UNKNOWN,
+            volume_quality:
+                tickvault_trading::candles::volume_update::VOLUME_QUALITY_UNKNOWN_METADATA,
+            bucket_revision: 0,
             security_id: sid,
             exchange_segment_code: seg,
             tf_ordinal: tf,
@@ -1069,7 +1150,7 @@ mod tests {
             low: 99.0,
             close,
             close_pct_from_prev_day: 1.5,
-            net_volume_signed: -4_242,
+            net_volume_signed: -424,
             net_volume_classified: true,
             total_buy_qty: 89_600,
             total_sell_qty: 4_800,
@@ -1077,6 +1158,261 @@ mod tests {
             change_pct: 1.5,
             open_gap_pct: 0.8,
         }
+    }
+
+    #[test]
+    fn partial_write_isolated_then_healthy_seal_and_single_dlq_record_recover() {
+        use crate::seal_absorption::{SealAbsorptionPipeline, SubmitOutcome};
+        use crate::seal_writer_task::{
+            SEAL_ARCHIVE_SUBDIR, SEAL_REPLAYING_SUBDIR, SealSink, drain_recovered_seals,
+        };
+
+        #[derive(Default)]
+        struct RecoverySink(Vec<u64>);
+        impl SealSink for RecoverySink {
+            fn recover_batch(
+                &mut self,
+                seals: &[BufferedSeal],
+            ) -> Result<
+                crate::seal_recovery_guard::RecoveredBatch,
+                crate::seal_recovery_guard::RecoveryRefusal,
+            > {
+                crate::seal_writer_task::recover_fixture_batch(self, seals)
+            }
+
+            fn append_seal(&mut self, seal: &BufferedSeal) -> anyhow::Result<()> {
+                self.0.push(seal.security_id);
+                Ok(())
+            }
+            fn flush(&mut self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn discard_pending(&mut self) {}
+        }
+
+        // Include zero bytes, both header boundaries, the old record boundary
+        // and a nearly complete v3 record. The actual pipeline performs the
+        // failure escalation; the test does not duplicate its cascade logic.
+        for cutoff in [0, 1, 7, 8, 127, 128, SEAL_SPILL_RECORD_SIZE - 1] {
+            let base = std::env::temp_dir()
+                .join(format!("tv-seal-partial-{}-{cutoff}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).expect("fixture root");
+            let spill = base.join("spill");
+            let dlq = base.join("dlq");
+            // Start with an absent spill directory, as on a fresh boot. Its
+            // first free-space probe is unavailable and the existing policy
+            // permits capture; all three calls share that cached observation.
+            let pipeline = SealAbsorptionPipeline::with_capacity_and_dirs_for_test(
+                4,
+                spill.clone(),
+                dlq.clone(),
+            );
+            let writer = pipeline.spill_handle();
+            let now = 1_777_000_000;
+            let first = mk_seal(11, 0, 0, 1_716_000_900, 100.0);
+            let failed = mk_seal(22, 0, 0, 1_716_000_900, 100.0);
+            let later = mk_seal(33, 0, 0, 1_716_000_900, 100.0);
+            assert_eq!(
+                pipeline.rescue_in_flight(first.try_into_buffered_seal().expect("first seal"), now),
+                SubmitOutcome::Spilled
+            );
+            writer
+                .fail_next_write_after
+                .store(cutoff, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                pipeline
+                    .rescue_in_flight(failed.try_into_buffered_seal().expect("failed seal"), now),
+                SubmitOutcome::DlqWritten
+            );
+            assert_eq!(
+                pipeline.rescue_in_flight(later.try_into_buffered_seal().expect("later seal"), now),
+                SubmitOutcome::Spilled
+            );
+            assert_eq!(writer.read_all(now).expect("clean daily file"), vec![later]);
+            let dlq_records = pipeline
+                .dlq_handle()
+                .read_all(now)
+                .expect("single escalation");
+            assert_eq!(dlq_records.len(), 1);
+            assert_eq!(dlq_records[0].security_id, failed.security_id);
+            let name = writer
+                .spill_path(now)
+                .file_name()
+                .expect("name")
+                .to_os_string();
+            let mut original = first.to_bytes().to_vec();
+            original.extend_from_slice(&failed.to_bytes()[..cutoff]);
+            assert_eq!(
+                std::fs::read(spill.join(SEAL_REPLAYING_SUBDIR).join(&name))
+                    .expect("interrupted original retained"),
+                original
+            );
+            drop(writer);
+            drop(pipeline);
+
+            let mut sink = RecoverySink::default();
+            let outcome = drain_recovered_seals(&mut sink, &spill, &dlq, 64);
+            sink.0.sort_unstable();
+            if cutoff == 0 {
+                assert_eq!(
+                    sink.0,
+                    vec![11, 22, 33],
+                    "a complete original and the two healthy files remain replayable"
+                );
+                assert_eq!(outcome.seals_reingested, 3);
+                assert!(!outcome.pending_count_unknown);
+                assert_eq!(
+                    std::fs::read(spill.join(SEAL_ARCHIVE_SUBDIR).join(&name))
+                        .expect("complete old prefix archived"),
+                    original
+                );
+            } else {
+                assert_eq!(
+                    sink.0,
+                    vec![22, 33],
+                    "the torn original's valid prefix must stay deferred; only separate healthy files replay"
+                );
+                assert_eq!(outcome.seals_reingested, 2);
+                assert_eq!(outcome.seals_left_pending, 1);
+                assert_eq!(outcome.files_deferred_invalid, 1);
+                assert!(outcome.pending_count_unknown);
+                assert_eq!(outcome.files_left_pending, 1);
+                assert_eq!(
+                    std::fs::read(spill.join(SEAL_REPLAYING_SUBDIR).join(&name))
+                        .expect("whole torn original survives recovery"),
+                    original
+                );
+            }
+            std::fs::remove_dir_all(base).expect("cleanup");
+        }
+    }
+
+    #[test]
+    fn a_restarted_writer_cannot_append_a_healthy_seal_behind_a_torn_tail() {
+        let dir = std::env::temp_dir().join(format!("tv-seal-restart-torn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = 1_777_000_000;
+        let first = mk_seal(11, 0, 0, 1_716_000_900, 100.0);
+        let later = mk_seal(22, 0, 0, 1_716_000_900, 100.0);
+        let mut original = first.to_bytes().to_vec();
+        original.extend_from_slice(&later.to_bytes()[..9]);
+        let path = writer.spill_path(now);
+        std::fs::write(&path, &original).expect("simulate interrupted earlier process");
+        writer
+            .append_seal(&later, now)
+            .expect("fresh correctly framed file");
+        assert_eq!(writer.read_all(now).expect("healthy record"), vec![later]);
+        assert_eq!(
+            std::fs::read(
+                dir.join(crate::seal_writer_task::SEAL_REPLAYING_SUBDIR)
+                    .join(path.file_name().expect("filename"))
+            )
+            .expect("torn original retained"),
+            original
+        );
+        drop(writer);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn failed_isolation_refuses_later_appends_until_the_original_can_be_retained() {
+        let dir =
+            std::env::temp_dir().join(format!("tv-seal-isolation-blocked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+        let blocker = dir.join(crate::seal_writer_task::SEAL_REPLAYING_SUBDIR);
+        std::fs::write(&blocker, b"not a directory").expect("staging blocker");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = 1_777_000_000;
+        let failed = mk_seal(11, 0, 0, 1_716_000_900, 100.0);
+        let later = mk_seal(22, 0, 0, 1_716_000_900, 100.0);
+        writer
+            .fail_next_write_after
+            .store(9, std::sync::atomic::Ordering::Relaxed);
+        assert!(writer.append_seal(&failed, now).is_err());
+        let path = writer.spill_path(now);
+        let original = std::fs::read(&path).expect("partial bytes");
+        assert_eq!(original, failed.to_bytes()[..9]);
+        assert!(writer.append_seal(&later, now).is_err());
+        assert_eq!(
+            std::fs::read(&path).expect("not extended by a later seal"),
+            original
+        );
+        std::fs::remove_file(blocker).expect("repair the fixture staging path");
+        writer
+            .append_seal(&later, now)
+            .expect("recover after retaining old bytes");
+        assert_eq!(
+            writer.read_all(now).expect("healthy daily file"),
+            vec![later]
+        );
+        drop(writer);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn v3_round_trip_preserves_the_original_bucket_definition_and_quality() {
+        let mut original = mk_seal(913, 1, 0, 1_716_000_900, 102.5);
+        original.metadata = CandleMetadata {
+            lot_size: u32::MAX,
+            instrument_definition_version: i64::MAX as u64,
+            underlying_id: 13,
+            family_code: 2,
+        };
+        original.volume_quality = 0xA5;
+        original.bucket_revision = i64::MAX as u64;
+        let decoded = SerializedSeal::from_bytes(&original.to_bytes()).expect("v3");
+        assert_eq!(decoded, original);
+        let seal = decoded.try_into_buffered_seal().expect("known timeframe");
+        assert_eq!(seal.state.metadata, original.metadata);
+        assert_eq!(seal.state.volume_quality, 0xA5);
+        assert_eq!(seal.state.bucket_revision, original.bucket_revision);
+    }
+
+    #[test]
+    fn mixed_legacy_and_v4_file_preserves_stride_and_never_invents_historical_lots() {
+        let dir = temp_spill_dir("mixed-stride-v3");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = 1_716_000_000;
+        let mut current = mk_seal(913, 1, 0, 1_716_000_900, 102.5);
+        current.metadata = CandleMetadata {
+            lot_size: 50,
+            instrument_definition_version: 91,
+            underlying_id: 13,
+            family_code: 2,
+        };
+        current.volume_quality = 0;
+        current.bucket_revision = 17;
+        let mut v1 = current.to_bytes()[..SEAL_SPILL_LEGACY_RECORD_SIZE].to_vec();
+        v1[7] = 1;
+        v1[80..88].copy_from_slice(&24_200.10_f64.to_le_bytes());
+        let mut v2 = current.to_bytes()[..SEAL_SPILL_LEGACY_RECORD_SIZE].to_vec();
+        v2[7] = 2;
+        let mut bytes = v1;
+        bytes.extend_from_slice(&current.to_bytes());
+        bytes.extend_from_slice(&v2);
+        bytes.extend_from_slice(&current.to_bytes());
+        let path = writer.spill_path(now);
+        std::fs::write(&path, &bytes).expect("write mixed versions");
+        let rows = writer.read_all(now).expect("mixed stride");
+        assert_eq!(rows.len(), 4);
+        assert!(!rows[0].net_volume_classified);
+        assert_eq!(rows[1], current);
+        assert_eq!(rows[3], current);
+        assert_eq!(rows[2].net_volume_signed, current.net_volume_signed);
+        for old in [&rows[0], &rows[2]] {
+            assert_eq!(old.metadata, CandleMetadata::UNKNOWN);
+            assert_eq!(
+                old.volume_quality,
+                VOLUME_QUALITY_UNKNOWN_METADATA | VOLUME_QUALITY_LEGACY_BASIS
+            );
+            assert_eq!(old.bucket_revision, 0);
+        }
+        assert_eq!(std::fs::read(&path).expect("non-destructive"), bytes);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn temp_spill_dir(name: &str) -> PathBuf {
@@ -1092,10 +1428,64 @@ mod tests {
     }
 
     #[test]
-    fn test_seal_spill_record_size_is_128() {
-        // L-C1 wire format is locked at 128 bytes. Bumping breaks
-        // every spilled-but-not-yet-replayed file.
-        assert_eq!(SEAL_SPILL_RECORD_SIZE, 128);
+    fn test_seal_spill_versions_have_explicit_distinct_strides() {
+        assert_eq!(SEAL_SPILL_LEGACY_RECORD_SIZE, 128);
+        assert_eq!(SEAL_SPILL_RECORD_SIZE, 176);
+        assert_eq!(SEAL_SPILL_FORMAT_VERSION, 4);
+    }
+
+    #[test]
+    fn legacy_tick_rule_caches_never_become_whole_bar_volume_after_replay_or_rewrite() {
+        for version in [2_u8, 3] {
+            let mut current = mk_seal(913, 1, 0, 1_716_000_900, 102.5);
+            current.volume_quality = 0;
+            current.net_volume_signed = -424;
+            current.net_volume_classified = true;
+            let mut bytes = current.to_bytes();
+            bytes[7] = version;
+            let decoded = SerializedSeal::from_bytes(&bytes).expect("legacy cache");
+            assert_eq!(decoded.net_volume_signed, -424);
+            assert!(decoded.net_volume_classified);
+            assert_ne!(decoded.volume_quality & VOLUME_QUALITY_LEGACY_BASIS, 0);
+            let rewritten = SerializedSeal::from_bytes(&decoded.to_bytes()).expect("v4 rewrite");
+            assert_eq!(
+                rewritten, decoded,
+                "rewriting must retain the legacy discriminator"
+            );
+            let seal = rewritten
+                .try_into_buffered_seal()
+                .expect("active timeframe");
+            assert_eq!(seal.state.net_volume(), None);
+            let row = crate::shadow_seal_columns::ShadowSealRow::from_buffered_seal(&seal);
+            assert_eq!(row.net_volume, Some(-424), "old diagnostic cache survives");
+            assert_eq!(
+                row.volume_basis,
+                crate::shadow_seal_columns::LEGACY_VOLUME_BASIS
+            );
+        }
+    }
+
+    #[test]
+    fn v4_whole_bar_cache_round_trip_does_not_need_omitted_previous_close() {
+        for signed in [-1234, 0, 1234] {
+            let mut seal = mk_buffered_seal(913, 1, TfIndex::M1, 1_716_000_900, 102.5);
+            seal.state.net_volume_signed = signed;
+            seal.state.net_volume_classified = true;
+            seal.state.volume_quality = 0;
+            let bytes = SerializedSeal::from(&seal).to_bytes();
+            assert_eq!(bytes[7], 4);
+            let recovered = SerializedSeal::from_bytes(&bytes)
+                .expect("v4 cache")
+                .try_into_buffered_seal()
+                .expect("active timeframe");
+            assert_eq!(recovered.state.net_volume(), Some(signed));
+            let row = crate::shadow_seal_columns::ShadowSealRow::from_buffered_seal(&recovered);
+            assert_eq!(row.net_volume, Some(signed));
+            assert_eq!(
+                row.volume_basis,
+                tickvault_trading::candles::CANDLE_SIGNED_BAR_VS_ONE_LOT_METRIC
+            );
+        }
     }
 
     #[test]
@@ -1117,6 +1507,10 @@ mod tests {
         // i64 OI can be negative for short positions; pct fields can
         // be negative on red days.
         let original = SerializedSeal {
+            metadata: tickvault_trading::candles::CandleMetadata::UNKNOWN,
+            volume_quality:
+                tickvault_trading::candles::volume_update::VOLUME_QUALITY_UNKNOWN_METADATA,
+            bucket_revision: 0,
             security_id: 25,
             exchange_segment_code: 1,
             tf_ordinal: 4,
@@ -1194,45 +1588,30 @@ mod tests {
     }
 
     #[test]
-    fn test_read_all_refuses_legacy_records_but_drains_v1_siblings() {
-        // A daily spill file mixing a pre-renumber legacy record (byte 7
-        // == 0 — OLD TfIndex ordinal space) with a current v1 record must
-        // drain ONLY the v1 record; the legacy one is refused (never
-        // misdecoded into the renumbered ordinal space) and lost with the
-        // file when clear_spill_for_date deletes it after drain.
+    fn unsupported_legacy_ordinal_space_retains_the_whole_spill_file() {
         let dir = temp_spill_dir("legacy-refusal");
         let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
         let now = 1_716_000_000_i64;
-
-        // Legacy record: forge byte 7 back to 0 (the pre-C2 padding value).
-        let legacy = mk_seal(13, 0, 1, 1_716_000_900, 100.0);
-        let mut legacy_bytes = legacy.to_bytes();
-        legacy_bytes[7] = 0;
-
-        // Current v1 record (to_bytes stamps the version).
-        let v1 = mk_seal(25, 1, 2, 1_716_001_500, 200.75);
-        let v1_bytes = v1.to_bytes();
-
+        let mut legacy = mk_seal(13, 0, 1, 1_716_000_900, 100.0).to_bytes();
+        legacy[7] = 0;
+        let sibling = mk_seal(25, 1, 2, 1_716_001_500, 200.75).to_bytes();
         let path = writer.spill_path(now);
         std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
-        let mut raw = Vec::with_capacity(2 * SEAL_SPILL_RECORD_SIZE);
-        raw.extend_from_slice(&legacy_bytes);
-        raw.extend_from_slice(&v1_bytes);
-        std::fs::write(&path, &raw).expect("write mixed spill file");
-
-        let drained = writer.read_all(now).expect("read");
-        assert_eq!(drained.len(), 1, "only the v1 record must drain");
-        assert_eq!(drained[0], v1);
-
-        writer.clear_spill_for_date(now).expect("clear");
-        assert!(!path.exists(), "spill file deleted after drain");
+        let mut raw = legacy.to_vec();
+        raw.extend_from_slice(&sibling);
+        std::fs::write(&path, &raw).expect("write");
+        assert!(writer.read_all(now).is_err());
+        assert_eq!(std::fs::read(&path).expect("retained"), raw);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn test_serialized_seal_from_bytes_rejects_truncated_buffer() {
-        let short = vec![0u8; SEAL_SPILL_RECORD_SIZE - 1];
-        assert_eq!(SerializedSeal::from_bytes(&short), None);
+        let record = mk_seal(13, 0, 0, 1_716_000_900, 100.0).to_bytes();
+        assert_eq!(
+            SerializedSeal::from_bytes(&record[..SEAL_SPILL_RECORD_SIZE - 1]),
+            None
+        );
     }
 
     #[test]
@@ -1294,7 +1673,7 @@ mod tests {
             .expect("valid")
             .timestamp();
         let name = ist_date_filename(utc_noon);
-        assert_eq!(name, "seals-2026-01-01.bin");
+        assert_eq!(name, "seals-2026-01-01.cseal4");
         // Suppress unused
         let _ = ist_midnight_2026_05_10;
     }
@@ -1308,7 +1687,7 @@ mod tests {
             .expect("valid")
             .timestamp();
         let name = ist_date_filename(utc);
-        assert_eq!(name, "seals-2026-05-10.bin");
+        assert_eq!(name, "seals-2026-05-10.cseal4");
     }
 
     #[test]
@@ -1385,8 +1764,8 @@ mod tests {
     #[test]
     fn test_seal_spill_writer_truncated_tail_is_handled_gracefully() {
         // Manually write a truncated record at the tail to simulate a
-        // crash mid-flush. The reader must drop the partial record
-        // and return everything before it without panic.
+        // crash mid-flush. The reader must fail without authorizing deletion
+        // of either the valid prefix or the unread suffix.
         let dir = temp_spill_dir("truncated-tail");
         let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
         let now = chrono::Utc
@@ -1406,10 +1785,11 @@ mod tests {
             f.write_all(&[0u8; 50]).expect("partial write");
             f.flush().expect("flush");
         }
-        let drained = writer.read_all(now).expect("read");
-        // s1 returned; truncated tail dropped without panic.
-        assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0], s1);
+        assert!(writer.read_all(now).is_err());
+        assert_eq!(
+            std::fs::metadata(&path).expect("retained").len(),
+            (SEAL_SPILL_RECORD_SIZE + 50) as u64
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1423,7 +1803,7 @@ mod tests {
             .expect("valid")
             .timestamp();
         let p = writer.spill_path(utc_noon);
-        assert!(p.to_string_lossy().ends_with("seals-2026-05-10.bin"));
+        assert!(p.to_string_lossy().ends_with("seals-2026-05-10.cseal4"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1679,13 +2059,8 @@ mod tests {
                 "attempt {attempt} must FAIL so the caller escalates to the DLQ"
             );
         }
-        // read_all over a dead spill dir is a clean empty, never a panic.
-        assert!(
-            writer
-                .read_all(now)
-                .expect("read_all on dead dir")
-                .is_empty()
-        );
+        // A dead directory is an inspection failure, never a clean empty.
+        assert!(writer.read_all(now).is_err());
 
         // Un-block: the writer recovers on the next call with no restart.
         std::fs::remove_file(&blocked).expect("remove blocker");
@@ -1769,24 +2144,15 @@ mod tests {
         state.oi = 50_000;
         state.tick_count = 5;
         state.close_pct_from_prev_day = 1.5;
-        state.net_volume_signed = -4_242;
+        state.net_volume_signed = -1234;
         state.net_volume_classified = true;
         state.total_buy_qty = 89_600;
         state.total_sell_qty = 4_800;
         BufferedSeal::new(sid, seg, tf, state, Feed::Dhan)
     }
 
-    /// The tick-rule accumulator SURVIVES a disk spill (record format v2).
-    ///
-    /// Before v2 this test pinned the opposite: bytes 80..88 carried the dead
-    /// `bucket_open_prev_close`, the record was byte-for-byte full, and a
-    /// replayed bar therefore persisted `net_volume = NULL`. Reclaiming those
-    /// eight bytes closes that gap — a bar rescued to disk and drained back now
-    /// reports the SAME signed flow it was classified with, so a QuestDB
-    /// outage no longer punches a NULL hole through the column.
-    ///
-    /// The sign matters as much as the magnitude: a bar whose flow was
-    /// sell-heavy must come back sell-heavy, not merely non-null.
+    /// The v4 whole-bar signed cache survives disk recovery without needing
+    /// the previous-close input which the record deliberately omits.
     #[test]
     fn a_replayed_spill_record_carries_the_net_volume_it_was_classified_with() {
         let seal = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 24_341.95);
@@ -1859,41 +2225,33 @@ mod tests {
         );
     }
 
-    /// The unclassified sentinel round-trips as the flag, not as a value.
-    ///
-    /// `i64::MIN` is the on-wire marker for "this bar was never classified".
-    /// It cannot collide with a real reading — `net_volume()` clamps to
-    /// ±volume, and `volume` is a `u32` — but the encode/decode pair has to
-    /// agree on it or an unclassified bar comes back carrying the sentinel as
-    /// a number.
     #[test]
-    fn the_unclassified_sentinel_round_trips_as_a_flag_never_as_a_value() {
-        let mut seal = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 24_341.95);
-        seal.state.net_volume_classified = false;
-        seal.state.net_volume_signed = 0;
-
-        let bytes = SerializedSeal::from(&seal).to_bytes();
-        assert_eq!(
-            i64::from_le_bytes([
-                bytes[80], bytes[81], bytes[82], bytes[83], bytes[84], bytes[85], bytes[86],
-                bytes[87],
-            ]),
-            SEAL_SPILL_NET_VOLUME_UNCLASSIFIED,
-            "an unclassified bar writes the sentinel, so the reader can tell it \
-             apart from a genuinely balanced bar"
-        );
-
-        let decoded = SerializedSeal::from_bytes(&bytes).expect("a well-formed record decodes");
-        assert!(!decoded.net_volume_classified);
-        assert_eq!(decoded.net_volume_signed, 0);
-        assert_eq!(
-            decoded
+    fn v4_classification_byte_preserves_raw_diagnostics_without_ranking_unrepresentable_volume() {
+        for (signed, classified) in [(0, false), (0, true), (i64::MIN, true)] {
+            let mut seal = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0);
+            seal.state.volume = u64::MAX;
+            seal.state.net_volume_signed = signed;
+            seal.state.net_volume_classified = classified;
+            let bytes = SerializedSeal::from(&seal).to_bytes();
+            assert_eq!(bytes[161], u8::from(classified));
+            let recovered = SerializedSeal::from_bytes(&bytes)
+                .expect("v3")
                 .try_into_buffered_seal()
-                .expect("a known tf ordinal round-trips")
-                .state
-                .net_volume(),
-            None
-        );
+                .expect("timeframe");
+            assert_eq!(recovered.state.net_volume_signed, signed);
+            assert_eq!(recovered.state.net_volume_classified, classified);
+            assert_eq!(
+                recovered.state.net_volume(),
+                None,
+                "unrepresentable gross is not publishable"
+            );
+        }
+        let mut v2 = mk_seal(13, 0, 0, 1_716_000_900, 100.0).to_bytes();
+        v2[7] = 2;
+        v2[80..88].copy_from_slice(&SEAL_SPILL_NET_VOLUME_UNCLASSIFIED.to_le_bytes());
+        let old = SerializedSeal::from_bytes(&v2[..SEAL_SPILL_LEGACY_RECORD_SIZE]).expect("v2");
+        assert!(!old.net_volume_classified);
+        assert_eq!(old.net_volume_signed, 0);
     }
 
     #[test]
@@ -1902,7 +2260,7 @@ mod tests {
         let serialised = SerializedSeal::from(&buffered);
         assert_eq!(serialised.security_id, 13);
         assert_eq!(serialised.exchange_segment_code, 0);
-        assert_eq!(serialised.tf_ordinal, 0); // M1.as_ordinal() = 0
+        assert_eq!(serialised.tf_ordinal, 0); // M1 durable storage ID = 0
         assert_eq!(serialised.bucket_start_ist_secs, 1_716_000_900);
         assert_eq!(serialised.tick_count, 5);
         assert_eq!(serialised.volume, 1234);
@@ -1913,93 +2271,84 @@ mod tests {
         assert_eq!(serialised.low, 99.0);
         assert_eq!(serialised.close, 102.5);
         assert_eq!(serialised.close_pct_from_prev_day, 1.5);
-        assert_eq!(serialised.net_volume_signed, -4_242);
+        assert_eq!(serialised.net_volume_signed, -1234);
         assert!(serialised.net_volume_classified);
         assert_eq!(serialised.total_buy_qty, 89_600);
         assert_eq!(serialised.total_sell_qty, 4_800);
     }
 
     #[test]
-    fn test_from_buffered_seal_maps_all_twenty_one_tfs_to_correct_ordinal() {
-        // Verify every TfIndex variant maps to its canonical ordinal
-        // (0..=20: legacy 0..=4 byte-stable, C3 second-scale 5..=20
-        // appended — which needed NO version bump, the TF ordinal space being
-        // version-independent; the v2 bump was for bytes 80..88). This pins the
-        // trading↔storage contract: a future re-ordering of TfIndex::ALL
-        // would silently flip every spilled record's TF assignment.
-        let buffered = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0);
-        let mut tested: Vec<u8> = Vec::with_capacity(TfIndex::ALL.len());
-        for tf in TfIndex::ALL {
-            let mut b = buffered;
-            b.tf = tf;
-            let s = SerializedSeal::from(&b);
-            assert_eq!(
-                s.tf_ordinal as usize,
-                tf.as_ordinal(),
-                "tf_ordinal mismatch for {}",
-                tf.display_name()
-            );
-            tested.push(s.tf_ordinal);
-        }
-        let expected: Vec<u8> = (0..TfIndex::ALL.len() as u8).collect();
-        assert_eq!(tested, expected);
-
-        // Append-only proof: the 5 LEGACY frames (M1, M3, M5, M15, D1)
-        // keep their exact pre-C3 ordinals 0..=4 — the C3 second-scale
-        // frames are APPENDED after D1, never interleaved, so a pre-C3
-        // spilled record decodes to the SAME frame under the C3 binary — which
-        // is why that change needed no version bump. (The version is 2 today,
-        // bumped 2026-09-10 for bytes 80..88, not for the ordinal space.)
-        let legacy: [(TfIndex, u8); 5] = [
+    fn test_from_buffered_seal_uses_durable_ids_for_every_active_timeframe() {
+        let expected = [
+            (TfIndex::S1, 5),
+            (TfIndex::S3, 7),
+            (TfIndex::S5, 9),
             (TfIndex::M1, 0),
             (TfIndex::M3, 1),
             (TfIndex::M5, 2),
+            (TfIndex::M10, 24),
             (TfIndex::M15, 3),
-            (TfIndex::D1, 4),
+            (TfIndex::M30, 22),
+            (TfIndex::M60, 23),
         ];
-        for (tf, ord) in legacy {
-            let mut b = buffered;
-            b.tf = tf;
-            let s = SerializedSeal::from(&b);
-            assert_eq!(
-                s.tf_ordinal,
-                ord,
-                "legacy ordinal drift for {} (append-only violated)",
-                tf.display_name()
-            );
-            assert_eq!(
-                s.tf(),
-                Some(tf),
-                "legacy roundtrip for {}",
-                tf.display_name()
-            );
+        assert_eq!(expected.len(), TfIndex::ALL.len());
+        for (tf, storage_id) in expected {
+            let buffered = mk_buffered_seal(13, 0, tf, 1_716_000_900, 100.0);
+            let serialized = SerializedSeal::from(&buffered);
+            assert_eq!(serialized.tf_ordinal, storage_id, "{}", tf.display_name());
+            assert_eq!(serialized.tf(), Some(tf));
+            assert_eq!(serialized.to_bytes()[5], storage_id);
         }
     }
 
     #[test]
-    fn test_serialized_seal_tf_returns_some_for_valid_ordinals() {
-        for (idx, tf) in TfIndex::ALL.iter().enumerate() {
-            let mut s =
-                SerializedSeal::from(&mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0));
-            s.tf_ordinal = idx as u8;
-            assert_eq!(s.tf(), Some(*tf));
-        }
-    }
-
-    #[test]
-    fn test_serialized_seal_tf_returns_none_for_out_of_range_ordinal() {
-        let mut s =
+    fn test_every_storage_id_preserves_active_retired_and_unknown_meaning_in_v1_v2_v3() {
+        let active = [
+            (5, TfIndex::S1),
+            (7, TfIndex::S3),
+            (9, TfIndex::S5),
+            (0, TfIndex::M1),
+            (1, TfIndex::M3),
+            (2, TfIndex::M5),
+            (24, TfIndex::M10),
+            (3, TfIndex::M15),
+            (22, TfIndex::M30),
+            (23, TfIndex::M60),
+        ];
+        let retired = [4u8, 6, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21];
+        let template =
             SerializedSeal::from(&mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0));
-        // 21 timeframes → valid ordinals are 0..=20; the first
-        // out-of-range ordinal is `TfIndex::ALL.len()` (= 21). ROLLBACK
-        // SAFETY: this clean-refusal arm is the same code shape the older
-        // 5-frame binary takes for a C3-written record carrying ordinal
-        // >= 5 — refused (skip + warn at the read site), NEVER a panic —
-        // which is what let the C3 append land without a version bump.
-        s.tf_ordinal = TfIndex::ALL.len() as u8; // out of range (21)
-        assert_eq!(s.tf(), None);
-        s.tf_ordinal = 255;
-        assert_eq!(s.tf(), None);
+        for version in [1u8, 2, 3, 4] {
+            for storage_id in 0u8..=u8::MAX {
+                let mut bytes = template.to_bytes();
+                bytes[5] = storage_id;
+                bytes[7] = version;
+                let size = if version >= 3 {
+                    SEAL_SPILL_RECORD_SIZE
+                } else {
+                    SEAL_SPILL_LEGACY_RECORD_SIZE
+                };
+                let decoded =
+                    SerializedSeal::from_bytes(&bytes[..size]).expect("valid record framing");
+                assert_eq!(decoded.tf_ordinal, storage_id);
+                let expected = active
+                    .iter()
+                    .find_map(|(id, tf)| (*id == storage_id).then_some(*tf));
+                assert_eq!(
+                    decoded.tf(),
+                    expected,
+                    "version {version}, durable ID {storage_id}"
+                );
+                assert_eq!(
+                    decoded.try_into_buffered_seal().map(|seal| seal.tf),
+                    expected
+                );
+                assert_eq!(
+                    TfIndex::is_retired_storage_ordinal(storage_id),
+                    retired.contains(&storage_id)
+                );
+            }
+        }
     }
 
     #[test]
@@ -2163,9 +2512,8 @@ mod tests {
     }
 
     #[test]
-    fn spill_sweep_counts_unreplayed_records_it_destroys() {
-        // The property that matters most: deleting a NON-EMPTY spill file is
-        // data loss, and it must be counted and surfaced — never silent.
+    fn spill_sweep_preserves_unconfirmed_records_even_after_retention_age() {
+        // Retention age cannot substitute for a database acknowledgement.
         let dir = spill_tmp("nonempty");
         write_aged(
             &dir,
@@ -2174,9 +2522,11 @@ mod tests {
             10_000,
         );
         let out = prune_spill_files_at(&dir, 3_600, std::time::SystemTime::now());
-        assert_eq!(out.deleted, 1);
-        assert_eq!(out.deleted_non_empty, 1, "must flag it as non-empty");
-        assert_eq!(out.records_lost, 7, "must report the exact record count");
+        assert_eq!(out.deleted, 0);
+        assert_eq!(out.skipped_unconfirmed, 1);
+        assert_eq!(out.records_lost, 0);
+        assert_eq!(out.bytes_after, (SEAL_SPILL_RECORD_SIZE * 7) as u64);
+        assert!(dir.join("seals-20260101.bin").exists());
     }
 
     #[test]
@@ -2268,39 +2618,29 @@ mod tests {
     }
 }
 
-/// C3 phase-B pins: the spill `tf_ordinal` byte round-trips every one of the
-/// 21 `TfIndex` frames, the legacy 5 keep ordinals 0..=4, and out-of-range
-/// ordinals refuse cleanly (`None`) — never panic.
+/// Dense runtime indexes are independent of historical durable spill IDs.
 #[cfg(test)]
-mod c3_tf_ordinal_pins {
-    use tickvault_trading::candles::TfIndex;
-    use tickvault_trading::candles::tf_index::TF_COUNT;
+mod runtime_and_storage_ordinal_pins {
+    use tickvault_trading::candles::{TF_COUNT, TfIndex};
 
     #[test]
-    fn test_tf_ordinal_roundtrip_covers_all_frames() {
-        // 24 since 2026-08-10 (M2/M30/M60 appended, operator Quote 13).
-        // The loop bound is derived from TF_COUNT so an appended frame is
-        // actually exercised instead of silently falling outside the range.
-        assert_eq!(TF_COUNT, 24);
-        for ord in 0..TF_COUNT {
-            let tf =
-                TfIndex::from_ordinal(ord).unwrap_or_else(|| panic!("ordinal {ord} must decode"));
-            assert_eq!(tf.as_ordinal(), ord, "round-trip broke at {ord}");
+    fn test_runtime_ordinals_are_dense_but_never_reused_as_storage_ids() {
+        assert_eq!(TF_COUNT, 10);
+        for (ordinal, tf) in TfIndex::ALL.into_iter().enumerate() {
+            assert_eq!(tf.as_ordinal(), ordinal);
+            assert_eq!(TfIndex::from_ordinal(ordinal), Some(tf));
+            assert_eq!(
+                TfIndex::from_storage_ordinal(tf.storage_ordinal()),
+                Some(tf)
+            );
         }
-        // The legacy 5-frame set keeps its pre-C3 ordinals 0..=4.
-        assert_eq!(TfIndex::M1.as_ordinal(), 0);
-        assert_eq!(TfIndex::M3.as_ordinal(), 1);
-        assert_eq!(TfIndex::M5.as_ordinal(), 2);
-        assert_eq!(TfIndex::M15.as_ordinal(), 3);
-        assert_eq!(TfIndex::D1.as_ordinal(), 4);
-    }
-
-    #[test]
-    fn test_from_ordinal_refuses_past_the_end_and_255_without_panic() {
-        assert!(TfIndex::from_ordinal(TF_COUNT).is_none());
-        assert!(TfIndex::from_ordinal(255).is_none());
-        for ord in TF_COUNT..=255usize {
-            assert!(TfIndex::from_ordinal(ord).is_none(), "{ord} must refuse");
+        assert_ne!(
+            TfIndex::S1.as_ordinal() as u8,
+            TfIndex::S1.storage_ordinal()
+        );
+        assert_eq!(TfIndex::M10.storage_ordinal(), 24);
+        for ordinal in TF_COUNT..=255usize {
+            assert!(TfIndex::from_ordinal(ordinal).is_none());
         }
     }
 }

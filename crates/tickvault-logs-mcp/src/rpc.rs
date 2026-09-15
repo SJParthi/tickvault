@@ -16,6 +16,38 @@ use serde_json::{Map, Value, json};
 use crate::config::Ctx;
 use crate::tools;
 
+/// Maximum request bytes excluding the newline. Oversized requests are drained
+/// incrementally and rejected, so the next newline-delimited request survives.
+const REQUEST_LINE_MAX_BYTES: usize = 1024 * 1024;
+
+fn read_request_line<R: BufRead>(
+    input: &mut R,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<Option<bool>> {
+    buf.clear();
+    let mut seen = false;
+    let mut oversized = false;
+    loop {
+        let chunk = input.fill_buf()?;
+        if chunk.is_empty() {
+            return Ok(seen.then_some(oversized));
+        }
+        seen = true;
+        let newline = chunk.iter().position(|byte| *byte == b'\n');
+        let content_len = newline.unwrap_or(chunk.len());
+        if !oversized {
+            let room = REQUEST_LINE_MAX_BYTES.saturating_sub(buf.len());
+            buf.extend_from_slice(&chunk[..content_len.min(room)]);
+            oversized = content_len > room;
+        }
+        let consumed = content_len + usize::from(newline.is_some());
+        input.consume(consumed);
+        if newline.is_some() {
+            return Ok(Some(oversized));
+        }
+    }
+}
+
 /// legacy `f"{value}"` rendering of a JSON value pulled from the request
 /// (`unknown tool: {name}` / `method not found: {method}`): `None`,
 /// `True`/`False`, bare strings, number repr.
@@ -138,7 +170,7 @@ pub fn process_line(ctx: &Ctx, raw: &str) -> Option<Value> {
 /// responses out, flush after every response (the retired reference implementation flushes per
 /// write).
 ///
-/// Lines are read as RAW BYTES (`read_until(b'\n')`) and converted with
+/// Lines are read as bounded RAW BYTES and converted with
 /// `from_utf8_lossy` — review round-2 fix: the previous `lines()` iterator
 /// yielded `Err(InvalidData)` on an invalid-UTF-8 line and silently broke
 /// the loop, dropping every SUBSEQUENT valid request (false-OK exit 0),
@@ -159,15 +191,19 @@ pub fn run_stdio_loop(ctx: &Ctx) {
 fn run_loop<R: BufRead, W: Write>(ctx: &Ctx, mut input: R, mut out: W) {
     let mut buf: Vec<u8> = Vec::new();
     loop {
-        buf.clear();
-        match input.read_until(b'\n', &mut buf) {
-            Ok(0) => break, // EOF
-            Ok(_) => {}
+        let oversized = match read_request_line(&mut input, &mut buf) {
+            Ok(None) => break, // EOF
+            Ok(Some(oversized)) => oversized,
             Err(_) => break, // genuine I/O error — not a decode error
-        }
-        let raw = String::from_utf8_lossy(&buf);
-        let Some(resp) = process_line(ctx, &raw) else {
-            continue;
+        };
+        let resp = if oversized {
+            envelope_error(&Value::Null, -32600, "request exceeds 1048576-byte limit")
+        } else {
+            let raw = String::from_utf8_lossy(&buf);
+            let Some(resp) = process_line(ctx, &raw) else {
+                continue;
+            };
+            resp
         };
         if let Ok(s) = serde_json::to_string(&resp) {
             // legacy's envelope writes (_respond/_respond_error) use
@@ -193,6 +229,58 @@ fn run_loop<R: BufRead, W: Write>(ctx: &Ctx, mut input: R, mut out: W) {
 mod tests {
     use super::*;
     use crate::config::EndpointsConfig;
+
+    #[test]
+    fn bounded_request_line_accepts_limit_and_recovers_after_oversize() {
+        use std::io::{BufReader, Cursor};
+        let mut input = vec![b' '; REQUEST_LINE_MAX_BYTES];
+        input.push(b'\n');
+        input.extend(std::iter::repeat_n(b'x', REQUEST_LINE_MAX_BYTES + 1));
+        input.extend_from_slice(b"\n{\"id\":9,\"method\":\"initialize\"}\n");
+        // Tiny source chunks also exercise the exact-limit/newline seam.
+        let mut reader = BufReader::with_capacity(31, Cursor::new(input));
+        let mut buf = Vec::new();
+        assert_eq!(
+            read_request_line(&mut reader, &mut buf).unwrap(),
+            Some(false)
+        );
+        assert_eq!(buf.len(), REQUEST_LINE_MAX_BYTES);
+        assert_eq!(
+            read_request_line(&mut reader, &mut buf).unwrap(),
+            Some(true)
+        );
+        assert_eq!(buf.len(), REQUEST_LINE_MAX_BYTES);
+        assert_eq!(
+            read_request_line(&mut reader, &mut buf).unwrap(),
+            Some(false)
+        );
+        assert!(std::str::from_utf8(&buf).unwrap().contains("initialize"));
+        assert_eq!(read_request_line(&mut reader, &mut buf).unwrap(), None);
+    }
+
+    #[test]
+    fn oversized_rpc_request_reports_error_then_serves_next_request() {
+        let mut input = vec![b'x'; REQUEST_LINE_MAX_BYTES + 1];
+        input.extend_from_slice(b"\n{\"id\":7,\"method\":\"initialize\"}\n");
+        let mut output = Vec::new();
+        run_loop(&test_ctx(), std::io::Cursor::new(input), &mut output);
+        let text = String::from_utf8(output).unwrap();
+        let replies: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0]["error"]["code"], -32600);
+        assert_eq!(replies[1]["id"], 7);
+        assert!(replies[1]["result"]["serverInfo"].is_object());
+        let mut no_newline = std::io::Cursor::new(vec![b'x'; REQUEST_LINE_MAX_BYTES + 10]);
+        let mut buf = Vec::new();
+        assert_eq!(
+            read_request_line(&mut no_newline, &mut buf).unwrap(),
+            Some(true)
+        );
+        assert_eq!(buf.len(), REQUEST_LINE_MAX_BYTES);
+    }
 
     fn test_ctx() -> Ctx {
         // A fresh, empty repo root — the rpc-layer tests below only

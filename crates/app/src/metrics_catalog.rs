@@ -30,7 +30,7 @@
 //!     ~231K series.
 //!
 //! Folding both into one catalog gives us:
-//!   * compile-time `Tf` enum → `as_static_str()` returns one of 21
+//!   * shared `TfIndex` type → `display_name()` returns one of ten
 //!     `&'static str` constants; no allocation on the hot path;
 //!   * `ALLOWED_*` slices → ratcheted by a runtime test in this same
 //!     module so any addition has to land here AND in the test.
@@ -125,83 +125,14 @@ pub const ALLOWED_SUBSYSTEM_COMPONENTS: &[&str] = &[
     "papaya_overhead",
 ];
 
-/// Compile-time enum for the allowed `tf` label values used by the
-/// in-memory eviction counter (HOT-C2 + SEC-M1 + L128).
-///
-/// The exact 21 timeframes match L6 in the in-memory store plan:
-/// 1m..15m (every minute) + 30m + 1h..4h (every hour) + 1d. Seconds
-/// engines (1s/3s/5s/10s/15s/30s) were retired in L7 of the plan;
-/// they are NOT permitted in this enum.
-///
-/// Routing values into this enum (rather than accepting a `&str`)
-/// guarantees that:
-///   1. an arbitrary `tf` value cannot be passed via `format!`
-///      (rejected at the type level),
-///   2. the cardinality of the `tf` label is bounded at compile time
-///      (BUG-H5 — exactly 21 series, no growth path),
-///   3. the hot path uses a static `&'static str` from
-///      [`Tf::as_static_str`] with zero allocation (HOT-C2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Tf {
-    M1,
-    M5,
-    M15,
-    M30,
-    H1,
-    H2,
-    H3,
-    H4,
-    D1,
-}
+/// Metrics use the same typed active frame as the candle engine. There is no
+/// independent label enum that can continue advertising retired timeframes.
+pub use tickvault_trading::candles::TfIndex as Tf;
 
-impl Tf {
-    /// All 9 timeframes, ordered ascending. PR #517 (Wave-5 TF reduction)
-    /// retired the 12 sub-15-minute non-canonical timeframes
-    /// (M2/M3/M4/M6/M7/M8/M9/M10/M11/M12/M13/M14). Used by the boot-time
-    /// counter pre-warm (BUG-L13) and by the cardinality ratchet.
-    pub const ALL: [Self; 9] = [
-        Self::M1,
-        Self::M5,
-        Self::M15,
-        Self::M30,
-        Self::H1,
-        Self::H2,
-        Self::H3,
-        Self::H4,
-        Self::D1,
-    ];
-
-    /// `&'static str` form for use as a Prometheus label value.
-    /// The returned reference has program-lifetime, so the metrics
-    /// crate can intern it without allocating.
-    #[must_use]
-    pub const fn as_static_str(self) -> &'static str {
-        match self {
-            Self::M1 => "1m",
-            Self::M5 => "5m",
-            Self::M15 => "15m",
-            Self::M30 => "30m",
-            Self::H1 => "1h",
-            Self::H2 => "2h",
-            Self::H3 => "3h",
-            Self::H4 => "4h",
-            Self::D1 => "1d",
-        }
-    }
-}
-
-/// All `&'static str` TF label values, derived from [`Tf::ALL`].
-/// Pinned by the ratchet so adding an entry without updating the
-/// enum (or vice versa) fails the build.
+/// Static labels for the active candle set; cardinality follows TF_COUNT.
 #[must_use]
-pub fn allowed_tf_labels() -> [&'static str; 9] {
-    let mut out: [&'static str; 9] = [""; 9];
-    let mut i = 0;
-    while i < Tf::ALL.len() {
-        out[i] = Tf::ALL[i].as_static_str();
-        i += 1;
-    }
-    out
+pub fn allowed_tf_labels() -> [&'static str; tickvault_trading::candles::TF_COUNT] {
+    std::array::from_fn(|index| Tf::ALL[index].display_name())
 }
 
 #[cfg(test)]
@@ -284,67 +215,34 @@ mod tests {
     }
 
     #[test]
-    fn tf_enum_has_exactly_9_variants_per_pr517() {
-        // PR #517 (Wave-5 TF reduction): 21 → 9 TFs. Retired the 12 sub-15-
-        // minute non-canonical timeframes (M2/M3/M4/M6/M7/M8/M9/M10/M11/
-        // M12/M13/M14). The active ladder is now 1m / 5m / 15m / 30m /
-        // 1h / 2h / 3h / 4h / 1d.
+    fn tf_labels_match_the_exact_active_candle_set() {
+        let expected = [
+            "1s", "3s", "5s", "1m", "3m", "5m", "10m", "15m", "30m", "60m",
+        ];
+        assert_eq!(allowed_tf_labels(), expected);
+        assert_eq!(Tf::ALL.len(), expected.len());
+        let unique: HashSet<_> = allowed_tf_labels().into_iter().collect();
+        assert_eq!(unique.len(), expected.len());
         assert_eq!(
-            Tf::ALL.len(),
-            9,
-            "PR #517 pins 9 timeframes after the sub-15m retirement."
+            tickvault_common::config::TimeframesConfig::default_list(),
+            expected,
         );
     }
 
     #[test]
-    fn tf_static_str_values_are_unique_and_match_enum() {
-        let mut set = HashSet::new();
-        for tf in Tf::ALL {
-            assert!(set.insert(tf.as_static_str()), "duplicate TF label");
-        }
-        assert_eq!(set.len(), 9);
-    }
-
-    #[test]
-    fn tf_static_str_values_are_canonical_pinned_set() {
-        // PR #517 ratchet — pin the EXACT set so an unsanctioned addition
-        // (e.g. someone re-introduces "2m" or "30s") fails this test.
-        let expected: HashSet<&'static str> =
-            ["1m", "5m", "15m", "30m", "1h", "2h", "3h", "4h", "1d"]
-                .into_iter()
-                .collect();
-        let actual: HashSet<&'static str> = allowed_tf_labels().into_iter().collect();
-        assert_eq!(actual, expected, "PR #517: TF label set drifted");
-    }
-
-    #[test]
-    fn tf_retired_engines_are_banned() {
-        // L7 retired 1s/3s/5s/10s/15s/30s. PR #517 retired 2m/3m/4m/6m/7m/
-        // 8m/9m/10m/11m/12m/13m/14m. The ratchet ensures none ever sneak
-        // back in.
-        for banned in [
-            "1s", "3s", "5s", "10s", "15s", "30s", "2m", "3m", "4m", "6m", "7m", "8m", "9m", "10m",
-            "11m", "12m", "13m", "14m",
+    fn retired_candle_labels_cannot_be_prewarmed() {
+        for retired in [
+            "2s", "4s", "6s", "7s", "8s", "9s", "10s", "11s", "12s", "13s", "14s", "15s", "30s",
+            "2m", "1h", "2h", "3h", "4h", "1d",
         ] {
-            for &allowed in &allowed_tf_labels() {
-                assert_ne!(
-                    allowed, banned,
-                    "Retired timeframe {banned} MUST NOT reappear — re-add via \
-                     coordinated PR (config + cascade engine + matview DDL + \
-                     enum + symmetry ratchet)."
-                );
-            }
+            assert!(!allowed_tf_labels().contains(&retired), "{retired}");
         }
     }
 
     #[test]
-    fn allowed_tf_labels_helper_matches_enum_iteration() {
-        for (i, tf) in Tf::ALL.iter().enumerate() {
-            assert_eq!(
-                allowed_tf_labels()[i],
-                tf.as_static_str(),
-                "allowed_tf_labels()[{i}] drifted from Tf::ALL[{i}]"
-            );
+    fn allowed_tf_labels_follow_canonical_enum_iteration() {
+        for (index, tf) in Tf::ALL.iter().enumerate() {
+            assert_eq!(allowed_tf_labels()[index], tf.display_name());
         }
     }
 }

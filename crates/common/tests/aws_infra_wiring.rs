@@ -521,20 +521,27 @@ fn test_deploy_aws_workflow_refreshes_repo_and_systemd_unit() {
     // — a stale unit would load a stale config. Under the single-prod-env model
     // (operator 2026-06-30) the unit sets TV_ENVIRONMENT=prod and production.toml
     // locks dry_run=true (NO real orders), so refreshing the unit keeps the box
-    // on the correct env. The deploy must git-pull the clone AND re-copy the
-    // systemd unit before daemon-reload + restart.
+    // on the correct env. The deploy must refresh the clone to the EXACT
+    // deployment commit AND re-copy the systemd unit before daemon-reload +
+    // restart. Following a moving main can pair newer config with an older
+    // binary, so the fetched object is verified before detached checkout.
     let content =
         std::fs::read_to_string(workspace_root().join(".github/workflows/deploy-aws.yml"))
             .expect("deploy-aws.yml must be readable"); // APPROVED: test
     assert!(
-        content.contains("git -C repo reset --hard origin/main"),
-        "deploy-aws.yml SSM command must git-refresh the box's repo clone to \
-         origin/main before copying config/systemd — otherwise the box runs \
-         its stale first-boot files forever."
+        content.contains(r#"git -C repo fetch --depth 1 origin \"$DEPLOY_SHA\""#)
+            && content.contains(r#"git -C repo checkout --detach --force \"$DEPLOY_SHA\""#),
+        "deploy-aws.yml must fetch and check out the exact binary deployment \
+         commit before copying config/systemd"
+    );
+    assert!(
+        !content.contains("git -C repo reset --hard origin/main")
+            && !content.contains("git -C repo fetch --depth 1 origin main"),
+        "the deployed source must never silently follow a moving main"
     );
     assert!(
         content.contains(
-            "cp -f repo/deploy/systemd/tickvault.service /etc/systemd/system/tickvault.service"
+            "cp -a -- repo/deploy/systemd/tickvault.service /etc/systemd/system/tickvault.service.new; mv -- /etc/systemd/system/tickvault.service.new /etc/systemd/system/tickvault.service"
         ),
         "deploy-aws.yml SSM command must refresh the systemd unit from the repo \
          (carries TV_ENVIRONMENT=prod; production.toml locks dry_run=true — a \

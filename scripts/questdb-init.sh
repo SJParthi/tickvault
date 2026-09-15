@@ -121,8 +121,8 @@ apply_dedup_keys() {
 # Phase 3: Candle tables — owned by the app candle engine (NOT this script)
 # ---------------------------------------------------------------------------
 # Since the "one common candle engine" convergence (#1189), every candle
-# timeframe (candles_1m … candles_1d) is a REAL TABLE that the running app
-# folds directly from `ticks` (O(1) per tick) and seals via its aggregator —
+# timeframe in the active Rust registry is a REAL TABLE that the running app
+# folds directly from `ticks` (fixed per-frame work) and seals via its aggregator —
 # NOT a QuestDB materialized view. The app's idempotent boot DDL creates +
 # DEDUP-keys those tables and drops any stale matview squatting the name.
 #

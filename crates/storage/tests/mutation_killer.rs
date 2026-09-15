@@ -15,7 +15,11 @@
 
 #![cfg(test)]
 
-use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType, replay_all};
+#[path = "support/owned_wal_replay.rs"]
+mod owned_wal_replay;
+use owned_wal_replay::{assert_complete_replay, claim_wal};
+
+use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType};
 
 /// Build a unique temp dir for each test so parallel `cargo test`
 /// instances never collide on the WAL directory.
@@ -138,7 +142,9 @@ fn mutation_replay_preserves_exact_frame_bytes_not_truncated() {
         drop(spill);
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    let recovered = replay_all(&dir).unwrap();
+    let dir_owner = claim_wal(&dir);
+    let recovered_batch = assert_complete_replay(&dir_owner);
+    let recovered = &recovered_batch.frames;
     assert_eq!(recovered.len(), 1);
     // A mutant off-by-one in the payload slice would truncate the
     // first or last byte — assert the full payload is preserved.
@@ -162,7 +168,9 @@ fn mutation_replay_preserves_ws_type_tag_not_swapped() {
         drop(spill);
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    let recovered = replay_all(&dir).unwrap();
+    let dir_owner = claim_wal(&dir);
+    let recovered_batch = assert_complete_replay(&dir_owner);
+    let recovered = &recovered_batch.frames;
     assert_eq!(recovered.len(), 1);
     // A mutant tag swap (OrderUpdate → LiveFeed) would silently mis-
     // route the replay into the wrong drain helper.
@@ -188,7 +196,9 @@ fn mutation_replay_fifo_order_preserved_not_reversed() {
         drop(spill);
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    let recovered = replay_all(&dir).unwrap();
+    let dir_owner = claim_wal(&dir);
+    let recovered_batch = assert_complete_replay(&dir_owner);
+    let recovered = &recovered_batch.frames;
     assert_eq!(recovered.len(), 5);
     // A mutant reversing the iterator would give [4,3,2,1,0] — the
     // FIFO contract is the basis for dedup idempotency.
@@ -255,7 +265,9 @@ fn mutation_replay_empty_dir_returns_empty_vec_not_err() {
     let dir = tmp("empty");
     // A mutant that turns `Ok(Vec::new())` into `Err(...)` would
     // break first-boot (no WAL dir yet).
-    let recovered = replay_all(&dir).unwrap();
+    let dir_owner = claim_wal(&dir);
+    let recovered_batch = assert_complete_replay(&dir_owner);
+    let recovered = &recovered_batch.frames;
     assert!(recovered.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -271,7 +283,13 @@ fn mutation_replay_nonexistent_dir_returns_empty_vec_not_err() {
             .unwrap_or(0)
     ));
     let _ = std::fs::remove_dir_all(&dir);
-    // A mutant that panics / errors on missing dir breaks first boot.
-    let recovered = replay_all(&dir).unwrap();
+    // First boot must establish exclusive ownership before inspecting its
+    // new empty namespace; it must not fabricate sequence authority/history.
+    let dir_owner = claim_wal(&dir);
+    let recovered_batch = assert_complete_replay(&dir_owner);
+    let recovered = &recovered_batch.frames;
     assert!(recovered.is_empty());
+    assert!(dir.join(".lock").is_file());
+    assert!(!dir.join("sequence.tvsq").exists());
+    let _ = std::fs::remove_dir_all(&dir);
 }

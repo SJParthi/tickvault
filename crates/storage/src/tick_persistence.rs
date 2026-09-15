@@ -1158,11 +1158,57 @@ pub fn tick_spill_max_bytes() -> u64 {
 /// `Err` when the directory cannot be created or the append fails. The caller
 /// treats that as "rescue unavailable" and falls back to the counted drop —
 /// a spill that cannot be written must never mask the loss.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SpillDurability {
+    /// Drain fallback: preserve bytes without introducing a blocking fsync.
+    Buffered,
+    /// Worker only: file content and directory entries synced before WAL ack.
+    Synced,
+}
+
 fn spill_failed_ilp(
     dir: &Path,
     payload: &[u8],
     feed: Feed,
     now_unix_secs: i64,
+) -> std::io::Result<PathBuf> {
+    spill_failed_ilp_with_durability(dir, payload, feed, now_unix_secs, SpillDurability::Buffered)
+}
+
+/// The syscall boundary is injectable so failure tests do not require a real
+/// full disk or a power cut. Buffered mode never invokes either sync callback.
+fn finish_spill_sync(
+    durability: SpillDurability,
+    sync_file: impl FnOnce() -> std::io::Result<()>,
+    sync_directories: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    if durability == SpillDurability::Synced {
+        sync_file()?;
+        sync_directories()?;
+    }
+    Ok(())
+}
+
+/// Sync ancestors as well as the leaf directory: create_dir_all may have
+/// created more than one directory. Only the off-drain worker calls this.
+fn sync_spill_directory_tree(dir: &Path) -> std::io::Result<()> {
+    for ancestor in dir.ancestors() {
+        let path = if ancestor.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            ancestor
+        };
+        std::fs::File::open(path)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn spill_failed_ilp_with_durability(
+    dir: &Path,
+    payload: &[u8],
+    feed: Feed,
+    now_unix_secs: i64,
+    durability: SpillDurability,
 ) -> std::io::Result<PathBuf> {
     // O(1) EXEMPT: begin — cold path, runs only on a flush failure.
     std::fs::create_dir_all(dir)?;
@@ -1328,6 +1374,11 @@ fn spill_failed_ilp(
         .open(&path)?;
     file.write_all(payload)?;
     file.flush()?;
+    finish_spill_sync(
+        durability,
+        || file.sync_data(),
+        || sync_spill_directory_tree(dir),
+    )?;
     Ok(path)
     // O(1) EXEMPT: end
 }
@@ -2633,6 +2684,13 @@ impl TickWriter {
         // already installs on every successful hand-off.
         let range = self.take_pending_range();
         if let Some(tx) = self.rescue.as_ref() {
+            // The normal writer can ACK later batches while this independent
+            // queue is stalled. Protect these rows BEFORE publishing them, or
+            // that later ACK could make replay skip their only durable copy.
+            // Keep the mark until a confirmed replay clears its bucket; a
+            // successful rescue may therefore cause a harmless extra replay.
+            crate::wal_applied_watermark::applied_watermark()
+                .note_unapplied_range(range.0, range.1);
             let protocol = self.buffer.protocol_version();
             let batch = RescueBatch {
                 buffer: std::mem::replace(&mut self.buffer, Buffer::new(protocol)),
@@ -2678,8 +2736,13 @@ impl TickWriter {
             }
         }
 
-        let landed =
-            perform_tick_rescue(&self.spill_dir, self.buffer.as_bytes(), self.feed, dropped);
+        let landed = perform_tick_rescue(
+            &self.spill_dir,
+            self.buffer.as_bytes(),
+            self.feed,
+            dropped,
+            SpillDurability::Buffered,
+        );
         note_rescue_outcome_ticks(landed, range, false);
         self.buffer.clear();
         self.pending = 0;
@@ -2687,9 +2750,9 @@ impl TickWriter {
     }
 }
 
-/// A rescued payload is APPLIED from the WAL's point of view — the spill tier
-/// is durable and re-ingestable — and a failed rescue is the one arm where
-/// captured frames genuinely need the next replay.
+/// A storage-synced rescued payload can be APPLIED from the WAL's point of
+/// view. Failed or buffered-only rescues preserve the range for replay; a
+/// successful File::flush alone is not a power-loss-safe acknowledgement.
 /// `in_order` is `true` ONLY on the writer thread, which completes batches in
 /// the order they were handed off. A rescue from the PRODUCER (inline
 /// fallback) or the rescue THREAD can land while earlier batches still sit in
@@ -2699,7 +2762,20 @@ impl TickWriter {
 /// unread next boot. Out of order, a landing acks nothing: those frames are
 /// re-replayed and collapse on DEDUP, which is the cheap direction.
 fn note_rescue_outcome_ticks(landed: bool, range: (u64, u64), in_order: bool) {
-    let wm = crate::wal_applied_watermark::applied_watermark();
+    record_rescue_result(
+        crate::wal_applied_watermark::applied_watermark(),
+        landed,
+        range,
+        in_order,
+    );
+}
+
+fn record_rescue_result(
+    wm: &crate::wal_applied_watermark::AppliedWatermark,
+    landed: bool,
+    range: (u64, u64),
+    in_order: bool,
+) {
     if landed {
         if in_order {
             wm.note_ticks_acked(range.1);
@@ -2710,18 +2786,31 @@ fn note_rescue_outcome_ticks(landed: bool, range: (u64, u64), in_order: bool) {
     }
 }
 
-/// The rescue write itself — the part that touches the disk.
+/// The rescue write itself — returns true only for storage-synced success.
+/// Buffered success is still counted as spilled, but cannot confirm WAL replay.
 ///
 /// Extracted 2026-08-28 so the SAME code serves both the dedicated rescue
 /// thread and the inline fallback in [`TickPersistenceWriter::discard_pending`].
 /// Two copies would have drifted, and the copy that drifted would have been the
 /// fallback — the one that only runs on the worst day.
-fn perform_tick_rescue(spill_dir: &Path, payload: &[u8], feed: Feed, dropped: usize) -> bool {
+fn perform_tick_rescue(
+    spill_dir: &Path,
+    payload: &[u8],
+    feed: Feed,
+    dropped: usize,
+    durability: SpillDurability,
+) -> bool {
     let payload_len = payload.len();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0_i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
-    match spill_failed_ilp(spill_dir, payload, feed, now) {
+    let result = match durability {
+        SpillDurability::Buffered => spill_failed_ilp(spill_dir, payload, feed, now),
+        SpillDurability::Synced => {
+            spill_failed_ilp_with_durability(spill_dir, payload, feed, now, durability)
+        }
+    };
+    match result {
         Ok(path) => {
             // BOTH counters, and the alarmed one is not optional.
             //
@@ -2748,6 +2837,7 @@ fn perform_tick_rescue(spill_dir: &Path, payload: &[u8], feed: Feed, dropped: us
                 code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                 feed = feed.as_str(),
                 rescued = dropped,
+                storage_synced = durability == SpillDurability::Synced,
                 bytes = payload_len,
                 path = %path.display(),
                 "tick flush failed — the buffered rows were RESCUED to the tick \
@@ -2756,7 +2846,9 @@ fn perform_tick_rescue(spill_dir: &Path, payload: &[u8], feed: Feed, dropped: us
                  ticks dedup key carries capture_seq: \
                  curl --data-binary @<path> http://<questdb>:9000/write"
             );
-            true
+            // Buffered fallback is recoverable in a running OS but is not a
+            // durable landing. Keep its WAL range unapplied until replay/ack.
+            durability == SpillDurability::Synced
         }
         Err(err) => {
             // The rescue itself failed (disk full, cap reached, no
@@ -2769,9 +2861,9 @@ fn perform_tick_rescue(spill_dir: &Path, payload: &[u8], feed: Feed, dropped: us
                 feed = feed.as_str(),
                 dropped,
                 spill_error = %err,
-                "tick flush failed AND the spill rescue also failed — these ticks \
-                 are permanently lost and nothing re-inserts them. The raw frames \
-                 remain in the write-ahead log for manual recovery."
+                "tick flush failed AND spill persistence was not confirmed — these rows \
+                 are not confirmed in QuestDB or durable spill. Their WAL range remains \
+                 unapplied for recovery wherever the raw frames are available."
             );
             false
         }
@@ -2855,6 +2947,7 @@ impl TickRescueSink {
             batch.buffer.as_bytes(),
             self.feed,
             batch.rows,
+            SpillDurability::Synced,
         );
         note_rescue_outcome_ticks(landed, (batch.min_seq, batch.max_seq), false);
         // The hand-off was counted when the producer queued this payload; the
@@ -3122,7 +3215,13 @@ impl TickWriterSink {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0_i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
-        match spill_failed_ilp(&self.spill_dir, batch.buffer.as_bytes(), self.feed, now) {
+        match spill_failed_ilp_with_durability(
+            &self.spill_dir,
+            batch.buffer.as_bytes(),
+            self.feed,
+            now,
+            SpillDurability::Synced,
+        ) {
             Ok(path) => {
                 note_rescue_outcome_ticks(true, (batch.min_seq, batch.max_seq), true);
                 metrics::counter!("tv_ticks_dropped_total", "feed" => self.feed.as_str())
@@ -3153,9 +3252,9 @@ impl TickWriterSink {
                     dropped = rows,
                     reason = why,
                     spill_error = %err,
-                    "offloaded tick flush failed AND the spill rescue also failed — these \
-                     ticks are permanently lost and nothing re-inserts them. The raw frames \
-                     remain in the write-ahead log for manual recovery."
+                    "offloaded tick flush failed AND spill persistence was not confirmed — \
+                     these rows are not confirmed in QuestDB or durable spill. Their WAL \
+                     range remains unapplied for recovery wherever raw frames are available."
                 );
             }
         }
@@ -3249,6 +3348,7 @@ mod tests {
             received_at_nanos: 1_779_951_600_111_000_000,
             average_traded_price: 23_145.1,
             volume: 1_234_567,
+            volume_present: true,
             total_sell_quantity: 9_000,
             total_buy_quantity: 10_000,
             day_open: 23_100.0,
@@ -5201,20 +5301,81 @@ mod tests {
     }
 
     #[test]
+    fn buffered_spill_never_syncs_or_marks_the_wal_range_durable() {
+        let wm = crate::wal_applied_watermark::AppliedWatermark::new_for_tests();
+        let result = finish_spill_sync(
+            SpillDurability::Buffered,
+            || panic!("inline fallback must never fsync"),
+            || panic!("inline fallback must never sync directories"),
+        );
+        assert!(result.is_ok());
+        let landed = result.is_ok() && SpillDurability::Buffered == SpillDurability::Synced;
+        record_rescue_result(&wm, landed, (100, 110), false);
+        assert_eq!(wm.snapshot().hwm_ticks, 0);
+        assert_eq!(wm.unlanded_total(), 1);
+        assert!(wm.snapshot().range_has_unapplied(100, 110));
+    }
+
+    #[test]
+    fn worker_sync_failures_preserve_wal_and_success_requires_file_then_directory() {
+        use std::cell::RefCell;
+        for fail in ["file", "directory", "none"] {
+            let calls = RefCell::new(Vec::new());
+            let result = finish_spill_sync(
+                SpillDurability::Synced,
+                || {
+                    calls.borrow_mut().push("file");
+                    if fail == "file" {
+                        Err(std::io::Error::other("injected file sync failure"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                || {
+                    calls.borrow_mut().push("directory");
+                    if fail == "directory" {
+                        Err(std::io::Error::other("injected directory sync failure"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            let wm = crate::wal_applied_watermark::AppliedWatermark::new_for_tests();
+            record_rescue_result(&wm, result.is_ok(), (100, 110), true);
+            if fail == "none" {
+                assert_eq!(wm.snapshot().hwm_ticks, 110);
+                assert_eq!(wm.unlanded_total(), 0);
+            } else {
+                assert!(result.is_err());
+                assert_eq!(wm.snapshot().hwm_ticks, 0);
+                assert_eq!(wm.unlanded_total(), 1);
+                assert!(wm.snapshot().range_has_unapplied(100, 110));
+            }
+            assert_eq!(
+                *calls.borrow(),
+                if fail == "file" {
+                    vec!["file"]
+                } else {
+                    vec!["file", "directory"]
+                }
+            );
+        }
+    }
+
+    #[test]
     fn an_out_of_order_rescue_never_advances_the_watermark() {
-        // The global is shared across the test binary; use ranges far above
-        // anything another test acks so the assertion is about THIS call.
-        let wm = crate::wal_applied_watermark::applied_watermark();
+        // Isolate counters and acknowledgements from parallel rescue tests.
+        let wm = crate::wal_applied_watermark::AppliedWatermark::new_for_tests();
         let base = 1u64 << 62;
         let before = wm.snapshot().hwm_ticks;
-        note_rescue_outcome_ticks(true, (base, base + 10), false);
+        record_rescue_result(&wm, true, (base, base + 10), false);
         assert_eq!(
             wm.snapshot().hwm_ticks,
             before,
             "a producer-side or rescue-thread landing acks nothing"
         );
         let unlanded = wm.unlanded_total();
-        note_rescue_outcome_ticks(false, (base + 20, base + 30), false);
+        record_rescue_result(&wm, false, (base + 20, base + 30), false);
         assert_eq!(wm.unlanded_total(), unlanded + 1);
         assert!(wm.snapshot().range_has_unapplied(base + 25, base + 25));
     }

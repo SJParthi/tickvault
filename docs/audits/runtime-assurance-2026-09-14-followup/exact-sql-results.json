@@ -1,0 +1,47 @@
+{
+  "completed_utc": "2026-09-14T04:00:16.926480+00:00",
+  "scope": "SQLite execution of extracted Rust SQL templates with independent Python Fraction oracle; no Rust compilation or QuestDB/AWS execution",
+  "source_path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/storage/src/console_views.rs",
+  "builder_sha256": "e1b21b3dec67708fa01238971eddc1ae938272c72d0264659f85c2d5d5f10e88",
+  "cases": [
+    {
+      "name": "different_ratios_same_milli_lot",
+      "status": "passed",
+      "rows": 2
+    },
+    {
+      "name": "positive_sub_milli_lots",
+      "status": "passed",
+      "rows": 2
+    },
+    {
+      "name": "adjacent_max_denominators_float_collision",
+      "status": "passed",
+      "rows": 2
+    },
+    {
+      "name": "equal_ratios_identity_and_segment_ties",
+      "status": "passed",
+      "rows": 3
+    },
+    {
+      "name": "extreme_numerators_and_denominators",
+      "status": "passed",
+      "rows": 4
+    },
+    {
+      "name": "invalid_rows_preserved_after_valid",
+      "status": "passed",
+      "rows": 10
+    },
+    {
+      "name": "deterministic_u32_population",
+      "status": "passed",
+      "rows": 20000
+    }
+  ],
+  "passed": 7,
+  "failed": 0,
+  "rows": 20023,
+  "order_sql": "CASE WHEN t.delta_units BETWEEN 1 AND 4294967295 AND t.lot_size BETWEEN 1 AND 4294967295 THEN 1 ELSE 0 END DESC, ((CASE WHEN t.delta_units BETWEEN 1 AND 4294967295 AND t.lot_size BETWEEN 1 AND 4294967295 THEN t.delta_units ELSE cast(0 AS LONG) END) / (CASE WHEN t.delta_units BETWEEN 1 AND 4294967295 AND t.lot_size BETWEEN 1 AND 4294967295 THEN t.lot_size ELSE cast(1 AS LONG) END)) DESC, ((((CASE WHEN t.delta_units BETWEEN 1 AND 4294967295 AND t.lot_size BETWEEN 1 AND 4294967295 THEN t.delta_units ELSE cast(0 AS LONG) END) % (CASE WHEN t.delta_units BETWEEN 1 AND 4294967295 AND t.lot_size BETWEEN 1 AND 4294967295 THEN t.lot_size ELSE cast(1 AS LONG) END)) * 2147483648) / (CASE WHEN t.delta_units BETWEEN 1 AND 4294967295 AND t.lot_size BETWEEN 1 AND 4294967295 THEN t.lot_size ELSE cast(1 AS LONG) END)) DESC, ((((((CASE WHEN t.delta_units BETWEEN 1 AND 4294967295 AND t.lot_size BETWEEN 1 AND 4294967295 THEN t.delta_units ELSE cast(0 AS LONG) END) % (CASE WHEN t.delta_units BETWEEN 1 AND 4294967295 AND t.lot_size BETWEEN 1 AND 4294967295 THEN t.lot_size ELSE cast(1 AS LONG) END)) * 2147483648) % (CASE WHEN t.delta_units BETWEEN 1 AND 4294967295 AND t.lot_size BETWEEN 1 AND 4294967295 THEN t.lot_size ELSE cast(1 AS LONG) END)) * 2147483648) / (CASE WHEN t.delta_units BETWEEN 1 AND 4294967295 AND t.lot_size BETWEEN 1 AND 4294967295 THEN t.lot_size ELSE cast(1 AS LONG) END)) DESC, ((((((((CASE WHEN t.delta_units BETWEEN 1 AND 4294967295 AND t.lot_size BETWEEN 1 AND 4294967295 THEN t.delta_units ELSE cast(0 AS LONG) END) % (CASE WHEN t.delta_units BETWEEN 1 AND 4294967295 AND t.lot_size BETWEEN 1 AND 4294967295 THEN t.lot_size ELSE cast(1 AS LONG) END)) * 2147483648) % (CASE WHEN t.delta_units BETWEEN 1 AND 4294967295 AND t.lot_size BETWEEN 1 AND 4294967295 THEN t.lot_size ELSE cast(1 AS LONG) END)) * 2147483648) % (CASE WHEN t.delta_units BETWEEN 1 AND 4294967295 AND t.lot_size BETWEEN 1 AND 4294967295 THEN t.lot_size ELSE cast(1 AS LONG) END)) * 4) / (CASE WHEN t.delta_units BETWEEN 1 AND 4294967295 AND t.lot_size BETWEEN 1 AND 4294967295 THEN t.lot_size ELSE cast(1 AS LONG) END)) DESC"
+}

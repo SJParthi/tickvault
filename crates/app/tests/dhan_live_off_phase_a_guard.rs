@@ -342,8 +342,23 @@ fn test_live_lane_refuses_to_dial_without_the_shared_instance_lock() {
         !rest_src.contains("let instance_lock_held = Arc::new(AtomicBool::new(false));"),
         "a privately-minted flag would leave the live lane reading a flag nobody writes"
     );
-    let feed_src = strip_line_comments(&read("crates/app/src/dhan_feed_stack.rs"));
-    let prod = feed_src.split("#[cfg(test)]").next().unwrap_or(&feed_src);
+    // Delimit the RAW source first: strip_line_comments also removes `#`
+    // lines for TOML, including Rust's #[cfg(test)] attribute. Splitting its
+    // output could therefore never find this boundary. Match the actual
+    // top-level test module so inline test probes do not truncate production.
+    let feed_src = read("crates/app/src/dhan_feed_stack.rs");
+    let prod = strip_line_comments(
+        feed_src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("the stack's top-level test module must delimit production source")
+            .0,
+    );
+    // Dial helpers are declared before bring-up. Restrict position assertions
+    // to this function's call sites rather than their earlier definitions.
+    let prod = prod
+        .split_once("async fn run_dhan_feed_stack(")
+        .expect("the production bring-up function must exist")
+        .1;
     assert!(
         prod.contains("if !params.instance_lock_held.load(Ordering::Acquire)"),
         "run_dhan_feed_stack must check the lock flag before dialing"
@@ -368,8 +383,17 @@ fn test_live_lane_refuses_to_dial_without_the_shared_instance_lock() {
     let fold = prod
         .find("let capacity = distinct_fold_slots(")
         .expect("fold present"); // APPROVED: test
+    let dial = prod
+        .find("let dialed = dial_planned_connections(")
+        .expect("the bring-up must contain its first socket dial"); // APPROVED: test
+    let refusal = &prod[gate..fold];
     assert!(
-        token_wait < gate && gate < fold,
-        "lock gate must follow the token wait ({token_wait}) and precede the fold ({fold}); gate at {gate}"
+        refusal.contains("\"instance_lock_not_held\");\n        return;"),
+        "a missing lock must account for the replayed WAL and return before the fold or dial"
+    );
+    assert!(
+        token_wait < gate && gate < fold && fold < dial,
+        "lock gate must follow the token wait ({token_wait}) and precede the fold ({fold}) \
+         and first dial ({dial}); gate at {gate}"
     );
 }

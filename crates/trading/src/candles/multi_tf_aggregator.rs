@@ -38,7 +38,7 @@
 //!
 //! # Zero allocation on the per-tick path
 //!
-//! Steady state: one `HashMap::get` on a `Copy` key, one `Vec` index, 21
+//! Steady state: one `HashMap::get` on a `Copy` key, one `Vec` index, `TF_COUNT`
 //! scalar folds. No `Vec::new`, no `String`, no `format!`, no `collect`, no
 //! `clone`. The ONLY allocation is on first sight of a new instrument (one map
 //! insert + one `Vec::push`) — the cold path, once per instrument per process.
@@ -52,15 +52,45 @@
 
 use std::collections::HashMap;
 
-use tickvault_common::constants::MAX_PLAUSIBLE_LTP;
+use tickvault_common::constants::{
+    EXCHANGE_SEGMENT_BSE_EQ, EXCHANGE_SEGMENT_BSE_FNO, EXCHANGE_SEGMENT_NSE_EQ,
+    EXCHANGE_SEGMENT_NSE_FNO, MAX_PLAUSIBLE_LTP,
+};
 use tickvault_common::feed::Feed;
-use tickvault_common::tick_types::ParsedTick;
+use tickvault_common::tick_types::{ParsedTick, VolumeCounter, VolumeObservation, VolumeQuality};
 
 use crate::candles::aggregator_cell::{AggregatorCell, ConsumeOutcome, FeedStrategy, TickPrices};
 use crate::candles::tf_index::{
-    CANDLE_SESSION_OPEN_SECS_OF_DAY_IST, MARKET_CLOSE_SECS_OF_DAY_IST, fold_clock_ist_secs,
+    CANDLE_SESSION_OPEN_SECS_OF_DAY_IST, MARKET_CLOSE_SECS_OF_DAY_IST, MARKET_OPEN_SECS_OF_DAY_IST,
+    candle_bucket_clock_ist_secs, fold_clock_ist_secs,
 };
-use crate::candles::{BufferOutcome, BufferedSeal, LiveCandleState, SealRing, TfIndex};
+use crate::candles::volume_update::{
+    VOLUME_QUALITY_ATTRIBUTION_UNCERTAIN, volume_quality_bits, volume_quality_from_bits,
+};
+use crate::candles::{
+    BufferOutcome, BufferedSeal, CandleMetadata, CandleVolumeUpdate, LiveCandleState, SealRing,
+    TF_COUNT, TfIndex,
+};
+
+#[cfg(test)]
+#[path = "multi_tf_aggregator/closure_tests.rs"]
+mod observation_window_closure_tests;
+
+#[cfg(test)]
+#[path = "multi_tf_aggregator/signed_bar_tests.rs"]
+mod signed_bar_tests;
+
+#[cfg(test)]
+#[path = "multi_tf_aggregator/dhan_clock_open_tests.rs"]
+mod dhan_clock_open_tests;
+
+#[cfg(test)]
+#[path = "multi_tf_aggregator/counter_attribution_tests.rs"]
+mod counter_attribution_tests;
+
+#[cfg(test)]
+#[path = "multi_tf_aggregator/ten_minute_tests.rs"]
+mod ten_minute_tests;
 
 /// Hard ceiling on distinct `(feed, security_id, segment)` identities the
 /// container will fold. Matches the `rest_candle_fold::FOLD_MAX_SLOTS` /
@@ -109,6 +139,55 @@ pub const MAX_PLAUSIBLE_EXCHANGE_TS_SECS: u32 = 2_524_608_000;
 /// part of it under the 2026-06-19 feed-in-key lock.
 type CompositeKey = (Feed, u64, u8);
 
+/// The first present counter, with the evidence needed to judge a bucket's
+/// opening boundary. A positive observation carries no quantity for the
+/// unobserved prefix. Its second is rounded down by the fold clock, so even
+/// equality with a bucket start does not prove a pre-bucket baseline. A real
+/// zero counter at that boundary does prove that prefix contained no volume.
+#[derive(Clone, Copy, Debug)]
+struct VolumeBaseline {
+    observed_secs: u32,
+    known_zero: bool,
+}
+
+impl VolumeBaseline {
+    #[inline]
+    fn covers_bucket_start(self, bucket_start_secs: u32) -> bool {
+        self.observed_secs < bucket_start_secs
+            || (self.observed_secs == bucket_start_secs && self.known_zero)
+    }
+}
+
+/// Evidence for the narrowly admitted first regular-session Dhan trade.
+/// A snapshot arriving later, an absent quantity field or a segment with a
+/// different regular opening time supplies no proof of a zero origin.
+#[inline]
+fn dhan_opening_trade_quantity(
+    feed: Feed,
+    tick: &ParsedTick,
+    observation: VolumeObservation,
+) -> Option<u16> {
+    if feed != Feed::Dhan
+        || !matches!(
+            tick.exchange_segment_code,
+            EXCHANGE_SEGMENT_NSE_EQ
+                | EXCHANGE_SEGMENT_NSE_FNO
+                | EXCHANGE_SEGMENT_BSE_EQ
+                | EXCHANGE_SEGMENT_BSE_FNO
+        )
+        || !tick.volume_present
+        || tick.last_trade_quantity == 0
+        || tick.exchange_timestamp % 86_400 != MARKET_OPEN_SECS_OF_DAY_IST
+        || tick.received_at_nanos <= 0
+        || observation != VolumeObservation::Cumulative(u64::from(tick.last_trade_quantity))
+    {
+        return None;
+    }
+    let receipt_ist_secs =
+        tick.received_at_nanos / 1_000_000_000 + crate::candles::tf_index::IST_UTC_OFFSET_SECS;
+    (receipt_ist_secs == i64::from(tick.exchange_timestamp)).then_some(tick.last_trade_quantity)
+}
+
 /// One instrument's fold state.
 #[derive(Clone, Debug)]
 struct InstrumentSlot {
@@ -117,28 +196,27 @@ struct InstrumentSlot {
     key: CompositeKey,
     /// Per-timeframe candle state.
     cell: AggregatorCell,
-    /// Cumulative day volume as of the END of the last tick folded. On a
-    /// boundary crossing this becomes the new bucket's volume baseline.
-    ///
-    /// MONOTONIC by construction (see `consume_tick`): it may advance, never
-    /// regress. `tick.volume` is DAY-CUMULATIVE, so a late tick carries a
-    /// SMALLER value than the one already stored; letting that value land
-    /// here dragged the NEXT bucket's baseline backwards and inflated its
-    /// volume by the whole regression. Measured live 2026-08-24: intraday
-    /// frames summed to ~9.2x the day bar.
-    last_cumulative: u64,
-    /// `false` until the first tick this slot ever folds.
-    ///
-    /// A slot created MID-SESSION starts with no knowledge of the volume the
-    /// instrument already traded, and `0` is not that knowledge — it is the
-    /// absence of it. Treating `0` as a baseline made the first bucket report
-    /// `cumulative - 0`, i.e. THE ENTIRE DAY SO FAR, in one bar. The first
-    /// tick seeds the baseline instead, so the first bar reports `0` and the
-    /// unattributable volume is COUNTED
-    /// (`tv_aggregator_slot_volume_baseline_seeded_total`) rather than
-    /// invented. Under-reporting one bucket is far less wrong than
-    /// over-reporting by a whole day, and it must not be silent.
-    volume_baseline_seeded: bool,
+    /// Shared presence/session-aware policy used to derive every frame's input.
+    volume_counter: VolumeCounter,
+    /// First present counter observation in this session. A positive baseline
+    /// in the bucket's opening second is still partial: subsecond receipt
+    /// rounding must never turn an unobserved prefix into complete coverage.
+    volume_baseline: Option<VolumeBaseline>,
+    /// LTT of the last accepted present counter, including an unchanged
+    /// counter. Price-only packets and rejected lower counters cannot shorten
+    /// the interval whose intervening quantity has no individual trade times.
+    last_counter_observed_secs: Option<u32>,
+    volume_revision: u64,
+    /// Bounded trusted receipt clock for observation freshness, not bucket placement.
+    last_observed_secs: u32,
+    /// Highest accepted source event second. Late same-bucket Dhan observations
+    /// may contribute quantity but cannot silently refresh the last trade price.
+    last_trade_secs: u32,
+    /// Exact last bucket whose admitted window was qualified as expired,
+    /// matching the cell's single amendable last-sealed bucket per frame.
+    /// A cutoff high-water mark would incorrectly certify an older partial
+    /// administrative seal. Zero is outside every admitted bucket grid.
+    qualified_closed_bucket_start: [u32; TF_COUNT],
     /// Last accepted last-traded price, in rupees.
     ///
     /// Stored on the slot that ALREADY EXISTS per instrument rather than in a
@@ -152,36 +230,76 @@ struct InstrumentSlot {
     /// sentinel on this feed (Ticker-mode packets and pre-open instruments both
     /// carry it). Every consumer of this value already refuses a non-finite.
     last_ltp: f64,
-    /// Direction of the last CLASSIFIED tick for this instrument: `+1`
-    /// buy-initiated, `-1` sell-initiated, `0` before any classification.
-    ///
-    /// This is the zero-tick carry of the tick rule. A tick whose price equals
-    /// the previous tick's is attributed to the side that last moved the
-    /// price — unchanged-price ticks are the MAJORITY on a liquid contract, so
-    /// discarding them would under-report a bar's flow by most of its volume,
-    /// and splitting them evenly would invent a number the rule does not say.
-    ///
-    /// Per INSTRUMENT, not per timeframe. All 24 frames see the same tick
-    /// sequence, so one carry serves them all; storing it per frame would be 24
-    /// copies of one fact and would let them drift.
-    ///
-    /// `i8` because it holds three values. At `AGGREGATOR_MAX_SLOTS` (25,000)
-    /// that is 25 KB across the fleet — a rounding error against the 170 MB
-    /// slot table, and the reason this lives here rather than on
-    /// `LiveCandleState`, where it would have cost 24 bytes per instrument and
-    /// pushed a second budget assert.
-    last_tick_sign: i8,
+}
+
+impl InstrumentSlot {
+    fn annotate_volume(
+        &mut self,
+        tf: TfIndex,
+        state: LiveCandleState,
+        metadata: CandleMetadata,
+        volume_missing: bool,
+        attribution_uncertain: bool,
+    ) -> LiveCandleState {
+        let quality = VolumeQuality {
+            baseline_known: self
+                .volume_baseline
+                .is_some_and(|baseline| baseline.covers_bucket_start(state.bucket_start_ist_secs)),
+            counter_ambiguous: self.volume_counter.is_ambiguous(),
+            volume_missing,
+            attribution_uncertain,
+        };
+        self.cell.stamp_volume_metadata(
+            tf,
+            state,
+            metadata,
+            volume_quality_bits(quality),
+            self.volume_revision,
+        )
+    }
+
+    fn volume_update(
+        &mut self,
+        tf: TfIndex,
+        state: LiveCandleState,
+        closed_through_secs: Option<u32>,
+    ) -> CandleVolumeUpdate {
+        let start = state.bucket_start_ist_secs;
+        let window_end = tf.observation_window_end(start);
+        if window_end.is_some_and(|end| closed_through_secs.is_some_and(|cutoff| cutoff >= end)) {
+            self.qualified_closed_bucket_start[tf.as_ordinal()] = start;
+        }
+        let closed =
+            window_end.is_some() && self.qualified_closed_bucket_start[tf.as_ordinal()] == start;
+        CandleVolumeUpdate {
+            feed: self.key.0,
+            security_id: self.key.1,
+            segment_code: self.key.2,
+            tf,
+            session_day: start / 86_400,
+            bucket_start_secs: start,
+            bucket_end_secs: tf.bucket_end(start),
+            gross_volume: state.volume,
+            estimated_net_volume: state.signed_bar_volume(),
+            metadata: state.metadata,
+            volume_quality: state.volume_quality,
+            revision: state.bucket_revision,
+            last_observed_secs: self.last_observed_secs,
+            quality: volume_quality_from_bits(state.volume_quality),
+            closed,
+        }
+    }
 }
 
 /// Per-tick outcome, coalesced across all [`TF_COUNT`](crate::candles::TF_COUNT)
-/// timeframes so the caller emits ONE log line / counter set per tick rather
-/// than 21.
+/// timeframes so the caller emits one log line / counter set per tick
+/// rather than one per timeframe.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ConsumeStats {
     /// Timeframes that sealed a bucket and emitted it. `0..=TF_COUNT`.
     pub sealed_count: u8,
-    /// Timeframes whose most-recently-sealed bucket was AMENDED by this late
-    /// tick and re-emitted for UPSERT. `0..=TF_COUNT`.
+    /// Seal amendments emitted for this tick, including pending carry settled
+    /// before a counter restart. At most two amendments per timeframe.
     pub amended_count: u8,
     /// Timeframes that dropped this tick as too late to place.
     /// `0..=TF_COUNT`.
@@ -192,9 +310,9 @@ pub struct ConsumeStats {
     /// `true` when the tick fell outside the `[09:15, 15:40)` IST candle
     /// window. Nothing was folded.
     pub out_of_session: bool,
-    /// `true` when the vendor stamped this tick for a LATER IST day than our
-    /// own receipt clock. Nothing was folded, and — crucially — the watermark
-    /// was NOT advanced.
+    /// `true` when the vendor stamp is ahead of the receipt beyond the allowed
+    /// clock lead, including a later IST day. Nothing folds or advances the
+    /// watermark. The field name is retained for caller compatibility.
     pub future_trading_day: bool,
     /// `true` when the slot table was at [`AGGREGATOR_MAX_SLOTS`] and this
     /// instrument therefore has NO fold state. Fail-closed: nothing was
@@ -286,7 +404,7 @@ pub struct ConsumeStats {
     ///    morning**. They cannot be history; they were written that day.
     /// 2. **The day open is destroyed.** With a bucket already open on the
     ///    stale date, today's real 09:15 tick takes the CONTINUE path instead
-    ///    of the OPEN path, so the day-open arm never fires — across all 24
+    ///    of the OPEN path, so the day-open arm never fires — across all active frames
     ///    timeframes for that instrument.
     ///
     /// # Why this is a CANDLE-only refusal
@@ -361,122 +479,83 @@ impl Default for MultiTfAggregator {
     }
 }
 
-/// Classifies one tick's traded volume as buy- or sell-initiated (the tick
-/// rule), returning it signed.
-///
-/// # The rule
-///
-/// - `price > prev` — an UPTICK. The trade lifted the offer, so the aggressor
-///   was a buyer: `+delta`.
-/// - `price < prev` — a DOWNTICK. The trade hit the bid: `-delta`.
-/// - `price == prev` — a ZERO TICK. Attributed to whichever side last moved
-///   the price, via `carry`. This is the case that decides whether the column
-///   is useful at all: unchanged-price ticks are the majority on a liquid
-///   contract, so discarding them would under-report a bar's flow by most of
-///   its volume, and halving them would invent a number the rule does not say.
-///
-/// `carry` is read AND updated: an up/down tick writes the new direction, a
-/// zero tick reads it and leaves it alone.
-///
-/// # The four refusals, each returning `0`
-///
-/// - **No delta** — nothing traded since the previous tick, so there is
-///   nothing to classify. The common case for a repeated snapshot.
-/// - **No previous price** (`prev` non-finite) — the first accepted tick for
-///   this instrument, where `last_ltp` is still `NaN`. `NaN` fails BOTH `>`
-///   and `<`, so an unguarded comparison would land on the zero-tick arm and
-///   attribute the whole first delta to a carry that is itself `0` — silently
-///   correct today, and silently wrong the moment the carry is non-zero from a
-///   previous day. Refused explicitly instead.
-/// - **Non-finite or non-positive current price** — `0.0` is this feed's
-///   absent-price sentinel (Ticker-mode packets, pre-open instruments), never
-///   a real price, and a poisoned price cannot classify anything.
-/// - **Zero tick with no carry** — the price has not moved since the first
-///   tick we ever saw for this instrument, so no side has revealed itself.
-///   Returning `0` says "unclassified"; guessing would be fabrication.
-///
-/// # Why the comparison is exact and not a tolerance
-///
-/// Both prices come from `f32_to_f64_clean`, so an unchanged price is
-/// bit-identical on both sides and compares equal. A widening `f32 as f64`
-/// would make `10.20` become `10.19999980926514` and report an unchanged price
-/// as an UPTICK — systematically, on the majority of ticks, which would turn
-/// this column into a near-copy of gross volume.
-///
-/// # Complexity
-/// O(1) — three compares, one negate, one byte written. Zero allocation. Runs
-/// ONCE per tick, never once per timeframe.
-/// A backwards step in the vendor's day-cumulative volume at or beyond this
-/// size is a counter RESTART (a `u32` wrap, or a day rollover), never a stale
-/// packet — and the two need opposite remedies. See the call site in
-/// [`MultiTfAggregator::consume_tick_with_prices`] for why refusing a restart
-/// silently kills the instrument for the rest of the session.
-///
-/// Half the `u32` range. Chosen because it is the largest floor that cannot
-/// produce a false positive — a stale packet is behind by the volume traded
-/// between two packets we received, and no plausible gap approaches 2^31 — and
-/// the smallest that cannot produce a false negative, since a wrap from just
-/// below `u32::MAX` back to just above zero is a drop of nearly the full `u32`
-/// range, and a day rollover drops the entire previous day's volume.
-const CUMULATIVE_RESTART_DROP_FLOOR: u64 = 1 << 31;
-
-#[inline]
-#[must_use]
-fn classify_tick_volume(prev: f64, price: f64, delta: u64, carry: &mut i8) -> Option<i64> {
-    // ⚠ 2026-09-11: this returned a bare `i64` and answered `0` to FOUR
-    // different questions — "nothing traded", "the price is unusable", "no
-    // previous price", and "real volume whose side is unknown". The call site
-    // then wrapped every one of them in `Some(..)`, so `net_volume_classified`
-    // was `true` on every live bar and the `None` arm the fold already carries
-    // (`aggregator_cell::fold_in_bucket`) was UNREACHABLE from the live path.
-    //
-    // The consequence is the one this column exists to prevent: a bar whose
-    // volume was entirely unclassifiable published `Some(0)` — "buy and sell
-    // flow were perfectly balanced" — about flow nobody measured. `Some(0)` and
-    // `None` are now two different answers, which is what the storage layer,
-    // the spill format and `net_volume()` were all already built to expect.
-    if delta == 0 {
-        // GENUINELY ZERO, not unclassifiable: no volume traded between this
-        // packet and the last accepted one, so there is no flow to attribute
-        // and the bar stays fully classified. Duplicate packets (the same
-        // update delivered twice, which this feed does routinely) land here.
-        return Some(0);
-    }
-    if !price.is_finite() || price <= 0.0 {
-        // Real volume arrived under a price we cannot read — a Ticker-mode
-        // `0.0` sentinel or a corrupt field. Unclassifiable, never zero.
-        return None;
-    }
-    // Saturate BEFORE the sign: `-(u64 as i64)` past `i64::MAX` wraps POSITIVE,
-    // which would record a sell as a buy. Same hazard, same handling, as the
-    // tick-persistence path.
-    let magnitude = i64::try_from(delta).unwrap_or(i64::MAX);
-    if !prev.is_finite() || prev <= 0.0 {
-        // First classifiable tick for this instrument: there is no previous
-        // price to compare against, so the delta is real but unclassifiable.
-        // The carry is deliberately NOT written — inventing a direction here
-        // would then propagate to every zero tick that follows.
-        return None;
-    }
-    if price > prev {
-        *carry = 1;
-        Some(magnitude)
-    } else if price < prev {
-        *carry = -1;
-        Some(-magnitude)
-    } else {
-        match *carry {
-            1 => Some(magnitude),
-            -1 => Some(-magnitude),
-            // Real volume, price unchanged, and no side has EVER revealed
-            // itself for this instrument. This is the opening-bar case: the
-            // honest answer is "we do not know", never "balanced".
-            _ => None,
-        }
-    }
-}
-
 impl MultiTfAggregator {
+    /// An untraded snapshot carries no supported current-session quantity
+    /// clock. Its receipt says when it arrived, not when its counter was
+    /// measured. It must not open a slot, seed a zero baseline, reset a
+    /// session or refresh quantity freshness. In particular, a later positive
+    /// counter must remain a baseline rather than counting its unseen prefix.
+    ///
+    /// A present zero may still contradict an already accepted same-session
+    /// counter. Publish that uncertainty from the existing candle state so an
+    /// old eligible winner cannot survive a counter regression. This path
+    /// creates no candle, observation clock or qualified complete-window seal.
+    fn observe_untraded_zero<F, V>(
+        &mut self,
+        feed: Feed,
+        tick: &ParsedTick,
+        wider_counter: Option<u64>,
+        metadata: CandleMetadata,
+        on_seal: &mut F,
+        on_volume: &mut V,
+    ) -> u8
+    where
+        F: FnMut(Feed, u64, u8, TfIndex, LiveCandleState),
+        V: FnMut(CandleVolumeUpdate),
+    {
+        if tick.last_traded_price != 0.0
+            || tick.received_at_nanos <= 0
+            || tick.volume_observation(wider_counter) != VolumeObservation::Cumulative(0)
+        {
+            return 0;
+        }
+        let receipt =
+            tick.received_at_nanos / 1_000_000_000 + crate::candles::tf_index::IST_UTC_OFFSET_SECS;
+        let Ok(at) = u32::try_from(receipt) else {
+            return 0;
+        };
+        if !(MIN_PLAUSIBLE_EXCHANGE_TS_SECS..=MAX_PLAUSIBLE_EXCHANGE_TS_SECS).contains(&at)
+            || at / 86_400 < self.watermark_secs / 86_400
+            || at % 86_400 < CANDLE_SESSION_OPEN_SECS_OF_DAY_IST
+            || at % 86_400 >= MARKET_CLOSE_SECS_OF_DAY_IST
+        {
+            return 0;
+        }
+        let key = (feed, tick.security_id, tick.exchange_segment_code);
+        let Some(index) = self.lookup(key.0, key.1, key.2) else {
+            return 0;
+        };
+        let Some(slot) = self.slots.get_mut(index) else {
+            return 0;
+        };
+        if slot.volume_counter.session_day() != Some(at / 86_400)
+            || slot.volume_counter.cumulative().is_none()
+        {
+            return 0;
+        }
+        slot.volume_revision = slot.volume_revision.saturating_add(1);
+        slot.volume_counter
+            .observe(at / 86_400, VolumeObservation::Cumulative(0));
+        let mut amended_count = 0_u8;
+        for tf in TfIndex::ALL {
+            let state = slot.cell.snapshot(tf);
+            if !state.is_uninitialised() {
+                let state = slot.annotate_volume(tf, state, metadata, false, true);
+                on_volume(slot.volume_update(tf, state, None));
+            }
+            // Catch-up may have drained the price candle before the source
+            // anomaly arrived. Revoke its retained ranking too; an empty live
+            // slot must not shield the last published closed winner.
+            if let Some(previous) = slot.cell.last_sealed_snapshot(tf) {
+                let previous = slot.annotate_volume(tf, previous, metadata, false, true);
+                on_volume(slot.volume_update(tf, previous, None));
+                on_seal(key.0, key.1, key.2, tf, previous);
+                amended_count = amended_count.saturating_add(1);
+            }
+        }
+        amended_count
+    }
+
     /// Aggregator with an explicit late-tick policy, pre-sized to
     /// [`AGGREGATOR_DEFAULT_SLOTS`].
     ///
@@ -734,12 +813,14 @@ impl MultiTfAggregator {
         self.slots.push(InstrumentSlot {
             key,
             cell: AggregatorCell::empty(),
-            last_cumulative: 0,
+            volume_counter: VolumeCounter::default(),
+            volume_baseline: None,
+            last_counter_observed_secs: None,
+            volume_revision: 0,
+            last_observed_secs: 0,
+            last_trade_secs: 0,
+            qualified_closed_bucket_start: [0; TF_COUNT],
             last_ltp: f64::NAN,
-            last_tick_sign: 0,
-            // Deliberately NOT a baseline — see the field doc. The first tick
-            // this slot folds replaces it with a real observation.
-            volume_baseline_seeded: false,
         });
         self.index
             .insert(key, u32::try_from(idx).unwrap_or(u32::MAX));
@@ -760,19 +841,71 @@ impl MultiTfAggregator {
     /// reported distinctly in the returned [`ConsumeStats`], never silently.
     ///
     /// # Complexity
-    /// O(1) per tick: one hash lookup + [`TF_COUNT`](crate::candles::TF_COUNT)
-    /// (a compile-time constant — read the symbol, do not quote a number: it
-    /// moved 21 → 24 on 2026-08-10) scalar folds. Zero heap allocation in
-    /// steady state.
+    /// Expected O(F) work on an already allocated instrument, where F is the
+    /// fixed [`TF_COUNT`](crate::candles::TF_COUNT): one expected-constant hash
+    /// lookup and one scalar fold per active frame. First-sight slot growth
+    /// and caller callbacks have separate costs; this is not a worst-case
+    /// end-to-end latency bound.
     pub fn consume_tick<F>(
         &mut self,
         feed: Feed,
         tick: &ParsedTick,
         cumulative_volume_override: Option<u64>,
-        mut on_seal: F,
+        on_seal: F,
     ) -> ConsumeStats
     where
         F: FnMut(Feed, u64, u8, TfIndex, LiveCandleState),
+    {
+        self.consume_tick_with_volume_updates(
+            feed,
+            tick,
+            cumulative_volume_override,
+            on_seal,
+            |_| {},
+        )
+    }
+
+    /// Fold once and expose the exact same per-bucket gross/signed quantities to
+    /// consumers such as Top Volume. At most a fixed number of publications per
+    /// timeframe of this instrument are emitted. O(F) steady-state work; no
+    /// instrument-population scan, database read, allocation or timer delta.
+    pub fn consume_tick_with_volume_updates<F, V>(
+        &mut self,
+        feed: Feed,
+        tick: &ParsedTick,
+        cumulative_volume_override: Option<u64>,
+        on_seal: F,
+        on_volume: V,
+    ) -> ConsumeStats
+    where
+        F: FnMut(Feed, u64, u8, TfIndex, LiveCandleState),
+        V: FnMut(CandleVolumeUpdate),
+    {
+        self.consume_tick_with_context(
+            feed,
+            tick,
+            cumulative_volume_override,
+            CandleMetadata::UNKNOWN,
+            on_seal,
+            on_volume,
+        )
+    }
+
+    /// Fold with instrument metadata resolved once by the owner. Each new bucket
+    /// pins that definition; a mid-bucket change taints the existing bucket and
+    /// never re-prices its historical signed quantity under a different lot size.
+    pub fn consume_tick_with_context<F, V>(
+        &mut self,
+        feed: Feed,
+        tick: &ParsedTick,
+        cumulative_volume_override: Option<u64>,
+        metadata: CandleMetadata,
+        mut on_seal: F,
+        mut on_volume: V,
+    ) -> ConsumeStats
+    where
+        F: FnMut(Feed, u64, u8, TfIndex, LiveCandleState),
+        V: FnMut(CandleVolumeUpdate),
     {
         // PRICE CLASSIFICATION — corrupt and "not traded yet" are different
         // answers and were being given the same one.
@@ -875,11 +1008,20 @@ impl MultiTfAggregator {
         // LTT is the vendor's never-traded sentinel" — but the fold refused
         // those rows before they could reach it, so that path was unreachable.
         if tick.exchange_timestamp == 0 && tick.received_at_nanos != 0 {
+            let amended_count = self.observe_untraded_zero(
+                feed,
+                tick,
+                cumulative_volume_override,
+                metadata,
+                &mut on_seal,
+                &mut on_volume,
+            );
             crate::candles::fold_counters::fold_counters()
                 .tick_untraded_timestamp
                 .increment(1);
             return ConsumeStats {
                 untraded_timestamp: true,
+                amended_count,
                 ..ConsumeStats::default()
             };
         }
@@ -959,11 +1101,20 @@ impl MultiTfAggregator {
         // that can still produce a PERSISTED row — including the untraded
         // sentinel, which is candle-only and writes the tick anyway).
         if p == 0.0 {
+            let amended_count = self.observe_untraded_zero(
+                feed,
+                tick,
+                cumulative_volume_override,
+                metadata,
+                &mut on_seal,
+                &mut on_volume,
+            );
             crate::candles::fold_counters::fold_counters()
                 .tick_refused_untraded_sentinel
                 .increment(1);
             return ConsumeStats {
                 untraded_sentinel: true,
+                amended_count,
                 ..ConsumeStats::default()
             };
         }
@@ -1045,17 +1196,12 @@ impl MultiTfAggregator {
         // The stale-trading-day gate below reads this same watermark, and
         // reads it on the SAME clock.
         //
-        // CORRECTED 2026-08-28 (found by an adversarial sweep, hours after the
-        // first draft): that gate compared `tick.exchange_timestamp` against a
-        // watermark that had just been advanced on the FOLD clock. The comment
-        // here defended the mismatch as harmless because the two clocks agree
-        // within the trusted band — true of the MAGNITUDE and irrelevant to
-        // the FAILURE, because the gate does integer division into IST days.
-        // A packet near midnight whose receipt crosses the day boundary
-        // advances the watermark into day D+1 and is then rejected by its own
-        // advance as `stale_trading_day`. Comparing like with like removes the
-        // shape entirely rather than arguing it is small.
-        let fold_secs = fold_clock_ist_secs(tick.exchange_timestamp, tick.received_at_nanos);
+        // Dhan bucket placement is validated LTT; its observation clock stays
+        // on the bounded receipt policy used by freshness consumers. Other
+        // feeds retain their existing bucket-clock contract.
+        let fold_secs =
+            candle_bucket_clock_ist_secs(feed, tick.exchange_timestamp, tick.received_at_nanos);
+        let observed_secs = fold_clock_ist_secs(tick.exchange_timestamp, tick.received_at_nanos);
 
         // FUTURE TRADING DAY gate — BEFORE the advance, and that ordering is
         // the entire point.
@@ -1069,7 +1215,7 @@ impl MultiTfAggregator {
         // far outside it. So one clock-fault packet stamped for tomorrow was
         // returned verbatim, advanced the watermark into day D+1, and every
         // honest tick for the REST OF THE SESSION then failed the stale-day
-        // gate below: all 24 timeframes stop folding, for every instrument,
+        // gate below: all ten active timeframes stop folding, for every instrument,
         // with no error — only a rising refusal counter.
         //
         // The receipt clock is the right reference and the only one available:
@@ -1091,7 +1237,10 @@ impl MultiTfAggregator {
                 + crate::candles::tf_index::IST_UTC_OFFSET_SECS;
             let fold_day = i64::from(fold_secs) / 86_400;
             let receipt_day = receipt_ist_secs / 86_400;
-            if fold_day > receipt_day {
+            if fold_day > receipt_day
+                || i64::from(tick.exchange_timestamp)
+                    > receipt_ist_secs + crate::candles::tf_index::MAX_PLAUSIBLE_RECEIPT_LEAD_SECS
+            {
                 crate::candles::fold_counters::fold_counters()
                     .tick_refused_future_trading_day
                     .increment(1);
@@ -1139,7 +1288,10 @@ impl MultiTfAggregator {
             }
         }
 
-        if fold_secs > self.watermark_secs {
+        // Clockless legacy replay can still fold local buckets with uncertain
+        // attribution. It cannot advance a shared watermark from an unverified
+        // vendor stamp and thereby force-seal every other instrument.
+        if tick.received_at_nanos > 0 && fold_secs > self.watermark_secs {
             self.watermark_secs = fold_secs;
         }
 
@@ -1229,139 +1381,149 @@ impl MultiTfAggregator {
             };
         };
 
-        let cumulative_volume =
-            cumulative_volume_override.unwrap_or_else(|| u64::from(tick.volume));
+        let observation = tick.volume_observation(cumulative_volume_override);
+        let volume_missing = matches!(observation, VolumeObservation::Missing);
+        let previous_counter = slot.volume_counter.cumulative();
+        let assessment = slot.volume_counter.observe_with_opening_trade(
+            fold_secs / 86_400,
+            observation,
+            dhan_opening_trade_quantity(feed, tick, observation),
+        );
+        let previous_counter_secs = if assessment.session_changed {
+            None
+        } else {
+            slot.last_counter_observed_secs
+        };
+        let cumulative_volume = assessment.cumulative;
+        let baseline = assessment.baseline;
+        let trade_time_regressed =
+            feed == Feed::Dhan && tick.exchange_timestamp < slot.last_trade_secs;
+        let mut stats = ConsumeStats::default();
+        slot.volume_revision = slot.volume_revision.saturating_add(1);
+        slot.last_observed_secs = slot.last_observed_secs.max(observed_secs);
+        slot.last_trade_secs = slot.last_trade_secs.max(tick.exchange_timestamp);
 
-        // SEED, do not assume zero. A slot allocated mid-session has never
-        // seen this instrument, so the volume it traded before we arrived is
-        // unattributable to any bucket we own. Anchoring the baseline on this
-        // first observation makes the first bar report 0; anchoring it on `0`
-        // made the first bar report the whole day.
-        // Recorded HERE, on the accepted-tick path, so it can never hold a price
-        // the fold itself refused. Every earlier return in this function is a
-        // refusal.
-        // Captured BEFORE the overwrite below — this is the tick rule's whole
-        // input, and it is available at exactly one instant in this function.
-        let prev_ltp = slot.last_ltp;
-        // STALE-PACKET GATE (2026-09-11). A packet whose day-cumulative is
-        // BELOW the previous accepted one is stale — a cumulative counter
-        // cannot legitimately go down within a day. Its delta is already
-        // neutralised downstream (`saturating_sub` yields 0), but until today
-        // its PRICE was still adopted as `last_ltp` on the line below, and
-        // that price is the tick rule's entire input for the NEXT packet.
-        //
-        // The failure it caused: 102 -> [stale 105] -> 103 classified the 103
-        // as a DOWNTICK and latched `carry = -1`, inverting that tick's sign
-        // and every flat tick after it until the next real move. MEASURED on
-        // the live box 2026-09-11: security 68407 took 5 cumulative
-        // regressions before 09:40 IST, one of them (09:15:07 -> 09:15:08,
-        // 40,820 -> 40,690) carrying a price that moved the opposite way.
-        //
-        // A stale packet is refused as an INPUT to the rule, not merely
-        // discounted in the output.
-        let is_stale_packet =
-            slot.volume_baseline_seeded && cumulative_volume < slot.last_cumulative;
-        if !is_stale_packet {
+        // A new validated session is an explicit axis change. A same-session
+        // lower observation is not: drop magnitude and packet count cannot
+        // distinguish a reset from delayed old data. Keep the old high-water
+        // quantity and invalidate signed/eligible decisions for the session.
+        if assessment.session_changed {
+            for tf in TfIndex::ALL {
+                if let Some(state) = slot.cell.force_seal(tf) {
+                    stats.sealed_count = stats.sealed_count.saturating_add(1);
+                    let state = slot.annotate_volume(tf, state, state.metadata, false, true);
+                    on_volume(slot.volume_update(tf, state, Some(fold_secs)));
+                    on_seal(key.0, key.1, key.2, tf, state);
+                }
+            }
+            slot.volume_baseline = None;
+            slot.last_counter_observed_secs = None;
+        }
+        let decreased = matches!(observation, VolumeObservation::Cumulative(value)
+            if previous_counter.is_some_and(|previous| value < previous)
+                && !assessment.session_changed);
+        if decreased {
+            crate::candles::fold_counters::fold_counters()
+                .cumulative_regression
+                .increment(1);
+        }
+        if !volume_missing && !decreased {
+            slot.last_counter_observed_secs = Some(fold_secs);
+        }
+        if !decreased && !trade_time_regressed {
             slot.last_ltp = prices.last_traded_price;
         }
-        if !slot.volume_baseline_seeded {
-            slot.volume_baseline_seeded = true;
-            slot.last_cumulative = cumulative_volume;
+        if assessment.baseline_seeded {
+            slot.volume_baseline = Some(VolumeBaseline {
+                observed_secs: fold_secs,
+                known_zero: baseline == 0,
+            });
+            // Price-only packets may have opened buckets before any counter
+            // arrived. Rebase those zero/partial buckets before folding the
+            // first present counter, so a missing Ticker field can never turn
+            // into a baseline of zero for the entire day so far.
+            // A proved opening trade already has a zero origin and a positive
+            // first increment. Rebasing empty cells would mark their chains
+            // broken and replace that origin with the live counter, losing
+            // the very first trade again. Such a proof requires no accepted
+            // counter in the current session; any price-only cells have a
+            // zero quantity axis, and prior-session cells were cleared above.
+            let mut amended = [None; TF_COUNT];
+            if assessment.increment == 0 {
+                slot.cell.rebase_open_buckets(baseline, |tf, state| {
+                    if let Some(target) = amended.get_mut(tf.as_ordinal()) {
+                        *target = Some(state);
+                    }
+                });
+            }
+            for tf in TfIndex::ALL {
+                if let Some(Some(state)) = amended.get(tf.as_ordinal()) {
+                    stats.amended_count = stats.amended_count.saturating_add(1);
+                    let state = slot.annotate_volume(tf, *state, state.metadata, false, true);
+                    on_volume(slot.volume_update(tf, state, Some(fold_secs)));
+                    on_seal(key.0, key.1, key.2, tf, state);
+                }
+            }
             crate::candles::fold_counters::fold_counters()
                 .slot_volume_baseline_seeded
                 .increment(1);
         }
-        let baseline = slot.last_cumulative;
-        let mut stats = ConsumeStats::default();
-
-        // `prices` was widened above the price gate — ONCE per tick, not once
-        // per timeframe. The three source fields are identical across all
-        // `TF_COUNT` timeframes, and `f32_to_f64_clean` costs a decimal
-        // round-trip (~50 ns) rather than a cast, so folding it inside this
-        // loop would multiply one tick's conversion cost by `TF_COUNT × 3`
-        // for no added information.
-
-        // Same reasoning, and a stronger reason besides: this one is a
-        // comparison against the PREVIOUS PACKET, so it is only meaningful
-        // once per tick. Running it inside the loop would compare a packet
-        // against itself for 23 of the 24 timeframes and silently destroy the
-        // delta. It must stay above the loop.
         let extremes = slot.cell.observe_session_extremes(tick, fold_secs);
-
-        // TICK-RULE CLASSIFICATION — derived ONCE per tick, for the same
-        // reason `extremes` two lines up is: it is a comparison against the
-        // PREVIOUS PACKET, so running it inside the timeframe loop would
-        // compare a packet against itself for 23 of the 24 frames and destroy
-        // the answer.
-        //
-        // The delta is `cumulative - baseline`, where `baseline` is the
-        // previous ACCEPTED tick's day-cumulative for this instrument. That is
-        // the same quantity the fold uses for `volume` at a bucket rollover, so
-        // the net and the gross count exactly the same trades — which is what
-        // makes `net_volume().abs() <= volume` hold rather than merely be
-        // hoped for.
-        let signed_tick_volume = if is_stale_packet {
-            // A stale packet traded nothing new (its delta off the monotonic
-            // baseline is 0) and reveals no direction. `Some(0)` — genuinely
-            // nothing — and deliberately NOT `None`, which would poison an
-            // otherwise fully-classified bar over a packet that added no
-            // volume for the bar to be ignorant of.
-            Some(0)
+        // Compatibility argument carries observation availability only. The
+        // whole-bar sign is derived inside the cell from its frozen baseline.
+        let signed_tick_volume = if assessment.quality.counter_ambiguous || volume_missing {
+            None
         } else {
-            classify_tick_volume(
-                prev_ltp,
-                prices.last_traded_price,
-                cumulative_volume.saturating_sub(baseline),
-                &mut slot.last_tick_sign,
-            )
+            Some(0)
         };
 
-        // COUNTER-RESTART DETECTION — hoisted ABOVE the timeframe loop on
-        // 2026-09-11. The ordering was a real defect, not a style point: a
-        // frame whose bucket OPENED on this very tick seeded its net from an
-        // unattributed carry measured against the PRE-restart counter, and the
-        // rebase that clears that carry ran after the loop, too late to stop
-        // it. The bar then published a sign for trades whose span no longer
-        // existed — reproduced by
-        // `hostile_a_carried_sign_across_a_restart_inverts_the_published_net`
-        // as `volume 200, net_signed -800`: a fully SELL-initiated bar whose
-        // only real flow was a 200-unit BUY. The magnitude form is
-        // `hostile_a_carried_sign_survives_a_counter_restart_and_exceeds_the_bars_volume`.
-        //
-        // Hoisting is behaviour-preserving for everything else. `baseline` is
-        // captured above, so this tick's classification still sees the old
-        // anchor and its delta still saturates to 0; and `rebase_open_buckets`
-        // PRESERVES each open bucket's counted volume while re-anchoring its
-        // `bucket_start_cumulative`, so folding after the rebase lands on the
-        // same volume as folding before it did.
-        //
-        // The two-events reasoning — why an ENORMOUS backwards step is a wrap
-        // or a day rollover and a small one is a stale packet — is recorded in
-        // full at the surviving stale-packet arm below.
-        let restarted = cumulative_volume < slot.last_cumulative
-            && slot.last_cumulative - cumulative_volume >= CUMULATIVE_RESTART_DROP_FLOOR;
-        if restarted {
-            // RE-ANCHOR on the new value rather than refusing it. This costs
-            // exactly one tick's delta (the wrapping tick's own volume is
-            // unattributable — its true delta spans the wrap and cannot be
-            // recovered from a truncated counter) and keeps the instrument
-            // alive for the remainder of the session.
-            slot.last_cumulative = cumulative_volume;
-            // Re-anchoring the SLOT baseline alone is NOT sufficient: every
-            // bucket that is already OPEN still holds a
-            // `bucket_start_cumulative` from before the restart, so its volume
-            // would freeze for the rest of the bucket (up to 59 minutes on
-            // M60) while `tick_count` kept rising. The cell re-bases those in
-            // the same breath, preserving what each has already counted, and
-            // drops every unattributed carry with them.
-            slot.cell.rebase_open_buckets(cumulative_volume);
-            crate::candles::fold_counters::fold_counters()
-                .cumulative_reanchored
-                .increment(1);
-        }
+        // A Dhan packet supplies one last-trade time/quantity and a cumulative
+        // counter. A larger (or inconsistent) increment does not locate the
+        // intervening trades within that interval. A missing counter crossing
+        // a boundary is flagged now, before its outgoing bucket can leave the
+        // cell's bounded retention. Do not manufacture a split of the gross
+        // quantity. Other feeds retain their existing clock/counter contract.
+        let uncertain_counter_interval = (feed == Feed::Dhan
+            && (volume_missing
+                || (assessment.increment > 0
+                    && (trade_time_regressed
+                        || tick.last_trade_quantity == 0
+                        || assessment.increment != u64::from(tick.last_trade_quantity)))))
+        .then_some(previous_counter_secs)
+        .flatten();
+        // A rejected counter regression also revokes a retained closed row;
+        // a timer drain must not shield the previous eligible publication.
+        let counter_axis_rejected = feed == Feed::Dhan && decreased;
 
         for tf in TfIndex::ALL {
-            match slot.cell.consume_tick_with_extremes(
+            let uncertain_bucket_range = uncertain_counter_interval.and_then(|previous| {
+                let from = tf.bucket_start(previous);
+                let to = tf.bucket_start(fold_secs);
+                (from != to).then_some((from.min(to), from.max(to)))
+            });
+            let affected = |state: LiveCandleState| {
+                !state.is_uninitialised()
+                    && (counter_axis_rejected
+                        || uncertain_bucket_range.is_some_and(|(first, last)| {
+                            (first..=last).contains(&state.bucket_start_ist_secs)
+                        }))
+            };
+            let before = slot.cell.snapshot(tf);
+            if affected(before) {
+                // The ordinary rollover callback will publish this stamped
+                // outgoing state; no intermediate same-revision publication.
+                slot.annotate_volume(tf, before, before.metadata, false, true);
+            }
+            let boundary_amendment = slot.cell.last_sealed_snapshot(tf).and_then(|previous| {
+                (affected(previous)
+                    && previous.volume_quality & VOLUME_QUALITY_ATTRIBUTION_UNCERTAIN == 0)
+                    .then(|| slot.annotate_volume(tf, previous, previous.metadata, false, true))
+            });
+            let mut attribution_uncertain = tick.received_at_nanos <= 0
+                || trade_time_regressed
+                || counter_axis_rejected
+                || uncertain_bucket_range.is_some();
+            let outcome = slot.cell.consume_tick_with_extremes(
                 tf,
                 tick,
                 prices,
@@ -1369,27 +1531,56 @@ impl MultiTfAggregator {
                 strategy,
                 cumulative_volume,
                 extremes,
-                // Passed THROUGH, not re-wrapped. Until 2026-09-11 this read
-                // `Some(signed_tick_volume)`, which made every live bar
-                // "classified" by construction and left the fold's own `None`
-                // arm dead code.
+                // Availability only; numeric tick-direction payloads are gone.
                 signed_tick_volume,
                 // Derived ONCE at :748, above this loop — the same hoisting
                 // contract as `prices` and `cumulative_volume`. Passing it
                 // down rather than recomputing it saves 48 conversions per
-                // tick (24 timeframes × the bucket site and one fold arm).
+                // tick (TF_COUNT timeframes × the bucket site and one fold arm).
                 fold_secs,
-            ) {
+            );
+            if let Some(previous) = boundary_amendment {
+                let emitted_by_fold = match outcome {
+                    ConsumeOutcome::Sealed { sealed_state } => {
+                        sealed_state.bucket_start_ist_secs == previous.bucket_start_ist_secs
+                    }
+                    ConsumeOutcome::AmendedLate { amended_state } => {
+                        amended_state.bucket_start_ist_secs == previous.bucket_start_ist_secs
+                    }
+                    ConsumeOutcome::Updated | ConsumeOutcome::DiscardLate => false,
+                };
+                if !emitted_by_fold {
+                    stats.amended_count = stats.amended_count.saturating_add(1);
+                    // Preserve the existing closure qualification. Discovering
+                    // uncertainty is not a new clock or a new volume sample.
+                    on_volume(slot.volume_update(tf, previous, None));
+                    on_seal(key.0, key.1, key.2, tf, previous);
+                }
+            }
+            match outcome {
                 ConsumeOutcome::Updated => {}
                 ConsumeOutcome::Sealed { sealed_state } => {
                     stats.sealed_count = stats.sealed_count.saturating_add(1);
+                    let sealed_state =
+                        slot.annotate_volume(tf, sealed_state, sealed_state.metadata, false, false);
+                    on_volume(slot.volume_update(tf, sealed_state, Some(fold_secs)));
                     on_seal(key.0, key.1, key.2, tf, sealed_state);
                 }
                 ConsumeOutcome::AmendedLate { amended_state } => {
                     stats.amended_count = stats.amended_count.saturating_add(1);
+                    attribution_uncertain = true;
+                    let amended_state = slot.annotate_volume(
+                        tf,
+                        amended_state,
+                        amended_state.metadata,
+                        false,
+                        true,
+                    );
+                    on_volume(slot.volume_update(tf, amended_state, Some(fold_secs)));
                     on_seal(key.0, key.1, key.2, tf, amended_state);
                 }
                 ConsumeOutcome::DiscardLate => {
+                    attribution_uncertain = true;
                     stats.late_count = stats.late_count.saturating_add(1);
                     // A tick discarded here is DATA LOSS for this timeframe:
                     // the bar it should have contributed to is now missing a
@@ -1401,7 +1592,7 @@ impl MultiTfAggregator {
                     // and reached nothing.
                     //
                     // Pre-resolved handle, per this module's whole reason for
-                    // existing: this arm sits inside the 24-timeframe loop on
+                    // existing: this arm sits inside the fixed-timeframe loop on
                     // the per-tick path, which is the one place a bare
                     // `counter!` macro must never appear.
                     crate::candles::fold_counters::fold_counters()
@@ -1409,85 +1600,19 @@ impl MultiTfAggregator {
                         .increment(1);
                 }
             }
+            let current = slot.cell.snapshot(tf);
+            if !current.is_uninitialised() {
+                let current = slot.annotate_volume(
+                    tf,
+                    current,
+                    metadata,
+                    volume_missing,
+                    attribution_uncertain,
+                );
+                on_volume(slot.volume_update(tf, current, None));
+            }
         }
 
-        // Store the SAME resolved cumulative the cells folded, so the next
-        // bucket's baseline matches what was just written — never the
-        // truncated `u32` when a `u64` override was supplied.
-        //
-        // MERGE RESOLUTION 2026-08-25 — both branches found this same defect
-        // independently and fixed it the same way. main's version is kept
-        // because it is a strict superset: identical monotonic advance, plus
-        // a counter that makes the correction VISIBLE. This branch's version
-        // (`slot.last_cumulative.max(cumulative_volume)`) is behaviourally
-        // equal and silent, and a silent correction is the weaker of two
-        // otherwise-identical fixes.
-        //
-        // ADVANCE ONLY. This was an UNCONDITIONAL assignment and that was a
-        // live data-corruption defect, measured 2026-08-24: the same trading
-        // day tiled five ways did not sum to one volume total (1s
-        // 40,397,638,853 vs 1d 4,372,993,982 — the intraday frames were ~9.2x
-        // the day bar, and 6,088 instruments disagreed with their own 1m sum).
-        //
-        // Mechanism: `tick.volume` is DAY-CUMULATIVE. `FeedStrategy::DEFAULT`
-        // is `Refold`, so late ticks are routine (10.0% of live ticks arrive
-        // >1h behind receive time) and every timeframe can return
-        // `DiscardLate` — yet the store below still ran, writing that late
-        // tick's SMALLER cumulative. The next bucket then opened on a baseline
-        // BELOW the volume already traded, and `cumulative - baseline`
-        // double-counted the difference. The regression is silently
-        // self-amplifying because nothing downstream can see a baseline.
-        //
-        // Refusing the regression is the only correct answer: a cumulative
-        // counter cannot legitimately go down within a day, so a smaller value
-        // is stale, never news. It is counted so the correction is visible.
-        if cumulative_volume > slot.last_cumulative {
-            slot.last_cumulative = cumulative_volume;
-        } else if cumulative_volume < slot.last_cumulative {
-            // TWO different events reach this arm and they need OPPOSITE
-            // remedies. Until 2026-09-11 both were treated as "stale packet",
-            // which is correct for one of them and catastrophic for the other.
-            //
-            //   STALE PACKET — a small backwards step. Refuse it: a cumulative
-            //   counter cannot legitimately go down, so a smaller value is
-            //   stale, never news.
-            //
-            //   COUNTER RESTART — an ENORMOUS backwards step. Two causes:
-            //     * `ParsedTick.volume` is `u32`, so the vendor's day-cumulative
-            //       WRAPS past 4,294,967,295 back to a small number;
-            //     * a day rollover restarts the counter near zero in a process
-            //       that outlived `force_seal_all`.
-            //   Refusing this one freezes `last_cumulative` at the high-water
-            //   mark FOREVER. Every later `saturating_sub` then yields 0, so
-            //   every bar reports `volume 0` and `net_volume` NULL for the rest
-            //   of the session — silently, while `tick_count` keeps rising.
-            //   The guard that prevents double-counting becomes the thing that
-            //   kills the instrument.
-            //
-            // MEASURED 2026-09-11, 25 minutes into the session: the busiest
-            // instrument on the box (81245, NSE_FNO) had already reached a
-            // cumulative volume of 250,519,875 — the same order of magnitude as
-            // the `u32` ceiling once extrapolated across a full session. This
-            // is a reachable event, not a theoretical one.
-            //
-            // The two are separated by MAGNITUDE, which is the only signal
-            // available: no real stale packet is behind by half the `u32`
-            // range, and every wrap and every rollover is.
-            //
-            // 2026-09-11: the RESTART half of this decision is made ABOVE the
-            // timeframe loop (search `let restarted =`). It has to be: a
-            // bucket that OPENS on the restarting tick would otherwise seed
-            // its net from a carry the rebase had not yet cleared. A restart
-            // therefore never reaches this arm — the hoisted branch has
-            // already re-anchored `last_cumulative` to `cumulative_volume`, so
-            // neither comparison above is true on that tick. What survives
-            // here is the STALE-PACKET half, which needs no re-anchor: its
-            // delta is already neutralised by `saturating_sub` and its price
-            // was refused as an input to the tick rule above.
-            crate::candles::fold_counters::fold_counters()
-                .cumulative_regression
-                .increment(1);
-        }
         stats
     }
 
@@ -1533,75 +1658,51 @@ impl MultiTfAggregator {
     /// O(N × [`TF_COUNT`]) where N is the number of allocated slots. COLD
     /// path — once per day boundary, never per tick.
     ///
-    /// Written as the CONSTANT, not as a literal. This line said `21` while
-    /// `TF_COUNT` was 24 — understating the real cost by ~14% — because a
-    /// number copied into a doc comment has no way to stay true when the
-    /// constant beside it moves. Cite the symbol; let it move on its own.
-    pub fn force_seal_all<F>(&mut self, mut on_seal: F) -> usize
+    /// The count derives from the registry, so retired frames add neither
+    /// fold state nor a seal visit.
+    pub fn force_seal_all<F>(&mut self, on_seal: F) -> usize
     where
         F: FnMut(Feed, u64, u8, TfIndex, LiveCandleState),
+    {
+        self.force_seal_all_with_volume_updates(on_seal, |_| {})
+    }
+
+    /// Administrative flush with the same canonical quantity callback as live
+    /// folds. Existing state is emitted before resetting its volume baseline
+    /// and quality. With no expiry cutoff, these updates do not certify a
+    /// complete observation window. Use the explicit expiry method before an
+    /// orderly after-close drain. O(N × F), not an O(1) tick operation.
+    pub fn force_seal_all_with_volume_updates<F, V>(
+        &mut self,
+        mut on_seal: F,
+        mut on_volume: V,
+    ) -> usize
+    where
+        F: FnMut(Feed, u64, u8, TfIndex, LiveCandleState),
+        V: FnMut(CandleVolumeUpdate),
     {
         let mut emitted = 0_usize;
         for slot in &mut self.slots {
             let (feed, sid, seg) = slot.key;
-            // DAY-BOUNDARY RESET — required by the monotonic baseline in
-            // `consume_tick`, and wrong to omit. The vendor's cumulative
-            // volume restarts at ~0 each session; without this the
-            // advance-only rule would read tomorrow's honest small cumulative
-            // as a regression, refuse it all day, and publish every bar at
-            // volume 0. This is the ONE place a regression is legitimate, so
-            // it is the one place the baseline drops — and it drops to
-            // UNSEEDED, not to a fabricated `0` baseline.
-            slot.last_cumulative = 0;
-            slot.volume_baseline_seeded = false;
-            // The tick-rule carry resets with the baseline, and for the same
-            // reason: a direction learned from yesterday's last print is not
-            // evidence about today's first. Carrying it across would attribute
-            // the whole of the new session's opening zero-tick volume to
-            // whichever side happened to move the price at yesterday's close.
-            //
-            // `last_ltp` is deliberately LEFT ALONE — it is a published
-            // accessor (`MultiTfAggregator::last_ltp`) whose contract is "the
-            // last accepted price", and blanking it here would make that
-            // reader answer `None` after a force-seal. The carry reset is
-            // enough: with `last_tick_sign` at 0, the first zero tick of the
-            // new day is refused as unclassified rather than mis-signed.
-            slot.last_tick_sign = 0;
+            slot.volume_revision = slot.volume_revision.saturating_add(1);
             for tf in TfIndex::ALL {
                 if let Some(state) = slot.cell.force_seal(tf) {
                     emitted = emitted.saturating_add(1);
+                    let state = slot.annotate_volume(tf, state, state.metadata, false, false);
+                    on_volume(slot.volume_update(tf, state, None));
                     on_seal(feed, sid, seg, tf, state);
                 }
             }
-            // MERGE RESOLUTION 2026-08-25 — both branches found this same
-            // day-boundary defect and reset the baseline; main's version is
-            // kept and this branch's duplicate assignment is removed.
-            //
-            // The difference was not cosmetic. This branch reset to a
-            // baseline of `0`, so day two's first bar owned everything traded
-            // since the open. main resets to UNSEEDED, so day two's first
-            // PACKET re-seeds and the first bar owns only what traded after
-            // it. main's is kept because it is the conservative direction: it
-            // can under-attribute the sub-second window before our first
-            // packet of the day, but it can never over-attribute volume that
-            // was not ours — and the same seeding rule already governs a slot
-            // allocated mid-session, so one rule now covers both arrivals.
-            //
-            // The original reasoning, still true: `force_seal` resets the
-            // CELL's day state, but `last_cumulative` lives on the SLOT and
-            // nothing touched it, so a process spanning midnight opened day
-            // two with YESTERDAY's final cumulative as baseline and
-            // `saturating_sub` floored every bucket to 0. D1 is the worst
-            // case — one bucket per day, so the whole daily bar read zero.
-            // Masked today only because the box stops at 17:30 and restarts
-            // with `last_cumulative: 0`; a schedule change would have made it
-            // live, silently, with no counter moving.
+            slot.volume_counter.reset_baseline();
+            slot.volume_baseline = None;
+            slot.last_counter_observed_secs = None;
         }
         emitted
     }
 
     /// Watermark-aware intraday catch-up seal across every instrument: seals
-    /// only the buckets whose exclusive end is at or before `cutoff_secs`.
+    /// only the buckets whose admitted observation-window end is at or before
+    /// `cutoff_secs`. The final-tail nominal timestamp is preserved.
     ///
     /// This is what closes a bar for an illiquid instrument that stops
     /// ticking mid-session — without it that bar would wait for the next tick
@@ -1615,29 +1716,63 @@ impl MultiTfAggregator {
     /// O(N × [`TF_COUNT`]). Driven at a multi-second cadence — but NOT on a
     /// background task: the caller drives this from the frame drain's own
     /// `tokio::select!`, so a sweep is a periodic PAUSE of the drain, not
-    /// work that happens beside it. MEASURED at the 25,000-slot x
-    /// [`TF_COUNT`] ceiling by `catch_up_seal_all_sweep_cost_at_the_authorized_ceiling`
-    /// in this file: 9.67 ms, 16.1 ns per cell (2026-08-21, release, x86 dev
-    /// container), a 0.2% duty cycle at the 5 s cadence — recorded in
-    /// CLAUDE.md's O(1) table. (This line read "UNMEASURED" until 2026-09-08,
-    /// three weeks after the harness landed.
-    /// The literal `21` this line once carried was stale; cite the
-    /// constant so it cannot go stale again.)
-    pub fn catch_up_seal_all<F>(&mut self, cutoff_secs: u32, mut on_seal: F) -> usize
+    /// work that happens beside it. The ignored
+    /// `catch_up_seal_all_sweep_cost_at_the_authorized_ceiling` harness below
+    /// measures the selected source/runtime. Earlier 24-frame timings do not
+    /// measure this ten-frame candidate and must not be relabeled as such.
+    pub fn catch_up_seal_all<F>(&mut self, cutoff_secs: u32, on_seal: F) -> usize
     where
         F: FnMut(Feed, u64, u8, TfIndex, LiveCandleState),
+    {
+        self.catch_up_seal_all_with_volume_updates(cutoff_secs, on_seal, |_| {})
+    }
+
+    /// Publish timer-sealed candles to the same canonical stream. A timer does
+    /// not create a new observation timestamp or infer missing volume. The
+    /// existing sweep visits N instruments × F frames; only actual seals emit.
+    pub fn catch_up_seal_all_with_volume_updates<F, V>(
+        &mut self,
+        cutoff_secs: u32,
+        mut on_seal: F,
+        mut on_volume: V,
+    ) -> usize
+    where
+        F: FnMut(Feed, u64, u8, TfIndex, LiveCandleState),
+        V: FnMut(CandleVolumeUpdate),
     {
         let mut emitted = 0_usize;
         for slot in &mut self.slots {
             let (feed, sid, seg) = slot.key;
+            slot.volume_revision = slot.volume_revision.saturating_add(1);
             for tf in TfIndex::ALL {
                 if let Some(state) = slot.cell.catch_up_seal(tf, cutoff_secs) {
                     emitted = emitted.saturating_add(1);
+                    let state = slot.annotate_volume(tf, state, state.metadata, false, false);
+                    on_volume(slot.volume_update(tf, state, Some(cutoff_secs)));
                     on_seal(feed, sid, seg, tf, state);
                 }
             }
         }
         emitted
+    }
+
+    /// Explicit local-clock expiry of the regular capture observation windows.
+    /// This closes aggregation state, not the provider's delivery history.
+    /// The caller supplies its trusted IST wall-clock second; source freshness,
+    /// quantity quality, and nominal bucket identities remain unchanged.
+    /// Early calls leave unexpired windows open; repeated calls do not invent
+    /// zero candles or duplicate unchanged seals. O(N × F), on maintenance.
+    pub fn seal_expired_observation_windows_with_volume_updates<F, V>(
+        &mut self,
+        now_ist_secs: u32,
+        on_seal: F,
+        on_volume: V,
+    ) -> usize
+    where
+        F: FnMut(Feed, u64, u8, TfIndex, LiveCandleState),
+        V: FnMut(CandleVolumeUpdate),
+    {
+        self.catch_up_seal_all_with_volume_updates(now_ist_secs, on_seal, on_volume)
     }
 }
 
@@ -1714,118 +1849,121 @@ mod tests {
             exchange_segment_code: seg,
             last_traded_price: price,
             exchange_timestamp: ts,
+            received_at_nanos: if (MIN_PLAUSIBLE_EXCHANGE_TS_SECS..=MAX_PLAUSIBLE_EXCHANGE_TS_SECS)
+                .contains(&ts)
+            {
+                (i64::from(ts) - 19_800) * 1_000_000_000
+            } else {
+                0
+            },
             volume: cum,
             ..ParsedTick::default()
         }
     }
 
-    // -- tick-rule net volume (2026-09-10) ----------------------------------
-    //
-    // The classification lives HERE, not in the cell, because it needs the
-    // previous TICK and a cell only has bars. These tests drive the real
-    // `consume_tick` path end to end.
-
-    /// THE FIX, in one test: flow and close can DISAGREE, and the old
-    /// implementation reported the close.
-    ///
-    /// A bar that sells 1,000 into the bid and buys 400 on the offer, and
-    /// happens to close one tick above where it opened, has net flow of -600.
-    /// The pre-2026-09-10 code signed the whole 1,400 by the close direction
-    /// and reported +1,400 — wrong magnitude AND wrong sign.
     #[test]
-    fn a_bar_that_closes_up_on_selling_flow_reports_negative_net_volume() {
+    fn preopen_ingest_preserves_the_official_open_in_all_active_frames() {
         let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
-        let sink = |_: Feed, _: u64, _: u8, _: TfIndex, _: LiveCandleState| {};
-        let base = OPEN;
+        for (stamp, cumulative) in [
+            (CANDLE_OPEN, 100_u32),
+            (CANDLE_OPEN + 300, 110),
+            (CANDLE_OPEN + 840, 120),
+        ] {
+            let mut before = tick(77, SEG_IDX, stamp, 100.0, cumulative);
+            before.received_at_nanos = (i64::from(stamp) - 19_800) * 1_000_000_000;
+            let stats = agg.consume_tick(Feed::Dhan, &before, None, |_, _, _, _, _| {});
+            assert!(
+                stats.folded(),
+                "pre-open packets reach the live candle path"
+            );
+        }
 
-        // Establish a price, then a baseline tick so the first delta is real.
-        let _ = agg.consume_tick(
-            Feed::Dhan,
-            &tick(77, SEG_IDX, base, 100.0, 1_000),
-            None,
-            sink,
-        );
-        // DOWNTICK carrying 1,000: sell-initiated.
-        let _ = agg.consume_tick(
-            Feed::Dhan,
-            &tick(77, SEG_IDX, base + 1, 99.0, 2_000),
-            None,
-            sink,
-        );
-        // UPTICK carrying 400: buy-initiated. Closes ABOVE the first price.
-        let _ = agg.consume_tick(
-            Feed::Dhan,
-            &tick(77, SEG_IDX, base + 2, 101.0, 2_400),
-            None,
-            sink,
-        );
+        let mut opening = tick(77, SEG_IDX, OPEN, 105.0, 130);
+        opening.received_at_nanos = (i64::from(OPEN) - 19_800) * 1_000_000_000;
+        opening.day_open = 98.0;
+        opening.day_high = 110.0;
+        opening.day_low = 95.0;
+        let stats = agg.consume_tick(Feed::Dhan, &opening, None, |_, _, _, _, _| {});
+        assert!(stats.folded());
+        for tf in TfIndex::ALL {
+            let state = agg
+                .snapshot(Feed::Dhan, 77, SEG_IDX, tf)
+                .expect("instrument has fold state");
+            let period = tf.seconds_per_bucket();
+            assert_eq!(
+                state.bucket_start_ist_secs,
+                CANDLE_OPEN + (900 / period) * period
+            );
+            assert_eq!(state.open, 98.0, "official open for {tf:?}");
+            assert_eq!(state.high, 110.0, "opening high for {tf:?}");
+            assert_eq!(state.low, 95.0, "opening low for {tf:?}");
+            assert_eq!(state.close, 105.0, "observed close for {tf:?}");
+        }
+    }
 
+    // Gross-counter uncertainty still refuses signed-bar publication. The
+    // dedicated signed_bar_tests module checks the whole-bar direction rule.
+
+    /// A reset quote is current: the next tick compares with its price,
+    /// even when the pre-reset price would imply the opposite direction.
+    #[test]
+    fn an_ambiguous_counter_restart_cannot_establish_a_new_price_axis() {
+        for (before, reset, after, _old_inferred_net) in [
+            (100.0_f32, 110.0_f32, 105.0_f32, -200_i64),
+            (110.0, 100.0, 105.0, 200),
+        ] {
+            let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+            for (offset, price, cumulative) in
+                [(0, before, 4_000_000_000), (1, reset, 100), (2, after, 300)]
+            {
+                let _ = agg.consume_tick(
+                    Feed::Dhan,
+                    &tick(91, SEG_IDX, OPEN + offset, price, cumulative),
+                    None,
+                    |_, _, _, _, _| {},
+                );
+            }
+            let bar = agg
+                .snapshot(Feed::Dhan, 91, SEG_IDX, TfIndex::M1)
+                .expect("open bucket");
+            assert_eq!(bar.volume, 0);
+            assert_eq!(bar.net_volume(), None);
+            assert_ne!(
+                bar.volume_quality
+                    & crate::candles::volume_update::VOLUME_QUALITY_COUNTER_AMBIGUOUS,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn a_restart_does_not_invent_a_direction_for_an_unchanged_price() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        for (offset, price, cumulative) in [
+            (0, 100.0, 4_000_000_000),
+            (1, 101.0, 4_000_000_100),
+            (2, 110.0, 100),
+            (3, 110.0, 300),
+        ] {
+            let _ = agg.consume_tick(
+                Feed::Dhan,
+                &tick(91, SEG_IDX, OPEN + offset, price, cumulative),
+                None,
+                |_, _, _, _, _| {},
+            );
+        }
         let bar = agg
-            .snapshot(Feed::Dhan, 77, SEG_IDX, TfIndex::M1)
-            .expect("bucket is open");
-        assert_eq!(bar.volume, 1_400, "gross is every lot that traded");
-        assert!(bar.close > 100.0, "the bar closed UP — that is the trap");
-        assert_eq!(
-            bar.net_volume(),
-            Some(-600),
-            "1,000 sold minus 400 bought. The old code signed the whole 1,400 \
-             by the close direction and answered +1,400 — wrong sign, wrong size"
-        );
+            .snapshot(Feed::Dhan, 91, SEG_IDX, TfIndex::M1)
+            .expect("open bucket");
+        assert_eq!(bar.volume, 100);
+        assert_eq!(bar.net_volume(), None);
     }
 
-    /// The zero-tick carry: unchanged-price ticks keep the last direction.
-    ///
-    /// This is the case that decides whether the column is useful at all —
-    /// unchanged-price ticks are the majority on a liquid contract, so
-    /// discarding them would under-report a bar's flow by most of its volume.
+    /// A lower counter alone cannot distinguish a reset from a stale snapshot.
+    /// Preserve observed pre-decrease quantity and expose uncertainty instead
+    /// of inventing a certified counter axis from the drop magnitude.
     #[test]
-    fn an_unchanged_price_carries_the_previous_direction() {
-        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
-        let sink = |_: Feed, _: u64, _: u8, _: TfIndex, _: LiveCandleState| {};
-        let base = OPEN;
-
-        let _ = agg.consume_tick(
-            Feed::Dhan,
-            &tick(77, SEG_IDX, base, 100.0, 1_000),
-            None,
-            sink,
-        );
-        // DOWNTICK 500 — sets the carry to sell.
-        let _ = agg.consume_tick(
-            Feed::Dhan,
-            &tick(77, SEG_IDX, base + 1, 99.0, 1_500),
-            None,
-            sink,
-        );
-        // FLAT 300 — same price, so it inherits the sell direction.
-        let _ = agg.consume_tick(
-            Feed::Dhan,
-            &tick(77, SEG_IDX, base + 2, 99.0, 1_800),
-            None,
-            sink,
-        );
-
-        assert_eq!(
-            agg.snapshot(Feed::Dhan, 77, SEG_IDX, TfIndex::M1)
-                .expect("open")
-                .net_volume(),
-            Some(-800),
-            "500 on the downtick plus 300 carried at the same price"
-        );
-    }
-
-    /// A cumulative RESTART re-anchors the baseline instead of freezing it.
-    ///
-    /// The vendor's day-cumulative can restart near zero (a counter wrap, or a
-    /// session restart on the exchange side). Without the re-anchor the
-    /// advance-only rule reads every later tick as a regression, so the
-    /// instrument reports `volume 0` for the rest of the session while its
-    /// `tick_count` keeps rising — wrong, and silent.
-    ///
-    /// The three outcomes are deliberately far apart so this test cannot pass
-    /// by accident: 51,000 is the re-anchored answer, 1,000 is the frozen one.
-    #[test]
-    fn a_cumulative_restart_re_anchors_the_baseline_instead_of_freezing() {
+    fn an_ambiguous_counter_restart_preserves_quantity_and_invalidates_net() {
         let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
         let sink = |_: Feed, _: u64, _: u8, _: TfIndex, _: LiveCandleState| {};
         let base = OPEN;
@@ -1844,16 +1982,14 @@ mod tests {
             None,
             sink,
         );
-        // THE RESTART: a backwards step of ~4e9, far past the floor. This tick
-        // itself adds nothing (it traded nothing new), but it must MOVE the
-        // baseline.
+        // A large decrease is ambiguous, not proof of a new counter axis.
         let _ = agg.consume_tick(
             Feed::Dhan,
             &tick(91, SEG_IDX, base + 2, 102.0, 100_000),
             None,
             sink,
         );
-        // The proof tick: 50,000 above the RESTARTED counter.
+        // A recovery below the retained high cannot certify another 50,000.
         let _ = agg.consume_tick(
             Feed::Dhan,
             &tick(91, SEG_IDX, base + 3, 103.0, 150_000),
@@ -1866,91 +2002,31 @@ mod tests {
             .expect("open bucket");
         assert_eq!(
             open.net_volume(),
-            Some(51_000),
-            "1,000 before the restart plus 50,000 after it; a frozen baseline \
-             would report 1,000 and lose the rest of the session"
+            None,
+            "an unresolved counter epoch cannot produce certified signed flow"
         );
         assert_eq!(
-            open.volume, 51_000,
-            "gross must count exactly the same trades as net"
+            open.volume, 1_000,
+            "only the accepted old-axis increment is attributed"
         );
     }
 
-    /// A small backwards step is a STALE PACKET, not a restart: it must not
-    /// re-anchor, and it must not poison the next tick's direction.
-    ///
-    /// MEASURED on the live box 2026-09-11: security 68407 took five
-    /// cumulative regressions before 09:40 IST — 09:15:07 -> 09:15:08 went
-    /// 40,820 -> 40,690 while the price moved the OTHER way. An out-of-order
-    /// snapshot is an older view, so it is refused as an INPUT to the tick
-    /// rule rather than merely discounted in the output.
-    ///
-    /// Three outcomes discriminate all three branches at once:
-    ///   11,000 — correct
-    ///    9,000 — the stale price was allowed to set the direction
-    ///   12,000 — the stale packet wrongly re-anchored the baseline
+    /// A lower counter adds no accepted quantity and is explicitly uncertain.
+    /// A genuine duplicate is different: it leaves a known bar classified.
     #[test]
-    fn a_stale_packet_neither_re_anchors_nor_sets_the_next_ticks_direction() {
+    fn a_lower_counter_contributes_zero_and_invalidates_certified_net() {
         let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
         let sink = |_: Feed, _: u64, _: u8, _: TfIndex, _: LiveCandleState| {};
         let base = OPEN;
 
+        // Give this M1 candle a real same-timeframe predecessor; otherwise
+        // its signed value would already be unavailable before the decrease.
         let _ = agg.consume_tick(
             Feed::Dhan,
-            &tick(92, SEG_IDX, base, 100.0, 10_000),
+            &tick(93, SEG_IDX, base - 1, 100.0, 5_000),
             None,
             sink,
         );
-        // UPTICK 10,000 — the real flow, and it sets the last accepted price
-        // to 101.0.
-        let _ = agg.consume_tick(
-            Feed::Dhan,
-            &tick(92, SEG_IDX, base + 1, 101.0, 20_000),
-            None,
-            sink,
-        );
-        // THE STALE PACKET: cumulative goes BACKWARDS by 1,000 (far under the
-        // restart floor) and carries a HIGHER price. If that price were
-        // allowed through, the next tick would read as a downtick.
-        let _ = agg.consume_tick(
-            Feed::Dhan,
-            &tick(92, SEG_IDX, base + 2, 103.0, 19_000),
-            None,
-            sink,
-        );
-        // The proof tick: 102.0 is ABOVE the last genuinely accepted price
-        // (101.0) and BELOW the stale one (103.0).
-        let _ = agg.consume_tick(
-            Feed::Dhan,
-            &tick(92, SEG_IDX, base + 3, 102.0, 21_000),
-            None,
-            sink,
-        );
-
-        let open = agg
-            .snapshot(Feed::Dhan, 92, SEG_IDX, TfIndex::M1)
-            .expect("open bucket");
-        assert_eq!(
-            open.net_volume(),
-            Some(11_000),
-            "10,000 up, nothing from the stale packet, 1,000 up off the \
-             high-water baseline"
-        );
-    }
-
-    /// A stale packet leaves the bar CLASSIFIED, and that distinction is the
-    /// whole point of `Some(0)` rather than `None`.
-    ///
-    /// It traded nothing new, so there is no flow for the bar to be ignorant
-    /// of. Returning `None` would NULL an otherwise fully-classified bar over
-    /// a packet that added no volume — a duplicate or an out-of-order snapshot
-    /// would silently erase a good reading.
-    #[test]
-    fn a_stale_packet_contributes_zero_and_never_unclassifies_the_bar() {
-        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
-        let sink = |_: Feed, _: u64, _: u8, _: TfIndex, _: LiveCandleState| {};
-        let base = OPEN;
-
         let _ = agg.consume_tick(
             Feed::Dhan,
             &tick(93, SEG_IDX, base, 100.0, 5_000),
@@ -1969,6 +2045,20 @@ mod tests {
             .net_volume();
         assert_eq!(before, Some(1_000), "a clean uptick of 1,000");
 
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(93, SEG_IDX, base + 1, 101.0, 6_000),
+            None,
+            sink,
+        );
+        let duplicate = agg.snapshot(Feed::Dhan, 93, SEG_IDX, TfIndex::M1).unwrap();
+        assert_eq!(duplicate.volume, 1_000, "a duplicate cannot count twice");
+        assert_eq!(
+            duplicate.net_volume(),
+            before,
+            "a duplicate preserves the known signal"
+        );
+
         // The out-of-order snapshot.
         let _ = agg.consume_tick(
             Feed::Dhan,
@@ -1982,53 +2072,10 @@ mod tests {
             .expect("open bucket");
         assert_eq!(
             after.net_volume(),
-            Some(1_000),
-            "unchanged — the stale packet added no volume and no direction"
+            None,
+            "the lower counter cannot certify whether its epoch changed"
         );
         assert_eq!(after.volume, 1_000, "and it added nothing to gross either");
-    }
-    /// Before any direction has revealed itself, a flat tick is UNCLASSIFIED.
-    ///
-    /// Guessing here would propagate: the carry would then sign every
-    /// subsequent flat tick on a direction nobody observed.
-    #[test]
-    fn a_flat_tick_with_no_carry_yet_makes_the_bar_unclassified_not_balanced() {
-        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
-        let sink = |_: Feed, _: u64, _: u8, _: TfIndex, _: LiveCandleState| {};
-        let base = OPEN;
-
-        let _ = agg.consume_tick(
-            Feed::Dhan,
-            &tick(77, SEG_IDX, base, 100.0, 1_000),
-            None,
-            sink,
-        );
-        // Same price, real volume, and no direction has ever been observed.
-        let _ = agg.consume_tick(
-            Feed::Dhan,
-            &tick(77, SEG_IDX, base + 1, 100.0, 1_600),
-            None,
-            sink,
-        );
-
-        let bar = agg
-            .snapshot(Feed::Dhan, 77, SEG_IDX, TfIndex::M1)
-            .expect("open");
-        assert_eq!(bar.volume, 600, "the gross still counts it");
-        // ⚠ 2026-09-11: this asserted `Some(0)` with the rationale "traded but
-        // unclassifiable nets to zero — a real reading". That rationale was the
-        // defect written down as a test. `Some(0)` on this column means "buy
-        // and sell flow were measured and were equal"; here nothing was
-        // measured at all — the price never moved and no direction has ever
-        // been observed for this instrument, so the 600 units have no known
-        // side. Publishing `0` made an unmeasured bar indistinguishable from a
-        // genuinely balanced one.
-        assert_eq!(
-            bar.net_volume(),
-            None,
-            "the bar traded 600 units whose side is unknown — that is NULL, \
-             never a measured zero"
-        );
     }
 
     /// THE INVARIANT, driven through the real fold rather than asserted on a
@@ -2069,117 +2116,6 @@ mod tests {
         }
     }
 
-    /// **Conservation across timeframes** — the property an operator checks by
-    /// eye: if `candles_1m` says a minute was +800, the `candles_1s` rows
-    /// underneath it must add up to +800.
-    ///
-    /// It holds BY CONSTRUCTION — `classify_tick_volume` runs once per tick and
-    /// the same signed number is added into every open bar, so the frames are
-    /// different WINDOWS over one classification, never different answers. But
-    /// "by construction" is a claim, and until this test nothing pinned it:
-    /// every other `net_volume` test asserts a property of ONE bar.
-    ///
-    /// This is also what makes a sub-minute frame legitimately look SPARSE
-    /// without being wrong. A second in which no tick arrived opens no bucket
-    /// at all — that is an absent ROW, not a missing measurement — and a
-    /// second whose only tick carried no new volume reports NULL. Neither
-    /// contributes to the sum, so the totals still agree.
-    #[test]
-    fn every_sub_minute_frame_sums_to_the_same_minute_net_volume() {
-        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
-        let mut sealed: Vec<(TfIndex, i64)> = Vec::new();
-        // `OPEN` is minute-aligned, so [base, base+59] is exactly ONE M1 bucket.
-        let base = OPEN;
-
-        let mut cum = 1_000u32;
-        let mut price = 100.0f32;
-        for i in 0..60u32 {
-            // Irregular sizes and a flipping direction, including flat ticks
-            // that ride the carry — so the net is not trivially +gross and the
-            // sum has to do real work.
-            price += match i % 4 {
-                0 => 0.25,
-                1 => -0.50,
-                2 => 0.0,
-                _ => 0.75,
-            };
-            cum += 10 + i * 3;
-            let _ = agg.consume_tick(
-                Feed::Dhan,
-                &tick(77, SEG_IDX, base + i, price, cum),
-                None,
-                |_: Feed, _: u64, _: u8, tf: TfIndex, st: LiveCandleState| {
-                    if let Some(net) = st.net_volume() {
-                        sealed.push((tf, net));
-                    }
-                },
-            );
-        }
-
-        let minute = agg
-            .snapshot(Feed::Dhan, 77, SEG_IDX, TfIndex::M1)
-            .and_then(|b| b.net_volume())
-            .expect("the minute bar traded and was classified");
-
-        // ANTI-VACUITY, checked before the loop that does the real asserting.
-        // Both of these have failed silently in this repository's history: a
-        // filter that excludes every frame makes the loop below assert nothing
-        // and the test pass green, and a net that equals the gross would mean
-        // the flat and down ticks above never exercised the carry — the sum
-        // would then be trivially conserved because every term has one sign.
-        let gross = agg
-            .snapshot(Feed::Dhan, 77, SEG_IDX, TfIndex::M1)
-            .map(|b| b.volume)
-            .expect("the minute bar exists");
-        assert!(
-            minute.unsigned_abs() < gross,
-            "the fixture never produced offsetting flow: net {minute} vs gross \
-             {gross} — conservation would hold trivially, so this test would \
-             prove nothing"
-        );
-
-        let mut frames_checked = 0usize;
-        for tf in TfIndex::ALL {
-            // Keep only frames whose buckets TILE this minute: the first starts
-            // exactly on the minute and the last still starts inside it. That
-            // admits every sub-minute frame and excludes D1, whose bucket began
-            // at midnight and holds volume this minute never saw.
-            if tf.bucket_start(base) != base || tf.bucket_start(base + 59) >= base + 60 {
-                continue;
-            }
-            frames_checked += 1;
-            let closed: i64 = sealed
-                .iter()
-                .filter(|(t, _)| *t == tf)
-                .map(|(_, net)| *net)
-                .sum();
-            // The frame's LAST bucket has not sealed yet, so it is still open
-            // and has to be read from the snapshot or the sum is short by it.
-            let still_open = agg
-                .snapshot(Feed::Dhan, 77, SEG_IDX, tf)
-                .and_then(|b| b.net_volume())
-                .unwrap_or(0);
-            assert_eq!(
-                closed + still_open,
-                minute,
-                "{tf:?}: its bars sum to {} but the minute they tile reports \
-                 {minute} — the frames disagree about the same trades, which \
-                 is the one thing a single per-tick classification is supposed \
-                 to make impossible",
-                closed + still_open
-            );
-        }
-
-        // The second-scale family alone is 19 frames; if the tiling filter ever
-        // stops admitting them, this test goes quiet rather than red.
-        assert!(
-            frames_checked >= 10,
-            "only {frames_checked} frames were compared — the tiling filter is \
-             excluding frames it should admit, so this test is no longer \
-             checking what it claims"
-        );
-    }
-
     /// The first tick for an instrument has no previous price to compare to.
     ///
     /// `last_ltp` is `NaN` until the first accepted tick, and `NaN` fails BOTH
@@ -2207,169 +2143,6 @@ mod tests {
         );
     }
 
-    /// The classifier itself, exhaustively — the refusals are the interesting
-    /// half and each one is a hazard that has bitten this repository before.
-    #[test]
-    fn classify_tick_volume_refuses_every_input_it_cannot_read() {
-        let mut carry = 0i8;
-
-        // NOTHING TRADED is `Some(0)`, not `None`. This is the distinction the
-        // 2026-09-11 change exists to make: no volume moved, so the bar is not
-        // ignorant of anything and must stay fully classified. A duplicate
-        // packet — which this feed delivers routinely — lands here, and
-        // returning `None` would let one duplicate NULL an otherwise complete
-        // bar.
-        assert_eq!(classify_tick_volume(100.0, 101.0, 0, &mut carry), Some(0));
-        assert_eq!(carry, 0, "a refused tick must not move the carry");
-
-        // No previous price (the first tick): real delta, unclassifiable.
-        assert_eq!(
-            classify_tick_volume(f64::NAN, 101.0, 500, &mut carry),
-            None,
-            "real volume with no previous price is UNKNOWN, never balanced"
-        );
-        assert_eq!(
-            carry, 0,
-            "inventing a direction here would sign every following flat tick"
-        );
-
-        // Absent-price sentinel and poisoned prices on the current side: real
-        // volume arrived under a price we cannot read.
-        assert_eq!(classify_tick_volume(100.0, 0.0, 500, &mut carry), None);
-        assert_eq!(classify_tick_volume(100.0, f64::NAN, 500, &mut carry), None);
-        assert_eq!(
-            classify_tick_volume(100.0, f64::INFINITY, 500, &mut carry),
-            None
-        );
-
-        // Flat with no carry: real volume, and no side has EVER revealed
-        // itself. The opening-bar case, and the one that used to publish
-        // `Some(0)` = "perfectly balanced" about flow nobody measured.
-        assert_eq!(
-            classify_tick_volume(100.0, 100.0, 500, &mut carry),
-            None,
-            "real volume with no known direction must never read as balanced"
-        );
-
-        // Now the classifying cases.
-        assert_eq!(
-            classify_tick_volume(100.0, 101.0, 500, &mut carry),
-            Some(500)
-        );
-        assert_eq!(carry, 1, "an uptick sets the carry to buy");
-        assert_eq!(
-            classify_tick_volume(101.0, 101.0, 300, &mut carry),
-            Some(300)
-        );
-        assert_eq!(carry, 1, "a flat tick READS the carry, never rewrites it");
-        assert_eq!(
-            classify_tick_volume(101.0, 99.0, 700, &mut carry),
-            Some(-700)
-        );
-        assert_eq!(carry, -1, "a downtick sets the carry to sell");
-        assert_eq!(
-            classify_tick_volume(99.0, 99.0, 200, &mut carry),
-            Some(-200)
-        );
-    }
-
-    /// The distinction the `Option` exists for, stated as its own test so it
-    /// cannot be collapsed back by a future refactor: a genuinely-zero tick and
-    /// an unclassifiable tick must NOT compare equal.
-    #[test]
-    fn a_balanced_tick_and_an_unclassifiable_tick_are_different_answers() {
-        let mut carry = 0i8;
-        let nothing_traded = classify_tick_volume(100.0, 101.0, 0, &mut carry);
-        let traded_but_unknown = classify_tick_volume(100.0, 100.0, 500, &mut carry);
-
-        assert_eq!(nothing_traded, Some(0));
-        assert_eq!(traded_but_unknown, None);
-        assert_ne!(
-            nothing_traded, traded_but_unknown,
-            "collapsing these two is the defect: one means no flow existed, the \
-             other means flow existed and we could not read its side"
-        );
-    }
-
-    /// `-(u64 as i64)` past `i64::MAX` wraps POSITIVE, which would record a
-    /// sell as a buy. Same hazard, same handling, as the tick-persistence path.
-    #[test]
-    fn classify_tick_volume_saturates_instead_of_wrapping_a_sell_into_a_buy() {
-        let mut carry = -1i8;
-        let signed = classify_tick_volume(100.0, 99.0, u64::MAX, &mut carry)
-            .expect("a downtick with a readable price classifies");
-        assert!(signed < 0, "a downtick must never classify as buy volume");
-        assert_eq!(signed, -i64::MAX);
-    }
-
-    /// An exact comparison, never a widened `f32`.
-    ///
-    /// `10.20_f32 as f64` is `10.19999980926514`. Comparing that against a
-    /// decimal-clean `10.2` reports an UNCHANGED price as an UPTICK —
-    /// systematically, on the majority of ticks, which would turn this column
-    /// into a near-copy of gross volume.
-    #[test]
-    fn an_unchanged_decimal_clean_price_is_flat_not_an_uptick() {
-        let clean = tickvault_common::price_precision::f32_to_f64_clean(10.20_f32);
-        let mut carry = -1i8;
-        assert_eq!(
-            classify_tick_volume(clean, clean, 900, &mut carry),
-            Some(-900),
-            "identical decimal-clean prices must compare EQUAL and take the \
-             carry, not read as a rise"
-        );
-    }
-
-    /// The day boundary resets the carry, never inherits it.
-    ///
-    /// A direction learned from yesterday's last print is not evidence about
-    /// today's first, and carrying it would attribute the whole of the new
-    /// session's opening flat volume to whichever side moved the price at
-    /// yesterday's close.
-    #[test]
-    fn a_force_seal_clears_the_tick_rule_carry() {
-        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
-        let sink = |_: Feed, _: u64, _: u8, _: TfIndex, _: LiveCandleState| {};
-        let base = OPEN;
-
-        let _ = agg.consume_tick(
-            Feed::Dhan,
-            &tick(77, SEG_IDX, base, 100.0, 1_000),
-            None,
-            sink,
-        );
-        // A downtick sets the carry to sell.
-        let _ = agg.consume_tick(
-            Feed::Dhan,
-            &tick(77, SEG_IDX, base + 1, 99.0, 1_500),
-            None,
-            sink,
-        );
-
-        let _ = agg.force_seal_all(sink);
-
-        // New day: a flat tick must NOT inherit yesterday's sell direction.
-        let _ = agg.consume_tick(
-            Feed::Dhan,
-            &tick(77, SEG_IDX, base + 86_400, 99.0, 200),
-            None,
-            sink,
-        );
-        let _ = agg.consume_tick(
-            Feed::Dhan,
-            &tick(77, SEG_IDX, base + 86_401, 99.0, 900),
-            None,
-            sink,
-        );
-
-        assert_eq!(
-            agg.snapshot(Feed::Dhan, 77, SEG_IDX, TfIndex::M1)
-                .expect("open")
-                .net_volume_signed,
-            0,
-            "yesterday's direction is not evidence about today"
-        );
-    }
     // -- volume-conservation guards (live defect, measured 2026-08-24) ------
     //
     // The live box tiled ONE trading day five ways and got five different
@@ -2577,9 +2350,13 @@ mod tests {
             expected,
             "1m frames must tile the day exactly"
         );
-        assert_eq!(total(TfIndex::D1), expected, "the day bar is the same day");
-        assert_eq!(total(TfIndex::S1), total(TfIndex::M1));
-        assert_eq!(total(TfIndex::M1), total(TfIndex::D1));
+        for tf in TfIndex::ALL {
+            assert_eq!(
+                total(tf),
+                expected,
+                "every active frame conserves the ledger: {tf:?}"
+            );
+        }
     }
 
     /// The unattributed carry must be settled ONCE — the sharpest edge in the
@@ -2648,142 +2425,15 @@ mod tests {
             "the carry was swept up in-bucket; applying it again at the next \
              open would invent volume"
         );
-        // The day frame never refuses anything, so it is the independent
-        // witness: if the 1m total exceeds it, the extra units are fabricated.
-        assert_eq!(total(TfIndex::D1), expected);
-        assert_eq!(total(TfIndex::S1), expected);
-    }
-
-    /// The carried SIGN travels with the carried units into the SAME bar, so
-    /// the receiving bar counts one set of trades twice over — once gross,
-    /// once net.
-    ///
-    /// This is the half a gross-only fix silently leaves broken. `volume` and
-    /// `net_volume` are two readings of ONE set of trades, and
-    /// `net_volume().abs() <= volume` is a structural fact only while both are
-    /// fed from the same deltas. Settling the gross alone would hand the
-    /// receiving bar units whose direction it never learned, while
-    /// `net_volume_classified` still reported the bar fully classified — a
-    /// confident answer over volume nobody signed.
-    ///
-    /// WHICH bar receives it is the part this test pins, and it changed on
-    /// 2026-09-11. The carry is settled into the bar that is OPEN when the
-    /// late tick arrives, at that bar's SEAL — not into the next bar to open.
-    /// Right-endpoint chaining forces it: the following bucket must start
-    /// exactly where this one ended, so units parked past that endpoint would
-    /// fall in a gap. It is also the better answer on its own terms — the open
-    /// bar is the one temporally nearer the refused tick.
-    ///
-    /// BITE PROOF: dropping `carry.net` from `UnattributedCarry::settle_into`
-    /// leaves this bar at `Some(1000)` against a gross of 2,000 — half its
-    /// flow missing, and nothing anywhere saying so.
-    #[test]
-    fn a_settled_carry_brings_its_sign_with_it_not_just_its_units() {
-        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
-        let mut m1: std::collections::HashMap<u32, LiveCandleState> =
-            std::collections::HashMap::new();
-
-        // Every tick is an UPTICK, so every delta is buy-initiated and the
-        // arithmetic stays readable: net must equal gross throughout.
-        for (off, cum, px) in [
-            (0_u32, 1_000_u32, 100.0_f32), // seeds the baseline (unclassified)
-            (60, 2_000, 101.0),            // rolls 1m: opens bucket 60
-            (10, 3_000, 102.0),            // LATE for 1m — carries +1,000
-            (120, 4_000, 103.0),           // rolls 1m: SEALS bucket 60
-        ] {
-            let _ = agg.consume_tick(
-                Feed::Dhan,
-                &tick(77, SEG_IDX, OPEN + off, px, cum),
-                None,
-                |_, _, _, tf, st| {
-                    if tf == TfIndex::M1 {
-                        m1.insert(st.bucket_start_ist_secs, st);
-                    }
-                },
+        // Each active frame must independently match the received ledger;
+        // agreement between two candles could otherwise hide a shared defect.
+        for tf in TfIndex::ALL {
+            assert_eq!(
+                total(tf),
+                expected,
+                "one carry settlement per frame: {tf:?}"
             );
         }
-
-        let bar = m1
-            .get(&(OPEN + 60))
-            .copied()
-            .expect("bucket 60 sealed when the 120 tick rolled it");
-        assert_eq!(
-            bar.volume, 2_000,
-            "its own 1,000 plus the 1,000 the late tick brought"
-        );
-        assert_eq!(
-            bar.net_volume(),
-            Some(2_000),
-            "both deltas were buy-initiated, so the net must account for the \
-             carried units too — a net short of the gross here means the \
-             carry arrived unsigned"
-        );
-    }
-
-    /// A bar that settles units nobody could SIGN inherits the ignorance —
-    /// it does not report a confident net over volume it never classified.
-    ///
-    /// ⚠ HONEST SCOPE, and it is narrower than it looks. On the live path the
-    /// `unclassified` half of the carry is BELT-AND-BRACES rather than
-    /// load-bearing, because of how `classify_tick_volume` reaches its `None`
-    /// arm: real volume at an UNCHANGED price with no side ever revealed for
-    /// this instrument. Once any side reveals itself the per-instrument sign
-    /// carry latches, and every later flat tick classifies — so a carry can
-    /// only be unclassified while EVERY bar so far is also unclassified,
-    /// including the one that receives it. There is therefore no reachable
-    /// sequence in which a fully-classified bar settles unsignable units.
-    ///
-    /// The flag is kept anyway, and this test with it, for two reasons: the
-    /// `Ticker`-mode path (`consume_tick_with_prices`) passes `None` for every
-    /// tick, and a future change to the classifier that widens its `None` arm
-    /// would otherwise silently publish a net over volume it never signed.
-    /// What this test pins UNCONDITIONALLY is the other half — that the units
-    /// are counted.
-    ///
-    /// BITE PROOF: dropping the `owed > state.volume` widening from
-    /// `UnattributedCarry::settle_into` leaves this bar at 1,000 of its 2,000
-    /// units.
-    #[test]
-    fn a_bar_that_settles_unsignable_units_refuses_to_report_a_net() {
-        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
-        let mut m1: std::collections::HashMap<u32, LiveCandleState> =
-            std::collections::HashMap::new();
-
-        for (off, cum, px) in [
-            // Flat opening prints: no side ever reveals itself, so every
-            // delta below is real volume with no readable direction.
-            (0_u32, 1_000_u32, 100.0_f32), // first tick — unclassifiable
-            (60, 2_000, 100.0),            // flat, carry still 0 — unclassifiable
-            (10, 3_000, 100.0),            // LATE for 1m, and UNSIGNABLE
-            (120, 4_000, 101.0),           // first real move: SEALS bucket 60
-        ] {
-            let _ = agg.consume_tick(
-                Feed::Dhan,
-                &tick(77, SEG_IDX, OPEN + off, px, cum),
-                None,
-                |_, _, _, tf, st| {
-                    if tf == TfIndex::M1 {
-                        m1.insert(st.bucket_start_ist_secs, st);
-                    }
-                },
-            );
-        }
-
-        let bar = m1
-            .get(&(OPEN + 60))
-            .copied()
-            .expect("bucket 60 sealed when the 120 tick rolled it");
-        assert_eq!(
-            bar.volume, 2_000,
-            "the units are still counted — ignorance of direction is not a \
-             reason to lose the trades"
-        );
-        assert_eq!(
-            bar.net_volume(),
-            None,
-            "1,000 of this bar's 2,000 units arrived with no readable side, \
-             so the honest answer is NULL rather than a net over half of it"
-        );
     }
 
     /// A carry outstanding at the DAY BOUNDARY is settled into that day's
@@ -2927,8 +2577,8 @@ mod tests {
         // the SLOT and was never reset. A process spanning midnight opened day
         // two's first bucket with yesterday's final cumulative as baseline —
         // `saturating_sub` floored every bucket to 0, and with the monotonic
-        // `max` above it would have STAYED pinned there. D1 is the worst case:
-        // one bucket per day, so the entire daily bar reads zero volume.
+        // `max` above it would have STAYED pinned there, suppressing new-day
+        // volume in every active timeframe until the old counter was exceeded.
         //
         // Delete the `slot.last_cumulative = 0;` line in `force_seal_all` and
         // day two's volume reads 0 instead of 300.
@@ -3231,7 +2881,7 @@ mod tests {
     /// exchange disagree by more than the trusted band, and a stamp one day
     /// ahead disagrees by ~86,400 s. That value then advanced the watermark
     /// into day D+1, and every honest tick afterwards failed the stale-day
-    /// gate: all 24 timeframes stop folding, for every instrument, with only a
+    /// gate: all ten active timeframes stop folding, for every instrument, with only a
     /// rising refusal counter to show for it.
     ///
     /// Both halves are asserted because either alone would be a false pass:
@@ -3281,20 +2931,28 @@ mod tests {
         );
     }
 
-    /// The gate stands down with no receipt to compare against, so a WAL frame
-    /// written before the TVW3 format carried one folds exactly as it did
-    /// before. `received_at_nanos == 0` is the documented sentinel.
+    /// Clockless legacy replay may fold locally, but cannot move a shared
+    /// watermark from a vendor timestamp nobody independently validated.
     #[test]
-    fn a_future_dated_tick_with_no_receipt_clock_is_judged_as_before() {
+    fn a_clockless_future_replay_cannot_advance_the_global_watermark() {
         let today_in_session = DAY + 33_300 + 60;
         let mut agg = MultiTfAggregator::default();
-        // Default `received_at_nanos` is 0 — the sentinel.
-        let t = tick(13, SEG_IDX, today_in_session + 86_400, 100.0, 1);
+        let mut t = tick(13, SEG_IDX, today_in_session + 86_400, 100.0, 1);
+        t.received_at_nanos = 0;
         assert_eq!(t.received_at_nanos, 0, "fixture must exercise the sentinel");
         let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
         assert!(
             !stats.future_trading_day,
             "with no second clock the gate must not guess"
+        );
+        assert_eq!(agg.watermark_secs(), 0);
+        let state = agg
+            .snapshot(Feed::Dhan, 13, SEG_IDX, TfIndex::M1)
+            .expect("local replay");
+        assert_ne!(
+            state.volume_quality
+                & crate::candles::volume_update::VOLUME_QUALITY_ATTRIBUTION_UNCERTAIN,
+            0
         );
     }
 
@@ -3366,16 +3024,10 @@ mod tests {
         );
     }
 
-    /// A tick received just after IST midnight, stamped just before it, is NOT
-    /// stale — it is a boundary crossing, and refusing it would silently drop
-    /// the last trades of every session.
-    ///
-    /// `fold_clock_ist_secs` is what makes this safe: receipt and exchange
-    /// agree well inside the trusted band, so the FOLD clock is the receipt,
-    /// and both sides of the comparison land on the same day. The gate is
-    /// therefore judging a genuine day mismatch, not a clock straddle.
+    /// Receipt must not re-date a Dhan trade across IST midnight. The regular
+    /// capture window is already closed then; this is a candle-only refusal.
     #[test]
-    fn a_tick_straddling_ist_midnight_inside_the_trusted_band_is_not_stale() {
+    fn a_dhan_tick_straddling_ist_midnight_keeps_its_event_day() {
         let mut agg = MultiTfAggregator::default();
 
         let just_before_midnight = DAY - 1;
@@ -3388,11 +3040,11 @@ mod tests {
         let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
 
         assert!(
-            !stats.stale_trading_day,
-            "two seconds apart is inside the trusted band, so the fold clock \
-             takes the receipt and both sides land on the same day — a \
-             refusal here would drop real closing trades every session"
+            stats.stale_trading_day,
+            "receipt does not re-date a prior-day Dhan LTT into a current-day candle"
         );
+        assert!(!stats.folded());
+        assert!(agg.is_empty());
     }
 
     #[test]
@@ -3539,10 +3191,18 @@ mod tests {
         // Same for the 1s frame: 600 elapsed 1s buckets, ONE bar.
         let s1: Vec<&SealRow> = seals.iter().filter(|r| r.3 == TfIndex::S1).collect();
         assert_eq!(s1.len(), 1, "600 elapsed 1s buckets must emit ONE bar");
-        // And 1d never crossed a boundary at all.
+        // The ten-minute frame crosses exactly one nominal boundary from
+        // 09:15 to 09:25 on its 09:00 grid; the hour frame stays in one bucket.
+        let m10: Vec<&SealRow> = seals.iter().filter(|r| r.3 == TfIndex::M10).collect();
+        assert_eq!(
+            m10.len(),
+            1,
+            "the active 10m frame seals its one populated bucket"
+        );
+        assert_eq!(m10[0].4, CANDLE_OPEN + 600);
         assert!(
-            !seals.iter().any(|r| r.3 == TfIndex::D1),
-            "the 1d bucket did not close — it must emit nothing"
+            !seals.iter().any(|r| r.3 == TfIndex::M60),
+            "the 60m bucket did not close — it must emit nothing"
         );
     }
 
@@ -3682,7 +3342,7 @@ mod tests {
             assert_eq!(stats.late_count, 0, "same second is never late");
         }
         // Even the finest frame (1s) keeps them all in ONE bucket.
-        for tf in [TfIndex::S1, TfIndex::M1, TfIndex::D1] {
+        for tf in TfIndex::ALL {
             let s = agg.snapshot(Feed::Dhan, 13, SEG_IDX, tf).expect("slot");
             assert_eq!(
                 s.tick_count,
@@ -4499,7 +4159,7 @@ mod tests {
     /// Every scaling document in this repo sizes MEMORY at 25,000 instruments
     /// and then says CPU is UNMEASURED — `websocket-connection-scope-lock.md`
     /// states it outright ("~12,500 packets/sec at the open × (decode +
-    /// 24-timeframe fold + ILP append) has never run"). Memory fitting is not
+    /// fixed-timeframe fold + ILP append) has never run"). Memory fitting is not
     /// the same claim as the box keeping up, and the second one is what drops
     /// ticks. This turns the CPU half into a number.
     ///
@@ -4632,11 +4292,13 @@ mod tests {
         ];
         let bars = hostile_run(SEQ);
         let expected = 1_700_u64 - 1_000;
-        assert_eq!(
-            hostile_total(&bars, TfIndex::D1),
-            expected,
-            "sanity: the day bar sweeps everything"
-        );
+        for tf in TfIndex::ALL {
+            assert_eq!(
+                hostile_total(&bars, tf),
+                expected,
+                "received ledger for {tf:?}"
+            );
+        }
         assert_eq!(
             hostile_total(&bars, TfIndex::M1),
             expected,
@@ -4679,11 +4341,13 @@ mod tests {
         });
 
         let expected = 1_500_u64 - 1_000;
-        assert_eq!(
-            hostile_total(&bars, TfIndex::D1),
-            expected,
-            "sanity: the day bar swept the late tick in-bucket"
-        );
+        for tf in TfIndex::ALL {
+            assert_eq!(
+                hostile_total(&bars, tf),
+                expected,
+                "received ledger for {tf:?}"
+            );
+        }
         assert_eq!(
             hostile_total(&bars, TfIndex::S1),
             expected,
@@ -4745,12 +4409,13 @@ mod tests {
         });
 
         let expected = 1_500_u64 - 1_000;
-        assert_eq!(
-            hostile_total(&bars, TfIndex::D1),
-            expected,
-            "sanity: the day bar's bucket never closed, so it swept the late \
-             tick in-bucket and must show the full span"
-        );
+        for tf in TfIndex::ALL {
+            assert_eq!(
+                hostile_total(&bars, tf),
+                expected,
+                "received ledger for {tf:?}"
+            );
+        }
         assert_eq!(
             bars.get(&(TfIndex::S1, OPEN)).copied(),
             Some(0),
@@ -4772,15 +4437,12 @@ mod tests {
         );
     }
 
-    /// FINDING C — the carried SIGN survives a counter restart even though
-    /// `rebase_open_buckets` claims to drop the carry.
+    /// Historical regression C: resetting the cumulative axis must preserve
+    /// gross volume and its classification together.
     ///
-    /// The restart is detected AFTER the timeframe loop, so the wrapping tick
-    /// has already rolled the bucket and `open_bucket` has already seeded the
-    /// new bar's `net_volume_signed` with `carry.net`. `rebase_open_buckets`
-    /// then clears `carried_*` and re-anchors `bucket_start_cumulative` — but
-    /// it never touches `net_volume_signed`. The gross died with the counter;
-    /// the sign did not.
+    /// The old path cleared carry while leaving its signed contribution in
+    /// the open candle. Carry now settles before rebasing, so both quantities
+    /// remain on the same volume ledger.
     ///
     /// Result: a bar whose `net_volume_signed` exceeds its own `volume`,
     /// which `net_volume()` silently CLAMPS to `±volume` — publishing
@@ -4894,26 +4556,20 @@ mod tests {
         );
         assert_eq!(
             t3.net_volume(),
-            Some(200),
-            "the bar's only classified flow was +200 (a buy); the published \
-             net must not be negative"
+            None,
+            "a drop followed by a recovery cannot certify a new counter axis"
         );
     }
 
     /// FINDING C3 — the OTHER `chain_broken` consumption site, and the one
     /// that fails SILENTLY for a whole bucket.
     ///
-    /// The two restart tests above both restart on a tick that ROLLS, so the
-    /// broken chain is consumed at the roll site. This one restarts while the
-    /// frame has NO open bucket — the slot was drained by the watermark
-    /// sealer — so the flag is consumed by
-    /// `AggregatorCell::next_bucket_start_cumulative` instead.
+    /// The two restart tests above restart with an open bucket. This one
+    /// restarts after the watermark sealer drained it. The retained sealed
+    /// predecessor must also be rebased before it can seed a later bucket.
     ///
-    /// That path is the dangerous one. `rebase_open_buckets` re-anchors OPEN
-    /// buckets onto the new axis, so a bar that was open across the restart
-    /// chains correctly. `last_sealed` is NOT re-anchored — a bar sealed
-    /// BEFORE the restart keeps a right endpoint on the erased axis. Chaining
-    /// the next bucket to it computes `volume = cumulative − start` against a
+    /// The original bug kept `last_sealed` on the erased cumulative axis.
+    /// Chaining the next bucket to it computed `volume = cumulative − start` against a
     /// number the post-restart counter may not reach for hours, so the bar
     /// publishes **0 volume with a rising tick count** — no error, no
     /// counter, nothing to see. The instrument simply stops reporting flow.
@@ -4978,12 +4634,8 @@ mod tests {
             "sanity: the bar must have seen ticks at all"
         );
         assert_eq!(
-            t5.volume, 700,
-            "a bucket opened after a counter restart must anchor on the LIVE \
-             cumulative, not on a right endpoint from the erased axis — \
-             chaining across the restart reports 0 volume while {} ticks land \
-             in the bar, with no error anywhere",
-            t5.tick_count
+            t5.volume, 0,
+            "same-session decreases remain ambiguous until an explicit session transition"
         );
     }
 
@@ -5367,8 +5019,8 @@ mod tests {
                 .filter(|((tf, _), _)| *tf == TfIndex::S1)
                 .map(|(_, v)| *v)
                 .sum();
-            // Ground truth: D1's bucket spans the day, so it never refuses a
-            // tick. Use the raw arithmetic so a D1 defect cannot hide one.
+            // Independent received-counter ledger: a shared candle defect
+            // cannot hide behind agreement with another timeframe.
             let expected = u64::from(max_cum - first_cum);
             tally.record(s1, expected, &log);
         }
@@ -5393,7 +5045,7 @@ mod tests {
             state
         };
         let mut failures = 0_usize;
-        let mut first: Option<(Vec<(u32, u32)>, u64, u64)> = None;
+        let mut first: Option<(Vec<(u32, u32)>, TfIndex, u64, u64)> = None;
         for _case in 0..4_000 {
             let n = 6 + (next() % 8) as usize;
             let mut seq: Vec<(u32, u32)> = vec![(0, 1_000)];
@@ -5411,21 +5063,355 @@ mod tests {
                 seq.push((off.min(110), cum));
             }
             let bars = hostile_run(&seq);
-            let d1 = hostile_total(&bars, TfIndex::D1);
-            let s1 = hostile_total(&bars, TfIndex::S1);
-            if s1 != d1 {
-                failures += 1;
-                if first.is_none() {
-                    first = Some((seq, s1, d1));
+            let expected = u64::from(cum - 1_000);
+            for tf in TfIndex::ALL {
+                let actual = hostile_total(&bars, tf);
+                if actual != expected {
+                    failures += 1;
+                    if first.is_none() {
+                        first = Some((seq.clone(), tf, actual, expected));
+                    }
                 }
             }
         }
         assert_eq!(failures, 0, "monotonic control failed: {first:?}");
     }
 
-    /// FUZZ — every frame must tile the day to the SAME total, over many
-    /// randomly reordered / occasionally-stale sequences. The oracle is D1,
-    /// whose single bucket spans the day and therefore never refuses a tick.
+    /// Unlike the older three-frame comparison, check every registered frame
+    /// against the received cumulative ledger, not against another candle.
+    #[test]
+    fn all_active_frames_preserve_late_carry_across_counter_restarts() {
+        use std::collections::HashMap;
+
+        for strategy in [FeedStrategy::REFOLD, FeedStrategy::DISCARD] {
+            for catch_up in [false, true] {
+                for reset_offset in [10_u32, 60, 61, 120] {
+                    for (prices, direction) in [
+                        ([100.0_f32, 101.0, 102.0, 103.0, 104.0, 105.0], 1_i64),
+                        ([100.0, 99.0, 98.0, 97.0, 96.0, 95.0], -1),
+                        ([100.0, 100.0, 100.0, 100.0, 100.0, 100.0], 0),
+                    ] {
+                        let mut agg = MultiTfAggregator::new(strategy);
+                        let mut latest = HashMap::new();
+                        for (off, cum, price) in [
+                            (0_u32, 3_000_000_000_u32, prices[0]),
+                            (60, 3_000_000_100, prices[1]),
+                        ] {
+                            let stats = agg.consume_tick(
+                                Feed::Dhan,
+                                &tick(77, SEG_IDX, OPEN + off, price, cum),
+                                None,
+                                |_, _, _, tf, state| {
+                                    latest.insert((tf, state.bucket_start_ist_secs), state);
+                                },
+                            );
+                            assert!(stats.folded());
+                        }
+                        if catch_up {
+                            agg.catch_up_seal_all(OPEN + 120, |_, _, _, tf, state| {
+                                latest.insert((tf, state.bucket_start_ist_secs), state);
+                            });
+                        }
+                        let m1 = agg
+                            .snapshot(Feed::Dhan, 77, SEG_IDX, TfIndex::M1)
+                            .expect("tracked instrument");
+                        assert_eq!(m1.is_uninitialised(), catch_up);
+                        // Accepted +50 arrives too late for M1. Before the
+                        // fix a restart erased its pending gross and sign.
+                        for (index, (off, cum)) in [
+                            (10_u32, 3_000_000_150_u32),
+                            (reset_offset, 10),
+                            (reset_offset, 15),
+                            (121, 20),
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        {
+                            let stats = agg.consume_tick(
+                                Feed::Dhan,
+                                &tick(77, SEG_IDX, OPEN + off, prices[index + 2], cum),
+                                None,
+                                |_, _, _, tf, state| {
+                                    latest.insert((tf, state.bucket_start_ist_secs), state);
+                                },
+                            );
+                            assert!(stats.folded());
+                            if index >= 1 {
+                                let index = agg.lookup(Feed::Dhan, 77, SEG_IDX).expect("slot");
+                                assert!(agg.slots[index].volume_counter.is_ambiguous());
+                            }
+                        }
+                        agg.force_seal_all(|_, _, _, tf, state| {
+                            latest.insert((tf, state.bucket_start_ist_secs), state);
+                        });
+                        for tf in TfIndex::ALL {
+                            let mut count = 0;
+                            let mut gross = 0_u64;
+                            for ((frame, _), state) in &latest {
+                                if *frame != tf {
+                                    continue;
+                                }
+                                count += 1;
+                                gross += state.volume;
+                                if state.volume > 0 {
+                                    let expected_net = if state.bucket_open_prev_close <= 0.0
+                                        || state.volume_quality & crate::candles::volume_update::VOLUME_QUALITY_COUNTER_AMBIGUOUS != 0
+                                    {
+                                        None
+                                    } else {
+                                        Some(
+                                            direction
+                                                * i64::try_from(state.volume)
+                                                    .expect("small volume"),
+                                        )
+                                    };
+                                    assert_eq!(
+                                        state.net_volume(),
+                                        expected_net,
+                                        "frame {tf:?}, catch_up {catch_up}, reset {reset_offset}, direction {direction}"
+                                    );
+                                }
+                            }
+                            assert!(count > 0, "missing frame {tf:?}");
+                            // Independent conservative ledger: +100 and +50
+                            // before an unresolved same-session decrease. A
+                            // guessed new axis must not add another ten.
+                            assert_eq!(
+                                gross, 150,
+                                "frame {tf:?}, catch_up {catch_up}, reset {reset_offset}, direction {direction}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn all_active_frames_preserve_late_carry_through_repeated_counter_restarts() {
+        use std::collections::HashMap;
+
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let mut latest = HashMap::new();
+        for (index, (off, cumulative)) in [
+            (0_u32, 3_000_000_000_u32),
+            (60, 3_000_000_100),
+            (10, 3_000_000_150),
+            (61, 10),
+            (62, 20),
+            (180, 3_000_000_020),
+            (121, 3_000_000_050),
+            (181, 5),
+            (241, 15),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if index == 6 {
+                agg.catch_up_seal_all(OPEN + 240, |_, _, _, tf, state| {
+                    latest.insert((tf, state.bucket_start_ist_secs), state);
+                });
+            }
+            let price = 100.0 + f32::from(u16::try_from(index).expect("short trace"));
+            let stats = agg.consume_tick(
+                Feed::Dhan,
+                &tick(77, SEG_IDX, OPEN + off, price, cumulative),
+                None,
+                |_, _, _, tf, state| {
+                    latest.insert((tf, state.bucket_start_ist_secs), state);
+                },
+            );
+            assert!(stats.folded());
+        }
+        agg.force_seal_all(|_, _, _, tf, state| {
+            latest.insert((tf, state.bucket_start_ist_secs), state);
+        });
+        for tf in TfIndex::ALL {
+            let gross: u64 = latest
+                .iter()
+                .filter(|((frame, _), _)| *frame == tf)
+                .map(|(_, state)| state.volume)
+                .sum();
+            // Only +100 and +50 exceed the original baseline; none of the
+            // ambiguous recoveries reaches its accepted high-water mark.
+            assert_eq!(gross, 150, "frame {tf:?}");
+        }
+    }
+
+    #[test]
+    fn all_active_frames_conserve_accepted_volume_under_reorder_and_catch_up() {
+        use std::collections::HashMap;
+        let mut seed = 0xA11F_24CA_9D1E_2026_u64;
+        for case in 0..256 {
+            let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+            let mut bars = HashMap::new();
+            let mut cumulative = 1_000_u32;
+            let mut accepted_high = cumulative;
+            let mut offset = 0_u32;
+            let first = tick(13, SEG_IDX, OPEN, 100.0, cumulative);
+            let _ = agg.consume_tick(Feed::Dhan, &first, None, |_, _, _, tf, st| {
+                bars.insert((tf, st.bucket_start_ist_secs), st.volume);
+            });
+            let mut drained = 0;
+            for step in 0..64 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                offset = if seed % 4 == 0 {
+                    offset.saturating_sub(3)
+                } else {
+                    offset + 2
+                };
+                cumulative = if seed % 7 == 0 {
+                    cumulative.saturating_sub(17)
+                } else {
+                    cumulative + 31 + u32::try_from(seed % 100).expect("small delta")
+                };
+                accepted_high = accepted_high.max(cumulative);
+                let current = tick(13, SEG_IDX, OPEN + offset, 100.0, cumulative);
+                let _ = agg.consume_tick(Feed::Dhan, &current, None, |_, _, _, tf, st| {
+                    bars.insert((tf, st.bucket_start_ist_secs), st.volume);
+                });
+                if step % 5 == 0 {
+                    drained += agg.catch_up_seal_all(OPEN + offset + 1, |_, _, _, tf, st| {
+                        bars.insert((tf, st.bucket_start_ist_secs), st.volume);
+                    });
+                }
+            }
+            agg.force_seal_all(|_, _, _, tf, st| {
+                bars.insert((tf, st.bucket_start_ist_secs), st.volume);
+            });
+            assert!(drained > 0, "fixture must actually execute catch-up seals");
+            let expected = u64::from(accepted_high - 1_000);
+            assert!(expected > 0);
+            for tf in TfIndex::ALL {
+                let mut count = 0;
+                let total: u64 = bars
+                    .iter()
+                    .filter_map(|((frame, _), volume)| {
+                        if *frame == tf {
+                            count += 1;
+                            Some(*volume)
+                        } else {
+                            None
+                        }
+                    })
+                    .sum();
+                assert!(count > 0, "missing frame {tf:?}, case {case}");
+                assert_eq!(total, expected, "frame {tf:?}, case {case}");
+            }
+        }
+    }
+
+    /// Warm baseline immediately before 09:15, then an uninterrupted full
+    /// session. Independent period arithmetic checks EVERY persisted bucket
+    /// label, gross delta and signed delta across all ten active frames.
+    /// This is a synthetic fold test, not proof of broker or DB completeness.
+    #[test]
+    fn all_active_frames_match_per_bucket_gross_and_net_through_full_session_boundaries() {
+        use std::collections::HashMap;
+        const PERIODS: [(TfIndex, u32); 10] = [
+            (TfIndex::S1, 1),
+            (TfIndex::S3, 3),
+            (TfIndex::S5, 5),
+            (TfIndex::M1, 60),
+            (TfIndex::M3, 180),
+            (TfIndex::M5, 300),
+            (TfIndex::M10, 600),
+            (TfIndex::M15, 900),
+            (TfIndex::M30, 1_800),
+            (TfIndex::M60, 3_600),
+        ];
+        assert_eq!(PERIODS.len(), TfIndex::ALL.len());
+        for tf in TfIndex::ALL {
+            assert_eq!(PERIODS.iter().filter(|(frame, _)| *frame == tf).count(), 1);
+        }
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let mut expected: std::collections::BTreeMap<(TfIndex, u32), (u64, f64)> =
+            std::collections::BTreeMap::new();
+        let mut actual = HashMap::new();
+        let anchor = OPEN - 15 * 60; // 09:00, independent of bucket_start().
+        let seed_ts = OPEN - 1;
+        let mut cumulative = 10_000_u32;
+        let mut first = tick(13, SEG_IDX, seed_ts, 100.0, cumulative);
+        first.received_at_nanos = (i64::from(seed_ts) - 19_800) * 1_000_000_000;
+        let _ = agg.consume_tick(Feed::Dhan, &first, None, |_, _, _, tf, st| {
+            actual.insert((tf, st.bucket_start_ist_secs), (st.volume, st.net_volume()));
+        });
+        for (tf, period) in PERIODS {
+            expected.insert(
+                (tf, anchor + (seed_ts - anchor) / period * period),
+                (0, 100.0),
+            );
+        }
+        let mut received_total = 0_u64;
+        let mut drained = 0;
+        // 09:15:00 through 15:39:59 inclusive: 23,100 received deltas.
+        for second in 0..23_100_u32 {
+            let ts = OPEN + second;
+            let delta = 1 + second % 97;
+            let buy = second % 2 == 0;
+            cumulative += delta;
+            received_total += u64::from(delta);
+            // Generate every intended event second, with receipt one second
+            // later. Dhan LTT owns the bucket; the final valid 15:39:59 print
+            // consequently arrives after the 15:40 capture boundary.
+            let mut current = tick(13, SEG_IDX, ts, if buy { 101.0 } else { 100.0 }, cumulative);
+            current.received_at_nanos = (i64::from(ts + 1) - 19_800) * 1_000_000_000 + 100_000_000;
+            for (tf, period) in PERIODS {
+                let key = (tf, anchor + (ts - anchor) / period * period);
+                let total = expected.entry(key).or_default();
+                total.0 += u64::from(delta);
+                total.1 = if buy { 101.0 } else { 100.0 };
+            }
+            let _ = agg.consume_tick(Feed::Dhan, &current, None, |_, _, _, tf, st| {
+                actual.insert((tf, st.bucket_start_ist_secs), (st.volume, st.net_volume()));
+            });
+            if second % 67 == 0 {
+                drained += agg.catch_up_seal_all(ts + 1, |_, _, _, tf, st| {
+                    actual.insert((tf, st.bucket_start_ist_secs), (st.volume, st.net_volume()));
+                });
+            }
+        }
+        agg.force_seal_all(|_, _, _, tf, st| {
+            actual.insert((tf, st.bucket_start_ist_secs), (st.volume, st.net_volume()));
+        });
+        assert!(drained > 0);
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "no missing or invented bucket labels"
+        );
+        let mut previous_close: HashMap<TfIndex, f64> = HashMap::new();
+        for (key, (gross, close)) in &expected {
+            let expected_net = previous_close.insert(key.0, *close).map(|previous| {
+                let magnitude = i64::try_from(*gross).expect("bounded fixture");
+                if *close > previous {
+                    magnitude
+                } else if *close < previous {
+                    -magnitude
+                } else {
+                    0
+                }
+            });
+            assert_eq!(
+                actual.get(key),
+                Some(&(*gross, expected_net)),
+                "bucket {key:?}"
+            );
+        }
+        for tf in TfIndex::ALL {
+            let total: u64 = actual
+                .iter()
+                .filter_map(|((frame, _), (gross, _))| (*frame == tf).then_some(*gross))
+                .sum();
+            assert_eq!(total, received_total, "full-session ledger {tf:?}");
+        }
+    }
+
+    /// FUZZ — every active frame must match the independently accepted
+    /// cumulative ledger over reordered and occasionally stale observations.
+    /// No candle timeframe is allowed to certify another candle's arithmetic.
     #[test]
     fn hostile_fuzz_every_frame_tiles_the_day_to_one_total() {
         let mut state = 0x2545_F491_4F6C_DD1D_u64;
@@ -5435,7 +5421,7 @@ mod tests {
             state ^= state << 17;
             state
         };
-        let mut failures: Vec<(Vec<(u32, u32)>, u64, u64, u64)> = Vec::new();
+        let mut failures: Vec<(Vec<(u32, u32)>, TfIndex, u64, u64)> = Vec::new();
         for _case in 0..4_000 {
             let n = 6 + (next() % 8) as usize;
             let mut seq: Vec<(u32, u32)> = vec![(0, 1_000)];
@@ -5459,65 +5445,51 @@ mod tests {
                 seq.push((off.min(110), cum));
             }
             let bars = hostile_run(&seq);
-            let d1 = hostile_total(&bars, TfIndex::D1);
-            let s1 = hostile_total(&bars, TfIndex::S1);
-            let m1 = hostile_total(&bars, TfIndex::M1);
-            if s1 != d1 || m1 != d1 {
-                failures.push((seq, s1, m1, d1));
+            let expected = u64::from(seq.iter().map(|(_, value)| *value).max().unwrap() - 1_000);
+            for tf in TfIndex::ALL {
+                let actual = hostile_total(&bars, tf);
+                if actual != expected {
+                    failures.push((seq.clone(), tf, actual, expected));
+                }
             }
         }
-        let over = failures.iter().filter(|(_, s1, _, d1)| s1 > d1).count();
-        let under = failures.iter().filter(|(_, s1, _, d1)| s1 < d1).count();
-        let m1_over = failures.iter().filter(|(_, _, m1, d1)| m1 > d1).count();
-        let m1_under = failures.iter().filter(|(_, _, m1, d1)| m1 < d1).count();
+        let over = failures
+            .iter()
+            .filter(|(_, _, actual, expected)| actual > expected)
+            .count();
+        let under = failures
+            .iter()
+            .filter(|(_, _, actual, expected)| actual < expected)
+            .count();
         let stale = failures
             .iter()
             .filter(|(seq, _, _, _)| seq.windows(2).any(|w| w[1].1 < w[0].1))
             .count();
         println!(
-            "HOSTILE FUZZ: {} failures / 4000. S1 over-reports (DOUBLE COUNT): {over}; \
-             S1 under-reports (LOSS): {under}. M1 over: {m1_over}; M1 under: {m1_under}. \
-             failures whose sequence contains a STALE (backwards) cumulative: {stale}",
-            failures.len()
+            "HOSTILE FUZZ: {} frame failures / {} comparisons; double counts: {over}; \
+             losses: {under}; failures with stale cumulative observations: {stale}",
+            failures.len(),
+            4_000 * TF_COUNT
         );
-        // Hoisted out of the `assert!` argument list. Inside it the chain is
-        // evaluated only on failure, so it is dead text on every passing run —
-        // and a six-line expression buried in a macro argument is the harder
-        // thing to read either way. `take(3)` of an empty vec costs nothing.
         let first_three = failures
             .iter()
             .take(3)
-            .map(|(seq, s1, m1, d1)| format!("  seq={seq:?}\n    S1={s1} M1={m1} D1={d1}"))
+            .map(|(seq, tf, actual, expected)| {
+                format!("  seq={seq:?}\n    {tf:?}={actual} ledger={expected}")
+            })
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
             failures.is_empty(),
-            "{} of 4000 sequences failed conservation. First 3:\n{first_three}",
+            "{} timeframe comparisons failed conservation. First 3:\n{first_three}",
             failures.len()
         );
     }
 }
 
-// -- the receipt clock, driven END TO END through a real fold ---------------
-//
-// ADDED 2026-08-28 after an adversarial sweep found the gap and named it
-// precisely: `ParsedTick::default().received_at_nanos == 0`, and EVERY candle
-// fixture in this workspace leaves it there. `fold_clock_ist_secs` returns
-// early on that sentinel, so the entire suite exercised the EXCHANGE-clock
-// FALLBACK and passed "by construction, not by agreement" — nothing drove a
-// non-zero receipt through a bucket, a close guard, or a seal.
-//
-// The first draft of these tests ALSO carried a wrong premise, and writing
-// them is what exposed it. It used a 100-minute-stale trade stamp on the
-// belief that the receipt clock rescues a dormant contract from filing into a
-// bar hours in the past. It does not, and cannot: the delta guard rejects any
-// receipt more than `MAX_PLAUSIBLE_RECEIPT_LAG_SECS` past the trade, so that
-// packet still buckets on its trade stamp. `test_a_stale_snapshot_still_
-// buckets_on_its_trade_stamp` below pins that limit deliberately, because a
-// limit nobody wrote down is how the next reader inherits the same wrong
-// belief. What the receipt clock actually corrects is DELIVERY LAG inside the
-// band — measured p50 1.4s, p99 46s on this feed — which is exactly where a
-// minute boundary gets crossed on an ordinary day.
+// Nonzero receipts driven through the real fold. Dhan event-time buckets and
+// bounded receipt freshness are deliberately separate; TrueData retains the
+// previous receipt-based bucket policy.
 #[cfg(test)]
 mod receipt_clock_end_to_end_tests {
     use super::tests::{CANDLE_OPEN, SEG_IDX, tick};
@@ -5538,11 +5510,9 @@ mod receipt_clock_end_to_end_tests {
         at
     }
 
-    /// The ordinary day, and the reason this change exists: a trade printed in
-    /// one minute and delivered in the next. Two seconds of lag — well inside
-    /// the measured p50 — decide which bar the packet belongs to.
+    /// Delivery can cross a minute without changing the trade's candle.
     #[test]
-    fn delivery_lag_across_a_minute_boundary_files_the_bar_by_receipt() {
+    fn delivery_lag_across_a_minute_boundary_keeps_the_dhan_trade_minute() {
         let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::REFOLD, 4);
 
         // Traded at 09:29:59, received at 09:30:01.
@@ -5555,8 +5525,8 @@ mod receipt_clock_end_to_end_tests {
 
         assert_eq!(
             seal_m1_bucket(&mut agg),
-            Some(TfIndex::M1.bucket_start(received)),
-            "a packet received at 09:30:01 belongs to the 09:30 bar"
+            Some(TfIndex::M1.bucket_start(traded)),
+            "a Dhan trade at 09:29:59 belongs to the 09:29 bar"
         );
         assert_ne!(
             TfIndex::M1.bucket_start(received),
@@ -5565,13 +5535,24 @@ mod receipt_clock_end_to_end_tests {
         );
     }
 
-    /// THE LIMIT, pinned deliberately. A snapshot whose last trade was 100
-    /// minutes ago is NOT re-dated to now — the delta guard refuses it and the
-    /// exchange stamp wins. This is not a defect: with `received_at` still
-    /// re-stamped at WAL replay, a large positive delta is indistinguishable
-    /// from a replayed frame, and re-dating a replay to replay-time would
-    /// destroy the bars it belongs to. Recorded as a test so the bound is a
-    /// fact rather than a belief.
+    #[test]
+    fn truedata_retains_receipt_minute_at_the_same_delivery_boundary() {
+        let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::REFOLD, 4);
+        let traded = CANDLE_OPEN + 30 * 60 - 1;
+        let received = traded + 2;
+        let mut t = tick(13, SEG_IDX, traded, 100.0, 10);
+        t.received_at_nanos = receipt_nanos_for_ist(received);
+        assert!(
+            agg.consume_tick(Feed::Truedata, &t, None, |_, _, _, _, _| {})
+                .folded()
+        );
+        assert_eq!(
+            seal_m1_bucket(&mut agg),
+            Some(TfIndex::M1.bucket_start(received))
+        );
+    }
+
+    /// A same-day dormant snapshot does not become a current-minute trade.
     #[test]
     fn a_stale_snapshot_still_buckets_on_its_trade_stamp() {
         let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::REFOLD, 4);
@@ -5585,16 +5566,11 @@ mod receipt_clock_end_to_end_tests {
         assert_eq!(
             seal_m1_bucket(&mut agg),
             Some(TfIndex::M1.bucket_start(traded)),
-            "beyond MAX_PLAUSIBLE_RECEIPT_LAG_SECS the fold falls back to the \
-             trade stamp — the receipt clock corrects delivery lag, it does \
-             not re-date a stale snapshot"
+            "the Dhan bucket clock does not re-date a stale snapshot"
         );
     }
 
-    /// A WAL frame re-stamped at replay: the receipt reads 9 hours after the
-    /// trade. That is a perfectly SANE epoch — an absolute plausibility band
-    /// would wave it through — so the guard being on the DELTA rather than on
-    /// the value is what catches it.
+    /// A same-day legacy replay cannot use replay wall time as trade time.
     #[test]
     fn a_replayed_frame_falls_back_to_the_trade_stamp() {
         let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::REFOLD, 4);
@@ -5612,14 +5588,10 @@ mod receipt_clock_end_to_end_tests {
         );
     }
 
-    /// Close ownership on the receipt clock: two packets in one minute, the
-    /// EARLIER-traded one arriving LAST, both inside the trusted band. On the
-    /// exchange clock the order guard would refuse the late arrival and the
-    /// bar would keep the first price; on the receipt clock the last-received
-    /// packet owns the close. That is the semantic the operator asked for,
-    /// written as a test rather than asserted in a comment.
+    /// A late-arriving earlier Dhan event can widen the range, not replace
+    /// the close of a later event in the same candle.
     #[test]
-    fn the_close_is_owned_by_the_last_packet_we_received() {
+    fn the_dhan_close_is_owned_by_the_latest_trade_time() {
         let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::REFOLD, 4);
         let minute = TfIndex::M1.bucket_start(CANDLE_OPEN + 30 * 60);
 
@@ -5638,10 +5610,8 @@ mod receipt_clock_end_to_end_tests {
             }
         });
         assert!(
-            (close - 107.0).abs() < 1e-9,
-            "the LAST-RECEIVED packet owns the close (got {close}); on the \
-             exchange clock the earlier-traded 107.0 would have been refused \
-             by the order guard and the bar would have closed at 100.0"
+            (close - 100.0).abs() < 1e-9,
+            "the earlier 107.0 event cannot replace the later 100.0 close: {close}"
         );
     }
 }
@@ -5813,7 +5783,8 @@ mod day_gate_permutation_sweep {
     fn a_prior_day_frame_with_no_receipt_is_left_to_the_watermark() {
         let mut agg = MultiTfAggregator::default();
         let yesterday = DAY - 86_400 + 33_400;
-        let t = tick(13, SEG_IDX, yesterday, 100.0, 1);
+        let mut t = tick(13, SEG_IDX, yesterday, 100.0, 1);
+        t.received_at_nanos = 0;
         assert_eq!(t.received_at_nanos, 0, "fixture must exercise the sentinel");
 
         let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
@@ -5824,6 +5795,7 @@ mod day_gate_permutation_sweep {
              here would strand every pre-TVW3 boot replay, which is prior-day \
              by construction"
         );
+        assert_eq!(agg.watermark_secs(), 0);
     }
 
     /// A NEGATIVE receipt is garbage, not a clock, and it is treated as the
@@ -5927,15 +5899,9 @@ mod day_gate_permutation_sweep {
 
     // -- day boundaries -----------------------------------------------------
 
-    /// One SECOND apart across IST midnight, far outside the trusted band, is
-    /// a genuine day mismatch and is refused.
-    ///
-    /// This is the sharp edge of the rule and it is deliberate: the comparison
-    /// is on DAYS, so a single second can flip it. It is safe because the
-    /// trusted band already collapses a real straddle onto one clock (pinned
-    /// by `a_tick_straddling_ist_midnight_inside_the_trusted_band_is_not_stale`)
-    /// and because the candle session closes at 15:40 IST — nothing legitimate
-    /// trades within a second of midnight.
+    /// A last-trade stamp one second before midnight belongs to the prior
+    /// day. Receipt never re-dates it; the regular candle window has already
+    /// closed, so the refusal affects candle construction only.
     #[test]
     fn an_exchange_stamp_one_second_before_midnight_is_stale_against_the_next_day() {
         let mut agg = MultiTfAggregator::default();
@@ -6079,6 +6045,886 @@ mod day_gate_permutation_sweep {
                     same_day,
                     "day_offset {day_offset}, receipt_offset {receipt_offset}: \
                      a tick folds if and only if the two days match"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod canonical_volume_contract_tests {
+    use super::*;
+    use crate::candles::volume_update::{
+        VOLUME_QUALITY_ATTRIBUTION_UNCERTAIN, VOLUME_QUALITY_COUNTER_AMBIGUOUS,
+        VOLUME_QUALITY_DEFINITION_CHANGED, VOLUME_QUALITY_MISSING_OBSERVATION,
+        VOLUME_QUALITY_UNKNOWN_BASELINE,
+    };
+    use std::collections::BTreeMap;
+
+    const DAY: u32 = 1_779_321_600;
+    const OPEN: u32 = DAY + 33_300;
+
+    fn metadata() -> CandleMetadata {
+        CandleMetadata {
+            lot_size: 100,
+            instrument_definition_version: 1,
+            underlying_id: 17,
+            family_code: 1,
+        }
+    }
+
+    fn observed(at: u32, price: f32, cumulative: Option<u32>) -> ParsedTick {
+        ParsedTick {
+            security_id: 77,
+            exchange_segment_code: 2,
+            exchange_timestamp: at,
+            received_at_nanos: (i64::from(at) - 19_800) * 1_000_000_000,
+            last_traded_price: price,
+            volume: cumulative.unwrap_or(0),
+            volume_present: cumulative.is_some(),
+            ..ParsedTick::default()
+        }
+    }
+
+    #[test]
+    fn an_untraded_zero_cannot_certify_a_session_or_allocate_the_first_positive_prefix() {
+        for exchange_timestamp in [0, OPEN - 86_400, OPEN] {
+            let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 1);
+            let mut untraded = observed(OPEN, 0.0, Some(0));
+            untraded.exchange_timestamp = exchange_timestamp;
+            let stats = agg.consume_tick_with_context(
+                Feed::Dhan,
+                &untraded,
+                None,
+                metadata(),
+                |_, _, _, _, _| panic!("an untraded instrument has no price candle"),
+                |_| panic!("an unsupported zero has no canonical ranked candle"),
+            );
+            assert!(stats.untraded_timestamp || stats.untraded_sentinel);
+            assert_eq!(agg.watermark_secs(), 0);
+            assert!(
+                agg.is_empty(),
+                "a sentinel cannot allocate counter authority"
+            );
+            assert!(agg.last_ltp(Feed::Dhan, 77, 2).is_none());
+            assert!(agg.snapshot(Feed::Dhan, 77, 2, TfIndex::M1).is_none());
+
+            for (price, cumulative, measured_delta) in [(100.0, 100, 0), (101.0, 150, 50)] {
+                let mut updates = BTreeMap::new();
+                agg.consume_tick_with_context(
+                    Feed::Dhan,
+                    &observed(OPEN + 1, price, Some(cumulative)),
+                    None,
+                    metadata(),
+                    |_, _, _, _, _| {},
+                    |update| {
+                        updates.insert(update.tf, update);
+                    },
+                );
+                for tf in TfIndex::ALL {
+                    let state = agg.snapshot(Feed::Dhan, 77, 2, tf).expect("real candle");
+                    let update = updates.get(&tf).expect("canonical candle publication");
+                    assert_eq!(
+                        state.volume, measured_delta,
+                        "the first 100 is only a baseline"
+                    );
+                    assert_eq!(update.gross_volume, state.volume);
+                    assert_ne!(state.volume_quality & VOLUME_QUALITY_UNKNOWN_BASELINE, 0);
+                    assert!(!update.quality.is_eligible(), "{tf:?}");
+                    assert_eq!(update.last_observed_secs, OPEN + 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_untraded_zero_cannot_fill_a_missing_volume_field_or_refresh_its_clock() {
+        let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 1);
+        agg.consume_tick_with_context(
+            Feed::Dhan,
+            &observed(OPEN, 100.0, None),
+            None,
+            metadata(),
+            |_, _, _, _, _| {},
+            |_| {},
+        );
+        let mut untraded = observed(OPEN + 1, 0.0, Some(0));
+        untraded.exchange_timestamp = 0;
+        agg.consume_tick_with_context(
+            Feed::Dhan,
+            &untraded,
+            None,
+            metadata(),
+            |_, _, _, _, _| panic!("no new candle or amendment is supported"),
+            |_| panic!("no quantity observation clock exists for the sentinel"),
+        );
+        let index = agg.lookup(Feed::Dhan, 77, 2).expect("existing price slot");
+        let slot = &agg.slots[index];
+        assert_eq!(slot.volume_counter.cumulative(), None);
+        assert!(slot.volume_baseline.is_none());
+        assert_eq!(slot.last_observed_secs, OPEN);
+        agg.consume_tick_with_context(
+            Feed::Dhan,
+            &observed(OPEN + 1, 101.0, Some(1_000)),
+            None,
+            metadata(),
+            |_, _, _, _, _| {},
+            |update| {
+                assert_eq!(update.gross_volume, 0);
+                assert_ne!(update.volume_quality & VOLUME_QUALITY_UNKNOWN_BASELINE, 0);
+                assert!(!update.quality.is_eligible());
+            },
+        );
+    }
+
+    #[test]
+    fn an_untraded_counter_regression_revokes_quantity_without_refreshing_it() {
+        let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 1);
+        for (price, counter) in [(100.0, 0), (101.0, 100)] {
+            agg.consume_tick_with_context(
+                Feed::Dhan,
+                &observed(OPEN, price, Some(counter)),
+                None,
+                metadata(),
+                |_, _, _, _, _| {},
+                |_| {},
+            );
+        }
+        let mut untraded = observed(OPEN + 10, 0.0, Some(0));
+        untraded.exchange_timestamp = 0;
+        let mut seen = 0;
+        agg.consume_tick_with_context(
+            Feed::Dhan,
+            &untraded,
+            None,
+            metadata(),
+            |_, _, _, _, _| panic!("no new candle is created by the sentinel"),
+            |update| {
+                seen += 1;
+                assert_eq!(update.gross_volume, 100);
+                assert_eq!(update.estimated_net_volume, None);
+                assert_eq!(update.last_observed_secs, OPEN);
+                assert_ne!(update.volume_quality & VOLUME_QUALITY_COUNTER_AMBIGUOUS, 0);
+                assert_ne!(
+                    update.volume_quality & VOLUME_QUALITY_ATTRIBUTION_UNCERTAIN,
+                    0
+                );
+                assert!(!update.quality.is_eligible());
+                assert!(!update.closed);
+            },
+        );
+        assert_eq!(seen, TF_COUNT);
+        assert_eq!(agg.watermark_secs(), OPEN);
+    }
+
+    #[test]
+    fn an_untraded_regression_also_amends_the_retained_closed_candle() {
+        let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 1);
+        for (price, counter) in [(100.0, 0), (101.0, 100)] {
+            agg.consume_tick_with_context(
+                Feed::Dhan,
+                &observed(OPEN, price, Some(counter)),
+                None,
+                metadata(),
+                |_, _, _, _, _| {},
+                |_| {},
+            );
+        }
+        agg.catch_up_seal_all_with_volume_updates(OPEN + 60, |_, _, _, _, _| {}, |_| {});
+        assert!(
+            agg.snapshot(Feed::Dhan, 77, 2, TfIndex::S5)
+                .unwrap()
+                .is_uninitialised()
+        );
+        let mut untraded = observed(OPEN + 61, 0.0, Some(0));
+        untraded.exchange_timestamp = 0;
+        let mut candles = BTreeMap::new();
+        let mut updates = BTreeMap::new();
+        let stats = agg.consume_tick_with_context(
+            Feed::Dhan,
+            &untraded,
+            None,
+            metadata(),
+            |_, _, _, tf, state| {
+                candles.insert((tf, state.bucket_start_ist_secs), state);
+            },
+            |update| {
+                updates.insert((update.tf, update.bucket_start_secs), update);
+            },
+        );
+        assert!(stats.amended_count > 0);
+        assert_eq!(stats.sealed_count, 0);
+        let candle = candles
+            .get(&(TfIndex::S5, OPEN))
+            .expect("persisted amendment");
+        let update = updates
+            .get(&(TfIndex::S5, OPEN))
+            .expect("winner invalidation");
+        assert_eq!(candle.volume, 100);
+        assert_eq!(candle.net_volume(), None);
+        assert_ne!(candle.volume_quality & VOLUME_QUALITY_COUNTER_AMBIGUOUS, 0);
+        assert_eq!(update.volume_quality, candle.volume_quality);
+        assert_eq!(update.revision, candle.bucket_revision);
+        assert_eq!(update.last_observed_secs, OPEN);
+        assert!(!update.quality.is_eligible());
+        assert!(
+            update.closed,
+            "only the earlier catch-up supplied closure authority"
+        );
+        assert_eq!(agg.watermark_secs(), OPEN);
+    }
+
+    #[test]
+    fn a_next_day_untraded_zero_does_not_reset_or_seal_the_existing_counter_epoch() {
+        let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 1);
+        agg.consume_tick_with_context(
+            Feed::Dhan,
+            &observed(OPEN, 100.0, Some(1_000)),
+            None,
+            metadata(),
+            |_, _, _, _, _| {},
+            |_| {},
+        );
+        let index = agg.lookup(Feed::Dhan, 77, 2).unwrap();
+        let revision = agg.slots[index].volume_revision;
+        let mut untraded = observed(OPEN + 86_400, 0.0, Some(0));
+        untraded.exchange_timestamp = 0;
+        let stats = agg.consume_tick_with_context(
+            Feed::Dhan,
+            &untraded,
+            None,
+            metadata(),
+            |_, _, _, _, _| panic!("receipt cannot close a previous-session candle"),
+            |_| panic!("receipt cannot publish a new current-session quantity"),
+        );
+        assert_eq!(stats.sealed_count, 0);
+        assert_eq!(stats.amended_count, 0);
+        assert_eq!(agg.slots[index].volume_revision, revision);
+        assert_eq!(
+            agg.slots[index].volume_counter.session_day(),
+            Some(OPEN / 86_400)
+        );
+        assert_eq!(agg.slots[index].volume_counter.cumulative(), Some(1_000));
+        assert_eq!(agg.slots[index].last_observed_secs, OPEN);
+        assert_eq!(agg.watermark_secs(), OPEN);
+    }
+
+    #[test]
+    fn a_valid_price_and_dated_zero_still_establishes_real_quantity_for_all_frames() {
+        let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 1);
+        let at = DAY + CANDLE_SESSION_OPEN_SECS_OF_DAY_IST;
+        for (price, counter) in [(100.0, 0), (101.0, 50)] {
+            let mut updates = BTreeMap::new();
+            let stats = agg.consume_tick_with_context(
+                Feed::Dhan,
+                &observed(at, price, Some(counter)),
+                None,
+                metadata(),
+                |_, _, _, _, _| {},
+                |update| {
+                    updates.insert(update.tf, update);
+                },
+            );
+            assert!(stats.folded());
+            for tf in TfIndex::ALL {
+                let candle = agg
+                    .snapshot(Feed::Dhan, 77, 2, tf)
+                    .expect("real price candle");
+                let update = updates.get(&tf).expect("same canonical quantity");
+                assert_eq!(candle.volume, u64::from(counter), "{tf:?}");
+                assert_eq!(
+                    candle.net_volume(),
+                    None,
+                    "first candle has no predecessor: {tf:?}"
+                );
+                assert!(candle.tick_count > 0);
+                assert_eq!(update.gross_volume, candle.volume);
+                assert_eq!(update.estimated_net_volume, candle.net_volume());
+                assert_eq!(
+                    update.volume_quality,
+                    crate::candles::volume_update::VOLUME_QUALITY_UNCLASSIFIED_NET,
+                    "{tf:?}"
+                );
+                assert!(update.quality.is_eligible(), "{tf:?}");
+                assert_eq!(update.last_observed_secs, at);
+            }
+        }
+    }
+
+    #[test]
+    fn every_frame_publishes_the_same_gross_signed_metadata_and_revision_as_its_candle() {
+        let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 1);
+        let mut candles = BTreeMap::new();
+        let mut updates = BTreeMap::new();
+        for (at, price, cumulative) in [
+            (OPEN, 100.0, 1_000),
+            (OPEN, 101.0, 1_100),
+            (OPEN, 100.0, 1_150),
+        ] {
+            let stats = agg.consume_tick_with_context(
+                Feed::Dhan,
+                &observed(at, price, Some(cumulative)),
+                None,
+                metadata(),
+                |_, _, _, tf, state| {
+                    candles.insert((tf, state.bucket_start_ist_secs), state);
+                },
+                |update| {
+                    updates.insert((update.tf, update.bucket_start_secs), update);
+                },
+            );
+            assert!(stats.folded());
+        }
+        assert_eq!(updates.len(), TF_COUNT);
+        for tf in TfIndex::ALL {
+            let state = agg
+                .snapshot(Feed::Dhan, 77, 2, tf)
+                .expect("same instrument");
+            let update = updates
+                .get(&(tf, state.bucket_start_ist_secs))
+                .expect("all24");
+            assert_eq!(state.volume, 150);
+            assert_eq!(state.net_volume(), None, "first candle has no predecessor");
+            assert_eq!(update.gross_volume, state.volume);
+            assert_eq!(update.estimated_net_volume, state.net_volume());
+            assert_eq!(update.metadata, state.metadata);
+            assert_eq!(update.volume_quality, state.volume_quality);
+            assert_eq!(update.revision, state.bucket_revision);
+            assert_eq!(
+                update.bucket_end_secs,
+                tf.bucket_end(state.bucket_start_ist_secs)
+            );
+            assert!(!update.closed);
+        }
+        agg.force_seal_all_with_volume_updates(
+            |_, _, _, tf, state| {
+                candles.insert((tf, state.bucket_start_ist_secs), state);
+            },
+            |update| {
+                updates.insert((update.tf, update.bucket_start_secs), update);
+            },
+        );
+        assert_eq!(candles.len(), TF_COUNT);
+        for (key, state) in candles {
+            let update = updates
+                .get(&key)
+                .expect("every actual seal emits quantities");
+            assert!(
+                !update.closed,
+                "an administrative flush has no expiry cutoff"
+            );
+            assert_eq!(
+                (update.gross_volume, update.estimated_net_volume),
+                (state.volume, state.net_volume())
+            );
+            assert_eq!(
+                (update.metadata, update.volume_quality, update.revision),
+                (state.metadata, state.volume_quality, state.bucket_revision)
+            );
+        }
+    }
+
+    #[test]
+    fn a_positive_first_counter_at_a_subsecond_boundary_never_certifies_the_opening_prefix() {
+        let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 1);
+        let mut latest = BTreeMap::new();
+        for (price, counter, fractional_nanos) in
+            [(100.0, 1_000, 900_000_000), (101.0, 1_100, 950_000_000)]
+        {
+            let mut tick = observed(OPEN, price, Some(counter));
+            tick.received_at_nanos += fractional_nanos;
+            let stats = agg.consume_tick_with_context(
+                Feed::Dhan,
+                &tick,
+                None,
+                metadata(),
+                |_, _, _, _, _| {},
+                |update| {
+                    latest.insert(update.tf, update);
+                },
+            );
+            assert!(stats.folded());
+        }
+        for tf in TfIndex::ALL {
+            let update = latest.get(&tf).expect("all frames publish canonical state");
+            assert_eq!(
+                update.gross_volume, 100,
+                "the first 1,000 is only a baseline"
+            );
+            assert_eq!(
+                update.estimated_net_volume, None,
+                "first candle has no predecessor"
+            );
+            assert_ne!(
+                update.volume_quality & VOLUME_QUALITY_UNKNOWN_BASELINE,
+                0,
+                "09:15:00.900 is not a pre-bucket observation: {tf:?}"
+            );
+            assert!(!update.quality.baseline_known, "{tf:?}");
+            assert!(!update.quality.is_eligible(), "{tf:?}");
+        }
+    }
+
+    #[test]
+    fn a_genuine_zero_in_the_opening_second_preserves_known_zero_and_signed_quantity() {
+        let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 1);
+        let aligned_frames = [TfIndex::S1, TfIndex::S5, TfIndex::M1, TfIndex::M15];
+        for (price, counter, fractional_nanos) in
+            [(100.0, 0, 900_000_000), (101.0, 100, 950_000_000)]
+        {
+            let mut tick = observed(OPEN, price, Some(counter));
+            tick.received_at_nanos += fractional_nanos;
+            agg.consume_tick_with_context(
+                Feed::Dhan,
+                &tick,
+                None,
+                metadata(),
+                |_, _, _, _, _| {},
+                |_| {},
+            );
+            for tf in aligned_frames {
+                let state = agg.snapshot(Feed::Dhan, 77, 2, tf).expect("aligned candle");
+                assert_eq!(state.bucket_start_ist_secs, OPEN, "{tf:?}");
+                assert_eq!(state.volume, u64::from(counter), "{tf:?}");
+                assert_eq!(
+                    state.net_volume(),
+                    None,
+                    "first candle has no predecessor: {tf:?}"
+                );
+                assert_eq!(
+                    state.volume_quality,
+                    crate::candles::volume_update::VOLUME_QUALITY_UNCLASSIFIED_NET,
+                    "known quantity but unknown direction: {tf:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_partial_positive_baseline_only_certifies_buckets_starting_after_its_observation_second() {
+        let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 1);
+        let mut tick = observed(OPEN, 100.0, Some(1_000));
+        tick.received_at_nanos += 900_000_000;
+        agg.consume_tick_with_context(
+            Feed::Dhan,
+            &tick,
+            None,
+            metadata(),
+            |_, _, _, _, _| {},
+            |_| {},
+        );
+        for (at, price, counter, newly_complete) in [
+            (OPEN + 1, 101.0, 1_100, TfIndex::S1),
+            (OPEN + 5, 102.0, 1_200, TfIndex::S5),
+            (OPEN + 60, 103.0, 1_300, TfIndex::M1),
+        ] {
+            let mut tick = observed(at, price, Some(counter));
+            // Each 100-unit increment is one located trade. A cumulative
+            // snapshot without LTQ cannot certify a crossed bucket boundary.
+            tick.last_trade_quantity = 100;
+            agg.consume_tick_with_context(
+                Feed::Dhan,
+                &tick,
+                None,
+                metadata(),
+                |_, _, _, _, _| {},
+                |_| {},
+            );
+            let complete = agg
+                .snapshot(Feed::Dhan, 77, 2, newly_complete)
+                .expect("later bucket");
+            assert_eq!(complete.bucket_start_ist_secs, at);
+            assert_eq!(complete.volume, 100);
+            assert_eq!(complete.net_volume(), Some(100));
+            assert_eq!(complete.volume_quality, 0, "{newly_complete:?}");
+            let longer = agg.snapshot(Feed::Dhan, 77, 2, TfIndex::M15).expect("M15");
+            assert_eq!(longer.bucket_start_ist_secs, OPEN);
+            assert_ne!(longer.volume_quality & VOLUME_QUALITY_UNKNOWN_BASELINE, 0);
+        }
+    }
+
+    #[test]
+    fn absent_then_large_counter_seeds_without_counting_the_day_or_certifying_the_bucket() {
+        let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 1);
+        let mut latest = BTreeMap::new();
+        for (price, counter) in [
+            (100.0, None),
+            (101.0, Some(3_000_000)),
+            (102.0, Some(3_000_010)),
+        ] {
+            agg.consume_tick_with_context(
+                Feed::Dhan,
+                &observed(OPEN + 1, price, counter),
+                None,
+                metadata(),
+                |_, _, _, _, _| {},
+                |update| {
+                    latest.insert(update.tf, update);
+                },
+            );
+        }
+        for tf in TfIndex::ALL {
+            let update = latest.get(&tf).expect("all frames");
+            assert_eq!(update.gross_volume, 10, "{tf:?}");
+            assert_ne!(
+                update.volume_quality & VOLUME_QUALITY_MISSING_OBSERVATION,
+                0,
+                "{tf:?}"
+            );
+            assert!(!update.quality.is_eligible());
+        }
+    }
+
+    #[test]
+    fn genuine_zero_is_a_baseline_and_missing_after_a_high_counter_never_resets() {
+        for (sequence, expected) in [
+            (vec![Some(0), Some(100), Some(300)], 300),
+            (
+                vec![
+                    Some(3_000_000_000),
+                    Some(3_000_000_100),
+                    None,
+                    Some(3_000_000_200),
+                ],
+                200,
+            ),
+        ] {
+            let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 1);
+            for (index, counter) in sequence.into_iter().enumerate() {
+                agg.consume_tick_with_context(
+                    Feed::Dhan,
+                    &observed(OPEN, 100.0 + index as f32, counter),
+                    None,
+                    metadata(),
+                    |_, _, _, _, _| {},
+                    |_| {},
+                );
+            }
+            for tf in TfIndex::ALL {
+                let state = agg.snapshot(Feed::Dhan, 77, 2, tf).expect("all frames");
+                assert_eq!(state.volume, expected, "{tf:?}");
+                assert_eq!(state.volume_quality & VOLUME_QUALITY_COUNTER_AMBIGUOUS, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn all_frames_keep_decreases_uncertain_across_arbitrarily_large_recoveries() {
+        let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 1);
+        let mut latest = BTreeMap::new();
+        for counter in [
+            3_000_000_000,
+            3_000_000_100,
+            100,
+            200,
+            2_000_000_000,
+            3_000_000_200,
+        ] {
+            agg.consume_tick_with_context(
+                Feed::Dhan,
+                &observed(OPEN, 101.0, Some(counter)),
+                None,
+                metadata(),
+                |_, _, _, _, _| {},
+                |update| {
+                    latest.insert(update.tf, update);
+                },
+            );
+        }
+        for tf in TfIndex::ALL {
+            let update = latest.get(&tf).expect("all frames");
+            assert_eq!(update.gross_volume, 200, "no staircase recount: {tf:?}");
+            assert_eq!(update.estimated_net_volume, None);
+            assert!(update.quality.counter_ambiguous);
+            assert_ne!(update.volume_quality & VOLUME_QUALITY_COUNTER_AMBIGUOUS, 0);
+        }
+    }
+
+    #[test]
+    fn a_changed_lot_cannot_reprice_an_open_bucket_and_the_next_bucket_pins_the_new_definition() {
+        let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 1);
+        let old = metadata();
+        let changed = CandleMetadata {
+            lot_size: 200,
+            instrument_definition_version: 2,
+            ..old
+        };
+        for (at, value, meta) in [
+            (OPEN, 0, old),
+            (OPEN, 100, changed),
+            (OPEN + 60, 200, changed),
+        ] {
+            agg.consume_tick_with_context(
+                Feed::Dhan,
+                &observed(at, 100.0 + value as f32, Some(value)),
+                None,
+                meta,
+                |_, _, _, _, _| {},
+                |_| {},
+            );
+            let state = agg.snapshot(Feed::Dhan, 77, 2, TfIndex::M1).expect("M1");
+            if at == OPEN && value == 100 {
+                assert_eq!(state.metadata, old);
+                assert_ne!(state.volume_quality & VOLUME_QUALITY_DEFINITION_CHANGED, 0);
+            }
+        }
+        let new_bucket = agg.snapshot(Feed::Dhan, 77, 2, TfIndex::M1).expect("M1");
+        assert_eq!(new_bucket.metadata, changed);
+        assert_eq!(
+            new_bucket.volume_quality & VOLUME_QUALITY_DEFINITION_CHANGED,
+            0
+        );
+    }
+
+    #[test]
+    fn a_partial_baseline_remains_partial_and_a_later_bucket_can_be_eligible() {
+        let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 1);
+        for (at, price, value) in [(OPEN + 20, 100.0, 1_000), (OPEN + 21, 101.0, 1_100)] {
+            let mut tick = observed(at, price, Some(value));
+            tick.last_trade_quantity = 100;
+            agg.consume_tick_with_context(
+                Feed::Dhan,
+                &tick,
+                None,
+                metadata(),
+                |_, _, _, _, _| {},
+                |_| {},
+            );
+        }
+        let partial = agg.snapshot(Feed::Dhan, 77, 2, TfIndex::M1).expect("M1");
+        assert_ne!(partial.volume_quality & VOLUME_QUALITY_UNKNOWN_BASELINE, 0);
+        let mut tick = observed(OPEN + 60, 102.0, Some(1_200));
+        // The final 100 units belong to this last trade in the new minute.
+        tick.last_trade_quantity = 100;
+        agg.consume_tick_with_context(
+            Feed::Dhan,
+            &tick,
+            None,
+            metadata(),
+            |_, _, _, _, _| {},
+            |_| {},
+        );
+        let next = agg
+            .snapshot(Feed::Dhan, 77, 2, TfIndex::M1)
+            .expect("next M1");
+        assert_eq!(next.volume_quality, 0);
+        assert_eq!(next.net_volume(), Some(100));
+    }
+
+    #[test]
+    fn timer_seals_do_not_invent_freshness_or_change_bucket_identity() {
+        let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 1);
+        for (price, value) in [(100.0, 0), (101.0, 100)] {
+            agg.consume_tick_with_context(
+                Feed::Dhan,
+                &observed(OPEN, price, Some(value)),
+                None,
+                metadata(),
+                |_, _, _, _, _| {},
+                |_| {},
+            );
+        }
+        let prior = agg.snapshot(Feed::Dhan, 77, 2, TfIndex::M1).expect("M1");
+        let mut sealed = None;
+        agg.catch_up_seal_all_with_volume_updates(
+            OPEN + 120,
+            |_, _, _, _, _| {},
+            |update| {
+                if update.tf == TfIndex::M1 {
+                    sealed = Some(update);
+                }
+            },
+        );
+        let update = sealed.expect("timer closes the actual M1");
+        assert_eq!(update.bucket_start_secs, OPEN);
+        assert_eq!(update.bucket_end_secs, OPEN + 60);
+        assert_eq!(update.last_observed_secs, OPEN);
+        assert!(update.revision > prior.bucket_revision);
+        assert!(update.closed);
+    }
+
+    #[test]
+    fn a_same_day_future_stamp_cannot_move_the_global_watermark() {
+        let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 2);
+        let good = observed(OPEN, 100.0, Some(0));
+        agg.consume_tick(Feed::Dhan, &good, None, |_, _, _, _, _| {});
+        let before = agg.watermark_secs();
+        let mut poison = good;
+        poison.security_id = 88;
+        poison.exchange_timestamp = OPEN + 3_600;
+        let rejected = agg.consume_tick_with_context(
+            Feed::Dhan,
+            &poison,
+            None,
+            metadata(),
+            |_, _, _, _, _| panic!("must not seal"),
+            |_| panic!("must not publish"),
+        );
+        assert!(rejected.future_trading_day);
+        assert!(!rejected.folded());
+        assert_eq!(agg.watermark_secs(), before);
+        assert_eq!(agg.lookup(Feed::Dhan, 88, 2), None);
+    }
+
+    #[test]
+    fn signed_overflow_stays_unavailable_even_after_later_cancellation() {
+        let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 1);
+        let mut latest = BTreeMap::new();
+        for (price, counter) in [
+            (100.0, 0_u64),
+            (101.0, i64::MAX as u64),
+            (102.0, (i64::MAX as u64) + 1),
+            (100.0, u64::MAX),
+        ] {
+            agg.consume_tick_with_context(
+                Feed::Dhan,
+                &observed(OPEN, price, Some(0)),
+                Some(counter),
+                metadata(),
+                |_, _, _, _, _| {},
+                |update| {
+                    latest.insert(update.tf, update);
+                },
+            );
+        }
+        for update in latest.values() {
+            assert_eq!(update.gross_volume, u64::MAX);
+            assert_eq!(update.estimated_net_volume, None);
+            assert_ne!(
+                update.volume_quality
+                    & crate::candles::volume_update::VOLUME_QUALITY_UNCLASSIFIED_NET,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn gross_beyond_sql_long_is_refused_by_the_shared_candle_state_before_ranking() {
+        let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 1);
+        let at = DAY + 32_400;
+        let mut latest = BTreeMap::new();
+        // Each signed delta and the running net fit i64. Only the accumulated
+        // gross crosses the persisted domain, which previously left RAM green.
+        for (price, counter) in [
+            (100.0, 0_u64),
+            (101.0, 1_u64 << 62),
+            (100.0, i64::MAX as u64),
+        ] {
+            agg.consume_tick_with_context(
+                Feed::Dhan,
+                &observed(at, price, Some(0)),
+                Some(counter),
+                metadata(),
+                |_, _, _, _, _| {},
+                |update| {
+                    latest.insert(update.tf, update);
+                },
+            );
+        }
+        for update in latest.values() {
+            assert_eq!(update.gross_volume, i64::MAX as u64);
+            assert_eq!(
+                update.estimated_net_volume, None,
+                "first candle has no predecessor"
+            );
+            assert_eq!(
+                update.volume_quality,
+                crate::candles::volume_update::VOLUME_QUALITY_UNCLASSIFIED_NET
+            );
+            assert!(update.quality.is_eligible());
+        }
+        let unrepresentable = (i64::MAX as u64) + 1;
+        agg.consume_tick_with_context(
+            Feed::Dhan,
+            &observed(at, 101.0, Some(0)),
+            Some(unrepresentable),
+            metadata(),
+            |_, _, _, _, _| {},
+            |update| {
+                latest.insert(update.tf, update);
+            },
+        );
+        for tf in TfIndex::ALL {
+            let state = agg
+                .snapshot(Feed::Dhan, 77, 2, tf)
+                .expect("canonical state");
+            let update = latest.get(&tf).expect("canonical update");
+            assert_eq!(state.volume, unrepresentable, "raw gross is never clamped");
+            assert_eq!(
+                state.net_volume_signed, 0,
+                "unrepresentable magnitude is unavailable"
+            );
+            assert_eq!(state.net_volume(), None);
+            assert_eq!(update.gross_volume, state.volume);
+            assert_eq!(update.estimated_net_volume, state.net_volume());
+            assert_eq!(update.volume_quality, state.volume_quality);
+            assert_ne!(state.volume_quality & VOLUME_QUALITY_COUNTER_AMBIGUOUS, 0);
+            assert!(!update.quality.is_eligible());
+        }
+        let mut seals = BTreeMap::new();
+        agg.force_seal_all_with_volume_updates(
+            |_, _, _, tf, state| {
+                seals.insert(tf, state);
+            },
+            |update| {
+                latest.insert(update.tf, update);
+            },
+        );
+        assert_eq!(seals.len(), TF_COUNT);
+        for (tf, state) in seals {
+            let update = latest.get(&tf).expect("same sealed revision");
+            assert!(
+                !update.closed,
+                "an administrative flush has no expiry cutoff"
+            );
+            assert_eq!(state.volume, unrepresentable);
+            assert_eq!(update.gross_volume, state.volume);
+            assert_eq!(update.estimated_net_volume, state.net_volume());
+            assert_eq!(update.volume_quality, state.volume_quality);
+            assert_eq!(update.revision, state.bucket_revision);
+            assert!(!update.quality.is_eligible());
+        }
+    }
+
+    #[test]
+    fn the_canonical_callback_bound_holds_through_close_late_data_and_session_change() {
+        use crate::candles::volume_update::MAX_VOLUME_UPDATES_PER_TICK;
+        for strategy in [FeedStrategy::REFOLD, FeedStrategy::DISCARD] {
+            let mut agg = MultiTfAggregator::with_capacity(strategy, 1);
+            for (index, (at, counter)) in [
+                (OPEN, None),
+                (OPEN, Some(1_000)),
+                (OPEN + 1, Some(1_100)),
+                (OPEN + 120, Some(1_200)),
+                (OPEN + 1, Some(1_300)),
+                (OPEN + 121, Some(100)),
+                (OPEN + 86_400, Some(0)),
+                (OPEN + 86_401, Some(100)),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if index == 4 {
+                    agg.catch_up_seal_all(OPEN + 180, |_, _, _, _, _| {});
+                }
+                let mut tick = observed(at, 100.0 + index as f32, counter);
+                if index == 4 {
+                    tick.received_at_nanos = 0;
+                }
+                let mut count = 0_usize;
+                agg.consume_tick_with_context(
+                    Feed::Dhan,
+                    &tick,
+                    None,
+                    metadata(),
+                    |_, _, _, _, _| {},
+                    |_| {
+                        count += 1;
+                    },
+                );
+                assert!(
+                    count <= MAX_VOLUME_UPDATES_PER_TICK,
+                    "{strategy:?}: {index} emitted {count}"
                 );
             }
         }

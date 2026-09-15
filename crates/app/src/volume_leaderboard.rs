@@ -19,6 +19,17 @@
 //! the negative control: it proves the split earns its place rather than
 //! asserting that it does.
 //!
+//! # Current implementation (2026-09-14)
+//!
+//! Per-tick identity lookup retains expected O(1) hashing. Stable dense slots
+//! eliminate repeat hashing during dirty sweeps. Fixed-width radix passes
+//! order the complete board in O(rows), first by milli-lots and then by an
+//! exact fractional key inside each rounded tie. The exact ratio of window
+//! units to lot size decides order; only equal ratios fall back to identity.
+//! Public milli-lots and percentage columns retain their display precision.
+//! Small bounded groups use comparison sorting. Historical timings below do
+//! not measure the added exact fractional refinement.
+//!
 //! # There is no heap and no threshold, and that is the design
 //!
 //! The first design pitched to the operator kept an incremental min-heap of the
@@ -138,28 +149,24 @@
 //!
 //! # Allocation
 //!
-//! The maps and the sweep buffer are pre-sized at construction and the metric
+//! The identity maps, dense state and sweep buffers are pre-sized at construction and the metric
 //! handles are resolved there too, so [`VolumeLeaderboard::observe`] — the
 //! per-tick path — allocates nothing in steady state.
 //!
-//! **The two post-sort passes DO allocate**, and neither is per tick:
-//! [`distinct_underlying_over`] takes two `Vec`s of `k` (the depth-200 path,
-//! `k = 5`), and [`gainer_eligible`] takes one `Vec` of `limit` plus a
-//! per-underlying verdict memo (the depth-20 path, `limit = 300`). Both run
-//! once per 5-second sweep on the drain's timer arm. Stated because an earlier
-//! version of this header said "allocation happens once at construction"
-//! without qualification, which was true of `rank` and false of these paths,
-//! and a later version named a `rank_distinct_underlying` method that was
-//! deleted on 2026-09-08 (its only callers were its own tests — the production
-//! depth-200 publish had used `distinct_underlying_over` since the day it was
-//! wired).
+//! **Post-sort selection allocates on the five-second timer arm:**
+//! [`gainer_eligible_for_depth`] builds two bounded vectors (300 contracts and
+//! 20 distinct underlyings) plus a per-underlying verdict memo. It walks the
+//! complete ordered population until both independent bands fill. These
+//! allocations are separate from the steady-state per-tick observation path.
 
-use std::collections::HashMap;
+use std::{cmp::Ordering, collections::HashMap};
 
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::types::ExchangeSegment;
 use tickvault_storage::top_volume_rank_persistence::SnapshotCadence;
 use tracing::{error, warn};
+
+mod ranking_sort;
 
 /// Contracts tracked before the map refuses new ones.
 ///
@@ -273,18 +280,18 @@ pub struct RankedContract {
     /// the monotonicity gate guards and what the baselines below are measured
     /// against. Since 2026-09-07 it is no longer the sort key.
     pub volume: u32,
-    /// The RANK KEY: lots traded in the window that just closed, × 1000.
+    /// Lots traded in the window that just closed, × 1000, rounded down.
     ///
     /// **Written by [`VolumeLeaderboard::rank`], ignored by
     /// [`VolumeLeaderboard::observe`].** A caller constructing an observation
     /// leaves it 0 and the ranking overwrites it; a value set here on the way
     /// IN has no effect and is not read.
     ///
-    /// Milli-lots rather than whole lots because a 250-deep board is decided at
-    /// its bottom edge: with integer lots every contract trading under one lot
-    /// in a one-second window collapses to 0 and the cut becomes an arbitrary
-    /// tie-break rather than a measurement. See the 2026-09-07 scope-lock
-    /// section.
+    /// This is a display value and a coarse radix key. Exact ordering uses
+    /// `delta_units / lot_size`, so unequal ratios do not become identity
+    /// ties when this field rounds them to the same milli-lot. A positive
+    /// sub-milli-lot delta remains on the board with this field equal to zero.
+    /// The numerator and denominator beside it preserve its exact quantity.
     pub window_lots_milli: u64,
     /// The rank key's NUMERATOR: units traded in the window that just closed.
     ///
@@ -547,12 +554,11 @@ const _: () = assert!(
 const _: () = assert!(
     size_of::<Tracked>() <= 64,
     "Tracked is stored 25,000 times per family; growth here is multiplied by \
-     that. Decide deliberately before raising this. (NOT a cache-line bound — \
-     hashbrown stores the 16-byte key inline beside it, so an entry is already \
-     80 bytes and already straddles.)"
+     that. Decide deliberately before raising this. Dense Vec storage is not \
+     guaranteed to be aligned to a cache-line boundary.)"
 );
 
-/// Fixed-point scale on the rank key. 1000 = three decimal places of a lot.
+/// Fixed-point display scale. 1000 = three decimal places of a lot.
 pub const LOTS_SCALE: u64 = 1_000;
 
 const _: () = assert!(
@@ -628,47 +634,112 @@ pub const fn window_lots_milli(delta_units: u32, lot_size: u32) -> Option<u64> {
     Some((delta_units as u64 * LOTS_SCALE) / lot_size as u64)
 }
 
+/// Exact window-volume ratio descending, then contract identity ascending.
+///
+/// `(delta_units / lot_size - 1) * 100` is the one-lot-baseline volume
+/// percentage. Comparing the ratios before division gives the same order
+/// without rounding or floating point. Both cross-products fit in `u128`
+/// (indeed, a product of two `u32` values fits in `u64`).
+///
+/// Ranking excludes a zero lot size. For callers validating constructed rows,
+/// this comparator remains a total order: an invalid denominator sorts after
+/// every valid ratio, never as an infinite winner. Equal valid ratios, and
+/// pairs of invalid rows, use security id and segment as deterministic ties.
+pub(crate) fn compare_ranked_contracts(a: &RankedContract, b: &RankedContract) -> Ordering {
+    let ratio_order = match (a.lot_size, b.lot_size) {
+        (0, 0) => Ordering::Equal,
+        (0, _) => Ordering::Greater,
+        (_, 0) => Ordering::Less,
+        (a_lot, b_lot) => (u128::from(b.delta_units) * u128::from(a_lot))
+            .cmp(&(u128::from(a.delta_units) * u128::from(b_lot))),
+    };
+    ratio_order
+        .then_with(|| a.security_id.cmp(&b.security_id))
+        .then_with(|| (a.segment as u8).cmp(&(b.segment as u8)))
+}
+
+/// The fractional part of milli-lots, encoded without merging unequal ratios.
+///
+/// The remainder is less than a positive `u32` denominator. Distinct fractions
+/// with such denominators differ by at least `1 / (d1 * d2)`, which is strictly
+/// greater than `2^-64`, since `(u32::MAX)^2 < 2^64`. Multiplication by `2^64`
+/// followed by floor therefore keeps distinct fractions distinct. Equal
+/// fractions keep equal keys even when their numerator/denominator differ.
+///
+/// `delta * 1000` fits below `2^42`; the remainder shifted by 64 fits below
+/// `2^96`, both safely within `u128`. The final quotient is below `2^64`.
+/// The caller has already refused a zero lot size.
+fn exact_fractional_lots_key(row: &RankedContract) -> u64 {
+    debug_assert_ne!(row.lot_size, 0);
+    let denominator = u128::from(row.lot_size);
+    let remainder = (u128::from(row.delta_units) * u128::from(LOTS_SCALE)) % denominator;
+    ((remainder << 64) / denominator) as u64
+}
+
+/// Complete exact ranking using bounded-width integer keys and no new buffer.
+///
+/// Integer milli-lots order disjoint ratio ranges. Only a rounded tie needs a
+/// fractional refinement; groups whose ratios are all exactly equal already
+/// have the correct identity order and skip that refinement. The existing
+/// radix sorter is reused by temporarily replacing the scratch row's display
+/// field with its fractional key, then restoring it before returning.
+///
+/// Two fixed-width radix sorts and linear scans are O(rows), with bounded
+/// stack storage and no heap allocation. Small comparison-sort groups are
+/// bounded by the radix sort's fixed cutoffs. This is not O(1) for a complete
+/// board. The additional `u128` division work requires an AWS benchmark; the
+/// timings for the previous rounded-key implementation do not cover it.
+fn sort_by_exact_volume_ratio(rows: &mut [RankedContract]) {
+    ranking_sort::sort(rows);
+    let mut start = 0;
+    while start < rows.len() {
+        let first = rows[start];
+        let mut end = start + 1;
+        let mut all_ratios_equal = true;
+        while end < rows.len() && rows[end].window_lots_milli == first.window_lots_milli {
+            all_ratios_equal = all_ratios_equal
+                && u128::from(rows[end].delta_units) * u128::from(first.lot_size)
+                    == u128::from(first.delta_units) * u128::from(rows[end].lot_size);
+            end += 1;
+        }
+        if !all_ratios_equal {
+            let group = &mut rows[start..end];
+            for row in group.iter_mut() {
+                row.window_lots_milli = exact_fractional_lots_key(row);
+            }
+            ranking_sort::sort(group);
+            for row in group.iter_mut() {
+                row.window_lots_milli = first.window_lots_milli;
+            }
+        }
+        start = end;
+    }
+}
+
 #[derive(Debug)]
 struct Family {
-    volumes: HashMap<ContractKey, Tracked>,
-    /// Keys that have TRADED since each window's last sweep — the work list.
-    ///
-    /// One list per cadence slot, holding exactly the contracts whose
-    /// `Tracked::dirty` bit for that slot is set. The sweep walks this instead
-    /// of the whole map, which is what makes the per-sweep cost scale with the
-    /// number of contracts that TRADED rather than with the number that EXIST.
-    ///
-    /// **The invariant, and it is the whole correctness argument:** for every
-    /// window `w`, `dirty[w]` contains a key AT MOST ONCE, and contains it if
-    /// and only if `volumes[key].dirty & (1 << w) != 0`. Every writer of
-    /// `Tracked` upholds it — insert seeds the mask to 0 and pushes nothing,
-    /// an accepted advance pushes into exactly the lists whose bit was clear,
-    /// a re-latch preserves the mask and pushes nothing, a refusal touches
-    /// neither, and a sweep clears its own bit as it drains its own list.
-    ///
-    /// Pre-sized at construction for the same reason `volumes` is: a list that
-    /// grows from empty to the authorized ceiling reallocates and copies ~15
-    /// times, and every one of those lands on the per-tick path. The cost is
-    /// `WINDOW_COUNT × MAX_TRACKED_CONTRACTS × 16 B` ≈ 1.6 MB per family and
-    /// ~3.2 MB in all, committed at boot — stated rather than buried, though
-    /// it is small beside the ~5.3 MB the maps already commit (~2.6 MB per
-    /// family: hashbrown stores the 16-byte key INLINE beside the 64-byte
-    /// `Tracked`, so an entry is 80 B, and 25,000 rounds up to 32,768 buckets
-    /// — 32,768 × 80 B ≈ 2.6 MB. An earlier version of this line said "~4 MB",
-    /// which counted the value and not the inline key).
-    dirty: [Vec<ContractKey>; WINDOW_COUNT],
+    /// External identities are resolved once per observation. Work lists keep
+    /// stable dense indices, so a sweep does not repeat this hash lookup.
+    indices: HashMap<ContractKey, usize>,
+    volumes: Vec<Tracked>,
+    /// Dense indices that have traded since each cadence's last sweep.
+    /// Each index occurs at most once per list, exactly when its dirty bit is
+    /// set. Entries only append; reset clears indices, entries and lists
+    /// together. No swap-remove or compaction may invalidate these indices.
+    /// Four preallocated usize lists cost 800,000 bytes per family on 64-bit
+    /// targets, half the previous composite-key lists. Sweeps directly index
+    /// the state vector instead of hashing each identity again.
+    dirty: [Vec<usize>; WINDOW_COUNT],
     non_monotonic: u64,
     at_capacity: u64,
     relatched: u64,
     /// Recoveries absorbed after a re-latch. See `Tracked::resync_ceiling`.
     resynced: u64,
-    /// Contracts the sweep put on the work list and then LEFT OFF the board
-    /// because their window key truncated to zero milli-lots.
+    /// Changed contracts whose exact window delta is zero, so they are omitted.
     ///
-    /// Added 2026-09-12 by an adversarial sweep, which found this the only
-    /// remaining membership filter on `top_volume` with no instrument at all.
-    /// See the emit site for what a non-zero reading means -- it is the one
-    /// signal that would falsify the unit premise the key rests on.
+    /// The existing `zero_lot_window` metric label is retained. Since the
+    /// 2026-09-14 precision correction it no longer counts a positive quantity
+    /// that merely rounds below one milli-lot; those rows remain rankable.
     zero_lot: u64,
     /// PRE-RESOLVED counter handles.
     ///
@@ -737,7 +808,8 @@ impl Family {
             // Pre-sized: an unsized map reallocates and rehashes ~15 times on
             // its way to the authorized universe, and every one of those lands
             // on the per-tick path.
-            volumes: HashMap::with_capacity(MAX_TRACKED_CONTRACTS),
+            indices: HashMap::with_capacity(MAX_TRACKED_CONTRACTS),
+            volumes: Vec::with_capacity(MAX_TRACKED_CONTRACTS),
             // Pre-sized for the same reason, and `from_fn` rather than an
             // array literal because a `Vec` is not `Copy`.
             dirty: std::array::from_fn(|_| Vec::with_capacity(MAX_TRACKED_CONTRACTS)),
@@ -758,6 +830,7 @@ impl Family {
     /// the resolved handles. Replacing the struct would hand back the capacity
     /// and pay the growth again every session.
     fn clear(&mut self) {
+        self.indices.clear();
         self.volumes.clear();
         // Cleared WITH the map, and it must be: a work list naming keys that
         // no longer exist would have the next sweep probe a cleared map for
@@ -834,7 +907,10 @@ impl VolumeLeaderboard {
         let label = family.as_str();
         let slot = self.family_mut(family);
 
-        if let Some(existing) = slot.volumes.get_mut(&key) {
+        if let Some(&entry_index) = slot.indices.get(&key) {
+            // Entries are append-only until clear resets both structures.
+            // No references or indices escape this family's reset lifetime.
+            let existing = &mut slot.volumes[entry_index];
             // STRICTLY less. An UNCHANGED cumulative volume is the NORMAL state,
             // not a fault: a Full/Quote packet is emitted on an LTP, bid, ask
             // or OI change, so between two trades of one contract many packets
@@ -1107,7 +1183,7 @@ impl VolumeLeaderboard {
                     // each key in each list at most once and therefore keeps
                     // the lists bounded by the map they index.
                     if was_dirty & (1u8 << window) == 0 {
-                        pending.push(key);
+                        pending.push(entry_index);
                     }
                 }
             }
@@ -1185,28 +1261,27 @@ impl VolumeLeaderboard {
             return Observation::RefusedAtCapacity;
         }
 
-        slot.volumes.insert(
-            key,
-            Tracked {
-                contract,
-                consecutive_lower: 0,
-                // Seeded to what this contract has ALREADY traded today, never
-                // to 0. Seeding 0 would make its first window report the whole
-                // session so far — the largest figure it will ever show, on a
-                // board whose top entries take depth sockets.
-                baseline: [contract.volume; WINDOW_COUNT],
-                // CLEAN, and nothing is pushed. The baseline one line above is
-                // this contract's own current volume, so its delta in every
-                // window is structurally zero until it advances — a sweep that
-                // visited it would rank nothing and write a baseline it
-                // already holds. Marking it here would put every contract in
-                // the universe on the work list at attach and hand back the
-                // whole-universe walk on the first sweep of the session.
-                dirty: 0,
-                // No ceiling is armed: this contract has never re-latched.
-                resync_ceiling: 0,
-            },
-        );
+        let entry_index = slot.volumes.len();
+        slot.volumes.push(Tracked {
+            contract,
+            consecutive_lower: 0,
+            // Seeded to what this contract has ALREADY traded today, never
+            // to 0. Seeding 0 would make its first window report the whole
+            // session so far — the largest figure it will ever show, on a
+            // board whose top entries take depth sockets.
+            baseline: [contract.volume; WINDOW_COUNT],
+            // CLEAN, and nothing is pushed. The baseline one line above is
+            // this contract's own current volume, so its delta in every
+            // window is structurally zero until it advances — a sweep that
+            // visited it would rank nothing and write a baseline it
+            // already holds. Marking it here would put every contract in
+            // the universe on the work list at attach and hand back the
+            // whole-universe walk on the first sweep of the session.
+            dirty: 0,
+            // No ceiling is armed: this contract has never re-latched.
+            resync_ceiling: 0,
+        });
+        slot.indices.insert(key, entry_index);
         Observation::Accepted
     }
 
@@ -1233,10 +1308,12 @@ impl VolumeLeaderboard {
     /// TRADED in the window (the sorted population), not the 250 or 5 the
     /// depth pools were handed; the handed counts are on the steering side.
     ///
-    /// The sort is O(n log n) in that traded population, and since 2026-09-12
-    /// so is the WALK that feeds it — the sweep drains `Family::dirty[idx]`
-    /// rather than the whole map, so neither half scales with the size of the
-    /// universe. That is the achievable form of the operator's O(1) ask:
+    /// The sweep reads O(D) dense slots for D changed contracts. Complete
+    /// exact-ratio ordering uses bounded byte-radix passes over R qualifying
+    /// rows, O(R) for fixed-width keys, including fractional refinement inside
+    /// rounded milli-lot ties. Small bounded groups use comparison sorting.
+    /// Neither half walks unchanged contracts. This bounds work to the changed
+    /// population rather than making a complete result O(1):
     /// per-sweep O(1) is arithmetically impossible, because the output is one
     /// row per traded contract and Ω(traded) is a floor; O(1) in the size of
     /// the UNIVERSE is what a work list can deliver, and is what this does.
@@ -1285,8 +1362,8 @@ impl VolumeLeaderboard {
         };
         let slot = self.family_mut(family);
         let mut pending = std::mem::take(&mut slot.dirty[idx]);
-        for key in pending.drain(..) {
-            let Some(tracked) = slot.volumes.get_mut(&key) else {
+        for entry_index in pending.drain(..) {
+            let Some(tracked) = slot.volumes.get_mut(entry_index) else {
                 continue;
             };
             tracked.dirty &= !(1u8 << idx);
@@ -1341,16 +1418,14 @@ impl VolumeLeaderboard {
         //
         //   a contract is absent from `dirty[idx]` ⟺ its bit for `idx` is
         //   clear ⟺ no accepted advance since this window's last sweep ⟹
-        //   `baseline[idx] == volume` ⟹ `delta == 0` ⟹ `lots == 0` ⟹ the
+        //   `baseline[idx] == volume` ⟹ `delta == 0` ⟹ the
         //   loop would have `continue`d, after writing a baseline it already
         //   held.
         //
         // The arrows are DIRECTIONAL past the third step and that is not a
-        // typographic nicety — the last two do not hold in reverse.
-        // `lots == delta * 1000 / lot_size` is an integer division, so a
-        // delta of 1 on a 2,000-unit lot yields `lots == 0` with `delta != 0`;
-        // and the loop also `continue`s when the lot size is MISSING, whatever
-        // the delta. Neither reverse direction is needed: the claim being
+        // typographic nicety — the last step does not hold in reverse.
+        // The loop also `continue`s when the lot size is MISSING, whatever
+        // the delta. That reverse direction is not needed: the claim being
         // proven is one-way — absent from the list ⟹ the old walk would have
         // skipped it — so left-to-right is the whole proof. (Stated because an
         // earlier version of this comment wrote ⟺ throughout, which asserts
@@ -1367,12 +1442,12 @@ impl VolumeLeaderboard {
         // `a_contract_that_traded_is_never_skipped_by_the_sweep_that_follows`.
         let slot = self.family_mut(family);
         let mut pending = std::mem::take(&mut slot.dirty[idx]);
-        for key in pending.drain(..) {
+        for entry_index in pending.drain(..) {
             // A key on the list whose entry is gone can only mean a daily
             // reset landed between the mark and the sweep, and `clear` empties
             // both halves together — so this is the defensive arm, and it
             // skips rather than re-inserting a contract the reset removed.
-            let Some(tracked) = slot.volumes.get_mut(&key) else {
+            let Some(tracked) = slot.volumes.get_mut(entry_index) else {
                 continue;
             };
             tracked.dirty &= !(1u8 << idx);
@@ -1383,6 +1458,7 @@ impl VolumeLeaderboard {
             tracked.baseline[idx] = tracked.contract.volume;
 
             let mut row = tracked.contract;
+            let key = (row.security_id, row.segment);
             // A missing lot size cannot reach here through production — the
             // join refuses it — so this is the defensive arm, and it SKIPS
             // rather than ranking the contract at 0, which would put it in an
@@ -1416,44 +1492,15 @@ impl VolumeLeaderboard {
             let Some(lots) = window_lots_milli(delta, lot) else {
                 continue;
             };
-            // A contract whose window key truncates to ZERO milli-lots is not
-            // "top volume" and is left OFF the board — the same treatment as a
-            // missing lot size, for the same reason: ranking zeros would pad
-            // the tail of a 250-deep board with contracts ordered by nothing
-            // but their security_id, and the depth pools would swap sockets
-            // onto strikes that traded nothing. Found by the 2026-09-08
-            // adversarial sweep; before it, the first sweep after every boot
-            // published up to 250 zero-lot "top" contracts.
-            //
-            // ⚠ CORRECTED 2026-09-12 — this comment used to justify the skip
-            // by saying a zero is "the COMMON value (every quiet contract,
-            // every first sweep after a boot)". That was true of the
-            // whole-map walk it was written for and is FALSE of the work-list
-            // drain that replaced it: a quiet contract has a CLEAR dirty bit
-            // and never reaches this line. Everything on this list traded.
-            //
-            // So a zero here is now RARE, and its two remaining causes are
-            // both worth seeing:
-            //
-            //   (a) `delta × 1000 < lot_size` — the division truncated. On a
-            //       1,800-unit lot that needs delta < 2 units, which should be
-            //       vanishingly rare IF `volume` is in the same unit as
-            //       `lot_size`. **That premise is an INFERENCE, not a vendor
-            //       fact**: the Dhan doc gives the field as `| 23-26 | int32 |
-            //       4 | Volume |` with no unit, and this module's header flags
-            //       the CUMULATIVE premise at length while never flagging the
-            //       UNIT one. If volume actually arrives in LOTS, this key
-            //       becomes roughly `lots / lot_size` — a systematic penalty on
-            //       large-lot contracts, with every downstream surface still
-            //       green. A SUSTAINED non-zero count here, concentrated on
-            //       large-lot contracts, is that signature.
-            //   (b) a resync that adopted EXACTLY the abandoned ceiling, so
-            //       every window delta is genuinely zero for one sweep.
-            //
-            // The counter is what lets the next live session tell (a) from (b)
-            // and from "the filter never fires". The settling measurement is
-            // one query on a live box, and it is stated at the warn below.
-            if lots == 0 {
+            // A real zero delta is omitted. Before the 2026-09-14 precision
+            // correction this tested `lots == 0`, which also erased positive
+            // quantities below one milli-lot (for example 1 / 2,000 lots).
+            // Those positive rows now retain their exact numerator and
+            // denominator and are ordered by that ratio. A resync may still
+            // leave a marked contract with an actual zero delta for a sweep.
+            // Correct ordering assumes volume and lot_size use the same unit;
+            // integer divisibility alone cannot establish the vendor's unit.
+            if delta == 0 {
                 slot.zero_lot = slot.zero_lot.saturating_add(1);
                 slot.refused_zero_lot.increment(1);
                 let zero_lot_total = slot.zero_lot;
@@ -1473,7 +1520,7 @@ impl VolumeLeaderboard {
                         delta_units = delta,
                         lot_size = lot,
                         zero_lot_total,
-                        "volume_leaderboard: a contract that TRADED in this window ranked zero milli-lots and was left off the board. Rare by design. If this is sustained and concentrated on large lot sizes, the ranking key's unit premise is wrong -- settle it on a live box with: SELECT delta_units, lot_size FROM top_volume WHERE tf='1s' LIMIT 50. delta_units a multiple of lot_size means volume arrives in LOTS and the key is inverted; unrelated small values mean the premise holds."
+                        "volume_leaderboard: a changed contract had zero exact window units and was left off the board; a reset can produce this state. Positive quantities remain on the board even when the milli-lot display rounds to zero."
                     );
                 }
                 continue;
@@ -1492,30 +1539,12 @@ impl VolumeLeaderboard {
         // Drained, so this hands the CAPACITY back, not the contents.
         slot.dirty[idx] = pending;
 
-        // Most lots traded in the window first, then a DETERMINISTIC tiebreak
-        // on the composite identity. Without the tiebreak, equal keys order by
-        // whatever the hash map yielded, so the same input reorders between
-        // sweeps and the caller swaps subscriptions for nothing — and equal
-        // keys are COMMON now in a way they were not under a cumulative key:
-        // every contract that traded nothing in the window is exactly 0.
-        //
-        // THIS IS THE VOLUME-PERCENTAGE ORDER (operator 2026-09-12: "rank on
-        // volume-percentage alone"). The key is `window_lots_milli` and the
-        // percentage the operator reads is
-        // `net_volume_chg_pct = window_lots_milli / 10 - 100` — a strictly
-        // increasing affine transform, so the two produce the SAME sequence,
-        // row for row, including every tie. Sorting on the percentage instead
-        // would change nothing except to put a float in a comparator, and a
-        // non-finite comparator is non-transitive: one NaN corrupts the whole
-        // sort rather than misplacing one row. Integer key, percentage
-        // presentation. Pinned by
-        // `ranking_by_volume_percentage_is_the_same_order_as_ranking_by_lots`.
-        scratch.sort_unstable_by(|a, b| {
-            b.window_lots_milli
-                .cmp(&a.window_lots_milli)
-                .then_with(|| a.security_id.cmp(&b.security_id))
-                .then_with(|| (a.segment as u8).cmp(&(b.segment as u8)))
-        });
+        // One-lot-baseline volume percentage is an increasing transform of
+        // the exact ratio delta_units / lot_size. The stored milli-lot and
+        // milli-percent values round that ratio; they no longer decide ties.
+        // Resolve exact-ratio equality by composite identity only, before
+        // applying k, so a more precise winner cannot be cut behind a lower id.
+        sort_by_exact_volume_ratio(&mut scratch);
         scratch.truncate(k);
         self.scratch = scratch;
 
@@ -1612,8 +1641,9 @@ impl VolumeLeaderboard {
 /// the shape that produced 800 rows/minute against 100,800 on 2026-08-26.
 ///
 /// A free function over an ALREADY-ranked slice, deliberately — the
-/// production 5-second arm ranks the full population ONCE and applies this
-/// to that slice. It was extracted on 2026-09-08 from a `rank_distinct_underlying`
+/// production 5-second arm ranks the full population ONCE; its shared
+/// [`gainer_eligible_for_depth`] walk now collects the distinct band directly.
+/// This standalone helper was extracted on 2026-09-08 from a `rank_distinct_underlying`
 /// method that ranked internally, and that method was deleted the same day
 /// once its only callers were its own tests, because "without ranking again"
 /// is the load-bearing half. [`VolumeLeaderboard::rank`] rolls each contract's per-cadence baseline
@@ -1628,9 +1658,8 @@ impl VolumeLeaderboard {
 ///
 /// O(`ordered.len()` × k) — the outer loop walks `ordered`, and each row costs a
 /// linear `contains` over the underlyings already picked, which is bounded by
-/// `k`. On the depth-200 path `ordered` is the gainer-eligible output (≤ 300)
-/// and `k` is `DEPTH200_EXIT_UNDERLYINGS` (20), so ≈ 6,000 integer compares once
-/// a minute. Still cheaper than building a 20-entry `HashSet`.
+/// `k`. The production depth selector now uses memo first-visits to collect
+/// distinct names while evaluating eligibility, avoiding this separate scan.
 ///
 /// ⚠ CORRECTED 2026-09-13: this read "O(k × distinct-seen) with both bounded by
 /// `k`. `k` is 5 on the depth-200 path" — wrong twice. The outer loop is over
@@ -1864,7 +1893,40 @@ pub fn gainer_eligible<F>(
 where
     F: Fn(u64) -> GainerVerdict,
 {
-    let mut out: Vec<RankedContract> = Vec::with_capacity(ranked.len().min(limit));
+    let selected = gainer_eligible_for_depth(ranked, limit, 0, verdict_of);
+    (selected.contracts, selected.tally)
+}
+
+/// Independent depth bands selected from the same complete volume order.
+#[derive(Debug)]
+pub struct GainerDepthSelection {
+    /// First eligible contracts, including different strikes of one name.
+    pub contracts: Vec<RankedContract>,
+    /// Highest-ranked eligible contract of each distinct underlying.
+    pub underlyings: Vec<RankedContract>,
+    /// Verdicts for rows visited before both bands filled or input ended.
+    pub tally: GainerTally,
+}
+
+/// Fill both depth bands without letting the contract limit truncate the
+/// distinct-underlying population. A name's first visited row is its heaviest
+/// contract because `ranked` is already ordered. One memo entry supplies both
+/// its verdict and first-visit identity; no second ranking or distinct scan.
+///
+/// Stops only when both bands are full. Expected O(visited rows) work and
+/// O(visited underlyings + both limits) space, with one verdict probe per name.
+#[must_use]
+pub fn gainer_eligible_for_depth<F>(
+    ranked: &[RankedContract],
+    contract_limit: usize,
+    underlying_limit: usize,
+    verdict_of: F,
+) -> GainerDepthSelection
+where
+    F: Fn(u64) -> GainerVerdict,
+{
+    let mut contracts = Vec::with_capacity(ranked.len().min(contract_limit));
+    let mut underlyings = Vec::with_capacity(ranked.len().min(underlying_limit));
     let mut tally = GainerTally::default();
     // One verdict per UNDERLYING, not per row. A stock's ~102 strikes share
     // one spot and one previous close, so the verdict is identical for every
@@ -1876,22 +1938,36 @@ where
     // once. Cold path: one 5-second sweep, never per tick.
     let mut memo: HashMap<u64, GainerVerdict> = HashMap::with_capacity(GAINER_MEMO_CAPACITY);
     for row in ranked {
-        if out.len() >= limit {
+        if contracts.len() >= contract_limit && underlyings.len() >= underlying_limit {
             break;
         }
-        let verdict = *memo
-            .entry(row.underlying_id)
-            .or_insert_with(|| verdict_of(row.underlying_id));
+        let (verdict, first_underlying) = match memo.entry(row.underlying_id) {
+            std::collections::hash_map::Entry::Occupied(entry) => (*entry.get(), false),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let verdict = verdict_of(row.underlying_id);
+                entry.insert(verdict);
+                (verdict, true)
+            }
+        };
         match verdict {
             GainerVerdict::Gainer => {
                 tally.gainer = tally.gainer.saturating_add(1);
-                out.push(*row);
+                if contracts.len() < contract_limit {
+                    contracts.push(*row);
+                }
+                if first_underlying && underlyings.len() < underlying_limit {
+                    underlyings.push(*row);
+                }
             }
             GainerVerdict::NotGainer => tally.not_gainer = tally.not_gainer.saturating_add(1),
             GainerVerdict::Unknown => tally.unknown = tally.unknown.saturating_add(1),
         }
     }
-    (out, tally)
+    GainerDepthSelection {
+        contracts,
+        underlyings,
+        tally,
+    }
 }
 
 /// Pre-size for the per-underlying verdict memo in [`gainer_eligible`]:
@@ -2018,7 +2094,7 @@ mod tests {
         family: OptionFamily,
     ) -> Observation {
         let key = (contract.security_id, contract.segment);
-        if contract.volume > 1 && !lb.family_mut(family).volumes.contains_key(&key) {
+        if contract.volume > 1 && !lb.family_mut(family).indices.contains_key(&key) {
             let seed = RankedContract {
                 volume: 1,
                 ..contract
@@ -2030,6 +2106,215 @@ mod tests {
 
     fn all(_: &RankedContract) -> bool {
         true
+    }
+
+    #[test]
+    fn exact_ratio_order_refines_milli_lot_ties_in_every_family_and_cadence() {
+        for family in [OptionFamily::Stock, OptionFamily::Index] {
+            for cadence in SnapshotCadence::ALL {
+                let mut lb = VolumeLeaderboard::new();
+                for (id, delta, lot) in [
+                    (1, 2_001, 2_000),
+                    (2, 2_000, 1_999),
+                    (3, 2, 2),
+                    (4, 4_002, 4_000),
+                ] {
+                    let seed = RankedContract {
+                        lot_size: lot,
+                        ..stock(id, 100, 1)
+                    };
+                    lb.observe(seed, family);
+                    lb.observe(
+                        RankedContract {
+                            volume: 1 + delta,
+                            ..seed
+                        },
+                        family,
+                    );
+                }
+                let ranked = lb.rank(family, cadence, usize::MAX, |_| None, all);
+                assert_eq!(
+                    ranked.iter().map(|row| row.security_id).collect::<Vec<_>>(),
+                    vec![2, 1, 4, 3],
+                    "the higher exact ratio must win inside a rounded tie: {family:?} {cadence:?}"
+                );
+                assert!(ranked.iter().all(|row| row.window_lots_milli == 1_000));
+                assert_eq!(
+                    u128::from(ranked[0].delta_units) * u128::from(ranked[1].lot_size),
+                    u128::from(ranked[1].delta_units) * u128::from(ranked[0].lot_size) + 1,
+                    "the two leading exact ratios differ by one cross-product unit"
+                );
+                assert_eq!(
+                    u128::from(ranked[1].delta_units) * u128::from(ranked[2].lot_size),
+                    u128::from(ranked[2].delta_units) * u128::from(ranked[1].lot_size),
+                    "only a true ratio tie should fall back to id order"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exact_ratio_ranking_retains_sub_milli_lots_but_omits_true_zero_and_invalid_lots() {
+        for family in [OptionFamily::Stock, OptionFamily::Index] {
+            for cadence in SnapshotCadence::ALL {
+                let mut lb = VolumeLeaderboard::new();
+                for (id, delta, lot) in [(1, 1, 4_000), (2, 1, 2_000), (3, 0, 2_000), (4, 7, 0)] {
+                    let seed = RankedContract {
+                        lot_size: lot,
+                        ..stock(id, 100, 1)
+                    };
+                    lb.observe(seed, family);
+                    lb.observe(
+                        RankedContract {
+                            volume: 1 + delta,
+                            ..seed
+                        },
+                        family,
+                    );
+                }
+                let ranked = lb.rank(family, cadence, usize::MAX, |_| Some(0), all);
+                assert_eq!(
+                    ranked.iter().map(|row| row.security_id).collect::<Vec<_>>(),
+                    vec![2, 1],
+                    "positive quantities below display precision remain rankable"
+                );
+                assert!(ranked.iter().all(|row| row.window_lots_milli == 0));
+                assert!(ranked.iter().all(|row| row.delta_units == 1));
+                assert_eq!(
+                    lb.family_ref(family).zero_lot,
+                    0,
+                    "a positive quantity must not increment the zero-window refusal counter"
+                );
+                assert!(
+                    lb.rank(family, cadence, usize::MAX, |_| Some(0), all)
+                        .is_empty(),
+                    "ranking advances the cadence baseline once, including sub-milli rows"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exact_ratio_ranking_applies_top_k_after_resolving_rounded_ties() {
+        let mut lb = VolumeLeaderboard::new();
+        for (id, lot) in [(1, 4_000), (2, 2_000)] {
+            let seed = RankedContract {
+                lot_size: lot,
+                ..stock(id, 100, 1)
+            };
+            lb.observe(seed, OptionFamily::Stock);
+            lb.observe(RankedContract { volume: 2, ..seed }, OptionFamily::Stock);
+        }
+        let ranked = lb.rank(OptionFamily::Stock, S1, 1, |_| None, all);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].security_id, 2);
+        assert_eq!(ranked[0].window_lots_milli, 0);
+    }
+
+    #[test]
+    fn exact_ratio_comparator_handles_extreme_cross_products_and_invalid_denominators() {
+        let max = u32::MAX;
+        let greater = RankedContract {
+            delta_units: max - 1,
+            lot_size: max,
+            ..stock(99, 100, max)
+        };
+        let lesser = RankedContract {
+            delta_units: max - 2,
+            lot_size: max - 1,
+            ..stock(1, 100, max)
+        };
+        assert_eq!(
+            compare_ranked_contracts(&greater, &lesser),
+            Ordering::Less,
+            "ratios below one differing by less than f64 precision must retain their order"
+        );
+        assert!(exact_fractional_lots_key(&greater) > exact_fractional_lots_key(&lesser));
+        let invalid = RankedContract {
+            delta_units: max,
+            lot_size: 0,
+            ..stock(0, 100, max)
+        };
+        assert_eq!(
+            compare_ranked_contracts(&invalid, &greater),
+            Ordering::Greater
+        );
+        assert_eq!(compare_ranked_contracts(&greater, &invalid), Ordering::Less);
+        assert_eq!(
+            compare_ranked_contracts(&invalid, &invalid),
+            Ordering::Equal
+        );
+        let largest = RankedContract {
+            delta_units: max,
+            lot_size: 1,
+            ..greater
+        };
+        assert_eq!(compare_ranked_contracts(&largest, &greater), Ordering::Less);
+        assert_eq!(exact_fractional_lots_key(&largest), 0);
+        let same_ratio_later_segment = RankedContract {
+            segment: ExchangeSegment::BseFno,
+            ..greater
+        };
+        assert_eq!(
+            compare_ranked_contracts(&greater, &same_ratio_later_segment),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn exact_ratio_radix_sort_matches_cross_products_and_preserves_every_payload() {
+        const SEGMENTS: [ExchangeSegment; 4] = [
+            ExchangeSegment::NseFno,
+            ExchangeSegment::BseFno,
+            ExchangeSegment::McxComm,
+            ExchangeSegment::NseCurrency,
+        ];
+        for size in [0, 1, 2, 63, 64, 65, 127, 128, 129, 257, 4_096] {
+            for shape in 0..4 {
+                let mut state = 0x5eed_f00d_6a09_e667_u64;
+                let mut rows: Vec<_> = (0..size)
+                    .map(|i| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        let (delta, lot) = match shape {
+                            0 => (state as u32, (state >> 32) as u32 | 1),
+                            1 => (u32::MAX - 1 - i as u32, u32::MAX),
+                            2 => (i as u32 + 1, 2 * (i as u32 + 1)),
+                            _ => {
+                                let lot = u32::MAX - i as u32;
+                                (lot - 1, lot)
+                            }
+                        };
+                        RankedContract {
+                            security_id: state.rotate_left(19),
+                            segment: SEGMENTS[i % SEGMENTS.len()],
+                            underlying_id: i as u64,
+                            volume: state as u32,
+                            window_lots_milli: window_lots_milli(delta, lot).expect("positive lot"),
+                            delta_units: delta,
+                            lot_size: lot,
+                        }
+                    })
+                    .collect();
+                let original_allocation = rows.as_ptr();
+                let mut expected = rows.clone();
+                // Independent complete-ratio comparison: no fractional-key
+                // encoding, milli-lot sort, or production comparator reused.
+                expected.sort_unstable_by(|a, b| {
+                    (u128::from(b.delta_units) * u128::from(a.lot_size))
+                        .cmp(&(u128::from(a.delta_units) * u128::from(b.lot_size)))
+                        .then_with(|| a.security_id.cmp(&b.security_id))
+                        .then_with(|| (a.segment as u8).cmp(&(b.segment as u8)))
+                });
+                sort_by_exact_volume_ratio(&mut rows);
+                assert_eq!(rows, expected, "size={size}, shape={shape}");
+                assert_eq!(rows.as_ptr(), original_allocation);
+                assert!(rows.windows(2).all(|pair| {
+                    compare_ranked_contracts(&pair[0], &pair[1]) != Ordering::Greater
+                }));
+            }
+        }
     }
 
     /// Ticks fold from the candle session open (09:00) but ranking is gated to
@@ -2060,9 +2345,10 @@ mod tests {
         );
     }
 
-    /// The operator's requirement is that the board be ranked "purely based on
-    /// volume percentage". It already is, and this proves it rather than
-    /// asserting it.
+    /// This fixture's quantities are exact at milli-lot precision. For this
+    /// restricted case the displayed percentage and exact-ratio order agree.
+    /// The sub-milli and mixed-denominator regressions above cover quantities
+    /// that the display rounds together; the display must not decide those ties.
     ///
     /// `net_volume_chg_pct = window_lots_milli / 10 - 100` is strictly
     /// increasing, so ordering by it and ordering by the stored integer key
@@ -2195,6 +2481,19 @@ mod tests {
     /// already held.
     fn assert_dirty_invariant(lb: &VolumeLeaderboard, family: OptionFamily, note: &str) {
         let slot = lb.family_ref(family);
+        assert_eq!(
+            slot.indices.len(),
+            slot.volumes.len(),
+            "{note}: identity/slot count"
+        );
+        for (identity, &index) in &slot.indices {
+            let row = &slot.volumes[index].contract;
+            assert_eq!(
+                *identity,
+                (row.security_id, row.segment),
+                "{note}: slot identity"
+            );
+        }
         for (window, pending) in slot.dirty.iter().enumerate() {
             let bit = 1u8 << window;
             let mut seen = std::collections::HashSet::new();
@@ -2211,7 +2510,7 @@ mod tests {
                 // and `clear` empties both halves together — so this asserts a
                 // property rather than guarding a live path, which is what a
                 // test helper is for.
-                let tracked = slot.volumes.get(key).unwrap_or_else(|| {
+                let tracked = slot.volumes.get(*key).unwrap_or_else(|| {
                     panic!(
                         "{note}: {family:?} window {window} lists {key:?} with no map entry \
                          — the list has outlived the map it indexes"
@@ -2223,10 +2522,10 @@ mod tests {
                     "{note}: {family:?} window {window} lists {key:?} but its bit is clear"
                 );
             }
-            for (key, tracked) in &slot.volumes {
+            for (key, tracked) in slot.volumes.iter().enumerate() {
                 if tracked.dirty & bit != 0 {
                     assert!(
-                        seen.contains(key),
+                        seen.contains(&key),
                         "{note}: {family:?} window {window} has {key:?} marked but NOT on the \
                          work list — the sweep would never visit it and its traded volume \
                          would be folded into a later window"
@@ -2266,7 +2565,7 @@ mod tests {
             .expect("production text precedes the first test module");
 
         assert_eq!(
-            production.matches(".push(key)").count(),
+            production.matches("pending.push(entry_index)").count(),
             1,
             "exactly ONE site may add to the work list — the accepted-advance arm, which is \
              the only place that checks the bit before pushing. A second producer breaks the \
@@ -2278,14 +2577,14 @@ mod tests {
         // new `.push(` anywhere in the production half fails this test and the
         // author has to come here and say which list they are pushing into.
         //
-        // The five are: the work-list producer (the only one that matters
+        // The seven are: the dense-state append, the work-list producer (the one that matters
         // here), `scratch.push(row)` in `rank`, `seen.push`/`out.push` in
-        // `distinct_underlying_over`, and `out.push` in `gainer_eligible` —
-        // the last four all push into function-local `Vec`s that die at the
+        // `distinct_underlying_over`, and the two outputs in `gainer_eligible_for_depth` —
+        // the last five all push into function-local `Vec`s that die at the
         // end of the call and index nothing.
         assert_eq!(
             production.matches(".push(").count(),
-            5,
+            7,
             "a new `.push(` appeared in the production half. If it pushes into a work list \
              it is a SECOND PRODUCER and breaks the at-most-once invariant; if it pushes \
              into a function-local buffer it is harmless — decide which, then update this \
@@ -2517,7 +2816,7 @@ mod tests {
         let mut expected: Vec<RankedContract> = lb
             .family_ref(OptionFamily::Stock)
             .volumes
-            .values()
+            .iter()
             .filter_map(|t| {
                 let delta = t.contract.volume.saturating_sub(t.baseline[0]);
                 let lots = window_lots_milli(delta, 1)?;
@@ -3736,6 +4035,122 @@ mod tests {
         );
     }
 
+    /// Instrumented synthetic timings, not a per-event latency guarantee.
+    /// Observe quantiles describe BATCH-AVERAGE ns/event; rank quantiles
+    /// describe individual calls. Fixture construction and correctness checks
+    /// are outside the timers. This never contacts a broker or database.
+    #[test]
+    fn top_volume_latency_characterization_ns_us() {
+        const CONTRACTS: u64 = 20_220;
+        const SAMPLES: usize = if cfg!(debug_assertions) { 3 } else { 100 };
+        const LIMIT: usize = 250;
+
+        fn percentile_index(percent: usize, len: usize) -> usize {
+            (percent * len).div_ceil(100) - 1
+        }
+
+        let lots: HashMap<ContractKey, u32> = (0..CONTRACTS)
+            .map(|id| ((id, ExchangeSegment::NseFno), 1 + (id as u32 % 4) * 25))
+            .collect();
+        let mut report = String::from(
+            "SYNTHETIC Top Volume: release-only characterization, NOT a guarantee; \
+             warm existing contracts, Stock family, S1, output limit 250, \
+             Samples per case reported below after one warm-up. Observe = batch-average ns/event; \
+             rank = individual-call ns (us in parentheses). No cold inserts, \
+             DB/network, persistence or scheduler wait measured.\n",
+        );
+        for carried_lot in [true, false] {
+            for traded in [100_u64, 500, 2_000, CONTRACTS] {
+                let mut lb = VolumeLeaderboard::new();
+                for id in 0..CONTRACTS {
+                    let mut row = stock(id, id % 220, base_volume(id));
+                    if carried_lot {
+                        row.lot_size = lots[&(id, ExchangeSegment::NseFno)];
+                    }
+                    let _ = lb.observe(row, OptionFamily::Stock);
+                }
+                assert_eq!(lb.tracked(OptionFamily::Stock), CONTRACTS as usize);
+                let mut observe_ns_per_event = Vec::with_capacity(SAMPLES);
+                let mut rank_ns = Vec::with_capacity(SAMPLES);
+                let expected_len = (traded as usize).min(LIMIT);
+                let mut prepared = Vec::with_capacity(traded as usize);
+                for sample in 0..=SAMPLES {
+                    prepared.clear();
+                    for step in 0..traded {
+                        let id = step * CONTRACTS / traded;
+                        // Strictly increasing counters; scrambled increments
+                        // prevent a presorted/zero-volume fixture.
+                        let cumulative =
+                            base_volume(id) + (sample as u32 + 1) * (1 + id as u32 % 97);
+                        let mut row = stock(id, id % 220, cumulative);
+                        if carried_lot {
+                            row.lot_size = lots[&(id, ExchangeSegment::NseFno)];
+                        }
+                        prepared.push(row);
+                    }
+                    let started = std::time::Instant::now();
+                    for row in &prepared {
+                        std::hint::black_box(
+                            lb.observe(std::hint::black_box(*row), OptionFamily::Stock),
+                        );
+                    }
+                    let observe_elapsed = started.elapsed().as_nanos();
+                    let started = std::time::Instant::now();
+                    let ranked = lb.rank(
+                        OptionFamily::Stock,
+                        S1,
+                        LIMIT,
+                        |c| lots.get(&(c.security_id, c.segment)).copied(),
+                        all,
+                    );
+                    std::hint::black_box(ranked);
+                    let rank_elapsed = started.elapsed().as_nanos();
+                    assert_eq!(
+                        ranked.len(),
+                        expected_len,
+                        "sample {sample}, dirty {traded}"
+                    );
+                    assert!(ranked.iter().all(|row| row.window_lots_milli > 0));
+                    assert!(
+                        ranked
+                            .windows(2)
+                            .all(|pair| { pair[0].window_lots_milli >= pair[1].window_lots_milli })
+                    );
+                    if sample != 0 {
+                        observe_ns_per_event.push(observe_elapsed as f64 / traded as f64);
+                        rank_ns.push(rank_elapsed);
+                    }
+                }
+                assert_eq!(rank_ns.len(), SAMPLES);
+                observe_ns_per_event.sort_unstable_by(f64::total_cmp);
+                rank_ns.sort_unstable();
+                let mode = if carried_lot {
+                    "carried"
+                } else {
+                    "fallback_hash"
+                };
+                report.push_str(&format!(
+                    "tracked={CONTRACTS} dirty={traded} returned={expected_len} \
+                     lot={mode} samples={SAMPLES}\n",
+                ));
+                for (label, index) in [
+                    ("p50", percentile_index(50, SAMPLES)),
+                    ("p95", percentile_index(95, SAMPLES)),
+                    ("p99", percentile_index(99, SAMPLES)),
+                    ("max", SAMPLES - 1),
+                ] {
+                    report.push_str(&format!(
+                        "  {label}: observe_batch_avg={:.2} ns/event; rank={} ns ({:.3} us)\n",
+                        observe_ns_per_event[index],
+                        rank_ns[index],
+                        rank_ns[index] as f64 / 1_000.0,
+                    ));
+                }
+            }
+        }
+        println!("{report}");
+    }
+
     #[test]
     fn reset_daily_clears_both_families() {
         // Cumulative volume restarts at 09:00. A leaderboard carried across the
@@ -4411,6 +4826,68 @@ mod tests {
         assert_eq!(tally.unknown, 0);
     }
 
+    #[test]
+    fn gainer_depth_bands_are_independent_and_share_one_verdict_per_name() {
+        use std::cell::Cell;
+
+        let ranked = [
+            stock(1, 10, 800),
+            stock(2, 10, 700),
+            stock(3, 20, 600),
+            stock(4, 30, 500),
+            stock(5, 40, 400),
+            stock(6, 40, 300),
+            stock(7, 50, 200),
+            stock(8, 60, 100),
+        ];
+        let probes = Cell::new(0);
+        let selected = gainer_eligible_for_depth(&ranked, 2, 3, |underlying| {
+            probes.set(probes.get() + 1);
+            match underlying {
+                10 | 40 | 50 => GainerVerdict::Gainer,
+                20 => GainerVerdict::NotGainer,
+                30 => GainerVerdict::Unknown,
+                _ => panic!("both bands were full before this name"),
+            }
+        });
+        let ids =
+            |rows: &[RankedContract]| rows.iter().map(|row| row.security_id).collect::<Vec<_>>();
+        assert_eq!(ids(&selected.contracts), vec![1, 2]);
+        assert_eq!(ids(&selected.underlyings), vec![1, 5, 7]);
+        assert_eq!(probes.get(), 5);
+        assert_eq!(
+            selected.tally,
+            GainerTally {
+                gainer: 5,
+                not_gainer: 1,
+                unknown: 1
+            }
+        );
+    }
+
+    #[test]
+    fn gainer_depth_bands_handle_empty_zero_and_unfilled_limits() {
+        let ranked = [stock(1, 10, 3), stock(2, 20, 2), stock(3, 10, 1)];
+        for (contracts, underlyings, expected_contracts, expected_underlyings) in [
+            (0, 0, 0, 0),
+            (0, usize::MAX, 0, 2),
+            (usize::MAX, 0, 3, 0),
+            (3, 1, 3, 1),
+            (1, 3, 1, 2),
+        ] {
+            let selected = gainer_eligible_for_depth(&ranked, contracts, underlyings, |_| {
+                GainerVerdict::Gainer
+            });
+            assert_eq!(selected.contracts.len(), expected_contracts);
+            assert_eq!(selected.underlyings.len(), expected_underlyings);
+        }
+        let empty = gainer_eligible_for_depth(&[], usize::MAX, usize::MAX, |_| {
+            panic!("empty input must not probe a name")
+        });
+        assert!(empty.contracts.is_empty() && empty.underlyings.is_empty());
+        assert_eq!(empty.tally, GainerTally::default());
+    }
+
     /// The memo: a stock's many strikes share one verdict, so the store is
     /// probed once per underlying, not once per row — and on a down day the
     /// walk still reaches the end of the population without a probe per row.
@@ -4493,3 +4970,6 @@ mod tests {
         assert_eq!(gainers[0].security_id, 251);
     }
 }
+
+#[cfg(test)]
+mod optimization_tests;

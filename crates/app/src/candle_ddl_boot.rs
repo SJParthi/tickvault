@@ -10,7 +10,7 @@
 //!   the movers grid), marker-gated + versioned.
 //! - [`tickvault_storage::shadow_persistence::ensure_shadow_candle_tables`]
 //!   — `CREATE TABLE IF NOT EXISTS candles_<tf>` + `DEDUP ENABLE UPSERT
-//!   KEYS` for all 21 Engine-B candle tables.
+//!   KEYS` for the ten active candle tables, including the new 10m table.
 //! - [`tickvault_storage::console_views::ensure_named_views`] — the
 //!   read-only analyst console views.
 //!
@@ -33,10 +33,9 @@
 //! `build_shared_infra` AWAITS this fn INLINE, BEFORE
 //! `spawn_seal_writer_loop` installs the process-wide seal sender — so the
 //! candle DDL (with DEDUP) lands before the first fold seal can reach ILP.
-//! Worst-case inline cost is the 60s probe bound; on probe exhaustion the
-//! DDL is SKIPPED LOUDLY (attempting 45+ DROP/CREATE HTTP calls against a
-//! down QuestDB would serialize ~10s timeouts each into a multi-minute
-//! boot stall for zero benefit) and the next boot retries.
+//! Probe and ensure retries are bounded. Exhaustion returns a startup error
+//! before the seal writer or candle producers start, preventing ILP from
+//! inventing a candle schema without its basis metadata or DEDUP key.
 
 use tickvault_common::config::QuestDbConfig;
 use tracing::{error, info, warn};
@@ -47,11 +46,8 @@ pub const CANDLE_DDL_READINESS_ATTEMPTS: u32 = 12;
 
 /// Attempts at the candle-table ensure before the boot gives up.
 ///
-/// Six attempts five seconds apart is thirty seconds — deliberately the SAME
-/// bound as [`LIVE_TABLE_DDL_ATTEMPTS`], because it answers the same question
-/// about the same database. Not unbounded: a QuestDB that will not accept a
-/// `CREATE TABLE` in half a minute is the boot-probe escalation codes' problem,
-/// and holding the boot behind it would turn a schema gap into a dark session.
+/// Matches [`LIVE_TABLE_DDL_ATTEMPTS`]. These bounds limit retries and backoff;
+/// each DDL call also has its own HTTP timeout. Exhaustion fails startup.
 pub const CANDLE_ENSURE_ATTEMPTS: u32 = 6;
 /// Seconds between candle-ensure attempts.
 pub const CANDLE_ENSURE_BACKOFF_SECS: u64 = 5;
@@ -61,16 +57,13 @@ pub const CANDLE_DDL_READINESS_BACKOFF_SECS: u64 = 5;
 /// Run the retired-object sweep + candle-table ensure DDL + named views,
 /// gated on a bounded quiet readiness probe.
 ///
-/// Degrade-safe, never blocks boot indefinitely:
+/// The caller must propagate failure before starting any candle writer:
 /// - probe client build failure → proceed to the DDL anyway (the DDL fns
-///   build their own clients and degrade per HTTP-CLIENT-01);
-/// - probe exhausted (QuestDB down) → SKIP the DDL loudly and return —
-///   the first ILP write may then auto-create `candles_*` WITHOUT DEDUP
-///   UPSERT KEYS (duplicate-row window until a later boot's ensure
-///   succeeds); the drop-sweep marker is not written, so the sweep also
-///   retries next boot.
+///   build their own clients and their success remains mandatory);
+/// - probe or table-ensure exhaustion → return an error, retaining existing
+///   disk recovery records for a later successful startup.
 // TEST-EXEMPT: network I/O orchestration — the call order + boot wiring are pinned by crates/app/tests/ensure_ddl_boot_wiring_guard.rs; the probe-bound constants are unit-tested below; the underlying DDL fns carry their own unit tests in tickvault-storage.
-pub async fn run_candle_ddl_at_boot(questdb: &QuestDbConfig) {
+pub async fn run_candle_ddl_at_boot(questdb: &QuestDbConfig) -> anyhow::Result<()> {
     let probe_url = format!(
         "http://{}:{}/exec?query=SELECT%201",
         questdb.host, questdb.http_port
@@ -112,13 +105,10 @@ pub async fn run_candle_ddl_at_boot(questdb: &QuestDbConfig) {
             attempts = CANDLE_DDL_READINESS_ATTEMPTS,
             backoff_secs = CANDLE_DDL_READINESS_BACKOFF_SECS,
             "candle DDL boot: QuestDB not ready within the quiet probe bound — \
-             candle DDL SKIPPED this boot. Consequence: if the candle tables do \
-             not exist yet, the first ILP write may auto-create them WITHOUT \
-             DEDUP UPSERT KEYS (duplicate-row window until a later boot's ensure \
-             succeeds). The retired-object sweep marker is not written, so the \
-             sweep also retries next boot."
+             startup refused before candle writers; retained recovery files \
+             will be retried on a later successful startup"
         );
-        return;
+        anyhow::bail!("candle schema readiness probe exhausted; candle writers cannot start");
     }
 
     // Order is load-bearing (the pre-#1522 main.rs contract): the drop
@@ -168,21 +158,25 @@ pub async fn run_candle_ddl_at_boot(questdb: &QuestDbConfig) {
         error!(
             code = tickvault_common::error_code::ErrorCode::HotPath02WriterQueueDrop.code_str(),
             attempts = CANDLE_ENSURE_ATTEMPTS,
-            "candle DDL boot: candle tables NOT confirmed keyed after every \
-             attempt. Consequence: any candle table that does not exist will be \
-             auto-created by the first ILP row WITHOUT its DEDUP UPSERT KEYS, \
-             and every replayed bar then duplicates into it instead of \
-             collapsing — silently, for the life of that table. The next boot \
-             re-runs this ensure; a table already created key-less is NOT \
-             repaired by it."
+            "candle DDL boot: required candle schema, volume basis metadata or \
+             DEDUP key was not established after every attempt — startup \
+             refused before candle writers"
+        );
+        anyhow::bail!(
+            "required candle schema or DEDUP ensure exhausted; candle writers cannot start"
         );
     }
 
-    tickvault_storage::console_views::ensure_named_views(questdb).await;
+    if !tickvault_storage::console_views::ensure_named_views(questdb).await {
+        anyhow::bail!(
+            "required Top Volume projections did not converge; candle writers cannot start"
+        );
+    }
     info!(
         keyed,
-        "candle DDL boot complete — retired-object sweep + candle ensure attempted + named views"
+        "candle DDL boot complete — required candle schema and four Top Volume projections accepted before writer startup"
     );
+    Ok(())
 }
 
 /// Attempts at the `ticks` + `market_depth` DDL before the boot gives up.
@@ -281,16 +275,22 @@ pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
             // validate against those tables), and every statement here is
             // `CREATE OR REPLACE`, so a second pass on an already-correct view
             // is free. Additive beats re-ordering on a boot path.
-            tickvault_storage::console_views::ensure_named_views(questdb).await;
+            if !tickvault_storage::console_views::ensure_named_views(questdb).await {
+                error!(
+                    code =
+                        tickvault_common::error_code::ErrorCode::CandleSchema01Refused.code_str(),
+                    "required Top Volume projections failed during the view re-ensure"
+                );
+                return false;
+            }
         }
         if ticks_ok && depth_ok && rank_ok {
             info!(
                 attempt,
                 "live-table DDL boot complete — ticks (5-key DEDUP) + market_depth \
                  (depth_kind DEDUP) + top_volume_rank (6-key DEDUP) ensured. The named \
-                 views were then RE-ATTEMPTED against the now-existing rank table; \
-                 that call reports its own outcome per view and returns nothing, so \
-                 this line claims the attempt, never its success."
+                 four primary Top Volume projections were confirmed. Optional analyst \
+                 and legacy views report their own individual outcomes."
             );
             return true;
         }
@@ -357,8 +357,8 @@ mod tests {
     ///
     /// A source pin rather than a behavioural one, because the ensure needs a
     /// live QuestDB. It asserts the three things that make the retry real: the
-    /// loop exists over the bound, the verdict is consulted, and the exhausted
-    /// path is a coded `error!` rather than a silent continue.
+    /// loop exists over the bound, the verdict is consulted, and exhaustion
+    /// returns an error before creating views or starting writers.
     #[test]
     fn the_candle_boot_retries_the_ensure_and_reports_exhaustion() {
         let src = include_str!("candle_ddl_boot.rs");
@@ -394,6 +394,33 @@ mod tests {
              same code the live-table exhaustion arm uses for the same \
              consequence"
         );
+        let exhausted = body
+            .split_once("if !keyed {")
+            .expect("ensure exhaustion branch")
+            .1
+            .split_once("console_views::ensure_named_views(questdb).await")
+            .expect("views remain after the readiness barrier")
+            .0;
+        assert!(
+            exhausted.contains("anyhow::bail!("),
+            "exhausted candle DDL must return an error before views and writer startup"
+        );
+    }
+
+    /// A down database must fail startup, so no caller can mistake a skipped
+    /// ensure for permission to start ILP. Backoffs use paused test time.
+    #[tokio::test(start_paused = true)]
+    async fn candle_ddl_probe_exhaustion_returns_a_startup_error() {
+        let questdb = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        let error = run_candle_ddl_at_boot(&questdb)
+            .await
+            .expect_err("unavailable QuestDB cannot authorize candle writer startup");
+        assert!(error.to_string().contains("readiness probe exhausted"));
     }
 
     /// Against a port nothing listens on, every attempt fails, the loop

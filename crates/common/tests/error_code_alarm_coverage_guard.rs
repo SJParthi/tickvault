@@ -185,6 +185,17 @@ fn high_or_critical() -> Vec<ErrorCode> {
 ///     which is a legitimate leg of the documented paging OR but is not
 ///     mechanically discoverable, so it must be recorded here by hand.
 const LOG_SINK_ONLY_EXEMPT: &[&str] = &[
+    // 2026-09-15: explicit classifications for the new refusal diagnostics.
+    // These ERROR logs name evidence that must be reviewed before resuming.
+    // No dedicated paging route is claimed or silently added to the AWS bill.
+    // Actual frame loss still increments the existing durable-floor counters
+    // and emits WS-SPILL-02; failed boot readiness is independently watched.
+    // Those routes do not cover every sequence/replay/ranking/schema refusal.
+    // See runtime-recovery-error-codes.md for the exact delivery boundary.
+    "WAL-SEQUENCE-01",
+    "WAL-RECOVERY-01",
+    "CANDLE-SCHEMA-01",
+    "CANDLE-RANK-01",
     // Seeded 2026-08-10 by running this guard against the live tree and pasting
     // its own failure output. Deliberately NOT annotated with 90 individually
     // researched reasons: inventing a plausible-sounding justification per line

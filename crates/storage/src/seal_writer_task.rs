@@ -45,7 +45,7 @@
 //! hot-path zero-alloc rule applies to `MultiTfAggregator::consume_tick`
 //! and below, NOT to the storage drain task.
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Seek};
 use std::path::{Path, PathBuf};
 
 use tracing::{error, info, warn};
@@ -55,6 +55,7 @@ use tickvault_trading::candles::BufferedSeal;
 
 use crate::seal_absorption::{SealAbsorptionPipeline, SubmitOutcome};
 use crate::seal_dlq::SealDlqRecord;
+use crate::seal_recovery_guard::{MAX_RECOVERY_BATCH, RecoveredBatch, RecoveryRefusal};
 use crate::seal_spill::{SEAL_SPILL_RECORD_SIZE, SerializedSeal};
 use crate::shadow_candle_writer::ShadowCandleWriter;
 
@@ -302,36 +303,40 @@ fn rescue_one(
 //    `<dir>/replaying/`. Leftovers already sitting in `replaying/` from a
 //    prior crashed boot are re-globbed too, so a crash mid-recovery loses
 //    nothing.
-// 2. **Re-ingest.** Records are decoded and appended straight into the ILP
-//    writer, flushed in bounded batches.
-// 3. **Confirm.** ONLY after a successful flush does the file move
+// 2. **Reconcile.** Completely decoded originals enter bounded batches.
+//    Applied database rows are read before writes: missing keys may insert,
+//    exact full-row duplicates are skipped, and differing rows are refused.
+// 3. **Confirm.** ONLY after WAL application and full-row readback does a file move
 //    `replaying/` → `archive/`. `archive/` is never re-globbed, so confirmed
 //    history never re-injects.
 // 4. **Fail-closed.** A failed flush leaves the file in `replaying/` and
 //    STOPS the drain (QuestDB is down; the next file would just burn another
 //    bounded flush timeout). Next boot re-globs it.
 //
-// ## Why this is idempotent
+// ## Recovery does not invent cross-process revision ordering
 //
-// Two independent layers, because either one alone is insufficient:
-//
-// - **File side:** a file is in exactly ONE of `replaying/` (not yet
-//   confirmed) or `archive/` (confirmed). The rename is the commit point, so
-//   a crash anywhere re-reads at most the one in-flight file — never a file
-//   already archived. Recovered seals are deliberately NOT re-submitted into
+// - **File side:** no-replace moves publish a hard link before removing the
+//   source. An interrupted move can leave both names, with no original bytes
+//   replaced. An extra name can be replayed again; DEDUP prevents duplicate
+//   keys, but cannot prevent an older revision replacing a newer row.
+//   Recovered seals are deliberately NOT re-submitted into
 //   the absorption pipeline: doing so would let a still-dead QuestDB rescue
 //   them into a FRESH spill file while the staged copy also survives,
 //   multiplying the on-disk set on every failed boot.
-// - **DB side:** the candle tables' DEDUP UPSERT KEYS
-//   `(ts, security_id, segment, feed)` collapse a re-ingest of the same seal,
-//   which covers the residual window where a flush commits server-side but
-//   the process dies before the archive rename.
+// - **DB side:** candle DEDUP UPSERT KEYS `(ts, security_id, segment, feed)`
+//   use last-write-wins, so recovery never intentionally overwrites a present
+//   key. bucket_revision restarts with the aggregator and cannot order boots.
+//   The boot producer barrier excludes the managed live writer; independent
+//   concurrent writers are unsupported because SQL reads + ILP are not an
+//   atomic compare-and-insert. Readback proves applied equality, not a
+//   hardware/power-loss guarantee. Archived originals remain retained.
 //
 // ## Honesty (Rule 11 — no false-OK)
 //
 // `seals_left_pending` is reported to the caller and surfaced as a counter +
-// an `error!`. Seals sitting in `replaying/` are on DISK and NOT in QuestDB;
-// this module never reports them as absorbed.
+// an `error!`. Seals sitting in `replaying/` are not confirmed in QuestDB;
+// some may already be present after a partial ACK. Retention proves neither
+// absence nor the winning revision in the database.
 
 /// Staging directory for files that have been read back but whose re-ingest
 /// is not yet confirmed. Re-globbed on every boot until confirmed.
@@ -341,7 +346,7 @@ pub const SEAL_REPLAYING_SUBDIR: &str = "replaying";
 /// never re-inject.
 pub const SEAL_ARCHIVE_SUBDIR: &str = "archive";
 
-/// Filename prefix shared by both the spill (`.bin`) and DLQ (`.ndjson`)
+/// Filename prefix shared by legacy and versioned spill/DLQ records
 /// daily files (`seals-YYYY-MM-DD.*`).
 const SEAL_FILE_PREFIX: &str = "seals-";
 
@@ -351,19 +356,50 @@ const SEAL_FILE_PREFIX: &str = "seals-";
 pub struct BootDrainOutcome {
     /// Files moved into (or already sitting in) `replaying/` this pass.
     pub files_staged: usize,
-    /// Records successfully decoded off disk.
+    /// Active-timeframe records successfully decoded off disk.
     pub seals_recovered: usize,
-    /// Recovered seals that a successful flush committed to QuestDB.
+    /// Recovered records confirmed equal to applied QuestDB rows (new inserts
+    /// plus already identical rows). HTTP acceptance alone does not count.
     pub seals_reingested: usize,
+    /// Confirmed records skipped because the persisted payload matched,
+    /// including recognized 18-column legacy duplicates whose added fields
+    /// remain NULL. Included in seals_reingested; no new ILP row was sent.
+    pub seals_already_present: usize,
     /// Files confirmed and moved to `archive/`.
     pub files_archived: usize,
-    /// Files still in `replaying/` (flush failed or never attempted).
+    /// Known files still in `replaying/` (flush failed or never attempted).
     pub files_left_pending: usize,
-    /// Seals still on disk and NOT in QuestDB. The honest loss-risk number.
+    /// Known decoded seals not confirmed in QuestDB. A failed stream leaves
+    /// an unread tail, whose additional record count is explicitly unknown.
     pub seals_left_pending: usize,
-    /// Records that could not be decoded (corrupt tail / legacy format /
-    /// unknown timeframe ordinal). Their bytes survive in `archive/`.
+    /// Undecodable records or damaged boundaries. Their originals remain
+    /// pending; a damaged suffix can contain an unknown number of records.
     pub records_undecodable: usize,
+    /// Decoded records belonging to intentionally retired timeframes. They
+    /// are known pending history, not corruption; their originals are retained.
+    pub records_retired_timeframe: usize,
+    /// Whole originals deferred before any sink append because they contain
+    /// retired history. Active siblings are pending too, preventing an old
+    /// revision from overwriting a later correction on a subsequent boot.
+    pub files_deferred_retired_timeframe: usize,
+    /// Whole originals deferred before any sink append because their records,
+    /// framing, complete read or rewind could not be verified. These originals
+    /// must be repaired/reconciled before replaying even their valid siblings.
+    pub files_deferred_invalid: usize,
+    /// Whole originals retained after a valid key matched differing stored
+    /// values. Revision magnitude is never used to override a conflict.
+    pub files_deferred_conflict: usize,
+    /// Recovery was invoked without the managed-writer boot exclusion.
+    pub files_deferred_ordering_unverified: usize,
+    /// The runner was already recovered or started live processing, so no
+    /// staging inspection was allowed under a false boot-exclusion claim.
+    pub ordering_exclusion_unverified: bool,
+    /// Directory/entry inspection or staging failures. Zero known files does
+    /// not mean an empty backlog when discovery was incomplete.
+    pub discovery_errors: usize,
+    /// At least one retained file/directory was not completely decoded or
+    /// inspected. The numeric pending counters are only lower bounds then.
+    pub pending_count_unknown: bool,
 }
 
 impl BootDrainOutcome {
@@ -371,13 +407,16 @@ impl BootDrainOutcome {
     #[must_use]
     pub const fn is_clean(&self) -> bool {
         self.files_staged == 0
+            && self.discovery_errors == 0
+            && !self.pending_count_unknown
+            && !self.ordering_exclusion_unverified
     }
 }
 
 /// Which on-disk format a staged file carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StagedKind {
-    /// Fixed 128-byte binary records (`SealSpillWriter`).
+    /// Versioned 128/176-byte binary records (`SealSpillWriter`).
     Spill,
     /// NDJSON lines (`SealDlqWriter`).
     Dlq,
@@ -386,64 +425,66 @@ enum StagedKind {
 /// Moves every `seals-*` file in `dir` into `dir/replaying/` and returns the
 /// full staged set (including leftovers from a prior crashed boot).
 ///
-/// A file that cannot be moved is skipped with a `warn!` and left in place —
-/// it is retried on the next boot. Never deletes, never loses.
-fn stage_pending_files(dir: &Path) -> Vec<PathBuf> {
-    if !dir.exists() {
-        return Vec::new();
+/// Discovery and staging failures are returned, never flattened into an empty
+/// backlog. All directory entries are inspected before moving any live file.
+fn stage_pending_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let live = list_seal_files(dir, true)?;
+    if live.is_empty() && !dir.try_exists()? {
+        return Ok(Vec::new());
     }
     let replaying = dir.join(SEAL_REPLAYING_SUBDIR);
-    if let Err(err) = std::fs::create_dir_all(&replaying) {
-        warn!(?replaying, ?err, "cannot create seal replay staging dir");
-        return Vec::new();
+    std::fs::create_dir_all(&replaying)?;
+    // Refuse an unreadable pre-existing staging directory before moving any
+    // live originals. The final listing also detects later inspection errors.
+    let _ = list_seal_files(&replaying, false)?;
+    for path in live {
+        crate::seal_spill::move_seal_file_no_replace(&path, &replaying)?;
     }
-
-    // Move live files into staging. `rename` within one directory tree is
-    // atomic, so a crash leaves the file in exactly one of the two places.
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !is_seal_file(&path) {
-                continue;
-            }
-            let Some(name) = path.file_name() else {
-                continue;
-            };
-            let target = replaying.join(name);
-            if target.exists() {
-                // A same-named leftover is already staged (prior crashed
-                // boot). Keep BOTH: park the live one under a free name
-                // rather than clobbering un-recovered records.
-                let target = free_path(&replaying, name);
-                if let Err(err) = std::fs::rename(&path, &target) {
-                    warn!(?path, ?err, "cannot stage seal file — retried next boot");
-                }
-                continue;
-            }
-            if let Err(err) = std::fs::rename(&path, &target) {
-                warn!(?path, ?err, "cannot stage seal file — retried next boot");
-            }
-        }
-    }
-
-    // Re-glob the staging dir: this pass's moves PLUS any unconfirmed
-    // leftovers. Sorted so recovery is deterministic (oldest date first).
-    let mut staged: Vec<PathBuf> = std::fs::read_dir(&replaying)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| is_seal_file(p))
-        .collect();
-    staged.sort();
-    staged
+    list_seal_files(&replaying, false)
 }
 
-/// `true` for a regular file named `seals-*.bin` or `seals-*.ndjson`.
-fn is_seal_file(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
+fn list_seal_files(dir: &Path, absent_is_empty: bool) -> std::io::Result<Vec<PathBuf>> {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => collect_seal_files(entries),
+        Err(error) if absent_is_empty && error.kind() == std::io::ErrorKind::NotFound => {
+            // A dangling link is an inspection failure, not an absent fresh
+            // directory. Only an actual absent pathname is a clean no-op.
+            match std::fs::symlink_metadata(dir) {
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+                _ => Err(error),
+            }
+        }
+        Err(error) => Err(error),
     }
+}
+
+fn collect_seal_files(
+    entries: impl IntoIterator<Item = std::io::Result<std::fs::DirEntry>>,
+) -> std::io::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        // Propagate per-entry metadata failures even when another entry was
+        // readable. Never return an incomplete list as a complete discovery.
+        let file_type = entry.file_type()?;
+        if is_seal_name(&path) {
+            if !file_type.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "seal recovery name does not identify a regular file",
+                ));
+            }
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+/// Recognizes legacy, v3 and v4 spill/DLQ names, including repeated collision
+/// suffixes. Filesystem inspection belongs to the fallible discovery function.
+fn is_seal_name(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
@@ -454,114 +495,352 @@ fn is_seal_file(path: &Path) -> bool {
 /// (`seals-2026-08-11.bin.1`) keep their kind via the embedded extension.
 fn staged_kind(path: &Path) -> Option<StagedKind> {
     let name = path.file_name().and_then(|n| n.to_str())?;
-    // Split off any `.N` collision suffix before classifying.
-    let base = name.rsplit_once('.').map_or(name, |(head, tail)| {
-        if tail.chars().all(|c| c.is_ascii_digit()) && !tail.is_empty() {
-            head
-        } else {
-            name
+    // A file can collide at staging and again at archive. Every numeric
+    // suffix must remain discoverable. Recognize the historical broken
+    // `.overflow` fallback too, but the no-replace mover never creates it.
+    let mut base = name;
+    while let Some((head, tail)) = base.rsplit_once('.') {
+        if tail != "overflow" && (tail.is_empty() || !tail.bytes().all(|c| c.is_ascii_digit())) {
+            break;
         }
-    });
-    if base.ends_with(".bin") {
-        Some(StagedKind::Spill)
-    } else if base.ends_with(".ndjson") {
-        Some(StagedKind::Dlq)
-    } else {
-        None
+        base = head;
+    }
+    match base.rsplit_once('.').map(|(_, extension)| extension) {
+        Some(
+            "bin"
+            | crate::seal_spill::SEAL_SPILL_V3_EXTENSION
+            | crate::seal_spill::SEAL_SPILL_V4_EXTENSION,
+        ) => Some(StagedKind::Spill),
+        Some(
+            "ndjson"
+            | crate::seal_dlq::SEAL_DLQ_V3_EXTENSION
+            | crate::seal_dlq::SEAL_DLQ_V4_EXTENSION,
+        ) => Some(StagedKind::Dlq),
+        _ => None,
     }
 }
 
-/// Returns `dir/name`, appending `.1`, `.2`, … until the path is free.
-/// Bounded so a pathological directory cannot spin forever.
-fn free_path(dir: &Path, name: &std::ffi::OsStr) -> PathBuf {
-    let base = dir.join(name);
-    if !base.exists() {
-        return base;
-    }
-    let stem = name.to_string_lossy().into_owned();
-    for suffix in 1..10_000u32 {
-        let candidate = dir.join(format!("{stem}.{suffix}"));
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    dir.join(format!("{stem}.overflow"))
+/// Recovery accepts the current fixed-field DLQ JSON within a finite line
+/// budget. Current writers emit numeric fields and a short known feed name;
+/// oversized/corrupt/future records remain in the original for inspection.
+/// The cap bounds memory, not the time needed to skip a damaged long line.
+const SEAL_DLQ_RECORD_MAX_BYTES: usize = 16 * 1024;
+
+/// One bounded decoding step. A damaged binary boundary cannot be guessed;
+/// a damaged NDJSON line can safely resume after its newline delimiter.
+enum StagedRead {
+    Record(SerializedSeal),
+    Undecodable { terminal: bool },
+    Eof,
 }
 
-/// Decodes every fixed-size record in a staged spill file.
-/// Returns `(records, undecodable_count)`.
-fn read_staged_spill(path: &Path) -> Option<(Vec<SerializedSeal>, usize)> {
-    let Ok(file) = std::fs::File::open(path) else {
-        // `None`, NOT an empty vec. Until 2026-08-21 both arms returned
-        // `(Vec::new(), 0)`, which is indistinguishable from "read fine, found
-        // nothing" — so the caller archived the file as fully recovered and
-        // the seals inside it were lost permanently, with a success line in
-        // the boot log. The caller now refuses to archive on `None`.
-        warn!(?path, "cannot open staged spill file");
-        return None;
-    };
-    let mut reader = BufReader::new(file);
-    let mut out = Vec::new();
-    let mut undecodable = 0usize;
-    let mut buf = [0u8; SEAL_SPILL_RECORD_SIZE];
-    // The loop ends on the first read error, which is either a clean EOF or a
-    // truncated trailing record (a torn write at the moment of the crash).
-    // Either way nothing further in the file is readable.
-    while reader.read_exact(&mut buf).is_ok() {
-        // Same format-version gate as `SealSpillWriter::read_all`: a byte-7 of
-        // 0 is a pre-renumber record whose tf ordinal lives in the OLD
-        // 12-frame space and would silently mis-decode.
-        if buf[7] == 0 {
-            undecodable += 1;
-            continue;
+/// Read one DLQ line with fixed storage. Bytes past the limit are consumed
+/// without allocation until newline/EOF so a later valid line can recover.
+/// `None` means clean EOF before any byte, not an oversized or unreadable row.
+fn read_bounded_dlq_line<R: BufRead>(
+    reader: &mut R,
+    line: &mut [u8; SEAL_DLQ_RECORD_MAX_BYTES],
+) -> std::io::Result<Option<(usize, bool)>> {
+    let mut used = 0usize;
+    let mut oversized = false;
+    let mut saw_bytes = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(saw_bytes.then_some((used, oversized)));
         }
-        match SerializedSeal::from_bytes(&buf) {
-            Some(seal) => out.push(seal),
-            None => undecodable += 1,
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let payload_len = newline.unwrap_or(available.len());
+        let consumed = payload_len + usize::from(newline.is_some());
+        let copied = payload_len.min(line.len() - used);
+        line[used..used + copied].copy_from_slice(&available[..copied]);
+        used += copied;
+        oversized |= copied != payload_len;
+        reader.consume(consumed);
+        saw_bytes = true;
+        if newline.is_some() {
+            return Ok(Some((used, oversized)));
         }
     }
-    Some((out, undecodable))
 }
 
-/// Decodes every NDJSON line in a staged DLQ file.
-/// Returns `(records, undecodable_count)`.
-fn read_staged_dlq(path: &Path) -> Option<(Vec<SerializedSeal>, usize)> {
-    let Ok(file) = std::fs::File::open(path) else {
-        warn!(?path, "cannot open staged dlq file");
-        return None;
-    };
-    let mut out = Vec::new();
-    let mut undecodable = 0usize;
-    for line in BufReader::new(file).lines() {
-        let Ok(line) = line else {
-            undecodable += 1;
-            continue;
+fn read_staged_record<R: BufRead>(
+    reader: &mut R,
+    kind: StagedKind,
+    binary: &mut [u8; SEAL_SPILL_RECORD_SIZE],
+    line: &mut [u8; SEAL_DLQ_RECORD_MAX_BYTES],
+) -> std::io::Result<StagedRead> {
+    match kind {
+        StagedKind::Spill => {
+            match crate::seal_spill::read_full_record(reader, binary).map_err(|error| {
+                let kind = error
+                    .downcast_ref::<std::io::Error>()
+                    .map_or(std::io::ErrorKind::InvalidData, std::io::Error::kind);
+                std::io::Error::new(kind, error)
+            })? {
+                Some(size) => Ok(match SerializedSeal::from_bytes(&binary[..size]) {
+                    Some(seal) => StagedRead::Record(seal),
+                    None => StagedRead::Undecodable { terminal: true },
+                }),
+                None => Ok(StagedRead::Eof),
+            }
+        }
+        StagedKind::Dlq => loop {
+            let Some((used, oversized)) = read_bounded_dlq_line(reader, line)? else {
+                return Ok(StagedRead::Eof);
+            };
+            if oversized {
+                return Ok(StagedRead::Undecodable { terminal: false });
+            }
+            if line[..used].iter().all(|byte| byte.is_ascii_whitespace()) {
+                continue;
+            }
+            return Ok(
+                match serde_json::from_slice::<SealDlqRecord>(&line[..used]) {
+                    Ok(record) => StagedRead::Record(SerializedSeal::from(&record)),
+                    Err(_) => StagedRead::Undecodable { terminal: false },
+                },
+            );
+        },
+    }
+}
+
+#[derive(Default)]
+struct StagedPreflight {
+    records_decoded: usize,
+    active_records: usize,
+    retired_records: usize,
+    records_undecodable: usize,
+    reached_eof: bool,
+    io_failed: bool,
+}
+
+impl StagedPreflight {
+    fn pending_unknown(&self) -> bool {
+        !self.reached_eof || self.records_undecodable != 0
+    }
+
+    fn defers_whole_file(&self) -> bool {
+        self.retired_records != 0 || self.io_failed || self.pending_unknown()
+    }
+}
+
+/// Inspect the entire recognizable original before touching the sink. A
+/// retired/unknown record, malformed boundary, missing EOF or read failure
+/// keeps the whole file pending, including valid active siblings. Replaying
+/// those siblings on every boot could overwrite newer revisions under
+/// last-write-wins database DEDUP. Buffers stay independent of file size.
+fn preflight_staged_stream<R: BufRead>(
+    reader: &mut R,
+    kind: StagedKind,
+    path: &Path,
+) -> StagedPreflight {
+    let mut outcome = StagedPreflight::default();
+    let mut binary = [0u8; SEAL_SPILL_RECORD_SIZE];
+    let mut line = [0u8; SEAL_DLQ_RECORD_MAX_BYTES];
+    loop {
+        match read_staged_record(reader, kind, &mut binary, &mut line) {
+            Ok(StagedRead::Record(record)) => {
+                outcome.records_decoded = outcome.records_decoded.saturating_add(1);
+                if tickvault_trading::candles::TfIndex::is_retired_storage_ordinal(
+                    record.tf_ordinal,
+                ) {
+                    outcome.retired_records = outcome.retired_records.saturating_add(1);
+                } else if record.tf().is_some() {
+                    outcome.active_records = outcome.active_records.saturating_add(1);
+                } else {
+                    outcome.records_undecodable = outcome.records_undecodable.saturating_add(1);
+                }
+            }
+            Ok(StagedRead::Eof) => {
+                outcome.reached_eof = true;
+                return outcome;
+            }
+            Ok(StagedRead::Undecodable { terminal }) => {
+                outcome.records_undecodable = outcome.records_undecodable.saturating_add(1);
+                if terminal {
+                    return outcome;
+                }
+            }
+            Err(error) => {
+                // Both framing failures and native I/O failures defer the
+                // entire original. Keep their reasons separate in diagnostics:
+                // a damaged boundary cannot classify the unread suffix.
+                outcome.io_failed = !matches!(
+                    error.kind(),
+                    std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof
+                );
+                outcome.records_undecodable = outcome.records_undecodable.saturating_add(1);
+                warn!(
+                    ?path,
+                    ?error,
+                    "staged seal preflight incomplete — original remains unconfirmed"
+                );
+                return outcome;
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct StreamReplayOutcome {
+    /// Decoded serialized records, including an unsupported timeframe.
+    records_decoded: usize,
+    /// Decoded records whose timeframe is supported.
+    seals_recovered: usize,
+    seals_reingested: usize,
+    seals_already_present: usize,
+    records_undecodable: usize,
+    records_retired_timeframe: usize,
+    reached_eof: bool,
+    sink_failed: bool,
+    conflict: bool,
+    ordering_unverified: bool,
+}
+
+impl StreamReplayOutcome {
+    fn complete(&self) -> bool {
+        self.reached_eof
+            && !self.sink_failed
+            && !self.conflict
+            && !self.ordering_unverified
+            && self.records_undecodable == 0
+            && self.records_retired_timeframe == 0
+            && self.records_decoded == self.seals_reingested
+    }
+
+    fn pending_unknown(&self) -> bool {
+        !self.reached_eof || self.records_undecodable != 0
+    }
+}
+
+/// Every recovery write passes the separate reconciliation seam. A partial
+/// ACK leaves the unchanged original; the next boot reads applied rows and
+/// skips exact duplicates before attempting the still-missing keys.
+fn flush_recovered_batch<S: SealSink>(
+    writer: &mut S,
+    path: &Path,
+    pending: &mut Vec<BufferedSeal>,
+    outcome: &mut StreamReplayOutcome,
+) -> bool {
+    if pending.is_empty() {
+        return true;
+    }
+    let confirmed = writer.recover_batch(pending);
+    match confirmed {
+        Ok(batch) if batch.inserted.checked_add(batch.identical) == Some(pending.len()) => {
+            outcome.seals_reingested = outcome.seals_reingested.saturating_add(pending.len());
+            outcome.seals_already_present = outcome
+                .seals_already_present
+                .saturating_add(batch.identical);
+            pending.clear();
+            true
+        }
+        other => {
+            let refusal = match other {
+                Err(refusal) => refusal,
+                Ok(_) => RecoveryRefusal::Unconfirmed(anyhow::anyhow!(
+                    "recovery sink returned an incomplete confirmation"
+                )),
+            };
+            outcome.conflict = matches!(&refusal, RecoveryRefusal::Conflict);
+            outcome.ordering_unverified = matches!(&refusal, RecoveryRefusal::OrderingUnverified);
+            outcome.sink_failed = !outcome.conflict;
+            error!(
+                code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                ?refusal,
+                ?path,
+                pending = pending.len(),
+                "seal recovery: batch not confirmed — original retained; no conflicting row is authorized for overwrite"
+            );
+            writer.discard_pending();
+            pending.clear();
+            false
+        }
+    }
+}
+
+/// Stream one staged file. At most `max_batch.clamp(1, MAX_RECOVERY_BATCH)`
+/// seals enter reconciliation, with fixed reader/line buffers.
+/// No allocation grows with file length. Runtime work still scales with bytes,
+/// and neither this loop nor the boot barrier bounds blocking kernel I/O.
+fn replay_staged_stream<S: SealSink, R: BufRead>(
+    writer: &mut S,
+    reader: &mut R,
+    kind: StagedKind,
+    max_batch: usize,
+    path: &Path,
+) -> StreamReplayOutcome {
+    let mut outcome = StreamReplayOutcome::default();
+    let batch = max_batch.clamp(1, MAX_RECOVERY_BATCH);
+    let mut pending = Vec::with_capacity(batch);
+    let mut binary = [0u8; SEAL_SPILL_RECORD_SIZE];
+    let mut line = [0u8; SEAL_DLQ_RECORD_MAX_BYTES];
+    loop {
+        let record = match read_staged_record(reader, kind, &mut binary, &mut line) {
+            Ok(StagedRead::Record(record)) => record,
+            Ok(StagedRead::Eof) => {
+                outcome.reached_eof = true;
+                break;
+            }
+            Ok(StagedRead::Undecodable { .. }) => {
+                outcome.records_undecodable = outcome.records_undecodable.saturating_add(1);
+                break;
+            }
+            Err(error) => {
+                outcome.records_undecodable = outcome.records_undecodable.saturating_add(1);
+                warn!(
+                    ?path,
+                    ?error,
+                    "staged seal stream incomplete — original retained"
+                );
+                break;
+            }
         };
-        if line.trim().is_empty() {
-            continue;
+        outcome.records_decoded = outcome.records_decoded.saturating_add(1);
+        if tickvault_trading::candles::TfIndex::is_retired_storage_ordinal(record.tf_ordinal) {
+            outcome.records_retired_timeframe = outcome.records_retired_timeframe.saturating_add(1);
+            break;
         }
-        match serde_json::from_str::<SealDlqRecord>(&line) {
-            Ok(record) => out.push(SerializedSeal::from(&record)),
-            Err(_) => undecodable += 1,
+        let Some(seal) = record.try_into_buffered_seal() else {
+            outcome.records_undecodable = outcome.records_undecodable.saturating_add(1);
+            break;
+        };
+        outcome.seals_recovered = outcome.seals_recovered.saturating_add(1);
+        pending.push(seal);
+        if pending.len() == batch
+            && !flush_recovered_batch(writer, path, &mut pending, &mut outcome)
+        {
+            return outcome;
         }
     }
-    Some((out, undecodable))
+    // A failure during the second read must not flush its current prefix.
+    // Earlier confirmed batches cannot be undone here. An unchanged retry
+    // skips identical applied rows and refuses conflicts; original bytes stay intact.
+    if !outcome.reached_eof
+        || outcome.records_undecodable != 0
+        || outcome.records_retired_timeframe != 0
+    {
+        if !pending.is_empty() {
+            writer.discard_pending();
+        }
+        return outcome;
+    }
+    flush_recovered_batch(writer, path, &mut pending, &mut outcome);
+    outcome
 }
 
 /// Moves a confirmed file from `replaying/` to `archive/`.
 fn archive_staged(path: &Path) -> std::io::Result<()> {
-    let Some(replaying_dir) = path.parent() else {
-        return Ok(());
-    };
-    let Some(root) = replaying_dir.parent() else {
-        return Ok(());
-    };
+    let root = path.parent().and_then(Path::parent).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "seal archive path has no staging root",
+        )
+    })?;
     let archive = root.join(SEAL_ARCHIVE_SUBDIR);
     std::fs::create_dir_all(&archive)?;
-    let Some(name) = path.file_name() else {
-        return Ok(());
-    };
-    std::fs::rename(path, free_path(&archive, name))
+    crate::seal_spill::move_seal_file_no_replace(path, &archive).map(|_| ())
 }
 
 /// The narrow slice of [`ShadowCandleWriter`] the recovery drain needs.
@@ -572,14 +851,24 @@ fn archive_staged(path: &Path) -> std::io::Result<()> {
 /// half that actually proves seals are re-ingested and files archived —
 /// untestable and therefore unproven.
 ///
-/// Cold path, static dispatch (`impl Trait`), no `dyn`, no allocation.
+/// Cold path, static dispatch (`impl Trait`), with bounded batch allocation.
 pub trait SealSink {
     /// Append one seal to the wire buffer.
     fn append_seal(&mut self, seal: &BufferedSeal) -> anyhow::Result<()>;
     /// Flush the wire buffer to the database.
     fn flush(&mut self) -> anyhow::Result<()>;
-    /// Discard the retained buffer after a failed flush (poison recovery).
+    /// Discard the local retained buffer after a failed append/flush (poison recovery).
     fn discard_pending(&mut self);
+    /// Boot-recovery-only admission, separate from live last-write-wins
+    /// append. Implementations must confirm applied full-row equality or the
+    /// explicit unchanged18-column legacy contract, refusing other differences.
+    /// An unimplemented guard is a retained backlog.
+    fn recover_batch(
+        &mut self,
+        _seals: &[BufferedSeal],
+    ) -> Result<RecoveredBatch, RecoveryRefusal> {
+        Err(RecoveryRefusal::OrderingUnverified)
+    }
 }
 
 impl SealSink for ShadowCandleWriter {
@@ -592,6 +881,27 @@ impl SealSink for ShadowCandleWriter {
     fn discard_pending(&mut self) {
         Self::discard_pending(self);
     }
+    fn recover_batch(&mut self, seals: &[BufferedSeal]) -> Result<RecoveredBatch, RecoveryRefusal> {
+        Self::reconcile_recovered_batch(self, seals)
+    }
+}
+
+/// Transport-only fixture adapter. These sinks own an isolated in-memory
+/// destination; production reconciliation is tested separately against a
+/// conflicting-row/WAL/partial-ACK store in seal_recovery_guard.
+#[cfg(test)]
+pub(crate) fn recover_fixture_batch<S: SealSink + ?Sized>(
+    sink: &mut S,
+    seals: &[BufferedSeal],
+) -> Result<RecoveredBatch, RecoveryRefusal> {
+    for seal in seals {
+        sink.append_seal(seal)?;
+    }
+    sink.flush()?;
+    Ok(RecoveredBatch {
+        inserted: seals.len(),
+        identical: 0,
+    })
 }
 
 /// Boot-time recovery: reads every orphaned spill / DLQ file back and
@@ -600,9 +910,23 @@ impl SealSink for ShadowCandleWriter {
 /// Cold path — runs ONCE at writer-loop startup, before the drain ticker.
 /// Allowed to allocate.
 ///
-/// Stops at the first flush failure (QuestDB is down; the remaining files
-/// stay staged for the next boot) and reports exactly how many seals are
-/// still on disk rather than in the database.
+/// Stops at the first append or flush failure (the remaining files
+/// stay staged for the next boot). Reports known pending counts and explicitly
+/// marks an unknown total when inspection, a damaged suffix, or an unread tail
+/// prevents counting. Record memory is independent of file length; the sink
+/// buffer contains at most `max_batch.clamp(1, MAX_RECOVERY_BATCH)` seals.
+/// Every file is preflighted with fixed buffers before any sink append. A
+/// retired/unknown ID, damaged record, incomplete read or I/O failure defers
+/// its whole original without writing even a valid prefix. An active-only,
+/// completely decoded file is
+/// then rewound on the same open handle and replayed in bounded batches, so
+/// successful recovery normally reads that file twice. Boot ownership excludes
+/// external file mutation between those passes. This framing gate does not
+/// infer a revision order. The separate recovery sink admits absent keys and
+/// exact full-row duplicates only, with WAL+readback confirmation before
+/// archive. A conflict retains the original for reconciliation. This contract
+/// requires the one-time managed-writer boot exclusion; external concurrent
+/// writers are not supported by SQL-read/ILP-write reconciliation.
 pub fn drain_recovered_seals<S: SealSink>(
     writer: &mut S,
     spill_dir: &Path,
@@ -612,9 +936,24 @@ pub fn drain_recovered_seals<S: SealSink>(
     let mut outcome = BootDrainOutcome::default();
     let batch = max_batch.max(1);
 
-    let mut staged = stage_pending_files(spill_dir);
-    if dlq_dir != spill_dir {
-        staged.extend(stage_pending_files(dlq_dir));
+    let mut staged = Vec::new();
+    for directory in [Some(spill_dir), (dlq_dir != spill_dir).then_some(dlq_dir)]
+        .into_iter()
+        .flatten()
+    {
+        match stage_pending_files(directory) {
+            Ok(files) => staged.extend(files),
+            Err(error) => {
+                outcome.discovery_errors += 1;
+                outcome.pending_count_unknown = true;
+                error!(
+                    code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                    ?directory,
+                    ?error,
+                    "seal recovery discovery INCOMPLETE — pending count is unknown; originals retained"
+                );
+            }
+        }
     }
     outcome.files_staged = staged.len();
     if staged.is_empty() {
@@ -629,9 +968,10 @@ pub fn drain_recovered_seals<S: SealSink>(
     let mut halted = false;
     for path in &staged {
         if halted {
-            // QuestDB is down — count the untouched remainder honestly
-            // instead of burning a bounded flush timeout per file.
+            // The sink refused a batch — count known untouched files without
+            // reading their records or retrying the same failed sink per file.
             outcome.files_left_pending += 1;
+            outcome.pending_count_unknown = true;
             continue;
         }
         // A file we could not READ is never a file we may ARCHIVE.
@@ -650,110 +990,144 @@ pub fn drain_recovered_seals<S: SealSink>(
         // every boot. That is the correct trade: loud forever beats silent
         // once, and an operator can inspect and remove a named file, whereas
         // nobody can recover a seal that was archived as if it had landed.
-        let Some((records, undecodable)) = (match staged_kind(path) {
-            Some(StagedKind::Spill) => read_staged_spill(path),
-            Some(StagedKind::Dlq) => read_staged_dlq(path),
-            None => None,
-        }) else {
+        let opened = staged_kind(path)
+            .and_then(|kind| std::fs::File::open(path).ok().map(|file| (kind, file)));
+        let Some((kind, file)) = opened else {
             error!(
                 code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
                 ?path,
-                "seal recovery: staged file could not be read or classified — it is \
-                 NOT archived and stays staged for the next boot. Every seal in it is \
-                 unrecovered. Inspect the file: an unreadable one needs its permissions \
-                 or disk checked, and a file with an unrecognised name does not belong \
-                 in the staging directory at all."
+                "seal recovery: staged file could not be read or classified — original remains pending"
             );
             outcome.files_left_pending += 1;
+            outcome.pending_count_unknown = true;
             continue;
         };
-        outcome.records_undecodable += undecodable;
-        outcome.seals_recovered += records.len();
-        if undecodable > 0 {
-            warn!(
-                ?path,
-                undecodable,
-                "seal recovery: records could not be decoded — bytes retained in archive/"
-            );
-        }
-
-        let mut committed = 0usize;
-        let mut file_ok = true;
-        for chunk in records.chunks(batch) {
-            let mut appended = 0usize;
-            for record in chunk {
-                let Some(seal) = record.try_into_buffered_seal() else {
-                    // Forward-compat guard: unknown tf ordinal.
-                    outcome.records_undecodable += 1;
-                    outcome.seals_recovered = outcome.seals_recovered.saturating_sub(1);
-                    continue;
+        let mut reader = BufReader::new(file);
+        let preflight = preflight_staged_stream(&mut reader, kind, path);
+        let defer_retired = preflight.retired_records != 0;
+        let defer_preflight = preflight.defers_whole_file();
+        let rewind = if defer_preflight {
+            Ok(())
+        } else {
+            reader.rewind()
+        };
+        if defer_preflight || rewind.is_err() {
+            outcome.files_left_pending += 1;
+            outcome.seals_recovered = outcome
+                .seals_recovered
+                .saturating_add(preflight.active_records);
+            outcome.seals_left_pending = outcome
+                .seals_left_pending
+                .saturating_add(preflight.records_decoded);
+            outcome.records_undecodable = outcome
+                .records_undecodable
+                .saturating_add(preflight.records_undecodable);
+            outcome.records_retired_timeframe = outcome
+                .records_retired_timeframe
+                .saturating_add(preflight.retired_records);
+            outcome.pending_count_unknown |= preflight.pending_unknown();
+            if defer_retired {
+                outcome.files_deferred_retired_timeframe += 1;
+                warn!(
+                    ?path,
+                    retired_records = preflight.retired_records,
+                    active_records_deferred = preflight.active_records,
+                    "retired timeframe history: whole original deferred before replay to preserve later database corrections"
+                );
+            } else {
+                outcome.files_deferred_invalid += 1;
+                outcome.pending_count_unknown = true;
+                let reason = if preflight.io_failed {
+                    "io_failure"
+                } else if !preflight.reached_eof {
+                    "incomplete_stream"
+                } else if preflight.records_undecodable != 0 {
+                    "undecodable_record_or_timeframe"
+                } else {
+                    "rewind_failure"
                 };
-                if let Err(append_err) = writer.append_seal(&seal) {
-                    error!(
-                        code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
-                        ?append_err,
-                        security_id = seal.security_id,
-                        "seal recovery: append failed for a recovered seal"
-                    );
-                    continue;
-                }
-                appended += 1;
+                warn!(
+                    ?path,
+                    reason,
+                    active_records_deferred = preflight.active_records,
+                    records_undecodable = preflight.records_undecodable,
+                    error = ?rewind.err(),
+                    "seal recovery: whole original deferred before sink writes — valid siblings remain pending with unverified history"
+                );
             }
-            if appended == 0 {
-                continue;
-            }
-            match writer.flush() {
-                Ok(()) => committed += appended,
-                Err(flush_err) => {
-                    error!(
-                        code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
-                        ?flush_err,
-                        ?path,
-                        pending = records.len().saturating_sub(committed),
-                        "seal recovery: flush failed — file stays staged for the next boot"
-                    );
-                    // Poison-buffer recovery, same reasoning as `drain_once`.
-                    writer.discard_pending();
-                    file_ok = false;
-                    break;
-                }
-            }
+            continue;
         }
-
-        outcome.seals_reingested += committed;
-
-        if file_ok {
+        let replay = replay_staged_stream(writer, &mut reader, kind, batch, path);
+        drop(reader);
+        outcome.records_undecodable = outcome
+            .records_undecodable
+            .saturating_add(replay.records_undecodable);
+        outcome.records_retired_timeframe = outcome
+            .records_retired_timeframe
+            .saturating_add(replay.records_retired_timeframe);
+        outcome.seals_recovered = outcome
+            .seals_recovered
+            .saturating_add(replay.seals_recovered);
+        outcome.seals_reingested = outcome
+            .seals_reingested
+            .saturating_add(replay.seals_reingested);
+        outcome.seals_already_present = outcome
+            .seals_already_present
+            .saturating_add(replay.seals_already_present);
+        outcome.files_deferred_conflict += usize::from(replay.conflict);
+        outcome.files_deferred_ordering_unverified += usize::from(replay.ordering_unverified);
+        outcome.pending_count_unknown |= replay.pending_unknown();
+        halted = replay.sink_failed;
+        if replay.complete() {
             match archive_staged(path) {
                 Ok(()) => outcome.files_archived += 1,
                 Err(err) => {
-                    // Re-ingest succeeded but the rename did not. The file
-                    // stays staged; the next boot re-reads it and QuestDB's
-                    // DEDUP keys collapse the duplicate rows.
-                    warn!(?path, ?err, "seal recovery: archive rename failed");
-                    outcome.files_left_pending += 1;
+                    // A failed no-replace move/barrier retains the bytes at
+                    // source, destination or both. A remaining staged name
+                    // can replay again; the guard rechecks full-row equality
+                    // and skips identical data rather than blindly resending.
+                    warn!(?path, ?err, "seal recovery: archive move not confirmed");
+                    outcome.pending_count_unknown = true;
+                    if std::fs::symlink_metadata(path).is_ok() {
+                        outcome.files_left_pending += 1;
+                    }
                 }
             }
         } else {
             outcome.files_left_pending += 1;
-            outcome.seals_left_pending += records.len().saturating_sub(committed);
-            halted = true;
+            outcome.seals_left_pending = outcome.seals_left_pending.saturating_add(
+                replay
+                    .records_decoded
+                    .saturating_sub(replay.seals_reingested),
+            );
+            // Corruption does not strand other healthy files. A sink failure
+            // stops this pass without decoding unbounded unread tails merely
+            // to supply a precise count that is already marked unknown.
         }
     }
 
-    if outcome.files_left_pending > 0 {
+    if outcome.files_left_pending > 0 || outcome.pending_count_unknown {
         error!(
             code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
             files_pending = outcome.files_left_pending,
             seals_pending = outcome.seals_left_pending,
             seals_reingested = outcome.seals_reingested,
-            "seal recovery INCOMPLETE — sealed candles are on DISK and NOT in QuestDB"
+            discovery_errors = outcome.discovery_errors,
+            pending_count_unknown = outcome.pending_count_unknown,
+            records_retired_timeframe = outcome.records_retired_timeframe,
+            files_deferred_retired_timeframe = outcome.files_deferred_retired_timeframe,
+            files_deferred_invalid = outcome.files_deferred_invalid,
+            files_deferred_conflict = outcome.files_deferred_conflict,
+            files_deferred_ordering_unverified = outcome.files_deferred_ordering_unverified,
+            "seal recovery INCOMPLETE — retained files or unconfirmed discovery require inspection"
         );
     } else {
         info!(
             files_archived = outcome.files_archived,
             seals_reingested = outcome.seals_reingested,
             records_undecodable = outcome.records_undecodable,
-            "seal recovery complete — every recovered seal re-ingested"
+            seals_already_present = outcome.seals_already_present,
+            "seal recovery complete — every recovered record confirmed against applied rows"
         );
     }
 
@@ -768,6 +1142,40 @@ pub fn drain_recovered_seals<S: SealSink>(
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    // Small-fixture collection only; production replays the same decoder one
+    // record at a time and never constructs a whole-file record vector.
+    fn collect_staged_fixture(
+        path: &Path,
+        kind: StagedKind,
+    ) -> Option<(Vec<SerializedSeal>, usize)> {
+        let mut reader = BufReader::new(std::fs::File::open(path).ok()?);
+        let mut binary = [0u8; SEAL_SPILL_RECORD_SIZE];
+        let mut line = [0u8; SEAL_DLQ_RECORD_MAX_BYTES];
+        let mut records = Vec::new();
+        let mut undecodable = 0;
+        loop {
+            match read_staged_record(&mut reader, kind, &mut binary, &mut line) {
+                Ok(StagedRead::Record(record)) => records.push(record),
+                Ok(StagedRead::Eof) => return Some((records, undecodable)),
+                Ok(StagedRead::Undecodable { terminal }) => {
+                    undecodable += 1;
+                    if terminal {
+                        return Some((records, undecodable));
+                    }
+                }
+                Err(_) => return Some((records, undecodable + 1)),
+            }
+        }
+    }
+
+    fn read_staged_spill(path: &Path) -> Option<(Vec<SerializedSeal>, usize)> {
+        collect_staged_fixture(path, StagedKind::Spill)
+    }
+
+    fn read_staged_dlq(path: &Path) -> Option<(Vec<SerializedSeal>, usize)> {
+        collect_staged_fixture(path, StagedKind::Dlq)
+    }
 
     /// The three unreadable paths must be DISTINGUISHABLE from an empty file.
     ///
@@ -849,7 +1257,7 @@ mod tests {
         // against code it never reached.
         let prod = src.split("\nmod tests {").next().unwrap_or(src);
         assert!(
-            prod.contains("outcome.files_left_pending += 1;\n            continue;"),
+            prod.contains("outcome.files_left_pending += 1;\n            outcome.pending_count_unknown = true;\n            continue;"),
             "the not-read arm must count the file as still pending and skip it, \
              never fall through to archive_staged"
         );
@@ -907,7 +1315,7 @@ mod tests {
         state.oi = 50_000;
         state.tick_count = 5;
         state.close_pct_from_prev_day = 1.5;
-        state.net_volume_signed = -4_242;
+        state.net_volume_signed = -1234;
         state.net_volume_classified = true;
         state.total_buy_qty = 89_600;
         state.total_sell_qty = 4_800;
@@ -1331,6 +1739,1260 @@ mod tests {
         assert_eq!(drained[1].security_id, 13);
         assert_eq!(drained[1].exchange_segment_code, 1);
         assert_eq!(drained[1].close, 200.0);
+        cleanup(&spill, &dlq);
+    }
+    #[test]
+    fn staged_reader_salvages_complete_prefix_and_marks_partial_original_pending() {
+        let (spill, dlq) = temp_pair("v3-staged-reader");
+        std::fs::create_dir_all(&spill).expect("mkdir");
+        let record = SerializedSeal::from(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0));
+        let current = record.to_bytes();
+        let mut old = current[..crate::seal_spill::SEAL_SPILL_LEGACY_RECORD_SIZE].to_vec();
+        old[7] = 2;
+        let mut bytes = old;
+        bytes.extend_from_slice(&current);
+        let path = spill.join("seals-2026-01-01.bin");
+        std::fs::write(&path, &bytes).expect("mixed file");
+        let (rows, rejected) = read_staged_spill(&path).expect("complete mixed file");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rejected, 0);
+        assert_eq!(
+            rows[0].metadata,
+            tickvault_trading::candles::CandleMetadata::UNKNOWN
+        );
+        assert_eq!(rows[1], record);
+        bytes.extend_from_slice(&current[..20]);
+        std::fs::write(&path, &bytes).expect("interrupted final record");
+        let (prefix, rejected) = read_staged_spill(&path).expect("recoverable complete prefix");
+        assert_eq!(prefix.len(), 2);
+        assert_eq!(rejected, 1, "the original cannot be confirmed as complete");
+        assert_eq!(std::fs::read(&path).expect("retained"), bytes);
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn one_rejected_append_cannot_archive_a_partially_recovered_file() {
+        #[derive(Default)]
+        struct TestSink {
+            reject_id: Option<u64>,
+            accepted: usize,
+        }
+        impl SealSink for TestSink {
+            fn recover_batch(
+                &mut self,
+                seals: &[BufferedSeal],
+            ) -> Result<
+                crate::seal_recovery_guard::RecoveredBatch,
+                crate::seal_recovery_guard::RecoveryRefusal,
+            > {
+                crate::seal_writer_task::recover_fixture_batch(self, seals)
+            }
+
+            fn append_seal(&mut self, seal: &BufferedSeal) -> anyhow::Result<()> {
+                if self.reject_id == Some(seal.security_id) {
+                    anyhow::bail!("injected append refusal");
+                }
+                self.accepted += 1;
+                Ok(())
+            }
+            fn flush(&mut self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn discard_pending(&mut self) {}
+        }
+        let (spill, dlq) = temp_pair("retain-rejected-append");
+        std::fs::create_dir_all(&spill).expect("mkdir");
+        let mut bytes = Vec::new();
+        for id in [13, 25] {
+            bytes.extend_from_slice(
+                &SerializedSeal::from(&mk_seal(id, 0, TfIndex::M1, 1_716_023_700, 100.0))
+                    .to_bytes(),
+            );
+        }
+        std::fs::write(spill.join("seals-2026-01-01.bin"), bytes).expect("write");
+        let mut refusal = TestSink {
+            reject_id: Some(25),
+            accepted: 0,
+        };
+        let first = drain_recovered_seals(&mut refusal, &spill, &dlq, 64);
+        assert_eq!(first.files_archived, 0);
+        assert_eq!(first.files_left_pending, 1);
+        assert_eq!(
+            first.seals_reingested, 0,
+            "a failed append discards the unflushed batch"
+        );
+        assert_eq!(first.seals_left_pending, 2);
+        assert!(
+            !first.pending_count_unknown,
+            "the final batch is admitted after a complete EOF read"
+        );
+        let mut healthy = TestSink::default();
+        let second = drain_recovered_seals(&mut healthy, &spill, &dlq, 64);
+        assert_eq!(second.seals_reingested, 2);
+        assert_eq!(second.files_archived, 1);
+        assert_eq!(second.files_left_pending, 0);
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn v4_write_names_are_invisible_to_rollback_discovery_but_new_recovery_finds_them() {
+        // Reference discovery contract read from 7f97c32 and ede0a795:
+        // a regular seals-* file whose collision-stripped name ends with
+        // .bin or .ndjson. In particular .cseal3 and .cseal3json never match.
+        fn rollback_recognizes(path: &Path) -> bool {
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                return false;
+            };
+            let base = name.rsplit_once('.').map_or(name, |(head, tail)| {
+                if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) {
+                    head
+                } else {
+                    name
+                }
+            });
+            path.is_file()
+                && name.starts_with("seals-")
+                && (base.ends_with(".bin") || base.ends_with(".ndjson"))
+        }
+        let (spill, dlq) = temp_pair("rollback-namespace-v3");
+        let now = jan1_noon_utc();
+        let record = SerializedSeal::from(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0));
+        let binary = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        binary.append_seal(&record, now).expect("new spill");
+        let json = crate::seal_dlq::SealDlqWriter::with_dlq_dir_for_test(dlq.clone());
+        json.append_record(&SealDlqRecord::from(&record), now)
+            .expect("new DLQ");
+        let binary_path = binary.spill_path(now);
+        let json_path = json.dlq_path(now);
+        assert!(!rollback_recognizes(&binary_path));
+        assert!(!rollback_recognizes(&json_path));
+        assert_eq!(binary_path.parent(), Some(spill.as_path()));
+        assert_eq!(json_path.parent(), Some(dlq.as_path()));
+        assert_eq!(
+            crate::seal_dlq::dlq_bytes_at(&dlq),
+            std::fs::metadata(&json_path).expect("size").len()
+        );
+
+        let mut legacy =
+            record.to_bytes()[..crate::seal_spill::SEAL_SPILL_LEGACY_RECORD_SIZE].to_vec();
+        legacy[7] = 2;
+        let legacy_path = spill.join("seals-2025-12-31.bin");
+        std::fs::write(&legacy_path, legacy).expect("legacy spill");
+        assert!(rollback_recognizes(&legacy_path));
+        let old_json = dlq.join("seals-2025-12-31.ndjson");
+        std::fs::write(&old_json, "{}\n").expect("legacy JSON");
+        assert!(rollback_recognizes(&old_json));
+
+        // A restarted new binary discovers old and new records, including a
+        // filename collision suffix in the same replaying namespace.
+        let staged_spill = stage_pending_files(&spill).expect("stage spill");
+        let staged_dlq = stage_pending_files(&dlq).expect("stage DLQ");
+        assert_eq!(staged_spill.len(), 2);
+        assert_eq!(staged_dlq.len(), 2);
+        for path in staged_spill.iter().chain(&staged_dlq) {
+            if path.extension().and_then(|e| e.to_str()) == Some("cseal4")
+                || path.extension().and_then(|e| e.to_str()) == Some("cseal4json")
+            {
+                assert!(!rollback_recognizes(path));
+                let collision = path.with_file_name(format!(
+                    "{}.1",
+                    path.file_name().expect("name").to_string_lossy()
+                ));
+                std::fs::copy(path, &collision).expect("collision fixture");
+                assert!(!rollback_recognizes(&collision));
+                assert!(is_seal_name(&collision));
+            }
+        }
+        assert!(
+            staged_spill
+                .iter()
+                .all(|path| read_staged_spill(path).is_some())
+        );
+        assert!(
+            staged_dlq
+                .iter()
+                .all(|path| read_staged_dlq(path).is_some())
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    #[derive(Default)]
+    struct RecordingSink {
+        accepted: Vec<u64>,
+    }
+
+    impl SealSink for RecordingSink {
+        fn recover_batch(
+            &mut self,
+            seals: &[BufferedSeal],
+        ) -> Result<
+            crate::seal_recovery_guard::RecoveredBatch,
+            crate::seal_recovery_guard::RecoveryRefusal,
+        > {
+            crate::seal_writer_task::recover_fixture_batch(self, seals)
+        }
+
+        fn append_seal(&mut self, seal: &BufferedSeal) -> anyhow::Result<()> {
+            self.accepted.push(seal.security_id);
+            Ok(())
+        }
+
+        fn flush(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn discard_pending(&mut self) {}
+    }
+
+    #[derive(Default)]
+    struct StreamingSink {
+        pending: usize,
+        max_pending: usize,
+        pending_id_sum: u64,
+        committed: usize,
+        committed_id_sum: u64,
+        appended: usize,
+        flushes: usize,
+        discards: usize,
+        fail_flush: Option<usize>,
+        fail_append: Option<usize>,
+        read_position: Option<std::rc::Rc<std::cell::Cell<usize>>>,
+        first_flush_position: Option<usize>,
+    }
+
+    impl SealSink for StreamingSink {
+        fn recover_batch(
+            &mut self,
+            seals: &[BufferedSeal],
+        ) -> Result<
+            crate::seal_recovery_guard::RecoveredBatch,
+            crate::seal_recovery_guard::RecoveryRefusal,
+        > {
+            crate::seal_writer_task::recover_fixture_batch(self, seals)
+        }
+
+        fn append_seal(&mut self, seal: &BufferedSeal) -> anyhow::Result<()> {
+            self.appended += 1;
+            self.pending += 1;
+            self.max_pending = self.max_pending.max(self.pending);
+            self.pending_id_sum += seal.security_id;
+            // Refuse after a local mutation, so the test requires discarding
+            // an incomplete batch rather than assuming Err made no changes.
+            anyhow::ensure!(
+                self.fail_append != Some(self.appended),
+                "injected append refusal"
+            );
+            Ok(())
+        }
+
+        fn flush(&mut self) -> anyhow::Result<()> {
+            self.flushes += 1;
+            if self.first_flush_position.is_none() {
+                self.first_flush_position =
+                    self.read_position.as_ref().map(|position| position.get());
+            }
+            anyhow::ensure!(
+                self.fail_flush != Some(self.flushes),
+                "injected flush refusal"
+            );
+            self.committed += self.pending;
+            self.committed_id_sum += self.pending_id_sum;
+            self.pending = 0;
+            self.pending_id_sum = 0;
+            Ok(())
+        }
+
+        fn discard_pending(&mut self) {
+            self.discards += 1;
+            self.pending = 0;
+            self.pending_id_sum = 0;
+        }
+    }
+
+    struct ObservedRead<R> {
+        input: R,
+        position: std::rc::Rc<std::cell::Cell<usize>>,
+        fail_at: Option<usize>,
+    }
+
+    impl<R: std::io::Read> std::io::Read for ObservedRead<R> {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            let position = self.position.get();
+            let remaining = match self.fail_at {
+                Some(boundary) if position >= boundary => {
+                    return Err(std::io::Error::other("injected non-advancing read error"));
+                }
+                Some(boundary) => boundary - position,
+                None => output.len(),
+            };
+            let limit = output.len().min(remaining);
+            let read = self.input.read(&mut output[..limit])?;
+            self.position.set(position + read);
+            Ok(read)
+        }
+    }
+
+    fn serialized_fixture(id: u64) -> SerializedSeal {
+        SerializedSeal::from(&mk_seal(id, 0, TfIndex::M1, 1_716_023_700, 100.0))
+    }
+
+    #[test]
+    fn valid_conflicting_originals_are_retained_while_separate_missing_rows_can_recover() {
+        #[derive(Default)]
+        struct ConflictSink {
+            appended: Vec<u64>,
+        }
+        impl SealSink for ConflictSink {
+            fn append_seal(&mut self, seal: &BufferedSeal) -> anyhow::Result<()> {
+                assert_ne!(
+                    seal.security_id, 13,
+                    "conflicting row reached unsafe append"
+                );
+                self.appended.push(seal.security_id);
+                Ok(())
+            }
+            fn flush(&mut self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn discard_pending(&mut self) {}
+            fn recover_batch(
+                &mut self,
+                seals: &[BufferedSeal],
+            ) -> Result<RecoveredBatch, RecoveryRefusal> {
+                if seals.iter().any(|seal| seal.security_id == 13) {
+                    return Err(RecoveryRefusal::Conflict);
+                }
+                recover_fixture_batch(self, seals)
+            }
+        }
+        let (spill, dlq) = temp_pair("valid-conflict-retention");
+        let name = "seals-2026-01-01.cseal4";
+        let original = serialized_fixture(13).to_bytes();
+        std::fs::write(spill.join(name), original).expect("conflict fixture");
+        std::fs::write(
+            spill.join("seals-2026-01-02.cseal4"),
+            serialized_fixture(14).to_bytes(),
+        )
+        .expect("independent fixture");
+        let mut sink = ConflictSink::default();
+        for boot in 0..2 {
+            let outcome = drain_recovered_seals(&mut sink, &spill, &dlq, 64);
+            assert_eq!(outcome.files_deferred_conflict, 1);
+            assert_eq!(outcome.files_left_pending, 1);
+            assert_eq!(outcome.files_archived, usize::from(boot == 0));
+            assert_eq!(outcome.seals_reingested, usize::from(boot == 0));
+            assert_eq!(sink.appended, vec![14]);
+            assert_eq!(
+                std::fs::read(spill.join(SEAL_REPLAYING_SUBDIR).join(name))
+                    .expect("unchanged original"),
+                original
+            );
+            assert!(!spill.join(SEAL_ARCHIVE_SUBDIR).join(name).exists());
+        }
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn direct_production_writer_cannot_replay_without_boot_exclusion() {
+        let (spill, dlq) = temp_pair("production-recovery-exclusion");
+        let name = "seals-2026-01-01.cseal4";
+        let original = serialized_fixture(13).to_bytes();
+        std::fs::write(spill.join(name), original).expect("fixture");
+        let mut writer = ShadowCandleWriter::for_test();
+        let outcome = drain_recovered_seals(&mut writer, &spill, &dlq, 64);
+        assert_eq!(outcome.files_deferred_ordering_unverified, 1);
+        assert_eq!(outcome.files_archived, 0);
+        assert_eq!(outcome.seals_reingested, 0);
+        assert_eq!(writer.pending_count(), 0);
+        assert_eq!(writer.buffer_byte_count(), 0);
+        assert_eq!(
+            std::fs::read(spill.join(SEAL_REPLAYING_SUBDIR).join(name)).expect("retained"),
+            original
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn retired_timeframe_history_defers_whole_mixed_files_and_replays_separate_active_files() {
+        let (spill, dlq) = temp_pair("retired-timeframe-history");
+        let binary_name = "seals-retired.cseal3";
+        let dlq_name = "seals-retired.cseal3json";
+        let retired = [4u8, 6, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21];
+        let mut binary = Vec::new();
+        let mut json = Vec::new();
+        let mut next_id = 1u64;
+        // Each supported binary format carries all ten active frames plus
+        // all fifteen retired IDs. Retirement is independent of record stride.
+        for version in [1u8, 2, 3] {
+            for storage_id in (0u8..=24).rev() {
+                let mut record = serialized_fixture(next_id);
+                next_id += 1;
+                record.tf_ordinal = storage_id;
+                let mut bytes = record.to_bytes();
+                bytes[7] = version;
+                let size = if version == 3 {
+                    SEAL_SPILL_RECORD_SIZE
+                } else {
+                    crate::seal_spill::SEAL_SPILL_LEGACY_RECORD_SIZE
+                };
+                binary.extend_from_slice(&bytes[..size]);
+                if version == 3 {
+                    json.extend(serde_json::to_vec(&SealDlqRecord::from(&record)).expect("DLQ"));
+                    json.push(b'\n');
+                }
+            }
+        }
+        std::fs::write(spill.join(binary_name), &binary).expect("mixed binary");
+        std::fs::write(dlq.join(dlq_name), &json).expect("mixed DLQ");
+        // A separate new 10m file must archive normally in the same pass.
+        let new_frame = SerializedSeal::from(&mk_seal(999, 0, TfIndex::M10, 1_716_023_400, 100.0));
+        let new_name = "seals-new-10m.cseal3";
+        std::fs::write(spill.join(new_name), new_frame.to_bytes()).expect("new 10m");
+
+        let mut sink = StreamingSink::default();
+        let outcome = drain_recovered_seals(&mut sink, &spill, &dlq, 2);
+        assert_eq!(outcome.seals_recovered, TfIndex::ALL.len() * 4 + 1);
+        assert_eq!(outcome.seals_reingested, 1);
+        assert_eq!(sink.committed, 1);
+        assert_eq!(
+            sink.committed_id_sum, 999,
+            "mixed-file active siblings must never reach the sink"
+        );
+        assert!(sink.max_pending <= 2);
+        assert_eq!(outcome.records_retired_timeframe, retired.len() * 4);
+        assert_eq!(
+            outcome.records_undecodable, 0,
+            "retired history is not corrupt"
+        );
+        assert_eq!(outcome.seals_left_pending, 100);
+        assert_eq!(outcome.files_deferred_retired_timeframe, 2);
+        assert!(
+            !outcome.pending_count_unknown,
+            "fully decoded retired records have an exact known count"
+        );
+        assert_eq!(outcome.files_left_pending, 2);
+        assert_eq!(outcome.files_archived, 1);
+        assert_eq!(
+            std::fs::read(spill.join(SEAL_REPLAYING_SUBDIR).join(binary_name))
+                .expect("retained binary"),
+            binary
+        );
+        assert_eq!(
+            std::fs::read(dlq.join(SEAL_REPLAYING_SUBDIR).join(dlq_name)).expect("retained DLQ"),
+            json
+        );
+        assert!(!spill.join(SEAL_ARCHIVE_SUBDIR).join(binary_name).exists());
+        assert!(!dlq.join(SEAL_ARCHIVE_SUBDIR).join(dlq_name).exists());
+        assert_eq!(
+            std::fs::read(spill.join(SEAL_ARCHIVE_SUBDIR).join(new_name)).expect("10m archived"),
+            new_frame.to_bytes()
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn unknown_timeframe_is_not_misreported_as_retired_or_reinterpreted_as_an_active_index() {
+        for kind in [StagedKind::Spill, StagedKind::Dlq] {
+            let mut retired = serialized_fixture(11);
+            retired.tf_ordinal = 4; // Historical 1d; runtime index 4 is now 3m.
+            let mut unknown = serialized_fixture(12);
+            unknown.tf_ordinal = 255;
+            let active = SerializedSeal::from(&mk_seal(13, 0, TfIndex::M10, 1_716_023_400, 100.0));
+            let mut bytes = Vec::new();
+            for record in [retired, unknown, active] {
+                match kind {
+                    StagedKind::Spill => bytes.extend_from_slice(&record.to_bytes()),
+                    StagedKind::Dlq => {
+                        bytes.extend(
+                            serde_json::to_vec(&SealDlqRecord::from(&record)).expect("DLQ"),
+                        );
+                        bytes.push(b'\n');
+                    }
+                }
+            }
+            let mut reader = BufReader::with_capacity(17, std::io::Cursor::new(bytes));
+            let outcome = preflight_staged_stream(&mut reader, kind, Path::new("storage-identity"));
+            assert_eq!(outcome.records_decoded, 3);
+            assert_eq!(outcome.retired_records, 1);
+            assert_eq!(outcome.records_undecodable, 1);
+            assert_eq!(outcome.active_records, 1);
+            assert!(outcome.pending_unknown());
+        }
+    }
+
+    #[test]
+    fn transient_preflight_read_failure_defers_before_retry_can_reveal_retired_history() {
+        for kind in [StagedKind::Spill, StagedKind::Dlq] {
+            let active = serialized_fixture(13);
+            let mut retired = serialized_fixture(12);
+            retired.tf_ordinal = 4;
+            let mut bytes = Vec::new();
+            let mut fail_at = 0;
+            for record in [active, retired] {
+                match kind {
+                    StagedKind::Spill => bytes.extend_from_slice(&record.to_bytes()),
+                    StagedKind::Dlq => {
+                        bytes.extend(
+                            serde_json::to_vec(&SealDlqRecord::from(&record)).expect("DLQ"),
+                        );
+                        bytes.push(b'\n');
+                    }
+                }
+                if fail_at == 0 {
+                    fail_at = bytes.len();
+                }
+            }
+            let observed = ObservedRead {
+                input: std::io::Cursor::new(bytes),
+                position: std::rc::Rc::new(std::cell::Cell::new(0)),
+                fail_at: Some(fail_at),
+            };
+            let mut reader = BufReader::with_capacity(1, observed);
+            let first =
+                preflight_staged_stream(&mut reader, kind, Path::new("transient-preflight"));
+            assert_eq!(first.active_records, 1);
+            assert_eq!(
+                first.retired_records, 0,
+                "retirement is still hidden after native read refusal"
+            );
+            assert!(first.io_failed);
+            assert!(first.defers_whole_file());
+            assert!(first.pending_unknown());
+
+            // A later read of the same contents succeeds and exposes retirement.
+            // The first-pass gate must still refuse any intervening sink append.
+            let mut recovered_input = reader.into_inner();
+            recovered_input.fail_at = None;
+            recovered_input.input.set_position(0);
+            recovered_input.position.set(0);
+            let mut reader = BufReader::with_capacity(1, recovered_input);
+            let mut sink = StreamingSink::default();
+            if !first.defers_whole_file() {
+                let _ = replay_staged_stream(
+                    &mut sink,
+                    &mut reader,
+                    kind,
+                    1,
+                    Path::new("unsafe-retry"),
+                );
+            }
+            assert_eq!(sink.appended, 0);
+            let later = preflight_staged_stream(&mut reader, kind, Path::new("successful-retry"));
+            assert!(later.reached_eof);
+            assert_eq!(later.active_records, 1);
+            assert_eq!(later.retired_records, 1);
+            assert!(!later.io_failed);
+            assert!(later.defers_whole_file());
+        }
+    }
+
+    #[test]
+    fn mixed_retired_history_never_overwrites_a_newer_revision_on_first_or_repeated_boot() {
+        struct LastWriteWinsSink {
+            revision: u64,
+            pending: Option<u64>,
+            appends: usize,
+        }
+        impl SealSink for LastWriteWinsSink {
+            fn recover_batch(
+                &mut self,
+                seals: &[BufferedSeal],
+            ) -> Result<
+                crate::seal_recovery_guard::RecoveredBatch,
+                crate::seal_recovery_guard::RecoveryRefusal,
+            > {
+                crate::seal_writer_task::recover_fixture_batch(self, seals)
+            }
+
+            fn append_seal(&mut self, seal: &BufferedSeal) -> anyhow::Result<()> {
+                self.appends += 1;
+                if seal.security_id == 13 {
+                    self.pending = Some(seal.state.bucket_revision);
+                }
+                Ok(())
+            }
+            fn flush(&mut self) -> anyhow::Result<()> {
+                if let Some(revision) = self.pending.take() {
+                    self.revision = revision;
+                }
+                Ok(())
+            }
+            fn discard_pending(&mut self) {
+                self.pending = None;
+            }
+        }
+        for kind in [StagedKind::Spill, StagedKind::Dlq] {
+            for retired_position in 0..3 {
+                let (spill, dlq) =
+                    temp_pair(&format!("retired-revision-{kind:?}-{retired_position}"));
+                let mut old = serialized_fixture(13);
+                old.bucket_revision = 1;
+                let mut retired = serialized_fixture(12);
+                retired.tf_ordinal = 4;
+                let mut records = vec![old, serialized_fixture(14)];
+                records.insert(retired_position, retired);
+                let mut bytes = Vec::new();
+                for record in records {
+                    match kind {
+                        StagedKind::Spill => bytes.extend_from_slice(&record.to_bytes()),
+                        StagedKind::Dlq => {
+                            bytes.extend(
+                                serde_json::to_vec(&SealDlqRecord::from(&record)).expect("DLQ"),
+                            );
+                            bytes.push(b'\n');
+                        }
+                    }
+                }
+                let (directory, name) = match kind {
+                    StagedKind::Spill => (&spill, "seals-retired-revision.cseal3"),
+                    StagedKind::Dlq => (&dlq, "seals-retired-revision.cseal3json"),
+                };
+                std::fs::write(directory.join(name), &bytes).expect("retained history");
+                let mut sink = LastWriteWinsSink {
+                    revision: 2,
+                    pending: None,
+                    appends: 0,
+                };
+                for boot in 0..2 {
+                    let outcome = drain_recovered_seals(&mut sink, &spill, &dlq, 1);
+                    assert_eq!(
+                        sink.revision, 2,
+                        "boot {boot}: newer correction must survive"
+                    );
+                    assert_eq!(
+                        sink.appends, 0,
+                        "whole mixed file must be checked before the first append"
+                    );
+                    assert_eq!(outcome.seals_recovered, 2);
+                    assert_eq!(outcome.seals_reingested, 0);
+                    assert_eq!(outcome.seals_left_pending, 3);
+                    assert_eq!(outcome.records_retired_timeframe, 1);
+                    assert_eq!(outcome.files_deferred_retired_timeframe, 1);
+                    assert_eq!(outcome.files_left_pending, 1);
+                    assert_eq!(outcome.files_archived, 0);
+                    assert!(!outcome.pending_count_unknown);
+                    assert_eq!(
+                        std::fs::read(directory.join(SEAL_REPLAYING_SUBDIR).join(name))
+                            .expect("unchanged original"),
+                        bytes
+                    );
+                }
+                cleanup(&spill, &dlq);
+            }
+        }
+    }
+
+    #[test]
+    fn damaged_or_unknown_originals_never_write_old_siblings_on_repeated_boots() {
+        struct LastWriteWinsSink {
+            revision: u64,
+            pending: Option<u64>,
+            appends: usize,
+            flushes: usize,
+        }
+        impl SealSink for LastWriteWinsSink {
+            fn recover_batch(
+                &mut self,
+                seals: &[BufferedSeal],
+            ) -> Result<
+                crate::seal_recovery_guard::RecoveredBatch,
+                crate::seal_recovery_guard::RecoveryRefusal,
+            > {
+                crate::seal_writer_task::recover_fixture_batch(self, seals)
+            }
+
+            fn append_seal(&mut self, seal: &BufferedSeal) -> anyhow::Result<()> {
+                self.appends += 1;
+                self.pending = Some(seal.state.bucket_revision);
+                Ok(())
+            }
+            fn flush(&mut self) -> anyhow::Result<()> {
+                self.flushes += 1;
+                if let Some(revision) = self.pending.take() {
+                    self.revision = revision;
+                }
+                Ok(())
+            }
+            fn discard_pending(&mut self) {
+                self.pending = None;
+            }
+        }
+        fn encode(kind: StagedKind, record: &SerializedSeal) -> Vec<u8> {
+            match kind {
+                StagedKind::Spill => record.to_bytes().to_vec(),
+                StagedKind::Dlq => {
+                    let mut bytes = serde_json::to_vec(&SealDlqRecord::from(record)).expect("DLQ");
+                    bytes.push(b'\n');
+                    bytes
+                }
+            }
+        }
+
+        let mut old = serialized_fixture(11);
+        old.bucket_revision = 1;
+        let mut unknown = old;
+        unknown.tf_ordinal = 255;
+        for kind in [StagedKind::Spill, StagedKind::Dlq] {
+            let active_bytes = encode(kind, &old);
+            // The bool marks a torn tail, which is deliberately placed only
+            // at EOF. Other malformed records exercise start/middle/end.
+            let mut malformed = vec![("unknown-timeframe", encode(kind, &unknown), false)];
+            match kind {
+                StagedKind::Spill => {
+                    let mut bad_version = active_bytes.clone();
+                    bad_version[7] = 0;
+                    malformed.push(("unsupported-version", bad_version, false));
+                    let mut bad_classification = active_bytes.clone();
+                    bad_classification[161] = 2;
+                    malformed.push(("invalid-classification", bad_classification, false));
+                    malformed.push(("torn-header", active_bytes[..7].to_vec(), true));
+                    malformed.push(("torn-record", active_bytes[..11].to_vec(), true));
+                }
+                StagedKind::Dlq => {
+                    malformed.push(("invalid-json", b"{not-json}\n".to_vec(), false));
+                    malformed.push(("invalid-utf8", b"{\xff}\n".to_vec(), false));
+                    let mut oversized = vec![b'x'; SEAL_DLQ_RECORD_MAX_BYTES + 1];
+                    oversized.push(b'\n');
+                    malformed.push(("oversized-line", oversized, false));
+                    malformed.push(("torn-json", b"{\"security_id\":".to_vec(), true));
+                }
+            }
+            for (tag, bad, tail_only) in malformed {
+                for position in 0..=2 {
+                    if tail_only && position != 2 {
+                        continue;
+                    }
+                    let (spill, dlq) =
+                        temp_pair(&format!("unverified-original-{kind:?}-{tag}-{position}"));
+                    let mut original = Vec::new();
+                    for item in 0..=2 {
+                        original.extend_from_slice(if item == position {
+                            &bad
+                        } else {
+                            &active_bytes
+                        });
+                    }
+                    let (directory, name) = match kind {
+                        StagedKind::Spill => (&spill, "seals-unverified.cseal3"),
+                        StagedKind::Dlq => (&dlq, "seals-unverified.cseal3json"),
+                    };
+                    std::fs::write(directory.join(name), &original).expect("damaged original");
+                    let mut sink = LastWriteWinsSink {
+                        revision: 2,
+                        pending: None,
+                        appends: 0,
+                        flushes: 0,
+                    };
+                    for boot in 0..3 {
+                        let outcome = drain_recovered_seals(&mut sink, &spill, &dlq, 1);
+                        assert_eq!(
+                            sink.revision, 2,
+                            "{kind:?} {tag} {position}, boot {boot}: old siblings cannot overwrite a newer correction"
+                        );
+                        assert_eq!(sink.appends, 0);
+                        assert_eq!(sink.flushes, 0);
+                        assert_eq!(sink.pending, None);
+                        assert_eq!(outcome.seals_reingested, 0);
+                        assert_eq!(outcome.files_archived, 0);
+                        assert_eq!(outcome.files_left_pending, 1);
+                        assert_eq!(outcome.files_deferred_invalid, 1);
+                        assert_eq!(outcome.files_deferred_retired_timeframe, 0);
+                        assert!(outcome.records_undecodable > 0);
+                        assert!(outcome.pending_count_unknown);
+                        assert_eq!(
+                            std::fs::read(directory.join(SEAL_REPLAYING_SUBDIR).join(name))
+                                .expect("whole original retained"),
+                            original
+                        );
+                        assert!(!directory.join(SEAL_ARCHIVE_SUBDIR).join(name).exists());
+                    }
+                    cleanup(&spill, &dlq);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn replay_pass_flushes_many_batches_before_its_eof_with_bounded_sink() {
+        use std::io::Write;
+        let (spill, dlq) = temp_pair("streaming-many-batches");
+        let path = spill.join("seals-large.cseal3");
+        let records = 20_003usize;
+        let mut output = std::fs::File::create(&path).expect("large fixture");
+        // This fixture measures the bounded replay pass only. Production
+        // first preflights the whole file, then rewinds before this pass.
+        // Neither pass needs a record vector proportional to file length.
+        for id in 1..=records as u64 {
+            output
+                .write_all(&serialized_fixture(id).to_bytes())
+                .expect("write fixture record");
+        }
+        drop(output);
+        for requested_batch in [0usize, 37] {
+            let position = std::rc::Rc::new(std::cell::Cell::new(0));
+            let observed = ObservedRead {
+                input: std::fs::File::open(&path).expect("fixture input"),
+                position: std::rc::Rc::clone(&position),
+                fail_at: None,
+            };
+            // One-byte buffering makes read progress exact at each complete
+            // binary record instead of hiding up to an OS-reader buffer.
+            let mut reader = BufReader::with_capacity(1, observed);
+            let mut sink = StreamingSink {
+                read_position: Some(position),
+                ..Default::default()
+            };
+            let outcome = replay_staged_stream(
+                &mut sink,
+                &mut reader,
+                StagedKind::Spill,
+                requested_batch,
+                &path,
+            );
+            let batch = requested_batch.max(1);
+            assert!(outcome.complete());
+            assert_eq!(outcome.seals_reingested, records);
+            assert_eq!(sink.committed, records);
+            assert_eq!(
+                sink.committed_id_sum,
+                records as u64 * (records as u64 + 1) / 2
+            );
+            assert_eq!(sink.max_pending, batch);
+            assert_eq!(sink.flushes, records.div_ceil(batch));
+            assert_eq!(
+                sink.first_flush_position,
+                Some(batch * SEAL_SPILL_RECORD_SIZE)
+            );
+            assert!(sink.first_flush_position.unwrap() < records * SEAL_SPILL_RECORD_SIZE);
+            assert_eq!(sink.pending, 0);
+            assert_eq!(
+                std::fs::metadata(&path).expect("original retained").len(),
+                (records * SEAL_SPILL_RECORD_SIZE) as u64
+            );
+        }
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn preflight_late_corruption_defers_whole_original_and_recovers_later_file() {
+        let (spill, dlq) = temp_pair("streaming-late-corruption");
+        let name = "seals-2026-01-01.cseal3";
+        let mut original = Vec::new();
+        for id in 1..=13u64 {
+            original.extend_from_slice(&serialized_fixture(id).to_bytes());
+        }
+        original.extend_from_slice(&serialized_fixture(14).to_bytes()[..11]);
+        std::fs::write(spill.join(name), &original).expect("late torn tail");
+        std::fs::write(
+            spill.join("seals-2026-01-02.cseal3"),
+            serialized_fixture(50).to_bytes(),
+        )
+        .expect("later healthy file");
+        let mut sink = StreamingSink::default();
+        let outcome = drain_recovered_seals(&mut sink, &spill, &dlq, 4);
+        assert_eq!(
+            sink.committed, 1,
+            "only the separate healthy file can reach the sink"
+        );
+        assert_eq!(sink.committed_id_sum, 50);
+        assert_eq!(sink.max_pending, 1);
+        assert_eq!(
+            outcome.seals_recovered, 14,
+            "thirteen deferred valid siblings plus one healthy seal"
+        );
+        assert_eq!(
+            outcome.seals_left_pending, 13,
+            "the malformed boundary hides an unknown tail"
+        );
+        assert_eq!(outcome.seals_reingested, 1);
+        assert_eq!(outcome.records_undecodable, 1);
+        assert_eq!(outcome.files_deferred_invalid, 1);
+        assert_eq!(outcome.files_left_pending, 1);
+        assert_eq!(outcome.files_archived, 1);
+        assert!(outcome.pending_count_unknown);
+        assert_eq!(
+            std::fs::read(spill.join(SEAL_REPLAYING_SUBDIR).join(name))
+                .expect("whole original retained"),
+            original
+        );
+        assert!(!spill.join(SEAL_ARCHIVE_SUBDIR).join(name).exists());
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn streaming_sink_refusal_stops_before_unread_tail_and_preserves_originals() {
+        for append_failure in [false, true] {
+            let (spill, dlq) = temp_pair(&format!("streaming-sink-refusal-{append_failure}"));
+            let name = "seals-2026-01-01.cseal3";
+            let original: Vec<u8> = (1..=20u64)
+                .flat_map(|id| serialized_fixture(id).to_bytes())
+                .collect();
+            let later = serialized_fixture(100).to_bytes();
+            std::fs::write(spill.join(name), &original).expect("first fixture");
+            std::fs::write(spill.join("seals-2026-01-02.cseal3"), later).expect("later fixture");
+            let mut sink = StreamingSink {
+                fail_append: append_failure.then_some(6),
+                fail_flush: (!append_failure).then_some(2),
+                ..Default::default()
+            };
+            let outcome = drain_recovered_seals(&mut sink, &spill, &dlq, 4);
+            let decoded = 8; // admission now waits for the complete bounded batch
+            assert_eq!(outcome.seals_recovered, decoded);
+            assert_eq!(
+                outcome.seals_reingested, 4,
+                "only the first confirmed batch counts"
+            );
+            assert_eq!(
+                outcome.seals_left_pending,
+                decoded - 4,
+                "known decoded pending only"
+            );
+            assert!(outcome.pending_count_unknown);
+            assert_eq!(outcome.files_left_pending, 2);
+            assert_eq!(outcome.files_archived, 0);
+            assert_eq!(
+                sink.appended,
+                if append_failure { 6 } else { 8 },
+                "neither unread tail nor later file reached the failed sink"
+            );
+            assert_eq!(sink.discards, 1);
+            assert_eq!(sink.pending, 0);
+            assert_eq!(sink.committed_id_sum, 1 + 2 + 3 + 4);
+            assert_eq!(
+                std::fs::read(spill.join(SEAL_REPLAYING_SUBDIR).join(name))
+                    .expect("original still replayable"),
+                original
+            );
+            assert_eq!(
+                std::fs::read(
+                    spill
+                        .join(SEAL_REPLAYING_SUBDIR)
+                        .join("seals-2026-01-02.cseal3")
+                )
+                .expect("unread original retained"),
+                later
+            );
+            cleanup(&spill, &dlq);
+        }
+    }
+
+    #[test]
+    fn second_pass_read_error_discards_unflushed_prefix_without_claiming_eof() {
+        let bytes: Vec<u8> = (1..=20u64)
+            .flat_map(|id| serialized_fixture(id).to_bytes())
+            .collect();
+        let fail_at = 5 * SEAL_SPILL_RECORD_SIZE + 11;
+        let position = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = ObservedRead {
+            input: std::io::Cursor::new(&bytes),
+            position: std::rc::Rc::clone(&position),
+            fail_at: Some(fail_at),
+        };
+        let mut reader = BufReader::with_capacity(1, observed);
+        let mut sink = StreamingSink::default();
+        let outcome = replay_staged_stream(
+            &mut sink,
+            &mut reader,
+            StagedKind::Spill,
+            4,
+            Path::new("read-error-fixture"),
+        );
+        assert_eq!(
+            position.get(),
+            fail_at,
+            "the persistent read error must not be polled forever"
+        );
+        assert_eq!(
+            outcome.seals_reingested, 4,
+            "earlier acknowledged batches remain applied"
+        );
+        assert_eq!(sink.committed_id_sum, 1 + 2 + 3 + 4);
+        assert_eq!(
+            sink.discards, 1,
+            "the current unflushed prefix must stay pending"
+        );
+        assert_eq!(sink.pending, 0);
+        assert_eq!(sink.max_pending, 4);
+        assert_eq!(outcome.records_undecodable, 1);
+        assert!(!outcome.reached_eof);
+        assert!(!outcome.complete());
+        assert!(outcome.pending_unknown());
+        assert!(
+            !outcome.sink_failed,
+            "a damaged source is distinct from a failed database"
+        );
+    }
+
+    #[test]
+    fn bounded_dlq_preflight_defers_valid_siblings_of_oversized_input() {
+        let (spill, dlq) = temp_pair("streaming-dlq-line-cap");
+        let mut bytes = serde_json::to_vec(&SealDlqRecord::from(&serialized_fixture(11)))
+            .expect("first record");
+        assert!(bytes.len() < SEAL_DLQ_RECORD_MAX_BYTES);
+        bytes.push(b'\n');
+        // Deliberately much larger than the permitted record; the decoder
+        // must skip to newline without constructing a String of this size.
+        bytes.extend(std::iter::repeat_n(b'x', SEAL_DLQ_RECORD_MAX_BYTES * 8));
+        bytes.push(b'\n');
+        bytes.extend(
+            serde_json::to_vec(&SealDlqRecord::from(&serialized_fixture(25))).expect("last record"),
+        );
+        // The final valid record intentionally has no trailing newline.
+        let name = "seals-large-line.cseal3json";
+        std::fs::write(dlq.join(name), &bytes).expect("mixed DLQ fixture");
+        let mut sink = StreamingSink::default();
+        let outcome = drain_recovered_seals(&mut sink, &spill, &dlq, 1);
+        assert_eq!(sink.appended, 0);
+        assert_eq!(sink.committed, 0);
+        assert_eq!(sink.committed_id_sum, 0);
+        assert_eq!(sink.max_pending, 0);
+        assert_eq!(
+            outcome.seals_recovered, 2,
+            "bounded inspection can count both valid siblings"
+        );
+        assert_eq!(outcome.seals_left_pending, 2);
+        assert_eq!(outcome.records_undecodable, 1);
+        assert_eq!(outcome.files_deferred_invalid, 1);
+        assert!(outcome.pending_count_unknown);
+        assert_eq!(outcome.files_left_pending, 1);
+        assert_eq!(outcome.files_archived, 0);
+        assert_eq!(
+            std::fs::read(dlq.join(SEAL_REPLAYING_SUBDIR).join(name))
+                .expect("oversized original retained"),
+            bytes
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn bounded_dlq_line_limit_is_exact_across_reader_boundaries() {
+        for length in [
+            SEAL_DLQ_RECORD_MAX_BYTES - 1,
+            SEAL_DLQ_RECORD_MAX_BYTES,
+            SEAL_DLQ_RECORD_MAX_BYTES + 1,
+        ] {
+            let mut bytes = vec![b'x'; length];
+            bytes.extend_from_slice(b"\n{}\r\n");
+            let mut reader = BufReader::with_capacity(17, std::io::Cursor::new(bytes));
+            let mut line = [0u8; SEAL_DLQ_RECORD_MAX_BYTES];
+            assert_eq!(
+                read_bounded_dlq_line(&mut reader, &mut line).expect("bounded first line"),
+                Some((
+                    length.min(SEAL_DLQ_RECORD_MAX_BYTES),
+                    length > SEAL_DLQ_RECORD_MAX_BYTES
+                ))
+            );
+            assert_eq!(
+                read_bounded_dlq_line(&mut reader, &mut line).expect("following complete line"),
+                Some((3, false))
+            );
+            assert_eq!(&line[..3], b"{}\r");
+            assert_eq!(
+                read_bounded_dlq_line(&mut reader, &mut line).expect("clean EOF"),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn exhausted_staging_and_archive_names_preserve_every_original() {
+        for have_overflow in [false, true] {
+            let (spill, dlq) = temp_pair(&format!("name-exhaustion-{have_overflow}"));
+            let replaying = spill.join(SEAL_REPLAYING_SUBDIR);
+            let archive = spill.join(SEAL_ARCHIVE_SUBDIR);
+            std::fs::create_dir_all(&replaying).expect("staging dir");
+            std::fs::create_dir_all(&archive).expect("archive dir");
+            let sentinel = dlq.join("occupied-original");
+            std::fs::write(&sentinel, b"retained destination bytes").expect("sentinel");
+
+            for (directory, name) in [
+                (&replaying, "seals-stage.cseal3"),
+                (&archive, "seals-archive.cseal3"),
+            ] {
+                for suffix in 0..crate::seal_spill::SEAL_MOVE_NAME_ATTEMPTS {
+                    let name = if suffix == 0 {
+                        name.to_string()
+                    } else {
+                        format!("{name}.{suffix}")
+                    };
+                    std::fs::hard_link(&sentinel, directory.join(name)).expect("occupied name");
+                }
+                if have_overflow {
+                    std::fs::hard_link(&sentinel, directory.join(format!("{name}.overflow")))
+                        .expect("historical overflow sentinel");
+                }
+            }
+
+            let live = spill.join("seals-stage.cseal3");
+            let staged = replaying.join("seals-archive.cseal3");
+            std::fs::write(&live, b"live original").expect("live source");
+            std::fs::write(&staged, b"confirmed original").expect("archive source");
+            assert!(stage_pending_files(&spill).is_err());
+            assert!(archive_staged(&staged).is_err());
+            assert_eq!(
+                std::fs::read(&live).expect("live retained"),
+                b"live original"
+            );
+            assert_eq!(
+                std::fs::read(&staged).expect("staged retained"),
+                b"confirmed original"
+            );
+            assert_eq!(
+                std::fs::read(&sentinel).expect("all occupied hard links retained"),
+                b"retained destination bytes"
+            );
+            assert_eq!(
+                replaying.join("seals-stage.cseal3.overflow").exists(),
+                have_overflow
+            );
+            assert_eq!(
+                archive.join("seals-archive.cseal3.overflow").exists(),
+                have_overflow
+            );
+            cleanup(&spill, &dlq);
+        }
+    }
+
+    #[test]
+    fn move_seal_file_no_replace_handles_concurrent_collisions_without_overwrite() {
+        let (spill, dlq) = temp_pair("concurrent-names");
+        let mut sources = Vec::new();
+        for id in 0..8u8 {
+            let parent = spill.join(id.to_string());
+            std::fs::create_dir_all(&parent).expect("source dir");
+            let source = parent.join("seals-shared.cseal3");
+            std::fs::write(&source, [id]).expect("source bytes");
+            sources.push(source);
+        }
+        let barrier = std::sync::Barrier::new(sources.len());
+        std::thread::scope(|scope| {
+            for source in &sources {
+                let destination = &dlq;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    crate::seal_spill::move_seal_file_no_replace(source, destination)
+                        .expect("unique no-replace destination");
+                });
+            }
+        });
+        let paths = list_seal_files(&dlq, false).expect("all destinations discoverable");
+        let mut values: Vec<_> = paths
+            .iter()
+            .map(|path| std::fs::read(path).expect("retained bytes")[0])
+            .collect();
+        values.sort_unstable();
+        assert_eq!(values, (0..8u8).collect::<Vec<_>>());
+        assert!(sources.iter().all(|path| !path.exists()));
+        assert!(staged_kind(Path::new("seals-day.cseal3.1.2")).is_some());
+        assert!(staged_kind(Path::new("seals-day.cseal3.overflow.1")).is_some());
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn directory_and_entry_failures_never_report_a_clean_empty_backlog() {
+        let (spill, dlq) = temp_pair("discovery-errors");
+        let live = spill.join("seals-day.cseal3");
+        std::fs::write(&live, b"original bytes").expect("source");
+        let entry = std::fs::read_dir(&spill)
+            .expect("real directory")
+            .next()
+            .expect("entry");
+        let injected = vec![
+            entry,
+            Err(std::io::Error::other("injected directory entry failure")),
+        ];
+        assert!(collect_seal_files(injected).is_err());
+        assert_eq!(
+            std::fs::read(&live).expect("untouched source"),
+            b"original bytes"
+        );
+        assert!(!spill.join(SEAL_REPLAYING_SUBDIR).exists());
+
+        // A regular file where a directory is configured is a deterministic
+        // inspection failure even when tests run with elevated privileges.
+        let blocked = dlq.join("not-a-directory");
+        std::fs::write(&blocked, b"retained blocker").expect("blocker");
+        let mut sink = RecordingSink::default();
+        let outcome = drain_recovered_seals(&mut sink, &blocked, &blocked, 64);
+        assert_eq!(outcome.discovery_errors, 1);
+        assert!(outcome.pending_count_unknown);
+        assert!(!outcome.is_clean());
+        assert_eq!(
+            outcome.files_left_pending, 0,
+            "an unknown count must not be fabricated"
+        );
+        assert!(sink.accepted.is_empty());
+        assert_eq!(
+            std::fs::read(&blocked).expect("blocker retained"),
+            b"retained blocker"
+        );
+
+        let absent = dlq.join("genuinely-absent");
+        assert!(drain_recovered_seals(&mut sink, &absent, &absent, 64).is_clean());
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn unreadable_staging_directory_refuses_before_moving_live_files() {
+        let (spill, dlq) = temp_pair("staging-blocked");
+        let live = spill.join("seals-day.cseal3");
+        std::fs::write(&live, b"pending live bytes").expect("live");
+        std::fs::write(spill.join(SEAL_REPLAYING_SUBDIR), b"staging blocker").expect("blocker");
+        let mut sink = RecordingSink::default();
+        let outcome = drain_recovered_seals(&mut sink, &spill, &dlq, 64);
+        assert_eq!(outcome.discovery_errors, 1);
+        assert!(outcome.pending_count_unknown);
+        assert!(!outcome.is_clean());
+        assert!(sink.accepted.is_empty());
+        assert_eq!(
+            std::fs::read(&live).expect("live retained"),
+            b"pending live bytes"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn a_damaged_original_is_deferred_without_stranding_separate_complete_files() {
+        let (spill, dlq) = temp_pair("prefix-salvage");
+        let first = SerializedSeal::from(&mk_seal(11, 0, TfIndex::M1, 1_716_023_700, 100.0));
+        let interrupted = SerializedSeal::from(&mk_seal(22, 0, TfIndex::M1, 1_716_023_700, 100.0));
+        let later = SerializedSeal::from(&mk_seal(33, 0, TfIndex::M1, 1_716_023_700, 100.0));
+        let mut original = first.to_bytes().to_vec();
+        original.extend_from_slice(&interrupted.to_bytes()[..17]);
+        std::fs::write(spill.join("seals-2026-01-01.cseal3"), &original).expect("torn source");
+        std::fs::write(spill.join("seals-2026-01-02.cseal3"), later.to_bytes())
+            .expect("healthy source");
+        let mut sink = RecordingSink::default();
+        let outcome = drain_recovered_seals(&mut sink, &spill, &dlq, 64);
+        assert_eq!(
+            sink.accepted,
+            vec![33],
+            "the old prefix must never reach the sink"
+        );
+        assert_eq!(outcome.seals_recovered, 2);
+        assert_eq!(outcome.seals_left_pending, 1);
+        assert_eq!(outcome.seals_reingested, 1);
+        assert_eq!(outcome.records_undecodable, 1);
+        assert_eq!(outcome.files_deferred_invalid, 1);
+        assert_eq!(outcome.files_left_pending, 1);
+        assert_eq!(outcome.files_archived, 1);
+        assert!(outcome.pending_count_unknown);
+        assert_eq!(
+            std::fs::read(
+                spill
+                    .join(SEAL_REPLAYING_SUBDIR)
+                    .join("seals-2026-01-01.cseal3")
+            )
+            .expect("whole torn original retained"),
+            original
+        );
+        assert!(
+            spill
+                .join(SEAL_ARCHIVE_SUBDIR)
+                .join("seals-2026-01-02.cseal3")
+                .exists()
+        );
         cleanup(&spill, &dlq);
     }
 }

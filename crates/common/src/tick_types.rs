@@ -28,8 +28,13 @@ pub struct ParsedTick {
     pub received_at_nanos: i64,
     /// Average traded price (from Quote/Full; 0.0 for Ticker).
     pub average_traded_price: f32,
-    /// Cumulative day volume (from Quote/Full; 0 for Ticker).
+    /// Cumulative day volume. Interpret only when `volume_present` is true.
     pub volume: u32,
+    /// Whether this observation contains the cumulative-volume field.
+    /// A Quote/Full carrying zero is present; a Ticker has no such field.
+    /// Programmatic construction defaults to present for compatibility;
+    /// every wire decoder must set this field explicitly.
+    pub volume_present: bool,
     /// Total sell quantity (from Quote/Full; 0 for Ticker).
     pub total_sell_quantity: u32,
     /// Total buy quantity (from Quote/Full; 0 for Ticker).
@@ -71,6 +76,7 @@ impl Default for ParsedTick {
             received_at_nanos: 0,
             average_traded_price: 0.0,
             volume: 0,
+            volume_present: true,
             total_sell_quantity: 0,
             total_buy_quantity: 0,
             day_open: 0.0,
@@ -85,6 +91,212 @@ impl Default for ParsedTick {
             gamma: f64::NAN,
             theta: f64::NAN,
             vega: f64::NAN,
+        }
+    }
+}
+
+/// One source observation, preserving absence separately from a real zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeObservation {
+    Missing,
+    Cumulative(u64),
+}
+
+impl ParsedTick {
+    /// An explicit wider counter is itself a present observation.
+    #[inline]
+    #[must_use]
+    pub fn volume_observation(&self, wider_counter: Option<u64>) -> VolumeObservation {
+        match wider_counter {
+            Some(value) => VolumeObservation::Cumulative(value),
+            None if self.volume_present => VolumeObservation::Cumulative(u64::from(self.volume)),
+            None => VolumeObservation::Missing,
+        }
+    }
+}
+
+/// Quality of a quantity attributed under the configured candle clock.
+/// Eligibility establishes the local calculation contract, not that a retail
+/// source delivered every exchange trade or supplied aggressor-side labels.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VolumeQuality {
+    pub baseline_known: bool,
+    pub counter_ambiguous: bool,
+    pub volume_missing: bool,
+    pub attribution_uncertain: bool,
+}
+
+impl VolumeQuality {
+    #[inline]
+    #[must_use]
+    pub const fn is_eligible(self) -> bool {
+        self.baseline_known
+            && !self.counter_ambiguous
+            && !self.volume_missing
+            && !self.attribution_uncertain
+    }
+}
+
+/// Result of a single constant-work cumulative-counter observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeAssessment {
+    /// Previous accepted counter, or this observation when establishing a baseline.
+    pub baseline: u64,
+    /// Accepted monotonic counter on the current session axis.
+    pub cumulative: u64,
+    pub increment: u64,
+    pub baseline_seeded: bool,
+    pub session_changed: bool,
+    pub quality: VolumeQuality,
+}
+
+/// Shared, presence-aware cumulative-volume policy. A decrease without an
+/// explicit new session is ambiguous: it never lowers the accepted counter,
+/// and subsequent observations cannot silently certify the affected session.
+/// Magnitude, repeated packets and reaching an old high do not prove a reset.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VolumeCounter {
+    session_day: Option<u32>,
+    last: Option<u64>,
+    ambiguous: bool,
+    /// Unlike `last`, this survives an administrative same-session reset.
+    /// Missing Ticker observations do not consume first-trade evidence.
+    has_seen_counter: bool,
+}
+
+impl VolumeCounter {
+    #[inline]
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// A same-session administrative flush may forget its quantity baseline,
+    /// but it cannot turn an unresolved counter epoch into known data.
+    #[inline]
+    pub fn reset_baseline(&mut self) {
+        self.last = None;
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn cumulative(&self) -> Option<u64> {
+        self.last
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn session_day(&self) -> Option<u32> {
+        self.session_day
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn is_ambiguous(&self) -> bool {
+        self.ambiguous
+    }
+
+    /// The caller validates the session against its trusted receipt/replay clock.
+    /// Older-session input is refused here as a second defence and cannot reset
+    /// either the accepted axis or its ambiguity flag.
+    #[inline]
+    pub fn observe(
+        &mut self,
+        session_day: u32,
+        observation: VolumeObservation,
+    ) -> VolumeAssessment {
+        self.observe_with_opening_trade(session_day, observation, None)
+    }
+
+    /// Observe a counter with optional, caller-validated first-trade evidence.
+    ///
+    /// The caller must only provide a quantity for a current-session opening
+    /// second whose trusted receipt is in that same second. This counter also
+    /// requires positive cumulative == that trade's quantity and no accepted
+    /// counter yet in this session. A same-session reset after a counter, missing
+    /// field, duplicate or unresolved counter epoch can never mint a prefix.
+    /// All other observations retain the ordinary baseline-only behavior.
+    #[inline]
+    pub fn observe_with_opening_trade(
+        &mut self,
+        session_day: u32,
+        observation: VolumeObservation,
+        opening_trade_quantity: Option<u16>,
+    ) -> VolumeAssessment {
+        let old_session = self.session_day;
+        let session_changed = old_session.is_some_and(|old| session_day > old);
+        if old_session.is_some_and(|old| session_day < old) {
+            let value = self.last.unwrap_or(0);
+            return VolumeAssessment {
+                baseline: value,
+                cumulative: value,
+                increment: 0,
+                baseline_seeded: false,
+                session_changed: false,
+                quality: VolumeQuality {
+                    baseline_known: self.last.is_some(),
+                    counter_ambiguous: true,
+                    volume_missing: matches!(observation, VolumeObservation::Missing),
+                    attribution_uncertain: true,
+                },
+            };
+        }
+        if old_session.is_none() || session_changed {
+            self.session_day = Some(session_day);
+            self.last = None;
+            self.ambiguous = false;
+            self.has_seen_counter = false;
+        }
+        let mut quality = VolumeQuality {
+            baseline_known: self.last.is_some(),
+            counter_ambiguous: self.ambiguous,
+            volume_missing: false,
+            attribution_uncertain: false,
+        };
+        let VolumeObservation::Cumulative(value) = observation else {
+            quality.volume_missing = true;
+            let current = self.last.unwrap_or(0);
+            return VolumeAssessment {
+                baseline: current,
+                cumulative: current,
+                increment: 0,
+                baseline_seeded: false,
+                session_changed,
+                quality,
+            };
+        };
+        let Some(previous) = self.last else {
+            let opening_origin_proven = !self.has_seen_counter
+                && !self.ambiguous
+                && opening_trade_quantity
+                    .is_some_and(|quantity| quantity > 0 && value == u64::from(quantity));
+            self.last = Some(value);
+            self.has_seen_counter = true;
+            if opening_origin_proven {
+                quality.baseline_known = true;
+            }
+            return VolumeAssessment {
+                baseline: if opening_origin_proven { 0 } else { value },
+                cumulative: value,
+                increment: if opening_origin_proven { value } else { 0 },
+                baseline_seeded: true,
+                session_changed,
+                quality,
+            };
+        };
+        if value < previous {
+            self.ambiguous = true;
+            quality.counter_ambiguous = true;
+        } else {
+            self.last = Some(value);
+        }
+        let cumulative = self.last.unwrap_or(previous);
+        VolumeAssessment {
+            baseline: previous,
+            cumulative,
+            increment: cumulative.saturating_sub(previous),
+            baseline_seeded: false,
+            session_changed,
+            quality,
         }
     }
 }
@@ -225,6 +437,236 @@ impl DhanIntradayResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_counter_never_seeds_but_a_present_zero_does() {
+        let mut counter = VolumeCounter::default();
+        let missing = counter.observe(20_000, VolumeObservation::Missing);
+        assert!(!missing.quality.baseline_known);
+        assert!(missing.quality.volume_missing);
+        assert_eq!(counter.cumulative(), None);
+        let seeded = counter.observe(20_000, VolumeObservation::Cumulative(0));
+        assert!(seeded.baseline_seeded);
+        assert_eq!(counter.cumulative(), Some(0));
+        assert_eq!(
+            counter
+                .observe(20_000, VolumeObservation::Cumulative(100))
+                .increment,
+            100
+        );
+        assert_eq!(
+            counter
+                .observe(20_000, VolumeObservation::Cumulative(300))
+                .increment,
+            200
+        );
+    }
+
+    #[test]
+    fn proved_opening_trade_counts_once_and_only_on_a_new_session() {
+        for quantity in [1_u16, 600, u16::MAX] {
+            let value = u64::from(quantity);
+            let mut counter = VolumeCounter::default();
+            let first = counter.observe_with_opening_trade(
+                20_000,
+                VolumeObservation::Cumulative(value),
+                Some(quantity),
+            );
+            assert_eq!(first.baseline, 0);
+            assert_eq!(first.increment, value);
+            assert!(first.baseline_seeded);
+            assert!(first.quality.is_eligible());
+            let duplicate = counter.observe_with_opening_trade(
+                20_000,
+                VolumeObservation::Cumulative(value),
+                Some(quantity),
+            );
+            assert_eq!(duplicate.increment, 0);
+            assert!(!duplicate.baseline_seeded);
+
+            counter.reset_baseline();
+            let after_flush = counter.observe_with_opening_trade(
+                20_000,
+                VolumeObservation::Cumulative(value),
+                Some(quantity),
+            );
+            assert_eq!(after_flush.baseline, value);
+            assert_eq!(after_flush.increment, 0);
+            assert!(!after_flush.quality.baseline_known);
+
+            let tomorrow = counter.observe_with_opening_trade(
+                20_001,
+                VolumeObservation::Cumulative(value),
+                Some(quantity),
+            );
+            assert!(tomorrow.session_changed);
+            assert_eq!(tomorrow.baseline, 0);
+            assert_eq!(tomorrow.increment, value);
+        }
+    }
+
+    #[test]
+    fn opening_hint_cannot_create_volume_without_matching_present_quantity() {
+        for (observation, hint) in [
+            (VolumeObservation::Missing, Some(600)),
+            (VolumeObservation::Cumulative(600), None),
+            (VolumeObservation::Cumulative(1_200), Some(600)),
+            (VolumeObservation::Cumulative(0), Some(0)),
+            (VolumeObservation::Cumulative(u64::MAX), Some(u16::MAX)),
+        ] {
+            let mut counter = VolumeCounter::default();
+            let result = counter.observe_with_opening_trade(20_000, observation, hint);
+            assert_eq!(result.increment, 0);
+            assert!(!result.quality.baseline_known);
+        }
+    }
+
+    #[test]
+    fn missing_price_only_observation_does_not_consume_the_first_counter_evidence() {
+        let mut counter = VolumeCounter::default();
+        counter.observe(20_000, VolumeObservation::Missing);
+        let first_counter = counter.observe_with_opening_trade(
+            20_000,
+            VolumeObservation::Cumulative(600),
+            Some(600),
+        );
+        assert_eq!(first_counter.baseline, 0);
+        assert_eq!(first_counter.increment, 600);
+        assert!(first_counter.quality.baseline_known);
+    }
+
+    #[test]
+    fn opening_hint_cannot_clear_same_session_ambiguity_or_reopen_an_old_session() {
+        let mut counter = VolumeCounter::default();
+        counter.observe(20_000, VolumeObservation::Cumulative(1_200));
+        let regression = counter.observe_with_opening_trade(
+            20_000,
+            VolumeObservation::Cumulative(600),
+            Some(600),
+        );
+        assert_eq!(regression.increment, 0);
+        assert!(regression.quality.counter_ambiguous);
+        counter.reset_baseline();
+        let restart = counter.observe_with_opening_trade(
+            20_000,
+            VolumeObservation::Cumulative(600),
+            Some(600),
+        );
+        assert_eq!(restart.increment, 0);
+        assert!(restart.quality.counter_ambiguous);
+        let old = counter.observe_with_opening_trade(
+            19_999,
+            VolumeObservation::Cumulative(600),
+            Some(600),
+        );
+        assert_eq!(old.increment, 0);
+        assert!(old.quality.attribution_uncertain);
+        assert_eq!(counter.session_day(), Some(20_000));
+    }
+
+    #[test]
+    fn missing_observation_cannot_trigger_a_large_counter_reset() {
+        let mut counter = VolumeCounter::default();
+        counter.observe(20_000, VolumeObservation::Cumulative(3_000_000_000));
+        assert_eq!(
+            counter
+                .observe(20_000, VolumeObservation::Cumulative(3_000_000_100))
+                .increment,
+            100
+        );
+        counter.observe(20_000, VolumeObservation::Missing);
+        let last = counter.observe(20_000, VolumeObservation::Cumulative(3_000_000_200));
+        assert_eq!(last.increment, 100);
+        assert!(last.quality.is_eligible());
+    }
+
+    #[test]
+    fn ambiguous_decreases_never_reseed_after_a_packet_count_or_recovery() {
+        for high in [1_000_u64, 1 << 31, u64::MAX] {
+            let mut counter = VolumeCounter::default();
+            counter.observe(20_000, VolumeObservation::Cumulative(high));
+            for _ in 0..64 {
+                let lower = counter.observe(20_000, VolumeObservation::Cumulative(10));
+                assert!(lower.quality.counter_ambiguous);
+                assert_eq!(lower.increment, 0);
+                assert_eq!(lower.cumulative, high);
+            }
+            let recovery = counter.observe(20_000, VolumeObservation::Cumulative(high));
+            assert_eq!(recovery.increment, 0);
+            assert!(!recovery.quality.is_eligible());
+            let new_session = counter.observe(20_001, VolumeObservation::Cumulative(0));
+            assert!(new_session.session_changed);
+            assert!(new_session.baseline_seeded);
+            assert_eq!(new_session.increment, 0);
+            assert!(!new_session.quality.counter_ambiguous);
+            let next = counter.observe(20_001, VolumeObservation::Cumulative(50));
+            assert_eq!(next.increment, 50);
+            assert!(next.quality.is_eligible());
+        }
+    }
+
+    #[test]
+    fn old_session_and_u64_limits_cannot_corrupt_the_accepted_axis() {
+        let mut counter = VolumeCounter::default();
+        counter.observe(20_000, VolumeObservation::Cumulative(0));
+        let highest = counter.observe(20_000, VolumeObservation::Cumulative(u64::MAX));
+        assert_eq!(highest.increment, u64::MAX);
+        let stale = counter.observe(19_999, VolumeObservation::Cumulative(0));
+        assert!(stale.quality.attribution_uncertain);
+        assert_eq!(counter.cumulative(), Some(u64::MAX));
+        assert_eq!(counter.session_day(), Some(20_000));
+        assert_eq!(
+            counter
+                .observe(20_000, VolumeObservation::Cumulative(u64::MAX))
+                .increment,
+            0
+        );
+    }
+
+    #[test]
+    fn an_administrative_flush_cannot_clear_same_session_counter_ambiguity() {
+        let mut counter = VolumeCounter::default();
+        counter.observe(20_000, VolumeObservation::Cumulative(1_000));
+        counter.observe(20_000, VolumeObservation::Cumulative(100));
+        counter.reset_baseline();
+        let seeded = counter.observe(20_000, VolumeObservation::Cumulative(200));
+        assert!(seeded.baseline_seeded);
+        assert!(seeded.quality.counter_ambiguous);
+        assert!(
+            !counter
+                .observe(20_000, VolumeObservation::Cumulative(300))
+                .quality
+                .is_eligible()
+        );
+        assert!(
+            counter
+                .observe(20_001, VolumeObservation::Cumulative(0))
+                .session_changed
+        );
+        assert!(
+            counter
+                .observe(20_001, VolumeObservation::Cumulative(50))
+                .quality
+                .is_eligible()
+        );
+    }
+
+    #[test]
+    fn parsed_volume_presence_survives_an_explicit_wider_override() {
+        let tick = ParsedTick {
+            volume_present: false,
+            ..ParsedTick::default()
+        };
+        assert_eq!(tick.volume_observation(None), VolumeObservation::Missing);
+        assert_eq!(
+            tick.volume_observation(Some(0)),
+            VolumeObservation::Cumulative(0)
+        );
+        assert_eq!(
+            tick.volume_observation(Some(u64::MAX)),
+            VolumeObservation::Cumulative(u64::MAX)
+        );
+    }
 
     // --- ParsedTick ---
 
@@ -425,6 +867,7 @@ mod tests {
             received_at_nanos: 1_740_556_500_123_456_789,
             average_traded_price: 244.0,
             volume: 50000,
+            volume_present: true,
             total_sell_quantity: 25000,
             total_buy_quantity: 25000,
             day_open: 242.0,

@@ -108,9 +108,19 @@ jobs:
             echo "::notice::AWS bootstrap secrets not yet configured — skipping deploy chain."
             echo "::notice::Follow deploy/aws/terraform/BOOTSTRAP-ONE-TIME.md (40 sec) to enable automation."
             echo ""
-            echo "Skipped jobs: build, guard_market_hours, deploy."
+            echo "Skipped jobs: build, release_validation, guard_market_hours, deploy."
             echo "This is the EXPECTED state for a fresh repo. Workflow exits 0."
           fi
+
+  release_validation:
+    name: Release Validation
+    needs: preflight
+    if: needs.preflight.outputs.bootstrap_ready == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/release-validation.yml
+    with:
+      source_sha: ${{ github.sha }}
 
   build:
     # Native ARM64 runner — matches t4g.medium Graviton instance arch.
@@ -126,6 +136,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: Install Rust toolchain (host = aarch64-unknown-linux-musl, static binary)
         # MUSL static target eliminates GLIBC version dependency entirely.
@@ -224,16 +237,31 @@ jobs:
         env:
           CC_aarch64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-          # Same provenance var as the main build — BOTH shipped binaries
-          # embed the exact deploy sha.
+          # Same provenance var as the main build — the smoke check embeds
+          # the exact deploy sha too.
           TICKVAULT_BUILD_GIT_SHA: ${{ github.sha }}
         run: cargo build --release --target aarch64-unknown-linux-musl --bin smoke_test -p tickvault-app
+
+      - name: Build WAL sequence migration operator binary (ARM64 musl static)
+        # Distribution only: a migration still requires a stopped writer and
+        # independently verified namespace evidence supplied by the operator.
+        env:
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          TICKVAULT_BUILD_GIT_SHA: ${{ github.sha }}
+        run: cargo build --release --target aarch64-unknown-linux-musl --bin tv-wal-sequence-migrate -p tickvault-storage
 
       - name: Verify binaries exist + tickvault under 30MB + statically linked
         run: |
           BIN_DIR=target/aarch64-unknown-linux-musl/release
           file "$BIN_DIR/tickvault"
           file "$BIN_DIR/smoke_test"
+          file "$BIN_DIR/tv-wal-sequence-migrate"
+          file "$BIN_DIR/tv-wal-sequence-migrate" | grep -q 'aarch64\|ARM' \
+            || (echo "FAIL: WAL sequence migration binary is not ARM64"; exit 1)
+          file "$BIN_DIR/tv-wal-sequence-migrate" | grep -q 'statically linked' \
+            || (echo "FAIL: WAL sequence migration binary is not statically linked"; exit 1)
+          "$BIN_DIR/tv-wal-sequence-migrate" --help >/dev/null
           # Confirm the file command reports ARM aarch64 (not x86)
           file "$BIN_DIR/tickvault" | grep -q 'aarch64\|ARM' \
             || (echo "FAIL: tickvault is not ARM64 — arch mismatch with Graviton box"; exit 1)
@@ -260,14 +288,15 @@ jobs:
             exit 1
           fi
 
-      - name: Stage both binaries for upload
+      - name: Stage application, smoke, and migration binaries for upload
         run: |
           mkdir -p dist
           BIN_DIR=target/aarch64-unknown-linux-musl/release
           cp "$BIN_DIR/tickvault"   dist/tickvault
           cp "$BIN_DIR/smoke_test"  dist/smoke_test
+          cp "$BIN_DIR/tv-wal-sequence-migrate" dist/tv-wal-sequence-migrate
 
-      - name: Upload artifact (both binaries)
+      - name: Upload artifact (application, smoke, and migration binaries)
         id: upload
         uses: actions/upload-artifact@v7
         with:
@@ -391,7 +420,7 @@ jobs:
   deploy:
     name: Deploy to EC2
     runs-on: ubuntu-24.04
-    needs: [preflight, build, guard_market_hours]
+    needs: [preflight, build, guard_market_hours, release_validation]
     # deploy_allowed gate (2026-07-17): on an in-window MAIN-BRANCH push run
     # the guard now exits GREEN with deploy_allowed=false (deferred no-op)
     # instead of red — this condition is what actually skips the deploy in
@@ -399,17 +428,49 @@ jobs:
     # runs emit deploy_allowed=true; an in-window dispatch WITHOUT the
     # override, and an in-window TAG push, still fail the guard job red,
     # which skips this job via `needs` exactly as before.
-    if: needs.preflight.outputs.bootstrap_ready == 'true' && needs.guard_market_hours.outputs.deploy_allowed == 'true'
+    if: needs.preflight.outputs.bootstrap_ready == 'true' && needs.guard_market_hours.outputs.deploy_allowed == 'true' && needs.release_validation.result == 'success'
     environment: prod
     steps:
       - name: Checkout (for deploy scripts)
         uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Require release validation for this deployment source
+        env:
+          VALIDATED_SHA: ${{ needs.release_validation.outputs.source_sha }}
+          VALIDATED_TREE: ${{ needs.release_validation.outputs.source_tree }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$VALIDATED_TREE" =~ ^[0-9a-f]{40}$ ]]
+          test "$VALIDATED_SHA" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$VALIDATED_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$VALIDATED_TREE"
+          printf 'Deployment source `%s`, tree `%s`, passed required release validation. Remaining deployment gates still apply.\n' \
+            "$VALIDATED_SHA" "$VALIDATED_TREE" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Download built binary
         uses: actions/download-artifact@v4
         with:
           name: tickvault-binary
           path: ./dist/
+
+      - name: Bind deployment to downloaded artifact bytes
+        id: artifact_digests
+        run: |
+          set -euo pipefail
+          for binary in tickvault smoke_test tv-wal-sequence-migrate; do
+            digest=$(sha256sum "./dist/$binary" | cut -d ' ' -f 1)
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::Missing artifact digest for $binary"; exit 1; }
+            case "$binary" in
+              tickvault) key=tickvault ;;
+              smoke_test) key=smoke_test ;;
+              tv-wal-sequence-migrate) key=migration ;;
+            esac
+            printf '%s_sha256=%s\n' "$key" "$digest" >> "$GITHUB_OUTPUT"
+          done
 
       - name: Configure AWS credentials (OIDC preferred, keys fallback)
         # The OIDC role (AWS_ROLE_ARN) only exists AFTER the post-bootstrap
@@ -715,16 +776,19 @@ jobs:
             echo "::warning::$MISSING /tickvault/prod/* keys are missing — app boot may HALT. Populate them MANUALLY via aws ssm put-parameter (operator-owned; the deploy never auto-seeds prod)."
           fi
 
-      - name: Upload both binaries to S3 deploy bucket
+      - name: Upload application, smoke, and migration binaries to S3 deploy bucket
         # Skipped on an intentional off-hours skip — no deploy is happening.
         if: env.DEPLOY_SKIP_REASON == ''
         run: |
-          chmod +x ./dist/tickvault ./dist/smoke_test
+          chmod +x ./dist/tickvault ./dist/smoke_test ./dist/tv-wal-sequence-migrate
           aws s3 cp ./dist/tickvault \
             s3://tv-prod-cold/deploys/${{ github.sha }}/tickvault \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }}
           aws s3 cp ./dist/smoke_test \
             s3://tv-prod-cold/deploys/${{ github.sha }}/smoke_test \
+            --region ${{ vars.AWS_REGION || 'ap-south-1' }}
+          aws s3 cp ./dist/tv-wal-sequence-migrate \
+            s3://tv-prod-cold/deploys/${{ github.sha }}/tv-wal-sequence-migrate \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }}
 
       - name: Re-gate market hours at SWAP time (no mid-session restart)
@@ -823,7 +887,9 @@ jobs:
       # Back up the current binary so we can roll back
       # Download the new binaries from S3
       # Run smoke test using the NEW standalone binary (must exit 0 in < 30s)
-      # Atomic swap of both binaries after smoke passes
+      # Rename staged binaries after smoke and operator --help checks pass.
+      # The migration tool performs read-only admission inspection; applying a
+      # namespace migration remains an explicit offline operator prerequisite.
       # Reload systemd (picks up the refreshed unit) + (re)enable + restart.
       # `enable` is required because a previously-failed deploy may have
       # disabled the service via the auto-stop step (kills Telegram spam).
@@ -922,6 +988,353 @@ jobs:
       # has zero log streams. Idempotent. EVERY step is `|| true` and bounded by
       # `timeout` / `--no-block` so the agent can NEVER block or fail the deploy —
       # the verified-running trading app above is what the deploy succeeds on.
+      - name: Refuse unready WAL authority and unapproved artifacts before installation
+        id: wal_admission
+        if: env.DEPLOY_SKIP_REASON == ''
+        env:
+          AWS_REGION_EFF: ${{ vars.AWS_REGION || 'ap-south-1' }}
+          DEPLOY_SHA: ${{ github.sha }}
+          DEPLOY_RUN_ID: ${{ github.run_id }}
+          DEPLOY_RUN_ATTEMPT: ${{ github.run_attempt }}
+          DEPLOY_TICKVAULT_SHA256: ${{ steps.artifact_digests.outputs.tickvault_sha256 }}
+          DEPLOY_SMOKE_SHA256: ${{ steps.artifact_digests.outputs.smoke_test_sha256 }}
+          DEPLOY_MIGRATION_SHA256: ${{ steps.artifact_digests.outputs.migration_sha256 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 2
+          [[ "$DEPLOY_RUN_ID" =~ ^[0-9]+$ && "$DEPLOY_RUN_ATTEMPT" =~ ^[0-9]+$ ]] || exit 2
+          STAGE_ID=$DEPLOY_SHA-$DEPLOY_RUN_ID-$DEPLOY_RUN_ATTEMPT
+          GUARD_SHA=$(sha256sum scripts/tickvault-start-guard.sh | cut -d ' ' -f 1)
+          DROPIN_SHA=$(sha256sum deploy/systemd/tickvault-sequence-guard.conf | cut -d ' ' -f 1)
+          for digest in "$DEPLOY_TICKVAULT_SHA256" "$DEPLOY_SMOKE_SHA256" "$DEPLOY_MIGRATION_SHA256" "$GUARD_SHA" "$DROPIN_SHA"; do
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || exit 2
+          done
+          cat > "$RUNNER_TEMP/tickvault-wal-admission.sh" <<'TV_WAL_ADMISSION'
+          # WAL-DEPLOY-PREFLIGHT-BEGIN
+          set -euo pipefail
+          umask 077
+          export LC_ALL=C
+          [[ "$STAGE_ID" =~ ^${DEPLOY_SHA}-[0-9]+-[0-9]+$ ]] || exit 2
+          BASE=/var/lib/tickvault/deploy-stage
+          [ ! -L /var/lib/tickvault ] && [ ! -L "$BASE" ] || exit 2
+          [ "$(stat -c %u /var/lib/tickvault)" = 0 ] || exit 2
+          mode=$(stat -c %a /var/lib/tickvault)
+          (( (8#$mode & 0022) == 0 )) || exit 2
+          install -d -m 0700 -o root -g root "$BASE"
+          STAGE=$BASE/$STAGE_ID
+          mkdir -m 0700 "$STAGE"
+          # Only a fresh root-private staging directory is written. The active
+          # application, repository, config, WAL and service remain untouched.
+          for binary in tickvault smoke_test tv-wal-sequence-migrate; do
+            timeout 120 aws s3 cp "s3://tv-prod-cold/deploys/$DEPLOY_SHA/$binary" "$STAGE/$binary"
+            chmod 0755 "$STAGE/$binary"
+          done
+          printf '%s  tickvault\n%s  smoke_test\n%s  tv-wal-sequence-migrate\n' "$EXPECTED_TICKVAULT_SHA256" "$EXPECTED_SMOKE_SHA256" "$EXPECTED_MIGRATION_SHA256" > "$STAGE/artifacts.sha256"
+          printf '%s  /usr/local/libexec/tickvault-start-guard\n%s  /etc/systemd/system/tickvault.service.d/90-sequence-authority-guard.conf\n' "$EXPECTED_GUARD_SHA256" "$EXPECTED_DROPIN_SHA256" > "$STAGE/start-guard.sha256"
+          cat > "$STAGE/verify.sh" <<'TV_WAL_VERIFY'
+          # WAL-DEPLOY-VERIFY-BEGIN
+          set -euo pipefail
+          export LC_ALL=C
+          [ "$#" = 4 ] || exit 2
+          DEPLOY_SHA=$1; APP_SHA=$2; MIGRATION_SHA=$3; SMOKE_SHA=$4
+          [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 2
+          for digest in "$APP_SHA" "$MIGRATION_SHA" "$SMOKE_SHA"; do
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || exit 2
+          done
+          STAGE=$(cd -- "$(dirname -- "$0")" && pwd -P)
+          [[ "${STAGE##*/}" =~ ^${DEPLOY_SHA}-[0-9]+-[0-9]+$ ]] || exit 2
+          secure_path() {
+            local path=$1 kind=$2 cursor=$1 uid mode links
+            [ "$(realpath -e -- "$path")" = "$path" ] || return 2
+            while [ "$cursor" != / ]; do
+              [ ! -L "$cursor" ] || return 2
+              uid=$(stat -c %u -- "$cursor") || return 2
+              mode=$(stat -c %a -- "$cursor") || return 2
+              [ "$uid" = 0 ] || return 2
+              if (( (8#$mode & 0022) != 0 )); then
+                [ -d "$cursor" ] && (( (8#$mode & 01000) != 0 )) || return 2
+              fi
+              cursor=$(dirname -- "$cursor")
+            done
+            if [ "$kind" = directory ]; then [ -d "$path" ]; else
+              [ -f "$path" ] && [ "$(stat -c %h -- "$path")" = 1 ] || return 2
+            fi
+          }
+          GUARD=/usr/local/libexec/tickvault-start-guard
+          DROPIN=/etc/systemd/system/tickvault.service.d/90-sequence-authority-guard.conf
+          WAL_DIR=/opt/tickvault/data/ws_wal
+          secure_path "$STAGE" directory
+          for file in verify.sh artifacts.sha256 start-guard.sha256 tickvault smoke_test tv-wal-sequence-migrate; do secure_path "$STAGE/$file" regular; done
+          secure_path "$GUARD" regular
+          secure_path "$DROPIN" regular
+          secure_path /opt/tickvault directory
+          secure_path /opt/tickvault/bin directory
+          (cd "$STAGE" && sha256sum --check --status artifacts.sha256 && sha256sum --check --status start-guard.sha256)
+          printf '%s  %s/tickvault\n%s  %s/tv-wal-sequence-migrate\n%s  %s/smoke_test\n' "$APP_SHA" "$STAGE" "$MIGRATION_SHA" "$STAGE" "$SMOKE_SHA" "$STAGE" | sha256sum --check --status
+          # The independent drop-in must already be installed and loaded;
+          # normal deployment never installs it, issues policy, or unfences.
+          start=$(systemctl show -p ExecStart --value tickvault)
+          [[ "$start" == *'path=/usr/local/libexec/tickvault-start-guard ;'* && "$start" == *'argv[]=/usr/local/libexec/tickvault-start-guard run ;'* ]] || { echo START_GUARD_NOT_LOADED; exit 2; }
+          condition=$(systemctl show -p ExecCondition --value tickvault)
+          [[ "$condition" == *'path=/usr/local/libexec/tickvault-start-guard ;'* && "$condition" == *'argv[]=/usr/local/libexec/tickvault-start-guard check ;'* ]] || { echo START_CONDITION_NOT_LOADED; exit 2; }
+          runtime_user=$(systemctl show -p User --value tickvault)
+          [ "$runtime_user" = ec2-user ] || { echo START_RUNTIME_USER_UNVERIFIED; exit 2; }
+          # A root admission alone cannot prove that the service account can
+          # read its policy and shared lock. Verify the current approved app
+          # under the same user before any normal-deployment mutation.
+          timeout 30 sudo -u ec2-user -- "$GUARD" check
+          pid=$(systemctl show -p MainPID --value tickvault)
+          [[ "$pid" =~ ^[0-9]+$ ]] || exit 2
+          if [ "$pid" != 0 ]; then
+            [ "$(readlink -e "/proc/$pid/cwd")" = /opt/tickvault ] || exit 2
+            found=no; seen=0
+            for fd in /proc/"$pid"/fd/*; do
+              seen=$((seen + 1)); [ "$seen" -le 4096 ] || exit 2
+              target=$(readlink -- "$fd") || continue
+              if [ "$target" = "$WAL_DIR/.wal-owner.lock" ]; then found=yes; fi
+            done
+            [ "$found" = yes ] || { echo ACTIVE_WAL_NAMESPACE_UNVERIFIED; exit 2; }
+            [ "$(systemctl show -p MainPID --value tickvault)" = "$pid" ] || exit 2
+          fi
+          timeout 15 "$STAGE/tv-wal-sequence-migrate" --inspect --wal-dir "$WAL_DIR" > "$STAGE/namespace-observation.json"
+          jq -e --arg wal "$WAL_DIR" '.mode == "inspect" and .wal_directory == $wal and .namespace_state == "valid_durable_authority" and .authority_structurally_valid == true and (.reserved_through | type == "string" and test("^[0-9]+$")) and .migration_applied == false and .sequence_authority_written == false and .deployment_authorized == false' "$STAGE/namespace-observation.json" >/dev/null
+          timeout 30 "$GUARD" admit --binary "$STAGE/tickvault" --sha256 "$APP_SHA" --source-sha "$DEPLOY_SHA" --wal-dir "$WAL_DIR"
+          printf 'WAL_DEPLOY_ADMISSION_PASSED commit=%s binary_sha256=%s\n' "$DEPLOY_SHA" "$APP_SHA"
+          # WAL-DEPLOY-VERIFY-END
+          TV_WAL_VERIFY
+          chmod 0700 "$STAGE/verify.sh"
+          bash "$STAGE/verify.sh" "$DEPLOY_SHA" "$EXPECTED_TICKVAULT_SHA256" "$EXPECTED_MIGRATION_SHA256" "$EXPECTED_SMOKE_SHA256"
+          printf '%s\n' "$STAGE_ID" > "$STAGE/ready"
+          # WAL-DEPLOY-PREFLIGHT-END
+          TV_WAL_ADMISSION
+          PARAMETERS=$(jq -cn --arg sha "$DEPLOY_SHA" --arg id "$STAGE_ID" --arg app "$DEPLOY_TICKVAULT_SHA256" --arg smoke "$DEPLOY_SMOKE_SHA256" --arg migration "$DEPLOY_MIGRATION_SHA256" --arg guard "$GUARD_SHA" --arg dropin "$DROPIN_SHA" --rawfile script "$RUNNER_TEMP/tickvault-wal-admission.sh" '{commands: ["DEPLOY_SHA=" + $sha, "STAGE_ID=" + $id, "EXPECTED_TICKVAULT_SHA256=" + $app, "EXPECTED_SMOKE_SHA256=" + $smoke, "EXPECTED_MIGRATION_SHA256=" + $migration, "EXPECTED_GUARD_SHA256=" + $guard, "EXPECTED_DROPIN_SHA256=" + $dropin, $script], executionTimeout: ["600"]}')
+          CMD=$(aws ssm send-command --region "$AWS_REGION_EFF" --instance-ids "$IID" --document-name AWS-RunShellScript --parameters "$PARAMETERS" --query Command.CommandId --output text)
+          STATUS=Pending
+          for _ in $(seq 1 120); do
+            STATUS=$(aws ssm get-command-invocation --region "$AWS_REGION_EFF" --command-id "$CMD" --instance-id "$IID" --query Status --output text 2>/dev/null || echo Pending)
+            case "$STATUS" in Success|Failed|Cancelled|TimedOut) break ;; esac
+            sleep 5
+          done
+          OUT=$(aws ssm get-command-invocation --region "$AWS_REGION_EFF" --command-id "$CMD" --instance-id "$IID" --query StandardOutputContent --output text 2>/dev/null || echo '')
+          printf '%s\n' "$OUT"
+          if [ "$STATUS" != Success ] || ! printf '%s\n' "$OUT" | grep -Fxq "WAL_DEPLOY_ADMISSION_PASSED commit=$DEPLOY_SHA binary_sha256=$DEPLOY_TICKVAULT_SHA256"; then
+            echo "::error::WAL/artifact admission refused or unverified (status=$STATUS). No application/repository/config mutation or service stop was requested. Stage evidence remains under /var/lib/tickvault/deploy-stage/$STAGE_ID. Complete the explicit offline migration/start-policy prerequisites; this workflow never fabricates them."
+            exit 1
+          fi
+          echo "stage_id=$STAGE_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare private coherent rollback snapshot
+        id: rollback
+        if: env.DEPLOY_SKIP_REASON == ''
+        env:
+          AWS_REGION_EFF: ${{ vars.AWS_REGION || 'ap-south-1' }}
+          DEPLOY_SHA: ${{ github.sha }}
+          DEPLOY_RUN_ID: ${{ github.run_id }}
+          DEPLOY_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 2
+          [[ "$DEPLOY_RUN_ID" =~ ^[0-9]+$ && "$DEPLOY_RUN_ATTEMPT" =~ ^[0-9]+$ ]] || exit 2
+          ROLLBACK_ID=$DEPLOY_SHA-$DEPLOY_RUN_ID-$DEPLOY_RUN_ATTEMPT
+          cat > "$RUNNER_TEMP/prepare-tickvault-rollback.sh" <<'TV_PREPARE_ROLLBACK'
+          # COHERENT-ROLLBACK-PREPARE-BEGIN
+          set -euo pipefail
+          umask 077
+          [[ "$ROLLBACK_ID" =~ ^[0-9a-f]{40}-[0-9]+-[0-9]+$ ]] || exit 2
+          BASE=/var/lib/tickvault/deploy-rollback
+          [ ! -L "$BASE" ] || { echo ROLLBACK_BASE_IS_SYMLINK; exit 2; }
+          install -d -m 0700 "$BASE"
+          SNAPSHOT=$BASE/$ROLLBACK_ID
+          mkdir -m 0700 "$SNAPSHOT"
+          # Only deployment-owned paths. Absent paths are retained as evidence,
+          # so rollback removes only new owned paths, never an unrelated tree.
+          cat > "$SNAPSHOT/owned.paths" <<'TV_OWNED_PATHS'
+          opt/tickvault/bin/tickvault
+          opt/tickvault/bin/smoke_test
+          opt/tickvault/bin/tv-wal-sequence-migrate
+          opt/tickvault/config
+          etc/systemd/system/tickvault.service
+          etc/systemd/system/tickvault-holiday-gate.service
+          etc/systemd/system/tickvault-host-tuning.service
+          TV_OWNED_PATHS
+          : > "$SNAPSHOT/present.paths"
+          : > "$SNAPSHOT/absent.paths"
+          while IFS= read -r path; do
+            [ ! -L "/$path" ] || { echo "ROLLBACK_UNSUPPORTED_OWNED_SYMLINK path=$path"; exit 2; }
+            if [ -e "/$path" ]; then
+              printf '%s\n' "$path" >> "$SNAPSHOT/present.paths"
+            else
+              printf '%s\n' "$path" >> "$SNAPSHOT/absent.paths"
+            fi
+          done < "$SNAPSHOT/owned.paths"
+          # Internal config links are preserved. External targets would not
+          # belong to this snapshot and cannot be promised a coherent restore.
+          if [ -d /opt/tickvault/config ]; then
+            while IFS= read -r -d '' link; do
+              resolved=$(readlink -f -- "$link") || exit 2
+              case "$resolved" in /opt/tickvault/config/*) ;; *) echo ROLLBACK_EXTERNAL_CONFIG_SYMLINK; exit 2 ;; esac
+            done < <(find /opt/tickvault/config -type l -print0)
+          fi
+          : > "$SNAPSHOT/lifecycle"
+          for unit in tickvault tickvault-host-tuning; do
+            load=$(systemctl show -p LoadState --value "$unit" 2>/dev/null) || exit 2
+            if [ "$load" = not-found ]; then
+              state=inactive; enabled=not-found
+            else
+              [ "$load" = loaded ] || { echo "ROLLBACK_UNSUPPORTED_LOAD unit=$unit state=$load"; exit 2; }
+              state=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null) || exit 2
+              enabled=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+              case "$state" in active|inactive) ;; *) echo "ROLLBACK_NONQUIESCENT unit=$unit state=$state"; exit 2 ;; esac
+              case "$enabled" in enabled|disabled|static|indirect) ;; *) echo "ROLLBACK_UNSUPPORTED_ENABLEMENT unit=$unit state=$enabled"; exit 2 ;; esac
+            fi
+            printf '%s|%s|%s\n' "$unit" "$state" "$enabled" >> "$SNAPSHOT/lifecycle"
+          done
+          sha256sum /usr/local/libexec/tickvault-start-guard /etc/systemd/system/tickvault.service.d/90-sequence-authority-guard.conf > "$SNAPSHOT/start-guard.sha256"
+          tar --create --format=posix --acls --xattrs --file "$SNAPSHOT/previous.tar" --directory / --files-from "$SNAPSHOT/present.paths" 2> "$SNAPSHOT/snapshot.log"
+          cat > "$SNAPSHOT/restore.sh" <<'TV_RESTORE_ROLLBACK'
+          # COHERENT-ROLLBACK-RESTORE-BEGIN
+          set -Eeuo pipefail
+          umask 077
+          SNAPSHOT=$(cd -- "$(dirname -- "$0")" && pwd)
+          PHASE=validate
+          restore_failed() {
+            rc=$?
+            trap - ERR
+            printf 'ROLLBACK_FAILED phase=%s exit=%s\n' "$PHASE" "$rc" > "$SNAPSHOT/restore.status"
+            printf 'ROLLBACK_FAILED phase=%s exit=%s evidence=%s\n' "$PHASE" "$rc" "$SNAPSHOT"
+            exit "$rc"
+          }
+          trap restore_failed ERR
+          test -f "$SNAPSHOT/ready"
+          (cd "$SNAPSHOT" && sha256sum --check --status manifest.sha256)
+          if [ "${1:-}" = --check-current ]; then
+            PHASE=check-baseline
+            tar --compare --acls --xattrs --file "$SNAPSHOT/previous.tar" --directory / >> "$SNAPSHOT/restore.log" 2>&1
+            while IFS= read -r path; do
+              test ! -e "/$path"
+              test ! -L "/$path"
+            done < "$SNAPSHOT/absent.paths"
+            while IFS='|' read -r unit prior_state prior_enabled; do
+              if [ "$prior_enabled" = not-found ]; then
+                test "$(systemctl show -p LoadState --value "$unit")" = not-found
+              else
+                test "$(systemctl show -p ActiveState --value "$unit")" = "$prior_state"
+                actual=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+                test "$actual" = "$prior_enabled"
+              fi
+            done < "$SNAPSHOT/lifecycle"
+            echo ROLLBACK_BASELINE_CURRENT
+            exit 0
+          fi
+          test "$#" -eq 0
+          PHASE=verify-persistent-guard
+          sha256sum --check --status "$SNAPSHOT/start-guard.sha256"
+          PHASE=stop
+          load=$(systemctl show -p LoadState --value tickvault 2>> "$SNAPSHOT/restore.log")
+          if [ "$load" != not-found ]; then
+            systemctl stop tickvault >> "$SNAPSHOT/restore.log" 2>&1
+            test "$(systemctl show -p ActiveState --value tickvault)" = inactive
+          fi
+          # Remove only enablement belonging to the two units this deploy
+          # enables. Restore saved enablement before restoring active state.
+          while IFS='|' read -r unit prior_state prior_enabled; do
+            load=$(systemctl show -p LoadState --value "$unit" 2>> "$SNAPSHOT/restore.log")
+            if [ "$load" != not-found ]; then
+              systemctl disable "$unit" >> "$SNAPSHOT/restore.log" 2>&1
+            fi
+          done < "$SNAPSHOT/lifecycle"
+          PHASE=restore-files
+          FAILED=$(mktemp -d "$SNAPSHOT/failed-state.XXXXXX")
+          slot=0
+          while IFS= read -r path; do
+            if [ -e "/$path" ] || [ -L "/$path" ]; then
+              mv -- "/$path" "$FAILED/$slot"
+            fi
+            slot=$((slot + 1))
+          done < "$SNAPSHOT/owned.paths"
+          tar --extract --same-owner --same-permissions --acls --xattrs --file "$SNAPSHOT/previous.tar" --directory / >> "$SNAPSHOT/restore.log" 2>&1
+          tar --compare --acls --xattrs --file "$SNAPSHOT/previous.tar" --directory / >> "$SNAPSHOT/restore.log" 2>&1
+          while IFS= read -r path; do
+            test ! -e "/$path"
+            test ! -L "/$path"
+          done < "$SNAPSHOT/absent.paths"
+          PHASE=restore-systemd
+          systemctl daemon-reload >> "$SNAPSHOT/restore.log" 2>&1
+          while IFS='|' read -r unit prior_state prior_enabled; do
+            if [ "$prior_enabled" = enabled ]; then
+              systemctl enable "$unit" >> "$SNAPSHOT/restore.log" 2>&1
+            fi
+            if [ "$prior_enabled" != not-found ]; then
+              actual=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+              test "$actual" = "$prior_enabled"
+            fi
+          done < "$SNAPSHOT/lifecycle"
+          PHASE=restore-lifecycle
+          # Host tuning is restored before the application. An intentionally
+          # inactive previous app is never started by rollback.
+          for wanted in tickvault-host-tuning tickvault; do
+            while IFS='|' read -r unit prior_state prior_enabled; do
+              [ "$unit" = "$wanted" ] || continue
+              if [ "$prior_state" = active ]; then
+                if [ "$unit" = tickvault ]; then
+                  PHASE=restore-compatibility
+                  if ! timeout 30 /usr/local/libexec/tickvault-start-guard check >> "$SNAPSHOT/restore.log" 2>&1; then
+                    # The independent gate remains installed even when the old
+                    # base unit is restored. Never approve or start this binary.
+                    if timeout 30 /usr/local/libexec/tickvault-start-guard fence --reason rollback_incompatible >> "$SNAPSHOT/restore.log" 2>&1; then
+                      printf 'ROLLBACK_FENCED_INCOMPLETE reason=artifact_not_admitted evidence=%s\n' "$SNAPSHOT" | tee "$SNAPSHOT/restore.status"
+                    else
+                      printf 'ROLLBACK_FENCE_UNVERIFIED evidence=%s\n' "$SNAPSHOT" | tee "$SNAPSHOT/restore.status"
+                    fi
+                    exit 2
+                  fi
+                  PHASE=restore-lifecycle
+                fi
+                systemctl reset-failed "$unit" >> "$SNAPSHOT/restore.log" 2>&1
+                systemctl restart "$unit" >> "$SNAPSHOT/restore.log" 2>&1
+                restored=no
+                for _ in $(seq 1 30); do
+                  if systemctl is-active --quiet "$unit"; then restored=yes; break; fi
+                  sleep 2
+                done
+                test "$restored" = yes
+              elif [ "$prior_enabled" != not-found ]; then
+                systemctl stop "$unit" >> "$SNAPSHOT/restore.log" 2>&1
+                test "$(systemctl show -p ActiveState --value "$unit")" = inactive
+              else
+                test "$(systemctl show -p LoadState --value "$unit")" = not-found
+              fi
+              if [ "$unit" = tickvault ]; then APP_STATE=$prior_state; fi
+            done < "$SNAPSHOT/lifecycle"
+          done
+          printf 'ROLLBACK_RESTORED_STATE=%s\n' "$APP_STATE" > "$SNAPSHOT/restore.status"
+          cat "$SNAPSHOT/restore.status"
+          # File and lifecycle restoration is not a WAL/schema compatibility test.
+          # COHERENT-ROLLBACK-RESTORE-END
+          TV_RESTORE_ROLLBACK
+          chmod 0700 "$SNAPSHOT/restore.sh"
+          (cd "$SNAPSHOT" && sha256sum previous.tar owned.paths present.paths absent.paths lifecycle restore.sh start-guard.sha256 > manifest.sha256)
+          printf '%s\n' "$ROLLBACK_ID" > "$SNAPSHOT/ready"
+          printf 'ROLLBACK_PREPARED id=%s\n' "$ROLLBACK_ID"
+          # COHERENT-ROLLBACK-PREPARE-END
+          TV_PREPARE_ROLLBACK
+          PARAMETERS=$(jq -cn --arg id "$ROLLBACK_ID" --rawfile script "$RUNNER_TEMP/prepare-tickvault-rollback.sh" '{commands: ["ROLLBACK_ID=" + $id, $script], executionTimeout: ["300"]}')
+          CMD=$(aws ssm send-command --region "$AWS_REGION_EFF" --instance-ids "$IID" --document-name AWS-RunShellScript --parameters "$PARAMETERS" --query Command.CommandId --output text)
+          STATUS=Pending
+          for _ in $(seq 1 90); do
+            STATUS=$(aws ssm get-command-invocation --region "$AWS_REGION_EFF" --command-id "$CMD" --instance-id "$IID" --query Status --output text 2>/dev/null || echo Pending)
+            case "$STATUS" in Success|Failed|Cancelled|TimedOut) break ;; esac
+            sleep 3
+          done
+          if [ "$STATUS" != Success ]; then
+            echo "::error::Private rollback snapshot was not confirmed (status=$STATUS); installation has not started. Evidence remains in /var/lib/tickvault/deploy-rollback/$ROLLBACK_ID."
+            exit 1
+          fi
+          echo "rollback_id=$ROLLBACK_ID" >> "$GITHUB_OUTPUT"
+          echo "DEPLOY_ROLLBACK_ID=$ROLLBACK_ID" >> "$GITHUB_ENV"
+
       - name: Run SSM command — download binaries + smoke test + atomic swap
         # Skipped on an intentional off-hours skip — send-command can't reach a
         # stopped box (InvalidInstanceId), and there is nothing to deploy.
@@ -935,23 +1348,37 @@ jobs:
         # EXPRESSION-LENGTH LOCK (2026-08-18): this run block MUST stay free of
         # `${{ }}` interpolation. GitHub compiles any run script containing an
         # expression into a SINGLE template expression capped at 21,000 chars;
-        # this block is ~23,100, so one interpolation makes the whole workflow
-        # file unparseable — `422 Exceeded max expression length 21000` — which
-        # kills the push trigger AND workflow_dispatch, silently blocking every
-        # deploy. Pass values through `env:` below and reference them as shell
-        # variables instead. Inside the single-quoted `--parameters 'commands=[…]'`
-        # payload use quote-splicing ('"$VAR"') — a bare $VAR will not expand.
+        # an earlier version reached ~23,100 and made the workflow unparseable
+        # (`422 Exceeded max expression length 21000`). Keep the current shorter
+        # block expression-free as it grows. Pass values through `env:` below
+        # and reference them as shell
+        # variables instead. jq constructs the SSM JSON and prepends the
+        # validated SHA as a box-side variable; the command array stays literal.
         env:
           AWS_REGION_EFF: ${{ vars.AWS_REGION || 'ap-south-1' }}
           DEPLOY_SHA: ${{ github.sha }}
+          DEPLOY_ROLLBACK_ID: ${{ steps.rollback.outputs.rollback_id }}
+          DEPLOY_TICKVAULT_SHA256: ${{ steps.artifact_digests.outputs.tickvault_sha256 }}
+          DEPLOY_SMOKE_SHA256: ${{ steps.artifact_digests.outputs.smoke_test_sha256 }}
+          DEPLOY_MIGRATION_SHA256: ${{ steps.artifact_digests.outputs.migration_sha256 }}
         run: |
-          CMD_ID=$(aws ssm send-command \
-            --region "$AWS_REGION_EFF" \
-            --instance-ids "$IID" \
-            --document-name "AWS-RunShellScript" \
-            --comment "tickvault deploy sha=$DEPLOY_SHA" \
-            --parameters 'commands=[
+          set -euo pipefail
+          if [[ ! "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::DEPLOY_SHA must be the exact 40-character deployment commit"
+            exit 1
+          fi
+          [[ "$DEPLOY_ROLLBACK_ID" =~ ^${DEPLOY_SHA}-[0-9]+-[0-9]+$ ]] || { echo "::error::Missing or mismatched private rollback snapshot"; exit 2; }
+          for digest in "$DEPLOY_TICKVAULT_SHA256" "$DEPLOY_SMOKE_SHA256" "$DEPLOY_MIGRATION_SHA256"; do
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::Release artifact SHA256 is missing or invalid"; exit 2; }
+          done
+          SSM_PARAMETERS=$(jq -cn --arg deploy_sha "$DEPLOY_SHA" --arg rollback_id "$DEPLOY_ROLLBACK_ID" --arg tickvault_sha "$DEPLOY_TICKVAULT_SHA256" --arg smoke_sha "$DEPLOY_SMOKE_SHA256" --arg migration_sha "$DEPLOY_MIGRATION_SHA256" --argjson commands '[
               "set -euo pipefail",
+              "SNAPSHOT=/var/lib/tickvault/deploy-rollback/$ROLLBACK_ID; test \"$(cat \"$SNAPSHOT/ready\")\" = \"$ROLLBACK_ID\"; (cd \"$SNAPSHOT\" && sha256sum --check --status manifest.sha256)",
+              "TV_ROLLBACK_ARMED=0; TV_INSTALL_MUTATED=0",
+              "rollback_on_exit() { rc=$?; trap - EXIT; set +e; if [ \"$rc\" -ne 0 ] && [ \"$TV_ROLLBACK_ARMED\" -eq 1 ]; then echo DEPLOY_FAILED: restoring private coherent snapshot; bash \"$SNAPSHOT/restore.sh\"; restore_rc=$?; if [ \"$restore_rc\" -ne 0 ]; then echo \"ROLLBACK_FAILED exit=$restore_rc evidence=$SNAPSHOT\"; fi; elif [ \"$rc\" -ne 0 ] && [ \"$TV_INSTALL_MUTATED\" -eq 1 ]; then echo READINESS_UNCONFIRMED=yes; fi; exit \"$rc\"; }",
+              "trap rollback_on_exit EXIT",
+              "STAGE=/var/lib/tickvault/deploy-stage/$ROLLBACK_ID; test \"$(cat \"$STAGE/ready\")\" = \"$ROLLBACK_ID\"; test ! -L \"$STAGE\"; test \"$(stat -c %u \"$STAGE\")\" = 0; test \"$(stat -c %a \"$STAGE\")\" = 700; test ! -L \"$STAGE/verify.sh\"; test \"$(stat -c %u \"$STAGE/verify.sh\")\" = 0; test \"$(stat -c %h \"$STAGE/verify.sh\")\" = 1; test \"$(stat -c %a \"$STAGE/verify.sh\")\" = 700",
+              "bash \"$STAGE/verify.sh\" \"$DEPLOY_SHA\" \"$EXPECTED_TICKVAULT_SHA256\" \"$EXPECTED_MIGRATION_SHA256\" \"$EXPECTED_SMOKE_SHA256\"",
               "command -v git >/dev/null 2>&1 || sudo timeout 180 dnf install -y git || sudo timeout 180 yum install -y git",
               "command -v docker >/dev/null 2>&1 || sudo timeout 180 dnf install -y docker || sudo timeout 180 yum install -y docker",
               "sudo systemctl enable --now docker",
@@ -962,30 +1389,44 @@ jobs:
               "if docker compose version >/dev/null 2>&1; then echo COMPOSE-PLUGIN-OK: already present - skipping install; else sudo timeout 180 dnf install -y docker-compose-plugin || sudo timeout 180 yum install -y docker-compose-plugin || echo compose plugin not in distro repos - falling back to pinned static binary; fi",
               "if ! docker compose version >/dev/null 2>&1; then COMPOSE_ARCH=$(uname -m); case \"$COMPOSE_ARCH\" in aarch64) COMPOSE_SHA256=\"$COMPOSE_SHA256_AARCH64\";; x86_64) COMPOSE_SHA256=\"$COMPOSE_SHA256_X86_64\";; *) COMPOSE_SHA256=\"\";; esac; if [ -z \"$COMPOSE_SHA256\" ]; then echo WARN: no pinned compose sha256 for arch $COMPOSE_ARCH - skipping static install; else timeout 150 curl -fsSL --max-time 120 https://github.com/docker/compose/releases/download/$COMPOSE_PIN/docker-compose-linux-$COMPOSE_ARCH -o /tmp/docker-compose.dl && echo \"$COMPOSE_SHA256  /tmp/docker-compose.dl\" | sha256sum -c - && sudo mkdir -p /usr/local/lib/docker/cli-plugins && sudo install -m 0755 -o root -g root /tmp/docker-compose.dl /usr/local/lib/docker/cli-plugins/docker-compose || echo WARN: pinned compose plugin download or sha256 verification FAILED - nothing installed - final verify below decides; rm -f /tmp/docker-compose.dl; fi; fi",
               "docker compose version || (echo FATAL: docker compose plugin still unavailable after distro package + pinned sha256-verified static binary attempts - boot path would BOOT-02 on the next nuke; exit 1)",
+              "bash \"$SNAPSHOT/restore.sh\" --check-current",
+              "echo DEPLOY_INSTALL_STARTED=yes; TV_ROLLBACK_ARMED=1; TV_INSTALL_MUTATED=1",
               "mkdir -p /opt/tickvault/config /opt/tickvault/data/spill /opt/tickvault/logs /opt/tickvault/bin",
-              "chown -R ec2-user:ec2-user /opt/tickvault",
-              "if [ ! -d /opt/tickvault/repo/.git ]; then sudo -u ec2-user git clone --depth 1 https://github.com/SJParthi/tickvault.git /opt/tickvault/repo; fi",
+              "chown root:root /opt/tickvault /opt/tickvault/bin; chmod 0755 /opt/tickvault /opt/tickvault/bin; chown ec2-user:ec2-user /opt/tickvault/config /opt/tickvault/data /opt/tickvault/data/spill /opt/tickvault/logs; install -d -m 0755 -o ec2-user -g ec2-user /opt/tickvault/repo",
+              "if [ ! -d /opt/tickvault/repo/.git ]; then sudo -u ec2-user timeout 120 git clone --no-checkout --depth 1 https://github.com/SJParthi/tickvault.git /opt/tickvault/repo; fi",
               "cd /opt/tickvault",
-              "if [ -d repo/.git ]; then sudo -u ec2-user timeout 120 git -C repo fetch --depth 1 origin main && sudo -u ec2-user git -C repo reset --hard origin/main; fi",
+              "sudo -u ec2-user timeout 120 git -C repo fetch --depth 1 origin \"$DEPLOY_SHA\"",
+              "FETCHED_SHA=$(sudo -u ec2-user git -C repo rev-parse --verify FETCH_HEAD^{commit})",
+              "if [ \"$FETCHED_SHA\" != \"$DEPLOY_SHA\" ]; then echo FATAL: fetched commit differs from deployment binary; exit 1; fi",
+              "DEPLOY_TREE=$(sudo -u ec2-user git -C repo rev-parse --verify \"$DEPLOY_SHA^{tree}\")",
+              "sudo -u ec2-user git -C repo checkout --detach --force \"$DEPLOY_SHA\"",
+              "CHECKED_OUT_SHA=$(sudo -u ec2-user git -C repo rev-parse --verify HEAD^{commit}); CHECKED_OUT_TREE=$(sudo -u ec2-user git -C repo rev-parse --verify HEAD^{tree})",
+              "if [ \"$CHECKED_OUT_SHA\" != \"$DEPLOY_SHA\" ] || [ \"$CHECKED_OUT_TREE\" != \"$DEPLOY_TREE\" ]; then echo FATAL: deployed source identity mismatch; exit 1; fi",
+              "echo DEPLOY-SOURCE: commit=$CHECKED_OUT_SHA tree=$CHECKED_OUT_TREE",
+              "cmp -s repo/scripts/tickvault-start-guard.sh /usr/local/libexec/tickvault-start-guard && cmp -s repo/deploy/systemd/tickvault-sequence-guard.conf /etc/systemd/system/tickvault.service.d/90-sequence-authority-guard.conf || { echo FATAL: installed permanent start guard differs from validated source; exit 1; }",
               "if [ ! -d repo/config ]; then echo FATAL: repo/config missing after git clone; exit 1; fi",
               "cp -f repo/config/*.toml config/",
               "chown -R ec2-user:ec2-user config/",
               "echo ===== deployed config/production.toml line count + head =====",
               "wc -l config/production.toml repo/config/production.toml",
-              "diff -q config/production.toml repo/config/production.toml || (echo FATAL: deployed config/production.toml differs from repo/config/production.toml after cp; diff config/production.toml repo/config/production.toml; exit 1)",
-              "if [ -f repo/deploy/systemd/tickvault.service ]; then cp -f repo/deploy/systemd/tickvault.service /etc/systemd/system/tickvault.service; fi",
-              "if [ -f repo/deploy/systemd/tickvault-holiday-gate.service ]; then cp -f repo/deploy/systemd/tickvault-holiday-gate.service /etc/systemd/system/tickvault-holiday-gate.service; fi",
-              "if [ -f repo/deploy/systemd/tickvault-host-tuning.service ]; then cp -f repo/deploy/systemd/tickvault-host-tuning.service /etc/systemd/system/tickvault-host-tuning.service; fi",
+              "for CONFIG_FILE in base.toml production.toml; do sudo -u ec2-user git -C repo show \"$DEPLOY_SHA:config/$CONFIG_FILE\" | cmp -s - \"config/$CONFIG_FILE\" || { echo \"FATAL: deployed config/$CONFIG_FILE differs from the deployment commit\"; exit 1; }; done",
+              "if [ -f repo/deploy/systemd/tickvault.service ]; then cp -a -- repo/deploy/systemd/tickvault.service /etc/systemd/system/tickvault.service.new; mv -- /etc/systemd/system/tickvault.service.new /etc/systemd/system/tickvault.service; fi",
+              "if [ -f repo/deploy/systemd/tickvault-holiday-gate.service ]; then cp -a -- repo/deploy/systemd/tickvault-holiday-gate.service /etc/systemd/system/tickvault-holiday-gate.service.new; mv -- /etc/systemd/system/tickvault-holiday-gate.service.new /etc/systemd/system/tickvault-holiday-gate.service; fi",
+              "if [ -f repo/deploy/systemd/tickvault-host-tuning.service ]; then cp -a -- repo/deploy/systemd/tickvault-host-tuning.service /etc/systemd/system/tickvault-host-tuning.service.new; mv -- /etc/systemd/system/tickvault-host-tuning.service.new /etc/systemd/system/tickvault-host-tuning.service; fi",
               "rm -rf scripts/groww-sidecar && echo GROWW-SIDECAR-RETIRED: on-box sidecar source removed",
               "rm -rf /opt/tickvault/data/groww/venv && echo GROWW-VENV-RETIRED: stale sidecar venv removed",
               "if [ -f bin/tickvault ]; then cp bin/tickvault bin/tickvault.backup; fi",
-              "timeout 300 aws s3 cp s3://tv-prod-cold/deploys/${{ github.sha }}/tickvault  bin/tickvault.new",
-              "timeout 300 aws s3 cp s3://tv-prod-cold/deploys/${{ github.sha }}/smoke_test bin/smoke_test.new",
-              "chmod +x bin/tickvault.new bin/smoke_test.new",
-              "timeout 40 bin/smoke_test.new --duration 30",
+              "timeout 300 aws s3 cp s3://tv-prod-cold/deploys/$DEPLOY_SHA/tickvault bin/tickvault.new",
+              "timeout 300 aws s3 cp s3://tv-prod-cold/deploys/$DEPLOY_SHA/smoke_test bin/smoke_test.new",
+              "timeout 300 aws s3 cp s3://tv-prod-cold/deploys/$DEPLOY_SHA/tv-wal-sequence-migrate bin/tv-wal-sequence-migrate.new",
+              "printf \"%s  bin/tickvault.new\\n%s  bin/smoke_test.new\\n%s  bin/tv-wal-sequence-migrate.new\\n\" \"$EXPECTED_TICKVAULT_SHA256\" \"$EXPECTED_SMOKE_SHA256\" \"$EXPECTED_MIGRATION_SHA256\" | sha256sum --check --status || { echo \"FATAL: staged binary differs from the downloaded release artifact\"; exit 1; }",
+              "chmod +x bin/tickvault.new bin/smoke_test.new bin/tv-wal-sequence-migrate.new",
+              "timeout 10 bin/tv-wal-sequence-migrate.new --help >/dev/null",
+              "TV_ENVIRONMENT=prod timeout 40 bin/smoke_test.new --duration 30",
               "mv bin/tickvault.new   bin/tickvault",
               "mv bin/smoke_test.new  bin/smoke_test",
-              "chown ec2-user:ec2-user bin/tickvault bin/smoke_test",
+              "mv bin/tv-wal-sequence-migrate.new bin/tv-wal-sequence-migrate",
+              "chown root:root bin/tickvault bin/smoke_test bin/tv-wal-sequence-migrate; chmod 0755 bin/tickvault bin/smoke_test bin/tv-wal-sequence-migrate",
               "grep -q \"^TV_QDB_HTTP_BIND=\" repo/deploy/docker/.env 2>/dev/null || echo \"TV_QDB_HTTP_BIND=0.0.0.0\" >> repo/deploy/docker/.env",
               "chown ec2-user:ec2-user repo/deploy/docker/.env",
               "if [ -f repo/deploy/docker/docker-compose.yml ]; then export TV_QUESTDB_PG_USER=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-user --with-decryption --output text --query Parameter.Value 2>/dev/null || echo admin); export TV_QUESTDB_PG_PASSWORD=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-password --with-decryption --output text --query Parameter.Value 2>/dev/null || echo quest); (cd repo/deploy/docker && { TV_QUESTDB_PG_USER=\"$TV_QUESTDB_PG_USER\" TV_QUESTDB_PG_PASSWORD=\"$TV_QUESTDB_PG_PASSWORD\" timeout 600 docker compose up -d && echo COMPOSE-UP-OK: first attempt; } || { echo \"WARN: compose up attempt 1 failed - a recreate leaves the old container renamed to <id>_<service> and the daemon can then refuse to start it; removing the containers of this compose project and retrying once (named volumes and data are untouched)\"; docker compose ps -aq 2>/dev/null | xargs -r docker rm -f >/dev/null 2>&1 || true; TV_QUESTDB_PG_USER=\"$TV_QUESTDB_PG_USER\" TV_QUESTDB_PG_PASSWORD=\"$TV_QUESTDB_PG_PASSWORD\" timeout 600 docker compose up -d && echo COMPOSE-UP-OK: recovered on attempt 2 after clearing stale containers; }) || (echo FATAL: docker compose up failed on BOTH attempts or exceeded 600s; docker compose -f repo/deploy/docker/docker-compose.yml ps -a || true; exit 1); else echo FATAL: docker-compose.yml missing from repo/deploy/docker; exit 1; fi",
@@ -1007,8 +1448,9 @@ jobs:
               "systemctl is-active tickvault-host-tuning >/dev/null 2>&1 && echo \"host-tuning: applied\" || echo \"host-tuning: WARNING not active - check journalctl -u tickvault-host-tuning\"",
               "cat /opt/tickvault/net-tuning.status 2>/dev/null || echo \"host-tuning: no net-tuning.status yet\"",
               "systemctl restart tickvault --no-block || (echo ===== systemctl restart dispatch failed ===== && systemctl status tickvault.service --no-pager -l || true; echo ===== journalctl -xeu last 100 ===== && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1)",
+              "TV_ROLLBACK_ARMED=0",
               "READY_OK=no; for i in $(seq 1 150); do if systemctl is-active --quiet tickvault; then READY_OK=yes; break; fi; sleep 5; done",
-              "if [ \"$READY_OK\" != yes ]; then echo ===== tickvault not active within 750s - app likely never sent READY=1 - start job continues in background ===== && systemctl status tickvault.service --no-pager -l || true; echo ===== app stdout/stderr ONLY last 200 ===== && journalctl -u tickvault.service -n 200 --no-pager --output=cat || true; echo ===== journalctl -xeu last 100 ===== && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1; fi",
+              "if [ \"$READY_OK\" != yes ]; then STATE=$(systemctl show -p ActiveState --value tickvault 2>/dev/null || true); if [ \"$STATE\" = failed ]; then TV_ROLLBACK_ARMED=1; else echo READINESS_UNCONFIRMED=yes; fi; echo ===== tickvault not active within 750s - app likely never sent READY=1 - start job continues in background ===== && systemctl status tickvault.service --no-pager -l || true; echo ===== app stdout/stderr ONLY last 200 ===== && journalctl -u tickvault.service -n 200 --no-pager --output=cat || true; echo ===== journalctl -xeu last 100 ===== && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1; fi",
               "echo TICKVAULT-UP",
               "command -v amazon-cloudwatch-agent-ctl >/dev/null 2>&1 || sudo timeout 180 dnf install -y amazon-cloudwatch-agent || sudo timeout 180 yum install -y amazon-cloudwatch-agent || (curl -fsSL --max-time 120 https://amazoncloudwatch-agent-ap-south-1.s3.ap-south-1.amazonaws.com/amazon_linux/arm64/latest/amazon-cloudwatch-agent.rpm -o /tmp/cwa.rpm && sudo rpm -i /tmp/cwa.rpm) || true",
               "sudo mkdir -p /opt/aws/amazon-cloudwatch-agent/etc",
@@ -1023,7 +1465,13 @@ jobs:
               "echo === CWAGENT OWN LOG tail40 ===; sudo tail -n 40 /opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log 2>/dev/null || true",
               "echo === APP LOG DIR ===; ls -la /opt/tickvault/data/logs/ 2>/dev/null | head -20 || true; ls -la /opt/tickvault/data/logs/machine/ 2>/dev/null | head -20 || true",
               "echo DEPLOY OK"
-            ]' \
+            ]' '{commands: (["DEPLOY_SHA=" + $deploy_sha, "ROLLBACK_ID=" + $rollback_id, "EXPECTED_TICKVAULT_SHA256=" + $tickvault_sha, "EXPECTED_SMOKE_SHA256=" + $smoke_sha, "EXPECTED_MIGRATION_SHA256=" + $migration_sha] + $commands)}')
+          CMD_ID=$(aws ssm send-command \
+            --region "$AWS_REGION_EFF" \
+            --instance-ids "$IID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "tickvault deploy sha=$DEPLOY_SHA" \
+            --parameters "$SSM_PARAMETERS" \
             --query 'Command.CommandId' --output text)
           echo "command_id=$CMD_ID" >> $GITHUB_OUTPUT
 
@@ -1092,7 +1540,7 @@ jobs:
         # Skipped on an intentional off-hours skip (the box is down on purpose;
         # there is no command_id to query, so this would only emit AWS
         # ParamValidation noise — see the "Ensure instance running" step).
-        if: always() && env.DEPLOY_SKIP_REASON == ''
+        if: always() && env.DEPLOY_SKIP_REASON == '' && steps.ssm.outputs.command_id != ''
         run: |
           STATUS=$(aws ssm get-command-invocation \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
@@ -1101,11 +1549,23 @@ jobs:
             --query 'Status' --output text)
           echo "===== SSM command status: ${STATUS} ====="
           echo "----- STDOUT (on-box) -----"
-          aws ssm get-command-invocation \
+          DEPLOY_OUTPUT=$(aws ssm get-command-invocation \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
             --command-id ${{ steps.ssm.outputs.command_id }} \
             --instance-id "$IID" \
-            --query 'StandardOutputContent' --output text || true
+            --query 'StandardOutputContent' --output text || true)
+          printf '%s\n' "$DEPLOY_OUTPUT"
+          if printf '%s\n' "$DEPLOY_OUTPUT" | grep -qx 'DEPLOY_INSTALL_STARTED=yes'; then
+            echo "DEPLOY_INSTALL_STARTED=yes" >> "$GITHUB_ENV"
+          fi
+          if printf '%s\n' "$DEPLOY_OUTPUT" | grep -q '^ROLLBACK_FENCED_INCOMPLETE '; then
+            echo "ROLLBACK_FENCED=yes" >> "$GITHUB_ENV"
+          fi
+          if printf '%s\n' "$DEPLOY_OUTPUT" | grep -Eqx 'ROLLBACK_RESTORED_STATE=(active|inactive)'; then
+            echo "ROLLBACK_RESTORED=yes" >> "$GITHUB_ENV"
+          elif printf '%s\n' "$DEPLOY_OUTPUT" | grep -qx 'READINESS_UNCONFIRMED=yes'; then
+            echo "READINESS_UNCONFIRMED=yes" >> "$GITHUB_ENV"
+          fi
           echo "----- STDERR (on-box) -----"
           aws ssm get-command-invocation \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
@@ -1119,6 +1579,7 @@ jobs:
 
 
       - name: Verify app readiness (gate on readiness, not 60s is-active)
+        id: readiness
         # Skipped on an intentional off-hours skip — nothing was deployed to the
         # (stopped) box, so there is no fresh process to monitor.
         if: env.DEPLOY_SKIP_REASON == ''
@@ -1176,17 +1637,18 @@ jobs:
             ELAPSED=$((ELAPSED + READINESS_POLL_SECS))
           done
           if [ "$VERIFIED" -eq 0 ] && [ "$CRASHED" -eq 0 ]; then
-            # Timed out: re-probe once. Alive-but-slow (still "activating", no extra
-            # restart) is a healthy slow boot we DO NOT kill; only a failed/looping
-            # unit is a crash.
+            # Timed out: re-probe once. A unit that has not reached active is
+            # unverified, including an unavailable probe. Leave a possible
+            # slow boot running, but fail the deploy and do not record its SHA.
             OUT="$(probe)"; STATE=$(parse_state "$OUT"); NR=$(parse_nr "$OUT"); NR="${NR:-$BASELINE}"
             if [ "$STATE" = "active" ]; then
               VERIFIED=1
             elif [ "$STATE" = "failed" ] || [ "$NR" -gt "$BASELINE" ]; then
               CRASHED=1
             else
-              echo "::warning::Readiness not confirmed within ${READINESS_TIMEOUT_SECS}s, but the unit is '${STATE:-unknown}' with no extra restarts (baseline ${BASELINE}) — NOT rolling back. systemd Type=notify sends READY=1 only after the WAL-replay boot gates; a slow-but-healthy boot must not be killed."
-              VERIFIED=1
+              echo "READINESS_UNCONFIRMED=yes" >> "$GITHUB_ENV"
+              echo "::error::Readiness not confirmed within ${READINESS_TIMEOUT_SECS}s: state='${STATE:-unknown}', restart baseline=${BASELINE}. Deployment is UNVERIFIED and its SHA will not be recorded. Leaving the service running so a possible slow WAL-replay boot can finish; no automatic rollback or stop on this uncertainty."
+              exit 1
             fi
           fi
           if [ "$CRASHED" -eq 1 ]; then
@@ -1294,21 +1756,21 @@ jobs:
             # written for: `systemctl start` alone did nothing, and only
             # `reset-failed` followed by `start` brought the app up.
             #
-            # `cp` not `mv` for the backup: `mv` CONSUMES it, so a second
-            # rollback in the same session finds no backup and silently does
-            # nothing (the `if [ -f ... ]` simply falls through). Keeping the
-            # file means the recovery path is repeatable.
-            #
-            # The result is now READ instead of fired and forgotten, so a
-            # rollback that failed to restore service says so in the log
-            # rather than reporting the same "exit 1" as one that worked.
+            # The immutable private snapshot restores prior binaries, config,
+            # units and prior active/inactive state. It remains available after
+            # success or failure; no WAL/schema compatibility is implied.
+            if [[ ! "$DEPLOY_ROLLBACK_ID" =~ ^[0-9a-f]{40}-[0-9]+-[0-9]+$ ]]; then
+              echo "::error::ROLLBACK snapshot identity is missing or invalid"
+              exit 1
+            fi
+            RB_PARAMETERS=$(jq -cn --arg id "$DEPLOY_ROLLBACK_ID" '{commands: ["bash /var/lib/tickvault/deploy-rollback/" + $id + "/restore.sh"], executionTimeout: ["300"]}')
             RB_CMD=$(aws ssm send-command \
               --region "$REGION" \
               --instance-ids "$IID" \
               --document-name "AWS-RunShellScript" \
-              --parameters 'commands=["set -euo pipefail","if [ ! -d /opt/tickvault ]; then echo SKIP_ROLLBACK_NO_DIR; exit 0; fi","cd /opt/tickvault","if [ ! -f bin/tickvault.backup ]; then echo ROLLBACK_NO_BACKUP_BINARY; exit 1; fi","cp -f bin/tickvault.backup bin/tickvault","systemctl reset-failed tickvault || true","systemctl start tickvault","for i in $(seq 1 30); do if systemctl is-active --quiet tickvault; then echo ROLLBACK_ACTIVE; exit 0; fi; sleep 2; done","echo ROLLBACK_NOT_ACTIVE; systemctl status tickvault --no-pager -l | head -20; exit 1"]' \
+              --parameters "$RB_PARAMETERS" \
               --query 'Command.CommandId' --output text 2>/dev/null || echo "")
-            if [ -n "$RB_CMD" ]; then
+            if [ -n "$RB_CMD" ] && [ "$RB_CMD" != "None" ]; then
               for _ in $(seq 1 24); do
                 sleep 5
                 RB_STATE=$(aws ssm get-command-invocation --region "$REGION" \
@@ -1319,17 +1781,27 @@ jobs:
               RB_OUT=$(aws ssm get-command-invocation --region "$REGION" \
                 --command-id "$RB_CMD" --instance-id "$IID" \
                 --query 'StandardOutputContent' --output text 2>/dev/null || echo "")
-              if printf '%s' "$RB_OUT" | grep -q ROLLBACK_ACTIVE; then
-                echo "::warning::ROLLBACK SUCCEEDED — the previous binary is running. The deploy still FAILS so the bad build is not recorded as shipped."
+              if printf '%s\n' "$RB_OUT" | grep -q '^ROLLBACK_FENCED_INCOMPLETE '; then
+                echo "ROLLBACK_FENCED=yes" >> "$GITHUB_ENV"
+              fi
+              if [ "$RB_STATE" = "Success" ] && printf '%s\n' "$RB_OUT" | grep -Eqx 'ROLLBACK_RESTORED_STATE=(active|inactive)'; then
+                echo "ROLLBACK_RESTORED=yes" >> "$GITHUB_ENV"
+                echo "::warning::ROLLBACK restored the prior files and lifecycle state: $RB_OUT. The deploy still FAILS; data-format compatibility remains a separate release gate."
               else
-                echo "::error::ROLLBACK DID NOT RESTORE SERVICE (state=${RB_STATE:-unknown}). The box has NO APP. Output: ${RB_OUT}"
+                echo "::error::ROLLBACK UNVERIFIED (state=${RB_STATE:-unknown}). Private evidence is retained; inspect the service before further action. Output: ${RB_OUT}"
               fi
             else
               echo "::error::ROLLBACK could not be dispatched — the box may have NO APP."
             fi
             exit 1
           fi
-          echo "DEPLOY VERIFIED: tickvault reached readiness (systemd active, or a healthy slow WAL-replay boot with no crash)"
+          if [ "$VERIFIED" -ne 1 ]; then
+            echo "READINESS_UNCONFIRMED=yes" >> "$GITHUB_ENV"
+            echo "::error::Deployment did not produce a confirmed active service; refusing to record it as verified."
+            exit 1
+          fi
+          echo "verified=true" >> "$GITHUB_OUTPUT"
+          echo "DEPLOY VERIFIED: tickvault reached readiness (systemd active)"
 
       - name: Verify log ingestion (LOG-INGESTION-SMOKE, non-fatal)
         # Incident 2026-07-06 17:19 IST: the app moved its machine logs to
@@ -1396,16 +1868,110 @@ jobs:
             echo "::notice::LOG-INGESTION-SMOKE moot — instance state is $STATE (budget guard / scheduled stop raced the smoke window); no shipper verdict possible, no page."
             exit 0
           fi
-          echo "::warning::LOG-INGESTION-SMOKE: no fresh app log events in /tickvault/prod/app stream ${IID}/app within ~5 min of readiness — the CloudWatch agent is likely not shipping (glob/config mismatch or dead agent). The deploy itself is VERIFIED HEALTHY; NOT rolling back. Check the on-box === CWAGENT STATUS === / === APP LOG DIR === dumps above."
+          echo "::warning::LOG-INGESTION-SMOKE: no fresh app log events in /tickvault/prod/app stream ${IID}/app within ~5 min of readiness — the CloudWatch agent is likely not shipping (glob/config mismatch or dead agent). The systemd readiness was observed; release identity verification is still pending; NOT rolling back. Check the on-box === CWAGENT STATUS === / === APP LOG DIR === dumps above."
           SHORT_SHA="${GITHUB_SHA:0:7}"
           IST_TIME="$(TZ='Asia/Kolkata' date +'%I:%M %p IST')"
           aws sns publish \
             --region "$REGION" \
             --topic-arn arn:aws:sns:${REGION}:${{ steps.acct.outputs.id }}:tv-prod-alerts \
             --subject "⚠️ tickvault deployed but its logs are NOT reaching CloudWatch" \
-            --message "⚠️ New code went LIVE at ${IST_TIME} (version ${SHORT_SHA}) and the app is running fine — but its logs are NOT arriving in CloudWatch. Trading is unaffected. Automated remediation: re-dispatch deploy-aws.yml on main — its CloudWatch-agent step reinstalls, re-enables and restarts the shipper (no manual SSM needed). Same signature as the 06 Jul incident only if the box was RUNNING throughout this check. Run: ${{ github.run_id }}" \
+            --message "⚠️ Service readiness was observed at ${IST_TIME} for requested version ${SHORT_SHA}, but logs are NOT arriving in CloudWatch. Release identity verification is still pending; live trading health is not established by this check. Automated remediation: re-dispatch deploy-aws.yml on main — its CloudWatch-agent step reinstalls, re-enables and restarts the shipper (no manual SSM needed). Same signature as the 06 Jul incident only if the box was RUNNING throughout this check. Run: ${{ github.run_id }}" \
           || echo "::warning::LOG-INGESTION-SMOKE: the SNS page also failed — operator must rely on this run log + the market-hours ingestion-silent alarm."
           exit 0
+
+      - name: Verify running release identity before provenance promotion
+        id: release_identity
+        if: success() && env.DEPLOY_SKIP_REASON == '' && steps.readiness.outputs.verified == 'true'
+        env:
+          AWS_REGION_EFF: ${{ vars.AWS_REGION || 'ap-south-1' }}
+          DEPLOY_SHA: ${{ github.sha }}
+          DEPLOY_ROLLBACK_ID: ${{ steps.rollback.outputs.rollback_id }}
+          DEPLOY_TICKVAULT_SHA256: ${{ steps.artifact_digests.outputs.tickvault_sha256 }}
+          DEPLOY_SMOKE_SHA256: ${{ steps.artifact_digests.outputs.smoke_test_sha256 }}
+          DEPLOY_MIGRATION_SHA256: ${{ steps.artifact_digests.outputs.migration_sha256 }}
+        run: |
+          set -euo pipefail
+          # A failed/unknown SSM observation is not evidence of a crashed app.
+          # Keep generic failure cleanup from stopping a possibly healthy run.
+          echo "READINESS_UNCONFIRMED=yes" >> "$GITHUB_ENV"
+          [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Invalid release commit"; exit 2; }
+          [[ "$DEPLOY_ROLLBACK_ID" =~ ^${DEPLOY_SHA}-[0-9]+-[0-9]+$ ]] || { echo "::error::Invalid private rollback identity"; exit 2; }
+          for digest in "$DEPLOY_TICKVAULT_SHA256" "$DEPLOY_SMOKE_SHA256" "$DEPLOY_MIGRATION_SHA256"; do
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::Invalid release artifact digest"; exit 2; }
+          done
+          cat > "$RUNNER_TEMP/verify-tickvault-release-identity.sh" <<'TV_RELEASE_IDENTITY'
+          set -euo pipefail
+          # RELEASE-IDENTITY-VERIFY-BEGIN
+          verify_release_identity() {
+            local pid_before pid_after health_json health_sha health_status installed_sha running_sha smoke_sha migration_sha config_file expected_config_sha installed_config_sha
+            systemctl is-active --quiet tickvault || return 3
+            pid_before=$(systemctl show -p MainPID --value tickvault) || return 3
+            [[ "$pid_before" =~ ^[1-9][0-9]*$ ]] || return 3
+            installed_sha=$(sha256sum /opt/tickvault/bin/tickvault | cut -d ' ' -f 1) || return 3
+            running_sha=$(sha256sum "/proc/$pid_before/exe" | cut -d ' ' -f 1) || return 3
+            smoke_sha=$(sha256sum /opt/tickvault/bin/smoke_test | cut -d ' ' -f 1) || return 3
+            migration_sha=$(sha256sum /opt/tickvault/bin/tv-wal-sequence-migrate | cut -d ' ' -f 1) || return 3
+            health_json=$(curl -fsS --max-time 5 http://127.0.0.1:3001/health) || return 3
+            health_sha=$(printf '%s' "$health_json" | jq -er '.git_sha | select(type == "string" and test("^[0-9a-f]{40}$"))') || return 3
+            health_status=$(printf '%s' "$health_json" | jq -er '.status | select(type == "string")') || return 3
+            [ "$health_status" = healthy ] || return 3
+            pid_after=$(systemctl show -p MainPID --value tickvault) || return 3
+            systemctl is-active --quiet tickvault || return 3
+            [ "$pid_before" = "$pid_after" ] || return 3
+            [ "$installed_sha" = "$EXPECTED_TICKVAULT_SHA256" ] && [ "$running_sha" = "$EXPECTED_TICKVAULT_SHA256" ] && [ "$smoke_sha" = "$EXPECTED_SMOKE_SHA256" ] && [ "$migration_sha" = "$EXPECTED_MIGRATION_SHA256" ] && [ "$health_sha" = "$DEPLOY_SHA" ] || return 2
+            for config_file in base.toml production.toml; do
+              expected_config_sha=$(sudo -u ec2-user git -C /opt/tickvault/repo show "$DEPLOY_SHA:config/$config_file" | sha256sum | cut -d ' ' -f 1) || return 3
+              installed_config_sha=$(sha256sum "/opt/tickvault/config/$config_file" | cut -d ' ' -f 1) || return 3
+              [ "$installed_config_sha" = "$expected_config_sha" ] || return 2
+            done
+            pid_after=$(systemctl show -p MainPID --value tickvault) || return 3
+            systemctl is-active --quiet tickvault || return 3
+            [ "$pid_before" = "$pid_after" ] || return 3
+            printf 'RELEASE_IDENTITY_VERIFIED commit=%s pid=%s binary_sha256=%s\n' "$DEPLOY_SHA" "$pid_after" "$running_sha"
+          }
+          # RELEASE-IDENTITY-VERIFY-END
+          if verify_release_identity; then exit 0; else identity_result=$?; fi
+          if [ "$identity_result" -eq 2 ]; then
+            echo RELEASE_IDENTITY_MISMATCH=yes
+            SNAPSHOT=/var/lib/tickvault/deploy-rollback/$ROLLBACK_ID
+            test "$(cat "$SNAPSHOT/ready")" = "$ROLLBACK_ID"
+            (cd "$SNAPSHOT" && sha256sum --check --status manifest.sha256)
+            bash "$SNAPSHOT/restore.sh"
+            exit 2
+          fi
+          echo RELEASE_IDENTITY_UNCONFIRMED=yes
+          exit 3
+          TV_RELEASE_IDENTITY
+          PARAMETERS=$(jq -cn --arg sha "$DEPLOY_SHA" --arg rollback "$DEPLOY_ROLLBACK_ID" --arg binary "$DEPLOY_TICKVAULT_SHA256" --arg smoke "$DEPLOY_SMOKE_SHA256" --arg migration "$DEPLOY_MIGRATION_SHA256" --rawfile script "$RUNNER_TEMP/verify-tickvault-release-identity.sh" '{commands: ["DEPLOY_SHA=" + $sha, "ROLLBACK_ID=" + $rollback, "EXPECTED_TICKVAULT_SHA256=" + $binary, "EXPECTED_SMOKE_SHA256=" + $smoke, "EXPECTED_MIGRATION_SHA256=" + $migration, $script], executionTimeout: ["330"]}')
+          CMD=$(aws ssm send-command --region "$AWS_REGION_EFF" --instance-ids "$IID" --document-name AWS-RunShellScript --parameters "$PARAMETERS" --query Command.CommandId --output text)
+          STATUS=Pending
+          for _ in $(seq 1 120); do
+            STATUS=$(aws ssm get-command-invocation --region "$AWS_REGION_EFF" --command-id "$CMD" --instance-id "$IID" --query Status --output text 2>/dev/null || echo Pending)
+            case "$STATUS" in Success|Failed|Cancelled|TimedOut) break ;; esac
+            sleep 3
+          done
+          OUT=$(aws ssm get-command-invocation --region "$AWS_REGION_EFF" --command-id "$CMD" --instance-id "$IID" --query StandardOutputContent --output text 2>/dev/null || echo "")
+          if printf '%s\n' "$OUT" | grep -q '^ROLLBACK_FENCED_INCOMPLETE '; then
+            echo "ROLLBACK_FENCED=yes" >> "$GITHUB_ENV"
+          fi
+          if [ "$STATUS" = Success ] && printf '%s\n' "$OUT" | grep -Eq "^RELEASE_IDENTITY_VERIFIED commit=$DEPLOY_SHA pid=[1-9][0-9]* binary_sha256=$DEPLOY_TICKVAULT_SHA256$"; then
+            echo "READINESS_UNCONFIRMED=no" >> "$GITHUB_ENV"
+            echo "verified=true" >> "$GITHUB_OUTPUT"
+            printf '%s\n' "$OUT"
+          else
+            # A nonterminal/unavailable observation can contain partial output
+            # while restore is still running. Never race it with generic stop.
+            if [ "$STATUS" = Failed ] && printf '%s\n' "$OUT" | grep -Fxq 'RELEASE_IDENTITY_MISMATCH=yes' && printf '%s\n' "$OUT" | grep -Eqx 'ROLLBACK_RESTORED_STATE=(active|inactive)'; then
+              echo "ROLLBACK_RESTORED=yes" >> "$GITHUB_ENV"
+              echo "::error::Release identity mismatch; the private snapshot restored the prior files and lifecycle."
+            elif [ "$STATUS" = Failed ] && printf '%s\n' "$OUT" | grep -Fxq 'RELEASE_IDENTITY_MISMATCH=yes'; then
+              echo "READINESS_UNCONFIRMED=no" >> "$GITHUB_ENV"
+              echo "::error::Release identity mismatch and rollback is unverified; inspect retained snapshot evidence and service state."
+            else
+              echo "::error::Release identity could not be confirmed; no provenance was recorded and no automatic service stop is requested."
+            fi
+            exit 1
+          fi
 
       - name: Record deployed binary git SHA to SSM (B9 deploy provenance)
         # Runs ONLY after the swap is verified healthy (the standalone
@@ -1418,7 +1984,7 @@ jobs:
         # fail (or roll back) a verified-healthy deploy — the next deploy
         # retries the write. The IAM grant lives in deploy/aws/terraform/
         # oidc.tf (ssm:PutParameter on exactly this parameter ARN).
-        if: success() && env.DEPLOY_SKIP_REASON == ''
+        if: success() && env.DEPLOY_SKIP_REASON == '' && steps.readiness.outputs.verified == 'true' && steps.release_identity.outputs.verified == 'true'
         run: |
           # LOCKSTEP NOTE: the SSM path below hardcodes the single real env
           # (prod) while terraform reads /tickvault/${var.environment}/deploy/
@@ -1456,7 +2022,15 @@ jobs:
         # deliberately — auto-stopping again would fight that session and
         # mask its intent. The verify step failed with a DISTINCT
         # "EXTERNAL-STOP-DETECTED (not a crash)" message instead.
-        if: failure() && env.DEPLOY_SKIP_REASON == '' && env.EXTERNAL_STOP_DETECTED != 'yes'
+        # A confirmed rollback restored the previous files and lifecycle state;
+        # generic failure handling must not change that restored state. An unconfirmed readiness result fails the deploy but
+        # must leave a possible slow boot running for subsequent observation.
+        if: >-
+          failure() && env.DEPLOY_SKIP_REASON == '' &&
+          steps.ssm.outputs.command_id != '' &&
+          env.DEPLOY_INSTALL_STARTED == 'yes' &&
+          env.EXTERNAL_STOP_DETECTED != 'yes' &&
+          env.ROLLBACK_RESTORED != 'yes' && env.READINESS_UNCONFIRMED != 'yes'
         # When the deploy fails AFTER the binary is in place, systemd's
         # Restart=always keeps relaunching it every few seconds. If each
         # boot reaches the auth step (it does after PR #921/#922), each
@@ -1519,8 +2093,16 @@ jobs:
             # stopped the service during verify. The binary is healthy, no
             # rollback and no auto-stop happened; the operator just re-runs.
             MSG="⚠️ Deploy could not be verified at ${IST_TIME} (version ${SHORT_SHA}) — another session STOPPED the app during the check (this is NOT a crash; the new code is healthy). What you need to do RIGHT NOW: re-run the deploy once the other session finishes. Run: ${{ github.run_id }}"
+          elif [ "${ROLLBACK_FENCED:-}" = "yes" ]; then
+            MSG="⚠️ Deploy FAILED at ${IST_TIME} (version ${SHORT_SHA}). Prior files were restored but their binary failed permanent startup admission. Service remains fenced/incomplete; no incompatible binary was restarted. Inspect retained rollback and policy evidence. Run: ${{ github.run_id }}"
+          elif [ "${ROLLBACK_RESTORED:-}" = "yes" ]; then
+            MSG="⚠️ Deploy FAILED at ${IST_TIME} (version ${SHORT_SHA}). Rollback restored the previous files and service state, including an intentionally inactive state. The rejected version was not recorded as deployed. Run: ${{ github.run_id }}"
+          elif [ "${READINESS_UNCONFIRMED:-}" = "yes" ]; then
+            MSG="⚠️ Deploy UNVERIFIED at ${IST_TIME} (version ${SHORT_SHA}): readiness or release identity was not confirmed. The service was left running for further observation; no success or deployed SHA was recorded. Check the actual process and release identity before retrying. Run: ${{ github.run_id }}"
+          elif [ "${DEPLOY_INSTALL_STARTED:-}" != "yes" ]; then
+            MSG="⚠️ Deploy FAILED at ${IST_TIME} (version ${SHORT_SHA}). Application installation was not confirmed; this workflow did not request an automatic service stop. Check the actual service state and private snapshot evidence before retrying. Run: ${{ github.run_id }}"
           else
-            MSG="🆘 Deploy FAILED at ${IST_TIME} (version ${SHORT_SHA}). The app was auto-stopped to avoid repeated alerts; it stays set to auto-start at the next boot/deploy. Check the run: ${{ github.run_id }}"
+            MSG="🆘 Deploy FAILED at ${IST_TIME} (version ${SHORT_SHA}). Automatic service stop was requested for the failed install without changing prior enablement. Verify the actual service state and retained rollback evidence. Run: ${{ github.run_id }}"
           fi
           # If the app started then crashed inside the 60s verify window, the
           # Monitor step captured WHY into CRASH_DIAG — forward it so the

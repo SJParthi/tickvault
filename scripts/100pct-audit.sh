@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# 100% Audit Tracker — runs every verifiable check and prints a
-# real-time dashboard with proof per dimension.
+# Audit evidence tracker — runs selected checks and records their scope.
+# File existence is inventory, never proof that a check passed.
 #
 # M5 of .claude/plans/autonomous-operations-100pct.md.
 # Living matrix: .claude/plans/100pct-audit-tracker.md
@@ -17,11 +17,12 @@
 #   scripts/100pct-audit.sh --ci       # blocking mode for CI
 #
 # Exit:
-#   0  all P/R dimensions PASS (L/I are advisory only)
-#   1  one or more P/R dimensions regressed
-#   2  setup error (script missing a proof artifact it claims to check)
+#   0  all P/R dimensions have passing execution evidence (L/I advisory)
+#   1  one or more P/R dimensions failed or have no execution evidence
+#   2  invalid options or unavailable report setup
 
-set -u
+set -uo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 2
 
 JSON=0
 CI_MODE=0
@@ -29,6 +30,7 @@ for arg in "$@"; do
     case "$arg" in
         --json) JSON=1 ;;
         --ci)   CI_MODE=1 ;;
+        *) echo "unknown audit option: $arg" >&2; exit 2 ;;
     esac
 done
 
@@ -36,7 +38,26 @@ PASS_COUNT=0
 GAP_COUNT=0
 SKIP_COUNT=0
 ABS_COUNT=0
+REQUIRED_GAPS=0
 ROWS=()
+TEST_TIMEOUT_SECS=${TV_AUDIT_TEST_TIMEOUT_SECS:-900}
+case "$TEST_TIMEOUT_SECS" in
+    ''|*[!0-9]*) echo "TV_AUDIT_TEST_TIMEOUT_SECS must be integer seconds" >&2; exit 2 ;;
+esac
+if [[ ${#TEST_TIMEOUT_SECS} -gt 4 ]]; then
+    echo "TV_AUDIT_TEST_TIMEOUT_SECS must be between 1 and 3600" >&2
+    exit 2
+fi
+TEST_TIMEOUT_SECS=$((10#$TEST_TIMEOUT_SECS))
+if [[ "$TEST_TIMEOUT_SECS" -lt 1 || "$TEST_TIMEOUT_SECS" -gt 3600 ]]; then
+    echo "TV_AUDIT_TEST_TIMEOUT_SECS must be between 1 and 3600" >&2
+    exit 2
+fi
+AUDIT_LOG_DIR=$(mktemp -d "${TMPDIR:-/tmp}/tickvault-audit.XXXXXXXX") || exit 2
+if [[ "$JSON" == 1 ]] && ! command -v jq >/dev/null 2>&1; then
+    echo "jq is required for --json reporting" >&2
+    exit 2
+fi
 
 c_green="\033[0;32m"
 c_yellow="\033[0;33m"
@@ -48,6 +69,9 @@ record() {
     # record <category> <status> <dimension> <proof>
     local cat="$1" status="$2" dim="$3" proof="$4"
     ROWS+=("${cat}|${status}|${dim}|${proof}")
+    if [[ "$cat" == P || "$cat" == R ]] && [[ "$status" != PASS ]]; then
+        REQUIRED_GAPS=$((REQUIRED_GAPS + 1))
+    fi
     case "$status" in
         PASS) PASS_COUNT=$((PASS_COUNT + 1)) ;;
         GAP)  GAP_COUNT=$((GAP_COUNT + 1)) ;;
@@ -63,7 +87,7 @@ check_file_exists() {
     # check_file_exists <category> <dim> <path> <proof_description>
     local cat="$1" dim="$2" path="$3" proof="$4"
     if [[ -e "$path" ]]; then
-        record "$cat" PASS "$dim" "$proof"
+        record "$cat" SKIP "$dim" "artifact exists; execution not verified: $path"
     else
         record "$cat" GAP "$dim" "missing: $path"
     fi
@@ -73,32 +97,49 @@ check_test_exists() {
     # check_test_exists <category> <dim> <crate> <test_file> <proof_description>
     local cat="$1" dim="$2" crate="$3" test_file="$4" proof="$5"
     if [[ -f "crates/${crate}/tests/${test_file}" ]] || [[ -f "crates/${crate}/src/${test_file}" ]]; then
-        record "$cat" PASS "$dim" "$proof"
+        record "$cat" SKIP "$dim" "test source exists; not executed: $proof"
     else
-        record "$cat" GAP "$dim" "missing test: crates/${crate}/[tests|src]/${test_file}"
+        record "$cat" GAP "$dim" "missing test source: crates/${crate}/${test_file}"
     fi
 }
 
 check_cargo_test() {
     # check_cargo_test <category> <dim> <crate> <test_name> <proof>
     local cat="$1" dim="$2" crate="$3" test_name="$4" proof="$5"
-    if cargo test -p "$crate" --offline --test "$test_name" --quiet > /tmp/100pct-audit-$$.log 2>&1; then
-        record "$cat" PASS "$dim" "$proof"
+    run_cargo_check "$cat" "$dim" "$proof" -p "$crate" --test "$test_name"
+}
+
+run_cargo_check() {
+    local cat="$1" dim="$2" proof="$3"
+    shift 3
+    local log="$AUDIT_LOG_DIR/check-${#ROWS[@]}.log"
+    if ! command -v cargo >/dev/null 2>&1 || ! command -v timeout >/dev/null 2>&1; then
+        record "$cat" SKIP "$dim" "cargo/timeout unavailable; no test execution"
+        return
+    fi
+    if timeout --kill-after=15s "$TEST_TIMEOUT_SECS" \
+        cargo test --locked --offline "$@" --quiet -- --test-threads=1 > "$log" 2>&1; then
+        if grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed;' "$log"; then
+            record "$cat" PASS "$dim" "selected tests passed: $proof; log: $log"
+        else
+            record "$cat" GAP "$dim" "no nonzero passing test result; log: $log"
+        fi
     else
-        record "$cat" GAP "$dim" "test failed: cargo test -p ${crate} --test ${test_name} (see /tmp/100pct-audit-$$.log)"
+        local code=$?
+        record "$cat" GAP "$dim" "test build/execution failed or incomplete (exit $code); log: $log"
     fi
 }
 
 # =============================================================================
 # COVERAGE + TESTING (P — mechanically provable)
 # =============================================================================
-check_file_exists P "Line coverage threshold = 100%" \
+check_file_exists P "Per-crate coverage floors (current coverage unmeasured)" \
     quality/crate-coverage-thresholds.toml \
     "quality/crate-coverage-thresholds.toml + scripts/coverage-gate.sh"
 
 check_file_exists P "Mutation zero-survivors gate" \
     .github/workflows/mutation.yml \
-    ".github/workflows/mutation.yml fails PR on any SURVIVED line"
+    ".github/workflows/mutation.yml is a scheduled/main check; execution not verified"
 
 check_file_exists P "Fuzz corpus" \
     fuzz/ \
@@ -138,11 +179,11 @@ check_file_exists P "cargo deny config (licenses + version pinning)" \
 # =============================================================================
 # PERFORMANCE (P)
 # =============================================================================
-check_file_exists P "Benchmark budgets (O(1) enforcement)" \
+check_file_exists P "Latency budgets (not an asymptotic proof)" \
     quality/benchmark-budgets.toml \
     "tick_parse ≤10ns, lookup ≤50ns, routing ≤100ns, full_tick ≤10μs"
 
-check_file_exists P "Hot-path zero-allocation (DHAT)" \
+check_file_exists P "Hot-path allocation budgets (DHAT execution unverified)" \
     crates/core/tests/dhat_allocation.rs \
     "crates/core/tests/{dhat_allocation,dhat_ws_reader_zero_alloc,dhat_deep_depth,dhat_token_handle,dhat_instrument_registry}.rs — hot-path 0-alloc via the dhat feature"
 
@@ -157,7 +198,7 @@ check_cargo_test P "Every ErrorCode has runbook" \
     tickvault-common error_code_rule_file_crossref \
     "crates/common/tests/error_code_rule_file_crossref.rs"
 
-check_cargo_test P "Every ErrorCode has triage rule (54/54)" \
+check_cargo_test P "ErrorCode triage-rule source guard" \
     tickvault-common triage_rules_full_coverage_guard \
     "crates/common/tests/triage_rules_full_coverage_guard.rs (M2)"
 
@@ -175,13 +216,9 @@ check_cargo_test P "Metrics catalog no-drift" \
 # ratchet: the seal-ring lib suite (SEAL_BUFFER_CAPACITY L-C1 lock, incl.
 # test_seal_buffer_capacity_constant_is_locked_value). Inline because
 # check_cargo_test only handles --test integration targets.
-if cargo test -p tickvault-trading --offline --lib candles::seal_ring --quiet > /tmp/100pct-audit-$$.log 2>&1; then
-    record P PASS "Seal-ring capacity ratchet (SEAL_BUFFER_CAPACITY)" \
-        "crates/trading/src/candles/seal_ring.rs (lib tests)"
-else
-    record P GAP "Seal-ring capacity ratchet (SEAL_BUFFER_CAPACITY)" \
-        "test failed: cargo test -p tickvault-trading --lib candles::seal_ring (see /tmp/100pct-audit-$$.log)"
-fi
+run_cargo_check P "Seal-ring capacity ratchet (SEAL_BUFFER_CAPACITY)" \
+    "crates/trading/src/candles/seal_ring.rs (lib tests)" \
+    -p tickvault-trading --lib candles::seal_ring
 
 check_cargo_test P "Triage rules schema guard" \
     tickvault-common triage_rules_guard \
@@ -262,30 +299,15 @@ check_file_exists P "M4 rollback dispatcher" \
 # =============================================================================
 # RUNTIME VERIFIABLE (R — requires live services, SKIP if sandbox)
 # =============================================================================
-if command -v curl >/dev/null 2>&1 && curl -fsS -m 2 http://127.0.0.1:9090/-/healthy >/dev/null 2>&1; then
-    record R PASS "Prometheus live" "http://127.0.0.1:9090/-/healthy"
-    # Tick processing rate > 0 during market hours
-    if curl -fsS -m 3 "http://127.0.0.1:9090/api/v1/query?query=rate(tv_ticks_processed_total\[1m\])" 2>/dev/null | grep -q '"value"'; then
-        record R PASS "Tick processing rate metric emitted" "tv_ticks_processed_total via Prometheus"
-    else
-        record R GAP "Tick processing rate" "metric not emitting — check tickvault app is running"
-    fi
-    # Zero-tick-loss alert rule exists
-    if curl -fsS -m 3 http://127.0.0.1:9093/api/v2/alerts 2>/dev/null | grep -q 'status'; then
-        record R PASS "Alertmanager live" "http://127.0.0.1:9093"
-    else
-        record R SKIP "Alertmanager live" "not reachable from this host"
-    fi
-else
-    record R SKIP "Prometheus live probe" "not reachable from this host (sandbox mode)"
-    record R SKIP "Tick processing rate" "prometheus not reachable"
-    record R SKIP "Alertmanager live" "not reachable"
-fi
+# Prometheus/Alertmanager were retired. Their local ports cannot substantiate
+# the current CloudWatch deployment. This command does not contact AWS.
+record R SKIP "Live feed processing and loss alarms" \
+    "current deployed revision, CloudWatch state and data reconciliation not inspected"
 
 if command -v curl >/dev/null 2>&1 && curl -fsS -m 2 http://127.0.0.1:9000/ >/dev/null 2>&1; then
     record R PASS "QuestDB HTTP live" "http://127.0.0.1:9000/"
 else
-    record R SKIP "QuestDB HTTP" "not reachable (run make run on the Mac)"
+    record R SKIP "QuestDB HTTP" "local endpoint not reachable; deployment health unverified"
 fi
 
 # =============================================================================
@@ -294,23 +316,23 @@ fi
 # 2026-07-18 truth-sync: the tv_ticks_dropped_total alert + tick rescue ring
 # retired with the dead tick writer (stage-2/4 sweeps); the live defense is
 # the candle-side seal chain.
-record L PASS "Zero data loss (asymptotic)" \
-    "Layers: seal ring (SEAL_BUFFER_CAPACITY 200K) -> NDJSON spill -> DLQ + DEDUP-idempotent replay + AGGREGATOR-DROP-01 pagers (errcode log-filter alarm + tv-<env>-seal-writer-dropped counter alarm). NOT absolute — upstream vendor CAN omit data."
+record L SKIP "Data-loss defenses" \
+    "buffering, spill and replay are design layers; this report does not execute a loss-reconciliation experiment"
 
-record L PASS "Zero WS disconnect (asymptotic)" \
-    "Layers: 5 conns/pool + state machine + ping/pong + auto-reconnect + DATA-805 handler + kill-switch on cascade. NOT absolute — Dhan CAN send code 50."
+record L SKIP "WebSocket recovery defenses" \
+    "reconnect and watchdog behavior needs bounded fault tests and deployed observations"
 
-record L PASS "QuestDB never fails (asymptotic)" \
-    "Layers: docker healthcheck + spill-to-disk + auto-replay + self-heal ALTER TABLE + up{} alert + partition manager. NOT absolute — disk/hardware CAN fail."
+record L SKIP "QuestDB recovery defenses" \
+    "a responsive HTTP endpoint does not establish persistence or recovery correctness"
 
 # =============================================================================
 # IMPOSSIBLE ABSOLUTE (I — math forbids, closest proxies listed)
 # =============================================================================
 record I ABS "Zero bugs ever" \
-    "Halting problem + Rice's theorem forbid absolute proof. Closest proxies: 100% line coverage + 0 mutation survivors + 24h fuzz + property tests + loom + sanitizers + code review + security review + hot-path DHAT."
+    "finite tests cannot establish correctness for every unbounded input and external failure; formal proofs need explicit models and assumptions"
 
 record I ABS "O(1) on ALL paths (hot + cold)" \
-    "Cold paths (CSV parse, ILP flush) are O(n) by construction — data size varies. Hot path O(1) enforced mechanically via DHAT + benchmarks + banned-pattern + hot-path-reviewer agent."
+    "reading or emitting n records requires work proportional to n; DHAT, source scans and latency samples do not prove a universal asymptotic bound"
 
 record I ABS "Absolute perfect security" \
     "Zero-day CVEs exist by definition. Closest proxies: cargo audit + cargo deny + secret scan + banned patterns + Secret<T>/zeroize + TLS (aws-lc-rs) + API auth middleware + systemd hardening + static IP + security-reviewer agent + weekly dependabot."
@@ -325,14 +347,14 @@ if [[ "$JSON" == "1" ]]; then
     for row in "${ROWS[@]}"; do
         IFS='|' read -r cat status dim proof <<< "$row"
         [[ $first -eq 0 ]] && printf ',\n'
-        printf '    {"category":"%s","status":"%s","dimension":"%s","proof":"%s"}' \
-            "$cat" "$status" "$dim" "${proof//\"/\\\"}"
+        jq -cn --arg category "$cat" --arg status "$status" --arg dimension "$dim" --arg proof "$proof" \
+            '{category:$category,status:$status,dimension:$dimension,proof:$proof}'
         first=0
     done
     printf '\n  ]\n}\n'
 else
     echo "================================================================="
-    echo "  tickvault 100% Audit Tracker — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "  tickvault Audit Evidence Tracker — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "  Plan: .claude/plans/100pct-audit-tracker.md"
     echo "================================================================="
     printf "Categories: P=Mechanically Provable | R=Runtime | L=Layered | I=Impossible (closest proxy)\n\n"
@@ -360,19 +382,17 @@ else
     printf "  PASS: ${c_green}%d${c_reset}   GAP: ${c_red}%d${c_reset}   SKIP: ${c_yellow}%d${c_reset}   ABSOLUTE-IMPOSSIBLE: ${c_yellow}%d${c_reset}\n" \
         "$PASS_COUNT" "$GAP_COUNT" "$SKIP_COUNT" "$ABS_COUNT"
     echo "================================================================="
-    if [[ $GAP_COUNT -eq 0 ]]; then
-        printf "  ${c_green}All mechanically-provable + runtime-reachable dimensions PASS.${c_reset}\n"
+    if [[ $REQUIRED_GAPS -eq 0 ]]; then
+        printf "  ${c_green}Selected checks passed within their recorded scope.${c_reset}\n"
     else
-        printf "  ${c_red}%d gap(s) — fix before merging.${c_reset}\n" "$GAP_COUNT"
+        printf "  ${c_yellow}%d required dimension(s) failed or lack execution evidence.${c_reset}\n" "$REQUIRED_GAPS"
     fi
     echo "================================================================="
 fi
 
-# Exit: GAP is fatal in CI mode, SKIP is advisory, ABS is informational
-if [[ "$CI_MODE" == "1" && $GAP_COUNT -gt 0 ]]; then
-    exit 1
-fi
-if [[ $GAP_COUNT -gt 0 ]]; then
+# Both interactive and CI exit status distinguish missing evidence from PASS.
+# L/I advisory rows never control the verdict.
+if [[ $REQUIRED_GAPS -gt 0 ]]; then
     exit 1
 fi
 exit 0

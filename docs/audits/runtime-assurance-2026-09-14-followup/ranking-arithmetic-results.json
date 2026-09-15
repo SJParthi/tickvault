@@ -1,0 +1,51 @@
+{
+  "completed_utc": "2026-09-14T04:04:22.239332+00:00",
+  "scope": "Python arithmetic model of fixed-width ratio keys against independent Fraction ordering; no Rust compilation, radix execution, AWS, or QuestDB execution",
+  "source_path": "/workspace/scratch/81296451ef3b/tickvault-audit/crates/app/src/volume_leaderboard.rs",
+  "source_sha256": "a54d1f11f941d67111279a99d76650f44bbd23fdf61cf8f513aefb97c27867ab",
+  "cases": [
+    {
+      "name": "unequal_ratios_inside_one_display_bin",
+      "rows": 2,
+      "status": "passed"
+    },
+    {
+      "name": "positive_sub_milli_lots",
+      "rows": 3,
+      "status": "passed"
+    },
+    {
+      "name": "adjacent_maximum_denominators",
+      "rows": 2,
+      "status": "passed"
+    },
+    {
+      "name": "equal_ratios_use_identity_and_segment",
+      "rows": 3,
+      "status": "passed"
+    },
+    {
+      "name": "maximum_numerators_and_denominators",
+      "rows": 7,
+      "status": "passed"
+    },
+    {
+      "name": "one_rounded_bucket_4096_rows",
+      "rows": 4096,
+      "status": "passed"
+    },
+    {
+      "name": "all_4096_small_positive_fractions",
+      "rows": 4096,
+      "status": "passed"
+    },
+    {
+      "name": "deterministic_u32_population_4096_rows",
+      "rows": 4096,
+      "status": "passed"
+    }
+  ],
+  "passed": 8,
+  "failed": 0,
+  "rows": 12305
+}

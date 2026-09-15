@@ -1,26 +1,60 @@
 //! `LiveCandleState` — the shared per-bucket OHLCV state struct.
 //!
-//! Extracted 2026-07-17 (stage-3 dead-WS sweep) from the DELETED
-//! `aggregator_cell.rs` (the publisher-less 21-TF TICK aggregator died
-//! with the live-feed retirements — Dhan 2026-07-13, Groww 2026-07-15).
-//! The struct itself is load-bearing across the SURVIVING seal chain:
-//! it is the payload of [`crate::candles::BufferedSeal`], consumed by the
-//! storage seal-writer chain (`seal_writer_loop` / `ShadowCandleWriter` /
-//! spill / DLQ) and PRODUCED today only by the REST-era candle fold
-//! (`crates/app/src/rest_candle_fold.rs` — FOLD-01), which constructs it
-//! from official `spot_1m_rest` bars. The tick-fold constructors
-//! (`from_first_tick` / `fold_in_bucket` / `fold_late_hlc`) died with the
-//! aggregator; construction is now literal-field (all fields `pub`).
-//!
-//! Field semantics are UNCHANGED from the deleted cell (the QuestDB
-//! `candles_<tf>` column contract depends on them — see
-//! `shadow_seal_columns.rs`).
+//! Used by the live tick fold, REST reconstruction and the durable seal chain.
+//! `volume` is the nonnegative magnitude used for candle aggregation. The
+//! current signed cache projects that magnitude using this timeframe's frozen
+//! previous close. Legacy signed tick sums are distinguished during recovery;
+//! they must never be silently relabeled as whole-bar volume.
+
+/// Instrument definition pinned when a candle bucket opens.
+///
+/// Zero denotes unknown, including records written before this metadata was
+/// persisted. Historical buckets must never acquire today's lot definition.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CandleMetadata {
+    pub lot_size: u32,
+    pub instrument_definition_version: u64,
+    pub underlying_id: u64,
+    /// 0 = unknown, 1 = stock options, 2 = index options.
+    pub family_code: u8,
+}
+
+impl CandleMetadata {
+    pub const UNKNOWN: Self = Self {
+        lot_size: 0,
+        instrument_definition_version: 0,
+        underlying_id: 0,
+        family_code: 0,
+    };
+
+    /// SQL LONG boundaries are part of the persisted definition contract.
+    #[inline]
+    #[must_use]
+    pub const fn is_known(self) -> bool {
+        self.lot_size > 0
+            && self.instrument_definition_version > 0
+            && self.instrument_definition_version <= i64::MAX as u64
+            && self.underlying_id > 0
+            && self.underlying_id <= i64::MAX as u64
+            && (self.family_code == 1 || self.family_code == 2)
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn ranking_family(self) -> Option<&'static str> {
+        match self.family_code {
+            1 => Some("stock"),
+            2 => Some("index"),
+            _ => None,
+        }
+    }
+}
 
 /// Per-bucket live candle state (one open bucket of one timeframe).
 ///
-/// The 3 Wave-5 pct fields plus `open_pct` / `open_gap_pct` stay `0.0`
-/// in the REST-era runtime — the seal-time pct-stamping primitives were
-/// removed with the `PrevDayCache` feeder (dead-code cleanup — BATCH-5).
+/// Live folds refresh the signed cache after changing magnitude or close.
+/// Reconstruction and durable replay must supply explicit provenance and must
+/// not infer a preceding bar that was not persisted with the record.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LiveCandleState {
     /// Bucket-open IST epoch second (aligned to TF boundary).
@@ -36,45 +70,10 @@ pub struct LiveCandleState {
     pub close: f64,
     /// **Incremental** volume within this bucket.
     pub volume: u64,
-    /// Tick-rule SIGNED volume accumulated across this bucket: buy-initiated
-    /// volume minus sell-initiated volume, in the same units as
-    /// [`Self::volume`].
-    ///
-    /// # What replaced what (2026-09-10)
-    ///
-    /// Until today `net_volume()` DERIVED a sign at seal time by comparing the
-    /// bar's close against the previous bar's close, and signed the WHOLE
-    /// bar's volume with it. That is a bar-DIRECTION proxy, not net volume: a
-    /// bar that traded 900 lots on the offer and 1,000 on the bid but happened
-    /// to close one tick up reported `+1,900`, when the honest answer is
-    /// `-100`. The proxy is not merely imprecise — it has the WRONG SIGN
-    /// whenever a bar's close disagrees with its flow, which is exactly the
-    /// divergence a net-volume reader is looking for.
-    ///
-    /// # The rule
-    ///
-    /// Classic tick rule, evaluated ONCE per tick above the timeframe loop:
-    /// the volume traded since the previous tick is BUY-initiated when this
-    /// tick's price is above the previous tick's, SELL-initiated when below,
-    /// and — the zero-tick case — carries the PREVIOUS tick's direction when
-    /// the price is unchanged. Carrying rather than discarding matters:
-    /// unchanged-price ticks are the majority on a liquid contract, and
-    /// dropping them would under-report the bar's flow by most of its volume.
-    ///
-    /// # What this is NOT, stated because the vendor gives us no better
-    ///
-    /// This is INFERRED aggressor side, not reported aggressor side. Dhan's
-    /// feed carries no buy/sell flag and no trade-by-trade tape — a Quote or
-    /// Full packet is a periodic snapshot carrying a day-cumulative volume, so
-    /// the "volume since the previous tick" is itself an aggregate of every
-    /// trade in that interval, signed as a unit. Where several trades on both
-    /// sides fall inside one snapshot interval, they are attributed together.
-    /// `total_buy_qty` / `total_sell_qty` cannot help: those are RESTING order
-    /// totals, and this file's fold says in as many words that nothing
-    /// downstream may treat their difference as an imbalance of trades.
-    ///
-    /// The honest claim is therefore "tick-rule net volume", never "actual
-    /// buy volume minus actual sell volume", and no surface may relabel it.
+    /// Cached whole-bar signed volume. Legacy field names remain for replay
+    /// compatibility; fresh live states never accumulate signed tick increments.
+    /// Magnitude is `volume`; direction compares `close` to the frozen prior
+    /// same-timeframe close. Legacy replay values carry a refusing basis flag.
     pub net_volume_signed: i64,
     /// Cumulative-volume snapshot at bucket-open. Set ONCE per bucket
     /// open; retained for column-contract compatibility.
@@ -117,10 +116,8 @@ pub struct LiveCandleState {
     /// Vendor's total PENDING sell-order quantity. Same contract as
     /// [`Self::total_buy_qty`].
     ///
-    /// This field and `total_buy_qty` together occupy the 8 bytes vacated by
-    /// `volume_pct_from_prev_day` (same 2026-05-28 removal). The struct is
-    /// therefore UNCHANGED at 128 bytes and every downstream size assertion
-    /// holds without being raised.
+    /// Together with `total_buy_qty`, this occupies the storage previously
+    /// used by the retired volume percentage field.
     pub total_sell_qty: u32,
     /// Today's SESSION open (the official 09:15 open). Static per trading
     /// day; last non-zero value wins. Feeds `open_pct` at seal.
@@ -133,31 +130,17 @@ pub struct LiveCandleState {
     /// OPENING GAP % (gap-up positive, gap-down negative). Stamped at
     /// seal time. `0.0` if `prev_day_close` is `0.0` (div-by-zero guard).
     pub open_gap_pct: f64,
-    /// `true` when [`Self::net_volume_signed`] was accumulated by the live
-    /// fold; `false` when this bar was rebuilt from a source that does not
-    /// carry it.
-    ///
-    /// # Why this exists, and why it is not a defensive nicety
-    ///
-    /// The 128-byte disk-spill record (`seal_spill::SEAL_SPILL_RECORD_SIZE`)
-    /// is byte-for-byte FULL — every one of its 128 bytes is assigned — so a
-    /// spilled bar cannot carry the accumulator without a coordinated on-disk
-    /// format migration. Without this flag a replayed bar would arrive with
-    /// `net_volume_signed == 0` and `volume > 0`, and `net_volume()` would
-    /// report `Some(0)`: a confident "this bar's flow was perfectly balanced"
-    /// for a bar nobody classified. That is a fabricated reading, and strictly
-    /// worse than the `NULL` the column is designed to accept.
-    ///
-    /// So the flag is the honest half of a deliberately incomplete change:
-    /// the LIVE path (fold → ring → writer) classifies and reports; the SPILL
-    /// path (fold → ring evicted → disk → replay) reports `NULL` and says so.
-    /// Carrying the accumulator through disk is a format bump plus a mixed-
-    /// stride reader, and it is recorded as outstanding rather than rushed
-    /// through beside a hot-path change.
-    ///
-    /// Costs ZERO bytes: it lands in padding the struct already had after its
-    /// three trailing `u32`s (measured — `size_of` is 136 with and without).
+    /// Whether the cached whole-bar projection is available. Missing prior
+    /// candle close is unavailable; an equal close is a known zero.
     pub net_volume_classified: bool,
+    /// Immutable instrument definition for this bucket, including its lot size.
+    pub metadata: CandleMetadata,
+    /// Sticky local quality flags; zero means locally eligible, not proof of
+    /// exchange-wide completeness. See `candles::volume_update` for flag bits.
+    pub volume_quality: u32,
+    /// Positive monotonic revision within this bucket. Zero means unavailable
+    /// for legacy/rebuilt records; exhaustion must make the bucket ineligible.
+    pub bucket_revision: u64,
 }
 
 impl LiveCandleState {
@@ -187,6 +170,9 @@ impl LiveCandleState {
             open_pct: 0.0,
             open_gap_pct: 0.0,
             net_volume_classified: false,
+            metadata: CandleMetadata::UNKNOWN,
+            volume_quality: crate::candles::volume_update::VOLUME_QUALITY_UNKNOWN_METADATA,
+            bucket_revision: 0,
         }
     }
 
@@ -268,73 +254,71 @@ impl LiveCandleState {
         self.open_gap_pct = pct_change(self.session_open, self.prev_day_close);
     }
 
-    /// Tick-rule net volume for this bar: buy-initiated minus sell-initiated.
-    ///
-    /// Returns `None` — persisted as SQL NULL — when the question cannot be
-    /// asked. That distinction is the whole reason this returns an `Option`:
-    /// `0` here means "the bar's flow was balanced", and it must NOT also mean
-    /// "no trade was classifiable". `close_pct_from_prev_day` collapses both
-    /// onto `0.0` because its column has carried that sentinel since the first
-    /// row ever written; this column can be honest.
-    ///
-    /// # What this replaced, and why the old answer could be the WRONG SIGN
-    ///
-    /// From its introduction to 2026-09-10 this function derived a sign at
-    /// SEAL time — `close > bucket_open_prev_close` — and applied it to the
-    /// whole bar's volume. It was documented honestly as "the quantity a
-    /// broker chart plots as Net Volume", and it is not that: it is bar
-    /// direction times bar volume. A bar that traded 1,000 lots into the bid
-    /// and 900 into the offer, and closed one tick up on the last print,
-    /// reported `+1,900` where the honest reading is `-100`. The failure is
-    /// not a rounding difference; the sign is inverted precisely when flow and
-    /// close disagree, which is the case a net-volume reader is looking at the
-    /// column to find.
-    ///
-    /// See [`Self::net_volume_signed`] for the rule now used, and for the
-    /// stated limit: this is INFERRED aggressor side, because the vendor
-    /// publishes neither a trade tape nor a buy/sell flag.
-    ///
-    /// # The three refusals
-    ///
-    /// - **Not classified** (`!net_volume_classified`) — this bar was rebuilt
-    ///   from a source that does not carry the accumulator, today meaning the
-    ///   disk spill. Refused rather than reported as balanced; see that
-    ///   field for why a `Some(0)` here would be a fabrication.
-    ///
-    /// - **Untraded bar** (`tick_count == 0`) — no tick was folded, so nothing
-    ///   was classified. Distinct from a balanced bar.
-    /// - **No classifiable volume** (`volume == 0`) — every tick in the bucket
-    ///   arrived with the day-cumulative unchanged, which is what a repeated
-    ///   snapshot of a quiet instrument looks like. There were prints to
-    ///   count only if volume moved.
-    ///
-    /// A bar that traded and whose flow genuinely nets to zero returns
-    /// `Some(0)`, and that is a real reading, not a refusal.
-    ///
-    /// # The invariant a reader may rely on
-    ///
-    /// `net_volume().abs() <= volume`, always. The accumulator is a sum of
-    /// per-tick deltas each of which is bounded by that tick's contribution to
-    /// `volume`, and the saturation below cannot widen it. A row violating it
-    /// is a fold defect, not a market condition.
-    ///
-    /// # Complexity
-    /// O(1) — one compare and one saturating convert on fields already in this
-    /// struct. Zero allocation. Runs once per SEAL, never once per tick; the
-    /// per-tick work is a single `i64` add in the fold.
+    /// Refresh a live cache from its canonical magnitude and frozen bar baseline.
+    /// A preceding candle's late correction does not rewrite this baseline.
+    /// No open-price or previous-day fallback is inferred. Never use this to
+    /// reinterpret a replayed legacy cache: its basis flag remains refusing.
+    #[inline]
+    pub fn refresh_signed_bar_volume(&mut self) {
+        use super::volume_update::{
+            VOLUME_QUALITY_COUNTER_AMBIGUOUS, VOLUME_QUALITY_LEGACY_BASIS,
+            VOLUME_QUALITY_UNCLASSIFIED_NET,
+        };
+        let refused = self.volume_quality
+            & (VOLUME_QUALITY_COUNTER_AMBIGUOUS | VOLUME_QUALITY_LEGACY_BASIS)
+            != 0
+            || self.tick_count == 0
+            || !self.close.is_finite()
+            || self.close <= 0.0
+            || !self.bucket_open_prev_close.is_finite()
+            || self.bucket_open_prev_close <= 0.0;
+        let projected = if refused {
+            None
+        } else {
+            i64::try_from(self.volume).ok().map(|magnitude| {
+                if self.close > self.bucket_open_prev_close {
+                    magnitude
+                } else if self.close < self.bucket_open_prev_close {
+                    -magnitude
+                } else {
+                    0
+                }
+            })
+        };
+        self.net_volume_signed = projected.unwrap_or(0);
+        self.net_volume_classified = projected.is_some();
+        // Only the obsolete classification bit is recomputed. Quantity,
+        // metadata, attribution and legacy-basis flags remain unchanged.
+        self.volume_quality &= !VOLUME_QUALITY_UNCLASSIFIED_NET;
+        if projected.is_none() {
+            self.volume_quality |= VOLUME_QUALITY_UNCLASSIFIED_NET;
+        }
+    }
+
+    /// Read the cached whole-bar projection, including after durable replay.
+    /// Replay omits the predecessor close, so never reconstruct it here.
+    #[inline]
+    #[must_use]
+    pub fn signed_bar_volume(&self) -> Option<i64> {
+        use super::volume_update::{VOLUME_QUALITY_COUNTER_AMBIGUOUS, VOLUME_QUALITY_LEGACY_BASIS};
+        if !self.net_volume_classified
+            || self.tick_count == 0
+            || self.volume > i64::MAX as u64
+            || self.volume_quality
+                & (VOLUME_QUALITY_COUNTER_AMBIGUOUS | VOLUME_QUALITY_LEGACY_BASIS)
+                != 0
+        {
+            return None;
+        }
+        (self.net_volume_signed == 0 || self.net_volume_signed.unsigned_abs() == self.volume)
+            .then_some(self.net_volume_signed)
+    }
+
+    /// Compatibility accessor for the whole-bar signed cache.
     #[inline]
     #[must_use]
     pub fn net_volume(&self) -> Option<i64> {
-        if !self.net_volume_classified || self.tick_count == 0 || self.volume == 0 {
-            return None;
-        }
-        // The accumulator is already `i64` and each addition saturates, so the
-        // magnitude cannot wrap. Clamping to the bar's own volume is belt-and
-        // -braces on the stated invariant: an accumulator that somehow exceeded
-        // the bar it belongs to would be a fold defect, and reporting a net
-        // larger than the gross would look like a real market reading.
-        let ceiling = i64::try_from(self.volume).unwrap_or(i64::MAX);
-        Some(self.net_volume_signed.clamp(-ceiling, ceiling))
+        self.signed_bar_volume()
     }
 }
 
@@ -405,7 +389,7 @@ fn pct_change_raw(value: f64, baseline: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{LiveCandleState, pct_change, pct_change_raw};
+    use super::{CandleMetadata, LiveCandleState, pct_change, pct_change_raw};
 
     /// The four percentage columns must carry AT MOST two decimals, because
     /// Dhan publishes two and the daily cross-verification compares our
@@ -670,123 +654,161 @@ mod tests {
         );
     }
 
-    /// The two dropped percentage fields (`oi_pct_from_prev_day`,
-    /// `volume_pct_from_prev_day`) are GONE, not merely unstamped.
-    ///
-    /// Their DDL columns were removed 2026-05-28 (spot has no OI, indices have
-    /// no volume) and the fields then sat in every bar holding a permanent
-    /// `0.0` — 16 bytes per state, multiplied by `TF_COUNT` slots and again by
-    /// `last_sealed`, in a struct pinned at exactly 128 bytes by three separate
-    /// compile-time assertions with zero slack between them.
-    ///
-    /// Reclaiming those 16 bytes is what pays for `bucket_open_prev_close`
-    /// (8) + `total_buy_qty` (4) + `total_sell_qty` (4). This test is the
-    /// replacement for the old "they are never stamped" pin: it asserts the
-    /// struct did not grow, which is the property the assertions downstream
-    /// actually depend on.
+    /// Metadata adds at most 48 bytes to each live and last-sealed slot.
     #[test]
-    fn the_state_is_136_bytes_and_every_size_assert_knows_it() {
-        assert_eq!(
-            std::mem::size_of::<LiveCandleState>(),
-            136,
-            "LiveCandleState changed size — BufferedSeal (<=152), AggregatorCell \
-             (MAX_AGGREGATOR_CELL_BYTES) and SerializedSeal (SEAL_SPILL_RECORD_SIZE) \
-             all assume this figure and every one of them is at zero slack today. \
-             128 -> 136 on 2026-09-10 for `net_volume_signed`; the cost is recorded \
-             in aws-budget.md."
-        );
-    }
-
-    /// The classified MARKER is free — it must land in existing padding.
-    ///
-    /// If it ever stops being free, the two RAM budgets move again and the
-    /// arithmetic recorded beside them goes stale. Asserting the size WITHOUT
-    /// it is not possible from here, so this asserts the property that makes
-    /// it free: the struct is a multiple of its 8-byte alignment with room to
-    /// spare after the three trailing `u32`s.
-    #[test]
-    fn the_classified_marker_costs_nothing() {
+    fn pinned_metadata_state_fits_the_reviewed_184_byte_budget() {
+        assert!(std::mem::size_of::<LiveCandleState>() <= 184);
         assert_eq!(std::mem::align_of::<LiveCandleState>(), 8);
-        // 11 f64 + 2 u64 + 2 i64 + 3 u32 + 1 bool = 133 bytes of payload,
-        // which is why 136 has room and the flag is free.
-        assert_eq!(std::mem::size_of::<LiveCandleState>(), 136);
+        assert!(std::mem::size_of::<CandleMetadata>() <= 32);
     }
 
-    /// The three refusals, each one a real hazard rather than defensive noise.
     #[test]
-    fn net_volume_refuses_every_question_it_cannot_answer() {
-        let mut s = sealed(24_273.15, 24_341.95, 24_334.55);
-        s.volume = 1_000;
-        s.net_volume_classified = true;
-        s.net_volume_signed = 400;
-        s.tick_count = 3;
-
-        // Sanity: with all three preconditions met it DOES answer.
-        assert_eq!(s.net_volume(), Some(400));
-
-        // Not classified: a bar rebuilt from a source that does not carry the
-        // accumulator. Reporting `Some(0)` here would say "perfectly balanced"
-        // about a bar nobody classified.
-        s.net_volume_classified = false;
-        assert_eq!(s.net_volume(), None);
-        s.net_volume_classified = true;
-
-        // Untraded bar: no tick was folded, so nothing was classified.
-        s.tick_count = 0;
-        assert_eq!(s.net_volume(), None);
-        s.tick_count = 3;
-
-        // No classifiable volume: every tick repeated the same day-cumulative,
-        // so there were no prints to attribute to a side.
-        s.volume = 0;
-        assert_eq!(s.net_volume(), None);
+    fn metadata_requires_a_complete_representable_bucket_definition() {
+        let valid = CandleMetadata {
+            lot_size: 50,
+            instrument_definition_version: 8,
+            underlying_id: 13,
+            family_code: 2,
+        };
+        assert!(valid.is_known());
+        assert_eq!(valid.ranking_family(), Some("index"));
+        assert!(!CandleMetadata::UNKNOWN.is_known());
+        for invalid in [
+            CandleMetadata {
+                lot_size: 0,
+                ..valid
+            },
+            CandleMetadata {
+                instrument_definition_version: 0,
+                ..valid
+            },
+            CandleMetadata {
+                instrument_definition_version: u64::MAX,
+                ..valid
+            },
+            CandleMetadata {
+                underlying_id: u64::MAX,
+                ..valid
+            },
+            CandleMetadata {
+                family_code: 3,
+                ..valid
+            },
+        ] {
+            assert!(!invalid.is_known());
+        }
+        assert_eq!(LiveCandleState::empty().metadata, CandleMetadata::UNKNOWN);
+        assert_eq!(LiveCandleState::empty().bucket_revision, 0);
+        assert_ne!(LiveCandleState::empty().volume_quality, 0);
     }
 
-    /// A traded bar whose flow genuinely nets to zero is a REAL reading.
-    ///
-    /// This is the distinction the `Option` exists for, and it is the one a
-    /// naive implementation collapses: `Some(0)` means balanced, `None` means
-    /// unanswerable, and a reader must be able to tell them apart.
     #[test]
-    fn a_balanced_bar_reports_zero_and_that_is_not_a_refusal() {
-        let mut s = sealed(24_273.15, 24_341.95, 24_334.55);
-        s.volume = 1_000;
-        s.tick_count = 8;
-        s.net_volume_classified = true;
-        s.net_volume_signed = 0;
+    fn signed_bar_volume_uses_full_magnitude_and_prior_close_not_open() {
+        // Includes the supplied red-but-positive candle and open=close case.
+        for (open, close, previous, volume, expected) in [
+            (20.65, 20.65, 13.25, 600_u64, 600_i64),
+            (31.60, 30.95, 20.65, 46_200, 46_200),
+            (31.00, 32.60, 30.95, 18_600, 18_600),
+            (32.60, 33.35, 32.60, 27_600, 27_600),
+            (33.35, 32.40, 33.35, 30_600, -30_600),
+            (32.40, 34.50, 32.40, 39_600, 39_600),
+            (34.00, 32.40, 32.40, 900, 0),
+        ] {
+            let mut state = LiveCandleState::empty();
+            state.open = open;
+            state.close = close;
+            state.bucket_open_prev_close = previous;
+            state.volume = volume;
+            state.tick_count = 1;
+            state.refresh_signed_bar_volume();
+            assert_eq!(state.signed_bar_volume(), Some(expected));
+            assert_eq!(state.net_volume(), Some(expected));
+            assert_eq!(state.volume, volume);
+        }
+    }
+
+    #[test]
+    fn signed_bar_unknown_baseline_overflow_and_legacy_cache_are_unavailable() {
+        use crate::candles::volume_update::VOLUME_QUALITY_LEGACY_BASIS;
+        let mut state = LiveCandleState::empty();
+        state.close = 101.0;
+        state.open = 100.0;
+        state.prev_day_close = 90.0;
+        state.volume = 50;
+        state.tick_count = 1;
+        state.refresh_signed_bar_volume();
+        assert_eq!(state.signed_bar_volume(), None, "no guessed baseline");
+        for previous in [f64::NAN, f64::INFINITY, -1.0, 0.0] {
+            state.bucket_open_prev_close = previous;
+            state.refresh_signed_bar_volume();
+            assert_eq!(state.signed_bar_volume(), None);
+        }
+        state.bucket_open_prev_close = 100.0;
+        state.volume = i64::MAX as u64;
+        state.refresh_signed_bar_volume();
+        assert_eq!(state.signed_bar_volume(), Some(i64::MAX));
+        state.close = 99.0;
+        state.refresh_signed_bar_volume();
+        assert_eq!(state.signed_bar_volume(), Some(-i64::MAX));
+        state.volume += 1;
+        state.refresh_signed_bar_volume();
+        assert_eq!(state.signed_bar_volume(), None);
+        state.volume = 50;
+        state.net_volume_signed = -50;
+        state.net_volume_classified = true;
+        state.volume_quality |= VOLUME_QUALITY_LEGACY_BASIS;
+        assert_eq!(state.signed_bar_volume(), None);
+        state.refresh_signed_bar_volume();
+        assert_ne!(state.volume_quality & VOLUME_QUALITY_LEGACY_BASIS, 0);
+        assert_eq!(state.signed_bar_volume(), None);
+    }
+
+    #[test]
+    fn refreshing_direction_only_recomputes_the_classification_quality_bit() {
+        use crate::candles::volume_update::{
+            VOLUME_QUALITY_ATTRIBUTION_UNCERTAIN, VOLUME_QUALITY_COUNTER_AMBIGUOUS,
+            VOLUME_QUALITY_MISSING_OBSERVATION, VOLUME_QUALITY_UNCLASSIFIED_NET,
+            VOLUME_QUALITY_UNKNOWN_BASELINE,
+        };
+        let quantity_flags = VOLUME_QUALITY_ATTRIBUTION_UNCERTAIN
+            | VOLUME_QUALITY_MISSING_OBSERVATION
+            | VOLUME_QUALITY_UNKNOWN_BASELINE;
+        let mut state = LiveCandleState::empty();
+        state.close = 101.0;
+        state.volume = 50;
+        state.tick_count = 1;
+        state.volume_quality = quantity_flags | VOLUME_QUALITY_UNCLASSIFIED_NET;
+        state.bucket_open_prev_close = 100.0;
+        state.refresh_signed_bar_volume();
+        assert_eq!(state.signed_bar_volume(), Some(50));
+        assert_eq!(state.volume_quality, quantity_flags);
+        state.close = 99.0;
+        state.refresh_signed_bar_volume();
+        assert_eq!(state.signed_bar_volume(), Some(-50));
+        assert_eq!(state.volume_quality, quantity_flags);
+        state.volume_quality |= VOLUME_QUALITY_COUNTER_AMBIGUOUS;
+        state.refresh_signed_bar_volume();
+        assert_eq!(state.signed_bar_volume(), None);
+        assert_eq!(state.volume_quality & quantity_flags, quantity_flags);
+    }
+
+    #[test]
+    fn replay_reads_valid_cache_without_needing_a_missing_previous_close() {
+        let mut state = LiveCandleState::empty();
+        state.volume = 50;
+        state.tick_count = 1;
+        state.net_volume_classified = true;
+        state.net_volume_signed = -50;
+        assert_eq!(state.signed_bar_volume(), Some(-50));
+        state.net_volume_signed = -20;
         assert_eq!(
-            s.net_volume(),
-            Some(0),
-            "500 lots bought and 500 sold is a balanced bar, not an unknown one"
+            state.signed_bar_volume(),
+            None,
+            "old partial net is not a bar magnitude"
         );
-    }
-
-    /// THE INVARIANT: the net can never exceed the gross it is drawn from.
-    ///
-    /// A row violating it would look like a real market reading — "this bar
-    /// traded 1,000 lots, of which 5,000 were buys" — so the clamp is the last
-    /// line of defence behind the fold's own arithmetic.
-    #[test]
-    fn net_volume_can_never_exceed_the_bars_own_volume() {
-        let mut s = sealed(24_273.15, 24_341.95, 24_334.55);
-        s.tick_count = 4;
-        s.net_volume_classified = true;
-        s.volume = 1_000;
-
-        s.net_volume_signed = 5_000;
-        assert_eq!(
-            s.net_volume(),
-            Some(1_000),
-            "clamped to the bar's own gross"
-        );
-        s.net_volume_signed = -5_000;
-        assert_eq!(s.net_volume(), Some(-1_000), "and on the sell side too");
-
-        // The saturating ceiling: a `u64` volume past `i64::MAX` must not wrap
-        // the clamp bound into a negative number, which would invert the sign.
-        s.volume = u64::MAX;
-        s.net_volume_signed = i64::MIN;
-        let nv = s.net_volume().expect("classified and traded");
-        assert!(nv < 0, "a sell-heavy bar must never report as buy-heavy");
+        state.net_volume_signed = 0;
+        assert_eq!(state.signed_bar_volume(), Some(0));
+        state.tick_count = 0;
+        assert_eq!(state.signed_bar_volume(), None);
     }
 }

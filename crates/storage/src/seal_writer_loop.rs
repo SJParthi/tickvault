@@ -267,13 +267,48 @@ fn record_boot_drain_observability(outcome: &BootDrainOutcome) {
         metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_reingested")
             .increment(outcome.seals_reingested as u64);
     }
+    if outcome.seals_already_present > 0 {
+        metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_already_present")
+            .increment(outcome.seals_already_present as u64);
+    }
+    if outcome.files_deferred_conflict > 0 {
+        metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_conflict_file_deferred")
+            .increment(outcome.files_deferred_conflict as u64);
+    }
+    if outcome.files_deferred_ordering_unverified > 0 || outcome.ordering_exclusion_unverified {
+        metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_ordering_unverified")
+            .increment(
+                outcome.files_deferred_ordering_unverified as u64
+                    + u64::from(outcome.ordering_exclusion_unverified),
+            );
+    }
     if outcome.records_undecodable > 0 {
         metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_undecodable")
             .increment(outcome.records_undecodable as u64);
     }
+    if outcome.records_retired_timeframe > 0 {
+        metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_retired_timeframe")
+            .increment(outcome.records_retired_timeframe as u64);
+    }
+    if outcome.files_deferred_retired_timeframe > 0 {
+        metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_retired_file_deferred")
+            .increment(outcome.files_deferred_retired_timeframe as u64);
+    }
+    if outcome.files_deferred_invalid > 0 {
+        metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_invalid_file_deferred")
+            .increment(outcome.files_deferred_invalid as u64);
+    }
     if outcome.seals_left_pending > 0 {
         metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_pending")
             .increment(outcome.seals_left_pending as u64);
+    }
+    if outcome.discovery_errors > 0 {
+        metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_discovery_errors")
+            .increment(outcome.discovery_errors as u64);
+    }
+    if outcome.pending_count_unknown {
+        metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_pending_unknown")
+            .increment(1);
     }
 }
 
@@ -401,6 +436,57 @@ fn run_cycle(runner: &mut SealWriterRunner, now_unix_secs: i64) -> CycleOutcome 
     }
 }
 
+/// Publish startup completion only after recovery has stopped touching files.
+/// The supplied recovery operation is synchronous; the signal never races it.
+fn recover_before_producers(
+    recover: impl FnOnce() -> BootDrainOutcome,
+    boot_ready: Option<tokio::sync::oneshot::Sender<BootDrainOutcome>>,
+) -> bool {
+    // Expose both states on the local exporter even on a clean boot. An
+    // external delta sampler can still absorb an early boot event into its
+    // first baseline, so the coded recovery logs remain required evidence.
+    metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_discovery_errors").increment(0);
+    metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_pending_unknown").increment(0);
+    let boot = match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(recover)
+        }
+        _ => recover(),
+    };
+    record_boot_drain_observability(&boot);
+    if !boot.is_clean() {
+        info!(
+            files_staged = boot.files_staged,
+            seals_recovered = boot.seals_recovered,
+            seals_reingested = boot.seals_reingested,
+            files_archived = boot.files_archived,
+            files_left_pending = boot.files_left_pending,
+            seals_left_pending = boot.seals_left_pending,
+            records_undecodable = boot.records_undecodable,
+            records_retired_timeframe = boot.records_retired_timeframe,
+            files_deferred_retired_timeframe = boot.files_deferred_retired_timeframe,
+            files_deferred_invalid = boot.files_deferred_invalid,
+            files_deferred_conflict = boot.files_deferred_conflict,
+            files_deferred_ordering_unverified = boot.files_deferred_ordering_unverified,
+            ordering_exclusion_unverified = boot.ordering_exclusion_unverified,
+            seals_already_present = boot.seals_already_present,
+            discovery_errors = boot.discovery_errors,
+            pending_count_unknown = boot.pending_count_unknown,
+            "seal writer boot recovery drain finished"
+        );
+    }
+    if let Some(ready) = boot_ready
+        && ready.send(boot).is_err()
+    {
+        error!(
+            code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+            "seal recovery startup waiter disappeared — draining accepted seals and exiting"
+        );
+        return false;
+    }
+    true
+}
+
 /// Long-running tokio task. Calls `runner.run_one_cycle` on a fixed
 /// 100 ms interval until cancelled. On cancellation, performs ONE
 /// final drain cycle so no buffered seal is silently lost.
@@ -413,9 +499,27 @@ fn run_cycle(runner: &mut SealWriterRunner, now_unix_secs: i64) -> CycleOutcome 
 /// Returns the outcome of the final post-cancel drain so the caller
 /// can log / surface it for graceful-shutdown observability.
 pub async fn run_seal_writer_loop(
+    runner: SealWriterRunner,
+    interval: Duration,
+    cancel_rx: watch::Receiver<bool>,
+) -> CycleOutcome {
+    run_seal_writer_loop_with_boot_ready(runner, interval, cancel_rx, None).await
+}
+
+/// Run the writer and notify startup only after its one recovery pass finishes.
+///
+/// Production must await this notification BEFORE starting any seal producer.
+/// A completion can carry pending recovery files; it means staging/replay has
+/// stopped touching names, not that every recovered seal reached QuestDB.
+/// This prevents a same-process producer from keeping an append descriptor to
+/// a file that recovery has already read and archived. External concurrent
+/// writers to these directories remain unsupported by the singleton lifecycle.
+/// A dropped startup receiver exits through the normal final rescue drain.
+pub async fn run_seal_writer_loop_with_boot_ready(
     mut runner: SealWriterRunner,
     interval: Duration,
     mut cancel_rx: watch::Receiver<bool>,
+    boot_ready: Option<tokio::sync::oneshot::Sender<BootDrainOutcome>>,
 ) -> CycleOutcome {
     info!(
         interval_ms = interval.as_millis(),
@@ -436,19 +540,8 @@ pub async fn run_seal_writer_loop(
     // ratchet splits this file at the FIRST occurrence of that token to scan
     // production code only; an earlier literal silently shrinks the scanned
     // region and would let the observability wiring be deleted unnoticed.
-    let boot = runner.boot_drain();
-    record_boot_drain_observability(&boot);
-    if !boot.is_clean() {
-        info!(
-            files_staged = boot.files_staged,
-            seals_recovered = boot.seals_recovered,
-            seals_reingested = boot.seals_reingested,
-            files_archived = boot.files_archived,
-            files_left_pending = boot.files_left_pending,
-            seals_left_pending = boot.seals_left_pending,
-            records_undecodable = boot.records_undecodable,
-            "seal writer boot recovery drain finished"
-        );
+    if !recover_before_producers(|| runner.boot_drain(), boot_ready) {
+        return final_drain(&mut runner, &mut SealWriterProgress::default());
     }
 
     let mut ticker = tokio::time::interval(interval);
@@ -598,6 +691,235 @@ mod tests {
         state.total_buy_qty = 89_600;
         state.total_sell_qty = 4_800;
         BufferedSeal::new(sid, seg, tf, state, Feed::Dhan)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn boot_barrier_waits_for_real_replay_before_new_append_handles_open() {
+        use crate::seal_spill::{SealSpillWriter, SerializedSeal};
+        use crate::seal_writer_task::{
+            SEAL_ARCHIVE_SUBDIR, SEAL_REPLAYING_SUBDIR, SealSink, drain_recovered_seals,
+        };
+
+        struct BlockedFlush {
+            entered: Option<tokio::sync::oneshot::Sender<()>>,
+            release: std::sync::mpsc::Receiver<()>,
+            fail: bool,
+        }
+        impl SealSink for BlockedFlush {
+            fn recover_batch(
+                &mut self,
+                seals: &[BufferedSeal],
+            ) -> Result<
+                crate::seal_recovery_guard::RecoveredBatch,
+                crate::seal_recovery_guard::RecoveryRefusal,
+            > {
+                crate::seal_writer_task::recover_fixture_batch(self, seals)
+            }
+
+            fn append_seal(&mut self, _: &BufferedSeal) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn flush(&mut self) -> anyhow::Result<()> {
+                self.entered
+                    .take()
+                    .expect("one flush")
+                    .send(())
+                    .expect("waiter");
+                self.release.recv_timeout(Duration::from_secs(5))?;
+                anyhow::ensure!(!self.fail, "injected database refusal");
+                Ok(())
+            }
+            fn discard_pending(&mut self) {}
+        }
+
+        for failed_flush in [false, true] {
+            let label = if failed_flush {
+                "boot-barrier-refusal"
+            } else {
+                "boot-barrier-success"
+            };
+            let (spill, dlq) = temp_pair(label);
+            let now = 1_716_000_000;
+            let previous = SealSpillWriter::with_spill_dir_for_test(spill.clone());
+            let old = SerializedSeal::from(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0));
+            previous
+                .append_seal(&old, now)
+                .expect("previous process spill");
+            let path = previous.spill_path(now);
+            let original = std::fs::read(&path).expect("original");
+            drop(previous);
+            // The new process owns this writer, but production does not let
+            // any producer open its append descriptor before readiness.
+            let live_writer = SealSpillWriter::with_spill_dir_for_test(spill.clone());
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
+            let worker_spill = spill.clone();
+            let worker_dlq = dlq.clone();
+            let worker = std::thread::spawn(move || {
+                let mut sink = BlockedFlush {
+                    entered: Some(entered_tx),
+                    release: release_rx,
+                    fail: failed_flush,
+                };
+                recover_before_producers(
+                    || drain_recovered_seals(&mut sink, &worker_spill, &worker_dlq, 16),
+                    Some(ready_tx),
+                )
+            });
+            tokio::time::timeout(Duration::from_secs(5), entered_rx)
+                .await
+                .expect("replay reached flush")
+                .expect("flush notification");
+            assert!(
+                matches!(
+                    ready_rx.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ),
+                "a blocked recovery must not release startup"
+            );
+            assert!(
+                !path.exists(),
+                "the original is already staged during the blocked flush"
+            );
+            release_tx.send(()).expect("release replay");
+            let boot = tokio::time::timeout(Duration::from_secs(5), ready_rx)
+                .await
+                .expect("completion")
+                .expect("worker notification");
+            assert!(worker.join().expect("worker"));
+            assert_eq!(boot.files_archived, if failed_flush { 0 } else { 1 });
+            assert_eq!(boot.files_left_pending, if failed_flush { 1 } else { 0 });
+
+            let healthy = SerializedSeal::from(&mk_seal(25, 0, TfIndex::M1, 1_716_024_300, 200.0));
+            let later = SerializedSeal::from(&mk_seal(51, 0, TfIndex::M1, 1_716_024_900, 300.0));
+            live_writer
+                .append_seal(&healthy, now)
+                .expect("first new producer append");
+            live_writer
+                .append_seal(&later, now)
+                .expect("cached descriptor append");
+            assert_eq!(
+                live_writer.read_all(now).expect("fresh live file"),
+                vec![healthy, later]
+            );
+            let retained_dir = if failed_flush {
+                SEAL_REPLAYING_SUBDIR
+            } else {
+                SEAL_ARCHIVE_SUBDIR
+            };
+            assert_eq!(
+                std::fs::read(
+                    spill
+                        .join(retained_dir)
+                        .join(path.file_name().expect("name"))
+                )
+                .expect("retained original"),
+                original,
+                "new accepted seals must not land behind the replayed/archived inode"
+            );
+            drop(live_writer);
+            cleanup(&spill, &dlq);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_run_seal_writer_loop_with_boot_ready_rescues_after_waiter_drop() {
+        let (spill, dlq) = temp_pair("boot-waiter-dropped");
+        let runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 16);
+        // A fresh absent directory uses the pipeline's existing fail-open
+        // probe policy, keeping this rescue independent of host free space.
+        std::fs::remove_dir(&spill).expect("fresh spill directory");
+        let producer = runner.sender();
+        producer
+            .try_send(mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
+            .expect("accepted before startup cancellation");
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        drop(ready_rx);
+        let task = tokio::spawn(run_seal_writer_loop_with_boot_ready(
+            runner,
+            Duration::from_secs(30),
+            cancel_rx,
+            Some(ready_tx),
+        ));
+        let final_outcome = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("startup cancellation must not deadlock")
+            .expect("worker");
+        assert_eq!(final_outcome.submitted_from_mpsc, 1);
+        assert_eq!(final_outcome.drain.rescued_to_spill, 1);
+        let reader = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        assert_eq!(
+            reader
+                .read_all(utc_now_secs())
+                .expect("accepted seal retained")
+                .len(),
+            1
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn boot_recovery_panic_cannot_report_ready_or_remove_staged_originals() {
+        use crate::seal_spill::{SealSpillWriter, SerializedSeal};
+        use crate::seal_writer_task::{SEAL_REPLAYING_SUBDIR, SealSink, drain_recovered_seals};
+        struct PanickingSink;
+        impl SealSink for PanickingSink {
+            fn recover_batch(
+                &mut self,
+                seals: &[BufferedSeal],
+            ) -> Result<
+                crate::seal_recovery_guard::RecoveredBatch,
+                crate::seal_recovery_guard::RecoveryRefusal,
+            > {
+                crate::seal_writer_task::recover_fixture_batch(self, seals)
+            }
+
+            fn append_seal(&mut self, _: &BufferedSeal) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn flush(&mut self) -> anyhow::Result<()> {
+                panic!("injected boot task failure")
+            }
+            fn discard_pending(&mut self) {}
+        }
+        let (spill, dlq) = temp_pair("boot-recovery-panic");
+        let previous = SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let seal = SerializedSeal::from(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0));
+        let now = 1_716_000_000;
+        previous
+            .append_seal(&seal, now)
+            .expect("previous process spill");
+        let path = previous.spill_path(now);
+        let bytes = std::fs::read(&path).expect("original bytes");
+        drop(previous);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let worker_spill = spill.clone();
+        let worker_dlq = dlq.clone();
+        let worker = std::thread::spawn(move || {
+            recover_before_producers(
+                || drain_recovered_seals(&mut PanickingSink, &worker_spill, &worker_dlq, 16),
+                Some(ready_tx),
+            )
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), ready_rx)
+                .await
+                .expect("failed worker must close notification")
+                .is_err()
+        );
+        assert!(worker.join().is_err());
+        assert_eq!(
+            std::fs::read(
+                spill
+                    .join(SEAL_REPLAYING_SUBDIR)
+                    .join(path.file_name().expect("name"))
+            )
+            .expect("original survives task failure"),
+            bytes
+        );
+        cleanup(&spill, &dlq);
     }
 
     #[test]
@@ -1031,7 +1353,27 @@ mod tests {
                 ..Default::default()
             },
             BootDrainOutcome {
+                records_retired_timeframe: 1,
+                ..Default::default()
+            },
+            BootDrainOutcome {
+                files_deferred_retired_timeframe: 1,
+                ..Default::default()
+            },
+            BootDrainOutcome {
+                files_deferred_invalid: 1,
+                ..Default::default()
+            },
+            BootDrainOutcome {
                 seals_left_pending: 7,
+                ..Default::default()
+            },
+            BootDrainOutcome {
+                discovery_errors: 1,
+                ..Default::default()
+            },
+            BootDrainOutcome {
+                pending_count_unknown: true,
                 ..Default::default()
             },
         ] {
@@ -1044,10 +1386,19 @@ mod tests {
             files_staged: 4,
             seals_recovered: 900,
             seals_reingested: 850,
+            seals_already_present: 20,
             files_archived: 3,
             files_left_pending: 1,
             seals_left_pending: 50,
             records_undecodable: 2,
+            records_retired_timeframe: 3,
+            files_deferred_retired_timeframe: 1,
+            files_deferred_invalid: 1,
+            files_deferred_conflict: 1,
+            files_deferred_ordering_unverified: 1,
+            ordering_exclusion_unverified: true,
+            discovery_errors: 1,
+            pending_count_unknown: true,
         });
     }
 

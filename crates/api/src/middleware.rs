@@ -474,7 +474,9 @@ pub async fn require_bearer_auth(
         return Ok(next.run(request).await);
     }
 
-    // BUG-3 fix (2026-07-05): auth-failure warns carry the request path
+    // Authentication diagnostics carry the request path at DEBUG only.
+    // The counter remains unconditional; rejected traffic must not amplify
+    // production WARN/INFO logs. BUG-3: diagnostics carry the request path
     // (URI path only — NEVER the query string, which could carry tokens)
     // and a sanitized peer label, so the operator can distinguish their own
     // browser from a credential probe. Header VALUES are never logged.
@@ -501,9 +503,9 @@ pub async fn require_bearer_auth(
                 Ok(next.run(request).await)
             } else {
                 // 401-burst visibility (2026-07-10): SINGLE UNLABELED counter —
-                // one increment per bearer-auth rejection, no per-401 log beyond
-                // the pre-existing BUG-3 warn (log-amplification defence; the
-                // warn already carries path + peer for forensics). Feeds the
+                // one increment per bearer-auth rejection. Per-request details
+                // are DEBUG only, preserving forensic fields without a WARN
+                // flood at normal production levels. Feeds the
                 // tv-<env>-api-auth-failed CloudWatch alarm via the metrics log
                 // group delta-extraction route (auth-failed-alarm.tf); the
                 // series is pre-registered at 0 in main.rs post-recorder-install
@@ -518,7 +520,7 @@ pub async fn require_bearer_auth(
                 if config.request_oob_reload() {
                     debug!("GAP-SEC-01: mismatched bearer — out-of-band token re-read hinted");
                 }
-                warn!(
+                debug!(
                     path = %request_path,
                     peer = %client_peer_label(&request),
                     "GAP-SEC-01: API auth failed — invalid bearer token"
@@ -529,7 +531,7 @@ pub async fn require_bearer_auth(
         Some(_) => {
             // 401-burst counter — see the invalid-token arm comment.
             metrics::counter!("tv_api_auth_failed_total").increment(1);
-            warn!(
+            debug!(
                 path = %request_path,
                 peer = %client_peer_label(&request),
                 "GAP-SEC-01: API auth failed — malformed Authorization header"
@@ -539,7 +541,7 @@ pub async fn require_bearer_auth(
         None => {
             // 401-burst counter — see the invalid-token arm comment.
             metrics::counter!("tv_api_auth_failed_total").increment(1);
-            warn!(
+            debug!(
                 path = %request_path,
                 peer = %client_peer_label(&request),
                 "GAP-SEC-01: API auth failed — missing Authorization header"
@@ -668,14 +670,27 @@ pub async fn request_tracing(request: Request, next: Next) -> Response {
     )
     .record(duration_ms);
 
-    // Structured log for audit trail — includes all 5W fields.
-    tracing::info!(
-        http.method = %method,
-        http.path = %path,
-        http.status = status,
-        duration_ms = format!("{duration_ms:.2}"),
-        "API request completed"
-    );
+    // The outer middleware also observes 401/404/429 responses. Keep client
+    // rejection details at DEBUG; otherwise rate limiting/authentication would
+    // still produce one INFO event for every rejected request. The histogram
+    // above always records the response, including its bounded status label.
+    if response.status().is_client_error() {
+        tracing::debug!(
+            http.method = %method,
+            http.path = %path,
+            http.status = status,
+            duration_ms,
+            "API request rejected"
+        );
+    } else {
+        tracing::info!(
+            http.method = %method,
+            http.path = %path,
+            http.status = status,
+            duration_ms,
+            "API request completed"
+        );
+    }
 
     response
 }
@@ -1554,6 +1569,81 @@ mod tests {
     // Request tracing middleware (L5)
     // -----------------------------------------------------------------------
 
+    #[derive(Clone, Default)]
+    struct CapturedLevels(std::sync::Arc<std::sync::Mutex<Vec<tracing::Level>>>);
+
+    impl tracing::Subscriber for CapturedLevels {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            self.0.lock().unwrap().push(*event.metadata().level());
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn client_rejections_keep_status_without_warn_or_info_log_amplification() {
+        use axum::{Router, body::Body, http::Request};
+        use tower::ServiceExt;
+        use tracing::instrument::WithSubscriber;
+
+        let capture = CapturedLevels::default();
+        let observed = capture.clone();
+        async move {
+            let app = Router::new()
+                .route("/protected", axum::routing::get(mock_handler))
+                .layer(axum::middleware::from_fn_with_state(
+                    ApiAuthConfig::new("test-token".into()),
+                    require_bearer_auth,
+                ))
+                .layer(axum::middleware::from_fn(request_tracing));
+            for bearer in [None, Some("invalid"), Some("Bearer wrong")] {
+                let mut request = Request::builder().uri("/protected");
+                if let Some(value) = bearer {
+                    request = request.header("authorization", value);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            }
+            let limited = Router::new()
+                .route(
+                    "/limited",
+                    axum::routing::get(|| async { StatusCode::TOO_MANY_REQUESTS }),
+                )
+                .layer(axum::middleware::from_fn(request_tracing));
+            let response = limited
+                .oneshot(
+                    Request::builder()
+                        .uri("/limited")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+        .with_subscriber(capture)
+        .await;
+        let levels = observed.0.lock().unwrap();
+        assert!(levels.iter().any(|level| *level == tracing::Level::DEBUG));
+        assert!(
+            levels
+                .iter()
+                .all(|level| *level == tracing::Level::DEBUG || *level == tracing::Level::TRACE)
+        );
+    }
+
     #[tokio::test]
     async fn test_request_tracing_returns_response_and_preserves_status() {
         use axum::Router;
@@ -1877,11 +1967,11 @@ mod tests {
         assert_eq!(client_peer_label(&request), "203.0.113.7");
     }
 
-    /// Source-scan ratchet: every GAP-SEC-01 auth-failure warn must carry
+    /// Source-scan ratchet: every GAP-SEC-01 auth-failure diagnostic must carry
     /// the `path` + `peer` structured fields (BUG-3, 2026-07-05) — and must
     /// never log the Authorization header value.
     #[test]
-    fn test_auth_failure_warns_carry_path_and_peer_fields() {
+    fn test_auth_failure_diagnostics_are_debug_and_carry_path_and_peer_fields() {
         let src = include_str!("middleware.rs");
         for needle in [
             "API auth failed — invalid bearer token",
@@ -1891,11 +1981,12 @@ mod tests {
             let pos = src.find(needle).unwrap_or_else(|| {
                 panic!("auth-failure warn message not found in middleware.rs: {needle}")
             });
-            // The warn! block immediately preceding the message must carry
+            // The debug! block immediately preceding the message must carry
             // the structured fields.
             let window = &src[pos.saturating_sub(200)..pos];
             assert!(
-                window.contains("path = %request_path")
+                window.contains("debug!(")
+                    && window.contains("path = %request_path")
                     && window.contains("peer = %client_peer_label(&request)"),
                 "the warn for '{needle}' must carry `path` + `peer` structured fields"
             );

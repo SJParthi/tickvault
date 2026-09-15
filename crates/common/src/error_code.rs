@@ -67,6 +67,18 @@ impl fmt::Display for Severity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ErrorCode {
+    /// WAL-SEQUENCE-01: sequence capacity, ownership or reservation durability
+    /// is unavailable. Capture can stop; accepted IDs must never be reused.
+    WalSequence01AdmissionRefused,
+    /// WAL-RECOVERY-01: a WAL replay, archive, or directory durability proof
+    /// failed. Retained files require investigation before confirmation.
+    WalRecovery01Refused,
+    /// CANDLE-SCHEMA-01: required candle schema/projection startup or migration
+    /// was refused. Writers stay blocked where their prerequisites fail.
+    CandleSchema01Refused,
+    /// CANDLE-RANK-01: metadata or publication validation refused a ranking.
+    /// No complete/current ranking can be inferred from the rejected update.
+    CandleRank01Refused,
     // -----------------------------------------------------------------------
     // Instrument — Priority 0 (data-loss / correctness)
     // -----------------------------------------------------------------------
@@ -1093,6 +1105,10 @@ impl ErrorCode {
     #[must_use]
     pub const fn code_str(self) -> &'static str {
         match self {
+            Self::WalSequence01AdmissionRefused => "WAL-SEQUENCE-01",
+            Self::WalRecovery01Refused => "WAL-RECOVERY-01",
+            Self::CandleSchema01Refused => "CANDLE-SCHEMA-01",
+            Self::CandleRank01Refused => "CANDLE-RANK-01",
             // Instrument P0 — PR #6b (2026-05-19): I-P0-01/02/04/05/06 retired
             Self::InstrumentP0ExpiryAtGate4 => "I-P0-03",
             // Instrument P1 — PR #6a (2026-05-19): I-P1-01 / I-P1-02 / I-P1-03 retired
@@ -1288,6 +1304,10 @@ impl ErrorCode {
     #[must_use]
     pub const fn severity(self) -> Severity {
         match self {
+            Self::WalSequence01AdmissionRefused
+            | Self::WalRecovery01Refused
+            | Self::CandleSchema01Refused
+            | Self::CandleRank01Refused => Severity::High,
             // Critical: auth / account / global connection cap
             Self::Dh901InvalidAuth
             | Self::Dh902NoApiAccess
@@ -1575,6 +1595,10 @@ impl ErrorCode {
     #[must_use]
     pub const fn runbook_path(self) -> &'static str {
         match self {
+            Self::WalSequence01AdmissionRefused
+            | Self::WalRecovery01Refused
+            | Self::CandleSchema01Refused
+            | Self::CandleRank01Refused => ".claude/rules/project/runtime-recovery-error-codes.md",
             // PR #6b (2026-05-19): I-P0-01/02/04/05/06 retired with their modules.
             Self::InstrumentP0ExpiryAtGate4
             // PR #6a (2026-05-19): I-P1-01 / I-P1-02 / I-P1-03 retired
@@ -1821,6 +1845,11 @@ impl ErrorCode {
             self,
             Self::Futidx02CrossFeedExpiryMismatch
                 | Self::WalSuspend01TableSuspended
+                // Refusal recovery needs review of the retained evidence.
+                | Self::WalSequence01AdmissionRefused
+                | Self::WalRecovery01Refused
+                | Self::CandleSchema01Refused
+                | Self::CandleRank01Refused
 
                 // SPOT-XVERIFY-01 (Dhan↔Groww spot cross-broker
                 // comparator): a cross-broker OHLC divergence is a
@@ -1862,6 +1891,10 @@ impl ErrorCode {
     #[must_use]
     pub fn all() -> &'static [ErrorCode] {
         &[
+            Self::WalSequence01AdmissionRefused,
+            Self::WalRecovery01Refused,
+            Self::CandleSchema01Refused,
+            Self::CandleRank01Refused,
             // PR #6b (2026-05-19): I-P0-01/02/04/05/06 retired with their modules.
             Self::InstrumentP0ExpiryAtGate4,
             // PR #6a (2026-05-19): I-P1-01 / I-P1-02 / I-P1-03 retired
@@ -2077,6 +2110,26 @@ impl FromStr for ErrorCode {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn recovery_refusal_codes_preserve_operator_review_and_exact_identity() {
+        for (code, name) in [
+            (ErrorCode::WalSequence01AdmissionRefused, "WAL-SEQUENCE-01"),
+            (ErrorCode::WalRecovery01Refused, "WAL-RECOVERY-01"),
+            (ErrorCode::CandleSchema01Refused, "CANDLE-SCHEMA-01"),
+            (ErrorCode::CandleRank01Refused, "CANDLE-RANK-01"),
+        ] {
+            assert_eq!(code.code_str(), name);
+            assert_eq!(name.parse::<ErrorCode>(), Ok(code));
+            assert_eq!(code.severity(), Severity::High);
+            assert!(!code.is_auto_triage_safe());
+            assert!(ErrorCode::all().contains(&code));
+            assert_eq!(
+                code.runbook_path(),
+                ".claude/rules/project/runtime-recovery-error-codes.md"
+            );
+        }
+    }
 
     #[test]
     fn test_all_variants_have_unique_code_str() {
@@ -2336,6 +2389,10 @@ mod tests {
         for code in ErrorCode::all() {
             let s = code.code_str();
             let has_known_prefix = s.starts_with("I-P")
+                || s.starts_with("WAL-SEQUENCE-")
+                || s.starts_with("WAL-RECOVERY-")
+                || s.starts_with("CANDLE-SCHEMA-")
+                || s.starts_with("CANDLE-RANK-")
                 || s.starts_with("GAP-")
                 || s.starts_with("OMS-GAP-")
                 || s.starts_with("WS-GAP-")

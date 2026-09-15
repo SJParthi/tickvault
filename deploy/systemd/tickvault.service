@@ -4,6 +4,8 @@
 # Auto-restarts the trading app on crash. Watchdog kills hung processes.
 #
 # Install:
+#   Install the persistent start guard and independent drop-in first; see
+#   docs/wal-sequence-start-guard.md. Initial installation stays fenced.
 #   sudo cp deploy/systemd/tickvault.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable tickvault
@@ -81,8 +83,10 @@ Type=notify
 # /opt/tickvault is chowned to ec2-user in the user-data script.
 User=ec2-user
 Group=ec2-user
-# The app binary, dropped by the deploy-aws GitHub Actions workflow.
-ExecStart=/opt/tickvault/bin/tickvault
+# The independent drop-in preserves this admission even when an old base
+# unit is restored. The guard pins and execs the exact approved app inode.
+ExecCondition=/usr/local/libexec/tickvault-start-guard check
+ExecStart=/usr/local/libexec/tickvault-start-guard run
 WorkingDirectory=/opt/tickvault
 
 # Self-heal: ensure the QuestDB container EXISTS + is started before the app

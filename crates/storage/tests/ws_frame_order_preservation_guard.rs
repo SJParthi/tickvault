@@ -28,9 +28,13 @@
 //! single-producer FIFO within a segment + that sort are the full order
 //! guarantee.
 
+#[path = "support/owned_wal_replay.rs"]
+mod owned_wal_replay;
+use owned_wal_replay::{assert_complete_replay, claim_wal};
+
 use std::sync::Arc;
 
-use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType, replay_all};
+use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType};
 
 fn tmp_dir(tag: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -84,7 +88,9 @@ fn test_wal_replay_preserves_exact_tick_order() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
-    let recovered = replay_all(&dir).expect("replay_all");
+    let dir_owner = claim_wal(&dir);
+    let recovered_batch = assert_complete_replay(&dir_owner);
+    let recovered = &recovered_batch.frames;
     assert_eq!(recovered.len(), N as usize, "every frame must replay");
 
     // THE ORDER GUARANTEE: recovered[i] is exactly the i-th appended frame.
@@ -125,11 +131,13 @@ fn test_wal_replay_order_is_strictly_monotonic() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
-    let recovered = replay_all(&dir).expect("replay_all");
+    let dir_owner = claim_wal(&dir);
+    let recovered_batch = assert_complete_replay(&dir_owner);
+    let recovered = &recovered_batch.frames;
     assert_eq!(recovered.len(), N as usize);
 
     let mut prev: Option<u32> = None;
-    for rec in &recovered {
+    for rec in recovered {
         let m = decode_marker(&rec.frame);
         if let Some(p) = prev {
             assert_eq!(
