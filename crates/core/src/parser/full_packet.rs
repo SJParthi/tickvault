@@ -81,6 +81,7 @@ pub fn parse_full_packet(
         received_at_nanos,
         average_traded_price: atp,
         volume,
+        volume_present: true,
         total_sell_quantity: total_sell_qty,
         total_buy_quantity: total_buy_qty,
         day_open,

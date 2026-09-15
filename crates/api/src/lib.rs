@@ -369,7 +369,7 @@ fn resolve_cors_origins(allowed_origins: &[String]) -> Vec<axum::http::HeaderVal
 ///
 /// If the list is empty, falls back to permissive localhost defaults for dev safety.
 // O(1) EXEMPT: begin — cold path, called once at boot
-fn build_cors_layer(allowed_origins: &[String]) -> CorsLayer {
+pub fn build_cors_layer(allowed_origins: &[String]) -> CorsLayer {
     use axum::http::{Method, header};
 
     // B3: Restrict methods to GET/POST/DELETE and headers to Authorization/Content-Type.
@@ -862,11 +862,9 @@ mod tests {
 
         // Companion ratchet to the 401 test above: the gate OPENS for the real
         // token in BOTH modes, so the 2026-07-04 gating can never lock the
-        // operator out. The probe is a TrueData DISABLE: it is runtime-toggleable
-        // and narrowing is always permitted, so a 200 here means "past the auth
-        // gate" and nothing else. (It probed "groww" until 2026-08-21; that name
-        // now answers 400 "unknown feed", which would have passed the auth gate
-        // too but for the wrong reason.)
+        // operator out. The probe is a TrueData DISABLE: authentication must
+        // pass, then the handler must explicitly refuse the unwired transport.
+        // A 200 would falsely claim the switch controlled a running feed.
         for feed_toggle_public in [true, false] {
             let auth = ApiAuthConfig::from_token(SecretString::from("secret-tok".to_string()));
             let router = build_router_with_auth(auth_test_state(), &[], auth, feed_toggle_public);
@@ -885,9 +883,9 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 response.status(),
-                axum::http::StatusCode::OK,
+                axum::http::StatusCode::CONFLICT,
                 "POST /api/feeds/{{feed}} with the valid bearer token must pass \
-                 the gate (feed_toggle_public={feed_toggle_public})"
+                 auth and refuse the unwired feed (feed_toggle_public={feed_toggle_public})"
             );
         }
     }

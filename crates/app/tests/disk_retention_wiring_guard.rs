@@ -30,8 +30,8 @@ fn read_main_rs() -> String {
 fn test_main_spawns_ws_wal_archive_prune() {
     let src = read_main_rs();
     assert!(
-        src.contains("ws_frame_spill::prune_archived_segments("),
-        "main.rs must call ws_frame_spill::prune_archived_segments — without \
+        src.contains("ws_wal_prune.prune_archived_segments("),
+        "main.rs must call its owned WAL handle's prune_archived_segments — without \
          it, confirmed-replay WAL segments accumulate unbounded in \
          data/ws_wal/archive/ (~0.15-0.6 GB/day on the prod 30 GB volume)"
     );
@@ -45,19 +45,15 @@ fn test_main_spawns_ws_wal_archive_prune() {
         src.contains("WS_WAL_ARCHIVE_PRUNE_INTERVAL_SECS"),
         "the prune task must loop on the pinned 6h cadence constant"
     );
-    // The prune must read the SAME WAL dir the writer uses (the
-    // single-source-of-truth helper — relocated 2026-07-18 from the retired
-    // tick_conservation_boot module into boot_helpers with the
-    // tick-conservation retirement), so the two can never drift.
+    // The prune must share the exact claim that boot replay and the writer
+    // hold, rather than re-resolving a mutable directory pathname.
     let prune_idx = src
-        .find("ws_frame_spill::prune_archived_segments(")
+        .find("ws_wal_prune.prune_archived_segments(")
         .expect("prune call present");
-    let window = &src[prune_idx.saturating_sub(600)..prune_idx];
+    let window = &src[prune_idx.saturating_sub(900)..prune_idx];
     assert!(
-        window.contains("boot_helpers::ws_wal_dir()"),
-        "the prune task must resolve the WAL dir via \
-         boot_helpers::ws_wal_dir() (the shared single source of \
-         truth), not a hardcoded path"
+        window.contains("let ws_wal_prune = ws_wal_maintenance.clone();"),
+        "the prune task must retain boot's original directory claim"
     );
 }
 

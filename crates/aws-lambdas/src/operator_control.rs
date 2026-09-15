@@ -132,6 +132,10 @@ pub const SQL_BANNED: [&str; 25] = [
 /// legacy: `_SQL_MAX_ROWS = 1000` — server-side row cap for the read-only
 /// SQL console (both the Data-tab query box and the DB tab share `sql`).
 pub const SQL_MAX_ROWS: i64 = 1000;
+/// Remote HTTP work and SSM execution are bounded independently of polling.
+const SQL_CURL_TIMEOUT_SECS: u32 = 4;
+const SQL_COMMAND_EXECUTION_TIMEOUT_SECS: u32 = 10;
+const SQL_COMMAND_DELIVERY_TIMEOUT_SECS: i32 = 30;
 
 /// legacy: `_QDB_LINK_TTL_SECS = 90` — TTL of the one-click console link
 /// token minted by the `qdb_console_url` action. The console front Lambda
@@ -372,20 +376,6 @@ pub const MAIN_SHA_MAX_AGE_SECS: f64 = 600.0;
 pub const CONSOLE_HTML: &str = include_str!("operator_control_console.html");
 
 // --------------------------------------------------------- legacy-parity glue
-
-/// legacy `bool(x)` truthiness for JSON values (`bool(payload.get("force",
-/// False))`): null/absent → false, numbers → != 0, strings/arrays/objects →
-/// non-empty.
-fn truthy(v: &Value) -> bool {
-    match v {
-        Value::Null => false,
-        Value::Bool(b) => *b,
-        Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
-        Value::String(s) => !s.is_empty(),
-        Value::Array(a) => !a.is_empty(),
-        Value::Object(o) => !o.is_empty(),
-    }
-}
 
 /// legacy `str(payload.get(key, "")).strip()` for the string fields the
 /// router reads (action / confirm / command_id / query). Ledger deviation: a
@@ -1253,6 +1243,12 @@ pub trait OpsShell {
     async fn instance_state(&self) -> Result<String, String>;
     /// legacy `_ssm_shell(commands)` → CommandId (Err → the 500 arm).
     async fn ssm_shell(&self, commands: &[String]) -> Result<String, String>;
+    /// Dispatch a read command with a remote execution deadline.
+    async fn ssm_shell_bounded(
+        &self,
+        commands: &[String],
+        execution_timeout_secs: u32,
+    ) -> Result<String, String>;
     /// legacy `_ssm_shell_sync(commands, timeout)` → stdout+stderr, "" on
     /// any failure (box stopped / SSM offline) — callers degrade to an empty
     /// snapshot, never a 500.
@@ -1275,6 +1271,85 @@ pub trait OpsShell {
     /// legacy `_main_sha()` — GitHub main HEAD, 60s cache / 600s max-age,
     /// fail-soft to "unknown".
     async fn main_sha(&self) -> String;
+}
+
+#[derive(Debug)]
+enum CheckedCommandError {
+    DispatchFailed,
+    Deadline { command_id: Option<String> },
+    Failed { command_id: String, status: String },
+    EmptyOutput { command_id: String },
+}
+
+/// Preserve command outcomes instead of turning failure/timeout into CSV.
+/// A deadline is uncertainty: the remote command may still be queued/running.
+async fn checked_sql_command<S: OpsShell>(
+    shell: &S,
+    commands: &[String],
+    budget: std::time::Duration,
+) -> Result<String, CheckedCommandError> {
+    let deadline = tokio::time::Instant::now() + budget;
+    let command_id = tokio::time::timeout_at(
+        deadline,
+        shell.ssm_shell_bounded(commands, SQL_COMMAND_EXECUTION_TIMEOUT_SECS),
+    )
+    .await
+    .map_err(|_| CheckedCommandError::Deadline { command_id: None })?
+    .map_err(|_| CheckedCommandError::DispatchFailed)?;
+    let poll = async {
+        loop {
+            if let Ok((status, stdout, _stderr)) = shell.command_invocation(&command_id).await {
+                match status.as_str() {
+                    "Success" if stdout.trim().is_empty() => {
+                        return Err(CheckedCommandError::EmptyOutput {
+                            command_id: command_id.clone(),
+                        });
+                    }
+                    "Success" => return Ok(stdout),
+                    "Failed" | "Cancelled" | "TimedOut" => {
+                        return Err(CheckedCommandError::Failed {
+                            command_id: command_id.clone(),
+                            status,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs_f64(VIEW_POLL_SECS)).await;
+        }
+    };
+    tokio::time::timeout_at(deadline, poll)
+        .await
+        .unwrap_or_else(|_| {
+            Err(CheckedCommandError::Deadline {
+                command_id: Some(command_id.clone()),
+            })
+        })
+}
+
+fn sql_command_response(result: Result<String, CheckedCommandError>) -> Value {
+    match result {
+        Ok(csv) => resp(200, &json!({"ok": true, "action": "sql", "csv": csv})),
+        Err(CheckedCommandError::DispatchFailed) => resp(
+            503,
+            &json!({"ok": false, "action": "sql", "error": "query dispatch could not be confirmed"}),
+        ),
+        Err(CheckedCommandError::Deadline { command_id }) => resp(
+            504,
+            &json!({"ok": false, "action": "sql", "status": "Pending", "command_id": command_id,
+                "error": "query completion was not confirmed before the deadline; the command may still be queued or running"}),
+        ),
+        Err(CheckedCommandError::Failed { command_id, status }) => resp(
+            502,
+            &json!({"ok": false, "action": "sql", "status": status, "command_id": command_id,
+                "error": "query command did not complete successfully"}),
+        ),
+        Err(CheckedCommandError::EmptyOutput { command_id }) => resp(
+            502,
+            &json!({"ok": false, "action": "sql", "command_id": command_id,
+                "error": "query command returned no result data"}),
+        ),
+    }
 }
 
 /// legacy 500 arm: `except Exception: _resp(500, {"error": "action failed",
@@ -1329,7 +1404,13 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
     };
 
     let action = payload_str(&payload, "action").to_string();
-    let force = truthy(payload.get("force").unwrap_or(&Value::Bool(false)));
+    // An override is an explicit JSON boolean, never legacy truthiness:
+    // the string "false" must not stop a live box during market hours.
+    let force = match payload.get("force") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => return resp(400, &json!({"error": "force must be a JSON boolean"})),
+    };
 
     // HARD gate first: data-destructive actions have NO force escape during
     // market hours (audit fix #2 — see DATA_DESTRUCTIVE above). Must run
@@ -1462,7 +1543,7 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
             // resurrect-proof rewrite — operator incident 2026-07-02).
             // Requires force=true (even off-hours) + the typed confirm token
             // (PR-5 H-1: a scripted call with a stolen bearer can no longer
-            // fire this). Command list: WIPE_QUESTDB_COMMANDS (oracle golden).
+            // fire this). Command list: reviewed WIPE_QUESTDB_COMMANDS.
             if !force {
                 return resp(
                     409,
@@ -1623,14 +1704,21 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
             let q = cap_sql_rows(&q);
             let enc = url_quote(&q);
             let cmds = [
-                "set +e".to_string(),
+                // Preserve curl failure through the output-limiting pipeline.
+                "set -e; set -o pipefail".to_string(),
                 format!(
-                    "curl -fsS 'http://127.0.0.1:9000/exp?query={enc}&limit={SQL_MAX_ROWS}' 2>/dev/null | head -{} || echo 'query failed'",
+                    "curl -fsS --max-time {SQL_CURL_TIMEOUT_SECS} 'http://127.0.0.1:9000/exp?query={enc}&limit={SQL_MAX_ROWS}' 2>/dev/null | head -{}",
                     SQL_MAX_ROWS + 1
                 ),
             ];
-            let out = shell.ssm_shell_sync(&cmds, VIEW_TIMEOUT_SECS).await;
-            resp(200, &json!({"ok": true, "action": "sql", "csv": out}))
+            sql_command_response(
+                checked_sql_command(
+                    shell,
+                    &cmds,
+                    std::time::Duration::from_secs_f64(VIEW_TIMEOUT_SECS),
+                )
+                .await,
+            )
         }
         "qdb_console_url" => {
             // READ-ONLY: mint a one-click 90s HMAC link to the B4 QuestDB
@@ -1956,6 +2044,28 @@ impl OpsShell for AwsShell {
             .instance_ids(&self.instance_id)
             .document_name("AWS-RunShellScript")
             .parameters("commands", commands.to_vec())
+            .send()
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        out.command()
+            .and_then(|c| c.command_id())
+            .map(ToString::to_string)
+            .ok_or_else(|| "send_command: no CommandId".to_string())
+    }
+
+    async fn ssm_shell_bounded(
+        &self,
+        commands: &[String],
+        execution_timeout_secs: u32,
+    ) -> Result<String, String> {
+        let out = self
+            .ssm
+            .send_command()
+            .instance_ids(&self.instance_id)
+            .document_name("AWS-RunShellScript")
+            .parameters("commands", commands.to_vec())
+            .parameters("executionTimeout", vec![execution_timeout_secs.to_string()])
+            .timeout_seconds(SQL_COMMAND_DELIVERY_TIMEOUT_SECS)
             .send()
             .await
             .map_err(|e| format!("{e:?}"))?;
@@ -2438,6 +2548,7 @@ mod tests {
 
     use crate::operator_control_action_commands::{
         DOCKER_NUKE_BARE_COMMANDS, DOCKER_RESET_COMMANDS, WIPE_QUESTDB_COMMANDS,
+        WIPE_QUESTDB_PREPARE_COMMAND,
     };
     use crate::operator_control_commands::{
         FEEDS_VIEW_COMMANDS, LATENCY_COMMANDS, REST_LATENCY_SQL, VIEW_COMMANDS,
@@ -2466,6 +2577,7 @@ mod tests {
         cost: String,
         captured: std::sync::Mutex<Vec<Vec<String>>>,
         captured_sync: std::sync::Mutex<Vec<Vec<String>>>,
+        captured_execution_timeouts: std::sync::Mutex<Vec<u32>>,
     }
 
     impl Default for MockShell {
@@ -2485,6 +2597,7 @@ mod tests {
                 cost: String::new(),
                 captured: std::sync::Mutex::new(Vec::new()),
                 captured_sync: std::sync::Mutex::new(Vec::new()),
+                captured_execution_timeouts: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -2548,6 +2661,17 @@ mod tests {
         async fn ssm_shell_sync(&self, commands: &[String], _timeout_secs: f64) -> String {
             self.captured_sync.lock().unwrap().push(commands.to_vec());
             self.sync_output.clone()
+        }
+        async fn ssm_shell_bounded(
+            &self,
+            commands: &[String],
+            execution_timeout_secs: u32,
+        ) -> Result<String, String> {
+            self.captured_execution_timeouts
+                .lock()
+                .unwrap()
+                .push(execution_timeout_secs);
+            self.ssm_shell(commands).await
         }
         async fn command_invocation(
             &self,
@@ -3329,6 +3453,128 @@ mod tests {
         assert_eq!(status_of(&resp), 401);
     }
 
+    #[tokio::test]
+    async fn test_force_requires_json_boolean_before_market_hours_override() {
+        for value in [
+            Value::Null,
+            json!("false"),
+            json!("true"),
+            json!(0),
+            json!(1),
+            json!([]),
+            json!([false]),
+            json!({}),
+            json!({"value": false}),
+        ] {
+            let shell = MockShell {
+                market_hours: true,
+                forbid_ssm: Some("invalid force must never dispatch a command"),
+                ..MockShell::default()
+            };
+            let response = post(&shell, json!({"action": "restart-app", "force": value})).await;
+            assert_eq!(status_of(&response), 400, "force={value}");
+        }
+        for payload in [
+            json!({"action": "restart-app"}),
+            json!({"action": "restart-app", "force": false}),
+        ] {
+            let shell = MockShell {
+                market_hours: true,
+                forbid_ssm: Some("absent/false force must preserve the market-hours gate"),
+                ..MockShell::default()
+            };
+            assert_eq!(status_of(&post(&shell, payload).await), 409);
+        }
+        let shell = MockShell {
+            market_hours: true,
+            ..MockShell::default()
+        };
+        let response = post(&shell, json!({"action": "restart-app", "force": true})).await;
+        assert_eq!(status_of(&response), 200);
+        assert!(
+            shell
+                .captured_joined()
+                .contains("systemctl restart tickvault")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sql_control_requires_confirmed_success_and_remote_deadline() {
+        let shell = MockShell {
+            invocation: Ok(("Success".to_string(), "x\n1\n".to_string(), String::new())),
+            ..MockShell::default()
+        };
+        let response = post(&shell, json!({"action": "sql", "query": "select 1 x"})).await;
+        assert_eq!(status_of(&response), 200);
+        assert_eq!(body_of(&response)["csv"], "x\n1\n");
+        assert_eq!(
+            *shell.captured_execution_timeouts.lock().unwrap(),
+            [SQL_COMMAND_EXECUTION_TIMEOUT_SECS]
+        );
+        let command = shell.captured_joined();
+        assert!(command.contains(&format!("--max-time {SQL_CURL_TIMEOUT_SECS}")));
+        assert!(command.contains("set -o pipefail"));
+        for forbidden in ["systemctl", "rm -", "docker", "query=TRUNCATE"] {
+            assert!(!command.contains(forbidden));
+        }
+
+        // Run only the captured READ command with curl replaced by a failure.
+        // The previous `head || echo` pipeline acknowledged this as success.
+        let output = std::process::Command::new("bash")
+            .args(["--noprofile", "--norc", "-c"])
+            .arg(format!("curl() {{ return 7; }}\n{command}"))
+            .env_remove("BASH_ENV")
+            .output()
+            .expect("Bash must run the isolated SQL transport fixture");
+        assert!(!output.status.success(), "curl failure must survive head");
+    }
+
+    #[tokio::test]
+    async fn test_sql_control_refuses_dispatch_terminal_and_empty_failures() {
+        let dispatch_failure = MockShell {
+            ssm_result: Err("SSM unavailable".to_string()),
+            ..MockShell::default()
+        };
+        let response = post(
+            &dispatch_failure,
+            json!({"action": "sql", "query": "select 1"}),
+        )
+        .await;
+        assert_eq!(status_of(&response), 503);
+        assert_eq!(body_of(&response)["ok"], false);
+        for status in ["Failed", "Cancelled", "TimedOut", "Success"] {
+            let shell = MockShell {
+                invocation: Ok((status.to_string(), String::new(), "diagnostic".to_string())),
+                ..MockShell::default()
+            };
+            let response = post(&shell, json!({"action": "sql", "query": "select 1"})).await;
+            assert_eq!(status_of(&response), 502, "status={status}");
+            assert_eq!(body_of(&response)["ok"], false);
+            assert!(body_of(&response).get("csv").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sql_control_poll_timeout_is_pending_not_success() {
+        let shell = MockShell {
+            invocation: Ok(("InProgress".to_string(), String::new(), String::new())),
+            ..MockShell::default()
+        };
+        let result = checked_sql_command(&shell, &[], std::time::Duration::from_millis(5)).await;
+        let response = sql_command_response(result);
+        assert_eq!(status_of(&response), 504);
+        let body = body_of(&response);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["status"], "Pending");
+        assert!(body.get("csv").is_none());
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("may still be queued or running")
+        );
+    }
+
     // ---------------------------------------------------------- class WipeGate
     // legacy setUp pinned the clock OFF-hours (MockShell default) — since the
     // audit-fix-#2 hard lock, a forced data-destructive action is 409'd
@@ -3418,9 +3664,12 @@ mod tests {
         //  (b) the unit is DISABLED for the wipe window and re-enabled before
         //      the final start;
         //  (c) prev_day_ohlcv is in the dynamic truncate targets.
-        // (the legacy runtime scanned handler source; the Rust command list is the
-        // oracle-captured WIPE_QUESTDB_COMMANDS golden — same ordering.)
+        // Read-only catalog validation must happen before these mutations.
         let joined = WIPE_QUESTDB_COMMANDS.join("\n");
+        assert!(
+            joined.find("TARGETS=$(wipe_targets)").unwrap()
+                < joined.find("systemctl stop tickvault").unwrap()
+        );
         let rm_pos = joined.find("feed capture/replay sources removed").unwrap();
         let truncate_pos = joined.find("WIPE-TARGETS").unwrap();
         assert!(
@@ -3462,84 +3711,313 @@ mod tests {
         assert!(joined.contains("WIPE-PARTIAL"));
     }
 
-    /// Every equality-arm table in the wipe TARGET predicate must also be
-    /// counted by the verification tail, and vice versa.
-    ///
-    /// # The defect this closes (2026-09-05)
-    ///
-    /// `market_depth` was in NEITHER half. The action truncated everything
-    /// else and printed `WIPE-COMPLETE` with the largest table in the process
-    /// untouched — a measured 1,530,651,649 rows/session, 299 GB — which is
-    /// why that day's wipe had to drop the table by hand over EC2 Instance
-    /// Connect *after* this tool reported success. Quote 21 of the same day
-    /// names `market_depth` in the authorized wipe set, so the tool was
-    /// failing against the operator's own written scope.
-    ///
-    /// A symmetry test alone would NOT have caught it — absent from both
-    /// halves is symmetric. So this asserts symmetry AND names the two
-    /// market-data tables whose omission is the expensive one. Symmetry is
-    /// what stops the next addition from landing in one half only; the named
-    /// pair is what stops this specific regression.
+    // All 24 current candles, seven other market-data targets, and one future
+    // candle name. This fixture is deliberately larger than the old eight-table
+    // verifier and proves the selector is not frozen to the existing TF enum.
+    const WIPE_FIXTURE_TARGETS: &str = "ticks market_depth prev_day_ohlcv rest_spot_1m rest_option_chain_1m rest_option_contract_1m rest_fetch_audit candles_1m candles_3m candles_5m candles_15m candles_1d candles_1s candles_2s candles_3s candles_4s candles_5s candles_6s candles_7s candles_8s candles_9s candles_10s candles_11s candles_12s candles_13s candles_14s candles_15s candles_30s candles_2m candles_30m candles_60m candles_7m";
+
+    const WIPE_FAKE_READ_ONLY_TRANSPORT: &str = r#"
+curl() {
+  MOCK_QUERY=''
+  for MOCK_ARG in "$@"; do
+    case "$MOCK_ARG" in query=*) MOCK_QUERY=$MOCK_ARG ;; esac
+  done
+  case "$MOCK_QUERY" in
+    'query=SELECT table_name FROM tables()')
+      if [ "$MOCK_CATALOG_FAILURE" = nul ]; then printf '\000'; fi
+      printf '%s' "$MOCK_CATALOG"
+      if [ "$MOCK_CATALOG_FAILURE" = 1 ]; then return 7; fi ;;
+    'query=SELECT count() AS count FROM '*)
+      MOCK_TABLE=${MOCK_QUERY#'query=SELECT count() AS count FROM '}
+      if [ "$MOCK_FAILURE" = all ]; then return 7; fi
+      if [ "$MOCK_TABLE" = "$MOCK_COUNT_TABLE" ]; then
+        if [ "$MOCK_FAILURE" = nul ]; then printf '"count"\n\0000\n'; return 0; fi
+        printf '%s' "$MOCK_COUNT_RESPONSE"
+        if [ "$MOCK_FAILURE" = 1 ]; then return 7; fi
+      else
+        printf '"count"\n0\n'
+      fi ;;
+    *) printf 'FORBIDDEN FAKE TRANSPORT QUERY\n' >&2; return 97 ;;
+  esac
+  return 0
+}
+sleep() { :; }
+"#;
+
+    fn wipe_fixture_catalog() -> String {
+        let mut csv = String::from("\"table_name\"\n");
+        for table in WIPE_FIXTURE_TARGETS
+            .split_whitespace()
+            .chain(["order_audit", "pnl_audit"])
+        {
+            csv.push_str(&format!("\"{table}\"\n"));
+        }
+        csv
+    }
+
+    fn run_wipe_read_only_fixture(overrides: &[(&str, &str)], complete: bool) -> String {
+        // Execute ONLY the actual read-only preparation and verification.
+        // Every outbound command is a fake that refuses unknown queries. The
+        // destructive middle commands are never included in this test process.
+        let verification = WIPE_QUESTDB_COMMANDS.last().unwrap();
+        assert!(verification.starts_with("sleep 3"));
+        for readonly in [WIPE_QUESTDB_PREPARE_COMMAND, *verification] {
+            for forbidden in ["systemctl", "rm -", "docker", "query=TRUNCATE"] {
+                assert!(!readonly.contains(forbidden));
+            }
+        }
+        let catalog = wipe_fixture_catalog();
+        let mut command = std::process::Command::new("bash");
+        command
+            .args(["--noprofile", "--norc", "-c"])
+            .arg(format!(
+                "{WIPE_FAKE_READ_ONLY_TRANSPORT}\n{WIPE_QUESTDB_PREPARE_COMMAND}\n\
+                 MOCK_CATALOG=$MOCK_CURRENT_CATALOG\n\
+                 MOCK_CATALOG_FAILURE=$MOCK_CURRENT_CATALOG_FAILURE\n\
+                 WIPE_TRUNCATES_OK=$MOCK_TRUNCATES_OK\n{verification}"
+            ))
+            .env_remove("BASH_ENV")
+            .env("MOCK_CATALOG", &catalog)
+            .env("MOCK_CURRENT_CATALOG", &catalog)
+            .env("MOCK_CATALOG_FAILURE", "0")
+            .env("MOCK_CURRENT_CATALOG_FAILURE", "0")
+            .env("MOCK_COUNT_TABLE", "market_depth")
+            .env("MOCK_COUNT_RESPONSE", "\"count\"\n0\n")
+            .env("MOCK_FAILURE", "0")
+            .env("MOCK_TRUNCATES_OK", "1");
+        for (key, value) in overrides {
+            command.env(key, value);
+        }
+        let output = command
+            .output()
+            .expect("Bash must execute the isolated read-only wipe fixture");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            output.status.code(),
+            Some(if complete { 0 } else { 1 }),
+            "{overrides:?}: {stdout}"
+        );
+        assert_eq!(
+            stdout.contains("WIPE-COMPLETE"),
+            complete,
+            "{overrides:?}: {stdout}"
+        );
+        assert_eq!(
+            stdout.contains("WIPE-PARTIAL"),
+            !complete,
+            "{overrides:?}: {stdout}"
+        );
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("FORBIDDEN"));
+        stdout.into_owned()
+    }
+
+    #[test]
+    fn test_wipe_verifier_requires_explicit_zero_counts() {
+        for (body, failure, complete) in [
+            ("\"count\"\n0\n", "0", true),
+            ("\"count\"\r\n0\r\n", "0", true),
+            ("\"count\"\n0", "0", true),
+            ("\"count\"\n3\n", "0", false),
+            ("\"count\"\n0\n0\n", "0", false),
+            ("\"count\"\n0\n\n", "0", false),
+            ("\"count\"\n0,0\n", "0", false),
+            ("\"count\"\n00\n", "0", false),
+            ("\"count\"\n0.0\n", "0", false),
+            ("\"count\"\n-0\n", "0", false),
+            ("\"count\"\n 0\n", "0", false),
+            ("\"count\"\n0e0\n", "0", false),
+            ("\"other\"\n0\n", "0", false),
+            ("count\n0\n", "0", false),
+            (r#"{"dataset":[[0]]}"#, "0", false),
+            (r#"{"dataset":[[3]]}"#, "0", false),
+            ("", "0", false),
+            ("not JSON", "0", false),
+            (r#"{"dataset":[]}"#, "0", false),
+            (r#"{"dataset":[["zero"]]}"#, "0", false),
+            (r#"{"dataset":[[0.5]]}"#, "0", false),
+            (r#"{"dataset":[[-1]]}"#, "0", false),
+            (r#"{"dataset":[[3]],"extra":{"dataset":[[0]]}}"#, "0", false),
+            (r#"{"dataset":[[0]],broken}"#, "0", false),
+            (r#"{"error":"query failed","dataset":[[0]]}"#, "0", false),
+            ("\"count\"\n0\n", "1", false),
+            ("", "all", false),
+            ("", "nul", false),
+            ("\"count\"\n0\n__TICKVAULT_WIPE_CURL_OK__\n", "0", false),
+            ("\"count\"\n0\n__TICKVAULT_WIPE_CURL_OK__", "1", false),
+            ("\"count\"\n0\n\"error\"\n", "0", false),
+            (
+                "\"count\"\n999999999999999999999999999999999999\n",
+                "0",
+                false,
+            ),
+            ("\"count\"\n+0\n", "0", false),
+            ("\"count\"\n0 \n", "0", false),
+        ] {
+            run_wipe_read_only_fixture(
+                &[("MOCK_COUNT_RESPONSE", body), ("MOCK_FAILURE", failure)],
+                complete,
+            );
+        }
+    }
+
+    /// Every discovered target gets its own count. An independently populated,
+    /// malformed, or unavailable candle must fail even when candles_1m is zero.
     #[test]
     fn test_wipe_targets_and_verification_name_the_same_tables() {
-        let joined = WIPE_QUESTDB_COMMANDS.join("\n");
-
-        // The two market-data tables that carry essentially all the bytes.
-        // `ticks` was always present; `market_depth` was the omission.
-        for t in ["ticks", "market_depth"] {
-            assert!(
-                joined.contains(&format!("$0==\"{t}\"")),
-                "wipe TARGET predicate does not name `{t}` — the action would \
-                 report WIPE-COMPLETE while leaving it fully populated"
-            );
-            assert!(
-                joined.contains(&format!("$(qc {t})")),
-                "wipe VERIFICATION tail does not count `{t}` — WIPE-COMPLETE \
-                 would be printed without ever checking it reached zero"
-            );
-        }
-
-        // Symmetry, discovered rather than listed: every `$0=="X"` equality
-        // arm in the predicate must have a `$(qc X)` in the tail, and every
-        // `$(qc X)` must have an arm. `candles_` is matched by `index(...)==1`
-        // (a prefix, not an equality arm) and is verified via `candles_1m`
-        // alone, so it is excluded from both directions deliberately.
-        let mut targets: Vec<String> = Vec::new();
-        for part in joined.split("$0==\"").skip(1) {
-            if let Some(end) = part.find('"') {
-                targets.push(part[..end].to_string());
+        let stdout = run_wipe_read_only_fixture(&[], true);
+        let result = stdout
+            .lines()
+            .find(|line| line.starts_with("WIPE-RESULT "))
+            .unwrap();
+        let counts: std::collections::BTreeMap<_, _> = result
+            .split_whitespace()
+            .skip(1)
+            .map(|field| field.split_once('=').unwrap())
+            .collect();
+        assert_eq!(counts.len(), 32);
+        assert!(!counts.contains_key("order_audit"));
+        assert!(!counts.contains_key("pnl_audit"));
+        for table in WIPE_FIXTURE_TARGETS.split_whitespace() {
+            assert_eq!(counts.get(table), Some(&"0"), "{table}");
+            for (body, failure, expected) in [
+                ("\"count\"\n3\n", "0", "3"),
+                ("{\"error\":\"unavailable\"}", "0", "?"),
+                ("\"count\"\n0\n", "1", "?"),
+            ] {
+                let stdout = run_wipe_read_only_fixture(
+                    &[
+                        ("MOCK_COUNT_TABLE", table),
+                        ("MOCK_COUNT_RESPONSE", body),
+                        ("MOCK_FAILURE", failure),
+                    ],
+                    false,
+                );
+                let expected_field = format!("{table}={expected}");
+                assert!(
+                    stdout
+                        .split_whitespace()
+                        .any(|field| field == expected_field)
+                );
             }
         }
-        let mut verified: Vec<String> = Vec::new();
-        for part in joined.split("$(qc ").skip(1) {
-            if let Some(end) = part.find(')') {
-                verified.push(part[..end].to_string());
+    }
+
+    const WIPE_BAD_CATALOG_SUFFIXES: &[&str] = &[
+        "\n",
+        "\"ticks\"\n",
+        "\"candles_1m\"\n",
+        "candles_45m\n",
+        "\"\"\n",
+        "\"candles_45m\",\"extra\"\n",
+        "\"candles_45m;DROP TABLE ticks\"\n",
+        "\"candles_45m --\"\n",
+        "\"candles_45m\"\"escaped\"\n",
+        "\"candles_$(exit 99)\"\n",
+        "\"candles_`exit 99`\"\n",
+        "\"candles_../ticks\"\n",
+        "\"candles_45-m\"\n",
+        "\"candles_λ\"\n",
+        "__TICKVAULT_WIPE_CURL_OK__\n",
+        "__TICKVAULT_WIPE_CURL_ERROR__\n",
+        "{\"dataset\":[[0]]}\n",
+        "{\"error\":\"query failed\"}\n",
+        " \"candles_45m\"\n",
+        "\"candles_45m\" \n",
+        "\"candles_45m\ncontinued\"\n",
+    ];
+
+    #[test]
+    fn test_wipe_catalog_rejects_malformed_names_and_transport_failures() {
+        let catalog = wipe_fixture_catalog();
+        for suffix in WIPE_BAD_CATALOG_SUFFIXES {
+            let bad_catalog = format!("{catalog}{suffix}");
+            for stage in ["MOCK_CATALOG", "MOCK_CURRENT_CATALOG"] {
+                run_wipe_read_only_fixture(&[(stage, &bad_catalog)], false);
             }
         }
-        assert!(
-            targets.len() >= 6 && verified.len() >= 6,
-            "wipe predicate/verification parse looks vacuous (targets={}, \
-             verified={}) — the scanner, not the commands, is broken",
-            targets.len(),
-            verified.len()
+        for bad_catalog in [
+            String::new(),
+            catalog.replacen("\"table_name\"", "table_name", 1),
+            catalog.replacen("\"table_name\"", "\"wrong\"", 1),
+        ] {
+            for stage in ["MOCK_CATALOG", "MOCK_CURRENT_CATALOG"] {
+                run_wipe_read_only_fixture(&[(stage, &bad_catalog)], false);
+            }
+        }
+        for failure in ["1", "nul"] {
+            for stage in ["MOCK_CATALOG_FAILURE", "MOCK_CURRENT_CATALOG_FAILURE"] {
+                run_wipe_read_only_fixture(&[(stage, failure)], false);
+            }
+        }
+        // Proper CSV with either line-ending convention or no final newline
+        // remains accepted; strict parsing does not force a single OS format.
+        for valid_catalog in [
+            catalog.replace('\n', "\r\n"),
+            catalog.trim_end().to_string(),
+        ] {
+            run_wipe_read_only_fixture(
+                &[
+                    ("MOCK_CATALOG", &valid_catalog),
+                    ("MOCK_CURRENT_CATALOG", &valid_catalog),
+                ],
+                true,
+            );
+        }
+    }
+
+    #[test]
+    fn test_wipe_original_current_and_required_targets_cannot_escape_verification() {
+        let catalog = wipe_fixture_catalog();
+        for required in [
+            "ticks",
+            "market_depth",
+            "candles_1m",
+            "prev_day_ohlcv",
+            "rest_spot_1m",
+            "rest_option_chain_1m",
+            "rest_option_contract_1m",
+            "rest_fetch_audit",
+        ] {
+            let missing = catalog.replace(&format!("\"{required}\"\n"), "");
+            let stdout = run_wipe_read_only_fixture(&[("MOCK_CATALOG", &missing)], false);
+            assert!(stdout.contains("no wipe started"));
+        }
+        let disappeared = catalog.replace("\"candles_60m\"\n", "");
+        let stdout = run_wipe_read_only_fixture(
+            &[
+                ("MOCK_CURRENT_CATALOG", &disappeared),
+                ("MOCK_COUNT_TABLE", "candles_60m"),
+                ("MOCK_FAILURE", "1"),
+            ],
+            false,
         );
-        for t in &targets {
-            assert!(
-                verified.contains(t),
-                "wipe TARGETS `{t}` but never verifies it reached zero — \
-                 WIPE-COMPLETE would be printed on an untested table"
+        assert!(stdout.contains("candles_60m=?"));
+        let added = format!("{catalog}\"candles_45m\"\n");
+        for (body, complete) in [
+            ("\"count\"\n0\n", true),
+            ("\"count\"\n3\n", false),
+            ("{\"error\":\"new table unavailable\"}", false),
+        ] {
+            let stdout = run_wipe_read_only_fixture(
+                &[
+                    ("MOCK_CURRENT_CATALOG", &added),
+                    ("MOCK_COUNT_TABLE", "candles_45m"),
+                    ("MOCK_COUNT_RESPONSE", body),
+                ],
+                complete,
             );
+            assert!(stdout.contains("candles_45m="));
         }
-        for v in &verified {
-            if v == "candles_1m" {
-                continue; // matched by the `index($0,"candles_")==1` prefix arm
-            }
-            assert!(
-                targets.contains(v),
-                "wipe VERIFIES `{v}` but never truncates it — the action would \
-                 report WIPE-PARTIAL forever on a table it does not touch"
-            );
-        }
+        // An unrelated audit table is preserved and does not join the wipe.
+        run_wipe_read_only_fixture(
+            &[
+                ("MOCK_COUNT_TABLE", "order_audit"),
+                ("MOCK_COUNT_RESPONSE", "\"count\"\n3\n"),
+            ],
+            true,
+        );
+        // A known failed truncate cannot be hidden by later zero counts.
+        run_wipe_read_only_fixture(&[("MOCK_TRUNCATES_OK", "0")], false);
     }
 
     #[test]
@@ -3564,32 +4042,13 @@ mod tests {
                 "wipe target predicate lost the {live} arm"
             );
         }
-        // Review fix M2 (2026-07-16): honest completion verifies EVERY
-        // truncate-target family — the legacy pair AND all FOUR live REST
-        // tables.
-        for t in [
-            "ticks",
-            "candles_1m",
-            "rest_spot_1m",
-            "rest_option_chain_1m",
-            "rest_option_contract_1m",
-            "rest_fetch_audit",
-        ] {
-            assert!(joined.contains(&format!("$(qc {t})")), "{t}");
-        }
-        assert!(joined.contains("rest_spot_1m=${S:-?}"));
-        // Review fix M2: a missing/erroring count defaults to 0 (absent
-        // table = nothing left = wiped). The old default-to-1 made EVERY
-        // post-nuke wipe read WIPE-PARTIAL forever.
-        for default in [
-            "${T:-0}", "${C:-0}", "${S:-0}", "${O:-0}", "${K:-0}", "${A:-0}",
-        ] {
-            assert!(joined.contains(default), "{default}");
-            assert!(
-                !joined.contains(&default.replace(":-0", ":-1")),
-                "{default}"
-            );
-        }
+        // The same captured TARGETS drives truncation and later joins the
+        // current catalog; there is no separate representative-table list.
+        assert!(joined.contains("for t in $TARGETS; do"));
+        assert!(joined.contains("\"$TARGETS\" \"$CURRENT_TARGETS\""));
+        assert!(joined.contains("for t in $VERIFY_TARGETS; do"));
+        assert!(joined.contains("if COUNT=$(qc \"$t\"); then"));
+        assert!(joined.contains("COUNT='?'"));
         assert!(joined.contains("TRUNCATE-FAILED"));
     }
 

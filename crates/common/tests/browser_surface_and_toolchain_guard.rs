@@ -409,15 +409,20 @@ fn toolchain_scanner_detects_a_planted_runner() {
 /// reject what someone already thought of; an allowlist rejects everything
 /// nobody has justified.
 ///
-/// Each entry below is a real spawn site in the workspace today, and every one
-/// is a system utility or VCS — no language runtime among them.
+/// Each entry below is a real spawn site in the workspace today. The set
+/// includes shell interpreters as well as system utilities and VCS. Existing
+/// operational shell is an explicit gap against literal Rust-only operation,
+/// not frontend code and not proof that the whole deployment runs Rust.
 const SPAWN_ALLOWLIST: &[(&str, &str)] = &[
     (
         "git",
         "build.rs sha resolution + guard tests enumerating tracked files",
     ),
-    ("bash", "test harnesses invoking the repo's own .sh hooks"),
-    ("sh", "same, POSIX form"),
+    (
+        "bash",
+        "operational doctor.sh via logs MCP, plus test/hook harnesses; not Rust",
+    ),
+    ("sh", "existing POSIX shell invocation; not Rust"),
     (
         "docker",
         "compose health checks (infra.rs) + container tests",
@@ -516,7 +521,7 @@ fn every_spawned_binary_is_on_the_allowlist() {
 }
 
 #[test]
-fn spawn_allowlist_is_documented_and_has_no_language_runtime() {
+fn spawn_allowlist_is_documented_and_frozen_including_existing_shell() {
     for (bin, why) in SPAWN_ALLOWLIST {
         assert!(
             !bin.is_empty() && !why.is_empty(),
@@ -561,8 +566,8 @@ fn spawn_allowlist_is_documented_and_has_no_language_runtime() {
 
     assert_eq!(
         actual, frozen,
-        "SPAWN_ALLOWLIST changed. Every entry is a system utility or VCS today, \
-         and nothing may join them quietly.\n\n\
+        "SPAWN_ALLOWLIST changed. Existing entries include operational shell, \
+         system utilities and VCS; nothing may join them quietly.\n\n\
          If the addition is genuinely required, update FROZEN in the same commit \
          with a stated reason on the entry. If it is a language runtime or a \
          package manager, it does not belong here at all — add a dated operator \

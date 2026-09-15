@@ -208,5 +208,8 @@ I_DIR="$TMP/i"
 mkdir -p "$I_DIR"
 expect "empty criterion dir -> FAIL-CLOSED" 3 "$I_DIR"
 
+# A missing directory takes a different branch from an empty existing one.
+expect "missing criterion dir -> FAIL-CLOSED" 3 "$TMP/not-created"
+
 printf '  bench-gate self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

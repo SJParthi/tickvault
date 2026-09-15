@@ -18,6 +18,17 @@
 //!
 //! Known deliberate deviations from the retired reference implementation (each documented at the
 //! deviation site and in the PR body):
+//!   - Resource bounds: request lines are limited to 1 MiB; oversized lines
+//!     receive -32600 after draining to newline, preserving later requests.
+//!     Error-history and runbook searches share an 8 MiB input budget per call;
+//!     each HTTP body and summary-file buffer also has an 8 MiB ceiling.
+//!     Tail tools scan an 8 MiB suffix, with one extra line-boundary byte, and
+//!     report `scan_truncated`; partial runbook searches also report that flag.
+//!     Complete-history and HTTP requests refuse excess input. Overflow detection
+//!     may read one extra byte. Grep retains its separate 2,000,000-byte per-file
+//!     limit and skips larger files; it has no aggregate input-byte ceiling.
+//!     File catalogs, decoded JSON overhead and output size are separate costs.
+//!     These are byte-buffer bounds, not constant-time or deadline guarantees.
 //!   - Repo-root resolution: legacy uses `__file__`; this binary resolves
 //!     the repo root from `TICKVAULT_MCP_REPO_ROOT` (if set + resolved),
 //!     else walks up from the current dir looking for `.mcp.json` /

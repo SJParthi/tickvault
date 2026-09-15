@@ -1,277 +1,173 @@
-//! T3.6 REAL — Disk-full chaos via `ulimit -f` subprocess.
+//! WAL file-size-limit failure in an isolated Unix subprocess.
 //!
-//! Literal disk-full testing without root: re-spawn this test binary
-//! under a shell that has set `ulimit -f N` (file-size limit in 1-KB
-//! blocks). Inside the child, the `WsFrameSpill` writer thread hits
-//! the limit on its first segment write and receives EFBIG from
-//! `write(2)` — the exact kernel signal a full disk produces when
-//! `fallocate` isn't in play.
+//! `ulimit -f` produces EFBIG/SIGXFSZ, not ENOSPC. The child ignores SIGXFSZ
+//! so Rust receives an I/O error instead of an expected process kill. A probe
+//! first proves the file-size restriction actually applies. The real WAL
+//! writer then receives bounded frames, shuts down, and replays the surviving
+//! prefix. This checks fixture activation, process survival and recovered
+//! payload integrity; it does not claim zero loss under disk exhaustion or
+//! power-loss durability. Every unexpected child exit, including panic, fails.
 //!
-//! # Why this approach
-//!
-//! Three alternatives were rejected:
-//!   - **Root + loop device / tmpfs quota** — needs privileged CI,
-//!     not portable across macOS-dev + Linux-CI.
-//!   - **libc::setrlimit direct** — would add `libc` as a dev-dep on
-//!     `tickvault-storage`, which requires Parthiban approval per
-//!     CLAUDE.md.
-//!   - **`/dev/full`** — a char device, not a filesystem; the WAL
-//!     writer creates regular files under a directory, so the
-//!     character device trick doesn't apply.
-//!
-//! The `ulimit -f` subprocess path is portable, uses only tools
-//! every POSIX system already has, needs no new deps, and exercises
-//! the same kernel code path a real ENOSPC / EFBIG would hit.
-//!
-//! # How the test is wired
-//!
-//! A single `#[test]` function detects via an env var whether it is
-//! the parent (normal `cargo test` invocation) or the child
-//! (re-spawned under ulimit). The child runs the actual chaos and
-//! writes its observations to stdout; the parent spawns the child
-//! via `sh -c 'ulimit -f N && exec <binary> --test-threads=1 --exact
-//! <test-name>'`, reads stdout, and asserts the observations.
-//!
-//! By staying inside ONE `#[test]` function we avoid the cargo-test
-//! test-per-process complication and keep the subprocess invocation
-//! syntactically identical across macOS and Linux.
-//!
-//! # What the child asserts
-//!
-//! 1. `WsFrameSpill::new()` succeeds with a clean temp dir (file
-//!    creation fits within the first few KB).
-//! 2. Appending 200 × 256-byte frames produces a mix of `Spilled` /
-//!    `Dropped` outcomes (at least one `Dropped` is expected because
-//!    the 4-KB file limit is smaller than the 256-KB writer buffer).
-//! 3. The process does NOT panic.
-//! 4. `drop_critical_count()` or persistent outcome data reflects
-//!    the observed disk-full event.
-//!
-//! The parent prints the child's stdout on failure so any panic or
-//! assertion is visible in CI logs.
-//!
-//! # Skip conditions
-//!
-//! Skipped on:
-//!   - Windows (`cfg!(windows)`) — `ulimit` is a POSIX-shell builtin.
-//!   - Environments where `sh` is not on PATH.
-//!   - Environments where the child process cannot be respawned via
-//!     the current exe path (uncommon — covered by `env::current_exe`
-//!     erroring).
-//!
-//! All skip paths log a note and return a passing assertion.
+//! Unix-only: this test does not substantiate Windows behavior. The child has
+//! a 15-second deadline and uses only an owned temporary directory.
 
-#![cfg(test)]
+#![cfg(unix)]
 
 use std::env;
 use std::path::PathBuf;
-use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Env-var name signalling the child-mode execution.
 const CHAOS_MODE_ENV: &str = "TICKVAULT_CHAOS_DISK_FULL_MODE";
-
-/// File-size limit in 1-KB blocks passed to `ulimit -f`. 8 blocks =
-/// 8 KB — large enough to let the WAL segment's first-record write
-/// reach disk for at least one small frame, small enough to trip
-/// EFBIG before the writer has flushed many batches.
 const CHILD_FSIZE_BLOCKS: u32 = 8;
+const FRAMES: u32 = 200;
 
-fn chaos_tmp(tag: &str) -> PathBuf {
+fn chaos_tmp() -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let p = env::temp_dir().join(format!(
-        "tv-wal-ulimit-{tag}-{}-{nanos}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&p);
-    std::fs::create_dir_all(&p).expect("create chaos temp dir"); // APPROVED: test
-    p
+        .expect("clock after epoch")
+        .as_nanos();
+    let dir = env::temp_dir().join(format!("tv-wal-ulimit-{}-{nanos}", std::process::id()));
+    std::fs::create_dir(&dir).expect("create isolated chaos dir");
+    dir
 }
 
-/// Child-mode chaos body. Runs under `ulimit -f 8` (8 KB file size
-/// cap). Creates a `WsFrameSpill`, floods it with 200 × 256-byte
-/// frames, and reports observations on stdout so the parent can
-/// assert. Panics and process termination via SIGXFSZ are all
-/// treated as failures — the body must complete cleanly.
-///
-/// Note: with the default SIGXFSZ disposition (terminate), a
-/// `write(2)` past the limit kills the WHOLE process on Linux,
-/// including the main test thread. Therefore this child MUST use
-/// `write(2)` only indirectly via the `WsFrameSpill` writer thread,
-/// which holds its own thread stack and does not take the main
-/// thread down — but BSD-style kernels still raise SIGXFSZ against
-/// the whole process. We mitigate by keeping every write-batch
-/// SMALL (256 bytes) and limiting the burst so the kernel has time
-/// to route the error to the writer thread before the main thread
-/// also attempts any file I/O.
 fn run_child_chaos() {
-    use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType};
+    use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType, replay_all};
 
-    let dir = chaos_tmp("child");
-
-    // Step 1 — new() MUST succeed. The first segment file is empty,
-    // so the create(2) fits within the 8-KB limit.
-    let spill = match WsFrameSpill::new(&dir) {
-        Ok(s) => s,
-        Err(err) => {
-            println!("CHILD_RESULT new_failed err={err}");
-            return;
+    let dir = chaos_tmp();
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
         }
-    };
+    }
+    let _cleanup = Cleanup(dir.clone());
 
-    // Step 2 — flood with 200 × 256-byte frames. The writer thread
-    // buffers up to 256 KB before flushing; the first flush hits
-    // the 8-KB rlimit and the background write(2) returns EFBIG
-    // (or SIGXFSZ terminates the process — if that happens the
-    // parent sees a non-zero exit status which is ALSO an accepted
-    // observation).
+    // Shell ulimit units differ; 64 KiB exceeds eight blocks on the supported
+    // Unix shells. Ignoring SIGXFSZ must leave the actual EFBIG error visible.
+    let error = std::fs::write(dir.join("limit-probe"), vec![0; 65_536])
+        .expect_err("file-size restriction was not applied");
+    assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
+    // libtest may print its `test name ... ` prefix without a newline.
+    println!("\nCHILD_LIMIT verified");
+
+    let wal = dir.join("wal");
+    let spill = WsFrameSpill::new(&wal).expect("new WAL under file-size limit");
     let mut spilled = 0u64;
     let mut dropped = 0u64;
-    for i in 0..200u32 {
-        let frame = vec![(i & 0xff) as u8; 256];
+    for marker in 0..FRAMES {
+        let mut frame = vec![0x5a; 256];
+        frame[..4].copy_from_slice(&marker.to_le_bytes());
         match spill.append(WsType::LiveFeed, frame) {
             AppendOutcome::Spilled => spilled += 1,
             AppendOutcome::Dropped => dropped += 1,
         }
     }
-
-    // Give the writer thread a moment to drain and hit the limit.
-    std::thread::sleep(Duration::from_millis(200));
-
-    let drop_critical = spill.drop_critical_count();
-
-    // Step 3 — emit structured observations on stdout. Each line is
-    // a key=value pair the parent can grep for.
-    println!("CHILD_RESULT completed");
-    println!("CHILD_STAT appended={}", spilled + dropped);
-    println!("CHILD_STAT spilled={spilled}");
-    println!("CHILD_STAT dropped={dropped}");
-    println!("CHILD_STAT drop_critical={drop_critical}");
-
-    // Step 4 — drop the spill so the writer thread exits cleanly.
+    assert_eq!(spilled + dropped, u64::from(FRAMES));
+    assert!(spilled > 0, "the actual WAL admission path must execute");
+    assert_eq!(spill.drop_critical_count(), dropped);
+    let queued = spill.shutdown(Duration::from_secs(5));
+    assert_eq!(queued, 0, "bounded fixture must drain its accepted frames");
     drop(spill);
-    let _ = std::fs::remove_dir_all(&dir);
+
+    let recovered = replay_all(&wal).expect("replay after restricted write");
+    assert!(
+        !recovered.is_empty(),
+        "verify an actual surviving WAL prefix"
+    );
+    assert!(recovered.len() <= spilled as usize);
+    let mut seen = [false; FRAMES as usize];
+    for record in &recovered {
+        assert_eq!(record.ws_type, WsType::LiveFeed);
+        assert_eq!(record.frame.len(), 256);
+        let marker = u32::from_le_bytes(record.frame[..4].try_into().expect("marker"));
+        assert!(marker < FRAMES, "unwritten marker recovered");
+        assert!(!seen[marker as usize], "duplicate marker recovered");
+        seen[marker as usize] = true;
+        assert!(record.frame[4..].iter().all(|byte| *byte == 0x5a));
+    }
+    println!("CHILD_STAT appended={FRAMES}");
+    println!("CHILD_STAT recovered={}", recovered.len());
+    println!("CHILD_RESULT completed");
 }
 
-/// Parent-mode test body. Spawns the child via `sh -c 'ulimit -f N;
-/// exec <current_exe> --test-threads=1 --exact
-/// <qualified_test_name>'`, pipes stdout, and asserts the
-/// observations.
+fn assert_child_evidence(output: &Output) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "child did not complete successfully: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+    for marker in [
+        "CHILD_LIMIT verified",
+        "CHILD_STAT appended=200",
+        "CHILD_RESULT completed",
+    ] {
+        assert!(
+            stdout.lines().any(|line| line == marker),
+            "child lacks {marker:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+}
+
 #[test]
 fn chaos_disk_full_via_ulimit_subprocess() {
-    if env::var(CHAOS_MODE_ENV).is_ok() {
-        // ── CHILD MODE ────────────────────────────────────────────
+    if env::var_os(CHAOS_MODE_ENV).is_some() {
         run_child_chaos();
         return;
     }
-
-    // ── PARENT MODE ──────────────────────────────────────────────
-
-    // Skip on Windows — `ulimit` is a POSIX-shell builtin.
-    if cfg!(windows) {
-        eprintln!("note: ulimit disk-full chaos skipped on Windows");
-        return;
-    }
-
-    // Skip if `sh` is not on PATH (extremely unlikely on Linux/macOS
-    // but guarded for portability).
-    if which_sh().is_none() {
-        eprintln!("note: /bin/sh not found — disk-full chaos skipped");
-        return;
-    }
-
-    // CHANGED 2026-08-10 from a silent `return` to a hard failure.
-    //
-    // `env::current_exe()` failing is not a portability case — it means the
-    // test harness itself is broken. Skipping made a broken harness
-    // indistinguishable from a passing chaos test, and nextest swallows
-    // `eprintln!`, so the "note" nobody saw was the only difference between
-    // "disk-full survival proven" and "nothing ran".
-    let current_exe = env::current_exe().expect(
-        "env::current_exe() failed — the disk-full chaos test cannot respawn \
-         itself. This is a broken harness, not a platform limitation: failing \
-         loudly beats silently reporting that disk-full survival was proven.",
-    );
-
-    // Respawn self under `ulimit -f N`. `cargo test` passes the
-    // test name on argv; use `--exact` + `--test-threads=1` so the
-    // child runs ONLY this test and does not race other tests.
+    let current_exe = env::current_exe().expect("current test binary");
     let script = format!(
-        "ulimit -f {blocks}; exec \"{exe}\" --test-threads=1 --exact \
-         chaos_disk_full_via_ulimit_subprocess 2>&1",
-        blocks = CHILD_FSIZE_BLOCKS,
-        exe = current_exe.display(),
+        "trap '' XFSZ || exit 125; ulimit -f {CHILD_FSIZE_BLOCKS} || exit 125; \
+         exec \"$1\" --test-threads=1 --exact chaos_disk_full_via_ulimit_subprocess --nocapture"
     );
-
-    let output = match Command::new("sh")
-        .arg("-c")
-        .arg(&script)
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", &script, "tickvault-ulimit"])
+        .arg(current_exe)
         .env(CHAOS_MODE_ENV, "1")
-        .output()
-    {
-        Ok(o) => o,
-        Err(err) => {
-            // CHANGED 2026-08-10 from a silent `return` to a hard failure, same
-            // reasoning as the current_exe arm above: `sh` was already proven
-            // present, so a spawn failure here is a broken environment, not an
-            // unsupported platform. Skipping let a chaos test that never ran
-            // report exactly like one that ran and passed.
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn isolated file-size-limit child");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if child.try_wait().expect("poll child").is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child.wait_with_output().expect("reap timed out child");
             panic!(
-                "failed to spawn the ulimit child ({err}) — the disk-full chaos \
-                 test did NOT run. /bin/sh was already located, so this is a \
-                 broken environment, not a platform gate."
+                "file-size-limit child timed out; no passing evidence\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
             );
         }
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    // Either the child ran to completion (exit code 0 + CHILD_RESULT
-    // line present) OR the child was terminated by SIGXFSZ (exit
-    // status signals 25 on Linux, which is what default SIGXFSZ
-    // action does). Both are valid observations of the disk-full
-    // scenario. What is NOT valid:
-    //   - child panicked cleanly (cargo test reports test failure)
-    //   - child produced output implying corruption
-    //   - child hung past the cargo-test timeout (not our concern —
-    //     cargo would kill it)
-    if output.status.success() {
-        // Happy path — child survived. Verify we see expected tags.
-        assert!(
-            stdout.contains("CHILD_RESULT completed"),
-            "child exited 0 but did not emit completion marker.\n\
-             stdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-        let appended_ok = stdout
-            .lines()
-            .any(|l| l.starts_with("CHILD_STAT appended="));
-        assert!(
-            appended_ok,
-            "child did not report appended count.\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-    } else {
-        // Child was killed (SIGXFSZ) — ALSO a valid observation.
-        // The contract we care about is "no panic in the Rust test
-        // harness itself, which would manifest as a panic message
-        // in stderr". Assert no Rust panic text.
-        assert!(
-            !stderr.contains("RUST_BACKTRACE")
-                && !stderr.contains("thread 'main' panicked")
-                && !stderr.contains("attempted to unwrap"),
-            "child panicked inside Rust code (not a SIGXFSZ kill).\n\
-             stdout:\n{stdout}\nstderr:\n{stderr}"
-        );
+        std::thread::sleep(Duration::from_millis(10));
     }
+    assert_child_evidence(&child.wait_with_output().expect("collect child output"));
 }
 
-fn which_sh() -> Option<PathBuf> {
-    let sh = PathBuf::from("/bin/sh");
-    if sh.exists() {
-        return Some(sh);
-    }
-    None
+#[test]
+#[should_panic(expected = "child did not complete successfully")]
+fn child_panic_with_stdout_markers_is_rejected() {
+    use std::os::unix::process::ExitStatusExt;
+    assert_child_evidence(&Output {
+        status: std::process::ExitStatus::from_raw(101 << 8),
+        stdout: b"CHILD_LIMIT verified\nCHILD_STAT appended=200\nCHILD_RESULT completed\nthread panicked\n".to_vec(),
+        stderr: Vec::new(),
+    });
+}
+
+#[test]
+#[should_panic(expected = "child lacks")]
+fn zero_exit_without_executed_fixture_is_rejected() {
+    use std::os::unix::process::ExitStatusExt;
+    assert_child_evidence(&Output {
+        status: std::process::ExitStatus::from_raw(0),
+        stdout: b"test result: ok. 0 passed; 0 failed;\n".to_vec(),
+        stderr: Vec::new(),
+    });
 }

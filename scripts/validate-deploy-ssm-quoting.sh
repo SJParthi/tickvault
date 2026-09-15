@@ -9,9 +9,11 @@
 #     /home/runner/work/_temp/xxx.sh: line N: syntax error near unexpected token `('
 # and the whole deploy fails before the new binary is ever swapped in.
 #
-# This script fails (exit 2) if any line BETWEEN the opening `'commands=[` and the
-# closing `]'` of a deploy workflow contains a literal apostrophe. The opening and
-# closing lines themselves are the only legal apostrophes.
+# This script fails (exit 2) if any line BETWEEN the opening `'commands=[` or
+# `--argjson commands '[` and the closing `]'` contains a literal apostrophe.
+# The jq form safely carries validated runner values into the SSM JSON without
+# inserting GitHub expressions into the large literal command array. Both forms
+# must retain the same apostrophe and escaping checks.
 #
 # Box-side quoting MUST use escaped double quotes (\") — never raw single quotes.
 set -euo pipefail
@@ -32,7 +34,7 @@ for f in "${FILES[@]}"; do
   # Inside a multi-line block, flag any interior line carrying an apostrophe.
   bad=$(awk '
     # multi-line opener: has commands=[ but NO closing ]'\'' on the same line
-    /--parameters '\''commands=\[/ && $0 !~ /\]'\''/ { inblock=1; next }
+    /--parameters '\''commands=\[|--argjson commands '\''\[/ && $0 !~ /\]'\''/ { inblock=1; next }
     # closer of a multi-line block
     inblock && /^[[:space:]]*\]'\''/ { inblock=0; next }
     # interior line of a multi-line block with a quote-breaking apostrophe
@@ -62,7 +64,7 @@ for f in "${FILES[@]}"; do
   # invisible until a real deploy runs. Every deploy silently failed and
   # auto-stopped the app, which is why prod sat on a launch-time binary.
   bad_esc=$(awk '
-    /--parameters '\''commands=\[/ && $0 !~ /\]'\''/ { inblock=1; next }
+    /--parameters '\''commands=\[|--argjson commands '\''\[/ && $0 !~ /\]'\''/ { inblock=1; next }
     inblock && /^[[:space:]]*\]'\''/ { inblock=0; next }
     inblock && /\\\\\\"/ { print FILENAME ":" NR ": " $0 }
   ' "$f" || true)

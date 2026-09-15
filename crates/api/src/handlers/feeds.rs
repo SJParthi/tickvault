@@ -52,27 +52,14 @@ pub struct FeedErrorResponse {
     pub allowed: Vec<&'static str>,
 }
 
-/// Every runtime-toggleable feed label, built from the single-source [`Feed::ALL`]
-/// (SP1) so a future feed is automatically included — no hardcoded 2-feed list
-/// (the NTM 2-role→3-role anti-regression lesson). Adding `Feed::X` to `ALL`
-/// surfaces it here with zero edits.
+/// Feed labels this handler can toggle. The enum's capability flag precedes
+/// actual transport wiring: Dhan and TrueData are refused in both directions
+/// below, so they must not appear as allowed alternatives in an error.
 fn toggleable_feed_labels() -> Vec<&'static str> {
     Feed::ALL
         .iter()
         .copied()
-        .filter(|f| f.is_runtime_toggleable())
-        .map(Feed::as_str)
-        .collect()
-}
-
-/// The feeds that can STILL be disabled while Dhan is safety-locked — every
-/// toggleable feed except Dhan. Also derived from [`Feed::ALL`], so feed#3 is
-/// included automatically.
-fn toggleable_except_dhan_labels() -> Vec<&'static str> {
-    Feed::ALL
-        .iter()
-        .copied()
-        .filter(|f| f.is_runtime_toggleable() && *f != Feed::Dhan)
+        .filter(|f| f.is_runtime_toggleable() && !matches!(*f, Feed::Dhan | Feed::Truedata))
         .map(Feed::as_str)
         .collect()
 }
@@ -122,6 +109,20 @@ pub async fn set_feed(
         ));
     }
 
+    // The enum exposes TrueData before its transport is implemented. An
+    // accepted switch would change an unused atomic and return a Dhan-only
+    // snapshot, so refuse both directions before mutation or persistence.
+    if feed == Feed::Truedata {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(FeedErrorResponse {
+                error: "TrueData is not running yet, so this control cannot enable or disable it"
+                    .to_string(),
+                allowed: toggleable_feed_labels(),
+            }),
+        ));
+    }
+
     // Phase A refusal, made UNCONDITIONAL in PR-C2 (operator directive
     // 2026-07-13 — "now remove this entire Dhan live websocket feed
     // instruments subscription even entire live websocket feed itself"): the
@@ -160,7 +161,7 @@ pub async fn set_feed(
                      would change nothing while showing ON. To turn the live \
                      feed on or off, change the configuration and restart"
                     .to_string(),
-                allowed: toggleable_except_dhan_labels(),
+                allowed: toggleable_feed_labels(),
             }),
         ));
     }
@@ -183,7 +184,7 @@ pub async fn set_feed(
                      would have darkened the next start-up. To turn the live feed \
                      off, change the configuration and restart"
                     .to_string(),
-                allowed: toggleable_except_dhan_labels(),
+                allowed: toggleable_feed_labels(),
             }),
         ));
     }
@@ -201,7 +202,7 @@ pub async fn set_feed(
                      (orders/positions open) — Dhan can only be turned off in the no-orders \
                      data-pull phase, so the system is never blinded mid-trade"
                     .to_string(),
-                allowed: toggleable_except_dhan_labels(),
+                allowed: toggleable_feed_labels(),
             }),
         ));
     }
@@ -526,6 +527,32 @@ mod tests {
         assert!(resp.dhan_enabled);
     }
 
+    #[tokio::test]
+    async fn test_set_feed_truedata_refused_without_mutating_either_feed() {
+        for before in [false, true] {
+            for enabled in [false, true] {
+                let state = test_state(FeedsConfig {
+                    truedata_enabled: before,
+                    ..FeedsConfig::default()
+                });
+                let dhan_before = state.feed_runtime().snapshot();
+                let result = set_feed(
+                    State(state.clone()),
+                    Path("truedata".to_string()),
+                    Json(SetFeedRequest { enabled }),
+                )
+                .await;
+                let (status, Json(body)) = result.expect_err("unwired feed must refuse a toggle");
+                assert_eq!(status, StatusCode::CONFLICT);
+                assert!(body.error.contains("TrueData is not running yet"));
+                assert!(body.allowed.is_empty());
+                assert_eq!(state.feed_runtime().is_enabled(Feed::Truedata), before);
+                assert!(!state.feed_runtime().lane_running(Feed::Truedata));
+                assert_eq!(state.feed_runtime().snapshot(), dhan_before);
+            }
+        }
+    }
+
     // 2026-08-21: two Groww toggle tests were deleted here
     // (`test_set_feed_groww_enable_refused_409_after_retirement` and
     // `test_set_feed_groww_disable_flips_state`). Both POSTed the literal
@@ -770,8 +797,33 @@ mod tests {
         // user-supplied feed name back (no reflected input).
         assert_eq!(body.error, "unknown feed");
         assert!(
+            body.allowed.is_empty(),
+            "neither current feed has a wired toggle"
+        );
+        assert!(
             !body.error.contains("kite"),
             "unknown-feed error must not reflect the URL segment"
         );
+    }
+
+    #[tokio::test]
+    async fn test_feed_error_allowed_metadata_excludes_unwired_controls() {
+        for feed in Feed::ALL {
+            for enabled in [false, true] {
+                let state = test_state(FeedsConfig::default());
+                let (status, Json(body)) = set_feed(
+                    State(state),
+                    Path(feed.as_str().to_string()),
+                    Json(SetFeedRequest { enabled }),
+                )
+                .await
+                .expect_err("both current feed controls are refused");
+                assert_eq!(status, StatusCode::CONFLICT);
+                assert!(
+                    body.allowed.is_empty(),
+                    "no refused control is an allowed alternative"
+                );
+            }
+        }
     }
 }

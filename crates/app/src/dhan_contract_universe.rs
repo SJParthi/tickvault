@@ -1918,8 +1918,24 @@ pub async fn load_contract_universe(
         crate::contract_underlying_map::global_contract_underlying_map().publish_labels(
             crate::contract_underlying_map::labels_from_artifact(&contracts),
         );
+        // Preserve selected option identities even when multiplier/ownership
+        // validation refused their metadata. Otherwise a mapped intersection
+        // could falsely claim complete coverage of the selected option set.
+        let option_keys: std::collections::HashSet<_> = contracts
+            .iter()
+            .filter(|row| row.c == "OPTSTK" || row.c == "OPTIDX")
+            .filter_map(|row| derivative_segment(&row.x).map(|segment| (row.i, segment)))
+            .collect();
+        let selected_options: Vec<_> = selection
+            .instruments
+            .iter()
+            .filter(|instrument| {
+                option_keys.contains(&(instrument.security_id, instrument.segment))
+            })
+            .cloned()
+            .collect();
         let build = crate::contract_underlying_map::global_contract_underlying_map()
-            .publish_from_legs(&legs);
+            .publish_selected_from_legs(&legs, &selected_options);
         tracing::info!(
             mapped_contracts = build.accepted,
             subscribed_option_legs_ordered_first = selected_first,

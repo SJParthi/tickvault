@@ -9,26 +9,17 @@
 //! ## Why a separate ring (vs reusing tick_persistence's machinery)
 //!
 //! Per locked decision L-C1: sealed candles are NOT ticks. The IST
-//! midnight burst force-seals every open bucket across all 21 TFs in a
-//! single tokio yield, and the persistence path differs (21 distinct
+//! midnight burst force-seals every open bucket across all active TFs in a
+//! single tokio yield, and the persistence path differs (TF_COUNT distinct
 //! plain candle tables, one ILP `Sender` per TF). A dedicated ring
 //! keeps the seal absorption budget independent of the (since-retired)
 //! tick path's rescue ring.
 //!
 //! ## RAM budget
 //!
-//! `SEAL_BUFFER_CAPACITY = AGGREGATOR_MAX_SLOTS × TF_COUNT` (25,000 × 24
-//! = 600,000) and `BufferedSeal` ≤ 144 bytes → **~86 MB worst-case**.
-//! 0.26% of the r8g.xlarge 32 GiB host (operator Quote 13, 2026-08-08).
-//! Was a hardcoded 200,000 (~29 MB) until 2026-08-10 — see the constant's
-//! own doc for why that literal under-sized the midnight burst by 3×.
-//!
-//! **This paragraph restated the product as a literal and went stale**
-//! (2026-08-14): it read "25,000 × 21 = 525,000 → ~76 MB" after `TF_COUNT`
-//! moved 21 → 24 on 2026-08-10. The constant's own doc, forty lines below,
-//! explicitly warns against doing exactly that — and this header did it
-//! anyway. The numbers above are re-derived; if you are reading them long
-//! after 2026-08-14, verify against `TF_COUNT` rather than trusting them.
+//! Capacity is `AGGREGATOR_MAX_SLOTS × TF_COUNT`. The reviewed v3 ceiling
+//! is 200 bytes per `BufferedSeal`, including pinned metadata and quality.
+//! Budget admission must use `size_of::<BufferedSeal>()`, not an older literal.
 //!
 //! ## Drop semantics on overflow
 //!
@@ -69,36 +60,21 @@ use crate::candles::{LiveCandleState, TfIndex};
 /// instruments × ALL timeframes, plus headroom for downstream
 /// backpressure spikes. Per locked decision L-C1.
 ///
-/// DERIVED, not a literal, since 2026-08-10. The previous 200,000
-/// carried the comment "generously sized to absorb the IST-midnight
-/// force-seal burst across all instruments × 21 TFs" — which was
-/// arithmetically FALSE at the configured ceiling:
-/// `force_seal_all` emits `AGGREGATOR_MAX_SLOTS × TF_COUNT`
-/// seals in one burst, so 200,000 would have force-evicted the
-/// remainder down the spill/DLQ tiers in a single tokio yield, every
-/// midnight, while the header claimed headroom. Deriving the constant
-/// makes that class of drift impossible: change either input and this
-/// follows.
+/// Derived from the configured slot ceiling and the active timeframe count.
+/// One complete force-seal burst fits without evicting solely because the
+/// registry changed. Slow persistence can still overflow a later burst and
+/// must use the caller's spill/DLQ escalation.
 ///
-/// **Do not restate the product as a literal in prose.** The original
-/// 2026-08-10 note hardcoded "25,000 × 21 = 525,000 ≈ 76 MB"; `TF_COUNT`
-/// then moved to 24, and the derived constant silently became 600,000
-/// (≈86 MB) while every comment still said 525,000. The number was
-/// re-derived correctly by the compiler and re-stated wrongly by the
-/// docs — which is how the storage-side `SEAL_MPSC_CAPACITY` in front of
-/// this ring was left at 200,000 through the whole 2026-08-10 repair.
-/// Cost scales as `AGGREGATOR_MAX_SLOTS × TF_COUNT × size_of::<BufferedSeal>()`;
-/// at the r8g.xlarge 32 GiB host (operator Quote 13, 2026-08-08) that is
-/// a fraction of a percent either way. On the retired 4 GiB t4g.medium
-/// the same correctness would have cost ~2% of the entire machine, which
-/// is very likely why the literal was left low; the instance upgrade is
-/// what makes the honest value affordable.
+/// Cost scales as `AGGREGATOR_MAX_SLOTS × TF_COUNT × size_of::<BufferedSeal>()`.
+/// The independent 200-byte row ceiling permits at most 50,000,000 bytes of
+/// row storage for the active ten frames at 25,000 slots. Allocator and
+/// `VecDeque` bookkeeping are additional, and admission uses the actual size.
 pub const SEAL_BUFFER_CAPACITY: usize =
     crate::candles::multi_tf_aggregator::AGGREGATOR_MAX_SLOTS * crate::candles::tf_index::TF_COUNT;
 
 /// One sealed bar ready to flush to its `candles_*` plain table.
 /// `Copy` so the ring's `VecDeque<BufferedSeal>` does not need
-/// ref-counted entries. Sized ≤ 128 bytes per the const-assert below.
+/// ref-counted entries. Sized ≤ 200 bytes per the const-assert below.
 ///
 /// The `exchange_segment_code: u8` is the SAME byte as
 /// `ParsedTick::exchange_segment_code`. The writer slice maps this
@@ -106,7 +82,7 @@ pub const SEAL_BUFFER_CAPACITY: usize =
 /// `tickvault_common::segment::segment_code_to_str`.
 ///
 /// `tf` is encoded as [`TfIndex`] (1 byte) so the writer slice can
-/// dispatch to one of the 21 ILP `Sender`s by ordinal without lookup.
+/// dispatch to the active ILP sender array by ordinal without lookup.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BufferedSeal {
     /// Composite-key part 1 (per I-P1-11).
@@ -159,27 +135,12 @@ impl BufferedSeal {
     }
 }
 
-// Compile-time size assertion. `BufferedSeal` carries the entire
-// `LiveCandleState` (136 bytes since the 2026-09-10 `net_volume_signed`
-// accumulator; 128 from the 2026-06-05 Option B `close_ts_ist_secs`) + the
-// routing fields (security_id + segment + tf + padding). 152 bytes covers it.
-// Ring RAM = SEAL_BUFFER_CAPACITY × this size — see that constant's note on
-// why the product is deliberately NOT restated as a literal here.
-//
-// 144 → 152 RAISED 2026-09-10. Fleet cost: SEAL_BUFFER_CAPACITY is
-// AGGREGATOR_MAX_SLOTS × TF_COUNT = 600,000, so the ring grows 86.4 MB →
-// 91.2 MB, +4.8 MB (0.015% of the r8g.xlarge 32 GiB host). The aggregator
-// cell's own budget carries a further +~10 MB; the whole net-volume change is
-// ~15 MB, recorded in `aws-budget.md` under the same date.
-//
-// The 152 stays a LITERAL for the same reason its sibling in
-// `aggregator_cell.rs` does: writing `size_of::<LiveCandleState>() + 16` here
-// would make the assert unable to fail on exactly the change it exists to
-// catch, and this one DID catch the net-volume field and made its cost
-// visible before it shipped.
+// Reviewed v3 bound: the pinned bucket definition, revision and quality add
+// at most 48 bytes per seal. Capacity remains instrument-limit × frame-count;
+// at the current 600,000 entries the ceiling rises from 91.2 to 120 MB.
 const _: () = assert!(
-    std::mem::size_of::<BufferedSeal>() <= 152,
-    "BufferedSeal exceeded 152-byte budget — ring RAM = SEAL_BUFFER_CAPACITY × this size; bumping requires updating aws-budget.md."
+    std::mem::size_of::<BufferedSeal>() <= 200,
+    "BufferedSeal exceeded 200-byte budget — ring RAM = SEAL_BUFFER_CAPACITY × this size; bumping requires updating aws-budget.md."
 );
 
 /// Outcome of [`SealRing::try_buffer`].
@@ -384,11 +345,9 @@ mod tests {
         // Pinned by `const _ = assert!` above. Runtime-mirrored here
         // so a future field bloat fails grep-able tests too.
         //
-        // 144 -> 152 on 2026-09-10 with `LiveCandleState::net_volume_signed`
-        // (128 -> 136). Fleet cost recorded beside the const assert and in
-        // aws-budget.md: the ring is SEAL_BUFFER_CAPACITY x this size, so
-        // 86.4 MB -> 91.2 MB.
-        assert!(std::mem::size_of::<BufferedSeal>() <= 152);
+        // v3 adds the bucket-pinned definition, quality and revision.
+        // The bound must stay explicit so future growth is reviewed.
+        assert!(std::mem::size_of::<BufferedSeal>() <= 200);
     }
 
     #[test]
@@ -407,12 +366,8 @@ mod tests {
         // literal but the PROPERTY the literal was meant to guarantee: the
         // ring must hold an entire `force_seal_all` burst without evicting.
         //
-        // The old form asserted `== 200_000` while `force_seal_all` emits
-        // AGGREGATOR_MAX_SLOTS × TF_COUNT (525,000 when that was written at
-        // TF_COUNT=21; 600,000 today) — so the ratchet was
-        // actively PINNING a capacity 2.6× too small and reading as a safety
-        // guarantee. Asserting the property instead of the number means
-        // raising either input can never silently outgrow the ring again.
+        // A fixed former frame count can silently undersize a new registry.
+        // The burst property stays derived even when the active set shrinks.
         assert_eq!(
             SEAL_BUFFER_CAPACITY,
             AGGREGATOR_MAX_SLOTS * TF_COUNT,
@@ -614,9 +569,8 @@ mod tests {
     #[test]
     fn test_seal_ring_handles_every_tf_distinctly() {
         // Push one seal per TF, drain in FIFO, verify TfIndex preserved.
-        // Capacity is TF_COUNT, not a literal: at a hardcoded 21 the three
-        // frames appended on 2026-08-10 would have been silently EVICTED
-        // and this test would have asserted against a truncated drain.
+        // Capacity and iteration come from the same active registry, so all
+        // ten frame identities survive one full FIFO burst, including M10.
         let mut ring = SealRing::with_capacity(TF_COUNT);
         for tf in TfIndex::ALL {
             ring.try_buffer(mk_seal(13, 0, tf, 1_716_000_900, 100.0));

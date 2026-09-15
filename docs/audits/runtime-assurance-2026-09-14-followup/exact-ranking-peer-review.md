@@ -1,0 +1,18 @@
+# Exact-volume ranking peer review
+
+Read-only review of the exact-ranking agent's current candidate in `volume_leaderboard.rs` (SHA-256 `a54d1f11f941d67111279a99d76650f44bbd23fdf61cf8f513aefb97c27867ab`), `volume_leaderboard/ranking_sort.rs`, `top_volume_runtime.rs`, and related persistence/view diffs. No edit made to these files. No Rust compiler or test execution was available.
+
+No concrete arithmetic, borrow, restoration or zero-denominator defect was found in the reviewed ranking path.
+
+- For `n = delta_units`, `d = lot_size > 0`, `q = floor(1000*n/d)` orders non-overlapping coarse ratio ranges. Inside a q tie, `r = (1000*n) mod d` satisfies `0 <= r < d`.
+- Distinct rational remainders differ by at least `1/(d1*d2)`. Positive u32 denominators give `d1*d2 <= (2^32-1)^2 < 2^64`, so the separation is strictly larger than one `2^-64` unit. Taking `floor(r*2^64/d)` therefore cannot merge unequal ratios. Equivalent unreduced fractions retain equal keys.
+- `1000*n < 2^42`; `r << 64 < 2^96`; the quotient is below `2^64`. `u128` arithmetic and the final u64 cast fit the documented domain. The sorter is private and rank refuses missing/zero denominators before constructing rows.
+- Equal-q boundaries and the copied first row are determined before any mutation. Every row in a refined group has its display key restored to that group's original q after sorting. No await, publication, callback or fallible operation intervenes on normal return. Equal-ratio groups are already identity-ordered by the initial radix pass and correctly skip refinement.
+- The existing sorter uses all eight bytes of the u64 key, with safe integer comparison for groups <=128 (outer) or <=64 (recursive). Fraction keys with high bits set are supported. Two sequential fixed-width sorts and disjoint group scans retain O(R) total work and bounded sort stack; this is not O(1) for the board.
+- The independent Rust oracle compares full u128 cross-products and complete rows, so it can detect both order errors and failure to restore payload fields. Those Rust tests are still unrun. A local Python Fraction cross-check independently compared 26,246 input ratios, including exhaustive small denominators, 20,000 random u32 pairs and 4,096 adjacent fractions near u32::MAX; no unequal-ratio key collision or ordering mismatch occurred. This is a mathematical cross-check, not execution of the Rust implementation or a performance measurement.
+- `TopVolumeRuntime` accepts positive sub-milli quantities, rejects zero delta, invalid denominator or inconsistent display score, and uses the shared exact cross-product ordering before accepting publication. No remaining production `window_lots_milli == 0` membership filter was found in the scanned workspace.
+- The view's proposed integer plus 31+31+2-bit fraction limbs have products below signed i64::MAX for this domain. Actual QuestDB integer division/modulo behavior, parser acceptance and populated Rust/SQL parity remain live validation gates.
+
+Limitations: the fixed denominator-width proof must be revisited if lot_size widens to u64. Full-key refinement adds u128 division and new sorted population membership, so prior AWS latency measurements do not measure this candidate. The displayed percentage remains rounded and may look tied while exact-ratio ranking correctly distinguishes rows. Test/source evidence cannot certify feed units, missing upstream ticks, arbitrary timeframes, DB availability or trading profitability.
+
+Math evidence: `/workspace/scratch/81296451ef3b/tickvault-audit/docs/audits/runtime-assurance-2026-09-14-followup/exact-ranking-peer-evidence.json`.

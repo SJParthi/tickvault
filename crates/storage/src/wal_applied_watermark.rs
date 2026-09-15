@@ -1,5 +1,5 @@
-//! WAL applied-watermark — the record of which captured frames have ALREADY
-//! reached the database, so a restart never replays them a second time.
+//! WAL applied-watermark — reported sink progress and protected gaps used
+//! to reduce restart replay. Conservative states can replay frames again.
 //!
 //! # The defect this closes (MEASURED 2026-09-03/04, not inferred)
 //!
@@ -87,6 +87,9 @@ pub const REPLAY_REORDER_SLACK_SEQ: u64 = 1_000_000_000;
 /// How often `wait_for_offload_drained` re-checks the writer counters.
 /// Boot / catch-up only, never a hot path.
 pub const OFFLOAD_DRAIN_POLL_MILLIS: u64 = 50;
+/// Maximum attempts to obtain a coherent snapshot. A busy writer never
+/// makes a reader spin indefinitely; persistence retains its previous file.
+const SNAPSHOT_ATTEMPTS: usize = 2;
 /// A watermark further than this ahead of the wall clock is implausible
 /// (a stepped clock, a foreign directory) and is ignored — replay more.
 const APPLIED_MAX_FUTURE_NANOS: u64 = 86_400 * 1_000_000_000;
@@ -348,14 +351,12 @@ pub struct AppliedWatermark {
     hwm_ticks: AtomicU64,
     hwm_depth: AtomicU64,
     depth_untracked: AtomicBool,
-    overflowed: AtomicBool,
     /// Conservative upper bound on the sequences the bucket table FAILED to
-    /// record. `overflowed` alone says "something is unprotected"; without a
-    /// height there is no way to tell whether a later confirmed drain covered
-    /// it, so `reset_unapplied_below` used to clear the flag on the strength
-    /// of `kept == 0` — a count of the buckets it DID record, which is exactly
-    /// the set that excludes these. See that function for the loss this
-    /// prevents.
+    /// record. Zero means no overflow; a nonzero value supplies both the
+    /// protection flag and its height. Keeping them in ONE atomic lets a
+    /// reset compare-and-clear an old height without erasing a newer mark.
+    /// A separate flag could be cleared after another writer raised the
+    /// height, leaving a coherent snapshot with missing replay protection.
     overflow_high_seq: AtomicU64,
     bucket_ids: [AtomicU64; UNAPPLIED_BUCKETS],
     bucket_counts: [AtomicU64; UNAPPLIED_BUCKETS],
@@ -378,6 +379,14 @@ pub struct AppliedWatermark {
     /// none. So while suspect, acks do NOT move the watermark (they park in
     /// `suspect_max_*`), and on recovery the parked range is marked unapplied.
     sink_suspect: AtomicBool,
+    /// Monotone invalidation of replay ACK evidence. A later clean probe
+    /// cannot make an earlier unhealthy interval disappear from a batch's
+    /// proof. Saturation permanently refuses new confirmation evidence.
+    sink_failure_epoch: AtomicU64,
+    /// Cold confirmation/probe/failure serialization. No successful tick or
+    /// depth ACK takes this lock. A confirmation guard pins the local health
+    /// verdict while its exact WAL generation is archived.
+    replay_health_lock: Mutex<()>,
     /// The watermarks as of the last CLEAN probe. When suspicion begins, the
     /// frames acked since then — the probe's detection window, one poll
     /// interval — are marked unapplied, because the table may have been
@@ -392,6 +401,37 @@ pub struct AppliedWatermark {
     /// it before and after a batch: a batch that lost rows must never have its
     /// WAL segment archived, because the segment is now the ONLY copy.
     unlanded: AtomicU64,
+    /// Snapshot coherence across the two sink threads and failure producers.
+    /// A count, not a seqlock odd/even bit: two concurrent writers must not
+    /// make an in-progress mutation appear complete.
+    snapshot_writers: AtomicU64,
+    snapshot_generation: AtomicU64,
+}
+
+struct SnapshotMutation<'a>(&'a AppliedWatermark);
+
+/// Evidence captured before refolding a replay batch. This proves only that
+/// no locally observed sink failure occurred across that batch; it is not a
+/// database transaction or proof against an unobserved upstream failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayAckFence {
+    unlanded_before: u64,
+    sink_failure_epoch: u64,
+    healthy_at_capture: bool,
+}
+
+/// Keep alive through the exact-generation archive call. Probe transitions
+/// and failed rescues cannot change the local verdict while this guard lives.
+#[must_use]
+pub struct ReplayConfirmationGuard<'a> {
+    _health: std::sync::MutexGuard<'a, ()>,
+}
+
+impl Drop for SnapshotMutation<'_> {
+    fn drop(&mut self) {
+        self.0.snapshot_generation.fetch_add(1, Ordering::AcqRel);
+        self.0.snapshot_writers.fetch_sub(1, Ordering::Release);
+    }
 }
 
 static APPLIED: AppliedWatermark = AppliedWatermark::new();
@@ -414,7 +454,6 @@ impl AppliedWatermark {
             hwm_ticks: AtomicU64::new(0),
             hwm_depth: AtomicU64::new(0),
             depth_untracked: AtomicBool::new(false),
-            overflowed: AtomicBool::new(false),
             overflow_high_seq: AtomicU64::new(0),
             bucket_ids: [const { AtomicU64::new(0) }; UNAPPLIED_BUCKETS],
             bucket_counts: [const { AtomicU64::new(0) }; UNAPPLIED_BUCKETS],
@@ -427,12 +466,31 @@ impl AppliedWatermark {
             persist_lock: Mutex::new(()),
             dir_tag: AtomicU64::new(0),
             sink_suspect: AtomicBool::new(false),
+            sink_failure_epoch: AtomicU64::new(0),
+            replay_health_lock: Mutex::new(()),
             healthy_ticks: AtomicU64::new(0),
             healthy_depth: AtomicU64::new(0),
             suspect_max_ticks: AtomicU64::new(0),
             suspect_max_depth: AtomicU64::new(0),
             unlanded: AtomicU64::new(0),
+            snapshot_writers: AtomicU64::new(0),
+            snapshot_generation: AtomicU64::new(0),
         }
+    }
+
+    fn snapshot_mutation(&self) -> SnapshotMutation<'_> {
+        self.snapshot_writers.fetch_add(1, Ordering::AcqRel);
+        SnapshotMutation(self)
+    }
+
+    fn replay_health_mutation(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.replay_health_lock.lock().unwrap_or_else(|poisoned| {
+            // An interrupted health mutation leaves no trustworthy proof.
+            // Retain the state for diagnostics, but never heal its epoch.
+            self.sink_failure_epoch.store(u64::MAX, Ordering::Release);
+            self.sink_suspect.store(true, Ordering::Release);
+            poisoned.into_inner()
+        })
     }
 
     /// Binds the watermark to its directory and seeds RAM from the file there,
@@ -440,6 +498,7 @@ impl AppliedWatermark {
     /// zeros. First caller wins; a second bind is ignored (one WAL dir per
     /// process, enforced by `lock_wal_dir`).
     pub fn bind(&self, wal_dir: &Path) {
+        let _mutation = self.snapshot_mutation();
         let set = self
             .paths
             .set((
@@ -458,6 +517,7 @@ impl AppliedWatermark {
     /// Loads a snapshot into RAM (monotone on the watermarks, replace on the
     /// buckets).
     pub fn seed(&self, snap: &AppliedSnapshot) {
+        let _mutation = self.snapshot_mutation();
         self.hwm_ticks.fetch_max(snap.hwm_ticks, Ordering::AcqRel);
         self.hwm_depth.fetch_max(snap.hwm_depth, Ordering::AcqRel);
         // The seeded value is the last clean point this process knows of; the
@@ -477,7 +537,6 @@ impl AppliedWatermark {
             // boot replays rather than skipping. Fails towards replay, which
             // costs time; the alternative costs data.
             self.overflow_high_seq.store(u64::MAX, Ordering::Release);
-            self.overflowed.store(true, Ordering::Release);
         }
         // O(1) EXEMPT: fixed UNAPPLIED_BUCKETS iterations, boot-time seed
         for (i, (id, count)) in snap.buckets.iter().enumerate() {
@@ -488,6 +547,7 @@ impl AppliedWatermark {
 
     /// Rows up to `max_seq` landed in QuestDB or were durably rescued.
     pub fn note_ticks_acked(&self, max_seq: u64) {
+        let _mutation = self.snapshot_mutation();
         if self.sink_suspect.load(Ordering::Acquire) {
             self.suspect_max_ticks.fetch_max(max_seq, Ordering::AcqRel);
         } else {
@@ -497,6 +557,7 @@ impl AppliedWatermark {
 
     /// Depth rows up to `max_seq` landed in QuestDB or were durably rescued.
     pub fn note_depth_acked(&self, max_seq: u64) {
+        let _mutation = self.snapshot_mutation();
         if self.sink_suspect.load(Ordering::Acquire) {
             self.suspect_max_depth.fetch_max(max_seq, Ordering::AcqRel);
         } else {
@@ -515,6 +576,21 @@ impl AppliedWatermark {
     /// direction is "replay more"; a suspension longer than the bucket table
     /// covers (~9.8 h) overflows it, which is the old full replay.
     pub fn note_questdb_probe(&self, clean: bool) {
+        let _health = self.replay_health_mutation();
+        let _mutation = self.snapshot_mutation();
+        if !clean
+            && self
+                .sink_failure_epoch
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
+                    Some(epoch.saturating_add(1))
+                })
+                .is_err()
+        {
+            // The always-Some update retries contention and cannot refuse.
+            // If that contract changes, an unrecorded failure must never
+            // preserve a valid replay fence.
+            self.sink_failure_epoch.store(u64::MAX, Ordering::Release);
+        }
         if clean {
             if self.sink_suspect.swap(false, Ordering::AcqRel) {
                 let parked_ticks = self.suspect_max_ticks.swap(0, Ordering::AcqRel);
@@ -555,6 +631,7 @@ impl AppliedWatermark {
     /// The lane runs without a depth sink: inline depth is discarded by design,
     /// so the tick watermark alone decides whether a main-feed frame is applied.
     pub fn mark_depth_untracked(&self) {
+        let _mutation = self.snapshot_mutation();
         self.depth_untracked.store(true, Ordering::Release);
     }
 
@@ -563,12 +640,13 @@ impl AppliedWatermark {
     /// without one, so enabling depth persistence never inherits the weaker
     /// rule from the file.
     pub fn mark_depth_tracked(&self) {
+        let _mutation = self.snapshot_mutation();
         self.depth_untracked.store(false, Ordering::Release);
     }
 
     /// A captured frame at `seq` will NOT be applied by this session (shed at
     /// the ring, append failed, rescue failed). Its bucket is marked so replay
-    /// never skips a segment overlapping it. Three atomics, cold arm only.
+    /// never skips a segment overlapping it. Bounded atomic work, cold arm only.
     pub fn note_unapplied(&self, seq: u64) {
         let id = seq >> UNAPPLIED_BUCKET_SHIFT;
         if id == 0 {
@@ -582,6 +660,10 @@ impl AppliedWatermark {
             self.mark_slot(slot);
             return;
         }
+        // Repeated marks in an already-published bucket take the fast return
+        // above. Only a change to the load-bearing id/overflow state needs
+        // snapshot coordination; the count beside an id is informational.
+        let _mutation = self.snapshot_mutation();
         if current == 0
             && self.bucket_ids[slot]
                 .compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire)
@@ -601,10 +683,11 @@ impl AppliedWatermark {
             // provably passed it. Storing the bucket top rather than the
             // seq keeps this an upper bound on every frame the bucket
             // would have held.
-            let bucket_top = ((id + 1) << UNAPPLIED_BUCKET_SHIFT).saturating_sub(1);
+            // Setting the low bits also handles the final u64 bucket without
+            // wrapping its top to zero (the no-overflow sentinel).
+            let bucket_top = seq | ((1u64 << UNAPPLIED_BUCKET_SHIFT) - 1);
             self.overflow_high_seq
                 .fetch_max(bucket_top, Ordering::AcqRel);
-            self.overflowed.store(true, Ordering::Release);
         }
     }
 
@@ -629,6 +712,7 @@ impl AppliedWatermark {
         if lo == 0 || lo > hi {
             return;
         }
+        let _mutation = self.snapshot_mutation();
         let first = lo >> UNAPPLIED_BUCKET_SHIFT;
         let last = hi >> UNAPPLIED_BUCKET_SHIFT;
         if last.saturating_sub(first) >= UNAPPLIED_BUCKETS as u64 {
@@ -638,7 +722,6 @@ impl AppliedWatermark {
             // confirmed drain would clear that on the strength of a bucket count
             // that never included these frames.
             self.overflow_high_seq.fetch_max(hi, Ordering::AcqRel);
-            self.overflowed.store(true, Ordering::Release);
             return;
         }
         // O(1) EXEMPT: bounded by UNAPPLIED_BUCKETS, cold failure arm
@@ -673,6 +756,13 @@ impl AppliedWatermark {
     /// when nothing above the ceiling remains: a wrapped table cannot say
     /// which ids it lost.
     pub fn reset_unapplied_below(&self, ceiling_seq: u64) {
+        self.reset_unapplied_below_with(ceiling_seq, || {});
+    }
+
+    /// The callback exposes the eligibility-read/clear boundary for a
+    /// deterministic regression. Production passes an empty closure.
+    fn reset_unapplied_below_with(&self, ceiling_seq: u64, before_overflow_clear: impl FnOnce()) {
+        let _mutation = self.snapshot_mutation();
         let ceiling_id = ceiling_seq >> UNAPPLIED_BUCKET_SHIFT;
         let mut kept = 0usize;
         // O(1) EXEMPT: fixed UNAPPLIED_BUCKETS iterations, boot-time reset
@@ -699,11 +789,22 @@ impl AppliedWatermark {
         // counter anywhere. Found by an adversarial sweep on 2026-09-05,
         // the same day this module landed, and reproduced before fixing.
         //
-        // The flag may only be cleared once the confirmed ceiling has
-        // provably passed everything the table failed to record.
-        if kept == 0 && self.overflow_high_seq.load(Ordering::Acquire) < ceiling_seq {
-            self.overflow_high_seq.store(0, Ordering::Release);
-            self.overflowed.store(false, Ordering::Release);
+        // The confirmed ceiling must pass the recorded height, and that
+        // height must STILL be current when cleared. Snapshot mutation
+        // guards detect overlapping writes for readers; they do not serialize
+        // writers. A later wide-range mark records no bucket ids, so an
+        // unconditional store here could erase its only protection.
+        let overflow_high = self.overflow_high_seq.load(Ordering::Acquire);
+        if kept == 0 && overflow_high < ceiling_seq {
+            before_overflow_clear();
+            // One attempt only. A concurrent mark above the old height wins
+            // and remains protected; a later reset can revisit the old work.
+            // The status is intentionally terminal: success cleared only the
+            // observed height; failure retained a different concurrent mark.
+            let _cleared_observed_height = self
+                .overflow_high_seq
+                .compare_exchange(overflow_high, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
         }
     }
 
@@ -712,7 +813,18 @@ impl AppliedWatermark {
     /// [`Self::note_unapplied_range`]) keeps the next boot from skipping it;
     /// this counter keeps THIS boot from archiving it.
     pub fn note_unlanded(&self) {
-        self.unlanded.fetch_add(1, Ordering::AcqRel);
+        let _health = self.replay_health_mutation();
+        if self
+            .unlanded
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                Some(count.saturating_add(1))
+            })
+            .is_err()
+        {
+            // Refusal is impossible for this always-Some closure. Retain a
+            // permanently ineligible fence if a future update can refuse.
+            self.unlanded.store(u64::MAX, Ordering::Release);
+        }
     }
 
     /// Monotone count of batches that landed nowhere. Snapshot it before a
@@ -721,6 +833,53 @@ impl AppliedWatermark {
     #[must_use]
     pub fn unlanded_total(&self) -> u64 {
         self.unlanded.load(Ordering::Acquire)
+    }
+
+    /// Capture before refolding, alongside the caller's unlanded baseline.
+    /// An overlapping probe transition creates an ineligible fence.
+    #[must_use]
+    pub fn replay_ack_fence(&self, unlanded_before: u64) -> ReplayAckFence {
+        let epoch = self.sink_failure_epoch.load(Ordering::Acquire);
+        ReplayAckFence {
+            unlanded_before,
+            sink_failure_epoch: epoch,
+            healthy_at_capture: !self.sink_suspect.load(Ordering::Acquire)
+                && epoch == self.sink_failure_epoch.load(Ordering::Acquire),
+        }
+    }
+
+    #[must_use]
+    pub fn replay_ack_fence_valid(&self, fence: ReplayAckFence) -> bool {
+        fence.healthy_at_capture
+            && fence.sink_failure_epoch != u64::MAX
+            && fence.unlanded_before != u64::MAX
+            && self.sink_failure_epoch.load(Ordering::Acquire) == fence.sink_failure_epoch
+            && !self.sink_suspect.load(Ordering::Acquire)
+            && self.unlanded.load(Ordering::Acquire) == fence.unlanded_before
+            && self.sink_failure_epoch.load(Ordering::Acquire) == fence.sink_failure_epoch
+    }
+
+    /// Refuse contention, poison, an invalidated fence, or outstanding sink
+    /// work. The caller must separately prove semantic consumption and empty
+    /// producer buffers, then hold this through exact WAL confirmation.
+    ///
+    /// This serializes only local observations. A later probe, remote database
+    /// loss, or an unobserved suspension is outside this local proof.
+    #[must_use]
+    pub fn replay_confirmation_guard(
+        &self,
+        fence: ReplayAckFence,
+    ) -> Option<ReplayConfirmationGuard<'_>> {
+        let health = self.replay_health_lock.try_lock().ok()?;
+        if !self.replay_ack_fence_valid(fence)
+            || self.ticks_completed.load(Ordering::Acquire)
+                < self.ticks_handed_off.load(Ordering::Acquire)
+            || self.depth_completed.load(Ordering::Acquire)
+                < self.depth_handed_off.load(Ordering::Acquire)
+        {
+            return None;
+        }
+        Some(ReplayConfirmationGuard { _health: health })
     }
 
     /// A batch left the producer for the tick writer thread.
@@ -748,6 +907,26 @@ impl AppliedWatermark {
     /// landed, and `confirm_replayed` archived on the strength of it.
     #[must_use]
     pub fn wait_for_offload_drained(&self, timeout: Duration, unlanded_before: u64) -> bool {
+        self.wait_for_offload_drained_guarded(timeout, self.replay_ack_fence(unlanded_before))
+    }
+
+    /// Wait against evidence captured before the replay, so even a complete
+    /// healthy → suspect → healthy transition invalidates its ACKs.
+    #[must_use]
+    pub fn wait_for_offload_drained_guarded(
+        &self,
+        timeout: Duration,
+        fence: ReplayAckFence,
+    ) -> bool {
+        self.wait_for_offload_drained_with(timeout, fence, || {})
+    }
+
+    fn wait_for_offload_drained_with(
+        &self,
+        timeout: Duration,
+        fence: ReplayAckFence,
+        mut before_completion_check: impl FnMut(),
+    ) -> bool {
         let target_ticks = self.ticks_handed_off.load(Ordering::Acquire);
         let target_depth = self.depth_handed_off.load(Ordering::Acquire);
         let deadline = std::time::Instant::now() + timeout;
@@ -756,13 +935,15 @@ impl AppliedWatermark {
             // AND whose rescue failed still completes — and its rows exist
             // only in the WAL segment the caller is about to archive. So the
             // wait is also "nothing was lost since the caller's snapshot".
-            if self.unlanded.load(Ordering::Acquire) != unlanded_before {
+            if !self.replay_ack_fence_valid(fence) {
                 return false;
             }
+            // Deterministic scheduling seam: production does nothing here.
+            before_completion_check();
             if self.ticks_completed.load(Ordering::Acquire) >= target_ticks
                 && self.depth_completed.load(Ordering::Acquire) >= target_depth
             {
-                return true;
+                return self.replay_ack_fence_valid(fence);
             }
             if std::time::Instant::now() >= deadline {
                 return false;
@@ -771,26 +952,62 @@ impl AppliedWatermark {
         }
     }
 
-    /// Current RAM state.
+    /// A coherent RAM snapshot, or a conservative value that skips no frame
+    /// when concurrent writers prevent one within the fixed attempt budget.
     #[must_use]
     pub fn snapshot(&self) -> AppliedSnapshot {
-        let mut buckets = [(0u64, 0u64); UNAPPLIED_BUCKETS];
-        // O(1) EXEMPT: fixed UNAPPLIED_BUCKETS iterations, cold path
-        for (i, slot) in buckets.iter_mut().enumerate() {
-            *slot = (
-                self.bucket_ids[i].load(Ordering::Acquire),
-                self.bucket_counts[i].load(Ordering::Acquire),
-            );
+        self.try_snapshot_with(|| {})
+            .unwrap_or_else(|| AppliedSnapshot {
+                overflowed: true,
+                dir_tag: self.dir_tag.load(Ordering::Acquire),
+                ..AppliedSnapshot::default()
+            })
+    }
+
+    /// The callback is an observation seam for the deterministic concurrent
+    /// regression; production passes an empty closure. At most two fixed-size
+    /// copies, even if a writer is descheduled indefinitely.
+    ///
+    /// Writers publish their active count before touching snapshot fields,
+    /// then advance the generation before releasing the count. Every field
+    /// is acquired below. Seeing any concurrent new field therefore also
+    /// orders its writer's active publication before the validation loads.
+    /// A writer that is still active, or completed during the copy, makes the
+    /// attempt fail. The fence keeps field reads before that validation.
+    /// Without this check a copy of old buckets followed by a new high-water
+    /// mark could falsely certify a failed frame as applied.
+    fn try_snapshot_with(&self, mut after_buckets: impl FnMut()) -> Option<AppliedSnapshot> {
+        for _ in 0..SNAPSHOT_ATTEMPTS {
+            let generation = self.snapshot_generation.load(Ordering::Acquire);
+            if self.snapshot_writers.load(Ordering::Acquire) != 0 {
+                continue;
+            }
+            let mut buckets = [(0u64, 0u64); UNAPPLIED_BUCKETS];
+            // O(1) EXEMPT: fixed UNAPPLIED_BUCKETS iterations, cold snapshot
+            for (i, slot) in buckets.iter_mut().enumerate() {
+                *slot = (
+                    self.bucket_ids[i].load(Ordering::Acquire),
+                    self.bucket_counts[i].load(Ordering::Acquire),
+                );
+            }
+            after_buckets();
+            let snap = AppliedSnapshot {
+                hwm_ticks: self.hwm_ticks.load(Ordering::Acquire),
+                hwm_depth: self.hwm_depth.load(Ordering::Acquire),
+                depth_untracked: self.depth_untracked.load(Ordering::Acquire),
+                overflowed: self.overflow_high_seq.load(Ordering::Acquire) != 0,
+                persisted_at_nanos: 0,
+                dir_tag: self.dir_tag.load(Ordering::Acquire),
+                buckets,
+            };
+            std::sync::atomic::fence(Ordering::Acquire);
+            if self.snapshot_writers.load(Ordering::Acquire) == 0
+                && self.snapshot_generation.load(Ordering::Acquire) == generation
+            {
+                return Some(snap);
+            }
         }
-        AppliedSnapshot {
-            hwm_ticks: self.hwm_ticks.load(Ordering::Acquire),
-            hwm_depth: self.hwm_depth.load(Ordering::Acquire),
-            depth_untracked: self.depth_untracked.load(Ordering::Acquire),
-            overflowed: self.overflowed.load(Ordering::Acquire),
-            persisted_at_nanos: 0,
-            dir_tag: self.dir_tag.load(Ordering::Acquire),
-            buckets,
-        }
+        None
     }
 
     /// Persists if at least [`APPLIED_PERSIST_INTERVAL_NANOS`] elapsed since
@@ -825,7 +1042,12 @@ impl AppliedWatermark {
         let Ok(_guard) = self.persist_lock.try_lock() else {
             return;
         };
-        let mut snap = self.snapshot();
+        let Some(mut snap) = self.try_snapshot_with(|| {}) else {
+            // Keep the last coherent file. Persisting the conservative RAM
+            // fallback would seed a sticky overflow flag on the next boot;
+            // a transient snapshot conflict should only defer this persist.
+            return;
+        };
         snap.persisted_at_nanos = wall_nanos();
         let bytes = snap.to_bytes();
         let written = write_fresh(tmp, &bytes).and_then(|()| std::fs::rename(tmp, path));
@@ -906,6 +1128,91 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("scratch dir");
         dir
+    }
+
+    #[test]
+    fn snapshot_retries_when_a_failure_and_later_ack_race_the_bucket_copy() {
+        let wm = std::sync::Arc::new(AppliedWatermark::new_for_tests());
+        wm.mark_depth_untracked();
+        let failed = seq(5);
+        let later = seq(10);
+        let (copy_done_tx, copy_done_rx) = std::sync::mpsc::channel();
+        let (mutation_done_tx, mutation_done_rx) = std::sync::mpsc::channel();
+        let writer_wm = std::sync::Arc::clone(&wm);
+        let writer = std::thread::spawn(move || {
+            copy_done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("snapshot reached seam");
+            writer_wm.note_unapplied(failed);
+            writer_wm.note_ticks_acked(later);
+            mutation_done_tx.send(()).expect("reader is waiting");
+        });
+        let mut first_attempt = true;
+        let snap = wm
+            .try_snapshot_with(|| {
+                if first_attempt {
+                    first_attempt = false;
+                    copy_done_tx.send(()).expect("release concurrent writer");
+                    mutation_done_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("writer completed the interleaved mutation");
+                }
+            })
+            .expect("the second attempt can copy a stable watermark");
+        writer.join().expect("writer did not panic");
+        assert_eq!(snap.hwm_ticks, later);
+        assert!(snap.skip_below(AppliedSink::Ticks) > failed);
+        assert!(
+            !snap.frame_is_applied(AppliedSink::Ticks, failed),
+            "old buckets plus the later high-water mark would lose the failed frame"
+        );
+    }
+
+    #[test]
+    fn concurrent_snapshot_writers_never_look_idle_after_one_finishes() {
+        let wm = AppliedWatermark::new_for_tests();
+        let first = wm.snapshot_mutation();
+        let second = wm.snapshot_mutation();
+        assert!(
+            wm.try_snapshot_with(|| panic!("writers are active"))
+                .is_none()
+        );
+        drop(first);
+        assert!(
+            wm.try_snapshot_with(|| panic!("second writer is still active"))
+                .is_none()
+        );
+        let conservative = wm.snapshot();
+        assert!(conservative.overflowed);
+        assert!(!conservative.frame_is_applied(AppliedSink::Ticks, seq(1)));
+        drop(second);
+        assert!(wm.try_snapshot_with(|| {}).is_some());
+    }
+
+    #[test]
+    fn a_busy_snapshot_does_not_replace_the_last_coherent_watermark_file() {
+        let dir = scratch("snapshot-busy");
+        let wm = AppliedWatermark::new_for_tests();
+        wm.bind(&dir);
+        wm.mark_depth_untracked();
+        wm.note_ticks_acked(seq(1));
+        wm.persist_now();
+
+        let mutation = wm.snapshot_mutation();
+        wm.note_ticks_acked(seq(10));
+        wm.persist_now();
+        let kept = AppliedSnapshot::load(&dir).expect("previous coherent snapshot survives");
+        assert_eq!(kept.hwm_ticks, seq(1));
+        assert!(
+            !kept.overflowed,
+            "contention must not persist a sticky overflow flag"
+        );
+
+        drop(mutation);
+        wm.persist_now();
+        let updated = AppliedSnapshot::load(&dir).expect("next coherent persist succeeds");
+        assert_eq!(updated.hwm_ticks, seq(10));
+        std::fs::remove_dir_all(dir).expect("cleanup");
     }
 
     #[test]
@@ -1382,6 +1689,89 @@ mod tests {
     }
 
     #[test]
+    fn reset_unapplied_below_preserves_a_wide_range_marked_after_its_height_read() {
+        use std::sync::{Arc, mpsc};
+
+        let ceiling = 512u64 << UNAPPLIED_BUCKET_SHIFT;
+        let lo = ceiling + 1;
+        let hi = ((512 + UNAPPLIED_BUCKETS as u64) << UNAPPLIED_BUCKET_SHIFT) + 2;
+        // Cover both an initially clean table and an older overflow that the
+        // reset would otherwise be entitled to clear. Neither has bucket ids.
+        for old_high in [0, 256u64 << UNAPPLIED_BUCKET_SHIFT] {
+            let wm = Arc::new(AppliedWatermark::new_for_tests());
+            if old_high != 0 {
+                wm.note_unapplied_range(1u64 << UNAPPLIED_BUCKET_SHIFT, old_high);
+            }
+            let (eligible_tx, eligible_rx) = mpsc::channel();
+            let (marked_tx, marked_rx) = mpsc::channel();
+            let marker = Arc::clone(&wm);
+            let writer = std::thread::spawn(move || {
+                // A bounded two-phase barrier forces the newer mark to finish
+                // after reset's height read and before its compare-and-clear.
+                eligible_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("reset reached the overflow-clear boundary");
+                marker.note_unapplied_range(lo, hi);
+                marked_tx.send(()).expect("reset is waiting for the mark");
+            });
+
+            wm.reset_unapplied_below_with(ceiling, || {
+                eligible_tx.send(()).expect("marker is waiting");
+                marked_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("newer wide-range protection was published");
+            });
+            writer.join().expect("wide-range marker completed");
+
+            let later_ack = hi + REPLAY_REORDER_SLACK_SEQ + 1;
+            wm.note_ticks_acked(later_ack);
+            wm.note_depth_acked(later_ack);
+            let snap = wm.snapshot();
+            assert_eq!(wm.overflow_high_seq.load(Ordering::Acquire), hi);
+            assert!(snap.overflowed, "the newer range must survive the reset");
+            assert!(snap.buckets.iter().all(|(id, _)| *id == 0));
+            for sink in [AppliedSink::Ticks, AppliedSink::Depth] {
+                assert!(snap.skip_below(sink) > hi, "later ACK covers the range");
+                for frame in [lo, hi] {
+                    assert!(
+                        !snap.frame_is_applied(sink, frame),
+                        "the mark must protect individual frames after the later ACK"
+                    );
+                }
+            }
+
+            wm.reset_unapplied_below(hi + 1);
+            assert!(
+                !wm.snapshot().overflowed,
+                "a subsequent confirmed reset past the newer range may clear it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_collision_in_the_final_sequence_bucket_never_wraps_to_no_overflow() {
+        let wm = AppliedWatermark::new_for_tests();
+        let last_id = u64::MAX >> UNAPPLIED_BUCKET_SHIFT;
+        let earlier_id = last_id - UNAPPLIED_BUCKETS as u64;
+        wm.note_unapplied(earlier_id << UNAPPLIED_BUCKET_SHIFT);
+        wm.note_unapplied(u64::MAX);
+        assert_eq!(wm.overflow_high_seq.load(Ordering::Acquire), u64::MAX);
+
+        wm.reset_unapplied_below(u64::MAX);
+        wm.note_ticks_acked(u64::MAX);
+        wm.note_depth_acked(u64::MAX);
+        let snap = wm.snapshot();
+        assert!(
+            snap.overflowed,
+            "no representable ceiling passes this bucket"
+        );
+        assert!(
+            !snap.frame_is_applied(AppliedSink::Ticks, u64::MAX - 2 * REPLAY_REORDER_SLACK_SEQ),
+            "the collided bucket remains protected even below a later ACK"
+        );
+    }
+
+    #[test]
     fn a_persisted_overflow_flag_can_never_be_cleared_by_this_process() {
         // The file format carries one BIT, not a height, so a loaded flag
         // must be treated as unbounded: this process cannot know how far the
@@ -1529,6 +1919,88 @@ mod tests {
         wm.note_questdb_probe(true);
         wm.note_ticks_acked(seq(30));
         assert_eq!(wm.snapshot().hwm_ticks, seq(30), "advancing again");
+    }
+
+    #[test]
+    fn replay_wait_refuses_a_sink_failure_between_check_and_completion() {
+        let wm = AppliedWatermark::new_for_tests();
+        let fence = wm.replay_ack_fence(wm.unlanded_total());
+        wm.note_ticks_handed_off();
+        let accepted = wm.wait_for_offload_drained_with(Duration::ZERO, fence, || {
+            wm.note_questdb_probe(false);
+            wm.note_ticks_acked(seq(10));
+            wm.note_ticks_completed();
+        });
+        assert!(
+            !accepted,
+            "a parked ACK cannot authorize replay confirmation"
+        );
+        assert!(wm.replay_confirmation_guard(fence).is_none());
+    }
+
+    #[test]
+    fn a_transient_sink_failure_cannot_heal_the_original_replay_fence() {
+        let wm = AppliedWatermark::new_for_tests();
+        let fence = wm.replay_ack_fence(wm.unlanded_total());
+        wm.note_ticks_handed_off();
+        let accepted = wm.wait_for_offload_drained_with(Duration::ZERO, fence, || {
+            wm.note_questdb_probe(false);
+            wm.note_ticks_acked(seq(10));
+            wm.note_questdb_probe(true);
+            wm.note_ticks_completed();
+        });
+        assert!(!wm.is_sink_suspect(), "the final health flag is clean");
+        assert!(
+            !accepted,
+            "the intervening failure still invalidates this batch"
+        );
+        assert!(wm.replay_confirmation_guard(fence).is_none());
+        let next = wm.replay_ack_fence(wm.unlanded_total());
+        assert!(wm.replay_ack_fence_valid(next), "a later replay can retry");
+    }
+
+    #[test]
+    fn confirmation_rechecks_the_fence_after_a_successful_wait() {
+        let wm = AppliedWatermark::new_for_tests();
+        let fence = wm.replay_ack_fence(wm.unlanded_total());
+        wm.note_ticks_handed_off();
+        assert!(wm.replay_confirmation_guard(fence).is_none());
+        wm.note_ticks_completed();
+        assert!(wm.wait_for_offload_drained_guarded(Duration::ZERO, fence));
+        {
+            let _confirmation = wm.replay_confirmation_guard(fence).unwrap();
+            assert!(
+                wm.replay_health_lock.try_lock().is_err(),
+                "the exact archive operation holds the local health verdict"
+            );
+        }
+        wm.note_questdb_probe(false);
+        wm.note_questdb_probe(true);
+        assert!(
+            wm.replay_confirmation_guard(fence).is_none(),
+            "failure after wait and before archive must still retain originals"
+        );
+    }
+
+    #[test]
+    fn replay_failure_counters_exhaust_instead_of_wrapping_to_valid_evidence() {
+        let wm = AppliedWatermark::new_for_tests();
+        wm.sink_failure_epoch.store(u64::MAX - 1, Ordering::Release);
+        wm.note_questdb_probe(false);
+        wm.note_questdb_probe(true);
+        wm.note_questdb_probe(false);
+        wm.note_questdb_probe(true);
+        assert_eq!(wm.sink_failure_epoch.load(Ordering::Acquire), u64::MAX);
+        let exhausted = wm.replay_ack_fence(wm.unlanded_total());
+        assert!(!wm.replay_ack_fence_valid(exhausted));
+        assert!(wm.replay_confirmation_guard(exhausted).is_none());
+
+        let wm = AppliedWatermark::new_for_tests();
+        wm.unlanded.store(u64::MAX - 1, Ordering::Release);
+        wm.note_unlanded();
+        wm.note_unlanded();
+        assert_eq!(wm.unlanded_total(), u64::MAX);
+        assert!(!wm.replay_ack_fence_valid(wm.replay_ack_fence(wm.unlanded_total())));
     }
 
     #[test]

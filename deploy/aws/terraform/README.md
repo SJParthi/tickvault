@@ -46,10 +46,11 @@ per `.claude/rules/project/aws-budget.md` — **~₹1,022/mo** on `t4g.medium`
    Update the default in `variables.tf` if newer. `lifecycle.ignore_changes = [ami]` on the instance prevents existing instances from being rebuilt.
 
    **Why Amazon Linux 2023 (not Ubuntu)?** AL2023 ships with AWS CLI + amazon-ssm-agent + amazon-cloudwatch-agent **pre-installed**, so the user-data script skips ~30 lines of apt-get installs. ~30s faster cold boot at the daily 08:00 IST EventBridge start. ~150 MB more RAM headroom on the 4 GiB host. The Rust binary, Docker, and tickvault behaviour are byte-identical on either OS.
-5. **Find your public IP** and set `TF_VAR_operator_cidr`:
+5. **Use SSM Session Manager by default**: leave `TF_VAR_operator_cidr` empty for no inbound SSH. If SSH is required, find your public IP and explicitly allow that address:
    ```bash
    export TF_VAR_operator_cidr="$(curl -s ifconfig.me)/32"
    ```
+   Public `/0` ranges are rejected. CI reads the optional `TF_VAR_OPERATOR_CIDR` repository secret and otherwise retains SSM-only access. Confirm SSM is online before removing an existing SSH rule.
 6. **Set operator email for alarm notifications** (required):
    ```bash
    export TF_VAR_operator_email="you@example.com"

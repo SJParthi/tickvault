@@ -49,6 +49,17 @@ env:
   # `#![cfg_attr(not(test), deny(...))]` in each lib.rs.
 
 jobs:
+  # Run in parallel with the existing suite, but include it in All Green.
+  # The called workflow has a separate concurrency group and validates the
+  # actual PR head rather than the synthetic pull-request merge commit.
+  release-validation:
+    name: Release Validation
+    permissions:
+      contents: read
+    uses: ./.github/workflows/release-validation.yml
+    with:
+      source_sha: ${{ github.event.pull_request.head.sha || github.sha }}
+
   # -------------------------------------------------------------------------
   # Local-Runtime Branch Guard — the `local-runtime` branch is ONE-WAY
   # (operator directive 2026-07-04: "it should be merged entirely from all
@@ -1113,6 +1124,7 @@ jobs:
       - repo-guards
       - dhat-zero-alloc
       - loom-concurrency
+      - release-validation
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1182,9 +1194,9 @@ jobs:
   # hardening 2026-07-04). This replaces the at-open arming that lived in
   # auto-merge.yml: arming at PR open meant the merge fired the instant the
   # (then only 4) required checks passed, while Test/Coverage were still
-  # running. Arming here, strictly AFTER the full suite is green, means even
-  # a branch-protection misconfiguration cannot merge a red PR through this
-  # bot path.
+  # running. Arming now verifies the current head after the full suite and
+  # release validation succeed. Branch protection must still require All
+  # Green: an armed auto-merge flag can survive later branch updates.
   #
   # SECURITY (preserved verbatim from auto-merge.yml / PR #1390 — do NOT
   # weaken): the PR must originate from a branch in THIS repository, not a
@@ -1208,14 +1220,11 @@ jobs:
       github.actor == 'SJParthi' ||
       startsWith(github.head_ref, 'claude/')
       )
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+    uses: ./.github/workflows/auto-merge.yml
+    with:
+      pr_number: ${{ format('{0}', github.event.pull_request.number) }}
+      source_sha: ${{ github.event.pull_request.head.sha }}
     permissions:
       contents: write
       pull-requests: write
-    steps:
-      - name: Enable auto-merge (squash)
-        run: gh pr merge --auto --squash "$PR_URL"
-        env:
-          PR_URL: ${{ github.event.pull_request.html_url }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      checks: read

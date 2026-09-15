@@ -43,11 +43,11 @@ fn production_region(src: &str) -> String {
 fn test_candle_ddl_boot_awaited_before_seal_writer_spawn_in_main() {
     let main_src = production_region(&read_src("src/main.rs"));
 
-    let ddl_call = "candle_ddl_boot::run_candle_ddl_at_boot(&config.questdb).await";
+    let ddl_call = "candle_ddl_boot::run_candle_ddl_at_boot(&config.questdb).await?;";
     let ddl_pos = main_src.find(ddl_call).unwrap_or_else(|| {
         panic!(
             "main.rs production region must await `{ddl_call}` inside \
-             build_shared_infra — the fresh-volume no-DEDUP fix (Track A 2026-07-18)"
+             build_shared_infra and propagate failure before writers start"
         )
     });
     assert_eq!(
@@ -59,7 +59,7 @@ fn test_candle_ddl_boot_awaited_before_seal_writer_spawn_in_main() {
 
     // The CALL site (not the fn definition) — the argument form is unique
     // to the build_shared_infra call.
-    let seal_call = "spawn_seal_writer_loop(&config.questdb);";
+    let seal_call = "spawn_seal_writer_loop(&config.questdb).await?;";
     let seal_pos = main_src.find(seal_call).unwrap_or_else(|| {
         panic!("main.rs production region must call `{seal_call}` in build_shared_infra")
     });
@@ -73,6 +73,59 @@ fn test_candle_ddl_boot_awaited_before_seal_writer_spawn_in_main() {
 }
 
 #[test]
+fn seal_recovery_is_awaited_before_any_candle_producer_starts() {
+    let main_src = production_region(&read_src("src/main.rs"));
+    let spawn_start = main_src
+        .find("async fn spawn_seal_writer_loop(")
+        .expect("seal startup must be awaitable");
+    let spawn_end = main_src[spawn_start..]
+        .find("fn spawn_scoreboard_midnight_reset_task(")
+        .map(|offset| spawn_start + offset)
+        .expect("next startup helper");
+    let spawn_body = &main_src[spawn_start..spawn_end];
+    assert!(spawn_body.contains("run_seal_writer_loop_with_boot_ready("));
+    assert!(spawn_body.contains("Some(boot_ready_tx)"));
+    assert!(
+        spawn_body.contains("let boot = boot_ready_rx.await.map_err("),
+        "startup must await recovery and fail when its worker disappears"
+    );
+
+    let shared_start = main_src
+        .find("async fn build_shared_infra(")
+        .expect("shared startup");
+    let shared = &main_src[shared_start..];
+    let recovered = shared
+        .find("spawn_seal_writer_loop(&config.questdb).await?;")
+        .expect("recovery completion must propagate startup errors");
+    let fold = shared
+        .find("rest_candle_fold::spawn_supervised_rest_candle_fold(")
+        .expect("REST catch-up producer");
+    assert!(
+        recovered < fold,
+        "REST catch-up must wait for seal recovery"
+    );
+
+    let main_start = main_src.find("async fn async_main()").expect("main");
+    let main = &main_src[main_start..spawn_start];
+    let shared_call = main.find("} = build_shared_infra(").expect("shared call");
+    let feed_call = main
+        .find("dhan_feed_stack::spawn_dhan_feed_stack(")
+        .expect("feed call");
+    assert!(
+        shared_call < feed_call,
+        "Dhan must start after shared startup"
+    );
+    let shared_statement = main[shared_call..feed_call]
+        .split_once(';')
+        .expect("shared startup statement")
+        .0;
+    assert!(
+        shared_statement.trim_end().ends_with(".await?"),
+        "shared startup must complete before the live feed starts"
+    );
+}
+
+#[test]
 fn test_candle_ddl_boot_calls_drop_ensure_views_in_order() {
     let boot_src = production_region(&read_src("src/candle_ddl_boot.rs"));
 
@@ -81,7 +134,7 @@ fn test_candle_ddl_boot_calls_drop_ensure_views_in_order() {
         .expect("candle_ddl_boot must run the retired-object drop sweep");
     let ensure_pos = boot_src
         .find("shadow_persistence::ensure_shadow_candle_tables(questdb).await")
-        .expect("candle_ddl_boot must ensure the 21 candle tables (DEDUP)");
+        .expect("candle_ddl_boot must ensure every active candle table (DEDUP)");
     let views_pos = boot_src
         .find("console_views::ensure_named_views(questdb).await")
         .expect("candle_ddl_boot must ensure the analyst console views");
@@ -93,6 +146,27 @@ fn test_candle_ddl_boot_calls_drop_ensure_views_in_order() {
     );
 }
 
+#[test]
+fn primary_top_volume_projection_refusal_blocks_candle_startup() {
+    let boot_src = production_region(&read_src("src/candle_ddl_boot.rs"));
+    let candle = boot_src
+        .split(concat!("pub async ", "fn run_candle_ddl_at_boot"))
+        .nth(1)
+        .expect("candle startup helper")
+        .split(concat!("pub async ", "fn run_live_table_ddl_at_boot"))
+        .next()
+        .expect("candle startup region");
+    let refusal = candle
+        .split("if !tickvault_storage::console_views::ensure_named_views(questdb).await {")
+        .nth(1)
+        .expect("primary projection readiness must be consulted")
+        .split('}')
+        .next()
+        .expect("refusal arm");
+    assert!(refusal.contains("anyhow::bail!("));
+    assert!(refusal.contains("candle writers cannot start"));
+}
+
 /// The writer → table → ensure → boot-call-site coverage table: every
 /// LIVE-writer table's ensure fn must keep at least the named production
 /// call site. Losing one silently re-opens the fresh-volume no-DEDUP
@@ -101,7 +175,7 @@ fn test_candle_ddl_boot_calls_drop_ensure_views_in_order() {
 fn test_every_live_table_ensure_fn_keeps_its_boot_call_site() {
     // (ensure fn call needle, caller file relative to crates/app)
     let coverage: &[(&str, &str)] = &[
-        // candles_* (21 tables) — seal chain writer (rest_candle_fold)
+        // Every active candles_* table — shared seal chain writer.
         ("ensure_shadow_candle_tables", "src/candle_ddl_boot.rs"),
         // analyst console views (read-only projections)
         ("ensure_named_views", "src/candle_ddl_boot.rs"),
@@ -339,23 +413,26 @@ fn every_offload_writer_is_joined_and_labelled_at_shutdown() {
         );
     }
 
-    // A spawned writer whose handle is DISCARDED cannot be joined. The exact
-    // spelling that hid the third writer was `Ok(_handle) =>`.
-    //
-    // Asserted POSITIVELY — that the handle is bound and handed over — rather
-    // than by banning the discard spelling. The first draft did ban the string,
-    // and it went red against CORRECT code: the fix's own explanatory comment
-    // quotes `Ok(_handle)` to say what it replaced, and a source scan cannot
-    // tell prose from code. A guard that forbids naming the defect it prevents
-    // makes the defect undocumentable, which is a bad trade for a pin that the
-    // positive form gives anyway.
+    // Candle-derived ranking no longer spawns the legacy periodic writer in
+    // production. Its optional diagnostic attachment still has to retain both
+    // the producer and the thread; requiring the removed production call site
+    // would resurrect that writer merely to satisfy this guard.
+    let attach_start = lane
+        .find("pub fn with_top_volume_writer(")
+        .expect("legacy attachment must retain its paired ownership contract");
+    let attach_end = lane[attach_start..]
+        .find("pub fn snapshot_legacy_top_volume(")
+        .map(|offset| attach_start + offset)
+        .expect("legacy snapshot follows the attachment");
+    let attachment =
+        tickvault_common::source_scan::strip_rust_comments(&lane[attach_start..attach_end])
+            .split_whitespace()
+            .collect::<String>();
     assert!(
-        lane.contains("with_top_volume_writer(producer, handle)"),
-        "the top-volume writer's JoinHandle must be BOUND at the spawn site and \
-         handed to the lane with its producer. Discarding it (`Ok(_handle) =>`) \
-         means the thread can never be joined at shutdown, so its final batches \
-         die with the process and nothing counts them — the state this writer \
-         shipped in for six days while its two siblings had the accounting"
+        attachment.contains("self.top_volume=Some(writer);")
+            && attachment.contains("self.top_volume_thread=Some(thread);"),
+        "optional top-volume attachment must retain its producer and JoinHandle \
+         together so closing the queue and joining the thread remain possible"
     );
 
     // All three joins must be present, and against the SAME deadline: `main`

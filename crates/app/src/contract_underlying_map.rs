@@ -125,6 +125,10 @@ pub enum LegRefusal {
     /// column for. A contract absent from the board is visible in this
     /// counter; a contract wrongly at the top of it is not.
     MissingLotSize,
+    /// Two usable definitions for the same composite contract disagree about
+    /// lot size, underlying or option family. Neither definition may win by
+    /// artifact order; the identity remains unresolved for this publication.
+    ConflictingDefinition,
     /// The snapshot is at its ceiling.
     AtCapacity,
 }
@@ -136,13 +140,14 @@ impl LegRefusal {
     /// here leaves that reason's series unseeded, and an unseeded series is one
     /// the CloudWatch agent drops on its first sample -- silent on the one day
     /// it fires. `all_variants_are_in_the_seed_list` pins that this stays whole.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::ZeroOrNegativeContractId,
         Self::ZeroOrNegativeUnderlyingId,
         Self::UnresolvedUnderlyingSymbol,
         Self::UnsupportedSegment,
         Self::UnderlyingClassMismatch,
         Self::MissingLotSize,
+        Self::ConflictingDefinition,
         Self::AtCapacity,
     ];
 
@@ -156,6 +161,7 @@ impl LegRefusal {
             Self::UnsupportedSegment => "unsupported_segment",
             Self::UnderlyingClassMismatch => "underlying_class_mismatch",
             Self::MissingLotSize => "missing_lot_size",
+            Self::ConflictingDefinition => "conflicting_definition",
             Self::AtCapacity => "at_capacity",
         }
     }
@@ -218,6 +224,19 @@ pub struct ContractOwner {
     pub lot_size: u32,
 }
 
+/// One coherent metadata publication. The numeric version is a process
+/// publication identifier; the actual lot, family and underlying are also
+/// pinned into each candle, so historical arithmetic does not depend on a
+/// later lookup or on the uniqueness of a clock-derived identifier.
+#[derive(Debug, Default)]
+pub struct ContractSnapshot {
+    pub version: u64,
+    pub owners: HashMap<ContractKey, ContractOwner>,
+    pub definition_versions: HashMap<ContractKey, u64>,
+    /// Only options in the declared subscription selection are ranked.
+    pub ranked: HashSet<ContractKey>,
+}
+
 /// What building a snapshot produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotBuild {
@@ -227,14 +246,29 @@ pub struct SnapshotBuild {
     pub refusals: Vec<(i64, LegRefusal)>,
 }
 
-/// Builds a mapping snapshot from one minute's chain legs. Pure.
+/// Builds a mapping snapshot from one coherent set of definition legs. Pure.
 ///
-/// A later leg for the same contract overwrites an earlier one — the chain is
-/// a snapshot of one minute, so a repeat is a re-observation, not a conflict.
+/// Identical duplicates coalesce. Different lot sizes, underlyings or families
+/// for the same composite identity make it unavailable for this publication;
+/// a later duplicate cannot resolve the ambiguity by file order. Conflicted
+/// identities still consume an admission slot, keeping the cold-path metadata
+/// budget bounded while the caller preserves the declared selected universe.
 #[must_use]
 pub fn build_snapshot(legs: &[LegIds]) -> (HashMap<ContractKey, ContractOwner>, SnapshotBuild) {
+    let (map, build, _) = build_snapshot_with_ambiguities(legs);
+    (map, build)
+}
+
+fn build_snapshot_with_ambiguities(
+    legs: &[LegIds],
+) -> (
+    HashMap<ContractKey, ContractOwner>,
+    SnapshotBuild,
+    HashSet<ContractKey>,
+) {
     let mut map: HashMap<ContractKey, ContractOwner> =
         HashMap::with_capacity(legs.len().min(MAX_TRACKED_CONTRACTS));
+    let mut ambiguous = HashSet::with_capacity(legs.len().min(MAX_TRACKED_CONTRACTS));
     let mut refusals = Vec::new();
 
     for leg in legs {
@@ -280,25 +314,35 @@ pub fn build_snapshot(legs: &[LegIds]) -> (HashMap<ContractKey, ContractOwner>, 
             continue;
         }
         let key = (contract_id, leg.contract_segment);
-        // An UPDATE to a contract already in the snapshot is always allowed;
-        // only a NEW contract can hit the ceiling. Refusing the update would
-        // pin a stale underlying against a contract that had moved.
-        if map.len() >= MAX_TRACKED_CONTRACTS && !map.contains_key(&key) {
+        if ambiguous.contains(&key) {
+            // Sticky for this complete input snapshot. Repeating either
+            // conflicting definition is not evidence that it is authoritative.
+            continue;
+        }
+        let owner = ContractOwner {
+            underlying_id,
+            family: leg.family,
+            lot_size: leg.lot_size,
+        };
+        if let Some(previous) = map.get(&key) {
+            if *previous != owner {
+                map.remove(&key);
+                ambiguous.insert(key);
+                refusals.push((leg.contract_security_id, LegRefusal::ConflictingDefinition));
+            }
+            continue;
+        }
+        // A conflict must not free a slot that an unrelated artifact row can
+        // take. Owners plus ambiguity tombstones share the same fixed bound.
+        if map.len() + ambiguous.len() >= MAX_TRACKED_CONTRACTS {
             refusals.push((leg.contract_security_id, LegRefusal::AtCapacity));
             continue;
         }
-        map.insert(
-            key,
-            ContractOwner {
-                underlying_id,
-                family: leg.family,
-                lot_size: leg.lot_size,
-            },
-        );
+        map.insert(key, owner);
     }
 
     let accepted = map.len();
-    (map, SnapshotBuild { accepted, refusals })
+    (map, SnapshotBuild { accepted, refusals }, ambiguous)
 }
 
 /// Turns the two daily artifacts into ranking legs — the ONLY producer wired
@@ -539,7 +583,7 @@ pub fn order_selected_first(
 /// The published mapping. Cheap to clone — it is one `Arc`.
 #[derive(Debug, Clone)]
 pub struct ContractUnderlyingMap {
-    inner: Arc<ArcSwap<HashMap<ContractKey, ContractOwner>>>,
+    inner: Arc<ArcSwap<ContractSnapshot>>,
     /// Human-readable contract labels, resolved ONCE per publish.
     ///
     /// A SECOND snapshot rather than a field on [`ContractOwner`], and that is
@@ -562,7 +606,7 @@ impl ContractUnderlyingMap {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            inner: Arc::new(ArcSwap::from_pointee(ContractSnapshot::default())),
             labels: Arc::new(ArcSwap::from_pointee(HashMap::new())),
         }
     }
@@ -572,7 +616,79 @@ impl ContractUnderlyingMap {
     /// Readers in flight keep the old snapshot until they drop it, so a
     /// rebuild can never hand the drain a half-built map.
     pub fn publish(&self, snapshot: HashMap<ContractKey, ContractOwner>) {
-        self.inner.store(Arc::new(snapshot));
+        let ranked = snapshot.keys().copied().collect();
+        self.publish_selection(snapshot, ranked);
+    }
+
+    fn publish_selection(
+        &self,
+        owners: HashMap<ContractKey, ContractOwner>,
+        ranked: HashSet<ContractKey>,
+    ) {
+        // Cold publication only. A new Arc carries all fields atomically.
+        let clock = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(1, |d| u64::try_from(d.as_micros()).unwrap_or(1));
+        self.inner.rcu(|old| {
+            if old.owners == owners && old.ranked == ranked {
+                return Arc::clone(old);
+            }
+            let version = old
+                .version
+                .checked_add(1)
+                .filter(|v| *v <= i64::MAX as u64)
+                .map(|v| v.max(clock.min(i64::MAX as u64)))
+                .unwrap_or(0);
+            Arc::new(ContractSnapshot {
+                version,
+                definition_versions: owners
+                    .iter()
+                    .map(|(key, owner)| {
+                        let definition_version = if old.owners.get(key) == Some(owner) {
+                            old.definition_versions.get(key).copied().unwrap_or(version)
+                        } else {
+                            version
+                        };
+                        (*key, definition_version)
+                    })
+                    .collect(),
+                owners: owners.clone(),
+                ranked: ranked.clone(),
+            })
+        });
+    }
+
+    #[must_use]
+    pub fn versioned_snapshot(&self) -> Arc<ContractSnapshot> {
+        self.inner.load_full()
+    }
+
+    /// One atomic snapshot read; no map scan on a decision path.
+    #[must_use]
+    pub fn current_version(&self) -> u64 {
+        self.inner.load().version
+    }
+
+    /// Select the registered ranking universe in the same atomic publication
+    /// as its multipliers. Unsubscribed artifact rows never count as missing
+    /// feed coverage. `selected` must contain all selected OPTIONS, including
+    /// ones whose metadata is invalid. Spots and futures are excluded by the
+    /// artifact-aware caller. Build and selection are cold O(N) work.
+    pub fn publish_selected_from_legs(
+        &self,
+        legs: &[LegIds],
+        selected: &[SubscribeInstrument],
+    ) -> SnapshotBuild {
+        let (owners, build) = build_snapshot(legs);
+        let ranked = selected
+            .iter()
+            .map(|instrument| (instrument.security_id, instrument.segment))
+            .collect();
+        for (_, reason) in &build.refusals {
+            metrics::counter!(REFUSED_COUNTER, "reason" => reason.as_str()).increment(1);
+        }
+        self.publish_selection(owners, ranked);
+        build
     }
 
     /// Replaces the label snapshot, atomically. Built by
@@ -605,7 +721,7 @@ impl ContractUnderlyingMap {
     /// Refusals are counted here rather than in `build_snapshot`, which stays
     /// pure so the decision rule is testable without a metrics recorder.
     pub fn publish_from_legs(&self, legs: &[LegIds]) -> SnapshotBuild {
-        let (map, build) = build_snapshot(legs);
+        let (map, build, ambiguous) = build_snapshot_with_ambiguities(legs);
         // A refusal means a contract cannot be RANKED at all — the ranking is
         // narrower than the subscription, silently, and a counter alone would
         // leave that reaching nobody. One SUMMARY line per publish, not per leg.
@@ -650,7 +766,12 @@ impl ContractUnderlyingMap {
                  top-volume boards stay empty, and no other signal says so."
             );
         }
-        self.publish(map);
+        // The legacy all-legs entry point has no separate selected list.
+        // Preserve conflicted identities in its declared universe as well:
+        // dropping them from both maps would manufacture complete coverage of
+        // the remaining, easier-to-resolve contracts.
+        let ranked = map.keys().copied().chain(ambiguous).collect();
+        self.publish_selection(map, ranked);
         build
     }
 
@@ -668,7 +789,11 @@ impl ContractUnderlyingMap {
     /// distinct-underlying rule would then admit five strikes of nothing.
     #[must_use]
     pub fn owner_of(&self, contract_id: u64, segment: ExchangeSegment) -> Option<ContractOwner> {
-        self.inner.load().get(&(contract_id, segment)).copied()
+        self.inner
+            .load()
+            .owners
+            .get(&(contract_id, segment))
+            .copied()
     }
 
     /// The underlying's id alone, for callers that do not need the family.
@@ -684,7 +809,7 @@ impl ContractUnderlyingMap {
     /// How many contracts the published snapshot holds.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner.load().len()
+        self.inner.load().owners.len()
     }
 
     /// Whether nothing has been published yet, or the last publish was empty.
@@ -824,11 +949,48 @@ mod tests {
     }
 
     #[test]
-    fn build_snapshot_lets_a_later_leg_overwrite_an_earlier_one() {
-        // One minute's chain is a snapshot; a repeat is a re-observation.
-        let (map, build) = build_snapshot(&[leg(100, 13), leg(100, 25)]);
+    fn build_snapshot_coalesces_identical_definition_duplicates() {
+        let definition = leg(100, 13);
+        let (map, build) = build_snapshot(&[definition, definition, definition]);
         assert_eq!(build.accepted, 1);
-        assert_eq!(under(&map, (100, FNO)), Some(25));
+        assert_eq!(under(&map, (100, FNO)), Some(13));
+        assert!(build.refusals.is_empty());
+    }
+
+    #[test]
+    fn conflicting_definition_permutations_never_choose_a_lot_underlying_or_family() {
+        let original = leg(100, 13);
+        let other = leg(200, 25);
+        for changed in [
+            LegIds {
+                lot_size: 150,
+                ..original
+            },
+            LegIds {
+                underlying_security_id: 25,
+                ..original
+            },
+            LegIds {
+                family: OptionFamily::Index,
+                ..original
+            },
+        ] {
+            for entries in [
+                [original, original, changed, other, original],
+                [changed, original, changed, other, changed],
+                [other, changed, original, original, changed],
+            ] {
+                let (map, build, ambiguous) = build_snapshot_with_ambiguities(&entries);
+                assert_eq!(build.accepted, 1);
+                assert_eq!(under(&map, (100, FNO)), None);
+                assert_eq!(under(&map, (200, FNO)), Some(25));
+                assert_eq!(ambiguous, HashSet::from([(100, FNO)]));
+                assert_eq!(
+                    build.refusals,
+                    vec![(100, LegRefusal::ConflictingDefinition)]
+                );
+            }
+        }
     }
 
     #[test]
@@ -843,16 +1005,78 @@ mod tests {
     }
 
     #[test]
-    fn build_snapshot_still_updates_a_tracked_contract_at_the_ceiling() {
-        // The ceiling bounds how many contracts are held, never how fresh
-        // their mapping is. Refusing this would pin a stale underlying.
+    fn build_snapshot_accepts_an_identical_duplicate_at_the_ceiling() {
+        let mut legs: Vec<LegIds> = (1..=MAX_TRACKED_CONTRACTS as i64)
+            .map(|i| leg(i, 13))
+            .collect();
+        legs.push(leg(7, 13));
+        let (map, build) = build_snapshot(&legs);
+        assert_eq!(under(&map, (7, FNO)), Some(13));
+        assert_eq!(build.accepted, MAX_TRACKED_CONTRACTS);
+        assert!(build.refusals.is_empty());
+    }
+
+    #[test]
+    fn conflicting_definitions_remain_sticky_and_consume_capacity() {
         let mut legs: Vec<LegIds> = (1..=MAX_TRACKED_CONTRACTS as i64)
             .map(|i| leg(i, 13))
             .collect();
         legs.push(leg(7, 25));
-        let (map, build) = build_snapshot(&legs);
-        assert_eq!(under(&map, (7, FNO)), Some(25));
-        assert!(build.refusals.is_empty());
+        legs.push(leg(999_999, 13));
+        legs.push(leg(7, 13));
+        let (map, build, ambiguous) = build_snapshot_with_ambiguities(&legs);
+        assert_eq!(build.accepted, MAX_TRACKED_CONTRACTS - 1);
+        assert!(!map.contains_key(&(7, FNO)));
+        assert!(!map.contains_key(&(999_999, FNO)));
+        assert_eq!(map.len() + ambiguous.len(), MAX_TRACKED_CONTRACTS);
+        assert_eq!(
+            build.refusals,
+            vec![
+                (7, LegRefusal::ConflictingDefinition),
+                (999_999, LegRefusal::AtCapacity),
+            ]
+        );
+    }
+
+    #[test]
+    fn conflicting_selected_metadata_revokes_the_owner_without_shrinking_the_universe() {
+        let original = leg(100, 13);
+        let changed = LegIds {
+            lot_size: 150,
+            ..original
+        };
+        let other = leg(200, 25);
+        let selected = [100, 200].map(|security_id| SubscribeInstrument {
+            security_id,
+            segment: FNO,
+        });
+        for explicit_selection in [false, true] {
+            let map = ContractUnderlyingMap::new();
+            map.publish_from_legs(&[original, other]);
+            let previous_version = map.current_version();
+            let build = if explicit_selection {
+                map.publish_selected_from_legs(&[original, changed, other], &selected)
+            } else {
+                map.publish_from_legs(&[changed, original, other])
+            };
+            let unresolved = map.versioned_snapshot();
+            assert!(unresolved.version > previous_version);
+            assert_eq!(build.accepted, 1);
+            assert_eq!(unresolved.ranked, HashSet::from([(100, FNO), (200, FNO)]));
+            assert!(!unresolved.owners.contains_key(&(100, FNO)));
+            assert!(!unresolved.definition_versions.contains_key(&(100, FNO)));
+            assert_eq!(map.owner_of(100, FNO), None);
+            assert!(map.owner_of(200, FNO).is_some());
+
+            // A later, internally consistent publication can supply the real
+            // changed definition. A duplicate inside one publication cannot.
+            map.publish_selected_from_legs(&[changed, other], &selected);
+            let resolved = map.versioned_snapshot();
+            assert!(resolved.version > unresolved.version);
+            assert_eq!(resolved.ranked, unresolved.ranked);
+            assert_eq!(map.owner_of(100, FNO).unwrap().lot_size, 150);
+            assert_eq!(resolved.definition_versions[&(100, FNO)], resolved.version);
+        }
     }
 
     #[test]
@@ -965,6 +1189,35 @@ mod tests {
         // underlying's — an entry under `IDX_I` or `NSE_EQ` would match no
         // tick this lane ever receives.
         assert!(legs.iter().all(|l| l.contract_segment == FNO));
+    }
+
+    #[test]
+    fn conflicting_artifact_lot_definitions_stay_unresolved_in_either_file_order() {
+        let original = contract(500, "OPTSTK", "RELIANCE", "NSE");
+        let changed = ContractRow {
+            z: 150,
+            ..original.clone()
+        };
+        for rows in [[original.clone(), changed.clone()], [changed, original]] {
+            let (legs, artifact_refusals) = legs_from_artifact(&rows, &symbol_map());
+            assert!(
+                artifact_refusals.is_empty(),
+                "both definitions are individually valid"
+            );
+            let map = ContractUnderlyingMap::new();
+            let selected = [SubscribeInstrument {
+                security_id: 500,
+                segment: FNO,
+            }];
+            let build = map.publish_selected_from_legs(&legs, &selected);
+            assert_eq!(build.accepted, 0);
+            assert_eq!(
+                build.refusals,
+                vec![(500, LegRefusal::ConflictingDefinition)]
+            );
+            assert_eq!(map.owner_of(500, FNO), None);
+            assert!(map.versioned_snapshot().ranked.contains(&(500, FNO)));
+        }
     }
 
     /// The NEGATIVE CONTROL for the defect this module's header records.
@@ -1390,6 +1643,8 @@ mod tests {
             LegRefusal::UnresolvedUnderlyingSymbol,
             LegRefusal::UnsupportedSegment,
             LegRefusal::UnderlyingClassMismatch,
+            LegRefusal::MissingLotSize,
+            LegRefusal::ConflictingDefinition,
             LegRefusal::AtCapacity,
         ] {
             assert!(labels.contains(r.as_str()), "{} is not seeded", r.as_str());

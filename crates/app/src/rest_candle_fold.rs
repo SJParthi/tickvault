@@ -1,27 +1,20 @@
 //! REST-era bar-fold candle derivation (FOLD-01 runbook:
 //! `.claude/rules/project/rest-candle-fold-error-codes.md`).
 //!
-//! Operator directive 2026-07-16 (verbatim): *"why the fuck remaining candles
-//! 1m till 1day is not yet generated and populated — resolve these"* + *"for
-//! only spots we will have minimum one month data because anyhow based on
-//! underlying spots alone only trading decision will be entered or exited —
-//! but option only for the current day"* + *"everything should be always
-//! available in our own questdb right — our entire one month should be stored
-//! and fetched from questdb even before premarket"*.
+//! The retained candle registry contains exactly 1s, 3s, 5s, 1m, 3m, 5m,
+//! 10m, 15m, 30m and 60m. This optional REST derivation lane folds each
+//! persist-CONFIRMED `spot_1m_rest` vendor bar into the seven minute-scale
+//! frames. A 1m vendor bar contains no sub-minute path, so it never populates
+//! 1s, 3s or 5s. Those frames require the live tick lane.
 //!
-//! With both live feeds retired (Dhan 2026-07-13, Groww 2026-07-15) the 21-TF
-//! tick aggregator is publisher-less, so the `candles_*` tables stopped
-//! populating. This module derives them from the ONLY live market-data source
-//! left — the per-minute `spot_1m_rest` official 1m bars — by FOLDING each
-//! persist-CONFIRMED 1m bar into all 5 timeframe buckets and emitting sealed
-//! buckets as [`BufferedSeal`]s into the EXISTING global seal-writer channel
+//! Sealed buckets are emitted as [`BufferedSeal`]s into the global seal-writer channel
 //! (`tickvault_storage::seal_writer_runner::global_seal_sender`), which lands
 //! them in the same `candles_*` tables with the same DEDUP key
 //! (`ts, security_id, segment, feed`) — idempotent by construction.
 //!
-//! This is NOT tick synthesis: no row ever touches `ticks`
-//! (`live-feed-purity.md` rules 1-6 stand; rule 10 carries the dated
-//! 2026-07-16 edit permitting this writer to produce `candles_1d`).
+//! No REST-derived row touches `ticks`. This lane remains config-gated;
+//! enabling it alongside the live writer requires resolving their shared
+//! candle key, which does not distinguish REST-derived and tick-derived rows.
 //!
 //! Design points (plan `.claude/plans/active-plan-rest-candle-derivation.md`):
 //! - Pure fold core: o = first bar open, h = max, l = min, c = last close,
@@ -30,21 +23,21 @@
 //!   tick_count 0 (honest — REST bars carry no tick counts), oi 0, pct
 //!   columns 0.0. Exact-match parity with
 //!   `tf_consistency_boot::recompute_window` is golden-tested.
-//! - Bucket grid: `TfIndex::bucket_start` (09:15-anchored) with effective end
-//!   `min(start + tf_secs, 15:30 close)` — the tf_consistency session grid.
+//! - Bucket grid: `TfIndex::bucket_start` (09:00-anchored) with effective end
+//!   `min(start + tf_secs, 15:40 close)` — the tf_consistency session grid.
 //!   A bucket seals when a LATER in-session bar crosses its effective end (or
-//!   opens a later bucket); D1 + every open partial force-seals at/after the
-//!   15:30 close bar.
+//!   opens a later bucket); every remaining partial seals when the 15:39 bar
+//!   reaches the local observation-window end.
 //! - Out-of-order/duplicate bars (backfill/sweep repairs — 2026-07-16
 //!   round-2 HIGH redesign; round-3 burst coalescing): every bar the
 //!   process receives for the CURRENT trading day ALSO lands in a
 //!   per-(feed, sid, segment) in-RAM **day-map** (minute → last-received
-//!   bar, last-write-wins; ≤375 entries × 8 keys — trivial memory). A
+//!   bar, last-write-wins; at most 400 minute entries per slot). A
 //!   repair bar for the current day (out-of-order minute OR a value-UPDATE
 //!   of an already-folded minute) updates the map; the consumer loop
 //!   drains each arriving burst as ONE batch and refolds every dirty slot
-//!   ONCE per batch from its map through a fresh engine (≤375 bars ×
-//!   5 TFs — microseconds, cold path; a mid-day-outage sweep of N repairs
+//!   ONCE per batch from its map through a fresh engine (at most 400 bars ×
+//!   seven minute frames, cold path; a mid-day-outage sweep of N repairs
 //!   costs one refold per slot, never N full-day refolds), swaps the live
 //!   engine in place, and re-emits every bucket the refold closed (DEDUP
 //!   UPSERT heals in place). Lossless for bars received IN-PROCESS THIS
@@ -126,35 +119,9 @@ use tracing::{error, info, warn};
 /// a full channel drops loudly (counter + coded error), never blocks a leg.
 pub const FOLD_BAR_CHANNEL_CAPACITY: usize = 4096;
 
-/// Session open, IST seconds-of-day (09:15:00) — const-asserted against the
-/// canonical nanos constants so a session change cannot silently diverge.
-///
-/// **2026-08-28 — DELIBERATELY LEFT AT 09:15 while the LIVE candle grid moved
-/// to 09:00, and the residual is recorded rather than hidden.** This lane is
-/// `enabled = false` (stood down 2026-08-11 because it wrote into the live
-/// lane's own `candles_<tf>` tables under a dedup key that cannot separate
-/// the two sources). Moving it was attempted and reverted: its golden fold
-/// fixtures encode the 09:15 grid throughout, and rewriting them on a
-/// trading morning to serve a lane nothing runs is the wrong trade.
-///
-/// The residual, stated precisely — and CORRECTED, because the first version
-/// of this note called the failure direction "SAFE" and an adversarial sweep
-/// proved that wrong within the hour. This constant is now NARROWER than the
-/// grid `TfIndex::bucket_start` produces, and the consequence is not merely
-/// under-capture: with the gate at 09:15 and the grid at 09:00, the moved
-/// frames' final buckets end PAST the 15:40 close, so they never seal at
-/// close. `test_final_session_minute_seals_everything_including_d1` measures
-/// it directly — it expects `open_bucket_count() == 0` after the close and
-/// gets **6**. Six buckets per instrument would be carried, unsealed, into
-/// the next day.
-///
-/// That is latent, not live: the lane is `enabled = false`. But "safe" was
-/// the wrong word and is retracted here rather than left standing.
-///
-/// **Re-enabling this lane requires moving this constant to 32_400 AND
-/// regenerating the golden fold fixtures in the same change** — on top of
-/// solving the candle-key collision that stood it down, which is a schema
-/// decision, not a config flip.
+/// Session open, IST seconds-of-day (09:00:00). The local observation window
+/// and its fixtures share the live candle grid. This does not enable the REST
+/// lane or resolve the REST/live candle-key collision described above.
 pub const FOLD_SESSION_OPEN_SECS_OF_DAY_IST: u32 = 32_400;
 
 /// Session close, IST seconds-of-day (15:40:00), exclusive.
@@ -174,7 +141,7 @@ const _: () = assert!(
     "fold session close must equal MARKET_CLOSE_IST_NANOS"
 );
 
-/// Per-(feed, SID, day) catch-up row CAP. A full session is 375 minutes,
+/// Per-(feed, SID, day) catch-up row CAP. A full session is 400 minutes,
 /// so 500 leaves headroom; the query fetches `cap + 1` (the 2026-07-18
 /// LIMIT+1 probe — the tf_consistency/#1630 convention) and `> cap` rows
 /// is the loud truncation tripwire (a partial fold is never trusted; an
@@ -407,15 +374,14 @@ pub enum FoldOutcome {
     /// Bar's minute is ≤ the last folded minute — the caller marks the
     /// (feed, sid, segment, day) dirty for a QuestDB refold instead.
     OutOfOrder,
-    /// Bar's minute lies outside [09:15, 15:30) IST — skipped + counted.
+    /// Bar's minute lies outside [09:00, 15:40) IST — skipped + counted.
     OutOfSession,
 }
 
-/// Effective (session-truncated) end of a TF bucket, IST seconds-of-day.
+/// Effective (session-truncated) end of a TF bucket, IST wall-clock epoch seconds.
 ///
-/// `min(bucket_start + tf_secs, 15:30 close)` — the tf_consistency grid rule;
-/// D1's natural end (next-day 09:15) truncates to the SAME day's close so the
-/// daily candle seals at 15:30 per the operator's demand.
+/// `min(bucket_start + tf_secs, 15:40 close)` — the tf_consistency grid rule.
+/// A tail bucket retains its nominal opening label when its end is truncated.
 pub fn session_truncated_end(tf: TfIndex, bucket_start_ist_secs: u32) -> u32 {
     let day_start = (bucket_start_ist_secs / 86_400) * 86_400;
     let close = day_start + FOLD_SESSION_CLOSE_SECS_OF_DAY_IST;
@@ -429,7 +395,7 @@ pub fn in_session(ist_secs: u32) -> bool {
     (FOLD_SESSION_OPEN_SECS_OF_DAY_IST..FOLD_SESSION_CLOSE_SECS_OF_DAY_IST).contains(&sod)
 }
 
-/// Per-(feed, SID, segment) fold engine: 5 open buckets + ordering watermark.
+/// Per-(feed, SID, segment) fold engine: active buckets + ordering watermark.
 #[derive(Debug)]
 pub struct SidFoldState {
     pub feed: Feed,
@@ -475,8 +441,9 @@ impl SidFoldState {
         }
     }
 
-    /// Folds one 1m bar into all 5 TF buckets, sealing any bucket the bar
-    /// has moved past. O(TF_COUNT) per bar — constant work, cold path.
+    /// Folds one 1m bar into every active minute-scale bucket, sealing any
+    /// bucket the bar has moved past. O(TF_COUNT) per bar on this cold path;
+    /// the configured registry is bounded to ten frames.
     pub fn fold_bar(&mut self, bar: &ConfirmedBar) -> FoldOutcome {
         let minute_secs_i64 = bar.minute_ts_ist_nanos / 1_000_000_000;
         let Ok(minute_secs) = u32::try_from(minute_secs_i64) else {
@@ -505,7 +472,7 @@ impl SidFoldState {
                 Some(existing) if existing.bucket_start_ist_secs == start => {
                     // Same bucket — fold in place. M3: the volume Σ is
                     // SATURATING (counted + coalesced warn) so a poisoned
-                    // vendor volume can never tear the 21-TF state mid-loop
+                    // vendor volume can never tear the multi-frame state mid-loop
                     // or stall the ordering watermark.
                     let vol = match existing.volume.checked_add(bar.volume) {
                         Some(v) => v,
@@ -553,8 +520,8 @@ impl SidFoldState {
                 }
             }
         }
-        // A bar whose minute is the LAST session minute (15:29) closes every
-        // bucket whose effective end == 15:30 — seal them immediately so the
+        // A bar whose minute is the LAST session minute (15:39) closes every
+        // bucket whose effective end == 15:40 — seal them immediately so the
         // final candles never wait for a next-day bar.
         let minute_end = minute_secs.saturating_add(60);
         for tf in TfIndex::ALL {
@@ -634,6 +601,10 @@ pub fn sealed_bucket_to_seal(
         session_open: b.open,
         open_pct: 0.0,
         open_gap_pct: 0.0,
+        metadata: tickvault_trading::candles::CandleMetadata::UNKNOWN,
+        volume_quality: tickvault_trading::candles::volume_update::VOLUME_QUALITY_UNKNOWN_METADATA
+            | tickvault_trading::candles::volume_update::VOLUME_QUALITY_UNCLASSIFIED_NET,
+        bucket_revision: 0,
     };
     BufferedSeal::new(security_id, exchange_segment_code, sealed.tf, state, feed)
 }
@@ -644,7 +615,7 @@ pub fn sealed_bucket_to_seal(
 
 /// Rebuilds a fresh engine from the day-map (minute-ordered — `BTreeMap`
 /// iteration), returning it plus every bucket the refold closed. Pure —
-/// no I/O; ≤375 bars × 5 TFs of constant work (microseconds, cold path).
+/// no I/O; O(rows × TF_COUNT), bounded to 400 minute rows for a valid day-map.
 /// The caller emits the sealed buckets (DEDUP UPSERT heals in place) and
 /// swaps the returned engine over the live one.
 pub fn refold_from_day_map(
@@ -1910,7 +1881,9 @@ async fn refold_day(
     let mut folded_bars: Vec<ConfirmedBar> = Vec::new();
     // PR-2 RAM residency: the whole day's seals, recorded as per-TF blocks
     // AFTER the fold (newest→oldest day order needs the block-prepend path).
-    // ~1.5 seals/bar across the 5 TFs — cold-path, bounded by the row LIMIT.
+    // A complete local day has 702 seals across the seven minute frames.
+    // Sparse inputs may close several frames at once; this cold-path vector
+    // can grow beyond its initial reservation and is bounded by the row limit.
     let mut day_seals: Vec<SealedBucket> = Vec::with_capacity(rows.len().saturating_mul(4));
     for row in &rows {
         let bar = ConfirmedBar {
@@ -2538,11 +2511,8 @@ mod tests {
         assert_eq!(sealed[0].bucket.open, 100.0);
         assert_eq!(sealed[0].bucket.close, 100.5);
 
-        // Every OTHER minute-scale frame is left open. Asserted BY NAME, not
-        // by count: this test previously read "all 5 TFs" and checked `== 4`,
-        // which silently stayed green in spirit but went stale the moment the
-        // frame set grew (M2/M30/M60 joined). A bare count cannot tell you
-        // WHICH frame went missing, so it is the wrong shape for a guard.
+        // Every other active minute frame is left open. Names make both an
+        // omitted requested frame and a reintroduced retired frame visible.
         let mut open: Vec<TfIndex> = TfIndex::ALL
             .into_iter()
             .filter(|tf| e.buckets[*tf as usize].is_some())
@@ -2553,9 +2523,8 @@ mod tests {
             vec![
                 TfIndex::M3,
                 TfIndex::M5,
+                TfIndex::M10,
                 TfIndex::M15,
-                TfIndex::D1,
-                TfIndex::M2,
                 TfIndex::M30,
                 TfIndex::M60,
             ],
@@ -2563,7 +2532,7 @@ mod tests {
         );
         // And NOT one second-scale frame: a 1m bar spans sixty 1s buckets, so
         // folding it into them would fabricate fifty-nine candles that no
-        // trade ever printed. Those frames wait for the GDF 1s feed.
+        // trade ever printed. Those frames require live ticks.
         assert!(
             !open.iter().any(|tf| tf.is_second_scale()),
             "the REST 1m fold must never open a sub-minute bucket"
@@ -2596,15 +2565,43 @@ mod tests {
     }
 
     #[test]
+    fn test_m10_uses_ten_minute_bars_and_separates_the_next_bucket() {
+        let mut e = SidFoldState::new(Feed::Dhan, 13, 0);
+        let bars: Vec<_> = (0..11u32)
+            .map(|minute| {
+                let price = 100.0 + f64::from(minute);
+                bar_at(minute, price, price + 2.0, price - 1.0, price + 1.0, 10)
+            })
+            .collect();
+        let sealed = fold_all(&mut e, &bars);
+        let m10: Vec<_> = sealed.iter().filter(|s| s.tf == TfIndex::M10).collect();
+        assert_eq!(m10.len(), 1, "the eleventh minute opens a new 10m bucket");
+        assert_eq!(m10[0].bucket.bucket_start_ist_secs, OPEN);
+        assert_eq!(m10[0].bucket.open, 100.0);
+        assert_eq!(m10[0].bucket.high, 111.0);
+        assert_eq!(m10[0].bucket.low, 99.0);
+        assert_eq!(m10[0].bucket.close, 110.0);
+        assert_eq!(m10[0].bucket.volume, 100);
+        let next = e.buckets[TfIndex::M10 as usize].expect("next M10 is open");
+        assert_eq!(next.bucket_start_ist_secs, OPEN + 600);
+        assert_eq!(next.open, 110.0);
+        assert_eq!(next.volume, 10);
+        assert!(
+            TfIndex::ALL
+                .into_iter()
+                .filter(|tf| tf.is_second_scale())
+                .all(|tf| e.buckets[tf as usize].is_none())
+        );
+    }
+
+    #[test]
     fn test_ram_hook_catchup_equals_live_fold_ring() {
         use tickvault_trading::in_mem::spot_bar_store::SpotBarStore;
         // PR-2 equality contract: the SAME full-session bar set through the
         // LIVE per-seal upsert hook and the CATCH-UP day-block hook must
         // leave IDENTICAL rings (rehydration-equals-live-fold).
-        // 2026-08-07: 375 -> 385 minutes (NSE CAS change of 2026-08-03). The
-        // FULL session matters here: the live path only populates D1 when the
-        // final in-session bar seals every open bucket, so a short day leaves
-        // the live ring empty for D1 and the parity assert below fires.
+        // The full session exercises the final truncated M3/M15/M30/M60
+        // buckets as well as exact-boundary M1/M5/M10 endings.
         let mut bars = Vec::new();
         // 2026-08-28: 385 -> 400 minutes (fold session open 09:15 -> 09:00).
         for m in 0..400u32 {
@@ -2626,8 +2623,8 @@ mod tests {
         let mut day_seals = fold_all(&mut catchup_engine, &bars);
         day_seals.extend(catchup_engine.force_seal_open());
         ram_store_record_day_into(&catchup_store, Feed::Dhan, 13, 0, &day_seals);
-        // Ring parity per TF (the 15:29 close bar seals everything live too,
-        // so both paths cover all 5 minute-scale TFs; second frames are GDF-gated).
+        // The 15:39 close bar seals every active minute frame in both paths.
+        // Vendor minute bars must leave the second-frame rings empty.
         let key = SlotKey {
             feed: Feed::Dhan,
             security_id: 13,
@@ -2637,7 +2634,7 @@ mod tests {
             let live = live_store.latest_n(key, tf, 10_000);
             let catchup = catchup_store.latest_n(key, tf, 10_000);
             if tf.is_second_scale() {
-                // Second-scale frames are GDF-feed-gated: REST 1m folds never populate them.
+                // REST 1m folds never populate second-scale frames.
                 assert!(live.is_empty(), "no REST live fold for {tf:?}");
                 assert!(catchup.is_empty(), "no REST catch-up fold for {tf:?}");
                 continue;
@@ -2648,7 +2645,7 @@ mod tests {
     }
 
     #[test]
-    fn test_final_session_minute_seals_everything_including_d1() {
+    fn test_final_session_minute_seals_every_active_minute_frame() {
         let mut e = SidFoldState::new(Feed::Dhan, 13, 0);
         // 15:39 is minute offset 374 from 09:15.
         // 2026-08-07: 374 -> 384 (session 375 -> 385 min, NSE CAS 2026-08-03).
@@ -2663,38 +2660,41 @@ mod tests {
         let FoldOutcome::Folded(sealed) = outcome else {
             panic!("expected folded");
         };
-        // Every remaining open bucket seals at close (all 5 TFs' final
-        // buckets end at 15:30 by session truncation).
+        // Every remaining active minute bucket seals at the local close.
         assert_eq!(e.open_bucket_count(), 0);
-        let d1 = sealed
-            .iter()
-            .find(|s| s.tf == TfIndex::D1)
-            .expect("D1 must seal at close");
-        assert_eq!(d1.bucket.open, 100.0);
-        assert_eq!(d1.bucket.close, 200.5);
-        assert_eq!(d1.bucket.bucket_start_ist_secs, OPEN);
-        assert_eq!(d1.bucket.volume, 3);
+        let close = (DAY0 as u32) + FOLD_SESSION_CLOSE_SECS_OF_DAY_IST;
+        for tf in TfIndex::ALL.into_iter().filter(|tf| !tf.is_second_scale()) {
+            let final_start = tf.bucket_start(close - 1);
+            let final_bucket = sealed
+                .iter()
+                .find(|s| s.tf == tf && s.bucket.bucket_start_ist_secs == final_start)
+                .unwrap_or_else(|| panic!("{tf:?} must seal its final bucket at close"));
+            assert_eq!(final_bucket.bucket.open, 200.0);
+            assert_eq!(final_bucket.bucket.close, 200.5);
+            assert_eq!(final_bucket.bucket.volume, 2);
+            assert_eq!(session_truncated_end(tf, final_start), close);
+        }
+        assert!(sealed.iter().all(|s| !s.tf.is_second_scale()));
     }
 
     #[test]
     fn test_session_truncated_end_final_partial_bucket() {
-        // 2026-08-07 (NSE CAS change of 2026-08-03): the session is now 385
-        // minutes, which M15 does NOT divide evenly (385 / 15 = 25.67). The
-        // C2-era comment claimed M15 "fits EXACTLY" at [15:15, 15:30) — that
-        // was true only of the 375-minute session. The final M15 bucket now
-        // opens 15:30 and its natural end (15:45) TRUNCATES to the 15:40
-        // close, so M15 joins D1 as a truncating frame. Same assertion,
-        // materially different reason — worth stating so a future reader
-        // does not "restore" the exact-fit claim.
+        // M15's final bucket opens 15:30 and truncates its natural 15:45
+        // endpoint to the local 15:40 close.
         let start = (DAY0 as u32) + 55_800; // 15:30 — the final M15 bucket
         assert_eq!(
             session_truncated_end(TfIndex::M15, start),
             (DAY0 as u32) + FOLD_SESSION_CLOSE_SECS_OF_DAY_IST,
             "M15 final bucket truncates at the close (natural end 15:45)"
         );
-        // D1's natural next-day end truncates to the same-day close.
+        // M60's final hour retains its 15:00 opening label and truncates too.
         assert_eq!(
-            session_truncated_end(TfIndex::D1, OPEN),
+            session_truncated_end(TfIndex::M60, (DAY0 as u32) + 54_000),
+            (DAY0 as u32) + FOLD_SESSION_CLOSE_SECS_OF_DAY_IST
+        );
+        // M10's final bucket ends exactly at 15:40.
+        assert_eq!(
+            session_truncated_end(TfIndex::M10, start),
             (DAY0 as u32) + FOLD_SESSION_CLOSE_SECS_OF_DAY_IST
         );
         // A mid-session M5 keeps its natural end.
@@ -2931,7 +2931,7 @@ mod tests {
 
         let mut buckets_checked = 0usize;
         for tf in TfIndex::ALL {
-            // Second-scale frames are GDF-feed-gated: REST 1m bars can never
+            // REST 1m bars can never
             // populate a sub-minute bucket, so the fold side has nothing to seal.
             if tf.is_second_scale() {
                 continue;
@@ -2978,11 +2978,11 @@ mod tests {
                 }
             }
         }
-        // 375 M1 + 75 M5 + ... — a full day must check hundreds of buckets;
-        // guard against a vacuous pass.
-        assert!(
-            buckets_checked > 400,
-            "golden compare must cover the full day ({buckets_checked} buckets)"
+        // Independent ceil(400 / minutes) counts across exactly the seven
+        // active minute frames: 400 + 134 + 80 + 40 + 27 + 14 + 7.
+        assert_eq!(
+            buckets_checked, 702,
+            "golden comparison must cover every active minute-frame bucket"
         );
     }
 
@@ -3315,7 +3315,7 @@ mod tests {
         assert_eq!(state.day_map_len(), 1);
 
         // First bar of the NEXT trading day: the fold transition-seals the
-        // old day's residue (incl. its D1) and the map restarts. Today has
+        // old day's open minute buckets and the map restarts. Today has
         // reached day1, so the roll is legal (round-3 clamp).
         let LiveBarAction::Folded(sealed) =
             state.apply_live_bar(&next_day_bar_at(0, 2.0, 2.0, 2.0, 2.0, 1), day1_date())
@@ -3325,8 +3325,8 @@ mod tests {
         assert!(
             sealed
                 .iter()
-                .any(|s| s.tf == TfIndex::D1 && s.bucket.bucket_start_ist_secs == OPEN),
-            "old day's D1 residue must seal on the day roll"
+                .any(|s| s.tf == TfIndex::M60 && s.bucket.bucket_start_ist_secs == OPEN),
+            "old day's M60 residue must seal on the day roll"
         );
         assert_eq!(state.day_map_len(), 1, "day-map restarts for the new day");
         let day1 = state.current_day().expect("rolled day set");

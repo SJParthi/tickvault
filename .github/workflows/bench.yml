@@ -166,8 +166,9 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$rc"
 
-      # Save the baseline whenever the benches completed and there was NO
-      # confident regression (gate_rc != '2'). An absolute-budget hardware
+      # Save only recognized completed measurements (gate_rc 0 or 1).
+      # Missing/invalid measurements (3 or absent) never seed a baseline,
+      # including an operator reset. An absolute-budget hardware
       # misfit (rc=1) does NOT starve the cache — otherwise dev-calibrated
       # budgets failing forever on slower runners would mean the baseline is
       # never saved and the regression arm never activates (deadlock). A >5%
@@ -179,8 +180,9 @@ jobs:
       - name: Save Criterion baseline (benches ok, no regression)
         if: >-
           always() && steps.bench.outcome == 'success' &&
-          (steps.gate.outputs.gate_rc != '2' ||
-           (github.event_name == 'workflow_dispatch' && inputs.reset_baseline == true))
+          (steps.gate.outputs.gate_rc == '0' || steps.gate.outputs.gate_rc == '1' ||
+           (steps.gate.outputs.gate_rc == '2' &&
+            github.event_name == 'workflow_dispatch' && inputs.reset_baseline == true))
         uses: actions/cache/save@v6
         with:
           path: target/criterion

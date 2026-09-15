@@ -6,8 +6,8 @@
 # individual test running longer than a minute is almost certainly
 # blocked on a network read that was supposed to be mocked.
 #
-# `terminate-after` gives the test 10 seconds to print its panic hook
-# before nextest SIGKILLs it.
+# `terminate-after` counts slow-timeout periods: two periods mean 120s
+# in the default profile and 180s in CI, before termination handling.
 
 [profile.default]
 # Per-test timeout. Tests that exceed this are killed and reported FAIL.

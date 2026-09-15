@@ -49,15 +49,36 @@ fn production_sources(crate_src: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Strip `#[cfg(test)]` modules so an inline test call site cannot satisfy the
-/// guard. Brace-counting from the `mod tests` that follows the attribute is
-/// enough here: these modules are the last item in their file and are not
-/// nested inside another `cfg(test)` block.
+/// Keep the prefix before the first top-level test module. Inline test probes
+/// and top-level test constants do not end production code. These source files
+/// put production wiring before their test modules, so cutting at the module
+/// excludes test call sites without hiding the rest of a production function.
 fn strip_cfg_test_modules(text: &str) -> String {
-    let Some(idx) = text.find("#[cfg(test)]") else {
+    let Some((idx, _)) = text
+        .match_indices("#[cfg(test)]\nmod ")
+        .find(|(idx, _)| *idx == 0 || text.as_bytes()[*idx - 1] == b'\n')
+    else {
         return text.to_string();
     };
     text[..idx].to_string()
+}
+
+#[test]
+fn source_scan_keeps_production_after_inline_test_attributes() {
+    let fixture = concat!(
+        "fn drain() {\n    #[cfg(test)]\n    let probe = 0;\n}\n",
+        "#[cfg(test)]\nconst TEST_CLOCK: u64 = 0;\n",
+        "fn production_tail() {}\n",
+        "#[cfg(test)]\nmod tests { fn test_only_tail() {} }\n",
+    );
+    let production = strip_cfg_test_modules(fixture);
+    assert!(production.contains("fn production_tail() {}"));
+    assert!(!production.contains("fn test_only_tail() {}"));
+    assert_eq!(
+        strip_cfg_test_modules("fn production_only() {}"),
+        "fn production_only() {}"
+    );
+    assert!(strip_cfg_test_modules("#[cfg(test)]\nmod tests {}\n").is_empty());
 }
 
 fn app_src() -> PathBuf {

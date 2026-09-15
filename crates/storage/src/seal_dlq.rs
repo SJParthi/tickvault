@@ -1,7 +1,7 @@
 //! Wave 6 Sub-PR #1 item 1.2d — sealed-candle NDJSON dead-letter queue.
 //!
 //! Third absorption tier of the locked Wave 6 design L-C1:
-//! `SealRing` (in-memory FIFO) → `SealSpillWriter` (binary 128-byte
+//! `SealRing` (in-memory FIFO) → `SealSpillWriter` (versioned binary
 //! disk records) → `SealDlqWriter` (this module — NDJSON last-resort).
 //!
 //! ## Why NDJSON for the third tier
@@ -28,7 +28,9 @@
 //!   without re-deriving the trading-side `BufferedSeal`.
 //! - [`SealDlqWriter`] — append-only NDJSON file writer with the
 //!   exact `seal_spill.rs` API surface:
-//!   - IST-date file rotation (`seals-2026-05-10.ndjson`).
+//!   - IST-date file rotation (`seals-2026-05-10.cseal4json`).
+//!     New metadata-bearing records are hidden from rollback binaries; new
+//!     boot recovery also accepts legacy `.ndjson` records.
 //!   - `append_record()` (one line per call).
 //!   - `read_all()` recovery scan that silently drops corrupt
 //!     lines with `warn!` so a single bad line does NOT stall replay.
@@ -58,11 +60,20 @@ use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
 use tickvault_common::feed::Feed;
 
 use crate::seal_spill::SerializedSeal;
+use crate::shadow_seal_columns::LEGACY_VOLUME_BASIS;
+use tickvault_trading::candles::CANDLE_SIGNED_BAR_VS_ONE_LOT_METRIC;
+use tickvault_trading::candles::volume_update::VOLUME_QUALITY_LEGACY_BASIS;
 
 /// Production DLQ directory — sibling of `data/spill/` so operators
 /// looking at `data/` see all three absorption tiers next to each
 /// other (`logs/`, `spill/`, `dlq/`).
 const SEAL_DLQ_DIR: &str = "data/dlq";
+/// Rollback binaries recognize only `.ndjson`. Keep metadata-bearing records
+/// outside their discovery namespace so they cannot replay then archive them
+/// while discarding the pinned bucket definition.
+pub const SEAL_DLQ_V3_EXTENSION: &str = "cseal3json";
+/// New signed whole-bar records cannot be consumed by v3 rollback readers.
+pub const SEAL_DLQ_V4_EXTENSION: &str = "cseal4json";
 
 /// JSON-serialisable mirror of [`SerializedSeal`]. Field names are
 /// stable wire format for `jq` operability — every new field MUST
@@ -71,7 +82,7 @@ const SEAL_DLQ_DIR: &str = "data/dlq";
 ///
 /// Field-by-field correspondence with `SerializedSeal`:
 /// - `security_id`, `exchange_segment_code` — composite key (I-P1-11).
-/// - `tf_ordinal` — `TfIndex::as_ordinal()` (0..=20).
+/// - `tf_ordinal` — durable `TfIndex::storage_ordinal()`, never a dense runtime index.
 /// - `bucket_start_ist_secs`, `tick_count`, `volume`,
 ///   `bucket_start_cumulative`, `oi`, `open`, `high`, `low`, `close`
 ///   — `LiveCandleState` payload.
@@ -84,6 +95,22 @@ const SEAL_DLQ_DIR: &str = "data/dlq";
 // path, so a `Clone`-only record is fine — every conversion uses `&self`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SealDlqRecord {
+    /// Missing or unrecognized basis is legacy, never silently current.
+    #[serde(default)]
+    pub volume_basis: String,
+    /// Historical records without these fields remain unknown on replay.
+    #[serde(default)]
+    pub lot_size: u32,
+    #[serde(default)]
+    pub instrument_definition_version: u64,
+    #[serde(default)]
+    pub underlying_id: u64,
+    #[serde(default)]
+    pub family_code: u8,
+    #[serde(default = "unknown_metadata_quality")]
+    pub volume_quality: u32,
+    #[serde(default)]
+    pub bucket_revision: u64,
     // `u64` (2026-06-29 widening) — the seal DLQ carries BOTH Dhan (≤u32) and
     // Groww (bit-62 index ids > u32) seals; NDJSON round-trips u64 natively.
     #[serde(default)]
@@ -112,7 +139,7 @@ pub struct SealDlqRecord {
     pub close: f64,
     #[serde(default)]
     pub close_pct_from_prev_day: f64,
-    /// Tick-rule signed order flow (see `SerializedSeal::net_volume_signed`).
+    /// Versioned signed cache (see `SerializedSeal::net_volume_signed`).
     /// Replaced `bucket_open_prev_close` on 2026-09-10 — that was the retired
     /// scheme's sign baseline and had no production reader anywhere.
     ///
@@ -147,6 +174,10 @@ pub struct SealDlqRecord {
     pub feed: String,
 }
 
+fn unknown_metadata_quality() -> u32 {
+    tickvault_trading::candles::volume_update::VOLUME_QUALITY_UNKNOWN_METADATA
+}
+
 impl From<&SerializedSeal> for SealDlqRecord {
     /// Lossless conversion from the binary spill record to the
     /// JSON-serialisable DLQ record. `O(1)`, zero allocation
@@ -154,6 +185,18 @@ impl From<&SerializedSeal> for SealDlqRecord {
     #[inline]
     fn from(s: &SerializedSeal) -> Self {
         Self {
+            volume_basis: if s.volume_quality & VOLUME_QUALITY_LEGACY_BASIS != 0 {
+                LEGACY_VOLUME_BASIS
+            } else {
+                CANDLE_SIGNED_BAR_VS_ONE_LOT_METRIC
+            }
+            .to_owned(),
+            lot_size: s.metadata.lot_size,
+            instrument_definition_version: s.metadata.instrument_definition_version,
+            underlying_id: s.metadata.underlying_id,
+            family_code: s.metadata.family_code,
+            volume_quality: s.volume_quality,
+            bucket_revision: s.bucket_revision,
             security_id: s.security_id,
             exchange_segment_code: s.exchange_segment_code,
             // Round-trip feed provenance through the DLQ NDJSON.
@@ -187,6 +230,19 @@ impl From<&SealDlqRecord> for SerializedSeal {
     #[inline]
     fn from(r: &SealDlqRecord) -> Self {
         Self {
+            metadata: tickvault_trading::candles::CandleMetadata {
+                lot_size: r.lot_size,
+                instrument_definition_version: r.instrument_definition_version,
+                underlying_id: r.underlying_id,
+                family_code: r.family_code,
+            },
+            volume_quality: r.volume_quality
+                | if r.volume_basis == CANDLE_SIGNED_BAR_VS_ONE_LOT_METRIC {
+                    0
+                } else {
+                    VOLUME_QUALITY_LEGACY_BASIS
+                },
+            bucket_revision: r.bucket_revision,
             security_id: r.security_id,
             exchange_segment_code: r.exchange_segment_code,
             // Pre-feed DLQ records have feed="" → Feed::Dhan (backward-compatible);
@@ -214,10 +270,10 @@ impl From<&SealDlqRecord> for SerializedSeal {
     }
 }
 
-/// Returns today's IST date in `seals-YYYY-MM-DD.ndjson` form for the
+/// Returns today's IST date in `seals-YYYY-MM-DD.cseal4json` form for the
 /// DLQ filename. Pure function for testability (clock injected by
 /// caller in tests). Mirrors `seal_spill::ist_date_filename` but with
-/// the `.ndjson` suffix.
+/// the JSON suffix. The new suffix prevents older readers discarding metadata.
 fn ist_date_filename(now_unix_secs: i64) -> String {
     // `IST_UTC_OFFSET_SECONDS` per data-integrity.md — 19_800.
     let ist_secs = now_unix_secs.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
@@ -225,7 +281,7 @@ fn ist_date_filename(now_unix_secs: i64) -> String {
         .timestamp_opt(ist_secs, 0)
         .single()
         .unwrap_or_else(|| Utc.timestamp_opt(0, 0).single().unwrap_or_default());
-    dt.format("seals-%Y-%m-%d.ndjson").to_string()
+    format!("{}.{}", dt.format("seals-%Y-%m-%d"), SEAL_DLQ_V4_EXTENSION)
 }
 
 /// Append-only NDJSON DLQ writer. One instance lives in the writer
@@ -402,7 +458,12 @@ pub fn dlq_bytes_at(dlq_dir: &Path) -> u64 {
     };
     entries
         .flatten()
-        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("ndjson"))
+        .filter(|e| {
+            matches!(
+                e.path().extension().and_then(|s| s.to_str()),
+                Some("ndjson" | SEAL_DLQ_V3_EXTENSION | SEAL_DLQ_V4_EXTENSION)
+            )
+        })
         .filter_map(|e| e.metadata().ok())
         .map(|m| m.len())
         .sum()
@@ -424,6 +485,10 @@ mod tests {
 
     fn mk_serialized_seal(sid: u64, seg: u8, tf: u8, bucket: u32, close: f64) -> SerializedSeal {
         SerializedSeal {
+            metadata: tickvault_trading::candles::CandleMetadata::UNKNOWN,
+            volume_quality:
+                tickvault_trading::candles::volume_update::VOLUME_QUALITY_UNKNOWN_METADATA,
+            bucket_revision: 0,
             security_id: sid,
             exchange_segment_code: seg,
             feed: Feed::Dhan,
@@ -438,7 +503,7 @@ mod tests {
             low: 99.0,
             close,
             close_pct_from_prev_day: 1.5,
-            net_volume_signed: -4_242,
+            net_volume_signed: -424,
             net_volume_classified: true,
             total_buy_qty: 89_600,
             total_sell_qty: 4_800,
@@ -446,6 +511,65 @@ mod tests {
             change_pct: 1.5,
             open_gap_pct: 0.8,
         }
+    }
+
+    #[test]
+    fn legacy_dlq_metadata_stays_unknown_and_new_bucket_definition_round_trips() {
+        let legacy: SealDlqRecord = serde_json::from_str(
+            r#"{"security_id":913,"net_volume_signed":-10,"net_volume_classified":true}"#,
+        )
+        .expect("old JSON remains readable");
+        let restored = SerializedSeal::from(&legacy);
+        assert_eq!(
+            restored.metadata,
+            tickvault_trading::candles::CandleMetadata::UNKNOWN
+        );
+        assert_eq!(
+            restored.volume_quality,
+            unknown_metadata_quality() | VOLUME_QUALITY_LEGACY_BASIS
+        );
+        assert_eq!(restored.bucket_revision, 0);
+        let mut original = mk_serialized_seal(913, 1, 0, 1_716_000_900, 102.5);
+        original.metadata = tickvault_trading::candles::CandleMetadata {
+            lot_size: 75,
+            instrument_definition_version: 7,
+            underlying_id: 13,
+            family_code: 2,
+        };
+        original.volume_quality = 32;
+        original.bucket_revision = 19;
+        let json = serde_json::to_string(&SealDlqRecord::from(&original)).expect("JSON");
+        let parsed: SealDlqRecord = serde_json::from_str(&json).expect("read JSON");
+        assert_eq!(SerializedSeal::from(&parsed), original);
+    }
+
+    #[test]
+    fn old_dlq_cache_with_complete_metadata_is_still_legacy_after_forwarding() {
+        let mut old = serde_json::to_value(SealDlqRecord::from(&mk_serialized_seal(
+            913,
+            1,
+            0,
+            1_716_000_900,
+            102.5,
+        )))
+        .expect("fixture");
+        old.as_object_mut().expect("object").remove("volume_basis");
+        old["volume_quality"] = serde_json::json!(0);
+        let old: SealDlqRecord = serde_json::from_value(old).expect("legacy JSON");
+        let decoded = SerializedSeal::from(&old);
+        assert_ne!(decoded.volume_quality & VOLUME_QUALITY_LEGACY_BASIS, 0);
+        assert_eq!(decoded.net_volume_signed, -424);
+        assert_eq!(
+            decoded
+                .try_into_buffered_seal()
+                .expect("active")
+                .state
+                .net_volume(),
+            None
+        );
+        let forwarded = SealDlqRecord::from(&decoded);
+        assert_eq!(forwarded.volume_basis, LEGACY_VOLUME_BASIS);
+        assert_eq!(SerializedSeal::from(&forwarded), decoded);
     }
 
     fn temp_dlq_dir(name: &str) -> PathBuf {
@@ -570,6 +694,7 @@ mod tests {
             "low",
             "close",
             "close_pct_from_prev_day",
+            "volume_basis",
             "net_volume_signed",
             "net_volume_classified",
             "total_buy_qty",
@@ -621,6 +746,10 @@ mod tests {
         // i64 OI can be negative for short positions; pct fields can
         // be negative on red days — JSON round-trip MUST preserve.
         let s = SerializedSeal {
+            metadata: tickvault_trading::candles::CandleMetadata::UNKNOWN,
+            volume_quality:
+                tickvault_trading::candles::volume_update::VOLUME_QUALITY_UNKNOWN_METADATA,
+            bucket_revision: 0,
             security_id: 25,
             exchange_segment_code: 1,
             feed: Feed::Dhan,
@@ -651,15 +780,15 @@ mod tests {
     }
 
     #[test]
-    fn test_ist_date_filename_uses_ndjson_suffix() {
+    fn test_ist_date_filename_uses_rollback_isolated_json_suffix() {
         let utc_noon = chrono::Utc
             .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
             .single()
             .expect("valid")
             .timestamp();
         let name = ist_date_filename(utc_noon);
-        assert_eq!(name, "seals-2026-01-01.ndjson");
-        assert!(name.ends_with(".ndjson"));
+        assert_eq!(name, "seals-2026-01-01.cseal4json");
+        assert!(name.ends_with(".cseal4json"));
     }
 
     #[test]
@@ -671,7 +800,7 @@ mod tests {
             .expect("valid")
             .timestamp();
         let name = ist_date_filename(utc);
-        assert_eq!(name, "seals-2026-05-10.ndjson");
+        assert_eq!(name, "seals-2026-05-10.cseal4json");
     }
 
     #[test]
@@ -697,7 +826,7 @@ mod tests {
             .expect("valid")
             .timestamp();
         let p = writer.dlq_path(utc_noon);
-        assert!(p.to_string_lossy().ends_with("seals-2026-05-10.ndjson"));
+        assert!(p.to_string_lossy().ends_with("seals-2026-05-10.cseal4json"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -924,12 +1053,16 @@ mod tests {
         assert_eq!(dlq_bytes_at(&dir), 0, "empty dir is zero");
 
         std::fs::write(dir.join("seals-2026-08-19.ndjson"), vec![0_u8; 700]).expect("w1");
-        std::fs::write(dir.join("seals-2026-08-18.ndjson"), vec![0_u8; 300]).expect("w2");
+        std::fs::write(dir.join("seals-2026-08-18.cseal3json"), vec![0_u8; 300]).expect("w2");
         // A foreign file must not inflate the DLQ signal — a false "the DLQ
         // is growing" reading would send an operator hunting a non-incident.
         std::fs::write(dir.join("notes.txt"), vec![0_u8; 999_999]).expect("w3");
 
-        assert_eq!(dlq_bytes_at(&dir), 1000, "only .ndjson records count");
+        assert_eq!(
+            dlq_bytes_at(&dir),
+            1000,
+            "legacy and metadata-bearing JSON both count"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

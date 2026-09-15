@@ -914,6 +914,11 @@ async fn async_main() -> Result<()> {
             std::process::exit(1);
         }
     };
+    let ws_wal_maintenance = tickvault_storage::ws_frame_spill::WalMaintenance::from_guard(
+        ws_wal_guard
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("WAL maintenance requires a held directory claim"))?,
+    )?;
 
     // Replay first — this MUST happen before any WS connection opens so we
     // never race a fresh append against a stale segment rotation.
@@ -960,10 +965,16 @@ async fn async_main() -> Result<()> {
     // below confirms in that case, and confirming archives the staged
     // leftovers UNREAD. The refusal is most likely on exactly the full-disk
     // boot, which is the boot that can least afford to lose them.
-    let mut ws_wal_replay_refused = false;
-    match tickvault_storage::ws_frame_spill::replay_all_fenced(&ws_wal_path) {
+    let ws_wal_replay_refused;
+    // This receipt belongs to this exact staged batch. Never resolve the
+    // latest replay generation later, after another replay may have run.
+    let ws_wal_replay_confirmation_id;
+    let mut ws_wal_replay_unconsumed_frames = 0u64;
+    match ws_wal_maintenance.replay_fenced() {
         Ok(batch) => {
-            ws_wal_replay_refused = batch.stopped_for_disk || batch.stopped_for_frame_cap;
+            ws_wal_replay_refused =
+                batch.stopped_for_disk || batch.stopped_for_frame_cap || batch.stopped_for_memory;
+            ws_wal_replay_confirmation_id = batch.confirmation_id;
             let recovered = batch.frames;
             if recovered.is_empty() {
                 info!(dir = %ws_wal_dir, "STAGE-C: WAL replay — no residual frames");
@@ -999,15 +1010,17 @@ async fn async_main() -> Result<()> {
                         }
                     }
                 }
+                // The receipt covers every transport in this pass. Keep the
+                // unsupported count beside the live subset through handoff.
+                ws_wal_replay_unconsumed_frames = ord.saturating_add(truedata);
                 info!(
                     dir = %ws_wal_dir,
                     total = live + ord + truedata,
                     live_feed = live,
                     order_update = ord,
                     truedata_feed = truedata,
-                    "STAGE-C: WAL replay recovered residual frames — both types are \
-                     pre-retirement residue with no live consumer (PR-C3, 2026-07-14): \
-                     counted loudly at STAGE-C.2b, then archived (raw frames stay on disk)"
+                    "STAGE-C: WAL replay read retained frames; originals remain \
+                     unconfirmed until every transport is consumed and its rows land"
                 );
                 // PR-C3 round-2 review (2026-07-14, MEDIUM): the
                 // tv_ws_frame_wal_replay_total increments that lived HERE
@@ -1018,10 +1031,15 @@ async fn async_main() -> Result<()> {
             }
         }
         Err(err) => {
+            // A failed pass has not proved that staged segments were read.
+            // Keep them eligible for replay; the later no-refold branch must
+            // not archive unread data merely because no batch was returned.
+            ws_wal_replay_refused = true;
+            ws_wal_replay_confirmation_id = 0;
             error!(
                 ?err,
                 dir = %ws_wal_dir,
-                "STAGE-C: WAL replay failed — continuing boot with fresh WAL"
+                "STAGE-C: WAL replay failed — retaining staged segments unconfirmed"
             );
         }
     }
@@ -1721,7 +1739,8 @@ async fn async_main() -> Result<()> {
     // boot arms) — deliberately NOT the Dhan-lane periodic health loop,
     // which never runs on a Groww-only boot. Prunes once at task start
     // (each daily prod boot reclaims immediately), then every 6 h.
-    tokio::spawn(async {
+    let ws_wal_prune = ws_wal_maintenance.clone();
+    tokio::spawn(async move {
         use std::time::Duration;
         // Monotonic, so the pressure floor cannot be defeated by a wall-clock
         // jump (NTP step, DST, a container clock correction).
@@ -1729,8 +1748,7 @@ async fn async_main() -> Result<()> {
         let mut last_pressure_reclaim_secs: Option<u64> = None;
         loop {
             let wal_dir = tickvault_app::boot_helpers::ws_wal_dir();
-            let _outcome = tickvault_storage::ws_frame_spill::prune_archived_segments(
-                &wal_dir,
+            let _outcome = ws_wal_prune.prune_archived_segments(
                 tickvault_common::constants::WS_WAL_ARCHIVE_RETENTION_SECS,
                 tickvault_common::constants::WS_WAL_ARCHIVE_MAX_BYTES,
             );
@@ -1747,8 +1765,7 @@ async fn async_main() -> Result<()> {
             //
             // Rides this same loop for the same reason the spill sweep does:
             // same cadence, same cold path, one fewer task to supervise.
-            let _active = tickvault_storage::ws_frame_spill::prune_active_segments(
-                &wal_dir,
+            let _active = ws_wal_prune.prune_active_segments(
                 tickvault_common::constants::WS_WAL_ACTIVE_RETENTION_SECS,
                 tickvault_storage::ws_frame_spill::ws_wal_active_max_bytes(&wal_dir),
             );
@@ -2380,7 +2397,8 @@ async fn async_main() -> Result<()> {
 
     // Daily 15:40 IST timeframe-consistency verifier — PROCESS-GLOBAL like
     // the conservation audit + scoreboard above (operator 2026-07-13):
-    // recompute every higher-TF candle (3m..15m) from the stored 1m rows and
+    // recompute the six higher-minute frames (3m, 5m, 10m, 15m, 30m, 60m)
+    // from the stored 1m rows and
     // compare against the persisted TF tables — Dhan verifies TODAY, Groww
     // verifies the PREVIOUS trading day (TF-VERIFY-01/02). Gated on
     // `[tf_consistency] enabled` + trading-day inside the task; the
@@ -2520,8 +2538,7 @@ async fn async_main() -> Result<()> {
             "STAGE-C.2b: residual OrderUpdate WAL frames from a pre-retirement session have \
              no consumer (the order-update WS spawn + its drain were retired 2026-07-14 per \
              the Dhan noise lock; the trading pipeline is dormant until the live-trading \
-             re-wire) — counted and archived with the WAL segments; the raw JSON frames \
-             remain on disk in the archive for forensic replay"
+             re-wire) — the original segments remain unconfirmed and cannot be archived"
         );
         metrics::counter!(
             "tv_ws_frame_wal_reinjected_dropped_total",
@@ -2550,49 +2567,22 @@ async fn async_main() -> Result<()> {
     // socket opens. The re-fold is DEDUP-idempotent: `capture_seq` is read back
     // from the WAL record rather than re-stamped.
     //
-    // This block now fires ONLY when the frames have nowhere to go — the lane
-    // is disabled, so nothing will ever fold them. That is still real loss and
-    // still says so; what changed is that it is no longer the normal path.
+    // A disabled lane cannot consume these frames this boot. Keep the full
+    // generation in the recovery path rather than confirming a cleared Vec.
     if !ws_wal_replay_live_feed.is_empty() && !dhan_lane_will_refold {
         let dropped = ws_wal_replay_live_feed.len() as u64;
-        // 2026-08-11 — this message was written on 2026-07-14, when it was
-        // true: the Dhan live WS had just been retired, nothing appended
-        // LiveFeed frames, and anything found here really was pre-retirement
-        // residue being tidied away.
-        //
-        // It stopped being true when the live lane came back and became the
-        // WAL's first frame producer since that retirement. These frames can
-        // now be TODAY'S — captured minutes ago by a session that died — and
-        // the operator reading "residual ... from a pre-retirement session"
-        // would file it as housekeeping rather than as data loss.
-        //
-        // CORRECTED 2026-08-19: the parenthetical "(the fold path takes a
-        // live ring, not a replay batch)" is FALSE since 2026-08-15 —
-        // `refold_wal_frames` takes precisely a replay batch, and the guard
-        // above (`dhan_lane_will_refold`) is why this block no longer fires on
-        // the normal path. It survived inside a block whose CONDITION had
-        // already been narrowed around it, which is how a comment outlives the
-        // fact it described.
-        //
-        // The block itself is still correct and still a real drop: it fires
-        // ONLY when the lane will not run, and then nothing will ever fold
-        // these frames. The message below is accurate for that branch.
         error!(
             code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
             frames = dropped,
-            "STAGE-C.2b: {dropped} captured live-feed frames were replayed from the \
-             write-ahead log and DROPPED — there is no re-fold path, so the ticks and candles \
-             they contain are NOT in the database. The raw frames are preserved in the WAL \
-             archive and can be recovered manually. If this session followed an unclean stop \
-             during market hours, this is real data loss for that window, not leftover residue \
-             from an old session."
+            "STAGE-C.2b: {dropped} captured live-feed frames cannot be folded because \
+             the lane is disabled. Their original WAL segments remain unconfirmed \
+             for a later replay; this boot has not recovered their ticks or candles."
         );
         metrics::counter!(
             "tv_ws_frame_wal_reinjected_dropped_total",
             "ws_type" => "live_feed"
         )
         .increment(dropped);
-        ws_wal_replay_live_feed.clear();
     }
     if dhan_lane_will_refold && !ws_wal_replay_live_feed.is_empty() {
         // DELIBERATELY NOT CONFIRMING HERE (2026-08-21).
@@ -2621,30 +2611,30 @@ async fn async_main() -> Result<()> {
              lane will fold these frames and confirm them itself. A crash before that \
              replays them again next boot rather than losing them."
         );
-    } else if ws_wal_replay_refused {
-        // The pass was REFUSED before it read anything. Segments an earlier
-        // boot staged are still in `replaying/`, unread; confirming would
-        // archive them with a zero count. Leave them for a boot with the disk
-        // and the frame budget to read them. The refusal itself already
-        // fired a coded error in the storage layer.
+    } else if ws_wal_replay_refused
+        || ws_wal_replay_unconsumed_frames > 0
+        || !ws_wal_replay_live_feed.is_empty()
+    {
         warn!(
-            "STAGE-C: the WAL replay was refused (disk floor or per-boot frame cap), so \
-             nothing staged is confirmed — `replaying/` is left exactly as found for the \
-             next boot"
+            generation = ws_wal_replay_confirmation_id,
+            unconsumed_frames = ws_wal_replay_unconsumed_frames,
+            live_frames = ws_wal_replay_live_feed.len(),
+            "STAGE-C: replay was refused or frames remain unconsumed — the \
+             original generation is retained unconfirmed for the next replay"
         );
     } else {
-        // No refold is coming — either the lane will not run (the frames were
-        // just dropped loudly above) or there were none. Archiving here is
-        // correct and necessary: NOT confirming would re-stage the same
-        // unreadable segments on every boot forever (the WS-REINJECT-01
-        // growth-storm class).
-        //
-        // Honest envelope (round-2 note, 2026-07-14): this also runs when
-        // `replay_all` itself ERRORED above — segments staged but never read
-        // are archived with a zero count (raw frames preserved on disk, count
-        // lost).
-        let confirm_ws_wal_path = tickvault_app::boot_helpers::ws_wal_dir();
-        tickvault_storage::ws_frame_spill::confirm_replayed(&confirm_ws_wal_path);
+        // Only a successful pass with no returned frames of ANY transport
+        // can be confirmed without a consuming lane.
+        if ws_wal_replay_confirmation_id == 0 {
+            tracing::debug!(
+                "STAGE-C: no WAL replay receipt was issued — no staged segments confirmed"
+            );
+        } else if !ws_wal_maintenance.confirm_replayed_generation(ws_wal_replay_confirmation_id) {
+            error!(
+                generation = ws_wal_replay_confirmation_id,
+                "STAGE-C: WAL replay confirmation refused — retaining unconfirmed segments"
+            );
+        }
     }
 
     // =======================================================================
@@ -2906,6 +2896,9 @@ async fn async_main() -> Result<()> {
             // opens; DEDUP-idempotent via the replay-stable `capture_seq`.
             // Empty on a clean boot.
             wal_replay_live_feed: std::mem::take(&mut ws_wal_replay_live_feed),
+            wal_replay_confirmation_id: ws_wal_replay_confirmation_id,
+            wal_replay_unconsumed_frames: ws_wal_replay_unconsumed_frames,
+            wal_maintenance: Some(ws_wal_maintenance.clone()),
             // DEFAULT-OFF: with `live_subscription_from_master = false` (the
             // shipped value) this returns the same 4 hardcoded index SIDs the
             // lane has always used, so the operator's 2026-08-11 third-quote
@@ -3261,8 +3254,12 @@ const SEAL_ESCALATION_SHUTDOWN_BUDGET: std::time::Duration =
 /// How often the shutdown poll re-checks whether the escalation thread is done.
 const SEAL_ESCALATION_JOIN_POLL: std::time::Duration = std::time::Duration::from_millis(10); // APPROVED: this IS the named constant the rule asks for
 
-fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConfig) {
-    use tickvault_storage::seal_writer_loop::{run_seal_writer_loop, seal_drain_interval};
+async fn spawn_seal_writer_loop(
+    questdb_config: &tickvault_common::config::QuestDbConfig,
+) -> Result<()> {
+    use tickvault_storage::seal_writer_loop::{
+        run_seal_writer_loop_with_boot_ready, seal_drain_interval,
+    };
     use tickvault_storage::seal_writer_runner::SealWriterRunner;
 
     // MEASURED AND RAISED 2026-08-20 — the old value was a live ceiling, not
@@ -3459,9 +3456,17 @@ fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConf
                     "seal writer loop already installed (idempotent skip) — first installer \
                      wins; this runner will not be spawned"
                 );
+                anyhow::bail!("duplicate seal writer startup cannot bypass the recovery barrier");
             } else {
+                let (boot_ready_tx, boot_ready_rx) = tokio::sync::oneshot::channel();
                 let handle = tokio::spawn(async move {
-                    run_seal_writer_loop(runner, seal_drain_interval(), cancel_rx).await
+                    run_seal_writer_loop_with_boot_ready(
+                        runner,
+                        seal_drain_interval(),
+                        cancel_rx,
+                        Some(boot_ready_tx),
+                    )
+                    .await
                 });
                 if let Ok(mut slot) = SEAL_WRITER_HANDLE.lock() {
                     *slot = Some(handle);
@@ -3471,15 +3476,29 @@ fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConf
                     max_drain_per_cycle = SEAL_MAX_DRAIN_PER_CYCLE,
                     "seal writer task spawned — Engine B candle sealing enabled"
                 );
+                // The REST catch-up and Dhan producers start only after this
+                // await. They must not open spill/DLQ descriptors while boot
+                // recovery stages or archives those same daily files.
+                let boot = boot_ready_rx.await.map_err(|err| {
+                    anyhow::anyhow!("seal writer stopped before recovery completed: {err}")
+                })?;
+                tracing::info!(
+                    files_left_pending = boot.files_left_pending,
+                    discovery_errors = boot.discovery_errors,
+                    pending_count_unknown = boot.pending_count_unknown,
+                    "seal recovery pass finished — live seal producers may now start"
+                );
             }
         }
         Err(err) => {
             tracing::error!(
                 ?err,
-                "failed to construct SealWriterRunner — candles will NOT seal this session"
+                "failed to construct SealWriterRunner — refusing boot before seal producers start"
             );
+            return Err(err);
         }
     }
+    Ok(())
 }
 
 /// Spawns the RELOCATED scoreboard IST-midnight reset task (stage-3 dead-WS
@@ -3744,10 +3763,12 @@ async fn build_shared_infra(
     // tables must be ensured WITH `DEDUP ENABLE UPSERT KEYS` before the
     // REST-era bar-fold's first seal can reach ILP, or a fresh QuestDB
     // volume auto-creates them WITHOUT DEDUP (silent duplicate-row window
-    // — the bug the PR-C2/#1581 lane deletions left behind). Bounded by
-    // the module's 60s quiet-probe; a down QuestDB skips the DDL loudly.
+    // — the bug the PR-C2/#1581 lane deletions left behind). Probe and ensure
+    // retries are bounded; a down QuestDB fails shared startup.
+    // Failure stops startup before writer recovery or candle producers can
+    // auto-create a schema without volume provenance or its DEDUP key.
     // Ordering pinned by crates/app/tests/ensure_ddl_boot_wiring_guard.rs.
-    tickvault_app::candle_ddl_boot::run_candle_ddl_at_boot(&config.questdb).await;
+    tickvault_app::candle_ddl_boot::run_candle_ddl_at_boot(&config.questdb).await?;
 
     // --- `ticks` DDL — the SAME reasoning, and it had NO caller at all ---
     //
@@ -3817,7 +3838,7 @@ async fn build_shared_infra(
     .await;
 
     // --- Seal-writer (installs the process-wide global_seal_sender) ---
-    spawn_seal_writer_loop(&config.questdb);
+    spawn_seal_writer_loop(&config.questdb).await?;
 
     // --- Scoreboard IST-midnight resets (RELOCATED, stage-3 sweep) ---
     spawn_scoreboard_midnight_reset_task();
@@ -3919,11 +3940,12 @@ async fn build_shared_infra(
     }
 
     // --- REST-era candle derivation (operator directive 2026-07-16) ---
-    // Folds persist-confirmed `spot_1m_rest` 1m bars into all 21 `candles_*`
-    // timeframes through the shared seal-writer channel installed just above
+    // Folds persist-confirmed `spot_1m_rest` 1m bars into the seven supported
+    // minute frames (1m, 3m, 5m, 10m, 15m, 30m, 60m) through the shared
+    // seal-writer channel installed just above
     // (the seal chain is no longer dormant — this is its REST-era producer),
-    // plus a boot catch-up over the stored month. Config-gated (fail-safe
-    // serde default OFF; base.toml opts in); supervised; cold path only.
+    // plus a boot catch-up over the configured window. Config-gated (fail-safe
+    // serde default OFF; base.toml also leaves it OFF); supervised; cold path only.
     // FOLD-01 runbook: .claude/rules/project/rest-candle-fold-error-codes.md
     if config.rest_candle_fold.enabled {
         let (fold_bar_tx, fold_bar_rx) =
@@ -3938,8 +3960,8 @@ async fn build_shared_infra(
             info!(
                 catchup_days = config.rest_candle_fold.catchup_days,
                 "rest_candle_fold: REST-era candle derivation ARMED — spot legs hand \
-                 off persist-confirmed 1m bars; boot catch-up re-folds the stored \
-                 month into all 21 timeframes (candles_1m..candles_1d populate again)"
+                 off persist-confirmed 1m bars; boot catch-up re-folds the configured \
+                 window into seven supported minute frames (1m, 3m, 5m, 10m, 15m, 30m, 60m)"
             );
         } else {
             // LOW: first-wins refusal — a duplicate install means a second
@@ -4047,11 +4069,15 @@ async fn build_shared_infra(
     let router = tickvault_api::build_router_with_auth(
         api_state,
         &config.api.allowed_origins,
-        api_auth_config,
+        api_auth_config.clone(),
         // 2026-07-04 operator quote: flag accepted-but-IGNORED — the feed
         // toggle is bearer-protected in ALL modes (see
         // websocket-connection-scope-lock.md). Kept to avoid a cascade.
         config.strategy.dry_run,
+    )
+    .merge(
+        tickvault_app::candle_top_volume_api::build_candle_top_volume_router(api_auth_config)
+            .layer(tickvault_api::build_cors_layer(&config.api.allowed_origins)),
     );
     let bind_addr: SocketAddr = format_bind_addr(&config.api.host, config.api.port)
         .parse()

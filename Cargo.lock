@@ -4123,6 +4123,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arc-swap",
+ "arrayvec",
  "aws-config",
  "aws-sdk-s3",
  "axum",

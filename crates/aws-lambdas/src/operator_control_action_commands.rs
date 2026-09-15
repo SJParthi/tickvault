@@ -1,12 +1,82 @@
-//! AUTO-GENERATED action command goldens for the operator-control port —
-//! captured by RUNNING the legacy oracle's `lambda_handler`
-//! (`deploy/aws/lambda/operator-control/handler.py`) with a stubbed
-//! `_ssm_shell` (`scratchpad/w4-dump-actions.py`), NEVER hand-transcribed.
-//! Byte-exact with the SSM command lists each action dispatches.
+//! Operator action command lists, originally captured from the legacy oracle.
+//! Subsequent reviewed safety fixes are maintained here and exercised by the
+//! operator-control regressions; these are the command lists actually dispatched.
 
-/// legacy: `lambda_handler wipe-questdb cmds` (handler.py:1126-1197) — captured from the RUNNING oracle.
-pub const WIPE_QUESTDB_COMMANDS: [&str; 10] = [
+/// Read-only preparation for the wipe. Strict catalog parsing happens BEFORE
+/// stopping the app or removing replay data. The original target manifest is
+/// retained for verification even if a table disappears from the later catalog.
+///
+/// Framing the raw curl stream avoids command substitution dropping NUL bytes
+/// or trailing blank rows. A unique final success record must follow a complete
+/// CSV response; an HTTP/transport failure cannot be hidden by a valid-looking
+/// body. Both CSV parsers reject extra fields, records, and malformed framing.
+pub(crate) const WIPE_QUESTDB_PREPARE_COMMAND: &str = r#"QDB='http://127.0.0.1:9000'
+WIPE_REQUIRED_TARGETS='ticks market_depth candles_1m prev_day_ohlcv rest_spot_1m rest_option_chain_1m rest_option_contract_1m rest_fetch_audit'
+qdb_wipe_csv() {
+  if curl -fsS --max-time "$2" --get --data-urlencode "query=$1" "$QDB/exp" 2>/dev/null; then
+    printf '\n__TICKVAULT_WIPE_CURL_OK__\n'
+  else
+    printf '\n__TICKVAULT_WIPE_CURL_ERROR__\n'
+  fi
+}
+wipe_targets() {
+  qdb_wipe_csv 'SELECT table_name FROM tables()' 15 | LC_ALL=C awk '
+    { sub(/\r$/, "") }
+    NR == 1 { if ($0 != "\"table_name\"") invalid = 1; next }
+    $0 == "__TICKVAULT_WIPE_CURL_OK__" {
+      if (footer) invalid = 1
+      footer = NR
+      next
+    }
+    $0 == "" { if (blank) invalid = 1; blank = NR; next }
+    {
+      if (footer || blank) invalid = 1
+      if ($0 !~ /^"[A-Za-z_][A-Za-z0-9_]*"$/) { invalid = 1; next }
+      $0 = substr($0, 2, length($0) - 2)
+      if (seen[$0]++) invalid = 1
+      if ($0=="ticks" || $0=="market_depth" || index($0,"candles_")==1 || $0=="prev_day_ohlcv" || $0=="rest_spot_1m" || $0=="rest_option_chain_1m" || $0=="rest_option_contract_1m" || $0=="rest_fetch_audit") targets[++n] = $0
+    }
+    END {
+      if (invalid || !footer || footer != NR || (blank && blank != NR - 1) || !n) exit 1
+      for (i = 1; i <= n; i++) print targets[i]
+    }
+  '
+}
+qc() {
+  case "$1" in
+    ticks|market_depth|prev_day_ohlcv|rest_spot_1m|rest_option_chain_1m|rest_option_contract_1m|rest_fetch_audit|candles_*) ;;
+    *) return 1 ;;
+  esac
+  case "$1" in *[!A-Za-z0-9_]*) return 1 ;; esac
+  qdb_wipe_csv "SELECT count() AS count FROM $1" 5 | LC_ALL=C awk '
+    { sub(/\r$/, "") }
+    NR == 1 { if ($0 != "\"count\"") invalid = 1; next }
+    NR == 2 {
+      if ($0 !~ /^(0|[1-9][0-9]*)$/) invalid = 1
+      count = $0
+      next
+    }
+    NR == 3 && $0 == "" { blank = 1; next }
+    $0 == "__TICKVAULT_WIPE_CURL_OK__" && (NR == 3 || (NR == 4 && blank)) { footer = 1; next }
+    { invalid = 1 }
+    END { if (!invalid && footer && (NR == 3 || NR == 4)) print count; else exit 1 }
+  '
+}
+TARGETS=$(wipe_targets) || { echo 'WIPE-PARTIAL: target catalog could not be verified; no wipe started'; exit 1; }
+TARGETS=$(printf '%s\n' "$TARGETS" | LC_ALL=C sort -u) || { echo 'WIPE-PARTIAL: target manifest could not be prepared; no wipe started'; exit 1; }
+for t in $WIPE_REQUIRED_TARGETS; do
+  if ! printf '%s\n' "$TARGETS" | grep -Fxq -- "$t"; then
+    echo "WIPE-PARTIAL: required table $t is absent; no wipe started"
+    exit 1
+  fi
+done
+WIPE_MANIFEST_READY=1
+WIPE_TRUNCATES_OK=0"#;
+
+/// Legacy wipe action with reviewed catalog preflight and complete verification.
+pub const WIPE_QUESTDB_COMMANDS: [&str; 11] = [
     r#"set +e"#,
+    WIPE_QUESTDB_PREPARE_COMMAND,
     r#"systemctl stop tickvault || true"#,
     r#"systemctl disable tickvault || true"#,
     r#"rm -rf /opt/tickvault/data/ws_wal /opt/tickvault/data/groww /opt/tickvault/data/spill /opt/tickvault/data/dlq /opt/tickvault/data/instrument-cache 2>/dev/null || true"#,
@@ -16,15 +86,11 @@ pub const WIPE_QUESTDB_COMMANDS: [&str; 10] = [
     // this element WAS a 17-line embedded interpreter program dispatched via
     // SSM RunCommand to the prod box — i.e. the banned runtime EXECUTING in
     // production. Re-expressed as curl + POSIX shell with the SAME semantics:
-    // same dynamic table discovery, same target predicate, same TRUNCATE per
+    // same dynamic target policy, same TRUNCATE per
     // target, same WIPE-TARGETS / TRUNCATED / TRUNCATE-FAILED stdout markers.
-    // Table discovery uses QuestDB's CSV endpoint (/exp) instead of /exec so
-    // the names parse with `tail`+`tr` and need no JSON reader on the box;
-    // `curl --get --data-urlencode` performs the same URL encoding the old
-    // program's quote() did. The independent WIPE-RESULT/WIPE-COMPLETE
-    // verification tail (next elements) is unchanged and still proves the
-    // counts actually reached zero — a botched wipe reports WIPE-PARTIAL,
-    // never a silent success.
+    // The preparation command validates the CSV catalog and every identifier
+    // before any mutation. The verification tail counts every captured target
+    // plus targets discovered after restart, including every candles_* table.
     //
     // 2026-09-05: `market_depth` was MISSING from both halves -- the target
     // predicate and the verification tail -- so `wipe-questdb` truncated
@@ -39,16 +105,44 @@ pub const WIPE_QUESTDB_COMMANDS: [&str; 10] = [
     // It is in BOTH halves now. Verification-only would have been worse than
     // useless: the tool would report WIPE-PARTIAL forever while never
     // truncating the table it complains about.
-    r#"QDB='http://127.0.0.1:9000'
-ALL=$(curl -fsS --max-time 15 --get --data-urlencode 'query=SELECT table_name FROM tables()' "$QDB/exp" | tail -n +2 | tr -d '"\r' | sed '/^$/d')
-TARGETS=$(printf '%s\n' "$ALL" | awk '$0=="ticks" || $0=="market_depth" || index($0,"candles_")==1 || $0=="prev_day_ohlcv" || $0=="rest_spot_1m" || $0=="rest_option_chain_1m" || $0=="rest_option_contract_1m" || $0=="rest_fetch_audit"' | sort)
-echo "WIPE-TARGETS $(printf '%s\n' "$TARGETS" | sed '/^$/d' | wc -l | tr -d ' ') $(printf '%s\n' "$TARGETS" | sed '/^$/d' | paste -sd' ' -)"
+    r#"echo "WIPE-TARGETS $(printf '%s\n' "$TARGETS" | wc -l | tr -d ' ') $(printf '%s\n' "$TARGETS" | paste -sd' ' -)"
+WIPE_TRUNCATES_OK=1
 for t in $TARGETS; do
-  if curl -fsS --max-time 30 --get --data-urlencode "query=TRUNCATE TABLE $t" "$QDB/exec" >/dev/null; then echo "TRUNCATED $t"; else echo "TRUNCATE-FAILED $t"; fi
+  if curl -fsS --max-time 30 --get --data-urlencode "query=TRUNCATE TABLE $t" "$QDB/exec" >/dev/null; then echo "TRUNCATED $t"; else echo "TRUNCATE-FAILED $t"; WIPE_TRUNCATES_OK=0; fi
 done"#,
     r#"systemctl enable tickvault || true"#,
     r#"systemctl start tickvault || true"#,
-    r#"sleep 3; qc() { curl -fsS "http://127.0.0.1:9000/exec?query=SELECT%20count()%20FROM%20$1" 2>/dev/null | grep -o '\[\[[0-9]*' | grep -o '[0-9]*'; }; T=$(qc ticks); D=$(qc market_depth); C=$(qc candles_1m); P=$(qc prev_day_ohlcv); S=$(qc rest_spot_1m); O=$(qc rest_option_chain_1m); K=$(qc rest_option_contract_1m); A=$(qc rest_fetch_audit); echo "WIPE-RESULT ticks=${T:-?} market_depth=${D:-?} candles_1m=${C:-?} prev_day_ohlcv=${P:-?} rest_spot_1m=${S:-?} rest_option_chain_1m=${O:-?} rest_option_contract_1m=${K:-?} rest_fetch_audit=${A:-?}"; if [ "${T:-0}" = 0 ] && [ "${D:-0}" = 0 ] && [ "${C:-0}" = 0 ] && [ "${P:-0}" = 0 ] && [ "${S:-0}" = 0 ] && [ "${O:-0}" = 0 ] && [ "${K:-0}" = 0 ] && [ "${A:-0}" = 0 ]; then echo WIPE-COMPLETE; else echo 'WIPE-PARTIAL: rows remain — inspect the counts + TRUNCATE-FAILED lines above'; fi"#,
+    // Unknown is never zero. Verify the union of original and current targets:
+    // disappearing tables still get counted (and fail), while new candle
+    // tables cannot escape through a representative candles_1m-only check.
+    // App restart and concurrent writers mean these are observed counts, not
+    // an atomic snapshot or a promise that rows cannot appear afterwards.
+    r#"sleep 3
+if [ "${WIPE_MANIFEST_READY:-0}" != 1 ] || [ -z "${TARGETS:-}" ]; then
+  echo 'WIPE-PARTIAL: original target manifest is unavailable'
+  exit 1
+fi
+CURRENT_TARGETS=$(wipe_targets) || { echo 'WIPE-PARTIAL: verification catalog could not be verified'; exit 1; }
+VERIFY_TARGETS=$(printf '%s\n' "$TARGETS" "$CURRENT_TARGETS" | LC_ALL=C sort -u) || { echo 'WIPE-PARTIAL: verification manifest could not be prepared'; exit 1; }
+WIPE_PARTIAL=0
+if [ "${WIPE_TRUNCATES_OK:-0}" != 1 ]; then WIPE_PARTIAL=1; fi
+printf 'WIPE-RESULT'
+for t in $VERIFY_TARGETS; do
+  if COUNT=$(qc "$t"); then
+    if [ "$COUNT" != 0 ]; then WIPE_PARTIAL=1; fi
+  else
+    COUNT='?'
+    WIPE_PARTIAL=1
+  fi
+  printf ' %s=%s' "$t" "$COUNT"
+done
+printf '\n'
+if [ "$WIPE_PARTIAL" = 0 ]; then
+  echo WIPE-COMPLETE
+else
+  echo 'WIPE-PARTIAL: rows remain or a count could not be verified — inspect the counts + TRUNCATE-FAILED lines above'
+  exit 1
+fi"#,
 ];
 
 /// legacy: `lambda_handler docker-reset cmds` (handler.py:1258-1306) — captured from the RUNNING oracle.

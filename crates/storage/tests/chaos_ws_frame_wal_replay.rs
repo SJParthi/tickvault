@@ -1,43 +1,16 @@
-//! STAGE-D P7 — Chaos: SIGKILL + WAL replay, all 4 WS types.
+//! In-process WAL replay after a clean writer shutdown, plus tail truncation.
 //!
-//! Simulates the exact failure mode we want the zero-tick-loss guarantee to
-//! survive: a previous `tickvault` process received SIGKILL mid-session and
-//! died with frames still in the WS reader's hot path. The WAL segment on
-//! disk contains whatever hit `write(2)` before the kill. A fresh process
-//! comes up, calls `WsFrameSpill::replay_all`, and MUST recover every
-//! durable frame across all 4 WebSocket types (LiveFeed / Depth-20 /
-//! Depth-200 / OrderUpdate).
+//! The fixture writes LiveFeed and OrderUpdate frames, explicitly drains and
+//! stops the writer, and checks complete payloads, transport tags and replay
+//! confirmation behavior. It does not send SIGKILL, restart an OS process,
+//! test all endpoint types, query QuestDB, or simulate power loss. Those need
+//! distinct experiments. The truncation case appends a partial record and
+//! checks that earlier valid payloads remain available.
 //!
-//! Unlike the old `chaos_sigkill_replay.rs` (which targets the legacy tick
-//! spill file), this test exercises the new `WsFrameSpill` WAL introduced
-//! in Stage C. It DOES NOT simulate the crash via `fork()` — cargo test
-//! can't reliably do that cross-platform. Instead, the test:
-//!
-//!   1. Opens a fresh `WsFrameSpill` in a temp dir.
-//!   2. Calls `append()` with frames representing all 4 WS types.
-//!   3. Drops the spill, which joins the writer thread and flushes the
-//!      segment — the on-disk state after this Drop is identical to the
-//!      state a kernel would leave behind after a SIGKILL that occurred
-//!      after the last `write(2)` syscall but before the next one.
-//!   4. Calls `replay_all()` on the same dir via a fresh process-like
-//!      code path.
-//!   5. Asserts that every frame comes back with the correct WsType tag
-//!      and payload, and that the archive directory holds the replayed
-//!      segment.
-//!
-//! This is P7 scenarios 5 and 11 from the plan:
-//!   - Scenario 5: "SIGKILL the process mid-ingestion — WAL survives,
-//!     restart replays, QuestDB has all frames"
-//!   - Scenario 11: "Corrupted WAL record (truncated or bad CRC) —
-//!     record skipped, counter incremented, replay continues"
-//!
-//! Runs in normal CI (no `#[ignore]`) because it uses only in-process
-//! temp dirs — no Docker, no network, no privileged ops. Execution
-//! takes ~200 ms on a cold machine.
+//! Uses owned temporary directories without network or Docker access.
 
 #![cfg(test)]
 
-use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tickvault_storage::ws_frame_spill::{
@@ -78,15 +51,14 @@ fn build_order_update_frame(marker: u32) -> Vec<u8> {
         .into_bytes()
 }
 
-/// **P7 Scenario 5** — full 4-type SIGKILL replay: all frames must
-/// come back with the correct `WsType` tag and exact payload.
+/// Clean drain preserves both fixture transport types and complete payloads.
 #[test]
-fn chaos_sigkill_ws_frame_wal_recovers_all_four_types() {
-    let dir = chaos_tmp("all-4-types");
+fn chaos_clean_shutdown_wal_replays_live_and_order_payloads_until_confirmed() {
+    let dir = chaos_tmp("live-and-order");
 
-    // Simulated pre-crash writer session: append frames of every type.
+    // One in-process writer session, containing exactly two transport types.
     {
-        let spill = Arc::new(WsFrameSpill::new(&dir).expect("WsFrameSpill::new"));
+        let spill = WsFrameSpill::new(&dir).expect("WsFrameSpill::new");
 
         // 50 LiveFeed frames with distinct markers
         for i in 0..50u32 {
@@ -106,17 +78,11 @@ fn chaos_sigkill_ws_frame_wal_recovers_all_four_types() {
             assert_eq!(outcome, AppendOutcome::Spilled);
         }
 
-        // Let the background writer thread drain the crossbeam channel.
-        // In production the spill's Drop joins the writer thread; here
-        // we wait explicitly so the segment file is flushed before we
-        // walk the directory for replay.
-        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(spill.shutdown(Duration::from_secs(5)), 0);
         drop(spill);
-        // After drop, the writer thread has finished its drain loop.
-        std::thread::sleep(Duration::from_millis(50));
     }
 
-    // "Fresh process" — call replay_all on the same dir.
+    // Replay through the public API in this same process.
     let recovered = replay_all(&dir).expect("replay_all");
     assert_eq!(
         recovered.len(),
@@ -127,7 +93,20 @@ fn chaos_sigkill_ws_frame_wal_recovers_all_four_types() {
     // Partition by ws_type and verify per-type counts + payload integrity.
     let mut live = 0usize;
     let mut ord = 0usize;
-    for rec in &recovered {
+    for (index, rec) in recovered.iter().enumerate() {
+        let (expected_type, expected_frame) = if index < 50 {
+            (WsType::LiveFeed, build_live_feed_frame(index as u32))
+        } else {
+            (
+                WsType::OrderUpdate,
+                build_order_update_frame(3000 + (index - 50) as u32),
+            )
+        };
+        assert_eq!(rec.ws_type, expected_type, "transport tag at index {index}");
+        assert_eq!(
+            rec.frame, expected_frame,
+            "complete payload at index {index}"
+        );
         match rec.ws_type {
             WsType::LiveFeed => {
                 assert_eq!(rec.frame.len(), 16, "LiveFeed frame must be 16 bytes");
@@ -168,7 +147,12 @@ fn chaos_sigkill_ws_frame_wal_recovers_all_four_types() {
         "P7 Scenario 5 (crash-safe): un-confirmed segments MUST re-replay"
     );
 
-    // Now confirm (caller proved durable re-capture) → archive → no re-replay.
+    for (first, repeated) in recovered.iter().zip(&second_no_confirm) {
+        assert_eq!(repeated.ws_type, first.ws_type);
+        assert_eq!(repeated.frame, first.frame);
+    }
+
+    // Confirm within this fixture → archive → no re-replay. There is no DB write.
     confirm_replayed(&dir);
     let third_after_confirm = replay_all(&dir).expect("replay_all idempotent after confirm");
     assert_eq!(
@@ -197,16 +181,15 @@ fn chaos_wal_corrupted_tail_is_skipped_and_prior_records_recovered() {
 
     // Append 10 valid frames through the normal writer.
     {
-        let spill = Arc::new(WsFrameSpill::new(&dir).expect("WsFrameSpill::new"));
+        let spill = WsFrameSpill::new(&dir).expect("WsFrameSpill::new");
         for i in 0..10u32 {
             assert_eq!(
                 spill.append(WsType::LiveFeed, build_live_feed_frame(i)),
                 AppendOutcome::Spilled
             );
         }
-        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(spill.shutdown(Duration::from_secs(5)), 0);
         drop(spill);
-        std::thread::sleep(Duration::from_millis(50));
     }
 
     // Find the segment file and append corrupted garbage to its tail —
@@ -243,8 +226,11 @@ fn chaos_wal_corrupted_tail_is_skipped_and_prior_records_recovered() {
     );
     for (i, rec) in recovered.iter().enumerate() {
         assert!(matches!(rec.ws_type, WsType::LiveFeed));
-        let sid = u32::from_le_bytes(rec.frame[4..8].try_into().unwrap());
-        assert_eq!(sid as usize, i, "security_id marker survives replay");
+        assert_eq!(
+            rec.frame,
+            build_live_feed_frame(i as u32),
+            "complete payload"
+        );
     }
 
     let _ = std::fs::remove_dir_all(&dir);

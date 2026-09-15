@@ -81,6 +81,10 @@ jobs:
           fi
           echo "Fuzz matrix matches fuzz/Cargo.toml ($count targets)."
 
+      - name: Verify fuzz failures and missing evidence fail the gate
+        shell: bash
+        run: bash scripts/fuzz-gate.selftest.sh
+
   fuzz:
     needs: fuzz-target-drift
     name: "Fuzz Targets (${{ matrix.target }})"
@@ -121,8 +125,11 @@ jobs:
 
       - name: Build fuzz target (${{ matrix.target }})
         id: build
+        shell: bash
         if: steps.check.outputs.exists == 'true'
         run: |
+          set -euo pipefail
+          # An unspecified Linux shell is bash -e, which lets tee hide failure.
           cargo +${{ env.NIGHTLY_VERSION }} fuzz build ${{ matrix.target }} 2>&1 | tee /tmp/fuzz-build.log || {
             echo "build_failed=true" >> "$GITHUB_OUTPUT"
             echo "::error::Fuzz target ${{ matrix.target }} failed to BUILD (not a crash). Check nightly compatibility."
@@ -133,6 +140,7 @@ jobs:
 
       - name: Run fuzz target (${{ matrix.target }})
         id: fuzz
+        shell: bash
         if: steps.check.outputs.exists == 'true' && steps.build.outcome == 'success'
         env:
           # PR #288 (#8 + Phase 12.3): scheduled runs use 3600s (1h), 12x the
@@ -141,14 +149,26 @@ jobs:
           # per aws-budget.md. Manual dispatch can go higher for deep runs.
           FUZZ_SECS: ${{ github.event.inputs.fuzz_duration_secs || '3600' }}
         run: |
+          set -euo pipefail
+          case "$FUZZ_SECS" in
+            ''|*[!0-9]*) echo "::error::fuzz duration must be integer seconds"; exit 1 ;;
+          esac
+          if [ "${#FUZZ_SECS}" -gt 5 ] || [ "$FUZZ_SECS" -lt 1 ] || [ "$FUZZ_SECS" -gt 21600 ]; then
+            echo "::error::fuzz duration must be between 1 and 21600 seconds"
+            exit 1
+          fi
+          # Interpret leading zeroes as decimal, not shell octal.
+          FUZZ_SECS=$((10#$FUZZ_SECS))
           # -rss_limit_mb=4096: increase RSS limit for ASan-instrumented builds.
           # -max_total_time=$FUZZ_SECS: stop after N seconds if no crash found.
-          # outer `timeout` matches to prevent runaway.
-          timeout "${FUZZ_SECS}" cargo +${{ env.NIGHTLY_VERSION }} fuzz run ${{ matrix.target }} \
+          # Outer timeout has grace for Cargo startup and final reporting.
+          # Hitting it is incomplete evidence, never "no crashes found".
+          timeout --kill-after=15s "$((FUZZ_SECS + 60))" cargo +${{ env.NIGHTLY_VERSION }} fuzz run ${{ matrix.target }} \
             -- -max_total_time="${FUZZ_SECS}" -rss_limit_mb=4096 2>&1 | tee /tmp/fuzz-run.log || {
             EXIT_CODE=${PIPESTATUS[0]}
             if [ "$EXIT_CODE" -eq 124 ]; then
-              echo "Fuzz run completed (timeout reached — no crashes found)"
+              echo "::error::Fuzz harness exceeded its outer timeout; campaign incomplete"
+              exit 1
             else
               echo "=== Fuzz run failed (exit code $EXIT_CODE) ==="
               echo "=== Last 50 lines ==="
@@ -164,6 +184,11 @@ jobs:
               fi
             fi
           }
+          # A successful launcher with no executed inputs is also not a pass.
+          if ! grep -Eq '^#[1-9][0-9]*[[:space:]]+DONE([[:space:]]|$)' /tmp/fuzz-run.log; then
+            echo "::error::Fuzzer exited without nonzero completed-execution evidence"
+            exit 1
+          fi
 
       - name: Upload crash artifacts
         if: failure() && steps.fuzz.outputs.fuzz_crashed == 'true'

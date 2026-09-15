@@ -138,7 +138,10 @@ fn a_zero_dwell_is_recordable_and_does_not_poison_the_maximum() {
 #[test]
 fn the_gauge_is_published_and_the_recorder_is_wired_into_the_drain() {
     let src = include_str!("../src/dhan_feed_stack.rs");
-    let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+    let production = src
+        .split_once("\n#[cfg(test)]\nmod tests {")
+        .expect("the stack's top-level test module must delimit production source")
+        .0;
     assert!(
         production.contains("record_ring_dwell(queued_nanos)"),
         "the drain must record the dwell it already computes — without this \

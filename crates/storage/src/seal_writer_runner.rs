@@ -626,6 +626,9 @@ pub struct SealWriterRunner {
     spill_dir: std::path::PathBuf,
     /// DLQ directory — same reasoning as `spill_dir`.
     dlq_dir: std::path::PathBuf,
+    /// Consumed by the first boot attempt or live drain. Recovery never
+    /// regains its producer-exclusion contract after live processing starts.
+    boot_recovery_available: bool,
 }
 
 impl SealWriterRunner {
@@ -647,6 +650,7 @@ impl SealWriterRunner {
             max_drain_per_cycle,
             spill_dir: production_spill_dir(),
             dlq_dir: production_dlq_dir(),
+            boot_recovery_available: true,
         })
     }
 
@@ -678,6 +682,7 @@ impl SealWriterRunner {
             max_drain_per_cycle,
             spill_dir,
             dlq_dir,
+            boot_recovery_available: true,
         }
     }
 
@@ -689,12 +694,29 @@ impl SealWriterRunner {
     /// read back by anything — see the module docs on
     /// [`crate::seal_writer_task::drain_recovered_seals`].
     pub fn boot_drain(&mut self) -> BootDrainOutcome {
-        drain_recovered_seals(
+        if !std::mem::replace(&mut self.boot_recovery_available, false) {
+            tracing::error!(
+                code =
+                    tickvault_common::error_code::ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                "seal recovery refused outside its one-time boot exclusion — no files inspected or mutated"
+            );
+            return BootDrainOutcome {
+                ordering_exclusion_unverified: true,
+                pending_count_unknown: true,
+                ..Default::default()
+            };
+        }
+        // main.rs awaits the boot result before starting every managed candle
+        // producer. This ownership is deliberately absent from live drains.
+        self.writer.set_boot_recovery_exclusive(true);
+        let outcome = drain_recovered_seals(
             &mut self.writer,
             &self.spill_dir,
             &self.dlq_dir,
             self.max_drain_per_cycle,
-        )
+        );
+        self.writer.set_boot_recovery_exclusive(false);
+        outcome
     }
 
     /// Spill directory this runner recovers from (test observability).
@@ -753,6 +775,7 @@ impl SealWriterRunner {
     /// `try_recv` is a non-blocking sync method. The future tokio
     /// loop in 1.2f.5 wraps this in `tokio::time::interval`.
     pub fn run_one_cycle(&mut self, now_unix_secs: i64) -> CycleOutcome {
+        self.boot_recovery_available = false;
         let mut outcome = CycleOutcome::default();
 
         // Step 1: drain mpsc → pipeline.submit
@@ -846,6 +869,39 @@ mod tests {
         state.total_buy_qty = 89_600;
         state.total_sell_qty = 4_800;
         BufferedSeal::new(sid, seg, tf, state, Feed::Dhan)
+    }
+
+    #[test]
+    fn recovery_scope_cannot_be_reopened_after_boot_or_a_live_drain() {
+        for live_first in [false, true] {
+            let (spill, dlq) = temp_pair(&format!("boot-exclusion-{live_first}"));
+            let mut runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 2, 8, 16);
+            if live_first {
+                let _ = runner.run_one_cycle(jan1_noon_utc());
+            } else {
+                assert!(runner.boot_drain().is_clean());
+            }
+            let name = "seals-2026-01-01.cseal4";
+            let bytes = crate::seal_spill::SerializedSeal::from(&mk_seal(
+                13,
+                0,
+                TfIndex::M1,
+                1_716_023_700,
+                100.0,
+            ))
+            .to_bytes();
+            std::fs::write(spill.join(name), bytes).expect("late original");
+            let refused = runner.boot_drain();
+            assert!(refused.ordering_exclusion_unverified);
+            assert!(refused.pending_count_unknown);
+            assert_eq!(refused.files_staged, 0);
+            assert_eq!(refused.files_archived, 0);
+            assert_eq!(
+                std::fs::read(spill.join(name)).expect("unstaged original"),
+                bytes
+            );
+            cleanup(&spill, &dlq);
+        }
     }
 
     #[test]

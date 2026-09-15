@@ -1,4 +1,4 @@
-//! `tv-guarantees` — the self-verifying guarantee report.
+//! `tv-guarantees` — source evidence and limitations report (legacy command name).
 //!
 //! Operator demand (2026-08-18, verbatim, typos preserved): *"Ensure to use
 //! one and only RUST O(1) in the entire workspace codebase except frontend
@@ -8,38 +8,30 @@
 //! working guaranteed assurance solution"*, and *"table level comapriosn view
 //! where even any humans can udnerstand"*.
 //!
-//! This binary exists because every one of those sentences is really the same
-//! request: **stop being told, start being shown.** Every number below is
-//! MEASURED from the working tree at the moment of the run. Nothing is
-//! hardcoded from a document, because a document cannot stay true — this
-//! repository has now recorded four separate corrections to a single row of a
-//! table in `CLAUDE.md`, each caused by re-reading the row instead of the code.
+//! This command inventories source and configuration and evaluates selected
+//! static predicates. It also includes authored design explanations and prior
+//! benchmark observations. It does not run the referenced tests, benchmarks,
+//! AWS checks or database queries, and it cannot guarantee production behavior.
 //!
-//! # The three verdicts, and why there are three
+//! # Evidence labels
 //!
-//! A two-state PASS/FAIL report would have to lie about this system, so it
-//! does not use one:
-//!
-//! - **GUARANTEED** — mechanically enforced by a build-failing ratchet. If it
-//!   regresses, CI goes red. This is the only class that is a promise.
-//! - **BOUNDED** — genuinely not O(1), by nature, with a NAMED constraint and
-//!   a known ceiling. Honest and safe, but never to be relabelled O(1).
-//! - **IMPOSSIBLE** — the literal demand contradicts arithmetic. Reported as
-//!   such, with the reason, and never quietly dropped from the list.
-//!
-//! The third class is the load-bearing one. `CLAUDE.md`'s own non-O(1) table
-//! carries the warning this binary is built around: *"a partial disclosure
-//! reads exactly like a complete one"*. A report that silently omitted the
-//! impossible rows would read exactly like a report where everything passed.
+//! - **STATIC CHECK** — this invocation evaluated a source/config predicate
+//!   successfully. The predicate's scope is stated in the row; it is not an
+//!   executed test suite, a runtime measurement or proof of an entire claim.
+//! - **REFERENCE** — an inventory or authored claim without a pass/fail
+//!   predicate here. Named tests still need to be executed separately.
+//! - **BOUNDED** — a stated limit or design tradeoff. This label does not
+//!   establish that production stays inside the limit.
+//! - **IMPOSSIBLE** — a literal requirement conflicts with arithmetic.
+//! - **BROKEN** — an evaluated static predicate failed.
 //!
 //! # Exit codes
 //!
-//! - `0` — every GUARANTEED row holds.
-//! - `1` — at least one GUARANTEED row is BROKEN. Suitable as a CI gate.
+//! - `0` — no evaluated static predicate failed; references remain unverified.
+//! - `1` — at least one static predicate failed, or the git index was unreadable.
 //!
-//! BOUNDED and IMPOSSIBLE rows never fail the run. They are facts about the
-//! problem, not defects, and a gate that failed on them would be permanently
-//! red and therefore permanently ignored.
+//! Reference, bounded and impossible rows do not change the exit code. A zero
+//! exit status is not a live-health, correctness, complexity or test-pass promise.
 //!
 //! # Invocation
 //!
@@ -54,23 +46,26 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// How much a row can be promised.
+/// The evidence or limitation represented by a row.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Verdict {
-    /// Enforced by a build-failing ratchet.
-    Guaranteed,
-    /// Not O(1) by nature; constraint named, ceiling known.
+    /// A predicate over source/configuration evaluated by this invocation.
+    StaticCheck,
+    /// Inventory or authored explanation; no pass/fail predicate was run.
+    Reference,
+    /// A stated bound or tradeoff, not a runtime verification.
     Bounded,
     /// The literal demand contradicts arithmetic.
     Impossible,
-    /// A GUARANTEED row that no longer holds. Fails the run.
+    /// An evaluated static predicate failed. Fails the run.
     Broken,
 }
 
 impl Verdict {
     fn label(self) -> &'static str {
         match self {
-            Self::Guaranteed => "GUARANTEED",
+            Self::StaticCheck => "STATIC CHECK",
+            Self::Reference => "REFERENCE",
             Self::Bounded => "BOUNDED",
             Self::Impossible => "IMPOSSIBLE",
             Self::Broken => "** BROKEN **",
@@ -78,7 +73,7 @@ impl Verdict {
     }
 }
 
-/// One measured row of the report.
+/// One source-derived or authored row of the report.
 struct Row {
     what: String,
     verdict: Verdict,
@@ -651,7 +646,7 @@ fn count_lines_containing(root: &Path, needles: &[&str]) -> usize {
 /// Inlined rather than linked: the artifact host blocks every external origin
 /// but Google Fonts, and a stylesheet that silently fails to load produces a
 /// page that looks broken rather than one that looks unstyled.
-const HTML_HEAD: &str = r##"<title>TickVault Guarantee Ledger</title>
+const HTML_HEAD: &str = r##"<title>TickVault Source Evidence</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
 <style>
@@ -744,7 +739,14 @@ fn render_html(sections: &[(&str, &[Row])]) -> String {
         .iter()
         .filter(|r| r.verdict == Verdict::Impossible)
         .count();
-    let guaranteed = all.len() - bounded - impossible - broken;
+    let checked = all
+        .iter()
+        .filter(|r| r.verdict == Verdict::StaticCheck)
+        .count();
+    let references = all
+        .iter()
+        .filter(|r| r.verdict == Verdict::Reference)
+        .count();
 
     let mut s = String::new();
     let _ = write!(s, "{}", HTML_HEAD);
@@ -752,16 +754,17 @@ fn render_html(sections: &[(&str, &[Row])]) -> String {
     let _ = write!(
         s,
         r#"<div class="wrap"><header class="mast">
-<p class="eyebrow">TickVault &middot; generated by <b>make guarantees</b> &middot; every number measured at run time</p>
-<h1>Every guarantee here was <em>measured</em>, not claimed.</h1>
-<p class="standfirst">An O(1) live F&amp;O trading system for NSE. This page is produced by the
-same command that gates every pull request &mdash; so a promise cannot outlive the code that
-stopped keeping it.</p>
+<p class="eyebrow">TickVault &middot; generated by <b>make guarantees</b> &middot; source evidence</p>
+<h1>What the source shows, and what still needs verification.</h1>
+<p class="standfirst">This report combines evaluated static predicates, inventories and authored
+references. It does not execute the cited tests or benchmarks, or inspect AWS or the database.
+A passing static check is scoped to its predicate; it is not a production guarantee.</p>
 <div class="band">
-<div class="tile t-g"><div class="n">{guaranteed}</div><div class="k">Guaranteed</div><div class="d">Holds, with a test that fails the build if it stops holding.</div></div>
-<div class="tile t-b"><div class="n">{bounded}</div><div class="k">Bounded</div><div class="d">True inside a stated limit. The limit is printed, never hidden.</div></div>
-<div class="tile t-i"><div class="n">{impossible}</div><div class="k">Impossible</div><div class="d">Forbidden by arithmetic. Naming them is the honest part.</div></div>
-<div class="tile t-x"><div class="n">{broken}</div><div class="k">Broken</div><div class="d">A guaranteed row that stopped holding. Any number here exits non-zero.</div></div>
+<div class="tile t-g"><div class="n">{checked}</div><div class="k">Static checks</div><div class="d">Source/configuration predicates evaluated successfully in this run.</div></div>
+<div class="tile t-b"><div class="n">{references}</div><div class="k">References</div><div class="d">Inventory or authored explanation. Referenced tests were not run here.</div></div>
+<div class="tile t-b"><div class="n">{bounded}</div><div class="k">Bounded</div><div class="d">Stated limit or tradeoff; production behavior still needs verification.</div></div>
+<div class="tile t-i"><div class="n">{impossible}</div><div class="k">Impossible</div><div class="d">Literal requirement conflicts with arithmetic.</div></div>
+<div class="tile t-x"><div class="n">{broken}</div><div class="k">Broken</div><div class="d">An evaluated static predicate failed. Any number here exits non-zero.</div></div>
 </div></header>
 "#
     );
@@ -770,12 +773,13 @@ stopped keeping it.</p>
         let _ = write!(
             s,
             "<section><h2>{}</h2><div class=\"tscroll\"><table>\
-             <thead><tr><th>What was measured</th><th>Verdict</th><th>Measured</th><th>Proof / why</th></tr></thead><tbody>",
+             <thead><tr><th>Subject</th><th>Verdict</th><th>Observation / reference</th><th>Scope / source</th></tr></thead><tbody>",
             esc(title)
         );
         for r in rows.iter() {
             let (chip, cls) = match r.verdict {
-                Verdict::Guaranteed => ("Guaranteed", "c-g"),
+                Verdict::StaticCheck => ("Static check", "c-g"),
+                Verdict::Reference => ("Reference", "c-b"),
                 Verdict::Bounded => ("Bounded", "c-b"),
                 Verdict::Impossible => ("Impossible", "c-i"),
                 Verdict::Broken => ("Broken", "c-x"),
@@ -796,13 +800,13 @@ stopped keeping it.</p>
 
     let _ = write!(
         s,
-        r#"<footer><p><b>How to reproduce every number on this page:</b> <code>make guarantees</code> for the
-table, <code>make guarantees-html</code> for this page. Both read the working tree and count what is
-actually there. The same command runs in continuous integration on every pull request, so a
-guarantee that quietly stops holding is caught by the machine rather than remembered by a person.</p>
-<p style="margin-top:14px">Bounded and impossible rows are facts about the problem, not defects &mdash;
-they never fail the run, because a gate that failed on arithmetic would be permanently red, and a
-permanently red gate is an ignored gate.</p></footer></div>"#
+        r#"<footer><p><b>Reproduce this source report:</b> <code>make guarantees</code> for the table,
+<code>make guarantees-html</code> for this page. Dynamic counts come from the checkout;
+authored descriptions and historical benchmark figures are not revalidated by this command.</p>
+<p style="margin-top:14px">Only failed static predicates make this command exit non-zero.
+References, bounds and impossible requirements remain visible and do not change the exit code.
+Execute the cited tests and benchmarks separately, and verify deployed service and database
+state before making operational claims.</p></footer></div>"#
     );
     s
 }
@@ -839,10 +843,10 @@ fn render(title: &str, rows: &[Row]) -> String {
     let _ = writeln!(s, "{}", "=".repeat(title.len()));
     let _ = writeln!(
         s,
-        "{:<w_what$}  {:<w_verd$}  {:<w_meas$}  PROOF / WHY",
+        "{:<w_what$}  {:<w_verd$}  {:<w_meas$}  SCOPE / SOURCE",
         "WHAT",
         "VERDICT",
-        "MEASURED",
+        "OBSERVATION",
         w_what = w_what,
         w_verd = w_verd,
         w_meas = w_meas
@@ -1137,26 +1141,26 @@ fn main() {
 
     let lang = vec![
         Row::new(
-            "Interpreted runtimes tracked",
+            "Selected non-shell source extensions",
             if interpreted == 0 {
-                Verdict::Guaranteed
+                Verdict::StaticCheck
             } else {
                 Verdict::Broken
             },
             format!("{interpreted} files"),
-            "rust_only_guard: both allowlists empty, shrink-only",
+            "extension count only; excludes shell, embedded frontend and vendor runtimes",
         ),
         Row::new(
             "Rust sources",
-            Verdict::Guaranteed,
+            Verdict::Reference,
             format!("{rust} files"),
-            "the workspace proper",
+            "tracked Rust files; includes backend, tests and tools, not deployment dependencies",
         ),
         Row::new(
             "Shell scripts",
             Verdict::Bounded,
             format!("{shell} files"),
-            "CI/hook glue. NOT Rust. git invokes hooks as shell",
+            "production boot/recovery/doctor plus CI/hooks; NOT Rust; migration remains",
         ),
         Row::new(
             "`#!` executables (any name)",
@@ -1166,19 +1170,19 @@ fn main() {
         ),
         Row::new(
             "Rust spawn literals",
-            Verdict::Guaranteed,
-            "benign only",
-            "rust_only_guard: Command::new/.arg/.args scanned",
+            Verdict::Reference,
+            "allowlisted, including shell",
+            "guard source covers spawn literals; this row does not execute the guard",
         ),
         Row::new(
             "Build toolchain surface",
-            Verdict::Guaranteed,
+            Verdict::Reference,
             "scanned",
             ".cargo/config runner+linker, Cargo.toml, make, Docker",
         ),
         Row::new(
             "node-family invocations",
-            Verdict::Guaranteed,
+            Verdict::Reference,
             "budgeted",
             "command-position scan, shrink-only budget",
         ),
@@ -1245,7 +1249,7 @@ fn main() {
             // CLAUDE.md records against its own headline O(1) sentence, and
             // it would send an auditor looking for loops away empty-handed.
             "Tick packet decode (hot path)",
-            Verdict::Guaranteed,
+            Verdict::Reference,
             "O(1), 0 alloc",
             "fixed offsets; Full also reads 5 depth levels into a stack array -- a protocol constant, zero heap",
         ),
@@ -1264,7 +1268,7 @@ fn main() {
         Row::new(
             "DHAT zero-alloc gates",
             if dhat > 0 {
-                Verdict::Guaranteed
+                Verdict::StaticCheck
             } else {
                 Verdict::Broken
             },
@@ -1317,13 +1321,13 @@ fn main() {
         // have undone a documented decision.
         Row::new(
             "Instrument lookup (live tick path)",
-            Verdict::Guaranteed,
+            Verdict::Reference,
             "O(1) avg",
             "MultiTfAggregator::slot_index -- composite-key HashMap into a dense Vec",
         ),
         Row::new(
             "Uniqueness + dedup",
-            Verdict::Guaranteed,
+            Verdict::Reference,
             "O(1)",
             "QuestDB DEDUP keys, hash on the composite",
         ),
@@ -1335,7 +1339,7 @@ fn main() {
         Row::new(
             "Composite key where an id is keyed",
             if dedup_sid == dedup_sid_seg {
-                Verdict::Guaranteed
+                Verdict::StaticCheck
             } else {
                 Verdict::Broken
             },
@@ -1351,14 +1355,53 @@ fn main() {
         Row::new(
             "catch_up_seal_all",
             Verdict::Bounded,
-            "O(slots x 24)",
-            "every 5s; zero-alloc; 9.67ms/sweep measured at the 25,000x24 ceiling",
+            format!("O(slots x {})", tickvault_trading::candles::TF_COUNT),
+            "visits the active timeframe registry every 5s; current candidate latency unmeasured",
         ),
         Row::new(
-            "Fold CPU at the 25,000 ceiling",
+            "Active candle aggregation frames",
+            Verdict::Reference,
+            format!("F = {}", tickvault_trading::candles::TF_COUNT),
+            "1s, 3s, 5s, 1m, 3m, 5m, 10m, 15m, 30m, 60m; candle storage remains ten frames",
+        ),
+        Row::new(
+            "Active Top Volume ranking frames",
+            Verdict::Reference,
+            format!("FT = {}", tickvault_trading::candles::TOP_VOLUME_TF_COUNT),
+            "1s, 3s, 5s and 1m only; longer candle frames are not supported Top Volume selectors",
+        ),
+        Row::new(
+            "Top Volume family/frame combinations",
+            Verdict::Reference,
+            format!(
+                "2 x FT = {}",
+                2 * tickvault_trading::candles::TOP_VOLUME_TF_COUNT
+            ),
+            "stock and index option families, each with four ranking frames; eight combinations",
+        ),
+        Row::new(
+            "Top Volume ordered-index maintenance",
             Verdict::Bounded,
+            "O(log N) per changed row",
+            "N is indexed population; full-bucket eviction still costs O(N), not constant work",
+        ),
+        Row::new(
+            "Top Volume full row output",
+            Verdict::Bounded,
+            "O(K)",
+            "copying or serializing K returned rows visits those rows; full boards have K = N",
+        ),
+        Row::new(
+            "Earlier 24-frame catch-up observation",
+            Verdict::Reference,
+            "9.67 ms/sweep",
+            "2026-08-21, 25,000x24 cells, x86 release build; not this candidate or AWS proof",
+        ),
+        Row::new(
+            "Earlier 24-frame fold-only observation",
+            Verdict::Reference,
             "2451 ns/tick",
-            "408k ticks/s on ONE core = 32.6x the 12,500/s open burst; FOLD ONLY, x86 not Graviton",
+            "historical x86 fold-only result; not a ten-frame measurement, AWS latency or hard bound",
         ),
         Row::new(
             "O(1) SPACE for n instruments",
@@ -1393,13 +1436,13 @@ fn main() {
     let auto = vec![
         Row::new(
             "CI workflows",
-            Verdict::Guaranteed,
+            Verdict::Reference,
             format!("{workflows} files"),
             "All Green fan-in is the single merge choke point",
         ),
         Row::new(
             "Unattended schedules",
-            Verdict::Guaranteed,
+            Verdict::Reference,
             format!("{scheduled} cron"),
             "mutation, fuzz, sanitizers, catch-up dispatch",
         ),
@@ -1454,7 +1497,7 @@ fn main() {
         Row::new(
             "Tests",
             if tests > 0 {
-                Verdict::Guaranteed
+                Verdict::StaticCheck
             } else {
                 Verdict::Broken
             },
@@ -1463,7 +1506,7 @@ fn main() {
         ),
         Row::new(
             "Coverage floors",
-            Verdict::Guaranteed,
+            Verdict::Reference,
             format!("{floors} crates"),
             "ratcheted: floors move up only",
         ),
@@ -1522,7 +1565,7 @@ fn main() {
         Row::new(
             "Workspace deps exactly pinned",
             if ranged == 0 {
-                Verdict::Guaranteed
+                Verdict::StaticCheck
             } else {
                 Verdict::Broken
             },
@@ -1532,7 +1575,7 @@ fn main() {
         Row::new(
             "Manifest agrees with Cargo.lock",
             if drifted == 0 {
-                Verdict::Guaranteed
+                Verdict::StaticCheck
             } else {
                 Verdict::Broken
             },
@@ -1542,7 +1585,7 @@ fn main() {
         Row::new(
             "Declared but never referenced",
             if unreferenced == 0 {
-                Verdict::Guaranteed
+                Verdict::StaticCheck
             } else {
                 Verdict::Bounded
             },
@@ -1745,7 +1788,7 @@ fn main() {
         Row::new(
             "Dedup keys, all named constants",
             if keys_with_id > 0 {
-                Verdict::Guaranteed
+                Verdict::StaticCheck
             } else {
                 Verdict::Broken
             },
@@ -1755,7 +1798,7 @@ fn main() {
         Row::new(
             "Candle key carries segment AND feed",
             if canonical_candle_key > 0 {
-                Verdict::Guaranteed
+                Verdict::StaticCheck
             } else {
                 Verdict::Broken
             },
@@ -1770,13 +1813,13 @@ fn main() {
         ),
         Row::new(
             "Written runbooks",
-            Verdict::Guaranteed,
+            Verdict::Reference,
             format!("{runbooks} files"),
             "runbook_path() must resolve — every_runbook_path_exists_on_disk",
         ),
         Row::new(
             "Distinct runbook destinations",
-            Verdict::Guaranteed,
+            Verdict::Reference,
             format!("{runbook_targets}"),
             "many codes share one runbook — files on disk is not destinations",
         ),
@@ -1789,7 +1832,7 @@ fn main() {
         Row::new(
             "CloudWatch alarms",
             if alarms > 0 {
-                Verdict::Guaranteed
+                Verdict::StaticCheck
             } else {
                 Verdict::Broken
             },
@@ -1882,7 +1925,7 @@ fn main() {
         Row::new(
             "Same container set, dev and prod",
             if compose_files == 1 {
-                Verdict::Guaranteed
+                Verdict::StaticCheck
             } else {
                 Verdict::Bounded
             },
@@ -1908,7 +1951,7 @@ fn main() {
         Row::new(
             "Sizing derived from the host it runs on",
             if host_derived > 0 {
-                Verdict::Guaranteed
+                Verdict::StaticCheck
             } else {
                 Verdict::Broken
             },
@@ -2028,7 +2071,7 @@ fn main() {
         Row::new(
             "Invariants that fail the build",
             if guard_files > 0 {
-                Verdict::Guaranteed
+                Verdict::StaticCheck
             } else {
                 Verdict::Broken
             },
@@ -2048,7 +2091,7 @@ fn main() {
         Row::new(
             "Refusals that are counted, never silent",
             if refusal_counters > 0 {
-                Verdict::Guaranteed
+                Verdict::StaticCheck
             } else {
                 Verdict::Broken
             },
@@ -2058,7 +2101,7 @@ fn main() {
         Row::new(
             "Panic macros left in production paths",
             if Path::new("crates/common/tests/production_panic_macro_guard.rs").exists() {
-                Verdict::Guaranteed
+                Verdict::StaticCheck
             } else {
                 Verdict::Broken
             },
@@ -2068,7 +2111,7 @@ fn main() {
         Row::new(
             "Crate roots that chose about silent panics",
             if silent_roots == 0 {
-                Verdict::Guaranteed
+                Verdict::StaticCheck
             } else {
                 Verdict::Broken
             },
@@ -2118,8 +2161,10 @@ fn main() {
         std::process::exit(if broken > 0 { 1 } else { 0 });
     }
 
-    println!("TICKVAULT GUARANTEE REPORT");
-    println!("Every number below is measured from the working tree, now.");
+    println!("TICKVAULT SOURCE EVIDENCE REPORT");
+    println!(
+        "Static checks, inventories and authored references; no tests, benchmarks or live checks run here."
+    );
     print!("{}", render("1. ONE LANGUAGE", &lang));
     print!("{}", render("2. O(1)", &o1));
     print!("{}", render("3. AUTOMATION", &auto));
@@ -2167,18 +2212,50 @@ fn main() {
     println!("\nSUMMARY");
     println!("=======");
     println!(
-        "  {} guaranteed   {bounded} bounded   {impossible} impossible   {broken} broken",
-        all.len() - bounded - impossible - broken
+        "  {} static checks   {} references   {bounded} bounded   {impossible} impossible   {broken} broken",
+        all.iter()
+            .filter(|r| r.verdict == Verdict::StaticCheck)
+            .count(),
+        all.iter()
+            .filter(|r| r.verdict == Verdict::Reference)
+            .count()
     );
     println!(
-        "\n  BOUNDED and IMPOSSIBLE rows are facts about the problem, not defects.\n  \
-         They never fail this run -- a gate that failed on arithmetic would be\n  \
-         permanently red, and a permanently red gate is an ignored gate."
+        "\n  REFERENCE, BOUNDED and IMPOSSIBLE rows do not affect the exit code.\n  \
+         Their presence does not certify runtime behavior or test results."
     );
 
     if broken > 0 {
-        println!("\n  {broken} GUARANTEED row(s) BROKEN -- exiting 1.");
+        println!("\n  {broken} static predicate(s) BROKEN -- exiting 1.");
         std::process::exit(1);
     }
-    println!("\n  Every guaranteed row holds.");
+    println!(
+        "\n  No evaluated static predicate failed. Referenced tests and live behavior remain unverified."
+    );
+}
+
+#[cfg(test)]
+mod evidence_render_tests {
+    use super::{Row, Verdict, render, render_html};
+
+    #[test]
+    fn references_and_checked_predicates_remain_distinct_in_both_outputs() {
+        let rows = [
+            Row::new("evaluated", Verdict::StaticCheck, "0", "source predicate"),
+            Row::new("unexecuted", Verdict::Reference, "guard name", "not run"),
+            Row::new("failed", Verdict::Broken, "1", "source predicate"),
+        ];
+        let text = render("Evidence", &rows);
+        let html = render_html(&[("Evidence", &rows)]);
+        assert!(text.contains("STATIC CHECK"));
+        assert!(text.contains("REFERENCE"));
+        assert!(text.contains("** BROKEN **"));
+        assert!(!text.contains("GUARANTEED"));
+        assert!(html.contains("Static check</span>"));
+        assert!(html.contains("Reference</span>"));
+        assert!(html.contains("Broken</span>"));
+        assert!(html.contains("does not execute the cited tests"));
+        assert!(!html.contains("Every guarantee here was"));
+        assert!(html.contains("<div class=\"n\">1</div><div class=\"k\">References</div>"));
+    }
 }

@@ -421,9 +421,10 @@ pub const fn secs_of_day_ist(ts_ist_nanos: i64) -> u32 {
 ///
 /// `net_volume_chg_pct = window_lots_milli / 10 - 100`, so in thousandths of a
 /// percent that is exactly `window_lots_milli * 100 - 100_000`. The two carry
-/// the SAME ordering, row for row, including every tie — which is why the
-/// comparator in `volume_leaderboard::rank` still sorts the integer key and
-/// this column is presentation only. It is STORED anyway, on the operator's
+/// the same quantized ordering. Unequal exact delta/lot ratios can share this
+/// displayed value; `volume_leaderboard::rank` refines those ties using the
+/// exact ratio. This stored column is presentation only. It is STORED anyway,
+/// on the operator's
 /// 2026-09-13 instruction ("put the volume percentage chnage column as well
 /// also alwasy to see the rpecise percnetgae chnage"): a reader asking the
 /// table what changed should not have to know the transform. That is a

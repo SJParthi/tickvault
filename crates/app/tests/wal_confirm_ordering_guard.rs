@@ -43,7 +43,7 @@ fn boot_does_not_confirm_when_the_lane_will_refold() {
     let src = production("src/main.rs");
     let confirms: Vec<&str> = src
         .lines()
-        .filter(|l| l.contains("confirm_replayed("))
+        .filter(|l| l.contains("confirm_replayed_generation("))
         .collect();
     assert_eq!(
         confirms.len(),
@@ -64,7 +64,7 @@ fn boot_does_not_confirm_when_the_lane_will_refold() {
              not folded yet, and a crash in between loses them",
         );
     let call = src
-        .find("confirm_replayed(")
+        .find("confirm_replayed_generation(")
         .expect("the no-refold branch must still confirm, or unreadable segments re-stage forever");
     assert!(
         guard < call,
@@ -81,7 +81,7 @@ fn the_lane_confirms_after_refolding() {
     let refold = src
         .find("refold_wal_frames(&mut ingest,")
         .expect("the lane must still call refold_wal_frames");
-    let confirm = src.find("confirm_replayed(").expect(
+    let confirm = src.find("confirm_replayed_generation(").expect(
         "the lane MUST confirm after folding. Without it the segments stay in \
          `replaying/` and every subsequent boot replays them again — bounded by the \
          replay byte budget, but permanently repeated work",
@@ -170,7 +170,7 @@ fn the_refolded_rows_are_flushed_before_their_segments_are_archived() {
                  only in the ILP buffer",
     );
     let confirm_at = tail
-        .find("confirm_replayed(")
+        .find("confirm_replayed_generation(")
         .expect("the confirm must follow the refold");
 
     assert!(
@@ -226,11 +226,92 @@ fn the_refold_refuses_to_fold_when_the_seal_writer_is_not_installed() {
     // The refusal must not also confirm: confirming archives the segments,
     // which is the half that makes the loss permanent.
     let confirm_at = source
-        .find("ws_frame_spill::confirm_replayed")
+        .find(".confirm_replayed_generation(")
         .expect("the confirm call must exist");
     assert!(
         refuse_at < confirm_at,
         "the refusal branch must sit ABOVE the confirm, so a refused refold cannot \
          archive the segments it declined to read"
+    );
+}
+
+/// Source wiring across the boot-to-lane handoff. Storage's generation tests
+/// exercise stale/changed receipts; this guard ensures production carries
+/// their exact identity instead of resolving whichever batch happens to be
+/// the latest by the time an asynchronous writer acknowledges its rows.
+#[test]
+fn the_exact_staging_receipt_is_carried_through_the_boot_handoff() {
+    let main = production("src/main.rs");
+    let lane = production("src/dhan_feed_stack.rs");
+    let main_flat = main
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace(" .", ".");
+    let lane_flat = lane
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace(" .", ".");
+    for required in [
+        "ws_wal_replay_confirmation_id = batch.confirmation_id;",
+        "ws_wal_replay_confirmation_id = 0;",
+        "wal_replay_confirmation_id: ws_wal_replay_confirmation_id,",
+        "wal_replay_unconsumed_frames: ws_wal_replay_unconsumed_frames,",
+        "if ws_wal_replay_confirmation_id == 0",
+        "ws_wal_maintenance.confirm_replayed_generation(ws_wal_replay_confirmation_id)",
+        "wal_maintenance: Some(ws_wal_maintenance.clone()),",
+    ] {
+        assert!(main_flat.contains(required), "boot must retain {required}");
+    }
+    for required in [
+        "pub wal_replay_confirmation_id: u64,",
+        "pub wal_replay_unconsumed_frames: u64,",
+        "if params.wal_replay_confirmation_id == 0",
+        "boot_replay_confirmed = wal_maintenance.confirm_replayed_generation(params.wal_replay_confirmation_id)",
+        "let confirmation_id = batch.confirmation_id;",
+        "if confirmation_id == 0",
+    ] {
+        assert!(lane_flat.contains(required), "lane must retain {required}");
+    }
+    for code in [&main, &lane] {
+        assert!(
+            !code.contains("ws_frame_spill::confirm_replayed("),
+            "production must never resolve a legacy latest-generation confirmation"
+        );
+    }
+    assert_eq!(
+        lane.matches(".confirm_replayed_generation(").count(),
+        3,
+        "only consumed boot/live batches and genuinely empty completion may confirm; unsupported-only batches must retain their originals"
+    );
+}
+
+#[test]
+fn catchup_cannot_replace_the_receipt_of_an_unconfirmed_boot_batch() {
+    let lane = production("src/dhan_feed_stack.rs");
+    let catchup = lane
+        .split_once("while rounds < WAL_CATCHUP_MAX_ROUNDS")
+        .expect("catch-up loop")
+        .1;
+    let refuse = catchup
+        .find("if !boot_replay_confirmed {")
+        .expect("a refused boot batch must prevent another staging pass");
+    let replay = catchup
+        .find("replay_with_report_fenced(")
+        .expect("catch-up staging pass");
+    assert!(refuse < replay);
+    assert!(catchup[refuse..replay].contains("break;"));
+    assert!(
+        catchup.contains("catchup_confirmation_failed = true;"),
+        "receipt/ACK failures must remain visible as a stopped recovery"
+    );
+    assert!(
+        catchup.contains("if !wal_maintenance.confirm_replayed_generation("),
+        "catch-up must inspect the generation confirmation result"
+    );
+    assert!(
+        catchup.contains("catchup_confirmation_failed = !catchup_drained;"),
+        "even empty completion must confirm its receipt before clearing unapplied state"
     );
 }

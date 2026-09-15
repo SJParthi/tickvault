@@ -129,7 +129,10 @@ fn an_out_of_range_index_is_dropped_and_never_corrupts_another_slot() {
 #[test]
 fn both_stamp_sites_and_the_publish_are_wired() {
     let src = include_str!("../src/dhan_feed_stack.rs");
-    let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+    let production = src
+        .split_once("\n#[cfg(test)]\nmod tests {")
+        .expect("the stack's top-level test module must delimit production source")
+        .0;
     assert_eq!(
         production.matches("record_connection_tick(").count(),
         3,

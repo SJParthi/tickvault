@@ -273,7 +273,7 @@ const DEPTH_TABLES: [&str; 1] = [crate::depth_persistence::MARKET_DEPTH_TABLE];
 ///
 /// The predicate is now the semantic one: a timeframe whose bucket is shorter
 /// than a minute is intraday. A new sub-minute timeframe joins automatically;
-/// a minute-or-longer one cannot join by accident. That is worth the O(24)
+/// a minute-or-longer one cannot join by accident. This is an O(TF_COUNT)
 /// scan, which runs on the cold retention sweep and never on a tick.
 fn is_intraday_table(table: &str) -> bool {
     if table == TICKS_TABLE {
@@ -3060,17 +3060,11 @@ mod tests {
 
     #[test]
     fn intraday_class_covers_ticks_and_every_second_level_candle() {
-        // These six are the heaviest tables on the box after depth. Before
+        // These active second-level tables can be heavy after depth. Before
         // the split they inherited `market_data_hot_days`, which at the
         // 25,000-instrument target commits several hundred GB on a 200 GB
         // root — and a full disk stops EVERY table, not just these.
-        for table in [
-            "ticks",
-            "candles_1s",
-            "candles_2s",
-            "candles_14s",
-            "candles_30s",
-        ] {
+        for table in ["ticks", "candles_1s", "candles_3s", "candles_5s"] {
             assert_eq!(
                 retention_class(table),
                 RetentionClass::Intraday,
@@ -3085,7 +3079,13 @@ mod tests {
         // operator's stated requirement if it regressed: minute-level history
         // is what indicators and strategies read. Sweeping it at 2 days would
         // leave them with nothing to warm up from.
-        for table in ["candles_1m", "candles_5m", "candles_15m", "candles_1d"] {
+        for table in [
+            "candles_1m",
+            "candles_5m",
+            "candles_10m",
+            "candles_15m",
+            "candles_60m",
+        ] {
             assert_eq!(
                 retention_class(table),
                 RetentionClass::MarketData,

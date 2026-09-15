@@ -104,9 +104,10 @@ case "$BENCH_BUDGET_MULTIPLIER" in
 esac
 
 if [ ! -d "$CRITERION_DIR" ]; then
-  echo "INFO: No criterion results found at $CRITERION_DIR — skipping bench gate."
+  echo "ERROR: Criterion directory missing: $CRITERION_DIR."
+  echo "       ZERO latency budgets were enforced — no measurement is not a pass."
   echo "  Run 'cargo bench --workspace' first to generate benchmark data."
-  exit 0
+  exit 3
 fi
 
 if [ ! -f "$BUDGETS_FILE" ]; then

@@ -157,7 +157,7 @@ pub const ALARM_PHRASES: [(&str, &str); 112] = [
     // ---- capacity + candle building ----
     (
         "aggregator-refusal-rate-high",
-        "🔷 DHAN: more than a QUARTER of prices arrive with a bad time stamp — the prices ARE saved, only the per-minute summary skips them. Recent sessions ran 2-7%",
+        "🔷 DHAN: more than a QUARTER of prices have time stamps the candle builder cannot use — affected candles may be incomplete. Database storage of those prices needs a separate check",
     ),
     (
         "aggregator-slots-exhausted",
@@ -285,7 +285,7 @@ pub const ALARM_PHRASES: [(&str, &str); 112] = [
     ),
     (
         "ticks-spilling",
-        "Prices are being saved to disk instead of the database because the database is behind — nothing is lost, they are replayed",
+        "Prices are being sent to disk because the database is behind — disk storage and replay into the database still need confirmation",
     ),
     ("ticks-lost-spill", "Rescued prices were lost for good"),
     (
@@ -525,7 +525,7 @@ pub const ALARM_PHRASES: [(&str, &str); 112] = [
     ),
     (
         "errcode-hot-path-02",
-        "The database is behind, so prices are being held on disk and replayed — nothing is lost",
+        "Saving prices to the database is under pressure — replay may be pending or some prices may have failed to save. Check the server log to confirm",
     ),
     (
         "errcode-oms-gap-06",
@@ -621,12 +621,12 @@ fn value_str_or(value: Option<&Value>, default: &str) -> String {
     }
 }
 
-/// Alarms whose CONDITION is a self-healing degrade, not an emergency.
+/// Alarms classified as degradation warnings rather than emergencies.
 ///
-/// Every one of these fires while the system is doing exactly what it was
-/// built to do: a flush could not reach the database, so the rows went to the
-/// spill file and will be replayed. Their own message bodies say so — "nothing
-/// is lost, they are replayed", "check it before assuming loss".
+/// These alarm names identify spill activity or candle timestamp refusal.
+/// Neither proves durable disk storage or completed database replay. Keep
+/// severity separate from persistence claims; failure and loss alarms below
+/// retain their emergency classification.
 ///
 /// WHY THIS LIST EXISTS (2026-09-08, from a real operator complaint with a
 /// screenshot). Between 08:32 and 09:21 IST the operator's phone took FOURTEEN
@@ -637,22 +637,19 @@ fn value_str_or(value: Option<&Value>, default: &str) -> String {
 /// `error_code.rs` never reached the phone at all: `HOT-PATH-02` is declared
 /// **Low** and arrived looking identical to a Critical.
 ///
-/// The measured truth for that session: dropped == spilled on both the tick
-/// and the depth path (every rescued row re-ingestable), WAL-dropped zero,
-/// sockets parked zero. Nothing was lost. The ONE alert that mattered — the
-/// contract universe failing at 09:13 — sat eleventh of fourteen, wearing the
-/// same emoji as the nine that said nothing was wrong.
+/// The counters recorded for that session were dropped == spilled on both
+/// the tick and depth paths, WAL-dropped zero, and sockets parked zero.
+/// Those counters alone do not prove that every row reached the database.
+/// The contract universe failure at 09:13 sat eleventh of fourteen, wearing
+/// the same emoji as the spill notices.
 ///
 /// FAIL-LOUD BY DEFAULT: an alarm not named here keeps 🆘. This list downgrades
-/// only conditions whose own text says nothing is lost, and adding to it is a
-/// deliberate act with a reason attached — never a way to quieten something
-/// inconvenient.
+/// only the explicitly reviewed conditions below. Adding to it requires a
+/// reason based on emit-site behavior, not reassuring message wording.
 const DEGRADE_NOT_EMERGENCY: &[&str] = &[
-    // The tick spill tier engaging. `dropped == spilled` is the proof the
-    // rescue worked, and this alarm fires on exactly that path.
+    // The tick spill tier engaging; completed persistence is checked separately.
     "ticks-spilling",
-    // Ticks the per-minute candle summary skipped. The ROWS ARE WRITTEN; only
-    // the candle is missed, and the emit site says so in capitals.
+    // Candle timestamp refusal; this alarm does not establish raw-tick durability.
     "aggregator-refusal-rate-high",
     // ⚠ TWO ENTRIES REMOVED 2026-09-08, hours after this list was written, by
     // an observability audit that read each alarm's EMIT SITES rather than
@@ -1230,6 +1227,12 @@ pub async fn post_to_telegram(
     Ok((status, body_text))
 }
 
+/// A required boolean also rejects missing, mistyped, or duplicate `ok` fields.
+#[derive(serde::Deserialize)]
+struct TelegramAcknowledgement {
+    ok: bool,
+}
+
 /// Send every folded text into the Telegram POST — the single delivery
 /// choke point (no filtering between the fold and the POST). Legacy
 /// parity: the `for text in texts:` loop of `lambda_handler`. `post` is
@@ -1245,10 +1248,16 @@ where
     for text in texts {
         match post(text.clone()).await {
             Ok((status, body)) => {
-                if status >= 400 {
+                let acknowledged = (200..300).contains(&status)
+                    && body.trim_start().starts_with('{')
+                    && serde_json::from_str::<TelegramAcknowledgement>(&body)
+                        .is_ok_and(|response| response.ok);
+                if !acknowledged {
                     let head: String = body.chars().take(200).collect();
-                    failures.push(format!("http {status}: {head}"));
-                    error!(code = "LAMBDA-NOTIFY-01", status, body = %head, "Telegram POST returned an error status");
+                    failures.push(format!(
+                        "http {status}: delivery was not acknowledged: {head}"
+                    ));
+                    error!(code = "LAMBDA-NOTIFY-01", status, body = %head, "Telegram POST did not acknowledge delivery");
                 } else {
                     sent += 1;
                 }
@@ -1267,16 +1276,15 @@ where
 }
 
 /// True when the batch had messages to send and NOT ONE reached Telegram.
+/// This diagnostic is narrower than acknowledgement: any failed message,
+/// including a partial delivery, must fail the invocation for retry.
 ///
 /// Operator sweep row 24 (2026-09-08): `handle` returned `Ok` on this shape,
 /// so a dead bot token, a revoked chat, or a Telegram outage produced ZERO
 /// Lambda errors — the `*-errors` alarm on this function stayed green while
-/// every page in the account was being dropped on the floor. A partial
-/// failure stays `Ok` (SNS would otherwise redeliver the whole batch and
-/// re-page the ones that landed); a TOTAL failure is the one shape where a
-/// redelivery costs nothing and an error is the only signal that survives,
-/// because the alarm's own Telegram leg is the thing that is broken and its
-/// email fan-out is not.
+/// every page in the account was being dropped on the floor. Total failure
+/// remains a useful diagnostic. The invocation now also fails partial
+/// batches, accepting possible duplicates so undelivered messages retry.
 #[must_use]
 pub fn nothing_was_delivered(result: &Value) -> bool {
     let sent = result.get("sent").and_then(Value::as_u64).unwrap_or(0);
@@ -1285,6 +1293,23 @@ pub fn nothing_was_delivered(result: &Value) -> bool {
         .and_then(Value::as_array)
         .map_or(0, Vec::len);
     sent == 0 && failures > 0
+}
+
+fn delivery_failed(result: &Value) -> bool {
+    result
+        .get("failures")
+        .and_then(Value::as_array)
+        .is_some_and(|failures| !failures.is_empty())
+}
+
+/// Merge only after successful delivery, preserving a newer concurrent
+/// observation if another caller finished while the transport was awaited.
+fn commit_delivered_cache(cache: &mut AlertCache, delivered: AlertCache) {
+    for (name, entry) in delivered {
+        if cache.get(&name).is_none_or(|current| current.1 <= entry.1) {
+            cache.insert(name, entry);
+        }
+    }
 }
 
 /// Fold + send composed — the testable end-to-end delivery seam the
@@ -1300,8 +1325,16 @@ where
     F: FnMut(String) -> Fut,
     Fut: Future<Output = Result<(u16, String), String>>,
 {
-    let texts = fold_records(records, now_epoch, cache);
-    send_texts(&texts, records.len(), post).await
+    // Folding is a proposal until the transport acknowledges the batch.
+    // On any failure the caller retries the batch; some delivered messages
+    // may repeat, but an undelivered OK must never enter the suppression cache.
+    let mut pending_cache = cache.clone();
+    let texts = fold_records(records, now_epoch, &mut pending_cache);
+    let result = send_texts(&texts, records.len(), post).await;
+    if !delivery_failed(&result) {
+        commit_delivered_cache(cache, pending_cache);
+    }
+    result
 }
 
 async fn fetch_ssm_secret(parameter_name: &str) -> Result<String, Error> {
@@ -1367,6 +1400,7 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(TELEGRAM_TIMEOUT_SECONDS))
+        .redirect(reqwest::redirect::Policy::none())
         .build()?;
 
     let now = SystemTime::now()
@@ -1374,17 +1408,17 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
 
-    // The warm-cache lock is scoped to the synchronous fold — never held
-    // across an await (the send loop below is lock-free).
-    let texts = {
+    // Snapshot under the lock, await transport without it, and commit only
+    // after every message succeeded. A failed attempt cannot suppress retry.
+    let mut delivered_cache = {
         let mut guard = LAST_SENT.lock().unwrap_or_else(|e| e.into_inner());
         let cache = guard.get_or_insert_with(HashMap::new);
-        fold_records(&records, now, cache)
+        cache.clone()
     };
     // (legacy backstopped a fold crash with one generic line per record;
     //  the Rust fold has no panicking path — ledger.)
 
-    let result = send_texts(&texts, records.len(), |text| {
+    let result = deliver(&records, now, &mut delivered_cache, |text| {
         let client = client.clone();
         let token = token.clone();
         let chat_id = chat_id.clone();
@@ -1399,18 +1433,21 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
     })
     .await;
 
-    if nothing_was_delivered(&result) {
+    if delivery_failed(&result) {
         error!(
             code = "LAMBDA-NOTIFY-01",
             records = records.len(),
-            "not one message of this batch reached Telegram — failing the invocation so the \
-             function's Errors alarm can say so through its email leg"
+            "one or more messages did not reach Telegram — failing the invocation for retry; \
+             messages already delivered may repeat"
         );
         return Err(Error::from(format!(
-            "telegram delivery failed for every message in the batch: {}",
+            "telegram delivery failed for one or more messages in the batch: {}",
             result["failures"]
         )));
     }
+
+    let mut guard = LAST_SENT.lock().unwrap_or_else(|e| e.into_inner());
+    commit_delivered_cache(guard.get_or_insert_with(HashMap::new), delivered_cache);
 
     Ok(result)
 }
@@ -1421,15 +1458,15 @@ mod tests {
 
     /// The exact alerts from the operator's 2026-09-08 screenshot.
     ///
-    /// Nine of fourteen carried "nothing is lost" in their own body and every
-    /// one rendered 🆘. These TWO are the repeat offenders whose bodies are
-    /// honest about it; each must now render ⚠️ so the ones that mean
-    /// something can be seen. (hot-path-02 and ws-spill-02 were on this list
+    /// Nine of fourteen carried "nothing is lost" in their old body and every
+    /// one rendered 🆘. These TWO retain their reviewed warning classification;
+    /// their message wording does not establish persistence. (hot-path-02 and
+    /// ws-spill-02 were on this list
     /// for one evening and were removed: ws-spill-02 is Critical permanent
     /// loss, and hot-path-02 has a loss arm — a name-level downgrade would
     /// have quietened both.)
     #[test]
-    fn a_degrade_that_says_nothing_is_lost_is_not_an_emergency() {
+    fn known_degradation_alarms_keep_the_warning_emoji() {
         for alarm in [
             "tv-prod-ticks-spilling",
             "tv-prod-aggregator-refusal-rate-high",
@@ -1437,7 +1474,7 @@ mod tests {
             assert_eq!(
                 severity_emoji(alarm, Some("ALARM")),
                 "⚠️",
-                "{alarm} says nothing is lost — it must not wear the emergency emoji"
+                "{alarm} has an explicit warning classification that must be preserved"
             );
         }
     }
@@ -2188,7 +2225,7 @@ mod tests {
         ));
         assert!(
             !nothing_was_delivered(&json!({"sent": 1, "failures": ["http 429: y"], "records": 2})),
-            "a partial failure stays Ok — SNS would redeliver and re-page the ones that landed"
+            "a partial failure is not total failure, but must still fail acknowledgement"
         );
         assert!(!nothing_was_delivered(
             &json!({"sent": 2, "failures": [], "records": 2})
@@ -2198,6 +2235,141 @@ mod tests {
             "an empty batch delivered nothing and failed nothing — not an error"
         );
         assert!(!nothing_was_delivered(&json!({"sent": 0, "skipped": 1})));
+    }
+
+    #[tokio::test]
+    async fn test_failed_ok_is_retried_before_cache_commit() {
+        let records = vec![alarm("tv-prod-cpu-high-5min", "OK")];
+        let mut cache = HashMap::new();
+        let first = deliver(&records, 1_000.0, &mut cache, |_| {
+            std::future::ready(Err("transport unavailable".to_string()))
+        })
+        .await;
+        assert!(delivery_failed(&first));
+        assert!(cache.is_empty(), "an attempted OK is not a delivered OK");
+
+        let mut retry_posts = Vec::new();
+        let retry = deliver(&records, 1_001.0, &mut cache, |text| {
+            retry_posts.push(text);
+            std::future::ready(Ok((200, r#"{"ok":true}"#.to_string())))
+        })
+        .await;
+        assert!(!delivery_failed(&retry));
+        assert_eq!(
+            retry_posts.len(),
+            1,
+            "the warm retry must send the recovery"
+        );
+        assert_eq!(cache["tv-prod-cpu-high-5min"].0, "OK");
+
+        let mut duplicate_posts = 0;
+        let duplicate = deliver(&records, 1_002.0, &mut cache, |_| {
+            duplicate_posts += 1;
+            std::future::ready(Ok((200, r#"{"ok":true}"#.to_string())))
+        })
+        .await;
+        assert!(!delivery_failed(&duplicate));
+        assert_eq!(duplicate_posts, 0, "success enables subsequent OK dedupe");
+    }
+
+    #[tokio::test]
+    async fn test_partial_delivery_failure_requires_retry_without_cache_commit() {
+        for transport_error in [false, true] {
+            let records = vec![
+                alarm("tv-prod-cpu-high-5min", "ALARM"),
+                alarm("tv-prod-ws-no-alive-connections", "ALARM"),
+            ];
+            let mut cache = HashMap::new();
+            let mut attempts = 0;
+            let first = deliver(&records, 1_000.0, &mut cache, |_| {
+                attempts += 1;
+                std::future::ready(if attempts == 1 {
+                    Ok((200, r#"{"ok":true}"#.to_string()))
+                } else if transport_error {
+                    Err("transport unavailable".to_string())
+                } else {
+                    Ok((429, "retry later".to_string()))
+                })
+            })
+            .await;
+            assert_eq!(first["sent"], 1);
+            assert!(
+                delivery_failed(&first),
+                "partial failure must fail acknowledgement"
+            );
+            assert!(
+                cache.is_empty(),
+                "failed batches must not commit delivery state"
+            );
+
+            let mut retry_posts = Vec::new();
+            let retry = deliver(&records, 1_001.0, &mut cache, |text| {
+                retry_posts.push(text);
+                std::future::ready(Ok((200, r#"{"ok":true}"#.to_string())))
+            })
+            .await;
+            assert!(!delivery_failed(&retry));
+            assert_eq!(retry_posts.len(), 2, "retry includes the undelivered alarm");
+            assert_eq!(cache.len(), 2);
+            assert!(cache.values().all(|entry| entry.2 == 1));
+        }
+    }
+
+    #[test]
+    fn test_delivered_cache_preserves_a_newer_observation() {
+        let mut cache = HashMap::from([("alarm".to_string(), ("OK".to_string(), 20.0, 0))]);
+        let older = HashMap::from([("alarm".to_string(), ("ALARM".to_string(), 10.0, 1))]);
+        commit_delivered_cache(&mut cache, older);
+        assert_eq!(cache["alarm"], ("OK".to_string(), 20.0, 0));
+    }
+
+    #[tokio::test]
+    async fn test_unacknowledged_telegram_responses_retry_without_cache_commit() {
+        for (status, body) in [
+            (302, r#"{"ok":true}"#),
+            (199, r#"{"ok":true}"#),
+            (429, r#"{"ok":true}"#),
+            (500, r#"{"ok":true}"#),
+            (200, r#"{"ok":false}"#),
+            (200, ""),
+            (204, ""),
+            (200, "not JSON"),
+            (200, r#"{"ok":true,broken}"#),
+            (200, r#"{"result":{"ok":true}}"#),
+            (200, r#"{"ok":"true"}"#),
+            (200, r#"{"ok":1}"#),
+            (200, r#"{"ok":null}"#),
+            (200, r#"{"ok":false,"ok":true}"#),
+            (200, r#"[{"ok":true}]"#),
+            (200, "[true]"),
+            (200, "true"),
+        ] {
+            let records = vec![alarm("tv-prod-cpu-high-5min", "OK")];
+            let mut cache = HashMap::new();
+            let first = deliver(&records, 1_000.0, &mut cache, |_| {
+                std::future::ready(Ok((status, body.to_string())))
+            })
+            .await;
+            assert_eq!(first["sent"], 0, "status={status} body={body:?}");
+            assert!(delivery_failed(&first), "status={status} body={body:?}");
+            assert!(
+                cache.is_empty(),
+                "unacknowledged delivery must not suppress retry"
+            );
+
+            let mut retry_posts = 0;
+            let retry = deliver(&records, 1_001.0, &mut cache, |_| {
+                retry_posts += 1;
+                std::future::ready(Ok((200, r#"{"ok":true,"result":{}}"#.to_string())))
+            })
+            .await;
+            assert!(!delivery_failed(&retry));
+            assert_eq!(
+                retry_posts, 1,
+                "the recovery must retry after {status} {body:?}"
+            );
+            assert_eq!(cache["tv-prod-cpu-high-5min"].0, "OK");
+        }
     }
 
     #[tokio::test]

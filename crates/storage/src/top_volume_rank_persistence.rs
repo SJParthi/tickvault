@@ -76,8 +76,8 @@
 //! symbol, and inventing one here would be fabrication. Join to
 //! `instrument_lifecycle` for names.
 //!
-//! `window_lots_milli` is THE SORT KEY and `volume` is not, which is the one
-//! thing a reader of this table has to know. `volume` is the vendor's
+//! Exact `delta_units / lot_size` determines the sort order;
+//! `window_lots_milli` is its quantized display value. `volume` is the vendor's
 //! CUMULATIVE day volume for the contract -- it only ever rises, so ordering
 //! by it would rank "busy since 09:15", not "busy now". `window_lots_milli`
 //! is the lots traded INSIDE the window that just closed, normalised by lot
@@ -102,7 +102,7 @@
 //! the row count is now a property of the market rather than of a constant:
 //!
 //! * Per sweep: one row per contract with a NON-ZERO window delta. A contract
-//!   that did not trade in the window is skipped at the zero-lot check, so the
+//!   that did not trade in the window is skipped at the zero-delta check, so the
 //!   count is the TRADED population, not the tracked one.
 //! * Hard ceiling per sweep: `TOP_VOLUME_MAX_ROWS_PER_SWEEP` (50,000 =
 //!   25,000/family x 2 families), the tracked-contract cap. Reaching it needs
@@ -453,15 +453,16 @@ pub struct TopVolumeRankRow<'a> {
     /// zero in this column would mean the guarantee broke, and is worth
     /// seeing.
     pub lot_size: i64,
-    /// **The RANK KEY**: lots traded in the window that just closed, x 1000.
+    /// Lots traded in the window, x 1000, rounded down for display.
+    /// Exact ranking uses delta_units / lot_size and can distinguish ties here.
     ///
     /// Added 2026-09-09. Until then the table stored only `volume`, the
     /// CUMULATIVE day count -- which has not been the sort key since
     /// 2026-09-07, when the scope lock moved ranking to lots-in-window. So a
     /// reader could see rank 1 hold less cumulative volume than rank 40 and
     /// have nothing in the row to explain it. This column IS the number the
-    /// order was computed from, so the ordering is checkable from the table
-    /// alone rather than taken on trust.
+    /// coarse order was computed from. The stored delta_units and lot_size
+    /// settle exact ties without relying on a rounded display value.
     ///
     /// Milli-lots, so 1_000 is one lot. `u64` at the source; a value that
     /// cannot fit `i64` is refused by the projection rather than wrapped
@@ -476,10 +477,9 @@ pub struct TopVolumeRankRow<'a> {
     ///
     /// ⚠ **It is a strictly-increasing affine transform of
     /// `window_lots_milli`, not independent information.** The two rank
-    /// identically, which is why the comparator still sorts the integer key —
-    /// a float comparator is non-transitive on a NaN and corrupts a whole sort
-    /// rather than misplacing one row. It is stored anyway because the
-    /// operator reads this table directly and should not have to know the
+    /// identically at display precision. Exact rational ranking can refine
+    /// their shared ties without a floating-point comparator. It is stored
+    /// because the operator reads this table directly and should not have to know the
     /// transform. If the two columns ever disagree, THIS one is wrong.
     ///
     /// Integer, never a `DOUBLE`: it is derived from an integer key, and a

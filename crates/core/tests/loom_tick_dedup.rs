@@ -7,8 +7,10 @@
 //! - Atomic tick counters — multiple producers increment, monitor reads
 //! - Connection health atomics — reconnection counter + state mutex
 //!
-//! These tests verify correctness under all possible thread interleavings
-//! using the Loom model checker.
+//! These tests explore these simplified atomic patterns with Loom. The gate
+//! was removed from production; the two unconstrained Boolean-race cases
+//! assert only that modeled threads complete without panicking. They do not
+//! establish a production deduplication or scheduling invariant.
 //!
 //! Run with: cargo test -p tickvault-core --features loom --test loom_tick_dedup
 
@@ -43,11 +45,10 @@ mod loom_tests {
         });
     }
 
-    /// Verifies that concurrent open/close of the storage gate never
-    /// produces a value other than true or false (i.e., no torn reads).
-    /// The tick processor must always see a valid boolean.
+    /// Completion-only exercise of a retired gate pattern. The final Boolean
+    /// may be either value, so there is no behavioral assertion to make here.
     #[test]
-    fn test_storage_gate_concurrent_open_close() {
+    fn test_storage_gate_concurrent_open_close_never_panics() {
         loom::model(|| {
             let gate = Arc::new(AtomicBool::new(false));
             let g_opener = Arc::clone(&gate);
@@ -64,19 +65,14 @@ mod loom_tests {
             opener.join().unwrap();
             closer.join().unwrap();
 
-            // Final value must be a valid boolean (true or false).
-            // Exact value depends on interleaving — both are correct.
-            let val = gate.load(Ordering::Acquire);
-            assert!(val || !val, "AtomicBool must be true or false");
+            // No claim beyond completion: a Boolean tautology proves nothing.
         });
     }
 
-    /// Verifies that a reader running concurrently with a writer always
-    /// sees either the old or new value — never a torn/invalid state.
-    /// This mirrors the hot-path pattern: tick processor reads the gate
-    /// while the scheduler may be toggling it.
+    /// Completion-only exercise of a reader racing a writer in the retired
+    /// gate pattern; a load preceding the store may legitimately read false.
     #[test]
-    fn test_storage_gate_reader_during_write() {
+    fn test_storage_gate_reader_during_write_never_panics() {
         loom::model(|| {
             let gate = Arc::new(AtomicBool::new(false));
             let g_writer = Arc::clone(&gate);
@@ -86,12 +82,7 @@ mod loom_tests {
                 g_writer.store(true, Ordering::Release);
             });
 
-            let reader = thread::spawn(move || {
-                // Must see either false (before write) or true (after write).
-                let val = g_reader.load(Ordering::Acquire);
-                assert!(val || !val);
-                val
-            });
+            let reader = thread::spawn(move || g_reader.load(Ordering::Acquire));
 
             writer.join().unwrap();
             let _read_value = reader.join().unwrap();

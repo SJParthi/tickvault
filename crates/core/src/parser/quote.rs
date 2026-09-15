@@ -55,6 +55,7 @@ pub fn parse_quote_packet(
         received_at_nanos,
         average_traded_price: atp,
         volume,
+        volume_present: true,
         total_sell_quantity: total_sell_qty,
         total_buy_quantity: total_buy_qty,
         day_open,
@@ -144,6 +145,7 @@ mod tests {
         assert_eq!(tick.received_at_nanos, 888);
         assert!((tick.average_traded_price - 24450.25).abs() < 0.01);
         assert_eq!(tick.volume, 5000000);
+        assert!(tick.volume_present);
         assert_eq!(tick.total_sell_quantity, 2000000);
         assert_eq!(tick.total_buy_quantity, 3000000);
         assert!((tick.day_open - 24400.0).abs() < 0.01);
@@ -161,6 +163,31 @@ mod tests {
         assert_eq!(tick.open_interest, 0);
         assert_eq!(tick.oi_day_high, 0);
         assert_eq!(tick.oi_day_low, 0);
+    }
+
+    #[test]
+    fn a_quote_zero_is_a_present_cumulative_volume() {
+        let (buf, hdr) = make_quote_packet(
+            2,
+            77,
+            100.0,
+            0,
+            1_779_354_900,
+            100.0,
+            0,
+            0,
+            0,
+            100.0,
+            100.0,
+            100.0,
+            100.0,
+        );
+        let tick = parse_quote_packet(&buf, &hdr, 0).unwrap();
+        assert!(tick.volume_present);
+        assert_eq!(
+            tick.volume_observation(None),
+            tickvault_common::tick_types::VolumeObservation::Cumulative(0)
+        );
     }
 
     #[test]

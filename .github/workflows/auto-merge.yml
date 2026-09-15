@@ -1,5 +1,5 @@
 # =============================================================================
-# tickvault — Auto-Merge (manual fallback ONLY — merge-gate hardening 2026-07-04)
+# tickvault — shared automatic/manual merge gate
 # =============================================================================
 # The at-open `pull_request` arming that used to live here is RETIRED.
 #
@@ -9,15 +9,16 @@
 # On 2026-07-03, PRs #1387 / #1388 / #1382 merged seconds BEFORE their
 # (non-required) Test (storage) job failed, turning main red for hours.
 #
-# Auto-merge is now armed by the `enable-auto-merge` job in ci.yml, which runs
-# `needs: all-green` — i.e. strictly AFTER the ENTIRE PR suite (build, all 6
+# Auto-merge is armed by the `enable-auto-merge` job in ci.yml, which calls
+# this workflow with `needs: all-green` — AFTER the ENTIRE PR suite (build, all 6
 # Test crates, security, coverage, repo guards, design-first wall, deploy
 # lint) is green. Same token pattern, same same-repo/fork-safety guard from
 # PR #1390. See .claude/rules/project/merge-gate-lock-2026-07-04.md.
 #
-# This file is kept ONLY as an operator-initiated manual fallback (e.g. the
+# This file also provides an operator-initiated manual fallback (e.g. the
 # ci.yml arming job was itself cancelled and the operator wants to re-arm
-# without pushing an empty commit). It never fires automatically.
+# without pushing an empty commit). Neither path arms at PR open: both
+# require All Green and CI's release-validation result on the current head.
 #
 # Security: All actions pinned. Same-repo origin is re-verified via the API
 # before arming — a fork PR can never be armed even via manual dispatch.
@@ -26,6 +27,16 @@
 name: Auto-Merge
 
 on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: Same-repository PR whose completed checks should be verified.
+        required: true
+        type: string
+      source_sha:
+        description: Exact PR head validated by the calling CI run.
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       pr_number:
@@ -36,13 +47,12 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  # 2026-08-10 audit: needed to READ the All Green check-run conclusion before
-  # arming. Read-only; it grants no new write surface.
+  # Read the exact-head All Green and release check conclusions before arming.
   checks: read
 
 jobs:
   auto-merge:
-    name: "Enable Auto-Merge (manual fallback)"
+    name: "Verify checks and enable auto-merge"
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -51,6 +61,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ inputs.pr_number }}
+          EXPECTED_HEAD_SHA: ${{ inputs.source_sha || '' }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -58,47 +69,50 @@ jobs:
             echo "::error::pr_number must be a plain integer, got: $PR_NUMBER"
             exit 1
           fi
-          head_repo=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.repo.full_name')
-          is_draft=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.draft')
-          if [ "$head_repo" != "$REPO" ]; then
-            echo "::error::PR #${PR_NUMBER} originates from fork '$head_repo' — refusing to arm auto-merge (PR #1390 fork-safety guard)."
-            exit 1
-          fi
-          if [ "$is_draft" = "true" ]; then
-            echo "::error::PR #${PR_NUMBER} is a draft — refusing to arm auto-merge."
+          pr=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")
+          head_sha=$(jq -er '.head.sha' <<< "$pr")
+          [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]
+          if [ -n "$EXPECTED_HEAD_SHA" ] && [ "$EXPECTED_HEAD_SHA" != "$head_sha" ]; then
+            echo "::error::PR head changed since the calling CI run — refusing to arm auto-merge."
             exit 1
           fi
 
-          # ---------------------------------------------------------------
-          # 2026-08-10 SECURITY FIX (audit finding, section 4b of
-          # docs/audits/2026-08-10-rust-only-o1-audit.md).
-          #
-          # Until now this fallback checked only fork-origin and draft status,
-          # then armed. It NEVER consulted the All Green result — so a manual
-          # dispatch could arm a PR whose only-green checks were the 4 legacy
-          # branch-protection ones, while Test / Coverage / Repo Guards were
-          # still red or pending. That is a side door around the exact control
-          # the 2026-07-04 hardening was built to create, and it reproduces the
-          # 2026-07-03 red-merge class (#1387 / #1388 / #1382) through a path
-          # the ci.yml redesign never touched.
-          #
-          # The header above already claims this file carries "the same guard
-          # from PR #1390". That guard was the fork/draft check ONLY. This is
-          # the missing half.
-          #
-          # Per merge-gate-lock §3.2 the verdict must be bound to the EXACT
-          # final head SHA: a green All Green on a superseded head counts for
-          # NOTHING, which is why the conclusion is read for head_sha rather
-          # than for the PR in general.
-          # ---------------------------------------------------------------
-          head_sha=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha')
-          all_green=$(gh api "repos/${REPO}/commits/${head_sha}/check-runs" \
-            --jq '[.check_runs[] | select(.name == "All Green")]
-                  | sort_by(.completed_at) | last | .conclusion // "missing"')
-          if [ "$all_green" != "success" ]; then
-            echo "::error::All Green is '${all_green}' on head ${head_sha} for PR #${PR_NUMBER} — refusing to arm auto-merge. Nothing merges without All Green (merge-gate-lock 2026-07-04 §2)."
-            exit 1
-          fi
-          echo "All Green verified success on head ${head_sha} — arming auto-merge."
+          require_same_pr_head() {
+            jq -e --arg repo "$REPO" --arg sha "$head_sha" '
+              .state == "open" and .draft == false
+              and .head.repo.full_name == $repo and .head.sha == $sha
+              and .base.repo.full_name == $repo and .base.ref == "main"
+            ' >/dev/null <<< "$1" || {
+              echo "::error::PR must remain open, non-draft, from this repository, targeting main, and on the verified head."
+              return 1
+            }
+          }
+          require_same_pr_head "$pr"
 
-          gh pr merge --auto --squash "https://github.com/${REPO}/pull/${PR_NUMBER}"
+          # Paginate every attempt. Ordering by completed_at can let an old
+          # success hide a newer queued/in-progress rerun with a null finish
+          # time. The newest check ID must itself be completed and successful.
+          checks=$(gh api --paginate --slurp \
+            "repos/${REPO}/commits/${head_sha}/check-runs?filter=all&per_page=100")
+          for required_check in 'All Green' 'Release Validation / Release Validation Complete'; do
+            verdict=$(jq -er --arg sha "$head_sha" --arg name "$required_check" '
+              [ .[].check_runs[]
+                | select(.name == $name and .head_sha == $sha
+                    and .app.slug == "github-actions") ]
+              | sort_by(.id) | last
+              | if . == null then "missing"
+                elif .status != "completed" then (.status // "missing-status")
+                else (.conclusion // "missing-conclusion") end
+            ' <<< "$checks")
+            if [ "$verdict" != success ]; then
+              echo "::error::${required_check} is '${verdict}' on head ${head_sha} — refusing to arm auto-merge."
+              exit 1
+            fi
+          done
+
+          # Recheck eligibility after the API reads; the CLI's head condition
+          # also refuses a head change between this read and the merge request.
+          require_same_pr_head "$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")"
+          echo "All Green and release validation succeeded on head ${head_sha} — arming auto-merge."
+          gh pr merge --auto --squash --match-head-commit "$head_sha" \
+            "https://github.com/${REPO}/pull/${PR_NUMBER}"

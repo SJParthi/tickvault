@@ -262,8 +262,8 @@ resource "aws_lambda_function" "tv_hard_stop_guard" {
       # runtime kill line is $35; aligning the fallback const is a flagged
       # follow-up, fail direction = kills later, never earlier.)
       # $35 -> $100 on 2026-08-08 per the operator ruling recorded verbatim in
-      # budget.tf (Quote 13 — r8g.xlarge for the 13-timeframe + tick-retention
-      # requirement; the bill's high estimate is $73.60 and the actions fire at
+      # budget.tf (Quote 13 — r8g.xlarge for the then-active 13-timeframe +
+      # tick-retention requirement; that historical bill estimate was $73.60 and the actions fire at
       # 90%/100%, so a ceiling under ~$82 would stop the box mid-session).
       # $100 -> $130 on 2026-08-19 per the operator ruling recorded verbatim in
       # budget.tf (Quote 17 — gp3 IOPS 3000->6000 + throughput 125->500 adds
@@ -271,6 +271,9 @@ resource "aws_lambda_function" "tv_hard_stop_guard" {
       # fire at 90%/100%, so a $100 ceiling would put the 90% line at $90, BELOW
       # the new bill, and stop the trading box mid-session. $130 puts it at $117 —
       # $4.28 of room, thinner than the $7.28 this change was called in to fix.)
+      # Current application scope is ten candle frames and four Top Volume
+      # frames, defined by the Rust registries; the dated sizing notes above
+      # are historical and do not change the existing budget limits below.
       BUDGET_KILL_USD = "150"
       # 2026-07-09: change-only ping state (matches the IAM statement's
       # single-parameter scope above).

@@ -365,14 +365,27 @@ if [ "$STATE" = "running" ]; then
         # stop or an operator action (the 2026-07-02 mid-market wipe was
         # misread as a crash by the deploy monitor). The heal message states
         # the observation + what was done, never an assumed cause.
-        echo "  app inactive ($APP), unit enabled — reset-failed + start via SSM"
-        ssm_run "systemctl reset-failed tickvault 2>/dev/null; systemctl start tickvault 2>/dev/null; sleep 5" >/dev/null
-        APP2=$(ssm_run "systemctl is-active tickvault 2>/dev/null || echo inactive" | tr -d '[:space:]')
-        if [ "$APP2" = "active" ]; then
-          note_heal "restarted app (tickvault) — unit was $APP (cause unknown to autopilot: could be a crash, an external stop, or an operator action); cleared any reset-failed state and started it"
+        # The persistent start gate also covers the unit's boot/Restart path.
+        # Probe before clearing a crash limit so intentional maintenance does
+        # not get fought every 15 minutes. Missing/unreadable policy or helper
+        # is a refusing state, never an implicit permit for an older binary.
+        # PERSISTENT-START-ADMISSION-BEGIN
+        ADMISSION=$(ssm_run "/usr/local/libexec/tickvault-start-guard check 2>&1" || true)
+        if [[ "$ADMISSION" = TV_START_GUARD_ALLOWED\ sha256=* ]]; then
+          echo "  app inactive ($APP), unit enabled and artifact admitted — reset-failed + start via SSM"
+          ssm_run "/usr/local/libexec/tickvault-start-guard check && systemctl reset-failed tickvault && systemctl start tickvault; sleep 5" >/dev/null
+          APP2=$(ssm_run "systemctl is-active tickvault 2>/dev/null || echo inactive" | tr -d '[:space:]')
+          if [ "$APP2" = "active" ]; then
+            note_heal "restarted app (tickvault) — unit was $APP (cause unknown to autopilot: could be a crash, an external stop, or an operator action); cleared any reset-failed state and started the admitted artifact"
+          else
+            note_issue "app (tickvault) not active after admitted start ($APP2) — check journalctl and persistent start-guard state"
+          fi
+        elif [[ "$ADMISSION" = *TV_START_GUARD_REFUSED\ maintenance_fenced* ]]; then
+          note_ok "app (tickvault) remains stopped under the persistent maintenance fence; autopilot did not reset or start it"
         else
-          note_issue "app (tickvault) not active after restart ($APP2) — check journalctl"
+          note_issue "app (tickvault) start admission refused or unverified; autopilot did not reset or start it — inspect /var/lib/tickvault/start-guard and journalctl"
         fi
+        # PERSISTENT-START-ADMISSION-END
       fi
     fi
 

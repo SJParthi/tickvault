@@ -4,7 +4,7 @@
 //! by PR-C3 (2026-07-14, order-update leg).
 //!
 //! Original shape: BOTH boot paths (slow + fast crash-recovery) had to call
-//! `ws_frame_spill::confirm_replayed(...)` after re-injecting staged WAL
+//! `ws_frame_spill::confirm_replayed_generation(...)` after re-injecting staged WAL
 //! frames, each gated on a `*_reinjection_clean` flag. The fast arm, the
 //! Dhan pool re-injection target, and both clean flags DIED with the Dhan
 //! live-WS lane (PR-C2). PR-C3 then retired the order-update broadcast
@@ -38,7 +38,7 @@ use std::path::PathBuf;
 /// the one real call. The count below is an EQUALITY, so the concrete
 /// bypass an adversarial sweep named on 2026-09-05 is: delete the real
 /// call and write one comment containing the full
-/// `ws_frame_spill::confirm_replayed(` literal. The count stays 1, the
+/// `ws_frame_spill::confirm_replayed_generation(` literal. The count stays 1, the
 /// guard stays green, and staged WAL segments re-replay every boot —
 /// the 25-75 GB per restart this guard exists to prevent.
 ///
@@ -64,7 +64,7 @@ fn main_rs() -> String {
 fn confirm_replayed_called_from_both_boot_paths() {
     // PR-C2: single boot path → exactly one confirm site.
     let body = main_rs();
-    let calls = body.matches("ws_frame_spill::confirm_replayed(").count();
+    let calls = body.matches(".confirm_replayed_generation(").count();
     assert_eq!(
         calls, 1,
         "ws_frame_spill::confirm_replayed must be called exactly once (the \
@@ -90,7 +90,7 @@ fn both_paths_gate_confirm_on_a_reinjection_clean_flag() {
     // and the next reader's cheapest fix is to weaken it.
     let flat: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
     let flat_confirm = flat
-        .find("ws_frame_spill::confirm_replayed(")
+        .find(".confirm_replayed_generation(")
         .expect("confirm_replayed must exist in the normalised body too");
     for ws_type in ["live_feed", "order_update"] {
         let needle =

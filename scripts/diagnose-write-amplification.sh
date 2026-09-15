@@ -56,8 +56,10 @@ else
   echo "########## Storage shape — which table dominates? (Item 12, Candidate A) ##########"
   q "table sizes / partition counts" \
     "SELECT table_name, partitionBy, walEnabled FROM tables() ORDER BY table_name"
-  q "candle rows today across timeframes" \
-    "SELECT count() FROM candles_1s WHERE ts >= '${DAY}T00:00:00.000000Z'"
+  for tf in 1s 3s 5s 1m 3m 5m 10m 15m 30m 60m; do
+    q "${tf} candle rows today" \
+      "SELECT count() FROM candles_${tf} WHERE ts >= '${DAY}T00:00:00.000000Z'"
+  done
   q "market_depth rows today" \
     "SELECT count() FROM market_depth WHERE ts >= '${DAY}T00:00:00.000000Z'"
   q "WAL apply backlog (writerTxn lag = unapplied commits)" \
@@ -88,7 +90,7 @@ cat <<'GUIDE'
                                NOTE: this makes Item 14 decoupling HARMFUL until capped
                                (wider batches = wider ts span = more merge work).
   E1 late-tick count ~ZERO  -> Candidate B exonerated. Suspect commit COUNT (candle path,
-                               100ms bare timer, 24 tables, PARTITION BY DAY) or the
+                               flush cadence, ten active candle tables, PARTITION BY DAY) or the
                                16 MiB QDB_CAIRO_WRITER_DATA_APPEND_PAGE_SIZE.
   IDX_I absent from ticks   -> the 17,931 refusals are the indices (LTT=0 on a computed
                                index). Fix is a counted, row-REFUSED sentinel (Item 12b).

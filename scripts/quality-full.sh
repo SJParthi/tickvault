@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
-# tickvault — Full Quality Gates (All 7 CI Stages)
+# tickvault — Local Quality Checks (7 Stages)
 # =============================================================================
-# Runs the same stages that CI runs on GitHub Actions, plus local-only checks.
-# If this passes locally, it will pass in CI.
+# Runs the commands listed below. This local wrapper differs from CI in
+# target selection, features and coverage policy; it cannot certify a CI pass.
 #
 # Usage: ./scripts/quality-full.sh
 #
@@ -26,6 +26,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 FAILED=0
+UNAVAILABLE=0
 
 run_stage() {
     local stage_num="$1"
@@ -45,64 +46,69 @@ run_stage() {
 
 echo ""
 echo -e "${CYAN}╔════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║   Full Quality Gates — 7 Stages                ║${NC}"
+echo -e "${CYAN}║   Local Quality Checks — 7 Stages                ║${NC}"
 echo -e "${CYAN}╚════════════════════════════════════════════════╝${NC}"
 echo ""
 
 # Stage 1: Compile
-run_stage "1/6" "Compile" "cargo build --release --workspace"
+run_stage "1/7" "Compile" "cargo build --release --workspace"
 
 # Stage 2: Lint
-run_stage "2/6" "Format Check" "cargo fmt --all -- --check"
-run_stage "2/6" "Clippy" "cargo clippy --workspace --all-targets -- -D warnings -W clippy::perf"
-run_stage "2/6" "Doc Warnings" "RUSTDOCFLAGS=\"-D warnings\" cargo doc --workspace --no-deps"
-run_stage "2/6" "Doc Tests" "cargo test --doc --workspace"
+run_stage "2/7" "Format Check" "cargo fmt --all -- --check"
+run_stage "2/7" "Clippy" "cargo clippy --workspace --all-targets -- -D warnings -W clippy::perf"
+run_stage "2/7" "Doc Warnings" "RUSTDOCFLAGS=\"-D warnings\" cargo doc --workspace --no-deps"
+run_stage "2/7" "Doc Tests" "cargo test --doc --workspace"
 
 if command -v typos > /dev/null 2>&1; then
-    run_stage "2/6" "Typos" "typos ."
+    run_stage "2/7" "Typos" "typos ."
 else
-    echo -e "${CYAN}[Stage 2/6]${NC} Typos"
-    echo -e "  ${YELLOW}SKIPPED${NC} — typos not installed"
+    echo -e "${CYAN}[Stage 2/7]${NC} Typos"
+    UNAVAILABLE=$((UNAVAILABLE + 1))
+    echo -e "  ${YELLOW}UNAVAILABLE${NC} — typos not installed"
     echo ""
 fi
 
 # Stage 3: Test
-run_stage "3/6" "Tests" "cargo test --workspace"
+run_stage "3/7" "Tests" "cargo test --workspace"
 
 # Stage 4: Security
 if command -v cargo-audit > /dev/null 2>&1; then
-    run_stage "4/6" "Security Audit" "cargo audit"
+    run_stage "4/7" "Security Audit" "cargo audit"
 else
-    echo -e "${CYAN}[Stage 4/6]${NC} Security Audit"
-    echo -e "  ${YELLOW}SKIPPED${NC} — cargo-audit not installed"
+    echo -e "${CYAN}[Stage 4/7]${NC} Security Audit"
+    UNAVAILABLE=$((UNAVAILABLE + 1))
+    echo -e "  ${YELLOW}UNAVAILABLE${NC} — cargo-audit not installed"
     echo ""
 fi
 
 if command -v cargo-deny > /dev/null 2>&1; then
-    run_stage "4/6" "Deny Check" "cargo deny check"
+    run_stage "4/7" "Deny Check" "cargo deny check"
 else
-    echo -e "${CYAN}[Stage 4/6]${NC} Deny Check"
-    echo -e "  ${YELLOW}SKIPPED${NC} — cargo-deny not installed"
+    echo -e "${CYAN}[Stage 4/7]${NC} Deny Check"
+    UNAVAILABLE=$((UNAVAILABLE + 1))
+    echo -e "  ${YELLOW}UNAVAILABLE${NC} — cargo-deny not installed"
     echo ""
 fi
 
 # Stage 5: Performance (skip if no benchmarks exist)
 BENCH_FILES=$(find . -path "*/benches/*.rs" -type f 2>/dev/null | head -1)
 if [ -n "$BENCH_FILES" ]; then
-    run_stage "5/6" "Benchmarks" "cargo bench --workspace"
+    run_stage "5/7" "Benchmarks" "cargo bench --workspace"
 else
-    echo -e "${CYAN}[Stage 5/6]${NC} Benchmarks"
-    echo -e "  ${YELLOW}SKIPPED${NC} — no benchmark files found"
+    echo -e "${CYAN}[Stage 5/7]${NC} Benchmarks"
+    UNAVAILABLE=$((UNAVAILABLE + 1))
+    echo -e "  ${YELLOW}UNAVAILABLE${NC} — no benchmark files found"
     echo ""
 fi
 
 # Stage 6: Coverage (99% threshold)
 if command -v cargo-llvm-cov > /dev/null 2>&1; then
-    run_stage "6/6" "Coverage (99% threshold)" "cargo llvm-cov --workspace --fail-under-lines 99"
-    run_stage "6/6" "Coverage report" "cargo llvm-cov --workspace --html --output-dir target/llvm-cov"
+    run_stage "6/7" "Coverage (99% threshold)" "cargo llvm-cov --workspace --fail-under-lines 99"
+    run_stage "6/7" "Coverage report" "cargo llvm-cov --workspace --html --output-dir target/llvm-cov"
 else
-    echo -e "${CYAN}[Stage 6/6]${NC} Coverage"
-    echo -e "  ${YELLOW}SKIPPED${NC} — cargo-llvm-cov not installed (install: cargo install cargo-llvm-cov)"
+    echo -e "${CYAN}[Stage 6/7]${NC} Coverage"
+    UNAVAILABLE=$((UNAVAILABLE + 1))
+    echo -e "  ${YELLOW}UNAVAILABLE${NC} — cargo-llvm-cov not installed (install: cargo install cargo-llvm-cov)"
     echo ""
 fi
 
@@ -120,18 +126,21 @@ if [ -x "$SCRIPT_DIR/flaky-detect.sh" ]; then
     echo ""
 else
     echo -e "${CYAN}[Stage 7/7]${NC} Flakiness Detection"
-    echo -e "  ${YELLOW}SKIPPED${NC} — scripts/flaky-detect.sh not found"
+    UNAVAILABLE=$((UNAVAILABLE + 1))
+    echo -e "  ${YELLOW}UNAVAILABLE${NC} — scripts/flaky-detect.sh not found"
     echo ""
 fi
 
 # Summary
 echo -e "${CYAN}════════════════════════════════════════════════${NC}"
-if [ $FAILED -eq 0 ]; then
-    echo -e "${GREEN}  All quality gates PASSED${NC}"
-    echo -e "  Code is production-ready."
-else
-    echo -e "${RED}  Some quality gates FAILED${NC}"
-    echo -e "  Fix failures before shipping."
+if [ "$FAILED" -ne 0 ]; then
+    echo -e "${RED}  One or more executed local checks FAILED${NC}"
     exit 1
+elif [ "$UNAVAILABLE" -ne 0 ]; then
+    echo -e "${YELLOW}  Local checks incomplete: $UNAVAILABLE unavailable${NC}"
+    exit 2
+else
+    echo -e "${GREEN}  The executed local checks PASSED${NC}"
+    echo "  CI, deployment and production behavior require their own evidence."
 fi
 echo ""

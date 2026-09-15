@@ -1,48 +1,39 @@
-// STAGE-C: Non-blocking disk-durable spill for every WebSocket frame.
+// STAGE-C: Bounded queue feeding a background WebSocket-frame WAL writer.
 //
-// Hot-path `append()` is O(1) and never blocks: it uses a crossbeam bounded
-// channel with `try_send`. A dedicated background thread writes records to
-// append-only WAL segment files. On startup, `replay_all()` walks every WAL
-// file, validates CRC32, and returns the recovered frames so downstream
-// consumers can drain them before live reads resume.
+// `append()` attempts a crossbeam `try_send` without waiting for queue space
+// or disk I/O. A dedicated thread writes append-only WAL segments. Startup
+// replay validates stored record CRCs and returns recoverable frames within
+// its configured work budgets.
 //
-// DURABILITY — read this before relying on the word "durable" (corrected
-// 2026-08-11, and the trade taken 2026-09-05).
+// DURABILITY — queue acceptance, buffered writes, and successful file syncs
+// are different boundaries:
 //
-// The writer thread calls `BufWriter::flush()`, which hands bytes to the
-// OPERATING SYSTEM, and then — at most once per `WAL_FSYNC_INTERVAL_MS_DEFAULT`
-// (1,000 ms, env-overridable, `0` disables) — calls `sync_all`, which forces
-// them onto the physical device. Concretely:
+//   * `AppendOutcome::Spilled` acknowledges only admission to process memory.
+//     An abrupt process exit can lose queued and userspace-buffered records.
+//   * `persisted_count()` counts records only after the whole owned batch
+//     successfully flushes to the OS; it does not acknowledge device sync.
+//   * Open/write/flush failures retain the bounded batch and its byte charge
+//     for retry. An abrupt process exit can still lose these admitted records.
+//   * A successful flush hands bytes to the operating system. Those bytes
+//     normally survive a writer-process SIGKILL while the kernel and storage
+//     remain healthy; this does not establish power-loss durability.
+//   * The writer requests `sync_all` for dirty bytes after batch flushes and
+//     during idle waits when
+//     `WAL_FSYNC_INTERVAL_MS_DEFAULT` elapses (1,000 ms by default, overridable;
+//     `0` disables frame-file syncing). Rotation, stop, and close also attempt
+//     a final flush followed by sync unless syncing is disabled.
+//   * A newly created WAL pathname requires successful sync of its held
+//     parent directory before the segment is offered to the batch writer.
 //
-//   * process killed (SIGKILL, panic, OOM) -> flushed records SURVIVE, because
-//     the page cache belongs to the kernel, not to us. This is the case the
-//     WAL exists for and it is genuinely covered, sync or no sync.
-//   * machine loses power, kernel panics, or the host is force-stopped ->
-//     records written since the last SYNC are lost. That window is now bounded
-//     by the interval (~1 s) rather than by the kernel's writeback policy
-//     (`dirty_expire_centisecs`, default 30 s).
+// The configured interval is a scheduling target, not a durability deadline.
+// Queue delay, scheduler stalls, slow or failed I/O, and disabled syncing can
+// extend the unsynced window. A successful file sync relies on the filesystem
+// and device honoring it. New-segment directory sync and frame-file sync are
+// separate barriers. This API returns no per-record sync acknowledgement
+// and makes no unconditional promise about survival after power loss.
 //
-// It is a BOUND, not an elimination. A power cut still loses up to a second of
-// frames, and no interval short of a sync per record removes that — a sync per
-// record is not affordable at the 5,000 fps envelope, which is why the earlier
-// note called this "a deliberate throughput trade". The trade is now taken at
-// an interval, with the cost and the new risk written at the constant.
-//
-// AMENDED 2026-09-06 — the interval bound did NOT hold for a rotated segment,
-// and the paragraph above claimed it did. `maybe_sync_segment` syncs `current`
-// and only `current`. At a 128 MiB rotation the writer flushed the full
-// segment, dropped it, and made the NEW file `current` — so the closed one was
-// never synced by anything, ever, and its tail fell back to the kernel's
-// writeback policy (the ~30 s the text above says was replaced). `persisted`
-// had already counted every record in it. Rotation now finalises through
-// `finalise_segment`, the same flush-then-sync the stop and close arms use, so
-// the ~1 s bound is true of every segment rather than only the last one.
-//
-// Three comments in this file previously said "fsync" while the code called
-// `sync_all` zero times. That overstatement was load-bearing, because the live
-// feed refuses to open a socket without this WAL and cites it as the durability
-// floor. The words and the syscalls are kept in agreement by
-// `test_durability_claim_matches_what_the_code_actually_does`.
+// `test_durability_claim_matches_what_the_code_actually_does` checks the source
+// documentation against the API boundary; it does not simulate power loss.
 //
 // Record format on disk (four versions; replay accepts all four):
 //     v1 [MAGIC:4="TVW1"][ws_type:u8][len:u32 LE][frame][crc32:u32 LE]
@@ -77,7 +68,7 @@
 // false one.
 
 use std::fs::{File, OpenOptions}; // O(1) EXEMPT: import line only — uses are the cold writer thread + boot replay
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -86,8 +77,22 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded};
+use sha2::{Digest, Sha256};
 use tickvault_common::error_code::ErrorCode;
 use tracing::{error, info, warn};
+
+#[path = "wal_sequence_inspect.rs"]
+mod sequence_namespace_inspect;
+pub use sequence_namespace_inspect::{
+    SequenceNamespaceInspection, SequenceNamespaceState, inspect_sequence_namespace,
+};
+
+#[path = "wal_sequence_audit.rs"]
+mod sequence_retained_audit;
+pub use sequence_retained_audit::{
+    SequenceReceiptVerification, SequenceRetainedWalAudit, audit_retained_wal_namespace,
+    verify_sequence_migration_receipt,
+};
 
 // ---------------------------------------------------------------------------
 // WsType — one byte tag so replay can route each frame back to the right
@@ -189,15 +194,9 @@ pub enum WalEndpoint {
 }
 
 impl WalEndpoint {
-    /// TOTAL decode: an unknown byte maps to [`WalEndpoint::MainFeed`].
-    ///
-    /// Total on purpose. A record whose endpoint byte this binary does not
-    /// recognise is still a captured frame with a valid CRC; refusing it would
-    /// turn a forward-compatibility gap into a permanent loss. `MainFeed` is
-    /// the pre-v4 assumption, so an unknown value degrades to exactly the
-    /// behaviour every earlier binary had. The reader COUNTS the mapping (one
-    /// coded line per segment) so it is never silent.
-    // TEST-EXEMPT: covered by tvw4_unknown_endpoint_byte_maps_to_main_feed_not_a_panic
+    /// Compatibility enum conversion. Unknown values map to MainFeed here,
+    /// but the WAL reader validates the original byte before returning a
+    /// frame and quarantines unsupported records rather than guessing a route.
     #[must_use]
     pub const fn from_u8(b: u8) -> Self {
         match b {
@@ -273,7 +272,7 @@ struct WalRecord {
 /// Result of a hot-path `append()` attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppendOutcome {
-    /// Frame was QUEUED for durable write. Hot path is done.
+    /// Frame was QUEUED for the background writer. No write is acknowledged.
     ///
     /// Read the first word literally: this is a `try_send` onto a bounded
     /// channel, and a background thread turns the queued record into bytes.
@@ -281,8 +280,9 @@ pub enum AppendOutcome {
     /// separated by up to `SPILL_CHANNEL_CAPACITY` records plus a 256 KiB
     /// `BufWriter` — around 100 s of frames at the 5,000 fps envelope.
     ///
-    /// Everything in that window dies on an abort (`panic = "abort"`, an
-    /// OOM-kill, a SIGKILL past `TimeoutStopSec`) and is counted by NOTHING:
+    /// WAL copies still in that window can disappear on an abort
+    /// (`panic = "abort"`, an OOM-kill, a SIGKILL past `TimeoutStopSec`)
+    /// without incrementing a per-record loss counter:
     /// `persisted_count` counts `write_all`, and `drop_critical` counts only
     /// the frames `try_send` refused outright. The window is now at least
     /// OBSERVABLE — `tv_ws_frame_spill_queue_depth` and its session
@@ -290,10 +290,10 @@ pub enum AppendOutcome {
     /// is not the same as closed, and this doc says "queued" so no caller
     /// mistakes the one for the other.
     ///
-    /// Nor is a written record fsync'ed; see the module header. The durable
-    /// floor is page-cache-deep, not platter-deep.
+    /// Later writes, flushes, and syncs have separate failure boundaries; this
+    /// return value acknowledges none of them. See the module header.
     Spilled,
-    /// Spill channel was full — frame could not be persisted.
+    /// Frame could not be queued for the WAL (capacity or writer unavailable).
     /// CRITICAL: counted in drop metric; Telegram alert fires.
     Dropped,
 }
@@ -757,6 +757,8 @@ struct SpillDropCounters {
     /// disk — and the remedy is a depth-scope or host-memory decision rather
     /// than a disk one.
     ticks_lost_bytes_full: [metrics::Counter; WS_TYPE_COUNT],
+    /// Durable identity capacity or ownership is unavailable.
+    ticks_lost_sequence_unavailable: [metrics::Counter; WS_TYPE_COUNT],
 }
 
 impl SpillDropCounters {
@@ -793,17 +795,22 @@ impl SpillDropCounters {
                 "ws_type" => t.as_str(),
             )
         });
+        let ticks_lost_sequence_unavailable = WS_TYPES_BY_INDEX.map(|t| {
+            metrics::counter!("tv_ticks_lost_total", "source" => "spill_sequence_unavailable", "ws_type" => t.as_str())
+        });
         let counters = Self {
             drop_critical,
             ticks_lost_channel_full,
             ticks_lost_writer_dead,
             ticks_lost_bytes_full,
+            ticks_lost_sequence_unavailable,
         };
         for idx in 0..WS_TYPE_COUNT {
             counters.drop_critical[idx].increment(0);
             counters.ticks_lost_channel_full[idx].increment(0);
             counters.ticks_lost_writer_dead[idx].increment(0);
             counters.ticks_lost_bytes_full[idx].increment(0);
+            counters.ticks_lost_sequence_unavailable[idx].increment(0);
         }
         counters
     }
@@ -811,17 +818,19 @@ impl SpillDropCounters {
 
 pub struct WsFrameSpill {
     spill_tx: Sender<WalRecord>,
-    /// Bytes of frame payload QUEUED but not yet handed to the writer.
+    /// Payload bytes admitted but not successfully batch-flushed.
     ///
-    /// Incremented by `append` before the `try_send`, decremented by the
-    /// writer the instant a record leaves the channel. Shared with the writer
-    /// thread through the `Arc`, which is why it is not a plain `AtomicU64`.
+    /// Reservations cover both channel entries and the worker-owned retry
+    /// batch. Ownership transfer must not make memory available to producers
+    /// while failed writes still retain the original payloads.
     ///
     /// See [`wal_queue_max_bytes`] for why a byte bound exists at all when the
     /// channel is already record-bounded.
     queued_bytes: Arc<AtomicU64>,
     drop_critical: Arc<AtomicU64>,
     persisted_total: Arc<AtomicU64>,
+    unflushed_records: Arc<AtomicU64>,
+    sequence: Option<Arc<SequenceReservations>>,
     /// Pre-resolved per-`WsType` loss counters — see [`SpillDropCounters`].
     drop_counters: SpillDropCounters,
     /// SP5.1: optional per-feed health registry. When `Some`, a dropped
@@ -844,13 +853,10 @@ pub struct WsFrameSpill {
     /// paths hold: there is no `self` to consume. The lock is taken exactly
     /// once, at shutdown, and never on the append path.
     writer: std::sync::Mutex<Option<thread::JoinHandle<()>>>,
-    /// Where this spill's segments live — so `Drop` can release ONLY its own
-    /// open-segment registration, never another spill's in the same process.
-    wal_dir: PathBuf,
-    /// The exclusive claim on the WAL directory, held for as long as this spill
-    /// exists. Never read — its ONLY job is to keep the `flock` taken, and to
-    /// release it on drop so the next process can start. See [`WalDirGuard`].
-    _dir_guard: Option<WalDirGuard>,
+    /// Shares the original directory claim with the writer and maintenance
+    /// handles. Only the writer releases its open-segment registration.
+    /// See [`WalDirGuard`] for ownership validation and lifetime.
+    _dir_guard: Option<Arc<WalDirGuard>>,
 }
 
 impl WsFrameSpill {
@@ -873,10 +879,10 @@ impl WsFrameSpill {
     ///
     /// # Why this exists — the ordering hole it closes
     ///
-    /// `new` claims the directory and then seeds the sequence, which is correct
-    /// in isolation. It is NOT sufficient for the real boot path, because
-    /// `main` calls [`replay_all`] on this directory ~115 lines EARLIER, and
-    /// `replay_all` MUTATES: it renames live `*.wal` files into `replaying/`.
+    /// `new` claims the directory and then seeds the sequence. The app must
+    /// claim it earlier, before [`WalMaintenance::replay_fenced`] stages live
+    /// `*.wal` files in `replaying/`, and retain that same claim when it
+    /// constructs the writer here.
     ///
     /// So starting a second process while one is live used to stage the
     /// INCUMBENT's currently-open segment out from under it. The incumbent
@@ -896,25 +902,24 @@ impl WsFrameSpill {
         wal_dir: P,
         dir_guard: Option<WalDirGuard>,
     ) -> anyhow::Result<Self> {
-        let wal_dir = wal_dir.as_ref().to_path_buf();
-        std::fs::create_dir_all(&wal_dir) // O(1) EXEMPT: one-shot constructor, not the per-frame append
-            .map_err(|e| anyhow::anyhow!("create WAL dir {:?}: {e}", wal_dir))?;
+        // The existing claim owns an existing directory. Recreating this
+        // path could silently replace its locked inode with an unowned root.
+        let wal_dir = std::fs::canonicalize(wal_dir.as_ref())?;
 
-        // ORDER IS LOAD-BEARING.
-        //
-        // 1. The directory is CLAIMED before this function is entered — by the
-        //    caller for the boot path, by `new` for everyone else. Two
-        //    processes sharing one WAL directory mint `capture_seq` from two
-        //    independent clock-seeded counters, collide inside the `ticks`
-        //    DEDUP key, and destroy ticks with no counter anywhere to show it.
-        //    See [`lock_wal_dir`] for why this is fail-closed, not a warning.
-        // 2. Only THEN read the on-disk high-water mark and ratchet the counter
-        //    past it. Doing this before the claim would race a live incumbent
-        //    that is still appending, and could seed from a value it is about
-        //    to exceed.
-        // 3. Only THEN spawn the writer thread, so nothing can append at a
-        //    sequence below the high-water mark.
-        let disk_high = seed_frame_seq_from_disk(&wal_dir);
+        // Ownership precedes any authority read/write. A missing manifest
+        // beside history requires an explicit verified offline migration;
+        // startup never reconstructs a supposedly complete bound from WAL.
+        let guard = dir_guard
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("WAL writer requires an exclusive directory guard"))?;
+        anyhow::ensure!(
+            guard.path.parent().is_some_and(
+                |parent| replay_directory_key(parent) == replay_directory_key(&wal_dir)
+            ),
+            "WAL directory guard belongs to a different directory"
+        );
+        let sequence = Arc::new(SequenceReservations::open(&wal_dir, guard)?);
+        let disk_high = sequence.reserved_through.load(Ordering::Acquire);
         // The applied-watermark lives beside the segments and is seeded from
         // its file HERE, before the first sink can persist — otherwise the
         // first in-session persist would overwrite a good snapshot with zeros.
@@ -923,7 +928,7 @@ impl WsFrameSpill {
             tracing::debug!(
                 wal_dir = ?wal_dir,
                 disk_high,
-                "WAL directory claimed exclusively; sequence ratcheted past disk"
+                "WAL directory claimed; next identity range committed before writer startup"
             );
         }
 
@@ -931,6 +936,8 @@ impl WsFrameSpill {
         let drop_critical = Arc::new(AtomicU64::new(0));
         let persisted_total = Arc::new(AtomicU64::new(0));
         let queued_bytes = Arc::new(AtomicU64::new(0));
+        let unflushed_records = Arc::new(AtomicU64::new(0));
+        let unflushed_for_thread = Arc::clone(&unflushed_records);
         let queued_bytes_for_thread = Arc::clone(&queued_bytes); // APPROVED: Arc clone in the one-shot constructor
 
         let persisted_for_thread = persisted_total.clone(); // APPROVED: Arc clone in the one-shot constructor
@@ -950,10 +957,18 @@ impl WsFrameSpill {
         // fires once, on the bad boot, which is precisely the shape the agent's
         // first-sample rule swallows.
         metrics::counter!(WAL_REPLAY_RESTORE_FAILED_COUNTER).increment(0);
+        metrics::counter!("tv_wal_segment_directory_sync_refused_total").increment(0);
 
+        let sequence_for_thread = Arc::clone(&sequence);
+        let dir_guard = dir_guard.map(Arc::new);
+        let writer_guard = dir_guard.clone();
         let writer = thread::Builder::new()
             .name("ws-frame-spill-writer".to_string()) // APPROVED: one-shot constructor (thread name)
             .spawn(move || {
+                // The directory claim outlives the public handle if a bounded
+                // shutdown returns while this writer still owns a retry batch.
+                let _writer_guard = writer_guard;
+                let mut pending = Vec::with_capacity(257);
                 // Supervisor loop (mirrors WS-GAP-05 pool supervisor +
                 // DISK-WATCHER-01). A panic or a fatal return from the writer
                 // must NOT silently kill the durable WAL floor: we re-enter
@@ -969,6 +984,9 @@ impl WsFrameSpill {
                             &persisted_for_thread,
                             &stop_for_thread,
                             &queued_bytes_for_thread,
+                            &unflushed_for_thread,
+                            &sequence_for_thread,
+                            &mut pending,
                         )
                     }));
                     match outcome {
@@ -1011,11 +1029,12 @@ impl WsFrameSpill {
             queued_bytes,
             drop_critical,
             persisted_total,
+            unflushed_records,
+            sequence: Some(sequence),
             drop_counters: SpillDropCounters::new(),
             feed_health: None,
             stop,
             writer: std::sync::Mutex::new(Some(writer)),
-            wal_dir,
             _dir_guard: dir_guard,
         })
     }
@@ -1051,6 +1070,10 @@ impl WsFrameSpill {
         ));
         std::fs::create_dir_all(&dir).expect("test temp dir");
         let dir_guard = lock_wal_dir(&dir).expect("fresh temp dir is never contended");
+        let sequence = Arc::new(
+            SequenceReservations::open(&dir, dir_guard.as_ref().expect("test directory guard"))
+                .expect("fresh sequence authority"),
+        );
         let (tx, rx) = bounded::<WalRecord>(SPILL_CHANNEL_CAPACITY);
         drop(rx); // no writer ever runs → channel is Disconnected for sends
         Self {
@@ -1058,30 +1081,78 @@ impl WsFrameSpill {
             queued_bytes: Arc::new(AtomicU64::new(0)),
             drop_critical: Arc::new(AtomicU64::new(0)),
             persisted_total: Arc::new(AtomicU64::new(0)),
+            unflushed_records: Arc::new(AtomicU64::new(0)),
+            sequence: Some(sequence),
             drop_counters: SpillDropCounters::new(),
             feed_health: None,
             stop: Arc::new(AtomicBool::new(false)),
             writer: std::sync::Mutex::new(None),
-            wal_dir: dir.clone(),
-            _dir_guard: dir_guard,
+            _dir_guard: dir_guard.map(Arc::new),
         }
     }
 
-    /// Hot path. Non-blocking. O(1). Zero-allocation: accepts anything
-    /// convertible into `Bytes` and sends it over the pre-allocated crossbeam
-    /// ring — no heap allocation occurs here. The WS read loop passes
-    /// `data.clone()` (an O(1) Arc refcount bump, NOT a `Vec<u8>` copy);
-    /// `Vec<u8>` callers convert via `Bytes::from`, which steals the buffer
-    /// (also zero-copy), so existing callers keep working unchanged.
+    /// Allocate only within this writer's synced reservation. No filesystem,
+    /// clock read, allocation or lock is performed on this path. `None` means
+    /// the cold refill has not committed capacity or the identity space is
+    /// exhausted; the caller must explicitly refuse/classify capture.
+    #[must_use]
+    pub fn try_next_frame_seq(&self) -> Option<u64> {
+        let result = self
+            .sequence
+            .as_ref()
+            .and_then(|sequence| sequence.allocate());
+        if result.is_none() {
+            metrics::counter!("tv_wal_sequence_admission_refused_total").increment(1);
+        }
+        result
+    }
+
+    /// A cold-path maintenance handle bound to this writer's original claim.
+    pub fn maintenance(&self) -> anyhow::Result<WalMaintenance> {
+        let guard = self
+            ._dir_guard
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("WAL maintenance requires a held directory claim"))?;
+        WalMaintenance::from_guard(guard)
+    }
+
+    /// Record one capture refused after `try_next_frame_seq()` returned None.
+    /// Call exactly once for that frame; `append()` already records its own.
+    pub fn record_sequence_refusal(&self, ws_type: WsType) {
+        let count = self.drop_critical.fetch_add(1, Ordering::Relaxed) + 1;
+        let index = ws_type_index(ws_type);
+        self.drop_counters.drop_critical[index].increment(1);
+        self.drop_counters.ticks_lost_sequence_unavailable[index].increment(1);
+        if refusal_line_due(count) {
+            error!(
+                code = ErrorCode::WsSpill02FrameDropped.code_str(),
+                ws_type = ws_type.as_str(),
+                drop_count = count,
+                "WAL capture refused: no committed sequence capacity or directory ownership"
+            );
+        }
+        self.record_feed_drop_for_health(ws_type);
+    }
+
+    /// Attempts queue admission without waiting for capacity or disk I/O.
+    /// The WS read loop passes shared `Bytes`, so this handoff does not copy
+    /// the frame payload. Other callers supply their own `Into<Bytes>`
+    /// conversion, whose cost is separate from queue admission.
+    /// [`AppendOutcome::Spilled`] means queued only; this call neither waits
+    /// for nor acknowledges a write, flush, or file sync.
     // TEST-EXEMPT: covered by test_append_spill_and_replay_roundtrip + test_drop_counter_increments_when_channel_full; the Bytes-clone hand-off is proven zero-alloc by crates/core/tests/dhat_ws_reader_zero_alloc.rs::dhat_ws_reader_tail_zero_alloc
     pub fn append(&self, ws_type: WsType, frame: impl Into<Bytes>) -> AppendOutcome {
-        self.append_with_seq(ws_type, frame, next_frame_seq())
+        let Some(sequence) = self.try_next_frame_seq() else {
+            self.record_sequence_refusal(ws_type);
+            return AppendOutcome::Dropped;
+        };
+        self.append_with_seq(ws_type, frame, sequence)
     }
 
     /// Like [`WsFrameSpill::append`] but stamps the caller-provided `frame_seq`
     /// (the WS read loop's value) so the SAME sequence is persisted in the WAL
     /// AND shared with the live broadcast → `ticks.capture_seq` (replay-stable).
-    /// TICK-SEQ-01 threading slice. Hot path, O(1), zero-alloc.
+    /// The outcome still acknowledges only queue admission, as in `append`.
     // TEST-EXEMPT: identical try_send path as `append` (covered by test_append_spill_and_replay_roundtrip + test_wal_v2_roundtrip_preserves_frame_seq); frame_seq plumbing covered by chaos_ws_frame_wal_replay + the read-loop integration.
     pub fn append_with_seq(
         &self,
@@ -1112,8 +1183,8 @@ impl WsFrameSpill {
     /// replay can route a depth frame to the depth drain.
     ///
     /// The caller stamps `received_at_nanos` at the read instant, BEFORE this
-    /// append. Hot path, O(1), zero-alloc — the extra fields are 9 bytes on an
-    /// already-moved struct.
+    /// append. The extra fields travel with the queued record; this call does
+    /// not wait for their eventual write or sync.
     // TEST-EXEMPT: same `try_send` path as `append_with_seq`; the receipt round-trip is covered by tvw3_roundtrip_preserves_received_at, the endpoint round-trip by tvw4_roundtrip_preserves_every_endpoint.
     pub fn append_with_seq_at(
         &self,
@@ -1123,6 +1194,15 @@ impl WsFrameSpill {
         received_at_nanos: i64,
         endpoint: WalEndpoint,
     ) -> AppendOutcome {
+        if self.sequence.as_ref().is_some_and(|issuer| {
+            !issuer.directory_guard.valid.load(Ordering::Acquire)
+                || frame_seq > issuer.reserved_through.load(Ordering::Acquire)
+                || frame_seq > MAX_FRAME_SEQUENCE
+        }) {
+            self.record_sequence_refusal(ws_type);
+            metrics::counter!("tv_wal_sequence_admission_refused_total").increment(1);
+            return AppendOutcome::Dropped;
+        }
         let record = WalRecord {
             ws_type,
             frame_seq,
@@ -1161,6 +1241,7 @@ impl WsFrameSpill {
             return self.refuse_over_byte_budget(ws_type, frame_bytes, prev_bytes, budget);
         }
 
+        self.unflushed_records.fetch_add(1, Ordering::Relaxed);
         match self.spill_tx.try_send(record) {
             Ok(()) => AppendOutcome::Spilled,
             Err(TrySendError::Full(_)) => {
@@ -1169,6 +1250,7 @@ impl WsFrameSpill {
                 // zero and every later frame is refused on a queue that is
                 // actually empty.
                 self.queued_bytes.fetch_sub(frame_bytes, Ordering::Relaxed);
+                self.unflushed_records.fetch_sub(1, Ordering::Relaxed);
                 let prev = self.drop_critical.fetch_add(1, Ordering::Relaxed);
                 // `code` added 2026-08-26. Without it this line carried only
                 // `ws_type` and `drop_count`, so the CloudWatch metric filter
@@ -1204,6 +1286,7 @@ impl WsFrameSpill {
             Err(TrySendError::Disconnected(_)) => {
                 // Released for the same reason as the `Full` arm above.
                 self.queued_bytes.fetch_sub(frame_bytes, Ordering::Relaxed);
+                self.unflushed_records.fetch_sub(1, Ordering::Relaxed);
                 // WS-SPILL-02: the writer thread was dead at this instant
                 // (channel Disconnected). The WS-SPILL-01 supervisor respawns
                 // it, so this window is tiny and practically unreachable — but
@@ -1309,19 +1392,19 @@ impl WsFrameSpill {
         self.drop_critical.load(Ordering::Relaxed)
     }
 
+    /// Records in completely flushed batches, counted once after retries.
+    /// This is not a file-sync or directory-sync acknowledgement and does not
+    /// establish durability after host failure or power loss.
     // TEST-EXEMPT: covered by test_append_spill_and_replay_roundtrip (wait_until_persisted reads this)
     pub fn persisted_count(&self) -> u64 {
-        self.persisted_total.load(Ordering::Relaxed)
+        self.persisted_total.load(Ordering::Acquire)
     }
 
-    /// Records still sitting in the writer's queue right now.
-    ///
-    /// This is the size of the loss window an abrupt exit would take: `append`
-    /// returns [`AppendOutcome::Spilled`] the instant a record is QUEUED, and
-    /// the writer thread is what turns queued into bytes.
+    /// Admitted records not yet batch-flushed: channel plus owned retry batch.
+    /// Zero is not a file/device-sync acknowledgement.
     #[must_use]
     pub fn queued_records(&self) -> usize {
-        self.spill_tx.len()
+        usize::try_from(self.unflushed_records.load(Ordering::Acquire)).unwrap_or(usize::MAX)
     }
 
     /// Drain the writer's queue and stop it, bounded by `budget`.
@@ -1339,8 +1422,7 @@ impl WsFrameSpill {
     /// Every one of those was already reported to its caller as `Spilled`, and
     /// counted by nothing on the way out: `persisted_total` counts `write_all`
     /// and `drop_critical` counts only what `try_send` refused outright. So the
-    /// durable floor — the guarantee the whole ring → spill → WAL chain rests
-    /// on — had an unmeasured hole at exactly the moment it was most likely to
+    /// asynchronous WAL path had an unmeasured hole at the moment it was likely to
     /// matter. The tick and depth ILP writers had this fixed on 2026-08-28
     /// (`tv_offload_writer_shutdown_incomplete_total`); the WAL itself did not.
     ///
@@ -1351,18 +1433,14 @@ impl WsFrameSpill {
     ///
     /// # What it does not promise
     ///
-    /// Returns the number of records still queued when the budget expired —
-    /// `0` for a clean drain. A non-zero return is a real, permanent loss and
-    /// says so, at `error!` and on
-    /// [`WAL_SPILL_SHUTDOWN_INCOMPLETE_COUNTER`]; it is reported rather than
-    /// waited out because systemd's `TimeoutStopSec` escalates to SIGKILL, and
-    /// a SIGKILL loses strictly more.
+    /// Returns admitted records still unflushed after the drain wait, including
+    /// the worker-owned retry batch. A nonzero sample counts records at risk if the process exits;
+    /// it is reported by [`WAL_SPILL_SHUTDOWN_INCOMPLETE_COUNTER`].
     ///
-    /// Even a `0` return leaves the `write_all`-not-`fsync` residual: the exit
-    /// flush pushes the 256 KiB `BufWriter` into the page cache, not onto the
-    /// platter. That is the same durability boundary the whole module has
-    /// always had (there is no `fsync` anywhere in this file) and this method
-    /// deliberately does not claim to have changed it.
+    /// Zero means those admitted batches have flushed at the sample. It does
+    /// not establish device/directory sync or that the writer exited within the budget. The exit path attempts a final flush and, when
+    /// enabled, a file sync, but their failures are logged rather than
+    /// returned by this API. Zero therefore is not a durability acknowledgement.
     pub fn shutdown(&self, budget: Duration) -> usize {
         self.stop.store(true, Ordering::Release);
         // Last chance to record what this session applied. The sink threads
@@ -1373,12 +1451,12 @@ impl WsFrameSpill {
 
         let deadline = Instant::now() + budget;
 
-        // Phase 1: wait for the queue itself to empty. This is the number that
-        // matters — a record still in the channel has not been written at all.
-        while !self.spill_tx.is_empty() && Instant::now() < deadline {
+        // Wait for channel and owned retry batch; moving a record out of the
+        // channel alone does not make it successfully flushed.
+        while self.queued_records() > 0 && Instant::now() < deadline {
             thread::sleep(WAL_SHUTDOWN_POLL);
         }
-        let queued = self.spill_tx.len();
+        let queued = self.queued_records();
 
         // Phase 2: wait for the thread to notice, flush, and exit. Polled
         // rather than joined outright: a writer parked in
@@ -1426,7 +1504,7 @@ impl WsFrameSpill {
         } else {
             info!(
                 persisted = self.persisted_count(),
-                "WAL spill: final drain complete on shutdown; queue empty"
+                "WAL spill: admitted batches flushed on shutdown; stable-storage acknowledgement not provided"
             );
         }
 
@@ -1438,15 +1516,10 @@ impl WsFrameSpill {
 // Background writer thread
 // ---------------------------------------------------------------------------
 
-/// Flush and close the current segment on the way out of [`writer_loop`].
-///
-/// Shared by the two exit arms so a future third one cannot quietly forget the
-/// flush: `persist_record_resilient` counts a record as persisted when
-/// `write_all` lands it in the 256 KiB `BufWriter`, not when the buffer reaches
-/// the platter, so dropping an unflushed writer loses records that
-/// `persisted_count()` has already claimed.
-/// Forces the open segment onto the physical device, rate-limited by
-/// `interval`. Returns the new "last synced" instant.
+/// Attempts a file sync for dirty bytes when `interval` has elapsed. The
+/// writer loop flushes the userspace buffer before marking the segment dirty.
+/// Returns the instant of the completed attempt, including a failed attempt;
+/// only a successful sync clears dirty state.
 ///
 /// Called ONLY from the writer thread, never from `append()`. A failure is
 /// reported and swallowed: a device that cannot sync is a degraded WAL, not a
@@ -1455,20 +1528,18 @@ fn maybe_sync_segment(
     current: &mut Option<BufWriter<File>>,
     interval: Option<Duration>,
     last_sync: Instant,
+    dirty: &mut bool,
 ) -> Instant {
-    let Some(interval) = interval else {
-        return last_sync;
-    };
-    if last_sync.elapsed() < interval {
-        return last_sync;
-    }
     let Some(w) = current.as_mut() else {
-        // No open segment: nothing to sync, and re-arming the timer here would
-        // let a long segment-less stretch trigger a sync storm on reopen.
-        return Instant::now();
+        return last_sync;
     };
     let started = Instant::now();
-    match w.get_ref().sync_all() {
+    let Some(result) = sync_dirty_segment_if_due(dirty, interval, last_sync.elapsed(), || {
+        w.get_ref().sync_all()
+    }) else {
+        return last_sync;
+    };
+    match result {
         Ok(()) => {
             metrics::counter!("tv_wal_fsync_total").increment(1);
             // A gauge, not a histogram: the number that matters operationally
@@ -1479,32 +1550,56 @@ fn maybe_sync_segment(
         }
         Err(err) => {
             metrics::counter!("tv_wal_fsync_errors_total").increment(1);
-            // Deliberately NOT `report_io_error`. That helper says "reopening
-            // segment; thread stays alive", which is true of a WRITE failure
-            // and false of this one: a failed sync reopens nothing, loses
-            // nothing that was already written, and does not endanger the
-            // thread. Its consequence is narrower and worth naming exactly —
-            // the records are still in the page cache and still survive a
-            // process death; what is gone is the BOUND on the power-loss
-            // window, which silently reverts to the kernel's writeback policy.
-            // Routing it through the write-error helper would also have
-            // inflated `tv_ws_frame_spill_write_errors_total` with events that
-            // are not write errors.
+            // Do not count a failed device sync as stable-storage success or
+            // assert what an I/O error preserved. Keep the dirty segment
+            // scheduled for retry, including when no new frames arrive.
             warn!(
                 code = ErrorCode::WsSpill01WriterRespawn.code_str(),
                 stage = "fsync",
                 error = %err,
-                "WAL segment sync FAILED — records already written are still \
-                 in the page cache and still survive a process kill, but the \
-                 power-loss window is no longer bounded by the sync interval"
+                "WAL segment sync FAILED — stable-storage durability is unconfirmed; \
+                 the dirty segment remains scheduled for retry"
             );
         }
     }
     Instant::now()
 }
 
-/// Flushes a segment that is being FINALISED and, unless syncing is disabled,
-/// forces it onto the device.
+/// Shared scheduling seam for production file sync and deterministic failure
+/// tests. A failed attempt retains dirty state; a clean segment never syncs.
+fn sync_dirty_segment_if_due(
+    dirty: &mut bool,
+    interval: Option<Duration>,
+    since_last_attempt: Duration,
+    sync: impl FnOnce() -> std::io::Result<()>,
+) -> Option<std::io::Result<()>> {
+    if !*dirty || interval.is_none_or(|interval| since_last_attempt < interval) {
+        return None;
+    }
+    let result = sync();
+    if result.is_ok() {
+        *dirty = false;
+    }
+    Some(result)
+}
+
+/// Wake for the earlier of shutdown polling and a dirty segment's sync due
+/// time. Scheduler and I/O delay remain outside this requested wait bound.
+fn writer_receive_wait(
+    interval: Option<Duration>,
+    since_last_attempt: Duration,
+    dirty: bool,
+) -> Duration {
+    match interval {
+        Some(interval) if dirty => {
+            WAL_WRITER_STOP_POLL.min(interval.saturating_sub(since_last_attempt))
+        }
+        _ => WAL_WRITER_STOP_POLL,
+    }
+}
+
+/// Attempts to flush a final segment and, unless syncing is disabled, sync
+/// its file. Errors are reported; the caller receives no durability result.
 ///
 /// Three events finalise a segment and nothing writes to it afterwards: the
 /// writer stopping, the channel closing, and a 128 MiB rotation. Until
@@ -1514,13 +1609,12 @@ fn maybe_sync_segment(
 /// `current`, and at that instant `current` is the NEW segment, so the closed
 /// one is never synced by anything, ever. A power cut inside the kernel's
 /// writeback window therefore loses its last records permanently, while
-/// `persisted` has already counted every one of them — the silent-loss shape
-/// the WAL exists to make impossible.
+/// `persisted` has already counted every one of them.
 ///
 /// The sync here is UNCONDITIONAL rather than rate-limited, because each of
-/// these is the LAST chance for that particular segment. Its cost is bounded
-/// by what the periodic sync has not already written — at most one sync
-/// interval of records — and it is paid once per finalisation, not per record.
+/// these is the LAST application sync attempt for that particular segment.
+/// It is paid once per finalisation, not per record. Its duration and the
+/// amount of pending data depend on prior I/O and are not bounded by the interval.
 fn finalise_segment(
     current: &mut Option<BufWriter<File>>,
     flush_stage: &'static str,
@@ -1559,208 +1653,172 @@ fn finalise_segment(
     }
 }
 
+/// A bounded batch owns its original `Bytes` until the complete batch flushes.
+/// Retries preserve the same capture identities and stop channel dequeueing.
+/// Partial failed files remain retained for recovery; they are never treated
+/// as completed segments merely because some bytes reached the filesystem.
 fn writer_loop(
     rx: &Receiver<WalRecord>,
     wal_dir: &Path,
     persisted: &AtomicU64,
     stop: &AtomicBool,
     queued_bytes: &AtomicU64,
+    unflushed_records: &AtomicU64,
+    sequence: &SequenceReservations,
+    pending: &mut Vec<WalRecord>,
 ) -> anyhow::Result<()> {
-    /// Releases a record's byte reservation the instant it leaves the channel.
-    ///
-    /// Called on RECEIPT, never after the write — a record that fails to
-    /// persist has still left the queue, and holding its bytes would shrink
-    /// the budget by exactly the amount a failing disk keeps producing.
-    fn release(queued_bytes: &AtomicU64, record: &WalRecord) {
-        queued_bytes.fetch_sub(record.frame.len() as u64, Ordering::Relaxed);
-    }
-
-    // `None` = no open segment; the next record reopens one. A transient disk
-    // error sets this back to `None` instead of propagating out of the thread.
-    // The thread therefore NEVER dies on a transient I/O hiccup — it keeps
-    // draining the channel so `append()` never observes `Disconnected` and the
-    // durable WAL floor survives. The ONLY clean exit is the channel closing.
-    let mut current: Option<BufWriter<File>> = open_segment_resilient(wal_dir);
-    let mut bytes_written: u64 = 0;
-
-    // Resolved ONCE, outside the loop, for the same reason the batch-boundary
-    // comment below gives: a handle re-resolved per iteration is how a metric
-    // write becomes a cost.
+    let mut current: Option<BufWriter<File>> =
+        open_segment_resilient(wal_dir, &sequence.directory_guard);
+    let mut bytes_written = 0u64;
     let depth_gauge = metrics::gauge!("tv_ws_frame_spill_queue_depth");
     let high_water_gauge = metrics::gauge!("tv_ws_frame_spill_queue_high_water");
-    // The queue's depth in BYTES, which is the dimension that can exhaust the
-    // host. `queue_depth` counts records, so a queue holding 200 depth-200
-    // frames and one holding 200 ticker packets read identically on it while
-    // differing by four orders of magnitude in resident heap. Without this
-    // gauge a byte blow-up is invisible right up to the OOM kill.
     let bytes_gauge = metrics::gauge!("tv_ws_frame_spill_queue_bytes");
-    let mut high_water: usize = 0;
-    // Seeded so the series REGISTERS at startup. The CloudWatch agent computes
-    // deltas and drops the first sample of a series it has never seen, so an
-    // always-zero gauge that is never set would be indistinguishable from an
-    // absent one — the exact failure that made a depth loss unknowable on
-    // 2026-08-28.
+    let owned_gauge = metrics::gauge!("tv_ws_frame_spill_worker_owned_records");
+    let retry_counter = metrics::counter!("tv_ws_frame_spill_batch_retries_total");
+    let mut high_water = 0usize;
     depth_gauge.set(0.0);
     high_water_gauge.set(0.0);
     bytes_gauge.set(0.0);
-    // Resolved once per writer start, not per iteration: an env read inside
-    // the loop would be a syscall on every batch.
+    owned_gauge.set(pending.len() as f64);
     let fsync_interval = resolve_wal_fsync_interval();
     let mut last_sync = Instant::now();
+    let mut dirty = false;
     loop {
-        // Timed, not blocking, so the thread can notice a shutdown request.
-        //
-        // The clean exit used to be reachable ONLY by every `Sender` being
-        // dropped. That can never happen here: the sole sender lives inside
-        // `WsFrameSpill`, which the drain paths hold through an `Arc`, so the
-        // channel stays open for the life of the process and the writer stayed
-        // parked in `recv()` while the process exited around it. Everything
-        // still queued went with it — captured, acknowledged as `Spilled`, and
-        // counted by nothing. This arm is what ends that.
-        let first = match rx.recv_timeout(WAL_WRITER_STOP_POLL) {
-            Ok(r) => r,
-            Err(RecvTimeoutError::Timeout) => {
-                // Empty channel by construction — `recv_timeout` only times out
-                // when nothing arrived. So a stop request that reaches here has
-                // a fully drained queue behind it and it is safe to close.
-                if stop.load(Ordering::Acquire) {
-                    finalise_segment(&mut current, "flush_on_stop", "fsync_on_stop");
-                    info!("ws-frame-spill-writer stop requested and queue drained; exiting");
-                    // The writer is gone: its last segment is closed and replayable again.
+        sequence.directory_guard.ensure_current()?;
+        if let Err(error) = sequence.refill_if_needed() {
+            metrics::counter!("tv_wal_sequence_reservation_failed_total").increment(1);
+            error!(error = %error, "WAL sequence reservation could not be synced; existing committed IDs remain bounded");
+        }
+        if pending.is_empty() {
+            let wait = writer_receive_wait(fsync_interval, last_sync.elapsed(), dirty);
+            let first = match rx.recv_timeout(wait) {
+                Ok(r) => r,
+                Err(RecvTimeoutError::Timeout) => {
+                    if stop.load(Ordering::Acquire) {
+                        finalise_segment(&mut current, "flush_on_stop", "fsync_on_stop");
+                        clear_open_segment_under(wal_dir);
+                        return Ok(());
+                    }
+                    last_sync =
+                        maybe_sync_segment(&mut current, fsync_interval, last_sync, &mut dirty);
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    finalise_segment(&mut current, "flush_on_close", "fsync_on_close");
                     clear_open_segment_under(wal_dir);
                     return Ok(());
                 }
-                continue;
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                // Reported, not discarded. This was `drop(w.flush())`, and
-                // the buffer it drops is `WAL_WRITER_BUFFER` = 256 KiB --
-                // roughly 1,300 records that `persisted` has ALREADY
-                // counted, because `persist_record_resilient` increments on
-                // a successful `write_all` into the buffer, not on a
-                // successful flush to the platter.
-                //
-                // So the old form did two wrong things at once: it lost the
-                // records, and it left `persisted_count()` over-reporting by
-                // exactly the number it lost. The sibling flush thirty lines
-                // below has always called `report_io_error` -- this arm and
-                // the rotation arm were the two that did not.
-                finalise_segment(&mut current, "flush_on_close", "fsync_on_close");
-                info!("ws-frame-spill-writer channel closed; exiting");
-                clear_open_segment_under(wal_dir);
-                return Ok(());
-            }
-        };
-
-        release(queued_bytes, &first);
-        #[cfg(test)]
-        maybe_test_panic(&first);
-        bytes_written += persist_record_resilient(&mut current, wal_dir, &first, persisted);
-
-        // Drain up to N more without blocking so we batch-flush.
-        for _ in 0..256 {
-            match rx.try_recv() {
-                Ok(r) => {
-                    release(queued_bytes, &r);
-                    #[cfg(test)]
-                    maybe_test_panic(&r);
-                    bytes_written += persist_record_resilient(&mut current, wal_dir, &r, persisted);
+            };
+            pending.push(first);
+            // A finite batch. Byte reservations stay charged while ownership
+            // moves from channel to worker, so dequeue cannot defeat the cap.
+            for _ in 0..256 {
+                match rx.try_recv() {
+                    Ok(r) => pending.push(r),
+                    Err(_) => break,
                 }
-                Err(_) => break,
             }
         }
-
-        if let Some(w) = current.as_mut()
-            && let Err(err) = w.flush()
+        #[cfg(test)]
+        if let Some(at) = pending
+            .iter()
+            .position(|r| r.frame.as_ref() == TEST_PANIC_SENTINEL)
         {
-            report_io_error("flush", &err);
-            // Drop the possibly-broken writer; the next record reopens it.
-            current = None;
-            thread::sleep(WAL_WRITER_IO_RETRY_BACKOFF);
+            // The deliberate sentinel is not a captured market frame. Keep
+            // every real record owned by the supervisor across this unwind.
+            let sentinel = pending.remove(at);
+            queued_bytes.fetch_sub(sentinel.frame.len() as u64, Ordering::Relaxed);
+            unflushed_records.fetch_sub(1, Ordering::Relaxed);
+            maybe_test_panic(&sentinel);
         }
-
-        // AFTER the flush, never before: syncing a file whose latest records
-        // are still sitting in the BufWriter would force the previous batch to
-        // the platter and leave this one exactly as exposed as before.
-        last_sync = maybe_sync_segment(&mut current, fsync_interval, last_sync);
-
-        // The exposure C1 named, made measurable.
-        //
-        // `AppendOutcome::Spilled` means QUEUED, not written: `append` is a
-        // `try_send` onto a 524,288-slot channel and this thread is what turns
-        // a queued record into bytes. Everything still in the channel at an
-        // abort (`panic = "abort"`, an OOM-kill, a SIGKILL past
-        // `TimeoutStopSec`) is PERMANENTLY LOST — and is counted by nothing,
-        // because `persisted` counts `write_all` and `drop_critical` counts
-        // only the refusals `try_send` rejected outright.
-        //
-        // Until this gauge the depth of that window had never been observed,
-        // so the honest answer to "how many frames could we lose on an abort?"
-        // was Unknown with a ceiling of 524,288 (~100 s at the 5,000 fps
-        // envelope). Now it is a number.
-        //
-        // Published HERE, at the batch boundary, and deliberately not in
-        // `append`: the hot path already learned this lesson once, when
-        // `record_ws_lag` allocated twice per tick (~36 M allocations/hour) on
-        // a path documented as allocation-free. One gauge write per ~257
-        // records costs nothing measurable; one per frame is how that defect
-        // was reintroduced.
-        //
-        // The high-water is the load-bearing half. A gauge sampled every 30 s
-        // by the CloudWatch agent will read ~0 all session and miss the burst
-        // that matters — the whole point is the PEAK during a disk stall, and
-        // a peak that decays between scrapes was never observed at all.
         let queued = rx.len();
         depth_gauge.set(queued as f64);
+        owned_gauge.set(pending.len() as f64);
         bytes_gauge.set(queued_bytes.load(Ordering::Relaxed) as f64);
-        if queued > high_water {
-            high_water = queued;
+        let outstanding = queued.saturating_add(pending.len());
+        if outstanding > high_water {
+            high_water = outstanding;
             high_water_gauge.set(high_water as f64);
         }
-
-        if bytes_written >= WAL_SEGMENT_MAX_BYTES {
-            // FLUSH **AND SYNC**. A rotation finalises this segment: nothing
-            // writes to it again, and `maybe_sync_segment` only ever syncs
-            // `current`, which one line below becomes the NEW file. Flushing
-            // alone therefore left every 128 MiB segment's tail in the page
-            // cache with no later sync to force it down, while `persisted`
-            // had already counted every record in it. This is the same
-            // finalisation the stop and close arms perform, and it is by far
-            // the most frequent of the three.
-            finalise_segment(&mut current, "flush_on_rotate", "fsync_on_rotate");
-            current = open_segment_resilient(wal_dir);
+        if current.is_none() {
+            current = open_segment_resilient(wal_dir, &sequence.directory_guard);
             bytes_written = 0;
+            dirty = false;
+            last_sync = Instant::now();
+        }
+        let Some(w) = current.as_mut() else {
+            retry_counter.increment(1);
+            thread::sleep(WAL_WRITER_IO_RETRY_BACKOFF);
+            continue;
+        };
+        sequence.directory_guard.ensure_current()?;
+        let attempt = flush_owned_batch(w, pending);
+        if let Err(err) = attempt {
+            report_io_error("batch_write_or_flush", &err);
+            retry_counter.increment(1);
+            // Do not let BufWriter::drop make a second, unobserved flush of a
+            // partially written buffer. Retry the whole identity-stable batch
+            // in a newly named segment; the old file stays available to triage.
+            if let Some(failed) = current.take() {
+                let (file, _unwritten) = failed.into_parts();
+                drop(file);
+            }
+            clear_open_segment_under(wal_dir);
+            thread::sleep(WAL_WRITER_IO_RETRY_BACKOFF);
+            continue;
+        }
+        bytes_written =
+            bytes_written.saturating_add(pending.iter().map(record_disk_size).sum::<u64>());
+        dirty = true;
+        // A flush acknowledgement, not stable-storage acknowledgement. Count
+        // each original batch only once even if an earlier attempt wrote a
+        // valid prefix that replay later encounters again.
+        let batch_records = pending.len() as u64;
+        for record in pending.drain(..) {
+            queued_bytes.fetch_sub(record.frame.len() as u64, Ordering::Relaxed);
+            unflushed_records.fetch_sub(1, Ordering::Release);
+        }
+        persisted.fetch_add(batch_records, Ordering::Release);
+        owned_gauge.set(0.0);
+        bytes_gauge.set(queued_bytes.load(Ordering::Relaxed) as f64);
+        last_sync = maybe_sync_segment(&mut current, fsync_interval, last_sync, &mut dirty);
+        if bytes_written >= WAL_SEGMENT_MAX_BYTES {
+            finalise_segment(&mut current, "flush_on_rotate", "fsync_on_rotate");
+            current = open_segment_resilient(wal_dir, &sequence.directory_guard);
+            bytes_written = 0;
+            dirty = false;
+            last_sync = Instant::now();
         }
     }
 }
 
-/// Open a fresh WAL segment, converting any error into `None` + a loud
-/// `WS-SPILL-01` log + counter so the writer thread keeps draining the channel
-/// instead of dying. The next record retries the open.
-fn open_segment_resilient(wal_dir: &Path) -> Option<BufWriter<File>> {
-    // Operator sweep row 22 (2026-09-08): the directory is created at boot,
-    // but a mid-session `rm -rf data/ws_wal` (the Quote 21 wipe shape, or an
-    // operator clearing disk by hand) left every later segment open failing
-    // with ENOENT until restart — the durable floor gone for the session
-    // while the writer "stayed alive". Re-creating it here costs one
-    // `mkdir -p` per segment rotation on the background writer thread, never
-    // per frame, and is idempotent when the directory exists.
-    // O(1) EXEMPT: segment-rotation path on the dedicated background writer thread, never the per-frame append
-    if let Err(err) = std::fs::create_dir_all(wal_dir) {
-        error!(
-            code = ErrorCode::WsSpill01WriterRespawn.code_str(),
-            stage = "create_dir",
-            error = %err,
-            "WAL spill writer could not create the WAL directory — will retry; thread stays alive"
-        );
-        metrics::counter!(
-            "tv_ws_frame_spill_write_errors_total",
-            "stage" => "create_dir"
-        )
-        .increment(1);
+/// A writer seam shared by the production batch and bounded regression
+/// fixtures. No ownership/counter changes occur before the final flush.
+fn flush_owned_batch<W: Write>(writer: &mut W, pending: &[WalRecord]) -> std::io::Result<()> {
+    for record in pending {
+        write_record(writer, record)?;
+    }
+    writer.flush()
+}
+
+/// Retry a segment open while the original directory ownership remains valid.
+/// Never recreate a deleted directory: a held flock on an unlinked inode
+/// cannot authorize writes into a newly created directory at the same path.
+fn open_segment_resilient(wal_dir: &Path, guard: &WalDirGuard) -> Option<BufWriter<File>> {
+    if let Err(error) = guard.ensure_current().and_then(|()| {
+        anyhow::ensure!(guard.path.parent().is_some_and(|parent|
+            replay_directory_key(parent) == replay_directory_key(wal_dir)),
+            "WAL open directory differs from its held ownership");
+        Ok(())
+    }) {
+        error!(code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+            stage = "directory_ownership", error = %error,
+            "WAL segment open refused: original directory/lock ownership is unavailable");
+        metrics::counter!("tv_ws_frame_spill_write_errors_total", "stage" => "directory_ownership")
+            .increment(1);
         return None;
     }
-    match open_new_segment(wal_dir) {
+    match open_new_segment(wal_dir, guard) {
         Ok(w) => Some(w),
         Err(err) => {
             error!(
@@ -1775,63 +1833,6 @@ fn open_segment_resilient(wal_dir: &Path) -> Option<BufWriter<File>> {
             )
             .increment(1);
             None
-        }
-    }
-}
-
-/// Durably write one record, reopening the segment first if needed. Returns the
-/// on-disk byte count actually persisted (0 if the write could not land).
-/// NEVER propagates an error — a transient disk failure must not kill the
-/// writer thread (that would silently end durable capture of every frame).
-fn persist_record_resilient(
-    current: &mut Option<BufWriter<File>>,
-    wal_dir: &Path,
-    r: &WalRecord,
-    persisted: &AtomicU64,
-) -> u64 {
-    if current.is_none() {
-        *current = open_segment_resilient(wal_dir);
-    }
-    let Some(w) = current.as_mut() else {
-        // No segment available (disk full / unwritable). The frame still
-        // reaches the in-memory broadcast + the persist-side ring→spill→DLQ;
-        // only the WAL belt is missing for this frame, which we count + alarm.
-        metrics::counter!(
-            "tv_ws_frame_spill_write_errors_total",
-            "stage" => "no_segment"
-        )
-        .increment(1);
-        // BACKOFF (2026-08-24, audit): the two SIBLING I/O failure arms — the
-        // flush arm and the `write_record` arm below — both sleep
-        // `WAL_WRITER_IO_RETRY_BACKOFF` before returning. This one did not, and
-        // it is the arm that fires on a FULL DISK: `open_segment_resilient`
-        // emits one coded `error!` per record while no segment can be opened,
-        // so at the ~5,000 frame/s envelope the writer spun through ~5,000
-        // `open()` syscalls and ~5,000 ERROR lines PER SECOND, written to the
-        // disk that is already full. The failure is detected either way
-        // (WS-SPILL-01 has a live metric-filter alarm), so this is not a
-        // silence fix — it stops a detected failure from amplifying itself and
-        // starving the very disk the operator has to recover.
-        //
-        // The sleep is the writer thread's own, exactly as in the sibling arms:
-        // this runs on the dedicated WAL writer, never on the hot path. Frames
-        // continue to reach the broadcast and the ring→spill→DLQ while it
-        // backs off — the durable-WAL belt is what is degraded, and it is
-        // already degraded by the full disk.
-        thread::sleep(WAL_WRITER_IO_RETRY_BACKOFF);
-        return 0;
-    };
-    match write_record(w, r) {
-        Ok(()) => {
-            persisted.fetch_add(1, Ordering::Relaxed);
-            record_disk_size(r)
-        }
-        Err(err) => {
-            report_io_error("write_record", &err);
-            // Drop the possibly-corrupt writer; reopen on the next record.
-            *current = None;
-            thread::sleep(WAL_WRITER_IO_RETRY_BACKOFF);
-            0
         }
     }
 }
@@ -1921,28 +1922,457 @@ pub fn current_frame_seq() -> u64 {
     WAL_FRAME_SEQ.load(Ordering::Acquire)
 }
 
+/// Legacy, non-durable sequence allocation for compatibility/tests. Production
+/// capture must use `WsFrameSpill::try_next_frame_seq`, whose directory has a
+/// synced reservation. These single-slot claims remain disjoint from every
+/// in-process writer reservation, but are not a restart durability API.
+/// Exhaustion terminates the process: this legacy infallible interface cannot
+/// report a refused allocation, and returning a fallback would reuse identity.
 pub fn next_frame_seq() -> u64 {
-    let now = SystemTime::now()
+    let (sequence, _) = match claim_sequence_range(sequence_clock_floor(), 1) {
+        Ok(claim) => claim,
+        Err(error) => {
+            error!(error = %error, "legacy WAL sequence allocation exhausted; refusing identity reuse");
+            std::process::abort();
+        }
+    };
+    WAL_FRAME_SEQ.fetch_max(sequence, Ordering::Release);
+    sequence
+}
+
+static WAL_RESERVED_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const SEQUENCE_RESERVATION_FILE: &str = "sequence.tvsq";
+const SEQUENCE_RESERVATION_TMP: &str = "sequence.tvsq.tmp";
+const SEQUENCE_INITIALIZED_FILE: &str = "sequence.initialized";
+const SEQUENCE_RESERVATION_FRAMES: u64 = 1 << 20;
+const SEQUENCE_REFILL_FRAMES: u64 = SEQUENCE_RESERVATION_FRAMES / 8;
+const SEQUENCE_MANIFEST_LEN: usize = 52;
+const MAX_FRAME_SEQUENCE: u64 = (i64::MAX as u64) & !MAX_PACKET_INDEX;
+
+fn sequence_clock_floor() -> u64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
-        .unwrap_or(0);
-    // Work in BASE units (nanos >> reserved bits) so the returned value always
-    // ends in zeroed low bits.
-    let now_base = now >> PACKET_INDEX_BITS;
-    // Never let the shift back up overflow u64.
-    let base_ceiling = u64::MAX >> PACKET_INDEX_BITS;
+        .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+        & !MAX_PACKET_INDEX
+}
+
+fn claim_sequence_range(floor: u64, frames: u64) -> anyhow::Result<(u64, u64)> {
+    anyhow::ensure!(frames > 0, "cannot reserve an empty sequence range");
+    let span = frames
+        .checked_shl(PACKET_INDEX_BITS)
+        .filter(|_| frames <= (MAX_FRAME_SEQUENCE >> PACKET_INDEX_BITS))
+        .ok_or_else(|| anyhow::anyhow!("sequence reservation exceeds supported range"))?;
     loop {
-        let prev = WAL_FRAME_SEQ.load(Ordering::Relaxed);
-        let prev_base = prev >> PACKET_INDEX_BITS;
-        let next_base = prev_base.saturating_add(1).max(now_base).min(base_ceiling);
-        let next = next_base << PACKET_INDEX_BITS;
-        if WAL_FRAME_SEQ
-            .compare_exchange_weak(prev, next, Ordering::SeqCst, Ordering::Relaxed)
+        let previous = WAL_RESERVED_SEQUENCE.load(Ordering::Acquire);
+        let base = previous.max(floor & !MAX_PACKET_INDEX);
+        let end = base
+            .checked_add(span)
+            .filter(|end| *end <= MAX_FRAME_SEQUENCE)
+            .ok_or_else(|| anyhow::anyhow!("signed capture_seq identity space exhausted"))?;
+        if WAL_RESERVED_SEQUENCE
+            .compare_exchange_weak(previous, end, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            return next;
+            return Ok((base + (1 << PACKET_INDEX_BITS), end));
         }
     }
+}
+
+/// Per-directory issuer. Its bound becomes visible only after file sync,
+/// atomic rename and parent-directory sync. Ranges claimed by different
+/// instances in this process are disjoint, even if a write fails: failed
+/// claims are burned. Independent processes sharing one capture namespace
+/// must share this owned directory, not copy the manifest to separate roots.
+/// A changed root in the same database/feed namespace requires verified
+/// offline migration; multiple roots are not a restart-global allocator.
+struct SequenceReservations {
+    directory_guard: WalDirGuard,
+    directory_digest: [u8; 32],
+    cursor: AtomicU64,
+    reserved_through: AtomicU64,
+    generation: AtomicU64,
+    refill: std::sync::Mutex<()>,
+}
+
+impl SequenceReservations {
+    fn open(directory: &Path, guard: &WalDirGuard) -> anyhow::Result<Self> {
+        guard.ensure_current()?;
+        let directory = std::fs::canonicalize(directory)?;
+        anyhow::ensure!(
+            guard.path.parent() == Some(directory.as_path()),
+            "sequence authority directory differs from held ownership"
+        );
+        let directory_digest: [u8; 32] =
+            Sha256::digest(directory.as_os_str().as_encoded_bytes()).into();
+        let previous = match File::open(guard.io_path(SEQUENCE_RESERVATION_FILE)?) {
+            Ok(mut file) => {
+                anyhow::ensure!(
+                    file.metadata()?.len() == SEQUENCE_MANIFEST_LEN as u64,
+                    "invalid WAL sequence manifest size"
+                );
+                let mut bytes = [0u8; SEQUENCE_MANIFEST_LEN];
+                file.read_exact(&mut bytes)?;
+                Self::decode_manifest(&bytes, &directory_digest)?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Absence is allowed only for a genuinely new namespace.
+                // A lock file alone is created before first initialization.
+                for entry in std::fs::read_dir(&directory)? {
+                    let path = entry?.path();
+                    anyhow::ensure!(
+                        path.file_name()
+                            .is_some_and(|name| name == WAL_DIR_LOCK_FILE),
+                        "sequence reservation missing beside existing history; verified migration required: {directory:?}"
+                    );
+                }
+                0
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let issuer = Self {
+            directory_guard: guard.clone_claim(),
+            directory_digest,
+            cursor: AtomicU64::new(previous),
+            reserved_through: AtomicU64::new(previous),
+            generation: AtomicU64::new(0),
+            refill: std::sync::Mutex::new(()),
+        };
+        // The retained bound can be ahead of the wall clock after a burst or
+        // backwards clock step. No database scan or timing assumption is used.
+        let (start, end) = claim_sequence_range(
+            previous.max(sequence_clock_floor()),
+            SEQUENCE_RESERVATION_FRAMES,
+        )?;
+        if previous == 0 {
+            // This marker survives normal WAL pruning. Losing only the live
+            // manifest can therefore never silently recreate a new authority.
+            let mut initialized = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(guard.io_path(SEQUENCE_INITIALIZED_FILE)?)?;
+            initialized.write_all(&issuer.directory_digest)?;
+            initialized.sync_all()?;
+            guard.directory.sync_all()?;
+            guard.ensure_current()?;
+        }
+        issuer.commit_bound(end)?;
+        issuer
+            .cursor
+            .store(start - (1 << PACKET_INDEX_BITS), Ordering::Release);
+        issuer.reserved_through.store(end, Ordering::Release);
+        Ok(issuer)
+    }
+
+    fn decode_manifest(bytes: &[u8], directory_digest: &[u8; 32]) -> anyhow::Result<u64> {
+        anyhow::ensure!(
+            bytes.len() == SEQUENCE_MANIFEST_LEN,
+            "invalid WAL sequence manifest length"
+        );
+        anyhow::ensure!(
+            &bytes[..4] == b"TVSQ" && bytes[4..8] == 1u32.to_le_bytes(),
+            "unsupported WAL sequence manifest"
+        );
+        anyhow::ensure!(
+            &bytes[8..40] == directory_digest,
+            "WAL sequence manifest belongs to a different directory"
+        );
+        let expected = u32::from_le_bytes(bytes[48..52].try_into()?);
+        anyhow::ensure!(
+            crc32_ieee_of(&[&bytes[..48]]) == expected,
+            "WAL sequence manifest checksum mismatch"
+        );
+        let reserved = u64::from_le_bytes(bytes[40..48].try_into()?);
+        anyhow::ensure!(
+            reserved > 0 && reserved <= MAX_FRAME_SEQUENCE && reserved & MAX_PACKET_INDEX == 0,
+            "WAL sequence manifest bound outside supported capture_seq range"
+        );
+        Ok(reserved)
+    }
+
+    fn commit_bound(&self, end: u64) -> anyhow::Result<()> {
+        self.directory_guard.ensure_current()?;
+        let mut bytes = [0u8; SEQUENCE_MANIFEST_LEN];
+        bytes[..4].copy_from_slice(b"TVSQ");
+        bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
+        bytes[8..40].copy_from_slice(&self.directory_digest);
+        bytes[40..48].copy_from_slice(&end.to_le_bytes());
+        let crc = crc32_ieee_of(&[&bytes[..48]]);
+        bytes[48..52].copy_from_slice(&crc.to_le_bytes());
+        let temporary = self.directory_guard.io_path(SEQUENCE_RESERVATION_TMP)?;
+        let manifest = self.directory_guard.io_path(SEQUENCE_RESERVATION_FILE)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &manifest)?;
+        self.directory_guard.directory.sync_all()?;
+        self.directory_guard.ensure_current()?;
+        Ok(())
+    }
+
+    fn allocate(&self) -> Option<u64> {
+        if !self.directory_guard.valid.load(Ordering::Acquire) {
+            return None;
+        }
+        let generation = self.generation.load(Ordering::Acquire);
+        if generation & 1 != 0 {
+            return None;
+        }
+        loop {
+            let previous = self.cursor.load(Ordering::Acquire);
+            let next = previous.checked_add(1 << PACKET_INDEX_BITS)?;
+            if next > self.reserved_through.load(Ordering::Acquire)
+                || self.generation.load(Ordering::Acquire) != generation
+            {
+                return None;
+            }
+            if self
+                .cursor
+                .compare_exchange_weak(previous, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                // A rollover racing the final allocation can conservatively
+                // burn this ID. It cannot return an uncommitted or reused ID.
+                if self.generation.load(Ordering::Acquire) != generation
+                    || !self.directory_guard.valid.load(Ordering::Acquire)
+                {
+                    return None;
+                }
+                WAL_FRAME_SEQ.fetch_max(next, Ordering::Release);
+                return Some(next);
+            }
+        }
+    }
+
+    fn refill_if_needed(&self) -> anyhow::Result<()> {
+        self.directory_guard.ensure_current()?;
+        let old_end = self.reserved_through.load(Ordering::Acquire);
+        let cursor = self.cursor.load(Ordering::Acquire);
+        if old_end.saturating_sub(cursor) >> PACKET_INDEX_BITS > SEQUENCE_REFILL_FRAMES {
+            return Ok(());
+        }
+        let _refill = self
+            .refill
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sequence refill lock poisoned"))?;
+        let old_end = self.reserved_through.load(Ordering::Acquire);
+        if old_end.saturating_sub(self.cursor.load(Ordering::Acquire)) >> PACKET_INDEX_BITS
+            > SEQUENCE_REFILL_FRAMES
+        {
+            return Ok(());
+        }
+        // With one production writer the reservation can extend contiguously.
+        // When another instance has claimed an intervening range, finish this
+        // range first; never extend a bound across somebody else's IDs.
+        let observed_global = WAL_RESERVED_SEQUENCE.load(Ordering::Acquire);
+        if observed_global != old_end && self.cursor.load(Ordering::Acquire) != old_end {
+            return Ok(());
+        }
+        let span = SEQUENCE_RESERVATION_FRAMES << PACKET_INDEX_BITS;
+        let contiguous_end = old_end
+            .checked_add(span)
+            .filter(|end| *end <= MAX_FRAME_SEQUENCE);
+        if let Some(end) = contiguous_end
+            && WAL_RESERVED_SEQUENCE
+                .compare_exchange(old_end, end, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            self.commit_bound(end)?;
+            self.reserved_through.store(end, Ordering::Release);
+            return Ok(());
+        }
+        if self.cursor.load(Ordering::Acquire) != old_end {
+            return Ok(());
+        }
+        let (start, end) = claim_sequence_range(old_end, SEQUENCE_RESERVATION_FRAMES)?;
+        self.commit_bound(end)?;
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.cursor
+            .store(start - (1 << PACKET_INDEX_BITS), Ordering::Release);
+        self.reserved_through.store(end, Ordering::Release);
+        self.generation.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+}
+
+/// Inputs to an explicit offline migration. The caller must obtain a
+/// conservative upper bound across the complete capture namespace: database,
+/// rescue/history tiers and retained WAL. A DB MAX from only current rows is
+/// not automatically sufficient when older history was pruned.
+#[derive(Debug, Clone)]
+pub struct SequenceMigrationEvidence {
+    pub highest_capture_seq: u64,
+    pub complete_namespace_verified: bool,
+    /// Human-readable evidence identifier, query/backup scope and verifier;
+    /// never credentials or captured production payloads. At most 4096 bytes.
+    pub provenance: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SequenceMigrationReceipt {
+    pub verified_capture_bound: u64,
+    pub retained_wal_bound: u64,
+    pub reserved_through: u64,
+    pub receipt_path: PathBuf,
+}
+
+/// Initialize a missing identity manifest without deleting existing history.
+/// This is deliberately not called by normal startup. Requires the exact
+/// held writer guard, caller-attested complete namespace evidence, and a
+/// complete CRC-validated scan of every retained WAL (including quarantine).
+/// Any unreadable/unsupported identity state refuses migration.
+///
+/// The receipt, initialization marker and manifest are synced before return.
+/// No IDs are issued here; normal startup durably reserves the next range.
+pub fn migrate_sequence_authority(
+    directory: &Path,
+    guard: &WalDirGuard,
+    evidence: SequenceMigrationEvidence,
+) -> anyhow::Result<SequenceMigrationReceipt> {
+    guard.ensure_current()?;
+    let directory = std::fs::canonicalize(directory)?;
+    anyhow::ensure!(
+        guard
+            .path
+            .parent()
+            .is_some_and(|parent| replay_directory_key(parent) == directory),
+        "migration guard belongs to another WAL directory"
+    );
+    anyhow::ensure!(
+        evidence.complete_namespace_verified,
+        "migration requires an explicitly verified complete capture namespace bound"
+    );
+    anyhow::ensure!(
+        !evidence.provenance.trim().is_empty() && evidence.provenance.len() <= 4096,
+        "migration requires bounded nonempty evidence provenance"
+    );
+    anyhow::ensure!(
+        evidence.highest_capture_seq <= i64::MAX as u64,
+        "migration capture bound exceeds signed database range"
+    );
+    anyhow::ensure!(
+        !directory.join(SEQUENCE_RESERVATION_FILE).exists(),
+        "sequence manifest already exists; migration never overwrites an authority"
+    );
+    let _maintenance = WAL_MAINTENANCE
+        .lock()
+        .map_err(|_| anyhow::anyhow!("WAL maintenance lock poisoned"))?;
+    let mut retained_high = 0;
+    for candidate in [
+        directory.clone(),
+        directory.join(REPLAYING_SUBDIR),
+        directory.join(ARCHIVE_SUBDIR),
+        directory.join(QUARANTINE_SUBDIR),
+    ] {
+        let entries = match std::fs::read_dir(&candidate) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("wal") {
+                continue;
+            }
+            anyhow::ensure!(
+                !is_open_segment(&path),
+                "cannot migrate while a WAL segment is open: {path:?}"
+            );
+            retained_high = retained_high.max(scan_sequence_segment(&path, true)?);
+        }
+    }
+    anyhow::ensure!(
+        evidence.highest_capture_seq >= retained_high,
+        "verified bound {} is below retained WAL {}",
+        evidence.highest_capture_seq,
+        retained_high
+    );
+    let bound = (evidence.highest_capture_seq & !MAX_PACKET_INDEX).max(sequence_clock_floor());
+    anyhow::ensure!(
+        bound
+            .checked_add(SEQUENCE_RESERVATION_FRAMES << PACKET_INDEX_BITS)
+            .is_some_and(|end| end <= MAX_FRAME_SEQUENCE),
+        "migration leaves no supported reservation headroom"
+    );
+    let digest: [u8; 32] = Sha256::digest(directory.as_os_str().as_encoded_bytes()).into();
+    guard.ensure_current()?;
+    let initializer = SequenceReservations {
+        directory_guard: guard.clone_claim(),
+        directory_digest: digest,
+        cursor: AtomicU64::new(bound),
+        reserved_through: AtomicU64::new(bound),
+        generation: AtomicU64::new(0),
+        refill: std::sync::Mutex::new(()),
+    };
+    let receipt_name = format!("sequence-migration-{bound}.json");
+    let receipt_path = directory.join(&receipt_name);
+    let receipt = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": 1,
+        "verified_capture_bound": evidence.highest_capture_seq,
+        "retained_wal_bound": retained_high,
+        "reserved_through": bound,
+        "complete_namespace_verified": evidence.complete_namespace_verified,
+        "provenance": evidence.provenance,
+    }))?;
+    let receipt_io_path = guard.io_path(&receipt_name)?;
+    match OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&receipt_io_path)
+    {
+        Ok(mut file) => {
+            file.write_all(&receipt)?;
+            file.sync_all()?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let mut file = File::open(&receipt_io_path)?;
+            anyhow::ensure!(
+                file.metadata()?.len() == receipt.len() as u64,
+                "migration receipt already exists with different evidence"
+            );
+            let mut existing = vec![0u8; receipt.len()];
+            file.read_exact(&mut existing)?;
+            anyhow::ensure!(
+                existing == receipt,
+                "migration receipt already exists with different evidence"
+            );
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let marker = guard.io_path(SEQUENCE_INITIALIZED_FILE)?;
+    if marker.exists() {
+        let mut file = File::open(&marker)?;
+        anyhow::ensure!(
+            file.metadata()?.len() == digest.len() as u64,
+            "invalid initialization marker length"
+        );
+        let mut existing = [0u8; 32];
+        file.read_exact(&mut existing)?;
+        anyhow::ensure!(
+            existing == digest,
+            "initialization marker belongs to another directory"
+        );
+    } else {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(marker)?;
+        file.write_all(&digest)?;
+        file.sync_all()?;
+    }
+    guard.directory.sync_all()?;
+    guard.ensure_current()?;
+    initializer.commit_bound(bound)?;
+    Ok(SequenceMigrationReceipt {
+        verified_capture_bound: evidence.highest_capture_seq,
+        retained_wal_bound: retained_high,
+        reserved_through: bound,
+        receipt_path,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2142,52 +2572,213 @@ pub const WAL_SEQ_RESEED_ADVANCED_COUNTER: &str = "tv_wal_seq_reseed_advanced_to
 /// ticks that cannot be reconstructed from anything, because both writers
 /// believe they succeeded.
 ///
-/// The guard is held by value inside [`WsFrameSpill`], so dropping the spill
-/// releases the directory for the next process.
+/// The writer and spill share the guard. A public-handle drop cannot release
+/// ownership while the background writer still holds an unflushed retry batch.
 #[derive(Debug)]
 pub struct WalDirGuard {
-    /// Held open purely so the `flock` stays taken. Dropping this releases it,
-    /// which is the intended release path.
-    _lock: File,
+    /// Clones retain the same locked open-file description and directory inode.
+    _lock: Arc<File>,
+    directory: Arc<File>,
     path: PathBuf,
+    valid: Arc<AtomicBool>,
 }
 
 impl WalDirGuard {
+    // Private sharing only: callers cannot clone one claim into two writers.
+    fn clone_claim(&self) -> Self {
+        Self {
+            _lock: Arc::clone(&self._lock),
+            directory: Arc::clone(&self.directory),
+            path: self.path.clone(),
+            valid: Arc::clone(&self.valid),
+        }
+    }
+
     /// The lock file this guard holds.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// A detected path/lock replacement permanently revokes this authority.
+    /// Checking occurs on the cold writer path; frame allocation reads only
+    /// the shared atomic refusal flag. The application must stop capture and
+    /// recover the original namespace before creating a new authority.
+    fn ensure_current(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.valid.load(Ordering::Acquire),
+            "WAL directory ownership was revoked"
+        );
+        let result = self.check_current();
+        if result.is_err() {
+            self.valid.store(false, Ordering::Release);
+        }
+        result
+    }
+
+    #[cfg(unix)]
+    fn check_current(&self) -> anyhow::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let directory = self
+            .path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("WAL guard lacks directory"))?;
+        let held_directory = self.directory.metadata()?;
+        let live_directory = std::fs::symlink_metadata(directory)?;
+        let held_lock = self._lock.metadata()?;
+        let live_lock = std::fs::symlink_metadata(&self.path)?;
+        anyhow::ensure!(
+            live_directory.is_dir()
+                && held_directory.dev() == live_directory.dev()
+                && held_directory.ino() == live_directory.ino()
+                && live_lock.is_file()
+                && held_lock.dev() == live_lock.dev()
+                && held_lock.ino() == live_lock.ino(),
+            "WAL directory or lock inode changed; retained ownership cannot authorize the replacement"
+        );
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn check_current(&self) -> anyhow::Result<()> {
+        anyhow::bail!("WAL directory identity validation is unsupported on this platform")
+    }
+
+    /// Linux writes are anchored to the held directory descriptor, so a
+    /// concurrent path replacement cannot redirect payload/manifest writes
+    /// into another writer's replacement namespace. Metadata checks before
+    /// and after still refuse continued operation after ownership is lost.
+    fn io_path(&self, name: impl AsRef<Path>) -> anyhow::Result<PathBuf> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            Ok(PathBuf::from(format!("/proc/self/fd/{}", self.directory.as_raw_fd())).join(name))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.path
+                .parent()
+                .map(|directory| directory.join(name))
+                .ok_or_else(|| anyhow::anyhow!("WAL guard lacks directory for owned I/O"))
+        }
+    }
 }
 
-/// Take the exclusive claim on `wal_dir`, or refuse.
-///
-/// # The two failures are NOT the same, and they get opposite treatment
-///
-/// - **CONTENTION** — another live process holds the lock. This is the case the
-///   lock exists for, and it is fail-CLOSED: `Err`. Two processes minting
-///   `capture_seq` from independent clocks destroy ticks through the DEDUP key
-///   with no counter to show it, so one refused boot is the cheap outcome.
-///
-/// - **THE LOCK FILE CANNOT BE CREATED** — an unwritable directory, a full
-///   disk. This returns `Ok(None)`, and the caller proceeds DEGRADED. It is not
-///   evidence of a second process, and killing the lane over a transient
-///   filesystem problem is the worse failure: the writer is deliberately built
-///   to survive an unwritable directory and recover when permission returns
-///   (`test_writer_survives_unwritable_dir_then_recovers` pins exactly that).
-///   Turning that recoverable state into a dead feed would trade a rare silent
-///   loss for a common total outage.
-///
-/// **Honest limit of the degraded arm:** while `Ok(None)` is in force, mutual
-/// exclusion is NOT enforced. It is logged with a coded error and counted, so
-/// the state is visible rather than assumed away — but a second process started
-/// during it would not be refused. That window is bounded by the directory
-/// being unwritable, which the writer is already reporting loudly through
-/// `WS-SPILL-01`.
-///
-/// # Errors
-///
-/// Contention only. A creation failure is `Ok(None)`, never `Err`.
+/// Production replay, confirmation and retention bound to an existing
+/// directory claim. Clone shares the same held descriptors; it cannot be
+/// converted into a second writer. Path-only free functions remain for
+/// compatibility fixtures, and are not the production ownership boundary.
+#[derive(Debug)]
+pub struct WalMaintenance {
+    guard: WalDirGuard,
+}
+
+impl Clone for WalMaintenance {
+    fn clone(&self) -> Self {
+        Self {
+            guard: self.guard.clone_claim(),
+        }
+    }
+}
+
+impl WalMaintenance {
+    pub fn from_guard(guard: &WalDirGuard) -> anyhow::Result<Self> {
+        guard.ensure_current()?;
+        metrics::counter!("tv_wal_maintenance_ownership_refused_total").increment(0);
+        Ok(Self {
+            guard: guard.clone_claim(),
+        })
+    }
+
+    fn anchored_directory(&self) -> anyhow::Result<PathBuf> {
+        if let Err(error) = self.guard.ensure_current() {
+            metrics::counter!("tv_wal_maintenance_ownership_refused_total").increment(1);
+            error!(error = %error, "WAL maintenance refused: original directory ownership is unavailable");
+            return Err(error);
+        }
+        self.guard.io_path("")
+    }
+
+    pub fn replay_fenced(&self) -> anyhow::Result<WalReplayBatch> {
+        self.replay_with_report_fenced(WAL_REPLAY_MAX_BYTES)
+    }
+
+    pub fn replay_with_report_fenced(&self, budget_bytes: usize) -> anyhow::Result<WalReplayBatch> {
+        let directory = self.anchored_directory()?;
+        let batch = replay_all_with_report_fenced(&directory, budget_bytes)?;
+        if let Err(error) = self.guard.ensure_current() {
+            // The directory may have moved, so its canonical key can differ
+            // from the one recorded by replay. Discard this exact generation.
+            if let Ok(mut manifests) = REPLAY_RECEIPTS.lock() {
+                manifests.retain(|manifest| manifest.generation != batch.confirmation_id);
+            }
+            return Err(error);
+        }
+        if batch.confirmation_id != 0 {
+            let key = replay_directory_key(&directory);
+            let mut manifests = REPLAY_RECEIPTS
+                .lock()
+                .map_err(|_| anyhow::anyhow!("WAL receipt registry poisoned"))?;
+            let manifest = manifests
+                .iter_mut()
+                .find(|manifest| {
+                    manifest.directory == key && manifest.generation == batch.confirmation_id
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("WAL replay receipt was superseded before ownership binding")
+                })?;
+            // The descriptor stays pinned even if the caller drops its handle
+            // before delivering this pass's semantic ACK.
+            manifest._ownership = Some(self.guard.clone_claim());
+        }
+        Ok(batch)
+    }
+
+    #[must_use]
+    pub fn confirm_replayed_generation(&self, generation: u64) -> bool {
+        let Ok(directory) = self.anchored_directory() else {
+            return false;
+        };
+        let confirmed = confirm_replayed_generation(&directory, generation);
+        self.guard.ensure_current().is_ok() && confirmed
+    }
+
+    fn prune_owned(&self, prune: impl FnOnce(&Path) -> ArchivePruneOutcome) -> ArchivePruneOutcome {
+        let Ok(directory) = self.anchored_directory() else {
+            return ArchivePruneOutcome {
+                failed: 1,
+                ..ArchivePruneOutcome::default()
+            };
+        };
+        let mut outcome = prune(&directory);
+        if self.guard.ensure_current().is_err() {
+            outcome.failed += 1;
+        }
+        outcome
+    }
+
+    #[must_use]
+    pub fn prune_archived_segments(
+        &self,
+        retention_secs: u64,
+        max_bytes: u64,
+    ) -> ArchivePruneOutcome {
+        self.prune_owned(|directory| prune_archived_segments(directory, retention_secs, max_bytes))
+    }
+
+    #[must_use]
+    pub fn prune_active_segments(
+        &self,
+        retention_secs: u64,
+        max_bytes: u64,
+    ) -> ArchivePruneOutcome {
+        self.prune_owned(|directory| prune_active_segments(directory, retention_secs, max_bytes))
+    }
+}
+
+/// Claim exclusive WAL-directory ownership before any replay, migration or
+/// writer startup. Directory creation, lock-file access and filesystem-lock
+/// failures all return Err; absence of proof never enables concurrent owners.
 pub fn lock_wal_dir(wal_dir: &Path) -> anyhow::Result<Option<WalDirGuard>> {
     // CREATE THE DIRECTORY FIRST (2026-08-28, round-2 fix).
     //
@@ -2209,14 +2800,15 @@ pub fn lock_wal_dir(wal_dir: &Path) -> anyhow::Result<Option<WalDirGuard>> {
             code = ErrorCode::WsSpill01WriterRespawn.code_str(),
             wal_dir = ?wal_dir,
             error = %e,
-            "could not create the WAL directory, so one-writer-per-directory is NOT \
-             enforced for this process. Continuing anyway: the spill writer survives and \
-             recovers from an unwritable directory, and killing the feed over it would be \
-             the worse failure. While this persists, a second process would not be refused."
+            "WAL directory creation failed; exclusive ownership is unproved and startup is refused"
         );
-        return Ok(None);
+        return Err(anyhow::anyhow!(
+            "exclusive WAL directory ownership unavailable: {e}"
+        ));
     }
-    let path = wal_dir.join(WAL_DIR_LOCK_FILE);
+    let canonical_directory = std::fs::canonicalize(wal_dir)?;
+    let directory = Arc::new(File::open(&canonical_directory)?);
+    let path = canonical_directory.join(WAL_DIR_LOCK_FILE);
     // `create(true)` and deliberately NOT `create_new(true)`: the file survives
     // a clean shutdown and carries no state — the kernel lock IS the state — so
     // an existing file is the normal case and is reused.
@@ -2234,18 +2826,25 @@ pub fn lock_wal_dir(wal_dir: &Path) -> anyhow::Result<Option<WalDirGuard>> {
                 code = ErrorCode::WsSpill01WriterRespawn.code_str(),
                 lock_file = ?path,
                 error = %e,
-                "could not create the WAL directory lock file, so one-writer-per-directory \
-                 is NOT enforced for this process. Continuing anyway: the usual cause is an \
-                 unwritable directory or a full disk, which the spill writer already survives \
-                 and recovers from, and killing the feed over it would be the worse failure. \
-                 While this persists, a second process on this directory would not be refused."
+                "WAL lock file could not be opened; refusing startup without exclusive ownership"
             );
-            return Ok(None);
+            return Err(anyhow::anyhow!(
+                "exclusive WAL directory ownership unavailable: {e}"
+            ));
         }
     };
 
     match lock.try_lock() {
-        Ok(()) => Ok(Some(WalDirGuard { _lock: lock, path })),
+        Ok(()) => {
+            let guard = WalDirGuard {
+                _lock: Arc::new(lock),
+                directory,
+                path,
+                valid: Arc::new(AtomicBool::new(true)),
+            };
+            guard.ensure_current()?;
+            Ok(Some(guard))
+        }
         // CONTENTION — the lock is genuinely held. Fail closed. This is the one
         // arm the whole mechanism exists for.
         // O(1) EXEMPT: a match PATTERN on an error variant, not a filesystem call — and the whole function is a one-shot boot-time claim, never on any per-frame path.
@@ -2257,104 +2856,34 @@ pub fn lock_wal_dir(wal_dir: &Path) -> anyhow::Result<Option<WalDirGuard>> {
                  processes minting capture_seq from their own clocks silently destroy \
                  ticks through the ticks DEDUP key, with no counter to show it. \
                  Identify the incumbent with `fuser -v` on the lock file and stop it, \
-                 or point this process at its own WAL directory."
+                 then recover the original directory. A different WAL root sharing \
+                 this database/feed namespace requires verified offline sequence migration."
             ))
         }
-        // THE FILESYSTEM CANNOT LOCK — not evidence of anything, and fatal if
-        // treated as such (2026-08-28).
-        //
-        // `try_lock` returns `Error(io)` rather than `WouldBlock` when the
-        // filesystem has no working `flock`: NFS without lockd, some FUSE and
-        // overlay mounts. Collapsing that into the contention arm made an
-        // unlockable filesystem indistinguishable from a live incumbent, and
-        // since `main` exits on this error, the result was a PERMANENT BOOT
-        // LOOP on a mount that simply lacks locking — a total outage caused by
-        // the safety mechanism rather than by anything it protects against.
-        //
-        // This is the same over-fail as the create arm above, which was
-        // repaired earlier the same day and left standing here, in the same
-        // function. Both now degrade for the same reason: refusing to run is
-        // only correct when a SECOND WRITER is the actual evidence.
+        // An unsupported lock cannot establish exclusive identity ownership.
         Err(e) => {
             metrics::counter!(WAL_DIR_LOCK_UNAVAILABLE_COUNTER).increment(1);
             error!(
                 code = ErrorCode::WsSpill01WriterRespawn.code_str(),
                 lock_file = ?path,
                 error = %e,
-                "the filesystem refused to lock the WAL directory, so \
-                 one-writer-per-directory is NOT enforced for this process. This is a \
-                 lock-support failure, not a second process — the usual cause is a \
-                 mount without working flock (NFS without lockd, some FUSE or overlay \
-                 mounts). Continuing anyway, because refusing here would boot-loop the \
-                 feed forever on a filesystem that can never satisfy it. While this \
-                 persists, a second process on this directory would not be refused."
+                "filesystem locking is unavailable; refusing startup without exclusive identity ownership"
             );
-            Ok(None)
+            Err(anyhow::anyhow!(
+                "exclusive WAL directory ownership unavailable: {e}"
+            ))
         }
     }
 }
 
-/// How many trailing segments per directory the boot high-water probe reads.
+/// Greatest CRC-verified, complete, signed-column-representable sequence in
+/// all retained WAL segments. Includes archives and quarantine because their
+/// earlier complete records may already have reached downstream sinks.
 ///
-/// # Why more than one
-///
-/// The probe used to read only `segs.last()`, on the reasoning that the newest
-/// segment holds the maximum. True while the writer is running — and FALSE in
-/// exactly the case the probe exists for. `writer_loop` opens the next segment
-/// file BEFORE writing anything into it, so a crash in that window leaves a
-/// ZERO-BYTE newest segment. The probe then read 0, seeded nothing, and the
-/// restart re-issued `capture_seq` values already in the database, where
-/// QuestDB upserts the collisions away with no counter anywhere to show it.
-/// The same shape follows a torn or garbage first header, which ends the walk
-/// at offset 0.
-///
-/// FOUR, not "all": the cost is bounded and the benefit saturates immediately.
-/// Reading every segment in a long-running directory is an unbounded boot-time
-/// walk over a path that only needs to find one non-empty file, and four covers
-/// an empty newest plus three consecutive torn predecessors — a shape no
-/// observed crash has produced.
-const HIGH_WATER_SEGMENTS_PER_DIR: usize = 4;
-
-/// The highest `frame_seq` already committed to disk under `wal_dir`.
-///
-/// # Why a restart needs this
-///
-/// [`next_frame_seq`] returns `max(prev + 1, wall_clock)`. Above roughly 7,600
-/// frames/second the `prev + 1` arm wins and the counter runs AHEAD of the wall
-/// clock — its own header says so. A process that then restarts re-seeds from
-/// `AtomicU64::new(0)` plus the wall clock, i.e. from a value BELOW the
-/// high-water mark it had reached, and begins re-issuing sequence numbers that
-/// are already rows in the database. Those rows share the full DEDUP key with
-/// the new ticks and upsert them away.
-///
-/// It is the same silent loss as the two-process case, reached by one process
-/// and a crash instead of by two. So the counter has to be a ratchet ACROSS
-/// restarts, not only within one run.
-///
-/// # Cost
-///
-/// At most [`HIGH_WATER_SEGMENTS_PER_DIR`] trailing segments of each of the
-/// three directories (live, `replaying/`, `archive/`) are scanned, and only
-/// record HEADERS are read — frame payloads are seeked past, never copied. The
-/// walk stops at the first segment that yields a sequence, so the common case
-/// reads exactly one file per directory; the extra three exist for the crash
-/// window that leaves a zero-byte or torn newest segment.
-///
-/// CORRECTED 2026-08-28: this paragraph said "Only the NEWEST segment … is
-/// scanned … Three bounded header walks", which was true when written and
-/// stopped being true in the same change that made the walk read backwards.
-/// A cost claim that describes the previous behaviour is exactly the stale-doc
-/// class this file's own corrections keep recording.
-///
-/// Returns `0` when the directory is absent, empty, or holds only v1 (`TVW1`)
-/// records, which predate `frame_seq`. `0` is the correct answer there: it
-/// leaves the wall clock as the seed, exactly as before.
-///
-/// The greatest `frame_seq` written to any segment under `wal_dir`.
-///
-/// Best-effort and deliberately so — see [`highest_frame_seq_in_segment`]. A
-/// LOWER bound is strictly better than the wall clock alone; refusing to boot
-/// over a torn tail would turn a safety net into an outage.
+/// This is an O(retained bytes) cold recovery scan with fixed scratch space,
+/// not an O(1) probe. It cannot recover identities whose only evidence was
+/// pruned or never persisted; durable range reservation remains necessary to
+/// establish uniqueness for those cases.
 #[must_use]
 pub fn highest_frame_seq_on_disk(wal_dir: &Path) -> u64 {
     let mut highest = 0u64;
@@ -2362,131 +2891,146 @@ pub fn highest_frame_seq_on_disk(wal_dir: &Path) -> u64 {
         wal_dir.to_path_buf(),
         wal_dir.join(REPLAYING_SUBDIR),
         wal_dir.join(ARCHIVE_SUBDIR),
+        wal_dir.join(QUARANTINE_SUBDIR),
     ] {
-        let mut segs = wal_segments_in(&dir);
-        // Lexicographic == chronological: the name is the zero-padded rotation
-        // nanos, so the last is the newest.
-        segs.sort_by(|a, b| a.file_name().cmp(&b.file_name())); // O(1) EXEMPT: boot-time seed, cold path
-        // Walk BACKWARDS from the newest, and keep walking past an empty or
-        // torn one — see [`HIGH_WATER_SEGMENTS_PER_DIR`]. Stops at the first
-        // segment that yields a sequence, because segments are chronological
-        // and an older one cannot exceed a newer one that has content.
-        for seg in segs.iter().rev().take(HIGH_WATER_SEGMENTS_PER_DIR) {
-            let seen = highest_frame_seq_in_segment(seg);
-            if seen > 0 {
-                highest = highest.max(seen);
-                break;
-            }
+        for path in wal_segments_in(&dir) {
+            highest = highest.max(highest_frame_seq_in_segment(&path));
         }
     }
     highest
 }
 
-/// Header-only walk of one segment, returning the greatest `frame_seq` in it.
-///
-/// Deliberately tolerant: this is a best-effort high-water probe, not a replay.
-/// A torn tail, an unknown magic, or a short read simply ends the walk and
-/// returns what was seen — a LOWER bound is still strictly better than the wall
-/// clock alone, and refusing to boot over a torn tail would turn a safety net
-/// into an outage. Corruption accounting belongs to [`replay_segment`], which
-/// walks the same files moments later and reports it properly.
+/// Complete framing and CRC are validated before a sequence can raise the
+/// restart bound. A torn/corrupt suffix contributes no unverified header.
 fn highest_frame_seq_in_segment(path: &Path) -> u64 {
-    let Ok(mut f) = File::open(path) else {
-        return 0;
-    };
-    let mut highest = 0u64;
-    // One header at a time; v4 is the largest at 30 bytes. The buffer MUST be
-    // the largest header — a 29-byte buffer against a 30-byte v4 header read
-    // `filled < min_rec` on every record and returned 0, which re-seeded
-    // nothing and re-issued capture_seq values already in the database.
-    let mut head = [0u8; WAL_MIN_RECORD_V4];
-    loop {
-        let mut filled = 0usize;
-        while filled < head.len() {
-            match std::io::Read::read(&mut f, &mut head[filled..]) {
-                Ok(0) => break,
-                Ok(n) => filled += n,
-                Err(_) => return highest,
-            }
-        }
-        if filled < WAL_MIN_RECORD_V1 {
-            return highest;
-        }
-        let magic = &head[0..4];
-        let is_v4 = magic == WAL_MAGIC_V4;
-        let is_v3 = magic == WAL_MAGIC_V3;
-        let is_v2 = magic == WAL_MAGIC_V2;
-        let is_v1 = magic == WAL_MAGIC;
-        if !is_v1 && !is_v2 && !is_v3 && !is_v4 {
-            return highest;
-        }
-        let min_rec = if is_v4 {
-            WAL_MIN_RECORD_V4
-        } else if is_v3 {
-            WAL_MIN_RECORD_V3
-        } else if is_v2 {
-            WAL_MIN_RECORD_V2
-        } else {
-            WAL_MIN_RECORD_V1
-        };
-        if filled < min_rec {
-            return highest;
-        }
-        // v1: [magic|ws|len|frame|crc]                      -> len at 5
-        // v2: [magic|ws|seq(8)|len|frame|crc]                -> seq at 5, len at 13
-        // v3: [magic|ws|seq(8)|recv(8)|len|frame|crc]        -> seq at 5, len at 21
-        // v4: [magic|ws|seq(8)|recv(8)|ep(1)|len|frame|crc]  -> seq at 5, len at 22
-        let len_off = if is_v4 {
-            22
-        } else if is_v3 {
-            21
-        } else if is_v2 {
-            13
-        } else {
-            5
-        };
-        if (is_v2 || is_v3 || is_v4)
-            && let Ok(seq_bytes) = <[u8; 8]>::try_from(&head[5..13])
-        {
-            highest = highest.max(u64::from_le_bytes(seq_bytes));
-        }
-        let Ok(len_bytes) = <[u8; 4]>::try_from(&head[len_off..len_off + 4]) else {
-            return highest;
-        };
-        let frame_len = u64::from(u32::from_le_bytes(len_bytes));
-        // Skip the payload and its 4-byte CRC. The header read may have
-        // over-read into the payload, so the seek is relative to where the
-        // header actually ended, not to where the cursor now sits.
-        let over_read = i64::try_from(filled - min_rec).unwrap_or(i64::MAX);
-        let Ok(skip) = i64::try_from(frame_len + 4) else {
-            return highest;
-        };
-        let Some(delta) = skip.checked_sub(over_read) else {
-            return highest;
-        };
-        if std::io::Seek::seek(&mut f, std::io::SeekFrom::Current(delta)).is_err() {
-            return highest;
-        }
-    }
+    scan_sequence_segment(path, false).unwrap_or(0)
 }
 
-/// Ratchet [`WAL_FRAME_SEQ`] past everything already on disk under `wal_dir`.
+fn scan_sequence_segment(path: &Path, require_complete: bool) -> anyhow::Result<u64> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if require_complete => return Err(error.into()),
+        Err(_) => return Ok(0),
+    };
+    scan_sequence_file(file, path, require_complete).map(|scan| scan.highest_frame_seq)
+}
+
+/// The same framing/CRC pass serves restart recovery, migration and offline
+/// audit. Counts describe verified complete records only; audit additionally
+/// refuses legacy records whose original sequence was never recorded.
+#[derive(Debug, Default)]
+struct SequenceSegmentScan {
+    highest_frame_seq: u64,
+    bytes: u64,
+    records: u64,
+    legacy_records: u64,
+    unknown_endpoint_records: u64,
+}
+
+fn scan_sequence_file(
+    file: File,
+    path: &Path,
+    require_complete: bool,
+) -> anyhow::Result<SequenceSegmentScan> {
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if require_complete => return Err(error.into()),
+        Err(_) => return Ok(SequenceSegmentScan::default()),
+    };
+    let mut remaining = metadata.len();
+    let mut reader = BufReader::with_capacity(8 * 1024, file);
+    let mut scratch = [0u8; 8 * 1024];
+    let mut scan = SequenceSegmentScan::default();
+    while remaining > 0 {
+        let mut magic = [0u8; 4];
+        if remaining < 4 || reader.read_exact(&mut magic).is_err() {
+            break;
+        }
+        let (head_len, len_off, has_seq) = match magic {
+            WAL_MAGIC_V4 => (22usize, 18usize, true),
+            WAL_MAGIC_V3 => (21usize, 17usize, true),
+            WAL_MAGIC_V2 => (13usize, 9usize, true),
+            WAL_MAGIC => (5usize, 1usize, false),
+            _ => break,
+        };
+        let overhead = (4 + head_len + 4) as u64;
+        if remaining < overhead {
+            break;
+        }
+        let mut head = [0u8; 22];
+        if reader.read_exact(&mut head[..head_len]).is_err() || WsType::from_u8(head[0]).is_none() {
+            break;
+        }
+        let seq = if has_seq {
+            let mut seq_bytes = [0u8; 8];
+            seq_bytes.copy_from_slice(&head[1..9]);
+            u64::from_le_bytes(seq_bytes)
+        } else {
+            0
+        };
+        if seq > i64::MAX as u64 {
+            break;
+        }
+        let mut length = [0u8; 4];
+        length.copy_from_slice(&head[len_off..len_off + 4]);
+        let frame_len = u64::from(u32::from_le_bytes(length));
+        if frame_len > remaining - overhead {
+            break;
+        }
+        let mut crc = crc32_ieee_extend(0xFFFF_FFFF, &head[..head_len]);
+        let mut frame_remaining = frame_len;
+        while frame_remaining > 0 {
+            let take = frame_remaining.min(scratch.len() as u64) as usize;
+            if let Err(error) = reader.read_exact(&mut scratch[..take]) {
+                return if require_complete {
+                    Err(error.into())
+                } else {
+                    Ok(scan)
+                };
+            }
+            crc = crc32_ieee_extend(crc, &scratch[..take]);
+            frame_remaining -= take as u64;
+        }
+        let mut expected = [0u8; 4];
+        if reader.read_exact(&mut expected).is_err()
+            || (crc ^ 0xFFFF_FFFF) != u32::from_le_bytes(expected)
+        {
+            break;
+        }
+        scan.highest_frame_seq = scan.highest_frame_seq.max(seq);
+        scan.records += 1;
+        scan.legacy_records += u64::from(!has_seq);
+        scan.unknown_endpoint_records +=
+            u64::from(magic == WAL_MAGIC_V4 && head[17] > WalEndpoint::OrderUpdate.as_u8());
+        scan.bytes += overhead + frame_len;
+        remaining -= overhead + frame_len;
+    }
+    anyhow::ensure!(
+        !require_complete || remaining == 0,
+        "retained WAL identity scan incomplete or invalid: {path:?} ({remaining} bytes unresolved)"
+    );
+    Ok(scan)
+}
+
+/// Ratchet [`WAL_FRAME_SEQ`] past the complete-record, CRC-validated disk bound.
 ///
 /// Idempotent and monotonic: it only ever RAISES the counter, so calling it
 /// twice, or after frames have already been minted, can neither lower it nor
-/// reissue a value. Returns the high-water mark found, for logging.
+/// reissue a value already observed in this process. Only complete CRC-verified
+/// retained records contribute; production uses the durable reservation file
+/// to cover identities outside retained WAL. Returns the retained bound.
 pub fn seed_frame_seq_from_disk(wal_dir: &Path) -> u64 {
     let disk_high = highest_frame_seq_on_disk(wal_dir);
     if disk_high == 0 {
         return 0;
     }
-    // Advance to disk_high + one base unit so the very next mint is strictly
-    // greater than anything already written. `fetch_max` keeps it monotonic
-    // against a concurrent minter.
+    // Advance past the verified retained bound. This recovery helper does
+    // not replace production's synced range-reservation authority.
     let target = (disk_high >> PACKET_INDEX_BITS)
         .saturating_add(1)
-        .min(u64::MAX >> PACKET_INDEX_BITS)
+        .min((i64::MAX as u64) >> PACKET_INDEX_BITS)
         << PACKET_INDEX_BITS;
+    WAL_RESERVED_SEQUENCE.fetch_max(target, Ordering::SeqCst);
     let prev = WAL_FRAME_SEQ.fetch_max(target, Ordering::SeqCst);
     if prev < target {
         metrics::counter!(WAL_SEQ_RESEED_ADVANCED_COUNTER).increment(1);
@@ -2521,7 +3065,7 @@ pub fn packet_capture_seq(frame_seq: u64, packet_index: u64) -> Option<u64> {
     Some((frame_seq & !MAX_PACKET_INDEX) | packet_index)
 }
 
-fn write_record(w: &mut BufWriter<File>, r: &WalRecord) -> std::io::Result<()> {
+fn write_record<W: Write>(w: &mut W, r: &WalRecord) -> std::io::Result<()> {
     // Always write the v4 record (TVW4: frame_seq + received_at_nanos +
     // endpoint after ws_type). `u32::try_from` makes an over-large frame
     // explicit rather than silently truncating (frames are ≤162 B on the main
@@ -2560,19 +3104,65 @@ fn record_disk_size(r: &WalRecord) -> u64 {
     WAL_MIN_RECORD_V4 as u64 + r.frame.len() as u64
 }
 
-fn open_new_segment(wal_dir: &Path) -> anyhow::Result<BufWriter<File>> {
-    let nanos = SystemTime::now()
+fn open_new_segment(wal_dir: &Path, guard: &WalDirGuard) -> anyhow::Result<BufWriter<File>> {
+    open_new_segment_with_directory_sync(wal_dir, guard, |directory| directory.sync_all())
+}
+
+fn open_new_segment_with_directory_sync(
+    wal_dir: &Path,
+    guard: &WalDirGuard,
+    sync_directory: impl Fn(&File) -> std::io::Result<()>,
+) -> anyhow::Result<BufWriter<File>> {
+    guard.ensure_current()?;
+    static SEGMENT_NONCE: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
+        .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
         .unwrap_or(0);
-    let path = wal_dir.join(format!("ws-frames-{:020}.wal", nanos)); // APPROVED: segment rotation on the background writer thread, not the per-frame append
-    let f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|e| anyhow::anyhow!("open WAL segment {:?}: {e}", path))?;
-    set_open_segment(path);
-    Ok(BufWriter::with_capacity(WAL_WRITER_BUFFER, f))
+    for _ in 0..16 {
+        let previous = SEGMENT_NONCE.fetch_max(now, Ordering::Relaxed).max(now);
+        let stamp = SEGMENT_NONCE.fetch_add(1, Ordering::Relaxed).max(previous);
+        let name = format!("ws-frames-{stamp:020}.wal");
+        let path = wal_dir.join(&name);
+        let io_path = guard.io_path(&name)?;
+        // Register BEFORE create, so a concurrent directory scan cannot ever
+        // observe an unregistered, writable file. create_new refuses reuse.
+        anyhow::ensure!(
+            set_open_segment(path.clone()),
+            "WAL open-segment registration unavailable"
+        );
+        match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&io_path)
+        {
+            Ok(f) => {
+                // Sync the held parent after creation. File-only sync later
+                // cannot establish durability of this new replay pathname.
+                // Failure retains the empty original and refuses publication;
+                // the writer still owns its pending batch for a later retry.
+                if let Err(error) = guard
+                    .ensure_current()
+                    .and_then(|()| sync_directory(&guard.directory).map_err(anyhow::Error::from))
+                    .and_then(|()| guard.ensure_current())
+                {
+                    metrics::counter!("tv_wal_segment_directory_sync_refused_total").increment(1);
+                    clear_open_segment_under(wal_dir);
+                    return Err(error);
+                }
+                return Ok(BufWriter::with_capacity(WAL_WRITER_BUFFER, f));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                clear_open_segment_under(wal_dir);
+                return Err(anyhow::anyhow!("open WAL segment {path:?}: {err}"));
+            }
+        }
+    }
+    clear_open_segment_under(wal_dir);
+    Err(anyhow::anyhow!(
+        "could not reserve a unique WAL segment name"
+    ))
 }
 
 /// The segment the writer thread is APPENDING to right now, so a replay that
@@ -2601,11 +3191,14 @@ static OPEN_SEGMENTS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec
 /// earlier registration for the same directory. One entry per live spill —
 /// one in production, a handful in the test suite — so the vector is bounded
 /// by the number of writers that exist, and cleared as each one exits.
-fn set_open_segment(path: PathBuf) {
+fn set_open_segment(path: PathBuf) -> bool {
     if let Ok(mut open) = OPEN_SEGMENTS.lock() {
         let dir = path.parent();
         open.retain(|p| p.parent() != dir); // O(1) EXEMPT: bounded by live writers, rotation-time only
         open.push(path); // APPROVED: rotation-time registration, not the per-frame append
+        true
+    } else {
+        false
     }
 }
 
@@ -2619,21 +3212,43 @@ fn clear_open_segment_under(wal_dir: &Path) {
 
 impl Drop for WsFrameSpill {
     fn drop(&mut self) {
-        // The sender is going away with `self`, so no frame can reach the
-        // writer after this point; the writer exits on its next poll. Release
-        // the registration NOW rather than up to one poll interval later, so
-        // a replay that follows the drop sees the closed segment.
-        if !self.wal_dir.as_os_str().is_empty() {
-            clear_open_segment_under(&self.wal_dir);
+        self.stop.store(true, Ordering::Release);
+        // A cold, bounded close wait allows an ordinary owner handoff while
+        // preserving the guard if a failed batch still needs background retry.
+        // The hot append path never joins or waits on this handle.
+        if let Ok(slot) = self.writer.get_mut()
+            && let Some(handle) = slot.take()
+        {
+            let deadline = Instant::now() + WAL_WRITER_STOP_POLL + WAL_WRITER_IO_RETRY_BACKOFF;
+            while !handle.is_finished() && Instant::now() < deadline {
+                thread::sleep(WAL_SHUTDOWN_POLL);
+            }
+            if handle.is_finished() && handle.join().is_err() {
+                error!(
+                    code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+                    queued_records = self.queued_records(),
+                    "WAL spill writer PANICKED out of its supervisor loop during handle drop"
+                );
+            }
+            // If unfinished, the detached writer still owns its Arc guard.
         }
     }
+}
+
+/// Compare descriptor-anchored maintenance paths with canonical writer
+/// registrations. Only cold maintenance scans call this filesystem helper.
+fn same_wal_path(left: &Path, right: &Path) -> bool {
+    left == right
+        || std::fs::canonicalize(left)
+            .ok()
+            .is_some_and(|left| std::fs::canonicalize(right).is_ok_and(|right| left == right))
 }
 
 fn is_open_segment(path: &Path) -> bool {
     OPEN_SEGMENTS
         .lock()
-        .map(|open| open.iter().any(|p| p == path)) // O(1) EXEMPT: bounded by live writers, replay-time only
-        .unwrap_or(false)
+        .map(|open| open.iter().any(|p| same_wal_path(p, path))) // O(1) EXEMPT: bounded by live writers, replay-time only
+        .unwrap_or(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -2663,16 +3278,21 @@ const CRC32_TABLE: [u32; 256] = {
 fn crc32_ieee_of(chunks: &[&[u8]]) -> u32 {
     let mut c: u32 = 0xFFFF_FFFF;
     for chunk in chunks {
-        for &b in *chunk {
-            c = CRC32_TABLE[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
-        }
+        c = crc32_ieee_extend(c, chunk);
     }
     c ^ 0xFFFF_FFFF
 }
 
+fn crc32_ieee_extend(mut c: u32, bytes: &[u8]) -> u32 {
+    for &b in bytes {
+        c = CRC32_TABLE[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
+    }
+    c
+}
+
 // ---------------------------------------------------------------------------
 // Replay — walk every `.wal` file, parse records, return recovered frames.
-// Corrupted / truncated tails are logged and skipped.
+// Incomplete or unsupported originals refuse the pass and remain retained.
 //
 // CRASH-SAFETY (zero-loss MEDIUM fix 2026-06-30): a replayed segment is moved
 // to the IN-PROGRESS staging dir `<wal_dir>/replaying/` — NOT straight to
@@ -2697,6 +3317,169 @@ const REPLAYING_SUBDIR: &str = "replaying";
 /// Confirmed-history directory: holds segments whose frames have been durably
 /// re-captured into the live pipeline. NEVER re-globbed by `replay_all`.
 const ARCHIVE_SUBDIR: &str = "archive";
+
+/// Originals that could not be decoded completely. Never normal-pruned or
+/// automatically re-globbed; recovery requires an explicit validated repair.
+const QUARANTINE_SUBDIR: &str = "quarantine";
+
+/// Serializes cold replay, confirmation and pruning within this process.
+/// The directory flock separately prevents a second process owning the WAL.
+static WAL_MAINTENANCE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static REPLAY_GENERATION: AtomicU64 = AtomicU64::new(1);
+static REPLAY_RECEIPTS: std::sync::Mutex<Vec<ReplayManifest>> = std::sync::Mutex::new(Vec::new());
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SegmentFingerprint {
+    bytes: u64,
+    sha256: [u8; 32],
+}
+#[derive(Debug)]
+struct SegmentReceipt {
+    path: PathBuf,
+    fingerprint: SegmentFingerprint,
+}
+#[derive(Debug)]
+struct ReplayManifest {
+    directory: PathBuf,
+    generation: u64,
+    segments: Vec<SegmentReceipt>,
+    _ownership: Option<WalDirGuard>,
+}
+
+fn replay_directory_key(directory: &Path) -> PathBuf {
+    std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf())
+}
+
+fn invalidate_replay_receipts(directory: &Path) {
+    if let Ok(mut manifests) = REPLAY_RECEIPTS.lock() {
+        let key = replay_directory_key(directory);
+        manifests.retain(|manifest| manifest.directory != key);
+    }
+}
+
+fn segment_fingerprint(path: &Path) -> std::io::Result<SegmentFingerprint> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut bytes = 0u64;
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        bytes = bytes.saturating_add(read as u64);
+    }
+    Ok(SegmentFingerprint {
+        bytes,
+        sha256: hasher.finalize().into(),
+    })
+}
+
+/// Persisted proof that the exact archived bytes were acknowledged. Normal
+/// archive location alone is insufficient for files written by older builds.
+fn confirmation_marker_path(path: &Path) -> PathBuf {
+    path.with_extension("wal.confirmed")
+}
+
+fn persist_confirmation_marker(
+    path: &Path,
+    fingerprint: &SegmentFingerprint,
+) -> anyhow::Result<()> {
+    let marker = confirmation_marker_path(path);
+    let temporary = path.with_extension("wal.confirmed.tmp");
+    let mut bytes = [0u8; 52];
+    bytes[..4].copy_from_slice(b"TVCP");
+    bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
+    bytes[8..16].copy_from_slice(&fingerprint.bytes.to_le_bytes());
+    bytes[16..48].copy_from_slice(&fingerprint.sha256);
+    let crc = crc32_ieee_of(&[&bytes[..48]]);
+    bytes[48..52].copy_from_slice(&crc.to_le_bytes());
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    std::fs::rename(&temporary, &marker)?;
+    if let Some(parent) = marker.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn archive_has_confirmation(path: &Path) -> bool {
+    let Ok(mut file) = File::open(confirmation_marker_path(path)) else {
+        return false;
+    };
+    if !file.metadata().is_ok_and(|metadata| metadata.len() == 52) {
+        return false;
+    }
+    let mut bytes = [0u8; 52];
+    if file.read_exact(&mut bytes).is_err()
+        || &bytes[..4] != b"TVCP"
+        || bytes[4..8] != 1u32.to_le_bytes()
+        || crc32_ieee_of(&[&bytes[..48]])
+            != u32::from_le_bytes(bytes[48..52].try_into().unwrap_or_default())
+    {
+        return false;
+    }
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&bytes[16..48]);
+    let expected = SegmentFingerprint {
+        bytes: u64::from_le_bytes(bytes[8..16].try_into().unwrap_or_default()),
+        sha256: digest,
+    };
+    segment_fingerprint(path).ok().as_ref() == Some(&expected)
+}
+
+fn remove_confirmation_marker(path: &Path) {
+    if let Err(error) = std::fs::remove_file(confirmation_marker_path(path))
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(segment = ?path, error = %error, "confirmed data was reclaimed but its receipt could not be removed");
+    }
+}
+
+#[derive(Debug)]
+struct IncompleteWalSegment {
+    reason: &'static str,
+    offset: usize,
+    unread_bytes: usize,
+}
+impl std::fmt::Display for IncompleteWalSegment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "incomplete WAL segment: {} at byte {} ({} unread bytes)",
+            self.reason, self.offset, self.unread_bytes
+        )
+    }
+}
+impl std::error::Error for IncompleteWalSegment {}
+
+fn quarantine_incomplete_segment(directory: &Path, path: &Path) -> anyhow::Result<PathBuf> {
+    let quarantine = directory.join(QUARANTINE_SUBDIR);
+    std::fs::create_dir_all(&quarantine)?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("WAL path has no file name"))?;
+    let destination = quarantine.join(name);
+    anyhow::ensure!(
+        !destination.exists(),
+        "quarantine target already exists: {destination:?}"
+    );
+    std::fs::rename(path, &destination)?;
+    // Sync both directories for the rename. A failure still returns Err and
+    // no confirmation receipt is issued; original bytes remain retained.
+    File::open(&quarantine)?.sync_all()?;
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    metrics::counter!("tv_wal_replay_quarantined_segments_total").increment(1);
+    Ok(destination)
+}
 
 /// Largest total frame payload `replay_all` will hold in RAM at once.
 ///
@@ -2846,12 +3629,11 @@ pub const fn wal_replay_disk_floor_bytes(total_bytes: u64) -> u64 {
 /// and counted rather than materialised until something dies.
 pub const WAL_REPLAY_MAX_FRAMES_PER_BOOT: u64 = 3_000_000;
 
-/// Segments the applied-watermark let this pass ARCHIVE UNREAD.
+/// Legacy skip series, published at zero while exact per-frame ACK proof is absent.
 pub const WAL_REPLAY_SKIPPED_SEGMENTS_COUNTER: &str = "tv_wal_replay_skipped_segments_total";
-/// Frames inside a boundary segment that were read and then dropped as
-/// already applied.
+/// Legacy frame-skip series, published at zero; maximum ACK is not proof.
 pub const WAL_REPLAY_SKIPPED_FRAMES_COUNTER: &str = "tv_wal_replay_skipped_frames_total";
-/// Bytes of segment file the skip never read.
+/// Legacy skipped-byte series, published at zero while skipping is disabled.
 pub const WAL_REPLAY_SKIPPED_BYTES_COUNTER: &str = "tv_wal_replay_skipped_bytes_total";
 /// Passes refused because the volume was under [`WAL_REPLAY_DISK_FLOOR_BYTES`].
 pub const WAL_REPLAY_DISK_FLOOR_STOPS_COUNTER: &str = "tv_wal_replay_disk_floor_stops_total";
@@ -2879,34 +3661,15 @@ pub const WAL_REPLAY_SINK_SUSPECT_REFUSALS_COUNTER: &str =
 /// Frames returned by every replay pass of this process, for the per-boot cap.
 static WAL_REPLAY_FRAMES_THIS_BOOT: AtomicU64 = AtomicU64::new(0);
 
-/// Kill switch: `TV_WAL_APPLIED_SKIP=0` makes replay ignore the watermark
-/// file (it is still written). Deleting `applied.tvaw` has the same effect.
+/// Legacy configuration name retained for compatibility. Watermark-based
+/// skipping is disabled regardless of this value because it lacks exact ACK
+/// evidence. The watermark itself remains useful for diagnostics.
 pub const WAL_APPLIED_SKIP_ENV: &str = "TV_WAL_APPLIED_SKIP";
 
-fn applied_skip_enabled() -> bool {
-    // APPROVED: one env read per boot-time replay pass, cold path
-    // Any of the usual "off" spellings disables skipping; anything else — including a
-    // typo — keeps the default. The default is the SAFE direction only in the sense
-    // that skipping is proven by the tests; an operator who wants a full replay
-    // should check the boot log line that reports how many segments were skipped.
-    std::env::var(WAL_APPLIED_SKIP_ENV).map_or(true, |v| {
-        !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        )
-    })
-}
-
-// TEST-EXEMPT: covered by test_append_spill_and_replay_roundtrip + test_replay_handles_missing_dir + test_replay_detects_crc_corruption + test_unconfirmed_segment_is_rereplayed_on_next_boot + test_confirmed_segment_is_not_rereplayed
-pub fn replay_all<P: AsRef<Path>>(wal_dir: P) -> anyhow::Result<Vec<ReplayedFrame>> {
-    replay_all_with_budget(wal_dir, WAL_REPLAY_MAX_BYTES)
-}
-
-/// The PRODUCTION form of [`replay_all`] — STAGE-C boot replay — fenced by
-/// the disk floor and the per-boot frame cap exactly like every catch-up
-/// round. `replay_all` itself stays unfenced so the sixty-odd fixtures that
-/// drive it are not at the mercy of the host's free disk; production must
-/// call THIS one, and `crates/app/tests` pins that it does.
+/// Compatibility replay helper with the disk floor and per-boot frame cap.
+/// This path-based helper does not establish directory ownership. Production
+/// boot replay uses [`WalMaintenance::replay_fenced`], and catch-up uses
+/// [`WalMaintenance::replay_with_report_fenced`], through a held directory claim.
 // TEST-EXEMPT: thin delegate; the fences are proven by replay_all_with_report_at's tests.
 pub fn replay_all_fenced<P: AsRef<Path>>(wal_dir: P) -> anyhow::Result<WalReplayBatch> {
     // The whole batch, not just the frames: a REFUSED pass returns an empty
@@ -2917,13 +3680,15 @@ pub fn replay_all_fenced<P: AsRef<Path>>(wal_dir: P) -> anyhow::Result<WalReplay
     replay_all_with_report_fenced(wal_dir, WAL_REPLAY_MAX_BYTES)
 }
 
-/// [`replay_all`] with an injectable RAM budget.
+/// Frame-only fixture/compatibility replay with an injectable RAM budget.
+/// Production callers retain the full batch and directory ownership through
+/// [`WalMaintenance::replay_with_report_fenced`].
 ///
 /// Separated so the budget's SAFETY can be tested without a 512 MiB fixture.
 /// What needs proving is not the number — it is that a segment the budget
 /// stopped short of is still a `*.wal` file afterwards, and a test that has to
 /// allocate half a gigabyte to reach that branch would not be written.
-// TEST-EXEMPT: covered by replay_budget_defers_unread_segments_instead_of_staging_them + every replay_all test above
+// TEST-EXEMPT: covered by replay_budget_defers_unread_segments_instead_of_staging_them and the replay fixtures below
 pub fn replay_all_with_budget<P: AsRef<Path>>(
     wal_dir: P,
     budget_bytes: usize,
@@ -2933,14 +3698,16 @@ pub fn replay_all_with_budget<P: AsRef<Path>>(
 
 /// One replay pass, WITH the accounting a caller needs to page on it.
 ///
-/// `replay_all` / `replay_all_with_budget` return only the frames; the number
-/// of segments the budget DEFERRED was logged inside this function and then
-/// thrown away. A caller draining in rounds — the WAL catch-up loop — could
+/// [`replay_all_with_budget`] returns only frames and discards the deferral
+/// accounting. A caller draining in rounds — the WAL catch-up loop — could
 /// therefore never tell "the backlog is drained" from "the backlog is deferred
 /// on every round", which is the difference between a healthy boot and a
 /// capacity problem. This struct carries that verdict out.
 #[derive(Debug, Default)]
 pub struct WalReplayBatch {
+    /// Opaque identity of this successfully staged pass; 0 means no receipt.
+    /// Carry it through sink acknowledgement to confirm_replayed_generation.
+    pub confirmation_id: u64,
     /// The frames read this pass, in capture order.
     pub frames: Vec<ReplayedFrame>,
     /// Segments the RAM budget stopped short of. They remain `*.wal` files
@@ -2958,11 +3725,11 @@ pub struct WalReplayBatch {
     /// and the two have different remedies (more RAM / fewer rows per frame
     /// versus a bigger byte budget).
     pub stopped_for_memory: bool,
-    /// Segments the applied-watermark archived UNREAD this pass.
+    /// Segments validated and archived without materialising replay frames.
     pub skipped_segments: u64,
     /// Frames read from boundary segments and dropped as already applied.
     pub skipped_frames: u64,
-    /// Bytes of segment file the skip never read.
+    /// Bytes scanned in segments archived without materialising replay frames.
     pub skipped_bytes: u64,
     /// `true` when the pass was refused on [`WAL_REPLAY_DISK_FLOOR_BYTES`].
     pub stopped_for_disk: bool,
@@ -2997,12 +3764,26 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     stop_pct: u64,
 ) -> anyhow::Result<WalReplayBatch> {
     let wal_dir = wal_dir.as_ref();
-    if !wal_dir.exists() {
-        // APPROVED: boot-time WAL replay, cold path
-        return Ok(WalReplayBatch {
-            budget_bytes: budget_bytes as u64,
-            ..WalReplayBatch::default()
-        });
+    let _maintenance = WAL_MAINTENANCE
+        .lock()
+        .map_err(|_| anyhow::anyhow!("WAL maintenance lock poisoned"))?;
+    invalidate_replay_receipts(wal_dir);
+    match std::fs::metadata(wal_dir) {
+        Ok(metadata) => anyhow::ensure!(
+            metadata.is_dir(),
+            "WAL replay root is not a directory: {wal_dir:?}"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WalReplayBatch {
+                budget_bytes: budget_bytes as u64,
+                ..WalReplayBatch::default()
+            });
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "WAL replay root could not be inspected: {error}"
+            ));
+        }
     }
 
     // Re-glob BOTH the in-progress staging dir (un-confirmed leftovers from a
@@ -3010,9 +3791,9 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     // crashed boot was draining) AND the live `*.wal` segments (this crash's
     // fresh segments). NOT `archive/` — confirmed segments are never replayed.
     let replaying_dir = wal_dir.join(REPLAYING_SUBDIR);
-    let mut segments: Vec<PathBuf> = wal_segments_in(wal_dir);
+    let mut segments: Vec<PathBuf> = wal_segments_in_checked(wal_dir, false)?;
     let leftover_count = {
-        let mut leftovers = wal_segments_in(&replaying_dir);
+        let mut leftovers = wal_segments_in_checked(&replaying_dir, true)?;
         let n = leftovers.len();
         segments.append(&mut leftovers);
         n
@@ -3026,63 +3807,14 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     // bare live dir) instead of by capture time, breaking cross-source FIFO.
     segments.sort_by(|a, b| a.file_name().cmp(&b.file_name())); // O(1) EXEMPT: boot replay — this sort IS the FIFO-order invariant
 
-    // APPLIED-WATERMARK SKIP (2026-09-05). Every segment whose entire sequence
-    // range is below the watermark and overlaps no unapplied bucket is moved
-    // STRAIGHT to `archive/`, unread. The bytes never leave the disk, the
-    // frames never materialise, and nothing is refolded. The remaining
-    // segments are read as before; the boundary one is filtered per frame in
-    // `replay_segment_filtered`. See `wal_applied_watermark` for why every
-    // failure direction of this decision is "replay more".
-    let applied = if applied_skip_enabled() {
-        crate::wal_applied_watermark::AppliedSnapshot::load(wal_dir)
-    } else {
-        None
-    };
-    let mut skipped_segments = 0u64;
-    let mut skipped_bytes = 0u64;
-    if let Some(applied) = applied.as_ref() {
-        let archive_dir = wal_dir.join(ARCHIVE_SUBDIR);
-        // A segment's range is `[its first seq, next segment's first seq − 1]`.
-        // The LAST segment has no upper bound and is always read.
-        // O(1) EXEMPT: boot replay, one header read per segment, cold path
-        let firsts: Vec<u64> = segments
-            .iter()
-            .map(|p| first_frame_seq_in_segment(p))
-            .collect(); // APPROVED: boot-time WAL replay, cold path
-        let mut keep: Vec<PathBuf> = Vec::with_capacity(segments.len()); // APPROVED: boot-time WAL replay, cold path
-        for (idx, path) in segments.iter().enumerate() {
-            let lo = firsts[idx];
-            let hi = firsts.get(idx + 1).copied().and_then(|n| n.checked_sub(1));
-            let skip = match hi {
-                Some(hi) if hi > 0 => segment_range_is_applied(applied, lo, hi),
-                _ => false,
-            };
-            if !skip {
-                keep.push(path.clone()); // APPROVED: boot-time WAL replay, cold path
-                continue;
-            }
-            let Some(name) = path.file_name() else {
-                keep.push(path.clone()); // APPROVED: boot-time WAL replay, cold path
-                continue;
-            };
-            drop(std::fs::create_dir_all(&archive_dir)); // O(1) EXEMPT: boot replay skip, cold path
-            let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0); // O(1) EXEMPT: boot replay skip, cold path
-            // O(1) EXEMPT: boot replay skip, cold path
-            match std::fs::rename(path, archive_dir.join(name)) {
-                Ok(()) => {
-                    skipped_segments = skipped_segments.saturating_add(1);
-                    skipped_bytes = skipped_bytes.saturating_add(bytes);
-                }
-                Err(err) => {
-                    // Not archived → still a `*.wal` → read it as before.
-                    warn!(segment = ?path, error = %err, "could not archive an applied WAL segment; replaying it instead");
-                    keep.push(path.clone()); // APPROVED: boot-time WAL replay, cold path
-                }
-            }
-        }
-        segments = keep;
-    }
-    let mut skipped_frames = 0u64;
+    // A maximum ACK plus a finite reorder allowance is not an exact
+    // completion frontier: a producer can be suspended longer than that
+    // allowance before publishing an older allocated frame. Retain/replay
+    // every valid original regardless of that diagnostic watermark. Only a
+    // complete, exact replay-generation ACK can authorize archival.
+    let skipped_segments = 0u64;
+    let skipped_bytes = 0u64;
+    let skipped_frames = 0u64;
 
     let mut frames = Vec::new(); // APPROVED: boot-time WAL replay, cold path
     let mut corrupted = 0usize;
@@ -3094,6 +3826,7 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     let mut consumed = 0usize;
 
     let mut stopped_for_memory = false;
+    let mut fingerprints = Vec::with_capacity(segments.len());
     for path in &segments {
         if bytes_held >= budget_bytes && consumed > 0 {
             break;
@@ -3116,9 +3849,9 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
             stopped_for_memory = true;
             break;
         }
-        match replay_segment_filtered(path, applied.as_ref()) {
-            Ok((mut batch, dropped)) => {
-                skipped_frames = skipped_frames.saturating_add(dropped);
+        match replay_segment_filtered(path, None) {
+            Ok((mut batch, _dropped, fingerprint)) => {
+                fingerprints.push(fingerprint);
                 for f in &batch {
                     bytes_held = bytes_held.saturating_add(f.frame.len());
                 }
@@ -3126,50 +3859,39 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
             }
             Err(err) => {
                 corrupted += 1;
-                error!(segment = ?path, error = %err, "WAL segment corrupted; skipping");
+                if err.downcast_ref::<IncompleteWalSegment>().is_some() {
+                    match quarantine_incomplete_segment(wal_dir, path) {
+                        Ok(retained) => error!(segment = ?path, retained = ?retained, error = %err,
+                            "WAL replay refused an incomplete segment; original retained outside confirmed pruning"),
+                        Err(retain_error) => error!(segment = ?path, error = %retain_error,
+                            "WAL quarantine failed; refusing confirmation and retaining recovery state"),
+                    }
+                }
+                metrics::counter!("tv_wal_replay_corrupted_segments_total").increment(1);
+                error!(
+                    code = ErrorCode::WsSpill02FrameDropped.code_str(),
+                    segment = ?path,
+                    error = %err,
+                    corrupted_segments = corrupted,
+                    "WAL replay could not read a segment; refusing the pass so unread \
+                     staged files cannot be confirmed or archived"
+                );
+                // File-open/read errors have not established any recoverable
+                // prefix. Do not mark this segment consumed and later hand it
+                // to confirm_replayed's staging glob. The caller must retain
+                // all staged files when this pass returns Err. Parse-corrupt
+                // segments use the separate reported-prefix policy below.
+                return Err(anyhow::anyhow!(
+                    "WAL replay refused: could not read segment {path:?}: {err}"
+                ));
             }
         }
         consumed += 1;
     }
-    // RESTORE any DEFERRED segment that came from `replaying/` back to the
-    // live dir, BEFORE anything else can observe the deferral.
-    //
-    // This closes a silent, permanent tick-loss path found by an adversarial
-    // sweep on 2026-08-28 and verified in source:
-    //
-    //   1. A boot stages segments L1..L5 into `replaying/` and crashes before
-    //      `confirm_replayed`. Correct so far -- that is the crash-safety
-    //      design working.
-    //   2. The next boot re-globs `replaying/` (L1..L5) plus this crash's
-    //      fresh `*.wal` files. Leftovers sort FIRST (smaller nanos), so the
-    //      budget can run out INSIDE them -- say after L3.
-    //   3. Staging below moves only `take(consumed)`, so L4 and L5 are never
-    //      touched. They are still sitting in `replaying/`.
-    //   4. The refold succeeds, so the caller calls `confirm_replayed`, which
-    //      globs ALL of `replaying/` and archives every file it finds --
-    //      including L4 and L5, which THIS BOOT NEVER READ.
-    //
-    // An archived segment is never re-globbed. Those frames are gone: captured
-    // to disk, then deleted from the recovery path without ever reaching the
-    // database, with no counter and no error. That is precisely the class the
-    // whole capture-at-receipt chain exists to make impossible.
-    //
-    // The staging comment below already states the invariant that was being
-    // broken -- "an archived segment is NEVER re-globbed, so its frames would
-    // be lost for good. This slice is the whole safety of the budget above."
-    // It is correct about the slice it controls and blind to the leftovers it
-    // does not, because `confirm_replayed` archives by GLOB, not by that slice.
-    //
-    // Restoring is the minimal repair that keeps `confirm_replayed`'s glob
-    // correct BY CONSTRUCTION: after this loop, `replaying/` contains only
-    // segments this boot actually read, which is exactly what that function
-    // assumes. It needs no signature change and no manifest file.
-    //
-    // A failed restore is LOUD, never silent: the segment stays in
-    // `replaying/` and would be archived unread, so it is the one residual
-    // and it gets a coded error plus a counter rather than a shrug. Both
-    // renames are within one filesystem between sibling directories, so a
-    // failure here means the staging renames below are failing too.
+    // Deferred leftovers stay recoverable in either root or staging. Restore
+    // to the root for the existing backlog workflow, but never replace a
+    // different original with the same filename. Exact receipts contain only
+    // this pass's consumed files; a failed restore refuses this pass too.
     let mut restore_failures = 0usize;
     for path in segments.iter().skip(consumed) {
         if path.parent() != Some(replaying_dir.as_path()) {
@@ -3178,18 +3900,24 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
         let Some(name) = path.file_name() else {
             continue;
         };
+        let destination = wal_dir.join(name);
+        if destination.exists() {
+            restore_failures = restore_failures.saturating_add(1);
+            error!(code = ErrorCode::WsSpill02FrameDropped.code_str(),
+                segment = ?path, destination = ?destination,
+                "WAL deferred restore refused: another original already occupies the destination");
+            continue;
+        }
         // O(1) EXEMPT: boot replay restore, cold path, bounded by deferred count
-        if let Err(err) = std::fs::rename(path, wal_dir.join(name)) {
+        if let Err(err) = std::fs::rename(path, destination) {
             restore_failures = restore_failures.saturating_add(1);
             error!(
                 code = ErrorCode::WsSpill02FrameDropped.code_str(),
                 segment = ?path,
                 error = %err,
                 "WAL replay could not restore a DEFERRED staged segment to the \
-                 live directory. It is still in the replay staging area, where \
-                 the confirm step archives everything it finds -- so these \
-                 captured frames may be archived without ever being replayed. \
-                 This is the one path by which recovery can lose data."
+                 live directory. The pass is refused and must NOT be confirmed; \
+                 the unread segment remains available for a later replay."
             );
         }
     }
@@ -3199,6 +3927,12 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     // first occurrence is the only one you get.
     // APPROVED: cast -- restore_failures is O(segments) <= u64 always.
     metrics::counter!(WAL_REPLAY_RESTORE_FAILED_COUNTER).increment(restore_failures as u64);
+    if restore_failures > 0 {
+        anyhow::bail!(
+            "WAL replay refused: {restore_failures} deferred segment(s) could not be restored; \
+             do not confirm the staged segments"
+        );
+    }
 
     let deferred = segments.len().saturating_sub(consumed);
     if deferred > 0 {
@@ -3236,15 +3970,14 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
         skipped_segments,
         skipped_frames,
         skipped_bytes,
-        watermark_present = applied.is_some(),
+        heuristic_watermark_authorizes_skip = false,
         "WAL replay complete"
     );
 
-    // SLA counter: frames recovered from WAL on startup. Pair with
-    // `tv_ticks_lost_total` (from append) to show the complete
-    // zero-tick-loss picture on Grafana. If spill dropped 0 and
-    // replay recovered N, the guarantee held for the last N frames.
-    // Parthiban 2026-04-20.
+    // Frames returned by this replay pass, not proof of end-to-end zero loss.
+    // Queue admission, actual writes, DB ACKs and upstream delivery have
+    // different failure boundaries; a zero append-refusal counter cannot
+    // establish that all admitted or upstream frames survived.
     metrics::counter!("tv_wal_replay_recovered_total").increment(frames.len() as u64);
     // UNCONDITIONAL since 2026-08-26, mirroring the recovered counter one line
     // above, which has always incremented by a possibly-zero length.
@@ -3265,24 +3998,54 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     // They remain re-globbable next boot until `confirm_replayed` is called.
     // Best-effort, like the prior archive move: a failed move leaves the
     // segment as `*.wal`, which is STILL re-globbed next boot — never worse.
-    drop(std::fs::create_dir_all(&replaying_dir)); // O(1) EXEMPT: boot replay staging move, cold path
+    if consumed > 0 {
+        std::fs::create_dir_all(&replaying_dir)?;
+    } // Cold staging only when needed
     // ONLY the segments actually read. Staging one that was never replayed
     // would hand it to `confirm_replayed`, which archives it — and an archived
     // segment is NEVER re-globbed, so its frames would be lost for good. This
     // slice is the whole safety of the budget above.
-    for seg in segments.iter().take(consumed) {
+    let confirmation_id = REPLAY_GENERATION
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+            generation.checked_add(1).filter(|next| *next != 0)
+        })
+        .map_err(|_| anyhow::anyhow!("WAL replay generation exhausted"))?;
+    anyhow::ensure!(confirmation_id != 0, "WAL replay generation exhausted");
+    let mut receipts = Vec::with_capacity(consumed);
+    for (seg, fingerprint) in segments.iter().take(consumed).zip(fingerprints) {
         if let Some(name) = seg.file_name() {
             let dst = replaying_dir.join(name);
-            // A leftover that was re-read from `replaying/` renames onto
-            // itself / is overwritten by identical bytes — safe.
             if seg != &dst {
-                drop(std::fs::rename(seg, dst)); // O(1) EXEMPT: boot replay staging move, cold path
+                anyhow::ensure!(
+                    !dst.exists(),
+                    "refusing to replace a different staged WAL: {dst:?}"
+                );
+                if let Err(err) = std::fs::rename(seg, &dst) {
+                    // Source remains active, with no confirmable receipt.
+                    warn!(segment = ?seg, error = %err, "WAL staging failed; source remains replayable");
+                    continue;
+                }
             }
+            receipts.push(SegmentReceipt {
+                path: dst,
+                fingerprint,
+            });
         }
     }
+    let manifest = ReplayManifest {
+        directory: replay_directory_key(wal_dir),
+        generation: confirmation_id,
+        segments: receipts,
+        _ownership: None,
+    };
+    REPLAY_RECEIPTS
+        .lock()
+        .map_err(|_| anyhow::anyhow!("WAL receipt lock poisoned"))?
+        .push(manifest);
 
     // APPROVED: casts — usize counts on a cold boot path, always ≤ u64.
     Ok(WalReplayBatch {
+        confirmation_id,
         frames,
         deferred_segments: deferred as u64,
         bytes_replayed: bytes_held as u64,
@@ -3296,122 +4059,112 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     })
 }
 
-/// `true` when the whole `[lo, hi]` range is applied for EVERY sink a frame in
-/// it could feed. A segment mixes main-feed and depth frames, and a
-/// main-feed frame feeds both sinks, so the segment-level decision takes the
-/// stricter of the two.
-fn segment_range_is_applied(
+/// Test-only diagnostic mapping. Neither this heuristic nor its scan is an
+/// authority to skip replay or delete a captured original.
+/// A Dhan tick/depth ACK can cover only a known Dhan market-data endpoint.
+/// Order updates, other providers, and forward-version endpoint tags have no
+/// matching ACK in this file and must remain in the replay set. Legacy Dhan
+/// records have no endpoint byte and retain their historical main-feed route.
+#[cfg(test)]
+const fn applied_sink_for(
+    ws_type: WsType,
+    endpoint_byte: Option<u8>,
+) -> Option<crate::wal_applied_watermark::AppliedSink> {
+    use crate::wal_applied_watermark::AppliedSink;
+    match (ws_type, endpoint_byte) {
+        (WsType::LiveFeed, None | Some(0)) => Some(AppliedSink::Ticks),
+        (WsType::LiveFeed, Some(1 | 2)) => Some(AppliedSink::Depth),
+        _ => None,
+    }
+}
+
+/// Validate every actual record before archival, with 16 KiB of read/scratch
+/// buffers regardless of segment or frame length. A closed WAL segment is
+/// expected to be immutable; a changed length, short read, bad CRC, legacy
+/// unsequenced record, or unsupported tag refuses the optimization.
+///
+/// This is O(bytes scanned), not an O(1) header probe. No filename or producer
+/// scheduling assumption can substitute for checking the captured records.
+#[cfg(test)]
+fn segment_matches_heuristic_watermark(
+    path: &Path,
     applied: &crate::wal_applied_watermark::AppliedSnapshot,
-    lo: u64,
-    hi: u64,
 ) -> bool {
-    use crate::wal_applied_watermark::AppliedSink;
-    applied.range_is_applied(AppliedSink::Ticks, lo, hi)
-        && applied.range_is_applied(AppliedSink::Depth, lo, hi)
-}
-
-/// Which watermark a replayed frame answers to, from its TVW4 endpoint.
-const fn applied_sink_for(endpoint: WalEndpoint) -> crate::wal_applied_watermark::AppliedSink {
-    use crate::wal_applied_watermark::AppliedSink;
-    match endpoint {
-        WalEndpoint::Depth20 | WalEndpoint::Depth200 => AppliedSink::Depth,
-        // Order-update frames have no sink and never advance a watermark; the
-        // tick watermark is the stricter of the two for a main-feed frame.
-        WalEndpoint::MainFeed | WalEndpoint::OrderUpdate => AppliedSink::Ticks,
-    }
-}
-
-/// The FIRST record's `frame_seq`, read and CRC-VERIFIED. `0` for a v1
-/// record, an empty file, a torn or corrupt first record, or an unreadable
-/// path — every one of which means "unknown", and an unknown range is never
-/// skipped. Verified rather than header-only because this value bounds the
-/// PREVIOUS segment's skip range: a bit-flip in the seq bytes that read as a
-/// plausibly lower number would narrow that range and let a segment be
-/// skipped while its real tail sits above the watermark.
-fn first_frame_seq_in_segment(path: &Path) -> u64 {
-    // A frame larger than this in the first record is not a record this
-    // writer produced; refuse to allocate for it.
-    const FIRST_RECORD_PROBE_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
-    let Ok(mut f) = File::open(path) else {
-        return 0;
+    const SCAN_BUFFER_BYTES: usize = 8 * 1024;
+    let Ok(file) = File::open(path) else {
+        return false;
     };
-    let mut head = [0u8; WAL_MIN_RECORD_V4];
-    let mut filled = 0usize;
-    while filled < head.len() {
-        match std::io::Read::read(&mut f, &mut head[filled..]) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(_) => return 0,
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    let file_len = metadata.len();
+    if file_len == 0 {
+        return false;
+    }
+    let mut remaining = file_len;
+    let mut reader = BufReader::with_capacity(SCAN_BUFFER_BYTES, file); // APPROVED: fixed-size cold replay buffer
+    let mut scratch = [0u8; SCAN_BUFFER_BYTES];
+    while remaining > 0 {
+        let mut magic = [0u8; 4];
+        if remaining < magic.len() as u64 || reader.read_exact(&mut magic).is_err() {
+            return false;
         }
+        // Header excludes magic and CRC; every byte in it participates in CRC.
+        let (head_len, len_off, has_endpoint) = match magic {
+            WAL_MAGIC_V4 => (22usize, 18usize, true),
+            WAL_MAGIC_V3 => (21usize, 17usize, false),
+            WAL_MAGIC_V2 => (13usize, 9usize, false),
+            _ => return false,
+        };
+        let overhead = (4 + head_len + 4) as u64;
+        if remaining < overhead {
+            return false;
+        }
+        let mut head = [0u8; 22];
+        if reader.read_exact(&mut head[..head_len]).is_err() {
+            return false;
+        }
+        let Some(ws_type) = WsType::from_u8(head[0]) else {
+            return false;
+        };
+        let endpoint_byte = has_endpoint.then_some(head[17]);
+        let Some(sink) = applied_sink_for(ws_type, endpoint_byte) else {
+            return false;
+        };
+        let mut seq_bytes = [0u8; 8];
+        seq_bytes.copy_from_slice(&head[1..9]);
+        let seq = u64::from_le_bytes(seq_bytes);
+        if seq > i64::MAX as u64 || !applied.frame_is_applied(sink, seq) {
+            return false;
+        }
+        let mut len_bytes = [0u8; 4];
+        len_bytes.copy_from_slice(&head[len_off..len_off + 4]);
+        let frame_len = u64::from(u32::from_le_bytes(len_bytes));
+        if frame_len > remaining - overhead {
+            return false;
+        }
+        let mut crc = crc32_ieee_extend(0xFFFF_FFFF, &head[..head_len]);
+        let mut frame_remaining = frame_len;
+        while frame_remaining > 0 {
+            let take = frame_remaining.min(SCAN_BUFFER_BYTES as u64) as usize;
+            if reader.read_exact(&mut scratch[..take]).is_err() {
+                return false;
+            }
+            crc = crc32_ieee_extend(crc, &scratch[..take]);
+            frame_remaining -= take as u64;
+        }
+        let mut crc_bytes = [0u8; 4];
+        if reader.read_exact(&mut crc_bytes).is_err()
+            || (crc ^ 0xFFFF_FFFF) != u32::from_le_bytes(crc_bytes)
+        {
+            return false;
+        }
+        remaining -= overhead + frame_len;
     }
-    let magic = &head[0..4];
-    let is_v4 = magic == WAL_MAGIC_V4;
-    let is_v3 = magic == WAL_MAGIC_V3;
-    let is_v2 = magic == WAL_MAGIC_V2;
-    let (min_rec, len_off) = if is_v4 {
-        (WAL_MIN_RECORD_V4, 22)
-    } else if is_v3 {
-        (WAL_MIN_RECORD_V3, 21)
-    } else if is_v2 {
-        (WAL_MIN_RECORD_V2, 13)
-    } else {
-        return 0;
-    };
-    if filled < min_rec {
-        return 0;
-    }
-    let Some(frame_seq) = head
-        .get(5..13)
-        .and_then(|b| b.try_into().ok())
-        .map(u64::from_le_bytes)
-    else {
-        return 0;
-    };
-    let Some(frame_len) = head
-        .get(len_off..len_off + 4)
-        .and_then(|b| b.try_into().ok())
-        .map(|b| u32::from_le_bytes(b) as usize)
-    else {
-        return 0;
-    };
-    if frame_len > FIRST_RECORD_PROBE_MAX_FRAME_BYTES {
-        return 0;
-    }
-    let record_len = len_off + 4 + frame_len + 4;
-    let mut record = vec![0u8; record_len]; // APPROVED: boot replay skip pass, one record, cold path
-    let copied = filled.min(record_len);
-    record[..copied].copy_from_slice(&head[..copied]);
-    if copied < record_len && std::io::Read::read_exact(&mut f, &mut record[copied..]).is_err() {
-        return 0;
-    }
-    let frame = &record[len_off + 4..len_off + 4 + frame_len];
-    let len_le = &record[len_off..len_off + 4];
-    let ws_byte = record[4];
-    let actual = if is_v4 {
-        crc32_ieee_of(&[
-            &[ws_byte],
-            &record[5..13],
-            &record[13..21],
-            &[record[21]],
-            len_le,
-            frame,
-        ])
-    } else if is_v3 {
-        crc32_ieee_of(&[&[ws_byte], &record[5..13], &record[13..21], len_le, frame])
-    } else {
-        crc32_ieee_of(&[&[ws_byte], &record[5..13], len_le, frame])
-    };
-    let Some(expected) = record
-        .get(record_len - 4..)
-        .and_then(|b| b.try_into().ok())
-        .map(u32::from_le_bytes)
-    else {
-        return 0;
-    };
-    if actual != expected {
-        return 0;
-    }
-    frame_seq
+    reader
+        .get_ref()
+        .metadata()
+        .is_ok_and(|m| m.len() == file_len)
 }
 
 /// [`replay_all_with_report`] with the disk probe and the per-boot frame count
@@ -3427,11 +4180,14 @@ pub fn replay_all_with_report_at<P: AsRef<Path>>(
     frames_so_far: u64,
 ) -> anyhow::Result<WalReplayBatch> {
     let wal_dir = wal_dir.as_ref();
-    let refused = |stopped_for_disk: bool| WalReplayBatch {
-        budget_bytes: budget_bytes as u64,
-        stopped_for_disk,
-        stopped_for_frame_cap: !stopped_for_disk,
-        ..WalReplayBatch::default()
+    let refused = |stopped_for_disk: bool| {
+        invalidate_replay_receipts(wal_dir);
+        WalReplayBatch {
+            budget_bytes: budget_bytes as u64,
+            stopped_for_disk,
+            stopped_for_frame_cap: !stopped_for_disk,
+            ..WalReplayBatch::default()
+        }
     };
     if frames_so_far >= WAL_REPLAY_MAX_FRAMES_PER_BOOT {
         metrics::counter!(WAL_REPLAY_FRAME_CAP_STOPS_COUNTER).increment(1);
@@ -3491,11 +4247,10 @@ fn resolved_memory_ceiling_bytes() -> Option<u64> {
 
 /// One replay pass under the REAL host memory guard.
 ///
-/// The thin wrapper `replay_all` / `replay_all_with_budget` and every boot
-/// path go through: it resolves this host's memory ceiling ONCE (the same
-/// `resolve_memory_ceiling` the resource monitor and `RESOURCE-02` use, so
-/// the guard and the alarm can never disagree about what the ceiling is) and
-/// reads `/proc/self/status` per segment.
+/// This fixture/compatibility helper resolves the host memory ceiling once
+/// and reads `/proc/self/status` per segment. Production uses held
+/// [`WalMaintenance`] methods, which reach the same guarded parser through
+/// the additional disk and per-boot frame fences.
 ///
 /// A host where neither probe resolves (non-Linux dev machine) gets
 /// `ceiling_bytes = None`, and `rss_at_or_above_fraction` then fails OPEN —
@@ -3516,15 +4271,12 @@ pub fn replay_all_with_report<P: AsRef<Path>>(
     // on the WAL path the LOOSEST of the three, and it is the one that runs
     // while a large ILP buffer is being materialised.
     //
-    // The doc comment above claims this uses "the same `resolve_memory_ceiling`
-    // the resource monitor and RESOURCE-02 use, so the guard and the alarm can
-    // never disagree." That sentence was false for as long as the path was
-    // hardcoded. It is true now (`resolved_memory_ceiling_bytes`).
+    // `resolved_memory_ceiling_bytes` now resolves the same cgroup-aware
+    // ceiling as the resource monitor.
     //
-    // 2026-09-05: this form carries the MEMORY guard only. The disk floor and
-    // the per-boot frame cap live in `replay_all_with_report_fenced`, which is
-    // what production calls; this one stays unfenced so a fixture on a
-    // small-disk host can still exercise the replay itself.
+    // This helper carries the memory guard only, so a small-disk fixture can
+    // exercise replay. Production uses held WalMaintenance methods; those
+    // add directory ownership and invoke the disk/frame-fenced helper.
     replay_all_with_report_guarded(
         wal_dir,
         budget_bytes,
@@ -3534,10 +4286,11 @@ pub fn replay_all_with_report<P: AsRef<Path>>(
     )
 }
 
-/// The PRODUCTION form of [`replay_all_with_report`]: the disk floor and the
-/// per-boot frame cap sit in front of the pass, so a full volume can no longer
-/// be made fuller by recovery. Every catch-up round and the STAGE-C boot
-/// replay (via [`replay_all_fenced`]) come through here.
+/// Shared disk/frame-fenced helper behind
+/// [`WalMaintenance::replay_with_report_fenced`]. The app enters through the
+/// held maintenance handle for boot and catch-up, so its directory ownership
+/// is validated and Linux filesystem operations use the pinned descriptor.
+/// Calling this path-based helper directly does not establish that ownership.
 ///
 /// The counter series below are created on the first pass of every boot,
 /// because the CloudWatch agent drops a counter's first sample and a refusal
@@ -3567,70 +4320,128 @@ pub fn replay_all_with_report_fenced<P: AsRef<Path>>(
     )
 }
 
-/// Lists the `*.wal` segment files directly under `dir` (NOT recursive).
-/// Returns an empty Vec for a missing/unreadable dir.
-fn wal_segments_in(dir: &Path) -> Vec<PathBuf> {
-    // O(1) EXEMPT: boot replay helper — cold path, bounded segment listing
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new(); // APPROVED: boot replay helper, cold path
+/// Strict recovery listing: only a deliberately optional absent child is
+/// empty. Unreadable directories, failed entries and poisoned ownership
+/// metadata refuse replay instead of reporting a falsely drained backlog.
+fn wal_segments_in_checked(dir: &Path, absent_is_empty: bool) -> anyhow::Result<Vec<PathBuf>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if absent_is_empty && error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Vec::new());
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "WAL directory {dir:?} could not be listed: {error}"
+            ));
+        }
     };
-    entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("wal"))
-        // Never the segment the writer thread is appending to — see
-        // `OPEN_SEGMENT` for the loss this prevents.
-        .filter(|p| !is_open_segment(p))
-        .collect() // APPROVED: boot replay helper, cold path
+    let open = OPEN_SEGMENTS
+        .lock()
+        .map_err(|_| anyhow::anyhow!("WAL open-segment registry poisoned"))?;
+    let mut paths = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|extension| extension.to_str()) == Some("wal")
+            && !open.iter().any(|current| same_wal_path(current, &path))
+        {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
 }
 
-/// CRASH-SAFETY confirm step: move every segment in `<wal_dir>/replaying/` to
-/// `<wal_dir>/archive/`. Call this ONLY after the frames returned by
-/// `replay_all` have been durably re-captured into the live pipeline (i.e. the
-/// boot re-injection succeeded). Until this runs, the staged segments are
-/// re-replayed on the next boot — so a crash between `replay_all` and this call
-/// can never strand frames. Idempotent and best-effort: a missing `replaying/`
-/// is a no-op; a rename failure leaves the segment in `replaying/` for a
-/// harmless (DEDUP-idempotent) re-replay next boot. NEVER panics, NEVER blocks.
-// TEST-EXEMPT: covered by test_confirmed_segment_is_not_rereplayed + test_confirm_replayed_missing_dir_is_noop + test_crash_between_move_and_confirm_still_rereplays
+/// Best-effort diagnostic/test listing. Recovery must use the strict form.
+fn wal_segments_in(dir: &Path) -> Vec<PathBuf> {
+    wal_segments_in_checked(dir, true).unwrap_or_default()
+}
+
+/// Compatibility confirmation for synchronous legacy callers. New callers
+/// must carry `WalReplayBatch::confirmation_id` to the generation-aware API.
+/// Only files in the current complete-pass manifest can be archived.
 pub fn confirm_replayed<P: AsRef<Path>>(wal_dir: P) {
+    let key = replay_directory_key(wal_dir.as_ref());
+    let generation = REPLAY_RECEIPTS.lock().ok().and_then(|manifests| {
+        manifests
+            .iter()
+            .find(|manifest| manifest.directory == key)
+            .map(|manifest| manifest.generation)
+    });
+    if let Some(generation) = generation
+        && !confirm_replayed_generation(wal_dir.as_ref(), generation)
+    {
+        warn!(
+            wal_dir = ?wal_dir.as_ref(),
+            generation,
+            "WAL compatibility confirmation refused; replay generation is not fully confirmed"
+        );
+    }
+}
+
+/// Confirm exactly the acknowledged replay generation. A stale generation,
+/// missing manifest, unread file, changed bytes, or failed rename is refused.
+/// Cold O(total confirmed bytes) validation; never a per-frame operation.
+#[must_use]
+pub fn confirm_replayed_generation<P: AsRef<Path>>(wal_dir: P, generation: u64) -> bool {
     let wal_dir = wal_dir.as_ref();
-    let replaying_dir = wal_dir.join(REPLAYING_SUBDIR);
-    let staged = wal_segments_in(&replaying_dir);
-    if staged.is_empty() {
-        return;
+    let Ok(_maintenance) = WAL_MAINTENANCE.lock() else {
+        return false;
+    };
+    let key = replay_directory_key(wal_dir);
+    let Ok(mut manifests) = REPLAY_RECEIPTS.lock() else {
+        return false;
+    };
+    let Some(at) = manifests
+        .iter()
+        .position(|manifest| manifest.directory == key && manifest.generation == generation)
+    else {
+        return false;
+    };
+    let manifest = manifests.remove(at);
+    drop(manifests);
+    if manifest.segments.is_empty() {
+        return true;
     }
     let archive_dir = wal_dir.join(ARCHIVE_SUBDIR);
-    drop(std::fs::create_dir_all(&archive_dir)); // O(1) EXEMPT: boot-time confirm step, cold path
+    if std::fs::create_dir_all(&archive_dir).is_err() {
+        return false;
+    }
+    let mut all_confirmed = true;
     let mut confirmed = 0u64;
-    for seg in &staged {
-        if let Some(name) = seg.file_name() {
-            let dst = archive_dir.join(name);
-            // O(1) EXEMPT: boot-time confirm step, cold path
-            match std::fs::rename(seg, &dst) {
-                Ok(()) => confirmed += 1,
-                Err(err) => {
-                    // Stays in `replaying/` → re-replayed next boot (DEDUP-safe).
-                    error!(
-                        segment = ?seg,
-                        error = %err,
-                        "WAL replay confirm: could not archive staged segment — \
-                         it stays in replaying/ and will be re-replayed next boot \
-                         (idempotent via capture_seq DEDUP)"
-                    );
-                }
+    for receipt in manifest.segments {
+        if is_open_segment(&receipt.path)
+            || segment_fingerprint(&receipt.path).ok().as_ref() != Some(&receipt.fingerprint)
+        {
+            all_confirmed = false;
+            error!(segment = ?receipt.path, generation,
+                "WAL confirm refused: bytes differ from the complete replay receipt");
+            continue;
+        }
+        let Some(name) = receipt.path.file_name() else {
+            all_confirmed = false;
+            continue;
+        };
+        let destination = archive_dir.join(name);
+        if destination.exists() {
+            all_confirmed = false;
+            error!(segment = ?receipt.path, generation, "WAL confirm refused to overwrite existing archive");
+            continue;
+        }
+        if let Err(error) = persist_confirmation_marker(&destination, &receipt.fingerprint) {
+            all_confirmed = false;
+            error!(segment = ?receipt.path, error = %error, "WAL archive proof was not synced; retaining staged source");
+            continue;
+        }
+        match std::fs::rename(&receipt.path, &destination) {
+            Ok(()) => confirmed += 1,
+            Err(err) => {
+                all_confirmed = false;
+                error!(segment = ?receipt.path, error = %err,
+                    "WAL confirmation failed; original remains replayable");
             }
         }
     }
-    if confirmed > 0 {
-        metrics::counter!("tv_wal_replay_confirmed_segments_total").increment(confirmed);
-    }
-    info!(
-        wal_dir = ?wal_dir,
-        confirmed_segments = confirmed,
-        staged = staged.len(),
-        "WAL replay confirmed — staged segments archived"
-    );
+    metrics::counter!("tv_wal_replay_confirmed_segments_total").increment(confirmed);
+    all_confirmed
 }
 
 /// Outcome of one `<wal_dir>/archive/` pruning pass.
@@ -3649,9 +4460,8 @@ pub struct ArchivePruneOutcome {
     /// the box is actually seeing, which is a different operator signal from
     /// routine age expiry.
     pub size_deleted: usize,
-    /// Bytes freed by the byte-ceiling pass (2026-09-02). Populated ONLY by
-    /// that pass, so on the ACTIVE directory it is the size of un-replayed
-    /// capture that disk pressure destroyed — the number a page has to carry.
+    /// Bytes of eligible, redundant segments reclaimed by the byte ceiling.
+    /// Unapplied or unknown active segments are not eligible.
     pub size_deleted_bytes: u64,
     /// Age, in whole seconds at prune time, of the OLDEST segment the byte
     /// pass deleted (2026-09-02). Zero when it deleted nothing. Oldest, not
@@ -3701,72 +4511,26 @@ pub fn prune_archived_segments_at<P: AsRef<Path>>(
     max_bytes: u64,
     now: std::time::SystemTime,
 ) -> ArchivePruneOutcome {
+    let Ok(_maintenance) = WAL_MAINTENANCE.lock() else {
+        return ArchivePruneOutcome {
+            failed: 1,
+            ..ArchivePruneOutcome::default()
+        };
+    };
     prune_wal_dir_at(
         &wal_dir.as_ref().join(ARCHIVE_SUBDIR),
         retention_secs,
         max_bytes,
         now,
+        archive_has_confirmation,
     )
 }
 
-/// Bounds the ACTIVE `<wal_dir>/*.wal` set by age and bytes — the sibling of
-/// [`prune_archived_segments_at`], added 2026-08-25.
-///
-/// # The leak this closes
-///
-/// Until now ONLY `archive/` was bounded. The active directory had no age
-/// bound and no byte bound, because the design assumed it drains itself:
-/// segments are replayed at boot, moved to `replaying/`, confirmed, moved to
-/// `archive/`, and pruned there.
-///
-/// It does not drain. [`WAL_REPLAY_MAX_BYTES`] caps a boot replay at 512 MiB —
-/// five segments — while the live lane writes segments continuously all
-/// session. Anything past the newest 512 MiB is never replayed, never
-/// confirmed, never archived, and so was never eligible for any bound.
-///
-/// Measured on the prod box 2026-08-25: **244 active segments, 31 GB, the
-/// oldest dated 08-24** — against a 1.9 GB archive that its own bounds were
-/// holding correctly. The volume was 94% full and free space was cycling down
-/// to 1.94 GB, which is the condition that makes an ILP flush fail, which is
-/// what the tick-spill rescue exists for.
-///
-/// # Why deleting these is bounded — and where it is NOT
-///
-/// A segment is written BEFORE parse and broadcast, as a crash-recovery copy.
-/// On a session that did not crash, the live lane folded those same frames in
-/// real time, so an un-replayed segment from a previous session is usually
-/// redundant — its frames were already processed.
-///
-/// **Usually, not always, and the exception is real.** `WalRingSink::accept`
-/// is WAL-first by design: it appends the frame, and only THEN tries to
-/// reserve ring budget. When that reservation fails it returns
-/// `FrameSinkOutcome::RingFull` and the frame is never folded — it exists in
-/// the ACTIVE WAL and nowhere else. The WAL record carries no flag
-/// distinguishing that frame from one the lane folded a microsecond later, so
-/// this prune cannot tell them apart, and a deletion can therefore be the last
-/// copy of a tick. The count of such sheds is `tv_dhan_ws_ring_full_total`;
-/// when it is zero for a session, everything this pass deletes from that
-/// session really was redundant.
-///
-/// The AGE pass is still bounded, and that bound is what makes it defensible:
-/// at any retention of one full day or more, nothing it deletes was reachable
-/// by the next boot's 512 MiB replay budget in any case — a session writes far
-/// more than that (measured: 244 segments, 31 GB), so the backlog past the
-/// budget is unrecoverable before this prune ever touches it.
-///
-/// The BYTE pass has no such bound. It ignores age and deletes the oldest
-/// survivor to hold the volume under the ceiling, which can take a segment the
-/// next boot would have replayed. That is a disk-pressure event; it is counted
-/// separately as `tv_ws_wal_active_pruned_under_pressure_total` rather than
-/// folded into the routine total, and the condition causing it already pages
-/// through the free-space alarm.
-///
-/// The deeper defect this documents rather than fixes: the 512 MiB per-boot
-/// replay budget against a ~31 GB session means deferred segments can never
-/// drain, so they are guaranteed to reach one of these two passes. Closing
-/// that needs either a larger budget (slower boot) or in-session refold of
-/// shed frames (a design change) — neither is a line edit, and pretending the
-/// prune is harmless was the previous way of not saying so.
+/// Retain every active original. Maximum-ACK watermarks are diagnostic, not
+/// per-frame completion proofs. Exact generation ACKs first move consumed
+/// originals into archive; only archive pruning may reclaim their bytes.
+/// A finite disk can exceed its target while recovery is behind, which is
+/// surfaced rather than concealed by deleting unconfirmed capture.
 #[must_use]
 pub fn prune_active_segments_at<P: AsRef<Path>>(
     wal_dir: P,
@@ -3774,7 +4538,23 @@ pub fn prune_active_segments_at<P: AsRef<Path>>(
     max_bytes: u64,
     now: std::time::SystemTime,
 ) -> ArchivePruneOutcome {
-    prune_wal_dir_at(wal_dir.as_ref(), retention_secs, max_bytes, now)
+    let wal_dir = wal_dir.as_ref();
+    let Ok(_maintenance) = WAL_MAINTENANCE.lock() else {
+        return ArchivePruneOutcome {
+            failed: 1,
+            ..ArchivePruneOutcome::default()
+        };
+    };
+    let outcome = prune_wal_dir_at(wal_dir, retention_secs, max_bytes, now, |_| false);
+    if outcome.bytes_after > max_bytes {
+        metrics::counter!("tv_ws_wal_active_capacity_unreclaimed_total").increment(1);
+        warn!(
+            bytes_retained = outcome.bytes_after,
+            max_bytes,
+            "WAL capacity target exceeded: unapplied/unknown originals retained for recovery"
+        );
+    }
+    outcome
 }
 
 /// The shared age-then-bytes prune, over ONE directory of `*.wal` segments.
@@ -3789,14 +4569,16 @@ pub fn prune_active_segments_at<P: AsRef<Path>>(
 /// are subdirectories it never descends into, which is what keeps the
 /// staged-but-unconfirmed set out of its reach.
 #[must_use]
-fn prune_wal_dir_at(
+fn prune_wal_dir_at<E: Fn(&Path) -> bool>(
     dir: &Path,
     retention_secs: u64,
     max_bytes: u64,
     now: std::time::SystemTime,
+    eligible: E,
 ) -> ArchivePruneOutcome {
     let archive_dir = dir.to_path_buf();
     let mut outcome = ArchivePruneOutcome::default();
+    let mut protected_bytes = 0u64;
     // Segments surviving the age pass, as (mtime, len, path) — the byte
     // ceiling's candidate set.
     // Pre-allocated rather than grown from empty, per the banned-pattern
@@ -3807,12 +4589,35 @@ fn prune_wal_dir_at(
     let mut survivors: Vec<(std::time::SystemTime, u64, std::path::PathBuf)> =
         Vec::with_capacity(ARCHIVE_PRUNE_SURVIVOR_HINT);
     // O(1) EXEMPT: periodic cold archive prune, never the per-frame append
-    let Ok(entries) = std::fs::read_dir(&archive_dir) else {
-        return outcome; // missing archive dir — nothing to prune
+    let entries = match std::fs::read_dir(&archive_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return outcome,
+        Err(error) => {
+            outcome.failed += 1;
+            warn!(directory = ?archive_dir, error = %error, "WAL prune listing failed; completeness is unknown");
+            return outcome;
+        }
     };
     let cutoff = std::time::Duration::from_secs(retention_secs);
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                outcome.failed += 1;
+                warn!(directory = ?archive_dir, error = %error, "WAL prune entry unreadable; retaining unknown originals");
+                continue;
+            }
+        };
         let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.ends_with(".wal.confirmed") || name.ends_with(".wal.confirmed.tmp")
+            })
+        {
+            continue; // receipt metadata is not a segment in prune accounting
+        }
         if path.extension().and_then(|s| s.to_str()) != Some("wal") {
             outcome.kept += 1; // foreign file — never touched
             continue;
@@ -3843,8 +4648,10 @@ fn prune_wal_dir_at(
         // whole set is gone. Narrow is not zero, the predicate already
         // exists, and the cost of using it is one comparison per pass on a
         // six-hourly cold path.
-        if is_open_segment(&path) {
+        if is_open_segment(&path) || !eligible(&path) {
             outcome.kept += 1;
+            protected_bytes =
+                protected_bytes.saturating_add(entry.metadata().map_or(0, |m| m.len()));
             continue;
         }
         let age = entry
@@ -3855,9 +4662,14 @@ fn prune_wal_dir_at(
         match age {
             // O(1) EXEMPT: periodic cold archive prune, never the per-frame append
             Some(age) if age > cutoff => match std::fs::remove_file(&path) {
-                Ok(()) => outcome.deleted += 1,
+                Ok(()) => {
+                    outcome.deleted += 1;
+                    remove_confirmation_marker(&path);
+                }
                 Err(err) => {
                     outcome.failed += 1;
+                    protected_bytes = protected_bytes
+                        .saturating_add(entry.metadata().map_or(0, |metadata| metadata.len()));
                     warn!(
                         path = %path.display(),
                         error = %err,
@@ -3887,20 +4699,27 @@ fn prune_wal_dir_at(
     // triage actually needs.
     //
     // Cold path, runs on the periodic prune task — never the per-frame append.
-    let total: u64 = survivors.iter().map(|(_, len, _)| *len).sum();
+    let total = survivors
+        .iter()
+        .fold(protected_bytes, |total, (_, len, _)| {
+            total.saturating_add(*len)
+        });
     outcome.bytes_after = total;
     if total > max_bytes {
         // O(1) EXEMPT: periodic cold archive prune, never the per-frame append
         survivors.sort_by_key(|(mtime, _, _)| *mtime);
         let mut remaining = total;
+        let mut planned_remaining = total;
         for (mtime, len, path) in &survivors {
-            if remaining <= max_bytes {
+            if planned_remaining <= max_bytes {
                 break;
             }
+            planned_remaining = planned_remaining.saturating_sub(*len);
             // O(1) EXEMPT: periodic cold archive prune, never the per-frame append
             match std::fs::remove_file(path) {
                 Ok(()) => {
                     outcome.size_deleted += 1;
+                    remove_confirmation_marker(path);
                     outcome.size_deleted_bytes = outcome.size_deleted_bytes.saturating_add(*len);
                     // Oldest-first walk, so the FIRST successful delete is the
                     // oldest one; `max` keeps that true even if an earlier
@@ -3926,7 +4745,6 @@ fn prune_wal_dir_at(
                     // ceiling for one pass, which the next pass corrects. The
                     // failure is still counted and logged, so a permanently
                     // un-deletable file is visible rather than absorbed.
-                    remaining = remaining.saturating_sub(*len);
                     warn!(
                         path = %path.display(),
                         error = %err,
@@ -3987,73 +4805,18 @@ pub fn prune_active_segments<P: AsRef<Path>>(
     retention_secs: u64,
     max_bytes: u64,
 ) -> ArchivePruneOutcome {
-    let outcome = prune_active_segments_at(
-        wal_dir,
-        retention_secs,
-        max_bytes,
-        std::time::SystemTime::now(),
-    );
-    if outcome.deleted > 0 || outcome.failed > 0 || outcome.size_deleted > 0 {
-        metrics::counter!("tv_ws_wal_active_pruned_total")
-            .increment((outcome.deleted + outcome.size_deleted) as u64);
-        // Counted SEPARATELY from the total, because the two passes have
-        // different safety arguments and only one of them is bounded.
-        //
-        // The AGE pass deletes nothing a future boot could have reached: at a
-        // 48-hour retention against a 512 MiB per-boot replay budget, those
-        // segments were already past recovery. The BYTE pass ignores age
-        // entirely -- it deletes the oldest survivor to protect the volume,
-        // and it can therefore delete a segment the next boot would otherwise
-        // have replayed. That is a disk-pressure event, not routine
-        // housekeeping, and it deserves its own number.
-        //
-        // Deliberately NOT EMF-selected: the condition that produces it --
-        // the volume filling -- already pages via `tv-<env>-spill-dir-free-low`
-        // (noise-lock 2.3g), so a second pager for the same cause would be
-        // redundant, and every EMF name costs ~$0.30/mo against a maximal
-        // month already above the budget's automatic stop line. It is
-        // readable on `/metrics` and through the debug API. Stated here so
-        // the omission is a decision on the record rather than an oversight.
-        if outcome.size_deleted > 0 {
-            metrics::counter!("tv_ws_wal_active_pruned_under_pressure_total")
-                .increment(outcome.size_deleted as u64);
-            // ONE coded line per pass (2026-09-02). Until now this pass wrote an
-            // `info!` and a counter that is deliberately not EMF-selected — so
-            // capture destroyed under disk pressure reached no log filter and
-            // no alarm. Rides the already-filtered WS-SPILL-01 code with a
-            // distinguishing `source`; no new metric name, no new alarm.
-            error!(
-                code = ErrorCode::WsSpill01WriterRespawn.code_str(),
-                source = "active_segment_pruned_under_pressure",
-                segments_deleted = outcome.size_deleted,
-                bytes_freed = outcome.size_deleted_bytes,
-                oldest_segment_age_secs = outcome.size_deleted_oldest_age_secs,
-                max_bytes,
-                "ACTIVE WAL segments were deleted under DISK PRESSURE — un-replayed \
-                 capture that a future boot would otherwise have offered to the refold. \
-                 This is the prune-vs-suspended-QuestDB trade: keeping them would let the \
-                 volume fill, and a full volume WAL-suspends every QuestDB table (which \
-                 keeps ACKing writes it silently does not apply), so the prune protects the \
-                 live tape at the cost of the backlog. A frame shed at the ring \
-                 (tv_dhan_ws_ring_full_total) that reached only the WAL is now gone."
-            );
-        }
-        info!(
-            deleted = outcome.deleted,
-            size_deleted = outcome.size_deleted,
+    let outcome = prune_active_segments_at(wal_dir, retention_secs, max_bytes, SystemTime::now());
+    // Compatibility metrics remain visible at zero. A retention target is
+    // never authorization to erase an unconfirmed active original.
+    metrics::counter!("tv_ws_wal_active_pruned_total").increment(0);
+    metrics::counter!("tv_ws_wal_active_pruned_under_pressure_total").increment(0);
+    if outcome.failed > 0 {
+        warn!(
             failed = outcome.failed,
             kept = outcome.kept,
             bytes_after = outcome.bytes_after,
-            retention_secs,
             max_bytes,
-            "WAL ACTIVE prune pass complete — un-replayed segments deleted by age \
-             and, separately, by the byte ceiling. MOST are crash-recovery copies \
-             of frames the live lane folded in real time, and those are redundant. \
-             They are not ALL: a frame shed at the frame ring (tv_dhan_ws_ring_full_total) \
-             reached the WAL and was never folded, and the record does not distinguish \
-             the two — so a deletion here can be the last copy. The age pass is still \
-             bounded (nothing 48h old is reachable by a 512 MiB replay budget); the \
-             byte pass is not, and its count is tv_ws_wal_active_pruned_under_pressure_total."
+            "WAL active retention scan incomplete; unconfirmed originals retained"
         );
     }
     outcome
@@ -4095,24 +4858,10 @@ pub fn prune_active_segments<P: AsRef<Path>>(
 ///    no byte cap, no age cap and no free-space check. A replay that never
 ///    confirms leaves them permanently.
 ///
-/// # Why a fail-closed floor here would be WRONG
-///
-/// This is capture-at-receipt: the WAL is written BEFORE parse and
-/// broadcast, so a refusal drops a frame that exists nowhere else. That
-/// converts a bounded DISK problem into unrecoverable UPSTREAM loss — the
-/// opposite of the tick tier, where a refused rescue loses rows the database
-/// already rejected and which the vendor can still be asked for. It is also
-/// why the tick floor itself fails OPEN on a blind probe.
-///
-/// The correct shape is EVICTION, not refusal: at rotation — where
-/// `writer_loop` already tests `bytes_written >= WAL_SEGMENT_MAX_BYTES` —
-/// drop the OLDEST already-captured segment when the directory is over this
-/// ceiling. Deleting the oldest captured frame to make room for the newest
-/// uncaptured one is strictly better than dropping the newest, and it removes
-/// the six-hour lag without ever refusing a capture. It is not done here
-/// because deleting a segment that has not been confirmed replayed is itself
-/// a loss path, and choosing which of those two losses to take needs the
-/// replay-confirmation state in hand.
+/// The ceiling is a capacity target, not permission to evict unapplied
+/// records. Active cleanup requires complete applied evidence. If the target
+/// cannot be reclaimed, report retained bytes and bound future admission;
+/// neither an unlimited outage nor unlimited upstream input fits finite disk.
 ///
 /// # Complexity
 /// O(1) after the first call.
@@ -4162,32 +4911,27 @@ pub fn ws_wal_active_max_bytes<P: AsRef<Path>>(wal_dir: P) -> u64 {
 
 #[cfg(test)]
 fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
-    replay_segment_filtered(path, None).map(|(frames, _)| frames)
+    replay_segment_filtered(path, None).map(|(frames, _, _)| frames)
 }
 
-/// [`replay_segment`] with the applied-watermark filter: a record whose
-/// sequence is known-applied for its sink is CRC-verified, counted, and NOT
-/// returned. Returns `(frames, dropped_as_applied)`.
-///
-/// The filter runs AFTER the CRC check on purpose. A corrupt record must end
-/// the walk and be reported whether or not its sequence would have been
-/// skipped; filtering before the check would let corruption inside a skipped
-/// range pass silently.
+/// Completely decode a segment and fingerprint its original bytes. The
+/// compatibility watermark argument is deliberately ignored: a maximum ACK
+/// cannot prove that every lower allocated frame reached its sink. The
+/// skipped-record count therefore remains zero.
 fn replay_segment_filtered(
     path: &Path,
-    applied: Option<&crate::wal_applied_watermark::AppliedSnapshot>,
-) -> anyhow::Result<(Vec<ReplayedFrame>, u64)> {
-    let mut dropped_as_applied = 0u64;
+    _applied: Option<&crate::wal_applied_watermark::AppliedSnapshot>,
+) -> anyhow::Result<(Vec<ReplayedFrame>, u64, SegmentFingerprint)> {
+    let dropped_as_applied = 0u64;
     let mut f = File::open(path)?;
     let mut buf = Vec::new(); // APPROVED: boot-time WAL replay, cold path
     f.read_to_end(&mut buf)?;
 
     let mut out = Vec::new(); // APPROVED: boot-time WAL replay, cold path
     let mut i = 0usize;
-    let mut corrupted_at: Option<(&str, usize)> = None;
-    // TVW4 records whose endpoint byte this binary does not recognise. They
-    // replay as `MainFeed` (total decode, never a drop) and are COUNTED here so
-    // the mapping is reported once per segment rather than silently applied.
+    let mut corrupted_at: Option<(&'static str, usize)> = None;
+    // Count unsupported TVW4 endpoint tags before refusing the whole file.
+    // They are never guessed into the main-feed parser.
     let mut unknown_endpoint = 0usize;
     // Smallest record is v1 (13 bytes); v2 is 21. Gate the OUTER loop on the v1
     // minimum, then re-check the version-specific minimum after the magic check
@@ -4218,6 +4962,7 @@ fn replay_segment_filtered(
             // manual recovery with the newer binary remains possible. That is
             // the reason this is loud-and-counted rather than fail-closed.
             if i == 0 {
+                corrupted_at = Some(("unknown_magic", i));
                 metrics::counter!("tv_wal_replay_unknown_magic_total").increment(1);
                 error!(
                     code = ErrorCode::WsSpill02FrameDropped.code_str(),
@@ -4250,6 +4995,7 @@ fn replay_segment_filtered(
             WAL_MIN_RECORD_V1
         };
         if i + min_rec > buf.len() {
+            corrupted_at = Some(("incomplete_header", i));
             warn!(segment = ?path, offset = i, is_v2, "truncated header at tail");
             break;
         }
@@ -4358,10 +5104,11 @@ fn replay_segment_filtered(
             }
         };
         if record_end > buf.len() {
+            corrupted_at = Some(("incomplete_record", i));
             warn!(segment = ?path, offset = i, frame_len, "truncated record at tail");
             break;
         }
-        let frame = buf[frame_off..frame_off + frame_len].to_vec();
+        let frame = &buf[frame_off..frame_off + frame_len];
         let crc_bytes: [u8; 4] = match buf[frame_off + frame_len..record_end].try_into() {
             Ok(b) => b,
             Err(_) => {
@@ -4385,7 +5132,7 @@ fn replay_segment_filtered(
                 &received_at_nanos.to_le_bytes()[..],
                 &[endpoint_byte.unwrap_or(0)],
                 &len_le[..],
-                &frame,
+                frame,
             ])
         } else if is_v3 {
             crc32_ieee_of(&[
@@ -4393,55 +5140,41 @@ fn replay_segment_filtered(
                 &frame_seq.to_le_bytes()[..],
                 &received_at_nanos.to_le_bytes()[..],
                 &len_le[..],
-                &frame,
+                frame,
             ])
         } else if is_v2 {
-            crc32_ieee_of(&[
-                &[ws_byte],
-                &frame_seq.to_le_bytes()[..],
-                &len_le[..],
-                &frame,
-            ])
+            crc32_ieee_of(&[&[ws_byte], &frame_seq.to_le_bytes()[..], &len_le[..], frame])
         } else {
-            crc32_ieee_of(&[&[ws_byte], &len_le[..], &frame])
+            crc32_ieee_of(&[&[ws_byte], &len_le[..], frame])
         };
         if actual != expected {
             corrupted_at = Some(("crc_mismatch", i));
             warn!(segment = ?path, offset = i, expected, actual, "CRC mismatch; stopping");
             break;
         }
-        if let Some(applied) = applied
-            && applied.frame_is_applied(applied_sink_for(endpoint), frame_seq)
-        {
-            dropped_as_applied = dropped_as_applied.saturating_add(1);
-            i = record_end;
-            continue;
+        if frame_seq > i64::MAX as u64 {
+            corrupted_at = Some(("sequence_out_of_range", i));
+            break;
+        }
+        if endpoint_byte.is_some_and(|raw| raw > WalEndpoint::OrderUpdate.as_u8()) {
+            corrupted_at = Some(("unsupported_endpoint", i));
+            break;
         }
         out.push(ReplayedFrame {
             ws_type,
-            frame,
+            frame: frame.to_vec(), // APPROVED: materialise only a frame that requires replay
             frame_seq,
             received_at_nanos,
             endpoint,
         });
         i = record_end;
     }
+    if i != buf.len() && corrupted_at.is_none() {
+        corrupted_at = Some(("incomplete_tail", i));
+    }
     if unknown_endpoint > 0 {
-        // Not a loss — every such frame was returned above, as `MainFeed`.
-        // Reported ONCE per segment so the forward-compatibility mapping is
-        // visible in the log rather than applied in silence. Rides the
-        // already-filtered WS-SPILL-01 code with a distinguishing `source`;
-        // no new metric name (cost rule).
-        warn!(
-            code = ErrorCode::WsSpill01WriterRespawn.code_str(),
-            source = "unknown_endpoint_byte",
-            segment = ?path,
-            frames = unknown_endpoint,
-            "WAL replay: TVW4 records carried an endpoint byte this binary does not \
-             recognise — they were replayed as MAIN-FEED frames (the pre-v4 \
-             assumption), never dropped. A newer build wrote them; a depth frame \
-             among them is counted-and-skipped by the refold rather than re-persisted."
-        );
+        warn!(segment = ?path, frames = unknown_endpoint,
+            "WAL replay refused unsupported endpoint bytes; original retained for compatible recovery");
     }
     // CORRUPTION ACCOUNTING -- added 2026-08-28.
     //
@@ -4458,9 +5191,8 @@ fn replay_segment_filtered(
     // hazard one branch away -- an unknown magic at offset 0 -- has always been
     // counted and coded. This closes the gap between them.
     //
-    // The two TAIL sites are deliberately NOT counted: a partial trailing
-    // record is what an interrupted writer leaves behind, it abandons nothing
-    // beyond itself, and counting it would page on every unclean shutdown.
+    // A torn-looking length/header is not proof that no intact suffix exists.
+    // Every incomplete region is counted and refuses whole-segment confirmation.
     //
     // Bytes, not records: the record count of undecodable bytes is unknowable,
     // and a fabricated number inside a counter that exists to stop fabrication
@@ -4477,12 +5209,21 @@ fn replay_segment_filtered(
             abandoned_bytes = abandoned,
             recovered_frames = out.len(),
             "WAL segment is corrupt mid-file — the walk stopped here and every \
-             frame after this point is unrecovered. The segment is still moved \
-             to the archive directory, so the bytes survive for manual \
-             inspection, but nothing will read them again automatically."
+             frame after this point is unrecovered. This pass is refused and \
+             the original is retained outside confirmed-data pruning."
         );
+        return Err(IncompleteWalSegment {
+            reason,
+            offset,
+            unread_bytes: abandoned,
+        }
+        .into());
     }
-    Ok((out, dropped_as_applied))
+    let fingerprint = SegmentFingerprint {
+        bytes: buf.len() as u64,
+        sha256: Sha256::digest(&buf).into(),
+    };
+    Ok((out, dropped_as_applied, fingerprint))
 }
 
 // ---------------------------------------------------------------------------
@@ -4629,38 +5370,25 @@ mod tests {
     /// comfortable sentence cannot come back.
     #[test]
     fn the_prune_never_claims_the_frames_it_deletes_were_already_folded() {
-        let source = include_str!("ws_frame_spill.rs");
+        let dir = tmp_dir("unapplied-prune-retained");
+        let path = write_wm_segment(&dir, 10, 1, WalEndpoint::MainFeed);
+        let outcome =
+            prune_active_segments_at(&dir, 0, 0, SystemTime::now() + Duration::from_secs(1));
         assert!(
-            !source.contains(concat!("frames the live lane ", "already folded")),
-            "the prune's log line is asserting that everything it deletes was \
-             already folded. A frame shed at the ring (FrameSinkOutcome::RingFull) \
-             reached the WAL and was NOT folded, and the record cannot tell them \
-             apart -- so this claim is false for exactly the frames whose loss \
-             matters most"
+            path.exists(),
+            "age and byte pressure cannot authorize deleting unapplied data"
         );
-        assert!(
-            source.contains("tv_ws_wal_active_pruned_under_pressure_total"),
-            "the byte-ceiling pass ignores age and can delete a segment the next \
-             boot would have replayed. It must be counted separately from routine \
-             age pruning, or a disk-pressure data deletion is indistinguishable \
-             from housekeeping"
-        );
-        assert!(
-            source.contains("tv_dhan_ws_ring_full_total"),
-            "the doc must name the counter that tells an operator whether this \
-             prune's deletions were redundant -- without it, the honest caveat is \
-             unactionable"
-        );
+        assert_eq!(outcome.deleted + outcome.size_deleted, 0);
+        assert_eq!(outcome.bytes_after, std::fs::metadata(&path).unwrap().len());
+        std::fs::remove_dir_all(dir).unwrap();
     }
     use std::time::Duration;
 
     #[test]
     fn test_durability_claim_matches_what_the_code_actually_does() {
-        // A documentation ratchet, and the only kind that works for a claim
-        // like this one: durability is invisible in a unit test — a flushed
-        // record and a synced record are byte-identical until the machine
-        // loses power — so nothing but a source scan can keep the words and
-        // the syscalls in agreement.
+        // A documentation ratchet, not a durability experiment. A source
+        // scan can require honest wording; it cannot establish that a file
+        // survives a process crash or power loss on a particular device.
         //
         // Until 2026-08-11 this module asserted "fsync" three times while
         // calling `sync_all` zero times. The live feed refuses to open a
@@ -4715,7 +5443,7 @@ mod tests {
             // `sync_all` call site:
             //
             //   * that the sync is INTERVAL-driven, not per-record;
-            //   * that the residual window is bounded, not eliminated;
+            //   * that a configured interval is not a durability deadline;
             //   * that it is reversible without a rebuild.
             assert!(
                 production.contains("sync_all"),
@@ -4723,8 +5451,7 @@ mod tests {
             );
             assert!(
                 production.contains("WAL_FSYNC_INTERVAL_MS_DEFAULT"),
-                "this module now syncs, so the header must name the interval \
-                 constant that bounds the unsynced window"
+                "this module now syncs, so the header must name its configured interval"
             );
             // Pin the SENTENCE, not the word. The first version asked whether
             // the header contained "bounded" ANYWHERE, and a bite-proof that
@@ -4733,10 +5460,15 @@ mod tests {
             // lives in one sentence.
             let hdr = production.split("use std::fs").next().unwrap_or(production);
             assert!(
-                hdr.contains("It is a BOUND, not an elimination."),
-                "a periodic sync BOUNDS the power-loss window; it does not \
-                 close it. The header must say so, or the next reader will \
-                 read `sync_all` and assume zero loss."
+                hdr.contains(
+                    "The configured interval is a scheduling target, not a durability deadline."
+                ),
+                "a configured sync interval cannot bound scheduling delay, \
+                 queue delay, failed I/O, or disabled syncing"
+            );
+            assert!(
+                hdr.contains("acknowledges only admission to process memory"),
+                "append acceptance must not be described as a write or sync acknowledgement"
             );
             assert!(
                 hdr.contains("power"),
@@ -4865,11 +5597,12 @@ mod tests {
             .open(&path)
             .expect("temp segment must open");
         let mut current = Some(BufWriter::new(file));
+        let mut dirty = true;
 
         // Disabled: returns the SAME instant it was given, so the caller's
         // timer is untouched and no sync is attempted.
         let t0 = Instant::now();
-        let after_disabled = maybe_sync_segment(&mut current, None, t0);
+        let after_disabled = maybe_sync_segment(&mut current, None, t0, &mut dirty);
         assert_eq!(
             after_disabled, t0,
             "a disabled sync must not re-arm the caller's timer"
@@ -4877,7 +5610,7 @@ mod tests {
 
         // Interval not yet elapsed: also a no-op, same instant back.
         let long = Duration::from_secs(3_600);
-        let after_early = maybe_sync_segment(&mut current, Some(long), Instant::now());
+        let after_early = maybe_sync_segment(&mut current, Some(long), Instant::now(), &mut dirty);
         assert!(
             after_early.elapsed() < Duration::from_secs(1),
             "an early call must return the instant it was handed, unchanged"
@@ -4886,12 +5619,18 @@ mod tests {
         // Interval elapsed: the timer MUST advance, which is the only
         // observable signal that the sync branch was entered at all.
         let stale = Instant::now() - Duration::from_secs(10);
-        let after_due = maybe_sync_segment(&mut current, Some(Duration::from_millis(1)), stale);
+        let after_due = maybe_sync_segment(
+            &mut current,
+            Some(Duration::from_millis(1)),
+            stale,
+            &mut dirty,
+        );
         assert!(
             after_due > stale,
             "a due sync must re-arm the timer; if it did not, the sync branch \
              was never reached and this module is not syncing at all"
         );
+        assert!(!dirty, "only successful sync clears dirty bytes");
 
         // And the file survived it: sync_all on a healthy fd cannot corrupt,
         // but a panicking or file-closing implementation would show here.
@@ -5014,7 +5753,7 @@ mod tests {
         assert_eq!(spill.shutdown(Duration::from_secs(5)), 0);
         drop(spill);
 
-        let frames = replay_all(&dir).expect("replay");
+        let frames = replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).expect("replay");
         assert_eq!(
             frames.len(),
             64,
@@ -5176,7 +5915,7 @@ mod tests {
         // Give writer thread time to exit cleanly.
         std::thread::sleep(Duration::from_millis(50));
 
-        let frames = replay_all(&dir).unwrap();
+        let frames = replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).unwrap();
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].ws_type, WsType::LiveFeed);
         assert_eq!(frames[0].frame, vec![1, 2, 3, 4]);
@@ -5187,7 +5926,7 @@ mod tests {
         // ONLY after `confirm_replayed` (the caller proves durable re-capture)
         // is the second replay empty.
         confirm_replayed(&dir);
-        let frames2 = replay_all(&dir).unwrap();
+        let frames2 = replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).unwrap();
         assert!(
             frames2.is_empty(),
             "after confirm_replayed, segments are archived and must NOT re-replay"
@@ -5208,7 +5947,7 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(50));
 
-        let frames = replay_all(&dir).unwrap();
+        let frames = replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).unwrap();
         assert_eq!(frames.len(), 1);
 
         // The replayed segment is in `replaying/`, NOT `archive/`.
@@ -5254,13 +5993,13 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
 
         // First boot: replay returns the frames, stages them in `replaying/`.
-        let first = replay_all(&dir).unwrap();
+        let first = replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).unwrap();
         assert_eq!(first.len(), 2, "first boot recovers all frames");
 
         // CRASH before confirm — no `confirm_replayed` call. Next boot MUST
         // re-replay the staged segment (the pre-fix bug stranded it in
         // `archive/` and returned 0 here, silently losing auto-recovery).
-        let second = replay_all(&dir).unwrap();
+        let second = replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).unwrap();
         assert_eq!(
             second.len(),
             2,
@@ -5286,13 +6025,13 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(50));
 
-        let first = replay_all(&dir).unwrap();
+        let first = replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).unwrap();
         assert_eq!(first.len(), 1);
         confirm_replayed(&dir); // durable re-capture confirmed
 
         // Boot again: the confirmed segment lives only in `archive/`, which is
         // never re-globbed → zero re-replay.
-        let second = replay_all(&dir).unwrap();
+        let second = replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).unwrap();
         assert!(
             second.is_empty(),
             "confirmed (archived) segment must NOT re-replay"
@@ -5301,7 +6040,7 @@ mod tests {
         // A THIRD boot also returns 0 — the archive accumulates confirmed
         // history but is never re-injected (regression guard against
         // re-globbing the whole archive every boot).
-        let third = replay_all(&dir).unwrap();
+        let third = replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).unwrap();
         assert!(third.is_empty(), "archive must never be re-replayed");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -5323,7 +6062,7 @@ mod tests {
         let fresh = dir.join("ws-frames-00000000000000009999.wal");
         std::fs::write(&fresh, encode_v1_record(WsType::LiveFeed, &[0xBB])).unwrap();
 
-        let frames = replay_all(&dir).unwrap();
+        let frames = replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).unwrap();
         assert_eq!(frames.len(), 2, "both leftover and fresh must replay");
         assert_eq!(
             frames[0].frame,
@@ -5352,12 +6091,12 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(50));
 
-        let _first = replay_all(&dir).unwrap();
+        let _first = replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).unwrap();
         // Segment is now in replaying/. Simulate crash: no confirm.
         assert_eq!(wal_segments_in(&dir.join("replaying")).len(), 1);
 
         // Fresh process boots → re-replays the staged segment.
-        let recovered = replay_all(&dir).unwrap();
+        let recovered = replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).unwrap();
         assert_eq!(
             recovered.len(),
             1,
@@ -5695,19 +6434,14 @@ mod tests {
         bytes[victim] ^= 0xFF;
         std::fs::write(path, &bytes).unwrap();
 
-        let damaged = replay_segment(path).expect("a corrupt segment still returns Ok");
-        assert_eq!(
-            damaged.len(),
-            1,
-            "the walk must keep every frame BEFORE the corruption and stop there \
-             -- got {} frame(s)",
-            damaged.len()
-        );
-        assert_eq!(
-            &damaged[0].frame[..],
-            &[0xAAu8; 64][..],
-            "the surviving frame must be the first one, intact"
-        );
+        let error =
+            replay_segment(path).expect_err("a corrupt segment cannot return a confirmable prefix");
+        let incomplete = error
+            .downcast_ref::<IncompleteWalSegment>()
+            .expect("typed incomplete status");
+        assert_eq!(incomplete.reason, "crc_mismatch");
+        assert!(incomplete.offset > 0);
+        assert!(incomplete.unread_bytes > 0);
 
         // The load-bearing half: the abandonment is reported. Asserted on the
         // source rather than on a metrics recorder because the counters are
@@ -5729,10 +6463,8 @@ mod tests {
             );
         }
         assert!(
-            !source.contains("truncated header at tail\");\n            corrupted_at"),
-            "the two TAIL sites must NOT be counted -- a partial trailing record is \
-             what an interrupted writer leaves behind, and counting it would page on \
-             every unclean shutdown"
+            source.contains("incomplete_tail"),
+            "a tail cannot imply whole-file completeness"
         );
     }
 
@@ -5912,7 +6644,7 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(50));
 
-        let frames = replay_all(&dir).unwrap();
+        let frames = replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).unwrap();
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].frame, vec![9, 8, 7]);
         assert_eq!(frames[1].frame, vec![6, 5, 4]);
@@ -5937,7 +6669,7 @@ mod tests {
         bytes.extend_from_slice(&encode_v1_record(WsType::OrderUpdate, b"{\"a\":2}"));
         std::fs::write(&seg, &bytes).unwrap();
 
-        let frames = replay_all(&dir).unwrap();
+        let frames = replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).unwrap();
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].ws_type, WsType::LiveFeed);
         assert_eq!(frames[0].frame, vec![1, 2, 3, 4]);
@@ -5961,11 +6693,13 @@ mod tests {
         assert_eq!(bytes.len(), 13);
         std::fs::write(&seg, &bytes).unwrap();
 
-        let frames = replay_all(&dir).unwrap(); // must not panic
         assert!(
-            frames.is_empty(),
-            "truncated v2 header must recover 0 frames"
+            replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).is_err(),
+            "incomplete input must refuse confirmation"
         );
+        confirm_replayed(&dir);
+        assert!(wal_segments_in(&dir.join(ARCHIVE_SUBDIR)).is_empty());
+        assert_eq!(wal_segments_in(&dir.join(QUARANTINE_SUBDIR)).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6002,7 +6736,7 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(50));
 
-        let frames = replay_all(&dir).unwrap();
+        let frames = replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).unwrap();
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].frame, vec![1, 2, 3]);
         assert_eq!(frames[1].frame, vec![4, 5, 6]);
@@ -6028,7 +6762,7 @@ mod tests {
         bytes.extend_from_slice(&encode_v2_record(WsType::LiveFeed, 99, &[8, 8]));
         std::fs::write(&seg, &bytes).unwrap();
 
-        let frames = replay_all(&dir).unwrap();
+        let frames = replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).unwrap();
         assert_eq!(frames.len(), 2, "both legacy versions must still recover");
         assert_eq!(frames[0].frame, vec![7, 7, 7]);
         assert_eq!(frames[0].frame_seq, 0);
@@ -6058,7 +6792,7 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(50));
 
-        let frames = replay_all(&dir).unwrap();
+        let frames = replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].frame_seq, 42);
         assert_eq!(
@@ -6084,11 +6818,13 @@ mod tests {
         assert_eq!(bytes.len(), 21);
         std::fs::write(&seg, &bytes).unwrap();
 
-        let frames = replay_all(&dir).unwrap(); // must not panic
         assert!(
-            frames.is_empty(),
-            "a truncated v3 header must recover 0 frames"
+            replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).is_err(),
+            "incomplete input must refuse confirmation"
         );
+        confirm_replayed(&dir);
+        assert!(wal_segments_in(&dir.join(ARCHIVE_SUBDIR)).is_empty());
+        assert_eq!(wal_segments_in(&dir.join(QUARANTINE_SUBDIR)).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6104,12 +6840,8 @@ mod tests {
         bytes[13] ^= 0xFF;
         std::fs::write(&seg, &bytes).unwrap();
 
-        let frames = replay_all(&dir).unwrap();
-        assert!(
-            frames.is_empty(),
-            "a receipt-byte flip must fail CRC — otherwise the CRC does not \
-             cover the field and a corrupt timestamp reaches the aggregator"
-        );
+        assert!(replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).is_err());
+        assert_eq!(wal_segments_in(&dir.join(QUARANTINE_SUBDIR)).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6201,7 +6933,7 @@ mod tests {
             wait_until_persisted(&spill, 1);
         }
         std::thread::sleep(Duration::from_millis(50));
-        let frames = replay_all(&dir).unwrap();
+        let frames = replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(
             frames[0].received_at_nanos, WAL_RECEIPT_UNKNOWN_NANOS,
@@ -6224,11 +6956,13 @@ mod tests {
         bytes.extend_from_slice(&[0u8; 40]); // plausible-looking body
         std::fs::write(&seg, &bytes).unwrap();
 
-        let frames = replay_all(&dir).unwrap(); // must not panic
         assert!(
-            frames.is_empty(),
-            "an unparseable segment must recover 0 frames rather than guess"
+            replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).is_err(),
+            "incomplete input must refuse confirmation"
         );
+        confirm_replayed(&dir);
+        assert!(wal_segments_in(&dir.join(ARCHIVE_SUBDIR)).is_empty());
+        assert_eq!(wal_segments_in(&dir.join(QUARANTINE_SUBDIR)).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6352,7 +7086,7 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(50));
 
-        let frames = replay_all(&dir).unwrap();
+        let frames = replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).unwrap();
         assert_eq!(frames.len(), all.len());
         for (i, ep) in all.iter().enumerate() {
             assert_eq!(
@@ -6391,12 +7125,8 @@ mod tests {
         bytes[21] ^= 0x01;
         std::fs::write(&seg, &bytes).unwrap();
 
-        let frames = replay_all(&dir).unwrap();
-        assert!(
-            frames.is_empty(),
-            "an endpoint-byte flip must fail CRC — otherwise the CRC does not \
-             cover the field and a depth frame reaches the main-feed parser"
-        );
+        assert!(replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).is_err());
+        assert_eq!(wal_segments_in(&dir.join(QUARANTINE_SUBDIR)).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6404,7 +7134,7 @@ mod tests {
     /// must replay as MAIN-FEED — never dropped, never a panic. Dropping it
     /// would turn a forward-compatibility gap into permanent loss.
     #[test]
-    fn tvw4_unknown_endpoint_byte_maps_to_main_feed_not_a_panic() {
+    fn tvw4_unknown_endpoint_retains_original_without_guessing_route() {
         let dir = tmp_dir("v4-unknown-ep");
         let seg = dir.join("ws-frames-00000000000000000007.wal");
         let mut bytes = encode_v4_record_raw(
@@ -6417,16 +7147,15 @@ mod tests {
         bytes.extend_from_slice(&encode_v4_record_raw(WsType::LiveFeed, 10, 0, 0xFF, &[5]));
         std::fs::write(&seg, &bytes).unwrap();
 
-        let frames = replay_all(&dir).unwrap();
-        assert_eq!(frames.len(), 2, "unknown endpoint bytes are NOT dropped");
-        assert_eq!(frames[0].endpoint, WalEndpoint::MainFeed);
-        assert_eq!(frames[1].endpoint, WalEndpoint::MainFeed);
-        assert_eq!(frames[0].frame, vec![4, 4, 4]);
-        assert_eq!(frames[0].frame_seq, 9);
+        assert!(
+            replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).is_err(),
+            "unsupported endpoint must not be routed as main-feed"
+        );
+        confirm_replayed(&dir);
+        assert!(wal_segments_in(&dir.join(ARCHIVE_SUBDIR)).is_empty());
         assert_eq!(
-            WalEndpoint::from_u8(0xEE),
-            WalEndpoint::MainFeed,
-            "total decode"
+            std::fs::read(dir.join(QUARANTINE_SUBDIR).join(seg.file_name().unwrap())).unwrap(),
+            bytes
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6442,7 +7171,7 @@ mod tests {
         let bytes = encode_v3_record(WsType::OrderUpdate, 77, receipt, b"{\"o\":1}");
         std::fs::write(&seg, &bytes).unwrap();
 
-        let frames = replay_all(&dir).unwrap();
+        let frames = replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(
             frames[0].endpoint,
@@ -6480,7 +7209,7 @@ mod tests {
         ));
         std::fs::write(&seg, &bytes).unwrap();
 
-        let frames = replay_all(&dir).unwrap();
+        let frames = replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).unwrap();
         let got: Vec<(u64, WalEndpoint)> =
             frames.iter().map(|f| (f.frame_seq, f.endpoint)).collect();
         assert_eq!(
@@ -6513,7 +7242,7 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(50));
 
-        let frames = replay_all(&dir).unwrap();
+        let frames = replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).unwrap();
         assert_eq!(frames.len(), 3);
         assert_eq!(frames[0].endpoint, WalEndpoint::MainFeed);
         assert_eq!(
@@ -6651,7 +7380,7 @@ mod tests {
     fn test_replay_handles_missing_dir() {
         let dir = std::env::temp_dir().join("tv-wal-nonexistent-xyz");
         let _ = std::fs::remove_dir_all(&dir);
-        let frames = replay_all(&dir).unwrap();
+        let frames = replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).unwrap();
         assert!(frames.is_empty());
     }
 
@@ -6682,11 +7411,13 @@ mod tests {
         data[mid] ^= 0xFF;
         std::fs::write(&seg, data).unwrap();
 
-        let frames = replay_all(&dir).unwrap();
-        // Either zero or one frame may survive depending on which record got hit;
-        // the key assertion is that replay does NOT panic and stops at corruption.
-        assert!(frames.len() <= 2);
-
+        assert!(
+            replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).is_err(),
+            "incomplete input must refuse confirmation"
+        );
+        confirm_replayed(&dir);
+        assert!(wal_segments_in(&dir.join(ARCHIVE_SUBDIR)).is_empty());
+        assert_eq!(wal_segments_in(&dir.join(QUARANTINE_SUBDIR)).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6834,8 +7565,9 @@ mod tests {
         let file_path = dir.join("not-a-dir");
         std::fs::write(&file_path, b"x").unwrap();
         let bad = file_path.join("under-a-file");
-        assert!(open_segment_resilient(&bad).is_none());
-        assert!(open_segment_resilient(&dir).is_some());
+        let guard = lock_wal_dir(&dir).unwrap().unwrap();
+        assert!(open_segment_resilient(&bad, &guard).is_none());
+        assert!(open_segment_resilient(&dir, &guard).is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6847,8 +7579,8 @@ mod tests {
         // segment. (If the test runs as root the writes simply succeed — the
         // assertions below still hold; the deterministic open-failure proof is
         // `test_open_segment_resilient_returns_none_on_unopenable_path`.)
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         let spill = WsFrameSpill::new(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         // Channel still accepts; the writer logs WS-SPILL-01 + counts the error
         // but DOES NOT die.
         assert_eq!(
@@ -6919,6 +7651,7 @@ mod tests {
         let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         f.set_times(std::fs::FileTimes::new().set_modified(mtime))
             .unwrap();
+        persist_confirmation_marker(&path, &segment_fingerprint(&path).unwrap()).unwrap();
         path
     }
 
@@ -6937,27 +7670,30 @@ mod tests {
     }
 
     #[test]
-    fn active_prune_deletes_past_retention_and_keeps_the_current_session() {
-        // The leak this closes: ONLY `archive/` was ever bounded. The active
-        // dir had no age bound and no byte bound, on the assumption that boot
-        // replay drains it — but the replay budget is 512 MiB per boot against
-        // continuous writing, so everything past the newest five segments was
-        // never replayed, never confirmed, never archived, and eligible for no
-        // bound. Measured on the prod box: 244 files, 31 GB, oldest from the
-        // previous day, volume 94% full.
+    fn active_prune_retains_old_and_current_originals_without_exact_receipts() {
         let dir = tmp_dir("active-prune-age");
         let now = SystemTime::now();
-        let stale = plant_active_file(&dir, "ws-frames-00000000000000000010.wal", now, 259_200);
-        let todays = plant_active_file(&dir, "ws-frames-00000000000000000011.wal", now, 600);
-        let outcome = prune_active_segments_at(&dir, 172_800, u64::MAX, now);
-        assert_eq!(outcome.deleted, 1);
-        assert!(!stale.exists(), "a segment older than retention must go");
-        assert!(
-            todays.exists(),
-            "the current session's segments must never be touched — they are \
-             the crash-recovery copy that replay actually reads"
+        let stale = write_wm_segment(&dir, 10, 1, WalEndpoint::MainFeed);
+        let todays = write_wm_segment(&dir, 20, 1, WalEndpoint::MainFeed);
+        File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(now - Duration::from_secs(259_200)))
+            .unwrap();
+        write_wm_watermark(
+            &dir,
+            &crate::wal_applied_watermark::AppliedSnapshot {
+                hwm_ticks: wm_seq(500),
+                hwm_depth: wm_seq(500),
+                ..Default::default()
+            },
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        let outcome = prune_active_segments_at(&dir, 172_800, u64::MAX, now);
+        assert_eq!(outcome.deleted, 0);
+        assert!(stale.exists());
+        assert!(todays.exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -6980,8 +7716,26 @@ mod tests {
         // BOTH passes, because they select different victims: the age pass
         // takes anything past retention, the byte pass takes oldest-first.
         // The open segment is planted OLD so it is eligible for both.
-        let open = plant_active_file(&dir, "ws-frames-00000000000000000030.wal", now, 259_200);
-        let closed = plant_active_file(&dir, "ws-frames-00000000000000000031.wal", now, 259_200);
+        let open = write_wm_segment(&dir, 10, 1, WalEndpoint::MainFeed);
+        let closed = write_wm_segment(&dir, 20, 1, WalEndpoint::MainFeed);
+        for path in [&open, &closed] {
+            File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new().set_modified(now - Duration::from_secs(259_200)),
+                )
+                .unwrap();
+        }
+        write_wm_watermark(
+            &dir,
+            &crate::wal_applied_watermark::AppliedSnapshot {
+                hwm_ticks: wm_seq(500),
+                hwm_depth: wm_seq(500),
+                ..Default::default()
+            },
+        );
         set_open_segment(open.clone());
 
         // Age pass: retention would delete both.
@@ -6992,11 +7746,10 @@ mod tests {
              from here to the next rotation is lost with no error and no counter"
         );
         assert!(
-            !closed.exists(),
-            "non-vacuous: a closed segment past retention must still be deleted, \
-             or this test would pass on a prune that does nothing at all"
+            closed.exists(),
+            "a closed segment also needs exact completion proof before deletion"
         );
-        assert_eq!(outcome.deleted, 1);
+        assert_eq!(outcome.deleted, 0);
 
         // Byte pass: a zero ceiling would delete everything left.
         let outcome = prune_active_segments_at(&dir, u64::MAX, 0, now);
@@ -7018,29 +7771,28 @@ mod tests {
 
     #[test]
     fn active_prune_can_never_reach_what_the_next_boot_replay_would_read() {
-        // The safety property that makes this provable rather than probable.
-        // A boot replay is capped at WAL_REPLAY_MAX_BYTES (512 MiB) of the
-        // NEWEST segments. The retention floor is a full day. So no segment
-        // this pass can delete is reachable by the next replay — the pass and
-        // the replay operate on disjoint ends of the same directory.
-        assert!(
-            tickvault_common::constants::WS_WAL_ACTIVE_RETENTION_SECS >= 86_400,
-            "retention below one day could race the boot replay window"
+        let dir = tmp_dir("deferred-active-survives-prune");
+        for sec in [10, 20, 30] {
+            write_wm_segment(&dir, sec, 1, WalEndpoint::MainFeed);
+        }
+        let first = replay_all_with_report_guarded(&dir, 1, || None, None, 60).unwrap();
+        assert_eq!(first.frames.len(), 1);
+        assert_eq!(first.deferred_segments, 2);
+        assert!(confirm_replayed_generation(&dir, first.confirmation_id));
+        let outcome =
+            prune_active_segments_at(&dir, 0, 0, SystemTime::now() + Duration::from_secs(1));
+        assert_eq!(outcome.deleted + outcome.size_deleted, 0);
+        let remaining = replay_unguarded(&dir);
+        assert_eq!(
+            remaining
+                .frames
+                .iter()
+                .map(|frame| frame.frame_seq)
+                .collect::<Vec<_>>(),
+            vec![wm_seq(20), wm_seq(30)]
         );
-        // Non-vacuous: a segment inside one replay budget of the newest is
-        // young enough to survive, whatever its size.
-        let dir = tmp_dir("active-prune-replay-safe");
-        let now = SystemTime::now();
-        let recent = plant_active_file(&dir, "ws-frames-00000000000000000020.wal", now, 3_600);
-        let outcome = prune_active_segments_at(
-            &dir,
-            tickvault_common::constants::WS_WAL_ACTIVE_RETENTION_SECS,
-            u64::MAX,
-            now,
-        );
-        assert_eq!(outcome.deleted, 0);
-        assert!(recent.exists());
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(confirm_replayed_generation(&dir, remaining.confirmation_id));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -7072,31 +7824,36 @@ mod tests {
     /// page has to say how many bytes and how far back — so the pass reports
     /// the bytes it freed and the age of the oldest segment it deleted.
     #[test]
-    fn active_byte_ceiling_prune_reports_bytes_freed_and_oldest_age() {
-        let dir = tmp_dir("active-prune-pressure-report");
+    fn active_byte_ceiling_reports_unreclaimed_bytes_without_deleting_unknown_originals() {
+        let dir = tmp_dir("active-prune-pressure");
         let now = SystemTime::now();
-        // Three 13-byte segments ("segment-bytes"), 3 h / 2 h / 1 h old, all
-        // inside retention. A 20-byte ceiling forces the two OLDEST out.
-        let oldest = plant_active_file(&dir, "ws-frames-00000000000000000040.wal", now, 10_800);
-        let middle = plant_active_file(&dir, "ws-frames-00000000000000000041.wal", now, 7_200);
-        let newest = plant_active_file(&dir, "ws-frames-00000000000000000042.wal", now, 3_600);
-        let outcome = prune_active_segments_at(&dir, 172_800, 20, now);
-        assert_eq!(outcome.deleted, 0, "nothing is age-expired");
-        assert_eq!(outcome.size_deleted, 2, "two oldest removed by the ceiling");
-        assert_eq!(outcome.size_deleted_bytes, 26, "13 B x 2 segments freed");
-        assert_eq!(
-            outcome.size_deleted_oldest_age_secs, 10_800,
-            "the OLDEST deleted segment's age, not the newest"
+        let mut paths = Vec::new();
+        for (sec, age) in [(10, 10_800), (20, 7_200), (30, 3_600)] {
+            let path = write_wm_segment(&dir, sec, 1, WalEndpoint::MainFeed);
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(now - Duration::from_secs(age)))
+                .unwrap();
+            paths.push(path);
+        }
+        write_wm_watermark(
+            &dir,
+            &crate::wal_applied_watermark::AppliedSnapshot {
+                hwm_ticks: wm_seq(500),
+                hwm_depth: wm_seq(500),
+                ..Default::default()
+            },
         );
-        assert!(!oldest.exists() && !middle.exists());
-        assert!(newest.exists(), "the newest survives");
-        // A pass that deletes nothing under pressure reports zeros, so the
-        // page can never carry a stale number from a previous pass.
-        let quiet = prune_active_segments_at(&dir, 172_800, u64::MAX, now);
-        assert_eq!(quiet.size_deleted, 0);
-        assert_eq!(quiet.size_deleted_bytes, 0);
-        assert_eq!(quiet.size_deleted_oldest_age_secs, 0);
-        let _ = std::fs::remove_dir_all(&dir);
+        let one = WAL_MIN_RECORD_V4 as u64 + 32;
+        let outcome = prune_active_segments_at(&dir, 172_800, one, now);
+        assert_eq!(outcome.size_deleted, 0);
+        assert_eq!(outcome.size_deleted_bytes, 0);
+        assert_eq!(outcome.bytes_after, one * 3);
+        assert_eq!(outcome.size_deleted_oldest_age_secs, 0);
+        assert!(paths.iter().all(|path| path.exists()));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -7130,6 +7887,7 @@ mod tests {
         for idx in 0..n {
             let path = archive.join(format!("seg-{idx:03}.wal"));
             std::fs::write(&path, vec![0_u8; bytes]).expect("write segment");
+            persist_confirmation_marker(&path, &segment_fingerprint(&path).unwrap()).unwrap();
             // std, not the `filetime` crate — a new workspace dependency needs
             // operator approval, and `File::set_times` does the job.
             let mtime = base + std::time::Duration::from_secs(idx as u64);
@@ -7663,6 +8421,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reseed_probe_follows_every_boundary_in_mixed_version_segments() {
+        let dir = tmp_dir("wal-reseed-multi-record-boundaries");
+        let path = dir.join("ws-frames-00000000000000000001.wal");
+        for payload_len in [0usize, 1, 3, 4, 5, 37] {
+            let payload = vec![0xA5; payload_len];
+            let mut bytes = encode_v1_record(WsType::LiveFeed, &payload);
+            bytes.extend_from_slice(&encode_v2_record(WsType::LiveFeed, 100, &payload));
+            bytes.extend_from_slice(&encode_v3_record(WsType::LiveFeed, 900, 17, &payload));
+            bytes.extend_from_slice(&encode_v4_record(
+                WsType::LiveFeed,
+                500,
+                18,
+                WalEndpoint::Depth20,
+                &payload,
+            ));
+            bytes.extend_from_slice(&encode_v2_record(WsType::LiveFeed, 300, &payload));
+            bytes.extend_from_slice(&encode_v4_record(
+                WsType::LiveFeed,
+                1_000,
+                19,
+                WalEndpoint::MainFeed,
+                &payload,
+            ));
+            std::fs::write(&path, bytes).unwrap();
+            assert_eq!(
+                highest_frame_seq_in_segment(&path),
+                1_000,
+                "the maximum is in a later record; payload length {payload_len}"
+            );
+            assert_eq!(highest_frame_seq_on_disk(&dir), 1_000);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// An empty or absent directory seeds nothing, leaving the wall clock as the
     /// seed exactly as before. A first-ever boot must not be penalised.
     #[test]
@@ -7719,6 +8512,7 @@ mod tests {
              mint capture_seq from independent clock-seeded counters, collide in \
              the ticks DEDUP key, and destroy ticks with no counter to show it."
         );
+        assert_eq!(first.shutdown(Duration::from_secs(2)), 0);
         drop(first);
         assert!(
             WsFrameSpill::new(&dir).is_ok(),
@@ -7736,31 +8530,28 @@ mod tests {
     /// database.
     #[test]
     fn a_restart_mints_above_the_sequences_already_on_disk() {
-        let dir = tmp_dir("spill-restart-above");
-        let far_future = (u64::MAX >> 2) & !MAX_PACKET_INDEX;
-        let seg = dir.join("ws-frames-00000000000000000001.wal");
-        std::fs::create_dir_all(&dir).expect("dir");
-        let rec = WalRecord {
-            ws_type: WsType::LiveFeed,
-            frame: Bytes::from_static(&[1, 2, 3, 4]),
-            frame_seq: far_future,
-            received_at_nanos: 11,
-            endpoint: WalEndpoint::MainFeed,
-        };
-        let f = File::create(&seg).expect("segment");
-        let mut w = BufWriter::new(f);
-        write_record(&mut w, &rec).expect("write");
-        std::io::Write::flush(&mut w).expect("flush");
-        drop(w);
-
-        let _spill = WsFrameSpill::new(&dir).expect("construct over existing segments");
-        let next = next_frame_seq();
-        assert!(
-            next > far_future,
-            "constructing a spill over existing segments must ratchet the \
-             sequence past them (next {next} vs on-disk {far_future}); minting \
-             at or below re-issues capture_seq values that are already rows"
+        let dir = tmp_dir("spill-restart-reservation");
+        let spill = WsFrameSpill::new(&dir).unwrap();
+        let old_bound = spill
+            .sequence
+            .as_ref()
+            .unwrap()
+            .reserved_through
+            .load(Ordering::Acquire);
+        assert_eq!(
+            spill.append(WsType::LiveFeed, Bytes::from_static(b"first")),
+            AppendOutcome::Spilled
         );
+        assert_eq!(spill.shutdown(Duration::from_secs(2)), 0);
+        drop(spill);
+        let restarted = WsFrameSpill::new(&dir).unwrap();
+        assert!(
+            restarted.try_next_frame_seq().unwrap() > old_bound,
+            "restart must skip even unissued slots in the previous durable reservation"
+        );
+        assert_eq!(restarted.shutdown(Duration::from_secs(2)), 0);
+        drop(restarted);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A lock file that cannot be CREATED degrades — it does not kill the lane.
@@ -7778,30 +8569,15 @@ mod tests {
     /// does not — and this is the exact difference that let the regression
     /// reach CI green locally and red on the runner.
     #[test]
-    fn a_lock_file_that_cannot_be_created_degrades_instead_of_killing_the_lane() {
+    fn an_uncreatable_lock_file_refuses_unowned_capture() {
         let dir = tmp_dir("lock-uncreatable");
-        std::fs::create_dir_all(dir.join(WAL_DIR_LOCK_FILE)).expect("occupy the lock path");
-
-        let claimed = lock_wal_dir(&dir).expect("a creation failure must NOT be an Err");
+        std::fs::create_dir(dir.join(WAL_DIR_LOCK_FILE)).unwrap();
         assert!(
-            claimed.is_none(),
-            "an uncreatable lock file yields no guard, and says so, rather than \
-             pretending exclusion is in force"
+            lock_wal_dir(&dir).is_err(),
+            "unproved ownership must refuse startup"
         );
-
-        // And the whole spill must still construct, because the writer's own
-        // survive-and-recover behaviour is what this protects.
-        let spill = WsFrameSpill::new(&dir).expect(
-            "an uncreatable lock file must not stop the spill from constructing — \
-             the writer survives an unwritable directory by design",
-        );
-        assert_eq!(
-            spill.append(WsType::LiveFeed, vec![1, 2, 3]),
-            AppendOutcome::Spilled,
-            "the channel must still accept frames in the degraded state"
-        );
-        drop(spill);
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(WsFrameSpill::new(&dir).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Contention is still fail-CLOSED. The degrade above must not have softened
@@ -7905,18 +8681,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The bound is real: the probe does not walk an unbounded history.
+    /// A usable newest segment cannot hide an older larger sequence.
     #[test]
-    fn the_high_water_probe_reads_a_bounded_number_of_segments() {
-        assert!(
-            HIGH_WATER_SEGMENTS_PER_DIR >= 2,
-            "one segment is the defect — an empty newest file hides everything behind it"
-        );
-        assert!(
-            HIGH_WATER_SEGMENTS_PER_DIR <= 16,
-            "this runs at boot over three directories; an unbounded walk would turn a \
-             safety net into a slow start"
-        );
+    fn the_high_water_probe_checks_every_retained_segment() {
+        let dir = tmp_dir("reseed-all-retained");
+        let old = dir.join("ws-frames-00000000000000000001.wal");
+        std::fs::write(
+            &old,
+            encode_v4_record(
+                WsType::LiveFeed,
+                9_000,
+                0,
+                WalEndpoint::MainFeed,
+                b"older-high",
+            ),
+        )
+        .unwrap();
+        for index in 2..10 {
+            std::fs::write(
+                dir.join(format!("ws-frames-{index:020}.wal")),
+                encode_v4_record(
+                    WsType::LiveFeed,
+                    100 + index,
+                    0,
+                    WalEndpoint::MainFeed,
+                    b"newer-low",
+                ),
+            )
+            .unwrap();
+        }
+        assert_eq!(highest_frame_seq_on_disk(&dir), 9_000);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// The refresh must never rewind the projected clock.
@@ -8004,7 +8799,7 @@ mod tests {
         } // drop → writer thread drains and exits
         std::thread::sleep(Duration::from_millis(50));
 
-        let frames = replay_all(&dir).unwrap();
+        let frames = replay_all_with_budget(&dir, WAL_REPLAY_MAX_BYTES).unwrap();
         assert_eq!(frames.len(), 1, "the frame must survive the round trip");
         assert_eq!(
             frames[0].received_at_nanos, receipt,
@@ -8122,12 +8917,107 @@ mod tests {
             .expect("replay")
     }
 
-    /// BITE-PROOF of the whole change: three segments, every frame acked on
-    /// the previous session, a fresh boot replays NOTHING. The first two
-    /// segments are archived UNREAD; the last one (no upper bound) is read and
-    /// every frame in it is dropped as applied.
     #[test]
-    fn a_second_boot_after_a_clean_session_replays_zero_frames() {
+    fn a_failed_deferred_restore_refuses_the_batch_before_confirmation() {
+        let dir = tmp_dir("restore-refuses-confirm");
+        let staged_dir = dir.join(REPLAYING_SUBDIR);
+        std::fs::create_dir_all(&staged_dir).expect("staging directory");
+        let first = write_wm_segment(&staged_dir, 0, 1, WalEndpoint::MainFeed);
+        let deferred = write_wm_segment(&staged_dir, 10, 1, WalEndpoint::MainFeed);
+        let obstruction = dir.join(deferred.file_name().expect("segment name"));
+
+        // The probe runs after the first segment was read and after the
+        // directory listing. Create a destination-specific EISDIR conflict,
+        // then stop for memory so the second staged file must be restored.
+        // No actual disk pressure, permissions, or timing race is required.
+        let result = replay_all_with_report_guarded(
+            &dir,
+            usize::MAX,
+            || {
+                std::fs::create_dir(&obstruction).expect("inject restore conflict");
+                Some(100)
+            },
+            Some(100),
+            50,
+        );
+        assert!(
+            result.is_err(),
+            "an unread staged segment must prevent a confirmable replay result"
+        );
+        assert!(
+            first.is_file(),
+            "the consumed source must remain recoverable"
+        );
+        assert!(
+            deferred.is_file(),
+            "the unread source must remain recoverable"
+        );
+        assert!(!dir.join(ARCHIVE_SUBDIR).exists());
+
+        // Once the local obstruction is gone, both frames can be offered in
+        // a successful pass and only that pass may be confirmed.
+        std::fs::remove_dir(&obstruction).expect("remove injected conflict");
+        let retry = replay_unguarded(&dir);
+        assert_eq!(retry.frames.len(), 2);
+        assert_eq!(retry.frames[0].frame_seq, wm_seq(0));
+        assert_eq!(retry.frames[1].frame_seq, wm_seq(10));
+        confirm_replayed(&dir);
+        assert_eq!(wal_segments_in(&dir.join(ARCHIVE_SUBDIR)).len(), 2);
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn an_unreadable_staged_segment_refuses_the_pass_before_confirmation() {
+        let dir = tmp_dir("wal-unreadable-staged-segment");
+        let staged = dir.join(REPLAYING_SUBDIR);
+        std::fs::create_dir_all(&staged).unwrap();
+        let first = write_wm_segment(&staged, 0, 1, WalEndpoint::MainFeed);
+        let unreadable = staged.join(format!("ws-frames-{:020}.wal", wm_seq(10)));
+        // On the supported Unix targets File::open can open a directory but
+        // reading it fails with EISDIR, even as root. The listing sees this
+        // .wal entry and the first valid segment is read before it fails.
+        std::fs::create_dir(&unreadable).unwrap();
+
+        let result = replay_all_with_report_guarded(
+            &dir,
+            usize::MAX,
+            || None,
+            None,
+            WAL_REPLAY_RSS_STOP_PCT,
+        );
+        assert!(
+            result.is_err(),
+            "an unread file cannot produce a confirmable batch"
+        );
+        assert!(first.is_file());
+        assert!(unreadable.is_dir());
+        assert!(!dir.join(ARCHIVE_SUBDIR).exists());
+
+        std::fs::remove_dir(&unreadable).unwrap();
+        std::fs::write(
+            &unreadable,
+            encode_v4_record(
+                WsType::LiveFeed,
+                wm_seq(10),
+                7,
+                WalEndpoint::MainFeed,
+                b"readable-after-repair",
+            ),
+        )
+        .unwrap();
+        let retry = replay_unguarded(&dir);
+        assert_eq!(retry.frames.len(), 2);
+        assert_eq!(retry.frames[0].frame_seq, wm_seq(0));
+        assert_eq!(retry.frames[1].frame_seq, wm_seq(10));
+        confirm_replayed(&dir);
+        assert_eq!(wal_segments_in(&dir.join(ARCHIVE_SUBDIR)).len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Three segments, every record covered by the prior sink ACKs: validate
+    /// their bytes without materialising frames, then archive all three.
+    #[test]
+    fn a_maximum_ack_does_not_skip_unconfirmed_originals_on_a_second_boot() {
         let dir = tmp_dir("wm-clean-session");
         write_wm_segment(&dir, 0, 10, WalEndpoint::MainFeed);
         write_wm_segment(&dir, 100, 10, WalEndpoint::Depth20);
@@ -8141,26 +9031,167 @@ mod tests {
             },
         );
         let batch = replay_unguarded(&dir);
+        assert_eq!(
+            batch.frames.len(),
+            30,
+            "a maximum ACK cannot prove individual frame completion"
+        );
+        assert_eq!(batch.skipped_segments, 0);
+        assert_eq!(batch.skipped_frames, 0);
+        assert_eq!(batch.skipped_bytes, 0);
+        assert_eq!(wal_segments_in(&dir.join(REPLAYING_SUBDIR)).len(), 3);
+        assert!(wal_segments_in(&dir.join(ARCHIVE_SUBDIR)).is_empty());
+        assert!(confirm_replayed_generation(&dir, batch.confirmation_id));
+        assert_eq!(wal_segments_in(&dir.join(ARCHIVE_SUBDIR)).len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replay_checks_an_out_of_order_tail_instead_of_a_successor_header_bound() {
+        let dir = tmp_dir("wm-out-of-order-high-tail");
+        let mut bytes = encode_v4_record(
+            WsType::LiveFeed,
+            wm_seq(0),
+            7,
+            WalEndpoint::MainFeed,
+            b"already-applied",
+        );
+        bytes.extend_from_slice(&encode_v4_record(
+            WsType::LiveFeed,
+            wm_seq(1_000),
+            8,
+            WalEndpoint::MainFeed,
+            b"unapplied-tail",
+        ));
+        let first = dir.join(format!("ws-frames-{:020}.wal", wm_seq(0)));
+        std::fs::write(&first, bytes).unwrap();
+        // A producer stalled between sequence allocation and publication can
+        // put this lower sequence in the next physical segment.
+        write_wm_segment(&dir, 100, 1, WalEndpoint::MainFeed);
+        write_wm_watermark(
+            &dir,
+            &crate::wal_applied_watermark::AppliedSnapshot {
+                hwm_ticks: wm_seq(500),
+                hwm_depth: wm_seq(500),
+                ..Default::default()
+            },
+        );
+
+        let batch = replay_unguarded(&dir);
+        assert_eq!(batch.frames.len(), 3);
+        assert_eq!(batch.frames[1].frame_seq, wm_seq(1_000));
+        assert_eq!(batch.frames[1].frame, b"unapplied-tail");
+        assert_eq!(batch.skipped_segments, 0);
+        assert_eq!(batch.skipped_frames, 0);
         assert!(
-            batch.frames.is_empty(),
-            "nothing to replay: {}",
-            batch.frames.len()
+            dir.join(REPLAYING_SUBDIR)
+                .join(first.file_name().unwrap())
+                .is_file()
         );
-        assert_eq!(
-            batch.skipped_segments, 2,
-            "two whole segments archived unread"
+        assert!(
+            !dir.join(ARCHIVE_SUBDIR)
+                .join(first.file_name().unwrap())
+                .exists()
         );
-        assert_eq!(
-            batch.skipped_frames, 10,
-            "the unbounded last segment is filtered per frame"
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replay_checks_an_older_protected_record_after_a_newer_first_record() {
+        let dir = tmp_dir("wm-out-of-order-protected-tail");
+        let mut bytes = encode_v4_record(
+            WsType::LiveFeed,
+            wm_seq(1_000),
+            7,
+            WalEndpoint::MainFeed,
+            b"already-applied",
         );
-        assert!(batch.skipped_bytes > 0);
-        assert!(wal_segments_in(&dir).is_empty(), "no live segment left");
-        assert_eq!(wal_segments_in(&dir.join(ARCHIVE_SUBDIR)).len(), 2);
+        bytes.extend_from_slice(&encode_v4_record(
+            WsType::LiveFeed,
+            wm_seq(0),
+            8,
+            WalEndpoint::MainFeed,
+            b"protected-old-record",
+        ));
+        std::fs::write(
+            dir.join(format!("ws-frames-{:020}.wal", wm_seq(1_000))),
+            bytes,
+        )
+        .unwrap();
+        write_wm_segment(&dir, 2_000, 1, WalEndpoint::MainFeed);
+        let wm = crate::wal_applied_watermark::AppliedWatermark::new_for_tests();
+        wm.note_ticks_acked(wm_seq(3_000));
+        wm.note_depth_acked(wm_seq(3_000));
+        wm.note_unapplied(wm_seq(0));
+        write_wm_watermark(&dir, &wm.snapshot());
+
+        let batch = replay_unguarded(&dir);
+        assert_eq!(batch.frames.len(), 3);
+        assert_eq!(batch.frames[1].frame_seq, wm_seq(0));
+        assert_eq!(batch.frames[1].frame, b"protected-old-record");
+        assert_eq!(batch.skipped_segments, 0);
+        assert_eq!(batch.skipped_frames, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dhan_sink_acks_never_skip_other_transports_or_unknown_endpoints() {
+        let dir = tmp_dir("wm-transport-scope");
+        let mut bytes = encode_v4_record(
+            WsType::LiveFeed,
+            wm_seq(0),
+            7,
+            WalEndpoint::MainFeed,
+            b"covered-dhan-tick",
+        );
+        for (sec, ws_type, endpoint) in [
+            (1, WsType::OrderUpdate, WalEndpoint::OrderUpdate),
+            (2, WsType::TruedataFeed, WalEndpoint::MainFeed),
+            (4, WsType::LiveFeed, WalEndpoint::OrderUpdate),
+        ] {
+            bytes.extend_from_slice(&encode_v4_record(
+                ws_type,
+                wm_seq(sec),
+                7,
+                endpoint,
+                b"no-matching-ack",
+            ));
+        }
+        bytes.extend_from_slice(&encode_v4_record_raw(
+            WsType::LiveFeed,
+            wm_seq(3),
+            7,
+            0xFF,
+            b"forward-version-endpoint",
+        ));
+        bytes.extend_from_slice(&encode_v2_record(
+            WsType::OrderUpdate,
+            wm_seq(5),
+            b"legacy-order-update",
+        ));
+        bytes.extend_from_slice(&encode_v3_record(
+            WsType::TruedataFeed,
+            wm_seq(6),
+            7,
+            b"legacy-other-provider",
+        ));
+        std::fs::write(dir.join(format!("ws-frames-{:020}.wal", wm_seq(0))), bytes).unwrap();
+        write_wm_segment(&dir, 100, 1, WalEndpoint::MainFeed);
+        write_wm_watermark(
+            &dir,
+            &crate::wal_applied_watermark::AppliedSnapshot {
+                hwm_ticks: wm_seq(500),
+                hwm_depth: wm_seq(500),
+                ..Default::default()
+            },
+        );
+
+        assert!(replay_all_with_report_guarded(&dir, usize::MAX, || None, None, 60).is_err());
+        confirm_replayed(&dir);
         assert_eq!(
-            wal_segments_in(&dir.join(REPLAYING_SUBDIR)).len(),
+            wal_segments_in(&dir.join(QUARANTINE_SUBDIR)).len(),
             1,
-            "the read one is staged"
+            "forward-version endpoint original is retained rather than guessed"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8197,35 +9228,18 @@ mod tests {
         let batch = replay_unguarded(&dir);
         assert_eq!(
             batch.frames.len(),
-            5,
-            "exactly the shed segment's frames come back"
+            20,
+            "the protected bucket is not a complete ledger of missing frames"
         );
-        assert!(
-            batch
-                .frames
-                .iter()
-                .all(|f| f.frame_seq >= wm_seq(1_000) && f.frame_seq < wm_seq(1_005))
-        );
-        // A segment's range runs up to its SUCCESSOR's first sequence, so the
-        // first segment's range touches the shed bucket too and is read (its
-        // frames are then filtered as applied). Only the third is provably
-        // clear and archived unread. Conservative by construction: the bound
-        // errs towards reading, never towards skipping.
-        assert_eq!(
-            batch.skipped_segments, 1,
-            "only the segment after the shed is archived unread"
-        );
-        assert_eq!(
-            batch.skipped_frames, 10,
-            "the first and last are read and filtered"
-        );
+        assert_eq!(batch.skipped_segments, 0);
+        assert_eq!(batch.skipped_frames, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A main-feed frame feeds BOTH sinks: a depth watermark that lags keeps
     /// it in the replay set even when the tick watermark is past it.
     #[test]
-    fn replay_uses_the_lower_watermark_for_main_feed_frames() {
+    fn replay_does_not_infer_completion_from_either_sink_maximum() {
         let dir = tmp_dir("wm-lower");
         write_wm_segment(&dir, 0, 5, WalEndpoint::MainFeed);
         write_wm_segment(&dir, 100, 5, WalEndpoint::MainFeed);
@@ -8240,15 +9254,11 @@ mod tests {
         let batch = replay_unguarded(&dir);
         assert_eq!(
             batch.frames.len(),
-            5,
-            "the second segment is above the depth watermark"
+            10,
+            "neither maximum watermark proves each original was applied"
         );
-        // The first segment's range extends to the second's first sequence,
-        // which is above the depth watermark, so it is read rather than
-        // archived unread — and every one of its frames is then filtered on
-        // the LOWER watermark. Reading-and-filtering is the conservative arm.
         assert_eq!(batch.skipped_segments, 0);
-        assert_eq!(batch.skipped_frames, 5);
+        assert_eq!(batch.skipped_frames, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -8268,10 +9278,10 @@ mod tests {
             },
         );
         let batch = replay_unguarded(&dir);
-        // Slack is one second: seq(3) and seq(4) are within it, seq(0..=2) are
-        // below it and dropped.
-        assert_eq!(batch.frames.len(), 2);
-        assert_eq!(batch.skipped_frames, 3);
+        // Scheduling delay is unbounded; frames outside a finite slack need
+        // replay too, because an older allocation may have published late.
+        assert_eq!(batch.frames.len(), 5);
+        assert_eq!(batch.skipped_frames, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -8292,8 +9302,12 @@ mod tests {
             },
         );
         let batch = replay_unguarded(&dir);
-        assert_eq!(batch.frames.len(), 2, "both v1 frames come back");
-        assert!(batch.frames.iter().all(|f| f.frame_seq == 0));
+        assert_eq!(
+            batch.frames.len(),
+            4,
+            "both legacy and sequenced originals come back"
+        );
+        assert!(batch.frames[..2].iter().all(|f| f.frame_seq == 0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -8407,30 +9421,78 @@ mod tests {
         assert_eq!(wal_replay_disk_floor_bytes(0), 0);
     }
 
-    /// The header probe: first sequence of a v4 segment, zero for v1/empty.
+    /// Segment approval requires every byte, not just a valid first header.
     #[test]
-    fn first_frame_seq_in_segment_reads_one_header() {
-        let dir = tmp_dir("wm-first-seq");
+    fn applied_segment_scan_checks_all_record_crcs_and_rejects_incomplete_files() {
+        let dir = tmp_dir("wm-scan-all-records");
         let p = write_wm_segment(&dir, 42, 3, WalEndpoint::MainFeed);
-        assert_eq!(first_frame_seq_in_segment(&p), wm_seq(42));
+        let applied = crate::wal_applied_watermark::AppliedSnapshot {
+            hwm_ticks: wm_seq(500),
+            hwm_depth: wm_seq(500),
+            ..Default::default()
+        };
+        assert!(segment_matches_heuristic_watermark(&p, &applied));
         let v1 = dir.join("v1.wal");
         std::fs::write(&v1, encode_v1_record(WsType::LiveFeed, &[1])).unwrap();
-        assert_eq!(first_frame_seq_in_segment(&v1), 0);
+        assert!(!segment_matches_heuristic_watermark(&v1, &applied));
         let empty = dir.join("empty.wal");
         std::fs::write(&empty, b"").unwrap();
-        assert_eq!(first_frame_seq_in_segment(&empty), 0);
-        assert_eq!(first_frame_seq_in_segment(&dir.join("missing.wal")), 0);
-        // A corrupt FIRST record reads as unknown, never as its (possibly
-        // flipped) seq bytes: this value bounds the previous segment's skip
-        // range, so a bit-flip here must widen the range, never narrow it.
+        assert!(!segment_matches_heuristic_watermark(&empty, &applied));
+        assert!(!segment_matches_heuristic_watermark(
+            &dir.join("missing.wal"),
+            &applied
+        ));
+        // The original first-record probe could not detect a corrupt tail.
         let corrupt = dir.join("corrupt.wal");
         let mut bytes = std::fs::read(&p).unwrap();
-        bytes[7] ^= 0x01; // inside the seq field of the first record
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
         std::fs::write(&corrupt, &bytes).unwrap();
-        assert_eq!(first_frame_seq_in_segment(&corrupt), 0);
+        assert!(!segment_matches_heuristic_watermark(&corrupt, &applied));
         let torn = dir.join("torn.wal");
-        std::fs::write(&torn, &std::fs::read(&p).unwrap()[..WAL_MIN_RECORD_V4 + 2]).unwrap();
-        assert_eq!(first_frame_seq_in_segment(&torn), 0);
+        let clean = std::fs::read(&p).unwrap();
+        // Both a short final record and even one stray trailing byte refuse
+        // archival. Complete prefix records can still be replayed normally.
+        std::fs::write(&torn, &clean[..clean.len() - 1]).unwrap();
+        assert!(!segment_matches_heuristic_watermark(&torn, &applied));
+        let mut trailing = clean;
+        trailing.push(0x01);
+        std::fs::write(&torn, trailing).unwrap();
+        assert!(!segment_matches_heuristic_watermark(&torn, &applied));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn applied_segment_scan_streams_large_frames_across_all_sequenced_versions() {
+        let dir = tmp_dir("wm-scan-streamed-versions");
+        let path = dir.join("streamed.wal");
+        // Cross multiple read and CRC scratch boundaries, with different
+        // header sizes and zero-length payloads on either side.
+        let payload: Vec<u8> = (0..20_003).map(|i| (i % 251) as u8).collect();
+        let mut bytes = encode_v2_record(WsType::LiveFeed, wm_seq(0), &[]);
+        bytes.extend_from_slice(&encode_v3_record(
+            WsType::LiveFeed,
+            wm_seq(1),
+            123,
+            &payload,
+        ));
+        bytes.extend_from_slice(&encode_v4_record(
+            WsType::LiveFeed,
+            wm_seq(2),
+            456,
+            WalEndpoint::Depth200,
+            &[],
+        ));
+        std::fs::write(&path, &bytes).unwrap();
+        let applied = crate::wal_applied_watermark::AppliedSnapshot {
+            hwm_ticks: wm_seq(500),
+            hwm_depth: wm_seq(500),
+            ..Default::default()
+        };
+        assert!(segment_matches_heuristic_watermark(&path, &applied));
+        bytes[10_000] ^= 0x40;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(!segment_matches_heuristic_watermark(&path, &applied));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -8588,5 +9650,711 @@ mod queue_depth_visibility_tests {
             silent < REFUSAL_LINE_STRIDE,
             "silent run of {silent} frames exceeds the stride"
         );
+    }
+}
+
+#[cfg(test)]
+mod capture_recovery_regressions {
+    use super::*;
+
+    fn fixture_dir(name: &str) -> PathBuf {
+        static NONCE: AtomicU64 = AtomicU64::new(0);
+        let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "tickvault-recovery-{name}-{}-{nonce}-{}",
+            std::process::id(),
+            sequence_clock_floor()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    fn sequence_issuer(directory: &Path) -> anyhow::Result<SequenceReservations> {
+        let guard =
+            lock_wal_dir(directory)?.ok_or_else(|| anyhow::anyhow!("missing test guard"))?;
+        SequenceReservations::open(directory, &guard)
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn owned_io_refuses_a_missing_guard_parent_without_a_fallback_path() {
+        let directory = fixture_dir("guard-parent-missing");
+        let mut guard = lock_wal_dir(&directory).unwrap().unwrap();
+        // Exercise an invalid internal path without redirecting any write.
+        // The public constructor only creates canonical child lock paths.
+        guard.path = PathBuf::from("/");
+        let error = guard.io_path("must-not-be-created").unwrap_err();
+        assert!(error.to_string().contains("WAL guard lacks directory"));
+        assert!(!directory.join("must-not-be-created").exists());
+        drop(guard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn record(sequence: u64, payload: &'static [u8]) -> WalRecord {
+        WalRecord {
+            ws_type: WsType::LiveFeed,
+            frame_seq: sequence,
+            received_at_nanos: 0,
+            endpoint: WalEndpoint::MainFeed,
+            frame: Bytes::from_static(payload),
+        }
+    }
+
+    fn segment(directory: &Path, sequence: u64, payload: &'static [u8]) -> PathBuf {
+        let path = directory.join(format!("ws-frames-{sequence:020}.wal"));
+        let mut bytes = Vec::new();
+        write_record(&mut bytes, &record(sequence, payload)).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn replay(directory: &Path) -> anyhow::Result<WalReplayBatch> {
+        replay_all_with_report_guarded(directory, 1024 * 1024, || None, None, 60)
+    }
+
+    #[test]
+    fn ownership_loss_retains_the_owned_batch_and_revokes_future_allocations() {
+        let directory = fixture_dir("ownership-loss");
+        let issuer = sequence_issuer(&directory).unwrap();
+        let stored = directory.with_extension("saved");
+        let mut pending = vec![record(1, b"first-admitted"), record(2, b"second-admitted")];
+        let total_bytes = pending.iter().map(|record| record.frame.len() as u64).sum();
+        let bytes = AtomicU64::new(total_bytes);
+        let records = AtomicU64::new(2);
+        let persisted = AtomicU64::new(0);
+        let (_sender, receiver) = bounded(8);
+        std::fs::rename(&directory, &stored).unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        assert!(
+            writer_loop(
+                &receiver,
+                &directory,
+                &persisted,
+                &AtomicBool::new(true),
+                &bytes,
+                &records,
+                &issuer,
+                &mut pending
+            )
+            .is_err()
+        );
+        assert_eq!(
+            pending.len(),
+            2,
+            "original identity-stable batch stays owned"
+        );
+        assert_eq!(records.load(Ordering::Acquire), 2);
+        assert_eq!(bytes.load(Ordering::Acquire), total_bytes);
+        assert_eq!(persisted.load(Ordering::Acquire), 0);
+        assert!(issuer.allocate().is_none());
+        assert!(issuer.refill_if_needed().is_err());
+        assert!(
+            std::fs::read_dir(&directory).unwrap().next().is_none(),
+            "the old writer must not create files in the replacement directory"
+        );
+        std::fs::remove_dir(&directory).unwrap();
+        std::fs::rename(&stored, &directory).unwrap();
+        assert!(
+            issuer.allocate().is_none(),
+            "restoring a pathname cannot renew a revoked claim"
+        );
+        assert!(issuer.directory_guard.ensure_current().is_err());
+        drop(issuer);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn flush_failure_does_not_consume_the_identity_stable_owned_batch() {
+        struct FailedFlush {
+            bytes: Vec<u8>,
+        }
+        impl Write for FailedFlush {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("fixture flush failure"))
+            }
+        }
+        let pending = vec![record(7, b"first"), record(8, b"second")];
+        let mut failed = FailedFlush { bytes: Vec::new() };
+        assert!(flush_owned_batch(&mut failed, &pending).is_err());
+        assert_eq!(
+            pending
+                .iter()
+                .map(|record| record.frame_seq)
+                .collect::<Vec<_>>(),
+            [7, 8]
+        );
+        let mut retried = Vec::new();
+        flush_owned_batch(&mut retried, &pending).unwrap();
+        assert_eq!(
+            retried, failed.bytes,
+            "retry encodes the original identities, not new ones"
+        );
+    }
+
+    #[test]
+    fn incomplete_original_never_enters_a_confirmation_manifest_or_archive_prune() {
+        let directory = fixture_dir("incomplete-original");
+        let path = segment(&directory, 10, b"complete-prefix");
+        let mut original = std::fs::read(&path).unwrap();
+        original.extend_from_slice(b"TVW");
+        std::fs::write(&path, &original).unwrap();
+        assert!(replay(&directory).is_err());
+        confirm_replayed(&directory);
+        let _ = prune_archived_segments_at(
+            &directory,
+            0,
+            0,
+            SystemTime::now() + Duration::from_secs(1),
+        );
+        let _ =
+            prune_active_segments_at(&directory, 0, 0, SystemTime::now() + Duration::from_secs(1));
+        let retained = directory
+            .join(QUARANTINE_SUBDIR)
+            .join(path.file_name().unwrap());
+        assert_eq!(std::fs::read(retained).unwrap(), original);
+        assert!(wal_segments_in(&directory.join(ARCHIVE_SUBDIR)).is_empty());
+        let clean_later_pass = replay(&directory).unwrap();
+        assert!(
+            clean_later_pass.frames.is_empty(),
+            "quarantine must not hot-loop on every catch-up pass"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn stale_ack_and_files_outside_the_pass_manifest_cannot_be_confirmed() {
+        let directory = fixture_dir("confirmation-generation");
+        segment(&directory, 10, b"first");
+        let old = replay(&directory).unwrap();
+        let current = replay(&directory).unwrap();
+        assert_ne!(old.confirmation_id, current.confirmation_id);
+        assert!(!confirm_replayed_generation(
+            &directory,
+            old.confirmation_id
+        ));
+        let unread = segment(&directory.join(REPLAYING_SUBDIR), 20, b"not-in-pass");
+        assert!(confirm_replayed_generation(
+            &directory,
+            current.confirmation_id
+        ));
+        assert!(unread.exists());
+        assert_eq!(wal_segments_in(&directory.join(ARCHIVE_SUBDIR)).len(), 1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn changing_staged_bytes_invalidates_the_confirmation_fingerprint() {
+        let directory = fixture_dir("confirmation-fingerprint");
+        let original = segment(&directory, 10, b"before");
+        let batch = replay(&directory).unwrap();
+        let staged = directory
+            .join(REPLAYING_SUBDIR)
+            .join(original.file_name().unwrap());
+        let mut changed = Vec::new();
+        write_record(&mut changed, &record(10, b"different-complete-record")).unwrap();
+        std::fs::write(&staged, changed).unwrap();
+        assert!(!confirm_replayed_generation(
+            &directory,
+            batch.confirmation_id
+        ));
+        assert!(staged.exists());
+        assert!(wal_segments_in(&directory.join(ARCHIVE_SUBDIR)).is_empty());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn fresh_boot_replay_and_empty_confirmation_do_not_create_fake_history() {
+        let directory = fixture_dir("fresh-boot");
+        let guard = lock_wal_dir(&directory).unwrap();
+        let empty = replay(&directory).unwrap();
+        assert!(empty.frames.is_empty());
+        assert!(confirm_replayed_generation(
+            &directory,
+            empty.confirmation_id
+        ));
+        assert!(!directory.join(REPLAYING_SUBDIR).exists());
+        assert!(!directory.join(ARCHIVE_SUBDIR).exists());
+        let spill = WsFrameSpill::new_with_guard(&directory, guard).unwrap();
+        assert!(spill.try_next_frame_seq().is_some());
+        assert_eq!(spill.shutdown(Duration::from_secs(2)), 0);
+        drop(spill);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn restart_skips_the_whole_durable_reservation_even_when_no_wal_was_written() {
+        let directory = fixture_dir("sequence-restart");
+        let first = sequence_issuer(&directory).unwrap();
+        let first_id = first.allocate().unwrap();
+        let old_end = first.reserved_through.load(Ordering::Acquire);
+        assert!(first_id <= old_end);
+        drop(first);
+        let restarted = sequence_issuer(&directory).unwrap();
+        assert!(restarted.allocate().unwrap() > old_end);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn lost_manifest_is_not_reinitialized_after_all_wal_history_was_pruned() {
+        let directory = fixture_dir("sequence-missing");
+        let issuer = sequence_issuer(&directory).unwrap();
+        assert!(issuer.allocate().is_some());
+        drop(issuer);
+        std::fs::remove_file(directory.join(SEQUENCE_RESERVATION_FILE)).unwrap();
+        assert!(directory.join(SEQUENCE_INITIALIZED_FILE).exists());
+        assert!(sequence_issuer(&directory).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_manifest_copied_to_another_namespace_is_refused() {
+        let original = fixture_dir("sequence-origin");
+        let other = fixture_dir("sequence-copy");
+        let _issuer = sequence_issuer(&original).unwrap();
+        std::fs::copy(
+            original.join(SEQUENCE_RESERVATION_FILE),
+            other.join(SEQUENCE_RESERVATION_FILE),
+        )
+        .unwrap();
+        assert!(sequence_issuer(&other).is_err());
+        std::fs::remove_dir_all(original).unwrap();
+        std::fs::remove_dir_all(other).unwrap();
+    }
+
+    #[test]
+    fn failed_refill_never_exposes_uncommitted_capacity_and_recovery_advances() {
+        let directory = fixture_dir("sequence-refill");
+        let issuer = sequence_issuer(&directory).unwrap();
+        let old_end = issuer.reserved_through.load(Ordering::Acquire);
+        issuer.cursor.store(old_end, Ordering::Release); // all old slots consumed
+        std::fs::create_dir(
+            issuer
+                .directory_guard
+                .io_path(SEQUENCE_RESERVATION_TMP)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(issuer.allocate().is_none());
+        assert!(issuer.refill_if_needed().is_err());
+        assert_eq!(issuer.reserved_through.load(Ordering::Acquire), old_end);
+        assert!(issuer.allocate().is_none());
+        std::fs::remove_dir(
+            issuer
+                .directory_guard
+                .io_path(SEQUENCE_RESERVATION_TMP)
+                .unwrap(),
+        )
+        .unwrap();
+        issuer.refill_if_needed().unwrap();
+        let next = issuer.allocate().unwrap();
+        assert!(next > old_end);
+        let bytes = std::fs::read(
+            issuer
+                .directory_guard
+                .io_path(SEQUENCE_RESERVATION_FILE)
+                .unwrap(),
+        )
+        .unwrap();
+        let committed =
+            SequenceReservations::decode_manifest(&bytes, &issuer.directory_digest).unwrap();
+        assert!(next <= committed);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn separate_instances_and_rollovers_never_allocate_each_others_ranges() {
+        let first_directory = fixture_dir("sequence-a");
+        let second_directory = fixture_dir("sequence-b");
+        let first = sequence_issuer(&first_directory).unwrap();
+        let first_end = first.reserved_through.load(Ordering::Acquire);
+        let second = sequence_issuer(&second_directory).unwrap();
+        let second_start = second.allocate().unwrap();
+        let second_end = second.reserved_through.load(Ordering::Acquire);
+        assert!(second_start > first_end);
+        first.cursor.store(first_end, Ordering::Release);
+        first.refill_if_needed().unwrap();
+        assert!(first.allocate().unwrap() > second_end);
+        assert!(second.allocate().unwrap() <= second_end);
+        std::fs::remove_dir_all(first_directory).unwrap();
+        std::fs::remove_dir_all(second_directory).unwrap();
+    }
+
+    #[test]
+    fn reservation_range_exhaustion_is_an_error_not_a_saturating_duplicate() {
+        assert!(claim_sequence_range(MAX_FRAME_SEQUENCE, 1).is_err());
+        assert!(claim_sequence_range(0, 0).is_err());
+        assert!(claim_sequence_range(0, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn verified_offline_migration_preserves_history_and_installs_a_restart_bound() {
+        let directory = fixture_dir("sequence-migration");
+        let history_seq = sequence_clock_floor().saturating_sub(1 << 30) & !MAX_PACKET_INDEX;
+        let history = segment(&directory, history_seq, b"existing-history");
+        let original = std::fs::read(&history).unwrap();
+        let guard = lock_wal_dir(&directory).unwrap().unwrap();
+        assert!(
+            SequenceReservations::open(&directory, &guard).is_err(),
+            "normal startup must not guess the legacy bound"
+        );
+        let input = |bound, verified| SequenceMigrationEvidence {
+            highest_capture_seq: bound,
+            complete_namespace_verified: verified,
+            provenance: "local fixture: one retained record, no external history".to_owned(),
+        };
+        assert!(migrate_sequence_authority(&directory, &guard, input(history_seq, false)).is_err());
+        assert!(
+            migrate_sequence_authority(&directory, &guard, input(history_seq - 1, true)).is_err()
+        );
+        let receipt =
+            migrate_sequence_authority(&directory, &guard, input(history_seq, true)).unwrap();
+        assert_eq!(receipt.retained_wal_bound, history_seq);
+        assert!(receipt.receipt_path.exists());
+        assert_eq!(
+            std::fs::read(&history).unwrap(),
+            original,
+            "migration never rewrites history"
+        );
+        let issuer = SequenceReservations::open(&directory, &guard).unwrap();
+        assert!(issuer.allocate().unwrap() > receipt.reserved_through);
+        assert!(
+            migrate_sequence_authority(&directory, &guard, input(history_seq, true)).is_err(),
+            "an existing authority is not replaced by migration"
+        );
+        drop(guard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn a_deferred_restore_collision_preserves_both_distinct_originals() {
+        let directory = fixture_dir("deferred-file-collision");
+        let staged = directory.join(REPLAYING_SUBDIR);
+        std::fs::create_dir(&staged).unwrap();
+        let first = segment(&staged, 1, b"consumed-original");
+        let deferred = segment(&staged, 2, b"deferred-original");
+        let deferred_bytes = std::fs::read(&deferred).unwrap();
+        let destination = directory.join(deferred.file_name().unwrap());
+        let mut competing_bytes = Vec::new();
+        write_record(&mut competing_bytes, &record(3, b"different-live-original")).unwrap();
+        let refused = replay_all_with_report_guarded(
+            &directory,
+            usize::MAX,
+            || {
+                std::fs::write(&destination, &competing_bytes).unwrap();
+                Some(100)
+            },
+            Some(100),
+            50,
+        );
+        assert!(refused.is_err());
+        assert!(first.exists());
+        assert_eq!(std::fs::read(&deferred).unwrap(), deferred_bytes);
+        assert_eq!(std::fs::read(&destination).unwrap(), competing_bytes);
+        confirm_replayed(&directory);
+        assert!(!directory.join(ARCHIVE_SUBDIR).exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn replacing_only_the_lock_inode_revokes_the_old_sequence_authority() {
+        let directory = fixture_dir("lock-inode-replaced");
+        let issuer = sequence_issuer(&directory).unwrap();
+        let manifest_before = std::fs::read(
+            issuer
+                .directory_guard
+                .io_path(SEQUENCE_RESERVATION_FILE)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(issuer.allocate().is_some());
+        std::fs::remove_file(&issuer.directory_guard.path).unwrap();
+        let replacement_guard = lock_wal_dir(&directory).unwrap().unwrap();
+        assert!(open_segment_resilient(&directory, &issuer.directory_guard).is_none());
+        assert!(issuer.allocate().is_none());
+        assert!(issuer.refill_if_needed().is_err());
+        assert_eq!(
+            std::fs::read(
+                issuer
+                    .directory_guard
+                    .io_path(SEQUENCE_RESERVATION_FILE)
+                    .unwrap()
+            )
+            .unwrap(),
+            manifest_before
+        );
+        assert!(wal_segments_in(&directory).is_empty());
+        replacement_guard.ensure_current().unwrap();
+        drop(issuer);
+        drop(replacement_guard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_late_producer_below_the_maximum_ack_is_replayed_and_retained_without_exact_proof() {
+        let directory = fixture_dir("late-producer-max-ack");
+        // Real captures use an epoch-scale sequence. A tiny synthetic value
+        // such as 1 << 17 lies in unapplied bucket 0, the empty-slot sentinel;
+        // that conservatively refuses the old heuristic before this test can
+        // demonstrate why a maximum ACK plus finite slack is insufficient.
+        let late_sequence = 1_780_000_000_000_000_000u64 & !MAX_PACKET_INDEX;
+        assert_ne!(
+            late_sequence >> crate::wal_applied_watermark::UNAPPLIED_BUCKET_SHIFT,
+            0,
+            "fixture must use a real non-sentinel capture bucket"
+        );
+        let later_ack = late_sequence + 2 * crate::wal_applied_watermark::REPLAY_REORDER_SLACK_SEQ;
+        let original = segment(&directory, late_sequence, b"never-acked-late-producer");
+        let original_bytes = std::fs::read(&original).unwrap();
+        let watermark = crate::wal_applied_watermark::AppliedWatermark::new_for_tests();
+        watermark.bind(&directory);
+        watermark.note_ticks_acked(later_ack);
+        watermark.note_depth_acked(later_ack);
+        watermark.persist_now();
+        assert!(
+            !watermark
+                .snapshot()
+                .range_has_unapplied(late_sequence, late_sequence),
+            "fixture isolates the unsafe maximum-ACK heuristic, not an explicit unapplied mark"
+        );
+        assert!(
+            segment_matches_heuristic_watermark(&original, &watermark.snapshot()),
+            "this fixture lies outside the old finite-slack heuristic"
+        );
+        let now = SystemTime::now() + Duration::from_secs(10);
+        let active = prune_active_segments_at(&directory, 0, 0, now);
+        assert_eq!(active.deleted + active.size_deleted, 0);
+        assert_eq!(std::fs::read(&original).unwrap(), original_bytes);
+        let archive = directory.join(ARCHIVE_SUBDIR);
+        std::fs::create_dir(&archive).unwrap();
+        let unproved_archive = archive.join("ws-frames-00000000000000000090.wal");
+        std::fs::write(&unproved_archive, &original_bytes).unwrap();
+        let unproved = prune_archived_segments_at(&directory, 0, 0, now);
+        assert_eq!(unproved.deleted + unproved.size_deleted, 0);
+        assert_eq!(std::fs::read(&unproved_archive).unwrap(), original_bytes);
+        let batch = replay(&directory).unwrap();
+        assert_eq!(batch.frames.len(), 1);
+        assert_eq!(batch.frames[0].frame_seq, late_sequence);
+        assert_eq!(batch.frames[0].frame, b"never-acked-late-producer");
+        assert_eq!(batch.skipped_segments + batch.skipped_frames, 0);
+        assert!(confirm_replayed_generation(
+            &directory,
+            batch.confirmation_id
+        ));
+        let proved = prune_archived_segments_at(&directory, 0, 0, now);
+        assert_eq!(
+            proved.deleted + proved.size_deleted,
+            1,
+            "exactly confirmed bytes remain reclaimable; unknown legacy bytes do not"
+        );
+        assert_eq!(std::fs::read(&unproved_archive).unwrap(), original_bytes);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_staging_directory_cannot_report_an_empty_successful_pass() {
+        let directory = fixture_dir("staging-not-directory");
+        let original = segment(&directory, 1, b"unconsumed-original");
+        let original_bytes = std::fs::read(&original).unwrap();
+        // A regular file at the child directory path fails read_dir even for
+        // privileged test runners, without changing host permissions.
+        std::fs::write(directory.join(REPLAYING_SUBDIR), b"directory obstruction").unwrap();
+        assert!(replay(&directory).is_err());
+        confirm_replayed(&directory);
+        assert_eq!(std::fs::read(&original).unwrap(), original_bytes);
+        assert!(!directory.join(ARCHIVE_SUBDIR).exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn guarded_maintenance_never_operates_on_a_replacement_directory() {
+        let directory = fixture_dir("maintenance-replacement");
+        let guard = lock_wal_dir(&directory).unwrap().unwrap();
+        let maintenance = WalMaintenance::from_guard(&guard).unwrap();
+        let original = segment(&directory, 1, b"original-owned-capture");
+        let original_name = original.file_name().unwrap().to_owned();
+        let batch = replay(&directory).unwrap();
+        let saved = directory.with_extension("saved");
+        std::fs::rename(&directory, &saved).unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        let foreign = segment(&directory, 2, b"replacement-owned-by-someone-else");
+        let foreign_bytes = std::fs::read(&foreign).unwrap();
+        let foreign_archive = directory.join(ARCHIVE_SUBDIR);
+        std::fs::create_dir(&foreign_archive).unwrap();
+        let foreign_confirmed = segment(&foreign_archive, 3, b"foreign-confirmed-data");
+        persist_confirmation_marker(
+            &foreign_confirmed,
+            &segment_fingerprint(&foreign_confirmed).unwrap(),
+        )
+        .unwrap();
+        assert!(maintenance.replay_with_report_fenced(1024).is_err());
+        assert!(!maintenance.confirm_replayed_generation(batch.confirmation_id));
+        assert_eq!(maintenance.prune_active_segments(0, 0).failed, 1);
+        assert_eq!(maintenance.prune_archived_segments(0, 0).failed, 1);
+        assert_eq!(std::fs::read(&foreign).unwrap(), foreign_bytes);
+        assert!(foreign_confirmed.exists());
+        assert!(saved.join(REPLAYING_SUBDIR).join(original_name).exists());
+        drop(maintenance);
+        drop(guard);
+        std::fs::remove_dir_all(directory).unwrap();
+        std::fs::remove_dir_all(saved).unwrap();
+    }
+
+    #[test]
+    fn descriptor_anchored_maintenance_still_excludes_the_live_writer_segment() {
+        let directory = fixture_dir("maintenance-open-file");
+        let guard = lock_wal_dir(&directory).unwrap().unwrap();
+        let maintenance = WalMaintenance::from_guard(&guard).unwrap();
+        let mut writer = open_new_segment(&directory, &guard).unwrap();
+        write_record(&mut writer, &record(1, b"writer-is-still-live")).unwrap();
+        writer.flush().unwrap();
+        let anchored = maintenance.anchored_directory().unwrap();
+        assert!(
+            wal_segments_in_checked(&anchored, false)
+                .unwrap()
+                .is_empty()
+        );
+        drop(writer);
+        clear_open_segment_under(&directory);
+        assert_eq!(wal_segments_in_checked(&anchored, false).unwrap().len(), 1);
+        drop(maintenance);
+        drop(guard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn idle_dirty_wal_wakes_and_syncs_without_another_frame() {
+        let interval = Duration::from_millis(10);
+        let remaining = writer_receive_wait(Some(interval), Duration::from_millis(9), true);
+        assert_eq!(remaining, Duration::from_millis(1));
+        assert_eq!(
+            writer_receive_wait(Some(interval), interval, true),
+            Duration::ZERO
+        );
+        let mut dirty = true;
+        let calls = std::cell::Cell::new(0);
+        assert!(
+            sync_dirty_segment_if_due(&mut dirty, Some(interval), Duration::from_millis(9), || {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },)
+            .is_none()
+        );
+        assert_eq!(calls.get(), 0);
+        assert!(
+            sync_dirty_segment_if_due(&mut dirty, Some(interval), interval, || {
+                calls.set(calls.get() + 1);
+                Ok(())
+            })
+            .unwrap()
+            .is_ok()
+        );
+        assert!(!dirty);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            writer_receive_wait(Some(interval), interval, dirty),
+            WAL_WRITER_STOP_POLL
+        );
+        assert!(
+            sync_dirty_segment_if_due(&mut dirty, Some(interval), interval, || {
+                panic!("clean idle segments must not produce a sync storm")
+            })
+            .is_none()
+        );
+
+        // The scheduling behavior above must remain connected to receive
+        // timeout, where the original defect omitted every idle sync attempt.
+        let source = include_str!("ws_frame_spill.rs");
+        let writer = source.split_once("fn writer_loop(").unwrap().1;
+        let idle = writer
+            .split_once("Err(RecvTimeoutError::Timeout) => {")
+            .unwrap()
+            .1;
+        let idle = &idle[..idle.find("continue;").unwrap()];
+        assert!(idle.contains("maybe_sync_segment("));
+    }
+
+    #[test]
+    fn failed_idle_sync_stays_dirty_and_retries_at_the_next_interval() {
+        let interval = Duration::from_millis(10);
+        let mut dirty = true;
+        let failed = sync_dirty_segment_if_due(&mut dirty, Some(interval), interval, || {
+            Err(std::io::Error::other("injected device sync failure"))
+        });
+        assert!(failed.unwrap().is_err());
+        assert!(dirty, "failure must not acknowledge stable-storage success");
+        assert!(
+            sync_dirty_segment_if_due(&mut dirty, Some(interval), Duration::ZERO, || {
+                panic!("a failed attempt must not busy-spin before its retry interval")
+            })
+            .is_none()
+        );
+        assert!(
+            sync_dirty_segment_if_due(&mut dirty, Some(interval), interval, || Ok(()))
+                .unwrap()
+                .is_ok()
+        );
+        assert!(!dirty);
+
+        dirty = true;
+        assert!(
+            sync_dirty_segment_if_due(&mut dirty, None, interval, || {
+                panic!("explicitly disabled file sync must stay disabled")
+            })
+            .is_none()
+        );
+        assert!(
+            dirty,
+            "disabled is not a successful durability acknowledgement"
+        );
+    }
+
+    #[test]
+    fn new_segment_parent_sync_failure_retains_the_file_and_refuses_the_writer() {
+        let directory = fixture_dir("segment-parent-sync");
+        let guard = lock_wal_dir(&directory).unwrap().unwrap();
+        let calls = std::cell::Cell::new(0);
+        let failed = open_new_segment_with_directory_sync(&directory, &guard, |_| {
+            calls.set(calls.get() + 1);
+            let created = std::fs::read_dir(&directory)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "wal")
+                })
+                .count();
+            assert_eq!(
+                created, 1,
+                "directory barrier must follow pathname creation"
+            );
+            Err(std::io::Error::other(
+                "injected parent directory sync failure",
+            ))
+        });
+        assert!(
+            failed.is_err(),
+            "an unconfirmed pathname cannot become the writer"
+        );
+        assert_eq!(calls.get(), 1);
+        let retained = wal_segments_in_checked(&directory, false).unwrap();
+        assert_eq!(retained.len(), 1, "failed-open bytes remain discoverable");
+        assert!(std::fs::read(&retained[0]).unwrap().is_empty());
+
+        let writer = open_new_segment_with_directory_sync(&directory, &guard, |parent| {
+            calls.set(calls.get() + 1);
+            parent.sync_all()
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 2);
+        drop(writer);
+        clear_open_segment_under(&directory);
+        assert_eq!(wal_segments_in_checked(&directory, false).unwrap().len(), 2);
+        drop(guard);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

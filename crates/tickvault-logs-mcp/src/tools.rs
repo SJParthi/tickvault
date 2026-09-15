@@ -18,6 +18,7 @@
 //!   - Invalid UTF-8 in log files: legacy read_text() raises (tool error);
 //!     Rust skips the file (tail/history) — the app's sinks are UTF-8.
 
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -37,6 +38,68 @@ use crate::sigv4::{
 pub const ERRORS_JSONL_PREFIX: &str = "errors.jsonl";
 pub const SUMMARY_FILENAME: &str = "errors.summary.md";
 pub const AUTO_FIX_LOG: &str = "auto-fix.log";
+
+/// Input-byte ceilings for individual buffers and cumulative error-history
+/// and runbook scans. These bound buffering, not execution time or file-catalog size:
+/// decoding and searching remain O(bytes), and decoded JSON has extra overhead.
+/// Ordinary responses keep their legacy shape. Oversized tails explicitly mark
+/// the scanned suffix; whole-history/HTTP requests fail rather than claim that
+/// a truncated response is complete.
+const FILE_SCAN_MAX_BYTES: usize = 8 * 1024 * 1024;
+const HTTP_RESPONSE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+fn read_bounded(reader: impl Read, max_bytes: usize) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let limit = u64::try_from(max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    reader.take(limit).read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("input exceeds {max_bytes}-byte limit; result is incomplete"),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn read_scan_file(path: &Path, remaining_bytes: &mut usize) -> io::Result<Vec<u8>> {
+    let bytes = read_bounded(std::fs::File::open(path)?, *remaining_bytes)?;
+    *remaining_bytes = remaining_bytes.saturating_sub(bytes.len());
+    Ok(bytes)
+}
+
+fn read_text_bounded(path: &Path) -> io::Result<String> {
+    let bytes = read_bounded(std::fs::File::open(path)?, FILE_SCAN_MAX_BYTES)?;
+    String::from_utf8(bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+/// Seek to a bounded suffix, skipping the initial partial line. Read one
+/// preceding byte so an exact line-boundary seek does not lose a complete row.
+fn read_tail_window(path: &Path, max_bytes: usize) -> io::Result<(Vec<u8>, bool)> {
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let start = len.saturating_sub(max_bytes as u64);
+    if start == 0 {
+        // Limit against the opened file's snapshot length, even if it grows.
+        return read_bounded(file.take(len), max_bytes).map(|bytes| (bytes, false));
+    }
+    file.seek(SeekFrom::Start(start - 1))?;
+    let mut bytes = read_bounded(file.take(len - start + 1), max_bytes.saturating_add(1))?;
+    let prefix = bytes
+        .iter()
+        .position(|byte| matches!(*byte, b'\r' | b'\n'))
+        .map_or(bytes.len(), |idx| {
+            let end = idx + 1;
+            if bytes[idx] == b'\r' && bytes.get(end) == Some(&b'\n') {
+                end + 1
+            } else {
+                end
+            }
+        });
+    drop(bytes.drain(..prefix));
+    Ok((bytes, true))
+}
 
 /// Subprocess poll granularity while waiting on a spawned child
 /// (parity: the retired reference implementation subprocess timeout loop).
@@ -152,7 +215,7 @@ fn legacy_neg_slice<T>(lines: &[T], limit: i64) -> &[T] {
     let start = if limit > 0 {
         (n - limit).max(0)
     } else {
-        (-limit).min(n)
+        limit.saturating_neg().min(n)
     };
     &lines[start as usize..]
 }
@@ -246,6 +309,8 @@ pub fn tool_tail_errors(ctx: &Ctx, limit: i64, code: Option<&str>) -> Value {
     let dir_path = ctx.machine_logs_dir();
     let files = iter_errors_jsonl_files(&dir_path);
     let mut events: Vec<Value> = Vec::new();
+    let mut remaining_bytes = FILE_SCAN_MAX_BYTES;
+    let mut scan_truncated = false;
     for (_, f) in &files {
         // 2026-07-18 review LOW-1: lossy-decode (the app_log_tail
         // behavior) instead of silently dropping a WHOLE errors file on
@@ -254,9 +319,19 @@ pub fn tool_tail_errors(ctx: &Ctx, limit: i64, code: Option<&str>) -> Value {
         // per-line JSON parse and is skipped by the existing per-line
         // semantics. A genuinely unreadable file (io error) keeps the
         // skip-continue.
-        let Ok(bytes) = std::fs::read(f) else {
+        if remaining_bytes == 0 {
+            scan_truncated = true;
+            break;
+        }
+        let Ok((bytes, truncated)) = read_tail_window(f, remaining_bytes) else {
             continue;
         };
+        remaining_bytes = if truncated {
+            0
+        } else {
+            remaining_bytes.saturating_sub(bytes.len())
+        };
+        scan_truncated |= truncated;
         let raw = decode_utf8_replace(&bytes);
         let text = legacy_textmode(&raw);
         let lines = legacy_splitlines(&text);
@@ -282,12 +357,17 @@ pub fn tool_tail_errors(ctx: &Ctx, limit: i64, code: Option<&str>) -> Value {
             break;
         }
     }
-    json!({
+    let mut result = json!({
         "dir": dir_path.to_string_lossy(),
         "count": events.len(),
         "files_scanned": files.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
         "events": events,
-    })
+    });
+    if scan_truncated {
+        result["scan_truncated"] = json!(true);
+        result["scan_limit_bytes"] = json!(FILE_SCAN_MAX_BYTES);
+    }
+    result
 }
 
 struct NovelInfo {
@@ -386,6 +466,7 @@ pub fn tool_list_novel_signatures(ctx: &Ctx, since_minutes: i64) -> Result<Value
     let dir_path = ctx.machine_logs_dir();
     let files = iter_errors_jsonl_files(&dir_path);
 
+    let mut remaining_bytes = FILE_SCAN_MAX_BYTES;
     let mut order: Vec<String> = Vec::new();
     let mut first_seen: HashMap<String, NovelInfo> = HashMap::new();
     for (_, f) in &files {
@@ -396,8 +477,10 @@ pub fn tool_list_novel_signatures(ctx: &Ctx, since_minutes: i64) -> Result<Value
         // per-line JSON parse and is skipped by the existing per-line
         // semantics. A genuinely unreadable file (io error) keeps the
         // skip-continue.
-        let Ok(bytes) = std::fs::read(f) else {
-            continue;
+        let bytes = match read_scan_file(f, &mut remaining_bytes) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == io::ErrorKind::InvalidData => return Err(err.to_string()),
+            Err(_) => continue,
         };
         let raw = decode_utf8_replace(&bytes);
         let text = legacy_textmode(&raw);
@@ -486,7 +569,7 @@ pub fn tool_summary_snapshot(ctx: &Ctx) -> Value {
             "markdown": "",
         });
     }
-    match std::fs::read_to_string(&path) {
+    match read_text_bounded(&path) {
         Err(err) => json!({
             "path": path.to_string_lossy(),
             "exists": true,
@@ -512,8 +595,8 @@ pub fn tool_triage_log_tail(ctx: &Ctx, limit: i64) -> Value {
     if !path.exists() {
         return json!({"path": path.to_string_lossy(), "exists": false, "lines": []});
     }
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(raw) => raw,
+    let (bytes, scan_truncated) = match read_tail_window(&path, FILE_SCAN_MAX_BYTES) {
+        Ok(window) => window,
         Err(err) => {
             return json!({
                 "path": path.to_string_lossy(),
@@ -523,6 +606,12 @@ pub fn tool_triage_log_tail(ctx: &Ctx, limit: i64) -> Value {
             });
         }
     };
+    let raw = match String::from_utf8(bytes) {
+        Ok(raw) => raw,
+        Err(err) => {
+            return json!({"path": path.to_string_lossy(), "exists": true, "error": err.to_string(), "lines": []});
+        }
+    };
     let text = legacy_textmode(&raw);
     let lines = legacy_splitlines(&text);
     let tail: &[&str] = if lines.len() as i64 > limit {
@@ -530,13 +619,18 @@ pub fn tool_triage_log_tail(ctx: &Ctx, limit: i64) -> Value {
     } else {
         &lines
     };
-    json!({
+    let mut result = json!({
         "path": path.to_string_lossy(),
         "exists": true,
         "total_lines": lines.len(),
         "returned": tail.len(),
         "lines": tail,
-    })
+    });
+    if scan_truncated {
+        result["scan_truncated"] = json!(true);
+        result["total_lines"] = Value::Null;
+    }
+    result
 }
 
 /// the retired reference implementation `tool_signature_history`. `signature` is echoed verbatim
@@ -545,6 +639,7 @@ pub fn tool_signature_history(ctx: &Ctx, signature: &Value, limit: i64) -> Value
     let want = signature.as_str();
     let dir_path = ctx.machine_logs_dir();
     let files = iter_errors_jsonl_files(&dir_path);
+    let mut remaining_bytes = FILE_SCAN_MAX_BYTES;
     let mut matches: Vec<Value> = Vec::new();
     for (_, f) in &files {
         // 2026-07-18 review LOW-1: lossy-decode (the app_log_tail
@@ -554,8 +649,12 @@ pub fn tool_signature_history(ctx: &Ctx, signature: &Value, limit: i64) -> Value
         // per-line JSON parse and is skipped by the existing per-line
         // semantics. A genuinely unreadable file (io error) keeps the
         // skip-continue.
-        let Ok(bytes) = std::fs::read(f) else {
-            continue;
+        let bytes = match read_scan_file(f, &mut remaining_bytes) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == io::ErrorKind::InvalidData => {
+                return json!({"ok": false, "signature": signature, "error": err.to_string()});
+            }
+            Err(_) => continue,
         };
         let raw = decode_utf8_replace(&bytes);
         let text = legacy_textmode(&raw);
@@ -612,14 +711,24 @@ pub fn tool_find_runbook_for_code(ctx: &Ctx, code: &str) -> Value {
     let rules_dir = root.join(".claude").join("rules");
 
     let mut matches: Vec<Value> = Vec::new();
-    for search_dir in [runbooks_dir, rules_dir] {
+    let mut remaining_bytes = FILE_SCAN_MAX_BYTES;
+    let mut scan_truncated = false;
+    'scan: for search_dir in [runbooks_dir, rules_dir] {
         if !search_dir.exists() {
             continue;
         }
         let mut md_files = Vec::new();
         rglob_md(&search_dir, &mut md_files);
         for md in md_files {
-            let Ok(raw) = std::fs::read_to_string(&md) else {
+            let bytes = match read_scan_file(&md, &mut remaining_bytes) {
+                Ok(bytes) => bytes,
+                Err(err) if err.kind() == io::ErrorKind::InvalidData => {
+                    scan_truncated = true;
+                    break 'scan;
+                }
+                Err(_) => continue,
+            };
+            let Ok(raw) = String::from_utf8(bytes) else {
                 continue;
             };
             let text = legacy_textmode(&raw);
@@ -647,11 +756,16 @@ pub fn tool_find_runbook_for_code(ctx: &Ctx, code: &str) -> Value {
         }
     }
 
-    json!({
+    let mut result = json!({
         "code": code,
         "match_count": matches.len(),
         "matches": matches,
-    })
+    });
+    if scan_truncated {
+        result["scan_truncated"] = json!(true);
+        result["scan_limit_bytes"] = json!(FILE_SCAN_MAX_BYTES);
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -701,7 +815,7 @@ pub fn tool_questdb_sql(ctx: &Ctx, query: &str) -> Value {
             "error": format!("HTTP Error {}: {}", status.as_u16(), reason),
         });
     }
-    let body = match resp.bytes() {
+    let body = match read_bounded(resp, HTTP_RESPONSE_MAX_BYTES) {
         Ok(b) => decode_utf8_replace(&b),
         Err(e) => return json!({"ok": false, "query": query, "error": e.to_string()}),
     };
@@ -803,7 +917,7 @@ pub fn tool_tickvault_api(ctx: &Ctx, path: &str, base_url: Option<&str>) -> Valu
         });
     }
     let status_code = status.as_u16();
-    let body = match resp.bytes() {
+    let body = match read_bounded(resp, HTTP_RESPONSE_MAX_BYTES) {
         Ok(b) => decode_utf8_replace(&b),
         Err(e) => return json!({"ok": false, "error": e.to_string(), "url": full}),
     };
@@ -1156,8 +1270,8 @@ pub fn tool_app_log_tail(ctx: &Ctx, limit: i64, date: Option<&str>) -> Value {
             "log_dir": log_dir.to_string_lossy(),
         });
     }
-    let bytes = match std::fs::read(&log_file) {
-        Ok(b) => b,
+    let (bytes, scan_truncated) = match read_tail_window(&log_file, FILE_SCAN_MAX_BYTES) {
+        Ok(window) => window,
         Err(err) => {
             return json!({
                 "ok": false,
@@ -1173,13 +1287,18 @@ pub fn tool_app_log_tail(ctx: &Ctx, limit: i64, date: Option<&str>) -> Value {
     } else {
         &lines
     };
-    json!({
+    let mut result = json!({
         "ok": true,
         "path": log_file.to_string_lossy(),
         "total_lines": lines.len(),
         "returned": tail.len(),
         "lines": tail,
-    })
+    });
+    if scan_truncated {
+        result["scan_truncated"] = json!(true);
+        result["total_lines"] = Value::Null;
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -1251,7 +1370,10 @@ fn grep_walk(
         if meta.len() > 2_000_000 {
             continue;
         }
-        let Ok(bytes) = std::fs::read(&path) else {
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let Ok(bytes) = read_bounded(file, 2_000_000) else {
             continue;
         };
         let text = legacy_textmode(&decode_utf8_ignore(&bytes));
@@ -1481,8 +1603,7 @@ fn cloudwatch_via_sigv4(
     let status = resp.status();
     if status.as_u16() >= 400 {
         let reason = status.canonical_reason().unwrap_or("").to_string();
-        let err_body = resp
-            .bytes()
+        let err_body = read_bounded(resp, HTTP_RESPONSE_MAX_BYTES)
             .map(|b| legacy_slice_chars(&decode_utf8_replace(&b), 400).to_string())
             .unwrap_or_default();
         let detail = if err_body.is_empty() {
@@ -1498,10 +1619,15 @@ fn cloudwatch_via_sigv4(
             "error": format!("CloudWatch FilterLogEvents HTTP {}: {}", status.as_u16(), detail),
         });
     }
-    let payload = resp
-        .bytes()
-        .map(|b| decode_utf8_replace(&b))
-        .unwrap_or_default();
+    let payload = match read_bounded(resp, HTTP_RESPONSE_MAX_BYTES) {
+        Ok(bytes) => decode_utf8_replace(&bytes),
+        Err(err) => {
+            return json!({
+                "ok": false, "source": "cloudwatch_sigv4", "log_group": group,
+                "region": region, "error": err.to_string(),
+            });
+        }
+    };
     let events = parse_cloudwatch_events(&payload, limit);
     json!({
         "ok": true,
@@ -1567,10 +1693,14 @@ fn cloudwatch_via_portal(env: &dyn Env, filter_pattern: Option<&str>, limit: i64
                     ),
                 });
             }
-            let body = r
-                .bytes()
-                .map(|b| decode_utf8_replace(&b))
-                .unwrap_or_default();
+            let body = match read_bounded(r, HTTP_RESPONSE_MAX_BYTES) {
+                Ok(bytes) => decode_utf8_replace(&bytes),
+                Err(err) => {
+                    return json!({
+                        "ok": false, "source": "portal", "portal_url": url, "error": err.to_string(),
+                    });
+                }
+            };
             if body.trim().is_empty() {
                 Value::Object(Map::new())
             } else {
@@ -2089,6 +2219,189 @@ pub fn call_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_read_accepts_limit_and_stops_an_endless_body() {
+        let exact = vec![b'x'; 16];
+        assert_eq!(read_bounded(exact.as_slice(), 16).unwrap(), exact);
+        let mut oversized = std::io::Cursor::new(vec![b'x'; 100]);
+        let err = read_bounded(&mut oversized, 16).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            oversized.position(),
+            17,
+            "must not read the rest of an oversized body"
+        );
+        assert!(read_bounded(std::io::repeat(b'x'), 16).is_err());
+        assert!(read_bounded(std::io::empty(), 0).unwrap().is_empty());
+        assert!(read_bounded(&b"x"[..], 0).is_err());
+    }
+
+    #[test]
+    fn bounded_tail_keeps_complete_lines_at_and_across_seek_boundaries() {
+        let path = std::env::temp_dir().join(format!(
+            "tv-mcp-tail-window-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, b"old\nnew\nlast\n").unwrap();
+        assert_eq!(
+            read_tail_window(&path, 9).unwrap(),
+            (b"new\nlast\n".to_vec(), true)
+        );
+        assert_eq!(
+            read_tail_window(&path, 8).unwrap(),
+            (b"last\n".to_vec(), true)
+        );
+        assert_eq!(
+            read_tail_window(&path, 13).unwrap(),
+            (b"old\nnew\nlast\n".to_vec(), false)
+        );
+        std::fs::write(&path, b"one-oversized-line").unwrap();
+        assert_eq!(read_tail_window(&path, 4).unwrap(), (Vec::new(), true));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn bounded_tail_preserves_cr_and_crlf_at_every_seek_boundary() {
+        let path = std::env::temp_dir().join(format!(
+            "tv-mcp-tail-newlines-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        for separator in ["\r", "\r\n"] {
+            let content = format!("old{separator}new{separator}last{separator}");
+            std::fs::write(&path, content.as_bytes()).unwrap();
+            let new_start = 3 + separator.len();
+            let last_start = new_start + 3 + separator.len();
+            for start in 0..=content.len() {
+                let expected_start = match start {
+                    0 => 0,
+                    s if s <= new_start => new_start,
+                    s if s <= last_start => last_start,
+                    _ => content.len(),
+                };
+                assert_eq!(
+                    read_tail_window(&path, content.len() - start).unwrap(),
+                    (content.as_bytes()[expected_start..].to_vec(), start != 0),
+                    "separator={separator:?}, seek={start}"
+                );
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn runbook_scan_marks_oversize_and_cumulative_budget_exhaustion() {
+        use std::io::Write;
+
+        let base = std::env::temp_dir().join(format!(
+            "tv-mcp-runbook-budget-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let runbooks = base.join("docs/runbooks");
+        let rules = base.join(".claude/rules");
+        std::fs::create_dir_all(&runbooks).unwrap();
+        std::fs::create_dir_all(&rules).unwrap();
+        let path = runbooks.join("budget.md");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.set_len(FILE_SCAN_MAX_BYTES as u64 + 1).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        file.write_all(b"\nBUDGET_CODE\n").unwrap();
+        drop(file);
+        let ctx = Ctx {
+            repo_root: base.clone(),
+            cfg: config::EndpointsConfig::default(),
+        };
+        let oversized = tool_find_runbook_for_code(&ctx, "BUDGET_CODE");
+        assert_eq!(oversized["match_count"], 0);
+        assert_eq!(oversized["scan_truncated"], true);
+        assert_eq!(oversized["scan_limit_bytes"], FILE_SCAN_MAX_BYTES);
+
+        // Preserve ordinary response shape and matches below the byte limit.
+        std::fs::write(&path, b"BUDGET_CODE\n").unwrap();
+        let complete = tool_find_runbook_for_code(&ctx, "BUDGET_CODE");
+        assert_eq!(complete["match_count"], 1);
+        assert_eq!(complete["matches"][0]["first_line"], 1);
+        assert!(complete.get("scan_truncated").is_none());
+
+        // Each file fits alone; both directories share one scan budget.
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(FILE_SCAN_MAX_BYTES as u64 / 2 + 1)
+            .unwrap();
+        std::fs::File::create(rules.join("budget.md"))
+            .unwrap()
+            .set_len(FILE_SCAN_MAX_BYTES as u64 / 2 + 1)
+            .unwrap();
+        let cumulative = tool_find_runbook_for_code(&ctx, "BUDGET_CODE");
+        assert_eq!(cumulative["match_count"], 0);
+        assert_eq!(cumulative["scan_truncated"], true);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn oversized_error_log_tails_latest_but_refuses_complete_history() {
+        use std::io::Write;
+        let base = std::env::temp_dir().join(format!(
+            "tv-mcp-bounded-log-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let machine = base.join("data/logs/machine");
+        std::fs::create_dir_all(&machine).unwrap();
+        let path = machine.join("errors.jsonl.2026-09-14-01");
+        let mut file = std::fs::File::create(&path).unwrap();
+        // Sparse giant prefix: reading it all is unnecessary to return one row.
+        file.set_len(FILE_SCAN_MAX_BYTES as u64 + 4096).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        file.write_all(b"\n{\"code\":\"LATEST\",\"message\":\"retained\"}\n")
+            .unwrap();
+        drop(file);
+        let ctx = Ctx {
+            repo_root: base.clone(),
+            cfg: config::EndpointsConfig::default(),
+        };
+        let tail = tool_tail_errors(&ctx, 1, None);
+        assert_eq!(tail["count"], 1);
+        assert_eq!(tail["events"][0]["code"], "LATEST");
+        assert_eq!(tail["scan_truncated"], true);
+        assert!(
+            tool_list_novel_signatures(&ctx, 60)
+                .unwrap_err()
+                .contains("byte limit")
+        );
+        let history = tool_signature_history(&ctx, &json!("not-present"), 1);
+        assert_eq!(history["ok"], false);
+        assert!(history["error"].as_str().unwrap().contains("incomplete"));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn file_scan_budget_is_shared_across_files() {
+        let path = std::env::temp_dir().join(format!(
+            "tv-mcp-scan-budget-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, b"12345678").unwrap();
+        let mut budget = 15;
+        assert_eq!(read_scan_file(&path, &mut budget).unwrap().len(), 8);
+        assert_eq!(budget, 7);
+        assert!(read_scan_file(&path, &mut budget).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn negative_tail_limit_handles_entire_i64_domain_without_overflow() {
+        let lines = [1, 2, 3];
+        assert!(legacy_neg_slice(&lines, i64::MIN).is_empty());
+        assert_eq!(legacy_neg_slice(&lines, -1), &[2, 3]);
+        assert_eq!(legacy_neg_slice(&lines, 0), &lines);
+        assert_eq!(legacy_neg_slice(&lines, i64::MAX), &lines);
+        assert!(legacy_neg_slice::<u8>(&[], i64::MIN).is_empty());
+    }
 
     /// Run `run_with_timeout` on a helper thread so a REGRESSION fails this
     /// test instead of hanging it.

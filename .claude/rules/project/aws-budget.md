@@ -1263,3 +1263,19 @@ and the on-disk seal-spill record is unchanged in size and format. The carry is
 process state only — it never crosses the day boundary, and a counter restart
 drops it deliberately, because it is a difference measured against a baseline
 the restart erased.
+
+
+## RAM NOTE 2026-09-13 — candle counter-reset offset
+
+The counter-reset correction adds one `u64` (`reset_cumulative_offset`) to
+`AggregatorCell`. Its payload cost is 8 bytes per allocated instrument, or
+200,000 bytes (about 0.19 MiB) at the 25,000-instrument ceiling. The existing
+7,192-byte per-cell bound remains unchanged; compiled layout/test verification
+is required before deployment, and this note does not claim a measured RSS
+increase. No instance, disk, or monthly infrastructure budget is changed.
+
+The field shifts the cumulative-counter axis after a reset so already-counted
+candle volume is not lost when the new counter is smaller than that volume.
+It is shared across the fixed timeframe array: two fixed-array passes on reset
+and two saturating scalar additions per timeframe fold, with no new allocation.
+Repeated-reset, duplicate, and rollover regression tests accompany the change.

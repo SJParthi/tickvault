@@ -1,0 +1,45 @@
+{
+  "utc": "2026-09-14T04:08:46.265812+00:00",
+  "reviewed_commit": "af77fb0698aeb4414136767e4907593e90ac1ddf",
+  "local_runtime": {
+    "rustc": null,
+    "cargo": null,
+    "rustup": null,
+    "rustfmt": null,
+    "docker": null,
+    "podman": null,
+    "gcc": "/usr/bin/gcc",
+    "cc": "/usr/bin/cc",
+    "python": "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin/python",
+    "node": "/opt/codex/runtimes/codex-primary-runtime/dependencies/node/bin/node"
+  },
+  "candidate_rust_tests_executed": false,
+  "guard_correction": {
+    "same_file_extractors_repaired": 32,
+    "integration_direct_extractors_repaired": 3,
+    "integration_shared_extractors_repaired": 1,
+    "new_rust_regression_tests": 3,
+    "python_source_boundary_checks": "passed; not Rust execution",
+    "git_diff_check": "passed",
+    "guard_only_production_prefix_bytes_preserved": 774526,
+    "guard_only_production_prefix_sha256": "84d66f879b893feda3f20065456bc4d40ada42b16eb257bca38335022d96ae86"
+  },
+  "files": {
+    "crates/app/src/dhan_feed_stack.rs": "a3032e50d095b9e096bea0d2343bc28b11f3108227bd398cc4b83b44d4c79198",
+    "crates/app/tests/deaf_socket_gauge_guard.rs": "a84b13619e8989659e31d42ad5d8b9f34951338ae70fe87f09811423c8b1a45f",
+    "crates/app/tests/ring_dwell_gauge_guard.rs": "8c0f2fab4804fbac9e332a2a6a440ce362278d49979ded16743ff9c71ed1b70b",
+    "crates/app/tests/dhan_live_off_phase_a_guard.rs": "1cf49a8395f924d825fe8cb2662fd5399e245e4a39ae1bffe3ff53e5aaf9b443",
+    "crates/app/tests/lane_running_wiring_guard.rs": "500661fe69ce1ed404b34464863d92891564ca6bd79aabe9a5dad2ecc1c45c43"
+  },
+  "maintenance_fairness_fix": {
+    "implemented": true,
+    "rust_tests_executed": false,
+    "regression_selector": "dhan_feed_stack::tests::test_busy_seed_drain_services_every_cadence_without_frames",
+    "condition": "continuously ready seed queue with no frames cannot starve later timers",
+    "test_backlog": 4096,
+    "paused_deadlines_seconds": [
+      61,
+      122
+    ]
+  }
+}

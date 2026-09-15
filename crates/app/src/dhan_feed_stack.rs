@@ -44,20 +44,16 @@
 //! no parser, and no path by which one could be reached from here.
 //!
 //! # The path one tick takes
-//! ```text
-//! socket ──▶ WalRingSink ──▶ WAL (durable)  ──▶ bounded ring ──▶ run_frame_drain
-//!            (read task)      then, only then      65,536         (its own task)
-//!                                                                       │
-//!                              gap detector ◀── LiveIngest::ingest_tick ─┘
-//!                              aggregator (24 timeframes) ──▶ seal ring
-//!                              TickWriter::append_tick_with_seq ──▶ ticks
-//! ```
-//! The split at the ring is the whole design. The read task does exactly one
-//! thing per frame — hand it to the sink — because anything else it did would
-//! stall the automatic pong and turn a slow fold into a disconnect. The frame
-//! is durable in the write-ahead log BEFORE it is visible to the fold, so a
-//! process kill between the two steps loses nothing; a full ring is therefore
-//! back-pressure, never capture loss.
+//! The socket reader hands each frame to `WalRingSink`, which submits it to
+//! the asynchronous WAL queue before attempting the bounded fold ring.
+//! `run_frame_drain` consumes that ring, updates the gap detector and candle
+//! aggregator, and hands decoded rows to the persistence workers.
+//!
+//! Queue admission does not establish a completed disk write or sync. The WAL
+//! writer buffers, flushes and attempts to sync separately. A process kill can
+//! lose records still in the queue or userspace buffer; storage errors can
+//! prevent capture. A full fold ring therefore requires replay of surviving
+//! WAL records, and does not by itself establish a zero-loss guarantee.
 //!
 //! # Honest state of this round
 //! Sockets are dialed, frames are captured, and the fold consumes them.
@@ -69,16 +65,12 @@
 //! capturing without a durable floor, or dialing with a blank credential,
 //! would both look like success while being neither.
 //!
-//! **NOT claimed:** that a tick was ever observed arriving. Every branch here
-//! is exercised against a fake transport and pure unit tests; no session has
-//! run against live Dhan since the 2026-07-13 retirement. The main feed
-//! carries no sequence number and no snapshot-on-subscribe, so packet loss is
-//! undetectable at the protocol level — the 15:31 REST cross-verification is
-//! the lane's only ground truth, and it is spawned inside the same gate for
-//! exactly that reason. The delivery-lag and silent-instrument problems that
-//! caused the retirement (p99 46 s, max 199 s, 29–67 silent instruments per
-//! minute — `websocket-connection-scope-lock.md` §E) are Dhan-side and are
-//! NOT fixed by any of this.
+//! Source and isolated tests do not establish current live Dhan delivery.
+//! Check timestamped per-connection observations for the current session.
+//! The documented main-feed packet has no resumable exchange-event sequence;
+//! silence detection and REST reconciliation cannot reconstruct every missing
+//! intermediate trade. Historical latency figures are observations of their
+//! own sessions, not guarantees for this implementation or a new session.
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -122,6 +114,7 @@ use tickvault_storage::depth_persistence::{
     DepthWriter, depth_segment_label,
 };
 use tickvault_storage::tick_persistence::TickWriter;
+use tickvault_storage::wal_applied_watermark::ReplayAckFence;
 use tickvault_storage::ws_frame_spill::{WalEndpoint, WsFrameSpill, WsType};
 use tickvault_trading::candles::multi_tf_aggregator::AGGREGATOR_MAX_SLOTS;
 use tickvault_trading::candles::{BufferedSeal, ConsumeStats, FeedStrategy, MultiTfAggregator};
@@ -1050,6 +1043,29 @@ pub enum IngestOutcome {
     WriteFailed,
 }
 
+/// Production has one ranking owner and uses the published process runtime.
+/// Unit fixtures own an isolated runtime unless they explicitly exercise the
+/// shared publication seam. An unprepared fixture must not invalidate another
+/// fixture's board when its pinned metadata version is still zero.
+#[derive(Clone)]
+enum CandleRankingRuntimeHandle {
+    Global(&'static crate::bucket_top_volume::BucketTopVolumeRuntime),
+    #[cfg(test)]
+    Isolated(std::sync::Arc<crate::bucket_top_volume::BucketTopVolumeRuntime>),
+}
+
+impl std::ops::Deref for CandleRankingRuntimeHandle {
+    type Target = crate::bucket_top_volume::BucketTopVolumeRuntime;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Global(runtime) => runtime,
+            #[cfg(test)]
+            Self::Isolated(runtime) => runtime,
+        }
+    }
+}
+
 /// The live tick fold: gap detector → aggregator → tick writer, in that order,
 /// over ONE tick with ONE sequence number.
 ///
@@ -1065,9 +1081,10 @@ pub enum IngestOutcome {
 /// to report.
 ///
 /// # Complexity
-/// O(1) per tick: one hash lookup in the detector, one hash lookup plus
-/// `TF_COUNT` scalar folds in the aggregator, one ILP row append. No heap
-/// allocation in steady state.
+/// The warm fold visits a fixed `TF_COUNT` with expected dictionary access.
+/// Canonical ranking adds ordered-index work per changed frame; registration,
+/// bucket eviction and maintenance can perform population-sized work. This
+/// is not an O(1) bound for the complete ingestion path or elapsed latency.
 pub struct LiveIngest {
     /// Optional sink for the 5 depth levels that ride INLINE in every
     /// Full-mode tick packet (2026-08-19).
@@ -1303,6 +1320,14 @@ pub struct LiveIngest {
     /// a tick is seen, and a structure reached through `&mut self` on a
     /// single-owner path needs no concurrent map.
     leaderboard: crate::volume_leaderboard::VolumeLeaderboard,
+    /// The live ranking consumes canonical signed candle publications.
+    candle_ranking: crate::candle_volume_bridge::CandleVolumeBridge,
+    #[cfg(test)]
+    candle_ranking_runtime_for_test: CandleRankingRuntimeHandle,
+    /// A deterministic owner clock for unit fixtures. Production always reads
+    /// the actual publication clock, independently of any packet receipt.
+    #[cfg(test)]
+    candle_publication_secs_for_test: Option<u32>,
     /// `true` while [`refold_wal_frames`] is re-folding a WAL backlog through
     /// this ingest. The ranking observer is SKIPPED for the duration.
     ///
@@ -1330,6 +1355,137 @@ pub struct LiveIngest {
 }
 
 impl LiveIngest {
+    fn candle_ranking_runtime(&self) -> CandleRankingRuntimeHandle {
+        #[cfg(test)]
+        {
+            self.candle_ranking_runtime_for_test.clone()
+        }
+        #[cfg(not(test))]
+        {
+            CandleRankingRuntimeHandle::Global(
+                crate::bucket_top_volume::global_bucket_top_volume_runtime(),
+            )
+        }
+    }
+
+    fn candle_publication_now(&self) -> u32 {
+        #[cfg(test)]
+        if let Some(now) = self.candle_publication_secs_for_test {
+            return now;
+        }
+        candle_publication_clock()
+    }
+
+    /// Register the selected option metadata on the cold attach/maintenance
+    /// path. Every candle and ranking update then shares this pinned context.
+    pub fn prepare_candle_ranking(&mut self, now_ist_nanos: i64) {
+        let Ok(now) = u32::try_from(now_ist_nanos.div_euclid(1_000_000_000)) else {
+            return;
+        };
+        let runtime = self.candle_ranking_runtime();
+        self.candle_ranking.refresh(
+            now,
+            crate::contract_underlying_map::global_contract_underlying_map(),
+            &runtime,
+        );
+    }
+
+    /// The one-second maintenance arm publishes the four requested Top Volume
+    /// frames when changed. The candle engine still maintains all ten frames.
+    /// The five-second arm derives depth candidates from the same signed
+    /// ordering. Legacy cadence arguments do not calculate volume.
+    pub fn snapshot_top_volume(
+        &mut self,
+        now_ist_nanos: i64,
+        cadence: tickvault_storage::top_volume_rank_persistence::SnapshotCadence,
+    ) -> (usize, usize) {
+        use tickvault_storage::top_volume_rank_persistence::SnapshotCadence;
+        let Ok(now) = u32::try_from(now_ist_nanos.div_euclid(1_000_000_000)) else {
+            return (0, 1);
+        };
+        self.prepare_candle_ranking(now_ist_nanos);
+        let runtime = self.candle_ranking_runtime();
+        let counts =
+            if cadence == SnapshotCadence::OneSecond || cadence == SnapshotCadence::FiveSecond {
+                self.candle_ranking.publish_tables(now, &runtime)
+            } else {
+                (0, 0)
+            };
+        if cadence == SnapshotCadence::FiveSecond {
+            self.publish_candle_depth_candidates(now);
+        }
+        counts
+    }
+
+    fn publish_candle_depth_candidates(&self, now: u32) {
+        use crate::depth200_candidates::Depth200Candidate;
+        use crate::volume_leaderboard::{GainerVerdict, OptionFamily};
+        let runtime = self.candle_ranking_runtime();
+        let snapshot = runtime.load(OptionFamily::Stock, tickvault_trading::candles::TfIndex::S5);
+        let mut contracts = Vec::new();
+        let mut underlyings = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        if snapshot.is_some()
+            && self.candle_ranking.require_current_metadata(
+                crate::contract_underlying_map::global_contract_underlying_map(),
+                &runtime,
+            )
+        {
+            // Candidate selection consumes the same coverage/freshness gate as
+            // an automated decision; incomplete data cannot present a winner.
+            let request = crate::bucket_top_volume::BucketDecisionRequest {
+                feed: Feed::Dhan,
+                family: OptionFamily::Stock,
+                tf: tickvault_trading::candles::TfIndex::S5,
+                session_day: now / 86_400,
+                universe_version: self.candle_ranking.generation(),
+                metric: crate::bucket_top_volume::BucketVolumeMetric::SignedBarVolumeVsOneLotV3,
+                bucket_start_secs: tickvault_trading::candles::TfIndex::S5.bucket_start(now),
+                now_secs: now,
+                max_age_secs: 5,
+                require_closed: false,
+            };
+            if let Ok(snapshot) = runtime.load_for_decision(request) {
+                for row in &snapshot.rows {
+                    let verdict = crate::volume_leaderboard::underlying_gainer_verdict(
+                        self.spot_prices
+                            .latest_paise(row.underlying_id, ExchangeSegment::NseEquity),
+                        self.prev_close
+                            .get(row.underlying_id, ExchangeSegment::NseEquity),
+                    );
+                    if verdict != GainerVerdict::Gainer {
+                        continue;
+                    }
+                    let Some(lots) = row.estimated_net_lots_milli() else {
+                        continue;
+                    };
+                    let candidate = Depth200Candidate {
+                        security_id: row.security_id,
+                        segment: row.segment,
+                        underlying_id: row.underlying_id,
+                        window_lots_milli: lots,
+                    };
+                    if contracts.len() < crate::depth20_ranked_steer::DEPTH20_EXIT_RANKS {
+                        contracts.push(candidate);
+                    }
+                    if underlyings.len() < crate::depth200_candidates::DEPTH200_EXIT_UNDERLYINGS
+                        && seen.insert(row.underlying_id)
+                    {
+                        underlyings.push(candidate);
+                    }
+                    if contracts.len() == crate::depth20_ranked_steer::DEPTH20_EXIT_RANKS
+                        && underlyings.len()
+                            == crate::depth200_candidates::DEPTH200_EXIT_UNDERLYINGS
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        crate::depth20_ranked_steer::global_depth20_candidates().publish(contracts);
+        crate::depth200_candidates::global_depth200_candidates().publish(underlyings);
+    }
+
     /// Enables persistence of the 5 depth levels that ride inline in every
     /// Full-mode tick packet.
     ///
@@ -1372,11 +1528,11 @@ impl LiveIngest {
     ///
     /// # Complexity
     ///
-    /// O(n log n) in TRACKED CONTRACTS per call, from the ranking sort -- the
-    /// same sort the depth steering already pays. Deliberately NOT on the
+    /// O(D + R) ranking for D changed contracts and R output rows with the
+    /// fixed-width radix key, plus O(R) snapshot publication. Not on the
     /// per-tick path: it runs on a timer, and the write it triggers is handed
     /// to another thread rather than performed here.
-    pub fn snapshot_top_volume(
+    pub fn snapshot_legacy_top_volume(
         &mut self,
         now_ist_nanos: i64,
         cadence: tickvault_storage::top_volume_rank_persistence::SnapshotCadence,
@@ -1402,28 +1558,11 @@ impl LiveIngest {
             }
             return (0, 0);
         }
-        // Two consumers of this pass now, and they are gated separately.
-        //
-        // `wants_rows` is the original one: no writer, no rows to write.
-        // `wants_candidates` is the depth-200 steering publish (2026-09-08),
-        // which reads the SAME Stock/5s ranking and must keep working when the
-        // top-volume writer thread failed to spawn -- steering is not a
-        // persistence feature, and coupling it to one would make a rare degrade
-        // of the table a silent degrade of the depth pool.
-        //
-        // The early exit is kept for the case where NEITHER wants anything,
-        // because ranking to discover that would pay the sweep on the 1-second
-        // arm for nothing -- MEASURED 2026-09-12 at 123 us in the assumed
-        // realistic shape and 2.95 ms at the ceiling where every contract
-        // traded. (This comment said "~900 us" until then; that figure came
-        // from a harness that was timing an empty sort -- see
-        // `volume_leaderboard`'s header.)
+        // RAM snapshots are an independent consumer on every cadence and
+        // family. Database-writer failure must not stop their publication.
         let wants_rows = self.top_volume.is_some();
         let wants_candidates =
             cadence == tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond;
-        if !wants_rows && !wants_candidates {
-            return (0, 0);
-        }
 
         let mut appended = 0usize;
         let mut refused = 0usize;
@@ -1431,12 +1570,6 @@ impl LiveIngest {
             crate::volume_leaderboard::OptionFamily::Index,
             crate::volume_leaderboard::OptionFamily::Stock,
         ] {
-            // Only the Stock family feeds the candidates, so with no writer
-            // there is nothing the Index pass could produce. Skipping it keeps
-            // the writer-less degrade at ONE sort per 5 seconds instead of two.
-            if !wants_rows && family != crate::volume_leaderboard::OptionFamily::Stock {
-                continue;
-            }
             // Disjoint-field borrows, taken BEFORE the ranking borrow: the
             // gainer pass below reads these two stores while `rank`'s slice is
             // still alive, and the borrow checker allows that only because
@@ -1492,8 +1625,8 @@ impl LiveIngest {
             //
             // "An instrument qualifies if its underlying is in the day's
             // gainers; volume then decides the order." Applied on the FULL
-            // volume-ordered population, stopping once the depth-20 exit set
-            // is filled, so membership is the underlying's day gain and order
+            // volume-ordered population, stopping once both independent depth
+            // exit sets are filled, so membership is the underlying's day gain and order
             // is still lots-in-window. Not applied inside `rank`, because the
             // persisted `top_volume_rank` rows must keep recording which
             // contracts were busiest whether or not their stock rose.
@@ -1512,9 +1645,10 @@ impl LiveIngest {
             let steering = if family == crate::volume_leaderboard::OptionFamily::Stock
                 && wants_candidates
             {
-                Some(crate::volume_leaderboard::gainer_eligible(
+                Some(crate::volume_leaderboard::gainer_eligible_for_depth(
                     ranked_all,
                     crate::depth20_ranked_steer::DEPTH20_EXIT_RANKS,
+                    crate::depth200_candidates::DEPTH200_EXIT_UNDERLYINGS,
                     |underlying_id| {
                         let segment = crate::volume_leaderboard::STOCK_OPTION_UNDERLYING_SEGMENT;
                         crate::volume_leaderboard::underlying_gainer_verdict(
@@ -1526,25 +1660,33 @@ impl LiveIngest {
             } else {
                 None
             };
-            // The persisted rows: every contract that traded in the window
-            // (`TOP_VOLUME_PERSIST_PER_FAMILY`, operator 2026-09-12), whether
-            // or not their stock rose. COPIED out because the closures below
-            // need `self` again.
-            //
-            // ⚠ HONEST COST of removing the 250 cut, stated rather than
-            // absorbed: this copy used to be bounded by a constant — 250 rows
-            // × 40 B ≈ 10 KB per sweep. It is now bounded by the MARKET: one
-            // entry per contract with a non-zero window delta, hard-capped
-            // only by `MAX_TRACKED_CONTRACTS` (25,000/family ≈ 1 MB). It is on
-            // the drain's TIMER arm, not the per-tick path, and the allocation
-            // reuses no buffer. If the sweep cost moves, this line is one of
-            // the two places to look; the other is the sort in `rank`.
-            let ranked: Vec<crate::volume_leaderboard::RankedContract> = ranked_all[..ranked_all
-                .len()
-                .min(tickvault_common::constants::TOP_VOLUME_PERSIST_PER_FAMILY)]
-                .to_vec();
+            // Copy the complete board once. The immutable RAM snapshot and
+            // persistence share these rows; an empty board explicitly replaces
+            // the preceding result instead of leaving an old leader visible.
+            let ts_nanos =
+                crate::top_volume_snapshot::floor_to_grid(now_ist_nanos, cadence.interval_secs());
+            let snapshot = std::sync::Arc::new(crate::top_volume_runtime::TopVolumeSnapshot {
+                family,
+                cadence,
+                ts_nanos,
+                rows: ranked_all.to_vec(),
+            });
+            if !crate::top_volume_runtime::global_top_volume_runtime()
+                .publish_snapshot(std::sync::Arc::clone(&snapshot))
+            {
+                error!(
+                    source = "top_volume_runtime_publication_refused",
+                    ?family,
+                    ?cadence,
+                    ts_nanos,
+                    "refusing an invalid or older RAM snapshot; retaining consumed rows for persistence and steering"
+                );
+                refused += 1;
+            }
+            let ranked = snapshot.rows.as_slice();
 
-            if let Some((gainers, tally)) = steering {
+            if let Some(selection) = steering {
+                let tally = selection.tally;
                 crate::volume_leaderboard::record_gainer_tally(tally);
                 // Every verdict Unknown while the board is non-empty means the
                 // gainer filter has NO inputs — no spot or no previous close
@@ -1575,20 +1717,18 @@ impl LiveIngest {
                 // taken from the first 250, a held contract is kept while it
                 // stays inside the list — the hysteresis band the 2026-09-07
                 // lock names as the remedy for a churning board.
-                crate::depth20_ranked_steer::global_depth20_candidates()
-                    .publish(crate::depth200_candidates::candidates_from_ranked(&gainers));
+                crate::depth20_ranked_steer::global_depth20_candidates().publish(
+                    crate::depth200_candidates::candidates_from_ranked(&selection.contracts),
+                );
                 // The distinct-underlying pass is depth-200's rule only. The
                 // list runs to `DEPTH200_EXIT_UNDERLYINGS`, not the socket
                 // budget: the first five are the entry set, the rest is the
                 // hysteresis band that keeps a held contract from being
                 // swapped out on a single window in which it slipped to
                 // sixth.
-                let picked = crate::volume_leaderboard::distinct_underlying_over(
-                    &gainers,
-                    crate::depth200_candidates::DEPTH200_EXIT_UNDERLYINGS,
+                crate::depth200_candidates::global_depth200_candidates().publish(
+                    crate::depth200_candidates::candidates_from_ranked(&selection.underlyings),
                 );
-                crate::depth200_candidates::global_depth200_candidates()
-                    .publish(crate::depth200_candidates::candidates_from_ranked(&picked));
             }
 
             if ranked.is_empty() {
@@ -1612,7 +1752,7 @@ impl LiveIngest {
                 now_ist_nanos,
                 cadence,
                 family,
-                &ranked,
+                ranked,
                 |underlying_id| {
                     // The UNDERLYING's move, from the SAME two RAM stores the
                     // gainer verdict reads a few lines above -- so the column
@@ -1928,6 +2068,13 @@ impl LiveIngest {
                 }),
             gainer_all_unknown_reported: false,
             leaderboard: crate::volume_leaderboard::VolumeLeaderboard::new(),
+            candle_ranking: crate::candle_volume_bridge::CandleVolumeBridge::default(),
+            #[cfg(test)]
+            candle_ranking_runtime_for_test: CandleRankingRuntimeHandle::Isolated(
+                std::sync::Arc::new(crate::bucket_top_volume::BucketTopVolumeRuntime::new()),
+            ),
+            #[cfg(test)]
+            candle_publication_secs_for_test: None,
             replaying_wal: false,
             top_volume: None,
         }
@@ -2786,30 +2933,20 @@ impl LiveIngest {
         let mut rescued = 0u64;
         let mut skipped = 0u64;
         let sender = tickvault_storage::seal_writer_runner::global_seal_sender();
-        let stats: ConsumeStats = self.aggregator.consume_tick(
+        let mut volume_updates = crate::candle_volume_bridge::CandleUpdateBatch::new();
+        let mut volume_update_overflow = false;
+        let candle_metadata = self
+            .candle_ranking
+            .metadata(tick.security_id, tick.exchange_segment_code);
+        let stats: ConsumeStats = self.aggregator.consume_tick_with_context(
             Feed::Dhan,
             tick,
             None,
+            candle_metadata,
             |feed, security_id, segment_code, tf, state| {
-                // Emit rows ONLY for the thirteen timeframes the operator
-                // asked for (Quote 13, 2026-08-08). The enum carries 24, so
-                // eleven second-scale frames — S2 S3 S4 S6 S7 S8 S9 S11 S12
-                // S13 S14 — were writing a row per bucket for nobody.
-                //
-                // Counted into its OWN bucket, never into `dropped`: that
-                // counter means data we wanted and lost, and conflating
-                // "never asked for it" with "lost it" would make every drop
-                // alarm permanently noisy while hiding real losses in the
-                // noise. It is counted rather than silently returned because
-                // `test_seal_open_buckets_at_close_accounts_every_bar_it_produces`
-                // pins that no bar escapes accounting on ANY side — a bare
-                // `return` here made bars vanish from the ledger entirely,
-                // and that test caught it.
-                //
-                // The fold still computes all 24 slots. Only emission is
-                // gated, so ordinals, the `[_; TF_COUNT]` arrays and the
-                // audit-table `timeframe` symbols are all untouched.
-                // Pinned by `tf_index::tests::tf_index_operator_set_is_twelve`.
+                // Every active candle timeframe is operator-requested. Keep the
+                // policy check and explicit skipped accounting so a future
+                // policy change cannot silently remove seals from the ledger.
                 if !tf.is_operator_requested() {
                     skipped = skipped.saturating_add(1);
                     return;
@@ -2843,7 +2980,22 @@ impl LiveIngest {
                     emitted = emitted.saturating_add(1);
                 }
             },
+            |update| {
+                // This bounded batch belongs only to ranking. Every candle
+                // frame was already folded and its seal callback handled above.
+                if !update.tf.is_top_volume() {
+                    return;
+                }
+                if volume_updates.try_push(update).is_err() {
+                    volume_update_overflow = true;
+                }
+            },
         );
+        if volume_update_overflow {
+            let runtime = self.candle_ranking_runtime();
+            self.candle_ranking
+                .invalidate(&runtime, "update_batch_capacity");
+        }
         self.seals_emitted = self.seals_emitted.saturating_add(emitted);
         self.seals_dropped = self.seals_dropped.saturating_add(dropped);
         self.seals_rescued = self.seals_rescued.saturating_add(rescued);
@@ -3043,6 +3195,9 @@ impl LiveIngest {
 
         // `append_tick_with_seq`, never `append_tick` — the single-source rule.
         if self.writer.append_tick_with_seq(tick, capture_seq).is_err() {
+            let runtime = self.candle_ranking_runtime();
+            self.candle_ranking
+                .invalidate(&runtime, "tick_writer_refusal");
             // No log here since 2026-09-01: `append_tick_with_seq` now emits
             // the coded ERROR itself (with `feed`, `source` and the failure
             // text) AND increments the ALARMED `tv_ticks_dropped_total`. The
@@ -3058,6 +3213,21 @@ impl LiveIngest {
         // while every metric reports success.
         self.pending_rows = self.pending_rows.saturating_add(1);
         counters().ingest_ticks.increment(1);
+        // Even a price-sentinel tick can produce a qualified canonical
+        // invalidation (for example a counter regression). Apply those state
+        // publications after tick admission, before returning its fold status.
+        for update in volume_updates {
+            self.candle_ranking.apply(update);
+        }
+        let ranking_runtime = self.candle_ranking_runtime();
+        if self.candle_ranking.require_current_metadata(
+            crate::contract_underlying_map::global_contract_underlying_map(),
+            &ranking_runtime,
+        ) {
+            let publication_now = self.candle_publication_now();
+            self.candle_ranking
+                .publish_winners(publication_now, &ranking_runtime);
+        }
         if candle_only_refusal {
             // Counted under the SAME `out_of_session` reason as before, so the
             // existing 30s delta report and any dashboard built on it keep
@@ -3126,7 +3296,6 @@ impl LiveIngest {
         // here means the two can never disagree about what "this tick counts"
         // means.
         self.record_prev_close_from_tick(tick);
-        self.observe_for_ranking(tick);
         IngestOutcome::Folded {
             sealed: stats.sealed_count,
             amended: stats.amended_count,
@@ -3259,6 +3428,9 @@ impl LiveIngest {
     /// contract. Nothing errors; the board is simply wrong all day.
     pub fn reset_ranking_daily(&mut self) {
         self.leaderboard.reset_daily();
+        crate::top_volume_runtime::global_top_volume_runtime().reset_daily();
+        let runtime = self.candle_ranking_runtime();
+        self.candle_ranking.reset(&runtime);
         self.prev_close.reset_daily();
         // The spot store rides the SAME reset, and joining it here rather than
         // adding a second rollover site is the point: one place decides what a
@@ -3274,6 +3446,7 @@ impl LiveIngest {
         self.spot_prices.reset_daily();
     }
 
+    #[cfg(test)]
     fn observe_for_ranking(&mut self, tick: &ParsedTick) {
         // A replayed frame is not "now". See the `replaying_wal` field: feeding
         // it here re-latches the gate to a stale cumulative and the next live
@@ -3364,28 +3537,12 @@ impl LiveIngest {
         let mut rescued = 0u64;
         let mut skipped = 0u64;
         let sender = tickvault_storage::seal_writer_runner::global_seal_sender();
-        let bars = self
-            .aggregator
-            .force_seal_all(|feed, security_id, segment_code, tf, state| {
-                // Emit rows ONLY for the thirteen timeframes the operator
-                // asked for (Quote 13, 2026-08-08). The enum carries 24, so
-                // eleven second-scale frames — S2 S3 S4 S6 S7 S8 S9 S11 S12
-                // S13 S14 — were writing a row per bucket for nobody.
-                //
-                // Counted into its OWN bucket, never into `dropped`: that
-                // counter means data we wanted and lost, and conflating
-                // "never asked for it" with "lost it" would make every drop
-                // alarm permanently noisy while hiding real losses in the
-                // noise. It is counted rather than silently returned because
-                // `test_seal_open_buckets_at_close_accounts_every_bar_it_produces`
-                // pins that no bar escapes accounting on ANY side — a bare
-                // `return` here made bars vanish from the ledger entirely,
-                // and that test caught it.
-                //
-                // The fold still computes all 24 slots. Only emission is
-                // gated, so ordinals, the `[_; TF_COUNT]` arrays and the
-                // audit-table `timeframe` symbols are all untouched.
-                // Pinned by `tf_index::tests::tf_index_operator_set_is_twelve`.
+        let candle_ranking = &mut self.candle_ranking;
+        let bars = self.aggregator.force_seal_all_with_volume_updates(
+            |feed, security_id, segment_code, tf, state| {
+                // Every active candle timeframe is operator-requested. Keep the
+                // policy check and explicit skipped accounting so a future
+                // policy change cannot silently remove seals from the ledger.
                 if !tf.is_operator_requested() {
                     skipped = skipped.saturating_add(1);
                     return;
@@ -3419,10 +3576,25 @@ impl LiveIngest {
                 } else {
                     emitted = emitted.saturating_add(1);
                 }
-            });
+            },
+            |update| candle_ranking.apply(update),
+        );
+        let ranking_runtime = self.candle_ranking_runtime();
+        if self.candle_ranking.require_current_metadata(
+            crate::contract_underlying_map::global_contract_underlying_map(),
+            &ranking_runtime,
+        ) {
+            self.candle_ranking.publish_winners(
+                u32::try_from(now_ist_nanos().div_euclid(1_000_000_000)).unwrap_or(0),
+                &ranking_runtime,
+            );
+        }
         debug_assert_eq!(
             bars as u64,
-            emitted.saturating_add(dropped).saturating_add(skipped),
+            emitted
+                .saturating_add(dropped)
+                .saturating_add(rescued)
+                .saturating_add(skipped),
             "every bar force_seal_all produced must be accounted as emitted, \
              dropped, or skipped-as-unrequested"
         );
@@ -3752,6 +3924,16 @@ impl LiveIngest {
             .aggregator
             .watermark_secs()
             .saturating_sub(CATCHUP_LATENESS_MARGIN_SECS);
+        self.catch_up_seal_through(cutoff)
+    }
+
+    /// Close local observation windows through an explicitly admitted cutoff.
+    /// Ordinary catch-up supplies the source watermark minus the lateness
+    /// margin; the regular close controller supplies the capture-window end.
+    /// Neither path advances an instrument's observation clock or claims that
+    /// the provider delivered every earlier event. Retained amendments remain
+    /// possible after local window closure.
+    fn catch_up_seal_through(&mut self, cutoff: u32) -> (u64, u64) {
         if cutoff == 0 {
             return (0, 0);
         }
@@ -3760,28 +3942,13 @@ impl LiveIngest {
         let mut rescued = 0u64;
         let mut skipped = 0u64;
         let sender = tickvault_storage::seal_writer_runner::global_seal_sender();
-        let bars = self.aggregator.catch_up_seal_all(
+        let candle_ranking = &mut self.candle_ranking;
+        let bars = self.aggregator.catch_up_seal_all_with_volume_updates(
             cutoff,
             |feed, security_id, segment_code, tf, state| {
-                // Emit rows ONLY for the thirteen timeframes the operator
-                // asked for (Quote 13, 2026-08-08). The enum carries 24, so
-                // eleven second-scale frames — S2 S3 S4 S6 S7 S8 S9 S11 S12
-                // S13 S14 — were writing a row per bucket for nobody.
-                //
-                // Counted into its OWN bucket, never into `dropped`: that
-                // counter means data we wanted and lost, and conflating
-                // "never asked for it" with "lost it" would make every drop
-                // alarm permanently noisy while hiding real losses in the
-                // noise. It is counted rather than silently returned because
-                // `test_seal_open_buckets_at_close_accounts_every_bar_it_produces`
-                // pins that no bar escapes accounting on ANY side — a bare
-                // `return` here made bars vanish from the ledger entirely,
-                // and that test caught it.
-                //
-                // The fold still computes all 24 slots. Only emission is
-                // gated, so ordinals, the `[_; TF_COUNT]` arrays and the
-                // audit-table `timeframe` symbols are all untouched.
-                // Pinned by `tf_index::tests::tf_index_operator_set_is_twelve`.
+                // Every active candle timeframe is operator-requested. Keep the
+                // policy check and explicit skipped accounting so a future
+                // policy change cannot silently remove seals from the ledger.
                 if !tf.is_operator_requested() {
                     skipped = skipped.saturating_add(1);
                     return;
@@ -3812,10 +3979,23 @@ impl LiveIngest {
                     emitted = emitted.saturating_add(1);
                 }
             },
+            |update| candle_ranking.apply(update),
         );
+        let ranking_runtime = self.candle_ranking_runtime();
+        let publication_now = self.candle_publication_now();
+        if self.candle_ranking.require_current_metadata(
+            crate::contract_underlying_map::global_contract_underlying_map(),
+            &ranking_runtime,
+        ) {
+            self.candle_ranking
+                .publish_winners(publication_now, &ranking_runtime);
+        }
         debug_assert_eq!(
             bars as u64,
-            emitted.saturating_add(dropped),
+            emitted
+                .saturating_add(dropped)
+                .saturating_add(rescued)
+                .saturating_add(skipped),
             "every bar catch_up_seal_all produced must be accounted as emitted or dropped"
         );
         self.seals_emitted = self.seals_emitted.saturating_add(emitted);
@@ -4260,9 +4440,9 @@ pub const FLUSH_COUNTER: &str = "tv_dhan_feed_flush_total";
 ///
 /// Sized for a burst, not a backlog: at the ~5,000 frames/sec envelope this is
 /// roughly thirteen seconds of head-room, which covers a GC-style stall in the
-/// fold without letting an unbounded queue eat the heap. A full ring is a lag
-/// signal, never capture loss — the frame is already durable in the WAL by the
-/// time `try_send` is attempted (`WalRingSink`).
+/// fold without letting an unbounded queue eat the heap. A full ring signals
+/// lag and requires replay. WAL queue admission precedes `try_send`, but a
+/// completed durable write is not acknowledged at that boundary.
 pub const FRAME_RING_CAPACITY: usize = 65_536;
 
 /// Frame-ring share denominator. Sixteenths.
@@ -5149,6 +5329,35 @@ const CATCHUP_SEAL_INTERVAL: std::time::Duration =
 /// receipt-clock spread before anyone touches this constant.
 const CATCHUP_LATENESS_MARGIN_SECS: u32 = 2;
 
+/// Admit a close of the local regular observation window after captured work.
+/// Both captured-frame and seed queues must have been observed empty, and the
+/// aggregator must belong to this wall-clock session. This does not stop late
+/// admission or certify upstream delivery: retained corrections remain valid,
+/// and the separate arrival-clock persistence grace is unchanged.
+/// `completed_day` is cleared when later main-feed or seed work is consumed,
+/// even if that work cannot advance the source watermark. An unchanged book
+/// therefore avoids repeated population sweeps without stranding late buckets.
+fn regular_capture_close_cutoff(
+    now_secs: u32,
+    watermark_secs: u32,
+    completed_day: Option<u32>,
+    queues_drained: bool,
+) -> Option<u32> {
+    use tickvault_trading::candles::regular_observation_window_end;
+    let day = now_secs / 86_400;
+    if !queues_drained
+        || watermark_secs == 0
+        || watermark_secs > now_secs
+        || watermark_secs / 86_400 != day
+        || completed_day == Some(day)
+    {
+        return None;
+    }
+    let cutoff = regular_observation_window_end(now_secs)?;
+    let close_after = cutoff.checked_add(CATCHUP_LATENESS_MARGIN_SECS)?;
+    (now_secs >= close_after).then_some(cutoff)
+}
+
 /// How often the lane asks the gap detector what it has recorded.
 ///
 /// 30s matches [`DEFAULT_SILENCE_FLOOR_MILLIS`] — scanning faster cannot
@@ -5453,6 +5662,66 @@ fn flush_depth(depth: Option<&mut DepthIngest>) {
     }
 }
 
+/// Prefer captured frames for a bounded quantum, then poll every maintenance
+/// source once before admitting another quantum. If frames are absent, the
+/// first ready maintenance source also starts a pass: a busy seed queue must
+/// not hide lower-priority timers while the frame budget remains unused.
+/// Frames that arrive during that pass retain their remaining quantum. This
+/// bounds scheduling by work items, not elapsed time: frame parsing and
+/// maintenance still have their own costs.
+const DRAIN_FRAME_QUANTUM: usize = 64;
+
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum DrainMaintenance {
+    Flush,
+    CatchUp,
+    Seed,
+    Snapshot1s,
+    Snapshot3s,
+    Snapshot5s,
+    Snapshot1m,
+    Silence,
+}
+
+struct DrainFairness {
+    frames_left: usize,
+    serviced: u8,
+}
+
+impl DrainFairness {
+    const fn new() -> Self {
+        Self {
+            frames_left: DRAIN_FRAME_QUANTUM,
+            serviced: 0,
+        }
+    }
+
+    const fn allows_frame(&self) -> bool {
+        self.frames_left > 0
+    }
+
+    const fn allows_maintenance(&self, arm: DrainMaintenance) -> bool {
+        self.serviced & (1 << arm as u8) == 0
+    }
+
+    const fn maintenance_pass_started(&self) -> bool {
+        !self.allows_frame() || self.serviced != 0
+    }
+
+    fn frame_taken(&mut self) {
+        self.frames_left -= 1;
+    }
+
+    fn maintenance_taken(&mut self, arm: DrainMaintenance) {
+        self.serviced |= 1 << arm as u8;
+    }
+
+    fn next_quantum(&mut self) {
+        *self = Self::new();
+    }
+}
+
 async fn run_frame_drain(
     mut rx: tokio::sync::mpsc::Receiver<CapturedFrame>,
     mut ingest: LiveIngest,
@@ -5666,14 +5935,31 @@ async fn run_frame_drain(
     // invites the symmetric edit. Latch the arm shut instead of relying on
     // that.
     let mut seed_closed = false;
+    let mut shutting_down = false;
+    let mut completed_capture_close_day: Option<u32> = None;
+    let mut fairness = DrainFairness::new();
+    #[cfg(test)]
+    let mut maintenance_first_seen: [Option<u64>; 8] = [None; 8];
+    #[cfg(test)]
+    let mut maintenance_under_backlog_runs = [0_u64; 8];
 
     loop {
         tokio::select! {
-            // Biased so frames always win a tie: the flush timer firing while
-            // frames are queued must not preempt draining them.
+            // Bounded frame preference: every ready maintenance source gets
+            // one turn after at most DRAIN_FRAME_QUANTUM captured frames.
             biased;
-            maybe_frame = rx.recv() => {
+            () = shutdown.notified(), if !shutting_down => {
+                // Closing admissions retains queued frames and existing
+                // permits. Drain this finite tail, then use the common seal
+                // and flush path below. A busy sender cannot defer shutdown
+                // forever or make us abandon an already queued frame.
+                shutting_down = true;
+                rx.close();
+                info!("Dhan live feed: shutdown signalled — draining the captured tail");
+            }
+            maybe_frame = rx.recv(), if fairness.allows_frame() => {
                 let Some(frame) = maybe_frame else { break };
+                fairness.frame_taken();
                 // The lane is UP the moment a frame actually arrives, and not
                 // one instant sooner (plan Item 7). Raised once per drain, from
                 // the only place in the process that has proof a socket both
@@ -5762,6 +6048,10 @@ async fn run_frame_drain(
                 // would be counted "unparseable" and silently lost.
                 match frame.endpoint {
                     DhanEndpointType::MainFeed => {
+                        // A late captured frame may open a NEW final bucket
+                        // without advancing the cross-instrument watermark.
+                        // Rearm in constant work; only maintenance may sweep.
+                        completed_capture_close_day = None;
                         let outcome = drain_main_feed_frame(
                             &mut ingest, &frame, received_at_nanos, recv_millis, c,
                         );
@@ -5802,10 +6092,14 @@ async fn run_frame_drain(
                             // The ingest-shed gate, read here rather than
                             // inside `drain_depth_frame`, so a shed frame
                             // costs one relaxed atomic load and NOT a parse.
-                            // The frame is already durable in the WAL by this
-                            // point — shedding drops the DATABASE write, never
-                            // the capture.
+                            // WAL submission precedes this point, but its
+                            // asynchronous write/sync may still be pending.
+                            // Keep the recovery marker when skipping depth.
                             Some(_) if !INGEST_SHED.allows_dedicated_depth() => {
+                                // A later depth ACK must not hide this skipped
+                                // frame from replay after a restart.
+                                tickvault_storage::wal_applied_watermark::applied_watermark()
+                                    .note_unapplied(frame.seq);
                                 c.shed_dedicated_depth.increment(1);
                             }
                             Some(depth) => {
@@ -5952,63 +6246,18 @@ async fn run_frame_drain(
                     publish_fold_depth(&ingest);
                 }
             }
-            // SHUTDOWN (added 2026-08-14). Deliberately placed BELOW the frame
-            // arm in this `biased` select, and that ordering is load-bearing:
-            // a shutdown signal must not preempt frames already sitting in the
-            // ring. Placed above, the permit wins the very first poll and the
-            // drain exits abandoning queued work — which is a different way of
-            // losing the tail than the bug this arm exists to fix. The test
-            // `test_drain_exits_on_shutdown_signal_with_the_ring_still_open`
-            // caught exactly that during development, which is why it asserts
-            // the queued frame was FOLDED and not merely that the drain ended.
-            //
-            // Before this arm existed the drain
-            // could only end when the ring closed, and nothing closed it: the
-            // lane's handle was bound to `_dhan_feed_stack_monitor` and the
-            // shutdown path's Dhan steps had been "deleted with the lane" in
-            // 2026-07-13 — then the lane came back and the teardown did not.
-            //
-            // The consequence was silent and daily. At the 17:30 stop, SIGTERM
-            // ran the process teardown, `main` returned `Ok(())`, and the log
-            // printed "tickvault stopped" and classified the shutdown clean —
-            // while every ILP row still under FLUSH_ROW_THRESHOLD and every
-            // open candle in the aggregator went with the process. There was
-            // no metric whose value differed between a day that flushed and a
-            // day that did not.
-            //
-            // `Notify::notify_one` is permit-based, so a signal that arrives
-            // while this task is inside another arm is retained rather than
-            // lost — the lost-wake hazard that makes `notify_waiters` the
-            // wrong primitive here (audit-findings Rule 16).
-            () = shutdown.notified() => {
-                info!("Dhan live feed: shutdown signalled — sealing and flushing before exit");
-                // Seal whatever the aggregator still holds, THEN flush, in
-                // that order: sealing produces rows, so flushing first would
-                // leave exactly the rows sealing just created.
-                let (emitted, dropped) = ingest.catch_up_seal();
-                flush_and_record(&mut ingest, &feed_health);
-                flush_depth(ingest.depth_sink());
-                if dropped > 0 {
-                    error!(
-                        code = ErrorCode::WsGapConnectionState.code_str(),
-                        emitted,
-                        dropped,
-                        "Dhan live feed: candles were DROPPED during the shutdown seal — the \
-                         seal ring could not take them and they are lost with the process"
-                    );
-                } else {
-                    info!(
-                        emitted,
-                        "Dhan live feed: shutdown seal + flush complete — the day's tail is \
-                         persisted"
-                    );
-                }
-                break;
-            }
             // TIME trigger. Without it, the last rows of a thinly-traded
             // instrument sit unflushed below the size threshold waiting for a
             // next tick which, at the close, never comes.
-            _ = flush_timer.tick() => {
+            _ = flush_timer.tick(), if fairness.allows_maintenance(DrainMaintenance::Flush) => {
+                fairness.maintenance_taken(DrainMaintenance::Flush);
+                #[cfg(test)]
+                {
+                    maintenance_first_seen[DrainMaintenance::Flush as usize].get_or_insert(seen);
+                    if !rx.is_empty() || !seed_rx.is_empty() {
+                        maintenance_under_backlog_runs[DrainMaintenance::Flush as usize] += 1;
+                    }
+                }
                 flush_and_record(&mut ingest, &feed_health);
                 flush_depth(ingest.depth_sink());
                 publish_fold_depth(&ingest);
@@ -6017,7 +6266,15 @@ async fn run_frame_drain(
             // in source order but with no `biased` dependency between them —
             // they touch disjoint state (aggregator vs detector) and neither
             // starves the other, because both are timers, not a queue.
-            _ = catchup_timer.tick() => {
+            _ = catchup_timer.tick(), if fairness.allows_maintenance(DrainMaintenance::CatchUp) => {
+                fairness.maintenance_taken(DrainMaintenance::CatchUp);
+                #[cfg(test)]
+                {
+                    maintenance_first_seen[DrainMaintenance::CatchUp as usize].get_or_insert(seen);
+                    if !rx.is_empty() || !seed_rx.is_empty() {
+                        maintenance_under_backlog_runs[DrainMaintenance::CatchUp as usize] += 1;
+                    }
+                }
                 let (emitted, dropped) = ingest.catch_up_seal();
                 if emitted > 0 || dropped > 0 {
                     publish_fold_depth(&ingest);
@@ -6047,8 +6304,17 @@ async fn run_frame_drain(
             // detector that learned instruments from arriving ticks could
             // never report the one failure that matters here — an instrument
             // that arrives never.
-            maybe_seed = seed_rx.recv(), if !seed_closed => {
+            maybe_seed = seed_rx.recv(), if !seed_closed && fairness.allows_maintenance(DrainMaintenance::Seed) => {
+                fairness.maintenance_taken(DrainMaintenance::Seed);
+                #[cfg(test)]
+                {
+                    maintenance_first_seen[DrainMaintenance::Seed as usize].get_or_insert(seen);
+                    if !rx.is_empty() || !seed_rx.is_empty() {
+                        maintenance_under_backlog_runs[DrainMaintenance::Seed as usize] += 1;
+                    }
+                }
                 if let Some(batch) = maybe_seed {
+                    completed_capture_close_day = None;
                     let now_millis = u64::try_from(
                         chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0).max(0) / 1_000_000,
                     )
@@ -6058,6 +6324,7 @@ async fn run_frame_drain(
                     // successful no-op. So this counts accepted, and a value
                     // below `requested` means slots ran out.
                     let mut added = 0usize;
+                    ingest.prepare_candle_ranking(now_ist_nanos());
                     for inst in &batch {
                         if ingest.seed(inst.security_id, inst.segment, now_millis) {
                             added = added.saturating_add(1);
@@ -6079,17 +6346,51 @@ async fn run_frame_drain(
                     seed_closed = true;
                 }
             }
-            // The snapshot arms sit AFTER the frame arm's `biased` priority, so
-            // a snapshot can never preempt draining queued frames. They touch
-            // the leaderboard and the aggregator read-only-ish and cannot
-            // starve each other: all four are timers, not queues.
+            // Snapshot timers participate in the bounded maintenance turn.
+            // Each due cadence is serviced once before another frame quantum;
+            // a persistently full ring cannot hide the ranking publication.
             //
             // One arm per cadence, because `tokio::select!` is a macro over
             // literal arms and cannot be driven from `SnapshotCadence::ALL`.
             // `every_snapshot_cadence_has_a_timer_arm_in_the_drain` is what
             // makes that safe: it reads THIS source and requires an arm named
             // for every cadence the enum lists.
-            _ = snapshot_1s_timer.tick() => {
+            _ = snapshot_1s_timer.tick(), if fairness.allows_maintenance(DrainMaintenance::Snapshot1s) => {
+                fairness.maintenance_taken(DrainMaintenance::Snapshot1s);
+                #[cfg(test)]
+                {
+                    maintenance_first_seen[DrainMaintenance::Snapshot1s as usize].get_or_insert(seen);
+                    if !rx.is_empty() || !seed_rx.is_empty() {
+                        maintenance_under_backlog_runs[DrainMaintenance::Snapshot1s as usize] += 1;
+                    }
+                }
+                // The final daily/long-frame tail needs a local timer: no
+                // later source event is guaranteed to advance its watermark.
+                // This closes a revisionable observation window, never a
+                // source-data freshness or every-event completeness claim.
+                if let Ok(now_secs) =
+                    u32::try_from(now_ist_nanos().div_euclid(1_000_000_000))
+                    && let Some(cutoff) = regular_capture_close_cutoff(
+                        now_secs,
+                        ingest.aggregator.watermark_secs(),
+                        completed_capture_close_day,
+                        rx.is_empty() && seed_rx.is_empty(),
+                    )
+                {
+                    let (emitted, dropped) = ingest.catch_up_seal_through(cutoff);
+                    completed_capture_close_day = Some(cutoff / 86_400);
+                    if emitted > 0 || dropped > 0 {
+                        publish_fold_depth(&ingest);
+                    }
+                    if dropped > 0 {
+                        warn!(
+                            code = ErrorCode::WsGapConnectionState.code_str(),
+                            emitted,
+                            dropped,
+                            "regular capture close lost computed candles after rescue refusal"
+                        );
+                    }
+                }
                 let cadence =
                     tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond;
                 let (rows, refused) = ingest.snapshot_top_volume(now_ist_nanos(), cadence);
@@ -6098,7 +6399,15 @@ async fn run_frame_drain(
                 }
                 snapshot_refused = snapshot_refused.saturating_add(refused as u64);
             }
-            _ = snapshot_3s_timer.tick() => {
+            _ = snapshot_3s_timer.tick(), if fairness.allows_maintenance(DrainMaintenance::Snapshot3s) => {
+                fairness.maintenance_taken(DrainMaintenance::Snapshot3s);
+                #[cfg(test)]
+                {
+                    maintenance_first_seen[DrainMaintenance::Snapshot3s as usize].get_or_insert(seen);
+                    if !rx.is_empty() || !seed_rx.is_empty() {
+                        maintenance_under_backlog_runs[DrainMaintenance::Snapshot3s as usize] += 1;
+                    }
+                }
                 let cadence =
                     tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ThreeSecond;
                 let (rows, refused) = ingest.snapshot_top_volume(now_ist_nanos(), cadence);
@@ -6107,7 +6416,15 @@ async fn run_frame_drain(
                 }
                 snapshot_refused = snapshot_refused.saturating_add(refused as u64);
             }
-            _ = snapshot_5s_timer.tick() => {
+            _ = snapshot_5s_timer.tick(), if fairness.allows_maintenance(DrainMaintenance::Snapshot5s) => {
+                fairness.maintenance_taken(DrainMaintenance::Snapshot5s);
+                #[cfg(test)]
+                {
+                    maintenance_first_seen[DrainMaintenance::Snapshot5s as usize].get_or_insert(seen);
+                    if !rx.is_empty() || !seed_rx.is_empty() {
+                        maintenance_under_backlog_runs[DrainMaintenance::Snapshot5s as usize] += 1;
+                    }
+                }
                 let cadence =
                     tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond;
                 let (rows, refused) = ingest.snapshot_top_volume(now_ist_nanos(), cadence);
@@ -6116,7 +6433,15 @@ async fn run_frame_drain(
                 }
                 snapshot_refused = snapshot_refused.saturating_add(refused as u64);
             }
-            _ = snapshot_1m_timer.tick() => {
+            _ = snapshot_1m_timer.tick(), if fairness.allows_maintenance(DrainMaintenance::Snapshot1m) => {
+                fairness.maintenance_taken(DrainMaintenance::Snapshot1m);
+                #[cfg(test)]
+                {
+                    maintenance_first_seen[DrainMaintenance::Snapshot1m as usize].get_or_insert(seen);
+                    if !rx.is_empty() || !seed_rx.is_empty() {
+                        maintenance_under_backlog_runs[DrainMaintenance::Snapshot1m as usize] += 1;
+                    }
+                }
                 let cadence =
                     tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneMinute;
                 let (rows, refused) = ingest.snapshot_top_volume(now_ist_nanos(), cadence);
@@ -6125,7 +6450,15 @@ async fn run_frame_drain(
                 }
                 snapshot_refused = snapshot_refused.saturating_add(refused as u64);
             }
-            _ = silence_timer.tick() => {
+            _ = silence_timer.tick(), if fairness.allows_maintenance(DrainMaintenance::Silence) => {
+                fairness.maintenance_taken(DrainMaintenance::Silence);
+                #[cfg(test)]
+                {
+                    maintenance_first_seen[DrainMaintenance::Silence as usize].get_or_insert(seen);
+                    if !rx.is_empty() || !seed_rx.is_empty() {
+                        maintenance_under_backlog_runs[DrainMaintenance::Silence as usize] += 1;
+                    }
+                }
                 // Re-anchor the four snapshot timers against the wall clock.
                 //
                 // Beside `refresh_receipt_anchor()` below and for the same
@@ -6186,7 +6519,7 @@ async fn run_frame_drain(
                     info!(
                         rows_by_cadence = %by_cadence,
                         refused = snapshot_refused,
-                        "top-volume snapshots written in the last 30s"
+                        "canonical top-volume RAM rows materialized in the last 30s"
                     );
                     snapshot_rows = [0; crate::volume_leaderboard::WINDOW_COUNT];
                     snapshot_refused = 0;
@@ -6623,10 +6956,18 @@ async fn run_frame_drain(
                     }
                 }
             }
+            // Once a maintenance pass starts, let each ready source run once
+            // before resetting it. This also covers a pass started while the
+            // frame queue is empty and the frame quantum is only partly used.
+            // The fallback is disabled in a fresh idle turn, so no ready work
+            // means parking on the channels/timers rather than busy-looping.
+            () = std::future::ready(()), if fairness.maintenance_pass_started() => {
+                fairness.next_quantum();
+            }
         }
     }
 
-    // Every sender was dropped, so no socket is left.
+    // All admitted frames drained: senders closed or shutdown closed admission.
     //
     // ORDER MATTERS, and it is the reverse of the obvious one. Seal FIRST,
     // flush SECOND. A bucket closes only when a later tick crosses its
@@ -6638,7 +6979,26 @@ async fn run_frame_drain(
     // Skipping this step entirely is what the code did until 2026-08-11: one
     // bar per instrument per timeframe, discarded every single day, with no
     // counter moving and no log line. See `seal_open_buckets_at_close`.
-    let (close_emitted, close_dropped) = ingest.seal_open_buckets_at_close();
+    // The last consumed main-feed frame may have rearmed closure after the
+    // final timer tick. Apply the same clock/session/queue gates before the
+    // administrative flush, which cannot certify a still-partial window.
+    // A pending seed batch conservatively refuses this qualification; closing
+    // frame admission does not establish that the seed queue was consumed.
+    let (window_emitted, window_dropped) = if let Ok(now_secs) =
+        u32::try_from(now_ist_nanos().div_euclid(1_000_000_000))
+        && let Some(cutoff) = regular_capture_close_cutoff(
+            now_secs,
+            ingest.aggregator.watermark_secs(),
+            completed_capture_close_day,
+            rx.is_empty() && seed_rx.is_empty(),
+        ) {
+        ingest.catch_up_seal_through(cutoff)
+    } else {
+        (0, 0)
+    };
+    let (partial_emitted, partial_dropped) = ingest.seal_open_buckets_at_close();
+    let close_emitted = window_emitted.saturating_add(partial_emitted);
+    let close_dropped = window_dropped.saturating_add(partial_dropped);
 
     // Flush what is still buffered — the tail of the session is exactly the
     // data a naive shutdown loses.
@@ -6747,6 +7107,10 @@ async fn run_frame_drain(
         depth_refused,
         depth_dropped,
         unparseable,
+        #[cfg(test)]
+        maintenance_first_seen,
+        #[cfg(test)]
+        maintenance_under_backlog_runs,
     }
 }
 
@@ -6775,15 +7139,14 @@ pub const FLUSH_ROW_THRESHOLD: u64 = 1_000;
 ///
 /// 10,000 rows ≈ 1.6 MB per POST, and combined with the 500 ms time trigger it
 /// caps depth at ~5 flushes/second in the worst modelled case and ~2 in the
-/// expected one. The extra buffered rows are not a durability risk: every
-/// frame behind them is already in the write-ahead log, so a crash re-folds
-/// them rather than losing them.
+/// expected one. Surviving WAL records can be replayed after a crash. Records
+/// still queued or buffered by the WAL writer are not thereby guaranteed to
+/// survive; this batching threshold is not a crash-durability proof.
 pub const DEPTH_FLUSH_ROW_THRESHOLD: u64 = 10_000;
 
-/// Longest a buffered row may wait before being flushed anyway, in
-/// milliseconds. Half a second bounds how much of a thin instrument's tail can
-/// sit unflushed without making the flush rate meaningful against the size
-/// trigger.
+/// Nominal timer period for flushing buffered rows, in milliseconds.
+/// Scheduling, frame processing and persistence stalls can extend the actual
+/// wait; this constant is not a wall-clock deadline guarantee.
 pub const FLUSH_INTERVAL_MILLIS: u64 = 500;
 
 /// [`FLUSH_INTERVAL_MILLIS`] as a `Duration`.
@@ -6918,6 +7281,10 @@ pub fn drain_main_feed_frame(
                                 c,
                             ));
                     } else {
+                        // Tick persistence may advance independently. Preserve
+                        // the frame until its omitted depth is recovered too.
+                        tickvault_storage::wal_applied_watermark::applied_watermark()
+                            .note_unapplied(frame.seq);
                         c.shed_inline_depth.increment(1);
                     }
                 }
@@ -8068,6 +8435,10 @@ fn drain_depth_frame(
 /// property is that it terminates — and a drain that silently threw every
 /// frame away terminates just as promptly as one that works.
 pub struct DrainOutcome {
+    #[cfg(test)]
+    maintenance_first_seen: [Option<u64>; 8],
+    #[cfg(test)]
+    maintenance_under_backlog_runs: [u64; 8],
     /// The ingest, after the final flush.
     pub ingest: LiveIngest,
     /// Frames taken off the ring.
@@ -8807,6 +9178,15 @@ pub struct DhanFeedStackParams {
     /// `(frame_seq, received_at_nanos, endpoint, frame)` — the TVW4 endpoint
     /// is what routes a replayed depth frame to the depth drain.
     pub wal_replay_live_feed: Vec<(u64, i64, WalEndpoint, bytes::Bytes)>,
+    /// Receipt for the complete staging pass, including any other transport.
+    /// Zero means no receipt; it must never confirm another replay generation.
+    pub wal_replay_confirmation_id: u64,
+    /// Frames in the same generation that this lane cannot consume. Even
+    /// successfully refolding every live-feed frame cannot confirm these.
+    pub wal_replay_unconsumed_frames: u64,
+    /// Maintenance authority cloned from the same directory claim used by
+    /// boot replay and the capture writer. Required for an enabled lane.
+    pub wal_maintenance: Option<tickvault_storage::ws_frame_spill::WalMaintenance>,
     /// Main-feed instruments (the hardcoded index set — see
     /// [`hardcoded_index_universe`]).
     pub main_feed_instruments: Vec<SubscribeInstrument>,
@@ -9294,6 +9674,14 @@ const TOP_VOLUME_SNAPSHOT_INTERVALS: [std::time::Duration;
 /// calls adding the offset twice the single most critical rule in this
 /// repository, and the projection's own `secs_of_day_ist` is a MODULO of this
 /// value, not a conversion of it.
+/// Publication uses the current owner clock. Receipts from different sockets
+/// can arrive at the drain out of order, so one packet cannot backdate a whole
+/// board. Canonical row observation clocks are unchanged; future source data
+/// still fails the runtime's publication checks and old replay remains stale.
+fn candle_publication_clock() -> u32 {
+    u32::try_from(now_ist_nanos().div_euclid(1_000_000_000)).unwrap_or(0)
+}
+
 fn now_ist_nanos() -> i64 {
     chrono::Utc::now()
         .timestamp_nanos_opt()
@@ -11413,9 +11801,9 @@ pub struct WalRefoldOutcome {
     /// per-packet `capture_seq` is derived from `(frame_seq, packet_index)`,
     /// both of which replay reproduces exactly.
     pub depth_refolded_rows: u64,
-    /// Depth packets the replay arm REFUSED — parser rejection, unmapped
-    /// segment code, or an unrepresentable packet index. Captured, durably
-    /// written, and not in the table: real loss, counted and logged.
+    /// Depth packets the replay arm could not fully consume — parser
+    /// rejection, missing sink, partial inline rows, unmapped segment, or
+    /// unrepresentable packet index. Their originals must remain recoverable.
     pub depth_refused: u64,
     /// Inline depth rows re-appended on replay (2026-08-28).
     ///
@@ -11426,6 +11814,29 @@ pub struct WalRefoldOutcome {
     /// `capture_seq` is derived from `(frame_seq, packet_index)`, both of which
     /// replay reproduces exactly.
     pub inline_depth_rows: u64,
+}
+
+impl WalRefoldOutcome {
+    /// Semantic consumption only. Sink completion and the exact generation's
+    /// byte receipt must both be verified separately before archival.
+    #[must_use]
+    pub const fn fully_consumed(self) -> bool {
+        self.lost == 0
+            && self.unparseable == 0
+            && self.undecodable == 0
+            && self.depth_frames == 0
+            && self.depth_refused == 0
+    }
+}
+
+/// A confirmation covers a whole generation. A successfully consumed subset
+/// cannot authorize removing the originals that contain the remaining data.
+#[must_use]
+pub const fn wal_replay_consumption_complete(
+    outcome: WalRefoldOutcome,
+    unconsumed_frames: u64,
+) -> bool {
+    unconsumed_frames == 0 && outcome.fully_consumed()
 }
 /// Is this WAL frame from a DEPTH socket rather than the main feed?
 ///
@@ -11501,7 +11912,7 @@ pub const WAL_REPLAY_ACK_WAIT_SECS: u64 = 30;
 /// counted and coded; the caller then leaves the segments in `replaying/`,
 /// where the next boot's applied-watermark skips exactly the frames that did
 /// ack and replays the rest.
-fn wal_replay_acked(stage: &'static str, unlanded_before: u64) -> bool {
+fn wal_replay_acked(stage: &'static str, unlanded_before: ReplayAckFence) -> bool {
     let wm = tickvault_storage::wal_applied_watermark::applied_watermark();
 
     // A SUSPECT sink's "ok" is not a landing — refuse to confirm on it.
@@ -11525,7 +11936,7 @@ fn wal_replay_acked(stage: &'static str, unlanded_before: u64) -> bool {
     // next boot re-offers them, which is the same shape as the timeout arm
     // below and is idempotent by the DEDUP key. The failure direction is
     // "replay more", which is the only safe one.
-    if wm.is_sink_suspect() {
+    if wm.is_sink_suspect() || !wm.replay_ack_fence_valid(unlanded_before) {
         metrics::counter!(
             tickvault_storage::ws_frame_spill::WAL_REPLAY_SINK_SUSPECT_REFUSALS_COUNTER
         )
@@ -11534,16 +11945,31 @@ fn wal_replay_acked(stage: &'static str, unlanded_before: u64) -> bool {
             code = ErrorCode::WsSpill01WriterRespawn.code_str(),
             source = "replay_sink_suspect",
             stage,
-            "WAL replay: the sink is SUSPECT (QuestDB reported suspended tables), so its              write acks cannot be trusted as landings. The segments are NOT confirmed —              they stay in `replaying/` and the next boot re-offers them. Nothing is              archived unread. Clear the QuestDB suspension and restart."
+            "WAL replay: current or intervening sink failure invalidated its ACK evidence. \
+             The segments remain unconfirmed in `replaying/` for a complete recovery pass."
         );
         return false;
     }
 
-    if wm.wait_for_offload_drained(
+    if wm.wait_for_offload_drained_guarded(
         std::time::Duration::from_secs(WAL_REPLAY_ACK_WAIT_SECS),
         unlanded_before,
     ) {
         return true;
+    }
+    if !wm.replay_ack_fence_valid(unlanded_before) {
+        metrics::counter!(
+            tickvault_storage::ws_frame_spill::WAL_REPLAY_SINK_SUSPECT_REFUSALS_COUNTER
+        )
+        .increment(1);
+        error!(
+            code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+            source = "replay_sink_evidence_invalidated",
+            stage,
+            "WAL replay: sink health or durable landing failed during the ACK wait; \
+             even a later clean probe cannot authorize this generation's archive"
+        );
+        return false;
     }
     metrics::counter!(tickvault_storage::ws_frame_spill::WAL_REPLAY_ACK_WAIT_TIMEOUTS_COUNTER)
         .increment(1);
@@ -11570,7 +11996,11 @@ fn wal_replay_acked(stage: &'static str, unlanded_before: u64) -> bool {
 // TEST-EXEMPT: the three clauses are pinned separately — `wal_replay_acked` by the
 // storage tests on `wait_for_offload_drained`, the producer-empty clause by
 // `wal_applied_watermark_wiring_guard::both_lane_confirms_wait_for_the_writer_ack`.
-fn replay_rows_landed(ingest: &mut LiveIngest, stage: &'static str, unlanded_before: u64) -> bool {
+fn replay_rows_landed(
+    ingest: &mut LiveIngest,
+    stage: &'static str,
+    unlanded_before: ReplayAckFence,
+) -> bool {
     for attempt in 0..2u8 {
         if attempt > 0 {
             blocking_flush(|| ingest.flush());
@@ -11840,6 +12270,10 @@ pub fn refold_wal_frames(
         .seed_watermark_at_least(ist_day_start_secs);
 
     for (frame_seq, wal_received_at_nanos, endpoint, bytes) in frames {
+        if bytes.is_empty() {
+            out.unparseable = out.unparseable.saturating_add(1);
+            continue;
+        }
         // SIZE TRIGGER -- the bound this loop did not have, MEASURED biting on
         // 2026-09-02. The live drain flushes on `FLUSH_ROW_THRESHOLD` and
         // `DEPTH_FLUSH_ROW_THRESHOLD`; replay had NEITHER, so it appended the
@@ -11945,7 +12379,13 @@ pub fn refold_wal_frames(
                 }
                 continue;
             }
-            WalEndpoint::MainFeed | WalEndpoint::OrderUpdate => {}
+            WalEndpoint::OrderUpdate => {
+                // A live-feed transport tag does not turn an order-update
+                // endpoint into Dhan market-data bytes.
+                out.undecodable = out.undecodable.saturating_add(1);
+                continue;
+            }
+            WalEndpoint::MainFeed => {}
         }
         // A depth-socket frame in the live-feed WAL under a LEGACY record (no
         // endpoint byte): count it honestly and move on. See
@@ -12009,13 +12449,26 @@ pub fn refold_wal_frames(
                             counters(),
                         );
                         out.inline_depth_rows = out.inline_depth_rows.saturating_add(rows);
+                        if rows != (levels.len() as u64) * 2 {
+                            // The helper reports successful row appends; a
+                            // short count means some captured depth remains
+                            // unconsumed, even when its tick was accepted.
+                            out.depth_refused = out.depth_refused.saturating_add(1);
+                        }
+                    } else {
+                        out.depth_refused = out.depth_refused.saturating_add(1);
                     }
                     refold_one_tick(ingest, &tick, *frame_seq, packets, recv_millis, &mut out);
                 }
                 Ok(ParsedFrame::Tick(tick)) => {
                     refold_one_tick(ingest, &tick, *frame_seq, packets, recv_millis, &mut out);
                 }
-                Ok(_non_tick) => {
+                Ok(
+                    ParsedFrame::OiUpdate { .. }
+                    | ParsedFrame::PreviousClose { .. }
+                    | ParsedFrame::MarketStatus { .. }
+                    | ParsedFrame::Disconnect(_),
+                ) => {
                     // Open interest, previous close, disconnect, market status.
                     // Legitimate and expected in a replayed segment, and NOT
                     // loss — counted separately so `undecodable` below means
@@ -12052,7 +12505,7 @@ pub fn refold_wal_frames(
     // TVW4 (2026-09-02): the two outcomes of the depth arm, on the SAME
     // metric so one series carries the whole replay verdict. `depth_refolded`
     // counts LEVEL ROWS (what reached the table), `depth_refused` counts
-    // PACKETS the arm could not persist — real, permanent loss.
+    // PACKETS the arm could not persist; their originals remain unconfirmed.
     metrics::counter!("tv_dhan_wal_refolded_total", "outcome" => "depth_refolded")
         .increment(out.depth_refolded_rows);
     metrics::counter!("tv_dhan_wal_refolded_total", "outcome" => "depth_refused")
@@ -12063,9 +12516,9 @@ pub fn refold_wal_frames(
             source = "replay_depth_refused",
             depth_refused = out.depth_refused,
             depth_refolded_rows = out.depth_refolded_rows,
-            "WAL replay: depth packets were captured and REFUSED by the depth arm \
-             (parser rejection, unmapped segment, or an unrepresentable packet index) — \
-             their levels are permanently unrecovered, and the segment is archived either way."
+            "WAL replay: depth packets were not fully consumed (missing sink, rejected \
+             data, or partial row appends) — their original generation remains \
+             unconfirmed for recovery"
         );
     }
     if out.depth_frames > 0 {
@@ -12090,9 +12543,8 @@ pub fn refold_wal_frames(
             code = ErrorCode::WsSpill01WriterRespawn.code_str(),
             undecodable = out.undecodable,
             refolded = out.refolded,
-            "WAL replay: packets were captured and could NOT be decoded — these are \
-             permanently unrecovered, and the segment is archived either way. Until \
-             2026-08-28 this was swallowed with no counter and no log."
+            "WAL replay: captured packets could not be decoded — the original \
+             generation remains unconfirmed for recovery"
         );
     }
     if out.inline_depth_rows > 0 {
@@ -12107,7 +12559,7 @@ pub fn refold_wal_frames(
     // each catch-up round alike — reports the loss on the already-filtered
     // WS-SPILL-01 code rather than folding it into a per-caller summary that
     // a filter cannot match. `lost` is real, counted loss: a tick that was
-    // parsed and then REFUSED by the fold, with the segment archived anyway.
+    // parsed and then REFUSED by the fold. The whole generation stays unconfirmed.
     if out.lost > 0 {
         error!(
             code = ErrorCode::WsSpill01WriterRespawn.code_str(),
@@ -12117,9 +12569,8 @@ pub fn refold_wal_frames(
             undecodable = out.undecodable,
             depth_refused = out.depth_refused,
             frames = frames.len(),
-            "WAL replay LOST ticks: {} tick(s) were captured, parsed, and REFUSED by the \
-             fold — they are not in the database, and the segment is archived either way. \
-             The raw frames remain in the WAL archive and can be recovered by hand.",
+            "WAL replay: {} captured tick(s) were parsed but refused by the fold — \
+             their original generation remains unconfirmed for recovery.",
             out.lost
         );
     }
@@ -12322,6 +12773,15 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         report_unfolded_wal_frames(&params.wal_replay_live_feed, "wal_missing");
         return;
     };
+    let Some(wal_maintenance) = params.wal_maintenance else {
+        error!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            "Dhan live feed has no owned WAL maintenance handle — refusing to \
+             replay or confirm against an unclaimed directory"
+        );
+        report_unfolded_wal_frames(&params.wal_replay_live_feed, "wal_maintenance_missing");
+        return;
+    };
 
     // The client id is a credential-adjacent value the token manager owns. No
     // manager means there is no JWT to dial with — refuse rather than dial
@@ -12460,60 +12920,10 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // to end.
     let spot_prices_for_attach = std::sync::Arc::clone(ingest.spot_prices());
 
-    // The top-volume snapshot writer, split for offload BEFORE it is handed to
-    // the ingest -- so the ingest can only ever hold the producer half. The
-    // thread is spawned here rather than inside the ingest because the sink is
-    // moved into it and never comes back, and a split with nothing on the other
-    // end would rescue nothing: this table has no spill tier by design (a
-    // snapshot is a periodic SAMPLE, not a unique event), so its batches would
-    // simply be dropped and counted.
-    //
-    // A spawn failure leaves `top_volume` unset. That is the honest degrade:
-    // no snapshot rows rather than a synchronous ILP flush on the frame drain,
-    // which is the coupling that loses ticks upstream at the vendor with no
-    // sequence number and no counter that can see it.
-    {
-        let writer = tickvault_storage::top_volume_rank_persistence::TopVolumeRankWriter::new(
-            &params.questdb,
-        );
-        let (producer, mut sink, rx) = writer.split_for_offload();
-        match std::thread::Builder::new()
-            .name("tv-top-volume-writer".to_owned())
-            .spawn(move || {
-                while let Ok(mut batch) = rx.recv() {
-                    sink.write(&mut batch);
-                }
-                info!("top-volume writer thread exiting — the drain closed its queue");
-            }) {
-            Ok(handle) => {
-                // The handle is RETAINED since 2026-09-13. It used to be
-                // `Ok(_handle)` — discarded — which made this the only one of
-                // the lane's three offload writers with no shutdown accounting
-                // at all: no close, no join, no counter, no log. Up to
-                // `TOP_VOLUME_FLUSH_QUEUE_DEPTH` batches plus the one in flight
-                // died at every 17:30 stop and every mid-session redeploy, and
-                // nothing anywhere said so.
-                //
-                // §2.3n of the noise lock was written for exactly this shape on
-                // the tick and depth writers — "a thread that never got to run
-                // its drain increments neither loss series" — and the third
-                // writer simply never joined the pattern. The magnitude grew on
-                // this branch: removing the top-250 cut made a batch
-                // market-bounded rather than ≤500 rows.
-                ingest = ingest.with_top_volume_writer(producer, handle);
-                info!(
-                    "top-volume snapshots enabled — 1s, 3s, 5s and 1m rankings will be written                      off the drain"
-                );
-            }
-            Err(err) => {
-                error!(
-                    code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
-                    error = %err,
-                    "top-volume writer thread could not be spawned — NO ranking snapshots                      will be written this session. The lane and every other writer are                      unaffected; only the top_volume_rank table stays empty."
-                );
-            }
-        }
-    }
+    // Canonical Top Volume reads the same candle publications as the seal
+    // writer. Historical top_volume_<tf> views read candle tables; there is
+    // no independent gross-volume snapshot producer on the production lane.
+    ingest.prepare_candle_ranking(now_ist_nanos());
 
     // Move the blocking ILP round trip off the drain task, BEFORE any socket
     // opens. See `LiveIngest::spawn_offload_writer` for why a flush on the
@@ -12601,6 +13011,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // `capture_seq`, and the gap detector already knows every instrument, so a
     // recovered tick lands against a seeded slot rather than creating one.
     if !params.wal_replay_live_feed.is_empty() {
+        let mut boot_replay_confirmed = false;
         // ORDERING PIN -- added 2026-08-28.
         //
         // Every candle this refold seals goes through the seal closure, which
@@ -12639,7 +13050,16 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             ))
             .await;
         }
-        if !seal_writer_ready {
+        if params.wal_replay_confirmation_id == 0 {
+            error!(
+                code = ErrorCode::WsGapConnectionState.code_str(),
+                source = "refold_no_replay_receipt",
+                frames = params.wal_replay_live_feed.len(),
+                "WAL refold has no staging receipt — refusing to fold or confirm; \
+                 the staged segments remain eligible for a complete replay"
+            );
+            report_unfolded_wal_frames(&params.wal_replay_live_feed, "replay_receipt_missing");
+        } else if !seal_writer_ready {
             error!(
                 code = ErrorCode::WsGapConnectionState.code_str(),
                 source = "refold_no_seal_writer",
@@ -12652,29 +13072,28 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             );
             report_unfolded_wal_frames(&params.wal_replay_live_feed, "seal_writer_missing");
         } else {
-            let unlanded_before =
-                tickvault_storage::wal_applied_watermark::applied_watermark().unlanded_total();
+            let wm = tickvault_storage::wal_applied_watermark::applied_watermark();
+            let unlanded_before = wm.replay_ack_fence(wm.unlanded_total());
             let outcome = refold_wal_frames(&mut ingest, &params.wal_replay_live_feed);
-            if outcome.lost == 0 {
+            if wal_replay_consumption_complete(outcome, params.wal_replay_unconsumed_frames) {
                 info!(
                     frames = params.wal_replay_live_feed.len(),
                     ticks = outcome.refolded,
-                    "recovered live-feed frames from the write-ahead log and folded them — \
-                 ticks captured by a previous session are now in the database"
+                    "WAL replay consumed every frame in its generation; waiting for sink completion"
                 );
             } else {
-                // Never silently green: a frame we could not re-fold is data we
-                // captured and then failed to save, which is exactly what this
-                // path exists to stop.
                 error!(
                     code = ErrorCode::WsGapConnectionState.code_str(),
                     frames = params.wal_replay_live_feed.len(),
                     ticks = outcome.refolded,
                     lost = outcome.lost,
-                    "recovered live-feed frames from the write-ahead log, but {} tick(s) could \
-                 NOT be folded — the raw frames remain in the WAL archive and can be \
-                 recovered manually",
-                    outcome.lost
+                    unparseable = outcome.unparseable,
+                    undecodable = outcome.undecodable,
+                    depth_frames = outcome.depth_frames,
+                    depth_refused = outcome.depth_refused,
+                    unconsumed_frames = params.wal_replay_unconsumed_frames,
+                    "WAL replay did not consume its complete generation — retaining all \
+                     original segments unconfirmed for recovery"
                 );
             }
 
@@ -12696,11 +13115,9 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             // boot replays them again — which is idempotent, because every
             // affected table dedups on its upsert key.
             //
-            // Confirmed even when `outcome.lost > 0`: the frames we COULD fold are
-            // in the database, and the ones we could not are unfoldable rather
-            // than unread — re-replaying them next boot would fail identically
-            // while re-staging forever (the WS-REINJECT-01 growth-storm class).
-            // The `error!` above is what carries those, and it names the count.
+            // Any semantic refusal retains the WHOLE generation. Logging an
+            // undecodable or unsupported frame is not a durable replacement
+            // for the original and cannot authorize archive cleanup.
             // Resolved the same way boot resolves it (`TV_WS_WAL_DIR`, else the
             // default) rather than threaded through the params struct: one shared
             // helper cannot drift out of sync with itself, whereas a second copy
@@ -12737,12 +13154,24 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             // ACK BEFORE CONFIRMING (2026-09-05): `flush` on the offloaded path
             // returns rows handed to a queue. Wait for the writer threads to
             // land or rescue them before the segments leave the replay path.
-            if replay_rows_landed(&mut ingest, "boot_refold", unlanded_before) {
-                tickvault_storage::ws_frame_spill::confirm_replayed(
-                    crate::boot_helpers::ws_wal_dir(),
-                );
+            if wal_replay_consumption_complete(outcome, params.wal_replay_unconsumed_frames)
+                && replay_rows_landed(&mut ingest, "boot_refold", unlanded_before)
+            {
+                if let Some(_confirmation) = wm.replay_confirmation_guard(unlanded_before) {
+                    boot_replay_confirmed = wal_maintenance
+                        .confirm_replayed_generation(params.wal_replay_confirmation_id);
+                }
+                if !boot_replay_confirmed {
+                    error!(
+                        code = ErrorCode::WsGapConnectionState.code_str(),
+                        source = "boot_replay_confirmation_refused",
+                        generation = params.wal_replay_confirmation_id,
+                        "WAL replay receipt or guarded ACK evidence is no longer valid — \
+                         catch-up will not advance this unconfirmed batch"
+                    );
+                }
             }
-            if flushed > 0 {
+            if flushed > 0 && boot_replay_confirmed {
                 info!(
                     rows = flushed,
                     "flushed the re-folded WAL rows before archiving their segments — \
@@ -12797,6 +13226,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         // WHICH bound bound, which is the difference between "the backlog is
         // big" and "this box cannot drain it".
         let mut catchup_memory_stopped = false;
+        let mut catchup_confirmation_failed = !boot_replay_confirmed;
         // `true` only when the final pass found NOTHING left on disk — no
         // frames, no deferred segments, no disk/frame-cap refusal. That is the
         // one state in which the applied-watermark's unapplied buckets can be
@@ -12824,6 +13254,18 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         )
         .bytes();
         while rounds < WAL_CATCHUP_MAX_ROUNDS && tokio::time::Instant::now() < catchup_deadline {
+            // Starting a new replay invalidates the prior receipt. Do not
+            // advance until the exact previous generation was acknowledged
+            // and confirmed, including the initial boot-to-lane handoff.
+            if !boot_replay_confirmed {
+                error!(
+                    code = ErrorCode::WsGapConnectionState.code_str(),
+                    source = "wal_catchup_prior_unconfirmed",
+                    generation = params.wal_replay_confirmation_id,
+                    "WAL catch-up deferred because the initial batch is unconfirmed"
+                );
+                break;
+            }
             // MEMORY STOP — checked BEFORE the round, never after, because the
             // whole point is not to start work whose footprint we cannot hold.
             // One `/proc/self/status` read per round; the policy itself is the
@@ -12874,11 +13316,9 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 );
                 break;
             }
-            let wal_dir = crate::boot_helpers::ws_wal_dir();
-            let batch = match tickvault_storage::ws_frame_spill::replay_all_with_report_fenced(
-                &wal_dir,
-                tickvault_storage::ws_frame_spill::WAL_REPLAY_MAX_BYTES,
-            ) {
+            let batch = match wal_maintenance
+                .replay_with_report_fenced(tickvault_storage::ws_frame_spill::WAL_REPLAY_MAX_BYTES)
+            {
                 Ok(b) => b,
                 Err(err) => {
                     error!(
@@ -12921,11 +13361,26 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                      once per boot."
                 );
             }
+            let confirmation_id = batch.confirmation_id;
+            if confirmation_id == 0 {
+                catchup_confirmation_failed = true;
+                error!(
+                    code = ErrorCode::WsGapConnectionState.code_str(),
+                    source = "wal_catchup_receipt_missing",
+                    round = rounds,
+                    "WAL catch-up received no staging receipt — leaving the batch unconfirmed"
+                );
+                break;
+            }
             if batch.frames.is_empty() {
-                catchup_drained = batch.deferred_segments == 0
+                let complete = batch.deferred_segments == 0
                     && !batch.stopped_for_disk
                     && !batch.stopped_for_frame_cap
                     && !batch.stopped_for_memory;
+                if complete {
+                    catchup_drained = wal_maintenance.confirm_replayed_generation(confirmation_id);
+                    catchup_confirmation_failed = !catchup_drained;
+                }
                 break;
             }
             // Count what this lane does NOT fold before dropping it.
@@ -12941,11 +13396,8 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             // line — the same signal treated two opposite ways depending on
             // which drain happened to reach it first.
             //
-            // Counted, not folded: making this lane consume them would be a
-            // scope change, and the raw frames survive in the WAL archive
-            // either way. The counter shares `tv_ws_frame_wal_replay_total`
-            // with the boot path so one series answers "how many of these have
-            // we seen", regardless of which drain saw them.
+            // Counted as unconsumed. Their presence prevents confirming the
+            // whole generation, including segments that also contain ticks.
             let batch_len = batch.frames.len();
             let staged: Vec<(u64, i64, WalEndpoint, bytes::Bytes)> = batch
                 .frames
@@ -12969,43 +13421,61 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                     round = rounds,
                     frames = not_folded,
                     "WAL catch-up drain: frames this lane does not fold (order-update or \
-                     TrueData) were consumed and archived with their segments — the raw \
-                     frames remain on disk in the WAL archive, but nothing will read them \
-                     again automatically"
+                     TrueData) remain in their original unconfirmed segments; this \
+                     generation cannot be archived"
                 );
             }
             if staged.is_empty() {
-                // Nothing this lane folds, but the segments WERE consumed and
-                // staged -- confirm so the loop cannot spin on them forever.
-                tickvault_storage::ws_frame_spill::confirm_replayed(&wal_dir);
-                rounds = rounds.saturating_add(1);
-                continue;
+                // The nonempty batch consists entirely of unsupported
+                // transports. Stop instead of clearing its only originals.
+                catchup_confirmation_failed = true;
+                break;
             }
-            let unlanded_before =
-                tickvault_storage::wal_applied_watermark::applied_watermark().unlanded_total();
+            let wm = tickvault_storage::wal_applied_watermark::applied_watermark();
+            let unlanded_before = wm.replay_ack_fence(wm.unlanded_total());
             let outcome = refold_wal_frames(&mut ingest, &staged);
             let flushed = blocking_flush(|| ingest.flush());
+            if !wal_replay_consumption_complete(outcome, not_folded as u64) {
+                catchup_confirmation_failed = true;
+                error!(
+                    code = ErrorCode::WsGapConnectionState.code_str(),
+                    source = "wal_catchup_semantic_refusal",
+                    generation = confirmation_id,
+                    lost = outcome.lost,
+                    unparseable = outcome.unparseable,
+                    undecodable = outcome.undecodable,
+                    depth_frames = outcome.depth_frames,
+                    depth_refused = outcome.depth_refused,
+                    unconsumed_frames = not_folded,
+                    "WAL catch-up did not consume its whole generation — stopping \
+                     with the original segments retained and unconfirmed"
+                );
+                break;
+            }
             // ACK BEFORE CONFIRMING — see `replay_rows_landed`. A timeout ends
             // the drain rather than re-offering the same batch to a sink that
             // is not answering: the segments stay staged for the next boot.
             if !replay_rows_landed(&mut ingest, "catchup", unlanded_before) {
+                catchup_confirmation_failed = true;
                 break;
             }
-            tickvault_storage::ws_frame_spill::confirm_replayed(&wal_dir);
+            let Some(_confirmation) = wm.replay_confirmation_guard(unlanded_before) else {
+                catchup_confirmation_failed = true;
+                break;
+            };
+            if !wal_maintenance.confirm_replayed_generation(confirmation_id) {
+                catchup_confirmation_failed = true;
+                error!(
+                    code = ErrorCode::WsGapConnectionState.code_str(),
+                    source = "wal_catchup_confirmation_refused",
+                    generation = confirmation_id,
+                    "WAL catch-up could not confirm the acknowledged generation — stopping the drain"
+                );
+                break;
+            }
             catchup_frames = catchup_frames.saturating_add(staged.len());
             catchup_ticks = catchup_ticks.saturating_add(outcome.refolded as u64);
             rounds = rounds.saturating_add(1);
-            if outcome.lost > 0 {
-                error!(
-                    code = ErrorCode::WsGapConnectionState.code_str(),
-                    source = "wal_catchup_unfolded",
-                    round = rounds,
-                    frames = staged.len(),
-                    lost = outcome.lost,
-                    "the WAL catch-up drain could not fold {} tick(s) in this round",
-                    outcome.lost
-                );
-            }
             tracing::debug!(
                 round = rounds,
                 frames = staged.len(),
@@ -13026,7 +13496,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                  unapplied map is cleared for this session"
             );
         }
-        if rounds > 0 || catchup_memory_stopped {
+        if rounds > 0 || catchup_memory_stopped || catchup_confirmation_failed {
             // `catchup_memory_stopped` joins `exhausted` deliberately: all
             // three mean the SAME operational thing — the drain stood down
             // with work still on disk — and the counter exists to say that,
@@ -13037,7 +13507,9 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             let exhausted = catchup_memory_stopped
                 || tokio::time::Instant::now() >= catchup_deadline
                 || rounds >= WAL_CATCHUP_MAX_ROUNDS;
-            let stop_reason = if catchup_memory_stopped {
+            let stop_reason = if catchup_confirmation_failed {
+                "confirmation_failed"
+            } else if catchup_memory_stopped {
                 "memory"
             } else if rounds >= WAL_CATCHUP_MAX_ROUNDS {
                 "round_cap"
@@ -13053,6 +13525,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 not_folded = catchup_not_folded,
                 budget_exhausted = exhausted,
                 memory_stopped = catchup_memory_stopped,
+                confirmation_failed = catchup_confirmation_failed,
                 stop_reason,
                 "WAL catch-up drain finished — recovered a backlog that a single \
                  512 MiB replay batch could never have reached"
@@ -14255,6 +14728,36 @@ const IN_SESSION_1000_IST_MILLIS: u64 = (4 * 3_600 + 30 * 60) * 1_000;
 
 #[cfg(test)]
 mod tests {
+    /// Inline test probes are part of production functions. Stop only at the
+    /// actual top-level test module so those probes cannot hide the drain,
+    /// its shutdown tail, or the later boot wiring from source guards.
+    pub(super) fn production_before_tests(source: &str) -> &str {
+        source
+            .split_once(concat!("\n#[cfg(", "test)]\nmod tests {"))
+            .expect("the top-level tests module must delimit the production source")
+            .0
+    }
+
+    #[test]
+    fn production_scan_keeps_code_after_inline_test_probes() {
+        let fixture = concat!(
+            "fn drain() {\n    #[cfg(test)]\n    let probe = 0;\n}\n",
+            "#[cfg(test)]\nconst TEST_CLOCK: u64 = 0;\n",
+            "fn production_tail() {}\n",
+            "#[cfg(test)]\nmod tests { fn test_only_tail() {} }\n",
+        );
+        let production = production_before_tests(fixture);
+        assert!(production.contains("fn production_tail() {}"));
+        assert!(!production.contains("fn test_only_tail() {}"));
+
+        // Exercise the real file too: later production wiring must remain
+        // visible, and this test's own assertion text must remain excluded.
+        let production = production_before_tests(include_str!("dhan_feed_stack.rs"));
+        assert!(production.contains("ingest.close_offload_queues();"));
+        assert!(production.contains("ingest.shutdown_offload_writer(offload_deadline);"));
+        assert!(production.contains("pub fn now_ist_secs_of_day()"));
+        assert!(!production.contains("fn production_scan_keeps_code_after_inline_test_probes"));
+    }
 
     // -- WAL catch-up memory stop (2026-09-02) --------------------------------
     //
@@ -14522,22 +15025,32 @@ mod tests {
         // replay call, because the point is not to start work whose footprint
         // we cannot hold. A check moved after the round would measure the
         // damage instead of preventing it.
-        let src = include_str!("dhan_feed_stack.rs");
+        use tickvault_common::source_scan::{production_region, strip_rust_comments};
+        let production = production_region(include_str!("dhan_feed_stack.rs"))
+            .expect("the production region must exclude this test's own needles");
+        let src: String = strip_rust_comments(&production)
+            .split_whitespace()
+            .collect();
         let loop_body = src
-            .split("while rounds < WAL_CATCHUP_MAX_ROUNDS")
+            .split("whilerounds<WAL_CATCHUP_MAX_ROUNDS")
             .nth(1)
             .expect("the WAL catch-up loop must exist");
         let stop_at = loop_body
-            .find("wal_catchup_should_stop_for_memory")
+            .find("wal_catchup_should_stop_for_memory(")
             .expect("the loop must consult the memory stop");
         let replay_at = loop_body
-            .find("replay_all_with_report")
-            .expect("the loop must still perform a replay");
+            .find("wal_maintenance.replay_with_report_fenced(")
+            .expect("the loop must still perform its generation-fenced replay");
         assert!(
             stop_at < replay_at,
             "the memory stop must be evaluated BEFORE the round's replay, not \
              after it — checking afterwards measures the blowup instead of \
              preventing it"
+        );
+        let stop_branch = &loop_body[stop_at..replay_at];
+        assert!(
+            stop_branch.contains("catchup_memory_stopped=true;") && stop_branch.contains("break;"),
+            "the memory-stop branch must actually leave the loop before replay allocation"
         );
     }
 
@@ -14648,9 +15161,7 @@ mod tests {
     #[test]
     fn both_queues_close_before_either_join() {
         let source = include_str!("dhan_feed_stack.rs");
-        let production_half = source
-            .split_once("#[cfg(test)]")
-            .map_or(source, |(prod, _)| prod);
+        let production_half = super::tests::production_before_tests(source);
         let close = production_half
             .rfind("ingest.close_offload_queues();")
             .expect("the shutdown must close both queues");
@@ -14680,9 +15191,7 @@ mod tests {
     #[test]
     fn closing_the_queues_rescues_what_backpressure_retained() {
         let source = include_str!("dhan_feed_stack.rs");
-        let production_half = source
-            .split_once("#[cfg(test)]")
-            .map_or(source, |(prod, _)| prod);
+        let production_half = super::tests::production_before_tests(source);
         let close_fn = production_half
             .split_once("pub fn close_offload_queues(&mut self) {")
             .map(|(_, rest)| rest.split_once("\n    }").map_or(rest, |(b, _)| b))
@@ -14713,9 +15222,7 @@ mod tests {
     #[test]
     fn the_writer_thread_exists_before_the_writer_is_split() {
         let source = include_str!("dhan_feed_stack.rs");
-        let production_half = source
-            .split_once("#[cfg(test)]")
-            .map_or(source, |(prod, _)| prod);
+        let production_half = super::tests::production_before_tests(source);
         for (name, thread_name) in [
             ("tick", "\"tv-tick-writer\".to_owned()"),
             ("depth", "\"tv-depth-writer\".to_owned()"),
@@ -14745,9 +15252,7 @@ mod tests {
     #[test]
     fn the_lane_actually_moves_the_depth_flush_off_the_drain() {
         let source = include_str!("dhan_feed_stack.rs");
-        let production_half = source
-            .split_once("#[cfg(test)]")
-            .map_or(source, |(prod, _)| prod);
+        let production_half = super::tests::production_before_tests(source);
         assert!(
             production_half.contains("ingest.spawn_depth_offload_writer()"),
             "the boot path must call spawn_depth_offload_writer. Depth is ~24x the tick \
@@ -14790,9 +15295,7 @@ mod tests {
     #[test]
     fn a_failed_depth_offload_spawn_publishes_the_degraded_gauge() {
         let source = include_str!("dhan_feed_stack.rs");
-        let production_half = source
-            .split_once("#[cfg(test)]")
-            .map_or(source, |(prod, _)| prod);
+        let production_half = super::tests::production_before_tests(source);
 
         // The name is asserted here rather than only at the declaration so a
         // rename cannot silently orphan a future CloudWatch filter keyed on
@@ -14844,9 +15347,7 @@ mod tests {
     #[test]
     fn the_two_writer_joins_share_one_deadline() {
         let source = include_str!("dhan_feed_stack.rs");
-        let production_half = source
-            .split_once("#[cfg(test)]")
-            .map_or(source, |(prod, _)| prod);
+        let production_half = super::tests::production_before_tests(source);
         assert!(
             production_half.contains("let offload_deadline = std::time::Instant::now()"),
             "the shutdown must take ONE deadline before either join"
@@ -14912,9 +15413,7 @@ mod tests {
     #[test]
     fn the_depth_tail_flushes_before_the_blocking_offload_join() {
         let source = include_str!("dhan_feed_stack.rs");
-        let production_half = source
-            .split_once("#[cfg(test)]")
-            .map_or(source, |(prod, _)| prod);
+        let production_half = super::tests::production_before_tests(source);
         let join = production_half
             .rfind("ingest.shutdown_offload_writer(offload_deadline);")
             .expect("the shutdown tail must join the offload writer");
@@ -15168,8 +15667,7 @@ mod tests {
         // construction happens inside `run_dhan_feed_stack`, which needs a
         // live token manager and real sockets to reach.
         let src = include_str!("dhan_feed_stack.rs");
-        let test_marker = concat!("#[cfg(", "test)]");
-        let production = src.split(test_marker).next().unwrap_or(src);
+        let production = super::tests::production_before_tests(src);
         // 2026-08-28: re-anchored. The separate `let depth_ingest = Some(...)`
         // binding is GONE -- the dedicated and inline depth paths now share
         // ONE sink (`LiveIngest::depth_sink`), because two ILP buffers into
@@ -15209,8 +15707,7 @@ mod tests {
         // than pretending. It should be unreachable in production now, which
         // is why its counter's meaning is "a wiring bug", not "no depth".
         let src = include_str!("dhan_feed_stack.rs");
-        let test_marker = concat!("#[cfg(", "test)]");
-        let production = src.split(test_marker).next().unwrap_or(src);
+        let production = super::tests::production_before_tests(src);
         assert!(
             production.contains("c.depth_unconsumed.increment(1)"),
             "the no-ingest arm must still COUNT — a silently dropped depth frame \
@@ -15226,8 +15723,7 @@ mod tests {
         // already full — worse than not shedding at all, because the counters
         // would say shedding is working.
         let src = include_str!("dhan_feed_stack.rs");
-        let test_marker = concat!("#[cfg(", "test)]");
-        let production = src.split(test_marker).next().unwrap_or(src);
+        let production = super::tests::production_before_tests(src);
 
         assert!(
             production.contains("INGEST_SHED.allows_inline_depth()"),
@@ -15628,8 +16124,7 @@ mod tests {
         // and caught only because the bite-proof was actually run: collapsing
         // the branch to `if false` left the test green.
         let full = include_str!("dhan_feed_stack.rs");
-        let test_marker = concat!("#[cfg(", "test)]");
-        let src = full.split(test_marker).next().unwrap_or(full);
+        let src = super::tests::production_before_tests(full);
         assert!(
             src.contains("let cause = if slots.is_empty()"),
             "the unplaced error must branch on whether any connection exists"
@@ -15742,8 +16237,7 @@ mod tests {
         // anything else (the raw count, a constant, the delta itself) makes
         // the drift refusal vacuous.
         let full = include_str!("dhan_feed_stack.rs");
-        let test_marker = concat!("#[cfg(", "test)]");
-        let src = full.split(test_marker).next().unwrap_or(full);
+        let src = super::tests::production_before_tests(full);
         assert!(
             src.contains("let newly_priced = dial_without_spot")
                 && src.contains(".saturating_sub(contracts.underlyings_without_spot)"),
@@ -15780,8 +16274,7 @@ mod tests {
         // ~780 late-priced options unsubscribed every session, and it is a
         // one-word regression to reintroduce.
         let full = include_str!("dhan_feed_stack.rs");
-        let test_marker = concat!("#[cfg(", "test)]");
-        let src = full.split(test_marker).next().unwrap_or(full);
+        let src = super::tests::production_before_tests(full);
         assert!(
             src.contains("out_topups: Some(&mut live_topups)"),
             "the contract half must keep its senders so a late top-up can reach those sockets"
@@ -16425,6 +16918,9 @@ mod tests {
             // A disabled lane never reaches the re-fold, which is exactly why
             // main.rs still drops the batch loudly when the gate is closed.
             wal_replay_live_feed: Vec::new(),
+            wal_replay_confirmation_id: 0,
+            wal_replay_unconsumed_frames: 0,
+            wal_maintenance: None,
             main_feed_instruments: hardcoded_index_universe(),
             depth_20_instruments: Vec::new(),
             depth_200_instruments: Vec::new(),
@@ -16469,8 +16965,7 @@ mod tests {
         // returns before constructing anything observable — the property that
         // matters is that it happens BEFORE the sockets, not that it logs.
         let src = include_str!("dhan_feed_stack.rs");
-        let test_marker = concat!("#[cfg(", "test)]");
-        let production = src.split(test_marker).next().unwrap_or(src);
+        let production = super::tests::production_before_tests(src);
 
         let refusal = production
             .find("rest_fold_writes_dhan_candles {")
@@ -17988,13 +18483,9 @@ mod tests {
         // emitted-vs-dropped SPLIT is exercised by the writer-side tests; the
         // invariant here is that no bar escapes accounting on ANY side.
         //
-        // Updated 2026-08-18 with the operator-timeframe gate: of the 24 bars
-        // the fold produces, 13 are requested and reach dropped/emitted, and
-        // 11 land in `seals_skipped`. This test FAILED when that gate first
-        // shipped as a bare `return` — the eleven vanished from the ledger and
-        // the production `debug_assert` caught it. That is the test doing
-        // exactly its job, so the fix was a third counter, never a relaxed
-        // assertion.
+        // Every active registry frame is now requested. Keeping all callback
+        // outcomes in the same ledger also detects any future policy filter
+        // that silently discards a seal.
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
         let packet = ticker_packet(13, 23_146.45, 1_779_355_000);
         let ParsedFrame::Tick(tick) =
@@ -18995,8 +19486,7 @@ mod tests {
     #[test]
     fn the_production_boot_site_sizes_the_detector_at_the_authorized_ceiling() {
         let full = include_str!("dhan_feed_stack.rs");
-        let test_marker = concat!("#[cfg(", "test)]");
-        let src = full.split(test_marker).next().unwrap_or(full);
+        let src = super::tests::production_before_tests(full);
 
         assert_eq!(
             src.matches(".with_detector_capacity(").count(),
@@ -19133,6 +19623,122 @@ mod tests {
              nothing — an underflow here would wrap to ~u32::MAX and seal every \
              open bucket in the book at once"
         );
+    }
+
+    #[test]
+    fn regular_capture_close_waits_for_margin_and_drained_captured_queues() {
+        let day_start = 20_000 * 86_400;
+        let close = day_start + tickvault_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST;
+        let last_observed = close - 1;
+        let ready_at = close + CATCHUP_LATENESS_MARGIN_SECS;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(()).unwrap();
+
+        assert_eq!(
+            regular_capture_close_cutoff(ready_at, last_observed, None, rx.is_empty()),
+            None,
+            "captured work must drain before the timer closes its local window"
+        );
+        rx.try_recv().unwrap();
+        for now in [close - 1, close, ready_at - 1] {
+            assert_eq!(
+                regular_capture_close_cutoff(now, last_observed, None, rx.is_empty()),
+                None
+            );
+        }
+        assert_eq!(
+            regular_capture_close_cutoff(ready_at, last_observed, None, rx.is_empty()),
+            Some(close)
+        );
+        assert_eq!(
+            regular_capture_close_cutoff(ready_at + 1, last_observed, Some(20_000), true),
+            None,
+            "an unchanged session must not repeat the population-wide close sweep"
+        );
+    }
+
+    #[test]
+    fn regular_capture_close_refuses_unknown_wrong_day_and_future_watermarks() {
+        let day_start = 20_000 * 86_400;
+        let close = day_start + tickvault_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST;
+        let now = close + CATCHUP_LATENESS_MARGIN_SECS;
+        for watermark in [0, close - 86_400, close + 86_400, now + 1] {
+            assert_eq!(
+                regular_capture_close_cutoff(now, watermark, None, true),
+                None,
+                "a timer cannot establish the source session or repair its clock"
+            );
+        }
+        assert_eq!(
+            regular_capture_close_cutoff(now + 86_400, close + 86_400 - 1, Some(20_000), true),
+            Some(close + 86_400),
+            "the next observed session has an independent close"
+        );
+        assert_eq!(
+            regular_capture_close_cutoff(u32::MAX, u32::MAX - 1, None, true),
+            None,
+            "an unrepresentable regular observation window is refused rather than wrapped"
+        );
+    }
+
+    #[test]
+    fn regular_capture_close_is_wired_before_the_one_second_board_publication() {
+        let production = production_before_tests(include_str!("dhan_feed_stack.rs"));
+        let drain = production
+            .split_once("async fn run_frame_drain(")
+            .unwrap()
+            .1;
+        let one_second = drain
+            .split_once("_ = snapshot_1s_timer.tick()")
+            .unwrap()
+            .1
+            .split_once("_ = snapshot_3s_timer.tick()")
+            .unwrap()
+            .0;
+        let close = one_second
+            .find("ingest.catch_up_seal_through(cutoff)")
+            .unwrap();
+        let publish = one_second.find("ingest.snapshot_top_volume(").unwrap();
+        assert!(close < publish);
+        assert!(one_second[..close].contains("rx.is_empty() && seed_rx.is_empty()"));
+        assert!(one_second[..close].contains("ingest.aggregator.watermark_secs()"));
+        assert!(one_second[..close].contains("regular_capture_close_cutoff("));
+        assert!(one_second[close..publish].contains("completed_capture_close_day = Some("));
+
+        let frame_arm = drain
+            .split_once("maybe_frame = rx.recv()")
+            .unwrap()
+            .1
+            .split_once("// SIZE trigger.")
+            .unwrap()
+            .0;
+        let rearm = frame_arm
+            .find("completed_capture_close_day = None;")
+            .unwrap();
+        assert!(rearm < frame_arm.find("drain_main_feed_frame(").unwrap());
+        let seed_arm = drain
+            .split_once("if let Some(batch) = maybe_seed {")
+            .unwrap()
+            .1
+            .split_once("// A closed channel is NORMAL")
+            .unwrap()
+            .0;
+        assert!(seed_arm.contains("completed_capture_close_day = None;"));
+
+        let shutdown = drain
+            .split_once("// All admitted frames drained:")
+            .unwrap()
+            .1;
+        let qualify = shutdown
+            .find("ingest.catch_up_seal_through(cutoff)")
+            .unwrap();
+        let partial = shutdown
+            .find("ingest.seal_open_buckets_at_close()")
+            .unwrap();
+        let flush = shutdown.find("flush_and_record(").unwrap();
+        assert!(qualify < partial && partial < flush);
+        assert!(shutdown[..qualify].contains("rx.is_empty() && seed_rx.is_empty()"));
+        assert!(shutdown[..qualify].contains("regular_capture_close_cutoff("));
     }
 
     /// The catch-up seal is wired into the drain loop and does not ride the
@@ -19720,6 +20326,142 @@ mod tests {
         drop(tx);
     }
 
+    /// Exercise the real drain, with more queued frames than it can consume
+    /// between virtual-time advances. The timer observations are collected
+    /// inside the production select arms, before the final flush on exit.
+    #[tokio::test(start_paused = true)]
+    async fn test_busy_frame_drain_services_every_cadence_before_the_ring_empties() {
+        const BACKLOG: usize = DRAIN_FRAME_QUANTUM * 64;
+        let ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        let (tx, rx) = tokio::sync::mpsc::channel::<CapturedFrame>(BACKLOG);
+        let packet =
+            bytes::Bytes::copy_from_slice(&ticker_packet(13, 23_146.45, todays_in_session_ltt()));
+        for seq in 0..BACKLOG {
+            tx.try_send(CapturedFrame {
+                seq: seq as u64 + 1,
+                endpoint: DhanEndpointType::MainFeed,
+                connection_index: 0,
+                received_at: std::time::Instant::now(),
+                bytes: packet.clone(),
+            })
+            .expect("finite fixture must fit in its ring");
+        }
+        drop(tx);
+        let drain = run_frame_drain(
+            rx,
+            ingest,
+            Arc::new(RingByteBudget::new(MAIN_FEED_RING_MAX_BYTES)),
+            Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
+            Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tickvault_common::feed_health::FeedHealthRegistry::new()),
+            tokio::sync::mpsc::channel(1).1,
+        );
+        tokio::pin!(drain);
+        // Poll the actual drain here so its timers exist before the clock
+        // advances. No concurrently spawned task can consume the fixture
+        // between these controlled polls. Tokio's receive budget yields
+        // with a substantial, explicitly observed backlog still present.
+        for _ in 0..2 {
+            std::future::poll_fn(|cx| {
+                assert!(
+                    std::future::Future::poll(drain.as_mut(), cx).is_pending(),
+                    "fixture must outlast each controlled maintenance deadline"
+                );
+                std::task::Poll::Ready(())
+            })
+            .await;
+            tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        }
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+            .await
+            .expect("the finite drain must finish before its deadline");
+        assert_eq!(outcome.frames_seen, BACKLOG as u64);
+        assert_eq!(outcome.ingest.pending_rows(), 0);
+        for arm in [
+            DrainMaintenance::Flush,
+            DrainMaintenance::CatchUp,
+            DrainMaintenance::Snapshot1s,
+            DrainMaintenance::Snapshot3s,
+            DrainMaintenance::Snapshot5s,
+            DrainMaintenance::Snapshot1m,
+            DrainMaintenance::Silence,
+        ] {
+            let index = arm as usize;
+            assert!(
+                outcome.maintenance_first_seen[index].is_some_and(|seen| seen < BACKLOG as u64),
+                "maintenance arm {index} was hidden until the ring emptied"
+            );
+            assert!(
+                outcome.maintenance_under_backlog_runs[index] >= 2,
+                "maintenance arm {index} must run across repeated deadlines under backlog"
+            );
+        }
+    }
+
+    /// No frame arrives to consume the frame quantum. A seed queue that stays
+    /// ready across both deadlines must still let every timer run repeatedly.
+    #[tokio::test(start_paused = true)]
+    async fn test_busy_seed_drain_services_every_cadence_without_frames() {
+        const BACKLOG: usize = DRAIN_FRAME_QUANTUM * 64;
+        let ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<CapturedFrame>(1);
+        let (seed_tx, seed_rx) = tokio::sync::mpsc::channel(BACKLOG);
+        for _ in 0..BACKLOG {
+            seed_tx
+                .try_send(vec![inst(13, ExchangeSegment::IdxI)])
+                .expect("the finite seed fixture must fit in its queue");
+        }
+        drop(seed_tx);
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let drain = run_frame_drain(
+            frame_rx,
+            ingest,
+            Arc::new(RingByteBudget::new(MAIN_FEED_RING_MAX_BYTES)),
+            Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
+            Arc::new(RingByteBudget::new(DEPTH_RING_MAX_BYTES)),
+            Arc::clone(&shutdown),
+            Arc::new(tickvault_common::feed_health::FeedHealthRegistry::new()),
+            seed_rx,
+        );
+        tokio::pin!(drain);
+        // Direct polling prevents another task consuming the finite fixture
+        // between observations. The third poll services the second deadline
+        // before shutdown, which would otherwise outrank every timer.
+        for deadline in 0..=2 {
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(drain.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            if deadline < 2 {
+                tokio::time::advance(std::time::Duration::from_secs(61)).await;
+            }
+        }
+        shutdown.notify_one();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+            .await
+            .expect("shutdown must finish while the frame sender is still alive");
+        assert_eq!(outcome.frames_seen, 0);
+        assert_eq!(outcome.ingest.tracked_instruments(), 1);
+        for arm in [
+            DrainMaintenance::Flush,
+            DrainMaintenance::CatchUp,
+            DrainMaintenance::Snapshot1s,
+            DrainMaintenance::Snapshot3s,
+            DrainMaintenance::Snapshot5s,
+            DrainMaintenance::Snapshot1m,
+            DrainMaintenance::Silence,
+        ] {
+            let index = arm as usize;
+            assert!(
+                outcome.maintenance_under_backlog_runs[index] >= 2,
+                "maintenance arm {index} was starved by ready seed batches with no frames"
+            );
+        }
+        drop(frame_tx);
+    }
+
     #[test]
     fn test_an_idle_flush_cannot_forge_feed_liveness() {
         // `flush_and_record` runs on the 500 ms timer whether or not anything
@@ -19946,8 +20688,7 @@ mod tests {
         // flavor-guarded helper. This one did not, and nothing caught it,
         // because "is this call blocking?" is invisible to the type system.
         let src = include_str!("dhan_feed_stack.rs");
-        let test_marker = concat!("#[cfg(", "test)]");
-        let production_half_with_comments = src.split(test_marker).next().unwrap_or(src);
+        let production_half_with_comments = super::tests::production_before_tests(src);
         // Comments STRIPPED before counting (2026-08-18). The counting
         // assertions below search for call syntax, and this module documents
         // the old call shape while explaining why it changed — so an
@@ -20197,8 +20938,7 @@ mod tests {
         // Q3 of the 2026-07-13 amendment: hardcoded security ids only. This is
         // the mechanical half of that promise.
         let src = include_str!("dhan_feed_stack.rs");
-        let test_marker = concat!("#[cfg(", "test)]");
-        let production_half = src.split(test_marker).next().unwrap_or(src);
+        let production_half = super::tests::production_before_tests(src);
         assert!(production_half.contains("SPOT_1M_REST_INDICES"), "sanity");
         for banned in [
             concat!("csv_", "downloader"),
@@ -20378,8 +21118,7 @@ mod tests {
         // The invariant is now about PROVENANCE, not source order: only code
         // that is holding a received frame may claim the lane is up.
         let src = include_str!("dhan_feed_stack.rs");
-        let test_marker = concat!("#[cfg(", "test)]");
-        let production_half = src.split(test_marker).next().unwrap_or(src);
+        let production_half = super::tests::production_before_tests(src);
 
         assert_eq!(
             production_half
@@ -20498,8 +21237,7 @@ mod tests {
         // blank credential, would each look like success while being neither —
         // so this pins that the code says REFUSING and means it.
         let src = include_str!("dhan_feed_stack.rs");
-        let test_marker = concat!("#[cfg(", "test)]");
-        let production_half = src.split(test_marker).next().unwrap_or(src);
+        let production_half = super::tests::production_before_tests(src);
 
         for needle in [
             "let Some(spill) = params.spill else",
@@ -20712,8 +21450,7 @@ mod tests {
     #[test]
     fn test_depth_late_attach_cannot_delay_the_main_feed_dial() {
         let src = include_str!("dhan_feed_stack.rs");
-        let test_marker = concat!("#[cfg(", "test)]");
-        let production = src.split(test_marker).next().unwrap_or(src);
+        let production = super::tests::production_before_tests(src);
         let main_dial = production
             .find("MAIN-FEED-DIAL-SITE")
             .expect("the main-feed dial call site must exist");
@@ -20921,8 +21658,7 @@ mod tests {
     #[test]
     fn depth_done_is_never_latched_on_a_successful_plan() {
         let src = include_str!("dhan_feed_stack.rs");
-        let test_marker = concat!("#[cfg(", "test)]");
-        let production = src.split(test_marker).next().unwrap_or(src);
+        let production = super::tests::production_before_tests(src);
         let depth_arm = production
             .split_once("// ---- half 2: DEPTH ----")
             .expect("the depth dial arm must exist")
@@ -20955,8 +21691,7 @@ mod tests {
     #[test]
     fn the_preopen_readiness_verdict_does_not_wait_for_the_mover_socket() {
         let src = include_str!("dhan_feed_stack.rs");
-        let test_marker = concat!("#[cfg(", "test)]");
-        let production = src.split(test_marker).next().unwrap_or(src);
+        let production = super::tests::production_before_tests(src);
         assert!(
             production.contains("if contracts_done && depth_ready && !readiness_published {"),
             "the readiness verdict rides depth_ready (the first successful plan), never \
@@ -20977,8 +21712,7 @@ mod tests {
     #[test]
     fn every_dial_site_compares_planned_against_dialed() {
         let src = include_str!("dhan_feed_stack.rs");
-        let test_marker = concat!("#[cfg(", "test)]");
-        let production = src.split(test_marker).next().unwrap_or(src);
+        let production = super::tests::production_before_tests(src);
         let dial_sites = production.matches("dial_planned_connections(\n").count()
             + production.matches("= dial_planned_connections(").count();
         assert!(
@@ -21007,8 +21741,7 @@ mod tests {
     #[test]
     fn test_depth_late_attach_holds_only_a_weak_sender() {
         let src = include_str!("dhan_feed_stack.rs");
-        let test_marker = concat!("#[cfg(", "test)]");
-        let production = src.split(test_marker).next().unwrap_or(src);
+        let production = super::tests::production_before_tests(src);
         assert!(
             production.contains("frame_tx.downgrade()"),
             "the depth late-attach must be handed a WeakSender via downgrade(), never a clone"
@@ -21043,8 +21776,7 @@ mod tests {
     #[test]
     fn test_depth_deadline_gates_retries_not_the_first_attempt() {
         let src = include_str!("dhan_feed_stack.rs");
-        let test_marker = concat!("#[cfg(", "test)]");
-        let production = src.split(test_marker).next().unwrap_or(src);
+        let production = super::tests::production_before_tests(src);
         assert!(
             production.contains("let out_of_time = past_hard_stop || past_deadline_and_window;"),
             "the two deadline conditions must still be ORed into one `out_of_time` value — the \
@@ -21075,8 +21807,7 @@ mod tests {
     #[test]
     fn test_depth_give_up_requires_both_the_deadline_and_a_minimum_window() {
         let src = include_str!("dhan_feed_stack.rs");
-        let test_marker = concat!("#[cfg(", "test)]");
-        let production = src.split(test_marker).next().unwrap_or(src);
+        let production = super::tests::production_before_tests(src);
 
         assert!(
             production.contains("window_elapsed >= DEPTH_ATTACH_MIN_WINDOW_SECS"),
@@ -21144,6 +21875,127 @@ mod wal_refold_tests {
 
     fn ingest() -> LiveIngest {
         LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4)
+    }
+
+    #[test]
+    fn wal_confirmation_refuses_every_combination_of_unconsumed_data() {
+        for mask in 0u8..64 {
+            let count = |bit: u32| u64::from(mask & (1u8 << bit) != 0);
+            let outcome = WalRefoldOutcome {
+                refolded: 100,
+                depth_refolded_rows: 200,
+                inline_depth_rows: 10,
+                non_tick: 2,
+                lost: count(0),
+                unparseable: count(1),
+                undecodable: count(2),
+                depth_frames: count(3),
+                depth_refused: count(4),
+            };
+            assert_eq!(
+                wal_replay_consumption_complete(outcome, count(5)),
+                mask == 0,
+                "successful rows must not hide a refused category: mask {mask}"
+            );
+        }
+        assert!(!wal_replay_consumption_complete(
+            WalRefoldOutcome::default(),
+            u64::MAX
+        ));
+    }
+
+    #[test]
+    fn empty_or_wrong_endpoint_frames_cannot_be_confirmed() {
+        let mut oi = vec![0u8; tickvault_common::constants::OI_PACKET_SIZE];
+        oi[0] = tickvault_common::constants::RESPONSE_CODE_OI;
+        let wrong_endpoint = refold_wal_frames(
+            &mut ingest(),
+            &[(
+                1 << 17,
+                WAL_RECEIPT_UNKNOWN_NANOS,
+                WalEndpoint::OrderUpdate,
+                bytes::Bytes::from(oi),
+            )],
+        );
+        assert_eq!(wrong_endpoint.undecodable, 1);
+        assert!(!wal_replay_consumption_complete(wrong_endpoint, 0));
+        let empty = refold_wal_frames(
+            &mut ingest(),
+            &[(
+                2 << 17,
+                WAL_RECEIPT_UNKNOWN_NANOS,
+                WalEndpoint::MainFeed,
+                bytes::Bytes::new(),
+            )],
+        );
+        assert_eq!(empty.unparseable, 1);
+        assert!(!wal_replay_consumption_complete(empty, 0));
+    }
+
+    #[test]
+    fn incomplete_inline_depth_keeps_the_entire_generation_unconfirmed() {
+        use tickvault_common::constants::{
+            DEPTH_LEVEL_OFFSET_BID_PRICE, FULL_OFFSET_DEPTH_START, FULL_QUOTE_PACKET_SIZE,
+            RESPONSE_CODE_FULL,
+        };
+        let mut packet = vec![0u8; FULL_QUOTE_PACKET_SIZE];
+        packet[0] = RESPONSE_CODE_FULL;
+        packet[1..3].copy_from_slice(&(FULL_QUOTE_PACKET_SIZE as u16).to_le_bytes());
+        packet[4..8].copy_from_slice(&13u32.to_le_bytes());
+        packet[8..12].copy_from_slice(&100.5f32.to_le_bytes());
+        packet[14..18].copy_from_slice(&1_700_000_000u32.to_le_bytes());
+        let bad_price = FULL_OFFSET_DEPTH_START + DEPTH_LEVEL_OFFSET_BID_PRICE;
+        packet[bad_price..bad_price + 4].copy_from_slice(&(-1.0f32).to_le_bytes());
+        let mut with_depth = ingest().with_inline_depth(DepthIngest::for_test());
+        let partial = refold_wal_frames(
+            &mut with_depth,
+            &[(
+                1 << 17,
+                WAL_RECEIPT_UNKNOWN_NANOS,
+                WalEndpoint::MainFeed,
+                bytes::Bytes::from(packet),
+            )],
+        );
+        assert_eq!(partial.inline_depth_rows, 9);
+        assert_eq!(partial.depth_refused, 1);
+        assert!(!wal_replay_consumption_complete(partial, 0));
+    }
+
+    #[test]
+    fn boot_and_catchup_confirm_only_complete_consumption() {
+        let source = strip_line_comments(include_str!("dhan_feed_stack.rs"));
+        let production = source
+            .split("#[cfg(test)]\nmod wal_refold_tests")
+            .next()
+            .unwrap();
+        let normalized = production.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(normalized.contains(
+            "if wal_replay_consumption_complete(outcome, params.wal_replay_unconsumed_frames) && replay_rows_landed("
+        ));
+        let catchup = normalized
+            .split("if !wal_replay_consumption_complete(outcome, not_folded as u64) {")
+            .nth(1)
+            .expect("catch-up semantic refusal precedes acknowledgement");
+        let ack = catchup
+            .find("if !replay_rows_landed(")
+            .expect("sink ACK gate");
+        assert!(catchup[..ack].contains("catchup_confirmation_failed = true;"));
+        assert!(catchup[..ack].contains("break;"));
+        let empty = normalized
+            .split("if staged.is_empty() {")
+            .nth(1)
+            .expect("unsupported-only batch");
+        let until_refold = &empty[..empty.find("let outcome = refold_wal_frames(").unwrap()];
+        assert!(until_refold.contains("break;"));
+        assert!(!until_refold.contains("confirm_replayed_generation("));
+
+        let main = strip_line_comments(include_str!("main.rs"));
+        let main = main.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(main.contains(
+            "else if ws_wal_replay_refused || ws_wal_replay_unconsumed_frames > 0 || !ws_wal_replay_live_feed.is_empty()"
+        ));
+        assert!(!main.contains("ws_wal_replay_live_feed.clear()"));
+        assert!(main.contains("wal_replay_unconsumed_frames: ws_wal_replay_unconsumed_frames"));
     }
 
     /// A depth-20 frame exactly as the depth socket writes it: 12-byte header
@@ -21286,8 +22138,7 @@ mod wal_refold_tests {
     #[test]
     fn the_replay_loop_flushes_on_size_so_one_batch_cannot_build_a_four_gb_buffer() {
         let src = include_str!("dhan_feed_stack.rs");
-        let test_marker = concat!("#[cfg(", "test)]");
-        let production = src.split(test_marker).next().unwrap_or(src);
+        let production = super::tests::production_before_tests(src);
         let refold_at = production
             .find("pub fn refold_wal_frames")
             .expect("refold_wal_frames must exist");
@@ -21629,7 +22480,10 @@ mod wal_refold_tests {
             "a decode failure must be counted"
         );
         assert!(
-            body.contains("Ok(_non_tick) =>") && body.contains("out.non_tick"),
+            body.contains("ParsedFrame::OiUpdate { .. }")
+                && body.contains("ParsedFrame::Disconnect(_)")
+                && !body.contains("Ok(_non_tick)")
+                && body.contains("out.non_tick"),
             "a legitimate non-tick packet must be counted SEPARATELY, or \
              `undecodable` silently includes ordinary OI and prev-close frames"
         );
@@ -21673,6 +22527,8 @@ mod wal_refold_tests {
             without.inline_depth_rows, 0,
             "with no inline-depth sink there is nothing to append to"
         );
+        assert_eq!(without.depth_refused, 1);
+        assert!(!wal_replay_consumption_complete(without, 0));
 
         let mut with_sink = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4)
             .with_inline_depth(DepthIngest::for_test());
@@ -22103,8 +22959,7 @@ mod silence_latch_tests {
     #[test]
     fn test_risk_gap_03_page_is_rate_limited_across_episodes() {
         let src = include_str!("dhan_feed_stack.rs");
-        let test_marker = concat!("#[cfg(", "test)]");
-        let production = src.split(test_marker).next().unwrap_or(src);
+        let production = super::tests::production_before_tests(src);
 
         assert!(
             production.contains("!silence_reported && !cooling"),
@@ -22290,8 +23145,7 @@ mod contract_attach_tests {
         // The house `test_marker` split is what keeps a source scan measuring
         // the code rather than measuring itself.
         let full = include_str!("dhan_feed_stack.rs");
-        let test_marker = concat!("#[cfg(", "test)]");
-        let src = full.split(test_marker).next().unwrap_or(full);
+        let src = super::tests::production_before_tests(full);
         assert!(
             src.contains("let out_of_time = past_hard_stop || past_deadline_and_window;"),
             "out_of_time gained a term — if that term is the 09:12 deadline, the give-up \
@@ -22376,8 +23230,7 @@ mod contract_attach_tests {
     #[test]
     fn the_mid_session_arm_does_not_emit_the_field_the_alarm_filters_on() {
         let full = include_str!("dhan_feed_stack.rs");
-        let test_marker = concat!("#[cfg(", "test)]");
-        let src = full.split(test_marker).next().unwrap_or(full);
+        let src = super::tests::production_before_tests(full);
 
         let gate = src
             .find("if !preopen_deadline_applies(attach_started_ist) {")
@@ -22420,8 +23273,7 @@ mod contract_attach_tests {
     #[test]
     fn preopen_ready_gauge_is_published_only_on_the_both_halves_success_arm() {
         let full = include_str!("dhan_feed_stack.rs");
-        let test_marker = concat!("#[cfg(", "test)]");
-        let src = full.split(test_marker).next().unwrap_or(full);
+        let src = super::tests::production_before_tests(full);
         assert_eq!(
             src.matches("metrics::gauge!(PREOPEN_READY_GAUGE)").count(),
             1,
@@ -23695,6 +24547,7 @@ mod frame_walk_accounting_tests {
     /// compiler's only word on it was a `duplicated attribute` warning.)
     #[test]
     fn the_daily_reset_clears_the_spot_store_too() {
+        let _serial = super::depth_rebalance_wiring_tests::lock_published_views();
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
         let now = u32::try_from(chrono::Utc::now().timestamp()).unwrap_or(u32::MAX);
         assert_eq!(
@@ -23901,9 +24754,7 @@ mod frame_walk_accounting_tests {
         // the counter must sit OUTSIDE it. A future edit that hoists the log
         // back out restores the per-packet storm silently.
         let source = include_str!("dhan_feed_stack.rs");
-        let production = source
-            .split_once("#[cfg(test)]")
-            .map_or(source, |(prod, _)| prod);
+        let production = super::tests::production_before_tests(source);
         let arm = production
             .split_once("Ok(ParsedFrame::Disconnect(reason)) => {")
             .expect("the decoded-disconnect arm must exist")
@@ -23984,8 +24835,8 @@ mod late_seed_tests {
         assert_eq!(ingest.tracked_instruments(), 2);
     }
 
-    /// The drain must carry a seed arm at all, and it must not be biased ahead
-    /// of frames. Seeding is bookkeeping; a queued frame is data.
+    /// The drain carries a seed arm behind the bounded frame quantum. The
+    /// separate busy-drain test verifies maintenance progress under backlog.
     #[test]
     fn the_drain_has_a_seed_arm_that_does_not_outrank_frames() {
         let src = include_str!("dhan_feed_stack.rs");
@@ -24002,7 +24853,7 @@ mod late_seed_tests {
         assert!(
             frame_arm < seed_arm,
             "the frame arm must come FIRST under `biased;` — seeding must never \
-             preempt draining queued frames"
+             take the initial frame quantum's priority"
         );
 
         // ADDED 2026-09-09. The assertion above pinned only ONE side of the
@@ -24157,24 +25008,40 @@ mod late_seed_tests {
     /// symptom is a `tf` value that is absent from a table nobody reads until
     /// they need it.
     ///
-    /// Two things must line up per cadence, and this asserts both against
+    /// The constructor, guarded select arm and snapshot call must agree on
+    /// each cadence. Check their wiring against
     /// `SnapshotCadence::ALL` rather than a hand-written list: a timer built
-    /// through the aligned constructor, and a `select!` arm naming the
-    /// variant. The `MissedTickBehavior` moved into that constructor on
+    /// through the aligned constructor, and a `select!` arm that marks its
+    /// own maintenance source serviced and snapshots the same variant.
+    /// The `MissedTickBehavior` moved into that constructor on
     /// 2026-09-12 and is asserted ONCE by the test above rather than four
     /// times here.
     #[test]
     fn every_snapshot_cadence_has_a_timer_arm_in_the_drain() {
         let src = include_str!("dhan_feed_stack.rs");
-        let drain = src
-            .split_once("async fn run_frame_drain")
+        let production = super::tests::production_before_tests(src);
+        let drain = production
+            .split_once("async fn run_frame_drain(")
             .expect("the drain must exist")
-            .1;
+            .1
+            .split_once("\n}\n")
+            .expect("the drain must have a top-level closing brace")
+            .0;
+        // Ignore layout and full-line comments; only this production function
+        // can satisfy the guard, never a matching literal in a later test.
+        let drain: String = drain
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(|line| line.chars().filter(|c| !c.is_whitespace()))
+            .collect();
         for cadence in tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ALL {
             let label = cadence.as_str();
             let timer = format!("snapshot_{label}_timer");
+            let variant = format!(
+                "tickvault_storage::top_volume_rank_persistence::SnapshotCadence::{cadence:?}"
+            );
             assert!(
-                drain.contains(&format!("let mut {timer} = snapshot_timer_at(")),
+                drain.contains(&format!("letmut{timer}=snapshot_timer_at({variant},);")),
                 "cadence {label} has no timer: it is in SnapshotCadence::ALL, so \
                  its view and its label exist, but nothing ever fires a snapshot \
                  for it and `top_volume` will hold no `tf = '{label}'` row for \
@@ -24183,10 +25050,28 @@ mod late_seed_tests {
                  `tokio::time::interval` fires its first tick immediately and \
                  anchors that cadence on the drain's start instant instead."
             );
+            let maintenance = format!("DrainMaintenance::Snapshot{label}");
+            let arm_header =
+                format!("_={timer}.tick(),iffairness.allows_maintenance({maintenance})=>{{");
+            let (_, arm) = drain.split_once(&arm_header).unwrap_or_else(|| {
+                panic!(
+                    "cadence {label} has a timer but no select! arm guarded by its \
+                     own maintenance eligibility"
+                )
+            });
+            // Each snapshot arm is followed by another timer arm. Stop there
+            // so a sibling's serviced marker or cadence cannot satisfy this one.
+            let (arm, _) = arm
+                .split_once("}_=")
+                .expect("a snapshot arm must end before the next timer arm");
             assert!(
-                drain.contains(&format!("_ = {timer}.tick() =>")),
-                "cadence {label} has a timer but no select! arm, so the timer is \
-                 constructed and never polled"
+                arm.starts_with(&format!("fairness.maintenance_taken({maintenance});")),
+                "cadence {label} must mark its own maintenance source serviced"
+            );
+            assert!(
+                arm.contains(&format!("letcadence={variant};"))
+                    && arm.contains("ingest.snapshot_top_volume(now_ist_nanos(),cadence)"),
+                "cadence {label} must publish a snapshot with its matching cadence"
             );
         }
     }
@@ -24363,10 +25248,16 @@ mod depth_rebalance_wiring_tests {
     /// into every other test reporting a poisoned lock.
     static PUBLISHED_VIEWS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn lock_published_views() -> std::sync::MutexGuard<'static, ()> {
-        PUBLISHED_VIEWS
+    pub(super) fn lock_published_views() -> std::sync::MutexGuard<'static, ()> {
+        let guard = PUBLISHED_VIEWS
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Fixtures use different simulated times. Clear the timestamped RAM
+        // boards while holding the same guard as publication/reset, otherwise
+        // a prior test's later timestamp correctly rejects an older fixture.
+        crate::top_volume_runtime::global_top_volume_runtime().reset_daily();
+        crate::bucket_top_volume::global_bucket_top_volume_runtime().reset();
+        guard
     }
 
     fn instrument(id: u64) -> SubscribeInstrument {
@@ -24387,24 +25278,49 @@ mod depth_rebalance_wiring_tests {
         (endpoint, 0, tx, instruments)
     }
 
-    /// One end-to-end pass: a folded tick reaches the board, and a snapshot in
-    /// the window produces rows while the same state outside it produces none.
-    ///
-    /// Heavier than a unit test on purpose. The cheap version -- assert `(0, 0)`
-    /// before 09:15 on an ingest with no writer -- passes whether the clock gate
-    /// exists or not, because the no-writer guard returns the same tuple. That
-    /// is the vacuous-pass shape closed in #1884, and this test was written that
-    /// way first: deleting the gate left it green.
-    fn ranking_fixture() -> LiveIngest {
-        ranking_ingest(true)
+    const RANKING_DAY: u32 = 1_779_321_600;
+    // 09:26:40 IST: an exact 5s bucket boundary. Longer first buckets can
+    // honestly remain partial; their publication must expose that quality.
+    const RANKING_SECS: u32 = RANKING_DAY + 34_000;
+
+    fn ranking_tick(
+        id: u64,
+        secs: u32,
+        volume: u32,
+        price: f32,
+    ) -> tickvault_common::tick_types::ParsedTick {
+        tickvault_common::tick_types::ParsedTick {
+            security_id: id,
+            exchange_segment_code: ExchangeSegment::NseFno.binary_code(),
+            last_traded_price: price,
+            exchange_timestamp: secs,
+            // The receipt is UTC epoch, while exchange_timestamp follows the
+            // existing IST epoch convention. Do not accidentally add 5h30m.
+            received_at_nanos: (i64::from(secs) - 19_800) * 1_000_000_000,
+            volume,
+            volume_present: true,
+            ..tickvault_common::tick_types::ParsedTick::default()
+        }
     }
 
-    /// The same board, built with or without the snapshot writer attached.
+    fn fold_ranking_tick(
+        ingest: &mut LiveIngest,
+        tick: &tickvault_common::tick_types::ParsedTick,
+        ordinal: u64,
+    ) {
+        // Fixtures choose an owner clock explicitly rather than deriving the
+        // publication timestamp from the packet under test.
+        ingest
+            .candle_publication_secs_for_test
+            .get_or_insert(RANKING_SECS);
+        let frame_seq = ordinal << tickvault_storage::ws_frame_spill::PACKET_INDEX_BITS;
+        assert!(matches!(
+            ingest.ingest_tick_at(tick, frame_seq, 0, ordinal),
+            IngestOutcome::Folded { .. }
+        ));
+    }
+
     fn ranking_ingest(attach_writer: bool) -> LiveIngest {
-        use tickvault_common::types::ExchangeSegment;
-        // The global map is shared process state. Only this test publishes into
-        // it, and it publishes a superset each time, so a parallel run cannot
-        // observe a narrower map than it needs.
         crate::contract_underlying_map::global_contract_underlying_map().publish_from_legs(&[
             crate::contract_underlying_map::LegIds {
                 contract_security_id: 777,
@@ -24415,270 +25331,689 @@ mod depth_rebalance_wiring_tests {
             },
         ]);
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        ingest.candle_ranking_runtime_for_test = CandleRankingRuntimeHandle::Global(
+            crate::bucket_top_volume::global_bucket_top_volume_runtime(),
+        );
         if attach_writer {
-            // A thread that has already finished. The handle is REQUIRED rather
-            // than optional on purpose: the producer and the join handle are
-            // taken together because a join is only meaningful once the queue
-            // is closed, and the queue closes when the producer drops. Making
-            // the handle optional would let a future spawn site hand over the
-            // producer alone and re-create the exact defect the signature
-            // exists to prevent — a writer thread nothing can ever wait for.
-            // Paying one no-op thread per test is the cost of that guarantee.
             ingest = ingest.with_top_volume_writer(
                 tickvault_storage::top_volume_rank_persistence::TopVolumeRankWriter::for_test(),
                 std::thread::spawn(|| {}),
             );
         }
-        // A previous close AND a folded tick: `gain_pct` needs both, and the
-        // projection REFUSES a non-finite rather than writing a zero percent
-        // that would read as "this contract did not move".
-        ingest.record_previous_close(777, ExchangeSegment::NseFno, 100.0);
-        // The UNDERLYING too: the gainer filter judges the stock, not the
-        // contract. Spot 110 against a close of 100 is a gainer; the store is
-        // floored to the tick's own day first so the print is admitted.
         let underlying = crate::volume_leaderboard::STOCK_OPTION_UNDERLYING_SEGMENT;
-        let secs: u32 = 1_779_321_600 + 34_000;
         ingest.record_previous_close(13, underlying, 100.0);
         ingest
             .spot_prices()
-            .reset_for_trading_day(crate::spot_price_store::ist_day_of(secs));
-        let _ = ingest.record_spot_price(13, underlying, 110.0, secs);
-        let mut tick = tickvault_common::tick_types::ParsedTick::default();
-        tick.security_id = 777;
-        tick.exchange_segment_code = ExchangeSegment::NseFno.binary_code();
-        tick.last_traded_price = 110.0;
-        tick.volume = 5_000;
-        tick.exchange_timestamp = 1_779_321_600 + 34_000;
-        tick.received_at_nanos = i64::from(tick.exchange_timestamp) * 1_000_000_000;
-        // Two ticks, not one: the 2026-09-07 lots-in-window key seeds a newly
-        // tracked contract at its CURRENT cumulative, so a single print ranks
-        // nothing. The second print trades exactly one lot (75 units) inside
-        // the window, which is what puts 777 on the board.
-        tick.volume = 4_925;
-        let _ = ingest.ingest_tick_at(&tick, 1, 0, 1);
-        tick.volume = 5_000;
-        let _ = ingest.ingest_tick_at(&tick, 1, 0, 1);
+            .reset_for_trading_day(crate::spot_price_store::ist_day_of(RANKING_SECS));
+        let _ = ingest.record_spot_price(13, underlying, 110.0, RANKING_SECS);
+        ingest.prepare_candle_ranking(i64::from(RANKING_SECS) * 1_000_000_000);
+        // A real prior 5s candle closes at 99 with an observed zero counter.
+        // The current bar ends at 100 after 100 -> 101 -> 100, so all 300
+        // units are positive even though the final tick moves down. A tick
+        // imbalance would incorrectly return 150. Longer first bars still
+        // lack a preceding same-timeframe close and remain unavailable.
+        for (ordinal, (secs, volume, price)) in [
+            (RANKING_SECS - 5, 0, 99.0),
+            (RANKING_SECS, 0, 100.0),
+            (RANKING_SECS, 225, 101.0),
+            (RANKING_SECS, 300, 100.0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            fold_ranking_tick(
+                &mut ingest,
+                &ranking_tick(777, secs, volume, price),
+                u64::try_from(ordinal).unwrap() + 1,
+            );
+        }
         ingest
     }
 
-    /// The builder is the ONLY thing that opts a lane in to writing snapshots,
-    /// and its failure mode is silence: an ingest with no writer ranks nothing,
-    /// returns `(0, 0)`, and looks exactly like a quiet market. The boot path
-    /// tolerates a failed writer-thread spawn by leaving the writer unattached,
-    /// so this pair is what separates "opted out" from "opted in and empty".
-    #[test]
-    fn with_top_volume_writer_is_what_turns_silence_into_rows() {
-        let _serial = lock_published_views();
-        let day: i64 = 1_779_321_600;
-        let in_window = (day + 34_000) * 1_000_000_000;
-        let cadence = tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond;
-
-        let mut without = ranking_ingest(false);
-        assert_eq!(
-            without.snapshot_top_volume(in_window, cadence),
-            (0, 0),
-            "no writer attached must write nothing, and must not report a refusal \
-             either -- a lane that opted out did not fail"
-        );
-
-        let mut with = ranking_ingest(true);
-        let (rows, _) = with.snapshot_top_volume(in_window, cadence);
-        assert!(
-            rows >= 1,
-            "the same board with the writer attached must write rows, got {rows}"
-        );
+    fn ranking_fixture() -> LiveIngest {
+        ranking_ingest(false)
     }
 
-    /// The depth-200 steering publish rides the 5-SECOND ranking pass.
-    ///
-    /// Asserts on the process-wide view because that is the seam under test —
-    /// the drain writes it and the steering loop reads it, and a test against a
-    /// private instance would prove the module works while the wiring did not
-    /// exist. Written to be parallel-safe: every test in this module ranks the
-    /// SAME fixture contract, so the assertions are "was published" and
-    /// "contains 777", both of which any concurrent publisher of this fixture
-    /// also satisfies. Nothing here asserts an ABSENCE on the global, which is
-    /// the assertion a parallel run could break.
+    #[test]
+    fn an_unprepared_ingest_fixture_cannot_erase_another_fixtures_published_winner() {
+        let _serial = lock_published_views();
+        let _published_ingest = ranking_fixture();
+        let runtime = crate::bucket_top_volume::global_bucket_top_volume_runtime();
+        let request = canonical_request(RANKING_SECS);
+        let before = runtime.load_winner_for_decision(request).unwrap();
+
+        let mut unrelated = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        let isolated = unrelated.candle_ranking_runtime();
+        assert!(
+            !std::ptr::eq::<crate::bucket_top_volume::BucketTopVolumeRuntime>(&*isolated, runtime,),
+            "ordinary unit fixtures must own a distinct ranking runtime"
+        );
+        assert!(
+            !unrelated.candle_ranking.require_current_metadata(
+                crate::contract_underlying_map::global_contract_underlying_map(),
+                &isolated,
+            ),
+            "unprepared metadata must still refuse and invalidate its own runtime"
+        );
+
+        // This is the competing test's actual path: its zero metadata version
+        // differs from the prepared global map, so each operation invalidates
+        // its runtime. Previously this cleared the other fixture's winner
+        // between the zero-counter invalidation and that test's read.
+        fold_ranking_tick(
+            &mut unrelated,
+            &ranking_tick(777, RANKING_SECS, 0, 100.0),
+            1,
+        );
+        unrelated.seal_open_buckets_at_close();
+        unrelated.reset_ranking_daily();
+
+        let after = runtime.load_winner_for_decision(request).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&before, &after));
+        assert_eq!(after.first().unwrap().estimated_net_volume, Some(300));
+    }
+
+    fn canonical_request(now: u32) -> crate::bucket_top_volume::BucketDecisionRequest {
+        use crate::volume_leaderboard::OptionFamily;
+        use tickvault_trading::candles::TfIndex;
+        let snapshot = crate::bucket_top_volume::global_bucket_top_volume_runtime()
+            .load_winner(OptionFamily::Stock, TfIndex::S5)
+            .expect("canonical winner published by tick batch");
+        crate::bucket_top_volume::BucketDecisionRequest {
+            feed: Feed::Dhan,
+            family: OptionFamily::Stock,
+            tf: TfIndex::S5,
+            session_day: RANKING_SECS / 86_400,
+            universe_version: snapshot.universe_version,
+            metric: crate::bucket_top_volume::BucketVolumeMetric::SignedBarVolumeVsOneLotV3,
+            bucket_start_secs: RANKING_SECS,
+            now_secs: now,
+            max_age_secs: 5,
+            require_closed: false,
+        }
+    }
+
+    #[test]
+    fn canonical_rows_and_winner_do_not_depend_on_top_volume_writer_attachment() {
+        use crate::volume_leaderboard::OptionFamily;
+        use tickvault_trading::candles::TfIndex;
+        let _serial = lock_published_views();
+        let runtime = crate::bucket_top_volume::global_bucket_top_volume_runtime();
+        let mut without = ranking_ingest(false);
+        assert!(without.top_volume.is_none());
+        let first = runtime
+            .load_winner_for_decision(canonical_request(RANKING_SECS))
+            .unwrap();
+        // The winner is current before any full board or persistence timer.
+        assert!(runtime.load(OptionFamily::Stock, TfIndex::S5).is_none());
+        let (without_rows, without_refused) = without.snapshot_top_volume(
+            i64::from(RANKING_SECS) * 1_000_000_000,
+            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond,
+        );
+        assert!(without_rows > 0);
+        assert_eq!(without_refused, 0);
+        let mut with = ranking_ingest(true);
+        let (with_rows, with_refused) = with.snapshot_top_volume(
+            i64::from(RANKING_SECS) * 1_000_000_000,
+            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond,
+        );
+        assert_eq!((with_rows, with_refused), (without_rows, without_refused));
+        let second = runtime
+            .load_winner_for_decision(canonical_request(RANKING_SECS))
+            .unwrap();
+        assert_eq!(
+            first.first().unwrap().gross_volume,
+            second.first().unwrap().gross_volume
+        );
+        assert_eq!(first.first().unwrap().estimated_net_volume, Some(300));
+        assert_eq!(
+            second.first().unwrap().score_milli_pct(second.metric),
+            Some(300_000)
+        );
+        // Canonical ranking never writes the detached legacy snapshot table.
+        assert_eq!(with.top_volume.as_ref().unwrap().pending(), 0);
+    }
+
+    #[test]
+    fn written_untraded_zero_revokes_an_already_eligible_candle_winner() {
+        use crate::bucket_top_volume::BucketDecisionRefusal;
+        use crate::volume_leaderboard::OptionFamily;
+        use tickvault_trading::candles::TfIndex;
+
+        let _serial = lock_published_views();
+        let runtime = crate::bucket_top_volume::global_bucket_top_volume_runtime();
+        // Both vendor sentinel shapes preserve the raw tick without folding
+        // a zero price. Their canonical counter invalidation must still reach
+        // ranking, including the exchange-time-zero early-return path.
+        let observed_at = RANKING_SECS + 1;
+        for exchange_timestamp in [0, observed_at] {
+            let mut ingest = ranking_fixture();
+            ingest.candle_publication_secs_for_test = Some(observed_at);
+            let request = canonical_request(observed_at);
+            let before = runtime.load_winner_for_decision(request).unwrap();
+            assert_eq!(before.first().unwrap().estimated_net_volume, Some(300));
+            // A sentinel does not advance the candle watermark. Publication
+            // must use a valid observation/publication clock, not backdate
+            // this revocation to the previous price-bearing trade.
+            let mut zero = ranking_tick(777, observed_at, 0, 0.0);
+            zero.exchange_timestamp = exchange_timestamp;
+            let frame_seq = 5 << tickvault_storage::ws_frame_spill::PACKET_INDEX_BITS;
+            assert!(matches!(
+                ingest.ingest_tick_at(&zero, frame_seq, 0, 5),
+                IngestOutcome::WrittenOutOfSession
+            ));
+
+            let after = runtime
+                .load_winner(OptionFamily::Stock, TfIndex::S5)
+                .expect("canonical invalidation replaces the prior winner immediately");
+            assert!(after.revision > before.revision);
+            assert_eq!(after.coverage.observed_contracts, 1);
+            assert_eq!(after.coverage.eligible_contracts, 0);
+            assert_eq!(after.coverage.uncertain_contracts, 1);
+            assert!(after.first().is_none());
+            assert!(matches!(
+                runtime.load_winner_for_decision(request),
+                Err(BucketDecisionRefusal::IncompleteUniverse)
+            ));
+
+            ingest.snapshot_top_volume(
+                i64::from(observed_at) * 1_000_000_000,
+                tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond,
+            );
+            let table = runtime.load(OptionFamily::Stock, TfIndex::S5).unwrap();
+            assert!(table.rows.is_empty());
+            assert_eq!(table.coverage.uncertain_contracts, 1);
+        }
+    }
+
     #[test]
     fn the_five_second_pass_publishes_the_depth200_steering_candidates() {
         let _serial = lock_published_views();
         let mut ingest = ranking_fixture();
-        let day: i64 = 1_779_321_600;
-        let in_window = (day + 34_000) * 1_000_000_000;
-        ingest.snapshot_top_volume(
-            in_window,
+        let (rows, refused) = ingest.snapshot_top_volume(
+            i64::from(RANKING_SECS) * 1_000_000_000,
             tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond,
         );
+        assert!(rows > 0);
+        assert_eq!(refused, 0);
         let published = crate::depth200_candidates::global_depth200_candidates()
             .latest()
-            .expect("the 5s pass must PUBLISH, even if the ranking were empty");
-        assert!(
-            published.iter().any(|c| c.security_id == 777),
-            "the ranked stock option must reach the steering view, got {published:?}"
-        );
+            .unwrap();
+        let candidate = published.iter().find(|row| row.security_id == 777).unwrap();
+        assert_eq!(candidate.window_lots_milli, 4_000);
     }
 
-    /// Steering is not a persistence feature.
-    ///
-    /// The boot path tolerates a failed top-volume writer-thread spawn by
-    /// leaving the writer unattached. Before this wiring that early return also
-    /// skipped the ranking, so a rare degrade of one TABLE would have become a
-    /// silent degrade of the depth POOL — the pool would have steered on
-    /// nothing, with no counter to say so.
     #[test]
     fn candidates_are_published_even_when_no_snapshot_writer_is_attached() {
         let _serial = lock_published_views();
         let mut ingest = ranking_ingest(false);
-        let day: i64 = 1_779_321_600;
-        let in_window = (day + 34_000) * 1_000_000_000;
+        assert!(ingest.top_volume.is_none());
         let (rows, refused) = ingest.snapshot_top_volume(
-            in_window,
+            i64::from(RANKING_SECS) * 1_000_000_000,
             tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond,
         );
-        assert_eq!(
-            (rows, refused),
-            (0, 0),
-            "no writer still means no rows -- only the candidates changed"
+        assert!(
+            rows > 0,
+            "rows are materialized RAM rows, not claimed DB writes"
         );
+        assert_eq!(refused, 0);
         let published = crate::depth200_candidates::global_depth200_candidates()
             .latest()
-            .expect("a writer-less lane must still publish steering candidates");
-        assert!(
-            published.iter().any(|c| c.security_id == 777),
-            "got {published:?}"
-        );
+            .unwrap();
+        assert!(published.iter().any(|row| row.security_id == 777));
     }
 
-    /// The published list is bounded by the socket budget, not by the board.
-    ///
-    /// Five sockets exist, so publishing 250 rows would hand the steering loop
-    /// a wish-list it can never satisfy and make every divergence report read
-    /// as 245 unheld contracts every minute. Since the hysteresis band the
-    /// bound is the entry set PLUS the band, never the whole board.
     #[test]
     fn the_published_list_never_exceeds_the_depth200_entry_set_plus_band() {
         let _serial = lock_published_views();
         let mut ingest = ranking_fixture();
-        let day: i64 = 1_779_321_600;
-        let in_window = (day + 34_000) * 1_000_000_000;
         ingest.snapshot_top_volume(
-            in_window,
+            i64::from(RANKING_SECS) * 1_000_000_000,
             tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond,
         );
         let published = crate::depth200_candidates::global_depth200_candidates()
             .latest()
-            .expect("published");
-        assert!(
-            published.len() <= crate::depth200_candidates::DEPTH200_EXIT_UNDERLYINGS,
-            "published {} for {} entry slots plus band",
-            published.len(),
-            crate::depth200_candidates::DEPTH200_EXIT_UNDERLYINGS
-        );
+            .unwrap();
+        assert!(!published.is_empty());
+        assert!(published.len() <= crate::depth200_candidates::DEPTH200_EXIT_UNDERLYINGS);
     }
 
     #[test]
-    fn a_folded_tick_reaches_the_board_and_a_snapshot_in_the_window_writes_rows() {
+    fn depth200_reaches_distinct_gainers_beyond_the_depth20_contract_limit() {
+        use crate::contract_underlying_map::LegIds;
+        use crate::volume_leaderboard::OptionFamily;
         let _serial = lock_published_views();
-        let mut ingest = ranking_fixture();
-        let day: i64 = 1_779_321_600;
-        let in_window = (day + 34_000) * 1_000_000_000;
-        let (rows, _refused) = ingest.snapshot_top_volume(
-            in_window,
-            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond,
-        );
-        assert!(
-            rows >= 1,
-            "a folded tick with a previous close must produce at least one row, got {rows}"
-        );
-    }
-
-    #[test]
-    fn the_same_board_writes_nothing_outside_the_capture_window() {
-        let _serial = lock_published_views();
-        // Same fixture, same board, only the clock differs. Deleting the gate
-        // in `snapshot_top_volume` makes THIS fail -- which the cheap version
-        // of the test could not do.
-        let mut ingest = ranking_fixture();
-        let day: i64 = 1_779_321_600;
-        let pre_open = (day + 33_299) * 1_000_000_000;
-        let (rows, refused) = ingest.snapshot_top_volume(
-            pre_open,
-            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond,
-        );
-        assert_eq!(
-            (rows, refused),
-            (0, 0),
-            "09:14:59 is one second before capture opens"
-        );
-    }
-
-    #[test]
-    fn snapshot_top_volume_writes_nothing_outside_the_capture_window() {
-        let _serial = lock_published_views();
-        // The clock gate runs FIRST, before any ranking work. Outside the
-        // window there is nothing to publish, and ranking to discover that
-        // would pay the sort ~23,000 times a session for nothing.
+        let contract_limit = crate::depth20_ranked_steer::DEPTH20_EXIT_RANKS;
+        let underlying_limit = crate::depth200_candidates::DEPTH200_EXIT_UNDERLYINGS;
+        let count = contract_limit + underlying_limit - 1;
+        let legs: Vec<_> = (0..count)
+            .map(|index| {
+                let name = if index < contract_limit {
+                    0
+                } else {
+                    index - contract_limit + 1
+                };
+                LegIds {
+                    contract_security_id: 100_000 + i64::try_from(index).unwrap(),
+                    underlying_security_id: 60_000 + i64::try_from(name).unwrap(),
+                    contract_segment: ExchangeSegment::NseFno,
+                    family: OptionFamily::Stock,
+                    lot_size: 1,
+                }
+            })
+            .collect();
+        crate::contract_underlying_map::global_contract_underlying_map().publish_from_legs(&legs);
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
-        // 09:14:59 IST on an exact-day boundary — one second before capture opens.
-        let day: i64 = 1_779_321_600;
-        let pre_open = (day + 33_299) * 1_000_000_000;
-        let (rows, refused) = ingest.snapshot_top_volume(
-            pre_open,
-            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond,
+        ingest.candle_ranking_runtime_for_test = CandleRankingRuntimeHandle::Global(
+            crate::bucket_top_volume::global_bucket_top_volume_runtime(),
         );
-        assert_eq!((rows, refused), (0, 0), "the pre-open must publish nothing");
-    }
-
-    #[test]
-    fn snapshot_top_volume_writes_nothing_without_a_writer() {
-        let _serial = lock_published_views();
-        // The honest degrade when the writer thread could not be spawned: no
-        // rows, and specifically NOT a synchronous flush on the frame drain.
-        // In-window, so the clock gate cannot be what makes this pass.
-        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
-        let day: i64 = 1_779_321_600;
-        let in_window = (day + 40_000) * 1_000_000_000;
-        assert!(crate::top_volume_snapshot::within_capture_window(
-            crate::top_volume_snapshot::secs_of_day_ist(in_window)
-        ));
+        ingest.prepare_candle_ranking(i64::from(RANKING_SECS) * 1_000_000_000);
+        let underlying_segment = crate::volume_leaderboard::STOCK_OPTION_UNDERLYING_SEGMENT;
+        ingest
+            .spot_prices()
+            .reset_for_trading_day(crate::spot_price_store::ist_day_of(RANKING_SECS));
+        for index in 0..underlying_limit {
+            let id = 60_000 + u64::try_from(index).unwrap();
+            ingest.record_previous_close(id, underlying_segment, 100.0);
+            let _ = ingest.record_spot_price(id, underlying_segment, 110.0, RANKING_SECS);
+        }
+        // Establish every contract's predecessor before opening any current
+        // bar, keeping both event time and capture sequences ordered here.
+        for (index, leg) in legs.iter().enumerate() {
+            fold_ranking_tick(
+                &mut ingest,
+                &ranking_tick(
+                    u64::try_from(leg.contract_security_id).unwrap(),
+                    RANKING_SECS - 5,
+                    0,
+                    99.0,
+                ),
+                u64::try_from(index).unwrap() + 1,
+            );
+        }
+        for (index, leg) in legs.iter().enumerate() {
+            let first_sequence =
+                u64::try_from(legs.len()).unwrap() + u64::try_from(index).unwrap() * 2 + 1;
+            let security_id = u64::try_from(leg.contract_security_id).unwrap();
+            fold_ranking_tick(
+                &mut ingest,
+                &ranking_tick(security_id, RANKING_SECS, 0, 100.0),
+                first_sequence,
+            );
+            fold_ranking_tick(
+                &mut ingest,
+                &ranking_tick(
+                    security_id,
+                    RANKING_SECS,
+                    u32::try_from(count - index).unwrap(),
+                    101.0,
+                ),
+                first_sequence + 1,
+            );
+        }
         let (rows, refused) = ingest.snapshot_top_volume(
-            in_window,
+            i64::from(RANKING_SECS) * 1_000_000_000,
             tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond,
         );
-        assert_eq!((rows, refused), (0, 0));
+        assert!(rows >= count);
+        assert_eq!(refused, 0);
+        let depth20 = crate::depth20_ranked_steer::global_depth20_candidates()
+            .latest()
+            .unwrap();
+        let depth200 = crate::depth200_candidates::global_depth200_candidates()
+            .latest()
+            .unwrap();
+        assert_eq!(depth20.len(), contract_limit);
+        assert!(depth20.iter().all(|row| row.underlying_id == 60_000));
+        assert_eq!(depth200.len(), underlying_limit);
+        for (index, row) in depth200.iter().enumerate() {
+            let contract_index = if index == 0 {
+                0
+            } else {
+                contract_limit + index - 1
+            };
+            assert_eq!(
+                row.security_id,
+                100_000 + u64::try_from(contract_index).unwrap()
+            );
+            assert_eq!(row.underlying_id, 60_000 + u64::try_from(index).unwrap());
+        }
     }
 
     #[test]
-    fn ist_day_number_now_moves_once_per_day_and_is_stable_within_one() {
-        // Equality against the previous value is the ONLY operation, so what
-        // matters is that it does not flap inside a day and does advance across
-        // one. Two reads microseconds apart must agree.
-        let a = ist_day_number_now();
-        let b = ist_day_number_now();
-        assert_eq!(a, b, "the day number must not flap within a single day");
-        // A day number derived from the same clock must be positive in any
-        // realistic present -- a negative value would mean a pre-1970 clock,
-        // which floor division handles without wrapping but which would also
-        // make the reset fire once and then settle.
+    fn a_folded_tick_reaches_the_board_with_the_same_candle_quantity_and_metadata() {
+        use crate::volume_leaderboard::OptionFamily;
+        use tickvault_trading::candles::TfIndex;
+        let _serial = lock_published_views();
+        let mut ingest = ranking_fixture();
+        let runtime = crate::bucket_top_volume::global_bucket_top_volume_runtime();
+        let before = runtime
+            .load_winner_for_decision(canonical_request(RANKING_SECS))
+            .unwrap();
+        let pinned = ingest
+            .candle_ranking
+            .metadata(777, ExchangeSegment::NseFno.binary_code());
+        let row = before.first().unwrap();
+        assert_eq!(
+            (row.gross_volume, row.estimated_net_volume),
+            (300, Some(300))
+        );
+        assert_eq!(row.lot_size, pinned.lot_size);
+        assert_eq!(
+            row.instrument_definition_version,
+            pinned.instrument_definition_version
+        );
+        assert_eq!(row.volume_quality, 0);
+        assert!(!row.closed, "the current bucket has not expired yet");
+        ingest.candle_publication_secs_for_test = Some(before.bucket_end_secs);
+        ingest.catch_up_seal_through(before.bucket_end_secs);
+        let after = runtime
+            .load_winner(OptionFamily::Stock, TfIndex::S5)
+            .unwrap();
+        assert_eq!(after.first().unwrap().gross_volume, row.gross_volume);
+        assert_eq!(
+            after.first().unwrap().estimated_net_volume,
+            row.estimated_net_volume
+        );
+        assert!(after.first().unwrap().closed);
+        assert!(after.first().unwrap().revision > row.revision);
+        assert_eq!(
+            after.first().unwrap().last_observed_secs,
+            row.last_observed_secs
+        );
+        let mut closed_request = canonical_request(before.bucket_end_secs);
+        closed_request.require_closed = true;
+        assert!(runtime.load_winner_for_decision(closed_request).is_ok());
+    }
+
+    #[test]
+    fn an_administrative_flush_publishes_quantity_without_certifying_bucket_expiry() {
+        use crate::volume_leaderboard::OptionFamily;
+        use tickvault_trading::candles::TfIndex;
+        let _serial = lock_published_views();
+        let mut ingest = ranking_fixture();
+        let runtime = crate::bucket_top_volume::global_bucket_top_volume_runtime();
+        let before = runtime
+            .load_winner_for_decision(canonical_request(RANKING_SECS))
+            .unwrap();
+        let row = before.first().unwrap();
+        ingest.seal_open_buckets_at_close();
+        let after = runtime
+            .load_winner(OptionFamily::Stock, TfIndex::S5)
+            .unwrap();
+        let flushed = after.first().unwrap();
+        assert_eq!(flushed.gross_volume, row.gross_volume);
+        assert_eq!(flushed.estimated_net_volume, row.estimated_net_volume);
+        assert_eq!(flushed.last_observed_secs, row.last_observed_secs);
+        assert!(flushed.revision > row.revision);
         assert!(
-            a > 19_000,
-            "epoch-day for any date after 2022 exceeds 19,000"
+            !flushed.closed,
+            "a forced flush supplies no observation-window cutoff"
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_counter_decrease_revokes_the_prepared_canonical_winner() {
+        use crate::bucket_top_volume::BucketDecisionRefusal;
+        let _serial = lock_published_views();
+        let mut ingest = ranking_fixture();
+        let runtime = crate::bucket_top_volume::global_bucket_top_volume_runtime();
+        let request = canonical_request(RANKING_SECS);
+        assert!(runtime.load_winner_for_decision(request).is_ok());
+        fold_ranking_tick(&mut ingest, &ranking_tick(777, RANKING_SECS, 1, 102.0), 5);
+        let rejected = runtime.load_winner_for_decision(request).unwrap_err();
+        assert_eq!(rejected, BucketDecisionRefusal::IncompleteUniverse);
+        let diagnostic = runtime.load_winner(request.family, request.tf).unwrap();
+        assert_eq!(diagnostic.coverage.uncertain_contracts, 1);
+        assert!(diagnostic.first().is_none());
+    }
+
+    #[test]
+    fn interleaved_and_replayed_receipts_do_not_backdate_candle_publication() {
+        use crate::bucket_top_volume::{
+            BucketDecisionRefusal, BucketDecisionRequest, BucketVolumeMetric,
+        };
+        use crate::contract_underlying_map::LegIds;
+        use crate::volume_leaderboard::OptionFamily;
+        use tickvault_trading::candles::TfIndex;
+
+        let _serial = lock_published_views();
+        crate::contract_underlying_map::global_contract_underlying_map().publish_from_legs(&[
+            LegIds {
+                contract_security_id: 777,
+                underlying_security_id: 13,
+                contract_segment: ExchangeSegment::NseFno,
+                family: OptionFamily::Stock,
+                lot_size: 100,
+            },
+            LegIds {
+                contract_security_id: 778,
+                underlying_security_id: 14,
+                contract_segment: ExchangeSegment::NseFno,
+                family: OptionFamily::Stock,
+                lot_size: 100,
+            },
+        ]);
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        ingest.candle_ranking_runtime_for_test = CandleRankingRuntimeHandle::Global(
+            crate::bucket_top_volume::global_bucket_top_volume_runtime(),
+        );
+        ingest.prepare_candle_ranking(i64::from(RANKING_SECS) * 1_000_000_000);
+        ingest.candle_publication_secs_for_test = Some(RANKING_SECS + 2);
+        fold_ranking_tick(
+            &mut ingest,
+            &ranking_tick(777, RANKING_SECS - 5, 0, 99.0),
+            1,
+        );
+        fold_ranking_tick(
+            &mut ingest,
+            &ranking_tick(778, RANKING_SECS - 5, 0, 99.0),
+            2,
+        );
+        fold_ranking_tick(&mut ingest, &ranking_tick(777, RANKING_SECS, 0, 100.0), 3);
+        fold_ranking_tick(&mut ingest, &ranking_tick(778, RANKING_SECS, 0, 100.0), 4);
+        // A's later receipt was drained first; B's older receipt belongs to
+        // another socket/instrument and remains a valid same-bucket update.
+        fold_ranking_tick(
+            &mut ingest,
+            &ranking_tick(777, RANKING_SECS + 1, 100, 101.0),
+            5,
+        );
+        fold_ranking_tick(&mut ingest, &ranking_tick(778, RANKING_SECS, 200, 101.0), 6);
+        let runtime = crate::bucket_top_volume::global_bucket_top_volume_runtime();
+        let request = BucketDecisionRequest {
+            feed: Feed::Dhan,
+            family: OptionFamily::Stock,
+            tf: TfIndex::S5,
+            session_day: RANKING_SECS / 86_400,
+            universe_version: ingest.candle_ranking.generation(),
+            metric: BucketVolumeMetric::SignedBarVolumeVsOneLotV3,
+            bucket_start_secs: RANKING_SECS,
+            now_secs: RANKING_SECS + 2,
+            max_age_secs: 5,
+            require_closed: false,
+        };
+        let winner = runtime.load_winner_for_decision(request).unwrap();
+        assert_eq!(winner.published_secs, RANKING_SECS + 2);
+        assert_eq!(winner.coverage.newest_observed_secs, Some(RANKING_SECS + 1));
+        assert_eq!(winner.first().unwrap().security_id, 778);
+        assert_eq!(winner.first().unwrap().gross_volume, 200);
+        assert_eq!(winner.first().unwrap().estimated_net_volume, Some(200));
+
+        // An old replay can be processed now without making its source data
+        // current. Publication time is fresh, but strict source age refuses.
+        ingest.candle_publication_secs_for_test = Some(RANKING_SECS + 100);
+        ingest.replaying_wal = true;
+        fold_ranking_tick(&mut ingest, &ranking_tick(778, RANKING_SECS, 300, 102.0), 7);
+        ingest.replaying_wal = false;
+        let replayed = runtime
+            .load_winner(OptionFamily::Stock, TfIndex::S5)
+            .unwrap();
+        assert_eq!(replayed.published_secs, RANKING_SECS + 100);
+        assert_eq!(replayed.coverage.oldest_observed_secs, Some(RANKING_SECS));
+        assert_eq!(
+            runtime
+                .load_winner_for_decision(BucketDecisionRequest {
+                    now_secs: RANKING_SECS + 100,
+                    ..request
+                })
+                .unwrap_err(),
+            BucketDecisionRefusal::StaleInstrument
+        );
+    }
+
+    #[test]
+    fn maintenance_does_not_fabricate_fresh_rows_when_no_new_observation_arrived() {
+        use crate::bucket_top_volume::BucketDecisionRefusal;
+        let _serial = lock_published_views();
+        let mut ingest = ranking_fixture();
+        let cadence = tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond;
+        let runtime = crate::bucket_top_volume::global_bucket_top_volume_runtime();
+        assert!(
+            ingest
+                .snapshot_top_volume(i64::from(RANKING_SECS) * 1_000_000_000, cadence)
+                .0
+                > 0
+        );
+        let request = canonical_request(RANKING_SECS + 60);
+        let before = runtime.load(request.family, request.tf).unwrap();
+        assert_eq!(
+            ingest.snapshot_top_volume(i64::from(RANKING_SECS + 60) * 1_000_000_000, cadence),
+            (0, 0)
+        );
+        let after = runtime.load(request.family, request.tf).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&before, &after));
+        assert_eq!(after.published_secs, RANKING_SECS);
+        assert_eq!(
+            runtime.load_winner_for_decision(request).unwrap_err(),
+            BucketDecisionRefusal::StalePublication
+        );
+    }
+
+    #[test]
+    fn future_publication_time_is_not_backdated_into_a_fresh_board() {
+        let _serial = lock_published_views();
+        let mut ingest = ranking_fixture();
+        let runtime = crate::bucket_top_volume::global_bucket_top_volume_runtime();
+        let (rows, refused) = ingest.snapshot_top_volume(
+            i64::from(RANKING_SECS - 1) * 1_000_000_000,
+            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond,
+        );
+        assert_eq!(rows, 0);
+        assert!(refused > 0);
+        assert_eq!(
+            runtime
+                .load_winner_for_decision(canonical_request(RANKING_SECS - 1))
+                .unwrap_err(),
+            crate::bucket_top_volume::BucketDecisionRefusal::FutureClock
+        );
+    }
+
+    #[test]
+    fn writerless_snapshots_publish_only_four_rankings_without_narrowing_candles() {
+        use crate::volume_leaderboard::OptionFamily;
+        use tickvault_trading::candles::{TOP_VOLUME_TF_COUNT, TfIndex};
+        let _serial = lock_published_views();
+        let mut ingest = ranking_fixture();
+        assert!(ingest.top_volume.is_none());
+        let runtime = crate::bucket_top_volume::global_bucket_top_volume_runtime();
+        let (rows, refused) = ingest.snapshot_top_volume(
+            i64::from(RANKING_SECS) * 1_000_000_000,
+            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond,
+        );
+        assert!(rows > 0);
+        assert_eq!(refused, 0);
+        let mut held = Vec::new();
+        for tf in TfIndex::ALL {
+            let candle = ingest
+                .aggregator
+                .snapshot(Feed::Dhan, 777, ExchangeSegment::NseFno.binary_code(), tf)
+                .expect("every one of the ten candle frames must still be folded");
+            assert_eq!(candle.bucket_start_ist_secs, tf.bucket_start(RANKING_SECS));
+            assert_eq!(candle.volume, 300);
+            if matches!(tf, TfIndex::S1 | TfIndex::S3 | TfIndex::S5) {
+                assert_eq!(candle.bucket_open_prev_close, 99.0);
+                assert_eq!(candle.signed_bar_volume(), Some(300));
+            } else {
+                assert_eq!(candle.bucket_open_prev_close, 0.0);
+                assert_eq!(candle.signed_bar_volume(), None);
+            }
+            if !tf.is_top_volume() {
+                for family in [OptionFamily::Stock, OptionFamily::Index] {
+                    assert!(runtime.load(family, tf).is_none());
+                    assert!(runtime.load_winner(family, tf).is_none());
+                }
+            }
+        }
+        for tf in TfIndex::TOP_VOLUME_ALL {
+            for family in [OptionFamily::Stock, OptionFamily::Index] {
+                let board = runtime
+                    .load(family, tf)
+                    .expect("explicit family state for each requested Top Volume frame");
+                assert_eq!(board.tf, tf);
+                assert_eq!(board.bucket_start_secs, tf.bucket_start(RANKING_SECS));
+                assert_eq!(
+                    board.bucket_end_secs,
+                    tf.bucket_end(board.bucket_start_secs)
+                );
+                if family == OptionFamily::Stock {
+                    assert_eq!(board.coverage.expected_contracts, 1);
+                    assert_eq!(board.coverage.observed_contracts, 1);
+                } else {
+                    assert_eq!(board.coverage.expected_contracts, 0);
+                    assert!(board.rows.is_empty());
+                }
+                held.push(board);
+            }
+        }
+        ingest.reset_ranking_daily();
+        for tf in TfIndex::ALL {
+            for family in [OptionFamily::Stock, OptionFamily::Index] {
+                assert!(runtime.load(family, tf).is_none());
+                assert!(runtime.load_winner(family, tf).is_none());
+            }
+        }
+        assert_eq!(held.len(), TOP_VOLUME_TF_COUNT * 2);
+        assert!(
+            held.iter()
+                .all(|board| board.published_secs == RANKING_SECS)
         );
     }
 
     #[test]
     fn reset_ranking_daily_clears_both_stores_together() {
-        // They are read as a PAIR -- gain divides an LTP by a previous close --
-        // so clearing one and keeping the other computes today's price against
-        // yesterday's close for every contract, with nothing saying so.
-        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
-        ingest.record_previous_close(77, tickvault_common::types::ExchangeSegment::NseFno, 101.5);
-        assert_eq!(ingest.prev_close().tracked(), 1);
+        let _serial = lock_published_views();
+        let mut ingest = ranking_fixture();
+        assert!(ingest.prev_close().tracked() > 0);
         ingest.reset_ranking_daily();
+        assert_eq!(ingest.prev_close().tracked(), 0);
+    }
+
+    #[test]
+    fn ist_day_number_now_moves_once_per_day_and_is_stable_within_one() {
+        let first = ist_day_number_now();
+        assert_eq!(first, ist_day_number_now());
+        assert!(first > 19_000);
+    }
+
+    /// Legacy writer compatibility is deliberately exercised through the
+    /// explicitly named retired calculation, not the production entry point.
+    #[test]
+    fn legacy_snapshot_writer_attachment_controls_only_legacy_persistence() {
+        let _serial = lock_published_views();
+        let mut ingest = ranking_ingest(true);
+        for volume in [4_925, 5_000] {
+            ingest.observe_for_ranking(&ranking_tick(777, RANKING_SECS, volume, 110.0));
+        }
+        let (rows, _refused) = ingest.snapshot_legacy_top_volume(
+            i64::from(RANKING_SECS) * 1_000_000_000,
+            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond,
+        );
+        assert!(rows > 0);
         assert_eq!(
-            ingest.prev_close().tracked(),
+            ingest.top_volume.as_ref().unwrap().pending(),
             0,
-            "the previous-close half must clear with the leaderboard"
+            "disconnected legacy test flush does not prove a database write"
         );
     }
 
