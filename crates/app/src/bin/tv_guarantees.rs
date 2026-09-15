@@ -357,6 +357,19 @@ fn count_substring_scoped(root: &Path, needles: &[&str], production_only: bool) 
                 if production_only && path.file_name().is_some_and(|n| n == "tests.rs") {
                     continue;
                 }
+                // Match the production panic guard: an inner file attribute
+                // before any code excludes the entire module from release.
+                // A scattered item attribute or a later attribute decoy must
+                // never hide production code that follows it.
+                if production_only
+                    && text
+                        .lines()
+                        .map(str::trim)
+                        .find(|line| !line.is_empty() && !line.starts_with("//"))
+                        == Some("#![cfg(test)]")
+                {
+                    continue;
+                }
                 // This binary's own source names every needle it scans for.
                 // Counting itself would inflate every row it appears in.
                 if path.file_name().is_some_and(|n| n == "tv_guarantees.rs") {
@@ -2236,7 +2249,66 @@ fn main() {
 
 #[cfg(test)]
 mod evidence_render_tests {
-    use super::{Row, Verdict, render, render_html};
+    use super::{Row, Verdict, count_substring_scoped, render, render_html};
+
+    #[test]
+    fn production_scan_excludes_only_a_leading_whole_file_test_attribute() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("fixture clock after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tv-guarantees-cfg-test-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("create isolated scanner fixture");
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        for (source, expected) in [
+            ("#![cfg(test)]\nfn fixture() { panic!(\"test\"); }", 0),
+            (
+                "// test fixture\n\n#![cfg(test)]\nfn fixture() { panic!(\"test\"); }",
+                0,
+            ),
+            (
+                "// #![cfg(test)]\nfn production() { panic!(\"abort\"); }",
+                1,
+            ),
+            (
+                "#[cfg(test)]\nfn helper() {}\nfn production() { panic!(\"abort\"); }",
+                1,
+            ),
+            (
+                "#![cfg_attr(test, allow(dead_code))]\nfn production() { panic!(\"abort\"); }",
+                1,
+            ),
+            (
+                "const TEXT: &str = r#\"\n#![cfg(test)]\n\"#;\nfn production() { panic!(\"abort\"); }",
+                1,
+            ),
+            (
+                "fn earlier() {}\n#![cfg(test)]\nfn production() { panic!(\"abort\"); }",
+                1,
+            ),
+        ] {
+            std::fs::write(root.join("fixture.rs"), source).expect("write scanner input");
+            assert_eq!(
+                count_substring_scoped(&root, &["panic!("], true),
+                expected,
+                "production source classification: {source}"
+            );
+            assert_eq!(
+                count_substring_scoped(&root, &["panic!("], false),
+                1,
+                "the complete test/source count must still include its panic: {source}"
+            );
+        }
+    }
 
     #[test]
     fn references_and_checked_predicates_remain_distinct_in_both_outputs() {

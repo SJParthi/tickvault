@@ -4040,10 +4040,9 @@ mod tests {
     /// describe individual calls. Fixture construction and correctness checks
     /// are outside the timers. This never contacts a broker or database.
     #[test]
-    #[ignore = "synthetic latency characterization; run release, alone, with nocapture"]
     fn top_volume_latency_characterization_ns_us() {
         const CONTRACTS: u64 = 20_220;
-        const SAMPLES: usize = 100;
+        const SAMPLES: usize = if cfg!(debug_assertions) { 3 } else { 100 };
         const LIMIT: usize = 250;
 
         fn percentile_index(percent: usize, len: usize) -> usize {
@@ -4056,7 +4055,7 @@ mod tests {
         let mut report = String::from(
             "SYNTHETIC Top Volume: release-only characterization, NOT a guarantee; \
              warm existing contracts, Stock family, S1, output limit 250, \
-             100 samples after one warm-up. Observe = batch-average ns/event; \
+             Samples per case reported below after one warm-up. Observe = batch-average ns/event; \
              rank = individual-call ns (us in parentheses). No cold inserts, \
              DB/network, persistence or scheduler wait measured.\n",
         );

@@ -382,8 +382,14 @@ fn is_invocation_scan_target(path: &str) -> bool {
 ///
 /// Verified at fix time: all 99 tracked shebangs are `bash`, so this closes
 /// LATENT blind spots and both allowlists stay at their hard-zero floor.
-fn has_interpreter_shebang(content: &str) -> bool {
-    content.lines().next().is_some_and(|l| l.starts_with("#!"))
+fn has_interpreter_shebang(path: &str, content: &str) -> bool {
+    content.lines().next().is_some_and(|line| {
+        // In a Rust source file, `#![` begins an inner attribute, not an
+        // interpreter declaration. Only this syntax is excluded here: an
+        // actual `#!/...` remains executable even if renamed to `.rs`.
+        // The Rust spawn-literal scan still examines the entire source.
+        line.starts_with("#!") && !(path.ends_with(".rs") && line.starts_with("#!["))
+    })
 }
 
 /// The runtime a shebang line names, if any — `#!/usr/bin/env node` -> `node`,
@@ -405,7 +411,10 @@ fn has_interpreter_shebang(content: &str) -> bool {
 /// it needs no enumeration of file names or extensions — the same move §0.3
 /// of the lock file made for deciding WHICH files to scan, applied one step
 /// further to WHAT they declare.
-fn shebang_runtime(content: &str) -> Option<String> {
+fn shebang_runtime(path: &str, content: &str) -> Option<String> {
+    if !has_interpreter_shebang(path, content) {
+        return None;
+    }
     let first = content.lines().next()?;
     let rest = first.strip_prefix("#!")?;
     // `env` and its `-S` split-string form introduce the real runtime; a bare
@@ -1531,6 +1540,155 @@ fn git_ls_files_with(extra_args: &[&str], pathspecs: &[&str]) -> Vec<String> {
 /// fails on non-UTF-8, and a PNG has no shebang to find. Path-selected targets
 /// keep the original fail-loud behaviour, because a scan target we cannot read
 /// IS a guard failure.
+/// Parse source-evidence JSON without silently losing duplicate object keys.
+/// A permissive Value parse would hide an earlier command field behind a later
+/// duplicate. Invalid or ambiguous data always falls back to the full scan.
+struct UniqueEvidenceJson(serde_json::Value);
+
+impl<'de> serde::Deserialize<'de> for UniqueEvidenceJson {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = UniqueEvidenceJson;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("JSON with unique object keys")
+            }
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(UniqueEvidenceJson(value.into()))
+            }
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(UniqueEvidenceJson(value.into()))
+            }
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(UniqueEvidenceJson(value.into()))
+            }
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+                serde_json::Number::from_f64(value)
+                    .map(|number| UniqueEvidenceJson(serde_json::Value::Number(number)))
+                    .ok_or_else(|| E::custom("non-finite JSON number"))
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(UniqueEvidenceJson(value.into()))
+            }
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Ok(UniqueEvidenceJson(value.into()))
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(UniqueEvidenceJson(serde_json::Value::Null))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(UniqueEvidenceJson(value)) = sequence.next_element()? {
+                    values.push(value);
+                }
+                Ok(UniqueEvidenceJson(serde_json::Value::Array(values)))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut values = serde_json::Map::new();
+                while let Some((key, UniqueEvidenceJson(value))) =
+                    map.next_entry::<String, UniqueEvidenceJson>()?
+                {
+                    if values.insert(key, value).is_some() {
+                        return Err(serde::de::Error::custom("duplicate JSON key"));
+                    }
+                }
+                Ok(UniqueEvidenceJson(serde_json::Value::Object(values)))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+/// An evidence report's installed-program inventory is data, not a launch
+/// command. Recognize the envelope and plain path syntax, never a filename or
+/// hash exception. Scan EVERY remaining decoded key and string (including
+/// commands nested in arrays/objects). An inventory value with arguments,
+/// shell syntax, relative paths, or a different basename is not classified.
+fn source_evidence_scan_text(path: &str, content: &str) -> String {
+    if !path.ends_with(".json") || content.len() > 65_536 {
+        return content.to_owned();
+    }
+    let Ok(UniqueEvidenceJson(mut document)) = serde_json::from_str(content) else {
+        return content.to_owned();
+    };
+    let Some(object) = document.as_object_mut() else {
+        return content.to_owned();
+    };
+    let evidence_envelope = object
+        .get("utc")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok())
+        && object
+            .get("reviewed_commit")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| {
+                value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        && object
+            .get("candidate_rust_tests_executed")
+            .is_some_and(serde_json::Value::is_boolean);
+    let inventory_is_data = object
+        .get("local_runtime")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|inventory| {
+            !inventory.is_empty()
+                && inventory.iter().all(|(name, value)| {
+                    !name.is_empty()
+                        && name
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || b"_+-.".contains(&byte))
+                        && (value.is_null()
+                            || value.as_str().is_some_and(|program| {
+                                program.starts_with('/')
+                                    && program.rsplit('/').next() == Some(name.as_str())
+                                    && program[1..].split('/').all(|component| {
+                                        !component.is_empty()
+                                            && component != "."
+                                            && component != ".."
+                                            && component.bytes().all(|byte| {
+                                                byte.is_ascii_alphanumeric()
+                                                    || b"_+-.".contains(&byte)
+                                            })
+                                    })
+                            }))
+                })
+        });
+    if !evidence_envelope || !inventory_is_data {
+        return content.to_owned();
+    }
+    object.remove("local_runtime");
+    fn append_strings(value: &serde_json::Value, output: &mut String) {
+        match value {
+            serde_json::Value::Object(fields) => {
+                for (key, value) in fields {
+                    output.push_str(key);
+                    output.push('\n');
+                    append_strings(value, output);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    append_strings(value, output);
+                }
+            }
+            serde_json::Value::String(value) => {
+                output.push_str(value);
+                output.push('\n');
+            }
+            _ => {}
+        }
+    }
+    let mut scanned = String::new();
+    append_strings(&document, &mut scanned);
+    scanned
+}
+
 fn load_invocation_scan_files() -> Vec<(String, String)> {
     let root = repo_root();
     // SCOPE FIX #17 (2026-09-02): tracked AND untracked. See
@@ -1553,6 +1711,7 @@ fn load_invocation_scan_files() -> Vec<(String, String)> {
             // and `node app.js` on line 2 was invisible. An I/O failure is
             // now a panic: a scan target we cannot open IS a guard failure.
             let content = read_scan_text(&root, &p);
+            let content = source_evidence_scan_text(&p, &content);
             Some((p, content))
         })
         .collect()
@@ -1711,7 +1870,7 @@ fn every_tracked_executable_is_inside_the_invocation_scan() {
     // still has one.
     for path in git_ls_files_including_untracked(&["."]) {
         let content = read_scan_text(&root, &path);
-        if !has_interpreter_shebang(&content) {
+        if !has_interpreter_shebang(&path, &content) {
             continue;
         }
         executables += 1;
@@ -1756,7 +1915,7 @@ fn every_tracked_shebang_names_an_allowed_runtime() {
     // SCOPE FIX #17 (2026-09-02): tracked AND untracked, decoded lossily.
     for path in git_ls_files_including_untracked(&["."]) {
         let content = read_scan_text(&root, &path);
-        let Some(runtime) = shebang_runtime(&content) else {
+        let Some(runtime) = shebang_runtime(&path, &content) else {
             continue;
         };
         checked += 1;
@@ -1801,7 +1960,7 @@ fn shebang_runtime_parser_self_test() {
         ("fn main() {}\n", None),
     ] {
         assert_eq!(
-            shebang_runtime(line).as_deref(),
+            shebang_runtime("tools/fixture", line).as_deref(),
             expected,
             "shebang parse of {line:?}"
         );
@@ -1810,13 +1969,17 @@ fn shebang_runtime_parser_self_test() {
     // tracked, executable, and invisible to every other check here.
     let hostile = "#!/usr/bin/env node\nconst fs=require('fs');\n";
     assert_eq!(
-        shebang_runtime(hostile).as_deref(),
+        shebang_runtime("tools/fixture", hostile).as_deref(),
         Some("node"),
         "the hostile fixture MUST resolve to node — if this fails, SCOPE FIX \
          #15 has been reverted and the hole is open again"
     );
     assert!(
-        !["bash", "sh"].contains(&shebang_runtime(hostile).unwrap_or_default().as_str()),
+        !["bash", "sh"].contains(
+            &shebang_runtime("tools/fixture", hostile)
+                .unwrap_or_default()
+                .as_str()
+        ),
         "and it must NOT be in the allowed set"
     );
 }
@@ -3881,4 +4044,135 @@ fn scope_fix_2026_09_02_self_test() {
         tracked.iter().all(|t| all.binary_search(t).is_ok()),
         "self-test: every tracked file must also appear in the tracked+untracked set"
     );
+}
+
+#[test]
+fn evidence_inventory_is_data_but_its_envelope_cannot_hide_commands() {
+    let inventory = serde_json::json!({
+        "utc": "2026-09-14T04:08:46.265812+00:00",
+        "reviewed_commit": "af77fb0698aeb4414136767e4907593e90ac1ddf",
+        "candidate_rust_tests_executed": false,
+        "local_runtime": {
+            "rustc": null,
+            "python": "/opt/tools/python/bin/python",
+            "node": "/opt/tools/node/bin/node"
+        },
+        "details": { "result": "not executed" }
+    });
+    let path = "docs/audits/arbitrary-source-evidence.json";
+    let encoded = serde_json::to_string_pretty(&inventory).unwrap();
+    let clean = source_evidence_scan_text(path, &encoded);
+    assert!(!content_has_banned_invocation(&clean));
+    assert_eq!(count_node_invocations(&clean), 0);
+    assert!(
+        clean.contains("not executed"),
+        "non-inventory data must remain scanned"
+    );
+
+    for payload in [
+        serde_json::json!({"command": "python3 -c pass"}),
+        serde_json::json!({"nested": [{"command": "node script.js"}]}),
+        serde_json::json!({"escaped": "first line\nnode script.js"}),
+    ] {
+        let mut report = inventory.clone();
+        report["details"] = payload;
+        let scan = source_evidence_scan_text(path, &serde_json::to_string(&report).unwrap());
+        assert!(content_has_banned_invocation(&scan) || count_node_invocations(&scan) > 0);
+    }
+    for invalid_value in [
+        serde_json::json!("/opt/tools/python/bin/python -c pass"),
+        serde_json::json!("/opt/tools/../python"),
+        serde_json::json!("relative/python"),
+        serde_json::json!({"command": "python3 -c pass"}),
+    ] {
+        let mut report = inventory.clone();
+        report["local_runtime"]["python"] = invalid_value;
+        let encoded = serde_json::to_string(&report).unwrap();
+        assert_eq!(source_evidence_scan_text(path, &encoded), encoded);
+    }
+    for missing in ["utc", "reviewed_commit", "candidate_rust_tests_executed"] {
+        let mut report = inventory.clone();
+        report.as_object_mut().unwrap().remove(missing);
+        let encoded = serde_json::to_string(&report).unwrap();
+        assert_eq!(source_evidence_scan_text(path, &encoded), encoded);
+    }
+    let quoted = serde_json::to_string(&encoded).unwrap();
+    assert_eq!(
+        source_evidence_scan_text(path, &quoted),
+        quoted,
+        "a string containing JSON is not an evidence object"
+    );
+    assert_eq!(source_evidence_scan_text("runner.sh", &encoded), encoded);
+    let duplicate = encoded.replacen(
+        '"',
+        "\"command\":\"node script.js\",\"command\":\"clean\",\"",
+        1,
+    );
+    assert_eq!(source_evidence_scan_text(path, &duplicate), duplicate);
+    let malformed = format!("{encoded} trailing");
+    assert_eq!(source_evidence_scan_text(path, &malformed), malformed);
+    let manifest = r#"{"command":"node","args":["script.js"]}"#;
+    assert_eq!(source_evidence_scan_text(".mcp.json", manifest), manifest);
+    assert!(count_node_invocations(manifest) > 0);
+}
+
+#[test]
+fn rust_inner_attributes_are_not_interpreter_declarations() {
+    let path = "crates/common/src/fixture.rs";
+    for attribute in [
+        "#![cfg(test)]",
+        "#![cfg_attr(test, allow(dead_code))]",
+        "#![deny(unsafe_code)]",
+        "#![doc = \"test module\"]",
+    ] {
+        let source = format!("{attribute}\nfn fixture() {{}}\n");
+        assert!(!has_interpreter_shebang(path, &source), "{attribute}");
+        assert!(shebang_runtime(path, &source).is_none(), "{attribute}");
+        // This is Rust syntax classification, not a new general shebang
+        // escape: unknown interpreter spellings in other file types stay seen.
+        for script in ["tools/fixture", "scripts/fixture.sh", "docs/fixture.md"] {
+            assert!(has_interpreter_shebang(script, &source));
+            assert!(shebang_runtime(script, &source).is_some());
+        }
+    }
+    let interpreter = format!("{}3", banned_token());
+    let source = format!("#![cfg(test)]\nfn fixture() {{ Command::new(\"{interpreter}\"); }}\n");
+    assert!(!has_interpreter_shebang(path, &source));
+    assert!(
+        rust_spawn_violations(&source).contains(&interpreter),
+        "classifying the Rust attribute must not exempt the file's process spawns"
+    );
+}
+
+#[test]
+fn a_rust_filename_cannot_hide_a_real_interpreter_shebang() {
+    let interpreter = format!("{}3", banned_token());
+    for (line, runtime) in [
+        ("#!/usr/bin/env node".to_owned(), "node".to_owned()),
+        ("#!/usr/bin/node".to_owned(), "node".to_owned()),
+        ("#! /usr/bin/env node".to_owned(), "node".to_owned()),
+        (format!("#!/usr/bin/env {interpreter}"), interpreter),
+    ] {
+        // An attribute later in the file cannot disarm its first-line shebang.
+        let source = format!("{line}\n#![cfg(test)]\n");
+        for path in ["crates/common/src/fixture.rs", "build.rs"] {
+            assert!(has_interpreter_shebang(path, &source), "{path}: {line}");
+            assert_eq!(
+                shebang_runtime(path, &source).as_deref(),
+                Some(runtime.as_str())
+            );
+            assert!(!["bash", "sh"].contains(&runtime.as_str()));
+            assert!(
+                is_excluded_from_invocation_scan(path),
+                "the independent executable-scope guard must still reject this hidden script"
+            );
+        }
+    }
+    let wrapped = "#!/usr/bin/env -S bash -c \"node app.js\"\n#![cfg(test)]\n";
+    assert!(has_interpreter_shebang("build.rs", wrapped));
+    assert_eq!(
+        shebang_runtime("build.rs", wrapped).as_deref(),
+        Some("bash")
+    );
+    assert!(count_node_invocations(wrapped) > 0);
 }

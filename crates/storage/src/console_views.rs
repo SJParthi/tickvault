@@ -238,14 +238,18 @@ pub fn ticks_named_view_ddl() -> String {
     )
 }
 
-/// DDL for `candles_named`: candle quantities and their pinned ranking
+/// DDL for `candles_named`: gross quantity plus the same basis-gated signed
+/// `volume` projection as Top Volume. Original physical columns remain intact.
+/// Candle quantities retain their pinned ranking
 /// metadata, identity-first and LEFT-joined to current display labels.
 pub fn candles_named_view_ddl() -> String {
     let dim = candle_top_volume_views::unique_candle_lifecycle_dim_subquery();
+    let signed_volume = candle_top_volume_views::signed_candle_volume_sql();
     format!(
         "CREATE OR REPLACE VIEW {VIEW_CANDLES_NAMED} AS \
          SELECT c.ts, il.symbol_name, il.display_name, il.instrument_type, \
-         c.open, c.high, c.low, c.close, c.volume, c.net_volume, \
+         c.open, c.high, c.low, c.close, c.volume AS gross_volume, \
+         {signed_volume} AS volume, c.volume_basis, \
          c.lot_size, c.instrument_definition_version, c.underlying_id, c.ranking_family, \
          c.volume_quality, c.bucket_revision, c.oi, c.tick_count, \
          c.total_buy_qty, c.total_sell_qty, \
@@ -444,9 +448,10 @@ pub fn pre_register_view_ddl_counter() {
 
 /// Idempotently create-or-converge the `ticks_named` + `candles_named`
 /// analyst console views (`CREATE OR REPLACE VIEW` — every boot converges
-/// the deployed definition to the code). Returns true only when all four
-/// primary Top Volume projections were accepted. Optional analyst and legacy
-/// views remain best effort. Candle startup must consult the primary verdict.
+/// the deployed definition to the code). Returns true only when the named
+/// candle view and all four primary Top Volume projections were accepted.
+/// Other analyst and legacy views remain best effort. Candle startup must
+/// consult this complete quantity-projection verdict.
 ///
 /// Call ONLY after the base-table ensures (`ensure_tick_table_dedup_keys`
 /// + `ensure_shadow_candle_tables`, or the Groww delegating wrappers) have
@@ -490,18 +495,24 @@ pub async fn ensure_named_views(questdb_config: &QuestDbConfig) -> bool {
         }
     };
 
+    ensure_named_views_with_client(&client, &base_url).await
+}
+
+// Keep the full DDL sequence injectable so readiness is exercised against the
+// actual named-view and primary-view requests, including individual refusals.
+async fn ensure_named_views_with_client(client: &Client, base_url: &str) -> bool {
     // Both views attempted independently — one failing never blocks the other.
     run_view_ddl(
-        &client,
-        &base_url,
+        client,
+        base_url,
         VIEW_TICKS_NAMED,
         "create",
         &ticks_named_view_ddl(),
     )
     .await;
-    run_view_ddl(
-        &client,
-        &base_url,
+    let candles_named_ready = run_view_ddl(
+        client,
+        base_url,
         VIEW_CANDLES_NAMED,
         "create",
         &candles_named_view_ddl(),
@@ -512,8 +523,8 @@ pub async fn ensure_named_views(questdb_config: &QuestDbConfig) -> bool {
     // (no depth socket has ever opened) this DDL warn-fails and the two views
     // an analyst uses every day are already created.
     run_view_ddl(
-        &client,
-        &base_url,
+        client,
+        base_url,
         VIEW_DEPTH_NAMED,
         "create",
         &depth_named_view_ddl(),
@@ -525,8 +536,8 @@ pub async fn ensure_named_views(questdb_config: &QuestDbConfig) -> bool {
     // and why this is four literals rather than a prefix sweep.
     for legacy in LEGACY_TOP_VOLUME_VIEWS {
         run_view_ddl(
-            &client,
-            &base_url,
+            client,
+            base_url,
             legacy,
             "drop_legacy",
             &legacy_top_volume_view_drop_ddl(legacy),
@@ -539,8 +550,8 @@ pub async fn ensure_named_views(questdb_config: &QuestDbConfig) -> bool {
     // is renamed, deleted, or rewritten by this migration.
     for cadence in SnapshotCadence::ALL {
         run_view_ddl(
-            &client,
-            &base_url,
+            client,
+            base_url,
             &top_volume_legacy_view_name(cadence),
             "create_legacy",
             &top_volume_legacy_cadence_view_ddl(cadence),
@@ -548,7 +559,9 @@ pub async fn ensure_named_views(questdb_config: &QuestDbConfig) -> bool {
         .await;
     }
 
-    ensure_primary_candle_views(&client, &base_url).await
+    // Do not short-circuit the DDL attempts when the named view was refused.
+    let primary_ready = ensure_primary_candle_views(client, base_url).await;
+    candles_named_ready && primary_ready
 }
 
 // The mandatory projection subset is separate from optional console views.
@@ -672,6 +685,60 @@ mod tests {
                             .starts_with(&format!("CREATE OR REPLACE VIEW {view} AS ")))
                         .count(),
                     1
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn named_candle_projection_failure_blocks_readiness_without_skipping_primary_views() {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let request_count = 3
+            + LEGACY_TOP_VOLUME_VIEWS.len()
+            + SnapshotCadence::ALL.len()
+            + TfIndex::TOP_VOLUME_ALL.len();
+        for (failed_index, failure, expected_ready) in [
+            (None, (200, "{\"ddl\":\"OK\"}"), true),
+            (Some(1), (500, "{\"error\":\"named view refused\"}"), false),
+            (Some(1), (200, "{}"), false),
+            (
+                Some(0),
+                (500, "{\"error\":\"optional ticks view refused\"}"),
+                true,
+            ),
+            (
+                Some(request_count - 1),
+                (500, "{\"error\":\"primary view refused\"}"),
+                false,
+            ),
+        ] {
+            let responses = (0..request_count)
+                .map(|index| {
+                    if failed_index == Some(index) {
+                        failure
+                    } else {
+                        (200, "{\"ddl\":\"OK\"}")
+                    }
+                })
+                .collect();
+            let (endpoint, server) = ddl_server(responses).await;
+            let ready = ensure_named_views_with_client(&client, &endpoint).await;
+            assert_eq!(ready, expected_ready, "failed request {failed_index:?}");
+            let queries = tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(queries.len(), request_count, "every DDL must be attempted");
+            assert_eq!(queries[1], candles_named_view_ddl());
+            for tf in TfIndex::TOP_VOLUME_ALL {
+                let ddl = candle_top_volume_view_ddl(tf).unwrap();
+                assert_eq!(
+                    queries.iter().filter(|query| **query == ddl).count(),
+                    1,
+                    "named-view refusal must not skip or duplicate {tf:?}"
                 );
             }
         }

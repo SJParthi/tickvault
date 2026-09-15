@@ -719,6 +719,37 @@ pub const fn refusal_line_due(count: u64) -> bool {
 /// on all three arms move for every refused frame, throttle or not.
 pub const REFUSAL_LINE_STRIDE: u64 = 1 << 20;
 
+// Diagnostic throttles only: the metrics below still increment once per
+// refused operation. Success paths do not touch these atomics or emit logs.
+static WAL_SEQUENCE_ADMISSION_REFUSAL_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
+static WAL_DIRECTORY_SYNC_REFUSAL_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn note_sequence_admission_refusal(log_count: &AtomicU64) {
+    metrics::counter!("tv_wal_sequence_admission_refused_total").increment(1);
+    let count = log_count.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    if refusal_line_due(count) {
+        error!(
+            code = ErrorCode::WalSequence01AdmissionRefused.code_str(),
+            refusal_count = count,
+            "WAL sequence admission refused: committed identity capacity or ownership is unavailable; capture may be blocked"
+        );
+    }
+}
+
+fn note_segment_directory_sync_refusal(error: &anyhow::Error, path: &Path, log_count: &AtomicU64) {
+    metrics::counter!("tv_wal_segment_directory_sync_refused_total").increment(1);
+    let count = log_count.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    if refusal_line_due(count) {
+        error!(
+            code = ErrorCode::WalRecovery01Refused.code_str(),
+            refusal_count = count,
+            segment = ?path,
+            error = %error,
+            "WAL segment directory sync refused; segment publication stopped and queued data still needs durable storage"
+        );
+    }
+}
+
 /// Every [`WsType`], in [`ws_type_index`] order — the build order for the
 /// counter tables. Kept beside the index so the two cannot drift.
 const WS_TYPES_BY_INDEX: [WsType; WS_TYPE_COUNT] =
@@ -1102,7 +1133,7 @@ impl WsFrameSpill {
             .as_ref()
             .and_then(|sequence| sequence.allocate());
         if result.is_none() {
-            metrics::counter!("tv_wal_sequence_admission_refused_total").increment(1);
+            note_sequence_admission_refusal(&WAL_SEQUENCE_ADMISSION_REFUSAL_LOG_COUNT);
         }
         result
     }
@@ -1200,7 +1231,7 @@ impl WsFrameSpill {
                 || frame_seq > MAX_FRAME_SEQUENCE
         }) {
             self.record_sequence_refusal(ws_type);
-            metrics::counter!("tv_wal_sequence_admission_refused_total").increment(1);
+            note_sequence_admission_refusal(&WAL_SEQUENCE_ADMISSION_REFUSAL_LOG_COUNT);
             return AppendOutcome::Dropped;
         }
         let record = WalRecord {
@@ -1687,7 +1718,7 @@ fn writer_loop(
         sequence.directory_guard.ensure_current()?;
         if let Err(error) = sequence.refill_if_needed() {
             metrics::counter!("tv_wal_sequence_reservation_failed_total").increment(1);
-            error!(error = %error, "WAL sequence reservation could not be synced; existing committed IDs remain bounded");
+            error!(code = tickvault_common::error_code::ErrorCode::WalSequence01AdmissionRefused.code_str(), error = %error, "WAL sequence reservation could not be synced; existing committed IDs remain bounded");
         }
         if pending.is_empty() {
             let wait = writer_receive_wait(fsync_interval, last_sync.elapsed(), dirty);
@@ -1932,7 +1963,7 @@ pub fn next_frame_seq() -> u64 {
     let (sequence, _) = match claim_sequence_range(sequence_clock_floor(), 1) {
         Ok(claim) => claim,
         Err(error) => {
-            error!(error = %error, "legacy WAL sequence allocation exhausted; refusing identity reuse");
+            error!(code = tickvault_common::error_code::ErrorCode::WalSequence01AdmissionRefused.code_str(), error = %error, "legacy WAL sequence allocation exhausted; refusing identity reuse");
             std::process::abort();
         }
     };
@@ -2693,7 +2724,7 @@ impl WalMaintenance {
     fn anchored_directory(&self) -> anyhow::Result<PathBuf> {
         if let Err(error) = self.guard.ensure_current() {
             metrics::counter!("tv_wal_maintenance_ownership_refused_total").increment(1);
-            error!(error = %error, "WAL maintenance refused: original directory ownership is unavailable");
+            error!(code = tickvault_common::error_code::ErrorCode::WalRecovery01Refused.code_str(), error = %error, "WAL maintenance refused: original directory ownership is unavailable");
             return Err(error);
         }
         self.guard.io_path("")
@@ -3146,7 +3177,11 @@ fn open_new_segment_with_directory_sync(
                     .and_then(|()| sync_directory(&guard.directory).map_err(anyhow::Error::from))
                     .and_then(|()| guard.ensure_current())
                 {
-                    metrics::counter!("tv_wal_segment_directory_sync_refused_total").increment(1);
+                    note_segment_directory_sync_refusal(
+                        &error,
+                        &path,
+                        &WAL_DIRECTORY_SYNC_REFUSAL_LOG_COUNT,
+                    );
                     clear_open_segment_under(wal_dir);
                     return Err(error);
                 }
@@ -3861,10 +3896,14 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
                 corrupted += 1;
                 if err.downcast_ref::<IncompleteWalSegment>().is_some() {
                     match quarantine_incomplete_segment(wal_dir, path) {
-                        Ok(retained) => error!(segment = ?path, retained = ?retained, error = %err,
-                            "WAL replay refused an incomplete segment; original retained outside confirmed pruning"),
-                        Err(retain_error) => error!(segment = ?path, error = %retain_error,
-                            "WAL quarantine failed; refusing confirmation and retaining recovery state"),
+                        Ok(retained) => {
+                            error!(code = tickvault_common::error_code::ErrorCode::WalRecovery01Refused.code_str(), segment = ?path, retained = ?retained, error = %err,
+                            "WAL replay refused an incomplete segment; original retained outside confirmed pruning")
+                        }
+                        Err(retain_error) => {
+                            error!(code = tickvault_common::error_code::ErrorCode::WalRecovery01Refused.code_str(), segment = ?path, error = %retain_error,
+                            "WAL quarantine failed; refusing confirmation and retaining recovery state")
+                        }
                     }
                 }
                 metrics::counter!("tv_wal_replay_corrupted_segments_total").increment(1);
@@ -4412,7 +4451,7 @@ pub fn confirm_replayed_generation<P: AsRef<Path>>(wal_dir: P, generation: u64) 
             || segment_fingerprint(&receipt.path).ok().as_ref() != Some(&receipt.fingerprint)
         {
             all_confirmed = false;
-            error!(segment = ?receipt.path, generation,
+            error!(code = tickvault_common::error_code::ErrorCode::WalRecovery01Refused.code_str(), segment = ?receipt.path, generation,
                 "WAL confirm refused: bytes differ from the complete replay receipt");
             continue;
         }
@@ -4423,19 +4462,19 @@ pub fn confirm_replayed_generation<P: AsRef<Path>>(wal_dir: P, generation: u64) 
         let destination = archive_dir.join(name);
         if destination.exists() {
             all_confirmed = false;
-            error!(segment = ?receipt.path, generation, "WAL confirm refused to overwrite existing archive");
+            error!(code = tickvault_common::error_code::ErrorCode::WalRecovery01Refused.code_str(), segment = ?receipt.path, generation, "WAL confirm refused to overwrite existing archive");
             continue;
         }
         if let Err(error) = persist_confirmation_marker(&destination, &receipt.fingerprint) {
             all_confirmed = false;
-            error!(segment = ?receipt.path, error = %error, "WAL archive proof was not synced; retaining staged source");
+            error!(code = tickvault_common::error_code::ErrorCode::WalRecovery01Refused.code_str(), segment = ?receipt.path, error = %error, "WAL archive proof was not synced; retaining staged source");
             continue;
         }
         match std::fs::rename(&receipt.path, &destination) {
             Ok(()) => confirmed += 1,
             Err(err) => {
                 all_confirmed = false;
-                error!(segment = ?receipt.path, error = %err,
+                error!(code = tickvault_common::error_code::ErrorCode::WalRecovery01Refused.code_str(), segment = ?receipt.path, error = %err,
                     "WAL confirmation failed; original remains replayable");
             }
         }
@@ -9603,6 +9642,84 @@ mod queue_depth_visibility_tests {
              batch boundary so it costs one write per ~257 records, not one \
              per frame"
         );
+    }
+
+    #[test]
+    fn wal_refusal_diagnostics_are_coded_and_bounded_without_hiding_counts() {
+        use super::{note_segment_directory_sync_refusal, note_sequence_admission_refusal};
+        use std::io::Write;
+        use std::path::Path;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct LogBytes(Arc<Mutex<Vec<u8>>>);
+        impl Write for LogBytes {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("test log buffer")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer_output = Arc::clone(&output);
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::ERROR)
+            .with_writer(move || LogBytes(Arc::clone(&writer_output)))
+            .finish();
+        let admission = AtomicU64::new(0);
+        let directory = AtomicU64::new(0);
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..32 {
+                note_sequence_admission_refusal(&admission);
+                note_segment_directory_sync_refusal(
+                    &anyhow::anyhow!("injected directory sync failure"),
+                    Path::new("retained-test-segment.wal"),
+                    &directory,
+                );
+            }
+        });
+        assert_eq!(admission.load(Ordering::Relaxed), 32);
+        assert_eq!(directory.load(Ordering::Relaxed), 32);
+        let bytes = output.lock().expect("test log buffer").clone();
+        let text = String::from_utf8(bytes).expect("structured logs are UTF-8");
+        let records: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("structured log JSON"))
+            .collect();
+        for code in ["WAL-SEQUENCE-01", "WAL-RECOVERY-01"] {
+            let selected: Vec<&serde_json::Value> = records
+                .iter()
+                .filter(|record| record["fields"]["code"].as_str() == Some(code))
+                .collect();
+            let counts: Vec<u64> = selected
+                .iter()
+                .map(|record| {
+                    record["fields"]["refusal_count"]
+                        .as_u64()
+                        .expect("refusal count")
+                })
+                .collect();
+            assert_eq!(counts, [1, 2, 4, 8, 16, 32]);
+            assert!(selected.iter().all(|record| record["level"] == "ERROR"));
+        }
+        assert_eq!(
+            records.len(),
+            12,
+            "64 refusals must not create 64 log lines"
+        );
+        assert!(text.contains("capture may be blocked"));
+        assert!(text.contains("queued data still needs durable storage"));
+        assert!(!text.contains("nothing is lost"));
     }
 
     #[test]

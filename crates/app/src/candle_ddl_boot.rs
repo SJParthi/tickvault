@@ -276,7 +276,11 @@ pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
             // `CREATE OR REPLACE`, so a second pass on an already-correct view
             // is free. Additive beats re-ordering on a boot path.
             if !tickvault_storage::console_views::ensure_named_views(questdb).await {
-                error!("required Top Volume projections failed during the view re-ensure");
+                error!(
+                    code =
+                        tickvault_common::error_code::ErrorCode::CandleSchema01Refused.code_str(),
+                    "required Top Volume projections failed during the view re-ensure"
+                );
                 return false;
             }
         }

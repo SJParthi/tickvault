@@ -3755,7 +3755,7 @@ sleep() { :; }
         csv
     }
 
-    fn run_wipe_read_only_fixture(overrides: &[(&str, &str)], complete: bool) -> String {
+    fn assert_wipe_read_only_fixture(overrides: &[(&str, &str)], complete: bool) -> String {
         // Execute ONLY the actual read-only preparation and verification.
         // Every outbound command is a fake that refuses unknown queries. The
         // destructive middle commands are never included in this test process.
@@ -3853,7 +3853,7 @@ sleep() { :; }
             ("\"count\"\n+0\n", "0", false),
             ("\"count\"\n0 \n", "0", false),
         ] {
-            run_wipe_read_only_fixture(
+            assert_wipe_read_only_fixture(
                 &[("MOCK_COUNT_RESPONSE", body), ("MOCK_FAILURE", failure)],
                 complete,
             );
@@ -3864,7 +3864,7 @@ sleep() { :; }
     /// malformed, or unavailable candle must fail even when candles_1m is zero.
     #[test]
     fn test_wipe_targets_and_verification_name_the_same_tables() {
-        let stdout = run_wipe_read_only_fixture(&[], true);
+        let stdout = assert_wipe_read_only_fixture(&[], true);
         let result = stdout
             .lines()
             .find(|line| line.starts_with("WIPE-RESULT "))
@@ -3884,7 +3884,7 @@ sleep() { :; }
                 ("{\"error\":\"unavailable\"}", "0", "?"),
                 ("\"count\"\n0\n", "1", "?"),
             ] {
-                let stdout = run_wipe_read_only_fixture(
+                let stdout = assert_wipe_read_only_fixture(
                     &[
                         ("MOCK_COUNT_TABLE", table),
                         ("MOCK_COUNT_RESPONSE", body),
@@ -3932,7 +3932,7 @@ sleep() { :; }
         for suffix in WIPE_BAD_CATALOG_SUFFIXES {
             let bad_catalog = format!("{catalog}{suffix}");
             for stage in ["MOCK_CATALOG", "MOCK_CURRENT_CATALOG"] {
-                run_wipe_read_only_fixture(&[(stage, &bad_catalog)], false);
+                assert_wipe_read_only_fixture(&[(stage, &bad_catalog)], false);
             }
         }
         for bad_catalog in [
@@ -3941,12 +3941,12 @@ sleep() { :; }
             catalog.replacen("\"table_name\"", "\"wrong\"", 1),
         ] {
             for stage in ["MOCK_CATALOG", "MOCK_CURRENT_CATALOG"] {
-                run_wipe_read_only_fixture(&[(stage, &bad_catalog)], false);
+                assert_wipe_read_only_fixture(&[(stage, &bad_catalog)], false);
             }
         }
         for failure in ["1", "nul"] {
             for stage in ["MOCK_CATALOG_FAILURE", "MOCK_CURRENT_CATALOG_FAILURE"] {
-                run_wipe_read_only_fixture(&[(stage, failure)], false);
+                assert_wipe_read_only_fixture(&[(stage, failure)], false);
             }
         }
         // Proper CSV with either line-ending convention or no final newline
@@ -3955,7 +3955,7 @@ sleep() { :; }
             catalog.replace('\n', "\r\n"),
             catalog.trim_end().to_string(),
         ] {
-            run_wipe_read_only_fixture(
+            assert_wipe_read_only_fixture(
                 &[
                     ("MOCK_CATALOG", &valid_catalog),
                     ("MOCK_CURRENT_CATALOG", &valid_catalog),
@@ -3979,11 +3979,11 @@ sleep() { :; }
             "rest_fetch_audit",
         ] {
             let missing = catalog.replace(&format!("\"{required}\"\n"), "");
-            let stdout = run_wipe_read_only_fixture(&[("MOCK_CATALOG", &missing)], false);
+            let stdout = assert_wipe_read_only_fixture(&[("MOCK_CATALOG", &missing)], false);
             assert!(stdout.contains("no wipe started"));
         }
         let disappeared = catalog.replace("\"candles_60m\"\n", "");
-        let stdout = run_wipe_read_only_fixture(
+        let stdout = assert_wipe_read_only_fixture(
             &[
                 ("MOCK_CURRENT_CATALOG", &disappeared),
                 ("MOCK_COUNT_TABLE", "candles_60m"),
@@ -3998,7 +3998,7 @@ sleep() { :; }
             ("\"count\"\n3\n", false),
             ("{\"error\":\"new table unavailable\"}", false),
         ] {
-            let stdout = run_wipe_read_only_fixture(
+            let stdout = assert_wipe_read_only_fixture(
                 &[
                     ("MOCK_CURRENT_CATALOG", &added),
                     ("MOCK_COUNT_TABLE", "candles_45m"),
@@ -4009,7 +4009,7 @@ sleep() { :; }
             assert!(stdout.contains("candles_45m="));
         }
         // An unrelated audit table is preserved and does not join the wipe.
-        run_wipe_read_only_fixture(
+        assert_wipe_read_only_fixture(
             &[
                 ("MOCK_COUNT_TABLE", "order_audit"),
                 ("MOCK_COUNT_RESPONSE", "\"count\"\n3\n"),
@@ -4017,7 +4017,7 @@ sleep() { :; }
             true,
         );
         // A known failed truncate cannot be hidden by later zero counts.
-        run_wipe_read_only_fixture(&[("MOCK_TRUNCATES_OK", "0")], false);
+        assert_wipe_read_only_fixture(&[("MOCK_TRUNCATES_OK", "0")], false);
     }
 
     #[test]

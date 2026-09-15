@@ -253,6 +253,8 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) -> bool
             if !has_legacy_candle_cleanup_authority(tf) {
                 all_keyed = false;
                 error!(
+                    code =
+                        tickvault_common::error_code::ErrorCode::CandleSchema01Refused.code_str(),
                     table,
                     "new active candle table has an incompatible historical schema — preserved for explicit migration"
                 );
@@ -849,6 +851,7 @@ async fn drop_candle_table_if_confirmed_empty(
         metrics::counter!("tv_candle_migration_drop_refused_total", "table" => table.to_string())
             .increment(1);
         error!(
+            code = tickvault_common::error_code::ErrorCode::CandleSchema01Refused.code_str(),
             table,
             "candle migration DROP REFUSED: table is populated or its emptiness could not be verified; data preserved, explicit migration required"
         );
@@ -859,8 +862,8 @@ async fn drop_candle_table_if_confirmed_empty(
         Ok(response) if response.status().is_success() => true,
         _ => {
             error!(
-                table,
-                "confirmed-empty candle migration DROP failed; migration not completed"
+                code = tickvault_common::error_code::ErrorCode::CandleSchema01Refused.code_str(),
+                table, "confirmed-empty candle migration DROP failed; migration not completed"
             );
             false
         }

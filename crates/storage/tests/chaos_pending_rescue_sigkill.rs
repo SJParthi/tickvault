@@ -10,6 +10,10 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "support/owned_wal_replay.rs"]
+mod owned_wal_replay;
+use owned_wal_replay::{assert_complete_replay, claim_wal};
+
 use std::io::{BufRead, Read, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
@@ -23,8 +27,7 @@ use tickvault_storage::wal_applied_watermark::{
     AppliedSink, AppliedSnapshot, REPLAY_REORDER_SLACK_SEQ, applied_watermark,
 };
 use tickvault_storage::ws_frame_spill::{
-    AppendOutcome, PACKET_INDEX_BITS, WalEndpoint, WsFrameSpill, WsType, next_frame_seq,
-    replay_all_with_report_guarded,
+    AppendOutcome, PACKET_INDEX_BITS, WalEndpoint, WsFrameSpill, WsType,
 };
 
 const CHILD_MODE: &str = "TV_TEST_PENDING_RESCUE_SIGKILL";
@@ -66,13 +69,15 @@ fn wait_for_kill(kind: &str, seq: u64) {
 }
 
 fn run_child(kind: &str) {
-    let seq = next_frame_seq();
     let endpoint = if kind == "tick" {
         WalEndpoint::MainFeed
     } else {
         WalEndpoint::Depth20
     };
     let spill = WsFrameSpill::new("wal").expect("isolated WAL");
+    let seq = spill
+        .try_next_frame_seq()
+        .expect("sequence from the child writer reservation");
     assert_eq!(
         spill.append_with_seq_at(
             WsType::LiveFeed,
@@ -201,8 +206,8 @@ fn pending_rescue_remains_replayable_after_a_later_ack_and_sigkill() {
             !snapshot.frame_is_applied(sink, seq),
             "a pending {kind} rescue must protect its WAL frame even after a later ACK"
         );
-        let replay = replay_all_with_report_guarded(&wal, usize::MAX, || None, None, 90)
-            .expect("replay after process death");
+        let owner = claim_wal(&wal);
+        let replay = assert_complete_replay(&owner);
         assert_eq!(
             replay.frames.len(),
             1,

@@ -1,5 +1,8 @@
 //! Offline operator entry point for the existing WAL sequence migration engine.
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+#![cfg_attr(not(test), deny(clippy::expect_used))]
+
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read, Write};

@@ -142,7 +142,17 @@ gh() {
 }
 "#;
 
-fn run_merge_case(
+const GIT_STUB: &str = r#"
+git() {
+  case "$*" in
+    'rev-parse HEAD') printf '%s' "$TV_CHECKOUT_SHA" ;;
+    'rev-parse HEAD^{tree}') printf '%s' "$TV_CHECKOUT_TREE" ;;
+    *) return 91 ;;
+  esac
+}
+"#;
+
+fn assert_merge_case(
     case: &str,
     pr: &Value,
     recheck: &Value,
@@ -187,8 +197,8 @@ fn run_merge_case(
 #[test]
 fn auto_merge_requires_both_latest_completed_checks_on_the_current_head() {
     let pr = open_pr();
-    run_merge_case("automatic success", &pr, &pr, &passing_checks(), SHA, true);
-    run_merge_case("manual success", &pr, &pr, &passing_checks(), "", true);
+    assert_merge_case("automatic success", &pr, &pr, &passing_checks(), SHA, true);
+    assert_merge_case("manual success", &pr, &pr, &passing_checks(), "", true);
     for target in ["All Green", RELEASE_CHECK] {
         for (status, conclusion) in [
             ("completed", json!("failure")),
@@ -203,29 +213,29 @@ fn auto_merge_requires_both_latest_completed_checks_on_the_current_head() {
             let mut checks = passing_checks();
             // A newer unsuccessful attempt must win over the old success.
             checks.push(check(30, target, status, conclusion));
-            run_merge_case(target, &pr, &pr, &checks, SHA, false);
+            assert_merge_case(target, &pr, &pr, &checks, SHA, false);
         }
         let mut missing = passing_checks();
         missing.retain(|entry| entry["name"] != target);
-        run_merge_case("missing check", &pr, &pr, &missing, SHA, false);
+        assert_merge_case("missing check", &pr, &pr, &missing, SHA, false);
         let mut stale = passing_checks();
         for entry in &mut stale {
             if entry["name"] == target {
                 entry["head_sha"] = json!(OTHER_SHA);
             }
         }
-        run_merge_case("stale check", &pr, &pr, &stale, SHA, false);
+        assert_merge_case("stale check", &pr, &pr, &stale, SHA, false);
         let mut foreign = passing_checks();
         for entry in &mut foreign {
             if entry["name"] == target {
                 entry["app"]["slug"] = json!("untrusted-check-app");
             }
         }
-        run_merge_case("foreign app", &pr, &pr, &foreign, SHA, false);
+        assert_merge_case("foreign app", &pr, &pr, &foreign, SHA, false);
     }
     let mut unrelated = passing_checks();
     unrelated.push(check(40, "Unrelated job", "completed", json!("failure")));
-    run_merge_case("unrelated check", &pr, &pr, &unrelated, SHA, true);
+    assert_merge_case("unrelated check", &pr, &pr, &unrelated, SHA, true);
 }
 
 #[test]
@@ -245,7 +255,7 @@ fn auto_merge_rechecks_origin_draft_state_and_head_before_the_merge_request() {
     retargeted["base"]["ref"] = json!("other-branch");
     variants.push(retargeted);
     for changed in variants {
-        run_merge_case(
+        assert_merge_case(
             "initial eligibility",
             &changed,
             &changed,
@@ -253,7 +263,7 @@ fn auto_merge_rechecks_origin_draft_state_and_head_before_the_merge_request() {
             SHA,
             false,
         );
-        run_merge_case(
+        assert_merge_case(
             "eligibility changed",
             &pr,
             &changed,
@@ -264,8 +274,8 @@ fn auto_merge_rechecks_origin_draft_state_and_head_before_the_merge_request() {
     }
     let mut pushed = pr.clone();
     pushed["head"]["sha"] = json!(OTHER_SHA);
-    run_merge_case("head changed", &pr, &pushed, &passing_checks(), SHA, false);
-    run_merge_case(
+    assert_merge_case("head changed", &pr, &pushed, &passing_checks(), SHA, false);
+    assert_merge_case(
         "caller head stale",
         &pr,
         &pr,
@@ -423,15 +433,6 @@ fn release_validation_is_bound_to_source_and_required_by_every_merge_and_deploy_
 
 #[test]
 fn reusable_validation_rejects_empty_or_non_commit_inputs_before_recording_evidence() {
-    let stub = r#"
-git() {
-  case "$*" in
-    'rev-parse HEAD') printf '%s' "$TV_CHECKOUT_SHA" ;;
-    'rev-parse HEAD^{tree}') printf '%s' "$TV_CHECKOUT_TREE" ;;
-    *) return 91 ;;
-  esac
-}
-"#;
     for name in ["arm64", "questdb"] {
         let run = script(
             &job(&workflow("release-validation.yml"), name),
@@ -447,7 +448,7 @@ git() {
         ] {
             let fixture = Fixture::new();
             let output = fixture.run(
-                &format!("{stub}\n{run}"),
+                &format!("{GIT_STUB}\n{run}"),
                 &[
                     ("SOURCE_SHA", SHA),
                     ("SOURCE_INPUT_PRESENT", present),
@@ -468,15 +469,6 @@ fn deployment_rejects_source_or_tree_mismatch_before_credentials() {
         &job(&workflow("deploy-aws.yml"), "deploy"),
         "Require release validation for this deployment source",
     );
-    let stub = r#"
-git() {
-  case "$*" in
-    'rev-parse HEAD') printf '%s' "$TV_CHECKOUT_SHA" ;;
-    'rev-parse HEAD^{tree}') printf '%s' "$TV_CHECKOUT_TREE" ;;
-    *) return 91 ;;
-  esac
-}
-"#;
     for (validated, validated_tree, checkout, checkout_tree, accept) in [
         (SHA, TREE, SHA, TREE, true),
         (OTHER_SHA, TREE, SHA, TREE, false),
@@ -487,7 +479,7 @@ git() {
     ] {
         let fixture = Fixture::new();
         let output = fixture.run(
-            &format!("{stub}\n{run}"),
+            &format!("{GIT_STUB}\n{run}"),
             &[
                 ("GITHUB_SHA", SHA),
                 ("VALIDATED_SHA", validated),

@@ -2631,6 +2631,7 @@ async fn async_main() -> Result<()> {
             );
         } else if !ws_wal_maintenance.confirm_replayed_generation(ws_wal_replay_confirmation_id) {
             error!(
+                code = tickvault_common::error_code::ErrorCode::WalRecovery01Refused.code_str(),
                 generation = ws_wal_replay_confirmation_id,
                 "STAGE-C: WAL replay confirmation refused — retaining unconfirmed segments"
             );

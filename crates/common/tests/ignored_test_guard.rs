@@ -27,10 +27,10 @@
 //!    have to be added here deliberately, in the same change, where they are
 //!    visible.
 //!
-//! The seven ignored today are all genuinely not gates: four measurement
-//! harnesses (wall-clock timings, which would flake on a shared CI runner and a
-//! flaky gate is worse than none), a reporting aid, a re-bless helper that
-//! enforces nothing, and a chaos test needing a live Docker stack.
+//! Existing optional measurements and operator fixtures stay on their shrinking
+//! list. Isolated SQL cases are different: ordinary tests skip them because
+//! they require a disposable database, but the required release workflow must
+//! execute each exact case and reject zero tests or any failure.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -86,7 +86,7 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
     ),
     (
         "crates/core/tests/chaos_cascade_triple_failure.rs",
-        "cascade_01_triple_failure_live_docker_zero_loss",
+        "cascade_01_wal_roundtrip_while_questdb_paused_preserves_payloads",
     ),
     // Added 2026-09-03 with the streaming spill-replay repair it proves.
     //
@@ -193,6 +193,239 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
     ),
 ];
 
+/// These cases are excluded only from the default test process. They are
+/// mandatory CI release gates, not an optional ignore budget. The structural
+/// wiring and synthetic execution checks below keep both exact cases attached
+/// to All Green. Successful live database output remains separate evidence.
+const REQUIRED_ISOLATED_SQL: &[(&str, &str)] = &[
+    (
+        "crates/storage/src/candle_top_volume_views.rs",
+        "candle_top_volume_questdb_duplicate_labels_preserve_one_row_per_candle",
+    ),
+    (
+        "crates/storage/src/seal_recovery_guard.rs",
+        "isolated_questdb_recovery_inserts_skips_and_refuses_conflicts",
+    ),
+];
+
+fn allowed_ignored_cases() -> impl Iterator<Item = (&'static str, &'static str)> {
+    ALLOWED_IGNORED
+        .iter()
+        .copied()
+        .chain(REQUIRED_ISOLATED_SQL.iter().copied())
+}
+
+fn workflow_job(source: &str, name: &str) -> Option<String> {
+    let marker = format!("  {name}:");
+    let lines: Vec<_> = source.lines().collect();
+    let starts: Vec<_> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| **line == marker)
+        .collect();
+    if starts.len() != 1 {
+        return None;
+    }
+    let start = starts[0].0 + 1;
+    Some(
+        lines[start..]
+            .iter()
+            .take_while(|line| {
+                line.trim().is_empty()
+                    || line.trim_start().starts_with('#')
+                    || line.starts_with("    ")
+            })
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+const SQL_FIXTURE_NAMES: [&str; 2] = [
+    "console_views::candle_top_volume_views::tests::candle_top_volume_questdb_duplicate_labels_preserve_one_row_per_candle",
+    "seal_recovery_guard::tests::isolated_questdb_recovery_inserts_skips_and_refuses_conflicts",
+];
+
+/// Extract the actual literal run block; no handwritten copy of the SQL loop.
+fn isolated_sql_script(release: &str) -> Option<String> {
+    let questdb = workflow_job(release, "questdb")?;
+    let marker = "      - name: Execute each ignored SQL fixture and require one passing test each";
+    if questdb.matches(marker).count() != 1 {
+        return None;
+    }
+    let step = questdb.split_once(marker)?.1.split("\n      - ").next()?;
+    let run = step.split_once("\n        run: |\n")?.1;
+    let mut script = String::new();
+    for line in run.lines() {
+        let body = if line.trim().is_empty() {
+            ""
+        } else {
+            line.strip_prefix("          ")?
+        };
+        script.push_str(body);
+        script.push('\n');
+    }
+    (!script.is_empty()).then_some(script)
+}
+
+/// Cargo and git are synthetic functions. No compiler, registry, database or
+/// repository operation is reached. Actual tee/grep and shell error handling
+/// remain exercised, including the real pipeline's pipefail behavior.
+const SQL_EXECUTION_STUBS: &str = r#"
+cargo() {
+  if [ "$#" -ne 11 ]; then return 91; fi
+  case "$6" in
+    "$VIEW_SQL_FIXTURE"|"$RECOVERY_SQL_FIXTURE") ;;
+    *) return 92 ;;
+  esac
+  if [ "$*" != "test --locked -p tickvault-storage --lib $6 -- --ignored --exact --nocapture --test-threads=1" ]; then
+    return 93
+  fi
+  printf '%s\n' "$6" >> "$TV_SQL_CALL_LOG"
+  if [ "$6" = "$TV_SQL_TARGET" ]; then
+    case "$TV_SQL_MODE" in
+      failure) printf 'synthetic fixture failure\n'; return 37 ;;
+      missing_running) printf 'test result: ok. 1 passed; 0 failed; 0 ignored;\n'; return 0 ;;
+      missing_summary) printf 'running 1 test\n'; return 0 ;;
+      silent_success) return 0 ;;
+      zero_tests) printf 'running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored;\n'; return 0 ;;
+      ignored_test) printf 'running 1 test\ntest result: ok. 0 passed; 0 failed; 1 ignored;\n'; return 0 ;;
+      success_output_failure) printf 'running 1 test\ntest result: ok. 1 passed; 0 failed; 0 ignored;\n'; return 37 ;;
+      success) ;;
+      *) return 94 ;;
+    esac
+  fi
+  printf 'running 1 test\ntest result: ok. 1 passed; 0 failed; 0 ignored;\n'
+}
+git() {
+  if [ "$#" = 2 ] && [ "$1" = diff ] && [ "$2" = --exit-code ]; then
+    return 0
+  fi
+  return 95
+}
+"#;
+
+struct SqlScriptFixture(PathBuf);
+
+impl Drop for SqlScriptFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn observe_sql_script(script: &str, mode: &str, target: &str) -> (bool, Vec<String>) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let fixture = SqlScriptFixture(std::env::temp_dir().join(format!(
+        "tickvault-ignored-sql-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )));
+    std::fs::create_dir(&fixture.0).expect("create unique synthetic SQL fixture");
+    std::fs::create_dir(fixture.0.join("release-questdb")).expect("create fixture logs");
+    let output = std::process::Command::new("/bin/bash")
+        .args(["--noprofile", "--norc", "-c"])
+        .arg(format!("{SQL_EXECUTION_STUBS}\n{script}"))
+        .current_dir(&fixture.0)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("RUNNER_TEMP", &fixture.0)
+        .env("GITHUB_STEP_SUMMARY", fixture.0.join("summary"))
+        .env("TV_SQL_CALL_LOG", fixture.0.join("calls"))
+        .env("VIEW_SQL_FIXTURE", SQL_FIXTURE_NAMES[0])
+        .env("RECOVERY_SQL_FIXTURE", SQL_FIXTURE_NAMES[1])
+        .env("TV_SQL_MODE", mode)
+        .env("TV_SQL_TARGET", target)
+        .env("SOURCE_SHA", "0123456789abcdef0123456789abcdef01234567")
+        .env(
+            "TICKVAULT_ISOLATED_QUESTDB_EXEC_URL",
+            "http://127.0.0.1:1/exec",
+        )
+        .output()
+        .expect("execute actual SQL gate with synthetic Cargo");
+    let calls = match std::fs::read_to_string(fixture.0.join("calls")) {
+        Ok(calls) => calls.lines().map(str::to_owned).collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!("read synthetic Cargo calls: {error}"),
+    };
+    (output.status.success(), calls)
+}
+
+fn both_sql_fixtures_execute(release: &str) -> bool {
+    let Some(script) = isolated_sql_script(release) else {
+        return false;
+    };
+    let (success, calls) = observe_sql_script(&script, "success", "");
+    success && calls.iter().map(String::as_str).eq(SQL_FIXTURE_NAMES)
+}
+
+fn required_sql_execution_is_wired(release: &str, ci: &str) -> bool {
+    let Some(questdb) = workflow_job(release, "questdb") else {
+        return false;
+    };
+    let Some(fanin) = workflow_job(release, "release-validation") else {
+        return false;
+    };
+    let Some(call) = workflow_job(ci, "release-validation") else {
+        return false;
+    };
+    let Some(all_green) = workflow_job(ci, "all-green") else {
+        return false;
+    };
+    if [&questdb, &call]
+        .iter()
+        .any(|job| job.lines().any(|line| line.starts_with("    if:")))
+        || [&questdb, &fanin, &call, &all_green].iter().any(|job| {
+            job.lines()
+                .any(|line| line.trim_start().starts_with("continue-on-error:"))
+        })
+    {
+        return false;
+    }
+    let step_marker =
+        "      - name: Execute each ignored SQL fixture and require one passing test each";
+    let starts: Vec<_> = questdb.match_indices(step_marker).collect();
+    if starts.len() != 1 {
+        return false;
+    }
+    let execution = questdb[starts[0].0 + step_marker.len()..]
+        .split("\n      - name:")
+        .next()
+        .unwrap_or("");
+    if execution
+        .lines()
+        .any(|line| line.trim_start().starts_with("if:"))
+    {
+        return false;
+    }
+    let has_line = |text: &str, expected: &str| text.lines().any(|line| line.trim() == expected);
+    [
+        r#"set -euo pipefail"#,
+        r#"for fixture in "$VIEW_SQL_FIXTURE" "$RECOVERY_SQL_FIXTURE"; do"#,
+        r#"cargo test --locked -p tickvault-storage --lib "$fixture" \"#,
+        r#"-- --ignored --exact --nocapture --test-threads=1 \"#,
+        r#"grep -Fxq 'running 1 test' "$fixture_log""#,
+        r#"grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$fixture_log""#,
+        r#"test "$fixture_index" = 2"#,
+    ]
+    .iter()
+    .all(|line| has_line(execution, line))
+        && has_line(
+            &questdb,
+            "VIEW_SQL_FIXTURE: console_views::candle_top_volume_views::tests::candle_top_volume_questdb_duplicate_labels_preserve_one_row_per_candle",
+        )
+        && has_line(
+            &questdb,
+            "RECOVERY_SQL_FIXTURE: seal_recovery_guard::tests::isolated_questdb_recovery_inserts_skips_and_refuses_conflicts",
+        )
+        && has_line(&fanin, "needs: [arm64, questdb]")
+        && has_line(&fanin, "QDB_RESULT: ${{ needs.questdb.result }}")
+        && has_line(&fanin, r#"test "$QDB_RESULT" = success"#)
+        && has_line(&call, "uses: ./.github/workflows/release-validation.yml")
+        && has_line(&all_green, "- release-validation")
+        && both_sql_fixtures_execute(release)
+}
+
 struct Ignored {
     file: String,
     func: String,
@@ -291,7 +524,16 @@ fn the_ignored_set_only_shrinks() {
          this test vacuously forever."
     );
 
-    let allowed: BTreeSet<(&str, &str)> = ALLOWED_IGNORED.iter().copied().collect();
+    let release =
+        std::fs::read_to_string(repo_root().join(".github/workflows/release-validation.yml"))
+            .expect("release workflow");
+    let ci =
+        std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).expect("CI workflow");
+    assert!(
+        required_sql_execution_is_wired(&release, &ci),
+        "isolated SQL exclusions require both exact tests in the mandatory release workflow"
+    );
+    let allowed: BTreeSet<(&str, &str)> = allowed_ignored_cases().collect();
     let newly: Vec<String> = found
         .iter()
         .filter(|i| !allowed.contains(&(i.file.as_str(), i.func.as_str())))
@@ -317,9 +559,8 @@ fn the_allowlist_does_not_outlive_its_entries() {
         .into_iter()
         .map(|i| (i.file, i.func))
         .collect();
-    let stale: Vec<String> = ALLOWED_IGNORED
-        .iter()
-        .filter(|(f, n)| !found.contains(&((*f).to_string(), (*n).to_string())))
+    let stale: Vec<String> = allowed_ignored_cases()
+        .filter(|(f, n)| !found.contains(&(f.to_string(), n.to_string())))
         .map(|(f, n)| format!("{f} :: {n}"))
         .collect();
     assert!(
@@ -337,12 +578,12 @@ fn guard_self_test() {
     let found = scan_ignored();
     assert_eq!(
         found.len(),
-        ALLOWED_IGNORED.len(),
+        allowed_ignored_cases().count(),
         "scanner found {} ignored tests against an allowlist of {} — the two \
          other tests here would still pass if the scanner over- or \
          under-counted in a compensating way, so this pins the total",
         found.len(),
-        ALLOWED_IGNORED.len()
+        allowed_ignored_cases().count()
     );
     assert!(
         found.iter().all(|i| i.has_reason),
@@ -358,4 +599,118 @@ fn guard_self_test() {
          scanner is matching prose, or an attribute is orphaned: {:?}",
         found.iter().map(|i| &i.func).collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn required_sql_wiring_rejects_omissions_skips_and_vacuous_success() {
+    let release =
+        std::fs::read_to_string(repo_root().join(".github/workflows/release-validation.yml"))
+            .expect("release workflow");
+    let ci =
+        std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).expect("CI workflow");
+    assert!(required_sql_execution_is_wired(&release, &ci));
+    for needle in [
+        r#""$RECOVERY_SQL_FIXTURE""#,
+        "--ignored",
+        "--exact",
+        "grep -Fxq 'running 1 test'",
+        "grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored;'",
+        r#"test "$QDB_RESULT" = success"#,
+        "needs: [arm64, questdb]",
+    ] {
+        assert!(
+            release.contains(needle),
+            "mutation must change the real workflow: {needle}"
+        );
+        assert!(
+            !required_sql_execution_is_wired(&release.replace(needle, "REMOVED"), &ci),
+            "{needle}"
+        );
+    }
+    for (old, new) in [
+        ("  questdb:\n", "  questdb:\n    if: false\n"),
+        ("  questdb:\n", "  questdb:\n    continue-on-error: true\n"),
+        (
+            "      - name: Execute each ignored SQL fixture and require one passing test each\n",
+            "      - name: Execute each ignored SQL fixture and require one passing test each\n        if: false\n",
+        ),
+    ] {
+        assert!(release.contains(old));
+        assert!(!required_sql_execution_is_wired(
+            &release.replace(old, new),
+            &ci
+        ));
+    }
+    assert!(!required_sql_execution_is_wired(
+        &release,
+        &ci.replace("      - release-validation\n", "")
+    ));
+    assert!(!required_sql_execution_is_wired(
+        &release,
+        &ci.replace(
+            "  release-validation:\n",
+            "  release-validation:\n    if: false\n"
+        )
+    ));
+}
+
+#[test]
+fn mandatory_sql_execution_propagates_failure_and_rejects_missing_test_output() {
+    let release =
+        std::fs::read_to_string(repo_root().join(".github/workflows/release-validation.yml"))
+            .expect("release workflow");
+    let script = isolated_sql_script(&release).expect("actual SQL execution script");
+    let (success, calls) = observe_sql_script(&script, "success", "");
+    assert!(
+        success,
+        "the normal synthetic pair must pass the actual workflow step"
+    );
+    assert!(calls.iter().map(String::as_str).eq(SQL_FIXTURE_NAMES));
+    for (index, fixture) in SQL_FIXTURE_NAMES.iter().enumerate() {
+        for mode in [
+            "failure",
+            "missing_running",
+            "missing_summary",
+            "silent_success",
+            "zero_tests",
+            "ignored_test",
+            "success_output_failure",
+        ] {
+            let (success, calls) = observe_sql_script(&script, mode, fixture);
+            assert!(
+                !success,
+                "the actual SQL step accepted {mode} for {fixture}"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .map(String::as_str)
+                    .eq(SQL_FIXTURE_NAMES[..=index].iter().copied()),
+                "{mode} must reach the failing exact fixture and stop there: {calls:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn mandatory_sql_execution_cannot_be_replaced_by_an_early_successful_exit() {
+    let release =
+        std::fs::read_to_string(repo_root().join(".github/workflows/release-validation.yml"))
+            .expect("release workflow");
+    let ci =
+        std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).expect("CI workflow");
+    let marker = "      - name: Execute each ignored SQL fixture and require one passing test each\n        run: |\n";
+    assert_eq!(release.matches(marker).count(), 1);
+    let changed = release.replacen(marker, &format!("{marker}          exit 0\n"), 1);
+    let script = isolated_sql_script(&changed).expect("extract early-success mutant");
+    let (success, calls) = observe_sql_script(&script, "success", "");
+    assert!(
+        success,
+        "mutation specifically reproduces a successful shell exit"
+    );
+    assert!(
+        calls.is_empty(),
+        "the mutant must skip both Cargo invocations"
+    );
+    assert!(!required_sql_execution_is_wired(&changed, &ci));
 }

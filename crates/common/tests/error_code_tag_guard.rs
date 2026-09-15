@@ -291,7 +291,12 @@ fn scan_corpus_exists_and_is_substantial() {
 /// "this stock did not trade" rather than "we could not price it". Each now
 /// carries `WS-GAP-03` with a `source` naming which arm failed. The budget
 /// comes down with them, in the same change, per the rule two lines above.
-const UNCODED_ERROR_BUDGET: usize = 77;
+///
+/// 77 -> 75 (2026-09-15, PR #1914). The candidate initially measured 93
+/// uncoded sites. Coding all 18 new ranking/schema/WAL refusal sites reduced
+/// the unchanged scanner's observed total to 75. This measured reduction
+/// tightens the existing ratchet; no scan scope or exemption changed.
+const UNCODED_ERROR_BUDGET: usize = 75;
 
 /// Per-crate uncoded-error budgets, for the crates the six-name list never
 /// reached.

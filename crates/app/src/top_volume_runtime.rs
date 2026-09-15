@@ -420,12 +420,11 @@ mod tests {
 
     /// Local-store measurements only: does not publish into the live global.
     #[test]
-    #[ignore = "timing harness; run explicitly in release mode"]
     fn benchmark_runtime_snapshot_reads_and_publication() {
         use std::hint::black_box;
         use std::time::Instant;
 
-        const SAMPLES: usize = 100;
+        const SAMPLES: usize = if cfg!(debug_assertions) { 3 } else { 100 };
         const READS_PER_BATCH: u128 = 10_000;
         let family = OptionFamily::Stock;
         let cadence = SnapshotCadence::OneSecond;
@@ -455,12 +454,15 @@ mod tests {
                 }
                 reads.push(start.elapsed().as_nanos() / READS_PER_BATCH);
             }
+            assert_eq!(reads.len(), SAMPLES);
             reads.sort_unstable();
             println!(
                 "TV_READ rows={row_count} samples={SAMPLES} reads_per_batch={READS_PER_BATCH} \
                 p50_batch_mean_ns={} p99_batch_mean_ns={} max_batch_mean_ns={} \
                 note=batch_averages_not_individual_access_percentiles",
-                reads[49], reads[98], reads[99]
+                reads[(SAMPLES * 50).div_ceil(100) - 1],
+                reads[(SAMPLES * 99).div_ceil(100) - 1],
+                reads[SAMPLES - 1]
             );
 
             if row_count == 25_000 {
@@ -477,13 +479,16 @@ mod tests {
                     publications.push(start.elapsed().as_nanos());
                     drop(published);
                 }
+                assert_eq!(publications.len(), SAMPLES);
                 publications.sort_unstable();
                 println!(
                     "TV_PUBLISH rows={row_count} samples={SAMPLES} \
                     p50_ns={} p99_ns={} max_ns={} \
                     includes=ordering_validation_arc_allocation_swap_old_release \
                     excludes=full_vec_copy_and_fixture_preparation complexity=O(rows)",
-                    publications[49], publications[98], publications[99]
+                    publications[(SAMPLES * 50).div_ceil(100) - 1],
+                    publications[(SAMPLES * 99).div_ceil(100) - 1],
+                    publications[SAMPLES - 1]
                 );
             }
         }

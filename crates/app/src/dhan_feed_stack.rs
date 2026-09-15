@@ -1675,6 +1675,7 @@ impl LiveIngest {
                 .publish_snapshot(std::sync::Arc::clone(&snapshot))
             {
                 error!(
+                    code = tickvault_common::error_code::ErrorCode::CandleRank01Refused.code_str(),
                     source = "top_volume_runtime_publication_refused",
                     ?family,
                     ?cadence,
@@ -26447,15 +26448,15 @@ mod connection_delivery_tests {
         assert_eq!(
             ingest.dead_class_latch.load(Ordering::Relaxed) & bit,
             0,
-            "the pre-open sweeps must not count toward the in-session grace — 
-             if they did, the gate would merely DELAY the false report to the 
+            "the pre-open sweeps must not count toward the in-session grace —
+             if they did, the gate would merely DELAY the false report to the
              bell instead of preventing it"
         );
         let _ = ingest.scan_silence(SESSION_0916_IST_MILLIS + 1);
         assert_eq!(
             ingest.dead_class_latch.load(Ordering::Relaxed) & bit,
             bit,
-            "a full in-session detector cycle with nothing received must judge, 
+            "a full in-session detector cycle with nothing received must judge,
              or the gate has become a mute"
         );
     }

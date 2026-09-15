@@ -160,7 +160,7 @@ mod tests {
         });
     }
 
-    fn check(input: Vec<RankedContract>) {
+    fn assert_matches_oracle(input: Vec<RankedContract>) {
         let mut expected = input.clone();
         oracle(&mut expected);
         let mut actual = input;
@@ -178,7 +178,7 @@ mod tests {
             state
         };
         for size in [0, 1, 2, 63, 64, 65, 127, 128, 129, 257, 2_000, 25_000] {
-            check((0..size).map(|i| row(next(), next(), i)).collect());
+            assert_matches_oracle((0..size).map(|i| row(next(), next(), i)).collect());
         }
     }
 
@@ -196,18 +196,18 @@ mod tests {
                 }
             }
         }
-        check(rows);
-        check((0..1024).map(|i| row(42, 42, i)).collect());
+        assert_matches_oracle(rows);
+        assert_matches_oracle((0..1024).map(|i| row(42, 42, i)).collect());
     }
 
     #[test]
     fn sorted_reverse_and_uniform_keys_keep_complete_rows() {
         let mut rows: Vec<_> = (0..2048).map(|i| row(i, i % 17, i as usize)).collect();
         oracle(&mut rows);
-        check(rows.clone());
+        assert_matches_oracle(rows.clone());
         rows.reverse();
-        check(rows);
-        check(vec![row(u64::MAX, 0, 7); 2048]);
+        assert_matches_oracle(rows);
+        assert_matches_oracle(vec![row(u64::MAX, 0, 7); 2048]);
     }
 
     #[test]
@@ -236,7 +236,7 @@ mod tests {
     #[test]
     fn hundred_thousand_low_entropy_keys_and_long_common_prefixes_match_oracle() {
         for shape in 0..3 {
-            check(
+            assert_matches_oracle(
                 (0..100_000usize)
                     .map(|i| {
                         let reversed = (100_000 - i) as u64;

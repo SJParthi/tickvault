@@ -604,7 +604,7 @@ fn full_mode_frame_with_inline_depth_does_not_allocate_per_tick() {
             bytes.extend_from_slice(&full_packet(
                 5000 + i,
                 100.0 + (n % 97) as f32 * 0.05,
-                SESSION_EPOCH_SECS + (n % 600) as u32,
+                SESSION_EPOCH_SECS + n as u32,
             ));
         }
         CapturedFrame {
@@ -624,20 +624,37 @@ fn full_mode_frame_with_inline_depth_does_not_allocate_per_tick() {
     // slot and registers its metric keys, and that cost is per-universe, not
     // per-tick.
     for n in 0..4u64 {
-        let _ = drain_main_feed_frame(&mut ingest, &frame(n, n), SESSION_RECEIPT_NANOS, 1_000, c);
+        let out = drain_main_feed_frame(
+            &mut ingest,
+            &frame(n, n),
+            SESSION_RECEIPT_NANOS + n as i64 * 1_000_000_000,
+            1_000 + n,
+            c,
+        );
+        assert_eq!(out.folded, 4, "every warm-up packet must fold");
     }
 
     const FRAMES: u64 = 2_500; // x4 packets = 10,000 ticks
 
     // EVERY FIXTURE BUILT BEFORE THE PROFILER STARTS, so the measurement is of
     // the drain and not of the test's own Vec growth.
-    let frames: Vec<CapturedFrame> = (0..FRAMES).map(|n| frame(1_000 + n, n)).collect();
+    // Each receipt follows its frame's LTT on the same monotonic timeline.
+    // A fixed receipt with advancing LTT correctly exercises the FUTURE-time
+    // refusal path; that is not the valid Full-packet path measured here.
+    // Start after warm-up and do not wrap LTT backwards every 600 seconds.
+    let frames: Vec<CapturedFrame> = (0..FRAMES).map(|n| frame(1_000 + n, n + 4)).collect();
 
     let profiler = dhat::Profiler::builder().testing().build();
     let mut folded = 0u64;
     let mut depth_rows = 0u64;
-    for f in &frames {
-        let out = drain_main_feed_frame(&mut ingest, f, SESSION_RECEIPT_NANOS, 1_000, c);
+    for (n, f) in frames.iter().enumerate() {
+        let out = drain_main_feed_frame(
+            &mut ingest,
+            f,
+            SESSION_RECEIPT_NANOS + (n as i64 + 4) * 1_000_000_000,
+            1_004 + n as u64,
+            c,
+        );
         folded += out.folded;
         depth_rows += out.inline_depth_rows;
     }

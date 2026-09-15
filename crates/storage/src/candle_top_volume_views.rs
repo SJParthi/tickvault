@@ -48,18 +48,49 @@ pub(super) fn unique_candle_lifecycle_dim_subquery() -> &'static str {
      GROUP BY security_id, exchange_segment, feed) il"
 }
 
+/// SQL counterpart of LiveCandleState::signed_bar_volume: a current-basis
+/// cache is available only for a nonempty observed candle whose stored signed
+/// value is zero or has exactly the gross magnitude. Refusal bits still win
+/// when combined with other diagnostic flags. LONG persistence also rejects
+/// malformed negative gross quantities and values outside the u32 quality domain.
+///
+/// Bitwise LONG operations: <https://questdb.com/docs/reference/operators/bitwise/>.
+fn signed_candle_volume_available_sql() -> String {
+    use tickvault_trading::candles::volume_update::{
+        VOLUME_QUALITY_COUNTER_AMBIGUOUS, VOLUME_QUALITY_LEGACY_BASIS,
+    };
+    let refused_quality = VOLUME_QUALITY_COUNTER_AMBIGUOUS | VOLUME_QUALITY_LEGACY_BASIS;
+    format!(
+        "c.volume_basis = '{CANDLE_TOP_VOLUME_METRIC_VERSION}' \
+         AND c.net_volume IS NOT NULL AND c.tick_count > 0 AND c.volume >= 0 \
+         AND c.volume_quality BETWEEN 0 AND 4294967295 \
+         AND (c.volume_quality & cast({refused_quality} AS LONG)) = 0 \
+         AND (c.net_volume = c.volume OR c.net_volume = -c.volume OR c.net_volume = 0)"
+    )
+}
+
+/// One signed quantity projection shared by named candles and Top Volume.
+/// Attribution-uncertain diagnostics can retain a canonical signed quantity;
+/// the separate eligibility predicate still refuses them for ranking.
+/// Historical, ambiguous or malformed caches never become signed volume.
+pub(super) fn signed_candle_volume_sql() -> String {
+    let available = signed_candle_volume_available_sql();
+    format!("CASE WHEN {available} THEN c.net_volume ELSE cast(null AS LONG) END")
+}
+
 /// A row can be displayed without being suitable for ranking. In particular,
 /// SQL NULL is not a classified unchanged-close bar, and a missing definition is not today's lot.
 /// The quality mask establishes the local fold contract, not exchange-wide
 /// tick completeness or observed aggressor-side volume.
-fn eligibility_sql() -> &'static str {
-    "c.volume_basis = 'signed_bar_volume_vs_one_lot_v3' \
-     AND c.volume_quality = 0 AND c.net_volume IS NOT NULL \
-     AND c.lot_size BETWEEN 1 AND 4294967295 \
-     AND c.instrument_definition_version > 0 \
-     AND c.underlying_id > 0 AND c.ranking_family IN ('stock', 'index') \
-     AND c.bucket_revision > 0 AND c.volume >= 0 \
-     AND (c.net_volume = c.volume OR c.net_volume = -c.volume OR c.net_volume = 0)"
+fn eligibility_sql() -> String {
+    let available = signed_candle_volume_available_sql();
+    format!(
+        "{available} AND c.volume_quality = 0 \
+         AND c.lot_size BETWEEN 1 AND 4294967295 \
+         AND c.instrument_definition_version > 0 \
+         AND c.underlying_id > 0 AND c.ranking_family IN ('stock', 'index') \
+         AND c.bucket_revision > 0"
+    )
 }
 
 /// Exact signed rational ordering using signed LONG operations only.
@@ -110,13 +141,13 @@ pub fn candle_top_volume_view_ddl(tf: TfIndex) -> Option<String> {
     let eligible = eligibility_sql();
     let exact_order = exact_signed_ratio_order_sql();
     let dimension = unique_candle_lifecycle_dim_subquery();
+    let signed_volume = signed_candle_volume_sql();
     let denominator = format!("(CASE WHEN {eligible} THEN c.lot_size ELSE cast(1 AS LONG) END)");
     Some(format!(
         "CREATE OR REPLACE VIEW {view} AS \
          SELECT c.ts, il.symbol_name, il.display_name, il.instrument_type, \
          c.ranking_family AS family, \
-         CASE WHEN c.volume_basis = '{CANDLE_TOP_VOLUME_METRIC_VERSION}' \
-              THEN c.net_volume ELSE cast(null AS LONG) END AS volume, c.lot_size, \
+         {signed_volume} AS volume, c.lot_size, \
          CASE WHEN {eligible} THEN cast(c.net_volume AS DOUBLE) / cast({denominator} AS DOUBLE) \
               ELSE cast(null AS DOUBLE) END AS volume_lots, \
          CASE WHEN {eligible} THEN \
@@ -219,6 +250,10 @@ mod tests {
                 "AS rank_eligible",
                 "c.volume_quality = 0",
                 "c.net_volume IS NOT NULL",
+                "c.tick_count > 0",
+                "c.volume >= 0",
+                "c.volume_quality BETWEEN 0 AND 4294967295",
+                "(c.volume_quality & cast(520 AS LONG)) = 0",
                 "c.lot_size BETWEEN 1 AND 4294967295",
                 "c.instrument_definition_version > 0",
                 "c.ranking_family AS family",
@@ -312,6 +347,7 @@ mod tests {
         let candle_table = format!("{prefix}_candles");
         let master_table = format!("{prefix}_master");
         let view = format!("{prefix}_view");
+        let named_view = format!("{prefix}_named");
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
@@ -321,7 +357,7 @@ mod tests {
                 "CREATE TABLE {master_table} (security_id LONG, exchange_segment SYMBOL, feed SYMBOL, symbol_name SYMBOL, display_name STRING, instrument_type SYMBOL, dry_run BOOLEAN);"
             )).await?;
             sql(&client, &endpoint, &format!(
-                "CREATE TABLE {candle_table} (ts TIMESTAMP, volume LONG, net_volume LONG, lot_size LONG, instrument_definition_version LONG, underlying_id LONG, ranking_family SYMBOL, volume_quality LONG, bucket_revision LONG, feed SYMBOL, segment SYMBOL, security_id LONG, volume_basis SYMBOL);"
+                "CREATE TABLE {candle_table} (ts TIMESTAMP, volume LONG, net_volume LONG, lot_size LONG, instrument_definition_version LONG, underlying_id LONG, ranking_family SYMBOL, volume_quality LONG, bucket_revision LONG, feed SYMBOL, segment SYMBOL, security_id LONG, volume_basis SYMBOL, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, oi LONG, tick_count LONG, close_pct_from_prev_day DOUBLE, open_pct DOUBLE, change_pct DOUBLE, open_gap_pct DOUBLE, total_buy_qty LONG, total_sell_qty LONG);"
             )).await?;
             sql(&client, &endpoint, &format!(
                 "INSERT INTO {master_table} VALUES \
@@ -338,16 +374,16 @@ mod tests {
                  (7,'BSE_FNO','dhan','BSE','BSE option','OPTSTK',false);"
             )).await?;
             sql(&client, &endpoint, &format!(
-                "INSERT INTO {candle_table} VALUES \
-                 (cast(1000000 AS TIMESTAMP),200,200,100,1,10,'stock',0,1,'dhan','NSE_FNO',1,'signed_bar_volume_vs_one_lot_v3'), \
-                 (cast(1000000 AS TIMESTAMP),100,100,100,1,10,'stock',0,1,'dhan','NSE_FNO',2,'signed_bar_volume_vs_one_lot_v3'), \
-                 (cast(1000000 AS TIMESTAMP),600,0,100,1,10,'stock',0,1,'dhan','NSE_FNO',3,'signed_bar_volume_vs_one_lot_v3'), \
-                 (cast(1000000 AS TIMESTAMP),50,-50,100,1,10,'stock',0,1,'dhan','NSE_FNO',4,'signed_bar_volume_vs_one_lot_v3'), \
-                 (cast(1000000 AS TIMESTAMP),100,-100,100,1,10,'stock',0,1,'dhan','NSE_FNO',5,'signed_bar_volume_vs_one_lot_v3'), \
-                 (cast(1000000 AS TIMESTAMP),100,100,100,1,10,'stock',0,1,'dhan','NSE_FNO',6,'signed_bar_volume_vs_one_lot_v3'), \
-                 (cast(1000000 AS TIMESTAMP),100,100,100,1,10,'stock',0,1,'truedata','NSE_FNO',6,'signed_bar_volume_vs_one_lot_v3'), \
-                 (cast(1000000 AS TIMESTAMP),100,100,100,1,10,'stock',0,1,'dhan','NSE_FNO',7,'signed_bar_volume_vs_one_lot_v3'), \
-                 (cast(1000000 AS TIMESTAMP),100,100,100,1,10,'stock',0,1,'dhan','BSE_FNO',7,'signed_bar_volume_vs_one_lot_v3');"
+                "INSERT INTO {candle_table} (ts,volume,net_volume,lot_size,instrument_definition_version,underlying_id,ranking_family,volume_quality,bucket_revision,feed,segment,security_id,volume_basis,tick_count) VALUES \
+                 (cast(1000000 AS TIMESTAMP),200,200,100,1,10,'stock',0,1,'dhan','NSE_FNO',1,'signed_bar_volume_vs_one_lot_v3',1), \
+                 (cast(1000000 AS TIMESTAMP),100,100,100,1,10,'stock',0,1,'dhan','NSE_FNO',2,'signed_bar_volume_vs_one_lot_v3',1), \
+                 (cast(1000000 AS TIMESTAMP),500,0,100,1,10,'stock',0,1,'dhan','NSE_FNO',3,'signed_bar_volume_vs_one_lot_v3',1), \
+                 (cast(1000000 AS TIMESTAMP),50,-50,100,1,10,'stock',0,1,'dhan','NSE_FNO',4,'signed_bar_volume_vs_one_lot_v3',1), \
+                 (cast(1000000 AS TIMESTAMP),100,-100,100,1,10,'stock',0,1,'dhan','NSE_FNO',5,'signed_bar_volume_vs_one_lot_v3',1), \
+                 (cast(1000000 AS TIMESTAMP),100,100,100,1,10,'stock',0,1,'dhan','NSE_FNO',6,'signed_bar_volume_vs_one_lot_v3',1), \
+                 (cast(1000000 AS TIMESTAMP),100,100,100,1,10,'stock',0,1,'truedata','NSE_FNO',6,'signed_bar_volume_vs_one_lot_v3',1), \
+                 (cast(1000000 AS TIMESTAMP),100,100,100,1,10,'stock',0,1,'dhan','NSE_FNO',7,'signed_bar_volume_vs_one_lot_v3',1), \
+                 (cast(1000000 AS TIMESTAMP),100,100,100,1,10,'stock',0,1,'dhan','BSE_FNO',7,'signed_bar_volume_vs_one_lot_v3',1);"
             )).await?;
             let ddl = candle_top_volume_view_ddl(TfIndex::M1)
                 .expect("1m primary DDL")
@@ -383,11 +419,146 @@ mod tests {
                     return Err(format!("unexpected candle/label/ordering result: {actual}"));
                 }
             }
+            // Exercise the two actual view builders over one physical source.
+            // The named view displays current-basis diagnostics, whereas the
+            // Top Volume eligibility gate must still reject uncertain rows.
+            let metric = CANDLE_TOP_VOLUME_METRIC_VERSION;
+            let legacy = crate::shadow_seal_columns::LEGACY_VOLUME_BASIS;
+            let unclassified = i64::from(
+                tickvault_trading::candles::volume_update::VOLUME_QUALITY_UNCLASSIFIED_NET,
+            );
+            let legacy_quality = i64::from(
+                tickvault_trading::candles::volume_update::VOLUME_QUALITY_LEGACY_BASIS,
+            );
+            let unknown_quality = i64::from(
+                tickvault_trading::candles::volume_update::VOLUME_QUALITY_UNKNOWN_METADATA,
+            );
+            let uncertain = i64::from(
+                tickvault_trading::candles::volume_update::VOLUME_QUALITY_ATTRIBUTION_UNCERTAIN,
+            );
+            let counter_ambiguous = i64::from(
+                tickvault_trading::candles::volume_update::VOLUME_QUALITY_COUNTER_AMBIGUOUS,
+            );
+            let combined_counter = counter_ambiguous | uncertain;
+            let combined_legacy = legacy_quality | uncertain;
+            sql(&client, &endpoint, &format!(
+                "INSERT INTO {candle_table} (ts,volume,net_volume,lot_size,instrument_definition_version,underlying_id,ranking_family,volume_quality,bucket_revision,feed,segment,security_id,volume_basis,tick_count) VALUES \
+                 (cast(1000000 AS TIMESTAMP),800,null,100,1,10,'stock',{unclassified},1,'dhan','NSE_FNO',8,'{metric}',1), \
+                 (cast(1000000 AS TIMESTAMP),900,-900,100,1,10,'stock',{legacy_quality},1,'dhan','NSE_FNO',9,'{legacy}',1), \
+                 (cast(1000000 AS TIMESTAMP),1000,777,100,1,10,'stock',{unknown_quality},1,'dhan','NSE_FNO',10,null,1), \
+                 (cast(1000000 AS TIMESTAMP),1100,-1100,100,1,10,'stock',{unknown_quality},1,'dhan','NSE_FNO',11,'unrecognized_basis',1), \
+                 (cast(1000000 AS TIMESTAMP),1200,-1200,100,1,10,'stock',{uncertain},1,'dhan','NSE_FNO',12,'{metric}',1), \
+                 (cast(1000000 AS TIMESTAMP),1300,1300,100,1,10,'stock',{counter_ambiguous},1,'dhan','NSE_FNO',13,'{metric}',1), \
+                 (cast(1000000 AS TIMESTAMP),1400,-1400,100,1,10,'stock',{legacy_quality},1,'dhan','NSE_FNO',14,'{metric}',1), \
+                 (cast(1000000 AS TIMESTAMP),1500,777,100,1,10,'stock',0,1,'dhan','NSE_FNO',15,'{metric}',1), \
+                 (cast(1000000 AS TIMESTAMP),1600,1600,100,1,10,'stock',0,1,'dhan','NSE_FNO',16,'{metric}',0), \
+                 (cast(1000000 AS TIMESTAMP),-1700,-1700,100,1,10,'stock',0,1,'dhan','NSE_FNO',17,'{metric}',1), \
+                 (cast(1000000 AS TIMESTAMP),1800,-1800,100,1,10,'stock',{combined_counter},1,'dhan','NSE_FNO',18,'{metric}',1), \
+                 (cast(1000000 AS TIMESTAMP),1900,1900,100,1,10,'stock',{combined_legacy},1,'dhan','NSE_FNO',19,'{metric}',1), \
+                 (cast(1000000 AS TIMESTAMP),9223372036854775807,-9223372036854775807,100,1,10,'stock',0,1,'dhan','NSE_FNO',20,'{metric}',1), \
+                 (cast(1000000 AS TIMESTAMP),2100,2100,100,1,10,'stock',4294967296,1,'dhan','NSE_FNO',21,'{metric}',1), \
+                 (cast(1000000 AS TIMESTAMP),2200,2200,100,1,10,'stock',0,1,'dhan','NSE_FNO',22,'{metric}',null);"
+            )).await?;
+            let source_query = format!(
+                "SELECT security_id,segment,feed,volume,net_volume,volume_basis,volume_quality \
+                 FROM {candle_table} ORDER BY security_id,segment,feed;"
+            );
+            let source_before = sql(&client, &endpoint, &source_query).await?;
+            let named_ddl = crate::console_views::candles_named_view_ddl()
+                .replace("candles_named", &named_view)
+                .replace("candles_1m", &candle_table)
+                .replace("instrument_lifecycle", &master_table);
+            sql(&client, &endpoint, &named_ddl).await?;
+            let named_result = sql(&client, &endpoint, &format!(
+                "SELECT security_id,segment,feed,gross_volume,volume,volume_basis,volume_quality, \
+                 display_metadata_rows,display_metadata_ambiguous,symbol_name,display_name \
+                 FROM {named_view};"
+            )).await?;
+            let primary_result = sql(&client, &endpoint, &format!(
+                "SELECT security_id,segment,feed,volume,volume_basis,volume_quality,rank_eligible, \
+                 display_metadata_rows,display_metadata_ambiguous,symbol_name,display_name \
+                 FROM {view};"
+            )).await?;
+            let source_after = sql(&client, &endpoint, &source_query).await?;
+            if source_before.get("dataset") != source_after.get("dataset") {
+                return Err("view convergence changed physical source quantities or provenance".to_owned());
+            }
+            let named_rows = named_result.get("dataset").and_then(serde_json::Value::as_array)
+                .ok_or_else(|| "named fixture response has no dataset".to_owned())?;
+            let primary_rows = primary_result.get("dataset").and_then(serde_json::Value::as_array)
+                .ok_or_else(|| "primary fixture response has no dataset".to_owned())?;
+            let source_rows = source_after.get("dataset").and_then(serde_json::Value::as_array)
+                .ok_or_else(|| "source fixture response has no dataset".to_owned())?;
+            // Literal expectations distinguish gross, legacy cache, public
+            // signed quantity and ranking eligibility. No price/sign formula
+            // is reimplemented in this fixture.
+            let expected_quantities = [
+                (1, "NSE_FNO", "dhan", 200, Some(200), Some(200), Some(metric), 0, true),
+                (2, "NSE_FNO", "dhan", 100, Some(100), Some(100), Some(metric), 0, true),
+                (3, "NSE_FNO", "dhan", 500, Some(0), Some(0), Some(metric), 0, true),
+                (4, "NSE_FNO", "dhan", 50, Some(-50), Some(-50), Some(metric), 0, true),
+                (5, "NSE_FNO", "dhan", 100, Some(-100), Some(-100), Some(metric), 0, true),
+                (6, "NSE_FNO", "dhan", 100, Some(100), Some(100), Some(metric), 0, true),
+                (6, "NSE_FNO", "truedata", 100, Some(100), Some(100), Some(metric), 0, true),
+                (7, "NSE_FNO", "dhan", 100, Some(100), Some(100), Some(metric), 0, true),
+                (7, "BSE_FNO", "dhan", 100, Some(100), Some(100), Some(metric), 0, true),
+                (8, "NSE_FNO", "dhan", 800, None, None, Some(metric), unclassified, false),
+                (9, "NSE_FNO", "dhan", 900, Some(-900), None, Some(legacy), legacy_quality, false),
+                (10, "NSE_FNO", "dhan", 1000, Some(777), None, None, unknown_quality, false),
+                (11, "NSE_FNO", "dhan", 1100, Some(-1100), None, Some("unrecognized_basis"), unknown_quality, false),
+                (12, "NSE_FNO", "dhan", 1200, Some(-1200), Some(-1200), Some(metric), uncertain, false),
+                (13, "NSE_FNO", "dhan", 1300, Some(1300), None, Some(metric), counter_ambiguous, false),
+                (14, "NSE_FNO", "dhan", 1400, Some(-1400), None, Some(metric), legacy_quality, false),
+                (15, "NSE_FNO", "dhan", 1500, Some(777), None, Some(metric), 0, false),
+                (16, "NSE_FNO", "dhan", 1600, Some(1600), None, Some(metric), 0, false),
+                (17, "NSE_FNO", "dhan", -1700, Some(-1700), None, Some(metric), 0, false),
+                (18, "NSE_FNO", "dhan", 1800, Some(-1800), None, Some(metric), combined_counter, false),
+                (19, "NSE_FNO", "dhan", 1900, Some(1900), None, Some(metric), combined_legacy, false),
+                (20, "NSE_FNO", "dhan", i64::MAX, Some(-i64::MAX), Some(-i64::MAX), Some(metric), 0, true),
+                (21, "NSE_FNO", "dhan", 2100, Some(2100), None, Some(metric), 4_294_967_296, false),
+                (22, "NSE_FNO", "dhan", 2200, Some(2200), None, Some(metric), 0, false),
+            ];
+            for rows in [named_rows, primary_rows, source_rows] {
+                if rows.len() != expected_quantities.len() {
+                    return Err(format!(
+                        "quantity fixture expected {} rows, got {}: {rows:?}",
+                        expected_quantities.len(), rows.len()
+                    ));
+                }
+            }
+            for (id, segment, feed, gross, raw_cache, signed, basis, quality, eligible)
+                in expected_quantities
+            {
+                let key_matches = |row: &&serde_json::Value| {
+                    row[0].as_i64() == Some(id) && row[1] == segment && row[2] == feed
+                };
+                let named = named_rows.iter().find(key_matches)
+                    .ok_or_else(|| format!("missing named candle key {id}/{segment}/{feed}"))?;
+                let primary = primary_rows.iter().find(key_matches)
+                    .ok_or_else(|| format!("missing primary candle key {id}/{segment}/{feed}"))?;
+                let source = source_rows.iter().find(key_matches)
+                    .ok_or_else(|| format!("missing physical candle key {id}/{segment}/{feed}"))?;
+                if named[3].as_i64() != Some(gross) || named[4].as_i64() != signed
+                    || named[5].as_str() != basis || named[6].as_i64() != Some(quality)
+                    || primary[3].as_i64() != signed || primary[4].as_str() != basis
+                    || primary[5].as_i64() != Some(quality)
+                    || primary[6].as_bool() != Some(eligible)
+                    || source[3].as_i64() != Some(gross) || source[4].as_i64() != raw_cache
+                    || source[5].as_str() != basis || source[6].as_i64() != Some(quality)
+                    || (7..=10).any(|index| named[index] != primary[index])
+                {
+                    return Err(format!(
+                        "quantity/provenance/eligibility mismatch for {id}/{segment}/{feed}: \
+                         named={named}, primary={primary}, physical={source}"
+                    ));
+                }
+            }
             Ok::<(), String>(())
         }.await;
         // Cleanup is specific to the unique synthetic names above, never a
         // prefix sweep over existing user tables. Preserve the first failure.
         for query in [
+            format!("DROP VIEW IF EXISTS {named_view};"),
             format!("DROP VIEW IF EXISTS {view};"),
             format!("DROP TABLE IF EXISTS {candle_table};"),
             format!("DROP TABLE IF EXISTS {master_table};"),

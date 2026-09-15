@@ -4,18 +4,50 @@
 //! stops the writer, and checks complete payloads, transport tags and replay
 //! confirmation behavior. It does not send SIGKILL, restart an OS process,
 //! test all endpoint types, query QuestDB, or simulate power loss. Those need
-//! distinct experiments. The truncation case appends a partial record and
-//! checks that earlier valid payloads remain available.
+//! distinct experiments. The truncation case requires exact quarantine of
+//! the damaged original, then validates a separate known-good prefix copy.
 //!
 //! Uses owned temporary directories without network or Docker access.
 
 #![cfg(test)]
 
+#[path = "support/owned_wal_replay.rs"]
+mod owned_wal_replay;
+use owned_wal_replay::{assert_complete_replay, claim_wal};
+
+use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tickvault_storage::ws_frame_spill::{
-    AppendOutcome, WsFrameSpill, WsType, confirm_replayed, replay_all,
-};
+use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType};
+
+/// Exact original images, excluding confirmation markers and other metadata.
+/// Each result must be a regular WAL file; unreadable discovery is a failure.
+fn wal_segment_images(directory: &Path) -> BTreeMap<OsString, Vec<u8>> {
+    let mut images = BTreeMap::new();
+    for entry in std::fs::read_dir(directory).expect("read fixture WAL directory") {
+        let entry = entry.expect("read fixture WAL entry");
+        if entry
+            .path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("wal")
+        {
+            continue;
+        }
+        assert!(
+            entry.file_type().expect("read fixture WAL type").is_file(),
+            "a fixture WAL image must be a regular file"
+        );
+        let bytes = std::fs::read(entry.path()).expect("read complete fixture WAL image");
+        assert!(
+            images.insert(entry.file_name(), bytes).is_none(),
+            "duplicate fixture WAL name"
+        );
+    }
+    images
+}
 
 /// Build a unique temp dir keyed on caller tag + nanosecond timestamp
 /// so concurrent `cargo test` invocations never collide.
@@ -83,7 +115,9 @@ fn chaos_clean_shutdown_wal_replays_live_and_order_payloads_until_confirmed() {
     }
 
     // Replay through the public API in this same process.
-    let recovered = replay_all(&dir).expect("replay_all");
+    let dir_owner = claim_wal(&dir);
+    let recovered_batch = assert_complete_replay(&dir_owner);
+    let recovered = &recovered_batch.frames;
     assert_eq!(
         recovered.len(),
         60,
@@ -140,43 +174,72 @@ fn chaos_clean_shutdown_wal_replays_live_and_order_payloads_until_confirmed() {
     // confirms durable re-capture. WITHOUT a confirm, a second replay
     // re-returns the same frames (un-confirmed → re-replayed). This is the
     // fix: a second crash before persist no longer strands frames.
-    let second_no_confirm = replay_all(&dir).expect("replay_all re-replays un-confirmed");
+    let second_no_confirm_batch = assert_complete_replay(&dir_owner);
+    let second_no_confirm = &second_no_confirm_batch.frames;
     assert_eq!(
         second_no_confirm.len(),
         60,
         "P7 Scenario 5 (crash-safe): un-confirmed segments MUST re-replay"
     );
 
-    for (first, repeated) in recovered.iter().zip(&second_no_confirm) {
+    for (first, repeated) in recovered.iter().zip(second_no_confirm) {
         assert_eq!(repeated.ws_type, first.ws_type);
         assert_eq!(repeated.frame, first.frame);
+        assert_eq!(repeated.frame_seq, first.frame_seq);
+        assert_eq!(repeated.received_at_nanos, first.received_at_nanos);
+        assert_eq!(repeated.endpoint, first.endpoint);
     }
+    let replaying = dir.join("replaying");
+    let staged_images = wal_segment_images(&replaying);
+    assert!(
+        !staged_images.is_empty(),
+        "fixture must have staged WAL originals"
+    );
+    assert_ne!(
+        recovered_batch.confirmation_id,
+        second_no_confirm_batch.confirmation_id
+    );
+    assert!(
+        !dir_owner.confirm_replayed_generation(recovered_batch.confirmation_id),
+        "a superseded generation cannot ACK the newer pass"
+    );
+
+    assert_eq!(
+        wal_segment_images(&replaying),
+        staged_images,
+        "a refused stale ACK must preserve the staged originals"
+    );
 
     // Confirm within this fixture → archive → no re-replay. There is no DB write.
-    confirm_replayed(&dir);
-    let third_after_confirm = replay_all(&dir).expect("replay_all idempotent after confirm");
+    assert!(dir_owner.confirm_replayed_generation(second_no_confirm_batch.confirmation_id));
+    let third_after_confirm_batch = assert_complete_replay(&dir_owner);
+    let third_after_confirm = &third_after_confirm_batch.frames;
     assert_eq!(
         third_after_confirm.len(),
         0,
         "P7 Scenario 5: confirmed (archived) segments must not double-replay"
     );
 
-    // Archive directory must contain the confirmed segment(s) AFTER confirm.
+    // Confirmation markers alone are not evidence of retained originals.
+    // Every exact staged WAL name and byte image must survive the ACK.
     let archive = dir.join("archive");
-    assert!(
-        archive.exists(),
-        "archive directory must exist after confirm"
+    assert_eq!(
+        wal_segment_images(&archive),
+        staged_images,
+        "ACK must archive every original WAL byte under the same filename"
     );
-    let archived = std::fs::read_dir(&archive).expect("read archive").count();
-    assert!(archived >= 1, "archive must contain at least one segment");
+    assert!(
+        wal_segment_images(&replaying).is_empty(),
+        "confirmed originals must leave replaying"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// **P7 Scenario 11** — corrupted WAL tail must be skipped without
-/// losing the good records that came before it.
+/// **P7 Scenario 11** — an incomplete original cannot be acknowledged.
+/// Its exact bytes survive quarantine, including every earlier valid record.
 #[test]
-fn chaos_wal_corrupted_tail_is_skipped_and_prior_records_recovered() {
+fn chaos_wal_corrupted_tail_is_quarantined_and_prior_bytes_preserved() {
     let dir = chaos_tmp("corrupted-tail");
 
     // Append 10 valid frames through the normal writer.
@@ -194,8 +257,8 @@ fn chaos_wal_corrupted_tail_is_skipped_and_prior_records_recovered() {
 
     // Find the segment file and append corrupted garbage to its tail —
     // simulates the kernel having written a partial record when the
-    // process was killed. `replay_segment` must stop at the boundary
-    // and keep the 10 valid records.
+    // process was killed. Replay must reject the incomplete original instead
+    // of returning a confirmable prefix that could archive unvalidated bytes.
     let seg = std::fs::read_dir(&dir)
         .expect("read dir")
         .filter_map(|e| e.ok())
@@ -203,6 +266,7 @@ fn chaos_wal_corrupted_tail_is_skipped_and_prior_records_recovered() {
         .find(|p| p.extension().and_then(|s| s.to_str()) == Some("wal"))
         .expect("at least one .wal segment must exist");
 
+    let valid_prefix = std::fs::read(&seg).expect("snapshot the ten complete fixture records");
     {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
@@ -214,15 +278,46 @@ fn chaos_wal_corrupted_tail_is_skipped_and_prior_records_recovered() {
         f.write_all(b"TVW1").expect("tail magic");
         f.write_all(&[WsType::LiveFeed.as_u8()]).expect("tail type");
         f.write_all(&9999u32.to_le_bytes()).expect("tail len"); // claim 9999 bytes
-        // ...but do not write the 9999-byte body. `replay_segment`
-        // sees `record_end > buf.len()` and breaks cleanly.
+        // ...but do not write the 9999-byte body. The strict scanner must
+        // refuse the incomplete original and preserve it in quarantine.
     }
 
-    let recovered = replay_all(&dir).expect("replay_all must succeed on truncated tail");
+    let damaged_original = std::fs::read(&seg).expect("snapshot the damaged original");
+    assert!(damaged_original.starts_with(&valid_prefix));
+    let dir_owner = claim_wal(&dir);
+    assert!(
+        dir_owner.replay_fenced().is_err(),
+        "a truncated original must not produce an ACK-able prefix"
+    );
+    let quarantined = dir
+        .join("quarantine")
+        .join(seg.file_name().expect("segment name"));
+    assert_eq!(
+        std::fs::read(&quarantined).expect("quarantined original"),
+        damaged_original
+    );
+    assert!(
+        !dir.join("archive").exists(),
+        "unvalidated original cannot be archived"
+    );
+
+    // This fixture already knows the exact pre-damage bytes. Read a separate
+    // copy to prove all ten payloads remain in that prefix; never truncate or
+    // alter the captured quarantined original to make the test pass.
+    let prefix_copy_dir = dir.join("validated-prefix-copy");
+    std::fs::create_dir(&prefix_copy_dir).expect("separate fixture recovery directory");
+    std::fs::write(
+        prefix_copy_dir.join(seg.file_name().expect("segment name")),
+        &valid_prefix,
+    )
+    .expect("write known fixture prefix copy");
+    let prefix_owner = claim_wal(&prefix_copy_dir);
+    let recovered_batch = assert_complete_replay(&prefix_owner);
+    let recovered = &recovered_batch.frames;
     assert_eq!(
         recovered.len(),
         10,
-        "10 valid records must survive a truncated tail"
+        "every complete pre-damage record remains recoverable from the validated copy"
     );
     for (i, rec) in recovered.iter().enumerate() {
         assert!(matches!(rec.ws_type, WsType::LiveFeed));
@@ -233,6 +328,11 @@ fn chaos_wal_corrupted_tail_is_skipped_and_prior_records_recovered() {
         );
     }
 
+    assert_eq!(
+        std::fs::read(&quarantined).expect("original still retained"),
+        damaged_original
+    );
+    assert!(!dir.join("archive").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -240,7 +340,9 @@ fn chaos_wal_corrupted_tail_is_skipped_and_prior_records_recovered() {
 #[test]
 fn chaos_empty_wal_dir_replay_returns_zero() {
     let dir = chaos_tmp("empty-dir");
-    let recovered = replay_all(&dir).expect("replay_all on empty dir");
+    let dir_owner = claim_wal(&dir);
+    let recovered_batch = assert_complete_replay(&dir_owner);
+    let recovered = &recovered_batch.frames;
     assert!(
         recovered.is_empty(),
         "empty WAL dir must yield zero recovered frames"
@@ -248,13 +350,17 @@ fn chaos_empty_wal_dir_replay_returns_zero() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// **P7** — replaying a non-existent directory is a no-op, not an
-/// error. Ensures first-ever boot (no data dir yet) does not crash.
+/// **P7** — first boot claims its missing WAL directory before replay.
+/// The empty owned namespace contains no fake history or sequence authority.
 #[test]
 fn chaos_nonexistent_wal_dir_replay_returns_zero() {
     let dir = chaos_tmp("nonexistent");
     let _ = std::fs::remove_dir_all(&dir); // make sure it is gone
-    let recovered =
-        replay_all(&dir).expect("replay_all must tolerate a missing directory at first boot");
+    let dir_owner = claim_wal(&dir);
+    let recovered_batch = assert_complete_replay(&dir_owner);
+    let recovered = &recovered_batch.frames;
     assert!(recovered.is_empty());
+    assert!(dir.join(".lock").is_file());
+    assert!(!dir.join("sequence.tvsq").exists());
+    let _ = std::fs::remove_dir_all(&dir);
 }

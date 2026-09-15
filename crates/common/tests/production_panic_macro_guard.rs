@@ -91,6 +91,17 @@ fn repo_root() -> PathBuf {
 /// a risk is the safe direction; a `#[cfg(test)]` helper above `mod tests`
 /// earns an explicit allowlist entry instead of a blind spot.
 fn production_panic_sites(text: &str) -> usize {
+    // A file-level inner attribute excludes the ENTIRE module from non-test
+    // builds. Require it before any code; a comment, string, item attribute,
+    // or later test helper must never hide a production panic below it.
+    if text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with("//"))
+        == Some("#![cfg(test)]")
+    {
+        return 0;
+    }
     text.lines()
         .take_while(|l| !l.trim_start().starts_with("mod tests"))
         .filter(|l| !l.trim_start().starts_with("//"))
@@ -242,4 +253,27 @@ fn guard_self_test_distinguishes_code_from_prose_and_tests() {
         1,
         "the guard must see the arm it exists for"
     );
+}
+
+#[test]
+fn whole_file_test_attribute_is_compiler_enforced_and_not_a_name_exemption() {
+    assert_eq!(
+        production_panic_sites("#![cfg(test)]\nfn fixture() { panic!(\"test\"); }"),
+        0
+    );
+    assert_eq!(
+        production_panic_sites(
+            "// test-only fixture\n\n#![cfg(test)]\nfn fixture() { panic!(\"test\"); }"
+        ),
+        0
+    );
+    for production in [
+        "// #![cfg(test)]\nfn production() { panic!(\"abort\"); }",
+        "#[cfg(test)]\nfn helper() {}\nfn production() { panic!(\"abort\"); }",
+        "#![cfg_attr(test, allow(dead_code))]\nfn production() { panic!(\"abort\"); }",
+        "const TEXT: &str = r#\"\n#![cfg(test)]\n\"#;\nfn production() { panic!(\"abort\"); }",
+        "fn helper() {}\n#![cfg(test)]\nfn production() { panic!(\"abort\"); }",
+    ] {
+        assert_eq!(production_panic_sites(production), 1, "{production}");
+    }
 }

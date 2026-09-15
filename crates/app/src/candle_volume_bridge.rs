@@ -79,6 +79,7 @@ impl CandleVolumeBridge {
             .count();
         if missing_metadata != 0 {
             tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::CandleRank01Refused.code_str(),
                 missing_metadata,
                 source = "candle_ranking_metadata_incomplete",
                 "selected options lack metadata; refusing a falsely complete ranking"
@@ -111,6 +112,7 @@ impl CandleVolumeBridge {
             )
             .map_err(|error| {
                 tracing::error!(
+                    code = tickvault_common::error_code::ErrorCode::CandleRank01Refused.code_str(),
                     ?error,
                     source = "candle_ranking_registration_refused",
                     "canonical candle ranking universe could not be registered"
@@ -153,6 +155,7 @@ impl CandleVolumeBridge {
         self.refused = self.refused.saturating_add(1);
         metrics::counter!("tv_candle_ranking_refused_total", "reason" => reason).increment(1);
         tracing::error!(
+            code = tickvault_common::error_code::ErrorCode::CandleRank01Refused.code_str(),
             source = "candle_ranking_invalidated",
             reason,
             "ranking is blocked for the current session; metadata refresh does not clear the fault"

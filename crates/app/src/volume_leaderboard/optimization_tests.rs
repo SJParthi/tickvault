@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Public-API differential checks for the optimized exact-ratio ranker.
 //! The reference owns its own rows/baselines; it never reads implementation
 //! maps, dense slots, dirty lists, or sorting helpers.
@@ -309,9 +311,8 @@ fn optimized_slots_recover_across_relatch_resync_and_daily_reuse() {
 /// describe rank calls, excluding updates, construction, reference sorting,
 /// assertions, persistence, network and scheduler wait. No latency guarantee.
 #[test]
-#[ignore = "AWS synthetic full-ranking characterization; not a CI latency gate"]
 fn optimization_latency_matrix() {
-    const SAMPLES: usize = 100;
+    const SAMPLES: usize = if cfg!(debug_assertions) { 3 } else { 100 };
     for family in FAMILIES {
         for population in [100_usize, 2_000, 20_220, 25_000] {
             if family == OptionFamily::Index && population == 25_000 {
@@ -375,10 +376,10 @@ fn optimization_latency_matrix() {
                     population,
                     population,
                     SAMPLES,
-                    elapsed_ns[49],
-                    elapsed_ns[94],
-                    elapsed_ns[98],
-                    elapsed_ns[99],
+                    elapsed_ns[(SAMPLES * 50).div_ceil(100) - 1],
+                    elapsed_ns[(SAMPLES * 95).div_ceil(100) - 1],
+                    elapsed_ns[(SAMPLES * 99).div_ceil(100) - 1],
+                    elapsed_ns[SAMPLES - 1],
                 );
             }
         }

@@ -2,6 +2,9 @@
 //! Run a release build on the target AWS host. No network, DB, credentials or
 //! trading API is used. These are observed distributions, never latency bounds.
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+#![cfg_attr(not(test), deny(clippy::expect_used))]
+
 use std::hint::black_box;
 use std::time::Instant;
 

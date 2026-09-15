@@ -474,11 +474,23 @@ fn spawned_literals(body: &str) -> Vec<String> {
     out
 }
 
+/// Absolute paths pin the same already permitted system shells. Do not use
+/// file_name(): an arbitrary /tmp/bash would then acquire system-shell trust.
+/// The single checksum tool below only validates a synthetic deployment
+/// artifact in an integration test; it is not a production spawn permission.
+fn spawn_is_allowed(path: &str, binary: &str) -> bool {
+    let canonical = match binary {
+        "/bin/bash" => "bash",
+        "/bin/sh" => "sh",
+        name => name,
+    };
+    SPAWN_ALLOWLIST.iter().any(|(name, _)| *name == canonical)
+        || (path == "crates/common/tests/deploy_wal_admission_guard.rs" && binary == "sha256sum")
+}
+
 #[test]
 fn every_spawned_binary_is_on_the_allowlist() {
     let root = repo_root();
-    let allowed: Vec<&str> = SPAWN_ALLOWLIST.iter().map(|(bin, _)| *bin).collect();
-
     let mut violations = Vec::new();
     let mut seen_any = false;
 
@@ -489,7 +501,7 @@ fn every_spawned_binary_is_on_the_allowlist() {
         let body = read_scan_text(&root, &path);
         for bin in spawned_literals(&body) {
             seen_any = true;
-            if !allowed.contains(&bin.as_str()) {
+            if !spawn_is_allowed(&path, &bin) {
                 violations.push(format!("  {path}: Command::new(\"{bin}\")"));
             }
         }
@@ -1002,4 +1014,42 @@ fn js_scanners_self_test() {
     assert_eq!(inline_handler_count("let onloaded = 1;"), 0);
     assert_eq!(inline_handler_count("fn on_click_handler() {}"), 0);
     assert_eq!(inline_handler_count("// discusses onclick in prose"), 0);
+}
+
+#[test]
+fn pinned_shell_paths_and_the_checksum_fixture_do_not_widen_spawn_permissions() {
+    for binary in ["/bin/bash", "/bin/sh", "bash", "sh", "git"] {
+        assert!(
+            spawn_is_allowed("crates/common/tests/fixture.rs", binary),
+            "{binary}"
+        );
+    }
+    for binary in [
+        "/tmp/bash",
+        "/usr/local/bin/sh",
+        "/bin/bash-extra",
+        "/bin/../bin/bash",
+        "sha256sum",
+    ] {
+        assert!(
+            !spawn_is_allowed("crates/app/src/runtime.rs", binary),
+            "{binary}"
+        );
+    }
+    let fixture = "crates/common/tests/deploy_wal_admission_guard.rs";
+    assert!(spawn_is_allowed(fixture, "sha256sum"));
+    assert!(!spawn_is_allowed(
+        "crates/common/tests/deploy_wal_admission_guard.rs.extra",
+        "sha256sum"
+    ));
+    assert!(!spawn_is_allowed(fixture, "/tmp/sha256sum"));
+    let body = read_scan_text(&repo_root(), fixture);
+    assert_eq!(
+        spawned_literals(&body)
+            .iter()
+            .filter(|binary| binary.as_str() == "sha256sum")
+            .count(),
+        1,
+        "the documented checksum fixture permission is one real test-only spawn"
+    );
 }

@@ -328,7 +328,7 @@ fn deploy_failure_wiring_preserves_recovery_and_gates_provenance() {
 /// isolated files and a synthetic systemctl. This covers filesystem/lifecycle
 /// rollback, not WAL compatibility, AWS transport, or an actual deployment.
 #[cfg(target_os = "linux")]
-fn coherent_rollback_case(case: &str) {
+fn assert_coherent_rollback_case(case: &str) {
     use std::os::unix::fs::PermissionsExt;
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
@@ -693,7 +693,7 @@ fn coherent_rollback_restores_owned_files_and_prior_lifecycle() {
         "reuse",
         "install_failure",
     ] {
-        coherent_rollback_case(case);
+        assert_coherent_rollback_case(case);
     }
 }
 
@@ -709,7 +709,7 @@ fn coherent_rollback_refuses_stale_missing_or_corrupt_evidence() {
         "probe_unknown",
         "pre_install_failure",
     ] {
-        coherent_rollback_case(case);
+        assert_coherent_rollback_case(case);
     }
 }
 
@@ -717,7 +717,7 @@ fn coherent_rollback_refuses_stale_missing_or_corrupt_evidence() {
 #[cfg(target_os = "linux")]
 fn coherent_rollback_preserves_failure_evidence_without_claiming_success() {
     for case in ["extract", "reload", "stop", "start", "incompatible"] {
-        coherent_rollback_case(case);
+        assert_coherent_rollback_case(case);
     }
 }
 

@@ -60,7 +60,7 @@ But we CAN mechanically guarantee:
 | QuestDB outage drops zero ticks (disconnected writer) | `crates/storage/tests/zero_tick_loss_sla_guard.rs` | `test_zero_tick_loss_spill_survives_crash_and_replay_recovers_all_frames` — **RE-POINTED 2026-08-29.** The cited `chaos_questdb_full_session.rs` was DELETED; this doc kept citing it as live proof. |
 | Disk-full → DLQ NDJSON catches every tick | `crates/storage/tests/chaos_seal_disk_full_dlq_capture.rs` | `test_seal_spill_dead_dlq_captures_every_overflow_zero_drop` — **RE-POINTED 2026-08-29** (was the deleted `chaos_disk_full.rs`). Covers the SEAL tier; an equivalent tick-tier chaos test does NOT exist. |
 | SIGKILL mid-batch → spill replay loses zero ticks | `crates/storage/tests/chaos_seal_sigkill_spill_replay.rs` | `test_seal_spill_survives_sigkill_and_replays_loss_free_and_idempotent` — **RE-POINTED 2026-08-29** (was the deleted `chaos_sigkill_replay.rs`). |
-| Spill ring saturation (50 churn cycles) — no leak, no panic | `crates/storage/tests/chaos_ws_frame_spill_saturation.rs` | `chaos_rapid_spill_churn_50_cycles_no_leak_no_panic` |
+| 50 in-process WAL writer cycles — every cycle checks ten exact replayed payloads, their types and increasing frame sequences; resource leaks are not measured | `crates/storage/tests/chaos_ws_frame_spill_saturation.rs` | `chaos_rapid_spill_churn_50_cycles_preserves_every_payload` |
 | WAL is fail-closed at boot (no silent-loss degraded mode) | `crates/app/src/main.rs` | **UNPROVEN 2026-08-29.** The cited `phase2_7_perf_and_correctness_fixes.rs` does not exist and no replacement test was found. The behaviour may still hold; nothing verifies it. |
 
 ## Tier 3 — O(1) hot-path + zero-allocation

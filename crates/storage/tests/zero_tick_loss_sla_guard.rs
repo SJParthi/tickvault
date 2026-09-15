@@ -31,11 +31,13 @@
 //! pre-spill (TCP-drop) path. Here we focus on the spill→replay contract
 //! with an explicit zero-loss assertion.
 
+#[path = "support/owned_wal_replay.rs"]
+mod owned_wal_replay;
+use owned_wal_replay::{assert_complete_replay, claim_wal};
+
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tickvault_storage::ws_frame_spill::{
-    AppendOutcome, WsFrameSpill, WsType, confirm_replayed, replay_all,
-};
+use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType};
 
 /// Per-test scratch dir — namespaced by test name + wall-clock nanos so
 /// parallel test runs don't stomp each other. Cleans up any stale prior
@@ -90,7 +92,7 @@ fn test_zero_tick_loss_spill_survives_crash_and_replay_recovers_all_frames() {
     let ws_types = [WsType::LiveFeed, WsType::OrderUpdate];
     let expected_total: u64 = u64::from(N_PER_TYPE) * ws_types.len() as u64;
 
-    // Scope spill to drop before replay_all — mimics process crash.
+    // Scope spill to drop before owned replay; this is an in-process clean handoff.
     let mut originals: Vec<(WsType, Vec<u8>)> = Vec::with_capacity(expected_total as usize);
     {
         let spill = WsFrameSpill::new(&wal_dir).expect("spill new");
@@ -131,10 +133,12 @@ fn test_zero_tick_loss_spill_survives_crash_and_replay_recovers_all_frames() {
             expected_total,
             "persisted_count must equal frames written"
         );
-    } // <-- spill dropped here; writer thread joins, files are fsynced closed.
+    } // The public handle drops; the next exclusive claim proves writer ownership ended.
 
     // ---- Phase 2: replay from disk (new process perspective) ------------
-    let recovered = replay_all(&wal_dir).expect("replay_all must succeed");
+    let wal_dir_owner = claim_wal(&wal_dir);
+    let recovered_batch = assert_complete_replay(&wal_dir_owner);
+    let recovered = &recovered_batch.frames;
 
     // SLA assertion 2: every frame recovered, no loss, no extras.
     assert_eq!(
@@ -167,15 +171,28 @@ fn test_zero_tick_loss_spill_survives_crash_and_replay_recovers_all_frames() {
     // second replay re-returns the frames (un-confirmed → re-replayed); ONLY
     // after confirm is the second call empty. This proves both halves of the
     // fix: no silent strand (re-replay), and no whole-archive re-replay.
-    let unconfirmed = replay_all(&wal_dir).expect("un-confirmed re-replay must succeed");
+    let unconfirmed_batch = assert_complete_replay(&wal_dir_owner);
+    let unconfirmed = &unconfirmed_batch.frames;
     assert_eq!(
         unconfirmed.len() as u64,
         expected_total,
         "un-confirmed segments MUST re-replay; got {} expected {expected_total}",
         unconfirmed.len()
     );
-    confirm_replayed(&wal_dir);
-    let second = replay_all(&wal_dir).expect("second replay must succeed");
+    for (first, repeated) in recovered.iter().zip(unconfirmed) {
+        assert_eq!(repeated.frame, first.frame);
+        assert_eq!(repeated.ws_type, first.ws_type);
+        assert_eq!(repeated.frame_seq, first.frame_seq);
+        assert_eq!(repeated.received_at_nanos, first.received_at_nanos);
+        assert_eq!(repeated.endpoint, first.endpoint);
+    }
+    assert!(
+        !wal_dir_owner.confirm_replayed_generation(recovered_batch.confirmation_id),
+        "an older pass cannot ACK the current receipt"
+    );
+    assert!(wal_dir_owner.confirm_replayed_generation(unconfirmed_batch.confirmation_id));
+    let second_batch = assert_complete_replay(&wal_dir_owner);
+    let second = &second_batch.frames;
     assert!(
         second.is_empty(),
         "segments must be archived after confirm; post-confirm replay returned {} frames",
@@ -187,7 +204,9 @@ fn test_zero_tick_loss_spill_survives_crash_and_replay_recovers_all_frames() {
 fn test_zero_tick_loss_empty_wal_is_noop() {
     // Fresh tempdir, no writes, replay should return empty.
     let wal_dir = fresh_wal_dir("empty");
-    let frames = replay_all(&wal_dir).expect("replay on empty dir");
+    let wal_dir_owner = claim_wal(&wal_dir);
+    let frames_batch = assert_complete_replay(&wal_dir_owner);
+    let frames = &frames_batch.frames;
     assert!(frames.is_empty());
 }
 
@@ -209,7 +228,9 @@ fn test_zero_tick_loss_ws_type_tags_preserved_across_crash() {
         assert!(!wait_until_persisted(&spill, 20));
         assert_eq!(spill.drop_critical_count(), 0);
     }
-    let frames = replay_all(&wal_dir).expect("replay");
+    let wal_dir_owner = claim_wal(&wal_dir);
+    let frames_batch = assert_complete_replay(&wal_dir_owner);
+    let frames = &frames_batch.frames;
     assert_eq!(frames.len(), 20);
     // First 2 entries must be 2 distinct ws_types (one per variant).
     let first_two: std::collections::HashSet<u8> =
