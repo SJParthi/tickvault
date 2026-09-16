@@ -165,6 +165,15 @@ skip = [
     # toml_edit 0.22 (direct) + toml_edit 0.23 (via cargo-deny internal) etc.
     # causes winnow 0.6 + 0.7 duplicate through toml_edit's parser stack.
     { crate = "winnow", reason = "toml_edit + figment parser version split" },
+    # 2026-09-16: reqwest 0.13.5 moved to base64 0.23.x. MEASURED against the
+    # lockfile, the 0.22.1 line is still held by eight crates including our
+    # OWN `tickvault-aws-lambdas`, plus axum, hyper-util, lambda_runtime,
+    # metrics-exporter-prometheus, tonic, ureq and ureq-proto. Both versions
+    # therefore compile. Accepted deliberately rather than pinning reqwest
+    # back, which would forfeit the rustls 0.23.44 bump in the same group:
+    # base64 carries no advisory on either line, and nothing in this
+    # workspace passes a base64 type across the boundary.
+    { crate = "base64", reason = "reqwest 0.13.5 uses 0.23.x, axum/lambda/tonic/our own aws-lambdas use 0.22.x" },
     # 2026-06-10: the reqwest duplicate-version skip (opentelemetry-http 0.31
     # pulled reqwest 0.12) was removed — the otel 0.32 quartet bump leaves a
     # single reqwest 0.13.x in the tree.

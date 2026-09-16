@@ -126,6 +126,66 @@ for phantom in 'crates/(trading|websocket|oms)/' 'core/src/(websocket|ticker)/';
 done
 
 # ---------------------------------------------------------------------------
+# 7. BRACE-LESS `#[cfg(test)]` terminator — bite-proof, both directions.
+#
+#    Found 2026-09-16. `extract_prod_code` sets skip=1 on `#[cfg(test)]` and,
+#    for an item carrying no brace (`const X = ...;`, `mod tests;`,
+#    `use foo::bar;`), the catch-all skip arm kept consuming until the NEXT
+#    line containing `{` — the opening brace of the following PRODUCTION item,
+#    which was then swallowed whole and never scanned. Measured on the live
+#    tree: `crates/trading/src/strategy/mod.rs` lost three `pub mod` lines, and
+#    a minimal fixture lost an entire production fn carrying `.unwrap()`.
+#
+#    This pins BOTH halves, because only the second half stops the "fix" from
+#    being a scanner that strips nothing:
+#      (a) production code AFTER a brace-less #[cfg(test)] item must SURVIVE;
+#      (b) a real `mod tests { ... }` body must still be STRIPPED.
+# ---------------------------------------------------------------------------
+SELFTEST_TMP="$(mktemp -d)"
+trap 'rm -rf "$SELFTEST_TMP"' EXIT
+
+sed -n '/^extract_prod_code()/,/^}/p' "$BANNED_SCANNER" > "$SELFTEST_TMP/extract.sh"
+if ! grep -q 'awk' "$SELFTEST_TMP/extract.sh"; then
+  fail "could not lift extract_prod_code out of $BANNED_SCANNER — the self-test would pass vacuously"
+fi
+# shellcheck source=/dev/null
+. "$SELFTEST_TMP/extract.sh"
+
+cat > "$SELFTEST_TMP/braceless.rs" <<'FIXTURE'
+#[cfg(test)]
+const TEST_ONLY_SENTINEL: &str = "x";
+
+fn selftest_production_after(v: Option<u32>) -> u32 {
+    v.unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    fn selftest_inside_test_module() -> u32 {
+        Some(1u32).unwrap()
+    }
+}
+FIXTURE
+
+SELFTEST_EXTRACTED="$(extract_prod_code "$SELFTEST_TMP/braceless.rs")"
+
+# (a) production after a brace-less #[cfg(test)] item must be scanned
+if ! printf '%s' "$SELFTEST_EXTRACTED" | grep -q 'selftest_production_after'; then
+  fail "extract_prod_code swallows production code after a brace-less #[cfg(test)] item — restore the \`skip==1 && depth==0 && /;[[:space:]]*\$/\` terminator arm"
+fi
+if ! printf '%s' "$SELFTEST_EXTRACTED" | grep -q 'v.unwrap()'; then
+  fail "extract_prod_code drops the body of the production fn following a brace-less #[cfg(test)] item"
+fi
+
+# (b) a real test module body must STILL be stripped
+if printf '%s' "$SELFTEST_EXTRACTED" | grep -q 'selftest_inside_test_module'; then
+  fail "extract_prod_code no longer strips \`#[cfg(test)] mod tests { .. }\` — the terminator arm is too greedy"
+fi
+if printf '%s' "$SELFTEST_EXTRACTED" | grep -q 'TEST_ONLY_SENTINEL'; then
+  fail "extract_prod_code no longer strips the brace-less #[cfg(test)] item itself"
+fi
+
+# ---------------------------------------------------------------------------
 # RESULT
 # ---------------------------------------------------------------------------
 if [ "$FAILED" -ne 0 ]; then
@@ -134,5 +194,5 @@ if [ "$FAILED" -ne 0 ]; then
   exit 2
 fi
 
-echo "  hot-path scanner self-test: PASS ($ALT_COUNT alternatives, all match real files)" >&2
+echo "  hot-path scanner self-test: PASS ($ALT_COUNT alternatives, all match real files; brace-less #[cfg(test)] terminator bite-proven both ways)" >&2
 exit 0
