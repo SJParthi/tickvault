@@ -25,24 +25,24 @@ REPORT=""
 extract_prod_code() {
   local file="$1"
   awk '
-    BEGIN { skip=0; depth=0; exempt=0; skip_next=0; buf="" }
+    BEGIN { skip=0; depth=0; exempt=0; skip_next=0; seen_item=0; buf="" }
     # Skip #[cfg(test)] and #[test] blocks (brace-depth tracking)
     # Only trigger when NOT already inside a skip block to prevent
     # nested #[test] attributes from resetting the outer module depth.
-    skip==0 && /^[[:space:]]*#\[cfg\(test\)\]/ { skip=1; depth=0; next }
-    skip==0 && /^[[:space:]]*#\[test\]/ { skip=1; depth=0; next }
+    skip==0 && /^[[:space:]]*#\[cfg\(test\)\]/ { skip=1; depth=0; seen_item=0; next }
+    skip==0 && /^[[:space:]]*#\[test\]/ { skip=1; depth=0; seen_item=0; next }
     # Inside a skip block that has entered braces — track depth
     skip==1 && depth > 0 {
       depth += gsub(/\{/, "{")
       depth -= gsub(/\}/, "}")
-      if (depth <= 0) { skip=0; depth=0 }
+      if (depth <= 0) { skip=0; depth=0; seen_item=0 }
       next
     }
     # Inside a skip block, first line with opening brace — start depth tracking
     skip==1 && /\{/ {
       depth += gsub(/\{/, "{")
       depth -= gsub(/\}/, "}")
-      if (depth <= 0) { skip=0; depth=0 }
+      if (depth <= 0) { skip=0; depth=0; seen_item=0 }
       next
     }
     # A BRACE-LESS `#[cfg(test)]` item ends at its own semicolon.
@@ -61,7 +61,32 @@ extract_prod_code() {
     # carries a brace AND a semicolon, and the brace arm already balances it to
     # depth 0. `depth==0` keeps this out of the way of a real `mod tests {` body,
     # whose inner `let x = 1;` lines must stay skipped.
-    skip==1 && depth==0 && /;[[:space:]]*$/ { skip=0; next }
+    #
+    # ITEM-SCOPED: `seen_item` marks the FIRST code line of the item, and ONLY that
+    # line may end the skip. Three shapes broke the naive "any line ending in
+    # `;`" form (adversarial review of the first patch, 2026-09-16 -- all three
+    # reproduced end-to-end before and after):
+    #   (a) MISSED: `const X: u8 = 1; // note` -- the bare `$` anchor rejected a
+    #       trailing comment, so the headline bug survived a one-comment diff;
+    #   (b) FALSE POSITIVE: a doc comment between the attribute and the item
+    #       (`/// ... let n = parse(s)?;`) ended the skip early, flagging a
+    #       TEST-ONLY body as production;
+    #   (c) FALSE POSITIVE: a raw-string fixture (`r#" SELECT 1; "#;`) ended it
+    #       on the semicolon INSIDE the fixture and scanned the fixture as production.
+    #
+    # A false positive is the worse half -- it blocks a legitimate commit, which
+    # is how a guard gets disabled. Comments, blank lines and stacked attributes
+    # therefore never terminate. HONEST RESIDUAL: a MULTI-LINE brace-less item
+    # (case c) stays over-skipped -- the pre-patch behaviour, a miss rather than
+    # a false alarm. Stated, not hidden.
+    skip==1 && depth==0 && seen_item==0 && /^[[:space:]]*$/ { next }
+    skip==1 && depth==0 && seen_item==0 && /^[[:space:]]*(\/\/|\/\*|\*)/ { next }
+    skip==1 && depth==0 && seen_item==0 && /^[[:space:]]*#\[/ { next }
+    skip==1 && depth==0 && seen_item==0 {
+      seen_item=1
+      if ($0 ~ /;[[:space:]]*(\/\/.*)?$/) { skip=0; depth=0; seen_item=0 }
+      next
+    }
     # Inside a skip block, no braces yet (attribute lines like #[allow()])
     skip==1 { next }
     # Block-level exemptions: O(1) EXEMPT: begin ... O(1) EXEMPT: end
