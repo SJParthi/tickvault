@@ -888,3 +888,185 @@ wrong about its wiring. The rule-file-first law got the ordering right; what it
 cannot do on its own is verify that the names in the rule are the names in the
 running system. Mapping the manifest BEFORE the code is what caught it, and that
 step is now part of the removal, not optional preparation for it.
+
+---
+
+## ⚠ §12.9 — CORRECTED 2026-09-16 (same day, hours later): §12.8 has two FALSE claims and one WRONG decision, and the removal has a CRITICAL blocker §12 never named
+
+**No new authorization is claimed.** §12.0 is the operator's directive and its
+disposition stands. What follows corrects §12.8 — which was itself written to
+correct §12 — and records the one finding that changes the removal from a
+deletion into a redesign. Every item below is verified in source at the cited
+symbol. §12.8 is left standing per house convention; where it and §12.9
+conflict, §12.9 wins.
+
+### (a) ⚠ §12.8(a) states the reader-discovery hazard BACKWARDS
+
+§12.8(a) says a removal PR that greps the **legacy** table names *"finds zero
+readers, passes its own review against this file, and leaves every reader in
+place."*
+
+**That is the inverse of the truth, and following it would do the damage it
+warns about.** The MODULE name and the CONSTANT name both carry the legacy
+string, so every live reader's import line contains it:
+
+```
+crates/app/src/rest_candle_fold.rs       use ...::spot_1m_rest_persistence::SPOT_1M_REST_TABLE;
+crates/app/src/tf_consistency_boot.rs    use ...::spot_1m_rest_persistence::SPOT_1M_REST_TABLE;
+crates/app/src/feed_scoreboard_boot.rs   use ...::spot_1m_rest_persistence::SPOT_1M_REST_TABLE;
+crates/app/src/market_ram_store_boot.rs  use ...::option_chain_1m_persistence::OPTION_CHAIN_1M_TABLE;
+crates/app/src/dhan_depth_universe.rs    use ...::option_chain_1m_persistence::OPTION_CHAIN_1M_TABLE;
+crates/storage/src/partition_archive.rs      crate::option_chain_1m_persistence::OPTION_CHAIN_1M_TABLE,
+```
+
+MEASURED: **29 files** outside the three persistence modules carry the legacy
+string. Readers build their SQL through the CONSTANT
+(`FROM {SPOT_1M_REST_TABLE}`), never through the wire literal — so grepping the
+**NEW** names (`rest_spot_1m`, `rest_option_chain_1m`) is what returns almost
+nothing but test assertions and one operator-console string.
+
+**So the dangerous grep is the NEW wire name, and §12.8(a) told the next
+session to trust exactly that one.** The REJECT row it added is still right in
+substance (do not leave a reader pointed at a frozen table); its stated method
+was wrong and is replaced: **find readers by the MODULE/CONSTANT path, never by
+the table literal.**
+
+### (b) ⚠ §12.8(c) cited a COMMENT; the conclusion was right for a weaker reason
+
+§12.8(c) keeps `SPOT_1M_REST_INDICES` on the grounds that
+`dhan_live_universe.rs:212` is the live-universe fallback. **Line 212 is a
+comment.** That file never imports the constant.
+
+The real mechanism is two files away and is stronger than the one cited:
+`dhan_feed_stack.rs::hardcoded_index_universe()` maps the constant into
+`Vec<SubscribeInstrument>`, `main.rs` passes it as `index_universe`, and
+`dhan_live_universe::select_live_universe` returns it when the master artifact
+is `None`.
+
+**And the constant cannot be deleted at all without failing the build**, which
+is the decisive reason §12.8(c) missed: `crates/common/src/constants.rs` carries
+two `const _: () = assert!(...)` pins on it —
+`SPOT_1M_REST_LADDER_JITTER_SLOTS == SPOT_1M_REST_INDICES.len()`, and
+`CHAIN_1M_UNDERLYINGS` as its SID prefix. **KEEP stands; the evidence is
+replaced.**
+
+### (c) ⚠ DECISION CHANGED — RE-POINT the liveness alarm, do NOT retire it
+
+§12.8(b) offers "retire or re-point". A session note then chose RETIRE on the
+grounds that `dhan-no-ticks-flowing` already covers it and nothing is lost.
+**Measured, that is false — retiring doubles the detection latency on the one
+failure class it exists for:**
+
+| alarm | metric | eval x period | time to page |
+|---|---|---|---|
+| `market-hours-liveness-missing` | `tv_rest_1m_fire_heartbeat` | 5 x **60 s** | **~5 min** |
+| `dhan-no-ticks-flowing` | `tv_dhan_feed_last_tick_age_secs` | 2 x 300 s | ~10 min |
+| `dhan-live-lane-down` | `tv_dhan_feed_stack_up` | 2 x 300 s | ~10 min |
+| `app-log-ingestion-silent` | `IncomingLogEvents` | 3 x 300 s | ~15 min |
+
+The liveness alarm is **the only 60-second-period alarm in the entire gated
+set**. Both are `treat_missing_data = "breaching"` and both sit in the same
+`ALARM_NAMES` gate, so coverage is equivalent and only latency differs.
+
+**The re-point costs nothing and keeps the 5 minutes.**
+`tv_dhan_feed_last_tick_age_secs` is published on the 30-second silence timer
+(`SILENCE_SCAN_INTERVAL_SECS = 30`), unconditionally and before the
+market-hours gate, and it is already EMF-selected. So the change is a
+`metric_name` swap with `period = 60` and `evaluation_periods = 5` UNCHANGED —
+the same shape this alarm's own header records performing twice before
+(2026-07-13 SLO score, 2026-07-15 Groww bridge).
+
+The two alarms then become complementary rather than duplicative: the
+re-pointed one is a 5-minute **missing-data** detector (the exporter or the
+process stopped publishing at all), and `dhan-no-ticks-flowing` stays the
+10-minute **stale-data** detector (the gauge is climbing).
+
+### (d) 🆘 THE BLOCKER §12 NEVER NAMED: the 15:41 cross-verification is a BLOCKING BOOT FLOOR for all sixteen sockets
+
+This is the finding that changes the shape of the work, and it is verified in
+source at `dhan_feed_stack.rs`, in the block whose own comment reads
+*"the verification floor"*:
+
+```rust
+let Some(crossverify) = spawn_daily_crossverify(&params.main_feed_instruments) else {
+    error!( ... "REFUSING to open any socket ..." );
+    report_unfolded_wal_frames(&params.wal_replay_live_feed, "crossverify_deps_missing");
+    return;
+};
+```
+
+`spawn_daily_crossverify` returns `None` unless `install_crossverify_deps` ran
+at boot, and that call site constructs `DhanLiveCrossverifyConfig` — a type in
+the module the removal deletes. **So the implementer is forced to touch it, and
+the obvious edit makes `run_dhan_feed_stack` return before any dial.**
+
+Both gates are OPEN in production today (`dhan_enabled = true` in base and
+production config, `TICKVAULT_DHAN_LIVE_FEED=1` in the systemd unit), so this
+is a live path. The consequence of getting it wrong is **zero ticks, zero
+depth, all sixteen sockets dark for the session** — the precise opposite of the
+standing no-tick-loss mandate.
+
+The code comment records WHY the refusal is real: until 2026-08-11 this block
+called the comparator and discarded the result one line below a comment
+asserting the check was blocking. Both halves were false, and the lane opened
+all sixteen sockets while capturing data it had no way to verify.
+
+**Therefore removing the cross-verifier is a REDESIGN of the live lane's boot
+contract, not a deletion, and the first question is what replaces the
+verification floor — not which files to delete.** §12.8(e) already records that
+after this removal **nothing anywhere compares captured data against any
+external record**; this section adds that the lane is currently built to refuse
+to run in that state.
+
+### (e) ⚠ The paper order book loses its only mark producer, silently
+
+`mark_forward(` has exactly **two** production call sites, both in
+`dhan_cadence_executor.rs` (the spot close and the chain leg price). Everything
+else is `benches/` or `tests/`.
+
+The silent half is the sharp part. `order_runtime.rs` has three arms for a
+closed mark channel, including a producer-less-boot `warn!` — **all three
+require the channel to CLOSE.** The sender is *moved* out of `main`'s frame
+into `spawn_cadence_scheduler`; delete that call and the binding stays alive in
+`main` for the process lifetime, so the channel never closes, the receiver
+blocks forever, and there is **no log line, no counter and no page**. Setting
+the forwarder to `None` reaches the same place by a different route (the REST
+stack leaks a dummy sender on purpose so the arm idles).
+
+With `[order_runtime] enabled = true` and `paper_fill = true`, the paper book
+and the daily-loss halt run permanently unmarked and report healthy. That is
+the false-OK class rule 11 forbids, and no existing gate catches it.
+
+### What §12.9 does NOT change
+
+The operator's directive; the KEEP classes (auth REST, instrument identity
+REST); the REMOVE classes; the order-side carve-out; the SEBI never-delete
+rule; and §12.4's honest loss, which is confirmed and widened rather than
+softened.
+
+### The reusable half
+
+§12.8's own closing paragraph says three of its seven findings *"share one
+shape: a name that describes what something was called, not what it does now"*
+— and then two of its own items repeated that shape one level up. §12.8(a)
+reasoned about grep behaviour from the table names without running the grep,
+and §12.8(c) cited a line number without checking whether the line was code.
+**Mapping the manifest before the code was the right instinct; the step it was
+missing is that a claim about what a COMMAND returns has to be made by running
+the command, and a claim about a LINE has to be made by reading the line.**
+
+## What a PR that violates §12.9 looks like (REJECT)
+
+- Finds readers by grepping the wire table names (`rest_spot_1m`,
+  `rest_option_chain_1m`, `rest_option_contract_1m`) — that grep is near-empty
+  by construction and will miss every live query builder.
+- Deletes `SPOT_1M_REST_INDICES` (two `const` asserts and ~14 non-REST
+  consumers; the build fails).
+- RETIRES `market-hours-liveness-missing` instead of re-pointing it, or
+  re-points it while changing `period` or `evaluation_periods` (that is the
+  5-minute detection this section exists to keep).
+- Removes the cross-verifier without deciding what replaces the verification
+  floor — a naive deletion makes the live lane refuse to open any socket.
+- Deletes the cadence scheduler without giving `mark_forward` a home, or
+  relies on the producer-less `warn!` to report it (that arm cannot fire on
+  this path).
