@@ -126,6 +126,140 @@ for phantom in 'crates/(trading|websocket|oms)/' 'core/src/(websocket|ticker)/';
 done
 
 # ---------------------------------------------------------------------------
+# 7. BRACE-LESS `#[cfg(test)]` terminator — bite-proof, BOTH scanners, BOTH
+#    directions.
+#
+#    Found 2026-09-16. `extract_prod_code` sets skip=1 on `#[cfg(test)]` and,
+#    for an item carrying no brace (`const X = ...;`, `mod tests;`,
+#    `use foo::bar;`), the catch-all skip arm kept consuming until the NEXT
+#    line containing `{` — the opening brace of the following PRODUCTION item,
+#    which was then swallowed whole and never scanned. Measured on the live
+#    tree: `crates/trading/src/strategy/mod.rs` lost three `pub mod` lines.
+#
+#    An adversarial review of the FIRST patch then found the naive
+#    "any line ending in `;`" terminator was wrong three more ways, and two of
+#    them were FALSE POSITIVES — a guard that blocks a legitimate commit is a
+#    guard that gets disabled. All five shapes are pinned below.
+#
+#    Scoped to BOTH scanners deliberately: the arm is duplicated in
+#    banned-pattern-scanner.sh and data-integrity-guard.sh, and until now only
+#    the first copy was covered — the one-file-guarded-two-copies shape this
+#    repo records repeatedly. Deleting the arm from EITHER file now fails here.
+# ---------------------------------------------------------------------------
+SELFTEST_TMP="$(mktemp -d)"
+trap 'rm -rf "$SELFTEST_TMP"' EXIT
+
+cat > "$SELFTEST_TMP/c1_trailing_comment.rs" <<'FIXTURE'
+#[cfg(test)]
+const PLANT_FIXTURE: u8 = 1; // fixture, tests only
+
+pub fn selftest_production_after_comment(x: u8) -> u8 {
+    Some(x).unwrap()
+}
+FIXTURE
+
+cat > "$SELFTEST_TMP/c2_doc_comment.rs" <<'FIXTURE'
+#[cfg(test)]
+/// Asserts the production shape: let n = parse(s)?;
+fn selftest_only_a_test_helper() -> u32 {
+    Some(1u32).unwrap()
+}
+FIXTURE
+
+cat > "$SELFTEST_TMP/c3_raw_string.rs" <<'FIXTURE'
+#[cfg(test)]
+const SELFTEST_FIXTURE_SQL: &str = r#"
+SELECT 1;
+"127.0.0.1"
+"#;
+pub fn selftest_after_raw_string() -> u8 { 1 }
+FIXTURE
+
+cat > "$SELFTEST_TMP/c4_braceless_const.rs" <<'FIXTURE'
+#[cfg(test)]
+const TEST_ONLY_SENTINEL: &str = "x";
+
+fn selftest_production_after(v: Option<u32>) -> u32 {
+    v.unwrap()
+}
+FIXTURE
+
+cat > "$SELFTEST_TMP/c5_test_module.rs" <<'FIXTURE'
+#[cfg(test)]
+mod tests {
+    fn selftest_inside_test_module() -> u32 {
+        Some(1u32).unwrap()
+    }
+}
+FIXTURE
+
+
+for scanner in "$BANNED_SCANNER" ".claude/hooks/data-integrity-guard.sh"; do
+  scanner_name="$(basename "$scanner")"
+  if [ ! -f "$scanner" ]; then
+    fail "$scanner not found — cannot bite-proof its extract_prod_code copy"
+    continue
+  fi
+
+  sed -n '/^extract_prod_code()/,/^}/p' "$scanner" > "$SELFTEST_TMP/extract.sh"
+  # Guard against a vacuous lift: an empty or truncated extraction would make
+  # every assertion below pass for the wrong reason.
+  if ! grep -q 'awk' "$SELFTEST_TMP/extract.sh"; then
+    fail "could not lift extract_prod_code out of $scanner_name — the self-test would pass vacuously"
+    continue
+  fi
+  if ! grep -q 'seen_item' "$SELFTEST_TMP/extract.sh"; then
+    fail "$scanner_name: extract_prod_code has no \`seen_item\` state — the brace-less terminator arm is missing or was reverted"
+    continue
+  fi
+  # shellcheck source=/dev/null
+  . "$SELFTEST_TMP/extract.sh"
+
+  # (1) production AFTER a brace-less item whose `;` carries a trailing comment
+  #     must be scanned. The first patch anchored on `;$` and missed this, so a
+  #     real banned pattern went unreported on a one-comment difference.
+  out="$(extract_prod_code "$SELFTEST_TMP/c1_trailing_comment.rs")"
+  if ! printf '%s' "$out" | grep -q 'selftest_production_after_comment'; then
+    fail "$scanner_name: production after \`const X = 1; // comment\` is swallowed — the terminator regex must tolerate a trailing //-comment"
+  fi
+
+  # (2) FALSE-POSITIVE guard: a comment BETWEEN the attribute and the item must
+  #     not end the skip, however it happens to end.
+  out="$(extract_prod_code "$SELFTEST_TMP/c2_doc_comment.rs")"
+  if printf '%s' "$out" | grep -q 'selftest_only_a_test_helper'; then
+    fail "$scanner_name: a doc comment ending in \`;\` between #[cfg(test)] and its item ends the skip early — TEST-ONLY code is being scanned as production"
+  fi
+
+  # (3) FALSE-POSITIVE guard: a raw-string fixture must not be scanned because a
+  #     line INSIDE it happens to end in \`;\`.
+  out="$(extract_prod_code "$SELFTEST_TMP/c3_raw_string.rs")"
+  if printf '%s' "$out" | grep -q '127\.0\.0\.1'; then
+    fail "$scanner_name: a raw-string test fixture leaks into the production scan — only the FIRST code line of a brace-less item may terminate the skip"
+  fi
+
+  # (4) the original defect: production after a plain brace-less item survives,
+  #     and the item itself is still stripped.
+  out="$(extract_prod_code "$SELFTEST_TMP/c4_braceless_const.rs")"
+  if ! printf '%s' "$out" | grep -q 'selftest_production_after'; then
+    fail "$scanner_name: extract_prod_code swallows production code after a brace-less #[cfg(test)] item"
+  fi
+  if ! printf '%s' "$out" | grep -q 'v.unwrap()'; then
+    fail "$scanner_name: extract_prod_code drops the body of the production fn following a brace-less #[cfg(test)] item"
+  fi
+  if printf '%s' "$out" | grep -q 'TEST_ONLY_SENTINEL'; then
+    fail "$scanner_name: extract_prod_code no longer strips the brace-less #[cfg(test)] item itself"
+  fi
+
+  # (5) the half that stops the "fix" from being a scanner that strips nothing.
+  out="$(extract_prod_code "$SELFTEST_TMP/c5_test_module.rs")"
+  if printf '%s' "$out" | grep -q 'selftest_inside_test_module'; then
+    fail "$scanner_name: extract_prod_code no longer strips \`#[cfg(test)] mod tests { .. }\` — the terminator arm is too greedy"
+  fi
+
+  echo "  ok: $scanner_name extract_prod_code — 5 brace-less shapes pinned" >&2
+done
+
+# ---------------------------------------------------------------------------
 # RESULT
 # ---------------------------------------------------------------------------
 if [ "$FAILED" -ne 0 ]; then
@@ -134,5 +268,5 @@ if [ "$FAILED" -ne 0 ]; then
   exit 2
 fi
 
-echo "  hot-path scanner self-test: PASS ($ALT_COUNT alternatives, all match real files)" >&2
+echo "  hot-path scanner self-test: PASS ($ALT_COUNT alternatives, all match real files; brace-less #[cfg(test)] terminator bite-proven in BOTH scanners across 5 shapes)" >&2
 exit 0

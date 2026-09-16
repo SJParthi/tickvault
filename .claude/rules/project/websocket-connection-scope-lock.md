@@ -622,6 +622,26 @@ it outright: *"gives you the SecurityId of each option contract directly, no
 instrument master lookup needed for subscriptions"*
 (`docs/dhan-ref/06-option-chain.md:195`).
 
+> **⚠ CORRECTED 2026-09-16 — this sentence was true for ~50 lines and the code
+> stopped depending on it the SAME DAY.** The THIRD quote of 2026-08-11, below
+> in this file, REVERSED the instrument-master ban that forced the chain to be
+> the source (*"Q3 IS REVERSED: the daily Dhan master CSV … is ORDERED BACK"*).
+> The code followed; this prose did not. **Verified in source 2026-09-16:**
+> `dhan_depth_universe.rs:1097` (`load_depth_candidates`, the per-minute
+> steering path) opens with `read_contract_artifact(date_ist)` and returns
+> `Vec::new()` on failure — it does NOT query the chain; `dhan_feed_stack.rs:10151`
+> calls `load_depth_universe_from_master` FIRST with the `option_chain_1m` SQL
+> only as the `None` fallback at `:10161`; and `depth_seed.rs:28` validates every
+> seeded id against TODAY's contract artifact. The master is strictly richer —
+> 121,674 contracts with lot size, strike, expiry and leg, against the chain's
+> ~1,250 INDEX-option legs, which cannot represent a stock option at all
+> (`contract_underlying_map.rs:20`, measured). Left standing per house
+> convention because the sentence records a real 2026-08-11 decision; annotated
+> because a session trusting it would conclude that removing the option-chain
+> REST pull kills depth, which is the false-finding class the `day_ohlc_tracker`
+> row records. Removal authorization: `no-rest-except-live-feed-2026-06-27.md`
+> §12 (2026-09-16).
+
 **This is the sanctioned depth instrument source.** It costs no new fetch class,
 adds no REST call, breaks no rule, and self-rolls: when the expiry changes the
 chain returns the new contracts and the depth set follows automatically — the
@@ -5319,3 +5339,34 @@ that is the support ticket, not this cap.
 - Adopts socket-affine packing for depth-20 (condition 3, unchanged).
 - Changes the socket or instrument budgets, the name band, or the ATM windows.
 - Reports the 48 s worst case as a measured figure.
+
+### 2026-09-16 — SOCKETS ONLY: the per-minute REST KEEP is REVERSED
+
+**The verbatim operator demand (2026-09-16, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "Dude except sockets remove all the entire remaining rest api call related implementations ddue okay?"
+
+This REVERSES one REJECT row of the 2026-08-11 SECOND quote above, verbatim:
+*"Stands down, disables, or starves ANY per-minute REST leg for Dhan or Groww in
+the name of the live lane."* That row was written on a day when the Dhan live
+WebSocket had been retired for a month and REST was the only market data the
+system had. Sixteen sockets have carried the same instruments live since the
+2026-08-11 flip, so the row now protects a duplicate rather than a source.
+
+**The full disposition, the depth analysis, and the honest loss list live in
+`no-rest-except-live-feed-2026-06-27.md` §12** (recorded the same day, before
+any code). Summary of what it settles, all Verified in source:
+
+| | |
+|---|---|
+| **AUTH REST stays** | `connection.rs:1326` embeds the JWT in the socket URL; `current_feed_token`'s own docblock says *"there is no second credential path."* Removing it dials nothing. |
+| **Instrument-master REST stays** | `ParsedTick` carries id + segment + prices and **no symbol, strike, expiry, leg or lot size** — a socket can only echo ids you already subscribed. Identity must come from outside the socket. |
+| **Market-data REST goes** | spot-1m, option-chain, expirylist. |
+| **Depth survives it** | the live steering path reads the master contract artifact, not `option_chain_1m` — see the 2026-09-16 correction annotated at the "sanctioned depth instrument source" line above. |
+| **The cross-verification goes, and that is a real loss** | it is the ONLY ground truth this feed has. §12.4. |
+| **The legs were never actually off** | `[spot_1m_rest]`/`[option_chain_1m]` read `enabled = false` in base.toml while the cadence executor re-fires the same HTTP. §12.5. |
+
+**What this section does NOT authorize:** any change to the socket budget (16),
+the endpoint types (4), the order-side REST surface, `dry_run`, the §28 frozen
+indicator/strategy area, or any deletion of a SEBI/audit table row.

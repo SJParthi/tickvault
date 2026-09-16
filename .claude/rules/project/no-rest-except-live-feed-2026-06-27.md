@@ -590,3 +590,301 @@ lock is untouched (SSM read-only, never minted). Order MUTATIONS stay hard-locke
 (Gates 1–4; `GROWW_ORDER_LIVE_FIRE` false); the read-only GET areas stay OFF — this PR
 flips nothing else. The operator's go for the merge lands here verbatim:
 <OPERATOR-GO-HERE>
+
+---
+
+# §12 — SOCKETS-ONLY: every remaining market-data REST pull is REMOVED (operator directive 2026-09-16)
+
+> **Authority:** this section SUPERSEDES §8 (the Dhan per-minute spot-1m +
+> option-chain scheduled-pull KEEP class), §11 (the 2026-07-14 re-assertion that
+> those two legs are ENABLED classes), and the market-data half of §3's KEEP
+> rows. It also reverses the `websocket-connection-scope-lock.md` 2026-08-11
+> SECOND-quote REJECT row *"Stands down, disables, or starves ANY per-minute
+> REST leg for Dhan or Groww in the name of the live lane"* — that row was
+> written when the Dhan live WebSocket had been retired and REST was the only
+> market data there was. It is not that any more.
+>
+> **Recorded BEFORE any code change, per the rule-file-first law.**
+
+## §12.0 The verbatim operator demand (preserve EXACTLY, typos included)
+
+> "Dude except sockets remove all the entire remaining rest api call related implementations ddue okay?"
+
+## §12.1 What "except sockets" means, decided against this file's OWN §2
+
+§2 of this file already answers the boundary question, and it was written for
+exactly this trap. It records that a LITERAL "kill ALL REST" is
+**self-contradictory**, in its own words: it *"would also kill the live-feed
+AUTH and the static instrument-master CSVs — and **without those the live feed
+cannot connect or map a single tick**, so the literal lock destroys the very
+feed it wants to keep."*
+
+That is not an interpretation invented to soften the directive. It is the
+standing definition in the file the directive edits, and it is **VERIFIED in
+source today, twice**:
+
+| Verified | Evidence |
+|---|---|
+| A socket CANNOT dial without AUTH REST | `websocket/connection.rs:1326` calls `build_feed_url(endpoint, base_url, &token, &client_id)`; the URL is `wss://api-feed.dhan.co/?version=2&token=<JWT>&clientId=<ID>&authType=2`. `dhan_feed_stack.rs::current_feed_token` reads the `TokenManager` handle, whose only two writers are `POST auth.dhan.co/app/generateAccessToken` and `GET /v2/RenewToken`. Its own docblock: *"there is no second credential path."* |
+| A socket CANNOT name a contract | `ParsedTick` (`tick_types.rs:15-29`) carries `security_id` + `exchange_segment_code` + prices. **No symbol, strike, expiry, leg or lot size.** A socket can only echo ids you already subscribed. Contract identity must come from outside the socket. |
+
+So the sockets keep exactly the two classes §2 already names as their structural
+prerequisites, and **everything else that fetches market data over HTTP is
+removed.**
+
+## §12.2 The disposition table (every row Verified in source 2026-09-16)
+
+| Class | Endpoints | Verdict | Why |
+|---|---|---|---|
+| **AUTH** | `POST auth.dhan.co/app/generateAccessToken`, `GET /v2/RenewToken`, the `dhan-token-minter` Lambda | **KEEP** | produces the JWT the socket URL embeds — §2 class 1; removing it dials nothing |
+| **INSTRUMENT IDENTITY** | `GET images.dhan.co/api-data/api-scrip-master-detailed.csv`, `GET niftyindices.com/IndexConstituent/<slug>.csv` | **KEEP** | produces the `security_id` map the sockets subscribe with — §2 class 2; static daily reference files, not prices. §1 of this file bans *"REST prices, OHLCV, quotes, option-chain"* and these are none of those |
+| **MARKET DATA** | `POST /v2/charts/intraday` (spot-1m), `POST /v2/optionchain`, `POST /v2/optionchain/expirylist` | **REMOVE** | this is the class the directive names. The 16 sockets carry the same instruments live |
+| **VERIFICATION** | `POST /v2/charts/intraday` in `dhan_live_crossverify.rs` (15:41 compare) | **REMOVE — see §12.4, this is the one that costs something** | |
+| **DEAD** | `ip_verifier.rs` (5 fns), `ip_monitor.rs` (2 fns), `DHAN_CHARTS_HISTORICAL_PATH`, `DHAN_NSE_HOLIDAY_CROSS_CHECK_URL` | **REMOVE** | **zero production call sites**, Verified by workspace scan. Free |
+| **NOT broker REST** | QuestDB `/exec` + ILP (our own database over HTTP), Telegram `sendMessage`, AWS SDK (SSM/S3/SNS/CloudWatch/EC2) | **KEEP** | none of these is a market-data REST call to a broker |
+| **ORDER SIDE** | 51 `api.dhan.co/v2/*` URLs in `oms/api_client.rs`, `/v2/positions`, margin gate | **UNTOUCHED by this directive** | the directive says *market-data*-adjacent "rest api call related implementations"; the order surface is separately locked (`dry_run: true` hardcoded, §39 four-gate lattice) and removing it needs its own dated quote |
+
+## §12.3 The depth question, and the stale prose that would have answered it wrongly
+
+The obvious objection is that `websocket-connection-scope-lock.md:625` (the
+2026-08-11 SECOND quote) calls the option-chain REST pull *"the sanctioned depth
+instrument source"*, so deleting it should blind the 10 depth sockets.
+
+**That prose is STALE, and the code has not depended on it since the same day.**
+The THIRD quote of 2026-08-11, 50 lines below in the same file, REVERSED the
+instrument-master ban that forced the chain to be the source (*"Q3 IS REVERSED:
+the daily Dhan master CSV … is ORDERED BACK"*). The code followed the reversal;
+the prose at `:625` was never annotated.
+
+Verified in source 2026-09-16:
+
+- `dhan_depth_universe.rs:1097` — `load_depth_candidates`, the per-minute
+  steering path, opens with `read_contract_artifact(date_ist)`. On failure it
+  returns `Vec::new()` — **it does not query the chain.**
+- `dhan_feed_stack.rs:10151` — boot attach calls `load_depth_universe_from_master`
+  FIRST; the `option_chain_1m` SQL is only the `None` fallback at `:10161`.
+- `depth_seed.rs:28` validates every seeded id against **today's contract
+  artifact**, never the chain.
+- The master is strictly RICHER: `ContractRow` carries security_id, segment,
+  class, expiry, strike (paise), CE/PE, underlying and **lot_size** for
+  **121,674** contracts, against the chain's ~1,250 INDEX-option legs
+  (`contract_underlying_map.rs:20`, measured) — which cannot represent a stock
+  option at all.
+
+So depth loses its boot FALLBACK, not its source. **A doc line at `:625` is
+being annotated in lockstep with this section**, because a future session
+trusting it would conclude that deleting the chain kills depth — the
+false-finding class this repository records for `day_ohlc_tracker` (2026-08-12).
+
+## §12.4 What is LOST — stated plainly, not buried (Rule 11)
+
+1. **The 15:41 cross-verification dies, and it is the ONLY ground truth the
+   revived Dhan feed has.** It compares our captured candles against Dhan's own
+   official minute tape. Every other signal in the lane reports whether the
+   machinery RAN; this is the only one that reports whether the numbers are
+   RIGHT. After this, "the feed works" rests on internal consistency alone.
+   Removing it also retires the two alarms
+   `errcode-ws-gap-03-xverify-{vacuous,failed}` (§2.3f of the noise lock) and
+   the `-diverged` alarm (§2.3k), since a filter whose emit site is gone is a
+   permanently-green dead monitor.
+2. **`spot_1m_rest` and `option_chain_1m` stop receiving rows.** The TABLES are
+   retained (data already captured stays; they are not SEBI tables but deleting
+   history buys nothing). Any consumer reading them for a *current* value gets
+   the last row before this change — so every read site must be removed with the
+   writer, not left pointing at a frozen table.
+3. **The spot-price QuestDB backstop keeps working and is NOT this class.**
+   `dhan_contract_universe.rs:1531` queries `FROM ticks` — our own database,
+   our own socket-captured rows. It is not a broker REST pull.
+
+## §12.5 ⚠ A FALSE-OK this directive exposes, and it is worth more than the removal
+
+`config/base.toml` reads `[spot_1m_rest] enabled = false` (:697) and
+`[option_chain_1m] enabled = false` (:750). **Both legs fire anyway.**
+`[cadence] enabled = true` (:1029), and `dhan_cadence_executor.rs:341-343`
+builds `intraday_url` / `chain_url` / `expirylist_url` and calls the same
+`*_fetch_once_unpaced` functions. The legacy legs were stood down 2026-07-17
+under RS3 mutual exclusion and **the HTTP moved, it did not stop.**
+
+So anyone reading base.toml today concludes these two REST pulls are off. They
+are not. That is the false-OK class rule 11 forbids, and it means the removal
+must land in the **cadence executor**, not in a config flag — flipping
+`[cadence] enabled` would stand down every other cadence lane with it.
+
+## §12.6 What a PR that violates §12 looks like (REJECT)
+
+- Removes the AUTH REST calls or the token minter — every socket goes dark
+  (Verified at `connection.rs:1326`).
+- Removes the daily master CSV or the niftyindices constituent fetch — the live
+  universe collapses to the 4 hardcoded `SPOT_1M_REST_INDICES` and BOTH depth
+  pools open zero sockets. That is the 99.98% collapse
+  `tv-<env>-errcode-ws-gap-03-universe-collapse` exists to page on.
+- Removes a leg's HTTP while leaving its ALARM, its EMF metric name, or its
+  metric filter in place — a filter whose emit site is gone reads permanently
+  green (the `ws-reinject-01` / `tick-conserve-01` precedent, retired twice).
+- Removes a WRITER and leaves a READER pointed at the now-frozen table.
+- Stands the legs down by flipping `[cadence] enabled = false` — that kills
+  every other cadence lane as collateral (§12.5).
+- Deletes `spot_1m_rest` / `option_chain_1m` / `rest_fetch_audit` TABLE ROWS —
+  the writer is authorized for removal, the history is not.
+- Touches the order-side REST surface, `dry_run`, or the §28 frozen
+  indicator/strategy area under cover of this directive.
+- Claims the feed is verified after the cross-verification is gone.
+
+## §12.7 Trigger
+
+Covered by the §6 trigger list. Reinforced on any session editing
+`dhan_cadence_executor.rs`, `spot_1m_rest_boot.rs`, `option_chain_1m_boot.rs`,
+`dhan_live_crossverify.rs`, `ip_verifier.rs`, `ip_monitor.rs`, or any file
+containing `charts/intraday`, `optionchain`, `expirylist`, or `SOCKETS_ONLY`.
+
+---
+
+## ⚠ §12.8 — CORRECTED 2026-09-16 (same day, hours later): §12 names FOUR things wrongly, and two of them would break production
+
+**No new authorization is claimed.** §12 above is the operator's directive and
+its disposition stands unchanged. What follows are FACTUAL corrections to the
+manifest §12 gives, found by three parallel mapping agents commissioned to
+produce the deletion manifest BEFORE any code moved. Each is verified in source
+at the cited file:line. §12 is left standing per house convention; where it and
+§12.8 conflict, §12.8 wins.
+
+### (a) The table names in §12 are the LEGACY names. The wire names are different.
+
+| §12 / module name | REAL QuestDB table | Constant |
+|---|---|---|
+| `spot_1m_rest` | **`rest_spot_1m`** | `spot_1m_rest_persistence.rs:40` |
+| `option_chain_1m` | **`rest_option_chain_1m`** | `option_chain_1m_persistence.rs:61` |
+| `option_contract_1m_rest` | **`rest_option_contract_1m`** | `option_contract_1m_rest_persistence.rs:60` |
+| `rest_fetch_audit` | `rest_fetch_audit` (unchanged) | `rest_fetch_audit_persistence.rs:51` |
+
+Both persistence modules carry BOTH constants — e.g.
+`LEGACY_SPOT_1M_REST_TABLE = "spot_1m_rest"` at `:44` — so the names §12 uses
+exist in source and grep cleanly. **That is exactly what makes this dangerous.**
+
+§12.6's REJECT row reads *"Removes a WRITER and leaves a READER pointed at the
+now-frozen table."* A removal PR that greps the §12 names finds **zero readers**,
+passes its own review against this file, and leaves every reader in place. The
+checkable rule was written against names the readers do not use.
+
+**This is the same class as the 2026-09-12 `top_volume` rename** recorded in
+`CLAUDE.md`'s storage map: a stale name inside a *runnable* check costs more than
+a stale name in prose, because the check reports success. Here the check is a
+REJECT row rather than a SQL statement, and it fails the same way.
+
+### (b) ⚠ THE TRAP §12 DOES NOT NAME — a permanently-RED alarm
+
+`tv_rest_1m_fire_heartbeat` has exactly three producers, and **all three are
+inside the removal set**: `dhan_cadence_executor.rs:605`,
+`spot_1m_rest_boot.rs:2370`, `spot_1m_rest_boot.rs:3146`.
+
+It is the SOLE metric behind `tv-<env>-market-hours-liveness-missing`
+(`market-hours-liveness-alarm.tf:186`), and that alarm is
+**`treat_missing_data = "breaching"`** (`:193`) — the file's own header at `:75`
+states it verbatim: *"MISSING data PAGES during the gated window."*
+
+**Deleting the producers without retiring or re-pointing that alarm pages the
+operator every gated market window, every trading day, forever.** That is worse
+than the dead-monitor class this file records repeatedly: a permanently-GREEN
+monitor is ignored, but a permanently-RED one gets MUTED — and muting it
+silently disables the app-liveness signal, which is a real one.
+
+The alarm's own header already records one `metric_name` swap performed for this
+reason (`:170-171`). The socket-era candidate is `tv_dhan_feed_last_tick_age_secs`,
+already EMF-selected. **Re-pointing it is a DECISION, not a deletion**, and it is
+NOT authorized by §12 — it needs its own dated line here.
+
+**BINDING, added to the §12.6 REJECT list:** a PR that deletes any producer of
+`tv_rest_1m_fire_heartbeat` without retiring or re-pointing that alarm — and
+removing its gate membership from the `ALARM_NAMES` join in `market-hours-liveness-alarm.tf`
+— in the SAME change is a REJECT.
+
+### (c) `SPOT_1M_REST_INDICES` is NOT a REST constant. It is the live-universe fallback.
+
+`constants.rs:1807`. Its name says REST; its load-bearing consumer is
+`dhan_live_universe.rs:212`, where the four ids are the fallback the live
+universe collapses to when the master artifact is unreadable.
+
+**Deleting it dials zero sockets** — the 99.98% collapse that
+`tv-<env>-errcode-ws-gap-03-universe-collapse` exists to page on. §12.6 already
+bans removing the master CSV for that reason; this constant is the same hazard
+wearing a REST name. **KEEP.**
+
+### (d) The scope is larger than §12 implies: the cadence scheduler becomes DEAD
+
+`CadenceExecutor` (`crates/core/src/cadence/executor.rs`) declares exactly three
+methods — `fetch_chain`, `fetch_spot`, `fetch_expiry_list` — and **all three ARE
+the removed legs**. The Groww executor was deleted 2026-08-21. So after this
+removal `spawn_cadence_scheduler` (`cadence_boot.rs:72`) has no executor to
+build, and `crates/core/src/cadence/{runner,schedule,gate,ladder,decision,assembly,expiry}.rs`
+plus `main.rs:2410` are unreachable.
+
+That is a further ~15,600 lines of `src/` across ~46 files, not the narrow leg
+removal §12.2's table suggests. Recorded so the PR is scoped honestly rather
+than discovered mid-review.
+
+### (e) §12.4's loss list omits a third table, and understates the finality
+
+§12.4 names the 15:41 cross-verification. Its module also owns
+**`dhan_rest_1m_tape`** (`dhan_live_crossverify_persistence.rs:76`) — the raw
+vendor tape — alongside the two audit tables. All three are in the Lambda's SEBI
+keep-list (`operator_control_action_commands.rs:88,163`), so the wipe command
+protects them; deleting the writer leaves them frozen, and DROPPING them is a
+separate decision this file does not authorize.
+
+**And the finality is worse than §12.4 states.** An exhaustive search for any
+other comparator found none: `tf_consistency_boot` recomputes our own timeframes
+from our own candles; `rest_candle_fold` is a writer and is disabled;
+`volume_semantics_probe` is QuestDB-only and has zero callers; and
+`brutex_crossverify` / `spot_crossverify` / `cross_verify_1m` /
+`groww_cross_verify_1m` were all deleted in 2026-07-15 and 2026-08-21.
+
+**After this removal there is ZERO mechanism anywhere in this workspace that
+compares captured market data against any external record.** The India feed
+carries no sequence number and no snapshot-on-subscribe, so nothing else can
+answer *"are the numbers right"* — only *"did the machinery run"*.
+`websocket-connection-scope-lock.md` states that a non-zero `compared` is *"the
+ONLY evidence this repository can offer that the feed works"*. That evidence
+source ends here.
+
+### (f) Retention: the retained tables are NOT exempt
+
+`RETENTION_EXEMPT_TABLES` lists the LEGACY names — DELIBERATELY, and its own doc
+comment says why (the rename consumed them, and the coverage guard demands a decision about the surviving constant). That is NOT a defect and must not be "fixed". What it means is narrower: the LIVE names are in `DAY_PARTITIONED_TABLES` and ARE swept:
+
+| Table | Class | Window |
+|---|---|---|
+| `rest_spot_1m` | Standard | 90 days |
+| `rest_fetch_audit` | Standard | 90 days |
+| `rest_option_chain_1m` | **MarketData** | **15 days** |
+| `rest_option_contract_1m` | **MarketData** | **15 days** |
+
+So §12's "the TABLES are retained" is true of the rows and NOT of their local
+availability: retained chain history leaves EBS after 15 days. It is archived to
+S3 fail-closed, never destroyed — but it stops being locally queryable.
+Whether to move the three live names into the exempt list is an **operator
+decision**, not a consequence of §12.
+
+### (g) The DDL callers all live inside the deleted modules
+
+`ensure_spot_1m_rest_table`, `ensure_option_chain_1m_table` and
+`ensure_rest_fetch_audit_table` are called only from `cadence_boot.rs:158,171,177`
+and the two boot modules. If the tables are retained, **a DDL caller must be
+re-homed into a surviving boot step** — otherwise a future wipe leaves the
+retained readers erroring on "table does not exist" instead of returning empty.
+
+### What §12.8 does NOT change
+
+The operator's directive; the KEEP classes (auth REST, instrument identity REST);
+the REMOVE classes; the order-side carve-out; the SEBI never-delete rule; and
+§12.4's honest loss, which is confirmed and widened rather than softened.
+
+### The reusable half
+
+Three of these seven — the table names, the heartbeat alarm, and
+`SPOT_1M_REST_INDICES` — share one shape: **a name that describes what something
+was called, not what it does now.** §12 was written from the module names and the
+config section headers, both of which are accurate about the code's HISTORY and
+wrong about its wiring. The rule-file-first law got the ordering right; what it
+cannot do on its own is verify that the names in the rule are the names in the
+running system. Mapping the manifest BEFORE the code is what caught it, and that
+step is now part of the removal, not optional preparation for it.

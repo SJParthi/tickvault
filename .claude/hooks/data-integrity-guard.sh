@@ -42,19 +42,49 @@ REPORT=""
 extract_prod_code() {
   local file="$1"
   awk '
-    BEGIN { skip=0; depth=0; exempt=0; skip_next=0; buf="" }
-    skip==0 && /^[[:space:]]*#\[cfg\(test\)\]/ { skip=1; depth=0; next }
-    skip==0 && /^[[:space:]]*#\[test\]/ { skip=1; depth=0; next }
+    BEGIN { skip=0; depth=0; exempt=0; skip_next=0; seen_item=0; buf="" }
+    skip==0 && /^[[:space:]]*#\[cfg\(test\)\]/ { skip=1; depth=0; seen_item=0; next }
+    skip==0 && /^[[:space:]]*#\[test\]/ { skip=1; depth=0; seen_item=0; next }
     skip==1 && depth > 0 {
       depth += gsub(/\{/, "{")
       depth -= gsub(/\}/, "}")
-      if (depth <= 0) { skip=0; depth=0 }
+      if (depth <= 0) { skip=0; depth=0; seen_item=0 }
       next
     }
     skip==1 && /\{/ {
       depth += gsub(/\{/, "{")
       depth -= gsub(/\}/, "}")
-      if (depth <= 0) { skip=0; depth=0 }
+      if (depth <= 0) { skip=0; depth=0; seen_item=0 }
+      next
+    }
+    # A BRACE-LESS `#[cfg(test)]` item ends at its own semicolon -- without this
+    # the catch-all below skips on to the next `{`, which is the opening brace
+    # of the NEXT, PRODUCTION item, swallowing it un-scanned. Measured on the
+    # live tree 2026-09-16; identical arm in banned-pattern-scanner.sh.
+    #
+    # ITEM-SCOPED: `seen_item` marks the FIRST code line of the item, and ONLY that
+    # line may end the skip. Three shapes broke the naive "any line ending in
+    # `;`" form (adversarial review of the first patch, 2026-09-16 -- all three
+    # reproduced end-to-end before and after):
+    #   (a) MISSED: `const X: u8 = 1; // note` -- the bare `$` anchor rejected a
+    #       trailing comment, so the headline bug survived a one-comment diff;
+    #   (b) FALSE POSITIVE: a doc comment between the attribute and the item
+    #       (`/// ... let n = parse(s)?;`) ended the skip early, flagging a
+    #       TEST-ONLY body as production;
+    #   (c) FALSE POSITIVE: a raw-string fixture (`r#" SELECT 1; "#;`) ended it
+    #       on the semicolon INSIDE the fixture and scanned the fixture as production.
+    #
+    # A false positive is the worse half -- it blocks a legitimate commit, which
+    # is how a guard gets disabled. Comments, blank lines and stacked attributes
+    # therefore never terminate. HONEST RESIDUAL: a MULTI-LINE brace-less item
+    # (case c) stays over-skipped -- the pre-patch behaviour, a miss rather than
+    # a false alarm. Stated, not hidden.
+    skip==1 && depth==0 && seen_item==0 && /^[[:space:]]*$/ { next }
+    skip==1 && depth==0 && seen_item==0 && /^[[:space:]]*(\/\/|\/\*|\*)/ { next }
+    skip==1 && depth==0 && seen_item==0 && /^[[:space:]]*#\[/ { next }
+    skip==1 && depth==0 && seen_item==0 {
+      seen_item=1
+      if ($0 ~ /;[[:space:]]*(\/\/.*)?$/) { skip=0; depth=0; seen_item=0 }
       next
     }
     skip==1 { next }
