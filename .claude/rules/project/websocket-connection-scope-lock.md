@@ -622,6 +622,26 @@ it outright: *"gives you the SecurityId of each option contract directly, no
 instrument master lookup needed for subscriptions"*
 (`docs/dhan-ref/06-option-chain.md:195`).
 
+> **⚠ CORRECTED 2026-09-16 — this sentence was true for ~50 lines and the code
+> stopped depending on it the SAME DAY.** The THIRD quote of 2026-08-11, below
+> in this file, REVERSED the instrument-master ban that forced the chain to be
+> the source (*"Q3 IS REVERSED: the daily Dhan master CSV … is ORDERED BACK"*).
+> The code followed; this prose did not. **Verified in source 2026-09-16:**
+> `dhan_depth_universe.rs:1097` (`load_depth_candidates`, the per-minute
+> steering path) opens with `read_contract_artifact(date_ist)` and returns
+> `Vec::new()` on failure — it does NOT query the chain; `dhan_feed_stack.rs:10151`
+> calls `load_depth_universe_from_master` FIRST with the `option_chain_1m` SQL
+> only as the `None` fallback at `:10161`; and `depth_seed.rs:28` validates every
+> seeded id against TODAY's contract artifact. The master is strictly richer —
+> 121,674 contracts with lot size, strike, expiry and leg, against the chain's
+> ~1,250 INDEX-option legs, which cannot represent a stock option at all
+> (`contract_underlying_map.rs:20`, measured). Left standing per house
+> convention because the sentence records a real 2026-08-11 decision; annotated
+> because a session trusting it would conclude that removing the option-chain
+> REST pull kills depth, which is the false-finding class the `day_ohlc_tracker`
+> row records. Removal authorization: `no-rest-except-live-feed-2026-06-27.md`
+> §12 (2026-09-16).
+
 **This is the sanctioned depth instrument source.** It costs no new fetch class,
 adds no REST call, breaks no rule, and self-rolls: when the expiry changes the
 chain returns the new contracts and the depth set follows automatically — the
@@ -5320,83 +5340,33 @@ that is the support ticket, not this cap.
 - Changes the socket or instrument budgets, the name band, or the ATM windows.
 - Reports the 48 s worst case as a measured figure.
 
-### 2026-09-13 — DHAN-ONLY, RESTATED: the Groww token minter, and the false strings the 2026-08-21 removal left behind
+### 2026-09-16 — SOCKETS ONLY: the per-minute REST KEEP is REVERSED
 
-**The verbatim operator demand (2026-09-13, typed directly in-session — preserve
-EXACTLY, expletives and typos included):**
+**The verbatim operator demand (2026-09-16, typed directly in-session — preserve
+EXACTLY, typos included):**
 
-> "remove that fuckign groww token mitner also see clealry ntoe in this appllciation we ened to always ahve one an donly dhan related data dude okay? no groww accepatbela t any poitn dude okay?"
+> "Dude except sockets remove all the entire remaining rest api call related implementations ddue okay?"
 
-**No new scope is claimed.** The 2026-08-21 directive ("2026-08-21 (THIRD quote of
-the day)") already ordered the entire Groww surface removed; this is that directive
-executed on the residue it left, plus the operator naming one AWS resource it never
-covered. Recorded per the rule-file-first law.
+This REVERSES one REJECT row of the 2026-08-11 SECOND quote above, verbatim:
+*"Stands down, disables, or starves ANY per-minute REST leg for Dhan or Groww in
+the name of the live lane."* That row was written on a day when the Dhan live
+WebSocket had been retired for a month and REST was the only market data the
+system had. Sixteen sockets have carried the same instruments live since the
+2026-08-11 flip, so the row now protects a duplicate rather than a source.
 
-#### What was MEASURED, 2026-09-13 — better than expected in code, worse in AWS
+**The full disposition, the depth analysis, and the honest loss list live in
+`no-rest-except-live-feed-2026-06-27.md` §12** (recorded the same day, before
+any code). Summary of what it settles, all Verified in source:
 
-| Surface | Reading |
+| | |
 |---|---|
-| `fetch_groww_access_token` | **does not exist** — the only 3 hits are historical comments |
-| `Feed::Groww` enum variant | **does not exist** — `Feed::ALL` is `[Dhan, Truedata]`; the single textual hit is inside a comment |
-| Groww mentions in `crates/` | 1,765 lines, of which **1,202 are comments** and only **80 are production code** |
-| Tickvault Terraform declaring a Groww resource | **ZERO** — all 13 `.tf` files that mention the word do so in comments |
-| EventBridge rule `groww-token-minter-daily` | **ENABLED**, `cron(35 0 * * ? *)`, and it **minted at 06:05 IST that morning** |
-| `/tickvault/prod/groww/{access-token,api-key,totp-secret}` | present; access-token `LastModifiedDate` = today |
+| **AUTH REST stays** | `connection.rs:1326` embeds the JWT in the socket URL; `current_feed_token`'s own docblock says *"there is no second credential path."* Removing it dials nothing. |
+| **Instrument-master REST stays** | `ParsedTick` carries id + segment + prices and **no symbol, strike, expiry, leg or lot size** — a socket can only echo ids you already subscribed. Identity must come from outside the socket. |
+| **Market-data REST goes** | spot-1m, option-chain, expirylist. |
+| **Depth survives it** | the live steering path reads the master contract artifact, not `option_chain_1m` — see the 2026-09-16 correction annotated at the "sanctioned depth instrument source" line above. |
+| **The cross-verification goes, and that is a real loss** | it is the ONLY ground truth this feed has. §12.4. |
+| **The legs were never actually off** | `[spot_1m_rest]`/`[option_chain_1m]` read `enabled = false` in base.toml while the cadence executor re-fires the same HTTP. §12.5. |
 
-#### ⚠ The minter is NOT tickvault's to delete, and that is the honest blocker
-
-`groww-shared-token-minter-2026-07-02.md` §1 records that the Lambda's Terraform
-lives in the **bruteX repo**, and `brutex-readonly-lock-2026-07-18.md` makes
-tickvault READ-ONLY there. So the rule and the trigger sit in the operator's shared
-AWS account while their source of truth is a repo this session may not write. A
-disable from here is reverted by bruteX's next `terraform apply`, and bruteX loses
-its Groww token in between. The executing identity also lacks `events:DisableRule`
-and every `lambda:*` action (both verified by attempting them).
-
-**It is therefore an operator action, not an executor one**, and it is recorded
-here rather than half-done: EventBridge → Rules → `groww-token-minter-daily` →
-Disable, then delete the three SSM parameters.
-
-#### What WAS fixed in tickvault (the operator-visible half)
-
-Four Telegram/log surfaces stated, in production, that a second broker exists:
-
-| Site | Said | Reachability |
-|---|---|---|
-| `events.rs` `StartupComplete` ×4 arms | "(Groww per-minute legs report separately)" | **every boot** |
-| `events.rs` `Chain1mUnderlyingNotServed` / `…ServedRecovered` | "the second broker (🟢 GROWW) … check the Groww copy" | a §2.1 allowed-family page, live |
-| `events.rs` `DualFeedScorecardAborted` | "the 3:45 PM IST Dhan-vs-Groww scorecard" | live |
-| `order_runtime.rs:1282, :1914` | "Groww marks" / "waiting for the first Groww mark" | **`[order_runtime] enabled = true`, `self_test = true`** — both fire, and the mark producer has been `dhan_cadence_executor` since 2026-08-21, pinned by `cadence_mark_source_guard::test_dhan_cadence_executor_is_now_the_mark_producer`, a test INVERTED that day to assert exactly that |
-
-Every one is corrected, and the tests that asserted the old wording now assert its
-**ABSENCE** (`assert!(!msg.contains("Groww"))`) so it cannot creep back.
-
-**One claim CORRECTED rather than repeated.** A review of this work reported
-`feed_scoreboard_boot.rs:3448` as a live bug — `match feed { Dhan => dhan_on, _ =>
-groww_on }` now routing TrueData through a Groww variable. The call site
-(`main.rs:5409-5411`) passes `(is_enabled(Dhan), is_enabled(Truedata))`, so the
-**VALUE is correct and only the NAME was stale**. Renamed `groww_on` →
-`secondary_on`. Recorded because "misleading name" and "wrong behaviour" are
-different findings and only one of them was true.
-
-#### NOT done, and deliberately
-
-The feed-generic seam stays exactly as the 2026-08-21 REJECT list requires — the
-`Feed` enum, the cadence scheduler, and the `spot_1m_rest` / `option_chain_1m` /
-`rest_fetch_audit` tables and their writers are UNTOUCHED, because GDF and TrueData
-plug into them and their scope locks are unaffected by this quote. The dead
-`*_FEED_GROWW` constants, the dormant `FUTIDX-02` cross-feed comparator, and the
-`groww_symbol` / `groww_minutes` DDL columns are left for a separate change: the
-columns in particular are **not free** to remove, because the self-heal is
-`ADD COLUMN IF NOT EXISTS` and can never drop one, so a live `ALTER TABLE … DROP
-COLUMN` is an operator decision rather than a code edit.
-
-#### What a PR that violates this section looks like (REJECT)
-
-- Re-introduces any operator-facing string naming a second broker.
-- Removes the feed-generic seam "because only Dhan is left" (the 2026-08-21 row).
-- Deletes a SEBI/audit row, or a `feed='groww'` row from `instrument_lifecycle`,
-  `instrument_lifecycle_audit` or `index_constituency` — removing the WRITER was
-  authorized, deleting the ROWS never was.
-- Writes to the bruteX repo to remove the minter (read-only lock, 2026-07-18).
-- Reports the minter as removed on the strength of a tickvault-side change.
+**What this section does NOT authorize:** any change to the socket budget (16),
+the endpoint types (4), the order-side REST surface, `dry_run`, the §28 frozen
+indicator/strategy area, or any deletion of a SEBI/audit table row.
