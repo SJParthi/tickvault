@@ -57,6 +57,11 @@ extract_prod_code() {
       if (depth <= 0) { skip=0; depth=0 }
       next
     }
+    # A BRACE-LESS `#[cfg(test)]` item ends at its own semicolon -- without this
+    # the catch-all below skips on to the next `{`, which is the opening brace
+    # of the NEXT, PRODUCTION item, swallowing it un-scanned. Measured on the
+    # live tree 2026-09-16; identical arm in banned-pattern-scanner.sh.
+    skip==1 && depth==0 && /;[[:space:]]*$/ { skip=0; next }
     skip==1 { next }
     # Block-level exemptions
     /DATA-INTEGRITY-EXEMPT: begin/ { exempt=1; next }

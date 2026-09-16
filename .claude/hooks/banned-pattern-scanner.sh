@@ -45,6 +45,23 @@ extract_prod_code() {
       if (depth <= 0) { skip=0; depth=0 }
       next
     }
+    # A BRACE-LESS `#[cfg(test)]` item ends at its own semicolon.
+    #
+    # Without this arm the catch-all below keeps skipping until the next line
+    # containing `{` -- which, after `#[cfg(test)] const X = ...;` or
+    # `#[cfg(test)] mod tests;`, is the opening brace of the NEXT and
+    # PRODUCTION item. That item was swallowed whole and never scanned.
+    #
+    # Measured 2026-09-16 on the live tree: `crates/trading/src/strategy/mod.rs`
+    # lost `pub mod evaluator;`, `pub mod hot_reload;` and `pub mod types;`, and
+    # a minimal fixture proved an entire production `fn` carrying `.unwrap()`
+    # disappeared from the scan. 12 brace-less sites exist workspace-wide.
+    #
+    # Placed AFTER the two brace arms deliberately: `#[cfg(test)] use super::{a};`
+    # carries a brace AND a semicolon, and the brace arm already balances it to
+    # depth 0. `depth==0` keeps this out of the way of a real `mod tests {` body,
+    # whose inner `let x = 1;` lines must stay skipped.
+    skip==1 && depth==0 && /;[[:space:]]*$/ { skip=0; next }
     # Inside a skip block, no braces yet (attribute lines like #[allow()])
     skip==1 { next }
     # Block-level exemptions: O(1) EXEMPT: begin ... O(1) EXEMPT: end
