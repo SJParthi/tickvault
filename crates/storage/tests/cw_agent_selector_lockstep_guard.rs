@@ -133,21 +133,39 @@ fn user_data_carries_no_second_copy_of_the_selector() {
 #[test]
 fn cw_agent_selector_ships_heartbeat_and_drops_groww_live_metrics() {
     // 2026-07-15 (Groww live-feed retirement, Trap-A lockstep): the selector
-    // must ship the re-pointed liveness alarm's heartbeat gauge and must NOT
-    // resurrect the 4 retired Groww-live names (a dead name in the EMF list
-    // implies coverage no producer can ever publish again).
+    // must ship the re-pointed liveness alarm's gauge and must NOT resurrect
+    // retired names (a dead name in the EMF list implies coverage no producer
+    // can ever publish again).
+    //
+    // ⚠ RE-POINTED 2026-09-17. This guard REQUIRED
+    // `tv_rest_1m_fire_heartbeat` — correct until the operator's SOCKETS-ONLY
+    // narrowing removed all three of its producers
+    // (`no-rest-except-live-feed-2026-06-27.md` §12.10), at which point it was
+    // asserting the exact reverse of both of its own rules at once: it
+    // DEMANDED an EMF name whose producer is gone (the dead-name clause
+    // directly below) while its message warned of a false-SOS the alarm can no
+    // longer raise, because that alarm was re-pointed the same day.
+    //
+    // The RULE is unchanged and is why this was re-pointed rather than
+    // deleted: `tv-<env>-market-hours-liveness-missing` is
+    // `treat_missing_data = breaching` and is the ONLY ~5-minute detector in
+    // the gated set, so whatever gauge it reads MUST be shipped or it pages
+    // every gated window, every trading day. Only the gauge moved.
     let root = repo_root();
     let live = extract_selector_regex(
         &read(&root.join("deploy/aws/cloudwatch-agent.json")),
         "deploy/aws/cloudwatch-agent.json",
     );
     assert!(
-        live.contains("tv_rest_1m_fire_heartbeat"),
-        "cw-agent metric_selectors must ship tv_rest_1m_fire_heartbeat — the \
+        live.contains("tv_dhan_feed_last_tick_age_secs"),
+        "cw-agent metric_selectors must ship tv_dhan_feed_last_tick_age_secs — the \
          market-hours liveness alarm (treat_missing_data=breaching) is blind \
-         without it (false-SOS ~09:25 IST daily)"
+         without it (false-SOS every gated window, every trading day)"
     );
     for retired in [
+        // Lost all three producers with the per-minute REST legs (§12.10);
+        // shipping the name would imply coverage nothing can publish.
+        "tv_rest_1m_fire_heartbeat",
         "tv_groww_ws_active",
         "tv_feed_last_tick_age_seconds",
         "tv_feed_sidecar_stall_restart_total",
