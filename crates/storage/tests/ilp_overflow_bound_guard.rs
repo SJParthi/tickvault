@@ -138,8 +138,25 @@ fn every_flushing_writer_declares_its_failure_treatment() {
         }
     }
 
+    // Anti-vacuity floor, RE-DERIVED 2026-09-17: 15 -> 14.
+    //
+    // The delta is MEASURED and matched to its cause, not estimated. Four
+    // `*_persistence.rs` writers were deleted by the operator's SOCKETS-ONLY
+    // narrowing (`no-rest-except-live-feed-2026-06-27.md` §12.10), taking the
+    // real count 18 -> 14:
+    //
+    //   spot_1m_rest_persistence.rs        (the per-minute spot leg)
+    //   option_chain_1m_persistence.rs     (the per-minute chain leg)
+    //   rest_fetch_audit_persistence.rs    (the per-fetch forensics writer)
+    //   dhan_live_crossverify_persistence.rs (the 15:41 accuracy check)
+    //
+    // The floor now EQUALS the count rather than sitting 3 below it, and that
+    // is deliberate: this assertion exists to catch a discovery that silently
+    // matches nothing, so the tightest honest value is the measured one. A
+    // future removal must re-derive it here with its own named cause — which
+    // is what the 15 failed to force when these four went.
     assert!(
-        flushing >= 15,
+        flushing >= 14,
         "found only {flushing} flushing writers — the discovery is broken and \
          this test would pass vacuously"
     );
@@ -380,11 +397,24 @@ fn discard_counter_names(src: &str) -> Vec<String> {
 /// The stale-entry test below is what stops this list becoming the staleness it
 /// is exempting: an entry naming a counter no source file mentions any more
 /// must be removed in the same change that removes the branch.
-const GROWW_BRANCH_EXEMPT: [&str; 3] = [
-    "tv_groww_chain1m_rows_discarded_total",
-    "tv_groww_spot1m_rows_discarded_total",
-    "tv_groww_contract1m_rows_discarded_total",
-];
+///
+/// 2026-09-17: **3 -> 1.** `tv_groww_chain1m_rows_discarded_total` and
+/// `tv_groww_spot1m_rows_discarded_total` are REMOVED because their modules
+/// are — `option_chain_1m_persistence.rs` and `spot_1m_rest_persistence.rs`
+/// went with the per-minute REST legs under the operator's SOCKETS-ONLY
+/// narrowing (`no-rest-except-live-feed-2026-06-27.md` §12.10).
+///
+/// This is the stale-entry test doing precisely the job the paragraph above
+/// describes, and it caught the omission: the branches were deleted and their
+/// exemptions were not, so for two commits this list granted an exemption to
+/// names nothing produced — and the next counter to take one of those names
+/// would have inherited it silently.
+///
+/// `tv_groww_contract1m_rows_discarded_total` STAYS: its module
+/// (`option_contract_1m_rest_persistence.rs`) survives the removal
+/// (§12.10.7(f) records it as orphaned-but-retained), so the branch it
+/// exempts is still there to exempt.
+const GROWW_BRANCH_EXEMPT: [&str; 1] = ["tv_groww_contract1m_rows_discarded_total"];
 
 /// Whether `metric` is registered at zero somewhere in `src`.
 ///

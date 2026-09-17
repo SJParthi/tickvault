@@ -171,12 +171,6 @@
           "under a second", not as a precise number. Figures are bucket upper bounds, so they over-state slightly within a
           bucket. "+Inf" means slower than the largest bucket, i.e. unbounded. An empty table means the live feed produced no
           ticks at all — never read that as "fast".</div>
-        <div class="lbl" style="margin-top:14px">official minute candles (REST pulls)</div>
-        <div id="latrest" style="overflow:auto"></div>
-        <div class="muted" style="margin-top:6px">One row per (broker, pull type) read from today's fetch log on the box —
-          p50/p99 of "minute closed → data in hand", successful pulls only (approximate percentiles, 3 significant
-          figures, computed inside the database). Late repairs keep their real ≥60 s delay; unmeasured rows are
-          excluded, never faked as fast. "-" = no successful pulls recorded today for that pair.</div>
         <div class="lbl" style="margin-top:14px">box-wide (shared by all pulls)</div>
         <div class="shields" id="latnet"></div>
         <div class="muted" style="margin-top:6px">DB round-trip / clock skew are box-wide. Order placement reads "—"
@@ -199,7 +193,7 @@
           </div>
           <div style="flex:2 1 380px;min-width:280px">
             <div class="lbl">query</div>
-            <textarea id="dbsql" spellcheck="false">SELECT * FROM rest_spot_1m ORDER BY ts DESC LIMIT 50</textarea>
+            <textarea id="dbsql" spellcheck="false">SELECT * FROM ticks ORDER BY ts DESC LIMIT 50</textarea>
             <div class="row" style="margin-top:10px">
               <button class="b-blu" onclick="runDbSql()">▶ Run</button>
               <button class="b-ghost" onclick="dbDownloadCsv()">⬇ Download CSV</button></div>
@@ -320,14 +314,16 @@ async function loadOverview(){ $('refbtn').innerHTML='<span class="spin">🔄</s
   // Data-tab bars: today's rows per LIVE table (spot / chain; contracts
   // dropped 2026-09-03 — see parse_view). An unreadable count (empty value —
   // box/QuestDB unreachable) renders '—', never a fabricated 0 bar (Rule 11).
-  const rt=j.rows_today||{}, tkeys=['spot','chain'];
+  const rt=j.rows_today||{}, tkeys=['ticks','depth'];
   const vals=tkeys.map(k=>String(rt[k]==null?'':rt[k]).trim()===''?null:(parseInt(rt[k],10)||0));
   const mx=Math.max(1,...vals.map(v=>v||0));
   $('bars').innerHTML=tkeys.map((k,i)=>bar(k,vals[i],mx)).join('');
-  // Dedup-key check: the real rest_spot_1m upsert key is 4 columns
-  // (ts, security_id, exchange_segment, feed) per DEDUP_KEY_SPOT_1M_REST.
+  // Dedup-key check: the real `ticks` upsert key is 5 columns
+  // (ts, security_id, segment, capture_seq, feed) per DEDUP_KEY_TICKS.
+  // Re-pointed 2026-09-17 off rest_spot_1m (4 columns) — keeping the 4 would
+  // have shown a red schema-drift shield on a healthy box every day.
   // Three distinct states:
-  //   4 = OK (green) · 0 = DEDUP disabled entirely (RED — duplicate rows will
+  //   5 = OK (green) · 0 = DEDUP disabled entirely (RED — duplicate rows will
   //   accumulate) · any other number = schema drift (amber). A fetch failure
   //   (box/QuestDB unreachable) renders "unreachable" (amber), never a fake 0.
   // Stopped box → ONE calm banner + a greyed "—" shield instead of a scary
@@ -338,12 +334,12 @@ async function loadOverview(){ $('refbtn').innerHTML='<span class="spin">🔄</s
     $('shields').innerHTML=shieldIdle('Dedup key columns');
   } else {
   const dkRaw=String(j.dedup_key_columns||'').trim(), dkN=parseInt(dkRaw,10);
-  const dkUnknown=(dkRaw===''||isNaN(dkN)), keysOk=dkN===4;
+  const dkUnknown=(dkRaw===''||isNaN(dkN)), keysOk=dkN===5;
   let dkTxt,dkCls;
   if(dkUnknown){ dkTxt='unreachable'; dkCls='warn'; }
-  else if(dkN===4){ dkTxt='4 ✅'; dkCls='ok'; }
+  else if(dkN===5){ dkTxt='5 ✅'; dkCls='ok'; }
   else if(dkN===0){ dkTxt='0 — DEDUP disabled!'; dkCls='bad'; }
-  else { dkTxt=dkRaw+' — schema drift (expected 4)'; dkCls='warn'; }
+  else { dkTxt=dkRaw+' — schema drift (expected 5)'; dkCls='warn'; }
   $('shields').innerHTML=shield('Dedup key columns',dkTxt,keysOk,dkCls);
   }
   if(!$('feeds').dataset.loaded) loadFeeds();
@@ -380,26 +376,15 @@ async function loadFeeds(){ $('feeds').dataset.loaded='1'; $('feeds').innerHTML=
     // re-validates the same charset server-side before any shell command.
     const safeName=String(f.name).toLowerCase().replace(/[^a-z0-9_-]/g,'');
     const h=f.h; const badge=h?('<span class="badge '+vb(h.verdict)+'">'+esc(h.verdict||'?')+'</span>'):'<span class="badge unknown">no health</span>';
-    // REST-pull line (2026-07-16): today's fetch-log outcomes + last-hour
-    // prompt-pull latency from rest_fetch_audit — the old ticks/subscribed
-    // counters read frozen live-feed registries and are gone. "failed" =
-    // every non-ok, non-rate-limited outcome (error/empty/no_token/…) —
-    // EXCEPT skipped/boundary_skipped, which are minutes the leg never
-    // attempted (trading-day gate / missed boundaries), not pull failures
-    // (review fix L4; no_token IS a failure and stays counted).
-    const ra=(j.rest_audit||{})[f.name], rl=(j.rest_lat_hour||{})[f.name];
-    let pull;
-    if(ra && Object.keys(ra).length){
-      const ok=ra.ok||0, rlim=ra.rate_limited||0;
-      const failed=Object.keys(ra).filter(k=>k!=='ok'&&k!=='rate_limited'&&k!=='skipped'&&k!=='boundary_skipped').reduce((s,k)=>s+(ra[k]||0),0);
-      pull='pulls today: '+ok.toLocaleString()+' ok · '+failed.toLocaleString()+' failed · '+rlim.toLocaleString()+' rate-limited';
-      if(rl&&(rl.p50_ms!=null||rl.p99_ms!=null)) pull+=' — last hour: p50 '+fmtLagMs(rl.p50_ms)+' / p99 '+fmtLagMs(rl.p99_ms)+' after minute close';
-    } else if(j.rest_audit_error){ pull=esc(j.rest_audit_error); } else { pull='no official-candle pulls recorded today'; }
-    const detail='<div class="muted">'+(h&&h.reason?esc(h.reason)+' · ':'')+pull+'</div>';
+    // The REST-pull line was REMOVED 2026-09-17 with its rest_fetch_audit
+    // source (the per-minute legs are gone; see operator_control.rs). It is
+    // not replaced: there is no per-minute fetch left to count or to time,
+    // and an always-empty "pulls today" line would read as a failure.
+    const detail='<div class="muted">'+(h&&h.reason?esc(h.reason):'')+'</div>';
     return '<div class="pr"><div class="t"><b>'+esc(f.name)+'</b> — <span class="'+(f.enabled?'ok':'bad')+'">'+(f.enabled?'ENABLED':'disabled')+'</span>'
       +' · lane '+(f.lane?'<span class="ok">running</span>':'<span class="warn">not running</span>')+' '+badge+detail+'</div>'
       +'<button class="'+(f.enabled?'b-stop':'b-go')+' mini" onclick="feedToggle(\''+safeName+'\','+(!f.enabled)+')">'+(f.enabled?'⏹ turn OFF':'▶ turn ON')+'</button></div>'; }).join('');
-  const errs=[j.feeds_error,j.health_error,j.rest_audit_error].filter(Boolean).join(' · ');
+  const errs=[j.feeds_error,j.health_error].filter(Boolean).join(' · ');
   if(errs) $('feedsmsg').textContent=errs; }
 async function feedToggle(feed,enabled){
   if(!enabled && !confirm('Turn OFF "'+feed+'"? Its official-candle pulls (spot + option chain) stop until you turn it back on.')){ toast('cancelled'); return; }
@@ -485,17 +470,13 @@ function fmtNs(n){ if(n==null||n==='') return '—'; n=Number(n); if(n<1000) ret
 function fmtMs(s){ return (s===''||s==null)?'—':s+' ms'; }
 function fmtLagMs(v){ if(v==null||v==='') return '-'; if(typeof v==='string'&&/inf/i.test(v)) return 'over 60 s (slower than the last bucket)'; v=Number(v); if(!isFinite(v)) return '-';
   if(v>=1000) return (v/1000).toFixed(2)+' s'; return v.toFixed(2)+' ms'; } function fmtAge(s){ s=Number(s); return s<60?s.toFixed(0)+' s ago':s<3600?(s/60).toFixed(1)+' min ago':(s/3600).toFixed(1)+' h ago'; }
-// REST-era latency card (2026-07-16). The per-(broker, pull type) table
-// iterates the SERVER's j.rest_latency rows — sourced from today's
-// rest_fetch_audit on the box (feed + leg discovered from the data, never
-// hardcoded), so a future broker/leg gets its row with zero portal changes.
-// "-" = no successful pulls recorded today for that pair (never fake zeros).
+// Latency card. The REST per-(broker, pull type) table was REMOVED 2026-09-17
+// with its rest_fetch_audit source (see parse_latency in operator_control.rs).
 async function loadLatency(){ $('latnet').dataset.loaded='1'; $('latnet').innerHTML='<span class="muted">measuring…</span>';
-  $('latrest').innerHTML='<span class="muted">measuring…</span>';
   $('latws').innerHTML='<span class="muted">measuring…</span>';
-  const j=await call('latency'); if(!j){ $('latnet').innerHTML=''; $('latrest').innerHTML=''; $('latws').innerHTML=''; return; }
+  const j=await call('latency'); if(!j){ $('latnet').innerHTML=''; $('latws').innerHTML=''; return; }
   // Live sockets: every socket the app tracks, what each holds on the wire, what it delivered, and how late.
-  // Rendered BEFORE the REST table: this is the path that carries ticks. Rows come from the app's own counters.
+  // Rows come from the app's own counters.
   const ws=Array.isArray(j.ws_latency)?j.ws_latency:[]; const live=ws.filter(r=>Number(r.frames||0)>0).length;
   if(ws.length){
     let w='<div class="muted">'+live+' of '+ws.length+' sockets delivered data this session</div><table><tr><th>socket</th><th>pool</th><th>instruments on wire</th><th>frames delivered</th><th>last data</th><th>ticks timed</th><th>p50 exchange→here</th><th>p99 exchange→here</th></tr>';
@@ -505,16 +486,6 @@ async function loadLatency(){ $('latnet').dataset.loaded='1'; $('latnet').innerH
     $('latws').innerHTML=w+'</table>';
   } else {
     $('latws').innerHTML='<span class="warn">no live sockets reported — the live feed is off, produced nothing, or the app is unreachable. This is NOT a zero-latency reading.</span>';
-  }
-  const rows=Array.isArray(j.rest_latency)?j.rest_latency:[];
-  if(rows.length){
-    let h='<table><tr><th>broker</th><th>pull type</th><th>ok pulls today</th><th>p50 after close</th><th>p99 after close</th></tr>';
-    rows.forEach(r=>{ h+='<tr><td><b>'+esc(String(r.feed))+'</b></td><td>'+esc(String(r.leg))+'</td>'
-      +'<td>'+Number(r.ok_rows||0).toLocaleString()+'</td>'
-      +'<td>'+esc(fmtLagMs(r.p50_ms))+'</td><td>'+esc(fmtLagMs(r.p99_ms))+'</td></tr>'; });
-    $('latrest').innerHTML=h+'</table>';
-  } else {
-    $('latrest').innerHTML='<span class="warn">no successful pulls recorded today — market closed, box just started, or the fetch log is unreachable</span>';
   }
   const skew=Math.abs(parseFloat(j.clock_skew_ms));
   $('latnet').innerHTML=

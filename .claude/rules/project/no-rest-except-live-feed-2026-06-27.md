@@ -1605,8 +1605,155 @@ quietly skipped:
 | `dhan_depth_universe.rs` — the boot `None` fallback | `rest_option_chain_1m` | **REMOVE** (already required by §12.10.7(b) — a fallback that can only return empty is a dead monitor written in code) |
 | `volume_semantics_probe.rs` | `rest_option_chain_1m` | zero production callers, before and after; recorded, not deleted here |
 | `rest_candle_fold.rs` | `rest_spot_1m` | `enabled = false`; §12.10.7(g) already requires it removed or explicitly recorded inert |
-| `operator_control_commands.rs` — `CHAIN_TODAY`, `CHAIN_BY_FEED`, `REST_AUDIT`, `REST_LAT_HOUR`, `REST_LATENCY_SQL` | all three | **REMOVE**, exactly as the 2026-09-03 pair was removed |
-| `operator_control_console.html:202` default query | `rest_spot_1m` | **RE-POINT** — a console whose default query errors on open is the first thing an operator sees |
+| `operator_control_commands.rs` — `CHAIN_TODAY`, `CHAIN_BY_FEED`, `REST_AUDIT`, `REST_LAT_HOUR`, `REST_LATENCY_SQL` | all three | **REMOVE**, exactly as the 2026-09-03 pair was removed — **DONE 2026-09-17**, and see §12.12 below: this row named FIVE commands and the file had EIGHT of the same shape, so `SPOT_TODAY` / `SPOT_BY_FEED` / `DEDUP_KEYS` were RE-POINTED at the live tables rather than left reading a frozen one. |
+| `operator_control_console.html:202` default query | `rest_spot_1m` | **RE-POINT** — a console whose default query errors on open is the first thing an operator sees — **DONE 2026-09-17** (§12.12) |
+
+### §12.12 — 2026-09-17: the operator console's Data tab is RE-POINTED at the live tables, not emptied
+
+**No new authorization is claimed.** §12.11's disposition row above named five
+of `operator_control_commands.rs`'s REST-table reads. The file carried
+**eight** of the same shape, and the three it did not name —
+`SPOT_TODAY`, `SPOT_BY_FEED`, `DEDUP_KEYS` — are the console's **hero
+number, its per-broker split, and its schema shield**. A list that names some
+reads exactly like a list that audited the file; this is that class again, in
+the disposition table itself.
+
+**Why RE-POINT and not REMOVE.** Removing them empties the operator's primary
+surface: the hero counter renders `—` forever and the Data tab shows no bars.
+Leaving them is worse — every one is scoped to `today()` against a table with
+no writer, so each returns a permanent zero, and this file's own
+`operator_control.rs` docstring already states the rule that settles it:
+*"a zero an operator cannot distinguish from a real outage is worse than an
+absent field."* The third option is the one §12.9(c) took for
+`market-hours-liveness-missing` in this same removal series, for the same
+reason, and is taken here.
+
+| Command | Was | Now |
+|---|---|---|
+| `SPOT_TODAY` | `count() FROM rest_spot_1m WHERE ts IN today()` | **`TICKS_TODAY`** — `ticks` |
+| `CHAIN_TODAY` | `rest_option_chain_1m` | **`DEPTH_TODAY`** — `market_depth`, the other live socket table |
+| `SPOT_BY_FEED` | `rest_spot_1m` GROUP BY feed | **`TICKS_BY_FEED`** — `ticks` GROUP BY feed |
+| `CHAIN_BY_FEED` | `rest_option_chain_1m` GROUP BY feed | removed (one live by-feed split is the question, not two) |
+| `DEDUP_KEYS` | upsert-key count on `rest_spot_1m`, expected **4** | upsert-key count on `ticks`, expected **5** |
+| `REST_AUDIT` · `REST_LAT_HOUR` · `REST_LATENCY_SQL` | `rest_fetch_audit` | **REMOVED** — see below |
+
+**The field names MOVE with the queries** (`SPOT_TODAY` → `TICKS_TODAY`). A
+re-pointed query under its old name is the stale-name trap §12.8(a) and
+§12.9(a) each record: an operator reading "spot" would believe they were
+looking at the REST spot leg.
+
+**The dedup expectation moves 4 → 5**, and that is not cosmetic: `ticks` is
+`DEDUP UPSERT KEYS(ts, security_id, segment, capture_seq, feed)` — five,
+pinned by `questdb_init_script_guard.rs::test_init_script_ticks_ddl_is_final_
+schema_with_5_key_dedup`. A re-point that kept the 4 would have shown a red
+"DEDUP disabled / schema drift" shield on a perfectly healthy box, every day.
+
+**⚠ What is NOT re-pointed, and why.** `REST_AUDIT`, `REST_LAT_HOUR` and
+`REST_LATENCY_SQL` all measured **`close_to_data_ms` — how many seconds after
+a minute closed its data arrived.** That question has no surviving equivalent:
+there is no per-minute fetch left to time. The live lane's
+`tv_dhan_feed_last_tick_age_secs` measures ARRIVAL freshness, which is a
+different question, and presenting it as an answer to this one would be the
+false-OK this file exists to stop. The console's pull line and latency button
+are therefore REMOVED, not replaced.
+
+**⚠ What this leaves unwatched, stated rather than implied:** the console no
+longer answers the operator's 2026-07-13 Quote 2 (*"within how many seconds
+precisely"*), and nothing else does.
+
+**REJECT:** re-pointing a query while keeping its old field name; keeping the
+4-column dedup expectation against `ticks`; presenting tick-arrival age as
+minute-close latency; or re-adding any `rest_fetch_audit` read without its
+writer coming back first.
+
+#### ⚠ CORRECTED 2026-09-17 (same day, hours later) — it was NINE reads, not eight, and the ninth is the LATENCY tab
+
+The section above opens by correcting §12.11 for naming five reads where the
+file had eight. **It then made the same error one level down: the file has
+NINE.** The ninth is `LATENCY_COMMANDS[6]` — a `curl` that aggregates
+`count()`, `approx_percentile(close_to_data_ms, 0.5)` and `(…, 0.99)` from
+`rest_fetch_audit` for `today()`, grouped by `(feed, leg)`, and re-emits each
+row as a `RESTLAT_ROW=` line.
+
+**How it was missed, because the mechanism is the reusable part.** The audit
+that produced the eight-row table was of the `VIEW`/`FEEDS` command arrays —
+the Data tab. `LATENCY_COMMANDS` is a different array serving a different tab,
+so it was outside the thing being read, and its query is embedded INSIDE a
+shell string rather than named by a `const` a reader would grep. The standalone
+`REST_LATENCY_SQL` const WAS found and retired; the identical query inlined
+twenty lines above it was not. **A grep for the const name finds the const; only
+a grep for the TABLE finds both** — and the table grep is the one this file's
+own §12.9(a) already prescribes ("find readers by the MODULE/CONSTANT path,
+never by the table literal" — here the inverse, and both directions are needed).
+
+The count is now MEASURED rather than asserted:
+`awk '/^#\[cfg\(test\)\]/{exit}' crates/aws-lambdas/src/operator_control_commands.rs |
+grep -cE 'rest_fetch_audit|rest_spot_1m|rest_option_chain_1m'` returns the live
+reads; after this change it is **0**, every remaining hit being a tombstone.
+
+**Disposition: REMOVED, not re-pointed, and for the reason §12.12 already
+gives.** It measures `close_to_data_ms` — *how many seconds after a minute
+closed did its data arrive* — which is the exact question the paragraph above
+records as having no surviving equivalent. Re-pointing it at
+`tv_dhan_feed_last_tick_age_secs` would present ARRIVAL freshness as
+minute-close latency, which that same paragraph names as the false-OK this file
+exists to stop. Left in place it returns an empty result for `today()` every
+day, forever — a latency table that is permanently blank, on the tab an
+operator opens to ask whether the box is slow.
+
+Removed with it, as one unit: `REST_LAT_QUERY_MAX_SECS` (the 4-second budget
+that existed only for that curl), `parse_rest_lat_row`, the `RESTLAT_ROW=` arm
+of `parse_latency`, the `rest_latency` JSON field, and the console's REST-pull
+latency table. `LATENCY_TIMEOUT_SECS` is re-derived downward in the same change
+— a timeout sized for a query that no longer runs is a number that no longer
+means anything.
+
+**⚠ What this leaves unwatched, and it is narrower than it looks:** the
+latency tab keeps every BOX-WIDE probe it had — QuestDB round-trip (`QDB=`),
+clock skew (`SKEW=`), the dormant order-placement histogram, and the
+per-socket live WebSocket delivery lag (`WSLAT_RAW=`, sixteen sockets). What
+goes is the per-(feed, leg) REST pull percentile, and nothing replaces it,
+consistent with the paragraph above.
+
+**REJECT, in addition to the list above:** re-adding any `rest_fetch_audit`
+read in any command array; re-pointing the latency table at a tick-age gauge;
+or claiming this file has been audited for retired-table reads without running
+the table-literal grep over the production region of every command array.
+
+#### ⚠ TWO RESIDUALS the removal itself left, both found by counting rather than reading
+
+Acting on the correction above produced two defects of its own. Both are fixed
+in the same change and are recorded because each would read as deliberate to a
+later session, and neither was visible by reading the diff.
+
+**1. A dangling `#[test]`.** The retirement tombstone for
+`test_failed_bucket_excludes_never_attempted_minutes` was written UNDER the
+attribute rather than over it, so the attribute fell through onto the next
+function and `test_errors_render_verbatim_through_esc` carried TWO `#[test]`s.
+It compiled, it ran, and every suite stayed green — a duplicate attribute is
+not an error. It surfaced only when the ratchet delta (−10) failed to match
+the named removals (−11) and the missing one had to be hunted: the annotation
+count and the `fn test_*` count disagreed by exactly one.
+
+**The reusable half:** a retirement tombstone replaces an ITEM, and an item
+starts at its first attribute, not at its `fn`. Writing the tombstone below a
+surviving attribute silently re-parents it.
+
+**2. A dead labeled-line scan.** `parse_feeds_view` built a
+`HashMap<String, String>` from every non-marker line on every call. Its only
+two inputs were ever `REST_AUDIT=` and `REST_LAT_HOUR=`; with those gone,
+`FEEDS_VIEW_COMMANDS` emits marker-delimited JSON and nothing else, so the map
+had no input — and after the classification block was retired it had no reader
+either. Clippy does not flag it: a `HashMap` that is `insert`ed into is
+"used". Removed, with its two rules restated at the site, because re-adding a
+labeled line means re-adding the scan and both rules are easy to miss the
+second time: it must skip BETWEEN the BEGIN/END markers (a `=` inside a JSON
+body is not a field), and any field read that way owes the three-way
+ABSENT / UNPARSEABLE / GENUINELY-EMPTY split.
+
+The same pass rewrote the unreachable arm's comment, which still explained the
+2026-09-08 incident in terms of a third field the reader can no longer find.
+The lesson is kept and re-attached to the two fields that survive.
 
 ### ⚠ What is NOT claimed
 

@@ -87,11 +87,29 @@ pub const SECRET_TTL_SECS: f64 = 60.0;
 pub const VIEW_TIMEOUT_SECS: f64 = 6.0;
 /// legacy: `_VIEW_POLL_SECS = 0.4` — SSM get_command_invocation poll cadence.
 pub const VIEW_POLL_SECS: f64 = 0.4;
-/// legacy: `_LATENCY_TIMEOUT_SECS = 15.0` — the REST-era latency snapshot is
-/// one metrics scrape (3s) + one QuestDB round-trip probe (3s) + chronyc +
-/// one bounded rest_fetch_audit aggregate (4s); worst case ≈ 10-11s incl.
-/// SSM registration — per-curl `--max-time` bounds every leg.
-pub const LATENCY_TIMEOUT_SECS: f64 = 15.0;
+/// SSM RunCommand poll budget for the latency tab.
+///
+/// RE-DERIVED 2026-09-17, and the old figure is worth recording because it
+/// was stale in the DANGEROUS direction. It read "one metrics scrape (3s) +
+/// one QuestDB probe (3s) + chronyc + one bounded rest_fetch_audit aggregate
+/// (4s); worst case ≈ 10-11s" against a 15.0 budget — but the per-socket
+/// `WSLAT_RAW=` metrics curl (another 3s) was added later and never counted,
+/// so the real curl sum was 13s and the true margin was 2s, not the 4-5s the
+/// docstring implied.
+///
+/// Measured from the array itself — `LATENCY_COMMANDS` now carries THREE
+/// `--max-time 3` curls (order-placement metrics, QuestDB round-trip,
+/// per-socket WS lag) after the `rest_fetch_audit` aggregate was removed with
+/// the per-minute REST legs (`no-rest-except-live-feed-2026-06-27.md` §12.12,
+/// dated correction). `chronyc` is local and unbounded-but-instant.
+///
+///   3 + 3 + 3 = 9s of curl + SSM registration ≈ 10-11s worst case.
+///
+/// 12.0 leaves 3s over the curl sum — MORE margin than the 2s the 15.0
+/// actually had, while coming down with the work it budgets for. A timeout
+/// that outlives its commands is not free: it is how long an operator stares
+/// at a spinner when the box is wedged.
+pub const LATENCY_TIMEOUT_SECS: f64 = 12.0;
 
 /// legacy: `_SQL_ALLOWED_PREFIXES` — read-only SQL gate: the first keyword
 /// must be one of these.
@@ -325,8 +343,20 @@ pub fn mint_qdb_link_token_default_ttl(secret: &str, now_epoch: i64) -> String {
 
 // -------------------------------------------------------------- more constants
 
-/// legacy: `_REST_LAT_QUERY_MAX_SECS = 4` (handler.py:441).
-pub const REST_LAT_QUERY_MAX_SECS: u64 = 4;
+// ---- `REST_LAT_QUERY_MAX_SECS` is RETIRED 2026-09-17 ----
+//
+// The 4-second `--max-time` budget on the ONE `rest_fetch_audit` percentile
+// curl in `LATENCY_COMMANDS`. That curl is gone (the ninth retired-table read
+// in `operator_control_commands.rs`; full record in
+// `no-rest-except-live-feed-2026-06-27.md` §12.12's dated correction), so a
+// budget sized for it is a number that no longer bounds anything.
+//
+// The rule it encoded is KEPT and is why this tombstone exists rather than a
+// silent deletion: every on-box curl in a command array carries its own
+// `--max-time`, and the tab's `LATENCY_TIMEOUT_SECS` must stay above their sum
+// plus SSM registration. Adding a query back means adding a budget back and
+// re-deriving that total — never reusing this figure, which was fitted to a
+// query nobody will write again.
 
 /// legacy: `_FEED_API_UNREACHABLE` (handler.py:636-638) — verbatim.
 pub const FEED_API_UNREACHABLE: &str =
@@ -335,26 +365,40 @@ pub const FEED_API_UNREACHABLE: &str =
 /// legacy: `_BOX_UNREACHABLE` (handler.py:639) — verbatim.
 pub const BOX_UNREACHABLE: &str = "box unreachable (SSM offline or instance stopped)";
 
-/// The box answered and the `REST_AUDIT` line was present, but no row could be
-/// read out of it. Distinct from an ABSENT line and from a genuinely empty one:
-/// the query ran and produced something unreadable, which is a shape failure,
-/// not a report of zero pulls.
-pub const REST_AUDIT_UNPARSEABLE: &str = "the box sent a REST_AUDIT line no row could be read from — today's pull count is unknown, not zero";
+// ---- `REST_AUDIT_UNPARSEABLE` / `REST_AUDIT_ABSENT` are RETIRED 2026-09-17 ----
+//
+// The two sentences that kept the console's pull line honest, by separating
+// THREE outcomes the console had once folded into one: the query ran and
+// returned nothing (a real zero), the query answered with something
+// unreadable (a shape failure), and the snapshot carried no line at all (a
+// malformed answer). Only the first was ever "zero pulls today".
+//
+// They retire with the pull line itself — `rest_fetch_audit` has no writer
+// after the operator's SOCKETS-ONLY narrowing (§12.10; §12.11 names the reads
+// REMOVE; the console decision is §12.12).
+//
+// The THREE-OUTCOME RULE they encoded is NOT retired and is the durable part:
+// an absent field, an unparseable field and a genuinely empty one are three
+// different facts, and collapsing them into a confident zero is the exact
+// false-OK that produced the 2026-09-08 false alarm recorded in
+// `parse_feeds_view` below. Any future surface that reports a count read off
+// the box owes the same three-way split.
 
-/// The box answered, but its snapshot carries no `REST_AUDIT` line. Distinct
-/// from [`BOX_UNREACHABLE`]: the box IS reachable and the rest of the snapshot
-/// parsed, so this reports a malformed answer rather than no answer — and,
-/// critically, neither of them reports "zero pulls today".
-pub const REST_AUDIT_ABSENT: &str =
-    "the box snapshot carried no REST_AUDIT line — today's pull count is unknown, not zero";
-
-/// legacy: `_FEEDS_TIMEOUT_SECS = 28.0` (handler.py:685). Budget arithmetic
-/// (review fix M1, 2026-07-16): the snapshot's curls are `--max-time` bounded
-/// at 8s + 8s (app /api/feeds + /api/feeds/health) + 4s + 4s (the two
-/// rest_fetch_audit reads) = 24s worst case, PLUS SSM registration/poll
-/// overhead → 28s. The budget MUST exceed the sum of every `--max-time` in
-/// `FEEDS_VIEW_COMMANDS` (drift-proof test parses them).
-pub const FEEDS_TIMEOUT_SECS: f64 = 28.0;
+/// SSM RunCommand poll budget for the feeds tab.
+///
+/// RE-DERIVED 2026-09-17. The superseded 28.0 was correct arithmetic for a
+/// four-curl array: 8s + 8s (app `/api/feeds` + `/api/feeds/health`) + 4s + 4s
+/// (the two `rest_fetch_audit` reads) = 24s, plus SSM registration → 28s.
+/// Both audit reads were removed with the per-minute REST legs
+/// (`no-rest-except-live-feed-2026-06-27.md` §12.12), leaving:
+///
+///   8 + 8 = 16s of curl + SSM registration ≈ 18-20s worst case.
+///
+/// 20.0 keeps the SAME 4s margin over the curl sum that the 28.0 had over 24.
+/// The budget MUST exceed the sum of every `--max-time` in
+/// `FEEDS_VIEW_COMMANDS`, and the test parses them rather than copying a
+/// number — adding a curl without raising the budget fails the build.
+pub const FEEDS_TIMEOUT_SECS: f64 = 20.0;
 
 /// legacy: `_MAIN_SHA_TTL_SECS = 60.0` (handler.py:875).
 pub const MAIN_SHA_TTL_SECS: f64 = 60.0;
@@ -448,31 +492,33 @@ fn first_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-// The token/hex gate regexes cannot fail to compile; the `Option` +
+// The hex/feed-name gate regexes cannot fail to compile; the `Option` +
 // fail-closed arms exist only to satisfy the no-unwrap/no-expect lints.
-static TOKEN_RE: LazyLock<Option<Regex>> = LazyLock::new(|| Regex::new(r"^[a-z0-9_-]{1,32}$").ok());
 static FEED_NAME_RE: LazyLock<Option<Regex>> =
     LazyLock::new(|| Regex::new(r"^[a-z][a-z0-9_-]{0,31}$").ok());
 static HEX_SHA_RE: LazyLock<Option<Regex>> = LazyLock::new(|| Regex::new(r"^[0-9a-f]{7,40}$").ok());
 
-/// legacy `re.fullmatch(r"[a-z0-9_-]{1,32}", s)` — the feed/leg/outcome
-/// charset gate (defense in depth on our own symbols).
-fn is_token(s: &str) -> bool {
-    TOKEN_RE.as_ref().is_some_and(|re| re.is_match(s))
-}
-
-/// legacy `_num` (handler.py:514-520 / 732-738): ""/null/nan → None, else
-/// float-or-None.
-fn parse_num(s: &str) -> Option<f64> {
-    if s.is_empty() {
-        return None;
-    }
-    let low = s.to_lowercase();
-    if low == "null" || low == "nan" {
-        return None;
-    }
-    s.parse::<f64>().ok()
-}
+// ---- `TOKEN_RE` / `is_token` / `parse_num` are RETIRED 2026-09-17 ----
+//
+// All three existed for `parse_rest_lat_row` and the `rest_fetch_audit`
+// parsers above it, which went with the per-minute REST legs
+// (`no-rest-except-live-feed-2026-06-27.md` §12.12 and its dated correction).
+// `is_token` gated `<feed>`/`<leg>` symbols and `parse_num` turned
+// `""`/`null`/`NaN` into `None` so a percentile that the database could not
+// compute never became a plausible number.
+//
+// BOTH rules are still enforced, by the parsers that survive — which is why
+// this is a tombstone and not a lost guarantee:
+//   * `FEED_NAME_RE` (immediately above) is the SAME charset gate, anchored
+//     tighter (must start with a letter), and `is_feed_name` applies it to
+//     every feed symbol the console renders.
+//   * `parse_ws_lag_rows` drops a malformed Prometheus line rather than
+//     defaulting it, and `prom_label` returns `None` instead of falling back
+//     to connection 0.
+//
+// A future parser needing either must re-derive it against its own input.
+// Reviving these verbatim would import a charset fitted to a wire format
+// (the on-box CSV) that no longer exists.
 
 // ------------------------------------------------------------------ view snap
 
@@ -549,11 +595,11 @@ pub fn parse_view(stdout: &str) -> Value {
         }
     }
     let get = |k: &str| fields.get(k).cloned().unwrap_or_default();
-    let (spot, chain) = (get("SPOT_TODAY"), get("CHAIN_TODAY"));
+    let (ticks, depth) = (get("TICKS_TODAY"), get("DEPTH_TODAY"));
     json!({
         "app": get("APP"),
-        // Official minute candles captured today by the REST pulls — the
-        // TWO live tables, per table + per feed. See VIEW_COMMANDS.
+        // Rows captured today by the LIVE socket lane — the two live tables,
+        // per table + per feed. See VIEW_COMMANDS.
         //
         // 2026-09-03: `contracts` is GONE from all three fields, not zeroed.
         // `rest_option_contract_1m` has had no DDL caller and no writer since
@@ -562,12 +608,29 @@ pub fn parse_view(stdout: &str) -> Value {
         // exists — and a zero an operator cannot distinguish from a real
         // outage is worse than an absent field. Rationale + the measurement
         // live on VIEW_COMMANDS in operator_control_commands.rs.
-        "rows_today": {"spot": spot, "chain": chain},
-        "rows_today_total": sum_counts(&[&spot, &chain]),
+        //
+        // ⚠ 2026-09-17: these fields are RE-POINTED, not merely renamed. They
+        // read `rest_spot_1m` / `rest_option_chain_1m` until the operator's
+        // SOCKETS-ONLY narrowing removed both writers
+        // (`no-rest-except-live-feed-2026-06-27.md` §12.10; the decision and
+        // its alternatives are §12.12). Both tables are RETAINED and hold real
+        // history, so these queries did not ERROR — they returned a permanent
+        // zero for `today()`, which is the 2026-09-03 paragraph above arriving
+        // a second time and in its worse form. The names move WITH the
+        // queries: a re-pointed read under its old name is the stale-name trap
+        // §12.8(a)/§12.9(a) record, and an operator reading "spot" would
+        // believe they were looking at the retired REST leg.
+        "rows_today": {"ticks": ticks, "depth": depth},
+        "rows_today_total": sum_counts(&[&ticks, &depth]),
         "rows_by_feed": {
-            "spot": parse_feed_counts(&get("SPOT_BY_FEED")),
-            "chain": parse_feed_counts(&get("CHAIN_BY_FEED")),
+            "ticks": parse_feed_counts(&get("TICKS_BY_FEED")),
         },
+        // Upsert-key count for `ticks` — FIVE columns
+        // (ts, security_id, segment, capture_seq, feed), per
+        // `tick_persistence::DEDUP_KEY_TICKS` and pinned by
+        // `questdb_init_script_guard.rs`. The expectation moves 4 → 5 with the
+        // re-point; keeping the 4 would have shown a red "DEDUP disabled /
+        // schema drift" shield on a perfectly healthy box, every day.
         "dedup_key_columns": get("DEDUP_KEYS"),
         "recent_errors": errors,
     })
@@ -583,34 +646,19 @@ pub fn avg_ns(sum_v: &str, count_v: &str) -> Option<f64> {
     if c > 0.0 { Some(s / c) } else { None }
 }
 
-/// legacy: `_parse_rest_lat_row` (handler.py:496-532) — parse one
-/// `<feed>,<leg>,<ok_rows>,<p50>,<p99>` CSV line (latency in MILLISECONDS —
-/// close_to_data_ms is stored in ms), or None for anything malformed — a
-/// failed on-box query yields nothing, never a fabricated row.
-pub fn parse_rest_lat_row(raw: &str) -> Option<Value> {
-    let parts: Vec<&str> = raw.split(',').map(|p| p.trim().trim_matches('"')).collect();
-    if parts.len() != 5 {
-        return None;
-    }
-    let (feed, leg) = (parts[0], parts[1]);
-    if !is_token(feed) || !is_token(leg) {
-        return None;
-    }
-    let rows = parse_num(parts[2])?;
-    if rows < 0.0 {
-        return None;
-    }
-    let (p50, p99) = (parse_num(parts[3]), parse_num(parts[4]));
-    Some(json!({
-        "feed": feed,
-        "leg": leg,
-        // legacy `int(rows)` truncation; `as i64` saturates on the untested
-        // inf edge instead of raising.
-        "ok_rows": rows as i64,
-        "p50_ms": p50.map(round1),
-        "p99_ms": p99.map(round1),
-    }))
-}
+// ---- `parse_rest_lat_row` is RETIRED 2026-09-17 ----
+//
+// It parsed one `<feed>,<leg>,<ok_rows>,<p50>,<p99>` line out of the
+// `RESTLAT_ROW=` stream. Its producer — the `rest_fetch_audit` percentile
+// curl — was removed with the per-minute REST legs
+// (`no-rest-except-live-feed-2026-06-27.md` §12.12, dated correction), so
+// nothing emits that prefix any more.
+//
+// The DISCIPLINE it carried is preserved by its siblings and is restated here
+// because it is the durable half: a malformed on-box line yielded `None` and
+// the row was DROPPED — never defaulted, never half-parsed into a plausible
+// wrong number. `parse_ws_lag_rows` and `parse_feed_counts` still hold that
+// line, and any future latency parser must.
 
 /// legacy: `sec_to_ms` inside `_parse_latency` (handler.py:567-571) —
 /// `f"{float(s) * 1000:.1f}"`, "" on unparseable.
@@ -776,23 +824,24 @@ fn parse_ws_lag_rows(raw: &[String]) -> Vec<Value> {
 }
 
 /// legacy: `_parse_latency` (handler.py:535-585) — parse the labeled latency
-/// snapshot. RESTLAT_ROW lines carry the per-(feed, leg) rest_fetch_audit
-/// aggregate; the METRICS block carries the dormant order-placement
+/// snapshot. WSLAT_RAW lines carry the per-socket live delivery-lag histogram
+/// and gauges; the METRICS block carries the dormant order-placement
 /// histogram. Empty stdout (box stopped) degrades to an empty table + blank
 /// shields — the page says so honestly instead of fabricating numbers.
+///
+/// 2026-09-17: the `RESTLAT_ROW=` aggregate is no longer parsed — its
+/// `rest_fetch_audit` producer went with the per-minute REST legs.
 pub fn parse_latency(stdout: &str) -> Value {
     let mut metrics: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut rest_rows: Vec<Value> = Vec::new();
     let mut fields: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut ws_raw: Vec<String> = Vec::new();
     let mut in_metrics = false;
     for line in stdout.lines() {
-        if let Some(rest) = line.strip_prefix("RESTLAT_ROW=") {
-            if let Some(row) = parse_rest_lat_row(rest) {
-                rest_rows.push(row);
-            }
-            continue;
-        }
+        // 2026-09-17: the `RESTLAT_ROW=` arm is GONE with its producer. An
+        // older Lambda build still emitting the prefix now falls through to
+        // the generic `k=v` arm below and lands in `fields`, where nothing
+        // reads it — ignored, never rendered, and never surfaced as a
+        // latency row sourced from a table with no writer.
         if let Some(raw) = line.strip_prefix("WSLAT_RAW=") {
             ws_raw.push(raw.to_string());
             continue;
@@ -825,10 +874,12 @@ pub fn parse_latency(stdout: &str) -> Value {
             .map_or("", String::as_str),
     );
     json!({
-        // Per-(feed, leg) "how fast after each minute closed" rows. Empty
-        // list = the box returned no rows (stopped box, empty fetch log, or
-        // query failed) — the page says so honestly.
-        "rest_latency": rest_rows,
+        // 2026-09-17: the `rest_latency` field is GONE, not emptied. It
+        // carried per-(feed, leg) "how fast after each minute closed"
+        // percentiles from `rest_fetch_audit`; with no per-minute fetch left
+        // to time, an always-`[]` field would read as "the pulls ran and were
+        // never late" — the zero-an-operator-cannot-distinguish class this
+        // file records twice above.
         // Per-SOCKET live-feed delivery lag. Empty list = the lane produced no
         // ticks (feed off, box stopped, or /metrics unreachable) — the page
         // says that rather than showing a comforting zero.
@@ -887,73 +938,19 @@ pub fn extract_marked_json(stdout: &str, begin: &str, end: &str) -> (Value, Stri
     }
 }
 
-/// legacy: `_parse_rest_audit` (handler.py:702-723) — parse the REST_AUDIT
-/// value (';'-joined `feed,outcome,count` CSV rows) into
-/// {feed: {outcome: count_int}}. Charset-validated; malformed fragments are
-/// skipped so an empty/absent value yields {} — the card then says "no pulls
-/// recorded today" instead of fabricated zeros (audit Rule 11).
-pub fn parse_rest_audit(raw: &str) -> Value {
-    let mut out = serde_json::Map::new();
-    for part in raw.split(';') {
-        let parts: Vec<&str> = part
-            .trim()
-            .split(',')
-            .map(|p| p.trim().trim_matches('"'))
-            .collect();
-        if parts.len() != 3 {
-            continue;
-        }
-        let (feed, outcome, cnt) = (parts[0], parts[1], parts[2]);
-        if !is_token(feed) || !is_token(outcome) {
-            continue;
-        }
-        if cnt.is_empty() || !cnt.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        let Ok(n) = cnt.parse::<i64>() else {
-            continue;
-        };
-        if let Some(m) = out
-            .entry(feed.to_string())
-            .or_insert_with(|| Value::Object(serde_json::Map::new()))
-            .as_object_mut()
-        {
-            m.insert(outcome.to_string(), Value::Number(n.into()));
-        }
-    }
-    Value::Object(out)
-}
-
-/// legacy: `_parse_rest_lat_hour` (handler.py:726-755) — parse the
-/// REST_LAT_HOUR value (';'-joined `feed,p50,p99` CSV rows, milliseconds)
-/// into {feed: {p50_ms, p99_ms}}. Malformed fragments skipped, never
-/// fabricated.
-pub fn parse_rest_lat_hour(raw: &str) -> Value {
-    let mut out = serde_json::Map::new();
-    for part in raw.split(';') {
-        let parts: Vec<&str> = part
-            .trim()
-            .split(',')
-            .map(|p| p.trim().trim_matches('"'))
-            .collect();
-        if parts.len() != 3 {
-            continue;
-        }
-        let feed = parts[0];
-        if !is_token(feed) {
-            continue;
-        }
-        let (p50, p99) = (parse_num(parts[1]), parse_num(parts[2]));
-        if p50.is_none() && p99.is_none() {
-            continue;
-        }
-        out.insert(
-            feed.to_string(),
-            json!({"p50_ms": p50.map(round1), "p99_ms": p99.map(round1)}),
-        );
-    }
-    Value::Object(out)
-}
+// ---- `parse_rest_audit` and `parse_rest_lat_hour` are RETIRED 2026-09-17 ----
+//
+// They turned the two `rest_fetch_audit` snapshot lines into
+// `{feed: {outcome: count}}` and `{feed: {p50_ms, p99_ms}}`. Both sources are
+// gone with the per-minute REST legs (§12.10 / §12.11 / §12.12).
+//
+// Their shared DISCIPLINE is not retired and binds every future snapshot
+// parser here: charset-validate each fragment, SKIP anything malformed, and
+// let an empty input yield an empty map — never a fabricated zero row. The
+// caller, not the parser, decides what an empty map MEANS.
+//
+// `parse_feed_counts` below is the surviving example of that shape and is
+// still in use by the Data tab.
 
 /// legacy: `_parse_feeds_view` (handler.py:758-798) — parse the marked
 /// feeds-view snapshot. On any failure the matching *_error field carries a
@@ -967,86 +964,45 @@ pub fn parse_feeds_view(stdout: &str) -> Value {
             "feeds_error": BOX_UNREACHABLE,
             "health": null,
             "health_error": BOX_UNREACHABLE,
-            // `null` + an error field, exactly like the two above it.
+            // Both fields are `null` + a STRUCTURED error, never an empty map.
             //
-            // This read `{}` until 2026-09-08, and the console renders an empty
-            // map as the sentence "no official-candle pulls recorded today" —
-            // so an UNREADABLE box and a box that genuinely pulled nothing
-            // produced the identical words.
+            // That shape is the 2026-09-08 lesson, kept after the third field
+            // that taught it was retired with the REST legs: an empty map
+            // renders as a SENTENCE ("no ... recorded today"), so a blind read
+            // and a genuinely idle lane produce identical words. The operator
+            // read that sentence for a whole morning while the lane was
+            // healthy and flushing every minute.
             //
-            // On 2026-09-08 the operator read that sentence while the cadence
-            // lane was healthy: the per-minute decision line ran continuously
-            // (11:09 → 11:16 IST, `rows=1510`, `unknown=0`) and
-            // `tv_rest_1m_fire_heartbeat` read 1.0 from 09:15 IST — a gauge its
-            // own emit site sets ONLY after a `spot_1m_rest` flush ACK. Rows
-            // were being fetched and persisted the whole time.
-            //
-            // A false ALARM manufactured by an unreadable data path is the
-            // inverse of the false-OK the rest of this file is built to avoid,
-            // and it costs the same thing: trust in the surface. The two fields
-            // above already knew that; this one was left behind.
-            "rest_audit": null,
-            "rest_audit_error": BOX_UNREACHABLE,
-            "rest_lat_hour": null,
-            "rest_lat_hour_error": BOX_UNREACHABLE,
+            // A false ALARM manufactured by an unreadable data path costs the
+            // same thing a false OK does: trust in the surface. Any field
+            // added here owes the same three-way split — see the retired
+            // feeds-card tests in this file's test module for the full record.
         });
     }
     let (feeds, feeds_error) = extract_marked_json(stdout, "FEEDS_BEGIN", "FEEDS_END");
     let (health, health_error) =
         extract_marked_json(stdout, "FEEDS_HEALTH_BEGIN", "FEEDS_HEALTH_END");
-    let mut fields: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut in_block = false;
-    for line in stdout.lines() {
-        // Skip the marker-delimited JSON blocks — a JSON body containing '='
-        // must never be mistaken for a labeled line.
-        if line == "FEEDS_BEGIN" || line == "FEEDS_HEALTH_BEGIN" {
-            in_block = true;
-            continue;
-        }
-        if line == "FEEDS_END" || line == "FEEDS_HEALTH_END" {
-            in_block = false;
-            continue;
-        }
-        if in_block {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once('=') {
-            fields.insert(k.trim().to_string(), v.trim().to_string());
-        }
-    }
-    // THREE outcomes, not two. The console renders an empty map as the
-    // sentence "no official-candle pulls recorded today", so anything that
-    // degrades to `{}` becomes a claim about the LANE rather than about the
-    // READ — and on 2026-09-08 that claim was false while the lane was
-    // persisting every minute.
-    let (rest_audit, rest_audit_error) = match fields.get("REST_AUDIT") {
-        // Present and empty: the box ran the query and it returned no rows.
-        // The only one of the three that genuinely means "zero pulls".
-        Some(raw) if raw.is_empty() => (json!({}), Value::Null),
-        Some(raw) => {
-            let parsed = parse_rest_audit(raw);
-            if parsed.as_object().is_some_and(serde_json::Map::is_empty) {
-                // Non-empty input that yielded no row is a SHAPE failure —
-                // the query answered with something we cannot read. Reporting
-                // it as zero would be inventing the answer.
-                (Value::Null, json!(REST_AUDIT_UNPARSEABLE))
-            } else {
-                (parsed, Value::Null)
-            }
-        }
-        // No `REST_AUDIT` line at all. `map_or("")` used to fold this into the
-        // empty-string arm above, which is how an unreadable snapshot came to
-        // render as a confident zero.
-        None => (Value::Null, json!(REST_AUDIT_ABSENT)),
-    };
+    // ⚠ 2026-09-17: the labeled-line scan that stood here is REMOVED with the
+    // only two lines it ever read — `REST_AUDIT=` and `REST_LAT_HOUR=`, both
+    // sourced from `rest_fetch_audit`, whose writer went with the per-minute
+    // REST legs (`no-rest-except-live-feed-2026-06-27.md` §12.12). Every
+    // command in `FEEDS_VIEW_COMMANDS` now emits marker-delimited JSON and
+    // nothing else, so the scan had no input and its output had no reader:
+    // a `HashMap` built on every call and dropped unread.
+    //
+    // TWO RULES it encoded, restated because re-adding a labeled line means
+    // re-adding the scan and both are easy to miss the second time:
+    //
+    //   1. The scan MUST skip between the BEGIN/END markers. A '=' inside a
+    //      JSON body is not a labeled line, and a body carrying one would
+    //      otherwise register a phantom field.
+    //   2. A field read that way owes the three-way ABSENT / UNPARSEABLE /
+    //      GENUINELY-EMPTY split — see the unreachable arm above.
     json!({
         "feeds": feeds,
         "feeds_error": feeds_error,
         "health": health,
         "health_error": health_error,
-        "rest_audit": rest_audit,
-        "rest_audit_error": rest_audit_error,
-        "rest_lat_hour": parse_rest_lat_hour(fields.get("REST_LAT_HOUR").map_or("", String::as_str)),
     })
 }
 
@@ -2439,9 +2395,7 @@ mod tests {
     use crate::operator_control_action_commands::{
         DOCKER_NUKE_BARE_COMMANDS, DOCKER_RESET_COMMANDS, WIPE_QUESTDB_COMMANDS,
     };
-    use crate::operator_control_commands::{
-        FEEDS_VIEW_COMMANDS, LATENCY_COMMANDS, REST_LATENCY_SQL, VIEW_COMMANDS,
-    };
+    use crate::operator_control_commands::{FEEDS_VIEW_COMMANDS, LATENCY_COMMANDS, VIEW_COMMANDS};
 
     // ------------------------------------------------------------ MockShell
     // The legacy tests monkeypatched module globals (`_control_secret`,
@@ -2720,56 +2674,94 @@ mod tests {
         // reported no official-candle pulls all morning while the cadence lane
         // was persisting every minute — `tv_rest_1m_fire_heartbeat` read 1.0
         // from 09:15 IST, and that gauge is set only after a flush ACK.
+        // RE-BLESSED 2026-09-17 — the SOCKETS-ONLY console re-point.
+        //
+        // 48,906 -> 46,394 bytes. The console SHRANK by 2,512, which is the
+        // shape a removal PR should have: three surfaces whose source tables
+        // lost their writers under the operator's narrowing
+        // (`no-rest-except-live-feed-2026-06-27.md` §12.12 and its dated
+        // correction) are gone, and nothing was added to explain them here —
+        // the reasoning lives in the Rust files, which carry no shrink-only
+        // budget. The two failed 2026-09-08 re-blesses recorded above are why
+        // that distinction is kept.
+        //
+        // What left the file:
+        //   1. the per-(broker, pull type) REST latency table and its caption
+        //      (`rest_fetch_audit`);
+        //   2. the feed card's "pulls today: N ok · N failed" line and its
+        //      `rest_audit_error` strip entry (same source);
+        //   3. nothing else — the Data tab was RE-POINTED in place, so its
+        //      bars, hero and dedup shield keep their markup and only their
+        //      keys, table names and the 4 -> 5 expectation moved.
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CONSOLE_HTML.as_bytes());
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "00fab846feff040798808376562788db436781de7c7dffd84a52970faf9c6084"
+            "b364d3dacb24fb069f8374de122f32eb389eb2c35302018a00dd2e375e2bede1"
         );
-        assert_eq!(CONSOLE_HTML.len(), 48_906);
+        assert_eq!(CONSOLE_HTML.len(), 46_394);
     }
 
     // --------------------------------------------------------- class ParseView
     #[test]
     fn test_parses_labeled_snapshot() {
-        // REST-era snapshot (2026-07-16; contract leg dropped 2026-09-03):
-        // today's rows in the LIVE tables, totals + per-feed split, the
-        // 4-column dedup-key count. The stdout deliberately still CARRIES
-        // the retired CONTRACT_* labels — a box running an older Lambda
-        // build, or a stale in-flight SSM invocation, can still emit them,
-        // and the parser must ignore an unknown label rather than surface it.
+        // LIVE-LANE snapshot (re-pointed 2026-09-17): today's rows in the two
+        // SOCKET tables, the total, the per-feed split, and the FIVE-column
+        // dedup-key count for `ticks`.
+        //
+        // The stdout deliberately still CARRIES the retired REST-era labels
+        // (`SPOT_TODAY` / `CHAIN_TODAY` / `CONTRACT_*` / `*_BY_FEED`). A box
+        // running an older Lambda build, or a stale in-flight SSM invocation,
+        // emits exactly that shape, and the parser must IGNORE an unknown
+        // label rather than surface it. That is why the fixture keeps them
+        // rather than being tidied to the new names only: the re-point is a
+        // rolling deploy, and the first minutes of it look like this.
         let stdout = concat!(
             "APP=active\n",
-            "SPOT_TODAY=1125\n",
-            "CHAIN_TODAY=42000\n",
+            "TICKS_TODAY=1125\n",
+            "DEPTH_TODAY=42000\n",
+            "SPOT_TODAY=7\n",
+            "CHAIN_TODAY=9\n",
             "CONTRACT_TODAY=9000\n",
-            "SPOT_BY_FEED=\"dhan\",750;\"groww\",375;\n",
+            "TICKS_BY_FEED=\"dhan\",750;\"groww\",375;\n",
+            "SPOT_BY_FEED=\"dhan\",4;\n",
             "CHAIN_BY_FEED=\"dhan\",21000;\"groww\",21000;\n",
             "CONTRACT_BY_FEED=\"groww\",9000;\n",
-            "DEDUP_KEYS=4\n",
+            "DEDUP_KEYS=5\n",
             "ERRORS_BEGIN\n",
             "Jun 01 11:00 tickvault: WARN something\n",
             "ERRORS_END\n",
         );
         let out = parse_view(stdout);
         assert_eq!(out["app"], "active");
-        assert_eq!(out["rows_today"], json!({"spot": "1125", "chain": "42000"}));
-        // 43125, NOT 52125: the retired contract label is present in the
-        // stdout above and must contribute nothing.
+        assert_eq!(
+            out["rows_today"],
+            json!({"ticks": "1125", "depth": "42000"})
+        );
+        // 43125, NOT 52141: every retired label above is present in the stdout
+        // and must contribute nothing — the sum is the two LIVE counts alone.
         assert_eq!(out["rows_today_total"], "43125");
         assert_eq!(
-            out["rows_by_feed"]["spot"],
+            out["rows_by_feed"]["ticks"],
             json!({"dhan": "750", "groww": "375"})
         );
-        assert_eq!(
-            out["rows_by_feed"]["chain"],
-            json!({"dhan": "21000", "groww": "21000"})
-        );
-        // The retired contract leg renders as ABSENT, never as an empty map:
-        // a `{}` would read as "the leg ran and captured nothing".
-        assert!(out["rows_by_feed"].get("contracts").is_none());
-        assert!(out["rows_today"].get("contracts").is_none());
-        assert_eq!(out["dedup_key_columns"], "4");
+        // The retired legs render as ABSENT, never as an empty map: a `{}`
+        // would read as "the leg ran and captured nothing".
+        for gone in ["spot", "chain", "contracts"] {
+            assert!(
+                out["rows_by_feed"].get(gone).is_none(),
+                "rows_by_feed must not carry the retired `{gone}` leg"
+            );
+            assert!(
+                out["rows_today"].get(gone).is_none(),
+                "rows_today must not carry the retired `{gone}` leg"
+            );
+        }
+        // FIVE, not four — `DEDUP_KEY_TICKS` is
+        // (ts, security_id, segment, capture_seq, feed). The 4 the REST-era
+        // console expected would have shown a red schema-drift shield on a
+        // perfectly healthy box, every day.
+        assert_eq!(out["dedup_key_columns"], "5");
         assert_eq!(out["recent_errors"].as_array().unwrap().len(), 1);
         assert!(
             out["recent_errors"][0]
@@ -2785,9 +2777,9 @@ mod tests {
         let out = parse_view("");
         assert_eq!(out["app"], "");
         assert_eq!(out["dedup_key_columns"], "");
-        assert_eq!(out["rows_today"], json!({"spot": "", "chain": ""}));
+        assert_eq!(out["rows_today"], json!({"ticks": "", "depth": ""}));
         assert_eq!(out["rows_today_total"], "");
-        assert_eq!(out["rows_by_feed"], json!({"spot": {}, "chain": {}}));
+        assert_eq!(out["rows_by_feed"], json!({"ticks": {}}));
         assert_eq!(out["recent_errors"], json!([]));
     }
 
@@ -2795,8 +2787,8 @@ mod tests {
     fn test_partial_counts_sum_only_parseable() {
         // One table unreachable (empty value) — the total sums the rest,
         // never treating an unreachable count as 0-and-green. The retired
-        // CONTRACT_TODAY label is fed in deliberately and must not be summed.
-        let out = parse_view("SPOT_TODAY=100\nCHAIN_TODAY=\nCONTRACT_TODAY=23\n");
+        // REST-era labels are fed in deliberately and must not be summed.
+        let out = parse_view("TICKS_TODAY=100\nDEPTH_TODAY=\nSPOT_TODAY=23\nCONTRACT_TODAY=23\n");
         assert_eq!(out["rows_today_total"], "100");
     }
 
@@ -2898,41 +2890,78 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_key_query_targets_rest_spot_1m() {
-        // REST-era repoint (2026-07-16): the shield reads rest_spot_1m's
-        // 4-column key (ts, security_id, exchange_segment, feed per
-        // DEDUP_KEY_SPOT_1M_REST), not the retired ticks 5-column key.
+    fn test_dedup_key_query_targets_ticks() {
+        // RE-POINTED 2026-09-17 (renamed with its subject). It read
+        // `rest_spot_1m`'s 4-column key from 2026-07-16 until the operator's
+        // SOCKETS-ONLY narrowing removed that table's writer
+        // (`no-rest-except-live-feed-2026-06-27.md` \u00a712.12). The shield now
+        // reads `ticks`, whose key is FIVE columns
+        // (ts, security_id, segment, capture_seq, feed) per
+        // `DEDUP_KEY_TICKS`, pinned by `questdb_init_script_guard.rs`.
+        //
+        // The column COUNT matters as much as the table: a re-point that kept
+        // the 4-column expectation would have shown a red "schema drift"
+        // shield on a perfectly healthy box, every day.
         let dedup_cmd = VIEW_COMMANDS
             .iter()
             .find(|c| c.contains("DEDUP_KEYS="))
             .unwrap();
-        assert!(dedup_cmd.contains("table_columns(%27rest_spot_1m%27)"));
-        assert!(!dedup_cmd.contains("'ticks'"));
+        assert!(dedup_cmd.contains("table_columns(%27ticks%27)"));
+        assert!(!dedup_cmd.contains("rest_spot_1m"));
+        assert!(dedup_cmd.contains("upsertKey"));
     }
 
     #[test]
-    fn test_view_commands_target_live_rest_tables() {
+    fn test_view_commands_target_live_socket_tables() {
+        // RE-POINTED 2026-09-17 (renamed with its subject). It required
+        // `rest_spot_1m` and `rest_option_chain_1m` — the two per-minute REST
+        // tables — until the operator's SOCKETS-ONLY narrowing removed both
+        // writers (`no-rest-except-live-feed-2026-06-27.md` §12.12).
         let joined = VIEW_COMMANDS.join("\n");
-        for live in ["rest_spot_1m", "rest_option_chain_1m"] {
+        for live in ["FROM%20ticks", "FROM%20market_depth"] {
             assert!(joined.contains(live), "{live}");
         }
-        // 2026-09-03: and it must query NOTHING that has no writer. The view
-        // is the operator's read of "what did we capture today"; a query
-        // against a table that cannot exist renders a blank the operator
-        // cannot tell from a real capture failure. Re-adding this needs the
-        // per-contract leg itself back first — see VIEW_COMMANDS.
-        assert!(
-            !joined.contains("rest_option_contract_1m"),
-            "the view queried a table with no DDL caller and no writer"
-        );
+        // The rule this test has always enforced, now pointed the other way:
+        // the view must query NOTHING that has no writer. It is the
+        // operator's read of "what did we capture today", and a query against
+        // a writerless table renders a permanent zero the operator cannot
+        // tell from a real capture failure.
+        //
+        // All three REST tables are RETAINED and hold real history, so these
+        // queries did not ERROR — they returned 0 for `today()`, forever,
+        // which is the WORSE shape. Re-adding any of them needs its writer
+        // back first.
+        for dead in [
+            "rest_spot_1m",
+            "rest_option_chain_1m",
+            "rest_option_contract_1m",
+            "rest_fetch_audit",
+        ] {
+            assert!(
+                !joined.contains(dead),
+                "the view queried `{dead}`, which has no writer"
+            );
+        }
         // Today windows use the house `ts IN today()` convention.
         assert!(joined.contains("ts%20IN%20today()"));
     }
 
     #[test]
     fn test_db_console_default_query_targets_live_table() {
-        assert!(CONSOLE_HTML.contains("SELECT * FROM rest_spot_1m ORDER BY ts DESC LIMIT 50"));
-        assert!(!CONSOLE_HTML.contains("SELECT * FROM ticks ORDER BY ts DESC LIMIT 50"));
+        // ⚠ INVERTED 2026-09-17, same sign-flip as
+        // `test_view_sql_targets_no_dead_tables`: this test required
+        // `rest_spot_1m` and BANNED `ticks` — correct when the live feed was
+        // retired, and exactly backwards now that the SOCKETS-ONLY narrowing
+        // has removed the REST writers (§12.12).
+        //
+        // The RULE is unchanged and is why the default query matters at all:
+        // it is the first thing an operator sees when the Data tab opens, so
+        // it must hit a table that is guaranteed to have a writer. A default
+        // that returns a permanent empty result teaches them the button is
+        // broken; on a FRESH volume `rest_spot_1m` would not exist at all and
+        // the query would error outright.
+        assert!(CONSOLE_HTML.contains("SELECT * FROM ticks ORDER BY ts DESC LIMIT 50"));
+        assert!(!CONSOLE_HTML.contains("FROM rest_spot_1m"));
     }
 
     // ------------------------------------------------------- class RestLatency
@@ -2946,32 +2975,49 @@ mod tests {
         assert_eq!(avg_ns("", ""), None);
     }
 
-    #[test]
-    fn test_rest_latency_sql_filters_ok_and_sentinel() {
-        // outcome='ok' rows only; close_to_data_ms >= 0 drops the -1
-        // not-measured sentinel AND satisfies approx_percentile's
-        // non-negative-input requirement; today window + per-(feed, leg).
-        let sql = REST_LATENCY_SQL;
-        assert!(sql.contains("from rest_fetch_audit"));
-        assert!(sql.contains("outcome = 'ok'"));
-        assert!(sql.contains("close_to_data_ms >= 0"));
-        assert!(sql.contains("approx_percentile(close_to_data_ms, 0.5, 3)"));
-        assert!(sql.contains("approx_percentile(close_to_data_ms, 0.99, 3)"));
-        assert!(sql.contains("ts in today()"));
-        assert!(sql.contains("group by feed, leg"));
-    }
+    // ---- `test_rest_latency_sql_filters_ok_and_sentinel` is RETIRED
+    // ---- 2026-09-17 ----
+    //
+    // It pinned the shape of `REST_LATENCY_SQL`: `outcome = 'ok'` rows only,
+    // `close_to_data_ms >= 0` (which BOTH drops the -1 not-measured sentinel
+    // AND satisfies `approx_percentile`'s non-negative-input requirement), the
+    // `today()` window, and the `(feed, leg)` grouping.
+    //
+    // The const is gone with the rest of the `rest_fetch_audit` reads
+    // (`no-rest-except-live-teed-2026-06-27.md` §12.12, dated correction).
+    //
+    // WHAT THIS LEAVES UNWATCHED, stated rather than implied: nothing checks
+    // that a FUTURE percentile query filters its not-measured sentinel before
+    // aggregating. That rule is not obvious — a `-1` sentinel silently drags
+    // a p50 negative and `approx_percentile` rejects the input outright — so
+    // if any percentile-over-a-sentinel-bearing-column query is ever written,
+    // this test is the shape to restore.
 
     #[test]
     fn test_latency_commands_rest_era_bounded() {
         let joined = LATENCY_COMMANDS.join("\n");
-        // The audit aggregate is re-emitted as RESTLAT_ROW= labeled lines,
-        // every curl is --max-time bounded, and the box-wide probes are kept.
-        assert!(joined.contains("RESTLAT_ROW="));
-        assert!(joined.contains("rest_fetch_audit"));
+        // NARROWED 2026-09-17: the two `RESTLAT_ROW=` / `rest_fetch_audit`
+        // assertions are gone with the curl they pinned. Everything below is
+        // UNCHANGED and is why this test was narrowed rather than deleted —
+        // none of it ever depended on the REST leg.
+        //
+        // Every curl stays `--max-time` bounded, and the box-wide probes are
+        // kept: an operator asking "is the box slow?" still gets the QuestDB
+        // round-trip, the clock skew and the order-placement histogram.
         assert!(joined.contains("--max-time"));
         assert!(joined.contains("QDB="));
         assert!(joined.contains("SKEW="));
         assert!(joined.contains("tv_order_placement_duration_ns"));
+        // The per-socket live delivery lag is the tab's primary table now
+        // that the REST percentiles are gone — pinned so a future edit
+        // cannot leave the tab with no latency measurement at all.
+        assert!(joined.contains("WSLAT_RAW="));
+        // A retired table must never be read from this array again. The
+        // `rest_fetch_audit` needle is the one this test could not have
+        // caught before: it was an ASSERTED-PRESENT string until today.
+        assert!(!joined.contains("rest_fetch_audit"));
+        assert!(!joined.contains("rest_spot_1m"));
+        assert!(!joined.contains("rest_option_chain_1m"));
         // The retired live-feed probes must never be dialed again.
         assert!(!joined.contains("api-feed.dhan.co"));
         assert!(!joined.contains("socket-api.groww.in"));
@@ -2981,51 +3027,52 @@ mod tests {
 
     #[test]
     fn test_latency_timeout_reduced_with_margin() {
-        // No 25s WS-probe fan-out anymore — worst case is one 3s metrics curl
-        // + one 3s QDB probe + one 4s audit read + SSM registration.
-        assert_eq!(LATENCY_TIMEOUT_SECS, 15.0);
-        assert_eq!(REST_LAT_QUERY_MAX_SECS, 4);
-    }
-
-    #[test]
-    fn test_parse_rest_lat_row_happy() {
-        let row = parse_rest_lat_row("\"dhan\",\"spot_1m\",370,1450.04,5200.55").unwrap();
-        assert_eq!(
-            row,
-            json!({
-                "feed": "dhan",
-                "leg": "spot_1m",
-                "ok_rows": 370,
-                "p50_ms": 1450.0,
-                "p99_ms": 5200.6,
+        // RE-DERIVED 2026-09-17 with the rest_fetch_audit aggregate removed:
+        // three `--max-time 3` curls (order metrics, QuestDB probe, WS lag)
+        // = 9s + SSM registration. See the const's own docstring for why the
+        // superseded 15.0 was stale in the dangerous direction.
+        //
+        // The budget is asserted against the ARRAY, not against a copied
+        // number: a future curl added without raising the timeout fails here
+        // rather than silently eating the margin, which is exactly how the
+        // WSLAT curl slipped in under the old figure.
+        let curl_budget: f64 = LATENCY_COMMANDS
+            .iter()
+            .flat_map(|c| c.split("--max-time ").skip(1))
+            .filter_map(|rest| {
+                rest.split_whitespace()
+                    .next()
+                    .and_then(|n| n.parse::<f64>().ok())
             })
+            .sum();
+        assert_eq!(curl_budget, 9.0, "LATENCY_COMMANDS curl budget");
+        assert_eq!(LATENCY_TIMEOUT_SECS, 12.0);
+        assert!(
+            LATENCY_TIMEOUT_SECS > curl_budget,
+            "the poll budget must outlast the commands it polls \
+             ({LATENCY_TIMEOUT_SECS} vs {curl_budget})"
         );
     }
 
-    #[test]
-    fn test_parse_rest_lat_row_null_percentiles_degrade_to_none() {
-        let row = parse_rest_lat_row("groww,chain_1m,0,null,NaN").unwrap();
-        assert_eq!(row["ok_rows"], 0);
-        assert_eq!(row["p50_ms"], Value::Null);
-        assert_eq!(row["p99_ms"], Value::Null);
-    }
-
-    #[test]
-    fn test_parse_rest_lat_row_rejects_malformed_and_bad_tokens() {
-        // Malformed on-box output yields NOTHING — never a fabricated row.
-        for bad in [
-            "",
-            "a,b",
-            "dhan,spot_1m,x,1,2",
-            "DH AN,leg,1,2,3",
-            "<script>,leg,1,2,3",
-            "dhan,<b>leg</b>,1,2,3",
-            "dhan,leg,-5,1,2",
-            "dhan,leg,1,2,3,4",
-        ] {
-            assert!(parse_rest_lat_row(bad).is_none(), "{bad:?}");
-        }
-    }
+    // ---- the three `parse_rest_lat_row` tests are RETIRED 2026-09-17 ----
+    //
+    // `..._happy`, `..._null_percentiles_degrade_to_none` and
+    // `..._rejects_malformed_and_bad_tokens` covered the `RESTLAT_ROW=` CSV
+    // parser, which went with its `rest_fetch_audit` producer
+    // (`no-rest-except-live-feed-2026-06-27.md` §12.12, dated correction).
+    //
+    // The two rules they enforced are PRESERVED by the socket-lag tests that
+    // follow, which is why this is a tombstone and not a lost guarantee:
+    //   * a `null`/`NaN` percentile the database could not compute renders as
+    //     ABSENT, never as 0 (`..._degrade_to_none` → the `+Inf` and
+    //     missing-count arms below);
+    //   * a malformed on-box line yields NOTHING rather than a partially
+    //     parsed row (`..._rejects_malformed` →
+    //     `test_parse_ws_lag_rows_drops_malformed_lines`).
+    //
+    // The charset gate those tests also exercised (`is_token`) is retired with
+    // them; `FEED_NAME_RE` is the surviving, tighter equivalent and is
+    // exercised by the feed-name tests.
 
     /// Two sockets, one healthy and one badly late — the exact shape the panel
     /// exists to make visible, and the one a `{host}`-folded or per-endpoint
@@ -3174,6 +3221,18 @@ mod tests {
 
     #[test]
     fn test_parse_latency_full() {
+        // NARROWED 2026-09-17: the two `RESTLAT_ROW=` lines and every
+        // assertion over `rest_latency` are gone with the `rest_fetch_audit`
+        // curl that produced them (`no-rest-except-live-feed-2026-06-27.md`
+        // §12.12, dated correction). The box-wide probes below are unchanged
+        // and are what this test now pins.
+        //
+        // One `RESTLAT_ROW=` line is KEPT in the fixture DELIBERATELY: a box
+        // running an older Lambda build still emits the prefix, and it must
+        // fall through the generic `k=v` arm into `fields` where nothing reads
+        // it — ignored, never rendered. The assertion below is that no
+        // `rest_latency` key reappears, which is what would happen if someone
+        // restored the arm without restoring its source.
         let stdout = concat!(
             "METRICS_BEGIN\n",
             "tv_order_placement_duration_ns_sum 5000\n",
@@ -3182,61 +3241,43 @@ mod tests {
             "QDB=0.0021\n",
             "SKEW=0.000123\n",
             "RESTLAT_ROW=\"dhan\",\"chain_1m\",374,1300.0,2100.0\n",
-            "RESTLAT_ROW=\"groww\",\"spot_1m\",372,900.0,1600.0\n",
         );
         let out = parse_latency(stdout);
         assert_eq!(out["questdb_ms"], "2.1");
         assert_eq!(out["clock_skew_ms"], "0.1");
         assert_eq!(out["order_place_avg_ns"], json!(500.0));
-        let rows = out["rest_latency"].as_array().unwrap();
-        let mut by_key = std::collections::HashMap::new();
-        for r in rows {
-            by_key.insert(
-                (
-                    r["feed"].as_str().unwrap().to_string(),
-                    r["leg"].as_str().unwrap().to_string(),
-                ),
-                r.clone(),
-            );
-        }
-        let keys: std::collections::HashSet<_> = by_key.keys().cloned().collect();
-        assert_eq!(
-            keys,
-            std::collections::HashSet::from([
-                ("dhan".to_string(), "chain_1m".to_string()),
-                ("groww".to_string(), "spot_1m".to_string()),
-            ])
-        );
-        assert_eq!(
-            by_key[&("dhan".to_string(), "chain_1m".to_string())]["ok_rows"],
-            374
-        );
-        assert_eq!(
-            by_key[&("dhan".to_string(), "chain_1m".to_string())]["p99_ms"],
-            json!(2100.0)
-        );
-        assert_eq!(
-            by_key[&("groww".to_string(), "spot_1m".to_string())]["p50_ms"],
-            json!(900.0)
+        assert!(
+            out.get("rest_latency").is_none(),
+            "a stale RESTLAT_ROW= line must not resurrect the retired field"
         );
     }
 
     #[test]
     fn test_parse_latency_empty() {
-        // Box stopped -> empty table + blank shields, never fabricated numbers.
+        // Box stopped -> blank shields, never fabricated numbers.
+        //
+        // 2026-09-17: `rest_latency` is asserted ABSENT rather than `[]`. An
+        // always-empty list would have read as "the pulls ran and were never
+        // late" — the zero-an-operator-cannot-distinguish class. `ws_latency`
+        // keeps the empty-list shape because its producer is live: `[]` there
+        // genuinely means the lane reported no sockets, and the console says
+        // so in words rather than showing a comforting zero.
         let out = parse_latency("");
-        assert_eq!(out["rest_latency"], json!([]));
+        assert!(out.get("rest_latency").is_none());
+        assert_eq!(out["ws_latency"], json!([]));
         assert_eq!(out["questdb_ms"], "");
         assert_eq!(out["clock_skew_ms"], "");
         assert_eq!(out["order_place_avg_ns"], Value::Null);
     }
 
-    #[test]
-    fn test_parse_latency_malformed_rest_rows_skipped() {
-        let out = parse_latency("RESTLAT_ROW=garbage\nRESTLAT_ROW=dhan,spot_1m,10,1.0,2.0\n");
-        assert_eq!(out["rest_latency"].as_array().unwrap().len(), 1);
-        assert_eq!(out["rest_latency"][0]["feed"], "dhan");
-    }
+    // ---- `test_parse_latency_malformed_rest_rows_skipped` is RETIRED
+    // ---- 2026-09-17 ----
+    //
+    // It fed `RESTLAT_ROW=garbage` beside one good row and asserted the
+    // garbage was DROPPED rather than half-parsed. The rule is intact and is
+    // enforced one panel over by
+    // `test_parse_ws_lag_rows_drops_malformed_lines`, on the parser that
+    // still has a producer.
 
     // ------------------------------------------------------ class ParseStorage
     #[test]
@@ -4036,13 +4077,20 @@ mod tests {
 
     #[test]
     fn test_view_commands_query_live_tables_grouped_by_feed() {
-        for (label, table) in [
-            ("SPOT_BY_FEED=", "rest_spot_1m"),
-            ("CHAIN_BY_FEED=", "rest_option_chain_1m"),
-        ] {
-            let cmd = VIEW_COMMANDS.iter().find(|c| c.contains(label)).unwrap();
-            assert!(cmd.contains("GROUP%20BY%20feed"));
-            assert!(cmd.contains(&format!("FROM%20{table}")));
+        // RE-POINTED 2026-09-17. Two by-feed splits became ONE: `CHAIN_BY_FEED`
+        // is not re-pointed at `market_depth` because one live by-feed split is
+        // the question the card asks (§12.12's mapping table), and the NAME
+        // moved with the query — an operator reading "spot" would have believed
+        // they were looking at the retired REST leg.
+        let cmd = VIEW_COMMANDS
+            .iter()
+            .find(|c| c.contains("TICKS_BY_FEED="))
+            .unwrap();
+        assert!(cmd.contains("GROUP%20BY%20feed"));
+        assert!(cmd.contains("FROM%20ticks"));
+        let joined = VIEW_COMMANDS.join("\n");
+        for gone in ["SPOT_BY_FEED=", "CHAIN_BY_FEED=", "CONTRACT_BY_FEED="] {
+            assert!(!joined.contains(gone), "retired label `{gone}` is back");
         }
     }
 
@@ -4124,101 +4172,35 @@ mod tests {
         assert_eq!(out["health_error"], "");
     }
 
-    #[test]
-    fn test_parse_feeds_view_rest_lane_fields() {
-        // The REST-lane pulse rides the same snapshot as labeled lines
-        // OUTSIDE the marker blocks (2026-07-16).
-        let stdout = concat!(
-            "FEEDS_BEGIN\n{}\nFEEDS_END\n",
-            "FEEDS_HEALTH_BEGIN\n{}\nFEEDS_HEALTH_END\n",
-            "REST_AUDIT=\"dhan\",\"ok\",370;\"dhan\",\"error\",3;\"groww\",\"ok\",372;\"groww\",\"rate_limited\",2;\n",
-            "REST_LAT_HOUR=\"dhan\",1450.04,5200.55;\"groww\",900.0,1600.0;\n",
-        );
-        let out = parse_feeds_view(stdout);
-        assert_eq!(out["rest_audit"]["dhan"], json!({"ok": 370, "error": 3}));
-        assert_eq!(
-            out["rest_audit"]["groww"],
-            json!({"ok": 372, "rate_limited": 2})
-        );
-        assert_eq!(
-            out["rest_lat_hour"]["dhan"],
-            json!({"p50_ms": 1450.0, "p99_ms": 5200.6})
-        );
-        assert_eq!(
-            out["rest_lat_hour"]["groww"],
-            json!({"p50_ms": 900.0, "p99_ms": 1600.0})
-        );
-    }
-
-    #[test]
-    fn test_parse_feeds_view_distinguishes_absent_unreadable_and_genuinely_zero() {
-        // REWRITTEN 2026-09-08. This test previously asserted that "empty /
-        // absent / garbage values yield {}", with a comment citing Rule 11 —
-        // and it was pinning the very conflation Rule 11 forbids. `{}` renders
-        // in the console as "no official-candle pulls recorded today", so an
-        // UNREADABLE snapshot and an IDLE lane produced identical words.
-        //
-        // The operator hit exactly that on 2026-09-08: the console said no
-        // pulls had been recorded while the cadence lane was healthy — its
-        // per-minute decision line ran continuously (11:09 → 11:16 IST,
-        // `rows=1510`, `unknown=0`) and `tv_rest_1m_fire_heartbeat` read 1.0
-        // from 09:15 IST, a gauge its emit site sets ONLY after a
-        // `spot_1m_rest` flush ACK. The rows were landing. The read was blind.
-        //
-        // Avoiding a fabricated zero NUMBER while emitting a fabricated zero
-        // CLAIM is not honesty, so all three cases are now distinct.
-
-        // 1. ABSENT — no REST_AUDIT line in the snapshot at all.
-        let absent = parse_feeds_view("FEEDS_BEGIN\n{}\nFEEDS_END\n");
-        assert_eq!(absent["rest_audit"], json!(null));
-        assert_eq!(absent["rest_audit_error"], json!(REST_AUDIT_ABSENT));
-
-        // 2. PRESENT BUT UNREADABLE — the query answered with something no
-        //    row can be read from. A shape failure, never a count of zero.
-        let garbage =
-            parse_feeds_view("FEEDS_BEGIN\n{}\nFEEDS_END\nREST_AUDIT=;;garbage;a,b;<x>,ok,3;\n");
-        assert_eq!(garbage["rest_audit"], json!(null));
-        assert_eq!(garbage["rest_audit_error"], json!(REST_AUDIT_UNPARSEABLE));
-
-        // 3. PRESENT AND EMPTY — the query ran and returned no rows. The ONE
-        //    case that genuinely means "zero pulls today", and the only one
-        //    the console may render as that sentence.
-        let genuinely_zero = parse_feeds_view("FEEDS_BEGIN\n{}\nFEEDS_END\nREST_AUDIT=\n");
-        assert_eq!(genuinely_zero["rest_audit"], json!({}));
-        assert_eq!(genuinely_zero["rest_audit_error"], json!(null));
-
-        // 4. UNREACHABLE BOX — the third error, and it must not look like any
-        //    of the above either.
-        let unreachable = parse_feeds_view("");
-        assert_eq!(unreachable["rest_audit"], json!(null));
-        assert_eq!(unreachable["rest_audit_error"], json!(BOX_UNREACHABLE));
-
-        // The pure parsers keep their own contract: they answer `{}` for input
-        // they cannot read, and the CALLER above is what decides that `{}`
-        // from a non-empty input is an error rather than a zero.
-        assert_eq!(
-            parse_rest_audit(";;garbage;a,b;<x>,ok,3;dhan,ok,x;"),
-            json!({})
-        );
-        assert_eq!(parse_rest_lat_hour(";;garbage;dhan,null,null;"), json!({}));
-    }
-
-    #[test]
-    fn test_parse_feeds_view_json_body_never_mistaken_for_labeled_line() {
-        // A '=' inside the marker-delimited JSON must not leak into the
-        // labeled-line scan. The proof is now STRONGER than the old
-        // `== json!({})`: if the fake line leaked, `REST_AUDIT` would be
-        // PRESENT, and the result would carry either a parsed value or the
-        // UNPARSEABLE error — never the ABSENT one.
-        let stdout = "FEEDS_BEGIN\n{\"note\": \"REST_AUDIT=fake\"}\nFEEDS_END\n";
-        let out = parse_feeds_view(stdout);
-        assert_eq!(out["rest_audit"], json!(null));
-        assert_eq!(
-            out["rest_audit_error"],
-            json!(REST_AUDIT_ABSENT),
-            "a REST_AUDIT= inside the JSON body must not register as a real line"
-        );
-    }
+    // ---- the REST-lane feeds-card tests are RETIRED 2026-09-17 ----
+    //
+    // Three tests went together, because they pinned one chain that no longer
+    // exists: `test_parse_feeds_view_rest_lane_fields`,
+    // `test_parse_feeds_view_distinguishes_absent_unreadable_and_genuinely_zero`,
+    // and `test_rest_audit_line_inside_json_body_is_not_parsed`. Their
+    // subject was the `REST_AUDIT=` / `REST_LAT_HOUR=` pulse on the feeds
+    // card, read from `rest_fetch_audit` — removed with the per-minute REST
+    // legs (`no-rest-except-live-feed-2026-06-27.md` §12.12).
+    //
+    // ONE of them is worth more than the code it tested, so its rule is
+    // restated here rather than lost with it. The three-outcome test was
+    // REWRITTEN on 2026-09-08 after the console told the operator that no
+    // official-candle pulls had been recorded, all morning, while the lane
+    // was healthy and flushing every minute. The old version asserted that
+    // "absent / unreadable / garbage all yield `{}`" and cited Rule 11 while
+    // pinning the exact conflation Rule 11 forbids: `{}` rendered as the
+    // SENTENCE "no pulls recorded today", so a blind read and an idle lane
+    // produced identical words.
+    //
+    // THE DURABLE RULE, which binds every future parser on this surface:
+    // ABSENT, UNPARSEABLE and GENUINELY-EMPTY are three different facts and
+    // must render as three different things. Avoiding a fabricated zero
+    // NUMBER while emitting a fabricated zero CLAIM is not honesty.
+    //
+    // `parse_feeds_view`'s surviving arms still hold that line — an
+    // unreachable box yields `Value::Null` + `BOX_UNREACHABLE`, invalid JSON
+    // yields `Null` + a structured error, and an empty body yields `{}` — and
+    // those three cases keep their own tests above.
 
     // -------------------------------------- class FeedsViewCommandsPinned
     // Review fixes M1 + M5 (2026-07-16): the feeds-card snapshot commands
@@ -4234,40 +4216,37 @@ mod tests {
             .flat_map(|c| re.captures_iter(c))
             .map(|m| m[1].parse::<i64>().unwrap())
             .sum();
-        assert_eq!(total, 24); // 2×8s app curls + 2×4s audit curls
+        // 2026-09-17: 24 → 16. The two 4s `rest_fetch_audit` curls went with
+        // the per-minute REST legs; the two 8s app curls are what remain.
+        assert_eq!(total, 16); // 2×8s app curls
         assert!(FEEDS_TIMEOUT_SECS > total as f64);
-        assert_eq!(FEEDS_TIMEOUT_SECS, 28.0);
+        assert_eq!(FEEDS_TIMEOUT_SECS, 20.0);
     }
 
-    #[test]
-    fn test_rest_audit_curl_targets_todays_fetch_log() {
-        let cmd = FEEDS_VIEW_COMMANDS
-            .iter()
-            .find(|c| c.contains("REST_AUDIT="))
-            .unwrap();
-        assert!(cmd.contains("from rest_fetch_audit"));
-        assert!(cmd.contains("ts in today()"));
-        assert!(cmd.contains("group by feed, outcome"));
-        assert!(cmd.contains("--data-urlencode"));
-    }
-
-    #[test]
-    fn test_rest_lat_hour_curl_ist_timebase_ok_filter_and_sentinel() {
-        let cmd = FEEDS_VIEW_COMMANDS
-            .iter()
-            .find(|c| c.contains("REST_LAT_HOUR="))
-            .unwrap();
-        // IST timebase: ts is IST-shifted while QuestDB now() is UTC — the
-        // window compares against dateadd('m', 330, now()) (2026-07-07 lesson).
-        assert!(cmd.contains("dateadd('m', 330, now())"));
-        assert!(cmd.contains("dateadd('h', -1,"));
-        // Successful pulls only + the -1 not-measured sentinel excluded.
-        assert!(cmd.contains("outcome = 'ok'"));
-        assert!(cmd.contains("close_to_data_ms >= 0"));
-        assert!(cmd.contains("from rest_fetch_audit"));
-        assert!(cmd.contains("approx_percentile(close_to_data_ms, 0.5, 3)"));
-        assert!(cmd.contains("approx_percentile(close_to_data_ms, 0.99, 3)"));
-    }
+    // ---- the two REST-curl shape tests are RETIRED 2026-09-17 ----
+    //
+    // `test_rest_audit_curl_targets_todays_fetch_log` and
+    // `test_rest_lat_hour_curl_ist_timebase_ok_filter_and_sentinel` pinned the
+    // two `rest_fetch_audit` curls in `FEEDS_VIEW_COMMANDS`, both removed with
+    // the per-minute REST legs (`no-rest-except-live-feed-2026-06-27.md`
+    // §12.12).
+    //
+    // TWO rules they enforced are NOT obvious and are recorded here so a
+    // future query does not rediscover them the expensive way:
+    //
+    //   1. IST TIMEBASE. `ts` on these tables is IST-shifted while QuestDB's
+    //      `now()` is UTC, so an hour window must compare against
+    //      `dateadd('m', 330, now())`, never bare `now()` (the 2026-07-07
+    //      lesson). A query that forgets this is off by 5h30m and returns a
+    //      confident empty result.
+    //   2. THE -1 SENTINEL. `close_to_data_ms` stores -1 for "not measured",
+    //      so any aggregate over it needs `close_to_data_ms >= 0` — which
+    //      both drops the sentinel AND satisfies `approx_percentile`'s
+    //      non-negative-input requirement.
+    //
+    // Rule 1 still binds every remaining `today()`/window query on an
+    // IST-shifted table; rule 2 has no live consumer, which is why it is
+    // written out rather than pinned.
 
     // ---------------------------------------------- class FeedToggleValidation
     #[test]
@@ -4416,29 +4395,35 @@ data-pull phase, so the system is never blinded mid-trade";
     }
 
     // ---------------------------------------------------- class DedupKeyShield
-    // The dedup shield reads rest_spot_1m's REAL 4-column upsert key
-    // (ts, security_id, exchange_segment, feed per DEDUP_KEY_SPOT_1M_REST in
-    // crates/storage/src/spot_1m_rest_persistence.rs) — repointed 2026-07-16
-    // from the retired ticks 5-column key.
+    // The dedup shield reads `ticks`'s REAL 5-column upsert key
+    // (ts, security_id, segment, capture_seq, feed per DEDUP_KEY_TICKS in
+    // crates/storage/src/tick_persistence.rs) — RE-POINTED 2026-09-17 from
+    // rest_spot_1m's 4-column key, which it had carried since 2026-07-16.
+    //
+    // This is the SECOND time this shield has moved, and the direction
+    // reversed: 2026-07-16 took it OFF `ticks` when the live feed was
+    // retired; today's SOCKETS-ONLY narrowing takes it back.
     #[test]
-    fn test_view_comment_names_the_four_real_key_columns() {
+    fn test_view_comment_names_the_five_real_key_columns() {
         // the legacy runtime scanned handler.py; the Rust twin lives in the commands
         // module's doc comment (the %3D rationale block).
         let src = include_str!("operator_control_commands.rs");
-        assert!(src.contains("(ts, security_id, exchange_segment, feed)"));
-        assert!(src.contains("DEDUP_KEY_SPOT_1M_REST"));
+        assert!(src.contains("(ts, security_id, segment, capture_seq, feed)"));
+        assert!(src.contains("DEDUP_KEY_TICKS"));
     }
 
     #[test]
     fn test_html_distinguishes_ok_disabled_drift_unreachable() {
-        // 4 = OK (green): the check compares against 4, not the stale 5.
-        assert!(CONSOLE_HTML.contains("dkN===4"));
-        assert!(!CONSOLE_HTML.contains("dkN===5"));
+        // 5 = OK (green): RE-POINTED 2026-09-17 with the shield itself. The
+        // comment here read "not the stale 5" — `ticks` is the live table
+        // again, so 5 is the correct expectation and 4 is now the stale one.
+        assert!(CONSOLE_HTML.contains("dkN===5"));
+        assert!(!CONSOLE_HTML.contains("dkN===4"));
         // 0 = DEDUP disabled entirely (RED).
         assert!(CONSOLE_HTML.contains("DEDUP disabled!"));
         assert!(CONSOLE_HTML.contains("'bad'"));
         // other = schema drift (amber).
-        assert!(CONSOLE_HTML.contains("schema drift (expected 4)"));
+        assert!(CONSOLE_HTML.contains("schema drift (expected 5)"));
         // fetch failure = "unreachable" (amber), never a fake 0/OLD.
         assert!(CONSOLE_HTML.contains("'unreachable'"));
     }
@@ -4477,18 +4462,20 @@ data-pull phase, so the system is never blinded mid-trade";
         assert!(!CONSOLE_HTML.contains("live feed? Ticks"));
     }
 
-    #[test]
-    fn test_failed_bucket_excludes_never_attempted_minutes() {
-        // Review fix L4 (2026-07-16): skipped / boundary_skipped audit rows
-        // are minutes the leg never ATTEMPTED — lumping them into "failed"
-        // inflated the failure count. no_token IS a real failure and stays
-        // counted.
-        assert!(CONSOLE_HTML.contains("k!=='skipped'"));
-        assert!(CONSOLE_HTML.contains("k!=='boundary_skipped'"));
-        // no_token must NOT be excluded from the failed fold.
-        assert!(!CONSOLE_HTML.contains("k!=='no_token'"));
-    }
-
+    // ---- `test_failed_bucket_excludes_never_attempted_minutes` is RETIRED
+    // ---- 2026-09-17 ----
+    //
+    // It pinned the REST-pull line's "failed" fold: `skipped` and
+    // `boundary_skipped` audit rows are minutes the leg never ATTEMPTED
+    // (trading-day gate, missed boundaries), so folding them into "failed"
+    // inflated the count — while `no_token` IS a real failure and stayed
+    // counted. Its subject is gone with `rest_fetch_audit`.
+    //
+    // THE DURABLE RULE, recorded because it is not obvious and cost a review
+    // round to find: a NOT-ATTEMPTED outcome and a FAILED outcome are
+    // different facts, and an error bucket that silently absorbs the former
+    // reports a healthy gated leg as broken. Any future per-outcome rollup on
+    // this console owes the same distinction.
     #[test]
     fn test_errors_render_verbatim_through_esc() {
         assert!(CONSOLE_HTML.contains("esc(j.feeds_error"));
@@ -4496,17 +4483,27 @@ data-pull phase, so the system is never blinded mid-trade";
     }
 
     #[test]
-    fn test_feeds_card_shows_rest_pull_line_not_tick_counters() {
-        // 2026-07-16: the per-feed detail line is today's fetch-log pulse
-        // (ok/failed/rate-limited + last-hour p50/p99 after minute close),
-        // sourced from rest_fetch_audit — the old ticks/subscribed counters
-        // read frozen live-feed registries and are GONE.
-        assert!(CONSOLE_HTML.contains("j.rest_audit"));
-        assert!(CONSOLE_HTML.contains("j.rest_lat_hour"));
-        assert!(CONSOLE_HTML.contains("pulls today:"));
-        assert!(CONSOLE_HTML.contains("rate-limited"));
-        assert!(CONSOLE_HTML.contains("after minute close"));
-        assert!(CONSOLE_HTML.contains("no official-candle pulls recorded today"));
+    fn test_feeds_card_carries_no_writerless_pull_line() {
+        // ↺ REPLACES `test_feeds_card_shows_rest_pull_line_not_tick_counters`
+        // (2026-09-17). It REQUIRED the per-feed REST-pull line
+        // (ok/failed/rate-limited + last-hour p50/p99), sourced from
+        // `rest_fetch_audit` — removed with the per-minute legs
+        // (`no-rest-except-live-feed-2026-06-27.md` §12.12).
+        //
+        // Nothing replaces the line: there is no per-minute fetch left to
+        // count, and an always-empty "pulls today: 0 ok" would read as a
+        // failure rather than as an absence.
+        for gone in [
+            "j.rest_audit",
+            "j.rest_lat_hour",
+            "pulls today:",
+            "after minute close",
+            "no official-candle pulls recorded today",
+        ] {
+            assert!(!CONSOLE_HTML.contains(gone), "retired pull-line: {gone}");
+        }
+        // The ORIGINAL half of this test is UNCHANGED and still binds: the
+        // frozen live-feed registry counters must never come back either.
         assert!(!CONSOLE_HTML.contains("ticks_total"));
         assert!(!CONSOLE_HTML.contains("subscribed_total"));
         assert!(!CONSOLE_HTML.contains("' · ticks '"));
@@ -4525,22 +4522,36 @@ data-pull phase, so the system is never blinded mid-trade";
     }
 
     #[test]
-    fn test_html_has_rest_latency_table() {
-        assert!(CONSOLE_HTML.contains(r#"id="latrest""#));
-        assert!(CONSOLE_HTML.contains("how fast each official minute candle arrives"));
-        assert!(CONSOLE_HTML.contains("pull type"));
-        assert!(CONSOLE_HTML.contains("ok pulls today"));
-        assert!(CONSOLE_HTML.contains("p50 after close"));
-        assert!(CONSOLE_HTML.contains("p99 after close"));
+    fn test_html_latency_card_is_socket_only() {
+        // ↺ REPLACES `test_html_has_rest_latency_table` (2026-09-17). That
+        // test pinned the per-(broker, pull type) REST table, whose
+        // `rest_fetch_audit` source went with the per-minute legs
+        // (`no-rest-except-live-feed-2026-06-27.md` §12.12, dated correction).
+        //
+        // It is REPLACED rather than deleted because the card must not end up
+        // with NO latency table at all: the per-socket live delivery lag is
+        // now the tab's only measurement, and this is what pins it there.
+        assert!(CONSOLE_HTML.contains(r#"id="latws""#));
+        assert!(CONSOLE_HTML.contains("p50 exchange→here"));
+        assert!(CONSOLE_HTML.contains("p99 exchange→here"));
+        assert!(CONSOLE_HTML.contains("instruments on wire"));
+        // The retired REST table must not come back without its source.
+        assert!(!CONSOLE_HTML.contains(r#"id="latrest""#));
+        assert!(!CONSOLE_HTML.contains("ok pulls today"));
+        assert!(!CONSOLE_HTML.contains("p50 after close"));
     }
 
     #[test]
     fn test_latency_card_iterates_rows_no_hardcoded_names() {
-        // Future-feeds ratchet: the table renders whatever j.rest_latency
-        // carries (feed+leg discovered from the fetch log at measure time) —
-        // NO feed/leg name may be hardcoded in the portal JS.
+        // RE-POINTED 2026-09-17 from `j.rest_latency` to `j.ws_latency`. The
+        // RATCHET is unchanged and is the reason this was re-pointed rather
+        // than retired: the table renders whatever the server sends (socket
+        // index + endpoint discovered at measure time), so a new socket, pool
+        // or broker gets its row with ZERO portal changes. No feed, leg or
+        // endpoint name may be hardcoded in the portal JS.
         let js = load_latency_js();
-        assert!(js.contains("j.rest_latency"));
+        assert!(js.contains("j.ws_latency"));
+        assert!(!js.contains("j.rest_latency"));
         let lower = js.to_lowercase();
         assert!(!lower.contains("dhan"));
         assert!(!lower.contains("groww"));
@@ -4550,8 +4561,17 @@ data-pull phase, so the system is never blinded mid-trade";
 
     #[test]
     fn test_empty_table_is_honest_not_fake_zero() {
-        assert!(CONSOLE_HTML.contains("no successful pulls recorded today"));
-        assert!(CONSOLE_HTML.contains("never fake"));
+        // NARROWED 2026-09-17: the REST "no successful pulls recorded today"
+        // string went with its table. The RULE is unchanged and is now pinned
+        // on the surface that still has a producer — an empty socket table
+        // must say so in words, never render as a comforting zero.
+        // Both surviving empty-state strings, on the two tables that still
+        // have producers: the socket table says an empty result is NOT a
+        // zero-latency reading, and the card caption says an empty table must
+        // never be read as "fast".
+        assert!(CONSOLE_HTML.contains("This is NOT a zero-latency reading."));
+        assert!(CONSOLE_HTML.contains(r#"never read that as "fast""#));
+        assert!(!CONSOLE_HTML.contains("no successful pulls recorded today"));
     }
 
     #[test]
@@ -4809,16 +4829,31 @@ data-pull phase, so the system is never blinded mid-trade";
 
     #[test]
     fn test_view_sql_targets_no_dead_tables() {
+        // ⚠ INVERTED 2026-09-17 for `ticks`, and that is the whole point of
+        // this note. This test was written when the live feed was retired and
+        // `ticks` was the DEAD table — it banned `FROM%20ticks` and
+        // `TICKS_TODAY` by name. The 2026-08-11 revival made `ticks` the live
+        // lane's primary table, and the SOCKETS-ONLY narrowing made the REST
+        // tables the dead ones, so a guard left as written would now be
+        // asserting the exact reverse of the truth: it would fail the build
+        // for querying the one table that is guaranteed to have a writer.
+        //
+        // The RULE is unchanged and is what survives: the view must query
+        // nothing that has no writer. Only the membership of "dead" moved.
         let joined = VIEW_COMMANDS.join("\n");
         for dead in [
-            "FROM%20ticks",
             "candles_1m",
             "tick_conservation_audit",
             "ws_event_audit",
-            "MAX_TPS",
-            "TICKS_TODAY",
             "CONSERVE",
             "WS_DISC",
+            // Retired with the per-minute REST legs (§12.12). RETAINED tables,
+            // so these return a permanent zero rather than erroring — the
+            // shape this guard exists to keep off the operator's console.
+            "rest_spot_1m",
+            "rest_option_chain_1m",
+            "rest_option_contract_1m",
+            "rest_fetch_audit",
         ] {
             assert!(!joined.contains(dead), "{dead}");
         }
@@ -4962,7 +4997,8 @@ data-pull phase, so the system is never blinded mid-trade";
         // banner must never hide genuine failures while running).
         assert!(CONSOLE_HTML.contains("'unreachable'"));
         assert!(CONSOLE_HTML.contains("DEDUP disabled!"));
-        assert!(CONSOLE_HTML.contains("schema drift (expected 4)"));
+        // 4 -> 5 with the shield's re-point (2026-09-17, §12.12).
+        assert!(CONSOLE_HTML.contains("schema drift (expected 5)"));
     }
 
     #[test]
@@ -4981,7 +5017,11 @@ data-pull phase, so the system is never blinded mid-trade";
         assert!(overview.contains("loadLatency()"));
         assert!(overview.contains("Measure now"));
         assert!(overview.contains(r#"id="latnet""#));
-        assert!(overview.contains(r#"id="latrest""#));
+        // 2026-09-17: `latrest` is gone with the REST latency table; `latws`
+        // (the per-socket live lag) is the card's measurement now, and is
+        // pinned so the overview can never lose its latency table entirely.
+        assert!(overview.contains(r#"id="latws""#));
+        assert!(!overview.contains(r#"id="latrest""#));
         // Strip is fed by the same aws_status action the old AWS tab used.
         assert!(CONSOLE_HTML.contains("call('aws_status')"));
     }
