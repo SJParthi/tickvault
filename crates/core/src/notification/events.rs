@@ -1587,9 +1587,28 @@ impl NotificationEvent {
                 // asked "what happened to it?"). Truthful per-leg wording —
                 // a switched-off leg says so.
                 // 2026-07-14 operator broker-tag directive: the capture
-                // line reports the DHAN per-minute REST legs. Dhan is the
-                // only broker in this system (Groww retired 2026-08-21), so
-                // there is no second-broker leg to point at.
+                // line reports the DHAN per-minute REST legs — say so, and
+                // note the Groww per-minute legs report on their own
+                // alerts (they are config-gated in their own modules).
+                // ⚠ 2026-09-17: only the (false, false) arm is REACHABLE.
+                // `main.rs` passes DHAN_PER_MINUTE_LEGS_EXIST (a const `false`)
+                // for both fields, because the per-minute Dhan REST legs were
+                // removed on 2026-09-16.
+                //
+                // The three "armed" arms are KEPT rather than deleted: they are
+                // the record of what this line reported while the legs existed,
+                // and the event's shape is read by 43 sites, so collapsing it
+                // here would be a far wider change than the removal called for.
+                // They are NOT a latent false page — reaching one requires
+                // flipping DHAN_PER_MINUTE_LEGS_EXIST, which fails
+                // `boot_report_capture_claim_guard` until a producing module
+                // actually exists.
+                //
+                // Note their text still carries "(Groww per-minute legs report
+                // separately)", false since the 2026-08-21 Groww removal. Left
+                // as written because these arms are unreachable and the
+                // sentence is part of the historical record; the arm that DOES
+                // render is corrected below.
                 let capture_line = match (spot_1m_enabled, chain_1m_enabled) {
                     (true, true) => format!(
                         "\u{2705} Dhan per-minute price capture — armed \
@@ -1610,7 +1629,30 @@ impl NotificationEvent {
                          Dhan option chain for {chain_1m_underlyings} \
                          indices; Dhan spot candles — switched off"
                     ),
-                    (false, false) => "Dhan per-minute price capture — switched off".to_string(),
+                    // The ONLY reachable arm since 2026-09-16: `main.rs`
+                    // constant-folds both operands to
+                    // DHAN_PER_MINUTE_LEGS_EXIST = false, because the
+                    // per-minute Dhan REST legs were REMOVED under the
+                    // operator's sockets-only directive.
+                    //
+                    // Reworded 2026-09-17, twice over. It read "switched off
+                    // (Groww per-minute legs report separately)":
+                    //
+                    //   - "switched off" invites "then switch it on". There is
+                    //     no switch — the modules are deleted. An operator
+                    //     acting on the old wording would hunt for a flag that
+                    //     cannot do anything.
+                    //   - the Groww clause named a feed REMOVED on 2026-08-21,
+                    //     so it had been false on the operator's phone for a
+                    //     month, in this arm and in the three above it.
+                    //
+                    // Says what IS capturing instead of only what is not: a
+                    // line that reports an absence and stops there reads like
+                    // an outage.
+                    (false, false) => "Dhan per-minute REST price capture — REMOVED \
+                         (sockets-only, 16 Sep). Market data now comes from the \
+                         live socket feed, not per-minute pulls"
+                        .to_string(),
                 };
                 format!(
                     "<b>tickvault started</b>\nMode: {mode}\nBuild: {build}\n\
@@ -3574,6 +3616,19 @@ mod tests {
         // 2026-07-14 broker tag: the capture line reports the DHAN REST
         // legs — it must SAY Dhan and note the Groww legs report on their
         // own alerts (every arm).
+        //
+        // ⚠ 2026-09-17: the three "armed" arms below are UNREACHABLE in
+        // production — `main.rs` passes a `false` const for both fields. Their
+        // assertions are kept because the arms are kept (the event's shape is
+        // read by 43 sites, so collapsing it would be far wider than the
+        // removal called for), and they still describe those arms correctly.
+        //
+        // What they are NOT is a statement about what the operator receives.
+        // In particular the `Groww per-minute legs report separately` assertion
+        // three lines down pins text that has been FALSE since the 2026-08-21
+        // Groww removal — it is pinned here only because the arm carrying it
+        // can no longer render. The arm that DOES render is asserted at the
+        // bottom of this test, and it is asserted NOT to say it.
         let both = build(true, true).to_message();
         assert!(
             both.contains("Dhan per-minute price capture — armed"),
@@ -3614,13 +3669,40 @@ mod tests {
             "got: {spot_off}"
         );
 
+        // ── (false, false): REWRITTEN 2026-09-17 ─────────────────────────
+        //
+        // This is the ONLY arm `main.rs` can now reach — it constant-folds both
+        // fields to DHAN_PER_MINUTE_LEGS_EXIST, a `false` const, because the
+        // per-minute Dhan REST legs were removed on 2026-09-16.
+        //
+        // The two assertions withdrawn here were PINNING FALSE CLAIMS INTO the
+        // operator's boot Telegram, which is worth recording rather than just
+        // deleting:
+        //
+        //   - `contains("Dhan per-minute price capture — switched off")`.
+        //     "Switched off" invites "then switch it on"; the modules are
+        //     deleted, so there is no switch that can do anything.
+        //   - `contains("Groww per-minute legs report separately")`. The entire
+        //     Groww feed was REMOVED on 2026-08-21, so this test spent a month
+        //     REQUIRING the boot message to name a feed that does not exist —
+        //     and would have failed any attempt to take it out.
+        //
+        // A test that asserts a message says something false does not merely
+        // miss the bug: it defends it. The replacements below assert the two
+        // properties that actually matter and are checkable — that the line
+        // never claims capture is armed, and that it never names the removed
+        // feed — rather than freezing one exact sentence.
         let both_off = build(false, false).to_message();
         assert!(
-            both_off.contains("Dhan per-minute price capture — switched off"),
+            both_off.contains("Dhan per-minute REST price capture — REMOVED"),
             "got: {both_off}"
         );
         assert!(!both_off.contains("armed"), "got: {both_off}");
+        assert!(!both_off.contains("switched off"), "got: {both_off}");
         assert!(!both_off.contains("Groww"), "got: {both_off}");
+        // Says what IS capturing, not only what is not: a line reporting an
+        // absence and stopping there reads like an outage.
+        assert!(both_off.contains("live socket feed"), "got: {both_off}");
     }
 
     #[test]

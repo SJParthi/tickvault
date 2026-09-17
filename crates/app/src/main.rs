@@ -212,6 +212,43 @@ const API_BEARER_FETCH_BACKOFF_SECS: u64 = 2;
 /// past any normal dial-to-first-frame, and the condition it detects is
 /// structural rather than transient — once true it stays true, so waiting
 /// costs nothing and guessing early costs credibility.
+/// Whether a Dhan per-minute REST leg exists to be armed. It does NOT.
+///
+/// The boot Telegram's capture line reports whether today's per-minute Dhan
+/// spot-1m and option-chain pulls will fire. Until 2026-09-16 it computed that
+/// from config — `spot_1m_rest.enabled || (cadence.enabled && cadence.dhan_lane)`
+/// — which was correct while those legs existed.
+///
+/// They were REMOVED on 2026-09-16 under the operator's sockets-only directive
+/// ("Bro just remove per minute price falls and 3.41 pm accuracy check alone"),
+/// and the config was not: `[cadence] enabled` and `dhan_lane` both still read
+/// `true` in `config/base.toml`. So both operands evaluated TRUE and the boot
+/// Telegram sent, every trading morning:
+///
+///   "✅ Dhan per-minute price capture — armed (fires 9:16 AM to 3:30 PM IST
+///    on trading days): Dhan spot candles for N indices + Dhan option chain
+///    for M indices"
+///
+/// for legs with no module, no executor and no scheduler. Every one of
+/// `cadence_boot.rs`, `dhan_cadence_executor.rs`, `spot_1m_rest_boot.rs` and
+/// `option_chain_1m_boot.rs` is deleted; `crates/core/src/cadence/` is gone.
+/// A green checkmark on the operator's phone asserting a capability that does
+/// not exist is the false-OK class this repository keeps retiring — and it is
+/// the worst-placed instance of it, because it is delivered rather than
+/// waited for.
+///
+/// Constant-folded rather than left to config on purpose. Config is a
+/// PREFERENCE and these legs are ABSENT: no flag can arm a module that is not
+/// compiled, so reading a flag here can only ever produce a wrong answer, and
+/// flipping `[cadence] enabled` back would silently restore the false page.
+/// The same shape as `rest_candle_fold::LIVE_INLET_HAS_PRODUCER`, for the same
+/// reason.
+///
+/// Pinned by `boot_report_capture_claim_guard.rs`, which DERIVES the expected
+/// value from whether a producing module actually exists — so restoring a leg
+/// without flipping this fails, and flipping this without a leg fails too.
+const DHAN_PER_MINUTE_LEGS_EXIST: bool = false;
+
 const STALL_SCAN_STARVED_AFTER_SCANS: u32 = 4;
 
 /// Should the stall scan report that it is STARVED rather than healthy?
@@ -4215,12 +4252,14 @@ async fn run_process_runloop(
     // otherwise the boot Telegram claimed Dhan capture OFF on every boot.
     notifier.notify(NotificationEvent::StartupComplete {
         mode,
-        spot_1m_enabled: config.spot_1m_rest.enabled
-            || (config.cadence.enabled && config.cadence.dhan_lane),
+        // 2026-09-16 removal: the config operands that stood here
+        // (`config.spot_1m_rest.enabled || (config.cadence.enabled &&
+        // config.cadence.dhan_lane)`) both evaluate TRUE today for legs that
+        // no longer exist — see DHAN_PER_MINUTE_LEGS_EXIST.
+        spot_1m_enabled: DHAN_PER_MINUTE_LEGS_EXIST,
         spot_1m_indices: u32::try_from(tickvault_common::constants::SPOT_1M_REST_INDICES.len())
             .unwrap_or(0),
-        chain_1m_enabled: config.option_chain_1m.enabled
-            || (config.cadence.enabled && config.cadence.dhan_lane),
+        chain_1m_enabled: DHAN_PER_MINUTE_LEGS_EXIST,
         chain_1m_underlyings: u32::try_from(
             tickvault_common::constants::CHAIN_1M_UNDERLYINGS.len(),
         )
