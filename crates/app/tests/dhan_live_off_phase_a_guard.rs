@@ -273,16 +273,27 @@ fn test_rest_stack_module_is_not_a_stub() {
         // Renewal + mid-session watchdog.
         "spawn_renewal_task()",
         "spawn_mid_session_profile_watchdog(",
-        // The retained REST subsystems (the REST canary was deleted
-        // 2026-07-14 per the operator Dhan noise lock — the legs
-        // self-detect REST death via their own escalation edges).
-        "spawn_supervised_spot_1m_rest(",
-        "spawn_supervised_option_chain_1m(",
-        "run_option_chain_1m_probe(",
-        // Their existing config gates are respected.
-        "config.spot_1m_rest.enabled",
-        "config.option_chain_1m.enabled",
-        "config.option_chain_1m.probe_and_report",
+        // ---- The six REST-LEG needles are RETIRED 2026-09-17 ----
+        //
+        // `spawn_supervised_spot_1m_rest(`, `spawn_supervised_option_chain_1m(`,
+        // `run_option_chain_1m_probe(` and the three config gates
+        // (`config.spot_1m_rest.enabled`, `config.option_chain_1m.enabled`,
+        // `config.option_chain_1m.probe_and_report`) all named the per-minute
+        // market-data legs, which the operator's SOCKETS-ONLY narrowing removed
+        // (`no-rest-except-live-feed-2026-06-27.md` §12.10).
+        //
+        // The needles BELOW are unchanged, and this test is arguably MORE
+        // load-bearing after the narrowing than before it. §12.1 measured why
+        // the AUTH half could not go with the market-data half: the socket URL
+        // embeds the JWT (`connection.rs`'s `build_feed_url`), and
+        // `current_feed_token`'s own docblock says "there is no second
+        // credential path". So this stack's remaining job is to produce the one
+        // credential all sixteen sockets dial with — lock, mint, renew, watch,
+        // and publish a 0/1 up-gauge that reads 0 during bring-up.
+        //
+        // A skeleton HERE now means a dark lane, not a missing REST leg, which
+        // is why the list was narrowed rather than the test retired. The
+        // lock-before-mint ordering assertion below is untouched.
         // Observability: the 0/1 up-gauge (Rule 11 — bring-up reads 0).
         "tv_dhan_rest_stack_up",
     ] {

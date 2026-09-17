@@ -266,8 +266,26 @@ fn the_scan_is_not_vacuous() {
 fn guard_self_test_parser_bites() {
     // A parser that accepts anything proves nothing, so exercise its edges.
     let keys = error_code_keys();
+    // ⚠ FLOOR LOWERED 20 -> 18 on 2026-09-17, and it now sits AT the truth.
+    //
+    // MEASURED: `error_code_alerts` held 25 keys before and holds 18 after, a
+    // drop of exactly 7 — `chain-01`, `chain-02-escalation`,
+    // `chain-04-warmup`, `spot1m-01-escalation` and the three
+    // `ws-gap-03-xverify-*` verdicts. Every one is a filter the operator's
+    // SOCKETS-ONLY narrowing removed with its emit site
+    // (`no-rest-except-live-feed-2026-06-27.md` §12.10), and the seven matching
+    // ALARM_PHRASES rows are deleted in the same change. The delta matches its
+    // named cause exactly; a floor lowered by a number that did not would be
+    // padding.
+    //
+    // The old 20 sat five under the real 25, which is defensible for a
+    // "does the parser bite" self-test — its job is extraction, not inventory.
+    // At 18 it does both cheaply: a parser regression still fails it, and so
+    // does a coded alarm vanishing from terraform without this floor being
+    // re-derived. Adding an alarm never fails it, so the ratchet only ever
+    // costs a deliberate edit in the direction that deserves one.
     assert!(
-        keys.len() >= 20,
+        keys.len() >= 18,
         "error_code_alerts key extraction found only {} keys",
         keys.len()
     );

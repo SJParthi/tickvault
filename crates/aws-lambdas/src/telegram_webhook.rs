@@ -153,7 +153,7 @@ pub const GENERIC_SAFE_LINE: &str = "🔔 Alert received — details are in the 
 ///
 /// O(n) scan per lookup — cold path (a handful of alarm renders per SNS
 /// batch), deliberately not a hash map so the table stays a reviewable literal.
-pub const ALARM_PHRASES: [(&str, &str); 112] = [
+pub const ALARM_PHRASES: [(&str, &str); 105] = [
     // ---- capacity + candle building ----
     (
         "aggregator-refusal-rate-high",
@@ -503,22 +503,20 @@ pub const ALARM_PHRASES: [(&str, &str); 112] = [
         "errcode-boot-03",
         "The server clock has drifted too far for the app to start",
     ),
-    (
-        "errcode-chain-01",
-        "🔷 DHAN: option-chain access is being refused — the chain pull is down",
-    ),
-    (
-        "errcode-chain-02-escalation",
-        "🔷 DHAN: the option-chain pull has been failing for several minutes",
-    ),
-    (
-        "errcode-chain-04-warmup",
-        "🔷 DHAN: the option chain could not start this morning and is down for the day",
-    ),
-    (
-        "errcode-spot1m-01-escalation",
-        "🔷 DHAN: the index price pull has been failing for several minutes",
-    ),
+    // ---- Four REST-leg phrases RETIRED 2026-09-17 ----
+    //
+    // `errcode-chain-01`, `errcode-chain-02-escalation`,
+    // `errcode-chain-04-warmup` and `errcode-spot1m-01-escalation` translated
+    // the per-minute Dhan spot + option-chain pull alarms. Those legs, their
+    // error codes and their terraform metric filters were all removed by the
+    // operator's SOCKETS-ONLY narrowing
+    // (`no-rest-except-live-feed-2026-06-27.md` §12.10), so each phrase named
+    // an alarm that can never fire again.
+    //
+    // Deleted rather than kept "just in case", because this table's own guard
+    // says why: a stale entry makes the table look better covered than it is,
+    // and other tests can keep asserting against it forever while none of it
+    // is true of the running system.
     (
         "errcode-aggregator-drop-01",
         "Finished candles were dropped, or prices were refused by the candle builder",
@@ -579,18 +577,21 @@ pub const ALARM_PHRASES: [(&str, &str); 112] = [
         "errcode-ws-gap-03-universe-collapse",
         "🔷 DHAN: fell back to just four indices — almost the whole instrument list is missing",
     ),
-    (
-        "errcode-ws-gap-03-xverify-diverged",
-        "🔷 DHAN: our recorded prices disagree badly with the broker's own record",
-    ),
-    (
-        "errcode-ws-gap-03-xverify-failed",
-        "🔷 DHAN: the end-of-day price cross-check could not run",
-    ),
-    (
-        "errcode-ws-gap-03-xverify-vacuous",
-        "🔷 DHAN: the end-of-day price cross-check compared nothing at all",
-    ),
+    // ---- Three cross-verification phrases RETIRED 2026-09-17 ----
+    //
+    // `errcode-ws-gap-03-xverify-diverged`, `-failed` and `-vacuous` translated
+    // the three verdicts of the 15:41 live-vs-broker price cross-check. The
+    // comparator is gone (§12.10.3 removed it AND the boot floor that gated all
+    // sixteen sockets on it), so all three filters were removed from terraform
+    // and no SNS record can carry these names again.
+    //
+    // ⚠ Worth reading rather than skimming: the phrases these replaced were the
+    // operator-facing wording for the ONLY check that ever compared our captured
+    // prices against an external record — "our recorded prices disagree badly
+    // with the broker's own record". After this there is no such check anywhere
+    // in the workspace (§12.10.4), so no future phrase should be written that
+    // implies one exists. What survives says whether the machinery RAN, never
+    // whether the numbers are RIGHT.
 ];
 
 /// Cached SSM reads — Lambda containers stay warm for ~15 min. Re-fetch
