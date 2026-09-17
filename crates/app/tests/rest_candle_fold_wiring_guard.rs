@@ -133,6 +133,86 @@ fn main_rs_spawns_fold_gated_after_seal_writer_install() {
     );
 }
 
+/// The inertness const cannot drift away from the fact it records.
+///
+/// `LIVE_INLET_HAS_PRODUCER` exists because a fold with no producer arms
+/// cleanly and then receives nothing, silently, for a whole session — the
+/// producer-less-channel shape §12.9(e) closed for `mark_forward` and which
+/// cannot be closed the same way here (a first-wins `OnceLock` inlet has no
+/// observable emptiness).
+///
+/// A const is only worth more than a comment if it cannot go stale, so this
+/// test DERIVES the expected value instead of asserting a literal: the const
+/// must be `true` exactly when some production file outside the fold module
+/// calls `send_confirmed_bars`. Restore a producer and forget the const, and
+/// this fails; flip the const with no producer, and this fails too.
+#[test]
+fn the_inert_const_matches_whether_a_producer_actually_exists() {
+    let fold = read_source("crates/app/src/rest_candle_fold.rs");
+    let fold_prod = production_region(&fold);
+
+    // The const itself, and which way it reads today.
+    let declares_false = fold_prod.contains("pub const LIVE_INLET_HAS_PRODUCER: bool = false;");
+    let declares_true = fold_prod.contains("pub const LIVE_INLET_HAS_PRODUCER: bool = true;");
+    assert!(
+        declares_false ^ declares_true,
+        "rest_candle_fold must declare LIVE_INLET_HAS_PRODUCER as a plain          `bool = false;` or `bool = true;` — this guard reads the literal"
+    );
+
+    // Does a real producer exist? Scan every app-crate production source
+    // EXCEPT the fold module itself (which defines send_confirmed_bars and
+    // exercises it in its own tests) and this guard's own prose.
+    let src_dir = workspace_root().join("crates/app/src");
+    let mut producers: Vec<String> = Vec::new();
+    let entries = fs::read_dir(&src_dir)
+        .unwrap_or_else(|err| panic!("must be able to read {}: {err}", src_dir.display()));
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        if name == "rest_candle_fold.rs" {
+            continue;
+        }
+        let body = fs::read_to_string(&path).unwrap_or_default();
+        if production_region(&body).contains("send_confirmed_bars(") {
+            producers.push(name);
+        }
+    }
+
+    if producers.is_empty() {
+        assert!(
+            declares_false,
+            "no production file calls send_confirmed_bars, so the fold's live              inlet has no producer — LIVE_INLET_HAS_PRODUCER must stay `false`.              Flipping it arms a task that logs a clean start and then receives              nothing, all session, with no error and no counter."
+        );
+    } else {
+        assert!(
+            declares_true,
+            "these files call send_confirmed_bars: {producers:?} — a producer              exists again, so LIVE_INLET_HAS_PRODUCER must be flipped to `true`              in the SAME change, or the fold stays refused at boot while its              input flows"
+        );
+    }
+
+    // main.rs must actually CONSULT the const — a const nothing reads is a
+    // comment with a type.
+    let main_rs = read_source("crates/app/src/main.rs");
+    assert!(
+        production_region(&main_rs)
+            .contains("tickvault_app::rest_candle_fold::LIVE_INLET_HAS_PRODUCER"),
+        "main.rs must gate the fold spawn on LIVE_INLET_HAS_PRODUCER —          otherwise the const records the inertness without preventing it"
+    );
+
+    // ...and the refusal must be CODED and named, never a bare log line.
+    assert!(
+        production_region(&main_rs).contains("stage = \"no_producer\""),
+        "the refusal must carry stage=\"no_producer\" beside the FOLD-01 code,          so an operator who enabled the fold can find out why it did not arm"
+    );
+}
+
 // ---- `dhan_spot_leg_hands_off_confirmed_bars_at_both_flush_ok_arms` is
 // ---- RETIRED 2026-09-17 ----
 //
