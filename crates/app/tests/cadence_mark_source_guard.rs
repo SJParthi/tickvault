@@ -84,11 +84,18 @@ fn normalize_ws(body: &str) -> String {
     body.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Comment-stripped, whitespace-normalized production region.
-fn scan_region(rel: &str) -> String {
-    let src = app_src(rel);
-    normalize_ws(&strip_line_comments(production_region(&src)))
-}
+// ---- `scan_region` is RETIRED 2026-09-17 ----
+//
+// The composed "comment-stripped + whitespace-normalized production
+// region" helper. Its callers were pins 1-4, retired on 2026-09-16 with
+// the cadence mark producer; the two surviving order-runtime tests compose
+// `strip_line_comments(production_region(..))` inline and deliberately do
+// NOT normalize, because their needles are string literals carrying
+// `\`-continuations and each sits on one physical line.
+//
+// `normalize_ws` itself is KEPT — the scanner self-check still pins it, so
+// a future guard that needs wrapped-shape matching has a proven primitive
+// rather than a fresh one.
 
 // ---- Pins 1-4 RETIRED 2026-09-16: there is no cadence mark producer ----
 //

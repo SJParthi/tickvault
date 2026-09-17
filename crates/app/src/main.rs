@@ -5453,15 +5453,6 @@ fn spawn_feed_scoreboard_tasks(
         match inner.await {
             Ok(Ok(Some(summary))) => {
                 if sb_telegram_enabled {
-                    // REST plan PR-5 (operator Quote 2, 2026-07-13):
-                    // the official minute-candle pull digest lines — the
-                    // four canonical feed/leg pairs always render (honest
-                    // "not measured yet" when a source is absent); the
-                    // contract leg lights up automatically once its
-                    // forensics rows land.
-                    let rest_legs = tickvault_app::feed_scoreboard_boot::build_rest_leg_score_lines(
-                        &summary.rest_legs,
-                    );
                     sb_notifier.notify(NotificationEvent::DualFeedDailyScorecard {
                         trading_date_ist: summary.trading_date_ist.clone(),
                         dhan: to_line("Dhan", &summary.dhan),
@@ -5471,8 +5462,6 @@ fn spawn_feed_scoreboard_tasks(
                         early_run: summary.early_run,
                         restart_partial: summary.restart_partial,
                         dhan_feed_off: summary.dhan_feed_off,
-                        rest_legs,
-                        rest_legs_read_failed: summary.rest_legs_read_failed,
                     });
                 } else {
                     info!("feed_scoreboard: Telegram disabled — daily rows written only");
