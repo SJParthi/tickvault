@@ -126,28 +126,49 @@ fn main_rs_spawns_fold_gated_after_seal_writer_install() {
     );
 }
 
-#[test]
-fn dhan_spot_leg_hands_off_confirmed_bars_at_both_flush_ok_arms() {
-    let src = read_source("crates/app/src/spot_1m_rest_boot.rs");
-    let prod = production_region(&src);
-
-    assert_eq!(
-        count_occurrences(
-            prod,
-            "rest_candle_fold::send_confirmed_bars(&confirmed_bars)"
-        ),
-        2,
-        "the Dhan spot leg must hand off confirmed bars at EXACTLY two sites \
-         (the fire flush-ok arm + the sweep flush-ok arm)"
-    );
-    // Fire: own-minute + backfill staging; sweep: swept-minute staging.
-    assert_eq!(
-        count_occurrences(prod, "ConfirmedBar::from_minute_candle("),
-        3,
-        "the Dhan spot leg must stage bars at the 3 append-ok arms \
-         (fire own-minute, fire backfill, sweep)"
-    );
-}
+// ---- `dhan_spot_leg_hands_off_confirmed_bars_at_both_flush_ok_arms` is
+// ---- RETIRED 2026-09-17 ----
+//
+// It pinned the PRODUCER side of the fold's live hand-off inside
+// `spot_1m_rest_boot.rs`: `ConfirmedBar::from_minute_candle(` at exactly the
+// 3 append-ok arms (fire own-minute, fire backfill, sweep) and
+// `rest_candle_fold::send_confirmed_bars(&confirmed_bars)` at exactly the 2
+// flush-ok arms. Those counts were the mechanism behind the module's
+// persist-CONFIRMED contract: a bar could only fold AFTER its ILP ACK.
+//
+// That file is gone. The Dhan per-minute spot REST leg is one of the two
+// classes the operator's SOCKETS-ONLY narrowing removed
+// (`no-rest-except-live-feed-2026-06-27.md` §12.10), so `read_source` on it
+// panics with a bare `No such file or directory (os error 2)`.
+//
+// ## ⚠ THE RESIDUAL THIS LEAVES, which is the reason to read this tombstone
+//
+// `rest_candle_fold::send_confirmed_bars` now has **ZERO production callers**
+// — the fold's live-bar inlet has no producer at all. `set_global_fold_bar_sender`
+// is still installed (`main.rs`, inside the `[rest_candle_fold] enabled`
+// gate), and that gate is `false` in `config/base.toml`, so nothing runs
+// today and nothing is broken today.
+//
+// It is NOT harmless if the gate is ever flipped: `send_confirmed_bars` with
+// no sender is a DOCUMENTED no-op (`test_send_confirmed_bars_no_sender_is_noop`),
+// so a fold turned on would install its channel, spawn its task, log a clean
+// start, and receive nothing — for the whole session, with no error and no
+// counter. That is the same producer-less-channel shape this branch already
+// had to close for `mark_forward` (§12.9(e) / §12.10.5 #4), where the fix was
+// an explicit `drop` so the already-written "no live producer" warn could
+// fire. There is no equivalent arm here, because the fold's inlet is a
+// first-wins `OnceLock` install rather than a channel whose closure is
+// observable.
+//
+// Recorded rather than fixed in this test: the disposition of the fold itself
+// is §12.10.7(g)'s open item ("removed or explicitly recorded as inert"), and
+// deciding that is a change to the fold, not to its guard. What this test can
+// honestly do is stop asserting a hand-off from a file that no longer exists,
+// and say plainly what went unwatched when it did.
+//
+// The three tests AROUND this one are UNCHANGED and still bind — the fold
+// module's own load-bearing pieces, its refusal to write `ticks`, and the
+// main.rs spawn ordering. None of them reads the deleted leg.
 
 #[test]
 fn fold_module_keeps_load_bearing_pieces() {
