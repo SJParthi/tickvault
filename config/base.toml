@@ -693,6 +693,31 @@ coverage_detail_rows    = true   # per-instrument detail rows (populated by PR-4
 presence_fold_enabled   = true   # hot-path presence fold (lands in PR-4)
 trigger_secs_of_day_ist = 56700  # 15:45:00 IST
 
+# ⚠ INERT since 2026-09-16 — NOTHING READS THIS SECTION.
+#
+# The per-minute Dhan REST legs were REMOVED under the operator's sockets-only
+# directive ("Bro just remove per minute price falls and 3.41 pm accuracy check
+# alone"). Every module is deleted: spot_1m_rest_boot.rs,
+# option_chain_1m_boot.rs, dhan_cadence_executor.rs, cadence_boot.rs and
+# crates/core/src/cadence/.
+#
+# The keys below still deserialize into a struct, so no loader complains — and
+# that is exactly the hazard: they read like live controls and change nothing.
+# `config_key_has_a_reader_guard` cannot see it either; despite its name it
+# proves a key has a matching struct FIELD, not a reader.
+#
+# Their last production reader was the boot Telegram's capture line, which is
+# why it spent a month telling the operator that removed legs were "armed"
+# (no-rest-except-live-feed-2026-06-27.md §12.14). It is now constant-folded
+# to `main.rs::DHAN_PER_MINUTE_LEGS_EXIST`, so these keys have ZERO readers.
+#
+# DELETING them — here and in config.rs — is the open §12.11 row. Not done in
+# the same change as the annotation because config.rs lives in crates/common,
+# which escalates to workspace-wide testing, and a half-verified config
+# deletion is worse than a clearly-labelled dead section.
+#
+# Flipping any value below has NO EFFECT. If you want per-minute REST capture
+# back, it needs a fresh dated operator quote and the modules rebuilt.
 [spot_1m_rest]
 enabled = false # stood down 2026-07-17 — the cadence scheduler's real executors own the Dhan spot pulls (RS3 mutual exclusion)
 # 2026-07-14 serving-delay diagnostics rider: LOG-ONLY one-shot probes
@@ -746,6 +771,31 @@ target_rps = 3
 # disabled; keeping it true preserves the probe as the automatic fallback
 # canary if `enabled` is ever rolled back).
 # ===========================================================================
+# ⚠ INERT since 2026-09-16 — NOTHING READS THIS SECTION.
+#
+# The per-minute Dhan REST legs were REMOVED under the operator's sockets-only
+# directive ("Bro just remove per minute price falls and 3.41 pm accuracy check
+# alone"). Every module is deleted: spot_1m_rest_boot.rs,
+# option_chain_1m_boot.rs, dhan_cadence_executor.rs, cadence_boot.rs and
+# crates/core/src/cadence/.
+#
+# The keys below still deserialize into a struct, so no loader complains — and
+# that is exactly the hazard: they read like live controls and change nothing.
+# `config_key_has_a_reader_guard` cannot see it either; despite its name it
+# proves a key has a matching struct FIELD, not a reader.
+#
+# Their last production reader was the boot Telegram's capture line, which is
+# why it spent a month telling the operator that removed legs were "armed"
+# (no-rest-except-live-feed-2026-06-27.md §12.14). It is now constant-folded
+# to `main.rs::DHAN_PER_MINUTE_LEGS_EXIST`, so these keys have ZERO readers.
+#
+# DELETING them — here and in config.rs — is the open §12.11 row. Not done in
+# the same change as the annotation because config.rs lives in crates/common,
+# which escalates to workspace-wide testing, and a half-verified config
+# deletion is worse than a clearly-labelled dead section.
+#
+# Flipping any value below has NO EFFECT. If you want per-minute REST capture
+# back, it needs a fresh dated operator quote and the modules rebuilt.
 [option_chain_1m]
 enabled = false # stood down 2026-07-17 — the cadence scheduler's real executors own the Dhan chain pulls (RS3; entitlement remains proven live 2026-07-13, §8.7)
 probe_and_report = true
@@ -1022,6 +1072,31 @@ enabled = false
 # Flipping `enabled = true` needs the real broker executors (a later PR)
 # + the dated rule-file note per
 # `.claude/rules/project/cadence-error-codes.md`.
+# ⚠ INERT since 2026-09-16 — NOTHING READS THIS SECTION.
+#
+# The per-minute Dhan REST legs were REMOVED under the operator's sockets-only
+# directive ("Bro just remove per minute price falls and 3.41 pm accuracy check
+# alone"). Every module is deleted: spot_1m_rest_boot.rs,
+# option_chain_1m_boot.rs, dhan_cadence_executor.rs, cadence_boot.rs and
+# crates/core/src/cadence/.
+#
+# The keys below still deserialize into a struct, so no loader complains — and
+# that is exactly the hazard: they read like live controls and change nothing.
+# `config_key_has_a_reader_guard` cannot see it either; despite its name it
+# proves a key has a matching struct FIELD, not a reader.
+#
+# Their last production reader was the boot Telegram's capture line, which is
+# why it spent a month telling the operator that removed legs were "armed"
+# (no-rest-except-live-feed-2026-06-27.md §12.14). It is now constant-folded
+# to `main.rs::DHAN_PER_MINUTE_LEGS_EXIST`, so these keys have ZERO readers.
+#
+# DELETING them — here and in config.rs — is the open §12.11 row. Not done in
+# the same change as the annotation because config.rs lives in crates/common,
+# which escalates to workspace-wide testing, and a half-verified config
+# deletion is worse than a clearly-labelled dead section.
+#
+# Flipping any value below has NO EFFECT. If you want per-minute REST capture
+# back, it needs a fresh dated operator quote and the modules rebuilt.
 [cadence]
 # Native micro-retry hedge + background history re-pull (2026-07-20 operator directive).
 native_retry_enabled = true
