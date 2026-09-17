@@ -4137,7 +4137,6 @@ dependencies = [
  "criterion",
  "dhat",
  "figment",
- "governor",
  "metrics",
  "metrics-exporter-prometheus",
  "notify",

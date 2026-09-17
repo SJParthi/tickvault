@@ -46,6 +46,43 @@
 //! It also renders NO verdict on thin evidence. Every threshold below has a
 //! refusal arm, and `Inconclusive` is a first-class outcome — a probe that
 //! always answers is a probe that will eventually answer wrongly.
+//!
+//! ## ⚠ SUPERSEDED 2026-09-17 — the question is SETTLED, and the oracle is FROZEN
+//!
+//! This module has had **zero production callers** since it was written, and
+//! two separate things have now made it unrunnable as designed. Both are
+//! recorded here rather than acted on: the operator's sockets-only narrowing
+//! named two classes and said *"alone"*
+//! (`no-rest-except-live-feed-2026-06-27.md` §12.10), and this is neither, so
+//! §12.11's disposition table reads *"recorded, not deleted here"*.
+//!
+//! **1. The question was answered, by a better method, eight days earlier.**
+//! The premise above — *"No Dhan document states which it is"* — is still
+//! true of the documents, and it stopped mattering on **2026-09-09**, when
+//! the Track 2 monotonicity SELECT ran against the live box over EVERY
+//! instrument that ticked that session: **9,879,724 ticks across 8,675
+//! instruments, 157 monotonicity violations = 0.0016%**
+//! (`.claude/plans/research/track-2-result-2026-09-09.md`). A per-packet
+//! quantity would fall on roughly half of all ticks, not on one in 630,000.
+//! The field is CUMULATIVE, and the 157 are arrival artefacts —
+//! intra-second transposition and the documented slow-consumer skip — which
+//! is exactly what `volume_leaderboard`'s gate refuses.
+//!
+//! That method is strictly better than this one and is the reason not to
+//! revive this module: it needs **no second source at all**, so it can be
+//! re-run on any future session, against any instrument, for free.
+//!
+//! **2. The oracle is frozen.** `rest_option_chain_1m` is RETAINED with real
+//! history and has had **no writer** since 2026-09-16 (§12.10). So the join
+//! this module performs still resolves for any trading day up to that date —
+//! the evidence is not destroyed — but it can never again be run against a
+//! fresh session, which is the only form in which it would have been worth
+//! running.
+//!
+//! **If a future change re-opens the question** (a new vendor, a changed
+//! packet layout), prefer the Track 2 shape: measure monotonicity inside
+//! `ticks` alone. Reviving this module means also finding it a live oracle,
+//! and there is not one.
 
 /// Per-contract evidence, one row per contract that appears in both sources.
 #[derive(Clone, Debug, PartialEq, Eq)]
