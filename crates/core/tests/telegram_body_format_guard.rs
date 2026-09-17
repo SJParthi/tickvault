@@ -128,10 +128,6 @@ fn routine_fixtures() -> Vec<NotificationEvent> {
         scorecard_clean(),
         scorecard(sentinel_feed("Dhan"), false, false, vec![]),
         scorecard(feed("Dhan"), false, true, vec![]),
-        NotificationEvent::Spot1mFetchRecovered {
-            minute_ist: "10:45 AM".to_string(),
-            failed_minutes: 3,
-        },
     ]
 }
 
@@ -385,20 +381,27 @@ fn guard_feed_off_renders_exactly_one_off_line() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. REST-pair fixture sanity (severities pinned so the routing/loudness
-//    contract behind the redesign cannot silently drift)
-// ---------------------------------------------------------------------------
 
-#[test]
-fn guard_rest_pair_severities_high_open_info_resolve() {
-    let degraded = NotificationEvent::Spot1mFetchDegraded {
-        consecutive_failed_minutes: 3,
-        minute_ist: "10:42 AM".to_string(),
-    };
-    assert_eq!(degraded.severity(), Severity::High);
-    let recovered = NotificationEvent::Spot1mFetchRecovered {
-        minute_ist: "10:45 AM".to_string(),
-        failed_minutes: 3,
-    };
-    assert_eq!(recovered.severity(), Severity::Info);
-}
+// ---------------------------------------------------------------------------
+// 8. REST-pair fixture sanity — RETIRED 2026-09-17
+// ---------------------------------------------------------------------------
+//
+// `guard_rest_pair_severities_high_open_info_resolve` pinned the
+// loudness contract behind the episode redesign: a REST leg's Degraded
+// arm is High (it pages, and at ≥ High it also sends SMS) while its
+// Recovered arm is Info (it closes the bubble green without a second
+// page). Drift in either direction was the regression — a High recovery
+// double-pages every flap, an Info degrade never reaches the phone.
+//
+// Both arms it probed (`Spot1mFetchDegraded` / `Spot1mFetchRecovered`)
+// are deleted with Dhan Telegram families 1 and 2, whose producers the
+// operator's SOCKETS-ONLY narrowing removed. Record:
+// `dhan-rest-only-noise-lock-2026-07-14.md` §2.4.
+//
+// The CONTRACT is unretired and still holds for every surviving
+// Open/Resolve pair — `WebSocketDisconnected`/`WebSocketReconnected` and
+// `OrderUpdateDisconnected`/`OrderUpdateReconnected`. What is lost is
+// only this file's probe of it; the episode FSM's own role mapping is
+// pinned by `episode_rest_family_wiring_guard`'s surviving family tests
+// and by the WS guards. If a future per-minute family is built, this is
+// the shape to restore.

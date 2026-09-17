@@ -41,10 +41,18 @@ self-heals SILENTLY.**
 
 | # | Allowed Dhan alert | Variant(s) / route | Fires when |
 |---|---|---|---|
-| 1 | Spot-1m pull failing / recovered | `Spot1mFetchDegraded` (High) / `Spot1mFetchRecovered` (Info) / `Spot1mSidNotServed` (High) / `Spot1mSidServedRecovered` (Info) | the per-minute spot leg's persist-gated 3-minute escalation edge (`rest-1m-pipeline-error-codes.md`) |
-| 2 | Option-chain pull failing / recovered | `ChainFetchDegraded` (High) / `ChainFetchRecovered` (Info) / `ChainEntitlementAbsent`/`Confirmed` / `ChainExpirylistFailed` (High) / **`Chain1mUnderlyingNotServed` (High) / `Chain1mUnderlyingServedRecovered` (Info) — added 2026-07-14 per the §2.1 dated directive (the Dhan mirror of the Groww #1537 per-underlying detector)** | the chain leg's own edges (`rest-1m-pipeline-error-codes.md`) |
+| 1 ⚠RETIRED 2026-09-17 (§2.4) | Spot-1m pull failing / recovered | `Spot1mFetchDegraded` (High) / `Spot1mFetchRecovered` (Info) / `Spot1mSidNotServed` (High) / `Spot1mSidServedRecovered` (Info) | the per-minute spot leg's persist-gated 3-minute escalation edge (`rest-1m-pipeline-error-codes.md`) |
+| 2 ⚠RETIRED 2026-09-17 (§2.4) | Option-chain pull failing / recovered | `ChainFetchDegraded` (High) / `ChainFetchRecovered` (Info) / `ChainEntitlementAbsent`/`Confirmed` / `ChainExpirylistFailed` (High) / **`Chain1mUnderlyingNotServed` (High) / `Chain1mUnderlyingServedRecovered` (Info) — added 2026-07-14 per the §2.1 dated directive (the Dhan mirror of the Groww #1537 per-underlying detector)** | the chain leg's own edges (`rest-1m-pipeline-error-codes.md`) |
 | 3 | Token could not be obtained | `AuthenticationFailed` / `TokenRenewalFailed` (both Critical; reworded 2026-07-14 to plain English naming DHAN + the consequence: "the Dhan spot-1m and option-chain pulls will stop until this is fixed") | mint/renewal is TERMINALLY dead — the mid-session watchdog pages **ONCE PER FAILING EPISODE** (H1a latch, 2026-07-14 fix round — never the pre-fix ~30-min repeat) on EITHER (a) a forced re-mint failing terminally OR (b) the H1b attempt cap: `REMINT_MAX_ATTEMPTS_PER_EPISODE` (= 3) re-mints all "succeeded" yet the profile stayed REAL-invalid (dead-dataPlan/segment class — the body names the N re-logins + that the spot-1m/chain pulls are blocked). The latch resets on a clean profile cycle. (Its terminal arm emits `AuthenticationFailed` directly, since `force_renewal` -> `acquire_token` pages nothing on a non-RESILIENCE-03 permanent failure; the Telegram body is redacted + truncated via the house sanitizer — M2.) |
 | 4 | Token expires soon (4h early warning) | CloudWatch alarm `tv-<env>-token-remaining-low` on `tv_token_remaining_seconds` → SNS → Telegram Lambda | the renewal loop stopped renewing (the watchdog-of-the-renewal-loop). The Lambda's wording is ANOTHER session's scope. |
+
+> **⚠ ROWS 1 AND 2 ARE RETIRED (2026-09-17) — the surviving Dhan Telegram set is
+> rows 3 and 4 plus the family-(5) live-lane signals.** Their producers (the
+> per-minute spot-1m and option-chain REST legs) were deleted by the operator's
+> SOCKETS-ONLY narrowing, so the eleven variants they carried have no production
+> constructor and are deleted rather than allowlisted. Full record, including what
+> is LOST and the family-3 body-wording follow-up: **§2.4** at the end of this file.
+> The rows stay in place per house convention (annotate, never rewrite).
 
 **§2.1 — 2026-07-14 (same day, second directive): the family-(2) row gains the per-underlying
 not-served pair.** Coordinator-relayed operator directive (verbatim intent, labeled as such —
@@ -3755,3 +3763,120 @@ path only (reports a healthy median while slow swaps vanish); takes the dial
 stamp in `DialSucceeded` rather than reading it (the recovery measurement then
 has nothing to measure from); or adds a per-INSTRUMENT dimension to any of them
 — the §2.3 cardinality rule stands.
+
+---
+
+## §2.4 — 2026-09-17: FAMILIES 1 AND 2 ARE RETIRED — their producers were removed by the SOCKETS-ONLY narrowing, and eleven variants could no longer be sent
+
+**No new authorization is claimed, and none is needed.** §3's REJECT list
+governs **ADDING** a Dhan-scoped page; this section RECORDS the removal of two
+families whose EMIT SITES the operator already authorized deleting, under
+`no-rest-except-live-feed-2026-06-27.md` §12.10:
+
+> "Bro just remove per minute price falls and 3.41 pm accuracy check alone dude okay"
+
+Recorded here BEFORE the variants are deleted, per the rule-file-first law,
+because §2's contract table is the surface a future session reads to learn what
+Dhan is allowed to page about — and leaving it naming two families that cannot
+fire is the stale-in-the-reassuring-direction class this file has corrected
+repeatedly.
+
+### What is retired, and why it is a consequence rather than a decision
+
+| §2 row | Families | Producer | Status |
+|---|---|---|---|
+| 1 | spot-1m pull failing / recovered | `spot_1m_rest_boot.rs`, `cadence_escalation.rs`, `dhan_cadence_executor.rs` | **all three DELETED** |
+| 2 | option-chain pull failing / recovered (incl. the §2.1 per-underlying pair) | `option_chain_1m_boot.rs`, the same two | **all DELETED** |
+| 3 | token could not be obtained | `mid_session_watchdog.rs`, `token_manager.rs` | **UNCHANGED — stands** |
+| 4 | token expires soon (4h) | CloudWatch alarm on `tv_token_remaining_seconds` | **UNCHANGED — stands** |
+
+The eleven `NotificationEvent` variants that carried families 1 and 2 —
+`Spot1mFetchDegraded`, `Spot1mFetchRecovered`, `Spot1mSidNotServed`,
+`Spot1mSidServedRecovered`, `ChainFetchDegraded`, `ChainFetchRecovered`,
+`ChainEntitlementAbsent`, `ChainEntitlementConfirmed`, `ChainExpirylistFailed`,
+`Chain1mUnderlyingNotServed`, `Chain1mUnderlyingServedRecovered` — therefore
+have **ZERO production constructors**. The tree already says so in its own
+words: `crates/core/tests/notification_variant_dispatch_guard.rs::
+the_set_of_unsendable_telegram_variants_only_shrinks` fails the build naming all
+eleven —
+
+> "these NotificationEvent variants have NO production constructor -- they
+> render, carry severity logic and tests, and can never be sent: … Wire a
+> dispatch site, or argue the entry onto NO_PRODUCTION_DISPATCHER in review."
+
+**So this is not a choice between keeping and removing a page.** The page cannot
+be sent. The choice is between DELETING the variants and allowlisting them onto
+`NO_PRODUCTION_DISPATCHER` — and the second is refused below.
+
+### Why the variants are DELETED rather than allowlisted
+
+`NO_PRODUCTION_DISPATCHER` exists for a variant that is *between* producers — a
+dispatch site that is coming, or one gated behind a flag. These eleven are
+neither: their legs are gone by operator directive and nothing will construct
+them again without a new REST leg, which §12 of the REST lock makes a REJECT on
+its own.
+
+Allowlisting them would leave eleven rendered-but-unsendable events in the enum,
+each with `topic()`, `severity()`, body-format and test coverage — a Telegram
+family that reads as live in every surface a reader consults (the enum, the
+severity table, the body-format guard) and can never fire. That is the
+dead-monitor shape this file records at §2.3f, one layer up: a permanently-quiet
+surface is not neutral, it certifies that the case is covered.
+
+**The sanctioned precedent is the Groww retirement (2026-08-21)**, recorded at
+§2.2 of this file: when the operator removed that feed, `CadenceExpiryDisagreement`
+was **RETIRED — variant, emit arm and the `notifier` threading deleted** — with
+the reasoning stated verbatim there: *"leaving them would have meant a declared
+Telegram family that nothing can send, which is exactly the permanently quiet
+surface this table's deleted rows exist to prevent."* Same shape, same answer.
+
+### The §2 contract table is now a TWO-item Dhan Telegram set
+
+Families 3 and 4 survive and are untouched. Every "deleted or silenced" row in
+§2's second table stays deleted and silenced, and the family-(5) LIVE-LANE set
+(§2.3 onward, nineteen signals) is **entirely unaffected** — it watches the
+socket lane, which is the surface the operator KEPT.
+
+### ⚠ What is LOST (Rule 11 — no false-OK)
+
+**The two REST legs no longer page, because the two REST legs no longer exist.**
+That is the whole of it, and it is worth stating plainly rather than implying
+these families were redundant: while the legs ran, family 1 was the ONLY signal
+that the per-minute spot pull had stopped, and family 2 the only signal for the
+option chain. Nothing replaces them, because there is nothing left to watch.
+
+What is NOT lost: the ability to detect a dead Dhan token. Family 3 fires from
+the mid-session watchdog and the renewal path, both of which serve the SOCKET
+lane's auth (the socket URL embeds the JWT — `no-rest-except-live-feed-2026-06-27.md`
+§12.1), so a terminally-dead token still pages. Its body text says "the Dhan
+spot-1m and option-chain pulls will stop until this is fixed", which is now
+wrong in the reassuring direction — **that wording is a follow-up, not fixed
+here**, and it is recorded rather than quietly left: the consequence to state is
+that the sixteen live sockets stop, which is larger than what the sentence says.
+
+### ⚠ NOT claimed
+
+- That any alarm changes. The seven CloudWatch alarm phrases for these families
+  were already deleted with their metric filters (`telegram_webhook.rs`
+  `ALARM_PHRASES` 112 → 105, and `alarm_phrase_coverage_guard`'s floor
+  re-derived 20 → 18 by the measured drop of exactly 7). This section removes
+  the typed events; the alarm side was closed in the same removal.
+- That the guard's floor is a coverage target. `notification_variant_dispatch_guard`
+  asserts the unsendable SET only shrinks — an anti-vacuity direction, not a
+  count to hit.
+- That family 3's body wording is corrected. It is not (above).
+
+### What a PR that violates §2.4 looks like (REJECT)
+
+- Re-adds any of the eleven variants without a REST leg to construct it — a
+  variant with no producer is the shape this section exists to remove.
+- Adds any of the eleven to `NO_PRODUCTION_DISPATCHER` instead of deleting it
+  (the allowlist is for a variant between producers, not one whose producer was
+  removed by directive).
+- Adds a NEW Dhan-scoped Telegram family outside the surviving §2 set (3 and 4)
+  plus the family-(5) live-lane signals, without its own fresh dated quote — §3
+  is unchanged and still binds.
+- Reads the two-item table as authorization to STOP watching Dhan: the
+  live-lane family (5) is the Dhan surface now, and it is nineteen signals, not
+  two.
+- Claims the REST legs are monitored. They are gone.
