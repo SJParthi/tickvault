@@ -66,7 +66,27 @@ use tickvault_storage::feed_scoreboard_persistence::{
     LAG_FLOOR_MS_TRUEDATA, SCOREBOARD_SESSION_MINUTES, SCOREBOARD_UNAVAILABLE_SENTINEL,
     ScoreboardOutcome, ensure_feed_scoreboard_tables,
 };
-use tickvault_storage::spot_1m_rest_persistence::SPOT_1M_REST_TABLE;
+
+/// The per-minute spot-1m REST capture table.
+///
+/// **RE-HOMED 2026-09-16.** This was
+/// `tickvault_storage::spot_1m_rest_persistence::SPOT_1M_REST_TABLE` until
+/// the per-minute spot-1m REST leg — the table's only WRITER — was removed
+/// under the operator's sockets-only directive
+/// (`no-rest-except-live-feed-2026-06-27.md` §12.10). The persistence module
+/// went with the writer; the **TABLE and every row already in it are
+/// RETAINED**, so the name still has to resolve.
+///
+/// ⚠ The table is FROZEN from 2026-09-16: it holds every row captured up to
+/// that date and gains no new ones. A query against it returns real history
+/// and, for any later trading day, zero rows — which is the correct answer,
+/// not a read failure.
+///
+/// The wire name is `rest_spot_1m`. The old MODULE was called
+/// `spot_1m_rest_persistence`, which is the reverse — a long-standing trap
+/// this repository's own §12.8(a) records, and the reason this const spells
+/// the wire name out rather than deriving it from anything.
+const SPOT_1M_REST_TABLE: &str = "rest_spot_1m";
 
 /// Parses the QuestDB `/exec` count response (`{"dataset":[[N]]}`). Pure.
 /// Relocated 2026-07-18 from the retired `tick_conservation_boot` module

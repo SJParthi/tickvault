@@ -1592,28 +1592,9 @@ pub const DHAN_GENERATE_TOKEN_PATH: &str = "/app/generateAccessToken";
 /// Endpoint: GET <https://api.dhan.co/v2/RenewToken>
 pub const DHAN_RENEW_TOKEN_PATH: &str = "/RenewToken";
 
-/// Path for intraday minute candle data (appended to rest_api_base_url).
-/// Endpoint: POST <https://api.dhan.co/v2/charts/intraday>
-pub const DHAN_CHARTS_INTRADAY_PATH: &str = "/charts/intraday";
-
 /// Path for daily candle data (appended to rest_api_base_url).
 /// Endpoint: POST <https://api.dhan.co/v2/charts/historical>
 pub const DHAN_CHARTS_HISTORICAL_PATH: &str = "/charts/historical";
-
-/// Path for the full option chain (appended to rest_api_base_url).
-/// Endpoint: POST <https://api.dhan.co/v2/optionchain>
-/// Requires BOTH `access-token` AND `client-id` headers; rate limit is
-/// 1 unique request per 3 seconds (re-verified 2026-07-12 — UNCHANGED;
-/// multiple DISTINCT underlyings may go concurrently within the window).
-/// Re-added 2026-07-12 for the per-minute REST pipeline PR-3 — the
-/// 2026-06-28 deletion removed the prior `OPTION_CHAIN_*` constants with
-/// the retired subsystem; this is the §8 REBUILD, not a revival.
-pub const DHAN_OPTION_CHAIN_PATH: &str = "/optionchain";
-
-/// Path for the option-chain expiry list (appended to rest_api_base_url).
-/// Endpoint: POST <https://api.dhan.co/v2/optionchain/expirylist>
-/// Same headers + rate limit class as [`DHAN_OPTION_CHAIN_PATH`].
-pub const DHAN_OPTION_CHAIN_EXPIRYLIST_PATH: &str = "/optionchain/expirylist";
 
 // ---------------------------------------------------------------------------
 // Authentication — User Profile & IP Management Endpoints
@@ -1811,225 +1792,12 @@ pub const SPOT_1M_REST_INDICES: [(SecurityId, &str); 4] = [
     (INDIA_VIX_SECURITY_ID, "INDIA VIX"),
 ];
 
-/// Consecutive counted not-served minutes for ONE SID before the ONE
-/// edge-latched per-SID `SPOT1M-01 stage="sid_not_served"` page fires
-/// (operator scope addition 2026-07-13 — the INDIA VIX live-probe
-/// companion). A minute COUNTS toward a SID's streak only when that SID
-/// failed/was empty while ≥1 OTHER SID succeeded in the SAME minute — a
-/// global-outage minute (zero SIDs served) neither counts nor resets, so
-/// this detector distinguishes vendor-not-serving-this-index from a
-/// general outage (which the [`SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD`]
-/// edge owns). Re-armed only by that SID's own recovery.
-pub const SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD: u32 = 10;
-
-/// Post-minute-close fire delay (ms) — the FIRST attempt of the in-minute
-/// ladder.
-///
-/// **2026-07-31 (operator directive): 300 ms → 5 ms.** The old 300 ms was a
-/// GUESS — this comment previously said Dhan needed "a beat to seal the
-/// just-closed candle" while admitting in the same breath that the docs do
-/// NOT document just-closed-minute availability latency, and nobody had ever
-/// measured it (`close_to_data_ms` was recorded but never shipped to
-/// CloudWatch; verified 2026-07-31, zero datapoints).
-///
-/// Operator verbatim: *"even beofre 800 ms or just below one second i need
-/// the enitre spot and otpion chain data … just go ahead ad check after 5ms
-/// itself"*.
-///
-/// Moving the START is safe because the ladder offsets below are measured
-/// FROM THE FIRST ATTEMPT: the old 300 ms survives as rung 4, so the
-/// worst-case schedule is NO WORSE than before — we only add three earlier
-/// chances. The 5 ms rung is what MEASURES the vendor's true seal latency
-/// (`tv_rest1m_first_success_offset_ms`), which then feeds the self-tuning
-/// start offset.
-pub const SPOT_1M_REST_FIRE_DELAY_MS: u64 = 5;
-
-/// Bounded in-minute re-poll ladder: offsets (ms) FROM THE FIRST ATTEMPT at
-/// which the fetch is re-polled when the target minute's candle is not yet
-/// in the response (or the attempt errored). After the last offset the
-/// minute is counted failed/empty — never an unbounded in-minute retry.
-/// Strictly increasing.
-///
-/// **2026-07-31 early-fire re-spacing (operator directive).** Offsets are
-/// measured FROM THE FIRST ATTEMPT, so with the 5 ms start the absolute
-/// attempt schedule is:
-///
-/// | rung | absolute | note |
-/// |---|---|---|
-/// | 1 | +5 ms | the operator's instant check |
-/// | 2 | +50 ms | |
-/// | 3 | +150 ms | |
-/// | 4 | **+300 ms** | the OLD start — preserved as a fallback rung |
-/// | 5 | +700 ms | last rung inside the operator's <800 ms window |
-/// | 6 | +1_500 ms | tail — capture completeness, not decision data |
-/// | 7 | +3_000 ms | tail |
-///
-/// Rungs 1-5 all land inside 700 ms (the operator's "before 800 ms"
-/// requirement); rungs 6-7 preserve the long tail so a genuinely slow vendor
-/// minute is still CAPTURED rather than dropped — the §38.8 decision-freshness
-/// gate already forbids a late row from being a trading input, so the tail
-/// costs nothing but completeness.
-pub const SPOT_1M_REST_RETRY_OFFSETS_MS: [u64; 6] = [45, 145, 295, 695, 1_495, 2_995];
-
-/// Deterministic per-SID ladder jitter STEP (ms) — each spot SID shifts its
-/// whole re-poll schedule by `slot × step` (slot = the SID's fixed position
-/// in [`SPOT_1M_REST_INDICES`]), so the 4 concurrent ladders never re-poll
-/// Dhan in lockstep (429-coordination follow-up 2026-07-13: the first live
-/// session showed `/v2/charts/intraday` rate-limiting when consumers
-/// align). Deterministic + pure — no randomness anywhere.
-pub const SPOT_1M_REST_LADDER_JITTER_STEP_MS: u64 = 150;
-
-/// Number of distinct jitter slots (== the pinned [`SPOT_1M_REST_INDICES`]
-/// arity): worst-case jitter is `(slots - 1) × step` = 450 ms (4 slots
-/// since the 2026-07-13 INDIA VIX scope addition).
-pub const SPOT_1M_REST_LADDER_JITTER_SLOTS: u64 = 4;
-
-/// Extra bounded backoff (ms) applied before the NEXT ladder attempt after
-/// an HTTP 429 (DH-904 class) response — gives Dhan's rate-limit window a
-/// beat instead of re-polling straight back into it (429-coordination
-/// follow-up 2026-07-13). Applied at most once per remaining rung (≤ 4×);
-/// the rung COUNT is unchanged (never an extra retry), and the worst-case
-/// schedule still fits the hard per-SID budget (const-asserted below).
-/// 429s stay counted via the existing `tv_spot1m_rate_limited_total`.
-pub const SPOT_1M_REST_429_EXTRA_BACKOFF_MS: u64 = 2_000;
-
-/// First per-minute fire boundary, IST seconds-of-day: 09:16:00 — the
-/// close of the session's first (09:15) 1-minute candle.
-pub const SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST: u32 = 9 * 3600 + 16 * 60;
-
-/// Last per-minute fire boundary, IST seconds-of-day: 15:40:00 — the close
-/// of the session's last (15:39) 1-minute candle. INCLUSIVE (the 15:40:00
-/// boundary itself fires, targeting the 15:39 candle).
-///
-/// 2026-08-07: 15:30 -> 15:40 with the NSE CAS session change of 2026-08-03
-/// (see `MARKET_CLOSE_IST_NANOS`). Ten additional per-minute fires per day.
-pub const SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST: u32 = 15 * 3600 + 40 * 60;
-
-/// Consecutive fully-failed minutes (no SID succeeded) before the ONE
-/// edge-triggered SPOT1M-01 escalation page fires. Re-armed only after a
-/// successful minute (audit-findings Rule 4 — edge-triggered alerts only).
-pub const SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD: u32 = 3;
-
-/// A fire woken more than this many seconds past its minute boundary is
-/// SKIPPED (suspend / clock-step defense — the rest_canary
-/// `PROBE_STALE_GRACE_SECS` precedent scaled to the 60 s cadence).
-pub const SPOT_1M_REST_FIRE_STALE_GRACE_SECS: u32 = 30;
-
-/// Per-REQUEST HTTP timeout (secs) for a single intraday poll. Deliberately
-/// SHORT (5 s, not the 15 s house Dhan-charts value): the fire budget is one
-/// minute, and a black-holed peer must never let the ladder overrun it
-/// (2026-07-12 hostile-review H2 — the 15 s value made the worst-case
-/// ladder ~81 s).
-pub const SPOT_1M_REST_REQUEST_TIMEOUT_SECS: u64 = 5;
-
-/// HARD wall-clock budget (secs) for ONE index's whole in-minute ladder —
-/// enforced with `tokio::time::timeout` around the ladder, so no
-/// combination of stalls can push a fire past the next boundary. A budget
-/// overrun counts as that SID's failure for the minute.
-/// **2026-07-31: 20 s → 22 s.** The early-fire re-spacing adds two ladder
-/// rungs (4 → 6 offsets), and the worst-case schedule assert below charges a
-/// full 429 extra-backoff PER RUNG — so the hostile bound grew by 2 × 2 s
-/// while the last offset shrank (6_000 → 2_995 ms). Net worst case is
-/// 20_445 ms, which no longer fits a 20 s budget. 22 s restores headroom and
-/// still leaves the whole ladder finishing far inside the 60 s minute
-/// (5 ms + 22 s = 22.005 s — const-asserted below).
-pub const SPOT_1M_REST_SID_BUDGET_SECS: u64 = 22;
-
-/// Maximum accepted response body size (bytes) for one intraday poll —
-/// one minute × one index is a few hundred bytes; even a grossly
-/// over-delivering full-day columnar response is well under 2 MiB. Bodies
-/// beyond the cap are rejected before buffering (the csv_downloader
-/// `MAX_CSV_BODY_BYTES` §18 hardening pattern).
-pub const SPOT_1M_REST_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
-
-// Compile-time consistency: the fire window is anchored to the canonical
-// session gate — first fire = market open + 60 s (the 09:15 candle closes
-// at 09:16:00); last fire = the 15:30:00 close boundary itself.
-const _: () = assert!(
-    SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST as i64 * 1_000_000_000
-        == MARKET_OPEN_IST_NANOS + 60 * 1_000_000_000,
-    "SPOT_1M first fire must be market open + 60s (09:16:00 IST)"
-);
-const _: () = assert!(
-    SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST as i64 * 1_000_000_000 == MARKET_CLOSE_IST_NANOS,
-    "SPOT_1M last fire must be the 15:30:00 IST close boundary"
-);
-const _: () = assert!(
-    SPOT_1M_REST_LADDER_JITTER_SLOTS == SPOT_1M_REST_INDICES.len() as u64,
-    "SPOT_1M jitter slot count must equal the pinned index arity"
-);
-const _: () = assert!(
-    SPOT_1M_REST_RETRY_OFFSETS_MS[0] < SPOT_1M_REST_RETRY_OFFSETS_MS[1]
-        && SPOT_1M_REST_RETRY_OFFSETS_MS[1] < SPOT_1M_REST_RETRY_OFFSETS_MS[2]
-        && SPOT_1M_REST_RETRY_OFFSETS_MS[2] < SPOT_1M_REST_RETRY_OFFSETS_MS[3],
-    "SPOT_1M retry offsets must be strictly increasing"
-);
-// The REAL in-minute budget math (2026-07-12 hostile-review H2 fix — the
-// earlier assert ignored per-request timeouts): the hard per-SID ladder
-// budget, plus the post-boundary fire delay, must finish inside the minute;
-// and the ladder's own schedule (last offset + one full request timeout)
-// must fit inside that budget so the timeout only fires on genuine stalls.
-const _: () = assert!(
-    SPOT_1M_REST_FIRE_DELAY_MS + SPOT_1M_REST_SID_BUDGET_SECS * 1_000 < 60_000,
-    "SPOT_1M per-SID ladder budget must finish inside the minute"
-);
-// 429-coordination follow-up (2026-07-13): the schedule bound now includes
-// the worst-case deterministic jitter ((slots-1) × step = 450 ms at the
-// 4-SID arity) AND a 429 extra backoff before EVERY remaining rung
-// (4 × 2 s = 8 s) — the fully hostile schedule (6 s + 0.45 s + 8 s + one
-// 5 s request timeout = 19.45 s) still fits the 20 s hard per-SID budget.
-const _: () = assert!(
-    SPOT_1M_REST_RETRY_OFFSETS_MS[SPOT_1M_REST_RETRY_OFFSETS_MS.len() - 1]
-        + (SPOT_1M_REST_LADDER_JITTER_SLOTS - 1) * SPOT_1M_REST_LADDER_JITTER_STEP_MS
-        + SPOT_1M_REST_RETRY_OFFSETS_MS.len() as u64 * SPOT_1M_REST_429_EXTRA_BACKOFF_MS
-        + SPOT_1M_REST_REQUEST_TIMEOUT_SECS * 1_000
-        < SPOT_1M_REST_SID_BUDGET_SECS * 1_000,
-    "SPOT_1M ladder schedule (last offset + max jitter + max 429 backoffs + one request timeout) must fit the budget"
-);
-
-// 2026-07-31 early-fire invariants (operator directive). These pin the three
-// properties that make moving the start from 300 ms to 5 ms SAFE rather than
-// merely faster.
-
-// (a) The ladder must stay strictly increasing — a non-monotonic schedule
-//     would re-poll out of order and make the first-success offset (the whole
-//     point of the measurement) meaningless.
-const _: () = {
-    let mut i = 1;
-    while i < SPOT_1M_REST_RETRY_OFFSETS_MS.len() {
-        assert!(
-            SPOT_1M_REST_RETRY_OFFSETS_MS[i] > SPOT_1M_REST_RETRY_OFFSETS_MS[i - 1],
-            "SPOT_1M retry offsets must be strictly increasing"
-        );
-        i += 1;
-    }
-};
-
-// (b) The OLD 300 ms start must survive as a rung. This is what guarantees
-//     the early-fire change can never be WORSE than the previous behaviour:
-//     whatever the vendor does, we still poll at the instant we used to.
-const _: () = {
-    let mut found = false;
-    let mut i = 0;
-    while i < SPOT_1M_REST_RETRY_OFFSETS_MS.len() {
-        if SPOT_1M_REST_FIRE_DELAY_MS + SPOT_1M_REST_RETRY_OFFSETS_MS[i] == 300 {
-            found = true;
-        }
-        i += 1;
-    }
-    assert!(
-        found,
-        "the pre-2026-07-31 300 ms fire instant must remain a ladder rung — \
-         it is the proof that early-fire is never worse than the old schedule"
-    );
-};
-
-// (c) The operator's decision window: at least one rung must land at or
-//     before 800 ms, or the change fails its own purpose.
-const _: () = assert!(
-    SPOT_1M_REST_FIRE_DELAY_MS + SPOT_1M_REST_RETRY_OFFSETS_MS[0] <= 800,
-    "the first re-poll must land inside the operator's <800 ms decision window"
-);
+/// Post-minute-close fire delay (ms): the fetcher wakes ~300 ms after each
+/// minute boundary so Dhan has a beat to seal the just-closed candle before
+/// the first poll. The docs do NOT document just-closed-minute availability
+/// latency — the bounded re-poll ladder below plus the
+/// `tv_spot1m_close_to_data_ms` histogram are the honest live probe.
+pub const SPOT_1M_REST_FIRE_DELAY_MS: u64 = 300;
 
 // ---------------------------------------------------------------------------
 // Shared Dhan Data-API rate limiter + self-tuning (operator pacing directive
@@ -2055,27 +1823,6 @@ pub const DHAN_DATA_API_RPS_CEILING: u32 = 4;
 /// 3 requests/sec pacing (2026-07-14).
 pub const DHAN_DATA_API_DEFAULT_TARGET_RPS: u32 = 3;
 
-/// Rolling window (minutes) over which observed HTTP-429s accumulate
-/// toward a step-down decision.
-pub const DHAN_DATA_API_TUNER_429_WINDOW_MINUTES: u64 = 2;
-
-/// 429 count within the rolling window that trips ONE step-down to the
-/// [`DHAN_DATA_API_RPS_FLOOR`] (edge-logged once; window cleared on the
-/// transition so a single burst can never cascade).
-pub const DHAN_DATA_API_TUNER_429_STEP_DOWN_THRESHOLD: u32 = 3;
-
-/// Consecutive CLEAN minutes (zero 429s observed) at a reduced rate before
-/// ONE step back UP one level toward the config target.
-pub const DHAN_DATA_API_TUNER_CLEAN_MINUTES_FOR_STEP_UP: u32 = 10;
-
-/// Adaptive-degrade threshold for the spot-1m ladder (2026-07-14 retry
-/// shaping): after this many CONSECUTIVE no-data minutes (zero SIDs served
-/// their own just-closed candle), the ladder drops to a single attempt per
-/// minute (no re-polls) until ANY success re-arms the full ladder. The
-/// 2026-07-14 live regime (0/980 served, ~244 wasted 429s from ladder
-/// re-fires against all-empty responses) is the incident this bounds.
-pub const SPOT_1M_REST_DEGRADE_AFTER_CONSECUTIVE_NO_DATA_MINUTES: u32 = 5;
-
 // Compile-time consistency for the tuning ladder.
 const _: () = assert!(
     DHAN_DATA_API_RPS_FLOOR >= 1
@@ -2086,17 +1833,6 @@ const _: () = assert!(
 const _: () = assert!(
     DHAN_DATA_API_RPS_CEILING < 5,
     "Dhan Data-API ceiling must stay below the published 5/sec account budget"
-);
-const _: () = assert!(
-    DHAN_DATA_API_TUNER_429_STEP_DOWN_THRESHOLD >= 1
-        && DHAN_DATA_API_TUNER_429_WINDOW_MINUTES >= 1
-        && DHAN_DATA_API_TUNER_CLEAN_MINUTES_FOR_STEP_UP >= 1,
-    "Dhan Data-API tuner thresholds must be non-degenerate"
-);
-const _: () = assert!(
-    SPOT_1M_REST_DEGRADE_AFTER_CONSECUTIVE_NO_DATA_MINUTES
-        >= SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD,
-    "adaptive degrade must not pre-empt the SPOT1M-01 escalation edge"
 );
 
 // ---------------------------------------------------------------------------
@@ -2163,115 +1899,6 @@ const _: () = assert!(
         && CHAIN_1M_UNDERLYINGS[1].0 != INDIA_VIX_SECURITY_ID
         && CHAIN_1M_UNDERLYINGS[2].0 != INDIA_VIX_SECURITY_ID,
     "INDIA VIX is SPOT-ONLY (2026-07-13 scope) — never an option-chain underlying"
-);
-
-/// Fallback post-boundary fire delay (ms) for the chain leg: the chain
-/// task normally wakes when the SPOT leg signals its minute complete
-/// (~0.3–1.5 s after the boundary); when the spot leg is disabled, dead,
-/// or slow, this timer fires the chain anyway — sequencing is best-effort,
-/// never a hard dependency ("never blocked forever if spot is dead").
-pub const CHAIN_1M_FALLBACK_DELAY_MS: u64 = 2_500;
-
-/// Defensive per-underlying minimum gap (secs) between two option-chain
-/// requests for the SAME underlying — Dhan's documented limit is 1 unique
-/// request per 3 seconds (option-chain.md rule 4; DISTINCT underlyings may
-/// go concurrently). One request per underlying per minute leaves ~60 s
-/// gaps, so this guard never engages in normal operation.
-pub const CHAIN_1M_MIN_GAP_SECS: u64 = 3;
-
-/// Per-REQUEST HTTP timeout (secs) for one option-chain / expirylist call.
-/// Chains are BIG (hundreds of strikes × 2 legs) — 10 s, double the spot
-/// leg's 5 s, still bounded well inside the minute by the budget below.
-pub const CHAIN_1M_REQUEST_TIMEOUT_SECS: u64 = 10;
-
-/// HARD wall-clock budget (secs) for ONE underlying's per-minute chain
-/// fetch (`tokio::time::timeout` around the whole leg) — overruns can
-/// never stack across boundaries; a budget trip is that underlying's
-/// failure for the minute.
-pub const CHAIN_1M_UNDERLYING_BUDGET_SECS: u64 = 20;
-
-/// Maximum accepted response body size (bytes) for one option-chain call —
-/// a full NIFTY chain (~150 strikes × 2 legs × ~17 fields) is ~200–400 KiB;
-/// 8 MiB bounds a hostile/misbehaving server (csv_downloader §18 pattern,
-/// streamed cap).
-pub const CHAIN_1M_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
-
-/// Consecutive fully-failed chain minutes (no underlying succeeded, or the
-/// persist leg failed) before the ONE edge-triggered CHAIN-02 escalation
-/// page fires — mirrors [`SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD`].
-pub const CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD: u32 = 3;
-
-/// Bounded day-start expirylist retry backoffs (secs) BETWEEN attempts —
-/// 3 attempts total (first try + these two backoffs). Each backoff is ≥
-/// [`CHAIN_1M_MIN_GAP_SECS`]: a retry of the SAME unique request inside
-/// Dhan's 1-unique-per-3s window would earn the very rate-limit reject it
-/// retries (hostile-review L1). On final failure the chain pipeline
-/// degrades to disabled-for-the-day (CHAIN-04; NEVER a guessed expiry —
-/// option-chain.md rule 9).
-pub const CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS: [u64; 2] = [3, 6];
-
-const _: () = assert!(
-    CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS[0] >= CHAIN_1M_MIN_GAP_SECS
-        && CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS[1] >= CHAIN_1M_MIN_GAP_SECS,
-    "expirylist retries must not re-enter Dhan's 1-unique-per-3s window"
-);
-
-// Compile-time consistency: the chain leg's whole fire (fallback delay +
-// per-underlying budget) must finish inside the minute, and the fallback
-// delay must be LONGER than the spot leg's post-boundary fire delay (the
-// chain is sequenced AFTER the spot fetch).
-const _: () = assert!(
-    CHAIN_1M_FALLBACK_DELAY_MS + CHAIN_1M_UNDERLYING_BUDGET_SECS * 1_000 < 60_000,
-    "CHAIN_1M fire (fallback delay + underlying budget) must finish inside the minute"
-);
-const _: () = assert!(
-    CHAIN_1M_FALLBACK_DELAY_MS > SPOT_1M_REST_FIRE_DELAY_MS,
-    "CHAIN_1M fallback delay must trail the spot leg's fire delay (chain fires after spot)"
-);
-const _: () = assert!(
-    CHAIN_1M_REQUEST_TIMEOUT_SECS < CHAIN_1M_UNDERLYING_BUDGET_SECS,
-    "CHAIN_1M per-request timeout must fit inside the per-underlying budget"
-);
-
-/// Hard wall-clock ceiling (secs after the minute close) past which a
-/// chain RETRY may no longer LAUNCH — the operator's ≤~15s decision-data
-/// window (2026-07-14 directive). Gates ONLY the retry pass; pass 1 is
-/// the unchanged concurrent fire (Dhan-documented: distinct underlyings
-/// concurrently; the 3s bound is per unique (underlying, expiry) key).
-pub const CHAIN_1M_DECISION_CEILING_SECS: u64 = 15;
-
-/// Per-underlying not-served threshold — pinned to the spot leg's value
-/// (and, transitively once #1537 merges, the Groww chain's).
-pub const CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD: u32 = 10;
-const _: () = assert!(
-    CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD == SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD,
-    "one not-served threshold family across the REST legs"
-);
-
-// P1. A worst-case TIMED-OUT first attempt still leaves its retry
-// launchable inside the ceiling: 2.5s fallback + 10s request timeout
-// = 12.5s ≤ 15s (the 2.5s remainder is the modeled limiter-queue
-// headroom at 3 rps; at the 2 rps floor under a 429 storm the REAL-clock
-// gate may refuse — counted, never silent).
-const _: () = assert!(
-    CHAIN_1M_FALLBACK_DELAY_MS + CHAIN_1M_REQUEST_TIMEOUT_SECS * 1_000
-        <= CHAIN_1M_DECISION_CEILING_SECS * 1_000,
-    "a timed-out first attempt must leave the retry launchable inside the ceiling"
-);
-
-// P2. A ceiling-edge retry can never overrun the minute:
-// 15s launch + 20s per-underlying budget = 35s < 60s.
-const _: () = assert!(
-    (CHAIN_1M_DECISION_CEILING_SECS + CHAIN_1M_UNDERLYING_BUDGET_SECS) * 1_000 < 60_000,
-    "a ceiling-edge retry must not overrun the minute"
-);
-
-// P3. A FAST-FAIL first attempt's same-key ≥3s gap always leaves the
-// retry launchable: 3s gap < 15s − 2.5s fallback.
-const _: () = assert!(
-    CHAIN_1M_MIN_GAP_SECS * 1_000
-        < CHAIN_1M_DECISION_CEILING_SECS * 1_000 - CHAIN_1M_FALLBACK_DELAY_MS,
-    "the same-key retry gap must fit inside the decision ceiling"
 );
 
 // ---------------------------------------------------------------------------
@@ -3853,47 +3480,6 @@ pub const fn g2_wall_clock_gate_accepts(wall_clock_ts_nanos_of_day: i64) -> bool
 // Tests — Market Hours Constants
 // ---------------------------------------------------------------------------
 
-/// Cadence native-retry hedge: re-poll offsets for a 2xx-empty leg, in ms
-/// after the minute close (decision deadline T+4s).
-///
-/// 2026-07-31 (operator directive — "dhan also shdou lfollwo the sam
-/// eapproach rigth dude which shodul be same and check if an donly if the
-/// isntant 0 ms fails aloen emans then 5 ms and icnremental check
-/// approach"): the FIRST FIRE moved to T+0 — the same instant as Groww
-/// (`cadence.dhan_burst_offset_ms = 0`, `config/base.toml`) — and the
-/// three EARLY rungs 5 / 300 / 1000 were PREPENDED here so a T+0 miss
-/// escalates immediately instead of waiting 2 full seconds. `5` is the
-/// operator's stated first-retry step; it is a RETRY offset, never the
-/// first fire.
-///
-/// The 1000 rung deliberately reproduces the PRE-2026-07-31 fire instant
-/// (`dhan_burst_offset_ms` was 1000), so the worst case of the T+0 fire is
-/// exactly the timing we ran all of 2026-07-31 (measured p50 1029ms) — the
-/// early fire can only add chances, never remove one.
-///
-/// Rate-budget honesty: the 4 spots consume 4 of Dhan's 5/sec Data-API
-/// budget at the T+5 burst, so the 300 rung has room for at most ONE
-/// re-fire inside that first rolling second; the cadence gate APPENDS any
-/// remaining retries at the next free rolling-window instant (~T+1005),
-/// which is what the 1000 rung anchors. Rungs are advisory earliest
-/// instants, never a guarantee of 4 concurrent re-fires.
-pub const CADENCE_NATIVE_RETRY_OFFSETS_MS: [i64; 6] = [5, 300, 1_000, 2_000, 3_000, 3_800];
-
-/// Max native micro-retry attempts per lane per minute (== offsets len).
-pub const CADENCE_NATIVE_RETRY_MAX_ATTEMPTS: usize = 6;
-
-/// Decision deadline after minute close: native data arriving before this
-/// wins; at the deadline the pre-prepared cross-fill fires with no extra wait.
-pub const CADENCE_DECISION_DEADLINE_MS: i64 = 4_000;
-
-/// HTTP keep-alive knobs for the cadence Dhan REST client (hedge plan item 4).
-/// The pool idle timeout MUST exceed the 60 s cadence period, or every minute's
-/// volley pays a fresh TCP+TLS handshake (measured 2026-07-20: Dhan cycles
-/// 1.05-4.02 s vs Groww 0.29-0.87 s). 120 s idle > 60 s period; OS TCP
-/// keepalive probes every 30 s keep NAT/LB paths warm between volleys.
-pub const CADENCE_HTTP_POOL_IDLE_TIMEOUT_SECS: u64 = 120;
-pub const CADENCE_HTTP_TCP_KEEPALIVE_SECS: u64 = 30;
-
 #[cfg(test)]
 mod market_hours_tests {
     use super::*;
@@ -4591,7 +4177,6 @@ mod tests {
         let paths = [
             DHAN_GENERATE_TOKEN_PATH,
             DHAN_RENEW_TOKEN_PATH,
-            DHAN_CHARTS_INTRADAY_PATH,
             DHAN_CHARTS_HISTORICAL_PATH,
             DHAN_USER_PROFILE_PATH,
             DHAN_SET_IP_PATH,
@@ -4697,13 +4282,21 @@ mod tests {
         );
     }
 
-    /// Spot 1m REST pipeline (operator grant 2026-07-12) — the index set
-    /// is pinned to NIFTY=13, BANKNIFTY=25, SENSEX=51 + INDIA VIX=21
-    /// (operator scope addition 2026-07-13, relayed via the coordinator
-    /// session: INDIA VIX joins the spot 1m pull, spot only, no option
-    /// chain), and the fire window is [09:16:00, 15:30:00] IST inclusive.
+    /// The REST-era universe pins that SURVIVED the 2026-09-16 removal of the
+    /// per-minute market-data REST legs. Renamed from
+    /// `test_spot_1m_rest_constants_pinned`, because it no longer pins a REST
+    /// leg: the fire window, the re-poll ladder, the jitter, the 429 backoff,
+    /// the per-SID budget and the body cap all went with the fetcher.
+    ///
+    /// What is left is load-bearing for a DIFFERENT reason, and that is why
+    /// the test is kept rather than retired with its neighbours:
+    /// `SPOT_1M_REST_INDICES` is the LIVE-UNIVERSE FALLBACK — the four index
+    /// SIDs the feed stack dials when the master artifact is unreadable — so
+    /// its arity and contents still decide what a degraded boot subscribes.
+    /// Its name says REST and its job does not; the pin is what keeps that
+    /// mismatch from becoming a silent edit.
     #[test]
-    fn test_spot_1m_rest_constants_pinned() {
+    fn test_surviving_rest_era_universe_constants_pinned() {
         assert_eq!(
             SPOT_1M_REST_INDICES,
             [
@@ -4725,144 +4318,20 @@ mod tests {
                 .all(|&(sid, _)| sid != INDIA_VIX_SECURITY_ID),
             "INDIA VIX is SPOT-ONLY — never a chain underlying"
         );
-        // Per-SID not-served detector threshold (~10 minutes).
-        assert_eq!(SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD, 10);
-        assert_eq!(SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST, 33_360); // 09:16:00
-        assert_eq!(SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST, 56_400); // 15:40:00
-        // Both boundaries are exact minute marks.
-        assert_eq!(SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST % 60, 0);
-        assert_eq!(SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST % 60, 0);
-        // 2026-07-31 early-fire re-spacing (operator directive): the first
-        // attempt moved 300 ms -> 5 ms and the ladder gained two rungs. The
-        // OLD 300 ms instant survives as rung 4 (asserted below) — that is
-        // what makes the change never-worse than the previous schedule.
-        assert_eq!(SPOT_1M_REST_FIRE_DELAY_MS, 5);
-        assert_eq!(
-            SPOT_1M_REST_RETRY_OFFSETS_MS,
-            [45, 145, 295, 695, 1_495, 2_995]
-        );
-        // Absolute attempt instants, measured from the minute close.
-        let attempts: Vec<u64> = std::iter::once(SPOT_1M_REST_FIRE_DELAY_MS)
-            .chain(
-                SPOT_1M_REST_RETRY_OFFSETS_MS
-                    .iter()
-                    .map(|o| SPOT_1M_REST_FIRE_DELAY_MS + o),
-            )
-            .collect();
-        assert_eq!(attempts, vec![5, 50, 150, 300, 700, 1_500, 3_000]);
-        assert!(
-            attempts.contains(&300),
-            "the pre-2026-07-31 300 ms fire instant must remain a rung"
-        );
-        assert!(
-            attempts.iter().filter(|a| **a <= 800).count() >= 5,
-            "at least five attempts must land inside the operator's <800 ms window"
-        );
-        assert!(
-            SPOT_1M_REST_RETRY_OFFSETS_MS
-                .windows(2)
-                .all(|w| w[0] < w[1]),
-            "re-poll ladder must be strictly increasing"
-        );
-        assert_eq!(SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD, 3);
-        assert!(u64::from(SPOT_1M_REST_FIRE_STALE_GRACE_SECS) * 1_000 < 60_000);
-        // 2026-07-12 H2 fix: the REAL minute budget — short per-request
-        // timeout + a hard per-SID ladder budget that fits the minute.
-        assert_eq!(SPOT_1M_REST_REQUEST_TIMEOUT_SECS, 5);
-        // 20 -> 22 with the early-fire re-spacing: the worst-case schedule
-        // assert charges a full 429 extra-backoff PER RUNG, so 4 -> 6 rungs
-        // adds 2 x 2 s to the hostile bound even though the LAST offset
-        // shrank (6_000 -> 2_995 ms). Net worst case 20_445 ms.
-        assert_eq!(SPOT_1M_REST_SID_BUDGET_SECS, 22);
-        assert!(
-            SPOT_1M_REST_FIRE_DELAY_MS + SPOT_1M_REST_SID_BUDGET_SECS * 1_000 < 60_000,
-            "budget must finish inside the minute"
-        );
-        assert!(
-            SPOT_1M_REST_RETRY_OFFSETS_MS[3] + SPOT_1M_REST_REQUEST_TIMEOUT_SECS * 1_000
-                < SPOT_1M_REST_SID_BUDGET_SECS * 1_000,
-            "ladder schedule must fit the budget"
-        );
-        // 429-coordination follow-up (2026-07-13): deterministic per-SID
-        // jitter + bounded 429 extra backoff, worst case still inside the
-        // hard 20 s per-SID budget (6 s + 0.45 s + 8 s + 5 s = 19.45 s at
-        // the 4-SID arity).
-        assert_eq!(SPOT_1M_REST_LADDER_JITTER_STEP_MS, 150);
-        assert_eq!(SPOT_1M_REST_LADDER_JITTER_SLOTS, 4);
-        assert_eq!(
-            SPOT_1M_REST_LADDER_JITTER_SLOTS as usize,
-            SPOT_1M_REST_INDICES.len(),
-            "jitter slots must equal the pinned index arity"
-        );
-        assert_eq!(SPOT_1M_REST_429_EXTRA_BACKOFF_MS, 2_000);
-        assert!(
-            SPOT_1M_REST_RETRY_OFFSETS_MS[3]
-                + (SPOT_1M_REST_LADDER_JITTER_SLOTS - 1) * SPOT_1M_REST_LADDER_JITTER_STEP_MS
-                + SPOT_1M_REST_RETRY_OFFSETS_MS.len() as u64 * SPOT_1M_REST_429_EXTRA_BACKOFF_MS
-                + SPOT_1M_REST_REQUEST_TIMEOUT_SECS * 1_000
-                < SPOT_1M_REST_SID_BUDGET_SECS * 1_000,
-            "worst-case jittered + 429-backed-off schedule must fit the budget"
-        );
-        assert_eq!(SPOT_1M_REST_MAX_BODY_BYTES, 2 * 1024 * 1024);
+        assert_eq!(SPOT_1M_REST_FIRE_DELAY_MS, 300);
     }
 
-    /// Option-chain 1m REST pipeline (operator grant 2026-07-12, PR-3) —
-    /// the endpoint paths + the chain leg's bounded timing envelope.
-    #[test]
-    fn test_chain_1m_constants_pinned() {
-        assert_eq!(DHAN_OPTION_CHAIN_PATH, "/optionchain");
-        assert_eq!(DHAN_OPTION_CHAIN_EXPIRYLIST_PATH, "/optionchain/expirylist");
-        assert!(DHAN_OPTION_CHAIN_PATH.starts_with('/'));
-        assert!(DHAN_OPTION_CHAIN_EXPIRYLIST_PATH.starts_with('/'));
-        // The chain fires AFTER the spot leg; its fallback timer trails the
-        // spot fire delay and the whole fire fits inside the minute.
-        assert_eq!(CHAIN_1M_FALLBACK_DELAY_MS, 2_500);
-        assert!(CHAIN_1M_FALLBACK_DELAY_MS > SPOT_1M_REST_FIRE_DELAY_MS);
-        assert_eq!(CHAIN_1M_REQUEST_TIMEOUT_SECS, 10);
-        assert_eq!(CHAIN_1M_UNDERLYING_BUDGET_SECS, 20);
-        assert!(CHAIN_1M_FALLBACK_DELAY_MS + CHAIN_1M_UNDERLYING_BUDGET_SECS * 1_000 < 60_000);
-        assert!(CHAIN_1M_REQUEST_TIMEOUT_SECS < CHAIN_1M_UNDERLYING_BUDGET_SECS);
-        // Dhan's documented option-chain limit: 1 unique request / 3s.
-        assert_eq!(CHAIN_1M_MIN_GAP_SECS, 3);
-        assert_eq!(CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD, 3);
-        assert_eq!(CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS, [3, 6]);
-        // Each expirylist retry backoff clears the 1-unique-per-3s window
-        // (retrying the SAME request inside it earns the reject it retries).
-        assert!(CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS[0] >= CHAIN_1M_MIN_GAP_SECS);
-        assert_eq!(CHAIN_1M_MAX_BODY_BYTES, 8 * 1024 * 1024);
-    }
-
-    /// 2026-07-14 chain-capture hardening: the retry decision ceiling +
-    /// the per-underlying not-served threshold, pinned alongside their
-    /// existing schedule partners (2500ms fallback / 10s request timeout /
-    /// 20s budget) so the P1–P3 const-assert proofs stay meaningful.
-    #[test]
-    fn test_chain_decision_ceiling_constants_pinned() {
-        assert_eq!(CHAIN_1M_DECISION_CEILING_SECS, 15);
-        assert_eq!(CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD, 10);
-        assert_eq!(
-            CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD,
-            SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD
-        );
-        // The schedule partners the ceiling proofs are computed against.
-        assert_eq!(CHAIN_1M_FALLBACK_DELAY_MS, 2_500);
-        assert_eq!(CHAIN_1M_REQUEST_TIMEOUT_SECS, 10);
-        assert_eq!(CHAIN_1M_UNDERLYING_BUDGET_SECS, 20);
-        // P1: a timed-out first attempt leaves the retry launchable.
-        assert!(
-            CHAIN_1M_FALLBACK_DELAY_MS + CHAIN_1M_REQUEST_TIMEOUT_SECS * 1_000
-                <= CHAIN_1M_DECISION_CEILING_SECS * 1_000
-        );
-        // P2: a ceiling-edge retry never overruns the minute.
-        assert!(
-            (CHAIN_1M_DECISION_CEILING_SECS + CHAIN_1M_UNDERLYING_BUDGET_SECS) * 1_000 < 60_000
-        );
-        // P3: the same-key ≥3s gap fits inside the ceiling.
-        assert!(
-            CHAIN_1M_MIN_GAP_SECS * 1_000
-                < CHAIN_1M_DECISION_CEILING_SECS * 1_000 - CHAIN_1M_FALLBACK_DELAY_MS
-        );
-    }
+    // `test_chain_1m_constants_pinned` and
+    // `test_chain_decision_ceiling_constants_pinned` RETIRED 2026-09-16.
+    // Every constant they pinned — the option-chain endpoint paths, the
+    // fallback delay, the request timeout, the per-underlying budget, the
+    // 1-unique-per-3s gap, the expirylist backoff ladder, the body cap, the
+    // decision ceiling and the not-served threshold — was deleted with the
+    // per-minute option-chain REST leg the operator ordered removed. A pin
+    // on a deleted constant cannot compile, and re-pointing these at
+    // surviving constants would assert a different contract under the old
+    // names. The two survivors of that neighbourhood, CHAIN_1M_UNDERLYINGS
+    // and its VIX exclusion, keep their pins in the test above.
 
     /// Constant pin — 60s grace after close.
     #[test]

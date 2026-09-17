@@ -134,56 +134,108 @@
 # =============================================================================
 
 # ---------------------------------------------------------------------------
-# The market-hours liveness alarm — pages when tv_rest_1m_fire_heartbeat is
-# MISSING (app wedged / crash-looped / dead OR no REST 1m leg ever fired this
-# session; signal moved off tv_groww_exchange_lag_p99_seconds 2026-07-15 and
-# off the retired SLO score 2026-07-13). Actions gated to market hours.
-# HONEST SIGNAL CHOICE — tv_rest_1m_fire_heartbeat (2026-07-15):
-#   SIGNAL MOVED AGAIN 2026-07-15 (Groww live-feed retirement, operator
-#   directive: "remove the whole Groww live feed; keep only spot 1m and
-#   option chain for both brokers"). The previous gauge's ONLY sample
-#   producer — record_groww_tick in the deleted Groww bridge — died with
-#   the feed, so tv_groww_exchange_lag_p99_seconds would be MISSING all
-#   session and this breaching-on-missing alarm would false-SOS ~09:25 IST
-#   daily (the exact Phase-A failure shape, one knob later).
-#   New signal: tv_rest_1m_fire_heartbeat — an unlabeled gauge set ONCE PER
-#   PER-MINUTE FIRE by BOTH retained REST 1m spot legs
-#   (crates/app/src/spot_1m_rest_boot.rs and dhan_cadence_executor.rs,
-#   fire_one_minute). Deliberately NOT pre-registered at boot: the first
-#   set at the 09:16:01 IST fire IS the session-start signal, and
-#   metrics-exporter-prometheus re-renders the last value on every scrape
-#   thereafter — a WEDGED/DEAD/crash-looped process, or a session where NO
-#   REST leg ever fired, goes MISSING and pages. HONEST COVERAGE BOUND
-#   (2026-07-15 fix round): because the exporter re-renders the last gauge
-#   value on every scrape, a REST leg (or all of them) dying MID-SESSION
-#   after the first fire keeps the gauge published — that class is NOT
-#   covered here; it is owned by the legs' own persist-gated escalation
-#   pages (SPOT1M-01 / CHAIN-02 stage="escalation" filters). This alarm's
-#   real coverage = process/exporter death + never-fired sessions.
-#   The 1.0 value is a constant marker — only sample PRESENCE matters.
-#   BATCH-MODE note (2026-07-15 fix round): the Dhan spot leg's
-#   batch_catchup loop now ALSO stamps the heartbeat once per batch cycle,
-#   so every retained REST spot mode sets it; residual — a large
-#   batch_interval_minutes whose FIRST grid fire lands after the 09:20 IST
-#   gate-open + 5x60s eval still pages until that first cycle
-#   (per_minute is the supported default).
+# The market-hours liveness alarm — pages when the app's liveness signal is
+# MISSING (app wedged / crash-looped / dead). Actions gated to market hours.
+#
+# SIGNAL MOVED THREE TIMES, and each move is recorded because each was forced
+# by a producer dying rather than by a preference:
+#   2026-07-13  off the retired SLO score
+#   2026-07-15  off tv_groww_exchange_lag_p99_seconds (Groww live feed retired)
+#   2026-09-16  off tv_rest_1m_fire_heartbeat  ← current
+#
+# HONEST SIGNAL CHOICE — tv_dhan_feed_last_tick_age_secs (2026-09-16):
+#   The heartbeat's three producers (spot_1m_rest_boot.rs x2 and
+#   dhan_cadence_executor.rs) were deleted under the operator's sockets-only
+#   directive — "Bro just remove per minute price falls and 3.41 pm accuracy
+#   check alone dude okay" (no-rest-except-live-feed-2026-06-27.md §12.10).
+#
+#   ⚠ RE-POINTING WAS NOT OPTIONAL. This alarm is treat_missing_data =
+#   "breaching", so deleting the producers without acting would have paged
+#   EVERY gated market window, forever, for a metric nothing writes. A
+#   permanently-RED alarm is worse than a permanently-green one: green gets
+#   ignored, red gets MUTED — and muting this one silently disables the
+#   app-liveness signal, which is real.
+#
+#   ⚠ RETIRING IT WAS CONSIDERED AND REFUSED ON MEASUREMENT, not preference.
+#   The obvious argument is that tv-<env>-dhan-no-ticks-flowing already covers
+#   a dead app. Measured across the gated set:
+#     market-hours-liveness-missing  60s  x 5  = ~5 min to page
+#     dhan-no-ticks-flowing         300s  x 2  = ~10 min
+#     dhan-live-lane-down           300s  x 2  = ~10 min
+#     app-log-ingestion-silent      300s  x 3  = ~15 min
+#   This is the ONLY 60-second-period alarm in the entire gated set. Retiring
+#   it would have DOUBLED detection latency on the one failure class it exists
+#   for. period and evaluation_periods are therefore UNCHANGED by this move.
+#
+#   New signal: tv_dhan_feed_last_tick_age_secs, a gauge published on the live
+#   lane's 30-second silence timer, unconditionally and BEFORE the market-hours
+#   gate — so the series is dense from the drain's first second whether or not
+#   a frame ever arrives, which is precisely what a breaching-on-missing alarm
+#   needs. It was already EMF-selected (2026-08-21), so this move costs no new
+#   metric name and no user-data byte.
+#
+#   HONEST COVERAGE BOUND, carried forward unchanged in substance: this alarm
+#   covers process/exporter DEATH. It does not cover a live process whose data
+#   has gone stale — the exporter re-renders the last gauge value on every
+#   scrape, so a lane that stops receiving keeps publishing a (climbing) age.
+#   That class is owned by tv-<env>-dhan-no-ticks-flowing, which reads the same
+#   gauge with a Maximum >= 300 threshold. The two are complementary by design:
+#   this one is the ~5-minute MISSING-data detector, that one the ~10-minute
+#   STALE-data detector.
+#
 #   Evaluation shape, treat_missing_data = "breaching", dimensions and the
 #   09:20–15:35 IST window gate are UNCHANGED (metric_name-only swap).
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "market_hours_liveness_missing" {
   alarm_name        = "tv-${var.environment}-market-hours-liveness-missing"
-  alarm_description = "App liveness signal ABSENT during MARKET HOURS — tv_rest_1m_fire_heartbeat (set once per per-minute REST 1m fire by the retained Dhan spot leg, crates/app/src/spot_1m_rest_boot.rs and dhan_cadence_executor.rs) has not been published for ~5 min. Signal moved 2026-07-15: the Groww live feed (the previous lag gauge's only sample producer) is retired per the operator directive; missing heartbeat in-window now means the app is WEDGED/CRASH-LOOPING/OOM-killed/DEAD OR the per-minute REST spot leg stopped firing — both need operator action between 09:15-15:30 IST. Check: SSM → the box → 'systemctl status tickvault' + 'systemctl is-failed tickvault' + 'docker ps' + tail /opt/tickvault/logs/errors.jsonl + the SPOT1M-01/CHAIN-02 runbook (rest-1m-pipeline-error-codes.md). See operator-charter-forever.md §C."
+  alarm_description = "App liveness signal ABSENT during MARKET HOURS — tv_dhan_feed_last_tick_age_secs (published every 30s by the live lane's silence timer, unconditionally and before the market-hours gate) has not been published for ~5 min. MISSING here means the PROCESS is gone: wedged, crash-looping, OOM-killed or dead. It does NOT mean the feed went quiet — a live process with a stale feed keeps publishing a climbing age, and that class is owned by tv-${var.environment}-dhan-no-ticks-flowing (same gauge, Maximum >= 300). Signal moved 2026-09-16: the previous metric (tv_rest_1m_fire_heartbeat) lost all three producers when the per-minute REST legs were removed under the operator's sockets-only directive; this alarm is the only ~5-minute detector in the gated set, so it was re-pointed rather than retired. Check: SSM → the box → 'systemctl status tickvault' + 'systemctl is-failed tickvault' + 'docker ps' + tail /opt/tickvault/logs/errors.jsonl. See operator-charter-forever.md §C."
 
-  # LessThanThreshold / threshold=0 / statistic=Maximum: the lag p99 is >= 0,
-  # so a present value never satisfies <0 (present = OK); a MISSING metric is
-  # forced BREACHING below. Same math as boot-heartbeat-alarm.tf.
+  # LessThanThreshold / threshold=0 / statistic=Maximum: the metric is an AGE
+  # in seconds and is therefore >= 0, so a present value never satisfies <0
+  # (present = OK); a MISSING metric is forced BREACHING below. Same math as
+  # boot-heartbeat-alarm.tf, and it holds for the re-pointed gauge for the same
+  # reason it held for the lag p99 and the heartbeat marker before it: all
+  # three are non-negative, so only ABSENCE can trip this comparison.
   comparison_operator = "LessThanThreshold"
   evaluation_periods  = 5 # five missing 60s periods = ~5 min absent before paging
-  # 2026-07-15 (Groww live retirement): was tv_groww_exchange_lag_p99_seconds
-  # — its only sample producer (the Groww bridge) is deleted; see the
-  # 2026-07-15 HONEST SIGNAL CHOICE block above. 2026-07-13 history: was
-  # tv_realtime_guarantee_score (lane-owned publisher, retired with the lane).
-  metric_name = "tv_rest_1m_fire_heartbeat"
+  # 2026-09-16 (sockets-only removal): was tv_rest_1m_fire_heartbeat, whose
+  # THREE producers — the cadence executor and two sites in the spot-1m boot
+  # module — were all deleted with the per-minute market-data REST legs under
+  # the operator's directive recorded in
+  # `no-rest-except-live-feed-2026-06-27.md` §12.10.
+  #
+  # ⚠ THIS RE-POINT IS NOT OPTIONAL, and it is the sharp edge of that removal.
+  # This alarm is `treat_missing_data = "breaching"` (see below), so deleting
+  # the producers WITHOUT moving the metric would have paged every gated
+  # market window, every trading day, forever. A permanently-RED alarm is
+  # WORSE than a permanently-green one: green gets ignored, red gets MUTED —
+  # and muting this one silently disables the app-liveness signal it exists
+  # to carry.
+  #
+  # RETIRING it was considered and REFUSED on measurement, not preference.
+  # `dhan-no-ticks-flowing` reads the same gauge but at 2 x 300s = ~10 min;
+  # this alarm is the ONLY 60-second-period alarm in the entire gated set, so
+  # retiring it would have DOUBLED detection latency on the one failure class
+  # it covers. `period` and `evaluation_periods` are therefore UNCHANGED: the
+  # ~5-minute detection is the whole point of keeping it.
+  #
+  # The replacement is a like-for-like liveness signal: published on the
+  # drain's 30-second silence timer, unconditionally and before the
+  # market-hours gate, so it is DENSE from the drain's first second and
+  # ABSENT exactly when the app is not running. Already EMF-selected, so this
+  # is a metric_name swap and costs nothing.
+  #
+  # The two alarms are complementary rather than duplicative: this one is the
+  # ~5-minute MISSING-data detector (the process or its exporter stopped
+  # publishing at all); `dhan-no-ticks-flowing` stays the ~10-minute
+  # STALE-data detector (the gauge is present and climbing).
+  #
+  # 2026-07-15 history (Groww live retirement): was
+  # tv_groww_exchange_lag_p99_seconds — its only sample producer (the Groww
+  # bridge) was deleted; see the 2026-07-15 HONEST SIGNAL CHOICE block above.
+  # 2026-07-13 history: was tv_realtime_guarantee_score (lane-owned
+  # publisher, retired with the lane).
+  metric_name = "tv_dhan_feed_last_tick_age_secs"
   namespace   = local.app_namespace
   period      = 60
   statistic   = "Maximum"
@@ -624,10 +676,23 @@ resource "aws_cloudwatch_metric_alarm" "market_hours_gate_lambda_errors" {
 }
 
 # Open the liveness window at 09:20 IST (03:50 UTC) Mon-Fri — 5 min after the
-# 09:15 IST market open, giving the REST 1m legs' first fire (09:16:01 IST)
-# time to set tv_rest_1m_fire_heartbeat on a healthy session (2026-07-15
-# signal swap; was the Groww lag publisher's >= 50-sample budget before that,
-# and the SLO score's budget pre-2026-07-13).
+# 09:15 IST market open. The 09:20 minute is LOAD-BEARING for a reason that has
+# nothing to do with which metric this alarm reads: it is the exact minute the
+# boot-heartbeat window CLOSES, so the two hand over with no seam across the
+# market open (2026-07-09, boot-heartbeat-alarm.tf). Do not move it to suit a
+# signal.
+#
+# What the 5 minutes were originally FOR was giving the reading metric time to
+# produce its first sample on a healthy session — the REST legs' first fire at
+# 09:16:01 IST (2026-07-15 swap), the Groww lag publisher's >= 50-sample budget
+# before that, the SLO score's budget pre-2026-07-13.
+#
+# After the 2026-09-16 re-point that budget is no longer the binding
+# consideration: tv_dhan_feed_last_tick_age_secs is published on the lane's 30s
+# silence timer from the drain's first second — well before 09:15, let alone
+# 09:20 — so a healthy session has a dense series long before the window opens.
+# The handover is now the only reason this minute is what it is, and it is
+# sufficient on its own.
 resource "aws_cloudwatch_event_rule" "tv_market_hours_liveness_open" {
   name                = "tv-${var.environment}-market-hours-liveness-open"
   description         = "Enable market-hours liveness alarm actions at 09:20 IST (Mon-Fri)"
@@ -678,7 +743,7 @@ resource "aws_lambda_permission" "tv_market_hours_liveness_close" {
 }
 
 output "market_hours_liveness_alarm_name" {
-  description = "Market-hours liveness alarm (pages on a wedged/crash-looped/dead app OR a session where the REST 1m spot leg never fired, in the 09:20-15:35 IST window). Signal: the tv_rest_1m_fire_heartbeat gauge MISSING (treat_missing_data=breaching) — set once per per-minute fire by the retained Dhan REST 1m spot leg (spot_1m_rest_boot.rs + dhan_cadence_executor.rs), in the CW-agent filter (user-data.sh.tftpl). Signal moved off tv_groww_exchange_lag_p99_seconds on 2026-07-15 (Groww live-feed retirement) and off tv_realtime_guarantee_score on 2026-07-13 (PR-C2). Takes over from the boot-heartbeat window at exactly 09:20 IST (2026-07-09 — no seam over the 09:15 open). The same gate Lambda also window-gates the other ALARM_NAMES entry (app-log-ingestion-silent — list trimmed to 2 on 2026-07-17: boundary-catchup-storm-dhan retired with the stage-3 tick-aggregator deletion + dhan-exchange-lag-p99-high retired with the dead Dhan-lag chain; previously trimmed to 4 on 2026-07-15 with the Groww live-feed retirement)."
+  description = "Market-hours liveness alarm (pages on a wedged/crash-looped/dead app in the 09:20-15:35 IST window). Signal: the tv_dhan_feed_last_tick_age_secs gauge MISSING (treat_missing_data=breaching) — published every 30s by the live lane's silence timer, in the CW-agent EMF selector (deploy/aws/cloudwatch-agent.json). Signal moved off tv_rest_1m_fire_heartbeat on 2026-09-16 (the per-minute REST legs were removed under the operator's sockets-only directive, taking all three of that gauge's producers with them; re-pointed rather than retired because at 60s x 5 this is the only ~5-minute detector in the gated set), off tv_groww_exchange_lag_p99_seconds on 2026-07-15 (Groww live-feed retirement) and off tv_realtime_guarantee_score on 2026-07-13 (PR-C2). Takes over from the boot-heartbeat window at exactly 09:20 IST (2026-07-09 — no seam over the 09:15 open). The same gate Lambda also window-gates the other ALARM_NAMES entries."
   value       = aws_cloudwatch_metric_alarm.market_hours_liveness_missing.alarm_name
 }
 

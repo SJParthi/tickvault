@@ -105,15 +105,43 @@ fn test_every_live_table_ensure_fn_keeps_its_boot_call_site() {
         ("ensure_shadow_candle_tables", "src/candle_ddl_boot.rs"),
         // analyst console views (read-only projections)
         ("ensure_named_views", "src/candle_ddl_boot.rs"),
-        // spot_1m_rest — the spot legs
-        ("ensure_spot_1m_rest_table", "src/spot_1m_rest_boot.rs"),
-        ("ensure_spot_1m_rest_table", "src/cadence_boot.rs"),
-        // option_chain_1m — chain legs
-        (
-            "ensure_option_chain_1m_table",
-            "src/option_chain_1m_boot.rs",
-        ),
-        ("ensure_option_chain_1m_table", "src/cadence_boot.rs"),
+        // ---- The five REST-leg ensure rows are RETIRED 2026-09-17 ----
+        //
+        // They covered `spot_1m_rest` (×2 callers), `option_chain_1m` (×2) and
+        // `rest_fetch_audit` (×1). Every one of those five CALLERS and all
+        // three ensure FNS are gone: the operator's SOCKETS-ONLY narrowing
+        // (`no-rest-except-live-feed-2026-06-27.md` §12.10) removed the
+        // per-minute REST legs, and because each persistence module held its
+        // writer, its DDL and its table constant in ONE file, the modules were
+        // deleted whole. `grep -rn "fn ensure_spot_1m_rest_table" crates/`
+        // returns zero.
+        //
+        // ## Why these are RETIRED and not RE-HOMED
+        //
+        // §12.10.5 #6 of that rule file requires a DDL caller to be re-homed
+        // for every RETAINED table. Its premise — stated in §12.8(g) — is that
+        // the ensure fns survive and merely lose their callers. Measured
+        // false, above. So the choice was not "move a call" but "resurrect a
+        // CREATE TABLE for a table nothing will ever write again".
+        //
+        // That was REFUSED, and the decision is recorded with its reasoning in
+        // §12.11 of the same rule file (written BEFORE this edit, per the
+        // rule-file-first law). The short form: an empty table makes a reader
+        // report a measured zero where the truth is "there is no leg" — which
+        // is the blank-bar false-OK `operator_control_commands.rs` already
+        // paid for on 2026-09-03 with `rest_option_contract_1m`, where the
+        // house answer was to delete the QUERIES, not create the table. The
+        // requirement's PURPOSE ("no reader left erroring") is satisfied the
+        // other way: §12.11 names every surviving reader and its disposition.
+        //
+        // WHAT THIS TEST NO LONGER WATCHES, stated rather than implied: nothing
+        // here now asserts that a RETAINED-but-writer-less table has a DDL
+        // entry point. That is deliberate — for these three the honest state on
+        // a fresh volume is "absent", because on a fresh volume they would hold
+        // nothing either way. The rows BELOW are unchanged and still bind, and
+        // every one of them covers a table with a LIVE writer, which is the
+        // only case where a missing DEDUP key is silent corruption rather than
+        // an honest absence.
         // ticks — the live lane's own table. Its 5-key DEDUP
         // (ts, security_id, segment, capture_seq, feed) is what makes a WAL
         // replay idempotent; an ILP-auto-created table has none of it.
@@ -135,8 +163,8 @@ fn test_every_live_table_ensure_fn_keeps_its_boot_call_site() {
         // `ticks` and `market_depth`.
         ("ensure_top_volume_rank_table", "src/candle_ddl_boot.rs"),
         ("run_live_table_ddl_at_boot", "src/main.rs"),
-        // rest_fetch_audit — every REST leg's forensics
-        ("ensure_rest_fetch_audit_table", "src/spot_1m_rest_boot.rs"),
+        // (the `rest_fetch_audit` ensure row retired 2026-09-17 with the four
+        // REST-leg rows above — same removal, same reasoning, §12.11.)
         // tf_consistency_audit — 15:40 IST verifier
         (
             "ensure_tf_consistency_audit_table",

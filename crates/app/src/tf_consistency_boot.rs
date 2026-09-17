@@ -87,11 +87,11 @@ use tickvault_common::error_code::ErrorCode;
 use tickvault_common::segment::{segment_code_to_str, segment_str_to_code};
 use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_core::notification::{NotificationEvent, NotificationService};
-use tickvault_storage::spot_1m_rest_persistence::SPOT_1M_REST_TABLE;
 use tickvault_storage::tf_consistency_audit_persistence::{
     FindingCategory, TfConsistencyAuditWriter, TfConsistencyFinding,
     ensure_tf_consistency_audit_table,
 };
+use tickvault_storage::tick_persistence::TICKS_TABLE;
 use tickvault_trading::candles::TfIndex;
 
 /// IST seconds-of-day of the daily trigger (15:40:00) — after the Dhan
@@ -845,17 +845,32 @@ pub fn select_instruments_sql(feed: &str, day_start_ist_nanos: i64) -> String {
 }
 
 /// HIGH-3 (dead-fold false-OK, 2026-07-16): bounded COUNT of the SOURCE
-/// `spot_1m_rest` rows for a (feed, day) window. Fired ONLY when candle
-/// discovery came back EMPTY — with the REST-era bar-fold as the SOLE
-/// `candles_*` author, "zero candles" is genuinely NoData only when the
-/// source table is ALSO empty; source-rows-without-candles means the fold
-/// died silently and the pass must classify Blind (High), never NoData
-/// (Info). Same micros WHERE window shape as the sibling builders. Pure.
+/// rows for a (feed, day) window. Fired ONLY when candle discovery came
+/// back EMPTY — "zero candles" is genuinely NoData only when the source is
+/// ALSO empty; source-rows-without-candles means the fold died silently and
+/// the pass must classify Blind (High), never NoData (Info). Same micros
+/// WHERE window shape as the sibling builders. Pure.
+///
+/// **RE-POINTED 2026-09-16, from `rest_spot_1m` to `ticks`.** The original
+/// docblock justified the check with "the REST-era bar-fold is the SOLE
+/// `candles_*` author". That premise stopped being true on 2026-08-11, when
+/// the Dhan live lane took over candle authorship — so for a month this
+/// check has been asking a table that is not the source of the candles it
+/// guards. The per-minute REST writer is deleted as of today, which would
+/// have frozen that count at zero for every future day and silently
+/// downgraded this pass from **Blind (High Telegram)** to **NoData (Info)**
+/// on exactly the case it exists to catch.
+///
+/// Deleting the check was the smaller diff and would have been an
+/// UNDECLARED alarm-severity reduction. Re-pointing it at `ticks` — the
+/// live lane's own source — preserves the intent and repairs the stale
+/// premise in the same change. It is the same question, finally asked of
+/// the right table.
 #[must_use]
-pub fn select_spot_1m_count_sql(feed: &str, day_start_ist_nanos: i64) -> String {
+pub fn select_source_row_count_sql(feed: &str, day_start_ist_nanos: i64) -> String {
     let (start, end) = day_bounds_micros(day_start_ist_nanos);
     format!(
-        "SELECT count(*) FROM {SPOT_1M_REST_TABLE} \
+        "SELECT count(*) FROM {TICKS_TABLE} \
          WHERE feed = '{feed}' AND ts >= {start} AND ts < {end}"
     )
 }
@@ -1052,13 +1067,13 @@ pub fn classify_run_status(
 }
 
 /// HIGH-3 (2026-07-16): the empty-discovery source check — a positive
-/// `spot_1m_rest` row count while candle discovery is EMPTY means the
+/// source (`ticks`) row count while candle discovery is EMPTY means the
 /// bar-fold (the sole `candles_*` author) produced nothing; the pass must
 /// mark the source as seen so `classify_run_status` yields Blind, never
 /// NoData. Pure.
 #[must_use]
-pub fn empty_candles_with_spot_rows_is_blind(spot_1m_rows: i64) -> bool {
-    spot_1m_rows > 0
+pub fn empty_candles_with_source_rows_is_blind(source_rows: i64) -> bool {
+    source_rows > 0
 }
 
 /// Combine the two per-pass statuses into the run verdict: both feeds off
@@ -1407,24 +1422,24 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
         // HIGH-3 (dead-fold false-OK, 2026-07-16): with the REST-era
         // bar-fold as the SOLE candles_* author, zero candle rows is
         // genuinely "nothing to check" ONLY when the SOURCE table is also
-        // empty. One bounded COUNT against spot_1m_rest decides: source
+        // empty. One bounded COUNT against `ticks` decides: source
         // rows without candles = the fold died silently → the pass marks
         // the source seen so classification reads Blind (High Telegram),
         // never NoData (Info). A failed count read degrades the pass
         // (which ALSO classifies Blind at zero compared) — never a silent
         // NoData on an unproven emptiness.
-        let count_sql = select_spot_1m_count_sql(p.feed, day_start_nanos);
+        let count_sql = select_source_row_count_sql(p.feed, day_start_nanos);
         match http_get_text(p.client, p.exec_url, &count_sql).await {
             Ok(body) => match parse_count_dataset(&body) {
-                Some(spot_rows) if empty_candles_with_spot_rows_is_blind(spot_rows) => {
+                Some(source_rows) if empty_candles_with_source_rows_is_blind(source_rows) => {
                     stats.rows_seen = true;
                     error!(
                         code = ErrorCode::TfVerify02RunDegraded.code_str(),
                         stage = "source_without_candles",
                         feed = p.feed,
                         date = %stats.date_label,
-                        spot_rows,
-                        "TF-VERIFY-02: spot_1m_rest carries rows for this \
+                        source_rows,
+                        "TF-VERIFY-02: `ticks` carries rows for this \
                          (feed, day) but candle discovery is EMPTY — the \
                          bar-fold derived NOTHING (dead-fold class; pass \
                          classifies Blind, never NoData)"
@@ -1437,7 +1452,7 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
                     count_query_failure(&mut stats, "query_failed");
                     warn!(
                         feed = p.feed,
-                        "tf_consistency: spot_1m_rest count parse failed \
+                        "tf_consistency: source-row count parse failed \
                          (empty-discovery source check degraded)"
                     );
                 }
@@ -1447,7 +1462,7 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
                 warn!(
                     feed = p.feed,
                     %reason,
-                    "tf_consistency: spot_1m_rest count query failed \
+                    "tf_consistency: source-row count query failed \
                      (empty-discovery source check degraded)"
                 );
             }
@@ -3101,25 +3116,25 @@ mod tests {
     }
 
     /// HIGH-3 (dead-fold false-OK, 2026-07-16): zero candles + nonzero
-    /// spot_1m_rest rows must classify Blind (the source check flips
+    /// source rows must classify Blind (the source check flips
     /// rows_seen); zero + zero stays NoData.
     #[test]
-    fn test_empty_candles_with_spot_rows_is_blind_vs_nodata() {
+    fn test_empty_candles_with_source_rows_is_blind_vs_nodata() {
         use RunStatus::{Blind, NoData};
         // Nonzero source rows → the fold is the dead component → Blind.
-        assert!(empty_candles_with_spot_rows_is_blind(1));
-        assert!(empty_candles_with_spot_rows_is_blind(375));
+        assert!(empty_candles_with_source_rows_is_blind(1));
+        assert!(empty_candles_with_source_rows_is_blind(375));
         assert_eq!(
-            classify_run_status(0, 0, false, empty_candles_with_spot_rows_is_blind(375)),
+            classify_run_status(0, 0, false, empty_candles_with_source_rows_is_blind(375)),
             Blind,
             "zero candles + nonzero spot rows must page Blind, never NoData"
         );
         // Zero (or nonsensical negative) source rows → genuinely nothing
         // to check → NoData stands.
-        assert!(!empty_candles_with_spot_rows_is_blind(0));
-        assert!(!empty_candles_with_spot_rows_is_blind(-1));
+        assert!(!empty_candles_with_source_rows_is_blind(0));
+        assert!(!empty_candles_with_source_rows_is_blind(-1));
         assert_eq!(
-            classify_run_status(0, 0, false, empty_candles_with_spot_rows_is_blind(0)),
+            classify_run_status(0, 0, false, empty_candles_with_source_rows_is_blind(0)),
             NoData
         );
     }
@@ -3127,13 +3142,20 @@ mod tests {
     /// HIGH-3 companions: the COUNT SQL keeps the hardened read shape
     /// (micros window, feed scope) and the parser is total on garbage.
     #[test]
-    fn test_select_spot_1m_count_sql_and_parse_count_dataset() {
+    fn test_select_source_row_count_sql_and_parse_count_dataset() {
         let day_start_nanos = 1_752_600_600_000_000_000_i64;
-        let sql = select_spot_1m_count_sql("dhan", day_start_nanos);
-        assert!(
-            sql.starts_with("SELECT count(*) FROM rest_spot_1m"),
-            "{sql}"
-        );
+        let sql = select_source_row_count_sql("dhan", day_start_nanos);
+        // ⚠ RE-POINTED 2026-09-16: the source table is `ticks`, not `rest_spot_1m`.
+        // The operator's SOCKETS-ONLY directive
+        // (`no-rest-except-live-feed-2026-06-27.md` §12.10) deleted the
+        // per-minute spot-1m WRITER, so `rest_spot_1m` stops receiving rows and
+        // a count over it would read 0 every day. This verifier was RE-POINTED
+        // rather than deleted: with zero source rows its verdict degrades from
+        // Blind/High to NoData/Info, which is an undeclared alarm-severity
+        // REDUCTION — the false-OK class the rule file forbids. `ticks` is the
+        // socket-era source the candles are actually folded from, so the
+        // Blind-vs-NoData distinction stays honest.
+        assert!(sql.starts_with("SELECT count(*) FROM ticks"), "{sql}");
         assert!(sql.contains("feed = 'dhan'"));
         // Micros window, same day-bounds shape as the sibling builders.
         let (start, end) = day_bounds_micros(day_start_nanos);

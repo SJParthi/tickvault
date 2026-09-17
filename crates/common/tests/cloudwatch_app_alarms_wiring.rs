@@ -182,15 +182,36 @@ fn test_emit_site_guard_ignores_comment_only_mentions() {
         "is_metric_emitted matched a name that appears ONLY in a comment — \
          the emit-site guard is vacuous again (comment stripping regressed)."
     );
-    // Positive control (retuned 2026-07-15 — the FEED-STALL-01 emit died
-    // with the Groww live feed): the Trap-A heartbeat emit in
-    // crates/app/src/spot_1m_rest_boot.rs (+ groww_spot_1m_boot.rs) must be
-    // found — proves comment stripping did not break REAL emit detection,
-    // and pins the re-pointed liveness alarm's emit site.
+    // Positive control — RE-POINTED 2026-09-16, and the reason it moved is
+    // worth more than the move.
+    //
+    // It was `tv_rest_1m_fire_heartbeat`, emitted by
+    // `crates/app/src/spot_1m_rest_boot.rs`. That file was DELETED under the
+    // operator's sockets-only directive ("Bro just remove per minute price
+    // falls and 3.41 pm accuracy check alone dude okay" —
+    // `no-rest-except-live-feed-2026-06-27.md` §12.10), taking all three of
+    // that gauge's producers with it. A positive control whose subject no
+    // longer exists does not merely fail — while it failed it was the only
+    // thing standing between this helper and a silent vacuity regression.
+    //
+    // ⚠ The OBVIOUS replacement does not work, and the next reader will reach
+    // for it: `tv_dhan_feed_last_tick_age_secs` is the metric the liveness
+    // alarm now reads, but it is emitted as `gauge!(LAST_TICK_AGE_GAUGE)` —
+    // a CONST IDENTIFIER, which is this repository's house style and which
+    // `is_metric_emitted` cannot see, because it searches for the literal
+    // inside `gauge!("…"`. That is the same const-identifier trap
+    // `dhan-rest-only-noise-lock-2026-07-14.md` §2.3k records producing three
+    // false "dead monitor" findings on 2026-09-02. So the control must be a
+    // name that is genuinely spelled as a literal at its emit site.
+    //
+    // `tv_spill_dir_free_bytes` is that: a literal-string `gauge!` in
+    // `crates/storage/src/disk_health_watcher.rs`, EMF-selected, and alarmed
+    // by `tv-<env>-spill-dir-free-low` — a watcher on a path no feed-scope
+    // change touches, so it will not rot the next time the lane is re-scoped.
     assert!(
-        is_metric_emitted("tv_rest_1m_fire_heartbeat"),
+        is_metric_emitted("tv_spill_dir_free_bytes"),
         "comment stripping broke detection of a REAL emit site \
-         (spot_1m_rest_boot.rs tv_rest_1m_fire_heartbeat gauge)."
+         (disk_health_watcher.rs tv_spill_dir_free_bytes gauge)."
     );
 }
 
@@ -1117,8 +1138,47 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // or an operator decision on limit_amount.
     assert_eq!(
         names.len(),
-        110,
-        "Z+ L2 VERIFY ratchet: expected exactly 110 names in the MAIN EMF \
+        98,
+        "Z+ L2 VERIFY ratchet: expected exactly 98 names in the MAIN EMF \
+         (2026-09-16 TWELFTH: 110 -> 98, a REMOVAL of twelve and the second \
+         time this ratchet has been given a LEVER rather than another cost \
+         note. All twelve lost their producers on the same day, under the \
+         operator's sockets-only directive -- \"Bro just remove per minute \
+         price falls and 3.41 pm accuracy check alone dude okay\", the \
+         narrowing quote recorded in no-rest-except-live-feed-2026-06-27.md \
+         §12.10. Gone: tv_rest_1m_fire_heartbeat, \
+         tv_spot1m_persist_errors_total, tv_chain1m_persist_errors_total, \
+         tv_rest_fetch_audit_persist_errors_total, \
+         tv_rest_fetch_audit_rows_discarded_total, \
+         tv_chain_mark_refused_total, tv_cadence_ladder_exhausted_total, \
+         tv_cadence_boundary_skipped_total, tv_cadence_late_response_total, \
+         tv_cadence_runner_respawn_total, tv_cadence_gate_denials_total, \
+         tv_cadence_spot_fallback_total -- the per-minute Dhan spot-1m and \
+         option-chain REST legs plus the cadence scheduler that later \
+         re-fired the same HTTP. A selected name with no producer is billed \
+         and publishes nothing, and its dashboard line sits flat at zero, \
+         which reads as health; that is why these leave in the SAME change \
+         as their emit sites rather than being left to be found from a quiet \
+         chart. ⚠ tv_rest_1m_fire_heartbeat is the one that needed care: it \
+         was the SOLE metric behind tv-<env>-market-hours-liveness-missing, \
+         which is treat_missing_data = breaching, so removing its producers \
+         without acting would have paged every gated market window forever. \
+         A permanently-RED alarm is worse than a permanently-green one -- \
+         green gets ignored, red gets MUTED, and muting that alarm silently \
+         disables the app-liveness signal. RETIRING it was considered and \
+         REFUSED on measurement: it is the ONLY 60-second-period alarm in \
+         the gated set (~5 min to page against its siblings' ~10), so \
+         retiring would have DOUBLED detection latency. It is RE-POINTED at \
+         tv_dhan_feed_last_tick_age_secs instead, with period and \
+         evaluation_periods unchanged. -12 names = -$3.60/mo, the largest \
+         single reduction this list has had; maximal month ~$123.88 -> \
+         ~$120.28, and with the seven retired errcode alarms (-$0.70) \
+         ~$119.58. That is still ~$2.58 ABOVE the automatic \
+         STOP_EC2_INSTANCES line at $117.00 -- stated plainly rather than \
+         rounded into comfort, because a reduction is not the same as \
+         clearance. The \
+         already-approved Quote 10 Elastic IP release (-$3.60/mo) still \
+         alone returns the maximal month to under both lines. \
          (2026-09-02 ELEVENTH: 106 -> 110, and ALL FOUR were already emitted \
          with real call sites while reaching CloudWatch through nothing at \
          all. The one that matters is tv_tick_rescue_abandoned_total, whose \
@@ -1297,7 +1357,27 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
         // crates/app/tests/subsystem_memory_emf_guard.rs pins that pairing.
         // tv_dhan_exchange_lag_p99_seconds + tv_dhan_lag_samples_excluded_total
         // retired 2026-07-17 (dashboard tidy — dead Dhan-lag chain deleted).
-        "tv_rest_1m_fire_heartbeat",
+        // tv_rest_1m_fire_heartbeat REMOVED from this required list 2026-09-16.
+        //
+        // It was required here since 2026-07-15, when it replaced the dead
+        // Groww lag gauge 1:1 under tv-<env>-market-hours-liveness-missing.
+        // Its three producers (spot_1m_rest_boot.rs x2, dhan_cadence_executor.rs)
+        // were deleted under the operator's sockets-only directive -- "Bro just
+        // remove per minute price falls and 3.41 pm accuracy check alone dude
+        // okay" (`no-rest-except-live-feed-2026-06-27.md` §12.10).
+        //
+        // ⚠ This entry is exactly the shape the tv_subsystem_memory_estimated_bytes
+        // note above warns about: a ratchet REQUIRING a name reads as proof the
+        // metric matters, and would have kept a producer-less name in the
+        // selector indefinitely. The difference here is that the liveness alarm
+        // reading it is treat_missing_data = breaching, so a producer-less name
+        // is not merely billed-and-silent -- it PAGES, every gated market window,
+        // forever. The alarm is RE-POINTED at tv_dhan_feed_last_tick_age_secs
+        // (required immediately below, so the re-point cannot silently rot) with
+        // its period and evaluation_periods unchanged, because at 60s x 5 it is
+        // the only ~5-minute detector in the gated set and retiring it would have
+        // doubled that latency.
+        "tv_dhan_feed_last_tick_age_secs",
         // 2026-07-14 cluster-C order-side (dormant until cluster A / Phase-1):
         "tv_daily_pnl",
         // tv_order_fill_lag_seconds REMOVED from this required list 2026-08-21,
@@ -1327,13 +1407,28 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
         // 2026-08-09 metric-blindness fix — one representative per family, so
         // a partial revert of the widening fails loudly instead of silently
         // shrinking the operator's only metric sink:
-        "tv_spot1m_persist_errors_total", // Dhan REST leg persist failure
-        "tv_chain1m_persist_errors_total", // Dhan chain leg persist failure
-        "tv_cadence_ladder_exhausted_total", // retry ladder gave up = minute lost
+        // ⚠ THREE REPRESENTATIVES REMOVED 2026-09-16, and NOT replaced.
+        //
+        // `tv_spot1m_persist_errors_total` (Dhan REST leg persist failure),
+        // `tv_chain1m_persist_errors_total` (chain leg persist failure) and
+        // `tv_cadence_ladder_exhausted_total` (retry ladder gave up = minute
+        // lost) stood here as one-per-family anchors. All three families were
+        // REMOVED under the operator's sockets-only directive -- "Bro just
+        // remove per minute price falls and 3.41 pm accuracy check alone dude
+        // okay" (`no-rest-except-live-feed-2026-06-27.md` §12.10) -- so there
+        // is no surviving sibling to promote in their place, and inventing a
+        // substitute from an unrelated family would pad the list while
+        // weakening exactly the property it exists for.
+        //
+        // The four below are the live anchors and they still span four
+        // distinct failure families: the database silently refusing writes,
+        // SEBI audit-row loss, host memory saturation, and the RAM decision
+        // surface dropping rows. A partial revert of the 2026-08-09 widening
+        // still fails loudly on any of them.
         "tv_questdb_wal_suspended_tables", // QuestDB silently stops accepting writes
         "tv_order_audit_rows_discarded_total", // SEBI 5-yr audit row loss
-        "tv_oom_kills_total",             // host memory saturation
-        "tv_ram_store_dropped_total",     // RAM decision surface dropping rows
+        "tv_oom_kills_total",              // host memory saturation
+        "tv_ram_store_dropped_total",      // RAM decision surface dropping rows
     ] {
         assert!(
             names.iter().any(|n| n == required),
@@ -2903,13 +2998,33 @@ fn every_ws_gap_03_filter_carries_a_source_discriminator() {
         .filter(|l| l.starts_with("pattern") && l.contains("WS-GAP-03"))
         .collect();
 
+    // ⚠ FLOOR LOWERED 3 -> 1 on 2026-09-16, deliberately and with its reason.
+    //
+    // The floor is an ANTI-VACUITY device, not a coverage target: without it
+    // the `for p in patterns` loop below passes over an empty list and this
+    // guard certifies a rule it never checked. Three was the right number
+    // while three of the four WS-GAP-03 filters existed.
+    //
+    // Two of those three (`xverify-vacuous`, `xverify-failed`) plus the
+    // 2026-08-28 `xverify-diverged` were RETIRED on 2026-09-16: the 15:41
+    // cross-verification they matched was removed under the operator's
+    // sockets-only directive ("Bro just remove per minute price falls and
+    // 3.41 pm accuracy check alone dude okay" —
+    // `no-rest-except-live-feed-2026-06-27.md` §12.10), so none of their
+    // `$.source` values has an emit site any more. Leaving the floor at 3
+    // would fail the build over filters that CANNOT be restored without
+    // restoring the deleted comparison.
+    //
+    // 1 is the honest floor today: `ws-gap-03-universe-collapse` is the only
+    // surviving WS-GAP-03 filter, its emit site (`dhan_live_universe.rs`,
+    // `$.source = "fell_back_to_indices"`) is alive, and one is still enough
+    // to make the discriminator loop non-vacuous. Lower it no further — at 0
+    // this guard stops being a guard.
     assert!(
-        patterns.len() >= 3,
-        "expected at least the 3 WS-GAP-03 filters known on 2026-08-25 \
-         (universe-collapse, xverify-vacuous, xverify-failed), found {} — if they were \
-         renamed or removed, update this guard deliberately rather than letting it pass \
-         vacuously",
-        patterns.len()
+        !patterns.is_empty(),
+        "expected at least the 1 surviving WS-GAP-03 filter (universe-collapse); found \
+         none — if it was renamed or removed, update this guard deliberately rather than \
+         letting the discriminator loop below pass over an empty list",
     );
 
     for p in patterns {
@@ -2918,7 +3033,8 @@ fn every_ws_gap_03_filter_carries_a_source_discriminator() {
             "this WS-GAP-03 filter has no `$.source` discriminator, so it matches all \
              ~50 connection-state emit sites and will page on every reconnect:\n  {p}\n\
              Add the `$.source = \"...\"` condition that identifies the specific emit \
-             (see ws-gap-03-universe-collapse / ws-gap-03-xverify-blind)."
+             (see ws-gap-03-universe-collapse — the only surviving example since the \
+             xverify filters were retired 2026-09-16)."
         );
     }
 }

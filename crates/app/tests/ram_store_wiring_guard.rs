@@ -72,9 +72,27 @@ fn main_rs_installs_ram_stores_before_the_fold_spawn_gate() {
     let install_idx = main_rs
         .find("market_ram_store_boot::install_market_ram_stores(")
         .expect("main.rs must install the RAM stores");
-    let rehydrate_idx = main_rs
-        .find("market_ram_store_boot::spawn_chain_day_rehydrate(")
-        .expect("main.rs must spawn the chain-day rehydrate");
+    // ---- The REHYDRATE term is RETIRED 2026-09-16 ----
+    //
+    // This chain read `install → rehydrate → stats`. The middle term was
+    // `market_ram_store_boot::spawn_chain_day_rehydrate(`, the one-shot boot
+    // step that read today's per-minute option-chain rows back out of
+    // QuestDB so a mid-session restart did not open with an empty options
+    // view.
+    //
+    // Its source table's WRITER was removed by the operator's SOCKETS-ONLY
+    // narrowing (`no-rest-except-live-feed-2026-06-27.md` §12.10), so the
+    // reader went with it — deliberately, and as that section's own §12.6
+    // REJECT row demands in as many words: "Removes a WRITER and leaves a
+    // READER pointed at the now-frozen table." A rehydrate left standing
+    // would have read a table nothing writes, found nothing, recorded zero
+    // minutes and reported success — a boot step whose silence is
+    // indistinguishable from a quiet market.
+    //
+    // The two assertions BELOW are the reason this test was narrowed rather
+    // than deleted, and neither depended on the rehydrate: the same-block
+    // pin (a gate that drifted away no longer guards anything) and the
+    // load-bearing `install < fold gate` ORDER pin.
     let stats_idx = main_rs
         .find("market_ram_store_boot::spawn_ram_store_stats_task(")
         .expect("main.rs must spawn the stats/heartbeat task");
@@ -91,10 +109,9 @@ fn main_rs_installs_ram_stores_before_the_fold_spawn_gate() {
         .expect("main.rs must still gate the fold spawn");
 
     assert!(
-        gate_idx < install_idx && install_idx < rehydrate_idx && rehydrate_idx < stats_idx,
-        "install → rehydrate → stats must sit inside the gated block in that \
-         order (gate {gate_idx}, install {install_idx}, rehydrate \
-         {rehydrate_idx}, stats {stats_idx})"
+        gate_idx < install_idx && install_idx < stats_idx,
+        "install → stats must sit inside the gated block in that order \
+         (gate {gate_idx}, install {install_idx}, stats {stats_idx})"
     );
     assert!(
         stats_idx.saturating_sub(gate_idx) < 4096,
@@ -166,66 +183,65 @@ fn fold_emit_paths_call_the_ram_hooks() {
     );
 }
 
-#[test]
-fn chain_publish_helper_records_into_the_day_store_after_the_registry_publish() {
-    let src = read_source("crates/app/src/option_chain_1m_boot.rs");
-    let prod = production_region(&src);
-
-    let helper_def = prod
-        .find("pub fn publish_chain_moneyness_snapshot(")
-        .expect("the shared chain publish helper must exist");
-    let publish_idx = prod[helper_def..]
-        .find("publish_chain_snapshot(")
-        .map(|i| helper_def + i)
-        .expect("the helper must still publish the latest-minute registry snapshot");
-    let day_store_idx = prod[helper_def..]
-        .find("chain_day_store::chain_day_store()")
-        .map(|i| helper_def + i)
-        .expect("the helper must resolve the chain day store");
-    let record_idx = prod[helper_def..]
-        .find(".record_live(")
-        .map(|i| helper_def + i)
-        .expect("the helper must record the minute into the day store");
-    assert!(
-        publish_idx < record_idx,
-        "the latest-minute registry publish must PRECEDE the day-store \
-         record (publish {publish_idx}, record {record_idx}) — the registry \
-         stays the moneyness decision source of truth"
-    );
-    assert!(
-        day_store_idx > helper_def && record_idx > helper_def,
-        "day-store resolution + record must live inside the helper"
-    );
-
-    // The chain leg routes through the ONE shared helper. This once checked
-    // BOTH legs, which is what made "one shared helper" meaningful — with a
-    // single leg the assertion is that the leg calls the helper at all.
-    let dhan_calls = call_site_indices(prod, "publish_chain_moneyness_snapshot(");
-    assert!(
-        !dhan_calls.is_empty(),
-        "the chain leg must call publish_chain_moneyness_snapshot"
-    );
-}
+// ---- `chain_publish_helper_records_into_the_day_store_after_the_registry_publish`
+// ---- is RETIRED 2026-09-16 ----
+//
+// It pinned the ORDER inside `option_chain_1m_boot::publish_chain_moneyness_snapshot`:
+// the latest-minute registry publish had to PRECEDE the day-store
+// `.record_live(` call, so the registry stayed the moneyness decision source
+// of truth and the day store stayed the history behind it.
+//
+// `crates/app/src/option_chain_1m_boot.rs` no longer exists. The per-minute
+// option-chain REST pull is one of the two classes the operator's
+// SOCKETS-ONLY narrowing removed (`no-rest-except-live-feed-2026-06-27.md`
+// §12.10 — "Bro just remove per minute price falls and 3.41 pm accuracy
+// check alone dude okay"), so `read_source` on that path panics with a
+// bare `No such file or directory (os error 2)`.
+//
+// RETIRED rather than re-pointed, and the distinction matters: the sibling
+// `tf_consistency_boot` verifier in this same removal was RE-POINTED (to
+// `ticks`) because its SUBJECT survived the writer — candles are still
+// folded, just from a different source. This test's subject is the helper
+// itself, and there is no surviving publisher of a chain moneyness snapshot
+// to re-point at. Pinning an order between two calls that no longer happen
+// would be a guard that can only ever pass.
+//
+// WHAT THIS LEAVES UNWATCHED, stated rather than implied: nothing re-checks
+// that a FUTURE chain publisher puts the registry before the day store. If
+// one is ever built, this test is the shape to restore — §12.10.7(c) already
+// records that `chain_day_store` is installed, never written and read only
+// for the `tv_ram_store_chain_minutes_resident` gauge, which is the open
+// decision that would come with it.
 
 #[test]
 fn ram_store_boot_module_keeps_load_bearing_pieces() {
     let src = read_source("crates/app/src/market_ram_store_boot.rs");
     let prod = production_region(&src);
 
-    // Rehydrated minutes go through the never-overwrites-live API.
-    assert!(
-        prod.contains("record_rehydrated(snap)"),
-        "the rehydrate must record via record_rehydrated (live wins)"
-    );
-    // The bounded-read hardening: explicit LIMIT tripwire + streamed cap.
-    assert!(
-        prod.contains("rehydrate_truncated"),
-        "a truncated rehydrate window must degrade loudly, never fold partial"
-    );
-    assert!(
-        prod.contains("accumulate_capped("),
-        "the rehydrate reads must stay under the streamed response cap"
-    );
+    // ---- The three REHYDRATE pins are RETIRED 2026-09-16 ----
+    //
+    // `record_rehydrated(snap)`, `rehydrate_truncated` and
+    // `accumulate_capped(` pinned the one-shot chain-day rehydrate: it read
+    // today's per-minute option-chain rows back out of QuestDB so a
+    // mid-session restart did not start with an empty options view.
+    //
+    // The WRITER of the table it read was removed by the operator's
+    // SOCKETS-ONLY narrowing (`no-rest-except-live-feed-2026-06-27.md`
+    // §12.10), so the reader went with it — deliberately, and as that
+    // section's own §12.6 REJECT row requires in as many words: "Removes a
+    // WRITER and leaves a READER pointed at the now-frozen table." A
+    // rehydrate left behind would have read a table nothing writes, found
+    // nothing, recorded zero minutes, and reported success — a boot step
+    // whose silence is indistinguishable from a quiet market.
+    //
+    // The REST of this test is UNCHANGED and still binds: the seven operator
+    // gauges below and the coded-degrade pin have nothing to do with the
+    // rehydrate, and narrowing to them is why this test was not deleted
+    // wholesale. `tv_ram_store_chain_minutes_resident` in particular is KEPT
+    // on purpose — the chain store is now installed and never written
+    // (§12.10.7(c) records the open decision), so that gauge reading a flat
+    // zero is the honest surface for exactly that state, and it must keep
+    // being published rather than quietly dropped along with its writer.
     // The operator's depth gauges + the dense heartbeat.
     for gauge in [
         "tv_ram_store_spot_bars_resident",

@@ -738,74 +738,34 @@ pub enum ErrorCode {
     /// (`TICKVAULT_SCOREBOARD_NOW`) backfill the day. Severity::Medium,
     /// auto-triage-safe.
     Scoreboard01AggregationDegraded,
-    /// DHAN-LIVE-XVERIFY-01 — the daily Dhan live-vs-REST cross-verification
-    /// run degraded: an HTTP client build failure, an `/exec` query failure or
-    /// truncation, an audit-flush failure, or a run past its wall-clock
-    /// budget. Read-only over `candles_1m` and the REST tape; writes only its
-    /// own audit tables, so the live feed and tick capture are NEVER affected.
-    ///
-    /// This comparator is the ONLY ground truth the revived Dhan feed has —
-    /// the India feed carries no sequence number and no snapshot-on-subscribe,
-    /// so packet loss is undetectable at the protocol level. A degraded or
-    /// blind run therefore means we cannot vouch for the day, and it must
-    /// never render as a pass. Severity::High, auto-triage-safe.
-    DhanLiveXverify01RunDegraded,
-    /// SPOT1M-01 (per-minute REST pipeline PR-2, operator grant 2026-07-12)
-    /// — the per-minute spot 1m REST fetch degraded: a whole minute failed
-    /// for one/all of the 3 IDX_I spot indices (transport error, non-2xx,
-    /// DH-904/429 after the bounded in-minute re-poll ladder, no token, or
-    /// a 200 whose body never carried the just-closed minute's candle —
-    /// `outcome="empty"`, counted, never silent). The ESCALATION emission
-    /// (the one that also pages the typed Telegram event) fires
-    /// edge-triggered after 3 consecutive fully-failed minutes; sub-edge
-    /// per-minute emissions are coalesced once per fire. Severity::High,
-    /// auto-triage-safe (the fetch already degraded; the next minute
-    /// re-attempts; the WS candle pipeline is untouched).
-    Spot1m01FetchDegraded,
-    /// SPOT1M-02 (per-minute REST pipeline PR-2, 2026-07-12) — the
-    /// `spot_1m_rest` QuestDB persist leg failed (ensure-DDL non-2xx /
-    /// unreachable, ILP append rejected, or the ILP-over-HTTP flush was
-    /// refused by the server ACK). Best-effort forensic write: the fetch
-    /// loop continues, rows stay buffered where possible, and re-appends
-    /// are DEDUP-idempotent (`ts, security_id, exchange_segment, feed`).
+    // DHAN-LIVE-XVERIFY-01 and SPOT1M-01 RETIRED 2026-09-16: the 15:41
+    // cross-verification and the per-minute spot-1m REST fetch were both
+    // removed under the operator's sockets-only directive, so neither code
+    // had an emit site left. SPOT1M-02 below SURVIVES — its remaining
+    // emitter is the per-contract 1m leg, not the spot leg.
+    /// SPOT1M-02 (per-minute REST pipeline PR-2, 2026-07-12) — a per-minute
+    /// REST persist leg failed (ensure-DDL non-2xx / unreachable, ILP append
+    /// rejected, or the ILP-over-HTTP flush refused by the server ACK).
+    /// Best-effort forensic write: the caller continues, rows stay buffered
+    /// where possible, and re-appends are DEDUP-idempotent.
     /// Severity::High, auto-triage-safe.
+    ///
+    /// ⚠ CORRECTED 2026-09-16 — this docblock named `spot_1m_rest` as the
+    /// subject, and that leg is GONE (the operator's sockets-only directive
+    /// removed the per-minute Dhan spot-1m and option-chain pulls). The code
+    /// SURVIVES because a DIFFERENT leg still emits it: the per-contract 1m
+    /// writer, `crates/storage/src/option_contract_1m_rest_persistence.rs`,
+    /// which reuses SPOT1M-02 rather than owning a code of its own.
+    ///
+    /// ⚠ AND THAT REUSE IS WHY THIS VARIANT NEARLY DIED BY MISTAKE. Its four
+    /// surviving emit sites write the literal `code = "SPOT1M-02"`, never
+    /// `ErrorCode::Spot1m02PersistFailed.code_str()`, so a grep for the
+    /// VARIANT NAME returns zero hits outside this file and reads exactly
+    /// like the ten codes retired beside it. Only a grep for the CODE STRING
+    /// separates them. Same shape as the const-identifier trap this
+    /// repository has recorded twice: a name-based search answers a question
+    /// about names, not about reachability.
     Spot1m02PersistFailed,
-    /// CHAIN-01 (per-minute REST pipeline PR-3, operator grant 2026-07-12)
-    /// — the option-chain Data-API ENTITLEMENT is absent: Dhan rejected an
-    /// expirylist / option-chain call with the DH-902 / DATA 806 class
-    /// (or a 401/403 whose body names the missing subscription). Fires
-    /// ONCE per day (edge-triggered); the chain pipeline stays DOWN for
-    /// the day — never a per-minute 401 storm. Severity::High,
-    /// auto-triage NO (severity-independent override: restoring the
-    /// entitlement is an operator/broker account decision, never a code
-    /// fix).
-    Chain01EntitlementAbsent,
-    /// CHAIN-02 (per-minute REST pipeline PR-3, 2026-07-12) — the
-    /// per-minute option-chain fetch degraded: a whole minute failed for
-    /// one/all of the 3 underlyings (transport error, non-2xx, budget
-    /// overrun, malformed body, or a 200 whose chain carried zero strikes
-    /// — `outcome="empty"`, counted, never silent). The ESCALATION
-    /// emission (the one that also pages the typed Telegram event) fires
-    /// edge-triggered after 3 consecutive fully-failed minutes (persist
-    /// failures count — a fetched-but-never-persisted minute is NOT ok).
-    /// Severity::High, auto-triage-safe (the next minute re-attempts;
-    /// the WS pipeline is untouched).
-    Chain02FetchDegraded,
-    /// CHAIN-03 (per-minute REST pipeline PR-3, 2026-07-12) — the
-    /// `option_chain_1m` QuestDB persist leg failed (ensure-DDL non-2xx /
-    /// unreachable, ILP append rejected, or the ILP-over-HTTP flush was
-    /// refused by the server ACK; failed flushes DISCARD pending rows —
-    /// the poisoned-buffer defense). Best-effort forensic write;
-    /// re-appends are DEDUP-idempotent. Severity::High, auto-triage-safe.
-    Chain03PersistFailed,
-    /// CHAIN-04 (per-minute REST pipeline PR-3, 2026-07-12) — the
-    /// day-start expirylist warmup failed after bounded retries (3
-    /// attempts, 3s/6s backoff): the chain pipeline degrades to
-    /// DISABLED-FOR-THE-DAY — expiry dates come ONLY from the API
-    /// (option-chain.md rule 9), NEVER guessed. One page per day.
-    /// Severity::High, auto-triage-safe (the next trading-day boot
-    /// re-attempts automatically).
-    Chain04ExpirylistFailed,
 
     // -----------------------------------------------------------------------
     // Operator 2026-07-13: daily timeframe-consistency verifier.
@@ -952,57 +912,12 @@ pub enum ErrorCode {
     ExitVerify01Degraded,
 
     // -----------------------------------------------------------------------
-    // Cadence scheduler (operator cadence directive 2026-07-14, judge-locked
-    // design rev-8 — `crates/core/src/cadence/`; reshaped POST-CLOSE by the
-    // 2026-07-16 operator directive, cadence-error-codes.md §0b: the rev-8
-    // ":55 pre-close serialized" Dhan schedule is RETIRED). Dry-run
-    // decision-timing skeleton: per-minute post-close fetch cadence on BOTH
-    // lanes (Dhan all-7 burst primary / split fallback; Groww all-7 at T+0)
-    // with structural zero-429 gates, shape ladder, event-driven per-lane
-    // decisions. DEFAULT-OFF. See cadence-error-codes.md.
+    // Cadence scheduler (operator directive 2026-07-14) — RETIRED 2026-09-16.
+    // CADENCE-01/02/03/05 ceased to exist with `crates/core/src/cadence/`,
+    // deleted under the operator's sockets-only directive. CADENCE-04 was
+    // already variant-less before this change (its NotificationEvent and emit
+    // arm went with the Groww retirement, 2026-08-21).
     // -----------------------------------------------------------------------
-    /// CADENCE-01: a cadence lane DEGRADED this cycle — a non-Empty fetch
-    /// failure ended terminal after the retry budget
-    /// (`stage="fetch_failed"`), a 429 arrived despite the gates
-    /// (`stage="rate_limited"` — also a gate-bug signal), a spot returned
-    /// 200-empty (`stage="spot_empty"`, either lane), a chain returned
-    /// 200-empty (`stage="chain_empty"`, either lane), the Groww burst
-    /// fell back (`stage="groww_fallback"`), a lane borrowed the other
-    /// broker's data after its own path exhausted (`stage="cross_fill"`),
-    /// a spot resolved from the chain-embedded price
-    /// (`stage="chain_embedded_spot"`), moneyness classified Unknown
-    /// (`stage="moneyness_unknown"`), or the failure ladder exhausted its
-    /// floor (`stage="ladder_exhausted"`, edge-latched per episode). ONE
-    /// coalesced emission per (lane, cycle), never per-request.
-    /// Severity::High, auto-triage-safe (the next cycle re-attempts; the
-    /// ladder + cross-fill are the self-corrections).
-    Cadence01LaneDegraded,
-    /// CADENCE-02: a cadence lane's decision was HONEST-SKIPPED — the lane
-    /// was incomplete at its cutoff (`stage="cutoff"`), both brokers were
-    /// dead (`stage="both_sources_dead"`), or every underlying classified
-    /// Unknown (`stage="all_unknown"`). Exactly one per (lane, cycle);
-    /// never a late decision, never a decision on missing/stale data.
-    /// Severity::High, auto-triage-safe (the skip IS the fail-closed
-    /// action; the operator inspects the stage at leisure).
-    Cadence02DecisionSkipped,
-    /// CADENCE-03: the cadence scheduler itself DEGRADED — the failure
-    /// ladder shifted a rung (`stage="ladder_shift"`), a wake landed late
-    /// past a slot (`stage="late_wake"`), one or more minute boundaries
-    /// were skipped (`stage="boundary_skipped"`), a clock skew was clamped
-    /// (`stage="skew_clamped"`), the supervised runner respawned
-    /// (`stage="respawn"`), or a gate deferred a NOMINAL slot
-    /// (`stage="gate_deferred_nominal"` — a should-never scheduling-math
-    /// signal). Severity::Medium, auto-triage-safe.
-    Cadence03SchedulerDegraded,
-    /// CADENCE-05: the cadence native-retry / cross-fill RECOVERY
-    /// machinery degraded — the T+4s native-retry hedge reached
-    /// arbitration with the native leg still EMPTY (resolution token
-    /// `cross_fill`), or the bounded T+30s/T+50s background history
-    /// re-pull exhausted both attempts without repairing the minute.
-    /// At most one emit per (lane, leg, cycle minute).
-    /// Severity::Medium, auto-triage-safe (operator directive
-    /// 2026-07-20 — native-retry / cross-fill hedge).
-    Cadence05RecoveryDegraded,
 
     // ------------------------------------------------------------------
     // LAMBDA-* — the AWS Lambda operations family (2026-09-05)
@@ -1236,17 +1151,8 @@ impl ErrorCode {
             Self::Futidx02CrossFeedExpiryMismatch => "FUTIDX-02",
             // Dual-feed scoreboard PR-A (2026-07-10)
             Self::Scoreboard01AggregationDegraded => "SCOREBOARD-01",
-            // BruteX↔TickVault daily cross-verify (2026-07-12)
-            // Dhan↔Groww spot cross-broker comparator
-            // Per-minute spot 1m REST pipeline (operator grant 2026-07-12)
-            Self::DhanLiveXverify01RunDegraded => "DHAN-LIVE-XVERIFY-01",
-            Self::Spot1m01FetchDegraded => "SPOT1M-01",
+            // Per-minute REST pipeline (operator grant 2026-07-12).
             Self::Spot1m02PersistFailed => "SPOT1M-02",
-            // Per-minute option-chain REST pipeline (PR-3, 2026-07-12)
-            Self::Chain01EntitlementAbsent => "CHAIN-01",
-            Self::Chain02FetchDegraded => "CHAIN-02",
-            Self::Chain03PersistFailed => "CHAIN-03",
-            Self::Chain04ExpirylistFailed => "CHAIN-04",
             // Daily timeframe-consistency verifier (operator 2026-07-13)
             Self::TfVerify01MismatchFound => "TF-VERIFY-01",
             Self::TfVerify02RunDegraded => "TF-VERIFY-02",
@@ -1267,11 +1173,7 @@ impl ErrorCode {
             // Groww pre-trade margin surface (§39.3 area slot #4, 2026-07-15)
             // Groww orders shared contracts (PR-A0, 2026-07-15)
             // Groww order/position push channel (Stage A, 2026-07-16)
-            // Cadence scheduler (operator directive 2026-07-14)
-            Self::Cadence01LaneDegraded => "CADENCE-01",
-            Self::Cadence02DecisionSkipped => "CADENCE-02",
-            Self::Cadence03SchedulerDegraded => "CADENCE-03",
-            Self::Cadence05RecoveryDegraded => "CADENCE-05",
+            // RETIRED 2026-09-16 with the per-minute Dhan market-data REST legs.
             Self::LambdaStart01BoxNotRunning => "LAMBDA-START-01",
             Self::LambdaStart02SelfHealFailed => "LAMBDA-START-02",
             Self::LambdaAws01ReadCallFailed => "LAMBDA-AWS-01",
@@ -1400,33 +1302,18 @@ impl ErrorCode {
             // auto-correction already applied; the operator must see every
             // rollback (a repeat at the same rung = the discovered
             // server-side cap).
-            // SPOT1M-01/02 (operator grant 2026-07-12) — the per-minute
-            // spot 1m REST fetch/persist degraded. High: the operator must
-            // see a failing exchange-record pull (the escalation is
-            // edge-triggered at 3 consecutive fully-failed minutes); never
-            // a halt — the WS candle pipeline is untouched and re-appends
-            // are DEDUP-idempotent.
-            | Self::Spot1m01FetchDegraded
-            | Self::Spot1m02PersistFailed
-            // CHAIN-01..04 (PR-3, 2026-07-12) — the option-chain half of
-            // the per-minute REST pipeline. High: entitlement absence /
-            // sustained fetch degrade / persist failure / expirylist
-            // failure all need operator eyes; never a halt — the WS
-            // pipeline is untouched and re-appends are DEDUP-idempotent.
-            | Self::Chain01EntitlementAbsent
-            | Self::Chain02FetchDegraded
-            | Self::Chain03PersistFailed
-            | Self::Chain04ExpirylistFailed => Severity::High,
+            // SPOT1M-02 (operator grant 2026-07-12) — the per-minute REST
+            // persist leg failed. High: the operator must see a failing
+            // exchange-record write; never a halt — re-appends are
+            // DEDUP-idempotent. SPOT1M-01 and CHAIN-01..04 retired
+            // 2026-09-16 with the legs that emitted them.
+            | Self::Spot1m02PersistFailed => Severity::High,
             // FUTIDX-01/02 (§36 2026-07-08) — per-underlying selection degrade
             // / cross-feed expiry divergence. Loud (Telegram High), never a
             // halt; the spot universe + both live feeds are unaffected.
             Self::Futidx01SelectionDegraded | Self::Futidx02CrossFeedExpiryMismatch => {
                 Severity::High
             }
-            // DHAN-LIVE-XVERIFY-01 — the revived Dhan feed's only ground-truth
-            // check ran degraded or blind. Loud (High), never a halt; the
-            // feed and tick capture are unaffected.
-            Self::DhanLiveXverify01RunDegraded => Severity::High,
             // TICK-SPILL-01: rescued ticks are on disk and unreplayable until
             // someone looks. High because the spill tier IS the loss guarantee.
             Self::TickSpill01FileQuarantined => Severity::High,
@@ -1461,13 +1348,6 @@ impl ErrorCode {
             // order stays tracked and reconcile owns the follow-up. Both
             // LOG-SINK-ONLY (no pager entry — 2026-07-14 Dhan noise lock).
             Self::ExitOrder01ExecutionDegraded | Self::ExitVerify01Degraded => Severity::High,
-            // CADENCE-01/02 (operator 2026-07-14) — a cadence lane degraded
-            // this cycle / a lane decision was honest-skipped. High:
-            // operator eyes on every occurrence (a skip means no decision
-            // input for the minute; a degrade means a broker leg is
-            // failing); never a halt — the record-capture legs and tick
-            // capture are untouched, the next cycle re-attempts.
-            Self::Cadence01LaneDegraded | Self::Cadence02DecisionSkipped => Severity::High,
             // Medium: data pipeline correctness
             // PR #6b (2026-05-19): I-P0-01/02/04/05 retired with their modules.
             Self::InstrumentP1CrossSegmentCollision
@@ -1523,18 +1403,9 @@ impl ErrorCode {
             // FEED-GAP-01 (2026-07-14): gap-episode forensics degraded —
             // annotation-only side record; capture/recovery unaffected. Medium.
             Self::FeedGap01EpisodeDegraded => Severity::Medium,
-            // CADENCE-03 (operator 2026-07-14): the cadence scheduler
-            // degraded (ladder shift / late wake / boundary skip / respawn)
-            // — self-correcting scheduling telemetry, never data loss;
-            // the lane-level consequences page via CADENCE-01/02. Medium.
-            Self::Cadence03SchedulerDegraded => Severity::Medium,
             // CADENCE-04 (operator 2026-07-20): a cross_fill_audit
             // forensics write/read failure — best-effort record only; the
             // CADENCE-01 signal + counters still carry the event. Medium.
-            // CADENCE-05 (operator 2026-07-20): the native-retry /
-            // cross-fill recovery machinery degraded — cross-fill / the
-            // honest gap is the floor; nothing fabricated. Medium.
-            Self::Cadence05RecoveryDegraded => Severity::Medium,
 
             // LAMBDA-* (2026-09-05): the AWS Lambda operations family.
             // ALL NINE are Medium, and that is FORCED, not chosen — see the
@@ -1743,20 +1614,9 @@ impl ErrorCode {
             Self::Scoreboard01AggregationDegraded => {
                 "docs/error-runbooks/dual-feed-scoreboard-error-codes.md"
             }
-            // Dhan live-vs-REST cross-verification
-            Self::DhanLiveXverify01RunDegraded => {
-                "docs/error-runbooks/dhan-live-crossverify-error-codes.md"
-            }
-            // Per-minute spot 1m REST pipeline (operator grant 2026-07-12)
-            Self::Spot1m01FetchDegraded | Self::Spot1m02PersistFailed => {
-                "docs/error-runbooks/rest-1m-pipeline-error-codes.md"
-            }
-            // Per-minute option-chain REST pipeline (PR-3, 2026-07-12) —
-            // one runbook for the whole per-minute REST pipeline family.
-            Self::Chain01EntitlementAbsent
-            | Self::Chain02FetchDegraded
-            | Self::Chain03PersistFailed
-            | Self::Chain04ExpirylistFailed => {
+            // Per-minute REST pipeline (operator grant 2026-07-12). Only the
+            // contract-1m leg still emits in this family; see SPOT1M-02.
+            Self::Spot1m02PersistFailed => {
                 "docs/error-runbooks/rest-1m-pipeline-error-codes.md"
             }
             // Daily timeframe-consistency verifier (operator 2026-07-13)
@@ -1783,14 +1643,7 @@ impl ErrorCode {
             Self::ExitOrder01ExecutionDegraded | Self::ExitVerify01Degraded => {
                 ".claude/rules/project/dhan-exit-order-lockout-2026-07-14.md"
             }
-            // Cadence scheduler (operator directive 2026-07-14)
-            Self::Cadence01LaneDegraded
-            | Self::Cadence02DecisionSkipped
-            | Self::Cadence03SchedulerDegraded
-
-            | Self::Cadence05RecoveryDegraded => {
-                ".claude/rules/project/cadence-error-codes.md"
-            }
+            // Cadence scheduler RETIRED 2026-09-16 with `crates/core/src/cadence/`.
         }
     }
 
@@ -1827,10 +1680,6 @@ impl ErrorCode {
                 // data-comparability VERDICT — the operator judges which
                 // capture is wrong; the FUTIDX-02 precedent.
 
-                // CHAIN-01 (PR-3, 2026-07-12): restoring the option-chain
-                // Data-API entitlement is an operator/broker ACCOUNT
-                // decision — never auto-actioned despite High severity.
-                | Self::Chain01EntitlementAbsent
                 // TF-VERIFY-01 (operator 2026-07-13): a TF-vs-1m divergence
                 // is a data-comparability VERDICT over the audit rows — the
                 // operator judges whether it is a restart window, a real
@@ -1988,17 +1837,9 @@ impl ErrorCode {
             Self::Futidx02CrossFeedExpiryMismatch,
             // Dual-feed scoreboard PR-A (2026-07-10)
             Self::Scoreboard01AggregationDegraded,
-            // BruteX↔TickVault daily cross-verify (2026-07-12)
-            // Dhan↔Groww spot cross-broker comparator
-            // Per-minute spot 1m REST pipeline (operator grant 2026-07-12)
-            Self::DhanLiveXverify01RunDegraded,
-            Self::Spot1m01FetchDegraded,
+            // Per-minute REST pipeline (operator grant 2026-07-12). SPOT1M-02
+            // is the sole survivor — see its docblock.
             Self::Spot1m02PersistFailed,
-            // Per-minute option-chain REST pipeline (PR-3, 2026-07-12)
-            Self::Chain01EntitlementAbsent,
-            Self::Chain02FetchDegraded,
-            Self::Chain03PersistFailed,
-            Self::Chain04ExpirylistFailed,
             // Daily timeframe-consistency verifier (operator 2026-07-13)
             Self::TfVerify01MismatchFound,
             Self::TfVerify02RunDegraded,
@@ -2020,10 +1861,7 @@ impl ErrorCode {
             // Groww pre-trade margin surface (§39.3 area slot #4, 2026-07-15)
             // Groww orders shared contracts (PR-A0, 2026-07-15)
             // Groww order/position push channel (Stage A, 2026-07-16)
-            // Cadence scheduler (operator directive 2026-07-14)
-            Self::Cadence01LaneDegraded,
-            Self::Cadence02DecisionSkipped,
-            Self::Cadence03SchedulerDegraded,
+            // RETIRED 2026-09-16 with the per-minute Dhan market-data REST legs.
             Self::LambdaStart01BoxNotRunning,
             Self::LambdaStart02SelfHealFailed,
             Self::LambdaAws01ReadCallFailed,
@@ -2033,7 +1871,6 @@ impl ErrorCode {
             Self::LambdaPortal01ActionFailed,
             Self::LambdaProv01ShaUnknown,
             Self::LambdaMint01TokenMintFailed,
-            Self::Cadence05RecoveryDegraded,
         ]
     }
 }
@@ -2212,37 +2049,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_chain_codes_contract() {
-        // Per-minute option-chain REST pipeline (PR-3, 2026-07-12).
-        let c1 = ErrorCode::Chain01EntitlementAbsent;
-        assert_eq!(c1.code_str(), "CHAIN-01");
-        assert_eq!("CHAIN-01".parse::<ErrorCode>(), Ok(c1));
-        assert_eq!(c1.severity(), Severity::High);
-        // Design contract: the entitlement is an operator/broker ACCOUNT
-        // decision — NEVER auto-actioned despite being non-Critical (the
-        // FUTIDX-02 severity-independent override precedent).
-        assert!(!c1.is_auto_triage_safe());
-
-        for (code, s) in [
-            (ErrorCode::Chain02FetchDegraded, "CHAIN-02"),
-            (ErrorCode::Chain03PersistFailed, "CHAIN-03"),
-            (ErrorCode::Chain04ExpirylistFailed, "CHAIN-04"),
-        ] {
-            assert_eq!(code.code_str(), s);
-            assert_eq!(s.parse::<ErrorCode>(), Ok(code));
-            assert_eq!(code.severity(), Severity::High);
-            // Degrades self-heal (next minute / next trading-day boot) —
-            // auto-triage may inspect.
-            assert!(code.is_auto_triage_safe());
-            assert!(ErrorCode::all().contains(&code));
-        }
-        // The whole family shares the per-minute REST pipeline runbook.
-        assert_eq!(
-            c1.runbook_path(),
-            "docs/error-runbooks/rest-1m-pipeline-error-codes.md"
-        );
-    }
+    // `test_chain_codes_contract` RETIRED 2026-09-16. Its four subjects
+    // (CHAIN-01..04) ceased to exist with the per-minute option-chain REST
+    // leg the operator ordered removed; a contract test for a deleted enum
+    // variant cannot compile, and re-pointing it at a surviving code would
+    // assert a different contract under the old name. SPOT1M-02 keeps its
+    // own coverage via `test_all_codes_roundtrip`.
 
     #[test]
     fn test_tf_verify_codes_contract() {

@@ -295,8 +295,31 @@ fn documented_schema_matches_the_ddl_that_actually_runs() {
         }
     }
 
+    // ⚠ LOWERED 11 -> 9 on 2026-09-17, and the reason is the only thing that
+    // makes lowering an anti-vacuity floor legitimate: the coverage did not
+    // regress, the SUBJECTS left.
+    //
+    // The operator's SOCKETS-ONLY narrowing
+    // (`no-rest-except-live-feed-2026-06-27.md` §12.10) deleted four storage
+    // persistence modules whole. THREE of them carried both a documented
+    // header schema and an executable `CREATE TABLE IF NOT EXISTS`, so each
+    // counted toward `compared`: `spot_1m_rest_persistence.rs`,
+    // `option_chain_1m_persistence.rs` and `rest_fetch_audit_persistence.rs`.
+    // (The fourth, `dhan_live_crossverify_persistence.rs`, documented no
+    // schema — it was on NO_DOCUMENTED_SCHEMA below, and is removed from that
+    // list in the same change.)
+    //
+    // MEASURED, not inferred: the count read 12 before and reads 9 after — a
+    // drop of exactly 3, matching the three modules named above and nothing
+    // else. A floor lowered by a number that did not match its named cause
+    // would be a floor somebody padded.
+    //
+    // The new floor sits AT the measured truth rather than below it, which is
+    // a deliberate tightening: the old 11 sat one under the real 12, so a
+    // module could have lost its documented schema and this assertion would
+    // still have passed. At 9 the next silent loss fails the build.
     assert!(
-        compared >= 11,
+        compared >= 9,
         "only {compared} modules had both a documented and an executable schema -- \
          the scanner is broken, not the crate"
     );
@@ -464,7 +487,6 @@ fn guard_self_test() {
 /// deliberate decision that must be argued in review.
 const NO_DOCUMENTED_SCHEMA: &[&str] = &[
     "depth_persistence.rs",
-    "dhan_live_crossverify_persistence.rs",
     "instrument_lifecycle_persistence.rs",
     "order_leg_pnl_persistence.rs",
     "order_update_events_persistence.rs",

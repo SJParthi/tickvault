@@ -162,31 +162,42 @@ fn every_shipped_metric_name_has_a_production_producer() {
     );
 }
 
-#[test]
-fn the_refusal_counter_that_lost_its_shipping_is_shipped() {
-    // Regression pin for the specific defect. Named rather than left implicit,
-    // because the general test above would also pass if someone deleted this
-    // name instead of restoring it.
-    let tftpl = read("deploy/aws/cloudwatch-agent.json");
-    let agent = read("deploy/aws/cloudwatch-agent.json");
-    for (what, body) in [
-        ("cloudwatch-agent.json (2nd read)", &tftpl),
-        ("cloudwatch-agent.json", &agent),
-    ] {
-        assert!(
-            body.contains("tv_chain_mark_refused_total"),
-            "{what} no longer ships tv_chain_mark_refused_total -- when it fires, \
-             option legs cannot be marked and every option on that underlying is \
-             silently unpriced. It reached /metrics but not CloudWatch for the \
-             whole time its predecessor's name sat in the selector instead."
-        );
-        assert!(
-            !body.contains("tv_cadence_option_mark_unresolved_total"),
-            "{what} still carries tv_cadence_option_mark_unresolved_total, whose \
-             producer was deleted with the Groww feed in 1e3c9533."
-        );
-    }
-}
+// ---- `the_refusal_counter_that_lost_its_shipping_is_shipped`: REMOVED
+//      2026-09-16, and the reason matters more than the removal ----
+//
+// It pinned `tv_chain_mark_refused_total` INTO the EMF selector, named
+// rather than implicit, precisely so that "someone deleted the name instead
+// of restoring the producer" could never pass. That is exactly the shape of
+// what happened here, so this tombstone says plainly which it was.
+//
+// The counter's producer was the cadence executor's option-mark path. It
+// was not dropped to dodge this guard: the whole market-data REST surface
+// that produced it — the per-minute spot-1m and option-chain legs, the
+// cadence scheduler that fired them, and the 15:41 cross-verification — was
+// removed by OPERATOR DIRECTIVE on 2026-09-16, recorded BEFORE any code in
+// `no-rest-except-live-feed-2026-06-27.md` §12.10: "Bro just remove per
+// minute price falls and 3.41 pm accuracy check alone dude okay".
+//
+// With no producer the name could only ever have shipped a series that
+// never moves, and this file's own orphan test would then fail on it — the
+// two tests were in genuine deadlock, resolvable only together. Twelve
+// names left the selector in the same change (110 -> 98): this one, the
+// four REST persist/discard counters, the per-fire heartbeat, and the six
+// cadence counters.
+//
+// ⚠ `tv_rest_1m_fire_heartbeat` was NOT merely a shipped name. It is the
+// sole metric behind `tv-<env>-market-hours-liveness-missing`, which is
+// `treat_missing_data = "breaching"` — so deleting its producer without
+// re-pointing that alarm would page every gated market window, every
+// trading day, forever. That re-point ships in the same change; §12.8(b)
+// of the rule file records why a permanently-RED alarm is worse than a
+// permanently-green one (a red one gets MUTED, which silently disables a
+// real signal).
+//
+// What the retired test protected is NOT lost: the orphan test above still
+// fails the build if a name ships with no producer, and the count ratchet
+// in `cloudwatch_app_alarms_wiring.rs` still fails if the selector's size
+// moves without a deliberate, dated bump.
 
 #[test]
 fn guard_self_test() {
@@ -206,7 +217,7 @@ fn guard_self_test() {
         "scanner claims a name that does not exist -- it would never report an orphan"
     );
     assert!(
-        producers.contains(&"tv_chain_mark_refused_total".to_string()),
+        producers.contains(&"tv_dhan_feed_stack_up".to_string()),
         "scanner cannot see a literal that is demonstrably in production source"
     );
 }

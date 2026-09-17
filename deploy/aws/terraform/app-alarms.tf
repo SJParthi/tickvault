@@ -85,7 +85,8 @@ locals {
 # groww_ws_inactive + groww_stall_restart_storm ALSO retired — their
 # gauge/counter producers (the Groww bridge + sidecar stall watchdog) were
 # deleted; in-session process liveness is owned by the market-hours liveness
-# alarm, re-pointed to tv_rest_1m_fire_heartbeat.
+# alarm, re-pointed to tv_rest_1m_fire_heartbeat (and again, 2026-09-16, to
+# tv_dhan_feed_last_tick_age_secs when the per-minute REST legs were removed).
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # 3. Order-update WebSocket down — RETIRED 2026-07-14 (operator Dhan noise
@@ -102,7 +103,8 @@ locals {
 # the alarm could never fire again (permanent missing-data;
 # treat_missing_data=notBreaching made it silently dead, not stuck-FIRING).
 # Process liveness in-session is owned by the market-hours liveness alarm,
-# re-pointed to tv_rest_1m_fire_heartbeat in the same PR.
+# re-pointed to tv_rest_1m_fire_heartbeat in the same PR (and again, 2026-09-16,
+# to tv_dhan_feed_last_tick_age_secs with the sockets-only REST removal).
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------

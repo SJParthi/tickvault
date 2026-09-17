@@ -291,7 +291,16 @@ fn scan_corpus_exists_and_is_substantial() {
 /// "this stock did not trade" rather than "we could not price it". Each now
 /// carries `WS-GAP-03` with a `source` naming which arm failed. The budget
 /// comes down with them, in the same change, per the rule two lines above.
-const UNCODED_ERROR_BUDGET: usize = 77;
+///
+/// 77 -> 76 (2026-09-16). NOT a site coded — a site DELETED, the same shape
+/// as the 91 -> 83 Groww step above. The operator's SOCKETS-ONLY directive
+/// (`no-rest-except-live-feed-2026-06-27.md` §12, narrowed by §12.10 to
+/// MARKET DATA + VERIFICATION) removed the per-minute Dhan REST legs and the
+/// 15:41 cross-verification, and one uncoded `error!` went with them. The
+/// budget follows the corpus down in the same change, per the rule stated at
+/// the 91 -> 83 step: a ratchet allowed to sit above the truth is a ceiling
+/// somebody padded once, and it stops ratcheting the moment it does.
+const UNCODED_ERROR_BUDGET: usize = 76;
 
 /// Per-crate uncoded-error budgets, for the crates the six-name list never
 /// reached.

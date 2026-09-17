@@ -1527,3 +1527,112 @@ probe that reuses the cross-verification's own request shape as its fixture and
 reads a `crossverify` local at `:4949`. Both sides are in the removal set, so it
 goes with them — but it is the kind of cross-module fixture a per-file deletion
 walks past.
+
+---
+
+## §12.11 — RESOLVED 2026-09-17: §12.10.5 #6's DDL re-homing is satisfied by REMOVING the readers, not by creating writer-less tables
+
+> **This section RESOLVES a binding requirement differently from the way it is
+> worded, and is recorded BEFORE the code, per the rule-file-first law.** It
+> authorizes nothing new; it records a decision inside work the operator already
+> authorized (§12.10.0), and it names what the alternative would have cost.
+
+### What §12.10.5 #6 says, and the premise it rests on
+
+> "**Re-home a DDL caller for every RETAINED table**, or a future wipe leaves
+> readers erroring on 'table does not exist' instead of returning empty
+> (§12.8(g))."
+
+§12.8(g) states the premise in as many words: *"`ensure_spot_1m_rest_table`,
+`ensure_option_chain_1m_table` and `ensure_rest_fetch_audit_table` are called
+only from `cadence_boot.rs:158,171,177` and the two boot modules."* That
+sentence assumes the ensure fns SURVIVE the removal and only lose their callers.
+
+**They do not.** The four persistence modules were deleted whole —
+`spot_1m_rest_persistence.rs`, `option_chain_1m_persistence.rs`,
+`rest_fetch_audit_persistence.rs` and `dhan_live_crossverify_persistence.rs` —
+because each held its writer, its DDL and its table constant in one file. A
+workspace `grep` for `fn ensure_spot_1m_rest_table` now returns **zero**. So
+"re-home a caller" is not an edit; it is *resurrect a CREATE TABLE for a table
+nothing will ever write again*, and that is a different decision deserving a
+different answer.
+
+### The decision: satisfy the PURPOSE, which is "no reader left erroring"
+
+The requirement's stated purpose is the `or` clause — do not leave readers
+erroring. Two shapes satisfy it:
+
+| | (a) create the empty table | **(b) remove the readers** |
+|---|---|---|
+| Reader gets | `0 rows` | nothing — the query is gone |
+| What that reads as | *"the leg ran and captured nothing today"* | *"there is no leg"* |
+| Monitors | `feed_scoreboard_boot`'s REST arm reports a measured zero **every day, forever** | the arm goes with the leg |
+| New code | 3 resurrected CREATE TABLE statements + a boot caller | none |
+
+**(b) is taken.** (a) manufactures the exact misreading this repository has
+already paid for, and the precedent is dated, in-repo, and about one of these
+very tables.
+
+### The precedent that decides it — `operator_control_commands.rs`, 2026-09-03
+
+`rest_option_contract_1m` reached this state one removal earlier (its DDL
+entry point lost its last caller when the 2026-08-21 Groww removal deleted
+`groww_contract_1m_boot`). The house response is recorded at that file's own
+docblock and it was to **delete the queries, not create the table** — with
+two measured reasons:
+
+- **MEASURED on the box:** `SELECT count() FROM rest_option_contract_1m`
+  returned `table does not exist`, and QuestDB logged **61 errors in 30
+  minutes** naming it, about once a minute, for a leg with no writer.
+- **The larger half, in that docblock's own words:** `curl -f` swallowed the
+  400, the field arrived EMPTY, and the console rendered a blank "contracts"
+  bar — *"which reads as 'the per-contract leg captured nothing today' when
+  the truth is 'there is no per-contract leg'. An operator cannot tell a
+  broken leg from an absent one."*
+
+An empty table produces that second failure by construction and removes the
+first, which is the worse trade: the log noise is a nuisance an operator
+notices; a confidently blank chart is a false-OK an operator believes.
+
+### What this obliges, and it is MORE work than the table would have been
+
+Removing the readers is the larger job and every one is named here so none is
+quietly skipped:
+
+| Reader | Table | Disposition |
+|---|---|---|
+| `feed_scoreboard_boot.rs` — the REST-leg digest arm | `rest_fetch_audit`, `rest_spot_1m` | **REMOVE** the arm; a permanently-zero REST section in the daily scoreboard is the dead-monitor class |
+| `dhan_depth_universe.rs` — the boot `None` fallback | `rest_option_chain_1m` | **REMOVE** (already required by §12.10.7(b) — a fallback that can only return empty is a dead monitor written in code) |
+| `volume_semantics_probe.rs` | `rest_option_chain_1m` | zero production callers, before and after; recorded, not deleted here |
+| `rest_candle_fold.rs` | `rest_spot_1m` | `enabled = false`; §12.10.7(g) already requires it removed or explicitly recorded inert |
+| `operator_control_commands.rs` — `CHAIN_TODAY`, `CHAIN_BY_FEED`, `REST_AUDIT`, `REST_LAT_HOUR`, `REST_LATENCY_SQL` | all three | **REMOVE**, exactly as the 2026-09-03 pair was removed |
+| `operator_control_console.html:202` default query | `rest_spot_1m` | **RE-POINT** — a console whose default query errors on open is the first thing an operator sees |
+
+### ⚠ What is NOT claimed
+
+- **This does not preserve the history's queryability.** The ROWS are retained
+  (§12.6 forbids deleting them, and the SEBI allowlists at
+  `operator_control_action_commands.rs:88,163` are untouched), and on the
+  CURRENT volume the tables exist and can still be queried by hand. What goes
+  is the machinery that queried them automatically. On a FRESH volume the
+  tables will not exist at all — and that is the honest state, because on a
+  fresh volume they would hold nothing either way.
+- **`rest_option_contract_1m` is deliberately not in scope.** It has been
+  orphaned since 2026-08-21, its console queries are already gone, and adding
+  a DDL for it now would be a scope expansion nobody asked for.
+- **Retention is unchanged.** All five live names stay in
+  `DAY_PARTITIONED_TABLES` with their existing classes (§12.10.7(f)); this
+  section touches no retention list, and the `partition_retention_coverage_guard`
+  lockstep still binds.
+
+### What a PR that violates §12.11 looks like (REJECT)
+
+- Creates a CREATE TABLE for a table with no writer so a reader returns empty
+  instead of erroring — that is the blank-bar false-OK, restated.
+- Removes a reader's QUERY while leaving its alarm, metric filter or EMF name
+  in place (the permanently-green dead-monitor class §12.10.5 #5 already bans).
+- Deletes a retained table's ROWS, or edits either SEBI allowlist.
+- Leaves the operator console's DEFAULT query pointed at a table that may not
+  exist on a fresh volume.
+- Cites §12.10.5 #6 to justify resurrecting a deleted persistence module: the
+  requirement's premise (that the ensure fns survive) is measured false above.

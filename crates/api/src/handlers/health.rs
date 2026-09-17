@@ -108,24 +108,9 @@ impl Serialize for RuntimeMetricMap {
 /// and a live spawn site with no row here.
 pub const LIVE_RUNTIME_SUBSYSTEMS: &[RuntimeSubsystem] = &[
     RuntimeSubsystem {
-        name: "cadence_scheduler",
-        status: STATUS_UNWIRED,
-        metric: "tv_cadence_runner_respawn_total",
-    },
-    RuntimeSubsystem {
         name: "dhan_rest_stack",
         status: STATUS_UNWIRED,
         metric: "tv_token_remaining_seconds",
-    },
-    RuntimeSubsystem {
-        name: "dhan_spot_1m",
-        status: STATUS_UNWIRED,
-        metric: "tv_spot1m_persist_errors_total",
-    },
-    RuntimeSubsystem {
-        name: "dhan_option_chain_1m",
-        status: STATUS_UNWIRED,
-        metric: "tv_chain1m_persist_errors_total",
     },
     RuntimeSubsystem {
         name: "seal_writer",
@@ -221,6 +206,26 @@ pub const STATUS_UNWIRED: &str = "unwired";
 /// `SystemHealthStatus`, which has no setter for any of them, so any
 /// boolean here would be invented. Naming the real series is the honest,
 /// actionable answer; a `true` would be a fabrication.
+///
+/// # ⚠ CORRECTED 2026-09-16 — the count above was ALREADY wrong, and the
+/// # removal makes it wrong again
+///
+/// "The `runtime` array now lists all nine" was written on 2026-08-11 and
+/// the array has held **seven** rows ever since — the count was never true.
+/// It is the stale-count class this repository keeps recording, sitting in
+/// the doc comment of the one constant whose entire job is to answer "what
+/// runs?".
+///
+/// Today's removal takes it to **four**: `cadence_scheduler`,
+/// `dhan_spot_1m` and `dhan_option_chain_1m` went with the per-minute price
+/// pulls and the cadence scheduler, so their spawn sites no longer exist.
+/// Leaving them would have failed `health_subsystem_boot_parity_guard`,
+/// which checks BOTH directions — that guard is doing its job and is the
+/// reason this list cannot drift silently.
+///
+/// The number is NOT restated here as a literal a third time. The array is
+/// the count; read it. A hand-copied count in a doc comment is a claim with
+/// no way to stay true, which is exactly how the first one went stale.
 pub async fn health_check(State(state): State<SharedAppState>) -> Json<HealthResponse> {
     let health = state.health_status();
 

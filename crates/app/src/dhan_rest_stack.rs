@@ -1011,99 +1011,37 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
         );
     }
 
-    // REST-health canary (DHAN-REST-400) DELETED 2026-07-14 (operator Dhan
-    // noise lock): the spot-1m + option-chain legs self-detect a dead REST
-    // surface within ~3-4 minutes via their own escalation edges.
-
-    // Spot→chain sequencing signal — created ONLY when BOTH halves are
-    // enabled (byte-identical to the spawn_post_market_tasks wiring).
-    let (spot_minute_done_tx, spot_minute_done_rx) =
-        if config.spot_1m_rest.enabled && config.option_chain_1m.enabled {
-            let (tx, rx) = tokio::sync::watch::channel::<Option<u32>>(None);
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
-
-    // 2026-07-14 operator pacing directive: configure the shared Dhan
-    // Data-API limiter cap from `[dhan_data_api] target_rps` BEFORE any
-    // REST task spawns (idempotent; validate() already rejected an
-    // out-of-range value at boot).
-    crate::dhan_data_api_limiter::configure_shared_dhan_data_api_limiter(
-        config.dhan_data_api.target_rps,
-    );
-
-    if config.spot_1m_rest.enabled {
-        let _spot1m_supervisor = crate::spot_1m_rest_boot::spawn_supervised_spot_1m_rest(
-            crate::spot_1m_rest_boot::Spot1mRestTaskParams {
-                token_handle: Arc::clone(&token_handle),
-                notifier: params.notifier.clone(),
-                calendar: Arc::clone(&params.calendar),
-                questdb: config.questdb.clone(),
-                rest_api_base_url: config.dhan.rest_api_base_url.clone(),
-                minute_done_tx: spot_minute_done_tx,
-                diagnostics_enabled: config.spot_1m_rest.diagnostics,
-                diagnostics_second_probe_secs_of_day_ist: config
-                    .spot_1m_rest
-                    .diagnostics_second_probe_secs_of_day_ist,
-                fetch_mode: config.spot_1m_rest.fetch_mode,
-                batch_interval_minutes: config.spot_1m_rest.batch_interval_minutes,
-            },
-        );
-        info!(
-            "spot_1m_rest: per-minute spot 1m REST pipeline spawned \
-             (fires each minute close 09:16:00–15:30:00 IST)"
-        );
-    } else {
-        info!("spot_1m_rest: disabled by config — per-minute spot fetch not spawned");
-    }
-
-    {
-        let chain_params = crate::option_chain_1m_boot::OptionChain1mTaskParams {
-            token_handle: Arc::clone(&token_handle),
-            notifier: params.notifier.clone(),
-            calendar: Arc::clone(&params.calendar),
-            questdb: config.questdb.clone(),
-            rest_api_base_url: config.dhan.rest_api_base_url.clone(),
-            client_id: client_id.clone(),
-            spot_minute_done: spot_minute_done_rx,
-            cadence_enabled: config.cadence.enabled,
-        };
-        if config.option_chain_1m.enabled {
-            let _chain1m_supervisor =
-                crate::option_chain_1m_boot::spawn_supervised_option_chain_1m(chain_params);
-            info!(
-                "option_chain_1m: per-minute option-chain REST pipeline spawned \
-                 (expirylist warmup, then each minute close right after the spot leg)"
-            );
-        } else if config.option_chain_1m.probe_and_report {
-            let probe_handle = tokio::spawn(
-                crate::option_chain_1m_boot::run_option_chain_1m_probe(chain_params),
-            );
-            let _probe_monitor = tokio::spawn(async move {
-                if let Err(join_err) = probe_handle.await
-                    && !join_err.is_cancelled()
-                {
-                    error!(
-                        code = ErrorCode::Chain04ExpirylistFailed.code_str(),
-                        stage = "probe_task_exit",
-                        ?join_err,
-                        "CHAIN-04: the option-chain entitlement probe task died (panic) — \
-                         no verdict today; tomorrow's boot re-probes"
-                    );
-                }
-            });
-            info!(
-                "option_chain_1m: pipeline disabled by config — boot-time entitlement \
-                 probe spawned (verdict via Telegram)"
-            );
-        } else {
-            info!(
-                "option_chain_1m: disabled by config (probe_and_report off) — no \
-                 option-chain REST activity"
-            );
-        }
-    }
+    // ---- the two per-minute market-data REST legs: REMOVED 2026-09-16 ----
+    //
+    // This block spawned the supervised spot-1m fetcher
+    // (`POST /v2/charts/intraday`, interval "1") and the option-chain
+    // fetcher (`POST /v2/optionchain` + `/expirylist`), plus the
+    // spot→chain sequencing watch channel and the shared Dhan Data-API
+    // rate limiter they paced through.
+    //
+    // All of it is gone under the operator's 2026-09-16 directive, recorded
+    // BEFORE the code in `no-rest-except-live-feed-2026-06-27.md` §12.10:
+    // "Bro just remove per minute price falls and 3.41 pm accuracy check
+    // alone dude okay". The sixteen sockets have carried the same
+    // instruments live since the 2026-08-11 flip, so these legs were a
+    // duplicate of the live lane rather than its source.
+    //
+    // KEPT, deliberately, and NOT part of that removal: everything above
+    // and below this point in the stack — the instance lock, the TOTP mint
+    // and renewal, the silent mid-session profile watchdog, the GAP-02
+    // token sweep, the token-health gauge and the /health token writer.
+    // §2 of this file's own noise lock records why: a socket cannot dial
+    // without the JWT those phases produce (`build_feed_url` embeds it in
+    // the URL), so removing them dials nothing.
+    //
+    // The REST-health canary (DHAN-REST-400) was deleted earlier, on
+    // 2026-07-14, on the grounds that "the spot-1m + option-chain legs
+    // self-detect a dead REST surface within ~3-4 minutes via their own
+    // escalation edges". Those legs are now gone too, so nothing detects a
+    // dead Dhan REST surface — which is correct, because there is no longer
+    // a Dhan REST market-data surface to be dead. The token family-(3)
+    // Critical and the CloudWatch token-remaining-low alarm still cover the
+    // AUTH surface that survives.
 
     // Phase 0 Item 20 note (merge resolution, 2026-07-14): the 15:25 IST
     // orphan-position watchdog is NOT spawned from this stack. The PR-C2
@@ -1120,38 +1058,12 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
 
     metrics::gauge!("tv_dhan_rest_stack_up").set(1.0);
     info!(
-        spot_1m_rest_enabled = config.spot_1m_rest.enabled,
-        option_chain_1m_enabled = config.option_chain_1m.enabled,
-        option_chain_1m_probe = config.option_chain_1m.probe_and_report,
-        "DHAN REST-ONLY STACK UP — lock + token + renewal + silent mid-session watchdog + \
-         token sweep + token-health gauge + /health token writer + spot_1m_rest + \
-         option_chain_1m arms spawned WITHOUT any Dhan WebSocket (operator directives \
-         2026-07-13 + 2026-07-14; the 15:25 orphan watchdog is process-global in main.rs)"
+        "DHAN REST STACK UP — lock + token + renewal + silent mid-session watchdog + \
+         token sweep + token-health gauge + /health token writer, WITHOUT any Dhan \
+         WebSocket and WITHOUT any market-data REST leg (the per-minute spot-1m and \
+         option-chain pulls were removed 2026-09-16 per the operator's sockets-only \
+         directive; the 15:25 orphan watchdog is process-global in main.rs)"
     );
-
-    // M3 (2026-07-14 fix round): with BOTH per-minute legs disabled the
-    // stack has ZERO leg-level pager coverage — a total Dhan REST death
-    // would page nothing except the token family-(3) Critical + the
-    // CloudWatch token-remaining-low early warning. Loud at boot so the
-    // operator can never discover this from silence.
-    if rest_stack_has_zero_pager_legs(config.spot_1m_rest.enabled, config.option_chain_1m.enabled) {
-        warn!(
-            spot_1m_rest_enabled = false,
-            option_chain_1m_enabled = false,
-            "Dhan REST stack up with ZERO legs enabled — no pager coverage: a total \
-             Dhan REST death would fire NO leg alert (only the token family-(3) \
-             Critical + the tv-token-remaining-low CloudWatch alarm remain); enable \
-             [spot_1m_rest] / [option_chain_1m] if this is not intentional"
-        );
-    }
-}
-
-/// M3 (2026-07-14 fix round). Pure. True iff NEITHER per-minute Dhan REST
-/// leg is enabled — the configuration under which the stack has zero
-/// leg-level pager coverage (the boot-time warn above fires).
-#[must_use]
-pub(crate) fn rest_stack_has_zero_pager_legs(spot_enabled: bool, chain_enabled: bool) -> bool {
-    !spot_enabled && !chain_enabled
 }
 
 /// GAP-02 sweep body (extracted for the supervisor): every
@@ -1634,75 +1546,29 @@ mod tests {
         );
     }
 
-    /// Source-scan pin of the #1499-mirrored spot→chain contract
-    /// (2026-07-13 sequencing merge): PR #1499 rewrote the spot-1m fetch
-    /// internals (day-window + backfill + the 15:31 post-session sweep)
-    /// WITHOUT changing the spawn surface this REST-only stack mirrors
-    /// from main.rs's `spawn_post_market_tasks`. The stack therefore
-    /// inherits the sweep by construction — this test fails the build if
-    /// either side of that contract drifts (a sweep moved OUT of the
-    /// shared task, a params-field rename, or the stack dropping the
-    /// spot→chain sequencing channel) so the mirror can never diverge
-    /// silently again.
-    #[test]
-    fn test_dhan_rest_stack_mirrors_spot_chain_contract_post_1499() {
-        // The shared spot-1m module still owns the sweep + sequencing
-        // signal (the #1499 semantics both spawn paths inherit).
-        let spot_src = include_str!("spot_1m_rest_boot.rs");
-        for needle in [
-            "run_post_session_sweep(",
-            "pub minute_done_tx",
-            "send_replace",
-            // TEST-EXEMPT: string-literal ratchet needle (not a fn declaration) — pub-fn-test-guard grep false positive
-            "pub fn spawn_supervised_spot_1m_rest",
-        ] {
-            assert!(
-                spot_src.contains(needle),
-                "spot_1m_rest_boot.rs lost `{needle}` — the #1499-mirrored \
-                 contract drifted; re-check dhan_rest_stack's spawn mirror"
-            );
-        }
-
-        // This module's PRODUCTION region (split at the test-module marker
-        // so these assertion literals can never satisfy themselves) still
-        // spawns the same supervised task and builds the sequencing
-        // channel the lane path uses.
-        let own_src = include_str!("dhan_rest_stack.rs");
-        let (prod, _) = own_src
-            .split_once("#[cfg(test)]")
-            .expect("dhan_rest_stack.rs must keep its test module marker");
-        for needle in [
-            "spawn_supervised_spot_1m_rest(",
-            "spawn_supervised_option_chain_1m(",
-            "watch::channel::<Option<u32>>",
-            "minute_done_tx",
-        ] {
-            assert!(
-                prod.contains(needle),
-                "dhan_rest_stack.rs production region lost `{needle}` — the \
-                 REST-only stack no longer mirrors spawn_post_market_tasks"
-            );
-        }
-    }
-
-    /// M3 (2026-07-14 fix round): zero-pager-legs truth table + the boot
-    /// warn stays wired in the production region.
-    #[test]
-    fn test_rest_stack_zero_pager_legs_truth_table_and_warn_wired() {
-        assert!(rest_stack_has_zero_pager_legs(false, false));
-        assert!(!rest_stack_has_zero_pager_legs(true, false));
-        assert!(!rest_stack_has_zero_pager_legs(false, true));
-        assert!(!rest_stack_has_zero_pager_legs(true, true));
-        let own_src = include_str!("dhan_rest_stack.rs");
-        let (prod, _) = own_src
-            .split_once("#[cfg(test)]")
-            .expect("dhan_rest_stack.rs must keep its test module marker");
-        assert!(
-            prod.contains("rest_stack_has_zero_pager_legs(config.spot_1m_rest.enabled"),
-            "the boot-time zero-legs warn must stay wired — with both legs \
-             disabled a total Dhan REST death is otherwise pageless (M3)"
-        );
-    }
+    // ---- the spot→chain mirror tests: REMOVED 2026-09-16 with the legs ----
+    //
+    // Two tests lived here and both pinned the per-minute REST legs this
+    // stack no longer spawns:
+    //
+    //   * `test_dhan_rest_stack_mirrors_spot_chain_contract_post_1499` —
+    //     a source-scan pin that this module kept mirroring
+    //     `spawn_post_market_tasks`' spot→chain spawn surface. Both sides
+    //     of that mirror are gone: the shared `spot_1m_rest_boot` module
+    //     it read with `include_str!` no longer exists, so the test could
+    //     not compile, let alone pass.
+    //   * `test_rest_stack_zero_pager_legs_truth_table_and_warn_wired` —
+    //     pinned a boot warn that fired when BOTH legs were disabled. With
+    //     the legs removed outright that condition is permanent, so the
+    //     warn would have fired on every boot forever: the "one error per
+    //     boot" shape that trains an operator to discount a counter.
+    //     `rest_stack_has_zero_pager_legs` is deleted with it.
+    //
+    // Authority: `no-rest-except-live-feed-2026-06-27.md` §12.10 (operator
+    // 2026-09-16, "Bro just remove per minute price falls and 3.41 pm
+    // accuracy check alone dude okay"). The coverage question the second
+    // test raised is not answered by a test — it is recorded honestly in
+    // §12.10.4 of that file as a LOSS.
 
     /// L-fix (2026-07-14 fix round): the supervisor respawns a dying inner
     /// task (clean-exit class) with the configured backoff. 0s backoff so
