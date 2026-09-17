@@ -106,12 +106,6 @@ pub mod ilp_overflow;
 // Groww — both DELETED in SP5). Both feeds write here. See live-feed-purity.md
 // rule 11 + docs/design/sp5-unified-parity-audit-design.md. The two old physical
 // QuestDB tables are RETAINED on disk (SEBI 5y) but no longer written.
-/// Daily 15:31 IST Dhan LIVE-vs-REST cross-verification audit (the revived
-/// Dhan live feed's ONLY ground truth — the wire carries no sequence number,
-/// so Dhan's own 1m tape is the only packet-loss proxy available). Cell-level
-/// findings + a daily run row whose `blind` outcome makes a zero-comparison
-/// run structurally incapable of reading as a pass (the PR #1474 lesson).
-pub mod dhan_live_crossverify_persistence;
 /// Dual-feed scoreboard (operator 2026-07-10): one classified row per feed
 /// EPISODE (disconnect / stall / process death) with the blame verdict
 /// persisted — the month-end "who caused it" system-of-record.
@@ -237,22 +231,11 @@ pub mod seal_writer_task;
 pub mod shadow_candle_writer;
 pub mod shadow_persistence;
 pub mod shadow_seal_columns;
-// Per-minute spot 1m REST pipeline (operator grant 2026-07-12, PR-2 — the
-// SPOT half; SPOT1M-02): the `spot_1m_rest` table DDL + ILP-over-HTTP writer.
-pub mod spot_1m_rest_persistence;
-// Per-minute option-chain REST pipeline (operator grant 2026-07-12, PR-3 —
-// the OPTION-CHAIN half; CHAIN-03): the `option_chain_1m` table DDL +
-// ILP-over-HTTP writer.
-pub mod option_chain_1m_persistence;
 // Per-contract 1m candle leg of the Groww per-minute REST pipeline
 // (operator grant 2026-07-13, PR-4 — the fill-model leg): the
 // `option_contract_1m_rest` table DDL + ILP-over-HTTP writer (feed in the
 // DEDUP key; retention registered in partition_manager.rs).
 pub mod option_contract_1m_rest_persistence;
-// Per-fetch forensics for the per-minute REST legs (operator scope addition
-// 2026-07-13, Groww REST plan PR-2): the `rest_fetch_audit` table DDL +
-// ILP-over-HTTP writer — one row per (target minute, symbol, feed, leg).
-pub mod rest_fetch_audit_persistence;
 // Stage-2 dead-WS sweep (2026-07-17): `tick_flush_worker` / `tick_persistence`
 // / `tick_row_builder` / `tick_spill_drain` were DELETED with the dead Dhan
 // tick chain (`run_tick_processor` died in PR-C2/C3; the Groww live feed

@@ -43,7 +43,6 @@ use tickvault_core::websocket::pool_budget::{
     DEPTH_20_INSTRUMENTS_PER_CONNECTION, MAX_DEPTH_20_CONNECTIONS,
 };
 use tickvault_core::websocket::pool_supervisor::SubscribeInstrument;
-use tickvault_storage::option_chain_1m_persistence::OPTION_CHAIN_1M_TABLE;
 
 /// Instruments the whole depth-20 pool can carry.
 ///
@@ -797,97 +796,6 @@ pub fn select_depth_universe(candidates: &[DepthCandidate]) -> DepthSelection {
     out
 }
 
-/// The `/exec` query selecting one row per live contract from the most recent
-/// chain snapshot.
-///
-/// `LATEST ON ts PARTITION BY` collapses the per-minute history to the newest
-/// row per contract, and the `expiry >= today` bound is what stops a dead
-/// contract being subscribed after an expiry rolls: those rows stay in the
-/// table forever (nothing evicts them) and a subscription to an expired
-/// contract returns silence indistinguishable from a quiet book.
-///
-/// `contract_security_id > 0` is deliberately ALSO enforced in
-/// [`select_depth_universe`], not only here — the SQL filter keeps the result
-/// set small, the code filter is what makes the refusal countable.
-#[must_use]
-pub fn build_depth_candidate_query(today_ist_nanos: i64) -> String {
-    let today_micros = today_ist_nanos / 1_000;
-    format!(
-        // `ts >= {today_micros}` added 2026-08-14. Without it `LATEST ON ts`
-        // returns the newest row per partition from ANY day, so a pre-09:16
-        // caller silently got YESTERDAY's chain — stale `underlying_spot`
-        // driving ATM ranking, on derivative ids Dhan documents as unstable
-        // across days.
-        //
-        // This bound is safe ONLY because the caller now retries
-        // (`dhan_feed_stack::attach_depth_when_available`). Added alone, it
-        // would have turned a boot-time read into zero rows and REDUCED the
-        // socket count — correct but worse. Day bound and late-attach are one
-        // change; do not separate them.
-        "SELECT underlying_symbol, contract_security_id, expiry, strike, \
-         underlying_spot, leg FROM {OPTION_CHAIN_1M_TABLE} \
-         WHERE feed = 'dhan' AND contract_security_id > 0 AND expiry >= {today_micros} \
-         AND ts >= {today_micros} \
-         LATEST ON ts PARTITION BY underlying_security_id, expiry, strike, leg;"
-    )
-}
-
-/// Parse the `/exec` dataset into candidates.
-///
-/// Fail-LOUD on a malformed body or a missing `dataset` key, fail-soft per row
-/// — the house pattern from `brutex_crossverify_boot::parse_lifecycle_dataset`.
-/// The distinction matters: an empty `Vec` returned for garbage would be
-/// indistinguishable from a genuinely empty chain, and the caller's response to
-/// those two is different.
-///
-/// # Errors
-/// Returns `Err` when the body is not JSON or carries no `dataset` array.
-pub fn parse_depth_candidates_dataset(body: &str) -> Result<Vec<DepthCandidate>, String> {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
-        return Err("malformed /exec response: not valid JSON".to_owned());
-    };
-    let Some(rows) = v.get("dataset").and_then(|d| d.as_array()) else {
-        return Err("malformed /exec response: missing dataset array".to_owned());
-    };
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        let Some(cols) = row.as_array() else { continue };
-        if cols.len() < 6 {
-            continue;
-        }
-        let underlying = cols[0].as_str().unwrap_or_default();
-        if underlying.is_empty() {
-            continue;
-        }
-        let Some(contract_security_id) = cols[1].as_i64() else {
-            continue;
-        };
-        let expiry_micros = cols[2].as_i64().unwrap_or(0);
-        let strike = cols[3].as_f64().unwrap_or(f64::NAN);
-        let spot = cols[4].as_f64().unwrap_or(f64::NAN);
-        let leg = cols[5].as_str().unwrap_or_default();
-        if leg.is_empty() {
-            continue;
-        }
-        out.push(DepthCandidate {
-            underlying: underlying.to_owned(),
-            contract_security_id,
-            expiry_micros,
-            strike,
-            spot,
-            // The chain leg pulls NIFTY / BANKNIFTY / SENSEX only — index
-            // underlyings by construction, never a stock. Asserted rather
-            // than assumed by `chain_sourced_candidates_are_all_index_options`,
-            // because if the chain leg's scope ever widens, a stock arriving
-            // here would be mislabelled an index and its refusal would read
-            // as an unknown index rather than a stock we chose not to cover.
-            is_index_option: true,
-            leg: leg.to_owned(),
-        });
-    }
-    Ok(out)
-}
-
 /// Build depth candidates from the DAILY CONTRACT ARTIFACT plus spot prices,
 /// instead of from the per-minute option chain.
 ///
@@ -1024,7 +932,39 @@ pub async fn load_depth_universe_from_master(
         return None;
     }
     let selection = select_depth_universe(&candidates);
+    // ⚠ MOVED HERE 2026-09-16 — `empty_selection` used to be recorded by the
+    // chain-query fallback (`load_depth_universe`), deleted with the
+    // per-minute option-chain pull (`no-rest-except-live-feed-2026-06-27.md`
+    // §12.10). That deletion took SIX of this module's seven emit sites with
+    // it, and this one is the only one whose CONDITION survived: both pools
+    // empty still means every depth socket carries nothing for the session.
+    //
+    // Until this line the surviving master path returned `None` here with no
+    // counter and no coded log — the loud arm became a silent one, and the
+    // caller's `empty_selection` refusal comment in `dhan_feed_stack` pointed
+    // at a counter nothing incremented. `no_pre_registered_depth_reason_is_
+    // unreachable` is the guard that caught it, working exactly as written:
+    // a pre-registered reason with no emit site is a permanently-flat series
+    // that reads as health forever.
+    //
+    // The other five (`client_build`, `response_unreadable`, `non_2xx`,
+    // `request_failed`, `unparseable`) were HTTP-transport reasons for a fetch
+    // that no longer happens, so they are removed from the reason list rather
+    // than re-homed. There is no condition left for them to describe.
     if selection.depth_20.is_empty() && selection.depth_200.is_empty() {
+        record_depth_failure("empty_selection");
+        tracing::error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching.code_str(),
+            source = "contract_artifact",
+            reason = "empty_selection",
+            candidates = candidates.len(),
+            "WS-GAP-02: the daily contract artifact yielded candidates but the \
+             selector filled NEITHER depth pool — depth-20 and depth-200 will \
+             open ZERO sockets this session. There is no chain fallback behind \
+             this any more (removed 2026-09-16), so this is terminal for depth \
+             until the next attach retry. Check which underlyings had a usable \
+             spot price at attach time"
+        );
         return None;
     }
     // A selection with exactly ONE pool empty is USABLE and is kept — half the
@@ -1183,12 +1123,24 @@ pub const DEPTH_UNIVERSE_FAILED_COUNTER: &str = "tv_dhan_depth_universe_failed_t
 /// counter fires at most a handful of times per session — so an
 /// un-pre-registered reason would lose its first increment and, on a session
 /// that failed once, its only one.
-pub const DEPTH_FAILURE_REASONS: [&str; 7] = [
-    "client_build",
-    "response_unreadable",
-    "non_2xx",
-    "request_failed",
-    "unparseable",
+/// ⚠ TRIMMED 7 -> 2 on 2026-09-16, and a series only SHRINKS here for a
+/// reason worth stating: the five HTTP-transport reasons (`client_build`,
+/// `response_unreadable`, `non_2xx`, `request_failed`, `unparseable`) belonged
+/// to the chain-query fallback `load_depth_universe`, deleted with the
+/// per-minute option-chain pull (`no-rest-except-live-feed-2026-06-27.md`
+/// §12.10). No fetch happens here any more, so there is no condition left for
+/// them to describe, and a pre-registered reason with no emit site is a
+/// permanently-flat series that reads as health forever — the dead-monitor
+/// class this repo has retired twice.
+///
+/// `empty_selection` is KEPT because its CONDITION survived the deletion even
+/// though its emit site did not: both pools empty still means every depth
+/// socket carries nothing. It is re-homed onto the surviving master path in
+/// `load_depth_universe_from_master`, which had been returning `None` there
+/// silently. Removing it from this list instead would have been the easy way
+/// to make the guard pass, and it would have deleted the signal rather than
+/// the gap.
+pub const DEPTH_FAILURE_REASONS: [&str; 2] = [
     "empty_selection",
     // ADDED 2026-08-29. A selection with ONE of the two pools empty was
     // returned as `Some` and used, because the fall-through test is
@@ -1214,145 +1166,6 @@ pub fn pre_register_depth_failure_counters() {
 /// called from a path the drain's own budget covers.
 pub fn record_depth_failure(reason: &'static str) {
     metrics::counter!(DEPTH_UNIVERSE_FAILED_COUNTER, "reason" => reason).increment(1);
-}
-/// `/exec` HTTP timeout. Matches the sibling boot readers.
-const QUESTDB_EXEC_TIMEOUT_SECS: u64 = 10;
-
-/// Load and select the depth universe from the newest chain snapshot.
-///
-/// # Timing, stated plainly
-///
-/// This runs ONCE, at boot. On a normal morning the newest snapshot is
-/// yesterday's final minute, whose contracts are still the live expiry — so
-/// depth comes up populated before the open.
-///
-/// **The morning AFTER an expiry is the exception**: yesterday's rows are
-/// excluded by the `expiry >= today` bound (correctly — they are dead
-/// contracts), and today's chain has not been fetched yet at 08:30. Depth is
-/// therefore EMPTY that morning until the process is next restarted. That is a
-/// real limitation, not a bug being papered over: closing it needs live
-/// re-subscription on an already-running pool, which is a larger change than
-/// this one. It is logged at `error!` rather than left to be noticed.
-///
-/// An empty result is never reported as success. An empty instrument set opens
-/// ZERO sockets, and calling that "depth enabled" is exactly the false-OK the
-/// scope-lock forbids.
-// Every decision this makes is delegated to the unit-tested pure fns
-// (build_depth_candidate_query, parse_depth_candidates_dataset,
-// select_depth_universe); this wrapper only moves bytes and logs.
-// TEST-EXEMPT: network I/O (QuestDB /exec) — see the note above.
-pub async fn load_depth_universe(
-    questdb: &tickvault_common::config::QuestDbConfig,
-    today_ist_nanos: i64,
-) -> DepthSelection {
-    let url = format!("http://{}:{}/exec", questdb.host, questdb.http_port);
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(QUESTDB_EXEC_TIMEOUT_SECS))
-        .build()
-    {
-        Ok(c) => c,
-        Err(err) => {
-            record_depth_failure("client_build");
-            tracing::error!(
-                code =
-                    tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching.code_str(),
-                ?err,
-                "depth universe: HTTP client build failed — depth-20 and depth-200 will \
-                 open ZERO sockets this session"
-            );
-            return DepthSelection::default();
-        }
-    };
-    let sql = build_depth_candidate_query(today_ist_nanos);
-    let body = match client
-        .get(&url)
-        .query(&[("query", sql.as_str())])
-        .send()
-        .await
-    {
-        Ok(resp) if resp.status().is_success() => match resp.text().await {
-            Ok(b) => b,
-            Err(err) => {
-                record_depth_failure("response_unreadable");
-                tracing::error!(
-                    code = tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching
-                        .code_str(),
-                    ?err,
-                    "depth universe: could not read the chain snapshot response — \
-                     depth-20 and depth-200 will open ZERO sockets this session"
-                );
-                return DepthSelection::default();
-            }
-        },
-        Ok(resp) => {
-            record_depth_failure("non_2xx");
-            tracing::error!(
-                code = tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching.code_str(),
-                status = %resp.status(),
-                "depth universe: chain snapshot query returned non-2xx — depth-20 and \
-                 depth-200 will open ZERO sockets this session"
-            );
-            return DepthSelection::default();
-        }
-        Err(err) => {
-            record_depth_failure("request_failed");
-            tracing::error!(
-                code =
-                    tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching.code_str(),
-                ?err,
-                "depth universe: chain snapshot query failed — depth-20 and depth-200 \
-                 will open ZERO sockets this session"
-            );
-            return DepthSelection::default();
-        }
-    };
-
-    let candidates = match parse_depth_candidates_dataset(&body) {
-        Ok(c) => c,
-        Err(reason) => {
-            record_depth_failure("unparseable");
-            tracing::error!(
-                code =
-                    tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching.code_str(),
-                reason,
-                "depth universe: chain snapshot did not parse — depth-20 and depth-200 \
-                 will open ZERO sockets this session"
-            );
-            return DepthSelection::default();
-        }
-    };
-
-    let selection = select_depth_universe(&candidates);
-    if selection.depth_20.is_empty() && selection.depth_200.is_empty() {
-        record_depth_failure("empty_selection");
-        tracing::error!(
-            code = tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching.code_str(),
-            candidates = candidates.len(),
-            refused_zero_id = selection.refused_zero_id,
-            refused_unknown_underlying = selection.refused_unknown_underlying,
-            refused_stock_option = selection.refused_stock_option,
-            refused_bad_price = selection.refused_bad_price,
-            refused_depth_ineligible_segment = selection.refused_depth_ineligible_segment,
-            "depth universe is EMPTY — depth-20 and depth-200 will open ZERO sockets \
-             this session. Expected on the morning after an expiry (yesterday's \
-             contracts are dead and today's chain has not been fetched yet); a restart \
-             after 09:16 IST populates it. Any other time, check whether the \
-             option-chain leg is running and whether contract_security_id is populated."
-        );
-    } else {
-        tracing::info!(
-            depth_20 = selection.depth_20.len(),
-            depth_200 = selection.depth_200.len(),
-            candidates = candidates.len(),
-            refused_zero_id = selection.refused_zero_id,
-            refused_unknown_underlying = selection.refused_unknown_underlying,
-            refused_stock_option = selection.refused_stock_option,
-            refused_bad_price = selection.refused_bad_price,
-            refused_depth_ineligible_segment = selection.refused_depth_ineligible_segment,
-            "depth universe selected from the option chain"
-        );
-    }
-    selection
 }
 
 #[cfg(test)]
@@ -1616,22 +1429,6 @@ mod tests {
             "an index with no mapping is a real gap and must stay visible"
         );
         assert_eq!(sel.refused_stock_option, 0);
-    }
-
-    /// The chain leg hardcodes `is_index_option: true`. That is correct only
-    /// while the chain pulls index underlyings alone — if its scope widens, a
-    /// stock arriving through it would be mislabelled an index and its refusal
-    /// would read as an unknown index rather than a stock we chose not to
-    /// cover. Pinned so the widening has to face this.
-    #[test]
-    fn chain_sourced_candidates_are_all_index_options() {
-        let body = r#"{"dataset":[["NIFTY",101,1900000000000000,25000.0,25000.0,"CE"]]}"#;
-        let got = parse_depth_candidates_dataset(body).expect("valid dataset");
-        assert_eq!(got.len(), 1);
-        assert!(
-            got[0].is_index_option,
-            "the chain leg's candidates are index options by construction"
-        );
     }
 
     /// The chain parser defaults a missing `contract_security_id` to 0, and the
@@ -2173,109 +1970,6 @@ mod tests {
         );
         assert_eq!(sel.refused_depth_ineligible_segment, 1);
     }
-
-    /// Garbage must NOT read as "the chain is empty" — the caller treats those
-    /// two very differently, and conflating them is how a parse failure
-    /// becomes a silent zero-socket depth lane.
-    #[test]
-    fn test_parse_depth_candidates_dataset_errors_on_garbage_not_empty_list() {
-        assert!(parse_depth_candidates_dataset("not json").is_err());
-        assert!(parse_depth_candidates_dataset("{}").is_err());
-        assert_eq!(
-            parse_depth_candidates_dataset(r#"{"dataset":[]}"#),
-            Ok(vec![]),
-            "a genuinely empty chain stays Ok(empty)"
-        );
-    }
-
-    #[test]
-    fn test_dataset_row_parses_into_a_candidate() {
-        let body = r#"{"dataset":[["NIFTY",4242,1780000000000,25000.0,24980.5,"CE"]]}"#;
-        let rows = parse_depth_candidates_dataset(body).expect("parses");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].underlying, "NIFTY");
-        assert_eq!(rows[0].contract_security_id, 4242);
-        assert_eq!(rows[0].leg, "CE");
-    }
-
-    /// Expired contracts stay in the table forever (nothing evicts them), so
-    /// without the expiry bound a rolled expiry would keep being subscribed and
-    /// return silence indistinguishable from a quiet book.
-    #[test]
-    fn test_build_depth_candidate_query_bounds_by_expiry_and_refuses_zero_ids() {
-        let sql = build_depth_candidate_query(1_780_000_000_000_000_000);
-        assert!(
-            sql.contains("expiry >="),
-            "must exclude dead contracts: {sql}"
-        );
-        assert!(
-            sql.contains("contract_security_id > 0"),
-            "must exclude vendor-absent ids: {sql}"
-        );
-        // The 2026-08-14 rename: this reader is what feeds the 10 depth
-        // sockets, so a stale table name here is the difference between
-        // depth-live and depth-dark. Literal on purpose — see the note in
-        // market_ram_store_boot.
-        assert!(
-            sql.contains("FROM rest_option_chain_1m"),
-            "depth reader must follow the renamed REST table: {sql}"
-        );
-        assert!(
-            sql.contains("LATEST ON ts"),
-            "must collapse per-minute history to the newest row per contract: {sql}"
-        );
-        assert!(
-            sql.contains("1780000000000000"),
-            "nanos must be converted to micros for QuestDB: {sql}"
-        );
-    }
-
-    /// The envelope is 5 conns x 50 for depth-20 and 5 x 1 for depth-200.
-    /// Exceeding either makes `plan_pool` refuse the WHOLE lane, so a selection
-    /// that overflows does not degrade — it takes the main feed down with it.
-    #[test]
-    fn test_selection_stays_inside_the_authorized_connection_envelope() {
-        let mut rows = Vec::new();
-        for (u, base) in [("NIFTY", 0_i64), ("BANKNIFTY", 1000), ("SENSEX", 2000)] {
-            for i in 1..=200_i64 {
-                for (leg_idx, leg) in ["CE", "PE"].iter().enumerate() {
-                    let mut c = candidate(u, base + i * 2 + leg_idx as i64, i as f64, leg);
-                    c.spot = 100.0;
-                    rows.push(c);
-                }
-            }
-        }
-        let sel = select_depth_universe(&rows);
-        assert!(
-            sel.depth_20.len() <= 250,
-            "depth-20 envelope is 5 conns x 50 = 250, got {}",
-            sel.depth_20.len()
-        );
-        assert!(
-            sel.depth_200.len() <= 5,
-            "depth-200 envelope is 5 conns x 1 = 5, got {}",
-            sel.depth_200.len()
-        );
-    }
-
-    /// The day bound is what stops a pre-09:16 caller from silently receiving
-    /// YESTERDAY's chain. `LATEST ON ts` returns the newest row per partition
-    /// from ANY day without it.
-    #[test]
-    fn test_depth_candidate_query_is_day_bounded() {
-        let today = 1_786_000_000_000_000_000i64;
-        let sql = build_depth_candidate_query(today);
-        let micros = today / 1_000;
-        assert!(
-            sql.contains(&format!("ts >= {micros}")),
-            "the depth candidate query MUST bound ts to today — without it LATEST ON ts \
-             returns yesterday's chain and depth ranks ATM off a stale spot. sql={sql}"
-        );
-        assert!(
-            sql.contains(&format!("expiry >= {micros}")),
-            "the expiry filter must survive alongside the day bound. sql={sql}"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -2432,8 +2126,16 @@ mod failure_metric_tests {
                 emitted.push(&rest[..end]);
             }
         }
+        // Anti-vacuity floor, LOWERED 6 -> 3 on 2026-09-16. This number is not
+        // a coverage target; it exists so the loop below cannot pass over an
+        // empty list. It follows the corpus DOWN because five HTTP-transport
+        // emit sites were deleted with the chain fallback
+        // (`no-rest-except-live-feed-2026-06-27.md` §12.10) — see the note on
+        // `DEPTH_FAILURE_REASONS`. Three literals remain: `empty_selection`
+        // and `partial_selection` in production, plus one `empty_selection` in
+        // the test module below, which this whole-file scan legitimately sees.
         assert!(
-            emitted.len() >= 6,
+            emitted.len() >= 3,
             "expected every failure arm to record a reason, found {}",
             emitted.len()
         );
@@ -2462,7 +2164,17 @@ mod failure_metric_tests {
         let src = include_str!("dhan_depth_universe.rs");
         let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
         let errors = prod.matches("tracing::error!(").count();
-        assert!(errors >= 6, "expected the six failure arms, found {errors}");
+        // Anti-vacuity floor, LOWERED 6 -> 2 on 2026-09-16 — the same deletion
+        // that trimmed `DEPTH_FAILURE_REASONS` took four of these `error!` arms
+        // with the chain fallback (`no-rest-except-live-feed-2026-06-27.md`
+        // §12.10). The floor guards the loop below against an empty scan; it is
+        // not a target. The two surviving arms are `empty_selection` and
+        // `partial_selection`, and both carry `code=`, which is the property
+        // this test actually exists to pin.
+        assert!(
+            errors >= 2,
+            "expected the surviving failure arms, found {errors}"
+        );
         let mut uncoded = 0;
         for (idx, _) in prod.match_indices("tracing::error!(") {
             // CHARS, not bytes. These messages are full of em-dashes, and a
@@ -2526,9 +2238,13 @@ mod failure_metric_tests {
             DEPTH_FAILURE_REASONS.contains(&"partial_selection"),
             "a reason that is not pre-registered is not seeded at zero"
         );
+        // Count ratchet, 7 -> 2 on 2026-09-16 (see the const's own note): the
+        // five HTTP-transport reasons went with the deleted chain fallback.
+        // A new reason must still be a deliberate addition — this number moves
+        // only in the same change that adds or removes an emit site.
         assert_eq!(
             DEPTH_FAILURE_REASONS.len(),
-            7,
+            2,
             "count ratchet — a new reason must be a deliberate addition"
         );
     }

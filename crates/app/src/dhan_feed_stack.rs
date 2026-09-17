@@ -3984,14 +3984,6 @@ pub struct DrainCounters {
     /// Bytes abandoned mid-frame by the two give-up arms. See
     /// [`DRAIN_ABANDONED_BYTES_COUNTER`] for why this is bytes and not packets.
     abandoned_bytes: metrics::Counter,
-    xverify_measured: metrics::Counter,
-    xverify_vacuous: metrics::Counter,
-    xverify_failed: metrics::Counter,
-    /// Runs whose divergence rate was high enough that the two records are not
-    /// describing the same market. See the emit site for why the bar is set
-    /// where it is.
-    xverify_diverged: metrics::Counter,
-    xverify_no_token: metrics::Counter,
 }
 
 impl DrainCounters {
@@ -4057,11 +4049,6 @@ pub fn counters() -> &'static DrainCounters {
         truncated: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "truncated"),
         main_feed_length_mismatch: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "length_mismatch"),
         abandoned_bytes: metrics::counter!(DRAIN_ABANDONED_BYTES_COUNTER),
-        xverify_measured: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "measured"),
-        xverify_vacuous: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "vacuous"),
-        xverify_failed: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "failed"),
-        xverify_diverged: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "diverged"),
-        xverify_no_token: metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "no_token"),
     })
 }
 
@@ -10145,22 +10132,25 @@ async fn attach_depth_when_available(
         // QuestDB queries a minute for a set that is already subscribed buys
         // nothing. `outstanding_halves` already gates on `depth_done`, so an
         // empty selection here cannot change a decision.
+        // 2026-09-16: the `None` arm used to fall back to
+        // `load_depth_universe`, which queried the per-minute option-chain
+        // table. That WRITER is deleted, so the arm could only ever have
+        // returned an empty selection — a fallback that "fell back and got
+        // nothing", firing the empty-selection error whose remedy text named
+        // a leg that no longer exists. An empty `DepthSelection` here is the
+        // honest answer and it is already loud: the caller counts
+        // `empty_selection` and refuses to call a zero-socket pool enabled.
         let selection = if depth_done {
             crate::dhan_depth_universe::DepthSelection::default()
         } else {
-            match crate::dhan_depth_universe::load_depth_universe_from_master(
+            crate::dhan_depth_universe::load_depth_universe_from_master(
                 &questdb,
                 &spot_prices,
                 &today_date,
                 ymd_from_ist_date(&today_date),
             )
             .await
-            {
-                Some(from_artifact) => from_artifact,
-                None => {
-                    crate::dhan_depth_universe::load_depth_universe(&questdb, today_nanos).await
-                }
-            }
+            .unwrap_or_default()
         };
 
         // The FIFTH depth-200 socket: the day's biggest mover.
@@ -12260,51 +12250,37 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             "Dhan live feed is enabled while the REST candle fold is ALSO writing Dhan \
              candles — REFUSING to open any socket. Both write sealed candles into the same \
              candles_<tf> tables stamped feed='dhan', and the dedup key cannot tell them \
-             apart, so one silently overwrites the other. It would also make the 15:31 \
-             cross-verification compare the REST record against itself and always agree. \
+             apart, so one silently overwrites the other. \
              Turn OFF [rest_candle_fold] to run the live lane, or leave the live lane off."
         );
         report_unfolded_wal_frames(&params.wal_replay_live_feed, "rest_candle_fold_collision");
         return;
     }
 
-    // ---- verification floor ------------------------------------------------
-    // The 15:31 cross-verify is BLOCKING, not optional: the main feed has no
-    // snapshot-on-subscribe and no sequence number, so packet loss is
-    // invisible at the protocol level and this comparator is the only ground
-    // truth the lane has.
+    // ---- the verification floor: REMOVED 2026-09-16, and nothing replaces it ----
     //
-    // 2026-08-11: this block previously CALLED `spawn_daily_crossverify` and
-    // discarded the result, one line below a comment asserting the check was
-    // "BLOCKING, not optional ... it can never be enabled without its own
-    // verifier". Both halves were false. Nothing registered the comparator's
-    // dependencies, so it always took its refusal branch, and the lane opened
-    // all sixteen sockets regardless — capturing data it had no way to verify
-    // while the comment said that was impossible.
+    // A refusal floor stood here. It refused to open any socket unless the
+    // 15:41 live-vs-REST cross-verification could be armed, on the grounds
+    // that this feed carries no sequence number and no snapshot-on-subscribe,
+    // so the comparator was the ONLY way packet loss could ever be detected.
+    // That reasoning was correct and is unchanged. The comparator is gone by
+    // operator directive (the per-minute price pulls and the accuracy check),
+    // so a floor gating on it cannot stand — a precondition that can never be
+    // satisfied refuses every boot.
     //
-    // It is now a real refusal, in the same shape as the WAL floor below.
-    // Ordered FIRST among the three because it is the cheapest to satisfy and
-    // the most expensive to discover missing: a lane with no WAL loses ticks
-    // visibly on the next restart, whereas a lane with no verifier looks
-    // perfect right up until someone compares it against the broker's record.
-    let Some(crossverify) = spawn_daily_crossverify(&params.main_feed_instruments) else {
-        error!(
-            code = ErrorCode::WsGapConnectionState.code_str(),
-            planned_connections = plan.len(),
-            "Dhan live feed is enabled but the 15:31 cross-verification could not be armed — \
-             REFUSING to open any socket. This feed carries no sequence number and no \
-             snapshot-on-subscribe, so the daily comparison against Dhan's own REST record is \
-             the ONLY way packet loss can ever be detected. Capturing without it would produce \
-             data that cannot be verified, and a missing minute would be indistinguishable \
-             from a quiet one. Call install_crossverify_deps() during boot, before this stack \
-             spawns."
-        );
-        report_unfolded_wal_frames(&params.wal_replay_live_feed, "crossverify_deps_missing");
-        return;
-    };
-    // Held for the lane's lifetime so the comparator cannot be dropped while
-    // sockets are still capturing.
-    let _crossverify = crossverify;
+    // NOTHING TAKES ITS PLACE, deliberately. Inventing a different
+    // precondition on the live trading lane inside a removal change would be
+    // a new refusal nobody asked for, hiding behind a deletion. The five
+    // OTHER floors below and above are untouched: plan-build, the
+    // rest-fold exclusivity check, the capture/WAL floor, the token-manager
+    // floor and the dual-instance lock.
+    //
+    // THE HONEST CONSEQUENCE: from today there is ZERO mechanism anywhere in
+    // this workspace that compares captured market data against any external
+    // record. Every remaining signal reports whether the machinery RAN, not
+    // whether the numbers are RIGHT. Recorded at
+    // `no-rest-except-live-feed-2026-06-27.md` §12.10.3/§12.10.4 rather than
+    // left to be discovered.
 
     // ---- capture floor -----------------------------------------------------
     // Refused, not degraded: a live feed with no write-ahead log would report
@@ -13427,772 +13403,29 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
 }
 
 // ---------------------------------------------------------------------------
-// 15:31 cross-verification — the lane's only ground truth
+// 15:41 cross-verification — REMOVED 2026-09-16
 // ---------------------------------------------------------------------------
-
-/// Counter: daily cross-verify runs that could not start because no dependency
-/// provider was installed.
-pub const XVERIFY_UNPROVISIONED_COUNTER: &str = "tv_dhan_feed_xverify_unprovisioned_total";
-
-/// Everything the 15:31 comparator needs that this module cannot derive on its
-/// own. Registered once at boot via [`install_crossverify_deps`].
-///
-/// This is a registration seam rather than a field on
-/// [`DhanFeedStackParams`] deliberately: the params struct is built by
-/// `main.rs` with an exhaustive struct literal, so adding a required field
-/// there would break a file this module does not own. A provider that is never
-/// installed degrades loudly (see [`spawn_daily_crossverify`]) instead of
-/// silently skipping the verification.
-pub struct CrossverifyDeps {
-    /// QuestDB `/exec` endpoint the live side is read from.
-    pub questdb_exec_url: String,
-    /// Dhan intraday-candles endpoint the REST side is fetched from.
-    pub intraday_url: String,
-    /// Returns a currently-valid Dhan JWT, or `None` when the token manager
-    /// has none. A closure rather than a value because the token rotates every
-    /// ~23h and this scheduler outlives any single token.
-    pub jwt_provider: Box<dyn Fn() -> Option<String> + Send + Sync>,
-    /// Comparator knobs.
-    pub config: crate::dhan_live_crossverify::DhanLiveCrossverifyConfig,
-    /// QuestDB connection used to PERSIST the run's findings.
-    ///
-    /// Separate from `questdb_exec_url` above because that one is the HTTP
-    /// `/exec` READ endpoint and this is the ILP WRITE config — the same
-    /// server, two protocols. Added 2026-08-25 with the persistence wiring:
-    /// before it, this comparator produced its verdict, logged it, and threw
-    /// it away.
-    pub questdb: tickvault_common::config::QuestDbConfig,
-}
-
-static CROSSVERIFY_DEPS: std::sync::OnceLock<CrossverifyDeps> = std::sync::OnceLock::new();
-
-/// Installs the cross-verify dependencies. Idempotent: the first call wins and
-/// later calls return `false` rather than replacing a live provider.
-pub fn install_crossverify_deps(deps: CrossverifyDeps) -> bool {
-    CROSSVERIFY_DEPS.set(deps).is_ok()
-}
-
-/// Whether a provider has been installed.
-#[must_use]
-pub fn crossverify_deps_installed() -> bool {
-    CROSSVERIFY_DEPS.get().is_some()
-}
-
-/// Dhan's `instrument` string for a segment, or `None` when the segment alone
-/// cannot determine it.
-///
-/// Added 2026-08-25. `crossverify_targets` used to stamp `"INDEX"` on EVERY
-/// target, and that string goes verbatim into the Dhan REST intraday body. The
-/// live universe is ~119 indices plus ~750 NSE_EQ constituents, so roughly 86%
-/// of every run's fetches asked for a STOCK as though it were an INDEX. Those
-/// return no candles, land in the `rest_failures` bucket, and are never
-/// compared — while the run can still report `Clean` on the handful of real
-/// indices that happened to be labelled correctly.
-///
-/// That is a PARTIAL-denominator vacuous pass, and it is invisible to the
-/// module's `minutes_compared > 0` guard, which only catches a ZERO
-/// denominator. The comparator's own doc comment says it "can never verify a
-/// different universe than it captured" — true of the id set, false of the
-/// instrument type, and the type is what decides whether a fetch returns
-/// anything at all.
-///
-/// F&O returns `None` deliberately. `(security_id, segment)` is all the
-/// subscribe set carries, and `NSE_FNO` could be `FUTIDX`, `OPTIDX`, `FUTSTK`
-/// or `OPTSTK` — a guess would land back in the silent-failure bucket this
-/// exists to empty. An unverifiable target is counted and named, not fetched
-/// with a wrong label.
-#[must_use]
-pub fn dhan_intraday_instrument_for(segment: ExchangeSegment) -> Option<&'static str> {
-    match segment {
-        ExchangeSegment::IdxI => Some("INDEX"),
-        ExchangeSegment::NseEquity | ExchangeSegment::BseEquity => Some("EQUITY"),
-        // Ambiguous from the segment alone; see the doc above.
-        ExchangeSegment::NseFno | ExchangeSegment::BseFno => None,
-        // Out of the authorized scope entirely.
-        ExchangeSegment::NseCurrency | ExchangeSegment::BseCurrency | ExchangeSegment::McxComm => {
-            None
-        }
-    }
-}
-
-/// Builds the comparator's target list from the subscribed main-feed set, so
-/// the lane can never verify a different universe than it captured.
-///
-/// Returns the targets plus the count of subscribed instruments that CANNOT be
-/// targeted, because a wrong `instrument` label is worse than an absent one: it
-/// fetches nothing while looking like a fetch that failed.
-#[must_use]
-pub fn crossverify_targets_with_skipped(
-    main_feed: &[SubscribeInstrument],
-) -> (Vec<crate::dhan_live_crossverify::XverifyTarget>, usize) {
-    let mut targets = Vec::with_capacity(main_feed.len());
-    let mut skipped = 0_usize;
-    for i in main_feed {
-        let (Some(instrument), Ok(security_id)) = (
-            dhan_intraday_instrument_for(i.segment),
-            i64::try_from(i.security_id),
-        ) else {
-            // 2026-08-25: the id arm used to be `unwrap_or(0)`, which turned an
-            // out-of-range id into a target for instrument 0 — the comparator
-            // would then verify, and report on, an instrument that does not
-            // exist.
-            skipped = skipped.saturating_add(1);
-            continue;
-        };
-        targets.push(crate::dhan_live_crossverify::XverifyTarget {
-            security_id,
-            segment: i.segment.as_str().to_string(),
-            instrument: instrument.to_string(),
-        });
-    }
-    (targets, skipped)
-}
-
-/// Convenience wrapper for callers that only need the targets.
-#[must_use]
-pub fn crossverify_targets(
-    main_feed: &[SubscribeInstrument],
-) -> Vec<crate::dhan_live_crossverify::XverifyTarget> {
-    crossverify_targets_with_skipped(main_feed).0
-}
-
-/// Spawns the daily comparator (see [`XVERIFY_RUN_AT_SECS_OF_DAY_IST`]) for the
-/// subscribed universe.
-///
-/// Returns `None` — loudly — when no [`CrossverifyDeps`] were installed. That
-/// is a refusal, not a skip: a live lane with no verifier has no way to detect
-/// the packet loss its protocol cannot report, and saying so is the whole
-/// point of audit Rule 11.
-pub fn spawn_daily_crossverify(
-    main_feed: &[SubscribeInstrument],
-) -> Option<tokio::task::JoinHandle<()>> {
-    let (targets, skipped) = crossverify_targets_with_skipped(main_feed);
-    if skipped > 0 {
-        // Named, never silent. These instruments are captured by the lane and
-        // CANNOT be verified against the vendor tape, which is a coverage hole
-        // in the lane's only ground truth — the operator must be able to see
-        // its size rather than infer it from a `rest_failures` count that also
-        // carries genuine failures.
-        metrics::counter!("tv_dhan_xverify_targets_unverifiable_total").increment(skipped as u64);
-        warn!(
-            skipped,
-            targeted = targets.len(),
-            "cross-verification cannot target every subscribed instrument: an F&O \
-             contract's Dhan `instrument` string (FUTIDX / OPTIDX / FUTSTK / OPTSTK) \
-             is not derivable from its segment alone, and a wrong label fetches \
-             nothing while looking like a failed fetch. These instruments are \
-             CAPTURED but UNVERIFIED."
-        );
-    }
-    if !crossverify_deps_installed() {
-        metrics::counter!(XVERIFY_UNPROVISIONED_COUNTER).increment(1);
-        error!(
-            code = ErrorCode::WsGapConnectionState.code_str(),
-            targets = targets.len(),
-            "Dhan live feed is enabled but the 15:31 cross-verification has NO dependency \
-             provider installed, so it cannot run. The main feed has no snapshot-on-subscribe \
-             and no sequence number: without this comparator, packet loss is UNDETECTABLE. \
-             Call install_crossverify_deps() at boot before enabling the lane."
-        );
-        return None;
-    }
-    Some(tokio::spawn(async move {
-        // 2026-08-11 — this body used to be a single `info!` saying the
-        // verification was "scheduled". Nothing was scheduled. The lane's ONLY
-        // loss detector was a log line, and the log line said it was working:
-        // the precise false-OK shape audit Rule 11 exists to forbid, in the
-        // one place where being wrong is undetectable by any other means (the
-        // main feed carries no sequence number and no snapshot-on-subscribe).
-        info!(
-            targets = targets.len(),
-            run_at_ist = %run_at_ist_hhmm(),
-            "Dhan live-feed cross-verification armed — it will compare captured candles \
-             against Dhan's own REST record after the close"
-        );
-        loop {
-            let sleep_secs = secs_until_next_run_ist(now_ist_secs_of_day());
-            tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
-
-            // Same trading-day gate as the silence detector, for the same
-            // reason. On a weekday NSE holiday both sides of this comparison
-            // are legitimately empty, and the run reports "found no data on
-            // either side today" — a warning about the lane's ONLY loss
-            // detector, fired on a day it had nothing to detect. Left ungated
-            // it compounds the silence detector's false page into a pattern the
-            // operator learns to ignore.
-            if !silence_page_allowed_today() {
-                info!(
-                    "Dhan live-feed cross-verification skipped — not an NSE trading day. \
-                     No candles were expected, so there is nothing to verify."
-                );
-                continue;
-            }
-
-            let Some(deps) = CROSSVERIFY_DEPS.get() else {
-                // Unreachable in practice (the caller checked), but a `let
-                // else` beats an unwrap on a path that must never panic a
-                // long-lived task.
-                return;
-            };
-            let Some(jwt) = (deps.jwt_provider)() else {
-                counters().xverify_no_token.increment(1);
-                error!(
-                    code = ErrorCode::WsGapConnectionState.code_str(),
-                    "Dhan live-feed cross-verification could not run: no JWT available. The \
-                     day's captured candles are UNVERIFIED — packet loss for this session is \
-                     undetectable."
-                );
-                continue;
-            };
-
-            let ist = tickvault_common::trading_calendar::ist_offset();
-            let today = chrono::Utc::now().with_timezone(&ist).date_naive();
-            // IST-wall-clock-as-epoch, NOT the true UTC instant of IST
-            // midnight. `and_utc()`, deliberately, on a date that is already
-            // the IST date.
-            //
-            // FIXED 2026-08-11, and this was blind-since-birth. The previous
-            // line was `.and_local_timezone(ist)`, which yields the real UTC
-            // instant — 18:30Z the previous day. But BOTH sides of this
-            // comparison stamp IST wall-clock as though it were epoch: the
-            // live side because `ticks.ts` is `exchange_timestamp * 1e9` with
-            // no offset (Dhan's LTT is already IST epoch seconds — see
-            // data-integrity.md, "NEVER ADD +5:30 TO ts"), and the REST side
-            // because `intraday_utc_secs_to_ist_minute_nanos` adds the offset
-            // to a UTC epoch. Subtracting a true-UTC origin from an
-            // IST-wall-as-epoch value therefore produced `wall_secs + 19800`.
-            //
-            // The consequence was not a small drift. `is_in_session` accepts
-            // [33300, 55800); with the skew, a bucket left the window as soon
-            // as `wall_secs >= 36000` — 10:00 IST. Every minute from 10:00
-            // onward was dropped as `out_of_session` on BOTH sides before the
-            // join, so the comparison saw 45 of the day's 375 session minutes
-            // and, because `out_of_session` feeds no verdict and 45 is not
-            // vacuous, still reported Clean. The tail amnesty landed on
-            // 09:58-09:59 instead of 15:28-15:29, hiding the genuine tail too.
-            //
-            // This is the SAME defect class as the nanosecond-vs-microsecond
-            // bug that made the 2026-07 cross-verify blind since birth and
-            // helped retire the feed — re-created in a different coordinate
-            // system, in the one check that exists to catch disagreement.
-            let day_start_ist_nanos = today
-                .and_hms_opt(0, 0, 0)
-                .and_then(|dt| dt.and_utc().timestamp_nanos_opt())
-                .unwrap_or(0);
-            debug_assert_eq!(
-                day_start_ist_nanos % (24 * 3600 * 1_000_000_000_i64),
-                0,
-                "an IST-wall-as-epoch midnight must land exactly on a day boundary; a \
-                 non-zero remainder means a real-timezone origin crept back in"
-            );
-
-            let client = reqwest::Client::new();
-            match crate::dhan_live_crossverify::run_cross_verification(
-                &client,
-                &deps.questdb_exec_url,
-                &deps.intraday_url,
-                &jwt,
-                &targets,
-                today,
-                day_start_ist_nanos,
-                &deps.config,
-            )
-            .await
-            {
-                Ok(report) => {
-                    let c = &report.comparison;
-                    // Split BEFORE the log line, so the counter and the
-                    // `vacuous = ` field below can never disagree.
-                    if c.is_vacuous() {
-                        counters().xverify_vacuous.increment(1);
-                    } else {
-                        counters().xverify_measured.increment(1);
-                    }
-                    // THE VERDICT AS FIELDS, not as a debug dump.
-                    //
-                    // 2026-08-20, measured on the box: this emitted `?report`,
-                    // which renders every finding. Today's run produced a
-                    // 1,048,374-character line — EXACTLY CloudWatch's 1 MiB
-                    // event ceiling, so it was truncated. `RunReport`'s Debug
-                    // puts `findings` before the totals, which means the
-                    // truncation ate precisely the summary: `minutes_compared`
-                    // — the non-vacuity denominator this whole job exists to
-                    // produce — was unreadable, while thousands of individual
-                    // findings were not.
-                    //
-                    // The single most important measurement in the system was
-                    // the one number the log could not carry. Named fields are
-                    // bounded by construction and queryable; the per-cell
-                    // detail belongs in the audit table, which is what the
-                    // `persist_xverify_report` call below writes.
-                    //
-                    // ⚠ CORRECTED 2026-08-25. This comment previously read
-                    // "the findings are already persisted to the audit table"
-                    // — and that was FALSE. `append_cell`, `append_daily` and
-                    // even `ensure_dhan_live_crossverify_tables` had ZERO
-                    // production callers: the two tables were never created,
-                    // nothing was ever written, and the only record of the
-                    // feed's one ground-truth check was this log line. A
-                    // comment asserting persistence is worse than no comment,
-                    // because the next reader stops looking.
-                    info!(
-                        targets = targets.len(),
-                        outcome = ?c.outcome,
-                        instruments = c.instruments,
-                        minutes_compared = c.minutes_compared,
-                        cells_diverged = c.cells_diverged,
-                        missing_live = c.missing_live,
-                        // The split that makes `missing_live` actionable.
-                        // At 31.2% of fetched minutes on 2026-08-25 the
-                        // single figure could mean a catastrophe or a
-                        // non-event; these two say which. See
-                        // `DayComparison::missing_live_traded` — and note
-                        // the pair is uninformative for IDX_I, which has no
-                        // volume at all.
-                        missing_live_traded = c.missing_live_traded,
-                        missing_live_zero_volume = c.missing_live_zero_volume,
-                        missing_rest = c.missing_rest,
-                        tail_unsealed = c.tail_unsealed,
-                        out_of_session = c.out_of_session,
-                        noise_p50_paise = c.noise_p50_paise,
-                        noise_p95_paise = c.noise_p95_paise,
-                        noise_max_paise = c.noise_max_paise,
-                        // The match RATE, computed rather than left as an
-                        // exercise. Both inputs were already on this line,
-                        // so anyone could multiply by four and subtract —
-                        // and nobody did, for two sessions, while the run
-                        // sat at 0.09% of its intended coverage. A number
-                        // that needs arithmetic before it means anything is
-                        // a number that gets skipped.
-                        price_fields_compared = c.minutes_compared.saturating_mul(4),
-                        price_fields_agreed = c
-                            .minutes_compared
-                            .saturating_mul(4)
-                            .saturating_sub(c.cells_diverged),
-                        // Volume — reported for the first time today. A
-                        // capture percentage, never a pass/fail: see the
-                        // volume block on `DayComparison`.
-                        volume_cells = c.volume_cells,
-                        volume_exact = c.volume_exact,
-                        volume_capture_p50_pct = c.volume_capture_p50_pct,
-                        volume_capture_p05_pct = c.volume_capture_p05_pct,
-                        volume_capture_min_pct = c.volume_capture_min_pct,
-                        findings = c.findings.len(),
-                        rest_failures = report.rest_failures,
-                        // Added 2026-08-26. `rest_failures` alone reported
-                        // 814-of-864 and 815-of-865 on consecutive sessions
-                        // and gave nobody a way to act on it: the reason was
-                        // discarded at the fetch site. This field names the
-                        // dominant cause on the same line as the verdict.
-                        rest_failure_reasons = %report.rest_failure_breakdown.summary(),
-                        malformed_rows = report.malformed_rows,
-                        budget_elapsed = report.budget_elapsed,
-                        // Reported beside `degraded`, never folded into it: a
-                        // single REST failure also sets `degraded`, so the two
-                        // together were indistinguishable — which is why the
-                        // 2026-08-26 short live read left no trace in this
-                        // line even though the run's own counts summed to the
-                        // cap exactly.
-                        live_truncated = report.live_truncated,
-                        degraded = report.degraded,
-                        vacuous = c.is_vacuous(),
-                        "Dhan live-feed cross-verification finished — this is the honest \
-                         measure of whether the revived feed agrees with Dhan's own record"
-                    );
-                    // PERSIST, before any early-return branch below. A
-                    // vacuous or degraded verdict is exactly the one worth
-                    // keeping: "we could not measure today" is a fact about
-                    // the feed, and a table that only records the good days
-                    // cannot answer "how often were we blind last month".
-                    persist_xverify_report(&deps.questdb, &report, deps.config.tolerance_paise);
-                    // MASS DIVERGENCE -- the verdict that could report a
-                    // broken feed and page nobody.
-                    //
-                    // Until now only `vacuous` ("we measured nothing") and
-                    // `failed` ("we could not run") carried a `source` field,
-                    // so only those two were reachable by an alarm. A run that
-                    // DID measure and found the two records disagreeing
-                    // wholesale logged at `info!` alongside forty other fields
-                    // and reached no operator surface at all. The one check
-                    // that exists to say whether the revived feed is
-                    // trustworthy could answer "no" in a way nothing was
-                    // listening for.
-                    //
-                    // # Why the bar is HALF, and not one cell
-                    //
-                    // A non-zero `cells_diverged` is EXPECTED and is not a
-                    // defect: `cross-verify-1m-error-codes.md` §1 records that
-                    // a sampled live stream and the vendor's full tape
-                    // legitimately differ, and says to "track the trend, not
-                    // the absolute count". Paging on any divergence would page
-                    // every day, and this file already carries the lesson that
-                    // a pager which cries on an ordinary day teaches the
-                    // operator to ignore it.
-                    //
-                    // No baseline exists for what a NORMAL rate looks like, so
-                    // inventing a 1% or 5% threshold would be picking a number
-                    // out of the air and calling it a measurement. What CAN be
-                    // asserted without a baseline is this: if MORE THAN HALF
-                    // the compared price fields disagree beyond the configured
-                    // tolerance, the two records are not describing the same
-                    // market. No sampling-noise argument survives that, at any
-                    // baseline. So the bar sits where it is defensible today
-                    // rather than where it might be optimal after a month of
-                    // data -- and the counter beside it is what will supply
-                    // that data.
-                    //
-                    // Gated on a NON-VACUOUS run: a vacuous one has a zero
-                    // denominator, and its own arm below is already a page.
-                    let price_fields = c.minutes_compared.saturating_mul(4);
-                    if !c.is_vacuous()
-                        && price_fields > 0
-                        && c.cells_diverged.saturating_mul(2) > price_fields
-                    {
-                        counters().xverify_diverged.increment(1);
-                        error!(
-                            code = ErrorCode::WsGapConnectionState.code_str(),
-                            source = "xverify_diverged",
-                            instruments = c.instruments,
-                            minutes_compared = c.minutes_compared,
-                            price_fields_compared = price_fields,
-                            cells_diverged = c.cells_diverged,
-                            noise_p95_paise = c.noise_p95_paise,
-                            noise_max_paise = c.noise_max_paise,
-                            "Dhan live-feed cross-verification found MORE THAN HALF of the \
-                             compared price fields disagreeing with Dhan's own record. That is \
-                             not sampling noise at any baseline -- the captured candles and the \
-                             vendor tape are not describing the same market. Treat today's \
-                             candles as untrustworthy until this is explained"
-                        );
-                    }
-
-                    if c.is_vacuous() {
-                        // A run that compared nothing proves nothing, and the
-                        // outcome field alone does not say so loudly enough.
-                        //
-                        // `source` is what makes this line REACHABLE by an
-                        // alarm. `WS-GAP-03` has 25 emit sites in this file
-                        // alone — ordinary dial failures, reconnects and pool
-                        // supervisor events all carry it — so a filter keyed
-                        // on the code alone would page on connection churn,
-                        // which is the noise trap
-                        // `dhan-rest-only-noise-lock-2026-07-14.md` §2.3d-i
-                        // records (a bare-code filter was proposed there,
-                        // approved, and then found wrong for exactly this
-                        // reason). The shape that works is the three-condition
-                        // one that section settled on:
-                        // `{ $.code = "WS-GAP-03" && $.level = "ERROR" &&
-                        //    $.source = "xverify_vacuous" }` — and it cannot
-                        // be written at all until the field exists here.
-                        //
-                        // Adding the field is NOT adding a page: nothing
-                        // filters on it yet. The alarm itself still needs a
-                        // dated operator quote per that file's §3.
-                        //
-                        // ⚠ CORRECTED 2026-08-28. The paragraph that stood
-                        // here said the metric route was "blocked by ONE
-                        // BYTE", because the EMF selector lived in a user-data
-                        // template rendering 15,841 of a 15,872-byte budget.
-                        // That was true when measured on 2026-08-25 and
-                        // stopped being true the SAME DAY: the selector was
-                        // moved out of the template into
-                        // `deploy/aws/cloudwatch-agent.json`, copied in after
-                        // the repo clone. Re-measured 2026-08-28 by running
-                        // the guard rather than quoting anyone — the template
-                        // renders 13,823 bytes, so **2,049 are free**, and
-                        // `tv_dhan_feed` appears ZERO times in it.
-                        //
-                        // So the byte blocker is GONE. What remains is a COST
-                        // decision, not a technical one: an EMF name is
-                        // ~$0.30/mo against a budget whose automatic action
-                        // stops the trading box, and that is the operator's
-                        // call. Recorded this way because a stale measurement
-                        // quoted as a live blocker is exactly how this
-                        // repository has manufactured false findings before —
-                        // and a byte count carries a date like any other
-                        // claim.
-                        error!(
-                            code = ErrorCode::WsGapConnectionState.code_str(),
-                            source = "xverify_vacuous",
-                            targets = targets.len(),
-                            missing_live = c.missing_live,
-                            missing_rest = c.missing_rest,
-                            "Dhan live-feed cross-verification compared ZERO minutes — the day's \
-                             captured candles are UNVERIFIED. This is not a pass with no findings; \
-                             it is no measurement at all"
-                        );
-                    }
-                }
-                Err(err) => {
-                    counters().xverify_failed.increment(1);
-                    error!(
-                        code = ErrorCode::WsGapConnectionState.code_str(),
-                        source = "xverify_failed",
-                        %err,
-                        "Dhan live-feed cross-verification FAILED to run — the day's captured \
-                         candles are UNVERIFIED, never assume they are clean"
-                    );
-                }
-            }
-        }
-    }))
-}
-
-/// IST seconds-of-day at which the comparator runs: 15:41, one minute after
-/// the 15:40 close, so the final minute's candle has sealed.
-///
-/// **CORRECTED 2026-08-25** from 15:31, in lockstep with
-/// `dhan_live_crossverify::SESSION_CLOSE_SECS_OF_DAY_IST`. Both had missed the
-/// 2026-08-07 NSE CAS migration that moved the session end 15:30 -> 15:40.
-///
-/// The two MUST move together, and the const assert below is what enforces it.
-/// Moving the window without the fire time would be strictly worse than the
-/// drift it fixes: the comparator would run at 15:31 against a window ending at
-/// 15:40, so ten minutes that had not happened yet would be scored as missing on
-/// BOTH sides — turning a silent blind spot into a flood of false loss findings
-/// in the one check that exists to detect real loss.
-/// Writes one cross-verification run to its two audit tables.
-///
-/// # Why this exists, and why it is best-effort
-///
-/// The 15:41 comparison is the ONLY ground truth the revived Dhan feed has:
-/// the India feed carries no sequence number and offers no
-/// snapshot-on-subscribe, so packet loss is undetectable at the protocol
-/// level. Until 2026-08-25 the result of that comparison was written to a log
-/// line and discarded — `append_cell`, `append_daily` and
-/// `ensure_dhan_live_crossverify_tables` all had zero production callers, so
-/// there was no history, no trend, and no way to ask how often the feed
-/// disagreed with Dhan's own record last month.
-///
-/// Best-effort by construction: a persistence failure logs and returns. This
-/// runs once a day on a cold-path task, long after the market has closed, and
-/// failing the task would lose the log line too — which is strictly worse than
-/// losing the table row, since the log line is what the operator sees today.
-///
-/// Complexity is O(findings) with one ILP buffer; the row count is bounded by
-/// the comparison itself (one row per divergent/missing cell), and the
-/// findings vector already exists in memory — this adds no allocation beyond
-/// the ILP buffer.
-// TEST-EXEMPT: thin ILP-write shell over the fully-tested writer (append_cell / append_daily / flush are unit-tested in tickvault_storage) and a pure row mapping asserted by `the_daily_row_carries_every_comparison_total` below.
-fn persist_xverify_report(
-    questdb: &tickvault_common::config::QuestDbConfig,
-    report: &crate::dhan_live_crossverify::RunReport,
-    tolerance_paise: i64,
-) {
-    use tickvault_storage::dhan_live_crossverify_persistence::DhanLiveXverifyAuditWriter;
-
-    let c = &report.comparison;
-    let mut writer = DhanLiveXverifyAuditWriter::new(questdb);
-
-    // ---- flush in batches -------------------------------------------
-    //
-    // MEASURED, prod 2026-08-26: one run produced 764,003 rows and a
-    // 207,965,278-byte buffer against a 104,857,600-byte ceiling. The flush
-    // failed and **the entire day's comparison was discarded** — in the one
-    // check that exists to prove nothing was lost.
-    //
-    // The scope filter is the root-cause fix and cuts the row count by ~99%.
-    // This is the floor under it: a future day that is legitimately large
-    // loses at most one batch instead of everything. Two independent
-    // mechanisms, because "the row count can never grow again" is exactly the
-    // assumption that produced the ceiling breach.
-    //
-    // 20,000 rows is deliberate, not round: the breached buffer averaged
-    // ~272 bytes/row, so a batch lands near 5 MB — comfortably inside the
-    // 100 MB ceiling with two orders of magnitude of headroom for a row
-    // shape that grows.
-    const PERSIST_BATCH_ROWS: usize = 20_000;
-    let mut batch_errors = 0_usize;
-    //
-    // MERGED 2026-08-27: two sessions fixed this independently, one bounding
-    // ROWS and one bounding BYTES, and the bounds are not interchangeable.
-    // Rows give a predictable batch size; BYTES is the quantity that actually
-    // breached the ceiling, and it is the one that survives a row shape
-    // getting wider — which the batch-size note directly above names as the
-    // thing it is buying headroom against. Keeping only the row bound would
-    // have re-created that assumption one layer down.
-    let flush_if_full = |w: &mut DhanLiveXverifyAuditWriter, errs: &mut usize| {
-        let failed = if w.pending() >= PERSIST_BATCH_ROWS {
-            w.flush().is_err()
-        } else {
-            // Byte-bounded: a no-op below the threshold, one `len()` compare.
-            w.flush_if_large().is_err()
-        };
-        if failed {
-            // One batch lost, named, and the run continues. Before this the
-            // same failure took the whole day with it.
-            *errs += 1;
-        }
-    };
-
-    let mut cell_errors = 0_usize;
-    for finding in &c.findings {
-        if writer.append_cell(finding).is_err() {
-            cell_errors += 1;
-        }
-        flush_if_full(&mut writer, &mut batch_errors);
-    }
-
-    // The vendor's own tape, stored BEFORE any judgement is applied to it.
-    // Until 2026-08-26 these rows were compared in memory and dropped, so the
-    // only surviving trace of what the exchange actually said was the subset
-    // that happened to DISAGREE.
-    let mut tape_errors = 0_usize;
-    for row in &report.rest_tape {
-        if writer.append_rest_tape(row).is_err() {
-            tape_errors += 1;
-        }
-        flush_if_full(&mut writer, &mut batch_errors);
-    }
-
-    // The daily row now meets a nearly-empty buffer. That matters more than it
-    // looks: it is appended AFTER the cells, so under the old single-flush
-    // shape an oversized cell buffer destroyed the one row recording that a
-    // comparison happened at all — the detail and the evidence of its loss
-    // went in the same refusal.
-    let daily = xverify_daily_row(c, tolerance_paise);
-    let daily_err = writer.append_daily(&daily).err();
-
-    match writer.flush() {
-        Ok(()) => {
-            metrics::counter!(XVERIFY_PERSIST_ROWS_COUNTER)
-                .increment(c.findings.len() as u64 + report.rest_tape.len() as u64 + 1);
-            if cell_errors > 0 || daily_err.is_some() || tape_errors > 0 || batch_errors > 0 {
-                // Partial writes are reported, never rounded up to success:
-                // an audit table that silently drops rows is worse than one
-                // that is honestly incomplete.
-                //
-                // `chunk_flush_errors` joined this condition with the
-                // 2026-08-26 chunking, and it is the reason chunking is safe
-                // to do at all. Draining in pieces converts "no rows today"
-                // into "most rows today", which is an IMPROVEMENT only while
-                // the shortfall is visible — a silently-short audit table
-                // reads as a complete one. Each failed chunk discards its own
-                // buffer, so the rows lost are bounded by the flush threshold
-                // rather than by the run.
-                error!(
-                    code = ErrorCode::WsGapConnectionState.code_str(),
-                    source = "xverify_persist_partial",
-                    cell_errors,
-                    tape_errors,
-                    batch_errors,
-                    daily_failed = daily_err.is_some(),
-                    findings = c.findings.len(),
-                    tape_rows = report.rest_tape.len(),
-                    "Dhan live-feed cross-verification persisted with gaps — some findings \
-                     could not be appended or a chunk flush was refused, so the audit \
-                     tables are incomplete for today"
-                );
-            }
-        }
-        Err(err) => {
-            let discarded = writer.discard_pending();
-            metrics::counter!(XVERIFY_PERSIST_ERRORS_COUNTER).increment(1);
-            error!(
-                code = ErrorCode::WsGapConnectionState.code_str(),
-                // Deliberately the SAME label the run-failure arm uses, not a
-                // new one. The operator consequence is identical — there is
-                // no verdict on record for today — and `xverify_failed` is
-                // one of only two xverify labels an alarm matches on. A
-                // distinct label would be better triage and would page
-                // nobody, which is the trade this repository has got wrong
-                // before. The message below is what separates the causes.
-                source = "xverify_failed",
-                ?err,
-                discarded,
-                "Dhan live-feed cross-verification could NOT be persisted — today's \
-                 comparison exists only in this log stream. The feed's one ground-truth \
-                 record has no row for today; check QuestDB before the next session."
-            );
-        }
-    }
-}
-
-/// Maps a finished comparison onto its daily audit row. Pure.
-///
-/// Separated from the write so the mapping is testable without QuestDB — the
-/// failure this guards against is a column silently carrying the wrong total,
-/// which no integration test would notice and no log line would show.
-#[must_use]
-fn xverify_daily_row(
-    c: &crate::dhan_live_crossverify::DayComparison,
-    tolerance_paise: i64,
-) -> tickvault_storage::dhan_live_crossverify_persistence::DhanLiveXverifyDailyRow {
-    use tickvault_storage::dhan_live_crossverify_persistence::DhanLiveXverifyDailyRow;
-    // Every finding carries the run stamp and the trading day the comparison
-    // was FOR, so the daily row is stamped from the same source rather than
-    // from `now()` — a rerun must UPSERT onto the same row, not append a
-    // second one an hour later.
-    let (run_ts, day_ts) = c
-        .findings
-        .first()
-        .map_or((0, 0), |f| (f.run_ts_ist_nanos, f.trading_date_ist_nanos));
-    DhanLiveXverifyDailyRow {
-        run_ts_ist_nanos: run_ts,
-        trading_date_ist_nanos: day_ts,
-        instruments: c.instruments,
-        minutes_compared: c.minutes_compared,
-        cells_diverged: c.cells_diverged,
-        missing_live: c.missing_live,
-        missing_live_traded: c.missing_live_traded,
-        missing_live_zero_volume: c.missing_live_zero_volume,
-        missing_rest: c.missing_rest,
-        tail_unsealed: c.tail_unsealed,
-        out_of_session: c.out_of_session,
-        noise_p50_paise: c.noise_p50_paise,
-        noise_p95_paise: c.noise_p95_paise,
-        noise_max_paise: c.noise_max_paise,
-        tolerance_paise,
-        outcome: c.outcome,
-    }
-}
-
-/// Rows successfully written to the cross-verification audit tables.
-pub const XVERIFY_PERSIST_ROWS_COUNTER: &str = "tv_dhan_feed_xverify_rows_total";
-/// Runs whose findings could not be persisted at all.
-pub const XVERIFY_PERSIST_ERRORS_COUNTER: &str = "tv_dhan_feed_xverify_persist_errors_total";
-
-pub const XVERIFY_RUN_AT_SECS_OF_DAY_IST: u64 =
-    crate::dhan_live_crossverify::RUN_SECS_OF_DAY_IST as u64;
-
-const _: () = assert!(
-    XVERIFY_RUN_AT_SECS_OF_DAY_IST as i64
-        > crate::dhan_live_crossverify::SESSION_CLOSE_SECS_OF_DAY_IST,
-    "the comparator must fire AFTER the last minute of the window it compares"
-);
-
-/// The comparator's fire time as a `HH:MM` IST string, DERIVED.
-///
-/// Added 2026-08-25 because the arming log line carried a hardcoded `"15:31"`
-/// that survived the CAS correction above by three constants. A literal in an
-/// operator-facing field is the same class of defect as a literal in a
-/// comparison window — it just fails quietly, by telling the operator a time
-/// the code no longer uses.
-#[must_use]
-pub fn run_at_ist_hhmm() -> String {
-    let h = XVERIFY_RUN_AT_SECS_OF_DAY_IST / 3_600;
-    let m = (XVERIFY_RUN_AT_SECS_OF_DAY_IST % 3_600) / 60;
-    format!("{h:02}:{m:02}")
-}
-
-/// Seconds in a day.
-const SECS_PER_DAY: u64 = 24 * 3_600;
-
-/// Seconds to sleep from `now_secs_of_day` until the next run time (see
-/// [`XVERIFY_RUN_AT_SECS_OF_DAY_IST`] — 15:41 IST today).
-///
-/// Pure, so the schedule is testable without waiting a day. Returns a full day
-/// when called exactly at the run time, which is the right way round: firing
-/// twice in one session would double-count the verdict, and firing a day late
-/// merely delays it.
-#[must_use]
-pub const fn secs_until_next_run_ist(now_secs_of_day: u64) -> u64 {
-    if now_secs_of_day < XVERIFY_RUN_AT_SECS_OF_DAY_IST {
-        XVERIFY_RUN_AT_SECS_OF_DAY_IST - now_secs_of_day
-    } else {
-        SECS_PER_DAY - now_secs_of_day + XVERIFY_RUN_AT_SECS_OF_DAY_IST
-    }
-}
+//
+// The daily live-vs-REST comparator lived here. It was the lane's ONLY ground
+// truth: this feed carries no sequence number and no snapshot-on-subscribe, so
+// nothing else in the process can answer "are the numbers right" — only "did
+// the machinery run". It is gone by operator directive, together with the
+// per-minute REST legs it compared against.
+//
+// The three audit tables it wrote (`dhan_rest_1m_tape` and the two cross-verify
+// audit tables) and every row in them are RETAINED and stay in the operator
+// console's SEBI protect-list. Only the writer is gone.
+//
+// The boot REFUSAL FLOOR that gated every socket on this comparator being
+// armed is removed with it, and nothing replaces it — see the dated note at
+// the floor site above, and `no-rest-except-live-feed-2026-06-27.md`
+// §12.10.3/§12.10.4.
+//
+// The three time helpers that used to sit at the end of this section —
+// `is_within_market_hours_ist`, `now_ist_secs_of_day` and
+// `ist_secs_of_day_from_millis` — are NOT part of the comparator and survive
+// immediately below. They have 51 call sites between them, one of them on a
+// live drain path.
 
 /// IST seconds-of-day at which continuous trading actually begins (09:15:00).
 ///
@@ -16475,9 +15708,15 @@ mod tests {
         let refusal = production
             .find("rest_fold_writes_dhan_candles {")
             .expect("the exclusivity floor must exist in the bring-up");
-        let verification = production
-            .find("spawn_daily_crossverify(&params.main_feed_instruments)")
-            .expect("the verification floor must exist");
+        // ⚠ NARROWED 2026-09-16: this test also pinned `refusal < verification`.
+        // The verification floor is GONE — `spawn_daily_crossverify` went with
+        // the 15:41 comparator under the operator's SOCKETS-ONLY directive
+        // (`no-rest-except-live-feed-2026-06-27.md` §12.10.3, which decides the
+        // floor is REMOVED rather than replaced, and §12.10.4, which records
+        // that NOTHING now compares captured data against an external record).
+        // The half kept below is the one that still has a subject: the
+        // exclusivity check must precede ANY socket dial. Deleting the whole
+        // test would have dropped that surviving invariant with the dead one.
         // Anchor on the CALL SITE, not the socket-opening statement.
         //
         // This used to search for `run_connection(socket`, which lives inside
@@ -16498,11 +15737,6 @@ mod tests {
             .find("MAIN-FEED-DIAL-SITE")
             .expect("the dial call site must exist inside the bring-up");
 
-        assert!(
-            refusal < verification,
-            "the exclusivity check must come before the comparator is armed — arming a \
-             comparator that would then read its own input is worse than not arming it"
-        );
         assert!(
             refusal < dial,
             "the exclusivity check must come before ANY socket is dialed"
@@ -17157,398 +16391,40 @@ mod tests {
         );
     }
 
-    /// The cross-verification counter must be able to tell "we checked" from
-    /// "we ran and proved nothing".
-    ///
-    /// This comparison is the revived Dhan feed's ONLY ground truth, and a
-    /// `compared == 0` day is the exact false-OK this repository has retired
-    /// twice. The comparator detects it properly -- `Blind` is a first-class
-    /// outcome, `is_pass()` is false for it, and a vacuous run fires a coded
-    /// `error!`. What was missing was DELIVERY: every surface flattened the
-    /// distinction.
-    ///
-    ///   * the counter counted a vacuous run as `ran`, under a doc comment
-    ///     that read "anything other than `ran` means the candles were never
-    ///     checked" -- a promise the label could not keep;
-    ///   * `WS-GAP-03`, the code the vacuous `error!` carries, is not one of
-    ///     the 18 alarmed error codes, so the line pages nobody;
-    ///   * the two audit tables it writes have no console query, no QuestDB
-    ///     view, no dashboard widget and no runbook mention -- their only
-    ///     other reader is `partition_manager`, which DELETES their
-    ///     partitions on retention.
-    ///
-    /// The label split is the part that costs nothing: no new metric name, no
-    /// new alarm, no operator quote. The remaining surfaces are recorded above
-    /// rather than quietly fixed, because an alarm needs a dated operator
-    /// quote per `dhan-rest-only-noise-lock-2026-07-14.md` §3.
-    /// The daily audit row must carry EVERY total the comparison produced.
-    ///
-    /// A mapping that drops or transposes a column is the one failure mode
-    /// this table cannot survive and no integration test would catch: the row
-    /// lands, the count looks right, and the trend it exists to show is
-    /// silently wrong. Distinct values per field so a transposition cannot
-    /// pass by coincidence.
-    #[test]
-    fn the_daily_row_carries_every_comparison_total() {
-        use tickvault_storage::dhan_live_crossverify_persistence::{
-            DhanLiveXverifyCellFinding, DhanLiveXverifyCellKind, DhanLiveXverifyOutcome,
-        };
-
-        let finding = DhanLiveXverifyCellFinding {
-            run_ts_ist_nanos: 1_724_000_000_000_000_000,
-            trading_date_ist_nanos: 1_723_900_000_000_000_000,
-            security_id: 13,
-            segment: "IDX_I".to_owned(),
-            minute_ts_ist_nanos: 1_723_950_000_000_000_000,
-            kind: DhanLiveXverifyCellKind::Diverged,
-            field: "close",
-            live_value: 100.5,
-            rest_value: 100.25,
-            live_volume: 7,
-            rest_volume: 9,
-            diff_paise: 25,
-        };
-        let c = crate::dhan_live_crossverify::DayComparison {
-            outcome: DhanLiveXverifyOutcome::Diverged,
-            findings: vec![finding.clone()],
-            instruments: 11,
-            minutes_compared: 22,
-            cells_diverged: 33,
-            missing_live: 44,
-            missing_live_traded: 40,
-            missing_live_zero_volume: 4,
-            missing_rest: 55,
-            tail_unsealed: 66,
-            out_of_session: 77,
-            noise_p50_paise: 88,
-            noise_p95_paise: 99,
-            noise_max_paise: 111,
-            volume_cells: 122,
-            volume_exact: 133,
-            volume_capture_p50_pct: 94,
-            volume_capture_p05_pct: 61,
-            volume_capture_min_pct: 12,
-        };
-
-        let row = xverify_daily_row(&c, 5);
-        assert_eq!(row.instruments, 11);
-        assert_eq!(row.minutes_compared, 22);
-        assert_eq!(row.cells_diverged, 33);
-        assert_eq!(row.missing_live, 44);
-        assert_eq!(row.missing_rest, 55);
-        assert_eq!(row.tail_unsealed, 66);
-        assert_eq!(row.out_of_session, 77);
-        assert_eq!(row.noise_p50_paise, 88);
-        assert_eq!(row.noise_p95_paise, 99);
-        assert_eq!(row.noise_max_paise, 111);
-        assert_eq!(row.tolerance_paise, 5);
-        assert_eq!(row.outcome, DhanLiveXverifyOutcome::Diverged);
-
-        // The stamps come from the findings, NOT from `now()`, so a rerun
-        // upserts onto the same row instead of appending a second verdict for
-        // the same day an hour later.
-        assert_eq!(row.run_ts_ist_nanos, finding.run_ts_ist_nanos);
-        assert_eq!(row.trading_date_ist_nanos, finding.trading_date_ist_nanos);
-
-        // A vacuous run has no findings and therefore no stamp to borrow.
-        // It must still produce a row — "we could not measure today" is a
-        // fact worth keeping — and it must not fabricate a timestamp.
-        let blind = crate::dhan_live_crossverify::DayComparison {
-            outcome: DhanLiveXverifyOutcome::Blind,
-            findings: Vec::new(),
-            minutes_compared: 0,
-            ..c
-        };
-        let blind_row = xverify_daily_row(&blind, 0);
-        assert_eq!(blind_row.outcome, DhanLiveXverifyOutcome::Blind);
-        assert_eq!(blind_row.minutes_compared, 0);
-    }
-
-    /// The comment that said the findings "are already persisted" was false
-    /// for the entire life of the feature. This pins that the wiring which
-    /// makes it true is actually present — in all three places it has to be,
-    /// because any one of them missing puts the system straight back to
-    /// logging a verdict into the void.
-    #[test]
-    fn the_cross_verification_findings_are_actually_persisted() {
-        let src = include_str!("dhan_feed_stack.rs");
-        assert!(
-            src.contains("persist_xverify_report(&deps.questdb, &report"),
-            "the cross-verification run must call the persister; without this call the \
-             feed's only ground-truth check is a log line again"
-        );
-        assert!(
-            !src.contains("findings are\n                    // already persisted"),
-            "the retracted false comment must not return"
-        );
-
-        // The DDL must run at boot, or ILP auto-creates both tables WITHOUT
-        // their DEDUP keys and a rerun appends duplicate verdicts instead of
-        // replacing them.
-        let boot = include_str!("main.rs");
-        assert!(
-            boot.contains("ensure_dhan_live_crossverify_tables"),
-            "boot must create the cross-verification audit tables; ILP would otherwise \
-             auto-create them without the DEDUP keys that make a rerun idempotent"
-        );
-
-        // And the write-side config must reach the task.
-        assert!(
-            src.contains("pub questdb: tickvault_common::config::QuestDbConfig"),
-            "CrossverifyDeps must carry the ILP write config"
-        );
-    }
-
-    /// The 2026-08-26 loss, pinned at the call site.
-    ///
-    /// That session's 764,003 findings built a 207,965,278-byte ILP buffer
-    /// against the server's 104,857,600 cap; the single flush was refused and
-    /// the poisoned-buffer defence discarded every row, so the feed's only
-    /// ground truth has no record for the day.
-    ///
-    /// Two halves, and BOTH are load-bearing. The chunked flush stops the
-    /// buffer growing without bound — but it also converts "no rows today"
-    /// into "most rows today", which is an improvement only while the
-    /// shortfall is visible. A caller that chunked and then ignored the
-    /// failures would ship a silently-short audit table, which reads as a
-    /// complete one and is strictly worse than the honest total loss it
-    /// replaced.
-    #[test]
-    fn the_xverify_persist_drains_in_chunks_and_reports_what_it_lost() {
-        let src = include_str!("dhan_feed_stack.rs");
-
-        let body_start = src
-            .find("fn persist_xverify_report(")
-            .expect("the persister must exist");
-        // Bound the slice to the FUNCTION, not to end-of-file. This test's own
-        // string literals below contain every marker it looks for, so an
-        // unbounded slice would match itself and pass while production code had
-        // lost the call entirely — a guard that reads its own source is the
-        // purest form of the false-OK this file keeps finding.
-        let body_end = body_start
-            + 1
-            + src[body_start + 1..]
-                .find("\n}\n")
-                .expect("the persister must end at column 0");
-        let body = &src[body_start..body_end];
-        assert!(
-            !body.contains("fn the_xverify_persist_drains"),
-            "the scanned slice has swallowed this test — it would then match its \
-             own assertions and pass vacuously"
-        );
-
-        assert!(
-            body.contains("flush_if_full(&mut writer, &mut batch_errors)"),
-            "the append loop must drain in batches. Appending every finding and \
-             flushing once is what built a 207,965,278-byte buffer on \
-             2026-08-26 and lost all 764,003 rows to a refused flush"
-        );
-        // BOTH bounds, not either. Rows give a predictable batch size; BYTES
-        // is the quantity that actually breached, and the only one that
-        // survives a row shape getting wider.
-        assert!(
-            body.contains("w.pending() >= PERSIST_BATCH_ROWS"),
-            "the row bound must survive"
-        );
-        assert!(
-            body.contains("w.flush_if_large()"),
-            "the BYTE bound must survive: a row bound alone re-creates the \
-             'the rows can never get wider' assumption one layer down, which \
-             is what the batch-size note itself warns about"
-        );
-
-        let counted = body
-            .find("*errs += 1")
-            .expect("a refused batch must be counted, not swallowed");
-        let reported = body
-            .find("batch_errors > 0")
-            .expect("the count must reach the degraded-run condition");
-        let logged = body
-            .find("batch_errors,")
-            .expect("the count must be a field on the partial-write error line");
-        assert!(
-            counted < reported && reported < logged,
-            "the batch-failure count must be incremented, then gate the \
-             partial-write verdict, then be logged — a count that never \
-             reaches the verdict makes a short audit table look complete"
-        );
-    }
-
-    #[test]
-    fn xverify_counter_separates_a_measured_run_from_a_vacuous_one() {
-        let src = include_str!("dhan_feed_stack.rs");
-
-        assert!(
-            src.contains("\"outcome\" => \"vacuous\""),
-            "the vacuous label must exist -- without it a run that compared zero \
-             minutes is indistinguishable from one that checked the whole day"
-        );
-        assert!(
-            src.contains("\"outcome\" => \"measured\""),
-            "the success label must say `measured`, not `ran`: a vacuous run also ran"
-        );
-        assert!(
-            !src.contains("\"outcome\" => \"ran\""),
-            "the ambiguous `ran` label must not come back"
-        );
-
-        // The split must be DRIVEN by is_vacuous(), not by anything a later
-        // edit could let drift from the logged `vacuous =` field.
-        let at = src
-            .find("counters().xverify_vacuous.increment(1)")
-            .expect("the vacuous arm must exist");
-        let window = &src[at.saturating_sub(200)..at];
-        assert!(
-            window.contains("c.is_vacuous()"),
-            "the vacuous counter must be gated on is_vacuous(), so the counter and \
-             the log field cannot disagree"
-        );
-    }
-
-    /// The two cross-verify `error!` lines carry a `source` DISCRIMINATOR.
-    ///
-    /// Without it these lines are unreachable by any alarm and unfindable by
-    /// any triage query. `WS-GAP-03` is emitted from 25 sites in this file —
-    /// dial failures, reconnects, pool-supervisor events — so the only filter
-    /// shape that can single one out is the three-condition
-    /// code + level + source form that
-    /// `dhan-rest-only-noise-lock-2026-07-14.md` §2.3d-i settled on after a
-    /// bare-code filter was approved and then found wrong. That section is
-    /// the precedent; this test is what stops the field being dropped by a
-    /// later edit, which would silently un-write a future alarm.
-    ///
-    /// The values must also be DISTINCT: "the check ran and measured nothing"
-    /// and "the check could not run" have different causes and different
-    /// remedies, and collapsing them to one label would merge two independent
-    /// failures into one series — the same defect
-    /// `fold_counters::the_two_labelled_extremes_are_separate_handles`
-    /// guards on the metric side.
-    ///
-    /// This test asserts the FIELD, never the alarm. As of 2026-08-28 one of
-    /// the three — `xverify_diverged` — does have a metric-filter alarm, and
-    /// the other two have had theirs since 2026-08-25; but an alarm lives in
-    /// terraform and is pinned by its own wiring guard. Keeping the two
-    /// concerns apart is deliberate: a test that asserted both would go red
-    /// for an infrastructure edit that did not touch this file.
-    ///
-    /// The counter route remains separate and unshipped — the metric is in
-    /// neither EMF selector copy, which is a COST decision (~$0.30/mo per
-    /// name) and no longer a byte-budget one. See the corrected note at the
-    /// vacuous emit site.
-    #[test]
-    fn the_xverify_error_lines_carry_a_source_an_alarm_can_match_on() {
-        let src = include_str!("dhan_feed_stack.rs");
-
-        for (marker, label) in [
-            ("counters().xverify_vacuous.increment(1)", "xverify_vacuous"),
-            ("counters().xverify_failed.increment(1)", "xverify_failed"),
-            // ADDED 2026-08-28. The gap this closes is the sharpest of the
-            // three: the other two say "we could not measure". This one says
-            // "we measured, and the answer is bad" -- and it was the only
-            // verdict with no `source`, so mass divergence logged at `info!`
-            // among forty fields and reached nobody.
-            (
-                "counters().xverify_diverged.increment(1)",
-                "xverify_diverged",
-            ),
-        ] {
-            assert!(
-                src.contains(marker),
-                "the {label} counter arm must exist — the log field is only half \
-                 the signal"
-            );
-
-            // Anchor on the EMITTED field, not on a byte distance from the
-            // counter. The two are ~70 lines apart in the vacuous arm and
-            // adjacent in the failed one, so any fixed forward window is a
-            // number that has to be re-tuned every time the prose above the
-            // emit grows — and a window that silently became too short would
-            // pass by finding nothing to check.
-            let field = format!("source = \"{label}\"");
-            let at = src
-                .match_indices(&field)
-                // Skip the filter-shape comment, which spells the same field
-                // as `$.source = "…"` inside a CloudWatch pattern.
-                .find(|(i, _)| !src[..*i].ends_with("$."))
-                .map(|(i, _)| i)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "the {label} error! must carry `source = \"{label}\"` — \
-                         WS-GAP-03 has 25 emit sites in this file, so a filter \
-                         keyed on the code alone would page on ordinary \
-                         connection churn"
-                    )
-                });
-
-            // `code =` sits directly above `source =` in a tracing field list.
-            // 200 bytes is one or two field lines, so this cannot drift into a
-            // neighbouring emit and pass on someone else's code field.
-            let above = &src[at.saturating_sub(200)..at];
-            assert!(
-                above.contains("ErrorCode::WsGapConnectionState.code_str()"),
-                "the {label} source must sit on the SAME emit as the coded error \
-                 a filter pairs it with — a source field on an uncoded line \
-                 matches no three-condition filter"
-            );
-        }
-
-        // Distinct values, not one shared label.
-        assert_ne!(
-            src.matches("source = \"xverify_vacuous\"").count(),
-            0,
-            "the vacuous label must be present"
-        );
-        assert_ne!(
-            src.matches("source = \"xverify_failed\"").count(),
-            0,
-            "the failed label must be present"
-        );
-        // Exactly two REAL emissions. The needle also matches the `$.source =`
-        // inside the filter-shape comment above the vacuous arm, so that one is
-        // subtracted rather than the needle being narrowed — a narrower needle
-        // (say, a fixed indentation prefix) would stop biting the moment
-        // rustfmt moved the line, which is the failure mode this file's own
-        // O(1) table records five separate times about line numbers.
-        // 2026-08-25: the persistence wiring added two more emit sites, so
-        // the assertion moved from "exactly two emissions" to "exactly this
-        // SET of labels" — which is the property that actually matters and
-        // does not have to be re-counted every time an arm is added.
-        let mut labels: Vec<&str> = Vec::new();
-        for (idx, _) in src.match_indices("source = \"xverify_") {
-            let rest = &src[idx + "source = \"".len()..];
-            if let Some(end) = rest.find('"') {
-                labels.push(&rest[..end]);
-            }
-        }
-        labels.sort_unstable();
-        labels.dedup();
-        assert_eq!(
-            labels,
-            vec![
-                "xverify_diverged",
-                "xverify_failed",
-                "xverify_persist_partial",
-                "xverify_vacuous"
-            ],
-            "the xverify source labels changed. THREE of these are matched by CloudWatch \
-             metric filters (`xverify_vacuous`, `xverify_failed`, `xverify_diverged`) and \
-             page; \
-             `xverify_persist_partial` deliberately does not, because a partial write \
-             still lands the daily verdict row and adding an alarm needs a dated \
-             operator quote per dhan-rest-only-noise-lock-2026-07-14.md §3. A new label \
-             here means a new failure mode that pages nobody — decide that deliberately."
-        );
-
-        // The TOTAL-loss persist arm must reuse the ALARMED label. A distinct
-        // label would give better triage and reach no alarm, which is exactly
-        // how the audit found a comment claiming persistence that never
-        // happened: the failure would be invisible again.
-        assert!(
-            !src.contains("source = \"xverify_persist_failed\""),
-            "a total persistence failure must page through the alarmed `xverify_failed` \
-             label, not a private one nothing matches"
-        );
-    }
+    // ---- the cross-verification tests: REMOVED 2026-09-16 with the comparator ----
+    //
+    // Five tests lived here and every one pinned a piece of the 15:41
+    // live-vs-REST comparison, gone under the operator's 2026-09-16
+    // directive (`no-rest-except-live-feed-2026-06-27.md` §12.10):
+    //
+    //   * `the_daily_row_carries_every_comparison_total` — the daily audit
+    //     row's field mapping, guarding a transposition no integration test
+    //     could catch.
+    //   * `the_cross_verification_findings_are_actually_persisted` — the
+    //     three-site wiring pin (persister call, boot DDL, write config),
+    //     written after a comment claimed persistence that never happened.
+    //   * `the_xverify_persist_drains_in_chunks_and_reports_what_it_lost` —
+    //     the 2026-08-26 loss, where 764,003 findings built a 207,965,278-byte
+    //     ILP buffer against a 104,857,600-byte cap and the whole day was
+    //     discarded.
+    //   * `xverify_counter_separates_a_measured_run_from_a_vacuous_one` and
+    //     `the_xverify_error_lines_carry_a_source_an_alarm_can_match_on` —
+    //     the counter label split and the `$.source` contract. The five
+    //     `xverify_*` counters they asserted on are deleted with them rather
+    //     than left seeded at zero forever.
+    //
+    // ⚠ The last of those was the source-side half of a THREE-ALARM contract:
+    // `errcode-ws-gap-03-xverify-{vacuous,failed,diverged}` are CloudWatch
+    // metric filters keyed on `$.source`, and with no emit site left they can
+    // never match. Three permanently-green dead monitors is the exact class
+    // this repository has retired twice (`ws-reinject-01`, `tick-conserve-01`),
+    // so those filters go in the SAME change as this one — tracked in §12.8(b)
+    // of the rule file, never left to be discovered from a quiet dashboard.
+    //
+    // These tests were good, and none of them is being replaced. What they
+    // guarded no longer exists: §12.10.4 records that this workspace now has
+    // ZERO mechanism comparing captured market data against any external
+    // record, and that is a LOSS on the record, not a gap a test can close.
 
     #[test]
     fn test_pre_open_tick_is_written_even_though_it_opens_no_candle() {
@@ -19295,265 +18171,28 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_crossverify_targets_and_crossverify_deps_installed_mirror_reality() {
-        // The comparator must verify exactly what was captured. Verifying a
-        // different set would produce a clean verdict about instruments the
-        // lane never subscribed.
-        let universe = hardcoded_index_universe();
-        let (targets, skipped) = crossverify_targets_with_skipped(&universe);
-
-        assert_eq!(
-            targets.len(),
-            universe.len(),
-            "one target per subscribed instrument, no more and no fewer"
-        );
-        assert_eq!(skipped, 0, "every index is targetable");
-        for (t, i) in targets.iter().zip(universe.iter()) {
-            assert_eq!(t.security_id, i64::try_from(i.security_id).expect("fits"));
-            assert_eq!(t.segment, i.segment.as_str());
-        }
-        assert!(
-            crossverify_targets(&[]).is_empty(),
-            "an empty universe yields no targets rather than a default one"
-        );
-    }
-
-    /// BITE TEST (2026-08-25) — the partial-denominator vacuous pass.
-    ///
-    /// `instrument` used to be the literal `"INDEX"` for every target, and it
-    /// goes verbatim into the Dhan REST intraday body. The live universe is
-    /// ~119 indices plus ~750 NSE_EQ constituents, so ~86% of every run's
-    /// fetches asked for a STOCK as though it were an INDEX — returning no
-    /// candles, landing in `rest_failures`, and never being compared, while the
-    /// run could still report `Clean` on the correctly-labelled indices.
-    ///
-    /// The module's `minutes_compared > 0` guard cannot catch this: the
-    /// denominator is partial, not zero.
-    #[test]
-    fn an_equity_is_never_targeted_as_an_index_and_fno_is_never_guessed() {
-        let universe = vec![
-            SubscribeInstrument {
-                security_id: 13,
-                segment: ExchangeSegment::IdxI,
-            },
-            SubscribeInstrument {
-                security_id: 2885,
-                segment: ExchangeSegment::NseEquity,
-            },
-            SubscribeInstrument {
-                security_id: 500_325,
-                segment: ExchangeSegment::BseEquity,
-            },
-            SubscribeInstrument {
-                security_id: 45_800,
-                segment: ExchangeSegment::NseFno,
-            },
-        ];
-        let (targets, skipped) = crossverify_targets_with_skipped(&universe);
-
-        assert_eq!(
-            targets.len(),
-            3,
-            "the three cash instruments are targetable"
-        );
-        assert_eq!(
-            skipped, 1,
-            "the F&O contract is COUNTED as unverifiable, never guessed"
-        );
-        assert_eq!(targets[0].instrument, "INDEX");
-        assert_eq!(
-            targets[1].instrument, "EQUITY",
-            "an NSE_EQ constituent fetched as INDEX returns nothing and is \
-             silently never compared"
-        );
-        assert_eq!(targets[2].instrument, "EQUITY");
-        assert!(
-            targets.iter().all(|t| t.security_id != 0),
-            "an out-of-range id must be skipped, never coerced to instrument 0"
-        );
-    }
-
-    #[test]
-    fn test_crossverify_labels_an_equity_as_equity_not_index() {
-        // The bite test for the 2026-08-25 fix. Today's universe is ~119 NSE
-        // indices plus ~750 NTM equities; the previous code stamped "INDEX" on
-        // every one, so six of every seven targets asked Dhan for an index bar
-        // on an equity id. Dhan answers that pair with an empty candle set, so
-        // the comparator counted it `missing_rest` — an absent vendor tape
-        // reported where the real fault was our own request.
-        //
-        // Restore `instrument: "INDEX".to_string()` in `crossverify_targets`
-        // and this assertion fails with left: "INDEX", right: "EQUITY".
-        let universe = vec![
-            SubscribeInstrument {
-                security_id: 13,
-                segment: ExchangeSegment::IdxI,
-            },
-            SubscribeInstrument {
-                security_id: 2885,
-                segment: ExchangeSegment::NseEquity,
-            },
-            SubscribeInstrument {
-                security_id: 500_325,
-                segment: ExchangeSegment::BseEquity,
-            },
-        ];
-        let targets = crossverify_targets(&universe);
-        assert_eq!(targets.len(), 3, "every cash segment is labellable");
-        assert_eq!(targets[0].instrument, "INDEX");
-        assert_eq!(targets[1].instrument, "EQUITY");
-        assert_eq!(targets[2].instrument, "EQUITY");
-        // The segment string must keep travelling verbatim: the pair is what
-        // Dhan validates, so a right label on a wrong segment is no better.
-        assert_eq!(targets[1].segment, "NSE_EQ");
-        assert_eq!(targets[2].segment, "BSE_EQ");
-    }
-
-    #[test]
-    fn test_crossverify_drops_a_segment_it_cannot_label_rather_than_guessing() {
-        // An F&O id may be FUTIDX, OPTIDX, FUTSTK or OPTSTK and
-        // `SubscribeInstrument` carries only (security_id, segment), so no
-        // label here can be honest. Dropping it leaves the target UNVERIFIED
-        // and says so; guessing would leave it verified-against-nothing, which
-        // reads identically to a clean run.
-        let universe = vec![
-            SubscribeInstrument {
-                security_id: 13,
-                segment: ExchangeSegment::IdxI,
-            },
-            SubscribeInstrument {
-                security_id: 45_678,
-                segment: ExchangeSegment::NseFno,
-            },
-            SubscribeInstrument {
-                security_id: 84_321,
-                segment: ExchangeSegment::BseFno,
-            },
-        ];
-        let targets = crossverify_targets(&universe);
-        assert_eq!(
-            targets.len(),
-            1,
-            "only the index survives; the two contracts are excluded, not mislabelled"
-        );
-        assert_eq!(targets[0].segment, "IDX_I");
-        assert!(
-            targets
-                .iter()
-                .all(|t| t.instrument != "INDEX" || t.segment == "IDX_I"),
-            "no surviving target may carry INDEX on a non-index segment"
-        );
-    }
-
-    #[test]
-    fn test_dhan_intraday_instrument_for_covers_every_variant_deliberately() {
-        // Pins the mapping so a new segment cannot default into a label. Each
-        // arm below is a decision, not an accident.
-        assert_eq!(
-            dhan_intraday_instrument_for(ExchangeSegment::IdxI),
-            Some("INDEX")
-        );
-        assert_eq!(
-            dhan_intraday_instrument_for(ExchangeSegment::NseEquity),
-            Some("EQUITY")
-        );
-        assert_eq!(
-            dhan_intraday_instrument_for(ExchangeSegment::BseEquity),
-            Some("EQUITY")
-        );
-        for ambiguous in [
-            ExchangeSegment::NseFno,
-            ExchangeSegment::BseFno,
-            ExchangeSegment::NseCurrency,
-            ExchangeSegment::BseCurrency,
-            ExchangeSegment::McxComm,
-        ] {
-            assert_eq!(
-                dhan_intraday_instrument_for(ambiguous),
-                None,
-                "{} must refuse a label rather than invent one",
-                ambiguous.as_str()
-            );
-        }
-    }
-
-    #[test]
-    fn test_spawn_daily_crossverify_refuses_unless_install_crossverify_deps_ran() {
-        // A live lane with no verifier cannot detect the packet loss its
-        // protocol cannot report. `None` is a refusal, not a skip — and the
-        // caller logs it at ERROR.
-        //
-        // Note this asserts the state of a process-global OnceLock: in a test
-        // binary nothing installs deps, so `installed` is false here.
-        assert!(
-            !crossverify_deps_installed(),
-            "no test may install the global provider — it would leak across tests"
-        );
-        assert!(
-            spawn_daily_crossverify(&hardcoded_index_universe()).is_none(),
-            "without a provider the comparator must refuse to spawn"
-        );
-    }
-
-    #[test]
-    fn test_crossverify_schedule_lands_on_1531_ist_and_never_double_fires() {
-        // One minute after the close, so the final minute has sealed.
-        //
-        // RE-BLESSED 2026-08-25 from a hardcoded 55_860 (15:31). That literal
-        // was correct for the pre-CAS 15:30 close and became wrong on
-        // 2026-08-07 when the NSE CAS migration moved the session end to 15:40
-        // everywhere except here and the comparator's own window constant. The
-        // schedule is now DERIVED from the close, and the relationship — not a
-        // literal — is what this test pins, so the next session-hours change
-        // cannot leave it behind a seventh time.
-        const RUN: u64 = XVERIFY_RUN_AT_SECS_OF_DAY_IST;
-        assert_eq!(
-            RUN as i64,
-            crate::dhan_live_crossverify::SESSION_CLOSE_SECS_OF_DAY_IST + 60,
-            "the comparator must fire exactly one minute after the session close"
-        );
-        assert_eq!(RUN, 56_460, "09:15-15:40 session ⇒ a 15:41 IST run");
-
-        // Before the run time: wait until today's.
-        assert_eq!(secs_until_next_run_ist(0), RUN, "midnight → today's run");
-        assert_eq!(
-            secs_until_next_run_ist(RUN - 1),
-            1,
-            "one second before → one second to wait"
-        );
-
-        // AT the run time: a full day, never zero. Zero would busy-loop the
-        // task and fire the comparator repeatedly within one session.
-        assert_eq!(
-            secs_until_next_run_ist(RUN),
-            SECS_PER_DAY,
-            "exactly at the run time must wait a full day, not fire again"
-        );
-
-        // After: tomorrow's.
-        assert_eq!(secs_until_next_run_ist(RUN + 1), SECS_PER_DAY - 1);
-        assert_eq!(
-            secs_until_next_run_ist(SECS_PER_DAY - 1),
-            RUN + 1,
-            "one second before midnight → tomorrow's run"
-        );
-
-        // Total over every second of the day: always a positive, bounded wait.
-        for s in (0..SECS_PER_DAY).step_by(97) {
-            let wait = secs_until_next_run_ist(s);
-            assert!(
-                wait > 0 && wait <= SECS_PER_DAY,
-                "wait from {s} was {wait} — must be positive and at most one day"
-            );
-        }
-    }
-
+    // ---- `test_crossverify_targets_and_crossverify_deps_installed_mirror_reality`:
+    //      REMOVED 2026-09-16 with the comparator ----
+    //
+    // It pinned that the 15:41 comparison verified exactly what the lane had
+    // captured — the target set, the skipped-instrument accounting, the
+    // Dhan-intraday instrument mapping, the installed-deps gate and the
+    // next-run scheduling arithmetic. All of it is gone under the operator's
+    // 2026-09-16 directive (`no-rest-except-live-feed-2026-06-27.md` §12.10).
+    //
+    // Its point was the sharpest in this module and is worth keeping in
+    // words: a comparator that verifies a DIFFERENT set than the lane
+    // captured agrees with itself and proves nothing. That failure mode is
+    // now unreachable for the reason §12.10.4 records — there is no
+    // comparator.
     #[test]
     fn test_now_ist_secs_of_day_is_within_a_day() {
         // Total by construction; pinned so a timezone-handling change cannot
         // silently produce an out-of-range value that skews the schedule.
-        assert!(now_ist_secs_of_day() < SECS_PER_DAY);
+        // `SECS_PER_DAY` was a local duplicate inside the cross-verification
+        // scheduler removed 2026-09-16; the workspace constant is the same value
+        // and is the one that should always have been used here.
+        assert!(now_ist_secs_of_day() < tickvault_common::constants::SECONDS_PER_DAY as u64);
     }
 
     #[test]
@@ -20216,45 +18855,55 @@ mod tests {
                  `{banned}`"
             );
         }
-
-        // NARROWED 2026-08-11, deliberately and with the reason recorded.
+        // ⚠ TIGHTENED 2026-09-16 — this module now reaches for NO HTTP AT ALL.
         //
-        // This list used to ban `reqwest::` outright, as a blunt proxy for "no
-        // downloads". That proxy was wrong in a way that mattered: the 15:31
-        // cross-verification MUST make an HTTP call — it compares our captured
-        // candles against Dhan's own REST record, and it is the only ground
-        // truth this lane has (the main feed carries no sequence number and no
-        // snapshot-on-subscribe). Banning all HTTP would have banned the
-        // verifier that `websocket-connection-scope-lock.md` requires to be
-        // live from day one.
+        // The text below is the 2026-08-11 narrowing, kept because its
+        // reasoning is the record of why the ban moved from the TRANSPORT to
+        // the TARGET, and because that half still binds. What changed is the
+        // allowance it carved out: the 15:41 comparator is GONE (the operator's
+        // SOCKETS-ONLY directive — `no-rest-except-live-feed-2026-06-27.md`
+        // §12.10; the floor decision is §12.10.3 and the honest loss is
+        // §12.10.4). With no comparator there is no legitimate HTTP left here,
+        // so the bound drops from `<= 2` to `== 0` and the two comparator
+        // needles flip from required-PRESENT to required-ABSENT. That is a
+        // STRICTLY STRONGER pin than the one it replaces: a re-added fetch of
+        // any kind now fails the build instead of fitting inside a budget of 2.
         //
-        // So the ban moves from the TRANSPORT to the TARGET, which is what Q3
+        // (2026-08-11, retained) This list used to ban `reqwest::` outright, as
+        // a blunt proxy for "no downloads". That proxy was wrong in a way that
+        // mattered: the 15:31 cross-verification MUST make an HTTP call — it
+        // compared our captured candles against Dhan's own REST record, and it
+        // was the only ground truth this lane had (the main feed carries no
+        // sequence number and no snapshot-on-subscribe). Banning all HTTP would
+        // have banned the verifier that `websocket-connection-scope-lock.md`
+        // then required to be live from day one.
+        //
+        // So the ban moved from the TRANSPORT to the TARGET, which is what Q3
         // actually cares about: no instrument-master host, no CSV downloader,
-        // no parser, no universe enum. HTTP to the authorized intraday-candles
-        // endpoint (a KEEP class under `no-rest-except-live-feed-2026-06-27.md`
-        // §8) is permitted — and pinned below to that one use, so this cannot
-        // quietly become a general licence to fetch.
+        // no parser, no universe enum. That half is unchanged above.
         let http_uses = production_half.matches(concat!("reqwest", "::")).count();
-        assert!(
-            http_uses <= 2,
-            "HTTP in this module is permitted ONLY for the 15:31 comparator (a Client type \
-             and its constructor). Found {http_uses} uses — if a new one is legitimate, say \
-             why here; if it is a fetch of instrument data, it violates Q3."
+        assert_eq!(
+            http_uses, 0,
+            "this module must reach for NO HTTP. The only HTTP ever permitted here was the \
+             15:41 comparator, and it is removed (§12.10). Found {http_uses} use(s) — if a \
+             new one is genuinely needed it requires a dated operator quote in the rule \
+             file FIRST, not a budget raised here."
         );
         for (needle, why) in [
             (
                 concat!("run_cross_", "verification"),
-                "the comparator must still be the caller",
+                "the comparator is removed, so its caller must be gone too — a surviving \
+                 call site means the deletion was partial",
             ),
             (
                 "intraday_url",
-                "the only endpoint this module may reach is the authorized intraday one",
+                "the intraday endpoint was the comparator's only target; a surviving \
+                 reference means a market-data REST pull came back",
             ),
         ] {
             assert!(
-                production_half.contains(needle),
-                "the HTTP allowance is scoped to the comparator, but {why} — missing \
-                 `{needle}`"
+                !production_half.contains(needle),
+                "the comparator is REMOVED but {why} — found `{needle}`"
             );
         }
     }
@@ -20544,170 +19193,66 @@ mod tests {
         );
     }
 
-    /// The 15:31 comparator's day origin must be IST-WALL-AS-EPOCH, because
-    /// that is how both compared sides stamp their minutes.
-    ///
-    /// This test exists because the origin was built with
-    /// `.and_local_timezone(ist)` — the TRUE UTC instant of IST midnight —
-    /// while `ticks.ts` is `exchange_timestamp * 1e9` with no offset and the
-    /// REST side adds the offset to a UTC epoch. The 19,800-second skew pushed
-    /// every bucket from 10:00 IST onward out of `is_in_session`, so the only
-    /// loss detector this lane has compared 45 of 375 minutes and still
-    /// reported Clean.
-    ///
-    /// The assertion below is deliberately end-to-end over the WHOLE session
-    /// rather than a spot check on the origin: a test that only asserted
-    /// "origin == some constant" would have been satisfied by the broken value
-    /// too, as long as the constant were derived the same broken way.
-    #[test]
-    fn test_crossverify_day_origin_covers_the_entire_session_not_just_the_first_45_minutes() {
-        use crate::dhan_live_crossverify::{
-            SESSION_CLOSE_SECS_OF_DAY_IST, SESSION_OPEN_SECS_OF_DAY_IST, is_in_session,
-            is_tail_minute,
-        };
+    // ---- `test_crossverify_day_origin_covers_the_entire_session_not_just_the_first_45_minutes`:
+    //      REMOVED 2026-09-16 with the comparator ----
+    //
+    // Worth recording in words, because the bug it caught is the sharpest
+    // example in this file of why the comparison needed guarding at all: the
+    // day origin was built with `.and_local_timezone(ist)` — the TRUE UTC
+    // instant of IST midnight — while `ticks.ts` carries no offset. The
+    // 19,800-second skew pushed every bucket from 10:00 IST onward out of
+    // session, so the lane's only loss detector compared 45 of 375 minutes
+    // and still reported Clean.
+    //
+    // The test was deliberately end-to-end over the whole session rather than
+    // a spot check on the origin, because a spot check would have been
+    // satisfied by the broken value as long as the constant were derived the
+    // same broken way. That lesson outlives the code
+    // (`no-rest-except-live-feed-2026-06-27.md` §12.10).
 
-        let day = chrono::NaiveDate::from_ymd_opt(2026, 8, 11).expect("date"); // APPROVED: test
-        // Built EXACTLY as the runner builds it.
-        let origin = day
-            .and_hms_opt(0, 0, 0)
-            .and_then(|dt| dt.and_utc().timestamp_nanos_opt())
-            .expect("origin"); // APPROVED: test
-
-        // The DATA's stamping convention — fixed, and DELIBERATELY not derived
-        // from `origin`.
-        //
-        // The first draft of this test built `ts` from `origin`, so `ts -
-        // origin` cancelled the origin entirely and the assertion held for ANY
-        // origin. It passed with the bug deliberately re-injected. A test whose
-        // subject cancels out of its own arithmetic proves nothing — which is
-        // exactly the class this audit was hunting, found in the test written
-        // to close it.
-        //
-        // `ticks.ts` is `exchange_timestamp * 1e9`, and Dhan's LTT is already
-        // IST epoch seconds, so an IST wall-clock time is stamped as though it
-        // were UTC. `and_utc()` on the IST date reproduces that.
-        let data_midnight_secs = day
-            .and_hms_opt(0, 0, 0)
-            .and_then(|dt| dt.and_utc().timestamp_nanos_opt())
-            .expect("data midnight") // APPROVED: test
-            / 1_000_000_000;
-        let stamp = |h: i64, mi: i64| (data_midnight_secs + h * 3600 + mi * 60) * 1_000_000_000;
-
-        let mut in_session = 0i64;
-        for m in 0..(24 * 60) {
-            let ts = (data_midnight_secs + i64::from(m) * 60) * 1_000_000_000;
-            if is_in_session(ts, origin) {
-                in_session += 1;
-            }
-        }
-        // 09:15..15:40 = 385 minutes. DERIVED, never a hand-typed literal:
-        // this count moved once already (375 -> 385) when NSE added the
-        // 15:30-15:40 closing session on 2026-08-07, and a literal is exactly
-        // what let the private duplicate close-constant miss that migration
-        // for eighteen days.
-        let expected_minutes = (SESSION_CLOSE_SECS_OF_DAY_IST - SESSION_OPEN_SECS_OF_DAY_IST) / 60;
-        assert_eq!(
-            in_session, expected_minutes,
-            "the session gate must accept all {expected_minutes} session minutes. \
-             Got {in_session} — a count near 45 is the +19,800s IST-origin skew returning."
-        );
-
-        // And the tail amnesty must land on the REAL tail — the last two
-        // session minutes, whatever the close currently is — never on
-        // 09:58/09:59 as it did under the skew.
-        let tail_at = |h: i64, mi: i64| is_tail_minute(stamp(h, mi), origin);
-        let hm = |secs: i64| (secs / 3600, (secs % 3600) / 60);
-        let (h1, m1) = hm(SESSION_CLOSE_SECS_OF_DAY_IST - 60);
-        let (h2, m2) = hm(SESSION_CLOSE_SECS_OF_DAY_IST - 120);
-        assert!(tail_at(h1, m1), "{h1}:{m1} must be tail-amnestied");
-        assert!(tail_at(h2, m2), "{h2}:{m2} must be tail-amnestied");
-        assert!(
-            !tail_at(9, 58),
-            "09:58 is NOT the tail — that is the skew signature"
-        );
-        assert!(
-            !tail_at(9, 59),
-            "09:59 is NOT the tail — that is the skew signature"
-        );
-    }
-
+    // ---- `the_cross_verify_verdict_is_logged_as_fields_not_a_debug_dump`:
+    //      REMOVED 2026-09-16 with the comparator ----
+    //
+    // Kept in words because the MEASURED defect behind it is a reusable
+    // lesson about LOGGING, not about cross-verification. Prod box,
+    // 2026-08-20: the verdict emitted `?report` and the line came out at
+    // 1,048,374 characters — EXACTLY CloudWatch's 1 MiB event ceiling, so it
+    // was truncated. `RunReport`'s derived Debug prints `comparison.findings`
+    // BEFORE the totals, so the truncation ate precisely the summary:
+    // `minutes_compared` — the non-vacuity denominator, the one number that
+    // decided whether the day was verified at all — was unreadable, while
+    // several thousand individual findings were not. A debug-dump of a struct
+    // with an unbounded field is a log line whose most important content is
+    // the first thing lost.
+    //
+    // It also carried the FIFTH fixed-window guard found in this branch: it
+    // walked back a fixed 2,000 bytes from the emit and failed the day four
+    // fields were added — failing CLOSED, which is the better direction, but
+    // wrong in shape either way. A byte count is a guess about how long code
+    // will stay; a macro opening is a real boundary.
+    //
+    // Authority: `no-rest-except-live-feed-2026-06-27.md` §12.10, floor
+    // decision §12.10.3, honest loss §12.10.4.
+    //
+    // ⚠ SEAM FOUND WHILE REMOVING IT, recorded because the first attempt at
+    // this tombstone got it backwards. The deleted test sat INSIDE the doc
+    // comment of the test below: the `///` block beginning "THE regression
+    // that would cost real ticks" opens immediately after this note, then the
+    // cross-verify `#[test]` interrupted it, and the block RESUMED afterwards
+    // with "/// change exists to improve on.". Rust attaches a doc comment to
+    // the next item regardless of blank lines, so the first half was silently
+    // documenting the cross-verify test while its own continuation documented
+    // the depth test — one sentence split across two items, compiling
+    // cleanly. My first fix read the first half as ORPHANED and deleted it,
+    // which would have left the trailing "/// change exists to improve on."
+    // dangling on the depth test with its subject removed. The halves are
+    // rejoined by placing this note ABOVE the block instead of inside it.
     /// THE regression that would cost real ticks: the depth late-attach must
     /// never sit between the main-feed dial and the ring's template drop.
     ///
     /// Depth waits until ~09:16 IST. If that wait were inline, the main feed
     /// would dial 45 minutes late and the lane would miss the open — trading 5
     /// working sockets for 0, which is strictly worse than the 5-of-16 this
-
-    #[test]
-    fn the_cross_verify_verdict_is_logged_as_fields_not_a_debug_dump() {
-        // MEASURED DEFECT, prod box 2026-08-20: this site emitted `?report`,
-        // and the resulting log line was 1,048,374 characters — EXACTLY
-        // CloudWatch's 1 MiB event ceiling, therefore truncated.
-        //
-        // `RunReport`'s derived Debug prints `comparison.findings` BEFORE the
-        // totals, so the truncation ate precisely the summary. `minutes_compared`
-        // — the non-vacuity denominator, the one number that decides whether
-        // the day's captured candles were verified at all — was unreadable,
-        // while several thousand individual findings were not.
-        //
-        // A source scan rather than a runtime assertion because the emit sits
-        // inside the live cross-verify arm, which needs a token, QuestDB and a
-        // real REST leg to reach.
-        let src = include_str!("dhan_feed_stack.rs");
-        let marker = "cross-verification finished — this is the honest";
-        let idx = src.find(marker).expect("the cross-verify emit must exist");
-        // CORRECTED 2026-08-26. This walked back a FIXED 2,000 bytes, and on
-        // the day four more fields were added to the emit it failed — not
-        // because a field was missing, but because the list outgrew the
-        // window. It failed CLOSED, blocking a correct change, which is the
-        // better of the two directions; the shape is wrong either way.
-        //
-        // This is the FIFTH fixed-window guard found in this branch, all
-        // written by me. A byte count is a guess about how long code will
-        // stay; the macro opening is a real boundary and cannot drift.
-        //
-        // The openings are assembled from FRAGMENTS, not written whole. A
-        // source-scanning guard in another crate reads this file for `error!`
-        // sites and cannot tell a literal in a test array from a real emit —
-        // it failed on exactly that, and the failure was 100% correct given
-        // what it could see. Same technique the failure-reason pin uses one
-        // module over, for the same reason: this file is read by scanners.
-        let start = [
-            concat!("info", "!("),
-            concat!("error", "!("),
-            concat!("warn", "!("),
-        ]
-        .iter()
-        .filter_map(|m| src[..idx].rfind(m))
-        .max()
-        .expect("the emit must sit inside a tracing macro");
-        let emit = &src[start..idx];
-
-        assert!(
-            emit.contains("minutes_compared = c.minutes_compared"),
-            "the non-vacuity denominator must be its own field — it is the number \
-             the 1 MiB truncation destroyed"
-        );
-        for field in [
-            "cells_diverged = c.cells_diverged",
-            "missing_live = c.missing_live",
-            "missing_rest = c.missing_rest",
-            "noise_p50_paise = c.noise_p50_paise",
-            "vacuous = c.is_vacuous()",
-        ] {
-            assert!(
-                emit.contains(field),
-                "the verdict emit lost `{field}` — every summary number must be a \
-                 bounded named field, not part of a dump that can be cut off"
-            );
-        }
-        assert!(
-            !emit.contains("?report"),
-            "the verdict must NOT debug-dump the whole report: its findings vector \
-             is unbounded and pushed the line onto CloudWatch's 1 MiB ceiling, \
-             truncating away the totals that follow it"
-        );
-    }
     /// change exists to improve on.
     #[test]
     fn test_depth_late_attach_cannot_delay_the_main_feed_dial() {
@@ -24325,28 +22870,16 @@ mod late_seed_tests {
         );
     }
 
-    #[test]
-    fn the_tape_is_stamped_per_target_not_once_per_run() {
-        // The fetch loop runs for up to ten minutes. One run-level stamp
-        // would claim the last instrument was fetched at the same instant as
-        // the first, destroying the only number that says how stale the
-        // vendor's own record was when we read it.
-        let src = include_str!("dhan_live_crossverify.rs");
-        let loop_start = src
-            .find("for offset in 0..target_count")
-            .expect("the fetch loop must exist");
-        let loop_body = &src[loop_start..];
-        let stamp = loop_body
-            .find("fetched_at_ist_nanos_now")
-            .expect("the tape must be stamped INSIDE the fetch loop");
-        let push = loop_body
-            .find("rest_tape.extend")
-            .expect("the tape must be built inside the fetch loop");
-        assert!(
-            stamp < push,
-            "the stamp must be taken before the rows that carry it"
-        );
-    }
+    // ---- `the_tape_is_stamped_per_target_not_once_per_run`: REMOVED
+    //      2026-09-16 with the comparator ----
+    //
+    // It pinned that `dhan_rest_1m_tape` was stamped INSIDE the per-target
+    // fetch loop, not once per run — a run-level stamp would have claimed the
+    // last instrument was fetched at the same instant as the first,
+    // destroying the only number that recorded how stale the vendor's own
+    // record was when we read it. Gone with the fetch loop it guarded
+    // (`no-rest-except-live-feed-2026-06-27.md` §12.10). The `dhan_rest_1m_tape`
+    // TABLE and every row in it are RETAINED.
 }
 
 #[cfg(test)]

@@ -2392,14 +2392,6 @@ async fn async_main() -> Result<()> {
         &notifier,
     );
 
-    // Judge-locked cadence scheduler — PROCESS-GLOBAL like the verifier
-    // above (2026-07-14): per-minute chain + spot fire timing with
-    // structural zero-429 gates, failure ladder, and event-driven dry-run
-    // decisions (CADENCE-01/02/03). Config-gated (`[cadence] enabled`,
-    // ships false); dry-run executors both lanes — NO REST caller in this
-    // PR; the once-per-process AtomicBool inside makes the fast-arm +
-    // prefix dual-spawn safe. See `cadence_boot::spawn_cadence_scheduler`.
-    // Order-leg P&L (2026-07-19): shared leg-identity handle + boot consumer.
     let leg_identity_index = tickvault_app::leg_identity::new_shared_leg_identity_index();
     let order_leg_pnl_tx = tickvault_app::order_leg_pnl_boot::spawn_order_leg_pnl_capture(
         config.order_runtime.enabled,
@@ -2407,21 +2399,35 @@ async fn async_main() -> Result<()> {
         &config.questdb,
         std::sync::Arc::clone(&leg_identity_index),
     );
-    let _cadence_shutdown = tickvault_app::cadence_boot::spawn_cadence_scheduler(
-        &config,
-        &trading_calendar,
-        &feed_runtime,
-        &notifier,
-        // Order-runtime mark tap (2026-07-18): the GROWW cadence
-        // executor's spot persist-confirm seam is the live mark source
-        // (re-homed from the stood-down legacy legs). Threaded to the
-        // GROWW lane ONLY — NEVER the Dhan executor: Dhan sids
-        // (13/25/51) are a different id space than the Groww-native
-        // u64s the paper book keys on; cross-feeding would double-key
-        // instruments invisibly to the first-seen-segment tripwire.
-        order_runtime_mark_forwarder,
-        leg_identity_index,
-    );
+    // ---- the cadence scheduler: REMOVED 2026-09-16 ----
+    //
+    // `cadence_boot::spawn_cadence_scheduler` drove the per-minute chain +
+    // spot fire timing with the zero-429 gates, the failure ladder and the
+    // event-driven decisions. Its `CadenceExecutor` trait declared exactly
+    // three methods — `fetch_chain`, `fetch_spot`, `fetch_expiry_list` —
+    // and all three ARE the market-data REST legs removed under the
+    // operator's 2026-09-16 directive (`no-rest-except-live-feed-2026-06-27.md`
+    // §12.10). With nothing left to execute, the scheduler had no work to
+    // schedule, so the whole `crates/core/src/cadence/` tree goes with it.
+    //
+    // ⚠ THE EXPLICIT DROP BELOW IS LOAD-BEARING — do not "tidy" it away.
+    //
+    // `order_runtime_mark_forwarder` is an mpsc `Sender` that was MOVED into
+    // this call. Deleting the call alone would leave the binding alive in
+    // `async_main`'s frame for the whole process lifetime, so the channel
+    // would NEVER close, `mark_rx.recv()` would pend forever, and the paper
+    // order book's three already-written no-producer arms — including the
+    // `warn!` that exists precisely to say "no mark source" — would none of
+    // them ever run. No error, no warn, no counter: the daily-loss halt and
+    // the paper book would run on permanently stale marks while reporting
+    // healthy. That is the false-OK class this repository forbids.
+    //
+    // Dropping it closes the channel, which is the honest state: the Groww
+    // cadence executor WAS the live mark source, and it is gone. Wiring a
+    // new mark producer from the tick drain is real work on the order path
+    // and is deliberately OUT of this removal's scope.
+    drop(order_runtime_mark_forwarder);
+    let _ = leg_identity_index;
 
     // -----------------------------------------------------------------------
     // DayOhlcTracker boot wiring (post 2026-05-26 simplification; MOVED to
@@ -2768,62 +2774,36 @@ async fn async_main() -> Result<()> {
     // amendment stands — no CSV download, no parser). Depth sets are empty
     // until an operator names instruments for them.
     // =======================================================================
-    // -----------------------------------------------------------------------
-    // Register the 15:31 cross-verification dependencies BEFORE the lane
-    // spawns (2026-08-11).
+    // ---- the 15:41 cross-verification registration: REMOVED 2026-09-16 ----
     //
-    // Without this call `spawn_daily_crossverify` takes its refusal branch and
-    // the lane runs with NO loss detector at all. That is not a degraded mode
-    // — it is the absence of the only detector that can exist here: the Dhan
-    // main feed carries no sequence number and no snapshot-on-subscribe, so a
-    // dropped packet is invisible at the protocol level. The 15:31 comparison
-    // against Dhan's own REST record is the entire safety net.
+    // This installed the comparator's dependencies (QuestDB `/exec` for the
+    // live candles, Dhan's `/v2/charts/intraday` for the official tape, a
+    // fresh-JWT closure, and the ILP handle that wrote the findings) BEFORE
+    // the lane spawned, because `run_dhan_feed_stack` REFUSED to open any
+    // socket without them.
     //
-    // This was missed once already. The comparator's stub was replaced with a
-    // real implementation on 2026-08-10, and the registration it depends on
-    // was never written — so the "fix" changed a log line and nothing else.
-    // The lane now REFUSES to start without it (see `run_dhan_feed_stack`),
-    // which is what stops that from being possible a third time.
-    let crossverify_installed = tickvault_app::dhan_feed_stack::install_crossverify_deps(
-        tickvault_app::dhan_feed_stack::CrossverifyDeps {
-            questdb_exec_url: format!(
-                "http://{}:{}/exec",
-                config.questdb.host, config.questdb.http_port
-            ),
-            intraday_url: format!(
-                "{}{}",
-                config.dhan.rest_api_base_url,
-                tickvault_common::constants::DHAN_CHARTS_INTRADAY_PATH
-            ),
-            // A closure, not a value: the JWT rotates roughly every 23h and
-            // this scheduler outlives any single token. Reading it fresh at
-            // each run is the only correct shape.
-            jwt_provider: Box::new(|| {
-                let manager = tickvault_core::auth::token_manager::global_token_manager()?;
-                let guard = manager.token_handle().load();
-                guard.as_ref().as_ref().map(|state| {
-                    use secrecy::ExposeSecret as _;
-                    state.access_token().expose_secret().to_string()
-                })
-            }),
-            config: tickvault_app::dhan_live_crossverify::DhanLiveCrossverifyConfig::default(),
-            // The ILP WRITE side, added 2026-08-25 with the persistence
-            // wiring. Same server as `questdb_exec_url` above, different
-            // protocol: that one READS the live candles, this one WRITES the
-            // comparison's findings so the feed's only ground-truth check
-            // leaves a record instead of a log line.
-            questdb: config.questdb.clone(),
-        },
-    );
-    if !crossverify_installed {
-        // Idempotent by design — first call wins. A second call means someone
-        // added a rival registration, which would silently decide which
-        // endpoints the only ground-truth check uses.
-        tracing::warn!(
-            "cross-verification dependencies were already registered — the first \
-             registration stands; check for a duplicate install site"
-        );
-    }
+    // Both halves are gone under the operator's 2026-09-16 directive,
+    // recorded BEFORE the code in `no-rest-except-live-feed-2026-06-27.md`
+    // §12.10: "Bro just remove per minute price falls and 3.41 pm accuracy
+    // check alone dude okay". The refusal floor in `run_dhan_feed_stack`
+    // went with it, and §12.10.3 of that file records that NOTHING replaces
+    // it — a floor gating on a removed component cannot stand, and inventing
+    // a different precondition on the live trading lane inside a removal PR
+    // would be worse than having none.
+    //
+    // ⚠ THE HONEST CONSEQUENCE, which the deleted comment above stated
+    // better than any replacement could: the Dhan main feed carries no
+    // sequence number and no snapshot-on-subscribe, so a dropped packet is
+    // invisible at the protocol level. This comparison against Dhan's own
+    // REST record was the entire safety net. From today there is ZERO
+    // mechanism anywhere in this workspace that compares captured market
+    // data against any external record — every remaining signal reports
+    // whether the machinery RAN, never whether the numbers are RIGHT.
+    // §12.10.4 records that as a LOSS, not as a cost that was mitigated.
+    //
+    // The three audit tables it wrote (`dhan_rest_1m_tape` and its two
+    // siblings) are RETAINED with every row, and are in the operator
+    // console's SEBI keep-list. Only the writer is gone.
 
     // Depth instrument sets, sourced from the per-minute option chain (operator
     // 2026-08-11, second quote — "enable connect estbalish al lteh 16
@@ -3798,23 +3778,21 @@ async fn build_shared_infra(
 
     // --- Dhan live-vs-REST cross-verification audit tables ---
     //
-    // Third instance of the identical defect, found by the 2026-08-25 audit.
-    // `ensure_dhan_live_crossverify_tables` had ZERO production callers, and
-    // so did the two writers it exists for — so the tables did not exist, the
-    // 15:41 comparison's findings were never written, and a comment in
-    // `dhan_feed_stack` claimed the opposite.
+    // The DDL call here was REMOVED 2026-09-16 with the comparator that
+    // wrote these tables (`no-rest-except-live-feed-2026-06-27.md` §12.10).
     //
-    // This one matters more than the two above rather than less: the India
-    // feed carries no sequence number and no snapshot-on-subscribe, so this
-    // comparison against Dhan's own official tape is the ONLY evidence that
-    // the captured data is real. Awaited inline, before any run can fire, so
-    // ILP cannot auto-create either table without its DEDUP key — the
-    // cell table's key carries `field` and `kind` precisely so a diverged and
-    // a missing finding on the same minute both survive.
-    tickvault_storage::dhan_live_crossverify_persistence::ensure_dhan_live_crossverify_tables(
-        &config.questdb,
-    )
-    .await;
+    // The THREE tables — `dhan_rest_1m_tape` and its two audit siblings —
+    // are RETAINED with every row already in them, and they are in the
+    // operator console's SEBI keep-list, so the wipe command protects them.
+    // What is gone is the writer, and with it the only caller of their DDL.
+    //
+    // ⚠ The honest consequence, recorded rather than left to be discovered:
+    // on a FRESH volume these three tables are no longer created at boot, so
+    // a reader gets "table does not exist" instead of an empty result. They
+    // are not alone in that — §12.8(g) of the rule file records the same for
+    // the other retained REST tables, and re-homing a DDL caller into a
+    // surviving boot step is a decision that belongs to whoever decides how
+    // long the frozen history is kept queryable, not to this removal.
 
     // --- Seal-writer (installs the process-wide global_seal_sender) ---
     spawn_seal_writer_loop(&config.questdb);
@@ -3900,8 +3878,15 @@ async fn build_shared_infra(
             &config.market_ram_store,
             config.rest_candle_fold.catchup_days,
         );
-        let _ram_store_rehydrate =
-            tickvault_app::market_ram_store_boot::spawn_chain_day_rehydrate(config.questdb.clone());
+        // The chain-day rehydrate spawn was REMOVED 2026-09-16: it read
+        // today's rows back out of the per-minute option-chain table, whose
+        // WRITER went with the market-data REST legs
+        // (`no-rest-except-live-feed-2026-06-27.md` §12.10). Leaving it would
+        // have replayed the last pre-removal session into RAM on every boot
+        // as though it were today's — the §12.6 "reader pointed at a frozen
+        // table" REJECT. The chain-day store still installs and still fills
+        // forward from live publishes; what it no longer does is start a
+        // restarted session with anything behind it.
         let _ram_store_stats = tickvault_app::market_ram_store_boot::spawn_ram_store_stats_task();
         info!(
             spot_days = config.market_ram_store.spot_days,
@@ -4352,11 +4337,9 @@ async fn run_process_runloop(
         class: shutdown_class,
     });
 
-    // Cadence runner graceful teardown (verifier F2, 2026-07-15): the
-    // spawn's Notify previously parked unnotified in a `_cadence_shutdown`
-    // binding — the runner never saw a graceful shutdown. No-op when the
-    // scheduler is disabled / never spawned.
-    tickvault_app::cadence_boot::notify_cadence_shutdown();
+    // Cadence runner graceful teardown: REMOVED 2026-09-16 with the
+    // scheduler itself (`no-rest-except-live-feed-2026-06-27.md` §12.10).
+    // Nothing is left to notify.
 
     // Second Ctrl+C → force exit.
     tokio::spawn(async {

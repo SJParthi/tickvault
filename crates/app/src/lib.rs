@@ -37,40 +37,19 @@ pub mod calendar_staleness;
 // BruteX↔TickVault daily cross-verify (BRUTEX-XVERIFY, 2026-07-12): the
 // 15:50 IST I/O shell — S3 CSV fetch, QuestDB reads, compare orchestration,
 // persistence, Telegram summary + supervised spawn (Unit 7).
-// Judge-locked cadence scheduler boot wiring (2026-07-14): config-gated
-// dual-spawn of the supervised per-minute fire scheduler (dry-run
-// executors both lanes day 1 — no REST caller). Runbook:
-// `.claude/rules/project/cadence-error-codes.md`.
-pub mod cadence_boot;
-pub(crate) mod cadence_escalation;
 /// Cross-fill visibility (operator 2026-07-20): audit-channel consumer +
 // Boot-time candle-table DDL + retired-object sweep (Track A, 2026-07-18):
 // re-homes the pre-#1522 drop-legacy → ensure-candles → named-views chain
 // behind a bounded quiet probe; awaited from `build_shared_infra` BEFORE
 // the seal-writer spawn (the fresh-volume no-DEDUP fix).
 pub mod candle_ddl_boot;
-/// Real Dhan cadence executor — limiter-free, gate-pacing honored (the runner
-/// pre-acquires gates; this executor issues ONE bounded request per call).
-pub mod dhan_cadence_executor;
 // Phase 0 Item 20 (wired 2026-06-13): supervised 15:25 IST orphan-position
 // watchdog — daily open-position safety gate (alert-only in sandbox/dry-run).
 pub mod orphan_position_watchdog_boot;
 // Operator task DHAN-REST-400 (2026-06-10): scheduled REST-health canary —
 // GET /v2/profile at 09:05 / 12:00 / 15:25 IST, pages HIGH with the captured
 // (bounded, secret-redacted) body + final URL on any non-2xx.
-// Per-minute spot 1m REST pipeline (operator grant 2026-07-12, PR-2 — the
-// SPOT half): fetch each just-closed session minute's official 1m OHLCV
-// for the 3 IDX_I spot indices via POST /v2/charts/intraday and persist to
-// the `spot_1m_rest` table (SPOT1M-01/02).
 pub mod seal_loss_alarm;
-pub mod spot_1m_rest_boot;
-// Per-minute option-chain REST pipeline (operator grant 2026-07-12, PR-3 —
-// the OPTION-CHAIN half; config-gated DEFAULT-OFF pending the live
-// entitlement probe): day-start expirylist warmup, then each session
-// minute — sequenced right after the spot leg — pull the current-expiry
-// chain for the 3 underlyings via POST /v2/optionchain and persist to the
-// `option_chain_1m` table (CHAIN-01..04).
-pub mod option_chain_1m_boot;
 // Dual-feed scoreboard PR-A (operator 2026-07-10): boot-time process-death
 // reconciler + the 15:45 IST daily Dhan-vs-Groww aggregation + the Telegram
 // scorecard summary (SCOREBOARD-01 family).
@@ -126,18 +105,6 @@ pub mod depth_unsubscribe_probe;
 /// rider (2026-07-15 live-feed retirement re-home of the activation daily
 /// build loop + the sole persist_groww_instruments caller).
 pub mod dhan_contract_universe;
-/// Dhan runtime activation watcher (PR-2) — dormant supervisor that keeps the
-/// Dhan lane's running flag honest across runtime toggles and enforces the
-/// Dhan-disable safety gate at the supervisor layer (operator 2026-06-21/24).
-/// Shared self-tuning Dhan Data-API rate limiter (operator pacing
-/// directive 2026-07-14): ONE process-wide token-bucket gate every
-/// per-minute Dhan Data-API REST fire passes through — spot-1m fires +
-/// ladder re-polls + the 15:33:30 sweep + the #1524 diagnostic probes +
-/// the option-chain fires — 3 rps default, self-tuning down to the 2 rps
-/// floor on observed 429 bursts. Dhan-ONLY; Groww untouched.
-/// (`dhan_activation` — the lane cold-start watcher that preceded this
-/// decl — was deleted in PR-C2 with the Dhan live-WS lane.)
-pub mod dhan_data_api_limiter;
 pub mod dhan_depth_universe;
 /// Dhan 16-connection live-feed stack — boot wiring, DEFAULT-OFF behind BOTH
 /// `[feeds] dhan_enabled` and the `TICKVAULT_DHAN_LIVE_FEED=1` environment
@@ -152,14 +119,7 @@ pub mod dhan_feed_stack;
 /// Dhan live-WS retirement (the spot-1m legs must outlive the cross-verify
 /// module the Phase C deletion PRs remove). Pure move, zero behavior change.
 pub mod dhan_intraday_parse;
-/// Daily 15:31 IST Dhan LIVE-vs-REST cross-verification comparator — the
-/// revived Dhan live feed's ONLY ground truth (the wire carries no sequence
-/// number and no snapshot-on-subscribe, so Dhan's own 1m tape is the only
-/// packet-loss proxy). Integer-paise OHLC compare, quantified noise profile,
-/// and a `blind` outcome that makes a zero-comparison run structurally
-/// incapable of reading as a pass — the PR #1474 blind-since-birth lesson.
 pub mod dhan_lifecycle;
-pub mod dhan_live_crossverify;
 pub mod dhan_live_universe;
 /// 🔷 DHAN order-update PAPER-MODE push consumer (operator directive
 /// 2026-07-16; governance on PR #1597): receive-only broadcast consumer

@@ -124,10 +124,13 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
         "tv_candle_rows_out_of_window_refused_total",
         "logged, and the guard cannot see it — same const -> struct field -> method chain as the two rows below and as tv_dhan_feed_ingest_seq_refused_total. The emit is `counter.increment(1)` on a pre-resolved handle held in a CandleOutOfWindowCounters field; the throttled `warn!` (code=STORAGE-GAP-01, powers of two) sits on the next lines of the same `note()` body. VERIFIED 2026-09-05 by running this guard, not by reading the code. Carries NO `feed` label, unlike its tick and depth siblings: ShadowCandleWriter is feed-agnostic and `row.feed` varies per row, so a per-row labelled handle would drop `metrics::counter!` to its allocating arm on the seal path — the record_ws_lag class of defect, which cost 36M allocations/hour the last time it shipped. NOT EMF-shipped, deliberately: this counter measures the gate WORKING, so a series would chart normal behaviour rather than a defect, and an EMF name costs ~0.30 USD/mo against a September forecast of 130.39 with the automatic STOP_EC2_INSTANCES line at 135.00 — 4.61 of margin, and the noise lock's standing rule is that the next addition arrives with a LEVER, not a cost note. This change carries no lever.",
     ),
-    (
-        "tv_chain1m_rows_discarded_total",
-        "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
-    ),
+    // REMOVED 2026-09-16: `tv_chain1m_rows_discarded_total` — the counter no
+    // longer exists. Its `discard_pending()` lived in
+    // `option_chain_1m_persistence.rs`, deleted whole by the operator's
+    // SOCKETS-ONLY directive (`no-rest-except-live-feed-2026-06-27.md` §12,
+    // narrowed by §12.10 to MARKET DATA + VERIFICATION). An exemption for a
+    // counter that cannot emit asserts a pending decision that deletion has
+    // already made — the stale-row false-OK this guard's own message names.
     (
         "tv_depth_rows_out_of_window_refused_total",
         "logged, and the guard cannot see it — identical chain to tv_ticks_out_of_window_refused_total below (they share OutOfWindowCounters::note, which carries the throttled `warn!`). Recorded as its own row rather than left to an accidental pass: until 2026-09-05 the counter const was spelled at three struct-literal sites, which put it nine lines above the `error!` in the ILP-connect failure arm, and this guard reported the counter reachable on the strength of a log about a completely different event. The const is now named once, in `depth_out_of_window_counters`, so the verdict is honest. Its reason vocabulary says `arrival_*`, not `ts_*`, because market_depth has exactly ONE clock — the designated `ts` IS the receipt instant, the depth protocol carries no exchange timestamp at all. NOT EMF-shipped for the same reason and at the same cost as the row below.",
@@ -147,26 +150,27 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
         "tv_dhan_feed_seals_dropped",
         "gauge twin — VERIFIED 2026-08-12: this is the session GAUGE (SEALS_DROPPED_GAUGE, set once per drain in run_frame_drain). Its COUNTER twin tv_dhan_feed_seals_dropped_total IS in the EMF selector, so the loss itself is shipped and alarmable; the gauge is the same number in instantaneous form and shipping both would double-bill one signal.",
     ),
-    (
-        "tv_dhan_live_xverify_audit_rows_discarded_total",
-        "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
-    ),
+    // REMOVED 2026-09-16: `tv_dhan_live_xverify_audit_rows_discarded_total` —
+    // same shape as the chain row above. Its writer was
+    // `dhan_live_crossverify_persistence.rs`, deleted with the 15:41
+    // cross-verification (§12.10.3: NOTHING replaces the verification floor —
+    // the honest loss is recorded there, not exempted here).
     // REMOVED 2026-08-14: `tv_dhan_ws_dial_failed_total` is now in the EMF
     // selector. This is the counter that would have made the 2026-08-12
     // blackout visible — 12 consecutive HTTP 400 dial failures that reached
     // only the log sink. "Logged" was never an adequate exemption for it.
-    (
-        "tv_groww_chain1m_rows_discarded_total",
-        "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
-    ),
+    // REMOVED 2026-09-16: `tv_groww_chain1m_rows_discarded_total` — the Groww
+    // legs shared the FEED-GENERIC chain writer, so this counter died with
+    // `option_chain_1m_persistence.rs` in the same deletion. (The Groww FEED
+    // itself was retired 2026-08-21; this row outlived it because the writer
+    // was feed-generic and survived until now.)
     (
         "tv_groww_contract1m_rows_discarded_total",
         "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
     ),
-    (
-        "tv_groww_spot1m_rows_discarded_total",
-        "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
-    ),
+    // REMOVED 2026-09-16: `tv_groww_spot1m_rows_discarded_total` — same
+    // feed-generic writer story as the chain row above, in
+    // `spot_1m_rest_persistence.rs`.
     (
         "tv_mark_forward_dropped_total",
         "heartbeat — reported by the order-runtime reconcile heartbeat, not at the emit site (the DHAT budget there forbids a log line)",
@@ -183,10 +187,11 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
         "tv_pnl_audit_rows_discarded_total",
         "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
     ),
-    (
-        "tv_spot1m_rows_discarded_total",
-        "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). All 11 of this family verified 2026-08-12; the Err-context arms were found by spot-check after the first wording claimed only error!-or-bail!",
-    ),
+    // REMOVED 2026-09-16: `tv_spot1m_rows_discarded_total` — the Dhan half of
+    // the same deleted `spot_1m_rest_persistence.rs` writer. The `rest_spot_1m`
+    // TABLE and every row in it are RETAINED (§12.10.1 keeps the data; only the
+    // writer goes), so nothing here is a data decision — the counter simply has
+    // no site left to emit from.
     (
         "tv_spot_price_store_refused_total",
         "logged, and the guard cannot see it — the emit is `counter!(REFUSED_COUNTER).absolute(..)` inside `SpotPriceStore::publish_metrics`, the periodic fold that re-states every tally as an ABSOLUTE value from the 30-second drain arm, so the counter is published far from the site that increments the tally. The refusal itself is logged at that site: `record()` fires a coded `error!` (code=WS-GAP-03, source=spot_price_store_full, throttled to powers of two — noise-lock §2.3v) the moment a NEW instrument is refused past MAX_TRACKED_INSTRUMENTS, and the count is also carried on the drain's periodic summary line via `refusals()`. Recorded 2026-09-08 as its own row rather than by moving the log next to the absolute publish, which would log a running total every 30 s instead of the event. NOT EMF-shipped: the live spot universe is ~869 against a 25,000 cap, so the refusal needs the universe to grow ~29x first — which `dhan-contract-universe-failed` and the universe-collapse alarm already page on — and an EMF name is ~0.30 USD/mo against a September forecast of 142.24 with the automatic STOP_EC2_INSTANCES line at 135.00.",

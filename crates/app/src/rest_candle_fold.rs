@@ -111,11 +111,31 @@ use tickvault_common::constants::{MARKET_CLOSE_IST_NANOS, MARKET_OPEN_IST_NANOS}
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
 use tickvault_common::types::SecurityId;
-use tickvault_storage::spot_1m_rest_persistence::SPOT_1M_REST_TABLE;
 use tickvault_trading::candles::{BufferedSeal, LiveCandleState, TF_COUNT, TfIndex};
 use tickvault_trading::in_mem::spot_bar_store::{RamBar, SlotKey, spot_bar_store};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
+
+/// The per-minute spot-1m REST capture table.
+///
+/// **RE-HOMED 2026-09-16.** This was
+/// `tickvault_storage::spot_1m_rest_persistence::SPOT_1M_REST_TABLE` until
+/// the per-minute spot-1m REST leg — the table's only WRITER — was removed
+/// under the operator's sockets-only directive
+/// (`no-rest-except-live-feed-2026-06-27.md` §12.10). The persistence module
+/// went with the writer; the **TABLE and every row already in it are
+/// RETAINED**, so the name still has to resolve.
+///
+/// ⚠ The table is FROZEN from 2026-09-16: it holds every row captured up to
+/// that date and gains no new ones. A query against it returns real history
+/// and, for any later trading day, zero rows — which is the correct answer,
+/// not a read failure.
+///
+/// The wire name is `rest_spot_1m`. The old MODULE was called
+/// `spot_1m_rest_persistence`, which is the reverse — a long-standing trap
+/// this repository's own §12.8(a) records, and the reason this const spells
+/// the wire name out rather than deriving it from anything.
+const SPOT_1M_REST_TABLE: &str = "rest_spot_1m";
 
 // ---------------------------------------------------------------------------
 // Constants (all named — no magic numbers; cold-path envelope bounds)
@@ -259,29 +279,26 @@ pub struct ConfirmedBar {
     pub volume: i64,
 }
 
-impl ConfirmedBar {
-    /// Builds a confirmed bar from a parsed [`MinuteCandle`] — the single
-    /// choke point BOTH spot legs use at their persist-confirmed hook
-    /// sites (Dhan fire/sweep + Groww fire/sweep).
-    pub fn from_minute_candle(
-        feed: Feed,
-        security_id: SecurityId,
-        exchange_segment_code: u8,
-        candle: &crate::dhan_intraday_parse::MinuteCandle,
-    ) -> Self {
-        Self {
-            feed,
-            security_id,
-            exchange_segment_code,
-            minute_ts_ist_nanos: candle.minute_ts_ist_nanos,
-            open: candle.open,
-            high: candle.high,
-            low: candle.low,
-            close: candle.close,
-            volume: candle.volume,
-        }
-    }
-}
+// ---- `ConfirmedBar::from_minute_candle`: REMOVED 2026-09-16 ----
+//
+// It converted a parsed `MinuteCandle` into a `ConfirmedBar` and was the
+// single choke point BOTH spot legs used at their persist-confirmed hook
+// sites. Both legs are gone with the per-minute price pulls
+// (`no-rest-except-live-feed-2026-06-27.md` §12.10), so the function had no
+// producer left — dormant code, caught by the pub-fn wiring guard rather
+// than by me, which is the gate working exactly as intended.
+//
+// `ConfirmedBar` ITSELF stays: the fold, the catch-up path, the day map and
+// the repair slots all still use it. Only this constructor lost its subject.
+//
+// ⚠ CASCADE, recorded rather than silently followed: `from_minute_candle`
+// was the ONLY consumer of `MinuteCandle` outside `dhan_intraday_parse`, so
+// that whole module is now producer-less AND consumer-less. It is left in
+// place deliberately — deleting it is a separate, larger step with its own
+// tests, and §12.10.7(g) already records the related open item that
+// `[rest_candle_fold]` (enabled = false) is now an inert reader of a table
+// nothing writes. Both belong in one deliberate decision, not in the tail of
+// this one. Flagging beats a half-done cascade.
 
 static FOLD_BAR_SENDER: OnceLock<mpsc::Sender<ConfirmedBar>> = OnceLock::new();
 

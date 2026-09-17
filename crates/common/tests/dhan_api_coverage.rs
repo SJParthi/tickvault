@@ -1,7 +1,16 @@
 //! Dhan API endpoint coverage tests.
 //!
-//! Verifies the 45 known Dhan API endpoint URLs/path templates: 19
-//! constants-backed paths (18 with LIVE consumers + 1 ORPHAN —
+//! ⚠ RE-BASED 2026-09-16 — 45 → 42, 19 constants → 16. The operator's
+//! SOCKETS-ONLY directive (`no-rest-except-live-feed-2026-06-27.md` §12,
+//! narrowed by §12.10 to MARKET DATA + VERIFICATION) removed the three
+//! market-data REST path constants — `/charts/intraday`, `/optionchain`,
+//! `/optionchain/expirylist` — together with their only senders. The
+//! ORDER surface (api_client.rs, 19 inline templates) is untouched by that
+//! directive, which is why the inline half of every total below is
+//! unchanged and only the constants half moved.
+//!
+//! Verifies the 42 known Dhan API endpoint URLs/path templates: 16
+//! constants-backed paths (15 with LIVE consumers + 1 ORPHAN —
 //! `/charts/historical`, whose consumers were deleted by the merged Phase
 //! C-3 #1569; round-5 truth-sync 2026-07-15, MEASURED by
 //! `test_charts_historical_constant_is_orphaned_post_phase_c3`), 19 inline
@@ -21,7 +30,7 @@
 //! depth infrastructure — the prior header narrated the CONSTANTS
 //! THEMSELVES deleted and counted them nowhere; MEASURED by
 //! `test_depth_ws_url_constants_are_orphaned`), and 4 intentionally
-//! skipped endpoints — 45 in total. Prevents endpoint drift where new
+//! skipped endpoints — 42 in total. Prevents endpoint drift where new
 //! endpoints are added to api_client.rs using inline strings without this
 //! ledger (and its constants) being updated.
 //!
@@ -33,9 +42,8 @@ use std::path::{Path, PathBuf};
 use tickvault_common::constants::{
     // Conditional & Multi Order (1) — 2026-07-14
     DHAN_ALERTS_MULTI_ORDERS_PATH,
-    // Historical data (2)
+    // Historical data (1 — /charts/intraday removed 2026-09-16)
     DHAN_CHARTS_HISTORICAL_PATH,
-    DHAN_CHARTS_INTRADAY_PATH,
     // Funds & margin (3)
     DHAN_FUND_LIMIT_PATH,
     // Authentication (2)
@@ -49,10 +57,6 @@ use tickvault_common::constants::{
     DHAN_MARGIN_CALCULATOR_MULTI_PATH,
     DHAN_MARGIN_CALCULATOR_PATH,
     DHAN_MODIFY_IP_PATH,
-    // Option chain (2) — 2026-07-12 §8 rebuild, consumed by
-    // crates/app/src/option_chain_1m_boot.rs (scheduled pull)
-    DHAN_OPTION_CHAIN_EXPIRYLIST_PATH,
-    DHAN_OPTION_CHAIN_PATH,
     DHAN_PNL_EXIT_PATH,
     DHAN_POSITIONS_CONVERT_PATH,
     DHAN_POSITIONS_PATH,
@@ -77,8 +81,8 @@ use tickvault_common::constants::{
 // Test: All Dhan REST endpoint constants are defined and have correct paths
 // ---------------------------------------------------------------------------
 
-/// Verifies the 19 Dhan REST endpoint path constants in constants.rs, and
-/// that each constant maps to the correct v2 API path. 18 of the 19 have
+/// Verifies the 16 Dhan REST endpoint path constants in constants.rs, and
+/// that each constant maps to the correct v2 API path. 15 of the 16 have
 /// LIVE consumers; `/charts/historical` is ORPHANED (round-5 truth-sync
 /// 2026-07-15: the merged Phase C-3 deletion — #1569, the 2026-07-13
 /// Dhan-lane retirement — removed BOTH former consumers,
@@ -88,12 +92,12 @@ use tickvault_common::constants::{
 ///
 /// Endpoint groups covered:
 /// - Authentication: generateAccessToken, RenewToken
-/// - Historical data: charts/intraday (LIVE — app spot-1m pull),
-///   charts/historical (ORPHANED — constant only, zero consumers since
-///   Phase C-3 #1569)
-/// - Option chain: optionchain, optionchain/expirylist (2026-07-12 §8
-///   rebuild — LIVE consumers in crates/app/src/option_chain_1m_boot.rs,
-///   the per-minute scheduled pull; NOT api_client.rs)
+/// - Historical data: charts/historical only — charts/intraday was
+///   REMOVED 2026-09-16 with the spot-1m pull (ORPHANED — constant only,
+///   zero consumers since Phase C-3 #1569)
+/// - Option chain: NONE — both constants REMOVED 2026-09-16 with the
+///   per-minute chain pull (the 2026-07-12 §8 rebuild is superseded by
+///   §12/§12.10; there was never an api_client.rs sender)
 /// - User profile: profile
 /// - IP management: setIP, modifyIP, getIP
 /// - Portfolio: holdings, positions, positions/convert
@@ -113,13 +117,15 @@ fn test_all_dhan_rest_endpoint_constants_defined() {
     );
 
     // --- Historical data (docs/dhan-ref/05-historical-data.md) ---
-    // charts/intraday: LIVE — sole consumer is
-    // crates/app/src/spot_1m_rest_boot.rs (the §8 per-minute scheduled
-    // pull; APP crate, not core — round-5 attribution truth-sync).
-    assert_eq!(
-        DHAN_CHARTS_INTRADAY_PATH, "/charts/intraday",
-        "POST api.dhan.co/v2/charts/intraday"
-    );
+    // charts/intraday — RETIRED 2026-09-16. DHAN_CHARTS_INTRADAY_PATH
+    // ("/charts/intraday") was asserted here while its sole consumer,
+    // crates/app/src/spot_1m_rest_boot.rs, ran the §8 per-minute spot-1m
+    // pull. Both the constant and that consumer are removed by the
+    // operator's SOCKETS-ONLY directive
+    // (no-rest-except-live-feed-2026-06-27.md §12, narrowed by §12.10).
+    // The sockets carry the same instruments live, so this is a removal of
+    // a duplicate source, not of coverage — but nothing replaces the 15:41
+    // cross-verification it fed, which §12.10.4 records as a real loss.
     // charts/historical: ORPHANED — the merged Phase C-3 deletion (#1569,
     // 2026-07-13 Dhan-lane retirement) removed both former consumers
     // (prev_day_ohlcv_boot.rs + cross_verify_1m_boot.rs); the constant is
@@ -132,20 +138,17 @@ fn test_all_dhan_rest_endpoint_constants_defined() {
         "POST api.dhan.co/v2/charts/historical (ORPHANED — no live sender)"
     );
 
-    // --- Option chain (docs/dhan-ref/06-option-chain.md) ---
-    // Deleted 2026-06-28 with the retired core option_chain subsystem;
-    // REBUILT 2026-07-12 as the app-crate per-minute scheduled pull
-    // (no-rest-except-live-feed-2026-06-27.md §8; [option_chain_1m].enabled
-    // = true in base.toml since 2026-07-13). Consumer:
-    // crates/app/src/option_chain_1m_boot.rs — constants-backed, live.
-    assert_eq!(
-        DHAN_OPTION_CHAIN_PATH, "/optionchain",
-        "POST api.dhan.co/v2/optionchain"
-    );
-    assert_eq!(
-        DHAN_OPTION_CHAIN_EXPIRYLIST_PATH, "/optionchain/expirylist",
-        "POST api.dhan.co/v2/optionchain/expirylist"
-    );
+    // --- Option chain — RETIRED 2026-09-16 ---
+    // DHAN_OPTION_CHAIN_PATH ("/optionchain") and
+    // DHAN_OPTION_CHAIN_EXPIRYLIST_PATH ("/optionchain/expirylist") were
+    // asserted here from the 2026-07-14 review fix until today. Both
+    // constants are DELETED from constants.rs together with their only
+    // sender (crates/app/src/option_chain_1m_boot.rs), per the operator's
+    // SOCKETS-ONLY directive — no-rest-except-live-feed-2026-06-27.md §12,
+    // narrowed by §12.10 to MARKET DATA + VERIFICATION. The §8 grant that
+    // authorized the per-minute chain pull is SUPERSEDED, so re-adding
+    // these asserts requires re-adding the constants, and that requires a
+    // fresh dated operator quote in the rule file FIRST.
 
     // --- User profile (docs/dhan-ref/02-authentication.md) ---
     assert_eq!(
@@ -209,21 +212,23 @@ fn test_all_dhan_rest_endpoint_constants_defined() {
     );
 
     // --- Count verification ---
-    // 19 REST endpoint path constants in constants.rs
+    // 16 REST endpoint path constants in constants.rs
     // (2026-07-14: +1 /alerts/multi/orders — Conditional & Multi Order family;
-    // 2026-07-14 review fix: +2 option-chain constants — they were LIVE since
-    // the 2026-07-12 §8 rebuild but absent from this ledger, which falsely
-    // claimed them "no longer implemented";
     // 2026-07-15 round-5 truth-sync: DHAN_CHARTS_HISTORICAL_PATH stays in the
-    // 19 as a CONSTANTS census entry but is ORPHANED — zero consumers since
-    // the merged Phase C-3 #1569)
+    // census as a CONSTANTS entry but is ORPHANED — zero consumers since
+    // the merged Phase C-3 #1569;
+    // 2026-09-16: −3 — DHAN_CHARTS_INTRADAY_PATH, DHAN_OPTION_CHAIN_PATH and
+    // DHAN_OPTION_CHAIN_EXPIRYLIST_PATH were DELETED from constants.rs with
+    // the market-data REST legs they addressed, per the operator's
+    // SOCKETS-ONLY directive — no-rest-except-live-feed-2026-06-27.md §12,
+    // narrowed by §12.10 to MARKET DATA + VERIFICATION. The 2026-07-14
+    // review fix that ADDED the two option-chain constants to this ledger is
+    // therefore reversed by scope, not by error: they were correctly listed
+    // for as long as they existed.)
     let rest_paths: &[&str] = &[
         DHAN_GENERATE_TOKEN_PATH,
         DHAN_RENEW_TOKEN_PATH,
-        DHAN_CHARTS_INTRADAY_PATH,
         DHAN_CHARTS_HISTORICAL_PATH,
-        DHAN_OPTION_CHAIN_PATH,
-        DHAN_OPTION_CHAIN_EXPIRYLIST_PATH,
         DHAN_USER_PROFILE_PATH,
         DHAN_SET_IP_PATH,
         DHAN_MODIFY_IP_PATH,
@@ -240,8 +245,10 @@ fn test_all_dhan_rest_endpoint_constants_defined() {
     ];
     assert_eq!(
         rest_paths.len(),
-        19,
-        "Expected 19 REST endpoint path constants in constants.rs"
+        16,
+        "Expected 16 REST endpoint path constants in constants.rs (19 → 16 on \
+         2026-09-16 — the three market-data REST paths were removed with \
+         their senders)"
     );
 
     // All paths must start with '/'
@@ -589,9 +596,10 @@ fn test_inline_template_extractor_self_test() {
 /// constants-backed — and `websocket_count = 4` contradicted this file's
 /// own two-WS test):
 ///
-/// * **37 unique endpoint path TEMPLATES** = 19 inline templates built in
+/// * **34 unique endpoint path TEMPLATES** (was 37 until 2026-09-16) =
+///   19 inline templates built in
 ///   api_client.rs (MEASURED below by a source scan of its production
-///   region, pinned against an explicit list) + 19 constants-backed
+///   region, pinned against an explicit list) + 16 constants-backed
 ///   `DHAN_*_PATH` paths from constants.rs − 1 overlap (`/positions` is
 ///   BOTH inline in get_positions AND constants-backed in
 ///   exit_all_positions; the inline retrofit is a flagged follow-up). The
@@ -604,10 +612,10 @@ fn test_inline_template_extractor_self_test() {
 ///   2026-07-15; the prior "core (auth/RenewToken/ip/charts)" attribution
 ///   was wrong for BOTH charts constants: intraday's consumer is the APP
 ///   crate and historical's consumers are deleted).
-/// * **41 per-method REST OPERATIONS** enumerated in the breakdown below
+/// * **39 per-method REST OPERATIONS** (was 41 until 2026-09-16) enumerated below
 ///   (several operations share one path, e.g. PUT/DELETE/GET on
 ///   /orders/{order-id}) — plus exit-all's DELETE reusing the shared
-///   /positions path as a 42nd operation on an already-counted path. The
+///   /positions path as a 40th operation on an already-counted path. The
 ///   operations list scopes the OMS/option-chain/portfolio/funds/control
 ///   families; the auth/ip/charts/profile constants are single-operation
 ///   paths counted on the constants side (charts/historical: ORPHANED —
@@ -617,7 +625,7 @@ fn test_inline_template_extractor_self_test() {
 ///   /pnlExit = 5 method+path operations — matching api_client.rs' 6
 ///   control fns, activate/deactivate sharing POST /killswitch via query
 ///   param. The scalar is now MECHANICAL: the tally assert in the test
-///   body sums the family counts to 41.)
+///   body sums the family counts to 39.)
 ///
 /// The inline templates are MEASURED from the file, so the ledger's
 /// drift-detection purpose is mechanical: a new inline endpoint (or a
@@ -629,17 +637,20 @@ fn test_inline_template_extractor_self_test() {
 /// `extract_inline_url_templates` — human-review territory, not a
 /// mechanical claim.
 ///
-/// The 41 listed operations break down as:
+/// The 39 listed operations break down as:
 /// - Orders (9): place, modify, cancel, order-book, single-order, by-correlation, trade-book, trades-by-order, slicing
 /// - Super orders (4): place, modify, cancel, list
 /// - Forever orders (4): create, modify, delete, list
 /// - Conditional & Multi Order (6): create, modify, delete, get-one, get-all, place-multi (2026-07-14; place-multi is constants-backed)
 /// - EDIS (3): tpin, form, inquire
 /// - Statements (2): ledger, trade-history
-/// - Option chain via constants (2): optionchain, expirylist — core client
-///   deleted 2026-06-28, REBUILT 2026-07-12 as the app-crate per-minute
-///   scheduled pull (crates/app/src/option_chain_1m_boot.rs; counted in the
-///   19 constants, NOT in api_client.rs)
+/// - Option chain via constants (0 — RETIRED 2026-09-16): optionchain +
+///   expirylist were 2 operations until the operator's SOCKETS-ONLY
+///   directive (no-rest-except-live-feed-2026-06-27.md §12, narrowed by
+///   §12.10) removed both constants and their only sender
+///   (crates/app/src/option_chain_1m_boot.rs). The family is kept in this
+///   breakdown at zero rather than deleted, so the drop from 41 to 39 is
+///   visible in the list and not merely in the scalar.
 /// - Portfolio (3): holdings + positions/convert via constants;
 ///   get-positions builds INLINE `/positions` (round-3 truth-sync — the
 ///   prior "via constant" label was wrong for this one; exit-all is the
@@ -654,26 +665,27 @@ fn test_inline_template_extractor_self_test() {
 ///   get_kill_switch_status; configure_pnl_exit / stop_pnl_exit /
 ///   get_pnl_exit_status). The round-3 per-path "2" contradicted both.
 /// - Exit-all (DELETE /positions) reuses DHAN_POSITIONS_PATH — a distinct
-///   operation on a path already inside the 37 (asserted below, not part
-///   of the 41-item list)
+///   operation on a path already inside the 34 (asserted below, not part
+///   of the 39-item list)
 ///
-/// Total unique path templates: 19 (constants — incl. /alerts/multi/orders
-/// added 2026-07-14 and the 2 option-chain constants, live since the
-/// 2026-07-12 §8 rebuild) + 19 (inline in api_client.rs, MEASURED) − 1
-/// (the /positions overlap) = 37
+/// Total unique path templates: 16 (constants — incl. /alerts/multi/orders
+/// added 2026-07-14; the 2 option-chain constants and /charts/intraday were
+/// REMOVED 2026-09-16 with the market-data REST legs) + 19 (inline in
+/// api_client.rs, MEASURED — UNCHANGED, the order surface is untouched) − 1
+/// (the /positions overlap) = 34
 /// Plus 2 LIVE WebSocket URLs (the two-WS lock —
 /// `test_all_websocket_urls_defined`
-/// in THIS file; the round-2 scalar 4 contradicted it) = 39 implemented
+/// in THIS file; the round-2 scalar 4 contradicted it) = 36 implemented
 /// URLs/templates — of which `/charts/historical` is ORPHANED (constant
 /// retained, ZERO consumers since the merged Phase C-3 #1569 — round-5
-/// truth-sync 2026-07-15), so 38 have live senders/consumers today.
+/// truth-sync 2026-07-15), so 35 have live senders/consumers today.
 /// Plus 2 ORPHANED depth WebSocket URL constants (round-8 truth-sync
 /// 2026-07-15: `DHAN_TWENTY_DEPTH_WS_BASE_URL` +
 /// `DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL` — retained pub consts, ZERO
 /// consumers since PR #4; NOT in the live websocket_count, which the
 /// two-WS lock pins at 2 CONNECTIONS; measured by
 /// `test_depth_ws_url_constants_are_orphaned`).
-/// Grand ledger total: 45 = 39 implemented + 2 orphaned depth WS
+/// Grand ledger total: 42 = 36 implemented + 2 orphaned depth WS
 /// constants + 4 intentionally skipped
 #[test]
 fn test_oms_inline_endpoint_paths_documented() {
@@ -770,15 +782,19 @@ fn test_oms_inline_endpoint_paths_documented() {
         "Statements: 2 endpoint operations"
     );
 
-    // --- Option chain — deleted 2026-06-28, REBUILT 2026-07-12 (§8) ---
-    // The core option_chain REST client (crates/core/src/option_chain/) was
-    // deleted with the retired subsystem (operator directive 2026-06-28).
-    // A NEW per-minute scheduled-pull surface was authorized 2026-07-12
-    // (no-rest-except-live-feed-2026-06-27.md §8) and is LIVE: constants
-    // DHAN_OPTION_CHAIN_PATH + DHAN_OPTION_CHAIN_EXPIRYLIST_PATH are
-    // consumed by crates/app/src/option_chain_1m_boot.rs (enabled in
-    // base.toml since 2026-07-13). Both are counted in the 19
-    // constants-backed endpoints above — there is NO api_client.rs sender.
+    // --- Option chain — RETIRED 2026-09-16 (was: deleted 2026-06-28,
+    //     REBUILT 2026-07-12 §8) ---
+    // The per-minute scheduled chain pull authorized by
+    // no-rest-except-live-feed-2026-06-27.md §8 is REMOVED by the same
+    // file's §12 SOCKETS-ONLY directive (narrowed by §12.10 to MARKET DATA
+    // + VERIFICATION): both its constants (DHAN_OPTION_CHAIN_PATH,
+    // DHAN_OPTION_CHAIN_EXPIRYLIST_PATH) and its only sender
+    // (crates/app/src/option_chain_1m_boot.rs) are gone, so the family
+    // contributes 0 constants and 0 operations. There was never an
+    // api_client.rs sender, so the inline census below is UNCHANGED.
+    // Re-authorizing a chain pull restores the constants, this block, the
+    // option_chain_ops term and all four totals in one PR — the §8 grant
+    // is superseded, not silently reusable.
 
     // --- Exit all positions ---
     // Uses DELETE on DHAN_POSITIONS_PATH (/positions), already counted above.
@@ -808,7 +824,15 @@ fn test_oms_inline_endpoint_paths_documented() {
          (9 orders + 4 super + 4 forever + 6 conditional/multi + 3 EDIS + \
          2 statements)"
     );
-    let option_chain_ops: usize = 2; // POST optionchain + POST expirylist (app-crate consumer)
+    // ⚠ 2026-09-16 — the option-chain family is RETIRED, so this term is 0.
+    // It counted POST /optionchain + POST /optionchain/expirylist, whose
+    // constants AND whose only sender (the per-minute scheduled pull) were
+    // removed by the operator's SOCKETS-ONLY directive
+    // (no-rest-except-live-feed-2026-06-27.md §12/§12.10). The binding is
+    // KEPT at 0 rather than deleted so the tally still reads as a sum of
+    // named families: a future re-authorized chain pull sets this back to 2
+    // and moves the assert with it, in one visible diff.
+    let option_chain_ops: usize = 0;
     let portfolio_ops: usize = 3; // GET holdings + GET positions (inline) + POST convert
     let funds_margin_ops: usize = 3; // POST margincalculator + POST …/multi + GET fundlimit
     let traders_control_ops: usize = 5; // POST/GET killswitch + POST/DELETE/GET pnlExit
@@ -818,10 +842,11 @@ fn test_oms_inline_endpoint_paths_documented() {
         + funds_margin_ops
         + traders_control_ops;
     assert_eq!(
-        per_method_operations, 41,
-        "41 per-method REST operations across the scoped families — plus \
-         exit-all's DELETE /positions as the 42nd operation on an \
-         already-counted path (asserted above)"
+        per_method_operations, 39,
+        "39 per-method REST operations across the scoped families (41 → 39 \
+         on 2026-09-16: the 2 option-chain operations retired with their \
+         constants) — plus exit-all's DELETE /positions as the 40th \
+         operation on an already-counted path (asserted above)"
     );
 
     // --- Inline template census (MEASURED — round-3 fix 2026-07-14) ---
@@ -880,14 +905,26 @@ fn test_oms_inline_endpoint_paths_documented() {
     );
 
     // --- Grand total (every scalar reproducible from this file) ---
-    // 19 constants-backed REST endpoints (pinned by
+    // ⚠ RE-BASED 2026-09-16 — 19 → 16 constants, 45 → 42 total. The
+    //   operator's SOCKETS-ONLY directive
+    //   (no-rest-except-live-feed-2026-06-27.md §12, narrowed by §12.10 to
+    //   MARKET DATA + VERIFICATION) removed the three market-data REST
+    //   path constants and their only senders:
+    //     DHAN_CHARTS_INTRADAY_PATH          (spot-1m per-minute pull)
+    //     DHAN_OPTION_CHAIN_PATH             (per-minute chain pull)
+    //     DHAN_OPTION_CHAIN_EXPIRYLIST_PATH  (day-start expiry list)
+    //   Every number below moved by exactly 3, and each is derived here
+    //   rather than restated, so a wrong re-base fails instead of reading
+    //   plausible.
+    // 16 constants-backed REST endpoints (pinned by
     //   test_all_dhan_rest_endpoint_constants_defined; incl.
-    //   /alerts/multi/orders 2026-07-14 + the 2 option-chain constants,
-    //   live since the 2026-07-12 §8 rebuild; /charts/historical is
-    //   ORPHANED — constant retained, zero consumers since Phase C-3
-    //   #1569, measured by
-    //   test_charts_historical_constant_is_orphaned_post_phase_c3)
-    // + 19 inline templates in api_client.rs (MEASURED above)
+    //   /alerts/multi/orders 2026-07-14; /charts/historical is ORPHANED —
+    //   constant retained, zero consumers since Phase C-3 #1569, measured
+    //   by test_charts_historical_constant_is_orphaned_post_phase_c3)
+    // + 19 inline templates in api_client.rs (MEASURED above — UNCHANGED:
+    //   the removal touched only constants-backed market-data paths, and
+    //   api_client.rs is the ORDER surface, which this directive does not
+    //   touch)
     // − 1 overlap (/positions: inline get_positions + constants exit-all)
     // + 2 WebSocket endpoints (the two-WS lock —
     //   test_all_websocket_urls_defined; the round-2 scalar 4 contradicted
@@ -901,7 +938,7 @@ fn test_oms_inline_endpoint_paths_documented() {
     //   test_depth_ws_url_constants_are_orphaned. Deliberately NOT in the
     //   LIVE websocket_count — the two-WS lock pins 2 CONNECTIONS forever,
     //   and depth re-introduction requires a scope-lock rule edit FIRST.)
-    let constants_rest_count: usize = 19;
+    let constants_rest_count: usize = 16;
     let inline_template_count = inline_templates.len();
     let overlap_paths: usize = 1; // "/positions"
     let websocket_count: usize = 2;
@@ -910,15 +947,15 @@ fn test_oms_inline_endpoint_paths_documented() {
 
     let unique_path_templates = constants_rest_count + inline_template_count - overlap_paths;
     assert_eq!(
-        unique_path_templates, 37,
-        "37 unique endpoint path templates (19 constants + 19 measured \
+        unique_path_templates, 34,
+        "34 unique endpoint path templates (16 constants + 19 measured \
          inline − the /positions overlap)"
     );
 
     let total_implemented = unique_path_templates + websocket_count;
     assert_eq!(
-        total_implemented, 39,
-        "39 implemented endpoint URLs/templates (37 unique path templates \
+        total_implemented, 36,
+        "36 implemented endpoint URLs/templates (34 unique path templates \
          + 2 WebSocket URLs; incl. the ORPHANED /charts/historical — \
          constant retained, zero consumers since Phase C-3 #1569)"
     );
@@ -927,8 +964,8 @@ fn test_oms_inline_endpoint_paths_documented() {
     // skipped = total Dhan API endpoints known
     let total_known = total_implemented + orphaned_depth_ws_constant_count + skipped_count;
     assert_eq!(
-        total_known, 45,
-        "45 total known Dhan API endpoint URLs/templates (39 implemented + \
+        total_known, 42,
+        "42 total known Dhan API endpoint URLs/templates (36 implemented + \
          2 orphaned depth WS constants + 4 skipped)"
     );
 }
@@ -979,10 +1016,7 @@ fn test_path_constants_are_paths_not_full_urls() {
     let paths: &[&str] = &[
         DHAN_GENERATE_TOKEN_PATH,
         DHAN_RENEW_TOKEN_PATH,
-        DHAN_CHARTS_INTRADAY_PATH,
         DHAN_CHARTS_HISTORICAL_PATH,
-        DHAN_OPTION_CHAIN_PATH,
-        DHAN_OPTION_CHAIN_EXPIRYLIST_PATH,
         DHAN_USER_PROFILE_PATH,
         DHAN_SET_IP_PATH,
         DHAN_MODIFY_IP_PATH,

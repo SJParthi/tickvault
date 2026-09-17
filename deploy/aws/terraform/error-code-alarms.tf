@@ -388,71 +388,44 @@ locals {
       ok_recovery = false # 2026-07-14: once-per-episode mint failure - the retry-once latch holds, so the token stays dead for the session; auto-OK ~15 min later would be a Rule-11 false recovery
       desc        = "AUTH-GAP-05 forced re-mint FAILED: the mid-session watchdog detected a sustained dead Dhan token, issued its ONE forced re-mint for the episode, and the mint FAILED (permanent=true = a peer holds the dual-instance lock in-flight; permanent=false = mint HTTP/TOTP failure) - the token stays DEAD for the rest of the session (the retry-once latch holds; the 4h sweep backstop is lane-only per audit GAP-02). Successful self-heal re-mints deliberately do NOT page (trigger arm unmatched - silent-when-healing), and cooldown_skip=true mint-cooldown skips are excluded (non-terminal; the next re-arm window retries). NO recovered/OK page: recovery signal = tv_token_valid back to 1 / the next clean profile cycle. Runbook: .claude/rules/project/wave-4-error-codes.md (AUTH-GAP-05)"
     }
-    # SPOT1M-01 escalation edge (added 2026-07-14 — REST-audit GAP-03):
-    # the per-minute Dhan spot-1m REST leg (until 2026-08-21 the Groww spot +
-    # Groww contract legs emitted SPOT1M-01 too; they left with the Groww
-    # feed) pages HIGH via app Telegram at the
-    # 3-consecutive-fully-failed-minutes edge; this filter is the CW
-    # backstop for exactly that edge. Stage-scoped: stage="escalation" is
-    # the ONCE-per-episode edge line (edge-latched, re-armed only after a
-    # fetch+persist-clean minute); the per-minute stage="minute_failed" /
-    # "boundary_skipped" / etc. lines fire every failed minute and are
-    # sub-edge by design — a plain code filter would over-page vs the
-    # designed 3-minute escalation (rest-1m-pipeline-error-codes.md §1).
-    "spot1m-01-escalation" = {
-      pattern     = "{ $.code = \"SPOT1M-01\" && $.level = \"ERROR\" && $.stage = \"escalation\" }"
-      period      = 300
-      threshold   = 1
-      eval        = 3
-      dta         = 1
-      ok_recovery = false # 2026-07-14: once-per-episode edge - the recovery signal is the leg's own typed Info recovery Telegram / rows landing again, not the datapoint aging out
-      desc        = "SPOT1M-01 escalation: the per-minute Dhan REST 1m spot candle leg (the Groww spot + contract legs were removed 2026-08-21 with the Groww feed; the feed/leg fields in the errors-jsonl stream still name the leg) fully failed 3+ consecutive minutes (persist-gated: fetch-ok-but-lost rows count as failed). Fires once per episode (edge-latched). Triage: cross-check DH-901 (REST surface/token; the REST canary was retired 2026-07-14 with the Dhan noise lock), tv_spot1m_fetch_total outcome rates, QuestDB health for persist-gated episodes. NO recovered/OK page: recovery = the leg's typed recovery Telegram + rows landing again. Runbook: .claude/rules/project/rest-1m-pipeline-error-codes.md"
-    }
-    # CHAIN-02 escalation edge (added 2026-07-14 — REST-audit GAP-03):
-    # same contract as spot1m-01-escalation for the option-chain legs
-    # (Dhan only since 2026-08-21). stage="escalation" only — per-minute
-    # sub-edge lines deliberately unmatched.
-    "chain-02-escalation" = {
-      pattern     = "{ $.code = \"CHAIN-02\" && $.level = \"ERROR\" && $.stage = \"escalation\" }"
-      period      = 300
-      threshold   = 1
-      eval        = 3
-      dta         = 1
-      ok_recovery = false # 2026-07-14: once-per-episode edge - same rationale as spot1m-01-escalation
-      desc        = "CHAIN-02 escalation: the per-minute Dhan option-chain REST leg (the Groww chain leg was removed 2026-08-21 with the Groww feed) fully failed 3+ consecutive minutes (persist-gated). Fires once per episode (edge-latched). Triage: spot leg healthy + chain failing = chain-API-surface problem (entitlement wobble short of CHAIN-01, gateway); both failing = REST/token (AUTH-GAP runbooks). NO recovered/OK page: recovery = the typed ChainFetchRecovered Telegram + rows landing again. Runbook: .claude/rules/project/rest-1m-pipeline-error-codes.md"
-    }
-    # CHAIN-01 (added 2026-07-14 — REST-audit GAP-03): entitlement absent.
-    # Plain coded filter is safe: BOTH stages (warmup = day-down at boot,
-    # mid_session = revoked intra-day) fire ONCE per day/episode and are
-    # page-worthy; the probe-only path never emits CHAIN-01 (info!-level
-    # verdict only — verified 2026-07-14, option_chain_1m_boot.rs).
-    "chain-01" = {
-      pattern     = "{ $.code = \"CHAIN-01\" && $.level = \"ERROR\" }"
-      period      = 300
-      threshold   = 1
-      eval        = 3
-      dta         = 1
-      ok_recovery = false # 2026-07-14: once-per-day emitter - the entitlement stays absent when the datapoint ages out (Rule-11 false-recovery)
-      desc        = "CHAIN-01: Dhan Option Chain Data-API entitlement ABSENT (DH-902/806 class) - the chain pipeline is DOWN for the day (warmup stage) or was revoked mid-session (mid_session stage). Operator action: verify the account's Data-API plan on the Dhan portal; restoring the entitlement auto-resumes at the next trading-day boot. NO recovered/OK page: the entitlement does not return when the episode ages out. Runbook: .claude/rules/project/rest-1m-pipeline-error-codes.md"
-    }
-    # CHAIN-04 warmup arm (added 2026-07-14 — REST-audit GAP-03): the
-    # day-start expirylist warmup exhausted its bounded retries — the
-    # chain pipeline is DOWN FOR THE DAY (expiries are never guessed).
-    # Stage-scoped to "warmup" ONLY: the probe_client_build /
-    # probe_no_token / probe_inconclusive / probe_task_exit /
-    # warmup_no_token stages are log-only-by-design transient/respawn
-    # arms (warmup_no_token REPEATS every ~30s supervisor respawn until a
-    # token exists — the AUTH-GAP runbooks own the token page); a plain
-    # code filter would page on all of them.
-    "chain-04-warmup" = {
-      pattern     = "{ $.code = \"CHAIN-04\" && $.level = \"ERROR\" && $.stage = \"warmup\" }"
-      period      = 300
-      threshold   = 1
-      eval        = 3
-      dta         = 1
-      ok_recovery = false # 2026-07-14: once-per-day emitter - the day stays chain-less when the datapoint ages out; recovery = the next trading-day boot's clean warmup
-      desc        = "CHAIN-04 warmup FAILED: the day-start option-chain expirylist warmup exhausted its bounded retries - the chain pipeline is DOWN FOR THE DAY (expiry dates are never guessed; no mid-day retry by design). Triage: cross-check DH-901 + the WS feed (the REST canary was retired 2026-07-14); a healthy REST surface with only the expirylist failing points at the option-chain API specifically. Restart the app once the REST surface is healthy to re-run the warmup, else tomorrow's boot re-warms. NO recovered/OK page: the day stays down when the datapoint ages out. Runbook: .claude/rules/project/rest-1m-pipeline-error-codes.md"
-    }
+    # ── RETIRED 2026-09-16: the four per-minute REST-leg filters ──────────
+    #
+    # `spot1m-01-escalation`, `chain-02-escalation`, `chain-01` and
+    # `chain-04-warmup` lived here. Each was the CloudWatch backstop for a
+    # coded error emitted by the per-minute Dhan spot-1m / option-chain REST
+    # pulls (`spot_1m_rest_boot.rs`, `option_chain_1m_boot.rs`, and the
+    # cadence executor that later re-fired the same HTTP).
+    #
+    # Those legs were REMOVED on 2026-09-16 under the operator's sockets-only
+    # directive — "Bro just remove per minute price falls and 3.41 pm accuracy
+    # check alone dude okay" (`no-rest-except-live-feed-2026-06-27.md` §12.10).
+    # SPOT1M-01, CHAIN-01, CHAIN-02 and CHAIN-04 now have ZERO emit sites
+    # anywhere in `crates/*/src`, so all four filters could only ever match
+    # nothing.
+    #
+    # ⚠ THEY GO IN THE SAME CHANGE AS THEIR EMIT SITES. A filter whose producer
+    # is gone reads PERMANENTLY GREEN, which is the dead-monitor class this
+    # repository retired twice before (`ws-reinject-01` 2026-07-17,
+    # `tick-conserve-01` 2026-07-18) and the reason §12.6 of the rule file makes
+    # "removes a leg's HTTP while leaving its ALARM in place" an explicit REJECT.
+    #
+    # ⚠ A stale claim these descriptions carried, corrected on the way out: two
+    # of them told the operator to "cross-check DH-901 + the WS feed (the REST
+    # canary was retired 2026-07-14)". That retirement's own rationale was that
+    # "the legs self-detect REST death in ~3-4 min via their own escalation
+    # edges" — the legs are gone, so that reasoning is void. The Dhan REST
+    # surface's health is now covered by the AUTH family above (DH-901,
+    # AUTH-GAP-05) and by the token-health gauge, which is what the auth phases
+    # in `dhan_rest_stack` exist to keep alive: a socket cannot dial without the
+    # JWT those phases produce. Recorded here so the next reader does not chase
+    # a canary that was deleted on a premise that no longer holds.
+    #
+    # Cost: −4 alarms ≈ −$0.40/mo. Their derived metrics were sparse
+    # (dimensionless, billed only in hours a code fired), so the saving is
+    # small and the point is the four green tiles that can no longer mislead.
+    #
+    # The AUTH-GAP-05 entry directly above is UNTOUCHED — its emit site is the
+    # mid-session token watchdog, which `dhan_rest_stack` still spawns.
     # =====================================================================
     # 2026-08-11 — CRITICAL-SEVERITY PAGING GAP (+4 entries -> 15 filters +
     # 15 alarms, ~+$0.40/mo; see aws-budget.md COST NOTE 2026-08-11).
@@ -714,89 +687,44 @@ locals {
       desc        = "WS-GAP-03 universe collapse: the DHAN live feed fell back to the 4-instrument index universe. Either today's master exceeded the authorized capacity envelope, or it produced no usable widening (artifact unreadable, absent or empty). The session is running 4 instruments instead of the authorized ~24,600 - a 99.98% loss of market data - and nothing else reports it: the 4 indices still tick, so the no-ticks alarm stays green and every loss counter reads a healthy zero. Triage from the same log line: capacity vs master_entries at/over the cap means the universe outgrew 25,000 (a vendor option-chain expansion is the usual cause); master_entries 0 means the artifact did not load. Runbook: .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md"
     }
 
-    # 2026-08-25 (operator: "Fix wbrytjonf dude oaku", given in direct response
-    # to a message whose open-items list named this alarm and said it needed his
-    # go — the §2.3f dated authorization, written before this terraform).
+    # ── RETIRED 2026-09-16: the three cross-verify filters ────────────────
     #
-    # The 15:41 live-vs-official cross-verification is the ONLY ground truth the
-    # revived Dhan feed has, and until now neither of its failure verdicts
-    # reached anything: `tv_dhan_feed_xverify_runs_total` is in NEITHER EMF
-    # selector copy, and the error line carries WS-GAP-03, which has ~50 emit
-    # sites in dhan_feed_stack.rs.
+    # `ws-gap-03-xverify-vacuous`, `-failed` and `-diverged` lived here. All
+    # three were CloudWatch metric filters keyed on `$.source`, matching the
+    # three verdicts of the 15:41 live-vs-official cross-verification.
     #
-    # FOUR conditions, not the usual two. `$.level = "ERROR"` excludes the info
-    # arms; the two `$.source` values were added by PR #1808 SPECIFICALLY so
-    # this filter could exist, and they appear on exactly these two emits. A
-    # bare `$.code = "WS-GAP-03"` filter would page on every dial failure and
-    # reconnect — the RISK-GAP-03 noise trap (25 pages in one session) with 50x
-    # the surface, and the same mistake §2.3d-i records being approved and then
-    # caught before it shipped.
+    # That comparison was REMOVED on 2026-09-16 under the operator's
+    # sockets-only directive — "Bro just remove per minute price falls and
+    # 3.41 pm accuracy check alone dude okay", the narrowing quote recorded in
+    # `no-rest-except-live-feed-2026-06-27.md` §12.10. With
+    # `dhan_live_crossverify.rs` deleted there is NO emit site left for any of
+    # the three `$.source` values, so all three filters could only ever match
+    # nothing.
     #
-    # Why a log filter and not a metric: the counter name is 31 bytes and needs
-    # 32 with its separating pipe, against 31 free in the user-data budget
-    # (§2.3d-ii). The EMF route misses by ONE byte; this lane costs none.
+    # ⚠ THEY GO IN THE SAME CHANGE AS THE EMIT SITE, and that is not tidiness.
+    # A filter whose producer is gone reads PERMANENTLY GREEN — the dead-monitor
+    # class this repository has already retired twice (`ws-reinject-01`
+    # 2026-07-17, `tick-conserve-01` 2026-07-18). Three of them at once, on the
+    # one check that told the operator whether the feed's numbers were right,
+    # would be the most reassuring lie on this dashboard.
     #
-    # ok_recovery = false: the comparison runs ONCE per session, so an auto-OK
-    # an hour later means the datapoint aged out, never that anything compared.
-    # SPLIT INTO TWO ENTRIES, deliberately (2026-08-25, same change).
+    # ⚠ WHAT THIS COSTS, stated rather than absorbed: §12.10.4 of the rule file
+    # records it in full — after this change there is ZERO mechanism anywhere in
+    # this workspace that compares captured market data against any external
+    # record. Every remaining signal answers "did the machinery run", never "are
+    # the numbers right". Removing these filters does not create that gap; it
+    # stops the dashboard from implying the gap is watched.
     #
-    # The first draft was ONE entry matching both verdicts with
-    # `($.source = "a" || $.source = "b")`. `terraform plan` accepted it — and
-    # that acceptance means nothing here: the provider treats `pattern` as an
-    # opaque string, so filter-pattern SYNTAX is parsed only by the real
-    # PutMetricFilter call at APPLY time. A malformed pattern would therefore
-    # sail through every PR check and break the post-merge apply lane.
+    # Cost: −3 alarms ≈ −$0.30/mo. Their derived metrics were sparse (billed
+    # only in hours a code fired) and had not fired since the removal, so the
+    # real saving is the three green tiles nobody can now misread.
     #
-    # Two single-condition entries use only the shape already proven live by
-    # ws-gap-03-universe-collapse above. It costs one extra alarm (~$0.10/mo)
-    # and buys better triage anyway: the two verdicts have DIFFERENT causes and
-    # different next steps, so naming them separately tells the operator which
-    # one fired without opening the log.
-    "ws-gap-03-xverify-vacuous" = {
-      pattern     = "{ $.code = \"WS-GAP-03\" && $.level = \"ERROR\" && $.source = \"xverify_vacuous\" }"
-      period      = 3600
-      threshold   = 1
-      eval        = 1
-      dta         = 1
-      ok_recovery = false # runs once per session - an auto-OK means the datapoint aged out, not that the next run compared
-      desc        = "WS-GAP-03 cross-verify VACUOUS: the 15:41 live-vs-official comparison RAN and compared ZERO minutes. This is not a pass with no findings - it is no measurement at all, and a vacuous run rendering as 'no mismatches' is the false-OK class this repo has already retired twice. The comparison is the only ground truth the DHAN live feed has: the one check separating a lane that captures real ticks from one that merely dials. Triage from the same log line: missing_live high means the live lane produced no candles for the window (check tv_dhan_feed_last_tick_age_secs and the no-ticks alarm); missing_rest high means the official REST leg did not serve it (check the spot-1m leg). Runbook: .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md"
-    }
-
-    "ws-gap-03-xverify-failed" = {
-      pattern     = "{ $.code = \"WS-GAP-03\" && $.level = \"ERROR\" && $.source = \"xverify_failed\" }"
-      period      = 3600
-      threshold   = 1
-      eval        = 1
-      dta         = 1
-      ok_recovery = false # runs once per session - an auto-OK means the datapoint aged out, not that the next run ran
-      desc        = "WS-GAP-03 cross-verify FAILED TO RUN: the 15:41 live-vs-official comparison errored out, so the day's captured candles are UNVERIFIED - never assume they are clean. Distinct from the vacuous alarm: that one ran and found nothing to compare; this one did not complete. The comparison is the only ground truth the DHAN live feed has. Triage: the same log line carries the underlying error verbatim in its err field; a token or QuestDB failure is the usual cause. Runbook: .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md"
-    }
-
-    # ADDED 2026-08-28 (noise-lock section 2.3k). The two entries above both
-    # mean "we could not tell you". This one is the only verdict that is an
-    # actual FINDING about the feed - it ran, it measured, and the two records
-    # disagree - and it was the one with no source field and no alarm, logging
-    # at info! among forty fields. The check that exists to say whether the
-    # revived feed is trustworthy could answer NO in a form nothing watched.
-    #
-    # Threshold is HALF the compared price fields, and that bar is deliberate:
-    # a non-zero divergence count is EXPECTED (a sampled live stream and the
-    # vendor's full tape legitimately differ - cross-verify-1m-error-codes.md
-    # section 1 says track the trend, not the count), so paging on any
-    # divergence pages every trading day. No baseline exists for a NORMAL rate,
-    # so 1% or 5% would be a number invented and called a measurement. More
-    # than half is the one claim that holds at any baseline: the two records
-    # are not describing the same market. The app-side gate carries the
-    # arithmetic; this filter only matches the line it emits.
-    "ws-gap-03-xverify-diverged" = {
-      pattern     = "{ $.code = \"WS-GAP-03\" && $.level = \"ERROR\" && $.source = \"xverify_diverged\" }"
-      period      = 3600
-      threshold   = 1
-      eval        = 1
-      dta         = 1
-      ok_recovery = false # runs once per session - an auto-OK means the datapoint aged out, not that the next run agreed
-      desc        = "WS-GAP-03 cross-verify MASS DIVERGENCE: the 15:41 live-vs-official comparison ran and found MORE THAN HALF of the compared price fields disagreeing with Dhan's own record beyond tolerance. That is not sampling noise at any baseline - the captured candles and the vendor tape are not describing the same market, so treat the day's candles as untrustworthy until explained. The other two xverify alarms mean the check could not tell you; this one means it did and the answer is bad. Triage from the same log line: minutes_compared and price_fields_compared are the denominator, cells_diverged the numerator, noise_p95_paise / noise_max_paise say whether it is a small systematic offset (tolerance or rounding) or wholesale (wrong instruments, segment mismatch, clock fault). Runbook: .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md"
-    }
+    # The `ws-gap-03-universe-collapse` filter directly above is UNTOUCHED: its
+    # emit site (`dhan_live_universe.rs`, `$.source = "fell_back_to_indices"`)
+    # is alive, and it is the reason this map still carries a WS-GAP-03 entry at
+    # all. `cloudwatch_app_alarms_wiring.rs` pinned `patterns.len() >= 3` on
+    # WS-GAP-03 precisely because three of the four here were xverify; that
+    # assertion moved to 1 in this same change, with its own dated note.
 
     # ADDED 2026-08-28 (noise-lock section 2.3m). A depth-200 socket that
     # UNSUBSCRIBED its old contract and then failed to subscribe the new one is
