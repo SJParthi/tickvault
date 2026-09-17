@@ -1601,7 +1601,7 @@ quietly skipped:
 
 | Reader | Table | Disposition |
 |---|---|---|
-| `feed_scoreboard_boot.rs` — the REST-leg digest arm | `rest_fetch_audit`, `rest_spot_1m` | **REMOVE** the arm; a permanently-zero REST section in the daily scoreboard is the dead-monitor class |
+| `feed_scoreboard_boot.rs` — the REST-leg digest arm | `rest_fetch_audit`, `rest_spot_1m` | **REMOVE** the arm; a permanently-zero REST section in the daily scoreboard is the dead-monitor class — **DONE 2026-09-17.** The arm, both day queries, `aggregate_rest_leg_day`, the `tv_rest_leg_close_to_data_p99_ms` gauge (LOCAL `/metrics` only, so no alarm or EMF entry is owed), the `main.rs` threading, the `RestLegScoreLine` type + `render_pulls_per_leg` + the two event fields, the `rest_leg_digest_wiring_guard.rs` ratchet and 20 tests are gone; the now-orphaned `SPOT_1M_REST_TABLE` const went with them. Runbook `dual-feed-scoreboard-error-codes.md` §2b carries the dated RETIRED banner, which also corrects §12.9(a)'s "renders 'no data'" — it rendered ABSENCE (`None` → segment omitted), never a fabricated zero. **⚠ What this leaves unwatched:** the daily card no longer answers the operator's 2026-07-13 Quote 2 (*"within how many seconds precisely"*) at all, because there is no per-minute fetch left to time. |
 | `dhan_depth_universe.rs` — the boot `None` fallback | `rest_option_chain_1m` | **REMOVE** (already required by §12.10.7(b) — a fallback that can only return empty is a dead monitor written in code) |
 | `volume_semantics_probe.rs` | `rest_option_chain_1m` | zero production callers, before and after; recorded, not deleted here |
 | `rest_candle_fold.rs` | `rest_spot_1m` | `enabled = false`; §12.10.7(g) already requires it removed or explicitly recorded inert |

@@ -45,9 +45,16 @@ fn production_region(source: &str) -> &str {
     }
 }
 
-fn count_occurrences(haystack: &str, needle: &str) -> usize {
-    haystack.match_indices(needle).count()
-}
+// ---- `count_occurrences` is RETIRED 2026-09-17 ----
+//
+// It backed the EXACT-COUNT assertions of the REST-era pins retired on
+// 2026-09-16 — the shape that catches a SECOND call site appearing, which a
+// bare `contains` cannot see. Orphaned when those pins went, and `-D
+// warnings` rejects it.
+//
+// The rule it served is NOT retired: where a guard means "exactly one call
+// site", it must assert a COUNT, never mere presence. `production_region`
+// above is the other half of that discipline and is still in use.
 
 #[test]
 fn main_rs_spawns_fold_gated_after_seal_writer_install() {

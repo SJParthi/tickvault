@@ -323,6 +323,54 @@ classifier is total (`_ => Indeterminate`, proptest-pinned never-panic).
 
 ## §2b. 2026-07-13 update — REST 1m pull digest rides the daily card (Groww REST plan PR-5)
 
+> **⚠ RETIRED 2026-09-17 — the digest no longer exists, and neither do its
+> two sources.** The operator's SOCKETS-ONLY narrowing removed the
+> per-minute spot-1m and option-chain REST legs
+> (`no-rest-except-live-feed-2026-06-27.md` §12.10 — *"Bro just remove per
+> minute price falls and 3.41 pm accuracy check alone dude okay"*; disposition
+> table §12.11), so **nothing writes `rest_fetch_audit` or `rest_spot_1m`**.
+> A digest left standing would have read two frozen tables every day, found
+> nothing, and rendered a permanently-empty pull section — the dead-monitor
+> class §12.11 names this arm REMOVE for in as many words.
+>
+> **What went with it:** the `RestLegScoreLine` type, `render_pulls_per_leg`,
+> the `rest_legs` / `rest_legs_read_failed` event fields, the
+> `aggregate_rest_leg_day` aggregation and both day queries, the
+> `build_rest_leg_score_lines` threading in `main.rs`, the four
+> `rest_leg_*` SCOREBOARD-01 degrade stages named below, the
+> `tv_rest_leg_close_to_data_p99_ms` gauge (LOCAL `/metrics` only — it was
+> never CloudWatch-shipped, so no alarm or EMF selector entry is owed), and
+> the ratchet `crates/app/tests/rest_leg_digest_wiring_guard.rs` (3 tests),
+> whose entire subject was this wiring.
+>
+> **⚠ A precision correction while retiring it**, because
+> `no-rest-except-live-feed-2026-06-27.md` §12.9(a) says this reader
+> "renders 'no data'": it did not. `render_pulls_per_leg` returned `None`
+> on an empty leg set and the caller OMITTED the segment, so a dead source
+> rendered as ABSENCE, never as a fabricated zero. That distinction is the
+> thing worth carrying forward.
+>
+> **NOT retired — the two rules this section's design turned on**, which
+> still bind every surviving scorecard segment: the `-1`-sentinel
+> omit-never-fabricate convention (an unmeasured field is dropped, never
+> rendered as "?" or 0), and the THREE-STATE verdict mark (green ONLY when
+> every rendered sub-part is both fully counted AND failure-free; warning on
+> a counted failure; NO mark at all when a count is unmeasured, because a
+> green check over an invisible failure is a Rule-11 false-OK).
+>
+> **WHAT THIS LEAVES UNWATCHED, stated rather than implied:** the daily card
+> no longer answers the operator's 2026-07-13 Quote 2 — *"within how many
+> seconds precisely we are fetching this live real OHLCV"* — at all. There
+> is no per-minute fetch left to time. The live socket lane's own freshness
+> surface (`tv_dhan_feed_last_tick_age_secs`, alarmed as
+> `dhan-no-ticks-flowing`) is what answers the nearest surviving question,
+> and it answers a different one: *is data arriving*, not *how late was the
+> minute*.
+
+Contents below are retained as the 2026-07-13 historical record; where they
+conflict with this banner, the banner wins.
+
+
 The 15:45 aggregation gained an ADDITIVE step 6e (operator Quote 2,
 2026-07-13: *"always clearly note within a second — or within how many
 seconds precisely — we are fetching this live real OHLCV, along with the

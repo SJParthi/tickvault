@@ -560,16 +560,6 @@ pub enum NotificationEvent {
         /// race: the verdict says "no contest" instead of declaring a
         /// winner (round-4 hostile review 2026-07-10).
         dhan_feed_off: bool,
-        /// Official minute-candle pull digest lines (Groww REST plan PR-5,
-        /// operator Quote 2 2026-07-13): one plain-English line per
-        /// feed/pull-family answering "within how many seconds precisely"
-        /// with MEASURED numbers. Empty = the digest is not wired for this
-        /// card (older callers / tests) — the section is simply omitted.
-        rest_legs: Vec<RestLegScoreLine>,
-        /// `true` when the day's per-pull records could not be read while
-        /// building this card — the candle-pull lines may under-count or
-        /// read "not measured yet" (honest cause footnote, Rule 11).
-        rest_legs_read_failed: bool,
     },
 
     /// The daily dual-feed scorecard TASK died (panicked / errored) before
@@ -1201,51 +1191,23 @@ pub struct FeedScoreLine {
     pub streaming_minutes: i64,
 }
 
-/// One official-minute-candle pull digest line on the daily scorecard
-/// (Groww REST plan PR-5, operator Quote 2 2026-07-13: *"always clearly
-/// note within a second — or within how many seconds precisely — we are
-/// fetching this live real OHLCV, along with the option chain API"*).
-///
-/// `-1` on any field means "not measured / not recorded" and renders
-/// honestly (never a fabricated zero — audit Rule 11). Every number is
-/// MEASURED from the day's per-pull records — the line never asserts a
-/// freshness it did not observe.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RestLegScoreLine {
-    /// Feed display name ("Dhan" / "Groww").
-    pub feed: String,
-    /// Pull-family display name ("spot candles" / "option chain" /
-    /// "option contracts") — already plain English, never a wire slug.
-    pub leg: String,
-    /// Pulls that retrieved their target minute; `-1` = counts not
-    /// recorded for this feed/family yet.
-    pub ok_fetches: i64,
-    /// Pulls that ended without the target minute; `-1` = not recorded.
-    pub failed_fetches: i64,
-    /// Minutes that NEVER got repaired (post-close sweep included);
-    /// `-1` = not recorded.
-    pub named_gaps: i64,
-    /// `named_gap` rows classed `pre_boot` — minutes from before this
-    /// app start (bookkeeping, NOT pull failures; rendered separately
-    /// from "never recovered" — Fix E, 2026-07-17); `-1` = not recorded.
-    pub pre_boot_gaps: i64,
-    /// How many rate-limit rejections the day's pulls hit; `-1` unknown.
-    pub rate_limited_hits: i64,
-    /// Pulls repaired LATE (retrieved ≥60s after the minute closed — a
-    /// later pull's catch-up, not the prompt fetch); `-1` unknown.
-    pub late_recovered: i64,
-    /// Prompt-pull minute-close → data delay, median ms; `-1` = not
-    /// measured.
-    pub close_p50_ms: i64,
-    /// Prompt-pull worst-1% delay ms; `-1` = not measured.
-    pub close_p99_ms: i64,
-    /// Prompt-pull slowest delay ms; `-1` = not measured.
-    pub close_max_ms: i64,
-    /// How many prompt pulls the delay distribution is built from;
-    /// `-1` = no delay source at all, `0` = measured zero (every pull
-    /// failed).
-    pub close_samples: i64,
-}
+// ---- `RestLegScoreLine` is RETIRED 2026-09-17 ----
+//
+// One official-minute-candle pull digest line on the daily scorecard —
+// the operator's 2026-07-13 Quote 2 ("within how many seconds precisely").
+// Twelve `i64` fields, every one carrying a `-1` "not measured" sentinel so
+// a missing source rendered honestly instead of as a fabricated zero.
+//
+// Retired with its producer: the scoreboard's REST 1m pull digest read
+// `rest_fetch_audit` and `rest_spot_1m`, and nothing has written either
+// since the operator's SOCKETS-ONLY narrowing removed the per-minute
+// spot-1m and option-chain legs (`no-rest-except-live-feed-2026-06-27.md`
+// §12.10, disposition table §12.11).
+//
+// The `-1`-sentinel DISCIPLINE this type carried is NOT retired — it is
+// the house pattern for every scorecard number, and `FeedScoreLine` above
+// still uses it. Only the pull-family line is gone, because there is no
+// pull to measure.
 
 /// Compact IST date for card headers (`"2026-07-14"` → `"14 Jul"`) so a
 /// past-day backfill / forced-run card is distinguishable from today's at
@@ -1270,129 +1232,54 @@ fn render_compact_date_ist(date: &str) -> String {
     }
 }
 
-/// Compact per-leg label for the pulls segment: the digest leg display
-/// names ("spot candles" / "option chain" / "option contracts") shorten
-/// to one word so the two feed lines never wrap; an unknown future leg
-/// keeps its full plain-English name (never a wire slug — commandment 2).
-fn compact_leg_label(leg: &str) -> &str {
-    match leg {
-        "spot candles" => "spot",
-        "option chain" => "chain",
-        "option contracts" => "contracts",
-        other => other,
-    }
-}
+// ---- `compact_leg_label` is RETIRED 2026-09-17 ----
+//
+// It shortened the pulls segment's leg display names ("spot candles" ->
+// "spot", "option chain" -> "chain", "option contracts" -> "contracts") so
+// the two feed lines never wrapped, and passed ANY unknown leg through
+// verbatim rather than guessing.
+//
+// Orphaned by `render_pulls_per_leg`'s retirement below — it had exactly
+// one caller. Dead code, and `-D warnings` rejects it.
+//
+// Its RULE is NOT retired and still binds every surviving label on every
+// operator-facing surface: the fall-through returned the leg's full
+// PLAIN-ENGLISH name, never a wire slug, because Telegram commandment 2
+// bans library/wire names in an operator's message. A future renderer that
+// shortens a label must keep that fall-through shape.
 
-/// PER-LEG official-minute-candle pull segment for ONE feed (F3,
-/// 2026-07-15 fix round): renders each MEASURED leg compactly —
-/// `pulls spot 735/735 (1.8s), chain 733/735 (2.1s) ✅` — with one
-/// overall mark and the never-recovered note. The bracketed figure is
-/// the leg's worst-1% (p99) seconds-after-close pull delay (G7, fix
-/// round 2 — restores the operator's Quote-2 "how many seconds
-/// precisely" answer on the card in ONE compact figure per leg). Legs
-/// on the documented latency-only fallback source (counts `-1`,
-/// latency MEASURED — the `spot_1m_rest` forensics-writer-outage /
-/// pre-2026-07-14 arm) render count-less as `spot (1.8s)` (G6 — never
-/// dropped, never logged "not measured"). Legs with NOTHING measured
-/// render NOTHING on the card (the operator's 2026-07-15 escalation
-/// demanded suppressing unmeasured lines on the phone); `None` when no
-/// leg for the feed carries any measurement.
-///
-/// RULE-CONTRACT TENSION, recorded deliberately (see the plan file's
-/// Observability section): `dual-feed-scoreboard-error-codes.md` §2b
-/// mandates the four canonical feed/leg pairs ALWAYS render, with an
-/// absent source reading "not measured yet" — and, with
-/// `rest-1m-pipeline-error-codes.md` §3, a per-leg p50/p99/max delay
-/// digest. This card intentionally deviates per the operator's direct
-/// 2026-07-15 cleanliness escalation — unmeasured pairs move to the
-/// day's LOGS (`feed_scoreboard_boot::log_rest_leg_measurement_gaps`,
-/// fired from the aggregation path on EVERY run) and the delay digest folds to
-/// the ONE p99 figure above — PENDING the rule-file supersession the
-/// operator must land with a dated quote. Rule files are not editable
-/// in this PR.
-fn render_pulls_per_leg(rest_legs: &[RestLegScoreLine], feed: &str) -> Option<String> {
-    let mut parts: Vec<String> = Vec::new();
-    let mut gaps = 0i64;
-    let mut pre_boot = 0i64;
-    // R2 (fix round 3): the verdict mark is three-state and never
-    // fabricated — ✅ only when EVERY rendered leg is FULLY counted
-    // (ok >= 0 AND failed >= 0) and failure-free; ⚠️ when any counted
-    // failure / never-recovered gap exists (real trouble wins over
-    // partial data); NO mark when any rendered leg is latency-only or
-    // failed-count-unmeasured (the spot_1m_rest fallback exists exactly
-    // for forensics-writer outages, where failures are invisible — a
-    // green check there was a Rule-11 false-OK).
-    let mut any_failure = false;
-    let mut any_unmeasured = false;
-    for l in rest_legs {
-        if !l.feed.eq_ignore_ascii_case(feed) {
-            continue;
-        }
-        // p99 seconds-after-close, rendered only when genuinely measured
-        // (samples > 0 guards a zero-sample day from fabricating "0.0s").
-        let p99 = (l.close_p99_ms >= 0 && l.close_samples > 0)
-            .then(|| render_compact_secs(l.close_p99_ms));
-        if l.ok_fetches >= 0 {
-            if l.failed_fetches >= 0 {
-                // Fully counted leg: the only shape that may render x/y.
-                let total = l.ok_fetches.saturating_add(l.failed_fetches);
-                let counts = format!("{} {}/{total}", compact_leg_label(&l.leg), l.ok_fetches);
-                parts.push(match p99 {
-                    Some(secs) => format!("{counts} ({secs})"),
-                    None => counts,
-                });
-                if l.ok_fetches != total {
-                    any_failure = true;
-                }
-            } else {
-                // Failure count unmeasured (-1 sentinel): "x/x" would
-                // imply zero failures — render the ok count alone.
-                let counts = format!("{} {} ok", compact_leg_label(&l.leg), l.ok_fetches);
-                parts.push(match p99 {
-                    Some(secs) => format!("{counts} ({secs})"),
-                    None => counts,
-                });
-                any_unmeasured = true;
-            }
-        } else if let Some(secs) = p99 {
-            // Latency-only fallback leg (G6): the delay WAS measured —
-            // render it count-less instead of dropping the measurement.
-            parts.push(format!("{} ({secs})", compact_leg_label(&l.leg)));
-            any_unmeasured = true;
-        }
-        if l.named_gaps > 0 {
-            gaps = gaps.saturating_add(l.named_gaps);
-        }
-        if l.pre_boot_gaps > 0 {
-            // Fix E round 1: pre-boot gaps are bookkeeping (minutes from
-            // before this app start), never pull failures — summed here so
-            // they render, but they never flip the failure mark.
-            pre_boot = pre_boot.saturating_add(l.pre_boot_gaps);
-        }
-    }
-    if parts.is_empty() {
-        return None;
-    }
-    if gaps > 0 {
-        any_failure = true;
-    }
-    let mut seg = if any_failure {
-        format!("pulls {} \u{26a0}\u{fe0f}", parts.join(", "))
-    } else if any_unmeasured {
-        // Partially-unmeasured day: no verdict mark — the numbers shown
-        // are honest, but a clean/degraded verdict is unknowable.
-        format!("pulls {}", parts.join(", "))
-    } else {
-        format!("pulls {} \u{2705}", parts.join(", "))
-    };
-    if gaps > 0 {
-        seg.push_str(&format!("; {gaps} never recovered \u{26a0}\u{fe0f}"));
-    }
-    if pre_boot > 0 {
-        seg.push_str(&format!("; {pre_boot} from before app start"));
-    }
-    Some(seg)
-}
+// ---- `render_pulls_per_leg` is RETIRED 2026-09-17 ----
+//
+// It rendered ONE feed's per-leg pull segment on the daily scorecard —
+// `pulls spot 735/735 (1.8s), chain 733/735 (2.1s) ✅` — with a
+// THREE-STATE verdict mark that is worth recording because it is the
+// pattern, not the numbers, that mattered: ✅ only when every rendered leg
+// was fully counted AND failure-free; ⚠️ on any counted failure or
+// never-recovered gap; and NO mark at all when any leg was latency-only or
+// had an unmeasured failure count — because a green check over a leg whose
+// failures are invisible is a Rule-11 false-OK.
+//
+// Retired with `RestLegScoreLine` and the scoreboard digest that fed it:
+// nothing has written `rest_fetch_audit` or `rest_spot_1m` since the
+// operator's SOCKETS-ONLY narrowing removed the per-minute legs
+// (`no-rest-except-live-feed-2026-06-27.md` §12.10 / §12.11).
+//
+// ⚠ Recorded because it bears on §12.9(a)'s reading of this reader: the
+// function returned `None` when no leg produced a part, so an empty
+// aggregate OMITTED the pulls segment rather than printing "0/0 ✅". The
+// post-removal render was therefore honest on its own; what made the
+// removal right is a dead subsystem reading as live, not a false green.
+//
+// It also carried a RULE-CONTRACT TENSION, closed here rather than left
+// dangling: `dual-feed-scoreboard-error-codes.md` §2b mandates that the
+// four canonical feed/leg pairs ALWAYS render with an absent source
+// reading "not measured yet", while the operator's 2026-07-15 cleanliness
+// escalation demanded unmeasured lines be suppressed on the phone. The
+// code followed the operator and the comment flagged the deviation as
+// PENDING a rule-file supersession. With the legs gone there are no pairs
+// to render and the tension is moot — but §2b still says four pairs always
+// render, so a future per-minute family must resolve it rather than
+// inherit this note.
 
 /// Compact tick-count renderer for the aligned feed stat line: millions
 /// render as `1.94M` (the line must stay short enough to never wrap);
@@ -1421,7 +1308,14 @@ fn render_compact_secs(ms: i64) -> String {
 /// Unmeasured `-1` fields are OMITTED — never "?", never "not measured"; a
 /// feed with ZERO measured fields renders one honest plain line instead
 /// (never silent).
-fn aligned_feed_line(f: &FeedScoreLine, name_width: usize, pulls: Option<String>) -> String {
+/// ⚠ 2026-09-17: the third parameter `pulls: Option<String>` is RETIRED.
+/// It carried the per-leg REST pull segment rendered by the (now retired)
+/// `render_pulls_per_leg`, and after that retirement the single production
+/// caller could only ever pass `None` — a branch that can never be taken is
+/// not a capability, it is dead code wearing one. Restoring a per-leg
+/// segment means restoring its renderer, not re-adding a parameter nothing
+/// can fill.
+fn aligned_feed_line(f: &FeedScoreLine, name_width: usize) -> String {
     let mut segments: Vec<String> = Vec::new();
     if f.ticks >= 0 {
         segments.push(format!("{} ticks", render_compact_count(f.ticks)));
@@ -1431,9 +1325,6 @@ fn aligned_feed_line(f: &FeedScoreLine, name_width: usize, pulls: Option<String>
     }
     if f.drops_market >= 0 {
         segments.push(format!("drops {}", f.drops_market));
-    }
-    if let Some(p) = pulls {
-        segments.push(p);
     }
     if segments.is_empty() {
         // Wholly unmeasured feed: honest, not silent (audit Rule 11).
@@ -2106,8 +1997,6 @@ impl NotificationEvent {
                 early_run,
                 restart_partial,
                 dhan_feed_off,
-                rest_legs,
-                rest_legs_read_failed,
             } => {
                 // Telegram cleanliness overhaul (2026-07-15): verdict line
                 // FIRST (one emoji + one sentence), then one aligned
@@ -2117,8 +2006,7 @@ impl NotificationEvent {
                 // explanatory footnotes are deleted; the dropped per-leg
                 // pull freshness / exclusive-minute / streaming detail
                 // stays in the day's stored records and the portal.
-                let caveat =
-                    *partial_coverage || *degraded || *restart_partial || *rest_legs_read_failed;
+                let caveat = *partial_coverage || *degraded || *restart_partial;
                 // The cross-feed CONTEST verdict was removed with the second
                 // broker on 2026-08-21 — one feed cannot win against nobody.
                 // What replaces it is not "one-feed day", which was a
@@ -2165,38 +2053,35 @@ impl NotificationEvent {
                     "{emoji} <b>Feed scorecard 3:45 PM \u{b7} {date}</b> \u{2014} \
                      {verdict_sentence}{early}"
                 ));
-                // G8 (fix round 2): a broken pull-record READ renders an
-                // explicit token on the feed lines (incl. the feed-off
-                // line) — never silently omitted; previously only the
-                // shared floor caveat fired, indistinguishable from
-                // "no pull data exists" on the (permanent) Dhan
-                // feed-off day.
-                let pulls_for = |name: &str| -> Option<String> {
-                    if *rest_legs_read_failed {
-                        Some("pulls: records unreadable \u{26a0}\u{fe0f}".to_string())
-                    } else {
-                        render_pulls_per_leg(rest_legs, name)
-                    }
-                };
+                // The `pulls_for` closure is RETIRED 2026-09-17 with the
+                // REST pull digest. G8 (fix round 2) made a broken
+                // pull-record READ render an explicit "records unreadable"
+                // token on every feed line INCLUDING the feed-off line,
+                // rather than relying on the shared floor caveat — which
+                // was indistinguishable from "no pull data exists". With no
+                // pull records to read there is nothing to be unreadable.
+                // Record: `no-rest-except-live-feed-2026-06-27.md` §12.10.
                 let name_width = dhan.name.chars().count();
                 for (off, f) in [(dhan_feed_off, dhan)] {
                     if *off {
                         // A deliberately-switched-off feed is ONE honest
                         // line — never a wall of zeros, never a winner.
-                        // F2 (2026-07-15 fix round): the OFF line still
-                        // carries the pull digest when pull data exists —
-                        // on current prod every day is a Dhan feed-off day
-                        // (live WS retired) while the Dhan spot-1m/chain
-                        // REST pulls are the operator's most-watched
-                        // signal. Omitted only when there are genuinely no
-                        // measured pull rows for the feed.
-                        let mut off_line = format!("{}: OFF today (excluded from verdict)", f.name);
-                        if let Some(p) = pulls_for(&f.name) {
-                            off_line.push_str(&format!(" \u{b7} {p}"));
-                        }
+                        //
+                        // ⚠ 2026-09-17: the F2 (2026-07-15) note that stood
+                        // here said the OFF line "still carries the pull
+                        // digest when pull data exists — on current prod
+                        // every day is a Dhan feed-off day (live WS
+                        // retired) while the Dhan spot-1m/chain REST pulls
+                        // are the operator's most-watched signal." All
+                        // three halves are now false: the live WS came BACK
+                        // on 2026-08-11, the REST pulls are GONE
+                        // (`no-rest-except-live-feed-2026-06-27.md` §12.10),
+                        // and there is no digest to carry. The OFF line is
+                        // one line, full stop.
+                        let off_line = format!("{}: OFF today (excluded from verdict)", f.name);
                         lines.push(off_line);
                     } else {
-                        lines.push(aligned_feed_line(f, name_width, pulls_for(&f.name)));
+                        lines.push(aligned_feed_line(f, name_width));
                     }
                 }
                 // Incidents line: rendered ONLY when any blame/stall/
@@ -6523,27 +6408,15 @@ mod tests {
             early_run: false,
             restart_partial: false,
             dhan_feed_off: false,
-            rest_legs: vec![],
-            rest_legs_read_failed: false,
         }
     }
 
-    fn rest_line(feed: &str, leg: &str) -> RestLegScoreLine {
-        RestLegScoreLine {
-            feed: feed.to_string(),
-            leg: leg.to_string(),
-            ok_fetches: -1,
-            failed_fetches: -1,
-            named_gaps: -1,
-            pre_boot_gaps: -1,
-            rate_limited_hits: -1,
-            late_recovered: -1,
-            close_p50_ms: -1,
-            close_p99_ms: -1,
-            close_max_ms: -1,
-            close_samples: -1,
-        }
-    }
+    // ---- the `rest_line` fixture is RETIRED 2026-09-17 ----
+    //
+    // It built an all-`-1` `RestLegScoreLine` so each pull test could set
+    // only the fields it cared about and leave the rest honestly
+    // unmeasured. That all-sentinel default is the pattern worth keeping in
+    // mind for any future scorecard fixture; the type it built is gone.
 
     #[test]
     fn test_dual_feed_scorecard_topic_severity_policy() {
@@ -6685,12 +6558,16 @@ mod tests {
 
     #[test]
     fn test_dual_feed_scorecard_caveat_line_exactly_once() {
-        for (partial, degraded, restart, rest_failed) in [
-            (true, false, false, false),
-            (false, true, false, false),
-            (false, false, true, false),
-            (false, false, false, true),
-            (true, true, true, true),
+        // 2026-09-17: the FOURTH trigger — `rest_legs_read_failed`, an
+        // unreadable REST pull record — is RETIRED with the pull digest, so
+        // the matrix drops from four flags to three. The property under
+        // test is UNCHANGED and is the load-bearing half: however many
+        // triggers are true, the caveat renders EXACTLY ONCE.
+        for (partial, degraded, restart) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, true),
         ] {
             let ev = NotificationEvent::DualFeedDailyScorecard {
                 trading_date_ist: "2026-07-10".to_string(),
@@ -6701,8 +6578,6 @@ mod tests {
                 early_run: false,
                 restart_partial: restart,
                 dhan_feed_off: false,
-                rest_legs: vec![],
-                rest_legs_read_failed: rest_failed,
             };
             let msg = ev.to_message();
             assert_eq!(
@@ -6729,8 +6604,6 @@ mod tests {
             early_run: true,
             restart_partial: false,
             dhan_feed_off: false,
-            rest_legs: vec![],
-            rest_legs_read_failed: false,
         };
         let msg = ev.to_message();
         let first = msg.lines().next().unwrap_or_default();
@@ -6761,8 +6634,6 @@ mod tests {
             early_run: false,
             restart_partial: false,
             dhan_feed_off: true,
-            rest_legs: vec![],
-            rest_legs_read_failed: false,
         };
         let msg = ev.to_message();
         assert!(
@@ -6786,126 +6657,36 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_dual_feed_scorecard_feed_off_line_still_carries_pull_digest() {
-        // F2 (2026-07-15 fix round): on current prod EVERY day is a Dhan
-        // feed-off day (live WS retired) while the Dhan spot-1m/chain REST
-        // pulls are the operator's most-watched signal — the OFF line must
-        // still carry the pulls segment when pull data exists.
-        let mut d = score_line("Dhan");
-        d.ticks = 0;
-        let rest_legs = vec![
-            RestLegScoreLine {
-                ok_fetches: 735,
-                failed_fetches: 735,
-                ..rest_line("Dhan", "spot candles")
-            },
-            RestLegScoreLine {
-                ok_fetches: 733,
-                failed_fetches: 2,
-                ..rest_line("Dhan", "option chain")
-            },
-        ];
-        let ev = NotificationEvent::DualFeedDailyScorecard {
-            trading_date_ist: "2026-07-15".to_string(),
-            dhan: d,
-            session_minutes: 375,
-            partial_coverage: false,
-            degraded: false,
-            early_run: false,
-            restart_partial: false,
-            dhan_feed_off: true,
-            rest_legs,
-            rest_legs_read_failed: false,
-        };
-        let msg = ev.to_message();
-        let off_line = msg
-            .lines()
-            .find(|l| l.contains("Dhan: OFF today"))
-            .unwrap_or_default();
-        assert!(
-            off_line.contains(
-                "OFF today (excluded from verdict) \u{b7} pulls spot 735/1470, chain 733/735"
-            ),
-            "OFF line must carry the per-leg pull digest: {msg}"
-        );
-        assert!(
-            off_line.contains("\u{26a0}\u{fe0f}"),
-            "degraded pulls on the OFF line must carry the warning mark: {msg}"
-        );
-        // No pull rows for the OFF feed → the segment is genuinely omitted.
-        let mut d = score_line("Dhan");
-        d.ticks = 0;
-        let ev = NotificationEvent::DualFeedDailyScorecard {
-            trading_date_ist: "2026-07-15".to_string(),
-            dhan: d,
-            session_minutes: 375,
-            partial_coverage: false,
-            degraded: false,
-            early_run: false,
-            restart_partial: false,
-            dhan_feed_off: true,
-            rest_legs: vec![rest_line("Dhan", "spot candles")],
-            rest_legs_read_failed: false,
-        };
-        let msg = ev.to_message();
-        assert!(
-            msg.contains("Dhan: OFF today (excluded from verdict)"),
-            "{msg}"
-        );
-        assert!(
-            !msg.contains("Dhan: OFF today (excluded from verdict) \u{b7}"),
-            "all-sentinel pull rows must omit the segment, never fabricate: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_dual_feed_scorecard_pulls_fold_into_feed_lines() {
-        // The retired per-leg digest folds into ONE `pulls a/b` segment per
-        // feed line (aggregate over that feed's measured legs; `-1` legs
-        // skipped; named gaps append the honest warning).
-        let rest_legs = vec![
-            RestLegScoreLine {
-                ok_fetches: 735,
-                failed_fetches: 0,
-                ..rest_line("Dhan", "spot candles")
-            },
-            RestLegScoreLine {
-                ok_fetches: 33,
-                failed_fetches: 2,
-                named_gaps: 2,
-                pre_boot_gaps: 0,
-                ..rest_line("Dhan", "option chain")
-            },
-            // All-sentinel leg: contributes nothing, fabricates nothing.
-            rest_line("Dhan", "option contracts"),
-        ];
-        let ev = NotificationEvent::DualFeedDailyScorecard {
-            trading_date_ist: "2026-07-13".to_string(),
-            dhan: score_line("Dhan"),
-            session_minutes: 375,
-            partial_coverage: false,
-            degraded: false,
-            early_run: false,
-            restart_partial: false,
-            dhan_feed_off: false,
-            rest_legs,
-            rest_legs_read_failed: false,
-        };
-        let msg = ev.to_message();
-        assert!(
-            msg.contains(
-                "pulls spot 735/735, chain 33/35 \u{26a0}\u{fe0f}; 2 never recovered \u{26a0}\u{fe0f}"
-            ),
-            "pulls segment wrong: {msg}"
-        );
-        // The retired per-leg digest section must never come back.
-        assert!(!msg.contains("Official minute candles"), "{msg}");
-        assert!(!msg.contains("after close"), "{msg}");
-        // An empty rest_legs vec omits the pulls segment entirely.
-        let msg = scorecard(score_line("Dhan")).to_message();
-        assert!(!msg.contains("pulls"), "{msg}");
-    }
+    // ---- SEVEN pull-digest tests are RETIRED 2026-09-17 ----
+    //
+    // They pinned the daily scorecard's REST pull segment end to end:
+    //   * test_dual_feed_scorecard_feed_off_line_still_carries_pull_digest
+    //   * test_dual_feed_scorecard_pulls_fold_into_feed_lines
+    //   * test_dual_feed_scorecard_pulls_carry_p99_latency
+    //   * test_dual_feed_scorecard_latency_only_leg_renders_countless
+    //   * test_dual_feed_scorecard_read_failed_renders_unreadable_token
+    //   * test_render_pulls_per_leg_skips_sentinel_legs_and_names_each_leg
+    //   * test_render_pulls_per_leg_never_fabricates_a_verdict_mark
+    //
+    // Their whole subject is `render_pulls_per_leg` / `RestLegScoreLine` /
+    // `rest_legs_read_failed`, all retired above with the scoreboard digest
+    // that produced them, because nothing has written `rest_fetch_audit` or
+    // `rest_spot_1m` since the operator's SOCKETS-ONLY narrowing
+    // (`no-rest-except-live-feed-2026-06-27.md` §12.10, disposition §12.11).
+    //
+    // NOT retired, and it is what the interesting ones were really about:
+    // the THREE-STATE verdict-mark rule (green ONLY when every rendered
+    // sub-part is both fully counted AND failure-free; warning on a counted
+    // failure; NO mark at all when a count is unmeasured, because a green
+    // check over an invisible failure is a Rule-11 false-OK) and the
+    // omit-never-fabricate rule for `-1` sentinels. Both still bind every
+    // surviving scorecard segment, and the sentinel rule is still pinned by
+    // `test_aligned_feed_line_omits_each_sentinel_field` below.
+    //
+    // WHAT THIS LEAVES UNWATCHED, stated rather than implied: nothing
+    // re-checks the "records unreadable" rendering, because there is no
+    // record left to fail to read; and nothing re-checks the three-state
+    // verdict mark, because no surviving segment carries one.
 
     #[test]
     fn test_render_compact_date_ist_shapes() {
@@ -6921,169 +6702,19 @@ mod tests {
     }
 
     #[test]
-    fn test_dual_feed_scorecard_pulls_carry_p99_latency() {
-        // G7 (fix round 2): the pulls segment folds the measured worst-1%
-        // seconds-after-close delay into ONE compact bracketed figure per
-        // leg — the operator's Quote-2 latency answer back on the card.
-        let rest_legs = vec![
-            RestLegScoreLine {
-                ok_fetches: 735,
-                failed_fetches: 0,
-                close_p99_ms: 1_800,
-                close_samples: 730,
-                ..rest_line("Dhan", "spot candles")
-            },
-            RestLegScoreLine {
-                ok_fetches: 733,
-                failed_fetches: 2,
-                close_p99_ms: 2_100,
-                close_samples: 733,
-                ..rest_line("Dhan", "option chain")
-            },
-        ];
-        let ev = NotificationEvent::DualFeedDailyScorecard {
-            trading_date_ist: "2026-07-14".to_string(),
-            dhan: score_line("Dhan"),
-            session_minutes: 375,
-            partial_coverage: false,
-            degraded: false,
-            early_run: false,
-            restart_partial: false,
-            dhan_feed_off: false,
-            rest_legs,
-            rest_legs_read_failed: false,
-        };
-        let msg = ev.to_message();
-        assert!(
-            msg.contains("pulls spot 735/735 (1.8s), chain 733/735 (2.1s)"),
-            "pulls segment must carry per-leg p99 delay: {msg}"
-        );
-        // Zero-sample legs never fabricate a "0.0s" delay figure.
-        let rest_legs = vec![RestLegScoreLine {
-            ok_fetches: 735,
-            failed_fetches: 0,
-            close_p99_ms: 0,
-            close_samples: 0,
-            ..rest_line("Dhan", "spot candles")
-        }];
-        let ev = NotificationEvent::DualFeedDailyScorecard {
-            trading_date_ist: "2026-07-14".to_string(),
-            dhan: score_line("Dhan"),
-            session_minutes: 375,
-            partial_coverage: false,
-            degraded: false,
-            early_run: false,
-            restart_partial: false,
-            dhan_feed_off: false,
-            rest_legs,
-            rest_legs_read_failed: false,
-        };
-        let msg = ev.to_message();
-        assert!(
-            msg.contains("pulls spot 735/735 \u{2705}"),
-            "zero-sample leg must render counts without a delay figure: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_dual_feed_scorecard_latency_only_leg_renders_countless() {
-        // G6 (fix round 2): the documented spot_1m_rest latency-only
-        // fallback (counts -1, latency MEASURED — the forensics-writer
-        // outage / pre-2026-07-14 arm) renders a compact count-less
-        // segment — previously the measurement vanished from the card.
-        let rest_legs = vec![RestLegScoreLine {
-            close_p50_ms: 1_100,
-            close_p99_ms: 1_800,
-            close_max_ms: 5_000,
-            close_samples: 372,
-            ..rest_line("Dhan", "spot candles")
-        }];
-        let ev = NotificationEvent::DualFeedDailyScorecard {
-            trading_date_ist: "2026-07-14".to_string(),
-            dhan: score_line("Dhan"),
-            session_minutes: 375,
-            partial_coverage: false,
-            degraded: false,
-            early_run: false,
-            restart_partial: false,
-            dhan_feed_off: false,
-            rest_legs,
-            rest_legs_read_failed: false,
-        };
-        let msg = ev.to_message();
-        assert!(
-            msg.contains("pulls spot (1.8s)"),
-            "latency-only leg must render count-less, never vanish: {msg}"
-        );
-        // All-sentinel legs (nothing measured) still render nothing —
-        // the honest suppress-on-phone arm is unchanged.
-        let msg = scorecard(score_line("Dhan")).to_message();
-        assert!(!msg.contains("pulls"), "{msg}");
-    }
-
-    #[test]
-    fn test_dual_feed_scorecard_read_failed_renders_unreadable_token() {
-        // G8 (fix round 2): a broken pull-record READ is an explicit
-        // per-feed token — distinguishable on the phone from "no pull
-        // data exists", including on the (permanent prod) feed-off line.
-        let mut d = score_line("Dhan");
-        d.ticks = 0;
-        let ev = NotificationEvent::DualFeedDailyScorecard {
-            trading_date_ist: "2026-07-14".to_string(),
-            dhan: d,
-            session_minutes: 375,
-            partial_coverage: false,
-            degraded: false,
-            early_run: false,
-            restart_partial: false,
-            dhan_feed_off: true,
-            rest_legs: vec![],
-            rest_legs_read_failed: true,
-        };
-        let msg = ev.to_message();
-        assert!(
-            msg.contains(
-                "Dhan: OFF today (excluded from verdict) \u{b7} pulls: records \
-                 unreadable \u{26a0}\u{fe0f}"
-            ),
-            "OFF line must carry the unreadable token on a read-failed day: {msg}"
-        );
-        // The MEASURED shape carries the same token on its stat line.
-        let ev = NotificationEvent::DualFeedDailyScorecard {
-            trading_date_ist: "2026-07-14".to_string(),
-            dhan: score_line("Dhan"),
-            session_minutes: 375,
-            partial_coverage: false,
-            degraded: false,
-            early_run: false,
-            restart_partial: false,
-            dhan_feed_off: false,
-            rest_legs: vec![],
-            rest_legs_read_failed: true,
-        };
-        let measured = ev.to_message();
-        let feed_line = measured
-            .lines()
-            .find(|l| l.contains("<code>Dhan"))
-            .unwrap_or_default();
-        assert!(
-            feed_line.contains("pulls: records unreadable \u{26a0}\u{fe0f}"),
-            "the measured feed line must carry the unreadable token too: {measured}"
-        );
-        // The shared floor caveat still rides along (read-failed is a
-        // caveat class), and the line budget holds.
-        assert!(
-            msg.contains("Counts are a floor"),
-            "read-failed keeps the floor caveat: {msg}"
-        );
-        assert!(msg.lines().count() <= 6, "{msg}");
-    }
-
-    #[test]
     fn test_dual_feed_scorecard_line_budget_and_footnotes_deleted() {
         // Worst realistic case (measured everything + incidents + caveat)
         // stays inside the 6-line budget; the six retired footnotes never
         // render.
+        //
+        // ⚠ 2026-09-17: "worst realistic case" is now NARROWER than when
+        // this test was written — the REST pull segment it used to fold
+        // into the feed line is retired, so the card this exercises is
+        // strictly shorter than the one the 6-line budget was set against.
+        // The budget itself is UNCHANGED and deliberately not tightened: a
+        // budget re-derived downward every time a segment retires ratchets
+        // toward a number nobody chose, and the ≤ 6 figure is the operator's
+        // phone-screen limit, not a measurement of today's longest card.
         let mut d = score_line("Dhan");
         let mut g = score_line("Groww");
         d.lag_p50_ms = 1200;
@@ -7100,12 +6731,6 @@ mod tests {
             early_run: true,
             restart_partial: true,
             dhan_feed_off: false,
-            rest_legs: vec![RestLegScoreLine {
-                ok_fetches: 735,
-                failed_fetches: 0,
-                ..rest_line("Dhan", "spot candles")
-            }],
-            rest_legs_read_failed: true,
         };
         let msg = ev.to_message();
         assert!(
@@ -7144,161 +6769,24 @@ mod tests {
     // -- helper units (2026-07-15) ------------------------------------------
 
     #[test]
-    fn test_render_pulls_per_leg_skips_sentinel_legs_and_names_each_leg() {
-        // F3 (2026-07-15 fix round), verdict semantics tightened by R2
-        // (fix round 3): per-LEG pulls segment — each measured leg named
-        // compactly; `-1` legs render nothing (omission, never a
-        // fabricated zero); named gaps append the honest warning once.
-        // A failed-unmeasured leg renders "N ok" (never "N/N", which
-        // would imply zero failures) and real failures win the ⚠️ mark.
-        let legs = vec![
-            RestLegScoreLine {
-                ok_fetches: 10,
-                failed_fetches: 2,
-                named_gaps: 1,
-                // Fix E round 1: pre-boot gaps render beside "never
-                // recovered" as bookkeeping (no warning mark).
-                pre_boot_gaps: 2,
-                ..rest_line("Groww", "spot candles")
-            },
-            rest_line("Groww", "option chain"), // all -1: skipped
-            RestLegScoreLine {
-                ok_fetches: 5,
-                failed_fetches: -1, // failed unmeasured: "5 ok", never 5/5
-                ..rest_line("groww", "option contracts")
-            },
-        ];
-        assert_eq!(
-            render_pulls_per_leg(&legs, "Groww"),
-            Some(
-                "pulls spot 10/12, contracts 5 ok \u{26a0}\u{fe0f}; \
-                 1 never recovered \u{26a0}\u{fe0f}; 2 from before app start"
-                    .to_string()
-            )
-        );
-        // No measured legs for this feed → None (segment omitted).
-        assert_eq!(render_pulls_per_leg(&legs, "Dhan"), None);
-        assert_eq!(render_pulls_per_leg(&[], "Dhan"), None);
-        // All-clean FULLY-COUNTED legs earn the green mark; unknown legs
-        // keep their plain-English name.
-        let clean = vec![
-            RestLegScoreLine {
-                ok_fetches: 3,
-                failed_fetches: 0,
-                ..rest_line("Dhan", "spot candles")
-            },
-            RestLegScoreLine {
-                ok_fetches: 7,
-                failed_fetches: 0,
-                ..rest_line("Dhan", "expired options")
-            },
-        ];
-        assert_eq!(
-            render_pulls_per_leg(&clean, "Dhan"),
-            Some("pulls spot 3/3, expired options 7/7 \u{2705}".to_string())
-        );
-    }
-
-    #[test]
-    fn test_render_pulls_per_leg_never_fabricates_a_verdict_mark() {
-        // R2 (fix round 3): a leg with ANY unmeasured half renders NO
-        // verdict mark — a latency-only day (the forensics-writer-outage
-        // fallback, where failures are invisible) previously rendered a
-        // fabricated green ✅ (Rule-11 false-OK).
-        // (a) Latency-only leg alone: numbers shown, NO mark.
-        let latency_only = vec![RestLegScoreLine {
-            close_p99_ms: 1800,
-            close_samples: 350,
-            ..rest_line("Dhan", "spot candles")
-        }];
-        assert_eq!(
-            render_pulls_per_leg(&latency_only, "Dhan"),
-            Some("pulls spot (1.8s)".to_string())
-        );
-        // (b) Failed-unmeasured leg alone: "N ok", NO /total, NO mark.
-        let failed_unmeasured = vec![RestLegScoreLine {
-            ok_fetches: 735,
-            failed_fetches: -1,
-            close_p99_ms: 1800,
-            close_samples: 700,
-            ..rest_line("Dhan", "spot candles")
-        }];
-        assert_eq!(
-            render_pulls_per_leg(&failed_unmeasured, "Dhan"),
-            Some("pulls spot 735 ok (1.8s)".to_string())
-        );
-        // (c) Mixed clean-counted + latency-only: still NO mark — the
-        // unmeasured leg makes a clean verdict unknowable.
-        let mixed = vec![
-            RestLegScoreLine {
-                ok_fetches: 733,
-                failed_fetches: 0,
-                ..rest_line("Groww", "spot candles")
-            },
-            RestLegScoreLine {
-                close_p99_ms: 2100,
-                close_samples: 400,
-                ..rest_line("Groww", "option chain")
-            },
-        ];
-        assert_eq!(
-            render_pulls_per_leg(&mixed, "Groww"),
-            Some("pulls spot 733/733, chain (2.1s)".to_string())
-        );
-        // (d) Mixed counted-WITH-failures + latency-only: real trouble
-        // wins — the ⚠️ mark renders (honest "known trouble", partial
-        // data notwithstanding).
-        let mixed_failing = vec![
-            RestLegScoreLine {
-                ok_fetches: 700,
-                failed_fetches: 35,
-                ..rest_line("Groww", "spot candles")
-            },
-            RestLegScoreLine {
-                close_p99_ms: 2100,
-                close_samples: 400,
-                ..rest_line("Groww", "option chain")
-            },
-        ];
-        assert_eq!(
-            render_pulls_per_leg(&mixed_failing, "Groww"),
-            Some("pulls spot 700/735, chain (2.1s) \u{26a0}\u{fe0f}".to_string())
-        );
-        // (e) Never-recovered gaps on a latency-only day: ⚠️ + the gap
-        // suffix (a named gap is real, counted trouble).
-        let gaps_latency_only = vec![RestLegScoreLine {
-            close_p99_ms: 1800,
-            close_samples: 350,
-            named_gaps: 3,
-            pre_boot_gaps: 0,
-            ..rest_line("Dhan", "spot candles")
-        }];
-        assert_eq!(
-            render_pulls_per_leg(&gaps_latency_only, "Dhan"),
-            Some(
-                "pulls spot (1.8s) \u{26a0}\u{fe0f}; 3 never recovered \u{26a0}\u{fe0f}"
-                    .to_string()
-            )
-        );
-    }
-
-    #[test]
     fn test_aligned_feed_line_omits_each_sentinel_field() {
+        // 2026-09-17: the `pulls` argument is RETIRED with the REST pull
+        // digest, so the first case now pins the three SURVIVING measured
+        // segments and their separator/padding, which is what it was really
+        // guarding — the pulls string was a passenger in it.
         let mut f = score_line("Dhan");
         f.lag_p99_ms = 1400;
-        let line = aligned_feed_line(&f, 5, Some("pulls spot 735/735 \u{2705}".to_string()));
+        let line = aligned_feed_line(&f, 5);
         assert_eq!(
             line,
-            "<code>Dhan : 1.84M ticks \u{b7} delay 1.4s \u{b7} drops 3 \u{b7} \
-                 pulls spot 735/735 \u{2705}</code>"
+            "<code>Dhan : 1.84M ticks \u{b7} delay 1.4s \u{b7} drops 3</code>"
         );
         let mut f = score_line("Dhan");
         f.ticks = -1;
         f.drops_market = -1;
-        let line = aligned_feed_line(&f, 5, None);
+        let line = aligned_feed_line(&f, 5);
         assert!(!line.contains("ticks"), "{line}");
         assert!(!line.contains("drops"), "{line}");
-        assert!(!line.contains("pulls"), "{line}");
     }
 
     #[test]
