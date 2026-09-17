@@ -196,6 +196,31 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
   - Tests: digit-magnitude SQL literal guard; `compared == 0` ⇒ Blind classification;
     ISIN-join fail-closed + unresolved-named; a ratchet proving the OLD pass has no
     remaining scheduler call site (so the retirement cannot half-land)
+  - > **⚠ SUPERSEDED 2026-09-16 — the REPLACEMENT half is CANCELLED; the RETIREMENT half
+    > is absorbed into Item 43.** This item was queued 2026-08-19 to *replace* the
+    > post-market pass with a Dhan-only NTM + NSE-indices comparison. On 2026-09-16 the
+    > operator ordered the per-minute REST legs and the 15:41 accuracy check REMOVED
+    > ("Bro just remove per minute price falls and 3.41 pm accuracy check alone dude
+    > okay"), recorded verbatim in `no-rest-except-live-feed-2026-06-27.md` §12.10.0. The
+    > later directive governs, and it is not a narrowing of this one — it removes the
+    > mechanism this item planned to rebuild. **A rebuild is not authorized**: the
+    > replacement described here is itself a REST comparison against Dhan's own tape, so
+    > building it would re-add the exact call class the 2026-09-16 directive removes.
+    > Re-opening it needs its own fresh dated quote.
+    >
+    > **This item's own warning is now the permanent state, not a transitional one.** It
+    > says a non-zero `compared` is *"the single measurement that distinguishes 'the Dhan
+    > feed works' from 'the socket is open and silent'"* and that retiring the pass
+    > *"blinds that gate for exactly as long as the replacement is not running"*. Under
+    > Item 43 there IS no replacement, so the blinding is permanent. Recorded here because
+    > this item reached that conclusion independently four weeks earlier — the cost was
+    > known and is now accepted, not discovered.
+    >
+    > **What still stands from this item:** its trap list. The 2026-07-11 blind-since-birth
+    > lesson (nanosecond literals against a microsecond column, `compared=0` reported
+    > honestly while nobody read it) and the rule that `compared == 0` must classify Blind
+    > and never Ok remain the reference for any future comparator, in this repository or
+    > another. Item 43 removes the comparator; it does not retire the lesson.
 
 - [ ] **Item 9 — depth-200 = ATM CE/PE of the current expiry, NIFTY + BANKNIFTY only, with a
   HYSTERESIS re-subscribe policy** — **QUEUED 2026-08-19 by operator directive** (verbatim,
@@ -5666,3 +5691,115 @@ published page.
 **Nothing may be reported as fixed until these move:** backlog 55,060 → ;
 depth rows re-written 228,215,136 → ; disk reads 78 MB/s → ; total bytes
 written 5.02 TB → .
+
+---
+
+## ITEM 43 — DESIGN ADDENDUM (added 2026-09-16, operator: "Bro just remove per minute price falls and 3.41 pm accuracy check alone dude okay", reaffirmed "So once everything is entirely fi ed and resolved then this will be merged and deployed right dude")
+
+- [ ] **Item 43 — Remove the per-minute Dhan REST market-data legs and the 15:41 cross-verification**
+
+**Slot note.** The tree is at exactly 5 `active-plan*.md` files, and `plan-gate.sh` V7
+BLOCKS every `crates/*/src/**.rs` push at 6. This item is therefore added INSIDE this
+plan rather than as a sixth file — the same resolution shape this plan's own header
+records for 2026-08-10, and the same convention Items 5, 10, 11 and 12 follow. Adding a
+sixth file would block every other session's implementation pushes too.
+
+**Authorization and full manifest:** `no-rest-except-live-feed-2026-06-27.md` §12.10
+(the narrowing, and the verification-floor decision), §12.10.7 and §12.10.8 (the
+measured manifest, every row read at the cited line). This addendum is the DESIGN; that
+file is the CONTRACT and its REJECT lists bind.
+
+**Supersedes Item 8** of this plan — see the annotation at Item 8. Its replacement half
+is cancelled; a rebuilt comparator is not authorized.
+
+### Design
+
+Remove two things and nothing else:
+
+1. **The per-minute market-data trio** — `charts/intraday` (spot-1m), `optionchain`,
+   `expirylist`. `CadenceExecutor` declares exactly these three methods
+   (`cadence/executor.rs:291,298,309`), so the scheduler becomes unreachable and the
+   whole cadence tree, `dhan_cadence_executor.rs`, `cadence_escalation.rs`,
+   `cadence_boot.rs`, `spot_1m_rest_boot.rs` and `option_chain_1m_boot.rs` go with it
+   (~19,700 lines of `src/`).
+2. **The 15:41 cross-verification** — `dhan_live_crossverify.rs`,
+   `dhan_live_crossverify_persistence.rs`, `spawn_daily_crossverify`,
+   `install_crossverify_deps`, `run_cross_verification`, `persist_xverify_report`, and
+   **the boot floor that gates on it** (`dhan_feed_stack.rs:12290-12307`).
+
+KEPT, per §12.1 and §12.10.1: auth REST (the socket URL embeds the JWT), the
+instrument-identity REST (a `ParsedTick` carries no symbol, strike, expiry, leg or lot
+size), the order-side surface, and the DEAD class (`ip_verifier`, `ip_monitor`, two
+constants) which "alone" puts out of scope.
+
+The tables and their history are RETAINED. Only the writers go.
+
+### Edge Cases
+
+| Case | Handling |
+|---|---|
+| The boot floor gates on a removed component | Delete floor and comparator together. The binding is used exactly ONCE after `:12290` (`let _crossverify = crossverify;` at `:12307`, never read again), so nothing downstream is stranded. The other five floors — including the WAL floor at `:12314` — are UNTOUCHED. |
+| Floor 2's refusal message names the cross-verification (`:12263-12264`) | Re-word, do not just delete the block around it. |
+| Depth's chain fallback | `load_depth_universe` (`dhan_depth_universe.rs:1244`) is the `None` fallback at `dhan_feed_stack.rs:10161`. Primary is the master artifact (`load_depth_candidates:1090`), confirmed. The fallback would return empty forever, so the branch is deleted with the leg — a fallback that can only return empty is a dead monitor written in code. |
+| `SPOT1M-02` looks like it dies but SURVIVES | Its emit sites include `option_contract_1m_rest_persistence.rs:208,250,318,331`, outside the set. Deleting the variant breaks a surviving module. `SPOT1M-01` and `CHAIN-02` DO die entirely — their "surviving" sites are in `cadence_escalation.rs`, itself in the set. |
+| `SPOT_1M_REST_INDICES` is named for REST but is the live-universe fallback | KEPT. Two `const _: () = assert!(...)` pins in `constants.rs` fail the build on deletion, and `hardcoded_index_universe()` is the real consumer. |
+| Table constants vs retention lists | `partition_retention_coverage_guard` fails in BOTH directions — a constant without a retention entry, and an entry without a constant. They move in the same commit or not at all. |
+
+### Failure Modes
+
+| Mode | Why it is the dangerous one | Mitigation |
+|---|---|---|
+| **`mark_forward` orphaned silently** | `main.rs:2422` is the ONLY consumer of the forwarder binding. Deleting the spawn leaves it alive in `async_main`'s frame, so the channel never closes, `order_runtime.rs:1366`'s "no live mark producer" arm cannot fire, and the paper book runs on a frozen mark with `evaluate_daily_loss_halt` deciding on a stale price. `[cadence] enabled = false` IS loud; the code deletion is silent. | Explicitly drop the binding where the spawn was, so the EXISTING warn fires. Wiring a new producer is out of scope. |
+| **`market-hours-liveness-missing` pages forever** | All three producers of `tv_rest_1m_fire_heartbeat` are in the set, and it is `treat_missing_data = "breaching"`, gate-armed as the FIRST `ALARM_NAMES` entry. | Re-point `metric_name` to `tv_dhan_feed_last_tick_age_secs` (dense, already EMF-selected, published on the 30 s silence timer). `period = 60` and `evaluation_periods = 5` UNCHANGED — this is the only 60-second-period alarm in the gated set and its ~5-minute detection is the point. |
+| **Five surviving readers on frozen tables**, four of them silent | `market_ram_store_boot:435`, `rest_candle_fold:1246,1260`, `tf_consistency_boot:858`, `feed_scoreboard_boot:2444` (+ literal `rest_fetch_audit` at `:2431`), `dhan_depth_universe:828`. | Remove or explicitly record each as inert in the same change. Also the operator console's DEFAULT query (`operator_control_console.html:202`) and the SSM diag SQL. |
+| Dead monitors | 4 metric-filter alarms + 3 `ws-gap-03-xverify-*` alarms + 12 EMF selector entries + 12 dashboard widgets lose producers. `error_code_paging_filter_drift_guard` fails a filter whose code has zero emit sites. | Retire all in the same change. `cloudwatch_app_alarms_wiring.rs:2882,2894` pins an EXACT ws-gap-03 count; `alarm_phrase_coverage_guard` pins the phrase map. |
+| DDL orphaned for retained tables | Every `ensure_*` caller for the retained tables is inside the set. | Re-home one caller per retained table, or a future wipe leaves readers erroring on "table does not exist" instead of returning empty. |
+
+### Test Plan
+
+- `cargo check --workspace` then `cargo test -p` for each touched crate — common, core, storage, app, api, aws-lambdas. `crates/common` changes escalate to `--workspace` per `testing-scope.md`.
+- Re-bless or delete, in the same commit, every guard in the failure classes §12.10.8 and the guard map enumerate: source-scan guards asserting a deleted literal; the EMF selector lockstep and `emf_selector_producer_guard`; `partition_retention_coverage_guard`; `error_code_rule_file_crossref` and `error_code_paging_filter_drift_guard`; `runbook_cross_link_guard` (cited repo paths must resolve); `cloudwatch_app_alarms_wiring` (exact alarm counts); `claude_md_codebase_map_guard` (no table cell may name a deleted file).
+- NEW ratchets this item must add, or the removal can half-land:
+  1. the mark forwarder is explicitly dropped where the cadence spawn was (bite-proven: restore the binding un-dropped and the guard fails);
+  2. the liveness alarm reads `tv_dhan_feed_last_tick_age_secs` with `period = 60` and `evaluation_periods = 5` AND keeps its gate membership;
+  3. zero production call sites remain for `spawn_daily_crossverify` / `install_crossverify_deps` / `CadenceExecutor`;
+  4. the WAL floor and the other four floors still exist in `run_dhan_feed_stack`.
+- Verification that the lane still DIALS: the removal's whole risk is the boot floor, so a test must prove `run_dhan_feed_stack` reaches planning with no crossverify in the tree.
+
+### Rollback
+
+`git revert` of the single squashed commit restores every file, every alarm and every
+guard together — which is why this lands as ONE commit rather than a sequence. The
+config half is independently reversible without a code change: `[cadence] enabled =
+false` already stands the legs down today, so a pre-deploy rollback is a config flip,
+and a post-deploy rollback is the revert plus a redeploy. Nothing in this item is a
+one-way door: no table is dropped, no row is deleted, no schema is migrated.
+
+### Observability
+
+- **Net alarm change:** −7 (4 error-code filters + 3 xverify) and 1 re-pointed. No new
+  alarm and no new EMF name, so **$0.00/mo** — which matters: the September forecast is
+  $142.24 against a $135.00 automatic `STOP_EC2_INSTANCES` line, and §2.3n of the noise
+  lock requires a LEVER for any addition. This item only removes.
+- **What is LOST, stated plainly (§12.10.4):** after this there is ZERO mechanism
+  anywhere in the workspace comparing captured market data against any external record.
+  The India feed has no sequence number and no snapshot-on-subscribe, so nothing else can
+  answer "are the numbers right" — only "did the machinery run". `dhan-no-ticks-flowing`,
+  the `dropped == spilled` equality, `tv_aggregator_tick_refused_total` and the ghost
+  counter all answer the second question only and must never be quoted as answering the
+  first. **No claim that the feed is verified may be made after this lands.**
+- Recorded because it inverts an assumption: the cross-verification's own four metrics
+  and its `DHAN-LIVE-XVERIFY-01` code were in no EMF selector and no alarm. The only
+  ground truth the lane had was never itself monitored.
+
+### Honest envelope
+
+100% inside the tested envelope, with ratcheted regression coverage: the removal is
+mechanical, every deleted symbol's call sites were enumerated at file:line before any
+edit, and the four new ratchets above fail the build if the removal half-lands. **NOT
+claimed:** that the feed still has any external verification — it does not, by design,
+and that is this item's stated cost rather than an oversight. **NOT claimed:** that a
+green build proves the lane still dials — the boot floor is the risk, and the dial test
+is what proves it. **NOT claimed:** any measured post-deploy result; the first session
+after deploy is the measurement, and `dhan-no-ticks-flowing` staying green through an
+open is what would show the lane survived the floor's removal.

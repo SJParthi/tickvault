@@ -85,7 +85,10 @@
 # alarm was a permanently-missing-data dead monitor. Removed with its
 # window-gate ALARM_NAMES row, EMF allowlist entry and dashboard widgets; the
 # market-hours liveness alarm was re-pointed to tv_rest_1m_fire_heartbeat in
-# the same PR (market-hours-liveness-alarm.tf). Dated cost note in
+# the same PR (market-hours-liveness-alarm.tf) — and re-pointed AGAIN on
+# 2026-09-16 to tv_dhan_feed_last_tick_age_secs, when that heartbeat's own
+# producers went with the per-minute REST legs. Same failure shape both
+# times: a breaching-on-missing alarm whose metric loses its writer. Dated cost note in
 # aws-budget.md (COST NOTE 2026-07-15).
 # ---------------------------------------------------------------------------
 

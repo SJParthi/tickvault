@@ -494,137 +494,38 @@ pub enum NotificationEvent {
         detail: String,
     },
 
-    /// Per-minute spot 1m REST pipeline (operator grant 2026-07-12): the
-    /// per-minute pull of the just-closed minute's official index candle
-    /// has fully failed (no index succeeded) for several minutes in a row.
-    /// Fires ONCE per failing episode (edge-triggered, audit-findings
-    /// Rule 4); re-armed only after a successful minute. Severity::High.
-    Spot1mFetchDegraded {
-        /// How many minutes in a row have fully failed.
-        consecutive_failed_minutes: u32,
-        /// The most recent failed minute, IST 12-hour (e.g. "10:42 AM").
-        minute_ist: String,
-    },
-
-    /// The per-minute index candle pull RECOVERED after a failing episode
-    /// (falling edge — one Info ping so the operator knows it self-healed;
-    /// the missing minutes stay absent until re-pulled, never fabricated).
-    Spot1mFetchRecovered {
-        /// The minute that succeeded, IST 12-hour (e.g. "10:45 AM").
-        minute_ist: String,
-        /// How many minutes had fully failed during the episode.
-        failed_minutes: u32,
-    },
-
-    /// Per-SID persistent-empty detector (operator scope addition
-    /// 2026-07-13, relayed via the coordinator session — the INDIA VIX
-    /// live-probe companion): ONE index accumulated N consecutive
-    /// empty/failed minutes in the per-minute spot pull WHILE the other
-    /// indices succeeded in those same minutes — the vendor is not serving
-    /// THIS index, not a general outage. Fires ONCE per SID per episode
-    /// (edge-latched, Rule 4); re-armed only by that SID's own recovery.
-    /// Severity::High.
-    Spot1mSidNotServed {
-        /// The affected index (e.g. "INDIA VIX").
-        symbol: String,
-        /// How many counted minutes in a row this index went unserved.
-        consecutive_minutes: u32,
-    },
-
-    /// A previously-not-served index is being served again (falling edge —
-    /// one Info ping; the missing minutes stay absent until re-pulled,
-    /// never fabricated).
-    Spot1mSidServedRecovered {
-        /// The recovered index (e.g. "INDIA VIX").
-        symbol: String,
-        /// How many counted minutes the index went unserved.
-        not_served_minutes: u32,
-    },
-
-    /// Per-minute option-chain REST pipeline (operator grant 2026-07-12,
-    /// PR-3): the per-minute option-chain snapshot has fully failed for
-    /// several minutes in a row (edge-triggered ONCE per episode, Rule 4;
-    /// re-armed only after a successful minute). Severity::High.
-    ChainFetchDegraded {
-        /// How many minutes in a row have fully failed.
-        consecutive_failed_minutes: u32,
-        /// The most recent failed minute, IST 12-hour (e.g. "10:42 AM").
-        minute_ist: String,
-    },
-
-    /// The per-minute option-chain snapshot RECOVERED after a failing
-    /// episode (falling edge — one Info ping; the missing minutes stay
-    /// absent until re-pulled, never fabricated).
-    ChainFetchRecovered {
-        /// The minute that succeeded, IST 12-hour (e.g. "10:45 AM").
-        minute_ist: String,
-        /// How many minutes had fully failed during the episode.
-        failed_minutes: u32,
-    },
-
-    /// The broker rejected the option-chain data request because the
-    /// account has NO option-chain data subscription (entitlement absent —
-    /// the DH-902 / DATA 806 class). Fired ONCE per day. Severity depends
-    /// on intent: HIGH when the pipeline was switched ON and expected to
-    /// record (actionable — the operator must fix the subscription or
-    /// switch the setting off); INFO when it was only the boot-time
-    /// probe-and-report verdict for a disabled pipeline.
-    ChainEntitlementAbsent {
-        /// `true` when the option-chain pipeline was enabled (expected to
-        /// run); `false` for the probe-only verdict.
-        pipeline_enabled: bool,
-        /// Plain-English detail naming the reject class (already
-        /// secret-redacted + bounded at the emit site).
-        detail: String,
-    },
-
-    /// The boot-time option-chain probe CONFIRMED the account IS entitled
-    /// to option-chain data while this dedicated pipeline is disabled —
-    /// one Info ping confirming the minute-cadence engine's per-minute
-    /// chain pulls have the data they need (2026-07-18 reword: a disabled
-    /// dedicated leg is never presented as "recording is off" while the
-    /// cadence lane records the same chains).
-    ChainEntitlementConfirmed,
-
-    /// The day-start expiry-date lookup for the option chain failed after
-    /// bounded retries — the chain recording stays OFF for the day
-    /// (expiry dates come ONLY from the broker's list, never guessed).
-    /// One HIGH page per day (CHAIN-04).
-    ChainExpirylistFailed {
-        /// Plain-English detail (already secret-redacted + bounded at the
-        /// emit site).
-        detail: String,
-    },
-
-    /// Per-underlying not-served detector on the DHAN chain leg
-    /// (2026-07-14 — the Dhan mirror of the Groww #1537 detector; the
-    /// NIFTY expiry-day vendor-cutoff companion): ONE underlying
-    /// accumulated N consecutive empty/failed minutes in the per-minute
-    /// Dhan option-chain pull WHILE the other underlyings succeeded in
-    /// those same minutes — the vendor is not serving THIS underlying's
-    /// chain, not a general outage. Fires ONCE per underlying per episode
-    /// (edge-latched, Rule 4); re-armed only by that underlying's own
-    /// recovery. Severity::High. Noise-lock family-(2) extension per
-    /// `dhan-rest-only-noise-lock-2026-07-14.md` §2.1.
-    Chain1mUnderlyingNotServed {
-        /// The affected underlying (a pinned plain symbol, e.g. "NIFTY").
-        underlying: &'static str,
-        /// How many counted minutes in a row this underlying's chain
-        /// went unserved.
-        empty_minutes: u32,
-    },
-
-    /// A previously-not-served underlying's Dhan chain is being served
-    /// again (falling edge — one Info ping; the missing minutes stay
-    /// absent until re-pulled, never fabricated, never copied across
-    /// brokers).
-    Chain1mUnderlyingServedRecovered {
-        /// The recovered underlying (a pinned plain symbol, e.g. "NIFTY").
-        underlying: &'static str,
-        /// How many counted minutes the underlying's chain went unserved.
-        empty_minutes: u32,
-    },
-
+    // ---- The ELEVEN per-minute REST-leg variants are RETIRED 2026-09-17 ----
+    //
+    // `Spot1mFetchDegraded` / `Spot1mFetchRecovered` / `Spot1mSidNotServed` /
+    // `Spot1mSidServedRecovered` / `ChainFetchDegraded` /
+    // `ChainFetchRecovered` / `ChainEntitlementAbsent` /
+    // `ChainEntitlementConfirmed` / `ChainExpirylistFailed` /
+    // `Chain1mUnderlyingNotServed` / `Chain1mUnderlyingServedRecovered`
+    // carried Dhan Telegram families 1 and 2: the per-minute spot-1m pull
+    // failing/recovered, and the option-chain pull failing/recovered
+    // (including the 2026-07-14 per-underlying pair and the entitlement
+    // probe verdicts).
+    //
+    // Their PRODUCERS were removed by the operator's SOCKETS-ONLY narrowing
+    // ("Bro just remove per minute price falls and 3.41 pm accuracy check
+    // alone dude okay") — `spot_1m_rest_boot.rs`, `option_chain_1m_boot.rs`,
+    // `cadence_escalation.rs` and `dhan_cadence_executor.rs` are all gone —
+    // so none of the eleven had a production constructor left, and
+    // `notification_variant_dispatch_guard` said so by failing the build.
+    //
+    // DELETED rather than allowlisted onto `NO_PRODUCTION_DISPATCHER`, which
+    // exists for a variant BETWEEN producers, not one whose producer was
+    // removed by directive. Keeping them would have left eleven rendered,
+    // severity-carrying, test-covered events that read as a live Telegram
+    // family in every surface a reader consults and can never fire — the
+    // permanently-quiet-surface class. Same shape, same answer as the
+    // `CadenceExpiryDisagreement` retirement of 2026-08-21.
+    //
+    // Full record, including what is LOST (while the legs ran, these were
+    // the ONLY signal that either pull had stopped) and the family-(3)
+    // body-wording follow-up: `dhan-rest-only-noise-lock-2026-07-14.md`
+    // §2.4. The surviving Dhan set is families 3 and 4 plus the family-(5)
+    // live-lane signals.
     /// Once-per-trading-day Dhan-vs-Groww scorecard at 3:45 PM IST
     /// (operator directive 2026-07-10 — run both feeds live for a month,
     /// everything tracked + blame-attributed). Severity::Info +
@@ -659,16 +560,6 @@ pub enum NotificationEvent {
         /// race: the verdict says "no contest" instead of declaring a
         /// winner (round-4 hostile review 2026-07-10).
         dhan_feed_off: bool,
-        /// Official minute-candle pull digest lines (Groww REST plan PR-5,
-        /// operator Quote 2 2026-07-13): one plain-English line per
-        /// feed/pull-family answering "within how many seconds precisely"
-        /// with MEASURED numbers. Empty = the digest is not wired for this
-        /// card (older callers / tests) — the section is simply omitted.
-        rest_legs: Vec<RestLegScoreLine>,
-        /// `true` when the day's per-pull records could not be read while
-        /// building this card — the candle-pull lines may under-count or
-        /// read "not measured yet" (honest cause footnote, Rule 11).
-        rest_legs_read_failed: bool,
     },
 
     /// The daily dual-feed scorecard TASK died (panicked / errored) before
@@ -1300,51 +1191,23 @@ pub struct FeedScoreLine {
     pub streaming_minutes: i64,
 }
 
-/// One official-minute-candle pull digest line on the daily scorecard
-/// (Groww REST plan PR-5, operator Quote 2 2026-07-13: *"always clearly
-/// note within a second — or within how many seconds precisely — we are
-/// fetching this live real OHLCV, along with the option chain API"*).
-///
-/// `-1` on any field means "not measured / not recorded" and renders
-/// honestly (never a fabricated zero — audit Rule 11). Every number is
-/// MEASURED from the day's per-pull records — the line never asserts a
-/// freshness it did not observe.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RestLegScoreLine {
-    /// Feed display name ("Dhan" / "Groww").
-    pub feed: String,
-    /// Pull-family display name ("spot candles" / "option chain" /
-    /// "option contracts") — already plain English, never a wire slug.
-    pub leg: String,
-    /// Pulls that retrieved their target minute; `-1` = counts not
-    /// recorded for this feed/family yet.
-    pub ok_fetches: i64,
-    /// Pulls that ended without the target minute; `-1` = not recorded.
-    pub failed_fetches: i64,
-    /// Minutes that NEVER got repaired (post-close sweep included);
-    /// `-1` = not recorded.
-    pub named_gaps: i64,
-    /// `named_gap` rows classed `pre_boot` — minutes from before this
-    /// app start (bookkeeping, NOT pull failures; rendered separately
-    /// from "never recovered" — Fix E, 2026-07-17); `-1` = not recorded.
-    pub pre_boot_gaps: i64,
-    /// How many rate-limit rejections the day's pulls hit; `-1` unknown.
-    pub rate_limited_hits: i64,
-    /// Pulls repaired LATE (retrieved ≥60s after the minute closed — a
-    /// later pull's catch-up, not the prompt fetch); `-1` unknown.
-    pub late_recovered: i64,
-    /// Prompt-pull minute-close → data delay, median ms; `-1` = not
-    /// measured.
-    pub close_p50_ms: i64,
-    /// Prompt-pull worst-1% delay ms; `-1` = not measured.
-    pub close_p99_ms: i64,
-    /// Prompt-pull slowest delay ms; `-1` = not measured.
-    pub close_max_ms: i64,
-    /// How many prompt pulls the delay distribution is built from;
-    /// `-1` = no delay source at all, `0` = measured zero (every pull
-    /// failed).
-    pub close_samples: i64,
-}
+// ---- `RestLegScoreLine` is RETIRED 2026-09-17 ----
+//
+// One official-minute-candle pull digest line on the daily scorecard —
+// the operator's 2026-07-13 Quote 2 ("within how many seconds precisely").
+// Twelve `i64` fields, every one carrying a `-1` "not measured" sentinel so
+// a missing source rendered honestly instead of as a fabricated zero.
+//
+// Retired with its producer: the scoreboard's REST 1m pull digest read
+// `rest_fetch_audit` and `rest_spot_1m`, and nothing has written either
+// since the operator's SOCKETS-ONLY narrowing removed the per-minute
+// spot-1m and option-chain legs (`no-rest-except-live-feed-2026-06-27.md`
+// §12.10, disposition table §12.11).
+//
+// The `-1`-sentinel DISCIPLINE this type carried is NOT retired — it is
+// the house pattern for every scorecard number, and `FeedScoreLine` above
+// still uses it. Only the pull-family line is gone, because there is no
+// pull to measure.
 
 /// Compact IST date for card headers (`"2026-07-14"` → `"14 Jul"`) so a
 /// past-day backfill / forced-run card is distinguishable from today's at
@@ -1369,129 +1232,54 @@ fn render_compact_date_ist(date: &str) -> String {
     }
 }
 
-/// Compact per-leg label for the pulls segment: the digest leg display
-/// names ("spot candles" / "option chain" / "option contracts") shorten
-/// to one word so the two feed lines never wrap; an unknown future leg
-/// keeps its full plain-English name (never a wire slug — commandment 2).
-fn compact_leg_label(leg: &str) -> &str {
-    match leg {
-        "spot candles" => "spot",
-        "option chain" => "chain",
-        "option contracts" => "contracts",
-        other => other,
-    }
-}
+// ---- `compact_leg_label` is RETIRED 2026-09-17 ----
+//
+// It shortened the pulls segment's leg display names ("spot candles" ->
+// "spot", "option chain" -> "chain", "option contracts" -> "contracts") so
+// the two feed lines never wrapped, and passed ANY unknown leg through
+// verbatim rather than guessing.
+//
+// Orphaned by `render_pulls_per_leg`'s retirement below — it had exactly
+// one caller. Dead code, and `-D warnings` rejects it.
+//
+// Its RULE is NOT retired and still binds every surviving label on every
+// operator-facing surface: the fall-through returned the leg's full
+// PLAIN-ENGLISH name, never a wire slug, because Telegram commandment 2
+// bans library/wire names in an operator's message. A future renderer that
+// shortens a label must keep that fall-through shape.
 
-/// PER-LEG official-minute-candle pull segment for ONE feed (F3,
-/// 2026-07-15 fix round): renders each MEASURED leg compactly —
-/// `pulls spot 735/735 (1.8s), chain 733/735 (2.1s) ✅` — with one
-/// overall mark and the never-recovered note. The bracketed figure is
-/// the leg's worst-1% (p99) seconds-after-close pull delay (G7, fix
-/// round 2 — restores the operator's Quote-2 "how many seconds
-/// precisely" answer on the card in ONE compact figure per leg). Legs
-/// on the documented latency-only fallback source (counts `-1`,
-/// latency MEASURED — the `spot_1m_rest` forensics-writer-outage /
-/// pre-2026-07-14 arm) render count-less as `spot (1.8s)` (G6 — never
-/// dropped, never logged "not measured"). Legs with NOTHING measured
-/// render NOTHING on the card (the operator's 2026-07-15 escalation
-/// demanded suppressing unmeasured lines on the phone); `None` when no
-/// leg for the feed carries any measurement.
-///
-/// RULE-CONTRACT TENSION, recorded deliberately (see the plan file's
-/// Observability section): `dual-feed-scoreboard-error-codes.md` §2b
-/// mandates the four canonical feed/leg pairs ALWAYS render, with an
-/// absent source reading "not measured yet" — and, with
-/// `rest-1m-pipeline-error-codes.md` §3, a per-leg p50/p99/max delay
-/// digest. This card intentionally deviates per the operator's direct
-/// 2026-07-15 cleanliness escalation — unmeasured pairs move to the
-/// day's LOGS (`feed_scoreboard_boot::log_rest_leg_measurement_gaps`,
-/// fired from the aggregation path on EVERY run) and the delay digest folds to
-/// the ONE p99 figure above — PENDING the rule-file supersession the
-/// operator must land with a dated quote. Rule files are not editable
-/// in this PR.
-fn render_pulls_per_leg(rest_legs: &[RestLegScoreLine], feed: &str) -> Option<String> {
-    let mut parts: Vec<String> = Vec::new();
-    let mut gaps = 0i64;
-    let mut pre_boot = 0i64;
-    // R2 (fix round 3): the verdict mark is three-state and never
-    // fabricated — ✅ only when EVERY rendered leg is FULLY counted
-    // (ok >= 0 AND failed >= 0) and failure-free; ⚠️ when any counted
-    // failure / never-recovered gap exists (real trouble wins over
-    // partial data); NO mark when any rendered leg is latency-only or
-    // failed-count-unmeasured (the spot_1m_rest fallback exists exactly
-    // for forensics-writer outages, where failures are invisible — a
-    // green check there was a Rule-11 false-OK).
-    let mut any_failure = false;
-    let mut any_unmeasured = false;
-    for l in rest_legs {
-        if !l.feed.eq_ignore_ascii_case(feed) {
-            continue;
-        }
-        // p99 seconds-after-close, rendered only when genuinely measured
-        // (samples > 0 guards a zero-sample day from fabricating "0.0s").
-        let p99 = (l.close_p99_ms >= 0 && l.close_samples > 0)
-            .then(|| render_compact_secs(l.close_p99_ms));
-        if l.ok_fetches >= 0 {
-            if l.failed_fetches >= 0 {
-                // Fully counted leg: the only shape that may render x/y.
-                let total = l.ok_fetches.saturating_add(l.failed_fetches);
-                let counts = format!("{} {}/{total}", compact_leg_label(&l.leg), l.ok_fetches);
-                parts.push(match p99 {
-                    Some(secs) => format!("{counts} ({secs})"),
-                    None => counts,
-                });
-                if l.ok_fetches != total {
-                    any_failure = true;
-                }
-            } else {
-                // Failure count unmeasured (-1 sentinel): "x/x" would
-                // imply zero failures — render the ok count alone.
-                let counts = format!("{} {} ok", compact_leg_label(&l.leg), l.ok_fetches);
-                parts.push(match p99 {
-                    Some(secs) => format!("{counts} ({secs})"),
-                    None => counts,
-                });
-                any_unmeasured = true;
-            }
-        } else if let Some(secs) = p99 {
-            // Latency-only fallback leg (G6): the delay WAS measured —
-            // render it count-less instead of dropping the measurement.
-            parts.push(format!("{} ({secs})", compact_leg_label(&l.leg)));
-            any_unmeasured = true;
-        }
-        if l.named_gaps > 0 {
-            gaps = gaps.saturating_add(l.named_gaps);
-        }
-        if l.pre_boot_gaps > 0 {
-            // Fix E round 1: pre-boot gaps are bookkeeping (minutes from
-            // before this app start), never pull failures — summed here so
-            // they render, but they never flip the failure mark.
-            pre_boot = pre_boot.saturating_add(l.pre_boot_gaps);
-        }
-    }
-    if parts.is_empty() {
-        return None;
-    }
-    if gaps > 0 {
-        any_failure = true;
-    }
-    let mut seg = if any_failure {
-        format!("pulls {} \u{26a0}\u{fe0f}", parts.join(", "))
-    } else if any_unmeasured {
-        // Partially-unmeasured day: no verdict mark — the numbers shown
-        // are honest, but a clean/degraded verdict is unknowable.
-        format!("pulls {}", parts.join(", "))
-    } else {
-        format!("pulls {} \u{2705}", parts.join(", "))
-    };
-    if gaps > 0 {
-        seg.push_str(&format!("; {gaps} never recovered \u{26a0}\u{fe0f}"));
-    }
-    if pre_boot > 0 {
-        seg.push_str(&format!("; {pre_boot} from before app start"));
-    }
-    Some(seg)
-}
+// ---- `render_pulls_per_leg` is RETIRED 2026-09-17 ----
+//
+// It rendered ONE feed's per-leg pull segment on the daily scorecard —
+// `pulls spot 735/735 (1.8s), chain 733/735 (2.1s) ✅` — with a
+// THREE-STATE verdict mark that is worth recording because it is the
+// pattern, not the numbers, that mattered: ✅ only when every rendered leg
+// was fully counted AND failure-free; ⚠️ on any counted failure or
+// never-recovered gap; and NO mark at all when any leg was latency-only or
+// had an unmeasured failure count — because a green check over a leg whose
+// failures are invisible is a Rule-11 false-OK.
+//
+// Retired with `RestLegScoreLine` and the scoreboard digest that fed it:
+// nothing has written `rest_fetch_audit` or `rest_spot_1m` since the
+// operator's SOCKETS-ONLY narrowing removed the per-minute legs
+// (`no-rest-except-live-feed-2026-06-27.md` §12.10 / §12.11).
+//
+// ⚠ Recorded because it bears on §12.9(a)'s reading of this reader: the
+// function returned `None` when no leg produced a part, so an empty
+// aggregate OMITTED the pulls segment rather than printing "0/0 ✅". The
+// post-removal render was therefore honest on its own; what made the
+// removal right is a dead subsystem reading as live, not a false green.
+//
+// It also carried a RULE-CONTRACT TENSION, closed here rather than left
+// dangling: `dual-feed-scoreboard-error-codes.md` §2b mandates that the
+// four canonical feed/leg pairs ALWAYS render with an absent source
+// reading "not measured yet", while the operator's 2026-07-15 cleanliness
+// escalation demanded unmeasured lines be suppressed on the phone. The
+// code followed the operator and the comment flagged the deviation as
+// PENDING a rule-file supersession. With the legs gone there are no pairs
+// to render and the tension is moot — but §2b still says four pairs always
+// render, so a future per-minute family must resolve it rather than
+// inherit this note.
 
 /// Compact tick-count renderer for the aligned feed stat line: millions
 /// render as `1.94M` (the line must stay short enough to never wrap);
@@ -1520,7 +1308,14 @@ fn render_compact_secs(ms: i64) -> String {
 /// Unmeasured `-1` fields are OMITTED — never "?", never "not measured"; a
 /// feed with ZERO measured fields renders one honest plain line instead
 /// (never silent).
-fn aligned_feed_line(f: &FeedScoreLine, name_width: usize, pulls: Option<String>) -> String {
+/// ⚠ 2026-09-17: the third parameter `pulls: Option<String>` is RETIRED.
+/// It carried the per-leg REST pull segment rendered by the (now retired)
+/// `render_pulls_per_leg`, and after that retirement the single production
+/// caller could only ever pass `None` — a branch that can never be taken is
+/// not a capability, it is dead code wearing one. Restoring a per-leg
+/// segment means restoring its renderer, not re-adding a parameter nothing
+/// can fill.
+fn aligned_feed_line(f: &FeedScoreLine, name_width: usize) -> String {
     let mut segments: Vec<String> = Vec::new();
     if f.ticks >= 0 {
         segments.push(format!("{} ticks", render_compact_count(f.ticks)));
@@ -1530,9 +1325,6 @@ fn aligned_feed_line(f: &FeedScoreLine, name_width: usize, pulls: Option<String>
     }
     if f.drops_market >= 0 {
         segments.push(format!("drops {}", f.drops_market));
-    }
-    if let Some(p) = pulls {
-        segments.push(p);
     }
     if segments.is_empty() {
         // Wholly unmeasured feed: honest, not silent (audit Rule 11).
@@ -1714,20 +1506,13 @@ impl NotificationEvent {
             // ── Dhan-scoped: instrument master build ──
             | Self::InstrumentBuildSuccess { .. }
             | Self::InstrumentBuildFailed { .. }
-            // ── Dhan-scoped: per-minute REST legs (spot 1m + option
-            //    chain) — operator directive 2026-07-14: the pull alerts
-            //    must name the feed AND the leg ──
-            | Self::Spot1mFetchDegraded { .. }
-            | Self::Spot1mFetchRecovered { .. }
-            | Self::Spot1mSidNotServed { .. }
-            | Self::Spot1mSidServedRecovered { .. }
-            | Self::ChainFetchDegraded { .. }
-            | Self::ChainFetchRecovered { .. }
-            | Self::Chain1mUnderlyingNotServed { .. }
-            | Self::Chain1mUnderlyingServedRecovered { .. }
-            | Self::ChainEntitlementAbsent { .. }
-            | Self::ChainEntitlementConfirmed
-            | Self::ChainExpirylistFailed { .. }
+            // ── Dhan-scoped: the ELEVEN per-minute REST-leg arms (spot 1m +
+            //    option chain) were RETIRED 2026-09-17 with Dhan Telegram
+            //    families 1 and 2, whose producers the operator's
+            //    SOCKETS-ONLY narrowing removed. Record:
+            //    `dhan-rest-only-noise-lock-2026-07-14.md` §2.4. The
+            //    2026-07-14 broker-naming directive they served is UNCHANGED
+            //    and still binds every surviving arm in this list. ──
             // ── Dhan-scoped: market-open milestones (count the Dhan pool
             //    + order-update WS) ──
             | Self::MarketOpenStreamingConfirmation { .. }
@@ -1805,6 +1590,25 @@ impl NotificationEvent {
                 // line reports the DHAN per-minute REST legs — say so, and
                 // note the Groww per-minute legs report on their own
                 // alerts (they are config-gated in their own modules).
+                // ⚠ 2026-09-17: only the (false, false) arm is REACHABLE.
+                // `main.rs` passes DHAN_PER_MINUTE_LEGS_EXIST (a const `false`)
+                // for both fields, because the per-minute Dhan REST legs were
+                // removed on 2026-09-16.
+                //
+                // The three "armed" arms are KEPT rather than deleted: they are
+                // the record of what this line reported while the legs existed,
+                // and the event's shape is read by 43 sites, so collapsing it
+                // here would be a far wider change than the removal called for.
+                // They are NOT a latent false page — reaching one requires
+                // flipping DHAN_PER_MINUTE_LEGS_EXIST, which fails
+                // `boot_report_capture_claim_guard` until a producing module
+                // actually exists.
+                //
+                // Note their text still carries "(Groww per-minute legs report
+                // separately)", false since the 2026-08-21 Groww removal. Left
+                // as written because these arms are unreachable and the
+                // sentence is part of the historical record; the arm that DOES
+                // render is corrected below.
                 let capture_line = match (spot_1m_enabled, chain_1m_enabled) {
                     (true, true) => format!(
                         "\u{2705} Dhan per-minute price capture — armed \
@@ -1827,8 +1631,29 @@ impl NotificationEvent {
                          indices; Dhan spot candles — switched off (Groww \
                          per-minute legs report separately)"
                     ),
-                    (false, false) => "Dhan per-minute price capture — switched off \
-                         (Groww per-minute legs report separately)"
+                    // The ONLY reachable arm since 2026-09-16: `main.rs`
+                    // constant-folds both operands to
+                    // DHAN_PER_MINUTE_LEGS_EXIST = false, because the
+                    // per-minute Dhan REST legs were REMOVED under the
+                    // operator's sockets-only directive.
+                    //
+                    // Reworded 2026-09-17, twice over. It read "switched off
+                    // (Groww per-minute legs report separately)":
+                    //
+                    //   - "switched off" invites "then switch it on". There is
+                    //     no switch — the modules are deleted. An operator
+                    //     acting on the old wording would hunt for a flag that
+                    //     cannot do anything.
+                    //   - the Groww clause named a feed REMOVED on 2026-08-21,
+                    //     so it had been false on the operator's phone for a
+                    //     month, in this arm and in the three above it.
+                    //
+                    // Says what IS capturing instead of only what is not: a
+                    // line that reports an absence and stops there reads like
+                    // an outage.
+                    (false, false) => "Dhan per-minute REST price capture — REMOVED \
+                         (sockets-only, 16 Sep). Market data now comes from the \
+                         live socket feed, not per-minute pulls"
                         .to_string(),
                 };
                 format!(
@@ -2207,204 +2032,6 @@ impl NotificationEvent {
                      2. Restart the app to re-arm tomorrow's check."
                 )
             }
-            Self::Spot1mFetchDegraded {
-                consecutive_failed_minutes,
-                minute_ist,
-            } => {
-                format!(
-                    "\u{1f198} <b>Minute-by-minute spot index candle pull is FAILING</b>\n\
-                     The per-minute pull of Dhan's official 1-minute candle \
-                     for NIFTY, BANKNIFTY and SENSEX has failed \
-                     {consecutive_failed_minutes} minutes in a row (latest \
-                     failed minute: {minute_ist} IST).\n\
-                     Live streaming prices are NOT affected — only the \
-                     per-minute official record copy is missing.\n\
-                     What to do RIGHT NOW:\n\
-                     1. Check the Dhan data subscription is still active.\n\
-                     2. If live streaming prices ALSO stopped, treat it as a \
-                     full data outage.\n\
-                     3. Missing minutes fill in safely once the pull recovers."
-                )
-            }
-            Self::Spot1mFetchRecovered {
-                minute_ist,
-                failed_minutes,
-            } => {
-                format!(
-                    "\u{2705} <b>Minute-by-minute spot index candle pull recovered</b>\n\
-                     The per-minute official candle pull is working again as \
-                     of {minute_ist} IST, after {failed_minutes} failed \
-                     minute(s). The minutes that failed stay blank in the \
-                     record until re-pulled — nothing is made up."
-                )
-            }
-            Self::Spot1mSidNotServed {
-                symbol,
-                consecutive_minutes,
-            } => {
-                format!(
-                    "\u{1f198} <b>Dhan is not returning 1-minute candles for \
-                     {symbol}</b>\n\
-                     For {consecutive_minutes} minutes in a row the official \
-                     1-minute candle for {symbol} was missing from the \
-                     per-minute pull while the other indices came through \
-                     fine — the other indices are unaffected, so this looks \
-                     like Dhan not serving THIS index, not a general \
-                     outage.\n\
-                     Live streaming prices are NOT affected — only the \
-                     per-minute official record copy for {symbol} is \
-                     missing.\n\
-                     What to do RIGHT NOW:\n\
-                     1. Nothing urgent — the other indices keep recording \
-                     normally.\n\
-                     2. If this fires every day, ask Dhan whether \
-                     1-minute candles exist for this index at all.\n\
-                     3. Missing minutes fill in safely if Dhan starts \
-                     serving them."
-                )
-            }
-            Self::Spot1mSidServedRecovered {
-                symbol,
-                not_served_minutes,
-            } => {
-                format!(
-                    "\u{2705} <b>Dhan is serving 1-minute candles for \
-                     {symbol} again</b>\n\
-                     The per-minute official candle pull for {symbol} is \
-                     working again after {not_served_minutes} missed \
-                     minute(s). The minutes that were missed stay blank in \
-                     the record until re-pulled — nothing is made up."
-                )
-            }
-            Self::ChainFetchDegraded {
-                consecutive_failed_minutes,
-                minute_ist,
-            } => {
-                format!(
-                    "\u{1f198} <b>Minute-by-minute option chain recording is FAILING</b>\n\
-                     The per-minute option chain snapshot for NIFTY, BANKNIFTY \
-                     and SENSEX has failed {consecutive_failed_minutes} minutes \
-                     in a row (latest failed minute: {minute_ist} IST).\n\
-                     Live streaming prices are NOT affected — only the \
-                     per-minute option chain record is missing.\n\
-                     What to do RIGHT NOW:\n\
-                     1. Check the Dhan data subscription is still active.\n\
-                     2. If live streaming prices ALSO stopped, treat it as a \
-                     full data outage.\n\
-                     3. Missing minutes stay blank — nothing is made up."
-                )
-            }
-            Self::ChainFetchRecovered {
-                minute_ist,
-                failed_minutes,
-            } => {
-                format!(
-                    "\u{2705} <b>Minute-by-minute option chain recording recovered</b>\n\
-                     The per-minute option chain snapshot is working again as \
-                     of {minute_ist} IST, after {failed_minutes} failed \
-                     minute(s). The minutes that failed stay blank in the \
-                     record until re-pulled — nothing is made up."
-                )
-            }
-            Self::ChainEntitlementAbsent {
-                pipeline_enabled,
-                detail,
-            } => {
-                let detail = html_escape(detail);
-                if *pipeline_enabled {
-                    format!(
-                        "\u{1f198} <b>Option chain recording CANNOT run — no data \
-                         subscription</b>\n\
-                         Dhan refused the option chain data request: this \
-                         account has NO option chain data subscription right now.\n\
-                         Dhan said: {detail}\n\
-                         Option chain recording stays OFF for today. Live \
-                         streaming prices are NOT affected.\n\
-                         What to do RIGHT NOW:\n\
-                         1. Buy/renew the option chain data subscription with \
-                         Dhan, OR\n\
-                         2. Turn the option chain recording setting off so this \
-                         alert stops."
-                    )
-                } else {
-                    format!(
-                        "\u{1f514} <b>Option chain check: NOT available on this \
-                         account</b>\n\
-                         Today's one-time check confirmed the Dhan account has \
-                         NO option chain data subscription (Dhan said: \
-                         {detail}).\n\
-                         Nothing is broken on our side — no setting is at \
-                         fault; Dhan option chain data cannot be recorded \
-                         until the subscription is bought with Dhan. If the \
-                         minute-cadence engine is on, its own alerts will \
-                         show the failed Dhan chain pulls until then."
-                    )
-                }
-            }
-            Self::ChainEntitlementConfirmed => "\u{2705} <b>Option chain data IS available on \
-                 this account</b>\n\
-                 Today's one-time check confirmed Dhan WILL serve option \
-                 chain data. Minute-by-minute recording is handled by the \
-                 minute-cadence engine — when that engine is on, chains \
-                 record automatically; nothing else to do."
-                .to_string(),
-            Self::ChainExpirylistFailed { detail } => {
-                let detail = html_escape(detail);
-                format!(
-                    "\u{1f198} <b>Option chain recording could NOT start today</b>\n\
-                     The day-start lookup of option expiry dates failed after \
-                     several tries, so option chain recording stays OFF for \
-                     today (expiry dates are never guessed).\n\
-                     Dhan said: {detail}\n\
-                     Live streaming prices are NOT affected. Tomorrow's start \
-                     retries automatically.\n\
-                     What to do RIGHT NOW:\n\
-                     1. Check the Dhan data connection is healthy.\n\
-                     2. If this repeats daily, contact Dhan."
-                )
-            }
-            Self::Chain1mUnderlyingNotServed {
-                underlying,
-                empty_minutes,
-            } => {
-                format!(
-                    "\u{1f198} <b>Dhan is not returning the option chain for \
-                     {underlying}</b>\n\
-                     For {empty_minutes} minutes in a row the per-minute \
-                     option chain for {underlying} came back empty from Dhan \
-                     while the other indices came through fine — the other \
-                     indices are unaffected, so this looks like the broker \
-                     not serving THIS index's chain, not a general outage.\n\
-                     Live streaming prices are NOT affected — only Dhan's \
-                     per-minute option chain record for {underlying} is \
-                     missing; the same minutes may still be coming in from \
-                     the second broker (\u{1f7e2} GROWW), which records into \
-                     the same book with its own label.\n\
-                     What to do RIGHT NOW:\n\
-                     1. Nothing urgent — the other indices keep recording \
-                     normally, and the Groww copy covers {underlying} for \
-                     these minutes IF Groww is serving it.\n\
-                     2. On an expiry day this is usually the broker cutting \
-                     off the expiring chain early — it comes back with the \
-                     next expiry.\n\
-                     3. Missing Dhan minutes stay blank — nothing is made up \
-                     and nothing is copied across brokers."
-                )
-            }
-            Self::Chain1mUnderlyingServedRecovered {
-                underlying,
-                empty_minutes,
-            } => {
-                format!(
-                    "\u{2705} <b>Dhan is serving the option chain for \
-                     {underlying} again</b>\n\
-                     The per-minute option chain for {underlying} from Dhan \
-                     is working again after {empty_minutes} empty minute(s). \
-                     The minutes that were missed stay blank in Dhan's record \
-                     — nothing is made up; check the Groww copy for those \
-                     minutes if they matter."
-                )
-            }
             Self::DualFeedDailyScorecard {
                 trading_date_ist,
                 dhan,
@@ -2414,8 +2041,6 @@ impl NotificationEvent {
                 early_run,
                 restart_partial,
                 dhan_feed_off,
-                rest_legs,
-                rest_legs_read_failed,
             } => {
                 // Telegram cleanliness overhaul (2026-07-15): verdict line
                 // FIRST (one emoji + one sentence), then one aligned
@@ -2425,8 +2050,7 @@ impl NotificationEvent {
                 // explanatory footnotes are deleted; the dropped per-leg
                 // pull freshness / exclusive-minute / streaming detail
                 // stays in the day's stored records and the portal.
-                let caveat =
-                    *partial_coverage || *degraded || *restart_partial || *rest_legs_read_failed;
+                let caveat = *partial_coverage || *degraded || *restart_partial;
                 // The cross-feed CONTEST verdict was removed with the second
                 // broker on 2026-08-21 — one feed cannot win against nobody.
                 // What replaces it is not "one-feed day", which was a
@@ -2473,38 +2097,35 @@ impl NotificationEvent {
                     "{emoji} <b>Feed scorecard 3:45 PM \u{b7} {date}</b> \u{2014} \
                      {verdict_sentence}{early}"
                 ));
-                // G8 (fix round 2): a broken pull-record READ renders an
-                // explicit token on the feed lines (incl. the feed-off
-                // line) — never silently omitted; previously only the
-                // shared floor caveat fired, indistinguishable from
-                // "no pull data exists" on the (permanent) Dhan
-                // feed-off day.
-                let pulls_for = |name: &str| -> Option<String> {
-                    if *rest_legs_read_failed {
-                        Some("pulls: records unreadable \u{26a0}\u{fe0f}".to_string())
-                    } else {
-                        render_pulls_per_leg(rest_legs, name)
-                    }
-                };
+                // The `pulls_for` closure is RETIRED 2026-09-17 with the
+                // REST pull digest. G8 (fix round 2) made a broken
+                // pull-record READ render an explicit "records unreadable"
+                // token on every feed line INCLUDING the feed-off line,
+                // rather than relying on the shared floor caveat — which
+                // was indistinguishable from "no pull data exists". With no
+                // pull records to read there is nothing to be unreadable.
+                // Record: `no-rest-except-live-feed-2026-06-27.md` §12.10.
                 let name_width = dhan.name.chars().count();
                 for (off, f) in [(dhan_feed_off, dhan)] {
                     if *off {
                         // A deliberately-switched-off feed is ONE honest
                         // line — never a wall of zeros, never a winner.
-                        // F2 (2026-07-15 fix round): the OFF line still
-                        // carries the pull digest when pull data exists —
-                        // on current prod every day is a Dhan feed-off day
-                        // (live WS retired) while the Dhan spot-1m/chain
-                        // REST pulls are the operator's most-watched
-                        // signal. Omitted only when there are genuinely no
-                        // measured pull rows for the feed.
-                        let mut off_line = format!("{}: OFF today (excluded from verdict)", f.name);
-                        if let Some(p) = pulls_for(&f.name) {
-                            off_line.push_str(&format!(" \u{b7} {p}"));
-                        }
+                        //
+                        // ⚠ 2026-09-17: the F2 (2026-07-15) note that stood
+                        // here said the OFF line "still carries the pull
+                        // digest when pull data exists — on current prod
+                        // every day is a Dhan feed-off day (live WS
+                        // retired) while the Dhan spot-1m/chain REST pulls
+                        // are the operator's most-watched signal." All
+                        // three halves are now false: the live WS came BACK
+                        // on 2026-08-11, the REST pulls are GONE
+                        // (`no-rest-except-live-feed-2026-06-27.md` §12.10),
+                        // and there is no digest to carry. The OFF line is
+                        // one line, full stop.
+                        let off_line = format!("{}: OFF today (excluded from verdict)", f.name);
                         lines.push(off_line);
                     } else {
-                        lines.push(aligned_feed_line(f, name_width, pulls_for(&f.name)));
+                        lines.push(aligned_feed_line(f, name_width));
                     }
                 }
                 // Incidents line: rendered ONLY when any blame/stall/
@@ -3104,17 +2725,6 @@ impl NotificationEvent {
             Self::TfConsistencySummary { .. } => "TfConsistencySummary",
             Self::TfConsistencyAborted { .. } => "TfConsistencyAborted",
             Self::SpotCrossverifyAborted { .. } => "SpotCrossverifyAborted",
-            Self::Spot1mFetchDegraded { .. } => "Spot1mFetchDegraded",
-            Self::Spot1mFetchRecovered { .. } => "Spot1mFetchRecovered",
-            Self::Spot1mSidNotServed { .. } => "Spot1mSidNotServed",
-            Self::Spot1mSidServedRecovered { .. } => "Spot1mSidServedRecovered",
-            Self::ChainFetchDegraded { .. } => "ChainFetchDegraded",
-            Self::ChainFetchRecovered { .. } => "ChainFetchRecovered",
-            Self::Chain1mUnderlyingNotServed { .. } => "Chain1mUnderlyingNotServed",
-            Self::Chain1mUnderlyingServedRecovered { .. } => "Chain1mUnderlyingServedRecovered",
-            Self::ChainEntitlementAbsent { .. } => "ChainEntitlementAbsent",
-            Self::ChainEntitlementConfirmed => "ChainEntitlementConfirmed",
-            Self::ChainExpirylistFailed { .. } => "ChainExpirylistFailed",
             Self::DualFeedDailyScorecard { .. } => "DualFeedDailyScorecard",
             Self::DualFeedScorecardAborted { .. } => "DualFeedScorecardAborted",
             // PR #4/#5 (2026-05-19): DepthSpotPriceStale + 7 Phase2*
@@ -3169,90 +2779,29 @@ impl NotificationEvent {
         }
     }
 
-    /// Per-index / per-underlying not-served episode slot inside the REST
-    /// families (2026-07-15 cleanliness fold): each pinned symbol gets its
-    /// own bubble `conn` so one index's episode never swallows another's.
-    ///
-    /// The family-wide slot map (fix-round F1, 2026-07-15 — the SPOT and
-    /// CHAIN per-symbol ranges are DISJOINT so a spot recovery can never
-    /// green-close a chain leg's still-open bubble, and vice versa; the
-    /// chain not-served emit is edge-latched upstream, so a cross-leg
-    /// close would be a permanent Rule-11 false recovery):
-    ///
-    /// | conn | meaning |
-    /// |---|---|
-    /// | 0 | whole-leg spot pulls |
-    /// | 1 | whole-leg chain pulls |
-    /// | 2 | whole-leg contract pulls (Groww) |
-    /// | 7 | CHAIN not-served catch-all (unknown / never-chained symbol) |
-    /// | 8..=11 | SPOT not-served: NIFTY / BANKNIFTY / SENSEX / INDIA VIX |
-    /// | 12..=14 | CHAIN not-served: NIFTY / BANKNIFTY / SENSEX |
-    /// | 15 | SPOT not-served catch-all (unknown symbol) |
-    ///
-    /// Exact match over the pinned `&'static str` set — const, zero-alloc
-    /// (the DHAT bypass-arm pin holds).
-    const fn rest_slot(symbol: &str) -> u8 {
-        // `match` on str literals is not const-stable in all positions;
-        // byte-compare keeps this a true const fn.
-        const fn eq(a: &str, b: &str) -> bool {
-            let (a, b) = (a.as_bytes(), b.as_bytes());
-            if a.len() != b.len() {
-                return false;
-            }
-            let mut i = 0;
-            while i < a.len() {
-                if a[i] != b[i] {
-                    return false;
-                }
-                i += 1;
-            }
-            true
-        }
-        if eq(symbol, "NIFTY") {
-            8
-        } else if eq(symbol, "BANKNIFTY") {
-            9
-        } else if eq(symbol, "SENSEX") {
-            10
-        } else if eq(symbol, "INDIA VIX") {
-            11
-        } else {
-            15
-        }
-    }
-
-    /// CHAIN-leg per-underlying not-served slot — DISJOINT from every
-    /// [`Self::rest_slot`] spot slot (F1, 2026-07-15): known chain
-    /// underlyings map to `spot slot + 4` (12..=14); anything else —
-    /// including INDIA VIX, which is const-asserted out of every chain
-    /// leg upstream — shares the chain catch-all `7` (distinct from the
-    /// spot catch-all `15`). Const, zero-alloc.
-    const fn chain_rest_slot(symbol: &str) -> u8 {
-        const fn eq(a: &str, b: &str) -> bool {
-            let (a, b) = (a.as_bytes(), b.as_bytes());
-            if a.len() != b.len() {
-                return false;
-            }
-            let mut i = 0;
-            while i < a.len() {
-                if a[i] != b[i] {
-                    return false;
-                }
-                i += 1;
-            }
-            true
-        }
-        if eq(symbol, "NIFTY") {
-            12
-        } else if eq(symbol, "BANKNIFTY") {
-            13
-        } else if eq(symbol, "SENSEX") {
-            14
-        } else {
-            7
-        }
-    }
-
+    // ---- `rest_slot` and `chain_rest_slot` are RETIRED 2026-09-17 ----
+    //
+    // Two const, zero-alloc `&str`-to-`u8` slot mappers. They gave each
+    // pinned index its OWN episode-bubble `conn` so one symbol's not-served
+    // episode never swallowed another's, on DISJOINT spot (8..=11, 15) and
+    // chain (12..=14, 7) ranges — the F1 fix of 2026-07-15, whose whole
+    // point was that a SPOT recovery must never green-close a CHAIN leg's
+    // still-open bubble, which the edge-latched chain emit would have made
+    // a permanent Rule-11 false recovery.
+    //
+    // Their only callers were the four Dhan-REST arms of `episode_key`,
+    // deleted with Telegram families 1 and 2 when the operator's
+    // SOCKETS-ONLY narrowing removed their producers
+    // (`dhan-rest-only-noise-lock-2026-07-14.md` §2.4). Left in place they
+    // are `dead_code`, which the workspace's `-D warnings` clippy gate
+    // rejects — and an unreachable slot map is worse than absent: it reads
+    // as a live numbering contract that nothing honours.
+    //
+    // WHAT THIS LEAVES UNWATCHED, stated rather than implied: the
+    // disjoint-range INVARIANT now has no code to hold it. If a future
+    // per-symbol episode family is built, this is the shape to restore, and
+    // the cross-leg false-recovery hazard above is the reason it was not a
+    // single shared mapper in the first place.
     /// Telegram UX Overhaul (2026-07-07): which episode bubble, if any,
     /// this event folds into.
     ///
@@ -3304,43 +2853,25 @@ impl NotificationEvent {
             // arms are deleted; the GrowwFeed family itself stays
             // (renderer + historical snapshots still name it). Merge
             // resolution 2026-07-15: the boot-ping fold arms died with
-            // their variants; the REST-family routing below is KEPT.
-            // Per-minute REST pull incident families (2026-07-15
-            // coordinator-relayed cleanliness directive): each leg's
-            // Degraded/Recovered pair folds into ONE live-edited bubble per
-            // (family, leg) instead of 2 messages per flap cycle. First
-            // Degraded still pages (+ SMS at ≥ High); repeats edit in
-            // place; Recovered closes green. The once-per-day pages with no
-            // recovery edge (entitlement / expirylist / book-unresolved /
-            // probe verdicts) and the family-(3) token Criticals stay
-            // LEGACY — Critical never episode-folds. Zero-alloc: Copy match
-            // + const-fn slot lookup; String payloads match via as_str()
-            // (the DHAT bypass-arm pin holds).
-            Self::Spot1mFetchDegraded { .. } | Self::Spot1mFetchRecovered { .. } => {
-                Some(EpisodeKey {
-                    family: EpisodeFamily::DhanRest,
-                    conn: 0,
-                })
-            }
-            Self::ChainFetchDegraded { .. } | Self::ChainFetchRecovered { .. } => {
-                Some(EpisodeKey {
-                    family: EpisodeFamily::DhanRest,
-                    conn: 1,
-                })
-            }
-            Self::Spot1mSidNotServed { symbol, .. }
-            | Self::Spot1mSidServedRecovered { symbol, .. } => Some(EpisodeKey {
-                family: EpisodeFamily::DhanRest,
-                conn: Self::rest_slot(symbol.as_str()),
-            }),
-            // F1 (2026-07-15 fix round): chain not-served uses the DISJOINT
-            // chain slot range — a spot recovery on the same symbol must
-            // never green-close the chain leg's still-open bubble.
-            Self::Chain1mUnderlyingNotServed { underlying, .. }
-            | Self::Chain1mUnderlyingServedRecovered { underlying, .. } => Some(EpisodeKey {
-                family: EpisodeFamily::DhanRest,
-                conn: Self::chain_rest_slot(underlying),
-            }),
+            // their variants. The REST-family routing that this note once
+            // said was KEPT is itself retired — see immediately below.
+            // ---- The FOUR Dhan-REST episode arms are RETIRED 2026-09-17 ----
+            //
+            // They folded the spot-1m and option-chain Degraded/Recovered
+            // pairs into ONE live-edited bubble per (family, leg), with the
+            // per-symbol and per-underlying legs on DISJOINT slot ranges so
+            // a spot recovery could never green-close a still-open chain
+            // bubble (the F1 2026-07-15 fix).
+            //
+            // All eleven variants they keyed on are deleted with Dhan
+            // Telegram families 1 and 2 — their producers were removed by
+            // the operator's SOCKETS-ONLY narrowing. Record:
+            // `dhan-rest-only-noise-lock-2026-07-14.md` §2.4.
+            //
+            // `EpisodeFamily::DhanRest` is deliberately NOT removed: it is
+            // a slot-numbering identity in the episode FSM, and retiring an
+            // enum variant that a persisted bubble may still name is a
+            // separate decision with its own blast radius.
             _ => None,
         }
     }
@@ -3389,16 +2920,20 @@ impl NotificationEvent {
     pub fn episode_role(&self) -> super::episode::EpisodeRole {
         use super::episode::EpisodeRole;
         match self {
-            // The 8 REST *Recovered variants (2026-07-15 cleanliness fold)
-            // are their bubbles' recovery edges; role is consulted only
-            // when episode_key() is Some. (FeedRecovered retired with the
-            // Groww live feed, main #1581 — merge resolution 2026-07-15.)
-            Self::WebSocketReconnected { .. }
-            | Self::OrderUpdateReconnected { .. }
-            | Self::Spot1mFetchRecovered { .. }
-            | Self::ChainFetchRecovered { .. }
-            | Self::Spot1mSidServedRecovered { .. }
-            | Self::Chain1mUnderlyingServedRecovered { .. } => EpisodeRole::Resolve,
+            // The reconnect-class variants are their bubbles' recovery
+            // edges; role is consulted only when episode_key() is Some.
+            // (FeedRecovered retired with the Groww live feed, main #1581 —
+            // merge resolution 2026-07-15. The FOUR REST `*Recovered` arms
+            // — Spot1mFetchRecovered, ChainFetchRecovered,
+            // Spot1mSidServedRecovered, Chain1mUnderlyingServedRecovered —
+            // retired 2026-09-17 with Dhan Telegram families 1 and 2, whose
+            // producers the SOCKETS-ONLY narrowing removed; see
+            // `dhan-rest-only-noise-lock-2026-07-14.md` §2.4. The earlier
+            // "8 REST *Recovered variants" wording counted the Groww pairs
+            // too and was already stale by four.)
+            Self::WebSocketReconnected { .. } | Self::OrderUpdateReconnected { .. } => {
+                EpisodeRole::Resolve
+            }
             _ => EpisodeRole::Open,
         }
     }
@@ -3505,43 +3040,6 @@ impl NotificationEvent {
             }
             Self::TfConsistencyAborted { .. } => Severity::High,
             Self::SpotCrossverifyAborted { .. } => Severity::High,
-            // Per-minute spot 1m REST pipeline (2026-07-12): the degraded
-            // page is the edge-triggered escalation (3 consecutive fully-
-            // failed minutes); the recovery is a positive Info ping.
-            Self::Spot1mFetchDegraded { .. } => Severity::High,
-            Self::Spot1mFetchRecovered { .. } => Severity::Info,
-            // Groww per-minute spot 1m REST leg (2026-07-13): same edge
-            // semantics as the Dhan leg — one High page per episode, one
-            // Info ping on the falling edge.
-            Self::Spot1mSidNotServed { .. } => Severity::High,
-            Self::Spot1mSidServedRecovered { .. } => Severity::Info,
-            // One page per day when an underlying's chain recording could
-            // not start (never a guessed expiry) — actionable, not fatal.
-            // The probe is informational either way — nothing was expected
-            // to record while the pipeline is switched off.
-            // The contract leg mirrors the chain edge semantics: one HIGH
-            // page per failing episode, one Info recovery, one HIGH per day
-            // for an unresolvable contract book.
-            Self::ChainFetchDegraded { .. } => Severity::High,
-            Self::ChainFetchRecovered { .. } => Severity::Info,
-            // 2026-07-14 family-(2) extension (noise-lock §2.1): one HIGH
-            // page per underlying per not-served episode; Info recovery.
-            Self::Chain1mUnderlyingNotServed { .. } => Severity::High,
-            Self::Chain1mUnderlyingServedRecovered { .. } => Severity::Info,
-            // HIGH only when the pipeline was ON and expected to record;
-            // the probe-only verdict for a disabled pipeline is an Info
-            // heads-up, never a page (the operator asked for a report).
-            Self::ChainEntitlementAbsent {
-                pipeline_enabled, ..
-            } => {
-                if *pipeline_enabled {
-                    Severity::High
-                } else {
-                    Severity::Info
-                }
-            }
-            Self::ChainEntitlementConfirmed => Severity::Info,
-            Self::ChainExpirylistFailed { .. } => Severity::High,
             // Dual-feed scorecard (2026-07-10): Info per the contract — the
             // daily digest is a positive signal; degradation is carried
             // LOUDLY in the body (partial/degraded footnotes) and a task
@@ -4120,6 +3618,19 @@ mod tests {
         // 2026-07-14 broker tag: the capture line reports the DHAN REST
         // legs — it must SAY Dhan and note the Groww legs report on their
         // own alerts (every arm).
+        //
+        // ⚠ 2026-09-17: the three "armed" arms below are UNREACHABLE in
+        // production — `main.rs` passes a `false` const for both fields. Their
+        // assertions are kept because the arms are kept (the event's shape is
+        // read by 43 sites, so collapsing it would be far wider than the
+        // removal called for), and they still describe those arms correctly.
+        //
+        // What they are NOT is a statement about what the operator receives.
+        // In particular the `Groww per-minute legs report separately` assertion
+        // three lines down pins text that has been FALSE since the 2026-08-21
+        // Groww removal — it is pinned here only because the arm carrying it
+        // can no longer render. The arm that DOES render is asserted at the
+        // bottom of this test, and it is asserted NOT to say it.
         let both = build(true, true).to_message();
         assert!(
             both.contains("Dhan per-minute price capture — armed"),
@@ -4160,16 +3671,40 @@ mod tests {
             "got: {spot_off}"
         );
 
+        // ── (false, false): REWRITTEN 2026-09-17 ─────────────────────────
+        //
+        // This is the ONLY arm `main.rs` can now reach — it constant-folds both
+        // fields to DHAN_PER_MINUTE_LEGS_EXIST, a `false` const, because the
+        // per-minute Dhan REST legs were removed on 2026-09-16.
+        //
+        // The two assertions withdrawn here were PINNING FALSE CLAIMS INTO the
+        // operator's boot Telegram, which is worth recording rather than just
+        // deleting:
+        //
+        //   - `contains("Dhan per-minute price capture — switched off")`.
+        //     "Switched off" invites "then switch it on"; the modules are
+        //     deleted, so there is no switch that can do anything.
+        //   - `contains("Groww per-minute legs report separately")`. The entire
+        //     Groww feed was REMOVED on 2026-08-21, so this test spent a month
+        //     REQUIRING the boot message to name a feed that does not exist —
+        //     and would have failed any attempt to take it out.
+        //
+        // A test that asserts a message says something false does not merely
+        // miss the bug: it defends it. The replacements below assert the two
+        // properties that actually matter and are checkable — that the line
+        // never claims capture is armed, and that it never names the removed
+        // feed — rather than freezing one exact sentence.
         let both_off = build(false, false).to_message();
         assert!(
-            both_off.contains("Dhan per-minute price capture — switched off"),
+            both_off.contains("Dhan per-minute REST price capture — REMOVED"),
             "got: {both_off}"
         );
         assert!(!both_off.contains("armed"), "got: {both_off}");
-        assert!(
-            both_off.contains("Groww per-minute legs report separately"),
-            "got: {both_off}"
-        );
+        assert!(!both_off.contains("switched off"), "got: {both_off}");
+        assert!(!both_off.contains("Groww"), "got: {both_off}");
+        // Says what IS capturing, not only what is not: a line reporting an
+        // absence and stopping there reads like an outage.
+        assert!(both_off.contains("live socket feed"), "got: {both_off}");
     }
 
     #[test]
@@ -6563,56 +6098,26 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_dhan_rest_leg_events_carry_dhan_badge() {
-        // Operator directive 2026-07-14: the per-minute REST pull alerts
-        // must name the feed. Every Dhan REST-leg event (spot 1m + option
-        // chain) leads with the Dhan badge — trigger AND recovery pairwise,
-        // so an edge-cleared message can never render un-tagged while its
-        // trigger is tagged. Ratchet: removing any arm fails this test.
-        let events = [
-            NotificationEvent::Spot1mFetchDegraded {
-                consecutive_failed_minutes: 3,
-                minute_ist: "10:15".to_string(),
-            },
-            NotificationEvent::Spot1mFetchRecovered {
-                minute_ist: "10:18".to_string(),
-                failed_minutes: 3,
-            },
-            NotificationEvent::Spot1mSidNotServed {
-                symbol: "INDIA VIX".to_string(),
-                consecutive_minutes: 10,
-            },
-            NotificationEvent::Spot1mSidServedRecovered {
-                symbol: "INDIA VIX".to_string(),
-                not_served_minutes: 10,
-            },
-            NotificationEvent::ChainFetchDegraded {
-                consecutive_failed_minutes: 3,
-                minute_ist: "10:15".to_string(),
-            },
-            NotificationEvent::ChainFetchRecovered {
-                minute_ist: "10:18".to_string(),
-                failed_minutes: 3,
-            },
-            NotificationEvent::ChainEntitlementAbsent {
-                pipeline_enabled: true,
-                detail: "no subscription".to_string(),
-            },
-            NotificationEvent::ChainEntitlementConfirmed,
-            NotificationEvent::ChainExpirylistFailed {
-                detail: "lookup failed".to_string(),
-            },
-        ];
-        for ev in events {
-            assert_eq!(ev.feed_badge(), Some("🔷 DHAN"), "event: {}", ev.topic());
-            let msg = ev.to_message();
-            assert!(
-                msg.starts_with("🔷 DHAN — "),
-                "Dhan REST-leg body must lead with the Dhan badge: {msg}"
-            );
-        }
-    }
+    // ---- `test_dhan_rest_leg_events_carry_dhan_badge` is RETIRED 2026-09-17 ----
+    //
+    // It pinned the operator's 2026-07-14 broker-naming directive across
+    // NINE Dhan REST-leg events: every spot-1m and option-chain alert had
+    // to lead with the Dhan badge, trigger AND recovery pairwise, so an
+    // edge-cleared message could never render un-tagged while its trigger
+    // was tagged.
+    //
+    // All nine variants are deleted with families 1 and 2
+    // (`dhan-rest-only-noise-lock-2026-07-14.md` §2.4) -- their producers
+    // were removed by the operator's SOCKETS-ONLY narrowing. A badge test
+    // over an empty array is a test that cannot fail.
+    //
+    // WHAT THIS LEAVES UNWATCHED, stated rather than implied: the PAIRWISE
+    // badge discipline now has no ratchet of its own. The sibling
+    // `test_non_feed_events_carry_no_badge` above still pins the negative
+    // direction, and `feed_badge()` still stamps by variant -- but if a
+    // FUTURE Dhan-scoped family is added, this is the shape to restore,
+    // and §3 of the noise lock already makes such a family a REJECT
+    // without its own dated quote.
 
     #[test]
     fn test_dhan_scoped_gate_and_order_events_carry_dhan_badge() {
@@ -6907,227 +6412,34 @@ mod tests {
         assert!(msg.contains("What to do RIGHT NOW"));
     }
 
-    // -----------------------------------------------------------------------
-    // Spot1mFetchDegraded + Spot1mFetchRecovered (2026-07-12 — per-minute
-    // spot 1m REST pipeline PR-2)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_spot_1m_fetch_degraded_is_high_with_action_lines() {
-        let event = NotificationEvent::Spot1mFetchDegraded {
-            consecutive_failed_minutes: 3,
-            minute_ist: "10:42 AM".to_string(),
-        };
-        assert_eq!(event.topic(), "Spot1mFetchDegraded");
-        assert_eq!(event.severity(), Severity::High);
-        let msg = event.to_message();
-        assert!(msg.contains("FAILING"), "got: {msg}");
-        assert!(msg.contains("3 minutes in a row"), "got: {msg}");
-        // IST 12-hour timestamp (Telegram commandment 9).
-        assert!(msg.contains("10:42 AM IST"), "got: {msg}");
-        assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
-        // Honest scope line: the live WS pipeline is untouched.
-        assert!(msg.contains("NOT affected"), "got: {msg}");
-    }
-
-    #[test]
-    fn test_spot_1m_fetch_recovered_is_info_positive_ping() {
-        let event = NotificationEvent::Spot1mFetchRecovered {
-            minute_ist: "10:45 AM".to_string(),
-            failed_minutes: 4,
-        };
-        assert_eq!(event.topic(), "Spot1mFetchRecovered");
-        assert_eq!(event.severity(), Severity::Info);
-        let msg = event.to_message();
-        assert!(msg.contains("recovered"), "got: {msg}");
-        assert!(msg.contains("10:45 AM IST"), "got: {msg}");
-        assert!(msg.contains("4 failed"), "got: {msg}");
-        // No false-OK: recovery never claims the missing minutes came back.
-        assert!(msg.contains("nothing is made up"), "got: {msg}");
-    }
-
-    // -----------------------------------------------------------------------
-    // GrowwSpot1mFetchDegraded + GrowwSpot1mFetchRecovered (2026-07-13 —
-    // Groww per-minute spot 1m REST leg, PR-2 of the Groww REST plan)
-    // -----------------------------------------------------------------------
-
-    // -----------------------------------------------------------------------
-    // Spot1mSidNotServed + Spot1mSidServedRecovered (operator scope addition
-    // 2026-07-13, relayed via the coordinator session — the INDIA VIX
-    // live-probe companion)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_spot_1m_sid_not_served_is_high_names_the_index_and_scopes_honestly() {
-        let event = NotificationEvent::Spot1mSidNotServed {
-            symbol: "INDIA VIX".to_string(),
-            consecutive_minutes: 10,
-        };
-        assert_eq!(event.topic(), "Spot1mSidNotServed");
-        assert_eq!(event.severity(), Severity::High);
-        let msg = event.to_message();
-        // The operator-mandated plain-English core wording.
-        assert!(
-            msg.contains("not returning 1-minute candles for INDIA VIX"),
-            "got: {msg}"
-        );
-        assert!(msg.contains("other indices are unaffected"), "got: {msg}");
-        assert!(msg.contains("10 minutes in a row"), "got: {msg}");
-        assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
-        // Honest scope line: the live WS pipeline is untouched.
-        assert!(msg.contains("NOT affected"), "got: {msg}");
-    }
-
-    // -----------------------------------------------------------------------
-    // GrowwChain1m* events (2026-07-13 — Groww per-minute option-chain
-    // leg, PR-3 of the Groww REST plan)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_spot_1m_sid_served_recovered_is_info_positive_ping() {
-        let event = NotificationEvent::Spot1mSidServedRecovered {
-            symbol: "INDIA VIX".to_string(),
-            not_served_minutes: 12,
-        };
-        assert_eq!(event.topic(), "Spot1mSidServedRecovered");
-        assert_eq!(event.severity(), Severity::Info);
-        let msg = event.to_message();
-        assert!(
-            msg.contains("serving 1-minute candles for INDIA VIX again"),
-            "got: {msg}"
-        );
-        assert!(msg.contains("12 missed"), "got: {msg}");
-        // No false-OK: recovery never claims the missing minutes came back.
-        assert!(msg.contains("nothing is made up"), "got: {msg}");
-    }
-
+    // ---- The FOUR REST-leg test blocks here are RETIRED 2026-09-17 ----
+    //
+    // They covered the eleven `Spot1m*` / `Chain*` variants of Dhan
+    // Telegram families 1 and 2: the per-minute spot-1m pull failing /
+    // recovered, and the option-chain pull failing / recovered (including
+    // the §2.1 per-underlying pair and the entitlement probe).
+    //
+    // Both families are RETIRED, and the variants are deleted rather than
+    // allowlisted, because their PRODUCERS were removed by the operator's
+    // SOCKETS-ONLY narrowing -- `spot_1m_rest_boot.rs`,
+    // `option_chain_1m_boot.rs`, `cadence_escalation.rs` and
+    // `dhan_cadence_executor.rs` are all gone. Dated record, including
+    // what is LOST and why the `NO_PRODUCTION_DISPATCHER` allowlist is
+    // the WRONG home for a variant whose producer was removed by
+    // directive: `dhan-rest-only-noise-lock-2026-07-14.md` §2.4.
+    //
+    // Also removed here: a dangling `GrowwSpot1mFetchDegraded +
+    // GrowwSpot1mFetchRecovered` section HEADER that had outlived its own
+    // tests in the 2026-08-21 Groww removal. It named a family with no
+    // variants and no tests -- a heading that reads as coverage.
+    //
+    // The surviving Dhan Telegram set is families 3 (token unobtainable)
+    // and 4 (token 4h warning), whose tests are UNTOUCHED, plus the
+    // family-(5) live-lane signals.
     // -----------------------------------------------------------------------
     // SpotCrossverifySummary render/severity pins (Fix E review round 1,
     // 2026-07-17)
     // -----------------------------------------------------------------------
-
-    // -----------------------------------------------------------------------
-    // ChainFetchDegraded / ChainFetchRecovered / ChainEntitlementAbsent /
-    // ChainEntitlementConfirmed (2026-07-12 — per-minute option-chain REST
-    // pipeline PR-3)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_chain_fetch_degraded_is_high_with_action_lines() {
-        let event = NotificationEvent::ChainFetchDegraded {
-            consecutive_failed_minutes: 3,
-            minute_ist: "10:42 AM".to_string(),
-        };
-        assert_eq!(event.topic(), "ChainFetchDegraded");
-        assert_eq!(event.severity(), Severity::High);
-        let msg = event.to_message();
-        assert!(msg.contains("FAILING"), "got: {msg}");
-        assert!(msg.contains("3 minutes"), "got: {msg}");
-        // IST 12-hour timestamp (Telegram commandment 9).
-        assert!(msg.contains("10:42 AM IST"), "got: {msg}");
-        assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
-        // Honest scope line: the live WS pipeline is untouched.
-        assert!(msg.contains("NOT affected"), "got: {msg}");
-    }
-
-    #[test]
-    fn test_chain_fetch_recovered_is_info_positive_ping() {
-        let event = NotificationEvent::ChainFetchRecovered {
-            minute_ist: "10:45 AM".to_string(),
-            failed_minutes: 4,
-        };
-        assert_eq!(event.topic(), "ChainFetchRecovered");
-        assert_eq!(event.severity(), Severity::Info);
-        let msg = event.to_message();
-        assert!(msg.contains("recovered"), "got: {msg}");
-        assert!(msg.contains("10:45 AM IST"), "got: {msg}");
-        assert!(msg.contains("4 failed"), "got: {msg}");
-        // No false-OK: recovery never claims the missing minutes came back.
-        assert!(msg.contains("nothing is made up"), "got: {msg}");
-    }
-
-    /// The entitlement-absent verdict is HIGH (actionable) when the
-    /// pipeline was switched ON, but only an Info heads-up for the
-    /// probe-only path of a disabled pipeline — never a page for a report
-    /// the operator asked for.
-    #[test]
-    fn test_chain_entitlement_absent_severity_splits_on_intent() {
-        let paged = NotificationEvent::ChainEntitlementAbsent {
-            pipeline_enabled: true,
-            detail: "DH-902 access not subscribed".to_string(),
-        };
-        assert_eq!(paged.topic(), "ChainEntitlementAbsent");
-        assert_eq!(paged.severity(), Severity::High);
-        let msg = paged.to_message();
-        assert!(msg.contains("CANNOT run"), "got: {msg}");
-        assert!(msg.contains("DH-902"), "got: {msg}");
-        assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
-        assert!(msg.contains("NOT affected"), "got: {msg}");
-
-        let probe = NotificationEvent::ChainEntitlementAbsent {
-            pipeline_enabled: false,
-            detail: "DH-902 access not subscribed".to_string(),
-        };
-        assert_eq!(probe.severity(), Severity::Info);
-        let msg = probe.to_message();
-        assert!(msg.contains("NOT available"), "got: {msg}");
-        assert!(msg.contains("Nothing is broken"), "got: {msg}");
-        // 2026-07-18 canary reword: the probe verdict must never attribute
-        // the missing data to a recording switch — since the 2026-07-17
-        // cadence stand-down the minute-cadence engine records the chains,
-        // so the only honest cause here is the missing subscription.
-        assert!(
-            !msg.to_lowercase().contains("switched off"),
-            "stale switch attribution: {msg}"
-        );
-        assert!(
-            msg.contains("until the subscription is bought"),
-            "must name the real cause + action: {msg}"
-        );
-        assert!(
-            msg.contains("minute-cadence engine"),
-            "must point at the lane that records today: {msg}"
-        );
-        // Payload detail is HTML-escaped like every String arm.
-        let hostile = NotificationEvent::ChainEntitlementAbsent {
-            pipeline_enabled: false,
-            detail: "<script>x</script>".to_string(),
-        };
-        assert!(!hostile.to_message().contains("<script>"));
-    }
-
-    #[test]
-    fn test_chain_expirylist_failed_is_high_with_action_lines() {
-        let event = NotificationEvent::ChainExpirylistFailed {
-            detail: "http 500 <i>x</i>".to_string(),
-        };
-        assert_eq!(event.topic(), "ChainExpirylistFailed");
-        assert_eq!(event.severity(), Severity::High);
-        let msg = event.to_message();
-        assert!(msg.contains("could NOT start today"), "got: {msg}");
-        // Honest: never a guessed expiry; live prices untouched.
-        assert!(msg.contains("never guessed"), "got: {msg}");
-        assert!(msg.contains("NOT affected"), "got: {msg}");
-        assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
-        // Payload detail is HTML-escaped like every String arm.
-        assert!(!msg.contains("<i>"), "got: {msg}");
-    }
-
-    #[test]
-    fn test_chain_entitlement_confirmed_is_info_with_flip_instruction() {
-        let event = NotificationEvent::ChainEntitlementConfirmed;
-        assert_eq!(event.topic(), "ChainEntitlementConfirmed");
-        assert_eq!(event.severity(), Severity::Info);
-        let msg = event.to_message();
-        assert!(msg.contains("IS available"), "got: {msg}");
-        // Plain-English body (10 commandments — no config-key jargon; the
-        // exact key lives in the probe's log line). Fix E round 1
-        // (2026-07-17): the cadence engine records chains — never claim
-        // recording is switched OFF.
-        assert!(msg.contains("minute-cadence engine"), "got: {msg}");
-        assert!(!msg.contains("option_chain_1m"), "got: {msg}");
-        assert!(!msg.contains("switched OFF"), "stale OFF claim: {msg}");
-    }
 
     // -----------------------------------------------------------------------
     // DualFeedDailyScorecard + DualFeedScorecardAborted (2026-07-10 PR-A;
@@ -7180,27 +6492,15 @@ mod tests {
             early_run: false,
             restart_partial: false,
             dhan_feed_off: false,
-            rest_legs: vec![],
-            rest_legs_read_failed: false,
         }
     }
 
-    fn rest_line(feed: &str, leg: &str) -> RestLegScoreLine {
-        RestLegScoreLine {
-            feed: feed.to_string(),
-            leg: leg.to_string(),
-            ok_fetches: -1,
-            failed_fetches: -1,
-            named_gaps: -1,
-            pre_boot_gaps: -1,
-            rate_limited_hits: -1,
-            late_recovered: -1,
-            close_p50_ms: -1,
-            close_p99_ms: -1,
-            close_max_ms: -1,
-            close_samples: -1,
-        }
-    }
+    // ---- the `rest_line` fixture is RETIRED 2026-09-17 ----
+    //
+    // It built an all-`-1` `RestLegScoreLine` so each pull test could set
+    // only the fields it cared about and leave the rest honestly
+    // unmeasured. That all-sentinel default is the pattern worth keeping in
+    // mind for any future scorecard fixture; the type it built is gone.
 
     #[test]
     fn test_dual_feed_scorecard_topic_severity_policy() {
@@ -7342,12 +6642,16 @@ mod tests {
 
     #[test]
     fn test_dual_feed_scorecard_caveat_line_exactly_once() {
-        for (partial, degraded, restart, rest_failed) in [
-            (true, false, false, false),
-            (false, true, false, false),
-            (false, false, true, false),
-            (false, false, false, true),
-            (true, true, true, true),
+        // 2026-09-17: the FOURTH trigger — `rest_legs_read_failed`, an
+        // unreadable REST pull record — is RETIRED with the pull digest, so
+        // the matrix drops from four flags to three. The property under
+        // test is UNCHANGED and is the load-bearing half: however many
+        // triggers are true, the caveat renders EXACTLY ONCE.
+        for (partial, degraded, restart) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, true),
         ] {
             let ev = NotificationEvent::DualFeedDailyScorecard {
                 trading_date_ist: "2026-07-10".to_string(),
@@ -7358,8 +6662,6 @@ mod tests {
                 early_run: false,
                 restart_partial: restart,
                 dhan_feed_off: false,
-                rest_legs: vec![],
-                rest_legs_read_failed: rest_failed,
             };
             let msg = ev.to_message();
             assert_eq!(
@@ -7386,8 +6688,6 @@ mod tests {
             early_run: true,
             restart_partial: false,
             dhan_feed_off: false,
-            rest_legs: vec![],
-            rest_legs_read_failed: false,
         };
         let msg = ev.to_message();
         let first = msg.lines().next().unwrap_or_default();
@@ -7418,8 +6718,6 @@ mod tests {
             early_run: false,
             restart_partial: false,
             dhan_feed_off: true,
-            rest_legs: vec![],
-            rest_legs_read_failed: false,
         };
         let msg = ev.to_message();
         assert!(
@@ -7443,126 +6741,36 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_dual_feed_scorecard_feed_off_line_still_carries_pull_digest() {
-        // F2 (2026-07-15 fix round): on current prod EVERY day is a Dhan
-        // feed-off day (live WS retired) while the Dhan spot-1m/chain REST
-        // pulls are the operator's most-watched signal — the OFF line must
-        // still carry the pulls segment when pull data exists.
-        let mut d = score_line("Dhan");
-        d.ticks = 0;
-        let rest_legs = vec![
-            RestLegScoreLine {
-                ok_fetches: 735,
-                failed_fetches: 735,
-                ..rest_line("Dhan", "spot candles")
-            },
-            RestLegScoreLine {
-                ok_fetches: 733,
-                failed_fetches: 2,
-                ..rest_line("Dhan", "option chain")
-            },
-        ];
-        let ev = NotificationEvent::DualFeedDailyScorecard {
-            trading_date_ist: "2026-07-15".to_string(),
-            dhan: d,
-            session_minutes: 375,
-            partial_coverage: false,
-            degraded: false,
-            early_run: false,
-            restart_partial: false,
-            dhan_feed_off: true,
-            rest_legs,
-            rest_legs_read_failed: false,
-        };
-        let msg = ev.to_message();
-        let off_line = msg
-            .lines()
-            .find(|l| l.contains("Dhan: OFF today"))
-            .unwrap_or_default();
-        assert!(
-            off_line.contains(
-                "OFF today (excluded from verdict) \u{b7} pulls spot 735/1470, chain 733/735"
-            ),
-            "OFF line must carry the per-leg pull digest: {msg}"
-        );
-        assert!(
-            off_line.contains("\u{26a0}\u{fe0f}"),
-            "degraded pulls on the OFF line must carry the warning mark: {msg}"
-        );
-        // No pull rows for the OFF feed → the segment is genuinely omitted.
-        let mut d = score_line("Dhan");
-        d.ticks = 0;
-        let ev = NotificationEvent::DualFeedDailyScorecard {
-            trading_date_ist: "2026-07-15".to_string(),
-            dhan: d,
-            session_minutes: 375,
-            partial_coverage: false,
-            degraded: false,
-            early_run: false,
-            restart_partial: false,
-            dhan_feed_off: true,
-            rest_legs: vec![rest_line("Dhan", "spot candles")],
-            rest_legs_read_failed: false,
-        };
-        let msg = ev.to_message();
-        assert!(
-            msg.contains("Dhan: OFF today (excluded from verdict)"),
-            "{msg}"
-        );
-        assert!(
-            !msg.contains("Dhan: OFF today (excluded from verdict) \u{b7}"),
-            "all-sentinel pull rows must omit the segment, never fabricate: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_dual_feed_scorecard_pulls_fold_into_feed_lines() {
-        // The retired per-leg digest folds into ONE `pulls a/b` segment per
-        // feed line (aggregate over that feed's measured legs; `-1` legs
-        // skipped; named gaps append the honest warning).
-        let rest_legs = vec![
-            RestLegScoreLine {
-                ok_fetches: 735,
-                failed_fetches: 0,
-                ..rest_line("Dhan", "spot candles")
-            },
-            RestLegScoreLine {
-                ok_fetches: 33,
-                failed_fetches: 2,
-                named_gaps: 2,
-                pre_boot_gaps: 0,
-                ..rest_line("Dhan", "option chain")
-            },
-            // All-sentinel leg: contributes nothing, fabricates nothing.
-            rest_line("Dhan", "option contracts"),
-        ];
-        let ev = NotificationEvent::DualFeedDailyScorecard {
-            trading_date_ist: "2026-07-13".to_string(),
-            dhan: score_line("Dhan"),
-            session_minutes: 375,
-            partial_coverage: false,
-            degraded: false,
-            early_run: false,
-            restart_partial: false,
-            dhan_feed_off: false,
-            rest_legs,
-            rest_legs_read_failed: false,
-        };
-        let msg = ev.to_message();
-        assert!(
-            msg.contains(
-                "pulls spot 735/735, chain 33/35 \u{26a0}\u{fe0f}; 2 never recovered \u{26a0}\u{fe0f}"
-            ),
-            "pulls segment wrong: {msg}"
-        );
-        // The retired per-leg digest section must never come back.
-        assert!(!msg.contains("Official minute candles"), "{msg}");
-        assert!(!msg.contains("after close"), "{msg}");
-        // An empty rest_legs vec omits the pulls segment entirely.
-        let msg = scorecard(score_line("Dhan")).to_message();
-        assert!(!msg.contains("pulls"), "{msg}");
-    }
+    // ---- SEVEN pull-digest tests are RETIRED 2026-09-17 ----
+    //
+    // They pinned the daily scorecard's REST pull segment end to end:
+    //   * test_dual_feed_scorecard_feed_off_line_still_carries_pull_digest
+    //   * test_dual_feed_scorecard_pulls_fold_into_feed_lines
+    //   * test_dual_feed_scorecard_pulls_carry_p99_latency
+    //   * test_dual_feed_scorecard_latency_only_leg_renders_countless
+    //   * test_dual_feed_scorecard_read_failed_renders_unreadable_token
+    //   * test_render_pulls_per_leg_skips_sentinel_legs_and_names_each_leg
+    //   * test_render_pulls_per_leg_never_fabricates_a_verdict_mark
+    //
+    // Their whole subject is `render_pulls_per_leg` / `RestLegScoreLine` /
+    // `rest_legs_read_failed`, all retired above with the scoreboard digest
+    // that produced them, because nothing has written `rest_fetch_audit` or
+    // `rest_spot_1m` since the operator's SOCKETS-ONLY narrowing
+    // (`no-rest-except-live-feed-2026-06-27.md` §12.10, disposition §12.11).
+    //
+    // NOT retired, and it is what the interesting ones were really about:
+    // the THREE-STATE verdict-mark rule (green ONLY when every rendered
+    // sub-part is both fully counted AND failure-free; warning on a counted
+    // failure; NO mark at all when a count is unmeasured, because a green
+    // check over an invisible failure is a Rule-11 false-OK) and the
+    // omit-never-fabricate rule for `-1` sentinels. Both still bind every
+    // surviving scorecard segment, and the sentinel rule is still pinned by
+    // `test_aligned_feed_line_omits_each_sentinel_field` below.
+    //
+    // WHAT THIS LEAVES UNWATCHED, stated rather than implied: nothing
+    // re-checks the "records unreadable" rendering, because there is no
+    // record left to fail to read; and nothing re-checks the three-state
+    // verdict mark, because no surviving segment carries one.
 
     #[test]
     fn test_render_compact_date_ist_shapes() {
@@ -7578,169 +6786,19 @@ mod tests {
     }
 
     #[test]
-    fn test_dual_feed_scorecard_pulls_carry_p99_latency() {
-        // G7 (fix round 2): the pulls segment folds the measured worst-1%
-        // seconds-after-close delay into ONE compact bracketed figure per
-        // leg — the operator's Quote-2 latency answer back on the card.
-        let rest_legs = vec![
-            RestLegScoreLine {
-                ok_fetches: 735,
-                failed_fetches: 0,
-                close_p99_ms: 1_800,
-                close_samples: 730,
-                ..rest_line("Dhan", "spot candles")
-            },
-            RestLegScoreLine {
-                ok_fetches: 733,
-                failed_fetches: 2,
-                close_p99_ms: 2_100,
-                close_samples: 733,
-                ..rest_line("Dhan", "option chain")
-            },
-        ];
-        let ev = NotificationEvent::DualFeedDailyScorecard {
-            trading_date_ist: "2026-07-14".to_string(),
-            dhan: score_line("Dhan"),
-            session_minutes: 375,
-            partial_coverage: false,
-            degraded: false,
-            early_run: false,
-            restart_partial: false,
-            dhan_feed_off: false,
-            rest_legs,
-            rest_legs_read_failed: false,
-        };
-        let msg = ev.to_message();
-        assert!(
-            msg.contains("pulls spot 735/735 (1.8s), chain 733/735 (2.1s)"),
-            "pulls segment must carry per-leg p99 delay: {msg}"
-        );
-        // Zero-sample legs never fabricate a "0.0s" delay figure.
-        let rest_legs = vec![RestLegScoreLine {
-            ok_fetches: 735,
-            failed_fetches: 0,
-            close_p99_ms: 0,
-            close_samples: 0,
-            ..rest_line("Dhan", "spot candles")
-        }];
-        let ev = NotificationEvent::DualFeedDailyScorecard {
-            trading_date_ist: "2026-07-14".to_string(),
-            dhan: score_line("Dhan"),
-            session_minutes: 375,
-            partial_coverage: false,
-            degraded: false,
-            early_run: false,
-            restart_partial: false,
-            dhan_feed_off: false,
-            rest_legs,
-            rest_legs_read_failed: false,
-        };
-        let msg = ev.to_message();
-        assert!(
-            msg.contains("pulls spot 735/735 \u{2705}"),
-            "zero-sample leg must render counts without a delay figure: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_dual_feed_scorecard_latency_only_leg_renders_countless() {
-        // G6 (fix round 2): the documented spot_1m_rest latency-only
-        // fallback (counts -1, latency MEASURED — the forensics-writer
-        // outage / pre-2026-07-14 arm) renders a compact count-less
-        // segment — previously the measurement vanished from the card.
-        let rest_legs = vec![RestLegScoreLine {
-            close_p50_ms: 1_100,
-            close_p99_ms: 1_800,
-            close_max_ms: 5_000,
-            close_samples: 372,
-            ..rest_line("Dhan", "spot candles")
-        }];
-        let ev = NotificationEvent::DualFeedDailyScorecard {
-            trading_date_ist: "2026-07-14".to_string(),
-            dhan: score_line("Dhan"),
-            session_minutes: 375,
-            partial_coverage: false,
-            degraded: false,
-            early_run: false,
-            restart_partial: false,
-            dhan_feed_off: false,
-            rest_legs,
-            rest_legs_read_failed: false,
-        };
-        let msg = ev.to_message();
-        assert!(
-            msg.contains("pulls spot (1.8s)"),
-            "latency-only leg must render count-less, never vanish: {msg}"
-        );
-        // All-sentinel legs (nothing measured) still render nothing —
-        // the honest suppress-on-phone arm is unchanged.
-        let msg = scorecard(score_line("Dhan")).to_message();
-        assert!(!msg.contains("pulls"), "{msg}");
-    }
-
-    #[test]
-    fn test_dual_feed_scorecard_read_failed_renders_unreadable_token() {
-        // G8 (fix round 2): a broken pull-record READ is an explicit
-        // per-feed token — distinguishable on the phone from "no pull
-        // data exists", including on the (permanent prod) feed-off line.
-        let mut d = score_line("Dhan");
-        d.ticks = 0;
-        let ev = NotificationEvent::DualFeedDailyScorecard {
-            trading_date_ist: "2026-07-14".to_string(),
-            dhan: d,
-            session_minutes: 375,
-            partial_coverage: false,
-            degraded: false,
-            early_run: false,
-            restart_partial: false,
-            dhan_feed_off: true,
-            rest_legs: vec![],
-            rest_legs_read_failed: true,
-        };
-        let msg = ev.to_message();
-        assert!(
-            msg.contains(
-                "Dhan: OFF today (excluded from verdict) \u{b7} pulls: records \
-                 unreadable \u{26a0}\u{fe0f}"
-            ),
-            "OFF line must carry the unreadable token on a read-failed day: {msg}"
-        );
-        // The MEASURED shape carries the same token on its stat line.
-        let ev = NotificationEvent::DualFeedDailyScorecard {
-            trading_date_ist: "2026-07-14".to_string(),
-            dhan: score_line("Dhan"),
-            session_minutes: 375,
-            partial_coverage: false,
-            degraded: false,
-            early_run: false,
-            restart_partial: false,
-            dhan_feed_off: false,
-            rest_legs: vec![],
-            rest_legs_read_failed: true,
-        };
-        let measured = ev.to_message();
-        let feed_line = measured
-            .lines()
-            .find(|l| l.contains("<code>Dhan"))
-            .unwrap_or_default();
-        assert!(
-            feed_line.contains("pulls: records unreadable \u{26a0}\u{fe0f}"),
-            "the measured feed line must carry the unreadable token too: {measured}"
-        );
-        // The shared floor caveat still rides along (read-failed is a
-        // caveat class), and the line budget holds.
-        assert!(
-            msg.contains("Counts are a floor"),
-            "read-failed keeps the floor caveat: {msg}"
-        );
-        assert!(msg.lines().count() <= 6, "{msg}");
-    }
-
-    #[test]
     fn test_dual_feed_scorecard_line_budget_and_footnotes_deleted() {
         // Worst realistic case (measured everything + incidents + caveat)
         // stays inside the 6-line budget; the six retired footnotes never
         // render.
+        //
+        // ⚠ 2026-09-17: "worst realistic case" is now NARROWER than when
+        // this test was written — the REST pull segment it used to fold
+        // into the feed line is retired, so the card this exercises is
+        // strictly shorter than the one the 6-line budget was set against.
+        // The budget itself is UNCHANGED and deliberately not tightened: a
+        // budget re-derived downward every time a segment retires ratchets
+        // toward a number nobody chose, and the ≤ 6 figure is the operator's
+        // phone-screen limit, not a measurement of today's longest card.
         let mut d = score_line("Dhan");
         let mut g = score_line("Groww");
         d.lag_p50_ms = 1200;
@@ -7757,12 +6815,6 @@ mod tests {
             early_run: true,
             restart_partial: true,
             dhan_feed_off: false,
-            rest_legs: vec![RestLegScoreLine {
-                ok_fetches: 735,
-                failed_fetches: 0,
-                ..rest_line("Dhan", "spot candles")
-            }],
-            rest_legs_read_failed: true,
         };
         let msg = ev.to_message();
         assert!(
@@ -7801,161 +6853,24 @@ mod tests {
     // -- helper units (2026-07-15) ------------------------------------------
 
     #[test]
-    fn test_render_pulls_per_leg_skips_sentinel_legs_and_names_each_leg() {
-        // F3 (2026-07-15 fix round), verdict semantics tightened by R2
-        // (fix round 3): per-LEG pulls segment — each measured leg named
-        // compactly; `-1` legs render nothing (omission, never a
-        // fabricated zero); named gaps append the honest warning once.
-        // A failed-unmeasured leg renders "N ok" (never "N/N", which
-        // would imply zero failures) and real failures win the ⚠️ mark.
-        let legs = vec![
-            RestLegScoreLine {
-                ok_fetches: 10,
-                failed_fetches: 2,
-                named_gaps: 1,
-                // Fix E round 1: pre-boot gaps render beside "never
-                // recovered" as bookkeeping (no warning mark).
-                pre_boot_gaps: 2,
-                ..rest_line("Groww", "spot candles")
-            },
-            rest_line("Groww", "option chain"), // all -1: skipped
-            RestLegScoreLine {
-                ok_fetches: 5,
-                failed_fetches: -1, // failed unmeasured: "5 ok", never 5/5
-                ..rest_line("groww", "option contracts")
-            },
-        ];
-        assert_eq!(
-            render_pulls_per_leg(&legs, "Groww"),
-            Some(
-                "pulls spot 10/12, contracts 5 ok \u{26a0}\u{fe0f}; \
-                 1 never recovered \u{26a0}\u{fe0f}; 2 from before app start"
-                    .to_string()
-            )
-        );
-        // No measured legs for this feed → None (segment omitted).
-        assert_eq!(render_pulls_per_leg(&legs, "Dhan"), None);
-        assert_eq!(render_pulls_per_leg(&[], "Dhan"), None);
-        // All-clean FULLY-COUNTED legs earn the green mark; unknown legs
-        // keep their plain-English name.
-        let clean = vec![
-            RestLegScoreLine {
-                ok_fetches: 3,
-                failed_fetches: 0,
-                ..rest_line("Dhan", "spot candles")
-            },
-            RestLegScoreLine {
-                ok_fetches: 7,
-                failed_fetches: 0,
-                ..rest_line("Dhan", "expired options")
-            },
-        ];
-        assert_eq!(
-            render_pulls_per_leg(&clean, "Dhan"),
-            Some("pulls spot 3/3, expired options 7/7 \u{2705}".to_string())
-        );
-    }
-
-    #[test]
-    fn test_render_pulls_per_leg_never_fabricates_a_verdict_mark() {
-        // R2 (fix round 3): a leg with ANY unmeasured half renders NO
-        // verdict mark — a latency-only day (the forensics-writer-outage
-        // fallback, where failures are invisible) previously rendered a
-        // fabricated green ✅ (Rule-11 false-OK).
-        // (a) Latency-only leg alone: numbers shown, NO mark.
-        let latency_only = vec![RestLegScoreLine {
-            close_p99_ms: 1800,
-            close_samples: 350,
-            ..rest_line("Dhan", "spot candles")
-        }];
-        assert_eq!(
-            render_pulls_per_leg(&latency_only, "Dhan"),
-            Some("pulls spot (1.8s)".to_string())
-        );
-        // (b) Failed-unmeasured leg alone: "N ok", NO /total, NO mark.
-        let failed_unmeasured = vec![RestLegScoreLine {
-            ok_fetches: 735,
-            failed_fetches: -1,
-            close_p99_ms: 1800,
-            close_samples: 700,
-            ..rest_line("Dhan", "spot candles")
-        }];
-        assert_eq!(
-            render_pulls_per_leg(&failed_unmeasured, "Dhan"),
-            Some("pulls spot 735 ok (1.8s)".to_string())
-        );
-        // (c) Mixed clean-counted + latency-only: still NO mark — the
-        // unmeasured leg makes a clean verdict unknowable.
-        let mixed = vec![
-            RestLegScoreLine {
-                ok_fetches: 733,
-                failed_fetches: 0,
-                ..rest_line("Groww", "spot candles")
-            },
-            RestLegScoreLine {
-                close_p99_ms: 2100,
-                close_samples: 400,
-                ..rest_line("Groww", "option chain")
-            },
-        ];
-        assert_eq!(
-            render_pulls_per_leg(&mixed, "Groww"),
-            Some("pulls spot 733/733, chain (2.1s)".to_string())
-        );
-        // (d) Mixed counted-WITH-failures + latency-only: real trouble
-        // wins — the ⚠️ mark renders (honest "known trouble", partial
-        // data notwithstanding).
-        let mixed_failing = vec![
-            RestLegScoreLine {
-                ok_fetches: 700,
-                failed_fetches: 35,
-                ..rest_line("Groww", "spot candles")
-            },
-            RestLegScoreLine {
-                close_p99_ms: 2100,
-                close_samples: 400,
-                ..rest_line("Groww", "option chain")
-            },
-        ];
-        assert_eq!(
-            render_pulls_per_leg(&mixed_failing, "Groww"),
-            Some("pulls spot 700/735, chain (2.1s) \u{26a0}\u{fe0f}".to_string())
-        );
-        // (e) Never-recovered gaps on a latency-only day: ⚠️ + the gap
-        // suffix (a named gap is real, counted trouble).
-        let gaps_latency_only = vec![RestLegScoreLine {
-            close_p99_ms: 1800,
-            close_samples: 350,
-            named_gaps: 3,
-            pre_boot_gaps: 0,
-            ..rest_line("Dhan", "spot candles")
-        }];
-        assert_eq!(
-            render_pulls_per_leg(&gaps_latency_only, "Dhan"),
-            Some(
-                "pulls spot (1.8s) \u{26a0}\u{fe0f}; 3 never recovered \u{26a0}\u{fe0f}"
-                    .to_string()
-            )
-        );
-    }
-
-    #[test]
     fn test_aligned_feed_line_omits_each_sentinel_field() {
+        // 2026-09-17: the `pulls` argument is RETIRED with the REST pull
+        // digest, so the first case now pins the three SURVIVING measured
+        // segments and their separator/padding, which is what it was really
+        // guarding — the pulls string was a passenger in it.
         let mut f = score_line("Dhan");
         f.lag_p99_ms = 1400;
-        let line = aligned_feed_line(&f, 5, Some("pulls spot 735/735 \u{2705}".to_string()));
+        let line = aligned_feed_line(&f, 5);
         assert_eq!(
             line,
-            "<code>Dhan : 1.84M ticks \u{b7} delay 1.4s \u{b7} drops 3 \u{b7} \
-                 pulls spot 735/735 \u{2705}</code>"
+            "<code>Dhan : 1.84M ticks \u{b7} delay 1.4s \u{b7} drops 3</code>"
         );
         let mut f = score_line("Dhan");
         f.ticks = -1;
         f.drops_market = -1;
-        let line = aligned_feed_line(&f, 5, None);
+        let line = aligned_feed_line(&f, 5);
         assert!(!line.contains("ticks"), "{line}");
         assert!(!line.contains("drops"), "{line}");
-        assert!(!line.contains("pulls"), "{line}");
     }
 
     #[test]
@@ -8210,70 +7125,5 @@ mod tests {
             msg.contains("treated as trading days"),
             "past-cliff body must state the live consequence: {msg}"
         );
-    }
-
-    // -----------------------------------------------------------------------
-    // Chain1mUnderlyingNotServed + Chain1mUnderlyingServedRecovered
-    // (2026-07-14 — the Dhan mirror of the Groww #1537 per-underlying
-    // detector; noise-lock family-(2) extension per
-    // dhan-rest-only-noise-lock-2026-07-14.md §2.1)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_chain_1m_underlying_not_served_is_high_names_dhan_and_underlying() {
-        let event = NotificationEvent::Chain1mUnderlyingNotServed {
-            underlying: "NIFTY",
-            empty_minutes: 10,
-        };
-        assert_eq!(event.topic(), "Chain1mUnderlyingNotServed");
-        assert_eq!(event.severity(), Severity::High);
-        let msg = event.to_message();
-        // Broker-naming directive: the body names Dhan (never depends on
-        // the badge alone), and the badge layer stamps the Dhan badge.
-        assert!(
-            msg.contains("Dhan is not returning the option chain for NIFTY"),
-            "got: {msg}"
-        );
-        assert!(
-            msg.contains("not returning the option chain for"),
-            "got: {msg}"
-        );
-        assert!(msg.contains("other indices are unaffected"), "got: {msg}");
-        assert!(msg.contains("10 minutes in a row"), "got: {msg}");
-        assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
-        // Honest scope lines: the live WS pipeline is untouched, the
-        // sibling broker is stated as MAY + the explicit IF (independent
-        // serving state — no false-OK), and nothing crosses feeds.
-        assert!(msg.contains("NOT affected"), "got: {msg}");
-        assert!(msg.contains("may still be coming in"), "got: {msg}");
-        assert!(msg.contains("IF Groww is serving it"), "got: {msg}");
-        assert!(msg.contains("nothing is made up"), "got: {msg}");
-        assert!(
-            msg.contains("nothing is copied across brokers"),
-            "got: {msg}"
-        );
-        // 10-commandment hygiene: no file paths / config extensions.
-        assert!(!msg.contains(".rs"), "no file paths in Telegram: {msg}");
-        assert!(!msg.contains(".toml"), "no config paths in Telegram: {msg}");
-    }
-
-    #[test]
-    fn test_chain_1m_underlying_served_recovered_is_info() {
-        let event = NotificationEvent::Chain1mUnderlyingServedRecovered {
-            underlying: "NIFTY",
-            empty_minutes: 12,
-        };
-        assert_eq!(event.topic(), "Chain1mUnderlyingServedRecovered");
-        assert_eq!(event.severity(), Severity::Info);
-        let msg = event.to_message();
-        assert!(
-            msg.contains("Dhan is serving the option chain for NIFTY again"),
-            "got: {msg}"
-        );
-        assert!(msg.contains("12 empty"), "got: {msg}");
-        // No false-OK: recovery never claims the missing minutes came
-        // back — the operator is pointed at the Groww copy instead.
-        assert!(msg.contains("nothing is made up"), "got: {msg}");
-        assert!(msg.contains("check the Groww copy"), "got: {msg}");
     }
 }

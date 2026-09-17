@@ -84,92 +84,58 @@ fn normalize_ws(body: &str) -> String {
     body.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Comment-stripped, whitespace-normalized production region.
-fn scan_region(rel: &str) -> String {
-    let src = app_src(rel);
-    normalize_ws(&strip_line_comments(production_region(&src)))
-}
+// ---- `scan_region` is RETIRED 2026-09-17 ----
+//
+// The composed "comment-stripped + whitespace-normalized production
+// region" helper. Its callers were pins 1-4, retired on 2026-09-16 with
+// the cadence mark producer; the two surviving order-runtime tests compose
+// `strip_line_comments(production_region(..))` inline and deliberately do
+// NOT normalize, because their needles are string literals carrying
+// `\`-continuations and each sits on one physical line.
+//
+// `normalize_ws` itself is KEPT — the scanner self-check still pins it, so
+// a future guard that needs wrapped-shape matching has a proven primitive
+// rather than a fresh one.
 
-#[test]
-fn test_dhan_cadence_executor_is_now_the_mark_producer() {
-    // INVERTED 2026-08-21. This test previously asserted the OPPOSITE --
-    // that `dhan_cadence_executor.rs` must never mention a mark tap -- on
-    // this reasoning, preserved verbatim because it is still correct about
-    // the hazard:
-    //
-    //   "ID-SPACE BAN: the paper book keys on the Groww-native u64 id space
-    //    ... Feeding Dhan marks alongside Groww marks would DOUBLE-KEY the
-    //    same instrument as two book entries -- invisible to the
-    //    first-seen-SEGMENT tripwire, because both entries carry the SAME
-    //    segment code (IDX_I) under different ids."
-    //
-    // The operator's 2026-08-21 directive removes Groww entirely, which
-    // dissolves the premise rather than overruling the rule: "alongside
-    // Groww marks" describes a state that no longer exists. One id space
-    // remains, so there is nothing for a Dhan mark to double-key against.
-    //
-    // The invariant that survives is ONE marking broker, and it is pinned
-    // by `mark_source_single_id_space_guard.rs`. This test now pins the
-    // other half: Dhan actually produces marks, so the paper book is not
-    // left silently unmarked -- the failure this whole sequence exists to
-    // prevent.
-    let scan = scan_region("src/dhan_cadence_executor.rs");
-    for needle in ["mark_forward", "MarkForwarder", "mark_forwarder"] {
-        assert!(
-            scan.contains(needle),
-            "dhan_cadence_executor.rs production region lost `{needle}` -- \
-             Dhan is now the sole mark producer; without it the paper book \
-             and risk engine run unmarked with no error anywhere"
-        );
-    }
-}
-
-#[test]
-fn test_main_threads_forwarder_into_cadence_boot() {
-    let src = strip_line_comments(&app_src("src/main.rs"));
-    let at = src
-        .find("spawn_cadence_scheduler(")
-        .expect("main.rs lost the spawn_cadence_scheduler call");
-    let window = &src[at..(at + 400).min(src.len())];
-    assert!(
-        window.contains("order_runtime_mark_forwarder"),
-        "the main.rs spawn_cadence_scheduler call must pass \
-         order_runtime_mark_forwarder — without it the cadence Groww \
-         executor has no mark tap and the order runtime's mark channel is \
-         producer-less at boot (the PR #1624 regression)"
-    );
-}
-
-#[test]
-fn test_cadence_boot_passes_the_forwarder_to_the_sole_executor() {
-    // INVERTED 2026-08-21 alongside the test above -- same reason, same
-    // surviving invariant: exactly ONE executor may receive the tap. The
-    // direction flipped when Groww was ordered removed; "only one" did not.
-    //
-    // With one executor left, "only one" can no longer be checked by
-    // proving a SECOND executor lacks the tap -- there is no second
-    // executor to point at. What is still checkable, and is what the
-    // failure mode actually needs, is that the sole executor DOES receive
-    // it: without the tap the paper book and risk engine run unmarked with
-    // no error anywhere. The "never two" half now lives only in
-    // mark_source_single_id_space_guard.rs, and that is a real reduction in
-    // coverage rather than a relocation -- a future second executor added
-    // here with its own tap would not fail this test.
-    let scan = scan_region("src/cadence_boot.rs");
-    let dhan_at = scan
-        .find("DhanCadenceExecutor::new(")
-        .expect("cadence_boot.rs lost DhanCadenceExecutor::new(");
-    let dhan_window = &scan[dhan_at..];
-    let dhan_window = &dhan_window[..dhan_window
-        .find("leg_identity_index")
-        .unwrap_or(dhan_window.len())];
-    assert!(
-        dhan_window.contains("mark_forwarder"),
-        "cadence_boot.rs must pass the mark tap into DhanCadenceExecutor::new -- \
-         it is the sole live mark producer"
-    );
-}
-
+// ---- Pins 1-4 RETIRED 2026-09-16: there is no cadence mark producer ----
+//
+// `test_dhan_cadence_executor_is_now_the_mark_producer`,
+// `test_main_threads_forwarder_into_cadence_boot` and
+// `test_cadence_boot_passes_the_forwarder_to_the_sole_executor` pinned the
+// mark tap onto the cadence executor and the forwarder's route from main.rs
+// through cadence_boot. All three subjects are gone: the operator's
+// SOCKETS-ONLY narrowing removed the per-minute price pulls
+// (`no-rest-except-live-feed-2026-06-27.md` §12.10), and `CadenceExecutor`
+// declared exactly the three removed fetch methods, so the scheduler, its
+// boot and the executor went with them.
+//
+// ⚠ THE INCIDENT IN THE MODULE DOCBLOCK ABOVE IS NOT HISTORICAL — IT IS THE
+// SHAPE THIS BRANCH WALKED INTO AGAIN, FROM THE OTHER DIRECTION.
+//
+// PR #1624 stood the legacy legs down while they carried the only
+// `mark_forward` call sites, so the order runtime's mark channel had zero
+// producers, the sole sender dropped, and the Fix-F arm read the closed
+// channel as the benign day-complete state. Paper fills and unrealized-P&L
+// marks died silently.
+//
+// This removal deleted the cadence executor that #1624 had made the
+// producer — and the sender was MOVED BY VALUE into the cadence spawn, so
+// deleting that spawn left the binding alive in `async_main`'s frame for the
+// process lifetime. The channel would therefore NEVER close, `recv()` would
+// pend forever, and the producer-less warn at the Fix-F arm could not fire:
+// the same silent stall as #1624, except that #1624 was at least loud at the
+// 180s AwaitingMark timeout. `main.rs` now explicitly drops
+// `order_runtime_mark_forwarder` so the channel CLOSES and the arm pinned
+// below is reachable. §12.10.7(a) carries the measurement.
+//
+// So pins 1-4 are retired and pins 5+ are KEPT AND LOAD-BEARING: they are
+// the only pins on the never-any-mark and abnormal-death arms, and this
+// branch is the reason those arms are the live signal rather than a
+// fallback. Deleting this whole file to make the suite green would have
+// removed the guard on the exact defect the removal re-created.
+//
+// NOT claimed: that a mark producer exists. None does. The paper book runs
+// unmarked and now SAYS SO, which is the whole difference.
 #[test]
 fn test_order_runtime_fix_f_distinguishes_never_any_mark() {
     // The Fix-F closed-channel arm must not claim "day complete" when NO

@@ -45,9 +45,16 @@ fn production_region(source: &str) -> &str {
     }
 }
 
-fn count_occurrences(haystack: &str, needle: &str) -> usize {
-    haystack.match_indices(needle).count()
-}
+// ---- `count_occurrences` is RETIRED 2026-09-17 ----
+//
+// It backed the EXACT-COUNT assertions of the REST-era pins retired on
+// 2026-09-16 — the shape that catches a SECOND call site appearing, which a
+// bare `contains` cannot see. Orphaned when those pins went, and `-D
+// warnings` rejects it.
+//
+// The rule it served is NOT retired: where a guard means "exactly one call
+// site", it must assert a COUNT, never mere presence. `production_region`
+// above is the other half of that discipline and is still in use.
 
 #[test]
 fn main_rs_spawns_fold_gated_after_seal_writer_install() {
@@ -126,28 +133,129 @@ fn main_rs_spawns_fold_gated_after_seal_writer_install() {
     );
 }
 
+/// The inertness const cannot drift away from the fact it records.
+///
+/// `LIVE_INLET_HAS_PRODUCER` exists because a fold with no producer arms
+/// cleanly and then receives nothing, silently, for a whole session — the
+/// producer-less-channel shape §12.9(e) closed for `mark_forward` and which
+/// cannot be closed the same way here (a first-wins `OnceLock` inlet has no
+/// observable emptiness).
+///
+/// A const is only worth more than a comment if it cannot go stale, so this
+/// test DERIVES the expected value instead of asserting a literal: the const
+/// must be `true` exactly when some production file outside the fold module
+/// calls `send_confirmed_bars`. Restore a producer and forget the const, and
+/// this fails; flip the const with no producer, and this fails too.
 #[test]
-fn dhan_spot_leg_hands_off_confirmed_bars_at_both_flush_ok_arms() {
-    let src = read_source("crates/app/src/spot_1m_rest_boot.rs");
-    let prod = production_region(&src);
+fn the_inert_const_matches_whether_a_producer_actually_exists() {
+    let fold = read_source("crates/app/src/rest_candle_fold.rs");
+    let fold_prod = production_region(&fold);
 
-    assert_eq!(
-        count_occurrences(
-            prod,
-            "rest_candle_fold::send_confirmed_bars(&confirmed_bars)"
-        ),
-        2,
-        "the Dhan spot leg must hand off confirmed bars at EXACTLY two sites \
-         (the fire flush-ok arm + the sweep flush-ok arm)"
+    // The const itself, and which way it reads today.
+    let declares_false = fold_prod.contains("pub const LIVE_INLET_HAS_PRODUCER: bool = false;");
+    let declares_true = fold_prod.contains("pub const LIVE_INLET_HAS_PRODUCER: bool = true;");
+    assert!(
+        declares_false ^ declares_true,
+        "rest_candle_fold must declare LIVE_INLET_HAS_PRODUCER as a plain          `bool = false;` or `bool = true;` — this guard reads the literal"
     );
-    // Fire: own-minute + backfill staging; sweep: swept-minute staging.
-    assert_eq!(
-        count_occurrences(prod, "ConfirmedBar::from_minute_candle("),
-        3,
-        "the Dhan spot leg must stage bars at the 3 append-ok arms \
-         (fire own-minute, fire backfill, sweep)"
+
+    // Does a real producer exist? Scan every app-crate production source
+    // EXCEPT the fold module itself (which defines send_confirmed_bars and
+    // exercises it in its own tests) and this guard's own prose.
+    let src_dir = workspace_root().join("crates/app/src");
+    let mut producers: Vec<String> = Vec::new();
+    let entries = fs::read_dir(&src_dir)
+        .unwrap_or_else(|err| panic!("must be able to read {}: {err}", src_dir.display()));
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        if name == "rest_candle_fold.rs" {
+            continue;
+        }
+        let body = fs::read_to_string(&path).unwrap_or_default();
+        if production_region(&body).contains("send_confirmed_bars(") {
+            producers.push(name);
+        }
+    }
+
+    if producers.is_empty() {
+        assert!(
+            declares_false,
+            "no production file calls send_confirmed_bars, so the fold's live              inlet has no producer — LIVE_INLET_HAS_PRODUCER must stay `false`.              Flipping it arms a task that logs a clean start and then receives              nothing, all session, with no error and no counter."
+        );
+    } else {
+        assert!(
+            declares_true,
+            "these files call send_confirmed_bars: {producers:?} — a producer              exists again, so LIVE_INLET_HAS_PRODUCER must be flipped to `true`              in the SAME change, or the fold stays refused at boot while its              input flows"
+        );
+    }
+
+    // main.rs must actually CONSULT the const — a const nothing reads is a
+    // comment with a type.
+    let main_rs = read_source("crates/app/src/main.rs");
+    assert!(
+        production_region(&main_rs)
+            .contains("tickvault_app::rest_candle_fold::LIVE_INLET_HAS_PRODUCER"),
+        "main.rs must gate the fold spawn on LIVE_INLET_HAS_PRODUCER —          otherwise the const records the inertness without preventing it"
+    );
+
+    // ...and the refusal must be CODED and named, never a bare log line.
+    assert!(
+        production_region(&main_rs).contains("stage = \"no_producer\""),
+        "the refusal must carry stage=\"no_producer\" beside the FOLD-01 code,          so an operator who enabled the fold can find out why it did not arm"
     );
 }
+
+// ---- `dhan_spot_leg_hands_off_confirmed_bars_at_both_flush_ok_arms` is
+// ---- RETIRED 2026-09-17 ----
+//
+// It pinned the PRODUCER side of the fold's live hand-off inside
+// `spot_1m_rest_boot.rs`: `ConfirmedBar::from_minute_candle(` at exactly the
+// 3 append-ok arms (fire own-minute, fire backfill, sweep) and
+// `rest_candle_fold::send_confirmed_bars(&confirmed_bars)` at exactly the 2
+// flush-ok arms. Those counts were the mechanism behind the module's
+// persist-CONFIRMED contract: a bar could only fold AFTER its ILP ACK.
+//
+// That file is gone. The Dhan per-minute spot REST leg is one of the two
+// classes the operator's SOCKETS-ONLY narrowing removed
+// (`no-rest-except-live-feed-2026-06-27.md` §12.10), so `read_source` on it
+// panics with a bare `No such file or directory (os error 2)`.
+//
+// ## ⚠ THE RESIDUAL THIS LEAVES, which is the reason to read this tombstone
+//
+// `rest_candle_fold::send_confirmed_bars` now has **ZERO production callers**
+// — the fold's live-bar inlet has no producer at all. `set_global_fold_bar_sender`
+// is still installed (`main.rs`, inside the `[rest_candle_fold] enabled`
+// gate), and that gate is `false` in `config/base.toml`, so nothing runs
+// today and nothing is broken today.
+//
+// It is NOT harmless if the gate is ever flipped: `send_confirmed_bars` with
+// no sender is a DOCUMENTED no-op (`test_send_confirmed_bars_no_sender_is_noop`),
+// so a fold turned on would install its channel, spawn its task, log a clean
+// start, and receive nothing — for the whole session, with no error and no
+// counter. That is the same producer-less-channel shape this branch already
+// had to close for `mark_forward` (§12.9(e) / §12.10.5 #4), where the fix was
+// an explicit `drop` so the already-written "no live producer" warn could
+// fire. There is no equivalent arm here, because the fold's inlet is a
+// first-wins `OnceLock` install rather than a channel whose closure is
+// observable.
+//
+// Recorded rather than fixed in this test: the disposition of the fold itself
+// is §12.10.7(g)'s open item ("removed or explicitly recorded as inert"), and
+// deciding that is a change to the fold, not to its guard. What this test can
+// honestly do is stop asserting a hand-off from a file that no longer exists,
+// and say plainly what went unwatched when it did.
+//
+// The three tests AROUND this one are UNCHANGED and still bind — the fold
+// module's own load-bearing pieces, its refusal to write `ticks`, and the
+// main.rs spawn ordering. None of them reads the deleted leg.
 
 #[test]
 fn fold_module_keeps_load_bearing_pieces() {

@@ -91,7 +91,13 @@ use tickvault_common::source_scan::strip_rust_comments;
 /// derived — the change touched tests in `volume_leaderboard`, `hard_stop_guard`
 /// and the pool supervisor and one fewer assertion-free test remained. Lowered
 /// in the same change, as this ratchet's own failure message demands.
-const ASSERTION_FREE_BUDGET: usize = 164;
+/// 164 -> 160 on 2026-09-16: measured, not derived. The operator's
+/// sockets-only directive deleted the per-minute market-data REST legs and
+/// the 15:41 accuracy check, and eleven of their wiring guards went with
+/// them; four of those carried an assertion-free test. Nothing was rewritten
+/// to reach this number — the budget follows the corpus down, as this
+/// ratchet's own failure message demands.
+const ASSERTION_FREE_BUDGET: usize = 160;
 
 /// Substrings whose presence means the body asserts something.
 const ASSERTION_MARKERS: [&str; 12] = [

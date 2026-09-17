@@ -66,7 +66,21 @@ use tickvault_storage::feed_scoreboard_persistence::{
     LAG_FLOOR_MS_TRUEDATA, SCOREBOARD_SESSION_MINUTES, SCOREBOARD_UNAVAILABLE_SENTINEL,
     ScoreboardOutcome, ensure_feed_scoreboard_tables,
 };
-use tickvault_storage::spot_1m_rest_persistence::SPOT_1M_REST_TABLE;
+
+// ---- `SPOT_1M_REST_TABLE` is RETIRED 2026-09-17 ----
+//
+// It was re-homed into this module on 2026-09-16, one day before this,
+// when the per-minute spot-1m REST leg's persistence module went with its
+// writer — the name still had to resolve because the scoreboard's pull
+// digest queried `rest_spot_1m` for a latency fallback.
+//
+// The digest is now retired too (disposition §12.11), so this module has no
+// reader left and the const is dead. `-D warnings` rejects it.
+//
+// The TABLE and every row in it are still RETAINED — `no-rest-except-live-
+// feed-2026-06-27.md` §12.6 forbids deleting them, and the retention sweep
+// still covers `rest_spot_1m` under `DAY_PARTITIONED_TABLES`. What is gone
+// is the last thing that READ it from this process.
 
 /// Parses the QuestDB `/exec` count response (`{"dataset":[[N]]}`). Pure.
 /// Relocated 2026-07-18 from the retired `tick_conservation_boot` module
@@ -2348,486 +2362,42 @@ pub async fn reconcile_process_death_episodes(
 }
 
 // ---------------------------------------------------------------------------
-// REST 1m pull digest (Groww REST plan PR-5 — operator Quote 2 2026-07-13:
-// "always clearly note within a second — or within how many seconds
-// precisely — we are fetching this live real OHLCV, along with the option
-// chain API"). Aggregates the day's `rest_fetch_audit` per-fetch forensics
-// rows per (feed, leg) — pull outcome counts, rate-limit hits, and the
-// close→data freshness distribution — plus a latency-only fallback from the
-// `spot_1m_rest` per-row `close_to_data_ms` column for feeds whose per-fetch
-// forensics emits have not landed yet (the Dhan spot leg today — its audit
-// emit sites are the flagged follow-up in rest-1m-pipeline-error-codes.md).
-// Pure aggregation, O(day rows ≤ ~3K) — flagged O(N), cold, once per day.
+// The REST 1m pull digest is RETIRED 2026-09-17
 // ---------------------------------------------------------------------------
-
-/// A pull retrieved this many ms (or more) after its minute closed is a
-/// LATE recovery — a later fire's backfill / the post-close sweep repaired
-/// it, not the prompt in-minute ladder (the #1499 semantics split: prompt
-/// ladders finish well inside the minute by construction). Late repairs are
-/// counted separately and EXCLUDED from the prompt freshness distribution
-/// so one 2-hour sweep repair can never skew the "how fast after close"
-/// answer.
-pub const REST_LEG_LATE_RECOVERY_MS: i64 = 60_000;
-
-/// One parsed `rest_fetch_audit` row (the digest's working subset). Pure
-/// data; rows with unexpected shapes are skipped by the parser.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RestFetchLiteRow {
-    pub feed: String,
-    pub leg: String,
-    pub outcome: String,
-    /// Minute close → retrieval ms; `-1` sentinel on non-ok rows.
-    pub close_to_data_ms: i64,
-    /// 429 attempts inside this fetch's ladder.
-    pub rate_limited_count: i64,
-    /// The row's error-class slug (`pre_boot` splits restart-window rows
-    /// out of "never recovered" — Fix E, 2026-07-17); empty when absent.
-    pub error_class: String,
-}
-
-/// One (feed, leg) day aggregate for the scorecard digest. `-1` = that
-/// number has no measurement source (never a fabricated zero — Rule 11).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RestLegDaySummary {
-    /// Wire feed slug (`dhan` / `groww`).
-    pub feed: String,
-    /// Wire leg slug (`spot_1m` / `chain_1m` / `contract_1m`).
-    pub leg: String,
-    /// Fetches whose target minute was retrieved (`outcome='ok'`).
-    pub ok_fetches: i64,
-    /// Fetches that ended without the target minute (every non-ok,
-    /// non-named-gap outcome: empty / error / rate_limited / no_token /
-    /// skipped).
-    pub failed_fetches: i64,
-    /// Finally-unrecovered minutes (`outcome='named_gap'`, every class
-    /// EXCEPT `pre_boot` — Fix E, 2026-07-17).
-    pub named_gaps: i64,
-    /// `named_gap` rows classed `pre_boot` — minutes from before this
-    /// process started (audit bookkeeping, never a pull failure).
-    pub pre_boot_gaps: i64,
-    /// Sum of 429 attempts across the day's fetches.
-    pub rate_limited_hits: i64,
-    /// Ok rows retrieved ≥ [`REST_LEG_LATE_RECOVERY_MS`] after close —
-    /// repaired by a later fire / the sweep, honest real delay.
-    pub late_recovered: i64,
-    /// Prompt-pull close→data distribution (nearest-rank percentiles over
-    /// ok rows below the late threshold); `-1` when no prompt sample.
-    pub close_p50_ms: i64,
-    pub close_p99_ms: i64,
-    pub close_max_ms: i64,
-    /// Prompt samples the distribution is built from; `0` = measured zero
-    /// (counts exist but every pull failed); `-1` = no latency source.
-    pub close_samples: i64,
-}
-
-/// The day's `rest_fetch_audit` rows (the digest's working subset). Micros
-/// literals — the ONLY representation legal in an embedded QuestDB
-/// TIMESTAMP comparison (the module regression lock).
-#[must_use]
-pub fn build_rest_fetch_audit_day_sql(target_ist_day: u64) -> String {
-    let (start, end) = day_bounds_micros(target_ist_day);
-    format!(
-        "select feed, leg, outcome, close_to_data_ms, rate_limited_count, \
-         error_class from rest_fetch_audit where ts >= {start} and ts < {end}"
-    )
-}
-
-/// The day's per-row `spot_1m_rest.close_to_data_ms` values per feed — the
-/// latency-only fallback source for feeds without per-fetch forensics rows
-/// yet (the Dhan spot leg). Only measured (>= 0) values are fetched; the
-/// -1 sentinel rows (unmeasured) never reach the distribution. Micros
-/// literals.
-#[must_use]
-pub fn build_spot1m_close_latency_day_sql(target_ist_day: u64) -> String {
-    let (start, end) = day_bounds_micros(target_ist_day);
-    format!(
-        "select feed, close_to_data_ms from {SPOT_1M_REST_TABLE} \
-         where ts >= {start} and ts < {end} and close_to_data_ms >= 0"
-    )
-}
-
-/// Parse the [`build_rest_fetch_audit_day_sql`] response. Pure; `None` =
-/// unparsable body; rows with unexpected shapes are SKIPPED (best-effort),
-/// never a panic.
-#[must_use]
-pub fn parse_rest_fetch_audit_lite(body: &str) -> Option<Vec<RestFetchLiteRow>> {
-    let rows = parse_dataset(body)?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        let cols = match row.as_array() {
-            Some(c) if c.len() >= 5 => c,
-            _ => continue,
-        };
-        let (Some(feed), Some(leg), Some(outcome)) =
-            (cols[0].as_str(), cols[1].as_str(), cols[2].as_str())
-        else {
-            continue;
-        };
-        out.push(RestFetchLiteRow {
-            feed: feed.to_string(),
-            leg: leg.to_string(),
-            outcome: outcome.to_string(),
-            close_to_data_ms: cols[3].as_i64().unwrap_or(-1),
-            rate_limited_count: cols[4].as_i64().unwrap_or(0),
-            error_class: cols
-                .get(5)
-                .and_then(|c| c.as_str())
-                .unwrap_or_default()
-                .to_string(),
-        });
-    }
-    Some(out)
-}
-
-/// Parse the [`build_spot1m_close_latency_day_sql`] response into
-/// `(feed, close_to_data_ms)` pairs. Pure; `None` = unparsable body.
-#[must_use]
-pub fn parse_feed_close_latency_rows(body: &str) -> Option<Vec<(String, i64)>> {
-    let rows = parse_dataset(body)?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        if let Some(cols) = row.as_array()
-            && cols.len() >= 2
-            && let (Some(feed), Some(ms)) = (cols[0].as_str(), cols[1].as_i64())
-        {
-            out.push((feed.to_string(), ms));
-        }
-    }
-    Some(out)
-}
-
-/// Nearest-rank percentile over an ASCENDING-sorted slice; `-1` on empty
-/// input (the honest "no sample" sentinel). Pure.
-#[must_use]
-pub fn percentile_nearest_rank(sorted_asc: &[i64], pct: u32) -> i64 {
-    if sorted_asc.is_empty() {
-        return SCOREBOARD_UNAVAILABLE_SENTINEL;
-    }
-    let n = sorted_asc.len();
-    let rank = n
-        .saturating_mul(pct.min(100) as usize)
-        .div_ceil(100)
-        .clamp(1, n);
-    sorted_asc[rank - 1]
-}
-
-/// Fold one leg's prompt-latency samples into the percentile columns.
-fn fill_latency_distribution(s: &mut RestLegDaySummary, mut prompt_ms: Vec<i64>) {
-    prompt_ms.sort_unstable();
-    s.close_samples = i64::try_from(prompt_ms.len()).unwrap_or(i64::MAX);
-    s.close_p50_ms = percentile_nearest_rank(&prompt_ms, 50);
-    s.close_p99_ms = percentile_nearest_rank(&prompt_ms, 99);
-    s.close_max_ms = prompt_ms
-        .last()
-        .copied()
-        .unwrap_or(SCOREBOARD_UNAVAILABLE_SENTINEL);
-}
-
-/// Aggregate the day's per-fetch forensics rows (+ the spot latency
-/// fallback pairs) into per-(feed, leg) digest summaries. Pure,
-/// deterministic order (feed, then leg). Semantics:
-///
-/// - `ok` rows below [`REST_LEG_LATE_RECOVERY_MS`] feed the prompt
-///   freshness distribution; at/above it they count `late_recovered`
-///   (repaired later — the real delay stays honest, out of the prompt
-///   distribution).
-/// - `named_gap` rows count separately (never a "failed fetch" — they are
-///   the finally-unrecovered minutes).
-/// - Every other outcome counts `failed_fetches`; `rate_limited_count`
-///   sums across ALL rows.
-/// - A feed with a `spot_1m` data-table latency row but NO audit rows for
-///   that leg gets a latency-only summary (counts stay `-1` — that source
-///   records no outcomes). The same late split applies (backfilled data
-///   rows carry the real > 60s repair delay per the #1499 semantics).
-#[must_use]
-pub fn aggregate_rest_leg_day(
-    audit_rows: &[RestFetchLiteRow],
-    spot_latency_fallback: &[(String, i64)],
-) -> Vec<RestLegDaySummary> {
-    let mut map: BTreeMap<(String, String), (RestLegDaySummary, Vec<i64>)> = BTreeMap::new();
-    for r in audit_rows {
-        let key = (r.feed.clone(), r.leg.clone());
-        let entry = map.entry(key).or_insert_with(|| {
-            (
-                RestLegDaySummary {
-                    feed: r.feed.clone(),
-                    leg: r.leg.clone(),
-                    ok_fetches: 0,
-                    failed_fetches: 0,
-                    named_gaps: 0,
-                    pre_boot_gaps: 0,
-                    rate_limited_hits: 0,
-                    late_recovered: 0,
-                    close_p50_ms: SCOREBOARD_UNAVAILABLE_SENTINEL,
-                    close_p99_ms: SCOREBOARD_UNAVAILABLE_SENTINEL,
-                    close_max_ms: SCOREBOARD_UNAVAILABLE_SENTINEL,
-                    close_samples: 0,
-                },
-                Vec::new(),
-            )
-        });
-        let (s, prompt) = entry;
-        s.rate_limited_hits = s
-            .rate_limited_hits
-            .saturating_add(r.rate_limited_count.max(0));
-        match r.outcome.as_str() {
-            "ok" => {
-                s.ok_fetches = s.ok_fetches.saturating_add(1);
-                if r.close_to_data_ms >= 0 {
-                    if r.close_to_data_ms >= REST_LEG_LATE_RECOVERY_MS {
-                        s.late_recovered = s.late_recovered.saturating_add(1);
-                    } else {
-                        prompt.push(r.close_to_data_ms);
-                    }
-                }
-            }
-            // Fix E: `pre_boot`-classed rows are restart-window
-            // bookkeeping, never "never recovered" pull failures.
-            "named_gap" if r.error_class == "pre_boot" => {
-                s.pre_boot_gaps = s.pre_boot_gaps.saturating_add(1);
-            }
-            "named_gap" => s.named_gaps = s.named_gaps.saturating_add(1),
-            _ => s.failed_fetches = s.failed_fetches.saturating_add(1),
-        }
-    }
-    // Latency-only fallback: a feed whose spot leg persisted measured
-    // close→data values but wrote NO audit rows (the Dhan spot leg until
-    // its forensics follow-up lands) still answers Quote 2 — with counts
-    // honestly left at the -1 sentinel.
-    let mut fallback: BTreeMap<String, Vec<i64>> = BTreeMap::new();
-    for (feed, ms) in spot_latency_fallback {
-        if *ms >= 0 {
-            fallback.entry(feed.clone()).or_default().push(*ms);
-        }
-    }
-    for (feed, values) in fallback {
-        let key = (feed.clone(), "spot_1m".to_string());
-        if map.contains_key(&key) {
-            continue; // the per-fetch forensics source wins
-        }
-        let mut s = RestLegDaySummary {
-            feed,
-            leg: "spot_1m".to_string(),
-            ok_fetches: SCOREBOARD_UNAVAILABLE_SENTINEL,
-            failed_fetches: SCOREBOARD_UNAVAILABLE_SENTINEL,
-            named_gaps: SCOREBOARD_UNAVAILABLE_SENTINEL,
-            pre_boot_gaps: SCOREBOARD_UNAVAILABLE_SENTINEL,
-            rate_limited_hits: SCOREBOARD_UNAVAILABLE_SENTINEL,
-            late_recovered: 0,
-            close_p50_ms: SCOREBOARD_UNAVAILABLE_SENTINEL,
-            close_p99_ms: SCOREBOARD_UNAVAILABLE_SENTINEL,
-            close_max_ms: SCOREBOARD_UNAVAILABLE_SENTINEL,
-            close_samples: 0,
-        };
-        let prompt: Vec<i64> = values
-            .iter()
-            .copied()
-            .filter(|ms| {
-                if *ms >= REST_LEG_LATE_RECOVERY_MS {
-                    s.late_recovered = s.late_recovered.saturating_add(1);
-                    false
-                } else {
-                    true
-                }
-            })
-            .collect();
-        fill_latency_distribution(&mut s, prompt);
-        map.insert(key, (s, Vec::new()));
-    }
-    map.into_values()
-        .map(|(mut s, prompt)| {
-            if !prompt.is_empty() {
-                fill_latency_distribution(&mut s, prompt);
-            }
-            s
-        })
-        .collect()
-}
-
-/// Static gauge-label allowlist for the digest's dashboard gauge — metric
-/// labels must never carry unbounded parsed strings. `None` = an
-/// unexpected slug (skipped, defensive).
-#[must_use]
-pub fn rest_leg_gauge_labels(feed: &str, leg: &str) -> Option<(&'static str, &'static str)> {
-    let f = match feed {
-        "dhan" => "dhan",
-        "groww" => "groww",
-        _ => return None,
-    };
-    let l = match leg {
-        "spot_1m" => "spot_1m",
-        "chain_1m" => "chain_1m",
-        "contract_1m" => "contract_1m",
-        _ => return None,
-    };
-    Some((f, l))
-}
-
-/// Map the day summaries into the Telegram card's digest lines. The FOUR
-/// canonical (feed, leg) pairs ALWAYS render — the operator's Quote-2
-/// answer must exist even as an honest "not measured yet" — and any EXTRA
-/// measured pair (the PR-4 contract leg, once its forensics rows land)
-/// lights up automatically after them. Wire slugs are mapped to plain
-/// English here so no slug ever reaches Telegram (commandment 2).
-#[must_use]
-pub fn build_rest_leg_score_lines(
-    summaries: &[RestLegDaySummary],
-) -> Vec<tickvault_core::notification::events::RestLegScoreLine> {
-    use tickvault_core::notification::events::RestLegScoreLine;
-    let feed_display = |f: &str| match f {
-        "dhan" => "Dhan".to_string(),
-        "groww" => "Groww".to_string(),
-        other => other.to_string(),
-    };
-    let leg_display = |l: &str| match l {
-        "spot_1m" => "spot candles".to_string(),
-        "chain_1m" => "option chain".to_string(),
-        "contract_1m" => "option contracts".to_string(),
-        other => other.to_string(),
-    };
-    let to_line = |feed: &str, leg: &str, s: Option<&RestLegDaySummary>| -> RestLegScoreLine {
-        let sent = SCOREBOARD_UNAVAILABLE_SENTINEL;
-        match s {
-            Some(s) => RestLegScoreLine {
-                feed: feed_display(feed),
-                leg: leg_display(leg),
-                ok_fetches: s.ok_fetches,
-                failed_fetches: s.failed_fetches,
-                named_gaps: s.named_gaps,
-                pre_boot_gaps: s.pre_boot_gaps,
-                rate_limited_hits: s.rate_limited_hits,
-                late_recovered: s.late_recovered,
-                close_p50_ms: s.close_p50_ms,
-                close_p99_ms: s.close_p99_ms,
-                close_max_ms: s.close_max_ms,
-                close_samples: s.close_samples,
-            },
-            None => RestLegScoreLine {
-                feed: feed_display(feed),
-                leg: leg_display(leg),
-                ok_fetches: sent,
-                failed_fetches: sent,
-                named_gaps: sent,
-                pre_boot_gaps: sent,
-                rate_limited_hits: sent,
-                late_recovered: sent,
-                close_p50_ms: sent,
-                close_p99_ms: sent,
-                close_max_ms: sent,
-                close_samples: sent,
-            },
-        }
-    };
-    // 2026-08-21: was 4 pairs (Dhan x the removed second feed). Its two
-    // rows rendered every single day carrying the -1 "absent" sentinels,
-    // and `unmeasured_canonical_rest_pairs` then named them "not measured
-    // today" in the operator digest — which reads as a leg that should
-    // have run and did not, never as a feed that no longer exists.
-    const CANONICAL: [(&str, &str); 2] = [("dhan", "spot_1m"), ("dhan", "chain_1m")];
-    let mut out = Vec::with_capacity(summaries.len().max(CANONICAL.len()));
-    for (feed, leg) in CANONICAL {
-        let s = summaries.iter().find(|s| s.feed == feed && s.leg == leg);
-        out.push(to_line(feed, leg, s));
-    }
-    for s in summaries {
-        if !CANONICAL.contains(&(s.feed.as_str(), s.leg.as_str())) {
-            out.push(to_line(&s.feed, &s.leg, Some(s)));
-        }
-    }
-    // G6 (fix round 2): the F3 not-measured `info!` moved OUT of this
-    // builder into the AGGREGATION path (`log_rest_leg_measurement_gaps`,
-    // called right after `aggregate_rest_leg_day`) — this builder was
-    // only invoked on the telegram-enabled branch of main.rs, so on a
-    // telegram-disabled boot the §2b always-render contract was satisfied
-    // neither on the card nor in logs.
-    out
-}
-
-/// The CANONICAL card pairs whose lines carry MEASURED latency but NO
-/// pull counts (`ok_fetches == -1`, `close_samples > 0`) — the documented
-/// `spot_1m_rest` latency-only fallback source (a forensics-writer outage
-/// window or a pre-2026-07-14 backfill day). These pairs RENDER count-less
-/// on the card (G6, fix round 2) and are logged as latency-only — never
-/// as "not measured" (that log statement was false for exactly this arm).
-#[must_use]
-pub fn latency_only_canonical_rest_pairs(
-    lines: &[tickvault_core::notification::events::RestLegScoreLine],
-) -> Vec<(String, String)> {
-    CANONICAL_DISPLAY
-        .iter()
-        .filter(|(feed, leg)| {
-            let counts_measured = lines
-                .iter()
-                .any(|l| l.feed == *feed && l.leg == *leg && l.ok_fetches >= 0);
-            let latency_measured = lines
-                .iter()
-                .any(|l| l.feed == *feed && l.leg == *leg && l.close_samples > 0);
-            !counts_measured && latency_measured
-        })
-        .map(|(feed, leg)| ((*feed).to_string(), (*leg).to_string()))
-        .collect()
-}
-
-/// F3 log-side always-render contract, re-homed to the AGGREGATION path
-/// (G6, fix round 2) so it fires even when the scorecard Telegram is
-/// disabled — one truthful `info!` per canonical pair that is either
-/// wholly unmeasured (nothing on the card) or latency-only (renders a
-/// count-less delay segment). See the RULE-CONTRACT TENSION note on
-/// `unmeasured_canonical_rest_pairs`.
-pub fn log_rest_leg_measurement_gaps(summaries: &[RestLegDaySummary]) {
-    let lines = build_rest_leg_score_lines(summaries);
-    for (feed, leg) in unmeasured_canonical_rest_pairs(&lines) {
-        info!(
-            %feed,
-            %leg,
-            "rest-leg digest: {feed}/{leg} not measured — omitted from the \
-             scorecard card per the 2026-07-15 cleanliness directive; the \
-             always-render contract is satisfied in logs pending the \
-             rule-file supersession"
-        );
-    }
-    for (feed, leg) in latency_only_canonical_rest_pairs(&lines) {
-        info!(
-            %feed,
-            %leg,
-            "rest-leg digest: {feed}/{leg} latency measured, pull counts \
-             missing (the spot_1m_rest latency-only fallback source) — \
-             renders a count-less delay segment on the scorecard card"
-        );
-    }
-}
-
-/// The canonical card pairs (display names) the §2b contract names.
-///
-/// 2026-08-21: two, not four — the second feed was removed, and its pair
-/// names must not keep appearing in the digest as legs awaiting data.
-const CANONICAL_DISPLAY: [(&str, &str); 2] = [("Dhan", "spot candles"), ("Dhan", "option chain")];
-
-/// The CANONICAL card pairs (Dhan x spot candles/option chain) with
-/// NOTHING measured today — no pull counts AND no latency samples. Pure so
-/// the F3 not-measured logging is unit-testable.
-///
-/// G6 (fix round 2): a pair on the documented `spot_1m_rest` latency-only
-/// fallback (`ok_fetches == -1`, `close_samples > 0`) is MEASURED — it was
-/// previously misclassified unmeasured here (a false log statement while
-/// its real latency sat in the same lines vec) and simultaneously dropped
-/// from the card. Latency-only pairs are named separately by
-/// [`latency_only_canonical_rest_pairs`].
-#[must_use]
-pub fn unmeasured_canonical_rest_pairs(
-    lines: &[tickvault_core::notification::events::RestLegScoreLine],
-) -> Vec<(String, String)> {
-    CANONICAL_DISPLAY
-        .iter()
-        .filter(|(feed, leg)| {
-            !lines.iter().any(|l| {
-                l.feed == *feed && l.leg == *leg && (l.ok_fetches >= 0 || l.close_samples > 0)
-            })
-        })
-        .map(|(feed, leg)| ((*feed).to_string(), (*leg).to_string()))
-        .collect()
-}
-
+//
+// ~480 lines: `RestFetchLiteRow`, `RestLegDaySummary`, the two day queries
+// (`build_rest_fetch_audit_day_sql` over `rest_fetch_audit`,
+// `build_spot1m_close_latency_day_sql` over `rest_spot_1m`), their parsers,
+// the percentile filler, `aggregate_rest_leg_day`, the per-leg gauge labels,
+// the score-line builder and the measurement-gap logger.
+//
+// It existed for the operator's 2026-07-13 Quote 2 — "always clearly note
+// within a second, or within how many seconds precisely, we are fetching
+// this live real OHLCV, along with the option chain API" — and it answered
+// that by aggregating the day's per-fetch forensics per (feed, leg).
+//
+// Both tables it read still EXIST and keep their history; what changed is
+// that nothing WRITES them any more. The operator's SOCKETS-ONLY narrowing
+// removed the per-minute spot-1m and option-chain legs
+// (`no-rest-except-live-feed-2026-06-27.md` §12.10), so from that day this
+// arm aggregated zero rows for every target day — two QuestDB queries a
+// day to measure legs that no longer run. §12.11's disposition table names
+// this arm REMOVE for exactly that reason.
+//
+// ⚠ A PRECISION NOTE on §12.9(a), which listed this reader as failing
+// "silent — percentiles emit the `-1` no-sample sentinel, digest renders
+// 'no data'". Measured before cutting: the render is BETTER than that.
+// `render_pulls_per_leg` returns `None` when no leg produced a part, so an
+// empty aggregate OMITS the pulls segment rather than printing a fabricated
+// "0/0 ✅". The removal is still right — a dead subsystem that reads as
+// live is the cost here, not a false green — but the failure mode was
+// milder than recorded, and this file's own §12.9 is the section that
+// corrected §12.8 for imprecision.
+//
+// WHAT IS LOST, stated rather than implied: the scorecard no longer
+// answers "how many seconds after minute close did the pull land", because
+// there is no pull. Nothing replaces it; nothing needs to.
+// ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // The 15:45 IST daily aggregation
 // ---------------------------------------------------------------------------
@@ -2940,15 +2510,6 @@ pub struct ScoreboardSummary {
     /// stamps the distinct 'feed_off' outcome and the card says "no
     /// contest" instead of declaring a one-horse winner.
     pub dhan_feed_off: bool,
-
-    /// REST 1m pull digest aggregates per (feed, leg) — the Quote-2 daily
-    /// answer (Groww REST plan PR-5). Empty on days with no measurable
-    /// pull records (pre-deploy days / read failure — see the flag below).
-    pub rest_legs: Vec<RestLegDaySummary>,
-    /// `true` when the pull-record read/parse failed while building the
-    /// digest — the card carries the honest cause footnote; the rest of
-    /// the scorecard is UNAFFECTED (the digest is additive by design).
-    pub rest_legs_read_failed: bool,
 }
 
 /// RunCatchUp already-ran probe (round 4, 2026-07-10 — LOW): reads the
@@ -3609,98 +3170,22 @@ pub async fn run_feed_scoreboard(
         }
     }
 
-    // 6e. REST 1m pull digest (Groww REST plan PR-5 — the operator's
-    //     Quote-2 mandate: "within how many seconds precisely"). Reads the
-    //     day's rest_fetch_audit forensics rows + the spot_1m_rest
-    //     latency-fallback column and aggregates per (feed, leg). ADDITIVE
-    //     + best-effort: a read/parse failure logs SCOREBOARD-01
-    //     (stage=rest_leg_*), flags the card's honest footnote, and NEVER
-    //     touches the episode/coverage/lag sections, the daily rows, or
-    //     the run outcome. Nothing is persisted — the aggregates are
-    //     recomputed from the durable audit table on every run, so
-    //     backfills/reruns are idempotent by construction and no
-    //     keep-better guard is needed (the PR-C conventions apply at
-    //     RENDER time via the -1 sentinels).
-    let mut rest_legs_read_failed = false;
-    let audit_lite: Vec<RestFetchLiteRow> = {
-        let sql = build_rest_fetch_audit_day_sql(target_ist_day);
-        match exec_query(&client, questdb, &sql).await {
-            Some(body) => parse_rest_fetch_audit_lite(&body).unwrap_or_else(|| {
-                rest_legs_read_failed = true;
-                error!(
-                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
-                    stage = "rest_leg_parse",
-                    "SCOREBOARD-01: the day's rest_fetch_audit body was \
-                     unparsable — the pull digest degrades to the honest \
-                     footnote (the rest of the card is unaffected)"
-                );
-                Vec::new()
-            }),
-            None => {
-                rest_legs_read_failed = true;
-                error!(
-                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
-                    stage = "rest_leg_read",
-                    "SCOREBOARD-01: the day's rest_fetch_audit rows could not \
-                     be read — the pull digest degrades to the honest \
-                     footnote (the rest of the card is unaffected)"
-                );
-                Vec::new()
-            }
-        }
-    };
-    let spot_latency_fallback: Vec<(String, i64)> = {
-        let sql = build_spot1m_close_latency_day_sql(target_ist_day);
-        match exec_query(&client, questdb, &sql).await {
-            Some(body) => parse_feed_close_latency_rows(&body).unwrap_or_else(|| {
-                rest_legs_read_failed = true;
-                error!(
-                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
-                    stage = "rest_leg_fallback_parse",
-                    "SCOREBOARD-01: the day's spot candle latency body was \
-                     unparsable — the latency-only fallback lines degrade"
-                );
-                Vec::new()
-            }),
-            None => {
-                rest_legs_read_failed = true;
-                error!(
-                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
-                    stage = "rest_leg_fallback_read",
-                    "SCOREBOARD-01: the day's spot candle latency rows could \
-                     not be read — the latency-only fallback lines degrade"
-                );
-                Vec::new()
-            }
-        }
-    };
-    let rest_legs = aggregate_rest_leg_day(&audit_lite, &spot_latency_fallback);
-    // F3 log-side always-render contract (re-homed here by G6, fix
-    // round 2): fires on EVERY aggregation run — including
-    // telegram-disabled boots, where the card never renders at all.
-    log_rest_leg_measurement_gaps(&rest_legs);
-    // Dashboard gauge (plan PR-5 "+ dashboard gauge") — /metrics-local
-    // (NOT CloudWatch-shipped; the tv_index_futures_selected precedent, so
-    // zero alarm/cost impact), set on SAME-DAY runs only (a backfill's
-    // gauge would misrepresent NOW), static label values only (the bounded
-    // feed/leg allowlist — parsed strings never become label values).
-    if is_same_day_run {
-        for s in &rest_legs {
-            if s.close_p99_ms >= 0
-                && let Some((feed_label, leg_label)) = rest_leg_gauge_labels(&s.feed, &s.leg)
-            {
-                #[allow(clippy::cast_precision_loss)]
-                // APPROVED: display-only gauge of a bounded daily latency.
-                metrics::gauge!(
-                    "tv_rest_leg_close_to_data_p99_ms",
-                    "feed" => feed_label,
-                    "leg" => leg_label
-                )
-                .set(s.close_p99_ms as f64);
-            }
-        }
-    }
-
+    // 6e. The REST 1m pull digest is RETIRED 2026-09-17 with the legs it
+    //     measured. It read the day's `rest_fetch_audit` forensics rows and
+    //     the `rest_spot_1m` latency column, aggregated per (feed, leg), and
+    //     published `tv_rest_leg_close_to_data_p99_ms` on same-day runs.
+    //
+    //     Both tables keep their history; nothing writes them since the
+    //     operator's SOCKETS-ONLY narrowing removed the per-minute spot-1m
+    //     and option-chain legs, so this arm ran two QuestDB queries a day
+    //     to aggregate zero rows. Record + disposition table:
+    //     `no-rest-except-live-feed-2026-06-27.md` §12.10 and §12.11.
+    //
+    //     The `tv_rest_leg_close_to_data_p99_ms` gauge goes with it. It was
+    //     LOCAL `/metrics` only — never EMF-selected, never alarmed (the
+    //     `tv_index_futures_selected` precedent) — so there is no CloudWatch
+    //     filter, alarm or dashboard widget left pointing at a dead
+    //     producer, which is the lockstep §12.10.5 #5 requires.
     // 7. AUDIT-WS-01 under-count cross-check (self-scrape). SCOPED to
     //    same-day runs ONLY (round-2 hostile review 2026-07-10): the
     //    counter is CURRENT-SESSION state — a past-day backfill inheriting
@@ -3985,8 +3470,6 @@ pub async fn run_feed_scoreboard(
         // partial while the card rendered no restart caveat).
         restart_partial: restart_day_floor,
         dhan_feed_off: feed_off.get("dhan").copied().unwrap_or(false),
-        rest_legs,
-        rest_legs_read_failed,
     })
 }
 
@@ -6594,392 +6077,35 @@ mod tests {
         ));
     }
 
-    // -----------------------------------------------------------------------
-    // REST 1m pull digest (Groww REST plan PR-5 — operator Quote 2)
-    // -----------------------------------------------------------------------
-
-    fn audit_row(feed: &str, leg: &str, outcome: &str, close_ms: i64, rl: i64) -> RestFetchLiteRow {
-        RestFetchLiteRow {
-            feed: feed.to_string(),
-            leg: leg.to_string(),
-            outcome: outcome.to_string(),
-            close_to_data_ms: close_ms,
-            rate_limited_count: rl,
-            error_class: String::new(),
-        }
-    }
-
-    /// Micros-literal + column-shape regression lock for the two digest
-    /// SQL builders (QuestDB 9.3.5 embeds integer TIMESTAMP literals as
-    /// MICROSECONDS — a nanos literal silently matches nothing).
-    #[test]
-    fn test_rest_leg_digest_sql_builders_use_micros_and_expected_columns() {
-        let (start_micros, end_micros) = day_bounds_micros(DAY);
-        let audit_sql = build_rest_fetch_audit_day_sql(DAY);
-        assert!(audit_sql.contains("from rest_fetch_audit"), "{audit_sql}");
-        for col in [
-            "feed",
-            "leg",
-            "outcome",
-            "close_to_data_ms",
-            "rate_limited_count",
-        ] {
-            assert!(audit_sql.contains(col), "missing {col}: {audit_sql}");
-        }
-        assert!(
-            audit_sql.contains(&format!("ts >= {start_micros}"))
-                && audit_sql.contains(&format!("ts < {end_micros}")),
-            "micros window literals required: {audit_sql}"
-        );
-        let fb_sql = build_spot1m_close_latency_day_sql(DAY);
-        assert!(fb_sql.contains("from rest_spot_1m"), "{fb_sql}");
-        assert!(
-            fb_sql.contains("close_to_data_ms >= 0"),
-            "the -1 sentinel rows must never reach the distribution: {fb_sql}"
-        );
-        assert!(
-            fb_sql.contains(&format!("ts >= {start_micros}"))
-                && fb_sql.contains(&format!("ts < {end_micros}")),
-            "micros window literals required: {fb_sql}"
-        );
-        // Nanos literals must never appear (1000x the micros value).
-        let nanos_start = (DAY as i64) * 86_400 * NANOS_PER_SEC;
-        assert!(!audit_sql.contains(&nanos_start.to_string()), "{audit_sql}");
-        assert!(!fb_sql.contains(&nanos_start.to_string()), "{fb_sql}");
-    }
-
-    #[test]
-    fn test_parse_rest_fetch_audit_lite_and_latency_rows() {
-        let body = r#"{"columns":[],"dataset":[
-            ["groww","spot_1m","ok",1042,0],
-            ["groww","spot_1m","error",-1,2],
-            ["groww","chain_1m","ok",2100,0],
-            ["garbage-shape-row"],
-            [null,"spot_1m","ok",1,0]
-        ]}"#;
-        let rows = parse_rest_fetch_audit_lite(body).expect("parsable");
-        assert_eq!(rows.len(), 3, "bad-shape rows are skipped: {rows:?}");
-        assert_eq!(rows[0], audit_row("groww", "spot_1m", "ok", 1042, 0));
-        assert_eq!(rows[1].rate_limited_count, 2);
-        assert!(parse_rest_fetch_audit_lite("not json").is_none());
-        assert!(parse_rest_fetch_audit_lite(r#"{"no":"dataset"}"#).is_none());
-
-        let fb = parse_feed_close_latency_rows(
-            r#"{"columns":[],"dataset":[["dhan",1900],["dhan",61000],["bad"],["groww",120]]}"#,
-        )
-        .expect("parsable");
-        assert_eq!(
-            fb,
-            vec![
-                ("dhan".to_string(), 1900),
-                ("dhan".to_string(), 61000),
-                ("groww".to_string(), 120)
-            ]
-        );
-        assert!(parse_feed_close_latency_rows("nope").is_none());
-    }
-
-    #[test]
-    fn test_percentile_nearest_rank_boundaries() {
-        assert_eq!(percentile_nearest_rank(&[], 50), -1, "empty = sentinel");
-        assert_eq!(percentile_nearest_rank(&[7], 50), 7);
-        assert_eq!(percentile_nearest_rank(&[7], 99), 7);
-        let v: Vec<i64> = (1..=100).collect();
-        assert_eq!(percentile_nearest_rank(&v, 50), 50);
-        assert_eq!(percentile_nearest_rank(&v, 99), 99);
-        assert_eq!(percentile_nearest_rank(&v, 100), 100);
-        // pct > 100 clamps to the max — never an out-of-bounds panic.
-        assert_eq!(percentile_nearest_rank(&v, 250), 100);
-        let v2 = [10, 20, 30, 40];
-        assert_eq!(percentile_nearest_rank(&v2, 50), 20);
-        assert_eq!(percentile_nearest_rank(&v2, 99), 40);
-    }
-
-    /// The core aggregation semantics: ok-vs-failed-vs-named-gap split,
-    /// the ≥60s late-recovery exclusion from the prompt distribution, and
-    /// the 429 sum across ALL rows.
-    #[test]
-    fn test_aggregate_rest_leg_day_outcome_and_late_split() {
-        let rows = vec![
-            audit_row("groww", "spot_1m", "ok", 1_000, 0),
-            audit_row("groww", "spot_1m", "ok", 2_000, 1),
-            audit_row("groww", "spot_1m", "ok", 3_000, 0),
-            // Late repair (the sweep's honest >60s delay) — counted, NOT
-            // in the prompt distribution.
-            audit_row("groww", "spot_1m", "ok", 7_200_000, 0),
-            audit_row("groww", "spot_1m", "empty", -1, 0),
-            audit_row("groww", "spot_1m", "rate_limited", -1, 3),
-            audit_row("groww", "spot_1m", "named_gap", -1, 0),
-            audit_row("groww", "chain_1m", "ok", 2_100, 0),
-        ];
-        let out = aggregate_rest_leg_day(&rows, &[]);
-        assert_eq!(out.len(), 2);
-        let spot = out
-            .iter()
-            .find(|s| s.leg == "spot_1m")
-            .expect("spot summary");
-        assert_eq!(spot.feed, "groww");
-        assert_eq!(spot.ok_fetches, 4, "late repairs still count ok");
-        assert_eq!(spot.failed_fetches, 2, "empty + rate_limited");
-        assert_eq!(spot.named_gaps, 1, "gaps are NOT failed fetches");
-        assert_eq!(spot.rate_limited_hits, 4, "429s sum across all rows");
-        assert_eq!(spot.late_recovered, 1);
-        assert_eq!(spot.close_samples, 3, "the late repair is excluded");
-        assert_eq!(spot.close_p50_ms, 2_000);
-        assert_eq!(spot.close_p99_ms, 3_000);
-        assert_eq!(spot.close_max_ms, 3_000);
-        let chain = out
-            .iter()
-            .find(|s| s.leg == "chain_1m")
-            .expect("chain summary");
-        assert_eq!((chain.ok_fetches, chain.close_p50_ms), (1, 2_100));
-        // Empty day → empty vec (the card omits the section honestly).
-        assert!(aggregate_rest_leg_day(&[], &[]).is_empty());
-    }
-
-    /// An all-pulls-failed key keeps its measured counts with the -1
-    /// latency sentinels + a measured-zero sample count — never a
-    /// fabricated distribution (Rule 11).
-    #[test]
-    fn test_aggregate_rest_leg_day_zero_ok_sentinels() {
-        let rows = vec![
-            audit_row("groww", "chain_1m", "error", -1, 0),
-            audit_row("groww", "chain_1m", "no_token", -1, 0),
-        ];
-        let out = aggregate_rest_leg_day(&rows, &[]);
-        let s = &out[0];
-        assert_eq!((s.ok_fetches, s.failed_fetches), (0, 2));
-        assert_eq!(s.close_samples, 0, "measured zero, not -1");
-        assert_eq!(
-            (s.close_p50_ms, s.close_p99_ms, s.close_max_ms),
-            (-1, -1, -1)
-        );
-    }
-
-    /// The Dhan spot latency-only fallback: a feed with data-table latency
-    /// rows but NO audit rows gets a distribution with -1 COUNT sentinels;
-    /// a feed already covered by the audit source is never double-counted.
-    #[test]
-    fn test_aggregate_rest_leg_day_spot_latency_fallback() {
-        let audit = vec![audit_row("groww", "spot_1m", "ok", 1_042, 0)];
-        let fallback = vec![
-            ("dhan".to_string(), 1_900),
-            ("dhan".to_string(), 2_400),
-            ("dhan".to_string(), 100_000), // a backfilled repair — late
-            ("groww".to_string(), 999),    // audit source wins — ignored
-        ];
-        let out = aggregate_rest_leg_day(&audit, &fallback);
-        assert_eq!(out.len(), 2);
-        let dhan = out.iter().find(|s| s.feed == "dhan").expect("dhan spot");
-        assert_eq!(dhan.leg, "spot_1m");
-        assert_eq!(
-            (dhan.ok_fetches, dhan.failed_fetches, dhan.named_gaps),
-            (-1, -1, -1),
-            "the data table records no outcomes — counts stay sentinels"
-        );
-        assert_eq!(dhan.rate_limited_hits, -1);
-        assert_eq!(dhan.late_recovered, 1);
-        assert_eq!(dhan.close_samples, 2);
-        assert_eq!(dhan.close_p50_ms, 1_900);
-        assert_eq!(dhan.close_max_ms, 2_400);
-        let groww = out.iter().find(|s| s.feed == "groww").expect("groww spot");
-        assert_eq!(
-            groww.close_p50_ms, 1_042,
-            "the audit-derived distribution must win over the fallback"
-        );
-    }
-
-    /// The gauge-label allowlist: bounded static values only — a parsed
-    /// slug outside the allowlist is skipped, never a label value.
-    #[test]
-    fn test_rest_leg_gauge_labels_allowlist() {
-        assert_eq!(
-            rest_leg_gauge_labels("dhan", "spot_1m"),
-            Some(("dhan", "spot_1m"))
-        );
-        assert_eq!(
-            rest_leg_gauge_labels("groww", "chain_1m"),
-            Some(("groww", "chain_1m"))
-        );
-        assert_eq!(
-            rest_leg_gauge_labels("groww", "contract_1m"),
-            Some(("groww", "contract_1m"))
-        );
-        assert_eq!(rest_leg_gauge_labels("evil'feed", "spot_1m"), None);
-        assert_eq!(rest_leg_gauge_labels("dhan", "weird_leg"), None);
-    }
-
-    /// The card-line builder: the four canonical pairs ALWAYS render (the
-    /// Quote-2 answer exists even as "not measured yet"), extra measured
-    /// pairs (the PR-4 contract leg) append automatically, and wire slugs
-    /// never leak into the display names (commandment 2).
-    #[test]
-    fn test_build_rest_leg_score_lines_canonical_order_and_extras() {
-        let summaries = vec![
-            RestLegDaySummary {
-                feed: "dhan".to_string(),
-                leg: "spot_1m".to_string(),
-                ok_fetches: 1_496,
-                failed_fetches: 4,
-                named_gaps: 0,
-                pre_boot_gaps: 0,
-                rate_limited_hits: 0,
-                late_recovered: 2,
-                close_p50_ms: 1_400,
-                close_p99_ms: 3_200,
-                close_max_ms: 6_200,
-                close_samples: 1_494,
-            },
-            RestLegDaySummary {
-                feed: "dhan".to_string(),
-                leg: "contract_1m".to_string(),
-                ok_fetches: 10,
-                failed_fetches: 0,
-                named_gaps: 0,
-                pre_boot_gaps: 0,
-                rate_limited_hits: 0,
-                late_recovered: 0,
-                close_p50_ms: 900,
-                close_p99_ms: 1_500,
-                close_max_ms: 1_600,
-                close_samples: 10,
-            },
-        ];
-        let lines = build_rest_leg_score_lines(&summaries);
-        let names: Vec<(String, String)> = lines
-            .iter()
-            .map(|l| (l.feed.clone(), l.leg.clone()))
-            .collect();
-        assert_eq!(
-            names,
-            vec![
-                ("Dhan".to_string(), "spot candles".to_string()),
-                ("Dhan".to_string(), "option chain".to_string()),
-                ("Dhan".to_string(), "option contracts".to_string()),
-            ]
-        );
-        // The measured pair carries its numbers; an absent pair carries
-        // the honest -1 sentinels everywhere.
-        let dhan_spot = &lines[0];
-        assert_eq!(dhan_spot.ok_fetches, 1_496);
-        assert_eq!(dhan_spot.close_p99_ms, 3_200);
-        let dhan_chain = &lines[1];
-        assert_eq!(dhan_chain.ok_fetches, -1);
-        assert_eq!(dhan_chain.close_samples, -1);
-        // Empty summaries still render every canonical placeholder.
-        assert_eq!(
-            build_rest_leg_score_lines(&[]).len(),
-            CANONICAL_DISPLAY.len()
-        );
-    }
-
-    #[test]
-    fn test_unmeasured_canonical_rest_pairs_names_only_sentinel_pairs() {
-        // F3 (2026-07-15 fix round): the card suppresses unmeasured pairs,
-        // so the honest not-measured signal moves to the logs — this pure
-        // helper names exactly the canonical pairs with no measured pull
-        // source (the §2b always-render contract's log-side leg).
-        let summaries = vec![RestLegDaySummary {
-            feed: "dhan".to_string(),
-            leg: "spot_1m".to_string(),
-            ok_fetches: 1_496,
-            failed_fetches: 4,
-            named_gaps: 0,
-            pre_boot_gaps: 0,
-            rate_limited_hits: 0,
-            late_recovered: 2,
-            close_p50_ms: 1_400,
-            close_p99_ms: 3_200,
-            close_max_ms: 6_200,
-            close_samples: 1_494,
-        }];
-        let lines = build_rest_leg_score_lines(&summaries);
-        assert_eq!(
-            unmeasured_canonical_rest_pairs(&lines),
-            vec![("Dhan".to_string(), "option chain".to_string())]
-        );
-        // Every canonical pair measured → nothing to log.
-        let all = ["spot_1m", "chain_1m"];
-        let full: Vec<RestLegDaySummary> = ["dhan"]
-            .iter()
-            .flat_map(|f| {
-                all.iter().map(|l| RestLegDaySummary {
-                    feed: (*f).to_string(),
-                    leg: (*l).to_string(),
-                    ok_fetches: 5,
-                    failed_fetches: 0,
-                    named_gaps: 0,
-                    pre_boot_gaps: 0,
-                    rate_limited_hits: 0,
-                    late_recovered: 0,
-                    close_p50_ms: 900,
-                    close_p99_ms: 1_500,
-                    close_max_ms: 1_600,
-                    close_samples: 5,
-                })
-            })
-            .collect();
-        let lines = build_rest_leg_score_lines(&full);
-        assert!(unmeasured_canonical_rest_pairs(&lines).is_empty());
-        // Empty build → every canonical pair named.
-        assert_eq!(
-            unmeasured_canonical_rest_pairs(&build_rest_leg_score_lines(&[])).len(),
-            CANONICAL_DISPLAY.len()
-        );
-    }
-
-    #[test]
-    fn test_latency_only_pair_is_measured_not_unmeasured() {
-        // G6 (fix round 2): the documented spot_1m_rest latency-only
-        // fallback (counts -1, latency measured) must classify MEASURED —
-        // logging it "not measured" was a false statement during exactly
-        // the forensics-writer-outage window the fallback exists for. It
-        // is named separately as latency-only instead.
-        let summaries = vec![RestLegDaySummary {
-            feed: "dhan".to_string(),
-            leg: "spot_1m".to_string(),
-            ok_fetches: -1,
-            failed_fetches: -1,
-            named_gaps: -1,
-            pre_boot_gaps: -1,
-            rate_limited_hits: -1,
-            late_recovered: -1,
-            close_p50_ms: 1_100,
-            close_p99_ms: 1_800,
-            close_max_ms: 5_000,
-            close_samples: 372,
-        }];
-        let lines = build_rest_leg_score_lines(&summaries);
-        let unmeasured = unmeasured_canonical_rest_pairs(&lines);
-        assert!(
-            !unmeasured.contains(&("Dhan".to_string(), "spot candles".to_string())),
-            "a latency-only pair must never be logged 'not measured': {unmeasured:?}"
-        );
-        // The remaining canonical pair stays honestly unmeasured.
-        assert_eq!(unmeasured.len(), CANONICAL_DISPLAY.len() - 1);
-        // ...and the latency-only classifier names exactly this pair.
-        assert_eq!(
-            latency_only_canonical_rest_pairs(&lines),
-            vec![("Dhan".to_string(), "spot candles".to_string())]
-        );
-        // A counts-measured pair is never latency-only.
-        let counted = vec![RestLegDaySummary {
-            feed: "dhan".to_string(),
-            leg: "spot_1m".to_string(),
-            ok_fetches: 735,
-            failed_fetches: 0,
-            named_gaps: 0,
-            pre_boot_gaps: 0,
-            rate_limited_hits: 0,
-            late_recovered: 0,
-            close_p50_ms: 1_100,
-            close_p99_ms: 1_800,
-            close_max_ms: 5_000,
-            close_samples: 372,
-        }];
-        let lines = build_rest_leg_score_lines(&counted);
-        assert!(latency_only_canonical_rest_pairs(&lines).is_empty());
-    }
+    // ---- the REST 1m pull-digest test block is RETIRED 2026-09-17 ----
+    //
+    // TEN tests plus the `audit_row` fixture, covering the digest end to
+    // end: the two day-query SQL builders (micros-vs-nanos literal lock),
+    // both row parsers, `percentile_nearest_rank`, `aggregate_rest_leg_day`
+    // (outcome/late split, zero-ok sentinels, the spot latency fallback),
+    // the bounded gauge-label allowlist, `build_rest_leg_score_lines`
+    // canonical ordering, and the unmeasured / latency-only classifiers.
+    //
+    // Every production function they exercised was removed with the digest
+    // itself, because nothing writes `rest_fetch_audit` or `rest_spot_1m`
+    // after the operator's SOCKETS-ONLY narrowing
+    // (`no-rest-except-live-feed-2026-06-27.md` §12.10, disposition §12.11).
+    //
+    // THREE rules they encoded are NOT retired and outlive them:
+    //
+    //   1. QuestDB 9.3.5 embeds integer TIMESTAMP literals as MICROSECONDS.
+    //      A nanos literal silently matches NOTHING — it does not error, it
+    //      returns an empty set, which reads exactly like a quiet day. Any
+    //      future day-window query builder needs its own micros lock.
+    //   2. A gauge's label VALUES must come from a bounded allowlist, never
+    //      from a row's `feed`/`leg` column, or a vendor typo mints a new
+    //      time series (and, on a CloudWatch-shipped metric, a new bill).
+    //   3. `percentile_nearest_rank` on an EMPTY sample returns the `-1`
+    //      not-measured sentinel, never 0 — the omit-never-fabricate rule.
+    //
+    // WHAT THIS LEAVES UNWATCHED, stated rather than implied: nothing in
+    // this crate now pins rule 1 or rule 2, because this module has no
+    // remaining day-window query and no remaining labelled gauge.
 
     // MERGE RESOLVED 2026-07-15: the FEED-GAP-01 dangling-close sweep
     // tests died here with their production fns (the gap-episode

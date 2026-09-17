@@ -48,17 +48,27 @@ resource "aws_cloudwatch_dashboard" "operator" {
         width  = 8
         height = 6
         properties = {
-          # 2026-07-15 (Groww live retirement): was the Groww lag p99 gauge —
-          # its only sample producer (the Groww bridge) is deleted; the REST
-          # 1m fire heartbeat is the liveness signal (1 = per-minute legs
-          # firing; MISSING in-session = wedged/dead — the liveness alarm).
-          title   = "REST 1m fire heartbeat (1 = per-minute candle pulls firing)"
+          # SIGNAL RE-POINTED TWICE, both times because a producer died:
+          #   2026-07-15  off the Groww lag p99 gauge (Groww bridge deleted)
+          #   2026-09-16  off tv_rest_1m_fire_heartbeat  ← current
+          #
+          # The heartbeat's three producers went with the per-minute REST legs
+          # under the operator's sockets-only directive
+          # (no-rest-except-live-feed-2026-06-27.md §12.10). This widget now
+          # charts the SAME gauge the market-hours liveness alarm reads, so the
+          # tile and the pager can never disagree about what "alive" means.
+          #
+          # Read it as an AGE, not a marker: a healthy lane saws between 0 and
+          # ~30s (the silence timer's own cadence) and the line only climbs when
+          # ticks stop. 300 is where tv-<env>-dhan-no-ticks-flowing fires, which
+          # is why the axis tops out at 600 — half-scale IS the alarm line.
+          title   = "Feed liveness — seconds since the last tick (halfway = the alarm line)"
           region  = local.dash_region
           view    = "gauge"
-          metrics = [[local.dash_namespace, "tv_rest_1m_fire_heartbeat"]]
-          yAxis   = { left = { min = 0, max = 1 } }
+          metrics = [[local.dash_namespace, "tv_dhan_feed_last_tick_age_secs"]]
+          yAxis   = { left = { min = 0, max = 600 } }
           period  = 60
-          stat    = "Average"
+          stat    = "Maximum"
         }
       },
       {
@@ -226,9 +236,18 @@ resource "aws_cloudwatch_dashboard" "operator" {
         width  = 24
         height = 2
         properties = {
-          markdown = "## The live runtime — per-minute pulls, storage, memory\nThese are the parts that actually run today. **Persist-error lines should sit flat at zero.** A rising line means candles are being fetched but not saved. If the fire heartbeat at the top is missing during market hours, nothing is being pulled at all."
+          markdown = "## The live runtime — sockets, storage, memory\nThese are the parts that actually run today. **Error and drop lines should sit flat at zero.** Rewritten 2026-09-16: this section described the per-minute REST pulls, which were removed under the sockets-only directive — market data now arrives only over the WebSocket lane. If the liveness gauge at the top is missing during market hours, the process itself is gone."
         }
       },
+      # RETIRED 2026-09-16: "REST 1m legs — persist errors" charted
+      # tv_spot1m_persist_errors_total and tv_chain1m_persist_errors_total.
+      # Both writers were removed with the per-minute Dhan spot-1m and
+      # option-chain REST legs under the operator's sockets-only directive
+      # (no-rest-except-live-feed-2026-06-27.md §12.10), so the widget could
+      # only ever draw two flat zero lines — and on THIS dashboard a flat zero
+      # is the documented sign of health, which makes a producer-less line the
+      # most reassuring thing a reader could look at. Removed rather than left
+      # to be misread; the widgets below take its row.
       {
         type   = "metric"
         x      = 0
@@ -236,16 +255,31 @@ resource "aws_cloudwatch_dashboard" "operator" {
         width  = 12
         height = 6
         properties = {
-          title  = "REST 1m legs — persist errors (flat zero = healthy)"
+          # 2026-09-16: the "cadence scheduler" series
+          # (tv_cadence_runner_respawn_total) left with the scheduler itself —
+          # its only two executor methods were the per-minute spot-1m and
+          # option-chain pulls removed under the operator's sockets-only
+          # directive, so nothing was left for it to schedule. Moved to x=0 to
+          # take the row left by the retired REST-legs widget above.
+          title  = "Restarts — disk watcher / order push"
           region = local.dash_region
           view   = "timeSeries"
           metrics = [
-            [local.dash_namespace, "tv_spot1m_persist_errors_total", { label = "Dhan spot 1m", stat = "Sum" }],
-            [local.dash_namespace, "tv_chain1m_persist_errors_total", { label = "Dhan option chain 1m", stat = "Sum" }]
+            [local.dash_namespace, "tv_disk_watcher_respawn_total", { label = "disk watcher", stat = "Sum" }],
+            [local.dash_namespace, "tv_dhan_order_push_respawn_total", { label = "order push", stat = "Sum" }]
           ]
           period = 300
         }
       },
+      # RETIRED 2026-09-16: "Cadence pulls skipped / denied / exhausted" charted
+      # tv_cadence_boundary_skipped_total, tv_cadence_gate_denials_total and
+      # tv_cadence_ladder_exhausted_total. All three measured the per-minute
+      # REST scheduler, removed whole under the operator's sockets-only
+      # directive (no-rest-except-live-feed-2026-06-27.md §12.10) — with no
+      # market-data leg left to fire, the scheduler had nothing to schedule.
+      # Same reasoning as the widget two rows up: three producer-less lines
+      # sitting flat at zero read as health on a dashboard whose own text says
+      # flat zero IS health.
       {
         type   = "metric"
         x      = 12
@@ -253,42 +287,8 @@ resource "aws_cloudwatch_dashboard" "operator" {
         width  = 12
         height = 6
         properties = {
-          title  = "Restarts — cadence scheduler / disk watcher / order push"
-          region = local.dash_region
-          view   = "timeSeries"
-          metrics = [
-            [local.dash_namespace, "tv_cadence_runner_respawn_total", { label = "cadence scheduler", stat = "Sum" }],
-            [local.dash_namespace, "tv_disk_watcher_respawn_total", { label = "disk watcher", stat = "Sum" }],
-            [local.dash_namespace, "tv_dhan_order_push_respawn_total", { label = "order push", stat = "Sum" }]
-          ]
-          period = 300
-        }
-      },
-      {
-        type   = "metric"
-        x      = 0
-        y      = 44
-        width  = 8
-        height = 6
-        properties = {
-          title  = "Cadence pulls skipped / denied / exhausted"
-          region = local.dash_region
-          view   = "timeSeries"
-          metrics = [
-            [local.dash_namespace, "tv_cadence_boundary_skipped_total", { label = "minute skipped", stat = "Sum" }],
-            [local.dash_namespace, "tv_cadence_gate_denials_total", { label = "gate denied", stat = "Sum" }],
-            [local.dash_namespace, "tv_cadence_ladder_exhausted_total", { label = "retries exhausted", stat = "Sum" }]
-          ]
-          period = 300
-        }
-      },
-      {
-        type   = "metric"
-        x      = 8
-        y      = 44
-        width  = 8
-        height = 6
-        properties = {
+          # Moved up 2026-09-16 from (x=8, y=44) into the row the retired
+          # REST-legs widget left, so the section has no blank band.
           title  = "In-memory store — dropped / errors (flat zero = healthy)"
           region = local.dash_region
           view   = "timeSeries"
@@ -301,11 +301,14 @@ resource "aws_cloudwatch_dashboard" "operator" {
       },
       {
         type   = "metric"
-        x      = 16
+        x      = 0
         y      = 44
-        width  = 8
+        width  = 24
         height = 6
         properties = {
+          # Widened to the full row 2026-09-16: it is the only widget left on
+          # this row after the cadence widget retired, and the apply-lag series
+          # on the right axis reads far better across 24 columns than 8.
           title  = "Database write health — WAL suspended / apply lag / reconnects"
           region = local.dash_region
           view   = "timeSeries"
@@ -740,7 +743,11 @@ resource "aws_cloudwatch_dashboard" "operator" {
           metrics = [
             [local.dash_namespace, "tv_ilp_rows_discarded_total", { label = "database rows discarded", stat = "Sum" }],
             [local.dash_namespace, "tv_depth_rows_dropped_total", { label = "depth rows dropped", stat = "Sum" }],
-            [local.dash_namespace, "tv_rest_fetch_audit_rows_discarded_total", { label = "fetch-audit rows discarded", stat = "Sum" }],
+            # tv_rest_fetch_audit_rows_discarded_total removed 2026-09-16 — the
+            # rest_fetch_audit writer went with the per-minute REST legs
+            # (no-rest-except-live-feed-2026-06-27.md §12.10). The TABLE and its
+            # rows are retained; only the writer is gone, so the series can no
+            # longer move and a flat line here would read as "nothing was lost".
             [local.dash_namespace, "tv_ws_frame_spill_drop_critical", { label = "raw frames lost before capture", stat = "Sum" }]
           ]
           period = 300
@@ -758,7 +765,8 @@ resource "aws_cloudwatch_dashboard" "operator" {
           view   = "timeSeries"
           metrics = [
             [local.dash_namespace, "tv_depth_persist_errors_total", { label = "depth writes failed", stat = "Sum" }],
-            [local.dash_namespace, "tv_rest_fetch_audit_persist_errors_total", { label = "fetch-audit writes failed", stat = "Sum" }],
+            # tv_rest_fetch_audit_persist_errors_total removed 2026-09-16, same
+            # reason as its sibling in the widget to the left: no writer left.
             [local.dash_namespace, "tv_wal_replay_corrupted_segments_total", { label = "corrupted segments on replay", stat = "Sum" }],
             [local.dash_namespace, "tv_partition_archive_failed_total", { label = "archive to S3 failed", stat = "Sum" }],
             [local.dash_namespace, "tv_boot_deadline_exceeded_total", { label = "boot step ran out of time", stat = "Sum" }]
@@ -819,13 +827,24 @@ resource "aws_cloudwatch_dashboard" "operator" {
         width  = 12
         height = 6
         properties = {
+          # 2026-09-16: THREE of this widget's four series left with the
+          # per-minute REST legs and the cadence scheduler
+          # (no-rest-except-live-feed-2026-06-27.md §12.10):
+          # tv_cadence_late_response_total (broker answered after its minute),
+          # tv_cadence_spot_fallback_total (spot taken from the chain) and
+          # tv_chain_mark_refused_total (option mark refused). All three
+          # described a REST minute; there are no REST minutes now.
+          #
+          # The widget is KEPT rather than retired because its one surviving
+          # series is not a REST signal: the mid-session identity check runs on
+          # the token watchdog, which dhan_rest_stack still spawns — a socket
+          # cannot dial without the JWT it maintains. A single-line widget under
+          # this heading is honest; deleting it would take a live signal off the
+          # dashboard to tidy up three dead ones.
           title  = "Quiet fallbacks and refusals — every line should sit flat at zero"
           region = local.dash_region
           view   = "timeSeries"
           metrics = [
-            [local.dash_namespace, "tv_cadence_late_response_total", { label = "broker answer arrived after its minute", stat = "Sum" }],
-            [local.dash_namespace, "tv_cadence_spot_fallback_total", { label = "spot price taken from the chain instead", stat = "Sum" }],
-            [local.dash_namespace, "tv_chain_mark_refused_total", { label = "option mark refused", stat = "Sum" }],
             [local.dash_namespace, "tv_mid_session_profile_rest_degraded_total", { label = "mid-session identity check degraded", stat = "Sum" }]
           ]
           period = 300

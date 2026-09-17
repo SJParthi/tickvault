@@ -129,8 +129,22 @@ const SCRIPT_BUDGET: &[(&str, usize)] = &[
     ("crates/api/src/handlers/board_page.rs", 1),
     // --- NOT frontend: XSS fixtures + vendor-body parsing ---
     ("crates/api/src/middleware.rs", 1),
-    ("crates/aws-lambdas/src/operator_control.rs", 3),
-    ("crates/core/src/notification/events.rs", 6),
+    // 3 -> 2 (2026-09-17): the retired REST-audit test block carried one
+    // `<script` XSS fixture. Shrink-only, so the budget follows it down.
+    ("crates/aws-lambdas/src/operator_control.rs", 2),
+    // 6 -> 4 (2026-09-17): the seven retired REST-leg pull-digest tests
+    // carried two `<script` XSS fixtures between them.
+    //
+    // ⚠ This one shrank in commit 8fc50d4e0 and was re-stamped a commit
+    // LATE, leaving this guard red in between. The reason is worth recording
+    // because it is structural, not carelessness: `events.rs` lives in
+    // `core`, this guard lives in `common`, and `testing-scope.md`'s default
+    // ("edit in crates/<X> -> cargo test -p tickvault-<X>") would never run
+    // it for a core-only change. A cross-crate source-scan guard is outside
+    // the scope rule that is supposed to find it — so a change that shrinks
+    // ANY budgeted surface must run `tickvault-common` regardless of which
+    // crate it edited.
+    ("crates/core/src/notification/events.rs", 4),
     ("crates/trading/src/oms/api_client.rs", 1),
 ];
 

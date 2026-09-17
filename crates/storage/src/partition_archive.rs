@@ -296,6 +296,22 @@ const TICKS_TABLE: &str = "ticks";
 /// One minute, in seconds — the boundary between "intraday, current-day only"
 /// and "history the indicator and strategy paths read".
 const SECONDS_PER_MINUTE: u32 = 60;
+/// The per-minute option-chain capture table.
+///
+/// **RE-HOMED 2026-09-16.** This was
+/// `crate::option_chain_1m_persistence::OPTION_CHAIN_1M_TABLE` until the
+/// per-minute chain WRITER was deleted with the per-minute price pulls. The
+/// **TABLE and every row in it are RETAINED** — only the writer is gone — so
+/// its retention entry must survive, and the name needs a home that survives
+/// with it.
+///
+/// Named rather than inlined for exactly the reason `TICKS_TABLE` above gives:
+/// a rename must be a compile error here, not a silent reclassification into
+/// the wrong retention window. The literal is the same one
+/// `DAY_PARTITIONED_TABLES` in `partition_manager.rs` carries, and
+/// `partition_retention_coverage_guard` fails the build if the two disagree.
+const REST_OPTION_CHAIN_1M_TABLE: &str = "rest_option_chain_1m";
+
 /// The two per-minute option-chain capture tables (operator directive
 /// 2026-07-16: *"for only spots we will have minimum one month data …
 /// but option only for the current day"* — the chain tables are the
@@ -326,7 +342,7 @@ const SECONDS_PER_MINUTE: u32 = 60;
 /// a bad first sweep is "nothing freed yet", never data loss. Subsequent
 /// sweeps return to the ~1-partition/day steady state.
 const CHAIN_MARKET_DATA_TABLES: [&str; 2] = [
-    crate::option_chain_1m_persistence::OPTION_CHAIN_1M_TABLE,
+    REST_OPTION_CHAIN_1M_TABLE,
     crate::option_contract_1m_rest_persistence::OPTION_CONTRACT_1M_REST_TABLE,
 ];
 

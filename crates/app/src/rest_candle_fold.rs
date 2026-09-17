@@ -111,11 +111,72 @@ use tickvault_common::constants::{MARKET_CLOSE_IST_NANOS, MARKET_OPEN_IST_NANOS}
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
 use tickvault_common::types::SecurityId;
-use tickvault_storage::spot_1m_rest_persistence::SPOT_1M_REST_TABLE;
 use tickvault_trading::candles::{BufferedSeal, LiveCandleState, TF_COUNT, TfIndex};
 use tickvault_trading::in_mem::spot_bar_store::{RamBar, SlotKey, spot_bar_store};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
+
+/// The per-minute spot-1m REST capture table.
+///
+/// **RE-HOMED 2026-09-16.** This was
+/// `tickvault_storage::spot_1m_rest_persistence::SPOT_1M_REST_TABLE` until
+/// the per-minute spot-1m REST leg — the table's only WRITER — was removed
+/// under the operator's sockets-only directive
+/// (`no-rest-except-live-feed-2026-06-27.md` §12.10). The persistence module
+/// went with the writer; the **TABLE and every row already in it are
+/// RETAINED**, so the name still has to resolve.
+///
+/// ⚠ The table is FROZEN from 2026-09-16: it holds every row captured up to
+/// that date and gains no new ones. A query against it returns real history
+/// and, for any later trading day, zero rows — which is the correct answer,
+/// not a read failure.
+///
+/// The wire name is `rest_spot_1m`. The old MODULE was called
+/// `spot_1m_rest_persistence`, which is the reverse — a long-standing trap
+/// this repository's own §12.8(a) records, and the reason this const spells
+/// the wire name out rather than deriving it from anything.
+const SPOT_1M_REST_TABLE: &str = "rest_spot_1m";
+
+/// Whether anything in this workspace still SENDS into this fold's live-bar
+/// inlet (`send_confirmed_bars`).
+///
+/// **`false` since 2026-09-17**, and it is a `const` rather than a comment
+/// because the fact it records is the difference between a fold that works
+/// and a fold that reports a clean start and then sits silent for a session.
+///
+/// The fold has two inputs and the sockets-only narrowing took BOTH
+/// (`no-rest-except-live-feed-2026-06-27.md` §12.10):
+///
+///   1. **The live inlet.** Its only producer was `spot_1m_rest_boot.rs`,
+///      which called `send_confirmed_bars` at its two flush-ok arms — the
+///      persist-CONFIRMED contract that let a bar fold only after its ILP
+///      ACK. That file is gone, so `send_confirmed_bars` has zero production
+///      callers.
+///   2. **The boot catch-up.** It re-folds from `SPOT_1M_REST_TABLE` above,
+///      which is RETAINED but FROZEN — real history, and zero rows for any
+///      day after 2026-09-16.
+///
+/// Without this gate, flipping `[rest_candle_fold] enabled` to `true` would
+/// install the channel, spawn the task, log an ARMED line, and receive
+/// nothing — no error, no counter, for the whole session. That is the
+/// producer-less-channel shape §12.9(e) had to close for `mark_forward`, and
+/// here it cannot be closed the same way: the inlet is a first-wins
+/// `OnceLock` install, so its emptiness is never observable at runtime.
+///
+/// **This is not a removal.** The operator's narrowing named the per-minute
+/// price pulls and the 15:41 accuracy check "alone"; the module, its config
+/// section and the live lane's exclusivity floor are all untouched. What the
+/// const does is satisfy §12.10.7(g)'s obligation — *"removed or explicitly
+/// recorded as inert"* — mechanically rather than in prose, so the inertness
+/// is greppable, testable, and visible at the one place that would otherwise
+/// arm a dead task.
+///
+/// **To re-arm:** build a producer that calls `send_confirmed_bars` after a
+/// persist ACK, restore a writer for `rest_spot_1m` (or re-point the catch-up
+/// at a live source), and flip this to `true` in the SAME change. The live
+/// lane's floor 2 still refuses to open a socket while the fold is enabled,
+/// so re-arming is a scope decision, not a config flip.
+pub const LIVE_INLET_HAS_PRODUCER: bool = false;
 
 // ---------------------------------------------------------------------------
 // Constants (all named — no magic numbers; cold-path envelope bounds)
@@ -259,29 +320,26 @@ pub struct ConfirmedBar {
     pub volume: i64,
 }
 
-impl ConfirmedBar {
-    /// Builds a confirmed bar from a parsed [`MinuteCandle`] — the single
-    /// choke point BOTH spot legs use at their persist-confirmed hook
-    /// sites (Dhan fire/sweep + Groww fire/sweep).
-    pub fn from_minute_candle(
-        feed: Feed,
-        security_id: SecurityId,
-        exchange_segment_code: u8,
-        candle: &crate::dhan_intraday_parse::MinuteCandle,
-    ) -> Self {
-        Self {
-            feed,
-            security_id,
-            exchange_segment_code,
-            minute_ts_ist_nanos: candle.minute_ts_ist_nanos,
-            open: candle.open,
-            high: candle.high,
-            low: candle.low,
-            close: candle.close,
-            volume: candle.volume,
-        }
-    }
-}
+// ---- `ConfirmedBar::from_minute_candle`: REMOVED 2026-09-16 ----
+//
+// It converted a parsed `MinuteCandle` into a `ConfirmedBar` and was the
+// single choke point BOTH spot legs used at their persist-confirmed hook
+// sites. Both legs are gone with the per-minute price pulls
+// (`no-rest-except-live-feed-2026-06-27.md` §12.10), so the function had no
+// producer left — dormant code, caught by the pub-fn wiring guard rather
+// than by me, which is the gate working exactly as intended.
+//
+// `ConfirmedBar` ITSELF stays: the fold, the catch-up path, the day map and
+// the repair slots all still use it. Only this constructor lost its subject.
+//
+// ⚠ CASCADE, recorded rather than silently followed: `from_minute_candle`
+// was the ONLY consumer of `MinuteCandle` outside `dhan_intraday_parse`, so
+// that whole module is now producer-less AND consumer-less. It is left in
+// place deliberately — deleting it is a separate, larger step with its own
+// tests, and §12.10.7(g) already records the related open item that
+// `[rest_candle_fold]` (enabled = false) is now an inert reader of a table
+// nothing writes. Both belong in one deliberate decision, not in the tail of
+// this one. Flagging beats a half-done cascade.
 
 static FOLD_BAR_SENDER: OnceLock<mpsc::Sender<ConfirmedBar>> = OnceLock::new();
 

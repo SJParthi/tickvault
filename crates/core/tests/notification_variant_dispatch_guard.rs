@@ -219,8 +219,20 @@ fn the_set_of_unsendable_telegram_variants_only_shrinks() {
 #[test]
 fn the_scan_finds_a_realistic_number_of_variants() {
     let declared = declared_variants();
+    // ANTI-VACUITY floor, deliberately BELOW the true count — not a
+    // coverage target. Its job is to fail when the enum PARSER breaks, and
+    // a broken parser yields ~0, never 60. A floor AT the truth would fail
+    // on every ordinary variant retirement, which trains the next reader to
+    // re-baseline it without reading why.
+    //
+    // 2026-09-17: re-derived 70 -> 60. MEASURED 79 declared before, 68
+    // after — a drop of exactly 11, matching its named cause to the unit:
+    // the eleven `Spot1m*` / `Chain*` variants deleted with Dhan Telegram
+    // families 1 and 2 (`dhan-rest-only-noise-lock-2026-07-14.md` §2.4).
+    // The margin below truth is kept at the same order as the 9 the old
+    // floor carried, so this is a re-derivation, not padding.
     assert!(
-        declared.len() >= 70,
+        declared.len() >= 60,
         "only {} variants parsed out of the enum -- the scanner is broken, not the enum",
         declared.len()
     );

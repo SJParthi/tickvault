@@ -202,11 +202,18 @@ fn test_cloudwatch_operator_dashboard_exists() {
     // lag gauge — the score widget retired with the PARKed SLO publisher.)
     // (2026-07-15: the Groww lag gauge replaced by tv_rest_1m_fire_heartbeat
     // — its sample producer died with the Groww live feed.)
+    // (2026-09-16: tv_rest_1m_fire_heartbeat replaced by
+    // tv_dhan_feed_last_tick_age_secs — its three producers died with the
+    // per-minute REST legs, removed under the operator's sockets-only
+    // directive, no-rest-except-live-feed-2026-06-27.md §12.10. Twice now the
+    // "single most important signal" tile has lost its metric to a scope
+    // change, which is the reason this list is a REQUIREMENT and not a
+    // comment: the widget cannot quietly go blank.)
     // (2026-07-17, stage-3 dead-WS sweep: tv_aggregator_seals_emitted_total
     // left this list — its widget retired with the tick aggregator; the
     // series can never publish again.)
     for metric in &[
-        "tv_rest_1m_fire_heartbeat",
+        "tv_dhan_feed_last_tick_age_secs",
         "tv_questdb_disconnected_seconds",
         "tv_token_remaining_seconds",
     ] {

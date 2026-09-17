@@ -85,7 +85,8 @@ locals {
 # groww_ws_inactive + groww_stall_restart_storm ALSO retired — their
 # gauge/counter producers (the Groww bridge + sidecar stall watchdog) were
 # deleted; in-session process liveness is owned by the market-hours liveness
-# alarm, re-pointed to tv_rest_1m_fire_heartbeat.
+# alarm, re-pointed to tv_rest_1m_fire_heartbeat (and again, 2026-09-16, to
+# tv_dhan_feed_last_tick_age_secs when the per-minute REST legs were removed).
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # 3. Order-update WebSocket down — RETIRED 2026-07-14 (operator Dhan noise
@@ -102,7 +103,8 @@ locals {
 # the alarm could never fire again (permanent missing-data;
 # treat_missing_data=notBreaching made it silently dead, not stuck-FIRING).
 # Process liveness in-session is owned by the market-hours liveness alarm,
-# re-pointed to tv_rest_1m_fire_heartbeat in the same PR.
+# re-pointed to tv_rest_1m_fire_heartbeat in the same PR (and again, 2026-09-16,
+# to tv_dhan_feed_last_tick_age_secs with the sockets-only REST removal).
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -755,7 +757,7 @@ resource "aws_cloudwatch_metric_alarm" "questdb_wal_probe_failed" {
 }
 
 output "app_cloudwatch_alarms" {
-  description = "15 application-level alarms in THIS file (12 + the 2026-08-25 spill-dir-free-low and questdb-wal-suspended pair, §2.3g, + questdb-wal-probe-failed, §2.3h — the blind-detector guard on the pair above) (10 Prometheus-via-CW-agent + 1 disk-used + 1 mem-used Metrics-Insights; PR-C2 2026-07-13 retired 5 Dhan-lane alarms; order-update-ws-inactive RETIRED 2026-07-14 per dhan-rest-only-noise-lock-2026-07-14.md; tick-gap-instruments-silent RETIRED in PR-C3 2026-07-14; groww-ws-inactive + groww-stall-restart-storm RETIRED 2026-07-15 — their gauge/counter producers, the Groww bridge + sidecar stall watchdog, were deleted with the Groww live feed); 2 more silent-feed alarms live in silent-feed-alarms.tf (the Groww lag mirror also retired 2026-07-15). Cost note: the 2026-07-15 Groww live retirement removes 3 alarms + the feed-stall-restarts counter pager + 4 EMF series and adds 1 (tv_rest_1m_fire_heartbeat) — dated note in aws-budget.md; still well inside the $55 budget cap."
+  description = "The 12 application-level alarms declared in THIS file. The list below names EVERY alarm resource here and is pinned by cloudwatch_app_alarms_wiring.rs::the_app_alarms_output_names_every_alarm_in_the_file - a hand-maintained list silently omitted disk_fill_rate_high and questdb_wal_apply_lag, and the count in this very description read 15 against 12 resources and 10 listed, so it is derived and guarded now rather than copied. CORRECTED 2026-09-17, three claims at once: (a) the count; (b) \"2 more silent-feed alarms live in silent-feed-alarms.tf\" - that file declares ZERO and its own output says so, every one having been retired 2026-07-15/17 with its producer; (c) \"still well inside the $55 budget cap\" - the ceiling is $150 since 2026-08-25 (operator Quote 19), the AUTOMATIC STOP_EC2_INSTANCES action line is $135, and the September forecast measured 2026-09-06 was $142.24, i.e. ABOVE it - so a new alarm needs a lever, not a cost note (dhan-rest-only-noise-lock-2026-07-14.md section 2.3n). History kept: PR-C2 2026-07-13 retired 5 Dhan-lane alarms; order-update-ws-inactive retired 2026-07-14 per the Dhan noise lock; tick-gap-instruments-silent retired in PR-C3 2026-07-14; groww-ws-inactive + groww-stall-restart-storm retired 2026-07-15 with the Groww live feed; spill-dir-free-low + questdb-wal-suspended added 2026-08-25 (section 2.3g) and questdb-wal-probe-failed 2026-08-25 (section 2.3h, the blind-detector guard on that pair). The 2026-07-15 note that the Groww retirement ADDED tv_rest_1m_fire_heartbeat is itself superseded: that heartbeat lost its three producers with the per-minute REST legs on 2026-09-16, and the market-hours liveness alarm was re-pointed to tv_dhan_feed_last_tick_age_secs rather than retired."
   value = [
     aws_cloudwatch_metric_alarm.disk_used_high.alarm_name,
     aws_cloudwatch_metric_alarm.mem_used_high.alarm_name,
@@ -777,6 +779,14 @@ output "app_cloudwatch_alarms" {
     aws_cloudwatch_metric_alarm.spill_dir_free_low.alarm_name,
     aws_cloudwatch_metric_alarm.questdb_wal_suspended.alarm_name,
     aws_cloudwatch_metric_alarm.questdb_wal_probe_failed.alarm_name,
+    # Added to the LIST 2026-09-17 — both alarms have been declared in this
+    # file all along and were simply never listed here. An output named
+    # `app_cloudwatch_alarms` that omits two of its file's alarms is the
+    # quiet-inaccuracy class this repo keeps re-learning, so the omission is
+    # now impossible: the guard named in the description above requires this
+    # list to name every `aws_cloudwatch_metric_alarm` resource in the file.
+    aws_cloudwatch_metric_alarm.disk_fill_rate_high.alarm_name,
+    aws_cloudwatch_metric_alarm.questdb_wal_apply_lag.alarm_name,
     # late_tick_after_boundary retired 2026-07-18 (stage-4 unit A).
   ]
 }

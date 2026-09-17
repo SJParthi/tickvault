@@ -13,7 +13,7 @@
 //! checklist item); the guard cannot see variants nobody constructs.
 
 use tickvault_core::notification::events::{
-    FeedScoreLine, NotificationEvent, RestLegScoreLine, Severity, ShutdownClass,
+    FeedScoreLine, NotificationEvent, Severity, ShutdownClass,
 };
 
 // ---------------------------------------------------------------------------
@@ -54,29 +54,20 @@ fn sentinel_feed(name: &str) -> FeedScoreLine {
     }
 }
 
-fn rest_leg(feed_name: &str, ok: i64, failed: i64) -> RestLegScoreLine {
-    RestLegScoreLine {
-        feed: feed_name.to_string(),
-        leg: "spot candles".to_string(),
-        ok_fetches: ok,
-        failed_fetches: failed,
-        named_gaps: -1,
-        pre_boot_gaps: -1,
-        rate_limited_hits: -1,
-        late_recovered: -1,
-        close_p50_ms: -1,
-        close_p99_ms: -1,
-        close_max_ms: -1,
-        close_samples: -1,
-    }
-}
+// ---- the `rest_leg` fixture is RETIRED 2026-09-17 ----
+//
+// It built one `RestLegScoreLine` for the scorecard fixtures so a body
+// assertion could exercise the daily card's REST pull segment. The type and
+// the segment are both retired with the scoreboard digest that produced
+// them — nothing has written `rest_fetch_audit` or `rest_spot_1m` since the
+// operator's SOCKETS-ONLY narrowing (`no-rest-except-live-feed-2026-06-27.md`
+// §12.10, disposition §12.11).
+//
+// The FIXTURE-BASED honest limitation at the top of this file is unchanged
+// and now applies one variant-field wider: a card segment nobody constructs
+// is a segment this guard cannot see.
 
-fn scorecard(
-    dhan: FeedScoreLine,
-    partial: bool,
-    dhan_off: bool,
-    rest_legs: Vec<RestLegScoreLine>,
-) -> NotificationEvent {
+fn scorecard(dhan: FeedScoreLine, partial: bool, dhan_off: bool) -> NotificationEvent {
     NotificationEvent::DualFeedDailyScorecard {
         trading_date_ist: "2026-07-15".to_string(),
         dhan,
@@ -86,13 +77,11 @@ fn scorecard(
         early_run: false,
         restart_partial: false,
         dhan_feed_off: dhan_off,
-        rest_legs,
-        rest_legs_read_failed: false,
     }
 }
 
 fn scorecard_clean() -> NotificationEvent {
-    scorecard(feed("Dhan"), false, false, vec![rest_leg("Dhan", 735, 0)])
+    scorecard(feed("Dhan"), false, false)
 }
 
 fn tf_pass() -> NotificationEvent {
@@ -126,12 +115,8 @@ fn routine_fixtures() -> Vec<NotificationEvent> {
         shutdown(ShutdownClass::ScheduledStop),
         shutdown(ShutdownClass::OperatorStop),
         scorecard_clean(),
-        scorecard(sentinel_feed("Dhan"), false, false, vec![]),
-        scorecard(feed("Dhan"), false, true, vec![]),
-        NotificationEvent::Spot1mFetchRecovered {
-            minute_ist: "10:45 AM".to_string(),
-            failed_minutes: 3,
-        },
+        scorecard(sentinel_feed("Dhan"), false, false),
+        scorecard(feed("Dhan"), false, true),
     ]
 }
 
@@ -193,10 +178,9 @@ fn guard_scorecard_fully_measured_within_six_lines() {
             feed("Dhan"),
             true, // partial → caveat line
             false,
-            vec![rest_leg("Dhan", 735, 0)],
         ),
-        scorecard(feed("Dhan"), false, true, vec![]),
-        scorecard(sentinel_feed("Dhan"), false, false, vec![]),
+        scorecard(feed("Dhan"), false, true),
+        scorecard(sentinel_feed("Dhan"), false, false),
     ] {
         let body = ev.to_message();
         assert!(
@@ -239,9 +223,9 @@ fn guard_no_sentinel_placeholder_phrases_in_routine_scorecards() {
     // rendered "?" / "not measured yet" walls — omission must now be
     // structural.
     let fixtures = [
-        scorecard(sentinel_feed("Dhan"), false, false, vec![]),
-        scorecard(feed("Dhan"), false, true, vec![]),
-        scorecard(feed("Dhan"), false, false, vec![]),
+        scorecard(sentinel_feed("Dhan"), false, false),
+        scorecard(feed("Dhan"), false, true),
+        scorecard(feed("Dhan"), false, false),
         scorecard_clean(),
     ];
     for ev in fixtures {
@@ -278,8 +262,8 @@ fn guard_no_sentinel_placeholder_phrases_in_routine_scorecards() {
 fn guard_scorecard_verdict_line_is_first_with_emoji_and_header() {
     for ev in [
         scorecard_clean(),
-        scorecard(feed("Dhan"), true, false, vec![]),
-        scorecard(feed("Dhan"), false, true, vec![]),
+        scorecard(feed("Dhan"), true, false),
+        scorecard(feed("Dhan"), false, true),
     ] {
         let body = ev.to_message();
         let first = first_line(&body);
@@ -339,7 +323,7 @@ fn guard_caveat_line_renders_iff_partial_flag_and_exactly_once() {
         !clean.contains("Counts are a floor"),
         "clean day must carry no caveat: {clean}"
     );
-    let partial = scorecard(feed("Dhan"), true, false, vec![]).to_message();
+    let partial = scorecard(feed("Dhan"), true, false).to_message();
     assert_eq!(
         partial.matches("Counts are a floor").count(),
         1,
@@ -371,7 +355,7 @@ fn guard_routine_bodies_never_carry_action_lists() {
 
 #[test]
 fn guard_feed_off_renders_exactly_one_off_line() {
-    let body = scorecard(feed("Dhan"), false, true, vec![]).to_message();
+    let body = scorecard(feed("Dhan"), false, true).to_message();
     assert_eq!(
         body.matches("Dhan: OFF today (excluded from verdict)")
             .count(),
@@ -385,20 +369,27 @@ fn guard_feed_off_renders_exactly_one_off_line() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. REST-pair fixture sanity (severities pinned so the routing/loudness
-//    contract behind the redesign cannot silently drift)
-// ---------------------------------------------------------------------------
 
-#[test]
-fn guard_rest_pair_severities_high_open_info_resolve() {
-    let degraded = NotificationEvent::Spot1mFetchDegraded {
-        consecutive_failed_minutes: 3,
-        minute_ist: "10:42 AM".to_string(),
-    };
-    assert_eq!(degraded.severity(), Severity::High);
-    let recovered = NotificationEvent::Spot1mFetchRecovered {
-        minute_ist: "10:45 AM".to_string(),
-        failed_minutes: 3,
-    };
-    assert_eq!(recovered.severity(), Severity::Info);
-}
+// ---------------------------------------------------------------------------
+// 8. REST-pair fixture sanity — RETIRED 2026-09-17
+// ---------------------------------------------------------------------------
+//
+// `guard_rest_pair_severities_high_open_info_resolve` pinned the
+// loudness contract behind the episode redesign: a REST leg's Degraded
+// arm is High (it pages, and at ≥ High it also sends SMS) while its
+// Recovered arm is Info (it closes the bubble green without a second
+// page). Drift in either direction was the regression — a High recovery
+// double-pages every flap, an Info degrade never reaches the phone.
+//
+// Both arms it probed (`Spot1mFetchDegraded` / `Spot1mFetchRecovered`)
+// are deleted with Dhan Telegram families 1 and 2, whose producers the
+// operator's SOCKETS-ONLY narrowing removed. Record:
+// `dhan-rest-only-noise-lock-2026-07-14.md` §2.4.
+//
+// The CONTRACT is unretired and still holds for every surviving
+// Open/Resolve pair — `WebSocketDisconnected`/`WebSocketReconnected` and
+// `OrderUpdateDisconnected`/`OrderUpdateReconnected`. What is lost is
+// only this file's probe of it; the episode FSM's own role mapping is
+// pinned by `episode_rest_family_wiring_guard`'s surviving family tests
+// and by the WS guards. If a future per-minute family is built, this is
+// the shape to restore.

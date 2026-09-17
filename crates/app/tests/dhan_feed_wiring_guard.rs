@@ -137,33 +137,65 @@ fn dhan_feed_gap_detector_observes_before_aggregator_refusal() {
 }
 
 // ---------------------------------------------------------------------------
-// Orphan 4 — the 15:31 cross-verification (BLOCKING, not optional)
+// Orphan 4 — the 15:41 cross-verification — RETIRED 2026-09-17
 // ---------------------------------------------------------------------------
-
-#[test]
-fn dhan_feed_stack_spawns_the_daily_crossverify() {
-    assert!(
-        STACK_SRC.contains("spawn_daily_crossverify(&params.main_feed_instruments)"),
-        "the bring-up body must spawn the 15:31 comparator. The main feed has \
-         NO snapshot-on-subscribe and NO sequence number, so packet loss is \
-         undetectable at the protocol level and this cross-verify is the lane's \
-         only ground truth — the 2026-08-09 authorization requires it live from \
-         day one."
-    );
-}
-
-/// An un-provisioned comparator must refuse loudly, never skip quietly.
-#[test]
-fn dhan_feed_crossverify_refuses_loudly_when_unprovisioned() {
-    assert!(
-        STACK_SRC.contains("XVERIFY_UNPROVISIONED_COUNTER"),
-        "a missing cross-verify provider must increment a counter, not pass silently."
-    );
-    assert!(
-        STACK_SRC.contains("UNDETECTABLE"),
-        "the un-provisioned error must state the consequence in plain terms."
-    );
-}
+//
+// Two tests lived here and both are gone with their subject:
+//
+//   * `dhan_feed_stack_spawns_the_daily_crossverify` pinned
+//     `spawn_daily_crossverify(&params.main_feed_instruments)` in the bring-up
+//     body.
+//   * `dhan_feed_crossverify_refuses_loudly_when_unprovisioned` pinned
+//     `XVERIFY_UNPROVISIONED_COUNTER` and the word `UNDETECTABLE`, so a missing
+//     provider counted and said the consequence rather than skipping quietly.
+//
+// The operator's SOCKETS-ONLY narrowing removed the comparator
+// (`no-rest-except-live-feed-2026-06-27.md` §12.10 — "Bro just remove per
+// minute price falls and 3.41 pm accuracy check alone dude okay"), and §12.10.3
+// settled the harder half deliberately: the BOOT FLOOR that gated all sixteen
+// sockets on the comparator being provisioned was REMOVED WITH IT, not
+// re-pointed at something else. A refusal floor whose subject the operator has
+// ordered deleted cannot stand — keeping it means `run_dhan_feed_stack`
+// refuses to dial, every session, forever.
+//
+// ## ⚠ THE CLAIM THIS SECTION USED TO MAKE, and what replaces it: NOTHING
+//
+// The retired test's own message is the honest record of what is now gone, and
+// it is repeated here verbatim rather than paraphrased, because this is the
+// last place in the tree that asserted it:
+//
+//     "The main feed has NO snapshot-on-subscribe and NO sequence number, so
+//      packet loss is undetectable at the protocol level and this cross-verify
+//      is the lane's only ground truth — the 2026-08-09 authorization requires
+//      it live from day one."
+//
+// Every word of that is still TRUE about the feed. What changed is that the
+// comparator is gone, so **there is now ZERO mechanism anywhere in this
+// workspace that compares captured market data against any external record**
+// (§12.10.4, which searched for another and found none: `tf_consistency_boot`
+// recomputes our own timeframes from our own candles, `rest_candle_fold` is a
+// disabled writer, `volume_semantics_probe` is QuestDB-only with zero callers,
+// and every cross-broker comparator was deleted in 2026-07-15 and 2026-08-21).
+//
+// What survives answers "did the machinery run", never "are the numbers right",
+// and must never be quoted as answering the second:
+//
+//   | survives                                   | answers                          |
+//   |--------------------------------------------|----------------------------------|
+//   | `dhan-no-ticks-flowing`                    | is data arriving at all          |
+//   | `dropped == spilled` on both loss families | did we keep what we received     |
+//   | `tv_aggregator_tick_refused_total`         | are the timestamps in-session    |
+//   | `tv_dhan_feed_depth_total{outcome=ghost}`  | is the vendor honouring unsubscribe |
+//
+// `websocket-connection-scope-lock.md` states that a non-zero `compared` was
+// "the ONLY evidence this repository can offer that the feed works". That
+// evidence source ends here. No PR may claim the feed is verified after this
+// point — §12.10.6's REJECT list names that claim explicitly.
+//
+// The FIVE other refusal floors in `run_dhan_feed_stack` are UNTOUCHED
+// (plan-build, the fold/lane exclusivity check, the capture/WAL floor, the
+// token-manager floor and the dual-instance lock), and §12.10.6 makes weakening
+// any of them a REJECT. Only the verification floor went.
 
 // ---------------------------------------------------------------------------
 // The gate stays shut
