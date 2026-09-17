@@ -21,7 +21,12 @@ tickvault-storage = { path = "../storage" }
 tickvault-api = { path = "../api" }
 tokio = { workspace = true }
 papaya = { workspace = true }
-governor = { workspace = true }
+# governor was removed 2026-09-17: its only app-crate user was
+# `dhan_data_api_limiter.rs`, the Data-API rate limiter for the per-minute
+# REST legs, deleted under the operator's sockets-only narrowing
+# (`no-rest-except-live-feed-2026-06-27.md` §12.11). It stays a pinned
+# workspace dep — `trading` (the OMS order rate limiter) and `api` (the
+# public-route guard) both still use it; only this crate stopped.
 axum = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
