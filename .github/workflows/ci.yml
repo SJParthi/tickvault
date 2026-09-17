@@ -751,7 +751,6 @@ jobs:
           crates/app/tests/dhat_mark_forward.rs
           crates/app/tests/dhat_ws_lag.rs
           crates/core/tests/dhat_allocation.rs
-          crates/core/tests/dhat_cadence_decide.rs
           crates/core/tests/dhat_depth_packet_zero_alloc.rs
           crates/core/tests/dhat_instrument_registry.rs
           crates/core/tests/dhat_moneyness.rs
@@ -810,7 +809,6 @@ jobs:
           # (core)` also runs them; this lane remains the ratchet authority.
           cargo test -p tickvault-core --features dhat \
             --test dhat_allocation \
-            --test dhat_cadence_decide \
             --test dhat_depth_packet_zero_alloc \
             --test dhat_instrument_registry \
             --test dhat_moneyness \
@@ -845,8 +843,15 @@ jobs:
           # deleted with the producer-less presence registry: 8 -> 7.
           # 2026-08-11 (live-lane wiring): dhat_depth_packet_zero_alloc +
           # dhat_truedata_decode_zero_alloc added: 7 -> 9.
-          if [ "$ran" -ne 9 ]; then
-            echo "::error::core DHAT step executed $ran targets, expected 9 — a --test flag was dropped from this step (drift list vs run step mismatch)."
+          # 2026-09-16 (per-minute price pulls + 15:41 accuracy check removed,
+          # `no-rest-except-live-feed-2026-06-27.md` §12.10): dhat_cadence_decide
+          # deleted with the cadence scheduler — its CadenceExecutor declared
+          # exactly the three removed fetch methods, so the whole tree became
+          # unreachable: 9 -> 8. Found by this lane FAILING on the push, which is
+          # the drift check doing its job: the deletion had moved the test file
+          # and left both the drift list and the --test flag behind.
+          if [ "$ran" -ne 8 ]; then
+            echo "::error::core DHAT step executed $ran targets, expected 8 — a --test flag was dropped from this step (drift list vs run step mismatch)."
             exit 1
           fi
 
