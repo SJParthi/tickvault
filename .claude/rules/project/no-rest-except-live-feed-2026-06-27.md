@@ -1862,3 +1862,112 @@ type).
   exist on a fresh volume.
 - Cites §12.10.5 #6 to justify resurrecting a deleted persistence module: the
   requirement's premise (that the ensure fns survive) is measured false above.
+
+---
+
+## §12.14 — 2026-09-17: the removal's loudest survivor was on the operator's PHONE
+
+**No authorization is claimed.** This records a defect found while closing
+§12.11's terraform rows, fixed the same day, and one finding escalated rather
+than fixed.
+
+### The defect
+
+Every trading morning the boot Telegram sent, verbatim:
+
+> ✅ Dhan per-minute price capture — armed (fires 9:16 AM to 3:30 PM IST on
+> trading days): Dhan spot candles for N indices + Dhan option chain for M
+> indices
+
+for legs removed on 2026-09-16. `spot_1m_rest_boot.rs`,
+`option_chain_1m_boot.rs`, `dhan_cadence_executor.rs`, `cadence_boot.rs` and
+`crates/core/src/cadence/` are all deleted.
+
+**It survived because §12.10.7(e) named the site and the reason, and the reason
+was the trap.** That row records *"`main.rs:4201-4206` the boot report's
+`spot_1m_enabled` / `chain_1m_enabled` `||` operands"* as a required hand-edit.
+The operands read
+`spot_1m_rest.enabled || (cadence.enabled && cadence.dhan_lane)` — correct logic,
+evaluating flags for modules that no longer compile. `[cadence] enabled` and
+`dhan_lane` BOTH still read `true` in `config/base.toml`, so both operands
+returned TRUE.
+
+### Why this one outranks every other stale claim in the sweep
+
+Not severity — **placement**. Every other item §12.8–§12.13 corrected sits in a
+file somebody has to open: a comment, a docstring, an output description, a
+console default. This one is DELIVERED. A green checkmark, on the operator's
+phone, once per trading day, asserting a capability that does not exist.
+
+A stale comment costs the next reader a grep. A stale *page* costs the operator
+his trust in every page.
+
+### A second false claim in the same block, a month old
+
+Every arm of that message ended `(Groww per-minute legs report separately)`. The
+entire Groww feed was removed **2026-08-21**. So the boot Telegram has also been
+pointing the operator at a broker's alerts that cannot arrive, since before this
+removal began.
+
+### ⚠ And a TEST was pinning both false claims in place
+
+`test_startup_complete_per_minute_capture_wording_arms` asserted the rendered
+message **must contain** `"Groww per-minute legs report separately"`. For a
+month it would have FAILED any attempt to remove that sentence.
+
+That is the durable half of this section. This file has recorded vacuous guards
+(a scan that cannot fail) and stale guards (a claim that went untrue). This is a
+third shape and the worst of them: **a test that asserts a message says
+something false does not merely miss the bug — it defends it, and it turns
+fixing the bug into a test failure.** When a wording assertion and reality
+disagree, check which one moved before assuming the test is right.
+
+The replacements assert the two properties that are checkable and that matter —
+never claims armed, never names the removed feed — rather than freezing one
+exact sentence.
+
+### The fix shape, and why config was not re-gated
+
+Constant-folded to `DHAN_PER_MINUTE_LEGS_EXIST`, not re-gated on a flag. **A
+flag cannot arm a module that is not compiled**, so reading config here can only
+ever produce a wrong answer, and flipping `[cadence] enabled` back would
+silently restore the page. Same shape and same reason as
+`rest_candle_fold::LIVE_INLET_HAS_PRODUCER` (§12.13).
+
+`boot_report_capture_claim_guard.rs` does not stamp a `false` — it DERIVES the
+expected value from whether a producing module exists on disk, so the const
+cannot go stale in either direction.
+
+The event's shape is read by 43 sites, so it is unchanged: the three "armed"
+arms are kept and annotated unreachable rather than collapsed. They still carry
+the dead Groww clause; that is deliberate and recorded at the site, because they
+cannot render and the guard refuses to let them become reachable.
+
+### ⚠ NOT fixed — escalated instead
+
+`crates/app/tests/depth20_apply_properties.rs::re_planning_after_the_real_apply_is_quiet`
+is **intermittently red on `main`**, and will break a merge at random. Found
+while running the app suite for this change; it is pre-existing and unrelated to
+the removal.
+
+Its `layout()` generator has **no distinctness constraint** while its `wire()`
+sibling does — and `wire()`'s carries a written justification (*"the dial
+deduplicates before subscribing, so a connection cannot hold a repeat"*). So
+`want` can ask for one contract on TWO sockets at once; the apply satisfies it on
+one, the other still wants it, and re-planning re-asks. That is exactly the
+`second > first` the property forbids.
+
+Deliberately not fixed here: the within-socket case is confidently unreachable by
+`dedup_subscribe_set`, but the **cross-socket** case — the one the failing seed
+hits — needs a reachability claim about `depth20_name_board.rs`, which is outside
+the operator's "alone" narrowing. Constraining a generator without proving the
+input unreachable would hide a real convergence bug, and convergence is
+load-bearing: it is what stops the planner burning a connection's whole swap
+budget on churn while its counters read healthy.
+
+**What a PR that violates §12.14 looks like (REJECT):** re-gates the boot
+report's capture fields on config; deletes `DHAN_PER_MINUTE_LEGS_EXIST` instead
+of flipping it; makes one of the three unreachable arms reachable without
+correcting its Groww clause; re-adds a test assertion requiring an
+operator-facing message to state something false; or silences the depth-20
+proptest by deleting its seed, loosening its assertion, or marking it `#[ignore]`.
