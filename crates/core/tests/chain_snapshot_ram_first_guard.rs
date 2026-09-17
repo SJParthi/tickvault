@@ -222,44 +222,47 @@ fn without_fn_definitions(region: &str) -> String {
         .join("\n")
 }
 
-/// Wiring half: the chain boot leg must keep CALLING the classification
-/// surface and PUBLISHING the RAM snapshot. Scans the PRODUCTION region
-/// only — test-only code cannot satisfy the assertions.
-///
-/// This once covered three legs across two brokers; the second broker's
-/// chain and per-contract legs went with its feed on 2026-08-21, and with
-/// them the negative assertion that the contract leg must NOT publish a
-/// snapshot. That negative is worth naming as lost: it was the pin keeping
-/// a DB-audit-only leg from quietly becoming a second writer of the RAM
-/// decision surface.
-#[test]
-fn boot_legs_keep_moneyness_wiring() {
-    let app_src = repo_root().join("crates/app/src");
-
-    let dhan_chain = std::fs::read_to_string(app_src.join("option_chain_1m_boot.rs"))
-        .expect("option_chain_1m_boot.rs must exist");
-
-    {
-        let (name, content) = ("option_chain_1m_boot.rs", &dhan_chain);
-        // TRH-NEW-1: the scan sees CALL SITES only — fn definition lines
-        // are stripped so a leg that DEFINES the needle in its own
-        // production region (the Dhan leg) cannot pass vacuously.
-        let prod = without_fn_definitions(production_region(content));
-        assert!(
-            prod.contains("classify_chain_legs("),
-            "{name} must classify every chain leg via \
-             classify_chain_legs() in PRODUCTION code (the #[cfg(test)] \
-             region and fn DEFINITION lines cannot satisfy this) — the \
-             shared common-math glue"
-        );
-        assert!(
-            prod.contains("publish_chain_moneyness_snapshot("),
-            "{name} must publish the RAM chain snapshot after classification \
-             in PRODUCTION code (a fn DEFINITION line cannot satisfy this) — \
-             the decision surface future strategy consumers read"
-        );
-    }
-}
+// ---- `boot_legs_keep_moneyness_wiring` is RETIRED 2026-09-17 ----
+//
+// It was the WIRING half of this guard: the chain boot leg had to CALL
+// `classify_chain_legs(` and then PUBLISH via
+// `publish_chain_moneyness_snapshot(`, both in the PRODUCTION region, so a
+// `#[cfg(test)]` mention or the needle's own `fn` definition line could not
+// satisfy it.
+//
+// `crates/app/src/option_chain_1m_boot.rs` no longer exists — the per-minute
+// option-chain REST pull is one of the two classes the operator's SOCKETS-ONLY
+// narrowing removed (`no-rest-except-live-feed-2026-06-27.md` §12.10), so the
+// read panics with `Os { code: 2, kind: NotFound }`.
+//
+// ## ⚠ THE SURFACE THIS GUARDED NOW HAS NO WRITER AT ALL
+//
+// The docblock this replaces already recorded one loss: on 2026-08-21 the
+// second broker's chain and per-contract legs went with its feed, taking with
+// them the NEGATIVE assertion that the contract leg must not publish a
+// snapshot — "the pin keeping a DB-audit-only leg from quietly becoming a
+// second writer of the RAM decision surface".
+//
+// This removal takes the last remaining writer, and the state is measured, not
+// inferred:
+//
+//   * `grep -rn "classify_chain_legs" crates/*/src/` returns **nothing** — the
+//     classification surface went with the leg that held it.
+//   * `publish_chain_snapshot(` has production callers only inside
+//     `chain_snapshot.rs` itself, all under `#[cfg(test)]`.
+//
+// So the chain moneyness registry is now **installed, never written and never
+// read** — the same shape `no-rest-except-live-feed-2026-06-27.md` §12.10.7(c)
+// records for `chain_day_store`, and which that section leaves as an open
+// decision rather than resolving. The five tests that REMAIN in this file are
+// the SEMANTIC half — the registry's own first-wins / newer-wins / per-feed
+// isolation behaviour — and they still bind, because the registry type is
+// still compiled, still correct, and is what any future chain publisher would
+// have to satisfy.
+//
+// RETIRED rather than re-pointed: a wiring guard needs a wire. Re-pointing it
+// at the registry's own internals would turn a "the leg is connected" pin into
+// a "the type exists" pin, which the five semantic tests already do better.
 
 /// Self-test for the production-region split: a needle that appears ONLY
 /// inside a `#[cfg(test)]` module must NOT be visible to the scan, and a

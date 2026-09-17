@@ -150,10 +150,22 @@ async fn health_endpoint_publishes_every_runtime_subsystem() {
 /// The marker is a literal that appears at the subsystem's boot-path call
 /// site. Verified present 2026-08-11.
 const BOOT_SPAWN_MARKERS: &[(&str, &str)] = &[
-    ("cadence_scheduler", "cadence_boot::spawn_cadence_scheduler"),
+    // ---- Three rows RETIRED 2026-09-17 ----
+    //
+    // `cadence_scheduler` (`cadence_boot::spawn_cadence_scheduler`),
+    // `dhan_spot_1m` (`tv_spot1m_persist_errors_total`) and
+    // `dhan_option_chain_1m` (`tv_chain1m_persist_errors_total`) all went with
+    // the operator's SOCKETS-ONLY narrowing
+    // (`no-rest-except-live-feed-2026-06-27.md` §12.10). Their `/health` rows
+    // were already removed from `LIVE_RUNTIME_SUBSYSTEMS`; these three marker
+    // rows were left behind.
+    //
+    // They were not merely untidy. `cadence_scheduler`'s marker was still
+    // FOUND — by `main.rs`'s own tombstone COMMENT recording the deletion —
+    // so this table plus a prose-blind scanner demanded a `/health` row for a
+    // subsystem that cannot boot. The scanner is fixed above
+    // (`strip_whole_line_comments`); removing these rows is the other half.
     ("dhan_rest_stack", "dhan_rest_stack::spawn_dhan_rest_stack"),
-    ("dhan_spot_1m", "tv_spot1m_persist_errors_total"),
-    ("dhan_option_chain_1m", "tv_chain1m_persist_errors_total"),
     ("seal_writer", "spawn_seal_writer_loop"),
     (
         "market_ram_store",
@@ -197,7 +209,85 @@ fn app_src_concat() -> String {
         "crates/app/src must contain Rust sources — scan found none at {}",
         root.display()
     );
-    out
+    strip_whole_line_comments(&out)
+}
+
+/// Drop every line whose first non-whitespace characters are `//`.
+///
+/// ## Why this exists, and what it cost to find out
+///
+/// 2026-09-17: this guard reported `cadence_scheduler` as a LIVE booting
+/// subsystem whose `/health` row was missing. The subsystem had been deleted
+/// with the per-minute REST legs
+/// (`no-rest-except-live-feed-2026-06-27.md` §12.10); the ONLY surviving
+/// occurrence of its marker `cadence_boot::spawn_cadence_scheduler` anywhere
+/// in `crates/app/src` was inside a TOMBSTONE COMMENT in `main.rs` recording
+/// that it had been removed.
+///
+/// So the scan read a gravestone as a call site, and the guard demanded a
+/// `/health` row for something that cannot boot. This repository has recorded
+/// the same class from the other direction several times — a source scan
+/// satisfied by the very text that names what it searches for. The durable
+/// fix is to stop the scanner seeing prose at all, not to reword the prose:
+/// a tombstone that must avoid naming its subject is a tombstone nobody can
+/// grep for, which defeats the point of writing one.
+///
+/// ## The deliberately narrow rule, and why it is not "strip all comments"
+///
+/// Only WHOLE-LINE comments are dropped. A trailing `// ...` after code is
+/// LEFT IN PLACE, because stripping from the first `//` on a line would
+/// truncate any line containing a URL in a string literal (`"https://..."`)
+/// and could hide a real marker further along that same line. Erring toward
+/// "counts as live" is the safe direction here: this guard's failure mode is
+/// an endpoint that omits a live subsystem and still reports `healthy`, so a
+/// false POSITIVE costs a conversation and a false NEGATIVE costs a blind
+/// spot.
+///
+/// HONEST LIMIT: block comments (`/* ... */`) are not handled. None exists in
+/// `crates/app/src` today, and one spanning a marker would re-create exactly
+/// the bug above — recorded rather than silently assumed away.
+fn strip_whole_line_comments(src: &str) -> String {
+    src.lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Self-test for [`strip_whole_line_comments`]: a marker that survives ONLY in
+/// a tombstone comment must be invisible, and a real call site must stay
+/// visible — otherwise the scan can neither be trusted when it fires nor when
+/// it stays quiet.
+#[test]
+fn a_tombstone_comment_cannot_resurrect_a_deleted_subsystem() {
+    // The real shape that caused the 2026-09-17 failure, verbatim in spirit.
+    let tombstone = "fn main() {}\n    // `cadence_boot::spawn_cadence_scheduler` drove the per-minute chain +\n";
+    assert!(
+        !strip_whole_line_comments(tombstone).contains("cadence_boot::spawn_cadence_scheduler"),
+        "a whole-line tombstone comment must NOT read as a live call site"
+    );
+
+    // Doc comments are comments too — `///` and `//!` both start with `//`.
+    let doc = "/// see `cadence_boot::spawn_cadence_scheduler`\nfn main() {}\n";
+    assert!(
+        !strip_whole_line_comments(doc).contains("cadence_boot::spawn_cadence_scheduler"),
+        "a doc comment must NOT read as a live call site"
+    );
+
+    // The other direction, which is the half that matters more: a genuine
+    // call site must survive the strip, or this guard goes quietly blind.
+    let live = "fn main() {\n    cadence_boot::spawn_cadence_scheduler(&cfg);\n}\n";
+    assert!(
+        strip_whole_line_comments(live).contains("cadence_boot::spawn_cadence_scheduler"),
+        "a real call site must stay visible to the scan"
+    );
+
+    // A URL in a string literal must not truncate the line — the reason this
+    // strips whole lines only rather than from the first `//`.
+    let url_line = "    let u = \"https://x/y\"; cadence_boot::spawn_cadence_scheduler();\n";
+    assert!(
+        strip_whole_line_comments(url_line).contains("cadence_boot::spawn_cadence_scheduler"),
+        "a `//` inside a string literal must not hide the rest of the line"
+    );
 }
 
 /// DIRECTION 1 (rot): every `/health` row must still have a boot-path
@@ -251,6 +341,36 @@ fn every_booting_subsystem_is_reported_by_health() {
              dead."
         );
     }
+}
+
+/// Stale-entry direction for [`BOOT_SPAWN_MARKERS`] itself.
+///
+/// `every_booting_subsystem_is_reported_by_health` `continue`s past a marker
+/// it cannot find — correctly, because a not-yet-spawned subsystem is
+/// direction 1's business. The side effect is that a row whose subject has
+/// been DELETED sits here forever, costing nothing and watching nothing.
+///
+/// That accumulation is what made the 2026-09-17 failure possible: three dead
+/// rows had built up, and one of them found its marker in a tombstone comment
+/// and fired. A table that can only grow stops being an inventory.
+///
+/// The marker is a SOURCE literal, so "not found" means the call site is gone
+/// — never merely "not enabled today". Removing a row is therefore the correct
+/// response, and it must be a deliberate edit rather than silent drift.
+#[test]
+fn boot_spawn_markers_has_no_stale_rows() {
+    let src = app_src_concat();
+    let stale: Vec<&str> = BOOT_SPAWN_MARKERS
+        .iter()
+        .filter(|(_, marker)| !src.contains(marker))
+        .map(|(name, _)| *name)
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "these BOOT_SPAWN_MARKERS rows name a spawn site that no longer exists in \
+         crates/app/src — delete the row (and its LIVE_RUNTIME_SUBSYSTEMS row, if any) \
+         so this table keeps shrinking rather than accumulating dead entries: {stale:?}"
+    );
 }
 
 /// No fabricated health. Every row must be `unwired` for as long as
