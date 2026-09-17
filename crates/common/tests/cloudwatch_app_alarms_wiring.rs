@@ -3317,3 +3317,89 @@ resource "aws_cloudwatch_metric_alarm" "unreadable" {
 "#;
     let _ = alarm_eval_windows(&[("f.tf".to_string(), interpolated.to_string())]);
 }
+
+/// The `app_cloudwatch_alarms` output must name EVERY alarm in its own file.
+///
+/// ADDED 2026-09-17. The list was hand-maintained and had silently drifted in
+/// two directions at once: `disk_fill_rate_high` and `questdb_wal_apply_lag`
+/// were declared in the file and absent from the list, while the output's own
+/// `description` claimed **15** alarms against **12** resources and **10**
+/// listed.
+///
+/// That is the hand-copied-count class this repository keeps re-learning —
+/// most recently on `market_hours_gate_failed`'s `alarm_description`, which
+/// named "the 3 gated alarms" when the gate had grown to twelve. A count in
+/// prose is a claim, and a claim nothing checks goes stale silently. So the
+/// count is now DERIVED from this test and the list is pinned to the file:
+/// add an alarm without listing it, or remove one without delisting it, and
+/// the build fails naming the exact resource.
+///
+/// It deliberately does NOT check the number written in the description.
+/// Asserting a literal there would trade one hand-copied number for another;
+/// what makes the description trustworthy is that the LIST beneath it can no
+/// longer be wrong.
+#[test]
+fn the_app_alarms_output_names_every_alarm_in_the_file() {
+    let tf = read("deploy/aws/terraform/app-alarms.tf");
+
+    // Every `resource "aws_cloudwatch_metric_alarm" "<name>"` in the file.
+    let mut declared: Vec<String> = Vec::new();
+    for line in tf.lines() {
+        let line = line.trim_start();
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix(r#"resource "aws_cloudwatch_metric_alarm" ""#)
+            && let Some((name, _)) = rest.split_once('"')
+        {
+            declared.push(name.to_owned());
+        }
+    }
+    assert!(
+        declared.len() >= 10,
+        "ratchet self-check: parsed {} alarm resources from app-alarms.tf — \
+         the resource-header parser is broken, not the file",
+        declared.len()
+    );
+
+    // Everything the output's `value` list names, comments stripped so a
+    // retirement note like `# foo retired ...` can never satisfy the pin.
+    let out_start = tf
+        .find("output \"app_cloudwatch_alarms\" {")
+        .expect("app-alarms.tf must declare the app_cloudwatch_alarms output");
+    let out_body = &tf[out_start..];
+    let out_end = out_body
+        .find("\n}")
+        .expect("the app_cloudwatch_alarms output must be closed");
+    let listed_region = strip_line_comments(&out_body[..out_end]);
+
+    let mut listed: Vec<String> = Vec::new();
+    for chunk in listed_region.split("aws_cloudwatch_metric_alarm.").skip(1) {
+        let name: String = chunk
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() {
+            listed.push(name);
+        }
+    }
+
+    let missing: Vec<&String> = declared.iter().filter(|d| !listed.contains(d)).collect();
+    assert!(
+        missing.is_empty(),
+        "app-alarms.tf declares these alarms but the app_cloudwatch_alarms \
+         output does not list them: {missing:?}. An output named for the \
+         file's alarms that omits some of them reads as an inventory and is \
+         not one — add them to the `value` list."
+    );
+
+    let stale: Vec<&String> = listed.iter().filter(|l| !declared.contains(l)).collect();
+    assert!(
+        stale.is_empty(),
+        "the app_cloudwatch_alarms output lists these, but no such alarm \
+         resource exists in app-alarms.tf: {stale:?}. A retired alarm must \
+         leave the list in the same change that removes the resource — \
+         terraform would fail on the dangling reference, and this says so \
+         first."
+    );
+}
