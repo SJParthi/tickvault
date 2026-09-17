@@ -99,7 +99,21 @@
 # docs/audits/2026-07-14-rest-pipeline-adversarial-audit.md): +5 entries ->
 # 17 filters + 17 alarms (~+$0.50/mo; on top of the same-day REST-CANARY-01
 # retirement and the automation-gaps +3 above; 15 + 15 after the same-day
-# PR-C3 cross-verify retirement). The audit's single biggest systemic
+# PR-C3 cross-verify retirement).
+#
+#   MEASURED 2026-09-17 — the running-total chain above is the AUDIT TRAIL of
+#   what each dated change added or retired, and it is kept for that. It is NOT
+#   the current shape, and has not been since 2026-09-16. Counted in the file
+#   rather than carried forward: 5 standalone `aws_cloudwatch_log_metric_filter`
+#   resources, 4 standalone `aws_cloudwatch_metric_alarm` resources, and 18 live
+#   `error_code_alerts` map entries. Re-count with:
+#     grep -c '^resource "aws_cloudwatch_log_metric_filter"' <this file>
+#     grep -c '^resource "aws_cloudwatch_metric_alarm"'      <this file>
+#   A count in a comment is a claim, and a claim carries a date — this repo has
+#   now recorded four constraints that expired while still being quoted, so the
+#   command is written down beside the number.
+#
+# The audit's single biggest systemic
 # weakness: REST-leg paging was app-emitted Telegram ONLY — a dead app
 # notifier (or Telegram bot) silenced AUTH-GAP-05 + SPOT1M/CHAIN entirely.
 # SCOPED sub-filters (a 2026-07-14 extension of the pinned coded shape —
@@ -111,16 +125,32 @@
 #     forced re-mint INCLUDING successful self-heals, and the operator
 #     ruled those pages noise ("silent-when-healing,
 #     loud-only-when-unobtainable").
-#   - spot1m-01-escalation / chain-02-escalation match ONLY the
-#     once-per-episode stage="escalation" edge lines — the per-minute
-#     stage="minute_failed" lines are sub-edge by design (the 3-minute
-#     escalation edge is the page; a plain code filter would over-page
-#     every failed minute).
-#   - chain-04-warmup matches ONLY the down-for-the-day stage="warmup"
-#     arm — the probe_* / warmup_no_token stages are log-only-by-design
-#     respawn-retry arms (rest-1m-pipeline-error-codes.md §2e).
-#   - chain-01 is a plain coded filter (both its stages — warmup +
-#     mid_session — are once-per-episode page-worthy).
+#   - ⚠ RETIRED 2026-09-16, annotated 2026-09-17 — the four bullets below
+#     describe filters that NO LONGER EXIST. They are `spot1m-01-escalation`,
+#     `chain-02-escalation`, `chain-04-warmup` and `chain-01`, deleted with the
+#     per-minute Dhan REST legs under the operator's sockets-only directive; the
+#     full tombstone with its reasoning sits beside the map entries below, and a
+#     grep for any of the four names returns ZERO in this file.
+#
+#     The text is KEPT rather than deleted because it is the only record of WHY
+#     the scoped-sub-filter shape exists at all, and that shape is still LIVE for
+#     `auth-gap-05-remint-failed` one bullet above — the drift guard
+#     (error_code_paging_filter_drift_guard.rs) accepts exactly one extra
+#     $.field clause, and this is where that allowance is justified. Deleting
+#     the paragraph would leave the surviving exception unexplained.
+#
+#     Read every verb below in the PAST tense:
+#
+#     - spot1m-01-escalation / chain-02-escalation matched ONLY the
+#       once-per-episode stage="escalation" edge lines — the per-minute
+#       stage="minute_failed" lines were sub-edge by design (the 3-minute
+#       escalation edge was the page; a plain code filter would have over-paged
+#       every failed minute).
+#     - chain-04-warmup matched ONLY the down-for-the-day stage="warmup"
+#       arm — the probe_* / warmup_no_token stages were log-only-by-design
+#       respawn-retry arms (rest-1m-pipeline-error-codes.md §2e).
+#     - chain-01 was a plain coded filter (both its stages — warmup +
+#       mid_session — were once-per-episode page-worthy).
 #
 # 2026-09-02 UPDATE (second-sweep finding 5 — dhan-rest-only-noise-lock
 # section 2.3p): +1 entry (RESOURCE-02, ~+$0.10/mo). The process's own memory
