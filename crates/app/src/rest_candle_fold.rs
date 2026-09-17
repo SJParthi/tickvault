@@ -137,6 +137,47 @@ use tracing::{error, info, warn};
 /// the wire name out rather than deriving it from anything.
 const SPOT_1M_REST_TABLE: &str = "rest_spot_1m";
 
+/// Whether anything in this workspace still SENDS into this fold's live-bar
+/// inlet (`send_confirmed_bars`).
+///
+/// **`false` since 2026-09-17**, and it is a `const` rather than a comment
+/// because the fact it records is the difference between a fold that works
+/// and a fold that reports a clean start and then sits silent for a session.
+///
+/// The fold has two inputs and the sockets-only narrowing took BOTH
+/// (`no-rest-except-live-feed-2026-06-27.md` §12.10):
+///
+///   1. **The live inlet.** Its only producer was `spot_1m_rest_boot.rs`,
+///      which called `send_confirmed_bars` at its two flush-ok arms — the
+///      persist-CONFIRMED contract that let a bar fold only after its ILP
+///      ACK. That file is gone, so `send_confirmed_bars` has zero production
+///      callers.
+///   2. **The boot catch-up.** It re-folds from `SPOT_1M_REST_TABLE` above,
+///      which is RETAINED but FROZEN — real history, and zero rows for any
+///      day after 2026-09-16.
+///
+/// Without this gate, flipping `[rest_candle_fold] enabled` to `true` would
+/// install the channel, spawn the task, log an ARMED line, and receive
+/// nothing — no error, no counter, for the whole session. That is the
+/// producer-less-channel shape §12.9(e) had to close for `mark_forward`, and
+/// here it cannot be closed the same way: the inlet is a first-wins
+/// `OnceLock` install, so its emptiness is never observable at runtime.
+///
+/// **This is not a removal.** The operator's narrowing named the per-minute
+/// price pulls and the 15:41 accuracy check "alone"; the module, its config
+/// section and the live lane's exclusivity floor are all untouched. What the
+/// const does is satisfy §12.10.7(g)'s obligation — *"removed or explicitly
+/// recorded as inert"* — mechanically rather than in prose, so the inertness
+/// is greppable, testable, and visible at the one place that would otherwise
+/// arm a dead task.
+///
+/// **To re-arm:** build a producer that calls `send_confirmed_bars` after a
+/// persist ACK, restore a writer for `rest_spot_1m` (or re-point the catch-up
+/// at a live source), and flip this to `true` in the SAME change. The live
+/// lane's floor 2 still refuses to open a socket while the fold is enabled,
+/// so re-arming is a scope decision, not a config flip.
+pub const LIVE_INLET_HAS_PRODUCER: bool = false;
+
 // ---------------------------------------------------------------------------
 // Constants (all named — no magic numbers; cold-path envelope bounds)
 // ---------------------------------------------------------------------------

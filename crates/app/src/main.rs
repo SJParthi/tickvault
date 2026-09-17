@@ -3911,30 +3911,62 @@ async fn build_shared_infra(
     // serde default OFF; base.toml opts in); supervised; cold path only.
     // FOLD-01 runbook: .claude/rules/project/rest-candle-fold-error-codes.md
     if config.rest_candle_fold.enabled {
-        let (fold_bar_tx, fold_bar_rx) =
-            tokio::sync::mpsc::channel(tickvault_app::rest_candle_fold::FOLD_BAR_CHANNEL_CAPACITY);
-        if tickvault_app::rest_candle_fold::set_global_fold_bar_sender(fold_bar_tx) {
-            let _rest_candle_fold_supervisor =
-                tickvault_app::rest_candle_fold::spawn_supervised_rest_candle_fold(
-                    config.rest_candle_fold.clone(),
-                    config.questdb.clone(),
-                    fold_bar_rx,
-                );
-            info!(
-                catchup_days = config.rest_candle_fold.catchup_days,
-                "rest_candle_fold: REST-era candle derivation ARMED — spot legs hand \
-                 off persist-confirmed 1m bars; boot catch-up re-folds the stored \
-                 month into all 21 timeframes (candles_1m..candles_1d populate again)"
+        // 2026-09-17: the fold is ENABLED in config but has no input.
+        //
+        // Both of its sources went with the operator's sockets-only narrowing
+        // (`no-rest-except-live-feed-2026-06-27.md` §12.10): the live inlet's
+        // only producer was the per-minute spot leg's two flush-ok arms, and
+        // the boot catch-up re-folds from `rest_spot_1m`, which is RETAINED
+        // but frozen. `rest_candle_fold::LIVE_INLET_HAS_PRODUCER` carries
+        // that fact as a const so the refusal below is greppable and pinned,
+        // not a comment someone has to notice.
+        //
+        // Arming anyway is the expensive option, not the safe one: the task
+        // would install its channel, log a clean ARMED line, and receive
+        // nothing for the whole session — silently, because a first-wins
+        // `OnceLock` inlet has no observable emptiness. §12.10.7(g) requires
+        // this fold to be removed or explicitly recorded as inert; an inert
+        // thing that reports itself armed is recorded as WORKING.
+        if tickvault_app::rest_candle_fold::LIVE_INLET_HAS_PRODUCER {
+            let (fold_bar_tx, fold_bar_rx) = tokio::sync::mpsc::channel(
+                tickvault_app::rest_candle_fold::FOLD_BAR_CHANNEL_CAPACITY,
             );
+            if tickvault_app::rest_candle_fold::set_global_fold_bar_sender(fold_bar_tx) {
+                let _rest_candle_fold_supervisor =
+                    tickvault_app::rest_candle_fold::spawn_supervised_rest_candle_fold(
+                        config.rest_candle_fold.clone(),
+                        config.questdb.clone(),
+                        fold_bar_rx,
+                    );
+                info!(
+                    catchup_days = config.rest_candle_fold.catchup_days,
+                    "rest_candle_fold: REST-era candle derivation ARMED — spot legs hand \
+                     off persist-confirmed 1m bars; boot catch-up re-folds the stored \
+                     month into all 21 timeframes (candles_1m..candles_1d populate again)"
+                );
+            } else {
+                // LOW: first-wins refusal — a duplicate install means a second
+                // spawn attempt in one process (defensive; loud, never silent).
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::RestCandleFold01Degraded
+                        .code_str(),
+                    stage = "sender_install",
+                    "rest_candle_fold: global fold-bar sender was ALREADY installed — \
+                     duplicate fold spawn REFUSED (the first installation's task keeps \
+                     running; this receiver is dropped unused)"
+                );
+            }
         } else {
-            // LOW: first-wins refusal — a duplicate install means a second
-            // spawn attempt in one process (defensive; loud, never silent).
             error!(
                 code = tickvault_common::error_code::ErrorCode::RestCandleFold01Degraded.code_str(),
-                stage = "sender_install",
-                "rest_candle_fold: global fold-bar sender was ALREADY installed — \
-                 duplicate fold spawn REFUSED (the first installation's task keeps \
-                 running; this receiver is dropped unused)"
+                stage = "no_producer",
+                "rest_candle_fold: enabled in config but REFUSED to arm — nothing sends \
+                 into its live-bar inlet (the per-minute spot leg that did was removed), \
+                 and its boot catch-up source rest_spot_1m is retained but frozen. \
+                 Arming would log a clean start and then receive nothing, all session. \
+                 candles_* stay REST-underived; set [rest_candle_fold] enabled = false \
+                 to silence this, or restore a producer and flip \
+                 rest_candle_fold::LIVE_INLET_HAS_PRODUCER in the same change"
             );
         }
     } else {

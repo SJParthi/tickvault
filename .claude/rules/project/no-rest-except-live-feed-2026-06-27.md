@@ -1772,6 +1772,85 @@ The lesson is kept and re-attached to the two fields that survive.
   section touches no retention list, and the `partition_retention_coverage_guard`
   lockstep still binds.
 
+### §12.13 — 2026-09-17: `rest_candle_fold` is RECORDED INERT, mechanically, and NOT removed
+
+§12.10.7(g) left one open item: `[rest_candle_fold]` is `enabled = false` and
+its `main.rs` read sites survive, but what it folds is `rest_spot_1m` bars, so
+after the removal it is *"a disabled reader of a table nothing writes"* — and
+§12.6's REJECT row applies: it *"must be removed or explicitly recorded as
+inert in the same change."* This is that disposition.
+
+#### Why NOT removed
+
+The operator's narrowing named two classes and said **"alone"**. The fold is
+neither: it is a downstream CONSUMER of one of them. §12.10.6's own REJECT list
+bans removing anything else under cover of this quote, and removing the fold
+would additionally take the live lane's **exclusivity floor** with it — the
+floor that refuses to open a socket while the fold is writing the same
+`candles_<tf>` rows. §12.10.3 says in as many words that the other refusal
+floors are UNTOUCHED, and §12.10.6 makes weakening any of them a REJECT.
+
+So the module (4,028 lines), its `[rest_candle_fold]` config section, its
+runbook, and floor 2 are all left exactly as they are.
+
+#### Why "recorded as inert" had to be mechanical, not prose
+
+Both of the fold's inputs are gone:
+
+| Input | State |
+|---|---|
+| The live inlet (`send_confirmed_bars`) | **ZERO production callers.** Its only producer was `spot_1m_rest_boot.rs`, calling it at the two flush-ok arms — the persist-CONFIRMED contract that let a bar fold only after its ILP ACK. That file went with the per-minute legs. |
+| The boot catch-up | re-folds from `rest_spot_1m`, RETAINED but **FROZEN** — real history, zero rows for any day after 2026-09-16. |
+
+A comment recording that would not have been enough, because the failure it
+prevents is silent: flipping the gate to `true` installs the channel, spawns
+the task, logs a clean **ARMED** line, and then receives nothing for the whole
+session — no error, no counter. That is the producer-less-channel shape
+§12.9(e) had to close for `mark_forward`, and it **cannot be closed the same
+way**: the inlet is a first-wins `OnceLock` install, so its emptiness is never
+observable at runtime. An inert thing that reports itself armed is recorded as
+WORKING.
+
+#### What shipped
+
+`rest_candle_fold::LIVE_INLET_HAS_PRODUCER` (`false`), read by `main.rs`
+INSIDE the existing config gate. Enabled-but-producerless now emits a coded
+`FOLD-01` error with `stage = "no_producer"` naming both dead inputs and the
+two ways out, and arms nothing. The disabled path is unchanged; the seal-writer
+ordering is unchanged; no floor moves.
+
+**The const is DERIVED, not asserted.** A const is only worth more than a
+comment if it cannot go stale, so
+`the_inert_const_matches_whether_a_producer_actually_exists` scans every
+production file in `crates/app/src` except the fold module and requires the
+const to be `true` exactly when one of them calls `send_confirmed_bars`.
+Restore a producer and forget the const → fails. Flip the const with no
+producer → fails. Bite-proven in both directions, plus a third arm requiring
+`main.rs` to actually consult it (a const nothing reads is a comment with a
+type).
+
+#### ⚠ NOT claimed
+
+- That the fold works, or could be made to work by a config flip. Re-arming
+  needs a producer, a live catch-up source, and the const flipped in the same
+  change — and floor 2 still refuses to open a socket while it is enabled, so
+  it is a scope decision, not a setting.
+- That this reduces any surface. It adds one const, one branch and one test;
+  4,028 lines stay. What it buys is that the one way to use them wrongly is now
+  loud.
+
+#### What a PR that violates §12.13 looks like (REJECT)
+
+- Flips `LIVE_INLET_HAS_PRODUCER` to `true` without restoring a
+  `send_confirmed_bars` producer in the same change (the guard fails; do not
+  weaken it to pass).
+- Deletes the fold module, its config section, its runbook, or the live lane's
+  exclusivity floor citing this section — the narrowing said "alone".
+- Replaces the refusal with an `info!`, or drops `stage = "no_producer"`: an
+  operator who enabled the fold has to be able to find out why it did not arm.
+- Re-arms the fold while `rest_spot_1m` still has no writer, so the boot
+  catch-up silently re-folds an empty window.
+
 ### What a PR that violates §12.11 looks like (REJECT)
 
 - Creates a CREATE TABLE for a table with no writer so a reader returns empty
