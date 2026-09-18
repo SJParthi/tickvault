@@ -69,17 +69,20 @@ fn wire() -> impl Strategy<Value = Vec<Vec<SubscribeInstrument>>> {
 /// fabricate an input the builders cannot produce.
 ///
 /// ⚠ Per-socket dedup — what `wire()` does — is NOT enough, and that is
-/// MEASURED rather than assumed: a globally-distinct `want` survives 300,000
-/// proptest cases, while per-socket-distinct-only still fails at ~1,174. The
-/// trigger is specifically a CROSS-socket repeat.
+/// MEASURED rather than assumed: the globally-distinct generator survives
+/// 100,000 cases and reaches a 0-swap fixpoint within 2 minutes in 20,000
+/// cases, while the per-socket-distinct-only shape FAILS inside 50,000 and a
+/// duplicated `want` never settles in 3.675% of cases. The trigger is
+/// specifically a CROSS-socket repeat, so this constraint is minimal.
 ///
 /// ⚠ The mechanism is a PAIRING FLIP, not the "deferred work re-asked" shape
 /// recorded in `no-rest-except-live-feed-2026-06-27.md` §12.14 — that shape
 /// was tested directly and converges (1 then 1). Acquiring a duplicated key
 /// changes a socket's overlap profile, so `match_sockets_by_overlap` pairs it
 /// with a DIFFERENT layout socket the next minute, and the re-pairing costs
-/// more swaps than the first plan. §12.14's mechanism is corrected on the
-/// record in this PR.
+/// more swaps than the first plan. Corrected on the record in that file's
+/// dated "RESOLVED 2026-09-18" block, which also carries the measurements
+/// above and the reachability proof for both builders.
 fn layout() -> impl Strategy<Value = Depth20Layout> {
     prop::collection::vec(prop::collection::vec(instrument(), 0..7), 0..5).prop_map(|sockets| {
         let mut seen = BTreeSet::new();
