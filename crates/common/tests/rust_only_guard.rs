@@ -105,20 +105,28 @@ const INVOCATION_SITE_ALLOWLIST: &[&str] = &[];
 /// Verified at fix time (`git ls-files -- <pathspec>` for EVERY entry below):
 /// ZERO tracked matches for all seven, so both allowlists stay at their
 /// hard-zero floor and the ratchet cannot be re-grown by this widening.
-const BANNED_FILE_PATHSPECS: &[&str] = &[
-    "*.py", "*.pyw", "*.pyi", "*.pyx", "*.js", "*.jsx", "*.mjs", "*.cjs", "*.es6", "*.coffee",
-    "*.ts", "*.tsx", "*.mts", "*.cts", "*.rb", "*.pl", "*.php", "*.lua", "*.tcl", "*.groovy",
-    "*.jl",
-    "*.ipynb", // SCOPE FIX #6 — shell variants (all zero tracked; `.sh` + bash only)
-    "*.bash", "*.zsh", "*.ksh", "*.ps1", "*.bat", "*.fish", "*.nu",
+const BANNED_FILE_EXTENSIONS: &[&str] = &[
+    "py", "pyw", "pyi", "pyx", "js", "jsx", "mjs", "cjs", "es6", "coffee", "ts", "tsx", "mts",
+    "cts", "rb", "pl", "php", "lua", "tcl", "groovy", "jl",
+    "ipynb", // SCOPE FIX #6 — shell variants (all zero tracked; `.sh` + bash only)
+    "bash", "zsh", "ksh", "ps1", "bat", "fish", "nu",
     // SCOPE FIX #17 (2026-09-02) — COMPILED-or-VM runtimes. The ban listed
     // scripting languages only; a tracked `.java` / `.go` / `.swift` source
     // file is a second toolchain in the product path just as surely, and the
-    // lock says "one language" not "no scripting". Verified at fix time:
-    // `git ls-files -- <pathspec>` returns ZERO for all nine, so the hard-zero
-    // floor is unchanged. `*.R`/`*.r` are both listed because git pathspecs
-    // are case-sensitive.
-    "*.java", "*.kt", "*.kts", "*.scala", "*.go", "*.cs", "*.swift", "*.R", "*.r",
+    // lock says "one language" not "no scripting".
+    "java", "kt", "kts", "scala", "go", "cs", "swift",
+    "r", // was `*.R`/`*.r` — the case dimension is gone, so ONE entry now
+    // SCOPE FIX #21 (2026-09-18) — hole 11d, found by the same sweep as 11a.
+    // SCOPE FIX #17 enumerated "COMPILED-or-VM runtimes" and stopped at the
+    // ones it happened to think of. C, C++, Zig, Nim, Haskell, Elixir,
+    // Clojure, Erlang, Dart and OCaml were never listed. That matters MORE
+    // here than in most repositories: `cc` and `cmake` are ALREADY in
+    // `NATIVE_BUILD_TOOLCHAIN_BUDGET`, so a `build.rs` + `.c` pair compiles
+    // with ZERO new dependency signal — the lockfile check cannot see it and
+    // the token scan has nothing to match. Verified at fix time: zero tracked
+    // matches for all twenty, case-insensitively.
+    "c", "cc", "cpp", "cxx", "h", "hpp", "hxx", "zig", "nim", "hs", "ex", "exs", "clj", "cljs",
+    "erl", "dart", "ml", "mli", "f90", "pas",
 ];
 
 // ============================ PURE CORE ============================
@@ -129,6 +137,49 @@ fn py_files_not_in_allowlist(tracked_py: &[String], allowlist: &[&str]) -> Vec<S
     tracked_py
         .iter()
         .filter(|p| !allowed.contains(p.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Paths whose extension is in [`BANNED_FILE_EXTENSIONS`], compared
+/// CASE-INSENSITIVELY.
+///
+/// # SCOPE FIX #21 (2026-09-18) — hole 11a, and why this is a Rust filter
+/// # rather than one more pathspec
+///
+/// Until today this scope was expressed as 38 `git ls-files` pathspecs
+/// (`*.py`, `*.js`, …). **`core.ignorecase` is UNSET in this repository**, so
+/// git pathspecs are CASE-SENSITIVE — verified live at fix time:
+///
+/// ```text
+/// $ touch scripts/tv_verify_case.PY && git ls-files -o -- '*.py'
+/// (no match)
+/// ```
+///
+/// A tracked `evil.PY` / `build.JS` / `deploy.GO` therefore cleared the
+/// primary file ban entirely, on a case-preserving filesystem, with a
+/// ONE-KEYSTROKE rename. The guard's own const already carried the evidence
+/// that the case dimension was known — *"`*.R`/`*.r` are both listed because
+/// git pathspecs are case-sensitive"* — the lesson was applied to exactly one
+/// extension and never generalised.
+///
+/// The fix is NOT 38 uppercase twins. "Enumerate one more name" is the failure
+/// this lock has now recorded eleven times, and a twin list is wrong for
+/// `MyScript.Py` anyway. Asking a question about the FILE — *what is its
+/// extension, case-folded?* — has a bounded answer; listing the spellings does
+/// not.
+///
+/// ASCII-lowercasing is deliberate and sufficient: every extension in
+/// [`BANNED_FILE_EXTENSIONS`] is ASCII, so a Unicode fold would buy nothing
+/// and could introduce locale surprises.
+fn banned_extension_files(paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|p| {
+            p.rsplit_once('.')
+                .map(|(_, ext)| ext.to_ascii_lowercase())
+                .is_some_and(|ext| BANNED_FILE_EXTENSIONS.contains(&ext.as_str()))
+        })
         .cloned()
         .collect()
 }
@@ -921,7 +972,7 @@ const NODE_RUNTIME_BUDGET: &[(&str, usize)] = &[(".mcp.json", 2)];
 /// single `RUN go build` / `java -jar` line in a Dockerfile, workflow or
 /// script would put into the product path, and NONE was a banned token — the
 /// ban enumerated scripting languages and stopped there. Their FILE
-/// extensions joined [`BANNED_FILE_PATHSPECS`] in the same change; an
+/// extensions joined [`BANNED_FILE_EXTENSIONS`] in the same change; an
 /// extension ban is not an invocation ban (the 2026-08-01 `pip` lesson), so
 /// both halves land together. All ten have ZERO live invocations.
 ///
@@ -1176,9 +1227,43 @@ fn is_command_position(line: &str, at: usize) -> bool {
             ""
         } else if seg.ends_with('=') {
             ""
-        } else if seg.ends_with('/') && seg.starts_with(['/', '.', '~']) {
-            // A path to a binary: `/usr/bin/`, `./node_modules/.bin/`.
-            ""
+        } else if seg.ends_with('/')
+            && seg
+                .rsplit([' ', '\t'])
+                .next()
+                .is_some_and(|w| w.starts_with(['/', '.', '~', '$']))
+        {
+            // A path to a binary: `/usr/bin/`, `./node_modules/.bin/`, and
+            // since 2026-09-18 a VARIABLE-ROOTED one — `$HOME/bin/`,
+            // `$GOROOT/bin/` — which is the nvm / asdf / rbenv idiom and
+            // therefore the most likely real form of all of them.
+            //
+            // `$` is safe to add for the same reason `/`, `.` and `~` are:
+            // the arm ALSO requires the word to END in `/`, so it fires only
+            // on a path-shaped token. A sentence does not contain a
+            // `$`-rooted word ending in a slash.
+            //
+            // It consumes only that trailing WORD and lets the loop keep
+            // parsing the rest, rather than swallowing the whole segment.
+            // That is what makes `  run: $GOROOT/bin/go build ./...` work:
+            // the `:` arm above returns `""` for the ENTIRE segment, so a
+            // YAML key followed by a path matched no arm at all and a real
+            // CI line read as a mention. Consuming word-by-word keeps every
+            // remaining token subject to the same parser, so nothing is
+            // waved through — `see /usr/local/ node` still returns false,
+            // because `see` is a bare word and the loop stops there.
+            //
+            // NOT covered, stated rather than left to be discovered: any
+            // form whose prefix contains a BARE WORD. Both the braced
+            // `${NODE_HOME}/bin/node` and the command-substituted
+            // `$(dirname $0)/node` reach here as a bare word — `{` and `$(`
+            // are each consumed earlier as a separator, leaving
+            // `NODE_HOME}/bin/` and `dirname $0)/` respectively. Accepting a
+            // bare word is exactly the false-positive engine this guard
+            // cannot survive (`SSM managed node`), so the parser stops.
+            // Same root cause as the `ssh <host> "…"` limit recorded below.
+            let word_len = seg.rsplit([' ', '\t']).next().map_or(seg.len(), str::len);
+            &seg[..seg.len() - word_len]
         } else if seg
             .split_once(' ')
             .map_or(seg, |(h, _)| h)
@@ -1585,7 +1670,7 @@ fn read_scan_text(root: &Path, path: &str) -> String {
 
 /// (a) NO NEW tracked interpreted-language file — the rust-only forever-guard.
 /// Scope widened 2026-08-10 from `.py`-only to every extension in
-/// `BANNED_FILE_PATHSPECS` (see that const for the scope-hole record).
+/// `BANNED_FILE_EXTENSIONS` (see that const for the scope-hole record).
 #[test]
 fn no_banned_files_outside_allowlist() {
     assert_sorted_unique(TRACKED_BANNED_ALLOWLIST, "TRACKED_BANNED_ALLOWLIST");
@@ -1601,7 +1686,7 @@ fn no_banned_files_outside_allowlist() {
          interpreted-language file could exist and go unseen. This guard's PASS \
          would be meaningless."
     );
-    // Scope widened from `*.py` to the 9-extension BANNED_FILE_PATHSPECS by #1738,
+    // Scope widened from `*.py` to the 9-extension BANNED_FILE_EXTENSIONS by #1738,
     // landed in parallel. Kept verbatim — it is strictly broader than what this
     // test previously covered, and it composes with the assert above rather than
     // competing with it: theirs widens WHAT is looked for, mine proves the looking
@@ -1610,14 +1695,14 @@ fn no_banned_files_outside_allowlist() {
     // SCOPE FIX #17 (2026-09-02): tracked AND untracked. A new `.go` file that
     // has not been `git add`ed is exactly the change this test exists to
     // refuse, and it was invisible until the commit that made it permanent.
-    let tracked_banned = git_ls_files_including_untracked(BANNED_FILE_PATHSPECS);
+    let tracked_banned = banned_extension_files(&git_ls_files_including_untracked(&["."]));
     let new = py_files_not_in_allowlist(&tracked_banned, TRACKED_BANNED_ALLOWLIST);
     assert!(
         new.is_empty(),
         "RUST-ONLY VIOLATION: new tracked interpreted-language file(s) {new:?}. The rust-only \
          operator directive (2026-07-18) forbids ANY new interpreted-language runtime in this \
          repo, forever. This test (crates/common/tests/rust_only_guard.rs) is the gate: do NOT \
-         extend TRACKED_BANNED_ALLOWLIST and do NOT narrow BANNED_FILE_PATHSPECS — port the \
+         extend TRACKED_BANNED_ALLOWLIST and do NOT narrow BANNED_FILE_EXTENSIONS — port the \
          logic to Rust instead."
     );
 }
@@ -1627,7 +1712,7 @@ fn no_banned_files_outside_allowlist() {
 /// Scans the SAME pathspec set as test (a) so the two can never drift apart.
 #[test]
 fn allowlist_shrinks_monotonically() {
-    let tracked_banned = git_ls_files(BANNED_FILE_PATHSPECS);
+    let tracked_banned = banned_extension_files(&git_ls_files(&["."]));
     let stale = stale_entries(TRACKED_BANNED_ALLOWLIST, &tracked_banned);
     assert!(
         stale.is_empty(),
@@ -2746,7 +2831,7 @@ version = \"0.1.57\"\n";
 /// this asks git which lockfiles exist rather than naming one.
 fn all_locked_graphs() -> Vec<(String, Vec<String>)> {
     let root = repo_root();
-    let paths = git_ls_files(&["*Cargo.lock"]);
+    let paths = git_ls_files_including_untracked(&["*Cargo.lock"]);
     assert!(
         !paths.is_empty(),
         "RUST-ONLY GUARD IS BLIND: `git ls-files -- *Cargo.lock` matched nothing. \
@@ -3148,7 +3233,7 @@ fn ci_action_names(content: &str) -> Vec<String> {
 fn non_literal_spawn_sites_only_shrink() {
     let root = repo_root();
     let mut counted: Vec<(String, usize)> = Vec::new();
-    for path in git_ls_files(&["*.rs"]) {
+    for path in git_ls_files_including_untracked(&["*.rs"]) {
         // PRODUCTION source only. Test files legitimately carry this shape as
         // DATA: scan markers in string literals, and raw-string fixtures like
         // `r#"Command::new(program)"#` that exist precisely to prove a scanner
@@ -3386,7 +3471,7 @@ fn command_new_is_never_written_in_a_spelling_the_spawn_scan_cannot_see() {
     let root = repo_root();
     let mut violations: Vec<String> = Vec::new();
     let mut scanned = 0usize;
-    for path in git_ls_files(&["*.rs"]) {
+    for path in git_ls_files_including_untracked(&["*.rs"]) {
         // This guard names the spellings it bans, so it cannot scan itself.
         if path.ends_with("rust_only_guard.rs") {
             continue;
@@ -3476,7 +3561,7 @@ fn command_is_never_aliased_past_the_spawn_scan() {
     let root = repo_root();
     let mut violations: Vec<String> = Vec::new();
     let mut scanned = 0usize;
-    for path in git_ls_files(&["*.rs"]) {
+    for path in git_ls_files_including_untracked(&["*.rs"]) {
         // This guard names the markers it bans; scanning itself is
         // self-referential, exactly as the sibling spawn scan documents.
         if path.ends_with("crates/common/tests/rust_only_guard.rs") {
@@ -3654,7 +3739,7 @@ fn every_lambda_declares_the_rust_runtime() {
     // `.tf.json` (terraform's HCL-JSON form) is enumerated too: `*.tf` does not
     // match it, and while `.json` IS token-scanned, the token scanner is
     // provably blind to `nodejs20.x` for the word-boundary reason above.
-    let mut entries: Vec<String> = git_ls_files_including_untracked(&["**/*.tf", "**/*.tf.json"]);
+    let mut entries: Vec<String> = git_ls_files_including_untracked(&["*.tf", "*.tf.json"]);
     entries.sort();
     entries.dedup();
 
@@ -3864,12 +3949,13 @@ fn scope_fix_2026_09_02_self_test() {
             "self-test: `{member}` must be banned"
         );
     }
-    for spec in [
-        "*.java", "*.kt", "*.kts", "*.scala", "*.go", "*.cs", "*.swift", "*.R", "*.r",
-    ] {
+    // SCOPE FIX #21 (2026-09-18): the nine entries below were `*.java`-style
+    // git pathspecs; they are now case-folded EXTENSION names. `*.R`/`*.r`
+    // collapsed to one `r` because the case dimension no longer exists.
+    for ext in ["java", "kt", "kts", "scala", "go", "cs", "swift", "r"] {
         assert!(
-            BANNED_FILE_PATHSPECS.contains(&spec),
-            "self-test: `{spec}` must be a banned file pathspec"
+            BANNED_FILE_EXTENSIONS.contains(&ext),
+            "self-test: `{ext}` must be a banned file extension"
         );
     }
 
@@ -3881,4 +3967,190 @@ fn scope_fix_2026_09_02_self_test() {
         tracked.iter().all(|t| all.binary_search(t).is_ok()),
         "self-test: every tracked file must also appear in the tracked+untracked set"
     );
+}
+
+/// SCOPE FIX #21 (2026-09-18) — the two CRITICAL scope holes, bite-proven.
+///
+/// Both were found by an adversarial sweep told to assume the previous ten
+/// fixes had missed something, and both were then VERIFIED BY HAND against
+/// this repository before any code moved (`audit-findings-2026-04-17.md`
+/// Rule 10 puts subagent findings at roughly 45% real, so a finding is not a
+/// fact until the probe runs).
+///
+/// Neither hole was an active violation: the tree was clean of both. They were
+/// LATENT, which is the shape this file's own header warns about — *"a guard
+/// is only as good as its SCOPE, and scope errors are invisible by
+/// construction: they produce green, not red."*
+#[test]
+fn scope_fix_2026_09_18_self_test() {
+    // ---- 11a: the extension filter is CASE-FOLDED ------------------------
+    //
+    // `core.ignorecase` is unset here, so `git ls-files -- '*.py'` does NOT
+    // match `scripts/tv_verify_case.PY` (probed live; the plant was deleted).
+    // A pathspec-based ban was therefore evaded by one keystroke.
+    for evasion in [
+        "scripts/evil.PY",
+        "scripts/build.JS",
+        "deploy/deploy.GO",
+        "tools/MyScript.Py",
+        "crates/app/native.C",
+    ] {
+        assert!(
+            !banned_extension_files(&[evasion.to_string()]).is_empty(),
+            "self-test: `{evasion}` must be caught — the extension check is \
+             case-folded precisely so an uppercase rename cannot evade it"
+        );
+    }
+    // …and the filter must not fire on anything legitimate. A false positive
+    // here is the failure mode that gets a guard allowlisted within a week.
+    for allowed in [
+        "crates/app/src/main.rs",
+        "Cargo.toml",
+        "README.md",
+        "scripts/deploy.sh",
+        "deploy/aws/terraform/main.tf",
+        "Makefile", // no extension at all
+    ] {
+        assert!(
+            banned_extension_files(&[allowed.to_string()]).is_empty(),
+            "self-test: `{allowed}` must NOT be flagged"
+        );
+    }
+
+    // ---- 11b: `**/*.tf` MISSES root-level files --------------------------
+    //
+    // A git pathspec of the form `**/<pat>` requires at least one directory
+    // component, so `**/*.tf` cannot match a `.tf` at the repository root —
+    // while bare `*.tf` matches at EVERY depth. The managed-runtime check
+    // (`every_lambda_declares_the_rust_runtime`) is the ONLY check in this
+    // file that can see `runtime = "nodejs20.x"` at all: the token scanner is
+    // provably blind to it, because `node` inside `nodejs20.x` is followed by
+    // a digit and fails `is_command_position`'s word-boundary test. So a
+    // root-level `lambda.tf` declaring a node runtime cleared every gate.
+    //
+    // This is pinned against REAL tracked files rather than a plant, so it
+    // stays true without anyone having to re-run a probe: this repository has
+    // root-level tracked `.md` files (README.md, CLAUDE.md, …) and the two
+    // pathspec forms disagree about them by construction.
+    let deep_only = git_ls_files(&["**/*.md"]);
+    let every_depth = git_ls_files(&["*.md"]);
+    let root_level: Vec<&String> = every_depth.iter().filter(|p| !p.contains('/')).collect();
+    assert!(
+        !root_level.is_empty(),
+        "self-test: this repository must have at least one root-level tracked \
+         .md file for the pathspec-depth proof to mean anything"
+    );
+    for root in &root_level {
+        assert!(
+            !deep_only.contains(root),
+            "self-test: `**/*.md` must NOT match the root-level `{root}` — if \
+             it does, git's pathspec semantics changed and the `*.tf` fix in \
+             `every_lambda_declares_the_rust_runtime` needs re-deriving"
+        );
+        assert!(
+            every_depth.contains(root),
+            "self-test: bare `*.md` MUST match the root-level `{root}`"
+        );
+    }
+}
+
+/// SCOPE FIX #21, part 3 — HOLE THIRTEEN: a VARIABLE-ROOTED program path.
+///
+/// `is_command_position` accepted `/usr/bin/node`, `./bin/node` and
+/// `~/bin/node`, and rejected `$HOME/bin/node` — because the binary-path arm
+/// required the segment to start with `/`, `.` or `~`. That rejected form is
+/// the nvm / asdf / rbenv / `$GOROOT` idiom, i.e. the one a real CI script is
+/// most likely to be written in, and `count_node_invocations_in_line` is the
+/// ONLY detector for all 21 `NODE_FAMILY` names.
+///
+/// The tree is CLEAN of every shape below — this closes a LATENT hole.
+///
+/// Bite-proven in BOTH directions, which is the half that matters: the
+/// must-NOT-count block is what stops this guard becoming the false-positive
+/// engine that gets a guard allowlisted within a week.
+#[test]
+fn dollar_rooted_program_paths_are_command_position_self_test() {
+    // ---- must COUNT: the runtime really is being executed ----------------
+    for line in [
+        "$HOME/bin/node app.js",
+        "\t$HOME/.nvm/bin/npm ci",
+        "ExecStart=$HOME/bin/node /opt/app.js",
+        "RUN $HOME/bin/npm ci",
+        "  run: $GOROOT/bin/go build ./...",
+    ] {
+        assert_eq!(
+            count_node_invocations_in_line(line),
+            1,
+            "hole THIRTEEN: `{line}` executes a banned runtime and must count"
+        );
+    }
+
+    // ---- must NOT count: prose, and the paths that were already fine ------
+    //
+    // The `$`-rooted arm additionally requires the segment to END in `/`, so
+    // a `$` anywhere else on the line cannot drag a word into command
+    // position. `SSM managed node` is the live line from
+    // `scripts/aws-autopilot.sh` that this guard must never flag.
+    for line in [
+        "# the $COST of a managed node is not the point",
+        "echo \"restarts the box, node counts stay flat\"",
+        "  - name: SSM managed node inventory",
+        "# see $HOME for where node would live if we used it",
+        "see /usr/local/ node is where it would go",
+        "unpack into $HOME/bin/ node comes later",
+    ] {
+        assert_eq!(
+            count_node_invocations_in_line(line),
+            0,
+            "hole THIRTEEN: `{line}` is a MENTION and must not count — a \
+             guard whose first act is a false positive gets allowlisted"
+        );
+    }
+
+    // ---- the HONEST residual: a bare word in the prefix stops the parser -
+    //
+    // `$(dirname $0)/node` and `${NODE_HOME}/bin/node` both EXECUTE the
+    // runtime and both count 0. `$(` and `{` are each consumed earlier as a
+    // separator, so what reaches the binary-path arm is the bare word
+    // `dirname $0)/` / `NODE_HOME}/bin/`. Accepting a bare word there would
+    // make `SSM managed node` a build failure, and a guard whose first act
+    // is a false positive gets allowlisted within a week.
+    //
+    // Asserted rather than omitted: a silent gap is rediscovered, an
+    // asserted one is a decision on the record. If this is ever closed, the
+    // fix must ALSO keep the must-NOT-count block below green.
+    for line in [
+        "$(dirname $0)/node build.js",
+        "${NODE_HOME}/bin/node app.js",
+    ] {
+        assert_eq!(
+            count_node_invocations_in_line(line),
+            0,
+            "hole THIRTEEN residual: `{line}` executes a banned runtime and \
+             is NOT caught — a bare word in the prefix stops the parser \
+             deliberately. If you closed this, update the arm's comment too."
+        );
+    }
+    // ---- a path that NAMES a runtime and RUNS another counts BOTH --------
+    //
+    // `.../versions/node/v20.11.0/bin/npm` is the real nvm layout: `node`
+    // names the installed toolchain directory and `npm` is the program.
+    // Both are `NODE_FAMILY` names and both are genuinely on the line, so 2
+    // is the honest answer — asserting 1 here would be asserting that the
+    // scanner should skip one of two banned names it correctly found.
+    assert_eq!(
+        count_node_invocations_in_line("\t$HOME/.nvm/versions/node/v20.11.0/bin/npm ci"),
+        2,
+        "hole THIRTEEN: the nvm layout names `node` in the path AND runs \
+         `npm`; both are banned runtimes and both must count"
+    );
+
+    // ---- the baselines must still hold -----------------------------------
+    for line in ["/usr/bin/node app.js", "./bin/node app.js", "node app.js"] {
+        assert_eq!(
+            count_node_invocations_in_line(line),
+            1,
+            "hole THIRTEEN: the pre-existing form `{line}` must still count"
+        );
+    }
 }
