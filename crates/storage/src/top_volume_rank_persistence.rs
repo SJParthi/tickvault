@@ -64,6 +64,9 @@
 //!     lot_size LONG, window_lots_milli LONG,
 //!     net_volume_chg_milli_pct LONG,
 //!     gain_pct DOUBLE,
+//!     candle_volume_signed LONG,
+//!     candle_bucket_skew_secs LONG,
+//!     candle_price_chg_pct DOUBLE,
 //!     subscribed BOOLEAN
 //! ) timestamp(ts) PARTITION BY HOUR
 //!   DEDUP UPSERT KEYS(ts, tf, family, feed, security_id, segment);
@@ -507,6 +510,119 @@ pub struct TopVolumeRankRow<'a> {
     /// `Some` is still proven FINITE by the projection; a `NaN` never reaches
     /// this field, it becomes `None` and is counted.
     pub gain_pct: Option<f64>,
+    /// The **candle fold's own signed volume** for this contract, in this
+    /// window — the exact number `candles_<tf>.volume` carries for the same
+    /// `(ts, security_id, segment, feed)` — or `None` when the fold has no
+    /// bar to read.
+    ///
+    /// # Why this column exists (operator, 2026-09-18)
+    ///
+    /// *"i clelary told you to precisely have the same volume even in top
+    /// volume also as simialr to candles tables volume rigth dude … i mean it
+    /// shodu lbe precise as it is evenw ith minus also"*.
+    ///
+    /// `volume` beside it is the vendor's CUMULATIVE day counter and only ever
+    /// rises; `delta_units` is this window's traded UNITS and is always
+    /// positive. Neither is the candles table's number, which is **signed
+    /// gross** — negative when the bar closed below the previous bar's close.
+    /// So before this column the two tables could not be compared on volume at
+    /// all, however their timestamps lined up.
+    ///
+    /// # ⚠ It is ADDED, and nothing was replaced
+    ///
+    /// `volume`, `delta_units`, `lot_size`, `window_lots_milli` and
+    /// `net_volume_chg_milli_pct` are all UNCHANGED, and the sort is still
+    /// `window_lots_milli`. That is deliberate (operator, same day: *"bro just
+    /// keep evrythign … as logn as we confirm that manually and cross evrify
+    /// on modnay dont remvoe anythign"*): the old number and the new number sit
+    /// in the same row so a session can compare them side by side against the
+    /// candle table rather than taking a swap on trust.
+    ///
+    /// # Why it can be `None`, and why that is not a defect
+    ///
+    /// The fold is read at the snapshot instant by one O(1) probe. It answers
+    /// `None` when the contract has no aggregator slot at all (never ticked,
+    /// or the slot budget was exhausted), and the projection ALSO refuses a
+    /// bar that has never opened (`bucket_start_ist_secs == 0`) rather than
+    /// storing a zero that would read as "no trades" — the two are different
+    /// facts and only one of them is knowable here.
+    ///
+    /// Written as an ABSENT ILP field, i.e. NULL — the `gain_pct` precedent
+    /// directly above. A missing fold reading never costs the row its volume
+    /// columns.
+    pub candle_volume_signed: Option<i64>,
+    /// **The honesty column**: the fold bar's bucket-open second MINUS this
+    /// row's `ts`, in seconds. `0` means the two describe the SAME window.
+    ///
+    /// Present whenever [`Self::candle_volume_signed`] is, and absent with it.
+    ///
+    /// # Why a skew column rather than a silent read
+    ///
+    /// `MultiTfAggregator::snapshot` returns the bucket that is OPEN right
+    /// now. At a grid boundary that is almost always the window that just
+    /// closed — the next bucket opens on its first tick, not on the clock —
+    /// but a tick arriving in the same instant CAN roll it first, and this
+    /// sweep runs on the same task that folds ticks, so the race is real and
+    /// small rather than theoretical.
+    ///
+    /// Two further sources of a non-zero value, both legitimate: a contract
+    /// that did not trade in the window that just closed still holds its LAST
+    /// bar, which is older; and the leaderboard's window is "ticks OBSERVED
+    /// between sweeps" while a candle bucket is "ticks STAMPED inside the
+    /// bucket" (the fold clock is the exchange `ts` since 2026-09-18), so a
+    /// tick delivered across a boundary lands in different windows on the two
+    /// sides.
+    ///
+    /// Storing the skew makes every one of those visible in the row itself. A
+    /// cross-verification filters `candle_bucket_skew_secs = 0` and compares;
+    /// anything else is a row whose two volumes describe different windows and
+    /// were never meant to match. Silently reading whatever bar happened to be
+    /// open would have produced a column that is usually right and sometimes
+    /// quietly wrong, which is the false-OK this repository exists to refuse.
+    ///
+    /// `LONG` and signed: the bar can be older (negative) or, in the race
+    /// above, newer (positive).
+    pub candle_bucket_skew_secs: Option<i64>,
+    /// **The CONTRACT's own price percentage change** for this bar — against
+    /// the previous sealed bar of the same timeframe — or `None` when there is
+    /// no usable baseline.
+    ///
+    /// # Why this column exists (operator, 2026-09-18)
+    ///
+    /// *"why i cant see any normal percnetage change and volume percentage
+    /// change columns sepaartely dude espeiclaly in top volume table"*.
+    ///
+    /// He was right, and the answer was not a naming problem. The table
+    /// carried TWO percentage columns and NEITHER was this one:
+    ///
+    /// | column | what it actually measures |
+    /// |---|---|
+    /// | `net_volume_chg_milli_pct` | a VOLUME figure — lots traded in the window |
+    /// | `gain_pct` | the UNDERLYING STOCK's move from its previous close |
+    /// | **this** | **this option contract's own price move** |
+    ///
+    /// Nothing anywhere stored the third, because the leaderboard's
+    /// `RankedContract` carries no price at all. The fold does, and this row
+    /// now reads it — on the SAME O(1) probe that fetches
+    /// [`Self::candle_volume_signed`], so the column costs no extra lookup.
+    ///
+    /// # Why it is the right neighbour for the signed volume
+    ///
+    /// It is the exact comparison the volume's SIGN is derived from. A reader
+    /// seeing a negative `candle_volume_signed` sees, in this column, the price
+    /// fall that made it negative — instead of having to know the rule. Where
+    /// this is NULL the volume is positive by that same rule, because both
+    /// refuse on the identical "no usable baseline" gate.
+    ///
+    /// `DOUBLE`, matching `gain_pct` beside it, and rounded to 2 decimals at
+    /// the source by the fold's shared `pct_change` — the operator's
+    /// 2026-09-03 vendor-matching rule, so this is directly comparable to a
+    /// figure Dhan publishes rather than needing a tolerance nobody calibrated.
+    /// The integer-milli-percent rule that governs `net_volume_chg_milli_pct`
+    /// does NOT apply here: that column is derived from an integer SORT KEY,
+    /// where a float could round two distinct keys onto one printed value.
+    /// This one is a float at source and orders nothing.
+    pub candle_price_chg_pct: Option<f64>,
     /// Whether this contract actually held a depth subscription at this
     /// snapshot. The column that makes the table an audit rather than trivia.
     ///
@@ -537,6 +653,9 @@ pub fn top_volume_rank_create_ddl() -> String {
             window_lots_milli LONG, \
             net_volume_chg_milli_pct LONG, \
             gain_pct      DOUBLE, \
+            candle_volume_signed LONG, \
+            candle_bucket_skew_secs LONG, \
+            candle_price_chg_pct DOUBLE, \
             subscribed    BOOLEAN\
         ) timestamp(ts) PARTITION BY HOUR \
         DEDUP UPSERT KEYS({DEDUP_KEY_TOP_VOLUME_RANK});"
@@ -559,6 +678,9 @@ const TOP_VOLUME_RANK_COLUMNS: &[(&str, &str)] = &[
     ("window_lots_milli", "LONG"),
     ("net_volume_chg_milli_pct", "LONG"),
     ("gain_pct", "DOUBLE"),
+    ("candle_volume_signed", "LONG"),
+    ("candle_bucket_skew_secs", "LONG"),
+    ("candle_price_chg_pct", "DOUBLE"),
     ("subscribed", "BOOLEAN"),
 ];
 
@@ -915,6 +1037,31 @@ impl TopVolumeRankWriter {
             buffer
                 .column_f64("gain_pct", gain_pct)
                 .context("gain_pct")?;
+        }
+        // THREE MORE OPTIONAL columns, on the same absent-field-is-NULL rule.
+        //
+        // All three come from ONE `MultiTfAggregator::snapshot` probe in the
+        // projection, so they are present together or absent together: a
+        // contract with no aggregator slot, or whose bar has never opened, has
+        // no fold reading to report and stores NULL rather than a zero that
+        // would read as "no trades" or "flat". `candle_price_chg_pct` can
+        // additionally be NULL on its own when the bar has no usable baseline
+        // (the session's first bar of this timeframe) — the same gate the
+        // signed volume uses to decide it stays positive.
+        if let Some(candle_volume_signed) = r.candle_volume_signed {
+            buffer
+                .column_i64("candle_volume_signed", candle_volume_signed)
+                .context("candle_volume_signed")?;
+        }
+        if let Some(candle_bucket_skew_secs) = r.candle_bucket_skew_secs {
+            buffer
+                .column_i64("candle_bucket_skew_secs", candle_bucket_skew_secs)
+                .context("candle_bucket_skew_secs")?;
+        }
+        if let Some(candle_price_chg_pct) = r.candle_price_chg_pct {
+            buffer
+                .column_f64("candle_price_chg_pct", candle_price_chg_pct)
+                .context("candle_price_chg_pct")?;
         }
         buffer
             .column_bool("subscribed", r.subscribed)
@@ -1346,11 +1493,31 @@ const TOP_VOLUME_MAX_ROWS_PER_SWEEP: usize =
 /// again, which is the third time a width derivation here has under-counted).
 /// 448 keeps the same ~12% headroom the 384 carried over 324.
 ///
-/// The ceiling it produces is 50,000 x 448 = 22.4 MB, and the wedge assert
-/// below (2x <= the questdb-rs 100 MB `max_buf_size`) is what caps it: 500 B
-/// would be the arithmetic limit, so there is room for one more column of this
-/// size before that assert, not two.
-const TOP_VOLUME_ILP_ROW_BYTES: usize = 448;
+/// ⚠ 448 -> 596 on 2026-09-18, MEASURED by the same harness. The three fold
+/// columns added that day (`candle_volume_signed`, `candle_bucket_skew_secs`,
+/// `candle_price_chg_pct`) widened the worst-case line 401 -> 531 B, and 596
+/// keeps the same ~12% headroom. **No hand count was attempted**, which is now
+/// the standing rule here: three successive derivations under-counted, and the
+/// harness is cheaper than any of them.
+///
+/// # ⚠ The binding constraint has MOVED, and it is no longer the wedge
+///
+/// The old text read "500 B would be the arithmetic limit" for the wedge
+/// assert. That figure was computed when `TOP_VOLUME_SWEEPS_HELD` was 2; it
+/// has been 1 since 2026-09-12, so the wedge limit is now
+/// `100 MB / 2 / 50,000` = **1048 B** and this column is nowhere near it.
+///
+/// What DOES bind is the depth comparison
+/// (`the_producer_byte_ceiling_stays_tighter_than_the_depth_path`): the ceiling
+/// is 50,000 x 596 = **29.8 MB** against depth's 32 MiB, an 11% margin where
+/// 448 carried 33%. So the next column added here can NOT be paid for by
+/// raising this constant again — roughly 671 B is where the depth assert
+/// fails — and would have to come from a lower `TOP_VOLUME_MAX_ROWS_PER_SWEEP`
+/// or a deliberate, argued change to that relationship. Recorded here because
+/// the previous occupant of this paragraph named the wrong ceiling, and a
+/// reader sizing the next change from it would have had ~450 B of imaginary
+/// room.
+const TOP_VOLUME_ILP_ROW_BYTES: usize = 596;
 /// Worst-case sweeps the producer may hold before it drops.
 ///
 /// # ⚠ 2 → 1, forced by the corrected width above (2026-09-12)
@@ -1361,7 +1528,7 @@ const TOP_VOLUME_ILP_ROW_BYTES: usize = 448;
 /// behaviour was ~0.74 of one, and the vacuous assert could not say so.
 ///
 /// At the corrected width a true two sweeps is 32.4 MB, which collides with
-/// the sizing relationship `the_producer_byte_ceiling_is_far_tighter_than_the_depth_path`
+/// the sizing relationship `the_producer_byte_ceiling_stays_tighter_than_the_depth_path`
 /// pins against depth's 32 MiB. One sweep at 384 B is **19.2 MB** — still 60%
 /// MORE capacity than shipped today, comfortably under depth, and it satisfies
 /// the const-assert's actual requirement: hold at least one worst-case sweep.
@@ -1418,7 +1585,7 @@ const _: () = assert!(
 /// cover. Two independent terms are what make the asserts below capable of
 /// failing — the vacuous assert this replaced compared the ceiling to a factor
 /// of itself.
-const MEASURED_WORST_CASE_ILP_ROW_BYTES: usize = 401;
+const MEASURED_WORST_CASE_ILP_ROW_BYTES: usize = 531;
 
 // (3) The requirement the ORIGINAL assert's message named and its arithmetic
 //     could not check: the ceiling must hold at least one worst-case sweep at
@@ -1666,6 +1833,15 @@ mod tests {
             // follow from its own key would let a broken projection look right.
             net_volume_chg_milli_pct: 4_150_000,
             gain_pct: Some(4.25),
+            // The fold's own reading of the SAME bar, as the projection
+            // supplies it. NEGATIVE deliberately: the candles table's volume
+            // is signed, and a fixture that only ever carried a positive one
+            // could not tell a lost sign from a working one. `0` skew is the
+            // ordinary case — the row and the bar describe the same window —
+            // and the price change is the fall that made the volume negative.
+            candle_volume_signed: Some(-8_500),
+            candle_bucket_skew_secs: Some(0),
+            candle_price_chg_pct: Some(-0.37),
             subscribed: true,
         }
     }
@@ -2193,6 +2369,15 @@ mod tests {
             // A full-width shortest-repr f64 with a sign, so the widest
             // `gain_pct` field this column can carry.
             gain_pct: Some(-1.234_567_890_123_456_7_f64),
+            // The three fold columns at THEIR extremes too. `i64::MIN` is the
+            // widest signed integer this column can print (20 chars including
+            // the sign) and a second full-width `f64` is the widest percentage
+            // — the point of this test is that no real row can exceed the
+            // assumed width, so an optional column omitted here would
+            // under-measure exactly the case it exists to bound.
+            candle_volume_signed: Some(i64::MIN),
+            candle_bucket_skew_secs: Some(i64::MIN),
+            candle_price_chg_pct: Some(-1.234_567_890_123_456_7_f64),
             subscribed: true,
         };
         w.append_row(&r).expect("append");
@@ -2409,13 +2594,23 @@ mod tests {
     }
 
     #[test]
-    fn the_producer_byte_ceiling_is_far_tighter_than_the_depth_path() {
+    fn the_producer_byte_ceiling_stays_tighter_than_the_depth_path() {
         // Not a style preference — a sizing claim, pinned so it cannot drift
         // into depth's 32 MiB by copy-paste. Depth is a MEASURED ~63,800
         // rows/s and bursts 400 rows in ONE depth-200 snapshot; this table
         // emits at most one row per traded contract per sweep. A ceiling
         // sized for depth would hold minutes of stale rankings nothing
         // downstream wants — every sweep supersedes the last.
+        //
+        // ⚠ RENAMED 2026-09-18, from `..._is_far_tighter_than_...`. The three
+        // fold columns added that day took the row width 401 -> 531 B measured,
+        // the assumed width 448 -> 596, and the ceiling 22.4 -> 29.8 MB. That
+        // is an 11% margin under depth's 33.55 MB where it used to be 33%, and
+        // "far" had stopped being true. The ASSERTION is unchanged and still
+        // load-bearing; only the word that had gone stale is gone. Recorded
+        // rather than quietly renamed because the narrowing is the finding:
+        // this comparison, not the questdb-rs wedge, is now what caps the next
+        // column added to this table.
         assert!(
             MAX_TOP_VOLUME_PRODUCER_BUFFER_BYTES
                 < crate::depth_persistence::MAX_DEPTH_PRODUCER_BUFFER_BYTES,

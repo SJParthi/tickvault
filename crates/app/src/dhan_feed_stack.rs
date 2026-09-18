@@ -124,7 +124,9 @@ use tickvault_storage::depth_persistence::{
 use tickvault_storage::tick_persistence::TickWriter;
 use tickvault_storage::ws_frame_spill::{WalEndpoint, WsFrameSpill, WsType};
 use tickvault_trading::candles::multi_tf_aggregator::AGGREGATOR_MAX_SLOTS;
-use tickvault_trading::candles::{BufferedSeal, ConsumeStats, FeedStrategy, MultiTfAggregator};
+use tickvault_trading::candles::{
+    BufferedSeal, ConsumeStats, FeedStrategy, MultiTfAggregator, TfIndex,
+};
 use tracing::{error, info, warn};
 
 /// The segment label used when a ghost log line has no instrument recorded.
@@ -1329,6 +1331,42 @@ pub struct LiveIngest {
     top_volume: Option<tickvault_storage::top_volume_rank_persistence::TopVolumeRankWriter>,
 }
 
+/// The candle fold frame that measures the SAME interval as a snapshot
+/// cadence: 1s→`S1`, 3s→`S3`, 5s→`S5`, 1m→`M1`.
+///
+/// # Why this mapping is total, and why that is not luck
+///
+/// It exists so a `top_volume` row can carry the fold's own volume for its own
+/// window (operator, 2026-09-18: *"i clelary told you to precisely have the
+/// same volume even in top volume also as simialr to candles tables volume"*).
+/// That is only meaningful if every cadence HAS a fold frame of equal length.
+///
+/// Since the 2026-09-18 timeframe directive `TfIndex::is_operator_requested`
+/// admits exactly nine frames — `S1 S3 S5 M1 M3 M5 M15 M30 M60` — and the four
+/// cadences map onto the first four of them. The three-second pair is the one
+/// that had to be MADE true: `S3` was not an emitting frame before that
+/// directive, so a 3s snapshot row would have had no bar to compare against.
+///
+/// The mapping lives in the APP crate deliberately. `SnapshotCadence` is a
+/// storage type and `TfIndex` a trading one; storage does not depend on
+/// trading, and teaching it to would invert the crate order
+/// (`common ← core ← trading ← storage`) to carry one match arm. The app
+/// depends on both already.
+///
+/// # Complexity
+/// O(1) — a four-arm match, no allocation.
+const fn fold_frame_for_cadence(
+    cadence: tickvault_storage::top_volume_rank_persistence::SnapshotCadence,
+) -> TfIndex {
+    use tickvault_storage::top_volume_rank_persistence::SnapshotCadence;
+    match cadence {
+        SnapshotCadence::OneSecond => TfIndex::S1,
+        SnapshotCadence::ThreeSecond => TfIndex::S3,
+        SnapshotCadence::FiveSecond => TfIndex::S5,
+        SnapshotCadence::OneMinute => TfIndex::M1,
+    }
+}
+
 impl LiveIngest {
     /// Enables persistence of the 5 depth levels that ride inline in every
     /// Full-mode tick packet.
@@ -1599,6 +1637,16 @@ impl LiveIngest {
             }
 
             let prev_close = &self.prev_close;
+            // A THIRD disjoint field borrow, on the same rule as `spot_prices`
+            // and `prev_close`: the candle-fold probe in the projection below
+            // runs while `rank`'s slice is still alive, and the borrow checker
+            // permits that only because all three are named as fields rather
+            // than reached through `self`.
+            let aggregator = &self.aggregator;
+            // Resolved ONCE per sweep, not per contract — the cadence is fixed
+            // for the whole pass, so a per-row match would be ~20,000 wasted
+            // branches a second at the ceiling.
+            let fold_frame = fold_frame_for_cadence(cadence);
             let view = crate::depth_subscription_view::global_depth_subscription_view();
             // ONE atomic load for the whole sweep. Held across the projection
             // AND the append loop below, because the rows BORROW their label
@@ -1644,6 +1692,66 @@ impl LiveIngest {
                 },
                 |security_id, segment| view.is_subscribed(security_id, segment),
                 |security_id, segment| labels.get(&(security_id, segment)).map(AsRef::as_ref),
+                |security_id, segment, window_open_ist_secs| {
+                    // ONE O(1) probe into the fold the drain has already been
+                    // filling this window: one hash lookup, one slot index,
+                    // at most two `LiveCandleState` copies. No allocation.
+                    //
+                    // This is the whole of the operator's 2026-09-18 ask. The
+                    // leaderboard cannot answer it — `RankedContract` carries
+                    // traded UNITS and a cumulative counter and NO PRICE — so
+                    // neither the candle table's SIGNED volume nor the
+                    // contract's own price move was expressible from the
+                    // ranking alone. Both are read here, from the SAME bar, on
+                    // the same probe.
+                    //
+                    // `aggregator` is a disjoint field borrow taken beside
+                    // `spot_prices` and `prev_close` above, for the same
+                    // reason: `rank`'s slice is still alive, and the borrow
+                    // checker permits this only because all three are named as
+                    // fields rather than reached through `self`.
+                    // `bar_for_window`, not `snapshot`: the probe asks for
+                    // THIS ROW'S window and gets that bar or nothing. Reading
+                    // the currently-open bucket instead — which is what
+                    // `snapshot` returns — systematically hands back the NEXT
+                    // window for exactly the contracts a volume board exists
+                    // to rank, because a busy contract has already rolled by
+                    // the time the sweep reaches it. It returned the right
+                    // window only for the quiet tail.
+                    aggregator
+                        .bar_for_window(
+                            Feed::Dhan,
+                            security_id,
+                            segment.binary_code(),
+                            fold_frame,
+                            window_open_ist_secs,
+                        )
+                        .map(|bar| {
+                            // How far the fold's OPEN bucket has advanced past
+                            // the window this row describes. Zero means the
+                            // bar is still being written and its volume can
+                            // still grow; positive means the fold moved on and
+                            // the bar is sealed. It can never mean "a bar for
+                            // some other window" — `bar_for_window` refuses
+                            // that case rather than reporting it.
+                            let open_bucket = aggregator
+                                .snapshot(
+                                    Feed::Dhan,
+                                    security_id,
+                                    segment.binary_code(),
+                                    fold_frame,
+                                )
+                                .map_or(0, |open| open.bucket_start_ist_secs);
+                            let advance = i64::from(open_bucket)
+                                .saturating_sub(i64::from(window_open_ist_secs))
+                                .max(0);
+                            crate::top_volume_snapshot::CandleBarReading {
+                                signed_volume: bar.signed_volume(),
+                                open_bucket_advance_secs: advance,
+                                price_chg_pct: bar.close_chg_pct_from_prev_bar(),
+                            }
+                        })
+                },
             );
 
             refused = refused.saturating_add(projection.refusal_count());
