@@ -127,6 +127,13 @@ pub async fn run_candle_ddl_at_boot(questdb: &QuestDbConfig) {
     // column references against the ensured tables.
     tickvault_storage::shadow_persistence::drop_legacy_candle_objects(questdb).await;
 
+    // 2026-09-18 operator directive — the fifteen non-emitting candle tables are
+    // dropped BEFORE the ensure, which is itself filtered to the emitted nine. The
+    // two halves are one change: dropping without filtering the CREATE loop would be
+    // undone in this same boot, and filtering without dropping would leave the
+    // retired tables resident forever.
+    tickvault_storage::shadow_persistence::drop_retired_candle_tables(questdb).await;
+
     // RETRY the candle ensure, 2026-09-09.
     //
     // Until today this awaited the ensure ONCE and discarded the verdict —
