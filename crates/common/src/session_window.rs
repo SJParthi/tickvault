@@ -451,51 +451,51 @@ mod tests {
     /// delivered 35 seconds late lands at 15:40:05 -- past the window's
     /// exclusive end. It MUST still be written.
     ///
-    /// ## ⚠ Scope of "kept", corrected 2026-09-05 by an adversarial sweep
+    /// ## ✅ The divergence this note recorded is now STRUCTURALLY IMPOSSIBLE (2026-09-18)
     ///
-    /// This keeps the print in `ticks`. It does **not** put it in a candle.
-    /// The two paths read DIFFERENT CLOCKS for the same decision:
+    /// From 2026-09-05 to 2026-09-18 this doc recorded a real, measured split:
+    /// this gate judged on the EXCHANGE stamp while the fold judged on a
+    /// clock that PREFERRED the receipt inside ±300 s, so exactly this tick
+    /// landed in `ticks` and was absent from the 15:39 bar of every
+    /// timeframe. The note closed by saying the fix was "choosing one clock
+    /// for both", and that it was deliberately not taken here.
+    ///
+    /// The operator took it. Verbatim, 2026-09-18: *"now we need to use ts
+    /// dude isntead of received at dude okay?"* and *"go ahead and implement
+    /// the ts bucketing now dude."* — recorded in
+    /// `websocket-connection-scope-lock.md` section "2026-09-18 (SECOND)".
+    /// `tf_index::fold_clock_ist_secs` is now the IDENTITY on the exchange
+    /// stamp and takes no receipt argument at all, so both sides of the table
+    /// below read the same field:
     ///
     /// | | window | clock |
     /// |---|---|---|
     /// | this gate | `[09:00, 15:40)` | the EXCHANGE stamp, `row.ts_ist_nanos` |
-    /// | the fold (`MultiTfAggregator::consume`) | `[09:00, 15:40)` — identical | `tf_index::fold_clock_ist_secs`, which PREFERS the receipt when it is within ±300 s |
+    /// | the fold (`MultiTfAggregator::consume`) | `[09:00, 15:40)` — identical | `tf_index::fold_clock_ist_secs`, the exchange stamp verbatim |
     ///
-    /// So for exactly this tick the fold clock is the 15:40:05 receipt, which
-    /// is `>= MARKET_CLOSE_SECS_OF_DAY_IST`, and the aggregator returns
-    /// `out_of_session`: the print lands in `ticks` and is absent from the
-    /// 15:39 bar of every timeframe. The converse holds too — a receipt
-    /// running AHEAD of a just-out-of-window exchange stamp is folded into a
-    /// candle while this gate refuses the tick.
+    /// **So a 15:39:30 print delivered at 15:40:05 is now kept by this gate
+    /// AND folded into the 15:39 bar.** The `[15:35:00, 15:40:00)` band this
+    /// note used to measure no longer exists, in either direction: a receipt
+    /// running ahead of a just-out-of-window stamp cannot fold either.
     ///
-    /// ⚠ AND IT IS NOT A SILENT LOSS — verified in source 2026-09-06, because
-    /// an earlier version of this note omitted the half that matters and so
-    /// read like an unhandled gap. `MultiTfAggregator::consume` returning
-    /// `out_of_session` is a CANDLE-ONLY refusal in `dhan_feed_stack`:
-    /// `hard_refusal` is `refused_price || refused_timestamp` and nothing
-    /// else, so the tick falls through to `append_tick_with_seq` and the ROW
-    /// IS WRITTEN, then counted as
+    /// ## What is UNCHANGED, and must not be read as fixed by the above
+    ///
+    /// The `out_of_session` refusal still exists and is still CANDLE-ONLY —
+    /// it now fires on the exchange stamp rather than on a receipt-preferring
+    /// clock. `hard_refusal` in `dhan_feed_stack` is `refused_price ||
+    /// refused_timestamp` and nothing else, so such a tick still falls
+    /// through to `append_tick_with_seq`, the ROW IS STILL WRITTEN, and it is
+    /// still counted as
     /// `tv_aggregator_tick_refused_total{reason="out_of_session"}` and
-    /// reported as a delta by the 30-second `AGGREGATOR-DROP-01` line. The
-    /// divergence is therefore observable, bounded and deliberate: the tick
-    /// is in `ticks`, absent from the bar, and a counter says how often.
+    /// reported by the 30-second `AGGREGATOR-DROP-01` line. What changed is
+    /// only WHICH ticks reach that arm: a genuinely out-of-window trade,
+    /// never a punctually-stamped trade that arrived late.
     ///
-    /// The affected band is bounded on BOTH sides, which is why it is small.
-    /// The fold falls back to the exchange stamp once the lag exceeds
-    /// `MAX_PLAUSIBLE_RECEIPT_LAG_SECS` (300 s), so only an exchange stamp in
-    /// `[15:35:00, 15:40:00)` with a receipt at or past 15:40 diverges at all;
-    /// at Dhan's measured p99 lag of 46 s the band actually reached is about
-    /// `[15:39:14, 15:40:00)`. A lag beyond 300 s folds correctly.
-    ///
-    /// Deliberately NOT reconciled here. Making the two agree means choosing
-    /// one clock for both, which is plan item W1b/W2 ("candles bucket on
-    /// `received_at`"): W1b is REMAINING with its design settled, and W2 is
-    /// blocked on W1b. (An earlier version of this note called W1b itself
-    /// "blocked", which it is not.) Widening this change to settle it would
-    /// alter candle bucketing on a path the operator has separately scoped,
-    /// and the 2026-08-28 receipt-clock directive is what puts the receipt in
-    /// the fold clock in the first place — so the current behaviour is that
-    /// directive's own consequence, not a defect against it.
+    /// The two CROSS-DAY gates (`stale_trading_day` / `future_trading_day`)
+    /// still read `received_at_nanos` and still must: their question is
+    /// whether the vendor stamped a print for a different trading day than
+    /// the one we are living in, which needs both clocks by construction.
+    /// See `fold_clock_coupling_guard.rs`.
     #[test]
     fn a_late_delivered_closing_print_is_kept_not_discarded() {
         let event = at(15 * 3600 + 39 * 60 + 30); // 15:39:30, in window

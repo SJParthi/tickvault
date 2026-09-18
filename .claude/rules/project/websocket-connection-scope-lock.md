@@ -5799,3 +5799,109 @@ dropped because the vendor was slow.
 - Claims the two clocks now agree on the replay path without re-measuring: the
   2026-08-27 table is a measurement with a date, and the `TVW3` record format
   changed one of its inputs.
+
+#### 2026-09-18 (SECOND, continued) — SHIPPED, and the one constant the clock change forced with it
+
+**The verbatim operator authorization for the follow-through (2026-09-18, typed
+directly in-session):**
+
+> "go ahead and implement the ts bucketing now dude."
+
+> "fix and resolve everything dude okay?"
+
+The second was given in DIRECT response to a message that ended with one
+enumerated question — *"resize the seal margin inside this same change against a
+real measured inter-instrument trade-clock spread, or ship the clock fix and
+take the margin as its own change?"* — alongside the three findings the
+implementation had surfaced. That is the §28.2/§28.3 authorization shape this
+repository already accepts: a general go-ahead answering an ENUMERATED ask
+selects the enumerated work. Recorded HERE with the code, per the
+rule-file-first law.
+
+##### What shipped
+
+`tf_index::fold_clock_ist_secs` is now `const fn (exchange_timestamp: u32) ->
+u32`, the IDENTITY, and **the receipt parameter is REMOVED rather than
+ignored** — a two-argument signature whose second argument is unused reads at
+fourteen call sites as though the receipt still matters, and a later edit could
+start honouring it with no call site changing. Removing it makes that a compile
+error instead of a review question. `MAX_PLAUSIBLE_RECEIPT_LAG_SECS` (300) and
+`MAX_PLAUSIBLE_RECEIPT_LEAD_SECS` (10) are deleted, not merely unused.
+
+##### ⚠ The constant the clock change FORCED, and why it was resized rather than deferred
+
+`CATCHUP_LATENESS_MARGIN_SECS` moves **2 s → 240 s**, and the resize is a
+consequence of the directive rather than a separate opinion:
+
+| | before | after |
+|---|---|---|
+| what the catch-up watermark measures | the RECEIPT clock — every trusted tick stamped at essentially "now", inter-instrument spread sub-second | the TRADE clock — two instruments delivered 46 s apart carry fold values 46 s apart |
+| margin that covers it | 2 s | the delivery-lag SPREAD |
+
+The derivation is in the constant's own doc and is arithmetic, not judgement: a
+tick stamped `T` reaches the fold at `T + lag`, by which time the fastest-
+delivered instrument has dragged the watermark to `≈ T + lag − lag_min`, so
+`margin ≥ lag − lag_min`. Against the measured 2026-07-06 distribution (§E of
+this file: p50 1.38 s · p99 46.37 s · **max 198.69 s**) the bound is the MAX,
+which `MEASURED_MAX_DELIVERY_LAG_SECS = 199` now names, rounded up to the next
+whole minute. Two build-failing asserts pin BOTH the floor and the derivation,
+so the margin cannot be lowered below the measurement and cannot drift back
+into being a magic number.
+
+**Why the MAX and not the p99**, stated as a trade: a margin too SMALL discards
+a late tick's PRICE once it is 2+ buckets behind (volume survives —
+`carry_unattributed` runs BEFORE the `LatePolicy` branch); a margin too LARGE
+delays a catch-up bar. One is irreversible and one is latency, against a
+standing mandate that not one tick be missed. Sizing to p99 would knowingly
+discard the top 1% of late prices every session.
+
+**⚠ Honest cost, not buried:** every CATCH-UP bar now lands ~4 minutes after its
+close instead of ~2 seconds. That is a real latency regression on the 1s/3s/5s
+frames for any consumer of catch-up bars — and NOT a regression against the
+alternative those bars actually have, which is the 15:30 close sweep. The
+NORMAL rollover is untouched: an instrument that keeps ticking still seals on
+its own next tick at no added latency, which is every liquid instrument.
+
+##### ⚠ What is NOT fixed, and is not claimed to be (Rule 11)
+
+1. **The normal-rollover late path.** The margin governs the CATCH-UP seal only.
+   A bucket sealed by an instrument's own next tick is unreachable by any
+   margin, and under the trade clock a vendor re-ordering two prints of the
+   SAME instrument can seal early and discard the earlier price when it is 2+
+   buckets behind. Widening it needs `last_sealed` to remember more than one
+   bucket per (slot, timeframe) — a memory and design change with its own
+   measurement. Under the receipt clock this shape was impossible (receipt is
+   monotone per drain), so the clock change genuinely opens it.
+2. **The 199 s is a MEASUREMENT and carries a date.** One session, a 776-SID
+   subscription. The authorized universe is ~24,600 instruments across 16
+   sockets and nothing here claims the distribution is unchanged at that scale.
+   `tv_dhan_ws_lag_ms` is the live read-out; a worse measured max moves the
+   constant.
+3. **A third finding was raised and RETRACTED rather than "fixed".**
+   `last_observed_ts` is assigned from a now-non-monotone clock, which an
+   adversarial pass flagged HIGH. Working it through says it is not: the
+   consumer asks `bucket_start(prev) == bucket_start(current)` — a BUCKET
+   question, never an ordering one — so two stamps inside one bucket attribute
+   correctly whichever arrived first, and two stamps in different buckets
+   REFUSE. The guard's own comment already names the "late-routed" case. A
+   monotone `max(..)` was considered and rejected as the WRONG direction: it
+   narrows the attribution interval, which is how an extreme gets credited to a
+   window it did not happen in. Both halves are recorded at the site, because
+   the next reader will have the same suspicion.
+
+##### What a PR that violates this subsection looks like (REJECT)
+
+- Re-adds a receipt parameter to `fold_clock_ist_secs`, or a delta band in any
+  form — the whole directive undone, and it would pass every behavioural test.
+- Lowers `CATCHUP_LATENESS_MARGIN_SECS` below `MEASURED_MAX_DELIVERY_LAG_SECS`,
+  or writes it as a literal instead of deriving it (both fail the build; do not
+  weaken the asserts to pass).
+- Raises `MEASURED_MAX_DELIVERY_LAG_SECS` without a dated live measurement — it
+  is the one input the margin trusts.
+- Makes `last_observed_ts` monotone (narrows the attribution interval).
+- Removes `received_at_nanos` from `multi_tf_aggregator`, the `TVW3` WAL record,
+  or `ReplayedFrame` "because we bucket on ts now" — the cross-day gates and
+  `row_timestamp_ist_nanos` (which feeds the `ticks` DEDUP key) both still
+  require it.
+- Claims the catch-up latency cost is zero, or that the normal-rollover late
+  path is covered.

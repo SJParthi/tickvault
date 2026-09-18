@@ -2,7 +2,10 @@
 //!
 //! # The trap this pins, in the plan's own words
 //!
-//! W2 of `active-plan-receipt-clock-preopen.md`:
+//! W2 of `.claude/plans/archive/2026-08-28-receipt-clock-preopen.md` (cited as
+//! `active-plan-receipt-clock-preopen.md` until 2026-09-18; that path no
+//! longer exists — the plan was archived, and a citation nothing resolves is
+//! worth less than the sentence it points at):
 //!
 //! > The bucketing clock is ONE line ... but **eleven other sites read the same
 //! > field**, and four of them must move WITH it or they disagree with the
@@ -26,6 +29,22 @@
 //! | `tick_is_newest` | open-interest and close take their value from disagreeing orderings |
 //!
 //! None of those is a crash. Every one is a quietly wrong candle.
+//!
+//! # ⚠ 2026-09-18 — the fold clock changed VALUE; this file's property did not
+//!
+//! The operator's ts-bucketing directive
+//! (`websocket-connection-scope-lock.md`, section "2026-09-18 (SECOND)") made
+//! `fold_clock_ist_secs` the IDENTITY on the exchange stamp. Two receipt-band
+//! behaviour tests died with the band and were replaced by
+//! `the_fold_clock_is_the_exchange_stamp_for_every_input` plus
+//! `the_fold_clock_takes_no_receipt_argument`.
+//!
+//! The COUPLING property is untouched and is now the more valuable half. With
+//! both clocks converged, moving any one of the five sites back to
+//! `tick.exchange_timestamp` is a behavioural NO-OP today — so it would pass
+//! every other test in the workspace, and then become a split the moment the
+//! fold clock is ever anything other than the identity again. That is exactly
+//! the shape this file exists to refuse.
 
 use std::path::Path;
 use tickvault_common::source_scan::strip_rust_comments;
