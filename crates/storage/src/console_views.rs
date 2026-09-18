@@ -408,6 +408,45 @@ pub fn depth_named_view_ddl() -> String {
 /// | `window_lots` | `cast(window_lots_milli AS DOUBLE) / 1000.0` | `16.0` |
 /// | `net_volume_chg_pct` | `cast(net_volume_chg_milli_pct AS DOUBLE) / 1000.0` | `1500` |
 /// | `underlying_chg_pct` | the UNDERLYING's move vs its previous close | `2.4` |
+/// | `contract_price_chg_pct` | THIS contract's own close vs the previous bar of the SAME frame (stored, from the fold) | `-0.62` |
+/// | `candle_volume` | the fold's own signed volume for this window (stored) | `-3200` |
+/// | `candle_lots` | `candle_volume / lot_size` — SIGNED, so the minus survives | `-16.0` |
+/// | `candle_volume_chg_pct` | `(abs(candle_lots) - 1) * 100` — the SAME transform as `net_volume_chg_pct`, on the fold's number | `1500` |
+///
+/// # Why `candle_lots` keeps the sign and `candle_volume_chg_pct` does not
+/// (2026-09-18)
+///
+/// The operator asked for two things that pull in opposite directions: the
+/// volume *"precise as it is, evenw ith minus"*, and a volume-percentage
+/// change computed *"from same candles tables"* that he can compare against
+/// the leaderboard's own. Signing BOTH would satisfy the first and destroy
+/// the second — `net_volume_chg_pct` is built from a non-negative window
+/// delta, so a signed percentage would disagree with it on every DOWN bar for
+/// a reason that has nothing to do with the measurement, and the Monday
+/// cross-verification would read as a mismatch on roughly half the board.
+///
+/// So the split is deliberate and it loses nothing: `candle_lots` carries the
+/// sign (and `candle_volume` carries it in raw units), while the percentage
+/// is taken from the MAGNITUDE and is therefore directly comparable to
+/// `net_volume_chg_pct` row for row. At `candle_bucket_skew_secs = 0` — the
+/// same instrument, the same window, the same lot size — the two percentages
+/// should agree; where they do not, one of the two volume paths is wrong, and
+/// that is exactly the question these columns exist to answer.
+///
+/// # Neither is stored, and that is the point
+///
+/// Both are pure arithmetic over `candle_volume_signed` and `lot_size`, which
+/// ARE stored. Computing them here costs zero ILP bytes — which matters:
+/// `TOP_VOLUME_ILP_ROW_BYTES` now sits ~11% under the depth path's producer
+/// ceiling, and two more stored LONGs would breach it. More importantly a
+/// derived column cannot drift from its inputs, so `candle_lots` can never
+/// disagree with the `candle_volume` printed beside it.
+///
+/// `CASE WHEN t.lot_size > 0` rather than a bare division: a zero lot size is
+/// refused upstream (`LegRefusal::MissingLotSize`), so this arm should be
+/// unreachable — but a division by zero here would put an infinity into a
+/// column an operator reads as a measurement, and NULL is the honest answer
+/// to "how many lots is this" when the lot size is unknown.
 ///
 /// The casts are load-bearing, not decoration — see
 /// `the_derived_percentages_cast_before_dividing_a_long`. ONE probe settles
@@ -479,8 +518,17 @@ pub fn top_volume_cadence_view_ddl(cadence: SnapshotCadence) -> String {
          t.delta_units, t.lot_size, \
          cast(t.window_lots_milli AS DOUBLE) / 1000.0 AS window_lots, \
          cast(t.net_volume_chg_milli_pct AS DOUBLE) / 1000.0 AS net_volume_chg_pct, \
-         t.net_volume_chg_milli_pct, \
+         t.candle_price_chg_pct AS contract_price_chg_pct, \
          t.gain_pct AS underlying_chg_pct, \
+         t.candle_volume_signed AS candle_volume, \
+         CASE WHEN t.lot_size > 0 \
+         THEN cast(t.candle_volume_signed AS DOUBLE) / cast(t.lot_size AS DOUBLE) \
+         END AS candle_lots, \
+         CASE WHEN t.lot_size > 0 \
+         THEN (abs(cast(t.candle_volume_signed AS DOUBLE)) / cast(t.lot_size AS DOUBLE) - 1.0) * 100.0 \
+         END AS candle_volume_chg_pct, \
+         t.candle_bucket_skew_secs, \
+         t.net_volume_chg_milli_pct, \
          t.subscribed, t.volume, t.window_lots_milli, t.underlying_id, \
          t.feed, t.segment, t.security_id, t.tf \
          FROM {NAMED_VIEW_TOP_VOLUME_BASE} t \
@@ -932,6 +980,70 @@ mod tests {
                     "an un-cast LONG division reappeared: {ddl}"
                 );
             }
+        }
+    }
+
+    /// The two candle-derived columns must be arithmetic over the two STORED
+    /// candle inputs, guarded against a zero lot size, and must use the SAME
+    /// `(lots - 1) * 100` transform as `net_volume_chg_pct` — otherwise the
+    /// Monday cross-verification compares two numbers that were never
+    /// computed the same way and every disagreement is meaningless.
+    #[test]
+    fn the_candle_columns_divide_by_the_lot_size_and_reuse_the_same_transform() {
+        for cadence in SnapshotCadence::ALL {
+            let ddl = top_volume_cadence_view_ddl(cadence);
+            // Both are NULL-guarded rather than dividing blind.
+            assert_eq!(
+                ddl.matches("CASE WHEN t.lot_size > 0").count(),
+                2,
+                "both candle columns must guard the zero lot size: {ddl}"
+            );
+            // The signed form keeps the minus; the percentage takes the
+            // magnitude, so it stays comparable to net_volume_chg_pct.
+            assert!(
+                ddl.contains(
+                    "cast(t.candle_volume_signed AS DOUBLE) / cast(t.lot_size AS DOUBLE) \
+                     END AS candle_lots"
+                ),
+                "candle_lots must be the SIGNED division: {ddl}"
+            );
+            assert!(
+                ddl.contains(
+                    "(abs(cast(t.candle_volume_signed AS DOUBLE)) / cast(t.lot_size AS DOUBLE) \
+                     - 1.0) * 100.0 END AS candle_volume_chg_pct"
+                ),
+                "candle_volume_chg_pct must be (|lots| - 1) * 100: {ddl}"
+            );
+            // The LONG operands are cast before every division, for the same
+            // reason the row above this test records.
+            for uncast in [
+                "t.candle_volume_signed / ",
+                "t.candle_volume_signed AS DOUBLE) / t.lot_size",
+            ] {
+                assert!(
+                    !ddl.contains(uncast),
+                    "an un-cast LONG division reappeared: {ddl}"
+                );
+            }
+        }
+    }
+
+    /// The contract's OWN price move is read from the fold and exposed under a
+    /// name that cannot be confused with the UNDERLYING's — the operator asked
+    /// for both, separately, and a single ambiguous `pct` column is what made
+    /// him ask.
+    #[test]
+    fn the_contract_and_underlying_price_moves_are_separate_named_columns() {
+        for cadence in SnapshotCadence::ALL {
+            let ddl = top_volume_cadence_view_ddl(cadence);
+            assert!(
+                ddl.contains("t.candle_price_chg_pct AS contract_price_chg_pct"),
+                "the contract's own move must be named: {ddl}"
+            );
+            assert!(
+                ddl.contains("t.gain_pct AS underlying_chg_pct"),
+                "the underlying's move must be named: {ddl}"
+            );
         }
     }
 

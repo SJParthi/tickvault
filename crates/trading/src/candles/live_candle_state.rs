@@ -394,6 +394,61 @@ impl LiveCandleState {
         // `-i64::MAX`, which is `i64::MIN + 1`.
         if self.close < prev { -gross } else { gross }
     }
+
+    /// This bar's own price change against the PREVIOUS sealed bar of the same
+    /// timeframe, as a percentage — or `None` when there is no usable baseline.
+    ///
+    /// # Why this exists (operator, 2026-09-18)
+    ///
+    /// *"why i cant see any normal percnetage change and volume percentage
+    /// change columns sepaartely dude espeiclaly in top volume table"*.
+    ///
+    /// `top_volume` carried two percentage columns and NEITHER was the
+    /// contract's own price move: `net_volume_chg_milli_pct` is a VOLUME
+    /// figure (lots traded in the window), and `gain_pct` is the UNDERLYING
+    /// stock's move. Nothing anywhere stored "what did this option contract's
+    /// price do", because the leaderboard's `RankedContract` carries no price
+    /// at all — the fold does.
+    ///
+    /// # Why the PREVIOUS BAR and not the previous DAY
+    ///
+    /// [`Self::close_pct_from_prev_day`] is stamped at SEAL
+    /// ([`Self::stamp_seal_percentages`]), so on the OPEN bucket this method is
+    /// read from it is still `0.0` — reading it would store a fabricated zero
+    /// that is indistinguishable from a genuinely flat bar.
+    /// `bucket_open_prev_close` is snapshotted when the bucket OPENS and is
+    /// therefore live from the bar's first tick.
+    ///
+    /// It is also the RIGHT baseline for the row it lands beside: it is the
+    /// exact comparison [`Self::signed_volume`] derives its sign from. A reader
+    /// seeing a negative volume can see, in the next column, the price fall
+    /// that made it negative — rather than having to know the rule.
+    ///
+    /// # The refusal
+    ///
+    /// `None` when `bucket_open_prev_close` is not finite or not strictly
+    /// positive — `0.0` is the documented "no usable baseline" sentinel (the
+    /// session's first bar of this timeframe, or a slot whose previous bar was
+    /// never sealed), and a negative baseline would invert the sign so a fall
+    /// persisted as a rise. This is the SAME gate `signed_volume` applies, so
+    /// the two columns can never disagree about whether a baseline existed:
+    /// where this is `None`, the volume is unsigned-positive by that rule.
+    ///
+    /// Rounded to 2 decimals by `pct_change`, the shared house helper — so
+    /// this percentage rounds by exactly the rule every other percentage in
+    /// the fold rounds by, and matches the vendor's published precision.
+    ///
+    /// # Complexity
+    /// O(1) — two compares and one division, no allocation.
+    #[must_use]
+    pub fn close_chg_pct_from_prev_bar(&self) -> Option<f64> {
+        let baseline = self.bucket_open_prev_close;
+        if !baseline.is_finite() || baseline <= 0.0 {
+            return None;
+        }
+        let pct = pct_change(self.close, baseline);
+        pct.is_finite().then_some(pct)
+    }
 }
 
 /// `(value - baseline) / baseline * 100`, or `0.0` when that is not a
@@ -956,5 +1011,123 @@ mod tests {
             Some(-100),
             "the flow reading still disagrees"
         );
+    }
+
+    /// A bar whose close ROSE against the previous sealed bar's close reports
+    /// a positive percentage — and it is the SAME comparison the signed
+    /// volume derives its sign from, which is why these two columns can be
+    /// read side by side without a reader having to guess which baseline
+    /// each one used.
+    #[test]
+    fn close_chg_pct_from_prev_bar_rises_against_the_previous_bar_close() {
+        let s = LiveCandleState {
+            bucket_start_ist_secs: 33_300,
+            close: 101.0,
+            bucket_open_prev_close: 100.0,
+            ..LiveCandleState::empty()
+        };
+        assert_eq!(s.close_chg_pct_from_prev_bar(), Some(1.0));
+    }
+
+    /// The falling case, paired with the volume sign it explains: a bar that
+    /// closed BELOW the previous bar's close reports a negative percentage,
+    /// and `signed_volume` on the same bar is negative for the same reason.
+    /// Asserting both here is what stops one of the two rules drifting.
+    #[test]
+    fn a_falling_bar_reports_a_negative_change_beside_a_negative_volume() {
+        let s = LiveCandleState {
+            bucket_start_ist_secs: 33_300,
+            close: 99.0,
+            bucket_open_prev_close: 100.0,
+            volume: 500,
+            ..LiveCandleState::empty()
+        };
+        assert_eq!(s.close_chg_pct_from_prev_bar(), Some(-1.0));
+        assert_eq!(
+            s.signed_volume(),
+            -500,
+            "the sign of the volume and the sign of the price change are the \
+             same comparison — if these two ever disagree, one of the rules moved"
+        );
+    }
+
+    /// A FLAT bar is 0.00%, not `None`. The baseline exists and the bar is
+    /// genuinely unchanged; reporting absence there would read as "no
+    /// previous bar", which is a different fact.
+    #[test]
+    fn a_flat_bar_reports_zero_rather_than_absence() {
+        let s = LiveCandleState {
+            bucket_start_ist_secs: 33_300,
+            close: 100.0,
+            bucket_open_prev_close: 100.0,
+            ..LiveCandleState::empty()
+        };
+        assert_eq!(s.close_chg_pct_from_prev_bar(), Some(0.0));
+    }
+
+    /// `bucket_open_prev_close == 0.0` is the documented NO-BASELINE sentinel
+    /// — the session's first bucket, and any bar whose predecessor was never
+    /// sealed. It must report `None`, never a percentage computed against
+    /// zero: dividing by it yields an infinity that would reach the column as
+    /// a fabricated number.
+    #[test]
+    fn the_session_first_bar_has_no_baseline_and_reports_none() {
+        let s = LiveCandleState {
+            bucket_start_ist_secs: 33_300,
+            close: 100.0,
+            bucket_open_prev_close: 0.0,
+            ..LiveCandleState::empty()
+        };
+        assert_eq!(s.close_chg_pct_from_prev_bar(), None);
+    }
+
+    /// A non-finite or negative baseline is refused for the same reason: the
+    /// only honest answer is "no usable baseline", and a NaN reaching a
+    /// persisted column is the poisoning class this repository has already
+    /// paid for once.
+    #[test]
+    fn a_corrupt_baseline_is_refused_rather_than_propagated() {
+        for baseline in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            let s = LiveCandleState {
+                bucket_start_ist_secs: 33_300,
+                close: 100.0,
+                bucket_open_prev_close: baseline,
+                ..LiveCandleState::empty()
+            };
+            assert_eq!(
+                s.close_chg_pct_from_prev_bar(),
+                None,
+                "baseline {baseline} must yield no reading"
+            );
+        }
+    }
+
+    /// The accessor rounds by the SHARED rule, not a second one of its own:
+    /// it goes through `pct_change`, so the 2026-09-03 vendor-matching
+    /// 2-decimal directive applies to it automatically. A local formula here
+    /// would be how this column comes to disagree with the four that already
+    /// exist.
+    #[test]
+    fn close_chg_pct_from_prev_bar_rounds_by_the_same_two_decimal_rule() {
+        let s = LiveCandleState {
+            bucket_start_ist_secs: 33_300,
+            close: 24_273.15,
+            bucket_open_prev_close: 24_334.55,
+            ..LiveCandleState::empty()
+        };
+        let got = s.close_chg_pct_from_prev_bar().expect("baseline is usable");
+        assert_eq!(
+            got,
+            pct_change(24_273.15, 24_334.55),
+            "the accessor must reuse pct_change, not restate the arithmetic"
+        );
+        let rendered = format!("{got}");
+        if let Some(fraction) = rendered.split_once('.').map(|(_, f)| f) {
+            assert!(
+                fraction.len() <= 2,
+                "rendered {rendered:?} with {} decimals — Dhan publishes 2",
+                fraction.len()
+            );
+        }
     }
 }
