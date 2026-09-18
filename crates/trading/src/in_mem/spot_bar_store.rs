@@ -1225,4 +1225,133 @@ mod tests {
         let store = spot_bar_store().expect("global store must be readable");
         assert_eq!(store.spot_days(), 35, "the FIRST install's depth wins");
     }
+
+    /// A bar OLDER than everything retained, while the ring still has room,
+    /// must be kept at the front — not dropped.
+    ///
+    /// This is the boot catch-up shape reaching the per-bar `upsert` path
+    /// rather than the block-prepend fast path (a single-bar day, or a repair
+    /// refold of one older bucket). Before this test the `Err(0)` +
+    /// below-capacity arm had no coverage at all, so an edit that collapsed it
+    /// into the `DroppedOverWindow` arm above it would have silently discarded
+    /// every such bar while the ring sat half empty.
+    #[test]
+    fn an_older_bar_below_capacity_is_inserted_at_the_front_not_dropped() {
+        // D1 is one bar per session day, so `spot_days = 2` gives a ring of
+        // EXACTLY two — the smallest capacity that can be non-full and still
+        // hold an out-of-order pair.
+        let store = SpotBarStore::new(2);
+        assert_eq!(bars_per_day(TfIndex::D1), 1, "D1 must be one bar per day");
+
+        let newer = DAY0 + 86_400;
+        assert_eq!(
+            store.append_sealed(key(), TfIndex::D1, bar(newer, 101.0)),
+            UpsertOutcome::Appended
+        );
+        // Ring holds ONE bar of a two-bar ring: below capacity, and the
+        // incoming bucket is older than the front.
+        assert_eq!(
+            store.append_sealed(key(), TfIndex::D1, bar(DAY0, 100.0)),
+            UpsertOutcome::InsertedMiddle,
+            "an older bucket with room left must be retained, never dropped"
+        );
+
+        let held = store.latest_n(key(), TfIndex::D1, 8);
+        assert_eq!(
+            held.iter()
+                .map(|b| b.bucket_start_ist_secs)
+                .collect::<Vec<_>>(),
+            vec![newer, DAY0],
+            "`latest_n` reads NEWEST-first, so an ascending ring renders \
+             [newer, older]. A front insert that landed at the back would \
+             render [DAY0, newer] here and silently mis-order every read."
+        );
+        assert_eq!(
+            store.stats().middle_inserts,
+            1,
+            "a front insert is a counted middle insert, not a silent append"
+        );
+    }
+
+    /// A GAP-FILLING bar that arrives when the ring is already full must evict
+    /// the oldest and land in the right place — never corrupt the ordering.
+    ///
+    /// The index arithmetic here is the trap: `binary_search` returns the
+    /// insertion index computed against the PRE-eviction ring, so after
+    /// `pop_front` every position has shifted by one and the insert must use
+    /// `idx - 1`. Using `idx` unshifted puts the bar one slot too far right,
+    /// which breaks the ascending invariant that every read path
+    /// (`bar_at`'s binary search included) depends on. Nothing covered this
+    /// arm, and the corruption is silent — the ring simply starts answering
+    /// lookups with the wrong bucket.
+    #[test]
+    fn a_gap_filling_bar_at_capacity_evicts_the_oldest_and_keeps_the_ring_sorted() {
+        let store = SpotBarStore::new(2);
+
+        let oldest = DAY0;
+        let middle = DAY0 + 86_400;
+        let newest = DAY0 + 2 * 86_400;
+
+        assert_eq!(
+            store.append_sealed(key(), TfIndex::D1, bar(oldest, 100.0)),
+            UpsertOutcome::Appended
+        );
+        assert_eq!(
+            store.append_sealed(key(), TfIndex::D1, bar(newest, 102.0)),
+            UpsertOutcome::Appended
+        );
+        // Ring is now FULL and has a hole in the middle.
+        assert_eq!(
+            store.append_sealed(key(), TfIndex::D1, bar(middle, 101.0)),
+            UpsertOutcome::InsertedMiddle
+        );
+
+        let held = store.latest_n(key(), TfIndex::D1, 8);
+        assert_eq!(
+            held.iter()
+                .map(|b| b.bucket_start_ist_secs)
+                .collect::<Vec<_>>(),
+            vec![newest, middle],
+            "`latest_n` is NEWEST-first, so the ascending ring [middle, \
+             newest] renders this way. The OLDEST bar is evicted and the \
+             gap-filler lands BEFORE the newest in the ring -- an unshifted \
+             insert index would order the ring [newest, middle] and break \
+             every binary-search read"
+        );
+        assert_eq!(
+            store.bar_at(key(), TfIndex::D1, middle).map(|b| b.close),
+            Some(101.0),
+            "the gap-filler must be findable by its own bucket ts"
+        );
+        assert!(
+            store.bar_at(key(), TfIndex::D1, oldest).is_none(),
+            "the evicted bucket must be gone, not shadowing a later lookup"
+        );
+    }
+
+    /// An older-than-window bar AT capacity is dropped, and the drop is
+    /// COUNTED — the honest half of eviction.
+    #[test]
+    fn an_older_bar_at_capacity_is_dropped_and_counted() {
+        let store = SpotBarStore::new(2);
+
+        store.append_sealed(key(), TfIndex::D1, bar(DAY0 + 86_400, 101.0));
+        store.append_sealed(key(), TfIndex::D1, bar(DAY0 + 2 * 86_400, 102.0));
+        assert_eq!(
+            store.append_sealed(key(), TfIndex::D1, bar(DAY0, 100.0)),
+            UpsertOutcome::DroppedOverWindow,
+            "a bar older than the whole retained window at capacity is dropped"
+        );
+        assert_eq!(
+            store.stats().dropped_over_window,
+            1,
+            "the drop must be counted -- a silent drop is indistinguishable \
+             from an instrument that never emitted"
+        );
+        assert_eq!(
+            store.latest_n(key(), TfIndex::D1, 8).len(),
+            2,
+            "the retained window itself must be untouched by the refusal"
+        );
+    }
 }
