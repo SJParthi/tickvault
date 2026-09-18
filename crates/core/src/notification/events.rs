@@ -1615,19 +1615,21 @@ impl NotificationEvent {
                          (fires 9:16 AM to 3:30 PM IST on trading days): \
                          Dhan spot candles for {spot_1m_indices} indices + \
                          Dhan option chain for {chain_1m_underlyings} \
-                         indices"
+                         indices (Groww per-minute legs report separately)"
                     ),
                     (true, false) => format!(
                         "\u{2705} Dhan per-minute price capture — armed \
                          (fires 9:16 AM to 3:30 PM IST on trading days): \
                          Dhan spot candles for {spot_1m_indices} indices; \
-                         Dhan option chain — switched off"
+                         Dhan option chain — switched off (Groww per-minute \
+                         legs report separately)"
                     ),
                     (false, true) => format!(
                         "\u{2705} Dhan per-minute price capture — armed \
                          (fires 9:16 AM to 3:30 PM IST on trading days): \
                          Dhan option chain for {chain_1m_underlyings} \
-                         indices; Dhan spot candles — switched off"
+                         indices; Dhan spot candles — switched off (Groww \
+                         per-minute legs report separately)"
                     ),
                     // The ONLY reachable arm since 2026-09-16: `main.rs`
                     // constant-folds both operands to
@@ -2022,7 +2024,7 @@ impl NotificationEvent {
                 let detail = html_escape(detail);
                 format!(
                     "\u{26a0}\u{fe0f} <b>Daily spot cross-check did NOT run</b>\n\
-                     The 3:47 PM IST spot cross-verification check \
+                     The 3:47 PM IST check comparing Dhan vs Groww index prices \
                      died before finishing.\n\
                      Reason: {detail}\n\
                      What to do RIGHT NOW:\n\
@@ -2153,7 +2155,7 @@ impl NotificationEvent {
                 let detail = html_escape(detail);
                 format!(
                     "\u{26a0}\u{fe0f} <b>Daily feed scorecard did NOT run</b>\n\
-                     The 3:45 PM IST daily feed scorecard died before \
+                     The 3:45 PM IST Dhan-vs-Groww scorecard died before \
                      finishing.\n\
                      Reason: {detail}\n\
                      What to do RIGHT NOW:\n\
@@ -3644,10 +3646,10 @@ mod tests {
             "got: {both}"
         );
         assert!(!both.contains("switched off"), "got: {both}");
-        // Groww was removed 2026-08-21. Asserting its ABSENCE, not a
-        // replacement phrase: a card that names a second broker this
-        // system does not have is a false statement to the operator.
-        assert!(!both.contains("Groww"), "got: {both}");
+        assert!(
+            both.contains("Groww per-minute legs report separately"),
+            "got: {both}"
+        );
 
         let chain_off = build(true, false).to_message();
         assert!(

@@ -21,16 +21,29 @@
 //!   re-arm (fresh dated quote per dhan-rest-only-noise-lock-2026-07-14 §3)
 //!   re-attaches the socket + WAL producers to this SAME channel,
 //! - the RiskEngine fed by [`FillEvent`]s (the widened `handle_order_update`
-//!   return) and by DHAN marks (the zero-alloc [`MarkForwarder`] tap at the
-//!   per-minute REST legs. persist-confirm seam — re-homed 2026-07-16,
-//!   the live-bridge per-tick source died with #1581; 2026-07-17 truth-sync
-//!   — → bounded mpsc → `update_market_price`). ⚠ CORRECTED 2026-09-13: this
-//!   said "Groww marks" and had done since the 2026-08-21 Groww removal. The
-//!   producer is `dhan_cadence_executor`, pinned by
-//!   `cadence_mark_source_guard::test_dhan_cadence_executor_is_now_the_mark_producer`,
-//!   which was INVERTED on 2026-08-21 to assert exactly that. A doc naming the
-//!   wrong broker for the price the paper book fills at is the reassuring-direction
-//!   staleness this repo has recorded repeatedly,
+//!   return) and by marks (the zero-alloc [`MarkForwarder`] tap → bounded
+//!   mpsc → `update_market_price`). ⚠ CORRECTED TWICE, and the second
+//!   correction is the one that is live:
+//!
+//!   2026-09-13 — this said "Groww marks", stale since the 2026-08-21 Groww
+//!   removal, and named `dhan_cadence_executor` as the producer.
+//!
+//!   ⚠ 2026-09-18 — that producer NO LONGER EXISTS. The operator's
+//!   SOCKETS-ONLY narrowing (`no-rest-except-live-feed-2026-06-27.md` §12.10)
+//!   removed the per-minute REST legs on 2026-09-16, and `CadenceExecutor`
+//!   declared exactly the three removed fetch methods, so the executor, its
+//!   boot and the scheduler went with them. `cadence_mark_source_guard`'s
+//!   pins 1-4 were RETIRED in that change for the same reason.
+//!
+//!   So `mark_forward` has **ZERO production call sites** today — verified,
+//!   not assumed: every remaining caller is a `#[cfg(test)]` one in this
+//!   file. The paper book therefore runs UNMARKED, which §12.10.7(a) records
+//!   and which `main.rs` makes AUDIBLE by explicitly dropping
+//!   `order_runtime_mark_forwarder` so the channel CLOSES and the
+//!   producer-less warn can actually fire. Re-arming a mark producer is the
+//!   follow-up; naming a deleted module as the live source would be exactly
+//!   the reassuring-direction staleness the 2026-09-13 note was written to
+//!   complain about,
 //! - the next-mark PAPER FILLER (a pending `PAPER-n` order fills at the next
 //!   mark for its sid — fill-once, terminal orders never re-fill, finite>0
 //!   mark required, else deferred + counted),

@@ -2246,6 +2246,32 @@ mod tests {
             s_ntm < s_fno,
             "the settle must mirror resolve_live_universe's precedence, NTM before F&O"
         );
+
+        // ⚠ WIRING, not just shape — added 2026-09-18.
+        //
+        // Until now this guard stopped at the precedence check above, so
+        // deleting BOTH production call sites left it GREEN: it pinned that
+        // the helper is CORRECT and nothing pinned that it RUNS. That is the
+        // vacuous-guard class this repository has recorded repeatedly — a
+        // guard satisfied by the very artifact it exists to reject.
+        //
+        // `await_mapping_artifact` is the ONLY production caller and it
+        // returns early on several arms, so the call has to appear on both
+        // arms that actually narrow. Assert the CALL FORM inside that
+        // function's production body.
+        let waiter = body
+            // Split for the same pub-fn-guard reason as above.
+            .find(concat!("pub ", "async fn await_mapping_artifact"))
+            .expect("await_mapping_artifact");
+        let call_sites = body[waiter..]
+            .matches("settle_for_narrowed_spot_artifact(cfg, date_ist).await")
+            .count();
+        assert!(
+            call_sites >= 2,
+            "await_mapping_artifact must CALL the settle on both narrowing arms \
+             (NTM and F&O); found {call_sites}. Deleting a call site silently \
+             re-opens the boot race the settle exists to close."
+        );
     }
 
     #[tokio::test]
