@@ -118,10 +118,13 @@
 //! load gate still refuses only version 0, so v1 and v2 records replay
 //! unchanged; nothing on disk is orphaned by the bump.
 //!
-//! `net_volume_signed` / `net_volume_classified` survive on `SerializedSeal`
-//! and on `LiveCandleState` because the DLQ's NDJSON names them and the
-//! in-memory accumulator is retained, but **the binary record no longer
-//! carries either**: a spill-replayed seal decodes `0` / `false`.
+//! `net_volume_signed` / `net_volume_classified` survive on `LiveCandleState`
+//! ALONE — the in-memory accumulator is retained so restoring the flow value
+//! later is purely additive. They are gone from BOTH persisted shapes:
+//! `SerializedSeal` (the const-assert on `SEAL_SPILL_RECORD_SIZE` forces it —
+//! see the RETIRED note at the field site) and `SealDlqRecord`, whose NDJSON
+//! carries `bucket_open_prev_close` in their place. A spill-replayed or
+//! DLQ-replayed seal therefore decodes `0` / `false` for the flow pair.
 //!
 //! Total: 128 bytes, and **there is no spare room left**.
 //!
