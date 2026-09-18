@@ -460,6 +460,32 @@ pub const fn net_volume_chg_milli_pct(window_lots_milli: i64) -> Option<i64> {
     }
 }
 
+/// One reading of the candle fold's OPEN bucket for a contract, at the
+/// snapshot instant.
+///
+/// Added 2026-09-18 for the operator's *"i clelary told you to precisely have
+/// the same volume even in top volume also as simialr to candles tables
+/// volume"*. The leaderboard cannot answer that on its own —
+/// `RankedContract` carries traded UNITS and a cumulative counter and **no
+/// price at all**, so it can neither sign a volume nor state a price move.
+/// The fold holds both, and this is what the projection asks it for.
+///
+/// A struct rather than a tuple because three unlabelled numbers at a call
+/// site is how a skew gets stored in a volume column.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CandleBarReading {
+    /// The bar's SIGNED gross volume — byte-identical to what
+    /// `candles_<tf>.volume` carries for this contract and bucket.
+    pub signed_volume: i64,
+    /// The bar's bucket-OPEN, in IST epoch seconds. Compared against the row's
+    /// own `ts` to produce `candle_bucket_skew_secs`, which is what makes a
+    /// mismatched window visible instead of silent.
+    pub bucket_open_ist_secs: u32,
+    /// The bar's own price change against the previous sealed bar, in percent,
+    /// or `None` when that bar had no usable baseline.
+    pub price_chg_pct: Option<f64>,
+}
+
 /// Projects one family's ranked slice into storable rows.
 ///
 /// `gain_pct_of` is called with the **UNDERLYING's** id, not the contract's.
@@ -486,7 +512,7 @@ pub const fn net_volume_chg_milli_pct(window_lots_milli: i64) -> Option<i64> {
 /// only by `TOP_VOLUME_PERSIST_PER_FAMILY` (25,000). The claim understated the
 /// slice by up to 100x, in the reassuring direction.
 #[must_use]
-pub fn project_snapshot<'a, G, S, L>(
+pub fn project_snapshot<'a, G, S, L, C>(
     snapshot_ts_ist_nanos: i64,
     cadence: SnapshotCadence,
     family: OptionFamily,
@@ -494,11 +520,13 @@ pub fn project_snapshot<'a, G, S, L>(
     gain_pct_of: G,
     is_subscribed: S,
     label_of: L,
+    candle_of: C,
 ) -> SnapshotProjection<'a>
 where
     G: Fn(u64) -> Option<f64>,
     S: Fn(u64, ExchangeSegment) -> bool,
     L: Fn(u64, ExchangeSegment) -> Option<&'a str>,
+    C: Fn(u64, ExchangeSegment) -> Option<CandleBarReading>,
 {
     // FLOORED TO THE CADENCE GRID, not merely to the second.
     //
@@ -543,6 +571,11 @@ where
         .unwrap_or(1)
         .saturating_mul(NANOS_PER_SECOND);
     let ts = boundary.saturating_sub(period_nanos);
+    // The row stamp in IST epoch SECONDS, for the candle-skew comparison
+    // below: `LiveCandleState::bucket_start_ist_secs` is seconds, and doing
+    // the subtraction in seconds keeps the skew column a small honest integer
+    // rather than a nanosecond figure nobody reads.
+    let ts_secs = ts.div_euclid(NANOS_PER_SECOND);
     // `rows` IS pre-sized: it genuinely fills. Every contract on the board
     // produces a row — the two refusals that can fire in the common case
     // (`GainUnavailable`, `LabelUnavailable`) do NOT drop the row, they only
@@ -650,6 +683,36 @@ where
             refusals.push((contract.security_id, SnapshotRefusal::GainUnavailable));
         }
 
+        // ---- the candle fold's OWN reading of this contract (2026-09-18) ----
+        //
+        // ONE O(1) probe — one hash lookup and one index into a pre-sized slot
+        // array. It answers `None` when the contract has no aggregator slot at
+        // all (never ticked this session, or the slot budget was exhausted).
+        //
+        // A bar whose `bucket_open_ist_secs` is 0 has NEVER OPENED, which is
+        // the fold's documented sentinel, and it is refused here rather than
+        // stored: a `0` skew would claim the bar describes this exact window,
+        // and a `0` volume would read as "no trades", and neither is knowable.
+        // Refusing keeps the three columns NULL together, which is the only
+        // state a cross-verification can filter on.
+        let candle = candle_of(contract.security_id, contract.segment)
+            .filter(|bar| bar.bucket_open_ist_secs != 0);
+        // Bar bucket-open MINUS this row's `ts`, in seconds. `0` means the two
+        // describe the same window and the volumes are comparable; anything
+        // else is a row whose halves measure different intervals and was never
+        // meant to match. See the column's own doc for the three ways that
+        // legitimately happens.
+        let candle_bucket_skew_secs = candle
+            .as_ref()
+            .map(|bar| i64::from(bar.bucket_open_ist_secs).saturating_sub(ts_secs));
+        // FINITE-gated exactly as `gain_pct` above is. The fold already
+        // refuses a non-finite quotient, so this is the second gate on a value
+        // that must never reach `column_f64` — cheap, and it means a future
+        // caller computing a percentage in-line cannot slip a NaN through.
+        let candle_price_chg_pct = candle
+            .as_ref()
+            .and_then(|bar| bar.price_chg_pct)
+            .filter(|p| p.is_finite());
         rows.push(TopVolumeRankRow {
             snapshot_ts_ist_nanos: ts,
             cadence,
@@ -674,6 +737,9 @@ where
             net_volume_chg_milli_pct,
             gain_pct,
             subscribed: is_subscribed(contract.security_id, contract.segment),
+            candle_volume_signed: candle.as_ref().map(|bar| bar.signed_volume),
+            candle_bucket_skew_secs,
+            candle_price_chg_pct,
         });
     }
 
@@ -702,6 +768,35 @@ mod tests {
         None
     }
     const NO_LABEL: fn(u64, ExchangeSegment) -> Option<&'static str> = no_label;
+
+    /// The fold reading every test passes unless it is testing the fold.
+    ///
+    /// `None` — no aggregator slot — is the ordinary case for a synthetic
+    /// `RankedContract` that was never folded, and it is what every test
+    /// written before 2026-09-18 implicitly assumed. Passing it explicitly
+    /// keeps those tests asserting exactly what they asserted before the
+    /// three fold columns existed.
+    const fn no_candle(_id: u64, _segment: ExchangeSegment) -> Option<CandleBarReading> {
+        None
+    }
+    const NO_CANDLE: fn(u64, ExchangeSegment) -> Option<CandleBarReading> = no_candle;
+
+    /// A fold reading that describes the SAME window the row does (`skew 0`),
+    /// with a NEGATIVE volume and the price fall that signs it — the shape the
+    /// columns exist to carry.
+    #[allow(clippy::unnecessary_wraps)]
+    fn test_candle(_id: u64, _segment: ExchangeSegment) -> Option<CandleBarReading> {
+        Some(CandleBarReading {
+            signed_volume: -4_242,
+            // The 1-second cadence's row stamps `ts = 0` in these fixtures
+            // (`NANOS_PER_SECOND` floored to the grid, minus one period), so a
+            // bucket open of 1 would be a skew of 1. Tests that assert a skew
+            // set this deliberately; see `TEST_CANDLE_AT`.
+            bucket_open_ist_secs: 1,
+            price_chg_pct: Some(-0.37),
+        })
+    }
+    const TEST_CANDLE: fn(u64, ExchangeSegment) -> Option<CandleBarReading> = test_candle;
 
     /// Like [`contract`], naming the underlying explicitly for the tests that
     /// exercise the gain closure — which is keyed on the UNDERLYING.
@@ -771,6 +866,7 @@ mod tests {
             |_| Some(1.5),
             |_, _| false,
             TEST_LABEL,
+            NO_CANDLE,
         );
         assert_eq!(p.rows.len(), 3);
         // The `rank` COLUMN was removed on 2026-09-13 (operator: "rmeve the
@@ -797,6 +893,7 @@ mod tests {
             |_| Some(0.0),
             |_, _| true,
             TEST_LABEL,
+            NO_CANDLE,
         );
         // ONE stamp for the whole snapshot — the property this test is named
         // for, and the reason the DEDUP key can collapse a re-emit.
@@ -844,6 +941,7 @@ mod tests {
                 |_| Some(0.0),
                 |_, _| true,
                 TEST_LABEL,
+                NO_CANDLE,
             );
             assert_eq!(
                 p.rows[0].snapshot_ts_ist_nanos,
@@ -866,6 +964,7 @@ mod tests {
             |_| Some(2.0),
             |sid, _| sid == 10,
             TEST_LABEL,
+            NO_CANDLE,
         );
         assert!(p.rows[0].subscribed);
         assert!(!p.rows[1].subscribed);
@@ -884,6 +983,7 @@ mod tests {
             |_| Some(2.0),
             |_, _| true,
             TEST_LABEL,
+            NO_CANDLE,
         );
         assert_eq!(p.rows.len(), 2);
 
@@ -915,6 +1015,7 @@ mod tests {
             |_| Some(0.0),
             |_, _| false,
             TEST_LABEL,
+            NO_CANDLE,
         );
         let index = project_snapshot(
             NANOS_PER_SECOND,
@@ -924,6 +1025,7 @@ mod tests {
             |_| Some(0.0),
             |_, _| false,
             TEST_LABEL,
+            NO_CANDLE,
         );
         assert_eq!(stock.rows[0].family, "stock");
         assert_eq!(index.rows[0].family, "index");
@@ -944,6 +1046,7 @@ mod tests {
             |_| Some(0.0),
             |_, _| false,
             TEST_LABEL,
+            NO_CANDLE,
         );
         assert_eq!(p.rows.len(), 1);
         assert_eq!(p.rows[0].security_id, 10);
@@ -966,6 +1069,7 @@ mod tests {
             |_| Some(0.0),
             |_, _| false,
             TEST_LABEL,
+            NO_CANDLE,
         );
         assert!(p.rows.is_empty());
         assert_eq!(p.refusal_count(), 1);
@@ -999,6 +1103,7 @@ mod tests {
             },
             |_, _| false,
             TEST_LABEL,
+            NO_CANDLE,
         );
         // ALL THREE rows survive. Until 2026-09-12 this asserted ONE, because
         // a non-finite gain deleted the whole row -- taking the contract's
@@ -1051,6 +1156,7 @@ mod tests {
             |_| Some(0.0),
             |_, _| false,
             TEST_LABEL,
+            NO_CANDLE,
         );
         // The refused row is GONE, and the survivors keep the ranked slice's
         // ORDER — which is all the removed `rank` column ever recorded. A
@@ -1079,6 +1185,7 @@ mod tests {
             |_| Some(1.0),
             |_, _| false,
             TEST_LABEL,
+            NO_CANDLE,
         );
         assert_eq!(p.rows.len(), 2);
         assert_eq!(p.rows[0].window_lots_milli, 1_500);
@@ -1099,6 +1206,7 @@ mod tests {
             |_| Some(1.0),
             |_, _| false,
             TEST_LABEL,
+            NO_CANDLE,
         );
         assert!(p.rows.is_empty());
         assert_eq!(p.refusals, vec![(10, SnapshotRefusal::LotsOutOfRange)]);
@@ -1122,6 +1230,7 @@ mod tests {
             },
             |_, _| false,
             TEST_LABEL,
+            NO_CANDLE,
         );
         assert_eq!(p.rows.len(), 1);
         assert!(
@@ -1142,6 +1251,7 @@ mod tests {
             |_| Some(0.0),
             |_, _| false,
             TEST_LABEL,
+            NO_CANDLE,
         );
         assert_eq!(p.rows[0].volume, i64::from(u32::MAX));
     }
@@ -1156,6 +1266,7 @@ mod tests {
             |_| Some(0.0),
             |_, _| false,
             TEST_LABEL,
+            NO_CANDLE,
         );
         assert!(p.rows.is_empty());
         assert_eq!(p.refusal_count(), 0);
@@ -1181,6 +1292,7 @@ mod tests {
             },
             |_, _| false,
             TEST_LABEL,
+            NO_CANDLE,
         );
         // TWO rows, not one: the oversized id DROPS its row (that column is in
         // the DEDUP key), the unknown gain KEEPS its row with a NULL column.
@@ -1214,6 +1326,7 @@ mod tests {
             |_| None,
             |_, _| true,
             TEST_LABEL,
+            NO_CANDLE,
         );
         assert_eq!(
             p.rows.len(),
@@ -1245,6 +1358,7 @@ mod tests {
             |_| Some(1.0),
             |_, _| false,
             TEST_LABEL,
+            NO_CANDLE,
         );
         assert!(
             p.rows.is_empty(),
@@ -1466,6 +1580,7 @@ mod tests {
             |_| Some(1.0),
             |_, _| true,
             NO_LABEL,
+            NO_CANDLE,
         );
         assert_eq!(p.rows.len(), 1, "a missing label must never delete the row");
         assert_eq!(p.rows[0].contract, UNLABELLED_CONTRACT);
@@ -1480,6 +1595,7 @@ mod tests {
             |_| Some(1.0),
             |_, _| true,
             TEST_LABEL,
+            NO_CANDLE,
         );
         assert_eq!(p.rows[0].contract, "RELIANCE-25Sep2026-1400-CE");
         assert!(p.refusals.is_empty());
@@ -1623,5 +1739,249 @@ mod tests {
         let of_day = secs_of_day_ist(before_epoch);
         assert!(of_day < 86_400, "must stay inside a day, got {of_day}");
         assert_eq!(of_day, 86_399, "one second before the epoch is 23:59:59");
+    }
+    // ---- the three fold columns (operator, 2026-09-18) ----------------
+    //
+    // *"i clelary told you to precisely have the same volume even in top
+    // volume also as simialr to candles tables volume rigth dude … it shodu
+    // lbe precise as it is evenw ith minus also"* and, the same day, *"why i
+    // cant see any normal percnetage change and volume percentage change
+    // columns sepaartely"*.
+
+    /// A helper that parameterises the bar-open second, for the skew tests.
+    fn candle_at(
+        bucket_open_ist_secs: u32,
+        signed_volume: i64,
+        price_chg_pct: Option<f64>,
+    ) -> impl Fn(u64, ExchangeSegment) -> Option<CandleBarReading> {
+        move |_id, _segment| {
+            Some(CandleBarReading {
+                signed_volume,
+                bucket_open_ist_secs,
+                price_chg_pct,
+            })
+        }
+    }
+
+    /// The row stamp, in IST seconds, for the fixtures below — derived from
+    /// the projection's OWN rule rather than restated, so a change to the
+    /// stamp cannot leave these tests asserting a skew against a stale number.
+    fn row_ts_secs(snapshot_ts_ist_nanos: i64, cadence: SnapshotCadence) -> i64 {
+        let boundary = floor_to_grid(snapshot_ts_ist_nanos, cadence.interval_secs());
+        let period = i64::try_from(cadence.interval_secs())
+            .unwrap_or(1)
+            .saturating_mul(NANOS_PER_SECOND);
+        boundary.saturating_sub(period).div_euclid(NANOS_PER_SECOND)
+    }
+
+    #[test]
+    fn the_fold_reading_lands_in_the_three_candle_columns() {
+        let ranked = vec![contract(10, 1, 500)];
+        // A bar whose open IS this row's window, so the skew is 0 and the two
+        // volumes are directly comparable — the state a cross-verification
+        // filters for.
+        let ts_secs = row_ts_secs(10 * NANOS_PER_SECOND, SnapshotCadence::OneSecond);
+        let open = u32::try_from(ts_secs).expect("fixture stamp fits u32");
+        let p = project_snapshot(
+            10 * NANOS_PER_SECOND,
+            SnapshotCadence::OneSecond,
+            OptionFamily::Stock,
+            &ranked,
+            |_| Some(1.5),
+            |_, _| false,
+            TEST_LABEL,
+            candle_at(open, -4_242, Some(-0.37)),
+        );
+        let row = &p.rows[0];
+        assert_eq!(
+            row.candle_volume_signed,
+            Some(-4_242),
+            "the candles table's SIGNED volume must reach the column verbatim, \
+             minus and all — that is the whole of the operator's ask"
+        );
+        assert_eq!(
+            row.candle_bucket_skew_secs,
+            Some(0),
+            "a bar opening on this row's own window stamp is skew 0"
+        );
+        assert!(
+            (row.candle_price_chg_pct.expect("price change present") + 0.37).abs() < f64::EPSILON,
+            "the CONTRACT's own price move must reach its own column"
+        );
+    }
+
+    #[test]
+    fn the_three_candle_columns_are_null_together_when_the_fold_has_no_slot() {
+        let ranked = vec![contract(10, 1, 500)];
+        let p = project_snapshot(
+            NANOS_PER_SECOND,
+            SnapshotCadence::OneSecond,
+            OptionFamily::Stock,
+            &ranked,
+            |_| Some(1.5),
+            |_, _| false,
+            TEST_LABEL,
+            NO_CANDLE,
+        );
+        let row = &p.rows[0];
+        assert_eq!(row.candle_volume_signed, None);
+        assert_eq!(row.candle_bucket_skew_secs, None);
+        assert_eq!(row.candle_price_chg_pct, None);
+        // And the ROW still exists. A missing fold reading is a NULL column,
+        // never a dropped row — the `gain_pct` lesson of 2026-09-12, where an
+        // unknowable leaf column cost the table the volume it exists to record.
+        assert_eq!(p.rows.len(), 1);
+    }
+
+    #[test]
+    fn a_bar_that_never_opened_is_refused_rather_than_stored_as_a_zero_skew() {
+        let ranked = vec![contract(10, 1, 500)];
+        let p = project_snapshot(
+            NANOS_PER_SECOND,
+            SnapshotCadence::OneSecond,
+            OptionFamily::Stock,
+            &ranked,
+            |_| Some(1.5),
+            |_, _| false,
+            TEST_LABEL,
+            // `bucket_start_ist_secs == 0` is the fold's documented
+            // never-opened sentinel. Storing it would claim a skew of
+            // `-row_ts` AND a volume of 0 — two confident lies about a bar
+            // that does not exist.
+            candle_at(0, 0, Some(0.0)),
+        );
+        let row = &p.rows[0];
+        assert_eq!(row.candle_volume_signed, None);
+        assert_eq!(row.candle_bucket_skew_secs, None);
+        assert_eq!(row.candle_price_chg_pct, None);
+    }
+
+    #[test]
+    fn the_skew_is_the_bar_open_minus_the_row_stamp_and_is_signed_both_ways() {
+        let ranked = vec![contract(10, 1, 500)];
+        let snapshot = 300 * NANOS_PER_SECOND;
+        let cadence = SnapshotCadence::FiveSecond;
+        let ts_secs = row_ts_secs(snapshot, cadence);
+        let stamp = u32::try_from(ts_secs).expect("fixture stamp fits u32");
+
+        // A bar one whole period OLDER than this row's window — the ordinary
+        // shape for a contract that did not trade in the window that just
+        // closed and is still holding its last bar.
+        let older = project_snapshot(
+            snapshot,
+            cadence,
+            OptionFamily::Stock,
+            &ranked,
+            |_| Some(1.5),
+            |_, _| false,
+            TEST_LABEL,
+            candle_at(stamp - 5, 100, None),
+        );
+        assert_eq!(
+            older.rows[0].candle_bucket_skew_secs,
+            Some(-5),
+            "an older bar reads NEGATIVE — the column must be signed, because \
+             the race in the other direction is real too"
+        );
+
+        // A bar one period NEWER: the boundary race the column exists to make
+        // visible — a tick rolled the bucket in the same instant this sweep ran.
+        let newer = project_snapshot(
+            snapshot,
+            cadence,
+            OptionFamily::Stock,
+            &ranked,
+            |_| Some(1.5),
+            |_, _| false,
+            TEST_LABEL,
+            candle_at(stamp + 5, 100, None),
+        );
+        assert_eq!(newer.rows[0].candle_bucket_skew_secs, Some(5));
+    }
+
+    #[test]
+    fn a_non_finite_price_change_never_reaches_the_column() {
+        let ranked = vec![contract(10, 1, 500)];
+        let ts_secs = row_ts_secs(NANOS_PER_SECOND, SnapshotCadence::OneSecond);
+        let open = u32::try_from(ts_secs.max(1)).expect("fits u32");
+        let p = project_snapshot(
+            NANOS_PER_SECOND,
+            SnapshotCadence::OneSecond,
+            OptionFamily::Stock,
+            &ranked,
+            |_| Some(1.5),
+            |_, _| false,
+            TEST_LABEL,
+            candle_at(open, -77, Some(f64::NAN)),
+        );
+        let row = &p.rows[0];
+        assert_eq!(
+            row.candle_price_chg_pct, None,
+            "a NaN must be refused, not written — `column_f64` would carry it \
+             into the table and every comparison against it is false"
+        );
+        assert_eq!(
+            row.candle_volume_signed,
+            Some(-77),
+            "and refusing the percentage must not cost the VOLUME its column: \
+             the two are separate facts from the same bar"
+        );
+    }
+
+    /// The operator's constraint on this change, in a test:
+    ///
+    /// *"bro just keep evrythign … as logn as we confirm that manually and
+    /// cross evrify on modnay dont remvoe anythign dude okay?"*
+    ///
+    /// Nothing about the pre-existing volume columns may move. Monday's
+    /// cross-verification compares the old numbers against the new one IN THE
+    /// SAME ROW, and it can only do that if adding the fold reading changed
+    /// none of them.
+    #[test]
+    fn the_fold_reading_changes_none_of_the_existing_volume_columns() {
+        let ranked = vec![contract(10, 1, 500), contract(11, 1, 400)];
+        let without = project_snapshot(
+            NANOS_PER_SECOND,
+            SnapshotCadence::OneSecond,
+            OptionFamily::Stock,
+            &ranked,
+            |_| Some(1.5),
+            |_, _| true,
+            TEST_LABEL,
+            NO_CANDLE,
+        );
+        let with = project_snapshot(
+            NANOS_PER_SECOND,
+            SnapshotCadence::OneSecond,
+            OptionFamily::Stock,
+            &ranked,
+            |_| Some(1.5),
+            |_, _| true,
+            TEST_LABEL,
+            TEST_CANDLE,
+        );
+        assert_eq!(without.rows.len(), with.rows.len());
+        for (a, b) in without.rows.iter().zip(with.rows.iter()) {
+            assert_eq!(a.snapshot_ts_ist_nanos, b.snapshot_ts_ist_nanos);
+            assert_eq!(a.security_id, b.security_id);
+            assert_eq!(a.volume, b.volume, "cumulative volume must not move");
+            assert_eq!(a.delta_units, b.delta_units, "traded units must not move");
+            assert_eq!(a.lot_size, b.lot_size);
+            assert_eq!(
+                a.window_lots_milli, b.window_lots_milli,
+                "THE SORT KEY must not move — the ordering is what depth \
+                 steering reads, and this change is additive"
+            );
+            assert_eq!(
+                a.net_volume_chg_milli_pct, b.net_volume_chg_milli_pct,
+                "the volume-percentage column must not move"
+            );
+            assert_eq!(a.gain_pct, b.gain_pct);
+            assert_eq!(a.subscribed, b.subscribed);
+        }
+        // And the new columns really did arrive in the second projection —
+        // otherwise this test would pass by both sides being empty.
+        assert_eq!(with.rows[0].candle_volume_signed, Some(-4_242));
+        assert_eq!(without.rows[0].candle_volume_signed, None);
     }
 }
