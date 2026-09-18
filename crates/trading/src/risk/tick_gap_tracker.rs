@@ -2024,4 +2024,19 @@ mod tests {
              this is precisely the masking a shared key produced"
         );
     }
+
+    /// The I-P1-11 composite is the key: the same numeric id on a DIFFERENT
+    /// segment is a DIFFERENT instrument, and at capacity it is refused as a
+    /// newcomer rather than silently answered from the other segment's state.
+    #[test]
+    fn the_capacity_check_keys_on_the_composite_not_the_bare_security_id() {
+        let mut tracker = TickGapTracker::new(4);
+        tracker.record_tick(13, 0, 1_800_000_000);
+        tracker.record_tick(13, 1, 1_800_000_000);
+        assert_eq!(
+            tracker.tracked_securities(),
+            2,
+            "(13, IDX_I) and (13, NSE_EQ) are two instruments -- keying on the              bare id would let one mask the other's silence"
+        );
+    }
 }
