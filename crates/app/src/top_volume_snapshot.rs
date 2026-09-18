@@ -241,7 +241,14 @@ pub const fn floor_to_second(ts_nanos: i64) -> i64 {
 /// next boundary IS, this one says which boundary a given instant belongs to.
 /// Together they make a snapshot's timestamp a property of the window rather
 /// than of when the scheduler happened to run the arm — which is what lets a
-/// `top_volume` row and a `candles_<tf>` row share a `ts` and be joined.
+/// `top_volume` row land on the same grid as a `candles_<tf>` row.
+///
+/// ⚠ **The grid alone does NOT make the two joinable, and this doc said it
+/// did until 2026-09-18.** This function floors to a grid CELL BOUNDARY; a
+/// sweep firing at a boundary therefore floors to the window's CLOSE, while a
+/// candle is stamped at its window's OPEN — one period apart on every row.
+/// The caller subtracts one period for exactly that reason; see the dated
+/// comment at the `ts` binding in `project_snapshot`.
 ///
 /// `period_secs == 1` reduces to [`floor_to_second`], and a zero period is
 /// handled rather than divided by.
@@ -515,7 +522,27 @@ where
     //
     // For the 1-second cadence this is exactly `floor_to_second`, so nothing
     // about that board changes.
-    let ts = floor_to_grid(snapshot_ts_ist_nanos, cadence.interval_secs());
+    // ⚠ CORRECTED 2026-09-18 — the grid alignment above was necessary and was
+    // NOT sufficient, and the module said otherwise in two places.
+    //
+    // The sweep fires AT a grid boundary, so flooring `now` to the grid yields
+    // the boundary that has just been crossed — which is the window's CLOSE.
+    // A `candles_<tf>` bar is stamped at its window's OPEN. So a `top_volume`
+    // row and a candle row carrying the same `ts` described windows ONE PERIOD
+    // APART, on every row of every cadence, while this file's own docs claimed
+    // the alignment "lets a `top_volume` row and a `candles_<tf>` row share a
+    // `ts` and be joined". They could not be joined, and the failure was
+    // silent: the query simply returned the wrong window's figures.
+    //
+    // The measurement is unchanged — the leaderboard's delta covers the
+    // interval since the previous fire, i.e. the window that just closed — so
+    // naming that window by its OPEN is what the operator's "both of them
+    // should be precisely matchable" (2026-09-18) actually requires.
+    let boundary = floor_to_grid(snapshot_ts_ist_nanos, cadence.interval_secs());
+    let period_nanos = i64::try_from(cadence.interval_secs())
+        .unwrap_or(1)
+        .saturating_mul(NANOS_PER_SECOND);
+    let ts = boundary.saturating_sub(period_nanos);
     // `rows` IS pre-sized: it genuinely fills. Every contract on the board
     // produces a row — the two refusals that can fire in the common case
     // (`GainUnavailable`, `LabelUnavailable`) do NOT drop the row, they only
@@ -776,18 +803,54 @@ mod tests {
         let stamp = p.rows[0].snapshot_ts_ist_nanos;
         assert!(p.rows.iter().all(|r| r.snapshot_ts_ist_nanos == stamp));
 
-        // UPDATED 2026-09-12: that stamp is the CADENCE GRID cell, not merely
-        // the whole second the arm ran in. It used to assert `7s` here, which
-        // was the sub-second truncation of the fire instant; a 5-second board
-        // now floors to its own grid so a late fire cannot land on a second no
-        // candle row shares. The sub-second part is still gone, which is what
-        // the DEDUP key needs.
-        assert_eq!(stamp, floor_to_grid(fired_at, 5));
+        // UPDATED 2026-09-18: the stamp is the grid cell the closed window
+        // OPENED on — one period BEFORE the boundary the fire floors to. The
+        // grid alignment (2026-09-12) put the two on the same lattice; this
+        // subtraction is what makes a `top_volume` row and the `candles_5s`
+        // row for the same window carry the SAME `ts`, which the 2026-09-18
+        // directive requires ("both of them should be precisely matchable").
+        // The sub-second part is still gone, which is what the DEDUP key needs.
+        assert_eq!(stamp, floor_to_grid(fired_at, 5) - 5 * NANOS_PER_SECOND);
         assert_eq!(
             stamp % NANOS_PER_SECOND,
             0,
             "a snapshot stamp must never carry a sub-second remainder"
         );
+    }
+
+    #[test]
+    fn the_stamp_names_the_window_that_closed_not_the_one_beginning() {
+        // The joinability property, stated as arithmetic rather than as a
+        // claim in a docstring — which is how it was wrong from 2026-09-12 to
+        // 2026-09-18. A sweep firing at 09:20:05 on the 5s board measured
+        // 09:20:00..09:20:05, so its row must carry 09:20:00 — the same `ts`
+        // the `candles_5s` bar for that window carries.
+        for (cadence, period) in [
+            (SnapshotCadence::OneSecond, 1_i64),
+            (SnapshotCadence::ThreeSecond, 3),
+            (SnapshotCadence::FiveSecond, 5),
+            (SnapshotCadence::OneMinute, 60),
+        ] {
+            // An exact boundary: 09:00 + 60 periods, so every cadence lands on
+            // one and the arithmetic is checkable by hand.
+            let boundary_secs = SNAPSHOT_GRID_ANCHOR_SECS_OF_DAY_IST + 60 * period;
+            let fired_at = boundary_secs * NANOS_PER_SECOND;
+            let ranked = [contract(10, 1, 500)];
+            let p = project_snapshot(
+                fired_at,
+                cadence,
+                OptionFamily::Index,
+                &ranked,
+                |_| Some(0.0),
+                |_, _| true,
+                TEST_LABEL,
+            );
+            assert_eq!(
+                p.rows[0].snapshot_ts_ist_nanos,
+                (boundary_secs - period) * NANOS_PER_SECOND,
+                "{cadence:?}: the stamp must be the closed window's OPEN"
+            );
+        }
     }
 
     #[test]

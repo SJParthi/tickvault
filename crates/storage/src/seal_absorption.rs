@@ -451,6 +451,14 @@ mod tests {
         state.oi = 50_000;
         state.tick_count = 5;
         state.close_pct_from_prev_day = 1.5;
+        // Carried by the spill record since v3 (2026-09-18) — it is the
+        // baseline the persisted volume's SIGN is measured against. Set above
+        // both closes this helper is called with so a lost baseline, which
+        // decodes 0.0 and signs POSITIVE, cannot pass a round-trip by
+        // agreeing with the default.
+        state.bucket_open_prev_close = 24_400.0;
+        // NOT carried by the record any more; set here so the round-trip test
+        // below proves a replayed seal does not resurrect them.
         state.net_volume_signed = -4_242;
         state.net_volume_classified = true;
         state.total_buy_qty = 89_600;
@@ -792,17 +800,27 @@ mod tests {
     fn test_submit_preserves_seal_payload_through_spill_round_trip() {
         // The full LiveCandleState must round-trip from BufferedSeal → ring →
         // eviction → spill file → on-disk SerializedSeal record without field
-        // loss — the net-volume accumulator included, since record format v2.
+        // loss — the SIGN BASELINE included, since record format v3.
         //
-        // ⚠ `bucket_open_prev_close` is DELIBERATELY not carried and this test
-        // is what proves it stays out: the record dropped it in v2 to make room
-        // for the accumulator, so a fixture that still set it failed this exact
-        // equality. Dropping it is safe because the field is DEAD — no
-        // production code reads it (`close_pct_from_prev_day` is stamped from
-        // `prev_day_close`, see `LiveCandleState::stamp_seal_percentages`), and
-        // its only remaining references are the three writes-then-asserts in
-        // `aggregator_cell.rs`. If a future change gives it a real reader, this
-        // assertion fails and the record needs the field back.
+        // ⚠ CORRECTED 2026-09-18 — this comment used to say the opposite, and
+        // said it at length: that `bucket_open_prev_close` is "DELIBERATELY not
+        // carried", that the field is "DEAD — no production code reads it", and
+        // that "if a future change gives it a real reader, this assertion fails
+        // and the record needs the field back."
+        //
+        // That future change is here. The 2026-09-18 directive made the
+        // persisted `volume` SIGNED, and the sign is derived from
+        // `close < bucket_open_prev_close` — so the field has a production
+        // reader (`LiveCandleState::signed_volume`) and the record carries it
+        // again at bytes 80..88, exactly where v1 had it. The prediction was
+        // right and the test is re-blessed rather than loosened.
+        //
+        // What is NOT carried now is the pair that displaced it:
+        // `net_volume_signed` / `net_volume_classified` left the record at v3
+        // because the column they fed was deleted. The fixture sets them, so a
+        // round-trip that quietly kept carrying them would fail this equality
+        // — which is the same protection the old comment described, pointed at
+        // the other field.
         let (spill, dlq) = temp_pair("preserve-fields");
         let mut p =
             SealAbsorptionPipeline::with_capacity_and_dirs_for_test(1, spill.clone(), dlq.clone());
@@ -816,7 +834,23 @@ mod tests {
         let recovered = drained[0]
             .try_into_buffered_seal()
             .expect("valid tf_ordinal");
-        assert_eq!(recovered, s1);
+
+        // Whole-struct equality against an expectation with only the retired
+        // pair cleared: every other field, the baseline included, still has to
+        // match exactly.
+        let mut expected = s1;
+        expected.state.net_volume_signed = 0;
+        expected.state.net_volume_classified = false;
+        assert_eq!(recovered, expected);
+        assert_eq!(
+            recovered.state.bucket_open_prev_close, 24_400.0,
+            "the sign baseline survived the ring → spill → disk → replay chain"
+        );
+        assert_eq!(
+            recovered.state.signed_volume(),
+            -1234,
+            "and it still signs the bar, so a rescued sell bar comes back a sell bar"
+        );
         cleanup(&spill, &dlq);
     }
 
