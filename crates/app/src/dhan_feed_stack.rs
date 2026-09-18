@@ -2795,7 +2795,7 @@ impl LiveIngest {
                 // operator asked for (directive 2026-09-18: 1s 3s 5s 1m 3m
                 // 5m 15m 30m 60m). His list has eleven entries; `ticks` is a
                 // separate table and `10m` is DERIVED from candles_1m, so
-                // neither is a fold frame. The enum carries 24, so fourteen
+                // neither is a fold frame. The enum carries 24, so fifteen
                 // of them write nothing.
                 //
                 // Counted into its OWN bucket, never into `dropped`: that
@@ -3373,7 +3373,7 @@ impl LiveIngest {
                 // operator asked for (directive 2026-09-18: 1s 3s 5s 1m 3m
                 // 5m 15m 30m 60m). His list has eleven entries; `ticks` is a
                 // separate table and `10m` is DERIVED from candles_1m, so
-                // neither is a fold frame. The enum carries 24, so fourteen
+                // neither is a fold frame. The enum carries 24, so fifteen
                 // of them write nothing.
                 //
                 // Counted into its OWN bucket, never into `dropped`: that
@@ -3785,7 +3785,7 @@ impl LiveIngest {
                 // operator asked for (directive 2026-09-18: 1s 3s 5s 1m 3m
                 // 5m 15m 30m 60m). His list has eleven entries; `ticks` is a
                 // separate table and `10m` is DERIVED from candles_1m, so
-                // neither is a fold frame. The enum carries 24, so fourteen
+                // neither is a fold frame. The enum carries 24, so fifteen
                 // of them write nothing.
                 //
                 // Counted into its OWN bucket, never into `dropped`: that
@@ -3907,7 +3907,7 @@ impl LiveIngest {
 
     /// Bars produced for a timeframe nobody asked for, and therefore not sent.
     ///
-    /// Expected to be LARGE and to grow steadily — eleven of the twenty-four
+    /// Expected to be LARGE and to grow steadily — fifteen of the twenty-four
     /// timeframes are unrequested, so on a busy fold this outruns
     /// `seals_emitted`. A big number here is the gate working, not a fault,
     /// which is exactly why it must never be added to `seals_dropped`.
