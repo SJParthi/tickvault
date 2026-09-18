@@ -2024,7 +2024,7 @@ impl NotificationEvent {
                 let detail = html_escape(detail);
                 format!(
                     "\u{26a0}\u{fe0f} <b>Daily spot cross-check did NOT run</b>\n\
-                     The 3:47 PM IST check comparing Dhan vs Groww index prices \
+                     The 3:47 PM IST \u{1f537} DHAN index spot cross-check \
                      died before finishing.\n\
                      Reason: {detail}\n\
                      What to do RIGHT NOW:\n\
@@ -2155,7 +2155,7 @@ impl NotificationEvent {
                 let detail = html_escape(detail);
                 format!(
                     "\u{26a0}\u{fe0f} <b>Daily feed scorecard did NOT run</b>\n\
-                     The 3:45 PM IST Dhan-vs-Groww scorecard died before \
+                     The 3:45 PM IST \u{1f537} DHAN daily feed scorecard died before \
                      finishing.\n\
                      Reason: {detail}\n\
                      What to do RIGHT NOW:\n\
@@ -6913,6 +6913,12 @@ mod tests {
         let msg = ev.to_message();
         assert!(msg.contains("Daily feed scorecard did NOT run"), "{msg}");
         assert!(msg.contains("3:45 PM IST"), "{msg}");
+        // 2026-09-18: the body named "Dhan-vs-Groww" — a broker removed
+        // 2026-08-21 — from a LIVE dispatch site (main.rs, the scorecard
+        // task's Err and panic arms). Asserted ABSENT so it cannot creep
+        // back, per the scope-lock '2026-09-13 DHAN-ONLY' section.
+        assert!(!msg.contains("Groww"), "{msg}");
+        assert!(msg.contains("DHAN"), "{msg}");
         assert!(msg.contains("Reason: the task crashed: boom"), "{msg}");
         assert!(msg.contains("What to do RIGHT NOW"), "{msg}");
     }
