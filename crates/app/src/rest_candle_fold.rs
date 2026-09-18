@@ -672,9 +672,14 @@ pub fn sealed_bucket_to_seal(
         bucket_start_cumulative: 0,
         // A REST bar is a whole minute delivered as one row: there is no tick
         // sequence, so there is no tick RULE to apply and nothing to classify.
-        // `classified: false` makes `net_volume()` persist NULL, which is the
-        // honest answer — the accumulator being 0 would otherwise read as
-        // "this minute traded with perfectly balanced flow".
+        // `classified: false` leaves the in-memory flow accumulator unset,
+        // which is the honest answer — 0 with `classified: true` would read
+        // as "this minute traded with perfectly balanced flow".
+        //
+        // ⚠ CORRECTED 2026-09-18: this said `classified: false` "makes
+        // `net_volume()` persist NULL". Nothing persists it any more — the
+        // 2026-09-18 directive deleted the `net_volume` COLUMN, and the pair
+        // below now survives on `LiveCandleState` alone.
         net_volume_signed: 0,
         net_volume_classified: false,
         oi: 0,
@@ -684,8 +689,18 @@ pub fn sealed_bucket_to_seal(
         close_pct_from_prev_day: 0.0,
         // REST bars carry no order book and no intra-session previous close:
         // the fetcher hands us whole minutes, not a live tape. Zero is the
-        // documented "no baseline" sentinel, so `net_volume` persists NULL
-        // rather than a fabricated sign.
+        // documented "no baseline" sentinel.
+        //
+        // ⚠ CORRECTED 2026-09-18, and the correction MATTERS: this said the
+        // sentinel makes `net_volume` persist NULL "rather than a fabricated
+        // sign". Since the signed-volume change this field IS the sign — a
+        // baseline of `0.0` makes `signed_volume()` return the magnitude
+        // POSITIVE, not null. For a REST bar that is still the right answer
+        // (a whole minute delivered as one row has no previous same-timeframe
+        // close to compare against), but it is a positive sign, not an
+        // absence, and a reader planning to re-arm this fold needs to know
+        // which. `[rest_candle_fold]` is disabled and its live inlet has no
+        // producer, so nothing writes these rows today.
         bucket_open_prev_close: 0.0,
         total_buy_qty: 0,
         total_sell_qty: 0,

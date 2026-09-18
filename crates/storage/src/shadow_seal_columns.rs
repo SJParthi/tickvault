@@ -451,13 +451,39 @@ mod tests {
 
     #[test]
     fn test_volume_saturates_when_above_i64_max() {
+        // The baseline is set ABOVE the close DELIBERATELY. With the
+        // `LiveCandleState::empty()` default of `0.0` this test was VACUOUS:
+        // `signed_volume` returns early on `prev <= 0.0`, so the old
+        // "saturated volume MUST stay positive" assertion was satisfied by
+        // the no-baseline rule and could not fail whatever the saturation
+        // arm did. Driving the NEGATING arm is what actually exercises it.
         let mut state = LiveCandleState::empty();
         state.bucket_start_ist_secs = 1_716_000_900;
         state.volume = u64::MAX;
+        state.close = 100.0;
+        state.bucket_open_prev_close = 101.0;
         let seal = BufferedSeal::new(13, 0, TfIndex::M1, state, Feed::Dhan);
         let row = ShadowSealRow::from_buffered_seal(&seal);
-        assert_eq!(row.volume, i64::MAX);
-        assert!(row.volume > 0, "saturated volume MUST stay positive");
+        assert_eq!(
+            row.volume,
+            -i64::MAX,
+            "a saturated magnitude must still take the bar's sign, and the \
+             negation must not overflow: -i64::MAX is i64::MIN + 1"
+        );
+        assert_ne!(
+            row.volume,
+            i64::MIN,
+            "i64::MIN is unreachable by construction; reaching it would mean \
+             the saturation used wrapping arithmetic"
+        );
+        // And the same bar with a RISING close keeps the positive saturation.
+        let mut up = LiveCandleState::empty();
+        up.bucket_start_ist_secs = 1_716_000_900;
+        up.volume = u64::MAX;
+        up.close = 102.0;
+        up.bucket_open_prev_close = 101.0;
+        let up_seal = BufferedSeal::new(13, 0, TfIndex::M1, up, Feed::Dhan);
+        assert_eq!(ShadowSealRow::from_buffered_seal(&up_seal).volume, i64::MAX);
     }
 
     #[test]
