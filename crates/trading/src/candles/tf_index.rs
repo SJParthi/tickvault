@@ -560,6 +560,12 @@ impl TfIndex {
     ///
     /// # Why this exists
     ///
+    /// ⚠ **The three paragraphs below describe the 2026-08-08 set and are
+    /// SUPERSEDED by the 2026-09-18 section at the end of this doc.** They are
+    /// kept because the REASONING — gate emission, never delete variants — is
+    /// what this function still does; only the membership moved. Read the
+    /// named frames in them as history, not as the current set.
+    ///
     /// The enum carries **24** variants, so **eleven** second-scale frames —
     /// `S2 S3 S4 S6 S7 S8 S9 S11 S12 S13 S14` — are neither requested nor used
     /// by anything. Before this gate the live lane sealed all 24 on every fold,
@@ -582,7 +588,8 @@ impl TfIndex {
     /// deleting variants would cascade through all of that for no benefit.
     ///
     /// Changing this set needs a fresh dated operator quote, exactly like the
-    /// constants it derives from; `tf_index_operator_set_is_twelve` pins it.
+    /// constants it derives from; `tf_index_operator_set_is_the_operators_nine`
+    /// pins it.
     ///
     /// # 2026-08-25 — D1 removed (13 -> 12)
     ///
@@ -593,18 +600,49 @@ impl TfIndex {
     /// per the rule-file-first law. The variant, its ordinal and its slot are
     /// untouched — only EMISSION is gated, exactly as the eleven unrequested
     /// second-scale frames already are.
+    ///
+    /// # 2026-09-18 — the set is REPLACED (12 -> 9 native), and 10m is DERIVED
+    ///
+    /// Operator directive 2026-09-18, recorded in
+    /// `websocket-connection-scope-lock.md` section "2026-09-18 — ELEVEN
+    /// TIMEFRAMES, ONE SIGNED VOLUME" BEFORE this edit, per the
+    /// rule-file-first law. Verbatim: *"we will have one and only candles
+    /// tables timeframe which is ticks, 1s, 3s, 5s, 1m, 3m, 5m, 10m, 15m,
+    /// 30m, 60m right dude only these timeframes alone dude okay?"*
+    ///
+    /// Net against the 2026-08-08 set: **`S3` GAINS** emission, and
+    /// **`S10` / `S15` / `S30` / `M2` LOSE** it. Those four tables keep
+    /// existing and keep every row they already hold — the DDL creates all
+    /// 24 names from `TfIndex::ALL` and no populated table is ever dropped
+    /// (SEBI retention). Only new rows stop.
+    ///
+    /// ## Why this returns NINE for an eleven-item list
+    ///
+    /// The operator's list has eleven entries and two of them are not native
+    /// fold frames:
+    ///
+    /// | Entry | Where it comes from |
+    /// |---|---|
+    /// | `ticks` | the separate `ticks` table, not a candle frame at all |
+    /// | `10m` | **DERIVED** from `candles_1m`, never folded |
+    /// | the other nine | this set |
+    ///
+    /// `10m` is derived on the operator's own instruction (*"no 10s derive
+    /// the 10m dude okay"*) and there is no `M10` variant to add. That is
+    /// deliberate and load-bearing: a new variant would take ordinal 24,
+    /// move `TF_COUNT` 24 -> 25, resize every `[_; TF_COUNT]` array and the
+    /// seal ring with it, and add a 25th scalar fold to the per-tick path —
+    /// for a bar that is exactly `first(open) / max(high) / min(low) /
+    /// last(close)` over ten 1-minute bars. Deriving costs nothing per tick.
     #[inline]
     #[must_use]
     pub const fn is_operator_requested(self) -> bool {
         matches!(
             self,
             Self::S1
+                | Self::S3
                 | Self::S5
-                | Self::S10
-                | Self::S15
-                | Self::S30
                 | Self::M1
-                | Self::M2
                 | Self::M3
                 | Self::M5
                 | Self::M15
@@ -649,12 +687,25 @@ impl TfIndex {
     /// Aligns a tick's IST-second timestamp to the start of its
     /// containing bucket for this timeframe.
     ///
-    /// Buckets are anchored to the **09:15:00 IST market open**, NOT to
-    /// the epoch — so every timeframe's first candle of the day starts
-    /// exactly at 09:15 (a 15m bucket is `[09:15,09:30)`; the first
-    /// bucket of every frame starts at the open). A tick at or
-    /// before the open anchors to the first bucket; the aggregator's
-    /// market-hours gate keeps genuine pre-open ticks out anyway.
+    /// Buckets are anchored to the **CANDLE SESSION open**,
+    /// `CANDLE_SESSION_OPEN_SECS_OF_DAY_IST` = **09:00:00 IST**, NOT to the
+    /// epoch — so every timeframe's first candle of the day starts exactly at
+    /// 09:00 (a 15m bucket is `[09:00,09:15)`). A tick at or before that
+    /// anchor falls in the first bucket.
+    ///
+    /// ⚠ This paragraph read "the **09:15:00 IST market open** … a 15m bucket
+    /// is `[09:15,09:30)`" until 2026-09-18, and the two lines of code
+    /// immediately below it have anchored on 09:00 since the 2026-08-28
+    /// pre-open directive. The inline comment there recorded the move; this
+    /// doc block, which is what a reader and `cargo doc` actually see, did
+    /// not — so the function's own documentation contradicted its body for
+    /// three weeks, and it contradicted it about the exact quantity
+    /// (`ts` bucket boundaries) that decides which candle a tick lands in.
+    ///
+    /// The last sentence of the old text is also gone rather than reworded:
+    /// it said the market-hours gate "keeps genuine pre-open ticks out
+    /// anyway", which the same 2026-08-28 directive reversed — pre-open ticks
+    /// from 09:00 are now deliberately folded.
     ///
     /// `tick_ist_secs` MUST be the IST epoch second derived from the
     /// WS LTT field (NEVER `Utc::now()` per `data-integrity.md`).
@@ -1172,16 +1223,25 @@ mod tests {
         assert_eq!(sorted, TfIndex::ALL);
     }
 
-    /// The operator-requested set is EXACTLY the thirteen of Quote 13.
+    /// The operator-requested set is EXACTLY the nine native frames of the
+    /// 2026-09-18 directive.
     ///
     /// Both halves are named individually rather than counted. A count alone
     /// would pass if a requested frame were swapped for an unrequested one,
-    /// and that is precisely the mistake available here: eleven unrequested
-    /// second-scale variants sit immediately adjacent to the five wanted ones
-    /// (`S4`/`S5`/`S6`, `S14`/`S15`), so an off-by-one in either direction is
-    /// a plausible edit that a length check would wave through.
+    /// and that is precisely the mistake available here: the enum's
+    /// second-scale variants sit immediately adjacent to one another
+    /// (`S2`/`S3`/`S4`, `S4`/`S5`/`S6`), so an off-by-one in either direction
+    /// is a plausible edit that a length check would wave through — and the
+    /// 2026-09-18 change is itself exactly such an edit, moving `S3` in and
+    /// `S10`/`S15`/`S30`/`M2` out.
+    ///
+    /// The four that LEFT get their own assertion block rather than being
+    /// folded in with the never-requested eleven, for the same reason `D1`
+    /// has always had its own: "asked for, then withdrawn" and "never asked
+    /// for" are different facts, and a reader restoring one of them needs to
+    /// see which it is.
     #[test]
-    fn tf_index_operator_set_is_twelve() {
+    fn tf_index_operator_set_is_the_operators_nine() {
         let requested: Vec<TfIndex> = TfIndex::ALL
             .iter()
             .copied()
@@ -1190,21 +1250,20 @@ mod tests {
 
         assert_eq!(
             requested.len(),
-            12,
-            "operator Quote 13 (2026-08-08) named 13; the 2026-08-25 directive removed \
-             D1, leaving 12. Found {}. Changing this set needs a fresh dated quote.",
+            9,
+            "operator directive 2026-09-18 named eleven entries: `ticks` (not a \
+             candle frame), `10m` (DERIVED from candles_1m, no TfIndex variant) \
+             and these NINE native frames. Found {}. Changing this set needs a \
+             fresh dated quote.",
             requested.len()
         );
 
-        // The twelve that must emit rows.
+        // The nine that must emit rows.
         for tf in [
             TfIndex::S1,
+            TfIndex::S3,
             TfIndex::S5,
-            TfIndex::S10,
-            TfIndex::S15,
-            TfIndex::S30,
             TfIndex::M1,
-            TfIndex::M2,
             TfIndex::M3,
             TfIndex::M5,
             TfIndex::M15,
@@ -1213,24 +1272,36 @@ mod tests {
         ] {
             assert!(
                 tf.is_operator_requested(),
-                "{tf:?} is one of the operator's twelve and must emit rows"
+                "{tf:?} is one of the operator's nine and must emit rows"
             );
         }
 
-        // D1 — removed 2026-08-25. Kept as its OWN assertion rather than
-        // folded into the list below, because it is not "never asked for":
-        // it was requested, then explicitly withdrawn, and a reader needs to
-        // see that difference.
+        // Requested on 2026-08-08, WITHDRAWN on 2026-09-18. Their tables keep
+        // every row already written — the DDL still creates all 24 names and
+        // no populated table is ever dropped (SEBI retention). Only new rows
+        // stop.
+        for tf in [TfIndex::S10, TfIndex::S15, TfIndex::S30, TfIndex::M2] {
+            assert!(
+                !tf.is_operator_requested(),
+                "{tf:?} was dropped from the emission set by the 2026-09-18 \
+                 directive — restoring it needs a fresh dated quote"
+            );
+        }
+
+        // D1 — removed 2026-08-25, for a DIFFERENT reason than the four
+        // above: the operator ruled that a day bar must never be derived from
+        // the internal fold at all, not merely that he no longer wants the
+        // table.
         assert!(
             !TfIndex::D1.is_operator_requested(),
             "operator 2026-08-25: 1d must NEVER be derived from the internal \
              timeframe fold — the live lane must not emit candles_1d"
         );
 
-        // The eleven that exist but were never asked for.
+        // The ten that exist but were NEVER asked for. `S3` left this list on
+        // 2026-09-18; it is now in the requested nine above.
         for tf in [
             TfIndex::S2,
-            TfIndex::S3,
             TfIndex::S4,
             TfIndex::S6,
             TfIndex::S7,

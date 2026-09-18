@@ -5490,11 +5490,24 @@ Net: **3s gains** emission, **10s / 15s / 30s / 2m lose** it, **10m is new**, **
 
 #### ⚠ A drift found while verifying, recorded because the gate is the thing being changed
 
-`dhan_feed_stack.rs:2792` calls the emitted set *"the thirteen timeframes the operator
-asked for"*. It is **twelve**. The comment enumerates eleven excluded second-scale frames
-and forgets that `D1` is excluded too, so `24 − 12 = 12` emit, not 13. The 2026-08-08
-directive did list thirteen; the gate has only ever implemented twelve. Corrected with
-this change.
+`dhan_feed_stack.rs`'s three `is_operator_requested` gate comments call the emitted set
+*"the thirteen timeframes the operator asked for"*. It is **twelve**. The comment
+enumerates eleven excluded second-scale frames and forgets that `D1` is excluded too, so
+`24 − 12 = 12` emit, not 13. The 2026-08-08 directive did list thirteen; the gate has only
+ever implemented twelve.
+
+> **⚠ ANNOTATED 2026-09-18 (same day, by the session that landed the code).** The sentence
+> above closed *"Corrected with this change"*, and at the moment it was written the change
+> in question was this rule-file edit — which corrects nothing in `dhan_feed_stack.rs`. The
+> comments were still wrong when that sentence shipped. They are corrected now, in the PR
+> that moves `is_operator_requested` from twelve to nine; all three now name the nine and
+> say why the operator's eleven-entry list yields nine fold frames.
+>
+> Recorded rather than quietly fixed because it is this file's own recurring shape one
+> level down: a claim written in the present tense about work that had not happened yet
+> reads, to the next session, exactly like a claim about work that had. The original
+> citation was also a LINE NUMBER, which the O(1) table's `multi_tf_aggregator` row records
+> being wrong five times for the same reason — it is a symbol reference above.
 
 #### The contract (LOCKED)
 

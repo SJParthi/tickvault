@@ -184,6 +184,25 @@ pub fn spawn_day_ohlc_tick_consumer(
                     // a tick lands in, which tick owns a close) moved to the
                     // receipt clock in the aggregator where it belongs.
                     //
+                    // ✅ 2026-09-18: THIS SITE IS NO LONGER AN EXCEPTION.
+                    // The operator's ts-bucketing directive moved the
+                    // aggregator BACK to the exchange stamp
+                    // (`websocket-connection-scope-lock.md`, section
+                    // "2026-09-18 (SECOND)"), so the sentence above about
+                    // ordering living on the receipt clock is stale: there is
+                    // no second clock in the fold any more. This gate is
+                    // unchanged and needs no change — it was written on the
+                    // trade's own clock and the rest of the system has now
+                    // converged onto it.
+                    //
+                    // Worth keeping the whole block rather than trimming it to
+                    // the conclusion: it records an adversarial sweep
+                    // catching a real pre-open admission bug in a draft, and
+                    // the reasoning ("a window is a comparison against a
+                    // clock, so moving the clock moves the boundary") is what
+                    // must be re-applied if anyone ever proposes moving this
+                    // gate again.
+                    //
                     // A dormant contract whose last print was days ago is
                     // refused here, and that is correct rather than a loss:
                     // it has no day OHLC today to record.
