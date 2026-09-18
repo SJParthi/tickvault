@@ -243,10 +243,28 @@ fn candle_tables_are_swept_via_single_source() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let pm =
         fs::read_to_string(src.join("partition_manager.rs")).expect("read partition_manager.rs");
+    // 2026-09-18 — assert the EMITTED accessor by name, not by substring.
+    //
+    // `emitted_candle_table_names()` CONTAINS the literal `candle_table_names()`,
+    // so the original `pm.contains("candle_table_names()")` check passed
+    // unchanged the moment retention was re-pointed at the filtered set — a
+    // guard satisfied by the very edit it exists to notice. Both directions are
+    // pinned now: the emitted accessor must be present, and the unfiltered one
+    // must NOT be, because sweeping all TF_COUNT names asks QuestDB about
+    // fifteen dropped tables once per retention cycle forever.
     assert!(
-        pm.contains("candle_table_names()"),
-        "partition_manager must sweep candle tables via candle_table_names() — the candle \
-         retention loop is missing (the #1022 phantom-`_shadow`-name bug would return)"
+        pm.contains("emitted_candle_table_names()"),
+        "partition_manager must sweep candle tables via emitted_candle_table_names() — \
+         the candle retention loop is missing (the #1022 phantom-`_shadow`-name bug \
+         would return)"
+    );
+    assert!(
+        !pm.split("#[cfg(test)]")
+            .next()
+            .unwrap_or("")
+            .contains("shadow_persistence::candle_table_names()"),
+        "partition_manager must NOT sweep the unfiltered TF_COUNT set — the retired \
+         frames have no table, so every cycle would log a warn for each of them"
     );
 
     let names = tickvault_storage::shadow_persistence::candle_table_names();
@@ -308,4 +326,79 @@ fn candle_tables_are_swept_via_single_source() {
             "candle table name must be plain candles_<TF> (no _shadow): {n}"
         );
     }
+}
+
+/// The emitted and retired candle-name sets must PARTITION the ordinal set:
+/// disjoint, and together exactly `candle_table_names()`.
+///
+/// Added 2026-09-18 with the nine-frame directive. Without it the two
+/// accessors can drift in the one direction that is silent: a name in
+/// NEITHER set is a table that is never created AND never dropped, so it
+/// survives forever as an orphan with no writer and no retention sweep —
+/// the phantom-table class this file's sibling test was written for, arriving
+/// through the new accessor instead of through a `_shadow` suffix.
+#[test]
+fn emitted_and_retired_candle_names_partition_the_ordinal_set() {
+    use std::collections::BTreeSet;
+
+    let all: BTreeSet<&str> = tickvault_storage::shadow_persistence::candle_table_names()
+        .iter()
+        .copied()
+        .collect();
+    let emitted: BTreeSet<&str> =
+        tickvault_storage::shadow_persistence::emitted_candle_table_names()
+            .into_iter()
+            .collect();
+    let retired: BTreeSet<&str> =
+        tickvault_storage::shadow_persistence::retired_candle_table_names()
+            .into_iter()
+            .collect();
+
+    let overlap: Vec<_> = emitted.intersection(&retired).collect();
+    assert!(
+        overlap.is_empty(),
+        "a candle table is both created and dropped in the same boot: {overlap:?}"
+    );
+
+    let union: BTreeSet<&str> = emitted.union(&retired).copied().collect();
+    let orphans: Vec<_> = all.difference(&union).collect();
+    assert!(
+        orphans.is_empty(),
+        "these candle tables are in NEITHER set — never created, never dropped, \
+         never swept: {orphans:?}"
+    );
+    assert_eq!(
+        union, all,
+        "emitted + retired must be exactly the ordinal set"
+    );
+
+    // Anti-vacuity in both directions: an empty emitted set would mean no candle
+    // is ever written, and an empty retired set would mean this whole change is
+    // a no-op. Either would leave every assertion above trivially true.
+    assert!(
+        !emitted.is_empty() && !retired.is_empty(),
+        "both sets must be non-empty or the partition assertions are vacuous"
+    );
+
+    // The operator's 2026-09-18 directive names the frames that keep a TABLE.
+    // `candles_10m` is deliberately absent: 10m is a DERIVED VIEW over
+    // candles_1m, not a fold frame, so it has no ordinal and no table here.
+    let want: BTreeSet<&str> = [
+        "candles_1s",
+        "candles_3s",
+        "candles_5s",
+        "candles_1m",
+        "candles_3m",
+        "candles_5m",
+        "candles_15m",
+        "candles_30m",
+        "candles_60m",
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        emitted, want,
+        "the emitted candle tables must be exactly the operator's nine fold frames \
+         (10m is a derived view, not a table)"
+    );
 }

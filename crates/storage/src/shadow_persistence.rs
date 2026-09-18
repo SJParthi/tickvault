@@ -160,6 +160,49 @@ pub fn candle_table_names() -> [&'static str; TF_COUNT] {
     names
 }
 
+/// The candle tables that are actually WRITTEN — one per timeframe whose
+/// [`TfIndex::is_operator_requested`] is true.
+///
+/// ## Why this exists separately from [`candle_table_names`]
+///
+/// `candle_table_names()` MUST stay `[_; TF_COUNT]` and ordinal-aligned: the
+/// seal-writer chain indexes its `[Sender; TF_COUNT]` ILP sender array by
+/// `TfIndex as usize`, so narrowing that array would silently re-point every
+/// frame at the wrong table. This function is the DDL/retention view of the
+/// same set — a filtered `Vec`, never an ordinal index.
+///
+/// The operator's 2026-09-18 directive keeps exactly eleven frames: `ticks`
+/// plus `1s 3s 5s 1m 3m 5m 10m 15m 30m 60m`, of which `10m` is a derived VIEW
+/// over `candles_1m` (`console_views::candles_10m_view_ddl`) and not a fold
+/// frame. So NINE tables are created here, and the remaining fifteen ordinals
+/// get no table at all — see [`retired_candle_table_names`].
+#[must_use]
+// TEST-EXEMPT: pure filter over the ordinal array; pinned by test_emitted_and_retired_partition_the_ordinal_set.
+pub fn emitted_candle_table_names() -> Vec<&'static str> {
+    TfIndex::ALL
+        .iter()
+        .filter(|tf| tf.is_operator_requested())
+        .map(|tf| tf.table_name())
+        .collect()
+}
+
+/// The complement of [`emitted_candle_table_names`]: candle tables whose
+/// timeframe no longer emits, and which therefore must not exist.
+///
+/// Fed to [`drop_retired_candle_tables`]. Derived, never a hand-written list —
+/// a hand-written list is what goes stale the next time the operator moves the
+/// frame set, and this repository has now been bitten by a stale hand-written
+/// table ledger twice.
+#[must_use]
+// TEST-EXEMPT: pure filter over the ordinal array; pinned by test_emitted_and_retired_partition_the_ordinal_set.
+pub fn retired_candle_table_names() -> Vec<&'static str> {
+    TfIndex::ALL
+        .iter()
+        .filter(|tf| !tf.is_operator_requested())
+        .map(|tf| tf.table_name())
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // DDL setup — idempotent CREATE + DEDUP UPSERT.
 //
@@ -232,7 +275,10 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) -> bool
     };
 
     let mut all_keyed = true;
-    for table in candle_table_names() {
+    // 2026-09-18 — the EMITTED set, not all TF_COUNT ordinals. `drop_retired_candle_tables`
+    // drops the other fifteen; creating them here in the same boot would undo that drop
+    // silently and leave a keyless auto-create window behind it.
+    for table in emitted_candle_table_names() {
         // Schema self-heal: candle tables created before the
         // security_id LONG fix have `security_id` / `tick_count` typed
         // INT. The ILP seal writer sends them via `column_i64` (LONG);
@@ -761,6 +807,146 @@ pub async fn drop_legacy_candle_objects(questdb_config: &QuestDbConfig) {
 /// after restoring from an older QuestDB backup that still has the
 /// legacy matviews), delete the file.
 const LEGACY_DROP_MARKER_PATH: &str = "data/state/legacy_candle_objects_dropped.marker";
+
+// ---------------------------------------------------------------------------
+// Retired-timeframe candle tables (operator directive 2026-09-18)
+// ---------------------------------------------------------------------------
+
+/// One-shot marker for the retired-timeframe sweep.
+///
+/// DELIBERATELY SEPARATE from [`LEGACY_DROP_MARKER_PATH`], and the reason is
+/// the whole design of this sweep: bumping `LEGACY_DROP_SWEEP_VERSION` to
+/// re-arm the legacy loop would also re-run its step 2, which is an
+/// unconditional `DROP TABLE IF EXISTS candles_1s` — and `candles_1s` is one
+/// of the NINE tables the operator KEEPS. Re-arming the legacy sweep to drop
+/// fifteen retired tables would destroy a kept table's history as a side
+/// effect. Its own marker re-arms nothing.
+const RETIRED_CANDLE_DROP_MARKER_PATH: &str = "data/state/retired_candle_tables_dropped.marker";
+
+/// Bump when [`retired_candle_table_names`] GAINS a name, so every deployment
+/// re-runs the sweep exactly once for the wider set and then re-parks.
+/// Version history:
+/// - 1: the fifteen ordinals left non-emitting by the 2026-09-18 nine-frame
+///   directive (`D1`, `S2 S4 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S30`, `M2`).
+const RETIRED_CANDLE_DROP_SWEEP_VERSION: u32 = 1;
+
+fn retired_candle_marker_content() -> String {
+    format!(
+        "retired candle table drop sweep complete on this deployment.\n\
+         sweep_version={RETIRED_CANDLE_DROP_SWEEP_VERSION}\n"
+    )
+}
+
+fn retired_candle_marker_is_current(content: &str) -> bool {
+    content
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("sweep_version="))
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+        >= RETIRED_CANDLE_DROP_SWEEP_VERSION
+}
+
+/// Drop every candle table whose timeframe no longer emits.
+///
+/// MUST be awaited at boot BEFORE [`ensure_shadow_candle_tables`], which is
+/// now filtered to [`emitted_candle_table_names`] and will therefore not
+/// recreate what this drops. Running it AFTER the ensure would be harmless
+/// today but leaves the ordering fragile; the boot wiring pins the order.
+///
+/// Both object forms are swept for each name. A `candles_<tf>` name can be a
+/// plain table (Engine-B, every era since 2026-05) or a MATERIALIZED VIEW (the
+/// pre-#T1 architecture), and `DROP ... IF EXISTS` against the wrong form is a
+/// logged warn, never a blocker. Matviews go first: a base table with live
+/// dependents refuses to drop.
+///
+/// ## What this does NOT do (Rule 11 — no false-OK)
+///
+/// It does not reclaim the rows of a frame that is still emitting, and it does
+/// not touch `ticks`, `market_depth` or any SEBI table. Eleven of the fifteen
+/// names have had no writer since the 2026-09-05 wipe and are expected to be
+/// absent entirely — for those the DROP is a 2xx no-op and the reclaimed bytes
+/// are metadata, not gigabytes. The four that DID hold data (`candles_10s`,
+/// `candles_15s`, `candles_30s`, `candles_2m`) emitted between 2026-09-05 and
+/// 2026-09-18 under the earlier twelve-frame gate, so this is a one-off
+/// reclaim of that window, never a recurring saving.
+// TEST-EXEMPT: requires a running QuestDB; the name set and the marker gate are unit-tested, the DDL round-trip is boot-integration + `make doctor`. WIRING-EXEMPT: boot wiring lives in crates/app/src/candle_ddl_boot.rs, pinned by crates/app/tests/ensure_ddl_boot_wiring_guard.rs.
+pub async fn drop_retired_candle_tables(questdb_config: &QuestDbConfig) {
+    let marker_path = std::path::Path::new(RETIRED_CANDLE_DROP_MARKER_PATH);
+    if marker_path.exists()
+        && let Ok(content) = std::fs::read_to_string(marker_path)
+        && retired_candle_marker_is_current(&content)
+    {
+        tracing::debug!(
+            marker = RETIRED_CANDLE_DROP_MARKER_PATH,
+            version = RETIRED_CANDLE_DROP_SWEEP_VERSION,
+            "retired candle tables already swept at the current version — skipping"
+        );
+        return;
+    }
+
+    let retired = retired_candle_table_names();
+    if retired.is_empty() {
+        return;
+    }
+
+    let base_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+    let client = match Client::builder()
+        .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            error!(
+                error = %err,
+                code = tickvault_common::error_code::ErrorCode::HttpClient01BuildFailed.code_str(),
+                "HTTP-CLIENT-01 reqwest client build failed — retired-candle sweep skipped \
+                 this boot (marker not written, so the next boot retries)"
+            );
+            metrics::counter!(
+                "tv_http_client_build_failed_total",
+                "site" => "shadow_drop_retired_candles"
+            )
+            .increment(1);
+            return;
+        }
+    };
+
+    for name in &retired {
+        let ddl = format!("DROP MATERIALIZED VIEW IF EXISTS {name};");
+        run_drop_ddl(&client, &base_url, name, &ddl).await;
+    }
+    for name in &retired {
+        let ddl = format!("DROP TABLE IF EXISTS {name};");
+        run_drop_ddl(&client, &base_url, name, &ddl).await;
+    }
+
+    if let Some(parent) = marker_path.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!(
+            ?err,
+            path = %parent.display(),
+            "failed to create data/state/ dir for the retired-candle marker"
+        );
+        return;
+    }
+    if let Err(err) = std::fs::write(marker_path, retired_candle_marker_content()) {
+        tracing::warn!(
+            ?err,
+            path = RETIRED_CANDLE_DROP_MARKER_PATH,
+            "failed to write the retired-candle marker (sweep repeats next boot)"
+        );
+    } else {
+        tracing::info!(
+            dropped = retired.len(),
+            path = RETIRED_CANDLE_DROP_MARKER_PATH,
+            "retired candle tables swept — marker written"
+        );
+    }
+}
 
 /// Track A (2026-07-18) — the one-shot marker is now VERSIONED. Bump this
 /// integer whenever the drop set is EXTENDED (new retired tables/matviews)
