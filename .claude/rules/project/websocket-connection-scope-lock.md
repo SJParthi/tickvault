@@ -5451,3 +5451,135 @@ any code). Summary of what it settles, all Verified in source:
 **What this section does NOT authorize:** any change to the socket budget (16),
 the endpoint types (4), the order-side REST surface, `dry_run`, the §28 frozen
 indicator/strategy area, or any deletion of a SEBI/audit table row.
+
+### 2026-09-18 — ELEVEN TIMEFRAMES, ONE SIGNED VOLUME, AND `top_volume` ORDERED BY VOLUME-PERCENTAGE CHANGE
+
+**The verbatim operator demands (2026-09-18 and the two sessions before it — preserve
+EXACTLY, typos included):**
+
+**Quote A (the timeframe + column requirement, stated twice, verbatim the second time):**
+> "See as of now we will have one and only candles tables timeframe which is ticks, 1s, 3s, 5s, 1m, 3m, 5m, 10m, 15m, 30m, 60m right dude only these timeframes alone dude okay? See meanwhile in all these tables also we planned to remove net volume right dude and instead of this net volume we just planned to use one and only direct volume where it should accept m nus symbol right dude because our current volume is providing the precise timeframe timestamps jet volume dude okay? See meanwhile in top volume table also just have one and only 1s, 3s, 5s and 1m table where it shoudl also delete this net volume column and where it should have one and only direct volume precise to candles table dude so that obviously it will have the precise direct volume right dude precise to candles table volume right dude so both of them should be precisely matchable right dude even in our top volume table right dude so even here also we shoudl remove net volume column right dude meanwhile in top volume by default our plan is to always have the volume percentage change desc for every timeframe of its respective timestamps right dude am I right dude check whether all these in place or not dude okay?"
+
+**Quote B (the sign rule, with two Dhan chart screenshots attached):**
+> "see its simple our current volume si rpecisley correct dude but we just need to accept this negative sign thats it dude okay see ebcause if we see the rpecise volue anyhwo it is the net volume rigth if you see in dhan cahrts based on previous timeframe timestampt comapred to oits current tienfraen current tiemstamp if the close is lesser tehn its negative right dude am i irgith dude tlel me udd eokay?"
+
+**Quote C (2026-09-18 — the `10m` ruling and the authorization):**
+> "no 10s derive the 10m dude okay see whatver i asked use eevrythign as the main requirmenet dude okay?"
+
+Quote C answers the two questions this session put to the operator: `10m` is REAL and is
+to be **DERIVED** (not a typo for `10s`), and the whole of Quote A is the specification.
+This dated section is the rule-file-first record required before any timeframe or schema
+code moves.
+
+#### What this SUPERSEDES
+
+`daily-universe-scope-expansion-2026-05-27.md` §0 Quote 13 (2026-08-08) specified
+**thirteen** current-day timeframes — `1s/5s/10s/15s/30s · 1m/2m/3m/5m/15m/30m/60m · 1d`.
+That list is REPLACED by Quote A's set. Recorded rather than silently overwritten,
+because the 2026-08-08 set is why `TfIndex::is_operator_requested()` reads the way it
+does, and a reader of that gate needs to know which directive it now answers to.
+
+| | 2026-08-08 (Quote 13) | **2026-09-18 (Quote A)** |
+|---|---|---|
+| Candle frames | 13 | **10** + the `ticks` table |
+| Second-scale | 1s, 5s, 10s, 15s, 30s | **1s, 3s, 5s** |
+| Minute-scale | 1m, 2m, 3m, 5m, 15m, 30m, 60m | **1m, 3m, 5m, 10m, 15m, 30m, 60m** |
+| Day | 1d | — |
+
+Net: **3s gains** emission, **10s / 15s / 30s / 2m lose** it, **10m is new**, **1d leaves**.
+
+#### ⚠ A drift found while verifying, recorded because the gate is the thing being changed
+
+`dhan_feed_stack.rs:2792` calls the emitted set *"the thirteen timeframes the operator
+asked for"*. It is **twelve**. The comment enumerates eleven excluded second-scale frames
+and forgets that `D1` is excluded too, so `24 − 12 = 12` emit, not 13. The 2026-08-08
+directive did list thirteen; the gate has only ever implemented twelve. Corrected with
+this change.
+
+#### The contract (LOCKED)
+
+| # | Locked value |
+|---|---|
+| 1 | **Candle frames emitting rows: exactly 10** — `1s, 3s, 5s, 1m, 3m, 5m, 10m, 15m, 30m, 60m` — plus the separate `ticks` table. `is_operator_requested()` gains `S3`, loses `S10`/`S15`/`S30`/`M2`. |
+| 2 | **`10m` is DERIVED, never a new fold frame.** No `TfIndex` variant, no ordinal, no `TF_COUNT` change, no seal-ring resize, **zero added per-tick work**. See the derivability proof below — it is what makes Quote C's "derive" both possible and correct. |
+| 3 | **One `volume` column per candle table, signed.** `net_volume` is removed from the `CREATE TABLE` DDL and its `ADD COLUMN IF NOT EXISTS` self-heal is deleted. The column type is already `LONG` (signed); only the writer changes. |
+| 4 | **The sign rule, verbatim from Quote B:** compare this bar's `close` against the PREVIOUS bar's close **of the same timeframe**. Lower → the bar's whole volume is negative. Not lower → positive. The magnitude is **never** altered — Quote B: *"our current volume is precisely correct … we just need to accept this negative sign."* |
+| 5 | **`top_volume` cadences: exactly `1s, 3s, 5s, 1m`** — already true, unchanged. |
+| 6 | **`top_volume` carries one signed per-window `volume` that equals the candle bar's `volume`** for the same instrument and the same window. |
+| 7 | **The four `top_volume_{1s,3s,5s,1m}` views default to `ORDER BY` volume-percentage change `DESC`.** |
+| 8 | **The `ts` offset is closed** — see below; without it clause 6 is unachievable by any column change. |
+
+#### ⚠ Why `10m` is exactly derivable — and the one decision it forces
+
+Under clause 4, `signed = ±gross`, so **`abs(signed) == gross` for every bar**. Nothing is
+lost. A 10-minute bar is therefore recoverable from the 1-minute bars with no extra
+storage and no extra per-tick work: `first(open)`, `max(high)`, `min(low)`, `last(close)`,
+`sum(abs(volume))` for the gross, then clause 4's sign applied at the 10m level against the
+previous 10m close.
+
+**That identity is destroyed if a flat bar is zeroed.** TradingView's built-in Net Volume —
+which is what the Dhan chart in Quote B's screenshots runs — returns `0` when
+`close == close[1]`. Adopting that would make `abs(signed) != gross` for flat bars, and
+`10m` could no longer be derived from `1m` at all.
+
+**DECISION (labelled Assumed, not quoted — the operator did not address the flat case):
+a flat close is POSITIVE, not zero.** Grounds: Quote B says the magnitude is already
+correct and the ONLY change is the sign, and its stated rule fires on *"if the close is
+lesser"* alone. Zeroing a bar changes its magnitude, which Quote B excludes.
+
+**⚠ The honest cost of that decision, stated rather than buried:** on a bar whose close
+equals the previous close, the Dhan chart will show `0` and this table will show `+gross`.
+That is a real, visible divergence from the chart Quote B cites, and it is most frequent on
+the `1s` frame, where a flat close is common. It is reversible by a fresh dated quote — but
+reversing it makes `10m` a native fold frame (`TfIndex` ordinal 24, `TF_COUNT` 24 → 25,
+seal ring 600,000 → 625,000, one more scalar fold per tick), which is the more expensive
+shape Quote C's "derive" appears to reject.
+
+#### ⚠ The `ts` offset — clause 6 is impossible without this, and no column change fixes it
+
+MEASURED: **candle bars stamp the window OPEN; `top_volume` rows stamp the window CLOSE.**
+`TfIndex::bucket_start()` returns the window open; `top_volume_snapshot.rs:518` floors the
+snapshot timer's FIRE instant, which is the close. So a `top_volume` row and a
+`candles_<tf>` row carrying the same `ts` describe **different windows**, one period apart,
+on every row of every cadence — while `top_volume_snapshot.rs`'s own module comment claims
+the shared grid anchor "lets a `top_volume` row and a `candles_<tf>` row share a `ts` and be
+joined." It does not. `top_volume` must stamp the window OPEN, and that comment is a claim
+to correct in the same change.
+
+Five further blockers behind it, all recorded so none is rediscovered: `candles_3s` has no
+rows at all until clause 1 lands; the two sides use different clocks (per-tick receipt clock
+vs `now_ist_nanos()` at timer fire); `top_volume` applies a monotonicity re-latch
+(`RELATCH_AFTER_CONSECUTIVE_LOWER = 32`) that candles do not; the populations differ
+(candles = every instrument from 09:00, `top_volume` = option contracts from 09:15); and no
+test, guard or query anywhere cross-references the two tables.
+
+#### ⚠ What this section does NOT authorize (Rule 11)
+
+- **Any physical `DROP COLUMN`.** The candle self-heal is `ADD COLUMN IF NOT EXISTS` and can
+  never drop one, so removing `net_volume` from the DDL leaves the column present with stale
+  data on every existing table. Reclaiming it is an operator `ALTER TABLE … DROP COLUMN`,
+  not a code edit.
+- **Any new `TfIndex` variant or `TF_COUNT` change** — clause 2 exists to avoid exactly that.
+- Any change to the socket budget (16), the four endpoint types, `dry_run`, the §28 frozen
+  indicator/strategy area, or any deletion of a SEBI/audit row.
+- Any claim that this is deployed: push-to-main is path-filtered and the no-deploy band is
+  09:00–15:45 IST Mon–Fri.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Adds a `TfIndex` variant, or changes `TF_COUNT`, to serve `10m`.
+- Derives `10m` by SUMMING the signed 1m volumes — signed volume is **not additive across
+  timeframes** (five 1s bars of `+100, −100, +100, −100, +100` sum to `+100` while the 5s
+  bar reads `±500`). The gross must be summed and the sign applied at the 10m level.
+- Zeroes a flat bar without a fresh dated quote AND making `10m` a native frame in the same
+  change — the two are one decision, not two.
+- Removes `net_volume` from the DDL while leaving the `ADD COLUMN IF NOT EXISTS` self-heal,
+  which silently re-adds it on the next boot.
+- Ships clause 6 while `top_volume` still stamps the window close — the rows cannot match,
+  whatever the columns are called.
+- Leaves `top_volume_snapshot.rs`'s "share a `ts` and be joined" comment standing.
+- Reports clause 1 as done while `candles_3s` still has zero rows, or while `10s`/`15s`/
+  `30s`/`2m` are still emitting.
+- Deletes or weakens `every_sub_minute_frame_sums_to_the_same_minute_net_volume` instead of
+  re-scoping it: under clause 4 that property genuinely no longer holds for the SIGNED
+  number, and it must be re-scoped to the GROSS, not removed.
