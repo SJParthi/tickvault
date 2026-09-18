@@ -683,6 +683,33 @@ impl AggregatorCell {
             // must be measured on the same clock the buckets are. Passed IN,
             // never recomputed — same hot-path contract as `prices` and
             // `cumulative_volume`: derived once per TICK, above the loop.
+            //
+            // ⚠ 2026-09-18: that clock STOPPED BEING MONOTONE, and this line
+            // is deliberately NOT changed. The ts-bucketing directive made
+            // `fold_clock_ist_secs` the exchange stamp, which a vendor can
+            // deliver out of order, so `last_observed_ts` can now move
+            // BACKWARDS where under the receipt clock it never could.
+            //
+            // A monotone `max(..)` was considered and REJECTED, because it
+            // would be the wrong direction: holding the mark forward NARROWS
+            // the attribution interval, which is how an extreme gets credited
+            // to a window it did not happen in. The doc above this function
+            // states the rule it must not break — "a stale packet costs at
+            // worst a MISSED widening, never a wrong one".
+            //
+            // And no change is needed, because the CONSUMER never reads the
+            // ordering: it asks `tf.bucket_start(prev_observed_ts) ==
+            // bucket_start`, i.e. "did the previous observed packet open the
+            // SAME bucket as this one". Two stamps inside one bucket attribute
+            // to that bucket whichever came first, and two stamps in different
+            // buckets REFUSE. That guard's own comment already names the case
+            // ("the packet before was late-routed") — it was written for it.
+            //
+            // So the clock change makes this path refuse MORE often and
+            // mis-attribute never. Recorded rather than silently relied upon:
+            // an adversarial pass flagged this as a HIGH finding, and working
+            // it through says it is not one. Both halves are worth keeping,
+            // because the next reader will have the same suspicion.
             self.last_observed_ts = fold_secs;
         }
 
@@ -2057,8 +2084,9 @@ fn fold_in_bucket(
 /// Folds a LATE tick into an already-sealed bucket's high / low / close.
 ///
 /// `close` is overwritten ONLY when the late tick is genuinely the bucket's
-/// last tick (`fold_secs >= close_ts_ist_secs` — the RECEIPT clock since
-/// 2026-08-28), so an out-of-order EARLIER late tick can never clobber a
+/// last tick (`fold_secs >= close_ts_ist_secs` — the EXCHANGE stamp since the
+/// 2026-09-18 ts-bucketing directive, the RECEIPT clock from 2026-08-28 until
+/// then), so an out-of-order EARLIER late tick can never clobber a
 /// truly-later close. `open` /
 /// `volume` / `oi` are untouched: `open` belongs to the first tick, and the
 /// cumulative snapshots are order-dependent and ambiguous for a latecomer.

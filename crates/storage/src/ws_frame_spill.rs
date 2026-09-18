@@ -75,6 +75,20 @@
 // restores it instead of inventing one. A v1/v2 record replays with `0`, which
 // the persistence layer already maps to NULL - a missing timestamp, never a
 // false one.
+//
+// ⚠ 2026-09-18: THE CANDLE-BUCKETING HALF OF THAT JUSTIFICATION IS GONE, AND
+// v3 IS STILL LOAD-BEARING. The operator's ts-bucketing directive
+// (`websocket-connection-scope-lock.md`, section "2026-09-18 (SECOND)") made
+// `fold_clock_ist_secs` the identity on the exchange stamp, so a replayed
+// frame now buckets on its own trade stamp whatever receipt it carries. Two
+// OTHER consumers still require the persisted receipt, and a cleanup that
+// dropped the field "because we bucket on ts now" would break both:
+//   * the aggregator's CROSS-DAY gates compare the fold day against the
+//     RECEIPT day, so a `now()` re-stamp makes every legitimately replayed
+//     prior-day frame look stale (`multi_tf_aggregator::consume_tick`);
+//   * `row_timestamp_ist_nanos` derives a never-traded tick's `ts` from the
+//     receipt, and `ts` is the first column of the `ticks` DEDUP key — a
+//     re-stamp splits one observation into two rows in two partitions.
 
 use std::fs::{File, OpenOptions}; // O(1) EXEMPT: import line only — uses are the cold writer thread + boot replay
 use std::io::{BufWriter, Read, Write};
@@ -314,6 +328,11 @@ pub struct ReplayedFrame {
     /// is what placed 9.1% of a session's ticks 9-20 hours from their true
     /// arrival — invisible while candles bucketed on the exchange clock, and
     /// data-losing once they bucket on receipt.
+    ///
+    /// ⚠ 2026-09-18: candles bucket on the exchange clock AGAIN, and this
+    /// field is still required — by the aggregator's cross-day gates and by
+    /// `row_timestamp_ist_nanos` (which feeds the `ticks` DEDUP key). See the
+    /// module header for the full record.
     pub received_at_nanos: i64,
     /// TVW4: the socket this frame was captured from, read back from the v4
     /// record. [`WalEndpoint::MainFeed`] for v1–v3 records that predate the
@@ -5973,8 +5992,11 @@ mod tests {
 
     /// T1 — the whole reason v3 exists: a receipt stamped by the caller must
     /// survive the disk round-trip EXACTLY, so boot replay never has to invent
-    /// one. If this regresses, candle bucketing on the receipt clock silently
-    /// files replayed ticks at the wrong minute.
+    /// one. ~~If this regresses, candle bucketing on the receipt clock
+    /// silently files replayed ticks at the wrong minute.~~ 2026-09-18: the
+    /// fold no longer reads the receipt, so the consequence of a regression
+    /// moved rather than disappearing — it is now a cross-day-gate
+    /// misjudgement and a split `ticks` DEDUP key. See the module header.
     #[test]
     fn tvw3_roundtrip_preserves_received_at() {
         let dir = tmp_dir("v3-roundtrip");

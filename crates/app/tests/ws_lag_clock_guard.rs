@@ -32,6 +32,30 @@
 //! A "consistency" refactor that moved every clock read onto `fold_secs` would
 //! look tidy, pass CI, and silently blind the one metric that reports the
 //! vendor delivering late.
+//!
+//! # ⚠ 2026-09-18 — the ARITHMETIC above changed and the RULE did not
+//!
+//! The operator's ts-bucketing directive
+//! (`websocket-connection-scope-lock.md`, section "2026-09-18 (SECOND)") made
+//! `fold_clock_ist_secs` the IDENTITY on the exchange stamp, so the sentence
+//! *"the fold clock IS the receipt whenever the receipt is plausible"* is no
+//! longer true: the fold clock is now the exchange stamp, always.
+//!
+//! **That makes the collapse-to-zero failure UNREACHABLE today — and this
+//! guard stays, unchanged, for two reasons that are stronger than the one it
+//! was written for.**
+//!
+//! 1. The guard pins a SEMANTIC, not a coincidence. `ws_lag_ms` must measure
+//!    exchange-vs-receipt because that is what delivery lag IS. It must keep
+//!    reading the raw stamp even in a world where the fold clock happens to
+//!    equal it, or the next clock change re-opens the hole silently.
+//! 2. The two values converging is exactly what makes a "tidy" refactor
+//!    tempting: substituting `fold_secs` for `tick.exchange_timestamp` is now
+//!    a genuine no-op, so it would pass every behavioural test in the
+//!    workspace — and then blind the metric the day the clocks diverge again.
+//!
+//! The second test in this file asserts the convergence directly, so the
+//! current state is pinned rather than assumed.
 
 use std::path::Path;
 use tickvault_common::source_scan::strip_rust_comments;

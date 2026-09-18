@@ -1063,10 +1063,14 @@ impl MultiTfAggregator {
         // The advance below is `>`, so a tick from the PAST can never move the
         // watermark; the stale-day gate under it is safe for that reason. A
         // tick from the FUTURE had no such guard, and the asymmetry is not
-        // theoretical: `fold_clock_ist_secs` returns the VENDOR's stamp
-        // whenever receipt and exchange disagree by more than the trusted band
-        // (`tf_index.rs`), and a stamp one day ahead disagrees by ~86,400 s —
-        // far outside it. So one clock-fault packet stamped for tomorrow was
+        // theoretical: `fold_clock_ist_secs` returns the VENDOR's stamp.
+        // (Until 2026-09-18 it returned it only when receipt and exchange
+        // disagreed by more than a trusted band, and a stamp one day ahead
+        // disagrees by ~86,400 s — far outside it. Since the ts-bucketing
+        // directive there is no band and no exception: the vendor's stamp is
+        // ALWAYS what buckets, which makes this gate strictly MORE
+        // load-bearing, never less.) So one clock-fault packet stamped for
+        // tomorrow was
         // returned verbatim, advanced the watermark into day D+1, and every
         // honest tick for the REST OF THE SESSION then failed the stale-day
         // gate below: all 24 timeframes stop folding, for every instrument,
@@ -3397,10 +3401,29 @@ mod tests {
     /// seconds-of-day gate below. The cost of this strengthening in production
     /// is therefore zero, and it is stated rather than assumed.
     ///
-    /// What it BUYS is the 2026-09-10 operator row: a connect-snapshot of a
-    /// dormant contract carrying a LAST TRADE TIME from a previous session
-    /// (measured mean 5 hours, max 34 days). Any such snapshot arriving within
-    /// 300 s of its own stale stamp used to sail through this gate.
+    /// ## ⚠ What it buys, corrected the same day — it is NARROWER than the
+    /// ## first draft of this note claimed
+    ///
+    /// That draft said this strengthening buys the 2026-09-10 operator row —
+    /// a connect-snapshot of a dormant contract carrying a LAST TRADE TIME
+    /// from a previous session (measured mean 5 hours, max 34 days). **It
+    /// does not, and the arithmetic says so plainly: a stamp 5 hours old sits
+    /// 18,000 s from its receipt, far outside the retired ±300 s band, so the
+    /// hybrid ALREADY fell back to the exchange stamp and this gate ALREADY
+    /// fired on it.** That case was caught before this change and is caught
+    /// after it; claiming it as a win would be crediting a fix for work the
+    /// old code did.
+    ///
+    /// What it ACTUALLY buys is the one shape the band could hide: a stamp and
+    /// a receipt WITHIN 300 s of each other that nonetheless STRADDLE IST
+    /// midnight — precisely this test's fixture. Under the hybrid `fold_secs`
+    /// was the receipt, so `fold_day == receipt_day` and the gate was
+    /// arithmetically incapable of firing. Under the identity it fires.
+    ///
+    /// Narrow, and worth having anyway: a gate that cannot fire on its own
+    /// fixture is the class this repository keeps having to correct, and the
+    /// band is exactly where a stale stamp is hardest to tell from a fresh
+    /// one by eye.
     #[test]
     fn a_tick_stamped_before_ist_midnight_and_received_after_it_is_stale() {
         let mut agg = MultiTfAggregator::default();
