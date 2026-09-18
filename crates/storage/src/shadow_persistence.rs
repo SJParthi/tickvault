@@ -28,19 +28,37 @@
 //!     high                     DOUBLE,
 //!     low                      DOUBLE,
 //!     close                    DOUBLE,
-//!     volume                   LONG,
+//!     volume                   LONG,   -- SIGNED: see the note below
 //!     oi                       LONG,
 //!     tick_count               LONG,
 //!     close_pct_from_prev_day  DOUBLE,
 //!     open_pct                 DOUBLE,
 //!     change_pct               DOUBLE,
 //!     open_gap_pct             DOUBLE,
-//!     net_volume               LONG,
 //!     total_buy_qty            LONG,
 //!     total_sell_qty           LONG
 //! ) timestamp(ts) PARTITION BY DAY
 //!   DEDUP UPSERT KEYS(ts, security_id, segment, feed);
 //! ```
+//!
+//! # `volume` is SIGNED, and `net_volume` is gone (2026-09-18)
+//!
+//! `volume` carries the bar's GROSS traded quantity with the bar's DIRECTION
+//! in its sign: negative when this bar's close is below the previous bar's
+//! close of the SAME timeframe, positive otherwise — including a flat bar, a
+//! session's first bucket, and an unorderable previous close, none of which
+//! means "the close rose". `abs(volume)` is exactly what this column held
+//! before it was signed, which is what keeps a derived `10m` bar summable and
+//! lets a view render the chart-exact zero-on-flat form.
+//!
+//! ⚠ It is NOT net order flow. The tick-rule flow column `net_volume` is
+//! DELETED — from this `CREATE`, from its `ADD COLUMN IF NOT EXISTS`
+//! self-heal, and from the `candles_named` view, all in one change so the next
+//! boot cannot re-add it. Existing tables keep the column with its historical
+//! rows; nothing drops it, and nothing writes it again. The operator ruling
+//! and what it costs are recorded in
+//! `.claude/rules/project/websocket-connection-scope-lock.md`
+//! § "2026-09-18 (FOURTH)".
 //!
 //! `close_pct_from_prev_day` (re-added 2026-05-28, PR-4b) is the seal-time
 //! price % vs the previous-day close, sourced live from the tick `close`
@@ -246,7 +264,6 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) -> bool
                 open_pct                    DOUBLE, \
                 change_pct                  DOUBLE, \
                 open_gap_pct                DOUBLE, \
-                net_volume                  LONG, \
                 total_buy_qty               LONG, \
                 total_sell_qty              LONG\
             ) timestamp(ts) PARTITION BY DAY \
@@ -308,9 +325,6 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) -> bool
         // Additive + idempotent like every self-heal above: an existing table
         // gains the columns with NULLs for its historical rows, and no
         // populated table is ever dropped (SEBI retention).
-        let alter_net_volume =
-            format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS net_volume LONG;");
-        let _ = run_ddl(&client, &base_url, table, &alter_net_volume).await;
         let alter_total_buy_qty =
             format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS total_buy_qty LONG;");
         let _ = run_ddl(&client, &base_url, table, &alter_total_buy_qty).await;

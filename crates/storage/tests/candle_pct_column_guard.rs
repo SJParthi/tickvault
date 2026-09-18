@@ -234,22 +234,16 @@ fn self_test_code_only_strips_comments_keeps_code() {
 }
 
 // ============================================================================
-// 7. Net volume + the book totals — the SAME five-link chain.
+// 7. The book totals — the SAME five-link chain.
 //
-//    These are LONG columns, not DOUBLE, and `net_volume` is the one column in
-//    the whole candle schema that is deliberately OMITTED rather than
-//    zero-filled when absent: omitting an ILP column persists NULL, and NULL is
-//    the honest value for "this process did not classify this bar's flow" — a
-//    disk-spill replay, a REST-folded bar, or a bar with no ticks or no volume.
-//    Writing `0` would claim perfectly balanced flow about a bar nobody
-//    measured, and would draw a FLAT bar on a chart. That distinction is the
-//    thing most likely to be "tidied away" by a future refactor, so it is
-//    pinned by name here.
-//
-//    ⚠ CORRECTED 2026-09-10: the NULL reason above read "there was no previous
-//    bar to compare against", which belonged to the retired close-vs-close
-//    definition. `net_volume` is now tick-rule signed order flow, and a
-//    first-of-day bar with ticks reports a real value rather than NULL.
+//    ⚠ 2026-09-18: this section used to be "Net volume + the book totals" and
+//    described `net_volume` as the one candle column deliberately OMITTED
+//    rather than zero-filled, so an absent classification persisted as NULL.
+//    That column is DELETED by the 2026-09-18 directive and `volume` carries
+//    the sign instead; the two tests that pinned it are replaced further down
+//    by their inverses. The text is corrected rather than dropped because a
+//    reader arriving from the retired test names needs to find out where the
+//    behaviour went.
 // ============================================================================
 
 /// Assert a LONG candle column is wired across DDL, ALTER self-heal, ILP
@@ -302,12 +296,16 @@ fn assert_long_column_wired_end_to_end(col: &str, row_type: &str) {
     );
 }
 
-#[test]
-fn net_volume_column_wired_end_to_end() {
-    // `Option<i64>`, not `i64`: the Option IS the NULL, and collapsing it to a
-    // bare i64 is exactly the regression this pins.
-    assert_long_column_wired_end_to_end("net_volume", "Option<i64>");
-}
+// ⚠ RETIRED 2026-09-18 — `net_volume_column_wired_end_to_end` and
+// `net_volume_is_written_conditionally_so_absent_persists_as_null` are GONE,
+// and the two tests below pin the OPPOSITE. The operator's 2026-09-18
+// directive deletes the `net_volume` column and signs `volume` instead; the
+// ruling, and what it costs, are recorded in
+// `.claude/rules/project/websocket-connection-scope-lock.md`
+// § "2026-09-18 (FOURTH)". The tests are replaced rather than deleted because
+// a column removed from the CREATE while its `ADD COLUMN IF NOT EXISTS`
+// self-heal survives is silently re-added on the next boot — that is a named
+// REJECT in the rule section, and it needs a ratchet, not a comment.
 
 #[test]
 fn total_buy_qty_column_wired_end_to_end() {
@@ -320,27 +318,61 @@ fn total_sell_qty_column_wired_end_to_end() {
 }
 
 #[test]
-fn net_volume_is_written_conditionally_so_absent_persists_as_null() {
-    // The behavioural half the presence checks above cannot see: the write
-    // must sit behind an `if let Some(...)`. An unconditional
-    // `.column_i64("net_volume", row.net_volume.unwrap_or(0))` would satisfy
-    // every other assertion in this file while silently turning "no previous
-    // bar" into "the price did not move" on every first bar of every session,
-    // for all 24 timeframes, forever.
-    let (path, raw) = storage_src("shadow_candle_writer.rs");
+fn net_volume_is_gone_from_every_link_of_the_chain() {
+    // The inverse of `assert_long_column_wired_end_to_end`, over the same five
+    // links. One surviving link is enough to resurrect the column: the ALTER
+    // self-heal alone re-adds it on the next boot, and a view that names it
+    // fails to CREATE on a fresh volume.
+    for (file, what) in [
+        (
+            "shadow_persistence.rs",
+            "the CREATE DDL and its ALTER self-heal",
+        ),
+        ("shadow_seal_columns.rs", "the seal-row struct"),
+        ("shadow_candle_writer.rs", "the ILP write"),
+        ("console_views.rs", "the `candles_named` view"),
+    ] {
+        let (path, raw) = storage_src(file);
+        let code = code_only(&raw);
+        // `net_volume_chg_milli_pct` is a DIFFERENT column on a DIFFERENT
+        // table (`top_volume`), it is the one the operator asked to sort by,
+        // and it carries `net_volume` as a prefix — so match the bare word.
+        for hit in [
+            "\"net_volume\"",
+            "net_volume:",
+            "net_volume LONG",
+            "c.net_volume",
+        ] {
+            assert!(
+                !code.contains(hit),
+                "{}: `{hit}` still present in {what}. The 2026-09-18 directive \
+                 deletes the `net_volume` candle column; every link must go in \
+                 ONE change or the next boot re-adds it.",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn the_persisted_volume_is_the_signed_one() {
+    // The behavioural half no presence check can see. `volume` must be read
+    // from `LiveCandleState::signed_volume()`, which owns the sign rule in one
+    // place. A regression to `i64::try_from(seal.state.volume)` — the shape
+    // this replaced — compiles, passes every column-presence assertion, and
+    // silently un-signs every candle in the database.
+    let (path, raw) = storage_src("shadow_seal_columns.rs");
     let code = code_only(&raw);
     assert!(
-        code.contains("if let Some(net_volume) = row.net_volume"),
-        "{}: `net_volume` must be written only when present, so an absent \
-         baseline persists as NULL rather than as a fabricated flat bar. \
-         Restore the `if let Some(net_volume) = row.net_volume` guard.",
+        code.contains("seal.state.signed_volume()"),
+        "{}: the persisted `volume` must come from \
+         `LiveCandleState::signed_volume()` (2026-09-18 directive).",
         path.display()
     );
     assert!(
-        !code.contains("row.net_volume.unwrap_or(0)"),
-        "{}: never zero-fill `net_volume`. `0` means the price did not move; \
-         NULL means there was no previous bar. Collapsing them makes the \
-         day's first bar indistinguishable from a flat one.",
+        !code.contains("i64::try_from(seal.state.volume)"),
+        "{}: `volume` must NOT be widened straight from the unsigned state \
+         field — that is the un-signed shape this replaced.",
         path.display()
     );
 }

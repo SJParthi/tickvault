@@ -90,9 +90,29 @@ pub struct ShadowSealRow {
     pub low: f64,
     /// `LiveCandleState::close` — already `f64`.
     pub close: f64,
-    /// `LiveCandleState::volume` (`u64`) widened with saturation to
-    /// `i64`. Volumes ≥ `i64::MAX` would saturate (impossible in
-    /// practice).
+    /// The bar's **SIGNED GROSS VOLUME** — every unit that traded in the
+    /// bucket, carrying the bar's direction in its sign.
+    ///
+    /// Read from [`LiveCandleState::signed_volume`], which owns the whole
+    /// rule: negative when this bar's `close` is BELOW the previous bar's
+    /// close of the same timeframe, positive otherwise. The MAGNITUDE is the
+    /// unaltered gross volume, so `abs(volume)` is exactly what this column
+    /// held before it was signed.
+    ///
+    /// ⚠ **Three separate cases print POSITIVE and none of them means "the
+    /// close rose"**: a flat bar, the session's first bucket (no previous
+    /// close), and a previous close that cannot be ordered. Positive is the
+    /// default, not an assertion.
+    ///
+    /// ⚠ **This is NOT net order flow.** A bar that traded 1,000 into the bid
+    /// and 900 into the offer and closed one tick up reports `+1_900`, not
+    /// `-100`. The tick-rule flow value is no longer persisted anywhere —
+    /// the trade, and the operator ruling behind it, are recorded in
+    /// `websocket-connection-scope-lock.md` § "2026-09-18 (FOURTH)".
+    ///
+    /// Widened from the state's `u64` with saturation at `i64::MAX`
+    /// (impossible in practice; a saturating read stays a plausible
+    /// "impossibly large" rather than wrapping to a fake sell bar).
     pub volume: i64,
     /// `LiveCandleState::oi` — already `i64`.
     pub oi: i64,
@@ -120,38 +140,6 @@ pub struct ShadowSealRow {
     /// (today's 09:15 open vs yesterday's close). Lands in the
     /// `open_gap_pct` DOUBLE column (operator request 2026-06-02).
     pub open_gap_pct: f64,
-    /// The bar's SIGNED ORDER FLOW — buy-initiated volume minus sell-initiated
-    /// volume, accumulated per tick under the classic tick rule: an uptick is
-    /// buy-initiated, a downtick sell-initiated, and an unchanged price carries
-    /// the previous direction. `|net_volume| <= volume` always holds, because
-    /// both are summed from the same per-tick cumulative delta.
-    ///
-    /// ⚠ **CORRECTED 2026-09-10 — this doc described the OLD, WRONG definition
-    /// until today**, and it is the doc a reader lands on from the type. It
-    /// said "positive when the bar closed above the previous bar, negative when
-    /// below". That was bar DIRECTION applied to the whole bar's volume, which
-    /// inverts exactly when a bar's flow and its close disagree — the case
-    /// somebody consults this column to find. It also claimed the value "costs
-    /// no per-instrument RAM"; it costs 8 bytes on `LiveCandleState`. The
-    /// conversion site below was corrected in the same change that fixed the
-    /// arithmetic; this field doc was not, which is why it is annotated rather
-    /// than quietly rewritten.
-    ///
-    /// **`None` no longer means "the day's first bar".** A first bar with ticks
-    /// IS classified and DOES report flow. `None` now means **this process did
-    /// not classify the bar** — a disk-spill replay (the 128-byte record cannot
-    /// carry the accumulator), a REST-folded bar, a bar with no ticks, or a bar
-    /// with zero volume. That is a data-PROVENANCE fact, not a calendar one.
-    ///
-    /// It lands as a **NULL** column, never as `0`: on a chart `0` draws a flat
-    /// bar and NULL draws nothing, and "perfectly balanced flow" is a different
-    /// claim from "nobody measured the flow".
-    ///
-    /// **INFERRED, not observed.** Dhan publishes no trade tape and no
-    /// aggressor flag, so the side is inferred from the price move. Read from
-    /// [`LiveCandleState::net_volume`](tickvault_trading::candles::LiveCandleState::net_volume),
-    /// which owns every refusal in one place.
-    pub net_volume: Option<i64>,
     /// `LiveCandleState::total_buy_qty` (`u32`) widened to `i64`. The vendor's
     /// total PENDING BUY-order quantity resting in the book at this bar's last
     /// observed packet — **not executed volume**. `0` is the vendor's ABSENT
@@ -176,15 +164,15 @@ impl ShadowSealRow {
     /// - `security_id = u32 → i64` — widening cast, never lossy.
     /// - `segment = segment_code_to_str(u8)` — `&'static str`, maps the
     ///   8 known segments + UNKNOWN.
-    /// - `volume = u64 → i64` saturating cast (defensive — production
-    ///   volumes never approach `i64::MAX`).
+    /// - `volume = LiveCandleState::signed_volume()` — the gross volume
+    ///   carrying the bar's direction in its sign (2026-09-18 directive).
     /// - All other numeric fields are pass-through.
     #[inline]
     #[must_use]
     pub fn from_buffered_seal(seal: &BufferedSeal) -> Self {
         let timestamp_ist_nanos =
             i64::from(seal.state.bucket_start_ist_secs).saturating_mul(1_000_000_000);
-        let volume_i64 = i64::try_from(seal.state.volume).unwrap_or(i64::MAX);
+        let volume_i64 = seal.state.signed_volume();
         Self {
             table_name: seal.tf.table_name(),
             timestamp_ist_nanos,
@@ -210,28 +198,6 @@ impl ShadowSealRow {
             // the per-instrument RAM budget (operator request 2026-06-02).
             change_pct: seal.state.close_pct_from_prev_day,
             open_gap_pct: seal.state.open_gap_pct,
-            // ⚠ CORRECTED 2026-09-10. This comment said "Derived, not stored:
-            // the state carries the two INPUTS (the bar's own volume and the
-            // previous bar's close, snapshotted at bucket open) and this is the
-            // one place they become a signed figure." That was accurate, and
-            // it described a calculation that was WRONG: signing a whole bar's
-            // volume by its close direction is bar DIRECTION, not net volume,
-            // and it inverts precisely when a bar's flow and its close
-            // disagree.
-            //
-            // `net_volume_signed` is now ACCUMULATED per tick by the live fold
-            // under the tick rule, so this is a read rather than a derivation.
-            // The comment's claim that it "costs no per-instrument RAM" is
-            // therefore also retired: it costs 8 bytes on `LiveCandleState`,
-            // ~10 MB across the 25,000-slot ceiling plus ~4.8 MB on the seal
-            // ring, priced at both const-asserts and in aws-budget.md.
-            //
-            // What is UNCHANGED: `net_volume()` still owns every refusal in one
-            // place, and it still returns `None` — persisted as SQL NULL —
-            // rather than a fabricated zero. It gained one: a bar this process
-            // did not classify (a disk-spill replay, a REST bar) reports NULL
-            // instead of claiming perfectly balanced flow.
-            net_volume: seal.state.net_volume(),
             total_buy_qty: i64::from(seal.state.total_buy_qty),
             total_sell_qty: i64::from(seal.state.total_sell_qty),
         }
@@ -492,6 +458,46 @@ mod tests {
         let row = ShadowSealRow::from_buffered_seal(&seal);
         assert_eq!(row.volume, i64::MAX);
         assert!(row.volume > 0, "saturated volume MUST stay positive");
+    }
+
+    #[test]
+    fn the_row_carries_the_sign_not_just_the_magnitude() {
+        // The 2026-09-18 directive: the persisted `volume` is the bar's own
+        // gross volume carrying its direction. A row built from a bar that
+        // closed BELOW the previous bar of the same timeframe must reach the
+        // writer already negative — the conversion is the only place the sign
+        // is applied, so a regression here silently un-signs every candle.
+        let mut state = LiveCandleState::empty();
+        state.bucket_start_ist_secs = 1_716_000_900;
+        state.volume = 900;
+        state.bucket_open_prev_close = 101.0;
+        state.close = 100.0;
+        let seal = BufferedSeal::new(13, 0, TfIndex::M1, state, Feed::Dhan);
+        let row = ShadowSealRow::from_buffered_seal(&seal);
+        assert_eq!(row.volume, -900, "a down bar signs its whole gross volume");
+        assert_eq!(
+            row.volume.unsigned_abs(),
+            state.volume,
+            "the magnitude must survive the sign — `abs()` is what the 10m \
+             derivation sums, so a lost magnitude breaks it silently"
+        );
+    }
+
+    #[test]
+    fn an_up_bar_and_a_flat_bar_both_reach_the_row_positive() {
+        for (prev, close) in [(99.0_f64, 100.0_f64), (100.0, 100.0)] {
+            let mut state = LiveCandleState::empty();
+            state.bucket_start_ist_secs = 1_716_000_900;
+            state.volume = 900;
+            state.bucket_open_prev_close = prev;
+            state.close = close;
+            let seal = BufferedSeal::new(13, 0, TfIndex::M1, state, Feed::Dhan);
+            let row = ShadowSealRow::from_buffered_seal(&seal);
+            assert_eq!(
+                row.volume, 900,
+                "prev={prev} close={close}: only a LOWER close signs negative"
+            );
+        }
     }
 
     #[test]

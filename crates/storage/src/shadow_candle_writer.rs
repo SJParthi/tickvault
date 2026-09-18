@@ -488,25 +488,6 @@ impl ShadowCandleWriter {
             .with_context(|| "candle append: column_i64(total_buy_qty) failed")?
             .column_i64("total_sell_qty", row.total_sell_qty)
             .with_context(|| "candle append: column_i64(total_sell_qty) failed")?;
-        // Net volume is the ONE column deliberately omitted rather than
-        // zero-filled when absent. Omitting an ILP column persists NULL, and
-        // NULL is the honest value for "THIS PROCESS DID NOT CLASSIFY THIS
-        // BAR'S FLOW" — a disk-spill replay (the 128-byte record cannot carry
-        // the accumulator), a REST-folded bar, or a bar with no ticks or no
-        // volume. Writing `0` there would claim perfectly balanced buy and sell
-        // flow about a bar nobody measured, and on a chart it draws a FLAT bar
-        // where NULL draws nothing. Two distinct facts, two distinct storages.
-        //
-        // ⚠ CORRECTED 2026-09-10: this said NULL meant "there was no previous
-        // bar to compare against — the day's first bar of this timeframe". That
-        // was true of the retired close-vs-close definition and is false now: a
-        // first bar WITH ticks is classified and reports real flow. The NULL is
-        // a provenance signal, not a calendar one, and reading it as "start of
-        // day" would mislabel every spill-replayed bar in the table.
-        if let Some(net_volume) = row.net_volume {
-            buf.column_i64("net_volume", net_volume)
-                .with_context(|| "candle append: column_i64(net_volume) failed")?;
-        }
         buf.at(TimestampNanos::new(row.timestamp_ist_nanos))
             .with_context(|| "candle append: at(TimestampNanos) failed")?;
         self.pending_count += 1;
@@ -707,8 +688,6 @@ mod tests {
         state.oi = 50_000;
         state.tick_count = 5;
         state.close_pct_from_prev_day = 1.5;
-        state.net_volume_signed = -4_242;
-        state.net_volume_classified = true;
         state.total_buy_qty = 89_600;
         state.total_sell_qty = 4_800;
         BufferedSeal::new(sid, seg, tf, state, feed)
@@ -1237,7 +1216,6 @@ mod tests {
             open_pct: 0.4,
             change_pct: 1.5,
             open_gap_pct: 0.2,
-            net_volume: Some(1234),
             total_buy_qty: 89_600,
             total_sell_qty: 4_800,
         };
@@ -1318,7 +1296,6 @@ mod tests {
                 open_pct: 0.4,
                 change_pct: 1.5,
                 open_gap_pct: 0.2,
-                net_volume: Some(1234),
                 total_buy_qty: 89_600,
                 total_sell_qty: 4_800,
             };

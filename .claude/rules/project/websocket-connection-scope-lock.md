@@ -6038,3 +6038,202 @@ the SAME change that signs the column — never after.
   been fixed for the identical shape.
 - Claims spill replay loses the sign — v2 round-trips it; the withdrawn claim is
   recorded above so it is not repeated.
+
+### 2026-09-18 (FOURTH) — THE SIGNED-VOLUME DECISION IS TAKEN: `volume` BECOMES ±GROSS, `net_volume` IS DELETED, AND THE TICK-RULE FLOW VALUE IS LOST
+
+**The verbatim operator authorization (2026-09-18, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "see whatever is your recommendation go ahead dude okay ? but ensiure to fix resolve merge and deploy it dude okay?"
+
+Given in DIRECT response to a message that put the clause-4 conflict to him for the
+SECOND time — naming that his rule is the one this repository withdrew on 2026-09-10 as
+producing the wrong sign, showing the direction-vs-flow comparison, and asking which of
+the two stored forms he wanted. That is the §28.2/§28.3 authorization shape this
+repository already accepts: a general go-ahead answering an ENUMERATED ask selects the
+enumerated work. The preceding turn is the reaffirmation that makes it binding —
+*"is everyhtign entirley fixed and resolved and emrged and deploye ddude okay?"* — so
+the operator has now been told the objection twice and has ruled twice.
+
+This section is the rule-file-first record, written BEFORE the code it governs.
+
+#### ⚠ FIRST, a correction to the recommendation this quote answers — it was internally inconsistent
+
+The message he answered recommended, verbatim: *"store the tick-rule value, and deliver
+your rule as the view expression — it is the only arrangement that loses nothing."*
+
+**That recommendation quietly KEPT `net_volume`, which clause 3 of his own directive
+says twice to delete.** Both cannot be true. A single column cannot carry both the GROSS
+magnitude and the NET flow, because `|net_flow| != gross`: a bar that traded 1,000 into
+the bid and 900 into the offer has gross 1,900 and net −100, and no function recovers
+1,900 from −100.
+
+Re-derived against the contract already merged in the 2026-09-18 section above, the
+information-preserving direction is the opposite of what was recommended, and it is his
+directive read literally:
+
+| Stored form | `abs()` recovers gross? | Can a view render the other form? |
+|---|---|---|
+| **±gross (his clause 4)** | **YES** — `abs(v) == volume`, always | **YES** — TradingView's zero-on-flat is `CASE WHEN close = lag(close) THEN 0 ELSE v END`; his own form is the stored value |
+| net flow (the tick rule) | no — gross is destroyed | no — neither gross nor ±gross is recoverable |
+
+So ±gross is the reversible direction and net flow is the irreversible one. The
+recommendation is corrected here rather than quietly changed, because the operator acted
+on the wording and the wording was wrong.
+
+#### The decision (LOCKED)
+
+| # | Locked value |
+|---|---|
+| 1 | **One column, `volume`, signed.** Magnitude is the CURRENT gross volume, unaltered — his words: *"our current volume si rpecisley correct dude but we just need to accept this negative sign thats it"*. |
+| 2 | **Sign rule:** this bar's `close` against the PREVIOUS bar's close **of the same timeframe** (`LiveCandleState::bucket_open_prev_close`). Lower → negative. Not lower → positive. |
+| 3 | **A flat bar is POSITIVE, never zero** — carried unchanged from the 2026-09-18 contract above. Zeroing destroys the magnitude and breaks `abs(v) == gross`, which is what makes `10m` derivable and what lets a view render the chart-exact form. The reverse is impossible. |
+| 4 | **A bar with no previous close is POSITIVE** (session's first bucket, `bucket_open_prev_close == 0.0`). There is no previous close, so nothing fell. |
+| 5 | **`net_volume` is DELETED** — from the candle `CREATE`, from its `ADD COLUMN IF NOT EXISTS` self-heal, and from the `candles_named` view. The DDL and the self-heal must move in the SAME change or the next boot re-adds the column. |
+| 6 | **`top_volume` stamps the window OPEN**, not the window close, so a `top_volume` row and a `candles_<tf>` row carrying the same `ts` describe the same window. Without this, clause 5 of the directive (*"both of them should be precisely matchable"*) is unachievable by any column change. |
+| 7 | **The four `top_volume_{1s,3s,5s,1m}` views default to `ORDER BY ts DESC, net_volume_chg_milli_pct DESC`** — the integer column, never the float view alias. |
+| 8 | **`10m` is DERIVED, never a `TfIndex` variant** — `TF_COUNT` does not move, the seal ring does not resize, and no per-tick work is added. Clause 2 of the 2026-09-18 contract, unchanged. |
+
+#### ⚠ WHAT IS LOST (Rule 11 — no false-OK)
+
+**The tick-rule flow value (`net_volume_signed`) stops being PERSISTED.** No column
+carries it, no spill record carries it, and no query can reach it after this change.
+The in-memory accumulator on `LiveCandleState` is deliberately RETAINED — it costs one
+`i64` add per tick that was already being paid, and keeping it is what makes restoring
+the value later a purely ADDITIVE change (a new column under its own name and its own
+dated line) rather than a re-litigation of the fold. That retention must not be read as
+the value still being available: it lives for the length of one bucket and is then
+discarded.
+
+`live_candle_state.rs` records what the substitution costs, in its own words: the
+close-vs-close sign *"has the **WRONG SIGN** whenever a bar's close disagrees with its
+flow, which is exactly the divergence a net-volume reader is looking for."* A bar that
+traded net −100 and closed one tick up will report `+1,900`.
+
+That is a real, measured objection. It was put to the operator on 2026-09-18 and again in
+the turn this quote answers, and he ruled both times. Per the standing rule that a
+reaffirmed instruction ends the discussion, it proceeds — recorded here so the trade is on
+the record and not rediscovered as a defect.
+
+**Restoring the flow value later is a separate, additive decision**: a new column under its
+own name, with its own dated line. It is NOT recovered by renaming, and it is NOT what
+this change deletes by accident.
+
+#### The spill record — bytes 80..88 return to what v1 held, at format version 3
+
+Deleting `net_volume_signed` frees the 8 bytes v2 spent on it, and the field the new sign
+needs — `bucket_open_prev_close: f64` — is **exactly what v1 wrote at that same offset**.
+So the record returns to its v1 meaning at v3, with no stride change and no growth (the
+record is byte-for-byte full; the 2026-09-18 correction above records that any GROWTH would
+be a stride break across every `.bin` on disk).
+
+| version | bytes 80..88 | a v3 reader must |
+|---|---|---|
+| 1 | `bucket_open_prev_close: f64` | read it — same meaning |
+| 2 | `net_volume_signed: i64` | **NOT** read it as `f64`; sign unknown → write `+gross` |
+| 3 | `bucket_open_prev_close: f64` | read it |
+
+The v2 arm is the one that matters: an `i64` net volume reinterpreted as an `f64` price is
+a fabricated baseline, and the existing version gate (`SEAL_SPILL_FIRST_NET_VOLUME_VERSION`)
+is the precedent for refusing it rather than guessing.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Stores the tick-rule net flow in `volume` (destroys the gross magnitude; `abs(v) != gross`
+  then breaks the `10m` derivation and every view that renders the other form).
+- Zeroes a flat bar in the STORED column (same destruction, one bar at a time).
+- Removes `net_volume` from the `CREATE` while leaving its `ADD COLUMN IF NOT EXISTS`
+  self-heal, which silently re-adds the column on the next boot.
+- Derives `10m` by SUMMING signed 1m volumes — signed volume is **not additive across
+  timeframes** (five 1s bars of `+100, −100, +100, −100, +100` sum to `+100` while the 5s
+  bar reads `±500`). Sum `abs()` for the gross, then apply the sign at the 10m level.
+- Leaves `recompute_window` summing the bare `volume` — under a signed column it compares
+  `Σ(signed 1m)` against the higher-TF bar's own sign, which differ for any window mixing
+  up and down minutes. That is the same daily-false-page shape #1919 fixed, in the same
+  file, and it must move to `Σ abs()` with the sign checked separately IN THE SAME CHANGE.
+- Reads bytes 80..88 of a format-2 spill record as an `f64` baseline.
+- Adds an `M10` variant, or moves `TF_COUNT`.
+- Claims the tick-rule flow value is preserved anywhere.
+
+#### 2026-09-18 (FOURTH, same day) — SHIPPED, and the three things the implementation settled that the section above could only specify
+
+**No new authorization is claimed.** This records what landed against the contract
+above, and the three points where writing the code decided something the ruling had
+left open.
+
+##### 1. The spill record reached v3 with NO growth, and the const assert is what forced the right shape
+
+The section above predicts bytes 80..88 return to their v1 meaning. They did —
+`SEAL_SPILL_FORMAT_VERSION` 2 → **3**, `SEAL_SPILL_RECORD_SIZE` unchanged at 128, no
+stride break on any `.bin` already on disk.
+
+**What is NOT in the section above, because nobody knew it until the compiler said
+so:** adding `bucket_open_prev_close: f64` to `SerializedSeal` while keeping
+`net_volume_signed: i64` and `net_volume_classified: bool` fails the build —
+`const _: () = assert!(size_of::<SerializedSeal>() <= SEAL_SPILL_RECORD_SIZE)`, error
+`E0080`. The struct was already full.
+
+That assert made the design decision rather than merely reporting a size. The two
+options were to raise `SEAL_SPILL_RECORD_SIZE` — a stride break across every spill
+file in existence — or to accept that **a format which cannot represent a field
+should not reserve memory for it**. The second is right and is what shipped: both
+net fields are gone from `SerializedSeal` and from `SealDlqRecord`, replaced by the
+baseline. Recorded because a future reader will see a struct that looks like it has
+room and will not know it does not.
+
+##### 2. A pre-v3 record is REFUSED, not reinterpreted — and the fixture proves it in the strong direction
+
+`SEAL_SPILL_FIRST_PREV_CLOSE_VERSION = 3` gates the read. A v1 or v2 record decodes
+`0.0`, which `signed_volume()` treats as "no baseline" and signs **POSITIVE**.
+
+The test fixture therefore seals with a baseline of **24,400.0 — deliberately ABOVE
+both call-site closes** (102.5 and 24,341.95), so every fixture bar signs NEGATIVE.
+A lost baseline decodes 0.0 and signs positive, so the round-trip test cannot pass by
+accidentally agreeing with the default. Both round-trip tests also keep WHOLE-STRUCT
+equality, comparing against an `expected` copy with only the retired pair cleared, so
+a future field that silently fails to round-trip still fails.
+
+The DLQ is JSON and needs no version gate: no `deny_unknown_fields`, every field
+`serde(default)`, so a line from EITHER earlier era parses — the pre-2026-09-10 shape
+carries the baseline and keeps it, the 2026-09-10..09-18 flow-era shape carries the
+two retired keys and they are ignored. One test covers both eras rather than two
+covering one each.
+
+##### 3. `candles_10m` is a VIEW, and it is UNVERIFIED against a live QuestDB
+
+Clause 8 says derive. It is `console_views::candles_10m_view_ddl()` — a
+`CREATE OR REPLACE VIEW` over `candles_1m`: `SAMPLE BY 10m` for the OHLC and
+`sum(abs(volume))` for the gross, then a `lag(close)` window applied at the
+**10-minute** level to sign it. No `TfIndex` variant, no `TF_COUNT` change, no
+seal-ring resize, zero added per-tick work.
+
+Two details are load-bearing and are pinned by test rather than left to a reader:
+
+- It sums `abs(volume)` and **never** `sum(volume)` — the REJECT row above says why,
+  and `the_ten_minute_view_sums_the_magnitude_never_the_signed_value` asserts the
+  presence of one and the absence of the other.
+- The no-predecessor guard is `prev_close > 0`, **not** `IS NOT NULL`, so a first
+  bucket with no predecessor and a bucket whose baseline is genuinely zero take the
+  SAME branch and both sign positive.
+  `a_ten_minute_bucket_with_no_predecessor_falls_through_to_positive` asserts
+  `IS NOT NULL` is absent, so a later "tidy-up" cannot split them.
+
+**⚠ NOT claimed: that this DDL has ever been accepted by QuestDB.** No docker daemon
+exists in the build container and port 9000 is unreachable, so it could not be run.
+It is the first view in the module to use `SAMPLE BY` or a window function — there is
+no precedent in the repo to copy — and it is placed AFTER `ticks_named` /
+`candles_named` and BEFORE the depth views in `ensure_named_views` deliberately:
+`run_view_ddl` degrades a refusal to a counted warn and cannot block the statements
+behind it, so a dialect rejection costs an analyst nothing they open daily and shows
+up as one warn line. The first boot after deploy is the measurement.
+
+##### What a PR that violates this subsection looks like (REJECT)
+
+- Raises `SEAL_SPILL_RECORD_SIZE` to make room (stride break on every existing spill
+  file; the const assert exists to stop exactly this).
+- Reads bytes 80..88 without the `SEAL_SPILL_FIRST_PREV_CLOSE_VERSION` gate.
+- Lowers the test fixture's baseline below a call-site close, which lets a dropped
+  baseline pass by agreeing with the positive default.
+- Relaxes either round-trip test from whole-struct equality to field spot-checks.
+- Replaces `prev_close > 0` with `IS NOT NULL` in the 10m view.
+- Reports `candles_10m` as verified before a boot log shows the CREATE accepted.

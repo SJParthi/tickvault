@@ -336,6 +336,64 @@ impl LiveCandleState {
         let ceiling = i64::try_from(self.volume).unwrap_or(i64::MAX);
         Some(self.net_volume_signed.clamp(-ceiling, ceiling))
     }
+
+    /// This bar's GROSS volume, signed by the bar's own direction: negative
+    /// when the close fell against the previous bar's close of the SAME
+    /// timeframe, positive otherwise.
+    ///
+    /// This is the operator's 2026-09-18 rule, and it is deliberately NOT
+    /// [`Self::net_volume`]: it reports the bar's DIRECTION times the bar's
+    /// volume, never its order flow. The two disagree precisely when a bar
+    /// closes up on net selling, and the flow reading is the one this
+    /// repository measured as honest — see [`Self::net_volume`]'s own note on
+    /// what the old close-vs-close answer got wrong. The directive was put to
+    /// the operator twice WITH that objection stated and ruled twice; the
+    /// trade is recorded in `websocket-connection-scope-lock.md`
+    /// § "2026-09-18 (FOURTH)", including what is lost.
+    ///
+    /// # The invariant every consumer relies on
+    ///
+    /// `signed_volume().unsigned_abs() == volume`, always. That equality is
+    /// what makes a 10-minute bar DERIVABLE from ten 1-minute bars —
+    /// `sum(abs(v))` recovers the gross and the sign is applied at the 10m
+    /// level against the 10m previous close — and what lets a view render the
+    /// chart-exact zero-on-flat form. Signing is therefore
+    /// information-preserving; ZEROING a flat bar would not be, which is
+    /// exactly why a flat bar is positive here rather than zero.
+    ///
+    /// # The three positives that do not mean "the close rose"
+    ///
+    /// - **Flat** (`close == bucket_open_prev_close`) — positive by the rule
+    ///   above. A reader wanting TradingView's `0` renders it in SQL from the
+    ///   stored `close`; the reverse is impossible, which is the whole reason
+    ///   the stored form is this one.
+    /// - **No previous close** (`bucket_open_prev_close == 0.0` — the
+    ///   session's first bucket for this instrument) — positive, because
+    ///   there is no previous close and so nothing fell. `0.0` is this
+    ///   field's absent sentinel, not a price.
+    /// - **Unorderable previous close** (NaN, infinity) — positive. NaN
+    ///   compares `false` against everything, so without the explicit guard a
+    ///   NaN baseline would fall through to the negative arm and sign a whole
+    ///   bar on a comparison that never happened.
+    ///
+    /// # Complexity
+    /// O(1) — one compare and one saturating convert on fields already in
+    /// this struct. Zero allocation. Runs once per SEAL, never once per tick.
+    #[inline]
+    #[must_use]
+    pub fn signed_volume(&self) -> i64 {
+        // Saturating rather than wrapping: a volume above `i64::MAX` is a
+        // fold defect, and `i64::MAX` reads as "impossibly large" where a
+        // wrapped negative would read as a real sell bar.
+        let gross = i64::try_from(self.volume).unwrap_or(i64::MAX);
+        let prev = self.bucket_open_prev_close;
+        if !prev.is_finite() || prev <= 0.0 {
+            return gross;
+        }
+        // `-gross` cannot overflow: the most negative reachable value is
+        // `-i64::MAX`, which is `i64::MIN + 1`.
+        if self.close < prev { -gross } else { gross }
+    }
 }
 
 /// `(value - baseline) / baseline * 100`, or `0.0` when that is not a
@@ -788,5 +846,115 @@ mod tests {
         s.net_volume_signed = i64::MIN;
         let nv = s.net_volume().expect("classified and traded");
         assert!(nv < 0, "a sell-heavy bar must never report as buy-heavy");
+    }
+
+    /// The stored sign is the bar's DIRECTION and the magnitude is untouched —
+    /// the operator's 2026-09-18 rule, verbatim: *"our current volume si
+    /// rpecisley correct dude but we just need to accept this negative sign"*.
+    #[test]
+    fn a_bar_that_closed_down_signs_its_whole_gross_volume_negative() {
+        let mut s = sealed(24_290.00, 24_341.95, 24_334.55);
+        s.bucket_open_prev_close = 24_300.00;
+        s.volume = 1_900;
+        assert_eq!(s.signed_volume(), -1_900);
+    }
+
+    #[test]
+    fn a_bar_that_closed_up_signs_positive() {
+        let mut s = sealed(24_310.00, 24_341.95, 24_334.55);
+        s.bucket_open_prev_close = 24_300.00;
+        s.volume = 1_900;
+        assert_eq!(s.signed_volume(), 1_900);
+    }
+
+    /// A FLAT bar is POSITIVE, never zero. Zeroing is what TradingView's
+    /// built-in Net Volume does, and adopting it in the STORED column would
+    /// destroy that bar's magnitude — breaking `abs(v) == volume`, and with it
+    /// the 10m derivation and every view that renders the chart-exact form.
+    /// A view can turn `+gross` into `0`; nothing turns `0` back into `+gross`.
+    #[test]
+    fn a_flat_bar_is_positive_never_zero_so_the_magnitude_survives() {
+        let mut s = sealed(24_300.00, 24_341.95, 24_334.55);
+        s.bucket_open_prev_close = 24_300.00;
+        s.volume = 1_900;
+        assert_eq!(s.signed_volume(), 1_900, "a flat bar keeps its magnitude");
+    }
+
+    /// The session's first bucket has no previous close. `0.0` is that field's
+    /// absent sentinel, not a price, so nothing fell and the bar is positive.
+    #[test]
+    fn the_sessions_first_bucket_has_no_previous_close_and_is_positive() {
+        let mut s = sealed(24_290.00, 24_341.95, 24_334.55);
+        s.bucket_open_prev_close = 0.0;
+        s.volume = 1_900;
+        assert_eq!(s.signed_volume(), 1_900);
+    }
+
+    /// NaN compares `false` against everything, so without the explicit guard
+    /// a NaN baseline falls through to the negative arm and signs a whole bar
+    /// on a comparison that never happened.
+    #[test]
+    fn a_non_finite_previous_close_cannot_order_and_never_signs_a_bar_negative() {
+        for prev in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            let mut s = sealed(24_290.00, 24_341.95, 24_334.55);
+            s.bucket_open_prev_close = prev;
+            s.volume = 1_900;
+            assert_eq!(
+                s.signed_volume(),
+                1_900,
+                "prev={prev} must not sign negative"
+            );
+        }
+    }
+
+    /// `signed_volume().unsigned_abs() == volume`, ALWAYS. This is the
+    /// invariant the 10m derivation rests on: `sum(abs(v))` over ten 1m bars
+    /// recovers the gross, and the sign is applied at the 10m level. A change
+    /// that breaks this equality silently makes every derived frame wrong.
+    #[test]
+    fn signed_volume_always_lets_the_magnitude_survive_the_sign() {
+        for (close, prev) in [
+            (24_290.00, 24_300.00),
+            (24_310.00, 24_300.00),
+            (24_300.00, 24_300.00),
+            (24_290.00, 0.0),
+            (24_290.00, f64::NAN),
+        ] {
+            for volume in [0_u64, 1, 1_900, 20_000_000] {
+                let mut s = sealed(close, 24_341.95, 24_334.55);
+                s.bucket_open_prev_close = prev;
+                s.volume = volume;
+                assert_eq!(
+                    s.signed_volume().unsigned_abs(),
+                    volume,
+                    "close={close} prev={prev} volume={volume}"
+                );
+            }
+        }
+    }
+
+    /// The ruled-on trade, pinned so nobody "fixes" it back by accident.
+    ///
+    /// A bar that traded 1,000 into the bid and 900 into the offer has a flow
+    /// of −100 — but if its close ticked UP, the stored column reads `+1,900`.
+    /// That inversion is exactly what `net_volume()`'s own note records the
+    /// close-vs-close rule getting wrong, and it is what the operator ruled
+    /// for twice on 2026-09-18 with the objection stated. The in-memory flow
+    /// accumulator still disagrees; it simply no longer reaches a column.
+    #[test]
+    fn the_sign_follows_the_close_even_when_the_flow_disagrees() {
+        let mut s = sealed(24_301.00, 24_341.95, 24_334.55);
+        s.bucket_open_prev_close = 24_300.00;
+        s.volume = 1_900;
+        s.net_volume_signed = -100;
+        s.net_volume_classified = true;
+        s.tick_count = 2;
+
+        assert_eq!(s.signed_volume(), 1_900, "direction, not flow");
+        assert_eq!(
+            s.net_volume(),
+            Some(-100),
+            "the flow reading still disagrees"
+        );
     }
 }
