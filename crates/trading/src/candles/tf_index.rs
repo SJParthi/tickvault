@@ -170,125 +170,96 @@ pub(crate) const MARKET_OPEN_SECS_OF_DAY_IST: u32 = 33_300;
 /// between sessions.
 pub(crate) const CANDLE_SESSION_OPEN_SECS_OF_DAY_IST: u32 = 32_400;
 
-/// The largest plausible gap between a tick's EXCHANGE stamp and OUR receipt
-/// of it, in seconds.
-///
-/// Measured against production: Dhan's delivery lag ran p50 1.38 s, p90
-/// 8.50 s, p99 46.37 s and max 198.69 s on the worst recorded day
-/// (2026-07-06, the measurements that retired the feed the first time). 300 s
-/// is therefore well above any real delivery lag ever observed here, and far
-/// below the thing it exists to catch.
-pub const MAX_PLAUSIBLE_RECEIPT_LAG_SECS: i64 = 300;
-
-/// The largest amount by which a receipt may plausibly PRECEDE the exchange
-/// stamp, in seconds.
-///
-/// Non-zero because the two clocks are independent: Dhan stamps whole seconds
-/// on their clock, we stamp nanoseconds on ours, and a few seconds of skew
-/// between two machines is ordinary. Small, because a receipt genuinely
-/// EARLIER than the trade it describes is otherwise nonsense.
-pub const MAX_PLAUSIBLE_RECEIPT_LEAD_SECS: i64 = 10;
-
-/// IST is UTC+05:30. `received_at_nanos` is UTC; `exchange_timestamp` is
+/// IST is UTC+05:30. A receipt instant is UTC; `exchange_timestamp` is
 /// already IST (never add the offset to it — see `data-integrity.md`).
+///
+/// Retained after the 2026-09-18 ts-bucketing directive because the two
+/// clock-INDEPENDENT day gates in `multi_tf_aggregator` still compare the
+/// fold day against the RECEIPT day, and that comparison needs the offset.
 pub(crate) const IST_UTC_OFFSET_SECS: i64 = 19_800;
 
-/// The clock the candle grid buckets on: **the receipt clock, with the
-/// exchange clock as a fail-soft fallback**.
+/// The clock the candle grid buckets on: **the exchange stamp, and nothing
+/// else**.
 ///
-/// # Why the receipt clock
+/// # The directive
 ///
-/// Operator instruction, 2026-08-28: *"ensure to achieve this ohlcv based on
-/// one and only received at"*, and again the same day for day high/low.
+/// Operator, 2026-09-18: *"as of now to set the rpecise ohlcv we used the
+/// recived at right dude but now we have a catch bro which is see we need to
+/// use this ts dude nowhere hereafetr we hsodu luse received at to define our
+/// ohlcv dude okay? our only apporach si to use this ts to set our ohlcv
+/// everyhwere dude okay even volume also ddue okay?"* — recorded with its
+/// full contract in `websocket-connection-scope-lock.md`, section
+/// "2026-09-18 (SECOND) — OHLCV AND VOLUME BUCKET ON THE EXCHANGE `ts`".
 ///
-/// What it actually corrects is DELIVERY LAG: `exchange_timestamp` is Dhan's
-/// last trade time, and this feed's measured delivery lag is p50 1.4s / p99
-/// 46s, so on an ordinary day a trade printed at 09:29:59 reaches us at
-/// 09:30:01. On the trade clock that packet files into the 09:29 bar it was
-/// no longer part of by the time we could act on it; on the receipt clock it
-/// files into 09:30, which is the bar a live decision is actually reading.
+/// This REVERSES the 2026-08-28 receipt-clock directive, which the same rule
+/// file records as itself a reversal of a measurement. The measurement is
+/// what decided it, and it is worth restating because it argues FOR this
+/// change rather than merely permitting it — production, 2026-08-27, NIFTY:
 ///
-/// # What it does NOT correct — the limit, stated because it is not obvious
+/// | | exchange clock (`ts`) | receipt clock |
+/// |---|---|---|
+/// | session minutes present | **385 / 385** | 351 / 385 |
+/// | bars matching the vendor's own tape | **382 (99.2%)** | 321 (83.4%) |
+/// | phantom bars outside market hours | **0** | 4 |
+/// | ticks filed on the WRONG DAY | **0** | 4,319 |
+/// | ticks that would change MINUTE on the LIVE path | — | **0 of 83,871** |
 ///
-/// An earlier draft of this doc justified the change with the DORMANT
-/// CONTRACT case: `exchange_timestamp` on a sleepy option is the stamp of
-/// whenever it last printed (measured mean 5 hours, max 34 days), so
-/// bucketing on it supposedly files a live snapshot into a bar dated days
-/// ago. **That justification was FALSE**, and the test written to demonstrate
-/// it failed instead — which is how it was caught. The delta guard below
-/// refuses any receipt more than [`MAX_PLAUSIBLE_RECEIPT_LAG_SECS`] past the
-/// trade, so a stale snapshot falls straight back to its trade stamp and
-/// nothing changes for it.
+/// # What this function no longer does, stated exactly
 ///
-/// That is not a defect to fix here: while `received_at` is re-stamped at WAL
-/// replay, a large positive delta is INDISTINGUISHABLE from a replayed frame,
-/// and re-dating a replay to replay-time would destroy the bars it belongs
-/// to. Narrowing that ambiguity needs the real receipt carried through the
-/// WAL record — a separate change. Until then the honest scope of this clock
-/// is: correct within the trusted band, fall back outside it. Pinned by
-/// `receipt_clock_end_to_end_tests::a_stale_snapshot_still_buckets_on_its_trade_stamp`.
+/// Until 2026-09-18 this was a DELTA-BOUNDED HYBRID: it preferred the receipt
+/// when the receipt sat within `[-10 s, +300 s]` of the trade stamp, and fell
+/// back to the trade stamp outside that band. So a dormant snapshot, a
+/// replayed WAL frame, a clock step and a UTC/IST mix-up ALREADY bucketed on
+/// `ts`; the only population the hybrid moved was a live tick whose delivery
+/// lag crossed a bucket boundary.
 ///
-/// # Why there is a fallback at all, and why it is a DELTA and not a band
+/// **That correction is what this directive deletes, and nothing else.** The
+/// last row of the table above is the measured size of it on the live path:
+/// zero of 83,871 ticks changed minute, because Dhan stamps whole seconds and
+/// we receive inside the same second. The population it genuinely moved is a
+/// trade printed at 09:29:59 and delivered at 09:30:01, which the hybrid filed
+/// into 09:30 and this files into 09:29 — the bar the exchange says it belongs
+/// to, and the bar the vendor's own tape puts it in.
 ///
-/// A receipt is only trustworthy if it is a receipt. Two shapes are not:
+/// # What this REPAIRS, which is larger than what it costs
 ///
-/// - **The replay path.** Frames staged in the write-ahead log are re-stamped
-///   at REPLAY time until `TVW3` carries the original (see the plan's W1b).
-///   Measured on production 2026-08-27: 9.1% of a session's NIFTY ticks
-///   replayed 9–20 HOURS after their true arrival. Bucketing those on their
-///   apparent receipt filed 34 real minutes into 4 bars stamped outside
-///   market hours, and 4,319 ticks onto the following day.
-/// - **A clock step.** An NTP correction between receipt and use.
+/// The tick writer's session gate (`session_window::classify`) has always
+/// keyed on the exchange stamp alone. The fold keyed on the hybrid. So for a
+/// band of prints — an exchange stamp inside the window with a receipt past
+/// it, and its converse — a tick was written to `ticks` and absent from every
+/// candle, or folded into a candle while the row was refused. That divergence
+/// is recorded at length in `session_window.rs` and is now **structurally
+/// impossible**: both paths read one clock.
 ///
-/// An absolute plausibility band (is this a sane epoch?) catches neither: a
-/// replay stamp nine hours late is a perfectly sane epoch. The DELTA against
-/// the exchange stamp catches both, because both shapes are defined by
-/// disagreeing with it by far more than any real delivery lag.
+/// # What still reads the RECEIPT, deliberately
 ///
-/// That is what makes this safe to ship BEFORE the receipt is threaded
-/// through the WAL: a replayed frame's apparent receipt fails the delta test
-/// and the tick buckets on the exchange clock exactly as it does today.
-/// Finishing `TVW3` then upgrades those ticks from correct-by-fallback to
-/// correct-by-receipt, and no behaviour has to change to absorb it.
+/// - `ws_lag_ms` measures exchange-versus-receipt. Folding one into the other
+///   makes it identically zero, which is why
+///   `crates/app/tests/ws_lag_clock_guard.rs` exists and why this function
+///   cannot be handed a receipt at all any more — the signature is the guard.
+/// - The two day gates in `MultiTfAggregator::consume_tick`
+///   (`stale_trading_day` / `future_trading_day`) compare the fold day against
+///   the RECEIPT day. They are UNCHANGED: their question is "is the vendor's
+///   stamp from a different trading day than the one we are living in", which
+///   needs both clocks by construction.
+/// - `received_at` remains a stored column on every tick row.
 ///
-/// # What this is NOT used for
+/// # Why this is still a function and not an inlined field read
 ///
-/// - The QuestDB designated `ts` — that is the exchange stamp verbatim,
-///   forever (`data-integrity.md`).
-/// - `ws_lag_ms` — it measures exchange-versus-receipt, so folding one into
-///   the other makes it identically zero.
-/// - The stale-trading-day gate — that asks whether the VENDOR's stamp is
-///   from a closed day, which is a question about the exchange clock.
+/// It is the ONE named site that answers "which clock buckets a candle". A
+/// bare `tick.exchange_timestamp` at fourteen call sites answers it fourteen
+/// times, and the next directive would have to find all fourteen. The
+/// single-argument signature is itself the mechanical guarantee: a receipt
+/// cannot reach the fold clock, because there is nowhere to put it.
 ///
 /// # Complexity
 ///
-/// O(1) time, O(1) space, no allocation, no branch on data length: at most
-/// one add, one divide, two compares and a `u32` conversion. Safe to call
-/// per tick and per timeframe.
+/// O(1) time, O(1) space, zero allocation, zero branches — the identity, which
+/// the optimiser removes entirely. Safe to call per tick and per timeframe.
 #[inline]
 #[must_use]
-pub fn fold_clock_ist_secs(exchange_timestamp: u32, received_at_nanos: i64) -> u32 {
-    // 0 is the documented "no receipt" sentinel; negatives cannot be a real
-    // epoch. Either way there is nothing to prefer over the exchange stamp.
-    if received_at_nanos <= 0 {
-        return exchange_timestamp;
-    }
-    // UTC nanos -> IST seconds. Floor division is correct for a positive
-    // value and this is guaranteed positive by the guard above.
-    let receipt_ist_secs = received_at_nanos / 1_000_000_000 + IST_UTC_OFFSET_SECS;
-    let delta = receipt_ist_secs - i64::from(exchange_timestamp);
-    // The explicit comparison is the same two integer compares as
-    // `RangeInclusive::contains`, written out so the O(1) pre-commit scanner
-    // does not read `.contains(` as a Vec scan - the same reasoning, and the
-    // same suppression, as the session gate in `multi_tf_aggregator.rs`.
-    // APPROVED: lint suppressed for the scanner reason directly above; no behaviour silenced.
-    #[allow(clippy::manual_range_contains)]
-    if delta > MAX_PLAUSIBLE_RECEIPT_LAG_SECS || delta < -MAX_PLAUSIBLE_RECEIPT_LEAD_SECS {
-        return exchange_timestamp;
-    }
-    // Cannot overflow: `delta` is bounded above, so `receipt_ist_secs` is
-    // within 300 s of a `u32`. The fallback keeps it total regardless.
-    u32::try_from(receipt_ist_secs).unwrap_or(exchange_timestamp)
+pub const fn fold_clock_ist_secs(exchange_timestamp: u32) -> u32 {
+    exchange_timestamp
 }
 
 /// 15:30:00 IST expressed as seconds-of-day (`15*3600 + 30*60`).
@@ -740,6 +711,58 @@ impl TfIndex {
 mod tests {
     use super::*;
 
+    /// The directive, stated as an equality: the fold clock IS the exchange
+    /// stamp, and the receipt has no way to influence it.
+    ///
+    /// ## What this replaced (2026-09-18)
+    ///
+    /// Five tests pinned the delta-bounded hybrid: a live receipt one second
+    /// late winning the bucket, a nine-hour replay stamp falling back, the
+    /// `[-10 s, +300 s]` boundary on both sides, the absent-receipt sentinel,
+    /// and the UTC/IST mix-up failing closed. Every one of them pinned a
+    /// behaviour that no longer exists, and four of the five pinned a FALLBACK
+    /// that is now the only path — so they would have passed unchanged while
+    /// proving nothing. They are replaced rather than deleted, because a value
+    /// nothing pins is a value a refactor can change in silence.
+    #[test]
+    fn the_fold_clock_is_the_exchange_stamp_and_nothing_else() {
+        // The shapes the old hybrid treated differently, now all identical:
+        // an ordinary mid-session second, the second a live receipt would have
+        // moved (delivery lag across a minute boundary), a replayed frame's
+        // stamp, and the arithmetic extremes.
+        for exch in [
+            0_u32,
+            1,
+            1_779_362_677,       // ~11:24 IST, the old fixture
+            1_779_362_677 + 300, // the old lag bound
+            1_779_362_677 - 10,  // the old lead bound
+            u32::MAX,
+        ] {
+            assert_eq!(
+                fold_clock_ist_secs(exch),
+                exch,
+                "operator directive 2026-09-18: OHLCV and volume bucket on the \
+                 exchange `ts`. Any transformation here — a receipt, a clamp, \
+                 a blend — re-opens the `ticks`-versus-candle divergence that \
+                 `session_window.rs` records, because the tick writer's gate \
+                 reads the exchange stamp alone."
+            );
+        }
+    }
+
+    /// It is `const`, and that is load-bearing rather than decoration.
+    ///
+    /// A `const fn` cannot read a clock, cannot allocate, and cannot call a
+    /// non-const helper — so the compiler itself now refuses the entire class
+    /// of change this directive forbids. The identity is evaluated at compile
+    /// time wherever the stamp is known, and inlined to nothing where it is
+    /// not: O(1) is not a claim here, it is the absence of code.
+    #[test]
+    fn the_fold_clock_is_evaluated_at_compile_time() {
+        const FOLDED: u32 = fold_clock_ist_secs(1_779_362_677);
+        assert_eq!(FOLDED, 1_779_362_677);
+    }
+
     /// Session-constant drift pin (operator directive 2026-07-03): the
     /// trading-crate seconds-of-day session constants that gate the candle
     /// grid MUST stay 09:15:00 / 15:30:00 IST AND agree exactly with the
@@ -748,108 +771,6 @@ mod tests {
     /// edited alone, this test fails the build — the day-OHLC gate
     /// (`day_ohlc_session_accepts` in the app crate) delegates to the
     /// common-crate gate, so this pin keeps ALL session windows identical.
-    /// The LIVE path: receipt lands a second or two after the trade, so the
-    /// fold clock IS the receipt. This is the case the operator asked for.
-    #[test]
-    fn a_live_receipt_a_second_after_the_trade_is_the_fold_clock() {
-        let exch = 1_779_362_677_u32; // ~11:24 IST
-        // 1.4 s later in UTC nanos (measured Dhan p50 delivery lag).
-        let recv_utc = (i64::from(exch) - 19_800) * 1_000_000_000 + 1_400_000_000;
-        assert_eq!(fold_clock_ist_secs(exch, recv_utc), exch + 1);
-    }
-
-    /// The REPLAY path, and the reason the guard is a DELTA rather than a
-    /// plausibility band. Measured on production 2026-08-27: 9.1% of a
-    /// session's ticks replayed 9-20 HOURS after their true arrival. Nine
-    /// hours later is a perfectly SANE epoch - an absolute band waves it
-    /// through - and bucketing on it filed 34 real minutes into bars stamped
-    /// outside market hours. The delta catches it and falls back.
-    #[test]
-    fn a_replay_stamp_nine_hours_late_falls_back_to_the_exchange_clock() {
-        let exch = 1_779_362_677_u32;
-        let nine_hours_later = (i64::from(exch) - 19_800 + 9 * 3_600) * 1_000_000_000;
-        assert_eq!(
-            fold_clock_ist_secs(exch, nine_hours_later),
-            exch,
-            "a replay stamp must never place the bucket"
-        );
-    }
-
-    /// The boundary of the guard, both sides, so a future edit cannot widen
-    /// or narrow it without this failing.
-    #[test]
-    fn the_receipt_lag_guard_bites_exactly_at_its_documented_bound() {
-        let exch = 1_779_362_677_u32;
-        let at = |lag: i64| (i64::from(exch) - 19_800) * 1_000_000_000 + lag * 1_000_000_000;
-
-        // At the bound: still trusted.
-        assert_eq!(
-            fold_clock_ist_secs(exch, at(MAX_PLAUSIBLE_RECEIPT_LAG_SECS)),
-            exch + u32::try_from(MAX_PLAUSIBLE_RECEIPT_LAG_SECS).expect("bound fits u32")
-        );
-        // One second past it: refused.
-        assert_eq!(
-            fold_clock_ist_secs(exch, at(MAX_PLAUSIBLE_RECEIPT_LAG_SECS + 1)),
-            exch
-        );
-        // A receipt slightly BEFORE the trade is ordinary clock skew between
-        // two machines and is trusted...
-        assert_eq!(
-            fold_clock_ist_secs(exch, at(-MAX_PLAUSIBLE_RECEIPT_LEAD_SECS)),
-            exch - u32::try_from(MAX_PLAUSIBLE_RECEIPT_LEAD_SECS).expect("bound fits u32")
-        );
-        // ...but a receipt far before it is nonsense, and refused.
-        assert_eq!(
-            fold_clock_ist_secs(exch, at(-MAX_PLAUSIBLE_RECEIPT_LEAD_SECS - 1)),
-            exch
-        );
-    }
-
-    /// The sentinel and the impossible. `0` is the documented "no receipt"
-    /// value and must never be read as an epoch at the dawn of 1970.
-    #[test]
-    fn an_absent_or_negative_receipt_falls_back_and_never_panics() {
-        let exch = 1_779_362_677_u32;
-        assert_eq!(fold_clock_ist_secs(exch, 0), exch);
-        assert_eq!(fold_clock_ist_secs(exch, -1), exch);
-        assert_eq!(fold_clock_ist_secs(exch, i64::MIN), exch);
-        assert_eq!(fold_clock_ist_secs(exch, i64::MAX), exch);
-        // And the pathological exchange stamps, which must also not panic.
-        assert_eq!(fold_clock_ist_secs(0, i64::MAX), 0);
-        assert_eq!(fold_clock_ist_secs(u32::MAX, 0), u32::MAX);
-    }
-
-    /// The IST conversion itself, stated as an equality rather than a
-    /// tolerance: `received_at_nanos` is UTC and the exchange stamp is
-    /// already IST, so a missing offset shifts every bucket by 5h30m - the
-    /// single most likely way to get this wrong.
-    #[test]
-    fn the_receipt_is_converted_from_utc_to_ist_not_used_raw() {
-        let exch = 1_779_362_677_u32;
-        // A receipt at EXACTLY the trade instant, expressed in UTC.
-        let recv_utc = (i64::from(exch) - 19_800) * 1_000_000_000;
-        assert_eq!(fold_clock_ist_secs(exch, recv_utc), exch);
-        // And the guard catches the conversion bug itself, which is a
-        // property worth pinning rather than a coincidence. Feeding a value
-        // that is ALREADY IST (i.e. forgetting that the receipt is UTC) makes
-        // the computed receipt 19,800 s late - far outside the 300 s lag
-        // bound - so it FALLS BACK to the exchange stamp instead of shifting
-        // the whole grid by five and a half hours.
-        //
-        // This assertion was written expecting `exch + 19_800` and failed.
-        // The code was right and the expectation was wrong: the delta guard
-        // protects against a mis-conversion as well as against a replay
-        // stamp, which is a second reason to prefer it over an absolute
-        // plausibility band.
-        let already_ist_by_mistake = i64::from(exch) * 1_000_000_000;
-        assert_eq!(
-            fold_clock_ist_secs(exch, already_ist_by_mistake),
-            exch,
-            "a UTC/IST mix-up must fail closed onto the exchange stamp, \
-             never shift the grid by 5h30m"
-        );
-    }
-
     #[test]
     fn test_session_constants_pinned_and_agree_with_common_crate() {
         use tickvault_common::constants::{MARKET_CLOSE_IST_NANOS, MARKET_OPEN_IST_NANOS};

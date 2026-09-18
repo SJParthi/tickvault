@@ -51,11 +51,14 @@ fn tick_at(ts: u32, price: f32, volume: u32) -> ParsedTick {
         day_close: 23_950.75,
         day_high: price,
         day_low: price,
-        // 2026-08-28: a REAL receipt, two seconds after the trade — inside the
-        // fold clock's trusted band, so the measured region exercises the
-        // RECEIPT branch of `fold_clock_ist_secs` rather than its sentinel
-        // early-return. Left at the `Default` 0 this harness proved zero-alloc
-        // only for the fallback path, which is not the path production takes.
+        // 2026-08-28: a REAL receipt, two seconds after the trade. RE-STATED
+        // 2026-09-18: the fold clock no longer reads the receipt at all, so
+        // this value no longer selects a branch — there is only one branch.
+        // It is KEPT deliberately, because `ParsedTick::default()` leaves
+        // `received_at_nanos` at 0 and that sentinel still takes the two
+        // cross-day gates in `consume_tick` out of the measured region. A
+        // non-zero receipt is what makes this harness measure the allocation
+        // behaviour of the path production actually runs.
         received_at_nanos: (i64::from(ts) - 19_800 + 2) * 1_000_000_000,
         ..Default::default()
     }
