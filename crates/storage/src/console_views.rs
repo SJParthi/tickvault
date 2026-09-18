@@ -104,6 +104,15 @@ pub const NAMED_VIEW_CANDLES_BASE: &str = "candles_1m";
 /// Equality is pinned by the ratchet test
 /// `test_lifecycle_dim_matches_persistence_const`.
 const NAMED_VIEW_LIFECYCLE_DIM: &str = "instrument_lifecycle";
+/// Wire-format name of the DERIVED 10-minute candle view.
+///
+/// The operator's 2026-09-18 timeframe list ends
+/// `… 5m, 10m, 15m, 30m, 60m`, and his ruling on this one entry was explicit:
+/// *"no 10s derive the 10m"*. So `M10` is deliberately NOT a `TfIndex`
+/// variant — adding one would move `TF_COUNT`, resize the seal ring
+/// (`AGGREGATOR_MAX_SLOTS × TF_COUNT`), and add a tenth scalar fold to every
+/// tick, for a frame that is exactly recoverable from the 1m bars.
+pub const VIEW_CANDLES_10M: &str = "candles_10m";
 /// Wire-format name of the human-readable market-depth console view.
 pub const VIEW_DEPTH_NAMED: &str = "market_depth_named";
 /// Market-depth base table. Mirrors
@@ -228,14 +237,19 @@ pub fn ticks_named_view_ddl() -> String {
     )
 }
 
-/// DDL for the `candles_named` view: all 15 `candles_1m` columns,
+/// DDL for the `candles_named` view: every `candles_1m` column,
 /// identity-first column order, LEFT-joined against the lifecycle master.
+///
+/// `c.volume` is the SIGNED gross volume (2026-09-18) and `net_volume` is
+/// gone from the base table, so the view no longer selects it — a view that
+/// named a dropped column would fail to create on a fresh volume and leave
+/// the operator with no named candle face at all.
 pub fn candles_named_view_ddl() -> String {
     let dim = lifecycle_dim_subquery();
     format!(
         "CREATE OR REPLACE VIEW {VIEW_CANDLES_NAMED} AS \
          SELECT c.ts, il.symbol_name, il.display_name, il.instrument_type, \
-         c.open, c.high, c.low, c.close, c.volume, c.net_volume, c.oi, c.tick_count, \
+         c.open, c.high, c.low, c.close, c.volume, c.oi, c.tick_count, \
          c.total_buy_qty, c.total_sell_qty, \
          c.feed, c.segment, c.security_id, \
          c.change_pct, c.close_pct_from_prev_day, c.open_pct, c.open_gap_pct \
@@ -244,6 +258,75 @@ pub fn candles_named_view_ddl() -> String {
          ON c.security_id = il.security_id \
          AND c.segment = il.exchange_segment \
          AND c.feed = il.feed;"
+    )
+}
+
+/// DDL for `candles_10m` — the tenth timeframe of the 2026-09-18 list,
+/// DERIVED from `candles_1m` rather than folded per tick.
+///
+/// # Why a view and not a `TfIndex` variant
+///
+/// The operator ruled this entry explicitly: *"no 10s derive the 10m"*. A
+/// tenth fold frame would move `TF_COUNT` 24 → 25, which resizes the seal
+/// ring (`AGGREGATOR_MAX_SLOTS × TF_COUNT`, 600,000 today), shifts nothing
+/// on disk but adds a scalar fold to EVERY tick — all for a frame that is
+/// recoverable exactly. Zero per-tick work is the point.
+///
+/// # Why the derivation is EXACT, and what makes it so
+///
+/// `abs(volume) == gross` holds on every persisted bar, because the
+/// 2026-09-18 rule signs the whole magnitude and never zeroes it
+/// (`LiveCandleState::signed_volume`). So the gross of a 10-minute bucket is
+/// `sum(abs(volume))` of its 1m bars — no information was lost to recover.
+///
+/// That invariant is the whole reason the stored form is ±gross rather than
+/// net flow: a flat bar stored as `0`, TradingView's convention, would have
+/// destroyed its own magnitude and made this derivation impossible. A view
+/// can always render the zero-on-flat form from ±gross; the reverse cannot be
+/// done at all.
+///
+/// # The sign, applied at the 10m level
+///
+/// Clause 4 of the directive compares a bar's close against the PREVIOUS
+/// bar's close **of the same timeframe**, so the sign cannot be summed up
+/// from the 1m bars — five `+100` and five `-100` 1m bars sum to `0` while
+/// the 10m bar is `±1000`. The gross is summed; the sign is derived once, at
+/// this level, from `lag(close)` over the same instrument.
+///
+/// A bucket with no predecessor (`prev_close` NULL, or a non-positive value)
+/// signs POSITIVE — the same "no baseline" default `signed_volume()` applies,
+/// and not a claim that the close rose.
+///
+/// # ⚠ UNVERIFIED against a live QuestDB
+///
+/// No QuestDB was reachable when this was written (no docker daemon in the
+/// build container), and this is the first view in this module to use
+/// `SAMPLE BY` or a window function — there is no precedent here to copy. The
+/// failure mode is bounded and already engineered for: `run_view_ddl`
+/// degrades a refusal to a counted `warn!` and never blocks the views behind
+/// it, so a dialect rejection costs one log line and the other console views
+/// still create. The first boot after deploy is the measurement.
+pub fn candles_10m_view_ddl() -> String {
+    format!(
+        "CREATE OR REPLACE VIEW {VIEW_CANDLES_10M} AS \
+         SELECT b.ts, b.security_id, b.segment, b.feed, \
+         b.open, b.high, b.low, b.close, \
+         CASE WHEN b.prev_close > 0 AND b.close < b.prev_close \
+         THEN -b.gross ELSE b.gross END AS volume, \
+         b.oi, b.tick_count \
+         FROM ( \
+         SELECT a.*, \
+         lag(a.close) OVER ( \
+         PARTITION BY a.security_id, a.segment, a.feed ORDER BY a.ts \
+         ) AS prev_close \
+         FROM ( \
+         SELECT ts, security_id, segment, feed, \
+         first(open) AS open, max(high) AS high, min(low) AS low, \
+         last(close) AS close, sum(abs(volume)) AS gross, \
+         last(oi) AS oi, sum(tick_count) AS tick_count \
+         FROM {NAMED_VIEW_CANDLES_BASE} SAMPLE BY 10m \
+         ) a \
+         ) b;"
     )
 }
 
@@ -329,6 +412,22 @@ pub fn depth_named_view_ddl() -> String {
 /// zero means something: `0` is exactly one lot, and a contract that traded
 /// LESS than one lot reads NEGATIVE rather than as a plausible `75%`.
 ///
+/// # Default ordering (2026-09-18 directive)
+///
+/// The view carries `ORDER BY t.ts DESC, t.net_volume_chg_milli_pct DESC`, so
+/// a bare `SELECT * FROM top_volume_1s` opens on the newest window with the
+/// biggest volume-percentage change first — the operator's own words:
+/// *"always have the volume percentage change desc for every timeframe of its
+/// respective timestamps"*. `ts` leads because the ordering is stated PER
+/// TIMESTAMP; ordering by the percentage alone would interleave windows.
+///
+/// It sorts the INTEGER `net_volume_chg_milli_pct`, never the `AS
+/// net_volume_chg_pct` float alias two lines above it. The two rank
+/// identically (the alias is a strictly-increasing affine transform), and the
+/// integer cannot produce a NaN — the class of comparator defect this
+/// repository already records as corrupting a whole sort rather than
+/// misplacing one row.
+///
 /// # First boot after a deploy that adds a column
 ///
 /// `ensure_named_views` runs TWICE per boot, and the first call lands BEFORE
@@ -371,7 +470,8 @@ pub fn top_volume_cadence_view_ddl(cadence: SnapshotCadence) -> String {
          ON t.security_id = il.security_id \
          AND t.segment = il.exchange_segment \
          AND t.feed = il.feed \
-         WHERE t.tf = '{tf}';"
+         WHERE t.tf = '{tf}' \
+         ORDER BY t.ts DESC, t.net_volume_chg_milli_pct DESC;"
     )
 }
 /// Issue one view-DDL statement to QuestDB's `/exec` endpoint.
@@ -492,6 +592,19 @@ pub async fn ensure_named_views(questdb_config: &QuestDbConfig) {
         VIEW_CANDLES_NAMED,
         "create",
         &candles_named_view_ddl(),
+    )
+    .await;
+    // The derived tenth timeframe, attempted AFTER `candles_named` and
+    // independently of it. It is the one view here that uses `SAMPLE BY` and a
+    // window function, so it is also the one most likely to be refused by a
+    // dialect detail — placing it after the everyday faces means a refusal
+    // costs a warn and nothing an analyst opens daily.
+    run_view_ddl(
+        &client,
+        &base_url,
+        VIEW_CANDLES_10M,
+        "create",
+        &candles_10m_view_ddl(),
     )
     .await;
     // Depth joined its siblings 2026-08-15. It is attempted LAST and
@@ -625,7 +738,12 @@ mod tests {
             for c in SnapshotCadence::ALL {
                 assert_ne!(legacy, c.view_name(), "legacy name equals a live view");
             }
-            for live in [VIEW_TICKS_NAMED, VIEW_CANDLES_NAMED, VIEW_DEPTH_NAMED] {
+            for live in [
+                VIEW_TICKS_NAMED,
+                VIEW_CANDLES_NAMED,
+                VIEW_CANDLES_10M,
+                VIEW_DEPTH_NAMED,
+            ] {
                 assert_ne!(legacy, live, "legacy name equals a live console view");
             }
         }
@@ -945,6 +1063,119 @@ mod tests {
             1,
             "candles_named DDL must be exactly ONE statement (no injection surface)"
         );
+    }
+
+    #[test]
+    fn the_ten_minute_view_is_a_single_terminated_statement() {
+        let ddl = candles_10m_view_ddl();
+        assert!(ddl.ends_with(';'), "candles_10m DDL must end with ';'");
+        assert_eq!(
+            ddl.matches(';').count(),
+            1,
+            "candles_10m DDL must be exactly ONE statement (no injection surface)"
+        );
+        assert!(
+            ddl.starts_with("CREATE OR REPLACE VIEW candles_10m AS"),
+            "convergent idempotency: a bare CREATE VIEW fails on the second \
+             boot, which leaves the view frozen at its first definition"
+        );
+    }
+
+    /// The gross is summed, the SIGN is derived — and the two must not be
+    /// confused, because summing the signed values is the defect this whole
+    /// derivation exists to avoid.
+    ///
+    /// Five `+100` and five `-100` one-minute bars sum to `0`, while the
+    /// ten-minute bar they compose is `±1000`. A view that did
+    /// `sum(volume)` would therefore report a busy ten minutes as flat — and
+    /// it would be wrong quietly, since `0` is a legal reading.
+    #[test]
+    fn candles_10m_view_ddl_sums_the_magnitude_never_the_signed_value() {
+        let ddl = candles_10m_view_ddl();
+        assert!(
+            ddl.contains("sum(abs(volume)) AS gross"),
+            "the gross must come from the MAGNITUDE: {ddl}"
+        );
+        assert!(
+            !ddl.contains("sum(volume)"),
+            "summing the signed value cancels opposite minutes to zero: {ddl}"
+        );
+    }
+
+    /// The sign is applied ONCE, at the 10m level, against the previous 10m
+    /// close — clause 4 of the 2026-09-18 directive compares a bar against the
+    /// previous bar OF THE SAME TIMEFRAME.
+    #[test]
+    fn the_ten_minute_sign_is_derived_at_the_ten_minute_level() {
+        let ddl = candles_10m_view_ddl();
+        assert!(
+            ddl.contains("lag(a.close) OVER"),
+            "the baseline is the previous TEN-MINUTE close: {ddl}"
+        );
+        assert!(
+            ddl.contains("PARTITION BY a.security_id, a.segment, a.feed"),
+            "the previous bar must be the previous bar of the SAME instrument \
+             on the same feed, or one instrument's close signs another's \
+             volume: {ddl}"
+        );
+        assert!(
+            ddl.contains("b.prev_close > 0 AND b.close < b.prev_close"),
+            "negative only when the close FELL against a real baseline: {ddl}"
+        );
+        assert!(
+            ddl.contains("THEN -b.gross ELSE b.gross END AS volume"),
+            "the magnitude is never altered — only its sign: {ddl}"
+        );
+    }
+
+    /// A bucket with no predecessor signs POSITIVE, never zero and never
+    /// NULL.
+    ///
+    /// `lag()` returns NULL for the first bucket of an instrument, and in SQL
+    /// `NULL > 0` is NULL, which is not true — so the `CASE` falls to its
+    /// `ELSE` and the bar reports `+gross`. That is the same "no baseline"
+    /// default `LiveCandleState::signed_volume` applies, and it is a default
+    /// rather than a claim that the close rose.
+    #[test]
+    fn a_ten_minute_bucket_with_no_predecessor_falls_through_to_positive() {
+        let ddl = candles_10m_view_ddl();
+        // The guard is a positivity test rather than an IS NOT NULL test, so
+        // the NULL first bucket and a zero baseline take the SAME branch.
+        assert!(
+            ddl.contains("CASE WHEN b.prev_close > 0"),
+            "a NULL or non-positive baseline must fall through to ELSE: {ddl}"
+        );
+        assert!(
+            !ddl.contains("IS NOT NULL"),
+            "a separate NULL test would leave a zero baseline on a different \
+             branch from a missing one, which are the same state: {ddl}"
+        );
+    }
+
+    /// The view reads the ONE-MINUTE table. It is a derivation, not a frame.
+    ///
+    /// If a future change ever gives `10m` a `TfIndex` variant and a
+    /// `candles_10m` TABLE, this view would shadow it — a view and a table
+    /// cannot share a name — so this assertion is also what keeps the
+    /// derive-don't-fold decision honest.
+    #[test]
+    fn the_ten_minute_view_derives_from_the_one_minute_table() {
+        let ddl = candles_10m_view_ddl();
+        assert!(
+            ddl.contains("FROM candles_1m SAMPLE BY 10m"),
+            "the source is the 1m frame, sampled: {ddl}"
+        );
+        assert_eq!(
+            NAMED_VIEW_CANDLES_BASE, "candles_1m",
+            "the base table name this view derives from"
+        );
+    }
+
+    #[test]
+    fn the_ten_minute_view_name_is_stable() {
+        // Wire-format stability: the operator's timeframe list names this
+        // surface, and an analyst's saved query references it verbatim.
+        assert_eq!(VIEW_CANDLES_10M, "candles_10m");
     }
 
     #[test]

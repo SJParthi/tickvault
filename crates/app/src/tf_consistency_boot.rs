@@ -470,19 +470,45 @@ pub struct Recomputed {
     pub tick_count: i64,
 }
 
-/// Σ(volume) overflowed i64 — corrupt input data; the window is skipped and
+/// Σ(|volume|) overflowed i64, or a member carried `i64::MIN` (whose absolute
+/// value is not representable) — corrupt input data; the window is skipped and
 /// the pass degrades (never a silent wrap).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VolumeOverflow;
 
 /// Recompute a higher-TF candle from its window's 1m members (MUST be
 /// sorted ascending by ts): O = first open, H = max, L = min, C = last
-/// close, V = Σ volume (checked), tick_count = Σ (soft signal). `None` on
+/// close, V = **Σ |volume| (checked)**, tick_count = Σ (soft signal). `None` on
 /// an empty window (zero-tick buckets are never emitted by the aggregator,
 /// so absence on both sides is legitimate silence). Pure.
 ///
+/// # Why the MAGNITUDE and not the stored signed values (2026-09-18)
+///
+/// Since the 2026-09-18 directive the stored `volume` carries the bar's
+/// DIRECTION in its sign, and **a signed volume is not additive across
+/// timeframes**: five 1-minute bars of `+100, -100, +100, -100, +100` sum to
+/// `+100` while the 5-minute bar covering them reads `±500`. Summing the
+/// stored values would therefore report a mismatch on nearly every window
+/// containing both up and down minutes — a `TF-VERIFY-01` and one
+/// `TfConsistencySummary` page every trading day, and a 10,000-row audit
+/// budget spent on noise so that a genuine M30/M60 mismatch degrades to
+/// count-only. That is the exact shape PR #1919 fixed in this same file, and
+/// the rule section that ordered the signing names it as a REJECT.
+///
+/// What IS conserved is the gross quantity, so that is what this sums and what
+/// [`diff_strict_fields`] compares.
+///
+/// ⚠ **The SIGN is deliberately NOT verified here, and cannot be from this
+/// input.** A higher-TF bar's sign comes from its close against the PREVIOUS
+/// bar of the SAME timeframe, and that bar is outside the window — the members
+/// are the 1-minute rows inside it. Checking it needs the preceding higher-TF
+/// row, which this pass does not query. Flagged rather than faked: a
+/// magnitude-only check is honest about what it covers, and a sign derived
+/// from the wrong baseline would be worse than no check at all.
+///
 /// # Errors
-/// [`VolumeOverflow`] when Σ(volume) overflows i64 (corrupt data).
+/// [`VolumeOverflow`] when Σ(|volume|) overflows i64, or a member's volume is
+/// `i64::MIN` (corrupt data — no real bar reaches it).
 pub fn recompute_window(members: &[CandleRow]) -> Result<Option<Recomputed>, VolumeOverflow> {
     let (Some(first), Some(last)) = (members.first(), members.last()) else {
         return Ok(None);
@@ -498,7 +524,8 @@ pub fn recompute_window(members: &[CandleRow]) -> Result<Option<Recomputed>, Vol
         if m.low < low {
             low = m.low;
         }
-        volume = volume.checked_add(m.volume).ok_or(VolumeOverflow)?;
+        let gross = m.volume.checked_abs().ok_or(VolumeOverflow)?;
+        volume = volume.checked_add(gross).ok_or(VolumeOverflow)?;
         tick_count = tick_count.saturating_add(m.tick_count);
     }
     Ok(Some(Recomputed {
@@ -570,7 +597,12 @@ pub fn diff_strict_fields(stored: &CandleRow, rec: &Recomputed) -> Vec<DiffField
     if to_paise(stored.close) != to_paise(rec.close) {
         out.push(DiffField::Close);
     }
-    if stored.volume != rec.volume {
+    // MAGNITUDE only. `rec.volume` is already `Sigma |1m volume|`; the stored
+    // higher-TF value carries its own bar direction in its sign, and signed
+    // volume does not add across timeframes (see `recompute_window`). A
+    // `checked_abs` of `None` means the stored value is `i64::MIN`, which no
+    // real bar reaches — reporting it as a diff is correct.
+    if stored.volume.checked_abs() != Some(rec.volume) {
         out.push(DiffField::Volume);
     }
     out
@@ -2740,6 +2772,61 @@ mod tests {
         assert_eq!(rec.tick_count, 12, "sum tick_count");
     }
 
+    #[test]
+    fn a_mixed_sign_window_sums_the_gross_and_is_not_a_diff() {
+        // The 2026-09-18 defect this guards: signed volume is NOT additive
+        // across timeframes. Three minutes of +100, -100, +100 sum to +100 as
+        // stored values, while the higher-TF bar covering them holds the gross
+        // 300 with its OWN direction. Summing the stored values would report a
+        // mismatch on nearly every window containing both up and down minutes
+        // — a Telegram page every trading day.
+        let members = [
+            row(33_300, 100.0, 101.0, 99.5, 100.5, 100, 3),
+            row(33_360, 100.5, 102.0, 100.0, 100.0, -100, 4),
+            row(33_420, 100.0, 101.75, 98.0, 101.0, 100, 5),
+        ];
+        let rec = recompute_window(&members)
+            .expect("no overflow")
+            .expect("non-empty");
+        assert_eq!(
+            rec.volume, 300,
+            "the recompute sums the GROSS quantity, which is what is conserved"
+        );
+
+        // A stored higher-TF bar of the same gross is clean whichever way it
+        // closed — both signs must pass, or the verifier pages on half of all
+        // windows by construction.
+        for stored_volume in [300_i64, -300] {
+            let stored = CandleRow {
+                ts_nanos: 33_300,
+                open: 100.0,
+                high: 102.0,
+                low: 98.0,
+                close: 101.0,
+                volume: stored_volume,
+                tick_count: 12,
+            };
+            assert!(
+                !diff_strict_fields(&stored, &rec).contains(&DiffField::Volume),
+                "stored_volume={stored_volume}: matching gross is not a diff"
+            );
+        }
+
+        // And a genuine magnitude mismatch still IS one.
+        let wrong = CandleRow {
+            ts_nanos: 33_300,
+            open: 100.0,
+            high: 102.0,
+            low: 98.0,
+            close: 101.0,
+            volume: -299,
+            tick_count: 12,
+        };
+        assert!(
+            diff_strict_fields(&wrong, &rec).contains(&DiffField::Volume),
+            "a real magnitude mismatch must still be reported"
+        );
+    }
     #[test]
     fn test_recompute_window_empty_and_single_member() {
         assert_eq!(recompute_window(&[]), Ok(None));
