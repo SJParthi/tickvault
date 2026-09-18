@@ -21,10 +21,29 @@
 //!   re-arm (fresh dated quote per dhan-rest-only-noise-lock-2026-07-14 §3)
 //!   re-attaches the socket + WAL producers to this SAME channel,
 //! - the RiskEngine fed by [`FillEvent`]s (the widened `handle_order_update`
-//!   return) and by Groww marks (the zero-alloc [`MarkForwarder`] tap at the
-//!   Groww per-minute REST legs' persist-confirm seam — re-homed 2026-07-16,
-//!   the live-bridge per-tick source died with #1581; 2026-07-17 truth-sync
-//!   — → bounded mpsc → `update_market_price`),
+//!   return) and by marks (the zero-alloc [`MarkForwarder`] tap → bounded
+//!   mpsc → `update_market_price`). ⚠ CORRECTED TWICE, and the second
+//!   correction is the one that is live:
+//!
+//!   2026-09-13 — this said "Groww marks", stale since the 2026-08-21 Groww
+//!   removal, and named `dhan_cadence_executor` as the producer.
+//!
+//!   ⚠ 2026-09-18 — that producer NO LONGER EXISTS. The operator's
+//!   SOCKETS-ONLY narrowing (`no-rest-except-live-feed-2026-06-27.md` §12.10)
+//!   removed the per-minute REST legs on 2026-09-16, and `CadenceExecutor`
+//!   declared exactly the three removed fetch methods, so the executor, its
+//!   boot and the scheduler went with them. `cadence_mark_source_guard`'s
+//!   pins 1-4 were RETIRED in that change for the same reason.
+//!
+//!   So `mark_forward` has **ZERO production call sites** today — verified,
+//!   not assumed: every remaining caller is a `#[cfg(test)]` one in this
+//!   file. The paper book therefore runs UNMARKED, which §12.10.7(a) records
+//!   and which `main.rs` makes AUDIBLE by explicitly dropping
+//!   `order_runtime_mark_forwarder` so the channel CLOSES and the
+//!   producer-less warn can actually fire. Re-arming a mark producer is the
+//!   follow-up; naming a deleted module as the live source would be exactly
+//!   the reassuring-direction staleness the 2026-09-13 note was written to
+//!   complain about,
 //! - the next-mark PAPER FILLER (a pending `PAPER-n` order fills at the next
 //!   mark for its sid — fill-once, terminal orders never re-fill, finite>0
 //!   mark required, else deferred + counted),
@@ -124,10 +143,11 @@ const ORDER_UPDATE_LAG_ERROR_THRESHOLD: u64 = 1_000;
 const HOUSEKEEPING_TICK_SECS: u64 = 1;
 
 // ---------------------------------------------------------------------------
-// Mark forwarding (the Groww per-minute REST-leg tap — re-homed 2026-07-16)
+// Mark forwarding (the DHAN per-minute REST-leg tap — re-homed 2026-07-16;
+// broker corrected 2026-09-13, see the module header)
 // ---------------------------------------------------------------------------
 
-/// A mark-to-market price update. `Copy`, 16 bytes — sent from the Groww
+/// A mark-to-market price update. `Copy`, 16 bytes — sent from the Dhan
 /// per-minute REST legs at each persist-confirm choke point (own-fire
 /// just-closed 1m candle closes: ≤4 spot indices + the bounded ~30-contract
 /// selection per minute; 2026-07-17 truth-sync — the "per-tick" live-bridge
@@ -338,8 +358,8 @@ pub struct OrderRuntimeParams {
     /// producer exists in the socket-free shape; the gated live re-arm's
     /// socket/WAL drain must keep subscribing BEFORE any producer starts).
     pub first_order_update_rx: broadcast::Receiver<OrderUpdate>,
-    /// Bounded mark channel (the Groww per-minute REST legs' tap → this
-    /// runtime; re-homed 2026-07-16).
+    /// Bounded mark channel (the DHAN per-minute REST legs' tap → this
+    /// runtime; re-homed 2026-07-16, broker corrected 2026-09-13).
     pub mark_rx: mpsc::Receiver<MarkUpdate>,
     /// Shared arm flag (the hot-path gate half of the mark bridge).
     pub marks_wanted: Arc<AtomicBool>,
@@ -757,7 +777,7 @@ struct BookState {
     mirror: HashMap<u64, i64>,
     /// First-seen segment code per sid (the I-P1-11 tripwire). Footprint
     /// (HP-6): while armed, EVERY sid the tap forwards gets an entry — the
-    /// mark source is the Groww per-minute REST legs (≤4 spot indices + the
+    /// mark source is the DHAN per-minute REST legs (≤4 spot indices + the
     /// bounded ~30-contract selection per minute; 2026-07-17 truth-sync of
     /// the stale "~770-sid watch universe" live-bridge bound), so the map
     /// stays trivially small and is cleared at the daily reset.
@@ -1251,7 +1271,7 @@ async fn run_order_runtime(
     // DELTA rather than re-reporting a cumulative total forever.
     let mut marks_dropped_reported: u64 = 0;
     // Fix F (2026-07-17 respawn flap): the mark producers are DAY-SCOPED —
-    // the Groww per-minute REST legs' supervisors exit at day completion
+    // the DHAN per-minute REST legs' supervisors exit at day completion
     // ("day complete — supervisor exiting", ~15:31 IST after the
     // post-session sweep) and drop the last MarkForwarder clones, CLOSING
     // the mark mpsc for the rest of the process lifetime. That is a
@@ -1279,7 +1299,7 @@ async fn run_order_runtime(
         paper_fill = config.order_runtime.paper_fill,
         self_test = config.order_runtime.self_test,
         reconcile_interval_secs = reconcile_interval,
-        "order runtime started (paper book live — order updates + Groww marks now \
+        "order runtime started (paper book live — order updates + Dhan marks now \
          reach the OMS/RiskEngine; alert sinks wired). Paper book starts EMPTY: \
          paper fills are in-RAM only, so a restart zeroes paper positions + day \
          P&L (socket-free shape: no order-event frames are captured or replayed)"
@@ -1911,7 +1931,7 @@ async fn drive_self_test_timers(
     {
         return;
     }
-    info!("paper self-test armed — waiting for the first Groww mark to pick a sid");
+    info!("paper self-test armed — waiting for the first Dhan mark to pick a sid");
     self_test.phase = SelfTestPhase::AwaitingMark;
     self_test.started_at = std::time::Instant::now();
 }
