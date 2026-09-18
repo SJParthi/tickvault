@@ -336,20 +336,32 @@ fn net_volume_is_gone_from_every_link_of_the_chain() {
         let code = code_only(&raw);
         // `net_volume_chg_milli_pct` is a DIFFERENT column on a DIFFERENT
         // table (`top_volume`), it is the one the operator asked to sort by,
-        // and it carries `net_volume` as a prefix — so match the bare word.
-        for hit in [
-            "\"net_volume\"",
-            "net_volume:",
-            "net_volume LONG",
-            "c.net_volume",
-        ] {
+        // and it carries `net_volume` as a PREFIX. So carve that identifier
+        // out first, then refuse the bare word wherever it survives.
+        //
+        // A LITERAL list -- `\"net_volume\"`, `net_volume:`, `net_volume LONG`,
+        // `c.net_volume` -- was what this checked until 2026-09-18, and it had
+        // three evasions, all reachable by ordinary edits rather than malice:
+        // a different SQL alias (`b.net_volume`, which the 10m view's own
+        // nesting would naturally produce), a different column TYPE
+        // (`net_volume DOUBLE`), and a name spliced through `format!` from a
+        // const. Matching the WORD closes all three at once.
+        let scrubbed = code.replace("net_volume_chg_milli_pct", "");
+        let mut rest = scrubbed.as_str();
+        while let Some(at) = rest.find("net_volume") {
+            let tail = &rest[at + "net_volume".len()..];
+            let next_is_identifier = tail
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
             assert!(
-                !code.contains(hit),
-                "{}: `{hit}` still present in {what}. The 2026-09-18 directive \
-                 deletes the `net_volume` candle column; every link must go in \
-                 ONE change or the next boot re-adds it.",
+                next_is_identifier,
+                "{}: the bare word `net_volume` still appears in {what}. The \
+                 2026-09-18 directive deletes the `net_volume` candle column; \
+                 every link must go in ONE change or the next boot re-adds it.",
                 path.display()
             );
+            rest = tail;
         }
     }
 }
