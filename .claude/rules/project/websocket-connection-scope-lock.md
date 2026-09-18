@@ -6328,3 +6328,136 @@ different bug with the same ingredients.
   view costs one log line and is otherwise silent — the first boot is the
   measurement, and `SELECT count() FROM candles_10m WHERE ts IN today()`
   returning "table does not exist" is the tell.
+
+### 2026-09-18 (THIRD) — FUTURES ARE REMOVED FROM THE SUBSCRIPTION: equity underlying spots and options only
+
+**The verbatim operator demand (2026-09-18, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "See dude one more point dude which is see dude as of now let us go ahead with one and only equity underlying spots and only options dude remove the futures subscription itself dude okay? Do you understand dude what I'm even askign dude okay? It's simple dude we just need to remove this entire futures subscriptions alone dude okay?"
+
+Recorded HERE before any code, per the rule-file-first law. It NARROWS the
+2026-08-15 full-universe authorization, RETIRES the 2026-09-09 futures-as-primary
+centring lock, and MOVES the 2026-09-11 (THIRD/FOURTH) depth-20 name-board slot
+arithmetic.
+
+#### What is removed
+
+| Surface | Today | After |
+|---|---|---|
+| Main feed — `FUTIDX` contracts, ALL expiries | ~21 (Assumed 7 × 3) | **0** |
+| Main feed — `FUTSTK` contracts, ALL expiries | ~660 (Assumed 220 × 3) | **0** |
+| depth-20 — the future slot on EVERY name | 1 per name × 8 names = **8 slots** | **0** |
+| Equity underlying SPOT | kept | **kept** |
+| Index + stock OPTIONS | kept | **kept** |
+
+Sites: `dhan_contract_universe.rs` (`InstrumentClass::IndexFuture` /
+`StockFuture` push arms and their priority-1/2 block),
+`depth20_name_board.rs` (`slots_for_index_name`'s leading `1`,
+`slots_for_stock_name`, `future_index`, the two claim sites, `futures_missing`),
+`dhan_lifecycle.rs` (the `FUTIDX` / `FUTSTK` master rows).
+
+#### ⚠ THE FINDING THAT MAKES THIS CHEAP — the 2026-09-09 lock was NEVER IMPLEMENTED
+
+The 2026-09-09 section of this file authorized **stock futures as the PRIMARY
+price for centring the stock-option ATM±25 window**, with spot as the fallback,
+and stated the one-line change it needed:
+
+> "The ONLY thing stopping a future's price reaching the selector is the binding
+> pattern at `dhan_feed_stack.rs:6172-6176`, which admits `IdxI | NseEquity |
+> BseEquity` and nothing else. Widening it to `NseFno` is one enum arm."
+
+**That arm was never added.** Verified in source 2026-09-18: the live
+`record_spot_price` call site still binds
+`ExchangeSegment::IdxI | ExchangeSegment::NseEquity | ExchangeSegment::BseEquity`,
+and `SpotPriceStore` therefore holds no futures price. The sibling
+`PrevCloseStore` gate is narrower still (`IdxI | NseEquity`) exactly as that lock
+required.
+
+**So no futures price has ever centred a ladder.** The 2026-09-09 lock is retired
+by DELETION of the thing it would have applied to, not by a behaviour reversal —
+centring has been SPOT-primary the whole time and stays SPOT-primary. Its own
+measurement said the accuracy cost of that was **approximately zero** (median
+strike spacing 2.63%, one strike step needs 1.32%, futures premium ~0.5%); what
+it hoped to buy was COVERAGE for the handful of stocks that print no spot (8 of
+733 on 2026-08-21), and that coverage was never actually bought. Removing futures
+therefore loses a benefit this system never had.
+
+Recorded as a correction rather than an edit-in-place because the shape is the
+one this repository keeps paying for: **an authorization was written down, the
+code was not written, and four weeks of later sections reasoned as though it
+had been.** A scope lock records what is PERMITTED; only a call site records
+what RUNS, and the two must be checked separately.
+
+#### What it frees, and what that buys
+
+| | before | after |
+|---|---:|---:|
+| `slots_for_index_name(11)` | 47 | **46** |
+| `slots_for_stock_name(5)` | 24 | **23** |
+| `board_slot_cost()` = 2 index + 6 stock | **238** | **230** |
+| `DEPTH20_INSTRUMENT_BUDGET` | 250 | 250 |
+| spare depth-20 slots | 12 | **20** |
+| main-feed contracts | ~24,600 | **~23,920** |
+
+The const-assert `board_slot_cost() <= DEPTH20_INSTRUMENT_BUDGET` holds with more
+room, so the removal cannot fail the build in that direction.
+
+**What the 8 freed slots do and do not buy**, computed rather than guessed:
+
+| candidate | cost | verdict |
+|---|---:|---|
+| index ATM ±11 → ±12 | 238 | fits |
+| **index ATM ±11 → ±13** | **246** | **fits — the widest that does** |
+| index ATM ±11 → ±14 | 254 | over |
+| a 7th mover stock name | 253 | over |
+| stock ladder ±5 → ±6 | 254 | over |
+
+**NONE of these is taken by this quote.** Widening the index window is its own
+decision with its own dated row; this section removes futures and leaves the
+20 slots spare rather than spending them in the same change.
+
+#### ⚠ What is LOST (Rule 11 — no false-OK)
+
+- **No future ever ticks again.** `ticks` and every `candles_<tf>` frame stop
+  receiving `FUTIDX` / `FUTSTK` rows from the moment this lands. Rows already
+  written are RETAINED; only the writer stops.
+- **Futures leave `instrument_lifecycle` as a live class.** The rows already
+  there are NEVER deleted (SEBI, §5/§6/§25 of
+  `daily-universe-scope-expansion-2026-05-27.md`); the daily build simply stops
+  emitting new ones, exactly as the Groww removal of 2026-08-21 did.
+- **`futures_missing` becomes unreachable** and must be removed with its emit
+  sites, not left as a permanently-zero counter — a metric with no producer is
+  the dead-monitor class this repository has retired three times.
+- **Futures depth was already unreachable** and stays so: the 2026-08-11 second
+  quote records that no authorized Dhan source yields a FUTIDX `security_id` for
+  a depth subscription. Nothing changes there.
+- **The §36 / §36.7 FUTIDX grant** (`daily-universe-scope-expansion-2026-05-27.md`,
+  "ALL available monthly expiries of the 4 underlyings") is SUPERSEDED for the
+  revived Dhan lane by this quote. It remains the historical record of why
+  futures were ever subscribed.
+
+#### ⚠ NOT claimed
+
+- That this makes anything faster. It removes ~680 of ~24,600 main-feed
+  instruments — under 3% of the subscribed set — so the measured sweep and fold
+  costs move by roughly that fraction and nothing else changes shape.
+- That the freed depth slots are used. They are not, by design of this section.
+- That any future price was being read anywhere. It was not, and that is the
+  finding above rather than an assumption.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Subscribes any `FUTIDX` or `FUTSTK` contract on the main feed, or restores the
+  future slot to `slots_for_index_name` / `slots_for_stock_name`.
+- Spends the freed 8 slots (index ±12/±13, a 7th name, a wider stock ladder)
+  under cover of this quote — each needs its own dated row.
+- Deletes a `FUTIDX` / `FUTSTK` row from `instrument_lifecycle`,
+  `instrument_lifecycle_audit` or `index_constituency` (removing the WRITER is
+  authorized; deleting the ROWS never is).
+- Leaves `futures_missing`, `future_index` or the futures selection counters in
+  place with no producer.
+- Widens the `record_spot_price` binding to `NseFno` — the 2026-09-09 lock that
+  asked for it is retired by this section.
+- Removes equity underlying SPOT, or any option contract, in the name of this
+  narrowing. The quote names futures ALONE.
