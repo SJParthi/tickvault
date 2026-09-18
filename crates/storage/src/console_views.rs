@@ -297,6 +297,23 @@ pub fn candles_named_view_ddl() -> String {
 /// signs POSITIVE — the same "no baseline" default `signed_volume()` applies,
 /// and not a claim that the close rose.
 ///
+/// # The day partition, which is NOT cosmetic
+///
+/// The window is partitioned by IST DAY as well as by instrument,
+/// because the native fold refuses a cross-day baseline and says why in
+/// as many words (`aggregator_cell::net_volume_baseline`): *"Signing
+/// today's first bar against yesterday's close reports an OVERNIGHT GAP
+/// as intraday direction, on exactly the bar an operator looks at
+/// hardest."* Without the day key this view re-created exactly that
+/// defect, on the first bucket of every day and worse across a weekend:
+/// an instrument that gapped DOWN overnight and then ROSE through
+/// 09:00-09:10 would have read negative here and positive in
+/// `candles_1m`, so the two tables would contradict each other on the
+/// most-read bar of the session. `date_trunc` is the lowest-risk
+/// construct available for it -- `date_trunc('minute', ts)` is already
+/// live against this QuestDB in `feed_scoreboard_boot`, so unlike
+/// `SAMPLE BY` and `lag()` it is not a first use.
+///
 /// # ⚠ UNVERIFIED against a live QuestDB
 ///
 /// No QuestDB was reachable when this was written (no docker daemon in the
@@ -317,7 +334,8 @@ pub fn candles_10m_view_ddl() -> String {
          FROM ( \
          SELECT a.*, \
          lag(a.close) OVER ( \
-         PARTITION BY a.security_id, a.segment, a.feed ORDER BY a.ts \
+         PARTITION BY a.security_id, a.segment, a.feed, \
+         date_trunc('day', a.ts) ORDER BY a.ts \
          ) AS prev_close \
          FROM ( \
          SELECT ts, security_id, segment, feed, \
@@ -1099,6 +1117,42 @@ mod tests {
         assert!(
             !ddl.contains("sum(volume)"),
             "summing the signed value cancels opposite minutes to zero: {ddl}"
+        );
+    }
+
+    /// The window is partitioned by IST DAY, so the first bucket of a
+    /// session is never signed against the PREVIOUS session's close.
+    ///
+    /// The native fold refuses that baseline explicitly
+    /// (`aggregator_cell::net_volume_baseline` returns `0.0` when the last
+    /// seal belongs to a different IST day), and its docstring names the
+    /// reason: an overnight gap reported as intraday direction, on the bar
+    /// an operator reads hardest. Without this key the view contradicted
+    /// `candles_1m` on the first bucket of every trading day.
+    #[test]
+    fn the_ten_minute_sign_never_crosses_a_day_boundary() {
+        let ddl = candles_10m_view_ddl();
+        assert!(
+            ddl.contains("date_trunc('day', a.ts) ORDER BY a.ts"),
+            "the lag window must be partitioned by IST day, or the first \
+             bucket of each session is signed against yesterday: {ddl}"
+        );
+        // The day key belongs to the PARTITION, never the ORDER BY: ordering
+        // by a truncated day would tie every bucket of a session together and
+        // make `lag` pick an arbitrary neighbour.
+        let partition = ddl
+            .find("PARTITION BY a.security_id")
+            .expect("the window must partition by instrument");
+        let order = ddl
+            .find("ORDER BY a.ts")
+            .expect("the window must order by ts");
+        let day = ddl
+            .find("date_trunc('day', a.ts)")
+            .expect("the window must carry a day key");
+        assert!(
+            partition < day && day < order,
+            "the day key must sit INSIDE the PARTITION BY list, before the \
+             ORDER BY: {ddl}"
         );
     }
 
