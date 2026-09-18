@@ -6237,3 +6237,94 @@ up as one warn line. The first boot after deploy is the measurement.
 - Relaxes either round-trip test from whole-struct equality to field spot-checks.
 - Replaces `prev_close > 0` with `IS NOT NULL` in the 10m view.
 - Reports `candles_10m` as verified before a boot log shows the CREATE accepted.
+
+#### 2026-09-18 (FOURTH, same day, hours later) — the 10m view signed its first bucket of every day against YESTERDAY's close
+
+**No new authorization is claimed.** This is a defect in the change the section
+above records as SHIPPED, found by an adversarial sweep of that change and
+fixed before it merged. Recorded because the native fold refuses exactly this
+baseline, in a docstring that names the consequence — and the view I wrote to
+derive `10m` from `1m` re-created it one layer up.
+
+##### The defect
+
+`aggregator_cell::net_volume_baseline` returns `0.0` when the last sealed bar
+belongs to a different IST day, and says why verbatim:
+
+> *"Signing today's first bar against yesterday's close reports an OVERNIGHT
+> GAP as intraday direction, on exactly the bar an operator looks at hardest."*
+
+`candles_10m_view_ddl` computed its baseline as
+`lag(a.close) OVER (PARTITION BY a.security_id, a.segment, a.feed ORDER BY a.ts)`
+— **no day key, no `WHERE`**. So the 09:00–09:10 bucket of every session took
+its sign from the previous session's last bucket.
+
+**The failure, concretely.** NIFTY closes 24,500 on day N−1. Day N gaps down,
+opens 24,300, and the first bucket closes 24,350 — it ROSE 50 points. The view
+reads `24,350 < 24,500` and reports `−gross`. `candles_1m` for the same
+minutes reports positive. **The two tables contradict each other on the first
+bucket of every trading day, every instrument, and worse across a weekend or a
+holiday** — on the bar an operator opens the session by reading.
+
+##### The fix
+
+`date_trunc('day', a.ts)` joins the `PARTITION BY` list, which reproduces the
+native fold's IST-day refusal exactly (both tables store naive IST in a
+UTC-typed column, so the day is a plain truncation with no timezone hop).
+
+`date_trunc` is deliberately the construct chosen: **it is already live against
+this QuestDB** — `feed_scoreboard_boot` runs
+`select distinct date_trunc('minute', ts) from ticks` in production — so unlike
+`SAMPLE BY` and `lag()`, which this view is the repository's first user of, it
+is not a first use and adds no new dialect risk.
+
+Pinned by `the_ten_minute_sign_never_crosses_a_day_boundary`, which asserts the
+day key is present AND that it sits inside the `PARTITION BY` list rather than
+the `ORDER BY` — ordering by a truncated day would tie every bucket of a
+session together and make `lag` pick an arbitrary neighbour, which is a
+different bug with the same ingredients.
+
+##### Two more findings from the same sweep, fixed in the same change
+
+1. **A VACUOUS test.** `test_volume_saturates_when_above_i64_max` asserted
+   *"saturated volume MUST stay positive"* on a `LiveCandleState::empty()`
+   fixture whose `bucket_open_prev_close` is `0.0` — so `signed_volume()`
+   returned early on the no-baseline rule and the assertion could not fail
+   whatever the saturation arm did. It now drives the NEGATING arm (baseline
+   above the close) and asserts `-i64::MAX`, which proves the saturation AND
+   that `i64::MIN` is unreachable; a second case keeps the positive arm.
+   That is the ninth vacuous guard this repository has recorded, and the
+   shape is the same every time: **a fixture that satisfies the assertion by
+   a different rule than the one under test.**
+2. **The removal guard matched LITERALS, so three ordinary edits evaded it.**
+   `net_volume_is_gone_from_every_link_of_the_chain` checked for
+   `"net_volume"`, `net_volume:`, `net_volume LONG` and `c.net_volume`. A
+   different SQL alias (`b.net_volume` — which this very view's nesting
+   produces naturally), a different column type (`net_volume DOUBLE`), or a
+   name spliced through `format!` from a const each passed green. It now
+   carves out `net_volume_chg_milli_pct` and refuses the bare WORD, which
+   closes all three at once. Bite-proven both directions: adding
+   `b.net_volume` to the 10m view fails it by name; removing it passes.
+
+##### ⚠ What this does NOT fix (Rule 11)
+
+- **`fold_late_hlc` can still leave a stored sign contradicting the stored
+  closes in the same table.** A late tick amends bar N's close in place and
+  re-emits only bar N; bar N+1's sign was already computed and written from
+  the pre-amendment close. The sign is right for the data as it stood at seal
+  and wrong against the row now beside it, and `tf_consistency` is
+  structurally blind to it because it compares `abs()` on both sides. This is
+  a documented residual at the field site, not something this change
+  introduces or repairs.
+- **The higher-timeframe SIGN is verified by nothing.** `recompute_window`
+  sums `checked_abs` and compares against `checked_abs` of the stored value —
+  correct, and deliberately so, because a signed sum across frames does not
+  equal the frame's own sign. But it means an inverted 15m/30m/60m sign passes
+  the daily verifier silently. The rule text above asks for "the sign checked
+  separately as its own field"; that half is NOT implemented.
+- **The 10m view has still never been accepted by a live QuestDB.** No docker
+  daemon and no reachable port 9000 in this environment. `run_view_ddl`
+  degrades a refusal to a counted `warn!` that no alarm reads, so a rejected
+  view costs one log line and is otherwise silent — the first boot is the
+  measurement, and `SELECT count() FROM candles_10m WHERE ts IN today()`
+  returning "table does not exist" is the tell.
