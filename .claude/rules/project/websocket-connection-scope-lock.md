@@ -5617,3 +5617,185 @@ column already matches it with no re-fold.
 consequence of zeroing flat bars; with the magnitude preserved, `abs(signed) == gross`
 holds on every bar and clause 2's derived `10m` stands unconditionally — no `TfIndex`
 variant, no `TF_COUNT` change, no seal-ring resize, zero added per-tick work.
+
+### 2026-09-18 (SECOND) — OHLCV AND VOLUME BUCKET ON THE EXCHANGE `ts`, NOT `received_at`
+
+**The verbatim operator demand (2026-09-18, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "dude just now foudn one more issue which is see dude as fo now to set the rpecise ohlcv we used the recived at right dude but now we have a catch bro which is see we need to use this ts dude nowhere hereafetr we hsodu luse received at to define our ohlcv dude okay? our only apporach si to use this ts to set our ohlcv everyhwere dude okay even volume also ddue okay?"
+
+This dated section is the rule-file-first record required before any bucketing
+code moves. **It REVERSES the operator's own 2026-08-28 directive** recorded
+above ("CANDLES FROM 09:00, OHLCV ON THE RECEIPT CLOCK"), which is why it gets
+its own section rather than an edit in place.
+
+#### ⚠ This is a reversal of a reversal, and the earlier record says so
+
+The 2026-08-28 section opens with a block headed *"The reaffirmation, recorded
+so the decision is auditable"*, and its own words are: the receipt-clock
+instruction *"was given, measured against, reported back with contrary evidence,
+and then **reaffirmed**."* So the operator has now moved back to the clock that
+the contrary evidence favoured. That is not a contradiction to be papered over —
+it is the measurement winning, one directive later.
+
+#### The measurement, quoted from the section this one reverses
+
+| Measured on production, 2026-08-27, NIFTY | Exchange clock (`ts`) | `received_at` |
+|---|---|---|
+| Session minutes present | **385 / 385** | 351 / 385 |
+| Bars exactly matching the vendor's own tape | **382 (99.2%)** | 321 (83.4%) |
+| Phantom bars stamped outside market hours | **0** | 4 |
+| Ticks filed on the WRONG DAY | **0** | 4,319 |
+| Ticks that would change minute on the LIVE path | — | 0 of 83,871 |
+
+**The exchange clock won on every dimension that was measured.** The last row is
+why the 2026-08-28 choice was defensible at the time: on the LIVE path the two
+clocks are identical, because Dhan stamps whole seconds and we receive inside the
+same second. They diverge only on WAL replay — and there `received_at` carried
+the moment of REPLAY rather than the moment of receipt, which was a DEFECT in how
+`received_at` was populated, closed the same day by the `TVW3` record format.
+
+So the honest statement of this reversal: the 2026-08-28 directive fixed a
+`received_at` defect and then kept the clock whose own measurements were worse.
+This directive takes the better-measured clock.
+
+#### ⚠ CORRECTED 2026-09-18 (same day, hours later) — the "catch" first written
+#### here was WRONG on BOTH counts, and it was wrong in the blocking direction
+
+The first draft of this subsection told the operator that `ts` bucketing would
+re-create the **8,898 fabricated bars** defect and that today's bucketing is
+`received_at`. **Neither is true.** Both were asserted from the 2026-08-28
+section's prose rather than from the function that actually buckets a tick, and
+the function's own doc retracts the exact argument that was quoted. The wrong
+text is replaced rather than annotated, because leaving a false BLOCKER standing
+is how a session ends up refusing work the code already supports.
+
+**What actually buckets a tick today — `tf_index.rs::fold_clock_ist_secs`:**
+
+```rust
+if received_at_nanos <= 0 { return exchange_timestamp; }      // no receipt -> ts
+let delta = receipt_ist_secs - exchange_timestamp;
+if delta > MAX_PLAUSIBLE_RECEIPT_LAG_SECS      // +300
+    || delta < -MAX_PLAUSIBLE_RECEIPT_LEAD_SECS { //  -10
+    return exchange_timestamp;                                 // implausible -> ts
+}
+receipt_ist_secs                                               // else -> receipt
+```
+
+It is a **DELTA-BOUNDED HYBRID**, not `received_at`. It prefers the receipt clock
+ONLY inside `[-10 s, +300 s]` of the trade stamp, and falls back to `ts`
+everywhere else.
+
+| Case | Clock used TODAY | Clock under this directive | Changes? |
+|---|---|---|---|
+| Live tick, delivered inside 300 s | receipt | `ts` | **yes — this is the only real change** |
+| Dormant snapshot, LTT hours/days old | **`ts` already** (fails +300 s) | `ts` | no |
+| Clock lead > 10 s | **`ts` already** | `ts` | no |
+| Pre-TVW3 WAL frame, `received_at_nanos == 0` | **`ts` already** (sentinel arm) | `ts` | no |
+
+**So the stale-LTT case the draft called a blocker has been bucketing on `ts`
+since the delta guard was written.** `fold_clock_ist_secs`'s own doc says so, and
+retracts the justification the draft borrowed, verbatim: *"An earlier draft of
+this doc justified the change with the DORMANT CONTRACT case… **That
+justification was FALSE**, and the test written to demonstrate it failed instead
+— which is how it was caught. The delta guard below refuses any receipt more than
+[MAX_PLAUSIBLE_RECEIPT_LAG_SECS] past the trade, so a stale snapshot falls
+straight back to its trade stamp."*
+
+**And the fabricated-bar defect is NOT guarded by the clock — it is guarded by a
+clock-INDEPENDENT day gate** (`multi_tf_aggregator.rs`, the `fold_day` vs
+`receipt_day` comparison on both arms): a fold whose IST DAY differs from the
+receipt day is refused as `stale_trading_day` / `future_trading_day` **whichever
+clock produced `fold_secs`**. That gate is untouched by this directive and keeps
+working identically after it.
+
+#### What this directive ACTUALLY changes, stated honestly
+
+It deletes the **≤300 s delivery-lag correction** on the live path, and nothing
+else. The consequence, stated plainly rather than minimised:
+
+* A trade the exchange stamps **09:29:59** that reaches us at **09:30:01** files
+  into the **09:29** bar under `ts` (correct by EVENT time — it is what the
+  vendor's own tape shows) instead of the **09:30** bar under the hybrid (correct
+  by the bar a live decision was reading at that instant).
+* The measured live impact is **zero**: `0 of 83,871` ticks changed minute on the
+  live path (the 2026-08-28 table above), because Dhan stamps whole seconds and we
+  receive inside the same second. It bites only when delivery lag exceeds the
+  seconds remaining in the bucket — rare per tick at a p50 of 1.38 s, and
+  systematically more likely on the 1-second frame than the 1-minute one.
+* **That is the trade the operator has chosen**, and it is the one the measured
+  table favours: the exchange clock won 385/385 minutes, 99.2% tape agreement,
+  0 phantom bars, 0 wrong-day ticks.
+
+#### The ONE residual, which is pre-existing and is NOT introduced here
+
+A pre-TVW3 WAL frame carries `received_at_nanos == 0` — the documented "no
+receipt" sentinel. Both day gates stand down there rather than guess, so such a
+frame is protected only by the replay watermark's ordering. Under the hybrid it
+ALREADY buckets on `ts`, so this directive changes nothing about it. Recorded so
+it is not mistaken for a new hole opened by the clock change.
+
+#### `ws_lag_ms` MUST NOT follow this directive
+
+The delivery-lag gauge measures `received_at − ts` **by definition**. Refactoring
+it onto `fold_secs` would collapse it to a constant 0 and blind
+`tv-<env>-dhan-worst-socket-deaf`, which is the only alarm that can see a socket
+that pongs but has stopped delivering. `ws_lag_clock_guard.rs` exists for exactly
+this and stays.
+
+#### The 09:00 → 15:39:59 window clause — ALREADY SHIPPED, and it already keys on `ts`
+
+Operator, same message (2026-09-18, verbatim): *"meanwhiel now ensure to recieve
+the data starting 9 am till 3.39.59 pm dude okay so now we need to use ts dude
+isntead of received at dude okay?"*
+
+**This half needs no code.** `crates/common/src/session_window.rs` shipped
+2026-09-05 against the operator's own earlier verbatim rule — which that module
+quotes in its header — and it is WIRED, not dormant:
+
+| Property | Value, verified in source |
+|---|---|
+| Window | `[TICK_PERSIST_START_SECS_OF_DAY_IST, TICK_PERSIST_END_SECS_OF_DAY_IST)` = `[32_400, 56_400)` = **09:00:00 → 15:39:59.999999999 IST** |
+| Refusal key | **`ts` ALONE** (`WindowVerdict::is_refusal` matches `TsOutOfWindow` only) |
+| `received_at` out of window | **COUNTED and LOGGED, never refused** |
+| Production call sites | `tick_persistence.rs`, `depth_persistence.rs`, `shadow_candle_writer.rs`, `tick_spill_replay.rs` |
+| Complexity | **O(1)** — two integer divisions, two compares, zero allocation |
+
+The end being EXCLUSIVE is what makes it read "till 3.39 pm": the last accepted
+instant is 15:39:59.999999999. The module's own doc warns against "fixing" 56_400
+to 56_340, which would discard the entire 15:39 minute **including the closing
+auction**.
+
+**The receipt leg was deliberately made non-refusing**, and that decision is the
+operator's first principle applied: at the measured Dhan p99 delivery lag of
+46.37 s, refusing on receipt discarded the last ~46 seconds of every session for
+the slowest 1% of ticks — silently, with no replay. `ts` says WHAT THE ROW IS;
+`received_at` says how fast the network was, and a real print must never be
+dropped because the vendor was slow.
+
+#### What this directive does NOT authorize
+
+- Moving `TICK_PERSIST_START_SECS_OF_DAY_IST`, the day-OHLC gate, or any session
+  window. This changes WHICH CLOCK buckets a tick, never which ticks are admitted.
+- Re-admitting pre-open ticks into day HIGH/LOW/CLOSE (the 2026-08-25 carve-out
+  stands, and the 2026-08-26 re-affirmation stands with it).
+- Any change to the `ticks` table's own `ts`, which has stored the exchange
+  timestamp since it was written and is unaffected.
+- Any change to the socket budget, the endpoint types, `dry_run`, or the §28
+  frozen indicator/strategy area.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Buckets on `ts` without a stale-LTT guard — that is the 8,898-fabricated-bar
+  defect, restored by name.
+- Silently drops a stale-LTT tick instead of counting it: the refusal families
+  (`stale_trading_day`, `future_trading_day`, `untraded_timestamp`,
+  `untraded_sentinel`, `out_of_band_timestamp`) exist so a refusal is countable,
+  and a new one must be too.
+- Buckets OHLC on `ts` and leaves VOLUME on `received_at`, or vice versa — the
+  directive says "even volume also", and a split clock makes the two
+  unreconcilable by construction.
+- Claims the two clocks now agree on the replay path without re-measuring: the
+  2026-08-27 table is a measurement with a date, and the `TVW3` record format
+  changed one of its inputs.
