@@ -477,10 +477,25 @@ pub struct CandleBarReading {
     /// The bar's SIGNED gross volume — byte-identical to what
     /// `candles_<tf>.volume` carries for this contract and bucket.
     pub signed_volume: i64,
-    /// The bar's bucket-OPEN, in IST epoch seconds. Compared against the row's
-    /// own `ts` to produce `candle_bucket_skew_secs`, which is what makes a
-    /// mismatched window visible instead of silent.
-    pub bucket_open_ist_secs: u32,
+    /// How far the fold's OPEN bucket has advanced past the window this row
+    /// describes, in seconds — the value stored as `candle_bucket_skew_secs`.
+    ///
+    /// `0` means the bar this reading came from is STILL OPEN: the fold has
+    /// not rolled past this window yet, so the volume beside it can still
+    /// grow and a later sweep may read a larger number for the same window.
+    /// A POSITIVE value means the fold has moved on, so the bar is sealed and
+    /// its volume is final — which is the state a cross-verification wants.
+    ///
+    /// It can never say the reading is for the WRONG window: the probe
+    /// resolves the row's own window by integer equality and returns nothing
+    /// when it cannot (see `MultiTfAggregator::bar_for_window`). Before
+    /// 2026-09-18 this field carried a genuine skew and a non-zero value
+    /// meant "these two halves measure different intervals" — that shape
+    /// systematically excluded the busiest contracts from every cross-check,
+    /// because a busy contract has usually already rolled by the time a sweep
+    /// reads it, and those are precisely the rows a volume board exists to
+    /// rank.
+    pub open_bucket_advance_secs: i64,
     /// The bar's own price change against the previous sealed bar, in percent,
     /// or `None` when that bar had no usable baseline.
     pub price_chg_pct: Option<f64>,
@@ -526,7 +541,7 @@ where
     G: Fn(u64) -> Option<f64>,
     S: Fn(u64, ExchangeSegment) -> bool,
     L: Fn(u64, ExchangeSegment) -> Option<&'a str>,
-    C: Fn(u64, ExchangeSegment) -> Option<CandleBarReading>,
+    C: Fn(u64, ExchangeSegment, u32) -> Option<CandleBarReading>,
 {
     // FLOORED TO THE CADENCE GRID, not merely to the second.
     //
@@ -571,11 +586,18 @@ where
         .unwrap_or(1)
         .saturating_mul(NANOS_PER_SECOND);
     let ts = boundary.saturating_sub(period_nanos);
-    // The row stamp in IST epoch SECONDS, for the candle-skew comparison
-    // below: `LiveCandleState::bucket_start_ist_secs` is seconds, and doing
-    // the subtraction in seconds keeps the skew column a small honest integer
-    // rather than a nanosecond figure nobody reads.
+    // The row stamp in IST epoch SECONDS — the OPEN of the window this
+    // snapshot describes, and the exact key the candle fold buckets on
+    // (`LiveCandleState::bucket_start_ist_secs` is seconds). It is handed to
+    // the candle probe so the probe can answer for THIS window or refuse.
+    //
+    // `None` only when the stamp will not fit the fold's `u32` second —
+    // impossible on any epoch this code can see (`u32` seconds run past year
+    // 2106) and refused rather than coerced, because coercing to `0` would
+    // collide with the fold's own never-opened sentinel and store an empty
+    // bar as if it were a measurement.
     let ts_secs = ts.div_euclid(NANOS_PER_SECOND);
+    let window_open_secs = u32::try_from(ts_secs).ok();
     // `rows` IS pre-sized: it genuinely fills. Every contract on the board
     // produces a row — the two refusals that can fire in the common case
     // (`GainUnavailable`, `LabelUnavailable`) do NOT drop the row, they only
@@ -689,22 +711,21 @@ where
         // array. It answers `None` when the contract has no aggregator slot at
         // all (never ticked this session, or the slot budget was exhausted).
         //
-        // A bar whose `bucket_open_ist_secs` is 0 has NEVER OPENED, which is
-        // the fold's documented sentinel, and it is refused here rather than
-        // stored: a `0` skew would claim the bar describes this exact window,
-        // and a `0` volume would read as "no trades", and neither is knowable.
-        // Refusing keeps the three columns NULL together, which is the only
-        // state a cross-verification can filter on.
-        let candle = candle_of(contract.security_id, contract.segment)
-            .filter(|bar| bar.bucket_open_ist_secs != 0);
-        // Bar bucket-open MINUS this row's `ts`, in seconds. `0` means the two
-        // describe the same window and the volumes are comparable; anything
-        // else is a row whose halves measure different intervals and was never
-        // meant to match. See the column's own doc for the three ways that
-        // legitimately happens.
-        let candle_bucket_skew_secs = candle
-            .as_ref()
-            .map(|bar| i64::from(bar.bucket_open_ist_secs).saturating_sub(ts_secs));
+        // The probe is asked for THIS ROW'S OWN WINDOW, never for "whatever is
+        // open now": it is handed `window_open_secs` and answers `None` unless
+        // it holds a bar that starts exactly there. So the three columns
+        // either describe this row's window or are NULL together — a
+        // cross-verification can never be handed a neighbouring window's
+        // volume wearing this row's timestamp.
+        //
+        // `window_open_secs` is `None` only when the row's own `ts` will not
+        // fit the fold's `u32` second — impossible on any epoch this code can
+        // see (`u32` seconds run past year 2106) and refused rather than
+        // coerced, because coercing to `0` would match the fold's own
+        // never-opened sentinel and store an empty bar as a measurement.
+        let candle = window_open_secs
+            .and_then(|window| candle_of(contract.security_id, contract.segment, window));
+        let candle_bucket_skew_secs = candle.as_ref().map(|bar| bar.open_bucket_advance_secs);
         // FINITE-gated exactly as `gain_pct` above is. The fold already
         // refuses a non-finite quotient, so this is the second gate on a value
         // that must never reach `column_f64` — cheap, and it means a future
@@ -776,27 +797,31 @@ mod tests {
     /// written before 2026-09-18 implicitly assumed. Passing it explicitly
     /// keeps those tests asserting exactly what they asserted before the
     /// three fold columns existed.
-    const fn no_candle(_id: u64, _segment: ExchangeSegment) -> Option<CandleBarReading> {
+    const fn no_candle(
+        _id: u64,
+        _segment: ExchangeSegment,
+        _window: u32,
+    ) -> Option<CandleBarReading> {
         None
     }
-    const NO_CANDLE: fn(u64, ExchangeSegment) -> Option<CandleBarReading> = no_candle;
+    const NO_CANDLE: fn(u64, ExchangeSegment, u32) -> Option<CandleBarReading> = no_candle;
 
     /// A fold reading that describes the SAME window the row does (`skew 0`),
     /// with a NEGATIVE volume and the price fall that signs it — the shape the
     /// columns exist to carry.
     #[allow(clippy::unnecessary_wraps)]
-    fn test_candle(_id: u64, _segment: ExchangeSegment) -> Option<CandleBarReading> {
+    fn test_candle(_id: u64, _segment: ExchangeSegment, _window: u32) -> Option<CandleBarReading> {
         Some(CandleBarReading {
             signed_volume: -4_242,
-            // The 1-second cadence's row stamps `ts = 0` in these fixtures
-            // (`NANOS_PER_SECOND` floored to the grid, minus one period), so a
-            // bucket open of 1 would be a skew of 1. Tests that assert a skew
-            // set this deliberately; see `TEST_CANDLE_AT`.
-            bucket_open_ist_secs: 1,
+            // One second of advance: the fold has rolled past this row's
+            // window, so the bar is SEALED and its volume is final. Tests
+            // that care about the still-open case set `0` explicitly through
+            // `candle_advanced_by`.
+            open_bucket_advance_secs: 1,
             price_chg_pct: Some(-0.37),
         })
     }
-    const TEST_CANDLE: fn(u64, ExchangeSegment) -> Option<CandleBarReading> = test_candle;
+    const TEST_CANDLE: fn(u64, ExchangeSegment, u32) -> Option<CandleBarReading> = test_candle;
 
     /// Like [`contract`], naming the underlying explicitly for the tests that
     /// exercise the gain closure — which is keyed on the UNDERLYING.
@@ -1748,40 +1773,43 @@ mod tests {
     // cant see any normal percnetage change and volume percentage change
     // columns sepaartely"*.
 
-    /// A helper that parameterises the bar-open second, for the skew tests.
-    fn candle_at(
-        bucket_open_ist_secs: u32,
+    /// A helper that parameterises how far the fold's open bucket has
+    /// advanced past the row's window — `0` for a bar still being written,
+    /// positive for one the fold has already rolled past and sealed.
+    ///
+    /// It takes the advance DIRECTLY rather than a bar-open second, because
+    /// since 2026-09-18 the probe resolves the row's own window by integer
+    /// equality (`MultiTfAggregator::bar_for_window`) and returns `None` when
+    /// it cannot. A fixture can therefore no longer express "a reading for
+    /// the WRONG window" — that case is now unrepresentable rather than
+    /// merely untested.
+    fn candle_advanced_by(
+        open_bucket_advance_secs: i64,
         signed_volume: i64,
         price_chg_pct: Option<f64>,
-    ) -> impl Fn(u64, ExchangeSegment) -> Option<CandleBarReading> {
-        move |_id, _segment| {
+    ) -> impl Fn(u64, ExchangeSegment, u32) -> Option<CandleBarReading> {
+        move |_id, _segment, _window| {
             Some(CandleBarReading {
                 signed_volume,
-                bucket_open_ist_secs,
+                open_bucket_advance_secs,
                 price_chg_pct,
             })
         }
     }
 
-    /// The row stamp, in IST seconds, for the fixtures below — derived from
-    /// the projection's OWN rule rather than restated, so a change to the
-    /// stamp cannot leave these tests asserting a skew against a stale number.
-    fn row_ts_secs(snapshot_ts_ist_nanos: i64, cadence: SnapshotCadence) -> i64 {
-        let boundary = floor_to_grid(snapshot_ts_ist_nanos, cadence.interval_secs());
-        let period = i64::try_from(cadence.interval_secs())
-            .unwrap_or(1)
-            .saturating_mul(NANOS_PER_SECOND);
-        boundary.saturating_sub(period).div_euclid(NANOS_PER_SECOND)
-    }
+    // ⚠ REMOVED 2026-09-18 — `row_ts_secs` re-derived the row's stamp so the
+    // fixtures could compute a bar-open that would land on a given skew. The
+    // fixtures no longer choose a bar-open at all: `candle_advanced_by` states
+    // the advance directly, because `bar_for_window` resolves the window by
+    // integer equality and a fixture cannot express a mismatched one. Nothing
+    // called it, and a dead helper in a test module is a warning, not a spare.
 
     #[test]
     fn the_fold_reading_lands_in_the_three_candle_columns() {
         let ranked = vec![contract(10, 1, 500)];
-        // A bar whose open IS this row's window, so the skew is 0 and the two
-        // volumes are directly comparable — the state a cross-verification
-        // filters for.
-        let ts_secs = row_ts_secs(10 * NANOS_PER_SECOND, SnapshotCadence::OneSecond);
-        let open = u32::try_from(ts_secs).expect("fixture stamp fits u32");
+        // A bar the fold has NOT rolled past — advance 0 — so it is still
+        // open and its volume may still grow. The probe returns it for this
+        // row's own window; the column says so rather than implying finality.
         let p = project_snapshot(
             10 * NANOS_PER_SECOND,
             SnapshotCadence::OneSecond,
@@ -1790,7 +1818,7 @@ mod tests {
             |_| Some(1.5),
             |_, _| false,
             TEST_LABEL,
-            candle_at(open, -4_242, Some(-0.37)),
+            candle_advanced_by(0, -4_242, Some(-0.37)),
         );
         let row = &p.rows[0];
         assert_eq!(
@@ -1802,7 +1830,8 @@ mod tests {
         assert_eq!(
             row.candle_bucket_skew_secs,
             Some(0),
-            "a bar opening on this row's own window stamp is skew 0"
+            "advance 0 means the bar is still open — it is a real reading for \
+             this row's own window, not a missing one"
         );
         assert!(
             (row.candle_price_chg_pct.expect("price change present") + 0.37).abs() < f64::EPSILON,
@@ -1833,41 +1862,35 @@ mod tests {
         assert_eq!(p.rows.len(), 1);
     }
 
-    #[test]
-    fn a_bar_that_never_opened_is_refused_rather_than_stored_as_a_zero_skew() {
-        let ranked = vec![contract(10, 1, 500)];
-        let p = project_snapshot(
-            NANOS_PER_SECOND,
-            SnapshotCadence::OneSecond,
-            OptionFamily::Stock,
-            &ranked,
-            |_| Some(1.5),
-            |_, _| false,
-            TEST_LABEL,
-            // `bucket_start_ist_secs == 0` is the fold's documented
-            // never-opened sentinel. Storing it would claim a skew of
-            // `-row_ts` AND a volume of 0 — two confident lies about a bar
-            // that does not exist.
-            candle_at(0, 0, Some(0.0)),
-        );
-        let row = &p.rows[0];
-        assert_eq!(row.candle_volume_signed, None);
-        assert_eq!(row.candle_bucket_skew_secs, None);
-        assert_eq!(row.candle_price_chg_pct, None);
-    }
+    // ⚠ RETIRED 2026-09-18 — `a_bar_that_never_opened_is_refused_rather_than_
+    // stored_as_a_zero_skew` tested a shape this layer can no longer be
+    // handed. It fed a reading whose bar-open was the fold's never-opened
+    // sentinel (`bucket_start_ist_secs == 0`) and asserted the projection
+    // refused it.
+    //
+    // The projection no longer receives a bar-open at all. The probe resolves
+    // the row's own window by integer equality inside
+    // `MultiTfAggregator::bar_for_window`, which returns `None` when neither
+    // the open bucket nor the last sealed bucket matches — and a never-opened
+    // cell carries `0`, which can never equal a real row's window. So the
+    // refusal moved DOWN a layer and became structural rather than a
+    // downstream check.
+    //
+    // The replacement lives where the decision now is:
+    // `multi_tf_aggregator::tests::bar_for_window_refuses_a_never_opened_cell`.
+    // Recorded rather than deleted, because a reader finding the test gone
+    // would reasonably suspect the guarantee went with it.
 
     #[test]
-    fn the_skew_is_the_bar_open_minus_the_row_stamp_and_is_signed_both_ways() {
+    fn the_advance_column_says_open_or_sealed_and_never_a_wrong_window() {
         let ranked = vec![contract(10, 1, 500)];
         let snapshot = 300 * NANOS_PER_SECOND;
         let cadence = SnapshotCadence::FiveSecond;
-        let ts_secs = row_ts_secs(snapshot, cadence);
-        let stamp = u32::try_from(ts_secs).expect("fixture stamp fits u32");
 
-        // A bar one whole period OLDER than this row's window — the ordinary
-        // shape for a contract that did not trade in the window that just
-        // closed and is still holding its last bar.
-        let older = project_snapshot(
+        // Advance 0 — the fold has not rolled past this row's window, so the
+        // bar is STILL OPEN and the volume beside it can still grow. A
+        // cross-verification that wants a final number filters this out.
+        let still_open = project_snapshot(
             snapshot,
             cadence,
             OptionFamily::Stock,
@@ -1875,18 +1898,22 @@ mod tests {
             |_| Some(1.5),
             |_, _| false,
             TEST_LABEL,
-            candle_at(stamp - 5, 100, None),
+            candle_advanced_by(0, 100, None),
         );
         assert_eq!(
-            older.rows[0].candle_bucket_skew_secs,
-            Some(-5),
-            "an older bar reads NEGATIVE — the column must be signed, because \
-             the race in the other direction is real too"
+            still_open.rows[0].candle_bucket_skew_secs,
+            Some(0),
+            "zero advance means the bar is open, not that the reading is absent"
         );
 
-        // A bar one period NEWER: the boundary race the column exists to make
-        // visible — a tick rolled the bucket in the same instant this sweep ran.
-        let newer = project_snapshot(
+        // A positive advance — the fold has moved on, so this window's bar is
+        // SEALED and its volume is final. This is the state a cross-check
+        // wants, and BEFORE 2026-09-18 it was the state that was silently
+        // excluded: the old probe read the currently-open bucket, so a busy
+        // contract (which has always already rolled) never produced a
+        // comparable reading. The busiest contracts are exactly the ones a
+        // volume board exists to rank.
+        let sealed = project_snapshot(
             snapshot,
             cadence,
             OptionFamily::Stock,
@@ -1894,16 +1921,20 @@ mod tests {
             |_| Some(1.5),
             |_, _| false,
             TEST_LABEL,
-            candle_at(stamp + 5, 100, None),
+            candle_advanced_by(5, 100, None),
         );
-        assert_eq!(newer.rows[0].candle_bucket_skew_secs, Some(5));
+        assert_eq!(sealed.rows[0].candle_bucket_skew_secs, Some(5));
+
+        // What can no longer be expressed at all: a reading for a DIFFERENT
+        // window. `bar_for_window` matches the row's window by integer
+        // equality and returns `None` otherwise, so the projection is handed
+        // the right bar or nothing — never a bar for the wrong interval
+        // wearing a skew that a reader has to notice and discount.
     }
 
     #[test]
     fn a_non_finite_price_change_never_reaches_the_column() {
         let ranked = vec![contract(10, 1, 500)];
-        let ts_secs = row_ts_secs(NANOS_PER_SECOND, SnapshotCadence::OneSecond);
-        let open = u32::try_from(ts_secs.max(1)).expect("fits u32");
         let p = project_snapshot(
             NANOS_PER_SECOND,
             SnapshotCadence::OneSecond,
@@ -1912,7 +1943,7 @@ mod tests {
             |_| Some(1.5),
             |_, _| false,
             TEST_LABEL,
-            candle_at(open, -77, Some(f64::NAN)),
+            candle_advanced_by(0, -77, Some(f64::NAN)),
         );
         let row = &p.rows[0];
         assert_eq!(

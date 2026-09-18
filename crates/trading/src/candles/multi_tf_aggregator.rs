@@ -601,6 +601,52 @@ impl MultiTfAggregator {
         self.slots.get(idx).map(|s| s.cell.snapshot(tf))
     }
 
+    /// Snapshot of the bucket that covers ONE NAMED WINDOW, or `None` when
+    /// this instrument has no bar for that window.
+    ///
+    /// [`Self::snapshot`] answers "what is open right now", which is a
+    /// different question and the wrong one for a caller that already knows
+    /// which window it is describing. A busy contract has usually already
+    /// rolled by the time a sweep reads it — so a probe that takes the open
+    /// bucket systematically returns the NEXT window for exactly the
+    /// instruments a volume leaderboard exists to rank, and returns the
+    /// right one only for the quiet tail.
+    ///
+    /// This resolves the caller's own window instead: the open bucket when it
+    /// IS that window, otherwise the last sealed bucket when that is, and
+    /// otherwise nothing. It never returns a bar for a different window, so a
+    /// consumer cannot silently compare two windows as though they were one.
+    ///
+    /// `bucket_open_ist_secs` is the window's OPEN, in IST epoch seconds —
+    /// the same base and the same grid anchor `TfIndex::bucket_start` uses,
+    /// so the comparison is an integer equality and not an approximation.
+    ///
+    /// Returning `None` is a real answer and the common one at boot, after a
+    /// day-boundary `force_seal` (which clears `last_sealed`), and for any
+    /// instrument that did not trade in the window.
+    ///
+    /// # Complexity
+    /// O(1) average — one hash lookup and at most two array indexes, no
+    /// allocation.
+    #[must_use]
+    pub fn bar_for_window(
+        &self,
+        feed: Feed,
+        security_id: u64,
+        segment_code: u8,
+        tf: TfIndex,
+        bucket_open_ist_secs: u32,
+    ) -> Option<LiveCandleState> {
+        let idx = *self.index.get(&(feed, security_id, segment_code))? as usize;
+        let cell = &self.slots.get(idx)?.cell;
+        let open = cell.snapshot(tf);
+        if open.bucket_start_ist_secs == bucket_open_ist_secs {
+            return Some(open);
+        }
+        cell.last_sealed_snapshot(tf)
+            .filter(|s| s.bucket_start_ist_secs == bucket_open_ist_secs)
+    }
+
     /// Read-only slot lookup. A pure query can never consume capacity.
     ///
     /// # Complexity
@@ -1721,6 +1767,98 @@ mod tests {
             volume: cum,
             ..ParsedTick::default()
         }
+    }
+
+    // -- bar_for_window (2026-09-18) ---------------------------------------
+    //
+    // These three own a guarantee that used to live one layer up, in
+    // `top_volume_snapshot`: that a reading is for the row's OWN window or is
+    // absent. It moved here because the decision moved here — the probe now
+    // resolves the window by integer equality instead of handing back
+    // whatever bucket happens to be open and letting a downstream column
+    // report the discrepancy as a skew.
+
+    /// A cell that has never seen a tick carries `bucket_start_ist_secs == 0`,
+    /// the fold's documented never-opened sentinel. Asking it for a real
+    /// window must answer `None` — storing that empty bar would claim a
+    /// volume of 0 for a bar that does not exist.
+    #[test]
+    fn bar_for_window_refuses_a_never_opened_cell() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let sink = |_: Feed, _: u64, _: u8, _: TfIndex, _: LiveCandleState| {};
+        // Tick instrument 77 so a slot EXISTS — the refusal under test is the
+        // window mismatch, not a missing slot, and a test that could not tell
+        // them apart would pass with the equality check deleted.
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(77, SEG_IDX, OPEN, 100.0, 1_000),
+            None,
+            sink,
+        );
+        assert_eq!(
+            agg.bar_for_window(Feed::Dhan, 77, SEG_IDX, TfIndex::S1, 0),
+            None,
+            "the never-opened sentinel is not a window any row can ask for"
+        );
+    }
+
+    /// The whole point: a contract that has ROLLED — the ordinary state of a
+    /// busy one — still answers for the window that just closed, out of the
+    /// last-sealed bar. Before 2026-09-18 the probe returned the open bucket,
+    /// so the busiest contracts were read one window late every time.
+    #[test]
+    fn bar_for_window_answers_from_the_last_sealed_bar_after_the_fold_rolls() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let sink = |_: Feed, _: u64, _: u8, _: TfIndex, _: LiveCandleState| {};
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(77, SEG_IDX, OPEN, 100.0, 1_000),
+            None,
+            sink,
+        );
+        // A tick one second later rolls the 1-second bucket.
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(77, SEG_IDX, OPEN + 1, 101.0, 1_100),
+            None,
+            sink,
+        );
+
+        let open = agg
+            .snapshot(Feed::Dhan, 77, SEG_IDX, TfIndex::S1)
+            .expect("slot exists");
+        assert_eq!(
+            open.bucket_start_ist_secs,
+            OPEN + 1,
+            "the fold has rolled — this is precisely the state that used to \
+             hand a sweep the WRONG window"
+        );
+
+        let closed = agg
+            .bar_for_window(Feed::Dhan, 77, SEG_IDX, TfIndex::S1, OPEN)
+            .expect("the window that just closed is still reachable");
+        assert_eq!(closed.bucket_start_ist_secs, OPEN);
+    }
+
+    /// A window the cell holds NEITHER open NOR last-sealed is refused, not
+    /// approximated. This is the assertion that makes the other two mean
+    /// something: without it a probe that returned any bar at all would pass
+    /// them both.
+    #[test]
+    fn bar_for_window_refuses_a_window_the_cell_does_not_hold() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let sink = |_: Feed, _: u64, _: u8, _: TfIndex, _: LiveCandleState| {};
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(77, SEG_IDX, OPEN, 100.0, 1_000),
+            None,
+            sink,
+        );
+        assert_eq!(
+            agg.bar_for_window(Feed::Dhan, 77, SEG_IDX, TfIndex::S1, OPEN + 60),
+            None,
+            "a window the cell never held must be absent, never the nearest bar"
+        );
     }
 
     // -- tick-rule net volume (2026-09-10) ----------------------------------

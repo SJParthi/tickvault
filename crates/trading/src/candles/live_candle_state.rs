@@ -1019,7 +1019,7 @@ mod tests {
     /// read side by side without a reader having to guess which baseline
     /// each one used.
     #[test]
-    fn the_bar_price_change_rises_against_the_previous_bar_close() {
+    fn close_chg_pct_from_prev_bar_rises_against_the_previous_bar_close() {
         let s = LiveCandleState {
             bucket_start_ist_secs: 33_300,
             close: 101.0,
@@ -1108,7 +1108,7 @@ mod tests {
     /// would be how this column comes to disagree with the four that already
     /// exist.
     #[test]
-    fn the_bar_price_change_rounds_by_the_same_two_decimal_rule() {
+    fn close_chg_pct_from_prev_bar_rounds_by_the_same_two_decimal_rule() {
         let s = LiveCandleState {
             bucket_start_ist_secs: 33_300,
             close: 24_273.15,

@@ -64,6 +64,9 @@
 //!     lot_size LONG, window_lots_milli LONG,
 //!     net_volume_chg_milli_pct LONG,
 //!     gain_pct DOUBLE,
+//!     candle_volume_signed LONG,
+//!     candle_bucket_skew_secs LONG,
+//!     candle_price_chg_pct DOUBLE,
 //!     subscribed BOOLEAN
 //! ) timestamp(ts) PARTITION BY HOUR
 //!   DEDUP UPSERT KEYS(ts, tf, family, feed, security_id, segment);

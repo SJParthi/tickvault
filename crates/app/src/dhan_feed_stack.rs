@@ -1692,10 +1692,10 @@ impl LiveIngest {
                 },
                 |security_id, segment| view.is_subscribed(security_id, segment),
                 |security_id, segment| labels.get(&(security_id, segment)).map(AsRef::as_ref),
-                |security_id, segment| {
+                |security_id, segment, window_open_ist_secs| {
                     // ONE O(1) probe into the fold the drain has already been
                     // filling this window: one hash lookup, one slot index,
-                    // one `LiveCandleState` copy. No allocation.
+                    // at most two `LiveCandleState` copies. No allocation.
                     //
                     // This is the whole of the operator's 2026-09-18 ask. The
                     // leaderboard cannot answer it — `RankedContract` carries
@@ -1710,12 +1710,46 @@ impl LiveIngest {
                     // reason: `rank`'s slice is still alive, and the borrow
                     // checker permits this only because all three are named as
                     // fields rather than reached through `self`.
+                    // `bar_for_window`, not `snapshot`: the probe asks for
+                    // THIS ROW'S window and gets that bar or nothing. Reading
+                    // the currently-open bucket instead — which is what
+                    // `snapshot` returns — systematically hands back the NEXT
+                    // window for exactly the contracts a volume board exists
+                    // to rank, because a busy contract has already rolled by
+                    // the time the sweep reaches it. It returned the right
+                    // window only for the quiet tail.
                     aggregator
-                        .snapshot(Feed::Dhan, security_id, segment.binary_code(), fold_frame)
-                        .map(|bar| crate::top_volume_snapshot::CandleBarReading {
-                            signed_volume: bar.signed_volume(),
-                            bucket_open_ist_secs: bar.bucket_start_ist_secs,
-                            price_chg_pct: bar.close_chg_pct_from_prev_bar(),
+                        .bar_for_window(
+                            Feed::Dhan,
+                            security_id,
+                            segment.binary_code(),
+                            fold_frame,
+                            window_open_ist_secs,
+                        )
+                        .map(|bar| {
+                            // How far the fold's OPEN bucket has advanced past
+                            // the window this row describes. Zero means the
+                            // bar is still being written and its volume can
+                            // still grow; positive means the fold moved on and
+                            // the bar is sealed. It can never mean "a bar for
+                            // some other window" — `bar_for_window` refuses
+                            // that case rather than reporting it.
+                            let open_bucket = aggregator
+                                .snapshot(
+                                    Feed::Dhan,
+                                    security_id,
+                                    segment.binary_code(),
+                                    fold_frame,
+                                )
+                                .map_or(0, |open| open.bucket_start_ist_secs);
+                            let advance = i64::from(open_bucket)
+                                .saturating_sub(i64::from(window_open_ist_secs))
+                                .max(0);
+                            crate::top_volume_snapshot::CandleBarReading {
+                                signed_volume: bar.signed_volume(),
+                                open_bucket_advance_secs: advance,
+                                price_chg_pct: bar.close_chg_pct_from_prev_bar(),
+                            }
                         })
                 },
             );
