@@ -339,7 +339,9 @@ pub(crate) const RETENTION_EXEMPT_TABLES: &[&str] = &[
 pub fn all_managed_table_names() -> Vec<&'static str> {
     let mut names: Vec<&'static str> = HOUR_PARTITIONED_TABLES.to_vec();
     names.extend_from_slice(DAY_PARTITIONED_TABLES);
-    names.extend_from_slice(&crate::shadow_persistence::candle_table_names());
+    // 2026-09-18 — the EMITTED set: a dropped table has no `table_storage()` row,
+    // so measuring the retired fifteen would log a probe failure every cycle.
+    names.extend_from_slice(&crate::shadow_persistence::emitted_candle_table_names());
     names.extend_from_slice(RETENTION_EXEMPT_TABLES);
     names.sort_unstable();
     names.dedup();
@@ -449,7 +451,11 @@ impl PartitionManager {
         // `TfIndex::table_name()`) so the swept names can NEVER drift from what is
         // actually created/written. This is the dominant disk-growth source —
         // #1022 named phantom `candles_*_shadow` tables and missed it.
-        for table in crate::shadow_persistence::candle_table_names() {
+        // 2026-09-18 — the EMITTED set. Keeping all TF_COUNT names here would ask
+        // QuestDB about fifteen tables this boot has just dropped, once per retention
+        // cycle, forever: each returns an error the loop logs as a warn, which trains
+        // an operator to discount a real one.
+        for table in crate::shadow_persistence::emitted_candle_table_names() {
             if RETENTION_EXEMPT_TABLES.contains(&table) {
                 continue;
             }
@@ -1151,8 +1157,19 @@ mod tests {
                  SWEPT is not exempt from occupying disk"
             );
         }
-        for t in crate::shadow_persistence::candle_table_names() {
+        // 2026-09-18 — the EMITTED nine, not all TF_COUNT ordinals. The other
+        // fifteen are DROPPED at boot by `drop_retired_candle_tables`, so they
+        // have no `table_storage()` row: measuring them would log a probe
+        // failure every cycle, forever, for a table we deliberately removed.
+        for t in crate::shadow_persistence::emitted_candle_table_names() {
             assert!(names.contains(&t), "candle table `{t}` is not measured");
+        }
+        for t in crate::shadow_persistence::retired_candle_table_names() {
+            assert!(
+                !names.contains(&t),
+                "retired candle table `{t}` must NOT be measured — it is \
+                 dropped at boot, so a probe for it can only ever fail"
+            );
         }
 
         // Sorted and deduplicated: a table appearing in two lists must be

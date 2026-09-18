@@ -1031,6 +1031,10 @@ mod tests {
                 ..Default::default()
             },
             BootDrainOutcome {
+                records_retired_frame: 1,
+                ..Default::default()
+            },
+            BootDrainOutcome {
                 seals_left_pending: 7,
                 ..Default::default()
             },
@@ -1048,6 +1052,7 @@ mod tests {
             files_left_pending: 1,
             seals_left_pending: 50,
             records_undecodable: 2,
+            records_retired_frame: 5,
         });
     }
 
