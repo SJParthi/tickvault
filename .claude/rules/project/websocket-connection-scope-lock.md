@@ -5583,3 +5583,37 @@ test, guard or query anywhere cross-references the two tables.
 - Deletes or weakens `every_sub_minute_frame_sums_to_the_same_minute_net_volume` instead of
   re-scoping it: under clause 4 that property genuinely no longer holds for the SIGNED
   number, and it must be re-scoped to the GROSS, not removed.
+
+#### 2026-09-18 (same day, later) — the operator confirms the shape, and it SETTLES the flat-bar question
+
+**Verbatim:**
+> "see if we use volume to accept the negative sign then it would be so easy rigth dude where as we can match the precise dhan net volume of respective tiemframe respective tiemstamps rigth dide am i rigth dude okay?"
+
+He is right, and the confirmation names the objective function explicitly: **match Dhan's
+net volume for the respective timeframe at the respective timestamp.** That is the thing
+clause 4 exists to do.
+
+**It also settles the flat-bar decision above, which the section records as `Assumed`.**
+The argument that settles it is INFORMATION PRESERVATION, not a reading of his words:
+
+| Stored form | Can a VIEW render the other form? |
+|---|---|
+| **flat → `+gross`** (this section's decision) | **YES.** `CASE WHEN close > lag(close) THEN abs(volume) WHEN close < lag(close) THEN -abs(volume) ELSE 0 END` reproduces TradingView's built-in Net Volume **exactly**, flat bars included. |
+| flat → `0` | **NO.** A zeroed bar has destroyed its own magnitude. Nothing downstream can recover it — not a view, not a query, not a re-read. |
+
+So the stored column keeps the magnitude (Quote B: *"our current volume is precisely
+correct … we just need to accept this negative sign"*), and the chart-exact rendering is a
+view away whenever it is wanted. The reverse is impossible. One direction is reversible and
+the other is not, and this file's standing discipline is to take the reversible one.
+
+**⚠ And the flat-bar behaviour of the Dhan chart is `Unknown`, not Verified.** Neither
+screenshot in Quote B shows a bar whose close equals the previous close; TradingView's
+built-in formula returning `0` there is an INFERENCE from the chart being a TradingView
+chart, never an observation. Storing the information-preserving form means that inference
+never has to be right — if the chart turns out to carry `+gross` on a flat bar, the stored
+column already matches it with no re-fold.
+
+**This retires the "10m becomes a native frame" branch.** That branch existed only as the
+consequence of zeroing flat bars; with the magnitude preserved, `abs(signed) == gross`
+holds on every bar and clause 2's derived `10m` stands unconditionally — no `TfIndex`
+variant, no `TF_COUNT` change, no seal-ring resize, zero added per-tick work.
