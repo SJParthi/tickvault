@@ -5918,3 +5918,123 @@ its own next tick at no added latency, which is every liquid instrument.
   require it.
 - Claims the catch-up latency cost is zero, or that the normal-rollover late
   path is covered.
+
+---
+
+### 2026-09-18 (THIRD) — CLAUSE 4 IS THE RULE THIS REPOSITORY RETIRED ON 2026-09-10, and three blockers the contract section does not name
+
+**No new authorization is claimed and no scope changes.** The 2026-09-18 contract
+section above stands; this records what a source audit found when the code for it
+was scoped, and it is written BEFORE any signed-volume code per the
+rule-file-first law. Every row below is verified at the cited symbol.
+
+#### ⚠ Finding 1 — the close-vs-close sign rule already shipped here, and was WITHDRAWN as producing the WRONG sign
+
+Clause 4 of the contract above reads: *"compare this bar's `close` against the
+PREVIOUS bar's close of the same timeframe. Lower → the bar's whole volume is
+negative."* That is the operator's Quote B, and it is also, verbatim, the rule
+this repository implemented and then retired eight days earlier.
+
+`crates/trading/src/candles/live_candle_state.rs`, on the `net_volume_signed`
+field, under its own heading **"What replaced what (2026-09-10)"**:
+
+> "Until today `net_volume()` DERIVED a sign at seal time by comparing the bar's
+> close against the previous bar's close, and signed the WHOLE bar's volume with
+> it. That is a bar-DIRECTION proxy, not net volume: a bar that traded 900 lots
+> on the offer and 1,000 on the bid but happened to close one tick up reported
+> `+1,900`, when the honest answer is `-100`. The proxy is not merely imprecise —
+> it has the **WRONG SIGN** whenever a bar's close disagrees with its flow, which
+> is exactly the divergence a net-volume reader is looking for."
+
+What replaced it is the **classic tick rule**, evaluated once per tick above the
+timeframe loop: volume since the previous tick is BUY-initiated when the price is
+above the previous tick's, SELL-initiated when below, and carries the previous
+tick's direction when unchanged. That value is `net_volume_signed: i64`, and it
+is what the `net_volume` column has carried since 2026-09-10.
+
+**So the directive and the code disagree about what "signed volume" means**, and
+the two are not refinements of one another — they answer different questions:
+
+| | clause 4 (close vs previous close) | `net_volume_signed` (tick rule) |
+|---|---|---|
+| What the sign reports | the bar's **direction** | the bar's **order flow** |
+| Sign of a bar that closed up on net selling | `+` | `−` |
+| Derivable from stored columns at query time | **YES** — `close` and `lag(close)` are both stored | no — needs per-tick state |
+| Matches a Dhan/TradingView Net Volume pane | **that is the operator's stated objective** | not claimed |
+
+**Neither is wrong; they are different measures, and this is the operator's
+choice to make.** What must not happen is the code silently adopting one while
+the rule file names the other, which is the state the two would be in today if
+clause 4 were implemented as a rewrite of `net_volume`.
+
+**The recommended shape, because it is the only one that loses nothing:** keep
+`net_volume_signed` as the stored per-tick measure, and deliver clause 4 as the
+**view expression the contract section above already writes out** —
+`CASE WHEN close > lag(close) THEN abs(volume) WHEN close < lag(close) THEN -abs(volume) ELSE abs(volume) END`.
+That is information-preserving in the direction this file's standing discipline
+requires: the tick-rule value cannot be recovered from a close-vs-close column,
+while a close-vs-close column is one window function away from the stored
+`close`. Adopting clause 4 as the STORED value instead is a decision that needs
+its own dated line here, because it discards the 2026-09-10 work.
+
+#### ⚠ Finding 2 — the seal spill record is FULL, and v2 reclaimed the exact field a stored close-vs-close sign needs
+
+`crates/storage/src/seal_spill.rs`: `SEAL_SPILL_RECORD_SIZE = 128`,
+`SEAL_SPILL_FORMAT_VERSION = 2`. Bytes 80..88 held `bucket_open_prev_close: f64`
+in v1 — **the previous sealed bar's close, i.e. precisely the baseline clause 4
+needs** — and v2 reclaimed them for `net_volume_signed` after a reference scan
+found the field had *"no production reader anywhere."*
+
+Two consequences, both stated so neither is rediscovered:
+
+1. **Spill replay already preserves the sign correctly** for the tick-rule
+   measure. An earlier reading of this path recorded that a replayed bar would be
+   "always positive"; that is **WITHDRAWN** — v2 round-trips `net_volume_signed`
+   and uses `i64::MIN` as an out-of-range "not classified" sentinel, so a
+   replayed v2 bar reports real flow and a v1 bar reports SQL NULL, which is what
+   it reported when it was written.
+2. **A STORED close-vs-close sign needs a v3 record**, because the baseline it
+   requires is the field v2 spent. And the record has no room: the module's own
+   closing paragraph says *"the trailing 8-byte padding region (bytes 120..128) is
+   reserved for future field additions"*, while its own layout table four
+   paragraphs above assigns 120..128 to `security_id: u64` (2026-06-29). **The
+   doc contradicts itself and the table is the true half** — the record is
+   byte-for-byte full, so a v3 field means the record GROWS, which changes every
+   spill file's stride. That sentence is a correction owed in the same change.
+
+#### ⚠ Finding 3 — `recompute_window` breaks on day one of a signed `volume` column
+
+`crates/app/src/tf_consistency_boot.rs::recompute_window` accumulates
+`volume = volume.checked_add(m.volume)?` over a window's 1-minute members, and
+its SQL (`:803`) selects the bare `volume` column. Under a signed `volume` the
+members carry signed values, so the check compares **Σ(signed 1m)** against the
+higher-TF bar's **own** sign — and those are different numbers for any window
+containing both up and down minutes.
+
+The contract section above already records the arithmetic
+(*"five 1s bars of +100, −100, +100, −100, +100 sum to +100 while the 5s bar
+reads ±500"*) as a REJECT row about deriving `10m`. It applies with equal force
+to the verifier, and there it is not a design error but a **daily false alarm**:
+a mismatch on nearly every window, every instrument, driving `TF-VERIFY-01` and
+one `NotificationEvent::TfConsistencySummary` (`DispatchPolicy::Immediate`) — a
+Telegram page every trading day, and a 10,000-row audit budget consumed by noise
+so that genuine M30/M60 mismatches degrade to count-only.
+
+That is the same failure shape as the C1 defect fixed in this branch, and it is
+**in the same file**. The verifier must move to `Σ abs(m.volume)` compared
+against `abs(recorded)`, with the sign checked separately as its own field, in
+the SAME change that signs the column — never after.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Rewrites `net_volume_signed` from the tick rule to close-vs-close without a
+  fresh dated line here — that discards the 2026-09-10 work and re-adopts a rule
+  this repository withdrew as WRONG-SIGNED.
+- Ships a close-vs-close sign as a STORED seal field without growing the spill
+  record to v3 (the baseline byte range is spent) and without correcting the
+  module's self-contradicting "reserved padding" paragraph.
+- Signs the `volume` column while leaving `recompute_window` on `Σ signed` — a
+  daily Telegram page and an exhausted audit budget, in the file that has just
+  been fixed for the identical shape.
+- Claims spill replay loses the sign — v2 round-trips it; the withdrawn claim is
+  recorded above so it is not repeated.
