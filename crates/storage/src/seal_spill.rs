@@ -91,12 +91,31 @@
 //! `±volume`, so the reachable range is `[-i64::MAX, i64::MAX]` and `i64::MIN`
 //! sits strictly outside it.
 //!
-//! Total: 128 bytes. The trailing 8-byte padding region (bytes 120..128)
-//! is reserved for future field additions WITHOUT a file-format break —
-//! readers that don't recognise additional fields ignore them. Pre-§31
-//! records have zero at bytes 96..104, so they decode `open_pct = 0.0`;
-//! pre-2026-06-02 records have zero at bytes 104..120, so they decode
-//! `change_pct = 0.0` / `open_gap_pct = 0.0` (all backward-compatible).
+//! Total: 128 bytes, and **there is no spare room left**.
+//!
+//! ⚠ **CORRECTED 2026-09-18 — this paragraph used to read "the trailing 8-byte
+//! padding region (bytes 120..128) is reserved for future field additions
+//! WITHOUT a file-format break". That is FALSE, and the layout table four
+//! paragraphs above is the half that is right:** bytes 120..128 have carried
+//! `security_id: u64` since 2026-06-29, when the id was widened past 32 bits.
+//! The sentence survived that change unedited, so the module advertised a spare
+//! field range that the same module's own table had already assigned.
+//!
+//! It is stale in the direction that costs work: a reader planning a new field
+//! would take the free 8 bytes, find them occupied, and only then discover that
+//! any additional field means the RECORD GROWS — which changes the stride of
+//! every `.bin` file on disk and is a v3 format break, not the free extension
+//! this paragraph promised. That is a live consideration today: a stored
+//! close-vs-close volume sign needs the previous bar's close, which is exactly
+//! the `bucket_open_prev_close: f64` that v2 reclaimed at bytes 80..88.
+//!
+//! What the paragraph got RIGHT and is kept: older records decode cleanly
+//! because the ranges added later are zero in them. Pre-§31 records have zero at
+//! bytes 96..104, so they decode `open_pct = 0.0`; pre-2026-06-02 records have
+//! zero at bytes 104..120, so they decode `change_pct = 0.0` /
+//! `open_gap_pct = 0.0`; pre-2026-06-29 records have zero at bytes 120..128, so
+//! the decoder falls back to the low-32 id at bytes 0..4 (all
+//! backward-compatible).
 
 use std::fs::File;
 use std::io::{BufReader, Read, Write};

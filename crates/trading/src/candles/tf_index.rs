@@ -547,7 +547,7 @@ impl TfIndex {
         self.seconds_per_bucket() < 60
     }
 
-    /// True for the THIRTEEN timeframes the operator actually asked for.
+    /// True for the NINE native timeframes the operator asks for today.
     ///
     /// Operator, 2026-08-08 (verbatim, typos preserved — the same quote the
     /// r8g.xlarge was sized against, `daily-universe-scope-expansion` Quote 13):
@@ -611,10 +611,37 @@ impl TfIndex {
     /// 30m, 60m right dude only these timeframes alone dude okay?"*
     ///
     /// Net against the 2026-08-08 set: **`S3` GAINS** emission, and
-    /// **`S10` / `S15` / `S30` / `M2` LOSE** it. Those four tables keep
-    /// existing and keep every row they already hold — the DDL creates all
-    /// 24 names from `TfIndex::ALL` and no populated table is ever dropped
-    /// (SEBI retention). Only new rows stop.
+    /// **`S10` / `S15` / `S30` / `M2` LOSE** it. The DDL still creates all
+    /// 24 names from `TfIndex::ALL`, so those four tables keep existing and
+    /// keep the rows they already hold. Only new rows stop.
+    ///
+    /// ⚠ **CORRECTED 2026-09-18, hours after the line above was written.**
+    /// It originally closed *"and no populated table is ever dropped (SEBI
+    /// retention)"*. That is false twice over, and both halves are checkable
+    /// in one grep:
+    ///
+    /// 1. **Candle tables are NOT a SEBI never-delete class.** They are
+    ///    retention-swept like any other market-data table —
+    ///    `partition_manager.rs` iterates `candle_table_names()` and detaches
+    ///    DAY partitions past the cutoff. So "keeps every row it already
+    ///    holds" is true only inside the retention window; older partitions
+    ///    leave on schedule, exactly as they always have.
+    /// 2. **One candle table IS dropped by name, at boot.**
+    ///    `shadow_persistence::drop_legacy_candle_objects` carries a literal
+    ///    `DROP TABLE IF EXISTS candles_1s;` — written when `S1` was an
+    ///    Engine-A leftover. `S1` is now a frame the operator asked for, so
+    ///    that drop's original rationale no longer holds. It is version-gated
+    ///    behind a one-shot marker (`LEGACY_DROP_SWEEP_VERSION`) and the
+    ///    `candle_ddl_boot` site documents the consequence, so it does not
+    ///    fire on an ordinary boot — but the sentence claimed a guarantee
+    ///    ("never") that the tree does not make.
+    ///
+    /// Recorded rather than quietly reworded because the shape is the point:
+    /// "SEBI retention" is this repository's strongest never-delete claim, and
+    /// borrowing it for a class it does not cover reads as a guarantee to
+    /// anyone who does not re-check. The retirement of a frame's WRITER says
+    /// nothing about the fate of its TABLE, and the two must be checked
+    /// separately.
     ///
     /// ## Why this returns NINE for an eleven-item list
     ///
