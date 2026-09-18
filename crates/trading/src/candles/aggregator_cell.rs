@@ -947,7 +947,7 @@ impl AggregatorCell {
             // the hoisted classification. Pinned by
             // `only_the_extremes_entry_classifies_net_volume`.
             None,
-            fold_clock_ist_secs(tick.exchange_timestamp, tick.received_at_nanos),
+            fold_clock_ist_secs(tick.exchange_timestamp),
         )
     }
 
@@ -973,13 +973,22 @@ impl AggregatorCell {
         fold_secs: u32,
     ) -> ConsumeOutcome {
         let ord = tf.as_ordinal();
-        // 2026-08-28: THE bucketing decision, now on the receipt clock.
-        // `exchange_timestamp` is Dhan's LAST TRADE TIME - for a dormant
-        // contract that is whenever it last printed (measured mean 5 hours,
-        // max 34 days), so bucketing on it files a tick we received at 09:12
-        // into a bar dated days ago. See `fold_clock_ist_secs` for the delta
-        // guard that keeps a replayed or clock-stepped stamp from doing the
-        // same thing in the other direction.
+        // THE bucketing decision. 2026-08-28 it moved to the receipt clock;
+        // 2026-09-18 the operator's ts directive moved it back, and this is
+        // now the EXCHANGE stamp verbatim — `fold_clock_ist_secs` is the
+        // identity (see its doc for the measurement that decided it).
+        //
+        // The old comment here justified the receipt with the dormant-contract
+        // case: `exchange_timestamp` is Dhan's LAST TRADE TIME, so a sleepy
+        // option's snapshot carries a stamp from whenever it last printed
+        // (measured mean 5 hours, max 34 days). That justification was ALREADY
+        // withdrawn before this change — the delta guard refused any receipt
+        // more than 300 s past the trade, so such a snapshot bucketed on its
+        // trade stamp under the hybrid too. It is recorded here because the
+        // belief is durable and keeps coming back: a dormant snapshot belongs
+        // to the bar of its last TRADE, and the cross-day gates in
+        // `multi_tf_aggregator::consume_tick` are what stop it reaching a
+        // CLOSED day.
         //
         // `fold_secs` is an ARGUMENT, not a local: it is derived ONCE per
         // tick above the caller's timeframe loop, exactly like `prices` and
@@ -3460,10 +3469,8 @@ mod session_extreme_delta_tests {
     /// Drives the cell exactly as the real fan-out does: observe the packet's
     /// session extremes ONCE, then fold it into one timeframe.
     fn feed(cell: &mut AggregatorCell, tf: TfIndex, tick: &ParsedTick, cum: u32) {
-        let delta = cell.observe_session_extremes(
-            tick,
-            fold_clock_ist_secs(tick.exchange_timestamp, tick.received_at_nanos),
-        );
+        let delta =
+            cell.observe_session_extremes(tick, fold_clock_ist_secs(tick.exchange_timestamp));
         cell.consume_tick_with_extremes(
             tf,
             tick,
@@ -3473,7 +3480,7 @@ mod session_extreme_delta_tests {
             u64::from(cum),
             delta,
             None,
-            fold_clock_ist_secs(tick.exchange_timestamp, tick.received_at_nanos),
+            fold_clock_ist_secs(tick.exchange_timestamp),
         );
     }
 
@@ -3644,10 +3651,7 @@ mod session_extreme_delta_tests {
         let mut t = tick_at(OPEN, 100.0, 10);
         t.day_high = 250.0;
         t.day_low = 90.0;
-        let d = cell.observe_session_extremes(
-            &t,
-            fold_clock_ist_secs(t.exchange_timestamp, t.received_at_nanos),
-        );
+        let d = cell.observe_session_extremes(&t, fold_clock_ist_secs(t.exchange_timestamp));
         assert!(d.is_empty(), "no previous packet means no delta");
     }
 
@@ -3670,30 +3674,23 @@ mod session_extreme_delta_tests {
         let mut fresh = tick_at(second + 10, 100.0, 25);
         fresh.day_high = 130.0;
         fresh.day_low = 100.0;
-        let d = cell.observe_session_extremes(
-            &fresh,
-            fold_clock_ist_secs(fresh.exchange_timestamp, fresh.received_at_nanos),
-        );
+        let d =
+            cell.observe_session_extremes(&fresh, fold_clock_ist_secs(fresh.exchange_timestamp));
         assert_eq!(d.new_high, Some(f32_to_f64_clean(130.0)), "a real rise");
 
         // A LATE packet from before that print, carrying the older high.
         let mut stale = tick_at(second + 3, 100.0, 22);
         stale.day_high = 100.0;
         stale.day_low = 100.0;
-        let d = cell.observe_session_extremes(
-            &stale,
-            fold_clock_ist_secs(stale.exchange_timestamp, stale.received_at_nanos),
-        );
+        let d =
+            cell.observe_session_extremes(&stale, fold_clock_ist_secs(stale.exchange_timestamp));
         assert!(d.new_high.is_none(), "a fall is never a delta");
 
         // The next fresh packet re-states 130. It must NOT read as a rise.
         let mut echo = tick_at(second + 20, 100.0, 30);
         echo.day_high = 130.0;
         echo.day_low = 100.0;
-        let d = cell.observe_session_extremes(
-            &echo,
-            fold_clock_ist_secs(echo.exchange_timestamp, echo.received_at_nanos),
-        );
+        let d = cell.observe_session_extremes(&echo, fold_clock_ist_secs(echo.exchange_timestamp));
         assert!(
             d.new_high.is_none(),
             "restoring a level we already recorded is not a new print"
@@ -3704,10 +3701,8 @@ mod session_extreme_delta_tests {
         let mut higher = tick_at(second + 30, 100.0, 35);
         higher.day_high = 131.0;
         higher.day_low = 100.0;
-        let d = cell.observe_session_extremes(
-            &higher,
-            fold_clock_ist_secs(higher.exchange_timestamp, higher.received_at_nanos),
-        );
+        let d =
+            cell.observe_session_extremes(&higher, fold_clock_ist_secs(higher.exchange_timestamp));
         assert_eq!(
             d.new_high,
             Some(f32_to_f64_clean(131.0)),
@@ -3728,10 +3723,7 @@ mod session_extreme_delta_tests {
             let mut t = tick_at(second + 5, 100.0, 25);
             t.day_high = bad;
             t.day_low = bad;
-            let d = cell.observe_session_extremes(
-                &t,
-                fold_clock_ist_secs(t.exchange_timestamp, t.received_at_nanos),
-            );
+            let d = cell.observe_session_extremes(&t, fold_clock_ist_secs(t.exchange_timestamp));
             assert!(
                 d.is_empty(),
                 "an unusable session extreme must produce no delta"
@@ -3742,10 +3734,7 @@ mod session_extreme_delta_tests {
         let mut good = tick_at(second + 10, 100.0, 30);
         good.day_high = 101.0;
         good.day_low = 100.0;
-        let d = cell.observe_session_extremes(
-            &good,
-            fold_clock_ist_secs(good.exchange_timestamp, good.received_at_nanos),
-        );
+        let d = cell.observe_session_extremes(&good, fold_clock_ist_secs(good.exchange_timestamp));
         assert_eq!(
             d.new_high,
             Some(f32_to_f64_clean(101.0)),
@@ -3792,10 +3781,8 @@ mod session_extreme_delta_tests {
         let mut today = tick_at(OPEN + 86_400, 90.0, 5);
         today.day_high = 90.0;
         today.day_low = 90.0;
-        let d = cell.observe_session_extremes(
-            &today,
-            fold_clock_ist_secs(today.exchange_timestamp, today.received_at_nanos),
-        );
+        let d =
+            cell.observe_session_extremes(&today, fold_clock_ist_secs(today.exchange_timestamp));
         assert!(
             d.is_empty(),
             "the first packet of a new day is a baseline, not a fall"
@@ -3804,10 +3791,8 @@ mod session_extreme_delta_tests {
         let mut later = tick_at(OPEN + 86_400 + 10, 91.0, 8);
         later.day_high = 91.0;
         later.day_low = 90.0;
-        let d = cell.observe_session_extremes(
-            &later,
-            fold_clock_ist_secs(later.exchange_timestamp, later.received_at_nanos),
-        );
+        let d =
+            cell.observe_session_extremes(&later, fold_clock_ist_secs(later.exchange_timestamp));
         assert_eq!(
             d.new_high,
             Some(f32_to_f64_clean(91.0)),
@@ -3854,10 +3839,8 @@ mod session_extreme_delta_tests {
             let mut t = tick_at(ts, 100.0, cum);
             t.day_high = 100.0;
             t.day_low = 100.0;
-            let delta = cell.observe_session_extremes(
-                &t,
-                fold_clock_ist_secs(t.exchange_timestamp, t.received_at_nanos),
-            );
+            let delta =
+                cell.observe_session_extremes(&t, fold_clock_ist_secs(t.exchange_timestamp));
             let prices = TickPrices::from_tick(&t);
             for tf in TfIndex::ALL {
                 cell.consume_tick_with_extremes(
@@ -3869,7 +3852,7 @@ mod session_extreme_delta_tests {
                     u64::from(cum),
                     delta,
                     None,
-                    fold_clock_ist_secs(t.exchange_timestamp, t.received_at_nanos),
+                    fold_clock_ist_secs(t.exchange_timestamp),
                 );
             }
         }
@@ -3877,10 +3860,8 @@ mod session_extreme_delta_tests {
         let mut spike = tick_at(OPEN + 80, 100.0, 30);
         spike.day_high = 107.0;
         spike.day_low = 100.0;
-        let delta = cell.observe_session_extremes(
-            &spike,
-            fold_clock_ist_secs(spike.exchange_timestamp, spike.received_at_nanos),
-        );
+        let delta =
+            cell.observe_session_extremes(&spike, fold_clock_ist_secs(spike.exchange_timestamp));
         let prices = TickPrices::from_tick(&spike);
         for tf in TfIndex::ALL {
             cell.consume_tick_with_extremes(
@@ -3892,7 +3873,7 @@ mod session_extreme_delta_tests {
                 30,
                 delta,
                 None,
-                fold_clock_ist_secs(spike.exchange_timestamp, spike.received_at_nanos),
+                fold_clock_ist_secs(spike.exchange_timestamp),
             );
         }
 
@@ -3928,10 +3909,8 @@ mod session_extreme_delta_tests {
         // Establish the mark: the session low genuinely falls to 90.
         let mut fresh = tick_at(second + 10, 100.0, 25);
         fresh.day_low = 90.0;
-        let established = cell.observe_session_extremes(
-            &fresh,
-            fold_clock_ist_secs(fresh.exchange_timestamp, fresh.received_at_nanos),
-        );
+        let established =
+            cell.observe_session_extremes(&fresh, fold_clock_ist_secs(fresh.exchange_timestamp));
         assert_eq!(
             established.new_low,
             Some(90.0),
@@ -3943,7 +3922,7 @@ mod session_extreme_delta_tests {
         regressed.day_low = 95.0;
         let d = cell.observe_session_extremes(
             &regressed,
-            fold_clock_ist_secs(regressed.exchange_timestamp, regressed.received_at_nanos),
+            fold_clock_ist_secs(regressed.exchange_timestamp),
         );
         assert!(
             d.new_low.is_none(),
@@ -3955,10 +3934,8 @@ mod session_extreme_delta_tests {
         // the stale packet up, this would read as a new low.
         let mut probe = tick_at(second + 30, 100.0, 35);
         probe.day_low = 92.0;
-        let d92 = cell.observe_session_extremes(
-            &probe,
-            fold_clock_ist_secs(probe.exchange_timestamp, probe.received_at_nanos),
-        );
+        let d92 =
+            cell.observe_session_extremes(&probe, fold_clock_ist_secs(probe.exchange_timestamp));
         assert!(
             d92.new_low.is_none(),
             "92 is above the true mark of 90 — reporting it as a new low would \
@@ -3968,10 +3945,8 @@ mod session_extreme_delta_tests {
         // And a genuine new low still works.
         let mut lower = tick_at(second + 40, 100.0, 40);
         lower.day_low = 88.0;
-        let d88 = cell.observe_session_extremes(
-            &lower,
-            fold_clock_ist_secs(lower.exchange_timestamp, lower.received_at_nanos),
-        );
+        let d88 =
+            cell.observe_session_extremes(&lower, fold_clock_ist_secs(lower.exchange_timestamp));
         assert_eq!(
             d88.new_low,
             Some(88.0),
@@ -4161,10 +4136,7 @@ mod permutation_regression_tests {
         let mut a = tick_at(OPEN, 100.0, 10);
         a.day_high = 100.0;
         a.day_low = 100.0;
-        let d = cell.observe_session_extremes(
-            &a,
-            fold_clock_ist_secs(a.exchange_timestamp, a.received_at_nanos),
-        );
+        let d = cell.observe_session_extremes(&a, fold_clock_ist_secs(a.exchange_timestamp));
         cell.consume_tick_with_extremes(
             TfIndex::M1,
             &a,
@@ -4174,16 +4146,14 @@ mod permutation_regression_tests {
             10,
             d,
             None,
-            fold_clock_ist_secs(a.exchange_timestamp, a.received_at_nanos),
+            fold_clock_ist_secs(a.exchange_timestamp),
         );
 
         // 09:16 bucket: a Ticker packet -- no day fields at all.
         let silent = tick_at(OPEN + 70, 100.0, 20);
         assert_eq!(silent.day_high, 0.0, "fixture models a Ticker packet");
-        let d = cell.observe_session_extremes(
-            &silent,
-            fold_clock_ist_secs(silent.exchange_timestamp, silent.received_at_nanos),
-        );
+        let d =
+            cell.observe_session_extremes(&silent, fold_clock_ist_secs(silent.exchange_timestamp));
         cell.consume_tick_with_extremes(
             TfIndex::M1,
             &silent,
@@ -4193,7 +4163,7 @@ mod permutation_regression_tests {
             20,
             d,
             None,
-            fold_clock_ist_secs(silent.exchange_timestamp, silent.received_at_nanos),
+            fold_clock_ist_secs(silent.exchange_timestamp),
         );
 
         // 09:16 again: a Quote with a risen high. The rise could have printed
@@ -4202,10 +4172,7 @@ mod permutation_regression_tests {
         let mut c = tick_at(OPEN + 80, 100.0, 30);
         c.day_high = 105.0;
         c.day_low = 100.0;
-        let d = cell.observe_session_extremes(
-            &c,
-            fold_clock_ist_secs(c.exchange_timestamp, c.received_at_nanos),
-        );
+        let d = cell.observe_session_extremes(&c, fold_clock_ist_secs(c.exchange_timestamp));
         cell.consume_tick_with_extremes(
             TfIndex::M1,
             &c,
@@ -4215,7 +4182,7 @@ mod permutation_regression_tests {
             30,
             d,
             None,
-            fold_clock_ist_secs(c.exchange_timestamp, c.received_at_nanos),
+            fold_clock_ist_secs(c.exchange_timestamp),
         );
 
         assert_eq!(
@@ -4369,10 +4336,8 @@ mod open_bucket_ordering_tests {
         let mut inverted = tick_at(OPEN + 10, 100.0, 10);
         inverted.day_high = 50.0;
         inverted.day_low = 150.0;
-        let delta = cell.observe_session_extremes(
-            &inverted,
-            fold_clock_ist_secs(inverted.exchange_timestamp, inverted.received_at_nanos),
-        );
+        let delta = cell
+            .observe_session_extremes(&inverted, fold_clock_ist_secs(inverted.exchange_timestamp));
         assert!(
             delta.is_empty(),
             "an inverted pair must never produce a widening"
