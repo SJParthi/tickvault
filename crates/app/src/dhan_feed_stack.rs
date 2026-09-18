@@ -2791,10 +2791,12 @@ impl LiveIngest {
             tick,
             None,
             |feed, security_id, segment_code, tf, state| {
-                // Emit rows ONLY for the thirteen timeframes the operator
-                // asked for (Quote 13, 2026-08-08). The enum carries 24, so
-                // eleven second-scale frames — S2 S3 S4 S6 S7 S8 S9 S11 S12
-                // S13 S14 — were writing a row per bucket for nobody.
+                // Emit rows ONLY for the NINE native timeframes the
+                // operator asked for (directive 2026-09-18: 1s 3s 5s 1m 3m
+                // 5m 15m 30m 60m). His list has eleven entries; `ticks` is a
+                // separate table and `10m` is DERIVED from candles_1m, so
+                // neither is a fold frame. The enum carries 24, so fourteen
+                // of them write nothing.
                 //
                 // Counted into its OWN bucket, never into `dropped`: that
                 // counter means data we wanted and lost, and conflating
@@ -2809,7 +2811,7 @@ impl LiveIngest {
                 // The fold still computes all 24 slots. Only emission is
                 // gated, so ordinals, the `[_; TF_COUNT]` arrays and the
                 // audit-table `timeframe` symbols are all untouched.
-                // Pinned by `tf_index::tests::tf_index_operator_set_is_twelve`.
+                // Pinned by `tf_index::tests::tf_index_operator_set_is_the_operators_nine`.
                 if !tf.is_operator_requested() {
                     skipped = skipped.saturating_add(1);
                     return;
@@ -3367,10 +3369,12 @@ impl LiveIngest {
         let bars = self
             .aggregator
             .force_seal_all(|feed, security_id, segment_code, tf, state| {
-                // Emit rows ONLY for the thirteen timeframes the operator
-                // asked for (Quote 13, 2026-08-08). The enum carries 24, so
-                // eleven second-scale frames — S2 S3 S4 S6 S7 S8 S9 S11 S12
-                // S13 S14 — were writing a row per bucket for nobody.
+                // Emit rows ONLY for the NINE native timeframes the
+                // operator asked for (directive 2026-09-18: 1s 3s 5s 1m 3m
+                // 5m 15m 30m 60m). His list has eleven entries; `ticks` is a
+                // separate table and `10m` is DERIVED from candles_1m, so
+                // neither is a fold frame. The enum carries 24, so fourteen
+                // of them write nothing.
                 //
                 // Counted into its OWN bucket, never into `dropped`: that
                 // counter means data we wanted and lost, and conflating
@@ -3385,7 +3389,7 @@ impl LiveIngest {
                 // The fold still computes all 24 slots. Only emission is
                 // gated, so ordinals, the `[_; TF_COUNT]` arrays and the
                 // audit-table `timeframe` symbols are all untouched.
-                // Pinned by `tf_index::tests::tf_index_operator_set_is_twelve`.
+                // Pinned by `tf_index::tests::tf_index_operator_set_is_the_operators_nine`.
                 if !tf.is_operator_requested() {
                     skipped = skipped.saturating_add(1);
                     return;
@@ -3777,10 +3781,12 @@ impl LiveIngest {
         let bars = self.aggregator.catch_up_seal_all(
             cutoff,
             |feed, security_id, segment_code, tf, state| {
-                // Emit rows ONLY for the thirteen timeframes the operator
-                // asked for (Quote 13, 2026-08-08). The enum carries 24, so
-                // eleven second-scale frames — S2 S3 S4 S6 S7 S8 S9 S11 S12
-                // S13 S14 — were writing a row per bucket for nobody.
+                // Emit rows ONLY for the NINE native timeframes the
+                // operator asked for (directive 2026-09-18: 1s 3s 5s 1m 3m
+                // 5m 15m 30m 60m). His list has eleven entries; `ticks` is a
+                // separate table and `10m` is DERIVED from candles_1m, so
+                // neither is a fold frame. The enum carries 24, so fourteen
+                // of them write nothing.
                 //
                 // Counted into its OWN bucket, never into `dropped`: that
                 // counter means data we wanted and lost, and conflating
@@ -3795,7 +3801,7 @@ impl LiveIngest {
                 // The fold still computes all 24 slots. Only emission is
                 // gated, so ordinals, the `[_; TF_COUNT]` arrays and the
                 // audit-table `timeframe` symbols are all untouched.
-                // Pinned by `tf_index::tests::tf_index_operator_set_is_twelve`.
+                // Pinned by `tf_index::tests::tf_index_operator_set_is_the_operators_nine`.
                 if !tf.is_operator_requested() {
                     skipped = skipped.saturating_add(1);
                     return;
