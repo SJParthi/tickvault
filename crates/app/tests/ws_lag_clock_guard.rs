@@ -32,6 +32,30 @@
 //! A "consistency" refactor that moved every clock read onto `fold_secs` would
 //! look tidy, pass CI, and silently blind the one metric that reports the
 //! vendor delivering late.
+//!
+//! # ⚠ 2026-09-18 — the ARITHMETIC above changed and the RULE did not
+//!
+//! The operator's ts-bucketing directive
+//! (`websocket-connection-scope-lock.md`, section "2026-09-18 (SECOND)") made
+//! `fold_clock_ist_secs` the IDENTITY on the exchange stamp, so the sentence
+//! *"the fold clock IS the receipt whenever the receipt is plausible"* is no
+//! longer true: the fold clock is now the exchange stamp, always.
+//!
+//! **That makes the collapse-to-zero failure UNREACHABLE today — and this
+//! guard stays, unchanged, for two reasons that are stronger than the one it
+//! was written for.**
+//!
+//! 1. The guard pins a SEMANTIC, not a coincidence. `ws_lag_ms` must measure
+//!    exchange-vs-receipt because that is what delivery lag IS. It must keep
+//!    reading the raw stamp even in a world where the fold clock happens to
+//!    equal it, or the next clock change re-opens the hole silently.
+//! 2. The two values converging is exactly what makes a "tidy" refactor
+//!    tempting: substituting `fold_secs` for `tick.exchange_timestamp` is now
+//!    a genuine no-op, so it would pass every behavioural test in the
+//!    workspace — and then blind the metric the day the clocks diverge again.
+//!
+//! The second test in this file asserts the convergence directly, so the
+//! current state is pinned rather than assumed.
 
 use std::path::Path;
 use tickvault_common::source_scan::strip_rust_comments;
@@ -70,11 +94,24 @@ fn ws_lag_is_measured_against_the_raw_exchange_stamp() {
 
 /// The arithmetic itself, demonstrated rather than argued.
 ///
-/// Proves BOTH halves: a real delivery lag is measured, and substituting the
-/// receipt-derived clock for the exchange stamp collapses it to zero. Without
-/// the second assertion the first proves only that subtraction works.
+/// ## Re-blessed 2026-09-18, and the reason is the whole point
+///
+/// This test used to prove that substituting the FOLD clock for the exchange
+/// stamp collapsed a 46-second lag to zero — because the fold clock preferred
+/// the receipt whenever it sat within ±300 s of the trade. Under the
+/// 2026-09-18 ts-bucketing directive the fold clock IS the exchange stamp, so
+/// that substitution is now a no-op and the old assertion
+/// (`assert_ne!(fold_secs, TRADE_IST_SECS)`) is FALSE by construction.
+///
+/// It is replaced rather than deleted, and the source-scan guard above is
+/// KEPT, because the hazard has not gone away — it has only gone dormant. Any
+/// future directive that puts a receipt back into the fold clock re-arms it
+/// instantly, and at that moment `record_ws_lag` passing a fold-clocked value
+/// would silently make every socket read ~0 ms of lag and the deaf-socket
+/// alarm unable to fire. The scan is what survives a clock change; this test
+/// is what states today's arithmetic.
 #[test]
-fn substituting_the_fold_clock_would_collapse_every_lag_to_zero() {
+fn the_lag_is_real_and_the_fold_clock_is_now_the_same_stamp() {
     use tickvault_app::dhan_feed_stack::{WsLag, ws_lag_ms};
 
     const IST_OFFSET: i64 = tickvault_common::constants::IST_UTC_OFFSET_SECONDS as i64;
@@ -92,24 +129,22 @@ fn substituting_the_fold_clock_would_collapse_every_lag_to_zero() {
         other => panic!("expected a measured lag, got {other:?}"),
     }
 
-    // Now the defect: the fold clock for that same tick IS the receipt in IST
-    // seconds, because 46 s is inside the plausible band.
-    let fold_secs = tickvault_trading::candles::tf_index::fold_clock_ist_secs(
-        TRADE_IST_SECS,
-        received_utc_nanos,
-    );
-    assert_ne!(
+    // The fold clock for that same tick is the trade stamp verbatim, so the
+    // lag path and the fold path have CONVERGED: feeding one to the other is
+    // no longer destructive. Pinned so that a future receipt-bearing fold
+    // clock fails HERE, loudly, instead of silently zeroing every lag.
+    let fold_secs = tickvault_trading::candles::tf_index::fold_clock_ist_secs(TRADE_IST_SECS);
+    assert_eq!(
         fold_secs, TRADE_IST_SECS,
-        "the fixture must actually exercise the receipt-preferred branch, else \
-         the assertion below is vacuous"
+        "the fold clock must be the exchange stamp (operator directive \
+         2026-09-18). If this ever differs again, `record_ws_lag` must STILL \
+         be handed the raw stamp -- see the source-scan guard above, which is \
+         deliberately kept for exactly that day."
     );
     match ws_lag_ms(fold_secs, received_utc_nanos) {
         Some(WsLag::Measured(ms)) => assert!(
-            ms < 1_000.0,
-            "feeding the fold clock must collapse the 46-second lag toward zero \
-             -- got {ms}. This test exists to make that collapse VISIBLE, so if \
-             this assertion fails the arithmetic changed and the guard above \
-             needs re-deriving, not deleting."
+            (ms - 46_000.0).abs() < 1.0,
+            "with one clock, the fold value measures the SAME lag, got {ms}"
         ),
         other => panic!("expected a measured lag, got {other:?}"),
     }

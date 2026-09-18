@@ -54,14 +54,47 @@ fn wire() -> impl Strategy<Value = Vec<Vec<SubscribeInstrument>>> {
     prop::collection::vec(distinct_socket(), 0..5)
 }
 
+/// GLOBALLY distinct — no instrument appears twice in the whole layout,
+/// neither twice on one socket nor once on each of two.
+///
+/// This is not a convenience: both production builders guarantee it, each
+/// with ONE running `seen` set feeding a flat list that is then `chunks()`ed
+/// into sockets, so a key cannot be re-issued —
+/// `depth20_layout.rs::build_depth20_layout` (the pre-ranking fallback) and
+/// `depth20_name_board.rs::build_name_layout` (the primary engine). Each
+/// carries its own invariant test —
+/// `depth20_layout_properties.rs::no_instrument_appears_twice_in_the_whole_layout`
+/// and `depth20_name_board.rs::build_name_layout_never_subscribes_one_instrument_twice`
+/// — and THOSE are what hold the invariant. This generator merely declines to
+/// fabricate an input the builders cannot produce.
+///
+/// ⚠ Per-socket dedup — what `wire()` does — is NOT enough, and that is
+/// MEASURED rather than assumed: the globally-distinct generator survives
+/// 100,000 cases and reaches a 0-swap fixpoint within 2 minutes in 20,000
+/// cases, while the per-socket-distinct-only shape FAILS inside 50,000 and a
+/// duplicated `want` never settles in 3.675% of cases. The trigger is
+/// specifically a CROSS-socket repeat, so this constraint is minimal.
+///
+/// ⚠ The mechanism is a PAIRING FLIP, not the "deferred work re-asked" shape
+/// recorded in `no-rest-except-live-feed-2026-06-27.md` §12.14 — that shape
+/// was tested directly and converges (1 then 1). Acquiring a duplicated key
+/// changes a socket's overlap profile, so `match_sockets_by_overlap` pairs it
+/// with a DIFFERENT layout socket the next minute, and the re-pairing costs
+/// more swaps than the first plan. Corrected on the record in that file's
+/// dated "RESOLVED 2026-09-18" block, which also carries the measurements
+/// above and the reachability proof for both builders.
 fn layout() -> impl Strategy<Value = Depth20Layout> {
     prop::collection::vec(prop::collection::vec(instrument(), 0..7), 0..5).prop_map(|sockets| {
+        let mut seen = BTreeSet::new();
         Depth20Layout {
             sockets: sockets
                 .into_iter()
                 .map(|instruments| Depth20Socket {
                     underlying: None,
-                    instruments,
+                    instruments: instruments
+                        .into_iter()
+                        .filter(|i| seen.insert(key(*i)))
+                        .collect(),
                 })
                 .collect(),
             ..Depth20Layout::default()
@@ -251,4 +284,104 @@ proptest! {
         let (mut sockets, _rxs) = live(&held);
         let _ = apply_depth20_plan(&mut sockets, &plan);
     }
+}
+
+// ---------------------------------------------------------------------------
+// The duplicated-`want` case that `layout()` no longer generates.
+//
+// Constraining that generator to globally-distinct removed the ONLY coverage
+// of `claimed_takes`' behaviour under a cross-socket repeat. That path is
+// deliberate defence-in-depth against an input the two builders make
+// unreachable, so it must stay exercised even though production cannot reach
+// it — an untested defence is a defence nobody can rely on.
+//
+// What is asserted is exactly what `claimed_takes` guarantees and no more:
+// the plan never TAKES one instrument onto two sockets. Two stronger-sounding
+// properties are deliberately NOT asserted, because neither holds:
+//
+//   • Convergence. A duplicated `want` genuinely does not converge — that is
+//     the pairing flip documented at `layout()`, and asserting it here would
+//     just re-create the flake this change removes.
+//
+//   • "No instrument is ever HELD on two sockets." Measured while writing
+//     this test: it is false, and it is false for a globally-distinct `want`
+//     too. If socket A is told to take X while socket B still holds X and
+//     B's departure of X goes unfunded (B has no arrival to pair it with),
+//     X stays on B and also lands on A. The planner pairs departures with
+//     arrivals PER SOCKET and has no cross-socket departure awareness, so a
+//     transient double-hold is a property of the design, not a defect this
+//     test can assert away. It resolves on a later minute once B's departure
+//     is funded.
+// ---------------------------------------------------------------------------
+
+/// A cross-socket duplicate in `want` must be TAKEN once, not once per socket.
+/// This is the exact shape proptest reduced to before `layout()` was
+/// constrained, and it is the only remaining exercise of `claimed_takes`.
+#[test]
+fn a_cross_socket_duplicate_is_taken_onto_one_socket_only() {
+    let dup = SubscribeInstrument {
+        security_id: 7,
+        segment: ExchangeSegment::BseFno,
+    };
+    let other = SubscribeInstrument {
+        security_id: 4,
+        segment: ExchangeSegment::NseFno,
+    };
+    // Both sockets hold something they do not want, so each can FUND an
+    // arrival. Without `claimed_takes` both would therefore take `dup`.
+    let held: Vec<Vec<SubscribeInstrument>> = vec![
+        vec![
+            SubscribeInstrument {
+                security_id: 1,
+                segment: ExchangeSegment::BseFno,
+            },
+            SubscribeInstrument {
+                security_id: 2,
+                segment: ExchangeSegment::BseFno,
+            },
+        ],
+        vec![SubscribeInstrument {
+            security_id: 3,
+            segment: ExchangeSegment::BseFno,
+        }],
+    ];
+
+    // `dup` on BOTH sockets — the shape the builders cannot emit.
+    let want = Depth20Layout {
+        sockets: vec![
+            Depth20Socket {
+                underlying: None,
+                instruments: vec![dup, other],
+            },
+            Depth20Socket {
+                underlying: None,
+                instruments: vec![dup],
+            },
+        ],
+        ..Depth20Layout::default()
+    };
+
+    let plan = plan_depth20_minute(&held, &want);
+
+    // The guarantee: across the WHOLE plan, no key is taken twice.
+    let mut taken = BTreeSet::new();
+    for socket in &plan.sockets {
+        for (_, take) in &socket.swaps {
+            assert!(
+                taken.insert(key(*take)),
+                "instrument {:?} was taken onto two sockets in one plan",
+                key(*take)
+            );
+        }
+    }
+    assert!(
+        taken.contains(&key(dup)),
+        "the duplicate was never taken at all — this case no longer exercises \
+         `claimed_takes`, so the guard it protects is untested"
+    );
+
+    // And the apply path carries exactly the plan it was given.
+    let (mut sockets, _rxs) = live(&held);
+    let sent = apply_depth20_plan(&mut sockets, &plan);
+    assert_eq!(sent, plan.swap_count(), "a roomy channel dropped a command");
 }

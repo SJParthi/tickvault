@@ -1055,7 +1055,7 @@ impl MultiTfAggregator {
         // advances the watermark into day D+1 and is then rejected by its own
         // advance as `stale_trading_day`. Comparing like with like removes the
         // shape entirely rather than arguing it is small.
-        let fold_secs = fold_clock_ist_secs(tick.exchange_timestamp, tick.received_at_nanos);
+        let fold_secs = fold_clock_ist_secs(tick.exchange_timestamp);
 
         // FUTURE TRADING DAY gate — BEFORE the advance, and that ordering is
         // the entire point.
@@ -1063,10 +1063,14 @@ impl MultiTfAggregator {
         // The advance below is `>`, so a tick from the PAST can never move the
         // watermark; the stale-day gate under it is safe for that reason. A
         // tick from the FUTURE had no such guard, and the asymmetry is not
-        // theoretical: `fold_clock_ist_secs` returns the VENDOR's stamp
-        // whenever receipt and exchange disagree by more than the trusted band
-        // (`tf_index.rs`), and a stamp one day ahead disagrees by ~86,400 s —
-        // far outside it. So one clock-fault packet stamped for tomorrow was
+        // theoretical: `fold_clock_ist_secs` returns the VENDOR's stamp.
+        // (Until 2026-09-18 it returned it only when receipt and exchange
+        // disagreed by more than a trusted band, and a stamp one day ahead
+        // disagrees by ~86,400 s — far outside it. Since the ts-bucketing
+        // directive there is no band and no exception: the vendor's stamp is
+        // ALWAYS what buckets, which makes this gate strictly MORE
+        // load-bearing, never less.) So one clock-fault packet stamped for
+        // tomorrow was
         // returned verbatim, advanced the watermark into day D+1, and every
         // honest tick for the REST OF THE SESSION then failed the stale-day
         // gate below: all 24 timeframes stop folding, for every instrument,
@@ -3366,16 +3370,62 @@ mod tests {
         );
     }
 
-    /// A tick received just after IST midnight, stamped just before it, is NOT
-    /// stale — it is a boundary crossing, and refusing it would silently drop
-    /// the last trades of every session.
+    /// A tick stamped just before IST midnight and received just after it IS
+    /// refused as stale — and that is the gate finally doing what its own
+    /// comment has always claimed.
     ///
-    /// `fold_clock_ist_secs` is what makes this safe: receipt and exchange
-    /// agree well inside the trusted band, so the FOLD clock is the receipt,
-    /// and both sides of the comparison land on the same day. The gate is
-    /// therefore judging a genuine day mismatch, not a clock straddle.
+    /// ## ⚠ RE-BLESSED 2026-09-18, and this is a STRENGTHENING, not a loss
+    ///
+    /// This test used to assert the opposite, on the reasoning that the fold
+    /// clock took the receipt inside the ±300 s trusted band so both sides of
+    /// the comparison landed on the same day. That was an accurate
+    /// description of the hybrid — and it meant the day gate was
+    /// **structurally unable to fire** for any tick whose receipt sat within
+    /// five minutes of its stamp, because it was comparing a receipt-derived
+    /// day against the receipt day. A self-comparison.
+    ///
+    /// The gate's own comment states the rule it is meant to enforce, verbatim:
+    /// *"Using it on both sides makes the rule symmetric and order-independent:
+    /// the exchange day must BE the receipt day."* Under the 2026-09-18
+    /// ts-bucketing directive `fold_secs` IS the exchange stamp, so that is now
+    /// what the code compares. The rule and the implementation agree for the
+    /// first time.
+    ///
+    /// ## The old premise was false, and it is worth naming
+    ///
+    /// The retired assertion justified itself with *"refusing it would drop
+    /// real closing trades every session"*. It would not: NSE closes at 15:30
+    /// IST, the candle window closes at 15:40, and the box is stopped by
+    /// 17:30 — no session trade is anywhere near IST midnight, and any tick
+    /// that were would already be refused `out_of_session` by the
+    /// seconds-of-day gate below. The cost of this strengthening in production
+    /// is therefore zero, and it is stated rather than assumed.
+    ///
+    /// ## ⚠ What it buys, corrected the same day — it is NARROWER than the
+    /// ## first draft of this note claimed
+    ///
+    /// That draft said this strengthening buys the 2026-09-10 operator row —
+    /// a connect-snapshot of a dormant contract carrying a LAST TRADE TIME
+    /// from a previous session (measured mean 5 hours, max 34 days). **It
+    /// does not, and the arithmetic says so plainly: a stamp 5 hours old sits
+    /// 18,000 s from its receipt, far outside the retired ±300 s band, so the
+    /// hybrid ALREADY fell back to the exchange stamp and this gate ALREADY
+    /// fired on it.** That case was caught before this change and is caught
+    /// after it; claiming it as a win would be crediting a fix for work the
+    /// old code did.
+    ///
+    /// What it ACTUALLY buys is the one shape the band could hide: a stamp and
+    /// a receipt WITHIN 300 s of each other that nonetheless STRADDLE IST
+    /// midnight — precisely this test's fixture. Under the hybrid `fold_secs`
+    /// was the receipt, so `fold_day == receipt_day` and the gate was
+    /// arithmetically incapable of firing. Under the identity it fires.
+    ///
+    /// Narrow, and worth having anyway: a gate that cannot fire on its own
+    /// fixture is the class this repository keeps having to correct, and the
+    /// band is exactly where a stale stamp is hardest to tell from a fresh
+    /// one by eye.
     #[test]
-    fn a_tick_straddling_ist_midnight_inside_the_trusted_band_is_not_stale() {
+    fn a_tick_stamped_before_ist_midnight_and_received_after_it_is_stale() {
         let mut agg = MultiTfAggregator::default();
 
         let just_before_midnight = DAY - 1;
@@ -3388,10 +3438,14 @@ mod tests {
         let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
 
         assert!(
-            !stats.stale_trading_day,
-            "two seconds apart is inside the trusted band, so the fold clock \
-             takes the receipt and both sides land on the same day — a \
-             refusal here would drop real closing trades every session"
+            stats.stale_trading_day,
+            "the exchange day must BE the receipt day — the gate's own stated \
+             rule. Two seconds apart is irrelevant: they are different IST \
+             DAYS, which is the only question this gate asks."
+        );
+        assert!(
+            agg.lookup(Feed::Dhan, 66_422, SEG_IDX).is_none(),
+            "and a refused tick must open no bucket"
         );
     }
 
@@ -5498,32 +5552,35 @@ mod tests {
     }
 }
 
-// -- the receipt clock, driven END TO END through a real fold ---------------
+// -- the EXCHANGE clock, driven END TO END through a real fold ---------------
 //
-// ADDED 2026-08-28 after an adversarial sweep found the gap and named it
-// precisely: `ParsedTick::default().received_at_nanos == 0`, and EVERY candle
-// fixture in this workspace leaves it there. `fold_clock_ist_secs` returns
-// early on that sentinel, so the entire suite exercised the EXCHANGE-clock
-// FALLBACK and passed "by construction, not by agreement" — nothing drove a
-// non-zero receipt through a bucket, a close guard, or a seal.
+// ADDED 2026-08-28 for the receipt clock; REPLACED 2026-09-18 for the exchange
+// clock, per the operator's directive recorded in
+// `websocket-connection-scope-lock.md`, "2026-09-18 (SECOND) — OHLCV AND
+// VOLUME BUCKET ON THE EXCHANGE `ts`".
 //
-// The first draft of these tests ALSO carried a wrong premise, and writing
-// them is what exposed it. It used a 100-minute-stale trade stamp on the
-// belief that the receipt clock rescues a dormant contract from filing into a
-// bar hours in the past. It does not, and cannot: the delta guard rejects any
-// receipt more than `MAX_PLAUSIBLE_RECEIPT_LAG_SECS` past the trade, so that
-// packet still buckets on its trade stamp. `test_a_stale_snapshot_still_
-// buckets_on_its_trade_stamp` below pins that limit deliberately, because a
-// limit nobody wrote down is how the next reader inherits the same wrong
-// belief. What the receipt clock actually corrects is DELIVERY LAG inside the
-// band — measured p50 1.4s, p99 46s on this feed — which is exactly where a
-// minute boundary gets crossed on an ordinary day.
+// The reason this module exists at all survives both directives intact, and it
+// is the reason it was not simply deleted with the behaviour it pinned:
+// `ParsedTick::default().received_at_nanos == 0`, and EVERY candle fixture in
+// this workspace leaves it there. So a suite that never drives a NON-ZERO
+// receipt through a real bucket proves nothing about which clock is in
+// control — it passes "by construction, not by agreement". Every test below
+// therefore still sets a real receipt, and now asserts that it changes
+// NOTHING. That is a harder property to satisfy accidentally than the one it
+// replaced.
+//
+// Three of the four tests below are UNCHANGED in expectation. That is not
+// laziness — it is the measured shape of this change: the delta-bounded hybrid
+// already fell back to the trade stamp for a stale snapshot, a replayed frame,
+// a clock step and a UTC/IST mix-up. The ONLY population it moved was a live
+// tick whose delivery lag crossed a bucket boundary, and that is the one test
+// whose expectation flips.
 #[cfg(test)]
-mod receipt_clock_end_to_end_tests {
+mod exchange_clock_end_to_end_tests {
     use super::tests::{CANDLE_OPEN, SEG_IDX, tick};
     use super::*;
 
-    /// UTC nanos for an IST second — the conversion the fold clock inverts.
+    /// UTC nanos for an IST second — the conversion the day gates invert.
     fn receipt_nanos_for_ist(ist_secs: u32) -> i64 {
         (i64::from(ist_secs) - 19_800) * 1_000_000_000
     }
@@ -5538,40 +5595,51 @@ mod receipt_clock_end_to_end_tests {
         at
     }
 
-    /// The ordinary day, and the reason this change exists: a trade printed in
-    /// one minute and delivered in the next. Two seconds of lag — well inside
-    /// the measured p50 — decide which bar the packet belongs to.
+    /// THE ONE BEHAVIOURAL CHANGE, pinned in the direction it actually moved.
+    ///
+    /// A trade printed at 09:29:59 and delivered at 09:30:01. Until
+    /// 2026-09-18 the two seconds of delivery lag put this packet in the 09:30
+    /// bar. It now files into 09:29 — the minute the exchange says the trade
+    /// happened, and the minute the vendor's own 1-minute tape puts it in.
+    ///
+    /// Measured on production 2026-08-27 (NIFTY, full session): the exchange
+    /// clock produced 385/385 session minutes and 382 bars matching the
+    /// vendor's tape; the receipt clock produced 351/385 and 321. This test is
+    /// the single packet where that difference is created.
     #[test]
-    fn delivery_lag_across_a_minute_boundary_files_the_bar_by_receipt() {
+    fn delivery_lag_across_a_minute_boundary_files_the_bar_by_the_trade_stamp() {
         let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::REFOLD, 4);
 
-        // Traded at 09:29:59, received at 09:30:01.
-        let traded = CANDLE_OPEN + 30 * 60 - 1;
-        let received = CANDLE_OPEN + 30 * 60 + 1;
+        let traded = CANDLE_OPEN + 30 * 60 - 1; // 09:29:59
+        let received = CANDLE_OPEN + 30 * 60 + 1; // 09:30:01
         let mut t = tick(13, SEG_IDX, traded, 100.0, 10);
         t.received_at_nanos = receipt_nanos_for_ist(received);
 
         let _ = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
 
-        assert_eq!(
-            seal_m1_bucket(&mut agg),
-            Some(TfIndex::M1.bucket_start(received)),
-            "a packet received at 09:30:01 belongs to the 09:30 bar"
-        );
         assert_ne!(
             TfIndex::M1.bucket_start(received),
             TfIndex::M1.bucket_start(traded),
             "fixture must straddle a minute boundary or it proves nothing"
         );
+        assert_eq!(
+            seal_m1_bucket(&mut agg),
+            Some(TfIndex::M1.bucket_start(traded)),
+            "a trade printed at 09:29:59 belongs to the 09:29 bar however late \
+             it is delivered — operator directive 2026-09-18. A receipt-derived \
+             bucket here is the change undone."
+        );
     }
 
-    /// THE LIMIT, pinned deliberately. A snapshot whose last trade was 100
-    /// minutes ago is NOT re-dated to now — the delta guard refuses it and the
-    /// exchange stamp wins. This is not a defect: with `received_at` still
-    /// re-stamped at WAL replay, a large positive delta is indistinguishable
-    /// from a replayed frame, and re-dating a replay to replay-time would
-    /// destroy the bars it belongs to. Recorded as a test so the bound is a
-    /// fact rather than a belief.
+    /// A snapshot whose last trade was 100 minutes ago files into the bar its
+    /// trade stamp names.
+    ///
+    /// UNCHANGED in expectation, and worth keeping for exactly that reason:
+    /// the delta guard already produced this answer, so the test proves the
+    /// simplification did not move the case that people most expect it to.
+    /// (An earlier draft of this suite was written believing the receipt clock
+    /// re-dated such a snapshot to now. It never did — the test written to
+    /// demonstrate it failed instead, which is how the belief was caught.)
     #[test]
     fn a_stale_snapshot_still_buckets_on_its_trade_stamp() {
         let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::REFOLD, 4);
@@ -5585,18 +5653,17 @@ mod receipt_clock_end_to_end_tests {
         assert_eq!(
             seal_m1_bucket(&mut agg),
             Some(TfIndex::M1.bucket_start(traded)),
-            "beyond MAX_PLAUSIBLE_RECEIPT_LAG_SECS the fold falls back to the \
-             trade stamp — the receipt clock corrects delivery lag, it does \
-             not re-date a stale snapshot"
+            "a dormant contract's snapshot belongs to the bar of its last trade"
         );
     }
 
     /// A WAL frame re-stamped at replay: the receipt reads 9 hours after the
-    /// trade. That is a perfectly SANE epoch — an absolute plausibility band
-    /// would wave it through — so the guard being on the DELTA rather than on
-    /// the value is what catches it.
+    /// trade. UNCHANGED in expectation, and now unconditional rather than
+    /// rescued by a bound — which is the point. Measured on production
+    /// 2026-08-27: 9.1% of a session's NIFTY ticks replayed 9–20 HOURS after
+    /// their true arrival, and nine hours later is a perfectly SANE epoch.
     #[test]
-    fn a_replayed_frame_falls_back_to_the_trade_stamp() {
+    fn a_replayed_frame_buckets_on_the_trade_stamp() {
         let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::REFOLD, 4);
 
         let traded = CANDLE_OPEN + 20 * 60;
@@ -5612,14 +5679,18 @@ mod receipt_clock_end_to_end_tests {
         );
     }
 
-    /// Close ownership on the receipt clock: two packets in one minute, the
-    /// EARLIER-traded one arriving LAST, both inside the trusted band. On the
-    /// exchange clock the order guard would refuse the late arrival and the
-    /// bar would keep the first price; on the receipt clock the last-received
-    /// packet owns the close. That is the semantic the operator asked for,
-    /// written as a test rather than asserted in a comment.
+    /// The close is owned by the LATEST-TRADED packet, not the last-received.
+    ///
+    /// Two packets inside one minute: the first traded at +20 s, the second
+    /// traded at +5 s but arriving later. Under the receipt clock the late
+    /// arrival owned the close and the bar closed at 107.0. Under the exchange
+    /// clock the order guard refuses it as older and the bar closes at 100.0 —
+    /// the price of the last TRADE in the minute, which is what a candle close
+    /// means and what the vendor's own tape reports.
+    ///
+    /// High and low are unaffected: both packets still fold into the range.
     #[test]
-    fn the_close_is_owned_by_the_last_packet_we_received() {
+    fn the_close_is_owned_by_the_latest_traded_packet() {
         let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::REFOLD, 4);
         let minute = TfIndex::M1.bucket_start(CANDLE_OPEN + 30 * 60);
 
@@ -5632,16 +5703,66 @@ mod receipt_clock_end_to_end_tests {
         let _ = agg.consume_tick(Feed::Dhan, &second, None, |_, _, _, _, _| {});
 
         let mut close = f64::NAN;
+        let mut high = f64::NAN;
         agg.force_seal_all(|_, _, _, tf, st| {
             if tf == TfIndex::M1 {
                 close = st.close;
+                high = st.high;
             }
         });
         assert!(
-            (close - 107.0).abs() < 1e-9,
-            "the LAST-RECEIVED packet owns the close (got {close}); on the \
-             exchange clock the earlier-traded 107.0 would have been refused \
-             by the order guard and the bar would have closed at 100.0"
+            (close - 100.0).abs() < 1e-9,
+            "the LATEST-TRADED packet owns the close (got {close}); the \
+             out-of-order 107.0 traded EARLIER in the minute and must not \
+             become its closing price"
+        );
+        assert!(
+            (high - 107.0).abs() < 1e-9,
+            "the out-of-order packet must still widen the RANGE (got {high}) — \
+             only close OWNERSHIP is decided by ordering, never the extremes"
+        );
+    }
+
+    /// THE REPAIR, and the largest thing this directive buys.
+    ///
+    /// The tick writer's session gate (`session_window::classify`) has always
+    /// keyed on the exchange stamp alone. The fold keyed on the hybrid. So a
+    /// print traded at 15:39:30 and delivered at 15:40:05 was WRITTEN to
+    /// `ticks` and refused by every candle as `out_of_session` — one clock
+    /// admitting what the other refused, recorded at length in
+    /// `session_window.rs` as "deliberately NOT reconciled here".
+    ///
+    /// It is now structurally impossible: both paths read one clock. This test
+    /// is that divergence, in the exact band the doc names.
+    #[test]
+    fn a_late_delivered_closing_print_is_now_folded_as_well_as_written() {
+        let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::REFOLD, 4);
+
+        // 15:39:30 IST traded, 15:40:05 IST received — 35 s of delivery lag,
+        // well inside this feed's measured p99 of 46 s.
+        let day = (CANDLE_OPEN / 86_400) * 86_400;
+        let traded = day + 15 * 3_600 + 39 * 60 + 30;
+        let received = day + 15 * 3_600 + 40 * 60 + 5;
+        let mut t = tick(13, SEG_IDX, traded, 100.0, 10);
+        t.received_at_nanos = receipt_nanos_for_ist(received);
+
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+
+        assert!(
+            received % 86_400 >= MARKET_CLOSE_SECS_OF_DAY_IST,
+            "fixture must place the RECEIPT at or past the window close, or it \
+             does not exercise the divergence"
+        );
+        assert!(
+            stats.folded(),
+            "an in-window trade must fold however late it is delivered; on the \
+             receipt clock this same packet was refused `out_of_session` while \
+             its row was written"
+        );
+        assert_eq!(
+            seal_m1_bucket(&mut agg),
+            Some(TfIndex::M1.bucket_start(traded)),
+            "and it belongs to the 15:39 bar"
         );
     }
 }
@@ -5927,20 +6048,35 @@ mod day_gate_permutation_sweep {
 
     // -- day boundaries -----------------------------------------------------
 
-    /// One SECOND apart across IST midnight, far outside the trusted band, is
-    /// a genuine day mismatch and is refused.
+    /// One SECOND apart across IST midnight is a genuine day mismatch and is
+    /// refused.
     ///
-    /// This is the sharp edge of the rule and it is deliberate: the comparison
-    /// is on DAYS, so a single second can flip it. It is safe because the
-    /// trusted band already collapses a real straddle onto one clock (pinned
-    /// by `a_tick_straddling_ist_midnight_inside_the_trusted_band_is_not_stale`)
-    /// and because the candle session closes at 15:40 IST — nothing legitimate
-    /// trades within a second of midnight.
+    /// ## ⚠ Re-stated 2026-09-18 — the old safety argument cited a mechanism
+    /// ## and a test that no longer exist
+    ///
+    /// This used to read: *"It is safe because the trusted band already
+    /// collapses a real straddle onto one clock (pinned by
+    /// `a_tick_straddling_ist_midnight_inside_the_trusted_band_is_not_stale`)."*
+    /// Both halves are gone. The ts-bucketing directive deleted the trusted
+    /// band, and the test it named now asserts the OPPOSITE under the name
+    /// `a_tick_stamped_before_ist_midnight_and_received_after_it_is_stale` —
+    /// because with one clock the gate finally compares the EXCHANGE day
+    /// against the receipt day, which is the rule its own comment always
+    /// claimed to enforce.
+    ///
+    /// The sharp edge is therefore real and unmitigated: the comparison is on
+    /// DAYS, so a single second flips it, and nothing collapses a straddle any
+    /// more. **What makes it safe is the session window, not the fold clock**:
+    /// the candle session is `[09:00, 15:40)` IST and the box is stopped by
+    /// 17:30, so nothing legitimate trades within a second of IST midnight,
+    /// and anything that did would already be refused `out_of_session` by the
+    /// seconds-of-day gate. That is a weaker guarantee than the one this
+    /// comment used to claim, and it is stated plainly rather than implied.
     #[test]
     fn an_exchange_stamp_one_second_before_midnight_is_stale_against_the_next_day() {
         let mut agg = MultiTfAggregator::default();
-        // Receipt is a full working day later, so the trusted band cannot
-        // collapse the two onto one clock.
+        // Receipt a full working day later — the mismatch is unambiguous and
+        // does not depend on any band, which no longer exists.
         let mut t = tick(13, SEG_IDX, DAY - 1, 100.0, 1);
         t.received_at_nanos = receipt_at_ist(i64::from(DAY + 33_400));
 

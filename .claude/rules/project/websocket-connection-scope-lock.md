@@ -5340,6 +5340,87 @@ that is the support ticket, not this cap.
 - Changes the socket or instrument budgets, the name band, or the ATM windows.
 - Reports the 48 s worst case as a measured figure.
 
+### 2026-09-13 — DHAN-ONLY, RESTATED: the Groww token minter, and the false strings the 2026-08-21 removal left behind
+
+**The verbatim operator demand (2026-09-13, typed directly in-session — preserve
+EXACTLY, expletives and typos included):**
+
+> "remove that fuckign groww token mitner also see clealry ntoe in this appllciation we ened to always ahve one an donly dhan related data dude okay? no groww accepatbela t any poitn dude okay?"
+
+**No new scope is claimed.** The 2026-08-21 directive ("2026-08-21 (THIRD quote of
+the day)") already ordered the entire Groww surface removed; this is that directive
+executed on the residue it left, plus the operator naming one AWS resource it never
+covered. Recorded per the rule-file-first law.
+
+#### What was MEASURED, 2026-09-13 — better than expected in code, worse in AWS
+
+| Surface | Reading |
+|---|---|
+| `fetch_groww_access_token` | **does not exist** — the only 3 hits are historical comments |
+| `Feed::Groww` enum variant | **does not exist** — `Feed::ALL` is `[Dhan, Truedata]`; the single textual hit is inside a comment |
+| Groww mentions in `crates/` | 1,765 lines, of which **1,202 are comments** and only **80 are production code** |
+| Tickvault Terraform declaring a Groww resource | **ZERO** — all 13 `.tf` files that mention the word do so in comments |
+| EventBridge rule `groww-token-minter-daily` | **ENABLED**, `cron(35 0 * * ? *)`, and it **minted at 06:05 IST that morning** |
+| `/tickvault/prod/groww/{access-token,api-key,totp-secret}` | present; access-token `LastModifiedDate` = today |
+
+#### ⚠ The minter is NOT tickvault's to delete, and that is the honest blocker
+
+`groww-shared-token-minter-2026-07-02.md` §1 records that the Lambda's Terraform
+lives in the **bruteX repo**, and `brutex-readonly-lock-2026-07-18.md` makes
+tickvault READ-ONLY there. So the rule and the trigger sit in the operator's shared
+AWS account while their source of truth is a repo this session may not write. A
+disable from here is reverted by bruteX's next `terraform apply`, and bruteX loses
+its Groww token in between. The executing identity also lacks `events:DisableRule`
+and every `lambda:*` action (both verified by attempting them).
+
+**It is therefore an operator action, not an executor one**, and it is recorded
+here rather than half-done: EventBridge → Rules → `groww-token-minter-daily` →
+Disable, then delete the three SSM parameters.
+
+#### What WAS fixed in tickvault (the operator-visible half)
+
+Four Telegram/log surfaces stated, in production, that a second broker exists:
+
+| Site | Said | Reachability |
+|---|---|---|
+| `events.rs` `StartupComplete` ×4 arms | "(Groww per-minute legs report separately)" | **every boot** |
+| `events.rs` `Chain1mUnderlyingNotServed` / `…ServedRecovered` | "the second broker (🟢 GROWW) … check the Groww copy" | a §2.1 allowed-family page, live |
+| `events.rs` `DualFeedScorecardAborted` | "the 3:45 PM IST Dhan-vs-Groww scorecard" | live |
+| `order_runtime.rs:1282, :1914` | "Groww marks" / "waiting for the first Groww mark" | **`[order_runtime] enabled = true`, `self_test = true`** — both fire, and the mark producer has been `dhan_cadence_executor` since 2026-08-21, pinned by `cadence_mark_source_guard::test_dhan_cadence_executor_is_now_the_mark_producer`, a test INVERTED that day to assert exactly that |
+
+Every one is corrected, and the tests that asserted the old wording now assert its
+**ABSENCE** (`assert!(!msg.contains("Groww"))`) so it cannot creep back.
+
+**One claim CORRECTED rather than repeated.** A review of this work reported
+`feed_scoreboard_boot.rs:3448` as a live bug — `match feed { Dhan => dhan_on, _ =>
+groww_on }` now routing TrueData through a Groww variable. The call site
+(`main.rs:5409-5411`) passes `(is_enabled(Dhan), is_enabled(Truedata))`, so the
+**VALUE is correct and only the NAME was stale**. Renamed `groww_on` →
+`secondary_on`. Recorded because "misleading name" and "wrong behaviour" are
+different findings and only one of them was true.
+
+#### NOT done, and deliberately
+
+The feed-generic seam stays exactly as the 2026-08-21 REJECT list requires — the
+`Feed` enum, the cadence scheduler, and the `spot_1m_rest` / `option_chain_1m` /
+`rest_fetch_audit` tables and their writers are UNTOUCHED, because GDF and TrueData
+plug into them and their scope locks are unaffected by this quote. The dead
+`*_FEED_GROWW` constants, the dormant `FUTIDX-02` cross-feed comparator, and the
+`groww_symbol` / `groww_minutes` DDL columns are left for a separate change: the
+columns in particular are **not free** to remove, because the self-heal is
+`ADD COLUMN IF NOT EXISTS` and can never drop one, so a live `ALTER TABLE … DROP
+COLUMN` is an operator decision rather than a code edit.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Re-introduces any operator-facing string naming a second broker.
+- Removes the feed-generic seam "because only Dhan is left" (the 2026-08-21 row).
+- Deletes a SEBI/audit row, or a `feed='groww'` row from `instrument_lifecycle`,
+  `instrument_lifecycle_audit` or `index_constituency` — removing the WRITER was
+  authorized, deleting the ROWS never was.
+- Writes to the bruteX repo to remove the minter (read-only lock, 2026-07-18).
+- Reports the minter as removed on the strength of a tickvault-side change.
+
 ### 2026-09-16 — SOCKETS ONLY: the per-minute REST KEEP is REVERSED
 
 **The verbatim operator demand (2026-09-16, typed directly in-session — preserve
@@ -5370,3 +5451,457 @@ any code). Summary of what it settles, all Verified in source:
 **What this section does NOT authorize:** any change to the socket budget (16),
 the endpoint types (4), the order-side REST surface, `dry_run`, the §28 frozen
 indicator/strategy area, or any deletion of a SEBI/audit table row.
+
+### 2026-09-18 — ELEVEN TIMEFRAMES, ONE SIGNED VOLUME, AND `top_volume` ORDERED BY VOLUME-PERCENTAGE CHANGE
+
+**The verbatim operator demands (2026-09-18 and the two sessions before it — preserve
+EXACTLY, typos included):**
+
+**Quote A (the timeframe + column requirement, stated twice, verbatim the second time):**
+> "See as of now we will have one and only candles tables timeframe which is ticks, 1s, 3s, 5s, 1m, 3m, 5m, 10m, 15m, 30m, 60m right dude only these timeframes alone dude okay? See meanwhile in all these tables also we planned to remove net volume right dude and instead of this net volume we just planned to use one and only direct volume where it should accept m nus symbol right dude because our current volume is providing the precise timeframe timestamps jet volume dude okay? See meanwhile in top volume table also just have one and only 1s, 3s, 5s and 1m table where it shoudl also delete this net volume column and where it should have one and only direct volume precise to candles table dude so that obviously it will have the precise direct volume right dude precise to candles table volume right dude so both of them should be precisely matchable right dude even in our top volume table right dude so even here also we shoudl remove net volume column right dude meanwhile in top volume by default our plan is to always have the volume percentage change desc for every timeframe of its respective timestamps right dude am I right dude check whether all these in place or not dude okay?"
+
+**Quote B (the sign rule, with two Dhan chart screenshots attached):**
+> "see its simple our current volume si rpecisley correct dude but we just need to accept this negative sign thats it dude okay see ebcause if we see the rpecise volue anyhwo it is the net volume rigth if you see in dhan cahrts based on previous timeframe timestampt comapred to oits current tienfraen current tiemstamp if the close is lesser tehn its negative right dude am i irgith dude tlel me udd eokay?"
+
+**Quote C (2026-09-18 — the `10m` ruling and the authorization):**
+> "no 10s derive the 10m dude okay see whatver i asked use eevrythign as the main requirmenet dude okay?"
+
+Quote C answers the two questions this session put to the operator: `10m` is REAL and is
+to be **DERIVED** (not a typo for `10s`), and the whole of Quote A is the specification.
+This dated section is the rule-file-first record required before any timeframe or schema
+code moves.
+
+#### What this SUPERSEDES
+
+`daily-universe-scope-expansion-2026-05-27.md` §0 Quote 13 (2026-08-08) specified
+**thirteen** current-day timeframes — `1s/5s/10s/15s/30s · 1m/2m/3m/5m/15m/30m/60m · 1d`.
+That list is REPLACED by Quote A's set. Recorded rather than silently overwritten,
+because the 2026-08-08 set is why `TfIndex::is_operator_requested()` reads the way it
+does, and a reader of that gate needs to know which directive it now answers to.
+
+| | 2026-08-08 (Quote 13) | **2026-09-18 (Quote A)** |
+|---|---|---|
+| Candle frames | 13 | **10** + the `ticks` table |
+| Second-scale | 1s, 5s, 10s, 15s, 30s | **1s, 3s, 5s** |
+| Minute-scale | 1m, 2m, 3m, 5m, 15m, 30m, 60m | **1m, 3m, 5m, 10m, 15m, 30m, 60m** |
+| Day | 1d | — |
+
+Net: **3s gains** emission, **10s / 15s / 30s / 2m lose** it, **10m is new**, **1d leaves**.
+
+#### ⚠ A drift found while verifying, recorded because the gate is the thing being changed
+
+`dhan_feed_stack.rs:2792` calls the emitted set *"the thirteen timeframes the operator
+asked for"*. It is **twelve**. The comment enumerates eleven excluded second-scale frames
+and forgets that `D1` is excluded too, so `24 − 12 = 12` emit, not 13. The 2026-08-08
+directive did list thirteen; the gate has only ever implemented twelve. Corrected with
+this change.
+
+#### The contract (LOCKED)
+
+| # | Locked value |
+|---|---|
+| 1 | **Candle frames emitting rows: exactly 10** — `1s, 3s, 5s, 1m, 3m, 5m, 10m, 15m, 30m, 60m` — plus the separate `ticks` table. `is_operator_requested()` gains `S3`, loses `S10`/`S15`/`S30`/`M2`. |
+| 2 | **`10m` is DERIVED, never a new fold frame.** No `TfIndex` variant, no ordinal, no `TF_COUNT` change, no seal-ring resize, **zero added per-tick work**. See the derivability proof below — it is what makes Quote C's "derive" both possible and correct. |
+| 3 | **One `volume` column per candle table, signed.** `net_volume` is removed from the `CREATE TABLE` DDL and its `ADD COLUMN IF NOT EXISTS` self-heal is deleted. The column type is already `LONG` (signed); only the writer changes. |
+| 4 | **The sign rule, verbatim from Quote B:** compare this bar's `close` against the PREVIOUS bar's close **of the same timeframe**. Lower → the bar's whole volume is negative. Not lower → positive. The magnitude is **never** altered — Quote B: *"our current volume is precisely correct … we just need to accept this negative sign."* |
+| 5 | **`top_volume` cadences: exactly `1s, 3s, 5s, 1m`** — already true, unchanged. |
+| 6 | **`top_volume` carries one signed per-window `volume` that equals the candle bar's `volume`** for the same instrument and the same window. |
+| 7 | **The four `top_volume_{1s,3s,5s,1m}` views default to `ORDER BY` volume-percentage change `DESC`.** |
+| 8 | **The `ts` offset is closed** — see below; without it clause 6 is unachievable by any column change. |
+
+#### ⚠ Why `10m` is exactly derivable — and the one decision it forces
+
+Under clause 4, `signed = ±gross`, so **`abs(signed) == gross` for every bar**. Nothing is
+lost. A 10-minute bar is therefore recoverable from the 1-minute bars with no extra
+storage and no extra per-tick work: `first(open)`, `max(high)`, `min(low)`, `last(close)`,
+`sum(abs(volume))` for the gross, then clause 4's sign applied at the 10m level against the
+previous 10m close.
+
+**That identity is destroyed if a flat bar is zeroed.** TradingView's built-in Net Volume —
+which is what the Dhan chart in Quote B's screenshots runs — returns `0` when
+`close == close[1]`. Adopting that would make `abs(signed) != gross` for flat bars, and
+`10m` could no longer be derived from `1m` at all.
+
+**DECISION (labelled Assumed, not quoted — the operator did not address the flat case):
+a flat close is POSITIVE, not zero.** Grounds: Quote B says the magnitude is already
+correct and the ONLY change is the sign, and its stated rule fires on *"if the close is
+lesser"* alone. Zeroing a bar changes its magnitude, which Quote B excludes.
+
+**⚠ The honest cost of that decision, stated rather than buried:** on a bar whose close
+equals the previous close, the Dhan chart will show `0` and this table will show `+gross`.
+That is a real, visible divergence from the chart Quote B cites, and it is most frequent on
+the `1s` frame, where a flat close is common. It is reversible by a fresh dated quote — but
+reversing it makes `10m` a native fold frame (`TfIndex` ordinal 24, `TF_COUNT` 24 → 25,
+seal ring 600,000 → 625,000, one more scalar fold per tick), which is the more expensive
+shape Quote C's "derive" appears to reject.
+
+#### ⚠ The `ts` offset — clause 6 is impossible without this, and no column change fixes it
+
+MEASURED: **candle bars stamp the window OPEN; `top_volume` rows stamp the window CLOSE.**
+`TfIndex::bucket_start()` returns the window open; `top_volume_snapshot.rs:518` floors the
+snapshot timer's FIRE instant, which is the close. So a `top_volume` row and a
+`candles_<tf>` row carrying the same `ts` describe **different windows**, one period apart,
+on every row of every cadence — while `top_volume_snapshot.rs`'s own module comment claims
+the shared grid anchor "lets a `top_volume` row and a `candles_<tf>` row share a `ts` and be
+joined." It does not. `top_volume` must stamp the window OPEN, and that comment is a claim
+to correct in the same change.
+
+Five further blockers behind it, all recorded so none is rediscovered: `candles_3s` has no
+rows at all until clause 1 lands; the two sides use different clocks (per-tick receipt clock
+vs `now_ist_nanos()` at timer fire); `top_volume` applies a monotonicity re-latch
+(`RELATCH_AFTER_CONSECUTIVE_LOWER = 32`) that candles do not; the populations differ
+(candles = every instrument from 09:00, `top_volume` = option contracts from 09:15); and no
+test, guard or query anywhere cross-references the two tables.
+
+#### ⚠ What this section does NOT authorize (Rule 11)
+
+- **Any physical `DROP COLUMN`.** The candle self-heal is `ADD COLUMN IF NOT EXISTS` and can
+  never drop one, so removing `net_volume` from the DDL leaves the column present with stale
+  data on every existing table. Reclaiming it is an operator `ALTER TABLE … DROP COLUMN`,
+  not a code edit.
+- **Any new `TfIndex` variant or `TF_COUNT` change** — clause 2 exists to avoid exactly that.
+- Any change to the socket budget (16), the four endpoint types, `dry_run`, the §28 frozen
+  indicator/strategy area, or any deletion of a SEBI/audit row.
+- Any claim that this is deployed: push-to-main is path-filtered and the no-deploy band is
+  09:00–15:45 IST Mon–Fri.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Adds a `TfIndex` variant, or changes `TF_COUNT`, to serve `10m`.
+- Derives `10m` by SUMMING the signed 1m volumes — signed volume is **not additive across
+  timeframes** (five 1s bars of `+100, −100, +100, −100, +100` sum to `+100` while the 5s
+  bar reads `±500`). The gross must be summed and the sign applied at the 10m level.
+- Zeroes a flat bar without a fresh dated quote AND making `10m` a native frame in the same
+  change — the two are one decision, not two.
+- Removes `net_volume` from the DDL while leaving the `ADD COLUMN IF NOT EXISTS` self-heal,
+  which silently re-adds it on the next boot.
+- Ships clause 6 while `top_volume` still stamps the window close — the rows cannot match,
+  whatever the columns are called.
+- Leaves `top_volume_snapshot.rs`'s "share a `ts` and be joined" comment standing.
+- Reports clause 1 as done while `candles_3s` still has zero rows, or while `10s`/`15s`/
+  `30s`/`2m` are still emitting.
+- Deletes or weakens `every_sub_minute_frame_sums_to_the_same_minute_net_volume` instead of
+  re-scoping it: under clause 4 that property genuinely no longer holds for the SIGNED
+  number, and it must be re-scoped to the GROSS, not removed.
+
+#### 2026-09-18 (same day, later) — the operator confirms the shape, and it SETTLES the flat-bar question
+
+**Verbatim:**
+> "see if we use volume to accept the negative sign then it would be so easy rigth dude where as we can match the precise dhan net volume of respective tiemframe respective tiemstamps rigth dide am i rigth dude okay?"
+
+He is right, and the confirmation names the objective function explicitly: **match Dhan's
+net volume for the respective timeframe at the respective timestamp.** That is the thing
+clause 4 exists to do.
+
+**It also settles the flat-bar decision above, which the section records as `Assumed`.**
+The argument that settles it is INFORMATION PRESERVATION, not a reading of his words:
+
+| Stored form | Can a VIEW render the other form? |
+|---|---|
+| **flat → `+gross`** (this section's decision) | **YES.** `CASE WHEN close > lag(close) THEN abs(volume) WHEN close < lag(close) THEN -abs(volume) ELSE 0 END` reproduces TradingView's built-in Net Volume **exactly**, flat bars included. |
+| flat → `0` | **NO.** A zeroed bar has destroyed its own magnitude. Nothing downstream can recover it — not a view, not a query, not a re-read. |
+
+So the stored column keeps the magnitude (Quote B: *"our current volume is precisely
+correct … we just need to accept this negative sign"*), and the chart-exact rendering is a
+view away whenever it is wanted. The reverse is impossible. One direction is reversible and
+the other is not, and this file's standing discipline is to take the reversible one.
+
+**⚠ And the flat-bar behaviour of the Dhan chart is `Unknown`, not Verified.** Neither
+screenshot in Quote B shows a bar whose close equals the previous close; TradingView's
+built-in formula returning `0` there is an INFERENCE from the chart being a TradingView
+chart, never an observation. Storing the information-preserving form means that inference
+never has to be right — if the chart turns out to carry `+gross` on a flat bar, the stored
+column already matches it with no re-fold.
+
+**This retires the "10m becomes a native frame" branch.** That branch existed only as the
+consequence of zeroing flat bars; with the magnitude preserved, `abs(signed) == gross`
+holds on every bar and clause 2's derived `10m` stands unconditionally — no `TfIndex`
+variant, no `TF_COUNT` change, no seal-ring resize, zero added per-tick work.
+
+### 2026-09-18 (SECOND) — OHLCV AND VOLUME BUCKET ON THE EXCHANGE `ts`, NOT `received_at`
+
+**The verbatim operator demand (2026-09-18, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "dude just now foudn one more issue which is see dude as fo now to set the rpecise ohlcv we used the recived at right dude but now we have a catch bro which is see we need to use this ts dude nowhere hereafetr we hsodu luse received at to define our ohlcv dude okay? our only apporach si to use this ts to set our ohlcv everyhwere dude okay even volume also ddue okay?"
+
+This dated section is the rule-file-first record required before any bucketing
+code moves. **It REVERSES the operator's own 2026-08-28 directive** recorded
+above ("CANDLES FROM 09:00, OHLCV ON THE RECEIPT CLOCK"), which is why it gets
+its own section rather than an edit in place.
+
+#### ⚠ This is a reversal of a reversal, and the earlier record says so
+
+The 2026-08-28 section opens with a block headed *"The reaffirmation, recorded
+so the decision is auditable"*, and its own words are: the receipt-clock
+instruction *"was given, measured against, reported back with contrary evidence,
+and then **reaffirmed**."* So the operator has now moved back to the clock that
+the contrary evidence favoured. That is not a contradiction to be papered over —
+it is the measurement winning, one directive later.
+
+#### The measurement, quoted from the section this one reverses
+
+| Measured on production, 2026-08-27, NIFTY | Exchange clock (`ts`) | `received_at` |
+|---|---|---|
+| Session minutes present | **385 / 385** | 351 / 385 |
+| Bars exactly matching the vendor's own tape | **382 (99.2%)** | 321 (83.4%) |
+| Phantom bars stamped outside market hours | **0** | 4 |
+| Ticks filed on the WRONG DAY | **0** | 4,319 |
+| Ticks that would change minute on the LIVE path | — | 0 of 83,871 |
+
+**The exchange clock won on every dimension that was measured.** The last row is
+why the 2026-08-28 choice was defensible at the time: on the LIVE path the two
+clocks are identical, because Dhan stamps whole seconds and we receive inside the
+same second. They diverge only on WAL replay — and there `received_at` carried
+the moment of REPLAY rather than the moment of receipt, which was a DEFECT in how
+`received_at` was populated, closed the same day by the `TVW3` record format.
+
+So the honest statement of this reversal: the 2026-08-28 directive fixed a
+`received_at` defect and then kept the clock whose own measurements were worse.
+This directive takes the better-measured clock.
+
+#### ⚠ CORRECTED 2026-09-18 (same day, hours later) — the "catch" first written
+#### here was WRONG on BOTH counts, and it was wrong in the blocking direction
+
+The first draft of this subsection told the operator that `ts` bucketing would
+re-create the **8,898 fabricated bars** defect and that today's bucketing is
+`received_at`. **Neither is true.** Both were asserted from the 2026-08-28
+section's prose rather than from the function that actually buckets a tick, and
+the function's own doc retracts the exact argument that was quoted. The wrong
+text is replaced rather than annotated, because leaving a false BLOCKER standing
+is how a session ends up refusing work the code already supports.
+
+**What actually buckets a tick today — `tf_index.rs::fold_clock_ist_secs`:**
+
+```rust
+if received_at_nanos <= 0 { return exchange_timestamp; }      // no receipt -> ts
+let delta = receipt_ist_secs - exchange_timestamp;
+if delta > MAX_PLAUSIBLE_RECEIPT_LAG_SECS      // +300
+    || delta < -MAX_PLAUSIBLE_RECEIPT_LEAD_SECS { //  -10
+    return exchange_timestamp;                                 // implausible -> ts
+}
+receipt_ist_secs                                               // else -> receipt
+```
+
+It is a **DELTA-BOUNDED HYBRID**, not `received_at`. It prefers the receipt clock
+ONLY inside `[-10 s, +300 s]` of the trade stamp, and falls back to `ts`
+everywhere else.
+
+| Case | Clock used TODAY | Clock under this directive | Changes? |
+|---|---|---|---|
+| Live tick, delivered inside 300 s | receipt | `ts` | **yes — this is the only real change** |
+| Dormant snapshot, LTT hours/days old | **`ts` already** (fails +300 s) | `ts` | no |
+| Clock lead > 10 s | **`ts` already** | `ts` | no |
+| Pre-TVW3 WAL frame, `received_at_nanos == 0` | **`ts` already** (sentinel arm) | `ts` | no |
+
+**So the stale-LTT case the draft called a blocker has been bucketing on `ts`
+since the delta guard was written.** `fold_clock_ist_secs`'s own doc says so, and
+retracts the justification the draft borrowed, verbatim: *"An earlier draft of
+this doc justified the change with the DORMANT CONTRACT case… **That
+justification was FALSE**, and the test written to demonstrate it failed instead
+— which is how it was caught. The delta guard below refuses any receipt more than
+[MAX_PLAUSIBLE_RECEIPT_LAG_SECS] past the trade, so a stale snapshot falls
+straight back to its trade stamp."*
+
+**And the fabricated-bar defect is NOT guarded by the clock — it is guarded by a
+clock-INDEPENDENT day gate** (`multi_tf_aggregator.rs`, the `fold_day` vs
+`receipt_day` comparison on both arms): a fold whose IST DAY differs from the
+receipt day is refused as `stale_trading_day` / `future_trading_day` **whichever
+clock produced `fold_secs`**. That gate is untouched by this directive and keeps
+working identically after it.
+
+#### What this directive ACTUALLY changes, stated honestly
+
+It deletes the **≤300 s delivery-lag correction** on the live path, and nothing
+else. The consequence, stated plainly rather than minimised:
+
+* A trade the exchange stamps **09:29:59** that reaches us at **09:30:01** files
+  into the **09:29** bar under `ts` (correct by EVENT time — it is what the
+  vendor's own tape shows) instead of the **09:30** bar under the hybrid (correct
+  by the bar a live decision was reading at that instant).
+* The measured live impact is **zero**: `0 of 83,871` ticks changed minute on the
+  live path (the 2026-08-28 table above), because Dhan stamps whole seconds and we
+  receive inside the same second. It bites only when delivery lag exceeds the
+  seconds remaining in the bucket — rare per tick at a p50 of 1.38 s, and
+  systematically more likely on the 1-second frame than the 1-minute one.
+* **That is the trade the operator has chosen**, and it is the one the measured
+  table favours: the exchange clock won 385/385 minutes, 99.2% tape agreement,
+  0 phantom bars, 0 wrong-day ticks.
+
+#### The ONE residual, which is pre-existing and is NOT introduced here
+
+A pre-TVW3 WAL frame carries `received_at_nanos == 0` — the documented "no
+receipt" sentinel. Both day gates stand down there rather than guess, so such a
+frame is protected only by the replay watermark's ordering. Under the hybrid it
+ALREADY buckets on `ts`, so this directive changes nothing about it. Recorded so
+it is not mistaken for a new hole opened by the clock change.
+
+#### `ws_lag_ms` MUST NOT follow this directive
+
+The delivery-lag gauge measures `received_at − ts` **by definition**. Refactoring
+it onto `fold_secs` would collapse it to a constant 0 and blind
+`tv-<env>-dhan-worst-socket-deaf`, which is the only alarm that can see a socket
+that pongs but has stopped delivering. `ws_lag_clock_guard.rs` exists for exactly
+this and stays.
+
+#### The 09:00 → 15:39:59 window clause — ALREADY SHIPPED, and it already keys on `ts`
+
+Operator, same message (2026-09-18, verbatim): *"meanwhiel now ensure to recieve
+the data starting 9 am till 3.39.59 pm dude okay so now we need to use ts dude
+isntead of received at dude okay?"*
+
+**This half needs no code.** `crates/common/src/session_window.rs` shipped
+2026-09-05 against the operator's own earlier verbatim rule — which that module
+quotes in its header — and it is WIRED, not dormant:
+
+| Property | Value, verified in source |
+|---|---|
+| Window | `[TICK_PERSIST_START_SECS_OF_DAY_IST, TICK_PERSIST_END_SECS_OF_DAY_IST)` = `[32_400, 56_400)` = **09:00:00 → 15:39:59.999999999 IST** |
+| Refusal key | **`ts` ALONE** (`WindowVerdict::is_refusal` matches `TsOutOfWindow` only) |
+| `received_at` out of window | **COUNTED and LOGGED, never refused** |
+| Production call sites | `tick_persistence.rs`, `depth_persistence.rs`, `shadow_candle_writer.rs`, `tick_spill_replay.rs` |
+| Complexity | **O(1)** — two integer divisions, two compares, zero allocation |
+
+The end being EXCLUSIVE is what makes it read "till 3.39 pm": the last accepted
+instant is 15:39:59.999999999. The module's own doc warns against "fixing" 56_400
+to 56_340, which would discard the entire 15:39 minute **including the closing
+auction**.
+
+**The receipt leg was deliberately made non-refusing**, and that decision is the
+operator's first principle applied: at the measured Dhan p99 delivery lag of
+46.37 s, refusing on receipt discarded the last ~46 seconds of every session for
+the slowest 1% of ticks — silently, with no replay. `ts` says WHAT THE ROW IS;
+`received_at` says how fast the network was, and a real print must never be
+dropped because the vendor was slow.
+
+#### What this directive does NOT authorize
+
+- Moving `TICK_PERSIST_START_SECS_OF_DAY_IST`, the day-OHLC gate, or any session
+  window. This changes WHICH CLOCK buckets a tick, never which ticks are admitted.
+- Re-admitting pre-open ticks into day HIGH/LOW/CLOSE (the 2026-08-25 carve-out
+  stands, and the 2026-08-26 re-affirmation stands with it).
+- Any change to the `ticks` table's own `ts`, which has stored the exchange
+  timestamp since it was written and is unaffected.
+- Any change to the socket budget, the endpoint types, `dry_run`, or the §28
+  frozen indicator/strategy area.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Buckets on `ts` without a stale-LTT guard — that is the 8,898-fabricated-bar
+  defect, restored by name.
+- Silently drops a stale-LTT tick instead of counting it: the refusal families
+  (`stale_trading_day`, `future_trading_day`, `untraded_timestamp`,
+  `untraded_sentinel`, `out_of_band_timestamp`) exist so a refusal is countable,
+  and a new one must be too.
+- Buckets OHLC on `ts` and leaves VOLUME on `received_at`, or vice versa — the
+  directive says "even volume also", and a split clock makes the two
+  unreconcilable by construction.
+- Claims the two clocks now agree on the replay path without re-measuring: the
+  2026-08-27 table is a measurement with a date, and the `TVW3` record format
+  changed one of its inputs.
+
+#### 2026-09-18 (SECOND, continued) — SHIPPED, and the one constant the clock change forced with it
+
+**The verbatim operator authorization for the follow-through (2026-09-18, typed
+directly in-session):**
+
+> "go ahead and implement the ts bucketing now dude."
+
+> "fix and resolve everything dude okay?"
+
+The second was given in DIRECT response to a message that ended with one
+enumerated question — *"resize the seal margin inside this same change against a
+real measured inter-instrument trade-clock spread, or ship the clock fix and
+take the margin as its own change?"* — alongside the three findings the
+implementation had surfaced. That is the §28.2/§28.3 authorization shape this
+repository already accepts: a general go-ahead answering an ENUMERATED ask
+selects the enumerated work. Recorded HERE with the code, per the
+rule-file-first law.
+
+##### What shipped
+
+`tf_index::fold_clock_ist_secs` is now `const fn (exchange_timestamp: u32) ->
+u32`, the IDENTITY, and **the receipt parameter is REMOVED rather than
+ignored** — a two-argument signature whose second argument is unused reads at
+fourteen call sites as though the receipt still matters, and a later edit could
+start honouring it with no call site changing. Removing it makes that a compile
+error instead of a review question. `MAX_PLAUSIBLE_RECEIPT_LAG_SECS` (300) and
+`MAX_PLAUSIBLE_RECEIPT_LEAD_SECS` (10) are deleted, not merely unused.
+
+##### ⚠ The constant the clock change FORCED, and why it was resized rather than deferred
+
+`CATCHUP_LATENESS_MARGIN_SECS` moves **2 s → 240 s**, and the resize is a
+consequence of the directive rather than a separate opinion:
+
+| | before | after |
+|---|---|---|
+| what the catch-up watermark measures | the RECEIPT clock — every trusted tick stamped at essentially "now", inter-instrument spread sub-second | the TRADE clock — two instruments delivered 46 s apart carry fold values 46 s apart |
+| margin that covers it | 2 s | the delivery-lag SPREAD |
+
+The derivation is in the constant's own doc and is arithmetic, not judgement: a
+tick stamped `T` reaches the fold at `T + lag`, by which time the fastest-
+delivered instrument has dragged the watermark to `≈ T + lag − lag_min`, so
+`margin ≥ lag − lag_min`. Against the measured 2026-07-06 distribution (§E of
+this file: p50 1.38 s · p99 46.37 s · **max 198.69 s**) the bound is the MAX,
+which `MEASURED_MAX_DELIVERY_LAG_SECS = 199` now names, rounded up to the next
+whole minute. Two build-failing asserts pin BOTH the floor and the derivation,
+so the margin cannot be lowered below the measurement and cannot drift back
+into being a magic number.
+
+**Why the MAX and not the p99**, stated as a trade: a margin too SMALL discards
+a late tick's PRICE once it is 2+ buckets behind (volume survives —
+`carry_unattributed` runs BEFORE the `LatePolicy` branch); a margin too LARGE
+delays a catch-up bar. One is irreversible and one is latency, against a
+standing mandate that not one tick be missed. Sizing to p99 would knowingly
+discard the top 1% of late prices every session.
+
+**⚠ Honest cost, not buried:** every CATCH-UP bar now lands ~4 minutes after its
+close instead of ~2 seconds. That is a real latency regression on the 1s/3s/5s
+frames for any consumer of catch-up bars — and NOT a regression against the
+alternative those bars actually have, which is the 15:30 close sweep. The
+NORMAL rollover is untouched: an instrument that keeps ticking still seals on
+its own next tick at no added latency, which is every liquid instrument.
+
+##### ⚠ What is NOT fixed, and is not claimed to be (Rule 11)
+
+1. **The normal-rollover late path.** The margin governs the CATCH-UP seal only.
+   A bucket sealed by an instrument's own next tick is unreachable by any
+   margin, and under the trade clock a vendor re-ordering two prints of the
+   SAME instrument can seal early and discard the earlier price when it is 2+
+   buckets behind. Widening it needs `last_sealed` to remember more than one
+   bucket per (slot, timeframe) — a memory and design change with its own
+   measurement. Under the receipt clock this shape was impossible (receipt is
+   monotone per drain), so the clock change genuinely opens it.
+2. **The 199 s is a MEASUREMENT and carries a date.** One session, a 776-SID
+   subscription. The authorized universe is ~24,600 instruments across 16
+   sockets and nothing here claims the distribution is unchanged at that scale.
+   `tv_dhan_ws_lag_ms` is the live read-out; a worse measured max moves the
+   constant.
+3. **A third finding was raised and RETRACTED rather than "fixed".**
+   `last_observed_ts` is assigned from a now-non-monotone clock, which an
+   adversarial pass flagged HIGH. Working it through says it is not: the
+   consumer asks `bucket_start(prev) == bucket_start(current)` — a BUCKET
+   question, never an ordering one — so two stamps inside one bucket attribute
+   correctly whichever arrived first, and two stamps in different buckets
+   REFUSE. The guard's own comment already names the "late-routed" case. A
+   monotone `max(..)` was considered and rejected as the WRONG direction: it
+   narrows the attribution interval, which is how an extreme gets credited to a
+   window it did not happen in. Both halves are recorded at the site, because
+   the next reader will have the same suspicion.
+
+##### What a PR that violates this subsection looks like (REJECT)
+
+- Re-adds a receipt parameter to `fold_clock_ist_secs`, or a delta band in any
+  form — the whole directive undone, and it would pass every behavioural test.
+- Lowers `CATCHUP_LATENESS_MARGIN_SECS` below `MEASURED_MAX_DELIVERY_LAG_SECS`,
+  or writes it as a literal instead of deriving it (both fail the build; do not
+  weaken the asserts to pass).
+- Raises `MEASURED_MAX_DELIVERY_LAG_SECS` without a dated live measurement — it
+  is the one input the margin trusts.
+- Makes `last_observed_ts` monotone (narrows the attribution interval).
+- Removes `received_at_nanos` from `multi_tf_aggregator`, the `TVW3` WAL record,
+  or `ReplayedFrame` "because we bucket on ts now" — the cross-day gates and
+  `row_timestamp_ist_nanos` (which feeds the `ticks` DEDUP key) both still
+  require it.
+- Claims the catch-up latency cost is zero, or that the normal-rollover late
+  path is covered.

@@ -1965,6 +1965,62 @@ input unreachable would hide a real convergence bug, and convergence is
 load-bearing: it is what stops the planner burning a connection's whole swap
 budget on churn while its counters read healthy.
 
+
+#### ✅ RESOLVED 2026-09-18 — and the MECHANISM recorded above is WRONG
+
+The paragraphs above say the residual needs "a reachability claim about
+`depth20_name_board.rs`". That claim was made, and it holds exactly:
+
+| Builder | one running `seen` set | flat list then `chunks()` |
+|---|---|---|
+| `depth20_layout.rs::build_depth20_layout` | `:207`, claimed at `:233` / `:321` / `:327` (pair-atomic, `:331` undoes a half-claim) | `:341` |
+| `depth20_name_board.rs::build_name_layout` | `:1061`, claimed via `claim_instrument` `:458-469` | `:1197` |
+
+Those two are the ONLY producers of a `want` — the production call sites are
+`depth_rebalance.rs:1891` (name board) and `:1983` (layout fallback), and
+`layout.sockets.push` has **zero** occurrences outside those files, so nothing
+mutates a layout after it is built. `claim_instrument` short-circuits its
+`seen.insert` when the socket buffer is full, so a DROPPED instrument never
+falsely claims a key. A globally-distinct `want` is therefore what production
+emits, and constraining the generator to match it hides nothing.
+
+**⚠ The MECHANISM this section records is not the one that fires.** The text
+above says the apply "satisfies it on one, the other still wants it, and
+re-planning re-asks" — deferred work re-asked. That shape was tested directly
+and **converges** (1 swap, then 1). What actually fires is a **PAIRING FLIP**:
+`match_sockets_by_overlap` pairs a wire socket to a layout socket by key
+overlap, so acquiring a duplicated key CHANGES a socket's overlap profile and
+the next minute pairs it against a DIFFERENT layout socket — and the
+re-pairing costs MORE swaps than the first plan. `second > first` comes from
+the re-pairing, never from a deferral.
+
+**Measured, not argued** (temporary instrumentation, tree restored clean):
+
+| Check | Result |
+|---|---|
+| Convergence, globally-distinct generator | **100,000 cases PASS** |
+| Multi-minute fixpoint (0 swaps), 20,000 cases | **0 failures; settles in ≤2 minutes** |
+| Same fixpoint with a DUPLICATED `want` | **3.675% never settle** — the excluded shape is genuinely non-convergent |
+| Per-socket-only dedup (the `wire()` shape), 50,000 cases | **FAILS** — cross-socket repeat is the sole trigger, so the global constraint is minimal rather than a sledgehammer |
+
+**Honest cost of the constraint:** average non-empty sockets 1.72 → 1.62,
+average instruments per case 6.08 → 4.36, and 60.1% of cases still produce a
+non-quiet plan. The narrowing is real and is bounded; the removed slice is the
+shape production cannot emit.
+
+**Also corrected, because it was load-bearing in the reasoning:** `wire()`'s
+justification cites `dedup_subscribe_set` (`dhan_feed_stack.rs:720`), which is
+reached only from `build_feed_stack_plan` — the BOOT dial. The per-MINUTE
+guarantee actually comes from the arrivals filter `!have.contains(..)`
+(`depth20_track.rs:342`). The property is sound; the stated reason was half of
+it.
+
+**⚠ NOT claimed:** that the three retained `cc` regression seeds still bite.
+They replay a recorded RNG *seed* against a CHANGED generator, so all three now
+pass — they are inert, and the live proof is the new bite-proven unit test
+(neuter `depth20_track.rs:368`'s `arrivals.retain` and it fails), not the seed
+file. The seed file is retained unedited so that "the seeds were not touched"
+stays checkable.
 **What a PR that violates §12.14 looks like (REJECT):** re-gates the boot
 report's capture fields on config; deletes `DHAN_PER_MINUTE_LEGS_EXIST` instead
 of flipping it; makes one of the three unreachable arms reachable without

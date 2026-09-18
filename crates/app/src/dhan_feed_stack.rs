@@ -3729,13 +3729,27 @@ impl LiveIngest {
     ///
     /// The cutoff is `watermark − CATCHUP_LATENESS_MARGIN_SECS`, never the
     /// watermark itself. The watermark is the highest FOLD-CLOCK second seen
-    /// across ALL instruments (receipt where trusted, exchange stamp where not
-    /// — corrected 2026-08-28; it said "exchange timestamp", which stopped
-    /// being true when the grid moved to the receipt clock), and ticks arrive out of order between them, so
+    /// across ALL instruments (~~receipt where trusted, exchange stamp where
+    /// not — corrected 2026-08-28; it said "exchange timestamp", which stopped
+    /// being true when the grid moved to the receipt clock~~ **CORRECTED BACK
+    /// 2026-09-18: it is the EXCHANGE STAMP again, unconditionally.** The
+    /// operator's ts-bucketing directive made `fold_clock_ist_secs` the
+    /// identity on the trade stamp, so the 2026-08-28 correction above is
+    /// itself superseded and the sentence it replaced is true once more —
+    /// recorded rather than reverted, because a claim that has now been right,
+    /// wrong and right again is one a future reader should see the history
+    /// of), and ticks arrive out of order between them, so
     /// sealing right at the watermark would close a bucket whose own final
     /// ticks are still in flight — turning a latency fix into a truncated-bar
     /// bug, which is strictly worse than the problem it solves. The margin
     /// buys back that reordering window.
+    ///
+    /// ⚠ **And the margin's SIZING is now an open question, not a settled
+    /// one.** On the receipt clock the inter-instrument spread was
+    /// sub-second, which is what 2 s was chosen against. On the trade clock
+    /// two instruments delivered 46 s apart carry fold-clock values 46 s
+    /// apart. `CATCHUP_LATENESS_MARGIN_SECS` carries the full record and the
+    /// reason it was deliberately NOT resized without a measurement.
     ///
     /// A watermark below the margin (session not started) yields a saturating
     /// zero cutoff, which seals nothing — the correct answer, not a special
@@ -5134,7 +5148,128 @@ const CATCHUP_SEAL_INTERVAL: std::time::Duration =
 /// whose fold clock snaps back MINUTES, which no seconds-scale margin
 /// reaches. That is a separate finding and needs its own measurement of the
 /// receipt-clock spread before anyone touches this constant.
-const CATCHUP_LATENESS_MARGIN_SECS: u32 = 2;
+///
+/// # ⚠ THE PARAGRAPH ABOVE INVERTED ON 2026-09-18, AND THE MARGIN IS STILL 2
+///
+/// The operator's ts-bucketing directive (*"now we need to use ts dude
+/// isntead of received at dude okay?"* / *"go ahead and implement the ts
+/// bucketing now dude."*, recorded in `websocket-connection-scope-lock.md`
+/// section "2026-09-18 (SECOND)") made `fold_clock_ist_secs` the IDENTITY on
+/// the exchange stamp. The watermark this cutoff is measured from is
+/// therefore **the trade clock now, not the receipt clock**.
+///
+/// So the dismissal above — *"Those are the right numbers for the WRONG
+/// CLOCK"* — is exactly backwards from today. p90 8.50s / p99 46.37s /
+/// max 198.69s ARE the spread this margin now has to cover, because a trade
+/// stamped at T is folded at T however late it is delivered, and two
+/// instruments whose prints are delivered 46 s apart now carry fold-clock
+/// values 46 s apart. The audit was right; it was right early.
+///
+/// **The constant is NOT resized here, and that is a deliberate refusal, not
+/// an oversight.** The only honest input is a MEASURED inter-instrument
+/// trade-clock spread on a live session, and nobody has one: the delivery-lag
+/// percentiles are a per-tick exchange-to-receipt distribution, which is a
+/// different quantity from the spread BETWEEN instruments at one instant.
+/// Picking 10 s, or 46 s, or 200 s off those numbers would be inventing a
+/// measurement — and raising this cutoff delays every catch-up bar by exactly
+/// the amount raised, which is the truncated-bar/latency trade this doc opens
+/// by warning about, taken on a guess.
+///
+/// ## The consequence while it stays 2, stated plainly
+///
+/// A tick whose bucket has already sealed takes the late path in
+/// `aggregator_cell::consume`. Volume is SAFE — `carry_unattributed` runs
+/// BEFORE the `LatePolicy` branch, so the quantity is carried into the next
+/// bucket as unattributed rather than lost. The PRICE is amended into
+/// high/low/close only when the tick is exactly ONE bucket late
+/// (`LatePolicy::Refold` against `last_sealed`); two or more buckets late is
+/// `ConsumeOutcome::DiscardLate`. At a p99 delivery lag of 46 s that is many
+/// buckets on the 1s/3s/5s frames and none on 1m and above, so the exposure
+/// is concentrated in the second-scale timeframes.
+///
+/// # ✅ RESIZED 2026-09-18 — 2 s -> [`CATCHUP_LATENESS_MARGIN_SECS`], derived
+///
+/// Operator, in direct response to this finding being put to him with the
+/// choice ("resize inside this change, or ship the clock fix and take the
+/// margin separately"): *"fix and resolve everything dude okay?"*. That is
+/// the general-go-ahead-selects-the-enumerated-work shape
+/// `daily-universe-scope-expansion-2026-05-27.md` sections 28.2/28.3 already
+/// accept, so the resize lands here rather than as a deferred follow-up.
+///
+/// ## The derivation, so nobody has to trust a round number
+///
+/// The watermark is `max` over instruments of the trade stamp of the most
+/// recently RECEIVED tick. A tick stamped `T` reaches the fold at wall-clock
+/// `T + lag_i`, and by then the watermark has already been dragged to roughly
+/// `T + lag_i - lag_min` by whichever instrument was delivered fastest. For
+/// that tick NOT to find its own bucket already sealed:
+///
+/// ```text
+/// watermark - margin  <=  T
+///   =>  margin  >=  lag_i - lag_min
+/// ```
+///
+/// So the margin must cover the SPREAD of delivery lags, and this repository
+/// has measured that distribution: p50 1.38 s, p90 8.50 s, p95 14.93 s,
+/// p99 46.37 s, **max 198.69 s** (2026-07-06, 776-SID Quote subscription, all
+/// trading day — `websocket-connection-scope-lock.md` section E). Treating
+/// `lag_min` as 0 is the conservative reading, so the bound is the MAX, and
+/// [`MEASURED_MAX_DELIVERY_LAG_SECS`] carries it. The margin is that value
+/// rounded UP to the next whole minute.
+///
+/// ## Why the MAX and not the p99, stated as a trade rather than a preference
+///
+/// The two failure directions are not symmetric, and that is what decides it:
+///
+/// | margin too SMALL | margin too LARGE |
+/// |---|---|
+/// | a late tick finds its bucket sealed; volume survives via `carry_unattributed` but the PRICE is discarded once it is 2+ buckets late | the catch-up bar is written later |
+/// | irreversible | a delay, and still vastly earlier than the 15:30 close sweep this mechanism exists to beat |
+///
+/// One side loses data and the other costs latency, against a standing
+/// operator mandate that not one tick be missed. Sizing to p99 would
+/// knowingly discard the top 1% of late prices every session.
+///
+/// ## The honest cost, not buried
+///
+/// Every catch-up bar now lands ~4 minutes after its close instead of ~2
+/// seconds. On the 1s/3s/5s frames that is a real latency regression for any
+/// consumer reading catch-up bars — and it is NOT a regression against the
+/// alternative these bars actually have, which is the 15:30 close sweep
+/// (hours). The NORMAL rollover path is untouched: an instrument that keeps
+/// ticking still seals its bucket on its own next tick, at no added latency,
+/// which is every liquid instrument in every frame.
+///
+/// ## ⚠ What this does NOT fix (Rule 11 — no false OK)
+///
+/// The margin governs the CATCH-UP seal only. The NORMAL rollover seals a
+/// bucket the moment that instrument's own next tick lands in a later bucket,
+/// and no margin reaches that path. Under the receipt clock a per-instrument
+/// late arrival was impossible (receipt is monotone per drain); under the
+/// trade clock it is not, so a vendor re-ordering two prints of the SAME
+/// instrument can still seal early and discard the earlier price if it is 2+
+/// buckets behind. Widening that needs `last_sealed` to remember more than
+/// one bucket per (slot, timeframe), which is a memory and design change with
+/// its own measurement. Recorded rather than implied fixed.
+const CATCHUP_LATENESS_MARGIN_SECS: u32 = MEASURED_MAX_DELIVERY_LAG_SECS.div_ceil(60) * 60;
+
+/// The measured worst-case Dhan delivery lag, exchange stamp to our receipt.
+///
+/// 198.69 s, rounded UP to the whole second, from the 2026-07-06 measurement
+/// recorded in `websocket-connection-scope-lock.md` section E (776-SID Quote
+/// subscription, all trading day): p50 1.38 s, p90 8.50 s, p95 14.93 s,
+/// p99 46.37 s, max 198.69 s.
+///
+/// It exists as a NAMED constant so [`CATCHUP_LATENESS_MARGIN_SECS`] shows its
+/// derivation instead of being a round number nobody can re-check. Re-measure
+/// it and the margin moves with it.
+///
+/// ⚠ It is a MEASUREMENT and therefore carries a date. It is from ONE session
+/// on a 776-SID subscription; the authorized universe is ~24,600 instruments
+/// across 16 sockets, and nothing here claims the distribution is unchanged at
+/// that scale. `tv_dhan_ws_lag_ms` is the live read-out — if a session
+/// measures a worse max, this constant is what moves.
+const MEASURED_MAX_DELIVERY_LAG_SECS: u32 = 199;
 
 /// How often the lane asks the gap detector what it has recorded.
 ///
@@ -11716,6 +11851,25 @@ pub fn refold_wal_frames(
     // volume ranking.
     ingest.replaying_wal = true;
 
+    // ⚠ READ THIS FIRST — 2026-09-18. The two corrections below are kept
+    // verbatim as the record of how this line reached its current shape, and
+    // the MECHANISM the first of them describes no longer exists: there is no
+    // "delta guard" and no 300-second cliff, because `fold_clock_ist_secs` is
+    // now the identity on the exchange stamp (operator ts-bucketing directive,
+    // `websocket-connection-scope-lock.md` section "2026-09-18 (SECOND)"). A
+    // replayed frame buckets on its own trade stamp whatever receipt it
+    // carries, so the mis-filing described below cannot happen at all now.
+    //
+    // The CONCLUSION both corrections reach is UNCHANGED and still
+    // load-bearing: thread the PERSISTED receipt, never a fresh clock read.
+    // Two consumers still need it, and neither is the fold clock —
+    //   * the cross-day gates (`stale_trading_day` / `future_trading_day`)
+    //     compare the fold day against the RECEIPT day, so a fresh clock read
+    //     would make every legitimately replayed prior-day frame look stale;
+    //   * `row_timestamp_ist_nanos` derives a never-traded tick's `ts` from
+    //     the receipt, and `ts` is the first column of the `ticks` DEDUP key —
+    //     the ~950k-row duplication the second correction measures.
+    //
     // CORRECTED 2026-08-28. This block used `Utc::now()` for BOTH values, and
     // justified it with: "the tick's own exchange timestamp, which decides the
     // candle bucket, is read from the packet exactly as on the live path."
@@ -18040,6 +18194,26 @@ mod tests {
             CATCHUP_LATENESS_MARGIN_SECS >= 1,
             "a zero margin would seal at the watermark itself, truncating bars \
              whose final ticks are still in flight"
+        );
+        // 2026-09-18: the watermark is the TRADE clock now, so the margin must
+        // cover the delivery-lag SPREAD, not the sub-second inter-instrument
+        // spread the receipt clock had. Sizing it below the measured max means
+        // knowingly discarding the late prices above it.
+        assert!(
+            CATCHUP_LATENESS_MARGIN_SECS >= MEASURED_MAX_DELIVERY_LAG_SECS,
+            "the catch-up margin ({CATCHUP_LATENESS_MARGIN_SECS}s) must cover \
+             the measured worst-case delivery lag \
+             ({MEASURED_MAX_DELIVERY_LAG_SECS}s). Below it, a tick delivered at \
+             the tail finds its own bucket already sealed and its PRICE is \
+             discarded once it is 2+ buckets late — volume survives via \
+             `carry_unattributed`, the price does not."
+        );
+        // And the derivation must stay visible: a margin that stops being a
+        // whole-minute round-up of the measured max is a magic number again.
+        assert_eq!(
+            CATCHUP_LATENESS_MARGIN_SECS,
+            MEASURED_MAX_DELIVERY_LAG_SECS.div_ceil(60) * 60,
+            "the margin must remain DERIVED from the measured max delivery lag"
         );
     }
 

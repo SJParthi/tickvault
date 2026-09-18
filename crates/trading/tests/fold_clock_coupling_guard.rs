@@ -2,7 +2,10 @@
 //!
 //! # The trap this pins, in the plan's own words
 //!
-//! W2 of `active-plan-receipt-clock-preopen.md`:
+//! W2 of `.claude/plans/archive/2026-08-28-receipt-clock-preopen.md` (cited as
+//! `active-plan-receipt-clock-preopen.md` until 2026-09-18; that path no
+//! longer exists — the plan was archived, and a citation nothing resolves is
+//! worth less than the sentence it points at):
 //!
 //! > The bucketing clock is ONE line ... but **eleven other sites read the same
 //! > field**, and four of them must move WITH it or they disagree with the
@@ -26,6 +29,22 @@
 //! | `tick_is_newest` | open-interest and close take their value from disagreeing orderings |
 //!
 //! None of those is a crash. Every one is a quietly wrong candle.
+//!
+//! # ⚠ 2026-09-18 — the fold clock changed VALUE; this file's property did not
+//!
+//! The operator's ts-bucketing directive
+//! (`websocket-connection-scope-lock.md`, section "2026-09-18 (SECOND)") made
+//! `fold_clock_ist_secs` the IDENTITY on the exchange stamp. Two receipt-band
+//! behaviour tests died with the band and were replaced by
+//! `the_fold_clock_is_the_exchange_stamp_for_every_input` plus
+//! `the_fold_clock_takes_no_receipt_argument`.
+//!
+//! The COUPLING property is untouched and is now the more valuable half. With
+//! both clocks converged, moving any one of the five sites back to
+//! `tick.exchange_timestamp` is a behavioural NO-OP today — so it would pass
+//! every other test in the workspace, and then become a split the moment the
+//! fold clock is ever anything other than the identity again. That is exactly
+//! the shape this file exists to refuse.
 
 use std::path::Path;
 use tickvault_common::source_scan::strip_rust_comments;
@@ -91,7 +110,7 @@ fn the_bucket_and_the_close_ordering_guards_read_the_fold_clock() {
     let cell = src("src/candles/aggregator_cell.rs");
 
     assert!(
-        cell.contains("fold_clock_ist_secs(tick.exchange_timestamp, tick.received_at_nanos)"),
+        cell.contains("fold_clock_ist_secs(tick.exchange_timestamp)"),
         "the bucket must be chosen on the fold clock"
     );
     assert!(
@@ -108,62 +127,90 @@ fn the_bucket_and_the_close_ordering_guards_read_the_fold_clock() {
     );
 }
 
-/// A tick with NO receipt falls back to the exchange stamp -- never to zero,
-/// never to a clock read.
+/// The fold clock IS the exchange stamp, for every input, with no exception.
 ///
-/// This is the half that keeps the split fail-soft: v1/v2 WAL records and
-/// Ticker-mode packets genuinely have no receipt, and a fold that dropped them
-/// would lose real ticks to enforce a rule about a value that does not exist.
+/// ## Why this replaced two receipt-behaviour tests (2026-09-18)
+///
+/// Until the ts-bucketing directive this file pinned a delta-bounded hybrid:
+/// a receipt within `[-10 s, +300 s]` of the trade won, anything outside fell
+/// back. Two tests pinned each half. Both are now gone, because the property
+/// they guarded no longer exists — and deleting them without a replacement
+/// would leave the fold clock's VALUE unpinned entirely, which is how a
+/// "consistency" refactor quietly reintroduces the receipt.
+///
+/// This is the stronger pin, not a weaker one: the hybrid needed two tests and
+/// a band; the identity needs one test and admits no band at all.
 #[test]
-fn a_tick_without_a_receipt_falls_back_to_its_trade_stamp() {
+fn the_fold_clock_is_the_exchange_stamp_for_every_input() {
     use tickvault_trading::candles::tf_index::fold_clock_ist_secs;
 
-    const STAMP: u32 = 1_800_000_000;
-    for absent in [0_i64, -1, i64::MIN] {
+    // Every shape the wire can produce, including the ones the old hybrid
+    // treated specially: the session open, a mid-session second, the epoch
+    // floor and the u32 ceiling.
+    for stamp in [0_u32, 1, 1_800_000_000, 1_800_000_301, u32::MAX] {
         assert_eq!(
-            fold_clock_ist_secs(STAMP, absent),
-            STAMP,
-            "an absent receipt ({absent}) must fall back to the trade stamp"
+            fold_clock_ist_secs(stamp),
+            stamp,
+            "the fold clock must be the exchange stamp verbatim — operator \
+             directive 2026-09-18, recorded in \
+             `websocket-connection-scope-lock.md` section \"2026-09-18 \
+             (SECOND)\". A blended, clamped or receipt-derived value here \
+             re-opens the divergence between `ticks` and every candle."
         );
     }
 }
 
-/// The delta guard only ever WIDENS toward the exchange stamp, never invents a
-/// third value.
+/// The receipt cannot reach the fold clock, because there is nowhere to put it.
+///
+/// This is the mechanical half, and it is why the argument was REMOVED rather
+/// than ignored. A two-argument signature whose second argument is unused
+/// reads, at fourteen call sites, as though the receipt still matters — and a
+/// future edit could start honouring it again with no call site changing.
+/// Taking the argument away makes that a compile error instead of a review
+/// question.
 #[test]
-fn an_implausible_receipt_never_produces_a_third_clock() {
-    use tickvault_trading::candles::tf_index::fold_clock_ist_secs;
+fn the_fold_clock_takes_no_receipt_argument() {
+    let src = src("src/candles/tf_index.rs");
 
-    const STAMP: u32 = 1_800_000_000;
-    // A receipt hours late (a replayed frame re-stamped by an old binary) and
-    // one hours early (a stepped clock) must BOTH yield the trade stamp.
-    for receipt_ist_secs in [
-        i64::from(STAMP) + 86_400,
-        i64::from(STAMP) - 86_400,
-        i64::from(STAMP) + 301,
-        i64::from(STAMP) - 11,
-    ] {
-        let receipt_utc_nanos = (receipt_ist_secs
-            - i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS))
-            * 1_000_000_000;
-        assert_eq!(
-            fold_clock_ist_secs(STAMP, receipt_utc_nanos),
-            STAMP,
-            "a receipt {receipt_ist_secs} outside the plausible delta must fall \
-             back to the trade stamp, not to a blended or clamped third value"
-        );
-    }
+    assert!(
+        src.contains("pub const fn fold_clock_ist_secs(exchange_timestamp: u32) -> u32"),
+        "the fold clock must take the exchange stamp ALONE. Re-adding a \
+         receipt parameter is the whole 2026-09-18 directive undone, and it \
+         would pass every other test in this file."
+    );
+    assert!(
+        !src.contains("MAX_PLAUSIBLE_RECEIPT_LAG_SECS"),
+        "the delta band is deleted, not merely unused. A named bound that \
+         nothing enforces is the documented-mechanism-that-does-not-exist \
+         class this repository keeps having to correct."
+    );
+}
 
-    // And one INSIDE the band is genuinely preferred, or the guard above is
-    // vacuous because nothing is ever preferred.
-    let inside_ist = i64::from(STAMP) + 120;
-    let inside_utc_nanos = (inside_ist
-        - i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS))
-        * 1_000_000_000;
-    assert_eq!(
-        fold_clock_ist_secs(STAMP, inside_utc_nanos),
-        u32::try_from(inside_ist).unwrap(),
-        "a receipt inside the band MUST be preferred -- if it is not, the whole \
-         W2 change is inert and every test above passes vacuously"
+/// The two DAY gates still read the receipt, and must keep doing so.
+///
+/// They are not the fold clock and were never part of this directive: their
+/// question is "did the vendor stamp this for a different trading day than the
+/// one we are living in", which needs both clocks by construction. A cleanup
+/// that removed `received_at_nanos` from `multi_tf_aggregator` "because we
+/// bucket on ts now" would delete the only defence against a snapshot filing
+/// into a closed day — measured mean 5 hours, max 34 days.
+#[test]
+fn the_cross_day_gates_still_compare_the_fold_day_against_the_receipt_day() {
+    let agg = src("src/candles/multi_tf_aggregator.rs");
+
+    assert!(
+        agg.contains("let fold_day = i64::from(fold_secs) / 86_400"),
+        "the cross-day gates must still derive a fold day"
+    );
+    assert!(
+        agg.contains("let receipt_day = receipt_ist_secs / 86_400"),
+        "the cross-day gates must still derive a RECEIPT day. Without it, \
+         `stale_trading_day` and `future_trading_day` compare the exchange \
+         stamp against itself and can never fire."
+    );
+    assert!(
+        agg.contains("if fold_day > receipt_day") && agg.contains("if fold_day < receipt_day"),
+        "BOTH directions must survive: a stamp from a closed day and a stamp \
+         from a future day are different defects with different counters."
     );
 }

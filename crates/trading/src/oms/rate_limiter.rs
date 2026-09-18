@@ -422,4 +422,33 @@ mod tests {
             "the budget must not grow with usage"
         );
     }
+
+    /// `Default` must be the SAME budget as `new()`, not a second definition.
+    ///
+    /// `OrderBudget::default()` is the shape a caller reaches for without
+    /// thinking, and it currently delegates to `new()`. A future edit that
+    /// spells the tiers out here instead would compile, pass every existing
+    /// test (they all construct via `new()`), and hand that caller a
+    /// different order budget than the one the vendor documents — a silent
+    /// regulatory-limit divergence, not a crash.
+    #[test]
+    fn order_budget_default_is_the_documented_vendor_budget_not_a_second_definition() {
+        let mut from_default = OrderBudget::default();
+        let mut from_new = OrderBudget::new();
+
+        // Same ceilings, tier by tier, proven by consuming to each boundary
+        // rather than by reading private fields.
+        for _ in 0..OrderBudget::MAX_PER_MINUTE {
+            assert!(from_default.try_consume(0).is_ok());
+            assert!(from_new.try_consume(0).is_ok());
+        }
+        assert!(
+            from_default.try_consume(0).is_err(),
+            "the default budget must bind at the documented 250/min"
+        );
+        assert!(
+            from_new.try_consume(0).is_err(),
+            "and `new()` must bind at exactly the same place"
+        );
+    }
 }
