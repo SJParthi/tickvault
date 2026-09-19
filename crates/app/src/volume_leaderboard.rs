@@ -306,6 +306,39 @@ pub struct RankedContract {
     /// number actually divided by and would make the stored row a plausible
     /// lie rather than a record.
     pub lot_size: u32,
+    /// UTC epoch nanoseconds of the FIRST accepted tick in the window that
+    /// just closed, or `0` when none is known.
+    ///
+    /// **Written by [`VolumeLeaderboard::rank`], ignored by
+    /// [`VolumeLeaderboard::observe`]** — the same rank-output contract as
+    /// `delta_units` above. `observe` takes the receipt as its own argument
+    /// and stores it on `Tracked`; a value set on this field on the way IN is
+    /// overwritten.
+    ///
+    /// The clock is the RECEIPT clock (`ParsedTick::received_at_nanos`), which
+    /// is UTC epoch nanos back-dated by ring dwell — NOT the exchange stamp,
+    /// and NOT the IST-naive grid the row is stamped on. Anything comparing it
+    /// against a window boundary must convert; see
+    /// `top_volume_snapshot::project_snapshot`.
+    ///
+    /// `0` is the documented "no receipt" sentinel (`WAL_RECEIPT_UNKNOWN_NANOS`
+    /// — a pre-`TVW3` WAL frame carries no receipt clock at all), so it is
+    /// never rendered as a delay of zero. Both halves of every delay pair go
+    /// NULL together on it.
+    pub first_receipt_nanos: i64,
+    /// UTC epoch nanoseconds of the LAST accepted tick in the window that just
+    /// closed, or `0` when none is known.
+    ///
+    /// Also a rank output, on the same terms as `first_receipt_nanos`.
+    ///
+    /// # Why ONE value and not one per cadence
+    ///
+    /// A cadence's window CLOSES at the sweep, so "the last tick received in
+    /// this window" is the last tick received, full stop — the same physical
+    /// tick for whichever cadence is sweeping. Only the window's OPEN differs
+    /// between cadences, which is why `first_receipt_nanos` is stored per
+    /// window on `Tracked` and this one is not.
+    pub last_receipt_nanos: i64,
 }
 
 /// What happened to one observation.
@@ -472,6 +505,22 @@ struct Tracked {
     /// of the session. That is inert, not a gate: every arm below reads it
     /// only to compare, never to refuse.
     resync_ceiling: u32,
+    /// UTC epoch nanos of the FIRST accepted tick since this window's last
+    /// sweep, PER CADENCE. `0` = none since the sweep.
+    ///
+    /// Per window for the same reason the baseline is: the four boards measure
+    /// different intervals, so "the first tick in this window" is a different
+    /// tick for each of them. Set only where the dirty bit was CLEAR — the one
+    /// place that is provably the window's first accepted tick — and cleared
+    /// by the sweep that consumes it, in lockstep with the bit.
+    first_receipt_nanos: [i64; WINDOW_COUNT],
+    /// UTC epoch nanos of the most recent accepted tick, shared by every
+    /// cadence. `0` = none yet.
+    ///
+    /// ONE value, not `WINDOW_COUNT`: a window closes AT the sweep, so its
+    /// last tick is the last tick, whichever cadence is asking. See
+    /// `RankedContract::last_receipt_nanos`.
+    last_receipt_nanos: i64,
 }
 
 /// Distinct snapshot cadences, and therefore baselines per contract.
@@ -544,8 +593,25 @@ const _: () = assert!(
 /// silently reworded: a plausible-sounding performance rationale that does not
 /// survive contact with the container is exactly the shape this file's header
 /// keeps recording.
+///
+/// ⚠ RAISED 64 → 128 on 2026-09-19, and the number is DERIVED, not guessed.
+///
+/// The three delay pairs (the 2026-09-19 §19 §4 contract) need, per contract:
+/// the first accepted receipt of each cadence's open window
+/// (`[i64; WINDOW_COUNT]` = 32 B) and the most recent accepted receipt (8 B,
+/// shared — a window closes AT the sweep, so its last tick is the last tick).
+/// `RankedContract` carries the same two as rank OUTPUTS (16 B). 64 + 56 = 120,
+/// padded to 128 by the `i64` alignment.
+///
+/// What that costs, measured against the figure this file already records: the
+/// map was ~4 MB per family at 25,000 entries, and 64 B more per entry is
+/// **+1.6 MB** — on a 32 GiB host, for the only surface that can answer "how
+/// long after the window opened did the first trade reach us". The operator's
+/// standing instruction on this trade is "forget memory and size"; it is
+/// recorded here anyway, because a size ratchet raised without its arithmetic
+/// on the record is one that will be raised again without it.
 const _: () = assert!(
-    size_of::<Tracked>() <= 64,
+    size_of::<Tracked>() <= 128,
     "Tracked is stored 25,000 times per family; growth here is multiplied by \
      that. Decide deliberately before raising this. (NOT a cache-line bound — \
      hashbrown stores the 16-byte key inline beside it, so an entry is already \
@@ -837,7 +903,26 @@ impl VolumeLeaderboard {
     ///
     /// One hash lookup and one comparison. No heap, no threshold, no
     /// allocation.
-    pub fn observe(&mut self, contract: RankedContract, family: OptionFamily) -> Observation {
+    /// Records one accepted tick against the ranking board.
+    ///
+    /// `received_at_nanos` is `ParsedTick::received_at_nanos` — the RECEIPT
+    /// clock in UTC epoch nanos — and it is the only input the three delay
+    /// pairs have. `0` is the documented "no receipt" sentinel (a pre-`TVW3`
+    /// WAL frame carries no receipt clock), and it is stored as-is rather than
+    /// substituted: a zero must stay distinguishable from a real instant so
+    /// the rendered delay goes BLANK instead of claiming the fastest possible
+    /// delivery for a frame whose delivery time is unknown.
+    ///
+    /// It is deliberately NOT part of the monotonicity decision: a receipt is
+    /// evidence about the network, never about the vendor's counter, and
+    /// letting it gate an advance would put a clock fault in the path of a
+    /// real trade.
+    pub fn observe(
+        &mut self,
+        contract: RankedContract,
+        family: OptionFamily,
+        received_at_nanos: i64,
+    ) -> Observation {
         // Zero is the pre-open state of every contract, and ranking an
         // all-zero field would make the depth set "whichever 250 ticked
         // first" — arbitrary, and then a total turnover at the bell. Excluded
@@ -904,6 +989,17 @@ impl VolumeLeaderboard {
                         // leave a trap that a legitimate later climb trips,
                         // silently eating a real window.
                         resync_ceiling: stored,
+                        // RESEEDED to nothing, in lockstep with the baseline
+                        // one field up and for the same reason: the re-latch
+                        // declares the stored series garbage, and a first
+                        // receipt measured against a window whose baseline was
+                        // just thrown away would time a window that no longer
+                        // exists. The mask is PRESERVED (see `dirty` above), so
+                        // the next sweep visits this contract and reports a
+                        // delta of 0 with both delays BLANK -- which is the
+                        // honest pair for a window that measured nothing.
+                        first_receipt_nanos: [0; WINDOW_COUNT],
+                        last_receipt_nanos: received_at_nanos,
                     };
                     slot.relatched = slot.relatched.saturating_add(1);
                     let relatched_total = slot.relatched;
@@ -1108,7 +1204,38 @@ impl VolumeLeaderboard {
                 // conclude the ceiling is never carried, when in fact this line
                 // is exactly what carries the zeroed ceiling forward.
                 resync_ceiling: existing.resync_ceiling,
+                // CARRIED FORWARD. The per-window firsts are the property of
+                // the windows currently open, and an advance does not close
+                // one -- the sweep does. They are set below, only where a
+                // dirty bit was CLEAR, which is exactly the window's first
+                // accepted tick.
+                first_receipt_nanos: existing.first_receipt_nanos,
+                // OVERWRITTEN with this tick: "last accepted" is what it says,
+                // and this is the accepted advance. A `0` here is a frame with
+                // no receipt clock and is stored rather than skipped, so the
+                // delay renders BLANK instead of claiming an instant delivery.
+                last_receipt_nanos: received_at_nanos,
             };
+            // THE WINDOW-OPEN STAMP, and the guard is the whole correctness
+            // argument: a bit that was CLEAR means the sweep has consumed
+            // everything before it, so THIS tick is the first accepted tick of
+            // that window. A bit already set means the window opened earlier
+            // and its first receipt must not be overwritten -- doing so would
+            // make `open_latency` report the delay to the LATEST tick and
+            // `window_span` collapse toward zero on the busiest contracts,
+            // which is the exact inversion of what both columns are for.
+            //
+            // Guarded on the whole mask first, like the work-list push below:
+            // a liquid strike is already marked in every window on the
+            // overwhelming majority of its ticks, so the common case is one
+            // `u8` compare and no loop.
+            if was_dirty != ALL_WINDOWS_DIRTY {
+                for window in 0..WINDOW_COUNT {
+                    if was_dirty & (1u8 << window) == 0 {
+                        existing.first_receipt_nanos[window] = received_at_nanos;
+                    }
+                }
+            }
             // THE ONLY SITE THAT ADDS WORK. `existing` borrows `volumes` and
             // the lists sit beside it on the same struct, so the mask is
             // copied out above and the borrow ends here before the push.
@@ -1221,6 +1348,13 @@ impl VolumeLeaderboard {
                 dirty: 0,
                 // No ceiling is armed: this contract has never re-latched.
                 resync_ceiling: 0,
+                // A contract this process has never seen has no window open
+                // for it yet, so there is no first receipt to record and
+                // nothing to measure a span from. Both stay at the `0`
+                // sentinel until its first accepted ADVANCE, which is also
+                // the first instant its dirty bit is set.
+                first_receipt_nanos: [0; WINDOW_COUNT],
+                last_receipt_nanos: 0,
             },
         );
         Observation::Accepted
@@ -1307,6 +1441,11 @@ impl VolumeLeaderboard {
             };
             tracked.dirty &= !(1u8 << idx);
             tracked.baseline[idx] = tracked.contract.volume;
+            // Cleared with the bit, in lockstep. A first-receipt stamp is
+            // meaningful only against the baseline it was taken beside; this
+            // path throws the baseline away, so keeping the stamp would time a
+            // window whose start no longer exists.
+            tracked.first_receipt_nanos[idx] = 0;
         }
         // Drained, so this hands the CAPACITY back, not the contents.
         slot.dirty[idx] = pending;
@@ -1397,6 +1536,25 @@ impl VolumeLeaderboard {
                 .volume
                 .saturating_sub(tracked.baseline[idx]);
             tracked.baseline[idx] = tracked.contract.volume;
+            // CONSUMED AND CLEARED, in the same pass that clears the bit and
+            // rolls the baseline -- the three are one window boundary and
+            // splitting them would let the next window inherit this one's
+            // open stamp.
+            //
+            // Read into the row BEFORE the clear, and read `last_receipt_nanos`
+            // WITHOUT clearing it: "last accepted" is a property of the
+            // contract, not of the window, and zeroing it here would make the
+            // next window's close latency unmeasurable until the contract
+            // traded twice.
+            //
+            // Both are copied onto `row` even on the paths that `continue`
+            // below (a missing lot size, a zero-lot window). That is
+            // deliberate: `row` is discarded there, and the clear has already
+            // happened above, so a skipped contract still starts its next
+            // window cleanly.
+            let first_receipt_nanos = tracked.first_receipt_nanos[idx];
+            let last_receipt_nanos = tracked.last_receipt_nanos;
+            tracked.first_receipt_nanos[idx] = 0;
 
             let mut row = tracked.contract;
             // A missing lot size cannot reach here through production — the
@@ -1501,6 +1659,12 @@ impl VolumeLeaderboard {
             // not re-derived, which could drift from what was ranked.
             row.delta_units = delta;
             row.lot_size = lot;
+            // The window boundary stamps, carried onto the row from the values
+            // read and cleared at the top of this iteration. They are the ONLY
+            // inputs the three delay pairs have, and neither is re-derived
+            // here: a second read after the clear would return 0.
+            row.first_receipt_nanos = first_receipt_nanos;
+            row.last_receipt_nanos = last_receipt_nanos;
             if eligible(&row) {
                 scratch.push(row);
             }
@@ -1691,34 +1855,29 @@ pub fn distinct_underlying_over(ordered: &[RankedContract], k: usize) -> Vec<Ran
 /// segment the eligibility filter needs, and naming it once keeps the two
 /// lookups below from ever disagreeing about which store row is "the
 /// underlying".
+///
+/// # Why there is no family-derived form of this
+///
+/// Until 2026-09-19 a `underlying_segment(family)` helper sat here, mapping
+/// `Index` to `IDX_I` and `Stock` to this constant, so that the persisted
+/// row's `gain_pct` could never probe an index id in the equity segment.
+/// Both of its reasons are now gone: the operator's 2026-09-18 ruling removed
+/// `gain_pct` from the row entirely, and the same day's stock-options-only
+/// ruling removed the Index family from `top_volume`. The helper's last call
+/// site went with `gain_pct`, and the pub-fn wiring guard flagged it as
+/// dormant on the next push.
+///
+/// The hazard it guarded is REAL and is recorded here so nothing re-derives a
+/// segment casually: an index option's `underlying_id` is an index id
+/// (NIFTY=13, BANKNIFTY=25, SENSEX=51), and probing `(13, NSE_EQ)` is exactly
+/// the I-P1-11 collision this repository bans. At best it finds nothing; at
+/// worst an NSE cash equity carries id 13 — low ids are where equities live —
+/// and the row is ACCEPTED carrying that stock's percentage under an index's
+/// name, with no NaN to catch it and no refusal counter moving. If a future
+/// change puts index options back on any path that pairs an underlying id
+/// with a segment, derive the segment from the family rather than reaching
+/// for this constant.
 pub const STOCK_OPTION_UNDERLYING_SEGMENT: ExchangeSegment = ExchangeSegment::NseEquity;
-
-/// The segment this family's UNDERLYING trades in.
-///
-/// # Why this exists rather than a constant at each call site
-///
-/// [`STOCK_OPTION_UNDERLYING_SEGMENT`] is right for the eligibility filter,
-/// which is Stock-only by the 2026-09-06 lock. It is WRONG for the persisted
-/// `top_volume_rank` rows, which are written for BOTH families — and until
-/// 2026-09-09 the `gain_pct` closure used it unconditionally.
-///
-/// An index option's `underlying_id` is an index id (NIFTY=13, BANKNIFTY=25,
-/// SENSEX=51). Probing `(13, NSE_EQ)` is exactly the I-P1-11 collision this
-/// repository bans: at best it finds nothing and every index row is refused
-/// `NonFiniteGain` so the index half of the table is empty; at worst an NSE
-/// cash equity carries id 13 — low ids are where equities live — and the row
-/// is ACCEPTED carrying that stock's percentage under an index's name, with
-/// no NaN to catch it and no refusal counter moving.
-///
-/// Deriving the segment from the family makes the wrong pairing
-/// unrepresentable instead of merely corrected.
-#[must_use]
-pub const fn underlying_segment(family: OptionFamily) -> ExchangeSegment {
-    match family {
-        OptionFamily::Index => ExchangeSegment::IdxI,
-        OptionFamily::Stock => STOCK_OPTION_UNDERLYING_SEGMENT,
-    }
-}
 
 /// Metric: how the gainer filter judged each ranked contract's underlying,
 /// per 5-second pass. Labels are [`GAINER_VERDICT_LABELS`]. Local exporter
@@ -2008,6 +2167,23 @@ pub const MAX_PLAUSIBLE_GAIN_PCT: f64 = 1_000.0;
 mod tests {
     use super::*;
 
+    /// `observe` with NO receipt clock, for the ~100 tests that predate the
+    /// delay pairs and are about the ranking rather than about latency.
+    ///
+    /// `0` is `WAL_RECEIPT_UNKNOWN_NANOS` — the documented "this frame carries
+    /// no receipt" sentinel — so these tests exercise exactly the pre-2026-09-19
+    /// behaviour: both halves of every delay pair stay NULL. Named rather than
+    /// passed inline at every call site so a reader can see at a glance which
+    /// tests deliberately have no clock, and so the receipt tests below
+    /// (which call the real `observe`) stand out as the ones that do.
+    fn observe_no_receipt(
+        lb: &mut VolumeLeaderboard,
+        contract: RankedContract,
+        family: OptionFamily,
+    ) -> Observation {
+        lb.observe(contract, family, 0)
+    }
+
     fn stock(id: u64, underlying: u64, volume: u32) -> RankedContract {
         RankedContract {
             security_id: id,
@@ -2017,6 +2193,8 @@ mod tests {
             window_lots_milli: 0,
             delta_units: 0,
             lot_size: 0,
+            first_receipt_nanos: 0,
+            last_receipt_nanos: 0,
         }
     }
 
@@ -2039,9 +2217,9 @@ mod tests {
                 volume: 1,
                 ..contract
             };
-            let _ = lb.observe(seed, family);
+            let _ = observe_no_receipt(lb, seed, family);
         }
-        lb.observe(contract, family)
+        observe_no_receipt(lb, contract, family)
     }
 
     fn all(_: &RankedContract) -> bool {
@@ -2057,15 +2235,15 @@ mod tests {
         let mut lb = VolumeLeaderboard::new();
 
         // 09:00 — first observe seeds the baseline at this volume.
-        lb.observe(stock(1, 100, 1_000), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, 1_000), OptionFamily::Stock);
         // 09:00 -> 09:15, pre-open accumulation nobody ranked.
-        lb.observe(stock(1, 100, 900_000), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, 900_000), OptionFamily::Stock);
 
         // What the out-of-window path now does on every skipped sweep.
         lb.roll_baselines(OptionFamily::Stock, S1);
 
         // 09:15 — the first RANKED window trades 500 units.
-        lb.observe(stock(1, 100, 900_500), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, 900_500), OptionFamily::Stock);
         let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
         assert_eq!(ranked.len(), 1);
         assert_eq!(
@@ -2150,8 +2328,8 @@ mod tests {
             (7, 500),        // 2.5 lots       -> +150%
             (8, 6_400),      // tie with 4
         ] {
-            lb.observe(stock(id, 100, 1_000), OptionFamily::Stock);
-            lb.observe(stock(id, 100, 1_000 + delta), OptionFamily::Stock);
+            observe_no_receipt(&mut lb, stock(id, 100, 1_000), OptionFamily::Stock);
+            observe_no_receipt(&mut lb, stock(id, 100, 1_000 + delta), OptionFamily::Stock);
         }
         let by_lots = lb
             .rank(OptionFamily::Stock, S1, usize::MAX, lot200, all)
@@ -2380,7 +2558,7 @@ mod tests {
         let mut lb = VolumeLeaderboard::new();
 
         // Freshly inserted: baseline seeded to its own volume, nothing marked.
-        lb.observe(stock(1, 100, 5_000), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, 5_000), OptionFamily::Stock);
         assert_dirty_invariant(&lb, OptionFamily::Stock, "after insert");
         assert!(
             lb.family_ref(OptionFamily::Stock).dirty[0].is_empty(),
@@ -2389,7 +2567,7 @@ mod tests {
         );
 
         // Advanced: marked in EVERY window at once.
-        lb.observe(stock(1, 100, 5_400), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, 5_400), OptionFamily::Stock);
         assert_dirty_invariant(&lb, OptionFamily::Stock, "after advance");
         for window in 0..WINDOW_COUNT {
             assert_eq!(
@@ -2400,7 +2578,7 @@ mod tests {
         }
 
         // Advancing again must NOT push a second copy.
-        lb.observe(stock(1, 100, 5_900), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, 5_900), OptionFamily::Stock);
         assert_dirty_invariant(&lb, OptionFamily::Stock, "after a second advance");
         assert_eq!(
             lb.family_ref(OptionFamily::Stock).dirty[0].len(),
@@ -2435,7 +2613,7 @@ mod tests {
         // grow past the map they index. (Added 2026-09-12: the first version of
         // this test advanced only from the fully-clear and fully-marked states,
         // so removing the per-window bit guard passed it.)
-        lb.observe(stock(1, 100, 6_500), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, 6_500), OptionFamily::Stock);
         assert_dirty_invariant(
             &lb,
             OptionFamily::Stock,
@@ -2453,8 +2631,8 @@ mod tests {
         let _ = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
 
         // Unchanged and refused: neither may touch the lists.
-        lb.observe(stock(1, 100, 5_900), OptionFamily::Stock);
-        lb.observe(stock(1, 100, 10), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, 5_900), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, 10), OptionFamily::Stock);
         assert_dirty_invariant(&lb, OptionFamily::Stock, "after unchanged + refused");
         assert!(
             lb.family_ref(OptionFamily::Stock).dirty[0].is_empty(),
@@ -2463,7 +2641,7 @@ mod tests {
 
         // Re-latched: the mask is preserved, so the lists stay exact.
         for _ in 0..RELATCH_AFTER_CONSECUTIVE_LOWER {
-            lb.observe(stock(1, 100, 10), OptionFamily::Stock);
+            observe_no_receipt(&mut lb, stock(1, 100, 10), OptionFamily::Stock);
         }
         assert_eq!(
             lb.relatches(OptionFamily::Stock),
@@ -2474,8 +2652,8 @@ mod tests {
 
         // And a sweep of every cadence, in turn, leaves it consistent.
         for cadence in SnapshotCadence::ALL {
-            lb.observe(stock(2, 200, 1), OptionFamily::Stock);
-            lb.observe(stock(2, 200, 7_000), OptionFamily::Stock);
+            observe_no_receipt(&mut lb, stock(2, 200, 1), OptionFamily::Stock);
+            observe_no_receipt(&mut lb, stock(2, 200, 7_000), OptionFamily::Stock);
             let _ = lb.rank(OptionFamily::Stock, cadence, 10, lot1, all);
             assert_dirty_invariant(&lb, OptionFamily::Stock, "after a full-cadence sweep");
             lb.roll_baselines(OptionFamily::Stock, cadence);
@@ -2487,8 +2665,8 @@ mod tests {
         // assertion below holds whether `clear` empties them or not, which is
         // how the first version of this test passed with the reset's list-clear
         // deleted (2026-09-12).
-        lb.observe(stock(3, 300, 400), OptionFamily::Stock);
-        lb.observe(stock(3, 300, 900), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(3, 300, 400), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(3, 300, 900), OptionFamily::Stock);
         assert!(
             !lb.family_ref(OptionFamily::Stock).dirty[0].is_empty(),
             "the fixture must leave work pending, or the reset assertion below proves nothing"
@@ -2513,7 +2691,11 @@ mod tests {
         let mut lb = VolumeLeaderboard::new();
         // 400 contracts attach; only every seventh one then trades.
         for id in 0..400u64 {
-            lb.observe(stock(id, id % 20, 1_000 + id as u32), OptionFamily::Stock);
+            observe_no_receipt(
+                &mut lb,
+                stock(id, id % 20, 1_000 + id as u32),
+                OptionFamily::Stock,
+            );
         }
         // One sweep to establish steady state, so the comparison is not run
         // against the special first-sweep case.
@@ -2521,7 +2703,8 @@ mod tests {
 
         let mut traded = 0usize;
         for id in (0..400u64).step_by(7) {
-            lb.observe(
+            observe_no_receipt(
+                &mut lb,
                 stock(id, id % 20, 1_000 + id as u32 + (id as u32 % 13) + 1),
                 OptionFamily::Stock,
             );
@@ -2580,11 +2763,11 @@ mod tests {
     fn roll_baselines_for_one_cadence_leaves_every_other_alone() {
         for rolled in SnapshotCadence::ALL {
             let mut lb = VolumeLeaderboard::new();
-            lb.observe(stock(1, 100, 1_000), OptionFamily::Stock);
-            lb.observe(stock(1, 100, 10_000), OptionFamily::Stock);
+            observe_no_receipt(&mut lb, stock(1, 100, 1_000), OptionFamily::Stock);
+            observe_no_receipt(&mut lb, stock(1, 100, 10_000), OptionFamily::Stock);
 
             lb.roll_baselines(OptionFamily::Stock, rolled);
-            lb.observe(stock(1, 100, 10_400), OptionFamily::Stock);
+            observe_no_receipt(&mut lb, stock(1, 100, 10_400), OptionFamily::Stock);
 
             // The rolled cadence measures only what traded since ITS roll.
             let after = lb.rank(OptionFamily::Stock, rolled, 10, lot1, all);
@@ -2604,10 +2787,10 @@ mod tests {
                     continue;
                 }
                 let mut lb2 = VolumeLeaderboard::new();
-                lb2.observe(stock(1, 100, 1_000), OptionFamily::Stock);
-                lb2.observe(stock(1, 100, 10_000), OptionFamily::Stock);
+                observe_no_receipt(&mut lb2, stock(1, 100, 1_000), OptionFamily::Stock);
+                observe_no_receipt(&mut lb2, stock(1, 100, 10_000), OptionFamily::Stock);
                 lb2.roll_baselines(OptionFamily::Stock, rolled);
-                lb2.observe(stock(1, 100, 10_400), OptionFamily::Stock);
+                observe_no_receipt(&mut lb2, stock(1, 100, 10_400), OptionFamily::Stock);
                 let untouched = lb2.rank(OptionFamily::Stock, other, 10, lot1, all);
                 assert_eq!(
                     untouched[0].window_lots_milli,
@@ -2697,15 +2880,15 @@ mod tests {
         // cites as the reason the min-heap design was killed, reproduced per
         // contract inside the design that replaced it.
         let mut lb = VolumeLeaderboard::new();
-        lb.observe(stock(1, 100, u32::MAX), OptionFamily::Stock);
-        lb.observe(stock(2, 200, 5_000), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, u32::MAX), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(2, 200, 5_000), OptionFamily::Stock);
 
         // The real contract restarts near zero and climbs, as a wrapped or
         // session-reset counter does.
         for i in 1..RELATCH_AFTER_CONSECUTIVE_LOWER {
             assert!(
                 matches!(
-                    lb.observe(stock(1, 100, u32::from(i)), OptionFamily::Stock),
+                    observe_no_receipt(&mut lb, stock(1, 100, u32::from(i)), OptionFamily::Stock),
                     Observation::RefusedNonMonotonic { .. }
                 ),
                 "a SHORT run must still be refused -- that is the replay case"
@@ -2727,7 +2910,7 @@ mod tests {
         // anything: an opening rank closes both contracts' first window, then
         // 2 advances and 1 cannot.
         let _ = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
-        lb.observe(stock(2, 200, 6_000), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(2, 200, 6_000), OptionFamily::Stock);
         let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
         assert_eq!(
             ranked[0].security_id, 2,
@@ -2741,7 +2924,8 @@ mod tests {
 
         // The run crosses the threshold: the high is abandoned.
         assert_eq!(
-            lb.observe(
+            observe_no_receipt(
+                &mut lb,
                 stock(1, 100, u32::from(RELATCH_AFTER_CONSECUTIVE_LOWER)),
                 OptionFamily::Stock
             ),
@@ -2762,11 +2946,11 @@ mod tests {
         // trades MORE in the window than contract 2, and takes the top slot
         // on that basis rather than on a latched high.
         assert_eq!(
-            lb.observe(stock(1, 100, 9_000), OptionFamily::Stock),
+            observe_no_receipt(&mut lb, stock(1, 100, 9_000), OptionFamily::Stock),
             Observation::Accepted
         );
         assert_eq!(
-            lb.observe(stock(2, 200, 6_100), OptionFamily::Stock),
+            observe_no_receipt(&mut lb, stock(2, 200, 6_100), OptionFamily::Stock),
             Observation::Accepted
         );
         let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
@@ -2793,9 +2977,9 @@ mod tests {
         high: u32,
         low: u32,
     ) -> u32 {
-        lb.observe(stock(id, underlying, high), OptionFamily::Stock);
+        observe_no_receipt(lb, stock(id, underlying, high), OptionFamily::Stock);
         for _ in 0..RELATCH_AFTER_CONSECUTIVE_LOWER {
-            let _ = lb.observe(stock(id, underlying, low), OptionFamily::Stock);
+            let _ = observe_no_receipt(lb, stock(id, underlying, low), OptionFamily::Stock);
         }
         assert_eq!(lb.relatches(OptionFamily::Stock) > 0, true);
         low
@@ -2817,12 +3001,12 @@ mod tests {
         relatch_to(&mut lb, 1, 100, 1_000_000, 1_000);
         // A second contract that genuinely trades, so "did not rank" is a
         // comparison rather than an empty board.
-        lb.observe(stock(2, 200, 5_000), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(2, 200, 5_000), OptionFamily::Stock);
         let _ = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
 
         // The dip ends: the vendor reports the true cumulative again.
         assert_eq!(
-            lb.observe(stock(1, 100, 1_000_000), OptionFamily::Stock),
+            observe_no_receipt(&mut lb, stock(1, 100, 1_000_000), OptionFamily::Stock),
             Observation::ResyncedToCeiling {
                 ceiling: 1_000_000,
                 adopted: 1_000_000,
@@ -2831,7 +3015,7 @@ mod tests {
         );
         assert_eq!(lb.resyncs(OptionFamily::Stock), 1);
 
-        lb.observe(stock(2, 200, 6_000), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(2, 200, 6_000), OptionFamily::Stock);
         let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
         assert_eq!(
             ranked[0].security_id, 2,
@@ -2852,7 +3036,7 @@ mod tests {
 
         // Recovers to the ceiling PLUS 7,500 genuinely traded units.
         assert!(matches!(
-            lb.observe(stock(1, 100, 1_007_500), OptionFamily::Stock),
+            observe_no_receipt(&mut lb, stock(1, 100, 1_007_500), OptionFamily::Stock),
             Observation::ResyncedToCeiling { .. }
         ));
         let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
@@ -2894,7 +3078,7 @@ mod tests {
         // Stage 1 of the climb back — strictly BELOW the ceiling, so the
         // ceiling is NOT consumed and the stage ranks.
         assert_eq!(
-            lb.observe(stock(1, 100, 500_000), OptionFamily::Stock),
+            observe_no_receipt(&mut lb, stock(1, 100, 500_000), OptionFamily::Stock),
             Observation::Accepted,
             "a sub-ceiling stage is an ordinary advance, not a resync"
         );
@@ -2913,7 +3097,7 @@ mod tests {
         // TO it is absorbed — that half works and must keep working.
         assert!(
             matches!(
-                lb.observe(stock(1, 100, 1_000_000), OptionFamily::Stock),
+                observe_no_receipt(&mut lb, stock(1, 100, 1_000_000), OptionFamily::Stock),
                 Observation::ResyncedToCeiling { .. }
             ),
             "the ceiling is consumed when the climb finally reaches it"
@@ -2924,7 +3108,7 @@ mod tests {
         );
 
         // And genuine trading past the old high ranks at face value.
-        let _ = lb.observe(stock(1, 100, 1_003_000), OptionFamily::Stock);
+        let _ = observe_no_receipt(&mut lb, stock(1, 100, 1_003_000), OptionFamily::Stock);
         let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
         assert_eq!(
             ranked[0].window_lots_milli,
@@ -2943,14 +3127,14 @@ mod tests {
         relatch_to(&mut lb, 1, 100, 1_000_000, 1_000);
         let _ = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
         assert!(matches!(
-            lb.observe(stock(1, 100, 1_000_000), OptionFamily::Stock),
+            observe_no_receipt(&mut lb, stock(1, 100, 1_000_000), OptionFamily::Stock),
             Observation::ResyncedToCeiling { .. }
         ));
         let _ = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
 
         // Ordinary trading from here.
         assert_eq!(
-            lb.observe(stock(1, 100, 1_002_000), OptionFamily::Stock),
+            observe_no_receipt(&mut lb, stock(1, 100, 1_002_000), OptionFamily::Stock),
             Observation::Accepted,
             "the ceiling was consumed -- this is a normal advance, not a resync"
         );
@@ -2974,7 +3158,7 @@ mod tests {
 
         // A SECOND re-latch, from a much lower high.
         for _ in 0..RELATCH_AFTER_CONSECUTIVE_LOWER {
-            let _ = lb.observe(stock(1, 100, 50), OptionFamily::Stock);
+            let _ = observe_no_receipt(&mut lb, stock(1, 100, 50), OptionFamily::Stock);
         }
         assert_eq!(lb.relatches(OptionFamily::Stock), 2);
         let _ = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
@@ -2982,7 +3166,7 @@ mod tests {
         // The armed ceiling is now 1,000 -- the high the SECOND re-latch
         // abandoned -- not the stale 1,000,000.
         assert_eq!(
-            lb.observe(stock(1, 100, 1_000), OptionFamily::Stock),
+            observe_no_receipt(&mut lb, stock(1, 100, 1_000), OptionFamily::Stock),
             Observation::ResyncedToCeiling {
                 ceiling: 1_000,
                 adopted: 1_000,
@@ -3002,11 +3186,11 @@ mod tests {
         relatch_to(&mut lb, 1, 100, 1_000_000, 1_000);
         let _ = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
         assert!(matches!(
-            lb.observe(stock(1, 100, 1_000_000), OptionFamily::Stock),
+            observe_no_receipt(&mut lb, stock(1, 100, 1_000_000), OptionFamily::Stock),
             Observation::ResyncedToCeiling { .. }
         ));
         let _ = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
-        lb.observe(stock(1, 100, 1_004_000), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, 1_004_000), OptionFamily::Stock);
 
         let ranked = lb.rank(OptionFamily::Stock, S1, usize::MAX, lot1, all);
         assert_eq!(
@@ -3048,12 +3232,12 @@ mod tests {
         // reach the re-latch. An equal value is not evidence the stored high is
         // good, so it must not clear the run.
         let mut lb = VolumeLeaderboard::new();
-        lb.observe(stock(1, 100, u32::MAX), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, u32::MAX), OptionFamily::Stock);
         // 31 lower observations, each followed by one EQUAL to the stored high.
         for _ in 1..RELATCH_AFTER_CONSECUTIVE_LOWER {
-            lb.observe(stock(1, 100, 7), OptionFamily::Stock);
+            observe_no_receipt(&mut lb, stock(1, 100, 7), OptionFamily::Stock);
             assert_eq!(
-                lb.observe(stock(1, 100, u32::MAX), OptionFamily::Stock),
+                observe_no_receipt(&mut lb, stock(1, 100, u32::MAX), OptionFamily::Stock),
                 Observation::Unchanged,
                 "a value identical to the stored high is Unchanged, never Accepted"
             );
@@ -3065,7 +3249,7 @@ mod tests {
         );
         // The 32nd crosses it, DESPITE 31 intervening equal values.
         assert!(matches!(
-            lb.observe(stock(1, 100, 7), OptionFamily::Stock),
+            observe_no_receipt(&mut lb, stock(1, 100, 7), OptionFamily::Stock),
             Observation::Relatched { .. }
         ));
         assert_eq!(
@@ -3175,7 +3359,7 @@ mod tests {
         // inflate the refusal counter that a future alarm would read.
         let mut lb = VolumeLeaderboard::new();
         assert_eq!(
-            lb.observe(stock(1, 100, 0), OptionFamily::Stock),
+            observe_no_receipt(&mut lb, stock(1, 100, 0), OptionFamily::Stock),
             Observation::Ignored
         );
         assert_eq!(lb.non_monotonic_refusals(OptionFamily::Stock), 0);
@@ -3189,7 +3373,7 @@ mod tests {
         // makes the depth pool churn completely at the bell.
         let mut lb = VolumeLeaderboard::new();
         for id in 0..50u64 {
-            lb.observe(stock(id, id, 0), OptionFamily::Stock);
+            observe_no_receipt(&mut lb, stock(id, id, 0), OptionFamily::Stock);
         }
         assert!(
             lb.rank(OptionFamily::Stock, S1, 250, lot1, all).is_empty(),
@@ -3261,19 +3445,19 @@ mod tests {
         let mut lb = VolumeLeaderboard::new();
         for id in 0..MAX_TRACKED_CONTRACTS as u64 {
             assert_eq!(
-                lb.observe(stock(id, id, 1_000), OptionFamily::Stock),
+                observe_no_receipt(&mut lb, stock(id, id, 1_000), OptionFamily::Stock),
                 Observation::Accepted
             );
         }
         assert_eq!(
-            lb.observe(stock(999_999, 1, 5_000), OptionFamily::Stock),
+            observe_no_receipt(&mut lb, stock(999_999, 1, 5_000), OptionFamily::Stock),
             Observation::RefusedAtCapacity
         );
         assert_eq!(lb.capacity_refusals(OptionFamily::Stock), 1);
         // Fail-closed on the INSERT path only — an already-tracked contract is
         // never evicted and keeps advancing.
         assert_eq!(
-            lb.observe(stock(0, 0, 9_999), OptionFamily::Stock),
+            observe_no_receipt(&mut lb, stock(0, 0, 9_999), OptionFamily::Stock),
             Observation::Accepted
         );
         assert_eq!(lb.tracked(OptionFamily::Stock), MAX_TRACKED_CONTRACTS);
@@ -3288,11 +3472,11 @@ mod tests {
         // the board, not a tie at the bottom of it.
         let mut lb = VolumeLeaderboard::new();
         for id in (0..40u64).rev() {
-            lb.observe(stock(id, id, 777), OptionFamily::Stock);
+            observe_no_receipt(&mut lb, stock(id, id, 777), OptionFamily::Stock);
         }
         let _seed = lb.rank(OptionFamily::Stock, S1, 40, lot1, all);
         for id in (0..40u64).rev() {
-            lb.observe(stock(id, id, 1_777), OptionFamily::Stock);
+            observe_no_receipt(&mut lb, stock(id, id, 1_777), OptionFamily::Stock);
         }
         let first: Vec<u64> = lb
             .rank(OptionFamily::Stock, S1, 40, lot1, all)
@@ -3300,7 +3484,7 @@ mod tests {
             .map(|c| c.security_id)
             .collect();
         for id in (0..40u64).rev() {
-            lb.observe(stock(id, id, 2_777), OptionFamily::Stock);
+            observe_no_receipt(&mut lb, stock(id, id, 2_777), OptionFamily::Stock);
         }
         let second: Vec<u64> = lb
             .rank(OptionFamily::Stock, S1, 40, lot1, all)
@@ -3341,6 +3525,8 @@ mod tests {
             window_lots_milli: 0,
             delta_units: 0,
             lot_size: 0,
+            first_receipt_nanos: 0,
+            last_receipt_nanos: 0,
         };
 
         // Distinctness: five strikes of one name yield ONE entry.
@@ -3536,7 +3722,7 @@ mod tests {
             // are in production.
             let id = (step * contracts / traded.max(1)) % contracts;
             let volume = base_volume(id) + (round as u32 + 1) * (1 + (id as u32 % 97));
-            lb.observe(stock(id, id % 220, volume), OptionFamily::Stock);
+            observe_no_receipt(lb, stock(id, id % 220, volume), OptionFamily::Stock);
         }
         let start = std::time::Instant::now();
         let ranked = lb.rank(
@@ -3619,7 +3805,11 @@ mod tests {
 
         let mut lb = VolumeLeaderboard::new();
         for id in 0..CONTRACTS {
-            lb.observe(stock(id, id % 220, base_volume(id)), OptionFamily::Stock);
+            observe_no_receipt(
+                &mut lb,
+                stock(id, id % 220, base_volume(id)),
+                OptionFamily::Stock,
+            );
         }
         assert_eq!(lb.tracked(OptionFamily::Stock), CONTRACTS as usize);
 
@@ -3667,7 +3857,11 @@ mod tests {
         for round in 1..=ROUNDS {
             for step in 0..CONTRACTS {
                 let volume = base_volume(step) + (300 + round as u32) * (1 + (step as u32 % 97));
-                lb.observe(stock(step, step % 220, volume), OptionFamily::Stock);
+                observe_no_receipt(
+                    &mut lb,
+                    stock(step, step % 220, volume),
+                    OptionFamily::Stock,
+                );
             }
             let start = std::time::Instant::now();
             // Inlined rather than `distinct_over_full_rank`, which passes the
@@ -3759,9 +3953,9 @@ mod tests {
         // YESTERDAY all day — a failure the gate itself would mask, which is
         // why this is asserted rather than assumed.
         let mut lb = VolumeLeaderboard::new();
-        lb.observe(stock(1, 100, 900), OptionFamily::Stock);
-        lb.observe(stock(2, 200, 900), OptionFamily::Index);
-        lb.observe(stock(1, 100, 5), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, 900), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(2, 200, 900), OptionFamily::Index);
+        observe_no_receipt(&mut lb, stock(1, 100, 5), OptionFamily::Stock);
         assert_eq!(lb.non_monotonic_refusals(OptionFamily::Stock), 1);
 
         lb.reset_daily();
@@ -3770,7 +3964,7 @@ mod tests {
         assert_eq!(lb.tracked(OptionFamily::Index), 0);
         assert_eq!(lb.non_monotonic_refusals(OptionFamily::Stock), 0);
         assert_eq!(
-            lb.observe(stock(1, 100, 5), OptionFamily::Stock),
+            observe_no_receipt(&mut lb, stock(1, 100, 5), OptionFamily::Stock),
             Observation::Accepted,
             "after a reset, yesterday's high must not refuse today's first tick"
         );
@@ -3824,7 +4018,8 @@ mod tests {
         // unrelated cash stock in NSE_EQ. Keying on the bare id would merge two
         // instruments' volumes into one leaderboard entry.
         let mut lb = VolumeLeaderboard::new();
-        lb.observe(
+        observe_no_receipt(
+            &mut lb,
             RankedContract {
                 window_lots_milli: 0,
                 delta_units: 0,
@@ -3833,10 +4028,13 @@ mod tests {
                 segment: ExchangeSegment::NseFno,
                 underlying_id: 1,
                 volume: 500,
+                first_receipt_nanos: 0,
+                last_receipt_nanos: 0,
             },
             OptionFamily::Stock,
         );
-        lb.observe(
+        observe_no_receipt(
+            &mut lb,
             RankedContract {
                 window_lots_milli: 0,
                 delta_units: 0,
@@ -3845,6 +4043,8 @@ mod tests {
                 segment: ExchangeSegment::BseFno,
                 underlying_id: 2,
                 volume: 400,
+                first_receipt_nanos: 0,
+                last_receipt_nanos: 0,
             },
             OptionFamily::Stock,
         );
@@ -3859,7 +4059,11 @@ mod tests {
     fn rank_truncates_to_k_and_keeps_the_heaviest() {
         let mut lb = VolumeLeaderboard::new();
         for id in 0..500u64 {
-            lb.observe(stock(id, id, 1_000 + id as u32), OptionFamily::Stock);
+            observe_no_receipt(
+                &mut lb,
+                stock(id, id, 1_000 + id as u32),
+                OptionFamily::Stock,
+            );
         }
         // UPDATED 2026-09-07: the first rank CLOSES the opening window. Every
         // contract's baseline was seeded to what it had already traded, so
@@ -3875,7 +4079,8 @@ mod tests {
         // the OPPOSITE order to the cumulative one: id 0 trades the most.
         for id in 0..500u64 {
             let traded = 500 - id as u32;
-            lb.observe(
+            observe_no_receipt(
+                &mut lb,
                 stock(id, id, 1_000 + id as u32 + traded),
                 OptionFamily::Stock,
             );
@@ -3907,12 +4112,12 @@ mod tests {
         // — on a 1,200-unit lot = 20 lots. Ranking on units puts 2 first;
         // ranking on lots puts 1 first, which is the busier book.
         let mut lb = VolumeLeaderboard::new();
-        lb.observe(stock(1, 100, 1), OptionFamily::Stock);
-        lb.observe(stock(2, 200, 1), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, 1), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(2, 200, 1), OptionFamily::Stock);
         let _ = lb.rank(OptionFamily::Stock, S1, 10, lot_of_fixture, all);
 
-        lb.observe(stock(1, 100, 1 + 20_000), OptionFamily::Stock);
-        lb.observe(stock(2, 200, 1 + 24_000), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, 1 + 20_000), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(2, 200, 1 + 24_000), OptionFamily::Stock);
         let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot_of_fixture, all);
 
         assert_eq!(ranked[0].security_id, 1, "100 lots beats 20 lots");
@@ -3934,14 +4139,14 @@ mod tests {
         // own worked example, so the numbers below are his: 3,200 units traded
         // in the window against a 200-unit lot.
         let mut lb = VolumeLeaderboard::new();
-        lb.observe(stock(1, 100, 50_000), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, 50_000), OptionFamily::Stock);
         let opening = lb.rank(OptionFamily::Stock, S1, 10, lot_of_fixture, all);
         assert!(
             opening.is_empty(),
             "the first sweep sets the baseline and ranks nothing"
         );
 
-        lb.observe(stock(1, 100, 50_000 + 3_200), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, 50_000 + 3_200), OptionFamily::Stock);
         let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot_of_fixture, all);
 
         assert_eq!(ranked.len(), 1);
@@ -3969,11 +4174,11 @@ mod tests {
     #[test]
     fn delta_units_measures_one_window_even_after_a_sweep_that_ranked_nothing() {
         let mut lb = VolumeLeaderboard::new();
-        lb.observe(stock(1, 100, 1_000), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, 1_000), OptionFamily::Stock);
         let _ = lb.rank(OptionFamily::Stock, S1, 10, lot_of_fixture, all);
 
         // Window A: 2,000 units. Ranked.
-        lb.observe(stock(1, 100, 3_000), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, 3_000), OptionFamily::Stock);
         let a = lb.rank(OptionFamily::Stock, S1, 10, lot_of_fixture, all);
         assert_eq!(a[0].delta_units, 2_000);
 
@@ -3983,7 +4188,7 @@ mod tests {
 
         // Window C: 400 units. `delta_units` must be 400 — NOT 2,400, which is
         // what it would read if the quiet window had failed to roll forward.
-        lb.observe(stock(1, 100, 3_400), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, 3_400), OptionFamily::Stock);
         let c = lb.rank(OptionFamily::Stock, S1, 10, lot_of_fixture, all);
         assert_eq!(c[0].delta_units, 400);
         assert_eq!(c[0].volume, 3_400, "cumulative keeps climbing regardless");
@@ -3996,13 +4201,17 @@ mod tests {
         // last would steal the other's interval and both boards would report a
         // window neither one measured.
         let mut lb = VolumeLeaderboard::new();
-        lb.observe(stock(1, 100, 1), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, 1), OptionFamily::Stock);
         let _ = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
         let _ = lb.rank(OptionFamily::Stock, S5, 10, lot1, all);
 
         // Five 1-second windows of 1,000 units each.
         for step in 1..=5u32 {
-            lb.observe(stock(1, 100, 1 + step * 1_000), OptionFamily::Stock);
+            observe_no_receipt(
+                &mut lb,
+                stock(1, 100, 1 + step * 1_000),
+                OptionFamily::Stock,
+            );
             let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
             assert_eq!(
                 ranked[0].window_lots_milli,
@@ -4027,7 +4236,7 @@ mod tests {
         // 0, because a zero-lot tail is the arbitrary "whoever ticked first"
         // set the operator's requirement excludes.
         let mut lb = VolumeLeaderboard::new();
-        lb.observe(stock(1, 100, 4_000_000), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, 4_000_000), OptionFamily::Stock);
         let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
         assert!(
             ranked.is_empty(),
@@ -4035,7 +4244,7 @@ mod tests {
              and a zero window is not a place on the board"
         );
         // The observation itself is kept: the next window measures from it.
-        lb.observe(stock(1, 100, 4_000_050), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, 4_000_050), OptionFamily::Stock);
         let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].window_lots_milli, 50 * LOTS_SCALE);
@@ -4048,12 +4257,12 @@ mod tests {
         // tie at the bottom of a 250-deep board rather than out of it, and the
         // bottom edge is exactly where the cut is decided.
         let mut lb = VolumeLeaderboard::new();
-        lb.observe(stock(1, 100, 1), OptionFamily::Stock);
-        lb.observe(stock(2, 200, 1), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, 1), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(2, 200, 1), OptionFamily::Stock);
         let none_for_one = |c: &RankedContract| (c.security_id != 1).then_some(50);
         let _ = lb.rank(OptionFamily::Stock, S1, 10, none_for_one, all);
-        lb.observe(stock(1, 100, 5_000), OptionFamily::Stock);
-        lb.observe(stock(2, 200, 5_000), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, 5_000), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(2, 200, 5_000), OptionFamily::Stock);
         let ranked = lb.rank(OptionFamily::Stock, S1, 10, none_for_one, all);
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].security_id, 2);
@@ -4091,12 +4300,12 @@ mod tests {
             lot_size: 200,
             ..stock(1, 100, volume)
         };
-        lb.observe(carried(1), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, carried(1), OptionFamily::Stock);
         let never = |_: &RankedContract| -> Option<u32> {
             panic!("the sweep probed for a lot size the tick had already carried")
         };
         let _ = lb.rank(OptionFamily::Stock, S1, 10, never, all);
-        lb.observe(carried(20_001), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, carried(20_001), OptionFamily::Stock);
         let ranked = lb.rank(OptionFamily::Stock, S1, 10, never, all);
         assert_eq!(ranked.len(), 1);
         // 20,000 units on a 200-unit lot is exactly 100 lots.
@@ -4120,9 +4329,9 @@ mod tests {
             0,
             "the fixture must carry none, or this test proves nothing"
         );
-        lb.observe(stock(1, 100, 1), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, 1), OptionFamily::Stock);
         let _ = lb.rank(OptionFamily::Stock, S1, 10, lot_of_fixture, all);
-        lb.observe(stock(1, 100, 20_001), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, 20_001), OptionFamily::Stock);
         let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot_of_fixture, all);
         assert_eq!(ranked.len(), 1);
         assert_eq!(
@@ -4145,9 +4354,9 @@ mod tests {
             ..stock(1, 100, volume)
         };
         let disagrees = |_: &RankedContract| Some(50_u32);
-        lb.observe(carried(1), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, carried(1), OptionFamily::Stock);
         let _ = lb.rank(OptionFamily::Stock, S1, 10, disagrees, all);
-        lb.observe(carried(20_001), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, carried(20_001), OptionFamily::Stock);
         let ranked = lb.rank(OptionFamily::Stock, S1, 10, disagrees, all);
         assert_eq!(ranked[0].lot_size, 200, "the carried lot, not the probe's");
         assert_eq!(
@@ -4179,21 +4388,21 @@ mod tests {
         // with a delta measuring minutes, taking a socket on a number no other
         // contract on the board was measured over.
         let mut lb = VolumeLeaderboard::new();
-        lb.observe(stock(1, 100, 1), OptionFamily::Stock);
-        lb.observe(stock(2, 200, 1), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, 1), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(2, 200, 1), OptionFamily::Stock);
         let only_two = |c: &RankedContract| c.security_id == 2;
         let _ = lb.rank(OptionFamily::Stock, S1, 10, lot1, only_two);
 
         // Contract 1 trades hard for three windows while ineligible.
         for step in 1..=3u32 {
-            lb.observe(stock(1, 100, step * 10_000), OptionFamily::Stock);
-            lb.observe(stock(2, 200, step * 10), OptionFamily::Stock);
+            observe_no_receipt(&mut lb, stock(1, 100, step * 10_000), OptionFamily::Stock);
+            observe_no_receipt(&mut lb, stock(2, 200, step * 10), OptionFamily::Stock);
             let _ = lb.rank(OptionFamily::Stock, S1, 10, lot1, only_two);
         }
 
         // Now it becomes eligible and trades a modest amount. Its key must
         // measure THAT window, not the 30,000 it traded while sitting out.
-        lb.observe(stock(1, 100, 30_100), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, 30_100), OptionFamily::Stock);
         let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
         let one = ranked.iter().find(|c| c.security_id == 1).expect("present");
         assert_eq!(one.window_lots_milli, 100 * LOTS_SCALE);
@@ -4489,11 +4698,15 @@ mod tests {
     fn a_gainer_ranked_below_the_top_250_by_volume_still_qualifies_for_depth() {
         let mut lb = VolumeLeaderboard::new();
         for i in 1..=300u64 {
-            lb.observe(stock(i, i, 1), OptionFamily::Stock);
+            observe_no_receipt(&mut lb, stock(i, i, 1), OptionFamily::Stock);
         }
         for i in 1..=300u64 {
             // Contract i trades (301 - i) more units: rank i.
-            lb.observe(stock(i, i, 1 + (301 - i as u32)), OptionFamily::Stock);
+            observe_no_receipt(
+                &mut lb,
+                stock(i, i, 1 + (301 - i as u32)),
+                OptionFamily::Stock,
+            );
         }
         let ranked_all = lb.rank(OptionFamily::Stock, S1, usize::MAX, lot1, all);
         assert_eq!(ranked_all.len(), 300, "no cut inside rank");
@@ -4507,5 +4720,153 @@ mod tests {
         });
         assert_eq!(gainers.len(), 50);
         assert_eq!(gainers[0].security_id, 251);
+    }
+
+    // ---- the three receipt delays: the four invariants -------------------
+    //
+    // These four are the correctness of the feature. The storage tests prove
+    // the RENDERING (bands, sign, NULL, the sortable twin); these prove the
+    // MEASUREMENT — that the two receipt stamps name the right two instants.
+
+    /// The window-open stamp is kept from the window's FIRST trade, and no
+    /// later trade in the same window overwrites it.
+    ///
+    /// Overwriting would make `open_latency` report the delay to the LATEST
+    /// trade instead of the first, and would collapse `window_span` toward
+    /// zero on exactly the busiest contracts — the ones a reader most wants
+    /// it for.
+    ///
+    /// # What this test bites on, measured rather than asserted
+    ///
+    /// Two guards protect the stamp: an outer early-out (`was_dirty !=
+    /// ALL_WINDOWS_DIRTY`) and the inner per-window bit test. Bite-tested
+    /// 2026-09-19, all three ways:
+    ///
+    /// | broken | this test | the per-cadence test below |
+    /// |---|---|---|
+    /// | inner only | passes | **FAILS** |
+    /// | outer only | passes | passes |
+    /// | both | **FAILS** | **FAILS** |
+    ///
+    /// So this test proves the pair, and the per-cadence test is the one that
+    /// proves the inner condition on its own. Recorded because the first draft
+    /// of this comment claimed this test proved the inner bit test, and the
+    /// bite-test refuted it: with a single cadence ever swept, all four bits
+    /// move in lockstep, so the outer early-out alone is enough to hold the
+    /// stamp and the inner condition is never reached. A test that cannot fail
+    /// for the reason its comment gives is the vacuity class this repository
+    /// keeps recording — here caught before it shipped rather than after.
+    ///
+    /// The outer guard broken ALONE changes nothing, which is the honest
+    /// reading of it: it is an early-out over a loop the inner test would
+    /// already no-op. Neither is redundant in combination, which is why both
+    /// stay.
+    #[test]
+    fn the_first_receipt_of_a_window_is_kept_and_later_ticks_do_not_overwrite_it() {
+        let mut lb = VolumeLeaderboard::new();
+
+        // Seed the key (an untracked contract's first observe only seeds its
+        // baseline, so it ranks nothing until it trades).
+        lb.observe(stock(1, 100, 1_000), OptionFamily::Stock, 111);
+        // Drop the seeding stamp so the window below opens clean.
+        let _ = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
+
+        lb.observe(stock(1, 100, 1_100), OptionFamily::Stock, 5_000);
+        lb.observe(stock(1, 100, 1_200), OptionFamily::Stock, 6_000);
+        lb.observe(stock(1, 100, 1_300), OptionFamily::Stock, 7_000);
+
+        let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(
+            ranked[0].first_receipt_nanos, 5_000,
+            "the window's FIRST receipt must survive two later ticks — \
+             overwriting it would time the window from its last trade"
+        );
+        assert_eq!(
+            ranked[0].last_receipt_nanos, 7_000,
+            "the last receipt must be the LATEST tick, so the span between \
+             them is the real first-to-last interval"
+        );
+    }
+
+    /// Sweeping ONE cadence does not reopen another cadence's window.
+    ///
+    /// Each cadence keeps its own `first_receipt_nanos` slot precisely because
+    /// the four windows open at four different instants. A shared stamp would
+    /// make the 1-minute row report the 1-second window's opening delay, which
+    /// is wrong by up to a minute and looks entirely plausible.
+    #[test]
+    fn a_sweep_of_one_cadence_does_not_reopen_another_cadences_window() {
+        let mut lb = VolumeLeaderboard::new();
+
+        lb.observe(stock(1, 100, 1_000), OptionFamily::Stock, 111);
+        let _ = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
+        let _ = lb.rank(OptionFamily::Stock, S5, 10, lot1, all);
+
+        // Both windows open on this tick.
+        lb.observe(stock(1, 100, 1_100), OptionFamily::Stock, 2_000);
+        // The 1-second window closes and reopens; the 5-second one does not.
+        let one_sec = lb.rank(OptionFamily::Stock, S1, 10, lot1, all)[0].first_receipt_nanos;
+        assert_eq!(one_sec, 2_000);
+
+        lb.observe(stock(1, 100, 1_200), OptionFamily::Stock, 9_000);
+
+        let five_sec = lb.rank(OptionFamily::Stock, S5, 10, lot1, all);
+        assert_eq!(five_sec.len(), 1);
+        assert_eq!(
+            five_sec[0].first_receipt_nanos, 2_000,
+            "the 5-second window opened at 2_000 and the 1-second sweep must \
+             not have reopened it at 9_000 — its window never closed"
+        );
+    }
+
+    /// A frame carrying no receipt clock reports `0` on both halves, which the
+    /// projection renders as an EMPTY cell rather than `0 nanoseconds`.
+    ///
+    /// `WAL_RECEIPT_UNKNOWN_NANOS` is `0`: a pre-`TVW3` WAL frame has no
+    /// receipt at all. Reporting zero delay for an unknown delivery time would
+    /// claim the fastest possible arrival for a tick nobody timed.
+    #[test]
+    fn a_contract_with_no_receipt_clock_reports_zero_on_both_halves() {
+        let mut lb = VolumeLeaderboard::new();
+
+        observe_no_receipt(&mut lb, stock(1, 100, 1_000), OptionFamily::Stock);
+        let _ = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
+        observe_no_receipt(&mut lb, stock(1, 100, 1_100), OptionFamily::Stock);
+
+        let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].first_receipt_nanos, 0);
+        assert_eq!(ranked[0].last_receipt_nanos, 0);
+    }
+
+    /// An out-of-window baseline roll clears the stamp in lockstep with the
+    /// baseline it was taken beside.
+    ///
+    /// A first-receipt stamp times a window that starts at its baseline. The
+    /// roll throws that baseline away, so keeping the stamp would report an
+    /// opening delay measured against a window start that no longer exists —
+    /// the same class of error as the pre-2026-09-09 baseline over-count the
+    /// roll itself was added to fix, one column over.
+    #[test]
+    fn a_baseline_roll_clears_the_receipt_stamp_in_lockstep() {
+        let mut lb = VolumeLeaderboard::new();
+
+        lb.observe(stock(1, 100, 1_000), OptionFamily::Stock, 111);
+        // Pre-window accumulation, stamped at a pre-window instant.
+        lb.observe(stock(1, 100, 900_000), OptionFamily::Stock, 1_000);
+
+        lb.roll_baselines(OptionFamily::Stock, S1);
+
+        // The first IN-window trade opens the window afresh.
+        lb.observe(stock(1, 100, 900_500), OptionFamily::Stock, 8_000);
+
+        let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(
+            ranked[0].first_receipt_nanos, 8_000,
+            "the roll must have cleared the pre-window stamp — carrying 1_000 \
+             forward would time the window against a baseline it discarded"
+        );
     }
 }
