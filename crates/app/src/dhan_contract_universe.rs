@@ -558,10 +558,12 @@ pub struct ContractSelection {
     /// The contracts to subscribe, deduped on the I-P1-11 composite key and
     /// sorted deterministically.
     pub instruments: Vec<SubscribeInstrument>,
-    /// Index futures selected (all expiries at or after today).
-    pub index_futures: usize,
-    /// Stock futures selected (all expiries at or after today).
-    pub stock_futures: usize,
+    // Futures are NOT selected. The operator removed the entire futures
+    // subscription on 2026-09-18 (equity underlying spots and options only —
+    // `websocket-connection-scope-lock.md`, "2026-09-18 (THIRD)"), so there is
+    // no `index_futures` / `stock_futures` count here. A counter with nothing
+    // feeding it reads as "none selected today" when the truth is "never
+    // selected", which is the dead-monitor class the house rules forbid.
     /// Index options selected (current expiry, full chain, 2 underlyings).
     pub index_options: usize,
     /// Stock options selected (current expiry, ATM window both legs).
@@ -761,17 +763,17 @@ pub fn select_contract_universe(
 
     // ---- pass 1: bucket by underlying, O(rows) ----
     //
-    // Four buckets, not one flat list, because every downstream decision is
+    // Two buckets, not one flat list, because every downstream decision is
     // per-underlying: which expiry is nearest, where ATM sits, whether a full
     // chain is authorized. A flat list would need a scan per underlying.
-    let mut index_futures: Vec<Contract<'_>> = Vec::new();
-    let mut stock_futures: Vec<Contract<'_>> = Vec::new();
+    //
+    // No future bucket: futures are refused above, before this point.
     let mut index_opt: HashMap<&str, UnderlyingBucket<'_>> = HashMap::new();
     let mut stock_opt: HashMap<&str, UnderlyingBucket<'_>> = HashMap::new();
 
     for row in rows {
         let class = row.class;
-        if !class.is_future() && !class.is_option() {
+        if !class.is_option() {
             continue;
         }
         let Some(segment) = derivative_segment(&row.exch_id) else {
@@ -809,8 +811,6 @@ pub fn select_contract_universe(
             underlying: row.underlying_symbol.as_str(),
         };
         match class {
-            InstrumentClass::IndexFuture => index_futures.push(c),
-            InstrumentClass::StockFuture => stock_futures.push(c),
             InstrumentClass::IndexOption | InstrumentClass::StockOption => {
                 // An option with no strike or no leg cannot be placed on a
                 // ladder either.
@@ -836,36 +836,11 @@ pub fn select_contract_universe(
     //
     // Priority is what makes the capacity bound principled: when the envelope
     // binds, what gives way is the far-from-the-money tail of stock options,
-    // never a future and never an index chain.
+    // never an index chain.
     let mut chosen: HashSet<(SecurityId, ExchangeSegment)> = HashSet::new();
     let mut picked: Vec<SubscribeInstrument> = Vec::new();
 
-    // 1 + 2. Futures, ALL expiries at or after today. Never rolled, never
-    // trimmed: they are ~700 contracts against a 25,000 envelope.
-    //
-    // Ordered by (expiry, id) rather than by the order the master listed them.
-    // Nothing here is expected to overflow the envelope, but "expected" is not
-    // a property of the data: if it ever does, WHICH futures survive must be a
-    // function of the contracts, not of how the vendor happened to sort its
-    // export that morning.
-    index_futures.sort_unstable_by_key(|c| (c.expiry_ymd, c.security_id));
-    stock_futures.sort_unstable_by_key(|c| (c.expiry_ymd, c.security_id));
-    for c in &index_futures {
-        match push_contract(c, capacity, &mut chosen, &mut picked) {
-            PushOutcome::Added => out.index_futures += 1,
-            PushOutcome::Duplicate => out.deduped += 1,
-            PushOutcome::NoRoom => out.dropped_for_capacity += 1,
-        }
-    }
-    for c in &stock_futures {
-        match push_contract(c, capacity, &mut chosen, &mut picked) {
-            PushOutcome::Added => out.stock_futures += 1,
-            PushOutcome::Duplicate => out.deduped += 1,
-            PushOutcome::NoRoom => out.dropped_for_capacity += 1,
-        }
-    }
-
-    // 3. Index options — FULL chain, current expiry, exactly the two
+    // 1. Index options — FULL chain, current expiry, exactly the two
     // authorized underlyings. No spot price needed: taking every strike is
     // what "entire options contracts" means.
     for underlying in FULL_CHAIN_INDEX_UNDERLYINGS {
@@ -932,7 +907,7 @@ pub fn select_contract_universe(
         }
     }
 
-    // 4. Stock options — current expiry, ATM ± window, both legs. The only
+    // 2. Stock options — current expiry, ATM ± window, both legs. The only
     // class that needs a live price, and the only one that shrinks.
     //
     // The window is chosen BEFORE anything is pushed so the result is the
@@ -1948,8 +1923,6 @@ pub async fn load_contract_universe(
         spot_from_questdb = from_questdb,
         symbol_map_entries = symbols.len(),
         selected = selection.instruments.len(),
-        index_futures = selection.index_futures,
-        stock_futures = selection.stock_futures,
         index_options = selection.index_options,
         stock_options = selection.stock_options,
         atm_window = selection.atm_window_used,
@@ -2297,20 +2270,25 @@ mod tests {
     fn an_empty_master_selects_nothing_and_says_so() {
         let sel = select_contract_universe(&[], &no_spot(), TODAY, 25_000);
         assert!(sel.instruments.is_empty());
-        assert_eq!(sel.index_futures, 0);
+        assert_eq!(sel.index_options, 0);
         assert_eq!(sel.stock_options, 0);
         assert_eq!(sel.dropped_for_capacity, 0);
     }
 
     #[test]
-    fn futures_take_every_expiry_at_or_after_today() {
+    fn a_future_is_never_selected_whatever_its_expiry() {
+        // The operator removed the entire futures subscription on 2026-09-18
+        // (equity underlying spots and options only). This test replaces the
+        // two that used to prove futures WERE selected at every live expiry —
+        // it is the same fixture, asserting the opposite, so a revival of the
+        // selection path fails here rather than shipping silently.
         let rows = vec![
             contract(
                 1,
                 InstrumentClass::IndexFuture,
                 "NSE",
                 "NIFTY",
-                2026_08_28,
+                TODAY,
                 0,
                 OptionLeg::None,
             ),
@@ -2325,48 +2303,27 @@ mod tests {
             ),
             contract(
                 3,
-                InstrumentClass::IndexFuture,
+                InstrumentClass::StockFuture,
                 "NSE",
-                "NIFTY",
+                "RELIANCE",
                 2026_10_29,
-                0,
-                OptionLeg::None,
-            ),
-            // Yesterday's contract must NOT be subscribed: it is not tradeable
-            // and its absence of ticks would read as a silent instrument.
-            contract(
-                4,
-                InstrumentClass::IndexFuture,
-                "NSE",
-                "NIFTY",
-                2026_08_18,
                 0,
                 OptionLeg::None,
             ),
         ];
         let sel = select_contract_universe(&rows, &no_spot(), TODAY, 25_000);
-        assert_eq!(
-            sel.index_futures, 3,
-            "all three live expiries, never rolled"
+        assert!(
+            sel.instruments.is_empty(),
+            "futures are out of scope — got {:?}",
+            sel.instruments
         );
-        assert!(!sel.instruments.iter().any(|i| i.security_id == 4));
-    }
-
-    #[test]
-    fn todays_expiry_is_still_subscribed_on_expiry_day() {
-        // Index futures NEVER roll: the expiring contract streams through its
-        // final session and falls out of tomorrow's build by itself.
-        let rows = vec![contract(
-            1,
-            InstrumentClass::IndexFuture,
-            "NSE",
-            "NIFTY",
-            TODAY,
-            0,
-            OptionLeg::None,
-        )];
-        let sel = select_contract_universe(&rows, &no_spot(), TODAY, 25_000);
-        assert_eq!(sel.index_futures, 1, ">= today, not > today");
+        // And refused SILENTLY rather than counted as a capacity drop: a
+        // future is not a contract we wanted and could not fit, it is a class
+        // we no longer subscribe. Counting it would make every healthy day
+        // report ~680 drops.
+        assert_eq!(sel.dropped_for_capacity, 0);
+        assert_eq!(sel.refused_no_expiry, 0);
+        assert_eq!(sel.refused_no_strike, 0);
     }
 
     #[test]
@@ -2763,40 +2720,48 @@ mod tests {
             "both underlyings selected symmetrically"
         );
     }
-
     #[test]
-    fn futures_and_index_chains_outrank_stock_options_under_pressure() {
-        let mut rows = vec![
-            contract(
-                1,
-                InstrumentClass::IndexFuture,
+    fn index_chains_outrank_stock_options_under_pressure() {
+        // Futures used to head this priority order and are gone (2026-09-18).
+        // The ordering that remains is index chains before stock options, and
+        // it is what this fixture now proves: with room for two, the NIFTY
+        // chain takes both slots and the RELIANCE ladder gets nothing.
+        //
+        // Four index legs, not two: `MIN_LEGS_FOR_A_REAL_EXPIRY` would skip a
+        // two-leg chain as a stub, and the test would then pass its
+        // `stock_options == 0` assertion for the wrong reason entirely.
+        let mut rows = Vec::new();
+        for (i, strike) in [24_000i64, 24_100].into_iter().enumerate() {
+            let base = 1 + (i as u64) * 2;
+            rows.push(contract(
+                base,
+                InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
                 2026_08_28,
-                0,
-                OptionLeg::None,
-            ),
-            contract(
-                2,
-                InstrumentClass::StockFuture,
+                strike,
+                OptionLeg::Call,
+            ));
+            rows.push(contract(
+                base + 1,
+                InstrumentClass::IndexOption,
                 "NSE",
-                "RELIANCE",
+                "NIFTY",
                 2026_08_28,
-                0,
-                OptionLeg::None,
-            ),
-        ];
+                strike,
+                OptionLeg::Put,
+            ));
+        }
         rows.extend(stock_ladder("RELIANCE"));
-        // Only 2 slots: the two futures must win, stock options get nothing.
         let sel = select_contract_universe(&rows, &spot("RELIANCE", 1000), TODAY, 2);
-        assert_eq!(sel.index_futures, 1);
-        assert_eq!(sel.stock_futures, 1);
+        assert_eq!(sel.index_options, 2, "the chain takes both slots");
         assert_eq!(sel.stock_options, 0);
         assert_eq!(sel.instruments.len(), 2);
-        // The 102 stock options the operator asked for and did not get are
-        // COUNTED. A selection that silently returns futures only is
-        // indistinguishable from one where the master had no options.
-        assert_eq!(sel.dropped_for_capacity, 102);
+        // Everything asked for and not given is COUNTED — the two index legs
+        // past the envelope AND the whole stock ladder. A selection that
+        // silently returns two rows is indistinguishable from one where the
+        // master offered nothing else.
+        assert_eq!(sel.dropped_for_capacity, 2 + 102);
         assert_eq!(sel.atm_window_used, 0, "no window was usable");
         assert_eq!(
             sel.atm_window_reason, "no_room",
@@ -2805,40 +2770,25 @@ mod tests {
     }
 
     #[test]
-    fn an_envelope_smaller_than_the_futures_alone_drops_and_reports() {
-        let rows = vec![
-            contract(
-                1,
-                InstrumentClass::IndexFuture,
-                "NSE",
-                "NIFTY",
-                2026_08_28,
-                0,
-                OptionLeg::None,
-            ),
-            contract(
-                2,
-                InstrumentClass::IndexFuture,
-                "NSE",
-                "NIFTY",
-                2026_09_24,
-                0,
-                OptionLeg::None,
-            ),
-            contract(
-                3,
-                InstrumentClass::IndexFuture,
-                "NSE",
-                "NIFTY",
-                2026_10_29,
-                0,
-                OptionLeg::None,
-            ),
-        ];
+    fn an_envelope_smaller_than_the_index_chain_drops_and_reports() {
+        let mut rows = Vec::new();
+        for (i, strike) in [24_000, 24_100, 24_200].into_iter().enumerate() {
+            for (j, leg) in [OptionLeg::Call, OptionLeg::Put].into_iter().enumerate() {
+                rows.push(contract(
+                    (i * 2 + j + 1) as u64,
+                    InstrumentClass::IndexOption,
+                    "NSE",
+                    "NIFTY",
+                    2026_08_28,
+                    strike,
+                    leg,
+                ));
+            }
+        }
         let sel = select_contract_universe(&rows, &no_spot(), TODAY, 2);
         assert_eq!(sel.instruments.len(), 2);
         assert_eq!(
-            sel.dropped_for_capacity, 1,
+            sel.dropped_for_capacity, 4,
             "a truncation that is not counted is indistinguishable from a complete set"
         );
     }
@@ -3221,7 +3171,7 @@ mod tests {
     fn an_unmappable_exchange_is_counted_not_silently_skipped() {
         let rows = vec![contract(
             1,
-            InstrumentClass::IndexFuture,
+            InstrumentClass::IndexOption,
             "MCX",
             "GOLD",
             2026_08_28,
@@ -3235,28 +3185,54 @@ mod tests {
 
     #[test]
     fn the_same_composite_key_twice_is_deduped_per_i_p1_11() {
+        // Four legs, not two: `MIN_LEGS_FOR_A_REAL_EXPIRY` skips a shorter
+        // chain as a stub, so a two-row fixture would prove the stub rule
+        // rather than the dedup rule. Two strikes x two legs is the smallest
+        // chain the selector will actually take.
+        //
+        // The duplicate is the 24_100 PUT carrying the 24_000 CALL's id. Per
+        // I-P1-11 `push_contract` keys on `(security_id, segment)`, so the
+        // second arrival is a duplicate however its strike or leg differ.
         let rows = vec![
             contract(
                 7,
-                InstrumentClass::IndexFuture,
+                InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
                 2026_08_28,
-                0,
-                OptionLeg::None,
+                24_000,
+                OptionLeg::Call,
+            ),
+            contract(
+                8,
+                InstrumentClass::IndexOption,
+                "NSE",
+                "NIFTY",
+                2026_08_28,
+                24_000,
+                OptionLeg::Put,
+            ),
+            contract(
+                9,
+                InstrumentClass::IndexOption,
+                "NSE",
+                "NIFTY",
+                2026_08_28,
+                24_100,
+                OptionLeg::Call,
             ),
             contract(
                 7,
-                InstrumentClass::IndexFuture,
+                InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
-                2026_09_24,
-                0,
-                OptionLeg::None,
+                2026_08_28,
+                24_100,
+                OptionLeg::Put,
             ),
         ];
         let sel = select_contract_universe(&rows, &no_spot(), TODAY, 25_000);
-        assert_eq!(sel.instruments.len(), 1);
+        assert_eq!(sel.instruments.len(), 3, "the repeated id lands once");
         assert_eq!(sel.deduped, 1);
     }
 
@@ -3281,32 +3257,48 @@ mod tests {
     /// the same pair twice is deduped.
     #[test]
     fn a_bse_row_sharing_an_nse_id_is_refused_and_counted_not_deduped() {
-        let rows = vec![
-            contract(
-                7,
-                InstrumentClass::IndexFuture,
+        // A real four-leg NSE chain, because `MIN_LEGS_FOR_A_REAL_EXPIRY`
+        // skips a shorter one as a stub and the NSE side must actually be
+        // SELECTED for "only the NSE row survives" to mean anything.
+        let mut rows = Vec::new();
+        for (i, strike) in [24_000i64, 24_100].into_iter().enumerate() {
+            let base = 7 + (i as u64) * 2;
+            rows.push(contract(
+                base,
+                InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
                 2026_08_28,
-                0,
-                OptionLeg::None,
-            ),
-            contract(
-                7,
-                InstrumentClass::IndexFuture,
-                "BSE",
-                "SENSEX",
+                strike,
+                OptionLeg::Call,
+            ));
+            rows.push(contract(
+                base + 1,
+                InstrumentClass::IndexOption,
+                "NSE",
+                "NIFTY",
                 2026_08_28,
-                0,
-                OptionLeg::None,
-            ),
-        ];
+                strike,
+                OptionLeg::Put,
+            ));
+        }
+        // The BSE row carries id 7 — the same id as the first NSE leg.
+        rows.push(contract(
+            7,
+            InstrumentClass::IndexOption,
+            "BSE",
+            "SENSEX",
+            2026_08_28,
+            80_000,
+            OptionLeg::Call,
+        ));
         let sel = select_contract_universe(&rows, &no_spot(), TODAY, 25_000);
-        assert_eq!(sel.instruments.len(), 1, "only the NSE row survives");
-        assert_eq!(
-            sel.instruments[0].segment,
-            ExchangeSegment::NseFno,
-            "and it is the NSE one, not the BSE one"
+        assert_eq!(sel.instruments.len(), 4, "only the NSE chain survives");
+        assert!(
+            sel.instruments
+                .iter()
+                .all(|i| i.segment == ExchangeSegment::NseFno),
+            "and every survivor is NSE, never the BSE one"
         );
         assert_eq!(
             sel.refused_unknown_segment, 1,
@@ -3321,7 +3313,7 @@ mod tests {
         let rows = vec![
             contract(
                 1,
-                InstrumentClass::IndexFuture,
+                InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
                 0,
@@ -3648,7 +3640,7 @@ mod tests {
         let rows = vec![
             contract(
                 1,
-                InstrumentClass::IndexFuture,
+                InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
                 2026_08_18,
@@ -3657,7 +3649,7 @@ mod tests {
             ),
             contract(
                 2,
-                InstrumentClass::StockFuture,
+                InstrumentClass::StockOption,
                 "NSE",
                 "RELIANCE",
                 2026_08_01,
@@ -3675,7 +3667,7 @@ mod tests {
     fn a_missing_underlying_is_filed_under_its_own_counter() {
         let rows = vec![contract(
             1,
-            InstrumentClass::IndexFuture,
+            InstrumentClass::IndexOption,
             "NSE",
             "",
             2026_08_28,
@@ -3861,7 +3853,8 @@ mod tests {
                     next += 1;
                 }
             }
-            // and one future per stock
+            // and one future per stock, which the master really carries and
+            // the selection must now ignore entirely (2026-09-18).
             rows.push(contract(
                 next,
                 InstrumentClass::StockFuture,
@@ -3874,15 +3867,14 @@ mod tests {
             next += 1;
         }
         let sel = select_contract_universe(&rows, &prices, TODAY, 25_000);
-        assert_eq!(sel.stock_futures, 220);
+        assert_eq!(
+            sel.instruments.len(),
+            220 * 102,
+            "options only — the 220 futures in the fixture reach nothing"
+        );
         assert_eq!(sel.stock_options, 220 * 102);
         assert_eq!(sel.atm_window_used, 25, "no shrink needed at this scale");
         assert_eq!(sel.dropped_for_capacity, 0);
-        assert!(
-            sel.instruments.len() > 22_000,
-            "got {} — the authorized set is ~24,600",
-            sel.instruments.len()
-        );
         assert!(sel.instruments.len() <= 25_000, "never over the envelope");
     }
 }

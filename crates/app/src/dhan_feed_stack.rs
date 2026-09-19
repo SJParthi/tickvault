@@ -10897,7 +10897,6 @@ async fn attach_depth_when_available(
                             contracts = contracts.instruments.len(),
                             stock_options = contracts.stock_options,
                             index_options = contracts.index_options,
-                            futures = contracts.index_futures + contracts.stock_futures,
                             atm_window = contracts.atm_window_used,
                             depth_done,
                             "late-attach dialed the CONTRACT half of the main feed"

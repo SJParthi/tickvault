@@ -62,7 +62,6 @@ use tickvault_core::websocket::pool_supervisor::SubscribeInstrument;
 
 use crate::depth_rebalance::MoverRow;
 use crate::depth200_candidates::NOT_YET_RANKED;
-use crate::dhan_contract_universe::ContractRow;
 use crate::dhan_depth_universe::DepthCandidate;
 
 /// How many STOCK underlyings enter the board.
@@ -71,17 +70,24 @@ use crate::dhan_depth_universe::DepthCandidate;
 /// It was 7 until the index window widened to ±11.
 ///
 /// **Six is FORCED, not chosen.** Two independent pieces of arithmetic land on
-/// it: the budget (`2 × 47 + 7 × 24 = 262` against 250), and the fact that the
-/// freed index slots can buy neither a wider stock ladder (`2 × 47 + 6 × 28 =
-/// 262`) nor a seventh name. Spot is the only thing that fits the room ±11
-/// creates.
+/// it: the budget (`2 × 46 + 7 × 23 = 253` against 250), and the fact that the
+/// freed index slots can buy neither a wider stock ladder (`2 × 46 + 6 × 27 =
+/// 254`) nor a seventh name.
+///
+/// ⚠ CORRECTED 2026-09-19 — the figures were `2 × 47 + 7 × 24 = 262` and
+/// `2 × 47 + 6 × 28 = 262`, both written with the FUTURE leg and stale from
+/// the moment it was removed (2026-09-18). The VERDICT is re-derived and
+/// unchanged: 253 and 254 both still breach 250, so six is still forced. The
+/// closing sentence went with them — *"Spot is the only thing that fits the
+/// room ±11 creates"* was true when a future took a slot; the board now has
+/// 20 spare.
 pub const DEPTH20_NAME_ENTRY_RANK: usize = 6;
 
 /// How far a held name may slip before it loses its slots.
 ///
 /// A held name is KEPT while its rank is `<= DEPTH20_NAME_EXIT_RANK`, so it
 /// must fall out of the top 12 (~6% of the ~208 live F&O underlyings) before
-/// its 24 contracts are given away.
+/// its 23 contracts are given away.
 ///
 /// **This band is the remedy the 2026-09-07 lock prescribes in advance**, not
 /// an invention: *"If the swap budget is hit routinely, the answer is a longer
@@ -104,9 +110,10 @@ pub const DEPTH20_NAME_EXIT_RANK: usize = 12;
 ///
 /// **This is an arithmetic CEILING, not a preference.** The board is
 /// `2 × slots_for_index_name(11) + 6 × slots_for_stock_name(N)` against a hard
-/// 250. At `N = 5` that is 238; at `N = 6` it is 262, and `plan_pool` refuses
+/// 250. At `N = 5` that is 230; at `N = 6` it is 254, and `plan_pool` refuses
 /// the WHOLE pool fail-closed rather than truncating — a session-ending
-/// failure, not a degraded one.
+/// failure, not a degraded one. (238 / 262 until the future leg was removed
+/// on 2026-09-18; the verdict is unchanged — ±6 still breaches.)
 pub const DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE: usize = 5;
 
 /// Strikes each side of at-the-money for NIFTY and BANKNIFTY.
@@ -115,10 +122,17 @@ pub const DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE: usize = 5;
 /// ahead with plus or minus 11"* (2026-09-11 FOURTH). It was 10, quoted from
 /// the THIRD authorization, until he spent the wasted index slots.
 ///
-/// **±11 is the SOCKET ceiling.** An index name is
-/// `slots_for_index_name(N)` and one depth-20 connection admits
-/// [`DEPTH20_PER_SOCKET`]: ±11 is 47 of 50, and ±12 is 51 — over on its own,
-/// before the rest of the board is even counted.
+/// **±11 is the operator's authorized value — it is no longer a socket
+/// ceiling.** An index name is `slots_for_index_name(N)` and one depth-20
+/// connection admits [`DEPTH20_PER_SOCKET`].
+///
+/// ⚠ CORRECTED 2026-09-19 — this read *"**±11 is the SOCKET ceiling** … ±11 is
+/// 47 of 50, and ±12 is 51 — over on its own"*. Removing the future leg
+/// (2026-09-18) moved that bound: ±11 is **46** of 50 and ±12 is **exactly
+/// 50**, so ±12 fits a socket and ±13 (54) is the first that does not. The
+/// board at ±12 would be 238 of 250, also inside. Nothing arithmetic forces
+/// ±11 any more — only the 2026-09-11 FOURTH authorization does, and spending
+/// the freed slots needs its own dated row per the scope lock's REJECT list.
 pub const DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE: usize = 11;
 
 /// The depth-20 instrument budget: 5 sockets × 50.
@@ -379,14 +393,17 @@ impl NameBoard {
 /// ceiling below reads against a named number rather than a literal.
 pub const DEPTH20_PER_SOCKET: usize = 50;
 
-/// Slots one INDEX name consumes: its nearest-expiry future, plus both legs of
-/// every strike in its window.
+/// Slots one INDEX name consumes: both legs of every strike in its window.
 ///
-/// `1 + (2N+1) × 2`. Every unique F&O contract is one subscription — a future
-/// costs exactly what an option costs, because the pool dedups on the I-P1-11
-/// composite and instrument class is invisible to the subscribe path.
+/// `(2N+1) × 2`. Every unique option contract is one subscription.
 ///
-/// **There is no index SPOT term, and there never can be.** An index is
+/// **There is no future term.** The operator removed the entire futures
+/// subscription on 2026-09-18 — *"let us go ahead with one and only equity
+/// underlying spots and only options dude remove the futures subscription
+/// itself"* (`websocket-connection-scope-lock.md`, "2026-09-18 (THIRD)"). The
+/// leading `1` this formula used to carry WAS that future.
+///
+/// **There is no index SPOT term either, and there never can be.** An index is
 /// `IDX_I`, and `subscription_builder::validate_depth_segment` REFUSES every
 /// segment but `NSE_EQ` and `NSE_FNO` — so a NIFTY spot cannot reach a depth
 /// socket even if someone asked for it. That refusal is the vendor's own
@@ -394,22 +411,23 @@ pub const DEPTH20_PER_SOCKET: usize = 50;
 /// preference.
 #[must_use]
 pub const fn slots_for_index_name(strikes_each_side: usize) -> usize {
-    1 + (2 * strikes_each_side + 1) * 2
+    (2 * strikes_each_side + 1) * 2
 }
 
-/// Slots one STOCK name consumes: its `NSE_EQ` SPOT, its nearest-expiry
-/// future, plus both legs of every strike in its window.
+/// Slots one STOCK name consumes: its `NSE_EQ` SPOT, plus both legs of every
+/// strike in its window.
 ///
 /// The spot term is the 2026-09-11 (FOURTH) grant — *"in that top 6 try ot add
 /// its udnerlying spot also"*. It is admissible where an index spot is not
 /// because a cash equity is `NSE_EQ`, which Dhan documents as supported and
 /// uses as its own subscribe example.
 ///
-/// **Honest value: it buys levels 6–20 and nothing below them.** The main feed
-/// runs Full mode and `append_inline_depth` already persists 5 levels of every
-/// equity book, so levels 1–5 arrive today at no cost. What makes the trade
-/// worth taking is that the freed slots can buy nothing else: a wider stock
-/// ladder is 262 and a seventh name is 262, both over the 250 budget.
+/// **Honest value: the spot buys levels 6–20 and nothing below them.** The
+/// main feed runs Full mode and `append_inline_depth` already persists 5
+/// levels of every equity book, so levels 1–5 arrive today at no cost.
+///
+/// The leading `1` is the SPOT alone since 2026-09-18 — before that the future
+/// carried one term here and one inside `slots_for_index_name`.
 #[must_use]
 pub const fn slots_for_stock_name(strikes_each_side: usize) -> usize {
     1 + slots_for_index_name(strikes_each_side)
@@ -428,17 +446,23 @@ pub const fn board_slot_cost() -> usize {
 const _: () = assert!(
     board_slot_cost() <= DEPTH20_INSTRUMENT_BUDGET,
     "the depth-20 name board must fit 250 instruments; widen the stock ATM \
-     window and it does not — 238 at ±5, 262 at ±6"
+     window and it does not — 230 at ±5, 254 at ±6"
 );
 
 /// An INDEX name must fit ONE socket, or its ladder is split across two
 /// connections and no single line carries the whole book.
 ///
-/// This is the ceiling that makes ±11 the operator's maximum rather than his
-/// preference: 47 of 50 at ±11, 51 at ±12 — over before the board is counted.
+/// ⚠ CORRECTED 2026-09-19 — this doc and the message below both read *"47 of
+/// 50 at ±11, 51 at ±12 — over before the board is counted"*, and BOTH halves
+/// went stale the moment the future leg was removed (2026-09-18). ±11 is now
+/// **46** and ±12 is **exactly 50**, so ±12 FITS a socket and the first size
+/// that does not is ±13 (54). The ceiling this doc named as forcing ±11 has
+/// moved; ±11 is the operator's authorized value and ONLY that. The ASSERT
+/// itself was never wrong — it derives from the function, which is the whole
+/// reason only the prose rotted.
 const _: () = assert!(
     slots_for_index_name(DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE) <= DEPTH20_PER_SOCKET,
-    "an index name must fit one depth-20 socket: 47 at ±11, 51 at ±12"
+    "an index name must fit one depth-20 socket: 46 at ±11, 50 at ±12, 54 at ±13"
 );
 
 /// The band must be strictly wider than the entry set, or there is no
@@ -508,7 +532,7 @@ pub const DEPTH20_NAME_STOCK_SOCKETS: usize = 3;
 const _: () = assert!(
     DEPTH20_NAME_ENTRY_RANK * slots_for_stock_name(DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE)
         <= DEPTH20_NAME_STOCK_SOCKETS * DEPTH20_PER_SOCKET,
-    "the six stock names must fit three depth-20 sockets: 144 of 150 at ±5"
+    "the six stock names must fit three depth-20 sockets: 138 of 150 at ±5"
 );
 
 /// The board's two index names hold one socket each, so exactly two are
@@ -613,78 +637,6 @@ pub fn name_moves(movers: &[MoverRow]) -> Vec<NameMove> {
                 segment: row.segment,
                 move_bps: move_bps_from_pct(row.pct_change)?,
             })
-        })
-        .collect()
-}
-
-/// Each underlying's nearest non-expired FUTURE, keyed by upper-cased symbol.
-///
-/// The board gives every name one future slot ([`slots_for_index_name`]'s
-/// leading `1 +`). The contract artifact is the only authorized source: the
-/// option chain carries no futures at all, and a hardcoded contract id expires
-/// — the scope lock's standing REJECT.
-///
-/// Nearest expiry wins; the LOWEST id breaks a tie. Ties need a rule for the
-/// same reason every other grouping here has one: the artifact carries no
-/// `ORDER BY`, so last-write-wins would let two minutes of identical input
-/// choose different contracts and swap the socket back and forth all session
-/// while every counter read healthy.
-///
-/// A BSE future is refused by [`derivative_segment`] and an unsupported
-/// segment by [`segment_supports_depth`] — SENSEX can never have a depth book,
-/// so a SENSEX future here would be a socket that dies on connect.
-///
-/// # Complexity
-///
-/// O(1) EXEMPT: O(rows) over the day's contract artifact (~22,000 legs), of
-/// which the class filter keeps the ~1,300 futures. Built ONCE per session by
-/// the caller — the artifact is a daily file and `today_ymd` is fixed for the
-/// session, so a per-minute rebuild would answer the same question 375 times.
-#[must_use]
-pub fn future_index(
-    rows: &[ContractRow],
-    today_ymd: u32,
-) -> std::collections::HashMap<String, SubscribeInstrument> {
-    let mut best: std::collections::HashMap<String, (u32, u64, ExchangeSegment)> =
-        std::collections::HashMap::new();
-    for row in rows {
-        if !matches!(row.c.as_str(), "FUTSTK" | "FUTIDX") {
-            continue;
-        }
-        // `>=` keeps expiry DAY itself, which is a trading day.
-        if row.e < today_ymd || row.i == 0 {
-            continue;
-        }
-        let Some(segment) = crate::dhan_contract_universe::derivative_segment(&row.x) else {
-            continue;
-        };
-        if !crate::dhan_depth_universe::segment_supports_depth(segment) {
-            continue;
-        }
-        let key = row.u.trim().to_ascii_uppercase();
-        if key.is_empty() {
-            continue;
-        }
-        match best.entry(key) {
-            std::collections::hash_map::Entry::Occupied(mut held) => {
-                if (row.e, row.i) < (held.get().0, held.get().1) {
-                    held.insert((row.e, row.i, segment));
-                }
-            }
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert((row.e, row.i, segment));
-            }
-        }
-    }
-    best.into_iter()
-        .map(|(symbol, (_, security_id, segment))| {
-            (
-                symbol,
-                SubscribeInstrument {
-                    security_id,
-                    segment,
-                },
-            )
         })
         .collect()
 }
@@ -921,8 +873,6 @@ pub struct NameBoardPlan {
     pub index_unresolved: Vec<String>,
     /// Preferred names whose option window could not be resolved.
     pub names_unresolved: usize,
-    /// Names — index or stock — with no nearest-expiry future in the artifact.
-    pub futures_missing: usize,
     /// Stock names whose `NSE_EQ` spot slot was refused.
     pub spots_missing: usize,
 }
@@ -1054,7 +1004,6 @@ fn spot_for_bucket(
 pub fn build_name_layout(
     candidates: &[DepthCandidate],
     movers: &[MoverRow],
-    futures: &std::collections::HashMap<String, SubscribeInstrument>,
     held: &std::collections::BTreeSet<(u64, u8)>,
 ) -> NameBoardPlan {
     let mut plan = NameBoardPlan::default();
@@ -1074,10 +1023,6 @@ pub fn build_name_layout(
     // ---- 1. the two index names, whole sockets, unconditional ----
     for underlying in crate::depth20_layout::DEPTH_20_INDEX_UNDERLYINGS {
         let mut instruments: Vec<SubscribeInstrument> = Vec::with_capacity(DEPTH20_PER_SOCKET);
-        match futures.get(underlying) {
-            Some(future) => claim_instrument(&mut instruments, *future, &mut seen),
-            None => plan.futures_missing = plan.futures_missing.saturating_add(1),
-        }
         let bucket = by_underlying.get(underlying).map_or(&[][..], Vec::as_slice);
         let spot = spot_for_bucket(candidates, underlying, bucket);
         // Fail-CLOSED on an underlying we cannot name a contract segment for,
@@ -1164,10 +1109,6 @@ pub fn build_name_layout(
             );
         } else {
             plan.spots_missing = plan.spots_missing.saturating_add(1);
-        }
-        match futures.get(&symbol.trim().to_ascii_uppercase()) {
-            Some(future) => claim_instrument(&mut name_instruments, *future, &mut seen),
-            None => plan.futures_missing = plan.futures_missing.saturating_add(1),
         }
         for instrument in options {
             claim_instrument(&mut name_instruments, instrument, &mut seen);
@@ -1301,15 +1242,12 @@ pub const DEPTH20_NAME_BOARD_CHOSEN_GAUGE: &str = "tv_depth20_name_board_names_c
 /// * `index_unresolved` — NIFTY or BANKNIFTY had no window. This one alone
 ///   makes the plan unsteerable, so a non-zero count explains a minute the
 ///   caller fell back.
-/// * `futures_missing` — a name placed without its future slot. Costs ONE
-///   slot, never the name.
 /// * `spots_missing` — a stock name placed without its `NSE_EQ` spot slot.
-pub const DEPTH20_NAME_BOARD_OUTCOME_LABELS: [&str; 6] = [
+pub const DEPTH20_NAME_BOARD_OUTCOME_LABELS: [&str; 5] = [
     "swaps_planned",
     "swaps_capped",
     "names_unresolved",
     "index_unresolved",
-    "futures_missing",
     "spots_missing",
 ];
 
@@ -1373,8 +1311,6 @@ pub fn record_name_board_plan(plan: &NameBoardPlan, swaps_planned: usize, swaps_
         .increment(plan.names_unresolved as u64);
     metrics::counter!(DEPTH20_NAME_BOARD_COUNTER, "outcome" => "index_unresolved")
         .increment(plan.index_unresolved.len() as u64);
-    metrics::counter!(DEPTH20_NAME_BOARD_COUNTER, "outcome" => "futures_missing")
-        .increment(plan.futures_missing as u64);
     metrics::counter!(DEPTH20_NAME_BOARD_COUNTER, "outcome" => "spots_missing")
         .increment(plan.spots_missing as u64);
 }
@@ -1612,37 +1548,41 @@ mod tests {
     }
 
     #[test]
-    fn the_authorized_shape_is_238_of_250() {
+    fn the_authorized_shape_is_230_of_250() {
         // The operator asked directly: "will it sit under 250 slots". This is
         // the answer, and the const-assert above makes it a build failure
         // rather than a runtime pool refusal.
+        //
+        // 238 until 2026-09-18, when the futures removal took one slot off
+        // every name: eight names, eight slots, 238 -> 230.
         assert_eq!(
             slots_for_index_name(DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE),
-            47
+            46
         );
         assert_eq!(
             slots_for_stock_name(DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE),
-            24
+            23
         );
-        assert_eq!(board_slot_cost(), 238);
+        assert_eq!(board_slot_cost(), 230);
         assert!(board_slot_cost() <= DEPTH20_INSTRUMENT_BUDGET);
     }
 
     #[test]
     fn widening_the_stock_window_by_one_would_breach_the_budget() {
-        // Why ±5 is a CEILING and not a preference. At ±6 the board is 262
-        // against 250, and plan_pool refuses the WHOLE pool fail-closed - a
-        // session with no depth at all, not a narrower one.
+        // Why +/-5 is a CEILING and not a preference, and this bound SURVIVED
+        // the futures removal. At +/-6 the board is 254 against 250 (it was
+        // 262 before 2026-09-18), and plan_pool refuses the WHOLE pool
+        // fail-closed - a session with no depth at all, not a narrower one.
         let at_six = 2 * slots_for_index_name(DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE)
             + DEPTH20_NAME_ENTRY_RANK * slots_for_stock_name(6);
-        assert_eq!(at_six, 262);
+        assert_eq!(at_six, 254);
         assert!(at_six > DEPTH20_INSTRUMENT_BUDGET);
     }
 
     #[test]
     fn moving_one_name_costs_more_swaps_than_a_minute_affords() {
-        // The honest cost, pinned so it cannot be forgotten. 24 contracts leave
-        // and 24 arrive when a name rotates; the pool can move 20 slots a
+        // The honest cost, pinned so it cannot be forgotten. 23 contracts leave
+        // and 23 arrive when a name rotates; the pool can move 20 slots a
         // minute (4 per socket x 5), and ONE socket only 4 - so a rotation
         // confined to one line spans six minutes. That figure is the whole
         // argument for raising the swap budget, recorded in the 2026-09-11
@@ -1705,13 +1645,16 @@ mod tests {
     }
 
     #[test]
-    fn slots_for_name_counts_one_future_and_both_option_legs() {
+    fn slots_for_name_counts_both_option_legs() {
         // A name is not one instrument. Getting this wrong understates the
-        // budget by a factor of twenty-four and the error surfaces only as a
+        // budget by a factor of twenty-three and the error surfaces only as a
         // refused pool on a live morning.
-        assert_eq!(slots_for_index_name(0), 3, "future + one CE + one PE");
-        assert_eq!(slots_for_index_name(5), 1 + 11 * 2);
-        assert_eq!(slots_for_index_name(11), 1 + 23 * 2);
+        //
+        // The future term is gone (2026-09-18): an index name is now its
+        // option legs and nothing else.
+        assert_eq!(slots_for_index_name(0), 2, "one CE + one PE");
+        assert_eq!(slots_for_index_name(5), 11 * 2);
+        assert_eq!(slots_for_index_name(11), 23 * 2);
     }
 
     #[test]
@@ -1730,24 +1673,46 @@ mod tests {
     }
 
     #[test]
-    fn an_index_window_of_twelve_would_not_fit_one_socket() {
-        // Why +/-11 is the operator's ceiling rather than his preference. This
-        // is a SOCKET bound, independent of the 250 budget: at +/-12 one index
-        // name needs 51 of a connection's 50, so its ladder would split across
-        // two lines and neither would carry the whole book.
-        assert_eq!(slots_for_index_name(11), 47);
-        assert_eq!(slots_for_index_name(12), 51);
-        assert!(slots_for_index_name(12) > DEPTH20_PER_SOCKET);
+    fn the_socket_bound_on_an_index_window_is_now_thirteen_not_twelve() {
+        // ⚠ This test used to read `an_index_window_of_twelve_would_not_fit_
+        // one_socket` and justified +/-11 as a SOCKET bound: with the future
+        // term, +/-12 needed 51 of a connection's 50.
+        //
+        // Removing the future (2026-09-18) moved that bound. +/-12 is now
+        // exactly 50 — it FITS a socket — and at the board level 2*50 + 6*23
+        // = 238, inside the 250 budget. So nothing mechanical forces +/-11 any
+        // more; it is the operator's authorized value and only that.
+        //
+        // Recorded rather than quietly re-pointed at 13, because the freed
+        // slots are exactly what `websocket-connection-scope-lock.md`
+        // ("2026-09-18 (THIRD)") refuses to spend without its own dated row:
+        // "Spends the freed 8 slots (index +/-12/+/-13, a 7th name, a wider
+        // stock ladder) under cover of this quote". A reader who found this
+        // test asserting a socket bound at 12 would conclude the arithmetic
+        // still forbids +/-12. It does not — the rule file does.
+        assert_eq!(slots_for_index_name(11), 46);
+        assert_eq!(slots_for_index_name(12), 50);
+        assert_eq!(
+            slots_for_index_name(12),
+            DEPTH20_PER_SOCKET,
+            "+/-12 now fills a socket exactly — the bound is no longer here"
+        );
+        assert_eq!(slots_for_index_name(13), 54);
+        assert!(
+            slots_for_index_name(13) > DEPTH20_PER_SOCKET,
+            "+/-13 is where a ladder would split across two lines"
+        );
     }
 
     #[test]
     fn a_seventh_name_would_breach_the_budget() {
-        // Why SIX is forced. The board carried seven names at index +/-10; at
-        // +/-11 with the spot term a seventh is 262 against 250, and plan_pool
-        // refuses the WHOLE pool fail-closed. Six is arithmetic, not taste.
+        // Why SIX is forced, and this bound SURVIVED the futures removal. At
+        // +/-11 with the spot term a seventh name is 253 against 250 (it was
+        // 262 before 2026-09-18), and plan_pool refuses the WHOLE pool
+        // fail-closed. Six is arithmetic, not taste.
         let at_seven = 2 * slots_for_index_name(DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE)
             + 7 * slots_for_stock_name(DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE);
-        assert_eq!(at_seven, 262);
+        assert_eq!(at_seven, 253);
         assert!(at_seven > DEPTH20_INSTRUMENT_BUDGET);
     }
 
@@ -1768,7 +1733,6 @@ mod tests {
     // until this change — the skeleton-PR shape Rule 14 forbids.
     // ---------------------------------------------------------------------
 
-    use crate::dhan_contract_universe::ContractRow;
     use crate::dhan_depth_universe::DepthCandidate;
 
     const FNO: ExchangeSegment = ExchangeSegment::NseFno;
@@ -1779,19 +1743,6 @@ mod tests {
             segment: EQ,
             symbol: symbol.to_owned(),
             pct_change: pct,
-        }
-    }
-
-    fn future_row(underlying: &str, expiry: u32, id: u64, class: &str, exch: &str) -> ContractRow {
-        ContractRow {
-            i: id,
-            x: exch.to_owned(),
-            c: class.to_owned(),
-            e: expiry,
-            s: 0,
-            l: String::new(),
-            u: underlying.to_owned(),
-            z: 1,
         }
     }
 
@@ -1869,46 +1820,6 @@ mod tests {
             "a NaN move, an ex-split move and a zero id must be dropped, never carried at 0"
         );
         assert_eq!(moves[0].move_bps, 200);
-    }
-
-    // ---- future_index ----
-
-    #[test]
-    fn future_index_keeps_the_nearest_non_expired_future_per_underlying() {
-        let rows = vec![
-            future_row("NIFTY", 20_260_925, 101, "FUTIDX", "NSE"),
-            future_row("NIFTY", 20_261_030, 102, "FUTIDX", "NSE"),
-            // Already expired — must never be subscribed.
-            future_row("NIFTY", 20_260_828, 103, "FUTIDX", "NSE"),
-            future_row("RELIANCE", 20_260_925, 201, "FUTSTK", "NSE"),
-            // Not a future at all.
-            future_row("RELIANCE", 20_260_925, 202, "OPTSTK", "NSE"),
-        ];
-        let index = future_index(&rows, 20_260_913);
-        assert_eq!(index.len(), 2);
-        assert_eq!(index["NIFTY"].security_id, 101);
-        assert_eq!(index["NIFTY"].segment, FNO);
-        assert_eq!(index["RELIANCE"].security_id, 201);
-    }
-
-    #[test]
-    fn future_index_refuses_a_segment_the_vendor_serves_no_depth_for() {
-        // SENSEX futures are BSE_FNO and Dhan serves depth on NSE only, so a
-        // SENSEX future here would be a socket that dies on connect.
-        let rows = vec![future_row("SENSEX", 20_260_925, 301, "FUTIDX", "BSE")];
-        assert!(future_index(&rows, 20_260_913).is_empty());
-    }
-
-    #[test]
-    fn future_index_breaks_a_same_expiry_tie_on_the_lowest_id() {
-        // The artifact carries no ORDER BY, so last-write-wins would let two
-        // identical inputs choose different contracts and swap the socket back
-        // and forth all session.
-        let rows = vec![
-            future_row("AAA", 20_260_925, 900, "FUTSTK", "NSE"),
-            future_row("AAA", 20_260_925, 800, "FUTSTK", "NSE"),
-        ];
-        assert_eq!(future_index(&rows, 20_260_913)["AAA"].security_id, 800);
     }
 
     // ---- choose_names: THE hysteresis, applied to the CHOICE ----
@@ -2042,14 +1953,12 @@ mod tests {
     // ---- build_name_layout ----
 
     /// Two index chains, six stock chains, and the movers that rank them.
-    fn board_fixture() -> (Vec<DepthCandidate>, Vec<MoverRow>, Vec<ContractRow>) {
+    fn board_fixture() -> (Vec<DepthCandidate>, Vec<MoverRow>) {
         let mut candidates = chain("NIFTY", 24_000.0, 50.0, 40, 100_000);
         candidates.extend(chain("BANKNIFTY", 52_000.0, 100.0, 40, 200_000));
         let mut movers = Vec::new();
-        let mut futures = vec![
-            future_row("NIFTY", 20_260_925, 1_001, "FUTIDX", "NSE"),
-            future_row("BANKNIFTY", 20_260_925, 1_002, "FUTIDX", "NSE"),
-        ];
+        // No futures fixture: the operator removed the futures subscription
+        // on 2026-09-18, so the board places option and spot slots only.
         for k in 0..8u64 {
             let symbol = format!("STK{k}");
             #[expect(clippy::cast_precision_loss, reason = "k is 0..8")]
@@ -2062,21 +1971,14 @@ mod tests {
                 300_000 + i64::try_from(k).unwrap_or(0) * 1_000,
             ));
             movers.push(mover(700 + k, &symbol, pct));
-            futures.push(future_row(&symbol, 20_260_925, 2_000 + k, "FUTSTK", "NSE"));
         }
-        (candidates, movers, futures)
+        (candidates, movers)
     }
 
     #[test]
     fn build_name_layout_emits_the_whole_pool_and_fits_the_budget() {
-        let (candidates, movers, future_rows) = board_fixture();
-        let futures = future_index(&future_rows, 20_260_913);
-        let plan = build_name_layout(
-            &candidates,
-            &movers,
-            &futures,
-            &std::collections::BTreeSet::new(),
-        );
+        let (candidates, movers) = board_fixture();
+        let plan = build_name_layout(&candidates, &movers, &std::collections::BTreeSet::new());
         assert!(plan.is_steerable());
         assert_eq!(
             plan.layout.sockets.len(),
@@ -2097,18 +1999,12 @@ mod tests {
 
     #[test]
     fn build_name_layout_gives_each_index_name_its_own_socket_and_never_ranks_it() {
-        let (candidates, mut movers, future_rows) = board_fixture();
+        let (candidates, mut movers) = board_fixture();
         // A stock moving 90% cannot displace NIFTY or BANKNIFTY. (It is
         // refused by the plausibility band too, which is the point: neither
         // route reaches the index sockets.)
         movers.push(mover(999, "HUGE", 90.0));
-        let futures = future_index(&future_rows, 20_260_913);
-        let plan = build_name_layout(
-            &candidates,
-            &movers,
-            &futures,
-            &std::collections::BTreeSet::new(),
-        );
+        let plan = build_name_layout(&candidates, &movers, &std::collections::BTreeSet::new());
         assert_eq!(
             plan.layout.sockets[0].underlying.as_deref(),
             Some("NIFTY"),
@@ -2126,21 +2022,23 @@ mod tests {
             plan.layout.sockets[1].instruments.len(),
             slots_for_index_name(DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE)
         );
-        // The index FUTURE is on the socket, and it leads it.
-        assert_eq!(plan.layout.sockets[0].instruments[0].security_id, 1_001);
+        // No future leads the socket since 2026-09-18 — an index socket is
+        // its option legs and nothing else, so the first instrument is a
+        // ladder leg and the count is the pure option arithmetic above.
+        assert!(
+            plan.layout.sockets[0]
+                .instruments
+                .iter()
+                .all(|i| i.security_id != 1_001),
+            "the fixture's NIFTY future id must reach no socket"
+        );
         assert!(plan.chosen.iter().all(|c| c.underlying_id != 999));
     }
 
     #[test]
-    fn build_name_layout_carries_each_stock_name_spot_future_and_ladder() {
-        let (candidates, movers, future_rows) = board_fixture();
-        let futures = future_index(&future_rows, 20_260_913);
-        let plan = build_name_layout(
-            &candidates,
-            &movers,
-            &futures,
-            &std::collections::BTreeSet::new(),
-        );
+    fn build_name_layout_carries_each_stock_name_spot_and_ladder() {
+        let (candidates, movers) = board_fixture();
+        let plan = build_name_layout(&candidates, &movers, &std::collections::BTreeSet::new());
         let stock: Vec<_> = plan.layout.sockets[2..]
             .iter()
             .flat_map(|s| s.instruments.iter().copied())
@@ -2156,27 +2054,19 @@ mod tests {
                 .any(|i| i.security_id == 700 && i.segment == EQ),
             "a stock name must carry its own spot"
         );
-        // and its nearest-expiry future.
+        // and NO future: the operator removed the futures subscription on
+        // 2026-09-18, so a future id must never reach a depth socket.
         assert!(
-            stock
-                .iter()
-                .any(|i| i.security_id == 2_000 && i.segment == FNO),
-            "a stock name must carry its nearest-expiry future"
+            !stock.iter().any(|i| i.security_id == 2_000),
+            "no future slot survives the 2026-09-18 removal"
         );
-        assert_eq!(plan.futures_missing, 0);
         assert_eq!(plan.spots_missing, 0);
     }
 
     #[test]
     fn build_name_layout_never_subscribes_one_instrument_twice() {
-        let (candidates, movers, future_rows) = board_fixture();
-        let futures = future_index(&future_rows, 20_260_913);
-        let plan = build_name_layout(
-            &candidates,
-            &movers,
-            &futures,
-            &std::collections::BTreeSet::new(),
-        );
+        let (candidates, movers) = board_fixture();
+        let plan = build_name_layout(&candidates, &movers, &std::collections::BTreeSet::new());
         let mut seen = std::collections::HashSet::new();
         for socket in &plan.layout.sockets {
             for instrument in &socket.instruments {
@@ -2191,15 +2081,14 @@ mod tests {
 
     #[test]
     fn build_name_layout_applies_the_band_when_choosing_the_names() {
-        let (candidates, movers, future_rows) = board_fixture();
-        let futures = future_index(&future_rows, 20_260_913);
+        let (candidates, movers) = board_fixture();
         // Held: the two WEAKEST movers, ranked 7th and 8th - inside the band
         // (12), outside the entry set (6).
         let held: std::collections::BTreeSet<(u64, u8)> =
             [(706_u64, EQ.binary_code()), (707_u64, EQ.binary_code())]
                 .into_iter()
                 .collect();
-        let plan = build_name_layout(&candidates, &movers, &futures, &held);
+        let plan = build_name_layout(&candidates, &movers, &held);
         let chosen: Vec<u64> = plan.chosen.iter().map(|c| c.underlying_id).collect();
         assert!(
             chosen.contains(&706) && chosen.contains(&707),
@@ -2233,17 +2122,11 @@ mod tests {
     /// there the fallback is an entry-set name, which is allowed to be placed.
     #[test]
     fn an_unresolvable_entry_name_leaves_its_slots_empty_rather_than_promoting_a_band_name() {
-        let (mut candidates, movers, future_rows) = board_fixture();
+        let (mut candidates, movers) = board_fixture();
         // The top mover's chain vanishes - routine when the artifact and the
         // candle frames disagree about which stocks exist.
         candidates.retain(|c| c.underlying != "STK0");
-        let futures = future_index(&future_rows, 20_260_913);
-        let plan = build_name_layout(
-            &candidates,
-            &movers,
-            &futures,
-            &std::collections::BTreeSet::new(),
-        );
+        let plan = build_name_layout(&candidates, &movers, &std::collections::BTreeSet::new());
         assert_eq!(plan.names_unresolved, 1);
         assert_eq!(
             plan.chosen.len(),
@@ -2262,14 +2145,8 @@ mod tests {
         // The 09:00-09:07 case: ~750 equities have not printed at all, so the
         // movers query returns nothing. The board must decline rather than
         // displace the seed hold with an index-only layout.
-        let (candidates, _, future_rows) = board_fixture();
-        let futures = future_index(&future_rows, 20_260_913);
-        let plan = build_name_layout(
-            &candidates,
-            &[],
-            &futures,
-            &std::collections::BTreeSet::new(),
-        );
+        let (candidates, _) = board_fixture();
+        let plan = build_name_layout(&candidates, &[], &std::collections::BTreeSet::new());
         assert!(plan.chosen.is_empty());
         assert!(
             !plan.is_steerable(),
@@ -2280,15 +2157,9 @@ mod tests {
 
     #[test]
     fn a_missing_index_chain_is_named_and_makes_the_plan_unsteerable() {
-        let (mut candidates, movers, future_rows) = board_fixture();
+        let (mut candidates, movers) = board_fixture();
         candidates.retain(|c| c.underlying != "BANKNIFTY");
-        let futures = future_index(&future_rows, 20_260_913);
-        let plan = build_name_layout(
-            &candidates,
-            &movers,
-            &futures,
-            &std::collections::BTreeSet::new(),
-        );
+        let plan = build_name_layout(&candidates, &movers, &std::collections::BTreeSet::new());
         assert_eq!(plan.index_unresolved, vec!["BANKNIFTY".to_owned()]);
         assert!(
             !plan.is_steerable(),
@@ -2305,26 +2176,15 @@ mod tests {
             Some("BANKNIFTY")
         );
     }
-
     #[test]
-    fn a_missing_future_costs_one_slot_and_never_the_whole_name() {
-        let (candidates, movers, _) = board_fixture();
-        let plan = build_name_layout(
-            &candidates,
-            &movers,
-            &std::collections::HashMap::new(),
-            &std::collections::BTreeSet::new(),
-        );
-        assert!(
-            plan.is_steerable(),
-            "a name without a future is still a name"
-        );
-        // Two index names plus six stock names, each one future short.
-        assert_eq!(plan.futures_missing, 2 + DEPTH20_NAME_ENTRY_RANK);
-        assert_eq!(
-            plan.layout.instrument_count(),
-            board_slot_cost() - (2 + DEPTH20_NAME_ENTRY_RANK)
-        );
+    fn no_name_carries_a_future_slot() {
+        // Replaces `a_missing_future_costs_one_slot_and_never_the_whole_name`:
+        // there is no future slot to miss since 2026-09-18, so the assertion
+        // that used to prove the degrade now proves the absence.
+        let (candidates, movers) = board_fixture();
+        let plan = build_name_layout(&candidates, &movers, &std::collections::BTreeSet::new());
+        assert!(plan.is_steerable());
+        assert_eq!(plan.layout.instrument_count(), board_slot_cost());
     }
 
     // ---- NameBoardPlan::is_steerable / chosen_keys ----
@@ -2340,15 +2200,9 @@ mod tests {
         // Steering on it would be actively harmful: the plan is the legacy
         // index layout at a different width, so it would displace the
         // validated seed hold and the volume ranking and give back nothing.
-        let (mut candidates, movers, future_rows) = board_fixture();
+        let (mut candidates, movers) = board_fixture();
         candidates.retain(|c| !c.underlying.starts_with("STK"));
-        let futures = future_index(&future_rows, 20_260_913);
-        let plan = build_name_layout(
-            &candidates,
-            &movers,
-            &futures,
-            &std::collections::BTreeSet::new(),
-        );
+        let plan = build_name_layout(&candidates, &movers, &std::collections::BTreeSet::new());
 
         assert!(
             plan.index_unresolved.is_empty(),
@@ -2366,14 +2220,8 @@ mod tests {
 
         // And the converse, on the same fixture with the stocks restored -
         // otherwise this test would pass against a function hardcoded to false.
-        let (candidates, movers, future_rows) = board_fixture();
-        let futures = future_index(&future_rows, 20_260_913);
-        let full = build_name_layout(
-            &candidates,
-            &movers,
-            &futures,
-            &std::collections::BTreeSet::new(),
-        );
+        let (candidates, movers) = board_fixture();
+        let full = build_name_layout(&candidates, &movers, &std::collections::BTreeSet::new());
         assert!(full.is_steerable(), "the full board steers");
     }
 
@@ -2518,15 +2366,7 @@ mod tests {
         let empty = NameBoardPlan::default();
         assert!(empty.chosen.is_empty());
         assert!(empty.index_unresolved.is_empty());
-        assert_eq!(
-            (
-                empty.names_unresolved,
-                empty.futures_missing,
-                empty.spots_missing
-            ),
-            (0, 0, 0)
-        );
-        assert!(!empty.is_steerable(), "and it is the unsteerable shape");
+        assert_eq!((empty.names_unresolved, empty.spots_missing), (0, 0));
     }
 
     /// The recorder on a REAL plan, with an anti-vacuity gate.
@@ -2539,14 +2379,8 @@ mod tests {
     #[test]
     fn record_name_board_plan_covers_a_plan_that_actually_placed_names() {
         pre_register_name_board_counters();
-        let (candidates, movers, future_rows) = board_fixture();
-        let futures = future_index(&future_rows, 20_260_913);
-        let plan = build_name_layout(
-            &candidates,
-            &movers,
-            &futures,
-            &std::collections::BTreeSet::new(),
-        );
+        let (candidates, movers) = board_fixture();
+        let plan = build_name_layout(&candidates, &movers, &std::collections::BTreeSet::new());
         assert!(
             plan.is_steerable(),
             "the fixture must produce a steerable board, or this measures nothing"
