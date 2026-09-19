@@ -1733,38 +1733,22 @@ impl LiveIngest {
                             window_open_ist_secs,
                         )
                         .map(|bar| {
-                            // How far the fold's OPEN bucket has advanced past
-                            // the window this row describes. Zero means the
-                            // bar is still being written and its volume can
-                            // still grow; positive means the fold moved on and
-                            // the bar is sealed. It can never mean "a bar for
-                            // some other window" — `bar_for_window` refuses
-                            // that case rather than reporting it.
-                            let open_bucket = aggregator
-                                .snapshot(
-                                    Feed::Dhan,
-                                    security_id,
-                                    segment.binary_code(),
-                                    fold_frame,
-                                )
-                                .map_or(0, |open| open.bucket_start_ist_secs);
-                            let advance = i64::from(open_bucket)
-                                .saturating_sub(i64::from(window_open_ist_secs))
-                                .max(0);
+                            // COPIED, never re-derived (operator 2026-09-19
+                            // Quote A: "no extra claucltion or derivation").
+                            // All three are the same fields the candle writer
+                            // reads for the SAME bar, so the two tables agree
+                            // by construction rather than by coincidence.
+                            //
+                            // Three, not nine: the operator stripped the OHLC,
+                            // the bar-over-bar percentage and the bucket skew
+                            // off `top_volume` on 2026-09-19, so this probe
+                            // stops carrying what nothing stores -- and the
+                            // per-sweep `aggregator.snapshot()` call that
+                            // computed the skew goes with them, because a
+                            // field read here and dropped there is work paid
+                            // for nothing.
                             crate::top_volume_snapshot::CandleBarReading {
                                 signed_volume: bar.signed_volume(),
-                                open_bucket_advance_secs: advance,
-                                close_vs_prev_bar_pct: bar.close_chg_pct_from_prev_bar(),
-                                // COPIED, never re-derived (operator
-                                // 2026-09-19 Quote A: "no extra claucltion or
-                                // derivation"). Every one of these six is the
-                                // same field the candle writer reads for the
-                                // same bar, so the two tables agree by
-                                // construction rather than by coincidence.
-                                open: bar.open,
-                                high: bar.high,
-                                low: bar.low,
-                                close: bar.close,
                                 close_pct_from_prev_day: bar.close_pct_from_prev_day,
                                 open_pct: bar.open_pct,
                             }

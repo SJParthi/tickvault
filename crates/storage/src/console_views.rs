@@ -509,31 +509,49 @@ pub fn top_volume_cadence_view_ddl(cadence: SnapshotCadence) -> String {
     let view = cadence.view_name();
     let tf = cadence.as_str();
     let dim = lifecycle_dim_subquery();
+    // NO `ORDER BY`, deliberately — and this is the whole ordering guarantee,
+    // so it must not be "helpfully" restored.
+    //
+    // The operator's requirement is `ts ASC, volume_percentage_change DESC`,
+    // and the rows ALREADY sit in exactly that order on disk:
+    //
+    //   * `ts` is the designated timestamp, so QuestDB scans the table in
+    //     ascending `ts` by construction. That half costs nothing, ever.
+    //   * Within ONE `ts` the sweep appends the ranked slice in rank order,
+    //     and rank IS `volume_percentage_change` descending (the two differ
+    //     only by the fixed transform `pct = lots_milli / 10 - 100`, which is
+    //     monotone). All rows of one sweep share one `ts` and land in one
+    //     batch, so they keep their insertion order.
+    //
+    // So a plain scan returns `ts ASC, volume_percentage_change DESC` with
+    // ZERO comparison work: O(1) per row, at 20,000 rows or 20. An explicit
+    // `ORDER BY ts, volume_percentage_change DESC` asks the database to
+    // re-derive an ordering the data already has, at O(n log n) on EVERY
+    // query — which is what this view did until 2026-09-19.
+    //
+    // The honest limit: `ts DESC` is NOT free the same way. QuestDB reads it
+    // as a cheap backward scan, but that also reverses the within-`ts` order,
+    // giving `volume_percentage_change` ASC. Newest-first therefore costs a
+    // real sort; the operator asked for `ts ASC`, which is the free one.
     format!(
         "CREATE OR REPLACE VIEW {view} AS \
          SELECT t.ts, t.contract, il.symbol_name, il.display_name, il.instrument_type, t.family, \
-         t.delta_units, t.per_lot_quantity, t.total_lots_traded, \
+         t.per_lot_quantity, t.total_lots_traded, \
          t.volume_percentage_change, \
          t.percentage_change, t.open_percentage_change, \
-         t.open, t.high, t.low, t.close, \
-         t.close_vs_prev_bar_pct, \
-         t.candle_volume_signed AS candle_volume, \
+         t.volume, \
          CASE WHEN t.per_lot_quantity > 0 \
-         THEN cast(t.candle_volume_signed AS DOUBLE) / cast(t.per_lot_quantity AS DOUBLE) \
+         THEN cast(t.volume AS DOUBLE) / cast(t.per_lot_quantity AS DOUBLE) \
          END AS candle_lots, \
-         CASE WHEN t.per_lot_quantity > 0 \
-         THEN (abs(cast(t.candle_volume_signed AS DOUBLE)) / cast(t.per_lot_quantity AS DOUBLE) - 1.0) * 100.0 \
-         END AS candle_volume_chg_pct, \
-         t.candle_bucket_skew_secs, \
-         t.subscribed, t.cumulative_day_volume, t.underlying_id, \
+         t.open_latency, t.close_latency, t.window_span, \
+         t.subscribed, t.underlying_id, \
          t.feed, t.segment, t.security_id, t.tf \
          FROM {NAMED_VIEW_TOP_VOLUME_BASE} t \
          LEFT JOIN {dim} \
          ON t.security_id = il.security_id \
          AND t.segment = il.exchange_segment \
          AND t.feed = il.feed \
-         WHERE t.tf = '{tf}' \
-         ORDER BY t.ts DESC, t.volume_percentage_change DESC;"
+         WHERE t.tf = '{tf}';"
     )
 }
 /// Issue one view-DDL statement to QuestDB's `/exec` endpoint.
@@ -927,23 +945,17 @@ mod tests {
         for cadence in SnapshotCadence::ALL {
             let ddl = top_volume_cadence_view_ddl(cadence);
             for expected in [
-                // The volume inputs, stored because none is derivable from
+                // The ranking inputs, stored because none is derivable from
                 // the row alone.
-                "t.delta_units",
                 "t.per_lot_quantity",
                 "t.total_lots_traded",
                 "t.volume_percentage_change",
-                "t.cumulative_day_volume",
                 // The candle passthroughs -- the SAME numbers `candles_<tf>`
                 // carries for the same window, so the two tables agree with
                 // no arithmetic anywhere between them.
+                "t.volume",
                 "t.percentage_change",
                 "t.open_percentage_change",
-                "t.open",
-                "t.high",
-                "t.low",
-                "t.close",
-                "t.close_vs_prev_bar_pct",
                 "t.contract",
             ] {
                 assert!(
@@ -990,46 +1002,41 @@ mod tests {
             }
         }
     }
-
-    /// The two candle-derived columns must be arithmetic over the two STORED
-    /// candle inputs, guarded against a zero lot size, and must use the SAME
-    /// `(lots - 1) * 100` transform the writer applies to
-    /// `volume_percentage_change` — otherwise the Monday cross-verification
-    /// compares two numbers that were never computed the same way and every
-    /// disagreement is meaningless.
+    /// The one candle-derived column must be arithmetic over the two STORED
+    /// candle inputs and guarded against a zero lot size.
     ///
-    /// These two ARE derived in SQL, and that is not a contradiction of the
-    /// test above: `candle_lots` and `candle_volume_chg_pct` have no stored
-    /// column to pass through. They exist to restate the CANDLE's signed
-    /// volume in the same units as the volume board, which is the whole point
-    /// of the cross-check.
+    /// It IS derived in SQL, and that is not a contradiction of the test
+    /// above: `candle_lots` has no stored column to pass through. It exists
+    /// to restate the candle's signed volume in LOTS, which is the unit the
+    /// volume board ranks in, so the two can be compared by eye.
+    ///
+    /// ⚠ NARROWED 2026-09-19 — this pinned TWO derived columns and the
+    /// `(lots - 1) * 100` transform on the second. That second column,
+    /// `candle_volume_chg_pct`, restated the candle volume as a percentage
+    /// because `volume_percentage_change` was then stored in milli-units and
+    /// the two were not directly comparable. The writer now stores the WHOLE
+    /// number, so the view would have been re-deriving a figure that sits in
+    /// the row beside it — the exact disagreement the test above forbids. One
+    /// column, one guard.
     #[test]
     fn the_candle_columns_divide_by_the_lot_size_and_reuse_the_same_transform() {
         for cadence in SnapshotCadence::ALL {
             let ddl = top_volume_cadence_view_ddl(cadence);
-            // Both are NULL-guarded rather than dividing blind.
+            // NULL-guarded rather than dividing blind.
             assert_eq!(
                 ddl.matches("CASE WHEN t.per_lot_quantity > 0").count(),
-                2,
-                "both candle columns must guard the zero lot size: {ddl}"
+                1,
+                "the candle column must guard the zero lot size: {ddl}"
             );
-            // The signed form keeps the minus; the percentage takes the
-            // magnitude, so it stays comparable to volume_percentage_change.
+            // The division keeps the minus — a signed lot count is the point.
             assert!(
                 ddl.contains(
-                    "cast(t.candle_volume_signed AS DOUBLE) / cast(t.per_lot_quantity AS DOUBLE) \
+                    "cast(t.volume AS DOUBLE) / cast(t.per_lot_quantity AS DOUBLE) \
                      END AS candle_lots"
                 ),
                 "candle_lots must be the SIGNED division: {ddl}"
             );
-            assert!(
-                ddl.contains(
-                    "(abs(cast(t.candle_volume_signed AS DOUBLE)) / cast(t.per_lot_quantity AS \
-                     DOUBLE) - 1.0) * 100.0 END AS candle_volume_chg_pct"
-                ),
-                "candle_volume_chg_pct must be (|lots| - 1) * 100: {ddl}"
-            );
-            // The LONG operands are cast before every division.
+            // The LONG operands are cast before the division.
             //
             // `LONG / 1000.0` relies on the engine promoting the integer to a
             // double, and this repository has no in-repo evidence that
@@ -1037,10 +1044,7 @@ mod tests {
             // `docs/analysis/obi-backtest-queries.md`, whose ratio of two
             // integer columns casts BOTH sides first; an author casts both
             // sides of a ratio only when the un-cast form is wrong.
-            for uncast in [
-                "t.candle_volume_signed / ",
-                "t.candle_volume_signed AS DOUBLE) / t.per_lot_quantity",
-            ] {
+            for uncast in ["t.volume / ", "t.volume AS DOUBLE) / t.per_lot_quantity"] {
                 assert!(
                     !ddl.contains(uncast),
                     "an un-cast LONG division reappeared: {ddl}"
@@ -1056,9 +1060,15 @@ mod tests {
     /// `t.gain_pct AS underlying_chg_pct` beside the contract's own move,
     /// because the operator had asked for both separately. He then removed
     /// the underlying one (*"as of now I believe we don't need this
-    /// underlying percentage change"*), so what survives is THREE contract
-    /// baselines, and the reason the test survives with them is unchanged: a
-    /// single ambiguous `pct` column is what made him ask in the first place.
+    /// underlying percentage change"*), and later the same day removed
+    /// `close_vs_prev_bar_pct` with the rest of the non-ranking columns. So
+    /// what survives is TWO contract baselines, and the reason the test
+    /// survives with them is unchanged: a single ambiguous `pct` column is
+    /// what made him ask in the first place.
+    ///
+    /// The bar-over-bar move is the one that explains the SIGN on the
+    /// candle's volume, and it is no longer in this table — it is read from
+    /// `candles_<tf>`, which is where the sign is computed.
     #[test]
     fn the_contract_price_moves_are_separate_named_columns() {
         for cadence in SnapshotCadence::ALL {
@@ -1068,10 +1078,6 @@ mod tests {
                 "t.percentage_change",
                 // vs TODAY's 09:15 session open.
                 "t.open_percentage_change",
-                // vs the PREVIOUS BAR's close -- the one that explains the
-                // sign on the candle's volume, and the only one of the three
-                // the candles table does not itself store.
-                "t.close_vs_prev_bar_pct",
             ] {
                 assert!(
                     ddl.contains(named),
