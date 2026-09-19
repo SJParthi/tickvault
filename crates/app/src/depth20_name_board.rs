@@ -70,17 +70,24 @@ use crate::dhan_depth_universe::DepthCandidate;
 /// It was 7 until the index window widened to ±11.
 ///
 /// **Six is FORCED, not chosen.** Two independent pieces of arithmetic land on
-/// it: the budget (`2 × 47 + 7 × 24 = 262` against 250), and the fact that the
-/// freed index slots can buy neither a wider stock ladder (`2 × 47 + 6 × 28 =
-/// 262`) nor a seventh name. Spot is the only thing that fits the room ±11
-/// creates.
+/// it: the budget (`2 × 46 + 7 × 23 = 253` against 250), and the fact that the
+/// freed index slots can buy neither a wider stock ladder (`2 × 46 + 6 × 27 =
+/// 254`) nor a seventh name.
+///
+/// ⚠ CORRECTED 2026-09-19 — the figures were `2 × 47 + 7 × 24 = 262` and
+/// `2 × 47 + 6 × 28 = 262`, both written with the FUTURE leg and stale from
+/// the moment it was removed (2026-09-18). The VERDICT is re-derived and
+/// unchanged: 253 and 254 both still breach 250, so six is still forced. The
+/// closing sentence went with them — *"Spot is the only thing that fits the
+/// room ±11 creates"* was true when a future took a slot; the board now has
+/// 20 spare.
 pub const DEPTH20_NAME_ENTRY_RANK: usize = 6;
 
 /// How far a held name may slip before it loses its slots.
 ///
 /// A held name is KEPT while its rank is `<= DEPTH20_NAME_EXIT_RANK`, so it
 /// must fall out of the top 12 (~6% of the ~208 live F&O underlyings) before
-/// its 24 contracts are given away.
+/// its 23 contracts are given away.
 ///
 /// **This band is the remedy the 2026-09-07 lock prescribes in advance**, not
 /// an invention: *"If the swap budget is hit routinely, the answer is a longer
@@ -103,9 +110,10 @@ pub const DEPTH20_NAME_EXIT_RANK: usize = 12;
 ///
 /// **This is an arithmetic CEILING, not a preference.** The board is
 /// `2 × slots_for_index_name(11) + 6 × slots_for_stock_name(N)` against a hard
-/// 250. At `N = 5` that is 238; at `N = 6` it is 262, and `plan_pool` refuses
+/// 250. At `N = 5` that is 230; at `N = 6` it is 254, and `plan_pool` refuses
 /// the WHOLE pool fail-closed rather than truncating — a session-ending
-/// failure, not a degraded one.
+/// failure, not a degraded one. (238 / 262 until the future leg was removed
+/// on 2026-09-18; the verdict is unchanged — ±6 still breaches.)
 pub const DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE: usize = 5;
 
 /// Strikes each side of at-the-money for NIFTY and BANKNIFTY.
@@ -114,10 +122,17 @@ pub const DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE: usize = 5;
 /// ahead with plus or minus 11"* (2026-09-11 FOURTH). It was 10, quoted from
 /// the THIRD authorization, until he spent the wasted index slots.
 ///
-/// **±11 is the SOCKET ceiling.** An index name is
-/// `slots_for_index_name(N)` and one depth-20 connection admits
-/// [`DEPTH20_PER_SOCKET`]: ±11 is 47 of 50, and ±12 is 51 — over on its own,
-/// before the rest of the board is even counted.
+/// **±11 is the operator's authorized value — it is no longer a socket
+/// ceiling.** An index name is `slots_for_index_name(N)` and one depth-20
+/// connection admits [`DEPTH20_PER_SOCKET`].
+///
+/// ⚠ CORRECTED 2026-09-19 — this read *"**±11 is the SOCKET ceiling** … ±11 is
+/// 47 of 50, and ±12 is 51 — over on its own"*. Removing the future leg
+/// (2026-09-18) moved that bound: ±11 is **46** of 50 and ±12 is **exactly
+/// 50**, so ±12 fits a socket and ±13 (54) is the first that does not. The
+/// board at ±12 would be 238 of 250, also inside. Nothing arithmetic forces
+/// ±11 any more — only the 2026-09-11 FOURTH authorization does, and spending
+/// the freed slots needs its own dated row per the scope lock's REJECT list.
 pub const DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE: usize = 11;
 
 /// The depth-20 instrument budget: 5 sockets × 50.
@@ -437,11 +452,17 @@ const _: () = assert!(
 /// An INDEX name must fit ONE socket, or its ladder is split across two
 /// connections and no single line carries the whole book.
 ///
-/// This is the ceiling that makes ±11 the operator's maximum rather than his
-/// preference: 47 of 50 at ±11, 51 at ±12 — over before the board is counted.
+/// ⚠ CORRECTED 2026-09-19 — this doc and the message below both read *"47 of
+/// 50 at ±11, 51 at ±12 — over before the board is counted"*, and BOTH halves
+/// went stale the moment the future leg was removed (2026-09-18). ±11 is now
+/// **46** and ±12 is **exactly 50**, so ±12 FITS a socket and the first size
+/// that does not is ±13 (54). The ceiling this doc named as forcing ±11 has
+/// moved; ±11 is the operator's authorized value and ONLY that. The ASSERT
+/// itself was never wrong — it derives from the function, which is the whole
+/// reason only the prose rotted.
 const _: () = assert!(
     slots_for_index_name(DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE) <= DEPTH20_PER_SOCKET,
-    "an index name must fit one depth-20 socket: 47 at ±11, 51 at ±12"
+    "an index name must fit one depth-20 socket: 46 at ±11, 50 at ±12, 54 at ±13"
 );
 
 /// The band must be strictly wider than the entry set, or there is no
@@ -511,7 +532,7 @@ pub const DEPTH20_NAME_STOCK_SOCKETS: usize = 3;
 const _: () = assert!(
     DEPTH20_NAME_ENTRY_RANK * slots_for_stock_name(DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE)
         <= DEPTH20_NAME_STOCK_SOCKETS * DEPTH20_PER_SOCKET,
-    "the six stock names must fit three depth-20 sockets: 144 of 150 at ±5"
+    "the six stock names must fit three depth-20 sockets: 138 of 150 at ±5"
 );
 
 /// The board's two index names hold one socket each, so exactly two are
