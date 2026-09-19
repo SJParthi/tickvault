@@ -377,76 +377,77 @@ pub fn depth_named_view_ddl() -> String {
 }
 
 /// DDL for one per-cadence top-volume view (`top_volume_1s` /
-/// `top_volume_5s`): the ranking rows of ONE cadence, joined to the
-/// instrument master so `symbol_name` reads beside the rank.
+/// `top_volume_3s` / `top_volume_5s` / `top_volume_1m`): the ranking rows of
+/// ONE cadence, joined to the instrument master so `symbol_name` reads beside
+/// the rank.
 ///
-/// `cadence` is the `tf` SYMBOL literal (`1s` / `5s`) — the same wire strings
+/// `cadence` is the `tf` SYMBOL literal — the same wire strings
 /// `SnapshotCadence::as_str` writes, pinned by
 /// `test_top_volume_cadence_view_ddl_filters_on_the_two_stored_cadences`.
 ///
-/// # The three derived columns (added 2026-09-12)
+/// # 2026-09-19 — the view stopped deriving what the table now stores
 ///
-/// ⚠ 2026-09-13: `net_volume_chg_pct` is no longer DERIVED here from
-/// `window_lots_milli` — the operator asked for the percentage as a stored
-/// column, so the view now scales the stored `net_volume_chg_milli_pct` and
-/// exposes the raw milli-percent beside it. The value is identical either way
-/// (`window_lots_milli * 100 - 100_000`, then / 1000), so no reading changes;
-/// what changes is that the number exists in the table for a `SELECT *`.
-/// `t.rank` is gone from the projection with the column.
-///
-/// `window_lots` and `underlying_chg_pct` are computed
-/// HERE and stored nowhere. A view costs no bytes and cannot drift from its
-/// inputs, so a value that is a pure function of a stored column belongs in
-/// the view rather than in the table — the opposite call from `delta_units`
-/// and `lot_size`, which are stored precisely because they are NOT derivable
-/// from anything the row already carries.
+/// The operator's instruction was that the numbers he reads must be the
+/// numbers the table holds: *"no extra claucltion or derivation"*. Until this
+/// change the view scaled two stored integers (`window_lots_milli / 1000`,
+/// `net_volume_chg_milli_pct / 1000`) because those columns carried x1000
+/// scales that existed only to keep a sort key integral. Both are now stored
+/// at the scale he asked to read — whole lots and a whole-number percentage —
+/// so the view passes them through untouched and there is one fewer place the
+/// displayed number can disagree with the stored one.
 ///
 /// | column | is | example |
 /// |---|---|---|
 /// | `delta_units` | units traded in the window (stored) | `3200` |
-/// | `lot_size` | units per contract (stored) | `200` |
-/// | `window_lots` | `cast(window_lots_milli AS DOUBLE) / 1000.0` | `16.0` |
-/// | `net_volume_chg_pct` | `cast(net_volume_chg_milli_pct AS DOUBLE) / 1000.0` | `1500` |
-/// | `underlying_chg_pct` | the UNDERLYING's move vs its previous close | `2.4` |
-/// | `contract_price_chg_pct` | THIS contract's own close vs the previous bar of the SAME frame (stored, from the fold) | `-0.62` |
+/// | `per_lot_quantity` | units per contract (stored) | `200` |
+/// | `total_lots_traded` | whole lots traded in the window (stored) | `16` |
+/// | `volume_percentage_change` | the whole-number rank key (stored) | `1500` |
+/// | `percentage_change` | close vs YESTERDAY's close — equals `candles_<tf>.change_pct` | `-0.62` |
+/// | `open_percentage_change` | close vs TODAY's 09:15 open — equals `candles_<tf>.open_pct` | `1.14` |
+/// | `open` `high` `low` `close` | the candle row's four prices (stored) | — |
+/// | `close_vs_prev_bar_pct` | close vs the PREVIOUS BAR — the comparison the volume's SIGN comes from | `-0.62` |
 /// | `candle_volume` | the fold's own signed volume for this window (stored) | `-3200` |
-/// | `candle_lots` | `candle_volume / lot_size` — SIGNED, so the minus survives | `-16.0` |
-/// | `candle_volume_chg_pct` | `(abs(candle_lots) - 1) * 100` — the SAME transform as `net_volume_chg_pct`, on the fold's number | `1500` |
+/// | `candle_lots` | `candle_volume / per_lot_quantity` — SIGNED, so the minus survives | `-16.0` |
+/// | `candle_volume_chg_pct` | `(abs(candle_lots) - 1) * 100` — the SAME transform as the rank key, on the fold's number | `1500` |
 ///
 /// # Why `candle_lots` keeps the sign and `candle_volume_chg_pct` does not
-/// (2026-09-18)
 ///
 /// The operator asked for two things that pull in opposite directions: the
 /// volume *"precise as it is, evenw ith minus"*, and a volume-percentage
-/// change computed *"from same candles tables"* that he can compare against
-/// the leaderboard's own. Signing BOTH would satisfy the first and destroy
-/// the second — `net_volume_chg_pct` is built from a non-negative window
+/// change computed from the candle numbers that he can compare against the
+/// leaderboard's own. Signing BOTH would satisfy the first and destroy the
+/// second — `volume_percentage_change` is built from a non-negative window
 /// delta, so a signed percentage would disagree with it on every DOWN bar for
 /// a reason that has nothing to do with the measurement, and the Monday
 /// cross-verification would read as a mismatch on roughly half the board.
 ///
 /// So the split is deliberate and it loses nothing: `candle_lots` carries the
-/// sign (and `candle_volume` carries it in raw units), while the percentage
-/// is taken from the MAGNITUDE and is therefore directly comparable to
-/// `net_volume_chg_pct` row for row. At `candle_bucket_skew_secs = 0` — the
-/// same instrument, the same window, the same lot size — the two percentages
-/// should agree; where they do not, one of the two volume paths is wrong, and
-/// that is exactly the question these columns exist to answer.
+/// sign (and `candle_volume` carries it in raw units), while the percentage is
+/// taken from the MAGNITUDE and is therefore directly comparable to
+/// `volume_percentage_change` row for row. At `candle_bucket_skew_secs = 0` —
+/// the same instrument, the same window, the same lot size — the two
+/// percentages should agree; where they do not, one of the two volume paths is
+/// wrong, and that is exactly the question these columns exist to answer.
 ///
-/// # Neither is stored, and that is the point
+/// ⚠ The comparison is now coarser in ONE direction and that is stated rather
+/// than buried: `volume_percentage_change` is a whole number, so a row where
+/// the two paths differ by under one percent can no longer show it. The
+/// full-resolution inputs — `delta_units` and `per_lot_quantity` — are stored
+/// beside it, so the exact figure is recoverable by division whenever the
+/// coarse comparison flags a row worth looking at.
 ///
-/// Both are pure arithmetic over `candle_volume_signed` and `lot_size`, which
-/// ARE stored. Computing them here costs zero ILP bytes — which matters:
-/// `TOP_VOLUME_ILP_ROW_BYTES` now sits ~11% under the depth path's producer
-/// ceiling, and two more stored LONGs would breach it. More importantly a
-/// derived column cannot drift from its inputs, so `candle_lots` can never
-/// disagree with the `candle_volume` printed beside it.
+/// # The two derived columns, and why they stay derived
 ///
-/// `CASE WHEN t.lot_size > 0` rather than a bare division: a zero lot size is
-/// refused upstream (`LegRefusal::MissingLotSize`), so this arm should be
-/// unreachable — but a division by zero here would put an infinity into a
-/// column an operator reads as a measurement, and NULL is the honest answer
-/// to "how many lots is this" when the lot size is unknown.
+/// Both are pure arithmetic over `candle_volume_signed` and
+/// `per_lot_quantity`, which ARE stored. Computing them here costs zero ILP
+/// bytes, and a derived column cannot drift from its inputs — so `candle_lots`
+/// can never disagree with the `candle_volume` printed beside it.
+///
+/// `CASE WHEN t.per_lot_quantity > 0` rather than a bare division: a zero lot
+/// size is refused upstream (`LegRefusal::MissingLotSize`), so this arm should
+/// be unreachable — but a division by zero here would put an infinity into a
+/// column an operator reads as a measurement, and NULL is the honest answer to
+/// "how many lots is this" when the lot size is unknown.
 ///
 /// The casts are load-bearing, not decoration — see
 /// `the_derived_percentages_cast_before_dividing_a_long`. ONE probe settles
@@ -462,28 +463,33 @@ pub fn depth_named_view_ddl() -> String {
 /// braces; `b` reading `42` means the un-cast form was silently truncating and
 /// the cast is the only reason this view is right.
 ///
-/// `net_volume_chg_pct` is a percentage CHANGE measured from ONE LOT, not a
-/// percentage OF one lot: 3200 units against a 200 lot is `+1500%`, because
-/// `(3200 - 200) / 200 = 15`. The two readings differ by exactly 100 for
-/// every row, so they rank identically — the change form is used because its
-/// zero means something: `0` is exactly one lot, and a contract that traded
-/// LESS than one lot reads NEGATIVE rather than as a plausible `75%`.
+/// `volume_percentage_change` is a percentage CHANGE measured from ONE LOT,
+/// not a percentage OF one lot: 3200 units against a 200 lot is `+1500%`,
+/// because `(3200 - 200) / 200 = 15`. The two readings differ by exactly 100
+/// for every row, so they rank identically — the change form is used because
+/// its zero means something: `0` is exactly one lot, and a contract that
+/// traded LESS than one lot reads NEGATIVE rather than as a plausible `75%`.
 ///
 /// # Default ordering (2026-09-18 directive)
 ///
-/// The view carries `ORDER BY t.ts DESC, t.net_volume_chg_milli_pct DESC`, so
+/// The view carries `ORDER BY t.ts DESC, t.volume_percentage_change DESC`, so
 /// a bare `SELECT * FROM top_volume_1s` opens on the newest window with the
 /// biggest volume-percentage change first — the operator's own words:
 /// *"always have the volume percentage change desc for every timeframe of its
 /// respective timestamps"*. `ts` leads because the ordering is stated PER
 /// TIMESTAMP; ordering by the percentage alone would interleave windows.
 ///
-/// It sorts the INTEGER `net_volume_chg_milli_pct`, never the `AS
-/// net_volume_chg_pct` float alias two lines above it. The two rank
-/// identically (the alias is a strictly-increasing affine transform), and the
-/// integer cannot produce a NaN — the class of comparator defect this
-/// repository already records as corrupting a whole sort rather than
-/// misplacing one row.
+/// It sorts the STORED INTEGER, never a float alias. An integer cannot produce
+/// a NaN — the class of comparator defect this repository already records as
+/// corrupting a whole sort rather than misplacing one row.
+///
+/// # `gain_pct` / `underlying_chg_pct` is GONE (operator, 2026-09-19)
+///
+/// *"as of now I believe we don't need this underlying percentage change"*.
+/// It was the UNDERLYING STOCK's move sitting in an option contract's row, and
+/// with three correctly-sourced contract percentages now beside it the name
+/// was the main source of the confusion it caused. The gainer FILTER that
+/// reads the underlying's move is untouched — it never read this column.
 ///
 /// # First boot after a deploy that adds a column
 ///
@@ -499,15 +505,6 @@ pub fn depth_named_view_ddl() -> String {
 /// residual: if the live-table DDL exhausts all its attempts, the second call
 /// never runs that boot and the view stays at its previous definition until
 /// the next one.
-///
-/// The two percentages answer different questions and are named apart on
-/// purpose. `net_volume_chg_pct` is about the CONTRACT's traded quantity;
-/// `underlying_chg_pct` is the stored `gain_pct` column, which is the
-/// UNDERLYING STOCK's price move and is what the gainer filter reads. A row
-/// can be `+4400%` on volume and `-2%` on the underlying at the same time.
-/// The base table keeps the name `gain_pct`; only this display surface
-/// renames it, because `gain_pct` beside a volume percentage reads as though
-/// the two were the same kind of number.
 pub fn top_volume_cadence_view_ddl(cadence: SnapshotCadence) -> String {
     let view = cadence.view_name();
     let tf = cadence.as_str();
@@ -515,21 +512,20 @@ pub fn top_volume_cadence_view_ddl(cadence: SnapshotCadence) -> String {
     format!(
         "CREATE OR REPLACE VIEW {view} AS \
          SELECT t.ts, t.contract, il.symbol_name, il.display_name, il.instrument_type, t.family, \
-         t.delta_units, t.lot_size, \
-         cast(t.window_lots_milli AS DOUBLE) / 1000.0 AS window_lots, \
-         cast(t.net_volume_chg_milli_pct AS DOUBLE) / 1000.0 AS net_volume_chg_pct, \
-         t.candle_price_chg_pct AS contract_price_chg_pct, \
-         t.gain_pct AS underlying_chg_pct, \
+         t.delta_units, t.per_lot_quantity, t.total_lots_traded, \
+         t.volume_percentage_change, \
+         t.percentage_change, t.open_percentage_change, \
+         t.open, t.high, t.low, t.close, \
+         t.close_vs_prev_bar_pct, \
          t.candle_volume_signed AS candle_volume, \
-         CASE WHEN t.lot_size > 0 \
-         THEN cast(t.candle_volume_signed AS DOUBLE) / cast(t.lot_size AS DOUBLE) \
+         CASE WHEN t.per_lot_quantity > 0 \
+         THEN cast(t.candle_volume_signed AS DOUBLE) / cast(t.per_lot_quantity AS DOUBLE) \
          END AS candle_lots, \
-         CASE WHEN t.lot_size > 0 \
-         THEN (abs(cast(t.candle_volume_signed AS DOUBLE)) / cast(t.lot_size AS DOUBLE) - 1.0) * 100.0 \
+         CASE WHEN t.per_lot_quantity > 0 \
+         THEN (abs(cast(t.candle_volume_signed AS DOUBLE)) / cast(t.per_lot_quantity AS DOUBLE) - 1.0) * 100.0 \
          END AS candle_volume_chg_pct, \
          t.candle_bucket_skew_secs, \
-         t.net_volume_chg_milli_pct, \
-         t.subscribed, t.volume, t.window_lots_milli, t.underlying_id, \
+         t.subscribed, t.cumulative_day_volume, t.underlying_id, \
          t.feed, t.segment, t.security_id, t.tf \
          FROM {NAMED_VIEW_TOP_VOLUME_BASE} t \
          LEFT JOIN {dim} \
@@ -537,7 +533,7 @@ pub fn top_volume_cadence_view_ddl(cadence: SnapshotCadence) -> String {
          AND t.segment = il.exchange_segment \
          AND t.feed = il.feed \
          WHERE t.tf = '{tf}' \
-         ORDER BY t.ts DESC, t.net_volume_chg_milli_pct DESC;"
+         ORDER BY t.ts DESC, t.volume_percentage_change DESC;"
     )
 }
 /// Issue one view-DDL statement to QuestDB's `/exec` endpoint.
@@ -916,24 +912,39 @@ mod tests {
         crate::top_volume_rank_persistence::SnapshotCadence::OneSecond.as_str()
     }
 
-    /// The two stored inputs and the three derived columns are all present,
-    /// on BOTH cadence views.
+    /// Every stored column reaches the view UNDERIVED.
+    ///
+    /// ⚠ REWRITTEN 2026-09-19. This test used to assert the view DERIVED
+    /// `window_lots` and `net_volume_chg_pct` out of two milli columns. The
+    /// operator's directive that day removed the derivation, not the numbers:
+    /// *"no extra claucltion or derivation"* -- the writer now stores the
+    /// whole-number figures and the view passes them through. So the
+    /// assertion flips from "the view computes X" to "the view exposes X and
+    /// does NOT recompute it", which is the stronger of the two: a view that
+    /// re-derives a stored column can disagree with the column beside it.
     #[test]
-    fn the_top_volume_views_expose_the_inputs_and_the_two_percentages() {
+    fn the_top_volume_views_expose_the_stored_columns_underived() {
         for cadence in SnapshotCadence::ALL {
             let ddl = top_volume_cadence_view_ddl(cadence);
             for expected in [
-                // Stored, because neither is derivable from the row.
+                // The volume inputs, stored because none is derivable from
+                // the row alone.
                 "t.delta_units",
-                "t.lot_size",
-                // Derived here, because both are pure functions of a stored
-                // column and a view cannot drift from its own inputs.
-                "cast(t.window_lots_milli AS DOUBLE) / 1000.0 AS window_lots",
-                "cast(t.net_volume_chg_milli_pct AS DOUBLE) / 1000.0 AS net_volume_chg_pct",
-                "t.net_volume_chg_milli_pct",
+                "t.per_lot_quantity",
+                "t.total_lots_traded",
+                "t.volume_percentage_change",
+                "t.cumulative_day_volume",
+                // The candle passthroughs -- the SAME numbers `candles_<tf>`
+                // carries for the same window, so the two tables agree with
+                // no arithmetic anywhere between them.
+                "t.percentage_change",
+                "t.open_percentage_change",
+                "t.open",
+                "t.high",
+                "t.low",
+                "t.close",
+                "t.close_vs_prev_bar_pct",
                 "t.contract",
-                // The UNDERLYING's move, named apart from the volume one.
-                "t.gain_pct AS underlying_chg_pct",
             ] {
                 assert!(
                     ddl.contains(expected),
@@ -944,40 +955,37 @@ mod tests {
         }
     }
 
-    /// The two derived percentages must CAST before they divide.
+    /// The stored figures must NOT be recomputed by the view.
     ///
-    /// `window_lots_milli` is a LONG. `LONG / 1000.0` relies on the engine
-    /// promoting the integer to a double, and this repository has no in-repo
-    /// evidence that QuestDB 9.3.5 does — there is no other SQL string in the
-    /// tree that divides a LONG by a decimal literal. What the tree DOES have
-    /// is `docs/analysis/obi-backtest-queries.md`, whose ratio of two integer
-    /// columns casts BOTH sides to DOUBLE first; an author casts both sides of
-    /// a ratio only when the un-cast form is wrong.
-    ///
-    /// If the promotion does not happen, `42500 / 1000.0` is integer division:
-    /// `window_lots` reads 42 instead of 42.5, and `net_volume_chg_pct` reads
-    /// 4150 against a true 4150.0 — plausible numbers, quietly truncated, on
-    /// the surface the operator reads to decide what the board did. `cast(...)`
-    /// is correct under either semantics, costs nothing, and uses the same
-    /// syntax already proven live by `feed_scoreboard_boot`'s
-    /// `cast(ts as long)`.
+    /// ⚠ REWRITTEN 2026-09-19, and it is the bite for the directive rather
+    /// than a style rule. If the view re-derived `volume_percentage_change`
+    /// from `total_lots_traded`, the two would disagree for every contract
+    /// whose window traded a FRACTIONAL lot: 42.5 lots stores 4,150 and
+    /// re-derives to 4,100, because the lot count truncates before the
+    /// percentage is taken. One row, two numbers, a hundred apart -- and the
+    /// operator reads both.
     #[test]
-    fn the_derived_percentages_cast_before_dividing_a_long() {
+    fn the_view_never_recomputes_a_column_the_writer_already_stored() {
         for cadence in SnapshotCadence::ALL {
             let ddl = top_volume_cadence_view_ddl(cadence);
-            assert!(
-                ddl.contains("cast(t.window_lots_milli AS DOUBLE) / 1000.0"),
-                "window_lots must cast before dividing: {ddl}"
-            );
-            assert!(
-                ddl.contains("cast(t.net_volume_chg_milli_pct AS DOUBLE) / 1000.0"),
-                "net_volume_chg_pct must cast before dividing: {ddl}"
-            );
-            // And the un-cast form must not survive anywhere in the statement.
-            for uncast in ["t.window_lots_milli / ", "t.net_volume_chg_milli_pct / "] {
+            for recomputed in [
+                "t.total_lots_traded * 100",
+                "t.total_lots_traded - 1",
+                "t.delta_units / t.per_lot_quantity",
+                "cast(t.delta_units AS DOUBLE) / cast(t.per_lot_quantity AS DOUBLE)",
+                // The retired milli columns: an existing table still HAS them
+                // (the self-heal path has no DROP), so a view that started
+                // reading one again would silently serve pre-rename values.
+                "t.window_lots_milli",
+                "t.net_volume_chg_milli_pct",
+                "t.lot_size",
+                "t.gain_pct",
+                "t.candle_price_chg_pct",
+            ] {
                 assert!(
-                    !ddl.contains(uncast),
-                    "an un-cast LONG division reappeared: {ddl}"
+                    !ddl.contains(recomputed),
+                    "the view must pass the stored figure through, not \
+                     recompute it or read a retired column ({recomputed}): {ddl}"
                 );
             }
         }
@@ -985,40 +993,53 @@ mod tests {
 
     /// The two candle-derived columns must be arithmetic over the two STORED
     /// candle inputs, guarded against a zero lot size, and must use the SAME
-    /// `(lots - 1) * 100` transform as `net_volume_chg_pct` — otherwise the
-    /// Monday cross-verification compares two numbers that were never
-    /// computed the same way and every disagreement is meaningless.
+    /// `(lots - 1) * 100` transform the writer applies to
+    /// `volume_percentage_change` — otherwise the Monday cross-verification
+    /// compares two numbers that were never computed the same way and every
+    /// disagreement is meaningless.
+    ///
+    /// These two ARE derived in SQL, and that is not a contradiction of the
+    /// test above: `candle_lots` and `candle_volume_chg_pct` have no stored
+    /// column to pass through. They exist to restate the CANDLE's signed
+    /// volume in the same units as the volume board, which is the whole point
+    /// of the cross-check.
     #[test]
     fn the_candle_columns_divide_by_the_lot_size_and_reuse_the_same_transform() {
         for cadence in SnapshotCadence::ALL {
             let ddl = top_volume_cadence_view_ddl(cadence);
             // Both are NULL-guarded rather than dividing blind.
             assert_eq!(
-                ddl.matches("CASE WHEN t.lot_size > 0").count(),
+                ddl.matches("CASE WHEN t.per_lot_quantity > 0").count(),
                 2,
                 "both candle columns must guard the zero lot size: {ddl}"
             );
             // The signed form keeps the minus; the percentage takes the
-            // magnitude, so it stays comparable to net_volume_chg_pct.
+            // magnitude, so it stays comparable to volume_percentage_change.
             assert!(
                 ddl.contains(
-                    "cast(t.candle_volume_signed AS DOUBLE) / cast(t.lot_size AS DOUBLE) \
+                    "cast(t.candle_volume_signed AS DOUBLE) / cast(t.per_lot_quantity AS DOUBLE) \
                      END AS candle_lots"
                 ),
                 "candle_lots must be the SIGNED division: {ddl}"
             );
             assert!(
                 ddl.contains(
-                    "(abs(cast(t.candle_volume_signed AS DOUBLE)) / cast(t.lot_size AS DOUBLE) \
-                     - 1.0) * 100.0 END AS candle_volume_chg_pct"
+                    "(abs(cast(t.candle_volume_signed AS DOUBLE)) / cast(t.per_lot_quantity AS \
+                     DOUBLE) - 1.0) * 100.0 END AS candle_volume_chg_pct"
                 ),
                 "candle_volume_chg_pct must be (|lots| - 1) * 100: {ddl}"
             );
-            // The LONG operands are cast before every division, for the same
-            // reason the row above this test records.
+            // The LONG operands are cast before every division.
+            //
+            // `LONG / 1000.0` relies on the engine promoting the integer to a
+            // double, and this repository has no in-repo evidence that
+            // QuestDB 9.3.5 does. What the tree DOES have is
+            // `docs/analysis/obi-backtest-queries.md`, whose ratio of two
+            // integer columns casts BOTH sides first; an author casts both
+            // sides of a ratio only when the un-cast form is wrong.
             for uncast in [
                 "t.candle_volume_signed / ",
-                "t.candle_volume_signed AS DOUBLE) / t.lot_size",
+                "t.candle_volume_signed AS DOUBLE) / t.per_lot_quantity",
             ] {
                 assert!(
                     !ddl.contains(uncast),
@@ -1028,21 +1049,39 @@ mod tests {
         }
     }
 
-    /// The contract's OWN price move is read from the fold and exposed under a
-    /// name that cannot be confused with the UNDERLYING's — the operator asked
-    /// for both, separately, and a single ambiguous `pct` column is what made
-    /// him ask.
+    /// The contract's price moves are exposed under names that say WHICH
+    /// baseline each one measures from.
+    ///
+    /// ⚠ REWRITTEN 2026-09-19. This test used to pin
+    /// `t.gain_pct AS underlying_chg_pct` beside the contract's own move,
+    /// because the operator had asked for both separately. He then removed
+    /// the underlying one (*"as of now I believe we don't need this
+    /// underlying percentage change"*), so what survives is THREE contract
+    /// baselines, and the reason the test survives with them is unchanged: a
+    /// single ambiguous `pct` column is what made him ask in the first place.
     #[test]
-    fn the_contract_and_underlying_price_moves_are_separate_named_columns() {
+    fn the_contract_price_moves_are_separate_named_columns() {
         for cadence in SnapshotCadence::ALL {
             let ddl = top_volume_cadence_view_ddl(cadence);
+            for named in [
+                // vs YESTERDAY's close.
+                "t.percentage_change",
+                // vs TODAY's 09:15 session open.
+                "t.open_percentage_change",
+                // vs the PREVIOUS BAR's close -- the one that explains the
+                // sign on the candle's volume, and the only one of the three
+                // the candles table does not itself store.
+                "t.close_vs_prev_bar_pct",
+            ] {
+                assert!(
+                    ddl.contains(named),
+                    "{named} must be exposed under its own name: {ddl}"
+                );
+            }
             assert!(
-                ddl.contains("t.candle_price_chg_pct AS contract_price_chg_pct"),
-                "the contract's own move must be named: {ddl}"
-            );
-            assert!(
-                ddl.contains("t.gain_pct AS underlying_chg_pct"),
-                "the underlying's move must be named: {ddl}"
+                !ddl.contains("underlying_chg_pct"),
+                "the underlying's move was removed on 2026-09-19; a column \
+                 named for it would have no source: {ddl}"
             );
         }
     }

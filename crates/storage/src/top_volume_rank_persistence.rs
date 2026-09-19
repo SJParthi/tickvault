@@ -60,13 +60,16 @@
 //! CREATE TABLE IF NOT EXISTS top_volume (
 //!     ts TIMESTAMP, tf SYMBOL, family SYMBOL, feed SYMBOL,
 //!     segment SYMBOL, contract SYMBOL, security_id LONG,
-//!     underlying_id LONG, volume LONG, delta_units LONG,
-//!     lot_size LONG, window_lots_milli LONG,
-//!     net_volume_chg_milli_pct LONG,
-//!     gain_pct DOUBLE,
+//!     underlying_id LONG,
+//!     volume LONG, cumulative_day_volume LONG, delta_units LONG,
+//!     per_lot_quantity LONG, total_lots_traded LONG,
+//!     volume_percentage_change LONG,
 //!     candle_volume_signed LONG,
 //!     candle_bucket_skew_secs LONG,
-//!     candle_price_chg_pct DOUBLE,
+//!     close_vs_prev_bar_pct DOUBLE,
+//!     percentage_change DOUBLE,
+//!     open_percentage_change DOUBLE,
+//!     open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE,
 //!     subscribed BOOLEAN
 //! ) timestamp(ts) PARTITION BY HOUR
 //!   DEDUP UPSERT KEYS(ts, tf, family, feed, security_id, segment);
@@ -79,14 +82,24 @@
 //! symbol, and inventing one here would be fabrication. Join to
 //! `instrument_lifecycle` for names.
 //!
-//! `window_lots_milli` is THE SORT KEY and `volume` is not, which is the one
-//! thing a reader of this table has to know. `volume` is the vendor's
-//! CUMULATIVE day volume for the contract -- it only ever rises, so ordering
-//! by it would rank "busy since 09:15", not "busy now". `window_lots_milli`
-//! is the lots traded INSIDE the window that just closed, normalised by lot
-//! size and scaled by 1000 (integer milli-lots, never a float): a 1s row
-//! measures one second, a 5s row measures five. Both columns are stored so a
-//! row can be checked against the ranking that produced it.
+//! `volume_percentage_change` is THE SORT KEY and `volume` is not, which is
+//! the one thing a reader of this table has to know. `cumulative_day_volume`
+//! is the vendor's CUMULATIVE day total for the contract -- it only ever
+//! rises, so ordering by it would rank "busy since 09:15", not "busy now".
+//! `total_lots_traded` is the whole lots traded INSIDE the window that just
+//! closed, normalised by `per_lot_quantity`: a 1s row measures one second, a
+//! 5s row measures five, and `volume_percentage_change` is that lot count
+//! expressed as a whole-number percentage against one lot. Both the input and
+//! the derived figure are stored so a row can be checked against the ranking
+//! that produced it.
+//!
+//! ⚠ `volume` is the CANDLE's signed volume for the same window -- the SAME
+//! number `candles_<tf>` carries, so the two tables agree with no derivation
+//! (operator, 2026-09-18: *"no extra claucltion or derivation"*). It is NOT
+//! the sort key and must never be used as one: a signed value orders sellers
+//! below an untraded contract. During the two-phase rename it is written by
+//! `candle_volume_signed` and the vendor day total lives in
+//! `cumulative_day_volume`; see the phase note above.
 //!
 //! ## Honest volume
 //!
@@ -421,19 +434,38 @@ pub struct TopVolumeRankRow<'a> {
     pub security_id: i64,
     /// The underlying's numeric id. NOT a name — see the module header.
     pub underlying_id: i64,
-    /// Cumulative day volume as observed, AFTER the monotonicity gate.
-    pub volume: i64,
+    /// Cumulative day volume as observed, AFTER the monotonicity gate — the
+    /// vendor's running total since 09:15, NOT a per-window figure.
+    ///
+    /// # Written to `cumulative_day_volume`, no longer to `volume` (2026-09-19)
+    ///
+    /// The operator asked for ONE plainly-named `volume` in this table that
+    /// equals the candle's signed per-window volume. A column called `volume`
+    /// already existed and held THIS number instead, and QuestDB's self-heal
+    /// can add a column but can neither rename nor drop one — so re-pointing
+    /// the name in a single change would give one column two meanings across a
+    /// partition boundary, with nothing in the row to tell a reader which
+    /// meaning their row carries.
+    ///
+    /// Phase 1 (this change) moves the vendor total to its own honestly-named
+    /// column and STOPS writing `volume`. Phase 2, once the 15-day
+    /// `market_data_hot_days` window has rolled every Phase-1 row off the
+    /// volume, starts writing the candle's signed number into `volume` and
+    /// retires `candle_volume_signed`. Safe by the clock rather than by
+    /// anyone remembering. Full contract: the 2026-09-19 §3 of
+    /// `websocket-connection-scope-lock.md`.
+    pub cumulative_day_volume: i64,
     /// Traded UNITS inside the window that just closed — the NUMERATOR of
     /// the rank key, and the number an operator calls "net volume".
     ///
     /// Added 2026-09-12. Until then the table stored the cumulative
-    /// `volume` and the derived `window_lots_milli`, and NEITHER input of
+    /// volume and the derived lots figure, and NEITHER input of
     /// the division was present: a reader looking at a row could not see
     /// the traded quantity the rank was computed from, and could not
-    /// recover it, because `window_lots_milli = delta * 1000 / lot_size`
+    /// recover it, because `lots = delta * 1000 / lot_size`
     /// is one equation in two unknowns. Consecutive rows do not rescue it
     /// either — a contract only appears while it is inside the top
-    /// `TOP_VOLUME_RANK_PER_FAMILY`, so the `volume` series for any one
+    /// `TOP_VOLUME_RANK_PER_FAMILY`, so the volume series for any one
     /// contract has holes exactly where it stopped being interesting.
     ///
     /// `u32` at the source (the vendor's counter width); a value that
@@ -441,7 +473,8 @@ pub struct TopVolumeRankRow<'a> {
     /// than casts so the impossibility is enforced rather than assumed.
     pub delta_units: i64,
     /// Units per contract, from the day's master — the DENOMINATOR of the
-    /// rank key.
+    /// rank key. Stored as `per_lot_quantity` since 2026-09-19 (renamed from
+    /// `lot_size` on the operator's plain-names instruction).
     ///
     /// Added 2026-09-12, for the same reason as `delta_units` above: it is
     /// the other half of the division and it was not recoverable from the
@@ -451,65 +484,61 @@ pub struct TopVolumeRankRow<'a> {
     /// that could disagree with it.
     ///
     /// Guaranteed non-zero: a leg whose master row carries no lot size is
-    /// refused at the map build (`LegRefusal::MissingLotSize`) and again in
-    /// `window_lots_milli`, which returns `None` rather than dividing. So a
+    /// refused at the map build (`LegRefusal::MissingLotSize`) and again by
+    /// the lots computation, which returns `None` rather than dividing. So a
     /// zero in this column would mean the guarantee broke, and is worth
     /// seeing.
-    pub lot_size: i64,
-    /// **The RANK KEY**: lots traded in the window that just closed, x 1000.
+    pub per_lot_quantity: i64,
+    /// **The RANK KEY, in WHOLE LOTS**: lots traded in the window that just
+    /// closed.
     ///
-    /// Added 2026-09-09. Until then the table stored only `volume`, the
-    /// CUMULATIVE day count -- which has not been the sort key since
-    /// 2026-09-07, when the scope lock moved ranking to lots-in-window. So a
-    /// reader could see rank 1 hold less cumulative volume than rank 40 and
-    /// have nothing in the row to explain it. This column IS the number the
-    /// order was computed from, so the ordering is checkable from the table
-    /// alone rather than taken on trust.
+    /// # Whole lots, never milli-lots (operator, 2026-09-19)
     ///
-    /// Milli-lots, so 1_000 is one lot. `u64` at the source; a value that
-    /// cannot fit `i64` is refused by the projection rather than wrapped
-    /// negative.
-    pub window_lots_milli: i64,
-    /// **The volume-percentage change**, in MILLI-PERCENT (thousandths of a
-    /// percent): `window_lots_milli * 100 - 100_000`.
+    /// *"See total lots traded shoudl be the long right why decimal here bro
+    /// why the fuck bro why"*. Until this change the column was
+    /// `window_lots_milli` and carried lots x 1000, so a reader saw `4_150`
+    /// where 4.15 lots traded and `1_000` for one lot. The x1000 scale existed
+    /// to keep the SORT KEY an integer while preserving sub-lot resolution;
+    /// the operator has ruled that the displayed number is worth more than
+    /// that resolution.
     ///
-    /// Added 2026-09-13 on the operator's instruction. `4_150_000` reads
-    /// `+4150.000%`; `0` is exactly one lot traded in the window; a contract
-    /// that traded LESS than one lot reads NEGATIVE.
+    /// ⚠ **The rounding is real and is stated rather than buried.** A contract
+    /// that traded less than one whole lot in the window now reads `0`, and
+    /// two contracts that traded 1.2 and 1.8 lots both read `1`. The
+    /// full-resolution inputs remain in the row — `delta_units` and
+    /// `per_lot_quantity` — so the exact figure is always recoverable by
+    /// division, which is the property the 2026-09-12 note above was added to
+    /// guarantee and which this change deliberately preserves.
     ///
-    /// ⚠ **It is a strictly-increasing affine transform of
-    /// `window_lots_milli`, not independent information.** The two rank
-    /// identically, which is why the comparator still sorts the integer key —
+    /// The COMPARATOR is unaffected: it still orders on the full-resolution
+    /// integer the leaderboard computed, so two contracts that round to the
+    /// same printed lot count are still ordered correctly against each other.
+    pub total_lots_traded: i64,
+    /// **The volume-percentage change, as a WHOLE NUMBER.**
+    ///
+    /// A 200-per-lot contract that traded 8,000 units in the window reads
+    /// **3900** — not `3900.0`, not `39.00`, and not the `3_900_000`
+    /// milli-percent the column carried until 2026-09-19.
+    ///
+    /// # Why the scale changed (operator, 2026-09-19)
+    ///
+    /// The same instruction that made `total_lots_traded` whole lots. The
+    /// column was `net_volume_chg_milli_pct` and stored thousandths of a
+    /// percent so that the printed number could not lose ordering information;
+    /// the operator reads this table directly and has ruled that a whole
+    /// number is worth more than the three hidden decimals.
+    ///
+    /// ⚠ **It is a strictly-increasing transform of the lots figure, not
+    /// independent information.** The two rank identically, which is why the
+    /// comparator still sorts the leaderboard's own full-resolution integer —
     /// a float comparator is non-transitive on a NaN and corrupts a whole sort
-    /// rather than misplacing one row. It is stored anyway because the
-    /// operator reads this table directly and should not have to know the
-    /// transform. If the two columns ever disagree, THIS one is wrong.
+    /// rather than misplacing one row. It is stored because the operator
+    /// should not have to know the transform. If the two columns ever
+    /// disagree, THIS one is wrong.
     ///
     /// Integer, never a `DOUBLE`: it is derived from an integer key, and a
     /// float here could round two distinct keys onto one printed value.
-    pub net_volume_chg_milli_pct: i64,
-    /// The UNDERLYING's percentage change from its previous close, or `None`
-    /// when that is not knowable yet.
-    ///
-    /// `None` is written as an ABSENT ILP field, which QuestDB stores as NULL
-    /// — the `tick_persistence` per-feed-optional-column precedent. It is a
-    /// real state, not a defect: both inputs live in RAM stores fed only by
-    /// ticks (`SpotPriceStore`, `PrevCloseStore`), so an underlying that has
-    /// not printed since boot has neither. Equities give one stale ~08:30
-    /// snapshot and then nothing until the 09:07 auction print, and a
-    /// mid-session redeploy restarts both stores empty.
-    ///
-    /// # Why NULL and not a dropped row (2026-09-12)
-    ///
-    /// Until today an unknown gain DELETED the whole row. `gain_pct` is a leaf
-    /// DISPLAY column: it is not in the DEDUP key, the views pass it through
-    /// with no arithmetic, and nothing orders by it. So a `None` cost the
-    /// table the contract's VOLUME — the one thing it exists to record —
-    /// because a column beside it could not be computed.
-    ///
-    /// `Some` is still proven FINITE by the projection; a `NaN` never reaches
-    /// this field, it becomes `None` and is counted.
-    pub gain_pct: Option<f64>,
+    pub volume_percentage_change: i64,
     /// The **candle fold's own signed volume** for this contract, in this
     /// window — the exact number `candles_<tf>.volume` carries for the same
     /// `(ts, security_id, segment, feed)` — or `None` when the fold has no
@@ -583,46 +612,79 @@ pub struct TopVolumeRankRow<'a> {
     /// `LONG` and signed: the bar can be older (negative) or, in the race
     /// above, newer (positive).
     pub candle_bucket_skew_secs: Option<i64>,
-    /// **The CONTRACT's own price percentage change** for this bar — against
-    /// the previous sealed bar of the same timeframe — or `None` when there is
-    /// no usable baseline.
+    /// **This contract's own close against the PREVIOUS SEALED BAR** of the
+    /// same timeframe, in percent — or `None` when that bar had no usable
+    /// baseline.
     ///
-    /// # Why this column exists (operator, 2026-09-18)
+    /// # ⚠ This is NOT a `candles_<tf>` column, and must never be sold as one
     ///
-    /// *"why i cant see any normal percnetage change and volume percentage
-    /// change columns sepaartely dude espeiclaly in top volume table"*.
+    /// Renamed from `candle_price_chg_pct` on 2026-09-19 because the old name
+    /// invited exactly the cross-table comparison it cannot survive. Its
+    /// baseline is `LiveCandleState::bucket_open_prev_close`, and the candle
+    /// row stores no such column: the four percentages it does store are
+    /// `close_pct_from_prev_day`, `change_pct` (the same field again),
+    /// `open_pct` and `open_gap_pct`. A reader comparing this against any of
+    /// them would find them disagreeing on almost every row with nothing in
+    /// either table explaining why. The two columns that DO match the candle
+    /// row are [`Self::percentage_change`] and
+    /// [`Self::open_percentage_change`], which is what they are named for.
     ///
-    /// He was right, and the answer was not a naming problem. The table
-    /// carried TWO percentage columns and NEITHER was this one:
+    /// # Why it is kept at all
     ///
-    /// | column | what it actually measures |
-    /// |---|---|
-    /// | `net_volume_chg_milli_pct` | a VOLUME figure — lots traded in the window |
-    /// | `gain_pct` | the UNDERLYING STOCK's move from its previous close |
-    /// | **this** | **this option contract's own price move** |
+    /// It is the ONLY field in the row that explains the SIGN of the signed
+    /// volume. `LiveCandleState::signed_volume` picks that sign with
+    /// `close < bucket_open_prev_close` — the identical comparison this
+    /// percentage reports. Delete it and a reader sees a negative volume
+    /// beside a positive day-change percentage with nothing to reconcile them;
+    /// where this is NULL the volume is positive by that same rule, because
+    /// both refuse on the identical "no usable baseline" gate.
     ///
-    /// Nothing anywhere stored the third, because the leaderboard's
-    /// `RankedContract` carries no price at all. The fold does, and this row
-    /// now reads it — on the SAME O(1) probe that fetches
-    /// [`Self::candle_volume_signed`], so the column costs no extra lookup.
+    /// `DOUBLE`, rounded to 2 decimals at the source by the fold's shared
+    /// `pct_change` — the operator's 2026-09-03 vendor-matching rule. The
+    /// integer rule that governs [`Self::volume_percentage_change`] does NOT
+    /// apply: that column is derived from an integer SORT KEY, where a float
+    /// could round two distinct keys onto one printed value. This one is a
+    /// float at source and orders nothing.
+    pub close_vs_prev_bar_pct: Option<f64>,
+    /// **Close vs YESTERDAY's close**, in percent — the headline day change,
+    /// byte-identical to what `candles_<tf>.change_pct` carries for the same
+    /// `(ts, security_id, segment, feed)`.
     ///
-    /// # Why it is the right neighbour for the signed volume
+    /// # Byte-identical by construction, not by coincidence (2026-09-19)
     ///
-    /// It is the exact comparison the volume's SIGN is derived from. A reader
-    /// seeing a negative `candle_volume_signed` sees, in this column, the price
-    /// fall that made it negative — instead of having to know the rule. Where
-    /// this is NULL the volume is positive by that same rule, because both
-    /// refuse on the identical "no usable baseline" gate.
+    /// Both columns are filled from the SAME `LiveCandleState` field,
+    /// `close_pct_from_prev_day`, on the same bar: the candle writer reads it
+    /// in `shadow_seal_columns::from_buffered_seal` (which writes that one
+    /// field into BOTH its `close_pct_from_prev_day` and `change_pct`
+    /// columns), and this row reads it off the same probe that already
+    /// fetches [`Self::candle_volume_signed`]. Nothing is re-derived here —
+    /// operator 2026-09-19: *"no extra claucltion or derivation"*.
     ///
-    /// `DOUBLE`, matching `gain_pct` beside it, and rounded to 2 decimals at
-    /// the source by the fold's shared `pct_change` — the operator's
-    /// 2026-09-03 vendor-matching rule, so this is directly comparable to a
-    /// figure Dhan publishes rather than needing a tolerance nobody calibrated.
-    /// The integer-milli-percent rule that governs `net_volume_chg_milli_pct`
-    /// does NOT apply here: that column is derived from an integer SORT KEY,
-    /// where a float could round two distinct keys onto one printed value.
-    /// This one is a float at source and orders nothing.
-    pub candle_price_chg_pct: Option<f64>,
+    /// `None` when the fold has no bar for this window, exactly as the
+    /// candle-sourced columns beside it. A NULL here is not a defect: it means
+    /// this contract did not trade inside the window the candle grid measures.
+    pub percentage_change: Option<f64>,
+    /// **Close vs TODAY's 09:15 session open**, in percent — byte-identical to
+    /// `candles_<tf>.open_pct` for the same bar, from the same
+    /// `LiveCandleState::open_pct` field.
+    ///
+    /// ⚠ NOT the opening gap. That is `open_gap_pct`, a different candle
+    /// column measuring the session OPEN against yesterday's close, and it is
+    /// deliberately not carried here — the operator asked for "open percentage
+    /// change", which is the column whose name it matches.
+    ///
+    /// `0.0` at the source when `session_open` is `0.0` (the fold's
+    /// div-by-zero guard), so a zero here can mean "no session open recorded
+    /// yet" as well as "closed exactly at the open"; `None` means no bar.
+    pub open_percentage_change: Option<f64>,
+    /// The bar's OPEN price — byte-identical to `candles_<tf>.open`.
+    pub bar_open: Option<f64>,
+    /// The bar's HIGH — byte-identical to `candles_<tf>.high`.
+    pub bar_high: Option<f64>,
+    /// The bar's LOW — byte-identical to `candles_<tf>.low`.
+    pub bar_low: Option<f64>,
+    /// The bar's CLOSE — byte-identical to `candles_<tf>.close`.
+    pub bar_close: Option<f64>,
     /// Whether this contract actually held a depth subscription at this
     /// snapshot. The column that makes the table an audit rather than trivia.
     ///
@@ -635,6 +697,23 @@ pub struct TopVolumeRankRow<'a> {
 }
 
 /// The idempotent `CREATE TABLE` DDL for `top_volume_rank`. Pure.
+///
+/// # The three orphan columns this DDL deliberately no longer names
+///
+/// `lot_size`, `window_lots_milli` and `net_volume_chg_milli_pct` were RENAMED
+/// on 2026-09-19 (`per_lot_quantity`, `total_lots_traded`,
+/// `volume_percentage_change`), and `gain_pct` — the UNDERLYING's move, a
+/// different instrument's number sitting in a contract's row — was DELETED on
+/// the same instruction. QuestDB's self-heal can add a column but can neither
+/// rename nor drop one, so an EXISTING table keeps all four as orphans that go
+/// NULL from the deploy onward, while a FRESH table never grows them. Both
+/// states are honest; a column that is written under one name and read under
+/// another would not be.
+///
+/// `volume` is the one exception and is KEPT here on purpose: it is the
+/// Phase-2 target name for the candle's signed volume, so a fresh table should
+/// already have it. Nothing writes it during Phase 1 — see
+/// [`TopVolumeRankRow::cumulative_day_volume`].
 #[must_use]
 pub fn top_volume_rank_create_ddl() -> String {
     format!(
@@ -648,14 +727,20 @@ pub fn top_volume_rank_create_ddl() -> String {
             security_id   LONG, \
             underlying_id LONG, \
             volume        LONG, \
+            cumulative_day_volume LONG, \
             delta_units   LONG, \
-            lot_size      LONG, \
-            window_lots_milli LONG, \
-            net_volume_chg_milli_pct LONG, \
-            gain_pct      DOUBLE, \
+            per_lot_quantity LONG, \
+            total_lots_traded LONG, \
+            volume_percentage_change LONG, \
             candle_volume_signed LONG, \
             candle_bucket_skew_secs LONG, \
-            candle_price_chg_pct DOUBLE, \
+            close_vs_prev_bar_pct DOUBLE, \
+            percentage_change DOUBLE, \
+            open_percentage_change DOUBLE, \
+            open          DOUBLE, \
+            high          DOUBLE, \
+            low           DOUBLE, \
+            close         DOUBLE, \
             subscribed    BOOLEAN\
         ) timestamp(ts) PARTITION BY HOUR \
         DEDUP UPSERT KEYS({DEDUP_KEY_TOP_VOLUME_RANK});"
@@ -673,14 +758,20 @@ const TOP_VOLUME_RANK_COLUMNS: &[(&str, &str)] = &[
     ("security_id", "LONG"),
     ("underlying_id", "LONG"),
     ("volume", "LONG"),
+    ("cumulative_day_volume", "LONG"),
     ("delta_units", "LONG"),
-    ("lot_size", "LONG"),
-    ("window_lots_milli", "LONG"),
-    ("net_volume_chg_milli_pct", "LONG"),
-    ("gain_pct", "DOUBLE"),
+    ("per_lot_quantity", "LONG"),
+    ("total_lots_traded", "LONG"),
+    ("volume_percentage_change", "LONG"),
     ("candle_volume_signed", "LONG"),
     ("candle_bucket_skew_secs", "LONG"),
-    ("candle_price_chg_pct", "DOUBLE"),
+    ("close_vs_prev_bar_pct", "DOUBLE"),
+    ("percentage_change", "DOUBLE"),
+    ("open_percentage_change", "DOUBLE"),
+    ("open", "DOUBLE"),
+    ("high", "DOUBLE"),
+    ("low", "DOUBLE"),
+    ("close", "DOUBLE"),
     ("subscribed", "BOOLEAN"),
 ];
 
@@ -1019,35 +1110,35 @@ impl TopVolumeRankWriter {
             .context("security_id")?
             .column_i64("underlying_id", r.underlying_id)
             .context("underlying_id")?
-            .column_i64("volume", r.volume)
-            .context("volume")?
+            // `volume` is NOT written during Phase 1 -- it is the Phase-2
+            // target name for the candle's signed number, and writing the
+            // vendor's day total into it would give one column two meanings
+            // across a partition boundary. See
+            // `TopVolumeRankRow::cumulative_day_volume`.
+            .column_i64("cumulative_day_volume", r.cumulative_day_volume)
+            .context("cumulative_day_volume")?
             .column_i64("delta_units", r.delta_units)
             .context("delta_units")?
-            .column_i64("lot_size", r.lot_size)
-            .context("lot_size")?
-            .column_i64("window_lots_milli", r.window_lots_milli)
-            .context("window_lots_milli")?
-            .column_i64("net_volume_chg_milli_pct", r.net_volume_chg_milli_pct)
-            .context("net_volume_chg_milli_pct")?;
-        // OPTIONAL column -- omitted (NULL) when the underlying's gain is not
-        // knowable yet. Absent-field-is-NULL is the `tick_persistence`
-        // per-feed-optional precedent, and the row still carries 4 symbols and
-        // 7 fields so it can never become field-less.
-        if let Some(gain_pct) = r.gain_pct {
-            buffer
-                .column_f64("gain_pct", gain_pct)
-                .context("gain_pct")?;
-        }
-        // THREE MORE OPTIONAL columns, on the same absent-field-is-NULL rule.
+            .column_i64("per_lot_quantity", r.per_lot_quantity)
+            .context("per_lot_quantity")?
+            .column_i64("total_lots_traded", r.total_lots_traded)
+            .context("total_lots_traded")?
+            .column_i64("volume_percentage_change", r.volume_percentage_change)
+            .context("volume_percentage_change")?;
+        // OPTIONAL columns, on the absent-field-is-NULL rule -- the
+        // `tick_persistence` per-feed-optional precedent. The row still
+        // carries 4 symbols and 7 mandatory fields, so it can never become
+        // field-less however many of these are absent.
         //
-        // All three come from ONE `MultiTfAggregator::snapshot` probe in the
-        // projection, so they are present together or absent together: a
-        // contract with no aggregator slot, or whose bar has never opened, has
-        // no fold reading to report and stores NULL rather than a zero that
-        // would read as "no trades" or "flat". `candle_price_chg_pct` can
-        // additionally be NULL on its own when the bar has no usable baseline
-        // (the session's first bar of this timeframe) — the same gate the
-        // signed volume uses to decide it stays positive.
+        // All the candle-sourced values come from ONE
+        // `MultiTfAggregator::bar_for_window` probe in the projection, so they
+        // are present together or absent together: a contract with no
+        // aggregator slot, or whose bar has never opened, has no fold reading
+        // to report and stores NULL rather than a zero that would read as "no
+        // trades" or "flat". `close_vs_prev_bar_pct` can additionally be NULL
+        // on its own when the bar has no usable baseline (the session's first
+        // bar of this timeframe) -- the same gate the signed volume uses to
+        // decide it stays positive.
         if let Some(candle_volume_signed) = r.candle_volume_signed {
             buffer
                 .column_i64("candle_volume_signed", candle_volume_signed)
@@ -1058,10 +1149,32 @@ impl TopVolumeRankWriter {
                 .column_i64("candle_bucket_skew_secs", candle_bucket_skew_secs)
                 .context("candle_bucket_skew_secs")?;
         }
-        if let Some(candle_price_chg_pct) = r.candle_price_chg_pct {
+        if let Some(close_vs_prev_bar_pct) = r.close_vs_prev_bar_pct {
             buffer
-                .column_f64("candle_price_chg_pct", candle_price_chg_pct)
-                .context("candle_price_chg_pct")?;
+                .column_f64("close_vs_prev_bar_pct", close_vs_prev_bar_pct)
+                .context("close_vs_prev_bar_pct")?;
+        }
+        if let Some(percentage_change) = r.percentage_change {
+            buffer
+                .column_f64("percentage_change", percentage_change)
+                .context("percentage_change")?;
+        }
+        if let Some(open_percentage_change) = r.open_percentage_change {
+            buffer
+                .column_f64("open_percentage_change", open_percentage_change)
+                .context("open_percentage_change")?;
+        }
+        if let Some(bar_open) = r.bar_open {
+            buffer.column_f64("open", bar_open).context("open")?;
+        }
+        if let Some(bar_high) = r.bar_high {
+            buffer.column_f64("high", bar_high).context("high")?;
+        }
+        if let Some(bar_low) = r.bar_low {
+            buffer.column_f64("low", bar_low).context("low")?;
+        }
+        if let Some(bar_close) = r.bar_close {
+            buffer.column_f64("close", bar_close).context("close")?;
         }
         buffer
             .column_bool("subscribed", r.subscribed)
@@ -1439,7 +1552,39 @@ pub const MAX_TOP_VOLUME_RETAINED_FLUSH_SPANS: u32 = 2;
 /// crate, which `storage` cannot import (the dependency runs the other way).
 /// Naming it is the honest middle — a third family is now a visible edit here
 /// rather than an invisible factor inside an arithmetic expression.
-const OPTION_FAMILIES: usize = 2;
+///
+/// # ⚠ CORRECTED 2026-09-19 — 2 → 1, and it had been wrong since 2026-09-12
+///
+/// The operator's 2026-09-12 (later) directive took `top_volume` to STOCK
+/// OPTIONS ONLY — the index board was dropped because it steered nothing and
+/// poisoned the default sort (`websocket-connection-scope-lock.md`
+/// § "2026-09-18 (FOURTH)"). The single source of that policy,
+/// `dhan_feed_stack::RANKED_OPTION_FAMILIES`, has been a ONE-element array ever
+/// since, pinned by `top_volume_stock_only_guard`. This constant was not moved
+/// with it.
+///
+/// So the sweep has been sized for **50,000** rows while the pipeline can
+/// produce at most **25,000**. Wrong in the SAFE direction — the ceiling was
+/// twice what it needed to be, so nothing was ever dropped by it — and wrong in
+/// a way that matters anyway, because it is the DENOMINATOR every row-width
+/// decision divides by. At 50,000 rows the depth comparison
+/// (`the_producer_byte_ceiling_stays_tighter_than_the_depth_path`) fails at
+/// roughly **671 B** per row; at the true 25,000 it fails at roughly
+/// **1,342 B**. A column set needing ~725 B reads as unaffordable against the
+/// first number and sits at a 46% margin against the second.
+///
+/// That is the whole cost of this correction being late: a design was priced
+/// against a ceiling half its real size, and the argument that came out of it
+/// was wrong. Recorded rather than quietly edited, because the same stale
+/// factor of 2 has now been found in FOUR places — here, and in CLAUDE.md's
+/// "8 sweeps ≈ 23.6 ms ≈ 2.4% duty", which is 4 cadences × 2 families and is
+/// really 4 sweeps.
+///
+/// The comment below is unchanged and still governs: a third family is a
+/// VISIBLE edit here, never an invisible factor. It is now also a visible edit
+/// in `RANKED_OPTION_FAMILIES`, and the two must move together — the const
+/// assert below is what makes that non-optional.
+const OPTION_FAMILIES: usize = 1;
 const TOP_VOLUME_MAX_ROWS_PER_SWEEP: usize =
     tickvault_common::constants::TOP_VOLUME_PERSIST_PER_FAMILY * OPTION_FAMILIES;
 /// Worst-case ILP line width for one `top_volume` row, DERIVED below.
@@ -1517,7 +1662,46 @@ const TOP_VOLUME_MAX_ROWS_PER_SWEEP: usize =
 /// the previous occupant of this paragraph named the wrong ceiling, and a
 /// reader sizing the next change from it would have had ~450 B of imaginary
 /// room.
-const TOP_VOLUME_ILP_ROW_BYTES: usize = 596;
+///
+/// # ⚠ CORRECTED 2026-09-19 — both figures above divide by 50,000, and the
+/// # real row count is 25,000
+///
+/// `OPTION_FAMILIES` went 2 → 1 today (see its own note): the index board was
+/// dropped on 2026-09-12 and this factor was not moved with it. Every number in
+/// the two paragraphs above is therefore computed against twice the rows this
+/// pipeline can produce. Corrected:
+///
+/// | | stated above (50,000 rows) | true (25,000 rows) |
+/// |---|---|---|
+/// | wedge limit | 1,048 B | **2,097 B** |
+/// | ceiling at 596 B | 29.8 MB, 11% margin | **14.9 MB, 55% margin** |
+/// | where the depth assert fails | ~671 B | **~1,342 B** |
+///
+/// The paragraphs are left standing per house convention; this table is the
+/// operative set. The sentence "the next column added here can NOT be paid for
+/// by raising this constant again" was TRUE against 671 B and is FALSE against
+/// 1,342 B — and that mattered: a 2026-09-19 design needing ~725 B/row was
+/// priced as unaffordable against the stale ceiling before the factor was
+/// checked. **A derived constant carries the staleness of every term it
+/// derives from**, and this one had a stale term for a week while three
+/// separate notes above it were being carefully re-measured.
+///
+/// ⚠ 596 -> 792 on 2026-09-19, MEASURED by the same harness, never derived.
+/// The schema change that day removed `gain_pct` (~27 B) and added SEVEN
+/// columns — `cumulative_day_volume`, and the six candle passthroughs
+/// `percentage_change`, `open_percentage_change`, `open`, `high`, `low`,
+/// `close` — on top of the three renames, and the worst-case line went
+/// **531 -> 707 B**. 792 keeps the same ~12% headroom every step since
+/// 2026-09-13 has carried.
+///
+/// This is the fourth consecutive measurement and the standing rule held: no
+/// hand count was attempted. The corrected 25,000-row table below is what
+/// made it affordable — at 792 B the ceiling is 25,000 x 792 = **19.8 MB**
+/// against depth's 32 MiB, a **41% margin**, and the wedge limit is 2,097 B.
+/// Against the stale 50,000-row figure the same width would have read 39.6 MB
+/// and breached depth, which is exactly the false unaffordability the note
+/// below records.
+const TOP_VOLUME_ILP_ROW_BYTES: usize = 792;
 /// Worst-case sweeps the producer may hold before it drops.
 ///
 /// # ⚠ 2 → 1, forced by the corrected width above (2026-09-12)
@@ -1585,7 +1769,12 @@ const _: () = assert!(
 /// cover. Two independent terms are what make the asserts below capable of
 /// failing — the vacuous assert this replaced compared the ceiling to a factor
 /// of itself.
-const MEASURED_WORST_CASE_ILP_ROW_BYTES: usize = 531;
+/// ⚠ 531 -> 707 on 2026-09-19. Not a re-derivation: the harness built the
+/// widest line the new 23-column `write_row` can emit — every integer at its
+/// column's extreme and a full-width signed `f64` in all seven optional
+/// DOUBLEs — and reported 707 B. Update this by running the test and reading
+/// its message, never by counting.
+const MEASURED_WORST_CASE_ILP_ROW_BYTES: usize = 707;
 
 // (3) The requirement the ORIGINAL assert's message named and its arithmetic
 //     could not check: the ceiling must hold at least one worst-case sweep at
@@ -1820,28 +2009,42 @@ mod tests {
             contract: "RELIANCE-25Sep2026-1400-CE",
             security_id: 44_321,
             underlying_id: 2885,
-            volume: 117_567_970,
-            // The two inputs REPRODUCE the key beside them: 8,500 units on a
-            // 200-unit lot is 8,500 * 1000 / 200 = 42,500 milli-lots. A
-            // fixture whose inputs do not divide back to its own output would
-            // let a broken projection look right here.
+            cumulative_day_volume: 117_567_970,
+            // The two inputs REPRODUCE the two figures beside them: 8,500
+            // units on a 200-unit lot is 42.5 lots, so `total_lots_traded` is
+            // 42 (whole lots) and the percentage is +4150%. A fixture whose
+            // inputs do not divide back to its own outputs would let a broken
+            // projection look right here.
             delta_units: 8_500,
-            lot_size: 200,
-            window_lots_milli: 42_500,
-            // The transform, reproduced: 42_500 * 100 - 100_000 = 4_150_000
-            // milli-percent = +4150.000%. A fixture whose percentage does not
-            // follow from its own key would let a broken projection look right.
-            net_volume_chg_milli_pct: 4_150_000,
-            gain_pct: Some(4.25),
+            per_lot_quantity: 200,
+            total_lots_traded: 42,
+            // 42,500 milli-lots -> 42_500 * 100 - 100_000 = 4,150,000
+            // milli-percent -> 4150 whole percent. Deliberately NOT
+            // `total_lots_traded * 100 - 100` (which would be 4100): the
+            // percentage keeps the fractional lot the whole count truncates,
+            // and a fixture that agreed with the truncated derivation would
+            // pass on a projection that had silently switched to it.
+            volume_percentage_change: 4_150,
             // The fold's own reading of the SAME bar, as the projection
-            // supplies it. NEGATIVE deliberately: the candles table's volume
-            // is signed, and a fixture that only ever carried a positive one
-            // could not tell a lost sign from a working one. `0` skew is the
-            // ordinary case — the row and the bar describe the same window —
-            // and the price change is the fall that made the volume negative.
+            // supplies it. NEGATIVE volume deliberately: the candles table's
+            // volume is signed, and a fixture that only ever carried a
+            // positive one could not tell a lost sign from a working one. `0`
+            // skew is the ordinary case — the row and the bar describe the
+            // same window — and the bar-over-bar fall is what made the volume
+            // negative, so the two agree the way `signed_volume()` makes them.
             candle_volume_signed: Some(-8_500),
             candle_bucket_skew_secs: Some(0),
-            candle_price_chg_pct: Some(-0.37),
+            close_vs_prev_bar_pct: Some(-0.37),
+            // The candles table's OWN percentages, copied. Distinct VALUES
+            // from each other and from the bar-over-bar figure above, because
+            // they are three different measurements and a fixture that reused
+            // one number could not catch two of them being wired to one field.
+            percentage_change: Some(2.14),
+            open_percentage_change: Some(-1.08),
+            bar_open: Some(1_412.55),
+            bar_high: Some(1_420.00),
+            bar_low: Some(1_396.10),
+            bar_close: Some(1_397.30),
             subscribed: true,
         }
     }
@@ -1884,15 +2087,34 @@ mod tests {
     /// `contract` is a pure function of `security_id`, so it adds no identity
     /// — but a stale label on a re-emit would make the same contract a
     /// DIFFERENT key and duplicate the row, which is the collision the key
-    /// exists to prevent. `net_volume_chg_milli_pct` is the recorded value.
+    /// exists to prevent. `volume_percentage_change` is the recorded value.
     ///
     /// `rank` is asserted absent too, and stays asserted after the column was
     /// removed on 2026-09-13: an existing table still HAS the column (the
     /// self-heal path has no DROP), so a future change that started writing it
-    /// again must not be able to put it in the key by accident.
+    /// again must not be able to put it in the key by accident. The RETIRED
+    /// names (`net_volume_chg_milli_pct`, `window_lots_milli`, `lot_size`,
+    /// `gain_pct`, `candle_price_chg_pct`) stay listed for exactly that
+    /// reason — a table written before 2026-09-19 still carries them.
     #[test]
     fn the_display_columns_are_deliberately_absent_from_the_dedup_key() {
-        for banned in ["rank", "contract", "net_volume_chg_milli_pct", "gain_pct"] {
+        for banned in [
+            "rank",
+            "contract",
+            "volume_percentage_change",
+            "total_lots_traded",
+            "per_lot_quantity",
+            "cumulative_day_volume",
+            "percentage_change",
+            "open_percentage_change",
+            "close_vs_prev_bar_pct",
+            // Retired names, still asserted: an existing table has the columns.
+            "net_volume_chg_milli_pct",
+            "window_lots_milli",
+            "lot_size",
+            "gain_pct",
+            "candle_price_chg_pct",
+        ] {
             assert!(
                 !DEDUP_KEY_TOP_VOLUME_RANK
                     .split(',')
@@ -1927,23 +2149,45 @@ mod tests {
         );
     }
 
-    /// The stored percentage must FOLLOW from the stored key, exactly.
+    /// The stored percentage must FOLLOW from the stored inputs, exactly.
     ///
-    /// It is a monotone transform, not independent information — so the one
-    /// thing worth pinning is that the two never drift, in the direction the
-    /// doc names: if they disagree, the percentage is the wrong one.
+    /// It is a monotone transform of the lot count, not independent
+    /// information — so the one thing worth pinning is that the two never
+    /// drift, in the direction the doc names: if they disagree, the percentage
+    /// is the wrong one.
+    ///
+    /// The derivation goes through the MILLI-lot figure the leaderboard
+    /// computes, never through the whole `total_lots_traded` beside it: the
+    /// whole count truncates the fractional lot, and re-deriving from it would
+    /// silently round the percentage down by up to 100. The fixture carries
+    /// 42.5 lots precisely so the two derivations give DIFFERENT answers and
+    /// the wrong one cannot pass.
     #[test]
-    fn the_stored_percentage_follows_from_the_stored_key() {
+    fn the_stored_percentage_follows_from_the_stored_inputs() {
         let r = row();
+        let milli_lots = r.delta_units * 1_000 / r.per_lot_quantity;
         assert_eq!(
-            r.net_volume_chg_milli_pct,
-            r.window_lots_milli * 100 - 100_000,
-            "net_volume_chg_milli_pct must equal window_lots_milli * 100 - 100_000"
+            r.volume_percentage_change,
+            (milli_lots * 100 - 100_000) / 1_000,
+            "volume_percentage_change must equal (milli_lots * 100 - 100_000) / 1_000"
+        );
+        assert_eq!(
+            r.total_lots_traded,
+            milli_lots / 1_000,
+            "total_lots_traded must be the WHOLE lot count"
+        );
+        // The truncating derivation is a DIFFERENT number on this fixture, so
+        // the assertion above is not satisfied by both and cannot pass on a
+        // projection that switched to the cheaper form.
+        assert_ne!(
+            r.volume_percentage_change,
+            r.total_lots_traded * 100 - 100,
+            "the fixture must separate the two derivations, or neither is pinned"
         );
         // One lot is exactly zero change; below one lot is NEGATIVE, which is
         // the whole reason the change form was chosen over a ratio.
-        assert_eq!(1_000_i64 * 100 - 100_000, 0);
-        assert!(500_i64 * 100 - 100_000 < 0);
+        assert_eq!((1_000_i64 * 100 - 100_000) / 1_000, 0);
+        assert!((500_i64 * 100 - 100_000) / 1_000 < 0);
     }
 
     /// The two cadences must be distinguishable in the key, or the 5s
@@ -2162,13 +2406,13 @@ mod tests {
             "feed=dhan",
             "segment=NSE_FNO",
             "contract=RELIANCE-25Sep2026-1400-CE",
-            "net_volume_chg_milli_pct=4150000i",
+            "volume_percentage_change=4150i",
             "security_id=44321i",
-            "window_lots_milli=42500i",
+            "total_lots_traded=42i",
             "delta_units=8500i",
-            "lot_size=200i",
+            "per_lot_quantity=200i",
             "underlying_id=2885i",
-            "volume=117567970i",
+            "cumulative_day_volume=117567970i",
             "subscribed=t",
         ] {
             assert!(line.contains(expected), "missing {expected} in: {line}");
@@ -2195,22 +2439,22 @@ mod tests {
         }
     }
 
-    /// The stored inputs must DIVIDE BACK to the stored key.
+    /// The stored inputs must DIVIDE BACK to the stored lot count.
     ///
-    /// `window_lots_milli` is the number the board was ordered by;
-    /// `delta_units` and `lot_size` are the two numbers it was computed from.
-    /// If the row can carry a trio that does not satisfy its own arithmetic,
-    /// the column added "so the ordering is checkable from the table alone"
-    /// does not make it checkable.
+    /// `total_lots_traded` is what the board was ordered by (through its
+    /// milli-lot form); `delta_units` and `per_lot_quantity` are the two
+    /// numbers it was computed from. If the row can carry a trio that does not
+    /// satisfy its own arithmetic, the columns added "so the ordering is
+    /// checkable from the table alone" do not make it checkable.
     #[test]
-    fn the_stored_inputs_reproduce_the_stored_rank_key() {
+    fn the_stored_inputs_reproduce_the_stored_lot_count() {
         let r = row();
-        assert_eq!(r.lot_size, 200, "the fixture's denominator");
+        assert_eq!(r.per_lot_quantity, 200, "the fixture's denominator");
         assert_eq!(r.delta_units, 8_500, "the fixture's numerator");
         assert_eq!(
-            r.delta_units * 1_000 / r.lot_size,
-            r.window_lots_milli,
-            "8,500 units on a 200-unit lot is 42,500 milli-lots"
+            r.delta_units / r.per_lot_quantity,
+            r.total_lots_traded,
+            "8,500 units on a 200-unit lot is 42 whole lots"
         );
     }
 
@@ -2298,33 +2542,59 @@ mod tests {
         );
     }
 
-    /// An unknown underlying gain must OMIT the ILP field (QuestDB NULL) and
+    /// An unknown candle reading must OMIT the ILP fields (QuestDB NULL) and
     /// leave every other column of the row intact.
     ///
-    /// This is the bite for the 2026-09-12 fix. Before it, `gain_pct` was a
-    /// bare `f64` and an unknown gain took the ENTIRE row out of the table --
-    /// so the assertion that matters is not the absence of `gain_pct=`, it is
-    /// the PRESENCE of `volume=` beside it.
+    /// This is the bite for the 2026-09-12 fix, re-pointed on 2026-09-19 at
+    /// the columns that survived it. Before that fix, a percentage the row
+    /// could not resolve took the ENTIRE row out of the table -- so the
+    /// assertion that matters is not the absence of `percentage_change=`, it
+    /// is the PRESENCE of `cumulative_day_volume=` beside it.
+    ///
+    /// It is asserted on the CANDLE-sourced percentages because those are the
+    /// ones that can legitimately be absent now: a contract with no aggregator
+    /// slot, or one whose bar belongs to a neighbouring window, resolves none
+    /// of them. (`gain_pct`, the column this test was originally written for,
+    /// was deleted with the operator's removal of the underlying percentage
+    /// change on 2026-09-19.)
     #[test]
-    fn append_row_omits_gain_pct_when_it_is_unknown() {
+    fn append_row_omits_the_candle_percentages_when_they_are_unknown() {
         let mut w = TopVolumeRankWriter::for_test();
         let mut r = row();
-        r.gain_pct = None;
+        r.percentage_change = None;
+        r.open_percentage_change = None;
+        r.close_vs_prev_bar_pct = None;
         w.append_row(&r).expect("append");
         let line = w.buffer_utf8();
+        // ⚠ The LEADING COMMA is load-bearing and is not decoration. Every ILP
+        // field after the first is comma-prefixed, and `percentage_change` is a
+        // SUFFIX of both `volume_percentage_change` and
+        // `open_percentage_change` -- so a bare `"percentage_change="` matches
+        // the volume column that is always present and this test fails on a
+        // perfectly correct row. Found exactly that way on 2026-09-19.
+        for absent in [
+            ",percentage_change=",
+            ",open_percentage_change=",
+            ",close_vs_prev_bar_pct=",
+        ] {
+            assert!(
+                !line.contains(absent),
+                "an unknown percentage must be an ABSENT field (NULL), never a \
+                 written value -- a 0.0 there reads as a flat contract: \
+                 {absent} in {line}"
+            );
+        }
         assert!(
-            !line.contains("gain_pct="),
-            "an unknown gain must be an ABSENT field (NULL), never a written \
-             value -- a 0.0 there reads as a flat underlying: {line}"
-        );
-        assert!(
-            line.contains(&format!("volume={}i", r.volume)),
+            line.contains(&format!(
+                "cumulative_day_volume={}i",
+                r.cumulative_day_volume
+            )),
             "the row must still carry its volume -- that is the column this \
-             table exists for, and the whole reason the gain no longer drops \
-             it: {line}"
+             table exists for, and the whole reason a missing percentage no \
+             longer drops it: {line}"
         );
         assert!(
-            line.contains(&format!("window_lots_milli={}i", r.window_lots_milli)),
+            line.contains(&format!("total_lots_traded={}i", r.total_lots_traded)),
             "and the ranking key, or the ordering is uncheckable: {line}"
         );
         // No `flush` assertion: `for_test` has no sender, so a NON-EMPTY
@@ -2342,7 +2612,8 @@ mod tests {
     /// nothing measured it — the only assert over it compared `2X >= X`, which
     /// is true for every value. This test builds the widest line `write_row`
     /// can actually emit (every integer at its column's extreme, a full-width
-    /// `f64` gain, the longest real symbol values) and measures the bytes.
+    /// `f64` in every optional DOUBLE, the longest real symbol values) and
+    /// measures the bytes.
     ///
     /// It matters because past the producer ceiling this writer DROPS, and
     /// this table has no spill tier: an under-counted width means a single
@@ -2361,23 +2632,27 @@ mod tests {
             contract: "MAZAGONDOCKSHIPBUILDERS-25Sep2026-123456.75-CE",
             security_id: i64::MAX,
             underlying_id: i64::MAX,
-            volume: i64::from(u32::MAX),
+            cumulative_day_volume: i64::from(u32::MAX),
             delta_units: i64::from(u32::MAX),
-            lot_size: i64::MAX,
-            window_lots_milli: i64::MAX,
-            net_volume_chg_milli_pct: i64::MIN,
-            // A full-width shortest-repr f64 with a sign, so the widest
-            // `gain_pct` field this column can carry.
-            gain_pct: Some(-1.234_567_890_123_456_7_f64),
-            // The three fold columns at THEIR extremes too. `i64::MIN` is the
+            per_lot_quantity: i64::MAX,
+            total_lots_traded: i64::MAX,
+            volume_percentage_change: i64::MIN,
+            // Every OPTIONAL column at ITS extreme too. `i64::MIN` is the
             // widest signed integer this column can print (20 chars including
-            // the sign) and a second full-width `f64` is the widest percentage
-            // — the point of this test is that no real row can exceed the
-            // assumed width, so an optional column omitted here would
-            // under-measure exactly the case it exists to bound.
+            // the sign) and a full-width shortest-repr `f64` with a sign is
+            // the widest a percentage or a price can be -- the point of this
+            // test is that no real row can exceed the assumed width, so an
+            // optional column omitted here would under-measure exactly the
+            // case it exists to bound.
             candle_volume_signed: Some(i64::MIN),
             candle_bucket_skew_secs: Some(i64::MIN),
-            candle_price_chg_pct: Some(-1.234_567_890_123_456_7_f64),
+            close_vs_prev_bar_pct: Some(-1.234_567_890_123_456_7_f64),
+            percentage_change: Some(-1.234_567_890_123_456_7_f64),
+            open_percentage_change: Some(-1.234_567_890_123_456_7_f64),
+            bar_open: Some(-1.234_567_890_123_456_7_f64),
+            bar_high: Some(-1.234_567_890_123_456_7_f64),
+            bar_low: Some(-1.234_567_890_123_456_7_f64),
+            bar_close: Some(-1.234_567_890_123_456_7_f64),
             subscribed: true,
         };
         w.append_row(&r).expect("append");
@@ -2403,17 +2678,23 @@ mod tests {
         );
     }
 
-    /// The complement: a known gain is still written.
+    /// The complement: a known candle percentage is still written.
+    ///
+    /// Renamed from `append_row_writes_gain_pct_when_it_is_known` on
+    /// 2026-09-19 with the `gain_pct` column it covered. The property it
+    /// pinned -- an optional DOUBLE is written VERBATIM, sign included, and
+    /// is not silently rounded or dropped -- still matters, so it moves to
+    /// the column that replaced it rather than going away with the name.
     #[test]
-    fn append_row_writes_gain_pct_when_it_is_known() {
+    fn append_row_writes_a_candle_percentage_when_it_is_known() {
         let mut w = TopVolumeRankWriter::for_test();
         let mut r = row();
-        r.gain_pct = Some(-3.5);
+        r.percentage_change = Some(-3.5);
         w.append_row(&r).expect("append");
         let line = w.buffer_utf8();
         assert!(
-            line.contains("gain_pct=-3.5"),
-            "a known gain must be stored verbatim, negatives included: {line}"
+            line.contains("percentage_change=-3.5"),
+            "a known percentage must be stored verbatim, negatives included: {line}"
         );
     }
 

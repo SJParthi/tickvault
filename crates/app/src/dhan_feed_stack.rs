@@ -964,10 +964,15 @@ pub const TOP_VOLUME_APPEND_FAILURE_COUNTER: &str = "tv_top_volume_rank_append_f
 /// automatic-stop line, where a new EMF name is ~$0.30/mo and the standing
 /// rule requires a LEVER rather than a cost note).
 ///
-/// **`gain_unavailable` is EXPECTED to be non-zero** and is not a defect: it
-/// means the row was stored with a NULL `gain_pct` because the underlying had
-/// not printed yet. The other three reasons are zero on a healthy session and
-/// DO drop the row.
+/// **Every reason is zero on a healthy session.** `label_unavailable` NULLs a
+/// display column and keeps the row; the other two DROP it.
+///
+/// ⚠ This read "`gain_unavailable` is EXPECTED to be non-zero and is not a
+/// defect" until 2026-09-19. That reason and the `gain_pct` column it guarded
+/// were deleted with the operator's removal of the underlying percentage
+/// change, so there is no longer a reason that fires routinely — which means a
+/// non-zero reading on THIS counter is now always worth looking at, where
+/// before it usually was not.
 pub const TOP_VOLUME_SNAPSHOT_REFUSAL_COUNTER: &str = "tv_top_volume_snapshot_refused_total";
 
 /// Narrows a WAL frame sequence onto the `i64` `ticks.capture_seq` column.
@@ -1295,9 +1300,12 @@ pub struct LiveIngest {
     ///
     /// It shipped as a single `u64` and that number gated the throttled
     /// `warn!` for all four reasons at once. Three of the four DELETE the row
-    /// and are zero on a healthy session; the fourth, `gain_unavailable`, is
+    /// and are zero on a healthy session; the fourth, `gain_unavailable`, was
     /// the EXPECTED state near the open — before a spot price and a previous
-    /// close exist, every contract refuses.
+    /// close existed, every contract refused. (That reason was deleted
+    /// 2026-09-19 with the `gain_pct` column; the split it forced is KEPT,
+    /// because it is what stops any one common reason from suppressing the
+    /// first occurrence of a rare one.)
     ///
     /// So on an ordinary morning the benign reason drove the shared counter
     /// past 2²⁰ within a minute, and a later `RankOutOfRange` or
@@ -1315,7 +1323,8 @@ pub struct LiveIngest {
     /// `SnapshotRefusal::index`. An array rather than a labelled macro call
     /// per refusal, because a non-literal label drops `metrics::counter!` to
     /// its allocating arm on a path that runs per contract per cadence.
-    top_volume_snapshot_refusal_counters: [metrics::Counter; 4],
+    top_volume_snapshot_refusal_counters:
+        [metrics::Counter; crate::top_volume_snapshot::SnapshotRefusal::ALL.len()],
     /// Edge latch for the "every gainer verdict was Unknown" line: once per
     /// session, because the condition persists for a whole session when it
     /// happens at all and a line per 5-second sweep would be 4,680 of them.
@@ -1659,12 +1668,15 @@ impl LiveIngest {
                 continue;
             }
 
-            let prev_close = &self.prev_close;
-            // A THIRD disjoint field borrow, on the same rule as `spot_prices`
-            // and `prev_close`: the candle-fold probe in the projection below
-            // runs while `rank`'s slice is still alive, and the borrow checker
-            // permits that only because all three are named as fields rather
-            // than reached through `self`.
+            // A disjoint field borrow, on the same rule as `spot_prices`
+            // above: the candle-fold probe in the projection below runs while
+            // `rank`'s slice is still alive, and the borrow checker permits
+            // that only because both are named as fields rather than reached
+            // through `self`.
+            //
+            // A third, `prev_close`, was taken here until 2026-09-19 for the
+            // `gain_pct` closure the operator removed. Its store is still read
+            // by the gainer filter a few lines above; only this borrow is gone.
             let aggregator = &self.aggregator;
             // Resolved ONCE per sweep, not per contract — the cadence is fixed
             // for the whole pass, so a per-row match would be ~20,000 wasted
@@ -1684,35 +1696,6 @@ impl LiveIngest {
                 cadence,
                 family,
                 &ranked,
-                |underlying_id| {
-                    // The UNDERLYING's move, from the SAME two RAM stores the
-                    // gainer verdict reads a few lines above -- so the column
-                    // and the filter can never disagree about whether this
-                    // contract's stock was up.
-                    //
-                    // Until 2026-09-09 this probed the CONTRACT's own previous
-                    // close. Nothing has ever written one, so every row
-                    // returned `None` -> NaN -> refused as `NonFiniteGain`:
-                    // the table was EMPTY every session and the refusal
-                    // counter was the only place it showed.
-                    //
-                    // The first repair of that probed the underlying, but with
-                    // the STOCK segment hardcoded for BOTH families. This loop
-                    // runs Index as well, and an index option's underlying is
-                    // an index id (NIFTY=13) -- so it asked the stores for
-                    // `(13, NSE_EQ)`. That is the I-P1-11 collision, and it
-                    // fails in whichever direction the data happens to take:
-                    // no such equity and every index row is refused, or an
-                    // equity really does carry id 13 and the row is ACCEPTED
-                    // wearing that stock's percentage under an index's name.
-                    // `underlying_segment` derives it from the family, so
-                    // neither is expressible.
-                    let segment = crate::volume_leaderboard::underlying_segment(family);
-                    crate::volume_leaderboard::underlying_gain_pct(
-                        spot_prices.latest_paise(underlying_id, segment),
-                        prev_close.get(underlying_id, segment),
-                    )
-                },
                 |security_id, segment| view.is_subscribed(security_id, segment),
                 |security_id, segment| labels.get(&(security_id, segment)).map(AsRef::as_ref),
                 |security_id, segment, window_open_ist_secs| {
@@ -1771,7 +1754,19 @@ impl LiveIngest {
                             crate::top_volume_snapshot::CandleBarReading {
                                 signed_volume: bar.signed_volume(),
                                 open_bucket_advance_secs: advance,
-                                price_chg_pct: bar.close_chg_pct_from_prev_bar(),
+                                close_vs_prev_bar_pct: bar.close_chg_pct_from_prev_bar(),
+                                // COPIED, never re-derived (operator
+                                // 2026-09-19 Quote A: "no extra claucltion or
+                                // derivation"). Every one of these six is the
+                                // same field the candle writer reads for the
+                                // same bar, so the two tables agree by
+                                // construction rather than by coincidence.
+                                open: bar.open,
+                                high: bar.high,
+                                low: bar.low,
+                                close: bar.close,
+                                close_pct_from_prev_day: bar.close_pct_from_prev_day,
+                                open_pct: bar.open_pct,
                             }
                         })
                 },
@@ -1793,9 +1788,12 @@ impl LiveIngest {
                 // onset immediately and the MAGNITUDE without flooding.
                 //
                 // PER REASON since 2026-09-12 — see the field's own doc. A
-                // shared counter let the benign `gain_unavailable` flood at the
-                // open suppress the first occurrence of the three reasons that
-                // actually lose a row.
+                // shared counter let the then-benign `gain_unavailable` flood at
+                // the open suppress the first occurrence of the reasons that
+                // actually lose a row. That flood is gone with the reason
+                // itself (2026-09-19), and the per-reason split STAYS: it is
+                // what keeps a rare arithmetic refusal visible beside a common
+                // drift refusal, whichever of them is the common one next.
                 if seen.is_power_of_two() {
                     tracing::warn!(
                         code = tickvault_common::error_code::ErrorCode::WsGapConnectionState
@@ -1808,7 +1806,7 @@ impl LiveIngest {
                         // reasons — a shared number here would read as though
                         // this reason had fired that many times.
                         refusals = seen,
-                        "top_volume: a contract was refused by the snapshot projection. `gain_unavailable` is EXPECTED near the open and after a restart -- the row is still stored, with a NULL underlying-change column, so no volume is lost. Any OTHER reason drops the row and is zero on a healthy session."
+                        "top_volume: a contract was refused by the snapshot projection. `label_unavailable` still STORES the row -- only the display name is missing, so no volume is lost -- and means the label and owner snapshots have drifted. Any OTHER reason drops the row. All of them are zero on a healthy session."
                     );
                 }
             }
@@ -16848,9 +16846,9 @@ mod tests {
         assert!(
             production.contains("self.top_volume_snapshot_refusals[idx]"),
             "the session tally must be indexed BY REASON. A shared counter let \
-             `gain_unavailable` -- expected for every contract near the open -- \
-             push the throttle past 2^20 in a minute, so the next \
-             `RankOutOfRange` (which DELETES a row) logged only at the \
+             the then-common `gain_unavailable` -- expected for every contract \
+             near the open -- push the throttle past 2^20 in a minute, so the \
+             next `RankOutOfRange` (which DELETES a row) logged only at the \
              following power of two."
         );
 
@@ -16895,10 +16893,27 @@ mod tests {
         // assertion that names it, so the scan is scoped below the test module
         // and the count is asserted first. A guard that cannot fail is worse
         // than no guard, because it also reports that the case is covered.
+        // ⚠ COMMENT-STRIPPED since 2026-09-19, and that is a correctness fix
+        // rather than tidiness. The window below is measured in CHARACTERS
+        // from the emit, and the emit site carries a long explanatory comment
+        // before the `counter =` field. When that comment grew by six lines
+        // this guard went RED against perfectly correct code — the field was
+        // still on the very next log statement, just further down the file.
+        //
+        // An anchor a prose edit can move fails in the expensive direction:
+        // the next reader's cheapest fix is to widen the window until it
+        // passes, which is how a guard stops guarding. Stripping `//` lines
+        // makes the distance a property of the CODE. (Stripped inline rather
+        // than via `wal_refold_tests::strip_line_comments`, which is private
+        // to its own module — the same four lines, in scope here.)
         let production = include_str!("dhan_feed_stack.rs")
             .split("\n#[cfg(test)]")
             .next()
-            .expect("production text precedes the first test module");
+            .expect("production text precedes the first test module")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
         const EMIT: &str = "self.top_volume_snapshot_refusal_counters[idx].increment(1)";
         assert_eq!(
             production.matches(EMIT).count(),
@@ -16911,7 +16926,11 @@ mod tests {
             .split_once(EMIT)
             .expect("counted above, so this cannot fail")
             .1;
-        let window = &emit[..emit.len().min(1_600)];
+        // 600 CODE characters, tightened from the 1,600 the comment-bearing
+        // text needed. With prose out of the window the field is ~300 away,
+        // so this is still slack — but half the old reach, so a genuinely
+        // distant field is caught.
+        let window = &emit[..emit.len().min(600)];
         assert!(
             window.contains("tracing::warn!"),
             "a counter whose name ends `_refused_total` and reaches no \
