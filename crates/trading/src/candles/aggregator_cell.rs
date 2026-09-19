@@ -4269,33 +4269,38 @@ mod open_bucket_ordering_tests {
     }
 
     #[test]
-    fn the_daily_bars_close_survives_reordering_across_the_whole_session() {
-        // The same defect, at the scale where it hurt most. A 1-minute bucket
-        // gives a reordered packet a 60-second window to do damage; the daily
-        // bucket gives it the entire session, so ANY reordered packet could
-        // rewrite the day's close.
+    fn the_hour_bars_close_survives_reordering_across_the_whole_bucket() {
+        // The same defect, at the widest scale the fold still carries. A
+        // 1-minute bucket gives a reordered packet a 60-second window to do
+        // damage; the 60-minute bucket gives it a full hour, so ANY reordered
+        // packet could rewrite the hour's close.
+        //
+        // Until the 2026-09-19 nine-frame collapse this test ran on `D1` and
+        // spanned five hours — the daily frame was then the longest. `M60` is
+        // the longest now, so the ticks are re-anchored INSIDE one 09:00–10:00
+        // bucket; the property under test is unchanged.
         let mut cell = AggregatorCell::empty();
 
-        fold(&mut cell, TfIndex::D1, &tick_at(OPEN, 100.0, 10), 10);
+        fold(&mut cell, TfIndex::M60, &tick_at(OPEN, 100.0, 10), 10);
         fold(
             &mut cell,
-            TfIndex::D1,
-            &tick_at(OPEN + 5 * 3600, 250.0, 900),
+            TfIndex::M60,
+            &tick_at(OPEN + 40 * 60, 250.0, 900),
             900,
         );
-        // Fifty minutes stale, arriving last.
+        // Twenty minutes stale, arriving last.
         fold(
             &mut cell,
-            TfIndex::D1,
-            &tick_at(OPEN + 4 * 3600, 180.0, 700),
+            TfIndex::M60,
+            &tick_at(OPEN + 20 * 60, 180.0, 700),
             700,
         );
 
-        let s = cell.snapshot(TfIndex::D1);
+        let s = cell.snapshot(TfIndex::M60);
         assert_eq!(
             s.close,
             f32_to_f64_clean(250.0),
-            "the day's close must be the last TRADE, not the last delivery"
+            "the hour's close must be the last TRADE, not the last delivery"
         );
     }
 
@@ -4622,7 +4627,7 @@ mod open_bucket_ordering_tests {
         // Observable equivalence rather than field equality: the fields are
         // private and two cells that behave identically through the public
         // surface ARE the same cell as far as any caller can tell.
-        for tf in [TfIndex::S1, TfIndex::M1, TfIndex::D1] {
+        for tf in [TfIndex::S1, TfIndex::M1, TfIndex::M60] {
             assert_eq!(
                 from_default.last_sealed_snapshot(tf),
                 from_empty.last_sealed_snapshot(tf),

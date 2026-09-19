@@ -92,8 +92,12 @@ fn section8_keeps_seal_ring_claim_with_evidence_pointer() {
         // It required the literal "200,000-seal ring buffer capacity" in all
         // three rule files. `SEAL_BUFFER_CAPACITY` is not 200,000 and has not
         // been since 2026-08-10: it derives as `AGGREGATOR_MAX_SLOTS ×
-        // TF_COUNT`, which was 525,000 at TF_COUNT=21 and is 600,000 now that
-        // TF_COUNT is 24. So this guard was actively HOLDING THE OPERATOR-
+        // TF_COUNT`, which was 525,000 at TF_COUNT=21 and 600,000 at
+        // TF_COUNT=24. (It moved a THIRD time on 2026-09-19: the nine-frame
+        // collapse took TF_COUNT to 9 and the capacity to 225,000. This note
+        // deliberately does not chase it again — the assertion below pins the
+        // DERIVATION, which is why nothing here had to change.)
+        // So this guard was actively HOLDING THE OPERATOR-
         // FACING CLAIM AT A FIGURE 3× BELOW REALITY, and failing any attempt
         // to correct it — a ratchet enforcing a falsehood is worse than no
         // ratchet, because it makes the falsehood look verified.
@@ -106,8 +110,9 @@ fn section8_keeps_seal_ring_claim_with_evidence_pointer() {
             "{label} ({path}) must state the seal-ring envelope as the \
              DERIVATION `AGGREGATOR_MAX_SLOTS × TF_COUNT`, not as a literal \
              row count. A literal goes stale the next time TF_COUNT moves — \
-             it already did, twice (200,000 → 525,000 → 600,000), and this \
-             guard previously pinned the oldest of the three."
+             it already did, three times (200,000 → 525,000 → 600,000 → \
+             225,000), and this \
+             guard previously pinned the oldest of the four."
         );
         assert!(
             text.contains("`SEAL_BUFFER_CAPACITY`"),

@@ -17,9 +17,9 @@
 //!
 //! ## RAM budget
 //!
-//! `SEAL_BUFFER_CAPACITY = AGGREGATOR_MAX_SLOTS × TF_COUNT` (25,000 × 24
-//! = 600,000) and `BufferedSeal` ≤ 144 bytes → **~86 MB worst-case**.
-//! 0.26% of the r8g.xlarge 32 GiB host (operator Quote 13, 2026-08-08).
+//! `SEAL_BUFFER_CAPACITY = AGGREGATOR_MAX_SLOTS × TF_COUNT` (25,000 × 9
+//! = 225,000) and `BufferedSeal` ≤ 144 bytes → **~32 MB worst-case**.
+//! 0.10% of the r8g.xlarge 32 GiB host (operator Quote 13, 2026-08-08).
 //! Was a hardcoded 200,000 (~29 MB) until 2026-08-10 — see the constant's
 //! own doc for why that literal under-sized the midnight burst by 3×.
 //!
@@ -27,8 +27,11 @@
 //! (2026-08-14): it read "25,000 × 21 = 525,000 → ~76 MB" after `TF_COUNT`
 //! moved 21 → 24 on 2026-08-10. The constant's own doc, forty lines below,
 //! explicitly warns against doing exactly that — and this header did it
-//! anyway. The numbers above are re-derived; if you are reading them long
-//! after 2026-08-14, verify against `TF_COUNT` rather than trusting them.
+//! anyway. It went stale a SECOND time on 2026-09-19, when the nine-frame
+//! collapse took `TF_COUNT` 24 → 9 and the ring with it (600,000 → 225,000,
+//! ~86 MB → ~32 MB). Twice in five weeks, the same way. The numbers above
+//! are re-derived; if you are reading them long after 2026-09-19, verify
+//! against `TF_COUNT` rather than trusting them.
 //!
 //! ## Drop semantics on overflow
 //!
@@ -167,10 +170,15 @@ impl BufferedSeal {
 // why the product is deliberately NOT restated as a literal here.
 //
 // 144 → 152 RAISED 2026-09-10. Fleet cost: SEAL_BUFFER_CAPACITY is
-// AGGREGATOR_MAX_SLOTS × TF_COUNT = 600,000, so the ring grows 86.4 MB →
-// 91.2 MB, +4.8 MB (0.015% of the r8g.xlarge 32 GiB host). The aggregator
-// cell's own budget carries a further +~10 MB; the whole net-volume change is
-// ~15 MB, recorded in `aws-budget.md` under the same date.
+// AGGREGATOR_MAX_SLOTS × TF_COUNT = 225,000, so the ring grows 32.4 MB →
+// 34.2 MB, +1.8 MB (0.005% of the r8g.xlarge 32 GiB host). The aggregator
+// cell's own budget carries a further few MB; the whole net-volume change is
+// under 6 MB, recorded in `aws-budget.md` under the same date.
+//
+// ⚠ Those figures were 600,000 / 86.4 MB / 91.2 MB / +4.8 MB when written on
+// 2026-09-10 and are re-derived here: the 2026-09-19 nine-frame collapse took
+// TF_COUNT 24 → 9, so every product in this comment fell by 2.67×. The cost
+// of the raise itself is unchanged in SHAPE — it is the ring that shrank.
 //
 // The 152 stays a LITERAL for the same reason its sibling in
 // `aggregator_cell.rs` does: writing `size_of::<LiveCandleState>() + 16` here
@@ -409,10 +417,13 @@ mod tests {
         //
         // The old form asserted `== 200_000` while `force_seal_all` emits
         // AGGREGATOR_MAX_SLOTS × TF_COUNT (525,000 when that was written at
-        // TF_COUNT=21; 600,000 today) — so the ratchet was
+        // TF_COUNT=21; 600,000 after the 2026-08-10 raise to 24; 225,000
+        // since the 2026-09-19 nine-frame collapse) — so the ratchet was
         // actively PINNING a capacity 2.6× too small and reading as a safety
         // guarantee. Asserting the property instead of the number means
-        // raising either input can never silently outgrow the ring again.
+        // raising either input can never silently outgrow the ring again —
+        // and, as the three figures above show, LOWERING it cannot silently
+        // leave a stale literal behind either.
         assert_eq!(
             SEAL_BUFFER_CAPACITY,
             AGGREGATOR_MAX_SLOTS * TF_COUNT,

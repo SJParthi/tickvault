@@ -217,7 +217,7 @@ mod tests {
         EXCHANGE_SEGMENT_NSE_EQ, EXCHANGE_SEGMENT_NSE_FNO,
     };
     use tickvault_common::feed::Feed;
-    use tickvault_trading::candles::{LiveCandleState, TfIndex};
+    use tickvault_trading::candles::{LiveCandleState, TF_COUNT, TfIndex};
 
     fn mk_seal(sid: u64, seg: u8, tf: TfIndex, bucket: u32, close: f64) -> BufferedSeal {
         let mut state = LiveCandleState::empty();
@@ -301,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn test_table_name_dispatches_correctly_for_all_twenty_one_tfs() {
+    fn test_table_name_dispatches_correctly_for_every_frame() {
         for tf in TfIndex::ALL {
             let row = ShadowSealRow::from_buffered_seal(&mk_seal(13, 0, tf, 1_716_000_900, 100.0));
             assert_eq!(
@@ -317,29 +317,29 @@ mod tests {
         // Pin the EXACT strings so a future refactor of TfIndex doesn't
         // silently change the ILP-emitted table name (which would split
         // candles across two tables — silent data loss class bug).
+        // 2026-09-19 nine-frame collapse. Two things this list gets right
+        // that the 21-entry version it replaces did not:
+        //   - it is COMPLETE. The old list pinned 21 of the then-24 frames;
+        //     M2, M30 and M60 had no entry at all, so their table names were
+        //     unpinned while the test's name claimed otherwise.
+        //   - the length is asserted against TF_COUNT below, so a frame added
+        //     without a pin fails the build instead of going unnoticed.
         let pairs = [
             (TfIndex::M1, "candles_1m"),
             (TfIndex::M3, "candles_3m"),
             (TfIndex::M5, "candles_5m"),
             (TfIndex::M15, "candles_15m"),
-            (TfIndex::D1, "candles_1d"),
             (TfIndex::S1, "candles_1s"),
-            (TfIndex::S2, "candles_2s"),
             (TfIndex::S3, "candles_3s"),
-            (TfIndex::S4, "candles_4s"),
             (TfIndex::S5, "candles_5s"),
-            (TfIndex::S6, "candles_6s"),
-            (TfIndex::S7, "candles_7s"),
-            (TfIndex::S8, "candles_8s"),
-            (TfIndex::S9, "candles_9s"),
-            (TfIndex::S10, "candles_10s"),
-            (TfIndex::S11, "candles_11s"),
-            (TfIndex::S12, "candles_12s"),
-            (TfIndex::S13, "candles_13s"),
-            (TfIndex::S14, "candles_14s"),
-            (TfIndex::S15, "candles_15s"),
-            (TfIndex::S30, "candles_30s"),
+            (TfIndex::M30, "candles_30m"),
+            (TfIndex::M60, "candles_60m"),
         ];
+        assert_eq!(
+            pairs.len(),
+            TF_COUNT,
+            "every frame must have a pinned table name"
+        );
         for (tf, expected) in pairs {
             let row = ShadowSealRow::from_buffered_seal(&mk_seal(13, 0, tf, 1_716_000_900, 100.0));
             assert_eq!(row.table_name, expected, "TF {tf:?}");

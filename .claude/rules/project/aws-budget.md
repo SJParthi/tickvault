@@ -1189,6 +1189,55 @@ bytes**, MEASURED, not estimated.
 | `BufferedSeal` (`seal_ring.rs`) | ≤ 144 B | ≤ **152** B | ring is `SEAL_BUFFER_CAPACITY` (600,000) × this: 86.4 MB → **91.2 MB** |
 | **Total** | | | **~+15 MB** |
 
+> **⚠ CORRECTED 2026-09-19 — every figure in the table above fell by 2.67×,
+> and the one that matters is the ring.** The 2026-09-18 governing directive's
+> nine-frame collapse took `TF_COUNT` **24 → 9** on 2026-09-19, and both
+> budgets are DERIVED from it:
+>
+> | Budget | as written 2026-09-10 | after the collapse |
+> |---|---|---|
+> | `SEAL_BUFFER_CAPACITY` = `AGGREGATOR_MAX_SLOTS × TF_COUNT` | 600,000 | **225,000** |
+> | ring at ≤ 144 B | 86.4 MB | **32.4 MB** |
+> | ring at ≤ 152 B | 91.2 MB | **34.2 MB** |
+> | the raise's own fleet delta | +4.8 MB | **+1.8 MB** |
+> | `MAX_AGGREGATOR_CELL_BYTES` at 136 B | 6,784 B/instrument *(see below)* | **2,797 B/instrument** |
+> | aggregator table at the 25,000-slot ceiling | ~170 MB | **~70 MB** |
+> | **Total delta of the 2026-09-10 raise** | ~+15 MB | **~+5.4 MB** |
+>
+> **The RAISE is unchanged in shape — it is the ring that shrank**, so nothing
+> about the 2026-09-10 decision is revisited here; only its fleet arithmetic
+> is re-derived. Dollar cost remains **ZERO**: no instance change, no EBS
+> change, no new CloudWatch metric, no new alarm, no EMF name.
+>
+> Recorded as a dated correction rather than an edit in place because
+> `seal_ring.rs`'s own module header carried this same product as a literal
+> and went stale **twice in five weeks** (2026-08-14 at 21 → 24, and again
+> today at 24 → 9). The three struct-size asserts that point here
+> (`live_candle_state.rs`, `seal_ring.rs` ×2) each say *"update aws-budget.md
+> before raising"*, so this file is the one that tracks it — and a figure in
+> this file is a product of `TF_COUNT`, not a constant. **Verify against
+> `TF_COUNT` rather than trusting these numbers if you are reading them long
+> after 2026-09-19.**
+>
+> **⚠ A SECOND, INDEPENDENT staleness found while re-deriving, recorded
+> because it is the more dangerous of the two.** The `6,784 B/instrument`
+> above does not match the live formula at TF_COUNT=24 either — that formula,
+> `TF_COUNT × 136 × 2 + TF_COUNT × 21 + 160`, gives **7,192** at 24. The
+> per-frame scalar term widened (`× 4` → `× 21`) after 2026-09-10 and this
+> table was never re-derived, so the row understated the per-instrument budget
+> by ~6% on the day it was written and no one noticed for nine days. The
+> "after the collapse" column is computed from the formula **as it stands
+> today**, not by scaling the stale figure: 9 × 272 + 9 × 21 + 160 = **2,797**,
+> and 2,797 × 25,000 = **~70 MB**. The 2026-09-10 raise's own delta likewise
+> re-derives from the formula rather than from the old total: at TF_COUNT=9 the
+> 128-byte form is 2,653 and the 136-byte form is 2,797, so **+144 B per
+> instrument = +3.6 MB** at the ceiling, plus the ring's +1.8 MB = **+5.4 MB**.
+>
+> The lesson is narrower than "numbers go stale": this row is a product of
+> **two** inputs that each moved independently, and scaling the recorded total
+> by the one you noticed silently carries the other's error forward. Re-derive
+> from the constants, never from the previous row.
+
 Against the r8g.xlarge's 32 GiB (operator Quote 13) that is **0.046%** of the
 host. The aggregator table moves 0.49% → 0.52% of the machine.
 

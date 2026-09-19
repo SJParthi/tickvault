@@ -267,8 +267,8 @@ pub fn candles_named_view_ddl() -> String {
 /// # Why a view and not a `TfIndex` variant
 ///
 /// The operator ruled this entry explicitly: *"no 10s derive the 10m"*. A
-/// tenth fold frame would move `TF_COUNT` 24 → 25, which resizes the seal
-/// ring (`AGGREGATOR_MAX_SLOTS × TF_COUNT`, 600,000 today), shifts nothing
+/// tenth fold frame would move `TF_COUNT` 9 → 10, which resizes the seal
+/// ring (`AGGREGATOR_MAX_SLOTS × TF_COUNT`, 225,000 today), shifts nothing
 /// on disk but adds a scalar fold to EVERY tick — all for a frame that is
 /// recoverable exactly. Zero per-tick work is the point.
 ///

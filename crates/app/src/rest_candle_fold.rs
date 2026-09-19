@@ -204,7 +204,7 @@ pub const FOLD_BAR_CHANNEL_CAPACITY: usize = 4096;
 /// grid `TfIndex::bucket_start` produces, and the consequence is not merely
 /// under-capture: with the gate at 09:15 and the grid at 09:00, the moved
 /// frames' final buckets end PAST the 15:40 close, so they never seal at
-/// close. `test_final_session_minute_seals_everything_including_d1` measures
+/// close. `test_final_session_minute_seals_every_open_bucket` measures
 /// it directly — it expects `open_bucket_count() == 0` after the close and
 /// gets **6**. Six buckets per instrument would be carried, unsealed, into
 /// the next day.
@@ -2627,8 +2627,9 @@ mod tests {
                 TfIndex::M3,
                 TfIndex::M5,
                 TfIndex::M15,
-                TfIndex::D1,
-                TfIndex::M2,
+                // 2026-09-19: D1 and M2 retired with the nine-frame collapse;
+                // the list is still sorted by ORDINAL, which the collapse
+                // renumbered — M30 and M60 now sit at 7 and 8.
                 TfIndex::M30,
                 TfIndex::M60,
             ],
@@ -2721,7 +2722,7 @@ mod tests {
     }
 
     #[test]
-    fn test_final_session_minute_seals_everything_including_d1() {
+    fn test_final_session_minute_seals_every_open_bucket() {
         let mut e = SidFoldState::new(Feed::Dhan, 13, 0);
         // 15:39 is minute offset 374 from 09:15.
         // 2026-08-07: 374 -> 384 (session 375 -> 385 min, NSE CAS 2026-08-03).
@@ -2736,17 +2737,27 @@ mod tests {
         let FoldOutcome::Folded(sealed) = outcome else {
             panic!("expected folded");
         };
-        // Every remaining open bucket seals at close (all 5 TFs' final
-        // buckets end at 15:30 by session truncation).
+        // Every remaining open bucket seals at close. This is the property
+        // the test exists for and it is unchanged by the 2026-09-19 collapse.
         assert_eq!(e.open_bucket_count(), 0);
-        let d1 = sealed
+        // The frame-specific half DID change. Until the collapse this read
+        // the D1 seal, whose single bucket spanned the whole session — so it
+        // could assert open=100.0 (the 09:00 bar) AND close=200.5 (the 15:39
+        // bar) on ONE bucket. M60 is the widest frame now and it does not
+        // span the session: the 09:00 bar and the 15:39 bar fall in
+        // DIFFERENT hour buckets, so the final M60 seal carries only the
+        // second bar. Re-anchoring this on the LAST M60 seal keeps the
+        // "seals at close" property honest instead of asserting a
+        // whole-session bucket that no surviving frame produces.
+        let last_m60 = sealed
             .iter()
-            .find(|s| s.tf == TfIndex::D1)
-            .expect("D1 must seal at close");
-        assert_eq!(d1.bucket.open, 100.0);
-        assert_eq!(d1.bucket.close, 200.5);
-        assert_eq!(d1.bucket.bucket_start_ist_secs, OPEN);
-        assert_eq!(d1.bucket.volume, 3);
+            .filter(|s| s.tf == TfIndex::M60)
+            .next_back()
+            .expect("the widest frame must seal at close");
+        assert_eq!(last_m60.bucket.close, 200.5);
+        assert_eq!(last_m60.bucket.volume, 2);
+        // 09:00 + 6h = the 15:00 bucket, which is the one 15:39 lands in.
+        assert_eq!(last_m60.bucket.bucket_start_ist_secs, OPEN + 6 * 3_600);
     }
 
     #[test]
@@ -2756,18 +2767,22 @@ mod tests {
         // C2-era comment claimed M15 "fits EXACTLY" at [15:15, 15:30) — that
         // was true only of the 375-minute session. The final M15 bucket now
         // opens 15:30 and its natural end (15:45) TRUNCATES to the 15:40
-        // close, so M15 joins D1 as a truncating frame. Same assertion,
-        // materially different reason — worth stating so a future reader
-        // does not "restore" the exact-fit claim.
+        // close, so M15 is a truncating frame. Same assertion, materially
+        // different reason — worth stating so a future reader does not
+        // "restore" the exact-fit claim.
         let start = (DAY0 as u32) + 55_800; // 15:30 — the final M15 bucket
         assert_eq!(
             session_truncated_end(TfIndex::M15, start),
             (DAY0 as u32) + FOLD_SESSION_CLOSE_SECS_OF_DAY_IST,
             "M15 final bucket truncates at the close (natural end 15:45)"
         );
-        // D1's natural next-day end truncates to the same-day close.
+        // 2026-09-19: D1 stood here, whose natural NEXT-DAY end truncated to
+        // the same-day close. It is retired, and M60 is the widest frame now
+        // — so the truncating case moves from "a frame wider than the whole
+        // session" to "the final bucket of the widest frame". The 15:00 M60
+        // bucket's natural end is 16:00, which truncates to the 15:40 close.
         assert_eq!(
-            session_truncated_end(TfIndex::D1, OPEN),
+            session_truncated_end(TfIndex::M60, OPEN + 6 * 3_600),
             (DAY0 as u32) + FOLD_SESSION_CLOSE_SECS_OF_DAY_IST
         );
         // A mid-session M5 keeps its natural end.
@@ -3388,18 +3403,22 @@ mod tests {
         assert_eq!(state.day_map_len(), 1);
 
         // First bar of the NEXT trading day: the fold transition-seals the
-        // old day's residue (incl. its D1) and the map restarts. Today has
-        // reached day1, so the roll is legal (round-3 clamp).
+        // old day's residue (incl. the widest frame's open hour bucket) and
+        // the map restarts. Today has reached day1, so the roll is legal
+        // (round-3 clamp).
         let LiveBarAction::Folded(sealed) =
             state.apply_live_bar(&next_day_bar_at(0, 2.0, 2.0, 2.0, 2.0, 1), day1_date())
         else {
             panic!("a new day's first bar folds in-order");
         };
+        // 2026-09-19: this named D1, whose one bucket opened at OPEN. M60 is
+        // the widest frame now and its FIRST bucket opens at OPEN too, so the
+        // witness is the same instant — only the frame changed.
         assert!(
             sealed
                 .iter()
-                .any(|s| s.tf == TfIndex::D1 && s.bucket.bucket_start_ist_secs == OPEN),
-            "old day's D1 residue must seal on the day roll"
+                .any(|s| s.tf == TfIndex::M60 && s.bucket.bucket_start_ist_secs == OPEN),
+            "the old day's 09:00 hour bucket must seal on the day roll"
         );
         assert_eq!(state.day_map_len(), 1, "day-map restarts for the new day");
         let day1 = state.current_day().expect("rolled day set");

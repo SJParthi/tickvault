@@ -3076,17 +3076,32 @@ mod tests {
 
     #[test]
     fn intraday_class_covers_ticks_and_every_second_level_candle() {
-        // These six are the heaviest tables on the box after depth. Before
-        // the split they inherited `market_data_hot_days`, which at the
+        // These are the heaviest tables on the box after depth. Before the
+        // split they inherited `market_data_hot_days`, which at the
         // 25,000-instrument target commits several hundred GB on a 200 GB
         // root — and a full disk stops EVERY table, not just these.
-        for table in [
-            "ticks",
-            "candles_1s",
-            "candles_2s",
-            "candles_14s",
-            "candles_30s",
-        ] {
+        //
+        // The names stay LITERAL on purpose. `is_intraday_table` derives the
+        // boundary from `seconds_per_bucket() < SECONDS_PER_MINUTE`, so
+        // deriving the expectation from that same predicate would pass under
+        // ANY boundary constant — a tautology. A literal `candles_1s` here
+        // and a literal `candles_1m` in the test below are what actually pin
+        // the minute boundary in place.
+        //
+        // What the literals CANNOT do is notice a retired frame: this list
+        // named `candles_2s`, `candles_14s` and `candles_30s` until the
+        // 2026-09-19 collapse took TF_COUNT to 9, and all three went on
+        // asserting about tables nothing produces. The liveness check below
+        // is the half that closes that, so a future retirement fails loudly
+        // instead of leaving the boundary pinned to a ghost.
+        let live = crate::shadow_persistence::candle_table_names();
+        for table in ["ticks", "candles_1s", "candles_3s", "candles_5s"] {
+            assert!(
+                table == "ticks" || live.contains(&table),
+                "{table} is not a live candle table — a frame was retired and \
+                 this guard is now pinning the boundary to a name nothing \
+                 writes (live: {live:?})"
+            );
             assert_eq!(
                 retention_class(table),
                 RetentionClass::Intraday,
@@ -3101,7 +3116,18 @@ mod tests {
         // operator's stated requirement if it regressed: minute-level history
         // is what indicators and strategies read. Sweeping it at 2 days would
         // leave them with nothing to warm up from.
-        for table in ["candles_1m", "candles_5m", "candles_15m", "candles_1d"] {
+        //
+        // Literal, and liveness-checked, for the reasons the test above
+        // gives. This list carried `candles_1d` until the 2026-09-19 collapse
+        // retired D1.
+        let live = crate::shadow_persistence::candle_table_names();
+        for table in ["candles_1m", "candles_5m", "candles_15m", "candles_60m"] {
+            assert!(
+                live.contains(&table),
+                "{table} is not a live candle table — a frame was retired and \
+                 this guard is now pinning the boundary to a name nothing \
+                 writes (live: {live:?})"
+            );
             assert_eq!(
                 retention_class(table),
                 RetentionClass::MarketData,
