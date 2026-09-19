@@ -460,6 +460,8 @@ mod tests {
             // encode a division that `rank` would never produce.
             delta_units: u32::try_from(lots).unwrap_or(u32::MAX),
             lot_size: 1_000,
+            first_receipt_nanos: 0,
+            last_receipt_nanos: 0,
         }
     }
 

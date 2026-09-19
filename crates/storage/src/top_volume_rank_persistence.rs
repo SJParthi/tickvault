@@ -70,6 +70,9 @@
 //!     percentage_change DOUBLE,
 //!     open_percentage_change DOUBLE,
 //!     open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE,
+//!     open_latency VARCHAR, open_latency_ns LONG,
+//!     close_latency VARCHAR, close_latency_ns LONG,
+//!     window_span VARCHAR, window_span_ns LONG,
 //!     subscribed BOOLEAN
 //! ) timestamp(ts) PARTITION BY HOUR
 //!   DEDUP UPSERT KEYS(ts, tf, family, feed, security_id, segment);
@@ -685,6 +688,37 @@ pub struct TopVolumeRankRow<'a> {
     pub bar_low: Option<f64>,
     /// The bar's CLOSE — byte-identical to `candles_<tf>.close`.
     pub bar_close: Option<f64>,
+    /// How long after the window OPENED the first trade of it reached us, in
+    /// NANOSECONDS. `None` when this contract's receipt is unknown.
+    ///
+    /// # The two-column contract (operator, 2026-09-19)
+    ///
+    /// Verbatim: *"if it is below microseconds I need to know it took 100 or
+    /// 1000 microseconds, or if it is in milliseconds then the data should be
+    /// like this 100 or 200 or 123 milliseconds, or if it is in seconds then I
+    /// want to see this as 1 second or 2 seconds"*. So the table carries a
+    /// WHOLE-UNIT readable string (`open_latency`) AND this exact figure.
+    ///
+    /// **The `_ns` twin is not a convenience, it is the only sortable half.**
+    /// Text sorted descending compares the first character and stops: four real
+    /// delays of 1 second, 2 milliseconds, 3 microseconds and 4 nanoseconds sort
+    /// to `4, 3, 2, 1` — the EXACT REVERSE of their true order — and it looks
+    /// entirely plausible. Any `ORDER BY` must use this column.
+    ///
+    /// The row carries only the number; the writer renders the readable twin
+    /// from it at append time into one reusable buffer, so the pair cannot
+    /// disagree and the row stays allocation-free.
+    pub open_latency_ns: Option<i64>,
+    /// How long before the window CLOSED the last trade of it reached us, in
+    /// nanoseconds. Same contract as [`Self::open_latency_ns`].
+    pub close_latency_ns: Option<i64>,
+    /// First received trade to last received trade, in nanoseconds. `None`
+    /// unless BOTH receipts are known.
+    ///
+    /// On a contract that traded exactly once in the window this is `0`, which
+    /// is a real measurement (one trade spans no time) and not a missing one —
+    /// the missing case is `None` and renders as an empty cell.
+    pub window_span_ns: Option<i64>,
     /// Whether this contract actually held a depth subscription at this
     /// snapshot. The column that makes the table an audit rather than trivia.
     ///
@@ -696,6 +730,102 @@ pub struct TopVolumeRankRow<'a> {
     pub subscribed: bool,
 }
 
+/// The four bands of the delay renderer, in nanoseconds.
+///
+/// Each band stops SHORT of the round number above it so a value never renders
+/// as `1000 microseconds` when `1 millisecond` is the true reading: the
+/// microsecond band ends at 999,499 ns (which rounds to 999 µs) and the
+/// millisecond band begins at 999,500 ns (which rounds to 1 ms).
+const DELAY_MICRO_FLOOR_NANOS: i64 = 1_000;
+const DELAY_MILLI_FLOOR_NANOS: i64 = 999_500;
+const DELAY_SECOND_FLOOR_NANOS: i64 = 999_500_000;
+
+/// Renders a nanosecond delay as whole units of ONE band, into `out`.
+///
+/// # The contract (operator 2026-09-18, §19 §4)
+///
+/// > "if it is below microseconds I need to know it took 100 or 1000
+/// > microseconds, or if it is in milliseconds then the data should be like
+/// > this 100 or 200 or 123 milliseconds, or if it is in seconds then I want to
+/// > see this as 1 second or 2 seconds"
+///
+/// Whole units, never a decimal point, and one band per value:
+///
+/// | nanoseconds | renders as |
+/// |---|---|
+/// | `< 1,000` | whole **nanoseconds** — `4 nanoseconds` |
+/// | `1,000 .. 999,499` | whole **microseconds** — `100 microseconds` |
+/// | `999,500 .. 999,499,999` | whole **milliseconds** — `123 milliseconds` |
+/// | `>= 999,500,000` | whole **seconds** — `1 second` |
+///
+/// Rounding is to NEAREST within the band, and singular/plural follows the
+/// number (`1 second`, `2 seconds`).
+///
+/// # Why this is lossy on purpose, and why the `_ns` twin exists
+///
+/// `1 second` covers 999,500,000 .. 1,499,999,999 ns. That loss is the
+/// operator's own instruction and is confined to the SENTENCE: every delay is
+/// stored twice, and the `_ns` column always carries the exact signed figure.
+/// Nothing is lost from the table — only from the phrase.
+///
+/// **And the `_ns` twin is not a convenience.** Text sorted descending
+/// compares the first character and stops, so four real delays — 1 second,
+/// 2 milliseconds, 3 microseconds, 4 nanoseconds — sort to `4, 3, 2, 1`: the
+/// exact REVERSE of their true order, and it looks entirely plausible. Any
+/// `ORDER BY` must use the `_ns` column; the rendered string is for a human to
+/// read, never for a query to sort.
+///
+/// # Negative delays are real and are rendered with a sign
+///
+/// The drain back-dates `received_at_nanos` by ring dwell
+/// (`Utc::now() - frame.received_at.elapsed()`), so a tick can carry a receipt
+/// instant BEFORE the window it lands in. `unsigned_abs` takes the magnitude —
+/// never `abs()`, which panics on `i64::MIN` under the release profile's
+/// `overflow-checks = true` — and the sign is carried as a leading `-` so the
+/// sentence cannot silently claim a negative delay was positive.
+///
+/// # Allocation
+///
+/// Writes into a caller-owned buffer, which the caller CLEARS first. The naive
+/// `format!` shape would be three fresh `String`s per row — at the measured
+/// 20,220-contract ceiling that is 60,660 allocations per sweep, on the frame
+/// drain, in a codebase whose first principle is zero allocation on the hot
+/// path. One reused buffer is the whole difference.
+pub fn render_delay_into(out: &mut String, nanos: i64) {
+    use std::fmt::Write as _;
+
+    out.clear();
+    let magnitude = nanos.unsigned_abs();
+    if nanos < 0 {
+        out.push('-');
+    }
+    // Every band divides by its own unit with round-half-up, which is what
+    // makes 999,500 ns read as `1 millisecond` rather than `0 milliseconds`.
+    let (value, unit) = if magnitude < DELAY_MICRO_FLOOR_NANOS.unsigned_abs() {
+        (magnitude, "nanosecond")
+    } else if magnitude < DELAY_MILLI_FLOOR_NANOS.unsigned_abs() {
+        ((magnitude + 500) / 1_000, "microsecond")
+    } else if magnitude < DELAY_SECOND_FLOOR_NANOS.unsigned_abs() {
+        ((magnitude + 500_000) / 1_000_000, "millisecond")
+    } else {
+        ((magnitude + 500_000_000) / 1_000_000_000, "second")
+    };
+    // `String`'s `fmt::Write` impl is infallible, so this Result can only ever
+    // be `Ok`. It is DISCARDED rather than unwrapped because `unwrap_used` and
+    // `expect_used` are both denied outside tests, and a panic path on the
+    // frame drain — under `panic = "abort"` — for an error that cannot occur
+    // is a worse trade than an ignored Ok.
+    //
+    // `_ =` rather than `let _ =`: clippy's `let_underscore_must_use` fires on
+    // the second and not the first, and the destructuring-assignment form is
+    // the modern idiom for a deliberate discard. No `#[allow]` is needed, so
+    // none is added — the house rule requires an `// APPROVED:` beside every
+    // allow, and an allow that can be avoided should be.
+    _ = write!(out, "{value} {unit}");
+    if value != 1 {
+        out.push('s');
+    }
+}
 /// The idempotent `CREATE TABLE` DDL for `top_volume_rank`. Pure.
 ///
 /// # The three orphan columns this DDL deliberately no longer names
@@ -741,6 +871,12 @@ pub fn top_volume_rank_create_ddl() -> String {
             high          DOUBLE, \
             low           DOUBLE, \
             close         DOUBLE, \
+            open_latency  VARCHAR, \
+            open_latency_ns LONG, \
+            close_latency VARCHAR, \
+            close_latency_ns LONG, \
+            window_span   VARCHAR, \
+            window_span_ns LONG, \
             subscribed    BOOLEAN\
         ) timestamp(ts) PARTITION BY HOUR \
         DEDUP UPSERT KEYS({DEDUP_KEY_TOP_VOLUME_RANK});"
@@ -772,6 +908,12 @@ const TOP_VOLUME_RANK_COLUMNS: &[(&str, &str)] = &[
     ("high", "DOUBLE"),
     ("low", "DOUBLE"),
     ("close", "DOUBLE"),
+    ("open_latency", "VARCHAR"),
+    ("open_latency_ns", "LONG"),
+    ("close_latency", "VARCHAR"),
+    ("close_latency_ns", "LONG"),
+    ("window_span", "VARCHAR"),
+    ("window_span_ns", "LONG"),
     ("subscribed", "BOOLEAN"),
 ];
 
@@ -980,6 +1122,18 @@ pub struct TopVolumeRankWriter {
     /// needs, never 180,000 identical lines. Saturating, so a pathological
     /// session cannot panic under `overflow-checks`.
     discard_episodes: usize,
+    /// One reusable buffer for the three readable delay strings.
+    ///
+    /// A `format!` per delay per row would be 3 x 20,220 = 60,660 fresh
+    /// allocations per sweep, on the frame-drain task, in a codebase whose
+    /// first principle is zero allocation on the hot path. The in-repo
+    /// precedent is on this very struct's row type: `TopVolumeRankRow.segment`
+    /// was a `String` until 2026-09-08 and was removed for exactly this.
+    ///
+    /// Rendering CLEARS it first and every value is at most ~22 bytes, so it
+    /// reaches its final capacity on the first row and never allocates again
+    /// for the life of the writer.
+    delay_scratch: String,
     /// Set by [`TopVolumeRankWriter::split_for_offload`]. When present, `flush`
     /// hands the buffer to the writer thread instead of touching the network.
     ///
@@ -1034,6 +1188,7 @@ impl TopVolumeRankWriter {
                     buffer: b,
                     pending: 0,
                     discard_episodes: 0,
+                    delay_scratch: String::new(),
                     offload: None,
                     retained_spans: 0,
                 }
@@ -1048,6 +1203,7 @@ impl TopVolumeRankWriter {
                     buffer: Buffer::new(ProtocolVersion::V1),
                     pending: 0,
                     discard_episodes: 0,
+                    delay_scratch: String::new(),
                     offload: None,
                     retained_spans: 0,
                 }
@@ -1064,6 +1220,7 @@ impl TopVolumeRankWriter {
             buffer: Buffer::new(ProtocolVersion::V1),
             pending: 0,
             discard_episodes: 0,
+            delay_scratch: String::new(),
             offload: None,
             retained_spans: 0,
         }
@@ -1089,7 +1246,11 @@ impl TopVolumeRankWriter {
     ///
     /// # Errors
     /// Propagates ILP buffer errors (table/column append failure).
-    fn write_row(buffer: &mut Buffer, r: &TopVolumeRankRow<'_>) -> Result<()> {
+    fn write_row(
+        buffer: &mut Buffer,
+        scratch: &mut String,
+        r: &TopVolumeRankRow<'_>,
+    ) -> Result<()> {
         buffer
             .table(TOP_VOLUME_RANK_TABLE)
             .context("table")?
@@ -1176,6 +1337,28 @@ impl TopVolumeRankWriter {
         if let Some(bar_close) = r.bar_close {
             buffer.column_f64("close", bar_close).context("close")?;
         }
+        // The three delay PAIRS. Each pair is written together or not at all:
+        // the readable string and its exact nanosecond twin describe the same
+        // measurement, so a row carrying one without the other would let a
+        // reader sort on a column that is missing for half the table.
+        //
+        // A `None` here means the receipt clock is unknown for this contract
+        // (a pre-`TVW3` WAL frame carries no receipt), and the honest
+        // rendering of an unknown delay is an EMPTY cell — never
+        // `0 nanoseconds`, which would claim the fastest possible delivery.
+        for (readable, exact, value) in [
+            ("open_latency", "open_latency_ns", r.open_latency_ns),
+            ("close_latency", "close_latency_ns", r.close_latency_ns),
+            ("window_span", "window_span_ns", r.window_span_ns),
+        ] {
+            if let Some(nanos) = value {
+                render_delay_into(scratch, nanos);
+                buffer
+                    .column_str(readable, scratch.as_str())
+                    .context(readable)?;
+                buffer.column_i64(exact, nanos).context(exact)?;
+            }
+        }
         buffer
             .column_bool("subscribed", r.subscribed)
             .context("subscribed")?
@@ -1221,7 +1404,7 @@ impl TopVolumeRankWriter {
                 .set_marker()
                 .context("top_volume_rank: marker refused on a cleared buffer")?;
         }
-        match Self::write_row(&mut self.buffer, r) {
+        match Self::write_row(&mut self.buffer, &mut self.delay_scratch, r) {
             Ok(()) => {
                 self.buffer.clear_marker();
                 self.pending = self.pending.saturating_add(1);
@@ -1701,7 +1884,24 @@ const TOP_VOLUME_MAX_ROWS_PER_SWEEP: usize =
 /// Against the stale 50,000-row figure the same width would have read 39.6 MB
 /// and breached depth, which is exactly the false unaffordability the note
 /// below records.
-const TOP_VOLUME_ILP_ROW_BYTES: usize = 792;
+///
+/// ⚠ 792 -> 1040 on 2026-09-19 (LATER the same day), MEASURED by the same
+/// harness. The three delay PAIRS added six columns, and the worst-case line
+/// went **707 -> 926 B**. 1040 keeps the same ~12% headroom every step since
+/// 2026-09-13 has carried.
+///
+/// **The measurement only happened because the harness was fixed first.** Its
+/// fixture left all three delays `None`, so it would have reported 707 B
+/// unchanged and the ceiling would have been under-sized by 219 B per row with
+/// every assert green — the exact silent row loss these constants exist to
+/// prevent, arriving through the guard rather than around it. The fixture now
+/// sets all three to `i64::MIN`, their widest.
+///
+/// At 1040 B the ceiling is 25,000 x 1040 = **26.0 MB** against depth's
+/// 32 MiB, a **22.5% margin** (was 41%). That margin is real and it is
+/// shrinking: two more schema additions of this size would breach the depth
+/// relationship, and the next one should re-derive rather than assume.
+const TOP_VOLUME_ILP_ROW_BYTES: usize = 1040;
 /// Worst-case sweeps the producer may hold before it drops.
 ///
 /// # ⚠ 2 → 1, forced by the corrected width above (2026-09-12)
@@ -1774,7 +1974,14 @@ const _: () = assert!(
 /// column's extreme and a full-width signed `f64` in all seven optional
 /// DOUBLEs — and reported 707 B. Update this by running the test and reading
 /// its message, never by counting.
-const MEASURED_WORST_CASE_ILP_ROW_BYTES: usize = 707;
+/// ⚠ 707 -> 926 on 2026-09-19 (LATER the same day). The three delay pairs
+/// added six columns to `write_row`, and the widest line the 29-column writer
+/// can emit is 926 B — every integer at its column's extreme, a full-width
+/// signed `f64` in all seven optional DOUBLEs, and all three delays at
+/// `i64::MIN` (a 20-character exact column beside a 19-character
+/// `-9223372037 seconds` twin). Update this by running the test and reading
+/// its message, never by counting.
+const MEASURED_WORST_CASE_ILP_ROW_BYTES: usize = 926;
 
 // (3) The requirement the ORIGINAL assert's message named and its arithmetic
 //     could not check: the ceiling must hold at least one worst-case sweep at
@@ -2045,6 +2252,21 @@ mod tests {
             bar_high: Some(1_420.00),
             bar_low: Some(1_396.10),
             bar_close: Some(1_397.30),
+            // Real delays, because the anti-vacuity guard below derives its
+            // expectation from the column manifest: a fixture that left these
+            // `None` would declare six columns that never reach the wire.
+            //
+            // The three are internally consistent, so a projection that mixed
+            // them up would be visible here: the window is 5 s, the first
+            // trade arrived 123 ms after it opened, the last one 1 µs before
+            // it closed, and the span between them is therefore
+            // 5s - 123ms - 1us = 4.876999 s -- which RENDERS as "5 seconds",
+            // because the second band is whole-unit by the operator's own
+            // instruction. The `_ns` twin carries the exact figure, which is
+            // precisely the division of labour the pair exists for.
+            open_latency_ns: Some(123_000_000),
+            close_latency_ns: Some(1_000),
+            window_span_ns: Some(4_876_999_000),
             subscribed: true,
         }
     }
@@ -2426,14 +2648,51 @@ mod tests {
     /// keeps that test green unless someone also thinks to add it to the
     /// array. This one derives its expectation from the manifest, so a new
     /// column is covered the moment it is declared.
+    ///
+    /// # ⚠ Why the match is ANCHORED (2026-09-19), and a correction
+    ///
+    /// It used to ask `line.contains("{col}=")`, which is satisfied by any
+    /// other column whose name ENDS with this one — `volume=` is a substring
+    /// of `cumulative_day_volume=`, so `volume` has been passing vacuously
+    /// since Phase 1 began, on a line that never carried it.
+    ///
+    /// **An earlier draft of this note claimed the delay pairs added three
+    /// more of these — `open=` inside `open_latency=`, `close=` inside
+    /// `close_latency=`. That is FALSE and was refuted by bite-testing it:
+    /// the `=` sits between them, so `open_latency=` does not contain
+    /// `open=`.** The hazard is a SUFFIX collision, never a prefix one, and
+    /// recording the wrong shape would have sent the next reader looking for
+    /// the wrong thing. `volume` was and remains the only live instance.
+    ///
+    /// The anchoring is kept regardless, for two reasons that survive the
+    /// correction: it is what makes the `volume` carve-out below honest
+    /// rather than accidental, and the next suffix collision costs nothing to
+    /// have already been guarded against. It is the same substring trap
+    /// `append_row_omits_the_candle_percentages_when_they_are_unknown`
+    /// already records (`percentage_change=` inside
+    /// `volume_percentage_change=`), and the ILP field separator settles it:
+    /// a field is preceded by `,`, or by the single space that ends the
+    /// symbol section.
     #[test]
     fn every_declared_column_actually_reaches_the_wire() {
         let mut w = TopVolumeRankWriter::for_test();
         w.append_row(&row()).expect("append");
         let line = w.buffer_utf8();
         for (col, _) in TOP_VOLUME_RANK_COLUMNS {
+            // `volume` is DECLARED and deliberately not written during Phase 1
+            // — it is the Phase-2 target name for the candle's signed number.
+            // Named here rather than silently passing on a substring.
+            if *col == "volume" {
+                assert!(
+                    !line.contains(&format!(",{col}=")) && !line.contains(&format!(" {col}=")),
+                    "`volume` reached the wire during Phase 1 — one column would \
+                     then hold the vendor day total and the candle's signed \
+                     number across a partition boundary: {line}"
+                );
+                continue;
+            }
             assert!(
-                line.contains(&format!("{col}=")) || line.contains(&format!(",{col}=")),
+                line.contains(&format!(",{col}=")) || line.contains(&format!(" {col}=")),
                 "declared column {col} never reached the ILP line: {line}"
             );
         }
@@ -2654,6 +2913,16 @@ mod tests {
             bar_low: Some(-1.234_567_890_123_456_7_f64),
             bar_close: Some(-1.234_567_890_123_456_7_f64),
             subscribed: true,
+            // The three delay PAIRS at THEIR extreme, which is `i64::MIN` in
+            // every one: the exact column prints 20 characters
+            // (`-9223372036854775808`) and the readable twin renders in the
+            // SECOND band as `-9223372037 seconds`, 19 more. Leaving these
+            // `None` here would under-measure by all six columns — exactly the
+            // case this test exists to bound, and exactly the vacuity the
+            // column-manifest guard above was corrected for on the same day.
+            open_latency_ns: Some(i64::MIN),
+            close_latency_ns: Some(i64::MIN),
+            window_span_ns: Some(i64::MIN),
         };
         w.append_row(&r).expect("append");
         let width = w.buffer_utf8().len();
@@ -3012,6 +3281,162 @@ mod tests {
                  exporter until its first event, and an absent series reads as \
                  health — on a loss counter that is a false OK."
             );
+        }
+    }
+
+    /// Every band boundary, from BOTH sides, plus the two rounding hinges.
+    ///
+    /// The hinges are the point: 999,499 ns must read `999 microseconds` and
+    /// 999,500 ns must read `1 millisecond`. A band that ended on the round
+    /// number instead would render the second one as `1000 microseconds`,
+    /// which is exactly the shape the operator's instruction rules out.
+    #[test]
+    fn render_delay_into_uses_whole_units_and_never_the_round_number_above_a_band() {
+        let mut out = String::new();
+        for (nanos, expected) in [
+            (0_i64, "0 nanoseconds"),
+            (1, "1 nanosecond"),
+            (4, "4 nanoseconds"),
+            (999, "999 nanoseconds"),
+            (1_000, "1 microsecond"),
+            (100_000, "100 microseconds"),
+            (999_499, "999 microseconds"),
+            (999_500, "1 millisecond"),
+            (123_000_000, "123 milliseconds"),
+            (999_499_999, "999 milliseconds"),
+            (999_500_000, "1 second"),
+            (2_000_000_000, "2 seconds"),
+            (60_000_000_000, "60 seconds"),
+        ] {
+            render_delay_into(&mut out, nanos);
+            assert_eq!(out, expected, "{nanos} ns");
+        }
+    }
+
+    /// A negative delay renders with its sign and its magnitude, and does not
+    /// panic on `i64::MIN`.
+    ///
+    /// Both halves matter. The drain back-dates a receipt by ring dwell, so a
+    /// tick can legitimately carry an instant a hair before the boundary it
+    /// lands in — a clamp to zero would hide that. And `abs()` on `i64::MIN`
+    /// PANICS under this workspace's release profile (`overflow-checks = true`),
+    /// on the frame-drain task, so the renderer uses `unsigned_abs`.
+    #[test]
+    fn a_negative_delay_keeps_its_sign_and_i64_min_does_not_panic() {
+        let mut out = String::new();
+        render_delay_into(&mut out, -1_500_000);
+        assert_eq!(out, "-2 milliseconds");
+        render_delay_into(&mut out, -1);
+        assert_eq!(out, "-1 nanosecond");
+        // The whole point: this line panics if anyone swaps in `abs()`.
+        render_delay_into(&mut out, i64::MIN);
+        assert!(out.starts_with('-'), "sign lost on i64::MIN: {out}");
+        assert!(out.ends_with(" seconds"), "band wrong on i64::MIN: {out}");
+    }
+
+    /// The buffer is REUSED, so a longer previous value must never bleed into
+    /// a shorter next one.
+    ///
+    /// `render_delay_into` clears first. Without that, rendering `999
+    /// milliseconds` and then `1 second` would produce `1 secondiseconds`.
+    #[test]
+    fn the_reused_buffer_is_cleared_so_a_short_value_cannot_inherit_a_long_one() {
+        let mut out = String::new();
+        render_delay_into(&mut out, 999_499_999);
+        assert_eq!(out, "999 milliseconds");
+        render_delay_into(&mut out, 1);
+        assert_eq!(out, "1 nanosecond");
+    }
+
+    /// THE reason the `_ns` twin exists, demonstrated rather than asserted in
+    /// a comment.
+    ///
+    /// Four real delays, an order of magnitude apart each time. Sorted as TEXT
+    /// they come out in the EXACT REVERSE of their true order, and the result
+    /// looks entirely plausible — which is what makes it dangerous. Sorted on
+    /// the nanosecond twin they come out right. Any `ORDER BY` must use the
+    /// `_ns` column; this test fails if someone ever decides one column was
+    /// enough.
+    #[test]
+    fn sorting_the_readable_column_reverses_the_true_order_which_is_why_the_ns_twin_exists() {
+        let mut out = String::new();
+        let mut rendered: Vec<(i64, String)> = Vec::new();
+        for nanos in [1_000_000_000_i64, 2_000_000, 3_000, 4] {
+            render_delay_into(&mut out, nanos);
+            rendered.push((nanos, out.clone()));
+        }
+
+        let mut by_text = rendered.clone();
+        by_text.sort_by(|a, b| b.1.cmp(&a.1));
+        assert_eq!(
+            by_text.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            vec![4, 3_000, 2_000_000, 1_000_000_000],
+            "text descending should be wrong — if this now matches the true \
+             order the fixture stopped demonstrating the hazard"
+        );
+
+        let mut by_nanos = rendered;
+        by_nanos.sort_unstable_by_key(|(n, _)| std::cmp::Reverse(*n));
+        assert_eq!(
+            by_nanos.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            vec![1_000_000_000, 2_000_000, 3_000, 4],
+        );
+    }
+
+    /// A row with no receipt writes NEITHER half of any pair — never
+    /// `0 nanoseconds`, which would claim the fastest possible delivery for a
+    /// delay nobody measured.
+    #[test]
+    fn a_row_without_a_receipt_omits_both_halves_of_every_delay_pair() {
+        let mut w = TopVolumeRankWriter::for_test();
+        let row = TopVolumeRankRow {
+            open_latency_ns: None,
+            close_latency_ns: None,
+            window_span_ns: None,
+            ..row()
+        };
+        w.append_row(&row).expect("append");
+        let line = w.buffer_utf8();
+        for col in [
+            "open_latency=",
+            "open_latency_ns=",
+            "close_latency=",
+            "close_latency_ns=",
+            "window_span=",
+            "window_span_ns=",
+        ] {
+            assert!(
+                !line.contains(col),
+                "{col} present on a receipt-less row: {line}"
+            );
+        }
+    }
+
+    /// The present case: each pair writes BOTH halves, and the readable half
+    /// is the rendering of its own twin — so a reader can never sort on a
+    /// number that disagrees with the text beside it.
+    #[test]
+    fn each_delay_pair_writes_the_number_and_its_own_rendering() {
+        let mut w = TopVolumeRankWriter::for_test();
+        let row = TopVolumeRankRow {
+            open_latency_ns: Some(123_000_000),
+            close_latency_ns: Some(1_000),
+            window_span_ns: Some(0),
+            ..row()
+        };
+        w.append_row(&row).expect("append");
+        let line = w.buffer_utf8();
+        for fragment in [
+            "open_latency=\"123 milliseconds\"",
+            "open_latency_ns=123000000i",
+            "close_latency=\"1 microsecond\"",
+            "close_latency_ns=1000i",
+            // A contract that traded exactly ONCE spans no time. That is a
+            // real measurement, not a missing one, so it is written.
+            "window_span=\"0 nanoseconds\"",
+            "window_span_ns=0i",
+        ] {
+            assert!(line.contains(fragment), "missing {fragment} in {line}");
         }
     }
 }

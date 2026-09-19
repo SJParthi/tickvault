@@ -629,6 +629,95 @@ silence.
 
 ---
 
+
+## ✅ SHIPPED 2026-09-19 — the three delay pairs, and what the build caught
+
+The first two groups of this wave landed in #1926. This closes group 3.
+
+**Delivered:** `open_latency` / `open_latency_ns`, `close_latency` /
+`close_latency_ns`, `window_span` / `window_span_ns` on `top_volume` — the
+whole-unit four-band renderer, the exact nanosecond twin beside each, NULL on
+both halves when the receipt clock is unknown, and one writer-owned reusable
+buffer so the renderer allocates nothing per row.
+
+**Where the renderer lives, and why it moved.** `render_delay_into` was written
+in `crates/app/src/top_volume_snapshot.rs` and MOVED to
+`crates/storage/src/top_volume_rank_persistence.rs`. The dependency flow is
+`common ← core ← trading ← storage ← api ← app`, so storage cannot call into
+app; rather than duplicate the bands or push them into `common`, they sit beside
+the row type they render and beside their only consumer.
+
+**Tests added — 10, all green, all bite-proven:**
+
+*Storage (6):* the four bands and their hinges (999,499 → `999 microseconds`,
+999,500 → `1 millisecond`, 999,499,999 → `999 milliseconds`, 999,500,000 →
+`1 second`); the negative case including `i64::MIN` not panicking; the reused
+buffer cleared so a short value cannot inherit a long one; a demonstration that
+sorting the READABLE column reverses the true order (which is why the `_ns` twin
+exists — it is demonstrated, not asserted in a comment); a row with no receipt
+omitting both halves of every pair; and each pair writing the number and its own
+rendering together.
+
+*App (4):* the window's first receipt kept against two later ticks; a sweep of
+one cadence not reopening another's window; a contract with no clock reporting
+`0` on both halves; and a baseline roll clearing the stamp in lockstep with the
+baseline it was taken beside.
+
+### Two findings the guards produced
+
+**1. The worst-case row is 926 B, not 707 — and the harness would have missed
+it.** `MEASURED_WORST_CASE_ILP_ROW_BYTES` 707 → **926**, assumed
+`TOP_VOLUME_ILP_ROW_BYTES` 792 → **1040**. The harness's fixture left all three
+delays `None`, so it would have measured a row without the six new columns and
+passed, leaving the producer ceiling under-sized by 219 B per row with every
+assert green. Past that ceiling this writer DROPS and the table has no spill
+tier. Fixture now uses `i64::MIN` for all three, their widest. New margin
+against depth's 32 MiB: **22.5%, down from 41%** — stated because it is
+shrinking and the next addition must re-derive.
+
+**2. A column-manifest guard was passing vacuously.**
+`every_declared_column_actually_reaches_the_wire` matched `"{col}="`
+unanchored, so `volume` — declared but deliberately unwritten during Phase 1 of
+the rename — passed on the substring inside `cumulative_day_volume=`. Now
+anchored on the ILP field separator, with `volume` given an inverted assertion
+that fails if Phase 1 ever writes it. An earlier draft of this note claimed the
+delay columns added three more such collisions (`open=` inside
+`open_latency=`); **bite-testing refuted it** — the `=` intervenes, so the
+hazard is a suffix collision only, and `volume` is the sole live instance.
+
+**3. The `table_schema_lockstep_guard` caught the module header.** The six new
+columns were in the runtime CREATE and not in the documented schema; the guard
+named all six and the header now carries them.
+
+### Also corrected: a test doc that overclaimed
+
+Bite-testing the clear-bit guard three ways showed the first-receipt test proves
+the PAIR of guards, while the per-cadence test is the one that proves the inner
+per-window bit on its own — with a single cadence swept, all four bits move in
+lockstep so the outer early-out alone holds the stamp. The doc claimed the
+stronger thing and is corrected in place.
+
+### Verification
+
+`cargo fmt --all` clean; clippy `-D warnings -W clippy::perf` clean on every
+file this change touches (two hits fixed: a `let _` on a `#[must_use]` Result
+became a destructuring discard, and a `sort_by` in a new test became
+`sort_unstable_by_key`; the remaining workspace hits are pre-existing and
+untouched). Full suites green: **tickvault-app 2032 + 24 + integration all ok,
+0 failed**; **tickvault-storage all ok, 0 failed** (including the seven
+`seal_absorption` tests, run with 19 GB free against their 4 GiB precondition);
+**tickvault-common all ok, 0 failed**.
+
+### NOT claimed
+
+No DDL has been run against a live QuestDB and no row has been read back — port
+9000 is unreachable here and there is no docker daemon, so the first boot with
+this build is the measurement. The columns add no EMF name and no alarm: the
+September forecast measured 2026-09-06 is $142.24 against a $135.00 automatic
+`STOP_EC2_INSTANCES` line, and §2.3n requires a LEVER for the next CloudWatch
+addition. `volume` is still NOT re-pointed — Phase 2 is no earlier than
+**4 October 2026**, when the 15-day retention window has rolled past every
+Phase-1 row.
 # Item 4 — the per-minute artifact copy, and the map that had no cache at all
 
 **Status:** APPROVED
