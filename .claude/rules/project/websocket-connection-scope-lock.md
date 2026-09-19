@@ -6730,6 +6730,145 @@ can be stamped before the window it lands in. `abs()` on `i64::MIN` panics under
 the release profile's `overflow-checks = true` (pinned in CLAUDE.md), so the sign
 must be stripped with `unsigned_abs()` or an equivalent that cannot overflow.
 
+
+#### §4a — 2026-09-19 (later the same day): SHIPPED, and the two things the build caught on the way
+
+**No new authorization is claimed.** §4 above is the locked contract; this
+records what landed against it and what the guards found, because both findings
+are the kind a future reader would otherwise have to rediscover.
+
+**What shipped, exactly as §4 specifies:** three paired columns on
+`top_volume` — `open_latency` / `open_latency_ns`, `close_latency` /
+`close_latency_ns`, `window_span` / `window_span_ns`. The four bands stop short
+of the round number above them (999,499 ns renders `999 microseconds`; 999,500
+renders `1 millisecond`), the sign is stripped with `unsigned_abs` so `i64::MIN`
+cannot panic under `overflow-checks`, a missing receipt leaves BOTH halves of a
+pair NULL rather than writing `0 nanoseconds`, and the readable half is VARCHAR
+rendered into one writer-owned buffer — a `format!` per column per row would be
+3 × 20,220 = **60,660 fresh allocations per sweep** on the frame-drain task.
+
+**The measurement the stamps rest on.** `first_receipt_nanos` is PER-CADENCE
+(`[i64; WINDOW_COUNT]`) because the four windows open at four different
+instants; `last_receipt_nanos` is ONE shared value, because a window closes at
+the sweep and its last tick is the last tick whichever cadence asks. The open
+stamp is taken only when that cadence's dirty bit is CLEAR — a clear bit means
+the previous sweep consumed everything before it, so this tick is the window's
+first. Stamping unconditionally would make `open_latency` report the delay to
+the LATEST trade and collapse `window_span` toward zero on exactly the busiest
+contracts.
+
+#### ⚠ Finding 1 — the worst-case row is 926 B, not 707, and the harness that
+#### measures it would have reported 707 unchanged
+
+`MEASURED_WORST_CASE_ILP_ROW_BYTES` is re-derived **707 → 926** and the assumed
+`TOP_VOLUME_ILP_ROW_BYTES` **792 → 1040**, keeping the ~12% headroom every step
+since 2026-09-13 has carried.
+
+**The measurement only happened because the harness was fixed first.** Its
+worst-case fixture left all three delays `None`, so it would have measured a row
+WITHOUT the six new columns, reported 707 B, and passed — leaving the producer
+ceiling under-sized by 219 B per row with every assert green. Past that ceiling
+this writer DROPS and `top_volume` has **no spill tier**, so the failure mode is
+silent row loss with a perfectly healthy writer. The fixture now sets all three
+to `i64::MIN`, their widest (a 20-character exact column beside a 19-character
+`-9223372037 seconds` twin).
+
+At 1040 B the ceiling is 25,000 × 1040 = **26.0 MB** against depth's 32 MiB — a
+**22.5% margin, down from 41%**. That margin is real and shrinking: two more
+schema additions of this size would breach the depth relationship, and the next
+one must re-derive rather than assume.
+
+#### ⚠ Finding 2 — a column-manifest guard had been passing vacuously on `volume`
+
+`every_declared_column_actually_reaches_the_wire` asked
+`line.contains("{col}=")`, unanchored. That is satisfied by any column whose
+name ENDS with the one being checked — so `volume` has been passing on the
+substring inside `cumulative_day_volume=`, on a line that never carried it,
+since Phase 1 of the rename began. It is now anchored on the ILP field
+separator, and `volume` carries an explicit INVERTED assertion that fails if
+Phase 1 ever writes it.
+
+**An earlier draft of this note claimed the delay pairs added three more
+collisions of the same kind — `open=` inside `open_latency=`. That is FALSE and
+was refuted by bite-testing it:** the `=` sits between them, so `open_latency=`
+does not contain `open=`. The hazard is a SUFFIX collision, never a prefix one,
+and recording the wrong shape would have sent the next reader looking for the
+wrong thing. `volume` was and remains the only live instance.
+
+#### The bite-tests, and one test doc corrected by them
+
+Three ways, on the clear-bit guard that holds the open stamp:
+
+| broken | first-receipt test | per-cadence test |
+|---|---|---|
+| inner per-window bit test only | passes | **FAILS** |
+| outer early-out only | passes | passes |
+| both | **FAILS** | **FAILS** |
+
+The first-receipt test's own doc claimed it proved the inner bit test. It does
+not: with a single cadence ever swept all four bits move in lockstep, so the
+outer early-out alone holds the stamp and the inner condition is never reached.
+**The doc is corrected in place** rather than left standing — a test that cannot
+fail for the reason its comment gives is the vacuity class this repository keeps
+recording, here caught before it shipped rather than after.
+
+#### ⚠ Finding 3 — a helper went dormant when an ALREADY-MERGED PR deleted its
+#### only caller, and the push blocked on it
+
+The pre-push wiring guard refused the commit naming
+`volume_leaderboard::underlying_segment` as dormant. It is not part of this
+work: `git diff HEAD~1 HEAD` for that symbol returns **0**. Its last call site
+was the `gain_pct` closure, removed by **`035551a60` (PR #1926)** when the
+operator's 2026-09-18 ruling took the underlying's percentage change off the
+row — so the function was left behind, already-merged, and surfaced on the next
+push that happened to run the guard.
+
+**It is genuinely unreachable, and its siblings are not.** Checked one at a
+time rather than assumed as a group:
+
+| symbol | verdict |
+|---|---|
+| `STOCK_OPTION_UNDERLYING_SEGMENT` | **LIVE** — three production sites in `dhan_feed_stack.rs` |
+| `underlying_gainer_verdict` | **LIVE** — the gainer filter's own call site |
+| `eligible_gain_pct` | reachable only from `underlying_gain_pct` and tests, but doc-cross-referenced by **three** other modules |
+| `underlying_gain_pct` | test-only since PR #1926 |
+| `underlying_segment` | **unreachable, and referenced by nothing** |
+
+So only the last one is deleted. Widening this into a purge of the whole
+`gain_pct` family would orphan the cross-references in `prev_close_store.rs`,
+`depth20_name_board.rs` and `dhan_feed_stack.rs` that cite
+`eligible_gain_pct`'s reasoning by name, and it is not what blocked the push.
+**The remaining dormancy is RECORDED here rather than acted on** — it is a
+decision for its own change, which is this file's own standing discipline for a
+structure with no live reader.
+
+**What was NOT thrown away with it.** The deleted helper's docstring recorded a
+real hazard: an index option's `underlying_id` is an index id (NIFTY=13), and
+probing `(13, NSE_EQ)` is the I-P1-11 collision this repository bans — at worst
+an NSE cash equity carries id 13 and the row is ACCEPTED carrying that stock's
+percentage under an index's name, with no NaN to catch it. That warning is
+folded into `STOCK_OPTION_UNDERLYING_SEGMENT`'s own doc, so the next change that
+pairs an underlying id with a segment meets it. Deleting the code and the
+reasoning together would have been the cheaper half of the job.
+
+#### ⚠ NOT claimed
+
+- **That the delay strings have ever been rendered against live rows.** Port
+  9000 is unreachable from here and there is no docker daemon, so no DDL has
+  been executed against a live QuestDB and no row has been read back. The first
+  boot with this build is the measurement.
+- **That the columns make anything faster.** They make three durations readable
+  that were previously unknowable — the same claim §2.3's sixth addendum in
+  `dhan-rest-only-noise-lock-2026-07-14.md` makes for the reconnect histograms.
+- **That a delay is a network round trip.** It composes queue wait, wire write,
+  vendor processing and — on a thin option — the time until the contract's book
+  next changes. It is deliberately the UPPER bound.
+- **Any CloudWatch surface.** No EMF name and no alarm: the September forecast
+  measured 2026-09-06 is **$142.24** against an automatic `STOP_EC2_INSTANCES`
+  line of **$135.00**, and §2.3n requires a LEVER for the next addition, not a
+  cost note. The columns ARE the observability — they live in the table the
+  operator reads.
+
 #### §5 Honest envelope (mandatory per operator-charter §F)
 
 > "**O(1) per trade and per row, and nothing anywhere that grows faster than the
