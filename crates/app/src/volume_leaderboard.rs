@@ -847,6 +847,7 @@ impl Family {
 /// The complement is what turns a LOW-to-HIGH radix pass into the
 /// HIGH-to-LOW order the board wants, without a separate descending pass and
 /// without a comparator.
+#[cfg(test)]
 const RADIX_KEY_BYTES: usize = 17;
 
 /// One byte of the composite ranking key, least significant pass first.
@@ -857,6 +858,7 @@ const RADIX_KEY_BYTES: usize = 17;
 /// reads lots DESCENDING, then `security_id` ascending, then segment
 /// ascending — the three levels of
 /// [`VolumeLeaderboard::rank`]'s `sort_unstable_by`, in that order.
+#[cfg(test)]
 #[inline]
 const fn radix_key_byte(row: &RankedContract, pass: usize) -> u8 {
     match pass {
@@ -882,6 +884,7 @@ const fn radix_key_byte(row: &RankedContract, pass: usize) -> u8 {
 /// construction against [`MAX_TRACKED_CONTRACTS`] and reused by every sweep,
 /// so the ordering allocates nothing however often it runs — the same
 /// contract [`VolumeLeaderboard::scratch`] already holds.
+#[cfg(test)]
 #[derive(Debug)]
 struct RadixScratch {
     /// Indices into the row buffer, in the order built so far.
@@ -895,6 +898,7 @@ struct RadixScratch {
     counts: [u32; 256],
 }
 
+#[cfg(test)]
 impl RadixScratch {
     fn new() -> Self {
         Self {
@@ -1807,7 +1811,7 @@ impl VolumeLeaderboard {
                         delta_units = delta,
                         lot_size = lot,
                         zero_lot_total,
-                        "volume_leaderboard: a contract that TRADED in this window ranked zero milli-lots and was left off the board. Rare by design. If this is sustained and concentrated on large lot sizes, the ranking key's unit premise is wrong -- settle it on a live box with: SELECT delta_units, lot_size FROM top_volume WHERE tf='1s' LIMIT 50. delta_units a multiple of lot_size means volume arrives in LOTS and the key is inverted; unrelated small values mean the premise holds."
+                        "volume_leaderboard: a contract that TRADED in this window ranked zero milli-lots and was left off the board. Rare by design. If this is sustained and concentrated on large lot sizes, the ranking key's unit premise is wrong -- settle it on a live box with: SELECT per_lot_quantity, total_lots_traded FROM top_volume WHERE tf='1s' LIMIT 50. total_lots_traded clustering near 1000 (one lot) on the LARGEST per_lot_quantity values means volume arrives in LOTS and the key is inverted; values unrelated to lot size mean the premise holds. NOTE: the direct check -- the raw traded-unit count against the lot size -- is no longer storable, because the traded-unit column was removed from this table on 2026-09-19; this is the strongest test the surviving columns support."
                     );
                 }
                 continue;
@@ -2614,10 +2618,27 @@ mod tests {
     #[test]
     fn the_work_list_has_one_producer_and_the_gauges_are_per_cadence() {
         let src = include_str!("volume_leaderboard.rs");
+        // ⚠ Split on the test MODULE, not on a bare `#[cfg(test)]`.
+        //
+        // It used to split on `"\n#[cfg(test)]"`, which was correct while the
+        // only such attribute in the file was the one on `mod tests`. The
+        // rejected radix sort landed above it on 2026-09-19 with FOUR
+        // `#[cfg(test)]`-gated items of its own, so the slice stopped at the
+        // first of them — line 850, a thousand lines ABOVE the single
+        // `.push(key)` this test exists to count — and the count read 0.
+        //
+        // It failed LOUDLY rather than passing, which is the one direction a
+        // truncating scan is survivable in, and that is luck rather than
+        // design: the same truncation in a test asserting a BAN would have
+        // read "zero occurrences, clean" on a file it never reached.
+        //
+        // Anchoring on `mod tests` includes those gated items in the slice.
+        // That is the conservative direction on purpose: counting MORE text
+        // than production can only make an assertion stricter, never vacuous.
         let production = src
-            .split("\n#[cfg(test)]")
+            .split("\n#[cfg(test)]\nmod tests")
             .next()
-            .expect("production text precedes the first test module");
+            .expect("production text precedes the test module");
 
         assert_eq!(
             production.matches(".push(key)").count(),
@@ -2630,16 +2651,19 @@ mod tests {
         // this change pointed out that `pending.push(k)` or `list.push(*key)`
         // walks straight past it. So the TOTAL push count is pinned too: any
         // new `.push(` anywhere in the production half fails this test and the
-        // author has to come here and say which list they are pushing into.
         //
-        // The five are: the work-list producer (the only one that matters
+        // author has to come here and say which list they are pushing into.
+        // The six are: the work-list producer (the only one that matters
         // here), `scratch.push(row)` in `rank`, `seen.push`/`out.push` in
-        // `distinct_underlying_over`, and `out.push` in `gainer_eligible` —
-        // the last four all push into function-local `Vec`s that die at the
-        // end of the call and index nothing.
+        // `distinct_underlying_over`, `out.push` in `gainer_eligible`, and
+        // `self.out.push` inside the REJECTED radix sort — which is
+        // `#[cfg(test)]`-gated and compiles into no production binary, but
+        // sits above `mod tests` and so falls inside this slice. The last
+        // five all push into buffers that die at the end of the call and
+        // index nothing.
         assert_eq!(
             production.matches(".push(").count(),
-            5,
+            6,
             "a new `.push(` appeared in the production half. If it pushes into a work list \
              it is a SECOND PRODUCER and breaks the at-most-once invariant; if it pushes \
              into a function-local buffer it is harmless — decide which, then update this \
