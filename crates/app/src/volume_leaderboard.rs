@@ -797,6 +797,22 @@ impl VolumeLeaderboard {
     pub fn new() -> Self {
         // `Family::new` resolves and seeds each family's counter handles.
         Self {
+            // IDLE since 2026-09-18 (FOURTH): nothing observes an index option
+            // into this family, nothing ranks it and nothing persists it --
+            // see `dhan_feed_stack::RANKED_OPTION_FAMILIES`. It is CONSTRUCTED
+            // anyway, and the cost is stated rather than buried: ~4.2 MB
+            // committed at boot (~2.6 MB of pre-sized map plus ~1.6 MB of
+            // pre-sized dirty lists, derived at the `dirty` field above).
+            //
+            // Kept because the alternative is worse than 4.2 MB on a 32 GiB
+            // host: dropping the field makes `family_mut`/`family_ref` unable
+            // to answer for `OptionFamily::Index` at all, so re-admitting a
+            // family would be a re-shape of this struct and both selectors
+            // instead of one entry in `RANKED_OPTION_FAMILIES`. The metric
+            // handles it seeds also keep the `family="index"` series present
+            // at zero rather than absent -- an absent CloudWatch series and a
+            // healthy zero are indistinguishable, which this repository has
+            // already paid for once (the 2026-08-28 depth-spill incident).
             index: Family::new(OptionFamily::Index),
             stock: Family::new(OptionFamily::Stock),
             scratch: Vec::with_capacity(MAX_TRACKED_CONTRACTS),
