@@ -1513,33 +1513,16 @@ pub async fn run_depth_rebalance(
     let mut post_close_logged = false;
     let mut no_ranking_reported = false;
     let mut gainer_board_empty_reported = false;
-    // ---- the NAME board's two pieces of per-session state (2026-09-13) ----
-    //
-    // `future_index` is the day's nearest non-expired future per
-    // underlying. Built lazily from the contract artifact and KEPT: the
-    // artifact is a daily file and `today_ymd` is fixed for the session, so
-    // rebuilding it each minute would clone ~22,000 rows to answer an
-    // unchanged question 375 times.
+    // ---- the NAME board's one piece of per-session state (2026-09-13) ----
     //
     // `held_names` is what the board CHOSE last minute, and it is what
     // makes `DEPTH20_NAME_EXIT_RANK` mean anything: without it the band is
     // computed and discarded, the board re-orders freely every minute, and
     // the swap counters report controlled churn the whole time.
-    let mut future_index: HashMap<String, SubscribeInstrument> = HashMap::new();
-    // Whether the artifact has been READ, which is not the same question as
-    // whether it yielded any futures.
     //
-    // The retry used to be `if future_index.is_empty()`, so an artifact that
-    // parses to ZERO futures — every contract expired, the one day a rollover
-    // can produce it — was re-read and re-parsed on every one of the session's
-    // 375 iterations, each a blocking `std::fs` read and a ~22,000-row parse on
-    // the async steering task. The docstring beside it claimed the opposite
-    // ("resolved ONCE"), which is how it survived review.
-    //
-    // Retrying while UNREAD keeps the case the old guard was written for: the
-    // artifact legitimately may not exist yet at 09:00, and a permanently
-    // cached empty index would cost every name its future slot for the day.
-    let mut future_index_read = false;
+    // There is no `future_index` beside it since 2026-09-18: the operator
+    // removed the entire futures subscription, so the board places no future
+    // slot and the artifact is not read for one.
     let mut held_names: BTreeSet<(u64, u8)> = BTreeSet::new();
     loop {
         let second = u64::from(ist_second_of_day_now() % 60);
@@ -1819,13 +1802,13 @@ pub async fn run_depth_rebalance(
         // deleted:
         //
         //   1. the NAME board, whenever it can produce a steerable layout —
-        //      six stock movers with their spot, their nearest future and
-        //      their ATM ±5 ladder, plus NIFTY and BANKNIFTY at ±11,
-        //      unconditional and never displaceable by a mover;
+        //      six stock movers with their spot and their ATM ±5 ladder, plus
+        //      NIFTY and BANKNIFTY at ±11, unconditional and never
+        //      displaceable by a mover;
         //   2. otherwise exactly what ran before, unchanged.
         //
         // Step 2 is not a courtesy. The board needs a movers ranking AND a
-        // candidate slice AND the day's futures, and between 09:00 and ~09:07
+        // candidate slice, and between 09:00 and ~09:07
         // roughly 750 equities have not printed at all — so `is_steerable()`
         // is legitimately false for the first minutes of every session, which
         // is precisely the window the seed hold and the legacy layout exist
@@ -1833,50 +1816,8 @@ pub async fn run_depth_rebalance(
         if !depth20.is_empty() {
             let held_20: Vec<Vec<SubscribeInstrument>> =
                 depth20.iter().map(|s| s.held.clone()).collect();
-            // The day's futures, resolved ONCE.
-            //
-            // `today_ymd` is fixed for the session and the contract artifact
-            // is a daily file, so the nearest non-expired future per underlying
-            // cannot change under us. Rebuilding it every minute would clone
-            // ~22,000 artifact rows 375 times to answer the same question.
-            // Retried while UNREAD, not while EMPTY: the artifact can
-            // legitimately not exist yet at 09:00, so a failed READ must be
-            // retried — but a SUCCESSFUL read that yielded nothing is an
-            // answer, and re-asking it 375 times was the defect this flag
-            // closes. A genuinely all-expired artifact now costs every name
-            // its future slot for the day, loudly and once, instead of
-            // costing the steering task a 22,000-row parse every minute.
-            if !future_index_read {
-                match crate::dhan_contract_universe::read_contract_artifact(&date_ist) {
-                    Ok(rows) => {
-                        future_index_read = true;
-                        future_index = crate::depth20_name_board::future_index(&rows, today_ymd);
-                        if !future_index.is_empty() {
-                            tracing::info!(
-                                futures = future_index.len(),
-                                "depth-20 name board: nearest-expiry futures resolved for the \
-                                 session"
-                            );
-                        }
-                    }
-                    Err(err) => {
-                        // Fail-SOFT and once-ish: a name without a future is a
-                        // name one slot short, never a name that cannot be
-                        // placed. Logged at debug because before the artifact
-                        // is written this is the expected state.
-                        tracing::debug!(
-                            ?err,
-                            "depth-20 name board: no contract artifact yet, so no future slots"
-                        );
-                    }
-                }
-            }
-            let name_plan = crate::depth20_name_board::build_name_layout(
-                &candidates,
-                &movers,
-                &future_index,
-                &held_names,
-            );
+            let name_plan =
+                crate::depth20_name_board::build_name_layout(&candidates, &movers, &held_names);
             let ranking_20 = crate::depth20_ranked_steer::global_depth20_candidates().latest();
             let (plan_20, engine_20) = if name_plan.is_steerable() {
                 // Carried into next minute as the hysteresis input: the band at
@@ -1904,7 +1845,6 @@ pub async fn run_depth_rebalance(
                         capped,
                         names = name_plan.chosen.len(),
                         names_unresolved = name_plan.names_unresolved,
-                        futures_missing = name_plan.futures_missing,
                         spots_missing = name_plan.spots_missing,
                         instruments = name_plan.layout.instrument_count(),
                         "depth-20 NAME board steering this minute — six movers plus NIFTY and \

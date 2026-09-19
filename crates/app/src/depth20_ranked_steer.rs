@@ -70,7 +70,7 @@ use tickvault_core::websocket::pool_supervisor::SubscribeInstrument;
 /// What one stock name COSTS to rotate, in swaps.
 ///
 /// A name is its spot, its nearest future and its ATM window both legs —
-/// `slots_for_stock_name(DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE)`, 24 today — and
+/// `slots_for_stock_name(DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE)`, 23 today — and
 /// `plan_depth20_minute` pairs each departure with an arrival, so replacing one
 /// name is exactly that many swaps.
 ///
@@ -191,7 +191,7 @@ const _: () = assert!(
 // iteration arrives, the cap is not a cap — it is a backlog with a number on
 // it, and the next minute's `try_send` meets a queue that never emptied.
 //
-// 24 x 2 x 1 s = 48 s inside a 60 s interval. Raising the ladder, the budget or
+// 23 x 2 x 1 s = 46 s inside a 60 s interval. Raising the ladder, the budget or
 // the cap far enough to break this fails the build rather than quietly
 // producing a pool that is permanently one minute behind its own board.
 const _: () = assert!(
