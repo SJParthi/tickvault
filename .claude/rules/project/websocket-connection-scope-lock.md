@@ -7058,3 +7058,182 @@ be checked at the moment of writing. A schema contract is a claim about
 mechanisms in every row, and a rename is the most dangerous kind: it asserts that
 two things are the same number, which is precisely the assertion a name cannot
 carry on its own.
+
+### 2026-09-19 — FRESH-SCRATCH SCHEMA: the candle row is rebuilt around `ts`, and the three delays move into it
+
+**The verbatim operator demands (2026-09-19, typed directly in-session — preserve
+EXACTLY, typos and expletives included):**
+
+**Quote A (the column moves):**
+> "dude i clealry told you to make the candle table as to remove this close_pct_from_prev_day and rename the column name change_pct to percnetage_change and rename the column name open_pct to open_percentage_change dude okay? see meanwhile i clealry asked you to remvoe these right in top voluem tabel dude rmeove these columns dude okay?candle_volume_signed , candle_bucket_skew_secs, close_vs_prev_bar_pct and meanwhiel remvoe this fuckign ohlc fromt hsi top volume dude see meanwhiel put tehse columns into candles table dude not top voluem tbale dude okay? open_latency, open_latency_ns, close_latency, close_latency_ns, window_span, window_span_ns meanwhiel remvoe these also delta_units , cumulative_day_volume from top volume table dude okay? why dude first udnerstand my requirmenet why again and again making so many issues bro why once again chaneg the rpecise design dude okay?"
+
+**Quote B (fresh scratch):**
+> "jsut make this as the newer approach dude whereas it should consider this as a frehs acratch application fresh db eveyrhtign needs to ebe entirley fresh new dude okay?"
+
+**Quote C (the column ORDER + the go-ahead):**
+> "see in canlde table make the ts as first column always dude and open latency secodn column clsoe latency thrid column and window span foruth column dude and then following feed segment security id open high low close volume oi tick count etc ettc go ahead dude okay? yes bro evrythign needs ti eb the fresh new start dude okay?"
+
+**Quote D (the final placement + the name column + the anchor question):**
+> "bro put open latncy ns and close latency ns and window span ns to the final end dude okay? clelary ntoe dude ts, open latency close latency and amke window span as window span latency dude okay? then following feed etc etc etc dude okay? dude so meanwhiel now the entire feed will wokr enitltey ohlcv entilrey pruely based on this ts right dude am i rgith dude see thats why we have introduced this newer 6 columns right dude okay? remove this fuckign column dude okay? open_gap_pct. see emanwhile volume will accept this minus right dude okay dude okay? dude emanwhiel wheer si this fuckign symbol name inside candle dude i mean symbol name or contratc name or whatevr it is dude provide it dude okay? then go ahead entirley with your recommendation dude okay?"
+
+This section SUPERSEDES the 2026-09-19 §5 `top_volume` column contract and the
+2026-09-18 candle-column set. Recorded BEFORE the code, per the rule-file-first law.
+
+#### The operator's anchor question, answered on the record
+
+*"the entire feed will work entirely ohlcv entirely purely based on this ts right?"*
+**Yes — and it has been since the 2026-09-18 (SECOND) directive**, which made
+`fold_clock_ist_secs` the IDENTITY on the exchange timestamp. A trade lands in a bar
+by its EXCHANGE clock and by nothing else; the receipt clock cannot move it.
+
+The six delay columns exist because of that, not in spite of it: with the bar anchored
+on the vendor's clock, a bar built from data that arrived four seconds late is
+byte-identical to one built from data that arrived instantly. The delays are the only
+surface that separates them. They MEASURE receipt against the window; they never
+BUCKET by it. A PR that lets any delay value influence which bar a trade enters is a
+REJECT.
+
+#### `candles_<tf>` — the LOCKED column order, 22 columns
+
+| # | Column | Type |
+|---|---|---|
+| 1 | `ts` | TIMESTAMP |
+| 2 | `open_latency` | VARCHAR |
+| 3 | `close_latency` | VARCHAR |
+| 4 | `window_span_latency` | VARCHAR |
+| 5 | `feed` | SYMBOL |
+| 6 | `segment` | SYMBOL |
+| 7 | `security_id` | LONG |
+| 8 | `contract` | SYMBOL |
+| 9-12 | `open` `high` `low` `close` | DOUBLE |
+| 13 | `volume` | LONG (signed) |
+| 14 | `oi` | LONG |
+| 15 | `tick_count` | LONG |
+| 16 | `percentage_change` | DOUBLE |
+| 17 | `open_percentage_change` | DOUBLE |
+| 18 | `total_buy_qty` | LONG |
+| 19 | `total_sell_qty` | LONG |
+| 20 | `open_latency_ns` | LONG |
+| 21 | `close_latency_ns` | LONG |
+| 22 | `window_span_latency_ns` | LONG |
+
+`timestamp(ts) PARTITION BY DAY`, `DEDUP UPSERT KEYS(ts, security_id, segment, feed)`.
+Timeframes: `1s 3s 5s 1m 3m 5m 10m 15m 30m 60m` (`10m` derived as a view).
+
+**RENAMED:** `change_pct` → `percentage_change`; `open_pct` → `open_percentage_change`;
+`window_span` → `window_span_latency` (and its twin).
+**REMOVED:** `close_pct_from_prev_day`, `open_gap_pct`, `net_volume`.
+**ADDED:** the six delay columns and `contract`.
+
+#### `contract` — the name column, and why it is that name
+
+Candles carried NO name at all: an analyst reading `candles_1m` saw `security_id`
+and had to join `instrument_lifecycle` to learn what it was. `top_volume` already
+carries `contract`, so candles uses the SAME name — one name for one thing, which is
+what makes the two tables read and join identically. For an index the value is the
+index name; for an equity, the trading symbol.
+
+Resolution is O(1) and happens ONCE PER SEALED BAR, never per tick: one hash probe of
+the contract map (the same probe the volume leaderboard already makes for lot size),
+falling back to the daily master for non-option instruments. **An unresolved
+instrument leaves the column EMPTY — a guessed or fabricated name is a REJECT.**
+QuestDB SYMBOL is dictionary-encoded, so the per-row cost is the key, not the string.
+
+#### `open_gap_pct` — removed, and it costs nothing
+
+Verified 2026-09-19 by workspace scan: `open_gap_pct` has **ZERO SQL readers**. Every
+occurrence is a write site, a struct field, a spill-record byte range or a test. It has
+been written on every candle row since 2026-06-02 and read back by nothing. The FIELD
+survives on `LiveCandleState`/`SerializedSeal` (removing it would move every spill byte
+offset); only the column goes.
+
+#### `top_volume` — 15 columns, unchanged from the 2026-09-19 ruling
+
+`ts` `tf` `family` `feed` `segment` `contract` `security_id` `underlying_id` `volume`
+`per_lot_quantity` `total_lots_traded` `volume_percentage_change` `percentage_change`
+`open_percentage_change` `subscribed`.
+
+`volume_percentage_change` is THE SORT KEY, always DESCENDING. `volume` carries the
+candle's own signed number — copied, never re-derived (Quote A of 2026-09-19:
+*"no extra claucltion or derivation"*).
+
+**REMOVED (15):** `candle_volume_signed`, `candle_bucket_skew_secs`,
+`close_vs_prev_bar_pct`, `open`, `high`, `low`, `close`, `open_latency`,
+`open_latency_ns`, `close_latency`, `close_latency_ns`, `window_span`,
+`window_span_ns`, `delta_units`, `cumulative_day_volume`.
+
+**This collapses the two-phase `volume` rename** recorded in the 2026-09-19 §3. That
+phasing existed to stop one column meaning two things across a partition boundary;
+under fresh-scratch there is no old partition, so `volume` carries the candle's signed
+number from the first row.
+
+#### The fresh-scratch mechanism — ONE TIME, THIS TIME ALONE
+
+**Operator, 2026-09-19 (verbatim, typos included):**
+> "see as of now for this time alone only it shoudl be the fresh newer approach dude okay see clealry ntoe it hsodul be the fresh boot scratch fresher newer applciation dude okay?"
+
+This is NOT a standing schema-migration mechanism. It is a SINGLE NAMED ONE-SHOT,
+and the narrowing is the operator's own and is binding.
+
+A `schema_reset_log` table holds one row per reset id. At boot the app checks for
+the id **`2026-09-19-fresh-start`**. Absent → the allowlisted tables are DROPPED,
+CREATED fresh, and the id is written. Present → nothing happens, on that boot and
+on every boot after it, forever.
+
+There is exactly ONE id and it is a compile-time constant. A future schema change
+does NOT get a new one by writing code: minting a second reset id requires its own
+fresh dated operator quote in THIS file first. So the wipe cannot fire twice, cannot
+fire on a mid-session restart, and cannot be re-triggered by a later column change.
+
+**Allowlist (the ONLY tables the one-shot can reach):** `candles_<tf>` (all ten),
+`top_volume`, `ticks`, `market_depth`.
+
+**UNREACHABLE BY CONSTRUCTION — SEBI, five-year retention:**
+`instrument_lifecycle`, `instrument_lifecycle_audit`, `index_constituency`,
+`order_audit`, `order_update_events`, `position_update_events`, `ws_event_audit`.
+
+The allowlist is a literal `&[&str]` checked against the SEBI set at build time, so a
+SEBI table added to it fails the build rather than the boot.
+
+Every self-heal `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` for a removed column is
+DELETED in the same change. QuestDB can add a column but never drop or rename one, so
+a surviving self-heal silently re-adds what the CREATE just removed — the trap this
+file already records for `net_volume`.
+
+**Fail direction:** an unreadable or unwritable `schema_reset_log` REFUSES the wipe and
+boots on whatever schema exists, loudly — it never wipes on a guess. A wipe that ran but
+whose id could not be written would repeat, so the id write and the drops are ordered
+id-last-but-verified: the boot re-reads the id it just wrote and fails loudly if absent.
+
+#### ⚠ NOT claimed
+
+- That the DDL has been accepted by a live QuestDB. Port 9000 is unreachable from the
+  build container; the first boot after deploy is the measurement.
+- That the delay columns make anything faster. They make three durations readable that
+  were previously unknowable.
+- That a delay is a network round trip. It composes queue wait, wire write, vendor
+  processing, and — on a thin option — the time until the book next changes. It is
+  deliberately the UPPER bound.
+- Any CloudWatch surface. These are columns in the table the operator reads, not
+  metrics; §2.3n of the noise lock requires a LEVER for the next alarm, not a cost note.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Lets any delay value influence which bar a trade enters (`ts` alone buckets).
+- Reorders the candle columns away from the locked order above.
+- Ships a `_ns` twin anywhere but the final three positions.
+- Keeps a self-heal `ALTER` for `open_gap_pct`, `close_pct_from_prev_day`,
+  `net_volume`, `change_pct` or `open_pct`.
+- Sorts any delay on the VARCHAR column — text descending puts `1 second`,
+  `2 milliseconds`, `3 microseconds`, `4 nanoseconds` in the order 4, 3, 2, 1: the
+  exact reverse, and it looks plausible.
+- Renders a missing receipt as `0 nanoseconds` rather than leaving BOTH halves NULL.
+- Uses `abs()` on a delay (panics on `i64::MIN` under `overflow-checks`).
+- Stores a delay as SYMBOL (near-unique per row — the dictionary would be the table).
+- Fabricates a `contract` name for an unresolved instrument.
+- Re-derives any candle number inside the `top_volume` writer instead of copying it.
+- Points the fresh-scratch allowlist at ANY SEBI or audit table.
+- Mints a SECOND reset id, or makes the id anything but a compile-time constant, without its own fresh dated operator quote here first (the operator narrowed this to THIS TIME ALONE).
+- Runs the wipe on a mid-session restart, or on any boot after the id is written.
+- Allocates per row on the frame-drain task: the naive `format!` shape is three strings
+  per row; use the writer-owned reusable buffer.

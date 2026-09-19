@@ -694,8 +694,8 @@ pub fn build_movers_query(today_ist_micros: i64) -> String {
     let market_open_micros =
         today_ist_micros.saturating_add(MARKET_OPEN_SECS_OF_DAY_IST.saturating_mul(1_000_000));
     format!(
-        "SELECT c.security_id, il.symbol_name, c.close_pct_from_prev_day \
-         FROM (SELECT security_id, close_pct_from_prev_day FROM candles_1m \
+        "SELECT c.security_id, il.symbol_name, c.percentage_change AS close_pct_from_prev_day \
+         FROM (SELECT security_id, percentage_change FROM candles_1m \
          WHERE feed = 'dhan' AND segment = '{segment}' AND ts >= {market_open_micros} \
          LATEST ON ts PARTITION BY security_id) c \
          JOIN (SELECT security_id, symbol_name FROM instrument_lifecycle \

@@ -469,16 +469,16 @@ impl ShadowCandleWriter {
             .with_context(|| "candle append: column_i64(oi) failed")?
             .column_i64("tick_count", row.tick_count)
             .with_context(|| "candle append: column_i64(tick_count) failed")?
-            .column_f64("close_pct_from_prev_day", row.close_pct_from_prev_day)
-            .with_context(|| "candle append: column_f64(close_pct_from_prev_day) failed")?
-            // §31 Option 2: % change vs the official 09:15 session open.
-            .column_f64("open_pct", row.open_pct)
-            .with_context(|| "candle append: column_f64(open_pct) failed")?
-            // Operator request 2026-06-02: headline day change % + opening gap %.
-            .column_f64("change_pct", row.change_pct)
-            .with_context(|| "candle append: column_f64(change_pct) failed")?
-            .column_f64("open_gap_pct", row.open_gap_pct)
-            .with_context(|| "candle append: column_f64(open_gap_pct) failed")?
+            // The bar's headline move: close vs YESTERDAY's close. Renamed
+            // from `change_pct` 2026-09-19. Its byte-identical twin
+            // `close_pct_from_prev_day` is GONE — both were filled from the
+            // same `state.close_pct_from_prev_day`, so one name survives and
+            // the struct field keeps its original name.
+            .column_f64("percentage_change", row.change_pct)
+            .with_context(|| "candle append: column_f64(percentage_change) failed")?
+            // Close vs TODAY's 09:15 session open. Renamed from `open_pct`.
+            .column_f64("open_percentage_change", row.open_pct)
+            .with_context(|| "candle append: column_f64(open_percentage_change) failed")?
             // The vendor's PENDING order-book totals at this bar's last
             // observed packet — resting orders, NOT executed volume. Written
             // unconditionally, `0` included: the fold has already applied the
@@ -1011,27 +1011,80 @@ mod tests {
         assert!(s.contains("close="), "close column missing in {s}");
     }
 
+    /// Does the ILP line carry `name` as a field of its OWN, rather than as the
+    /// tail of a longer field name?
+    ///
+    /// Load-bearing since the 2026-09-19 rename: `open_percentage_change=`
+    /// CONTAINS `percentage_change=`, so a plain `contains` would report the
+    /// renamed column as present when only its open-variant sibling was
+    /// written. ILP separates fields with `,` (or a space before the first),
+    /// so the character before the name must not be part of an identifier.
+    fn has_ilp_field(line: &str, name: &str) -> bool {
+        let needle = format!("{name}=");
+        let mut from = 0usize;
+        while let Some(rel) = line[from..].find(&needle) {
+            let at = from + rel;
+            let prev_is_identifier = line[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+            if !prev_is_identifier {
+                return true;
+            }
+            from = at + needle.len();
+        }
+        false
+    }
+
     #[test]
-    fn test_append_seal_buffer_writes_close_pct_only() {
-        // PR-4b (2026-05-28): the 11-column schema writes
-        // `close_pct_from_prev_day` but NOT the oi/volume pct columns —
-        // spot has no OI and indices no volume, so those stay dropped.
+    fn test_append_seal_buffer_writes_the_two_renamed_pct_columns_only() {
+        // 2026-09-19 schema reset. The wire carries exactly two percentage
+        // columns, both renamed: `percentage_change` (was `change_pct`) and
+        // `open_percentage_change` (was `open_pct`).
+        //
+        // The removal half is the half that matters. ILP AUTO-CREATES any
+        // column a writer names, so a single leftover append silently
+        // re-creates `close_pct_from_prev_day` or `open_gap_pct` on a fresh
+        // table — undoing the reset with nothing failing. `oi_pct` and
+        // `volume_pct` were never written (spot has no OI, indices no volume)
+        // and are kept here as the original PR-4b assertion.
         let mut w = ShadowCandleWriter::for_test();
         w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("append");
         let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
+
         assert!(
-            s.contains("close_pct_from_prev_day="),
-            "close_pct MUST be written in {s}"
+            has_ilp_field(s, "percentage_change"),
+            "percentage_change MUST be written in {s}"
         );
         assert!(
-            !s.contains("oi_pct_from_prev_day"),
-            "oi_pct must NOT be written in {s}"
+            has_ilp_field(s, "open_percentage_change"),
+            "open_percentage_change MUST be written in {s}"
         );
-        assert!(
-            !s.contains("volume_pct_from_prev_day"),
-            "volume_pct must NOT be written in {s}"
-        );
+        for gone in [
+            "close_pct_from_prev_day",
+            "open_gap_pct",
+            "change_pct",
+            "open_pct",
+            "oi_pct_from_prev_day",
+            "volume_pct_from_prev_day",
+        ] {
+            assert!(
+                !has_ilp_field(s, gone),
+                "`{gone}` must NOT be written — ILP auto-creates the column in {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn self_test_has_ilp_field_is_boundary_aware() {
+        // Bite-proof for the helper above: without the boundary check the
+        // removal loop passes vacuously and the presence check reports a
+        // column that was never written.
+        let line = "candles_1m,feed=dhan open_percentage_change=0.4 123";
+        assert!(has_ilp_field(line, "open_percentage_change"));
+        assert!(!has_ilp_field(line, "percentage_change"));
+        assert!(has_ilp_field("a percentage_change=1", "percentage_change"));
     }
 
     #[test]

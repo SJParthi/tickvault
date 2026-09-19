@@ -16,14 +16,23 @@
 //!   (operator 2026-06-19, "same tables + feed column") keeps Dhan and
 //!   Groww candles for the same minute/instrument distinct, never merged.
 //!
-//! ## Schema (18 columns)
+//! ## Schema (22 columns)
+//!
+//! Column ORDER is the operator's, verbatim (2026-09-19): `ts` first, then
+//! the three READABLE delays, then identity, then OHLCV, then the two
+//! percentages, and the three exact `_ns` twins LAST. A reader scanning left
+//! to right meets the bar's identity and its freshness before a price.
 //!
 //! ```sql
 //! CREATE TABLE IF NOT EXISTS candles_1m (
+//!     ts                       TIMESTAMP,
+//!     open_latency             VARCHAR,
+//!     close_latency            VARCHAR,
+//!     window_span_latency      VARCHAR,
 //!     feed                     SYMBOL,
 //!     segment                  SYMBOL,
 //!     security_id              LONG,
-//!     ts                       TIMESTAMP,
+//!     contract                 SYMBOL,
 //!     open                     DOUBLE,
 //!     high                     DOUBLE,
 //!     low                      DOUBLE,
@@ -31,12 +40,13 @@
 //!     volume                   LONG,   -- SIGNED: see the note below
 //!     oi                       LONG,
 //!     tick_count               LONG,
-//!     close_pct_from_prev_day  DOUBLE,
-//!     open_pct                 DOUBLE,
-//!     change_pct               DOUBLE,
-//!     open_gap_pct             DOUBLE,
+//!     percentage_change        DOUBLE,
+//!     open_percentage_change   DOUBLE,
 //!     total_buy_qty            LONG,
-//!     total_sell_qty           LONG
+//!     total_sell_qty           LONG,
+//!     open_latency_ns          LONG,
+//!     close_latency_ns         LONG,
+//!     window_span_latency_ns   LONG
 //! ) timestamp(ts) PARTITION BY DAY
 //!   DEDUP UPSERT KEYS(ts, security_id, segment, feed);
 //! ```
@@ -94,8 +104,6 @@ use tracing::{error, info, warn};
 use tickvault_common::config::QuestDbConfig;
 use tickvault_trading::candles::{TF_COUNT, TfIndex};
 
-use crate::shadow_candle_writer::CANDLE_FEED_DHAN;
-
 // ---------------------------------------------------------------------------
 // QuestDB table names — one per timeframe.
 //
@@ -133,6 +141,42 @@ use crate::shadow_candle_writer::CANDLE_FEED_DHAN;
 /// pre-existing NULL-feed row (`UPDATE ... WHERE feed IS NULL`) BEFORE
 /// re-enabling DEDUP — so post-migration same-minute re-seals upsert cleanly.
 pub const DEDUP_KEY_CANDLES: &str = "ts, security_id, segment, feed";
+
+/// Every candle column the CREATE below still declares, paired with its type,
+/// for the boot self-heal that brings an OLDER table up to the current shape.
+///
+/// ⚠ This list holds ONLY columns that are in the CREATE. A removed column
+/// must never appear here: QuestDB can add a column but never drop or rename
+/// one, so a self-heal naming a removed column re-adds on the next boot
+/// exactly what the reset took out — the trap this repository already recorded
+/// for `net_volume`. `change_pct`, `open_pct`, `open_gap_pct`,
+/// `close_pct_from_prev_day` and `net_volume` are absent on purpose.
+///
+/// `ts` is excluded because it is the designated timestamp, which
+/// `ALTER TABLE ... ADD COLUMN` cannot create.
+const CANDLE_SELF_HEAL_COLUMNS: &[(&str, &str)] = &[
+    ("open_latency", "VARCHAR"),
+    ("close_latency", "VARCHAR"),
+    ("window_span_latency", "VARCHAR"),
+    ("feed", "SYMBOL"),
+    ("segment", "SYMBOL"),
+    ("security_id", "LONG"),
+    ("contract", "SYMBOL"),
+    ("open", "DOUBLE"),
+    ("high", "DOUBLE"),
+    ("low", "DOUBLE"),
+    ("close", "DOUBLE"),
+    ("volume", "LONG"),
+    ("oi", "LONG"),
+    ("tick_count", "LONG"),
+    ("percentage_change", "DOUBLE"),
+    ("open_percentage_change", "DOUBLE"),
+    ("total_buy_qty", "LONG"),
+    ("total_sell_qty", "LONG"),
+    ("open_latency_ns", "LONG"),
+    ("close_latency_ns", "LONG"),
+    ("window_span_latency_ns", "LONG"),
+];
 
 // ---------------------------------------------------------------------------
 // Public helpers — aggregate the table names for downstream consumers.
@@ -293,12 +337,65 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) -> bool
                 "candle table dropped — security_id INT→LONG self-heal"
             );
         }
+        // ── The 2026-09-19 fresh-scratch candle row ──────────────────────
+        //
+        // Column ORDER is the operator's, verbatim (2026-09-19, recorded in
+        // `websocket-connection-scope-lock.md`): `ts` first, then the three
+        // READABLE delays, then feed / segment / security_id / contract, then
+        // OHLCV, then the percentages, and the three exact `_ns` twins LAST.
+        // A reader scanning left to right meets the bar's identity and its
+        // freshness before a single price. Reordering these is a REJECT.
+        //
+        // `ts` is the window OPEN, stamped from the EXCHANGE trade clock and
+        // nothing else (`fold_clock_ist_secs` is the identity on
+        // `exchange_timestamp` since 2026-09-18). The six delay columns MEASURE
+        // our receipt against that window; they never MOVE a trade into a
+        // different bar. That is the whole reason they exist: with the bar
+        // anchored on the vendor's clock, a bar built from data that arrived
+        // four seconds late is byte-identical to one built instantly, and these
+        // columns are the only surface that separates them.
+        //
+        // `volume` is SIGNED — one column that accepts a minus, matching the
+        // vendor's net volume with no derivation anywhere downstream.
+        //
+        // `contract` is the instrument's NAME, resolved O(1) ONCE PER SEALED
+        // BAR (never per tick) and left EMPTY when unresolved — a fabricated
+        // name is a REJECT. It carries the same column name as
+        // `top_volume.contract` so the two tables read and join identically.
+        //
+        // REMOVED here and NEVER self-healed back: `open_gap_pct`,
+        // `close_pct_from_prev_day` (a byte-identical duplicate of
+        // `change_pct` — `shadow_seal_columns::from_buffered_seal` fills both
+        // from the SAME `state.close_pct_from_prev_day`), and `net_volume`.
+        // RENAMED: `change_pct` -> `percentage_change`, `open_pct` ->
+        // `open_percentage_change`.
+        //
+        // ⚠ CORRECTED 2026-09-19, hours after the first draft of this block
+        // was written. That draft claimed `open_gap_pct` has "zero SQL
+        // readers, verified". THAT CLAIM IS FALSE and the same sentence went
+        // into the scope-lock rule file. `console_views.rs::candles_named_view_ddl`
+        // selects it, along with all three of the other percentages, so the
+        // `candles_named` view would have failed to create on a fresh volume
+        // and the operator would have lost the entire named candle face — the
+        // exact failure that file's own doc warns about for `net_volume`.
+        // `close_pct_from_prev_day` had a SECOND reader the draft also missed:
+        // `depth_rebalance.rs` ranks the depth-steering board from it, so a
+        // missed rename returns nothing, the board ranks nothing, and every
+        // counter and alarm stays green. Both readers are repointed in the
+        // same change as this correction. The reusable half: a claim that a
+        // column has no readers is one `grep -rn` away and must be RE-RUN at
+        // the moment of writing, never carried forward from a scan taken
+        // against a different column.
         let create_ddl = format!(
             "CREATE TABLE IF NOT EXISTS {table} (\
+                ts                          TIMESTAMP, \
+                open_latency                VARCHAR, \
+                close_latency               VARCHAR, \
+                window_span_latency         VARCHAR, \
                 feed                        SYMBOL, \
                 segment                     SYMBOL, \
                 security_id                 LONG, \
-                ts                          TIMESTAMP, \
+                contract                    SYMBOL, \
                 open                        DOUBLE, \
                 high                        DOUBLE, \
                 low                         DOUBLE, \
@@ -306,101 +403,45 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) -> bool
                 volume                      LONG, \
                 oi                          LONG, \
                 tick_count                  LONG, \
-                close_pct_from_prev_day     DOUBLE, \
-                open_pct                    DOUBLE, \
-                change_pct                  DOUBLE, \
-                open_gap_pct                DOUBLE, \
+                percentage_change           DOUBLE, \
+                open_percentage_change      DOUBLE, \
                 total_buy_qty               LONG, \
-                total_sell_qty              LONG\
+                total_sell_qty              LONG, \
+                open_latency_ns             LONG, \
+                close_latency_ns            LONG, \
+                window_span_latency_ns      LONG\
             ) timestamp(ts) PARTITION BY DAY \
             DEDUP UPSERT KEYS({DEDUP_KEY_CANDLES});"
         );
         all_keyed &= run_ddl(&client, &base_url, table, &create_ddl).await;
 
-        // Schema self-heal: candle tables created before the
-        // close_pct_from_prev_day column existed (pre-2026-05-28 Engine-B
-        // 10-col schema) auto-migrate. QuestDB ignores the ADD when the
-        // column already exists, so running every boot is free (per
-        // observability-architecture.md "Schema self-heal at boot").
-        let alter_ddl =
-            format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS close_pct_from_prev_day DOUBLE;");
-        let _ = run_ddl(&client, &base_url, table, &alter_ddl).await;
+        // Schema self-heal, for the NEW column set ONLY.
+        //
+        // ⚠ The distinction this turns on, because the first draft of this
+        // rewrite got it wrong and CI caught it: self-healing a column the
+        // CREATE above STILL DECLARES is REQUIRED — without it an upgraded
+        // deployment keeps its old table and every new column stays empty
+        // forever, silently. Self-healing a column the CREATE above REMOVED
+        // is the opposite error: QuestDB can add a column but never drop or
+        // rename one, so such a statement re-adds on the next boot exactly
+        // what the reset just took out — the trap this repository already
+        // recorded for `net_volume`.
+        //
+        // Every name in `CANDLE_SELF_HEAL_COLUMNS` therefore appears in the
+        // CREATE above, and none of the removed names does: `change_pct`,
+        // `open_pct`, `open_gap_pct`, `close_pct_from_prev_day` and
+        // `net_volume` are absent on purpose, and adding any of them back is
+        // a REJECT. On a table this CREATE just made, every statement here is
+        // a no-op.
+        for (column, ty) in CANDLE_SELF_HEAL_COLUMNS {
+            let add = format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {ty};");
+            all_keyed &= run_ddl(&client, &base_url, table, &add).await;
+        }
 
-        // §31 Option 2 (2026-06-01): self-heal the `open_pct` column for
-        // tables created before it existed. Free on every boot.
-        let alter_open_pct =
-            format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS open_pct DOUBLE;");
-        let _ = run_ddl(&client, &base_url, table, &alter_open_pct).await;
-
-        // Operator request 2026-06-02: self-heal the `change_pct` +
-        // `open_gap_pct` columns for tables created before they existed.
-        // Free on every boot (QuestDB ignores ADD when the column exists).
-        let alter_change_pct =
-            format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS change_pct DOUBLE;");
-        let _ = run_ddl(&client, &base_url, table, &alter_change_pct).await;
-        let alter_open_gap_pct =
-            format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS open_gap_pct DOUBLE;");
-        let _ = run_ddl(&client, &base_url, table, &alter_open_gap_pct).await;
-        // net volume — the bar's SIGNED ORDER FLOW: buy-initiated volume minus
-        // sell-initiated volume, accumulated per tick under the tick rule
-        // (uptick = buy-initiated, downtick = sell-initiated, unchanged price
-        // carries the previous direction). INFERRED, not observed: Dhan
-        // publishes no trade tape and no aggressor flag.
-        //
-        // NULL (never 0) when THIS PROCESS DID NOT CLASSIFY the bar — a
-        // disk-spill replay, a REST-folded bar, or a bar with no ticks or no
-        // volume. `0` would claim perfectly balanced flow about a bar nobody
-        // measured, which is a different fact.
-        //
-        // ⚠ CORRECTED 2026-09-10. This comment sits above the DDL that CREATES
-        // the column, so it is the definition of record — and until today it
-        // read "the bar's volume signed by whether it closed above or below the
-        // bar before it … NULL when there is no previous bar to compare
-        // against, so a first-of-day bar is blank rather than flat". BOTH
-        // halves are now false: the sign is flow, not direction, and a
-        // first-of-day bar with ticks now reports a real value. The arithmetic
-        // was fixed in `live_candle_state` / `multi_tf_aggregator`; this
-        // storage-layer comment was left behind, which is how a reader would
-        // have gone on trusting the retired definition.
-        //
-        // `total_buy_qty` / `total_sell_qty` are the vendor's PENDING
-        // order-book totals at the bar's last observed packet — resting
-        // orders, NOT executed volume. Nothing may treat their difference as
-        // a buy/sell imbalance of trades.
-        //
-        // Additive + idempotent like every self-heal above: an existing table
-        // gains the columns with NULLs for its historical rows, and no
-        // populated table is ever dropped (SEBI retention).
-        let alter_total_buy_qty =
-            format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS total_buy_qty LONG;");
-        let _ = run_ddl(&client, &base_url, table, &alter_total_buy_qty).await;
-        let alter_total_sell_qty =
-            format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS total_sell_qty LONG;");
-        let _ = run_ddl(&client, &base_url, table, &alter_total_sell_qty).await;
-        // Feed-provenance label (operator 2026-06-19, "same tables + feed
-        // column"): broker source (`'dhan'`/`'groww'`). It IS part of the DEDUP
-        // key now (`DEDUP_KEY_CANDLES` includes `feed`), so a Dhan candle and a
-        // Groww candle for the same minute/instrument are BOTH kept. MUST run
-        // BEFORE the DEDUP-ENABLE migration below so the key column exists on
-        // pre-existing tables. Additive + idempotent.
-        let alter_feed = format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS feed SYMBOL;");
-        let _ = run_ddl(&client, &base_url, table, &alter_feed).await;
-        // Brownfield NULL-feed backfill (worst-case coverage, no-hallucination):
-        // rows persisted under the OLD 3-col key have `feed=NULL`. Without this,
-        // a new `feed='dhan'` row for the same `(ts, security_id, segment)` is a
-        // DISTINCT key (NULL != 'dhan') → a DUPLICATE, not an upsert. Stamping
-        // `feed='dhan'` on every legacy NULL row BEFORE re-enabling DEDUP closes
-        // that overlap window. Idempotent + cheap on every subsequent boot:
-        // `WHERE feed IS NULL` matches nothing once backfilled. MUST run BEFORE
-        // the DEDUP-ENABLE below (UPDATE on the live key column is cleanest
-        // before the key is re-applied).
-        let backfill_feed =
-            format!("UPDATE {table} SET feed = '{CANDLE_FEED_DHAN}' WHERE feed IS NULL;");
-        let _ = run_ddl(&client, &base_url, table, &backfill_feed).await;
-        // Brownfield DEDUP migration: re-enable the UPSERT key with `feed`
-        // included so EXISTING candle tables (created before the feed-in-key
-        // change) get the new 4-col key. Idempotent — re-enabling the same key
-        // is a no-op; greenfield tables already have it from the CREATE DDL.
+        // Re-assert the UPSERT key. Idempotent — re-enabling the same key is a
+        // no-op, and a table this CREATE just made already carries it. Kept
+        // because it is the one statement that can still repair a table whose
+        // key was somehow lost, and it adds no column.
         let dedup_enable =
             format!("ALTER TABLE {table} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_CANDLES});");
         all_keyed &= run_ddl(&client, &base_url, table, &dedup_enable).await;
