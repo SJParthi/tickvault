@@ -6796,3 +6796,126 @@ must be stripped with `unsigned_abs()` or an equivalent that cannot overflow.
 - Drops `family` from the row or the DEDUP key.
 - Claims the sweep is O(1) anywhere — in code, a comment, a commit message or a
   PR body (§5).
+
+#### ⚠ §8 CORRECTED 2026-09-19 (same day, hours later) — §2 names the WRONG SOURCE for BOTH percentage columns, and one of the two would have shipped a number the candles table does not contain
+
+**No scope changes and no operator quote is reinterpreted.** §2 above was
+written from the column NAMES rather than from the code that fills them. Tracing
+both writers proved two of its rows false, and the first one is false in the
+direction that matters: it would have shipped a column claiming candles-table
+parity while carrying a number the candles table has never held. Quote B asks for
+the opposite in as many words — *"completely precise to same candles table"* — so
+this is not a refinement, it is the difference between honouring that quote and
+breaking it. §2 stands per house convention; where it and §8 conflict, §8 wins.
+
+##### The four percentages the candles row actually carries, and where each comes from
+
+Verified in source, not inferred (`shadow_seal_columns.rs` `from_buffered_seal`,
+and the field docs on `LiveCandleState`):
+
+| candles column | filled from | what it MEANS |
+|---|---|---|
+| `close_pct_from_prev_day` | `state.close_pct_from_prev_day` | close vs **yesterday's** close |
+| `change_pct` | `state.close_pct_from_prev_day` — **the same field** | the headline day change; byte-identical to the row above |
+| `open_pct` | `state.open_pct` | close vs **today's 09:15 session open** |
+| `open_gap_pct` | `state.open_gap_pct` | session open vs yesterday's close (the opening gap) |
+
+`change_pct` and `close_pct_from_prev_day` are literally the same number under
+two names — the extraction site says so in its own comment. That duplication is
+what made the naming confusing enough to produce Quote C, and it is why §2's
+"four shared candle numbers" phrasing landed badly.
+
+##### Correction 1 — `percentage_change` is NOT a rename of `candle_price_chg_pct`
+
+`top_volume`'s existing `candle_price_chg_pct` is filled from
+`bar.close_chg_pct_from_prev_bar()`, whose baseline is
+`LiveCandleState::bucket_open_prev_close` — **the close of the PREVIOUS SEALED BAR
+of the same timeframe**. That is a third quantity, and the candles table does not
+carry it in any of its seventeen columns.
+
+So renaming that column `percentage_change` and describing it as "byte-equal to
+the candle row" would have been FALSE, and false in the reassuring direction: the
+name would have invited exactly the cross-table comparison Quote B asks for, and
+the two numbers would have disagreed on almost every row, with nothing in either
+table explaining why.
+
+**`percentage_change` is sourced from `LiveCandleState::close_pct_from_prev_day`**
+— the same field the candles row's `change_pct` column is filled from, so the two
+match by construction rather than by coincidence. It is a NEW column;
+`candle_price_chg_pct` is not renamed into it.
+
+##### Correction 2 — `open_percentage_change` is not the opening gap
+
+§2 describes it as *"the candle's open-vs-previous-close move"*. That is
+`open_gap_pct`, a different column. **`open_percentage_change` is sourced from
+`LiveCandleState::open_pct`** — close vs today's 09:15 session open — which is the
+column whose NAME matches what the operator asked for, and is the least-inference
+reading of Quote B's *"open percentage change"* against the candle columns he is
+looking at.
+
+##### Correction 3 — the bar-over-bar number is KEPT, honestly renamed, because it is the only thing in the row that explains the sign of `volume`
+
+The obvious follow-through from corrections 1 and 2 is to delete
+`candle_price_chg_pct` outright. **That would be wrong**, and the reason is the
+governing directive's own heart: the single `volume` column that accepts a minus.
+
+`LiveCandleState::signed_volume()` chooses that sign with
+`if self.close < self.bucket_open_prev_close { -gross } else { gross }` — the
+**identical baseline** `close_chg_pct_from_prev_bar()` uses. The two are the same
+comparison expressed twice, which the fold's own test asserts side by side. So
+that percentage is the one field in the row that answers *"why is this volume
+negative?"*, and none of the three candles-sourced percentages can answer it: a
+contract can close up on the day and down against the previous bar, and then the
+row shows a positive `percentage_change` beside a negative `volume` with nothing
+to reconcile them.
+
+It is therefore **RENAMED `close_vs_prev_bar_pct`** — a name that says what it is
+and claims no candles-table parity — rather than deleted or passed off as
+`percentage_change`.
+
+##### The corrected rows, replacing their §2 equivalents
+
+| Column | Type | Source | Meaning | Status vs §2 |
+|---|---|---|---|---|
+| `percentage_change` | DOUBLE, 2dp | `LiveCandleState::close_pct_from_prev_day` | close vs yesterday's close — equals the candle row's `change_pct` | **NEW** (§2 wrongly called it a rename) |
+| `open_percentage_change` | DOUBLE, 2dp | `LiveCandleState::open_pct` | close vs today's 09:15 session open — equals the candle row's `open_pct` | **NEW** (§2 described the wrong quantity) |
+| `close_vs_prev_bar_pct` | DOUBLE, 2dp | `LiveCandleState::close_chg_pct_from_prev_bar()` | close vs the previous sealed bar of this timeframe; **the sign of `volume` comes from this same comparison** | **RENAMED** from `candle_price_chg_pct` — NOT a candles-table column, and must never be presented as one |
+
+Every other row of §2 stands unchanged.
+
+##### Consequences for the rest of this section
+
+- **§5's honest envelope gains one line:** three percentages now ride the row
+  instead of one, so the per-row width estimate rises by ~16 B over the §6
+  figure. Against the corrected ~1,342 B ceiling that is noise, not a breach.
+- **`CandleBarReading` must widen by two fields, not one.** It carries three
+  fields today (`signed_volume`, `open_bucket_advance_secs`, `price_chg_pct`) and
+  must carry `open`/`high`/`low`/`close` plus `close_pct_from_prev_day` and
+  `open_pct`. All six are already on `LiveCandleState` at the construction site
+  (`dhan_feed_stack.rs`, the `bar_for_window` arm), so this is a copy, never a
+  re-derivation — Quote A holds.
+- **§7 gains two REJECT rows** (below).
+
+##### Added to the §7 REJECT list
+
+- Sources `percentage_change` from `close_chg_pct_from_prev_bar()`, or from
+  anything other than `close_pct_from_prev_day` — that is the exact defect this
+  correction exists to stop, and it ships a column that silently disagrees with
+  the candles table it names.
+- Sources `open_percentage_change` from `open_gap_pct` (the opening gap) rather
+  than `open_pct`.
+- Deletes the bar-over-bar percentage without replacing the explanation for the
+  sign of `volume` — a signed volume nothing in the row accounts for is worse
+  than an extra column.
+- Presents `close_vs_prev_bar_pct` as a candles-table column, or renames it back
+  into the `percentage_change` family.
+
+##### The reusable half
+
+§2 was written from column names and from what a rename would plausibly mean,
+with the code that fills each column one grep away. This file records the same
+shape repeatedly — a claim about a MECHANISM is checkable in one command and must
+be checked at the moment of writing. A schema contract is a claim about
+mechanisms in every row, and a rename is the most dangerous kind: it asserts that
+two things are the same number, which is precisely the assertion a name cannot
+carry on its own.
