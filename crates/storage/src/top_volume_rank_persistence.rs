@@ -1439,7 +1439,39 @@ pub const MAX_TOP_VOLUME_RETAINED_FLUSH_SPANS: u32 = 2;
 /// crate, which `storage` cannot import (the dependency runs the other way).
 /// Naming it is the honest middle — a third family is now a visible edit here
 /// rather than an invisible factor inside an arithmetic expression.
-const OPTION_FAMILIES: usize = 2;
+///
+/// # ⚠ CORRECTED 2026-09-19 — 2 → 1, and it had been wrong since 2026-09-12
+///
+/// The operator's 2026-09-12 (later) directive took `top_volume` to STOCK
+/// OPTIONS ONLY — the index board was dropped because it steered nothing and
+/// poisoned the default sort (`websocket-connection-scope-lock.md`
+/// § "2026-09-18 (FOURTH)"). The single source of that policy,
+/// `dhan_feed_stack::RANKED_OPTION_FAMILIES`, has been a ONE-element array ever
+/// since, pinned by `top_volume_stock_only_guard`. This constant was not moved
+/// with it.
+///
+/// So the sweep has been sized for **50,000** rows while the pipeline can
+/// produce at most **25,000**. Wrong in the SAFE direction — the ceiling was
+/// twice what it needed to be, so nothing was ever dropped by it — and wrong in
+/// a way that matters anyway, because it is the DENOMINATOR every row-width
+/// decision divides by. At 50,000 rows the depth comparison
+/// (`the_producer_byte_ceiling_stays_tighter_than_the_depth_path`) fails at
+/// roughly **671 B** per row; at the true 25,000 it fails at roughly
+/// **1,342 B**. A column set needing ~725 B reads as unaffordable against the
+/// first number and sits at a 46% margin against the second.
+///
+/// That is the whole cost of this correction being late: a design was priced
+/// against a ceiling half its real size, and the argument that came out of it
+/// was wrong. Recorded rather than quietly edited, because the same stale
+/// factor of 2 has now been found in FOUR places — here, and in CLAUDE.md's
+/// "8 sweeps ≈ 23.6 ms ≈ 2.4% duty", which is 4 cadences × 2 families and is
+/// really 4 sweeps.
+///
+/// The comment below is unchanged and still governs: a third family is a
+/// VISIBLE edit here, never an invisible factor. It is now also a visible edit
+/// in `RANKED_OPTION_FAMILIES`, and the two must move together — the const
+/// assert below is what makes that non-optional.
+const OPTION_FAMILIES: usize = 1;
 const TOP_VOLUME_MAX_ROWS_PER_SWEEP: usize =
     tickvault_common::constants::TOP_VOLUME_PERSIST_PER_FAMILY * OPTION_FAMILIES;
 /// Worst-case ILP line width for one `top_volume` row, DERIVED below.
@@ -1517,6 +1549,29 @@ const TOP_VOLUME_MAX_ROWS_PER_SWEEP: usize =
 /// the previous occupant of this paragraph named the wrong ceiling, and a
 /// reader sizing the next change from it would have had ~450 B of imaginary
 /// room.
+///
+/// # ⚠ CORRECTED 2026-09-19 — both figures above divide by 50,000, and the
+/// # real row count is 25,000
+///
+/// `OPTION_FAMILIES` went 2 → 1 today (see its own note): the index board was
+/// dropped on 2026-09-12 and this factor was not moved with it. Every number in
+/// the two paragraphs above is therefore computed against twice the rows this
+/// pipeline can produce. Corrected:
+///
+/// | | stated above (50,000 rows) | true (25,000 rows) |
+/// |---|---|---|
+/// | wedge limit | 1,048 B | **2,097 B** |
+/// | ceiling at 596 B | 29.8 MB, 11% margin | **14.9 MB, 55% margin** |
+/// | where the depth assert fails | ~671 B | **~1,342 B** |
+///
+/// The paragraphs are left standing per house convention; this table is the
+/// operative set. The sentence "the next column added here can NOT be paid for
+/// by raising this constant again" was TRUE against 671 B and is FALSE against
+/// 1,342 B — and that mattered: a 2026-09-19 design needing ~725 B/row was
+/// priced as unaffordable against the stale ceiling before the factor was
+/// checked. **A derived constant carries the staleness of every term it
+/// derives from**, and this one had a stale term for a week while three
+/// separate notes above it were being carefully re-measured.
 const TOP_VOLUME_ILP_ROW_BYTES: usize = 596;
 /// Worst-case sweeps the producer may hold before it drops.
 ///

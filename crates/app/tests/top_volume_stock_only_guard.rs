@@ -158,6 +158,87 @@ fn the_scope_lock_records_the_narrowing() {
     );
 }
 
+/// The storage crate's row-budget denominator must agree with the family list.
+///
+/// # Why this test exists — the factor was stale for a week and nobody could see it
+///
+/// `top_volume_rank_persistence::OPTION_FAMILIES` multiplies the per-family row
+/// cap into `TOP_VOLUME_MAX_ROWS_PER_SWEEP`, which is the denominator of every
+/// byte-ceiling decision this writer makes. It stayed at `2` after the
+/// 2026-09-18 (FOURTH) narrowing took `RANKED_OPTION_FAMILIES` to one element,
+/// so the sweep was sized for 50,000 rows against a pipeline that can produce
+/// 25,000.
+///
+/// Nothing could catch it. `storage` cannot import `OptionFamily` — the
+/// dependency runs `app` → `storage` — so no const assert can reach across, and
+/// that file's own comment says so and settles for "a visible edit here". A
+/// visible edit is only visible to someone who looks.
+///
+/// `app` CAN read `storage`'s source, so this is the one place the two
+/// declarations can be compared. Wrong in the SAFE direction that week (the
+/// ceiling was twice what it needed to be, so nothing dropped), and it still
+/// cost a real design decision: a column set was priced against ~671 B/row
+/// when the true limit was ~1,342 B, and read as unaffordable.
+#[test]
+fn the_storage_row_budget_counts_the_same_families_the_list_admits() {
+    let storage = strip_line_comments(include_str!(
+        "../../storage/src/top_volume_rank_persistence.rs"
+    ));
+
+    let decl = storage
+        .find("const OPTION_FAMILIES: usize =")
+        .map(|i| &storage[i..])
+        .expect(
+            "top_volume_rank_persistence::OPTION_FAMILIES is the storage-side row-budget \
+             denominator; it is gone. If it was renamed, this guard must follow it -- \
+             deleting the guard instead leaves the denominator unpinned.",
+        );
+    let end = decl
+        .find(';')
+        .expect("the OPTION_FAMILIES declaration has no `;` terminator");
+    let decl = &decl[..=end];
+
+    let storage_count: usize = decl
+        .rsplit('=')
+        .next()
+        .and_then(|tail| tail.trim().trim_end_matches(';').trim().parse().ok())
+        .unwrap_or_else(|| {
+            panic!("could not read a number out of the OPTION_FAMILIES declaration: {decl}")
+        });
+
+    // The app-side list, counted from its declared arity rather than by
+    // counting variant names -- the arity is what the type system enforces.
+    let code = feed_stack_code();
+    let list = code
+        .find("const RANKED_OPTION_FAMILIES")
+        .map(|i| &code[i..])
+        .expect("RANKED_OPTION_FAMILIES is the single source of the family policy; it is gone");
+    let list_end = list
+        .find("];")
+        .expect("the RANKED_OPTION_FAMILIES declaration has no `];` terminator");
+    let list = &list[..=list_end];
+
+    let semi = list
+        .find("; ")
+        .or_else(|| list.find(';'))
+        .expect("the RANKED_OPTION_FAMILIES array type has no arity separator");
+    let bracket = list[semi..]
+        .find(']')
+        .expect("the RANKED_OPTION_FAMILIES array type has no closing bracket");
+    let app_count: usize = list[semi + 1..semi + bracket]
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("could not read the arity out of: {list}"));
+
+    assert_eq!(
+        storage_count, app_count,
+        "the storage row-budget denominator (OPTION_FAMILIES = {storage_count}) must equal \
+         the number of families the ranking actually admits (RANKED_OPTION_FAMILIES has \
+         {app_count}). They drifted on 2026-09-12 and stayed wrong for a week: the sweep \
+         was sized for twice the rows the pipeline can produce, which halved every \
+         per-row byte ceiling derived from it. Move BOTH or neither."
+    );
+}
 /// Bite-proof: the comment stripper must actually strip, or every scan above
 /// is satisfiable by prose.
 #[test]
