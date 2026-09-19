@@ -17,7 +17,7 @@
 //! | the board is reached from the steering loop | the module is dormant again, and nothing says so |
 //! | the board is PRIMARY, ahead of the volume ranking | the 2026-09-11 authorization is recorded and not applied |
 //! | `held_names` is carried forward | the exit band is computed and discarded — churn control that reports control it does not have |
-//! | the slot arithmetic still sums to 238 ≤ 250 | `plan_pool` refuses the WHOLE pool fail-closed: a session with no depth at all |
+//! | the slot arithmetic still sums to 230 ≤ 250 | `plan_pool` refuses the WHOLE pool fail-closed: a session with no depth at all |
 //! | NIFTY and BANKNIFTY cannot be displaced | the two deepest books lose their sockets to a mover |
 //! | a missing price ranks `None`, never `0` | an unpriced name ties with a genuinely flat one and takes a socket it did not earn |
 //! | the comparator takes an INTEGER | a `NaN` comparator is non-transitive and `sort_unstable_by` corrupts the slice WHOLESALE |
@@ -52,14 +52,13 @@ use tickvault_app::depth20_name_board::{
     DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE, DEPTH20_INSTRUMENT_BUDGET, DEPTH20_NAME_ENTRY_RANK,
     DEPTH20_NAME_EXIT_RANK, DEPTH20_NAME_STOCK_SOCKETS, DEPTH20_PER_SOCKET,
     DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE, NameBoardPlan, NameMove, board_slot_cost,
-    build_name_layout, future_index, move_bps, move_bps_from_pct, name_moves, rank_names,
-    slots_for_index_name, slots_for_stock_name,
+    build_name_layout, move_bps, move_bps_from_pct, name_moves, rank_names, slots_for_index_name,
+    slots_for_stock_name,
 };
 use tickvault_app::depth20_ranked_steer::{
     DEPTH_SWAP_COMMAND_CHANNEL_DEPTH, DEPTH200_SWAP_COMMAND_CHANNEL_DEPTH,
     MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE,
 };
-use tickvault_app::dhan_contract_universe::ContractRow;
 use tickvault_app::dhan_depth_universe::DepthCandidate;
 use tickvault_common::types::ExchangeSegment;
 use tickvault_core::websocket::pool_supervisor::SWAP_WIRE_BUDGET;
@@ -132,7 +131,7 @@ fn only_offset(haystack: &str, needle: &str) -> Result<usize, String> {
 /// # The thirteenth vacuous guard (found and corrected 2026-09-13)
 ///
 /// Until today this property was asserted as `declared < consumed` — the
-/// offset of `let mut held_names:` against the offset of `&held_names,`.
+/// offset of `let mut held_names:` against the offset of `&held_names`.
 /// **That ordering cannot fail for the regression it names.** Rust already
 /// forbids use-before-declaration, so `declared < consumed` holds whether the
 /// declaration sits above `loop {` or is its first statement. PROVEN: moving
@@ -147,7 +146,12 @@ fn only_offset(haystack: &str, needle: &str) -> Result<usize, String> {
 fn held_names_outlives_the_loop(body: &str) -> Result<(), String> {
     let declared = only_offset(body, "let mut held_names:")?;
     let loop_start = only_offset(body, "\n    loop {")?;
-    let consumed = only_offset(body, "&held_names,")?;
+    // Anchored WITHOUT trailing punctuation: `cargo fmt` owns whether the call
+    // wraps (trailing comma) or fits one line (closing paren), and it collapsed
+    // this very call when the futures argument was removed on 2026-09-18 -
+    // turning a real property into a formatting assertion that failed on
+    // correct code. `&held_names` occurs once; the declaration has no `&`.
+    let consumed = only_offset(body, "&held_names")?;
     if declared >= loop_start {
         return Err(format!(
             "`held_names` is declared at byte {declared}, at or after the \
@@ -159,7 +163,7 @@ fn held_names_outlives_the_loop(body: &str) -> Result<(), String> {
     }
     if loop_start >= consumed {
         return Err(format!(
-            "`&held_names,` at byte {consumed} is not inside the steering loop \
+            "`&held_names` at byte {consumed} is not inside the steering loop \
              that starts at byte {loop_start} — the board is not being told \
              what it chose last minute"
         ));
@@ -179,7 +183,6 @@ fn the_steering_loop_builds_the_name_board_every_minute() {
         "crate::depth20_name_board::build_name_layout(",
         1,
     );
-    offset_of_only(&loop_body, "crate::depth20_name_board::future_index(", 1);
     assert!(
         loop_body.contains("name_plan.is_steerable()"),
         "the steering loop no longer asks the name board whether it can steer — \
@@ -324,7 +327,7 @@ fn pre_register_name_board_counters_seeds_every_label_the_recorder_can_emit() {
     // The CloudWatch agent computes a counter as the delta between consecutive
     // samples and DROPS the first sample of a series it has never seen. A label
     // the recorder can emit but the seeder never touches therefore loses its
-    // FIRST increment — and for these six that first increment is usually the
+    // FIRST increment — and for these five that first increment is usually the
     // only one the day ever produces. The series then reads zero on exactly the
     // session it was built to explain.
     //
@@ -333,7 +336,7 @@ fn pre_register_name_board_counters_seeds_every_label_the_recorder_can_emit() {
     let src = production_source("src/depth20_name_board.rs");
 
     let array = src
-        .split_once("DEPTH20_NAME_BOARD_OUTCOME_LABELS: [&str; 6] = [")
+        .split_once("DEPTH20_NAME_BOARD_OUTCOME_LABELS: [&str; 5] = [")
         .and_then(|(_, rest)| rest.split_once("];"))
         .map(|(inside, _)| inside.to_owned())
         .expect("the label array must be a literal the seeder can loop over");
@@ -357,10 +360,10 @@ fn pre_register_name_board_counters_seeds_every_label_the_recorder_can_emit() {
 
     // Anti-vacuity: two empty vectors compare equal, so an extractor that
     // silently matched nothing would pass this test against ANY source.
-    assert_eq!(seeded.len(), 6, "extracted the wrong thing from the array");
+    assert_eq!(seeded.len(), 5, "extracted the wrong thing from the array");
     assert_eq!(
         emitted.len(),
-        6,
+        5,
         "extracted the wrong thing from the recorder body"
     );
 
@@ -386,24 +389,24 @@ fn pre_register_name_board_counters_seeds_every_label_the_recorder_can_emit() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn the_board_still_sums_to_238_of_250() {
+fn the_board_still_sums_to_230_of_250() {
     // The operator asked directly: "will it sit under 250 slots". These are
     // the numbers, re-derived rather than quoted, so a change to either window
     // moves this test with it instead of leaving a stale literal.
     assert_eq!(
         slots_for_index_name(DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE),
-        47
+        46
     );
     assert_eq!(
         slots_for_stock_name(DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE),
-        24
+        23
     );
     assert_eq!(
         board_slot_cost(),
         2 * slots_for_index_name(DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE)
             + DEPTH20_NAME_ENTRY_RANK * slots_for_stock_name(DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE)
     );
-    assert_eq!(board_slot_cost(), 238);
+    assert_eq!(board_slot_cost(), 230);
     assert!(
         board_slot_cost() <= DEPTH20_INSTRUMENT_BUDGET,
         "over the budget `plan_pool` refuses the WHOLE pool fail-closed — a \
@@ -469,28 +472,15 @@ fn mover(id: u64, symbol: &str, pct: f64) -> MoverRow {
     }
 }
 
-fn future(underlying: &str, id: u64, class: &str) -> ContractRow {
-    ContractRow {
-        i: id,
-        x: "NSE".to_owned(),
-        c: class.to_owned(),
-        e: 20_260_925,
-        s: 0,
-        l: String::new(),
-        u: underlying.to_owned(),
-        z: 1,
-    }
-}
-
 /// Two index chains, eight stock chains, and the movers that rank them.
-fn fixture() -> (Vec<DepthCandidate>, Vec<MoverRow>, Vec<ContractRow>) {
+///
+/// No `ContractRow` futures since 2026-09-18: `build_name_layout` no longer
+/// takes a futures index, so a fixture carrying them could not feed one in and
+/// would prove nothing about their absence.
+fn fixture() -> (Vec<DepthCandidate>, Vec<MoverRow>) {
     let mut candidates = chain("NIFTY", 24_000.0, 50.0, 40, 100_000);
     candidates.extend(chain("BANKNIFTY", 52_000.0, 100.0, 40, 200_000));
     let mut movers = Vec::new();
-    let mut rows = vec![
-        future("NIFTY", 1_001, "FUTIDX"),
-        future("BANKNIFTY", 1_002, "FUTIDX"),
-    ];
     for k in 0..8u64 {
         let symbol = format!("STK{k}");
         #[expect(clippy::cast_precision_loss, reason = "k is 0..8")]
@@ -503,20 +493,18 @@ fn fixture() -> (Vec<DepthCandidate>, Vec<MoverRow>, Vec<ContractRow>) {
             300_000 + i64::try_from(k).unwrap_or(0) * 1_000,
         ));
         movers.push(mover(700 + k, &symbol, pct));
-        rows.push(future(&symbol, 2_000 + k, "FUTSTK"));
     }
-    (candidates, movers, rows)
+    (candidates, movers)
 }
 
 fn plan_with(movers: &[MoverRow], held: &std::collections::BTreeSet<(u64, u8)>) -> NameBoardPlan {
-    let (candidates, _, rows) = fixture();
-    let futures = future_index(&rows, 20_260_913);
-    build_name_layout(&candidates, movers, &futures, held)
+    let (candidates, _) = fixture();
+    build_name_layout(&candidates, movers, held)
 }
 
 #[test]
 fn no_mover_can_displace_nifty_or_banknifty() {
-    let (_, mut movers, _) = fixture();
+    let (_, mut movers) = fixture();
     // A stock moving harder than anything else on the board, and a second one
     // carrying an index's own numeric id — the I-P1-11 collision shape, where
     // id 13 is NIFTY in IDX_I and an unrelated cash stock in NSE_EQ.
@@ -624,7 +612,7 @@ fn minutes_to_rotate_a_name(cap: usize) -> usize {
 ///
 /// The board has recomputed and re-planned every minute since it shipped; what
 /// was not per-minute was the APPLICATION, throttled to four swaps a socket
-/// while a name costs twenty-four. This pins the repaired figure at ONE.
+/// while a name costs twenty-three. This pins the repaired figure at ONE.
 #[test]
 fn a_name_rotation_takes_exactly_one_steering_minute() {
     assert_eq!(
@@ -659,11 +647,12 @@ fn the_per_socket_plan_drains_inside_one_steering_interval() {
          swaps is {worst_case_secs}s at the wire ceiling, which does not fit a \
          {REBALANCE_INTERVAL_SECS}s steering interval"
     );
-    // 48 of 60 today. Stated rather than asserted loosely, because the next
+    // 46 of 60 today, 48 before the 2026-09-18 futures removal took one slot
+    // off the cap. Stated rather than asserted loosely, because the next
     // raise of the cap has to be checked against THIS margin — and because the
     // figure is a CEILING: `SWAP_WIRE_BUDGET` is a timeout, and this
     // repository has recorded three times that a bound is not a measurement.
-    assert_eq!(worst_case_secs, 48);
+    assert_eq!(worst_case_secs, 46);
     assert_eq!(REBALANCE_INTERVAL_SECS, 60);
 }
 
@@ -837,12 +826,12 @@ fn guard_self_test() {
     //     be sensitive to the cap rather than constant across it — a helper
     //     that returned 1 for every input would satisfy the assertion above
     //     while proving nothing.
-    assert_eq!(minutes_to_rotate_a_name(1), 24);
+    assert_eq!(minutes_to_rotate_a_name(1), 23);
     assert_eq!(minutes_to_rotate_a_name(12), 2);
     assert_eq!(minutes_to_rotate_a_name(24), 1);
     // A cap of zero must not divide by zero — a guard that panics on an
     // absurd input is a guard someone deletes rather than reads.
-    assert_eq!(minutes_to_rotate_a_name(0), 24);
+    assert_eq!(minutes_to_rotate_a_name(0), 23);
 
     // ...and the endpoint-split scan must fail on a stack that shares one
     //    constant between the pools, which is exactly the pre-2026-09-13 shape.
