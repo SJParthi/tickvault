@@ -384,7 +384,10 @@ impl SealOverflow {
     /// It is not a rare path either. The mutex this took is the same one the
     /// seal writer holds on every ring eviction: measured on the prod box
     /// 2026-08-20, `spilled: 541,519` in a single session with the ring at
-    /// 598,976/600,000. A producer-side escalation queues behind all of that.
+    /// 598,976/600,000 — its capacity at the time, 25,000 × TF_COUNT=24; the
+    /// 2026-09-19 nine-frame collapse took that derived ceiling to 225,000, so
+    /// re-read the constant rather than this dated pair. A producer-side
+    /// escalation queues behind all of that.
     ///
     /// Idempotent by construction — a second call replaces the sender, so the
     /// boot path installs exactly one. Returns the receiving half; the caller
@@ -523,12 +526,16 @@ pub fn global_seal_overflow() -> Option<&'static SealOverflow> {
 /// arithmetically FALSE at the configured ceiling.
 ///
 /// This channel sits IN FRONT OF the ring. `force_seal_all` emits
-/// `AGGREGATOR_MAX_SLOTS × TF_COUNT` = 25,000 × 24 = **600,000** seals
+/// `AGGREGATOR_MAX_SLOTS × TF_COUNT` = 25,000 × 9 = **225,000** seals
 /// in one burst, and every one of them must pass through here before it
 /// can reach the ring's three absorbing tiers. At 200,000 the channel
-/// force-dropped **400,000** of them on `try_send` — counter-only, no
-/// log line, no alarm — every midnight, while the ring behind it was
-/// correctly sized for the full burst and sat mostly empty.
+/// force-dropped the remainder on `try_send` — counter-only, no log line,
+/// no alarm — every midnight, while the ring behind it was correctly sized
+/// for the full burst and sat mostly empty. The shortfall was **400,000**
+/// when this was written at TF_COUNT=24; the 2026-09-19 nine-frame collapse
+/// puts the burst at 225,000, so a literal 200_000 would drop 25,000 today.
+/// The number moved; the DEFECT is that a literal cannot follow it, which is
+/// why this constant is derived.
 ///
 /// That is the exact drift class `SEAL_BUFFER_CAPACITY` was derived to
 /// prevent on 2026-08-10; the ring was fixed and the channel in front of
@@ -540,7 +547,7 @@ pub fn global_seal_overflow() -> Option<&'static SealOverflow> {
 /// Cost at the derived value: the mpsc allocates its buffer lazily per
 /// queued item (tokio `mpsc` does NOT pre-allocate capacity slots), so
 /// the steady-state cost is ~0 and the worst case equals the burst
-/// itself — 600,000 × ≤144 B ≈ **86 MB**, matching the ring, 0.26% of
+/// itself — 225,000 × ≤144 B ≈ **32 MB**, matching the ring, 0.10% of
 /// the r8g.xlarge 32 GiB host (operator Quote 13, 2026-08-08).
 pub const SEAL_MPSC_CAPACITY: usize = tickvault_trading::candles::SEAL_BUFFER_CAPACITY;
 

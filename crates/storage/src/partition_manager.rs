@@ -901,12 +901,28 @@ mod tests {
 
     #[test]
     fn test_candle_tables_are_real_plain_names_not_shadow() {
-        // The candle tables swept by detach_old_partitions come from the single
-        // source of truth. They MUST be plain `candles_<TF>` (no `_shadow`) and
-        // number 21 (M1/M3/M5/M15/D1 + S1..S15 + S30, TF-diet second-scale) —
-        // the exact bug #1022 had (phantom `_shadow` names).
+        // The candle tables swept by detach_old_partitions come from the
+        // single source of truth. They MUST be plain `candles_<TF>` with no
+        // `_shadow` — the exact bug #1022 had (phantom `_shadow` names).
+        //
+        // The COUNT is deliberately not asserted. It read `21` in the comment
+        // and `24` in the assertion for long enough that the two disagreed in
+        // the same test, and the 2026-09-19 collapse to 9 frames made both
+        // wrong at once. `candle_table_names()` returns `[&str; TF_COUNT]`, so
+        // a length assertion is a type-level tautology anyway: it can only
+        // ever restate the constant, never check anything.
+        //
+        // Distinctness IS a real property and nothing else here checked it: a
+        // duplicated arm in `TfIndex::table_name` would silently fold two
+        // frames into one table, and the sweep would then sweep that table on
+        // whichever class won the classifier.
         let names = crate::shadow_persistence::candle_table_names();
-        assert_eq!(names.len(), 24, "expected 24 live candle tables");
+        assert!(
+            !names.is_empty(),
+            "no candle tables — the source of truth has drifted and this \
+             guard is vacuous"
+        );
+        let mut seen: Vec<&str> = Vec::new();
         for name in names {
             assert!(
                 name.starts_with("candles_"),
@@ -916,6 +932,12 @@ mod tests {
                 !name.contains("_shadow"),
                 "candle table must be plain (no _shadow): {name}"
             );
+            assert!(
+                !seen.contains(&name),
+                "two fold frames share the table name {name} — one frame's \
+                 bars would land in the other's table"
+            );
+            seen.push(name);
         }
     }
 

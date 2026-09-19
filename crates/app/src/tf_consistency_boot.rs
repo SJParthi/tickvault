@@ -353,39 +353,41 @@ pub fn deterministic_run_ts_nanos(day_start_ist_nanos: i64) -> i64 {
 
 /// The comparison targets — today `M3`, `M5`, `M15`, `M30`, `M60`.
 ///
-/// Three filters, and the THIRD is the one that matters most:
+/// TWO filters, and the FIRST is the one that matters most:
 ///
-/// 1. `is_operator_requested()` — **a frame nothing WRITES must never be
-///    verified.** The verifier recomputes each target from `candles_1m`
-///    and reports a `MissingTfRow` for every window where the recompute
-///    succeeds and the stored row is absent. So a frame whose writer has
-///    been retired produces one finding per bucket per instrument, every
-///    run, forever — and the run's summary is an `Immediate` Telegram
-///    event, so that is a page every trading day about a table nobody
-///    fills. This filter did not exist until 2026-09-18, and the day the
-///    operator's nine-frame set landed it was the difference between a
-///    silent pass and ~187 false findings per instrument.
-/// 2. Second-scale frames are excluded separately — they are inside
-///    `is_operator_requested()` (S1/S3/S5 all emit), but a 30-second
-///    target's penultimate window sits inside the catchup margin at the
-///    15:40 pass, so a still-open bucket would read as a mismatch. See
-///    `test_verify_targets_exclude_second_scale_frames`.
-/// 3. `M1` is the recompute BASELINE — verifying it against itself
-///    proves nothing — and `D1` spans the whole session, so its only
-///    window is still open when the pass runs.
+/// 1. Second-scale frames are excluded — `S1`/`S3`/`S5` all emit, but a
+///    30-second target's penultimate window sits inside the catchup margin
+///    at the 15:40 pass, so a still-open bucket would read as a mismatch.
+///    See `test_verify_targets_exclude_second_scale_frames`.
+/// 2. `M1` is the recompute BASELINE — verifying it against itself proves
+///    nothing.
 ///
-/// The three are deliberately separate rather than one hand-written list:
-/// filter 1 tracks the writer, filter 2 tracks the pass timing, and
-/// filter 3 tracks the method. A future frame change moves exactly one.
+/// A THIRD filter stood here until 2026-09-19: `is_operator_requested()`,
+/// which kept a frame nothing WRITES out of the verifier. It mattered. The
+/// verifier recomputes each target from `candles_1m` and reports a
+/// `MissingTfRow` for every window where the recompute succeeds and the
+/// stored row is absent, so a frame whose writer had been retired produced
+/// one finding per bucket per instrument, every run, forever — and the
+/// run's summary is an `Immediate` Telegram event, i.e. a page every
+/// trading day about a table nobody fills. On the day the operator's
+/// nine-frame set landed it was the difference between a silent pass and
+/// ~187 false findings per instrument.
+///
+/// The nine-frame collapse retired it rather than weakening it: `TfIndex`
+/// now carries ONLY emitting frames, so the filter could only ever return
+/// true, and a filter that cannot filter reads as a live one to the next
+/// author. `D1` — the other frame the old filter 3 excluded, because its
+/// single window spans the whole session and is still open when the pass
+/// runs — no longer exists to exclude either.
+///
+/// The two that remain are deliberately separate rather than one
+/// hand-written list: filter 1 tracks the pass timing, filter 2 tracks the
+/// method. A future frame change moves exactly one.
 #[must_use]
 pub fn tf_verify_targets() -> Vec<TfIndex> {
     TfIndex::ALL
         .into_iter()
-        .filter(|tf| {
-            tf.is_operator_requested()
-                && !tf.is_second_scale()
-                && !matches!(tf, TfIndex::M1 | TfIndex::D1)
-        })
+        .filter(|tf| !tf.is_second_scale() && !matches!(tf, TfIndex::M1))
         .collect()
 }
 
@@ -2497,9 +2499,8 @@ mod tests {
     // -------------------------------------------------------------------
     // Targets + grid
     // -------------------------------------------------------------------
-
     #[test]
-    fn test_tf_verify_targets_are_every_written_minute_frame_above_1m_except_d1() {
+    fn test_tf_verify_targets_are_every_written_minute_frame_above_1m() {
         // Asserted BY NAME. The old form of this test pinned `len() == 3` with
         // the comment "5 TFs minus M1 minus D1"; when M2/M30/M60 joined the
         // frame set it failed on the count alone, which tells you a number
@@ -2507,14 +2508,18 @@ mod tests {
         // means a frame that quietly loses verification coverage — the actual
         // risk — fails the build too.
         //
-        // 2026-09-18: `M2` LEFT this list, and the reason is the point. It was
-        // removed from `is_operator_requested()` when the operator's nine-frame
-        // set landed, so nothing writes `candles_2m` any more — but this
-        // function still targeted it, and the verifier reports a missing row
-        // for every window it can recompute from 1m and cannot find stored.
-        // That is ~187 findings per instrument per run against a table nobody
-        // fills, and the run summary pages on Telegram. The by-name assertion
-        // is what makes the next such removal fail here instead of at 15:40.
+        // 2026-09-18: `M2` LEFT this list, and the reason is the point. It
+        // stopped being written when the operator's nine-frame set landed, but
+        // this function still targeted it, and the verifier reports a missing
+        // row for every window it can recompute from 1m and cannot find
+        // stored. That is ~187 findings per instrument per run against a table
+        // nobody fills, and the run summary pages on Telegram.
+        //
+        // 2026-09-19: `M2` and `D1` left the ENUM, so neither can be named
+        // here at all — the guarantee those two assertions carried is now
+        // structural rather than tested. What replaces them is the retired-name
+        // scan at the end: it is the only form that still fails the build if a
+        // dead frame ever comes back into verification.
         let targets = tf_verify_targets();
         assert_eq!(
             targets,
@@ -2529,43 +2534,42 @@ mod tests {
         );
 
         // M1 is the baseline the others are recomputed FROM — verifying it
-        // against itself proves nothing. D1 spans the whole session, so its
-        // only window is still open at the 15:40 pass.
+        // against itself proves nothing.
         assert!(!targets.contains(&TfIndex::M1));
-        assert!(!targets.contains(&TfIndex::D1));
 
-        // M2 is the 2026-09-18 case, pinned explicitly: a frame with no
-        // writer must not be verified.
-        assert!(
-            !targets.contains(&TfIndex::M2),
-            "M2 has no writer since the nine-frame set; verifying it pages daily"
-        );
-
-        // Structural cross-check: every frame the lane actually writes,
-        // minus the second-scale ones and those two, must appear here. This is
-        // what catches a NEW frame being added to the fold and silently never
-        // verified — and, in the other direction, a frame losing its writer
-        // and silently staying verified.
+        // Structural cross-check: every frame the lane writes, minus the
+        // second-scale ones and the baseline, must appear here. This is what
+        // catches a NEW frame being added to the fold and silently never
+        // verified. Since 2026-09-19 `TfIndex::ALL` IS the written set, so the
+        // cross-check no longer needs a writer predicate to express that.
         let written_minute_frames: Vec<TfIndex> = TfIndex::ALL
             .into_iter()
-            .filter(|tf| {
-                tf.is_operator_requested()
-                    && !tf.is_second_scale()
-                    && !matches!(tf, TfIndex::M1 | TfIndex::D1)
-            })
+            .filter(|tf| !tf.is_second_scale() && !matches!(tf, TfIndex::M1))
             .collect();
         assert_eq!(
             targets, written_minute_frames,
             "a frame written by the lane but absent here would ship unverified"
         );
 
-        // And the load-bearing half, stated as its own assertion rather than
-        // left implicit in the filter: no target may be a frame the lane does
-        // not emit.
-        for tf in &targets {
+        // The other direction, and the half that outlived the M2 assertion: a
+        // retired frame must never reappear as a target. Checked by TABLE NAME
+        // rather than by variant, because a retired variant does not exist to
+        // name — which is exactly why the variant-level assertions had to go.
+        let target_tables: Vec<&'static str> = targets.iter().map(|tf| tf.table_name()).collect();
+        for retired in [
+            "candles_1d",
+            "candles_2m",
+            "candles_2s",
+            "candles_4s",
+            "candles_6s",
+            "candles_10s",
+            "candles_15s",
+            "candles_30s",
+        ] {
             assert!(
-                tf.is_operator_requested(),
-                "{tf:?} is verified but not emitted — every run would report it missing"
+                !target_tables.contains(&retired),
+                "{retired} lost its writer in the nine-frame collapse; \
+                 verifying it would page daily against a table nobody fills"
             );
         }
     }

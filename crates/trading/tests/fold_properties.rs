@@ -24,9 +24,7 @@ use proptest::prelude::*;
 use tickvault_common::feed::Feed;
 use tickvault_common::price_precision::f32_to_f64_clean;
 use tickvault_common::tick_types::ParsedTick;
-use tickvault_trading::candles::aggregator_cell::{
-    AggregatorCell, FeedStrategy, tick_price_is_sane,
-};
+use tickvault_trading::candles::aggregator_cell::{FeedStrategy, tick_price_is_sane};
 use tickvault_trading::candles::live_candle_state::LiveCandleState;
 use tickvault_trading::candles::multi_tf_aggregator::MultiTfAggregator;
 use tickvault_trading::candles::tf_index::TfIndex;

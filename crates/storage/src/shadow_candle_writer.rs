@@ -1321,12 +1321,12 @@ mod tests {
     }
 
     #[test]
-    fn test_candle_writer_covers_all_21_tf_tables_for_arbitrary_feed() {
+    fn test_candle_writer_covers_every_tf_table_for_arbitrary_feed() {
         // OPERATOR SCOPE CLARIFICATION 2026-06-30: the candle path must cover
         // EVERY timeframe table, not just candles_1m — and for ANY feed. Drive one
-        // seal for EVERY TfIndex::ALL (all 21 TFs) tagged an ARBITRARY novel feed
+        // seal for EVERY TfIndex::ALL (every live frame) tagged an ARBITRARY novel feed
         // and assert each lands in its OWN candles_<tf> table tagged with that feed.
-        // Proves: one common writer → all 21 TF tables, feed stamped verbatim, no
+        // Proves: one common writer → every TF table, feed stamped verbatim, no
         // per-TF and no per-feed branch.
         let novel_feed = "future_test_feed";
         let mut seen_tables = std::collections::HashSet::new();
@@ -1365,14 +1365,19 @@ mod tests {
             );
             seen_tables.insert(table);
         }
-        // All 21 distinct candle tables were exercised.
+        // Every live candle table was exercised — derived from the enum, so
+        // it cannot go stale the next time TF_COUNT moves.
         assert_eq!(
             seen_tables.len(),
             TfIndex::ALL.len(),
-            "every one of the 21 TF candle tables must be covered"
+            "every live TF candle table must be covered"
         );
+        // Two literal anchors, one per scale, so the derived equality above
+        // cannot be satisfied by a table-name mapping that collapsed the
+        // scales. `candles_1d` stood here until the 2026-09-19 collapse
+        // retired D1; `candles_1s` is the surviving short-scale anchor.
         assert!(seen_tables.contains("candles_1m"));
-        assert!(seen_tables.contains("candles_1d"));
+        assert!(seen_tables.contains("candles_1s"));
     }
 
     #[test]

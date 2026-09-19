@@ -364,10 +364,6 @@ pub struct BootDrainOutcome {
     /// Records that could not be decoded (corrupt tail / legacy format /
     /// unknown timeframe ordinal). Their bytes survive in `archive/`.
     pub records_undecodable: usize,
-    /// Records decoded into a timeframe that no longer emits (the 2026-09-18
-    /// nine-frame directive). Their table was dropped, so re-ingesting them
-    /// would recreate it keyless; the bytes survive in `archive/`.
-    pub records_retired_frame: usize,
 }
 
 impl BootDrainOutcome {
@@ -692,21 +688,19 @@ pub fn drain_recovered_seals<S: SealSink>(
                     outcome.seals_recovered = outcome.seals_recovered.saturating_sub(1);
                     continue;
                 };
-                // 2026-09-18 — RETIRED-FRAME GATE. The three live emit sites in
-                // `dhan_feed_stack` refuse a non-requested timeframe before the seal
-                // is ever built, but this replay path is downstream of all three and
-                // reads files written by EARLIER binaries. A spill file from a
-                // session when `candles_10s` / `_15s` / `_30s` / `_2m` still emitted
-                // would otherwise re-ingest into a table this boot has just DROPPED,
-                // and ILP auto-create would rebuild it with NO dedup key — every
-                // later replay then duplicating into it for the life of the table,
-                // silently. Counted, never a silent discard: the bytes stay in
-                // `archive/` and `records_retired_frame` is the honest number.
-                if !seal.tf.is_operator_requested() {
-                    outcome.records_retired_frame += 1;
-                    outcome.seals_recovered = outcome.seals_recovered.saturating_sub(1);
-                    continue;
-                }
+                // 2026-09-19 — the RETIRED-FRAME GATE that stood here is GONE, and
+                // the guarantee it provided is now carried by the format version.
+                // It refused a seal whose timeframe no longer emitted, so a file
+                // written when `candles_10s` / `_15s` / `_30s` / `_2m` still existed
+                // could not re-ingest into a table this boot had just dropped. Two
+                // things retired it together: `SEAL_SPILL_FORMAT_VERSION` moved to 4
+                // when the nine-frame collapse RENUMBERED the ordinals, and
+                // `seal_spill::read_all` refuses every record below it — so no
+                // record written under the 24-frame ordinal space ever reaches this
+                // loop. And every ordinal the nine-frame table can decode IS one of
+                // the operator's nine, so the predicate was tautologically true.
+                // A gate that can only return true reads as a live filter to the
+                // next author; the version refusal is the real one.
                 if let Err(append_err) = writer.append_seal(&seal) {
                     error!(
                         code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
@@ -772,7 +766,6 @@ pub fn drain_recovered_seals<S: SealSink>(
             files_archived = outcome.files_archived,
             seals_reingested = outcome.seals_reingested,
             records_undecodable = outcome.records_undecodable,
-            records_retired_frame = outcome.records_retired_frame,
             "seal recovery complete — every recovered seal re-ingested"
         );
     }

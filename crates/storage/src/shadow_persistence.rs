@@ -204,8 +204,7 @@ pub fn candle_table_names() -> [&'static str; TF_COUNT] {
     names
 }
 
-/// The candle tables that are actually WRITTEN — one per timeframe whose
-/// [`TfIndex::is_operator_requested`] is true.
+/// The candle tables that are actually WRITTEN — one per fold frame.
 ///
 /// ## Why this exists separately from [`candle_table_names`]
 ///
@@ -213,38 +212,82 @@ pub fn candle_table_names() -> [&'static str; TF_COUNT] {
 /// seal-writer chain indexes its `[Sender; TF_COUNT]` ILP sender array by
 /// `TfIndex as usize`, so narrowing that array would silently re-point every
 /// frame at the wrong table. This function is the DDL/retention view of the
-/// same set — a filtered `Vec`, never an ordinal index.
+/// same set — a `Vec`, never an ordinal index.
 ///
-/// The operator's 2026-09-18 directive keeps exactly eleven frames: `ticks`
-/// plus `1s 3s 5s 1m 3m 5m 10m 15m 30m 60m`, of which `10m` is a derived VIEW
-/// over `candles_1m` (`console_views::candles_10m_view_ddl`) and not a fold
-/// frame. So NINE tables are created here, and the remaining fifteen ordinals
-/// get no table at all — see [`retired_candle_table_names`].
+/// ## 2026-09-19 — this is now every frame, and that is the point
+///
+/// It used to filter on `TfIndex::is_operator_requested`, because the enum
+/// carried fifteen frames the operator had retired and the predicate was what
+/// kept their tables from being created. The operator's 2026-09-19 directive
+/// deleted those variants outright (`TF_COUNT` 24 → 9), so the predicate
+/// became tautologically true and was removed — a gate that can only return
+/// true reads as a live filter to the next author.
+///
+/// The surviving nine are `1s 3s 5s 1m 3m 5m 10m 15m 30m 60m` MINUS `10m`,
+/// which is a derived VIEW over `candles_1m`
+/// (`console_views::candles_10m_view_ddl`) and not a fold frame.
 #[must_use]
-// TEST-EXEMPT: pure filter over the ordinal array; pinned by test_emitted_and_retired_partition_the_ordinal_set.
+// TEST-EXEMPT: pure map over the ordinal array; pinned by test_emitted_and_retired_partition_the_ordinal_set.
 pub fn emitted_candle_table_names() -> Vec<&'static str> {
-    TfIndex::ALL
-        .iter()
-        .filter(|tf| tf.is_operator_requested())
-        .map(|tf| tf.table_name())
-        .collect()
+    TfIndex::ALL.iter().map(|tf| tf.table_name()).collect()
 }
 
-/// The complement of [`emitted_candle_table_names`]: candle tables whose
-/// timeframe no longer emits, and which therefore must not exist.
+/// Candle tables this deployment once created and must now DROP.
 ///
-/// Fed to [`drop_retired_candle_tables`]. Derived, never a hand-written list —
-/// a hand-written list is what goes stale the next time the operator moves the
-/// frame set, and this repository has now been bitten by a stale hand-written
-/// table ledger twice.
+/// Fed to [`drop_retired_candle_tables`].
+///
+/// ## Why this is a HAND-WRITTEN list, reversing what this doc used to say
+///
+/// Until 2026-09-19 this was derived — `TfIndex::ALL` filtered on the inverse
+/// of `is_operator_requested` — under a doc that read *"Derived, never a
+/// hand-written list — a hand-written list is what goes stale the next time
+/// the operator moves the frame set."* That reasoning held while the retired
+/// frames were still enum variants carrying a false predicate. It stops
+/// holding the moment those variants are DELETED: a derivation over the
+/// surviving nine returns the EMPTY set, `drop_retired_candle_tables` returns
+/// early on `retired.is_empty()`, and fifteen orphan tables sit on a live box
+/// forever while every test still passes.
+///
+/// So this is a HISTORICAL FACT about what was once created, fixed at fifteen
+/// FOREVER, and NOT a mirror of `TfIndex::ALL`. Same shape, and for the same
+/// reason, as the scope lock's legacy `top_volume_rank_{1s,3s,5s,1m}` view
+/// sweep: *"fixed at four FOREVER — it is a historical fact about what was
+/// once created, not a mirror of `SnapshotCadence`."*
+///
+/// A tenth frame retired in the future ADDS an entry here (and bumps
+/// [`RETIRED_CANDLE_DROP_SWEEP_VERSION`]); it never rebuilds the list from the
+/// enum.
+///
+/// ⚠ Two names that must NEVER appear here:
+/// - `candles_10m` — a derived VIEW that IS wanted;
+/// - any survivor. Note `candles_15s` (retired) against `candles_15m`
+///   (survivor): the sweep matches EXACT names, never a prefix.
+const RETIRED_CANDLE_TABLES: [&str; 15] = [
+    // The day frame.
+    "candles_1d",
+    // The second-scale frames retired by the 2026-09-19 nine-frame directive.
+    "candles_2s",
+    "candles_4s",
+    "candles_6s",
+    "candles_7s",
+    "candles_8s",
+    "candles_9s",
+    "candles_10s",
+    "candles_11s",
+    "candles_12s",
+    "candles_13s",
+    "candles_14s",
+    "candles_15s",
+    "candles_30s",
+    // The two-minute frame.
+    "candles_2m",
+];
+
+/// See [`RETIRED_CANDLE_TABLES`] — the fifteen tables that must not exist.
 #[must_use]
-// TEST-EXEMPT: pure filter over the ordinal array; pinned by test_emitted_and_retired_partition_the_ordinal_set.
+// TEST-EXEMPT: pure const-array accessor; pinned by test_emitted_and_retired_partition_the_ordinal_set.
 pub fn retired_candle_table_names() -> Vec<&'static str> {
-    TfIndex::ALL
-        .iter()
-        .filter(|tf| !tf.is_operator_requested())
-        .map(|tf| tf.table_name())
-        .collect()
+    RETIRED_CANDLE_TABLES.to_vec()
 }
 
 // ---------------------------------------------------------------------------
@@ -1164,7 +1207,7 @@ mod tests {
     #[test]
     fn test_candle_table_names_has_tf_count_entries() {
         assert_eq!(candle_table_names().len(), TF_COUNT);
-        assert_eq!(TF_COUNT, 24);
+        assert_eq!(TF_COUNT, 9);
     }
 
     #[test]
@@ -1503,36 +1546,21 @@ mod tests {
     }
 
     #[test]
-    fn test_candle_table_names_canonical_ordering_1m_to_1d() {
+    fn test_candle_table_names_canonical_ordering() {
         let names = candle_table_names();
-        // C3: legacy 5-frame prefix (ordinals 0..=4) byte-stable, the 16
-        // second-scale frames APPENDED after candles_1d (ordinals 5..=20).
+        // 2026-09-19 nine-frame collapse: the four-frame legacy prefix is
+        // unchanged, `candles_1d` is GONE, and the second-scale block that
+        // followed it is now exactly 1s/3s/5s. `candles_15s` (retired) and
+        // `candles_15m` (kept) differ by one letter — this list is the exact
+        // set, never a prefix match.
         let expected = [
             "candles_1m",
             "candles_3m",
             "candles_5m",
             "candles_15m",
-            "candles_1d",
             "candles_1s",
-            "candles_2s",
             "candles_3s",
-            "candles_4s",
             "candles_5s",
-            "candles_6s",
-            "candles_7s",
-            "candles_8s",
-            "candles_9s",
-            "candles_10s",
-            "candles_11s",
-            "candles_12s",
-            "candles_13s",
-            "candles_14s",
-            "candles_15s",
-            "candles_30s",
-            // Appended 2026-08-10 with TfIndex::{M2, M30, M60} — the three
-            // frames of the operator's thirteen (Quote 13, 2026-08-08) that
-            // previously had no enum variant.
-            "candles_2m",
             "candles_30m",
             "candles_60m",
         ];

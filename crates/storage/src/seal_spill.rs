@@ -42,9 +42,9 @@
 //! |---|---|---|
 //! | 0    | 4 | `security_id` low-32 (legacy/Dhan; full u64 at 120-128) |
 //! | 4    | 1 | `exchange_segment_code: u8`     |
-//! | 5    | 1 | `tf_ordinal: u8` (0..=20 per `TfIndex`; 0..=4 = the legacy 5-frame set, 5..=20 = the C3 GDF-gated second-scale frames) |
+//! | 5    | 1 | `tf_ordinal: u8` (0..=8 per `TfIndex` — the operator's nine frames since 2026-09-19; the ordinal space has been renumbered twice, so the byte is meaningless without `format_version`) |
 //! | 6    | 1 | `feed_index: u8` (`Feed::index()` — 0=Dhan, 1=Groww; pre-feed records read 0=Dhan) |
-//! | 7    | 1 | `format_version: u8` (=2 since 2026-09-10; 2026-07-21 C2 — 0 = pre-renumber legacy, REFUSED on load; 1 = pre-accumulator, still readable) |
+//! | 7    | 1 | `format_version: u8` (=4 since 2026-09-19; `read_all` REFUSES every record BELOW the live constant, because each bump renumbered `tf_ordinal` and a stale byte decodes into the wrong frame silently) |
 //! | 8    | 4 | `bucket_start_ist_secs: u32`    |
 //! | 12   | 4 | `tick_count: u32`               |
 //! | 16   | 8 | `volume: u64`                   |
@@ -191,7 +191,28 @@ pub const SEAL_SPILL_RECORD_SIZE: usize = 128;
 /// without the baseline would report `+gross` for every down bar, which is the
 /// defect the bump removes. No stride change and no growth — the record has
 /// been byte-for-byte full since 2026-06-29.
-pub const SEAL_SPILL_FORMAT_VERSION: u8 = 3;
+///
+/// **Bumped 3 → 4 on 2026-09-19** — the SAME class of hazard the C2 note
+/// above records, at four times the scale. The operator's 2026-09-18
+/// timeframe directive collapsed `TF_COUNT` 24 → 9, and only `M1`..`M15`
+/// keep their ordinals: `S1` was 5 and is now **4**, `S5` was 9 and is now
+/// **6**, `M30` was 22 and is now **7**, `M60` was 23 and is now **8**. A
+/// version-3 record replayed against the new table therefore decodes into
+/// the WRONG FRAME **silently** — a byte in range is a byte in range, and
+/// nothing downstream can tell an `S1` seal filed as `S3` from a real one.
+/// Worse than the C2 case: fifteen frames were RETIRED outright, so a v3
+/// record naming one of them would ILP-auto-create a candle table the
+/// retired-table sweep has just dropped, with no dedup key. `read_all`
+/// therefore refuses EVERY record below this version rather than trying to
+/// recover the byte-stable `M1`..`M15` subset — the C2 precedent refused
+/// wholesale for the same reason, and the loss is bounded to one deploy
+/// boot's worth of spilled seals.
+///
+/// Task #15's per-window receipt stamps ride THIS SAME bump: two version
+/// steps in two commits would leave a version-4 file correct for one change
+/// and wrong for the other, which is exactly the ambiguity a version byte
+/// exists to prevent.
+pub const SEAL_SPILL_FORMAT_VERSION: u8 = 4;
 
 /// ⚠ **RETIRED 2026-09-18.** Bytes 80..88 no longer carry a net volume in any
 /// version this writer produces, so nothing reads this sentinel off the wire.
@@ -227,7 +248,7 @@ pub const SEAL_SPILL_FIRST_PREV_CLOSE_VERSION: u8 = 3;
 /// Self-contained binary record for spilled sealed bars.
 ///
 /// Field layout matches the wire-format table above. The
-/// `tf_ordinal` field is the `TfIndex::as_ordinal()` value (0..=20)
+/// `tf_ordinal` field is the `TfIndex::as_ordinal()` value (0..=8)
 /// from the trading crate; the glue slice translates
 /// `BufferedSeal::tf` ↔ `tf_ordinal` via a checked
 /// `TfIndex::from_ordinal` round-trip.
@@ -868,12 +889,29 @@ impl SealSpillWriter {
         loop {
             match read_full_record(&mut reader, &mut buf) {
                 Ok(true) => {
-                    // Format-version gate (2026-07-21 C2): a byte-7 of 0 marks a
+                    // Format-version gate. Byte 7 is the record's
+                    // `SEAL_SPILL_FORMAT_VERSION`, and ANY value below the live
+                    // constant is refused — never partially recovered.
+                    //
+                    // 2026-07-21 (C2, version 0 → 1): a byte-7 of 0 marks a
                     // pre-renumber record whose tf_ordinal lives in the OLD 12-frame
-                    // ordinal space (old M2=1 would misdecode as new M3=1). Refuse
-                    // the record, keep draining — a daily file can legitimately mix
-                    // legacy + v1 records via append across a deploy boundary.
-                    if buf[7] == 0 {
+                    // ordinal space (old M2=1 would misdecode as new M3=1).
+                    //
+                    // 2026-09-19 (version 3 → 4): the operator's timeframe directive
+                    // collapsed `TF_COUNT` 24 → 9 and only `M1`..`M15` kept their
+                    // ordinals — `S1` moved 5 → 4, `S5` 9 → 6, `M30` 22 → 7, `M60`
+                    // 23 → 8 — so a version-3 record decodes into the WRONG FRAME
+                    // silently, a byte in range being a byte in range. Fifteen
+                    // frames were RETIRED outright, so such a record can also name
+                    // a table the retired-table sweep has just dropped, which ILP
+                    // would auto-create with no dedup key. Hence WHOLESALE refusal
+                    // rather than recovering the byte-stable `M1`..`M15` subset.
+                    //
+                    // Refuse the record, keep draining — a daily file can
+                    // legitimately mix older + current records via append across a
+                    // deploy boundary. The loss is bounded to one deploy boot's
+                    // worth of spilled seals.
+                    if buf[7] < SEAL_SPILL_FORMAT_VERSION {
                         legacy_refused += 1;
                         continue;
                     }
@@ -898,8 +936,11 @@ impl SealSpillWriter {
             warn!(
                 ?path,
                 legacy_refused,
-                "refused pre-renumber legacy spill records (format_version byte 0 — \
-                 old TfIndex ordinal space; deleted with the file after drain)"
+                current_format_version = SEAL_SPILL_FORMAT_VERSION,
+                "refused spill records written under an OLDER format version (their \
+                 tf_ordinal belongs to a superseded TfIndex ordinal space, so \
+                 decoding them would file a seal under the wrong timeframe; deleted \
+                 with the file after drain)"
             );
         }
         info!(?path, count = all.len(), "drained spill file");
@@ -1302,35 +1343,57 @@ mod tests {
     }
 
     #[test]
-    fn test_read_all_refuses_legacy_records_but_drains_v1_siblings() {
-        // A daily spill file mixing a pre-renumber legacy record (byte 7
-        // == 0 — OLD TfIndex ordinal space) with a current v1 record must
-        // drain ONLY the v1 record; the legacy one is refused (never
-        // misdecoded into the renumbered ordinal space) and lost with the
-        // file when clear_spill_for_date deletes it after drain.
-        let dir = temp_spill_dir("legacy-refusal");
+    fn test_read_all_refuses_every_older_version_but_drains_current_siblings() {
+        // A daily spill file mixing records from EVERY older ordinal space
+        // with a current record must drain ONLY the current one.
+        //
+        // ⚠ WHY THIS TEST WAS REWRITTEN (2026-09-19). It used to forge one
+        // byte-7 == 0 record and pair it with a record it CALLED "v1" — but
+        // `to_bytes()` stamps the LIVE constant, so that sibling was never v1
+        // at all; it was whatever the current version happened to be. The test
+        // therefore only ever exercised the `== 0` corner and would have kept
+        // passing if the gate had stayed `buf[7] == 0` while the ordinal space
+        // renumbered underneath it. The version-3 record below is the case the
+        // nine-frame collapse actually creates, and it is forged explicitly so
+        // it cannot silently become "current" on the next bump.
+        let dir = temp_spill_dir("older-version-refusal");
         let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
         let now = 1_716_000_000_i64;
 
-        // Legacy record: forge byte 7 back to 0 (the pre-C2 padding value).
-        let legacy = mk_seal(13, 0, 1, 1_716_000_900, 100.0);
-        let mut legacy_bytes = legacy.to_bytes();
-        legacy_bytes[7] = 0;
+        // Pre-C2 record: byte 7 was zero padding, the 5-frame ordinal space.
+        let pre_c2 = mk_seal(13, 0, 1, 1_716_000_900, 100.0);
+        let mut pre_c2_bytes = pre_c2.to_bytes();
+        pre_c2_bytes[7] = 0;
 
-        // Current v1 record (to_bytes stamps the version).
-        let v1 = mk_seal(25, 1, 2, 1_716_001_500, 200.75);
-        let v1_bytes = v1.to_bytes();
+        // Version-3 record: the 24-frame ordinal space, where S1 was 5 and M60
+        // was 23. Both are IN RANGE for today's nine-frame table, so refusing
+        // on the version byte is the ONLY thing standing between this record
+        // and a silent misdecode into the wrong frame.
+        let v3 = mk_seal(19, 0, 3, 1_716_001_200, 150.25);
+        let mut v3_bytes = v3.to_bytes();
+        v3_bytes[7] = 3;
+        assert!(
+            v3_bytes[7] < SEAL_SPILL_FORMAT_VERSION,
+            "the forged record must be genuinely older than the live constant; \
+             bump this literal only together with a NEW forged version below it",
+        );
+
+        // Current record (to_bytes stamps the live version).
+        let current = mk_seal(25, 1, 2, 1_716_001_500, 200.75);
+        let current_bytes = current.to_bytes();
+        assert_eq!(current_bytes[7], SEAL_SPILL_FORMAT_VERSION);
 
         let path = writer.spill_path(now);
         std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
-        let mut raw = Vec::with_capacity(2 * SEAL_SPILL_RECORD_SIZE);
-        raw.extend_from_slice(&legacy_bytes);
-        raw.extend_from_slice(&v1_bytes);
+        let mut raw = Vec::with_capacity(3 * SEAL_SPILL_RECORD_SIZE);
+        raw.extend_from_slice(&pre_c2_bytes);
+        raw.extend_from_slice(&v3_bytes);
+        raw.extend_from_slice(&current_bytes);
         std::fs::write(&path, &raw).expect("write mixed spill file");
 
         let drained = writer.read_all(now).expect("read");
-        assert_eq!(drained.len(), 1, "only the v1 record must drain");
-        assert_eq!(drained[0], v1);
+        assert_eq!(drained.len(), 1, "only the current record must drain");
+        assert_eq!(drained[0], current);
 
         writer.clear_spill_for_date(now).expect("clear");
         assert!(!path.exists(), "spill file deleted after drain");
@@ -1346,8 +1409,12 @@ mod tests {
     #[test]
     fn test_serialized_seal_to_bytes_padding_zero_filled() {
         // Byte 6 is the feed index (0 = Dhan here); byte 7 carries the
-        // spill format version (C2, 2026-07-21) so legacy pre-renumber
-        // records (byte 7 == 0) are refusable on load. §31 Option 2 now
+        // spill format version (C2, 2026-07-21) so a record written under
+        // an OLDER ordinal space is refusable on load — the gate is
+        // `buf[7] < SEAL_SPILL_FORMAT_VERSION` in `read_all`, not a
+        // `== 0` test: the 2026-09-19 nine-frame collapse renumbered the
+        // ordinals a second time, so every version below the live constant
+        // is refused, not just the pre-C2 zero. §31 Option 2 now
         // uses bytes 96..104 for `open_pct`, so the zero-padding tail
         // starts at 104.
         let seal = mk_seal(13, 0, 0, 1_716_000_900, 100.0);
@@ -2070,13 +2137,16 @@ mod tests {
     }
 
     #[test]
-    fn test_from_buffered_seal_maps_all_twenty_one_tfs_to_correct_ordinal() {
+    fn test_from_buffered_seal_maps_all_nine_tfs_to_correct_ordinal() {
         // Verify every TfIndex variant maps to its canonical ordinal
-        // (0..=20: legacy 0..=4 byte-stable, C3 second-scale 5..=20
-        // appended — which needed NO version bump, the TF ordinal space being
-        // version-independent; the v2 bump was for bytes 80..88). This pins the
-        // trading↔storage contract: a future re-ordering of TfIndex::ALL
-        // would silently flip every spilled record's TF assignment.
+        // (0..=8 after the 2026-09-19 collapse to nine frames: M1/M3/M5/M15
+        // stay byte-stable at 0..=3, and everything after them RENUMBERED —
+        // which is exactly why that change carried a version bump to 4, unlike
+        // the earlier C3 second-scale APPEND, which only added ordinals above
+        // the existing ones and left every written byte meaning what it meant).
+        // This pins the trading↔storage contract: a future re-ordering of
+        // TfIndex::ALL would silently flip every spilled record's TF
+        // assignment, and only SEAL_SPILL_FORMAT_VERSION can catch it.
         let buffered = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0);
         let mut tested: Vec<u8> = Vec::with_capacity(TfIndex::ALL.len());
         for tf in TfIndex::ALL {
@@ -2094,18 +2164,22 @@ mod tests {
         let expected: Vec<u8> = (0..TfIndex::ALL.len() as u8).collect();
         assert_eq!(tested, expected);
 
-        // Append-only proof: the 5 LEGACY frames (M1, M3, M5, M15, D1)
-        // keep their exact pre-C3 ordinals 0..=4 — the C3 second-scale
-        // frames are APPENDED after D1, never interleaved, so a pre-C3
-        // spilled record decodes to the SAME frame under the C3 binary — which
-        // is why that change needed no version bump. (The version is 2 today,
-        // bumped 2026-09-10 for bytes 80..88, not for the ordinal space.)
-        let legacy: [(TfIndex, u8); 5] = [
+        // The four BYTE-STABLE frames: M1, M3, M5, M15 keep ordinals 0..=3
+        // across every ordinal-space change this record has seen.
+        //
+        // ⚠ The C3 second-scale change WAS append-only (frames added after
+        // D1 at ordinal 4, never interleaved), which is why it needed no
+        // version bump. The 2026-09-19 nine-frame collapse is NOT: D1 was
+        // RETIRED at ordinal 4 and every survivor past M15 RENUMBERED (S1
+        // 5→4, S5 9→6, M30 22→7, M60 23→8). That renumbering is exactly why
+        // `SEAL_SPILL_FORMAT_VERSION` is 4 and why `read_all` refuses every
+        // record below it — a stale ordinal byte is still in range, so it
+        // decodes into the WRONG frame silently.
+        let legacy: [(TfIndex, u8); 4] = [
             (TfIndex::M1, 0),
             (TfIndex::M3, 1),
             (TfIndex::M5, 2),
             (TfIndex::M15, 3),
-            (TfIndex::D1, 4),
         ];
         for (tf, ord) in legacy {
             let mut b = buffered;
@@ -2140,13 +2214,17 @@ mod tests {
     fn test_serialized_seal_tf_returns_none_for_out_of_range_ordinal() {
         let mut s =
             SerializedSeal::from(&mk_buffered_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0));
-        // 21 timeframes → valid ordinals are 0..=20; the first
-        // out-of-range ordinal is `TfIndex::ALL.len()` (= 21). ROLLBACK
-        // SAFETY: this clean-refusal arm is the same code shape the older
-        // 5-frame binary takes for a C3-written record carrying ordinal
-        // >= 5 — refused (skip + warn at the read site), NEVER a panic —
-        // which is what let the C3 append land without a version bump.
-        s.tf_ordinal = TfIndex::ALL.len() as u8; // out of range (21)
+        // 9 timeframes → valid ordinals are 0..=8; the first out-of-range
+        // ordinal is `TfIndex::ALL.len()` (= 9), derived so this test cannot
+        // go stale the way the surrounding prose did. ROLLBACK SAFETY: this
+        // clean-refusal arm is the same code shape an older binary takes for a
+        // record carrying an ordinal past the end of ITS table — refused (skip
+        // + warn at the read site), NEVER a panic. Refusal is NOT sufficient on
+        // its own for the 2026-09-19 collapse, though: that renumbering left
+        // every retired ordinal IN RANGE for the new table, so a stale byte
+        // decodes to the WRONG frame silently. SEAL_SPILL_FORMAT_VERSION = 4
+        // is what catches that case; this arm only covers ordinals past the end.
+        s.tf_ordinal = TfIndex::ALL.len() as u8; // out of range (9)
         assert_eq!(s.tf(), None);
         s.tf_ordinal = 255;
         assert_eq!(s.tf(), None);
@@ -2430,9 +2508,16 @@ mod tests {
     }
 }
 
-/// C3 phase-B pins: the spill `tf_ordinal` byte round-trips every one of the
-/// 21 `TfIndex` frames, the legacy 5 keep ordinals 0..=4, and out-of-range
-/// ordinals refuse cleanly (`None`) — never panic.
+/// Ordinal pins: the spill `tf_ordinal` byte round-trips every one of the
+/// 9 `TfIndex` frames, the four byte-stable frames keep ordinals 0..=3, and
+/// out-of-range ordinals refuse cleanly (`None`) — never panic.
+///
+/// ⚠ The module was named for the C3 second-scale change, which was
+/// APPEND-ONLY. The 2026-09-19 nine-frame collapse was NOT: the ordinal
+/// space was RENUMBERED, which is what a round-trip test cannot see on its
+/// own — `from_ordinal(ord).as_ordinal() == ord` holds under ANY consistent
+/// table. Only `SEAL_SPILL_FORMAT_VERSION` protects a record written under
+/// the old table.
 #[cfg(test)]
 mod c3_tf_ordinal_pins {
     use tickvault_trading::candles::TfIndex;
@@ -2440,21 +2525,24 @@ mod c3_tf_ordinal_pins {
 
     #[test]
     fn test_tf_ordinal_roundtrip_covers_all_frames() {
-        // 24 since 2026-08-10 (M2/M30/M60 appended, operator Quote 13).
-        // The loop bound is derived from TF_COUNT so an appended frame is
-        // actually exercised instead of silently falling outside the range.
-        assert_eq!(TF_COUNT, 24);
+        // 9 since 2026-09-19 (the operator's timeframe directive collapsed
+        // 24 → 9 and RENUMBERED every survivor past M15 — which is why
+        // `SEAL_SPILL_FORMAT_VERSION` is 4). The loop bound is derived from
+        // TF_COUNT so a frame added or retired is actually exercised instead
+        // of silently falling outside the range.
+        assert_eq!(TF_COUNT, 9);
         for ord in 0..TF_COUNT {
             let tf =
                 TfIndex::from_ordinal(ord).unwrap_or_else(|| panic!("ordinal {ord} must decode"));
             assert_eq!(tf.as_ordinal(), ord, "round-trip broke at {ord}");
         }
-        // The legacy 5-frame set keeps its pre-C3 ordinals 0..=4.
+        // The four BYTE-STABLE frames keep ordinals 0..=3 across every
+        // ordinal-space change this record has seen. `D1` sat at 4 until the
+        // 2026-09-19 nine-frame collapse RETIRED it; `S1` took that slot.
         assert_eq!(TfIndex::M1.as_ordinal(), 0);
         assert_eq!(TfIndex::M3.as_ordinal(), 1);
         assert_eq!(TfIndex::M5.as_ordinal(), 2);
         assert_eq!(TfIndex::M15.as_ordinal(), 3);
-        assert_eq!(TfIndex::D1.as_ordinal(), 4);
     }
 
     #[test]

@@ -7237,3 +7237,136 @@ id-last-but-verified: the boot re-reads the id it just wrote and fails loudly if
 - Runs the wipe on a mid-session restart, or on any boot after the id is written.
 - Allocates per row on the frame-drain task: the naive `format!` shape is three strings
   per row; use the writer-owned reusable buffer.
+
+### 2026-09-19 — THE FOLD COLLAPSES TO NINE FRAMES: `TF_COUNT` 24 → 9, and the existing "no `TF_COUNT` change" REJECT rows are NARROWED, not broken
+
+**The verbatim operator demand (2026-09-19, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "dude these shodu lnot even be considered or derived or calcualted anywhere dude okay?Not written anywhere 2s 4s 6s 10s 15s 30s 2m 1d"
+
+> "i clealry told you to acheive my requirements alone rigth dude okay? Always achieve O(1) everywhere."
+
+Given in DIRECT response to a table listing every timeframe the fold currently
+computes against the ten he authorized on 2026-09-18. Recorded HERE **before any
+code**, per the rule-file-first law, because three REJECT rows in this same file
+forbid touching `TF_COUNT` and each of them has to be read correctly before this
+work can land.
+
+#### ⚠ FIRST — the narrowing, because a blanket read of the existing rows blocks this
+
+This file already says, in three places:
+
+| Line | Row |
+|---|---|
+| §2026-09-18 (FOURTH), REJECT list | *"**Any new `TfIndex` variant or `TF_COUNT` change** — clause 2 exists to avoid exactly that."* |
+| same list | *"Adds a `TfIndex` variant, or changes `TF_COUNT`, to serve `10m`."* |
+| §2026-09-19 (fresh-scratch), REJECT list | *"Adds an `M10` variant, or moves `TF_COUNT`."* |
+
+and clause 2 / clause 8 of those sections: *"`10m` is DERIVED, never a new fold
+frame. No `TfIndex` variant, no ordinal, no `TF_COUNT` change, no seal-ring
+resize, **zero added per-tick work**."*
+
+**Every one of those was written to forbid an ADDITION** — specifically, `10m`
+arriving as a 25th fold frame when a view over `candles_1m` already answers it.
+Read literally today they would also forbid a REDUCTION, which is the opposite of
+what they protect: their stated purpose is *zero ADDED per-tick work*, and this
+change removes 15 frames of it.
+
+**They are NARROWED, and only in that one direction:**
+
+- Adding a `TfIndex` variant, or raising `TF_COUNT`, remains a **REJECT** without
+  its own fresh dated quote. Unchanged.
+- `10m` remains a **VIEW** over `candles_1m` (`console_views.rs`), never a fold
+  frame. Clause 2's substance is untouched.
+- REMOVING frames the operator has ruled must not exist is **AUTHORIZED** by the
+  quotes above, and `TF_COUNT` moves DOWN as its consequence.
+
+#### The authority for WHICH frames survive is the RETAIN list, not the remove list
+
+The operator's message enumerates `2s 4s 6s 10s 15s 30s 2m 1d`. That is an
+abbreviation — `S7`…`S9` and `S11`…`S14` are not named in it and are equally not
+wanted. The binding list is the **GOVERNING DIRECTIVE of 2026-09-18**, which names
+what is KEPT: ticks plus `1s 3s 5s 1m 3m 5m 10m 15m 30m 60m`. Anything outside
+that list goes, whether or not he typed it.
+
+**Note `15s`/`30s` are removed while `15m`/`30m` are retained** — the two lists
+agree, and the near-collision is why the retain list is the authority.
+
+#### What moves
+
+| | before | after |
+|---|---:|---:|
+| `TF_COUNT` | 24 | **9** |
+| Folded frames per tick | 24 | **9** — 2.67× less per-tick fold work |
+| `SEAL_BUFFER_CAPACITY` (= `AGGREGATOR_MAX_SLOTS × TF_COUNT`, derived) | 600,000 | **225,000** |
+| `SEAL_SPILL_FORMAT_VERSION` | 3 | **4** |
+| Candle tables written | 24 | **9 folded + `candles_10m` (a VIEW) = 10**, plus `ticks` |
+
+**REMOVED (15):** `D1`, `S2`, `S4`, `S6`, `S7`, `S8`, `S9`, `S10`, `S11`, `S12`,
+`S13`, `S14`, `S15`, `S30`, `M2`.
+
+**SURVIVING (9), in their new contiguous ordinal order:**
+`M1=0, M3=1, M5=2, M15=3, S1=4, S3=5, S5=6, M30=7, M60=8`.
+
+`M1`…`M15` keep ordinals 0–3; every other survivor renumbers, because `TfIndex::ALL`
+is indexed BY ordinal and `from_ordinal` is its inverse, so the ordinals must stay
+contiguous `0..TF_COUNT`. There is no arrangement that removes `D1` at ordinal 4
+and leaves the rest where they were.
+
+#### ⚠ The `SEAL_SPILL_FORMAT_VERSION` bump is MANDATORY, not hygiene
+
+`seal_spill.rs` persists the frame as a raw **`tf_ordinal` byte**. `S1` is ordinal
+5 in every spill file on disk today and ordinal 4 after this change. Replaying an
+old file against the new table would decode `S1` rows as `D1`… except `D1` no
+longer exists, so in practice it decodes them as whichever survivor now holds that
+number — **silently, with no parse error**, because a byte in range is a byte in
+range.
+
+So the version moves **3 → 4** in the same change, and a record older than 4 is
+REFUSED rather than reinterpreted. This is the same discipline
+`SEAL_SPILL_FIRST_PREV_CLOSE_VERSION` already applies to bytes 80..88.
+
+**Task #15 (the three delay pairs moving into the candle fold) folds into THIS
+version bump.** Both changes alter what a spill record means; two bumps in two
+commits would leave a version 4 that is correct for one of them and wrong for the
+other. #20 lands first and #15 rides the same step.
+
+#### ⚠ NOT claimed
+
+- **That any of this has been accepted by a live QuestDB.** Port 9000 is
+  unreachable from the build container and there is no docker daemon; the first
+  boot after deploy is the measurement. `candles_10m` in particular remains a view
+  no live database has ever parsed.
+- **That the 2.67× is a measured latency improvement.** It is an exact count of
+  fold frames, which is what `catch_up_seal_all`'s 600,000 cell visits and the
+  per-tick `[Mutex<LiveCandleState>; TF_COUNT]` walk both scale with. The measured
+  figure this repository holds is `catch_up_seal_all` at **9.67 ms / 16.1 ns per
+  cell / 600,000 cells**; at 225,000 cells the same constant predicts ~3.6 ms, and
+  that prediction has NOT been re-measured. Re-run the harness rather than quoting
+  this line — the withdrawn "900 µs" sweep figure recorded at
+  `volume_leaderboard.rs` is what a quoted-not-measured number costs.
+- **That the 15 removed frames' existing rows disappear.** Their tables are dropped
+  by the one-shot fresh-scratch wipe (`2026-09-19-fresh-start`), which is task #17
+  and a separate change; until it runs, a deployed box keeps the old tables with no
+  writer. They are NOT SEBI tables, so this is a housekeeping matter, not a
+  retention one.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Adds a `TfIndex` variant, or raises `TF_COUNT`, citing this section — the
+  narrowing is one-directional and the addition REJECT rows stand verbatim.
+- Makes `10m` a fold frame. It is a view over `candles_1m`; clause 2 is untouched.
+- Renumbers ordinals without bumping `SEAL_SPILL_FORMAT_VERSION` in the same
+  change — that is the silent mis-decode above, and it leaves no error to find.
+- Bumps the spill version twice for #20 and #15 separately.
+- Leaves `is_operator_requested` in place. With the fold reduced to exactly the
+  requested set it is tautologically `true`, and a gate that can only return true
+  reads as a live filter to the next author.
+- Leaves any `assert_eq!(TF_COUNT, 24)` behind. Four sites pin the literal
+  (`tf_index.rs` ×2, `seal_spill.rs`, `shadow_persistence.rs`); each exists to make
+  a frame change fail loudly, so each must move to 9 deliberately rather than be
+  deleted.
+- Keeps a `candles_<tf>` DDL, self-heal entry, table-name list or retention
+  registration for a removed frame — QuestDB's self-heal can ADD a column but never
+  drop a table, so a surviving name is a table that gets re-created empty forever.

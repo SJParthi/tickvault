@@ -18,8 +18,14 @@
 //! The cost was not theoretical. If the lane flush used its full 20s, the
 //! seal writer received **10s of its 75s budget**; at the measured
 //! ~10,200 seals/sec that drains ~102,000 of a possible 600,000 seals at the
-//! 25,000-instrument ceiling. The remainder — **including every instrument's
-//! final daily bar** — was destroyed by the SIGKILL, with no counter moving,
+//! 25,000-instrument ceiling (that ceiling is `AGGREGATOR_MAX_SLOTS ×
+//! TF_COUNT` and was written at TF_COUNT=24; the 2026-09-19 nine-frame
+//! collapse puts it at **225,000**, so the same 10s drains ~102,000 of
+//! 225,000 — the seals LOST are unchanged, only the fraction moved).
+//! The remainder — **including every instrument's final bar of the session
+//! on every frame** (this read "final daily bar" until 2026-09-19; the D1
+//! frame it named is retired, and the widest surviving frame is M60) — was
+//! destroyed by the SIGKILL, with no counter moving,
 //! because a killed process cannot log its own death.
 //!
 //! The sharpest part: the 75s constant's OWN comment reasons about this exact
