@@ -16,14 +16,23 @@
 //!   (operator 2026-06-19, "same tables + feed column") keeps Dhan and
 //!   Groww candles for the same minute/instrument distinct, never merged.
 //!
-//! ## Schema (18 columns)
+//! ## Schema (22 columns)
+//!
+//! Column ORDER is the operator's, verbatim (2026-09-19): `ts` first, then
+//! the three READABLE delays, then identity, then OHLCV, then the two
+//! percentages, and the three exact `_ns` twins LAST. A reader scanning left
+//! to right meets the bar's identity and its freshness before a price.
 //!
 //! ```sql
 //! CREATE TABLE IF NOT EXISTS candles_1m (
+//!     ts                       TIMESTAMP,
+//!     open_latency             VARCHAR,
+//!     close_latency            VARCHAR,
+//!     window_span_latency      VARCHAR,
 //!     feed                     SYMBOL,
 //!     segment                  SYMBOL,
 //!     security_id              LONG,
-//!     ts                       TIMESTAMP,
+//!     contract                 SYMBOL,
 //!     open                     DOUBLE,
 //!     high                     DOUBLE,
 //!     low                      DOUBLE,
@@ -31,12 +40,13 @@
 //!     volume                   LONG,   -- SIGNED: see the note below
 //!     oi                       LONG,
 //!     tick_count               LONG,
-//!     close_pct_from_prev_day  DOUBLE,
-//!     open_pct                 DOUBLE,
-//!     change_pct               DOUBLE,
-//!     open_gap_pct             DOUBLE,
+//!     percentage_change        DOUBLE,
+//!     open_percentage_change   DOUBLE,
 //!     total_buy_qty            LONG,
-//!     total_sell_qty           LONG
+//!     total_sell_qty           LONG,
+//!     open_latency_ns          LONG,
+//!     close_latency_ns         LONG,
+//!     window_span_latency_ns   LONG
 //! ) timestamp(ts) PARTITION BY DAY
 //!   DEDUP UPSERT KEYS(ts, security_id, segment, feed);
 //! ```
@@ -131,6 +141,42 @@ use tickvault_trading::candles::{TF_COUNT, TfIndex};
 /// pre-existing NULL-feed row (`UPDATE ... WHERE feed IS NULL`) BEFORE
 /// re-enabling DEDUP — so post-migration same-minute re-seals upsert cleanly.
 pub const DEDUP_KEY_CANDLES: &str = "ts, security_id, segment, feed";
+
+/// Every candle column the CREATE below still declares, paired with its type,
+/// for the boot self-heal that brings an OLDER table up to the current shape.
+///
+/// ⚠ This list holds ONLY columns that are in the CREATE. A removed column
+/// must never appear here: QuestDB can add a column but never drop or rename
+/// one, so a self-heal naming a removed column re-adds on the next boot
+/// exactly what the reset took out — the trap this repository already recorded
+/// for `net_volume`. `change_pct`, `open_pct`, `open_gap_pct`,
+/// `close_pct_from_prev_day` and `net_volume` are absent on purpose.
+///
+/// `ts` is excluded because it is the designated timestamp, which
+/// `ALTER TABLE ... ADD COLUMN` cannot create.
+const CANDLE_SELF_HEAL_COLUMNS: &[(&str, &str)] = &[
+    ("open_latency", "VARCHAR"),
+    ("close_latency", "VARCHAR"),
+    ("window_span_latency", "VARCHAR"),
+    ("feed", "SYMBOL"),
+    ("segment", "SYMBOL"),
+    ("security_id", "LONG"),
+    ("contract", "SYMBOL"),
+    ("open", "DOUBLE"),
+    ("high", "DOUBLE"),
+    ("low", "DOUBLE"),
+    ("close", "DOUBLE"),
+    ("volume", "LONG"),
+    ("oi", "LONG"),
+    ("tick_count", "LONG"),
+    ("percentage_change", "DOUBLE"),
+    ("open_percentage_change", "DOUBLE"),
+    ("total_buy_qty", "LONG"),
+    ("total_sell_qty", "LONG"),
+    ("open_latency_ns", "LONG"),
+    ("close_latency_ns", "LONG"),
+    ("window_span_latency_ns", "LONG"),
+];
 
 // ---------------------------------------------------------------------------
 // Public helpers — aggregate the table names for downstream consumers.
@@ -317,19 +363,29 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) -> bool
         // name is a REJECT. It carries the same column name as
         // `top_volume.contract` so the two tables read and join identically.
         //
-        // REMOVED here and NOT self-healed back: `open_gap_pct` (zero SQL
-        // readers, verified 2026-09-19), `close_pct_from_prev_day` (a
-        // byte-identical duplicate of `change_pct`), `net_volume`. RENAMED:
-        // `change_pct` -> `percentage_change`, `open_pct` ->
+        // REMOVED here and NEVER self-healed back: `open_gap_pct`,
+        // `close_pct_from_prev_day` (a byte-identical duplicate of
+        // `change_pct` — `shadow_seal_columns::from_buffered_seal` fills both
+        // from the SAME `state.close_pct_from_prev_day`), and `net_volume`.
+        // RENAMED: `change_pct` -> `percentage_change`, `open_pct` ->
         // `open_percentage_change`.
         //
-        // ⚠ EVERY `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` is deliberately
-        // GONE from this function. QuestDB can add a column but never drop or
-        // rename one, so a surviving self-heal silently re-adds exactly what
-        // this CREATE just removed — the trap this repository already recorded
-        // for `net_volume`. The one-shot `2026-09-19-fresh-start` boot reset
-        // is what brings an older table to this shape; a self-heal would
-        // quietly undo it on the very next boot.
+        // ⚠ CORRECTED 2026-09-19, hours after the first draft of this block
+        // was written. That draft claimed `open_gap_pct` has "zero SQL
+        // readers, verified". THAT CLAIM IS FALSE and the same sentence went
+        // into the scope-lock rule file. `console_views.rs::candles_named_view_ddl`
+        // selects it, along with all three of the other percentages, so the
+        // `candles_named` view would have failed to create on a fresh volume
+        // and the operator would have lost the entire named candle face — the
+        // exact failure that file's own doc warns about for `net_volume`.
+        // `close_pct_from_prev_day` had a SECOND reader the draft also missed:
+        // `depth_rebalance.rs` ranks the depth-steering board from it, so a
+        // missed rename returns nothing, the board ranks nothing, and every
+        // counter and alarm stays green. Both readers are repointed in the
+        // same change as this correction. The reusable half: a claim that a
+        // column has no readers is one `grep -rn` away and must be RE-RUN at
+        // the moment of writing, never carried forward from a scan taken
+        // against a different column.
         let create_ddl = format!(
             "CREATE TABLE IF NOT EXISTS {table} (\
                 ts                          TIMESTAMP, \
@@ -358,6 +414,29 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) -> bool
             DEDUP UPSERT KEYS({DEDUP_KEY_CANDLES});"
         );
         all_keyed &= run_ddl(&client, &base_url, table, &create_ddl).await;
+
+        // Schema self-heal, for the NEW column set ONLY.
+        //
+        // ⚠ The distinction this turns on, because the first draft of this
+        // rewrite got it wrong and CI caught it: self-healing a column the
+        // CREATE above STILL DECLARES is REQUIRED — without it an upgraded
+        // deployment keeps its old table and every new column stays empty
+        // forever, silently. Self-healing a column the CREATE above REMOVED
+        // is the opposite error: QuestDB can add a column but never drop or
+        // rename one, so such a statement re-adds on the next boot exactly
+        // what the reset just took out — the trap this repository already
+        // recorded for `net_volume`.
+        //
+        // Every name in `CANDLE_SELF_HEAL_COLUMNS` therefore appears in the
+        // CREATE above, and none of the removed names does: `change_pct`,
+        // `open_pct`, `open_gap_pct`, `close_pct_from_prev_day` and
+        // `net_volume` are absent on purpose, and adding any of them back is
+        // a REJECT. On a table this CREATE just made, every statement here is
+        // a no-op.
+        for (column, ty) in CANDLE_SELF_HEAL_COLUMNS {
+            let add = format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {ty};");
+            all_keyed &= run_ddl(&client, &base_url, table, &add).await;
+        }
 
         // Re-assert the UPSERT key. Idempotent — re-enabling the same key is a
         // no-op, and a table this CREATE just made already carries it. Kept

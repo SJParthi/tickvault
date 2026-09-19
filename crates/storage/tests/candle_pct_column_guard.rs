@@ -1,34 +1,63 @@
-//! Concern-C regression ratchet — `close_pct_from_prev_day` MUST stay wired
-//! end-to-end across the candle persistence chain.
+//! Candle percentage-column ratchet — the wire names, the struct fields, and
+//! the four columns the 2026-09-19 schema reset REMOVED.
 //!
-//! Background (active-plan.md "PR-4 HOTFIX", Concern C): the Engine-B candle
-//! rewrite SILENTLY DROPPED the `*_pct_from_prev_day` columns from the candle
-//! tables. The operator expected visible % changes; they were gone. PR-4b
-//! (#860) re-added `close_pct_from_prev_day` (operator decision 2026-05-28:
-//! only `close_pct` is persisted — spot instruments have no OI and indices
-//! have no volume, so `oi_pct` / `volume_pct` stay dropped).
+//! ## History (why this file exists at all)
 //!
-//! That regression slipped past CI because NO source-scan / unit test pinned
-//! the column to the DDL or the ILP write — the only tests were inside the
-//! pure pct-computation module. This file is the missing ratchet: it scans
-//! the storage `src/` and fails the build if `close_pct_from_prev_day` is
-//! removed from ANY of the four links in the persist chain:
+//! The Engine-B candle rewrite SILENTLY DROPPED the `*_pct_from_prev_day`
+//! columns from the candle tables: the operator expected visible % changes and
+//! they were simply gone. It slipped past CI because NO source scan pinned a
+//! column to the DDL or to the ILP write — the only tests lived inside the pure
+//! pct-computation module, which kept passing while nothing reached QuestDB.
+//! This file is that missing ratchet.
+//!
+//! ## What it pins TODAY (rewritten 2026-09-19, the operator's schema reset)
+//!
+//! The reset renamed two columns and removed two, so this guard now pins BOTH
+//! directions — a column that must be wired, and a column that must NOT come
+//! back:
+//!
+//! | wire column | source field | direction |
+//! |---|---|---|
+//! | `percentage_change` | `change_pct` | must be WIRED |
+//! | `open_percentage_change` | `open_pct` | must be WIRED |
+//! | `close_pct_from_prev_day` | — | must be ABSENT from the wire |
+//! | `open_gap_pct` | — | must be ABSENT from the wire |
+//!
+//! **The wire name and the struct field differ**, which is the whole reason the
+//! helper below takes a PAIR. `shadow_seal_columns::from_buffered_seal` fills
+//! `change_pct` and `close_pct_from_prev_day` from the SAME
+//! `state.close_pct_from_prev_day`, so the two were byte-identical duplicates
+//! under two names; the reset keeps one wire column and leaves the struct field
+//! names alone.
+//!
+//! **Why the removed columns keep their STRUCT fields.** `seal_spill.rs` is a
+//! fixed-offset binary record: deleting a field moves every byte range after it
+//! and breaks replay of records already on disk. So the reset removes the four
+//! names from the WIRE (DDL + self-heal + ILP append) and leaves the in-memory
+//! and on-disk field layout untouched. A removal test that also demanded the
+//! struct field disappear would be demanding a spill-format break.
+//!
+//! **Why removal needs its own test.** QuestDB's schema self-heal can ADD a
+//! column but can never DROP or RENAME one, and ILP auto-creates any column a
+//! writer names. So a single leftover `.column_f64("open_gap_pct", ..)` — or a
+//! single stale entry in the self-heal manifest — silently re-creates a removed
+//! column on the next boot, and the reset is undone with nothing failing.
+//!
+//! The five links this file scans, for every column in both directions:
 //!
 //!   1. CREATE TABLE DDL          — `shadow_persistence.rs`
-//!   2. ALTER self-heal           — `shadow_persistence.rs`
+//!   2. ALTER self-heal manifest  — `shadow_persistence.rs`
 //!   3. ILP append column write   — `shadow_candle_writer.rs`
 //!   4. seal row struct field     — `shadow_seal_columns.rs`
 //!   5. spill record (zero-loss)  — `seal_spill.rs`
 //!
-//! See: `.claude/rules/project/observability-architecture.md` (schema
-//! self-heal at boot) and `.claude/rules/project/wave-6-error-codes.md`
+//! See: `.claude/rules/project/observability-architecture.md` (schema self-heal
+//! at boot) and `.claude/rules/project/wave-6-error-codes.md`
 //! (AGGREGATOR-SEAL-01 — seal-time ILP write).
 
 #![cfg(test)]
 
 use std::path::PathBuf;
-
-const PCT_COLUMN: &str = "close_pct_from_prev_day";
 
 fn storage_src(file: &str) -> (PathBuf, String) {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -45,8 +74,10 @@ fn storage_src(file: &str) -> (PathBuf, String) {
 }
 
 /// Strip line comments + doc comments so the guard pins the LIVE code, not a
-/// comment that merely mentions the column name. Keeps the test honest: a
-/// future refactor that leaves the column only in a `//` comment must fail.
+/// comment that merely mentions the column name. Keeps the test honest in BOTH
+/// directions: a refactor that leaves a wired column only in a `//` comment
+/// must fail, and a removal test must not be defeated by the dated note that
+/// RECORDS the removal (those notes name every removed column by design).
 fn code_only(content: &str) -> String {
     content
         .lines()
@@ -58,172 +89,157 @@ fn code_only(content: &str) -> String {
         .join("\n")
 }
 
-// ============================================================================
-// 1. CREATE TABLE DDL must declare the column as DOUBLE
-// ============================================================================
-
-#[test]
-fn ddl_create_table_declares_close_pct_double_column() {
-    let (path, content) = storage_src("shadow_persistence.rs");
-    let code = code_only(&content);
-    assert!(
-        code.contains(PCT_COLUMN) && code.contains("DOUBLE"),
-        "{}: candle CREATE TABLE DDL must declare `{PCT_COLUMN} DOUBLE`. \
-         Concern-C regression: the Engine-B rewrite dropped the pct columns \
-         once already. Re-add it to the `create_ddl` format string.",
-        path.display()
-    );
-    // Pin the exact column-in-DDL token so a stray mention elsewhere can't
-    // satisfy the check above.
-    assert!(
-        code.contains(&format!("{PCT_COLUMN}     DOUBLE"))
-            || code.contains(&format!("{PCT_COLUMN} DOUBLE")),
-        "{}: `{PCT_COLUMN}` must appear as a `DOUBLE` column in the candle \
-         CREATE TABLE body.",
-        path.display()
-    );
+/// Collapse every run of whitespace to one space.
+///
+/// The CREATE TABLE body aligns its types into a column, so the gap between a
+/// name and its type is whatever the longest name in the table happens to be.
+/// Matching a literal run of spaces makes the guard fail on a purely cosmetic
+/// realignment — and, worse, makes it PASS vacuously if someone "fixes" that
+/// failure by loosening the pattern instead of normalizing.
+fn squeeze(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut in_ws = false;
+    for ch in content.chars() {
+        if ch.is_whitespace() {
+            if !in_ws {
+                out.push(' ');
+            }
+            in_ws = true;
+        } else {
+            out.push(ch);
+            in_ws = false;
+        }
+    }
+    out
 }
 
 // ============================================================================
-// 2. ALTER ADD COLUMN IF NOT EXISTS self-heal must cover the column
+// 1. Columns that must be WIRED — all five links, wire name vs struct field
 // ============================================================================
 
-#[test]
-fn ddl_self_heal_alter_adds_close_pct_column() {
-    let (path, content) = storage_src("shadow_persistence.rs");
-    let code = code_only(&content);
-    assert!(
-        code.contains("ALTER TABLE")
-            && code.contains("ADD COLUMN IF NOT EXISTS")
-            && code.contains(PCT_COLUMN),
-        "{}: candle tables created under the pre-2026-05-28 10-column schema \
-         must auto-migrate via `ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS \
-         {PCT_COLUMN} DOUBLE;`. Without this, an upgraded deployment keeps the \
-         old schema and the % column stays empty forever (schema self-heal — \
-         observability-architecture.md).",
-        path.display()
-    );
-}
-
-// ============================================================================
-// 3. ILP append_seal must actually WRITE the column to QuestDB
-// ============================================================================
-
-#[test]
-fn ilp_append_seal_writes_close_pct_column() {
-    let (path, content) = storage_src("shadow_candle_writer.rs");
-    let code = code_only(&content);
-    assert!(
-        code.contains(&format!(".column_f64(\"{PCT_COLUMN}\"")),
-        "{}: the ILP `append_seal` builder must emit \
-         `.column_f64(\"{PCT_COLUMN}\", row.{PCT_COLUMN})`. A DDL column that \
-         is never written stays NULL — the operator sees no % change. This is \
-         the second half of the Concern-C contract (DDL + write).",
-        path.display()
-    );
-}
-
-// ============================================================================
-// 4. The seal row struct must carry the field (DDL ↔ struct ↔ write parity)
-// ============================================================================
-
-#[test]
-fn seal_row_struct_carries_close_pct_field() {
-    let (path, content) = storage_src("shadow_seal_columns.rs");
-    let code = code_only(&content);
-    assert!(
-        code.contains(&format!("pub {PCT_COLUMN}: f64")),
-        "{}: the persisted seal-row struct must carry `pub {PCT_COLUMN}: f64` \
-         so the seal-time computed value reaches the ILP writer unchanged.",
-        path.display()
-    );
-}
-
-// ============================================================================
-// 5. Spill record must preserve the field (zero-loss recovery contract)
-// ============================================================================
-
-#[test]
-fn spill_record_preserves_close_pct_field() {
-    let (path, content) = storage_src("seal_spill.rs");
-    let code = code_only(&content);
-    assert!(
-        code.contains(PCT_COLUMN),
-        "{}: the on-disk spill record must carry `{PCT_COLUMN}` so a seal that \
-         overflows the ring → spill → DLQ still re-persists its % change on \
-         replay. Operator charter: zero loss inside the rescue envelope.",
-        path.display()
-    );
-}
-
-// ============================================================================
-// Self-tests for the helper (so the guard itself can't silently no-op)
-// ============================================================================
-
-// ============================================================================
-// 6. Operator request 2026-06-02 — `change_pct` + `open_gap_pct` columns must
-//    stay wired end-to-end across the SAME persist chain (DDL + ALTER + ILP
-//    write + seal-row struct + spill record). `change_pct` is DERIVED from
-//    `close_pct_from_prev_day` at the seal-row extractor (no LiveCandleState
-//    field), so its struct/spill presence is the row/serialized-seal field.
-// ============================================================================
-
-/// Assert a derived/stamped pct column is wired across DDL, ALTER, ILP write,
-/// seal-row struct and spill record.
-fn assert_pct_column_wired_end_to_end(col: &str) {
+/// Assert a pct column is wired across DDL, self-heal, ILP write, seal-row
+/// struct and spill record.
+///
+/// `wire` is the QuestDB column name; `field` is the Rust struct field that
+/// feeds it. Since 2026-09-19 they DIFFER, so a single-name assertion would
+/// either pin the DDL and miss the struct, or pin the struct and pass while the
+/// DDL declares a column nothing writes.
+fn assert_pct_column_wired_end_to_end(wire: &str, field: &str) {
     let (sp_path, sp) = storage_src("shadow_persistence.rs");
-    let sp = code_only(&sp);
+    let sp = squeeze(&code_only(&sp));
     assert!(
-        sp.contains(&format!("{col}                  DOUBLE"))
-            || sp.contains(&format!("{col}                DOUBLE"))
-            || sp.contains(&format!("{col} DOUBLE")),
-        "{}: candle CREATE TABLE DDL must declare `{col} DOUBLE` (operator \
-         request 2026-06-02).",
+        sp.contains(&format!("{wire} DOUBLE")),
+        "{}: candle CREATE TABLE DDL must declare `{wire} DOUBLE`.",
         sp_path.display()
     );
     assert!(
-        sp.contains(&format!("ADD COLUMN IF NOT EXISTS {col} DOUBLE")),
-        "{}: candle schema self-heal must `ALTER TABLE {{table}} ADD COLUMN IF \
-         NOT EXISTS {col} DOUBLE;` so upgraded deployments backfill the column.",
+        sp.contains(&format!("(\"{wire}\", \"DOUBLE\")")),
+        "{}: the candle schema self-heal manifest must carry \
+         `(\"{wire}\", \"DOUBLE\")` so a table created before this column \
+         existed backfills it via `ALTER TABLE .. ADD COLUMN IF NOT EXISTS`. \
+         Without it an upgraded deployment keeps the old schema and the column \
+         stays empty forever.",
         sp_path.display()
     );
 
     let (w_path, w) = storage_src("shadow_candle_writer.rs");
     let w = code_only(&w);
     assert!(
-        w.contains(&format!(".column_f64(\"{col}\"")),
-        "{}: the ILP `append_seal` builder must emit `.column_f64(\"{col}\", \
-         row.{col})` — a DDL column never written stays NULL.",
+        w.contains(&format!(".column_f64(\"{wire}\", row.{field})")),
+        "{}: the ILP `append_seal` builder must emit \
+         `.column_f64(\"{wire}\", row.{field})` — a DDL column never written \
+         stays NULL, and a wire name fed from the wrong field is worse than an \
+         empty one.",
         w_path.display()
     );
 
     let (r_path, r) = storage_src("shadow_seal_columns.rs");
     let r = code_only(&r);
     assert!(
-        r.contains(&format!("pub {col}: f64")),
-        "{}: the persisted seal-row struct must carry `pub {col}: f64`.",
+        r.contains(&format!("pub {field}: f64")),
+        "{}: the persisted seal-row struct must carry `pub {field}: f64` — it \
+         is the source of the `{wire}` column.",
         r_path.display()
     );
 
     let (s_path, s) = storage_src("seal_spill.rs");
     let s = code_only(&s);
     assert!(
-        s.contains(&format!("pub {col}: f64")),
-        "{}: the on-disk spill record must carry `pub {col}: f64` so an \
-         overflowed seal still re-persists the % on replay (zero-loss).",
+        s.contains(&format!("pub {field}: f64")),
+        "{}: the on-disk spill record must carry `pub {field}: f64` so a seal \
+         that overflows the ring -> spill -> DLQ still re-persists `{wire}` on \
+         replay (zero-loss inside the rescue envelope).",
         s_path.display()
     );
 }
 
 #[test]
-fn change_pct_column_wired_end_to_end() {
-    assert_pct_column_wired_end_to_end("change_pct");
+fn percentage_change_column_wired_end_to_end() {
+    assert_pct_column_wired_end_to_end("percentage_change", "change_pct");
 }
 
 #[test]
-fn open_gap_pct_column_wired_end_to_end() {
-    assert_pct_column_wired_end_to_end("open_gap_pct");
+fn open_percentage_change_column_wired_end_to_end() {
+    assert_pct_column_wired_end_to_end("open_percentage_change", "open_pct");
 }
+
+// ============================================================================
+// 2. Columns that must stay REMOVED from the wire (2026-09-19 schema reset)
+// ============================================================================
+
+/// Assert a removed column is gone from all three WIRE links, and say why each
+/// one on its own would undo the reset.
+///
+/// Deliberately does NOT assert the struct/spill field is gone: `seal_spill.rs`
+/// is a fixed-offset binary record, so dropping a field shifts every byte range
+/// after it and breaks replay of records already written. The reset is a WIRE
+/// change.
+fn assert_column_removed_from_the_wire(wire: &str) {
+    let (sp_path, sp) = storage_src("shadow_persistence.rs");
+    let sp_code = squeeze(&code_only(&sp));
+    assert!(
+        !sp_code.contains(&format!("{wire} DOUBLE")),
+        "{}: `{wire}` was REMOVED from the candle schema on 2026-09-19 and \
+         must not reappear in the CREATE TABLE body.",
+        sp_path.display()
+    );
+    assert!(
+        !sp_code.contains(&format!("(\"{wire}\"")),
+        "{}: `{wire}` must NEVER appear in the candle self-heal manifest. \
+         QuestDB can ADD a column but can never DROP or RENAME one, so a stale \
+         manifest entry re-adds on the next boot exactly what the reset took \
+         out — and nothing fails.",
+        sp_path.display()
+    );
+
+    let (w_path, w) = storage_src("shadow_candle_writer.rs");
+    let w_code = code_only(&w);
+    assert!(
+        !w_code.contains(&format!(".column_f64(\"{wire}\"")),
+        "{}: the ILP builder must not append `{wire}` — ILP AUTO-CREATES any \
+         column a writer names, so one leftover append silently re-creates the \
+         removed column on a fresh table.",
+        w_path.display()
+    );
+}
+
+#[test]
+fn close_pct_from_prev_day_is_gone_from_the_wire() {
+    // It was a byte-identical duplicate of `change_pct` (both filled from the
+    // same `state.close_pct_from_prev_day`); the survivor is the renamed
+    // `percentage_change`. The STRUCT field of this name stays — it is the
+    // source both columns always read.
+    assert_column_removed_from_the_wire("close_pct_from_prev_day");
+}
+
+#[test]
+fn open_gap_pct_is_gone_from_the_wire() {
+    assert_column_removed_from_the_wire("open_gap_pct");
+}
+
+// ============================================================================
+// 3. Self-tests — the guard itself must be able to fail
+// ============================================================================
 
 #[test]
 fn self_test_code_only_strips_comments_keeps_code() {
@@ -233,8 +249,30 @@ fn self_test_code_only_strips_comments_keeps_code() {
     assert!(stripped.contains("let x = close_pct_from_prev_day;"));
 }
 
+#[test]
+fn self_test_squeeze_normalizes_ddl_alignment() {
+    // The removal check and the wiring check both depend on this: without it a
+    // cosmetic realignment of the CREATE TABLE body flips either verdict.
+    assert!(squeeze("percentage_change        DOUBLE, \\").contains("percentage_change DOUBLE"));
+    assert!(squeeze("percentage_change DOUBLE,").contains("percentage_change DOUBLE"));
+}
+
+#[test]
+fn self_test_removal_check_would_catch_a_resurrected_column() {
+    // Bite-proof: the three patterns the removal assertion searches for must
+    // actually match the three shapes a resurrection takes. If a future
+    // refactor changes the manifest or the ILP call shape, this fails HERE —
+    // loudly — instead of the removal test passing vacuously.
+    let ddl = squeeze("                open_gap_pct            DOUBLE, \\");
+    assert!(ddl.contains("open_gap_pct DOUBLE"));
+    assert!(squeeze("    (\"open_gap_pct\", \"DOUBLE\"),").contains("(\"open_gap_pct\""));
+    assert!(
+        ".column_f64(\"open_gap_pct\", row.open_gap_pct)".contains(".column_f64(\"open_gap_pct\"")
+    );
+}
+
 // ============================================================================
-// 7. The book totals — the SAME five-link chain.
+// 4. The book totals — the SAME five-link chain, for LONG columns.
 //
 //    ⚠ 2026-09-18: this section used to be "Net volume + the book totals" and
 //    described `net_volume` as the one candle column deliberately OMITTED
@@ -246,25 +284,22 @@ fn self_test_code_only_strips_comments_keeps_code() {
 //    behaviour went.
 // ============================================================================
 
-/// Assert a LONG candle column is wired across DDL, ALTER self-heal, ILP
+/// Assert a LONG candle column is wired across DDL, self-heal manifest, ILP
 /// write, seal-row struct and the console view.
 fn assert_long_column_wired_end_to_end(col: &str, row_type: &str) {
     let (sp_path, sp_raw) = storage_src("shadow_persistence.rs");
-    let sp = code_only(&sp_raw);
+    let sp = squeeze(&code_only(&sp_raw));
     assert!(
-        sp.contains(&format!("{col}                  LONG"))
-            || sp.contains(&format!("{col}               LONG"))
-            || sp.contains(&format!("{col}              LONG"))
-            || sp.contains(&format!("{col} LONG")),
+        sp.contains(&format!("{col} LONG")),
         "{}: candle CREATE TABLE DDL must declare `{col} LONG`.",
         sp_path.display()
     );
     assert!(
-        sp.contains(&format!("ADD COLUMN IF NOT EXISTS {col} LONG")),
-        "{}: candle tables created before {col} existed must auto-migrate via \
-         `ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS {col} LONG;`. Without \
-         it an upgraded deployment keeps the old schema and the column stays \
-         empty forever (schema self-heal).",
+        sp.contains(&format!("(\"{col}\", \"LONG\")")),
+        "{}: the candle schema self-heal manifest must carry \
+         `(\"{col}\", \"LONG\")` so a table created before this column existed \
+         backfills it. Without it an upgraded deployment keeps the old schema \
+         and the column stays empty forever (schema self-heal).",
         sp_path.display()
     );
 

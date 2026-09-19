@@ -252,7 +252,7 @@ pub fn candles_named_view_ddl() -> String {
          c.open, c.high, c.low, c.close, c.volume, c.oi, c.tick_count, \
          c.total_buy_qty, c.total_sell_qty, \
          c.feed, c.segment, c.security_id, \
-         c.change_pct, c.close_pct_from_prev_day, c.open_pct, c.open_gap_pct \
+         c.percentage_change, c.open_percentage_change \
          FROM {NAMED_VIEW_CANDLES_BASE} c \
          LEFT JOIN {dim} \
          ON c.security_id = il.security_id \
