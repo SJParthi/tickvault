@@ -1081,11 +1081,10 @@ pub async fn load_depth_candidates(
     );
     // The same symbol map the contract path reads: depth groups by underlying
     // SYMBOL, and the spot prices come back keyed on (security_id, segment).
-    let mapping_path = crate::dhan_universe::mapping_artifact_path(date_ist);
-    let symbols = std::fs::read_to_string(&mapping_path)
-        .map_err(|e| e.to_string())
-        .and_then(|b| crate::dhan_contract_universe::parse_symbol_map(&b))
-        .unwrap_or_default();
+    // SHARED, not re-parsed: this runs once a minute and the mapping artifact
+    // is written once per trading day. See `read_symbol_map` for why the cache
+    // is guarded on the file's stat stamp rather than on the date alone.
+    let symbols = crate::dhan_contract_universe::read_symbol_map(date_ist).unwrap_or_default();
     let spot = crate::dhan_contract_universe::spot_paise_by_symbol(&symbols, &prices);
     if spot.is_empty() {
         // Pre-open has not settled yet (or the feed is not delivering). This

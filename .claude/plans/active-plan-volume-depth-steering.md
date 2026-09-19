@@ -626,3 +626,142 @@ NOT claimed: that `volume` carries the candle number today — it does not, for
 ~15 days, by design. NOT claimed: that a trade the broker never sent can be
 detected; their feed carries no sequence number and no column here can see
 silence.
+
+---
+
+# Item 4 — the per-minute artifact copy, and the map that had no cache at all
+
+**Status:** APPROVED
+**Date:** 2026-09-19
+**Approved by:** Parthiban — *"Then fix and resolve and ship everything dude okay?"*
+**Crate:** `crates/app` (`dhan_contract_universe.rs`, `dhan_depth_universe.rs`)
+
+## Design
+
+Two artifacts are written ONCE per trading day by the daily rider, atomically,
+and are immutable afterwards. Both are read on the per-minute depth-steering
+path. Neither was being shared.
+
+**The contract artifact** has been cached since 2026-08-22, but
+`read_contract_artifact` returned an owned `Vec<ContractRow>`, so every caller
+paid a deep copy. The 2026-08-21 production log records
+`contracts_in_artifact: 121674` — roughly 11 MB of JSON and ~46,000 `String`
+allocations per call. The 2026-09-01 change moved that copy off the cache LOCK,
+which stopped one caller blocking another, and left the copy itself: the
+steering loop still allocated and freed 11 MB every sixty seconds.
+
+**The mapping artifact** had NO cache. Both per-minute readers —
+`dhan_depth_universe::load_depth_candidates` and
+`select_contract_universe_from_disk` — did a full `read_to_string`, a full
+`serde_json` parse, and a fresh `HashMap` with one `to_uppercase()` `String`
+per row, on EVERY call. The 2026-08-22 measurement puts that at ~4,565 rows.
+
+The change:
+
+1. `read_contract_artifact` returns `Arc<Vec<ContractRow>>`. The owned form is
+   DELETED rather than kept beside it — a `Vec`-returning sibling is exactly
+   what a future caller reaches for without noticing what it costs, and the
+   note the old function carried telling callers to "prefer an `Arc`-returning
+   accessor" was advice a compiler cannot enforce.
+2. `store_artifact` takes the `Vec` by value and returns the stored `Arc`, so a
+   cache MISS no longer allocates the artifact twice (`serde_json` once, then
+   `rows.to_vec()` again).
+3. A new `read_symbol_map` / `SYMBOL_MAP_CACHE` mirrors the contract cache
+   exactly, including its stat guard, and replaces the inline read at both
+   per-minute sites.
+
+Both caches key on `(date, (len, mtime_nanos))`, never on date alone. The daily
+rider is SUPERVISED, so a respawn can legitimately rewrite today's file; a
+date-keyed cache would then serve the superseded artifact for the rest of the
+session, and downstream a stale universe is indistinguishable from a correct one.
+
+`Arc<Vec<T>>` derefs transitively, so every read-only call site
+(`&rows`, `.iter()`, `.len()`) compiles unchanged — `dhan_feed_stack.rs`'s seed
+application and `depth_rebalance.rs`'s close-time seed writer both needed no
+edit, which is the evidence that no caller ever needed to own it.
+
+## Edge Cases
+
+- **A file that cannot be stat-ed** returns `None` from `artifact_stamp`, which
+  DISABLES the cache for that call in both directions: it never hits, and the
+  result is never stored. A file we cannot prove unchanged is not a file we may
+  serve from memory.
+- **A rewrite with an identical byte count** is caught by mtime; **a rewrite
+  inside one mtime tick** is caught by length. Both directions are pinned.
+- **A new trading day** misses on the date, because derivative ids are
+  documented as unstable across days.
+- **A failure is NOT cached.** An artifact that arrives late is picked up on the
+  following minute rather than being negatively cached for the session.
+- **An unstampable file still returns its rows** — `store_artifact` and
+  `store_symbol_map` build the `Arc` and hand it back without storing it.
+- **Lock poisoning** recovers with `into_inner()` (the house pattern); the lock
+  is held for exactly one `Arc` bump, so no copy ever happens under it.
+
+## Failure Modes
+
+| Failure | Behaviour |
+|---|---|
+| Contract artifact missing/unparseable | unchanged — `Err`, reported as "contracts are NOT in effect", never an empty set that reads like a market with no derivatives |
+| Mapping artifact missing/unparseable | unchanged — the depth path falls through to an empty map (`unwrap_or_default`); the contract path logs `WS-GAP-03` with the path and counts `symbol_map_unreadable` |
+| Stale cache served after a rider respawn | IMPOSSIBLE — the stat guard misses on any length or mtime change |
+| Two callers contending | one `Arc` bump each; the lock is never held across a parse or a copy |
+
+**One behaviour change, stated rather than left to be discovered:**
+`parse_symbol_map` emits `tv_dhan_contract_symbol_collisions_total` and a coded
+`warn!`. Before this cache that fired on every read — once a minute, all
+session, for a condition that is a property of the FILE and cannot change while
+the file does not. It now fires once per PARSE, i.e. once per artifact version.
+The counter's per-session TOTAL therefore drops by roughly the number of reads,
+so a reading compared against a pre-2026-09-19 session is not comparable. What
+it MEASURES is unchanged: a non-zero value still means the ISIN join produced an
+ambiguous symbol.
+
+## Test Plan
+
+- `read_symbol_map_shares_one_parse_across_reads` — writes a real artifact,
+  reads twice, asserts `Arc::ptr_eq`. Pointer identity deliberately, not map
+  equality: a re-parse produces an EQUAL map at a different address, so equality
+  would pass whether or not the cache works. Also asserts the upper-casing and
+  that a missing file is an `Err`, never an empty map.
+- `symbol_map_cache_misses_when_the_file_was_rewritten_the_same_day` — the four
+  miss shapes (same-len new-mtime, new-len same-mtime, different date, `None`
+  stamp) plus the hit.
+- `test_write_contract_artifact_and_read_contract_artifact_round_trip_on_disk`
+  updated for the `Arc`.
+- The four existing contract-cache tests updated for the by-value
+  `store_artifact`.
+- **Bite-proven in both directions, 2026-09-19:** dropping the stat guard from
+  `cached_symbol_map` fails the rewrite test ("a rewrite with an identical byte
+  count must still invalidate"); removing the cache lookup from
+  `read_symbol_map` fails the ptr_eq test ("an unchanged artifact must be handed
+  back, never re-parsed"). Restored: 2028 passed, 0 failed.
+
+## Rollback
+
+Revert the commit. The caches are process-local and hold no state that outlives
+the process; nothing is persisted, no schema moves, no config key is added, and
+no operator surface changes except the collision-warning cadence noted above.
+
+## Observability
+
+No new metric, no new alarm, no EMF name, no user-data byte. The September
+forecast measured 2026-09-06 is $142.24 against an automatic
+`STOP_EC2_INSTANCES` line of $135.00, and §2.3n of
+`dhan-rest-only-noise-lock-2026-07-14.md` requires a LEVER, not a cost note, for
+the next addition — so this change deliberately adds none. The existing
+`tv_dhan_contract_symbol_collisions_total` and
+`CONTRACT_UNIVERSE_FAILED_COUNTER{reason}` are unchanged in meaning.
+
+## Honest 100% claim
+
+100% inside the tested envelope, with ratcheted regression coverage: a cache HIT
+is O(1) — one lock, one comparison, one `Arc` bump, and no copy anywhere on the
+path; the stat guard is pinned in all four miss shapes; the sharing itself is
+pinned by pointer identity, which is the only assertion a re-parse can fail.
+NOT claimed: that a cache MISS is O(1) — it is Θ(file), because a parse of an
+11 MB artifact cannot be otherwise, and it happens once per artifact version.
+NOT claimed: any measured before/after latency on the box — port 9000 is closed
+here and there is no docker daemon, so the first live session with this build is
+the measurement. NOT claimed: that this changes what any downstream selector
+CHOOSES; the rows and the map are byte-identical to what the previous code
+produced, which is why every read-only call site compiled unchanged.

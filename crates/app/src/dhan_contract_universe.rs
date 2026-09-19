@@ -210,32 +210,52 @@ pub fn write_contract_artifact(date_ist: &str, rows: &[ContractRow]) -> anyhow::
     Ok(())
 }
 
-/// Reads the day's contract artifact.
+/// Reads the day's contract artifact, SHARED rather than copied.
+///
+/// # Why this returns an `Arc` and no owned form exists (2026-09-19)
+///
+/// This used to return `Vec<ContractRow>`, and every caller paid a deep copy
+/// of the whole artifact — the 2026-08-21 production log records
+/// `contracts_in_artifact: 121674`, roughly 11 MB of JSON and ~46,000 `String`
+/// allocations per call. The 2026-09-01 change moved that copy off the cache
+/// LOCK, which stopped one caller blocking another, and left the copy itself
+/// in place: the per-minute depth steering loop still allocated and freed
+/// 11 MB every sixty seconds for a file that is written ONCE per trading day
+/// and is immutable afterwards.
+///
+/// Every production caller is read-only (`&rows`, `.iter()`, `.len()`), so
+/// none of them ever needed to own it. The owned form is therefore DELETED
+/// rather than kept beside this one: a `Vec`-returning sibling is exactly the
+/// thing a future caller reaches for without noticing what it costs, and the
+/// note the old function carried telling callers to "prefer an `Arc`-returning
+/// accessor" was advice a compiler cannot enforce.
+///
+/// `Arc<Vec<ContractRow>>` derefs transitively, so a caller passing `&rows`
+/// where `&[ContractRow]` or `&Vec<ContractRow>` is expected needs no change.
+/// A caller that genuinely needs ownership writes `(*rows).clone()` and the
+/// cost is then visible at its own call site, which is the point.
 ///
 /// # Errors
 ///
 /// Missing or unparseable file. Both are non-fatal to the caller and are
 /// reported as "contracts are NOT in effect" rather than as an empty set that
 /// looks like a market with no derivatives.
-pub fn read_contract_artifact(date_ist: &str) -> anyhow::Result<Vec<ContractRow>> {
+pub fn read_contract_artifact(date_ist: &str) -> anyhow::Result<std::sync::Arc<Vec<ContractRow>>> {
     let path = contract_artifact_path(date_ist);
     let stamp = artifact_stamp(&path);
 
-    // Cache hit: same file, same size, same mtime.
-    //
-    // The clone happens HERE, after `cached_artifact` has dropped the lock —
-    // this signature is public and owns its result, so the copy still occurs,
-    // but it no longer blocks every other task waiting on the cache. Callers
-    // on a per-minute path should prefer an `Arc`-returning accessor; see the
-    // note in `cached_artifact`.
+    // Cache hit: same file, same size, same mtime. The `Arc` bump is O(1) and
+    // is now the WHOLE cost of a hit — there is no copy left anywhere on this
+    // path.
     if let Some(hit) = cached_artifact(date_ist, stamp) {
-        return Ok(hit.as_ref().clone());
+        return Ok(hit);
     }
 
     let body = std::fs::read_to_string(&path)?;
     let rows: Vec<ContractRow> = serde_json::from_str(&body)?;
-    store_artifact(date_ist, stamp, &rows);
-    Ok(rows)
+    // Store FIRST, then hand back the very `Arc` the cache holds, so a miss
+    // costs one allocation of the `Vec` and not two.
+    Ok(store_artifact(date_ist, stamp, rows))
 }
 
 /// `(len, mtime_nanos)` for the artifact, or `None` when it cannot be stat'd.
@@ -329,19 +349,37 @@ fn cached_artifact(
     None
 }
 
-/// Replaces whatever is cached. One entry, never a growing map: only today's
-/// artifact is ever asked for, so keeping yesterday's would hold ~11 MB for
-/// nothing.
-fn store_artifact(date_ist: &str, stamp: Option<(u64, i128)>, rows: &[ContractRow]) {
-    let Some(stamp) = stamp else { return };
+/// Replaces whatever is cached and returns the `Arc` now held. One entry,
+/// never a growing map: only today's artifact is ever asked for, so keeping
+/// yesterday's would hold ~11 MB for nothing.
+///
+/// # Why it TAKES the `Vec` and HANDS BACK the `Arc` (2026-09-19)
+///
+/// It used to take `&[ContractRow]` and call `rows.to_vec()`, so a cache MISS
+/// allocated the artifact twice: once by `serde_json`, once again here. Taking
+/// ownership makes the second copy impossible to write, and returning the
+/// stored `Arc` means the caller does not then have to re-read its own cache
+/// to get one.
+///
+/// An unstampable file (`stamp == None`) is not cached — see
+/// [`artifact_stamp`] — but the caller still needs its rows, so the `Arc` is
+/// built and returned without being stored.
+fn store_artifact(
+    date_ist: &str,
+    stamp: Option<(u64, i128)>,
+    rows: Vec<ContractRow>,
+) -> std::sync::Arc<Vec<ContractRow>> {
+    let shared = std::sync::Arc::new(rows);
+    let Some(stamp) = stamp else { return shared };
     let mut guard = CONTRACT_ARTIFACT_CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     *guard = Some((
         date_ist.to_owned(),
         Some(stamp),
-        std::sync::Arc::new(rows.to_vec()),
+        std::sync::Arc::clone(&shared),
     ));
+    shared
 }
 
 /// Index underlyings whose FULL option chain is subscribed.
@@ -1544,6 +1582,114 @@ pub fn parse_symbol_map(body: &str) -> Result<HashMap<String, (u64, u8)>, String
     Ok(map)
 }
 
+/// The parsed symbol map, kept across calls, keyed on the same stat guard the
+/// contract artifact uses.
+///
+/// # Why this exists (2026-09-19)
+///
+/// The contract artifact has been cached since 2026-08-22; the mapping
+/// artifact beside it never was. BOTH per-minute readers —
+/// `dhan_depth_universe::load_depth_candidates` and
+/// `select_contract_universe_from_disk` — did a full `read_to_string` plus a
+/// full `serde_json` parse of the mapping file on EVERY call, then built a
+/// fresh `HashMap` with one `to_uppercase()` `String` allocation per row. The
+/// 2026-08-22 measurement puts that at ~4,565 rows per parse, once a minute,
+/// for the whole session, on the steering task.
+///
+/// It is the same file with the same lifecycle as the contract artifact —
+/// written once per trading day by the daily rider, atomically, immutable
+/// afterwards — so it gets the same treatment and the SAME reason for a stat
+/// guard rather than a date key: the rider is supervised, so a respawn can
+/// legitimately rewrite today's file, and a date-keyed cache would then serve
+/// the superseded map silently for the rest of the session.
+static SYMBOL_MAP_CACHE: std::sync::Mutex<Option<CachedSymbolMap>> = std::sync::Mutex::new(None);
+
+/// `(trading date, stat stamp, parsed map)` — the one cached symbol map.
+type CachedSymbolMap = (
+    String,
+    Option<(u64, i128)>,
+    std::sync::Arc<HashMap<String, (u64, u8)>>,
+);
+
+/// Reads and parses the day's mapping artifact into `symbol -> (id, segment)`,
+/// SHARED rather than re-parsed.
+///
+/// # Why the collision warning now fires once per PARSE, not once per READ
+///
+/// [`parse_symbol_map`] emits `tv_dhan_contract_symbol_collisions_total` and a
+/// coded `warn!` when a symbol resolves to two different pairs. Before this
+/// cache that fired on every read — once a minute, all session, for a
+/// condition that is a property of the FILE and cannot change while the file
+/// does not. It now fires once per parse, which is once per artifact version.
+///
+/// That is a deliberate reduction and it is stated rather than left to be
+/// discovered: the counter's per-session TOTAL drops by roughly the number of
+/// reads, so a reading compared against a pre-2026-09-19 session is not
+/// comparable. What it measures is unchanged — a non-zero value still means
+/// the ISIN join produced an ambiguous symbol, which is the signal.
+///
+/// # Errors
+///
+/// An unreadable file (the `io::Error` rendered) or a malformed one (the
+/// [`parse_symbol_map`] message). A failure is NOT cached: the next call
+/// re-reads, so a file that arrives late is picked up on the following minute
+/// rather than being negatively cached for the session.
+pub fn read_symbol_map(
+    date_ist: &str,
+) -> Result<std::sync::Arc<HashMap<String, (u64, u8)>>, String> {
+    let path = crate::dhan_universe::mapping_artifact_path(date_ist);
+    let stamp = artifact_stamp(&path);
+
+    if let Some(hit) = cached_symbol_map(date_ist, stamp) {
+        return Ok(hit);
+    }
+
+    let body = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let map = parse_symbol_map(&body)?;
+    Ok(store_symbol_map(date_ist, stamp, map))
+}
+
+/// Returns the cached map when the date AND the stat stamp both match.
+///
+/// A `None` stamp never matches — see [`artifact_stamp`]. Lock poisoning is
+/// recovered with `into_inner()` (the house pattern), and the lock is held for
+/// exactly one `Arc` bump: no copy happens under it, which is the property the
+/// contract-artifact cache had to be repaired for on 2026-09-01.
+fn cached_symbol_map(
+    date_ist: &str,
+    stamp: Option<(u64, i128)>,
+) -> Option<std::sync::Arc<HashMap<String, (u64, u8)>>> {
+    let stamp = stamp?;
+    let guard = SYMBOL_MAP_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (cached_date, cached_stamp, map) = guard.as_ref()?;
+    if cached_date == date_ist && *cached_stamp == Some(stamp) {
+        return Some(std::sync::Arc::clone(map));
+    }
+    None
+}
+
+/// Replaces whatever is cached and returns the `Arc` now held. One entry, for
+/// the same reason [`store_artifact`] keeps one.
+fn store_symbol_map(
+    date_ist: &str,
+    stamp: Option<(u64, i128)>,
+    map: HashMap<String, (u64, u8)>,
+) -> std::sync::Arc<HashMap<String, (u64, u8)>> {
+    let shared = std::sync::Arc::new(map);
+    let Some(stamp) = stamp else { return shared };
+    let mut guard = SYMBOL_MAP_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = Some((
+        date_ist.to_owned(),
+        Some(stamp),
+        std::sync::Arc::clone(&shared),
+    ));
+    shared
+}
+
 /// [`parse_symbol_map`] with the number of symbols that mapped to a DIFFERENT
 /// `(security_id, segment)` than an earlier row. Pure, so the collision count
 /// is a unit test rather than a log line.
@@ -1785,11 +1931,10 @@ pub async fn load_contract_universe(
             return ContractSelection::default();
         }
     };
+    // Computed for the error arm's log line only; the read itself is cached.
     let mapping_path = crate::dhan_universe::mapping_artifact_path(date_ist);
-    let symbols = match std::fs::read_to_string(&mapping_path)
-        .map_err(|e| e.to_string())
-        .and_then(|b| parse_symbol_map(&b))
-    {
+    // SHARED, not re-parsed — see `read_symbol_map`.
+    let symbols = match read_symbol_map(date_ist) {
         Ok(s) => s,
         Err(err) => {
             tracing::error!(
@@ -1805,7 +1950,7 @@ pub async fn load_contract_universe(
             // rather than "the map itself is broken".
             metrics::counter!(CONTRACT_UNIVERSE_FAILED_COUNTER, "reason" => "symbol_map_unreadable")
                 .increment(1);
-            HashMap::new()
+            std::sync::Arc::default()
         }
     };
 
@@ -2093,7 +2238,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let stamp = Some((4_242_u64, 1_700_000_000_000_000_000_i128));
-        super::store_artifact("2026-08-22", stamp, &[crow(7), crow(8)]);
+        super::store_artifact("2026-08-22", stamp, vec![crow(7), crow(8)]);
         let hit = super::cached_artifact("2026-08-22", stamp).expect("identical stamp must hit");
         assert_eq!(hit.len(), 2);
         assert_eq!(hit[0].i, 7);
@@ -2111,7 +2256,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let first = Some((4_242_u64, 1_700_000_000_000_000_000_i128));
-        super::store_artifact("2026-08-22", first, &[crow(7)]);
+        super::store_artifact("2026-08-22", first, vec![crow(7)]);
 
         // Same size, later mtime — a rewrite that happens to land the same
         // byte count. Length alone would have called this unchanged.
@@ -2138,7 +2283,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let stamp = Some((4_242_u64, 1_700_000_000_000_000_000_i128));
-        super::store_artifact("2026-08-21", stamp, &[crow(7)]);
+        super::store_artifact("2026-08-21", stamp, vec![crow(7)]);
         assert!(
             super::cached_artifact("2026-08-22", stamp).is_none(),
             "yesterday's artifact must not answer for today"
@@ -2161,10 +2306,95 @@ mod tests {
             .is_none(),
             "a missing file must not produce a stamp"
         );
-        super::store_artifact("2026-08-22", None, &[crow(7)]);
+        super::store_artifact("2026-08-22", None, vec![crow(7)]);
         assert!(
             super::cached_artifact("2026-08-22", None).is_none(),
             "an unknown stamp must never hit"
+        );
+    }
+
+    /// Two reads of an unchanged mapping artifact hand back the SAME
+    /// allocation.
+    ///
+    /// `Arc::ptr_eq` is the proof deliberately, rather than comparing the maps:
+    /// a re-parse would produce an EQUAL map at a different address, so
+    /// equality passes whether or not the cache works. Pointer identity is the
+    /// only assertion that fails when the parse is re-run, and not re-running
+    /// it is the entire point — the 2026-08-22 measurement puts this file at
+    /// ~4,565 rows, parsed twice a minute before this cache existed.
+    #[test]
+    fn read_symbol_map_shares_one_parse_across_reads() {
+        let _g = CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A date no production path and no other test uses, so the single
+        // cache slot cannot be contended and the file cannot collide with a
+        // real artifact.
+        let date = "2099-01-02";
+        let path = crate::dhan_universe::mapping_artifact_path(date);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).expect("cache dir");
+        }
+        std::fs::write(
+            &path,
+            r#"{"mappings":[{"symbol":"reliance","security_id":2885,"exchange_segment":1}]}"#,
+        )
+        .expect("writes");
+
+        let first = super::read_symbol_map(date).expect("reads");
+        assert_eq!(
+            first.get("RELIANCE"),
+            Some(&(2885_u64, 1_u8)),
+            "the symbol is upper-cased on the way in, because the spot join is \
+             case-sensitive and the artifact is not"
+        );
+
+        let second = super::read_symbol_map(date).expect("reads again");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "an unchanged artifact must be handed back, never re-parsed"
+        );
+
+        std::fs::remove_file(&path).expect("cleanup");
+        assert!(
+            super::read_symbol_map(date).is_err(),
+            "a missing artifact is an ERROR, never an empty map — an empty map \
+             silently drops every stock from at-the-money selection"
+        );
+    }
+
+    /// The miss that MATTERS, for the same reason the contract artifact's does:
+    /// the daily rider is supervised, so a respawn can rewrite TODAY's mapping
+    /// after something has read it, and a date-keyed cache would then serve the
+    /// superseded map for the rest of the session.
+    #[test]
+    fn symbol_map_cache_misses_when_the_file_was_rewritten_the_same_day() {
+        let _g = CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let first = Some((4_242_u64, 1_700_000_000_000_000_000_i128));
+        super::store_symbol_map("2026-08-22", first, HashMap::new());
+        assert!(
+            super::cached_symbol_map("2026-08-22", first).is_some(),
+            "an identical stamp must hit"
+        );
+        assert!(
+            super::cached_symbol_map("2026-08-22", Some((4_242, 1_700_000_000_000_000_001)))
+                .is_none(),
+            "a rewrite with an identical byte count must still invalidate"
+        );
+        assert!(
+            super::cached_symbol_map("2026-08-22", Some((4_243, 1_700_000_000_000_000_000)))
+                .is_none(),
+            "a rewrite inside one mtime tick must still invalidate"
+        );
+        assert!(
+            super::cached_symbol_map("2026-08-21", first).is_none(),
+            "yesterday's map must not answer for today"
+        );
+        assert!(
+            super::cached_symbol_map("2026-08-22", None).is_none(),
+            "a file we cannot stat is one we cannot prove unchanged"
         );
     }
 
@@ -3802,7 +4032,7 @@ mod tests {
         ]);
         write_contract_artifact(date, &rows).expect("writes");
         let back = read_contract_artifact(date).expect("reads");
-        assert_eq!(back, rows);
+        assert_eq!(*back, rows);
 
         // No `.tmp` may survive: a leftover temp file is a partial artifact
         // sitting next to the real one, waiting for a future glob to find it.
