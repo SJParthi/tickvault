@@ -6461,3 +6461,115 @@ decision with its own dated row; this section removes futures and leaves the
   asked for it is retired by this section.
 - Removes equity underlying SPOT, or any option contract, in the name of this
   narrowing. The quote names futures ALONE.
+
+### 2026-09-18 (FOURTH) — `top_volume` IS STOCK OPTIONS ONLY: the index family is dropped from the board
+
+**The verbatim operator demand (2026-09-18, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "See top volume will should pick one and only options either index options or stocks options right dude am I right dude"
+
+> "Just go ahead with the stocks options alone for top volume dude"
+
+The first is the operator's QUESTION; the second is the decision, given in DIRECT
+response to a reply that named the two families, showed what each costs, and
+stated that the index board already steers nothing. Recorded HERE before the
+code, per the rule-file-first law, because this NARROWS the 2026-09-06 lock that
+created the two-family split.
+
+#### What this SUPERSEDES
+
+The 2026-09-06 contract's family row, in that section's own words: *"index
+options and stock options are ranked in **SEPARATE leaderboards**, never one
+blended list."* That rule was written to stop a single blended top-250 returning
+250 index strikes and zero stock options, and its reasoning is UNCHANGED and
+still correct. This section goes one step further and removes the index board
+entirely.
+
+| Surface | 2026-09-06 | 2026-09-18 (FOURTH) |
+|---|---|---|
+| Boards ranked per cadence | **2** — `OptionFamily::Index` + `OptionFamily::Stock` | **1** — Stock only |
+| Rows persisted per sweep | ≤ 21,470 (1,250 index + 20,220 stock, MEASURED 2026-08-22) | **≤ 20,220** |
+| Sorts per second at four cadences | 8 | **4** |
+| Per-tick `observe` on an index-option tick | one hash probe | **none** |
+| The `family` column, and its place in the DEDUP key | present | **UNCHANGED — present, and still in the key** |
+
+#### The decisive finding: the index board already steers NOTHING
+
+This is not a preference. `dhan_feed_stack.rs`'s ranking loop carries the
+admission in its own comment, verbatim:
+
+> *"Only the Stock family feeds the candidates, so with no writer there is
+> nothing the Index pass could produce. Skipping it keeps the writer-less
+> degrade at ONE sort per 5 seconds instead of two."*
+
+with the guard `if !wants_rows && family != OptionFamily::Stock { continue; }`.
+So the Index board's ONLY consumer is the `top_volume` writer. Depth-20 and
+depth-200 both read the Stock ranking — and both have been **stock options only**
+since the 2026-09-06 lock, which forbids an index option on a depth socket in as
+many words. Dropping the Index family therefore removes a board that ranks, sorts
+and persists for one reader and steers nothing.
+
+#### The READ-TIME damage, which is what the operator would actually feel
+
+The 2026-09-06 split protects the RANKING. It does not protect the QUERY.
+
+The default sort locked on 2026-09-18 is `ORDER BY ts ASC,
+volume_percentage_change DESC`, and it does not carry a family predicate. With
+both families in one table, **index strikes sit on top of every page**: a single
+NIFTY weekly at-the-money strike out-trades stock-option strikes by orders of
+magnitude, and there are 1,250 index-option contracts against 20,220 stock-option
+contracts (MEASURED 2026-08-22). So the operator's own default query returns the
+index board's head and the stock board's tail, on every page, forever — unless
+every reader remembers a `WHERE family = 'stock'` that the default sort does not
+include.
+
+One family removes that failure mode by construction rather than by a predicate a
+reader has to remember.
+
+#### The contract (LOCKED)
+
+| Aspect | Locked value |
+|---|---|
+| Ranked families | **`OptionFamily::Stock` ONLY.** `OptionFamily::Index` is not ranked, not sorted, not persisted |
+| Per-tick observe | index-option ticks are NOT observed into the leaderboard — one hash probe saved per such tick on the frame drain |
+| `family` column | **KEPT**, in the row and in `DEDUP_KEY_TOP_VOLUME_RANK`. It becomes constant (`stock`), and that is deliberate: the self-heal is `ADD COLUMN IF NOT EXISTS` and can NEVER drop a column, so removing it from the key would strand a live column outside the key; keeping it makes re-adding a family a pure additive change |
+| `OptionFamily` enum | **KEPT** — `contract_underlying_map.rs` classifies `OPTIDX` vs `OPTSTK` from the master and that classification is what makes the exclusion possible. Deleting the variant would delete the ability to recognise an index option |
+| Everything else | UNCHANGED — four cadences (1s/3s/5s/1m), every traded contract persisted (no top-N cut), the volume-percentage sort key, depth-20 and depth-200 steering, the socket and instrument budgets, `dry_run`, the §28 frozen area |
+
+#### ⚠ What is LOST (Rule 11 — no false-OK)
+
+**Index-option volume stops having a record anywhere in this system.** Nothing
+reads it today — that is the finding above — but `top_volume` is the only place
+that number has ever been written, so after this change a question like "how busy
+was the NIFTY 24500 CE in the 09:20 minute" has no answer in the database at all.
+
+That is a real loss and it is the operator's to accept. It is reversible: the
+`family` column and the `OptionFamily` classification both stay, so restoring the
+index board is adding one arm back to one loop — not a migration.
+
+#### ⚠ NOT claimed
+
+- That this makes anything faster in a way a human would notice. It halves the
+  sweep count (8 → 4 per second at four cadences) and removes ~6% of the rows.
+  The measured ceiling sweep is 2.95 ms and the realistic one is 123 µs; the
+  saving is real and is small.
+- That it improves the ranking. The Stock board's contents and order are
+  **byte-identical** before and after — the families were already ranked
+  separately, so removing one changes nothing inside the other.
+- That depth is affected. Both pools already read Stock only.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Ranks, sorts or persists the index family into `top_volume` without a fresh
+  dated quote here.
+- Drops the `family` column, or removes it from the DEDUP key — the self-heal
+  cannot drop a column, so a key that no longer names a live column is a key that
+  no longer matches the table.
+- Deletes the `OptionFamily` enum or its `OPTIDX` classification — that is what
+  identifies an index option, and without it the exclusion cannot be enforced.
+- Blends the two families into one board on the grounds that only one is left
+  (the 2026-09-06 blending ban stands and is the reason a future second family
+  must be a separate board).
+- Reports the index board as "removed for performance" — the measured saving is
+  small; the reason is that it steers nothing and it poisons the default sort.

@@ -143,6 +143,36 @@ use tracing::{error, info, warn};
 /// on the drain.
 const DEPTH_SEGMENT_UNKNOWN: &str = tickvault_common::segment::segment_code_to_str(u8::MAX);
 
+/// The option families the volume board ranks, sorts and persists.
+///
+/// **STOCK ONLY since 2026-09-18 (FOURTH)** — operator: *"Just go ahead with
+/// the stocks options alone for top volume dude"*. Full dated record, the
+/// decisive finding and the REJECT list:
+/// `.claude/rules/project/websocket-connection-scope-lock.md`
+/// § "2026-09-18 (FOURTH)".
+///
+/// Two reasons, and the second is the one an operator feels:
+///
+/// 1. The Index board steered NOTHING. Its only consumer was the `top_volume`
+///    writer — depth-20 and depth-200 have read the Stock ranking, and only
+///    the Stock ranking, since the 2026-09-06 lock forbade an index option on
+///    a depth socket. The ranking loop below said so in its own comment.
+/// 2. The default read is `ORDER BY ts ASC, volume_percentage_change DESC`
+///    with no family predicate, and one NIFTY weekly ATM strike out-trades
+///    stock strikes by orders of magnitude. With both families in one table
+///    the index board's head sat on top of every page of the operator's own
+///    query — 1,250 index-option contracts against 20,220 stock-option ones
+///    (MEASURED 2026-08-22). The 2026-09-06 family split protects the
+///    RANKING; it never protected the QUERY.
+///
+/// A LIST rather than a bare constant on purpose: the loops below use
+/// `continue`, so re-admitting a family stays one entry here instead of a
+/// re-shape of a loop body. The `family` column and its place in
+/// `DEDUP_KEY_TOP_VOLUME_RANK` are UNCHANGED for the same reason — the
+/// schema self-heal is `ADD COLUMN IF NOT EXISTS` and can never drop one.
+const RANKED_OPTION_FAMILIES: [crate::volume_leaderboard::OptionFamily; 1] =
+    [crate::volume_leaderboard::OptionFamily::Stock];
+
 /// Environment opt-in that must be `1` for the lane to run, on top of
 /// `[feeds] dhan_enabled`. Absent means OFF, which is the whole point.
 pub const DHAN_LIVE_FEED_ENV: &str = "TICKVAULT_DHAN_LIVE_FEED";
@@ -1432,10 +1462,7 @@ impl LiveIngest {
             // and report ~15 minutes of volume as one window. O(tracked)
             // integer writes on a population that is near-empty before the
             // window opens; no sort, no allocation.
-            for family in [
-                crate::volume_leaderboard::OptionFamily::Index,
-                crate::volume_leaderboard::OptionFamily::Stock,
-            ] {
+            for family in RANKED_OPTION_FAMILIES {
                 self.leaderboard.roll_baselines(family, cadence);
             }
             return (0, 0);
@@ -1465,16 +1492,12 @@ impl LiveIngest {
 
         let mut appended = 0usize;
         let mut refused = 0usize;
-        for family in [
-            crate::volume_leaderboard::OptionFamily::Index,
-            crate::volume_leaderboard::OptionFamily::Stock,
-        ] {
-            // Only the Stock family feeds the candidates, so with no writer
-            // there is nothing the Index pass could produce. Skipping it keeps
-            // the writer-less degrade at ONE sort per 5 seconds instead of two.
-            if !wants_rows && family != crate::volume_leaderboard::OptionFamily::Stock {
-                continue;
-            }
+        for family in RANKED_OPTION_FAMILIES {
+            // The `!wants_rows && family != Stock` skip that used to stand here
+            // is GONE with the Index family (2026-09-18 FOURTH) -- with one
+            // family in the list it could never fire, and a guard that cannot
+            // fire reads as though a case is still covered. The `!wants_rows`
+            // exit further down, after the candidates publish, is the live one.
             // Disjoint-field borrows, taken BEFORE the ranking borrow: the
             // gainer pass below reads these two stores while `rank`'s slice is
             // still alive, and the borrow checker allows that only because
@@ -3403,6 +3426,19 @@ impl LiveIngest {
         else {
             return;
         };
+        // STOCK ONLY since 2026-09-18 (FOURTH). Observing an index option
+        // would keep a board that nothing ranks and nothing persists, so this
+        // is where the saving lands: one hash probe per index-option tick on
+        // the frame drain, not per sweep. The probe above is NOT wasted -- the
+        // owner lookup is what identifies the family, and the depth and candle
+        // paths need it regardless.
+        //
+        // `RANKED_OPTION_FAMILIES` is the single source: `contains` over a
+        // one-element array of a `Copy` enum compiles to one compare, and
+        // re-admitting a family stays one edit in one place.
+        if !RANKED_OPTION_FAMILIES.contains(&owner.family) {
+            return;
+        }
         let _ = self.leaderboard.observe(
             crate::volume_leaderboard::RankedContract {
                 security_id: tick.security_id,
