@@ -841,170 +841,6 @@ impl Family {
     }
 }
 
-/// Bytes in the composite ranking key: segment (1) + `security_id` (8) +
-/// `!window_lots_milli` (8).
-///
-/// The complement is what turns a LOW-to-HIGH radix pass into the
-/// HIGH-to-LOW order the board wants, without a separate descending pass and
-/// without a comparator.
-#[cfg(test)]
-const RADIX_KEY_BYTES: usize = 17;
-
-/// One byte of the composite ranking key, least significant pass first.
-///
-/// The pass order is what makes an LSD radix produce the comparator's order:
-/// the LAST pass is the MOST significant key, so passes run
-/// segment → `security_id` → `!window_lots_milli`, and the finished sequence
-/// reads lots DESCENDING, then `security_id` ascending, then segment
-/// ascending — the three levels of
-/// [`VolumeLeaderboard::rank`]'s `sort_unstable_by`, in that order.
-#[cfg(test)]
-#[inline]
-const fn radix_key_byte(row: &RankedContract, pass: usize) -> u8 {
-    match pass {
-        0 => row.segment as u8,
-        1..=8 => ((row.security_id >> ((pass - 1) * 8)) & 0xff) as u8,
-        _ => (((!row.window_lots_milli) >> ((pass - 9) * 8)) & 0xff) as u8,
-    }
-}
-
-/// Reusable buffers for the radix ordering.
-///
-/// # Why an index sort and not a row sort
-///
-/// A pass moves every element it touches. `RankedContract` is tens of bytes;
-/// a `u32` index is four. Seventeen passes over the rows would move
-/// seventeen times the row bytes; seventeen passes over the indices move
-/// seventeen times four bytes, and the rows move exactly ONCE, in the final
-/// gather.
-///
-/// # Why the buffers live here
-///
-/// Principle 1 is zero allocation on the hot path. These are sized once at
-/// construction against [`MAX_TRACKED_CONTRACTS`] and reused by every sweep,
-/// so the ordering allocates nothing however often it runs — the same
-/// contract [`VolumeLeaderboard::scratch`] already holds.
-#[cfg(test)]
-#[derive(Debug)]
-struct RadixScratch {
-    /// Indices into the row buffer, in the order built so far.
-    idx: Vec<u32>,
-    /// The destination of the pass in flight. Swapped with `idx` after each.
-    alt: Vec<u32>,
-    /// The gather target. Swapped with the caller's row buffer at the end, so
-    /// the rows are moved once rather than copied back.
-    out: Vec<RankedContract>,
-    /// Per-pass byte histogram. 256 `u32`s, reused by every pass.
-    counts: [u32; 256],
-}
-
-#[cfg(test)]
-impl RadixScratch {
-    fn new() -> Self {
-        Self {
-            idx: Vec::with_capacity(MAX_TRACKED_CONTRACTS),
-            alt: Vec::with_capacity(MAX_TRACKED_CONTRACTS),
-            out: Vec::with_capacity(MAX_TRACKED_CONTRACTS),
-            counts: [0; 256],
-        }
-    }
-
-    /// Orders `rows` by the composite ranking key, in Θ(rows).
-    ///
-    /// The result is BYTE-IDENTICAL to
-    /// `rows.sort_unstable_by(|a, b| b.window_lots_milli.cmp(&a.window_lots_milli)
-    /// .then_with(|| a.security_id.cmp(&b.security_id))
-    /// .then_with(|| (a.segment as u8).cmp(&(b.segment as u8))))` —
-    /// pinned by `radix_order_matches_the_comparator_exactly`, which is the
-    /// only thing that makes this swap safe to make.
-    ///
-    /// # Complexity
-    ///
-    /// [`RADIX_KEY_BYTES`] counting passes over an index array, each Θ(n)
-    /// with no comparisons, then one Θ(n) gather. So Θ(n) with a fixed
-    /// constant — no log factor, and the constant does not grow with the
-    /// board.
-    ///
-    /// # The skip
-    ///
-    /// A pass whose histogram puts every element in ONE bucket cannot change
-    /// the order, so it is skipped. In practice that removes most of the
-    /// seventeen: the high bytes of a `security_id` are zero for every
-    /// instrument Dhan issues, and the high bytes of `!window_lots_milli` are
-    /// `0xff` for every contract trading under ~4 billion milli-lots. The
-    /// WORST case is unchanged and is still seventeen — this is a constant
-    /// the data usually pays less of, never a bound that can be exceeded.
-    fn order(&mut self, rows: &mut Vec<RankedContract>) {
-        let n = rows.len();
-        // Nothing to order, and — the load-bearing half — `u32` indices
-        // cannot address a longer buffer. `MAX_TRACKED_CONTRACTS` is four
-        // orders of magnitude below that, so this is a guard against a future
-        // caller rather than a live case; it degrades to the comparator
-        // rather than truncating, because a silently short board is the
-        // failure this whole module exists to prevent.
-        if n < 2 {
-            return;
-        }
-        if n > u32::MAX as usize {
-            rows.sort_unstable_by(|a, b| {
-                b.window_lots_milli
-                    .cmp(&a.window_lots_milli)
-                    .then_with(|| a.security_id.cmp(&b.security_id))
-                    .then_with(|| (a.segment as u8).cmp(&(b.segment as u8)))
-            });
-            return;
-        }
-
-        self.idx.clear();
-        self.idx.extend(0..n as u32);
-        self.alt.clear();
-        self.alt.resize(n, 0);
-
-        for pass in 0..RADIX_KEY_BYTES {
-            self.counts = [0; 256];
-            for &i in &self.idx {
-                let b = radix_key_byte(&rows[i as usize], pass);
-                self.counts[b as usize] += 1;
-            }
-            // Every element in one bucket: the pass is the identity.
-            if self.counts.iter().any(|&c| c as usize == n) {
-                continue;
-            }
-            // Exclusive prefix sum, so each bucket's cursor starts at its own
-            // first slot. Placing forward from there is what makes the pass
-            // STABLE, which is what lets the earlier passes' order survive.
-            let mut running = 0u32;
-            for c in &mut self.counts {
-                let here = *c;
-                *c = running;
-                running += here;
-            }
-            for k in 0..n {
-                let i = self.idx[k];
-                let b = radix_key_byte(&rows[i as usize], pass) as usize;
-                self.alt[self.counts[b] as usize] = i;
-                self.counts[b] += 1;
-            }
-            std::mem::swap(&mut self.idx, &mut self.alt);
-        }
-
-        // The one time the rows move.
-        //
-        // Gather, then copy back rather than SWAP the two buffers. A swap
-        // looks cheaper and is the wrong trade: it hands the caller's vector
-        // to `out`, so `out`'s pre-sized capacity is replaced by whatever the
-        // caller happened to bring and the NEXT gather reallocates. Both
-        // buffers are sized once at `MAX_TRACKED_CONTRACTS`; the copy-back is
-        // one memcpy and keeps both pre-sizes intact forever.
-        self.out.clear();
-        for &i in &self.idx {
-            self.out.push(rows[i as usize]);
-        }
-        rows.clear();
-        rows.extend_from_slice(&self.out);
-    }
-}
-
 /// Per-family volume leaderboards.
 #[derive(Debug)]
 pub struct VolumeLeaderboard {
@@ -2622,19 +2458,23 @@ mod tests {
         //
         // It used to split on `"\n#[cfg(test)]"`, which was correct while the
         // only such attribute in the file was the one on `mod tests`. The
-        // rejected radix sort landed above it on 2026-09-19 with FOUR
+        // rejected radix sort briefly landed above it on 2026-09-19 with four
         // `#[cfg(test)]`-gated items of its own, so the slice stopped at the
-        // first of them — line 850, a thousand lines ABOVE the single
-        // `.push(key)` this test exists to count — and the count read 0.
+        // first of them — a thousand lines ABOVE the single `.push(key)` this
+        // test exists to count — and the count read 0.
         //
         // It failed LOUDLY rather than passing, which is the one direction a
         // truncating scan is survivable in, and that is luck rather than
         // design: the same truncation in a test asserting a BAN would have
-        // read "zero occurrences, clean" on a file it never reached.
+        // read "zero occurrences, clean" on a file it never reached. A sweep
+        // the same day found NINETEEN scanners across the tree splitting on a
+        // bare `#[cfg(test)]`, most of them in that silent direction.
         //
-        // Anchoring on `mod tests` includes those gated items in the slice.
-        // That is the conservative direction on purpose: counting MORE text
-        // than production can only make an assertion stricter, never vacuous.
+        // So the radix items MOVED inside `mod tests` — the fix for all
+        // nineteen at once, and this file now holds exactly one
+        // `#[cfg(test)]`. The anchor stays regardless: it is the conservative
+        // spelling, and counting MORE text than production can only make an
+        // assertion stricter, never vacuous.
         let production = src
             .split("\n#[cfg(test)]\nmod tests")
             .next()
@@ -2651,19 +2491,16 @@ mod tests {
         // this change pointed out that `pending.push(k)` or `list.push(*key)`
         // walks straight past it. So the TOTAL push count is pinned too: any
         // new `.push(` anywhere in the production half fails this test and the
-        //
         // author has to come here and say which list they are pushing into.
-        // The six are: the work-list producer (the only one that matters
+        //
+        // The five are: the work-list producer (the only one that matters
         // here), `scratch.push(row)` in `rank`, `seen.push`/`out.push` in
-        // `distinct_underlying_over`, `out.push` in `gainer_eligible`, and
-        // `self.out.push` inside the REJECTED radix sort — which is
-        // `#[cfg(test)]`-gated and compiles into no production binary, but
-        // sits above `mod tests` and so falls inside this slice. The last
-        // five all push into buffers that die at the end of the call and
-        // index nothing.
+        // `distinct_underlying_over`, and `out.push` in `gainer_eligible`.
+        // The last four all push into buffers that die at the end of the call
+        // and index nothing.
         assert_eq!(
             production.matches(".push(").count(),
-            6,
+            5,
             "a new `.push(` appeared in the production half. If it pushes into a work list \
              it is a SECOND PRODUCER and breaks the at-most-once invariant; if it pushes \
              into a function-local buffer it is harmless — decide which, then update this \
@@ -5066,6 +4903,166 @@ mod tests {
     // the false-OK this repository forbids.
     // ===================================================================
 
+    /// Bytes in the composite ranking key: segment (1) + `security_id` (8) +
+    /// `!window_lots_milli` (8).
+    ///
+    /// The complement is what turns a LOW-to-HIGH radix pass into the
+    /// HIGH-to-LOW order the board wants, without a separate descending pass and
+    /// without a comparator.
+    const RADIX_KEY_BYTES: usize = 17;
+
+    /// One byte of the composite ranking key, least significant pass first.
+    ///
+    /// The pass order is what makes an LSD radix produce the comparator's order:
+    /// the LAST pass is the MOST significant key, so passes run
+    /// segment → `security_id` → `!window_lots_milli`, and the finished sequence
+    /// reads lots DESCENDING, then `security_id` ascending, then segment
+    /// ascending — the three levels of
+    /// [`VolumeLeaderboard::rank`]'s `sort_unstable_by`, in that order.
+    #[inline]
+    const fn radix_key_byte(row: &RankedContract, pass: usize) -> u8 {
+        match pass {
+            0 => row.segment as u8,
+            1..=8 => ((row.security_id >> ((pass - 1) * 8)) & 0xff) as u8,
+            _ => (((!row.window_lots_milli) >> ((pass - 9) * 8)) & 0xff) as u8,
+        }
+    }
+
+    /// Reusable buffers for the radix ordering.
+    ///
+    /// # Why an index sort and not a row sort
+    ///
+    /// A pass moves every element it touches. `RankedContract` is tens of bytes;
+    /// a `u32` index is four. Seventeen passes over the rows would move
+    /// seventeen times the row bytes; seventeen passes over the indices move
+    /// seventeen times four bytes, and the rows move exactly ONCE, in the final
+    /// gather.
+    ///
+    /// # Why the buffers live here
+    ///
+    /// Principle 1 is zero allocation on the hot path. These are sized once at
+    /// construction against [`MAX_TRACKED_CONTRACTS`] and reused by every sweep,
+    /// so the ordering allocates nothing however often it runs — the same
+    /// contract [`VolumeLeaderboard::scratch`] already holds.
+    #[derive(Debug)]
+    struct RadixScratch {
+        /// Indices into the row buffer, in the order built so far.
+        idx: Vec<u32>,
+        /// The destination of the pass in flight. Swapped with `idx` after each.
+        alt: Vec<u32>,
+        /// The gather target. Swapped with the caller's row buffer at the end, so
+        /// the rows are moved once rather than copied back.
+        out: Vec<RankedContract>,
+        /// Per-pass byte histogram. 256 `u32`s, reused by every pass.
+        counts: [u32; 256],
+    }
+
+    impl RadixScratch {
+        fn new() -> Self {
+            Self {
+                idx: Vec::with_capacity(MAX_TRACKED_CONTRACTS),
+                alt: Vec::with_capacity(MAX_TRACKED_CONTRACTS),
+                out: Vec::with_capacity(MAX_TRACKED_CONTRACTS),
+                counts: [0; 256],
+            }
+        }
+
+        /// Orders `rows` by the composite ranking key, in Θ(rows).
+        ///
+        /// The result is BYTE-IDENTICAL to
+        /// `rows.sort_unstable_by(|a, b| b.window_lots_milli.cmp(&a.window_lots_milli)
+        /// .then_with(|| a.security_id.cmp(&b.security_id))
+        /// .then_with(|| (a.segment as u8).cmp(&(b.segment as u8))))` —
+        /// pinned by `radix_order_matches_the_comparator_exactly`, which is the
+        /// only thing that makes this swap safe to make.
+        ///
+        /// # Complexity
+        ///
+        /// [`RADIX_KEY_BYTES`] counting passes over an index array, each Θ(n)
+        /// with no comparisons, then one Θ(n) gather. So Θ(n) with a fixed
+        /// constant — no log factor, and the constant does not grow with the
+        /// board.
+        ///
+        /// # The skip
+        ///
+        /// A pass whose histogram puts every element in ONE bucket cannot change
+        /// the order, so it is skipped. In practice that removes most of the
+        /// seventeen: the high bytes of a `security_id` are zero for every
+        /// instrument Dhan issues, and the high bytes of `!window_lots_milli` are
+        /// `0xff` for every contract trading under ~4 billion milli-lots. The
+        /// WORST case is unchanged and is still seventeen — this is a constant
+        /// the data usually pays less of, never a bound that can be exceeded.
+        fn order(&mut self, rows: &mut Vec<RankedContract>) {
+            let n = rows.len();
+            // Nothing to order, and — the load-bearing half — `u32` indices
+            // cannot address a longer buffer. `MAX_TRACKED_CONTRACTS` is four
+            // orders of magnitude below that, so this is a guard against a future
+            // caller rather than a live case; it degrades to the comparator
+            // rather than truncating, because a silently short board is the
+            // failure this whole module exists to prevent.
+            if n < 2 {
+                return;
+            }
+            if n > u32::MAX as usize {
+                rows.sort_unstable_by(|a, b| {
+                    b.window_lots_milli
+                        .cmp(&a.window_lots_milli)
+                        .then_with(|| a.security_id.cmp(&b.security_id))
+                        .then_with(|| (a.segment as u8).cmp(&(b.segment as u8)))
+                });
+                return;
+            }
+
+            self.idx.clear();
+            self.idx.extend(0..n as u32);
+            self.alt.clear();
+            self.alt.resize(n, 0);
+
+            for pass in 0..RADIX_KEY_BYTES {
+                self.counts = [0; 256];
+                for &i in &self.idx {
+                    let b = radix_key_byte(&rows[i as usize], pass);
+                    self.counts[b as usize] += 1;
+                }
+                // Every element in one bucket: the pass is the identity.
+                if self.counts.iter().any(|&c| c as usize == n) {
+                    continue;
+                }
+                // Exclusive prefix sum, so each bucket's cursor starts at its own
+                // first slot. Placing forward from there is what makes the pass
+                // STABLE, which is what lets the earlier passes' order survive.
+                let mut running = 0u32;
+                for c in &mut self.counts {
+                    let here = *c;
+                    *c = running;
+                    running += here;
+                }
+                for k in 0..n {
+                    let i = self.idx[k];
+                    let b = radix_key_byte(&rows[i as usize], pass) as usize;
+                    self.alt[self.counts[b] as usize] = i;
+                    self.counts[b] += 1;
+                }
+                std::mem::swap(&mut self.idx, &mut self.alt);
+            }
+
+            // The one time the rows move.
+            //
+            // Gather, then copy back rather than SWAP the two buffers. A swap
+            // looks cheaper and is the wrong trade: it hands the caller's vector
+            // to `out`, so `out`'s pre-sized capacity is replaced by whatever the
+            // caller happened to bring and the NEXT gather reallocates. Both
+            // buffers are sized once at `MAX_TRACKED_CONTRACTS`; the copy-back is
+            // one memcpy and keeps both pre-sizes intact forever.
+            self.out.clear();
+            for &i in &self.idx {
+                self.out.push(rows[i as usize]);
+            }
+            rows.clear();
+            rows.extend_from_slice(&self.out);
+        }
+    }
+
     /// A deterministic pseudo-random row generator. No dependency, and the
     /// same sequence every run, so a failure is reproducible.
     fn radix_fixture(n: usize, seed: u64, lots_span: u64) -> Vec<RankedContract> {
@@ -5211,10 +5208,23 @@ mod tests {
     /// file is: a timing assertion is a flaky gate. Run it with
     /// `cargo test -p tickvault-app --release radix_vs_comparator -- --ignored --nocapture`.
     ///
+    /// `--release` is not decoration. MEASURED 2026-09-19, the SAME harness
+    /// in DEBUG prints "RADIX WINS" at n=2,000 and n=20,220 - the exact
+    /// opposite verdict - because an unoptimised build penalises the
+    /// comparator's per-pair closure far more than the radix's flat loops.
+    /// Read a debug run as a correctness check only; its timings answer a
+    /// question nobody asked.
+    ///
     /// What it does NOT claim: that either figure holds on the prod
     /// r8g.xlarge. This is an x86 dev container, and the two are measured
     /// against each other on the SAME machine in the SAME run, which is the
     /// only comparison that survives the difference.
+    ///
+    /// It DOES assert, and deliberately: each round is checked to have
+    /// ordered the `n` rows it claims and to have produced the same order on
+    /// both paths. A wall-clock harness with no assertion is how the
+    /// withdrawn 900 us figure came to be quoted for months - see the block
+    /// at the assertions.
     #[test]
     #[ignore = "wall-clock measurement, not a gate"]
     fn radix_vs_comparator_at_every_measured_shape() {
@@ -5233,23 +5243,64 @@ mod tests {
                 rx.order(&mut w);
             }
 
+            // Keep the LAST round's output from each path, so the assertions
+            // below run against data this harness actually timed.
             let mut cmp_nanos = 0u128;
+            let mut cmp_out: Vec<RankedContract> = Vec::new();
             for _ in 0..ROUNDS {
                 let mut rows = base.clone();
                 let t = std::time::Instant::now();
                 comparator_order(&mut rows);
                 cmp_nanos += t.elapsed().as_nanos();
                 std::hint::black_box(&rows);
+                cmp_out = rows;
             }
 
             let mut rad_nanos = 0u128;
+            let mut rad_out: Vec<RankedContract> = Vec::new();
             for _ in 0..ROUNDS {
                 let mut rows = base.clone();
                 let t = std::time::Instant::now();
                 rx.order(&mut rows);
                 rad_nanos += t.elapsed().as_nanos();
                 std::hint::black_box(&rows);
+                rad_out = rows;
             }
+
+            // ANTI-VACUITY — what makes the printed row worth reading.
+            //
+            // CLAUDE.md records a WITHDRAWN 900 us sweep figure whose harness
+            // seeded every baseline to the contract's own volume, so every
+            // delta was zero, every contract hit the `lots == 0` `continue`,
+            // and all fifty rounds timed an EMPTY vector under a lone `< 1 s`
+            // assertion that an empty sort passes trivially. A timing harness
+            // that cannot prove it did the work reports a number about
+            // nothing, and reports it confidently.
+            //
+            // These three say the row below is real: the fixture carried the
+            // `n` it claims, BOTH paths ordered that many rows, and the two
+            // agree - so neither figure came from a degenerate or half-built
+            // vector, and the verdict compares SPEED rather than one path
+            // quietly skipping work the other did. The dedicated equivalence
+            // tests above prove correctness across thirteen shapes; this pair
+            // proves it for the exact bytes that produced these timings.
+            assert_eq!(
+                cmp_out.len(),
+                n,
+                "the comparator timed {} rows, not {n}",
+                cmp_out.len()
+            );
+            assert_eq!(
+                rad_out.len(),
+                n,
+                "the radix timed {} rows, not {n}",
+                rad_out.len()
+            );
+            assert_eq!(
+                cmp_out, rad_out,
+                "the timed orderings diverged at n={n} - the figures below \
+                 would be comparing two different amounts of work"
+            );
 
             let c = cmp_nanos / u128::from(ROUNDS);
             let r = rad_nanos / u128::from(ROUNDS);
