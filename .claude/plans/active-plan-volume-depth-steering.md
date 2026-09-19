@@ -489,3 +489,140 @@ impossible when every traded contract is an output row — the honest floor is
 Θ(traded). NOT claimed: any duty-cycle figure from the old harness. NOT claimed:
 measured uncapped row counts at 3s, 5s or 1m. NOT claimed: that this pipeline is
 observable outside the box.
+
+---
+
+# WAVE 3 — 2026-09-19: `top_volume` carries the candle row (plain names, whole-number percentage, three delay pairs)
+
+**Status:** APPROVED
+**Date:** 2026-09-19
+**Approved by:** Parthiban — verbatim, in-session: *"Then fix and resolve and ship everything dude okay?"*, given in direct response to an enumerated list whose remaining items were exactly this work. The column contract itself comes from four earlier dated messages, preserved verbatim in the authority below.
+**Authority:** `.claude/rules/project/websocket-connection-scope-lock.md` § "2026-09-19 — `top_volume` CARRIES THE CANDLE ROW" (landed FIRST, per the rule-file-first law).
+**Crates touched:** `crates/storage`, `crates/app`.
+
+## Design
+
+A `top_volume` row stops pointing at a candle and becomes the candle row for its
+(contract, timeframe, timestamp). The fold already computes every number; the
+writer COPIES them rather than re-deriving any of them — that is the operator's
+own constraint (*"no extra claucltion or derivation"*), and it is also what makes
+the two tables provably agree instead of agreeing by coincidence.
+
+Three groups of change:
+
+1. **Plain names + honest types.** `lot_size` → `per_lot_quantity`;
+   `window_lots_milli` → `total_lots_traded` (whole lots, LONG, not milli);
+   `net_volume_chg_milli_pct` → `volume_percentage_change` (a WHOLE NUMBER —
+   200/lot × 8,000 units ⇒ 3900); `candle_price_chg_pct` → `percentage_change`
+   (DOUBLE, 2dp). `gain_pct` is DELETED: it is the UNDERLYING's move sitting in a
+   CONTRACT's row, and the operator asked for it gone.
+2. **The candle numbers.** `open`, `high`, `low`, `close`,
+   `open_percentage_change` join the row, copied from the fold's own values for
+   THIS row's window.
+3. **The three delay pairs.** `open_latency`, `close_latency`, `window_span` —
+   each a whole-unit VARCHAR plus an exact `_ns` LONG twin. The twin exists
+   because text sorted descending puts `4 nanoseconds` above `1 second`: the
+   exact reverse of the truth, and it looks plausible.
+
+The DDL, the `TOP_VOLUME_RANK_COLUMNS` manifest and the row struct move in
+lockstep — that manifest is what the `ADD COLUMN IF NOT EXISTS` self-heal walks,
+so a column added to one and not the other is a column that exists on a fresh
+table and never appears on an existing one.
+
+**`volume` is deliberately NOT re-pointed in this wave.** See Failure Modes.
+
+## Edge Cases
+
+- **No receipt clock.** `received_at_nanos <= 0` is the documented sentinel for a
+  pre-`TVW3` WAL replay. Both columns of the pair go NULL. Rendering `0
+  nanoseconds` would report the fastest possible delivery for a frame whose
+  delivery time is unknown.
+- **Negative delay.** The drain back-dates receipts by ring dwell, so a frame can
+  be stamped before the window it lands in. Real, not hypothetical.
+- **`i64::MIN`.** `abs()` panics on it under the release profile's
+  `overflow-checks = true`. `unsigned_abs()` or equivalent, never `abs()`.
+- **Band boundaries.** 999,600 ns must read `1 millisecond`, never `1000
+  microseconds` — each band stops short of the round number.
+- **Singular.** `1 second`, not `1 seconds`.
+- **Zero-lot contract.** `per_lot_quantity` cannot be 0; the percentage is
+  undefined and the row is skipped, as today.
+- **A window with one trade.** `window_span` is 0 ns and renders `0 nanoseconds`
+  — a real measurement, distinct from the NULL above.
+
+## Failure Modes
+
+- **⚠ THE ONE THAT DRIVES THE PHASING — `volume` already means something else.**
+  A `volume` column exists in this table holding the vendor's CUMULATIVE DAY
+  total. QuestDB's self-heal can only ADD a column; it cannot rename or drop one.
+  Re-pointing `volume` at the candle's signed number in one change gives one
+  column two meanings across a partition boundary, with nothing in the row to tell
+  them apart. **Phase 1 (this wave)** adds `cumulative_day_volume`, writes the
+  vendor total there, and STOPS writing `volume`. **Phase 2 (≥15 calendar days
+  later, once `market_data_hot_days` has rolled every Phase-1 row off the volume)**
+  starts writing the candle number into `volume` and retires
+  `candle_volume_signed`. Safe by the clock, not by anyone remembering. Cost,
+  stated: for ~15 days the operator sees `candle_volume_signed` where he asked for
+  `volume`. Overridable by him in one word, at the price of a `DROP TABLE` that
+  discards `top_volume` history (not a SEBI table — his call, never a session's).
+- **Allocation on the frame-drain task.** A naive `format!` per delay is 60,660
+  fresh allocations per sweep on the task that already carries a 14,932 µs ILP
+  append. The precedent is on this exact struct: `TopVolumeRankRow<'a>.segment`
+  was a `String` until 2026-09-08 and was removed for this reason. Reused buffer.
+- **Row-width ceiling.** `the_producer_byte_ceiling_stays_tighter_than_the_depth_path`
+  fails around ~671 B per row today. The new columns need ~725 B. That ceiling is
+  computed from `OPTION_FAMILIES = 2`, which R18 made wrong — corrected to 1, the
+  ceiling doubles to ~1,342 B and ~725 B sits at a 46% margin. **Without that
+  correction the columns look unaffordable and are not.**
+- **Sorting the VARCHAR.** Any `ORDER BY` on a delay must use the `_ns` twin.
+- **Drift between the two tables.** If the writer re-derives instead of copying,
+  the tables can disagree while both look right.
+
+## Test Plan
+
+- Band rendering across all four bands INCLUDING both sides of each boundary
+  (999,499 / 999,500 and 999,499,999 / 999,500,000).
+- Singular vs plural at 1 and 2 of every unit.
+- `received_at_nanos <= 0` ⇒ both columns NULL, asserted as NULL and not as 0.
+- `i64::MIN` does not panic (the test is the overflow proof).
+- Negative delay renders with its sign handled and its `_ns` twin exact.
+- Perfect-reversal proof: the four-value set sorted by text and by `_ns` produce
+  opposite orders — the test that justifies the second column existing.
+- `volume_percentage_change` is an integer 3900 for 200/lot × 8,000 units.
+- `total_lots_traded` has no fractional part at any input.
+- DDL / manifest / struct lockstep: every column in one is in all three.
+- `cumulative_day_volume` receives the vendor total and `volume` is not written.
+- Row-width guard passes with `OPTION_FAMILIES = 1` and the raised assumed width.
+- DHAT: the sweep allocates no more than it did before these columns.
+
+## Rollback
+
+Every column is additive except the `volume` write, which simply stops. Reverting
+the commit restores the old writer; the added columns remain on the table holding
+NULLs, which is the normal state for a column whose writer is absent — no DDL
+reversal needed and no row is corrupted in either direction. Phase 2 is a separate
+commit and separately revertible.
+
+## Observability
+
+No new CloudWatch metric and no new alarm. The September forecast measured
+2026-09-06 is $142.24 against an automatic `STOP_EC2_INSTANCES` line of $135.00,
+and §2.3n of `dhan-rest-only-noise-lock-2026-07-14.md` requires a LEVER, not a
+cost note, for the next addition. The delay columns ARE the observability — they
+are queryable rows, which is what the operator asked for. The existing
+`tv_top_volume_rank_append_failed_total` already covers a refused append.
+
+## Honest 100% claim
+
+100% inside the tested envelope, with ratcheted regression coverage: O(1) per
+trade and per row — a trade arriving is one hash probe, a window closing is one
+row build, a row written is one ILP append — identical at 4 contracts or 25,000;
+the band renderer is pure and total; the DDL, manifest and struct are pinned in
+lockstep; the delay pair's sort semantics are proven by the reversal test. NOT
+claimed: per-sweep O(1), which is Θ(rows) and arithmetically cannot be otherwise.
+NOT claimed: that QuestDB accepts these columns — port 9000 is closed here and
+there is no docker daemon, so the first boot with this build is the measurement.
+NOT claimed: that the delay strings have ever been rendered against live rows.
+NOT claimed: that `volume` carries the candle number today — it does not, for
+~15 days, by design. NOT claimed: that a trade the broker never sent can be
+detected; their feed carries no sequence number and no column here can see
+silence.

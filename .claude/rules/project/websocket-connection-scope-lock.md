@@ -6573,3 +6573,226 @@ index board is adding one arm back to one loop — not a migration.
   must be a separate board).
 - Reports the index board as "removed for performance" — the measured saving is
   small; the reason is that it steers nothing and it poisons the default sort.
+
+### 2026-09-19 — `top_volume` CARRIES THE CANDLE ROW: plain column names, whole-number volume percentage, and the three delay pairs
+
+**No new SCOPE is claimed.** The 2026-09-18 governing section above already
+locks the ten timeframes, the four `top_volume` cadences, the removal of
+`net_volume`, and the volume-percentage default sort. This section records the
+COLUMN CONTRACT that four later operator messages settled and that no rule file
+covers — the plain names, the whole-number percentage, `total_lots_traded` as an
+integer, the deletion of `gain_pct`, the candle numbers copied into the row, and
+the three delay pairs. Recorded BEFORE any code, per the rule-file-first law.
+
+#### §0 The verbatim operator demands (preserve EXACTLY, typos included)
+
+**Quote A (the heart piece — the candle number IS the number, no re-derivation):**
+> "see meanwhiel how our current top volume timeframe timestamos volume percnetage will be precisely calcuted i mean just we need to sue the rpecise volume which is avialable in our candles tabels even in our top volume rigtht dude so that no extra claucltion or derivation right dude so that it will be easily our volume percnetage will be eaisly calcualetd based on per lot quantity with volume so that precise voluem percnetage will be precisley calculated right see that too always our sortign descendign that tto base don volume percnetage always sorted right dude am i rgith dude"
+
+**Quote B (integers where integers belong; the candle numbers must MATCH):**
+> "See total lots traded shoudl be the long right why decimal here bro why the fuck bro why see meanwhile percentage change volume open percentage change shoudl be completely precise to same candles table right dude inside top volume table right dude am I right dude tellcme dude okay?"
+
+**Quote C (drop the underlying's move; name the shared numbers plainly):**
+> "See as of now I believe we don't need this underlying percentage change right dude see meanwhile what is this fucking four shared candle numbers dude this point alone I can't understand dude is this related to first received at and last received at dude"
+
+**Quote D (the delay display rule — whole units, never a decimal):**
+> "if it is below microseconds I need to know it took 100 or 1000 microseconds, or if it is in milliseconds then the data should be like this 100 or 200 or 123 milliseconds, or if it is in seconds then I want to see this as 1 second or 2 seconds"
+
+**The authorization to build (2026-09-19):**
+> "Then fix and resolve and ship everything dude okay?"
+
+#### §1 The rule — one paragraph
+
+A `top_volume` row stops being a pointer at a candle and BECOMES the candle row
+for that (contract, timeframe, timestamp): it carries the same `open`, `high`,
+`low`, `close`, the same signed `volume`, the same `percentage_change`, and the
+same `open_percentage_change` the `candles_<tf>` row carries for that identical
+window — **copied, never re-derived** (Quote A). Every column is named plainly,
+so a reader comparing the two tables compares like with like. The sort key
+`volume_percentage_change` becomes a WHOLE NUMBER (a 200-per-lot contract that
+traded 8,000 units in the window reads **3900**, not 3900.0 and not 39.00),
+`total_lots_traded` becomes a whole-lot LONG (Quote B), `gain_pct` — the
+UNDERLYING's move, which is a different instrument's number sitting in a
+contract's row — is DELETED (Quote C), and three delay measurements arrive as
+paired columns: a human-readable whole-unit string plus its exact nanosecond
+twin (Quote D).
+
+#### §2 The LOCKED column contract
+
+| Column | Type | Meaning | Status |
+|---|---|---|---|
+| `ts` | TIMESTAMP | window OPEN, the same grid the candle row uses | unchanged |
+| `tf` · `family` · `feed` · `segment` · `contract` | SYMBOL | identity | unchanged |
+| `security_id` · `underlying_id` | LONG | identity | unchanged |
+| `subscribed` | BOOLEAN | did this contract hold a depth socket at the snapshot | unchanged |
+| `delta_units` | LONG | raw units traded in the window | unchanged |
+| `candle_bucket_skew_secs` | LONG | grid disagreement between the two writers, 0 when they agree | unchanged |
+| `per_lot_quantity` | LONG | the contract's lot size | **RENAMED** from `lot_size` |
+| `total_lots_traded` | LONG | **WHOLE LOTS**, never milli-lots, never a decimal (Quote B) | **RENAMED + RETYPED** from `window_lots_milli` |
+| `volume_percentage_change` | LONG | **WHOLE NUMBER.** 200/lot, 8,000 units ⇒ **3900**. The DEFAULT DESCENDING SORT KEY | **RENAMED + RETYPED** from `net_volume_chg_milli_pct` |
+| `percentage_change` | DOUBLE | the candle's own close-vs-previous-close move, **2 decimals**, byte-equal to the candle row | **RENAMED** from `candle_price_chg_pct` |
+| `open_percentage_change` | DOUBLE | the candle's open-vs-previous-close move, **2 decimals** | **NEW** |
+| `open` · `high` · `low` · `close` | DOUBLE | the candle row's four prices, copied | **NEW** |
+| `volume` | LONG | **see §3 — this name is mid-migration and is the one dangerous column in the table** | **PHASED** |
+| `open_latency` / `open_latency_ns` | VARCHAR / LONG | delay between the window opening and the first trade we received in it | **NEW PAIR** |
+| `close_latency` / `close_latency_ns` | VARCHAR / LONG | delay between the last trade we received and the window closing | **NEW PAIR** |
+| `window_span` / `window_span_ns` | VARCHAR / LONG | first received trade to last received trade | **NEW PAIR** |
+| ~~`gain_pct`~~ | — | the UNDERLYING's percentage move | **DELETED** (Quote C) |
+| ~~`candle_volume_signed`~~ | — | the candle's signed volume under a temporary name | **RETIRED into `volume`** at Phase 2 (§3) |
+
+`family` STAYS in the row and in the DEDUP key even though R18 left one family:
+the self-heal is `ADD COLUMN IF NOT EXISTS` and can never DROP a column, so a key
+that stops naming a live column is a key that stops matching the table.
+
+#### §3 ⚠ THE `volume` RENAME IS TWO-PHASE AND TIME-GATED — the one place this contract cannot be honoured today
+
+The operator wants ONE plainly-named `volume` in `top_volume` that equals the
+candle's signed volume. **A column named `volume` already exists in this table and
+holds a completely different number** — the vendor's CUMULATIVE DAY volume, the
+running total since 09:15, documented as such in that module's own header.
+
+QuestDB's self-heal can only ADD a column. It cannot rename one and it cannot
+drop one. So re-pointing `volume` at the candle number in a single change gives
+one column two meanings across a partition boundary: rows written before the
+deploy hold a day-cumulative figure and rows written after hold a per-window
+signed figure, under the same name, in the same table, with nothing in the row to
+tell them apart. A reader summing that column, or sorting on it, or comparing two
+days, gets a silently wrong answer. That is the exact silent-corruption class this
+repository has retired repeatedly.
+
+**THE DECISION — two phases, separated by the retention window:**
+
+| | Phase 1 (this change) | Phase 2 (≥15 calendar days later) |
+|---|---|---|
+| `cumulative_day_volume` | **ADDED**, and the vendor total is written HERE | still written here |
+| `volume` | **STOPS BEING WRITTEN.** Old rows keep their old meaning and age out | **STARTS carrying the candle's signed volume** |
+| `candle_volume_signed` | still written (the candle number's temporary home) | **STOPS being written**; `volume` is its name from then on |
+| Reader sees | two honestly-named columns; `volume` visibly going stale | one plainly-named `volume`, every row meaning the same thing |
+
+**Why ≥15 calendar days and not sooner:** `top_volume` sits in
+`HOUR_PARTITIONED_TABLES` ⇒ `RetentionClass::MarketData` ⇒ `market_data_hot_days`,
+which is **15** in `config/base.toml`. Once that window has rolled, not one row
+written under the old meaning is still on the volume, so the name can change with
+no row anywhere holding the other number. Phase 2 is therefore SAFE BY THE CLOCK,
+not by anyone remembering.
+
+**⚠ The cost, stated rather than buried:** for those ~15 days the operator sees
+`candle_volume_signed` where he asked to see `volume`, and a `volume` column that
+has stopped moving. That is a real gap between what he asked for and what the
+table shows, and it is the price of never having one column mean two things.
+
+**He can overrule this in one word.** If he says to re-point `volume` now, the
+correct execution is a `DROP TABLE` + recreate — which discards the existing
+`top_volume` history, is NOT a SEBI table, and is a decision only he can make. It
+is recorded here so the option exists and so no session takes it unasked.
+
+#### §4 The delay display rule (Quote D) — four bands, whole units, no decimals
+
+Stored unit is NANOSECONDS. The VARCHAR twin is rendered by these bands, and each
+band stops SHORT of the round number so a value never renders as `1000
+microseconds` when `1 millisecond` is the true reading:
+
+| Nanoseconds | Renders as | Example |
+|---|---|---|
+| `< 1,000` | whole **nanoseconds** | `4 nanoseconds` |
+| `1,000` – `999,499` | whole **microseconds** | `100 microseconds` |
+| `999,500` – `999,499,999` | whole **milliseconds** | `123 milliseconds` |
+| `>= 999,500,000` | whole **seconds** | `1 second` |
+
+Singular/plural follows the number (`1 second`, `2 seconds`).
+
+**Why BOTH columns and not just the readable one.** Text sorted descending
+compares the first character and stops. Four real delays — 1 second, 2
+milliseconds, 3 microseconds, 4 nanoseconds — sort to `4, 3, 2, 1`: the EXACT
+REVERSE of their true order, and it looks plausible. The `_ns` twin is what any
+`ORDER BY` must use; the VARCHAR is what a human reads.
+
+**Rounding loss is real and is the operator's own instruction.** `1 second`
+covers 999,500,000 – 1,499,999,999 ns; `123 milliseconds` covers 122,500,000 –
+123,499,999. The `_ns` column always holds the exact figure, so nothing is lost
+from the table — only from the sentence.
+
+**VARCHAR, never SYMBOL.** SYMBOL is for a small repeated vocabulary; these
+strings are near-unique per row, so SYMBOL would build a dictionary the size of
+the table.
+
+**BLANK, never `0 nanoseconds`, when there is no receipt.**
+`WAL_RECEIPT_UNKNOWN_NANOS = 0` is the documented "no receipt" sentinel
+(`ws_frame_spill.rs`), and `received_at_nanos <= 0` means the frame carries no
+receipt clock at all — a pre-`TVW3` WAL replay. Rendering that as a delay of zero
+would report the fastest possible delivery for a frame whose delivery time is
+unknown. Both columns of the pair go NULL together.
+
+**A negative delay is genuinely possible and must not overflow.** The drain
+back-dates `received_at_nanos` by ring dwell
+(`Utc::now().timestamp_nanos_opt()… .saturating_sub(queued_nanos)`), so a frame
+can be stamped before the window it lands in. `abs()` on `i64::MIN` panics under
+the release profile's `overflow-checks = true` (pinned in CLAUDE.md), so the sign
+must be stripped with `unsigned_abs()` or an equivalent that cannot overflow.
+
+#### §5 Honest envelope (mandatory per operator-charter §F)
+
+> "**O(1) per trade and per row, and nothing anywhere that grows faster than the
+> number of rows you asked for.** Every OPERATION is constant-cost and identical
+> at 4 contracts or 25,000: a trade arriving is one hash probe, a window opening
+> is one slot write, a window closing is one row build, a row written is one ILP
+> append, and a row read is one index seek. **NOT claimed: that the SWEEP is
+> O(1).** It is Θ(rows) and cannot be otherwise — producing one row per traded
+> contract costs at least one row per traded contract, and any design that claims
+> otherwise has silently reintroduced a top-N cut. The measured sweep is 2.95 ms
+> if all 20,220 contracts trade in one window and **123 µs** at a realistic
+> ~2,000; the new columns take the worst second from ~64 ms to ~71 ms (7.1% duty)
+> and the realistic second from ~6.4 ms to ~7.2 ms (0.7%). **NOT claimed: that
+> QuestDB accepts these columns.** Port 9000 is closed here and there is no docker
+> daemon, so no DDL has been executed against a live database; the first boot with
+> this build is the measurement. **NOT claimed: that the delay columns have ever
+> been rendered against live rows.** **NOT claimed: that `volume` means the candle
+> number today** — §3 is explicit that it does not, for ~15 days. **NOT claimed:
+> that a trade the broker never sent us can be detected** — their feed carries no
+> sequence number, and no column in this table can see a gap that arrived as
+> silence."
+
+#### §6 Two figures that were stale and are corrected by this change
+
+1. **`OPTION_FAMILIES: usize = 2` is wrong post-R18** and is corrected to **1**.
+   It multiplies `TOP_VOLUME_PERSIST_PER_FAMILY` (25,000) into
+   `TOP_VOLUME_MAX_ROWS_PER_SWEEP`, so the sweep has been sized for **50,000**
+   rows since the index board was dropped. Corrected, the per-row byte ceiling
+   doubles from ~671 B to **~1,342 B**, and the new columns need ~725 B — a **46%
+   margin** against the depth path's 32 MiB producer bound rather than a breach.
+   **This correction is load-bearing: without it the new columns look unaffordable
+   and are not.** An earlier cost argument of mine rested on the stale ~671 B
+   figure and is WITHDRAWN.
+2. **CLAUDE.md's "8 sweeps ≈ 23.6 ms ≈ 2.4% duty"** is 4 cadences × 2 families.
+   Post-R18 it is **4 sweeps**. Same stale factor, fourth place it appears.
+
+#### §7 What a PR that violates this section looks like (REJECT)
+
+- Re-points `volume` at the candle number in ONE change (§3 — one column, two
+  meanings, across a partition boundary).
+- Ships Phase 2 before the 15-day retention window has rolled past every Phase-1
+  row, or without confirming `market_data_hot_days` is still 15.
+- Stores `volume_percentage_change` or `total_lots_traded` as a DOUBLE, or with
+  any fractional part (Quote B says LONG, in as many words).
+- Re-derives any candle number inside the `top_volume` writer instead of copying
+  the fold's own value (Quote A: *"no extra claucltion or derivation"*).
+- Keeps `gain_pct`, or re-adds the underlying's move under another name (Quote C).
+- Sorts any delay on the VARCHAR column — that is the exact-reverse bug in §4.
+- Renders a missing receipt (`received_at_nanos <= 0`) as `0 nanoseconds` rather
+  than leaving both columns NULL.
+- Uses `abs()` on the delay (panics on `i64::MIN` under `overflow-checks`).
+- Renders a delay with a decimal point, or as `1000 microseconds` where
+  `1 millisecond` is the band (§4 bands stop short of the round number for exactly
+  this reason).
+- Stores a delay as SYMBOL.
+- Allocates per row on the frame-drain task: the naive `format!` shape is
+  **60,660 fresh allocations per sweep** (three strings × 20,220 rows) on the task
+  that already carries a 14,932 µs ILP append, in a codebase whose first principle
+  is zero allocation on the hot path. The in-repo precedent is on THIS struct —
+  `TopVolumeRankRow<'a>.segment` was a `String` until 2026-09-08 and was removed
+  for exactly this. Use a reused buffer.
+- Leaves `OPTION_FAMILIES` at 2, or raises the assumed row width without the
+  measured basis (§6).
+- Drops `family` from the row or the DEDUP key.
+- Claims the sweep is O(1) anywhere — in code, a comment, a commit message or a
+  PR body (§5).
