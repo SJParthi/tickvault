@@ -11,24 +11,36 @@
 //! itself has none, and keeping it separable means the four refusals below
 //! are testable without a runtime.
 //!
-//! ## The four things it refuses, and why each is a real loss if it does not
+//! ## The three things it refuses, and why each is a real loss if it does not
 //!
 //! | Refusal | What it prevents |
 //! |---|---|
 //! | a snapshot timestamp not on a whole second | the row's own DEDUP key stops collapsing a re-emit, so one contract holds several rows for one snapshot |
 //! | a `security_id` or `underlying_id` above `i64::MAX` | QuestDB `LONG` is signed; a namespace-banded id would WRAP to a negative and be stored as a different instrument |
-//! | a non-finite `gain_pct` | the §28.4 NaN-poisoning class, one table over — a NaN written to `DOUBLE` makes every later comparison on the column false. **Since 2026-09-12 this refusal NULLs the column and KEEPS the row** — see [`SnapshotRefusal::GainUnavailable`] |
-//! | no human label for the contract | the row is WRITTEN with `unmapped` and counted — the label is a display column, and dropping the volume row over it would repeat the `gain_pct` mistake below |
+//! | volume arithmetic that will not fit a signed 64-bit column | a WRAPPED lot count or percentage is stored as the reason a contract ranked first |
+//! | no human label for the contract | the row is WRITTEN with `unmapped` and counted — the label is a display column, and dropping the volume row over it would repeat the `gain_pct` mistake recorded below |
 //!
 //! Each refusal is COUNTED. Three of them DROP the row, and must: they
 //! protect a column the row is KEYED or ORDERED by, so a wrong value there is
 //! stored as a different instrument or as the reason a contract ranked first.
-//! The fourth, `GainUnavailable`, NULLs one leaf column and keeps everything
+//! The fourth, `LabelUnavailable`, NULLs one leaf column and keeps everything
 //! else — because dropping the row there threw away the contract's VOLUME,
 //! the one thing this table exists to record, over a display column beside
 //! it. Dropping one observability row costs no tick; writing a wrong one
 //! costs the trust in the whole table; and dropping the RIGHT row for the
 //! wrong reason costs the record itself.
+//!
+//! ⚠ The heading says THREE and the table lists FOUR rows, because the first
+//! is a refusal of the SNAPSHOT (checked once, before any row is built) and
+//! the other three are refusals of a ROW. That is the shape the counter has:
+//! [`SnapshotRefusal`] carries the three per-row reasons only.
+//!
+//! A FOURTH per-row reason, `GainUnavailable`, was deleted on 2026-09-19 with
+//! the `gain_pct` column it guarded (operator: *"See as of now I believe we
+//! don't need this underlying percentage change right dude"*). It is not
+//! retained as an unreachable variant: a refusal reason with no emit site
+//! pre-registers a counter series that can only ever read zero, and a
+//! permanently-zero counter reads as coverage rather than as absence.
 
 use tickvault_common::types::ExchangeSegment;
 use tickvault_storage::top_volume_rank_persistence::{SnapshotCadence, TopVolumeRankRow};
@@ -49,30 +61,14 @@ pub const SNAPSHOT_FEED: &str = "dhan";
 pub enum SnapshotRefusal {
     /// The id does not fit a signed 64-bit column.
     IdTooLargeForSignedColumn,
-    /// The UNDERLYING's percentage change was not knowable — no spot price
-    /// yet, no previous close yet, or a value `eligible_gain_pct` refuses as
-    /// implausible.
-    ///
-    /// # This one does NOT drop the row (2026-09-12)
-    ///
-    /// It is the only refusal whose column is neither in the DEDUP key nor in
-    /// the ordering: the views select `gain_pct` with no arithmetic and
-    /// nothing else reads it. Until today it `continue`d like the other three,
-    /// so an underlying that had not yet printed took every one of its
-    /// contracts' volume rows out of the table with it — worst at the open and
-    /// after a mid-session redeploy, exactly when the record matters most.
-    ///
-    /// The name changed with the behaviour: it no longer describes a value
-    /// that was non-finite, it describes a column that is NULL.
-    GainUnavailable,
     /// No human label was resolvable for this contract.
     ///
     /// # This one does NOT drop the row either (2026-09-13)
     ///
-    /// Like [`Self::GainUnavailable`], the label is a leaf DISPLAY column: it
-    /// is not in the DEDUP key and nothing orders by it. The row is written
-    /// with `contract_underlying_map::UNLABELLED_CONTRACT` and still carries
-    /// `security_id` + `segment`, so the contract is identifiable by join.
+    /// Like the deleted `GainUnavailable` before it, the label is a leaf DISPLAY
+    /// column: it is not in the DEDUP key and nothing orders by it. The row is
+    /// WRITTEN with `contract_underlying_map::UNLABELLED_CONTRACT` and still
+    /// carries `security_id` + `segment`, so it is identifiable by join.
     ///
     /// It should be ZERO on a healthy session: the label snapshot and the
     /// owner snapshot are built from the same artifact rows in the same pass,
@@ -111,8 +107,7 @@ pub enum SnapshotRefusal {
     /// correct defence, and it is what makes the widening of `delta_units` to
     /// `u64` a safe future change rather than a silent wrap.
     ///
-    /// Its three siblings differ, and the difference is the point:
-    /// [`Self::GainUnavailable`] fires routinely (near the open),
+    /// Its two siblings differ, and the difference is the point:
     /// [`Self::LabelUnavailable`] fires on real snapshot drift, and
     /// [`Self::IdTooLargeForSignedColumn`] is unreachable only because every
     /// namespace band in use today sits below `2^63` — an id space this
@@ -130,9 +125,8 @@ impl SnapshotRefusal {
     /// from `/metrics` until its first occurrence, which is the one moment an
     /// operator needs it to already be there. Same reasoning as
     /// `pre_register_gainer_filter_counter`.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 3] = [
         Self::IdTooLargeForSignedColumn,
-        Self::GainUnavailable,
         Self::LabelUnavailable,
         Self::LotsOutOfRange,
     ];
@@ -144,15 +138,14 @@ impl SnapshotRefusal {
     /// That is not tidiness: `metrics::counter!(NAME, "reason" => label)` with
     /// a non-literal label drops to the ALLOCATING arm, which is the
     /// `record_ws_lag` class this repository measured at ~36M allocations an
-    /// hour. Four reasons x four cadences x two families over a population the
-    /// 2026-09-12 cut removal made market-bounded is not a path to allocate on.
+    /// hour. Three reasons x four cadences over a population the 2026-09-12 cut
+    /// removal made market-bounded is not a path to allocate on.
     #[must_use]
     pub const fn index(self) -> usize {
         match self {
             Self::IdTooLargeForSignedColumn => 0,
-            Self::GainUnavailable => 1,
-            Self::LabelUnavailable => 2,
-            Self::LotsOutOfRange => 3,
+            Self::LabelUnavailable => 1,
+            Self::LotsOutOfRange => 2,
         }
     }
 
@@ -161,7 +154,6 @@ impl SnapshotRefusal {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::IdTooLargeForSignedColumn => "id_too_large",
-            Self::GainUnavailable => "gain_unavailable",
             Self::LabelUnavailable => "label_unavailable",
             Self::LotsOutOfRange => "lots_out_of_range",
         }
@@ -207,12 +199,22 @@ impl SnapshotProjection<'_> {
 /// artifact-built snapshots have DRIFTED, which is a handful of contracts or
 /// none. 64 covers the drift case with no reallocation at all.
 ///
-/// It is deliberately NOT sized for the degraded window (post-open, before the
-/// first underlying is priced, when every row refuses `GainUnavailable`).
-/// Covering that costs ~323 KB of reserved-and-untouched memory on EVERY
-/// sweep, all session, on the frame drain — see the note at the allocation
-/// site. Growing into it instead costs ~10 reallocations inside one transient
-/// window, and `Vec`'s doubling makes the total memcpy amortized O(1).
+/// It is deliberately NOT sized for a degraded window in which most rows
+/// refuse. Covering that costs ~323 KB of reserved-and-untouched memory on
+/// EVERY sweep, all session, on the frame drain — see the note at the
+/// allocation site. Growing into it instead costs ~10 reallocations inside one
+/// transient window, and `Vec`'s doubling makes the total memcpy amortized
+/// O(1).
+///
+/// ⚠ This read "the degraded window (post-open, before the first underlying is
+/// priced, when every row refuses `GainUnavailable`)" until 2026-09-19. That
+/// window no longer produces refusals at all: `gain_pct` and its reason were
+/// deleted with the operator's removal of the underlying percentage change,
+/// so an unpriced underlying now costs this table nothing. The SIZING is
+/// unchanged and is still right — a small fixed capacity that grows
+/// geometrically is correct whether the degraded case is common or absent —
+/// but the case it was sized against is gone, which makes 64 more generous
+/// than it needs to be rather than less.
 const SNAPSHOT_REFUSAL_PREALLOC: usize = 64;
 
 /// Truncates a timestamp DOWN to its whole second.
@@ -460,6 +462,24 @@ pub const fn net_volume_chg_milli_pct(window_lots_milli: i64) -> Option<i64> {
     }
 }
 
+/// The scale the leaderboard's lot arithmetic carries, and the divisor that
+/// takes it back to the whole numbers the operator reads.
+///
+/// `VolumeLeaderboard` computes `(delta_units * 1000) / lot_size` so that a
+/// fractional lot survives the integer division and the ranking can separate
+/// two contracts that differ by less than one lot. That scale is an internal
+/// detail of the RANKING; the operator's own directive of 2026-09-19 is that
+/// the STORED figures are whole ("total lots traded shoudl be the long right
+/// why decimal here bro why the fuck bro"), so both stored columns divide it
+/// out here rather than pushing a thousandths unit into the table.
+///
+/// Named rather than spelled `1_000` at the two division sites, because the
+/// two must move together if the leaderboard's scale ever changes: dividing
+/// the lots by one factor and the percentage by another would put a row's own
+/// two numbers into disagreement, which is the one failure a reader cannot
+/// detect from the row.
+const MILLI_PER_WHOLE: i64 = 1_000;
+
 /// One reading of the candle fold's OPEN bucket for a contract, at the
 /// snapshot instant.
 ///
@@ -496,30 +516,64 @@ pub struct CandleBarReading {
     /// reads it, and those are precisely the rows a volume board exists to
     /// rank.
     pub open_bucket_advance_secs: i64,
-    /// The bar's own price change against the previous sealed bar, in percent,
-    /// or `None` when that bar had no usable baseline.
-    pub price_chg_pct: Option<f64>,
+    /// The bar's own price change against the PREVIOUS SEALED BAR of this
+    /// timeframe, in percent, or `None` when that bar had no usable baseline.
+    ///
+    /// # This is NOT a candles-table column, and must never be presented as one
+    ///
+    /// The `candles_<tf>` row carries four percentages and this is not among
+    /// them — its baseline is `LiveCandleState::bucket_open_prev_close`, which
+    /// no candle column stores. It is kept for one reason: it is the ONLY
+    /// field in the row that explains the SIGN of `signed_volume`.
+    /// `LiveCandleState::signed_volume` picks that sign with
+    /// `close < bucket_open_prev_close` — the identical comparison this
+    /// percentage reports. Without it a reader sees a negative volume beside a
+    /// positive day-change percentage and has nothing to reconcile them.
+    ///
+    /// Renamed from `price_chg_pct` 2026-09-19: the old name invited exactly
+    /// the cross-table comparison it cannot survive.
+    pub close_vs_prev_bar_pct: Option<f64>,
+    /// The bar's OPEN price — byte-identical to `candles_<tf>.open`.
+    pub open: f64,
+    /// The bar's HIGH — byte-identical to `candles_<tf>.high`.
+    pub high: f64,
+    /// The bar's LOW — byte-identical to `candles_<tf>.low`.
+    pub low: f64,
+    /// The bar's CLOSE — byte-identical to `candles_<tf>.close`.
+    pub close: f64,
+    /// Close vs YESTERDAY's close, in percent — the field that fills BOTH
+    /// `candles_<tf>.close_pct_from_prev_day` AND `candles_<tf>.change_pct`
+    /// (the extraction site writes one `LiveCandleState` field into both
+    /// columns). Copied, never re-derived.
+    pub close_pct_from_prev_day: f64,
+    /// Close vs TODAY's 09:15 session open, in percent — byte-identical to
+    /// `candles_<tf>.open_pct`. NOT the opening gap: that is `open_gap_pct`,
+    /// a different column measuring the session open against yesterday's
+    /// close, and it is deliberately not carried here.
+    pub open_pct: f64,
 }
 
 /// Projects one family's ranked slice into storable rows.
 ///
-/// `gain_pct_of` is called with the **UNDERLYING's** id, not the contract's.
-/// That is the whole point of the 2026-09-09 fix: it used to be called with
-/// `(contract.security_id, contract.segment)`, and nothing has ever written a
-/// previous close for an `NSE_FNO` contract, so the probe returned `None` on
-/// every row, became `NaN`, and each row was refused as `NonFiniteGain` —
-/// **the table was empty for the whole session while every counter read
-/// healthy.** Handing the closure the underlying id makes the wrong lookup
-/// unrepresentable rather than merely corrected.
+/// `is_subscribed` is supplied by the caller because the leaderboard does not
+/// hold it: subscription state belongs to the depth pool. Passing it in keeps
+/// this function pure and keeps the lookup the caller's O(1) hash probe rather
+/// than a scan here. `label_of` and `candle_of` are handed over for the same
+/// reason.
 ///
-/// `gain_pct_of` and `is_subscribed` are supplied by the caller because the
-/// leaderboard holds neither: gains come from the tick that carried the
-/// contract's LTP and previous close, and subscription state belongs to the
-/// depth pool. Passing them in keeps this function pure and keeps the two
-/// lookups the caller's O(1) hash probes rather than a scan here.
+/// # The UNDERLYING's percentage move is GONE (operator, 2026-09-19)
 ///
-/// O(k) in the ranked slice. Per contract it is O(1): two closure calls and a
-/// widening.
+/// A `gain_pct_of` closure used to be a fifth parameter, filling a `gain_pct`
+/// column with the move of the contract's UNDERLYING. The operator removed it:
+/// *"See as of now I believe we don't need this underlying percentage change
+/// right dude"*. Its refusal arm went with it rather than being left as a
+/// reason that can never fire — a counter with no emit site reads as coverage
+/// it does not provide. The percentages this row now carries are the
+/// CONTRACT's own, copied from the candle fold; the underlying's move is still
+/// available from the underlying's own rows in `candles_<tf>`.
+///
+/// O(k) in the ranked slice. Per contract it is O(1): three closure calls and
+/// a handful of widenings.
 ///
 /// ⚠ CORRECTED 2026-09-13: this read "which is 250 at the authorized budget".
 /// The operator's 2026-09-12 directive REMOVED the top-250 persistence cut —
@@ -527,18 +581,16 @@ pub struct CandleBarReading {
 /// only by `TOP_VOLUME_PERSIST_PER_FAMILY` (25,000). The claim understated the
 /// slice by up to 100x, in the reassuring direction.
 #[must_use]
-pub fn project_snapshot<'a, G, S, L, C>(
+pub fn project_snapshot<'a, S, L, C>(
     snapshot_ts_ist_nanos: i64,
     cadence: SnapshotCadence,
     family: OptionFamily,
     ranked: &[RankedContract],
-    gain_pct_of: G,
     is_subscribed: S,
     label_of: L,
     candle_of: C,
 ) -> SnapshotProjection<'a>
 where
-    G: Fn(u64) -> Option<f64>,
     S: Fn(u64, ExchangeSegment) -> bool,
     L: Fn(u64, ExchangeSegment) -> Option<&'a str>,
     C: Fn(u64, ExchangeSegment, u32) -> Option<CandleBarReading>,
@@ -600,8 +652,7 @@ where
     let window_open_secs = u32::try_from(ts_secs).ok();
     // `rows` IS pre-sized: it genuinely fills. Every contract on the board
     // produces a row — the two refusals that can fire in the common case
-    // (`GainUnavailable`, `LabelUnavailable`) do NOT drop the row, they only
-    // NULL a leaf column — so `ranked.len()` is the exact final length in
+    // (`LabelUnavailable`) does NOT drop the row, it only NULLs a leaf column — so `ranked.len()` is the exact final length in
     // every reachable case and one allocation is the whole cost.
     let mut rows = Vec::with_capacity(ranked.len());
     // `refusals` is NOT, and the comment that used to defend pre-sizing it
@@ -626,18 +677,20 @@ where
     // **8 x ~323 KB = ~2.6 MB allocated and dropped per second** on the frame
     // drain, for a buffer whose steady-state length is ZERO.
     //
-    // The count claim did not even hold on its own terms: `LabelUnavailable`
-    // and `GainUnavailable` can BOTH fire for one contract, so the true worst
-    // case is `2 x ranked.len()` entries and `ranked.len()` of capacity would
-    // have reallocated anyway.
+    // The count claim did not even hold on its own terms when it was written:
+    // `LabelUnavailable` and the then-existing `GainUnavailable` could BOTH
+    // fire for one contract, so the true worst case was `2 x ranked.len()`
+    // entries and `ranked.len()` of capacity would have reallocated anyway.
     //
-    // What the prior text got RIGHT, and this keeps: the degraded window is
-    // real. Between the open and the first priced underlying (measured at up
-    // to ~30 minutes on 2026-09-08) the board is full and every row refuses
-    // `GainUnavailable`, so the buffer does fill. A small fixed capacity pays
-    // geometric growth THERE — ~10 reallocations, amortized O(1) in total
-    // memcpy — and pays ~1 KiB once everywhere else. Pre-sizing paid ~323 KB
-    // everywhere, all session, to make that one transient window cheaper.
+    // ⚠ 2026-09-19: the degraded window that argument turned on is GONE.
+    // `GainUnavailable` fired on every row between the open and the first
+    // priced underlying (measured at up to ~30 minutes on 2026-09-08), and it
+    // was deleted with the `gain_pct` column. The remaining two reasons are
+    // unreachable arithmetic and real snapshot drift, so the steady-state
+    // length is now zero in every session, not merely most of one. The fixed
+    // capacity STAYS: geometric growth costs nothing when it never grows, and
+    // ~1 KiB once per sweep is the honest price of keeping a drift buffer that
+    // does not have to be sized against the market.
     let mut refusals = Vec::with_capacity(SNAPSHOT_REFUSAL_PREALLOC);
 
     for contract in ranked {
@@ -659,29 +712,46 @@ where
             refusals.push((contract.security_id, SnapshotRefusal::LotsOutOfRange));
             continue;
         };
-        // The percentage the operator reads, as an INTEGER in milli-percent.
-        // Exactly the transform `console_views` renders and
-        // `ranking_by_volume_percentage_is_the_same_order_as_ranking_by_lots`
-        // pins, carried out in `i64` so no float ever touches this path.
+        // The percentage the operator reads, as a WHOLE NUMBER (operator,
+        // 2026-09-19 Quote B: "total lots traded shoudl be the long right why
+        // decimal here bro"). Derived in `i64` throughout so no float ever
+        // touches this path.
+        //
+        // # Why it is divided from the milli value, not from `total_lots_traded`
+        //
+        // `total_lots_traded` truncates to whole lots, so deriving the
+        // percentage from it would throw away the fractional lot the operator
+        // asked to be precise about: 40.9 lots is +3,990%, and
+        // `total_lots_traded * 100 - 100` would report +3,900%. Both figures
+        // are the honest whole-number rendering of their OWN quantity, and
+        // each is derived from the same divisor, so the two never disagree
+        // about rank — truncation toward zero is monotone, so the descending
+        // order is identical either way.
         //
         // ⚠ CORRECTED 2026-09-13 — the implication was stated BACKWARDS. This
-        // read "it shares `window_lots_milli`'s refusal arm because it is a
-        // total function of it: if the key did not fit, neither does the
-        // percentage." The percentage limit is `i64::MAX / 100`, which is
-        // **100x TIGHTER** than the key limit of `i64::MAX` — so the true
-        // implication runs the other way (pct fits => key fits), and on paper
-        // a key-fits/pct-fails band exists at 9.22e16 < v <= 9.22e18. Sharing
-        // the arm is still right, because both mean "the volume arithmetic
-        // did not fit a column"; what was wrong is the reason given for it.
+        // read "it shares the lots refusal arm because it is a total function
+        // of it: if the key did not fit, neither does the percentage." The
+        // percentage limit is `i64::MAX / 100`, which is **100x TIGHTER** than
+        // the key limit of `i64::MAX` — so the true implication runs the other
+        // way (pct fits => key fits), and on paper a key-fits/pct-fails band
+        // exists at 9.22e16 < v <= 9.22e18. Sharing the arm is still right,
+        // because both mean "the volume arithmetic did not fit a column"; what
+        // was wrong is the reason given for it.
         //
-        // In practice NEITHER arm is reachable: `window_lots_milli` is capped
-        // by `u32::MAX * 1000` ~ 4.29e12, ~21,000x below even the tighter pct
+        // In practice NEITHER arm is reachable: the milli figure is capped by
+        // `u32::MAX * 1000` ~ 4.29e12, ~21,000x below even the tighter pct
         // limit. The band above is arithmetic, not a live case — see
         // `SnapshotRefusal::LotsOutOfRange`.
-        let Some(net_volume_chg_milli_pct) = net_volume_chg_milli_pct(window_lots_milli) else {
+        let Some(volume_percentage_change) =
+            net_volume_chg_milli_pct(window_lots_milli).map(|milli| milli / MILLI_PER_WHOLE)
+        else {
             refusals.push((contract.security_id, SnapshotRefusal::LotsOutOfRange));
             continue;
         };
+        // Whole lots, per the same quote. `floor(floor(1000d/L)/1000)` is
+        // exactly `floor(d/L)` for positive integers, so this is the lot count
+        // itself and not a rounding of a rounding.
+        let total_lots_traded = window_lots_milli / MILLI_PER_WHOLE;
 
         // ONE hash probe into the snapshot the caller loaded for this sweep,
         // then a pointer copy. No allocation, no refcount bump, no formatting
@@ -689,20 +759,6 @@ where
         let contract_label = label_of(contract.security_id, contract.segment);
         if contract_label.is_none() {
             refusals.push((contract.security_id, SnapshotRefusal::LabelUnavailable));
-        }
-
-        // The UNDERLYING's move, keyed on the underlying — see the fn doc.
-        //
-        // The `is_finite` filter SURVIVES the closure becoming an `Option`,
-        // and that is deliberate rather than belt-and-braces: the signature
-        // permits `Some(NaN)`, and a future caller that computes a gain
-        // in-line rather than through `eligible_gain_pct` would hand one over.
-        // A NaN must never reach `column_f64`, so it is mapped to `None` here
-        // and counted under the same reason — the column is NULL either way,
-        // and the row LIVES either way.
-        let gain_pct = gain_pct_of(contract.underlying_id).filter(|g| g.is_finite());
-        if gain_pct.is_none() {
-            refusals.push((contract.security_id, SnapshotRefusal::GainUnavailable));
         }
 
         // ---- the candle fold's OWN reading of this contract (2026-09-18) ----
@@ -713,10 +769,10 @@ where
         //
         // The probe is asked for THIS ROW'S OWN WINDOW, never for "whatever is
         // open now": it is handed `window_open_secs` and answers `None` unless
-        // it holds a bar that starts exactly there. So the three columns
-        // either describe this row's window or are NULL together — a
-        // cross-verification can never be handed a neighbouring window's
-        // volume wearing this row's timestamp.
+        // it holds a bar that starts exactly there. So every candle-sourced
+        // column either describes this row's window or is NULL with the rest
+        // of them — a cross-verification can never be handed a neighbouring
+        // window's volume wearing this row's timestamp.
         //
         // `window_open_secs` is `None` only when the row's own `ts` will not
         // fit the fold's `u32` second — impossible on any epoch this code can
@@ -726,13 +782,27 @@ where
         let candle = window_open_secs
             .and_then(|window| candle_of(contract.security_id, contract.segment, window));
         let candle_bucket_skew_secs = candle.as_ref().map(|bar| bar.open_bucket_advance_secs);
-        // FINITE-gated exactly as `gain_pct` above is. The fold already
-        // refuses a non-finite quotient, so this is the second gate on a value
+        // FINITE-gated on every percentage the bar carries. The fold already
+        // refuses a non-finite quotient, so this is the second gate on values
         // that must never reach `column_f64` — cheap, and it means a future
         // caller computing a percentage in-line cannot slip a NaN through.
-        let candle_price_chg_pct = candle
+        let close_vs_prev_bar_pct = candle
             .as_ref()
-            .and_then(|bar| bar.price_chg_pct)
+            .and_then(|bar| bar.close_vs_prev_bar_pct)
+            .filter(|p| p.is_finite());
+        // COPIED from the bar, never re-derived (operator, 2026-09-19 Quote A:
+        // "no extra claucltion or derivation"). `percentage_change` is the
+        // candles table's `close_pct_from_prev_day` — the SAME field that
+        // fills both `close_pct_from_prev_day` and `change_pct` there — and
+        // `open_percentage_change` is its `open_pct`. Neither is the
+        // bar-over-bar figure above, and neither is the opening gap.
+        let percentage_change = candle
+            .as_ref()
+            .map(|bar| bar.close_pct_from_prev_day)
+            .filter(|p| p.is_finite());
+        let open_percentage_change = candle
+            .as_ref()
+            .map(|bar| bar.open_pct)
             .filter(|p| p.is_finite());
         rows.push(TopVolumeRankRow {
             snapshot_ts_ist_nanos: ts,
@@ -743,24 +813,33 @@ where
             contract: contract_label.unwrap_or(UNLABELLED_CONTRACT),
             security_id,
             underlying_id,
-            // u32 -> i64 is lossless; no saturation is possible and none is
-            // written, so a future widening of the field cannot hide here.
-            volume: i64::from(contract.volume),
+            // The vendor's running day total. u32 -> i64 is lossless; no
+            // saturation is possible and none is written, so a future widening
+            // of the field cannot hide here.
+            cumulative_day_volume: i64::from(contract.volume),
             // The two inputs of the rank division, both `u32` at the source,
-            // so `i64::from` is lossless exactly as `volume` above is. They
+            // so `i64::from` is lossless exactly as the row above is. They
             // need no refusal arm of their own: neither can overflow, and a
-            // `lot_size` of 0 is already impossible here — `rank` only reaches
-            // this projection for contracts whose `window_lots_milli` divided,
-            // and `window_lots_milli` returns `None` on a zero lot.
+            // `per_lot_quantity` of 0 is already impossible here — `rank` only
+            // reaches this projection for contracts whose lots divided, and
+            // that division returns `None` on a zero lot.
             delta_units: i64::from(contract.delta_units),
-            lot_size: i64::from(contract.lot_size),
-            window_lots_milli,
-            net_volume_chg_milli_pct,
-            gain_pct,
+            per_lot_quantity: i64::from(contract.lot_size),
+            total_lots_traded,
+            volume_percentage_change,
             subscribed: is_subscribed(contract.security_id, contract.segment),
             candle_volume_signed: candle.as_ref().map(|bar| bar.signed_volume),
             candle_bucket_skew_secs,
-            candle_price_chg_pct,
+            close_vs_prev_bar_pct,
+            percentage_change,
+            open_percentage_change,
+            // The bar's own OHLC, byte-identical to the four `candles_<tf>`
+            // columns for the same instrument and the same window. Copied, so
+            // the two tables agree by construction rather than by coincidence.
+            bar_open: candle.as_ref().map(|bar| bar.open),
+            bar_high: candle.as_ref().map(|bar| bar.high),
+            bar_low: candle.as_ref().map(|bar| bar.low),
+            bar_close: candle.as_ref().map(|bar| bar.close),
         });
     }
 
@@ -818,16 +897,31 @@ mod tests {
             // that care about the still-open case set `0` explicitly through
             // `candle_advanced_by`.
             open_bucket_advance_secs: 1,
-            price_chg_pct: Some(-0.37),
+            // The bar-over-bar fall that SIGNS the negative volume above --
+            // `signed_volume` picks its sign with the identical comparison,
+            // so a fixture with a positive volume and a fall here would
+            // describe a bar the fold cannot produce.
+            close_vs_prev_bar_pct: Some(-0.37),
+            // Internally consistent, so a reader checking the arithmetic
+            // finds it holds: a 100.00 previous-day close, a 100.50 session
+            // open, and a 101.63 close give 1.63% and 1.12%.
+            open: 100.50,
+            high: 102.75,
+            low: 99.25,
+            close: 101.63,
+            close_pct_from_prev_day: 1.63,
+            open_pct: 1.12,
         })
     }
     const TEST_CANDLE: fn(u64, ExchangeSegment, u32) -> Option<CandleBarReading> = test_candle;
 
-    /// Like [`contract`], naming the underlying explicitly for the tests that
-    /// exercise the gain closure — which is keyed on the UNDERLYING.
-    fn contract_under(security_id: u64, underlying_id: u64, volume: u32) -> RankedContract {
-        contract(security_id, underlying_id, volume)
-    }
+    // ⚠ REMOVED 2026-09-19 — `contract_under` was a pass-through to
+    // [`contract`] that existed only to NAME the underlying for the tests
+    // exercising the gain closure, because that closure was the one input
+    // keyed on the underlying rather than the contract. The closure is gone
+    // and nothing in the surviving projection is underlying-keyed, so the
+    // alias had no remaining job. A dead helper in a test module is a
+    // warning, not a spare.
 
     fn contract(security_id: u64, underlying_id: u64, volume: u32) -> RankedContract {
         RankedContract {
@@ -888,7 +982,6 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_| Some(1.5),
             |_, _| false,
             TEST_LABEL,
             NO_CANDLE,
@@ -915,7 +1008,6 @@ mod tests {
             SnapshotCadence::FiveSecond,
             OptionFamily::Index,
             &ranked,
-            |_| Some(0.0),
             |_, _| true,
             TEST_LABEL,
             NO_CANDLE,
@@ -963,7 +1055,6 @@ mod tests {
                 cadence,
                 OptionFamily::Index,
                 &ranked,
-                |_| Some(0.0),
                 |_, _| true,
                 TEST_LABEL,
                 NO_CANDLE,
@@ -986,7 +1077,6 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_| Some(2.0),
             |sid, _| sid == 10,
             TEST_LABEL,
             NO_CANDLE,
@@ -1005,7 +1095,6 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_| Some(2.0),
             |_, _| true,
             TEST_LABEL,
             NO_CANDLE,
@@ -1014,19 +1103,26 @@ mod tests {
 
         for (row, src) in p.rows.iter().zip(ranked.iter()) {
             assert_eq!(row.delta_units, i64::from(src.delta_units));
-            assert_eq!(row.lot_size, i64::from(src.lot_size));
+            assert_eq!(row.per_lot_quantity, i64::from(src.lot_size));
             // The stored trio must close on its own arithmetic, or the column
             // that exists to make the ordering checkable cannot check it.
+            //
+            // ⚠ The `1_000` the old form carried is GONE, and its absence is
+            // the point. `total_lots_traded` is WHOLE lots since 2026-09-19,
+            // and `floor(floor(1000d/L)/1000) == floor(d/L)` for every
+            // positive `d` and `L` -- so the stored value is the lot count
+            // itself, not a rounding of a rounding, and the check says so in
+            // the units the operator reads.
             assert_eq!(
-                row.delta_units * 1_000 / row.lot_size,
-                row.window_lots_milli
+                row.delta_units / row.per_lot_quantity,
+                row.total_lots_traded
             );
         }
 
         // Per contract, not blanket: the two rows differ.
         assert_ne!(p.rows[0].delta_units, p.rows[1].delta_units);
-        // And neither is the cumulative volume, which is a separate column.
-        assert_ne!(p.rows[0].delta_units, p.rows[0].volume);
+        // And neither is the vendor's cumulative day total, a separate column.
+        assert_ne!(p.rows[0].delta_units, p.rows[0].cumulative_day_volume);
     }
 
     #[test]
@@ -1037,7 +1133,6 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_| Some(0.0),
             |_, _| false,
             TEST_LABEL,
             NO_CANDLE,
@@ -1047,7 +1142,6 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Index,
             &ranked,
-            |_| Some(0.0),
             |_, _| false,
             TEST_LABEL,
             NO_CANDLE,
@@ -1068,7 +1162,6 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_| Some(0.0),
             |_, _| false,
             TEST_LABEL,
             NO_CANDLE,
@@ -1091,7 +1184,6 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_| Some(0.0),
             |_, _| false,
             TEST_LABEL,
             NO_CANDLE,
@@ -1100,59 +1192,64 @@ mod tests {
         assert_eq!(p.refusal_count(), 1);
     }
 
+    /// A non-finite CANDLE percentage is NULLed, and the row survives.
+    ///
+    /// ⚠ RE-POINTED 2026-09-19 from `project_snapshot_refuses_a_nan_or_infinite_gain`.
+    /// The `gain_pct` column it was written for is gone with the operator's
+    /// removal of the underlying percentage change, but the hazard it guards
+    /// is not: the §28.4 poisoning class one table over, where a NaN in a
+    /// DOUBLE makes every later comparison on the column silently false. The
+    /// three candle percentages are the columns that carry it now, and each
+    /// is `.filter(|p| p.is_finite())` for exactly this reason.
     #[test]
-    fn project_snapshot_refuses_a_nan_or_infinite_gain() {
-        // The §28.4 poisoning class one table over: a NaN in a DOUBLE makes
-        // every later comparison on the column silently false.
-        // Distinct UNDERLYINGS, because the gain closure is keyed on the
-        // underlying id since 2026-09-09 — three strikes of one stock share
-        // one gain by construction and could not be told apart here.
-        let ranked = [
-            contract_under(10, 91, 500),
-            contract_under(11, 92, 400),
-            contract_under(12, 93, 300),
-        ];
+    fn project_snapshot_nulls_a_nan_or_infinite_candle_percentage() {
+        let ranked = [contract(10, 91, 500), contract(11, 92, 400)];
         let p = project_snapshot(
             NANOS_PER_SECOND,
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |underlying_id| match underlying_id {
-                // A caller that computes a gain in-line rather than through
-                // `eligible_gain_pct` CAN hand over a `Some(NaN)`. The
-                // signature permits it, so the projection must still refuse
-                // it -- these two arms are that case, not dead weight.
-                91 => Some(f64::NAN),
-                92 => Some(f64::INFINITY),
-                _ => Some(3.25),
-            },
             |_, _| false,
             TEST_LABEL,
-            NO_CANDLE,
+            |id, _, _| {
+                Some(CandleBarReading {
+                    signed_volume: -4_242,
+                    open_bucket_advance_secs: 1,
+                    // Contract 10 gets the poison in all three; contract 11
+                    // gets finite values, so the test separates "NULLed" from
+                    // "never written".
+                    close_vs_prev_bar_pct: Some(if id == 10 { f64::NAN } else { -0.37 }),
+                    open: 1_412.55,
+                    high: 1_420.0,
+                    low: 1_396.1,
+                    close: 1_397.3,
+                    close_pct_from_prev_day: if id == 10 { f64::INFINITY } else { 2.14 },
+                    open_pct: if id == 10 { f64::NEG_INFINITY } else { -1.08 },
+                })
+            },
         );
-        // ALL THREE rows survive. Until 2026-09-12 this asserted ONE, because
-        // a non-finite gain deleted the whole row -- taking the contract's
-        // volume, the column the table exists for, out with a display column
-        // beside it.
-        assert_eq!(p.rows.len(), 3);
+        // BOTH rows survive. A display column that cannot be resolved must
+        // never take the contract's volume out with it -- that is the whole
+        // reason the table exists, and the 2026-09-12 fix that established it.
+        assert_eq!(p.rows.len(), 2);
         assert_eq!(p.rows[0].security_id, 10);
+        assert_eq!(p.rows[0].close_vs_prev_bar_pct, None, "NaN is NULLed");
+        assert_eq!(p.rows[0].percentage_change, None, "Inf is NULLed");
+        assert_eq!(p.rows[0].open_percentage_change, None, "-Inf is NULLed");
+        // And the volume the row exists to carry is untouched by any of it.
+        assert_eq!(p.rows[0].cumulative_day_volume, 500);
         assert_eq!(p.rows[1].security_id, 11);
-        assert_eq!(p.rows[2].security_id, 12);
-        assert_eq!(p.rows[0].gain_pct, None, "NaN is NULLed, not stored");
-        assert_eq!(p.rows[1].gain_pct, None, "Inf is NULLed, not stored");
         assert!(
-            p.rows[2]
-                .gain_pct
-                .is_some_and(|g| (g - 3.25).abs() < f64::EPSILON)
+            p.rows[1]
+                .percentage_change
+                .is_some_and(|g| (g - 2.14).abs() < f64::EPSILON)
         );
-        // Still COUNTED -- the column being NULL is a fact an operator can
-        // read, and the counter is what says how often it happens.
-        assert_eq!(p.refusal_count(), 2);
-        assert!(
-            p.refusals
-                .iter()
-                .all(|(_, r)| *r == SnapshotRefusal::GainUnavailable)
-        );
+        // NOT counted as a refusal. The candle percentages have no refusal
+        // reason of their own: unlike the retired `GainUnavailable`, an absent
+        // candle is the ORDINARY state for a contract with no aggregator slot
+        // or a bar in a neighbouring window, and counting it would report a
+        // permanent nonzero rate for a system working as designed.
+        assert_eq!(p.refusal_count(), 0);
     }
 
     #[test]
@@ -1178,7 +1275,6 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_| Some(0.0),
             |_, _| false,
             TEST_LABEL,
             NO_CANDLE,
@@ -1207,16 +1303,27 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_| Some(1.0),
             |_, _| false,
             TEST_LABEL,
             NO_CANDLE,
         );
         assert_eq!(p.rows.len(), 2);
-        assert_eq!(p.rows[0].window_lots_milli, 1_500);
-        assert_eq!(p.rows[1].window_lots_milli, 1_200);
-        // And it is genuinely a different column from `volume`.
-        assert_ne!(p.rows[0].window_lots_milli, p.rows[0].volume);
+        // ⚠ RE-POINTED 2026-09-19 at the column that IS the sort key. The
+        // milli figure is gone from the table and the whole-lot count that
+        // replaced it is **1 for BOTH rows** (1.5 lots and 1.2 lots each
+        // floor to 1) -- so asserting the lot count would assert a number
+        // that cannot order anything, and this test would pass while the
+        // property it exists for was broken. The percentage separates them
+        // because it is derived from the MILLI value, before the floor.
+        assert_eq!(p.rows[0].total_lots_traded, 1);
+        assert_eq!(p.rows[1].total_lots_traded, 1);
+        assert_eq!(p.rows[0].volume_percentage_change, 50);
+        assert_eq!(p.rows[1].volume_percentage_change, 20);
+        // And it is genuinely a different column from the vendor cumulative.
+        assert_ne!(
+            p.rows[0].volume_percentage_change,
+            p.rows[0].cumulative_day_volume
+        );
     }
 
     #[test]
@@ -1228,7 +1335,6 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &[c],
-            |_| Some(1.0),
             |_, _| false,
             TEST_LABEL,
             NO_CANDLE,
@@ -1237,33 +1343,21 @@ mod tests {
         assert_eq!(p.refusals, vec![(10, SnapshotRefusal::LotsOutOfRange)]);
     }
 
-    #[test]
-    fn project_snapshot_asks_the_gain_closure_for_the_underlying_not_the_contract() {
-        // The 2026-09-09 defect in one assertion: the closure used to be
-        // handed the CONTRACT id and segment, and no previous close is ever
-        // stored for an NSE_FNO contract, so every row was refused as
-        // a non-finite gain and the table stayed empty all session.
-        let ranked = [contract(4_431, 2_885, 500)];
-        let p = project_snapshot(
-            NANOS_PER_SECOND,
-            SnapshotCadence::OneSecond,
-            OptionFamily::Stock,
-            &ranked,
-            |id| {
-                assert_eq!(id, 2_885, "the gain closure must receive the UNDERLYING id");
-                Some(7.5)
-            },
-            |_, _| false,
-            TEST_LABEL,
-            NO_CANDLE,
-        );
-        assert_eq!(p.rows.len(), 1);
-        assert!(
-            p.rows[0]
-                .gain_pct
-                .is_some_and(|g| (g - 7.5).abs() < f64::EPSILON)
-        );
-    }
+    // ⚠ `project_snapshot_asks_the_gain_closure_for_the_underlying_not_the_contract`
+    // was DELETED on 2026-09-19 with the closure it tested.
+    //
+    // It pinned a real 2026-09-09 defect -- the gain closure was handed the
+    // CONTRACT id, no previous close is ever stored for an NSE_FNO contract,
+    // so every row was refused and the table stayed empty all session. The
+    // operator removed the underlying percentage change entirely (*"as of now
+    // I believe we don't need this underlying percentage change"*), so there
+    // is no closure left to hand the wrong id to.
+    //
+    // Recorded rather than silently dropped because the defect class is the
+    // durable part: a projection keyed on the CONTRACT where the data is keyed
+    // on the UNDERLYING fails totally and silently. Nothing in the surviving
+    // projection is underlying-keyed -- `label_of` and `candle_of` both take
+    // the contract -- so there is no live surface for it today.
 
     #[test]
     fn project_snapshot_widens_volume_without_loss() {
@@ -1273,12 +1367,11 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_| Some(0.0),
             |_, _| false,
             TEST_LABEL,
             NO_CANDLE,
         );
-        assert_eq!(p.rows[0].volume, i64::from(u32::MAX));
+        assert_eq!(p.rows[0].cumulative_day_volume, i64::from(u32::MAX));
     }
 
     #[test]
@@ -1288,7 +1381,6 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &[],
-            |_| Some(0.0),
             |_, _| false,
             TEST_LABEL,
             NO_CANDLE,
@@ -1299,74 +1391,105 @@ mod tests {
 
     #[test]
     fn refusal_count_reports_every_dropped_contract() {
-        // Two different refusal reasons in one snapshot: the count is the
+        // Two DIFFERENT refusal reasons in one snapshot: the count is the
         // caller's single number for "how much of this snapshot is missing",
         // so it must not report only the first kind it met.
+        //
+        // ⚠ RE-POINTED 2026-09-19. This test used to pair the oversized id
+        // with an unknown GAIN, and the gain column is gone. It now pairs it
+        // with an unresolvable LABEL, which preserves the property that
+        // actually mattered: the two reasons behave DIFFERENTLY — one deletes
+        // the row, the other keeps it — and the count still covers both.
         let ranked = [
-            contract_under(u64::MAX, 91, 500),
-            contract_under(10, 92, 400),
-            contract_under(11, 93, 300),
+            contract(u64::MAX, 91, 500),
+            contract(10, 92, 400),
+            contract(11, 93, 300),
         ];
         let p = project_snapshot(
             NANOS_PER_SECOND,
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |underlying_id| {
-                if underlying_id == 92 { None } else { Some(1.0) }
-            },
             |_, _| false,
-            TEST_LABEL,
+            |security_id, segment| {
+                if security_id == 10 {
+                    None
+                } else {
+                    test_label(security_id, segment)
+                }
+            },
             NO_CANDLE,
         );
         // TWO rows, not one: the oversized id DROPS its row (that column is in
-        // the DEDUP key), the unknown gain KEEPS its row with a NULL column.
-        // Both are counted, and the count is still the caller's single number
-        // for "how much of this snapshot needed a refusal".
+        // the DEDUP key), the unresolvable label KEEPS its row with the
+        // fallback string. Both are counted, and the count is still the
+        // caller's single number for "how much of this snapshot needed a
+        // refusal".
         assert_eq!(p.rows.len(), 2);
         assert_eq!(p.rows[0].security_id, 10);
-        assert_eq!(p.rows[0].gain_pct, None);
+        assert_eq!(p.rows[0].contract, UNLABELLED_CONTRACT);
         assert_eq!(p.rows[1].security_id, 11);
         assert_eq!(p.refusal_count(), 2);
         assert_eq!(p.refusal_count(), p.refusals.len());
+        // The two reasons are DISTINCT — a count of 2 built from one reason
+        // twice would pass every assertion above.
+        assert_eq!(
+            p.refusals,
+            vec![
+                (u64::MAX, SnapshotRefusal::IdTooLargeForSignedColumn),
+                (10, SnapshotRefusal::LabelUnavailable),
+            ]
+        );
     }
 
-    /// The bite for the 2026-09-12 fix: an underlying whose gain is simply
-    /// not known yet must NOT cost the contract its volume row.
+    /// The bite for the 2026-09-12 fix, re-pointed 2026-09-19: a contract the
+    /// fold cannot answer for must NOT cost the row its volume.
     ///
-    /// `None` rather than `Some(NaN)` on purpose -- this is the shape the
-    /// PRODUCTION caller produces (`underlying_gain_pct` returns `Option`, and
-    /// the `.unwrap_or(f64::NAN)` that used to flatten it is gone). The NaN
-    /// path is a separate test because it is a separate hazard.
+    /// The original tested an unknown GAIN. That column is gone, and the
+    /// property survives it: the candle passthroughs are leaf DISPLAY columns
+    /// exactly as the gain was, so an absent bar NULLs them and leaves every
+    /// key and ordering column intact.
+    ///
+    /// ⚠ The refusal half INVERTS, and that is the point of keeping the test.
+    /// An unknown gain was COUNTED (`GainUnavailable`). An unknown candle is
+    /// NOT, and must not be: a contract with no aggregator slot, or one whose
+    /// bar sits in a neighbouring window, is the ORDINARY state, so counting
+    /// it would report a permanent nonzero refusal rate for a system working
+    /// as designed.
     #[test]
-    fn a_row_with_an_unknown_gain_still_carries_its_volume() {
+    fn a_row_with_an_unknown_candle_still_carries_its_volume() {
         let ranked = [contract(4_431, 2_885, 987_654)];
         let p = project_snapshot(
             NANOS_PER_SECOND,
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            // Neither store has heard from this underlying yet -- the ordinary
-            // state at the open, and after any mid-session restart.
-            |_| None,
             |_, _| true,
             TEST_LABEL,
+            // The fold has no bar for this contract in this window -- the
+            // ordinary state at the open, and after any mid-session restart.
             NO_CANDLE,
         );
         assert_eq!(
             p.rows.len(),
             1,
-            "an unknown gain must NULL one column, never delete the row"
+            "an unknown candle must NULL its columns, never delete the row"
         );
         assert_eq!(p.rows[0].security_id, 4_431);
-        assert_eq!(p.rows[0].volume, 987_654);
+        // The VENDOR cumulative survives untouched: it comes from the tick
+        // stream, never from the fold, so no candle answer can erase it.
+        assert_eq!(p.rows[0].cumulative_day_volume, 987_654);
         assert!(p.rows[0].subscribed);
-        assert_eq!(p.rows[0].gain_pct, None);
-        // Counted, because a NULL nobody counts is a NULL nobody notices.
-        assert_eq!(
-            p.refusals,
-            vec![(4_431, SnapshotRefusal::GainUnavailable)],
-            "the NULL must still be attributable to a reason"
+        // Every candle passthrough NULL, and none of them counted.
+        assert_eq!(p.rows[0].candle_volume_signed, None);
+        assert_eq!(p.rows[0].close_vs_prev_bar_pct, None);
+        assert_eq!(p.rows[0].percentage_change, None);
+        assert_eq!(p.rows[0].open_percentage_change, None);
+        assert_eq!(p.rows[0].bar_open, None);
+        assert_eq!(p.rows[0].bar_close, None);
+        assert!(
+            p.refusals.is_empty(),
+            "an absent bar is the ordinary state, not a refusal"
         );
     }
 
@@ -1380,7 +1503,6 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &oversized,
-            |_| Some(1.0),
             |_, _| false,
             TEST_LABEL,
             NO_CANDLE,
@@ -1406,9 +1528,25 @@ mod tests {
                 reason.index()
             );
         }
-        // And ALL is complete: an array sized from its length must have a slot
-        // for every reason the projection can produce.
-        assert_eq!(SnapshotRefusal::ALL.len(), 4);
+        // ⚠ The literal `4` that stood here is GONE (2026-09-19), and not
+        // merely because `ALL` is now three long. It claimed to prove "ALL is
+        // complete", and it could never do that: a variant added to the enum
+        // but NOT to `ALL` leaves the length unchanged, so the literal passes
+        // on exactly the defect it named. What actually guards completeness is
+        // the EXHAUSTIVE `match` inside `index()` and `as_str()` -- adding a
+        // variant fails the build there, at compile time, without any test.
+        //
+        // What this assertion can honestly carry is non-vacuity: the loop
+        // above proves nothing over an empty or one-element array.
+        assert!(SnapshotRefusal::ALL.len() >= 2);
+        // And `ALL` must list each reason ONCE -- a duplicate would give two
+        // slots the same `index()` and the loop above would still pass for
+        // whichever position happened to match.
+        let mut seen = SnapshotRefusal::ALL;
+        seen.sort_unstable_by_key(|r| r.index());
+        seen.windows(2).for_each(|w| {
+            assert_ne!(w[0].index(), w[1].index(), "duplicate slot in ALL");
+        });
     }
 
     /// Our grid anchor must be the CANDLE grid anchor, or the two tables sit
@@ -1602,7 +1740,6 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_| Some(1.0),
             |_, _| true,
             NO_LABEL,
             NO_CANDLE,
@@ -1617,7 +1754,6 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_| Some(1.0),
             |_, _| true,
             TEST_LABEL,
             NO_CANDLE,
@@ -1647,17 +1783,22 @@ mod tests {
 
     #[test]
     fn as_str_labels_are_distinct_for_every_refusal_reason() {
-        let labels = [
-            SnapshotRefusal::IdTooLargeForSignedColumn.as_str(),
-            SnapshotRefusal::GainUnavailable.as_str(),
-            SnapshotRefusal::LabelUnavailable.as_str(),
-            SnapshotRefusal::LotsOutOfRange.as_str(),
-        ];
+        // ⚠ DERIVED from `ALL` since 2026-09-19, never hand-listed. The
+        // hand-listed form named `GainUnavailable`, and when that variant was
+        // deleted the test stopped compiling -- which is the loud failure.
+        // The quiet one is the other direction: a variant ADDED to `ALL` and
+        // not to the list would leave its label unchecked while the test
+        // reported every reason distinct. `ALL` is the enum's own manifest,
+        // so reading it closes both directions at once.
+        let labels = SnapshotRefusal::ALL.map(SnapshotRefusal::as_str);
         let mut sorted = labels;
         sorted.sort_unstable();
         sorted.iter().zip(sorted.iter().skip(1)).for_each(|(a, b)| {
             assert_ne!(a, b, "refusal labels must be distinct: {labels:?}");
         });
+        // Non-vacuous: a one-element array has no adjacent pair, so the loop
+        // above would pass over an enum that had lost every reason but one.
+        assert!(labels.len() >= 2);
     }
 
     // -----------------------------------------------------------------------
@@ -1786,13 +1927,25 @@ mod tests {
     fn candle_advanced_by(
         open_bucket_advance_secs: i64,
         signed_volume: i64,
-        price_chg_pct: Option<f64>,
+        close_vs_prev_bar_pct: Option<f64>,
     ) -> impl Fn(u64, ExchangeSegment, u32) -> Option<CandleBarReading> {
         move |_id, _segment, _window| {
             Some(CandleBarReading {
                 signed_volume,
                 open_bucket_advance_secs,
-                price_chg_pct,
+                close_vs_prev_bar_pct,
+                // The four prices and the two day-scoped percentages are
+                // FIXED here and match `test_candle` exactly. This helper
+                // parameterises the three fields its callers vary; holding
+                // the rest constant is what lets a caller assert a
+                // passthrough column by value without restating six
+                // numbers it does not care about.
+                open: 100.50,
+                high: 102.75,
+                low: 99.25,
+                close: 101.63,
+                close_pct_from_prev_day: 1.63,
+                open_pct: 1.12,
             })
         }
     }
@@ -1815,7 +1968,6 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_| Some(1.5),
             |_, _| false,
             TEST_LABEL,
             candle_advanced_by(0, -4_242, Some(-0.37)),
@@ -1834,7 +1986,7 @@ mod tests {
              this row's own window, not a missing one"
         );
         assert!(
-            (row.candle_price_chg_pct.expect("price change present") + 0.37).abs() < f64::EPSILON,
+            (row.close_vs_prev_bar_pct.expect("price change present") + 0.37).abs() < f64::EPSILON,
             "the CONTRACT's own price move must reach its own column"
         );
     }
@@ -1847,7 +1999,6 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_| Some(1.5),
             |_, _| false,
             TEST_LABEL,
             NO_CANDLE,
@@ -1855,7 +2006,7 @@ mod tests {
         let row = &p.rows[0];
         assert_eq!(row.candle_volume_signed, None);
         assert_eq!(row.candle_bucket_skew_secs, None);
-        assert_eq!(row.candle_price_chg_pct, None);
+        assert_eq!(row.close_vs_prev_bar_pct, None);
         // And the ROW still exists. A missing fold reading is a NULL column,
         // never a dropped row — the `gain_pct` lesson of 2026-09-12, where an
         // unknowable leaf column cost the table the volume it exists to record.
@@ -1895,7 +2046,6 @@ mod tests {
             cadence,
             OptionFamily::Stock,
             &ranked,
-            |_| Some(1.5),
             |_, _| false,
             TEST_LABEL,
             candle_advanced_by(0, 100, None),
@@ -1918,7 +2068,6 @@ mod tests {
             cadence,
             OptionFamily::Stock,
             &ranked,
-            |_| Some(1.5),
             |_, _| false,
             TEST_LABEL,
             candle_advanced_by(5, 100, None),
@@ -1940,14 +2089,13 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_| Some(1.5),
             |_, _| false,
             TEST_LABEL,
             candle_advanced_by(0, -77, Some(f64::NAN)),
         );
         let row = &p.rows[0];
         assert_eq!(
-            row.candle_price_chg_pct, None,
+            row.close_vs_prev_bar_pct, None,
             "a NaN must be refused, not written — `column_f64` would carry it \
              into the table and every comparison against it is false"
         );
@@ -1976,7 +2124,6 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_| Some(1.5),
             |_, _| true,
             TEST_LABEL,
             NO_CANDLE,
@@ -1986,7 +2133,6 @@ mod tests {
             SnapshotCadence::OneSecond,
             OptionFamily::Stock,
             &ranked,
-            |_| Some(1.5),
             |_, _| true,
             TEST_LABEL,
             TEST_CANDLE,
@@ -1995,19 +2141,21 @@ mod tests {
         for (a, b) in without.rows.iter().zip(with.rows.iter()) {
             assert_eq!(a.snapshot_ts_ist_nanos, b.snapshot_ts_ist_nanos);
             assert_eq!(a.security_id, b.security_id);
-            assert_eq!(a.volume, b.volume, "cumulative volume must not move");
-            assert_eq!(a.delta_units, b.delta_units, "traded units must not move");
-            assert_eq!(a.lot_size, b.lot_size);
             assert_eq!(
-                a.window_lots_milli, b.window_lots_milli,
+                a.cumulative_day_volume, b.cumulative_day_volume,
+                "the vendor cumulative must not move"
+            );
+            assert_eq!(a.delta_units, b.delta_units, "traded units must not move");
+            assert_eq!(a.per_lot_quantity, b.per_lot_quantity);
+            assert_eq!(
+                a.total_lots_traded, b.total_lots_traded,
+                "the lot count must not move"
+            );
+            assert_eq!(
+                a.volume_percentage_change, b.volume_percentage_change,
                 "THE SORT KEY must not move — the ordering is what depth \
                  steering reads, and this change is additive"
             );
-            assert_eq!(
-                a.net_volume_chg_milli_pct, b.net_volume_chg_milli_pct,
-                "the volume-percentage column must not move"
-            );
-            assert_eq!(a.gain_pct, b.gain_pct);
             assert_eq!(a.subscribed, b.subscribed);
         }
         // And the new columns really did arrive in the second projection —
