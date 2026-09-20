@@ -7370,3 +7370,104 @@ other. #20 lands first and #15 rides the same step.
 - Keeps a `candles_<tf>` DDL, self-heal entry, table-name list or retention
   registration for a removed frame — QuestDB's self-heal can ADD a column but never
   drop a table, so a surviving name is a table that gets re-created empty forever.
+
+### 2026-09-19 — THE CANDLE FOLD MEASURES ITS OWN DELAYS: two receipt stamps per open bucket, three pairs derived at seal
+
+**No new scope is claimed and no operator quote is reinterpreted.** The
+2026-09-19 FRESH-SCRATCH SCHEMA section above already locks the 22-column
+candle order and already names the six delay columns as columns 2–4 and 20–22.
+What it does NOT say is where those six numbers come from, and until this
+change the honest answer was *nowhere* — the DDL declared them and no writer
+ever filled them. This dated section records the mechanism, per the
+rule-file-first law, and it is written BEFORE the verification sweep.
+
+#### The gap it closes
+
+The three delay pairs shipped on 2026-09-19 into `top_volume` (§4a above),
+measured by the snapshot path from its own per-cadence receipt stamps. The
+candle fold is a different producer on a different clock grid, and the
+operator's Turn-1 directive moved these columns *"into candles table dude not
+top voluem tbale"* — so the candle row needs its OWN measurement, not a copy of
+a `top_volume` figure taken against a different window.
+
+Copying would have been worse than absent: a `top_volume` 1s window and a
+`candles_1s` bucket share a grid but not a population, and a 60m candle has no
+`top_volume` counterpart at all. A borrowed number would have rendered
+plausibly and meant nothing.
+
+#### The contract (LOCKED)
+
+| Aspect | Locked value |
+|---|---|
+| Stored per open bucket | **exactly two** `i64`s on `LiveCandleState` — `first_receipt_ist_nanos`, `last_receipt_ist_nanos` |
+| Frame | **IST-naive**, and the frame is IN the field name. `ParsedTick::received_at_nanos` is UTC; `bucket_start_ist_secs` is IST-naive. The offset is applied ONCE, in `receipt_ist_nanos` |
+| Widening rule | **min/max over non-zero**, never first-write/last-write. The feed carries no sequence number, so the tick that OPENS a bucket by exchange time is not necessarily the earliest-arriving |
+| Derivation | at seal, in `ShadowSealRow::from_buffered_seal`: `open_latency = first − window_open`, `close_latency = window_close − last`, `window_span_latency = last − first`, where `window_close = window_open + tf.seconds_per_bucket()` |
+| Unknown | both stamps `0` ⇒ all three are `None` ⇒ all six columns omitted from the ILP row ⇒ NULL. `0` is the documented `WAL_RECEIPT_UNKNOWN_NANOS` convention |
+| Type | `Option<i64>` on `ShadowSealRow`, **never a sentinel** — `Some(0)` is a REAL reading (a single-tick bucket has a zero span) and must render `0 nanoseconds`; unknown and genuinely-instant must not share a value |
+| Rendering | `render_delay_into` from `top_volume_rank_persistence.rs`, **reused not duplicated** (same crate) — so the candle and `top_volume` delay text can never drift into two band tables |
+| Column names | `window_span_latency` / `window_span_latency_ns` on CANDLES, deliberately NOT `top_volume`'s `window_span` / `window_span_ns` (operator Turn-4, verbatim: *"amke window span as window span latency"*) |
+| Allocation | one writer-owned, writer-cleared `String` scratch reused across every row and every column — a naive `format!` is three allocations per row |
+| `fold_late_hlc` | deliberately does NOT move the stamps, and says so at the site |
+| Spill record | **NOT carried.** `SEAL_SPILL_RECORD_SIZE = 128` is byte-for-byte full; a replayed seal arrives with both stamps `0` and renders NULL. No format bump, no stride change, no new flag |
+
+#### ⚠ The anchor rule, restated because it is the one way this could be read wrong
+
+The operator's Turn-4 question — *"now the entire feed will wokr enitltey ohlcv
+entilrey pruely based on this ts right dude"* — is answered YES, and these six
+columns do not qualify it. `fold_clock_ist_secs` has been the IDENTITY on
+`exchange_timestamp` since the 2026-09-18 (SECOND) directive, so nothing but
+the exchange clock decides which bar a trade enters. The delays MEASURE receipt
+against the window; they never BUCKET by it. **A PR letting any delay value
+influence which bar a trade enters is a REJECT** — that row already stands in
+the FRESH-SCRATCH section and is reaffirmed here.
+
+#### ⚠ Honest cost, measured rather than argued
+
+Two `i64` per open bucket is **+10.8 MB of host RAM** at the 25,000-slot
+ceiling — 0.0314% of the 32 GiB host — split 7.2 MB on the aggregator cell and
+3.6 MB on the seal ring. Every figure is `size_of`-measured and re-derived from
+`TF_COUNT = 9`, never scaled from the previous row; the full derivation is the
+**RAM NOTE 2026-09-19** in `aws-budget.md`, which both const-asserts demanded
+before they would let the change build. **Dollar cost is ZERO** — no instance
+change, no EBS change, no new metric, no alarm, no EMF name.
+
+`BufferedSeal` now sits at **exactly** its 168-byte bound with zero slack, so
+the next field added to `LiveCandleState` fails the build. That is the assert
+working, and it means the next change here is a budget decision rather than an
+incidental one.
+
+#### ⚠ What is NOT claimed
+
+- **That any of this has been read back from a live QuestDB.** Port 9000 is
+  unreachable from here; the first boot with this build is the measurement, and
+  `SELECT open_latency, open_latency_ns FROM candles_1m WHERE ts IN today()` is
+  what settles it.
+- **That a delay is a network round trip.** It composes queue wait, wire read,
+  ring dwell and — on a thin contract — the time until that instrument next
+  trades inside the window. It is deliberately the UPPER bound.
+- **That a replayed bar carries them.** It cannot, by the spill-record decision
+  above, and NULL is the honest rendering of that.
+- **That the candle and `top_volume` figures for the same instrument and window
+  will agree.** They measure different populations on different producers; only
+  the RENDERING is shared.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Stores the three derived delays per open bucket instead of the two stamps
+  (pays fleet RAM for arithmetic that costs nothing once).
+- Applies the IST offset anywhere but `receipt_ist_nanos`, or compares a UTC
+  receipt against an IST bucket start — the result is wrong by 5h30m on every
+  bar and looks plausible.
+- Uses first-write/last-write instead of min/max over non-zero.
+- Replaces `Option<i64>` with a sentinel, collapsing "unknown" and "zero".
+- Duplicates the band table instead of calling `render_delay_into`.
+- Renames the candle columns to `top_volume`'s `window_span` / `window_span_ns`.
+- Allocates per row on the seal path, or drops the `clear()` before reuse so one
+  row's text trails into the next.
+- Carries the stamps into the spill record without a `SEAL_SPILL_FORMAT_VERSION`
+  bump and a size decision — the record is full.
+- Makes `fold_late_hlc` move the stamps: it amends a bar already written and
+  re-emits only that bar, so the moved figure would reach no row.
+- Sorts any delay on the VARCHAR half (text descending puts 1s / 2ms / 3µs / 4ns
+  in the order 4, 3, 2, 1 — the exact reverse, and it looks right).

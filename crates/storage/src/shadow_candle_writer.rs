@@ -49,6 +49,7 @@ use tickvault_common::config::QuestDbConfig;
 use tickvault_trading::candles::BufferedSeal;
 
 use crate::shadow_seal_columns::ShadowSealRow;
+use crate::top_volume_rank_persistence::render_delay_into;
 
 /// Build the questdb-rs **ILP-over-HTTP** connection conf string for a given
 /// host + HTTP port.
@@ -247,6 +248,19 @@ pub struct ShadowCandleWriter {
     /// by the writer task to drive batch-size-based flush triggers
     /// and by tests to verify append behaviour.
     pending_count: usize,
+    /// Reused render buffer for the three human-readable delay columns
+    /// (`open_latency`, `close_latency`, `window_span_latency`).
+    ///
+    /// A `format!` per column per row would be THREE fresh allocations on
+    /// every candle appended — the 60,660-per-sweep defect this codebase has
+    /// already fixed once on the sibling `top_volume` writer. `render_delay_into`
+    /// clears and writes into a caller-owned `String`, so the allocation is
+    /// paid once for the life of the writer and reused for every row.
+    delay_scratch: String,
+    /// Pre-resolved session-window refusal counters. See
+    /// [`CANDLE_OUT_OF_WINDOW_REASONS`] for why this gate reads the BUCKET
+    /// and never a seal clock.
+    out_of_window: CandleOutOfWindowCounters,
     /// Retained for the reconnect logic. Finding S2 (HIGH): the ILP
     /// conf string is wrapped in `SecretString` because it carries
     /// the QuestDB endpoint and (in conf-string-auth deployments)
@@ -254,10 +268,6 @@ pub struct ShadowCandleWriter {
     /// back with `.expose_secret()` only at `Sender` construction.
     /// Read by `reconnect()` (the broken-pipe recovery path) — no
     /// longer dead since the candle-writer reconnect landed 2026-06-30.
-    /// Pre-resolved session-window refusal counters. See
-    /// [`CANDLE_OUT_OF_WINDOW_REASONS`] for why this gate reads the BUCKET
-    /// and never a seal clock.
-    out_of_window: CandleOutOfWindowCounters,
     ilp_conf_string: SecretString,
 }
 
@@ -290,6 +300,7 @@ impl ShadowCandleWriter {
             sender,
             buffer,
             pending_count: 0,
+            delay_scratch: String::new(),
             ilp_conf_string: SecretString::from(conf_string),
             out_of_window: CandleOutOfWindowCounters::new(),
         })
@@ -306,6 +317,7 @@ impl ShadowCandleWriter {
             sender: None,
             buffer: Buffer::new(ProtocolVersion::V1),
             pending_count: 0,
+            delay_scratch: String::new(),
             ilp_conf_string: SecretString::from(String::new()),
             out_of_window: CandleOutOfWindowCounters::new(),
         }
@@ -488,6 +500,43 @@ impl ShadowCandleWriter {
             .with_context(|| "candle append: column_i64(total_buy_qty) failed")?
             .column_i64("total_sell_qty", row.total_sell_qty)
             .with_context(|| "candle append: column_i64(total_sell_qty) failed")?;
+        // The three receipt-delay pairs. Each is `Option`: a seal that came
+        // back through the disk spill tier carries no receipt stamps (the
+        // 128-byte record is byte-full and cannot hold them), and a bucket
+        // whose ticks all arrived with no receipt clock has none either. In
+        // both cases BOTH halves of the pair are omitted, so the row reads
+        // NULL rather than claiming a zero delay — `Some(0)` is a REAL
+        // reading (a single-tick bucket has a zero span) and must stay
+        // distinguishable from "unknown".
+        //
+        // `render_delay_into` is the same renderer the `top_volume` writer
+        // uses, reused rather than duplicated so the two tables can never
+        // drift into different wording. It clears and writes into the
+        // caller-owned scratch, so the three columns cost ZERO allocations
+        // per row — a `format!` here would be three fresh allocations on
+        // every candle appended.
+        //
+        // The `_ns` twin is NOT optional garnish: text sorted descending
+        // puts "1 second" after "4 nanoseconds", the exact reverse of the
+        // true order, so every ORDER BY must use the exact column.
+        let scratch = &mut self.delay_scratch;
+        for (readable, exact, value) in [
+            ("open_latency", "open_latency_ns", row.open_latency_ns),
+            ("close_latency", "close_latency_ns", row.close_latency_ns),
+            (
+                "window_span_latency",
+                "window_span_latency_ns",
+                row.window_span_latency_ns,
+            ),
+        ] {
+            if let Some(nanos) = value {
+                render_delay_into(scratch, nanos);
+                buf.column_str(readable, scratch.as_str())
+                    .with_context(|| format!("candle append: column_str({readable}) failed"))?;
+                buf.column_i64(exact, nanos)
+                    .with_context(|| format!("candle append: column_i64({exact}) failed"))?;
+            }
+        }
         buf.at(TimestampNanos::new(row.timestamp_ist_nanos))
             .with_context(|| "candle append: at(TimestampNanos) failed")?;
         self.pending_count += 1;
@@ -1271,6 +1320,9 @@ mod tests {
             open_gap_pct: 0.2,
             total_buy_qty: 89_600,
             total_sell_qty: 4_800,
+            open_latency_ns: None,
+            close_latency_ns: None,
+            window_span_latency_ns: None,
         };
         w.append_row(&novel_row).expect("append novel-feed row");
         let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
@@ -1351,6 +1403,9 @@ mod tests {
                 open_gap_pct: 0.2,
                 total_buy_qty: 89_600,
                 total_sell_qty: 4_800,
+                open_latency_ns: None,
+                close_latency_ns: None,
+                window_span_latency_ns: None,
             };
             w.append_row(&row).expect("append per-TF row");
             let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
@@ -1484,6 +1539,171 @@ mod tests {
         assert_ne!(
             CANDLE_OUT_OF_WINDOW_REASONS[0], CANDLE_OUT_OF_WINDOW_REASONS[1],
             "two reasons must never share a metric label"
+        );
+    }
+
+    // ---- the three delay pairs (2026-09-19, Task #15 step 6) ----
+
+    /// A row that KNOWS its delays emits all six columns, and the readable half
+    /// carries the whole-unit text the operator asked for (Quote D) — never a
+    /// decimal, never a raw nanosecond count on a millisecond-scale delay.
+    #[test]
+    fn a_row_with_known_receipt_stamps_emits_all_six_delay_columns() {
+        let mut w = ShadowCandleWriter::for_test();
+        let row = ShadowSealRow {
+            table_name: TfIndex::M1.table_name(),
+            timestamp_ist_nanos: 1_716_023_700_i64 * 1_000_000_000,
+            security_id: 4242,
+            segment: "NSE_FNO",
+            feed: "dhan",
+            open: 100.0,
+            high: 105.0,
+            low: 99.0,
+            close: 101.0,
+            volume: 1234,
+            oi: 50_000,
+            tick_count: 5,
+            close_pct_from_prev_day: 1.5,
+            open_pct: 0.4,
+            change_pct: 1.5,
+            open_gap_pct: 0.2,
+            total_buy_qty: 89_600,
+            total_sell_qty: 4_800,
+            // 123 ms, 4 s, and a zero span — the third is the case a sentinel
+            // would have destroyed: a single-tick bucket really did span zero,
+            // and that is NOT the same fact as "we do not know".
+            open_latency_ns: Some(123_000_000),
+            close_latency_ns: Some(4_000_000_000),
+            window_span_latency_ns: Some(0),
+        };
+        w.append_row(&row).expect("append row with delays");
+        let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
+
+        // The exact halves are what any ORDER BY must use.
+        assert!(
+            s.contains("open_latency_ns=123000000i"),
+            "the exact nanosecond twin must be written as an integer, got {s}"
+        );
+        assert!(
+            s.contains("close_latency_ns=4000000000i"),
+            "the exact nanosecond twin must be written as an integer, got {s}"
+        );
+        assert!(
+            s.contains("window_span_latency_ns=0i"),
+            "a genuinely-zero span must be WRITTEN as 0, not omitted, got {s}"
+        );
+
+        // The readable halves are whole units in the right band.
+        assert!(
+            s.contains(r#"open_latency="123 milliseconds""#),
+            "123 ms must render as whole milliseconds, got {s}"
+        );
+        assert!(
+            s.contains(r#"close_latency="4 seconds""#),
+            "4 s must render as whole seconds, plural, got {s}"
+        );
+        assert!(
+            s.contains(r#"window_span_latency="0 nanoseconds""#),
+            "a zero span must render as a real reading, not blank, got {s}"
+        );
+    }
+
+    /// A row that does NOT know its delays emits NOTHING for them. Omitted is
+    /// NULL in QuestDB; a written `0` would claim the fastest possible delivery
+    /// for a bar whose delivery time is unknowable (a spill replay, a REST
+    /// reconstruction). The two cases must never render alike.
+    #[test]
+    fn a_row_with_unknown_receipt_stamps_omits_the_delay_columns_entirely() {
+        let mut w = ShadowCandleWriter::for_test();
+        let row = ShadowSealRow {
+            table_name: TfIndex::M1.table_name(),
+            timestamp_ist_nanos: 1_716_023_700_i64 * 1_000_000_000,
+            security_id: 4242,
+            segment: "NSE_FNO",
+            feed: "dhan",
+            open: 100.0,
+            high: 105.0,
+            low: 99.0,
+            close: 101.0,
+            volume: 1234,
+            oi: 50_000,
+            tick_count: 5,
+            close_pct_from_prev_day: 1.5,
+            open_pct: 0.4,
+            change_pct: 1.5,
+            open_gap_pct: 0.2,
+            total_buy_qty: 89_600,
+            total_sell_qty: 4_800,
+            open_latency_ns: None,
+            close_latency_ns: None,
+            window_span_latency_ns: None,
+        };
+        w.append_row(&row).expect("append row without delays");
+        let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
+
+        for absent in [
+            "open_latency",
+            "open_latency_ns",
+            "close_latency",
+            "close_latency_ns",
+            "window_span_latency",
+            "window_span_latency_ns",
+        ] {
+            assert!(
+                !s.contains(absent),
+                "{absent} must be ABSENT (NULL), never written as zero, got {s}"
+            );
+        }
+        // Non-vacuity: the row itself really was serialised.
+        assert!(
+            s.starts_with("candles_1m,"),
+            "the row must still be written, only its delays omitted, got {s}"
+        );
+        assert!(
+            s.contains("total_sell_qty=4800i"),
+            "the column before the delay block must still be present, got {s}"
+        );
+    }
+
+    /// The scratch buffer is reused across rows, so a stale render must never
+    /// trail into the next one. Two rows through ONE writer, second shorter.
+    #[test]
+    fn the_reused_delay_scratch_never_leaks_one_rows_text_into_the_next() {
+        let mk = |ns: i64| ShadowSealRow {
+            table_name: TfIndex::M1.table_name(),
+            timestamp_ist_nanos: 1_716_023_700_i64 * 1_000_000_000,
+            security_id: 4242,
+            segment: "NSE_FNO",
+            feed: "dhan",
+            open: 100.0,
+            high: 105.0,
+            low: 99.0,
+            close: 101.0,
+            volume: 1234,
+            oi: 50_000,
+            tick_count: 5,
+            close_pct_from_prev_day: 1.5,
+            open_pct: 0.4,
+            change_pct: 1.5,
+            open_gap_pct: 0.2,
+            total_buy_qty: 89_600,
+            total_sell_qty: 4_800,
+            open_latency_ns: Some(ns),
+            close_latency_ns: None,
+            window_span_latency_ns: None,
+        };
+        let mut w = ShadowCandleWriter::for_test();
+        // Long text first (19 chars), then the shortest possible (13).
+        w.append_row(&mk(123_000_000)).expect("first");
+        w.append_row(&mk(4)).expect("second");
+        let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
+        assert!(
+            s.contains(r#"open_latency="4 nanoseconds""#),
+            "the second row must render its OWN value cleanly, got {s}"
+        );
+        assert!(
+            !s.contains(r#"open_latency="123 milliseconds4 nanoseconds""#),
+            "a missing clear() would append the second render onto the first, got {s}"
         );
     }
 }

@@ -42,7 +42,7 @@
 //! [`AggregatorCell::consume_tick`] is O(1): one ordinal index into a fixed
 //! array, a handful of scalar comparisons, no loop over data, no allocation.
 
-use tickvault_common::constants::MAX_PLAUSIBLE_LTP;
+use tickvault_common::constants::{IST_UTC_OFFSET_NANOS, MAX_PLAUSIBLE_LTP};
 use tickvault_common::price_precision::f32_to_f64_clean;
 use tickvault_common::tick_types::ParsedTick;
 
@@ -1672,6 +1672,31 @@ fn usable_exchange_price(raw: f32) -> bool {
     raw.is_normal() && raw > 0.0 && raw <= MAX_PLAUSIBLE_LTP
 }
 
+/// A tick's UTC receipt instant as IST-NAIVE nanoseconds, preserving the
+/// "no receipt" sentinel.
+///
+/// `ParsedTick::received_at_nanos` is UTC. Every timestamp the fold reasons
+/// about — `bucket_start_ist_secs`, `close_ts_ist_secs` — is IST-naive, so the
+/// offset is applied HERE, exactly once, at the only two sites that record a
+/// receipt. Storing the raw UTC value instead would leave every later
+/// subtraction against a window edge wrong by 5h30m in a way that looks
+/// perfectly reasonable: `open_latency` would read as five and a half hours on
+/// every bar of every session.
+///
+/// `0` is the documented "this frame carries no receipt clock" value — a
+/// pre-`TVW3` WAL replay, `WAL_RECEIPT_UNKNOWN_NANOS`. It is passed through
+/// UNSHIFTED rather than offset, because the writer renders `0` as a NULL
+/// delay pair; shifting it would turn "unknown" into a confident 5h30m. A
+/// negative reading is treated identically, since it cannot be a real receipt.
+#[inline]
+fn receipt_ist_nanos(received_at_nanos: i64) -> i64 {
+    if received_at_nanos > 0 {
+        received_at_nanos.saturating_add(IST_UTC_OFFSET_NANOS)
+    } else {
+        0
+    }
+}
+
 /// Builds the state of a bucket being opened by `tick`.
 ///
 /// `use_day_open` makes the bar open at the exchange-published `day_open`
@@ -1780,6 +1805,12 @@ fn open_bucket(
         session_open: prices.day_open,
         open_pct: 0.0,
         open_gap_pct: 0.0,
+        // Both stamps seeded from the SAME reading, because a bucket with one
+        // tick has a zero span and both edges are that tick. `min`/`max` in
+        // `fold_in_bucket` then widen them, which is what makes arrival order
+        // irrelevant — see the field docs for why first-write would be wrong.
+        first_receipt_ist_nanos: receipt_ist_nanos(tick.received_at_nanos),
+        last_receipt_ist_nanos: receipt_ist_nanos(tick.received_at_nanos),
     };
     // The official open is a REAL matched trade (the pre-open call auction
     // equilibrium), so it genuinely belongs inside this bar's range. Widen
@@ -2079,6 +2110,31 @@ fn fold_in_bucket(
     if prices.day_open > 0.0 {
         state.session_open = prices.day_open;
     }
+    // The bucket's receipt WINDOW, widened by min/max over real readings.
+    //
+    // MIN and MAX, never first-write and last-write. This feed carries no
+    // sequence number, so arrival order is arbitrary: the tick that opens a
+    // bucket by EXCHANGE time is not necessarily the one that reached us
+    // first, and the tick that closes it is not necessarily the one that
+    // reached us last. First/last-write would report whichever packet the
+    // network happened to deliver at the edges; min/max report the window the
+    // bucket's data actually occupied, which is what the three delay columns
+    // claim to measure.
+    //
+    // Only a REAL reading widens. `0` is the "no receipt" sentinel, so a
+    // `min` against it would peg every bucket containing one replayed frame at
+    // zero — an `open_latency` of "the whole time since midnight" on a bar
+    // that was perfectly prompt. A bucket whose stamps are still `0` takes the
+    // first real reading it sees on both edges.
+    let receipt = receipt_ist_nanos(tick.received_at_nanos);
+    if receipt > 0 {
+        if state.first_receipt_ist_nanos == 0 || receipt < state.first_receipt_ist_nanos {
+            state.first_receipt_ist_nanos = receipt;
+        }
+        if receipt > state.last_receipt_ist_nanos {
+            state.last_receipt_ist_nanos = receipt;
+        }
+    }
 }
 
 /// Folds a LATE tick into an already-sealed bucket's high / low / close.
@@ -2090,6 +2146,12 @@ fn fold_in_bucket(
 /// truly-later close. `open` /
 /// `volume` / `oi` are untouched: `open` belongs to the first tick, and the
 /// cumulative snapshots are order-dependent and ambiguous for a latecomer.
+///
+/// The two RECEIPT stamps are untouched for a different and stronger reason:
+/// this path amends a bar that was already sealed and already written, and it
+/// re-emits only the amended bar. Moving `first_receipt_ist_nanos` or
+/// `last_receipt_ist_nanos` here would change a figure no row will ever
+/// carry — the delay columns for that bar left with the seal.
 #[inline]
 fn fold_late_hlc(state: &mut LiveCandleState, prices: TickPrices, fold_secs: u32) {
     let price = prices.last_traded_price;
@@ -2122,13 +2184,18 @@ fn fold_late_hlc(state: &mut LiveCandleState, prices: TickPrices, fold_secs: u32
 // mystery const-assert.
 //
 // Fleet cost at the slot ceiling, stated because this constant multiplies:
-//   24 TF × 136 B × 2 = 6_528 B, padded ≤ 6_784 B per instrument
-//   × AGGREGATOR_MAX_SLOTS (25,000) = ~170 MB
-// against the r8g.xlarge 32 GiB host (operator Quote 13) that is 0.52% —
-// up from ~141 MB at 21 frames and ~160 MB at 24 frames × 128 B. On the
-// retired 4 GiB t4g.medium the same table would have been ~4.1% of the
+//   9 TF × 152 B × 2 = 2_736 B, + 9 × 21 + 160 = 3_085 B per instrument
+//   × AGGREGATOR_MAX_SLOTS (25,000) = ~77 MB
+// against the r8g.xlarge 32 GiB host (operator Quote 13) that is 0.24%. On the
+// retired 4 GiB t4g.medium the same table would have been ~1.9% of the
 // entire machine, which is the sort of number that used to make "just add
 // three timeframes" a real decision.
+//
+// ⚠ This paragraph read "24 TF × 136 B × 2 = 6_528 B … ~170 MB" until
+// 2026-09-19. The FORMULA below is derived from TF_COUNT and followed the
+// nine-frame collapse on its own; the prose did not, which is precisely the
+// stale-figure class this file keeps recording. Re-derived from the constants
+// rather than scaled from the previous row.
 //
 // 128 → 136 RAISED 2026-09-10 for `LiveCandleState::net_volume_signed`, the
 // tick-rule net-volume accumulator. The per-instrument cost is +256 B and the
@@ -2136,7 +2203,7 @@ fn fold_late_hlc(state: &mut LiveCandleState, prices: TickPrices, fold_secs: u32
 // file over carries a further +4.8 MB, so the whole change is ~15 MB. Recorded
 // in `aws-budget.md` under the same date, per this assert's own instruction.
 //
-// The 136 stays a LITERAL and is deliberately NOT written as
+// The 152 stays a LITERAL and is deliberately NOT written as
 // `size_of::<LiveCandleState>()`. Deriving it from the thing it bounds would
 // make this assert vacuous — it would still catch a change to the CELL's own
 // layout while silently permitting unbounded growth of the state it holds,
@@ -2155,9 +2222,28 @@ fn fold_late_hlc(state: &mut LiveCandleState, prices: TickPrices, fold_secs: u32
 // What it buys, measured rather than argued: the seconds frame was 2,990 gross
 // units and 650 of net short of the minute frame on security 68407, on the
 // SAME ticks, because a frame that refuses a late tick had nowhere to put its
-// volume. 10 MB for a conservation guarantee across all 24 frames is the
-// cheapest line in this budget.
-const MAX_AGGREGATOR_CELL_BYTES: usize = TF_COUNT * 136 * 2 + TF_COUNT * 21 + 160;
+// volume. 10 MB for a conservation guarantee across all nine frames is the
+// cheapest line in this budget. (That sentence said "all 24 frames" until
+// 2026-09-19; the fold is nine frames since the collapse, and the conservation
+// guarantee is unchanged in kind.)
+//
+// 136 → 152 RAISED 2026-09-19 for the two receipt stamps
+// (`LiveCandleState::first_receipt_ist_nanos` + `last_receipt_ist_nanos`),
+// which are what let a candle row carry `open_latency`, `close_latency` and
+// `window_span_latency`. Re-derived from the constants rather than scaled:
+//   9 TF × 152 B × 2 = 2_736 B, + 9 × 21 + 160 = 3_085 B per instrument
+//   × AGGREGATOR_MAX_SLOTS (25,000) = ~77.1 MB   (was 2_797 B / ~69.9 MB)
+// so the fleet cost is +7.2 MB, 0.02% of the 32 GiB host, and the seal ring's
+// own budget one file over carries a further +3.6 MB. Recorded in
+// `aws-budget.md` under the same date, per this assert's own instruction.
+//
+// What it buys: `ts` is the EXCHANGE clock, so a bar built from data that
+// arrived instantly and one built from data that arrived four seconds late are
+// byte-identical in every other column. These two stamps are the only surface
+// that can tell them apart — and they MEASURE receipt against the window, they
+// never BUCKET by it (`fold_clock_ist_secs` stays the identity on
+// `exchange_timestamp`).
+const MAX_AGGREGATOR_CELL_BYTES: usize = TF_COUNT * 152 * 2 + TF_COUNT * 21 + 160;
 const _: () = assert!(
     std::mem::size_of::<AggregatorCell>() <= MAX_AGGREGATOR_CELL_BYTES,
     "AggregatorCell exceeded its per-instrument budget — this multiplies by AGGREGATOR_MAX_SLOTS (25,000); update aws-budget.md before raising."

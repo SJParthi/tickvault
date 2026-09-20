@@ -1312,3 +1312,70 @@ and the on-disk seal-spill record is unchanged in size and format. The carry is
 process state only — it never crosses the day boundary, and a counter restart
 drops it deliberately, because it is a difference measured against a baseline
 the restart erased.
+
+---
+
+## RAM NOTE 2026-09-19 — per-bucket receipt stamps for the three delay pairs (+10.8 MB host RAM, +$0.00/mo)
+
+**Why this note exists.** `MAX_AGGREGATOR_CELL_BYTES` in
+`crates/trading/src/candles/aggregator_cell.rs` carries the instruction
+*"update aws-budget.md before raising"*, and it FIRED again. This is that
+update — the third time in nine days that assert has turned an invisible
+per-field cost into a measured fleet number before the change shipped. This
+time `BufferedSeal`'s own bound in `crates/trading/src/candles/seal_ring.rs`
+fired alongside it, so BOTH budgets move in one change.
+
+**The change.** `LiveCandleState` gains exactly TWO `i64` fields —
+`first_receipt_ist_nanos` and `last_receipt_ist_nanos` — so a sealed bar can
+answer three questions the candles table now has columns for: how long after
+the window opened the first trade in it reached us, how long before the window
+closed the last one did, and how far apart those two arrivals were.
+
+**Two, not three, and that is the point.** The three delays are DERIVED at seal
+time from those two stamps plus the bucket's own start and its timeframe's
+length. Storing the three answers per OPEN bucket would have paid for them
+`× TF_COUNT × AGGREGATOR_MAX_SLOTS` — fleet RAM for arithmetic that costs
+nothing once, at the one moment a bar is sealed.
+
+| Budget | Was | Now | Fleet delta |
+|---|---|---|---|
+| `MAX_AGGREGATOR_CELL_BYTES` (`aggregator_cell.rs`) | `TF_COUNT × 136 × 2 + TF_COUNT × 21 + 160` = 2,797 B allowed, **2,632 B actual** | `TF_COUNT × 152 × 2 + TF_COUNT × 21 + 160` = 3,085 B allowed, **2,920 B actual** | 65.8 MB → **73.0 MB** at `AGGREGATOR_MAX_SLOTS` (25,000) |
+| `BufferedSeal` (`seal_ring.rs`) | ≤ 152 B, **152 B actual** | ≤ 168 B, **168 B actual** | 34.2 MB → **37.8 MB** at `SEAL_BUFFER_CAPACITY` (225,000) |
+| **Total** | | | **+10.8 MB**, 0.0314% of the 32 GiB host |
+
+Every actual above is MEASURED with `size_of` on 2026-09-19, not estimated:
+`LiveCandleState` 152 · `AggregatorCell` 2,920 · `BufferedSeal` 168 ·
+`TF_COUNT` 9 · `AGGREGATOR_MAX_SLOTS` 25,000 · `SEAL_BUFFER_CAPACITY` 225,000.
+
+**The figures are RE-DERIVED from those constants, never scaled from the row
+above.** The 2026-09-11 note's fleet numbers (~164 MB → ~175 MB) were correct
+when written at `TF_COUNT = 24` and are now arithmetically stale — the
+operator's nine-frame collapse cut the cell array to nine entries the same
+week. Scaling that row forward would have carried a second, independent error
+into this one; that exact failure is what `aws-budget.md` already records
+against itself, so this note starts from `TF_COUNT` and re-multiplies.
+
+**⚠ `BufferedSeal` now sits EXACTLY on its bound with zero slack.** 168 allowed,
+168 actual. The next field added to `LiveCandleState` fails the const-assert on
+the first build, which is the assert working — but it means the next change in
+this area is a budget decision, not an incidental one. The doc comment above
+that struct still read *"Sized ≤ 128 bytes"* until today, two raises behind the
+assert; it is corrected in the same change.
+
+**Dollar cost: ZERO.** No instance change, no EBS change, no new CloudWatch
+metric, no alarm, no EMF name — the three delays land as columns in a table the
+operator already reads, which is why they cost nothing to observe. The
+September position is restated rather than inherited: read live 2026-09-06,
+`limit_amount` **$150**, the 90% `STOP_EC2_INSTANCES` action line **$135.00**,
+forecast **$142.24** — already $7.24 over that line. This change neither helps
+nor worsens it, and the noise lock's standing rule (the next addition arrives
+with a LEVER, not a cost note) is the reason no EMF name ships here.
+
+**What is NOT claimed.** A RAM note, not a disk note: the on-disk seal-spill
+record is unchanged in SIZE (`SEAL_SPILL_RECORD_SIZE = 128`, byte-for-byte
+full) and the two stamps are deliberately NOT carried in it — a spilled-and-
+replayed seal arrives with both at `0`, which is already the documented
+`WAL_RECEIPT_UNKNOWN_NANOS` convention, so all six delay columns render NULL
+rather than claiming a zero delay. No format bump, no stride change, no new
+flag. The candles table's own row width DOES grow by six columns; that is a
+disk figure and it is not measured here.

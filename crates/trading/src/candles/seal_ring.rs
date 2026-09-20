@@ -101,7 +101,11 @@ pub const SEAL_BUFFER_CAPACITY: usize =
 
 /// One sealed bar ready to flush to its `candles_*` plain table.
 /// `Copy` so the ring's `VecDeque<BufferedSeal>` does not need
-/// ref-counted entries. Sized ≤ 128 bytes per the const-assert below.
+/// ref-counted entries. Sized ≤ 168 bytes per the const-assert below —
+/// MEASURED at exactly 168 on 2026-09-19, so the bound has NO slack left.
+/// (This line said "≤ 128" until 2026-09-19: the assert was raised twice
+/// and the prose was not, which is the same stale-number class the
+/// `SEAL_BUFFER_CAPACITY` doc six lines above records against itself.)
 ///
 /// The `exchange_segment_code: u8` is the SAME byte as
 /// `ParsedTick::exchange_segment_code`. The writer slice maps this
@@ -109,7 +113,9 @@ pub const SEAL_BUFFER_CAPACITY: usize =
 /// `tickvault_common::segment::segment_code_to_str`.
 ///
 /// `tf` is encoded as [`TfIndex`] (1 byte) so the writer slice can
-/// dispatch to one of the 21 ILP `Sender`s by ordinal without lookup.
+/// dispatch to one of the `TF_COUNT` ILP `Sender`s by ordinal without
+/// lookup. (This said "21" until 2026-09-19; the operator's nine-frame
+/// collapse left it stale, so it now names the constant, not a number.)
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BufferedSeal {
     /// Composite-key part 1 (per I-P1-11).
@@ -180,14 +186,24 @@ impl BufferedSeal {
 // TF_COUNT 24 → 9, so every product in this comment fell by 2.67×. The cost
 // of the raise itself is unchanged in SHAPE — it is the ring that shrank.
 //
-// The 152 stays a LITERAL for the same reason its sibling in
+// The 168 stays a LITERAL for the same reason its sibling in
 // `aggregator_cell.rs` does: writing `size_of::<LiveCandleState>() + 16` here
 // would make the assert unable to fail on exactly the change it exists to
 // catch, and this one DID catch the net-volume field and made its cost
 // visible before it shipped.
+//
+// RAISED 152 -> 168 on 2026-09-19 for the two receipt stamps
+// (`LiveCandleState` 136 -> 152; this struct adds u64 + u8 + TfIndex + Feed =
+// 11 bytes of payload, so 163 pads to 168). Ring RAM at the derived
+// SEAL_BUFFER_CAPACITY of 225,000 moves 34.2 MB -> 37.8 MB, +3.6 MB, recorded
+// in aws-budget.md under the same date. It is worth exactly that: the three
+// delay columns are the only surface that can distinguish a bar built from
+// data that arrived instantly from one built from data that arrived four
+// seconds late, because `ts` is the exchange clock and the two bars are
+// otherwise byte-identical.
 const _: () = assert!(
-    std::mem::size_of::<BufferedSeal>() <= 152,
-    "BufferedSeal exceeded 152-byte budget — ring RAM = SEAL_BUFFER_CAPACITY × this size; bumping requires updating aws-budget.md."
+    std::mem::size_of::<BufferedSeal>() <= 168,
+    "BufferedSeal exceeded 168-byte budget — ring RAM = SEAL_BUFFER_CAPACITY × this size; bumping requires updating aws-budget.md."
 );
 
 /// Outcome of [`SealRing::try_buffer`].
@@ -393,10 +409,11 @@ mod tests {
         // so a future field bloat fails grep-able tests too.
         //
         // 144 -> 152 on 2026-09-10 with `LiveCandleState::net_volume_signed`
-        // (128 -> 136). Fleet cost recorded beside the const assert and in
-        // aws-budget.md: the ring is SEAL_BUFFER_CAPACITY x this size, so
-        // 86.4 MB -> 91.2 MB.
-        assert!(std::mem::size_of::<BufferedSeal>() <= 152);
+        // (128 -> 136); 152 -> 168 on 2026-09-19 with the two receipt stamps
+        // (136 -> 152). Fleet cost recorded beside the const assert and in
+        // aws-budget.md: the ring is SEAL_BUFFER_CAPACITY x this size, so at
+        // the post-collapse 225,000 that is 34.2 MB -> 37.8 MB.
+        assert!(std::mem::size_of::<BufferedSeal>() <= 168);
     }
 
     #[test]

@@ -707,6 +707,13 @@ pub fn sealed_bucket_to_seal(
         session_open: b.open,
         open_pct: 0.0,
         open_gap_pct: 0.0,
+        // A REST bar is reconstructed from a vendor candle, not received as a
+        // tick: there is no receipt clock at all, so both stamps are genuinely
+        // unknown. `0` is the documented WAL_RECEIPT_UNKNOWN_NANOS convention,
+        // which `from_buffered_seal` turns into `None` and the writer omits —
+        // so all six delay columns read NULL rather than claiming a zero delay.
+        first_receipt_ist_nanos: 0,
+        last_receipt_ist_nanos: 0,
     };
     BufferedSeal::new(security_id, exchange_segment_code, sealed.tf, state, feed)
 }
