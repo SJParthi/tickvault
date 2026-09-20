@@ -150,6 +150,33 @@ pub struct ShadowSealRow {
     /// `LiveCandleState::total_sell_qty` (`u32`) widened to `i64`. Same
     /// semantics as `total_buy_qty` — pending SELL orders, not trades.
     pub total_sell_qty: i64,
+    /// Nanoseconds between this bar's window OPENING and the first tick of it
+    /// that this process RECEIVED. `None` when the bucket carries no receipt
+    /// clock at all — a pre-`TVW3` WAL replay, or a seal that went to disk and
+    /// came back (the 128-byte spill record is full and does not carry the
+    /// stamps, so a replayed seal reports unknown rather than a fabricated 0).
+    ///
+    /// The writer renders BOTH halves of the pair from this one figure:
+    /// `open_latency` (whole units, human-readable) and `open_latency_ns`
+    /// (exact, the only one that may be sorted on). `None` writes NEITHER —
+    /// an empty cell is the honest rendering of an unknown delay, where
+    /// `0 nanoseconds` would claim the fastest possible delivery.
+    ///
+    /// ⚠ This MEASURES receipt against the window; it never BUCKETS by it.
+    /// `ts` is the exchange clock and nothing else decides which bar a trade
+    /// enters (`fold_clock_ist_secs`, the 2026-09-18 SECOND directive).
+    pub open_latency_ns: Option<i64>,
+    /// Nanoseconds between the last tick of this bar that this process
+    /// RECEIVED and the window CLOSING. Same `None` contract and same
+    /// measure-never-bucket rule as [`Self::open_latency_ns`].
+    pub close_latency_ns: Option<i64>,
+    /// Nanoseconds from the first RECEIVED tick of this bar to the last —
+    /// the receipt window the bar's data actually occupied. `Some(0)` is a
+    /// real reading (a single-tick bucket has a zero span) and is rendered
+    /// `0 nanoseconds`, which is why this is an `Option` rather than a
+    /// sentinel: the unknown case and the genuinely-instant case must not
+    /// share a value.
+    pub window_span_latency_ns: Option<i64>,
 }
 
 impl ShadowSealRow {
@@ -173,6 +200,34 @@ impl ShadowSealRow {
         let timestamp_ist_nanos =
             i64::from(seal.state.bucket_start_ist_secs).saturating_mul(1_000_000_000);
         let volume_i64 = seal.state.signed_volume();
+        // The three delays, derived HERE rather than stored on
+        // `LiveCandleState`: the fold keeps the two receipt STAMPS (16 bytes,
+        // multiplied by TF_COUNT and by AGGREGATOR_MAX_SLOTS), and the window
+        // edges they are measured against are already known from the bucket
+        // start and the frame's own period. Storing three more derived figures
+        // per open bucket would pay fleet RAM for arithmetic that costs
+        // nothing at seal time.
+        //
+        // `0` on a stamp is the "no receipt" sentinel, so it maps to `None`
+        // and the writer emits NEITHER half of that pair. A seal that was
+        // spilled to disk and replayed arrives here with both stamps at `0`
+        // for exactly that reason — the 128-byte spill record is full and does
+        // not carry them, so a replayed bar reports its delays as unknown
+        // instead of fabricating an instant one.
+        let window_open_ist_nanos = timestamp_ist_nanos;
+        let window_close_ist_nanos = window_open_ist_nanos
+            .saturating_add(i64::from(seal.tf.seconds_per_bucket()).saturating_mul(1_000_000_000));
+        let first_receipt = seal.state.first_receipt_ist_nanos;
+        let last_receipt = seal.state.last_receipt_ist_nanos;
+        let open_latency_ns =
+            (first_receipt > 0).then(|| first_receipt.saturating_sub(window_open_ist_nanos));
+        let close_latency_ns =
+            (last_receipt > 0).then(|| window_close_ist_nanos.saturating_sub(last_receipt));
+        // Both stamps required: a span needs two real edges, and the fold
+        // seeds them together, so one present without the other cannot happen
+        // — the test is belt-and-braces rather than a case being handled.
+        let window_span_latency_ns = (first_receipt > 0 && last_receipt > 0)
+            .then(|| last_receipt.saturating_sub(first_receipt));
         Self {
             table_name: seal.tf.table_name(),
             timestamp_ist_nanos,
@@ -200,6 +255,9 @@ impl ShadowSealRow {
             open_gap_pct: seal.state.open_gap_pct,
             total_buy_qty: i64::from(seal.state.total_buy_qty),
             total_sell_qty: i64::from(seal.state.total_sell_qty),
+            open_latency_ns,
+            close_latency_ns,
+            window_span_latency_ns,
         }
     }
 }
