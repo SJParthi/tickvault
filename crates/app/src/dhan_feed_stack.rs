@@ -3437,26 +3437,8 @@ impl LiveIngest {
                 // pays ONE hash probe for owner, family and multiplier
                 // together" — it was the implementation that paid two.
                 lot_size: owner.lot_size,
-                // Rank-output only, like the two above: `observe` takes the
-                // receipt as its own argument and stores it on `Tracked`, and
-                // `rank` writes these from there. A value set here is dropped.
-                first_receipt_nanos: 0,
-                last_receipt_nanos: 0,
             },
             owner.family,
-            // THE RECEIPT CLOCK, straight off the parsed tick. Not `now`: the
-            // drain back-dates this by ring dwell, so it is the instant the
-            // frame was taken off the socket rather than the instant the fold
-            // got to it -- which is what makes it a measure of the VENDOR path
-            // and not of our own queue.
-            //
-            // A replayed WAL frame never reaches this line (`replaying_wal`
-            // returns at the top of this function), so a pre-TVW3 record's `0`
-            // sentinel cannot arrive here through the live path. It is still
-            // passed through unaltered rather than substituted, because a
-            // caller outside the drain must get the same BLANK answer rather
-            // than a fabricated one.
-            tick.received_at_nanos,
         );
     }
 

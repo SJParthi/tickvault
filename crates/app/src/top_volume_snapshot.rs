@@ -42,7 +42,6 @@
 //! pre-registers a counter series that can only ever read zero, and a
 //! permanently-zero counter reads as coverage rather than as absence.
 
-use tickvault_common::constants::IST_UTC_OFFSET_NANOS;
 use tickvault_common::types::ExchangeSegment;
 use tickvault_storage::top_volume_rank_persistence::{SnapshotCadence, TopVolumeRankRow};
 
@@ -597,15 +596,6 @@ where
     let ts = boundary.saturating_sub(period_nanos);
     // The same two boundaries in the RECEIPT clock's frame.
     //
-    // `ts` and `boundary` are IST-NAIVE nanos — the frame the row is stamped in
-    // and the frame the candle grid lives in. `RankedContract::first_receipt_nanos`
-    // is `ParsedTick::received_at_nanos`, which is UTC epoch nanos. Subtracting
-    // one from the other without this conversion is a 5-hour-30-minute error
-    // that looks exactly like a plausible delay, in the direction that makes
-    // the feed look catastrophically slow — so the conversion is done ONCE
-    // here, per sweep, rather than per row.
-    let window_open_utc_nanos = ts.saturating_sub(IST_UTC_OFFSET_NANOS);
-    let window_close_utc_nanos = boundary.saturating_sub(IST_UTC_OFFSET_NANOS);
     // The row stamp in IST epoch SECONDS — the OPEN of the window this
     // snapshot describes, and the exact key the candle fold buckets on
     // (`LiveCandleState::bucket_start_ist_secs` is seconds). It is handed to
@@ -776,7 +766,6 @@ where
         //
         // # The clock, and the one conversion that must happen exactly once
         //
-        // `first_receipt_nanos` / `last_receipt_nanos` are `ParsedTick::
         // received_at_nanos` — a **UTC** epoch instant, back-dated by ring
         // dwell so it names the socket-receipt moment rather than the fold
         // moment. `ts` and `boundary` are **IST-naive** nanos (the grid this
@@ -799,19 +788,6 @@ where
         // The row stays allocation-free: the writer owns one reusable buffer
         // and renders at append time. A `format!` per column per row would be
         // 3 x 20,220 = 60,660 fresh allocations per sweep, on the frame drain.
-        let first_receipt =
-            (contract.first_receipt_nanos > 0).then_some(contract.first_receipt_nanos);
-        let last_receipt = (contract.last_receipt_nanos > 0).then_some(contract.last_receipt_nanos);
-        // Signed on purpose in all three. The drain back-dates a receipt by
-        // ring dwell, so a tick can legitimately carry an instant a hair
-        // before the boundary it lands in, and a small negative reading is the
-        // honest answer rather than a clamp to zero that would hide it.
-        let open_latency_ns = first_receipt.map(|r| r.saturating_sub(window_open_utc_nanos));
-        let close_latency_ns = last_receipt.map(|r| window_close_utc_nanos.saturating_sub(r));
-        let window_span_ns = match (first_receipt, last_receipt) {
-            (Some(first), Some(last)) => Some(last.saturating_sub(first)),
-            _ => None,
-        };
         rows.push(TopVolumeRankRow {
             snapshot_ts_ist_nanos: ts,
             cadence,
@@ -839,12 +815,6 @@ where
             volume: candle.as_ref().map(|bar| bar.signed_volume),
             percentage_change,
             open_percentage_change,
-            // The three receipt delays, in NANOSECONDS. The writer renders the
-            // readable twin beside each from this same value, so the pair can
-            // never disagree, and both halves go NULL together.
-            open_latency_ns,
-            close_latency_ns,
-            window_span_ns,
         });
     }
 
@@ -936,8 +906,6 @@ mod tests {
             // not of the projection, and no test asserts it up there.
             delta_units: volume.saturating_mul(3),
             lot_size: 1_000,
-            first_receipt_nanos: 0,
-            last_receipt_nanos: 0,
         }
     }
 
