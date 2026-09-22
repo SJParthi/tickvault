@@ -1534,6 +1534,47 @@ mod tests {
         }
     }
 
+    /// A08 (2026-09-22): a subscribed option at the END of an artifact larger
+    /// than the cap still gets its name. The plain file-order walk is the
+    /// control — it proves the fixture really does overflow the cap, so this
+    /// test cannot pass by the cap being out of reach.
+    #[test]
+    fn labels_from_artifact_selected_first_names_a_subscribed_contract_past_the_cap() {
+        let mut rows: Vec<ContractRow> = (1..=MAX_TRACKED_CONTRACTS as u64)
+            .map(|i| contract(i, "OPTSTK", "RELIANCE", "NSE"))
+            .collect();
+        let late = MAX_TRACKED_CONTRACTS as u64 + 7;
+        rows.push(contract(late, "OPTIDX", "NIFTY", "NSE"));
+
+        let file_order = labels_from_artifact(&rows);
+        assert_eq!(file_order.len(), MAX_TRACKED_CONTRACTS);
+        assert!(
+            !file_order.contains_key(&(late, FNO)),
+            "control: the file-order walk must drop the late row, or the fixture proves nothing"
+        );
+
+        let labels = labels_from_artifact_selected_first(&rows, &[subscribed(late, FNO)]);
+        assert_eq!(labels.len(), MAX_TRACKED_CONTRACTS, "the cap still holds");
+        assert!(
+            labels.contains_key(&(late, FNO)),
+            "the subscribed contract is named"
+        );
+    }
+
+    /// The same numeric id on a different segment is a different instrument
+    /// (I-P1-11) and earns no priority.
+    #[test]
+    fn labels_from_artifact_selected_first_matches_the_composite_key() {
+        let rows = [contract(500, "OPTIDX", "NIFTY", "NSE")];
+        let labels = labels_from_artifact_selected_first(
+            &rows,
+            &[subscribed(500, ExchangeSegment::NseEquity)],
+        );
+        // Still labelled in pass 2 — the selection only reorders, never filters.
+        assert!(labels.contains_key(&(500, FNO)));
+        assert_eq!(labels.len(), 1);
+    }
+
     #[test]
     fn order_selected_first_keeps_subscribed_contracts_ahead_and_stable() {
         let legs: Vec<LegIds> = (1..=5).map(|i| leg(i, 13)).collect();
@@ -1805,25 +1846,60 @@ pub fn contract_label(underlying: &str, expiry_ymd: u32, strike_paise: i64, leg:
 /// with no spare capacity word, which matters at ~22,000 entries.
 #[must_use]
 pub fn labels_from_artifact(contracts: &[ContractRow]) -> HashMap<ContractKey, Arc<str>> {
+    labels_from_artifact_selected_first(contracts, &[])
+}
+
+/// [`labels_from_artifact`], but every SUBSCRIBED contract is labelled before
+/// any unsubscribed one.
+///
+/// Added 2026-09-22 (review finding A08, HIGH). The table is capped at
+/// [`MAX_TRACKED_CONTRACTS`] and the artifact holds ~121,000 option rows, so a
+/// file-order walk filled the cap with whatever came first and every
+/// subscribed option past row 25,000 wrote its candles with a NULL
+/// `contract`. The owner map already orders selected-first
+/// ([`order_selected_first`]); this makes the labels follow the same rule.
+///
+/// Two passes over the rows, O(rows), once per attach — never on the tick path.
+#[must_use]
+pub fn labels_from_artifact_selected_first(
+    contracts: &[ContractRow],
+    selected: &[SubscribeInstrument],
+) -> HashMap<ContractKey, Arc<str>> {
+    let picked: HashSet<ContractKey> = selected
+        .iter()
+        .map(|instrument| (instrument.security_id, instrument.segment))
+        .collect();
     let mut labels: HashMap<ContractKey, Arc<str>> =
         HashMap::with_capacity(contracts.len().min(MAX_TRACKED_CONTRACTS));
-    for row in contracts {
-        if !matches!(row.c.as_str(), "OPTIDX" | "OPTSTK") {
+    // Pass 1 takes only subscribed keys; pass 2 fills what room is left. With
+    // an empty selection pass 1 takes nothing and this is the plain file-order
+    // walk.
+    for want_selected in [true, false] {
+        if want_selected && picked.is_empty() {
             continue;
         }
-        if row.i == 0 {
-            continue;
+        for row in contracts {
+            if !matches!(row.c.as_str(), "OPTIDX" | "OPTSTK") {
+                continue;
+            }
+            if row.i == 0 {
+                continue;
+            }
+            let Some(segment) = crate::dhan_contract_universe::derivative_segment(&row.x) else {
+                continue;
+            };
+            let key = (row.i, segment);
+            if picked.contains(&key) != want_selected {
+                continue;
+            }
+            if labels.len() >= MAX_TRACKED_CONTRACTS && !labels.contains_key(&key) {
+                continue;
+            }
+            labels.insert(
+                key,
+                Arc::from(contract_label(&row.u, row.e, row.s, &row.l).as_str()),
+            );
         }
-        let Some(segment) = crate::dhan_contract_universe::derivative_segment(&row.x) else {
-            continue;
-        };
-        if labels.len() >= MAX_TRACKED_CONTRACTS && !labels.contains_key(&(row.i, segment)) {
-            continue;
-        }
-        labels.insert(
-            (row.i, segment),
-            Arc::from(contract_label(&row.u, row.e, row.s, &row.l).as_str()),
-        );
     }
     labels
 }

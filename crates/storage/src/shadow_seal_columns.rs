@@ -21,6 +21,7 @@
 //! The writer is a thin wrapper that drains the absorption pipeline,
 //! calls this extractor, and feeds the `Buffer`.
 
+use tickvault_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST;
 use tickvault_common::price_precision::round_to_2dp;
 use tickvault_common::segment::segment_code_to_str;
 use tickvault_trading::candles::BufferedSeal;
@@ -215,8 +216,21 @@ impl ShadowSealRow {
         // not carry them, so a replayed bar reports its delays as unknown
         // instead of fabricating an instant one.
         let window_open_ist_nanos = timestamp_ist_nanos;
-        let window_close_ist_nanos = window_open_ist_nanos
-            .saturating_add(i64::from(seal.tf.seconds_per_bucket()).saturating_mul(1_000_000_000));
+        // The window CLOSE is the bucket end, clamped to the session close
+        // (15:40 IST, `TICK_PERSIST_END_SECS_OF_DAY_IST`). Without the clamp
+        // the last M30/M60 bar of the day measured its close delay against
+        // 16:00 or later — a minute-scale "delay" that was just the market
+        // shutting. Added 2026-09-22 (review findings A09/A13).
+        let bucket_start = i64::from(seal.state.bucket_start_ist_secs);
+        let bucket_end_secs = bucket_start.saturating_add(i64::from(seal.tf.seconds_per_bucket()));
+        let session_close_secs = bucket_start - bucket_start.rem_euclid(86_400)
+            + i64::from(TICK_PERSIST_END_SECS_OF_DAY_IST);
+        let window_close_secs = if bucket_start < session_close_secs {
+            bucket_end_secs.min(session_close_secs)
+        } else {
+            bucket_end_secs
+        };
+        let window_close_ist_nanos = window_close_secs.saturating_mul(1_000_000_000);
         let first_receipt = seal.state.first_receipt_ist_nanos;
         let last_receipt = seal.state.last_receipt_ist_nanos;
         let open_latency_ns =
@@ -673,5 +687,90 @@ mod tests {
         assert_eq!(row.volume, 1_000_000);
         assert_eq!(row.oi, 7_777_777);
         assert_eq!(row.tick_count, 42);
+    }
+
+    // ---- the three receipt delays (2026-09-22) --------------------------
+
+    /// An IST-naive day start: a whole multiple of 86,400.
+    const DAY: u32 = 1_789_948_800;
+    const SEC: i64 = 1_000_000_000;
+
+    fn seal_with_receipts(tf: TfIndex, bucket: u32, first: i64, last: i64) -> BufferedSeal {
+        let mut seal = mk_seal(13, EXCHANGE_SEGMENT_IDX_I, tf, bucket, 101.0);
+        seal.state.first_receipt_ist_nanos = first;
+        seal.state.last_receipt_ist_nanos = last;
+        seal
+    }
+
+    #[test]
+    fn from_buffered_seal_measures_the_three_delays_against_the_window() {
+        assert_eq!(DAY % 86_400, 0, "fixture must be a day start");
+        let bucket = DAY + 9 * 3600 + 15 * 60; // 09:15
+        let open = i64::from(bucket) * SEC;
+        let row = ShadowSealRow::from_buffered_seal(&seal_with_receipts(
+            TfIndex::M1,
+            bucket,
+            open + SEC,      // first trade received 1 s in
+            open + 59 * SEC, // last received 1 s before the close
+        ));
+        assert_eq!(row.open_latency_ns, Some(SEC));
+        assert_eq!(row.close_latency_ns, Some(SEC));
+        assert_eq!(row.window_span_latency_ns, Some(58 * SEC));
+    }
+
+    #[test]
+    fn from_buffered_seal_reports_no_receipt_as_unknown_never_zero() {
+        let row =
+            ShadowSealRow::from_buffered_seal(&seal_with_receipts(TfIndex::M1, DAY + 33_300, 0, 0));
+        assert_eq!(row.open_latency_ns, None);
+        assert_eq!(row.close_latency_ns, None);
+        assert_eq!(row.window_span_latency_ns, None);
+    }
+
+    #[test]
+    fn from_buffered_seal_single_receipt_has_a_real_zero_span() {
+        let bucket = DAY + 33_300;
+        let t = i64::from(bucket) * SEC + 30 * SEC;
+        let row = ShadowSealRow::from_buffered_seal(&seal_with_receipts(TfIndex::M1, bucket, t, t));
+        assert_eq!(row.window_span_latency_ns, Some(0));
+    }
+
+    /// A receipt stamped before its window (ring-dwell back-dating) is a
+    /// NEGATIVE open delay — reported as it is, not clamped to zero.
+    #[test]
+    fn from_buffered_seal_keeps_a_negative_open_delay() {
+        let bucket = DAY + 33_300;
+        let open = i64::from(bucket) * SEC;
+        let row = ShadowSealRow::from_buffered_seal(&seal_with_receipts(
+            TfIndex::M1,
+            bucket,
+            open - 2 * SEC,
+            open + 10 * SEC,
+        ));
+        assert_eq!(row.open_latency_ns, Some(-2 * SEC));
+    }
+
+    /// A09/A13: the last M60 bar (15:00) ends at the 15:40 session close, not
+    /// 16:00. A trade received at 15:39:59 is 1 s from the close, not 20 min.
+    #[test]
+    fn from_buffered_seal_clamps_the_last_bar_to_the_session_close() {
+        let bucket = DAY + 15 * 3600; // 15:00
+        let last = (i64::from(DAY) + 15 * 3600 + 39 * 60 + 59) * SEC; // 15:39:59
+        let row = ShadowSealRow::from_buffered_seal(&seal_with_receipts(
+            TfIndex::M60,
+            bucket,
+            i64::from(bucket) * SEC + SEC,
+            last,
+        ));
+        assert_eq!(row.close_latency_ns, Some(SEC));
+        // A mid-session M60 bar is NOT clamped.
+        let mid = DAY + 10 * 3600;
+        let row = ShadowSealRow::from_buffered_seal(&seal_with_receipts(
+            TfIndex::M60,
+            mid,
+            i64::from(mid) * SEC,
+            i64::from(mid) * SEC + 3599 * SEC,
+        ));
+        assert_eq!(row.close_latency_ns, Some(SEC));
     }
 }

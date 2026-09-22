@@ -2049,13 +2049,21 @@ pub async fn load_contract_universe(
                  set — the ranking cannot see any subscribed contract"
             );
         }
-        // Labels come from the SAME `&[ContractRow]` the legs came from, in the
-        // same pass, so the two snapshots can never describe different contract
-        // sets. Published BEFORE the owner map: the projection only reads a
-        // label for a contract the leaderboard already tracks, and the
-        // leaderboard only tracks what the owner map admits — so this order
-        // means a label is always present by the time anything can ask for it.
-        let labels = crate::contract_underlying_map::labels_from_artifact(&contracts);
+        // Labels come from the SAME `&[ContractRow]` the legs came from, with
+        // the SAME selected-first priority, so under the shared 25,000 cap a
+        // subscribed contract is labelled whenever the owner map admits it.
+        // (Until 2026-09-22 this walked the artifact in FILE order, and every
+        // subscribed option past row 25,000 wrote candles with a NULL
+        // `contract`; the comment here claimed the two maps could never
+        // differ.) They can still differ on a contract the owner map REFUSES
+        // for a reason this pass cannot see (unresolved underlying, no lot
+        // size) — an extra label, which is harmless. Published BEFORE the
+        // owner map: the projection only reads a label for a contract the
+        // leaderboard already tracks.
+        let labels = crate::contract_underlying_map::labels_from_artifact_selected_first(
+            &contracts,
+            &selection.instruments,
+        );
         // The candle writer fills `candles_<tf>.contract` from the SAME names,
         // re-keyed into the row's own `(security_id, segment-string)` shape
         // (storage cannot see this crate's map). Built from the same table in
