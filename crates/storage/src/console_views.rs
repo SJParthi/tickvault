@@ -329,7 +329,16 @@ mod tests {
             pg_port: 1,
             ilp_port: 1,
         };
-        // Must return (transport arm per view), never panic.
-        drop_retired_views(&cfg).await;
+        // Must RETURN through the transport arm for every view — a sweep
+        // that hangs on a dead QuestDB would stall the boot DDL step behind
+        // it. Bounded by one request timeout per view plus one of slack.
+        let per_view = Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS);
+        let views = u32::try_from(RETIRED_CONSOLE_VIEWS.len()).unwrap_or(u32::MAX);
+        let bound = per_view.saturating_mul(views.saturating_add(1));
+        let finished = tokio::time::timeout(bound, drop_retired_views(&cfg)).await;
+        assert!(
+            finished.is_ok(),
+            "the retired-view sweep did not return within {bound:?} against a dead port"
+        );
     }
 }
