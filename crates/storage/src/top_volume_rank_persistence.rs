@@ -3310,7 +3310,7 @@ mod tests {
     /// The four CREATEs are identical apart from the table name — one schema,
     /// four tables. A column added to one and not the others is caught here.
     #[test]
-    fn the_four_tables_share_one_schema_byte_for_byte() {
+    fn top_volume_create_ddl_is_one_schema_byte_for_byte_across_the_four_tables() {
         let normalised: Vec<String> = SnapshotCadence::ALL
             .iter()
             .map(|c| top_volume_create_ddl(*c).replace(c.table_name(), "T"))
@@ -3335,7 +3335,7 @@ mod tests {
     /// Every self-heal statement for a cadence names THAT cadence's table and
     /// no other; none drops anything; DEDUP ENABLE is last.
     #[test]
-    fn each_tables_self_heal_touches_only_that_table_and_never_drops() {
+    fn top_volume_ensure_statements_touch_only_that_table_and_never_drop() {
         for c in SnapshotCadence::ALL {
             let statements = top_volume_ensure_statements(c);
             assert_eq!(statements.len(), TOP_VOLUME_RANK_COLUMNS.len() + 2);
@@ -3363,7 +3363,7 @@ mod tests {
 
     /// The pre-drop removes a same-named legacy VIEW only — never a table.
     #[test]
-    fn the_view_predrop_drops_a_view_never_a_table() {
+    fn top_volume_view_predrop_ddl_drops_a_view_never_a_table() {
         for c in SnapshotCadence::ALL {
             let sql = top_volume_view_predrop_ddl(c);
             assert_eq!(sql, format!("DROP VIEW IF EXISTS {};", c.table_name()));
@@ -3375,7 +3375,7 @@ mod tests {
     /// (a CREATE against a name that is still a view creates nothing), and
     /// does not count the pre-drop's refusal as a failure.
     #[test]
-    fn the_ensure_fn_predrops_the_view_before_creating_and_tolerates_its_refusal() {
+    fn ensure_top_volume_tables_predrops_the_view_before_creating_and_tolerates_its_refusal() {
         let src = include_str!("top_volume_rank_persistence.rs");
         let prod = src.split("#[cfg(test)]").next().unwrap_or("");
         let body_start = prod
