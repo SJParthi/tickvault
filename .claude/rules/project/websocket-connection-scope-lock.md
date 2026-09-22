@@ -7742,3 +7742,30 @@ Per tick and per lookup the lane stays O(1) and allocation-free (DHAT-gated). NO
 - Lengthens the in-session catch-up budget back toward 300 s.
 - Adds an alarm, EMF name or page for any of the above without a lever.
 - Lowers `MemoryHigh` below 20G citing this section.
+
+### 2026-09-22 (FIFTH) — the contract name reaches spots, indices and `market_depth`; the last "your call" rows are closed
+
+**The verbatim operator demand (2026-09-22, typed directly in-session — preserve EXACTLY, typos included):**
+
+> "Dude I don't want any gaps or partial or any issues dude I clealry told you to fix and resolve everything dude and then merge and deploy it as well dude okay?"
+
+Given in DIRECT response to a published comparison page whose rows included, verbatim, *"Contract name on spot / index ticks — Gap — Those rows leave the name blank today"* and *"Contract name on market_depth — Your call — About 1.5 billion rows a session: adding a text column there costs real disk. Held until you decide."* The operator was shown both rows with their cost and answered "no gaps". That is the §28.2/§28.3 authorization shape, and it is the operator decision the (SECOND) section above said `market_depth` was waiting for. Recorded HERE before the code.
+
+#### What this authorizes
+
+| # | Change | Cost, stated |
+|---|---|---|
+| 1 | **Spot and index rows carry a name.** The day's mapping-artifact symbol map is turned into `(security_id, segment) -> symbol` for IDX_I / NSE_EQ / BSE_EQ only and merged into the SAME name table the candle and tick writers already read. Published at boot (if-empty, so it can never wipe option names) and again with the options at contract attach | Zero per-row cost change: the same one load + one hash probe per row already paid for options |
+| 2 | **`market_depth` gains `contract SYMBOL`.** Filled from the same table, resolved once per depth PACKET (never per level) and handed to every level row as a borrowed `&str` | Disk: a SYMBOL column is stored as a 4-byte key, ~1.53 B rows x 4 B = **~6 GB per session**, about 5.5% of the ~110 GB logical depth rows. ILP wire: each depth row now carries the name text (~20-25 bytes) to QuestDB — roughly **+25-30% of depth ILP payload**. That load lands on the depth WRITER THREAD, which has been off the frame drain since 2026-08-28, so a slower depth write backs up into the depth spill tier (recoverable), not into tick loss |
+
+#### ⚠ Honest envelope
+
+A name is never fabricated: an id absent from both the symbol map and the option table still writes NULL. Futures carry no name (they are no longer subscribed). The mapping artifact is written by the 08:30 daily rider; a boot that finds no artifact publishes nothing and the column stays NULL until the attach. NOT claimed: that the extra depth ILP bytes are free — they are the one real cost here and the depth spill counters are the read-out. NOT claimed: any dollar change — none (no instance, volume or IOPS change).
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Resolves the depth name per LEVEL instead of per packet (200x the probes on depth-200).
+- Allocates the name per row (`to_string`, `format!`) instead of borrowing it from the published snapshot.
+- Lets the boot publish REPLACE a non-empty table (wipes option names mid-session).
+- Gives a derivative id a spot's name because the numeric ids match (I-P1-11).
+- Adds `contract` to any DEDUP key — it is a label, never part of identity.

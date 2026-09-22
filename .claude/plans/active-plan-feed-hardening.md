@@ -5808,13 +5808,15 @@ open is what would show the lane survived the floor's removal.
 
 Authority: `websocket-connection-scope-lock.md` "2026-09-22 (FOURTH)" (operator quote recorded there). Crates: `crates/app` (dhan_feed_stack.rs), `crates/core` (websocket/pool_supervisor.rs), `crates/storage` (fresh_start_reset.rs, ws_frame_spill.rs, top_volume_rank_persistence.rs, tick_persistence.rs, depth_persistence.rs).
 
-- [ ] 44a — in-session catch-up budget (dhan_feed_stack.rs)
-- [ ] 44b — unknown packet skip validated by the next header (dhan_feed_stack.rs drain)
-- [ ] 44c — fresh-start reset renames rather than drops post-first-boot rows; DROP VIEW IF EXISTS (fresh_start_reset.rs)
-- [ ] 44d — WAL age prune respects the applied watermark; byte prune counts unapplied deletions (ws_frame_spill.rs)
-- [ ] 44e — top_volume per-row append moves to the writer thread (top_volume_rank_persistence.rs + dhan_feed_stack.rs)
-- [ ] 44f — socket reader never waits on swap wire writes (pool_supervisor.rs)
-- [ ] 44g — flush-path counters pre-resolved; ILP buffers recycled (tick_persistence.rs, depth_persistence.rs)
+- [x] 44a — in-session catch-up budget (dhan_feed_stack.rs)
+- [x] 44b — unknown packet skip validated by the next header (dhan_feed_stack.rs drain)
+- [x] 44c — fresh-start reset renames rather than drops post-first-boot rows; DROP VIEW IF EXISTS (fresh_start_reset.rs)
+- [x] 44d — WAL age prune respects the applied watermark; byte prune counts unapplied deletions (ws_frame_spill.rs)
+- [x] 44e — top_volume per-row append moves to the writer thread (top_volume_rank_persistence.rs + dhan_feed_stack.rs)
+- [x] 44f — socket reader never waits on swap wire writes (pool_supervisor.rs)
+- [x] 44g — flush-path counters pre-resolved; ILP buffers recycled (tick_persistence.rs, depth_persistence.rs)
+- [x] 44h — spot and index rows carry a contract name (dhan_contract_universe.rs, candle_contract_labels.rs, main.rs) — scope lock "2026-09-22 (FIFTH)"
+- [x] 44i — market_depth gains a contract SYMBOL, resolved once per packet (depth_persistence.rs) — scope lock "2026-09-22 (FIFTH)"
 
 ### Design
 

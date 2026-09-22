@@ -2881,6 +2881,18 @@ async fn async_main() -> Result<()> {
     )
     .await;
 
+    // Spot and index names for `ticks.contract` / `candles_<tf>.contract`
+    // BEFORE the lane dials, so the 09:00 pre-open index ticks carry one. The
+    // contract attach later replaces the table with spots + options; this
+    // publish only fills an EMPTY table, so it can never wipe option names.
+    let spot_names = tickvault_app::dhan_contract_universe::publish_spot_contract_labels_at_boot(
+        &universe_date_ist,
+    );
+    info!(
+        spot_contract_names = spot_names,
+        "spot and index contract names published at boot"
+    );
+
     // Give the lane the `/health` websocket reporter BEFORE it dials, so the
     // first socket that comes up is the one that arms the row.
     //

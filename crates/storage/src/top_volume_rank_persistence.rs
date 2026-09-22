@@ -195,6 +195,7 @@ use tracing::{debug, error, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::error_code::ErrorCode;
+use tickvault_common::types::ExchangeSegment;
 
 /// The per-timeframe DIRECT tables — one per [`SnapshotCadence`].
 ///
@@ -1967,6 +1968,405 @@ impl TopVolumeRankWriterSink {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Off-drain ROW hand-off for top_volume (2026-09-22, item 44e)
+// ---------------------------------------------------------------------------
+//
+// Until 2026-09-22 the drain moved the network off its task but still did the
+// per-row ILP APPEND itself: float formatting, symbol escaping and the delay
+// renderer for every row, measured at 14,932 µs for a 20,220-row sweep --
+// 14.5x the sort it followed. The split below moves the append too. The drain
+// now copies plain row DATA into a pre-sized, recycled `Vec` and hands it over
+// with one `try_send`; the writer thread resolves each contract label, appends
+// the ILP line and flushes. Nothing on the drain formats a byte.
+
+/// Depth of the row hand-off queue: every cadence plus one.
+///
+/// All four cadences (1s/3s/5s/1m) can hand off in the SAME drain tick at the
+/// top of a minute. A depth equal to the cadence count (the first version,
+/// which borrowed the flush queue's four) dropped the last sweep of that
+/// tick whenever even one earlier batch was still queued — usually the 1m
+/// sweep (2026-09-22 hostile review). One spare slot absorbs that tick.
+pub const TOP_VOLUME_ROW_QUEUE_DEPTH: usize = SnapshotCadence::ALL.len() + 1;
+
+const _: () = assert!(
+    TOP_VOLUME_ROW_QUEUE_DEPTH > SnapshotCadence::ALL.len(),
+    "one drain tick hands off every cadence at once; the queue must hold them all"
+);
+
+/// Spare row vectors the writer thread returns for reuse. Queue depth plus the
+/// one in flight plus the one being filled: enough that the steady state never
+/// allocates, bounded so a stalled drain cannot pile vectors up.
+const TOP_VOLUME_ROW_RECYCLE_DEPTH: usize = TOP_VOLUME_ROW_QUEUE_DEPTH + 2;
+
+/// The day's contract labels, keyed exactly as the app's label snapshot is:
+/// `(security_id, segment)` per I-P1-11. A type ALIAS rather than a new type,
+/// so the drain hands over the SAME `Arc` its projection just read and the
+/// writer thread resolves every row against the identical snapshot.
+pub type TopVolumeLabelMap = std::collections::HashMap<(u64, ExchangeSegment), std::sync::Arc<str>>;
+
+/// A snapshot row staged on the drain: every column EXCEPT the contract label,
+/// which the writer thread resolves from the batch's label snapshot.
+///
+/// A newtype over a row whose label is empty, never the row itself, so an
+/// unresolved row cannot be appended by mistake: the only way back to an
+/// appendable [`TopVolumeRankRow`] is [`TopVolumeStagedRow::with_contract`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct TopVolumeStagedRow {
+    row: TopVolumeRankRow<'static>,
+}
+
+impl TopVolumeStagedRow {
+    /// Copies a projected row's data. O(1), no allocation: every field is a
+    /// scalar or a `&'static str`, and the borrowed label is dropped here.
+    ///
+    /// Written field by field, without `..`, so a column added to the row
+    /// fails to compile here instead of being silently lost on the way to
+    /// the writer thread.
+    #[must_use]
+    pub fn from_row(r: &TopVolumeRankRow<'_>) -> Self {
+        Self {
+            row: TopVolumeRankRow {
+                snapshot_ts_ist_nanos: r.snapshot_ts_ist_nanos,
+                cadence: r.cadence,
+                family: r.family,
+                feed: r.feed,
+                segment: r.segment,
+                contract: "",
+                security_id: r.security_id,
+                underlying_id: r.underlying_id,
+                per_lot_quantity: r.per_lot_quantity,
+                total_lots_traded: r.total_lots_traded,
+                volume_percentage_change: r.volume_percentage_change,
+                volume: r.volume,
+                percentage_change: r.percentage_change,
+                open_percentage_change: r.open_percentage_change,
+                subscribed: r.subscribed,
+            },
+        }
+    }
+
+    /// The appendable row, carrying `contract` as its label.
+    #[must_use]
+    pub fn with_contract<'b>(&self, contract: &'b str) -> TopVolumeRankRow<'b> {
+        let r = &self.row;
+        TopVolumeRankRow {
+            snapshot_ts_ist_nanos: r.snapshot_ts_ist_nanos,
+            cadence: r.cadence,
+            family: r.family,
+            feed: r.feed,
+            segment: r.segment,
+            contract,
+            security_id: r.security_id,
+            underlying_id: r.underlying_id,
+            per_lot_quantity: r.per_lot_quantity,
+            total_lots_traded: r.total_lots_traded,
+            volume_percentage_change: r.volume_percentage_change,
+            volume: r.volume,
+            percentage_change: r.percentage_change,
+            open_percentage_change: r.open_percentage_change,
+            subscribed: r.subscribed,
+        }
+    }
+
+    /// The label-snapshot key, rebuilt from the row's own id and segment
+    /// symbol. `None` for a negative id or a segment symbol no
+    /// [`ExchangeSegment`] renders -- neither is reachable from a projected
+    /// row, and both resolve to the unlabelled fallback rather than a guess.
+    fn label_key(&self) -> Option<(u64, ExchangeSegment)> {
+        let id = u64::try_from(self.row.security_id).ok()?;
+        Some((id, segment_from_symbol(self.row.segment)?))
+    }
+}
+
+/// The [`ExchangeSegment`] whose `as_str()` is `symbol`. Bounded scan of the
+/// wire codes 0..=8 (the enum has eight variants and a gap at 6), so O(1).
+fn segment_from_symbol(symbol: &str) -> Option<ExchangeSegment> {
+    (0_u8..=8)
+        .filter_map(ExchangeSegment::from_byte)
+        .find(|seg| seg.as_str() == symbol)
+}
+
+/// The label for one staged row: the snapshot's entry, or `unlabelled`.
+fn resolve_label<'m>(
+    labels: &'m TopVolumeLabelMap,
+    staged: &TopVolumeStagedRow,
+    unlabelled: &'m str,
+) -> &'m str {
+    staged
+        .label_key()
+        .and_then(|key| labels.get(&key))
+        .map_or(unlabelled, AsRef::as_ref)
+}
+
+/// One sweep's staged rows on their way to the writer thread.
+pub struct TopVolumeRowBatch {
+    labels: std::sync::Arc<TopVolumeLabelMap>,
+    rows: Vec<TopVolumeStagedRow>,
+}
+
+impl TopVolumeRowBatch {
+    /// Rows this batch carries.
+    #[must_use]
+    // TEST-EXEMPT: accessor, exercised by the row hand-off tests below.
+    pub fn rows(&self) -> usize {
+        self.rows.len()
+    }
+}
+
+/// What happened to a sweep the drain tried to hand off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopVolumeHandoff {
+    /// Nothing was staged; nothing was sent.
+    Empty,
+    /// Handed to the writer thread.
+    Sent(usize),
+    /// The queue was full. Rows DROPPED, counted and logged -- never retained,
+    /// never waited for (a snapshot is a periodic sample, not a unique event).
+    QueueFull(usize),
+    /// The writer thread is gone. Rows DROPPED, counted and logged.
+    SinkGone(usize),
+}
+
+/// The drain half of the row hand-off. Holds no ILP buffer and no `Sender`.
+pub struct TopVolumeRowProducer {
+    tx: std::sync::mpsc::SyncSender<TopVolumeRowBatch>,
+    spares: std::sync::mpsc::Receiver<Vec<TopVolumeStagedRow>>,
+    rows: Vec<TopVolumeStagedRow>,
+    discard_episodes: usize,
+}
+
+impl TopVolumeRowProducer {
+    fn with_channels(
+        tx: std::sync::mpsc::SyncSender<TopVolumeRowBatch>,
+        spares: std::sync::mpsc::Receiver<Vec<TopVolumeStagedRow>>,
+    ) -> Self {
+        metrics::counter!("tv_top_volume_rank_rows_discarded_total").increment(0);
+        metrics::counter!("tv_top_volume_rank_flush_offloaded_total").increment(0);
+        metrics::counter!("tv_top_volume_rank_flush_queue_full_total").increment(0);
+        Self {
+            tx,
+            spares,
+            rows: Vec::with_capacity(TOP_VOLUME_MAX_ROWS_PER_SWEEP),
+            discard_episodes: 0,
+        }
+    }
+
+    /// Test producer whose queue is open, with the receiving end returned.
+    #[must_use]
+    // TEST-EXEMPT: test-only constructor for the app crate's snapshot tests.
+    pub fn for_test() -> (Self, std::sync::mpsc::Receiver<TopVolumeRowBatch>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(TOP_VOLUME_ROW_QUEUE_DEPTH);
+        let (_spare_tx, spare_rx) = std::sync::mpsc::sync_channel(TOP_VOLUME_ROW_RECYCLE_DEPTH);
+        (Self::with_channels(tx, spare_rx), rx)
+    }
+
+    /// Stages one projected row. O(1), a copy into a pre-sized vector.
+    ///
+    /// Refuses -- and counts the refusal as a discard -- past
+    /// `TOP_VOLUME_MAX_ROWS_PER_SWEEP` rows, so the vector never grows past
+    /// its pre-sized capacity and the drain never reallocates.
+    pub fn stage(&mut self, row: &TopVolumeRankRow<'_>) -> bool {
+        if self.rows.len() >= TOP_VOLUME_MAX_ROWS_PER_SWEEP {
+            self.count_discard(1, "the sweep exceeded its row bound");
+            return false;
+        }
+        self.rows.push(TopVolumeStagedRow::from_row(row));
+        true
+    }
+
+    /// Rows staged and not yet handed off.
+    #[must_use]
+    // TEST-EXEMPT: observability accessor, exercised by the hand-off tests below.
+    pub fn pending(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Hands the staged rows to the writer thread with ONE `try_send`.
+    ///
+    /// Never blocks: a blocking send would re-create the drain coupling the
+    /// split exists to remove. A full queue DROPS the sweep and counts it on
+    /// the discard series -- it does not retain it for a later sweep, because
+    /// the next sweep re-ranks the whole board anyway.
+    pub fn hand_off(&mut self, labels: std::sync::Arc<TopVolumeLabelMap>) -> TopVolumeHandoff {
+        let rows = self.rows.len();
+        if rows == 0 {
+            return TopVolumeHandoff::Empty;
+        }
+        let batch = TopVolumeRowBatch {
+            labels,
+            rows: std::mem::take(&mut self.rows),
+        };
+        match self.tx.try_send(batch) {
+            Ok(()) => {
+                metrics::counter!("tv_top_volume_rank_flush_offloaded_total").increment(1);
+                // Steady state: a vector the writer returned. Only when none
+                // has come back yet (the first sweeps, or a writer that is
+                // behind) is a fresh one pre-sized -- once per sweep at most,
+                // never per row.
+                self.rows = self
+                    .spares
+                    .try_recv()
+                    .unwrap_or_else(|_| Vec::with_capacity(TOP_VOLUME_MAX_ROWS_PER_SWEEP));
+                TopVolumeHandoff::Sent(rows)
+            }
+            Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                metrics::counter!("tv_top_volume_rank_flush_queue_full_total").increment(1);
+                self.reclaim(returned);
+                self.count_discard(rows, "the writer queue was full");
+                TopVolumeHandoff::QueueFull(rows)
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(returned)) => {
+                self.reclaim(returned);
+                self.count_discard(rows, "the writer thread is gone");
+                TopVolumeHandoff::SinkGone(rows)
+            }
+        }
+    }
+
+    /// Drops staged rows that will never be handed off, counts and logs them.
+    /// Called at shutdown, the one moment nothing else hands them off.
+    pub fn discard_pending(&mut self) -> usize {
+        let dropped = self.rows.len();
+        self.rows.clear();
+        self.count_discard(dropped, "the lane shut down with rows staged");
+        dropped
+    }
+
+    /// Takes the vector back so its capacity is reused, then empties it.
+    fn reclaim(&mut self, returned: TopVolumeRowBatch) {
+        let mut rows = returned.rows;
+        rows.clear();
+        self.rows = rows;
+    }
+
+    fn count_discard(&mut self, dropped: usize, why: &'static str) {
+        if dropped == 0 {
+            return;
+        }
+        metrics::counter!("tv_top_volume_rank_rows_discarded_total").increment(dropped as u64);
+        self.discard_episodes = self.discard_episodes.saturating_add(1);
+        // Powers of two, as in `discard_pending` above: a dead writer thread
+        // turns every sweep into an episode, and the onset and the magnitude
+        // are what an operator needs, not thousands of identical lines.
+        if self.discard_episodes.is_power_of_two() {
+            error!(
+                episodes = self.discard_episodes,
+                code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+                metric = "tv_top_volume_rank_rows_discarded_total",
+                dropped,
+                why,
+                "STORAGE-GAP-03: top_volume_rank rows discarded before reaching \
+                 the writer thread -- the ranking record has a hole for those \
+                 snapshots. No tick is lost by this: the leaderboard is in RAM \
+                 and the next snapshot rebuilds it."
+            );
+        }
+    }
+}
+
+/// What the writer thread did with one batch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TopVolumeBatchOutcome {
+    /// Rows the batch carried.
+    pub staged: usize,
+    /// Rows appended to the ILP buffer.
+    pub appended: usize,
+    /// Rows the ILP buffer refused at append time.
+    pub append_failed: usize,
+    /// Rows that LANDED in QuestDB (zero on any flush failure).
+    pub landed: usize,
+}
+
+/// The thread half of the row hand-off: formats ILP lines and flushes them.
+pub struct TopVolumeRowWriter {
+    formatter: TopVolumeRankWriter,
+    sink: TopVolumeRankWriterSink,
+    spares: std::sync::mpsc::SyncSender<Vec<TopVolumeStagedRow>>,
+    unlabelled: &'static str,
+}
+
+impl TopVolumeRowWriter {
+    /// Appends and flushes one batch, then returns its vector for reuse.
+    ///
+    /// Runs on the writer thread, never the drain: this is where the per-row
+    /// ILP formatting the drain used to pay now happens.
+    pub fn write_batch(&mut self, batch: TopVolumeRowBatch) -> TopVolumeBatchOutcome {
+        let TopVolumeRowBatch { labels, mut rows } = batch;
+        let mut out = TopVolumeBatchOutcome {
+            staged: rows.len(),
+            ..TopVolumeBatchOutcome::default()
+        };
+        for staged in &rows {
+            let contract = resolve_label(&labels, staged, self.unlabelled);
+            if self
+                .formatter
+                .append_row(&staged.with_contract(contract))
+                .is_ok()
+            {
+                out.appended = out.appended.saturating_add(1);
+            } else {
+                out.append_failed = out.append_failed.saturating_add(1);
+            }
+        }
+        if self.formatter.pending > 0 {
+            let protocol = self.formatter.buffer.protocol_version();
+            let mut flush = TopVolumeFlushBatch {
+                buffer: std::mem::replace(&mut self.formatter.buffer, Buffer::new(protocol)),
+                rows: self.formatter.pending,
+            };
+            self.formatter.pending = 0;
+            out.landed = self.sink.write(&mut flush);
+            // The ILP buffer is recycled too: cleared, its capacity kept.
+            flush.buffer.clear();
+            self.formatter.buffer = flush.buffer;
+        }
+        rows.clear();
+        // Full or disconnected: the vector is simply dropped. Recycling is an
+        // optimisation, never a correctness path.
+        drop(self.spares.try_send(rows));
+        out
+    }
+}
+
+impl TopVolumeRankWriter {
+    /// Splits this writer into a drain-side ROW producer and a thread-side
+    /// row writer. Supersedes [`Self::split_for_offload`] on the lane: that
+    /// split moved the network off the drain, this one moves the per-row ILP
+    /// append off it as well.
+    ///
+    /// `unlabelled` is the label written when a row's contract has no entry in
+    /// the batch's label snapshot -- the same fallback the projection counts
+    /// as `label_unavailable`.
+    #[must_use]
+    pub fn split_rows_for_offload(
+        mut self,
+        unlabelled: &'static str,
+    ) -> (
+        TopVolumeRowProducer,
+        TopVolumeRowWriter,
+        std::sync::mpsc::Receiver<TopVolumeRowBatch>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(TOP_VOLUME_ROW_QUEUE_DEPTH);
+        let (spare_tx, spare_rx) = std::sync::mpsc::sync_channel(TOP_VOLUME_ROW_RECYCLE_DEPTH);
+        let sink = TopVolumeRankWriterSink {
+            sender: self.sender.take(),
+        };
+        self.offload = None;
+        let writer = TopVolumeRowWriter {
+            formatter: self,
+            sink,
+            spares: spare_tx,
+            unlabelled,
+        };
+        (
+            TopVolumeRowProducer::with_channels(tx, spare_rx),
+            writer,
+            rx,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2239,7 +2639,9 @@ mod tests {
         );
         // One lot is exactly zero change; below one lot is NEGATIVE, which is
         // the whole reason the change form was chosen over a ratio.
-        assert_eq!((1_000_i64 * 100 - 100_000) / 1_000, 0);
+        // `black_box` so clippy does not fold the one-lot case to a constant
+        // (`erasing_op`); the arithmetic is the point of the assertion.
+        assert_eq!((std::hint::black_box(1_000_i64) * 100 - 100_000) / 1_000, 0);
         assert!((500_i64 * 100 - 100_000) / 1_000 < 0);
     }
 
@@ -3401,6 +3803,170 @@ mod tests {
         assert!(
             between.contains("debug!"),
             "pre-drop refusal is logged at debug"
+        );
+    }
+}
+
+// 2026-09-22 — item 44e: the drain stages plain row data and the writer thread
+// does the per-row ILP append. These pin the hand-off contract.
+#[cfg(test)]
+mod row_handoff_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn row(security_id: i64) -> TopVolumeRankRow<'static> {
+        TopVolumeRankRow {
+            snapshot_ts_ist_nanos: 1_757_000_000_000_000_000,
+            cadence: SnapshotCadence::OneSecond,
+            family: "stock_option",
+            feed: "dhan",
+            segment: "NSE_FNO",
+            contract: "ignored-by-staging",
+            security_id,
+            underlying_id: 2885,
+            per_lot_quantity: 200,
+            total_lots_traded: 42,
+            volume_percentage_change: 4_150,
+            volume: Some(-8_500),
+            percentage_change: Some(1.25),
+            open_percentage_change: Some(-0.5),
+            subscribed: true,
+        }
+    }
+
+    fn labels() -> Arc<TopVolumeLabelMap> {
+        let mut m = TopVolumeLabelMap::new();
+        m.insert(
+            (7, ExchangeSegment::NseFno),
+            Arc::from("RELIANCE-25Sep2026-1400-CE"),
+        );
+        Arc::new(m)
+    }
+
+    #[test]
+    fn staging_keeps_every_column_and_drops_only_the_label() {
+        let original = row(7);
+        let staged = TopVolumeStagedRow::from_row(&original);
+        assert_eq!(staged.with_contract(original.contract), original);
+        assert_eq!(staged.with_contract("x").contract, "x");
+    }
+
+    #[test]
+    fn every_segment_symbol_round_trips() {
+        for code in 0_u8..=8 {
+            if let Some(seg) = ExchangeSegment::from_byte(code) {
+                assert_eq!(segment_from_symbol(seg.as_str()), Some(seg));
+            }
+        }
+        assert_eq!(segment_from_symbol("NOT_A_SEGMENT"), None);
+    }
+
+    #[test]
+    fn labels_resolve_from_the_snapshot_and_fall_back_when_absent() {
+        let map = labels();
+        let hit = TopVolumeStagedRow::from_row(&row(7));
+        let miss = TopVolumeStagedRow::from_row(&row(8));
+        let negative = TopVolumeStagedRow::from_row(&row(-1));
+        assert_eq!(
+            resolve_label(&map, &hit, "unmapped"),
+            "RELIANCE-25Sep2026-1400-CE"
+        );
+        assert_eq!(resolve_label(&map, &miss, "unmapped"), "unmapped");
+        assert_eq!(resolve_label(&map, &negative, "unmapped"), "unmapped");
+    }
+
+    #[test]
+    fn a_batch_round_trips_through_the_channel_and_its_vector_is_recycled() {
+        let (mut producer, mut writer, rx) =
+            TopVolumeRankWriter::for_test().split_rows_for_offload("unmapped");
+        for id in [7, 8, 9] {
+            assert!(producer.stage(&row(id)));
+        }
+        assert_eq!(producer.pending(), 3);
+        assert_eq!(producer.hand_off(labels()), TopVolumeHandoff::Sent(3));
+        assert_eq!(producer.pending(), 0);
+        let batch = rx.try_recv().expect("the batch must reach the writer end");
+        assert_eq!(batch.rows(), 3);
+        let outcome = writer.write_batch(batch);
+        assert_eq!(outcome.staged, 3);
+        assert_eq!(outcome.appended, 3);
+        assert_eq!(outcome.append_failed, 0);
+        // `for_test` has no ILP sender, so nothing LANDS -- and that must be
+        // reported as zero, never forged into a success.
+        assert_eq!(outcome.landed, 0);
+        // The writer returned the vector; the next sweep reuses it.
+        let spare = producer
+            .spares
+            .try_recv()
+            .expect("the vector must come back");
+        assert!(spare.is_empty());
+        assert!(spare.capacity() >= TOP_VOLUME_MAX_ROWS_PER_SWEEP);
+        assert_eq!(writer.formatter.pending(), 0);
+    }
+
+    #[test]
+    fn an_empty_sweep_sends_nothing() {
+        let (mut producer, _writer, rx) =
+            TopVolumeRankWriter::for_test().split_rows_for_offload("unmapped");
+        assert_eq!(producer.hand_off(labels()), TopVolumeHandoff::Empty);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_full_queue_drops_the_sweep_and_never_blocks() {
+        let (mut producer, _writer, _rx) =
+            TopVolumeRankWriter::for_test().split_rows_for_offload("unmapped");
+        for _ in 0..TOP_VOLUME_ROW_QUEUE_DEPTH {
+            assert!(producer.stage(&row(7)));
+            assert_eq!(producer.hand_off(labels()), TopVolumeHandoff::Sent(1));
+        }
+        assert!(producer.stage(&row(7)));
+        assert!(producer.stage(&row(8)));
+        // If this blocked, the test would hang rather than fail -- itself the
+        // assertion.
+        assert_eq!(producer.hand_off(labels()), TopVolumeHandoff::QueueFull(2));
+        assert_eq!(producer.pending(), 0, "dropped, never retained");
+        assert!(producer.rows.capacity() >= TOP_VOLUME_MAX_ROWS_PER_SWEEP);
+    }
+
+    #[test]
+    fn a_gone_writer_drops_the_sweep() {
+        let (mut producer, _writer, rx) =
+            TopVolumeRankWriter::for_test().split_rows_for_offload("unmapped");
+        drop(rx);
+        assert!(producer.stage(&row(7)));
+        assert_eq!(producer.hand_off(labels()), TopVolumeHandoff::SinkGone(1));
+        assert_eq!(producer.pending(), 0);
+    }
+
+    #[test]
+    fn staging_refuses_past_the_row_bound_without_reallocating() {
+        let (mut producer, _writer, _rx) =
+            TopVolumeRankWriter::for_test().split_rows_for_offload("unmapped");
+        let capacity = producer.rows.capacity();
+        for _ in 0..TOP_VOLUME_MAX_ROWS_PER_SWEEP {
+            assert!(producer.stage(&row(7)));
+        }
+        assert!(!producer.stage(&row(7)), "one past the bound is refused");
+        assert_eq!(producer.pending(), TOP_VOLUME_MAX_ROWS_PER_SWEEP);
+        assert_eq!(producer.rows.capacity(), capacity, "the vector never grew");
+        assert_eq!(producer.discard_pending(), TOP_VOLUME_MAX_ROWS_PER_SWEEP);
+        assert_eq!(producer.pending(), 0);
+    }
+
+    #[test]
+    fn the_hand_off_uses_try_send_and_never_a_blocking_send() {
+        let src = include_str!("top_volume_rank_persistence.rs");
+        let start = src
+            .find("pub fn hand_off(&mut self")
+            .expect("hand_off must exist");
+        let body = &src[start..];
+        let end = body.find("pub fn discard_pending").unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(body.contains(".try_send(batch)"));
+        assert!(
+            !body.contains(".send(batch)"),
+            "a blocking send re-couples the drain"
         );
     }
 }

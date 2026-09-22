@@ -355,6 +355,7 @@ pub fn market_depth_create_ddl() -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {MARKET_DEPTH_TABLE} (\
             feed SYMBOL, \
+            contract SYMBOL, \
             segment SYMBOL, \
             depth_kind SYMBOL, \
             side SYMBOL, \
@@ -373,6 +374,7 @@ pub fn market_depth_create_ddl() -> String {
 /// ALTERs.
 const MARKET_DEPTH_COLUMNS: &[(&str, &str)] = &[
     ("feed", "SYMBOL"),
+    ("contract", "SYMBOL"),
     ("segment", "SYMBOL"),
     ("depth_kind", "SYMBOL"),
     ("side", "SYMBOL"),
@@ -1054,6 +1056,28 @@ pub struct DepthWriter {
     /// queue was full. Bounded by [`MAX_DEPTH_RETAINED_FLUSH_SPANS`] so
     /// backpressure cannot silently widen a commit without limit.
     retained_spans: u32,
+    /// Flush-path counter handles, resolved once at construction
+    /// (2026-09-22, item 44g) — see [`DepthFlushCounters`].
+    flush_counters: DepthFlushCounters,
+    /// Spent buffers coming back from the writer thread for reuse
+    /// (2026-09-22, item 44g). `Some` only once [`DepthWriter::split_for_offload`]
+    /// has run; see [`DepthWriterSink::return_spare_buffer`].
+    spare_buffers: Option<std::sync::mpsc::Receiver<Buffer>>,
+    /// The contract name resolved for the LAST `(security_id, segment)` this
+    /// writer appended (2026-09-22, item 44i).
+    ///
+    /// A depth packet carries 40 (depth-20) or 400 (depth-200) level rows for
+    /// ONE instrument, appended back to back. Resolving the name per level
+    /// would be an `ArcSwap` load plus a hash probe per row on the writer
+    /// that carries ~1.5e9 rows a session; caching on the key makes it one
+    /// resolution per run of rows for an instrument — once per packet — and
+    /// a plain two-field compare on every other level. The name is an
+    /// `Arc<str>` clone of the published entry, so a hit allocates nothing
+    /// and a miss increments one reference count.
+    ///
+    /// Cleared on every flush, so a table republished mid-session is picked
+    /// up at the next batch at the latest.
+    contract_label: Option<(i64, &'static str, Option<std::sync::Arc<str>>)>,
 }
 
 /// A unique temp spill directory, so a test writer never touches
@@ -1149,6 +1173,9 @@ impl DepthWriter {
                     offload: None,
                     rescue: None,
                     retained_spans: 0,
+                    flush_counters: DepthFlushCounters::new(feed),
+                    spare_buffers: None,
+                    contract_label: None,
                 }
             }
             Err(err) => {
@@ -1173,6 +1200,9 @@ impl DepthWriter {
                     offload: None,
                     rescue: None,
                     retained_spans: 0,
+                    flush_counters: DepthFlushCounters::new(feed),
+                    spare_buffers: None,
+                    contract_label: None,
                 }
             }
         }
@@ -1203,6 +1233,9 @@ impl DepthWriter {
             offload: None,
             rescue: None,
             retained_spans: 0,
+            flush_counters: DepthFlushCounters::new(feed),
+            spare_buffers: None,
+            contract_label: None,
         }
     }
 
@@ -1471,7 +1504,37 @@ impl DepthWriter {
             .symbol("side", row.side)
             .context("side")?
             .symbol("feed", feed)
-            .context("feed")?
+            .context("feed")?;
+        // `contract` — the instrument's NAME, from the same published table the
+        // tick and candle writers read (operator 2026-09-22, item 44i). Resolved
+        // once per instrument run, not per level; see `contract_label`. It is
+        // NOT part of the DEDUP key — two rows for one level must never become
+        // distinct because a name was published between them. Written only
+        // when the table knows this exact `(security_id, segment)`, otherwise
+        // OMITTED so the cell reads NULL — never a guessed name. Unlike the four
+        // symbols above this value comes from the day's artifact rather than a
+        // closed set, so it goes through `sanitize_ilp_symbol`, which borrows
+        // (no allocation) unless the name actually needs escaping.
+        let hit = matches!(
+            &self.contract_label,
+            Some((id, seg, _)) if *id == row.security_id && *seg == row.segment
+        );
+        if !hit {
+            let labels = crate::candle_contract_labels::candle_contract_labels();
+            let name = labels
+                .get(&(row.security_id, row.segment))
+                .map(std::sync::Arc::clone);
+            self.contract_label = Some((row.security_id, row.segment, name));
+        }
+        if let Some((_, _, Some(name))) = &self.contract_label {
+            self.buffer
+                .symbol(
+                    "contract",
+                    tickvault_common::sanitize::sanitize_ilp_symbol(name).as_ref(),
+                )
+                .context("contract")?;
+        }
+        self.buffer
             .column_i64("security_id", row.security_id)
             .context("security_id")?
             .column_i64("level", row.level)
@@ -1518,6 +1581,29 @@ impl DepthWriter {
     fn restore_pending_range(&mut self, range: (u64, u64)) {
         self.pending_min_seq = range.0;
         self.pending_max_seq = range.1;
+    }
+
+    /// Replaces the just-emptied buffer with a recycled spare from the writer
+    /// thread, when one is waiting (2026-09-22, item 44g).
+    ///
+    /// Called only after a hand-off SUCCEEDED, when `self.buffer` is the
+    /// zero-capacity `Buffer::new` the swap left behind (which never
+    /// allocated). Without this every batch regrew its ILP buffer from zero —
+    /// several reallocations per flush on the drain task, at the depth path's
+    /// ~2 MB batch size. A spare of another protocol version is dropped rather
+    /// than used, because the next batch must speak the protocol the sender
+    /// negotiated. `try_recv`, never `recv`: no spare simply means the next
+    /// append allocates as before.
+    fn install_spare_buffer(&mut self, protocol: ProtocolVersion) {
+        let Some(spares) = self.spare_buffers.as_ref() else {
+            return;
+        };
+        if let Ok(mut spare) = spares.try_recv()
+            && spare.protocol_version() == protocol
+        {
+            spare.clear();
+            self.buffer = spare;
+        }
     }
 
     /// Rescues every buffered-but-unflushed row to the depth spill tier, then
@@ -1593,11 +1679,7 @@ impl DepthWriter {
             };
             match tx.try_send(batch) {
                 Ok(()) => {
-                    metrics::counter!(
-                        DEPTH_RESCUE_QUEUED_COUNTER,
-                        "feed" => self.feed.as_str()
-                    )
-                    .increment(rows as u64);
+                    self.flush_counters.rescue_queued.increment(rows as u64);
                     crate::wal_applied_watermark::applied_watermark().note_depth_handed_off();
                     // Counted as rescued HERE, not on the thread, because the
                     // caller's log-wording branch reads this field one line
@@ -1608,25 +1690,18 @@ impl DepthWriter {
                     self.rescued = self.rescued.saturating_add(rows as u64);
                     self.pending = 0;
                     self.dropped = self.dropped.saturating_add(rows as u64);
+                    // The buffer left with the rescue batch; reuse a spare
+                    // from the writer thread instead of regrowing from zero.
+                    self.install_spare_buffer(protocol);
                     return rows;
                 }
                 Err(std::sync::mpsc::TrySendError::Full(returned)) => {
                     self.buffer = returned.buffer;
-                    metrics::counter!(
-                        DEPTH_RESCUE_INLINE_FALLBACK_COUNTER,
-                        "feed" => self.feed.as_str(),
-                        "reason" => "queue_full"
-                    )
-                    .increment(1);
+                    self.flush_counters.rescue_fallback_queue_full.increment(1);
                 }
                 Err(std::sync::mpsc::TrySendError::Disconnected(returned)) => {
                     self.buffer = returned.buffer;
-                    metrics::counter!(
-                        DEPTH_RESCUE_INLINE_FALLBACK_COUNTER,
-                        "feed" => self.feed.as_str(),
-                        "reason" => "thread_gone"
-                    )
-                    .increment(1);
+                    self.flush_counters.rescue_fallback_thread_gone.increment(1);
                 }
             }
         }
@@ -1674,13 +1749,21 @@ impl DepthWriter {
         std::sync::mpsc::Receiver<DepthFlushBatch>,
     ) {
         let (tx, rx) = std::sync::mpsc::sync_channel(DEPTH_FLUSH_QUEUE_DEPTH);
+        // The spare-buffer return lane is bounded by the SAME depth as the
+        // hand-off queue: at most that many buffers are ever in flight, so a
+        // deeper lane could never fill and a shallower one would drop spares
+        // the producer is about to need (2026-09-22, item 44g).
+        let (spare_tx, spare_rx) = std::sync::mpsc::sync_channel(DEPTH_FLUSH_QUEUE_DEPTH);
         let sink = DepthWriterSink {
             sender: self.sender.take(),
             feed: self.feed,
             spill_dir: self.spill_dir.clone(), // APPROVED: PathBuf moved into the offload writer, once per process at wiring
             spill_min_free_headroom: self.spill_min_free_headroom,
+            spare_return: Some(spare_tx),
+            counters: DepthSinkCounters::new(self.feed),
         };
         self.offload = Some(tx);
+        self.spare_buffers = Some(spare_rx);
         (self, sink, rx)
     }
     /// Hands the depth rescue write to a dedicated thread.
@@ -1763,11 +1846,11 @@ impl DepthWriter {
                 self.pending = 0;
                 self.retained_spans = 0;
                 crate::wal_applied_watermark::applied_watermark().note_depth_handed_off();
-                metrics::counter!(
-                    "tv_depth_flush_offloaded_total",
-                    "feed" => self.feed.as_str()
-                )
-                .increment(1);
+                self.flush_counters.offloaded.increment(1);
+                // Only NOW, after the send succeeded: on the Full arm below the
+                // retained buffer comes back into `self.buffer`, and a spare
+                // installed earlier would be discarded (2026-09-22, item 44g).
+                self.install_spare_buffer(protocol);
                 DepthOffloadOutcome::Sent(rows)
             }
             Err(std::sync::mpsc::TrySendError::Full(returned)) => {
@@ -1776,11 +1859,7 @@ impl DepthWriter {
                 // — the next flush retries. This arm is what makes the bounded
                 // queue safe: without it a full queue would either block the
                 // drain (the original defect) or drop rows (a worse one).
-                metrics::counter!(
-                    "tv_depth_flush_queue_full_total",
-                    "feed" => self.feed.as_str()
-                )
-                .increment(1);
+                self.flush_counters.queue_full.increment(1);
                 let held = returned.buffer.as_bytes().len();
                 self.buffer = returned.buffer;
                 self.retained_spans = self.retained_spans.saturating_add(1);
@@ -1794,11 +1873,7 @@ impl DepthWriter {
                 if self.retained_spans > MAX_DEPTH_RETAINED_FLUSH_SPANS
                     || held >= MAX_DEPTH_PRODUCER_BUFFER_BYTES
                 {
-                    metrics::counter!(
-                        "tv_depth_flush_width_capped_total",
-                        "feed" => self.feed.as_str()
-                    )
-                    .increment(1);
+                    self.flush_counters.width_capped.increment(1);
                     self.retained_spans = 0;
                     // Rescue rather than keep widening. Durable, counted, and
                     // re-ingestable — the same tier a failed flush uses.
@@ -1831,6 +1906,8 @@ impl DepthWriter {
     /// # Errors
     /// `Err` when disconnected or when the HTTP flush fails.
     pub fn flush(&mut self) -> Result<()> {
+        // A republished name table is picked up at the next batch at the latest.
+        self.contract_label = None;
         if self.pending == 0 {
             return Ok(());
         }
@@ -2342,6 +2419,80 @@ pub struct DepthWriterSink {
     feed: Feed,
     spill_dir: PathBuf,
     spill_min_free_headroom: u64,
+    /// Return lane for spent buffers — see [`DepthWriterSink::return_spare_buffer`].
+    spare_return: Option<std::sync::mpsc::SyncSender<Buffer>>,
+    /// Rescue-arm counter handles, resolved once at the split (item 44g).
+    counters: DepthSinkCounters,
+}
+
+/// Flush-path counter handles for the depth PRODUCER half, resolved once per
+/// writer (2026-09-22, item 44g).
+///
+/// Same mechanism as `OutOfWindowCounters`: a `feed` label taken from a
+/// variable drops the `metrics!` macro to its allocating arm (a fresh label
+/// vector plus a registry probe per call). The hand-off counter fired on EVERY
+/// depth flush, on the drain task. Names and labels are exactly the ones the
+/// call sites used before; the seeding in [`register_depth_drop_baseline`] is
+/// untouched.
+#[derive(Debug, Clone)]
+struct DepthFlushCounters {
+    offloaded: metrics::Counter,
+    queue_full: metrics::Counter,
+    width_capped: metrics::Counter,
+    rescue_queued: metrics::Counter,
+    rescue_fallback_queue_full: metrics::Counter,
+    rescue_fallback_thread_gone: metrics::Counter,
+}
+
+impl DepthFlushCounters {
+    fn new(feed: Feed) -> Self {
+        let feed = feed.as_str();
+        Self {
+            offloaded: metrics::counter!("tv_depth_flush_offloaded_total", "feed" => feed),
+            queue_full: metrics::counter!("tv_depth_flush_queue_full_total", "feed" => feed),
+            width_capped: metrics::counter!("tv_depth_flush_width_capped_total", "feed" => feed),
+            rescue_queued: metrics::counter!(DEPTH_RESCUE_QUEUED_COUNTER, "feed" => feed),
+            rescue_fallback_queue_full: metrics::counter!(
+                DEPTH_RESCUE_INLINE_FALLBACK_COUNTER,
+                "feed" => feed,
+                "reason" => "queue_full"
+            ),
+            rescue_fallback_thread_gone: metrics::counter!(
+                DEPTH_RESCUE_INLINE_FALLBACK_COUNTER,
+                "feed" => feed,
+                "reason" => "thread_gone"
+            ),
+        }
+    }
+}
+
+/// Rescue-arm counter handles for the depth writer-thread half (item 44g).
+/// `dropped` and `spilled` move together on a landed rescue and `dropped`
+/// alone on a failed one — the `dropped == spilled` proof is unchanged.
+#[derive(Debug, Clone)]
+struct DepthSinkCounters {
+    dropped: metrics::Counter,
+    spilled: metrics::Counter,
+    spill_error_cap: metrics::Counter,
+    spill_error_write: metrics::Counter,
+}
+
+impl DepthSinkCounters {
+    fn new(feed: Feed) -> Self {
+        let feed = feed.as_str();
+        Self {
+            dropped: metrics::counter!("tv_depth_rows_dropped_total", "feed" => feed),
+            spilled: metrics::counter!("tv_depth_rows_spilled_total", "feed" => feed),
+            spill_error_cap: metrics::counter!(
+                "tv_depth_spill_write_errors_total",
+                "stage" => "cap"
+            ),
+            spill_error_write: metrics::counter!(
+                "tv_depth_spill_write_errors_total",
+                "stage" => "write"
+            ),
+        }
+    }
 }
 
 impl DepthWriterSink {
@@ -2370,7 +2521,38 @@ impl DepthWriterSink {
         let wm = crate::wal_applied_watermark::applied_watermark();
         wm.note_depth_completed();
         wm.persist_if_due_now();
+        self.return_spare_buffer(batch);
         landed
+    }
+
+    /// Hands the batch's spent buffer back to the producer for reuse
+    /// (2026-09-22, item 44g). Called by [`DepthWriterSink::write`] once the
+    /// batch is done; `pub` only so the zero-allocation gate can drive the
+    /// recycle loop without a live QuestDB.
+    ///
+    /// Never blocks and never returns an unbounded buffer. The spent buffer is
+    /// dropped instead of returned when:
+    /// - this sink was not built by a split (no return lane);
+    /// - capacity above [`MAX_DEPTH_PRODUCER_BUFFER_BYTES`] — a burst-sized
+    ///   buffer kept as a spare would pin that memory for the session;
+    /// - the return lane is full — the producer already has spares;
+    /// - the producer is gone — nobody to return to.
+    ///
+    /// The buffer is cleared before it leaves, so a spare can never carry a
+    /// row into the next batch.
+    pub fn return_spare_buffer(&self, batch: &mut DepthFlushBatch) {
+        let Some(spare_return) = self.spare_return.as_ref() else {
+            return;
+        };
+        let protocol = batch.buffer.protocol_version();
+        // `Buffer::new` does not allocate (its `Vec` starts empty).
+        let mut spent = std::mem::replace(&mut batch.buffer, Buffer::new(protocol));
+        if spent.capacity() > MAX_DEPTH_PRODUCER_BUFFER_BYTES {
+            return;
+        }
+        spent.clear();
+        // Full or disconnected: the buffer is dropped here, never waited on.
+        let _dropped_if_refused = spare_return.try_send(spent);
     }
 
     fn write_inner(&mut self, batch: &mut DepthFlushBatch) -> usize {
@@ -2476,10 +2658,8 @@ impl DepthWriterSink {
         ) {
             Ok(path) => {
                 note_rescue_outcome_depth(true, (batch.min_seq, batch.max_seq), true);
-                metrics::counter!("tv_depth_rows_dropped_total", "feed" => self.feed.as_str())
-                    .increment(rows as u64);
-                metrics::counter!("tv_depth_rows_spilled_total", "feed" => self.feed.as_str())
-                    .increment(rows as u64);
+                self.counters.dropped.increment(rows as u64);
+                self.counters.spilled.increment(rows as u64);
                 error!(
                     code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                     feed = self.feed.as_str(),
@@ -2497,14 +2677,11 @@ impl DepthWriterSink {
             Err(err) => {
                 note_rescue_outcome_depth(false, (batch.min_seq, batch.max_seq), true);
                 if err.kind() == std::io::ErrorKind::StorageFull {
-                    metrics::counter!("tv_depth_spill_write_errors_total", "stage" => "cap")
-                        .increment(1);
+                    self.counters.spill_error_cap.increment(1);
                 } else {
-                    metrics::counter!("tv_depth_spill_write_errors_total", "stage" => "write")
-                        .increment(1);
+                    self.counters.spill_error_write.increment(1);
                 }
-                metrics::counter!("tv_depth_rows_dropped_total", "feed" => self.feed.as_str())
-                    .increment(rows as u64);
+                self.counters.dropped.increment(rows as u64);
                 error!(
                     code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                     feed = self.feed.as_str(),
@@ -2829,6 +3006,89 @@ mod tests {
         }
     }
 
+    fn publish_labels(pairs: &[((i64, &'static str), &str)]) {
+        let mut m = crate::candle_contract_labels::CandleContractLabels::new();
+        for (k, v) in pairs {
+            m.insert(*k, std::sync::Arc::<str>::from(*v));
+        }
+        crate::candle_contract_labels::publish_candle_contract_labels(m);
+    }
+
+    /// Item 44i: a known instrument carries its name as a SYMBOL (before any
+    /// field), an unknown one leaves the cell NULL, and the name is never in
+    /// the DEDUP key.
+    #[test]
+    fn market_depth_rows_carry_the_contract_name_only_when_the_table_knows_it() {
+        let _g = crate::candle_contract_labels::TEST_PUBLISH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_labels(&[((13, "IDX_I"), "NIFTY")]);
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        w.append_row(&row()).expect("append");
+        let line = w.buffer_utf8();
+        let first_field = line.find(' ').expect("fields");
+        let at = line
+            .find(",contract=NIFTY")
+            .expect("known contract must be named");
+        assert!(at < first_field, "contract must be a SYMBOL: {line}");
+
+        publish_labels(&[]);
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        w.append_row(&row()).expect("append");
+        let line = w.buffer_utf8();
+        assert!(
+            !line.contains("contract="),
+            "an unknown instrument must be NULL, never a guess: {line}"
+        );
+
+        assert!(
+            !DEDUP_KEY_MARKET_DEPTH.contains("contract"),
+            "a name must never make two rows for one level distinct"
+        );
+        assert!(market_depth_create_ddl().contains("contract SYMBOL"));
+    }
+
+    /// Item 44i: the name is resolved once per instrument run. A second row
+    /// for the SAME instrument reuses the cached name even if the table was
+    /// republished in between; a DIFFERENT instrument resolves afresh; a flush
+    /// clears the cache so the next batch sees the new table.
+    #[test]
+    fn market_depth_contract_name_is_resolved_once_per_instrument_run() {
+        let _g = crate::candle_contract_labels::TEST_PUBLISH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_labels(&[((13, "IDX_I"), "OLD"), ((25, "IDX_I"), "BANKNIFTY")]);
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        w.append_row(&row()).expect("level 1");
+        publish_labels(&[((13, "IDX_I"), "NEW"), ((25, "IDX_I"), "BANKNIFTY")]);
+        let mut level2 = row();
+        level2.level = 2;
+        w.append_row(&level2).expect("level 2");
+        let text = w.buffer_utf8();
+        assert_eq!(
+            text.matches(",contract=OLD").count(),
+            2,
+            "the same packet must not be named twice: {text}"
+        );
+
+        let mut other = row();
+        other.security_id = 25;
+        w.append_row(&other).expect("other instrument");
+        assert!(w.buffer_utf8().contains(",contract=BANKNIFTY"));
+
+        // Same numeric id on a different segment is a different instrument.
+        let mut other_seg = row();
+        other_seg.segment = "NSE_EQ";
+        w.append_row(&other_seg).expect("other segment");
+        let text = w.buffer_utf8();
+        let last = text.lines().last().expect("line");
+        assert!(!last.contains("contract="), "I-P1-11: {last}");
+
+        let _ = w.flush();
+        assert!(w.contract_label.is_none(), "flush must clear the cache");
+        publish_labels(&[]);
+    }
+
     #[test]
     fn append_row_stamps_the_kind_and_side_it_was_given() {
         let mut w = DepthWriter::for_test(Feed::Dhan);
@@ -2956,7 +3216,7 @@ mod tests {
         assert_eq!(w.discard_pending(), 1);
 
         assert!(
-            spill_files(&dir).len() > 0,
+            !spill_files(&dir).is_empty(),
             "with the queue full the rescue must have been written inline"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -2971,7 +3231,7 @@ mod tests {
 
         assert_eq!(w.discard_pending(), 1);
         assert!(
-            spill_files(&dir).len() > 0,
+            !spill_files(&dir).is_empty(),
             "no rescue channel means the old synchronous path, unchanged"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -2988,7 +3248,7 @@ mod tests {
         w.append_row(&row()).expect("append");
         assert_eq!(w.discard_pending(), 1);
         assert!(
-            spill_files(&dir).len() > 0,
+            !spill_files(&dir).is_empty(),
             "after close the rescue must still land on disk"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -3457,11 +3717,16 @@ mod tests {
         // +1 for `ts`, which is the designated timestamp and therefore not in
         // the ALTER column list.
         let derived = symbols * 4 + (wide + 1) * 8;
+        // 2026-09-22 (item 44i): `contract SYMBOL` joined the row, so the
+        // premise moved 72 -> 76 B/row. At the measured ~1.53e9 rows/session
+        // that is ~6.1 GB/session more on disk, recorded in the scope lock
+        // "2026-09-22 (FIFTH)" before the column landed. Every GB/day figure
+        // in this module's docs that says 72 B is now ~5.6% low.
         assert_eq!(
             (symbols, wide, derived),
-            (4, 6, 72),
-            "row-width premise drifted: the docs' GB/day table assumes 4 SYMBOL \
-             + 7 eight-byte columns = 72 B/row"
+            (5, 6, 76),
+            "row-width premise drifted: the storage estimate assumes 5 SYMBOL \
+             + 7 eight-byte columns = 76 B/row"
         );
     }
 
@@ -3485,6 +3750,147 @@ mod tests {
     // channel; the semantics are which arms report loss and which do not, and
     // getting that wrong is how a backpressure signal becomes a false loss
     // report (or, worse, how a real loss reports as healthy).
+
+    // ---- buffer recycling (2026-09-22, item 44g) -------------------------
+
+    /// A spent batch with a real, non-zero capacity, for the recycle tests.
+    fn spent_batch(capacity: usize) -> DepthFlushBatch {
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        buffer.reserve(capacity);
+        DepthFlushBatch {
+            buffer,
+            rows: 0,
+            min_seq: 0,
+            max_seq: 0,
+        }
+    }
+
+    #[test]
+    fn a_written_depth_buffer_round_trips_back_to_the_producer_empty() {
+        let (mut w, mut sink, rx) = DepthWriter::for_test(Feed::Dhan).split_for_offload();
+        w.append_row(&row()).expect("append");
+        w.flush().expect("hand off");
+
+        let mut batch = rx.try_recv().expect("batch queued");
+        let spent_capacity = batch.buffer.capacity();
+        assert!(spent_capacity > 0, "a batch that held a row has capacity");
+        // `write` rescues (no sender in for_test, temp spill dir) and then
+        // returns the buffer.
+        let _landed = sink.write(&mut batch);
+
+        w.append_row(&row()).expect("append");
+        w.flush().expect("second hand-off");
+        assert_eq!(
+            w.buffer.capacity(),
+            spent_capacity,
+            "the next batch must reuse the spent buffer, not regrow from zero"
+        );
+        assert!(
+            w.buffer.as_bytes().is_empty(),
+            "a recycled buffer must arrive EMPTY — a leftover level would be \
+             written twice"
+        );
+    }
+
+    #[test]
+    fn depth_return_spare_buffer_drops_every_buffer_it_must_not_return() {
+        // (case, capacity, pre-fill the lane, drop the producer, expect spares)
+        let cases: [(&str, usize, bool, bool, usize); 4] = [
+            ("normal buffer is returned", 1024, false, false, 1),
+            (
+                "oversized buffer is never returned",
+                MAX_DEPTH_PRODUCER_BUFFER_BYTES + 1,
+                false,
+                false,
+                0,
+            ),
+            (
+                "full lane drops the spare",
+                1024,
+                true,
+                false,
+                DEPTH_FLUSH_QUEUE_DEPTH,
+            ),
+            ("gone producer drops the spare", 1024, false, true, 0),
+        ];
+        for (case, capacity, prefill, drop_producer, expect) in cases {
+            let (producer, sink, _rx) = DepthWriter::for_test(Feed::Dhan).split_for_offload();
+            if prefill {
+                for _ in 0..DEPTH_FLUSH_QUEUE_DEPTH {
+                    sink.return_spare_buffer(&mut spent_batch(16));
+                }
+            }
+            let spares = if drop_producer {
+                drop(producer);
+                None
+            } else {
+                Some(producer)
+            };
+
+            let mut batch = spent_batch(capacity);
+            // Must return — never block — in every case.
+            sink.return_spare_buffer(&mut batch);
+
+            assert_eq!(
+                batch.buffer.capacity(),
+                0,
+                "{case}: the spent buffer always leaves the batch"
+            );
+            if let Some(p) = spares {
+                let lane = p.spare_buffers.as_ref().expect("split opens the lane");
+                let mut got = 0;
+                while let Ok(spare) = lane.try_recv() {
+                    assert!(spare.as_bytes().is_empty(), "{case}: spares are empty");
+                    assert!(
+                        spare.capacity() <= MAX_DEPTH_PRODUCER_BUFFER_BYTES,
+                        "{case}: no spare may exceed the producer bound"
+                    );
+                    got += 1;
+                }
+                assert_eq!(got, expect, "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_depth_spare_of_another_protocol_is_never_installed() {
+        let (mut w, sink, _rx) = DepthWriter::for_test(Feed::Dhan).split_for_offload();
+        let mut foreign = Buffer::new(ProtocolVersion::V2);
+        foreign.reserve(4096);
+        sink.spare_return
+            .as_ref()
+            .expect("split opens the lane")
+            .try_send(foreign)
+            .expect("lane has room");
+
+        w.append_row(&row()).expect("append");
+        w.flush().expect("hand off");
+
+        assert_eq!(
+            w.buffer.protocol_version(),
+            ProtocolVersion::V1,
+            "the next batch must speak the protocol the sender negotiated"
+        );
+        assert_eq!(w.buffer.capacity(), 0, "the foreign spare was dropped");
+    }
+
+    #[test]
+    fn a_full_depth_queue_does_not_swallow_a_waiting_spare() {
+        let (mut w, sink, _rx) = DepthWriter::for_test(Feed::Dhan).split_for_offload();
+        for _ in 0..DEPTH_FLUSH_QUEUE_DEPTH {
+            w.append_row(&row()).expect("append");
+            w.flush().expect("fills the queue");
+        }
+        sink.return_spare_buffer(&mut spent_batch(512));
+        w.append_row(&row()).expect("append");
+        w.flush().expect("backpressure is not a failure");
+        assert_eq!(w.pending(), 1, "the row is retained");
+        let lane = w.spare_buffers.as_ref().expect("lane");
+        assert!(
+            lane.try_recv().is_ok(),
+            "the spare must still be waiting — the Full arm must not take it"
+        );
+    }
 
     #[test]
     fn a_split_writer_hands_the_batch_to_the_queue_instead_of_the_network() {

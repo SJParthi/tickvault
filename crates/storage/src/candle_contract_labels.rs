@@ -26,9 +26,11 @@
 //!
 //! ## Honest limits
 //!
-//! * Only OPTION contracts carry a label (the app builds it from the `OPTIDX`
-//!   / `OPTSTK` rows). A spot, index or future candle writes NO `contract`, so
-//!   the column reads NULL there. A name is never fabricated.
+//! * Options carry their contract name; spots and indices carry the symbol the
+//!   day's mapping artifact gives them (added 2026-09-22 — before that they
+//!   were NULL). A future writes NO `contract` (futures are no longer
+//!   subscribed). A name is never fabricated: an id absent from both tables
+//!   stays NULL.
 //! * A seal re-ingested by the BOOT drain (spill/DLQ) can reach the writer
 //!   before the day's table is published. That bar is written with a NULL
 //!   `contract` — the same omission, never a guess.
@@ -61,6 +63,32 @@ pub fn publish_candle_contract_labels(labels: CandleContractLabels) -> usize {
     LABELS.store(Arc::new(labels));
     metrics::gauge!("tv_candle_contract_labels_published").set(n as f64);
     n
+}
+
+/// Publishes `labels` ONLY when the table is still empty, and returns whether
+/// it did.
+///
+/// The boot path publishes spot and index names so 09:00 pre-open index ticks
+/// carry a name before the contract attach runs. The attach later REPLACES the
+/// whole table with spots + options. If the boot publish could also replace,
+/// a slow boot racing a fast attach would wipe every option name for the rest
+/// of the session, so the boot publish is a compare-and-swap against empty.
+pub fn publish_candle_contract_labels_if_empty(labels: CandleContractLabels) -> bool {
+    let incoming = Arc::new(labels);
+    let mut stored = false;
+    LABELS.rcu(|current| {
+        if current.is_empty() {
+            stored = true;
+            Arc::clone(&incoming)
+        } else {
+            stored = false;
+            Arc::clone(current)
+        }
+    });
+    if stored {
+        metrics::gauge!("tv_candle_contract_labels_published").set(incoming.len() as f64);
+    }
+    stored
 }
 
 /// A snapshot of the current table. Hold it for the length of one row write.
@@ -100,6 +128,36 @@ mod tests {
         );
         // Same numeric id, different segment: a different instrument, no name.
         assert!(t.get(&(9_100_001, "NSE_EQ")).is_none());
+    }
+
+    #[test]
+    fn test_publish_candle_contract_labels_if_empty_never_overwrites_a_published_table() {
+        let _g = lock();
+        publish_candle_contract_labels(HashMap::new());
+        let mut boot = HashMap::new();
+        boot.insert((13, "IDX_I"), Arc::<str>::from("NIFTY"));
+        assert!(publish_candle_contract_labels_if_empty(boot));
+        assert_eq!(
+            candle_contract_labels().get(&(13, "IDX_I")).map(|s| &**s),
+            Some("NIFTY")
+        );
+
+        // The attach replaces the whole table with spots + options.
+        let mut attach = HashMap::new();
+        attach.insert((13, "IDX_I"), Arc::<str>::from("NIFTY"));
+        attach.insert((9_100_201, "NSE_FNO"), Arc::<str>::from("NIFTY-CE"));
+        publish_candle_contract_labels(attach);
+
+        // A late boot publish must NOT wipe the option name.
+        let mut late = HashMap::new();
+        late.insert((25, "IDX_I"), Arc::<str>::from("BANKNIFTY"));
+        assert!(!publish_candle_contract_labels_if_empty(late));
+        let t = candle_contract_labels();
+        assert_eq!(
+            t.get(&(9_100_201, "NSE_FNO")).map(|s| &**s),
+            Some("NIFTY-CE")
+        );
+        assert!(t.get(&(25, "IDX_I")).is_none());
     }
 
     #[test]

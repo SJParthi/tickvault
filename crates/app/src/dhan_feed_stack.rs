@@ -951,6 +951,40 @@ pub const PREV_CLOSE_WRONG_DAY_COUNTER: &str = "tv_prev_close_store_wrong_day_to
 /// the whole signal.
 pub const TOP_VOLUME_APPEND_FAILURE_COUNTER: &str = "tv_top_volume_rank_append_failed_total";
 
+/// Records one batch's ILP append refusals, on the top-volume WRITER THREAD.
+///
+/// Moved off the drain with the append itself on 2026-09-22 (item 44e). The
+/// count is still said out loud, not swallowed: a short snapshot otherwise
+/// reads exactly like a quiet minute. Throttled to the moments the running
+/// total crosses a power of two, which reports the onset at once and the
+/// magnitude without flooding -- the same shape the drain-side warn had, now
+/// fed a batch at a time rather than a row at a time.
+fn record_top_volume_append_failures(
+    total: &std::sync::atomic::AtomicU64,
+    counter: &metrics::Counter,
+    failed: usize,
+) {
+    if failed == 0 {
+        return;
+    }
+    let n = u64::try_from(failed).unwrap_or(u64::MAX);
+    let before = total.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    let after = before.saturating_add(n);
+    counter.increment(n);
+    if before == 0 || before.ilog2() != after.ilog2() {
+        // `counter` is a FIELD, not decoration: an operator who greps the
+        // counter name lands on this line. The surface is the LOG, not
+        // CloudWatch -- a WARN with its own source, invisible to every alarm.
+        warn!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            counter = TOP_VOLUME_APPEND_FAILURE_COUNTER,
+            source = "top_volume_append_failed",
+            failures = after,
+            "top_volume_rank: the ILP buffer refused snapshot rows. That sweep's snapshot is SHORT -- ranks are missing from the table and it reads exactly like a quiet minute. Ranking and depth steering are unaffected (both run from RAM); only the queryable record is incomplete."
+        );
+    }
+}
+
 /// Contracts a snapshot could not project into a storable row, by reason.
 ///
 /// Labelled `reason` with one series per [`SnapshotRefusal`], each pre-resolved
@@ -1282,7 +1316,10 @@ pub struct LiveIngest {
     /// Pre-resolved handle for [`PREV_CLOSE_WRONG_DAY_COUNTER`].
     prev_close_wrong_day_counter: metrics::Counter,
     /// Snapshot rows the ILP buffer refused at append time this session.
-    top_volume_append_failures: u64,
+    ///
+    /// Shared with the top-volume writer thread since 2026-09-22 (item 44e):
+    /// the append moved there, so the count is written there and read here.
+    top_volume_append_failures: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Pre-resolved handle for [`TOP_VOLUME_APPEND_FAILURE_COUNTER`].
     top_volume_append_failure_counter: metrics::Counter,
     /// Contracts refused by the snapshot projection this session, PER REASON,
@@ -1359,7 +1396,11 @@ pub struct LiveIngest {
     /// every test keeps its behaviour by construction. When present it is the
     /// PRODUCER half: its flush hands a batch to a dedicated thread and never
     /// blocks this task on the database.
-    top_volume: Option<tickvault_storage::top_volume_rank_persistence::TopVolumeRankWriter>,
+    ///
+    /// A ROW producer since 2026-09-22 (item 44e): it stages plain row data
+    /// and hands each sweep over with one `try_send`. The per-row ILP append
+    /// runs on the writer thread, not here.
+    top_volume: Option<tickvault_storage::top_volume_rank_persistence::TopVolumeRowProducer>,
 }
 
 /// The candle fold frame that measures the SAME interval as a snapshot
@@ -1415,14 +1456,14 @@ impl LiveIngest {
     /// Opts this ingest in to writing top-volume snapshots.
     ///
     /// Takes the PRODUCER half of an already-split writer. The type makes the
-    /// mistake unavailable rather than merely discouraged: `split_for_offload`
+    /// mistake unavailable rather than merely discouraged: `split_rows_for_offload`
     /// consumes the writer, so there is no way to hand this a synchronous
     /// handle whose flush would block the frame drain on an ILP round trip --
     /// the coupling that lost ticks in August, at Dhan's side, invisibly.
     #[must_use]
     pub fn with_top_volume_writer(
         mut self,
-        writer: tickvault_storage::top_volume_rank_persistence::TopVolumeRankWriter,
+        writer: tickvault_storage::top_volume_rank_persistence::TopVolumeRowProducer,
         thread: std::thread::JoinHandle<()>,
     ) -> Self {
         self.top_volume = Some(writer);
@@ -1778,97 +1819,41 @@ impl LiveIngest {
             let Some(writer) = self.top_volume.as_mut() else {
                 return (appended, refused);
             };
+            // STAGED, not appended (2026-09-22, item 44e). Until then this loop
+            // called the ILP `append_row` per row: float formatting, symbol
+            // escaping and the delay renderer on the frame-drain task, measured
+            // at 14,932 µs for a 20,220-row sweep -- 14.5x the sort above it.
+            // `stage` is a copy of the row's plain data into a pre-sized,
+            // recycled vector; the append runs on the writer thread, whose
+            // per-row refusals are counted there on
+            // `TOP_VOLUME_APPEND_FAILURE_COUNTER`.
+            //
+            // A consequence worth stating: an append refusal can no longer be
+            // folded into this function's `refused` return, because it now
+            // happens after the return. `appended` here means rows STAGED and
+            // offered to the writer.
             for row in &projection.rows {
-                if writer.append_row(row).is_ok() {
+                if writer.stage(row) {
                     appended = appended.saturating_add(1);
                 } else {
-                    // Counted AND said out loud, not swallowed. Until
-                    // 2026-09-09 a per-row ILP append error produced FEWER
-                    // rows with nothing anywhere reporting it -- the writer's
-                    // own discard counter covers the flush arms, never this
-                    // one. A short snapshot then reads exactly like a quiet
-                    // minute.
-                    //
-                    // The surface is the LOG, not CloudWatch: the September
-                    // forecast sits above the budget's automatic
-                    // STOP_EC2_INSTANCES line, so a new EMF name needs an
-                    // operator lever rather than a cost note. The warn is free,
-                    // greppable, and invisible to every alarm -- the one
-                    // WS-GAP-03 filter requires $.level = "ERROR" AND
-                    // $.source = "fell_back_to_indices", and this is a WARN
-                    // with a different source.
-                    //
-                    // Throttled on powers of two because one bad sweep can
-                    // refuse up to 500 rows: the 1st, 2nd, 4th ... failure of
-                    // the session is logged, which reports the onset at once
-                    // and the MAGNITUDE without flooding the sink.
+                    // Past the sweep's row bound. The producer counts and logs
+                    // it as a discard; the drain only reports it.
                     refused = refused.saturating_add(1);
-                    self.top_volume_append_failures =
-                        self.top_volume_append_failures.saturating_add(1);
-                    self.top_volume_append_failure_counter.increment(1);
-                    // `counter` is a FIELD, not decoration: an operator who
-                    // greps the counter name lands on this line, and the
-                    // loss-counter visibility guard can only SEE that this
-                    // counter has a surface if the name appears beside a log.
-                    if self.top_volume_append_failures.is_power_of_two() {
-                        tracing::warn!(
-                            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState
-                                .code_str(),
-                            counter = TOP_VOLUME_APPEND_FAILURE_COUNTER,
-                            source = "top_volume_append_failed",
-                            failures = self.top_volume_append_failures,
-                            "top_volume_rank: the ILP buffer refused a snapshot row. That sweep's snapshot is SHORT -- ranks are missing from the table and it reads exactly like a quiet minute. Ranking and depth steering are unaffected (both run from RAM); only the queryable record is incomplete."
-                        );
-                    }
                 }
             }
+            // ONE `try_send` per family per sweep, carrying the SAME label
+            // snapshot the projection just read, so the writer thread resolves
+            // every row against the identical map. It never blocks: a full
+            // queue DROPS the sweep and counts it on the discard series rather
+            // than retaining it, because the next sweep re-ranks the whole
+            // board. The outcome is ignored deliberately -- the producer has
+            // already counted and logged every arm that loses a row.
+            let _handoff = writer.hand_off(std::sync::Arc::clone(&labels));
         }
 
-        // The flush is the OFFLOAD hand-off, not a database round trip: a full
-        // queue is backpressure and the rows are retained for the next attempt.
-        //
-        // The result is deliberately DROPPED rather than propagated, and the
-        // drop is explicit so a reader sees the choice. `flush` already emits a
-        // coded error and increments its own counter on every failure arm, so
-        // re-reporting here would double-count one event -- and there is no
-        // action this caller could take that the writer has not already taken:
-        // it is one snapshot of a leaderboard that will be re-ranked a second
-        // from now.
-        // CORRECTED 2026-09-09: the gate was `appended > 0`, so a sweep that
-        // appended NOTHING could never re-offer rows a PREVIOUS sweep is still
-        // holding. `TopVolumeRankWriter::flush` retains its batch on a
-        // `QueueFull` hand-off (`pending` stays non-zero) and relies on a later
-        // flush to re-offer it -- but the two paths that produce no rows, an
-        // empty ranked set and a family with no writer, `continue` straight
-        // past this gate. The retained rows then sat unretried until some later
-        // sweep happened to append again, which on a quiet cadence is a real
-        // delay. Gating on PENDING as well re-offers them on the very next
-        // sweep. `flush` itself early-returns when `pending == 0`, so an idle
-        // sweep still costs nothing.
-        //
-        // ⚠ CORRECTED 2026-09-12 -- this paragraph used to close with
-        // "Recovering it needs the buffer cleared in `append_row`'s own error
-        // path, which is a separate change in the storage crate." **That
-        // change already existed when the sentence was written**, under the
-        // heading "# Why the marker (2026-09-09)" in
-        // `top_volume_rank_persistence::append_row`: it sets a MARKER before
-        // the row, `rewind_to_marker`s on any error, and falls back to
-        // `discard_pending()` if the rewind itself fails. So a half-written row
-        // cannot poison the buffer, and there is no storage-crate follow-up to
-        // open. Recorded rather than deleted because the cost of a stale
-        // "NOT fixed" note is the `day_ohlc_tracker` (2026-08-12) one: the next
-        // reader opens work that is already done.
-        //
-        // What the paragraph got RIGHT and is still worth keeping: `pending` is
-        // incremented only AFTER every `?` in `append_row`, so a failed append
-        // leaves `pending == 0` -- this gate reads false and `flush` would
-        // early-return regardless. That is now harmless rather than a leak,
-        // because the rewind already restored the buffer.
-        if let Some(writer) = self.top_volume.as_mut()
-            && (appended > 0 || writer.pending() > 0)
-        {
-            drop(writer.flush());
-        }
+        // The end-of-function `flush` that stood here until 2026-09-22 is gone
+        // with the retained-rows concept it existed for: nothing is held across
+        // sweeps any more, so there is nothing for a later sweep to re-offer.
         (appended, refused)
     }
 
@@ -2001,7 +1986,7 @@ impl LiveIngest {
                 c.increment(0);
                 c
             },
-            top_volume_append_failures: 0,
+            top_volume_append_failures: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             top_volume_append_failure_counter: {
                 let c = metrics::counter!(TOP_VOLUME_APPEND_FAILURE_COUNTER);
                 c.increment(0);
@@ -2042,8 +2027,23 @@ impl LiveIngest {
     /// Snapshot rows the ILP buffer refused at append time this session.
     /// Zero on a healthy session.
     #[must_use]
-    pub const fn top_volume_append_failures(&self) -> u64 {
+    pub fn top_volume_append_failures(&self) -> u64 {
         self.top_volume_append_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The shared append-failure count and its counter handle, for the
+    /// top-volume writer thread that now does the append (item 44e).
+    fn top_volume_append_failure_sink(
+        &self,
+    ) -> (
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+        metrics::Counter,
+    ) {
+        (
+            std::sync::Arc::clone(&self.top_volume_append_failures),
+            self.top_volume_append_failure_counter.clone(),
+        )
     }
 
     /// The previous-close store, for the gainer-eligibility filter.
@@ -2395,10 +2395,10 @@ impl LiveIngest {
         }
         // The top-volume queue closes when its PRODUCER drops — there is no
         // `close_offload()` on that writer, because the producer half owns the
-        // only sender. Account for retained rows FIRST: on a `QueueFull` the
-        // producer keeps them and `flush` returns `Ok` (backpressure, not
-        // loss), so at shutdown they are rows nothing will ever flush and,
-        // until 2026-09-13, rows that skipped even the discard counter.
+        // only sender. Account for STAGED rows first: since 2026-09-22 (item
+        // 44e) a sweep hands its rows off before returning, so this is
+        // normally zero -- but a row staged and never handed off is a row
+        // nothing will ever write, and it must reach the discard counter.
         if let Some(writer) = self.top_volume.as_mut() {
             let dropped = writer.discard_pending();
             if dropped > 0 {
@@ -4071,6 +4071,10 @@ pub struct DrainCounters {
     /// Bytes abandoned mid-frame by the two give-up arms. See
     /// [`DRAIN_ABANDONED_BYTES_COUNTER`] for why this is bytes and not packets.
     abandoned_bytes: metrics::Counter,
+    /// Unknown-code packets SKIPPED on their own length stamp because the
+    /// header they point at decoded cleanly (item 44b). Separate from
+    /// `unparseable`/`abandoned_bytes` so a recovery is never read as a loss.
+    unknown_skipped: metrics::Counter,
 }
 
 impl DrainCounters {
@@ -4136,6 +4140,7 @@ pub fn counters() -> &'static DrainCounters {
         truncated: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "truncated"),
         main_feed_length_mismatch: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "length_mismatch"),
         abandoned_bytes: metrics::counter!(DRAIN_ABANDONED_BYTES_COUNTER),
+        unknown_skipped: metrics::counter!(DRAIN_UNKNOWN_PACKET_SKIPPED_COUNTER),
     })
 }
 
@@ -4176,6 +4181,8 @@ fn seed_drain_loss_baselines() {
     // of the frame. Zero on a healthy lane, so any non-zero reading is the
     // event itself — and until now it could not be read at all.
     c.abandoned_bytes.increment(0);
+    // Item 44b: the skip arm, seeded beside the abandon arm it replaces.
+    c.unknown_skipped.increment(0);
     // Both writers' shutdown-abandonment episodes. Labelled rather than two
     // names because the EMF processor folds label values into one summed
     // series per host, and either writer abandoning its queue calls for the
@@ -4433,6 +4440,62 @@ pub const SEAL_WRITER_WAIT_INTERVAL_MS: u64 = 100;
 /// exactly as it did before this drain existed, so the loop can only ever
 /// recover MORE than the old single-batch behaviour, never less.
 pub const WAL_CATCHUP_BUDGET_SECS: u64 = 300;
+
+/// Catch-up budget for a boot that lands INSIDE the capture window, in seconds
+/// (item 44a, 2026-09-22 FOURTH scope-lock row 1).
+///
+/// The drain runs BEFORE the sockets dial, so every second spent here during
+/// the session is a second all sixteen sockets are dark — and Dhan has no
+/// snapshot-on-subscribe and no sequence number, so those ticks are gone at
+/// source. 20 s is one bounded round for a typical backlog while cutting the
+/// worst blind window to a fifteenth of the 300 s one; the round already
+/// started when the clock expires still finishes, so the true bound is
+/// 20 s plus one round. Leftovers stay `*.wal` for the next out-of-session
+/// boot, exactly as when the full budget runs out.
+pub const WAL_CATCHUP_IN_SESSION_BUDGET_SECS: u64 = 20;
+
+const _: () = assert!(
+    WAL_CATCHUP_IN_SESSION_BUDGET_SECS < WAL_CATCHUP_BUDGET_SECS,
+    "the in-session catch-up budget must be SHORTER than the out-of-session one \
+     — lengthening it back toward 300 s is a REJECT row in the 2026-09-22 \
+     (FOURTH) scope-lock entry"
+);
+
+/// Counter: boots whose WAL catch-up took the SHORT in-session budget.
+/// Local `/metrics` only (no EMF name — see the 2026-09-22 FOURTH budget note).
+pub const WAL_CATCHUP_IN_SESSION_COUNTER: &str = "tv_dhan_wal_catchup_in_session_total";
+
+/// The WAL catch-up budget for a boot at `ist_secs_of_day`.
+///
+/// Inside the capture window `[TICK_PERSIST_START_SECS_OF_DAY_IST,
+/// TICK_PERSIST_END_SECS_OF_DAY_IST)` — 09:00:00 inclusive to 15:40:00
+/// exclusive, half-open like every other window in this file — it is
+/// [`WAL_CATCHUP_IN_SESSION_BUDGET_SECS`]; everywhere else the full
+/// [`WAL_CATCHUP_BUDGET_SECS`]. Pure, total and O(1).
+///
+/// **A boot just before 09:00 is clamped** (2026-09-22 hostile review): the
+/// full budget from 08:56 would drain until ~09:01 and dial after the
+/// pre-open began. Before the window the budget is therefore
+/// `min(full, seconds-until-09:00 + in-session)`, so the drain ends no later
+/// than 09:00 plus the in-session budget.
+#[must_use]
+pub const fn wal_catchup_budget_secs(ist_secs_of_day: u64) -> u64 {
+    let start = tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST as u64;
+    let end = TICK_PERSIST_END_SECS_OF_DAY_IST as u64;
+    if ist_secs_of_day >= start && ist_secs_of_day < end {
+        WAL_CATCHUP_IN_SESSION_BUDGET_SECS
+    } else if ist_secs_of_day < start {
+        let until_open =
+            (start - ist_secs_of_day).saturating_add(WAL_CATCHUP_IN_SESSION_BUDGET_SECS);
+        if until_open < WAL_CATCHUP_BUDGET_SECS {
+            until_open
+        } else {
+            WAL_CATCHUP_BUDGET_SECS
+        }
+    } else {
+        WAL_CATCHUP_BUDGET_SECS
+    }
+}
 
 /// Hard round cap for the same drain, independent of the clock.
 ///
@@ -4758,6 +4821,60 @@ pub const DRAIN_FRAMES_COUNTER: &str = "tv_dhan_feed_drain_frames_total";
 /// CloudWatch. Stated rather than assumed: shipping it is a cost decision
 /// (~$0.30/mo) that belongs with the alarm that would read it.
 pub const DRAIN_ABANDONED_BYTES_COUNTER: &str = "tv_dhan_feed_abandoned_bytes_total";
+
+/// Counter: unknown-code packets the drain SKIPPED on their own length stamp
+/// instead of abandoning the rest of the frame (item 44b, 2026-09-22). Local
+/// `/metrics` only. Counted separately from [`DRAIN_ABANDONED_BYTES_COUNTER`]:
+/// a skip is a recovery, an abandon is a loss, and one series cannot say both.
+pub const DRAIN_UNKNOWN_PACKET_SKIPPED_COUNTER: &str = "tv_dhan_feed_unknown_packet_skipped_total";
+
+/// Where to resume the walk past an UNKNOWN-code packet at `offset`, or `None`
+/// to keep the abandon-and-count path (item 44b, 2026-09-22 FOURTH row 2).
+///
+/// The vendor's `message_length` stamp (header bytes 1..3, LE `u16`) is
+/// trusted ONLY when all of these hold:
+///
+/// 1. the whole 8-byte header is present and the stamp is `>= 8`;
+/// 2. `offset + stamp` does not run past the frame;
+/// 3. it lands EXACTLY on the frame end, or on a header whose response code
+///    is known AND whose own stamp equals that code's fixed size AND whose
+///    fixed size fits in what is left.
+///
+/// Rule 3's stamp-equals-size check validates the one hypothesis the skip
+/// rests on — that a stamp is the packet's byte length — on a packet whose
+/// length we already know. A skip on the stamp alone is a REJECT row: a
+/// misread stamp would resynchronise mid-payload and fabricate ticks.
+/// Two consecutive unknown packets therefore abandon at the first; that is
+/// the safe direction. O(1), no allocation, never panics.
+#[must_use]
+pub fn unknown_packet_skip(frame: &[u8], offset: usize) -> Option<usize> {
+    let header_end = offset.checked_add(tickvault_common::constants::BINARY_HEADER_SIZE)?;
+    let header = frame.get(offset..header_end)?;
+    let stamp = usize::from(u16::from_le_bytes([
+        *header.get(HEADER_OFFSET_MESSAGE_LENGTH)?,
+        *header.get(HEADER_OFFSET_MESSAGE_LENGTH + 1)?,
+    ]));
+    if stamp < tickvault_common::constants::BINARY_HEADER_SIZE {
+        return None;
+    }
+    let next = offset.checked_add(stamp)?;
+    if next > frame.len() {
+        return None;
+    }
+    if next == frame.len() {
+        return Some(next);
+    }
+    let rest = frame.get(next..)?;
+    let known = main_feed_packet_len(rest)?;
+    if known > rest.len() {
+        return None;
+    }
+    let next_stamp = usize::from(u16::from_le_bytes([
+        *rest.get(HEADER_OFFSET_MESSAGE_LENGTH)?,
+        *rest.get(HEADER_OFFSET_MESSAGE_LENGTH + 1)?,
+    ]));
+    (next_stamp == known).then_some(next)
+}
 
 /// Gauge: the LONGEST a frame sat in the ring before the drain folded it, in
 /// milliseconds, over the last reporting window.
@@ -7021,7 +7138,27 @@ pub fn drain_main_feed_frame(
     let mut disconnect_logged = false;
     while offset < frame.bytes.len() {
         let Some(len) = main_feed_packet_len(&frame.bytes[offset..]) else {
-            // Unrecognised code or a trailing partial packet: stop here rather
+            // Item 44b (2026-09-22): an unknown code no longer discards the
+            // packets stacked behind it WHEN its own length stamp lands on a
+            // header that decodes cleanly — see `unknown_packet_skip`. The
+            // packet itself is not decoded (we do not know its layout); the
+            // walk resumes at the next boundary, and the skip is counted apart
+            // from the abandon below.
+            if let Some(next) = unknown_packet_skip(&frame.bytes, offset) {
+                c.unknown_skipped.increment(1);
+                out.unknown_skipped = out.unknown_skipped.saturating_add(1);
+                offset = next;
+                packets = packets.saturating_add(1);
+                if packets >= MAX_PACKETS_PER_FRAME {
+                    c.truncated.increment(1);
+                    let abandoned = frame.bytes.len().saturating_sub(offset) as u64;
+                    c.abandoned_bytes.increment(abandoned);
+                    out.abandoned_bytes = out.abandoned_bytes.saturating_add(abandoned);
+                    return out;
+                }
+                continue;
+            }
+            // Unrecognised code whose stamp cannot be trusted: stop here rather
             // than resynchronising on a guess, which would fabricate ticks.
             c.unparseable.increment(1);
             out.unparseable = out.unparseable.saturating_add(1);
@@ -7351,6 +7488,9 @@ pub struct FrameOutcome {
     /// guessing. Returned as well as counted so a test can assert the
     /// magnitude — the whole reason this struct exists.
     pub abandoned_bytes: u64,
+    /// Unknown-code packets skipped on a validated length stamp (item 44b).
+    /// Their payload was NOT decoded; the packets behind them were.
+    pub unknown_skipped: u64,
 }
 
 /// What one depth frame produced.
@@ -12672,12 +12812,23 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         let writer = tickvault_storage::top_volume_rank_persistence::TopVolumeRankWriter::new(
             &params.questdb,
         );
-        let (producer, mut sink, rx) = writer.split_for_offload();
+        // ROW split since 2026-09-22 (item 44e): the drain stages plain row
+        // data, and this thread does the per-row ILP append as well as the
+        // flush. The append-failure count and its counter are shared with the
+        // ingest, so its accessor still reads the truth.
+        let (producer, mut row_writer, rx) =
+            writer.split_rows_for_offload(crate::contract_underlying_map::UNLABELLED_CONTRACT);
+        let (append_failures, append_failure_counter) = ingest.top_volume_append_failure_sink();
         match std::thread::Builder::new()
             .name("tv-top-volume-writer".to_owned())
             .spawn(move || {
-                while let Ok(mut batch) = rx.recv() {
-                    sink.write(&mut batch);
+                while let Ok(batch) = rx.recv() {
+                    let outcome = row_writer.write_batch(batch);
+                    record_top_volume_append_failures(
+                        &append_failures,
+                        &append_failure_counter,
+                        outcome.append_failed,
+                    );
                 }
                 info!("top-volume writer thread exiting — the drain closed its queue");
             }) {
@@ -12982,8 +13133,30 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         //
         // Placed AFTER the first batch deliberately: the aggregator is seeded
         // once, above, and every round folds against that same seeded state.
+        // 44a (2026-09-22): the budget is clock-aware. A mid-session restart
+        // takes the short one so the sockets dial sooner; the rest of the
+        // backlog stays `*.wal` for the next out-of-session boot.
+        let catchup_budget_secs = wal_catchup_budget_secs(now_ist_secs_of_day());
+        let in_session_counter = metrics::counter!(WAL_CATCHUP_IN_SESSION_COUNTER);
+        in_session_counter.increment(0);
+        if catchup_budget_secs < WAL_CATCHUP_BUDGET_SECS {
+            in_session_counter.increment(1);
+            warn!(
+                budget_secs = catchup_budget_secs,
+                full_budget_secs = WAL_CATCHUP_BUDGET_SECS,
+                counter = WAL_CATCHUP_IN_SESSION_COUNTER,
+                "WAL catch-up drain started INSIDE the capture window — taking the short \
+                 in-session budget so the sockets dial sooner. Whatever it does not reach \
+                 stays a `*.wal` file for the next out-of-session boot."
+            );
+        } else {
+            info!(
+                budget_secs = catchup_budget_secs,
+                "WAL catch-up drain started outside the capture window — full budget"
+            );
+        }
         let catchup_deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_secs(WAL_CATCHUP_BUDGET_SECS);
+            tokio::time::Instant::now() + std::time::Duration::from_secs(catchup_budget_secs);
         let mut rounds = 0u32;
         let mut catchup_frames = 0usize;
         let mut catchup_ticks = 0u64;
@@ -18803,7 +18976,7 @@ mod tests {
         // something it never closed, this test would hang rather than fail,
         // which is itself the assertion.
         ingest = ingest.with_top_volume_writer(
-            tickvault_storage::top_volume_rank_persistence::TopVolumeRankWriter::for_test(),
+            tickvault_storage::top_volume_rank_persistence::TopVolumeRowProducer::for_test().0,
             std::thread::spawn(|| {}),
         );
 
@@ -22341,6 +22514,84 @@ mod frame_walk_accounting_tests {
         );
     }
 
+    fn drain_bytes(bytes: Vec<u8>) -> FrameOutcome {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        drain_main_feed_frame(
+            &mut ingest,
+            &CapturedFrame {
+                seq: 1,
+                endpoint: DhanEndpointType::MainFeed,
+                connection_index: 0,
+                received_at: std::time::Instant::now(),
+                bytes: bytes.into(),
+            },
+            any_recv_nanos(),
+            1_000,
+            counters(),
+        )
+    }
+
+    /// Item 44b: an unknown code whose stamp lands on a clean known header is
+    /// SKIPPED, and the packets stacked behind it — a disconnect included —
+    /// are decoded instead of thrown away.
+    #[test]
+    fn an_unknown_packet_with_a_validated_stamp_is_skipped_and_the_rest_decodes() {
+        let good = ticker_packet(13, 100.5, any_ltt());
+        let mut unknown = [0u8; 16];
+        unknown[0] = 0xFE;
+        unknown[1] = 16;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&good);
+        bytes.extend_from_slice(&unknown);
+        bytes.extend_from_slice(&good);
+        bytes.extend_from_slice(&good);
+        bytes.extend_from_slice(&disconnect_packet(807));
+        let out = drain_bytes(bytes);
+        assert_eq!(out.unknown_skipped, 1, "outcome={out:?}");
+        assert_eq!(out.folded, 3, "all three tickers fold, outcome={out:?}");
+        assert_eq!(out.disconnects, 1, "the stacked disconnect is decoded");
+        assert_eq!(out.abandoned_bytes, 0, "nothing is abandoned");
+        assert_eq!(out.unparseable, 0, "a skip is not a give-up");
+    }
+
+    /// Item 44b: two consecutive unknown packets abandon at the FIRST — the
+    /// first one's stamp lands on another unknown code, which does not
+    /// validate — exactly as before.
+    #[test]
+    fn two_consecutive_unknown_packets_abandon_at_the_first() {
+        let good = ticker_packet(13, 100.5, any_ltt());
+        let mut unknown = [0u8; 16];
+        unknown[0] = 0xFE;
+        unknown[1] = 16;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&good);
+        bytes.extend_from_slice(&unknown);
+        bytes.extend_from_slice(&unknown);
+        bytes.extend_from_slice(&good);
+        let out = drain_bytes(bytes);
+        assert_eq!(out.unknown_skipped, 0);
+        assert_eq!(out.folded, 1);
+        assert_eq!(out.unparseable, 1);
+        assert_eq!(out.abandoned_bytes, 48, "outcome={out:?}");
+    }
+
+    /// Item 44b: an unknown packet that is the LAST thing in the frame and
+    /// whose stamp lands exactly on the frame end is skipped, not abandoned.
+    #[test]
+    fn a_trailing_unknown_packet_that_fits_exactly_is_skipped() {
+        let good = ticker_packet(13, 100.5, any_ltt());
+        let mut unknown = [0u8; 12];
+        unknown[0] = 0xFE;
+        unknown[1] = 12;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&good);
+        bytes.extend_from_slice(&unknown);
+        let out = drain_bytes(bytes);
+        assert_eq!(out.unknown_skipped, 1);
+        assert_eq!(out.folded, 1);
+        assert_eq!(out.abandoned_bytes, 0);
+    }
+
     /// Market sweep row 27 (2026-09-08): the vendor's own length stamp is
     /// COUNTED when it disagrees with the fixed size, and the packet is still
     /// decoded on the fixed size — the stamp is a measurement, never a resync.
@@ -23220,7 +23471,7 @@ mod depth_rebalance_wiring_tests {
             // exists to prevent — a writer thread nothing can ever wait for.
             // Paying one no-op thread per test is the cost of that guarantee.
             ingest = ingest.with_top_volume_writer(
-                tickvault_storage::top_volume_rank_persistence::TopVolumeRankWriter::for_test(),
+                tickvault_storage::top_volume_rank_persistence::TopVolumeRowProducer::for_test().0,
                 std::thread::spawn(|| {}),
             );
         }
@@ -24003,5 +24254,219 @@ mod connection_delivery_tests {
             0,
             "out of session the latch stands down"
         );
+    }
+}
+
+// 2026-09-22 — item 44a (clock-aware catch-up budget) + item 44b (validated
+// unknown-packet skip). Pure-function pins; the drain-level walk tests live in
+// `frame_walk_accounting_tests`.
+#[cfg(test)]
+mod item_44_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    const START: u64 = tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST as u64;
+    const END: u64 = TICK_PERSIST_END_SECS_OF_DAY_IST as u64;
+
+    #[test]
+    fn every_minute_of_the_day_gets_the_right_catchup_budget() {
+        for minute in 0_u64..1440 {
+            let secs = minute * 60;
+            let want = if (START..END).contains(&secs) {
+                WAL_CATCHUP_IN_SESSION_BUDGET_SECS
+            } else if secs < START {
+                (START - secs + WAL_CATCHUP_IN_SESSION_BUDGET_SECS).min(WAL_CATCHUP_BUDGET_SECS)
+            } else {
+                WAL_CATCHUP_BUDGET_SECS
+            };
+            assert_eq!(wal_catchup_budget_secs(secs), want, "minute {minute}");
+        }
+    }
+
+    #[test]
+    fn catchup_budget_boundaries_are_half_open() {
+        assert_eq!(
+            wal_catchup_budget_secs(32_399),
+            1 + WAL_CATCHUP_IN_SESSION_BUDGET_SECS
+        ); // 08:59:59
+        // A boot at 08:56 ends its drain by 09:00 + the in-session budget.
+        assert_eq!(
+            wal_catchup_budget_secs(32_160),
+            240 + WAL_CATCHUP_IN_SESSION_BUDGET_SECS
+        );
+        assert_eq!(wal_catchup_budget_secs(0), WAL_CATCHUP_BUDGET_SECS);
+        assert_eq!(
+            wal_catchup_budget_secs(32_400),
+            WAL_CATCHUP_IN_SESSION_BUDGET_SECS
+        ); // 09:00:00
+        assert_eq!(
+            wal_catchup_budget_secs(56_399),
+            WAL_CATCHUP_IN_SESSION_BUDGET_SECS
+        ); // 15:39:59
+        assert_eq!(wal_catchup_budget_secs(56_400), WAL_CATCHUP_BUDGET_SECS); // 15:40:00
+        assert_eq!(wal_catchup_budget_secs(u64::MAX), WAL_CATCHUP_BUDGET_SECS);
+        assert_eq!(START, 32_400);
+        assert_eq!(END, 56_400);
+    }
+
+    #[test]
+    fn the_catchup_deadline_reads_the_clock_aware_budget() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        assert!(
+            prod.contains("wal_catchup_budget_secs(now_ist_secs_of_day())"),
+            "the catch-up deadline must be sized by the clock-aware budget"
+        );
+        assert!(
+            prod.contains("from_secs(catchup_budget_secs)"),
+            "the deadline must use the resolved budget, not the raw 300 s const"
+        );
+        assert!(
+            !prod.contains("from_secs(WAL_CATCHUP_BUDGET_SECS)"),
+            "the raw full budget must not size the deadline directly"
+        );
+    }
+
+    /// A known ticker packet (code 2) whose stamp equals its fixed size.
+    fn known(stamp: u16) -> [u8; 16] {
+        let mut p = [0_u8; 16];
+        p[0] = 2;
+        p[1..3].copy_from_slice(&stamp.to_le_bytes());
+        p
+    }
+
+    /// An unknown-code packet of `len` bytes carrying `stamp`.
+    fn unknown(stamp: u16, len: usize) -> Vec<u8> {
+        let mut p = vec![0_u8; len];
+        if let Some(b) = p.get_mut(0) {
+            *b = 0xFE;
+        }
+        if len >= 3 {
+            p[1..3].copy_from_slice(&stamp.to_le_bytes());
+        }
+        p
+    }
+
+    fn frame(parts: &[&[u8]]) -> Vec<u8> {
+        parts.iter().flat_map(|p| p.iter().copied()).collect()
+    }
+
+    #[test]
+    fn unknown_packet_skip_table() {
+        let k = known(16);
+        // stamp 0 and 1..=7 are below a header: never skipped.
+        for stamp in 0_u16..8 {
+            let f = frame(&[&unknown(stamp, 24), &k]);
+            assert_eq!(unknown_packet_skip(&f, 0), None, "stamp {stamp}");
+        }
+        // Below-header stamps that would land exactly on a well-formed known
+        // packet: the size floor alone is what refuses them.
+        for stamp in 3_u16..8 {
+            let mut f = unknown(stamp, usize::from(stamp));
+            f.extend_from_slice(&k);
+            assert_eq!(
+                unknown_packet_skip(&f, 0),
+                None,
+                "overlapping stamp {stamp}"
+            );
+        }
+        // exactly 8, landing on a good known packet.
+        let f = frame(&[&unknown(8, 8), &k]);
+        assert_eq!(unknown_packet_skip(&f, 0), Some(8));
+        // exact fit to frame end.
+        let f = unknown(12, 12);
+        assert_eq!(unknown_packet_skip(&f, 0), Some(12));
+        // overrun by one.
+        let f = unknown(13, 12);
+        assert_eq!(unknown_packet_skip(&f, 0), None);
+        // lands on another unknown code.
+        let f = frame(&[&unknown(16, 16), &unknown(16, 16)]);
+        assert_eq!(unknown_packet_skip(&f, 0), None);
+        // lands on a known code whose stamp disagrees with its fixed size.
+        let f = frame(&[&unknown(16, 16), &known(17)]);
+        assert_eq!(unknown_packet_skip(&f, 0), None);
+        // lands on a known code whose fixed size overruns the frame.
+        let f = frame(&[&unknown(16, 16), &known(16)[..10]]);
+        assert_eq!(unknown_packet_skip(&f, 0), None);
+        // lands on a truncated next header (fewer than 3 bytes).
+        let f = frame(&[&unknown(16, 16), &[2_u8]]);
+        assert_eq!(unknown_packet_skip(&f, 0), None);
+        // header itself truncated.
+        let f = unknown(16, 7);
+        assert_eq!(unknown_packet_skip(&f, 0), None);
+        // non-zero offset.
+        let f = frame(&[&k, &unknown(16, 16), &k]);
+        assert_eq!(unknown_packet_skip(&f, 16), Some(32));
+        // offset past the end never panics.
+        assert_eq!(unknown_packet_skip(&f, usize::MAX), None);
+        assert_eq!(unknown_packet_skip(&[], 0), None);
+    }
+
+    #[test]
+    fn known_packets_after_a_skip_still_classify() {
+        let f = frame(&[&unknown(24, 24), &known(16), &known(16)]);
+        let next = unknown_packet_skip(&f, 0);
+        assert_eq!(next, Some(24));
+        let rest = f.get(24..).unwrap_or(&[]);
+        assert_eq!(main_feed_packet_len(rest), Some(16));
+    }
+
+    #[test]
+    fn the_drain_stages_top_volume_rows_and_never_appends_ilp() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        let start = prod
+            .find("pub fn snapshot_top_volume(")
+            .expect("snapshot_top_volume must exist");
+        let body = &prod[start..];
+        let end = body.find("\n    }\n").unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            !body.contains(".append_row("),
+            "the per-row ILP append must stay on the writer thread, not the drain"
+        );
+        assert!(body.contains("writer.stage(row)"), "rows must be STAGED");
+        assert!(
+            body.contains("writer.hand_off("),
+            "each sweep must be handed off"
+        );
+        assert!(
+            prod.contains("row_writer.write_batch(batch)"),
+            "the writer thread must do the append"
+        );
+    }
+
+    #[test]
+    fn append_failures_are_accumulated_from_the_writer_thread() {
+        let total = std::sync::atomic::AtomicU64::new(0);
+        let counter = metrics::counter!(TOP_VOLUME_APPEND_FAILURE_COUNTER);
+        record_top_volume_append_failures(&total, &counter, 0);
+        assert_eq!(total.load(std::sync::atomic::Ordering::Relaxed), 0);
+        record_top_volume_append_failures(&total, &counter, 3);
+        record_top_volume_append_failures(&total, &counter, 2);
+        assert_eq!(total.load(std::sync::atomic::Ordering::Relaxed), 5);
+    }
+
+    proptest! {
+        #[test]
+        fn unknown_packet_skip_is_total_and_sound(
+            bytes in proptest::collection::vec(any::<u8>(), 0..96),
+            offset in 0_usize..100,
+        ) {
+            if let Some(next) = unknown_packet_skip(&bytes, offset) {
+                let stamp = usize::from(u16::from_le_bytes([bytes[offset + 1], bytes[offset + 2]]));
+                prop_assert!(stamp >= 8);
+                prop_assert_eq!(next, offset + stamp);
+                prop_assert!(next <= bytes.len());
+                if next < bytes.len() {
+                    let rest = &bytes[next..];
+                    let size = main_feed_packet_len(rest);
+                    prop_assert!(size.is_some());
+                    let size = size.unwrap_or(0);
+                    prop_assert!(size <= rest.len());
+                    prop_assert_eq!(usize::from(u16::from_le_bytes([rest[1], rest[2]])), size);
+                }
+            }
+        }
     }
 }

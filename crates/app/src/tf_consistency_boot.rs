@@ -2536,6 +2536,9 @@ mod tests {
                 TfIndex::M15,
                 TfIndex::M30,
                 TfIndex::M60,
+                // 2026-09-22: M10 became a real fold frame (ordinal 9, the
+                // `candles_10m` table) so it is written and therefore verified.
+                TfIndex::M10,
             ],
             "every minute-scale frame the lane WRITES must be verified"
         );

@@ -1868,6 +1868,61 @@ fn candle_labels_from(
     out
 }
 
+/// Spot and index names for the same table, from the day's symbol map
+/// (added 2026-09-22 — until then every spot and index `ticks` / candle row
+/// wrote a NULL `contract`, because the table was built from option rows only).
+///
+/// Only the three spot segments are taken: IDX_I (0), NSE_EQ (1), BSE_EQ (4).
+/// A derivative id in the symbol map is not a spot and must not borrow a
+/// spot's name. When two symbols map to the same `(id, segment)` (an alias in
+/// the artifact), the lexically smallest wins so the choice is reproducible
+/// from the file rather than from hash iteration order.
+#[must_use]
+pub fn spot_labels_from(
+    symbols: &HashMap<String, (u64, u8)>,
+) -> tickvault_storage::candle_contract_labels::CandleContractLabels {
+    let mut out: tickvault_storage::candle_contract_labels::CandleContractLabels =
+        HashMap::with_capacity(symbols.len());
+    for (name, (id, code)) in symbols {
+        if !matches!(*code, 0 | 1 | 4) {
+            continue;
+        }
+        let Ok(id) = i64::try_from(*id) else {
+            continue;
+        };
+        let seg = tickvault_common::segment::segment_code_to_str(*code);
+        match out.entry((id, seg)) {
+            std::collections::hash_map::Entry::Occupied(mut held) => {
+                if name.as_str() < &**held.get() {
+                    held.insert(std::sync::Arc::from(name.as_str()));
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(std::sync::Arc::from(name.as_str()));
+            }
+        }
+    }
+    out
+}
+
+/// Publishes spot and index names at boot, before any contract attach, so the
+/// 09:00 pre-open index ticks carry a name. Uses the if-empty publish so it can
+/// never wipe a table the attach has already filled. Returns how many names it
+/// published (0 when the artifact is unreadable or the table was already set —
+/// both leave the column NULL until the attach, never wrong).
+pub fn publish_spot_contract_labels_at_boot(date_ist: &str) -> usize {
+    let Ok(symbols) = read_symbol_map(date_ist) else {
+        return 0;
+    };
+    let labels = spot_labels_from(&symbols);
+    let n = labels.len();
+    if tickvault_storage::candle_contract_labels::publish_candle_contract_labels_if_empty(labels) {
+        n
+    } else {
+        0
+    }
+}
+
 /// IST "now" as epoch nanoseconds — wall clock plus the fixed IST offset, the
 /// same convention the `ticks` designated timestamp is written in.
 fn ist_now_nanos() -> i64 {
@@ -2070,7 +2125,12 @@ pub async fn load_contract_universe(
         // the same pass, so a `top_volume` row and a candle row for one
         // contract can never carry two different names. `Arc<str>` clones are
         // refcount bumps; this runs once per attach, never on the tick path.
-        let candle_labels = candle_labels_from(&labels);
+        // Spots and indices first, then options: the keys never collide (spot
+        // segments vs NSE_FNO / BSE_FNO), so the order only matters for
+        // readability. The whole table is REPLACED, so the spot names the boot
+        // published must be included again here or this publish would drop them.
+        let mut candle_labels = spot_labels_from(&symbols);
+        candle_labels.extend(candle_labels_from(&labels));
         let published = tickvault_storage::candle_contract_labels::publish_candle_contract_labels(
             candle_labels,
         );
@@ -4049,6 +4109,57 @@ mod tests {
     fn a_malformed_symbol_map_is_an_error_not_an_empty_universe() {
         assert!(parse_symbol_map("not json").is_err());
         assert!(parse_symbol_map(r#"{"resolved":7}"#).is_err());
+    }
+
+    #[test]
+    fn spot_labels_from_names_only_spot_segments_under_their_own_segment() {
+        let mut symbols = HashMap::new();
+        symbols.insert("NIFTY 50".to_string(), (13u64, 0u8));
+        symbols.insert("RELIANCE".to_string(), (2885u64, 1u8));
+        symbols.insert("RELIANCE-BSE".to_string(), (500_325u64, 4u8));
+        // A derivative id must never borrow a spot name.
+        symbols.insert("SOMEFUT".to_string(), (13u64, 2u8));
+        symbols.insert("MCXTHING".to_string(), (77u64, 5u8));
+        let labels = spot_labels_from(&symbols);
+        assert_eq!(labels.len(), 3);
+        assert_eq!(labels.get(&(13, "IDX_I")).map(|s| &**s), Some("NIFTY 50"));
+        assert_eq!(
+            labels.get(&(2885, "NSE_EQ")).map(|s| &**s),
+            Some("RELIANCE")
+        );
+        assert_eq!(
+            labels.get(&(500_325, "BSE_EQ")).map(|s| &**s),
+            Some("RELIANCE-BSE")
+        );
+        // Same numeric id on a derivative segment: absent, never borrowed.
+        assert!(labels.get(&(13, "NSE_FNO")).is_none());
+        assert!(labels.get(&(77, "MCX_COMM")).is_none());
+    }
+
+    #[test]
+    fn spot_labels_from_breaks_an_alias_tie_by_the_smallest_name() {
+        // Every insertion order must give the same answer.
+        for order in [["NIFTY", "NIFTY 50"], ["NIFTY 50", "NIFTY"]] {
+            let mut symbols = HashMap::new();
+            for name in order {
+                symbols.insert(name.to_string(), (13u64, 0u8));
+            }
+            let labels = spot_labels_from(&symbols);
+            assert_eq!(labels.len(), 1);
+            assert_eq!(labels.get(&(13, "IDX_I")).map(|s| &**s), Some("NIFTY"));
+        }
+    }
+
+    #[test]
+    fn spot_labels_from_an_empty_map_is_empty() {
+        assert!(spot_labels_from(&HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn publish_spot_contract_labels_at_boot_publishes_nothing_without_an_artifact() {
+        // No mapping artifact exists for this date, so nothing is read and
+        // nothing is published — the column stays NULL rather than wrong.
+        assert_eq!(publish_spot_contract_labels_at_boot("1999-01-01"), 0);
     }
 
     #[test]

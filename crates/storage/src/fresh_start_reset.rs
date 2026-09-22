@@ -69,7 +69,9 @@
 //!   first, that session's `ticks` / `market_depth` / candle / `top_volume`
 //!   rows go with it. None of them is a SEBI table.
 //! - **A refused in-session boot DEFERS the wipe.** The next out-of-session
-//!   boot then drops whatever the in-session boot wrote. The deploy band
+//!   boot RENAMES any table the in-session boot wrote into to
+//!   `<name>_pre_reset_<yyyymmdd>` (never drops it; see [`reset_action`]).
+//!   Renamed tables sit outside retention and need a manual drop. The deploy band
 //!   (no deploys 09:00–15:45 IST) makes the first boot of a new build an
 //!   out-of-session one, so this needs a mid-session crash of a build that has
 //!   never booted before.
@@ -77,7 +79,7 @@
 //!   the log [`RESET_LOG_READ_ATTEMPTS`] times,
 //!   [`RESET_LOG_READ_BACKOFF_SECS`] apart. If it still does not answer, the
 //!   session boots on the OLD schema, and every write that day lands in the old
-//!   column layout. The next out-of-session boot then drops that whole day.
+//!   column layout. The next out-of-session boot renames that day aside.
 //!   The four refusal arms log `STORAGE-GAP-03`, so this is greppable and can be
 //!   triaged. No alarm pages on it.
 //! - **A bare nuke of the QuestDB volume deletes the log with everything else.**
@@ -108,7 +110,8 @@ use std::time::Duration;
 use reqwest::Client;
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{
-    IST_UTC_OFFSET_SECONDS, TICK_PERSIST_END_SECS_OF_DAY_IST, TICK_PERSIST_START_SECS_OF_DAY_IST,
+    IST_UTC_OFFSET_SECONDS, IST_UTC_OFFSET_SECONDS_I64, TICK_PERSIST_END_SECS_OF_DAY_IST,
+    TICK_PERSIST_START_SECS_OF_DAY_IST,
 };
 use tracing::{error, info, warn};
 
@@ -277,7 +280,9 @@ pub const RESET_ID_WRITE_ATTEMPTS: u32 = 3;
 /// Honest worst case, if every statement hangs its full
 /// `RESET_HTTP_TIMEOUT_SECS`: the read phase can pass the budget by one
 /// attempt (2 statements), the first drop pass is one statement per object,
-/// and the id write is its count bound. [`RESET_WORST_CASE_SECS`] is that sum.
+/// and the id write is its count bound. Since 2026-09-22 (FOURTH, 44c) the
+/// first-boot marker adds 3 statements and the table pass adds a census plus
+/// one newest-row probe per table. [`RESET_WORST_CASE_SECS`] is that sum.
 /// A QuestDB that REFUSES (a fast 400) costs seconds, not this.
 pub const RESET_RETRY_BUDGET_SECS: u64 = 120;
 
@@ -286,7 +291,8 @@ pub const RESET_WORST_CASE_SECS: u64 = RESET_RETRY_BUDGET_SECS
     + 2 * RESET_HTTP_TIMEOUT_SECS
     + (RESET_VIEWS.len() + RESET_TABLES.len()) as u64 * RESET_HTTP_TIMEOUT_SECS
     + RESET_ID_WRITE_ATTEMPTS as u64 * (3 * RESET_HTTP_TIMEOUT_SECS + RESET_LOG_READ_BACKOFF_SECS)
-    + 3 * RESET_HTTP_TIMEOUT_SECS;
+    + 3 * RESET_HTTP_TIMEOUT_SECS
+    + (4 + RESET_TABLES.len()) as u64 * RESET_HTTP_TIMEOUT_SECS;
 
 const _: () = assert!(RESET_ID_WRITE_ATTEMPTS >= 1);
 // Stays well inside an hour, so an unattended bad boot still finishes long
@@ -384,8 +390,10 @@ fn insert_log_sql() -> String {
     )
 }
 
-/// Every statement the drop pass issues, in order: views first (a base table
-/// is freed of dependents before it goes), then tables.
+/// The drop statements, in order: views first (a base table is freed of
+/// dependents before it goes), then tables. The Run pass issues the view half
+/// verbatim; a table gets its `DROP TABLE` only when [`reset_action`] says so
+/// (2026-09-22 FOURTH, 44c), else it is renamed or skipped.
 #[must_use]
 pub fn drop_statements() -> Vec<(&'static str, String)> {
     let mut out = Vec::with_capacity(RESET_VIEWS.len() + RESET_TABLES.len());
@@ -432,6 +440,285 @@ pub fn reportable_refusals<'a>(refused: &[(&'a str, String)]) -> Vec<&'a str> {
         })
         .map(|(o, _)| *o)
         .collect()
+}
+
+// ---- 2026-09-22 (FOURTH), item 44c: rename rather than drop ---------------
+//
+// A reset refused mid-session let that day write into the OLD tables, and the
+// next out-of-session boot dropped them. The table pass now asks each table
+// how new its newest row is, against the instant the reset first found itself
+// pending, and RENAMES aside any table holding a row from after that instant.
+
+/// The reset log's second row kind: the first boot at which the reset was
+/// pending. Written once (read before write), never swept — it lives in
+/// [`SCHEMA_RESET_LOG_TABLE`], which is retention-exempt. Its `ts` is
+/// QuestDB's `now()`, i.e. REAL UTC.
+pub const FIRST_BOOT_MARKER_ID: &str = "2026-09-19-fresh-start.first-boot";
+
+// The id count query is an exact `=` on FRESH_START_RESET_ID, so the marker
+// row can never be read as "the reset already ran".
+const _: () = assert!(!const_str_eq(FIRST_BOOT_MARKER_ID, FRESH_START_RESET_ID));
+
+/// How far a table's newest `ts` can sit BEFORE the moment that row was
+/// written: the widest candle bucket (60 min — a bar is stamped with its
+/// OPEN) plus 5 min of late-tick lateness. Subtracted from the marker, so the
+/// error is always toward RENAME. Every reset table stamps `ts` as naive IST
+/// (the marker is converted into that domain by [`marker_cutoff_micros`]).
+pub const NEWEST_ROW_LAG_MARGIN_SECS: i64 = 3_900;
+
+/// Numbered suffixes tried after `<table>_pre_reset_<yyyymmdd>` is taken
+/// (`_2` ..= `_9`). Past that the table is left untouched and the id is not
+/// written — never a drop.
+pub const RENAME_SUFFIX_ATTEMPTS: u32 = 9;
+
+/// What a name in the reset lists is on disk right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectKind {
+    /// A table (or a name the census could not rule out — fail closed).
+    Table,
+    /// A name in [`RESET_VIEWS`].
+    View,
+    /// Positively absent from the table census.
+    Missing,
+}
+
+/// The newest designated timestamp a table holds, in naive-IST micros.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewestRow {
+    /// `count() = 0`.
+    NoRows,
+    /// `max(ts)` in naive-IST microseconds.
+    At(i64),
+    /// The probe was refused or did not parse.
+    Unreadable,
+}
+
+/// The first-boot marker, already converted to the comparison cutoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerState {
+    /// Rows at or after this naive-IST micros instant are protected.
+    Present(i64),
+    /// The log answered and holds no marker (its write failed).
+    Absent,
+    /// The marker could not be read.
+    Unreadable,
+}
+
+/// What the table pass does to one object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetAction {
+    /// `DROP VIEW IF EXISTS` — the only statement a view name ever gets.
+    DropView,
+    /// `DROP TABLE IF EXISTS` — only for a table provably older than the marker.
+    DropTable,
+    /// `RENAME TABLE` to `<name>_pre_reset_<yyyymmdd>` — never a drop.
+    Rename,
+    /// Nothing to do.
+    Skip,
+}
+
+/// Pure decision for one object. Fail-closed: anything not PROVABLY free of
+/// rows written after the marker is renamed, never dropped.
+#[must_use]
+pub const fn reset_action(kind: ObjectKind, newest: NewestRow, marker: MarkerState) -> ResetAction {
+    match kind {
+        ObjectKind::View => ResetAction::DropView,
+        ObjectKind::Missing => ResetAction::Skip,
+        ObjectKind::Table => match (newest, marker) {
+            // An empty table has nothing to lose, marker or not.
+            (NewestRow::NoRows, _) => ResetAction::DropTable,
+            (NewestRow::At(t), MarkerState::Present(m)) if t < m => ResetAction::DropTable,
+            _ => ResetAction::Rename,
+        },
+    }
+}
+
+/// Refine a `Rename` verdict: a table whose OLDEST row is at or after the
+/// marker cutoff holds ONLY post-marker capture — it was already dropped or
+/// renamed by an earlier pass and recreated by the ensure DDL. Renaming it
+/// again would empty the LIVE table on every retry boot (2026-09-22 hostile
+/// review, HIGH), so it is skipped. Anything unproven stays `Rename`
+/// (fail-closed): an unreadable or empty oldest probe, an absent or
+/// unreadable marker, or an oldest row before the cutoff.
+///
+/// Honest residual: a table whose pre-marker partitions were removed by
+/// the retention sweep (the reset failing for longer than the 15-day
+/// market-data window, paging `STORAGE-GAP-03` every boot meanwhile) also
+/// reads as post-marker and keeps its old schema.
+#[must_use]
+pub const fn refine_rename(oldest: NewestRow, marker: MarkerState) -> ResetAction {
+    match (oldest, marker) {
+        (NewestRow::At(t), MarkerState::Present(m)) if t >= m => ResetAction::Skip,
+        _ => ResetAction::Rename,
+    }
+}
+
+/// Convert the marker's REAL-UTC micros into the naive-IST domain the reset
+/// tables stamp `ts` in, minus [`NEWEST_ROW_LAG_MARGIN_SECS`]. Saturating.
+#[must_use]
+pub const fn marker_cutoff_micros(marker_utc_micros: i64) -> i64 {
+    marker_utc_micros
+        .saturating_add(IST_UTC_OFFSET_SECONDS_I64 * 1_000_000)
+        .saturating_sub(NEWEST_ROW_LAG_MARGIN_SECS * 1_000_000)
+}
+
+/// The IST calendar date of a UTC epoch second, as `yyyymmdd`.
+#[must_use]
+pub fn ist_yyyymmdd(utc_epoch_secs: i64) -> u32 {
+    use chrono::Datelike;
+    let ist = utc_epoch_secs.saturating_add(IST_UTC_OFFSET_SECONDS_I64);
+    chrono::DateTime::from_timestamp(ist, 0).map_or(19_700_101, |d| {
+        let year = u32::try_from(d.year()).unwrap_or(1970);
+        year * 10_000 + d.month() * 100 + d.day()
+    })
+}
+
+/// The name a table is renamed to: `<table>_pre_reset_<yyyymmdd>`, then
+/// `_2` ..= `_`[`RENAME_SUFFIX_ATTEMPTS`] while `taken` says a name exists.
+/// `None` when every candidate is taken — the caller leaves the table alone.
+#[must_use]
+pub fn rename_target(
+    table: &str,
+    ist_yyyymmdd: u32,
+    taken: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let base = format!("{table}_pre_reset_{ist_yyyymmdd:08}");
+    if !taken(&base) {
+        return Some(base);
+    }
+    (2..=RENAME_SUFFIX_ATTEMPTS)
+        .map(|n| format!("{base}_{n}"))
+        .find(|candidate| !taken(candidate))
+}
+
+fn marker_read_sql() -> String {
+    format!(
+        "SELECT count(), cast(min(ts) AS LONG) FROM {SCHEMA_RESET_LOG_TABLE} \
+         WHERE reset_id = '{FIRST_BOOT_MARKER_ID}';"
+    )
+}
+
+fn marker_insert_sql() -> String {
+    format!(
+        "INSERT INTO {SCHEMA_RESET_LOG_TABLE} (reset_id, ts) VALUES ('{FIRST_BOOT_MARKER_ID}', now());"
+    )
+}
+
+fn table_census_sql() -> &'static str {
+    "SELECT table_name FROM tables();"
+}
+
+fn newest_row_sql(table: &str) -> String {
+    format!("SELECT count(), cast(max(ts) AS LONG) FROM {table};")
+}
+
+fn oldest_row_sql(table: &str) -> String {
+    format!("SELECT count(), cast(min(ts) AS LONG) FROM {table};")
+}
+
+fn rename_sql(from: &str, to: &str) -> String {
+    format!("RENAME TABLE '{from}' TO '{to}';")
+}
+
+/// `dataset[0]` as `(count, optional long)`. `None` when either cell is
+/// malformed — a null second cell is `Some((n, None))`.
+#[must_use]
+pub fn parse_count_and_long(body: &str) -> Option<(i64, Option<i64>)> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let row = value.get("dataset")?.get(0)?;
+    let n = row.get(0)?.as_i64().filter(|n| *n >= 0)?;
+    let cell = row.get(1)?;
+    if cell.is_null() {
+        return Some((n, None));
+    }
+    Some((n, Some(cell.as_i64()?)))
+}
+
+/// Every `dataset[i][0]` string of a `tables()` answer. `None` when malformed.
+#[must_use]
+pub fn parse_table_names(body: &str) -> Option<Vec<String>> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    value
+        .get("dataset")?
+        .as_array()?
+        .iter()
+        .map(|row| row.get(0)?.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// The marker row as `(count, min(ts))`; `None` when unreadable.
+async fn read_first_boot_marker(client: &Client, base_url: &str) -> Option<(i64, Option<i64>)> {
+    let body = exec(client, base_url, &marker_read_sql()).await?;
+    parse_count_and_long(&body)
+}
+
+/// Read the marker; write it once if absent; read it back. Returns the raw
+/// REAL-UTC micros state (not yet a cutoff).
+async fn ensure_first_boot_marker(client: &Client, base_url: &str) -> MarkerState {
+    match read_first_boot_marker(client, base_url).await {
+        None => return MarkerState::Unreadable,
+        Some((n, Some(micros))) if n > 0 => return MarkerState::Present(micros),
+        Some((n, None)) if n > 0 => return MarkerState::Unreadable,
+        Some(_) => {}
+    }
+    // Absent: record this boot. Read back regardless of the INSERT reply — an
+    // INSERT whose answer was lost may still have landed.
+    let _ = exec(client, base_url, &marker_insert_sql()).await;
+    match read_first_boot_marker(client, base_url).await {
+        Some((n, Some(micros))) if n > 0 => {
+            info!(
+                marker = FIRST_BOOT_MARKER_ID,
+                "fresh-start reset: first boot with the reset pending recorded"
+            );
+            MarkerState::Present(micros)
+        }
+        Some((0, _)) => MarkerState::Absent,
+        _ => MarkerState::Unreadable,
+    }
+}
+
+async fn table_census(client: &Client, base_url: &str) -> Option<Vec<String>> {
+    let body = exec(client, base_url, table_census_sql()).await?;
+    parse_table_names(&body)
+}
+
+async fn newest_row(client: &Client, base_url: &str, table: &str) -> NewestRow {
+    let Some(body) = exec(client, base_url, &newest_row_sql(table)).await else {
+        return NewestRow::Unreadable;
+    };
+    match parse_count_and_long(&body) {
+        Some((0, _)) => NewestRow::NoRows,
+        Some((_, Some(ts))) => NewestRow::At(ts),
+        _ => NewestRow::Unreadable,
+    }
+}
+
+/// The OLDEST row of a table, probed only when [`reset_action`] chose
+/// `Rename`. Same parse as [`newest_row`]; the variant carries `min(ts)`.
+async fn oldest_row(client: &Client, base_url: &str, table: &str) -> NewestRow {
+    let Some(body) = exec(client, base_url, &oldest_row_sql(table)).await else {
+        return NewestRow::Unreadable;
+    };
+    match parse_count_and_long(&body) {
+        Some((0, _)) => NewestRow::NoRows,
+        Some((_, Some(ts))) => NewestRow::At(ts),
+        _ => NewestRow::Unreadable,
+    }
+}
+
+fn record_rename(table: &str, target: &str) {
+    metrics::counter!("tv_fresh_start_reset_renamed_total").increment(1);
+    // ERROR, not warn: a renamed table is outside retention and needs a
+    // hand-drop, so it must reach the coded-error alarm (2026-09-22 review).
+    error!(
+        code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+        source = "fresh_start_reset_rename",
+        table,
+        new_name = target,
+        "fresh-start reset: table held rows newer than the first boot with the reset pending, \
+         so it was RENAMED aside instead of dropped. It is outside retention — inspect it and \
+         drop it by hand outside market hours."
+    );
 }
 
 /// Run one statement; `Some(body)` on 2xx, `None` on anything else.
@@ -563,8 +850,23 @@ pub async fn run_fresh_start_reset_retrying(
             tokio::time::sleep(backoff).await;
         }
     }
-    let ist = ist_secs_of_day(now_utc_epoch_secs());
+    let now_utc = now_utc_epoch_secs();
+    let ist = ist_secs_of_day(now_utc);
     let mut decision = decide(logged, ist);
+    // Seeded so the first rename is not swallowed by the agent's
+    // dropped-first-sample rule.
+    metrics::counter!("tv_fresh_start_reset_renamed_total").increment(0);
+    // The log answered and the id is absent: this boot may be the FIRST with
+    // the reset pending. Record it, so a later Run can tell rows written since
+    // (renamed) from rows written before (dropped). 2026-09-22 (FOURTH) 44c.
+    let marker = if matches!(
+        decision,
+        ResetDecision::Run | ResetDecision::RefuseInSession
+    ) {
+        ensure_first_boot_marker(client, base_url).await
+    } else {
+        MarkerState::Unreadable
+    };
 
     match decision {
         ResetDecision::AlreadyDone => {
@@ -613,22 +915,99 @@ pub async fn run_fresh_start_reset_retrying(
                     ist_secs_of_day = ist,
                     "fresh-start reset DEFERRED: this boot is inside the market session window, \
                      and the one-shot wipe never runs on a live session. Nothing was dropped. The \
-                     next boot outside 08:55–15:45 IST runs it, and will drop what this boot writes."
+                     next boot outside 08:55–15:45 IST runs it, and RENAMES aside (never drops) any \
+                     table this boot writes into."
                 );
             }
         }
         ResetDecision::Run => {
+            let cutoff = match marker {
+                MarkerState::Present(utc_micros) => {
+                    MarkerState::Present(marker_cutoff_micros(utc_micros))
+                }
+                other => other,
+            };
+            let run_date = ist_yyyymmdd(now_utc);
             let mut refused: Vec<(&'static str, String)> = Vec::new();
-            for (object, sql) in drop_statements() {
+            let mut attempted = 0_usize;
+            // Views first (a base table is freed of dependents before it goes):
+            // a name in RESET_VIEWS only ever gets `DROP VIEW IF EXISTS`.
+            for (view, sql) in drop_statements().into_iter().take(RESET_VIEWS.len()) {
+                attempted += 1;
                 if exec(client, base_url, &sql).await.is_none() {
-                    refused.push((object, sql));
+                    refused.push((view, sql));
+                }
+            }
+            // One census for kind and rename collisions. Unreadable = every
+            // name is treated as a table (fail closed: probed, never assumed
+            // absent).
+            let census = table_census(client, base_url).await;
+            let mut taken: std::collections::HashSet<String> =
+                census.iter().flatten().cloned().collect();
+            let mut renames: Vec<(&'static str, String)> = Vec::new();
+            let mut rename_blocked: Vec<&'static str> = Vec::new();
+            for table in RESET_TABLES {
+                // Unreachable by the const assert; kept so a list edit can
+                // never route a SEBI name into a probe, drop or rename.
+                if SEBI_NEVER_RESET.contains(table) {
+                    continue;
+                }
+                let kind = match &census {
+                    Some(names) if !names.iter().any(|n| n == table) => ObjectKind::Missing,
+                    _ => ObjectKind::Table,
+                };
+                let newest = if kind == ObjectKind::Table {
+                    newest_row(client, base_url, table).await
+                } else {
+                    NewestRow::NoRows
+                };
+                match reset_action(kind, newest, cutoff) {
+                    ResetAction::Skip | ResetAction::DropView => {}
+                    ResetAction::DropTable => {
+                        attempted += 1;
+                        let sql = format!("DROP TABLE IF EXISTS {table};");
+                        if exec(client, base_url, &sql).await.is_none() {
+                            refused.push((*table, sql));
+                        }
+                    }
+                    ResetAction::Rename => {
+                        if matches!(
+                            refine_rename(oldest_row(client, base_url, table).await, cutoff),
+                            ResetAction::Skip
+                        ) {
+                            info!(
+                                table,
+                                "fresh-start reset: table holds only rows written after the \
+                                 first boot — already reset by an earlier pass, left alone"
+                            );
+                            continue;
+                        }
+                        match rename_target(table, run_date, |n| taken.contains(n)) {
+                            Some(target) => {
+                                taken.insert(target.clone());
+                                if exec(client, base_url, &rename_sql(table, &target))
+                                    .await
+                                    .is_some()
+                                {
+                                    record_rename(table, &target);
+                                } else {
+                                    renames.push((*table, target));
+                                }
+                            }
+                            None => rename_blocked.push(table),
+                        }
+                    }
                 }
             }
             // A QuestDB finishing its own WAL replay can refuse DDL briefly. A
             // refused DROP left alone keeps the OLD schema for as long as that
-            // table lives, so retry it — in order, views still first.
+            // table lives, so retry it — in order, views still first. A
+            // refused RENAME is retried the same way.
             let mut round = 0;
-            while !refused.is_empty() && round < RESET_DROP_RETRY_ROUNDS && budget_left(started) {
+            while (!refused.is_empty() || !renames.is_empty())
+                && round < RESET_DROP_RETRY_ROUNDS
+                && budget_left(started)
+            {
                 round += 1;
                 tokio::time::sleep(backoff).await;
                 let mut still: Vec<(&'static str, String)> = Vec::new();
@@ -638,6 +1017,18 @@ pub async fn run_fresh_start_reset_retrying(
                     }
                 }
                 refused = still;
+                let mut still_renames: Vec<(&'static str, String)> = Vec::new();
+                for (table, target) in renames {
+                    if exec(client, base_url, &rename_sql(table, &target))
+                        .await
+                        .is_some()
+                    {
+                        record_rename(table, &target);
+                    } else {
+                        still_renames.push((table, target));
+                    }
+                }
+                renames = still_renames;
             }
             let refused_count = refused.len();
             let refused: Vec<&'static str> = reportable_refusals(&refused);
@@ -654,14 +1045,35 @@ pub async fn run_fresh_start_reset_retrying(
                 );
                 record("drop_refused");
             }
+            if !renames.is_empty() || !rename_blocked.is_empty() {
+                // A table holding rows newer than the first boot is never
+                // dropped. It stays untouched and the id is NOT written, so
+                // the reset retries on the next out-of-session boot.
+                let failed: Vec<&'static str> = renames.iter().map(|(t, _)| *t).collect();
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed
+                        .code_str(),
+                    source = "fresh_start_reset",
+                    reset_id = FRESH_START_RESET_ID,
+                    rename_refused = ?failed,
+                    rename_target_taken = ?rename_blocked,
+                    retry_rounds = round,
+                    "fresh-start reset: these tables hold rows newer than the first boot with \
+                     the reset pending and could NOT be renamed aside. They were left untouched \
+                     and the reset id was NOT written, so the next out-of-session boot retries."
+                );
+                record("rename_refused");
+                record(decision.as_str());
+                return decision;
+            }
             let (verified, id_attempts) = write_and_verify_id(client, base_url, backoff).await;
             if verified {
                 info!(
                     reset_id = FRESH_START_RESET_ID,
-                    dropped = drop_statements().len() - refused_count,
+                    dropped = attempted - refused_count,
                     id_attempts,
                     "fresh-start reset COMPLETE — id written and verified; the ensure DDL \
-                     that follows recreates every dropped object"
+                     that follows recreates every dropped or renamed object"
                 );
                 record("completed");
             } else {
@@ -963,6 +1375,31 @@ mod tests {
         LandButRefuse,
     }
 
+    /// The newest-row probe's answer for one table.
+    #[derive(Clone, Copy)]
+    enum Newest {
+        /// `(count, max(ts) as naive-IST micros)`.
+        Rows(i64, Option<i64>),
+        Refuse,
+    }
+
+    /// The `SELECT table_name FROM tables()` answer.
+    #[derive(Clone, Copy)]
+    enum Census {
+        Refuse,
+        /// Every reset table, every SEBI table, plus these extras.
+        AllPlus(&'static [&'static str]),
+        /// Exactly these names.
+        Only(&'static [&'static str]),
+    }
+
+    /// QuestDB's `now()` as the mock's marker INSERT records it.
+    const QDB_NOW_MICROS: i64 = IN_SESSION_UTC * 1_000_000;
+
+    fn no_rows(_: &str) -> Newest {
+        Newest::Rows(0, None)
+    }
+
     /// Everything the stand-in QuestDB can be told to do.
     #[derive(Clone, Copy)]
     struct Cfg {
@@ -975,6 +1412,17 @@ mod tests {
         refuse_drop: Option<(&'static str, usize)>,
         /// Answer to the "which reset tables exist" count; `None` = refuse.
         tables_present: Option<i64>,
+        /// First-boot marker already recorded, as REAL-UTC micros.
+        marker: Option<i64>,
+        marker_insert_ok: bool,
+        marker_read_ok: bool,
+        census: Census,
+        newest: fn(&str) -> Newest,
+        /// The `min(ts)` probe asked only on a `Rename` verdict. Defaults to
+        /// refused, which keeps the verdict `Rename` (fail-closed).
+        oldest: fn(&str) -> Newest,
+        /// Refuse the RENAME of this table this many times.
+        refuse_rename: Option<(&'static str, usize)>,
     }
 
     impl Default for Cfg {
@@ -986,8 +1434,47 @@ mod tests {
                 refuse_drop: None,
                 // A populated volume unless a test says otherwise.
                 tables_present: Some(RESET_TABLES.len() as i64),
+                marker: None,
+                marker_insert_ok: true,
+                marker_read_ok: true,
+                census: Census::AllPlus(&[]),
+                newest: no_rows,
+                oldest: |_| Newest::Refuse,
+                refuse_rename: None,
             }
         }
+    }
+
+    fn count_long_reply(n: i64, v: Option<i64>) -> String {
+        let cell = v.map_or_else(|| "null".to_owned(), |v| v.to_string());
+        let body = format!("{{\"dataset\":[[{n},{cell}]],\"count\":1}}");
+        format!(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn census_reply(census: Census) -> String {
+        let names: Vec<&str> = match census {
+            Census::Refuse => return REFUSED.to_owned(),
+            Census::Only(names) => names.to_vec(),
+            Census::AllPlus(extra) => RESET_TABLES
+                .iter()
+                .chain(SEBI_NEVER_RESET)
+                .chain(extra)
+                .copied()
+                .collect(),
+        };
+        let rows: Vec<String> = names.iter().map(|n| format!("[\"{n}\"]")).collect();
+        let body = format!(
+            "{{\"dataset\":[{}],\"count\":{}}}",
+            rows.join(","),
+            rows.len()
+        );
+        format!(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
     }
 
     /// A stateful QuestDB stand-in: every request line is recorded.
@@ -1003,17 +1490,21 @@ mod tests {
         let logged = Arc::new(Mutex::new(cfg.initial_logged));
         let creates = Arc::new(Mutex::new(0usize));
         let drops_refused = Arc::new(Mutex::new(0usize));
+        let renames_refused = Arc::new(Mutex::new(0usize));
+        let marker = Arc::new(Mutex::new(cfg.marker));
         let seen_c = Arc::clone(&seen);
         tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     continue;
                 };
-                let (seen, logged, creates, drops_refused) = (
+                let (seen, logged, creates, drops_refused, renames_refused, marker) = (
                     Arc::clone(&seen_c),
                     Arc::clone(&logged),
                     Arc::clone(&creates),
                     Arc::clone(&drops_refused),
+                    Arc::clone(&renames_refused),
+                    Arc::clone(&marker),
                 );
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1029,6 +1520,7 @@ mod tests {
                         .replace("%28", "(")
                         .replace("%29", ")")
                         .replace("%2C", ",")
+                        .replace("%27", "'")
                         .replace("%3B", ";");
                     seen.lock().unwrap().push(q.clone());
                     let reply = if q.contains("CREATE") {
@@ -1039,9 +1531,61 @@ mod tests {
                         } else {
                             OK.to_owned()
                         }
+                    } else if q.contains("first-boot") {
+                        if q.contains("INSERT") {
+                            if cfg.marker_insert_ok {
+                                let mut m = marker.lock().unwrap();
+                                if m.is_none() {
+                                    *m = Some(QDB_NOW_MICROS);
+                                }
+                                OK.to_owned()
+                            } else {
+                                REFUSED.to_owned()
+                            }
+                        } else if cfg.marker_read_ok {
+                            let m = *marker.lock().unwrap();
+                            count_long_reply(i64::from(m.is_some()), m)
+                        } else {
+                            REFUSED.to_owned()
+                        }
+                    } else if q.contains("tables()") && !q.contains("count") {
+                        census_reply(cfg.census)
                     } else if q.contains("table_name") {
                         cfg.tables_present
                             .map_or_else(|| REFUSED.to_owned(), count_reply)
+                    } else if q.contains("min(ts)") {
+                        let table = q
+                            .split("FROM ")
+                            .nth(1)
+                            .and_then(|r| r.split(';').next())
+                            .unwrap_or_default();
+                        match (cfg.oldest)(table) {
+                            Newest::Rows(n, v) => count_long_reply(n, v),
+                            Newest::Refuse => REFUSED.to_owned(),
+                        }
+                    } else if q.contains("max(ts)") {
+                        let table = q
+                            .split("FROM ")
+                            .nth(1)
+                            .and_then(|r| r.split(';').next())
+                            .unwrap_or_default();
+                        match (cfg.newest)(table) {
+                            Newest::Rows(n, v) => count_long_reply(n, v),
+                            Newest::Refuse => REFUSED.to_owned(),
+                        }
+                    } else if q.contains("RENAME") {
+                        match cfg.refuse_rename {
+                            Some((t, times)) if q.contains(&format!("TABLE '{t}' TO")) => {
+                                let mut r = renames_refused.lock().unwrap();
+                                if *r < times {
+                                    *r += 1;
+                                    REFUSED.to_owned()
+                                } else {
+                                    OK.to_owned()
+                                }
+                            }
+                            _ => OK.to_owned(),
+                        }
                     } else if q.contains("count") {
                         count_reply(*logged.lock().unwrap())
                     } else if q.contains("INSERT") {
@@ -1120,6 +1664,20 @@ mod tests {
         seen_matching(m, "DROP")
     }
 
+    /// The reset-id INSERT, never the first-boot marker's.
+    fn is_id_insert(q: &str) -> bool {
+        q.contains("INSERT") && q.contains(&format!("'{FRESH_START_RESET_ID}'"))
+    }
+
+    fn id_inserts(m: &Mock) -> usize {
+        m.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|q| is_id_insert(q))
+            .count()
+    }
+
     /// B3 (2026-09-22): a log that answers on the third try RUNS the reset,
     /// instead of refusing the whole session on the first refusal.
     #[tokio::test]
@@ -1139,7 +1697,7 @@ mod tests {
         .await;
         assert_eq!(d, ResetDecision::Run);
         assert_eq!(drops_seen(&m), drop_statements().len());
-        assert_eq!(seen_matching(&m, "INSERT"), 1);
+        assert_eq!(id_inserts(&m), 1);
     }
 
     /// The retry is BOUNDED: a log that never answers still refuses, drops
@@ -1158,7 +1716,7 @@ mod tests {
         assert_eq!(d, ResetDecision::RefuseUnreadable);
         assert_eq!(drops_seen(&m), 0);
         assert_eq!(seen_matching(&m, "CREATE"), 3);
-        assert_eq!(seen_matching(&m, "INSERT"), 0);
+        assert_eq!(id_inserts(&m), 0);
     }
 
     /// The blackout is judged on the clock AFTER the log answers. The clock
@@ -1200,7 +1758,7 @@ mod tests {
         assert_eq!(drops_seen(&m), drop_statements().len());
         let seen = m.seen.lock().unwrap().clone();
         let last_drop = seen.iter().rposition(|q| q.contains("DROP")).unwrap();
-        let insert = seen.iter().position(|q| q.contains("INSERT")).unwrap();
+        let insert = seen.iter().position(|q| is_id_insert(q)).unwrap();
         assert!(insert > last_drop, "the id is written LAST");
         assert!(
             seen[insert].contains("(reset_id, ts)"),
@@ -1235,7 +1793,7 @@ mod tests {
             ResetDecision::RefuseInSession
         );
         assert_eq!(drops_seen(&m), 0);
-        assert_eq!(seen_matching(&m, "INSERT"), 0);
+        assert_eq!(id_inserts(&m), 0);
         assert_eq!(seen_matching(&m, "table_name"), 1, "the volume was checked");
     }
 
@@ -1254,7 +1812,7 @@ mod tests {
             ResetDecision::NothingToWipe
         );
         assert_eq!(drops_seen(&m), 0);
-        assert_eq!(seen_matching(&m, "INSERT"), 1);
+        assert_eq!(id_inserts(&m), 1);
         // The next OFF-hours boot does not wipe the day.
         assert_eq!(
             run_fresh_start_reset_with(&client(), &url(&m), OFF_HOURS_UTC).await,
@@ -1275,7 +1833,7 @@ mod tests {
             run_fresh_start_reset_with(&client(), &url(&m), IN_SESSION_UTC).await,
             ResetDecision::RefuseInSession
         );
-        assert_eq!(seen_matching(&m, "INSERT"), 0);
+        assert_eq!(id_inserts(&m), 0);
     }
 
     #[tokio::test]
@@ -1322,7 +1880,7 @@ mod tests {
             drops_seen(&m),
             drop_statements().len() + RESET_DROP_RETRY_ROUNDS as usize
         );
-        assert_eq!(seen_matching(&m, "INSERT"), 1);
+        assert_eq!(id_inserts(&m), 1);
         assert_eq!(
             run_fresh_start_reset_with(&client(), &url(&m), OFF_HOURS_UTC).await,
             ResetDecision::AlreadyDone
@@ -1353,7 +1911,7 @@ mod tests {
             ResetDecision::Run
         );
         assert_eq!(
-            seen_matching(&m, "INSERT"),
+            id_inserts(&m),
             RESET_ID_WRITE_ATTEMPTS as usize,
             "every id-write attempt was spent"
         );
@@ -1377,7 +1935,7 @@ mod tests {
             run_fresh_start_reset_with(&client(), &url(&m), OFF_HOURS_UTC).await,
             ResetDecision::Run
         );
-        assert_eq!(seen_matching(&m, "INSERT"), 1);
+        assert_eq!(id_inserts(&m), 1);
         assert_eq!(
             run_fresh_start_reset_with(&client(), &url(&m), OFF_HOURS_UTC).await,
             ResetDecision::AlreadyDone
@@ -1399,7 +1957,542 @@ mod tests {
 
     #[test]
     fn the_worst_case_bound_is_the_documented_sum() {
-        // 120 + 60 + 30 statements × 30 + 3 × (90 + 5) + 90.
-        assert_eq!(RESET_WORST_CASE_SECS, 1_455);
+        // 120 + 60 + 30 statements × 30 + 3 × (90 + 5) + 90, plus (44c) the
+        // marker's 3 statements, the census and 18 newest-row probes × 30.
+        assert_eq!(RESET_WORST_CASE_SECS, 2_115);
+    }
+
+    // ---- 2026-09-22 (FOURTH) 44c: rename rather than drop -----------------
+
+    /// 17:30 IST on the same day as `IN_SESSION_UTC` — outside the blackout.
+    const EVENING_UTC: i64 = OFF_HOURS_UTC + 12 * 3600;
+    const RUN_DATE: &str = "20260921";
+
+    /// A REAL-UTC second as the naive-IST micros the reset tables stamp.
+    const fn ist_naive_micros(utc_secs: i64) -> i64 {
+        (utc_secs + IST_UTC_OFFSET_SECONDS_I64) * 1_000_000
+    }
+
+    /// Every (kind × newest × marker) permutation, expected value written out
+    /// rather than recomputed.
+    #[test]
+    fn reset_action_full_permutation_grid() {
+        use MarkerState as M;
+        use NewestRow as N;
+        use ResetAction as A;
+        let m = 1_000_000_i64;
+        let newest = [
+            N::NoRows,
+            N::At(m - 1),
+            N::At(m),
+            N::At(m + 1),
+            N::Unreadable,
+        ];
+        let markers = [M::Present(m), M::Absent, M::Unreadable];
+        for n in newest {
+            for mk in markers {
+                assert_eq!(
+                    reset_action(ObjectKind::View, n, mk),
+                    A::DropView,
+                    "{n:?} {mk:?}"
+                );
+                assert_eq!(
+                    reset_action(ObjectKind::Missing, n, mk),
+                    A::Skip,
+                    "{n:?} {mk:?}"
+                );
+            }
+        }
+        let table: [(NewestRow, MarkerState, ResetAction); 15] = [
+            (N::NoRows, M::Present(m), A::DropTable),
+            (N::NoRows, M::Absent, A::DropTable),
+            (N::NoRows, M::Unreadable, A::DropTable),
+            (N::At(m - 1), M::Present(m), A::DropTable),
+            (N::At(m - 1), M::Absent, A::Rename),
+            (N::At(m - 1), M::Unreadable, A::Rename),
+            (N::At(m), M::Present(m), A::Rename),
+            (N::At(m), M::Absent, A::Rename),
+            (N::At(m), M::Unreadable, A::Rename),
+            (N::At(m + 1), M::Present(m), A::Rename),
+            (N::At(m + 1), M::Absent, A::Rename),
+            (N::At(m + 1), M::Unreadable, A::Rename),
+            (N::Unreadable, M::Present(m), A::Rename),
+            (N::Unreadable, M::Absent, A::Rename),
+            (N::Unreadable, M::Unreadable, A::Rename),
+        ];
+        for (n, mk, want) in table {
+            assert_eq!(reset_action(ObjectKind::Table, n, mk), want, "{n:?} {mk:?}");
+        }
+    }
+
+    proptest::proptest! {
+        /// Around the boundary: a table is dropped iff its newest row is
+        /// STRICTLY before the cutoff, and only when the marker is present.
+        #[test]
+        fn a_table_is_dropped_only_strictly_before_the_marker(
+            m in proptest::prelude::any::<i64>(),
+            d in -5_i64..=5,
+        ) {
+            let t = m.saturating_add(d);
+            let got = reset_action(ObjectKind::Table, NewestRow::At(t), MarkerState::Present(m));
+            let want = if t < m { ResetAction::DropTable } else { ResetAction::Rename };
+            proptest::prop_assert_eq!(got, want);
+            for mk in [MarkerState::Absent, MarkerState::Unreadable] {
+                proptest::prop_assert_eq!(
+                    reset_action(ObjectKind::Table, NewestRow::At(t), mk),
+                    ResetAction::Rename
+                );
+            }
+        }
+
+        /// The cutoff never moves LATER than the marker in naive IST: a row
+        /// written after the marker (ts >= its naive-IST instant minus the
+        /// bucket lag) is always renamed.
+        #[test]
+        fn a_row_inside_the_lag_margin_is_renamed(
+            marker_secs in 0_i64..4_102_444_800,
+            back in 0_i64..=NEWEST_ROW_LAG_MARGIN_SECS,
+        ) {
+            let cutoff = marker_cutoff_micros(marker_secs * 1_000_000);
+            let row = ist_naive_micros(marker_secs) - back * 1_000_000;
+            proptest::prop_assert_eq!(
+                reset_action(ObjectKind::Table, NewestRow::At(row), MarkerState::Present(cutoff)),
+                ResetAction::Rename
+            );
+        }
+    }
+
+    #[test]
+    fn the_marker_cutoff_is_naive_ist_minus_the_margin_and_saturates() {
+        assert_eq!(marker_cutoff_micros(0), (19_800 - 3_900) * 1_000_000);
+        assert_eq!(marker_cutoff_micros(i64::MAX), i64::MAX - 3_900 * 1_000_000);
+        assert_eq!(
+            marker_cutoff_micros(i64::MIN),
+            i64::MIN + (19_800 - 3_900) * 1_000_000
+        );
+        assert_ne!(FIRST_BOOT_MARKER_ID, FRESH_START_RESET_ID);
+        assert!(!FIRST_BOOT_MARKER_ID.contains('\''));
+    }
+
+    #[test]
+    fn ist_date_rolls_at_ist_midnight_not_utc() {
+        assert_eq!(ist_yyyymmdd(OFF_HOURS_UTC), 20_260_921);
+        // 18:29:59 UTC = 23:59:59 IST, same date; one second later rolls.
+        assert_eq!(
+            ist_yyyymmdd(OFF_HOURS_UTC + 18 * 3600 + 29 * 60 + 59),
+            20_260_921
+        );
+        assert_eq!(
+            ist_yyyymmdd(OFF_HOURS_UTC + 18 * 3600 + 30 * 60),
+            20_260_922
+        );
+        assert_eq!(ist_yyyymmdd(i64::MAX), 19_700_101);
+    }
+
+    fn is_questdb_identifier(s: &str) -> bool {
+        s.len() <= 127
+            && s.starts_with(|c: char| c.is_ascii_lowercase())
+            && s.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    }
+
+    #[test]
+    fn the_rename_target_is_deterministic_and_a_valid_identifier() {
+        for table in RESET_TABLES {
+            let a = rename_target(table, 20_260_921, |_| false).unwrap();
+            let b = rename_target(table, 20_260_921, |_| false).unwrap();
+            assert_eq!(a, b);
+            assert_eq!(a, format!("{table}_pre_reset_20260921"));
+            assert!(is_questdb_identifier(&a), "{a}");
+            assert!(!RESET_TABLES.contains(&a.as_str()) && !RESET_VIEWS.contains(&a.as_str()));
+            assert!(!SEBI_NEVER_RESET.contains(&a.as_str()));
+        }
+        // Zero-padded, so a date always renders as eight digits.
+        assert_eq!(
+            rename_target("ticks", 1_010_101, |_| false).unwrap(),
+            "ticks_pre_reset_01010101"
+        );
+        // Taken -> numbered suffix, in order.
+        let base = "ticks_pre_reset_20260921";
+        assert_eq!(
+            rename_target("ticks", 20_260_921, |n| n == base).unwrap(),
+            format!("{base}_2")
+        );
+        let t = rename_target("ticks", 20_260_921, |n| {
+            n == base || n == format!("{base}_2")
+        });
+        assert_eq!(t.unwrap(), format!("{base}_3"));
+        // Every candidate taken -> None, never a drop.
+        assert_eq!(rename_target("ticks", 20_260_921, |_| true), None);
+    }
+
+    #[test]
+    fn parse_count_and_long_and_table_names() {
+        assert_eq!(
+            parse_count_and_long(r#"{"dataset":[[2,1700000000000000]]}"#),
+            Some((2, Some(1_700_000_000_000_000)))
+        );
+        assert_eq!(
+            parse_count_and_long(r#"{"dataset":[[0,null]]}"#),
+            Some((0, None))
+        );
+        assert_eq!(parse_count_and_long(r#"{"dataset":[[1,"x"]]}"#), None);
+        assert_eq!(parse_count_and_long(r#"{"dataset":[[-1,null]]}"#), None);
+        assert_eq!(parse_count_and_long(r#"{"dataset":[[1]]}"#), None);
+        assert_eq!(parse_count_and_long("nope"), None);
+        assert_eq!(
+            parse_table_names(r#"{"dataset":[["ticks"],["candles_1m"]]}"#),
+            Some(vec!["ticks".to_owned(), "candles_1m".to_owned()])
+        );
+        assert_eq!(parse_table_names(r#"{"dataset":[]}"#), Some(vec![]));
+        assert_eq!(parse_table_names(r#"{"dataset":[[1]]}"#), None);
+        assert_eq!(parse_table_names(r#"{"error":"x"}"#), None);
+    }
+
+    fn renames_of(m: &Mock, table: &str) -> Vec<String> {
+        m.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|q| q.contains(&format!("RENAME TABLE '{table}' TO")))
+            .cloned()
+            .collect()
+    }
+
+    /// `ticks` holds a row from 11:30 IST; `candles_1m` only one from 08:30.
+    fn day_rows(table: &str) -> Newest {
+        match table {
+            "ticks" => Newest::Rows(5, Some(ist_naive_micros(IN_SESSION_UTC + 3600))),
+            "candles_1m" => Newest::Rows(3, Some(ist_naive_micros(IN_SESSION_UTC - 2 * 3600))),
+            _ => Newest::Rows(0, None),
+        }
+    }
+
+    /// THE regression (2026-09-22 FOURTH): an in-session boot defers the wipe
+    /// and writes into the old tables; the evening boot must RENAME a table
+    /// holding that day's rows, not drop it.
+    #[tokio::test]
+    async fn a_deferred_reset_renames_what_the_session_wrote() {
+        let m = spawn_mock_with(Cfg {
+            newest: day_rows,
+            ..Cfg::default()
+        })
+        .await;
+        assert_eq!(
+            run_fresh_start_reset_with(&client(), &url(&m), IN_SESSION_UTC).await,
+            ResetDecision::RefuseInSession
+        );
+        assert_eq!(
+            seen_matching(&m, "first-boot"),
+            3,
+            "read, insert, read back"
+        );
+        assert_eq!(
+            run_fresh_start_reset_with(&client(), &url(&m), EVENING_UTC).await,
+            ResetDecision::Run
+        );
+        assert_eq!(
+            renames_of(&m, "ticks").len(),
+            1,
+            "the session's table is renamed aside"
+        );
+        assert!(renames_of(&m, "ticks")[0].contains(&format!("'ticks_pre_reset_{RUN_DATE}'")));
+        assert_eq!(seen_matching(&m, "DROP TABLE IF EXISTS ticks;"), 0);
+        assert_eq!(
+            seen_matching(&m, "DROP TABLE IF EXISTS candles_1m;"),
+            1,
+            "a table holding only pre-marker rows is still dropped"
+        );
+        assert_eq!(id_inserts(&m), 1);
+        assert_eq!(
+            run_fresh_start_reset_with(&client(), &url(&m), EVENING_UTC).await,
+            ResetDecision::AlreadyDone
+        );
+    }
+
+    /// HIGH (2026-09-22 hostile review): a retry boot must NOT rename a table
+    /// that holds only post-marker rows — that is the live table the DDL
+    /// recreated after an earlier pass, and renaming it empties it every boot.
+    #[tokio::test]
+    async fn a_retry_boot_leaves_a_table_holding_only_post_marker_rows_alone() {
+        fn oldest_is_newest(table: &str) -> Newest {
+            day_rows(table)
+        }
+        let m = spawn_mock_with(Cfg {
+            newest: day_rows,
+            oldest: oldest_is_newest,
+            ..Cfg::default()
+        })
+        .await;
+        assert_eq!(
+            run_fresh_start_reset_with(&client(), &url(&m), IN_SESSION_UTC).await,
+            ResetDecision::RefuseInSession
+        );
+        assert_eq!(
+            run_fresh_start_reset_with(&client(), &url(&m), EVENING_UTC).await,
+            ResetDecision::Run
+        );
+        assert!(
+            renames_of(&m, "ticks").is_empty(),
+            "a table whose OLDEST row is post-marker is already fresh — never renamed"
+        );
+        assert_eq!(seen_matching(&m, "DROP TABLE IF EXISTS ticks;"), 0);
+        assert_eq!(seen_matching(&m, "DROP TABLE IF EXISTS candles_1m;"), 1);
+        assert_eq!(id_inserts(&m), 1);
+    }
+
+    #[test]
+    fn refine_rename_skips_only_a_provably_post_marker_table() {
+        let m = 1_000_000_i64;
+        let cases = [
+            (NewestRow::At(m), MarkerState::Present(m), ResetAction::Skip),
+            (
+                NewestRow::At(m + 1),
+                MarkerState::Present(m),
+                ResetAction::Skip,
+            ),
+            (
+                NewestRow::At(m - 1),
+                MarkerState::Present(m),
+                ResetAction::Rename,
+            ),
+            (NewestRow::At(m), MarkerState::Absent, ResetAction::Rename),
+            (
+                NewestRow::At(m),
+                MarkerState::Unreadable,
+                ResetAction::Rename,
+            ),
+            (
+                NewestRow::Unreadable,
+                MarkerState::Present(m),
+                ResetAction::Rename,
+            ),
+            (
+                NewestRow::NoRows,
+                MarkerState::Present(m),
+                ResetAction::Rename,
+            ),
+        ];
+        for (oldest, marker, want) in cases {
+            assert_eq!(refine_rename(oldest, marker), want, "{oldest:?} {marker:?}");
+        }
+    }
+
+    /// The normal first boot (marker written THIS boot): rows from a
+    /// previous session are older than the cutoff and are dropped.
+    #[tokio::test]
+    async fn a_first_boot_run_still_drops_old_rows() {
+        fn ancient(_: &str) -> Newest {
+            Newest::Rows(9, Some(0))
+        }
+        let m = spawn_mock_with(Cfg {
+            newest: ancient,
+            ..Cfg::default()
+        })
+        .await;
+        assert_eq!(
+            run_fresh_start_reset_with(&client(), &url(&m), EVENING_UTC).await,
+            ResetDecision::Run
+        );
+        assert_eq!(seen_matching(&m, "RENAME"), 0);
+        assert_eq!(drops_seen(&m), drop_statements().len());
+        assert_eq!(id_inserts(&m), 1);
+    }
+
+    /// A refused RENAME leaves the table alone AND leaves the id unwritten,
+    /// so the next boot retries; once it succeeds the id is written.
+    #[tokio::test]
+    async fn a_failed_rename_does_not_mark_the_reset_done() {
+        let m = spawn_mock_with(Cfg {
+            marker: Some(QDB_NOW_MICROS),
+            newest: day_rows,
+            refuse_rename: Some(("ticks", 1 + RESET_DROP_RETRY_ROUNDS as usize)),
+            ..Cfg::default()
+        })
+        .await;
+        assert_eq!(
+            run_fresh_start_reset_with(&client(), &url(&m), EVENING_UTC).await,
+            ResetDecision::Run
+        );
+        assert_eq!(
+            renames_of(&m, "ticks").len(),
+            1 + RESET_DROP_RETRY_ROUNDS as usize
+        );
+        assert_eq!(
+            seen_matching(&m, "DROP TABLE IF EXISTS ticks;"),
+            0,
+            "never a drop"
+        );
+        assert_eq!(id_inserts(&m), 0, "the reset is NOT marked done");
+        assert_eq!(
+            run_fresh_start_reset_with(&client(), &url(&m), EVENING_UTC).await,
+            ResetDecision::Run,
+            "the next boot retries"
+        );
+        assert_eq!(id_inserts(&m), 1);
+        assert_eq!(
+            run_fresh_start_reset_with(&client(), &url(&m), EVENING_UTC).await,
+            ResetDecision::AlreadyDone
+        );
+    }
+
+    fn old_rows_everywhere(_: &str) -> Newest {
+        Newest::Rows(1, Some(0))
+    }
+
+    /// Marker write refused (Absent) or marker unreadable: FAIL CLOSED —
+    /// every table holding rows is renamed, not one is dropped.
+    #[tokio::test]
+    async fn an_absent_or_unreadable_marker_renames_every_non_empty_table() {
+        for (insert_ok, read_ok) in [(false, true), (true, false)] {
+            let m = spawn_mock_with(Cfg {
+                marker_insert_ok: insert_ok,
+                marker_read_ok: read_ok,
+                newest: old_rows_everywhere,
+                ..Cfg::default()
+            })
+            .await;
+            assert_eq!(
+                run_fresh_start_reset_with(&client(), &url(&m), EVENING_UTC).await,
+                ResetDecision::Run
+            );
+            assert_eq!(seen_matching(&m, "DROP TABLE"), 0, "{insert_ok} {read_ok}");
+            assert_eq!(seen_matching(&m, "RENAME TABLE"), RESET_TABLES.len());
+            assert_eq!(seen_matching(&m, "DROP VIEW IF EXISTS"), RESET_VIEWS.len());
+        }
+    }
+
+    /// A newest-row probe that is refused is never read as "empty".
+    #[tokio::test]
+    async fn an_unreadable_newest_row_probe_renames() {
+        fn refuse(_: &str) -> Newest {
+            Newest::Refuse
+        }
+        let m = spawn_mock_with(Cfg {
+            marker: Some(QDB_NOW_MICROS),
+            newest: refuse,
+            ..Cfg::default()
+        })
+        .await;
+        assert_eq!(
+            run_fresh_start_reset_with(&client(), &url(&m), EVENING_UTC).await,
+            ResetDecision::Run
+        );
+        assert_eq!(seen_matching(&m, "DROP TABLE"), 0);
+        assert_eq!(seen_matching(&m, "RENAME TABLE"), RESET_TABLES.len());
+    }
+
+    const TICKS_TAKEN: &[&str] = &["ticks_pre_reset_20260921"];
+    const TICKS_ALL_TAKEN: &[&str] = &[
+        "ticks_pre_reset_20260921",
+        "ticks_pre_reset_20260921_2",
+        "ticks_pre_reset_20260921_3",
+        "ticks_pre_reset_20260921_4",
+        "ticks_pre_reset_20260921_5",
+        "ticks_pre_reset_20260921_6",
+        "ticks_pre_reset_20260921_7",
+        "ticks_pre_reset_20260921_8",
+        "ticks_pre_reset_20260921_9",
+    ];
+
+    #[tokio::test]
+    async fn a_taken_rename_target_gets_a_suffix_and_all_taken_skips() {
+        let m = spawn_mock_with(Cfg {
+            marker: Some(QDB_NOW_MICROS),
+            newest: day_rows,
+            census: Census::AllPlus(TICKS_TAKEN),
+            ..Cfg::default()
+        })
+        .await;
+        run_fresh_start_reset_with(&client(), &url(&m), EVENING_UTC).await;
+        assert!(renames_of(&m, "ticks")[0].contains("'ticks_pre_reset_20260921_2'"));
+        assert_eq!(id_inserts(&m), 1);
+
+        let m = spawn_mock_with(Cfg {
+            marker: Some(QDB_NOW_MICROS),
+            newest: day_rows,
+            census: Census::AllPlus(TICKS_ALL_TAKEN),
+            ..Cfg::default()
+        })
+        .await;
+        assert_eq!(
+            run_fresh_start_reset_with(&client(), &url(&m), EVENING_UTC).await,
+            ResetDecision::Run
+        );
+        assert!(renames_of(&m, "ticks").is_empty());
+        assert_eq!(
+            seen_matching(&m, "DROP TABLE IF EXISTS ticks;"),
+            0,
+            "never a drop"
+        );
+        assert_eq!(id_inserts(&m), 0, "skipped, so the reset retries");
+    }
+
+    /// SEBI tables sit in the census holding rows; no statement the reset
+    /// sends ever names one — the decision is never reached for them.
+    #[tokio::test]
+    async fn no_statement_ever_names_a_sebi_table() {
+        let m = spawn_mock_with(Cfg {
+            newest: old_rows_everywhere,
+            marker_insert_ok: false,
+            ..Cfg::default()
+        })
+        .await;
+        run_fresh_start_reset_with(&client(), &url(&m), EVENING_UTC).await;
+        let seen = m.seen.lock().unwrap().clone();
+        for sebi in SEBI_NEVER_RESET {
+            assert!(
+                seen.iter()
+                    .all(|q| !q.contains(&format!(" {sebi};")) && !q.contains(&format!("'{sebi}'"))),
+                "{sebi} reached a statement"
+            );
+        }
+    }
+
+    /// A name only in RESET_VIEWS gets `DROP VIEW IF EXISTS` and nothing else.
+    #[tokio::test]
+    async fn a_view_name_only_ever_gets_drop_view_if_exists() {
+        let m = spawn_mock_with(Cfg {
+            newest: old_rows_everywhere,
+            ..Cfg::default()
+        })
+        .await;
+        run_fresh_start_reset_with(&client(), &url(&m), EVENING_UTC).await;
+        for view in RESET_VIEWS.iter().filter(|v| !RESET_TABLES.contains(v)) {
+            assert_eq!(
+                seen_matching(&m, &format!("DROP VIEW IF EXISTS {view};")),
+                1
+            );
+            assert_eq!(
+                seen_matching(&m, &format!("DROP TABLE IF EXISTS {view};")),
+                0
+            );
+            assert_eq!(seen_matching(&m, &format!("TABLE '{view}'")), 0);
+            assert_eq!(seen_matching(&m, &format!("FROM {view};")), 0);
+        }
+    }
+
+    const ONLY_TICKS: &[&str] = &["ticks"];
+
+    #[tokio::test]
+    async fn a_missing_table_is_skipped_and_an_unreadable_census_probes_everything() {
+        let m = spawn_mock_with(Cfg {
+            census: Census::Only(ONLY_TICKS),
+            ..Cfg::default()
+        })
+        .await;
+        run_fresh_start_reset_with(&client(), &url(&m), EVENING_UTC).await;
+        assert_eq!(seen_matching(&m, "max(ts)"), 1);
+        assert_eq!(seen_matching(&m, "DROP TABLE"), 1);
+        assert_eq!(seen_matching(&m, "DROP TABLE IF EXISTS market_depth;"), 0);
+        assert_eq!(id_inserts(&m), 1);
+
+        let m = spawn_mock_with(Cfg {
+            census: Census::Refuse,
+            ..Cfg::default()
+        })
+        .await;
+        run_fresh_start_reset_with(&client(), &url(&m), EVENING_UTC).await;
+        assert_eq!(seen_matching(&m, "max(ts)"), RESET_TABLES.len());
     }
 }
