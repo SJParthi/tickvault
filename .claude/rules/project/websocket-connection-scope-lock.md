@@ -7700,3 +7700,45 @@ isolates them. The only way a real print could match is if the receipt instant w
 - Changes the designated timestamp, the DEDUP key, or `row_timestamp_ist_nanos`'s fallback under cover of this change.
 - Reorders the CREATE without keeping `received_at` first and `ts` second.
 - Removes `ticks` from `RESET_TABLES` before the reset has run once in production (the new order would then never apply).
+
+### 2026-09-22 (FOURTH) — the fast-lane silent-loss closures, and the drain loses its last database write
+
+**The verbatim operator demand (2026-09-22, typed directly in-session — preserve EXACTLY, typos included):**
+
+> "Dude meanwhile eveen entilrey related to this dhans fast lane also ensure to fix and resolve everything dude especially to achieve O(1) dude okay? See because we always need to achieve this dhans super fast lane dude see we need to use our entire Aws instance including Unix Linux sockets pinning core affinity reading modifying enhancing adjusting pinning ram memory app db pressure wal ring bugger etc etc etc etc etc everything entirely to achieve the extreme super fast lane to always achieve O(1) dude okay?"
+
+> "Try to attack evrythign to find all kinds of extreme worst case eprmuations and combinations as well"
+
+Given in DIRECT response to a message that ENUMERATED the four ways the lane can still lose ticks without paging anyone, plus the reader/writer split and moving the `top_volume` append off the drain, and said each was designed but not yet built. That is the §28.2/§28.3 authorization shape this repository already accepts. It is also the dated line the 2026-09-13 correction above requires before the `top_volume` append moves off the frame drain (*"Moving it off the drain changes the data flow of a scope-locked module, so it needs its own dated line here first"*). Recorded HERE before any code.
+
+#### What this authorizes
+
+| # | Change | Why it is a silent-loss or stall path today |
+|---|---|---|
+| 1 | **An in-session restart dials sooner.** The boot WAL catch-up keeps its 300 s budget outside the capture window and takes a SHORT budget inside it; whatever is left stays a `*.wal` file for the next out-of-session boot | The catch-up runs BEFORE the sockets dial. A restart at 10:30 with a backlog kept all sixteen sockets dark for up to five minutes, and Dhan has no snapshot-on-subscribe and no sequence number, so those ticks are gone at source |
+| 2 | **An unknown packet code no longer discards the rest of its frame** when the vendor's own `message_length` stamp is plausible AND the header it points at decodes cleanly. Otherwise the existing abandon-and-count behaviour stands | One unlisted code threw away every packet stacked after it, including a disconnect packet |
+| 3 | **The fresh-start reset never destroys rows written after this build first booted.** Such a table is RENAMED aside instead of dropped; names in the view list are always dropped with `DROP VIEW IF EXISTS` | A reset refused mid-session let the day write into the old tables, and the next boot dropped them |
+| 4 | **The WAL AGE prune keeps any segment the applied watermark has not passed.** The BYTE-cap prune stays as the disk-full last resort, and when it deletes an unapplied segment that is counted and logged | The prune never consulted the watermark, so shed frames could be deleted before any replay reached them |
+| 5 | **The `top_volume` per-row ILP append leaves the frame drain** and runs on the writer thread that already owns the flush | MEASURED 14,932 µs at the ceiling, on the task that reads ticks |
+| 6 | **The socket reader no longer waits on a depth swap's wire writes** | A swap or top-up held the reader for up to ~2 s (per swap) to ~6 s (per top-up) while the kernel receive buffer filled |
+| 7 | **Flush-path counters are resolved once, and ILP buffers are recycled** instead of allocated per flush | Allocation and label-keyed map probes on the persistence path |
+
+#### ⚠ What this does NOT authorize, and two items it deliberately leaves out
+
+- **No new CloudWatch alarm, EMF name or Telegram page.** The September forecast is $142.24 against a $135.00 automatic `STOP_EC2_INSTANCES` line, and §2.3n of the noise lock requires a LEVER, not a cost note. Every new counter here is local `/metrics` plus a coded log line. Paging on abandoned bytes or on a reset refusal needs its own dated row in `dhan-rest-only-noise-lock-2026-07-14.md` with a lever.
+- **`MemoryHigh=20G` is NOT lowered.** An audit recommended 16G. The unit file records why 20G is load-bearing: a 21 GB spill read whole drove RSS to 20.96 GiB and the watchdog SIGABRTed a working process every ~9 minutes; 15G re-enters that loop. The audit was wrong on this point and is recorded as wrong rather than acted on.
+- **No instance, volume, IOPS or core-count change.** A separate volume for the WAL and spill tiers, or a larger instance so QuestDB and the app get disjoint cores, are money decisions for the operator.
+- No change to the socket budget (16), the four endpoint types, the subscription set, `dry_run`, or the §28 frozen area.
+
+#### ⚠ Honest envelope
+
+Per tick and per lookup the lane stays O(1) and allocation-free (DHAT-gated). NOT claimed: that a restart is now free — the short in-session budget shortens the blind window, it does not remove it, and anything the WAL did not capture is not recoverable by anyone. NOT claimed: that an unknown packet is now always recovered — the skip trusts a vendor length stamp whose semantics are still UNVERIFIED-LIVE for every code, which is why it is gated on the next header decoding cleanly and falls back to abandoning. NOT claimed: that the byte-cap prune can never delete unreplayed frames — on a full disk it must, and it now says so.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Skips an unknown packet on its length stamp alone, without validating the header it lands on.
+- Drops a table in the fresh-start reset that holds a row newer than the build's first boot.
+- Makes the byte-cap prune respect the watermark unconditionally (turns a pruned backlog into a full disk).
+- Lengthens the in-session catch-up budget back toward 300 s.
+- Adds an alarm, EMF name or page for any of the above without a lever.
+- Lowers `MemoryHigh` below 20G citing this section.
