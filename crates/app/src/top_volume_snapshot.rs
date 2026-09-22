@@ -509,6 +509,33 @@ pub struct CandleBarReading {
     pub open_pct: f64,
 }
 
+impl CandleBarReading {
+    /// Reads one bar the fold returned for a row's window.
+    ///
+    /// The sweep fires AT the window close, so that bar is usually still the
+    /// OPEN bucket — no tick stamped past the boundary has landed yet. The two
+    /// percentages are written only when a bucket seals, so on an open bucket
+    /// they still read 0.0, and 0.0 passes the finite filter and would be
+    /// stored as a real "unchanged on the day". Stamping this COPY runs the
+    /// exact function the seal runs, on the same close / previous-day close /
+    /// session open, so the value is the one the candle row will carry for the
+    /// ticks folded so far. Idempotent on a sealed bar.
+    ///
+    /// # Complexity
+    /// O(1): three percentage computations on a `Copy` value, no allocation.
+    #[must_use]
+    pub fn from_bar(
+        mut bar: tickvault_trading::candles::live_candle_state::LiveCandleState,
+    ) -> Self {
+        bar.stamp_seal_percentages();
+        Self {
+            signed_volume: bar.signed_volume(),
+            close_pct_from_prev_day: bar.close_pct_from_prev_day,
+            open_pct: bar.open_pct,
+        }
+    }
+}
+
 /// Projects one family's ranked slice into storable rows.
 ///
 /// `is_subscribed` is supplied by the caller because the leaderboard does not
@@ -2052,5 +2079,67 @@ mod tests {
         // otherwise this test would pass by both sides being empty.
         assert_eq!(with.rows[0].volume, Some(-4_242));
         assert_eq!(without.rows[0].volume, None);
+    }
+
+    // -- from_bar (2026-09-22, hostile finding B1) -------------------------
+
+    /// The sweep fires AT the window close, so the bar it probes is usually
+    /// still the OPEN bucket, whose two percentages are unstamped (0.0). A
+    /// field-by-field copy stored that 0.0 as a real "unchanged on the day"
+    /// while the candle row for the same bar later carried the true figure.
+    /// `from_bar` must stamp the copy with the seal's own function.
+    #[test]
+    fn from_bar_stamps_an_open_bucket_rather_than_copying_its_zeros() {
+        use tickvault_trading::candles::LiveCandleState;
+        let mut open = LiveCandleState::empty();
+        open.close = 110.0;
+        open.prev_day_close = 100.0;
+        open.session_open = 105.0;
+        // What an OPEN bucket carries: the seal has not stamped it yet.
+        open.close_pct_from_prev_day = 0.0;
+        open.open_pct = 0.0;
+
+        let r = CandleBarReading::from_bar(open);
+        assert_eq!(r.close_pct_from_prev_day, 10.0, "110 vs 100 is +10%");
+        assert_eq!(r.open_pct, 4.76, "110 vs 105 is +4.76% (2 dp)");
+
+        // It must equal what the seal itself stamps on the same bar, so the
+        // two tables agree by construction.
+        let mut sealed = open;
+        sealed.stamp_seal_percentages();
+        assert_eq!(r.close_pct_from_prev_day, sealed.close_pct_from_prev_day);
+        assert_eq!(r.open_pct, sealed.open_pct);
+        assert_eq!(r.signed_volume, sealed.signed_volume());
+    }
+
+    /// Idempotent on an already-sealed bar: stamping twice changes nothing.
+    #[test]
+    fn from_bar_is_idempotent_on_a_sealed_bar() {
+        use tickvault_trading::candles::LiveCandleState;
+        let mut bar = LiveCandleState::empty();
+        bar.close = 95.0;
+        bar.prev_day_close = 100.0;
+        bar.session_open = 100.0;
+        bar.stamp_seal_percentages();
+        let r = CandleBarReading::from_bar(bar);
+        assert_eq!(r.close_pct_from_prev_day, -5.0);
+        assert_eq!(r.open_pct, -5.0);
+    }
+
+    /// The feed stack's probe closure must go through `from_bar`. A revert
+    /// to a field-by-field struct literal re-opens B1 and compiles cleanly,
+    /// so it is pinned at the source.
+    #[test]
+    fn the_feed_stack_probe_reads_the_candle_through_from_bar() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        assert!(
+            prod.contains(".map(crate::top_volume_snapshot::CandleBarReading::from_bar)"),
+            "the top_volume candle probe must stamp via from_bar"
+        );
+        assert!(
+            !prod.contains("crate::top_volume_snapshot::CandleBarReading {"),
+            "a field-by-field CandleBarReading literal copies the open bucket's unstamped zeros"
+        );
     }
 }

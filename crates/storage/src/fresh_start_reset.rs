@@ -13,7 +13,8 @@
 //! |---|---|---|
 //! | id present | — | [`ResetDecision::AlreadyDone`] — nothing happens, forever |
 //! | unreadable / unwritable | — | [`ResetDecision::RefuseUnreadable`] — boots on whatever schema exists, loudly; NEVER wipes on a guess |
-//! | id absent | yes | [`ResetDecision::RefuseInSession`] — never wipes a live session; the next out-of-session boot runs it |
+//! | id absent, none of the reset tables exist | yes | [`ResetDecision::NothingToWipe`] — a bare-nuked volume; the id is recorded so no later boot wipes today |
+//! | id absent, reset tables exist (or unknown) | yes | [`ResetDecision::RefuseInSession`] — never wipes a live session; the next out-of-session boot runs it |
 //! | id absent | no | [`ResetDecision::Run`] — drop the allowlist, write the id, re-read it |
 //!
 //! The drops are followed by the boot's ordinary ensure path in the SAME boot:
@@ -28,6 +29,11 @@
 //! one needs its own dated operator quote in the scope lock first. The id is
 //! written LAST and then RE-READ; if the re-read does not find it the boot
 //! says so loudly, because a wipe whose id is missing would repeat.
+//!
+//! A DROP QuestDB refuses is retried [`RESET_DROP_RETRY_ROUNDS`] more times
+//! before it is given up on, and the id write is tried
+//! [`RESET_ID_WRITE_ATTEMPTS`] times, reading back before each re-insert so a
+//! write whose reply was lost is never doubled.
 //!
 //! The id is written after the drop pass even when an individual DROP was
 //! refused. A refused DROP is named in a coded error for the operator; NOT
@@ -61,7 +67,23 @@
 //!   triaged. No alarm pages on it.
 //! - **A bare nuke of the QuestDB volume deletes the log with everything else.**
 //!   The next boot then "resets" an empty volume — a harmless no-op that
-//!   re-writes the id.
+//!   re-writes the id. If that boot is IN-session it checks which reset tables
+//!   exist; with none it records the id rather than deferring, so the next
+//!   out-of-session boot does not drop the day this one captures. An
+//!   unreadable answer to that check keeps the deferral.
+//! - **Rows from before the reset can come back in the same boot.** The tick
+//!   and depth spill drains and the staged live-feed WAL run AFTER the drops
+//!   and write whatever they hold into the fresh tables. The seal spill is
+//!   version-gated and does not.
+//! - **A refused recreate after the drop leaves a table without its DEDUP
+//!   key.** If the ensure DDL that follows the reset is refused on every
+//!   attempt, the first ILP write auto-creates the table key-less, and the
+//!   reset never runs again. Before this reset those tables normally already
+//!   existed, so a refused ensure cost nothing.
+//! - **Time bound.** Retries of the log read and of refused DROPs stop
+//!   starting after [`RESET_RETRY_BUDGET_SECS`]. If every statement hangs its
+//!   full HTTP timeout the call is bounded by [`RESET_WORST_CASE_SECS`]; a
+//!   QuestDB that answers with a refusal costs seconds.
 //! - **Not verified against a live QuestDB.** Port 9000 is unreachable from the
 //!   build container. The HTTP exchange is pinned by a mock server below; the
 //!   first boot after deploy is the measurement.
@@ -207,6 +229,38 @@ const _: () = assert!(RESET_LOG_READ_ATTEMPTS >= 1);
 // enough to cross the 5-minute margin ahead of the persist window.
 const _: () = assert!((RESET_LOG_READ_ATTEMPTS as u64 - 1) * RESET_LOG_READ_BACKOFF_SECS < 300);
 
+/// Extra rounds for DROPs QuestDB refused on the first pass (added 2026-09-22,
+/// review finding A03). A refused DROP left alone keeps the OLD schema for the
+/// life of that table, because the id is written and the reset never returns.
+pub const RESET_DROP_RETRY_ROUNDS: u32 = 2;
+
+/// Attempts at writing the id and reading it back (added 2026-09-22). One lost
+/// write used to mean the next out-of-session boot re-ran the whole wipe and
+/// dropped the day captured in between, with nothing paging.
+pub const RESET_ID_WRITE_ATTEMPTS: u32 = 3;
+
+/// Wall-clock budget after which the reset stops STARTING retries of the log
+/// read and of refused DROPs. First attempts and the id write are not cut.
+///
+/// Honest worst case, if every statement hangs its full
+/// `RESET_HTTP_TIMEOUT_SECS`: the read phase can pass the budget by one
+/// attempt (2 statements), the first drop pass is one statement per object,
+/// and the id write is its count bound. [`RESET_WORST_CASE_SECS`] is that sum.
+/// A QuestDB that REFUSES (a fast 400) costs seconds, not this.
+pub const RESET_RETRY_BUDGET_SECS: u64 = 120;
+
+/// Upper bound on one reset call when every statement hangs to its timeout.
+pub const RESET_WORST_CASE_SECS: u64 = RESET_RETRY_BUDGET_SECS
+    + 2 * RESET_HTTP_TIMEOUT_SECS
+    + (RESET_VIEWS.len() + RESET_TABLES.len()) as u64 * RESET_HTTP_TIMEOUT_SECS
+    + RESET_ID_WRITE_ATTEMPTS as u64 * (3 * RESET_HTTP_TIMEOUT_SECS + RESET_LOG_READ_BACKOFF_SECS)
+    + 3 * RESET_HTTP_TIMEOUT_SECS;
+
+const _: () = assert!(RESET_ID_WRITE_ATTEMPTS >= 1);
+// Stays well inside an hour, so an unattended bad boot still finishes long
+// before the 08:55 IST blackout that a 06:00 recovery might otherwise meet.
+const _: () = assert!(RESET_WORST_CASE_SECS < 3600);
+
 /// The boot's verdict on the one-shot reset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResetDecision {
@@ -218,6 +272,10 @@ pub enum ResetDecision {
     RefuseInSession,
     /// The log could not be created or read — never wipe on a guess.
     RefuseUnreadable,
+    /// In-session boot on a volume holding NONE of [`RESET_TABLES`] (a bare
+    /// nuke): nothing to drop, so the id is recorded instead of deferring a
+    /// wipe that would later destroy the day this boot captures.
+    NothingToWipe,
 }
 
 impl ResetDecision {
@@ -229,6 +287,7 @@ impl ResetDecision {
             Self::Run => "run",
             Self::RefuseInSession => "refused_in_session",
             Self::RefuseUnreadable => "refused_unreadable",
+            Self::NothingToWipe => "nothing_to_wipe",
         }
     }
 }
@@ -288,7 +347,9 @@ fn count_log_sql() -> String {
 }
 
 fn insert_log_sql() -> String {
-    format!("INSERT INTO {SCHEMA_RESET_LOG_TABLE} VALUES ('{FRESH_START_RESET_ID}', now());")
+    format!(
+        "INSERT INTO {SCHEMA_RESET_LOG_TABLE} (reset_id, ts) VALUES ('{FRESH_START_RESET_ID}', now());"
+    )
 }
 
 /// Every statement the drop pass issues, in order: views first (a base table
@@ -328,6 +389,22 @@ async fn read_logged_count(client: &Client, base_url: &str) -> Option<i64> {
     parse_count(&body)
 }
 
+/// SQL counting how many of [`RESET_TABLES`] exist right now.
+fn reset_tables_present_sql() -> String {
+    let names: Vec<String> = RESET_TABLES.iter().map(|t| format!("'{t}'")).collect();
+    format!(
+        "SELECT count() FROM tables() WHERE table_name IN ({});",
+        names.join(", ")
+    )
+}
+
+/// How many of [`RESET_TABLES`] exist. `None` when the answer is unreadable —
+/// the caller then keeps its safe default and treats the volume as non-empty.
+async fn reset_tables_present(client: &Client, base_url: &str) -> Option<i64> {
+    let body = exec(client, base_url, &reset_tables_present_sql()).await?;
+    parse_count(&body)
+}
+
 fn record(outcome: &'static str) {
     metrics::counter!("tv_fresh_start_reset_total", "outcome" => outcome).increment(1);
 }
@@ -346,10 +423,47 @@ pub async fn run_fresh_start_reset_with(
         .await
 }
 
+/// Whether the retry budget still allows STARTING another retry.
+fn budget_left(started: tokio::time::Instant) -> bool {
+    started.elapsed() < Duration::from_secs(RESET_RETRY_BUDGET_SECS)
+}
+
+/// Write the id and read it back, up to [`RESET_ID_WRITE_ATTEMPTS`] times.
+///
+/// Bounded by COUNT, never by the budget: a missing id is the worst outcome
+/// this module has (the next out-of-session boot re-runs the whole wipe), so
+/// it always gets every attempt.
+async fn write_and_verify_id(client: &Client, base_url: &str, backoff: Duration) -> (bool, u32) {
+    for attempt in 1..=RESET_ID_WRITE_ATTEMPTS {
+        // An INSERT whose answer was lost may still have landed, so read
+        // before writing again rather than inserting blind a second time.
+        if attempt > 1 && read_logged_count(client, base_url).await.unwrap_or(0) > 0 {
+            return (true, attempt - 1);
+        }
+        let wrote = exec(client, base_url, &insert_log_sql()).await.is_some();
+        if wrote && read_logged_count(client, base_url).await.unwrap_or(0) > 0 {
+            return (true, attempt);
+        }
+        if attempt < RESET_ID_WRITE_ATTEMPTS {
+            warn!(
+                attempt,
+                attempts = RESET_ID_WRITE_ATTEMPTS,
+                "fresh-start reset: the reset id was not confirmed, retrying"
+            );
+            tokio::time::sleep(backoff).await;
+        }
+    }
+    (false, RESET_ID_WRITE_ATTEMPTS)
+}
+
 /// [`run_fresh_start_reset_with`] with a bounded retry on an UNREADABLE log.
 ///
 /// The clock is read AFTER the log answers, so the blackout decision uses the
 /// time the drops would actually run, not the time the boot began.
+///
+/// Retries of the log read and of refused DROPs stop STARTING once
+/// [`RESET_RETRY_BUDGET_SECS`] has elapsed; the id write is bounded by count
+/// alone. Every first attempt always runs.
 pub async fn run_fresh_start_reset_retrying(
     client: &Client,
     base_url: &str,
@@ -357,6 +471,7 @@ pub async fn run_fresh_start_reset_retrying(
     backoff: Duration,
     now_utc_epoch_secs: impl Fn() -> i64,
 ) -> ResetDecision {
+    let started = tokio::time::Instant::now();
     let attempts = attempts.max(1);
     let mut logged = None;
     for attempt in 1..=attempts {
@@ -365,6 +480,14 @@ pub async fn run_fresh_start_reset_retrying(
             break;
         }
         if attempt < attempts {
+            if !budget_left(started) {
+                warn!(
+                    attempt,
+                    budget_secs = RESET_RETRY_BUDGET_SECS,
+                    "fresh-start reset: retry budget spent before the reset log answered"
+                );
+                break;
+            }
             warn!(
                 attempt,
                 attempts, "fresh-start reset: the reset log did not answer, retrying"
@@ -373,8 +496,7 @@ pub async fn run_fresh_start_reset_retrying(
         }
     }
     let ist = ist_secs_of_day(now_utc_epoch_secs());
-    let decision = decide(logged, ist);
-    record(decision.as_str());
+    let mut decision = decide(logged, ist);
 
     match decision {
         ResetDecision::AlreadyDone => {
@@ -383,6 +505,7 @@ pub async fn run_fresh_start_reset_retrying(
                 "fresh-start reset already recorded — nothing to do"
             );
         }
+        ResetDecision::NothingToWipe => {}
         ResetDecision::RefuseUnreadable => {
             error!(
                 code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed
@@ -396,42 +519,78 @@ pub async fn run_fresh_start_reset_retrying(
             );
         }
         ResetDecision::RefuseInSession => {
-            error!(
-                code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed
-                    .code_str(),
-                source = "fresh_start_reset",
-                reset_id = FRESH_START_RESET_ID,
-                ist_secs_of_day = ist,
-                "fresh-start reset DEFERRED: this boot is inside the market session window, \
-                 and the one-shot wipe never runs on a live session. Nothing was dropped. The \
-                 next boot outside 08:55–15:45 IST runs it, and will drop what this boot writes."
-            );
-        }
-        ResetDecision::Run => {
-            let mut refused: Vec<&'static str> = Vec::new();
-            for (object, sql) in drop_statements() {
-                if exec(client, base_url, &sql).await.is_none() {
-                    refused.push(object);
+            // A bare-nuked volume booted in-session has NOTHING to wipe: the
+            // ensure DDL below creates every table on the new schema. Deferring
+            // anyway would let the next out-of-session boot drop the whole day
+            // this boot captures, so record the id instead. Only a positive
+            // zero counts — an unreadable answer keeps the deferral.
+            if reset_tables_present(client, base_url).await == Some(0) {
+                let (verified, _) = write_and_verify_id(client, base_url, backoff).await;
+                if verified {
+                    info!(
+                        reset_id = FRESH_START_RESET_ID,
+                        ist_secs_of_day = ist,
+                        "fresh-start reset: in-session boot on a volume with none of the reset \
+                         tables — nothing to wipe, id recorded so no later boot wipes today"
+                    );
+                    decision = ResetDecision::NothingToWipe;
                 }
             }
+            if decision == ResetDecision::RefuseInSession {
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed
+                        .code_str(),
+                    source = "fresh_start_reset",
+                    reset_id = FRESH_START_RESET_ID,
+                    ist_secs_of_day = ist,
+                    "fresh-start reset DEFERRED: this boot is inside the market session window, \
+                     and the one-shot wipe never runs on a live session. Nothing was dropped. The \
+                     next boot outside 08:55–15:45 IST runs it, and will drop what this boot writes."
+                );
+            }
+        }
+        ResetDecision::Run => {
+            let mut refused: Vec<(&'static str, String)> = Vec::new();
+            for (object, sql) in drop_statements() {
+                if exec(client, base_url, &sql).await.is_none() {
+                    refused.push((object, sql));
+                }
+            }
+            // A QuestDB finishing its own WAL replay can refuse DDL briefly. A
+            // refused DROP left alone keeps the OLD schema for as long as that
+            // table lives, so retry it — in order, views still first.
+            let mut round = 0;
+            while !refused.is_empty() && round < RESET_DROP_RETRY_ROUNDS && budget_left(started) {
+                round += 1;
+                tokio::time::sleep(backoff).await;
+                let mut still: Vec<(&'static str, String)> = Vec::new();
+                for (object, sql) in refused {
+                    if exec(client, base_url, &sql).await.is_none() {
+                        still.push((object, sql));
+                    }
+                }
+                refused = still;
+            }
+            let refused: Vec<&'static str> = refused.into_iter().map(|(o, _)| o).collect();
             if !refused.is_empty() {
                 error!(
                     code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed.code_str(),
                     source = "fresh_start_reset",
                     reset_id = FRESH_START_RESET_ID,
                     refused = ?refused,
+                    retry_rounds = round,
                     "fresh-start reset: these objects could NOT be dropped and keep their old \
                      schema. The reset id is still written so the wipe never repeats — drop \
                      them by hand outside market hours, and the next boot recreates them."
                 );
                 record("drop_refused");
             }
-            let wrote = exec(client, base_url, &insert_log_sql()).await.is_some();
-            let verified = wrote && read_logged_count(client, base_url).await.unwrap_or(0) > 0;
+            let (verified, id_attempts) = write_and_verify_id(client, base_url, backoff).await;
             if verified {
                 info!(
                     reset_id = FRESH_START_RESET_ID,
                     dropped = drop_statements().len() - refused.len(),
+                    id_attempts,
                     "fresh-start reset COMPLETE — id written and verified; the ensure DDL \
                      that follows recreates every dropped object"
                 );
@@ -442,16 +601,17 @@ pub async fn run_fresh_start_reset_retrying(
                         .code_str(),
                     source = "fresh_start_reset",
                     reset_id = FRESH_START_RESET_ID,
-                    wrote,
+                    id_attempts,
                     "fresh-start reset: the tables were dropped but the reset id could NOT be \
                      written and read back. The NEXT out-of-session boot will run the wipe \
                      AGAIN. Insert it by hand before then: \
-                     INSERT INTO schema_reset_log VALUES ('2026-09-19-fresh-start', now());"
+                     INSERT INTO schema_reset_log (reset_id, ts) VALUES ('2026-09-19-fresh-start', now());"
                 );
                 record("id_unverified");
             }
         }
     }
+    record(decision.as_str());
     decision
 }
 
@@ -579,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    fn blackout_edges() {
+    fn test_ist_secs_of_day_and_blackout_edges() {
         assert_eq!(RESET_BLACKOUT_START_SECS_OF_DAY_IST, 8 * 3600 + 55 * 60);
         assert_eq!(RESET_BLACKOUT_END_SECS_OF_DAY_IST, 15 * 3600 + 45 * 60);
         assert!(!in_reset_blackout(RESET_BLACKOUT_START_SECS_OF_DAY_IST - 1));
@@ -639,85 +799,67 @@ mod tests {
         )
     }
 
-    /// A stateful QuestDB stand-in: `logged` is the id's current row count,
-    /// an INSERT bumps it, every request line is recorded.
+    /// How the mock answers the id INSERT.
+    #[derive(Clone, Copy)]
+    enum Insert {
+        Ok,
+        Refuse,
+        /// The row lands but the reply is lost — the case a blind re-insert
+        /// would double up on.
+        LandButRefuse,
+    }
+
+    /// Everything the stand-in QuestDB can be told to do.
+    #[derive(Clone, Copy)]
+    struct Cfg {
+        initial_logged: i64,
+        /// Refuse this many CREATEs first (a WAL replay answering probes but
+        /// not DDL); `usize::MAX` = never answer.
+        refuse_creates: usize,
+        insert: Insert,
+        /// Refuse the DROP of this object this many times.
+        refuse_drop: Option<(&'static str, usize)>,
+        /// Answer to the "which reset tables exist" count; `None` = refuse.
+        tables_present: Option<i64>,
+    }
+
+    impl Default for Cfg {
+        fn default() -> Self {
+            Self {
+                initial_logged: 0,
+                refuse_creates: 0,
+                insert: Insert::Ok,
+                refuse_drop: None,
+                // A populated volume unless a test says otherwise.
+                tables_present: Some(RESET_TABLES.len() as i64),
+            }
+        }
+    }
+
+    /// A stateful QuestDB stand-in: every request line is recorded.
     struct Mock {
         port: u16,
         seen: Arc<Mutex<Vec<String>>>,
     }
 
-    async fn spawn_mock(
-        initial_logged: i64,
-        create_ok: bool,
-        insert_ok: bool,
-        refuse_drop_of: Option<&'static str>,
-    ) -> Mock {
+    async fn spawn_mock_with(cfg: Cfg) -> Mock {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let logged = Arc::new(Mutex::new(initial_logged));
-        let seen_c = Arc::clone(&seen);
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    continue;
-                };
-                let seen = Arc::clone(&seen_c);
-                let logged = Arc::clone(&logged);
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 8192];
-                    let n = stream.read(&mut buf).await.unwrap_or(0);
-                    let raw = String::from_utf8_lossy(&buf[..n]).into_owned();
-                    let line = raw.lines().next().unwrap_or_default().to_owned();
-                    let q = line.replace('+', " ").replace("%20", " ");
-                    seen.lock().unwrap().push(q.clone());
-                    let reply = if q.contains("CREATE") {
-                        if create_ok {
-                            OK.to_owned()
-                        } else {
-                            REFUSED.to_owned()
-                        }
-                    } else if q.contains("count") {
-                        count_reply(*logged.lock().unwrap())
-                    } else if q.contains("INSERT") {
-                        if insert_ok {
-                            *logged.lock().unwrap() += 1;
-                            OK.to_owned()
-                        } else {
-                            REFUSED.to_owned()
-                        }
-                    } else if refuse_drop_of.is_some_and(|t| q.contains(&format!("EXISTS {t}"))) {
-                        REFUSED.to_owned()
-                    } else {
-                        OK.to_owned()
-                    };
-                    let _ = stream.write_all(reply.as_bytes()).await;
-                });
-            }
-        });
-        Mock { port, seen }
-    }
-
-    /// A QuestDB that refuses the first `refuse_creates` CREATEs (a WAL
-    /// replay that answers probes but not DDL), then behaves normally on a
-    /// fresh volume.
-    async fn spawn_slow_start_mock(refuse_creates: usize) -> Mock {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let seen = Arc::new(Mutex::new(Vec::new()));
+        let logged = Arc::new(Mutex::new(cfg.initial_logged));
         let creates = Arc::new(Mutex::new(0usize));
-        let logged = Arc::new(Mutex::new(0i64));
+        let drops_refused = Arc::new(Mutex::new(0usize));
         let seen_c = Arc::clone(&seen);
         tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     continue;
                 };
-                let (seen, creates, logged) = (
+                let (seen, logged, creates, drops_refused) = (
                     Arc::clone(&seen_c),
-                    Arc::clone(&creates),
                     Arc::clone(&logged),
+                    Arc::clone(&creates),
+                    Arc::clone(&drops_refused),
                 );
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -729,21 +871,47 @@ mod tests {
                         .next()
                         .unwrap_or_default()
                         .replace('+', " ")
-                        .replace("%20", " ");
+                        .replace("%20", " ")
+                        .replace("%28", "(")
+                        .replace("%29", ")")
+                        .replace("%2C", ",")
+                        .replace("%3B", ";");
                     seen.lock().unwrap().push(q.clone());
                     let reply = if q.contains("CREATE") {
                         let mut c = creates.lock().unwrap();
                         *c += 1;
-                        if *c <= refuse_creates {
+                        if *c <= cfg.refuse_creates {
                             REFUSED.to_owned()
                         } else {
                             OK.to_owned()
                         }
+                    } else if q.contains("table_name") {
+                        cfg.tables_present
+                            .map_or_else(|| REFUSED.to_owned(), count_reply)
                     } else if q.contains("count") {
                         count_reply(*logged.lock().unwrap())
                     } else if q.contains("INSERT") {
-                        *logged.lock().unwrap() += 1;
-                        OK.to_owned()
+                        match cfg.insert {
+                            Insert::Ok => {
+                                *logged.lock().unwrap() += 1;
+                                OK.to_owned()
+                            }
+                            Insert::Refuse => REFUSED.to_owned(),
+                            Insert::LandButRefuse => {
+                                *logged.lock().unwrap() += 1;
+                                REFUSED.to_owned()
+                            }
+                        }
+                    } else if let Some((t, times)) = cfg.refuse_drop
+                        && q.contains(&format!("EXISTS {t};"))
+                    {
+                        let mut r = drops_refused.lock().unwrap();
+                        if *r < times {
+                            *r += 1;
+                            REFUSED.to_owned()
+                        } else {
+                            OK.to_owned()
+                        }
                     } else {
                         OK.to_owned()
                     };
@@ -754,59 +922,24 @@ mod tests {
         Mock { port, seen }
     }
 
-    /// B3 (2026-09-22): a log that answers on the third try RUNS the reset,
-    /// instead of refusing the whole session on the first refusal.
-    #[tokio::test]
-    async fn a_slow_starting_questdb_is_retried_not_given_up_on() {
-        let m = spawn_slow_start_mock(2).await;
-        let d = run_fresh_start_reset_retrying(
-            &client(),
-            &url(&m),
-            RESET_LOG_READ_ATTEMPTS,
-            Duration::ZERO,
-            || OFF_HOURS_UTC,
-        )
-        .await;
-        assert_eq!(d, ResetDecision::Run);
-        assert_eq!(drops_seen(&m), drop_statements().len());
-    }
-
-    /// The retry is BOUNDED: a log that never answers still refuses, drops
-    /// nothing, and makes exactly `attempts` CREATE calls.
-    #[tokio::test]
-    async fn a_never_answering_log_gives_up_after_the_bound() {
-        let m = spawn_slow_start_mock(usize::MAX).await;
-        let d = run_fresh_start_reset_retrying(&client(), &url(&m), 3, Duration::ZERO, || {
-            OFF_HOURS_UTC
+    async fn spawn_mock(
+        initial_logged: i64,
+        create_ok: bool,
+        insert_ok: bool,
+        refuse_drop_of: Option<&'static str>,
+    ) -> Mock {
+        spawn_mock_with(Cfg {
+            initial_logged,
+            refuse_creates: if create_ok { 0 } else { usize::MAX },
+            insert: if insert_ok {
+                Insert::Ok
+            } else {
+                Insert::Refuse
+            },
+            refuse_drop: refuse_drop_of.map(|t| (t, usize::MAX)),
+            ..Cfg::default()
         })
-        .await;
-        assert_eq!(d, ResetDecision::RefuseUnreadable);
-        assert_eq!(drops_seen(&m), 0);
-        let creates = m
-            .seen
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|q| q.contains("CREATE"))
-            .count();
-        assert_eq!(creates, 3);
-    }
-
-    /// The blackout is judged on the clock AFTER the log answers, so a boot
-    /// that began outside the window but reached the decision inside it
-    /// drops nothing.
-    #[tokio::test]
-    async fn the_blackout_is_judged_on_the_clock_after_the_retries() {
-        let m = spawn_slow_start_mock(1).await;
-        let calls = std::sync::atomic::AtomicU32::new(0);
-        let d = run_fresh_start_reset_retrying(&client(), &url(&m), 3, Duration::ZERO, || {
-            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            IN_SESSION_UTC
-        })
-        .await;
-        assert_eq!(d, ResetDecision::RefuseInSession);
-        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
-        assert_eq!(drops_seen(&m), 0);
+        .await
     }
 
     fn client() -> Client {
@@ -820,17 +953,93 @@ mod tests {
         format!("http://127.0.0.1:{}/exec", m.port)
     }
 
-    fn drops_seen(m: &Mock) -> usize {
+    fn seen_matching(m: &Mock, needle: &str) -> usize {
         m.seen
             .lock()
             .unwrap()
             .iter()
-            .filter(|q| q.contains("DROP"))
+            .filter(|q| q.contains(needle))
             .count()
     }
 
+    fn drops_seen(m: &Mock) -> usize {
+        seen_matching(m, "DROP")
+    }
+
+    /// B3 (2026-09-22): a log that answers on the third try RUNS the reset,
+    /// instead of refusing the whole session on the first refusal.
     #[tokio::test]
-    async fn a_fresh_volume_off_hours_wipes_writes_the_id_and_verifies() {
+    async fn test_run_fresh_start_reset_retrying_waits_out_a_slow_starting_questdb() {
+        let m = spawn_mock_with(Cfg {
+            refuse_creates: 2,
+            ..Cfg::default()
+        })
+        .await;
+        let d = run_fresh_start_reset_retrying(
+            &client(),
+            &url(&m),
+            RESET_LOG_READ_ATTEMPTS,
+            Duration::ZERO,
+            || OFF_HOURS_UTC,
+        )
+        .await;
+        assert_eq!(d, ResetDecision::Run);
+        assert_eq!(drops_seen(&m), drop_statements().len());
+        assert_eq!(seen_matching(&m, "INSERT"), 1);
+    }
+
+    /// The retry is BOUNDED: a log that never answers still refuses, drops
+    /// nothing, and makes exactly `attempts` CREATE calls.
+    #[tokio::test]
+    async fn a_never_answering_log_gives_up_after_the_bound() {
+        let m = spawn_mock_with(Cfg {
+            refuse_creates: usize::MAX,
+            ..Cfg::default()
+        })
+        .await;
+        let d = run_fresh_start_reset_retrying(&client(), &url(&m), 3, Duration::ZERO, || {
+            OFF_HOURS_UTC
+        })
+        .await;
+        assert_eq!(d, ResetDecision::RefuseUnreadable);
+        assert_eq!(drops_seen(&m), 0);
+        assert_eq!(seen_matching(&m, "CREATE"), 3);
+        assert_eq!(seen_matching(&m, "INSERT"), 0);
+    }
+
+    /// The blackout is judged on the clock AFTER the log answers. The clock
+    /// here reads OFF-hours until the second CREATE, then IN-session — so a
+    /// runner that read it at the START would see off-hours and drop, and
+    /// this test would fail.
+    #[tokio::test]
+    async fn the_blackout_is_judged_on_the_clock_after_the_retries() {
+        let m = spawn_mock_with(Cfg {
+            refuse_creates: 1,
+            ..Cfg::default()
+        })
+        .await;
+        let seen = Arc::clone(&m.seen);
+        let d = run_fresh_start_reset_retrying(&client(), &url(&m), 3, Duration::ZERO, || {
+            let creates = seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|q| q.contains("CREATE"))
+                .count();
+            if creates >= 2 {
+                IN_SESSION_UTC
+            } else {
+                OFF_HOURS_UTC
+            }
+        })
+        .await;
+        assert_eq!(d, ResetDecision::RefuseInSession);
+        assert_eq!(drops_seen(&m), 0);
+    }
+
+    #[tokio::test]
+    async fn test_run_fresh_start_reset_with_fresh_volume_off_hours_wipes_writes_the_id_and_verifies()
+     {
         let m = spawn_mock(0, true, true, None).await;
         let d = run_fresh_start_reset_with(&client(), &url(&m), OFF_HOURS_UTC).await;
         assert_eq!(d, ResetDecision::Run);
@@ -839,6 +1048,10 @@ mod tests {
         let last_drop = seen.iter().rposition(|q| q.contains("DROP")).unwrap();
         let insert = seen.iter().position(|q| q.contains("INSERT")).unwrap();
         assert!(insert > last_drop, "the id is written LAST");
+        assert!(
+            seen[insert].contains("(reset_id, ts)"),
+            "the id INSERT names its columns"
+        );
         assert!(
             seen[insert + 1..].iter().any(|q| q.contains("count")),
             "the id is re-read after it is written"
@@ -861,14 +1074,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_in_session_boot_drops_nothing() {
+    async fn an_in_session_boot_on_a_populated_volume_drops_nothing() {
         let m = spawn_mock(0, true, true, None).await;
         assert_eq!(
             run_fresh_start_reset_with(&client(), &url(&m), IN_SESSION_UTC).await,
             ResetDecision::RefuseInSession
         );
         assert_eq!(drops_seen(&m), 0);
-        assert!(m.seen.lock().unwrap().iter().all(|q| !q.contains("INSERT")));
+        assert_eq!(seen_matching(&m, "INSERT"), 0);
+        assert_eq!(seen_matching(&m, "table_name"), 1, "the volume was checked");
+    }
+
+    /// MEDIUM-3 (2026-09-22): a bare-nuked volume booted in-session has
+    /// nothing to wipe. It records the id instead of deferring — otherwise
+    /// the next out-of-session boot drops the whole day this boot captures.
+    #[tokio::test]
+    async fn an_in_session_boot_on_a_bare_nuked_volume_records_the_id() {
+        let m = spawn_mock_with(Cfg {
+            tables_present: Some(0),
+            ..Cfg::default()
+        })
+        .await;
+        assert_eq!(
+            run_fresh_start_reset_with(&client(), &url(&m), IN_SESSION_UTC).await,
+            ResetDecision::NothingToWipe
+        );
+        assert_eq!(drops_seen(&m), 0);
+        assert_eq!(seen_matching(&m, "INSERT"), 1);
+        // The next OFF-hours boot does not wipe the day.
+        assert_eq!(
+            run_fresh_start_reset_with(&client(), &url(&m), OFF_HOURS_UTC).await,
+            ResetDecision::AlreadyDone
+        );
+        assert_eq!(drops_seen(&m), 0);
+    }
+
+    /// An unreadable "which tables exist" answer is NEVER read as empty.
+    #[tokio::test]
+    async fn an_unreadable_table_census_keeps_the_deferral() {
+        let m = spawn_mock_with(Cfg {
+            tables_present: None,
+            ..Cfg::default()
+        })
+        .await;
+        assert_eq!(
+            run_fresh_start_reset_with(&client(), &url(&m), IN_SESSION_UTC).await,
+            ResetDecision::RefuseInSession
+        );
+        assert_eq!(seen_matching(&m, "INSERT"), 0);
     }
 
     #[tokio::test]
@@ -897,31 +1150,102 @@ mod tests {
         assert_eq!(d, ResetDecision::RefuseUnreadable);
     }
 
+    /// A DROP that keeps failing is retried the full bound, then named, and
+    /// the id is STILL written so the wipe never repeats.
     #[tokio::test]
-    async fn a_refused_drop_still_writes_the_id_so_the_wipe_never_repeats() {
+    async fn a_refused_drop_is_retried_then_the_id_still_written() {
         let m = spawn_mock(0, true, true, Some("market_depth")).await;
         assert_eq!(
             run_fresh_start_reset_with(&client(), &url(&m), OFF_HOURS_UTC).await,
             ResetDecision::Run
         );
-        assert!(m.seen.lock().unwrap().iter().any(|q| q.contains("INSERT")));
+        assert_eq!(
+            seen_matching(&m, "EXISTS market_depth;"),
+            1 + RESET_DROP_RETRY_ROUNDS as usize,
+            "the refused DROP is retried, and ONLY it"
+        );
+        assert_eq!(
+            drops_seen(&m),
+            drop_statements().len() + RESET_DROP_RETRY_ROUNDS as usize
+        );
+        assert_eq!(seen_matching(&m, "INSERT"), 1);
         assert_eq!(
             run_fresh_start_reset_with(&client(), &url(&m), OFF_HOURS_UTC).await,
             ResetDecision::AlreadyDone
         );
     }
 
+    /// A DROP refused once (QuestDB still replaying) succeeds on the retry.
     #[tokio::test]
-    async fn an_unwritable_id_is_reported_and_the_next_boot_would_repeat() {
+    async fn a_briefly_refused_drop_succeeds_on_the_retry() {
+        let m = spawn_mock_with(Cfg {
+            refuse_drop: Some(("ticks", 1)),
+            ..Cfg::default()
+        })
+        .await;
+        assert_eq!(
+            run_fresh_start_reset_with(&client(), &url(&m), OFF_HOURS_UTC).await,
+            ResetDecision::Run
+        );
+        assert_eq!(seen_matching(&m, "EXISTS ticks;"), 2);
+        assert_eq!(drops_seen(&m), drop_statements().len() + 1);
+    }
+
+    #[tokio::test]
+    async fn an_unwritable_id_is_retried_then_reported_and_the_next_boot_would_repeat() {
         let m = spawn_mock(0, true, false, None).await;
         assert_eq!(
             run_fresh_start_reset_with(&client(), &url(&m), OFF_HOURS_UTC).await,
             ResetDecision::Run
+        );
+        assert_eq!(
+            seen_matching(&m, "INSERT"),
+            RESET_ID_WRITE_ATTEMPTS as usize,
+            "every id-write attempt was spent"
         );
         // Honest consequence, pinned: without the id the next boot runs again.
         assert_eq!(
             run_fresh_start_reset_with(&client(), &url(&m), OFF_HOURS_UTC).await,
             ResetDecision::Run
         );
+    }
+
+    /// An INSERT that landed but whose answer was lost is found by the
+    /// re-read — never inserted a second time.
+    #[tokio::test]
+    async fn a_lost_insert_reply_is_not_inserted_twice() {
+        let m = spawn_mock_with(Cfg {
+            insert: Insert::LandButRefuse,
+            ..Cfg::default()
+        })
+        .await;
+        assert_eq!(
+            run_fresh_start_reset_with(&client(), &url(&m), OFF_HOURS_UTC).await,
+            ResetDecision::Run
+        );
+        assert_eq!(seen_matching(&m, "INSERT"), 1);
+        assert_eq!(
+            run_fresh_start_reset_with(&client(), &url(&m), OFF_HOURS_UTC).await,
+            ResetDecision::AlreadyDone
+        );
+    }
+
+    #[test]
+    fn the_census_counts_exactly_the_reset_tables() {
+        let sql = reset_tables_present_sql();
+        for t in RESET_TABLES {
+            assert!(
+                sql.contains(&format!("'{t}'")),
+                "{t} missing from the census"
+            );
+        }
+        assert!(!sql.contains("candles_10m"), "a view is not a table");
+        assert!(!sql.contains(SCHEMA_RESET_LOG_TABLE));
+    }
+
+    #[test]
+    fn the_worst_case_bound_is_the_documented_sum() {
+        // 120 + 60 + 25 statements × 30 + 3 × (90 + 5) + 90.
+        assert_eq!(RESET_WORST_CASE_SECS, 1_305);
     }
 }

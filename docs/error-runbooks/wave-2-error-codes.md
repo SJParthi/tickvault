@@ -255,6 +255,22 @@ ring + spill backoff exhausted. Coalesces AUDIT-01..06.
 **Triage:** see specific AUDIT-NN code emitted alongside.
 **Source:** `crates/storage/src/{phase2,depth_rebalance,ws_reconnect,boot,selftest,order}_audit_persistence.rs`
 
+### 2026-09-22 note — the one-shot fresh-start reset emits this code
+
+`crates/storage/src/fresh_start_reset.rs` logs STORAGE-GAP-03 with
+`source = "fresh_start_reset"` on four arms. None of them drops a SEBI table;
+those are unreachable by a build-time assertion.
+
+| Message starts | Meaning | What to do |
+|---|---|---|
+| `fresh-start reset REFUSED: the reset log could not be created or read` | QuestDB did not answer the log read within 6 tries 5 s apart. Nothing was dropped; the session runs on the OLD schema. | Nothing today. The next boot outside 08:55–15:45 IST runs the reset and drops today's rows with it. |
+| `fresh-start reset DEFERRED` | Boot was inside 08:55–15:45 IST on a volume that still holds reset tables. Nothing was dropped. | Same as above. A bare-nuked volume does NOT defer: it logs `nothing to wipe` at INFO and records the id. |
+| `these objects could NOT be dropped` | Named objects kept refusing their DROP after 2 retry rounds. They keep the old schema; the id is written anyway so the wipe never repeats. | Outside market hours: `DROP TABLE IF EXISTS <name>;` for each one named, then restart. The boot recreates it. |
+| `the reset id could NOT be written and read back` | The drops ran but 3 attempts to write the id failed. The NEXT out-of-session boot re-runs the whole wipe. | Before that boot: `INSERT INTO schema_reset_log (reset_id, ts) VALUES ('2026-09-19-fresh-start', now());` then check with `SELECT * FROM schema_reset_log;`. |
+
+Counter: `tv_fresh_start_reset_total{outcome}` (local `/metrics` only; no
+alarm). This path is log-sink-only, like the other STORAGE-GAP-03 emitters.
+
 ### 2026-07-14 note — pnl_audit rebuild emits this code (cluster-C)
 
 `crates/storage/src/pnl_audit_persistence.rs` (rebuilt on the same

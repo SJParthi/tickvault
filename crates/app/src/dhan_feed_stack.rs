@@ -1724,27 +1724,16 @@ impl LiveIngest {
                             fold_frame,
                             window_open_ist_secs,
                         )
-                        .map(|bar| {
-                            // COPIED, never re-derived (operator 2026-09-19
-                            // Quote A: "no extra claucltion or derivation").
-                            // All three are the same fields the candle writer
-                            // reads for the SAME bar, so the two tables agree
-                            // by construction rather than by coincidence.
-                            //
-                            // Three, not nine: the operator stripped the OHLC,
-                            // the bar-over-bar percentage and the bucket skew
-                            // off `top_volume` on 2026-09-19, so this probe
-                            // stops carrying what nothing stores -- and the
-                            // per-sweep `aggregator.snapshot()` call that
-                            // computed the skew goes with them, because a
-                            // field read here and dropped there is work paid
-                            // for nothing.
-                            crate::top_volume_snapshot::CandleBarReading {
-                                signed_volume: bar.signed_volume(),
-                                close_pct_from_prev_day: bar.close_pct_from_prev_day,
-                                open_pct: bar.open_pct,
-                            }
-                        })
+                        // `from_bar`, never a field-by-field copy: the bar is
+                        // usually still the OPEN bucket at the sweep instant,
+                        // whose two percentages are not stamped until it seals.
+                        // `from_bar` stamps a copy with the seal's own function
+                        // so the stored figures are the candle row's figures —
+                        // copied, never re-derived (operator 2026-09-19 Quote
+                        // A). Three fields, not nine: the operator stripped the
+                        // OHLC, the bar-over-bar percentage and the bucket skew
+                        // off `top_volume` on 2026-09-19.
+                        .map(crate::top_volume_snapshot::CandleBarReading::from_bar)
                 },
             );
 

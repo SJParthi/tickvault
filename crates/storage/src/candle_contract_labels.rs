@@ -85,7 +85,7 @@ mod tests {
     }
 
     #[test]
-    fn a_published_label_is_found_under_its_own_segment_only() {
+    fn test_publish_candle_contract_labels_finds_a_label_under_its_own_segment_only() {
         let _g = lock();
         let mut m = HashMap::new();
         m.insert(
@@ -103,7 +103,7 @@ mod tests {
     }
 
     #[test]
-    fn a_republish_replaces_rather_than_merges() {
+    fn test_candle_contract_labels_republish_replaces_rather_than_merges() {
         let _g = lock();
         let mut first = HashMap::new();
         first.insert((9_100_101, "NSE_FNO"), Arc::<str>::from("OLD-EXPIRED-CE"));

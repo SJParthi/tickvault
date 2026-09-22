@@ -1652,6 +1652,12 @@ pub const UNLABELLED_CONTRACT: &str = "unmapped";
 /// escaped characters and the general case is flagged rather than claimed
 /// solved.
 ///
+/// FRAMING, checked 2026-09-22 because a security review asked whether a raw
+/// newline in a master-CSV field could split one ILP line into two: it cannot.
+/// questdb-rs 6.1.0 escapes `\n`, `\r` and `\\` in a SYMBOL value as well as
+/// `,`, `=` and space (`ingress/buffer.rs::must_escape_unquoted`). The cost of
+/// such a byte is width — covered by the paragraph above — never injection.
+///
 /// The two 448/401 terms are LITERALS in this doc rather than imports: both
 /// are private consts in `tickvault-storage`, and naming them here is the same
 /// honest middle that file already takes with its own `OPTION_FAMILIES` — a
