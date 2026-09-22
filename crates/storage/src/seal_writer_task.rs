@@ -55,7 +55,7 @@ use tickvault_trading::candles::BufferedSeal;
 
 use crate::seal_absorption::{SealAbsorptionPipeline, SubmitOutcome};
 use crate::seal_dlq::SealDlqRecord;
-use crate::seal_spill::{SEAL_SPILL_RECORD_SIZE, SerializedSeal};
+use crate::seal_spill::{SEAL_SPILL_FORMAT_VERSION, SEAL_SPILL_RECORD_SIZE, SerializedSeal};
 use crate::shadow_candle_writer::ShadowCandleWriter;
 
 /// Outcome counters for one [`drain_once`] cycle. Maps 1:1 to the
@@ -508,10 +508,23 @@ fn read_staged_spill(path: &Path) -> Option<(Vec<SerializedSeal>, usize)> {
     // truncated trailing record (a torn write at the moment of the crash).
     // Either way nothing further in the file is readable.
     while reader.read_exact(&mut buf).is_ok() {
-        // Same format-version gate as `SealSpillWriter::read_all`: a byte-7 of
-        // 0 is a pre-renumber record whose tf ordinal lives in the OLD
-        // 12-frame space and would silently mis-decode.
-        if buf[7] == 0 {
+        // Format-version gate — the SAME `!=` test as `SealSpillWriter::read_all`.
+        //
+        // ⚠ CORRECTED 2026-09-22. This gate refused only `buf[7] == 0`, the
+        // version-0 era. `SealSpillWriter::read_all` refuses everything that is
+        // not the live version, and a comment further down this file claimed
+        // that was what protected the boot drain — but `read_all` has no
+        // production caller. The boot drain reads staged files HERE, so a
+        // version-3 record (the 24-frame ordinal space, before 2026-09-19)
+        // passed straight through: ordinal 5 was `S1` there and is `M30` now,
+        // so a one-second bar re-ingested as a thirty-minute bar, silently.
+        //
+        // `!=` rather than `<`: a record from a NEWER build is equally
+        // unreadable, and the case that produces one is a deploy rollback. A
+        // refused record is counted as undecodable and the file's bytes are
+        // kept in `archive/` — nothing is destroyed, only kept out of a
+        // timeframe it never belonged to.
+        if buf[7] != SEAL_SPILL_FORMAT_VERSION {
             undecodable += 1;
             continue;
         }
@@ -541,6 +554,14 @@ fn read_staged_dlq(path: &Path) -> Option<(Vec<SerializedSeal>, usize)> {
             continue;
         }
         match serde_json::from_str::<SealDlqRecord>(&line) {
+            // The DLQ carried no format version until 2026-09-22, so a line
+            // from the 24-frame era decoded into the nine-frame ordinal space
+            // with no warning. `format_version` defaults to 0 on those lines,
+            // below every real version, so they are refused here — counted,
+            // and retained on disk in `archive/`.
+            Ok(record) if record.format_version != SEAL_SPILL_FORMAT_VERSION => {
+                undecodable += 1;
+            }
             Ok(record) => out.push(SerializedSeal::from(&record)),
             Err(_) => undecodable += 1,
         }
@@ -694,13 +715,23 @@ pub fn drain_recovered_seals<S: SealSink>(
                 // written when `candles_10s` / `_15s` / `_30s` / `_2m` still existed
                 // could not re-ingest into a table this boot had just dropped. Two
                 // things retired it together: `SEAL_SPILL_FORMAT_VERSION` moved to 4
-                // when the nine-frame collapse RENUMBERED the ordinals, and
-                // `seal_spill::read_all` refuses every record below it — so no
-                // record written under the 24-frame ordinal space ever reaches this
-                // loop. And every ordinal the nine-frame table can decode IS one of
-                // the operator's nine, so the predicate was tautologically true.
-                // A gate that can only return true reads as a live filter to the
-                // next author; the version refusal is the real one.
+                // when the nine-frame collapse RENUMBERED the ordinals, and the
+                // version gates in `read_staged_spill` / `read_staged_dlq` refuse
+                // every record not written under it — so no record from the
+                // 24-frame ordinal space reaches this loop. And every ordinal the
+                // nine-frame table can decode IS one of the operator's nine, so the
+                // predicate was tautologically true. A gate that can only return
+                // true reads as a live filter to the next author; the version
+                // refusal is the real one.
+                //
+                // ⚠ CORRECTED 2026-09-22 — until today this paragraph named
+                // `seal_spill::read_all` as that refusal. It is not: `read_all`
+                // has no production caller, and the two readers this loop DOES
+                // use refused only version 0 (spill) and nothing at all (DLQ).
+                // So the claim this gate was removed on was false for three days.
+                // Both are now `!=` the live version, pinned by
+                // `boot_drain_refuses_a_spill_record_from_another_format_version`
+                // and `boot_drain_refuses_an_unversioned_dlq_line`.
                 if let Err(append_err) = writer.append_seal(&seal) {
                     error!(
                         code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
@@ -870,6 +901,101 @@ mod tests {
             prod.contains("could not be read or classified"),
             "the not-read arm must name what happened"
         );
+    }
+
+    /// The BOOT DRAIN — not `SealSpillWriter::read_all`, which has no
+    /// production caller — must refuse a spill record from any other format
+    /// version, OLDER or NEWER.
+    ///
+    /// Until 2026-09-22 this reader refused only byte-7 == 0, so a version-3
+    /// record (24-frame ordinal space) re-ingested under the nine-frame
+    /// numbering: ordinal 5 was `S1` and is now `M30`.
+    #[test]
+    fn boot_drain_refuses_a_spill_record_from_another_format_version() {
+        let dir = std::env::temp_dir().join(format!("tv-seal-version-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("seal-spill-2026-09-22.bin");
+
+        let current =
+            SerializedSeal::from(&mk_seal(13, 0, TfIndex::S1, 1_716_000_900, 102.5)).to_bytes();
+        assert_eq!(current[7], SEAL_SPILL_FORMAT_VERSION);
+        let mut older = current;
+        older[7] = SEAL_SPILL_FORMAT_VERSION - 1;
+        let mut newer = current;
+        newer[7] = SEAL_SPILL_FORMAT_VERSION + 1;
+        let mut legacy_zero = current;
+        legacy_zero[7] = 0;
+
+        let mut bytes = Vec::new();
+        for record in [current, older, newer, legacy_zero] {
+            bytes.extend_from_slice(&record);
+        }
+        std::fs::write(&path, &bytes).expect("write spill");
+
+        let (records, undecodable) = read_staged_spill(&path).expect("readable");
+        assert_eq!(
+            records.len(),
+            1,
+            "only the current-version record may be re-ingested"
+        );
+        assert_eq!(
+            undecodable, 3,
+            "the older, the newer (a rollback) and the version-0 record are all \
+             refused and counted — never decoded under the wrong ordinal space"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// The DLQ had no format version at all until 2026-09-22, so every line it
+    /// ever wrote decoded under whatever ordinal space the reading binary had.
+    /// A line with no `format_version` (every pre-2026-09-22 line) and a line
+    /// stamped with another version must both be refused; a line this build
+    /// writes must survive.
+    #[test]
+    fn boot_drain_refuses_an_unversioned_dlq_line() {
+        let dir = std::env::temp_dir().join(format!("tv-seal-dlq-version-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("seal-dlq-2026-09-22.ndjson");
+
+        let written = SealDlqRecord::from(&SerializedSeal::from(&mk_seal(
+            13,
+            0,
+            TfIndex::M1,
+            1_716_000_900,
+            102.5,
+        )));
+        assert_eq!(
+            written.format_version, SEAL_SPILL_FORMAT_VERSION,
+            "every line this build writes is stamped"
+        );
+        let current_line = serde_json::to_string(&written).expect("serialise");
+
+        let mut unversioned: serde_json::Value =
+            serde_json::from_str(&current_line).expect("round-trip");
+        if let Some(map) = unversioned.as_object_mut() {
+            map.remove("format_version");
+        }
+        let mut rollback = written.clone();
+        rollback.format_version = SEAL_SPILL_FORMAT_VERSION + 1;
+
+        let body = format!(
+            "{current_line}\n{}\n{}\n",
+            serde_json::to_string(&unversioned).expect("serialise"),
+            serde_json::to_string(&rollback).expect("serialise"),
+        );
+        std::fs::write(&path, body).expect("write dlq");
+
+        let (records, undecodable) = read_staged_dlq(&path).expect("readable");
+        assert_eq!(records.len(), 1, "only the stamped current line survives");
+        assert_eq!(
+            undecodable, 2,
+            "an unversioned line and a newer-version line are both refused and counted"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
     use std::path::PathBuf;
     use tickvault_common::feed::Feed;

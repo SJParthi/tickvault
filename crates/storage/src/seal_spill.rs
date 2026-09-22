@@ -878,8 +878,9 @@ impl SealSpillWriter {
             match read_full_record(&mut reader, &mut buf) {
                 Ok(true) => {
                     // Format-version gate. Byte 7 is the record's
-                    // `SEAL_SPILL_FORMAT_VERSION`, and ANY value below the live
-                    // constant is refused — never partially recovered.
+                    // `SEAL_SPILL_FORMAT_VERSION`, and ANY value other than the live
+                    // constant is refused — never partially recovered. `!=`, not `<` (2026-09-22):
+                    // a NEWER record is equally unreadable, and a deploy rollback makes one.
                     //
                     // 2026-07-21 (C2, version 0 → 1): a byte-7 of 0 marks a
                     // pre-renumber record whose tf_ordinal lives in the OLD 12-frame
@@ -899,7 +900,7 @@ impl SealSpillWriter {
                     // legitimately mix older + current records via append across a
                     // deploy boundary. The loss is bounded to one deploy boot's
                     // worth of spilled seals.
-                    if buf[7] < SEAL_SPILL_FORMAT_VERSION {
+                    if buf[7] != SEAL_SPILL_FORMAT_VERSION {
                         legacy_refused += 1;
                         continue;
                     }
