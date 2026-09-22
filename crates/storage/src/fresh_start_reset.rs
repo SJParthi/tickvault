@@ -19,8 +19,9 @@
 //!
 //! The drops are followed by the boot's ordinary ensure path in the SAME boot:
 //! `ensure_shadow_candle_tables` recreates the nine candle tables,
-//! `run_live_table_ddl_at_boot` recreates `ticks` / `market_depth` /
-//! `top_volume`, and `ensure_named_views` recreates every view. The reset
+//! `run_live_table_ddl_at_boot` recreates `ticks` / `market_depth` and the
+//! four direct `top_volume_<tf>` tables, and `ensure_named_views` recreates
+//! every console view. The reset
 //! itself creates nothing but its own log.
 //!
 //! ## Schema
@@ -128,6 +129,12 @@ pub const RESET_VIEWS: &[&str] = &[
     "candles_named",
     "ticks_named",
     "market_depth_named",
+    // The four per-cadence top-volume faces were VIEWS until 2026-09-22 and are
+    // DIRECT TABLES since. The same four names are therefore in BOTH lists: on
+    // a volume written by an older build they are views (this pass drops them),
+    // on a newer one they are tables (the table pass does). See
+    // [`reportable_refusals`] for why the half that does not apply is never
+    // reported as a failure.
     "top_volume_1s",
     "top_volume_3s",
     "top_volume_5s",
@@ -151,12 +158,17 @@ pub const RESET_TABLES: &[&str] = &[
     "candles_15m",
     "candles_30m",
     "candles_60m",
+    // The four direct per-cadence tables (2026-09-22). Also in [`RESET_VIEWS`]
+    // — on an older volume they are views.
+    "top_volume_1s",
+    "top_volume_3s",
+    "top_volume_5s",
+    "top_volume_1m",
+    // The retired single table and its pre-2026-09-12 name. No boot writes
+    // either any more (2026-09-22), and nothing renames one into the other;
+    // they are dropped so a fresh start leaves no old-schema ranking rows
+    // behind. The same logical table, not a widening of the allowlist.
     "top_volume",
-    // `top_volume` under its pre-2026-09-12 name (added 2026-09-22, hostile
-    // finding B5). Without it the reset drops `top_volume` and the SAME boot's
-    // `ensure_top_volume_rank_table` then RENAMES a surviving legacy table into
-    // its place, bringing every old-schema row back under the new name. It is
-    // the same logical table, not a widening of the allowlist.
     "top_volume_rank",
     "ticks",
     "market_depth",
@@ -380,6 +392,42 @@ pub fn drop_statements() -> Vec<(&'static str, String)> {
     out
 }
 
+/// The refusals worth REPORTING, out of every DROP still refused after the
+/// retry rounds.
+///
+/// A name that is in BOTH [`RESET_VIEWS`] and [`RESET_TABLES`] (the four
+/// `top_volume_<tf>` names, a view on an older volume and a table on a newer
+/// one) gets two statements, and only one of them can match what is on disk.
+/// Whether QuestDB answers `DROP VIEW IF EXISTS` on a TABLE's name with a
+/// no-op or an error is UNVERIFIED (no QuestDB is reachable from a dev
+/// container). If it errors, that refusal is the wrong-kind half of a
+/// successful drop, and reporting it would page "these objects could NOT be
+/// dropped" about a table that is gone.
+///
+/// So a VIEW-drop refusal is suppressed when the same name is in
+/// [`RESET_TABLES`] and its TABLE drop was NOT refused. Every other refusal is
+/// reported. The honest cost: if a stubborn VIEW of that name survives while
+/// `DROP TABLE IF EXISTS` on it is a no-op, the refusal is not named here —
+/// and is then named by `ensure_top_volume_tables`, whose `CREATE TABLE`
+/// cannot succeed over a live view and is a coded error of its own.
+#[must_use]
+pub fn reportable_refusals<'a>(refused: &[(&'a str, String)]) -> Vec<&'a str> {
+    let table_refused = |name: &str| {
+        refused
+            .iter()
+            .any(|(o, s)| *o == name && s.starts_with("DROP TABLE"))
+    };
+    refused
+        .iter()
+        .filter(|(object, sql)| {
+            !(sql.starts_with("DROP VIEW")
+                && RESET_TABLES.contains(object)
+                && !table_refused(object))
+        })
+        .map(|(o, _)| *o)
+        .collect()
+}
+
 /// Run one statement; `Some(body)` on 2xx, `None` on anything else.
 async fn exec(client: &Client, base_url: &str, sql: &str) -> Option<String> {
     match client.get(base_url).query(&[("query", sql)]).send().await {
@@ -585,7 +633,8 @@ pub async fn run_fresh_start_reset_retrying(
                 }
                 refused = still;
             }
-            let refused: Vec<&'static str> = refused.into_iter().map(|(o, _)| o).collect();
+            let refused_count = refused.len();
+            let refused: Vec<&'static str> = reportable_refusals(&refused);
             if !refused.is_empty() {
                 error!(
                     code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed.code_str(),
@@ -603,7 +652,7 @@ pub async fn run_fresh_start_reset_retrying(
             if verified {
                 info!(
                     reset_id = FRESH_START_RESET_ID,
-                    dropped = drop_statements().len() - refused.len(),
+                    dropped = drop_statements().len() - refused_count,
                     id_attempts,
                     "fresh-start reset COMPLETE — id written and verified; the ensure DDL \
                      that follows recreates every dropped object"
@@ -679,7 +728,7 @@ mod tests {
 
     #[test]
     fn the_allowlist_is_exactly_the_scope_lock_set() {
-        assert_eq!(RESET_TABLES.len(), 13);
+        assert_eq!(RESET_TABLES.len(), 17);
         let candles = RESET_TABLES
             .iter()
             .filter(|t| t.starts_with("candles_"))
@@ -687,7 +736,16 @@ mod tests {
         assert_eq!(candles, 9, "nine fold tables; candles_10m is a view");
         assert!(RESET_VIEWS.contains(&"candles_10m"));
         assert!(!RESET_TABLES.contains(&"candles_10m"));
-        for t in ["top_volume", "ticks", "market_depth", "top_volume_rank"] {
+        for t in [
+            "top_volume_1s",
+            "top_volume_3s",
+            "top_volume_5s",
+            "top_volume_1m",
+            "top_volume",
+            "ticks",
+            "market_depth",
+            "top_volume_rank",
+        ] {
             assert!(RESET_TABLES.contains(&t), "{t} missing");
         }
         // Emitted candle set must equal the reset's candle set, so a future
@@ -703,20 +761,30 @@ mod tests {
         assert_eq!(emitted, reset);
     }
 
-    /// B5 (2026-09-22): `ensure_top_volume_rank_table` renames a surviving
-    /// legacy table INTO `top_volume` later in the same boot. If the reset
-    /// dropped `top_volume` but not its legacy name, that rename would bring
-    /// every pre-reset row back. Pinned against the persistence module's own
-    /// constant, not a copied literal, so a second rename cannot drift past it.
+    /// Every top-volume name the persistence module knows — the four live
+    /// tables and both retired names — is dropped by the reset, pinned against
+    /// the module's own constants so a fifth cadence cannot survive a reset
+    /// unnoticed. The legacy VIEWS go before the legacy table, so its DROP is
+    /// never refused over a dependent view.
     #[test]
-    fn the_reset_drops_top_volume_under_both_of_its_names() {
+    fn the_reset_drops_every_top_volume_name() {
         use crate::top_volume_rank_persistence::{
-            LEGACY_TOP_VOLUME_RANK_TABLE, TOP_VOLUME_RANK_TABLE,
+            LEGACY_TOP_VOLUME_RANK_TABLE, LEGACY_TOP_VOLUME_TABLE, SnapshotCadence,
         };
-        assert!(RESET_TABLES.contains(&TOP_VOLUME_RANK_TABLE));
+        assert!(RESET_TABLES.contains(&LEGACY_TOP_VOLUME_TABLE));
         assert!(RESET_TABLES.contains(&LEGACY_TOP_VOLUME_RANK_TABLE));
-        // The legacy views go first, so the legacy DROP is never refused over
-        // a dependent view.
+        for c in SnapshotCadence::ALL {
+            assert!(
+                RESET_TABLES.contains(&c.table_name()),
+                "{} table",
+                c.table_name()
+            );
+            assert!(
+                RESET_VIEWS.contains(&c.table_name()),
+                "{} view",
+                c.table_name()
+            );
+        }
         let stmts = drop_statements();
         let legacy_table = stmts
             .iter()
@@ -727,6 +795,69 @@ mod tests {
             let at = stmts.iter().position(|(o, _)| *o == view).unwrap();
             assert!(at < legacy_table, "{view} must drop before its table");
         }
+    }
+
+    /// The only names in BOTH lists are the four per-cadence names — any other
+    /// overlap would make [`reportable_refusals`] suppress a real refusal.
+    #[test]
+    fn only_the_four_cadence_names_are_both_a_view_and_a_table() {
+        let both: Vec<&str> = RESET_VIEWS
+            .iter()
+            .copied()
+            .filter(|v| RESET_TABLES.contains(v))
+            .collect();
+        assert_eq!(
+            both,
+            [
+                "top_volume_1s",
+                "top_volume_3s",
+                "top_volume_5s",
+                "top_volume_1m"
+            ]
+        );
+    }
+
+    fn view(name: &'static str) -> (&'static str, String) {
+        (name, format!("DROP VIEW IF EXISTS {name};"))
+    }
+    fn table(name: &'static str) -> (&'static str, String) {
+        (name, format!("DROP TABLE IF EXISTS {name};"))
+    }
+
+    /// Every combination of "view drop refused / table drop refused" for a
+    /// dual-listed name, plus single-listed names of both kinds.
+    #[test]
+    fn reportable_refusals_every_permutation() {
+        // Dual-listed name: the four outcomes.
+        assert!(reportable_refusals(&[]).is_empty(), "neither refused");
+        assert!(
+            reportable_refusals(&[view("top_volume_1s")]).is_empty(),
+            "view half refused, table dropped — the wrong-kind half, suppressed"
+        );
+        assert_eq!(
+            reportable_refusals(&[table("top_volume_1s")]),
+            ["top_volume_1s"],
+            "a refused TABLE drop is always reported"
+        );
+        assert_eq!(
+            reportable_refusals(&[view("top_volume_1s"), table("top_volume_1s")]),
+            ["top_volume_1s", "top_volume_1s"],
+            "both halves refused — nothing dropped it, both reported"
+        );
+        // A view-only name is never suppressed.
+        assert_eq!(reportable_refusals(&[view("ticks_named")]), ["ticks_named"]);
+        // A table-only name is never suppressed.
+        assert_eq!(reportable_refusals(&[table("ticks")]), ["ticks"]);
+        // One name's table refusal never un-suppresses ANOTHER name's view half.
+        assert_eq!(
+            reportable_refusals(&[view("top_volume_1s"), table("top_volume_3s")]),
+            ["top_volume_3s"]
+        );
+        // Order is preserved.
+        assert_eq!(
+            reportable_refusals(&[table("ticks"), view("ticks_named"), view("top_volume_5s")]),
+            ["ticks", "ticks_named"]
+        );
     }
 
     #[test]
@@ -1259,7 +1390,7 @@ mod tests {
 
     #[test]
     fn the_worst_case_bound_is_the_documented_sum() {
-        // 120 + 60 + 25 statements × 30 + 3 × (90 + 5) + 90.
-        assert_eq!(RESET_WORST_CASE_SECS, 1_305);
+        // 120 + 60 + 29 statements × 30 + 3 × (90 + 5) + 90.
+        assert_eq!(RESET_WORST_CASE_SECS, 1_425);
     }
 }

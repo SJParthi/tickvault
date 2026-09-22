@@ -7497,3 +7497,90 @@ incidental one.
   re-emits only that bar, so the moved figure would reach no row.
 - Sorts any delay on the VARCHAR half (text descending puts 1s / 2ms / 3µs / 4ns
   in the order 4, 3, 2, 1 — the exact reverse, and it looks right).
+
+### 2026-09-22 — `top_volume` BECOMES FOUR DIRECT TABLES, one per timeframe, rows written `ts ASC, volume_percentage_change DESC`
+
+**The verbatim operator demand (2026-09-22, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "See meanwhile for this top volume also I clearly told you to make the table itself per timeframe per timestamp shoudl be always sorted by volume percentage desc always timestamp asc right dude that too always O(1) dude see meanwhile I clealry told you to make it as direct tables dude why focusing on view dude why"
+
+Recorded HERE before the code, per the rule-file-first law. It SUPERSEDES the
+2026-09-12 (SAME DAY, LATER) arrangement of ONE `top_volume` table plus four
+per-cadence VIEWS filtered on `tf`.
+
+#### What changes
+
+| Surface | Before | After |
+|---|---|---|
+| Storage | one table `top_volume`, all four cadences mixed, `tf` column separates them | **four tables** `top_volume_1s`, `top_volume_3s`, `top_volume_5s`, `top_volume_1m` |
+| Per-cadence reading surface | four VIEWS over `top_volume` + a LEFT JOIN to the lifecycle dimension | the tables themselves — no view, no join, no `WHERE tf=` filter |
+| Writer routing | every row to `top_volume` | each row to its own cadence's table, chosen by `SnapshotCadence::table_name()` — a `const fn`, O(1), no allocation |
+| Columns | 15 | **the same 15**, unchanged. `tf` is KEPT (constant per table) so a UNION across the four stays self-describing and the DEDUP key does not change shape |
+| DEDUP key | `ts, tf, family, feed, security_id, segment` | unchanged, per table |
+| Partitioning | `PARTITION BY HOUR`, one table | `PARTITION BY HOUR`, each of the four; all four join `HOUR_PARTITIONED_TABLES` |
+| The legacy `top_volume` table | live | **RETIRED as a write target.** Kept in `HOUR_PARTITIONED_TABLES` so its existing rows age out under the 15-day market-data window rather than sitting un-swept forever |
+
+**Why the view names are reused as table names, and the one step that makes it
+safe.** A QuestDB view and a table share one namespace, so `CREATE TABLE
+top_volume_1s` fails against a box where `top_volume_1s` is still the old view.
+The ensure path therefore issues `DROP VIEW IF EXISTS <name>` immediately before
+each `CREATE TABLE IF NOT EXISTS <name>`. On the first boot it removes the view;
+on every later boot the name is a table, the drop is refused, and that refusal
+is expected and logged at debug — never counted as a failure.
+
+#### The ordering contract — what "always sorted" means, stated exactly
+
+A sweep ranks one window's contracts by `window_lots_milli` descending, and
+`volume_percentage_change = window_lots_milli / 10 - 100` is monotone in it, so
+the rows of one sweep are appended in `volume_percentage_change` DESCENDING
+order. Sweeps run in time order, so windows arrive in `ts` ASCENDING order. The
+designated timestamp keeps each table physically ordered by `ts`.
+
+| Claim | Status |
+|---|---|
+| Rows are WRITTEN `ts ASC, volume_percentage_change DESC` | **Verified** — pinned by test on the writer's projection |
+| Each cadence's rows land in its own table only | **Verified** — pinned by test on the ILP line |
+| QuestDB PRESERVES arrival order among rows that share one `ts`, through WAL apply and DEDUP | **UNVERIFIED** — no live QuestDB is reachable from the build environment. Probe on the box: `SELECT ts, volume_percentage_change FROM top_volume_1s WHERE ts IN today() LIMIT 500` and check the second column never rises within one `ts` |
+
+**Until that probe reads clean, a reader who needs the order guaranteed writes
+`ORDER BY ts ASC, volume_percentage_change DESC`.** The rows are already in that
+order, so the sort is close to a no-op — but it is the only form this repository
+can promise today.
+
+#### O(1) — the honest statement
+
+| Operation | Cost |
+|---|---|
+| Choosing the table for a row | **O(1)** — a `const fn` match, no allocation |
+| Writing one row | **O(1)** — one ILP append |
+| Reading one window of one cadence | **O(log n)** partition seek + **O(k)** for the k rows returned. No join, no filter over the other three cadences, no sort at read time |
+| The sort itself | **O(m log m)** once per sweep, at write time, over the m contracts that traded in the window |
+
+Per-SWEEP O(1) is arithmetically impossible — a sweep's output is one row per
+traded contract — and is NOT claimed anywhere. What the split buys is that a
+read never pays for the other three cadences' rows, and never pays a join.
+
+#### ⚠ What is LOST, stated rather than implied
+
+The four views carried three joined columns from the instrument master —
+`symbol_name`, `display_name`, `instrument_type`. **The direct tables do not
+carry them.** The `contract` column still holds the human-readable contract
+label written at snapshot time, which is what the operator reads; the fuller
+master fields are one join away in `instrument_lifecycle` for anyone who needs
+them. Carrying them in every row would add ~100 bytes per row across ~20,000
+rows per sweep to duplicate a dimension table.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Re-introduces per-cadence VIEWS over a shared table (the arrangement this
+  section retires).
+- Writes a row to a table other than its own cadence's.
+- Drops `tf` from the tables or from the DEDUP key.
+- Removes the `DROP VIEW IF EXISTS` pre-step, or counts its expected refusal as
+  a failure (the second boot would then report an error forever).
+- Removes the legacy `top_volume` from `HOUR_PARTITIONED_TABLES` before its rows
+  have aged out.
+- Claims the within-`ts` physical order is guaranteed before the probe above has
+  read clean on a live box.
+- Claims per-sweep O(1).

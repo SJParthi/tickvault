@@ -1,5 +1,32 @@
-//! `top_volume` table — a queryable record of WHICH option contracts
+//! `top_volume_<tf>` tables — a queryable record of WHICH option contracts
 //! were the busiest, and whether we were actually watching them.
+//!
+//! ## ⚠ 2026-09-22 — FOUR DIRECT TABLES, one per timeframe
+//!
+//! Operator, verbatim: *"make the table itself per timeframe per timestamp
+//! shoudl be always sorted by volume percentage desc always timestamp asc …
+//! make it as direct tables dude why focusing on view"*.
+//!
+//! | Table | Holds | Written |
+//! |---|---|---|
+//! | `top_volume_1s` | the 1-second board | every second |
+//! | `top_volume_3s` | the 3-second board | every 3 s |
+//! | `top_volume_5s` | the 5-second board | every 5 s |
+//! | `top_volume_1m` | the 1-minute board | every minute |
+//!
+//! Same 15 columns, same DEDUP key, `PARTITION BY HOUR` each. The shared
+//! `top_volume` table and its four views are RETIRED; the writer routes each
+//! row by [`SnapshotCadence::table_name`].
+//!
+//! **Order.** One sweep is appended in rank order — `volume_percentage_change`
+//! DESCENDING — and sweeps run in time order, so rows are WRITTEN
+//! `ts ASC, volume_percentage_change DESC`. That is pinned by test on the
+//! projection. Whether QuestDB PRESERVES arrival order among rows sharing one
+//! `ts` through WAL apply and DEDUP is **UNVERIFIED** (no live QuestDB is
+//! reachable from the build environment); a reader who needs the order
+//! guaranteed today writes `ORDER BY ts, volume_percentage_change DESC`, which
+//! over already-ordered rows is close to free.
+//!
 //!
 //! Operator directive 2026-09-06: *"ensure to capture the top volume gainers
 //! of the entire options contracts starting 9.15 am till 3.39 pm ... meanwhile
@@ -39,7 +66,7 @@
 //! **What happens to a box that already has the table is worth stating
 //! plainly, because it is not what "removed" sounds like.** This module's
 //! self-heal is CREATE → `ADD COLUMN IF NOT EXISTS` → `DEDUP ENABLE`, and it
-//! contains no DROP by design (`top_volume_rank_ensure_statements_never_drop_
+//! contains no DROP by design (`top_volume_ensure_statements_never_drop_
 //! and_end_with_dedup_enable` fails the build on one, because a DROP in a path
 //! that runs every boot deletes history on any boot). QuestDB cannot drop a
 //! column through this path at all.
@@ -57,7 +84,8 @@
 //! ## Schema
 //!
 //! ```sql
-//! CREATE TABLE IF NOT EXISTS top_volume (
+//! -- identical for top_volume_1s / _3s / _5s / _1m
+//! CREATE TABLE IF NOT EXISTS top_volume_1s (
 //!     ts TIMESTAMP, tf SYMBOL, family SYMBOL, feed SYMBOL,
 //!     segment SYMBOL, contract SYMBOL, security_id LONG,
 //!     underlying_id LONG,
@@ -131,9 +159,12 @@
 //! (3,187,232 rows for a whole session under the 250 cut, which tells us
 //! nothing about the uncut count), and the 3s/5s/1m figures were never
 //! measured at all because the source partitions were archived to S3 and
-//! dropped from EBS before they could be. `SELECT tf, count(*) FROM
-//! top_volume WHERE ts IN today() GROUP BY tf` on the first session with
-//! this build is what turns the range into a number.
+//! dropped from EBS before they could be. Since 2026-09-22 each cadence is
+//! its own table, so the measurement is one count per table --
+//! `SELECT count(*) FROM top_volume_1s WHERE ts IN today()`, then the same for
+//! `_3s`, `_5s` and `_1m` -- on the first session with this build. (The single
+//! `GROUP BY tf` query that used to stand here names a table that no longer
+//! exists.)
 //!
 //! The `5s` rows are numerically a subset of the `1s` rows and are kept
 //! anyway because they mean something different: a `5s` row is the ranking
@@ -160,30 +191,43 @@
 
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::error_code::ErrorCode;
 
-/// QuestDB table name — one row per (snapshot, timeframe, family, contract).
+/// The per-timeframe DIRECT tables — one per [`SnapshotCadence`].
 ///
-/// ⚠ RENAMED 2026-09-12 from `top_volume_rank` to `top_volume` (operator:
-/// "dotnt make it as top volume rank table meake the table name as top volume
-/// alone"). The rows already written under the old name are CARRIED FORWARD by
-/// [`LEGACY_TOP_VOLUME_RANK_TABLE`] below, never abandoned — a second table
-/// holding half the history is the split this repo's own rename helper exists
-/// to detect and report.
-pub const TOP_VOLUME_RANK_TABLE: &str = "top_volume";
+/// ⚠ 2026-09-22 (operator: *"make the table itself per timeframe … make it as
+/// direct tables dude why focusing on view"*). Until today every cadence was
+/// written to ONE `top_volume` table and read through four views filtered on
+/// `tf`. Each cadence now has its OWN table under the name the view used to
+/// carry, so a reader of `top_volume_5s` reads rows that are nothing but the
+/// 5-second board — no join, no filter over the other three cadences.
+///
+/// Declared as `…_TABLE` consts (not only inside `table_name()`) so
+/// `partition_retention_coverage_guard`, which discovers tables by scanning
+/// for that name pattern, sees all four and demands a retention decision for
+/// each.
+pub const TOP_VOLUME_1S_TABLE: &str = "top_volume_1s";
+/// See [`TOP_VOLUME_1S_TABLE`].
+pub const TOP_VOLUME_3S_TABLE: &str = "top_volume_3s";
+/// See [`TOP_VOLUME_1S_TABLE`].
+pub const TOP_VOLUME_5S_TABLE: &str = "top_volume_5s";
+/// See [`TOP_VOLUME_1S_TABLE`].
+pub const TOP_VOLUME_1M_TABLE: &str = "top_volume_1m";
 
-/// The name this table was created under until 2026-09-12.
+/// The single shared table every cadence was written to from 2026-09-12 until
+/// 2026-09-22. RETIRED as a write target — nothing writes it any more.
 ///
-/// `ensure_top_volume_rank_table` runs a one-shot `RENAME TABLE` from this to
-/// [`TOP_VOLUME_RANK_TABLE`] BEFORE its CREATE, so a box that already holds
-/// rows carries them into the new name instead of stranding them in a table
-/// that is no longer swept by the partition manager. The rename fails on every
-/// boot after the first, and that failure is EXPECTED and not an error — see
-/// `try_rename_legacy_table`, which additionally reports a SPLIT if both names
-/// somehow exist at once.
+/// Kept as a named const, and kept in `HOUR_PARTITIONED_TABLES`, so any rows it
+/// still holds age out under the 15-day market-data window instead of sitting
+/// un-swept forever. The fresh-start reset drops it outright on a box that has
+/// not yet run that reset.
+pub const LEGACY_TOP_VOLUME_TABLE: &str = "top_volume";
+
+/// The name the shared table carried until 2026-09-12. Also retired, also
+/// dropped by the fresh-start reset; listed in `RETENTION_EXEMPT_TABLES`.
 pub const LEGACY_TOP_VOLUME_RANK_TABLE: &str = "top_volume_rank";
 
 /// DEDUP key. Designated `ts` FIRST (2026-04-28 regression rule); `segment`
@@ -322,21 +366,23 @@ impl SnapshotCadence {
         }
     }
 
-    /// The named QuestDB view this cadence is read through.
+    /// The DIRECT table this cadence's rows are written to (2026-09-22).
     ///
-    /// Lives HERE, beside the label it filters on, because the view's `WHERE
-    /// t.tf = '<label>'` clause and the view's own name are one claim: a view
-    /// called `top_volume_3s` that filters `tf = '5s'` is wrong in a way
-    /// no reader of either file alone could see. `console_views` builds the
-    /// DDL from this pair rather than from a second enum of its own, which is
-    /// what the deleted `TopVolumeCadence` was.
+    /// Lives HERE, beside the `tf` label the same rows carry, because the
+    /// table's name and its `tf` value are one claim: a table called
+    /// `top_volume_3s` holding `tf = '5s'` rows is wrong in a way no reader of
+    /// either file alone could see. A `const fn` match — O(1), no allocation —
+    /// because the writer calls it once per row.
+    ///
+    /// *(Was `view_name()` until 2026-09-22, when these names were read-only
+    /// views over one shared `top_volume` table.)*
     #[must_use]
-    pub const fn view_name(self) -> &'static str {
+    pub const fn table_name(self) -> &'static str {
         match self {
-            Self::OneSecond => "top_volume_1s",
-            Self::ThreeSecond => "top_volume_3s",
-            Self::FiveSecond => "top_volume_5s",
-            Self::OneMinute => "top_volume_1m",
+            Self::OneSecond => TOP_VOLUME_1S_TABLE,
+            Self::ThreeSecond => TOP_VOLUME_3S_TABLE,
+            Self::FiveSecond => TOP_VOLUME_5S_TABLE,
+            Self::OneMinute => TOP_VOLUME_1M_TABLE,
         }
     }
 }
@@ -670,7 +716,8 @@ pub fn render_delay_into(out: &mut String, nanos: i64) {
         out.push('s');
     }
 }
-/// The idempotent `CREATE TABLE` DDL for `top_volume_rank`. Pure.
+/// The idempotent `CREATE TABLE` DDL for ONE per-timeframe `top_volume_<tf>`
+/// table. Pure. All four tables share this exact schema and differ only in name.
 ///
 /// # The three orphan columns this DDL deliberately no longer names
 ///
@@ -695,9 +742,10 @@ pub fn render_delay_into(out: &mut String, nanos: i64) {
 /// `TopVolumeRankRow::cumulative_day_volume` field that no longer exists.
 /// Both described the pre-reset plan.)*
 #[must_use]
-pub fn top_volume_rank_create_ddl() -> String {
+pub fn top_volume_create_ddl(cadence: SnapshotCadence) -> String {
+    let table = cadence.table_name();
     format!(
-        "CREATE TABLE IF NOT EXISTS {TOP_VOLUME_RANK_TABLE} (\
+        "CREATE TABLE IF NOT EXISTS {table} (\
             ts            TIMESTAMP, \
             tf            SYMBOL, \
             family        SYMBOL, \
@@ -720,6 +768,7 @@ pub fn top_volume_rank_create_ddl() -> String {
 
 /// Every non-designated column, for the per-column self-heal ALTER manifest.
 /// Kept beside the DDL so `table_schema_lockstep_guard` can compare them.
+/// The SAME list for all four per-timeframe tables — they differ only in name.
 const TOP_VOLUME_RANK_COLUMNS: &[(&str, &str)] = &[
     ("tf", "SYMBOL"),
     ("family", "SYMBOL"),
@@ -737,44 +786,68 @@ const TOP_VOLUME_RANK_COLUMNS: &[(&str, &str)] = &[
     ("subscribed", "BOOLEAN"),
 ];
 
-/// The full idempotent statement list: CREATE, then per-column
-/// `ADD COLUMN IF NOT EXISTS`, then `DEDUP ENABLE`. Never a DROP. Pure, so
-/// the ordering is unit-testable without a live QuestDB.
+/// The `DROP VIEW` that clears a pre-2026-09-22 view of the SAME name before
+/// the table is created.
+///
+/// A QuestDB view and a table share one namespace, and until 2026-09-22 each
+/// of these four names was a VIEW over the shared `top_volume` table. A
+/// `CREATE TABLE IF NOT EXISTS top_volume_1s` against a box where that name is
+/// still a view does not create a table. So the view goes first.
+///
+/// From the second boot onward the name IS a table and no view of that name
+/// exists; `IF EXISTS` then makes the statement a no-op, and should QuestDB
+/// instead refuse a `DROP VIEW` that names a table, the refusal is EXPECTED —
+/// it is logged at debug by [`ensure_top_volume_tables`] and never counted as
+/// a failure (an error whose steady state is "once per boot, forever" trains
+/// the operator to ignore the counter).
 #[must_use]
-pub fn top_volume_rank_ensure_statements() -> Vec<String> {
-    let mut statements = vec![top_volume_rank_create_ddl()];
+pub fn top_volume_view_predrop_ddl(cadence: SnapshotCadence) -> String {
+    format!("DROP VIEW IF EXISTS {};", cadence.table_name())
+}
+
+/// The full idempotent statement list for ONE per-timeframe table: CREATE,
+/// then per-column `ADD COLUMN IF NOT EXISTS`, then `DEDUP ENABLE`. Never a
+/// DROP (the view pre-drop is separate, see [`top_volume_view_predrop_ddl`]).
+/// Pure, so the ordering is unit-testable without a live QuestDB.
+#[must_use]
+pub fn top_volume_ensure_statements(cadence: SnapshotCadence) -> Vec<String> {
+    let table = cadence.table_name();
+    let mut statements = Vec::with_capacity(TOP_VOLUME_RANK_COLUMNS.len() + 2);
+    statements.push(top_volume_create_ddl(cadence));
     for (col, ty) in TOP_VOLUME_RANK_COLUMNS {
         statements.push(format!(
-            "ALTER TABLE {TOP_VOLUME_RANK_TABLE} ADD COLUMN IF NOT EXISTS {col} {ty};"
+            "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {ty};"
         ));
     }
     statements.push(format!(
-        "ALTER TABLE {TOP_VOLUME_RANK_TABLE} DEDUP ENABLE \
-         UPSERT KEYS({DEDUP_KEY_TOP_VOLUME_RANK});"
+        "ALTER TABLE {table} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_TOP_VOLUME_RANK});"
     ));
     statements
 }
 
-/// Creates the `top_volume_rank` table if absent (schema-self-heal order:
+/// Creates the four per-timeframe `top_volume_<tf>` tables if absent
+/// (schema-self-heal order per table: drop a same-named legacy VIEW ->
 /// CREATE -> per-column ALTER -> DEDUP ENABLE; never a table drop).
 ///
 /// Fail-SOFT per statement: every failure logs at `error!` with
 /// `STORAGE-GAP-03` and the walk continues, so one refused statement never
-/// hides the next. The honest consequence, stated rather than hidden: a
-/// failed ensure leaves the table to be auto-created by the first ILP write
-/// WITHOUT `DEDUP UPSERT KEYS` — a duplicate-row window until a later ensure
-/// succeeds. Blocking the boot instead would trade a duplicate-row window
-/// for no session at all.
+/// hides the next, and one refused TABLE never hides the other three. The
+/// honest consequence, stated rather than hidden: a failed ensure leaves that
+/// table to be auto-created by the first ILP write WITHOUT `DEDUP UPSERT
+/// KEYS` — a duplicate-row window until a later ensure succeeds. Blocking the
+/// boot instead would trade a duplicate-row window for no session at all.
 ///
-/// Returns `true` only when EVERY statement was accepted, so the boot's
-/// bounded retry loop (`candle_ddl_boot::run_live_table_ddl_at_boot`) can
-/// re-run it beside `ticks` and `market_depth`. Until 2026-09-08 this fn
-/// returned `()` and had ZERO production callers — the table was written by
-/// its offload writer every second and ensured by nothing, so a fresh
-/// volume (the 2026-09-08 nuke) would have let the first ILP row auto-create
-/// it with no DEDUP key at all.
-// TEST-EXEMPT: live-QuestDB DDL runner; the statement list it sends is pure and is asserted by the ensure-statement tests below, and the boot call site is pinned by crates/app/tests/ensure_ddl_boot_wiring_guard.rs.
-pub async fn ensure_top_volume_rank_table(questdb_config: &QuestDbConfig) -> bool {
+/// Returns `true` only when EVERY statement for EVERY table was accepted
+/// (the view pre-drop excepted — its refusal is the normal steady state), so
+/// the boot's bounded retry loop (`candle_ddl_boot::run_live_table_ddl_at_boot`)
+/// can re-run it beside `ticks` and `market_depth`.
+///
+/// *(Until 2026-09-22 this was `ensure_top_volume_rank_table`, ensuring ONE
+/// shared `top_volume` table and first renaming a legacy `top_volume_rank`
+/// into it. The rename is gone: nothing writes the shared table any more, and
+/// the fresh-start reset drops both legacy names outright.)*
+// TEST-EXEMPT: live-QuestDB DDL runner; the statement lists it sends are pure and are asserted by the ensure-statement tests below, and the boot call site is pinned by crates/app/tests/ensure_ddl_boot_wiring_guard.rs.
+pub async fn ensure_top_volume_tables(questdb_config: &QuestDbConfig) -> bool {
     let base_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
@@ -789,122 +862,78 @@ pub async fn ensure_top_volume_rank_table(questdb_config: &QuestDbConfig) -> boo
                 code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
                 stage = "ensure_client_build",
                 ?err,
-                "STORAGE-GAP-03: HTTP client build failed — top_volume_rank not \
-                 ensured (the first ILP write may auto-create it WITHOUT dedup, \
+                "STORAGE-GAP-03: HTTP client build failed — top_volume_<tf> tables not \
+                 ensured (the first ILP write may auto-create them WITHOUT dedup, \
                  a duplicate-row window until the next successful boot)"
             );
             return false;
         }
     };
-    // BEFORE the CREATE, deliberately. A `CREATE TABLE IF NOT EXISTS
-    // top_volume` on a box that already holds `top_volume_rank` rows would
-    // succeed against an EMPTY new table and strand the old one: no longer in
-    // `HOUR_PARTITIONED_TABLES`, no longer swept, growing forever on a volume
-    // this repository has already filled twice. Renaming first carries the
-    // history across.
-    //
-    // The refusal is the NORMAL case from the second boot onward, which is why
-    // this goes through `try_rename_legacy_table` rather than the DDL loop
-    // below — that loop fires a coded error and increments a persist-error
-    // counter, and an error whose steady state is "one per boot, forever"
-    // trains the operator to discount the counter. The helper additionally
-    // probes whether the legacy table still exists on a refusal and reports a
-    // SPLIT, which is the only case here that needs a human.
-    //
-    // The `== Split` arm is NOT optional, and an earlier draft of this call
-    // discarded the verdict with `let _ =`. Both tables present means the
-    // history is halved — new rows in `top_volume`, everything before the
-    // rename stranded in `top_volume_rank`, which is no longer in
-    // `HOUR_PARTITIONED_TABLES` and so is never swept. That is the exact
-    // failure the comment above is about, and swallowing the verdict made it
-    // SILENT. Same shape as the three sibling renames
-    // (`spot_1m_rest_persistence`, `option_chain_1m_persistence`,
-    // `option_contract_1m_rest_persistence`): the helper deliberately does not
-    // log `Split` because the caller owns the coded error.
-    if crate::http_client::try_rename_legacy_table(
-        &client,
-        &base_url,
-        LEGACY_TOP_VOLUME_RANK_TABLE,
-        TOP_VOLUME_RANK_TABLE,
-    )
-    .await
-        == crate::http_client::LegacyRenameOutcome::Split
-    {
-        // `increment(1)`, and the `(0)` it replaced was the FOURTH vacuous
-        // instance found on this branch (2026-09-13, confirmed independently by
-        // two adversarial sweeps).
-        //
-        // A seed belongs at CONSTRUCTION, where it registers the series before
-        // the event. Inside the detection arm it is worse than nothing: the
-        // series comes into existence only when a split occurs, and it comes
-        // into existence reading ZERO. An operator grepping the counter across
-        // the fleet after a rollback-then-rollforward would find the number the
-        // metric exists to report saying nothing happened.
-        //
-        // All three sibling renames already do this correctly
-        // (`spot_1m_rest_persistence`, `option_chain_1m_persistence`,
-        // `option_contract_1m_rest_persistence` each `.increment(1)`); this one
-        // alone disagreed.
-        //
-        // HONEST LIMIT: this reuses a ROW-LOSS counter's name for a
-        // table-topology event, so a fleet-wide `sum()` now spans two label
-        // sets with two meanings. The `stage` label separates them and the
-        // coded `error!` below is the real triage surface; a dedicated metric
-        // name would cost ~$0.30/mo against a September forecast of $142.24
-        // and an automatic `STOP_EC2_INSTANCES` line at $135.00, which §2.3n of
-        // the noise lock says needs a LEVER and not a cost note. Recorded, not
-        // spent.
-        metrics::counter!(
-            "tv_top_volume_rank_rows_discarded_total",
-            "stage" => "legacy_table_split"
-        )
-        .increment(1);
-        error!(
-            code = "STORAGE-GAP-03",
-            stage = "legacy_table_split",
-            legacy_table = LEGACY_TOP_VOLUME_RANK_TABLE,
-            current_table = TOP_VOLUME_RANK_TABLE,
-            "STORAGE-GAP-03: both the legacy and current top-volume tables exist \
-             — the ranking history is SPLIT across two tables. New rows land in \
-             the current name; everything written before the rename stays in the \
-             legacy one, which is NOT in the hour-partitioned retention list and \
-             is therefore never swept. Neither is dropped; merging is an operator \
-             decision"
-        );
-    }
 
     let mut all_accepted = true;
-    for ddl in &top_volume_rank_ensure_statements() {
+    for cadence in SnapshotCadence::ALL {
+        // The legacy view of the same name, FIRST. Its refusal is expected
+        // from the second boot onward and is never a failure.
+        let predrop = top_volume_view_predrop_ddl(cadence);
         match client
             .get(&base_url)
-            .query(&[("query", ddl.as_str())])
+            .query(&[("query", predrop.as_str())])
             .send()
             .await
         {
             Ok(resp) if resp.status().is_success() => {}
             Ok(resp) => {
-                all_accepted = false;
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                error!(
-                    code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
-                    stage = "ensure_ddl",
-                    %status,
-                    ddl = ddl.as_str(),
-                    body = %body.chars().take(200).collect::<String>(),
-                    "STORAGE-GAP-03: top_volume_rank DDL returned non-2xx \
-                     (dedup may be missing — duplicate-row window)"
+                debug!(
+                    table = cadence.table_name(),
+                    status = %resp.status(),
+                    "top_volume: legacy view pre-drop refused — expected once the name \
+                     is a table"
                 );
             }
             Err(err) => {
-                all_accepted = false;
-                error!(
-                    code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
-                    stage = "ensure_ddl",
+                debug!(
+                    table = cadence.table_name(),
                     ?err,
-                    ddl = ddl.as_str(),
-                    "STORAGE-GAP-03: top_volume_rank DDL request failed"
+                    "top_volume: legacy view pre-drop request failed — the CREATE below \
+                     reports if it matters"
                 );
+            }
+        }
+
+        for ddl in &top_volume_ensure_statements(cadence) {
+            match client
+                .get(&base_url)
+                .query(&[("query", ddl.as_str())])
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {}
+                Ok(resp) => {
+                    all_accepted = false;
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    error!(
+                        code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+                        stage = "ensure_ddl",
+                        table = cadence.table_name(),
+                        %status,
+                        ddl = ddl.as_str(),
+                        body = %body.chars().take(200).collect::<String>(),
+                        "STORAGE-GAP-03: top_volume DDL returned non-2xx \
+                         (dedup may be missing — duplicate-row window)"
+                    );
+                }
+                Err(err) => {
+                    all_accepted = false;
+                    error!(
+                        code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+                        stage = "ensure_ddl",
+                        table = cadence.table_name(),
+                        ?err,
+                        ddl = ddl.as_str(),
+                        "STORAGE-GAP-03: top_volume DDL request failed"
+                    );
+                }
             }
         }
     }
@@ -1053,7 +1082,7 @@ impl TopVolumeRankWriter {
     /// Propagates ILP buffer errors (table/column append failure).
     fn write_row(buffer: &mut Buffer, r: &TopVolumeRankRow<'_>) -> Result<()> {
         buffer
-            .table(TOP_VOLUME_RANK_TABLE)
+            .table(r.cadence.table_name())
             .context("table")?
             // Symbols BEFORE columns (ILP tags-before-fields rule).
             .symbol("tf", r.cadence.as_str())
@@ -1777,7 +1806,12 @@ const _: () = assert!(
 /// Read from the test's own message — the constant was floored to 1, the test
 /// run, and the panic named the width — never counted. The same rule that has
 /// governed every rise.
-const MEASURED_WORST_CASE_ILP_ROW_BYTES: usize = 447;
+/// ⚠ 447 -> 450 on 2026-09-22. The row is unchanged; the TABLE NAME is
+/// what grew: every line now opens with `top_volume_1m` (the widest of the four
+/// per-cadence tables) instead of `top_volume`, three bytes longer. Read from
+/// the test's own message. The assumed 502 still covers it (11.6% headroom),
+/// so the producer ceiling does not move.
+const MEASURED_WORST_CASE_ILP_ROW_BYTES: usize = 450;
 
 // (3) The requirement the ORIGINAL assert's message named and its arithmetic
 //     could not check: the ceiling must hold at least one worst-case sweep at
@@ -2149,7 +2183,7 @@ mod tests {
     #[test]
     fn the_rank_column_is_absent_from_the_ddl_the_manifest_and_the_wire() {
         assert!(
-            !top_volume_rank_create_ddl().contains("rank "),
+            !top_volume_create_ddl(SnapshotCadence::OneSecond).contains("rank "),
             "the CREATE still declares rank"
         );
         assert!(
@@ -2236,7 +2270,7 @@ mod tests {
 
     #[test]
     fn top_volume_rank_create_ddl_partitions_by_hour_and_enables_dedup() {
-        let ddl = top_volume_rank_create_ddl();
+        let ddl = top_volume_create_ddl(SnapshotCadence::OneSecond);
         assert!(ddl.contains("PARTITION BY HOUR"), "{ddl}");
         assert!(
             ddl.contains(&format!("DEDUP UPSERT KEYS({DEDUP_KEY_TOP_VOLUME_RANK})")),
@@ -2249,7 +2283,7 @@ mod tests {
     /// Never a DROP — this table is append-only history.
     #[test]
     fn top_volume_rank_ensure_statements_never_drop_and_end_with_dedup_enable() {
-        let statements = top_volume_rank_ensure_statements();
+        let statements = top_volume_ensure_statements(SnapshotCadence::OneSecond);
         assert!(statements[0].starts_with("CREATE TABLE IF NOT EXISTS"));
         assert!(
             statements
@@ -2284,7 +2318,7 @@ mod tests {
         // for any table with one LONG column anywhere, so it could not catch a
         // manifest that declared the wrong type. It now compares the type
         // parsed from the column's OWN position in the DDL.
-        let ddl = top_volume_rank_create_ddl();
+        let ddl = top_volume_create_ddl(SnapshotCadence::OneSecond);
         let created = ddl_columns(&ddl);
 
         for (col, ty) in TOP_VOLUME_RANK_COLUMNS {
@@ -2344,7 +2378,7 @@ mod tests {
     /// depends on it passes by reading an empty list.
     #[test]
     fn the_ddl_column_parser_reads_the_whole_list_and_not_a_prefix() {
-        let created = ddl_columns(&top_volume_rank_create_ddl());
+        let created = ddl_columns(&top_volume_create_ddl(SnapshotCadence::OneSecond));
         assert_eq!(
             created.len(),
             TOP_VOLUME_RANK_COLUMNS.len() + 1,
@@ -2415,9 +2449,9 @@ mod tests {
         let line = w.buffer_utf8();
         for expected in [
             // The TRAILING COMMA is the assertion. An ILP table name ends at
-            // the first comma, so "top_volume," rejects the pre-2026-09-12
-            // "top_volume_rank," that a bare "top_volume" would accept.
-            "top_volume,",
+            // the first comma, so "top_volume_5s," rejects both the retired
+            // shared "top_volume," and any other cadence's table.
+            "top_volume_5s,",
             "tf=5s",
             "family=stock_option",
             "feed=dhan",
@@ -3160,6 +3194,213 @@ mod tests {
         assert_eq!(
             by_nanos.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
             vec![1_000_000_000, 2_000_000, 3_000, 4],
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 2026-09-22 — four DIRECT per-timeframe tables.
+    // ------------------------------------------------------------------
+
+    /// Every cadence has its own table, named `top_volume_<label>`, and no two
+    /// cadences share one. The suffix IS the `tf` label, so a row's table and
+    /// its `tf` column can never disagree.
+    #[test]
+    fn every_cadence_has_its_own_table_named_after_its_label() {
+        let mut seen = std::collections::HashSet::new();
+        for c in SnapshotCadence::ALL {
+            let table = c.table_name();
+            assert_eq!(table, format!("top_volume_{}", c.as_str()));
+            assert!(seen.insert(table), "{table} is shared by two cadences");
+            assert_ne!(table, LEGACY_TOP_VOLUME_TABLE);
+            assert_ne!(table, LEGACY_TOP_VOLUME_RANK_TABLE);
+        }
+        assert_eq!(seen.len(), 4);
+        // The four consts are what the retention guard discovers; they must be
+        // exactly what `table_name()` returns.
+        let consts = [
+            TOP_VOLUME_1S_TABLE,
+            TOP_VOLUME_3S_TABLE,
+            TOP_VOLUME_5S_TABLE,
+            TOP_VOLUME_1M_TABLE,
+        ];
+        for (c, k) in SnapshotCadence::ALL.iter().zip(consts) {
+            assert_eq!(c.table_name(), k);
+        }
+    }
+
+    /// `table_name()` is a `const fn` — callable at compile time, which is the
+    /// proof it allocates nothing and does no lookup at run time.
+    #[test]
+    fn table_name_is_evaluable_at_compile_time() {
+        const NAME: &str = SnapshotCadence::OneMinute.table_name();
+        assert_eq!(NAME, "top_volume_1m");
+    }
+
+    /// Each cadence's row reaches ITS table and no other, for all four.
+    #[test]
+    fn the_writer_routes_every_cadence_to_its_own_table() {
+        for c in SnapshotCadence::ALL {
+            let mut w = TopVolumeRankWriter::for_test();
+            w.append_row(&TopVolumeRankRow {
+                cadence: c,
+                ..row()
+            })
+            .expect("append");
+            let line = w.buffer_utf8();
+            let prefix = format!("{},", c.table_name());
+            assert!(line.starts_with(&prefix), "{c:?} wrote {line}");
+            assert!(line.contains(&format!("tf={}", c.as_str())), "{line}");
+            for other in SnapshotCadence::ALL {
+                if other != c {
+                    assert!(
+                        !line.starts_with(&format!("{},", other.table_name())),
+                        "{c:?} leaked into {}",
+                        other.table_name()
+                    );
+                }
+            }
+            assert!(!line.starts_with("top_volume,"), "wrote the retired table");
+        }
+    }
+
+    /// Every ORDER in which the four cadences can arrive in one buffer — all
+    /// 24 permutations — routes every line correctly. A writer that remembered
+    /// the previous row's table would fail some ordering, never all of them.
+    #[test]
+    fn every_arrival_order_of_the_four_cadences_routes_each_line_correctly() {
+        fn permutations(items: &[SnapshotCadence]) -> Vec<Vec<SnapshotCadence>> {
+            if items.len() <= 1 {
+                return vec![items.to_vec()];
+            }
+            let mut out = Vec::new();
+            for i in 0..items.len() {
+                let mut rest = items.to_vec();
+                let head = rest.remove(i);
+                for mut tail in permutations(&rest) {
+                    tail.insert(0, head);
+                    out.push(tail);
+                }
+            }
+            out
+        }
+        let all = permutations(&SnapshotCadence::ALL);
+        assert_eq!(all.len(), 24);
+        for order in all {
+            let mut w = TopVolumeRankWriter::for_test();
+            for c in &order {
+                w.append_row(&TopVolumeRankRow {
+                    cadence: *c,
+                    ..row()
+                })
+                .expect("append");
+            }
+            assert_eq!(w.pending(), 4);
+            let text = w.buffer_utf8();
+            let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+            assert_eq!(lines.len(), 4, "{text}");
+            for (line, c) in lines.iter().zip(&order) {
+                assert!(
+                    line.starts_with(&format!("{},", c.table_name())),
+                    "order {order:?}: {line}"
+                );
+            }
+        }
+    }
+
+    /// The four CREATEs are identical apart from the table name — one schema,
+    /// four tables. A column added to one and not the others is caught here.
+    #[test]
+    fn the_four_tables_share_one_schema_byte_for_byte() {
+        let normalised: Vec<String> = SnapshotCadence::ALL
+            .iter()
+            .map(|c| top_volume_create_ddl(*c).replace(c.table_name(), "T"))
+            .collect();
+        for ddl in &normalised[1..] {
+            assert_eq!(ddl, &normalised[0]);
+        }
+        for c in SnapshotCadence::ALL {
+            let ddl = top_volume_create_ddl(c);
+            assert!(
+                ddl.starts_with(&format!("CREATE TABLE IF NOT EXISTS {} (", c.table_name())),
+                "{ddl}"
+            );
+            assert!(ddl.contains("PARTITION BY HOUR"));
+            assert!(ddl.contains(&format!("DEDUP UPSERT KEYS({DEDUP_KEY_TOP_VOLUME_RANK})")));
+            // `tf` stays in the key even though it is constant per table: it
+            // keeps a UNION across the four self-describing.
+            assert!(DEDUP_KEY_TOP_VOLUME_RANK.contains("tf"));
+        }
+    }
+
+    /// Every self-heal statement for a cadence names THAT cadence's table and
+    /// no other; none drops anything; DEDUP ENABLE is last.
+    #[test]
+    fn each_tables_self_heal_touches_only_that_table_and_never_drops() {
+        for c in SnapshotCadence::ALL {
+            let statements = top_volume_ensure_statements(c);
+            assert_eq!(statements.len(), TOP_VOLUME_RANK_COLUMNS.len() + 2);
+            for s in &statements {
+                assert!(s.contains(c.table_name()), "{s}");
+                assert!(!s.to_uppercase().contains("DROP"), "{s}");
+                for other in SnapshotCadence::ALL {
+                    if other != c {
+                        assert!(!s.contains(other.table_name()), "{s}");
+                    }
+                }
+                assert!(
+                    !s.contains(&format!("{LEGACY_TOP_VOLUME_TABLE} ")),
+                    "names the retired shared table: {s}"
+                );
+            }
+            assert!(statements[0].starts_with("CREATE TABLE IF NOT EXISTS"));
+            assert!(
+                statements
+                    .last()
+                    .is_some_and(|s| s.contains("DEDUP ENABLE"))
+            );
+        }
+    }
+
+    /// The pre-drop removes a same-named legacy VIEW only — never a table.
+    #[test]
+    fn the_view_predrop_drops_a_view_never_a_table() {
+        for c in SnapshotCadence::ALL {
+            let sql = top_volume_view_predrop_ddl(c);
+            assert_eq!(sql, format!("DROP VIEW IF EXISTS {};", c.table_name()));
+            assert!(!sql.to_uppercase().contains("TABLE"), "{sql}");
+        }
+    }
+
+    /// The ensure fn issues the view pre-drop BEFORE the CREATE for each table
+    /// (a CREATE against a name that is still a view creates nothing), and
+    /// does not count the pre-drop's refusal as a failure.
+    #[test]
+    fn the_ensure_fn_predrops_the_view_before_creating_and_tolerates_its_refusal() {
+        let src = include_str!("top_volume_rank_persistence.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        let body_start = prod
+            .find("pub async fn ensure_top_volume_tables(")
+            .expect("ensure fn present");
+        let body = &prod[body_start..];
+        let predrop = body
+            .find("top_volume_view_predrop_ddl(cadence)")
+            .expect("pre-drop call");
+        let ensure = body
+            .find("top_volume_ensure_statements(cadence)")
+            .expect("ensure-statements call");
+        assert!(
+            predrop < ensure,
+            "the view must be dropped before the CREATE"
+        );
+        let between = &body[predrop..ensure];
+        assert!(
+            !between.contains("all_accepted = false"),
+            "a refused view pre-drop must not fail the ensure — it is the normal \
+             steady state from the second boot onward"
+        );
+        assert!(
+            between.contains("debug!"),
+            "pre-drop refusal is logged at debug"
         );
     }
 }

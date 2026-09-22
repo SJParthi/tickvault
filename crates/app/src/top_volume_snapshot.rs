@@ -2092,6 +2092,110 @@ mod tests {
         assert_eq!(without.rows[0].volume, None);
     }
 
+    // -- direct-table ordering (2026-09-22) --------------------------------
+
+    /// Operator 2026-09-22: every `top_volume_<tf>` table must read
+    /// `ts ASC, volume_percentage_change DESC`. The writer appends rows in the
+    /// order this projection returns them, and sweeps arrive in time order,
+    /// so the guarantee reduces to: within ONE snapshot, every row carries the
+    /// same `ts` and the key never rises from one row to the next.
+    ///
+    /// Exhaustive over every length-4 board drawn from a pool that includes
+    /// ties, a zero-ish key and a huge key — 6^4 = 1,296 boards — sorted the
+    /// way `VolumeLeaderboard::rank` sorts them, on all four cadences. A
+    /// board is only ever descending on its way in; what this pins is that
+    /// the projection neither reorders, nor drops-and-shuffles, nor stamps
+    /// two timestamps into one snapshot.
+    #[test]
+    fn every_snapshot_is_one_ts_and_descending_by_volume_percentage() {
+        const POOL: [u32; 6] = [1, 2, 399, 400, 500, 1_000_000];
+        // Divisible by 1, 3, 5 and 60 seconds, so every cadence grid lands on
+        // it and no row is refused as off-grid.
+        let ts = 3_600 * NANOS_PER_SECOND;
+        let mut boards = 0_u32;
+        for cadence in SnapshotCadence::ALL {
+            for a in POOL {
+                for b in POOL {
+                    for c in POOL {
+                        for d in POOL {
+                            let mut vols = [a, b, c, d];
+                            // Descending, exactly as the leaderboard ranks.
+                            vols.sort_unstable_by(|x, y| y.cmp(x));
+                            let ranked: Vec<RankedContract> = vols
+                                .iter()
+                                .enumerate()
+                                .map(|(i, v)| contract(100 + i as u64, 1, *v))
+                                .collect();
+                            let snap = project_snapshot(
+                                ts,
+                                cadence,
+                                OptionFamily::Stock,
+                                &ranked,
+                                |_, _| true,
+                                TEST_LABEL,
+                                NO_CANDLE,
+                            );
+                            assert_eq!(snap.rows.len(), ranked.len(), "no row may be dropped");
+                            let first_ts = snap.rows[0].snapshot_ts_ist_nanos;
+                            for (row, want) in snap.rows.iter().zip(ranked.iter()) {
+                                assert_eq!(
+                                    row.snapshot_ts_ist_nanos, first_ts,
+                                    "one snapshot must carry one ts ({cadence:?})"
+                                );
+                                assert_eq!(
+                                    row.security_id,
+                                    i64::try_from(want.security_id).unwrap(),
+                                    "the projection must keep the rank order"
+                                );
+                                assert_eq!(row.cadence, cadence);
+                            }
+                            for pair in snap.rows.windows(2) {
+                                assert!(
+                                    pair[0].volume_percentage_change
+                                        >= pair[1].volume_percentage_change,
+                                    "key rose inside a snapshot: {} then {} ({vols:?}, {cadence:?})",
+                                    pair[0].volume_percentage_change,
+                                    pair[1].volume_percentage_change
+                                );
+                            }
+                            boards += 1;
+                        }
+                    }
+                }
+            }
+        }
+        // Anti-vacuity: the loops really ran every board on every cadence.
+        assert_eq!(boards, 1_296 * 4);
+    }
+
+    /// A refused row in the MIDDLE of a board (an id that cannot fit the
+    /// signed column) must not reorder its neighbours: the survivors stay in
+    /// rank order and stay descending.
+    #[test]
+    fn a_refused_middle_row_leaves_the_survivors_descending() {
+        let mut ranked = vec![
+            contract(10, 1, 900),
+            contract(11, 1, 700),
+            contract(12, 1, 500),
+            contract(13, 1, 300),
+        ];
+        ranked[1].security_id = u64::MAX; // refused: does not fit i64
+        let snap = project_snapshot(
+            NANOS_PER_SECOND,
+            SnapshotCadence::OneSecond,
+            OptionFamily::Stock,
+            &ranked,
+            |_, _| true,
+            TEST_LABEL,
+            NO_CANDLE,
+        );
+        let ids: Vec<i64> = snap.rows.iter().map(|r| r.security_id).collect();
+        assert_eq!(ids, vec![10, 12, 13]);
+        for pair in snap.rows.windows(2) {
+            assert!(pair[0].volume_percentage_change >= pair[1].volume_percentage_change);
+        }
+    }
+
     // -- from_bar (2026-09-22, hostile finding B1) -------------------------
 
     /// The sweep fires AT the window close, so the bar it probes is usually

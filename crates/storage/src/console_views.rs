@@ -88,6 +88,7 @@ use tracing::{error, info, warn};
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::QUESTDB_TABLE_TICKS;
 
+#[cfg(test)]
 use crate::top_volume_rank_persistence::SnapshotCadence;
 
 /// Wire-format name of the human-readable ticks console view.
@@ -119,18 +120,11 @@ pub const VIEW_DEPTH_NAMED: &str = "market_depth_named";
 /// `depth_persistence::MARKET_DEPTH_TABLE`; equality is pinned by
 /// `test_depth_base_matches_persistence_const`.
 const NAMED_VIEW_DEPTH_BASE: &str = "market_depth";
-/// Top-volume base table. Mirrors `top_volume_rank_persistence::TOP_VOLUME_RANK_TABLE`;
-/// equality is pinned by `test_top_volume_base_matches_persistence_const`.
-///
-/// ⚠ The per-cadence view NAMES used to live here, beside a SECOND cadence
-/// enum (`TopVolumeCadence`) that duplicated `SnapshotCadence` variant for
-/// variant — same two labels, written out twice, in two crates' worth of
-/// `match` arms. The only thing holding them together was a hand-enumerated
-/// test asserting the 1s and 5s pairs by name, which a variant added to one
-/// enum and not the other passed unchanged. Both the names and the labels now
-/// come from `SnapshotCadence` (`view_name()` / `as_str()`), so the view's
-/// name and the `tf` value it filters on are one declaration.
-const NAMED_VIEW_TOP_VOLUME_BASE: &str = "top_volume";
+// The per-cadence top-volume VIEWS (and their base-table const) lived here
+// until 2026-09-22. They are now four DIRECT TABLES owned by
+// `top_volume_rank_persistence` (`SnapshotCadence::table_name()`), written
+// `ts ASC, volume_percentage_change DESC` at append time — see the
+// "2026-09-22" section of `websocket-connection-scope-lock.md`.
 
 /// The FOUR per-cadence view names this table's views carried BEFORE the
 /// 2026-09-12 `top_volume_rank` → `top_volume` rename.
@@ -152,8 +146,12 @@ const NAMED_VIEW_TOP_VOLUME_BASE: &str = "top_volume";
 /// attempted with these views still present fails every boot forever and the
 /// history stays stranded under the legacy name. Dropping them first removes
 /// that failure mode whether or not it exists; dropping them second would not.
-/// `ensure_named_views` runs BEFORE `ensure_top_volume_rank_table` on the boot
-/// path, so the ordering this needs is the ordering already there.
+/// ⚠ 2026-09-22: there is no rename any more. `top_volume` became four
+/// direct per-cadence TABLES (`top_volume_1s/3s/5s/1m`), created by
+/// `ensure_top_volume_tables` on the live-table DDL step, and the fresh-start
+/// reset drops both legacy tables outright. This sweep survives only so a box
+/// that still carries these four views has them removed; the rename-ordering
+/// argument above is history, kept per house convention.
 ///
 /// # An explicit four-name list, never a prefix match
 ///
@@ -376,185 +374,12 @@ pub fn depth_named_view_ddl() -> String {
     )
 }
 
-/// DDL for one per-cadence top-volume view (`top_volume_1s` /
-/// `top_volume_3s` / `top_volume_5s` / `top_volume_1m`): the ranking rows of
-/// ONE cadence, joined to the instrument master so `symbol_name` reads beside
-/// the rank.
-///
-/// `cadence` is the `tf` SYMBOL literal — the same wire strings
-/// `SnapshotCadence::as_str` writes, pinned by
-/// `test_top_volume_cadence_view_ddl_filters_on_the_two_stored_cadences`.
-///
-/// # 2026-09-19 — the view stopped deriving what the table now stores
-///
-/// The operator's instruction was that the numbers he reads must be the
-/// numbers the table holds: *"no extra claucltion or derivation"*. Until this
-/// change the view scaled two stored integers (`window_lots_milli / 1000`,
-/// `net_volume_chg_milli_pct / 1000`) because those columns carried x1000
-/// scales that existed only to keep a sort key integral. Both are now stored
-/// at the scale he asked to read — whole lots and a whole-number percentage —
-/// so the view passes them through untouched and there is one fewer place the
-/// displayed number can disagree with the stored one.
-///
-/// | column | is | example |
-/// |---|---|---|
-/// | `per_lot_quantity` | units per contract (stored) | `200` |
-/// | `total_lots_traded` | whole lots traded in the window (stored) | `16` |
-/// | `volume_percentage_change` | the whole-number rank key (stored) | `1500` |
-/// | `percentage_change` | close vs YESTERDAY's close — equals `candles_<tf>.percentage_change` | `-0.62` |
-/// | `open_percentage_change` | close vs TODAY's 09:15 open — equals `candles_<tf>.open_percentage_change` | `1.14` |
-/// | `volume` | the candle's own SIGNED volume for this window (stored) | `-3200` |
-/// | `candle_lots` | `volume / per_lot_quantity` — SIGNED, so the minus survives | `-16.0` |
-///
-/// ⚠ CORRECTED 2026-09-22. This table and the two sections that followed it
-/// described `delta_units`, `close_vs_prev_bar_pct`, `candle_volume_signed`,
-/// `candle_volume_chg_pct` and three delay columns. None of them is in the
-/// 15-column `top_volume` table any more, and the SELECT below still named
-/// three (`open_latency`, `close_latency`, `window_span`) — so on a fresh
-/// volume every `CREATE OR REPLACE VIEW` here REFUSED and the operator's four
-/// per-cadence faces did not exist at all. The delay columns now live on
-/// `candles_<tf>` only. Pinned by
-/// `every_column_a_view_selects_exists_in_its_base_table`, which reads each
-/// view's `alias.column` references against the table DDL instead of trusting
-/// a hand-kept list.
-///
-/// # The derived column, and why it stays derived
-///
-/// `candle_lots` is pure arithmetic over `volume` and `per_lot_quantity`,
-/// both stored. Computing it here costs zero ILP bytes and it can never
-/// disagree with the `volume` printed beside it.
-///
-/// `CASE WHEN t.per_lot_quantity > 0` rather than a bare division: a zero lot
-/// size is refused upstream (`LegRefusal::MissingLotSize`), so this arm should
-/// be unreachable — but a division by zero here would put an infinity into a
-/// column an operator reads as a measurement, and NULL is the honest answer to
-/// "how many lots is this" when the lot size is unknown.
-///
-/// The casts are load-bearing, not decoration — see
-/// `the_derived_percentages_cast_before_dividing_a_long`. ONE probe settles
-/// whether they were strictly necessary, and it has not been run because no
-/// QuestDB is reachable from a dev container:
-///
-/// ```text
-/// curl -sG 'http://localhost:9000/exec' --data-urlencode \
-///   "query=SELECT cast(42500 AS LONG)/1000.0 a, 42500/1000.0 b"
-/// ```
-///
-/// Both columns `42.5` means the promotion happens and the cast is belt-and-
-/// braces; `b` reading `42` means the un-cast form was silently truncating and
-/// the cast is the only reason this view is right.
-///
-/// `volume_percentage_change` is a percentage CHANGE measured from ONE LOT,
-/// not a percentage OF one lot: 3200 units against a 200 lot is `+1500%`,
-/// because `(3200 - 200) / 200 = 15`. The two readings differ by exactly 100
-/// for every row, so they rank identically — the change form is used because
-/// its zero means something: `0` is exactly one lot, and a contract that
-/// traded LESS than one lot reads NEGATIVE rather than as a plausible `75%`.
-///
-/// # Default ordering (2026-09-18 directive) — and what is NOT proven
-///
-/// The operator's words: *"always have the volume percentage change desc for
-/// every timeframe of its respective timestamps"*. The view carries NO
-/// `ORDER BY` (the reasoning is at the `format!` below): rows are expected to
-/// come back `ts ASC, volume_percentage_change DESC` because `ts` is the
-/// designated timestamp and each sweep appends its slice in rank order.
-///
-/// ⚠ CORRECTED 2026-09-22. This section said the view "carries
-/// `ORDER BY t.ts DESC, t.volume_percentage_change DESC`". It has not since
-/// 2026-09-19, and the within-`ts` half of the order now rests on QuestDB
-/// preserving insertion order among rows that share one timestamp through
-/// WAL apply and DEDUP — which this repository has never observed on a live
-/// table (no QuestDB is reachable from a dev container). It is therefore
-/// UNVERIFIED. The check, on the box, after one session: read rows in scan
-/// order and confirm every run of equal `ts` is non-increasing in
-/// `volume_percentage_change`:
-///
-/// ```text
-/// SELECT ts, volume_percentage_change FROM top_volume_1s
-/// WHERE ts IN today() LIMIT 5000;
-/// ```
-///
-/// A window-function `lag` cannot do this check: ordering BY `ts` inside a
-/// partition of equal `ts` is a tie, so it would compare rows in an order the
-/// query itself chose. An increase inside any one-`ts` run means an explicit
-/// `ORDER BY ts, volume_percentage_change DESC` must come back, whatever it
-/// costs — correctness outranks the sort's price. Until then, a reader who
-/// needs the order guaranteed writes it in the query.
-///
-/// Any sort here uses the STORED INTEGER, never a float alias. An integer
-/// cannot produce a NaN — the class of comparator defect this repository
-/// already records as corrupting a whole sort rather than misplacing one row.
-///
-/// # `gain_pct` / `underlying_chg_pct` is GONE (operator, 2026-09-19)
-///
-/// *"as of now I believe we don't need this underlying percentage change"*.
-/// It was the UNDERLYING STOCK's move sitting in an option contract's row, and
-/// with three correctly-sourced contract percentages now beside it the name
-/// was the main source of the confusion it caused. The gainer FILTER that
-/// reads the underlying's move is untouched — it never read this column.
-///
-/// # First boot after a deploy that adds a column
-///
-/// `ensure_named_views` runs TWICE per boot, and the first call lands BEFORE
-/// `ensure_top_volume_rank_table` has ALTERed the new columns in. On the first
-/// boot after a deploy that widens this table, that first `CREATE OR REPLACE`
-/// therefore REFUSES — the view names a column the table does not yet have —
-/// and the second call, after the ALTER, succeeds. Fail-soft by design
-/// (`run_view_ddl` counts and warns, never panics), and the same thing
-/// happened when `window_lots_milli` was added on 2026-09-09. Expected, not a
-/// defect; the reasoning for the double call rather than a re-order is at
-/// `candle_ddl_boot`'s own comment ("Additive beats re-ordering"). The honest
-/// residual: if the live-table DDL exhausts all its attempts, the second call
-/// never runs that boot and the view stays at its previous definition until
-/// the next one.
-pub fn top_volume_cadence_view_ddl(cadence: SnapshotCadence) -> String {
-    let view = cadence.view_name();
-    let tf = cadence.as_str();
-    let dim = lifecycle_dim_subquery();
-    // NO `ORDER BY`, deliberately — and this is the whole ordering guarantee,
-    // so it must not be "helpfully" restored.
-    //
-    // The operator's requirement is `ts ASC, volume_percentage_change DESC`,
-    // and the rows ALREADY sit in exactly that order on disk:
-    //
-    //   * `ts` is the designated timestamp, so QuestDB scans the table in
-    //     ascending `ts` by construction. That half costs nothing, ever.
-    //   * Within ONE `ts` the sweep appends the ranked slice in rank order,
-    //     and rank IS `volume_percentage_change` descending (the two differ
-    //     only by the fixed transform `pct = lots_milli / 10 - 100`, which is
-    //     monotone). All rows of one sweep share one `ts` and land in one
-    //     batch, so they keep their insertion order.
-    //
-    // So a plain scan returns `ts ASC, volume_percentage_change DESC` with
-    // ZERO comparison work: O(1) per row, at 20,000 rows or 20. An explicit
-    // `ORDER BY ts, volume_percentage_change DESC` asks the database to
-    // re-derive an ordering the data already has, at O(n log n) on EVERY
-    // query — which is what this view did until 2026-09-19.
-    //
-    // The honest limit: `ts DESC` is NOT free the same way. QuestDB reads it
-    // as a cheap backward scan, but that also reverses the within-`ts` order,
-    // giving `volume_percentage_change` ASC. Newest-first therefore costs a
-    // real sort; the operator asked for `ts ASC`, which is the free one.
-    format!(
-        "CREATE OR REPLACE VIEW {view} AS \
-         SELECT t.ts, t.contract, il.symbol_name, il.display_name, il.instrument_type, t.family, \
-         t.per_lot_quantity, t.total_lots_traded, \
-         t.volume_percentage_change, \
-         t.percentage_change, t.open_percentage_change, \
-         t.volume, \
-         CASE WHEN t.per_lot_quantity > 0 \
-         THEN cast(t.volume AS DOUBLE) / cast(t.per_lot_quantity AS DOUBLE) \
-         END AS candle_lots, \
-         t.subscribed, t.underlying_id, \
-         t.feed, t.segment, t.security_id, t.tf \
-         FROM {NAMED_VIEW_TOP_VOLUME_BASE} t \
-         LEFT JOIN {dim} \
-         ON t.security_id = il.security_id \
-         AND t.segment = il.exchange_segment \
-         AND t.feed = il.feed \
-         WHERE t.tf = '{tf}';"
-    )
-}
+// `top_volume_cadence_view_ddl` was DELETED 2026-09-22: the four per-cadence
+// top-volume faces are no longer views over one table but four direct tables
+// (`top_volume_rank_persistence::top_volume_create_ddl`). The candle-derived
+// `candle_lots` column the view computed is `volume / per_lot_quantity` over
+// the stored columns, so nothing is lost that a query cannot rebuild.
+
 /// Issue one view-DDL statement to QuestDB's `/exec` endpoint.
 ///
 /// Mirrors `shadow_persistence::run_ddl` levels exactly: `/exec` is
@@ -700,10 +525,9 @@ pub async fn ensure_named_views(questdb_config: &QuestDbConfig) {
         &depth_named_view_ddl(),
     )
     .await;
-    // The pre-rename faces, dropped BEFORE the four CREATEs below and before
-    // `ensure_top_volume_rank_table` renames the base table later in the same
-    // boot. See `LEGACY_TOP_VOLUME_VIEWS` for why the ordering is the point
-    // and why this is four literals rather than a prefix sweep.
+    // The pre-2026-09-12 `top_volume_rank_*` faces. See
+    // `LEGACY_TOP_VOLUME_VIEWS` for why this is four literals rather than a
+    // prefix sweep.
     for legacy in LEGACY_TOP_VOLUME_VIEWS {
         run_view_ddl(
             &client,
@@ -715,28 +539,10 @@ pub async fn ensure_named_views(questdb_config: &QuestDbConfig) {
         .await;
     }
 
-    // The per-cadence top-volume faces (2026-09-08; four cadences since
-    // 2026-09-12). Same posture as depth: attempted last and independently,
-    // warn-fail on a box where `top_volume` has not been created yet.
-    //
-    // A LOOP over `SnapshotCadence::ALL`, not one hand-written call per
-    // cadence. The unrolled form was the single most dangerous line in the
-    // four-cadence change: a cadence added to the enum, the labels, the
-    // timers and the docs but NOT to this block produces a fully green build,
-    // writes its rows to the base table all session, and answers every
-    // `SELECT * FROM top_volume_3s` with "table does not exist". Nothing
-    // in the tree would have caught it — no guard derives this call set from
-    // the enum.
-    for cadence in SnapshotCadence::ALL {
-        run_view_ddl(
-            &client,
-            &base_url,
-            cadence.view_name(),
-            "create",
-            &top_volume_cadence_view_ddl(cadence),
-        )
-        .await;
-    }
+    // The per-cadence top-volume VIEWS were created here until 2026-09-22.
+    // They are now DIRECT TABLES (`top_volume_rank_persistence::
+    // ensure_top_volume_tables`), which pre-drop a same-named view before creating the
+    // table — so nothing here builds a top-volume object any more.
 }
 
 // ---------------------------------------------------------------------------
@@ -759,15 +565,13 @@ mod tests {
         // a forgotten widen dropped that cadence's view out of every shared
         // invariant below (single statement, LEFT JOIN, dry-run isolation)
         // while still compiling.
-        let mut ddls: Vec<(&'static str, String)> = vec![
+        // The four top-volume faces left this list on 2026-09-22, when they
+        // became direct tables rather than views.
+        vec![
             ("ticks_named", ticks_named_view_ddl()),
             ("candles_named", candles_named_view_ddl()),
             ("market_depth_named", depth_named_view_ddl()),
-        ];
-        for cadence in SnapshotCadence::ALL {
-            ddls.push((cadence.view_name(), top_volume_cadence_view_ddl(cadence)));
-        }
-        ddls
+        ]
     }
 
     /// The sweep can never name a TABLE — the one way a drop list destroys
@@ -791,10 +595,16 @@ mod tests {
             );
             assert_ne!(
                 name,
-                crate::top_volume_rank_persistence::TOP_VOLUME_RANK_TABLE,
-                "the CURRENT table is in the drop sweep"
+                crate::top_volume_rank_persistence::LEGACY_TOP_VOLUME_TABLE,
+                "the retired shared table is in the drop sweep"
             );
-            assert_ne!(name, NAMED_VIEW_TOP_VOLUME_BASE, "base table in the sweep");
+            for c in SnapshotCadence::ALL {
+                assert_ne!(
+                    name,
+                    c.table_name(),
+                    "a live per-timeframe TABLE is in the sweep"
+                );
+            }
             // Every other table this crate ensures is out of range by
             // construction, but the two above share a prefix with all four
             // entries, which is exactly why the sweep is a literal list.
@@ -808,7 +618,7 @@ mod tests {
     /// The sweep can never drop a view the current code is about to CREATE.
     ///
     /// Both loops run in the same function, the drop first. An entry that
-    /// collided with a current `view_name()` would drop the view and then
+    /// collided with a current `table_name()` would drop the view and then
     /// immediately recreate it — harmless today, and a silent way to make the
     /// sweep look busy while achieving nothing. More importantly it would mean
     /// the rename had not actually changed that view's name, which is the
@@ -817,7 +627,7 @@ mod tests {
     fn the_legacy_view_sweep_never_collides_with_a_current_view() {
         for legacy in LEGACY_TOP_VOLUME_VIEWS {
             for c in SnapshotCadence::ALL {
-                assert_ne!(legacy, c.view_name(), "legacy name equals a live view");
+                assert_ne!(legacy, c.table_name(), "legacy name equals a live table");
             }
             for live in [
                 VIEW_TICKS_NAMED,
@@ -867,53 +677,6 @@ mod tests {
         }
     }
     #[test]
-    fn test_top_volume_cadence_view_ddl_filters_on_its_own_stored_cadence() {
-        // Each view must be ONE statement, read the one base table, and
-        // filter on exactly its own cadence literal — the wire strings
-        // `SnapshotCadence` writes. A view that forgot the WHERE would show
-        // every cadence interleaved, which is the shape the operator asked to
-        // be rid of.
-        //
-        // Driven from `ALL` rather than a hand-listed pair: the pre-2026-09-12
-        // form listed `(view, "1s", variant)` and `(view, "5s", variant)` by
-        // hand, so a third cadence was simply not tested — its view could
-        // filter on the wrong label, or on none, and this test stayed green.
-        for c in SnapshotCadence::ALL {
-            let view = c.view_name();
-            let cadence = c.as_str();
-            let ddl = top_volume_cadence_view_ddl(c);
-            assert_eq!(ddl.matches(';').count(), 1, "{view}: one statement");
-            assert!(
-                ddl.contains(&format!("FROM {NAMED_VIEW_TOP_VOLUME_BASE} t")),
-                "{view}"
-            );
-            assert!(
-                ddl.contains(&format!("WHERE t.tf = '{cadence}'")),
-                "{view}: {ddl}"
-            );
-            assert!(
-                ddl.contains("LEFT JOIN"),
-                "{view}: unmapped contracts must still show"
-            );
-            assert!(
-                ddl.contains("t.contract"),
-                "{view}: the human contract label is the point of the view — \
-                 `rank` was removed on 2026-09-13 and this replaced it"
-            );
-            assert!(
-                !ddl.contains("t.rank"),
-                "{view}: the rank column was removed from the table on \
-                 2026-09-13, so a view naming it fails to resolve"
-            );
-        }
-        assert_eq!(
-            tickvault_storage_cadence_1s(),
-            "1s",
-            "the view literal must match the persisted cadence string"
-        );
-    }
-
-    #[test]
     fn pre_register_view_ddl_counter_covers_every_outcome_and_does_not_panic() {
         pre_register_view_ddl_counter();
         pre_register_view_ddl_counter();
@@ -925,172 +688,6 @@ mod tests {
                 && !VIEW_DDL_COUNTER.contains("lost"),
             "a view is a read projection; its DDL outcome is not loss-shaped"
         );
-    }
-
-    fn tickvault_storage_cadence_1s() -> &'static str {
-        crate::top_volume_rank_persistence::SnapshotCadence::OneSecond.as_str()
-    }
-
-    /// Every stored column reaches the view UNDERIVED.
-    ///
-    /// ⚠ REWRITTEN 2026-09-19. This test used to assert the view DERIVED
-    /// `window_lots` and `net_volume_chg_pct` out of two milli columns. The
-    /// operator's directive that day removed the derivation, not the numbers:
-    /// *"no extra claucltion or derivation"* -- the writer now stores the
-    /// whole-number figures and the view passes them through. So the
-    /// assertion flips from "the view computes X" to "the view exposes X and
-    /// does NOT recompute it", which is the stronger of the two: a view that
-    /// re-derives a stored column can disagree with the column beside it.
-    #[test]
-    fn the_top_volume_views_expose_the_stored_columns_underived() {
-        for cadence in SnapshotCadence::ALL {
-            let ddl = top_volume_cadence_view_ddl(cadence);
-            for expected in [
-                // The ranking inputs, stored because none is derivable from
-                // the row alone.
-                "t.per_lot_quantity",
-                "t.total_lots_traded",
-                "t.volume_percentage_change",
-                // The candle passthroughs -- the SAME numbers `candles_<tf>`
-                // carries for the same window, so the two tables agree with
-                // no arithmetic anywhere between them.
-                "t.volume",
-                "t.percentage_change",
-                "t.open_percentage_change",
-                "t.contract",
-            ] {
-                assert!(
-                    ddl.contains(expected),
-                    "{expected} missing from {}: {ddl}",
-                    cadence.view_name()
-                );
-            }
-        }
-    }
-
-    /// The stored figures must NOT be recomputed by the view.
-    ///
-    /// ⚠ REWRITTEN 2026-09-19, and it is the bite for the directive rather
-    /// than a style rule. If the view re-derived `volume_percentage_change`
-    /// from `total_lots_traded`, the two would disagree for every contract
-    /// whose window traded a FRACTIONAL lot: 42.5 lots stores 4,150 and
-    /// re-derives to 4,100, because the lot count truncates before the
-    /// percentage is taken. One row, two numbers, a hundred apart -- and the
-    /// operator reads both.
-    #[test]
-    fn the_view_never_recomputes_a_column_the_writer_already_stored() {
-        for cadence in SnapshotCadence::ALL {
-            let ddl = top_volume_cadence_view_ddl(cadence);
-            for recomputed in [
-                "t.total_lots_traded * 100",
-                "t.total_lots_traded - 1",
-                "t.delta_units / t.per_lot_quantity",
-                "cast(t.delta_units AS DOUBLE) / cast(t.per_lot_quantity AS DOUBLE)",
-                // The retired milli columns: an existing table still HAS them
-                // (the self-heal path has no DROP), so a view that started
-                // reading one again would silently serve pre-rename values.
-                "t.window_lots_milli",
-                "t.net_volume_chg_milli_pct",
-                "t.lot_size",
-                "t.gain_pct",
-                "t.candle_price_chg_pct",
-            ] {
-                assert!(
-                    !ddl.contains(recomputed),
-                    "the view must pass the stored figure through, not \
-                     recompute it or read a retired column ({recomputed}): {ddl}"
-                );
-            }
-        }
-    }
-    /// The one candle-derived column must be arithmetic over the two STORED
-    /// candle inputs and guarded against a zero lot size.
-    ///
-    /// It IS derived in SQL, and that is not a contradiction of the test
-    /// above: `candle_lots` has no stored column to pass through. It exists
-    /// to restate the candle's signed volume in LOTS, which is the unit the
-    /// volume board ranks in, so the two can be compared by eye.
-    ///
-    /// ⚠ NARROWED 2026-09-19 — this pinned TWO derived columns and the
-    /// `(lots - 1) * 100` transform on the second. That second column,
-    /// `candle_volume_chg_pct`, restated the candle volume as a percentage
-    /// because `volume_percentage_change` was then stored in milli-units and
-    /// the two were not directly comparable. The writer now stores the WHOLE
-    /// number, so the view would have been re-deriving a figure that sits in
-    /// the row beside it — the exact disagreement the test above forbids. One
-    /// column, one guard.
-    #[test]
-    fn the_candle_columns_divide_by_the_lot_size_and_reuse_the_same_transform() {
-        for cadence in SnapshotCadence::ALL {
-            let ddl = top_volume_cadence_view_ddl(cadence);
-            // NULL-guarded rather than dividing blind.
-            assert_eq!(
-                ddl.matches("CASE WHEN t.per_lot_quantity > 0").count(),
-                1,
-                "the candle column must guard the zero lot size: {ddl}"
-            );
-            // The division keeps the minus — a signed lot count is the point.
-            assert!(
-                ddl.contains(
-                    "cast(t.volume AS DOUBLE) / cast(t.per_lot_quantity AS DOUBLE) \
-                     END AS candle_lots"
-                ),
-                "candle_lots must be the SIGNED division: {ddl}"
-            );
-            // The LONG operands are cast before the division.
-            //
-            // `LONG / 1000.0` relies on the engine promoting the integer to a
-            // double, and this repository has no in-repo evidence that
-            // QuestDB 9.3.5 does. What the tree DOES have is
-            // `docs/analysis/obi-backtest-queries.md`, whose ratio of two
-            // integer columns casts BOTH sides first; an author casts both
-            // sides of a ratio only when the un-cast form is wrong.
-            for uncast in ["t.volume / ", "t.volume AS DOUBLE) / t.per_lot_quantity"] {
-                assert!(
-                    !ddl.contains(uncast),
-                    "an un-cast LONG division reappeared: {ddl}"
-                );
-            }
-        }
-    }
-
-    /// The contract's price moves are exposed under names that say WHICH
-    /// baseline each one measures from.
-    ///
-    /// ⚠ REWRITTEN 2026-09-19. This test used to pin
-    /// `t.gain_pct AS underlying_chg_pct` beside the contract's own move,
-    /// because the operator had asked for both separately. He then removed
-    /// the underlying one (*"as of now I believe we don't need this
-    /// underlying percentage change"*), and later the same day removed
-    /// `close_vs_prev_bar_pct` with the rest of the non-ranking columns. So
-    /// what survives is TWO contract baselines, and the reason the test
-    /// survives with them is unchanged: a single ambiguous `pct` column is
-    /// what made him ask in the first place.
-    ///
-    /// The bar-over-bar move is the one that explains the SIGN on the
-    /// candle's volume, and it is no longer in this table — it is read from
-    /// `candles_<tf>`, which is where the sign is computed.
-    #[test]
-    fn the_contract_price_moves_are_separate_named_columns() {
-        for cadence in SnapshotCadence::ALL {
-            let ddl = top_volume_cadence_view_ddl(cadence);
-            for named in [
-                // vs YESTERDAY's close.
-                "t.percentage_change",
-                // vs TODAY's 09:15 session open.
-                "t.open_percentage_change",
-            ] {
-                assert!(
-                    ddl.contains(named),
-                    "{named} must be exposed under its own name: {ddl}"
-                );
-            }
-            assert!(
-                !ddl.contains("underlying_chg_pct"),
-                "the underlying's move was removed on 2026-09-19; a column \
-                 named for it would have no source: {ddl}"
-            );
-        }
     }
 
     /// `net_volume_chg_pct` is a percentage CHANGE measured from one lot.
@@ -1136,48 +733,6 @@ mod tests {
             );
         }
     }
-    /// The enum is what keeps a quote character out of the `format!`: its
-    /// `view_name()` and `as_str()` are compile-time literals, and the label
-    /// must be the SAME wire string the writer stamps — otherwise the view
-    /// filters on a value no row carries and reads empty all day.
-    ///
-    /// ⚠ Until 2026-09-12 this test pinned a SECOND cadence enum
-    /// (`TopVolumeCadence`) against `SnapshotCadence` by hand, pair by named
-    /// pair. It could not fail for a cadence it did not name, so a variant
-    /// added to one enum and not the other passed it unchanged — the reason
-    /// the second enum is now deleted rather than kept in step by a test.
-    #[test]
-    fn test_top_volume_cadence_view_and_tf_are_the_pinned_literals() {
-        for c in SnapshotCadence::ALL {
-            // The view name carries its own label, so a view called
-            // `top_volume_3s` that filters `tf = '5s'` fails here
-            // rather than reading empty in production.
-            assert_eq!(
-                c.view_name(),
-                format!("top_volume_{}", c.as_str()),
-                "the view name and the cadence label are one claim"
-            );
-            for s in [c.view_name(), c.as_str()] {
-                assert!(
-                    !s.contains('\'') && !s.contains('"') && !s.contains(';'),
-                    "{s}: a quote or terminator in a DDL literal is an injection surface"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_top_volume_base_matches_persistence_const() {
-        assert_eq!(
-            NAMED_VIEW_TOP_VOLUME_BASE,
-            crate::top_volume_rank_persistence::TOP_VOLUME_RANK_TABLE
-        );
-        assert_eq!(SnapshotCadence::OneSecond.view_name(), "top_volume_1s");
-        assert_eq!(SnapshotCadence::ThreeSecond.view_name(), "top_volume_3s");
-        assert_eq!(SnapshotCadence::FiveSecond.view_name(), "top_volume_5s");
-        assert_eq!(SnapshotCadence::OneMinute.view_name(), "top_volume_1m");
-    }
-
     #[test]
     fn test_depth_named_view_ddl_is_single_terminated_statement() {
         let ddl = depth_named_view_ddl();
@@ -1740,8 +1295,6 @@ mod tests {
 
         let ticks = declared_columns(&crate::tick_persistence::ticks_create_ddl());
         let depth = declared_columns(&crate::depth_persistence::market_depth_create_ddl());
-        let top =
-            declared_columns(&crate::top_volume_rank_persistence::top_volume_rank_create_ddl());
 
         let t = ticks_named_view_ddl();
         check("ticks_named", &t, "t", &ticks);
@@ -1752,11 +1305,6 @@ mod tests {
         let d = depth_named_view_ddl();
         check("market_depth_named", &d, "d", &depth);
         check("market_depth_named", &d, "il", &lifecycle_dim);
-        for cadence in SnapshotCadence::ALL {
-            let v = top_volume_cadence_view_ddl(cadence);
-            check(cadence.view_name(), &v, "t", &top);
-            check(cadence.view_name(), &v, "il", &lifecycle_dim);
-        }
         // candles_10m reads bare names from candles_1m inside its innermost
         // SELECT; those are checked by name.
         let ten = candles_10m_view_ddl();
@@ -1789,12 +1337,47 @@ mod tests {
     /// that shipped (`t.open_latency` against the 15-column table).
     #[test]
     fn the_view_column_scan_catches_a_column_the_table_dropped() {
-        let top =
-            declared_columns(&crate::top_volume_rank_persistence::top_volume_rank_create_ddl());
+        let top = declared_columns(&crate::top_volume_rank_persistence::top_volume_create_ddl(
+            SnapshotCadence::OneSecond,
+        ));
         let stale = "SELECT t.ts, t.open_latency FROM top_volume t";
         let refs = alias_references(stale, "t");
         assert_eq!(refs, vec!["ts".to_string(), "open_latency".to_string()]);
         assert!(!top.iter().any(|c| c == "open_latency"));
         assert!(alias_references("SELECT il.display_name", "d").is_empty());
+    }
+
+    /// Since 2026-09-22 the console-view pass creates NO `top_volume_*` object.
+    /// The four faces are direct tables owned by the persistence module; a
+    /// `CREATE VIEW top_volume_1s` re-added here would run BEFORE the table
+    /// ensure on the boot path and occupy the name the table needs.
+    #[test]
+    fn ensure_named_views_creates_no_top_volume_object() {
+        let src = include_str!("console_views.rs");
+        let prod = src
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("prod half");
+        let start = prod
+            .find("pub async fn ensure_named_views")
+            .expect("fn present");
+        let body = &prod[start..];
+        let end = body.find("\n}\n").expect("fn end");
+        let body = &body[..end];
+        assert!(
+            !body.contains("\"CREATE"),
+            "ensure_named_views builds a CREATE literal inline"
+        );
+        for c in SnapshotCadence::ALL {
+            assert!(
+                !body.contains(c.table_name()),
+                "ensure_named_views names the direct table {}",
+                c.table_name()
+            );
+        }
+        assert!(
+            body.contains("LEGACY_TOP_VOLUME_VIEWS"),
+            "legacy sweep removed"
+        );
     }
 }

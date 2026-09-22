@@ -263,14 +263,13 @@ fn test_every_live_table_ensure_fn_keeps_its_boot_call_site() {
         // depth pools begin silently overwriting each other's levels. Same
         // retry loop as `ticks`, so neither is retried without the other.
         ("ensure_market_depth_table", "src/candle_ddl_boot.rs"),
-        // top_volume_rank — the 1 s / 5 s volume-ranking snapshots
-        // (2026-09-06). Written every second by its offload writer from the
-        // first ranking sweep; until 2026-09-08 its ensure fn had ZERO
-        // production callers, so a fresh volume would have let the first ILP
-        // row auto-create it with none of its 6-key DEDUP
+        // top_volume_1s / _3s / _5s / _1m — the four DIRECT volume-ranking
+        // tables (2026-09-22; one table viewed four ways before that). Written
+        // every sweep by their offload writer from the first ranking; an
+        // un-ensured table is ILP-auto-created with none of its 6-key DEDUP
         // (ts, tf, family, feed, security_id, segment). Same retry loop as
         // `ticks` and `market_depth`.
-        ("ensure_top_volume_rank_table", "src/candle_ddl_boot.rs"),
+        ("ensure_top_volume_tables", "src/candle_ddl_boot.rs"),
         ("run_live_table_ddl_at_boot", "src/main.rs"),
         // (the `rest_fetch_audit` ensure row retired 2026-09-17 with the four
         // REST-leg rows above — same removal, same reasoning, §12.11.)
@@ -362,52 +361,44 @@ fn test_production_region_ignores_commented_out_calls() {
     );
 }
 
-/// The candle DDL — which carries the LEGACY VIEW SWEEP — must be awaited
-/// BEFORE the live-table DDL, which carries the `top_volume_rank` → `top_volume`
-/// RENAME.
+/// The candle DDL must be awaited BEFORE the live-table DDL.
 ///
-/// ## Why this ordering is load-bearing, and why nothing pinned it until now
+/// ## Why this ordering is load-bearing
 ///
-/// A QuestDB view is stored as its SQL TEXT and resolved at query time, so the
-/// four legacy `top_volume_rank_{1s,3s,5s,1m}` views must be dropped before the
-/// base table they name is renamed away from under them. More sharply: whether
-/// QuestDB REFUSES to rename a table that dependent views reference is
-/// **UNVERIFIED** — no QuestDB was reachable when the rename was written. If it
-/// does refuse, a rename attempted with those views still present fails on
-/// EVERY boot forever, and every ranking row written before the rename stays
-/// stranded in a table that is no longer in `HOUR_PARTITIONED_TABLES` and so is
-/// never swept.
+/// `run_candle_ddl_at_boot` carries two things the live-table DDL depends on:
 ///
-/// The two calls sit ~47 lines apart in one 4,000-line function. Swapping them
-/// COMPILES GREEN and produces exactly the order the design says is unsafe, and
-/// a 2026-09-13 adversarial sweep found that the existing guards in this file
-/// pin only (a) candle-DDL before the seal-writer spawn, (b) the ordering
-/// INSIDE `candle_ddl_boot.rs`, and (c) that the live-table DDL is called at
-/// all. None of them relates the two to each other.
+/// * the **fresh-start schema reset**, which drops the retired market-data
+///   tables and views (including the four direct `top_volume_<tf>` tables and
+///   the pre-2026-09-22 views of the same names). Ensuring the live tables
+///   FIRST would create them and then have the reset drop them, so the session
+///   would run on ILP-auto-created tables with no DEDUP key;
+/// * the **legacy view sweep**, which drops the four `top_volume_rank_*`
+///   views that still name a table this repository renamed away.
 ///
-/// This is the class this repository keeps recording: a correct ordering held
-/// by convention, in a file where the only thing preserving it is that nobody
-/// has yet had a reason to move a line.
+/// The two calls sit far apart in one very long function. Swapping them
+/// COMPILES GREEN. Until 2026-09-22 this guard pinned the same order for a
+/// different reason (a `top_volume_rank` → `top_volume` RENAME that no longer
+/// runs); the order outlived the rename because the reset now needs it.
 #[test]
-fn the_legacy_view_sweep_is_awaited_before_the_top_volume_rename() {
+fn the_candle_ddl_is_awaited_before_the_live_table_ddl() {
     let main_src = production_region(&read_src("src/main.rs"));
 
     let sweep = "candle_ddl_boot::run_candle_ddl_at_boot(&config.questdb).await";
-    let rename = "candle_ddl_boot::run_live_table_ddl_at_boot(&config.questdb).await";
+    let live = "candle_ddl_boot::run_live_table_ddl_at_boot(&config.questdb).await";
 
     // COUNTED before compared. A `find` on a string that occurs zero times
     // would panic with a clear message, but one that occurs TWICE would pin the
     // first occurrence and silently ignore a second call site placed anywhere —
-    // including one placed on the wrong side of the rename.
+    // including one placed on the wrong side of the live-table DDL.
     assert_eq!(
         main_src.matches(sweep).count(),
         1,
         "main.rs must await the candle DDL exactly once in production; this \
-         guard compares its position against the rename below, and two call \
+         guard compares its position against the live-table DDL below, and two call \
          sites would make that comparison meaningless"
     );
     assert_eq!(
-        main_src.matches(rename).count(),
+        main_src.matches(live).count(),
         1,
         "main.rs must await the live-table DDL exactly once in production"
     );
@@ -415,19 +406,17 @@ fn the_legacy_view_sweep_is_awaited_before_the_top_volume_rename() {
     let sweep_pos = main_src
         .find(sweep)
         .expect("counted above, so this cannot fail");
-    let rename_pos = main_src
-        .find(rename)
+    let live_pos = main_src
+        .find(live)
         .expect("counted above, so this cannot fail");
 
     assert!(
-        sweep_pos < rename_pos,
-        "`run_candle_ddl_at_boot` (which drops the four LEGACY \
-         top_volume_rank_* views) must be awaited BEFORE \
-         `run_live_table_ddl_at_boot` (which RENAMES top_volume_rank -> \
-         top_volume). Whether QuestDB refuses a rename with dependent views is \
-         UNVERIFIED; dropping first removes that failure mode whether or not it \
-         exists, and dropping second would not. Found the sweep at byte \
-         {sweep_pos} and the rename at byte {rename_pos}."
+        sweep_pos < live_pos,
+        "`run_candle_ddl_at_boot` (fresh-start reset + legacy view sweep) must \
+         be awaited BEFORE `run_live_table_ddl_at_boot` (which ensures ticks, \
+         market_depth and the four top_volume_<tf> tables). Swapped, the reset \
+         would drop tables the ensure just created. Found the candle DDL at byte \
+         {sweep_pos} and the live-table DDL at byte {live_pos}."
     );
 }
 
@@ -445,17 +434,17 @@ fn the_legacy_view_sweep_is_awaited_before_the_top_volume_rename() {
 /// that cannot build `ticks_named`, and attempt 2's successful `ticks` CREATE
 /// never re-runs it. The gate is now "did the confirmed base-table set grow".
 #[test]
-fn the_view_reensure_is_gated_on_the_rank_table_alone() {
+fn the_view_reensure_is_gated_on_base_table_growth() {
     let boot = production_region(&read_src("src/candle_ddl_boot.rs"));
 
-    // All three verdicts feed the growth check — none may be dropped from it.
+    // Both view-base verdicts feed the growth check — neither may be dropped.
     let feed = boot
         .find("let now = ViewBaseTables {")
         .expect("the re-ensure gate must build the confirmed base-table set");
     let feed_block = &boot[feed..];
     let feed_end = feed_block.find("};").expect("struct literal must close");
     let feed_block = &feed_block[..feed_end];
-    for field in ["ticks: ticks_ok", "depth: depth_ok", "rank: rank_ok"] {
+    for field in ["ticks: ticks_ok", "depth: depth_ok"] {
         assert!(
             feed_block.contains(field),
             "the confirmed base-table set must carry `{field}` — a base table \
@@ -489,13 +478,18 @@ fn the_view_reensure_is_gated_on_the_rank_table_alone() {
          re-ensure call was found after the gate"
     );
 
-    // And the success return stays gated on all three: reaching it means every
-    // live table is ready, which is a different claim from "the views were
-    // re-attempted".
+    // And the success return stays gated on EVERY live table, the four
+    // top-volume tables included: reaching it means every live table is
+    // ready, which is a different claim from "the views were re-attempted".
     assert!(
-        boot.contains("if ticks_ok && depth_ok && rank_ok {"),
-        "the boot-complete return must still require ALL THREE tables — \
+        boot.contains("if ticks_ok && depth_ok && volume_ok {"),
+        "the boot-complete return must still require every live table — \
          decoupling the view pass must not also weaken what `true` means"
+    );
+    assert!(
+        !feed_block.contains("volume_ok"),
+        "the top-volume tables are no longer read through a view, so their \
+         arrival must not trigger a view pass"
     );
 }
 

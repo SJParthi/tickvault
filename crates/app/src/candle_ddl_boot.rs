@@ -218,16 +218,13 @@ pub const LIVE_TABLE_DDL_BACKOFF_SECS: u64 = 5;
 struct ViewBaseTables {
     ticks: bool,
     depth: bool,
-    rank: bool,
 }
 
 impl ViewBaseTables {
     /// True when `self` confirms a table that `covered` had not — i.e. a view
     /// pass run now could build a view the previous pass could not.
     const fn grew_over(self, covered: Self) -> bool {
-        (self.ticks && !covered.ticks)
-            || (self.depth && !covered.depth)
-            || (self.rank && !covered.rank)
+        (self.ticks && !covered.ticks) || (self.depth && !covered.depth)
     }
 
     /// Accumulate: a table once confirmed stays covered, so a table that
@@ -236,14 +233,12 @@ impl ViewBaseTables {
         Self {
             ticks: self.ticks || other.ticks,
             depth: self.depth || other.depth,
-            rank: self.rank || other.rank,
         }
     }
 }
 
-/// Ensure the three LIVE-writer tables — `ticks`, `market_depth` and
-/// `top_volume_rank` — with
-/// their DEDUP keys, retrying a refusal instead of running the session on
+/// Ensure the LIVE-writer tables — `ticks`, `market_depth` and the four
+/// direct `top_volume_<tf>` tables (since 2026-09-22) — with their DEDUP keys, retrying a refusal instead of running the session on
 /// whatever ILP auto-creates.
 ///
 /// # Why a retry, when the candle DDL above gets one probe and one shot
@@ -264,7 +259,7 @@ impl ViewBaseTables {
 /// already-accepted table is free: every statement is `IF NOT EXISTS` or an
 /// idempotent `DEDUP ENABLE`.
 ///
-/// Returns `true` when all three tables were ensured on some attempt. On
+/// Returns `true` when every live table was ensured on some attempt. On
 /// exhaustion it returns `false` after a coded `error!` naming the
 /// consequence — never a panic, and never a silent continue.
 // TEST-EXEMPT: network I/O orchestration — the retry bound is unit-tested below, the give-up path is exercised against an unreachable port, and the boot call site is pinned by crates/app/tests/ensure_ddl_boot_wiring_guard.rs.
@@ -274,80 +269,56 @@ pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
         let ticks_ok = tickvault_storage::tick_persistence::ensure_ticks_table(questdb).await;
         let depth_ok =
             tickvault_storage::depth_persistence::ensure_market_depth_table(questdb).await;
-        // top_volume_rank — the 1s/3s/5s/1m volume-ranking snapshot table
-        // (2026-09-06). Its offload writer appends every second from the
-        // first ranking sweep; until 2026-09-08 NOTHING ensured the table,
-        // so on a fresh volume the first ILP row would have auto-created it
-        // with no DEDUP key (`ts, tf, family, feed, security_id, segment`)
-        // and every replayed or re-flushed snapshot would have duplicated.
-        let rank_ok =
-            tickvault_storage::top_volume_rank_persistence::ensure_top_volume_rank_table(questdb)
-                .await;
+        // The four direct `top_volume_<tf>` tables (2026-09-22; before that ONE
+        // `top_volume` table viewed four ways). Their offload writer appends
+        // from the first ranking sweep, so an un-ensured table would be
+        // ILP-auto-created with no DEDUP key (`ts, tf, family, feed,
+        // security_id, segment`) and every replayed snapshot would duplicate.
+        let volume_ok =
+            tickvault_storage::top_volume_rank_persistence::ensure_top_volume_tables(questdb).await;
         // Re-ensure the named views whenever a BASE TABLE they read is newly
-        // confirmed on this attempt — any of `ticks`, `market_depth` or
-        // `top_volume`, each on its own, never all three together.
+        // confirmed on this attempt — `ticks` or `market_depth`, each on its
+        // own. (The top-volume tables left this gate on 2026-09-22: they are
+        // no longer read through a view, so a view pass can gain nothing
+        // from their arrival.)
         //
-        // ⚠ History, because both earlier shapes were wrong in a way a later
+        // ⚠ History, because two earlier shapes were wrong in a way a later
         // edit could restore:
         //
-        // * Until 2026-09-13 this sat inside `if ticks_ok && depth_ok && rank_ok`,
-        //   which made the re-ensure hostage to two tables it did not need: a
-        //   `ticks` DDL that failed every attempt skipped the view pass even
-        //   though `top_volume` had been created, so the `top_volume_*` views
-        //   stayed ABSENT all session.
-        // * 2026-09-13 → 2026-09-22 it was `if rank_ok && !views_reensured` — a
-        //   ONE-SHOT latch keyed on the rank table alone. That fixed the case
-        //   above and opened its mirror image: `run_candle_ddl_at_boot` runs
-        //   `ensure_named_views` FIRST, before this fn creates `ticks` and
-        //   `market_depth`, so on a fresh volume `ticks_named` and
-        //   `market_depth_named` warn-fail there. If attempt 1 confirmed the
-        //   rank table but REFUSED `ticks`, the latch was spent on a pass that
-        //   could not build `ticks_named`, and attempt 2's successful `ticks`
-        //   CREATE never triggered another — the view stayed absent all
-        //   session while the table filled.
+        // * Until 2026-09-13 this sat inside an all-tables-ok condition, which
+        //   made the re-ensure hostage to tables it did not need.
+        // * 2026-09-13 → 2026-09-22 it was a ONE-SHOT latch keyed on the rank
+        //   table alone: `run_candle_ddl_at_boot` runs `ensure_named_views`
+        //   FIRST, before this fn creates `ticks` and `market_depth`, so on a
+        //   fresh volume `ticks_named` and `market_depth_named` warn-fail
+        //   there — and if the latch was spent on an attempt that REFUSED
+        //   `ticks`, the later successful `ticks` CREATE never triggered
+        //   another pass and the view stayed absent all session.
         //
         // The gate is therefore "did the set of confirmed base tables GROW",
-        // accumulated across attempts. Growth is monotone over three bits, so
-        // this runs at most THREE passes per boot (normally exactly one, when
-        // attempt 1 confirms all three at once), and a table that flaps back
-        // to refused on a retry never re-triggers a pass. Every statement in
-        // the pass is `CREATE OR REPLACE`, so a pass over an already-correct
-        // view is free apart from the log line.
+        // accumulated across attempts. Growth is monotone over two bits, so
+        // this runs at most TWO passes per boot, and a table that flaps back to
+        // refused never re-triggers a pass. Every statement in the pass is
+        // `CREATE OR REPLACE`, so a pass over an already-correct view is free.
         let now = ViewBaseTables {
             ticks: ticks_ok,
             depth: depth_ok,
-            rank: rank_ok,
         };
         if now.grew_over(views_covered) {
             views_covered = views_covered.union(now);
-            // Re-ensure the named views now that `top_volume_rank` EXISTS.
-            //
-            // `run_candle_ddl_at_boot` already ran `ensure_named_views`, and it
-            // runs FIRST — before this function creates `top_volume_rank`. So on
-            // any boot where that table was absent (a fresh volume, or the
-            // 2026-09-08 nuke) the two per-cadence views
-            // `top_volume_rank_1s` / `top_volume_rank_5s` referenced a table
-            // that did not yet exist, their DDL warn-failed, and nothing retried
-            // it in-boot: the base table then filled all session while
-            // `SELECT * FROM top_volume_rank_1s` answered "table does not
-            // exist". The operator's own words for this table were *"only using
-            // db i can see this"*, so the views failing is the failure mode he
-            // would actually meet.
-            //
             // Re-ensuring rather than MOVING the first call is deliberate: the
             // candle ordering above is load-bearing (the legacy-matview drop
             // sweep must precede the CREATE TABLE loop, and the candle views
-            // validate against those tables), and every statement here is
-            // `CREATE OR REPLACE`, so a second pass on an already-correct view
-            // is free. Additive beats re-ordering on a boot path.
+            // validate against those tables). Additive beats re-ordering on a
+            // boot path.
             tickvault_storage::console_views::ensure_named_views(questdb).await;
         }
-        if ticks_ok && depth_ok && rank_ok {
+        if ticks_ok && depth_ok && volume_ok {
             info!(
                 attempt,
                 "live-table DDL boot complete — ticks (5-key DEDUP) + market_depth \
-                 (depth_kind DEDUP) + top_volume_rank (6-key DEDUP) ensured. The named \
-                 views were then RE-ATTEMPTED against the now-existing rank table; \
+                 (depth_kind DEDUP) + top_volume_1s/3s/5s/1m (6-key DEDUP each) ensured. \
+                 The named views were re-attempted as each base table appeared; \
                  that call reports its own outcome per view and returns nothing, so \
                  this line claims the attempt, never its success."
             );
@@ -359,7 +330,7 @@ pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
                 attempts = LIVE_TABLE_DDL_ATTEMPTS,
                 ticks_ok,
                 depth_ok,
-                rank_ok,
+                volume_ok,
                 backoff_secs = LIVE_TABLE_DDL_BACKOFF_SECS,
                 "live-table DDL refused — retrying so the session does not run on an \
                  ILP-auto-created table with the DEDUP key missing"
@@ -371,7 +342,7 @@ pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
         code = tickvault_common::error_code::ErrorCode::HotPath02WriterQueueDrop.code_str(),
         attempts = LIVE_TABLE_DDL_ATTEMPTS,
         backoff_secs = LIVE_TABLE_DDL_BACKOFF_SECS,
-        "live-table DDL boot EXHAUSTED — ticks, market_depth and/or top_volume_rank could not be \
+        "live-table DDL boot EXHAUSTED — ticks, market_depth and/or a top_volume_<tf> table could not be \
          ensured. Consequence: the first ILP write may auto-create the table \
          WITHOUT its DEDUP key — a replay then duplicates ticks and the two depth \
          pools overwrite each other's levels — until a later boot's ensure succeeds. \
@@ -456,21 +427,23 @@ mod tests {
     }
 
     /// The view re-ensure gate fires exactly when the confirmed base-table set
-    /// GROWS. The case the one-shot rank latch missed: attempt 1 confirms the
-    /// rank table but refuses `ticks`; attempt 2 confirms `ticks` — that MUST
-    /// trigger a second pass, or `ticks_named` stays absent all session.
+    /// GROWS. The case the old one-shot latch missed: attempt 1 confirms
+    /// `market_depth` but refuses `ticks`; attempt 2 confirms `ticks` — that
+    /// MUST trigger a second pass, or `ticks_named` stays absent all session.
     #[test]
     fn view_reensure_fires_when_a_base_table_is_newly_confirmed() {
         let none = ViewBaseTables::default();
-        let rank_only = ViewBaseTables {
+        let depth_only = ViewBaseTables {
             ticks: false,
+            depth: true,
+        };
+        let ticks_only = ViewBaseTables {
+            ticks: true,
             depth: false,
-            rank: true,
         };
         let all = ViewBaseTables {
             ticks: true,
             depth: true,
-            rank: true,
         };
 
         // Normal fresh boot: attempt 1 confirms everything — one pass.
@@ -481,61 +454,41 @@ mod tests {
             "a repeat of the same set is not growth"
         );
 
-        // The mirror-image gap: rank first, ticks one attempt later.
-        assert!(rank_only.grew_over(none));
-        let covered = none.union(rank_only);
-        let ticks_later = ViewBaseTables {
-            ticks: true,
-            depth: false,
-            rank: true,
-        };
+        // Depth first, ticks one attempt later: two passes.
+        assert!(depth_only.grew_over(none));
+        let covered = none.union(depth_only);
         assert!(
-            ticks_later.grew_over(covered),
+            all.grew_over(covered),
             "a newly confirmed `ticks` table must re-run the view pass"
         );
-
-        // `ticks` alone (rank still refused) also triggers — the gate is not
-        // hostage to the rank table either.
-        let ticks_only = ViewBaseTables {
-            ticks: true,
-            depth: false,
-            rank: false,
-        };
         assert!(ticks_only.grew_over(none));
 
         // A table flapping back to refused never re-triggers.
         let covered = none.union(all);
         assert!(!none.grew_over(covered));
-        assert!(!rank_only.grew_over(covered));
+        assert!(!depth_only.grew_over(covered));
+        assert!(!ticks_only.grew_over(covered));
 
-        // Bounded: at most three passes, one per newly confirmed bit.
-        let mut covered = none;
-        let mut passes = 0;
-        for step in [
-            ViewBaseTables {
-                ticks: false,
-                depth: false,
-                rank: true,
-            },
-            ViewBaseTables {
-                ticks: true,
-                depth: false,
-                rank: false,
-            },
-            ViewBaseTables {
-                ticks: true,
-                depth: true,
-                rank: true,
-            },
-            all,
-            all,
-        ] {
-            if step.grew_over(covered) {
-                covered = covered.union(step);
-                passes += 1;
+        // Bounded: every one of the 4^5 = 1,024 five-attempt histories runs
+        // at most TWO passes — one per newly confirmed bit — and the union
+        // never loses a bit it has seen.
+        let states = [none, ticks_only, depth_only, all];
+        for code in 0..4usize.pow(5) {
+            let mut covered = none;
+            let mut passes = 0;
+            let mut c = code;
+            for _ in 0..5 {
+                let step = states[c % 4];
+                c /= 4;
+                let before = covered;
+                if step.grew_over(covered) {
+                    covered = covered.union(step);
+                    passes += 1;
+                }
+                assert!(covered.ticks >= before.ticks && covered.depth >= before.depth);
             }
+            assert!(passes <= 2, "history {code} ran {passes} passes");
         }
-        assert_eq!(passes, 3);
     }
 
     /// Against a port nothing listens on, every attempt fails, the loop
