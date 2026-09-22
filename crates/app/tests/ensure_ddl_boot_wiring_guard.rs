@@ -3,7 +3,7 @@
 //! The PR-C2 (#1522) Dhan-lane deletion and the #1581 Groww live-feed
 //! deletion removed the ONLY call sites of the candle-table DDL chain
 //! (`drop_legacy_candle_objects` → `ensure_shadow_candle_tables` →
-//! `ensure_named_views`) while the REST-era bar-fold KEPT writing the
+//! the console-view ensure) while the REST-era bar-fold KEPT writing the
 //! `candles_*` tables — so a fresh QuestDB volume auto-created them via
 //! ILP WITHOUT `DEDUP ENABLE UPSERT KEYS` (silent duplicate-row window).
 //!
@@ -14,7 +14,8 @@
 //!    `candle_ddl_boot::run_candle_ddl_at_boot` BEFORE the
 //!    `spawn_seal_writer_loop` call (DDL-before-first-ILP ordering).
 //! 2. `candle_ddl_boot.rs` actually calls the three storage DDL fns in
-//!    the load-bearing drop → ensure → views order (stub-guard).
+//!    the load-bearing view-drop → legacy-drop → ensure order (stub-guard;
+//!    since 2026-09-22 the app creates NO view).
 //! 3. Every LIVE-writer table's ensure fn keeps ≥1 production call site
 //!    (the writer → table → ensure → boot-call-site coverage table).
 
@@ -31,12 +32,72 @@ fn read_src(rel: &str) -> String {
 
 /// Production region = everything above the first column-0 `#[cfg(test)]`
 /// line (the house source-scan convention), so test-module mentions can
-/// never satisfy a production pin.
+/// never satisfy a production pin — WITH `//` comments stripped.
+///
+/// 2026-09-22: without the strip, a COMMENTED-OUT call satisfied every pin in
+/// this file. `// candle_ddl_boot::run_candle_ddl_at_boot(&config.questdb).await`
+/// contains the needle byte-for-byte, so deleting the real call and leaving
+/// the line behind as a comment — the most natural way to "temporarily"
+/// disable something — kept the guard green while the DDL never ran. It was
+/// not hypothetical for the coverage table below: its needles are BARE fn
+/// names, and `candle_ddl_boot.rs`'s own `//!` header names
+/// `ensure_shadow_candle_tables` and the (since retired) view creator (checked
+/// 2026-09-22), so those two rows were satisfied by documentation alone.
 fn production_region(src: &str) -> String {
-    match src.find("\n#[cfg(test)]") {
-        Some(idx) => src[..idx].to_string(),
-        None => src.to_string(),
+    let region = match src.find("\n#[cfg(test)]") {
+        Some(idx) => &src[..idx],
+        None => src,
+    };
+    strip_line_comments(region)
+}
+
+/// Removes `//`, `///` and `//!` comments, line by line, keeping every newline
+/// so line structure survives.
+///
+/// A whole-line comment becomes an empty line. A TRAILING comment is cut only
+/// when the `//` sits outside a string literal on that line (an even count of
+/// unescaped `"` before it), so `"https://…"` inside a string is kept.
+///
+/// Honest limits: string state is tracked per LINE, so a `//` on the
+/// continuation line of a multi-line string with no quote before it is cut.
+/// That can only REMOVE string text — never add a needle — so its failure
+/// direction is a false red, never a false green. Block comments (`/* */`)
+/// are not stripped; none of the scanned files contains `/*` (checked
+/// 2026-09-22 — re-check if a scanned file gains one).
+fn strip_line_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    for line in src.split_inclusive('\n') {
+        let (body, newline) = match line.strip_suffix('\n') {
+            Some(b) => (b, "\n"),
+            None => (line, ""),
+        };
+        if body.trim_start().starts_with("//") {
+            out.push_str(newline);
+            continue;
+        }
+        let bytes = body.as_bytes();
+        let mut in_str = false;
+        let mut cut = body.len();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' if in_str => {
+                    i += 2;
+                    continue;
+                }
+                b'"' => in_str = !in_str,
+                b'/' if !in_str && bytes.get(i + 1) == Some(&b'/') => {
+                    cut = i;
+                    break;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        out.push_str(&body[..cut]);
+        out.push_str(newline);
     }
+    out
 }
 
 #[test]
@@ -73,23 +134,82 @@ fn test_candle_ddl_boot_awaited_before_seal_writer_spawn_in_main() {
 }
 
 #[test]
-fn test_candle_ddl_boot_calls_drop_ensure_views_in_order() {
+fn test_candle_ddl_boot_drops_views_then_legacy_objects_then_ensures_tables() {
     let boot_src = production_region(&read_src("src/candle_ddl_boot.rs"));
 
+    let views_pos = boot_src
+        .find("console_views::drop_retired_views(questdb).await")
+        .expect("candle_ddl_boot must drop the retired console views");
     let drop_pos = boot_src
         .find("shadow_persistence::drop_legacy_candle_objects(questdb).await")
         .expect("candle_ddl_boot must run the retired-object drop sweep");
     let ensure_pos = boot_src
         .find("shadow_persistence::ensure_shadow_candle_tables(questdb).await")
-        .expect("candle_ddl_boot must ensure the 21 candle tables (DEDUP)");
-    let views_pos = boot_src
-        .find("console_views::ensure_named_views(questdb).await")
-        .expect("candle_ddl_boot must ensure the analyst console views");
+        .expect("candle_ddl_boot must ensure the candle tables (DEDUP)");
 
     assert!(
-        drop_pos < ensure_pos && ensure_pos < views_pos,
-        "load-bearing order: drop legacy objects (free squatted names) -> \
-         ensure candle tables -> named views (validate column refs)"
+        views_pos < drop_pos && drop_pos < ensure_pos,
+        "load-bearing order: drop retired views (a `candles_10m` VIEW squats the \
+         `candles_10m` TABLE name) -> drop legacy objects -> ensure candle tables"
+    );
+    // 2026-09-22 (SECOND) — NO VIEWS ANYWHERE. The app creates no view; the
+    // retired creator must never come back on the boot path.
+    assert!(
+        !boot_src.contains("ensure_named_views"),
+        "a view creator is back on the candle boot path"
+    );
+}
+
+/// The one-shot fresh-start reset (`2026-09-19-fresh-start`) must run AFTER
+/// the readiness gate and BEFORE every table DDL: it DROPS the allowlisted
+/// tables, and the ensures below are what recreate them on the new schema in
+/// the same boot. Run after the ensures, it would drop freshly-created tables
+/// and leave them absent until the next boot; run before readiness, a
+/// still-starting QuestDB reads as an unreadable log (safe, but it would
+/// defer the reset for a whole day).
+///
+/// And `build_shared_infra` — which awaits this boot fn — must precede the
+/// feed-stack spawn in `main.rs`, so no writer is live while the drops run.
+#[test]
+fn the_fresh_start_reset_runs_once_before_every_table_ddl() {
+    const CALL: &str = "fresh_start_reset::run_fresh_start_reset_at_boot(questdb).await";
+    let boot_src = production_region(&read_src("src/candle_ddl_boot.rs"));
+    assert_eq!(
+        boot_src.matches(CALL).count(),
+        1,
+        "the fresh-start reset must be awaited exactly once in the candle boot"
+    );
+    let reset_pos = boot_src.find(CALL).unwrap();
+    let ready_gate = boot_src
+        .find("if !ready {")
+        .expect("the readiness gate must exist");
+    let legacy = boot_src
+        .find("shadow_persistence::drop_legacy_candle_objects(questdb).await")
+        .unwrap();
+    let ensure = boot_src
+        .find("shadow_persistence::ensure_shadow_candle_tables(questdb).await")
+        .unwrap();
+    let views = boot_src
+        .find("console_views::drop_retired_views(questdb).await")
+        .unwrap();
+    assert!(
+        ready_gate < reset_pos && reset_pos < views && views < legacy && legacy < ensure,
+        "order: readiness gate -> fresh-start reset -> retired-view drop -> legacy \
+         sweep -> candle ensure"
+    );
+
+    let main_src = production_region(&read_src("src/main.rs"));
+    let infra = main_src
+        .find("= build_shared_infra(")
+        .expect("main must call build_shared_infra");
+    let feed = main_src
+        .find("dhan_feed_stack::spawn_dhan_feed_stack(")
+        .expect("main must spawn the feed stack");
+    assert!(
+        infra < feed,
+        "build_shared_infra (which runs the reset's DROPs) must complete before the \
+         feed stack spawns — a live writer during a DROP auto-creates the table \
+         without its DEDUP key"
     );
 }
 
@@ -103,8 +223,9 @@ fn test_every_live_table_ensure_fn_keeps_its_boot_call_site() {
     let coverage: &[(&str, &str)] = &[
         // candles_* (21 tables) — seal chain writer (rest_candle_fold)
         ("ensure_shadow_candle_tables", "src/candle_ddl_boot.rs"),
-        // analyst console views (read-only projections)
-        ("ensure_named_views", "src/candle_ddl_boot.rs"),
+        // retired console views (2026-09-22 SECOND — the app creates no view;
+        // this sweep must stay, or an old `candles_10m` VIEW blocks the table)
+        ("drop_retired_views", "src/candle_ddl_boot.rs"),
         // ---- The five REST-leg ensure rows are RETIRED 2026-09-17 ----
         //
         // They covered `spot_1m_rest` (×2 callers), `option_chain_1m` (×2) and
@@ -154,14 +275,13 @@ fn test_every_live_table_ensure_fn_keeps_its_boot_call_site() {
         // depth pools begin silently overwriting each other's levels. Same
         // retry loop as `ticks`, so neither is retried without the other.
         ("ensure_market_depth_table", "src/candle_ddl_boot.rs"),
-        // top_volume_rank — the 1 s / 5 s volume-ranking snapshots
-        // (2026-09-06). Written every second by its offload writer from the
-        // first ranking sweep; until 2026-09-08 its ensure fn had ZERO
-        // production callers, so a fresh volume would have let the first ILP
-        // row auto-create it with none of its 6-key DEDUP
+        // top_volume_1s / _3s / _5s / _1m — the four DIRECT volume-ranking
+        // tables (2026-09-22; one table viewed four ways before that). Written
+        // every sweep by their offload writer from the first ranking; an
+        // un-ensured table is ILP-auto-created with none of its 6-key DEDUP
         // (ts, tf, family, feed, security_id, segment). Same retry loop as
         // `ticks` and `market_depth`.
-        ("ensure_top_volume_rank_table", "src/candle_ddl_boot.rs"),
+        ("ensure_top_volume_tables", "src/candle_ddl_boot.rs"),
         ("run_live_table_ddl_at_boot", "src/main.rs"),
         // (the `rest_fetch_audit` ensure row retired 2026-09-17 with the four
         // REST-leg rows above — same removal, same reasoning, §12.11.)
@@ -215,52 +335,82 @@ fn test_production_region_split_excises_test_modules() {
     assert!(!region.contains("needle()"));
 }
 
-/// The candle DDL — which carries the LEGACY VIEW SWEEP — must be awaited
-/// BEFORE the live-table DDL, which carries the `top_volume_rank` → `top_volume`
-/// RENAME.
-///
-/// ## Why this ordering is load-bearing, and why nothing pinned it until now
-///
-/// A QuestDB view is stored as its SQL TEXT and resolved at query time, so the
-/// four legacy `top_volume_rank_{1s,3s,5s,1m}` views must be dropped before the
-/// base table they name is renamed away from under them. More sharply: whether
-/// QuestDB REFUSES to rename a table that dependent views reference is
-/// **UNVERIFIED** — no QuestDB was reachable when the rename was written. If it
-/// does refuse, a rename attempted with those views still present fails on
-/// EVERY boot forever, and every ranking row written before the rename stays
-/// stranded in a table that is no longer in `HOUR_PARTITIONED_TABLES` and so is
-/// never swept.
-///
-/// The two calls sit ~47 lines apart in one 4,000-line function. Swapping them
-/// COMPILES GREEN and produces exactly the order the design says is unsafe, and
-/// a 2026-09-13 adversarial sweep found that the existing guards in this file
-/// pin only (a) candle-DDL before the seal-writer spawn, (b) the ordering
-/// INSIDE `candle_ddl_boot.rs`, and (c) that the live-table DDL is called at
-/// all. None of them relates the two to each other.
-///
-/// This is the class this repository keeps recording: a correct ordering held
-/// by convention, in a file where the only thing preserving it is that nobody
-/// has yet had a reason to move a line.
+/// Scanner self-test: a COMMENTED-OUT call must NOT satisfy a pin, while the
+/// same call as live code must — and a `//` inside a string literal is text,
+/// not a comment. Bite-proves `strip_line_comments` in both directions.
 #[test]
-fn the_legacy_view_sweep_is_awaited_before_the_top_volume_rename() {
+fn test_production_region_ignores_commented_out_calls() {
+    const NEEDLE: &str = "candle_ddl_boot::run_candle_ddl_at_boot(&config.questdb).await";
+    let commented = format!(
+        "fn main() {{\n    // {NEEDLE};\n    /// {NEEDLE}\n    //! {NEEDLE}\n    \
+         let x = 1; // {NEEDLE}\n}}\n"
+    );
+    assert!(
+        !production_region(&commented).contains(NEEDLE),
+        "a commented-out call must not satisfy a production pin"
+    );
+
+    let live = format!("fn main() {{\n    {NEEDLE};\n}}\n");
+    assert_eq!(
+        production_region(&live).matches(NEEDLE).count(),
+        1,
+        "the live call must survive the strip exactly once"
+    );
+
+    let url = "fn f() { let u = \"https://example.invalid/x\"; g(u); } // tail\n";
+    let region = production_region(url);
+    assert!(
+        region.contains("\"https://example.invalid/x\"; g(u); }"),
+        "a `//` inside a string literal is text, not a comment: {region:?}"
+    );
+    assert!(!region.contains("tail"), "the trailing comment must be cut");
+
+    let escaped = "let s = \"a\\\"b // still string\"; real(); // gone\n";
+    let region = production_region(escaped);
+    assert!(
+        region.contains("still string") && region.contains("real();") && !region.contains("gone"),
+        "an escaped quote must not end the string early: {region:?}"
+    );
+}
+
+/// The candle DDL must be awaited BEFORE the live-table DDL.
+///
+/// ## Why this ordering is load-bearing
+///
+/// `run_candle_ddl_at_boot` carries two things the live-table DDL depends on:
+///
+/// * the **fresh-start schema reset**, which drops the retired market-data
+///   tables and views (including the four direct `top_volume_<tf>` tables and
+///   the pre-2026-09-22 views of the same names). Ensuring the live tables
+///   FIRST would create them and then have the reset drop them, so the session
+///   would run on ILP-auto-created tables with no DEDUP key;
+/// * the **legacy view sweep**, which drops the four `top_volume_rank_*`
+///   views that still name a table this repository renamed away.
+///
+/// The two calls sit far apart in one very long function. Swapping them
+/// COMPILES GREEN. Until 2026-09-22 this guard pinned the same order for a
+/// different reason (a `top_volume_rank` → `top_volume` RENAME that no longer
+/// runs); the order outlived the rename because the reset now needs it.
+#[test]
+fn the_candle_ddl_is_awaited_before_the_live_table_ddl() {
     let main_src = production_region(&read_src("src/main.rs"));
 
     let sweep = "candle_ddl_boot::run_candle_ddl_at_boot(&config.questdb).await";
-    let rename = "candle_ddl_boot::run_live_table_ddl_at_boot(&config.questdb).await";
+    let live = "candle_ddl_boot::run_live_table_ddl_at_boot(&config.questdb).await";
 
     // COUNTED before compared. A `find` on a string that occurs zero times
     // would panic with a clear message, but one that occurs TWICE would pin the
     // first occurrence and silently ignore a second call site placed anywhere —
-    // including one placed on the wrong side of the rename.
+    // including one placed on the wrong side of the live-table DDL.
     assert_eq!(
         main_src.matches(sweep).count(),
         1,
         "main.rs must await the candle DDL exactly once in production; this \
-         guard compares its position against the rename below, and two call \
+         guard compares its position against the live-table DDL below, and two call \
          sites would make that comparison meaningless"
     );
     assert_eq!(
-        main_src.matches(rename).count(),
+        main_src.matches(live).count(),
         1,
         "main.rs must await the live-table DDL exactly once in production"
     );
@@ -268,57 +418,40 @@ fn the_legacy_view_sweep_is_awaited_before_the_top_volume_rename() {
     let sweep_pos = main_src
         .find(sweep)
         .expect("counted above, so this cannot fail");
-    let rename_pos = main_src
-        .find(rename)
+    let live_pos = main_src
+        .find(live)
         .expect("counted above, so this cannot fail");
 
     assert!(
-        sweep_pos < rename_pos,
-        "`run_candle_ddl_at_boot` (which drops the four LEGACY \
-         top_volume_rank_* views) must be awaited BEFORE \
-         `run_live_table_ddl_at_boot` (which RENAMES top_volume_rank -> \
-         top_volume). Whether QuestDB refuses a rename with dependent views is \
-         UNVERIFIED; dropping first removes that failure mode whether or not it \
-         exists, and dropping second would not. Found the sweep at byte \
-         {sweep_pos} and the rename at byte {rename_pos}."
+        sweep_pos < live_pos,
+        "`run_candle_ddl_at_boot` (fresh-start reset + legacy view sweep) must \
+         be awaited BEFORE `run_live_table_ddl_at_boot` (which ensures ticks, \
+         market_depth and the four top_volume_<tf> tables). Swapped, the reset \
+         would drop tables the ensure just created. Found the candle DDL at byte \
+         {sweep_pos} and the live-table DDL at byte {live_pos}."
     );
 }
 
-/// The `top_volume` view re-ensure must NOT be gated on the tick or depth DDL.
+/// The live-table DDL loop creates NO view (2026-09-22 SECOND — NO VIEWS
+/// ANYWHERE), and its success return still requires EVERY live table.
 ///
-/// It sat inside `if ticks_ok && depth_ok && rank_ok` until 2026-09-13, which
-/// made the remedy hostage to two unrelated tables: a `ticks` DDL that failed
-/// every attempt skipped the view pass even though `top_volume` had been
-/// created, leaving the four views absent for the whole session — precisely the
-/// failure the re-ensure exists to fix.
+/// Until 2026-09-22 this loop re-ran a view pass whenever a base table of the
+/// `_named` views appeared. Those views are retired; a re-ensure call returning
+/// here would recreate a view the boot just dropped.
 #[test]
-fn the_view_reensure_is_gated_on_the_rank_table_alone() {
+fn the_live_table_loop_creates_no_view_and_requires_every_table() {
     let boot = production_region(&read_src("src/candle_ddl_boot.rs"));
-
-    let gate = boot.find("if rank_ok && !views_reensured {").expect(
-        "the view re-ensure must be gated on `rank_ok` ALONE (plus its \
-             once-per-boot latch), never on ticks_ok/depth_ok — coupling a fix \
-             to conditions it does not depend on makes it unavailable in the \
-             case it was written for",
-    );
-    // Searched from the GATE onward, not from the start of the file.
-    // `run_candle_ddl_at_boot` makes the FIRST `ensure_named_views` call ~75
-    // lines earlier, so a plain `find` locates that one and then "proves" the
-    // gate comes after the call it is supposed to guard. The guard was looking
-    // at the wrong occurrence of a string that legitimately appears twice.
+    let start = boot
+        .find(concat!("pub async ", "fn run_live_table_ddl_at_boot"))
+        .expect("the live-table boot fn must exist");
+    let body = &boot[start..];
     assert!(
-        boot[gate..].contains("console_views::ensure_named_views(questdb).await"),
-        "the `rank_ok` gate must PRECEDE the re-ensure call it guards — no \
-         re-ensure call was found after the gate"
+        !body.contains("ensure_named_views") && !body.contains("ViewBaseTables"),
+        "a view pass is back inside the live-table DDL loop"
     );
-
-    // And the success return stays gated on all three: reaching it means every
-    // live table is ready, which is a different claim from "the views were
-    // re-attempted".
     assert!(
-        boot.contains("if ticks_ok && depth_ok && rank_ok {"),
-        "the boot-complete return must still require ALL THREE tables — \
-         decoupling the view pass must not also weaken what `true` means"
+        body.contains("if ticks_ok && depth_ok && volume_ok {"),
+        "the boot-complete return must still require every live table"
     );
 }
 

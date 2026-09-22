@@ -99,7 +99,9 @@ use zeroize::Zeroizing;
 pub use zeroize::Zeroizing as FeedTokenBuffer;
 
 use super::pool_budget::{DhanEndpointType, MAIN_FEED_INSTRUMENTS_PER_CONNECTION};
-use super::pool_supervisor::{DhanFeedSocket, SocketEvent, SocketFailure, SubscribeInstrument};
+use super::pool_supervisor::{
+    DhanFeedSocket, SocketEvent, SocketFailure, SubscribeInstrument, WriteReply, WriteTicket,
+};
 use super::subscription_builder::{
     build_subscription_messages, build_twenty_depth_subscription_messages,
     build_twenty_depth_unsubscription_messages, build_two_hundred_depth_subscription_message,
@@ -292,6 +294,44 @@ where
     }
 }
 
+/// How our half of the close frame went. Debug/log surface only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseFrameSend {
+    /// The Close frame was written and flushed.
+    Sent,
+    /// The write failed — the peer is already gone, which is the state we want.
+    Failed,
+    /// The write did not finish inside [`CLOSE_HANDSHAKE_WAIT`]: the socket is
+    /// dropped without waiting for the peer, so the connection task can redial.
+    TimedOut,
+}
+
+/// Sends our Close frame, bounded by [`CLOSE_HANDSHAKE_WAIT`].
+///
+/// # Why this is bounded (hostile review 2026-09-22, MEDIUM)
+/// Until the reader/writer split this was a bare `stream.close(None).await`.
+/// A close is a WRITE plus a FLUSH, and a peer that has stopped reading — a
+/// full TCP send window, a half-open socket behind a NAT that dropped the
+/// flow — never drains it. The await then never returns, the connection task
+/// never reaches its redial, and the socket stays dark with no counter moving:
+/// the one failure every liveness check in this file is built to prevent,
+/// reached through the shutdown door instead of the read loop.
+///
+/// `WebSocketStream::close(msg)` is exactly `self.send(Message::Close(msg))`
+/// (tokio-tungstenite 0.29, `lib.rs`), so this is the same wire bytes, only
+/// bounded. Generic over the sink so the bound is testable against a peer whose
+/// flush never completes, under `tokio::time::pause`.
+async fn send_close_frame_bounded<S>(sink: &mut S) -> (CloseFrameSend, Option<String>)
+where
+    S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    match tokio::time::timeout(CLOSE_HANDSHAKE_WAIT, sink.send(Message::Close(None))).await {
+        Ok(Ok(())) => (CloseFrameSend::Sent, None),
+        Ok(Err(err)) => (CloseFrameSend::Failed, Some(safe_err(&err))),
+        Err(_elapsed) => (CloseFrameSend::TimedOut, None),
+    }
+}
+
 /// How long one subscribe message may take to reach the socket. A blocked write
 /// while the pool waits is the same disconnect hazard as a blocked read.
 // APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for; the scanner matches the declaration itself. Same shape as `pool_supervisor::IDLE_POLL_INTERVAL`.
@@ -309,6 +349,13 @@ pub const SUBSCRIBE_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// latest available state"; the feed carries no sequence number, so ticks lost
 /// that way are invisible to every counter we own. A reader that stops polling
 /// for ten seconds is how that classification is earned.
+///
+/// ⚠ CORRECTED 2026-09-22 (plan item 44f): the paragraph above describes the
+/// pre-split code. Every write — the ping included — now runs on the socket's
+/// writer task, so the reader keeps calling `recv()` while a write is stuck;
+/// the ping no longer delays a read at all. This bound now limits how long one
+/// stuck ping can hold the WRITER, which is what keeps the next swap's write
+/// from queueing behind it.
 ///
 /// # Why shortening the SHARED constant instead would have been wrong
 ///
@@ -967,6 +1014,11 @@ impl DhanSocketParams {
             // bounded by `SUBSCRIBE_SEND_TIMEOUT` (10 s). The outer budget
             // always elapses first and drops this future, so the timeout arm
             // never runs and this reason can never increment from the swap.
+            // ⚠ CORRECTED 2026-09-22 (plan item 44f): that described the
+            // pre-split code. The write now runs on the socket's writer task,
+            // which keeps it past the swap's budget, so this reason IS
+            // reachable — by a swap's stuck write, by probe Arm A, and by an
+            // unsubscribe-only swap. The rest of this note stands.
             //
             // It stays seeded rather than removed for two reasons: the arm IS
             // reachable if the function is ever called unwrapped, and deleting
@@ -1024,6 +1076,311 @@ impl DhanSocketParams {
     }
 }
 
+/// The full socket, before it is split into its two halves.
+type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+/// The read half, polled by the connection's own task.
+type WsReader = futures_util::stream::SplitStream<WsStream>;
+/// The write half, owned by the writer task.
+type WsSink = futures_util::stream::SplitSink<WsStream, Message>;
+
+/// Depth of the queue feeding the writer task.
+///
+/// The drain keeps ONE write in flight (a swap, a top-up batch, a replay
+/// batch or a ping), so the queue never holds more than that one job in
+/// normal operation; the headroom exists so a burst of submissions cannot
+/// turn into a refused write. A full queue fails the submission — it never
+/// blocks the caller, because the caller is the task that must keep reading.
+const WIRE_WRITE_QUEUE_DEPTH: usize = 8;
+
+/// How long [`DhanFeedSocket::close`] waits for the writer task to hand its
+/// write half back. The writer answers a stop at its next poll — even
+/// mid-write, because the write is raced against the stop — so this is a
+/// safety bound, not a wait anyone should observe.
+// APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for; same shape as `PING_SEND_TIMEOUT` above.
+const WRITER_STOP_WAIT: Duration = Duration::from_secs(1);
+
+/// Which kind of write a job carries: selects the timeout, the counters and
+/// the log lines, exactly as the three inline write paths did before the
+/// split.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WireWriteKind {
+    Subscribe,
+    Unsubscribe,
+    Ping,
+}
+
+/// One write job for the writer task: up to two prebuilt messages (the main
+/// feed's index split), their instrument counts for the logs, and the reply
+/// that answers the caller's ticket.
+struct WireWrite {
+    kind: WireWriteKind,
+    messages: [Option<Message>; 2],
+    instruments: [usize; 2],
+    reply: WriteReply,
+}
+
+/// Handle to one connection's writer task.
+struct WireWriter {
+    jobs: tokio::sync::mpsc::Sender<WireWrite>,
+    stop: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<WsSink>,
+}
+
+impl WireWriter {
+    /// Stops the writer and returns its write half, or `None` when the task
+    /// could not hand it back within [`WRITER_STOP_WAIT`] (it is then
+    /// aborted, which drops the half and releases the connection).
+    async fn stop(self, endpoint: DhanEndpointType) -> Option<WsSink> {
+        let WireWriter { jobs, stop, task } = self;
+        drop(jobs);
+        if stop.send(()).is_err() {
+            // The task already returned on its own — its join below still
+            // yields the write half.
+        }
+        let abort = task.abort_handle();
+        match tokio::time::timeout(WRITER_STOP_WAIT, task).await {
+            Ok(Ok(sink)) => Some(sink),
+            Ok(Err(_join)) => {
+                debug!(
+                    endpoint = endpoint.as_str(),
+                    "Dhan feed writer task ended without returning its write half"
+                );
+                None
+            }
+            Err(_elapsed) => {
+                abort.abort();
+                debug!(
+                    endpoint = endpoint.as_str(),
+                    wait_ms = WRITER_STOP_WAIT.as_millis(),
+                    "Dhan feed writer task did not stop in time — aborted"
+                );
+                None
+            }
+        }
+    }
+}
+
+/// The writer task: owns the write half and performs queued jobs one at a
+/// time, in order, so a later write can never overtake an earlier one.
+///
+/// Every job is raced against the stop signal, so a close never waits behind
+/// a write stuck on a full send buffer. A job interrupted that way answers
+/// `Err(SocketFailure)` — the answer a write on a dying socket has always
+/// given. Returns the write half so `close` can send the Close frame.
+async fn run_wire_writer(
+    mut sink: WsSink,
+    mut jobs: tokio::sync::mpsc::Receiver<WireWrite>,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+    endpoint: DhanEndpointType,
+) -> WsSink {
+    loop {
+        let job = tokio::select! {
+            biased;
+            _ = &mut stop => return sink,
+            next = jobs.recv() => match next {
+                Some(job) => job,
+                None => return sink,
+            },
+        };
+        let WireWrite {
+            kind,
+            messages,
+            instruments,
+            reply,
+        } = job;
+        let outcome = tokio::select! {
+            biased;
+            _ = &mut stop => {
+                reply.send(Err(SocketFailure));
+                return sink;
+            }
+            outcome = write_job(&mut sink, kind, messages, instruments, endpoint) => outcome,
+        };
+        reply.send(outcome);
+    }
+}
+
+/// Performs one job's writes in order; the first failure ends the job.
+async fn write_job(
+    sink: &mut WsSink,
+    kind: WireWriteKind,
+    messages: [Option<Message>; 2],
+    instruments: [usize; 2],
+    endpoint: DhanEndpointType,
+) -> Result<(), SocketFailure> {
+    if kind == WireWriteKind::Ping {
+        return write_ping(sink, endpoint).await;
+    }
+    for (message, count) in messages.into_iter().zip(instruments) {
+        if let Some(message) = message {
+            write_batch(sink, kind, message, count, endpoint).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Writes ONE subscribe or unsubscribe message, bounded by
+/// [`SUBSCRIBE_SEND_TIMEOUT`], with the counters and log lines the inline
+/// write paths used before the split.
+async fn write_batch(
+    stream: &mut WsSink,
+    kind: WireWriteKind,
+    message: Message,
+    instruments: usize,
+    endpoint: DhanEndpointType,
+) -> Result<(), SocketFailure> {
+    let unsubscribe = kind == WireWriteKind::Unsubscribe;
+    let send = stream.send(message);
+    match tokio::time::timeout(SUBSCRIBE_SEND_TIMEOUT, send).await {
+        Ok(Ok(())) => {
+            if unsubscribe {
+                debug!(
+                    endpoint = endpoint.as_str(),
+                    instruments, "Dhan unsubscribe batch sent"
+                );
+            } else {
+                debug!(
+                    endpoint = endpoint.as_str(),
+                    instruments, "Dhan subscribe batch sent"
+                );
+            }
+            Ok(())
+        }
+        Ok(Err(err)) => {
+            metrics::counter!(
+                SUBSCRIBE_FAILED_METRIC,
+                "endpoint" => endpoint.as_str(),
+                "reason" => if unsubscribe { "unsubscribe_send" } else { "send" },
+            )
+            .increment(1);
+            if unsubscribe {
+                warn!(
+                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                    endpoint = endpoint.as_str(),
+                    instruments,
+                    reason = %safe_err(&err),
+                    "Dhan unsubscribe batch could not be written to the socket"
+                );
+            } else {
+                warn!(
+                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                    endpoint = endpoint.as_str(),
+                    instruments,
+                    reason = %safe_err(&err),
+                    "Dhan subscribe batch could not be written to the socket"
+                );
+            }
+            Err(SocketFailure)
+        }
+        Err(_elapsed) => {
+            metrics::counter!(
+                SUBSCRIBE_FAILED_METRIC,
+                "endpoint" => endpoint.as_str(),
+                "reason" => if unsubscribe { "unsubscribe_timeout" } else { "timeout" },
+            )
+            .increment(1);
+            if unsubscribe {
+                warn!(
+                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                    endpoint = endpoint.as_str(),
+                    instruments,
+                    timeout_secs = SUBSCRIBE_SEND_TIMEOUT.as_secs(),
+                    "Dhan unsubscribe batch write timed out"
+                );
+            } else {
+                warn!(
+                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                    endpoint = endpoint.as_str(),
+                    instruments,
+                    timeout_secs = SUBSCRIBE_SEND_TIMEOUT.as_secs(),
+                    "Dhan subscribe write stalled past its deadline"
+                );
+            }
+            Err(SocketFailure)
+        }
+    }
+}
+
+/// Writes ONE keepalive Ping, bounded by its own [`PING_SEND_TIMEOUT`].
+///
+/// A failed send is counted and logged, never escalated: if Dhan does not
+/// answer pings on this endpoint the idle watchdog keeps governing the socket
+/// exactly as it did before 2026-08-26.
+async fn write_ping(stream: &mut WsSink, endpoint: DhanEndpointType) -> Result<(), SocketFailure> {
+    // `from_static(&[])` — an empty ping payload that provably allocates
+    // nothing (it points at a static empty slice). Dhan needs no payload —
+    // the frame itself is the probe.
+    let send = stream.send(Message::Ping(bytes::Bytes::from_static(&[])));
+    match tokio::time::timeout(PING_SEND_TIMEOUT, send).await {
+        Ok(Ok(())) => {
+            metrics::counter!(
+                CLIENT_KEEPALIVE_PING_METRIC,
+                "endpoint" => endpoint.as_str(),
+                "outcome" => "sent",
+            )
+            .increment(1);
+            Ok(())
+        }
+        Ok(Err(err)) => {
+            metrics::counter!(
+                CLIENT_KEEPALIVE_PING_METRIC,
+                "endpoint" => endpoint.as_str(),
+                "outcome" => "send_failed",
+            )
+            .increment(1);
+            debug!(
+                endpoint = endpoint.as_str(),
+                reason = %safe_err(&err),
+                "client keepalive ping could not be sent — the idle watchdog still \
+                 governs this socket, so this degrades to the pre-2026-08-26 behaviour"
+            );
+            Err(SocketFailure)
+        }
+        Err(_elapsed) => {
+            metrics::counter!(
+                CLIENT_KEEPALIVE_PING_METRIC,
+                "endpoint" => endpoint.as_str(),
+                "outcome" => "timeout",
+            )
+            .increment(1);
+            Err(SocketFailure)
+        }
+    }
+}
+
+/// Counts a submission the writer's queue refused — nothing reached the wire.
+fn count_write_failure(endpoint: DhanEndpointType, kind: WireWriteKind, reason: &'static str) {
+    match kind {
+        WireWriteKind::Ping => {
+            metrics::counter!(
+                CLIENT_KEEPALIVE_PING_METRIC,
+                "endpoint" => endpoint.as_str(),
+                "outcome" => "send_failed",
+            )
+            .increment(1);
+        }
+        WireWriteKind::Subscribe | WireWriteKind::Unsubscribe => {
+            metrics::counter!(
+                SUBSCRIBE_FAILED_METRIC,
+                "endpoint" => endpoint.as_str(),
+                "reason" => if kind == WireWriteKind::Unsubscribe {
+                    "unsubscribe_send"
+                } else {
+                    "send"
+                },
+            )
+            .increment(1);
+            warn!(
+                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                endpoint = endpoint.as_str(),
+                reason,
+                "Dhan (un)subscribe could not be queued for the socket writer — nothing \
+                 was written"
+            );
+        }
+    }
+}
+
 /// The production [`DhanFeedSocket`]: tokio-tungstenite over TLS, with an
 /// explicit frame cap and no policy of its own.
 ///
@@ -1031,9 +1388,21 @@ impl DhanSocketParams {
 pub struct DhanFeedSocketImpl<T: FeedTokenSource> {
     params: DhanSocketParams,
     token: T,
-    /// The live socket. `None` before the first dial and after every close, so
-    /// a stale stream can never be written to.
-    stream: Option<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    /// The READ half of the live socket. `None` before the first dial and
+    /// after every close, so a stale stream can never be read.
+    ///
+    /// Split from the write half on 2026-09-22 (plan item 44f): the write
+    /// half lives in the writer task behind [`WireWriter`], so a write stuck
+    /// behind a full send buffer never stops this half being polled.
+    stream: Option<WsReader>,
+    /// The writer task that owns the WRITE half, and the queue feeding it.
+    /// Present exactly when `stream` is.
+    writer: Option<WireWriter>,
+    /// Bumped on every successful dial. Every write is stamped with the
+    /// generation it was issued under, so an answer from a replaced
+    /// connection can be recognised and ignored — see
+    /// [`DhanFeedSocket::write_generation`].
+    generation: u64,
     /// Why the last dial failed, as one of the transport's bounded labels.
     ///
     /// A `&'static str` from a fixed set, never a formatted error: a
@@ -1056,11 +1425,12 @@ impl<T: FeedTokenSource> DhanFeedSocketImpl<T> {
             params,
             token,
             stream: None,
+            writer: None,
+            generation: 0,
             last_dial_failure_reason: "unknown",
             last_read_ended_by_reset: false,
         }
     }
-
     /// The endpoint type this socket serves.
     #[must_use]
     pub const fn endpoint(&self) -> DhanEndpointType {
@@ -1093,187 +1463,179 @@ impl<T: FeedTokenSource> DhanFeedSocketImpl<T> {
         )
         .increment(1);
     }
-    /// Writes ONE unsubscribe message.
+    /// Builds ONE subscribe or unsubscribe message.
     ///
-    /// **ADDED 2026-08-26** for the per-minute at-the-money re-selection. It
+    /// A payload that cannot be built is counted and logged here, exactly as
+    /// before the split, and reported as `None`. The unsubscribe arm
     /// deliberately reuses the subscribe path's failure metrics and error
-    /// code rather than minting new ones: an operator asking "did this socket
-    /// fail to change what it is subscribed to?" wants one answer, and the
-    /// `reason` label already separates a payload refusal from a dead socket
-    /// from a write failure from a timeout.
-    async fn send_unsubscribe_in_mode(
-        &mut self,
+    /// code (added 2026-08-26 for the per-minute re-selection): an operator
+    /// asking "did this socket fail to change what it is subscribed to?"
+    /// wants one answer, and the `reason` label separates the cases.
+    fn build_message(
+        &self,
+        kind: WireWriteKind,
         batch: &[SubscribeInstrument],
         feed_mode: FeedMode,
-    ) -> Result<(), SocketFailure> {
+    ) -> Option<Message> {
         let endpoint = self.params.endpoint;
-        let payload = match build_unsubscribe_payload(endpoint, feed_mode, batch) {
-            Ok(p) => p,
+        let built = if kind == WireWriteKind::Unsubscribe {
+            build_unsubscribe_payload(endpoint, feed_mode, batch)
+        } else {
+            build_subscribe_payload(endpoint, feed_mode, batch)
+        };
+        match built {
+            Ok(payload) => Some(Message::Text(payload.into())),
             Err(err) => {
-                metrics::counter!(
-                    SUBSCRIBE_FAILED_METRIC,
-                    "endpoint" => endpoint.as_str(),
-                    "reason" => "unsubscribe_payload",
-                )
-                .increment(1);
-                error!(
-                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
-                    endpoint = endpoint.as_str(),
-                    instruments = batch.len(),
-                    reason = %err,
-                    "Dhan unsubscribe payload could not be built — the instrument stays \
-                     subscribed, so this socket keeps carrying a contract that is no longer \
-                     the one that was chosen"
-                );
-                return Err(SocketFailure);
-            }
-        };
-
-        let Some(stream) = self.stream.as_mut() else {
-            metrics::counter!(
-                SUBSCRIBE_FAILED_METRIC,
-                "endpoint" => endpoint.as_str(),
-                "reason" => "unsubscribe_not_connected",
-            )
-            .increment(1);
-            warn!(
-                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
-                endpoint = endpoint.as_str(),
-                "unsubscribe attempted with no live Dhan socket"
-            );
-            return Err(SocketFailure);
-        };
-
-        let send = stream.send(Message::Text(payload.into()));
-        match tokio::time::timeout(SUBSCRIBE_SEND_TIMEOUT, send).await {
-            Ok(Ok(())) => {
-                debug!(
-                    endpoint = endpoint.as_str(),
-                    instruments = batch.len(),
-                    "Dhan unsubscribe batch sent"
-                );
-                Ok(())
-            }
-            Ok(Err(err)) => {
-                metrics::counter!(
-                    SUBSCRIBE_FAILED_METRIC,
-                    "endpoint" => endpoint.as_str(),
-                    "reason" => "unsubscribe_send",
-                )
-                .increment(1);
-                warn!(
-                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
-                    endpoint = endpoint.as_str(),
-                    instruments = batch.len(),
-                    reason = %safe_err(&err),
-                    "Dhan unsubscribe batch could not be written to the socket"
-                );
-                Err(SocketFailure)
-            }
-            Err(_elapsed) => {
-                metrics::counter!(
-                    SUBSCRIBE_FAILED_METRIC,
-                    "endpoint" => endpoint.as_str(),
-                    "reason" => "unsubscribe_timeout",
-                )
-                .increment(1);
-                warn!(
-                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
-                    endpoint = endpoint.as_str(),
-                    instruments = batch.len(),
-                    timeout_secs = SUBSCRIBE_SEND_TIMEOUT.as_secs(),
-                    "Dhan unsubscribe batch write timed out"
-                );
-                Err(SocketFailure)
+                if kind == WireWriteKind::Unsubscribe {
+                    metrics::counter!(
+                        SUBSCRIBE_FAILED_METRIC,
+                        "endpoint" => endpoint.as_str(),
+                        "reason" => "unsubscribe_payload",
+                    )
+                    .increment(1);
+                    error!(
+                        code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                        endpoint = endpoint.as_str(),
+                        instruments = batch.len(),
+                        reason = %err,
+                        "Dhan unsubscribe payload could not be built — the instrument stays \
+                         subscribed, so this socket keeps carrying a contract that is no longer \
+                         the one that was chosen"
+                    );
+                } else {
+                    metrics::counter!(
+                        SUBSCRIBE_FAILED_METRIC,
+                        "endpoint" => endpoint.as_str(),
+                        "reason" => "payload",
+                    )
+                    .increment(1);
+                    error!(
+                        code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                        endpoint = endpoint.as_str(),
+                        instruments = batch.len(),
+                        reason = %err,
+                        "Dhan subscribe payload could not be built — the socket would be live but \
+                         blind, so the connection is torn down instead"
+                    );
+                }
+                None
             }
         }
     }
 
-    async fn send_subscribe_in_mode(
-        &mut self,
-        batch: &[SubscribeInstrument],
-        feed_mode: FeedMode,
-    ) -> Result<(), SocketFailure> {
-        let endpoint = self.params.endpoint;
-        let payload = match build_subscribe_payload(endpoint, feed_mode, batch) {
-            Ok(p) => p,
-            Err(err) => {
-                metrics::counter!(
-                    SUBSCRIBE_FAILED_METRIC,
-                    "endpoint" => endpoint.as_str(),
-                    "reason" => "payload",
-                )
-                .increment(1);
-                error!(
-                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
-                    endpoint = endpoint.as_str(),
-                    instruments = batch.len(),
-                    reason = %err,
-                    "Dhan subscribe payload could not be built — the socket would be live but \
-                     blind, so the connection is torn down instead"
-                );
-                return Err(SocketFailure);
+    /// Builds the one or two messages a (un)subscribe needs and hands them to
+    /// the writer as ONE job.
+    ///
+    /// Only the main feed splits: indices go in [`IDX_I_FEED_MODE`] and
+    /// everything else in the configured mode, because Dhan serves an `IDX_I`
+    /// Full subscription with SILENCE rather than an error (see
+    /// [`IDX_I_FEED_MODE`]). One Dhan message carries exactly one
+    /// `RequestCode`, so the two modes cannot share a message. The unsubscribe
+    /// mirrors it arm for arm — the unsubscribe code is derived from the feed
+    /// mode, so an index removed with the Full code would never be removed.
+    ///
+    /// Both halves are BUILT before either is sent: a payload that cannot be
+    /// built fails the whole job without writing its sibling, so a partial
+    /// success can no longer leave the socket live and blind for one half.
+    fn submit_batch(&mut self, kind: WireWriteKind, batch: &[SubscribeInstrument]) -> WriteTicket {
+        let configured = self.params.feed_mode;
+        let mut messages: [Option<Message>; 2] = [None, None];
+        let mut instruments = [0usize; 2];
+        let split = if self.params.endpoint == DhanEndpointType::MainFeed {
+            let (indices, others) = partition_index_batch(batch);
+            if indices.is_empty() {
+                None
+            } else {
+                Some((indices, others))
             }
+        } else {
+            None
         };
-
-        let Some(stream) = self.stream.as_mut() else {
-            metrics::counter!(
-                SUBSCRIBE_FAILED_METRIC,
-                "endpoint" => endpoint.as_str(),
-                "reason" => "not_connected",
-            )
-            .increment(1);
-            warn!(
-                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
-                endpoint = endpoint.as_str(),
-                "subscribe attempted with no live Dhan socket"
-            );
-            return Err(SocketFailure);
-        };
-
-        let send = stream.send(Message::Text(payload.into()));
-        match tokio::time::timeout(SUBSCRIBE_SEND_TIMEOUT, send).await {
-            Ok(Ok(())) => {
-                debug!(
-                    endpoint = endpoint.as_str(),
-                    instruments = batch.len(),
-                    "Dhan subscribe batch sent"
-                );
-                Ok(())
+        match split {
+            None => {
+                let Some(message) = self.build_message(kind, batch, configured) else {
+                    return WriteTicket::resolved(self.generation, Err(SocketFailure));
+                };
+                messages[0] = Some(message);
+                instruments[0] = batch.len();
             }
-            Ok(Err(err)) => {
-                metrics::counter!(
-                    SUBSCRIBE_FAILED_METRIC,
-                    "endpoint" => endpoint.as_str(),
-                    "reason" => "send",
-                )
-                .increment(1);
-                warn!(
-                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
-                    endpoint = endpoint.as_str(),
-                    instruments = batch.len(),
-                    reason = %safe_err(&err),
-                    "Dhan subscribe batch could not be written to the socket"
-                );
-                Err(SocketFailure)
-            }
-            Err(_elapsed) => {
-                metrics::counter!(
-                    SUBSCRIBE_FAILED_METRIC,
-                    "endpoint" => endpoint.as_str(),
-                    "reason" => "timeout",
-                )
-                .increment(1);
-                warn!(
-                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
-                    endpoint = endpoint.as_str(),
-                    instruments = batch.len(),
-                    timeout_secs = SUBSCRIBE_SEND_TIMEOUT.as_secs(),
-                    "Dhan subscribe write stalled past its deadline"
-                );
-                Err(SocketFailure)
+            Some((indices, others)) => {
+                if !others.is_empty() {
+                    let Some(message) = self.build_message(kind, &others, configured) else {
+                        return WriteTicket::resolved(self.generation, Err(SocketFailure));
+                    };
+                    messages[0] = Some(message);
+                    instruments[0] = others.len();
+                }
+                let Some(message) = self.build_message(kind, &indices, IDX_I_FEED_MODE) else {
+                    return WriteTicket::resolved(self.generation, Err(SocketFailure));
+                };
+                messages[1] = Some(message);
+                instruments[1] = indices.len();
             }
         }
+        self.submit(kind, messages, instruments)
+    }
+
+    /// Queues one job on the writer and returns its ticket — never awaits.
+    ///
+    /// A socket that is not connected, or a writer whose queue is closed or
+    /// full, answers at once with a failure, counted under the same labels
+    /// the inline writes used.
+    fn submit(
+        &mut self,
+        kind: WireWriteKind,
+        messages: [Option<Message>; 2],
+        instruments: [usize; 2],
+    ) -> WriteTicket {
+        let endpoint = self.params.endpoint;
+        let generation = self.generation;
+        let Some(writer) = self.writer.as_ref() else {
+            match kind {
+                WireWriteKind::Ping => {}
+                WireWriteKind::Subscribe => {
+                    metrics::counter!(
+                        SUBSCRIBE_FAILED_METRIC,
+                        "endpoint" => endpoint.as_str(),
+                        "reason" => "not_connected",
+                    )
+                    .increment(1);
+                    warn!(
+                        code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                        endpoint = endpoint.as_str(),
+                        "subscribe attempted with no live Dhan socket"
+                    );
+                }
+                WireWriteKind::Unsubscribe => {
+                    metrics::counter!(
+                        SUBSCRIBE_FAILED_METRIC,
+                        "endpoint" => endpoint.as_str(),
+                        "reason" => "unsubscribe_not_connected",
+                    )
+                    .increment(1);
+                    warn!(
+                        code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                        endpoint = endpoint.as_str(),
+                        "unsubscribe attempted with no live Dhan socket"
+                    );
+                }
+            }
+            return WriteTicket::resolved(generation, Err(SocketFailure));
+        };
+        let (ticket, reply) = WriteTicket::pending(generation);
+        let job = WireWrite {
+            kind,
+            messages,
+            instruments,
+            reply,
+        };
+        if writer.jobs.try_send(job).is_err() {
+            // The writer is gone (its socket died) or behind by a full queue.
+            // Either way nothing reached the wire. The job — and with it the
+            // reply — is dropped here, so the ticket resolves as a failure.
+            count_write_failure(endpoint, kind, "queue_refused");
+        }
+        ticket
     }
 }
 
@@ -1394,7 +1756,18 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
                     max_frame_bytes = max_frame_bytes(endpoint),
                     "Dhan feed socket connected"
                 );
-                self.stream = Some(stream);
+                // Split: the read half stays here, the write half moves into
+                // the writer task (plan item 44f). The read half's own
+                // `poll_next` still flushes the automatic pong — tungstenite's
+                // `read` "never blocks on write" — so splitting cannot starve
+                // the pong the peer's keepalive depends on.
+                let (sink, reader) = stream.split();
+                let (jobs, queue) = tokio::sync::mpsc::channel(WIRE_WRITE_QUEUE_DEPTH);
+                let (stop, stop_rx) = tokio::sync::oneshot::channel();
+                let task = tokio::spawn(run_wire_writer(sink, queue, stop_rx, endpoint));
+                self.stream = Some(reader);
+                self.writer = Some(WireWriter { jobs, stop, task });
+                self.generation = self.generation.wrapping_add(1);
                 self.last_read_ended_by_reset = false;
                 Ok(())
             }
@@ -1412,148 +1785,35 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
         }
     }
 
-    /// Subscribes `batch`, splitting indices into their own message.
-    ///
-    /// Indices are subscribed in [`IDX_I_FEED_MODE`] and everything else in the
-    /// configured mode, because Dhan serves an `IDX_I` Full subscription with
-    /// SILENCE rather than an error (see [`IDX_I_FEED_MODE`] for the measured
-    /// evidence). One Dhan message carries exactly one `RequestCode`, so the
-    /// two modes cannot share a message and the split is structural, not a
-    /// preference.
-    ///
-    /// Only the main feed splits. The depth endpoints refuse a non-NSE segment
-    /// outright and never carry an index, so partitioning there would add a
-    /// branch that can never be taken.
-    ///
-    /// Both halves must reach the wire for the subscribe to count as sent: a
-    /// partial success would leave the socket live and blind for one half of
-    /// its universe, which is the exact shape this whole change exists to
-    /// remove.
-    async fn send_subscribe(&mut self, batch: &[SubscribeInstrument]) -> Result<(), SocketFailure> {
-        let configured = self.params.feed_mode;
-        if self.params.endpoint != DhanEndpointType::MainFeed {
-            return self.send_subscribe_in_mode(batch, configured).await;
-        }
-
-        let (indices, others) = partition_index_batch(batch);
-
-        // Nothing to split — send the batch exactly as before.
-        if indices.is_empty() {
-            return self.send_subscribe_in_mode(batch, configured).await;
-        }
-
-        if !others.is_empty() {
-            self.send_subscribe_in_mode(&others, configured).await?;
-        }
-        self.send_subscribe_in_mode(&indices, IDX_I_FEED_MODE).await
+    fn write_generation(&self) -> u64 {
+        self.generation
     }
 
-    async fn send_unsubscribe(
-        &mut self,
-        batch: &[SubscribeInstrument],
-    ) -> Result<(), SocketFailure> {
-        // Mirrors `send_subscribe` arm for arm, including the index split. An
-        // IDX_I instrument was SUBSCRIBED in Quote mode while everything else
-        // went out in Full (the 2026-08-21 index-mode carve-out), and the
-        // unsubscribe RequestCode is derived from the feed mode — so
-        // unsubscribing an index with the Full code would send a code the
-        // instrument was never subscribed under, and Dhan would have nothing
-        // to remove. The socket would look fine and keep the instrument.
-        let configured = self.params.feed_mode;
-        if self.params.endpoint != DhanEndpointType::MainFeed {
-            return self.send_unsubscribe_in_mode(batch, configured).await;
-        }
-
-        let (indices, others) = partition_index_batch(batch);
-
-        if indices.is_empty() {
-            return self.send_unsubscribe_in_mode(batch, configured).await;
-        }
-
-        if !others.is_empty() {
-            self.send_unsubscribe_in_mode(&others, configured).await?;
-        }
-        self.send_unsubscribe_in_mode(&indices, IDX_I_FEED_MODE)
-            .await
+    /// Subscribes `batch`, splitting indices into their own message — see
+    /// `submit_batch`. Both halves must reach the wire for the subscribe to
+    /// count as sent.
+    fn send_subscribe(&mut self, batch: &[SubscribeInstrument]) -> WriteTicket {
+        self.submit_batch(WireWriteKind::Subscribe, batch)
     }
 
-    /// Send ONE client-originated keepalive Ping.
+    fn send_unsubscribe(&mut self, batch: &[SubscribeInstrument]) -> WriteTicket {
+        self.submit_batch(WireWriteKind::Unsubscribe, batch)
+    }
+
+    /// Queues ONE client-originated keepalive Ping.
     ///
     /// Only reached for endpoints where [`DhanEndpointType::needs_client_keepalive_ping`]
     /// is true — see that method for the measurement showing depth-200 receives
     /// zero server pings, and why that quietly turned the idle watchdog into a
     /// liquidity detector.
     ///
-    /// # What this deliberately does NOT do
-    ///
-    /// It does **not** touch the idle watchdog. The reset stays where it has
-    /// been since 2026-08-19: on the **Pong we receive back**, through the
-    /// existing `Message::Pong` -> `SocketEvent::KeepAlive` ->
-    /// `ConnEvent::KeepAliveReceived` -> `record_activity` chain.
-    ///
-    /// That distinction is the whole safety of this change. Resetting on SEND
-    /// would defeat the watchdog outright — we would always look "active"
-    /// because we always ping, and a reader that had stopped draining would
-    /// never be caught. Resetting on the RECEIVED pong preserves the original
-    /// semantics exactly: a pong can only arrive if the socket is alive **and**
-    /// our read loop is polling it.
-    ///
-    /// # Failure is not fatal
-    ///
-    /// A failed send is counted and logged, never escalated. If Dhan does not
-    /// answer pings on this endpoint the watchdog simply keeps firing at 27s
-    /// exactly as it does today — this change can make that path better, never
-    /// worse.
-    async fn send_ping(&mut self) -> Result<(), SocketFailure> {
-        let endpoint = self.params.endpoint;
-        let Some(stream) = self.stream.as_mut() else {
-            return Err(SocketFailure);
-        };
-
-        // `from_static(&[])` — an empty ping payload that provably allocates
-        // nothing (it points at a static empty slice).
-        //
-        // The obvious empty-vector spelling was written here first and the
-        // banned-pattern scanner rejected it, correctly: this module is
-        // hot-path scoped, and a keepalive that allocates on a socket carrying
-        // 51,000 rows/s is exactly the small invisible cost Principle #1 exists
-        // to stop. Dhan needs no payload — the frame itself is the probe.
-        let send = stream.send(Message::Ping(bytes::Bytes::from_static(&[])));
-        match tokio::time::timeout(PING_SEND_TIMEOUT, send).await {
-            Ok(Ok(())) => {
-                metrics::counter!(
-                    CLIENT_KEEPALIVE_PING_METRIC,
-                    "endpoint" => endpoint.as_str(),
-                    "outcome" => "sent",
-                )
-                .increment(1);
-                Ok(())
-            }
-            Ok(Err(err)) => {
-                metrics::counter!(
-                    CLIENT_KEEPALIVE_PING_METRIC,
-                    "endpoint" => endpoint.as_str(),
-                    "outcome" => "send_failed",
-                )
-                .increment(1);
-                debug!(
-                    endpoint = endpoint.as_str(),
-                    reason = %err,
-                    "client keepalive ping could not be sent — the idle watchdog still \
-                     governs this socket, so this degrades to the pre-2026-08-26 behaviour"
-                );
-                Err(SocketFailure)
-            }
-            Err(_elapsed) => {
-                metrics::counter!(
-                    CLIENT_KEEPALIVE_PING_METRIC,
-                    "endpoint" => endpoint.as_str(),
-                    "outcome" => "timeout",
-                )
-                .increment(1);
-                Err(SocketFailure)
-            }
-        }
+    /// It does **not** touch the idle watchdog. The reset stays on the **Pong
+    /// we receive back** (`Message::Pong` -> `SocketEvent::KeepAlive` ->
+    /// `ConnEvent::KeepAliveReceived` -> `record_activity`). Resetting on SEND
+    /// would defeat the watchdog outright. A failed send is counted and
+    /// logged by the writer (`write_ping`), never escalated.
+    fn send_ping(&mut self) -> WriteTicket {
+        self.submit(WireWriteKind::Ping, [None, None], [0, 0])
     }
 
     async fn recv(&mut self) -> SocketEvent {
@@ -1723,17 +1983,50 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
     }
 
     async fn close(&mut self) {
-        let Some(mut stream) = self.stream.take() else {
+        let writer = self.writer.take();
+        let Some(reader) = self.stream.take() else {
+            // No read half: dropping the writer (if any) stops its task.
+            drop(writer);
             return;
         };
-        // Best effort. A close that fails means the peer is already gone, which
-        // is exactly the state we are trying to reach.
-        if let Err(err) = stream.close(None).await {
+        // Stop the writer and take its write half back, so the Close below
+        // goes out on the same connection exactly as it did before the split.
+        let Some(sink) = (match writer {
+            Some(writer) => writer.stop(self.params.endpoint).await,
+            None => None,
+        }) else {
             debug!(
                 endpoint = self.params.endpoint.as_str(),
-                reason = %safe_err(&err),
+                "Dhan feed socket writer did not hand its write half back — the socket is \
+                 dropped without a close frame, which still releases the connection"
+            );
+            return;
+        };
+        let Ok(mut stream) = reader.reunite(sink) else {
+            debug!(
+                endpoint = self.params.endpoint.as_str(),
+                "Dhan feed socket halves did not belong together — dropped without a close frame"
+            );
+            return;
+        };
+        // Best effort, and BOUNDED. A close that fails means the peer is already
+        // gone, which is exactly the state we are trying to reach. A close that
+        // never finishes (a peer that stopped reading) must not strand the
+        // connection task short of its redial — see `send_close_frame_bounded`.
+        let (sent, reason) = send_close_frame_bounded(&mut stream).await;
+        if sent != CloseFrameSend::Sent {
+            debug!(
+                endpoint = self.params.endpoint.as_str(),
+                close_frame = ?sent,
+                reason = reason.as_deref().unwrap_or(""),
+                wait_bound_ms = CLOSE_HANDSHAKE_WAIT.as_millis(),
                 "Dhan feed socket close was not clean — the socket is dropped regardless"
             );
+        }
+        if sent == CloseFrameSend::TimedOut {
+            // The peer is not draining our writes, so it will not send a Close
+            // reply either: waiting a second bound would only delay the redial.
+            return;
         }
         // Give the peer its half of the close handshake, bounded — see
         // `CLOSE_HANDSHAKE_WAIT` for why an instant redial on top of a
@@ -2131,6 +2424,93 @@ mod tests {
             CLOSE_HANDSHAKE_WAIT < DIAL_TIMEOUT,
             "the handshake wait must never dominate a dial cycle"
         );
+    }
+
+    /// The Close frame write is bounded (hostile review 2026-09-22, MEDIUM).
+    /// A peer that stops reading never lets the flush finish; before the bound
+    /// the connection task parked forever short of its redial. Bite: replace
+    /// the helper's `timeout` with a bare await and this test never returns.
+    #[tokio::test(start_paused = true)]
+    async fn the_close_frame_write_is_bounded_when_the_peer_stops_reading() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        type WsError = tokio_tungstenite::tungstenite::Error;
+
+        /// Accepts the frame, then never finishes flushing it.
+        struct StalledPeer;
+        impl futures_util::Sink<Message> for StalledPeer {
+            type Error = WsError;
+            fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Ready(Ok(()))
+            }
+            fn start_send(self: Pin<&mut Self>, _: Message) -> Result<(), WsError> {
+                Ok(())
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Pending
+            }
+            fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Pending
+            }
+        }
+        let started = tokio::time::Instant::now();
+        let (sent, reason) = send_close_frame_bounded(&mut StalledPeer).await;
+        assert_eq!(sent, CloseFrameSend::TimedOut);
+        assert!(reason.is_none());
+        assert_eq!(
+            started.elapsed(),
+            CLOSE_HANDSHAKE_WAIT,
+            "a stalled close is abandoned at exactly the named bound"
+        );
+
+        /// A peer that is already gone: the write fails at once.
+        struct GonePeer;
+        impl futures_util::Sink<Message> for GonePeer {
+            type Error = WsError;
+            fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Ready(Err(WsError::ConnectionClosed))
+            }
+            fn start_send(self: Pin<&mut Self>, _: Message) -> Result<(), WsError> {
+                Err(WsError::ConnectionClosed)
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let started = tokio::time::Instant::now();
+        let (sent, reason) = send_close_frame_bounded(&mut GonePeer).await;
+        assert_eq!(sent, CloseFrameSend::Failed);
+        assert!(reason.is_some_and(|r| !r.is_empty()));
+        assert_eq!(started.elapsed(), Duration::ZERO);
+
+        // A healthy peer: the frame goes out and nothing waits.
+        #[derive(Default)]
+        struct HealthyPeer(Vec<Message>);
+        impl futures_util::Sink<Message> for HealthyPeer {
+            type Error = WsError;
+            fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Ready(Ok(()))
+            }
+            fn start_send(mut self: Pin<&mut Self>, item: Message) -> Result<(), WsError> {
+                self.0.push(item);
+                Ok(())
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let mut healthy = HealthyPeer::default();
+        let started = tokio::time::Instant::now();
+        let (sent, _) = send_close_frame_bounded(&mut healthy).await;
+        assert_eq!(sent, CloseFrameSend::Sent);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert!(matches!(healthy.0.as_slice(), [Message::Close(None)]));
     }
 
     /// A bare numeric SecurityId immediately before a JSON object close.

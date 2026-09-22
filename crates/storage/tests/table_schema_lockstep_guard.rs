@@ -78,6 +78,12 @@ const NO_GENERIC_SELF_HEAL: &[(&str, &str)] = &[
         "four hand-rolled ALTERs; SEBI point-in-time table, never dropped",
     ),
     (
+        "fresh_start_reset.rs",
+        "the one-shot reset's own two-column log (reset_id, ts); its shape IS the \
+         reset contract, so a column change would be a new reset with its own \
+         dated quote, never a silent ALTER (2026-09-22)",
+    ),
+    (
         "instrument_lifecycle_persistence.rs",
         "two hand-rolled ALTERs; SEBI never-delete table",
     ),
@@ -92,7 +98,9 @@ const NO_GENERIC_SELF_HEAL: &[(&str, &str)] = &[
     ),
     (
         "shadow_persistence.rs",
-        "five hand-rolled ALTERs across the shadow candle tables",
+        "one ADD COLUMN loop driven by `CANDLE_SELF_HEAL_COLUMNS`, which a unit \
+         test pins to the CREATE column-for-column (2026-09-22: this reason \
+         said five hand-rolled ALTERs, which the 2026-09-19 reset replaced)",
     ),
     (
         "ws_event_audit_persistence.rs",

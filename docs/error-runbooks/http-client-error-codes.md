@@ -69,7 +69,8 @@ The site logs `error!(code = "HTTP-CLIENT-01", ...)`, increments
 | `lifecycle_ensure` / `lifecycle_audit_ensure` | lifecycle DDL skipped this boot (idempotent) |
 | `ticks_ensure_dedup` | ticks-table DDL skipped this boot (idempotent; ring/spill absorbs ILP errors) |
 | `tick_gap_check` | one best-effort post-recovery gap check skipped |
-| `named_views_ensure` | analyst console views (ticks_named/candles_named) DDL skipped this boot (idempotent — next boot re-runs; read-only projections, no data path affected, no duplicate-row window) |
+| `named_views_ensure` | RETIRED 2026-09-22 — the app creates no view any more ("no views anywhere"). Superseded by `retired_views_drop` below. |
+| `retired_views_drop` | the boot sweep that DROPS every retired console view name (incl. an old `candles_10m` VIEW) was skipped this boot. Idempotent — next boot re-runs. If a stale `candles_10m` VIEW survives, the `candles_10m` TABLE create is refused and that frame's bars are rescued to spill (HOT-PATH-02) until the next boot drops the view |
 | `wal_suspension_probe` | one 60s WAL-suspension probe tick skipped (W2 PR#6, 2026-07-10 — WAL-SUSPEND-01 watcher; next tick retries; probe-failed counter also rises) |
 | `oms_wiring` | (app crate, 2026-07-17 — post-#1562 audit) the shared OMS HTTP client (`crates/app/src/oms_wiring.rs::build_oms_http_client`) could not be built. Order runtime: the (re)spawn attempt returns before OMS construction — the supervisor's escalating-backoff respawn (5s→300s cap) retries; the paper book for that incarnation never opens (loud, never a panic). Trading pipeline (Dhan-lane-gated, dormant today): the pipeline task exits before OMS construction with its own consequence-line `error!`; a dhan-lane restart retries the spawn |
 

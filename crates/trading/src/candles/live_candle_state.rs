@@ -120,7 +120,10 @@ pub struct LiveCandleState {
     /// This field and `total_buy_qty` together occupy the 8 bytes vacated by
     /// `volume_pct_from_prev_day` (same 2026-05-28 removal). The struct is
     /// therefore UNCHANGED at 128 bytes and every downstream size assertion
-    /// holds without being raised.
+    /// holds without being raised. (That was the 2026-05-28 size. The struct
+    /// is **152 bytes today** — 136 on 2026-09-10 for `net_volume_signed`,
+    /// 152 on 2026-09-19 for the two receipt stamps — pinned by
+    /// `the_state_is_152_bytes_and_every_size_assert_knows_it`.)
     pub total_sell_qty: u32,
     /// Today's SESSION open (the official 09:15 open). Static per trading
     /// day; last non-zero value wins. Feeds `open_pct` at seal.
@@ -156,8 +159,44 @@ pub struct LiveCandleState {
     /// through beside a hot-path change.
     ///
     /// Costs ZERO bytes: it lands in padding the struct already had after its
-    /// three trailing `u32`s (measured — `size_of` is 136 with and without).
+    /// three trailing `u32`s (measured — `size_of` is 152 with and without).
     pub net_volume_classified: bool,
+    /// IST-NAIVE nanoseconds at which the FIRST tick of this bucket was
+    /// RECEIVED by this process. `0` is the "no receipt" sentinel.
+    ///
+    /// # What this measures, and what it must never do
+    ///
+    /// The bar's `ts` is the window open on the EXCHANGE clock, and nothing
+    /// else buckets a tick (`fold_clock_ist_secs` has been the identity on
+    /// `exchange_timestamp` since the 2026-09-18 SECOND directive). These two
+    /// stamps MEASURE receipt against that window; they never BUCKET by it. A
+    /// change that lets either one influence which bar a trade enters is a
+    /// REJECT — that is the whole reason the six delay columns could be added
+    /// without touching the fold clock.
+    ///
+    /// # The frame, in the name
+    ///
+    /// `ParsedTick::received_at_nanos` is UTC; `bucket_start_ist_secs` is
+    /// IST-naive. Storing the raw UTC value here would leave a subtraction
+    /// against the window open that is wrong by 5h30m and looks right, so the
+    /// offset is applied ONCE at the fold site and the field name carries the
+    /// frame — the same convention `close_ts_ist_secs` already uses.
+    ///
+    /// # Min, not first-write
+    ///
+    /// This feed carries no sequence number, so arrival order is arbitrary and
+    /// the tick that OPENS a bucket by exchange time is not necessarily the
+    /// one that arrived earliest. `min` over non-zero values answers "the
+    /// earliest receipt this bucket saw", which is what `open_latency` claims.
+    pub first_receipt_ist_nanos: i64,
+    /// IST-NAIVE nanoseconds at which the LAST tick of this bucket was
+    /// RECEIVED. `0` is the "no receipt" sentinel; `max` over non-zero values,
+    /// for the same arbitrary-arrival reason as [`Self::first_receipt_ist_nanos`].
+    ///
+    /// Deliberately NOT updated by `fold_late_hlc`: that path amends a bar
+    /// already sealed and already written, so moving its receipt stamps would
+    /// change a figure no row will ever carry.
+    pub last_receipt_ist_nanos: i64,
 }
 
 impl LiveCandleState {
@@ -187,6 +226,8 @@ impl LiveCandleState {
             open_pct: 0.0,
             open_gap_pct: 0.0,
             net_volume_classified: false,
+            first_receipt_ist_nanos: 0,
+            last_receipt_ist_nanos: 0,
         }
     }
 
@@ -789,8 +830,9 @@ mod tests {
     /// Their DDL columns were removed 2026-05-28 (spot has no OI, indices have
     /// no volume) and the fields then sat in every bar holding a permanent
     /// `0.0` — 16 bytes per state, multiplied by `TF_COUNT` slots and again by
-    /// `last_sealed`, in a struct pinned at exactly 128 bytes by three separate
-    /// compile-time assertions with zero slack between them.
+    /// `last_sealed`, in a struct pinned at exactly 128 bytes (at the time;
+    /// 152 today) by three separate compile-time assertions with zero slack
+    /// between them.
     ///
     /// Reclaiming those 16 bytes is what pays for `bucket_open_prev_close`
     /// (8) + `total_buy_qty` (4) + `total_sell_qty` (4). This test is the
@@ -798,14 +840,15 @@ mod tests {
     /// struct did not grow, which is the property the assertions downstream
     /// actually depend on.
     #[test]
-    fn the_state_is_136_bytes_and_every_size_assert_knows_it() {
+    fn the_state_is_152_bytes_and_every_size_assert_knows_it() {
         assert_eq!(
             std::mem::size_of::<LiveCandleState>(),
-            136,
-            "LiveCandleState changed size — BufferedSeal (<=152), AggregatorCell \
+            152,
+            "LiveCandleState changed size — BufferedSeal (<=168), AggregatorCell \
              (MAX_AGGREGATOR_CELL_BYTES) and SerializedSeal (SEAL_SPILL_RECORD_SIZE) \
              all assume this figure and every one of them is at zero slack today. \
-             128 -> 136 on 2026-09-10 for `net_volume_signed`; the cost is recorded \
+             128 -> 136 on 2026-09-10 for `net_volume_signed`; 136 -> 152 on \
+             2026-09-19 for the two receipt stamps. Both costs are recorded \
              in aws-budget.md."
         );
     }
@@ -820,9 +863,10 @@ mod tests {
     #[test]
     fn the_classified_marker_costs_nothing() {
         assert_eq!(std::mem::align_of::<LiveCandleState>(), 8);
-        // 11 f64 + 2 u64 + 2 i64 + 3 u32 + 1 bool = 133 bytes of payload,
-        // which is why 136 has room and the flag is free.
-        assert_eq!(std::mem::size_of::<LiveCandleState>(), 136);
+        // 11 f64 + 2 u64 + 4 i64 + 3 u32 + 1 bool = 149 bytes of payload,
+        // which is why 152 has room and the flag is free. (133/136 until the
+        // two receipt stamps landed 2026-09-19 — +16 bytes, same free flag.)
+        assert_eq!(std::mem::size_of::<LiveCandleState>(), 152);
     }
 
     /// The three refusals, each one a real hazard rather than defensive noise.

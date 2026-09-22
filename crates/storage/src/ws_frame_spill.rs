@@ -90,7 +90,7 @@
 //     receipt, and `ts` is the first column of the `ticks` DEDUP key — a
 //     re-stamp splits one observation into two rows in two partitions.
 
-use std::fs::{File, OpenOptions}; // O(1) EXEMPT: import line only — uses are the cold writer thread + boot replay
+use std::fs::{File, Metadata, OpenOptions}; // O(1) EXEMPT: import line only — uses are the cold writer thread + boot replay
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -3679,6 +3679,86 @@ pub struct ArchivePruneOutcome {
     pub size_deleted_oldest_age_secs: u64,
     /// Total bytes remaining in the archive after both passes.
     pub bytes_after: u64,
+    /// Segments past the age window that the AGE pass KEPT because the
+    /// applied watermark has not passed them (or cannot say) — 2026-09-22,
+    /// item 44d. Always zero on `archive/`, whose segments are applied by
+    /// construction.
+    pub age_kept_unapplied: usize,
+    /// Of `size_deleted`, the segments the BYTE pass deleted that were NOT
+    /// known to be applied (2026-09-22, item 44d). Each one is frames no
+    /// replay reached; counted as `tv_wal_pruned_unapplied_total`.
+    pub size_deleted_unapplied: usize,
+    /// Of `size_deleted`, the segments whose applied state could NOT be
+    /// determined (no usable watermark, the kill switch, the newest segment,
+    /// an unreadable successor). Counted apart from `size_deleted_unapplied`
+    /// so an unknown state never raises the PROVEN-loss ERROR (2026-09-22
+    /// hostile review: the kill switch made every byte-pass victim page).
+    pub size_deleted_unknown: usize,
+}
+
+/// Counter: segments the ACTIVE byte-ceiling prune deleted while the applied
+/// watermark had not passed them (2026-09-22, item 44d). Local `/metrics`
+/// only — the same pass already raises the WS-SPILL-01 pressure line.
+pub const WAL_PRUNED_UNAPPLIED_COUNTER: &str = "tv_wal_pruned_unapplied_total";
+
+/// Whether the applied watermark has passed ONE segment, for the prune.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentAppliedState {
+    /// Every frame in the segment's range is below the watermark and in no
+    /// unapplied bucket.
+    Applied,
+    /// The range is known and the watermark does not cover all of it.
+    Unapplied,
+    /// No watermark file, a rejected one, the kill switch, or a segment whose
+    /// range cannot be bounded (newest segment, unreadable first record).
+    Unknown,
+}
+
+/// What the prune does with one segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentPruneDecision {
+    Keep,
+    /// Past the age window AND applied: routine expiry.
+    DeleteAged,
+    /// The byte ceiling is exceeded: the disk-full last resort. `unapplied`
+    /// is true when the segment was not KNOWN to be applied.
+    DeleteForBytes {
+        unapplied: bool,
+    },
+}
+
+/// The per-segment prune rule (2026-09-22, item 44d). Pure and O(1).
+///
+/// The AGE pass deletes only a segment the watermark has passed — an unknown
+/// state keeps, so a missing or corrupt watermark fails closed. The BYTE pass
+/// deletes regardless of state: making it respect the watermark would turn a
+/// pruned backlog into a full disk (scope lock "2026-09-22 (FOURTH)"). It
+/// reports whether the victim was unapplied so the loss is counted.
+const fn segment_prune_decision(
+    aged: bool,
+    state: SegmentAppliedState,
+    byte_cap_exceeded: bool,
+) -> SegmentPruneDecision {
+    let applied = matches!(state, SegmentAppliedState::Applied);
+    if aged && applied {
+        SegmentPruneDecision::DeleteAged
+    } else if byte_cap_exceeded {
+        SegmentPruneDecision::DeleteForBytes {
+            unapplied: !applied,
+        }
+    } else {
+        SegmentPruneDecision::Keep
+    }
+}
+
+/// Where the prune gets each segment's applied state.
+#[derive(Clone, Copy)]
+enum PruneAppliedView<'a> {
+    /// `archive/`: only confirmed-replay segments land there.
+    AllApplied,
+    /// The active directory: judged against the watermark; `None` means no
+    /// usable watermark, so every segment is `Unknown`.
+    Watermark(Option<&'a crate::wal_applied_watermark::AppliedSnapshot>),
 }
 
 /// Pre-allocation hint for the archive prune's survivor list — a typical
@@ -3725,6 +3805,7 @@ pub fn prune_archived_segments_at<P: AsRef<Path>>(
         retention_secs,
         max_bytes,
         now,
+        PruneAppliedView::AllApplied,
     )
 }
 
@@ -3786,14 +3867,78 @@ pub fn prune_archived_segments_at<P: AsRef<Path>>(
 /// that needs either a larger budget (slower boot) or in-session refold of
 /// shed frames (a design change) — neither is a line edit, and pretending the
 /// prune is harmless was the previous way of not saying so.
+///
+/// # 2026-09-22 (item 44d): the AGE pass now consults the applied watermark
+///
+/// `applied` is the watermark snapshot for THIS directory. The age pass
+/// deletes only a segment the watermark has passed; a segment holding any
+/// frame not yet applied (a `RingFull` shed, a failed append or rescue) is
+/// kept past the window, and `None` — no file, a rejected file, the kill
+/// switch — keeps every segment. The BYTE pass is unchanged: it still deletes
+/// oldest-first under pressure, now counting each unapplied victim. So the
+/// "age pass deletes nothing reachable" argument above no longer rests on the
+/// replay budget alone — it rests on the watermark.
 #[must_use]
 pub fn prune_active_segments_at<P: AsRef<Path>>(
     wal_dir: P,
     retention_secs: u64,
     max_bytes: u64,
     now: std::time::SystemTime,
+    applied: Option<&crate::wal_applied_watermark::AppliedSnapshot>,
 ) -> ArchivePruneOutcome {
-    prune_wal_dir_at(wal_dir.as_ref(), retention_secs, max_bytes, now)
+    prune_wal_dir_at(
+        wal_dir.as_ref(),
+        retention_secs,
+        max_bytes,
+        now,
+        PruneAppliedView::Watermark(applied),
+    )
+}
+
+/// The applied state of every segment in `sorted` (file-name order, which is
+/// capture order). A segment's range is `[its first seq, next segment's first
+/// seq - 1]` — the same bound the replay skip uses — so the newest segment, a
+/// segment with an unreadable first record, or a non-increasing pair is
+/// `Unknown`. Cold path: one verified header read per segment, per pass.
+fn segment_applied_states(
+    sorted: &[PathBuf],
+    view: PruneAppliedView<'_>,
+) -> Vec<(SegmentAppliedState, u64, Option<u64>)> {
+    // O(1) EXEMPT: periodic cold prune, one entry per segment
+    match view {
+        PruneAppliedView::AllApplied => sorted
+            .iter()
+            .map(|_| (SegmentAppliedState::Applied, 0, None))
+            .collect(), // APPROVED: cold prune pass
+        PruneAppliedView::Watermark(None) => sorted
+            .iter()
+            .map(|_| (SegmentAppliedState::Unknown, 0, None))
+            .collect(), // APPROVED: cold prune pass
+        PruneAppliedView::Watermark(Some(snap)) => {
+            let firsts: Vec<u64> = sorted
+                .iter()
+                .map(|p| first_frame_seq_in_segment(p))
+                .collect(); // APPROVED: cold prune pass
+            firsts
+                .iter()
+                .enumerate()
+                .map(|(idx, &lo)| {
+                    let hi = firsts.get(idx + 1).and_then(|n| n.checked_sub(1));
+                    let state = match hi {
+                        Some(hi) if lo > 0 && hi >= lo => {
+                            if segment_range_is_applied(snap, lo, hi) {
+                                SegmentAppliedState::Applied
+                            } else {
+                                SegmentAppliedState::Unapplied
+                            }
+                        }
+                        _ => SegmentAppliedState::Unknown,
+                    };
+                    (state, lo, hi)
+                })
+                .collect() // APPROVED: cold prune pass
+        }
+    }
 }
 
 /// The shared age-then-bytes prune, over ONE directory of `*.wal` segments.
@@ -3813,29 +3958,40 @@ fn prune_wal_dir_at(
     retention_secs: u64,
     max_bytes: u64,
     now: std::time::SystemTime,
+    view: PruneAppliedView<'_>,
 ) -> ArchivePruneOutcome {
     let archive_dir = dir.to_path_buf();
     let mut outcome = ArchivePruneOutcome::default();
-    // Segments surviving the age pass, as (mtime, len, path) — the byte
-    // ceiling's candidate set.
-    // Pre-allocated rather than grown from empty, per the banned-pattern
-    // rule. One entry per surviving archive segment; the capacity is a
-    // typical steady-state segment count, so the common case allocates
-    // exactly once. Cold path — one allocation per prune pass, never the
-    // per-frame append.
-    let mut survivors: Vec<(std::time::SystemTime, u64, std::path::PathBuf)> =
+    // Every `*.wal` in the directory, open segment included — the open one
+    // still bounds its predecessor's sequence range (item 44d). One entry per
+    // segment, pre-sized to a typical steady-state count; cold path.
+    let mut segments: Vec<(PathBuf, Option<Metadata>)> =
         Vec::with_capacity(ARCHIVE_PRUNE_SURVIVOR_HINT);
     // O(1) EXEMPT: periodic cold archive prune, never the per-frame append
     let Ok(entries) = std::fs::read_dir(&archive_dir) else {
         return outcome; // missing archive dir — nothing to prune
     };
-    let cutoff = std::time::Duration::from_secs(retention_secs);
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) != Some("wal") {
             outcome.kept += 1; // foreign file — never touched
             continue;
         }
+        segments.push((path, entry.metadata().ok()));
+    }
+    // File-name order == capture order (`ws-frames-{nanos:020}.wal`).
+    segments.sort_by(|a, b| a.0.file_name().cmp(&b.0.file_name())); // O(1) EXEMPT: cold prune pass
+    let sorted_paths: Vec<PathBuf> = segments.iter().map(|(p, _)| p.clone()).collect(); // APPROVED: cold prune pass
+    let states = segment_applied_states(&sorted_paths, view);
+
+    // Segments surviving the age pass — the byte ceiling's candidate set, as
+    // (mtime, len, path, aged, state, first_seq, last_seq).
+    // Pre-allocated rather than grown from empty, per the banned-pattern
+    // rule. Cold path — one allocation per prune pass, never the per-frame
+    // append.
+    let mut survivors: Vec<PruneSurvivor> = Vec::with_capacity(ARCHIVE_PRUNE_SURVIVOR_HINT);
+    let cutoff = std::time::Duration::from_secs(retention_secs);
+    for ((path, meta), &(state, first_seq, last_seq)) in segments.into_iter().zip(states.iter()) {
         // NEVER the segment the writer currently holds open (2026-09-06).
         //
         // This function was extracted for the ARCHIVE directory, where no
@@ -3866,14 +4022,15 @@ fn prune_wal_dir_at(
             outcome.kept += 1;
             continue;
         }
-        let age = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|mtime| now.duration_since(mtime).ok());
-        match age {
+        let mtime = meta.as_ref().and_then(|m| m.modified().ok());
+        // Fresh, unreadable metadata, or a future mtime (clock skew): not
+        // aged — deleting on uncertainty would be the wrong default.
+        let aged = mtime
+            .and_then(|mt| now.duration_since(mt).ok())
+            .is_some_and(|age| age > cutoff);
+        match segment_prune_decision(aged, state, false) {
             // O(1) EXEMPT: periodic cold archive prune, never the per-frame append
-            Some(age) if age > cutoff => match std::fs::remove_file(&path) {
+            SegmentPruneDecision::DeleteAged => match std::fs::remove_file(&path) {
                 Ok(()) => outcome.deleted += 1,
                 Err(err) => {
                     outcome.failed += 1;
@@ -3884,16 +4041,27 @@ fn prune_wal_dir_at(
                     );
                 }
             },
-            // Fresh, unreadable metadata, or a future mtime (clock skew):
-            // keep — deleting on uncertainty would be the wrong default.
-            _ => {
+            SegmentPruneDecision::Keep | SegmentPruneDecision::DeleteForBytes { .. } => {
                 outcome.kept += 1;
+                if aged {
+                    // Past the window, kept only because the watermark has
+                    // not passed it (item 44d).
+                    outcome.age_kept_unapplied += 1;
+                }
                 // Survivor of the age pass — a candidate for the byte
-                // ceiling below. mtime is already read above; reuse it as
-                // the sort key so the ceiling deletes genuinely oldest-first.
-                if let Ok(meta) = entry.metadata() {
-                    let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-                    survivors.push((mtime, meta.len(), path));
+                // ceiling below. mtime is the sort key so the ceiling
+                // deletes genuinely oldest-first. Unreadable metadata is
+                // kept but never a byte candidate (no length to account).
+                if let Some(meta) = meta {
+                    survivors.push(PruneSurvivor {
+                        mtime: mtime.unwrap_or(std::time::UNIX_EPOCH),
+                        len: meta.len(),
+                        path,
+                        aged,
+                        state,
+                        first_seq,
+                        last_seq,
+                    });
                 }
             }
         }
@@ -3905,30 +4073,69 @@ fn prune_wal_dir_at(
     // survivor. Oldest-first because the newest segment is the one a crash
     // triage actually needs.
     //
+    // It deletes UNAPPLIED segments too (item 44d): respecting the watermark
+    // here would turn a pruned backlog into a full disk. Each such victim is
+    // counted and logged by name instead.
+    //
     // Cold path, runs on the periodic prune task — never the per-frame append.
-    let total: u64 = survivors.iter().map(|(_, len, _)| *len).sum();
+    let total: u64 = survivors.iter().map(|s| s.len).sum();
     outcome.bytes_after = total;
     if total > max_bytes {
         // O(1) EXEMPT: periodic cold archive prune, never the per-frame append
-        survivors.sort_by_key(|(mtime, _, _)| *mtime);
+        survivors.sort_by_key(|s| s.mtime);
         let mut remaining = total;
-        for (mtime, len, path) in &survivors {
+        for s in &survivors {
             if remaining <= max_bytes {
                 break;
             }
+            let unapplied = match segment_prune_decision(s.aged, s.state, true) {
+                SegmentPruneDecision::DeleteForBytes { unapplied } => unapplied,
+                SegmentPruneDecision::DeleteAged => false,
+                SegmentPruneDecision::Keep => continue,
+            };
             // O(1) EXEMPT: periodic cold archive prune, never the per-frame append
-            match std::fs::remove_file(path) {
+            match std::fs::remove_file(&s.path) {
                 Ok(()) => {
                     outcome.size_deleted += 1;
-                    outcome.size_deleted_bytes = outcome.size_deleted_bytes.saturating_add(*len);
+                    outcome.size_deleted_bytes = outcome.size_deleted_bytes.saturating_add(s.len);
                     // Oldest-first walk, so the FIRST successful delete is the
                     // oldest one; `max` keeps that true even if an earlier
                     // remove failed and a later one succeeded.
-                    let age_secs = now.duration_since(*mtime).map_or(0, |d| d.as_secs());
+                    let age_secs = now.duration_since(s.mtime).map_or(0, |d| d.as_secs());
                     outcome.size_deleted_oldest_age_secs =
                         outcome.size_deleted_oldest_age_secs.max(age_secs);
                     outcome.kept = outcome.kept.saturating_sub(1);
-                    remaining = remaining.saturating_sub(*len);
+                    if s.aged {
+                        outcome.age_kept_unapplied = outcome.age_kept_unapplied.saturating_sub(1);
+                    }
+                    remaining = remaining.saturating_sub(s.len);
+                    if unapplied && s.state == SegmentAppliedState::Unknown {
+                        outcome.size_deleted_unknown += 1;
+                        warn!(
+                            source = "active_segment_pruned_unknown",
+                            segment = %s.path.display(),
+                            first_frame_seq = s.first_seq,
+                            bytes = s.len,
+                            "WAL byte-ceiling prune deleted a segment whose applied state is \
+                             UNKNOWN (no usable watermark, or no readable successor). Not \
+                             proven lost; counted apart from the unapplied count."
+                        );
+                    } else if unapplied {
+                        outcome.size_deleted_unapplied += 1;
+                        error!(
+                            code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+                            source = "active_segment_pruned_unapplied",
+                            segment = %s.path.display(),
+                            first_frame_seq = s.first_seq,
+                            last_frame_seq = ?s.last_seq,
+                            applied_state = ?s.state,
+                            bytes = s.len,
+                            "WAL byte-ceiling prune deleted a segment the applied watermark had \
+                             NOT passed — frames in it were never replayed and are now gone. \
+                             Disk pressure outranked the backlog; counted as \
+                             tv_wal_pruned_unapplied_total."
+                        );
+                    }
                 }
                 Err(err) => {
                     outcome.failed += 1;
@@ -3945,9 +4152,9 @@ fn prune_wal_dir_at(
                     // ceiling for one pass, which the next pass corrects. The
                     // failure is still counted and logged, so a permanently
                     // un-deletable file is visible rather than absorbed.
-                    remaining = remaining.saturating_sub(*len);
+                    remaining = remaining.saturating_sub(s.len);
                     warn!(
-                        path = %path.display(),
+                        path = %s.path.display(),
                         error = %err,
                         "WAL archive byte-ceiling prune: remove_file failed — \
                          counted against the budget so the pass cannot \
@@ -3959,6 +4166,8 @@ fn prune_wal_dir_at(
         outcome.bytes_after = remaining;
         warn!(
             deleted = outcome.size_deleted,
+            deleted_unapplied = outcome.size_deleted_unapplied,
+            deleted_unknown = outcome.size_deleted_unknown,
             bytes_before = total,
             bytes_after = remaining,
             max_bytes,
@@ -3968,6 +4177,17 @@ fn prune_wal_dir_at(
         );
     }
     outcome
+}
+
+/// One age-pass survivor, carried into the byte pass.
+struct PruneSurvivor {
+    mtime: std::time::SystemTime,
+    len: u64,
+    path: PathBuf,
+    aged: bool,
+    state: SegmentAppliedState,
+    first_seq: u64,
+    last_seq: Option<u64>,
 }
 
 /// Wall-clock wrapper over [`prune_archived_segments_at`]. Cold path —
@@ -4006,12 +4226,38 @@ pub fn prune_active_segments<P: AsRef<Path>>(
     retention_secs: u64,
     max_bytes: u64,
 ) -> ArchivePruneOutcome {
+    let wal_dir = wal_dir.as_ref();
+    // Item 44d (2026-09-22): the age pass needs the applied watermark. Read
+    // from disk (the file the next boot's replay trusts), under the same kill
+    // switch as the replay skip. Absent, rejected or switched off => `None`,
+    // and the age pass keeps every segment — fail closed.
+    let applied = if applied_skip_enabled() {
+        crate::wal_applied_watermark::AppliedSnapshot::load(wal_dir)
+    } else {
+        None
+    };
     let outcome = prune_active_segments_at(
         wal_dir,
         retention_secs,
         max_bytes,
         std::time::SystemTime::now(),
+        applied.as_ref(),
     );
+    // Unconditional, possibly zero: creates the series on the first pass so
+    // the first real unapplied deletion is not swallowed as a baseline.
+    // APPROVED: cast — a per-pass segment count, always <= u64.
+    metrics::counter!(WAL_PRUNED_UNAPPLIED_COUNTER)
+        .increment(outcome.size_deleted_unapplied as u64);
+    if outcome.age_kept_unapplied > 0 {
+        info!(
+            age_kept_unapplied = outcome.age_kept_unapplied,
+            watermark_loaded = applied.is_some(),
+            retention_secs,
+            "WAL ACTIVE prune kept segments past the age window because the applied \
+             watermark has not passed them (or no usable watermark exists). Only the \
+             byte ceiling may remove them."
+        );
+    }
     if outcome.deleted > 0 || outcome.failed > 0 || outcome.size_deleted > 0 {
         metrics::counter!("tv_ws_wal_active_pruned_total")
             .increment((outcome.deleted + outcome.size_deleted) as u64);
@@ -4045,6 +4291,8 @@ pub fn prune_active_segments<P: AsRef<Path>>(
                 code = ErrorCode::WsSpill01WriterRespawn.code_str(),
                 source = "active_segment_pruned_under_pressure",
                 segments_deleted = outcome.size_deleted,
+                segments_unapplied = outcome.size_deleted_unapplied,
+                segments_unknown = outcome.size_deleted_unknown,
                 bytes_freed = outcome.size_deleted_bytes,
                 oldest_segment_age_secs = outcome.size_deleted_oldest_age_secs,
                 max_bytes,
@@ -6967,11 +7215,17 @@ mod tests {
         // never replayed, never confirmed, never archived, and eligible for no
         // bound. Measured on the prod box: 244 files, 31 GB, oldest from the
         // previous day, volume 94% full.
+        //
+        // 2026-09-22 (item 44d): the stale segment is a REAL applied one — the
+        // age pass now deletes only what the applied watermark has passed.
         let dir = tmp_dir("active-prune-age");
         let now = SystemTime::now();
-        let stale = plant_active_file(&dir, "ws-frames-00000000000000000010.wal", now, 259_200);
-        let todays = plant_active_file(&dir, "ws-frames-00000000000000000011.wal", now, 600);
-        let outcome = prune_active_segments_at(&dir, 172_800, u64::MAX, now);
+        let stale = write_wm_segment(&dir, 0, 3, WalEndpoint::MainFeed);
+        backdate(&stale, now, 259_200);
+        let todays = write_wm_segment(&dir, 100, 3, WalEndpoint::MainFeed);
+        backdate(&todays, now, 600);
+        let snap = all_applied_through(wm_seq(200));
+        let outcome = prune_active_segments_at(&dir, 172_800, u64::MAX, now, Some(&snap));
         assert_eq!(outcome.deleted, 1);
         assert!(!stale.exists(), "a segment older than retention must go");
         assert!(
@@ -7001,13 +7255,18 @@ mod tests {
 
         // BOTH passes, because they select different victims: the age pass
         // takes anything past retention, the byte pass takes oldest-first.
-        // The open segment is planted OLD so it is eligible for both.
-        let open = plant_active_file(&dir, "ws-frames-00000000000000000030.wal", now, 259_200);
-        let closed = plant_active_file(&dir, "ws-frames-00000000000000000031.wal", now, 259_200);
+        // The open segment is planted OLD so it is eligible for both. It is the
+        // NEWEST by name (as the writer's segment always is), so it bounds the
+        // closed one's range and the closed one reads as applied (item 44d).
+        let closed = write_wm_segment(&dir, 0, 3, WalEndpoint::MainFeed);
+        backdate(&closed, now, 259_200);
+        let open = write_wm_segment(&dir, 100, 3, WalEndpoint::MainFeed);
+        backdate(&open, now, 259_200);
         set_open_segment(open.clone());
+        let snap = all_applied_through(wm_seq(500));
 
         // Age pass: retention would delete both.
-        let outcome = prune_active_segments_at(&dir, 172_800, u64::MAX, now);
+        let outcome = prune_active_segments_at(&dir, 172_800, u64::MAX, now, Some(&snap));
         assert!(
             open.exists(),
             "the AGE pass unlinked the open segment -- every frame written \
@@ -7021,7 +7280,7 @@ mod tests {
         assert_eq!(outcome.deleted, 1);
 
         // Byte pass: a zero ceiling would delete everything left.
-        let outcome = prune_active_segments_at(&dir, u64::MAX, 0, now);
+        let outcome = prune_active_segments_at(&dir, u64::MAX, 0, now, None);
         assert!(
             open.exists(),
             "the BYTE pass unlinked the open segment. It deletes oldest-first, \
@@ -7059,6 +7318,7 @@ mod tests {
             tickvault_common::constants::WS_WAL_ACTIVE_RETENTION_SECS,
             u64::MAX,
             now,
+            None,
         );
         assert_eq!(outcome.deleted, 0);
         assert!(recent.exists());
@@ -7079,7 +7339,7 @@ mod tests {
         std::fs::create_dir_all(&staging).unwrap();
         let staged =
             plant_active_file(&staging, "ws-frames-00000000000000000031.wal", now, 999_999);
-        let outcome = prune_active_segments_at(&dir, 172_800, u64::MAX, now);
+        let outcome = prune_active_segments_at(&dir, 172_800, u64::MAX, now, None);
         assert_eq!(outcome.deleted, 0, "nothing in the ROOT to delete");
         assert!(archived.exists(), "archive/ has its own bounds");
         assert!(
@@ -7102,7 +7362,7 @@ mod tests {
         let oldest = plant_active_file(&dir, "ws-frames-00000000000000000040.wal", now, 10_800);
         let middle = plant_active_file(&dir, "ws-frames-00000000000000000041.wal", now, 7_200);
         let newest = plant_active_file(&dir, "ws-frames-00000000000000000042.wal", now, 3_600);
-        let outcome = prune_active_segments_at(&dir, 172_800, 20, now);
+        let outcome = prune_active_segments_at(&dir, 172_800, 20, now, None);
         assert_eq!(outcome.deleted, 0, "nothing is age-expired");
         assert_eq!(outcome.size_deleted, 2, "two oldest removed by the ceiling");
         assert_eq!(outcome.size_deleted_bytes, 26, "13 B x 2 segments freed");
@@ -7114,7 +7374,7 @@ mod tests {
         assert!(newest.exists(), "the newest survives");
         // A pass that deletes nothing under pressure reports zeros, so the
         // page can never carry a stale number from a previous pass.
-        let quiet = prune_active_segments_at(&dir, 172_800, u64::MAX, now);
+        let quiet = prune_active_segments_at(&dir, 172_800, u64::MAX, now, None);
         assert_eq!(quiet.size_deleted, 0);
         assert_eq!(quiet.size_deleted_bytes, 0);
         assert_eq!(quiet.size_deleted_oldest_age_secs, 0);
@@ -8142,6 +8402,222 @@ mod tests {
     fn replay_unguarded(dir: &Path) -> WalReplayBatch {
         replay_all_with_report_guarded(dir, usize::MAX, || None, None, WAL_REPLAY_RSS_STOP_PCT)
             .expect("replay")
+    }
+
+    // -----------------------------------------------------------------------
+    // Item 44d (2026-09-22): the WAL AGE prune respects the applied watermark
+    // -----------------------------------------------------------------------
+
+    /// Sets a file's mtime to `age_secs` before `now`.
+    fn backdate(path: &Path, now: SystemTime, age_secs: u64) {
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(now - Duration::from_secs(age_secs)))
+            .unwrap();
+    }
+
+    /// A watermark with both sinks acked through `hwm` and no unapplied bucket.
+    fn all_applied_through(hwm: u64) -> crate::wal_applied_watermark::AppliedSnapshot {
+        crate::wal_applied_watermark::AppliedSnapshot {
+            hwm_ticks: hwm,
+            hwm_depth: hwm,
+            ..Default::default()
+        }
+    }
+
+    /// Marks the bucket holding `seq` as captured-but-unapplied.
+    fn mark_unapplied(snap: &mut crate::wal_applied_watermark::AppliedSnapshot, seq: u64) {
+        use crate::wal_applied_watermark::{UNAPPLIED_BUCKET_SHIFT, UNAPPLIED_BUCKETS};
+        let id = seq >> UNAPPLIED_BUCKET_SHIFT;
+        snap.buckets[(id % UNAPPLIED_BUCKETS as u64) as usize] = (id, 1);
+    }
+
+    const ALL_STATES: [SegmentAppliedState; 3] = [
+        SegmentAppliedState::Applied,
+        SegmentAppliedState::Unapplied,
+        SegmentAppliedState::Unknown,
+    ];
+
+    /// The full permutation grid: (aged, state, byte cap exceeded).
+    #[test]
+    fn segment_prune_decision_over_the_full_grid() {
+        use SegmentAppliedState::{Applied, Unapplied, Unknown};
+        use SegmentPruneDecision::{DeleteAged, DeleteForBytes, Keep};
+        let grid = [
+            // aged, state, bytes -> decision
+            (false, Applied, false, Keep),
+            (false, Unapplied, false, Keep),
+            (false, Unknown, false, Keep),
+            (true, Applied, false, DeleteAged),
+            (true, Unapplied, false, Keep),
+            (true, Unknown, false, Keep),
+            (false, Applied, true, DeleteForBytes { unapplied: false }),
+            (false, Unapplied, true, DeleteForBytes { unapplied: true }),
+            (false, Unknown, true, DeleteForBytes { unapplied: true }),
+            (true, Applied, true, DeleteAged),
+            (true, Unapplied, true, DeleteForBytes { unapplied: true }),
+            (true, Unknown, true, DeleteForBytes { unapplied: true }),
+        ];
+        for (aged, state, bytes, want) in grid {
+            assert_eq!(
+                segment_prune_decision(aged, state, bytes),
+                want,
+                "aged={aged} state={state:?} bytes_exceeded={bytes}"
+            );
+        }
+    }
+
+    proptest::proptest! {
+        /// The invariants, over every input: the age pass (no byte pressure)
+        /// deletes ONLY an aged, applied segment; the byte pass deletes under
+        /// pressure whatever the state, and flags exactly the non-applied ones.
+        #[test]
+        fn segment_prune_decision_invariants(aged in proptest::bool::ANY, s in 0usize..3, bytes in proptest::bool::ANY) {
+            let state = ALL_STATES[s];
+            let applied = state == SegmentAppliedState::Applied;
+            let d = segment_prune_decision(aged, state, bytes);
+            match d {
+                SegmentPruneDecision::DeleteAged => proptest::prop_assert!(aged && applied),
+                SegmentPruneDecision::DeleteForBytes { unapplied } => {
+                    proptest::prop_assert!(bytes);
+                    proptest::prop_assert!(!(aged && applied));
+                    proptest::prop_assert_eq!(unapplied, !applied);
+                }
+                SegmentPruneDecision::Keep => proptest::prop_assert!(!(bytes || (aged && applied))),
+            }
+            if !bytes && !applied {
+                proptest::prop_assert_eq!(d, SegmentPruneDecision::Keep);
+            }
+        }
+    }
+
+    /// Four OLD segments: A applied, B holds an unapplied bucket, C applied,
+    /// D newest (no upper bound => unknown). The age pass removes A and C
+    /// only; the byte pass then removes the rest oldest-first and counts the
+    /// two that were not known applied.
+    #[test]
+    fn the_age_prune_keeps_unapplied_segments_and_the_byte_prune_counts_them() {
+        let dir = tmp_dir("wm-prune-mixed");
+        let now = SystemTime::now();
+        let a = write_wm_segment(&dir, 0, 3, WalEndpoint::MainFeed);
+        let b = write_wm_segment(&dir, 1_000, 3, WalEndpoint::Depth20);
+        let c = write_wm_segment(&dir, 2_000, 3, WalEndpoint::MainFeed);
+        let d = write_wm_segment(&dir, 3_000, 3, WalEndpoint::MainFeed);
+        for (p, age) in [(&a, 400_000), (&b, 390_000), (&c, 380_000), (&d, 370_000)] {
+            backdate(p, now, age);
+        }
+        let mut snap = all_applied_through(wm_seq(3_500));
+        mark_unapplied(&mut snap, wm_seq(1_500)); // inside B's range only
+
+        let age = prune_active_segments_at(&dir, 172_800, u64::MAX, now, Some(&snap));
+        assert_eq!(age.deleted, 2, "only the two applied segments expire");
+        assert!(!a.exists() && !c.exists());
+        assert!(
+            b.exists(),
+            "B holds an unapplied frame: the age pass must keep it"
+        );
+        assert!(d.exists(), "D's range is unbounded: unknown, so kept");
+        assert_eq!(age.age_kept_unapplied, 2);
+        assert_eq!(age.size_deleted, 0);
+
+        let bytes = prune_active_segments_at(&dir, 172_800, 0, now, Some(&snap));
+        assert_eq!(bytes.size_deleted, 2, "the byte ceiling still reaches them");
+        assert_eq!(bytes.size_deleted_unapplied, 1, "B is PROVEN unapplied");
+        assert_eq!(
+            bytes.size_deleted_unknown, 1,
+            "D is unknown, counted apart so it never raises the proven-loss ERROR"
+        );
+        assert_eq!(bytes.age_kept_unapplied, 0, "nothing aged is left kept");
+        assert!(!b.exists() && !d.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The byte pass on applied segments deletes without counting a loss, and
+    /// takes the oldest first.
+    #[test]
+    fn the_byte_prune_on_applied_segments_counts_no_unapplied_loss() {
+        let dir = tmp_dir("wm-prune-bytes-applied");
+        let now = SystemTime::now();
+        let a = write_wm_segment(&dir, 0, 3, WalEndpoint::MainFeed);
+        let b = write_wm_segment(&dir, 1_000, 3, WalEndpoint::MainFeed);
+        let c = write_wm_segment(&dir, 2_000, 3, WalEndpoint::MainFeed);
+        backdate(&a, now, 300);
+        backdate(&b, now, 200);
+        backdate(&c, now, 100);
+        let snap = all_applied_through(wm_seq(5_000));
+        let one = std::fs::metadata(&c).unwrap().len();
+        let out = prune_active_segments_at(&dir, 172_800, one, now, Some(&snap));
+        assert_eq!(out.deleted, 0, "nothing is past the age window");
+        assert_eq!(out.size_deleted, 2);
+        assert_eq!(out.size_deleted_unapplied, 0, "a and b were applied");
+        assert!(!a.exists() && !b.exists() && c.exists(), "oldest-first");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No usable watermark — absent (`None`), corrupt, or foreign — fails
+    /// closed: the age pass keeps every segment, however old.
+    #[test]
+    fn a_missing_or_corrupt_watermark_keeps_everything_by_age() {
+        let dir = tmp_dir("wm-prune-missing");
+        let now = SystemTime::now();
+        let a = write_wm_segment(&dir, 0, 3, WalEndpoint::MainFeed);
+        let b = write_wm_segment(&dir, 1_000, 3, WalEndpoint::MainFeed);
+        let c = write_wm_segment(&dir, 2_000, 3, WalEndpoint::MainFeed);
+        for p in [&a, &b, &c] {
+            backdate(p, now, 400_000);
+        }
+        let none = prune_active_segments_at(&dir, 172_800, u64::MAX, now, None);
+        assert_eq!(none.deleted, 0);
+        assert_eq!(none.age_kept_unapplied, 3);
+
+        // Corrupt file on disk, through the production wrapper (which loads it).
+        std::fs::write(
+            dir.join(crate::wal_applied_watermark::APPLIED_WATERMARK_FILE),
+            b"not a watermark",
+        )
+        .unwrap();
+        let corrupt = prune_active_segments(&dir, 172_800, u64::MAX);
+        assert_eq!(
+            corrupt.deleted, 0,
+            "a rejected watermark must keep everything"
+        );
+        assert!(a.exists() && b.exists() && c.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Non-vacuous twin of the above: the production wrapper DOES load a valid
+    /// watermark from disk and lets the age pass expire applied segments.
+    #[test]
+    fn the_production_wrapper_loads_the_watermark_and_expires_applied_segments() {
+        let dir = tmp_dir("wm-prune-wrapper");
+        let now = SystemTime::now();
+        let a = write_wm_segment(&dir, 0, 3, WalEndpoint::MainFeed);
+        let b = write_wm_segment(&dir, 1_000, 3, WalEndpoint::MainFeed);
+        backdate(&a, now, 400_000);
+        backdate(&b, now, 400_000);
+        write_wm_watermark(&dir, &all_applied_through(wm_seq(5_000)));
+        let out = prune_active_segments(&dir, 172_800, u64::MAX);
+        assert_eq!(
+            out.deleted, 1,
+            "a is applied and aged; b is the newest (unknown)"
+        );
+        assert!(!a.exists() && b.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `archive/` segments are applied by construction: the watermark is not
+    /// consulted and the byte pass never counts an unapplied loss there.
+    #[test]
+    fn the_archive_prune_never_reports_unapplied_losses() {
+        let dir = tmp_dir("wm-prune-archive");
+        let now = SystemTime::now();
+        plant_archive_file(&dir, "ws-frames-00000000000000000001.wal", now, 400_000);
+        plant_archive_file(&dir, "ws-frames-00000000000000000002.wal", now, 100);
+        let out = prune_archived_segments_at(&dir, 172_800, 0, now);
+        assert_eq!(out.deleted, 1);
+        assert_eq!(out.size_deleted, 1);
+        assert_eq!(out.size_deleted_unapplied, 0);
+        assert_eq!(out.age_kept_unapplied, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// BITE-PROOF of the whole change: three segments, every frame acked on

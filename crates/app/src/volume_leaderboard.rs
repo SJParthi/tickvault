@@ -306,39 +306,6 @@ pub struct RankedContract {
     /// number actually divided by and would make the stored row a plausible
     /// lie rather than a record.
     pub lot_size: u32,
-    /// UTC epoch nanoseconds of the FIRST accepted tick in the window that
-    /// just closed, or `0` when none is known.
-    ///
-    /// **Written by [`VolumeLeaderboard::rank`], ignored by
-    /// [`VolumeLeaderboard::observe`]** — the same rank-output contract as
-    /// `delta_units` above. `observe` takes the receipt as its own argument
-    /// and stores it on `Tracked`; a value set on this field on the way IN is
-    /// overwritten.
-    ///
-    /// The clock is the RECEIPT clock (`ParsedTick::received_at_nanos`), which
-    /// is UTC epoch nanos back-dated by ring dwell — NOT the exchange stamp,
-    /// and NOT the IST-naive grid the row is stamped on. Anything comparing it
-    /// against a window boundary must convert; see
-    /// `top_volume_snapshot::project_snapshot`.
-    ///
-    /// `0` is the documented "no receipt" sentinel (`WAL_RECEIPT_UNKNOWN_NANOS`
-    /// — a pre-`TVW3` WAL frame carries no receipt clock at all), so it is
-    /// never rendered as a delay of zero. Both halves of every delay pair go
-    /// NULL together on it.
-    pub first_receipt_nanos: i64,
-    /// UTC epoch nanoseconds of the LAST accepted tick in the window that just
-    /// closed, or `0` when none is known.
-    ///
-    /// Also a rank output, on the same terms as `first_receipt_nanos`.
-    ///
-    /// # Why ONE value and not one per cadence
-    ///
-    /// A cadence's window CLOSES at the sweep, so "the last tick received in
-    /// this window" is the last tick received, full stop — the same physical
-    /// tick for whichever cadence is sweeping. Only the window's OPEN differs
-    /// between cadences, which is why `first_receipt_nanos` is stored per
-    /// window on `Tracked` and this one is not.
-    pub last_receipt_nanos: i64,
 }
 
 /// What happened to one observation.
@@ -505,22 +472,6 @@ struct Tracked {
     /// of the session. That is inert, not a gate: every arm below reads it
     /// only to compare, never to refuse.
     resync_ceiling: u32,
-    /// UTC epoch nanos of the FIRST accepted tick since this window's last
-    /// sweep, PER CADENCE. `0` = none since the sweep.
-    ///
-    /// Per window for the same reason the baseline is: the four boards measure
-    /// different intervals, so "the first tick in this window" is a different
-    /// tick for each of them. Set only where the dirty bit was CLEAR — the one
-    /// place that is provably the window's first accepted tick — and cleared
-    /// by the sweep that consumes it, in lockstep with the bit.
-    first_receipt_nanos: [i64; WINDOW_COUNT],
-    /// UTC epoch nanos of the most recent accepted tick, shared by every
-    /// cadence. `0` = none yet.
-    ///
-    /// ONE value, not `WINDOW_COUNT`: a window closes AT the sweep, so its
-    /// last tick is the last tick, whichever cadence is asking. See
-    /// `RankedContract::last_receipt_nanos`.
-    last_receipt_nanos: i64,
 }
 
 /// Distinct snapshot cadences, and therefore baselines per contract.
@@ -594,24 +545,25 @@ const _: () = assert!(
 /// survive contact with the container is exactly the shape this file's header
 /// keeps recording.
 ///
-/// ⚠ RAISED 64 → 128 on 2026-09-19, and the number is DERIVED, not guessed.
+/// ⚠ RAISED 64 → 128 on 2026-09-19 for the three delay pairs, then
+/// LOWERED 128 → 64 the same afternoon when they left. Both are MEASURED.
 ///
-/// The three delay pairs (the 2026-09-19 §19 §4 contract) need, per contract:
-/// the first accepted receipt of each cadence's open window
-/// (`[i64; WINDOW_COUNT]` = 32 B) and the most recent accepted receipt (8 B,
-/// shared — a window closes AT the sweep, so its last tick is the last tick).
-/// `RankedContract` carries the same two as rank OUTPUTS (16 B). 64 + 56 = 120,
-/// padded to 128 by the `i64` alignment.
+/// The pairs needed, per contract, the first accepted receipt of each
+/// cadence's open window (`[i64; WINDOW_COUNT]` = 32 B) and the most recent
+/// accepted receipt (8 B, shared — a window closes AT the sweep, so its last
+/// tick is the last tick); `RankedContract` carried the same two as rank
+/// OUTPUTS. Their sole reader was the `top_volume` delay columns, and the
+/// operator moved those onto `candles_<tf>`, so the stamps became write-only
+/// per-tick work on the frame drain — a store and a bit test producing a
+/// number nothing read. They were removed with the columns.
 ///
-/// What that costs, measured against the figure this file already records: the
-/// map was ~4 MB per family at 25,000 entries, and 64 B more per entry is
-/// **+1.6 MB** — on a 32 GiB host, for the only surface that can answer "how
-/// long after the window opened did the first trade reach us". The operator's
-/// standing instruction on this trade is "forget memory and size"; it is
-/// recorded here anyway, because a size ratchet raised without its arithmetic
-/// on the record is one that will be raised again without it.
+/// `size_of::<Tracked>()` measures **64** again, so the +1.6 MB per family the
+/// raise cost is handed back in full and the `resync_ceiling` field above is
+/// once more free in the tail padding. Measured by a throwaway
+/// `assert_eq!(size_of::<Tracked>(), 0)` and reading the panic, never counted
+/// — the same rule the ILP width constants carry.
 const _: () = assert!(
-    size_of::<Tracked>() <= 128,
+    size_of::<Tracked>() <= 64,
     "Tracked is stored 25,000 times per family; growth here is multiplied by \
      that. Decide deliberately before raising this. (NOT a cache-line bound — \
      hashbrown stores the 16-byte key inline beside it, so an entry is already \
@@ -903,26 +855,7 @@ impl VolumeLeaderboard {
     ///
     /// One hash lookup and one comparison. No heap, no threshold, no
     /// allocation.
-    /// Records one accepted tick against the ranking board.
-    ///
-    /// `received_at_nanos` is `ParsedTick::received_at_nanos` — the RECEIPT
-    /// clock in UTC epoch nanos — and it is the only input the three delay
-    /// pairs have. `0` is the documented "no receipt" sentinel (a pre-`TVW3`
-    /// WAL frame carries no receipt clock), and it is stored as-is rather than
-    /// substituted: a zero must stay distinguishable from a real instant so
-    /// the rendered delay goes BLANK instead of claiming the fastest possible
-    /// delivery for a frame whose delivery time is unknown.
-    ///
-    /// It is deliberately NOT part of the monotonicity decision: a receipt is
-    /// evidence about the network, never about the vendor's counter, and
-    /// letting it gate an advance would put a clock fault in the path of a
-    /// real trade.
-    pub fn observe(
-        &mut self,
-        contract: RankedContract,
-        family: OptionFamily,
-        received_at_nanos: i64,
-    ) -> Observation {
+    pub fn observe(&mut self, contract: RankedContract, family: OptionFamily) -> Observation {
         // Zero is the pre-open state of every contract, and ranking an
         // all-zero field would make the depth set "whichever 250 ticked
         // first" — arbitrary, and then a total turnover at the bell. Excluded
@@ -989,17 +922,6 @@ impl VolumeLeaderboard {
                         // leave a trap that a legitimate later climb trips,
                         // silently eating a real window.
                         resync_ceiling: stored,
-                        // RESEEDED to nothing, in lockstep with the baseline
-                        // one field up and for the same reason: the re-latch
-                        // declares the stored series garbage, and a first
-                        // receipt measured against a window whose baseline was
-                        // just thrown away would time a window that no longer
-                        // exists. The mask is PRESERVED (see `dirty` above), so
-                        // the next sweep visits this contract and reports a
-                        // delta of 0 with both delays BLANK -- which is the
-                        // honest pair for a window that measured nothing.
-                        first_receipt_nanos: [0; WINDOW_COUNT],
-                        last_receipt_nanos: received_at_nanos,
                     };
                     slot.relatched = slot.relatched.saturating_add(1);
                     let relatched_total = slot.relatched;
@@ -1204,38 +1126,7 @@ impl VolumeLeaderboard {
                 // conclude the ceiling is never carried, when in fact this line
                 // is exactly what carries the zeroed ceiling forward.
                 resync_ceiling: existing.resync_ceiling,
-                // CARRIED FORWARD. The per-window firsts are the property of
-                // the windows currently open, and an advance does not close
-                // one -- the sweep does. They are set below, only where a
-                // dirty bit was CLEAR, which is exactly the window's first
-                // accepted tick.
-                first_receipt_nanos: existing.first_receipt_nanos,
-                // OVERWRITTEN with this tick: "last accepted" is what it says,
-                // and this is the accepted advance. A `0` here is a frame with
-                // no receipt clock and is stored rather than skipped, so the
-                // delay renders BLANK instead of claiming an instant delivery.
-                last_receipt_nanos: received_at_nanos,
             };
-            // THE WINDOW-OPEN STAMP, and the guard is the whole correctness
-            // argument: a bit that was CLEAR means the sweep has consumed
-            // everything before it, so THIS tick is the first accepted tick of
-            // that window. A bit already set means the window opened earlier
-            // and its first receipt must not be overwritten -- doing so would
-            // make `open_latency` report the delay to the LATEST tick and
-            // `window_span` collapse toward zero on the busiest contracts,
-            // which is the exact inversion of what both columns are for.
-            //
-            // Guarded on the whole mask first, like the work-list push below:
-            // a liquid strike is already marked in every window on the
-            // overwhelming majority of its ticks, so the common case is one
-            // `u8` compare and no loop.
-            if was_dirty != ALL_WINDOWS_DIRTY {
-                for window in 0..WINDOW_COUNT {
-                    if was_dirty & (1u8 << window) == 0 {
-                        existing.first_receipt_nanos[window] = received_at_nanos;
-                    }
-                }
-            }
             // THE ONLY SITE THAT ADDS WORK. `existing` borrows `volumes` and
             // the lists sit beside it on the same struct, so the mask is
             // copied out above and the borrow ends here before the push.
@@ -1348,13 +1239,6 @@ impl VolumeLeaderboard {
                 dirty: 0,
                 // No ceiling is armed: this contract has never re-latched.
                 resync_ceiling: 0,
-                // A contract this process has never seen has no window open
-                // for it yet, so there is no first receipt to record and
-                // nothing to measure a span from. Both stay at the `0`
-                // sentinel until its first accepted ADVANCE, which is also
-                // the first instant its dirty bit is set.
-                first_receipt_nanos: [0; WINDOW_COUNT],
-                last_receipt_nanos: 0,
             },
         );
         Observation::Accepted
@@ -1441,11 +1325,6 @@ impl VolumeLeaderboard {
             };
             tracked.dirty &= !(1u8 << idx);
             tracked.baseline[idx] = tracked.contract.volume;
-            // Cleared with the bit, in lockstep. A first-receipt stamp is
-            // meaningful only against the baseline it was taken beside; this
-            // path throws the baseline away, so keeping the stamp would time a
-            // window whose start no longer exists.
-            tracked.first_receipt_nanos[idx] = 0;
         }
         // Drained, so this hands the CAPACITY back, not the contents.
         slot.dirty[idx] = pending;
@@ -1536,26 +1415,6 @@ impl VolumeLeaderboard {
                 .volume
                 .saturating_sub(tracked.baseline[idx]);
             tracked.baseline[idx] = tracked.contract.volume;
-            // CONSUMED AND CLEARED, in the same pass that clears the bit and
-            // rolls the baseline -- the three are one window boundary and
-            // splitting them would let the next window inherit this one's
-            // open stamp.
-            //
-            // Read into the row BEFORE the clear, and read `last_receipt_nanos`
-            // WITHOUT clearing it: "last accepted" is a property of the
-            // contract, not of the window, and zeroing it here would make the
-            // next window's close latency unmeasurable until the contract
-            // traded twice.
-            //
-            // Both are copied onto `row` even on the paths that `continue`
-            // below (a missing lot size, a zero-lot window). That is
-            // deliberate: `row` is discarded there, and the clear has already
-            // happened above, so a skipped contract still starts its next
-            // window cleanly.
-            let first_receipt_nanos = tracked.first_receipt_nanos[idx];
-            let last_receipt_nanos = tracked.last_receipt_nanos;
-            tracked.first_receipt_nanos[idx] = 0;
-
             let mut row = tracked.contract;
             // A missing lot size cannot reach here through production — the
             // join refuses it — so this is the defensive arm, and it SKIPS
@@ -1647,7 +1506,7 @@ impl VolumeLeaderboard {
                         delta_units = delta,
                         lot_size = lot,
                         zero_lot_total,
-                        "volume_leaderboard: a contract that TRADED in this window ranked zero milli-lots and was left off the board. Rare by design. If this is sustained and concentrated on large lot sizes, the ranking key's unit premise is wrong -- settle it on a live box with: SELECT delta_units, lot_size FROM top_volume WHERE tf='1s' LIMIT 50. delta_units a multiple of lot_size means volume arrives in LOTS and the key is inverted; unrelated small values mean the premise holds."
+                        "volume_leaderboard: a contract that TRADED in this window ranked zero milli-lots and was left off the board. Rare by design. If this is sustained and concentrated on large lot sizes, the ranking key's unit premise is wrong -- settle it on a live box with: SELECT per_lot_quantity, total_lots_traded FROM top_volume_1s LIMIT 50. total_lots_traded clustering near 1000 (one lot) on the LARGEST per_lot_quantity values means volume arrives in LOTS and the key is inverted; values unrelated to lot size mean the premise holds. NOTE: the direct check -- the raw traded-unit count against the lot size -- is no longer storable, because the traded-unit column was removed from this table on 2026-09-19; this is the strongest test the surviving columns support."
                     );
                 }
                 continue;
@@ -1659,12 +1518,6 @@ impl VolumeLeaderboard {
             // not re-derived, which could drift from what was ranked.
             row.delta_units = delta;
             row.lot_size = lot;
-            // The window boundary stamps, carried onto the row from the values
-            // read and cleared at the top of this iteration. They are the ONLY
-            // inputs the three delay pairs have, and neither is re-derived
-            // here: a second read after the clear would return 0.
-            row.first_receipt_nanos = first_receipt_nanos;
-            row.last_receipt_nanos = last_receipt_nanos;
             if eligible(&row) {
                 scratch.push(row);
             }
@@ -2167,21 +2020,23 @@ pub const MAX_PLAUSIBLE_GAIN_PCT: f64 = 1_000.0;
 mod tests {
     use super::*;
 
-    /// `observe` with NO receipt clock, for the ~100 tests that predate the
-    /// delay pairs and are about the ranking rather than about latency.
+    /// Calls `observe`, taking the leaderboard as its first argument.
     ///
-    /// `0` is `WAL_RECEIPT_UNKNOWN_NANOS` — the documented "this frame carries
-    /// no receipt" sentinel — so these tests exercise exactly the pre-2026-09-19
-    /// behaviour: both halves of every delay pair stay NULL. Named rather than
-    /// passed inline at every call site so a reader can see at a glance which
-    /// tests deliberately have no clock, and so the receipt tests below
-    /// (which call the real `observe`) stand out as the ones that do.
+    /// ⚠ 2026-09-19: the name records history, not a choice. Until today
+    /// `observe` took a receipt-clock argument and this wrapper passed the
+    /// `WAL_RECEIPT_UNKNOWN_NANOS` sentinel, so the name distinguished the
+    /// ~100 ranking tests from the four that timed a window. The receipt
+    /// stamps left the board with the `top_volume` delay columns (their sole
+    /// reader), so `observe` no longer takes a clock and there is nothing
+    /// left to distinguish — every caller is now equivalent to `lb.observe`.
+    /// Kept as a pass-through because renaming ~90 call sites buys nothing;
+    /// the name is annotated rather than trusted.
     fn observe_no_receipt(
         lb: &mut VolumeLeaderboard,
         contract: RankedContract,
         family: OptionFamily,
     ) -> Observation {
-        lb.observe(contract, family, 0)
+        lb.observe(contract, family)
     }
 
     fn stock(id: u64, underlying: u64, volume: u32) -> RankedContract {
@@ -2193,8 +2048,6 @@ mod tests {
             window_lots_milli: 0,
             delta_units: 0,
             lot_size: 0,
-            first_receipt_nanos: 0,
-            last_receipt_nanos: 0,
         }
     }
 
@@ -2454,10 +2307,31 @@ mod tests {
     #[test]
     fn the_work_list_has_one_producer_and_the_gauges_are_per_cadence() {
         let src = include_str!("volume_leaderboard.rs");
+        // ⚠ Split on the test MODULE, not on a bare `#[cfg(test)]`.
+        //
+        // It used to split on `"\n#[cfg(test)]"`, which was correct while the
+        // only such attribute in the file was the one on `mod tests`. The
+        // rejected radix sort briefly landed above it on 2026-09-19 with four
+        // `#[cfg(test)]`-gated items of its own, so the slice stopped at the
+        // first of them — a thousand lines ABOVE the single `.push(key)` this
+        // test exists to count — and the count read 0.
+        //
+        // It failed LOUDLY rather than passing, which is the one direction a
+        // truncating scan is survivable in, and that is luck rather than
+        // design: the same truncation in a test asserting a BAN would have
+        // read "zero occurrences, clean" on a file it never reached. A sweep
+        // the same day found NINETEEN scanners across the tree splitting on a
+        // bare `#[cfg(test)]`, most of them in that silent direction.
+        //
+        // So the radix items MOVED inside `mod tests` — the fix for all
+        // nineteen at once, and this file now holds exactly one
+        // `#[cfg(test)]`. The anchor stays regardless: it is the conservative
+        // spelling, and counting MORE text than production can only make an
+        // assertion stricter, never vacuous.
         let production = src
-            .split("\n#[cfg(test)]")
+            .split("\n#[cfg(test)]\nmod tests")
             .next()
-            .expect("production text precedes the first test module");
+            .expect("production text precedes the test module");
 
         assert_eq!(
             production.matches(".push(key)").count(),
@@ -2474,9 +2348,9 @@ mod tests {
         //
         // The five are: the work-list producer (the only one that matters
         // here), `scratch.push(row)` in `rank`, `seen.push`/`out.push` in
-        // `distinct_underlying_over`, and `out.push` in `gainer_eligible` —
-        // the last four all push into function-local `Vec`s that die at the
-        // end of the call and index nothing.
+        // `distinct_underlying_over`, and `out.push` in `gainer_eligible`.
+        // The last four all push into buffers that die at the end of the call
+        // and index nothing.
         assert_eq!(
             production.matches(".push(").count(),
             5,
@@ -3525,8 +3399,6 @@ mod tests {
             window_lots_milli: 0,
             delta_units: 0,
             lot_size: 0,
-            first_receipt_nanos: 0,
-            last_receipt_nanos: 0,
         };
 
         // Distinctness: five strikes of one name yield ONE entry.
@@ -4028,8 +3900,6 @@ mod tests {
                 segment: ExchangeSegment::NseFno,
                 underlying_id: 1,
                 volume: 500,
-                first_receipt_nanos: 0,
-                last_receipt_nanos: 0,
             },
             OptionFamily::Stock,
         );
@@ -4043,8 +3913,6 @@ mod tests {
                 segment: ExchangeSegment::BseFno,
                 underlying_id: 2,
                 volume: 400,
-                first_receipt_nanos: 0,
-                last_receipt_nanos: 0,
             },
             OptionFamily::Stock,
         );
@@ -4722,151 +4590,429 @@ mod tests {
         assert_eq!(gainers[0].security_id, 251);
     }
 
-    // ---- the three receipt delays: the four invariants -------------------
+    // ===================================================================
+    // The radix ordering (2026-09-19) — Θ(n), no comparisons, no log factor.
     //
-    // These four are the correctness of the feature. The storage tests prove
-    // the RENDERING (bands, sign, NULL, the sortable twin); these prove the
-    // MEASUREMENT — that the two receipt stamps name the right two instants.
+    // Everything here exists to answer ONE question before the production
+    // sort is touched: does the radix order produce the SAME sequence, and
+    // is it actually FASTER at the sizes this board runs at? A Θ(n) sort
+    // with a seventeen-pass constant is not automatically faster than an
+    // O(n log n) sort at twenty thousand elements, and shipping it on the
+    // complexity class alone — while making the sweep slower — is exactly
+    // the false-OK this repository forbids.
+    // ===================================================================
 
-    /// The window-open stamp is kept from the window's FIRST trade, and no
-    /// later trade in the same window overwrites it.
+    /// Bytes in the composite ranking key: segment (1) + `security_id` (8) +
+    /// `!window_lots_milli` (8).
     ///
-    /// Overwriting would make `open_latency` report the delay to the LATEST
-    /// trade instead of the first, and would collapse `window_span` toward
-    /// zero on exactly the busiest contracts — the ones a reader most wants
-    /// it for.
+    /// The complement is what turns a LOW-to-HIGH radix pass into the
+    /// HIGH-to-LOW order the board wants, without a separate descending pass and
+    /// without a comparator.
+    const RADIX_KEY_BYTES: usize = 17;
+
+    /// One byte of the composite ranking key, least significant pass first.
     ///
-    /// # What this test bites on, measured rather than asserted
+    /// The pass order is what makes an LSD radix produce the comparator's order:
+    /// the LAST pass is the MOST significant key, so passes run
+    /// segment → `security_id` → `!window_lots_milli`, and the finished sequence
+    /// reads lots DESCENDING, then `security_id` ascending, then segment
+    /// ascending — the three levels of
+    /// [`VolumeLeaderboard::rank`]'s `sort_unstable_by`, in that order.
+    #[inline]
+    const fn radix_key_byte(row: &RankedContract, pass: usize) -> u8 {
+        match pass {
+            0 => row.segment as u8,
+            1..=8 => ((row.security_id >> ((pass - 1) * 8)) & 0xff) as u8,
+            _ => (((!row.window_lots_milli) >> ((pass - 9) * 8)) & 0xff) as u8,
+        }
+    }
+
+    /// Reusable buffers for the radix ordering.
     ///
-    /// Two guards protect the stamp: an outer early-out (`was_dirty !=
-    /// ALL_WINDOWS_DIRTY`) and the inner per-window bit test. Bite-tested
-    /// 2026-09-19, all three ways:
+    /// # Why an index sort and not a row sort
     ///
-    /// | broken | this test | the per-cadence test below |
-    /// |---|---|---|
-    /// | inner only | passes | **FAILS** |
-    /// | outer only | passes | passes |
-    /// | both | **FAILS** | **FAILS** |
+    /// A pass moves every element it touches. `RankedContract` is tens of bytes;
+    /// a `u32` index is four. Seventeen passes over the rows would move
+    /// seventeen times the row bytes; seventeen passes over the indices move
+    /// seventeen times four bytes, and the rows move exactly ONCE, in the final
+    /// gather.
     ///
-    /// So this test proves the pair, and the per-cadence test is the one that
-    /// proves the inner condition on its own. Recorded because the first draft
-    /// of this comment claimed this test proved the inner bit test, and the
-    /// bite-test refuted it: with a single cadence ever swept, all four bits
-    /// move in lockstep, so the outer early-out alone is enough to hold the
-    /// stamp and the inner condition is never reached. A test that cannot fail
-    /// for the reason its comment gives is the vacuity class this repository
-    /// keeps recording — here caught before it shipped rather than after.
+    /// # Why the buffers live here
     ///
-    /// The outer guard broken ALONE changes nothing, which is the honest
-    /// reading of it: it is an early-out over a loop the inner test would
-    /// already no-op. Neither is redundant in combination, which is why both
-    /// stay.
+    /// Principle 1 is zero allocation on the hot path. These are sized once at
+    /// construction against [`MAX_TRACKED_CONTRACTS`] and reused by every sweep,
+    /// so the ordering allocates nothing however often it runs — the same
+    /// contract [`VolumeLeaderboard::scratch`] already holds.
+    #[derive(Debug)]
+    struct RadixScratch {
+        /// Indices into the row buffer, in the order built so far.
+        idx: Vec<u32>,
+        /// The destination of the pass in flight. Swapped with `idx` after each.
+        alt: Vec<u32>,
+        /// The gather target. Swapped with the caller's row buffer at the end, so
+        /// the rows are moved once rather than copied back.
+        out: Vec<RankedContract>,
+        /// Per-pass byte histogram. 256 `u32`s, reused by every pass.
+        counts: [u32; 256],
+    }
+
+    impl RadixScratch {
+        fn new() -> Self {
+            Self {
+                idx: Vec::with_capacity(MAX_TRACKED_CONTRACTS),
+                alt: Vec::with_capacity(MAX_TRACKED_CONTRACTS),
+                out: Vec::with_capacity(MAX_TRACKED_CONTRACTS),
+                counts: [0; 256],
+            }
+        }
+
+        /// Orders `rows` by the composite ranking key, in Θ(rows).
+        ///
+        /// The result is BYTE-IDENTICAL to
+        /// `rows.sort_unstable_by(|a, b| b.window_lots_milli.cmp(&a.window_lots_milli)
+        /// .then_with(|| a.security_id.cmp(&b.security_id))
+        /// .then_with(|| (a.segment as u8).cmp(&(b.segment as u8))))` —
+        /// pinned by `radix_order_matches_the_comparator_exactly`, which is the
+        /// only thing that makes this swap safe to make.
+        ///
+        /// # Complexity
+        ///
+        /// [`RADIX_KEY_BYTES`] counting passes over an index array, each Θ(n)
+        /// with no comparisons, then one Θ(n) gather. So Θ(n) with a fixed
+        /// constant — no log factor, and the constant does not grow with the
+        /// board.
+        ///
+        /// # The skip
+        ///
+        /// A pass whose histogram puts every element in ONE bucket cannot change
+        /// the order, so it is skipped. In practice that removes most of the
+        /// seventeen: the high bytes of a `security_id` are zero for every
+        /// instrument Dhan issues, and the high bytes of `!window_lots_milli` are
+        /// `0xff` for every contract trading under ~4 billion milli-lots. The
+        /// WORST case is unchanged and is still seventeen — this is a constant
+        /// the data usually pays less of, never a bound that can be exceeded.
+        fn order(&mut self, rows: &mut Vec<RankedContract>) {
+            let n = rows.len();
+            // Nothing to order, and — the load-bearing half — `u32` indices
+            // cannot address a longer buffer. `MAX_TRACKED_CONTRACTS` is four
+            // orders of magnitude below that, so this is a guard against a future
+            // caller rather than a live case; it degrades to the comparator
+            // rather than truncating, because a silently short board is the
+            // failure this whole module exists to prevent.
+            if n < 2 {
+                return;
+            }
+            if n > u32::MAX as usize {
+                rows.sort_unstable_by(|a, b| {
+                    b.window_lots_milli
+                        .cmp(&a.window_lots_milli)
+                        .then_with(|| a.security_id.cmp(&b.security_id))
+                        .then_with(|| (a.segment as u8).cmp(&(b.segment as u8)))
+                });
+                return;
+            }
+
+            self.idx.clear();
+            self.idx.extend(0..n as u32);
+            self.alt.clear();
+            self.alt.resize(n, 0);
+
+            for pass in 0..RADIX_KEY_BYTES {
+                self.counts = [0; 256];
+                for &i in &self.idx {
+                    let b = radix_key_byte(&rows[i as usize], pass);
+                    self.counts[b as usize] += 1;
+                }
+                // Every element in one bucket: the pass is the identity.
+                if self.counts.iter().any(|&c| c as usize == n) {
+                    continue;
+                }
+                // Exclusive prefix sum, so each bucket's cursor starts at its own
+                // first slot. Placing forward from there is what makes the pass
+                // STABLE, which is what lets the earlier passes' order survive.
+                let mut running = 0u32;
+                for c in &mut self.counts {
+                    let here = *c;
+                    *c = running;
+                    running += here;
+                }
+                for k in 0..n {
+                    let i = self.idx[k];
+                    let b = radix_key_byte(&rows[i as usize], pass) as usize;
+                    self.alt[self.counts[b] as usize] = i;
+                    self.counts[b] += 1;
+                }
+                std::mem::swap(&mut self.idx, &mut self.alt);
+            }
+
+            // The one time the rows move.
+            //
+            // Gather, then copy back rather than SWAP the two buffers. A swap
+            // looks cheaper and is the wrong trade: it hands the caller's vector
+            // to `out`, so `out`'s pre-sized capacity is replaced by whatever the
+            // caller happened to bring and the NEXT gather reallocates. Both
+            // buffers are sized once at `MAX_TRACKED_CONTRACTS`; the copy-back is
+            // one memcpy and keeps both pre-sizes intact forever.
+            self.out.clear();
+            for &i in &self.idx {
+                self.out.push(rows[i as usize]);
+            }
+            rows.clear();
+            rows.extend_from_slice(&self.out);
+        }
+    }
+
+    /// A deterministic pseudo-random row generator. No dependency, and the
+    /// same sequence every run, so a failure is reproducible.
+    fn radix_fixture(n: usize, seed: u64, lots_span: u64) -> Vec<RankedContract> {
+        let mut s = seed | 1;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        (0..n)
+            .map(|i| {
+                let r = next();
+                RankedContract {
+                    // UNIQUE, and that is the point: `scratch` is built from a
+                    // map keyed on `(security_id, segment)`, so the composite
+                    // key is unique per row in production and BOTH sorts agree
+                    // on every tie. A fixture with repeats would compare a
+                    // STABLE radix against an UNSTABLE `sort_unstable_by` and
+                    // report a divergence that cannot occur on the real board.
+                    security_id: i as u64,
+                    segment: if r & 0x10 == 0 {
+                        ExchangeSegment::NseFno
+                    } else {
+                        ExchangeSegment::BseFno
+                    },
+                    underlying_id: r % 300,
+                    volume: (r % 1_000_000) as u32,
+                    // A span of 1 forces EVERY key equal, which is the case
+                    // the tiebreak levels exist for and the case a radix
+                    // sort gets wrong if any pass is unstable.
+                    window_lots_milli: if lots_span <= 1 { 0 } else { r % lots_span },
+                    delta_units: (r % 5000) as u32,
+                    lot_size: 1 + (r % 100) as u32,
+                }
+            })
+            .collect()
+    }
+
+    fn comparator_order(rows: &mut [RankedContract]) {
+        rows.sort_unstable_by(|a, b| {
+            b.window_lots_milli
+                .cmp(&a.window_lots_milli)
+                .then_with(|| a.security_id.cmp(&b.security_id))
+                .then_with(|| (a.segment as u8).cmp(&(b.segment as u8)))
+        });
+    }
+
+    /// The one test that makes the swap safe to make.
+    ///
+    /// Byte-identical output on every shape that matters, including the two
+    /// the radix could plausibly get wrong: every key equal (so the whole
+    /// order is decided by the tiebreak levels, which only survive if every
+    /// pass is stable), and every key distinct.
     #[test]
-    fn the_first_receipt_of_a_window_is_kept_and_later_ticks_do_not_overwrite_it() {
-        let mut lb = VolumeLeaderboard::new();
+    fn radix_order_matches_the_comparator_exactly() {
+        let mut rx = RadixScratch::new();
+        for &(n, span) in &[
+            (0usize, 1_000u64),
+            (1, 1_000),
+            (2, 1),
+            (2, 1_000),
+            (7, 1),
+            (7, 3),
+            (63, 1),
+            (64, 4),
+            (500, 1_000_000),
+            (2_000, 7),
+            (2_000, u64::MAX),
+            (20_220, 1_000_000),
+            (20_220, 1),
+        ] {
+            for seed in [1u64, 0x9E37_79B9_7F4A_7C15, 0xDEAD_BEEF_CAFE_F00D] {
+                let mut a = radix_fixture(n, seed, span);
+                let mut b = a.clone();
+                comparator_order(&mut a);
+                rx.order(&mut b);
+                assert_eq!(
+                    a, b,
+                    "radix order diverged from the comparator at n={n} span={span} seed={seed}"
+                );
+            }
+        }
+    }
 
-        // Seed the key (an untracked contract's first observe only seeds its
-        // baseline, so it ranks nothing until it trades).
-        lb.observe(stock(1, 100, 1_000), OptionFamily::Stock, 111);
-        // Drop the seeding stamp so the window below opens clean.
-        let _ = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
+    /// The skip is an optimisation, never a correctness shortcut.
+    ///
+    /// Feeds a shape where all but one pass is single-bucket (one segment,
+    /// ids under 256, lots under 256) and asserts the order still holds.
+    #[test]
+    fn radix_order_is_correct_when_almost_every_pass_is_skipped() {
+        let mut rx = RadixScratch::new();
+        let rows: Vec<RankedContract> = (0..300u64)
+            .map(|i| RankedContract {
+                security_id: i % 200,
+                segment: ExchangeSegment::NseFno,
+                underlying_id: 0,
+                volume: 0,
+                window_lots_milli: (i * 7) % 250,
+                delta_units: 0,
+                lot_size: 1,
+            })
+            .collect();
+        let mut a = rows.clone();
+        let mut b = rows;
+        comparator_order(&mut a);
+        rx.order(&mut b);
+        assert_eq!(a, b);
+    }
 
-        lb.observe(stock(1, 100, 1_100), OptionFamily::Stock, 5_000);
-        lb.observe(stock(1, 100, 1_200), OptionFamily::Stock, 6_000);
-        lb.observe(stock(1, 100, 1_300), OptionFamily::Stock, 7_000);
-
-        let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
-        assert_eq!(ranked.len(), 1);
-        assert_eq!(
-            ranked[0].first_receipt_nanos, 5_000,
-            "the window's FIRST receipt must survive two later ticks — \
-             overwriting it would time the window from its last trade"
-        );
-        assert_eq!(
-            ranked[0].last_receipt_nanos, 7_000,
-            "the last receipt must be the LATEST tick, so the span between \
-             them is the real first-to-last interval"
+    /// A steady-state ordering allocates NOTHING.
+    ///
+    /// Not a DHAT gate — a capacity assertion, which is what actually
+    /// matters here: the three buffers are sized once at construction, so a
+    /// sweep may only reuse them. A `push` past capacity would reallocate
+    /// and this catches it.
+    #[test]
+    fn radix_order_reuses_its_buffers() {
+        let mut rx = RadixScratch::new();
+        let (ci, ca, co) = (rx.idx.capacity(), rx.alt.capacity(), rx.out.capacity());
+        for seed in 0..8u64 {
+            let mut rows = radix_fixture(20_220, seed + 1, 1_000_000);
+            rx.order(&mut rows);
+        }
+        assert_eq!(rx.idx.capacity(), ci, "idx reallocated");
+        assert_eq!(rx.alt.capacity(), ca, "alt reallocated");
+        // `out` is SWAPPED with the caller's buffer, so after an odd number
+        // of orderings it holds whatever the caller brought. It must still
+        // be at least the ceiling.
+        assert!(
+            rx.out.capacity() >= co.min(MAX_TRACKED_CONTRACTS),
+            "out shrank below the ceiling"
         );
     }
 
-    /// Sweeping ONE cadence does not reopen another cadence's window.
+    /// The A/B that decides whether the radix ships.
     ///
-    /// Each cadence keeps its own `first_receipt_nanos` slot precisely because
-    /// the four windows open at four different instants. A shared stamp would
-    /// make the 1-minute row report the 1-second window's opening delay, which
-    /// is wrong by up to a minute and looks entirely plausible.
-    #[test]
-    fn a_sweep_of_one_cadence_does_not_reopen_another_cadences_window() {
-        let mut lb = VolumeLeaderboard::new();
-
-        lb.observe(stock(1, 100, 1_000), OptionFamily::Stock, 111);
-        let _ = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
-        let _ = lb.rank(OptionFamily::Stock, S5, 10, lot1, all);
-
-        // Both windows open on this tick.
-        lb.observe(stock(1, 100, 1_100), OptionFamily::Stock, 2_000);
-        // The 1-second window closes and reopens; the 5-second one does not.
-        let one_sec = lb.rank(OptionFamily::Stock, S1, 10, lot1, all)[0].first_receipt_nanos;
-        assert_eq!(one_sec, 2_000);
-
-        lb.observe(stock(1, 100, 1_200), OptionFamily::Stock, 9_000);
-
-        let five_sec = lb.rank(OptionFamily::Stock, S5, 10, lot1, all);
-        assert_eq!(five_sec.len(), 1);
-        assert_eq!(
-            five_sec[0].first_receipt_nanos, 2_000,
-            "the 5-second window opened at 2_000 and the 1-second sweep must \
-             not have reopened it at 9_000 — its window never closed"
-        );
-    }
-
-    /// A frame carrying no receipt clock reports `0` on both halves, which the
-    /// projection renders as an EMPTY cell rather than `0 nanoseconds`.
+    /// `#[ignore]`d for the same reason every other wall-clock number in this
+    /// file is: a timing assertion is a flaky gate. Run it with
+    /// `cargo test -p tickvault-app --release radix_vs_comparator -- --ignored --nocapture`.
     ///
-    /// `WAL_RECEIPT_UNKNOWN_NANOS` is `0`: a pre-`TVW3` WAL frame has no
-    /// receipt at all. Reporting zero delay for an unknown delivery time would
-    /// claim the fastest possible arrival for a tick nobody timed.
-    #[test]
-    fn a_contract_with_no_receipt_clock_reports_zero_on_both_halves() {
-        let mut lb = VolumeLeaderboard::new();
-
-        observe_no_receipt(&mut lb, stock(1, 100, 1_000), OptionFamily::Stock);
-        let _ = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
-        observe_no_receipt(&mut lb, stock(1, 100, 1_100), OptionFamily::Stock);
-
-        let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
-        assert_eq!(ranked.len(), 1);
-        assert_eq!(ranked[0].first_receipt_nanos, 0);
-        assert_eq!(ranked[0].last_receipt_nanos, 0);
-    }
-
-    /// An out-of-window baseline roll clears the stamp in lockstep with the
-    /// baseline it was taken beside.
+    /// `--release` is not decoration. MEASURED 2026-09-19, the SAME harness
+    /// in DEBUG prints "RADIX WINS" at n=2,000 and n=20,220 - the exact
+    /// opposite verdict - because an unoptimised build penalises the
+    /// comparator's per-pair closure far more than the radix's flat loops.
+    /// Read a debug run as a correctness check only; its timings answer a
+    /// question nobody asked.
     ///
-    /// A first-receipt stamp times a window that starts at its baseline. The
-    /// roll throws that baseline away, so keeping the stamp would report an
-    /// opening delay measured against a window start that no longer exists —
-    /// the same class of error as the pre-2026-09-09 baseline over-count the
-    /// roll itself was added to fix, one column over.
+    /// What it does NOT claim: that either figure holds on the prod
+    /// r8g.xlarge. This is an x86 dev container, and the two are measured
+    /// against each other on the SAME machine in the SAME run, which is the
+    /// only comparison that survives the difference.
+    ///
+    /// It DOES assert, and deliberately: each round is checked to have
+    /// ordered the `n` rows it claims and to have produced the same order on
+    /// both paths. A wall-clock harness with no assertion is how the
+    /// withdrawn 900 us figure came to be quoted for months - see the block
+    /// at the assertions.
     #[test]
-    fn a_baseline_roll_clears_the_receipt_stamp_in_lockstep() {
-        let mut lb = VolumeLeaderboard::new();
+    #[ignore = "wall-clock measurement, not a gate"]
+    // The printed table IS this harness's result (run with --nocapture), so
+    // the crate-wide print deny is lifted for this one test fn only.
+    #[allow(clippy::print_stdout)]
+    fn radix_vs_comparator_at_every_measured_shape() {
+        const ROUNDS: u32 = 50;
+        println!("\n  n        comparator      radix        verdict");
+        println!("  ------------------------------------------------");
+        for &n in &[100usize, 500, 2_000, 20_220] {
+            let base = radix_fixture(n, 0x5_DEEC_E66D, 1_000_000);
+            let mut rx = RadixScratch::new();
 
-        lb.observe(stock(1, 100, 1_000), OptionFamily::Stock, 111);
-        // Pre-window accumulation, stamped at a pre-window instant.
-        lb.observe(stock(1, 100, 900_000), OptionFamily::Stock, 1_000);
+            // Warm both paths so neither pays a first-touch page fault.
+            {
+                let mut w = base.clone();
+                comparator_order(&mut w);
+                let mut w = base.clone();
+                rx.order(&mut w);
+            }
 
-        lb.roll_baselines(OptionFamily::Stock, S1);
+            // Keep the LAST round's output from each path, so the assertions
+            // below run against data this harness actually timed.
+            let mut cmp_nanos = 0u128;
+            let mut cmp_out: Vec<RankedContract> = Vec::new();
+            for _ in 0..ROUNDS {
+                let mut rows = base.clone();
+                let t = std::time::Instant::now();
+                comparator_order(&mut rows);
+                cmp_nanos += t.elapsed().as_nanos();
+                std::hint::black_box(&rows);
+                cmp_out = rows;
+            }
 
-        // The first IN-window trade opens the window afresh.
-        lb.observe(stock(1, 100, 900_500), OptionFamily::Stock, 8_000);
+            let mut rad_nanos = 0u128;
+            let mut rad_out: Vec<RankedContract> = Vec::new();
+            for _ in 0..ROUNDS {
+                let mut rows = base.clone();
+                let t = std::time::Instant::now();
+                rx.order(&mut rows);
+                rad_nanos += t.elapsed().as_nanos();
+                std::hint::black_box(&rows);
+                rad_out = rows;
+            }
 
-        let ranked = lb.rank(OptionFamily::Stock, S1, 10, lot1, all);
-        assert_eq!(ranked.len(), 1);
-        assert_eq!(
-            ranked[0].first_receipt_nanos, 8_000,
-            "the roll must have cleared the pre-window stamp — carrying 1_000 \
-             forward would time the window against a baseline it discarded"
-        );
+            // ANTI-VACUITY — what makes the printed row worth reading.
+            //
+            // CLAUDE.md records a WITHDRAWN 900 us sweep figure whose harness
+            // seeded every baseline to the contract's own volume, so every
+            // delta was zero, every contract hit the `lots == 0` `continue`,
+            // and all fifty rounds timed an EMPTY vector under a lone `< 1 s`
+            // assertion that an empty sort passes trivially. A timing harness
+            // that cannot prove it did the work reports a number about
+            // nothing, and reports it confidently.
+            //
+            // These three say the row below is real: the fixture carried the
+            // `n` it claims, BOTH paths ordered that many rows, and the two
+            // agree - so neither figure came from a degenerate or half-built
+            // vector, and the verdict compares SPEED rather than one path
+            // quietly skipping work the other did. The dedicated equivalence
+            // tests above prove correctness across thirteen shapes; this pair
+            // proves it for the exact bytes that produced these timings.
+            assert_eq!(
+                cmp_out.len(),
+                n,
+                "the comparator timed {} rows, not {n}",
+                cmp_out.len()
+            );
+            assert_eq!(
+                rad_out.len(),
+                n,
+                "the radix timed {} rows, not {n}",
+                rad_out.len()
+            );
+            assert_eq!(
+                cmp_out, rad_out,
+                "the timed orderings diverged at n={n} - the figures below \
+                 would be comparing two different amounts of work"
+            );
+
+            let c = cmp_nanos / u128::from(ROUNDS);
+            let r = rad_nanos / u128::from(ROUNDS);
+            let verdict = if r < c {
+                "RADIX WINS"
+            } else {
+                "comparator wins"
+            };
+            println!(
+                "  {n:<8} {:>9.1} us  {:>9.1} us   {verdict}",
+                c as f64 / 1000.0,
+                r as f64 / 1000.0
+            );
+        }
+        println!();
     }
 }

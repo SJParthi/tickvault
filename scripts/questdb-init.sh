@@ -96,7 +96,7 @@ create_base_tables() {
     #    feed + payload_hash + capture_seq columns included so the
     #    scoreboard's feed-sliced reads work on a fresh box.
     execute_ddl "ticks" \
-        "CREATE TABLE IF NOT EXISTS ticks (feed SYMBOL, segment SYMBOL, security_id LONG, ltp DOUBLE, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, volume LONG, oi LONG, avg_price DOUBLE, last_trade_qty LONG, total_buy_qty LONG, total_sell_qty LONG, exchange_timestamp LONG, received_at TIMESTAMP, payload_hash LONG, capture_seq LONG, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY HOUR WAL"
+        "CREATE TABLE IF NOT EXISTS ticks (received_at TIMESTAMP, ts TIMESTAMP, contract SYMBOL, feed SYMBOL, segment SYMBOL, security_id LONG, ltp DOUBLE, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, volume LONG, oi LONG, avg_price DOUBLE, last_trade_qty LONG, total_buy_qty LONG, total_sell_qty LONG, payload_hash LONG, capture_seq LONG) TIMESTAMP(ts) PARTITION BY HOUR WAL"
 
     echo ""
 }
@@ -121,7 +121,9 @@ apply_dedup_keys() {
 # Phase 3: Candle tables — owned by the app candle engine (NOT this script)
 # ---------------------------------------------------------------------------
 # Since the "one common candle engine" convergence (#1189), every candle
-# timeframe (candles_1m … candles_1d) is a REAL TABLE that the running app
+# timeframe (candles_1s, _3s, _5s, _1m, _3m, _5m, _10m, _15m, _30m, _60m — the
+# 10-minute frame was a derived VIEW until 2026-09-22 and is now a folded table;
+# the old 10s/15s/30s/2m/1d frames are retired) is a REAL TABLE that the running app
 # folds directly from `ticks` (O(1) per tick) and seals via its aggregator —
 # NOT a QuestDB materialized view. The app's idempotent boot DDL creates +
 # DEDUP-keys those tables and drops any stale matview squatting the name.

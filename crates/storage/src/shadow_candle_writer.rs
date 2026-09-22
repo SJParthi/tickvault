@@ -49,6 +49,7 @@ use tickvault_common::config::QuestDbConfig;
 use tickvault_trading::candles::BufferedSeal;
 
 use crate::shadow_seal_columns::ShadowSealRow;
+use crate::top_volume_rank_persistence::render_delay_into;
 
 /// Build the questdb-rs **ILP-over-HTTP** connection conf string for a given
 /// host + HTTP port.
@@ -247,6 +248,19 @@ pub struct ShadowCandleWriter {
     /// by the writer task to drive batch-size-based flush triggers
     /// and by tests to verify append behaviour.
     pending_count: usize,
+    /// Reused render buffer for the three human-readable delay columns
+    /// (`open_latency`, `close_latency`, `window_span_latency`).
+    ///
+    /// A `format!` per column per row would be THREE fresh allocations on
+    /// every candle appended — the 60,660-per-sweep defect this codebase has
+    /// already fixed once on the sibling `top_volume` writer. `render_delay_into`
+    /// clears and writes into a caller-owned `String`, so the allocation is
+    /// paid once for the life of the writer and reused for every row.
+    delay_scratch: String,
+    /// Pre-resolved session-window refusal counters. See
+    /// [`CANDLE_OUT_OF_WINDOW_REASONS`] for why this gate reads the BUCKET
+    /// and never a seal clock.
+    out_of_window: CandleOutOfWindowCounters,
     /// Retained for the reconnect logic. Finding S2 (HIGH): the ILP
     /// conf string is wrapped in `SecretString` because it carries
     /// the QuestDB endpoint and (in conf-string-auth deployments)
@@ -254,10 +268,6 @@ pub struct ShadowCandleWriter {
     /// back with `.expose_secret()` only at `Sender` construction.
     /// Read by `reconnect()` (the broken-pipe recovery path) — no
     /// longer dead since the candle-writer reconnect landed 2026-06-30.
-    /// Pre-resolved session-window refusal counters. See
-    /// [`CANDLE_OUT_OF_WINDOW_REASONS`] for why this gate reads the BUCKET
-    /// and never a seal clock.
-    out_of_window: CandleOutOfWindowCounters,
     ilp_conf_string: SecretString,
 }
 
@@ -290,6 +300,7 @@ impl ShadowCandleWriter {
             sender,
             buffer,
             pending_count: 0,
+            delay_scratch: String::new(),
             ilp_conf_string: SecretString::from(conf_string),
             out_of_window: CandleOutOfWindowCounters::new(),
         })
@@ -306,6 +317,7 @@ impl ShadowCandleWriter {
             sender: None,
             buffer: Buffer::new(ProtocolVersion::V1),
             pending_count: 0,
+            delay_scratch: String::new(),
             ilp_conf_string: SecretString::from(String::new()),
             out_of_window: CandleOutOfWindowCounters::new(),
         }
@@ -452,7 +464,20 @@ impl ShadowCandleWriter {
             .symbol("feed", row.feed)
             .with_context(|| "candle append: symbol(feed) failed")?
             .symbol("segment", row.segment)
-            .with_context(|| "candle append: symbol(segment) failed")?
+            .with_context(|| "candle append: symbol(segment) failed")?;
+        // `contract` — the option's NAME (`NIFTY-25Sep2026-24500-CE`), from the
+        // table the app publishes once per day. One ArcSwap load + one hash
+        // probe per SEALED BAR, zero allocation (the name is borrowed out of
+        // the snapshot). Written only when the table knows this exact
+        // `(security_id, segment)`; otherwise the symbol is OMITTED and the
+        // column reads NULL — never a guessed name. It must sit here, among
+        // the symbols: ILP rejects a symbol after the first column.
+        let labels = crate::candle_contract_labels::candle_contract_labels();
+        if let Some(name) = labels.get(&(row.security_id, row.segment)) {
+            buf.symbol("contract", &**name)
+                .with_context(|| "candle append: symbol(contract) failed")?;
+        }
+        let buf = buf
             .column_i64("security_id", row.security_id)
             .with_context(|| "candle append: column_i64(security_id) failed")?
             .column_f64("open", row.open)
@@ -469,16 +494,16 @@ impl ShadowCandleWriter {
             .with_context(|| "candle append: column_i64(oi) failed")?
             .column_i64("tick_count", row.tick_count)
             .with_context(|| "candle append: column_i64(tick_count) failed")?
-            .column_f64("close_pct_from_prev_day", row.close_pct_from_prev_day)
-            .with_context(|| "candle append: column_f64(close_pct_from_prev_day) failed")?
-            // §31 Option 2: % change vs the official 09:15 session open.
-            .column_f64("open_pct", row.open_pct)
-            .with_context(|| "candle append: column_f64(open_pct) failed")?
-            // Operator request 2026-06-02: headline day change % + opening gap %.
-            .column_f64("change_pct", row.change_pct)
-            .with_context(|| "candle append: column_f64(change_pct) failed")?
-            .column_f64("open_gap_pct", row.open_gap_pct)
-            .with_context(|| "candle append: column_f64(open_gap_pct) failed")?
+            // The bar's headline move: close vs YESTERDAY's close. Renamed
+            // from `change_pct` 2026-09-19. Its byte-identical twin
+            // `close_pct_from_prev_day` is GONE — both were filled from the
+            // same `state.close_pct_from_prev_day`, so one name survives and
+            // the struct field keeps its original name.
+            .column_f64("percentage_change", row.change_pct)
+            .with_context(|| "candle append: column_f64(percentage_change) failed")?
+            // Close vs TODAY's 09:15 session open. Renamed from `open_pct`.
+            .column_f64("open_percentage_change", row.open_pct)
+            .with_context(|| "candle append: column_f64(open_percentage_change) failed")?
             // The vendor's PENDING order-book totals at this bar's last
             // observed packet — resting orders, NOT executed volume. Written
             // unconditionally, `0` included: the fold has already applied the
@@ -488,6 +513,43 @@ impl ShadowCandleWriter {
             .with_context(|| "candle append: column_i64(total_buy_qty) failed")?
             .column_i64("total_sell_qty", row.total_sell_qty)
             .with_context(|| "candle append: column_i64(total_sell_qty) failed")?;
+        // The three receipt-delay pairs. Each is `Option`: a seal that came
+        // back through the disk spill tier carries no receipt stamps (the
+        // 128-byte record is byte-full and cannot hold them), and a bucket
+        // whose ticks all arrived with no receipt clock has none either. In
+        // both cases BOTH halves of the pair are omitted, so the row reads
+        // NULL rather than claiming a zero delay — `Some(0)` is a REAL
+        // reading (a single-tick bucket has a zero span) and must stay
+        // distinguishable from "unknown".
+        //
+        // `render_delay_into` is the same renderer the `top_volume` writer
+        // uses, reused rather than duplicated so the two tables can never
+        // drift into different wording. It clears and writes into the
+        // caller-owned scratch, so the three columns cost ZERO allocations
+        // per row — a `format!` here would be three fresh allocations on
+        // every candle appended.
+        //
+        // The `_ns` twin is NOT optional garnish: text sorted descending
+        // puts "1 second" after "4 nanoseconds", the exact reverse of the
+        // true order, so every ORDER BY must use the exact column.
+        let scratch = &mut self.delay_scratch;
+        for (readable, exact, value) in [
+            ("open_latency", "open_latency_ns", row.open_latency_ns),
+            ("close_latency", "close_latency_ns", row.close_latency_ns),
+            (
+                "window_span_latency",
+                "window_span_latency_ns",
+                row.window_span_latency_ns,
+            ),
+        ] {
+            if let Some(nanos) = value {
+                render_delay_into(scratch, nanos);
+                buf.column_str(readable, scratch.as_str())
+                    .with_context(|| format!("candle append: column_str({readable}) failed"))?;
+                buf.column_i64(exact, nanos)
+                    .with_context(|| format!("candle append: column_i64({exact}) failed"))?;
+            }
+        }
         buf.at(TimestampNanos::new(row.timestamp_ist_nanos))
             .with_context(|| "candle append: at(TimestampNanos) failed")?;
         self.pending_count += 1;
@@ -1011,27 +1073,80 @@ mod tests {
         assert!(s.contains("close="), "close column missing in {s}");
     }
 
+    /// Does the ILP line carry `name` as a field of its OWN, rather than as the
+    /// tail of a longer field name?
+    ///
+    /// Load-bearing since the 2026-09-19 rename: `open_percentage_change=`
+    /// CONTAINS `percentage_change=`, so a plain `contains` would report the
+    /// renamed column as present when only its open-variant sibling was
+    /// written. ILP separates fields with `,` (or a space before the first),
+    /// so the character before the name must not be part of an identifier.
+    fn has_ilp_field(line: &str, name: &str) -> bool {
+        let needle = format!("{name}=");
+        let mut from = 0usize;
+        while let Some(rel) = line[from..].find(&needle) {
+            let at = from + rel;
+            let prev_is_identifier = line[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+            if !prev_is_identifier {
+                return true;
+            }
+            from = at + needle.len();
+        }
+        false
+    }
+
     #[test]
-    fn test_append_seal_buffer_writes_close_pct_only() {
-        // PR-4b (2026-05-28): the 11-column schema writes
-        // `close_pct_from_prev_day` but NOT the oi/volume pct columns —
-        // spot has no OI and indices no volume, so those stay dropped.
+    fn test_append_seal_buffer_writes_the_two_renamed_pct_columns_only() {
+        // 2026-09-19 schema reset. The wire carries exactly two percentage
+        // columns, both renamed: `percentage_change` (was `change_pct`) and
+        // `open_percentage_change` (was `open_pct`).
+        //
+        // The removal half is the half that matters. ILP AUTO-CREATES any
+        // column a writer names, so a single leftover append silently
+        // re-creates `close_pct_from_prev_day` or `open_gap_pct` on a fresh
+        // table — undoing the reset with nothing failing. `oi_pct` and
+        // `volume_pct` were never written (spot has no OI, indices no volume)
+        // and are kept here as the original PR-4b assertion.
         let mut w = ShadowCandleWriter::for_test();
         w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("append");
         let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
+
         assert!(
-            s.contains("close_pct_from_prev_day="),
-            "close_pct MUST be written in {s}"
+            has_ilp_field(s, "percentage_change"),
+            "percentage_change MUST be written in {s}"
         );
         assert!(
-            !s.contains("oi_pct_from_prev_day"),
-            "oi_pct must NOT be written in {s}"
+            has_ilp_field(s, "open_percentage_change"),
+            "open_percentage_change MUST be written in {s}"
         );
-        assert!(
-            !s.contains("volume_pct_from_prev_day"),
-            "volume_pct must NOT be written in {s}"
-        );
+        for gone in [
+            "close_pct_from_prev_day",
+            "open_gap_pct",
+            "change_pct",
+            "open_pct",
+            "oi_pct_from_prev_day",
+            "volume_pct_from_prev_day",
+        ] {
+            assert!(
+                !has_ilp_field(s, gone),
+                "`{gone}` must NOT be written — ILP auto-creates the column in {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn self_test_has_ilp_field_is_boundary_aware() {
+        // Bite-proof for the helper above: without the boundary check the
+        // removal loop passes vacuously and the presence check reports a
+        // column that was never written.
+        let line = "candles_1m,feed=dhan open_percentage_change=0.4 123";
+        assert!(has_ilp_field(line, "open_percentage_change"));
+        assert!(!has_ilp_field(line, "percentage_change"));
+        assert!(has_ilp_field("a percentage_change=1", "percentage_change"));
     }
 
     #[test]
@@ -1218,6 +1333,9 @@ mod tests {
             open_gap_pct: 0.2,
             total_buy_qty: 89_600,
             total_sell_qty: 4_800,
+            open_latency_ns: None,
+            close_latency_ns: None,
+            window_span_latency_ns: None,
         };
         w.append_row(&novel_row).expect("append novel-feed row");
         let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
@@ -1268,12 +1386,12 @@ mod tests {
     }
 
     #[test]
-    fn test_candle_writer_covers_all_21_tf_tables_for_arbitrary_feed() {
+    fn test_candle_writer_covers_every_tf_table_for_arbitrary_feed() {
         // OPERATOR SCOPE CLARIFICATION 2026-06-30: the candle path must cover
         // EVERY timeframe table, not just candles_1m — and for ANY feed. Drive one
-        // seal for EVERY TfIndex::ALL (all 21 TFs) tagged an ARBITRARY novel feed
+        // seal for EVERY TfIndex::ALL (every live frame) tagged an ARBITRARY novel feed
         // and assert each lands in its OWN candles_<tf> table tagged with that feed.
-        // Proves: one common writer → all 21 TF tables, feed stamped verbatim, no
+        // Proves: one common writer → every TF table, feed stamped verbatim, no
         // per-TF and no per-feed branch.
         let novel_feed = "future_test_feed";
         let mut seen_tables = std::collections::HashSet::new();
@@ -1298,6 +1416,9 @@ mod tests {
                 open_gap_pct: 0.2,
                 total_buy_qty: 89_600,
                 total_sell_qty: 4_800,
+                open_latency_ns: None,
+                close_latency_ns: None,
+                window_span_latency_ns: None,
             };
             w.append_row(&row).expect("append per-TF row");
             let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
@@ -1312,14 +1433,19 @@ mod tests {
             );
             seen_tables.insert(table);
         }
-        // All 21 distinct candle tables were exercised.
+        // Every live candle table was exercised — derived from the enum, so
+        // it cannot go stale the next time TF_COUNT moves.
         assert_eq!(
             seen_tables.len(),
             TfIndex::ALL.len(),
-            "every one of the 21 TF candle tables must be covered"
+            "every live TF candle table must be covered"
         );
+        // Two literal anchors, one per scale, so the derived equality above
+        // cannot be satisfied by a table-name mapping that collapsed the
+        // scales. `candles_1d` stood here until the 2026-09-19 collapse
+        // retired D1; `candles_1s` is the surviving short-scale anchor.
         assert!(seen_tables.contains("candles_1m"));
-        assert!(seen_tables.contains("candles_1d"));
+        assert!(seen_tables.contains("candles_1s"));
     }
 
     #[test]
@@ -1426,6 +1552,251 @@ mod tests {
         assert_ne!(
             CANDLE_OUT_OF_WINDOW_REASONS[0], CANDLE_OUT_OF_WINDOW_REASONS[1],
             "two reasons must never share a metric label"
+        );
+    }
+
+    // ---- `contract` (2026-09-22) ----
+
+    fn contract_row(security_id: i64, segment: &'static str) -> ShadowSealRow {
+        ShadowSealRow {
+            table_name: TfIndex::M1.table_name(),
+            timestamp_ist_nanos: 1_716_023_700_i64 * 1_000_000_000,
+            security_id,
+            segment,
+            feed: "dhan",
+            open: 100.0,
+            high: 105.0,
+            low: 99.0,
+            close: 101.0,
+            volume: 1234,
+            oi: 50_000,
+            tick_count: 5,
+            close_pct_from_prev_day: 1.5,
+            open_pct: 0.4,
+            change_pct: 1.5,
+            open_gap_pct: 0.2,
+            total_buy_qty: 0,
+            total_sell_qty: 0,
+            open_latency_ns: None,
+            close_latency_ns: None,
+            window_span_latency_ns: None,
+        }
+    }
+
+    fn publish_one(security_id: i64, segment: &'static str, name: &str) {
+        let mut m = std::collections::HashMap::new();
+        m.insert((security_id, segment), std::sync::Arc::<str>::from(name));
+        crate::candle_contract_labels::publish_candle_contract_labels(m);
+    }
+
+    /// A contract the day's table knows gets its NAME written, among the
+    /// symbols (ILP refuses a symbol after the first column).
+    #[test]
+    fn a_known_contract_writes_its_name_before_the_first_column() {
+        let _g = crate::candle_contract_labels::TEST_PUBLISH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_one(9_200_001, "NSE_FNO", "NIFTY-25Sep2026-24500-CE");
+        let mut w = ShadowCandleWriter::for_test();
+        w.append_row(&contract_row(9_200_001, "NSE_FNO"))
+            .expect("append");
+        let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
+        let name_at = s
+            .find("contract=NIFTY-25Sep2026-24500-CE")
+            .unwrap_or_else(|| panic!("the name must be written, got {s}"));
+        let first_column = s.find(" security_id=").expect("first column");
+        assert!(
+            name_at < first_column,
+            "contract is a SYMBOL and must precede every column, got {s}"
+        );
+    }
+
+    /// Anything the table does not know — a spot, a future, the same id on
+    /// another segment, a table not yet published — writes NO name. NULL,
+    /// never a guess.
+    #[test]
+    fn an_unknown_contract_omits_the_name_rather_than_guessing() {
+        let _g = crate::candle_contract_labels::TEST_PUBLISH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_one(9_200_101, "NSE_FNO", "BANKNIFTY-25Sep2026-55000-PE");
+        let mut w = ShadowCandleWriter::for_test();
+        // Same numeric id, different segment (I-P1-11): a different instrument.
+        w.append_row(&contract_row(9_200_101, "NSE_EQ"))
+            .expect("append");
+        // An id the table has never seen.
+        w.append_row(&contract_row(9_200_102, "NSE_FNO"))
+            .expect("append");
+        let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
+        assert!(
+            !s.contains("contract="),
+            "an unresolved contract must be OMITTED (NULL), got {s}"
+        );
+        assert_eq!(w.buffer_row_count(), 2, "both rows are still written");
+    }
+
+    // ---- the three delay pairs (2026-09-19, Task #15 step 6) ----
+
+    /// A row that KNOWS its delays emits all six columns, and the readable half
+    /// carries the whole-unit text the operator asked for (Quote D) — never a
+    /// decimal, never a raw nanosecond count on a millisecond-scale delay.
+    #[test]
+    fn a_row_with_known_receipt_stamps_emits_all_six_delay_columns() {
+        let mut w = ShadowCandleWriter::for_test();
+        let row = ShadowSealRow {
+            table_name: TfIndex::M1.table_name(),
+            timestamp_ist_nanos: 1_716_023_700_i64 * 1_000_000_000,
+            security_id: 4242,
+            segment: "NSE_FNO",
+            feed: "dhan",
+            open: 100.0,
+            high: 105.0,
+            low: 99.0,
+            close: 101.0,
+            volume: 1234,
+            oi: 50_000,
+            tick_count: 5,
+            close_pct_from_prev_day: 1.5,
+            open_pct: 0.4,
+            change_pct: 1.5,
+            open_gap_pct: 0.2,
+            total_buy_qty: 89_600,
+            total_sell_qty: 4_800,
+            // 123 ms, 4 s, and a zero span — the third is the case a sentinel
+            // would have destroyed: a single-tick bucket really did span zero,
+            // and that is NOT the same fact as "we do not know".
+            open_latency_ns: Some(123_000_000),
+            close_latency_ns: Some(4_000_000_000),
+            window_span_latency_ns: Some(0),
+        };
+        w.append_row(&row).expect("append row with delays");
+        let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
+
+        // The exact halves are what any ORDER BY must use.
+        assert!(
+            s.contains("open_latency_ns=123000000i"),
+            "the exact nanosecond twin must be written as an integer, got {s}"
+        );
+        assert!(
+            s.contains("close_latency_ns=4000000000i"),
+            "the exact nanosecond twin must be written as an integer, got {s}"
+        );
+        assert!(
+            s.contains("window_span_latency_ns=0i"),
+            "a genuinely-zero span must be WRITTEN as 0, not omitted, got {s}"
+        );
+
+        // The readable halves are whole units in the right band.
+        assert!(
+            s.contains(r#"open_latency="123 milliseconds""#),
+            "123 ms must render as whole milliseconds, got {s}"
+        );
+        assert!(
+            s.contains(r#"close_latency="4 seconds""#),
+            "4 s must render as whole seconds, plural, got {s}"
+        );
+        assert!(
+            s.contains(r#"window_span_latency="0 nanoseconds""#),
+            "a zero span must render as a real reading, not blank, got {s}"
+        );
+    }
+
+    /// A row that does NOT know its delays emits NOTHING for them. Omitted is
+    /// NULL in QuestDB; a written `0` would claim the fastest possible delivery
+    /// for a bar whose delivery time is unknowable (a spill replay, a REST
+    /// reconstruction). The two cases must never render alike.
+    #[test]
+    fn a_row_with_unknown_receipt_stamps_omits_the_delay_columns_entirely() {
+        let mut w = ShadowCandleWriter::for_test();
+        let row = ShadowSealRow {
+            table_name: TfIndex::M1.table_name(),
+            timestamp_ist_nanos: 1_716_023_700_i64 * 1_000_000_000,
+            security_id: 4242,
+            segment: "NSE_FNO",
+            feed: "dhan",
+            open: 100.0,
+            high: 105.0,
+            low: 99.0,
+            close: 101.0,
+            volume: 1234,
+            oi: 50_000,
+            tick_count: 5,
+            close_pct_from_prev_day: 1.5,
+            open_pct: 0.4,
+            change_pct: 1.5,
+            open_gap_pct: 0.2,
+            total_buy_qty: 89_600,
+            total_sell_qty: 4_800,
+            open_latency_ns: None,
+            close_latency_ns: None,
+            window_span_latency_ns: None,
+        };
+        w.append_row(&row).expect("append row without delays");
+        let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
+
+        for absent in [
+            "open_latency",
+            "open_latency_ns",
+            "close_latency",
+            "close_latency_ns",
+            "window_span_latency",
+            "window_span_latency_ns",
+        ] {
+            assert!(
+                !s.contains(absent),
+                "{absent} must be ABSENT (NULL), never written as zero, got {s}"
+            );
+        }
+        // Non-vacuity: the row itself really was serialised.
+        assert!(
+            s.starts_with("candles_1m,"),
+            "the row must still be written, only its delays omitted, got {s}"
+        );
+        assert!(
+            s.contains("total_sell_qty=4800i"),
+            "the column before the delay block must still be present, got {s}"
+        );
+    }
+
+    /// The scratch buffer is reused across rows, so a stale render must never
+    /// trail into the next one. Two rows through ONE writer, second shorter.
+    #[test]
+    fn the_reused_delay_scratch_never_leaks_one_rows_text_into_the_next() {
+        let mk = |ns: i64| ShadowSealRow {
+            table_name: TfIndex::M1.table_name(),
+            timestamp_ist_nanos: 1_716_023_700_i64 * 1_000_000_000,
+            security_id: 4242,
+            segment: "NSE_FNO",
+            feed: "dhan",
+            open: 100.0,
+            high: 105.0,
+            low: 99.0,
+            close: 101.0,
+            volume: 1234,
+            oi: 50_000,
+            tick_count: 5,
+            close_pct_from_prev_day: 1.5,
+            open_pct: 0.4,
+            change_pct: 1.5,
+            open_gap_pct: 0.2,
+            total_buy_qty: 89_600,
+            total_sell_qty: 4_800,
+            open_latency_ns: Some(ns),
+            close_latency_ns: None,
+            window_span_latency_ns: None,
+        };
+        let mut w = ShadowCandleWriter::for_test();
+        // Long text first (19 chars), then the shortest possible (13).
+        w.append_row(&mk(123_000_000)).expect("first");
+        w.append_row(&mk(4)).expect("second");
+        let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
+        assert!(
+            s.contains(r#"open_latency="4 nanoseconds""#),
+            "the second row must render its OWN value cleanly, got {s}"
+        );
+        assert!(
+            !s.contains(r#"open_latency="123 milliseconds4 nanoseconds""#),
+            "a missing clear() would append the second render onto the first, got {s}"
         );
     }
 }

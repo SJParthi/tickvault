@@ -1,5 +1,32 @@
-//! `top_volume` table — a queryable record of WHICH option contracts
+//! `top_volume_<tf>` tables — a queryable record of WHICH option contracts
 //! were the busiest, and whether we were actually watching them.
+//!
+//! ## ⚠ 2026-09-22 — FOUR DIRECT TABLES, one per timeframe
+//!
+//! Operator, verbatim: *"make the table itself per timeframe per timestamp
+//! shoudl be always sorted by volume percentage desc always timestamp asc …
+//! make it as direct tables dude why focusing on view"*.
+//!
+//! | Table | Holds | Written |
+//! |---|---|---|
+//! | `top_volume_1s` | the 1-second board | every second |
+//! | `top_volume_3s` | the 3-second board | every 3 s |
+//! | `top_volume_5s` | the 5-second board | every 5 s |
+//! | `top_volume_1m` | the 1-minute board | every minute |
+//!
+//! Same 15 columns, same DEDUP key, `PARTITION BY HOUR` each. The shared
+//! `top_volume` table and its four views are RETIRED; the writer routes each
+//! row by [`SnapshotCadence::table_name`].
+//!
+//! **Order.** One sweep is appended in rank order — `volume_percentage_change`
+//! DESCENDING — and sweeps run in time order, so rows are WRITTEN
+//! `ts ASC, volume_percentage_change DESC`. That is pinned by test on the
+//! projection. Whether QuestDB PRESERVES arrival order among rows sharing one
+//! `ts` through WAL apply and DEDUP is **UNVERIFIED** (no live QuestDB is
+//! reachable from the build environment); a reader who needs the order
+//! guaranteed today writes `ORDER BY ts, volume_percentage_change DESC`, which
+//! over already-ordered rows is close to free.
+//!
 //!
 //! Operator directive 2026-09-06: *"ensure to capture the top volume gainers
 //! of the entire options contracts starting 9.15 am till 3.39 pm ... meanwhile
@@ -39,7 +66,7 @@
 //! **What happens to a box that already has the table is worth stating
 //! plainly, because it is not what "removed" sounds like.** This module's
 //! self-heal is CREATE → `ADD COLUMN IF NOT EXISTS` → `DEDUP ENABLE`, and it
-//! contains no DROP by design (`top_volume_rank_ensure_statements_never_drop_
+//! contains no DROP by design (`top_volume_ensure_statements_never_drop_
 //! and_end_with_dedup_enable` fails the build on one, because a DROP in a path
 //! that runs every boot deletes history on any boot). QuestDB cannot drop a
 //! column through this path at all.
@@ -57,22 +84,16 @@
 //! ## Schema
 //!
 //! ```sql
-//! CREATE TABLE IF NOT EXISTS top_volume (
+//! -- identical for top_volume_1s / _3s / _5s / _1m
+//! CREATE TABLE IF NOT EXISTS top_volume_1s (
 //!     ts TIMESTAMP, tf SYMBOL, family SYMBOL, feed SYMBOL,
 //!     segment SYMBOL, contract SYMBOL, security_id LONG,
 //!     underlying_id LONG,
-//!     volume LONG, cumulative_day_volume LONG, delta_units LONG,
+//!     volume LONG,
 //!     per_lot_quantity LONG, total_lots_traded LONG,
 //!     volume_percentage_change LONG,
-//!     candle_volume_signed LONG,
-//!     candle_bucket_skew_secs LONG,
-//!     close_vs_prev_bar_pct DOUBLE,
 //!     percentage_change DOUBLE,
 //!     open_percentage_change DOUBLE,
-//!     open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE,
-//!     open_latency VARCHAR, open_latency_ns LONG,
-//!     close_latency VARCHAR, close_latency_ns LONG,
-//!     window_span VARCHAR, window_span_ns LONG,
 //!     subscribed BOOLEAN
 //! ) timestamp(ts) PARTITION BY HOUR
 //!   DEDUP UPSERT KEYS(ts, tf, family, feed, security_id, segment);
@@ -86,23 +107,19 @@
 //! `instrument_lifecycle` for names.
 //!
 //! `volume_percentage_change` is THE SORT KEY and `volume` is not, which is
-//! the one thing a reader of this table has to know. `cumulative_day_volume`
-//! is the vendor's CUMULATIVE day total for the contract -- it only ever
-//! rises, so ordering by it would rank "busy since 09:15", not "busy now".
-//! `total_lots_traded` is the whole lots traded INSIDE the window that just
-//! closed, normalised by `per_lot_quantity`: a 1s row measures one second, a
-//! 5s row measures five, and `volume_percentage_change` is that lot count
-//! expressed as a whole-number percentage against one lot. Both the input and
-//! the derived figure are stored so a row can be checked against the ranking
-//! that produced it.
+//! the one thing a reader of this table has to know. `total_lots_traded` is
+//! the whole lots traded INSIDE the window that just closed, normalised by
+//! `per_lot_quantity`: a 1s row measures one second, a 5s row measures five,
+//! and `volume_percentage_change` is that lot count expressed as a
+//! whole-number percentage against one lot.
 //!
-//! ⚠ `volume` is the CANDLE's signed volume for the same window -- the SAME
-//! number `candles_<tf>` carries, so the two tables agree with no derivation
-//! (operator, 2026-09-18: *"no extra claucltion or derivation"*). It is NOT
-//! the sort key and must never be used as one: a signed value orders sellers
-//! below an untraded contract. During the two-phase rename it is written by
-//! `candle_volume_signed` and the vendor day total lives in
-//! `cumulative_day_volume`; see the phase note above.
+//! `volume` is the CANDLE's OWN signed volume for the same window -- the SAME
+//! number `candles_<tf>` carries, read off the same fold probe rather than
+//! recomputed, so the two tables agree with no derivation (operator,
+//! 2026-09-19: *"no extra claucltion or derivation"*). It is NOT the sort key
+//! and must never be used as one: a signed value orders sellers below an
+//! untraded contract. It is NULL when the fold has no bar for the window --
+//! never a zero, which would read as "traded nothing".
 //!
 //! ## Honest volume
 //!
@@ -142,9 +159,12 @@
 //! (3,187,232 rows for a whole session under the 250 cut, which tells us
 //! nothing about the uncut count), and the 3s/5s/1m figures were never
 //! measured at all because the source partitions were archived to S3 and
-//! dropped from EBS before they could be. `SELECT tf, count(*) FROM
-//! top_volume WHERE ts IN today() GROUP BY tf` on the first session with
-//! this build is what turns the range into a number.
+//! dropped from EBS before they could be. Since 2026-09-22 each cadence is
+//! its own table, so the measurement is one count per table --
+//! `SELECT count(*) FROM top_volume_1s WHERE ts IN today()`, then the same for
+//! `_3s`, `_5s` and `_1m` -- on the first session with this build. (The single
+//! `GROUP BY tf` query that used to stand here names a table that no longer
+//! exists.)
 //!
 //! The `5s` rows are numerically a subset of the `1s` rows and are kept
 //! anyway because they mean something different: a `5s` row is the ranking
@@ -171,30 +191,44 @@
 
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::error_code::ErrorCode;
+use tickvault_common::types::ExchangeSegment;
 
-/// QuestDB table name — one row per (snapshot, timeframe, family, contract).
+/// The per-timeframe DIRECT tables — one per [`SnapshotCadence`].
 ///
-/// ⚠ RENAMED 2026-09-12 from `top_volume_rank` to `top_volume` (operator:
-/// "dotnt make it as top volume rank table meake the table name as top volume
-/// alone"). The rows already written under the old name are CARRIED FORWARD by
-/// [`LEGACY_TOP_VOLUME_RANK_TABLE`] below, never abandoned — a second table
-/// holding half the history is the split this repo's own rename helper exists
-/// to detect and report.
-pub const TOP_VOLUME_RANK_TABLE: &str = "top_volume";
+/// ⚠ 2026-09-22 (operator: *"make the table itself per timeframe … make it as
+/// direct tables dude why focusing on view"*). Until today every cadence was
+/// written to ONE `top_volume` table and read through four views filtered on
+/// `tf`. Each cadence now has its OWN table under the name the view used to
+/// carry, so a reader of `top_volume_5s` reads rows that are nothing but the
+/// 5-second board — no join, no filter over the other three cadences.
+///
+/// Declared as `…_TABLE` consts (not only inside `table_name()`) so
+/// `partition_retention_coverage_guard`, which discovers tables by scanning
+/// for that name pattern, sees all four and demands a retention decision for
+/// each.
+pub const TOP_VOLUME_1S_TABLE: &str = "top_volume_1s";
+/// See [`TOP_VOLUME_1S_TABLE`].
+pub const TOP_VOLUME_3S_TABLE: &str = "top_volume_3s";
+/// See [`TOP_VOLUME_1S_TABLE`].
+pub const TOP_VOLUME_5S_TABLE: &str = "top_volume_5s";
+/// See [`TOP_VOLUME_1S_TABLE`].
+pub const TOP_VOLUME_1M_TABLE: &str = "top_volume_1m";
 
-/// The name this table was created under until 2026-09-12.
+/// The single shared table every cadence was written to from 2026-09-12 until
+/// 2026-09-22. RETIRED as a write target — nothing writes it any more.
 ///
-/// `ensure_top_volume_rank_table` runs a one-shot `RENAME TABLE` from this to
-/// [`TOP_VOLUME_RANK_TABLE`] BEFORE its CREATE, so a box that already holds
-/// rows carries them into the new name instead of stranding them in a table
-/// that is no longer swept by the partition manager. The rename fails on every
-/// boot after the first, and that failure is EXPECTED and not an error — see
-/// `try_rename_legacy_table`, which additionally reports a SPLIT if both names
-/// somehow exist at once.
+/// Kept as a named const, and kept in `HOUR_PARTITIONED_TABLES`, so any rows it
+/// still holds age out under the 15-day market-data window instead of sitting
+/// un-swept forever. The fresh-start reset drops it outright on a box that has
+/// not yet run that reset.
+pub const LEGACY_TOP_VOLUME_TABLE: &str = "top_volume";
+
+/// The name the shared table carried until 2026-09-12. Also retired, also
+/// dropped by the fresh-start reset; listed in `RETENTION_EXEMPT_TABLES`.
 pub const LEGACY_TOP_VOLUME_RANK_TABLE: &str = "top_volume_rank";
 
 /// DEDUP key. Designated `ts` FIRST (2026-04-28 regression rule); `segment`
@@ -333,21 +367,23 @@ impl SnapshotCadence {
         }
     }
 
-    /// The named QuestDB view this cadence is read through.
+    /// The DIRECT table this cadence's rows are written to (2026-09-22).
     ///
-    /// Lives HERE, beside the label it filters on, because the view's `WHERE
-    /// t.tf = '<label>'` clause and the view's own name are one claim: a view
-    /// called `top_volume_3s` that filters `tf = '5s'` is wrong in a way
-    /// no reader of either file alone could see. `console_views` builds the
-    /// DDL from this pair rather than from a second enum of its own, which is
-    /// what the deleted `TopVolumeCadence` was.
+    /// Lives HERE, beside the `tf` label the same rows carry, because the
+    /// table's name and its `tf` value are one claim: a table called
+    /// `top_volume_3s` holding `tf = '5s'` rows is wrong in a way no reader of
+    /// either file alone could see. A `const fn` match — O(1), no allocation —
+    /// because the writer calls it once per row.
+    ///
+    /// *(Was `view_name()` until 2026-09-22, when these names were read-only
+    /// views over one shared `top_volume` table.)*
     #[must_use]
-    pub const fn view_name(self) -> &'static str {
+    pub const fn table_name(self) -> &'static str {
         match self {
-            Self::OneSecond => "top_volume_1s",
-            Self::ThreeSecond => "top_volume_3s",
-            Self::FiveSecond => "top_volume_5s",
-            Self::OneMinute => "top_volume_1m",
+            Self::OneSecond => TOP_VOLUME_1S_TABLE,
+            Self::ThreeSecond => TOP_VOLUME_3S_TABLE,
+            Self::FiveSecond => TOP_VOLUME_5S_TABLE,
+            Self::OneMinute => TOP_VOLUME_1M_TABLE,
         }
     }
 }
@@ -437,51 +473,11 @@ pub struct TopVolumeRankRow<'a> {
     pub security_id: i64,
     /// The underlying's numeric id. NOT a name — see the module header.
     pub underlying_id: i64,
-    /// Cumulative day volume as observed, AFTER the monotonicity gate — the
-    /// vendor's running total since 09:15, NOT a per-window figure.
-    ///
-    /// # Written to `cumulative_day_volume`, no longer to `volume` (2026-09-19)
-    ///
-    /// The operator asked for ONE plainly-named `volume` in this table that
-    /// equals the candle's signed per-window volume. A column called `volume`
-    /// already existed and held THIS number instead, and QuestDB's self-heal
-    /// can add a column but can neither rename nor drop one — so re-pointing
-    /// the name in a single change would give one column two meanings across a
-    /// partition boundary, with nothing in the row to tell a reader which
-    /// meaning their row carries.
-    ///
-    /// Phase 1 (this change) moves the vendor total to its own honestly-named
-    /// column and STOPS writing `volume`. Phase 2, once the 15-day
-    /// `market_data_hot_days` window has rolled every Phase-1 row off the
-    /// volume, starts writing the candle's signed number into `volume` and
-    /// retires `candle_volume_signed`. Safe by the clock rather than by
-    /// anyone remembering. Full contract: the 2026-09-19 §3 of
-    /// `websocket-connection-scope-lock.md`.
-    pub cumulative_day_volume: i64,
-    /// Traded UNITS inside the window that just closed — the NUMERATOR of
-    /// the rank key, and the number an operator calls "net volume".
-    ///
-    /// Added 2026-09-12. Until then the table stored the cumulative
-    /// volume and the derived lots figure, and NEITHER input of
-    /// the division was present: a reader looking at a row could not see
-    /// the traded quantity the rank was computed from, and could not
-    /// recover it, because `lots = delta * 1000 / lot_size`
-    /// is one equation in two unknowns. Consecutive rows do not rescue it
-    /// either — a contract only appears while it is inside the top
-    /// `TOP_VOLUME_RANK_PER_FAMILY`, so the volume series for any one
-    /// contract has holes exactly where it stopped being interesting.
-    ///
-    /// `u32` at the source (the vendor's counter width); a value that
-    /// cannot fit `i64` is impossible, but the projection converts rather
-    /// than casts so the impossibility is enforced rather than assumed.
-    pub delta_units: i64,
     /// Units per contract, from the day's master — the DENOMINATOR of the
     /// rank key. Stored as `per_lot_quantity` since 2026-09-19 (renamed from
     /// `lot_size` on the operator's plain-names instruction).
     ///
-    /// Added 2026-09-12, for the same reason as `delta_units` above: it is
-    /// the other half of the division and it was not recoverable from the
-    /// stored row. Sourced from the `LOT_SIZE` column of Dhan's
+    /// Added 2026-09-12. Sourced from the `LOT_SIZE` column of Dhan's
     /// `api-scrip-master-detailed.csv` and carried on `ContractOwner`, so
     /// it is the SAME value the ranking divided by rather than a re-lookup
     /// that could disagree with it.
@@ -505,13 +501,17 @@ pub struct TopVolumeRankRow<'a> {
     /// the operator has ruled that the displayed number is worth more than
     /// that resolution.
     ///
-    /// ⚠ **The rounding is real and is stated rather than buried.** A contract
-    /// that traded less than one whole lot in the window now reads `0`, and
-    /// two contracts that traded 1.2 and 1.8 lots both read `1`. The
-    /// full-resolution inputs remain in the row — `delta_units` and
-    /// `per_lot_quantity` — so the exact figure is always recoverable by
-    /// division, which is the property the 2026-09-12 note above was added to
-    /// guarantee and which this change deliberately preserves.
+    /// ⚠ **The rounding is real, and since 2026-09-19 it is NOT recoverable
+    /// from the row.** A contract that traded less than one whole lot in the
+    /// window reads `0`, and two contracts that traded 1.2 and 1.8 lots both
+    /// read `1`. Until the operator's 15-column narrowing the row also carried
+    /// `delta_units` (the traded units) beside `per_lot_quantity`, so the
+    /// exact figure was always recoverable by division; he removed that column
+    /// by name, so only the denominator survives and the numerator is gone.
+    /// Stated plainly rather than left for a reader to discover: this column
+    /// and `volume_percentage_change` are now the only record of the window's
+    /// size, both rounded, and the raw traded-unit count is not stored
+    /// anywhere in this table.
     ///
     /// The COMPARATOR is unaffected: it still orders on the full-resolution
     /// integer the leaderboard computed, so two contracts that round to the
@@ -542,125 +542,55 @@ pub struct TopVolumeRankRow<'a> {
     /// Integer, never a `DOUBLE`: it is derived from an integer key, and a
     /// float here could round two distinct keys onto one printed value.
     pub volume_percentage_change: i64,
-    /// The **candle fold's own signed volume** for this contract, in this
-    /// window — the exact number `candles_<tf>.volume` carries for the same
-    /// `(ts, security_id, segment, feed)` — or `None` when the fold has no
-    /// bar to read.
+    /// **The candle fold's own signed volume for this window** — the exact
+    /// number `candles_<tf>.volume` carries for the same
+    /// `(ts, security_id, segment, feed)` — or `None` when the fold has no bar
+    /// to read.
     ///
-    /// # Why this column exists (operator, 2026-09-18)
+    /// # This column IS the candle's number, with no derivation (operator, 2026-09-19)
     ///
-    /// *"i clelary told you to precisely have the same volume even in top
-    /// volume also as simialr to candles tables volume rigth dude … i mean it
-    /// shodu lbe precise as it is evenw ith minus also"*.
+    /// Verbatim: *"just we need to sue the rpecise volume which is avialable
+    /// in our candles tabels even in our top volume rigtht dude so that no
+    /// extra claucltion or derivation"*. So the value is READ off the same
+    /// `MultiTfAggregator` probe the candle writer seals from, never
+    /// recomputed here — if the two tables ever disagree, the bug is in the
+    /// probe, not in an arithmetic difference between two derivations.
     ///
-    /// `volume` beside it is the vendor's CUMULATIVE day counter and only ever
-    /// rises; `delta_units` is this window's traded UNITS and is always
-    /// positive. Neither is the candles table's number, which is **signed
-    /// gross** — negative when the bar closed below the previous bar's close.
-    /// So before this column the two tables could not be compared on volume at
-    /// all, however their timestamps lined up.
+    /// It is **signed gross**: negative when the bar closed below the previous
+    /// bar's close of the same timeframe, positive otherwise (a flat bar and a
+    /// first bar are both positive). `abs()` recovers the gross magnitude on
+    /// every row, which is what makes the 10-minute view derivable from the
+    /// 1-minute rows.
     ///
-    /// # ⚠ It is ADDED, and nothing was replaced
+    /// # The two-phase rename is GONE, and that is the fresh-start dividend
     ///
-    /// `volume`, `delta_units`, `lot_size`, `window_lots_milli` and
-    /// `net_volume_chg_milli_pct` are all UNCHANGED, and the sort is still
-    /// `window_lots_milli`. That is deliberate (operator, same day: *"bro just
-    /// keep evrythign … as logn as we confirm that manually and cross evrify
-    /// on modnay dont remvoe anythign"*): the old number and the new number sit
-    /// in the same row so a session can compare them side by side against the
-    /// candle table rather than taking a swap on trust.
+    /// Until 2026-09-19 this number lived in `candle_volume_signed` while
+    /// `volume` held the vendor's CUMULATIVE day counter, because QuestDB's
+    /// self-heal can add a column but can neither rename nor drop one — so
+    /// re-pointing the name on a live table would have given one column two
+    /// meanings across a partition boundary, with nothing in the row to tell a
+    /// reader which meaning theirs carried. The operator's fresh-scratch
+    /// directive (*"fresh db eveyrhtign needs to ebe entirley fresh new"*)
+    /// removes that constraint outright: a table with no legacy rows has no
+    /// second meaning to collide with, so Phase 1 and Phase 2 collapse into
+    /// one and the column is simply called what it is.
     ///
-    /// # Why it can be `None`, and why that is not a defect
-    ///
-    /// The fold is read at the snapshot instant by one O(1) probe. It answers
-    /// `None` when the contract has no aggregator slot at all (never ticked,
-    /// or the slot budget was exhausted), and the projection ALSO refuses a
-    /// bar that has never opened (`bucket_start_ist_secs == 0`) rather than
-    /// storing a zero that would read as "no trades" — the two are different
-    /// facts and only one of them is knowable here.
-    ///
-    /// Written as an ABSENT ILP field, i.e. NULL — the `gain_pct` precedent
-    /// directly above. A missing fold reading never costs the row its volume
-    /// columns.
-    pub candle_volume_signed: Option<i64>,
-    /// **The honesty column**: the fold bar's bucket-open second MINUS this
-    /// row's `ts`, in seconds. `0` means the two describe the SAME window.
-    ///
-    /// Present whenever [`Self::candle_volume_signed`] is, and absent with it.
-    ///
-    /// # Why a skew column rather than a silent read
-    ///
-    /// `MultiTfAggregator::snapshot` returns the bucket that is OPEN right
-    /// now. At a grid boundary that is almost always the window that just
-    /// closed — the next bucket opens on its first tick, not on the clock —
-    /// but a tick arriving in the same instant CAN roll it first, and this
-    /// sweep runs on the same task that folds ticks, so the race is real and
-    /// small rather than theoretical.
-    ///
-    /// Two further sources of a non-zero value, both legitimate: a contract
-    /// that did not trade in the window that just closed still holds its LAST
-    /// bar, which is older; and the leaderboard's window is "ticks OBSERVED
-    /// between sweeps" while a candle bucket is "ticks STAMPED inside the
-    /// bucket" (the fold clock is the exchange `ts` since 2026-09-18), so a
-    /// tick delivered across a boundary lands in different windows on the two
-    /// sides.
-    ///
-    /// Storing the skew makes every one of those visible in the row itself. A
-    /// cross-verification filters `candle_bucket_skew_secs = 0` and compares;
-    /// anything else is a row whose two volumes describe different windows and
-    /// were never meant to match. Silently reading whatever bar happened to be
-    /// open would have produced a column that is usually right and sometimes
-    /// quietly wrong, which is the false-OK this repository exists to refuse.
-    ///
-    /// `LONG` and signed: the bar can be older (negative) or, in the race
-    /// above, newer (positive).
-    pub candle_bucket_skew_secs: Option<i64>,
-    /// **This contract's own close against the PREVIOUS SEALED BAR** of the
-    /// same timeframe, in percent — or `None` when that bar had no usable
-    /// baseline.
-    ///
-    /// # ⚠ This is NOT a `candles_<tf>` column, and must never be sold as one
-    ///
-    /// Renamed from `candle_price_chg_pct` on 2026-09-19 because the old name
-    /// invited exactly the cross-table comparison it cannot survive. Its
-    /// baseline is `LiveCandleState::bucket_open_prev_close`, and the candle
-    /// row stores no such column: the four percentages it does store are
-    /// `close_pct_from_prev_day`, `change_pct` (the same field again),
-    /// `open_pct` and `open_gap_pct`. A reader comparing this against any of
-    /// them would find them disagreeing on almost every row with nothing in
-    /// either table explaining why. The two columns that DO match the candle
-    /// row are [`Self::percentage_change`] and
-    /// [`Self::open_percentage_change`], which is what they are named for.
-    ///
-    /// # Why it is kept at all
-    ///
-    /// It is the ONLY field in the row that explains the SIGN of the signed
-    /// volume. `LiveCandleState::signed_volume` picks that sign with
-    /// `close < bucket_open_prev_close` — the identical comparison this
-    /// percentage reports. Delete it and a reader sees a negative volume
-    /// beside a positive day-change percentage with nothing to reconcile them;
-    /// where this is NULL the volume is positive by that same rule, because
-    /// both refuse on the identical "no usable baseline" gate.
-    ///
-    /// `DOUBLE`, rounded to 2 decimals at the source by the fold's shared
-    /// `pct_change` — the operator's 2026-09-03 vendor-matching rule. The
-    /// integer rule that governs [`Self::volume_percentage_change`] does NOT
-    /// apply: that column is derived from an integer SORT KEY, where a float
-    /// could round two distinct keys onto one printed value. This one is a
-    /// float at source and orders nothing.
-    pub close_vs_prev_bar_pct: Option<f64>,
+    /// Written as an ABSENT ILP field, i.e. NULL, when the fold has no bar —
+    /// never a `0`, which would read as "traded nothing" when the truth is
+    /// "did not trade in the window this grid measures".
+    pub volume: Option<i64>,
     /// **Close vs YESTERDAY's close**, in percent — the headline day change,
-    /// byte-identical to what `candles_<tf>.change_pct` carries for the same
+    /// byte-identical to what `candles_<tf>.percentage_change` carries for the same
     /// `(ts, security_id, segment, feed)`.
     ///
     /// # Byte-identical by construction, not by coincidence (2026-09-19)
     ///
     /// Both columns are filled from the SAME `LiveCandleState` field,
     /// `close_pct_from_prev_day`, on the same bar: the candle writer reads it
-    /// in `shadow_seal_columns::from_buffered_seal` (which writes that one
-    /// field into BOTH its `close_pct_from_prev_day` and `change_pct`
-    /// columns), and this row reads it off the same probe that already
-    /// fetches [`Self::candle_volume_signed`]. Nothing is re-derived here —
+    /// in `shadow_seal_columns::from_buffered_seal` (the row field keeps its
+    /// old name `change_pct`; the COLUMN has been `percentage_change` since
+    /// 2026-09-19), and this row reads it off the same probe that already
+    /// fetches [`Self::volume`]. Nothing is re-derived here —
     /// operator 2026-09-19: *"no extra claucltion or derivation"*.
     ///
     /// `None` when the fold has no bar for this window, exactly as the
@@ -680,45 +610,6 @@ pub struct TopVolumeRankRow<'a> {
     /// div-by-zero guard), so a zero here can mean "no session open recorded
     /// yet" as well as "closed exactly at the open"; `None` means no bar.
     pub open_percentage_change: Option<f64>,
-    /// The bar's OPEN price — byte-identical to `candles_<tf>.open`.
-    pub bar_open: Option<f64>,
-    /// The bar's HIGH — byte-identical to `candles_<tf>.high`.
-    pub bar_high: Option<f64>,
-    /// The bar's LOW — byte-identical to `candles_<tf>.low`.
-    pub bar_low: Option<f64>,
-    /// The bar's CLOSE — byte-identical to `candles_<tf>.close`.
-    pub bar_close: Option<f64>,
-    /// How long after the window OPENED the first trade of it reached us, in
-    /// NANOSECONDS. `None` when this contract's receipt is unknown.
-    ///
-    /// # The two-column contract (operator, 2026-09-19)
-    ///
-    /// Verbatim: *"if it is below microseconds I need to know it took 100 or
-    /// 1000 microseconds, or if it is in milliseconds then the data should be
-    /// like this 100 or 200 or 123 milliseconds, or if it is in seconds then I
-    /// want to see this as 1 second or 2 seconds"*. So the table carries a
-    /// WHOLE-UNIT readable string (`open_latency`) AND this exact figure.
-    ///
-    /// **The `_ns` twin is not a convenience, it is the only sortable half.**
-    /// Text sorted descending compares the first character and stops: four real
-    /// delays of 1 second, 2 milliseconds, 3 microseconds and 4 nanoseconds sort
-    /// to `4, 3, 2, 1` — the EXACT REVERSE of their true order — and it looks
-    /// entirely plausible. Any `ORDER BY` must use this column.
-    ///
-    /// The row carries only the number; the writer renders the readable twin
-    /// from it at append time into one reusable buffer, so the pair cannot
-    /// disagree and the row stays allocation-free.
-    pub open_latency_ns: Option<i64>,
-    /// How long before the window CLOSED the last trade of it reached us, in
-    /// nanoseconds. Same contract as [`Self::open_latency_ns`].
-    pub close_latency_ns: Option<i64>,
-    /// First received trade to last received trade, in nanoseconds. `None`
-    /// unless BOTH receipts are known.
-    ///
-    /// On a contract that traded exactly once in the window this is `0`, which
-    /// is a real measurement (one trade spans no time) and not a missing one —
-    /// the missing case is `None` and renders as an empty cell.
-    pub window_span_ns: Option<i64>,
     /// Whether this contract actually held a depth subscription at this
     /// snapshot. The column that makes the table an audit rather than trivia.
     ///
@@ -826,7 +717,8 @@ pub fn render_delay_into(out: &mut String, nanos: i64) {
         out.push('s');
     }
 }
-/// The idempotent `CREATE TABLE` DDL for `top_volume_rank`. Pure.
+/// The idempotent `CREATE TABLE` DDL for ONE per-timeframe `top_volume_<tf>`
+/// table. Pure. All four tables share this exact schema and differ only in name.
 ///
 /// # The three orphan columns this DDL deliberately no longer names
 ///
@@ -840,14 +732,21 @@ pub fn render_delay_into(out: &mut String, nanos: i64) {
 /// states are honest; a column that is written under one name and read under
 /// another would not be.
 ///
-/// `volume` is the one exception and is KEPT here on purpose: it is the
-/// Phase-2 target name for the candle's signed volume, so a fresh table should
-/// already have it. Nothing writes it during Phase 1 — see
-/// [`TopVolumeRankRow::cumulative_day_volume`].
+/// `volume` is NAMED here and IS written: it carries the candle's signed
+/// gross volume for the window (see [`TopVolumeRankRow::volume`]), the same
+/// number the `candles_<tf>` row carries. The fresh-start reset collapsed the
+/// old two-phase rename into one step, so there is no `candle_volume_signed`
+/// and no `cumulative_day_volume` column any more.
+///
+/// *(CORRECTED 2026-09-22: this paragraph said `volume` was a Phase-2 target
+/// that "nothing writes during Phase 1" and linked a
+/// `TopVolumeRankRow::cumulative_day_volume` field that no longer exists.
+/// Both described the pre-reset plan.)*
 #[must_use]
-pub fn top_volume_rank_create_ddl() -> String {
+pub fn top_volume_create_ddl(cadence: SnapshotCadence) -> String {
+    let table = cadence.table_name();
     format!(
-        "CREATE TABLE IF NOT EXISTS {TOP_VOLUME_RANK_TABLE} (\
+        "CREATE TABLE IF NOT EXISTS {table} (\
             ts            TIMESTAMP, \
             tf            SYMBOL, \
             family        SYMBOL, \
@@ -857,26 +756,11 @@ pub fn top_volume_rank_create_ddl() -> String {
             security_id   LONG, \
             underlying_id LONG, \
             volume        LONG, \
-            cumulative_day_volume LONG, \
-            delta_units   LONG, \
             per_lot_quantity LONG, \
             total_lots_traded LONG, \
             volume_percentage_change LONG, \
-            candle_volume_signed LONG, \
-            candle_bucket_skew_secs LONG, \
-            close_vs_prev_bar_pct DOUBLE, \
             percentage_change DOUBLE, \
             open_percentage_change DOUBLE, \
-            open          DOUBLE, \
-            high          DOUBLE, \
-            low           DOUBLE, \
-            close         DOUBLE, \
-            open_latency  VARCHAR, \
-            open_latency_ns LONG, \
-            close_latency VARCHAR, \
-            close_latency_ns LONG, \
-            window_span   VARCHAR, \
-            window_span_ns LONG, \
             subscribed    BOOLEAN\
         ) timestamp(ts) PARTITION BY HOUR \
         DEDUP UPSERT KEYS({DEDUP_KEY_TOP_VOLUME_RANK});"
@@ -885,6 +769,7 @@ pub fn top_volume_rank_create_ddl() -> String {
 
 /// Every non-designated column, for the per-column self-heal ALTER manifest.
 /// Kept beside the DDL so `table_schema_lockstep_guard` can compare them.
+/// The SAME list for all four per-timeframe tables — they differ only in name.
 const TOP_VOLUME_RANK_COLUMNS: &[(&str, &str)] = &[
     ("tf", "SYMBOL"),
     ("family", "SYMBOL"),
@@ -894,67 +779,76 @@ const TOP_VOLUME_RANK_COLUMNS: &[(&str, &str)] = &[
     ("security_id", "LONG"),
     ("underlying_id", "LONG"),
     ("volume", "LONG"),
-    ("cumulative_day_volume", "LONG"),
-    ("delta_units", "LONG"),
     ("per_lot_quantity", "LONG"),
     ("total_lots_traded", "LONG"),
     ("volume_percentage_change", "LONG"),
-    ("candle_volume_signed", "LONG"),
-    ("candle_bucket_skew_secs", "LONG"),
-    ("close_vs_prev_bar_pct", "DOUBLE"),
     ("percentage_change", "DOUBLE"),
     ("open_percentage_change", "DOUBLE"),
-    ("open", "DOUBLE"),
-    ("high", "DOUBLE"),
-    ("low", "DOUBLE"),
-    ("close", "DOUBLE"),
-    ("open_latency", "VARCHAR"),
-    ("open_latency_ns", "LONG"),
-    ("close_latency", "VARCHAR"),
-    ("close_latency_ns", "LONG"),
-    ("window_span", "VARCHAR"),
-    ("window_span_ns", "LONG"),
     ("subscribed", "BOOLEAN"),
 ];
 
-/// The full idempotent statement list: CREATE, then per-column
-/// `ADD COLUMN IF NOT EXISTS`, then `DEDUP ENABLE`. Never a DROP. Pure, so
-/// the ordering is unit-testable without a live QuestDB.
+/// The `DROP VIEW` that clears a pre-2026-09-22 view of the SAME name before
+/// the table is created.
+///
+/// A QuestDB view and a table share one namespace, and until 2026-09-22 each
+/// of these four names was a VIEW over the shared `top_volume` table. A
+/// `CREATE TABLE IF NOT EXISTS top_volume_1s` against a box where that name is
+/// still a view does not create a table. So the view goes first.
+///
+/// From the second boot onward the name IS a table and no view of that name
+/// exists; `IF EXISTS` then makes the statement a no-op, and should QuestDB
+/// instead refuse a `DROP VIEW` that names a table, the refusal is EXPECTED —
+/// it is logged at debug by [`ensure_top_volume_tables`] and never counted as
+/// a failure (an error whose steady state is "once per boot, forever" trains
+/// the operator to ignore the counter).
 #[must_use]
-pub fn top_volume_rank_ensure_statements() -> Vec<String> {
-    let mut statements = vec![top_volume_rank_create_ddl()];
+pub fn top_volume_view_predrop_ddl(cadence: SnapshotCadence) -> String {
+    format!("DROP VIEW IF EXISTS {};", cadence.table_name())
+}
+
+/// The full idempotent statement list for ONE per-timeframe table: CREATE,
+/// then per-column `ADD COLUMN IF NOT EXISTS`, then `DEDUP ENABLE`. Never a
+/// DROP (the view pre-drop is separate, see [`top_volume_view_predrop_ddl`]).
+/// Pure, so the ordering is unit-testable without a live QuestDB.
+#[must_use]
+pub fn top_volume_ensure_statements(cadence: SnapshotCadence) -> Vec<String> {
+    let table = cadence.table_name();
+    let mut statements = Vec::with_capacity(TOP_VOLUME_RANK_COLUMNS.len() + 2);
+    statements.push(top_volume_create_ddl(cadence));
     for (col, ty) in TOP_VOLUME_RANK_COLUMNS {
         statements.push(format!(
-            "ALTER TABLE {TOP_VOLUME_RANK_TABLE} ADD COLUMN IF NOT EXISTS {col} {ty};"
+            "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {ty};"
         ));
     }
     statements.push(format!(
-        "ALTER TABLE {TOP_VOLUME_RANK_TABLE} DEDUP ENABLE \
-         UPSERT KEYS({DEDUP_KEY_TOP_VOLUME_RANK});"
+        "ALTER TABLE {table} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_TOP_VOLUME_RANK});"
     ));
     statements
 }
 
-/// Creates the `top_volume_rank` table if absent (schema-self-heal order:
+/// Creates the four per-timeframe `top_volume_<tf>` tables if absent
+/// (schema-self-heal order per table: drop a same-named legacy VIEW ->
 /// CREATE -> per-column ALTER -> DEDUP ENABLE; never a table drop).
 ///
 /// Fail-SOFT per statement: every failure logs at `error!` with
 /// `STORAGE-GAP-03` and the walk continues, so one refused statement never
-/// hides the next. The honest consequence, stated rather than hidden: a
-/// failed ensure leaves the table to be auto-created by the first ILP write
-/// WITHOUT `DEDUP UPSERT KEYS` — a duplicate-row window until a later ensure
-/// succeeds. Blocking the boot instead would trade a duplicate-row window
-/// for no session at all.
+/// hides the next, and one refused TABLE never hides the other three. The
+/// honest consequence, stated rather than hidden: a failed ensure leaves that
+/// table to be auto-created by the first ILP write WITHOUT `DEDUP UPSERT
+/// KEYS` — a duplicate-row window until a later ensure succeeds. Blocking the
+/// boot instead would trade a duplicate-row window for no session at all.
 ///
-/// Returns `true` only when EVERY statement was accepted, so the boot's
-/// bounded retry loop (`candle_ddl_boot::run_live_table_ddl_at_boot`) can
-/// re-run it beside `ticks` and `market_depth`. Until 2026-09-08 this fn
-/// returned `()` and had ZERO production callers — the table was written by
-/// its offload writer every second and ensured by nothing, so a fresh
-/// volume (the 2026-09-08 nuke) would have let the first ILP row auto-create
-/// it with no DEDUP key at all.
-// TEST-EXEMPT: live-QuestDB DDL runner; the statement list it sends is pure and is asserted by the ensure-statement tests below, and the boot call site is pinned by crates/app/tests/ensure_ddl_boot_wiring_guard.rs.
-pub async fn ensure_top_volume_rank_table(questdb_config: &QuestDbConfig) -> bool {
+/// Returns `true` only when EVERY statement for EVERY table was accepted
+/// (the view pre-drop excepted — its refusal is the normal steady state), so
+/// the boot's bounded retry loop (`candle_ddl_boot::run_live_table_ddl_at_boot`)
+/// can re-run it beside `ticks` and `market_depth`.
+///
+/// *(Until 2026-09-22 this was `ensure_top_volume_rank_table`, ensuring ONE
+/// shared `top_volume` table and first renaming a legacy `top_volume_rank`
+/// into it. The rename is gone: nothing writes the shared table any more, and
+/// the fresh-start reset drops both legacy names outright.)*
+// TEST-EXEMPT: live-QuestDB DDL runner; the statement lists it sends are pure and are asserted by the ensure-statement tests below, and the boot call site is pinned by crates/app/tests/ensure_ddl_boot_wiring_guard.rs.
+pub async fn ensure_top_volume_tables(questdb_config: &QuestDbConfig) -> bool {
     let base_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
@@ -969,122 +863,78 @@ pub async fn ensure_top_volume_rank_table(questdb_config: &QuestDbConfig) -> boo
                 code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
                 stage = "ensure_client_build",
                 ?err,
-                "STORAGE-GAP-03: HTTP client build failed — top_volume_rank not \
-                 ensured (the first ILP write may auto-create it WITHOUT dedup, \
+                "STORAGE-GAP-03: HTTP client build failed — top_volume_<tf> tables not \
+                 ensured (the first ILP write may auto-create them WITHOUT dedup, \
                  a duplicate-row window until the next successful boot)"
             );
             return false;
         }
     };
-    // BEFORE the CREATE, deliberately. A `CREATE TABLE IF NOT EXISTS
-    // top_volume` on a box that already holds `top_volume_rank` rows would
-    // succeed against an EMPTY new table and strand the old one: no longer in
-    // `HOUR_PARTITIONED_TABLES`, no longer swept, growing forever on a volume
-    // this repository has already filled twice. Renaming first carries the
-    // history across.
-    //
-    // The refusal is the NORMAL case from the second boot onward, which is why
-    // this goes through `try_rename_legacy_table` rather than the DDL loop
-    // below — that loop fires a coded error and increments a persist-error
-    // counter, and an error whose steady state is "one per boot, forever"
-    // trains the operator to discount the counter. The helper additionally
-    // probes whether the legacy table still exists on a refusal and reports a
-    // SPLIT, which is the only case here that needs a human.
-    //
-    // The `== Split` arm is NOT optional, and an earlier draft of this call
-    // discarded the verdict with `let _ =`. Both tables present means the
-    // history is halved — new rows in `top_volume`, everything before the
-    // rename stranded in `top_volume_rank`, which is no longer in
-    // `HOUR_PARTITIONED_TABLES` and so is never swept. That is the exact
-    // failure the comment above is about, and swallowing the verdict made it
-    // SILENT. Same shape as the three sibling renames
-    // (`spot_1m_rest_persistence`, `option_chain_1m_persistence`,
-    // `option_contract_1m_rest_persistence`): the helper deliberately does not
-    // log `Split` because the caller owns the coded error.
-    if crate::http_client::try_rename_legacy_table(
-        &client,
-        &base_url,
-        LEGACY_TOP_VOLUME_RANK_TABLE,
-        TOP_VOLUME_RANK_TABLE,
-    )
-    .await
-        == crate::http_client::LegacyRenameOutcome::Split
-    {
-        // `increment(1)`, and the `(0)` it replaced was the FOURTH vacuous
-        // instance found on this branch (2026-09-13, confirmed independently by
-        // two adversarial sweeps).
-        //
-        // A seed belongs at CONSTRUCTION, where it registers the series before
-        // the event. Inside the detection arm it is worse than nothing: the
-        // series comes into existence only when a split occurs, and it comes
-        // into existence reading ZERO. An operator grepping the counter across
-        // the fleet after a rollback-then-rollforward would find the number the
-        // metric exists to report saying nothing happened.
-        //
-        // All three sibling renames already do this correctly
-        // (`spot_1m_rest_persistence`, `option_chain_1m_persistence`,
-        // `option_contract_1m_rest_persistence` each `.increment(1)`); this one
-        // alone disagreed.
-        //
-        // HONEST LIMIT: this reuses a ROW-LOSS counter's name for a
-        // table-topology event, so a fleet-wide `sum()` now spans two label
-        // sets with two meanings. The `stage` label separates them and the
-        // coded `error!` below is the real triage surface; a dedicated metric
-        // name would cost ~$0.30/mo against a September forecast of $142.24
-        // and an automatic `STOP_EC2_INSTANCES` line at $135.00, which §2.3n of
-        // the noise lock says needs a LEVER and not a cost note. Recorded, not
-        // spent.
-        metrics::counter!(
-            "tv_top_volume_rank_rows_discarded_total",
-            "stage" => "legacy_table_split"
-        )
-        .increment(1);
-        error!(
-            code = "STORAGE-GAP-03",
-            stage = "legacy_table_split",
-            legacy_table = LEGACY_TOP_VOLUME_RANK_TABLE,
-            current_table = TOP_VOLUME_RANK_TABLE,
-            "STORAGE-GAP-03: both the legacy and current top-volume tables exist \
-             — the ranking history is SPLIT across two tables. New rows land in \
-             the current name; everything written before the rename stays in the \
-             legacy one, which is NOT in the hour-partitioned retention list and \
-             is therefore never swept. Neither is dropped; merging is an operator \
-             decision"
-        );
-    }
 
     let mut all_accepted = true;
-    for ddl in &top_volume_rank_ensure_statements() {
+    for cadence in SnapshotCadence::ALL {
+        // The legacy view of the same name, FIRST. Its refusal is expected
+        // from the second boot onward and is never a failure.
+        let predrop = top_volume_view_predrop_ddl(cadence);
         match client
             .get(&base_url)
-            .query(&[("query", ddl.as_str())])
+            .query(&[("query", predrop.as_str())])
             .send()
             .await
         {
             Ok(resp) if resp.status().is_success() => {}
             Ok(resp) => {
-                all_accepted = false;
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                error!(
-                    code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
-                    stage = "ensure_ddl",
-                    %status,
-                    ddl = ddl.as_str(),
-                    body = %body.chars().take(200).collect::<String>(),
-                    "STORAGE-GAP-03: top_volume_rank DDL returned non-2xx \
-                     (dedup may be missing — duplicate-row window)"
+                debug!(
+                    table = cadence.table_name(),
+                    status = %resp.status(),
+                    "top_volume: legacy view pre-drop refused — expected once the name \
+                     is a table"
                 );
             }
             Err(err) => {
-                all_accepted = false;
-                error!(
-                    code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
-                    stage = "ensure_ddl",
+                debug!(
+                    table = cadence.table_name(),
                     ?err,
-                    ddl = ddl.as_str(),
-                    "STORAGE-GAP-03: top_volume_rank DDL request failed"
+                    "top_volume: legacy view pre-drop request failed — the CREATE below \
+                     reports if it matters"
                 );
+            }
+        }
+
+        for ddl in &top_volume_ensure_statements(cadence) {
+            match client
+                .get(&base_url)
+                .query(&[("query", ddl.as_str())])
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {}
+                Ok(resp) => {
+                    all_accepted = false;
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    error!(
+                        code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+                        stage = "ensure_ddl",
+                        table = cadence.table_name(),
+                        %status,
+                        ddl = ddl.as_str(),
+                        body = %body.chars().take(200).collect::<String>(),
+                        "STORAGE-GAP-03: top_volume DDL returned non-2xx \
+                         (dedup may be missing — duplicate-row window)"
+                    );
+                }
+                Err(err) => {
+                    all_accepted = false;
+                    error!(
+                        code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+                        stage = "ensure_ddl",
+                        table = cadence.table_name(),
+                        ?err,
+                        ddl = ddl.as_str(),
+                        "STORAGE-GAP-03: top_volume DDL request failed"
+                    );
+                }
             }
         }
     }
@@ -1122,18 +972,6 @@ pub struct TopVolumeRankWriter {
     /// needs, never 180,000 identical lines. Saturating, so a pathological
     /// session cannot panic under `overflow-checks`.
     discard_episodes: usize,
-    /// One reusable buffer for the three readable delay strings.
-    ///
-    /// A `format!` per delay per row would be 3 x 20,220 = 60,660 fresh
-    /// allocations per sweep, on the frame-drain task, in a codebase whose
-    /// first principle is zero allocation on the hot path. The in-repo
-    /// precedent is on this very struct's row type: `TopVolumeRankRow.segment`
-    /// was a `String` until 2026-09-08 and was removed for exactly this.
-    ///
-    /// Rendering CLEARS it first and every value is at most ~22 bytes, so it
-    /// reaches its final capacity on the first row and never allocates again
-    /// for the life of the writer.
-    delay_scratch: String,
     /// Set by [`TopVolumeRankWriter::split_for_offload`]. When present, `flush`
     /// hands the buffer to the writer thread instead of touching the network.
     ///
@@ -1188,7 +1026,6 @@ impl TopVolumeRankWriter {
                     buffer: b,
                     pending: 0,
                     discard_episodes: 0,
-                    delay_scratch: String::new(),
                     offload: None,
                     retained_spans: 0,
                 }
@@ -1203,7 +1040,6 @@ impl TopVolumeRankWriter {
                     buffer: Buffer::new(ProtocolVersion::V1),
                     pending: 0,
                     discard_episodes: 0,
-                    delay_scratch: String::new(),
                     offload: None,
                     retained_spans: 0,
                 }
@@ -1220,7 +1056,6 @@ impl TopVolumeRankWriter {
             buffer: Buffer::new(ProtocolVersion::V1),
             pending: 0,
             discard_episodes: 0,
-            delay_scratch: String::new(),
             offload: None,
             retained_spans: 0,
         }
@@ -1246,13 +1081,9 @@ impl TopVolumeRankWriter {
     ///
     /// # Errors
     /// Propagates ILP buffer errors (table/column append failure).
-    fn write_row(
-        buffer: &mut Buffer,
-        scratch: &mut String,
-        r: &TopVolumeRankRow<'_>,
-    ) -> Result<()> {
+    fn write_row(buffer: &mut Buffer, r: &TopVolumeRankRow<'_>) -> Result<()> {
         buffer
-            .table(TOP_VOLUME_RANK_TABLE)
+            .table(r.cadence.table_name())
             .context("table")?
             // Symbols BEFORE columns (ILP tags-before-fields rule).
             .symbol("tf", r.cadence.as_str())
@@ -1271,15 +1102,6 @@ impl TopVolumeRankWriter {
             .context("security_id")?
             .column_i64("underlying_id", r.underlying_id)
             .context("underlying_id")?
-            // `volume` is NOT written during Phase 1 -- it is the Phase-2
-            // target name for the candle's signed number, and writing the
-            // vendor's day total into it would give one column two meanings
-            // across a partition boundary. See
-            // `TopVolumeRankRow::cumulative_day_volume`.
-            .column_i64("cumulative_day_volume", r.cumulative_day_volume)
-            .context("cumulative_day_volume")?
-            .column_i64("delta_units", r.delta_units)
-            .context("delta_units")?
             .column_i64("per_lot_quantity", r.per_lot_quantity)
             .context("per_lot_quantity")?
             .column_i64("total_lots_traded", r.total_lots_traded)
@@ -1300,20 +1122,8 @@ impl TopVolumeRankWriter {
         // on its own when the bar has no usable baseline (the session's first
         // bar of this timeframe) -- the same gate the signed volume uses to
         // decide it stays positive.
-        if let Some(candle_volume_signed) = r.candle_volume_signed {
-            buffer
-                .column_i64("candle_volume_signed", candle_volume_signed)
-                .context("candle_volume_signed")?;
-        }
-        if let Some(candle_bucket_skew_secs) = r.candle_bucket_skew_secs {
-            buffer
-                .column_i64("candle_bucket_skew_secs", candle_bucket_skew_secs)
-                .context("candle_bucket_skew_secs")?;
-        }
-        if let Some(close_vs_prev_bar_pct) = r.close_vs_prev_bar_pct {
-            buffer
-                .column_f64("close_vs_prev_bar_pct", close_vs_prev_bar_pct)
-                .context("close_vs_prev_bar_pct")?;
+        if let Some(volume) = r.volume {
+            buffer.column_i64("volume", volume).context("volume")?;
         }
         if let Some(percentage_change) = r.percentage_change {
             buffer
@@ -1324,40 +1134,6 @@ impl TopVolumeRankWriter {
             buffer
                 .column_f64("open_percentage_change", open_percentage_change)
                 .context("open_percentage_change")?;
-        }
-        if let Some(bar_open) = r.bar_open {
-            buffer.column_f64("open", bar_open).context("open")?;
-        }
-        if let Some(bar_high) = r.bar_high {
-            buffer.column_f64("high", bar_high).context("high")?;
-        }
-        if let Some(bar_low) = r.bar_low {
-            buffer.column_f64("low", bar_low).context("low")?;
-        }
-        if let Some(bar_close) = r.bar_close {
-            buffer.column_f64("close", bar_close).context("close")?;
-        }
-        // The three delay PAIRS. Each pair is written together or not at all:
-        // the readable string and its exact nanosecond twin describe the same
-        // measurement, so a row carrying one without the other would let a
-        // reader sort on a column that is missing for half the table.
-        //
-        // A `None` here means the receipt clock is unknown for this contract
-        // (a pre-`TVW3` WAL frame carries no receipt), and the honest
-        // rendering of an unknown delay is an EMPTY cell — never
-        // `0 nanoseconds`, which would claim the fastest possible delivery.
-        for (readable, exact, value) in [
-            ("open_latency", "open_latency_ns", r.open_latency_ns),
-            ("close_latency", "close_latency_ns", r.close_latency_ns),
-            ("window_span", "window_span_ns", r.window_span_ns),
-        ] {
-            if let Some(nanos) = value {
-                render_delay_into(scratch, nanos);
-                buffer
-                    .column_str(readable, scratch.as_str())
-                    .context(readable)?;
-                buffer.column_i64(exact, nanos).context(exact)?;
-            }
         }
         buffer
             .column_bool("subscribed", r.subscribed)
@@ -1404,7 +1180,7 @@ impl TopVolumeRankWriter {
                 .set_marker()
                 .context("top_volume_rank: marker refused on a cleared buffer")?;
         }
-        match Self::write_row(&mut self.buffer, &mut self.delay_scratch, r) {
+        match Self::write_row(&mut self.buffer, r) {
             Ok(()) => {
                 self.buffer.clear_marker();
                 self.pending = self.pending.saturating_add(1);
@@ -1779,6 +1555,12 @@ const TOP_VOLUME_MAX_ROWS_PER_SWEEP: usize =
 /// optional `f64`, a bool and a 19-digit nanosecond stamp — a worst-case row is
 /// **~265 B** by hand and a typical one ~233 B:
 ///
+/// ⚠ The sketch below is the 2026-09-12 LINE SHAPE, kept as the audit
+/// trail of that day's hand count. Five of its columns are gone from the table
+/// (`net_volume_chg_milli_pct`, `delta_units`, `lot_size`, `window_lots_milli`,
+/// `gain_pct`); the 15-column writer's real width is the 447 B measured at the
+/// bottom of this chain. Read it as history, never as today's row.
+///
 /// ```text
 ///   top_volume                                       11
 ///   ,tf=1m,family=stock,feed=dhan,segment=NSE_FNO    ~45
@@ -1901,7 +1683,40 @@ const TOP_VOLUME_MAX_ROWS_PER_SWEEP: usize =
 /// 32 MiB, a **22.5% margin** (was 41%). That margin is real and it is
 /// shrinking: two more schema additions of this size would breach the depth
 /// relationship, and the next one should re-derive rather than assume.
-const TOP_VOLUME_ILP_ROW_BYTES: usize = 1040;
+/// ⚠ 1040 -> 748 on 2026-09-19 (LATER STILL the same day), MEASURED by the
+/// same harness, and this is the first time the number has gone DOWN.
+///
+/// The operator stripped `top_volume` to its ranking columns that afternoon —
+/// `cumulative_day_volume`, `delta_units`, `candle_bucket_skew_secs`,
+/// `close_vs_prev_bar_pct` and the four OHLC passthroughs left the table, and
+/// `candle_volume_signed` became `volume`. Nine columns out, and the
+/// worst-case line went **926 -> 666 B**. 748 keeps the same ~12% headroom
+/// every step since 2026-09-13 has carried.
+///
+/// **Re-derived, not left high.** A constant that is too LARGE is the safe
+/// direction for row loss and the WRONG direction for the sizing relationship:
+/// it makes the producer ceiling claim more of the byte budget than the rows
+/// can possibly use, which is what made the six delay columns read as barely
+/// affordable one revision ago. At 748 B the ceiling is 25,000 x 748 =
+/// **18.7 MB** against depth's 32 MiB, a **44% margin** (was 22.5%) — room the
+/// three delay pairs moving into the candle fold will hand straight back.
+/// ⚠ 748 -> 502 on 2026-09-19 (LATER STILL the same day), MEASURED by the
+/// same harness, and the second DECREASE in one afternoon.
+///
+/// The three delay pairs moved OFF this table into the candle fold, where the
+/// operator asked for them. Six columns out and the worst-case line went
+/// **666 -> 447 B** — the exact 219 B the pairs added when they arrived, handed
+/// straight back, which is the arithmetic that says nothing else moved with
+/// them. 502 keeps the same ~12% headroom every step since 2026-09-13 has
+/// carried.
+///
+/// At 502 B the ceiling is 25,000 x 502 = **12.55 MB** against depth's 32 MiB,
+/// a **63% margin** (was 44%). Re-derived rather than left at 748 for the
+/// reason the previous decrease records: a constant that is too LARGE is safe
+/// against row loss and WRONG for the sizing relationship — it makes this
+/// producer claim byte budget the rows cannot use, which is what made the
+/// delay columns read as barely affordable two revisions ago.
+const TOP_VOLUME_ILP_ROW_BYTES: usize = 502;
 /// Worst-case sweeps the producer may hold before it drops.
 ///
 /// # ⚠ 2 → 1, forced by the corrected width above (2026-09-12)
@@ -1981,7 +1796,23 @@ const _: () = assert!(
 /// `i64::MIN` (a 20-character exact column beside a 19-character
 /// `-9223372037 seconds` twin). Update this by running the test and reading
 /// its message, never by counting.
-const MEASURED_WORST_CASE_ILP_ROW_BYTES: usize = 926;
+/// ⚠ 926 -> 666 on 2026-09-19 (LATER STILL the same day), and this is the
+/// first DECREASE this constant has ever recorded. The operator stripped nine
+/// columns off `top_volume` that afternoon, so the widest line the 21-column
+/// writer can emit is 666 B. Read from the test's own message, never counted —
+/// the same rule that has governed every rise.
+/// ⚠ 666 -> 447 on 2026-09-19 (LATER STILL the same day), the second
+/// DECREASE in one afternoon. The three delay pairs left this table for the
+/// candle fold, so the widest line the 15-column writer can emit is 447 B.
+/// Read from the test's own message — the constant was floored to 1, the test
+/// run, and the panic named the width — never counted. The same rule that has
+/// governed every rise.
+/// ⚠ 447 -> 450 on 2026-09-22. The row is unchanged; the TABLE NAME is
+/// what grew: every line now opens with `top_volume_1m` (the widest of the four
+/// per-cadence tables) instead of `top_volume`, three bytes longer. Read from
+/// the test's own message. The assumed 502 still covers it (11.6% headroom),
+/// so the producer ceiling does not move.
+const MEASURED_WORST_CASE_ILP_ROW_BYTES: usize = 450;
 
 // (3) The requirement the ORIGINAL assert's message named and its arithmetic
 //     could not check: the ceiling must hold at least one worst-case sweep at
@@ -2137,6 +1968,405 @@ impl TopVolumeRankWriterSink {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Off-drain ROW hand-off for top_volume (2026-09-22, item 44e)
+// ---------------------------------------------------------------------------
+//
+// Until 2026-09-22 the drain moved the network off its task but still did the
+// per-row ILP APPEND itself: float formatting, symbol escaping and the delay
+// renderer for every row, measured at 14,932 µs for a 20,220-row sweep --
+// 14.5x the sort it followed. The split below moves the append too. The drain
+// now copies plain row DATA into a pre-sized, recycled `Vec` and hands it over
+// with one `try_send`; the writer thread resolves each contract label, appends
+// the ILP line and flushes. Nothing on the drain formats a byte.
+
+/// Depth of the row hand-off queue: every cadence plus one.
+///
+/// All four cadences (1s/3s/5s/1m) can hand off in the SAME drain tick at the
+/// top of a minute. A depth equal to the cadence count (the first version,
+/// which borrowed the flush queue's four) dropped the last sweep of that
+/// tick whenever even one earlier batch was still queued — usually the 1m
+/// sweep (2026-09-22 hostile review). One spare slot absorbs that tick.
+pub const TOP_VOLUME_ROW_QUEUE_DEPTH: usize = SnapshotCadence::ALL.len() + 1;
+
+const _: () = assert!(
+    TOP_VOLUME_ROW_QUEUE_DEPTH > SnapshotCadence::ALL.len(),
+    "one drain tick hands off every cadence at once; the queue must hold them all"
+);
+
+/// Spare row vectors the writer thread returns for reuse. Queue depth plus the
+/// one in flight plus the one being filled: enough that the steady state never
+/// allocates, bounded so a stalled drain cannot pile vectors up.
+const TOP_VOLUME_ROW_RECYCLE_DEPTH: usize = TOP_VOLUME_ROW_QUEUE_DEPTH + 2;
+
+/// The day's contract labels, keyed exactly as the app's label snapshot is:
+/// `(security_id, segment)` per I-P1-11. A type ALIAS rather than a new type,
+/// so the drain hands over the SAME `Arc` its projection just read and the
+/// writer thread resolves every row against the identical snapshot.
+pub type TopVolumeLabelMap = std::collections::HashMap<(u64, ExchangeSegment), std::sync::Arc<str>>;
+
+/// A snapshot row staged on the drain: every column EXCEPT the contract label,
+/// which the writer thread resolves from the batch's label snapshot.
+///
+/// A newtype over a row whose label is empty, never the row itself, so an
+/// unresolved row cannot be appended by mistake: the only way back to an
+/// appendable [`TopVolumeRankRow`] is [`TopVolumeStagedRow::with_contract`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct TopVolumeStagedRow {
+    row: TopVolumeRankRow<'static>,
+}
+
+impl TopVolumeStagedRow {
+    /// Copies a projected row's data. O(1), no allocation: every field is a
+    /// scalar or a `&'static str`, and the borrowed label is dropped here.
+    ///
+    /// Written field by field, without `..`, so a column added to the row
+    /// fails to compile here instead of being silently lost on the way to
+    /// the writer thread.
+    #[must_use]
+    pub fn from_row(r: &TopVolumeRankRow<'_>) -> Self {
+        Self {
+            row: TopVolumeRankRow {
+                snapshot_ts_ist_nanos: r.snapshot_ts_ist_nanos,
+                cadence: r.cadence,
+                family: r.family,
+                feed: r.feed,
+                segment: r.segment,
+                contract: "",
+                security_id: r.security_id,
+                underlying_id: r.underlying_id,
+                per_lot_quantity: r.per_lot_quantity,
+                total_lots_traded: r.total_lots_traded,
+                volume_percentage_change: r.volume_percentage_change,
+                volume: r.volume,
+                percentage_change: r.percentage_change,
+                open_percentage_change: r.open_percentage_change,
+                subscribed: r.subscribed,
+            },
+        }
+    }
+
+    /// The appendable row, carrying `contract` as its label.
+    #[must_use]
+    pub fn with_contract<'b>(&self, contract: &'b str) -> TopVolumeRankRow<'b> {
+        let r = &self.row;
+        TopVolumeRankRow {
+            snapshot_ts_ist_nanos: r.snapshot_ts_ist_nanos,
+            cadence: r.cadence,
+            family: r.family,
+            feed: r.feed,
+            segment: r.segment,
+            contract,
+            security_id: r.security_id,
+            underlying_id: r.underlying_id,
+            per_lot_quantity: r.per_lot_quantity,
+            total_lots_traded: r.total_lots_traded,
+            volume_percentage_change: r.volume_percentage_change,
+            volume: r.volume,
+            percentage_change: r.percentage_change,
+            open_percentage_change: r.open_percentage_change,
+            subscribed: r.subscribed,
+        }
+    }
+
+    /// The label-snapshot key, rebuilt from the row's own id and segment
+    /// symbol. `None` for a negative id or a segment symbol no
+    /// [`ExchangeSegment`] renders -- neither is reachable from a projected
+    /// row, and both resolve to the unlabelled fallback rather than a guess.
+    fn label_key(&self) -> Option<(u64, ExchangeSegment)> {
+        let id = u64::try_from(self.row.security_id).ok()?;
+        Some((id, segment_from_symbol(self.row.segment)?))
+    }
+}
+
+/// The [`ExchangeSegment`] whose `as_str()` is `symbol`. Bounded scan of the
+/// wire codes 0..=8 (the enum has eight variants and a gap at 6), so O(1).
+fn segment_from_symbol(symbol: &str) -> Option<ExchangeSegment> {
+    (0_u8..=8)
+        .filter_map(ExchangeSegment::from_byte)
+        .find(|seg| seg.as_str() == symbol)
+}
+
+/// The label for one staged row: the snapshot's entry, or `unlabelled`.
+fn resolve_label<'m>(
+    labels: &'m TopVolumeLabelMap,
+    staged: &TopVolumeStagedRow,
+    unlabelled: &'m str,
+) -> &'m str {
+    staged
+        .label_key()
+        .and_then(|key| labels.get(&key))
+        .map_or(unlabelled, AsRef::as_ref)
+}
+
+/// One sweep's staged rows on their way to the writer thread.
+pub struct TopVolumeRowBatch {
+    labels: std::sync::Arc<TopVolumeLabelMap>,
+    rows: Vec<TopVolumeStagedRow>,
+}
+
+impl TopVolumeRowBatch {
+    /// Rows this batch carries.
+    #[must_use]
+    // TEST-EXEMPT: accessor, exercised by the row hand-off tests below.
+    pub fn rows(&self) -> usize {
+        self.rows.len()
+    }
+}
+
+/// What happened to a sweep the drain tried to hand off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopVolumeHandoff {
+    /// Nothing was staged; nothing was sent.
+    Empty,
+    /// Handed to the writer thread.
+    Sent(usize),
+    /// The queue was full. Rows DROPPED, counted and logged -- never retained,
+    /// never waited for (a snapshot is a periodic sample, not a unique event).
+    QueueFull(usize),
+    /// The writer thread is gone. Rows DROPPED, counted and logged.
+    SinkGone(usize),
+}
+
+/// The drain half of the row hand-off. Holds no ILP buffer and no `Sender`.
+pub struct TopVolumeRowProducer {
+    tx: std::sync::mpsc::SyncSender<TopVolumeRowBatch>,
+    spares: std::sync::mpsc::Receiver<Vec<TopVolumeStagedRow>>,
+    rows: Vec<TopVolumeStagedRow>,
+    discard_episodes: usize,
+}
+
+impl TopVolumeRowProducer {
+    fn with_channels(
+        tx: std::sync::mpsc::SyncSender<TopVolumeRowBatch>,
+        spares: std::sync::mpsc::Receiver<Vec<TopVolumeStagedRow>>,
+    ) -> Self {
+        metrics::counter!("tv_top_volume_rank_rows_discarded_total").increment(0);
+        metrics::counter!("tv_top_volume_rank_flush_offloaded_total").increment(0);
+        metrics::counter!("tv_top_volume_rank_flush_queue_full_total").increment(0);
+        Self {
+            tx,
+            spares,
+            rows: Vec::with_capacity(TOP_VOLUME_MAX_ROWS_PER_SWEEP),
+            discard_episodes: 0,
+        }
+    }
+
+    /// Test producer whose queue is open, with the receiving end returned.
+    #[must_use]
+    // TEST-EXEMPT: test-only constructor for the app crate's snapshot tests.
+    pub fn for_test() -> (Self, std::sync::mpsc::Receiver<TopVolumeRowBatch>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(TOP_VOLUME_ROW_QUEUE_DEPTH);
+        let (_spare_tx, spare_rx) = std::sync::mpsc::sync_channel(TOP_VOLUME_ROW_RECYCLE_DEPTH);
+        (Self::with_channels(tx, spare_rx), rx)
+    }
+
+    /// Stages one projected row. O(1), a copy into a pre-sized vector.
+    ///
+    /// Refuses -- and counts the refusal as a discard -- past
+    /// `TOP_VOLUME_MAX_ROWS_PER_SWEEP` rows, so the vector never grows past
+    /// its pre-sized capacity and the drain never reallocates.
+    pub fn stage(&mut self, row: &TopVolumeRankRow<'_>) -> bool {
+        if self.rows.len() >= TOP_VOLUME_MAX_ROWS_PER_SWEEP {
+            self.count_discard(1, "the sweep exceeded its row bound");
+            return false;
+        }
+        self.rows.push(TopVolumeStagedRow::from_row(row));
+        true
+    }
+
+    /// Rows staged and not yet handed off.
+    #[must_use]
+    // TEST-EXEMPT: observability accessor, exercised by the hand-off tests below.
+    pub fn pending(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Hands the staged rows to the writer thread with ONE `try_send`.
+    ///
+    /// Never blocks: a blocking send would re-create the drain coupling the
+    /// split exists to remove. A full queue DROPS the sweep and counts it on
+    /// the discard series -- it does not retain it for a later sweep, because
+    /// the next sweep re-ranks the whole board anyway.
+    pub fn hand_off(&mut self, labels: std::sync::Arc<TopVolumeLabelMap>) -> TopVolumeHandoff {
+        let rows = self.rows.len();
+        if rows == 0 {
+            return TopVolumeHandoff::Empty;
+        }
+        let batch = TopVolumeRowBatch {
+            labels,
+            rows: std::mem::take(&mut self.rows),
+        };
+        match self.tx.try_send(batch) {
+            Ok(()) => {
+                metrics::counter!("tv_top_volume_rank_flush_offloaded_total").increment(1);
+                // Steady state: a vector the writer returned. Only when none
+                // has come back yet (the first sweeps, or a writer that is
+                // behind) is a fresh one pre-sized -- once per sweep at most,
+                // never per row.
+                self.rows = self
+                    .spares
+                    .try_recv()
+                    .unwrap_or_else(|_| Vec::with_capacity(TOP_VOLUME_MAX_ROWS_PER_SWEEP));
+                TopVolumeHandoff::Sent(rows)
+            }
+            Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                metrics::counter!("tv_top_volume_rank_flush_queue_full_total").increment(1);
+                self.reclaim(returned);
+                self.count_discard(rows, "the writer queue was full");
+                TopVolumeHandoff::QueueFull(rows)
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(returned)) => {
+                self.reclaim(returned);
+                self.count_discard(rows, "the writer thread is gone");
+                TopVolumeHandoff::SinkGone(rows)
+            }
+        }
+    }
+
+    /// Drops staged rows that will never be handed off, counts and logs them.
+    /// Called at shutdown, the one moment nothing else hands them off.
+    pub fn discard_pending(&mut self) -> usize {
+        let dropped = self.rows.len();
+        self.rows.clear();
+        self.count_discard(dropped, "the lane shut down with rows staged");
+        dropped
+    }
+
+    /// Takes the vector back so its capacity is reused, then empties it.
+    fn reclaim(&mut self, returned: TopVolumeRowBatch) {
+        let mut rows = returned.rows;
+        rows.clear();
+        self.rows = rows;
+    }
+
+    fn count_discard(&mut self, dropped: usize, why: &'static str) {
+        if dropped == 0 {
+            return;
+        }
+        metrics::counter!("tv_top_volume_rank_rows_discarded_total").increment(dropped as u64);
+        self.discard_episodes = self.discard_episodes.saturating_add(1);
+        // Powers of two, as in `discard_pending` above: a dead writer thread
+        // turns every sweep into an episode, and the onset and the magnitude
+        // are what an operator needs, not thousands of identical lines.
+        if self.discard_episodes.is_power_of_two() {
+            error!(
+                episodes = self.discard_episodes,
+                code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+                metric = "tv_top_volume_rank_rows_discarded_total",
+                dropped,
+                why,
+                "STORAGE-GAP-03: top_volume_rank rows discarded before reaching \
+                 the writer thread -- the ranking record has a hole for those \
+                 snapshots. No tick is lost by this: the leaderboard is in RAM \
+                 and the next snapshot rebuilds it."
+            );
+        }
+    }
+}
+
+/// What the writer thread did with one batch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TopVolumeBatchOutcome {
+    /// Rows the batch carried.
+    pub staged: usize,
+    /// Rows appended to the ILP buffer.
+    pub appended: usize,
+    /// Rows the ILP buffer refused at append time.
+    pub append_failed: usize,
+    /// Rows that LANDED in QuestDB (zero on any flush failure).
+    pub landed: usize,
+}
+
+/// The thread half of the row hand-off: formats ILP lines and flushes them.
+pub struct TopVolumeRowWriter {
+    formatter: TopVolumeRankWriter,
+    sink: TopVolumeRankWriterSink,
+    spares: std::sync::mpsc::SyncSender<Vec<TopVolumeStagedRow>>,
+    unlabelled: &'static str,
+}
+
+impl TopVolumeRowWriter {
+    /// Appends and flushes one batch, then returns its vector for reuse.
+    ///
+    /// Runs on the writer thread, never the drain: this is where the per-row
+    /// ILP formatting the drain used to pay now happens.
+    pub fn write_batch(&mut self, batch: TopVolumeRowBatch) -> TopVolumeBatchOutcome {
+        let TopVolumeRowBatch { labels, mut rows } = batch;
+        let mut out = TopVolumeBatchOutcome {
+            staged: rows.len(),
+            ..TopVolumeBatchOutcome::default()
+        };
+        for staged in &rows {
+            let contract = resolve_label(&labels, staged, self.unlabelled);
+            if self
+                .formatter
+                .append_row(&staged.with_contract(contract))
+                .is_ok()
+            {
+                out.appended = out.appended.saturating_add(1);
+            } else {
+                out.append_failed = out.append_failed.saturating_add(1);
+            }
+        }
+        if self.formatter.pending > 0 {
+            let protocol = self.formatter.buffer.protocol_version();
+            let mut flush = TopVolumeFlushBatch {
+                buffer: std::mem::replace(&mut self.formatter.buffer, Buffer::new(protocol)),
+                rows: self.formatter.pending,
+            };
+            self.formatter.pending = 0;
+            out.landed = self.sink.write(&mut flush);
+            // The ILP buffer is recycled too: cleared, its capacity kept.
+            flush.buffer.clear();
+            self.formatter.buffer = flush.buffer;
+        }
+        rows.clear();
+        // Full or disconnected: the vector is simply dropped. Recycling is an
+        // optimisation, never a correctness path.
+        drop(self.spares.try_send(rows));
+        out
+    }
+}
+
+impl TopVolumeRankWriter {
+    /// Splits this writer into a drain-side ROW producer and a thread-side
+    /// row writer. Supersedes [`Self::split_for_offload`] on the lane: that
+    /// split moved the network off the drain, this one moves the per-row ILP
+    /// append off it as well.
+    ///
+    /// `unlabelled` is the label written when a row's contract has no entry in
+    /// the batch's label snapshot -- the same fallback the projection counts
+    /// as `label_unavailable`.
+    #[must_use]
+    pub fn split_rows_for_offload(
+        mut self,
+        unlabelled: &'static str,
+    ) -> (
+        TopVolumeRowProducer,
+        TopVolumeRowWriter,
+        std::sync::mpsc::Receiver<TopVolumeRowBatch>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(TOP_VOLUME_ROW_QUEUE_DEPTH);
+        let (spare_tx, spare_rx) = std::sync::mpsc::sync_channel(TOP_VOLUME_ROW_RECYCLE_DEPTH);
+        let sink = TopVolumeRankWriterSink {
+            sender: self.sender.take(),
+        };
+        self.offload = None;
+        let writer = TopVolumeRowWriter {
+            formatter: self,
+            sink,
+            spares: spare_tx,
+            unlabelled,
+        };
+        (
+            TopVolumeRowProducer::with_channels(tx, spare_rx),
+            writer,
+            rx,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2206,6 +2436,15 @@ mod tests {
         );
     }
 
+    /// The traded-unit count behind [`row`]'s figures.
+    ///
+    /// It is a CONSTANT here rather than a field because the operator removed
+    /// the traded-unit column from `top_volume` on 2026-09-19. The row still
+    /// has to be internally consistent -- 8,500 units on a 200-unit lot is
+    /// 42.5 lots, so 42 whole lots and +4150% -- and this is where the
+    /// numerator that makes that arithmetic checkable now lives.
+    const FIXTURE_TRADED_UNITS: i64 = 8_500;
+
     fn row() -> TopVolumeRankRow<'static> {
         TopVolumeRankRow {
             snapshot_ts_ist_nanos: 1_757_000_000_000_000_000,
@@ -2216,13 +2455,12 @@ mod tests {
             contract: "RELIANCE-25Sep2026-1400-CE",
             security_id: 44_321,
             underlying_id: 2885,
-            cumulative_day_volume: 117_567_970,
-            // The two inputs REPRODUCE the two figures beside them: 8,500
-            // units on a 200-unit lot is 42.5 lots, so `total_lots_traded` is
-            // 42 (whole lots) and the percentage is +4150%. A fixture whose
-            // inputs do not divide back to its own outputs would let a broken
-            // projection look right here.
-            delta_units: 8_500,
+            // 8,500 units traded on a 200-unit lot is 42.5 lots, so
+            // `total_lots_traded` is 42 (whole lots) and the percentage is
+            // +4150%. The unit count itself is no longer a column -- the
+            // operator removed it on 2026-09-19 -- so the fixture keeps the
+            // arithmetic in this comment rather than in a field, and the two
+            // stored figures still have to agree with each other.
             per_lot_quantity: 200,
             total_lots_traded: 42,
             // 42,500 milli-lots -> 42_500 * 100 - 100_000 = 4,150,000
@@ -2232,26 +2470,19 @@ mod tests {
             // and a fixture that agreed with the truncated derivation would
             // pass on a projection that had silently switched to it.
             volume_percentage_change: 4_150,
-            // The fold's own reading of the SAME bar, as the projection
-            // supplies it. NEGATIVE volume deliberately: the candles table's
-            // volume is signed, and a fixture that only ever carried a
-            // positive one could not tell a lost sign from a working one. `0`
-            // skew is the ordinary case — the row and the bar describe the
-            // same window — and the bar-over-bar fall is what made the volume
-            // negative, so the two agree the way `signed_volume()` makes them.
-            candle_volume_signed: Some(-8_500),
-            candle_bucket_skew_secs: Some(0),
-            close_vs_prev_bar_pct: Some(-0.37),
+            // The fold's own reading of the SAME bar, copied by the
+            // projection. NEGATIVE deliberately: the candles table's volume is
+            // signed, and a fixture that only ever carried a positive one
+            // could not tell a lost sign from a working one. Its MAGNITUDE is
+            // the 8,500 units the comment above works from, so this row's two
+            // volume figures and its lot arithmetic all describe one trade.
+            volume: Some(-8_500),
             // The candles table's OWN percentages, copied. Distinct VALUES
-            // from each other and from the bar-over-bar figure above, because
-            // they are three different measurements and a fixture that reused
-            // one number could not catch two of them being wired to one field.
+            // from each other, because they are two different measurements and
+            // a fixture that reused one number could not catch them being
+            // wired to the same field.
             percentage_change: Some(2.14),
             open_percentage_change: Some(-1.08),
-            bar_open: Some(1_412.55),
-            bar_high: Some(1_420.00),
-            bar_low: Some(1_396.10),
-            bar_close: Some(1_397.30),
             // Real delays, because the anti-vacuity guard below derives its
             // expectation from the column manifest: a fixture that left these
             // `None` would declare six columns that never reach the wire.
@@ -2264,9 +2495,6 @@ mod tests {
             // because the second band is whole-unit by the operator's own
             // instruction. The `_ns` twin carries the exact figure, which is
             // precisely the division of labour the pair exists for.
-            open_latency_ns: Some(123_000_000),
-            close_latency_ns: Some(1_000),
-            window_span_ns: Some(4_876_999_000),
             subscribed: true,
         }
     }
@@ -2355,7 +2583,7 @@ mod tests {
     #[test]
     fn the_rank_column_is_absent_from_the_ddl_the_manifest_and_the_wire() {
         assert!(
-            !top_volume_rank_create_ddl().contains("rank "),
+            !top_volume_create_ddl(SnapshotCadence::OneSecond).contains("rank "),
             "the CREATE still declares rank"
         );
         assert!(
@@ -2387,7 +2615,10 @@ mod tests {
     #[test]
     fn the_stored_percentage_follows_from_the_stored_inputs() {
         let r = row();
-        let milli_lots = r.delta_units * 1_000 / r.per_lot_quantity;
+        // The traded-unit count is NOT a column any more -- the operator
+        // removed it on 2026-09-19 -- so the numerator lives beside the
+        // fixture that uses it. The derivation it pins is unchanged.
+        let milli_lots = FIXTURE_TRADED_UNITS * 1_000 / r.per_lot_quantity;
         assert_eq!(
             r.volume_percentage_change,
             (milli_lots * 100 - 100_000) / 1_000,
@@ -2408,7 +2639,9 @@ mod tests {
         );
         // One lot is exactly zero change; below one lot is NEGATIVE, which is
         // the whole reason the change form was chosen over a ratio.
-        assert_eq!((1_000_i64 * 100 - 100_000) / 1_000, 0);
+        // `black_box` so clippy does not fold the one-lot case to a constant
+        // (`erasing_op`); the arithmetic is the point of the assertion.
+        assert_eq!((std::hint::black_box(1_000_i64) * 100 - 100_000) / 1_000, 0);
         assert!((500_i64 * 100 - 100_000) / 1_000 < 0);
     }
 
@@ -2439,7 +2672,7 @@ mod tests {
 
     #[test]
     fn top_volume_rank_create_ddl_partitions_by_hour_and_enables_dedup() {
-        let ddl = top_volume_rank_create_ddl();
+        let ddl = top_volume_create_ddl(SnapshotCadence::OneSecond);
         assert!(ddl.contains("PARTITION BY HOUR"), "{ddl}");
         assert!(
             ddl.contains(&format!("DEDUP UPSERT KEYS({DEDUP_KEY_TOP_VOLUME_RANK})")),
@@ -2452,7 +2685,7 @@ mod tests {
     /// Never a DROP — this table is append-only history.
     #[test]
     fn top_volume_rank_ensure_statements_never_drop_and_end_with_dedup_enable() {
-        let statements = top_volume_rank_ensure_statements();
+        let statements = top_volume_ensure_statements(SnapshotCadence::OneSecond);
         assert!(statements[0].starts_with("CREATE TABLE IF NOT EXISTS"));
         assert!(
             statements
@@ -2487,7 +2720,7 @@ mod tests {
         // for any table with one LONG column anywhere, so it could not catch a
         // manifest that declared the wrong type. It now compares the type
         // parsed from the column's OWN position in the DDL.
-        let ddl = top_volume_rank_create_ddl();
+        let ddl = top_volume_create_ddl(SnapshotCadence::OneSecond);
         let created = ddl_columns(&ddl);
 
         for (col, ty) in TOP_VOLUME_RANK_COLUMNS {
@@ -2547,7 +2780,7 @@ mod tests {
     /// depends on it passes by reading an empty list.
     #[test]
     fn the_ddl_column_parser_reads_the_whole_list_and_not_a_prefix() {
-        let created = ddl_columns(&top_volume_rank_create_ddl());
+        let created = ddl_columns(&top_volume_create_ddl(SnapshotCadence::OneSecond));
         assert_eq!(
             created.len(),
             TOP_VOLUME_RANK_COLUMNS.len() + 1,
@@ -2555,9 +2788,7 @@ mod tests {
         );
         assert_eq!(created.first().map(|c| c.0.as_str()), Some("ts"));
         assert!(
-            created
-                .iter()
-                .any(|(n, t)| n == "delta_units" && t == "LONG"),
+            created.iter().any(|(n, t)| n == "volume" && t == "LONG"),
             "parsed {created:?}"
         );
         assert!(
@@ -2620,9 +2851,9 @@ mod tests {
         let line = w.buffer_utf8();
         for expected in [
             // The TRAILING COMMA is the assertion. An ILP table name ends at
-            // the first comma, so "top_volume," rejects the pre-2026-09-12
-            // "top_volume_rank," that a bare "top_volume" would accept.
-            "top_volume,",
+            // the first comma, so "top_volume_5s," rejects both the retired
+            // shared "top_volume," and any other cadence's table.
+            "top_volume_5s,",
             "tf=5s",
             "family=stock_option",
             "feed=dhan",
@@ -2631,10 +2862,9 @@ mod tests {
             "volume_percentage_change=4150i",
             "security_id=44321i",
             "total_lots_traded=42i",
-            "delta_units=8500i",
             "per_lot_quantity=200i",
             "underlying_id=2885i",
-            "cumulative_day_volume=117567970i",
+            "volume=-8500i",
             "subscribed=t",
         ] {
             assert!(line.contains(expected), "missing {expected} in: {line}");
@@ -2664,6 +2894,11 @@ mod tests {
     /// recording the wrong shape would have sent the next reader looking for
     /// the wrong thing. `volume` was and remains the only live instance.
     ///
+    /// ⚠ 2026-09-19: the six delay columns that example names left this
+    /// table with the 21→15 strip (they live on `candles_<tf>` now), so the
+    /// names no longer resolve here. The correction is kept because the
+    /// LESSON is the durable half — suffix, never prefix.
+    ///
     /// The anchoring is kept regardless, for two reasons that survive the
     /// correction: it is what makes the `volume` carve-out below honest
     /// rather than accidental, and the next suffix collision costs nothing to
@@ -2679,18 +2914,19 @@ mod tests {
         w.append_row(&row()).expect("append");
         let line = w.buffer_utf8();
         for (col, _) in TOP_VOLUME_RANK_COLUMNS {
-            // `volume` is DECLARED and deliberately not written during Phase 1
-            // — it is the Phase-2 target name for the candle's signed number.
-            // Named here rather than silently passing on a substring.
-            if *col == "volume" {
-                assert!(
-                    !line.contains(&format!(",{col}=")) && !line.contains(&format!(" {col}=")),
-                    "`volume` reached the wire during Phase 1 — one column would \
-                     then hold the vendor day total and the candle's signed \
-                     number across a partition boundary: {line}"
-                );
-                continue;
-            }
+            // ⚠ RETIRED 2026-09-19 — the `volume` carve-out that stood here
+            // asserted the column must NOT reach the wire, because a two-phase
+            // rename was holding `volume` empty for a retention window so one
+            // column could never mean the vendor day total on Monday's rows and
+            // the candle's signed number on Tuesday's.
+            //
+            // Both halves of that reason are gone. The operator ordered a fresh
+            // scratch database the same day, so no row anywhere holds the old
+            // meaning and there is no partition boundary to straddle; and
+            // `cumulative_day_volume` — the column whose suffix made the
+            // unanchored match vacuous in the first place — left the table in
+            // the same change. `volume` is now an ordinary written column and
+            // is proven by the loop below exactly like every other one.
             assert!(
                 line.contains(&format!(",{col}=")) || line.contains(&format!(" {col}=")),
                 "declared column {col} never reached the ILP line: {line}"
@@ -2709,9 +2945,8 @@ mod tests {
     fn the_stored_inputs_reproduce_the_stored_lot_count() {
         let r = row();
         assert_eq!(r.per_lot_quantity, 200, "the fixture's denominator");
-        assert_eq!(r.delta_units, 8_500, "the fixture's numerator");
         assert_eq!(
-            r.delta_units / r.per_lot_quantity,
+            FIXTURE_TRADED_UNITS / r.per_lot_quantity,
             r.total_lots_traded,
             "8,500 units on a 200-unit lot is 42 whole lots"
         );
@@ -2822,7 +3057,6 @@ mod tests {
         let mut r = row();
         r.percentage_change = None;
         r.open_percentage_change = None;
-        r.close_vs_prev_bar_pct = None;
         w.append_row(&r).expect("append");
         let line = w.buffer_utf8();
         // ⚠ The LEADING COMMA is load-bearing and is not decoration. Every ILP
@@ -2845,8 +3079,8 @@ mod tests {
         }
         assert!(
             line.contains(&format!(
-                "cumulative_day_volume={}i",
-                r.cumulative_day_volume
+                "volume={}i",
+                r.volume.expect("fixture carries a volume")
             )),
             "the row must still carry its volume -- that is the column this \
              table exists for, and the whole reason a missing percentage no \
@@ -2891,8 +3125,6 @@ mod tests {
             contract: "MAZAGONDOCKSHIPBUILDERS-25Sep2026-123456.75-CE",
             security_id: i64::MAX,
             underlying_id: i64::MAX,
-            cumulative_day_volume: i64::from(u32::MAX),
-            delta_units: i64::from(u32::MAX),
             per_lot_quantity: i64::MAX,
             total_lots_traded: i64::MAX,
             volume_percentage_change: i64::MIN,
@@ -2903,26 +3135,10 @@ mod tests {
             // test is that no real row can exceed the assumed width, so an
             // optional column omitted here would under-measure exactly the
             // case it exists to bound.
-            candle_volume_signed: Some(i64::MIN),
-            candle_bucket_skew_secs: Some(i64::MIN),
-            close_vs_prev_bar_pct: Some(-1.234_567_890_123_456_7_f64),
+            volume: Some(i64::MIN),
             percentage_change: Some(-1.234_567_890_123_456_7_f64),
             open_percentage_change: Some(-1.234_567_890_123_456_7_f64),
-            bar_open: Some(-1.234_567_890_123_456_7_f64),
-            bar_high: Some(-1.234_567_890_123_456_7_f64),
-            bar_low: Some(-1.234_567_890_123_456_7_f64),
-            bar_close: Some(-1.234_567_890_123_456_7_f64),
             subscribed: true,
-            // The three delay PAIRS at THEIR extreme, which is `i64::MIN` in
-            // every one: the exact column prints 20 characters
-            // (`-9223372036854775808`) and the readable twin renders in the
-            // SECOND band as `-9223372037 seconds`, 19 more. Leaving these
-            // `None` here would under-measure by all six columns — exactly the
-            // case this test exists to bound, and exactly the vacuity the
-            // column-manifest guard above was corrected for on the same day.
-            open_latency_ns: Some(i64::MIN),
-            close_latency_ns: Some(i64::MIN),
-            window_span_ns: Some(i64::MIN),
         };
         w.append_row(&r).expect("append");
         let width = w.buffer_utf8().len();
@@ -3383,60 +3599,388 @@ mod tests {
         );
     }
 
-    /// A row with no receipt writes NEITHER half of any pair — never
-    /// `0 nanoseconds`, which would claim the fastest possible delivery for a
-    /// delay nobody measured.
+    // ------------------------------------------------------------------
+    // 2026-09-22 — four DIRECT per-timeframe tables.
+    // ------------------------------------------------------------------
+
+    /// Every cadence has its own table, named `top_volume_<label>`, and no two
+    /// cadences share one. The suffix IS the `tf` label, so a row's table and
+    /// its `tf` column can never disagree.
     #[test]
-    fn a_row_without_a_receipt_omits_both_halves_of_every_delay_pair() {
-        let mut w = TopVolumeRankWriter::for_test();
-        let row = TopVolumeRankRow {
-            open_latency_ns: None,
-            close_latency_ns: None,
-            window_span_ns: None,
-            ..row()
-        };
-        w.append_row(&row).expect("append");
-        let line = w.buffer_utf8();
-        for col in [
-            "open_latency=",
-            "open_latency_ns=",
-            "close_latency=",
-            "close_latency_ns=",
-            "window_span=",
-            "window_span_ns=",
-        ] {
+    fn every_cadence_has_its_own_table_named_after_its_label() {
+        let mut seen = std::collections::HashSet::new();
+        for c in SnapshotCadence::ALL {
+            let table = c.table_name();
+            assert_eq!(table, format!("top_volume_{}", c.as_str()));
+            assert!(seen.insert(table), "{table} is shared by two cadences");
+            assert_ne!(table, LEGACY_TOP_VOLUME_TABLE);
+            assert_ne!(table, LEGACY_TOP_VOLUME_RANK_TABLE);
+        }
+        assert_eq!(seen.len(), 4);
+        // The four consts are what the retention guard discovers; they must be
+        // exactly what `table_name()` returns.
+        let consts = [
+            TOP_VOLUME_1S_TABLE,
+            TOP_VOLUME_3S_TABLE,
+            TOP_VOLUME_5S_TABLE,
+            TOP_VOLUME_1M_TABLE,
+        ];
+        for (c, k) in SnapshotCadence::ALL.iter().zip(consts) {
+            assert_eq!(c.table_name(), k);
+        }
+    }
+
+    /// `table_name()` is a `const fn` — callable at compile time, which is the
+    /// proof it allocates nothing and does no lookup at run time.
+    #[test]
+    fn table_name_is_evaluable_at_compile_time() {
+        const NAME: &str = SnapshotCadence::OneMinute.table_name();
+        assert_eq!(NAME, "top_volume_1m");
+    }
+
+    /// Each cadence's row reaches ITS table and no other, for all four.
+    #[test]
+    fn the_writer_routes_every_cadence_to_its_own_table() {
+        for c in SnapshotCadence::ALL {
+            let mut w = TopVolumeRankWriter::for_test();
+            w.append_row(&TopVolumeRankRow {
+                cadence: c,
+                ..row()
+            })
+            .expect("append");
+            let line = w.buffer_utf8();
+            let prefix = format!("{},", c.table_name());
+            assert!(line.starts_with(&prefix), "{c:?} wrote {line}");
+            assert!(line.contains(&format!("tf={}", c.as_str())), "{line}");
+            for other in SnapshotCadence::ALL {
+                if other != c {
+                    assert!(
+                        !line.starts_with(&format!("{},", other.table_name())),
+                        "{c:?} leaked into {}",
+                        other.table_name()
+                    );
+                }
+            }
+            assert!(!line.starts_with("top_volume,"), "wrote the retired table");
+        }
+    }
+
+    /// Every ORDER in which the four cadences can arrive in one buffer — all
+    /// 24 permutations — routes every line correctly. A writer that remembered
+    /// the previous row's table would fail some ordering, never all of them.
+    #[test]
+    fn every_arrival_order_of_the_four_cadences_routes_each_line_correctly() {
+        fn permutations(items: &[SnapshotCadence]) -> Vec<Vec<SnapshotCadence>> {
+            if items.len() <= 1 {
+                return vec![items.to_vec()];
+            }
+            let mut out = Vec::new();
+            for i in 0..items.len() {
+                let mut rest = items.to_vec();
+                let head = rest.remove(i);
+                for mut tail in permutations(&rest) {
+                    tail.insert(0, head);
+                    out.push(tail);
+                }
+            }
+            out
+        }
+        let all = permutations(&SnapshotCadence::ALL);
+        assert_eq!(all.len(), 24);
+        for order in all {
+            let mut w = TopVolumeRankWriter::for_test();
+            for c in &order {
+                w.append_row(&TopVolumeRankRow {
+                    cadence: *c,
+                    ..row()
+                })
+                .expect("append");
+            }
+            assert_eq!(w.pending(), 4);
+            let text = w.buffer_utf8();
+            let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+            assert_eq!(lines.len(), 4, "{text}");
+            for (line, c) in lines.iter().zip(&order) {
+                assert!(
+                    line.starts_with(&format!("{},", c.table_name())),
+                    "order {order:?}: {line}"
+                );
+            }
+        }
+    }
+
+    /// The four CREATEs are identical apart from the table name — one schema,
+    /// four tables. A column added to one and not the others is caught here.
+    #[test]
+    fn top_volume_create_ddl_is_one_schema_byte_for_byte_across_the_four_tables() {
+        let normalised: Vec<String> = SnapshotCadence::ALL
+            .iter()
+            .map(|c| top_volume_create_ddl(*c).replace(c.table_name(), "T"))
+            .collect();
+        for ddl in &normalised[1..] {
+            assert_eq!(ddl, &normalised[0]);
+        }
+        for c in SnapshotCadence::ALL {
+            let ddl = top_volume_create_ddl(c);
             assert!(
-                !line.contains(col),
-                "{col} present on a receipt-less row: {line}"
+                ddl.starts_with(&format!("CREATE TABLE IF NOT EXISTS {} (", c.table_name())),
+                "{ddl}"
+            );
+            assert!(ddl.contains("PARTITION BY HOUR"));
+            assert!(ddl.contains(&format!("DEDUP UPSERT KEYS({DEDUP_KEY_TOP_VOLUME_RANK})")));
+            // `tf` stays in the key even though it is constant per table: it
+            // keeps a UNION across the four self-describing.
+            assert!(DEDUP_KEY_TOP_VOLUME_RANK.contains("tf"));
+        }
+    }
+
+    /// Every self-heal statement for a cadence names THAT cadence's table and
+    /// no other; none drops anything; DEDUP ENABLE is last.
+    #[test]
+    fn top_volume_ensure_statements_touch_only_that_table_and_never_drop() {
+        for c in SnapshotCadence::ALL {
+            let statements = top_volume_ensure_statements(c);
+            assert_eq!(statements.len(), TOP_VOLUME_RANK_COLUMNS.len() + 2);
+            for s in &statements {
+                assert!(s.contains(c.table_name()), "{s}");
+                assert!(!s.to_uppercase().contains("DROP"), "{s}");
+                for other in SnapshotCadence::ALL {
+                    if other != c {
+                        assert!(!s.contains(other.table_name()), "{s}");
+                    }
+                }
+                assert!(
+                    !s.contains(&format!("{LEGACY_TOP_VOLUME_TABLE} ")),
+                    "names the retired shared table: {s}"
+                );
+            }
+            assert!(statements[0].starts_with("CREATE TABLE IF NOT EXISTS"));
+            assert!(
+                statements
+                    .last()
+                    .is_some_and(|s| s.contains("DEDUP ENABLE"))
             );
         }
     }
 
-    /// The present case: each pair writes BOTH halves, and the readable half
-    /// is the rendering of its own twin — so a reader can never sort on a
-    /// number that disagrees with the text beside it.
+    /// The pre-drop removes a same-named legacy VIEW only — never a table.
     #[test]
-    fn each_delay_pair_writes_the_number_and_its_own_rendering() {
-        let mut w = TopVolumeRankWriter::for_test();
-        let row = TopVolumeRankRow {
-            open_latency_ns: Some(123_000_000),
-            close_latency_ns: Some(1_000),
-            window_span_ns: Some(0),
-            ..row()
-        };
-        w.append_row(&row).expect("append");
-        let line = w.buffer_utf8();
-        for fragment in [
-            "open_latency=\"123 milliseconds\"",
-            "open_latency_ns=123000000i",
-            "close_latency=\"1 microsecond\"",
-            "close_latency_ns=1000i",
-            // A contract that traded exactly ONCE spans no time. That is a
-            // real measurement, not a missing one, so it is written.
-            "window_span=\"0 nanoseconds\"",
-            "window_span_ns=0i",
-        ] {
-            assert!(line.contains(fragment), "missing {fragment} in {line}");
+    fn top_volume_view_predrop_ddl_drops_a_view_never_a_table() {
+        for c in SnapshotCadence::ALL {
+            let sql = top_volume_view_predrop_ddl(c);
+            assert_eq!(sql, format!("DROP VIEW IF EXISTS {};", c.table_name()));
+            assert!(!sql.to_uppercase().contains("TABLE"), "{sql}");
         }
+    }
+
+    /// The ensure fn issues the view pre-drop BEFORE the CREATE for each table
+    /// (a CREATE against a name that is still a view creates nothing), and
+    /// does not count the pre-drop's refusal as a failure.
+    #[test]
+    fn ensure_top_volume_tables_predrops_the_view_before_creating_and_tolerates_its_refusal() {
+        let src = include_str!("top_volume_rank_persistence.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        let body_start = prod
+            .find("pub async fn ensure_top_volume_tables(")
+            .expect("ensure fn present");
+        let body = &prod[body_start..];
+        let predrop = body
+            .find("top_volume_view_predrop_ddl(cadence)")
+            .expect("pre-drop call");
+        let ensure = body
+            .find("top_volume_ensure_statements(cadence)")
+            .expect("ensure-statements call");
+        assert!(
+            predrop < ensure,
+            "the view must be dropped before the CREATE"
+        );
+        let between = &body[predrop..ensure];
+        assert!(
+            !between.contains("all_accepted = false"),
+            "a refused view pre-drop must not fail the ensure — it is the normal \
+             steady state from the second boot onward"
+        );
+        assert!(
+            between.contains("debug!"),
+            "pre-drop refusal is logged at debug"
+        );
+    }
+}
+
+// 2026-09-22 — item 44e: the drain stages plain row data and the writer thread
+// does the per-row ILP append. These pin the hand-off contract.
+#[cfg(test)]
+mod row_handoff_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn row(security_id: i64) -> TopVolumeRankRow<'static> {
+        TopVolumeRankRow {
+            snapshot_ts_ist_nanos: 1_757_000_000_000_000_000,
+            cadence: SnapshotCadence::OneSecond,
+            family: "stock_option",
+            feed: "dhan",
+            segment: "NSE_FNO",
+            contract: "ignored-by-staging",
+            security_id,
+            underlying_id: 2885,
+            per_lot_quantity: 200,
+            total_lots_traded: 42,
+            volume_percentage_change: 4_150,
+            volume: Some(-8_500),
+            percentage_change: Some(1.25),
+            open_percentage_change: Some(-0.5),
+            subscribed: true,
+        }
+    }
+
+    fn labels() -> Arc<TopVolumeLabelMap> {
+        let mut m = TopVolumeLabelMap::new();
+        m.insert(
+            (7, ExchangeSegment::NseFno),
+            Arc::from("RELIANCE-25Sep2026-1400-CE"),
+        );
+        Arc::new(m)
+    }
+
+    #[test]
+    fn from_row_keeps_every_column_and_drops_only_the_label() {
+        let original = row(7);
+        let staged = TopVolumeStagedRow::from_row(&original);
+        assert_eq!(staged.with_contract(original.contract), original);
+    }
+
+    #[test]
+    fn with_contract_swaps_in_the_label_and_nothing_else() {
+        let original = row(7);
+        let relabelled = TopVolumeStagedRow::from_row(&original).with_contract("x");
+        assert_eq!(relabelled.contract, "x");
+        assert_eq!(
+            TopVolumeRankRow {
+                contract: original.contract,
+                ..relabelled
+            },
+            original,
+            "only the contract column may differ"
+        );
+    }
+
+    #[test]
+    fn every_segment_symbol_round_trips() {
+        for code in 0_u8..=8 {
+            if let Some(seg) = ExchangeSegment::from_byte(code) {
+                assert_eq!(segment_from_symbol(seg.as_str()), Some(seg));
+            }
+        }
+        assert_eq!(segment_from_symbol("NOT_A_SEGMENT"), None);
+    }
+
+    #[test]
+    fn labels_resolve_from_the_snapshot_and_fall_back_when_absent() {
+        let map = labels();
+        let hit = TopVolumeStagedRow::from_row(&row(7));
+        let miss = TopVolumeStagedRow::from_row(&row(8));
+        let negative = TopVolumeStagedRow::from_row(&row(-1));
+        assert_eq!(
+            resolve_label(&map, &hit, "unmapped"),
+            "RELIANCE-25Sep2026-1400-CE"
+        );
+        assert_eq!(resolve_label(&map, &miss, "unmapped"), "unmapped");
+        assert_eq!(resolve_label(&map, &negative, "unmapped"), "unmapped");
+    }
+
+    #[test]
+    fn write_batch_round_trips_a_handed_off_batch_and_recycles_its_vector() {
+        let (mut producer, mut writer, rx) =
+            TopVolumeRankWriter::for_test().split_rows_for_offload("unmapped");
+        for id in [7, 8, 9] {
+            assert!(producer.stage(&row(id)));
+        }
+        assert_eq!(producer.pending(), 3);
+        assert_eq!(producer.hand_off(labels()), TopVolumeHandoff::Sent(3));
+        assert_eq!(producer.pending(), 0);
+        let batch = rx.try_recv().expect("the batch must reach the writer end");
+        assert_eq!(batch.rows(), 3);
+        let outcome = writer.write_batch(batch);
+        assert_eq!(outcome.staged, 3);
+        assert_eq!(outcome.appended, 3);
+        assert_eq!(outcome.append_failed, 0);
+        // `for_test` has no ILP sender, so nothing LANDS -- and that must be
+        // reported as zero, never forged into a success.
+        assert_eq!(outcome.landed, 0);
+        // The writer returned the vector; the next sweep reuses it.
+        let spare = producer
+            .spares
+            .try_recv()
+            .expect("the vector must come back");
+        assert!(spare.is_empty());
+        assert!(spare.capacity() >= TOP_VOLUME_MAX_ROWS_PER_SWEEP);
+        assert_eq!(writer.formatter.pending(), 0);
+    }
+
+    #[test]
+    fn an_empty_sweep_sends_nothing() {
+        let (mut producer, _writer, rx) =
+            TopVolumeRankWriter::for_test().split_rows_for_offload("unmapped");
+        assert_eq!(producer.hand_off(labels()), TopVolumeHandoff::Empty);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_full_queue_drops_the_sweep_and_never_blocks() {
+        let (mut producer, _writer, _rx) =
+            TopVolumeRankWriter::for_test().split_rows_for_offload("unmapped");
+        for _ in 0..TOP_VOLUME_ROW_QUEUE_DEPTH {
+            assert!(producer.stage(&row(7)));
+            assert_eq!(producer.hand_off(labels()), TopVolumeHandoff::Sent(1));
+        }
+        assert!(producer.stage(&row(7)));
+        assert!(producer.stage(&row(8)));
+        // If this blocked, the test would hang rather than fail -- itself the
+        // assertion.
+        assert_eq!(producer.hand_off(labels()), TopVolumeHandoff::QueueFull(2));
+        assert_eq!(producer.pending(), 0, "dropped, never retained");
+        assert!(producer.rows.capacity() >= TOP_VOLUME_MAX_ROWS_PER_SWEEP);
+    }
+
+    #[test]
+    fn hand_off_to_a_gone_writer_drops_the_sweep() {
+        let (mut producer, _writer, rx) =
+            TopVolumeRankWriter::for_test().split_rows_for_offload("unmapped");
+        drop(rx);
+        assert!(producer.stage(&row(7)));
+        assert_eq!(producer.hand_off(labels()), TopVolumeHandoff::SinkGone(1));
+        assert_eq!(producer.pending(), 0);
+    }
+
+    #[test]
+    fn staging_refuses_past_the_row_bound_without_reallocating() {
+        let (mut producer, _writer, _rx) =
+            TopVolumeRankWriter::for_test().split_rows_for_offload("unmapped");
+        let capacity = producer.rows.capacity();
+        for _ in 0..TOP_VOLUME_MAX_ROWS_PER_SWEEP {
+            assert!(producer.stage(&row(7)));
+        }
+        assert!(!producer.stage(&row(7)), "one past the bound is refused");
+        assert_eq!(producer.pending(), TOP_VOLUME_MAX_ROWS_PER_SWEEP);
+        assert_eq!(producer.rows.capacity(), capacity, "the vector never grew");
+        assert_eq!(producer.discard_pending(), TOP_VOLUME_MAX_ROWS_PER_SWEEP);
+        assert_eq!(producer.pending(), 0);
+    }
+
+    #[test]
+    fn the_hand_off_uses_try_send_and_never_a_blocking_send() {
+        let src = include_str!("top_volume_rank_persistence.rs");
+        let start = src
+            .find("pub fn hand_off(&mut self")
+            .expect("hand_off must exist");
+        let body = &src[start..];
+        let end = body.find("pub fn discard_pending").unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(body.contains(".try_send(batch)"));
+        assert!(
+            !body.contains(".send(batch)"),
+            "a blocking send re-couples the drain"
+        );
     }
 }

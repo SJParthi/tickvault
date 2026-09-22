@@ -1351,8 +1351,8 @@ fn main() {
         Row::new(
             "catch_up_seal_all",
             Verdict::Bounded,
-            "O(slots x 24)",
-            "every 5s; zero-alloc; 9.67ms/sweep measured at the 25,000x24 ceiling",
+            "O(slots x TF_COUNT = 9)",
+            "every 5s; zero-alloc; 9.67ms/sweep was measured at the OLD 25,000x24 ceiling (2026-08-21); at 9 frames not re-measured",
         ),
         Row::new(
             "Fold CPU at the 25,000 ceiling",

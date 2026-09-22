@@ -21,6 +21,7 @@
 //! The writer is a thin wrapper that drains the absorption pipeline,
 //! calls this extractor, and feeds the `Buffer`.
 
+use tickvault_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST;
 use tickvault_common::price_precision::round_to_2dp;
 use tickvault_common::segment::segment_code_to_str;
 use tickvault_trading::candles::BufferedSeal;
@@ -150,6 +151,33 @@ pub struct ShadowSealRow {
     /// `LiveCandleState::total_sell_qty` (`u32`) widened to `i64`. Same
     /// semantics as `total_buy_qty` — pending SELL orders, not trades.
     pub total_sell_qty: i64,
+    /// Nanoseconds between this bar's window OPENING and the first tick of it
+    /// that this process RECEIVED. `None` when the bucket carries no receipt
+    /// clock at all — a pre-`TVW3` WAL replay, or a seal that went to disk and
+    /// came back (the 128-byte spill record is full and does not carry the
+    /// stamps, so a replayed seal reports unknown rather than a fabricated 0).
+    ///
+    /// The writer renders BOTH halves of the pair from this one figure:
+    /// `open_latency` (whole units, human-readable) and `open_latency_ns`
+    /// (exact, the only one that may be sorted on). `None` writes NEITHER —
+    /// an empty cell is the honest rendering of an unknown delay, where
+    /// `0 nanoseconds` would claim the fastest possible delivery.
+    ///
+    /// ⚠ This MEASURES receipt against the window; it never BUCKETS by it.
+    /// `ts` is the exchange clock and nothing else decides which bar a trade
+    /// enters (`fold_clock_ist_secs`, the 2026-09-18 SECOND directive).
+    pub open_latency_ns: Option<i64>,
+    /// Nanoseconds between the last tick of this bar that this process
+    /// RECEIVED and the window CLOSING. Same `None` contract and same
+    /// measure-never-bucket rule as [`Self::open_latency_ns`].
+    pub close_latency_ns: Option<i64>,
+    /// Nanoseconds from the first RECEIVED tick of this bar to the last —
+    /// the receipt window the bar's data actually occupied. `Some(0)` is a
+    /// real reading (a single-tick bucket has a zero span) and is rendered
+    /// `0 nanoseconds`, which is why this is an `Option` rather than a
+    /// sentinel: the unknown case and the genuinely-instant case must not
+    /// share a value.
+    pub window_span_latency_ns: Option<i64>,
 }
 
 impl ShadowSealRow {
@@ -173,6 +201,47 @@ impl ShadowSealRow {
         let timestamp_ist_nanos =
             i64::from(seal.state.bucket_start_ist_secs).saturating_mul(1_000_000_000);
         let volume_i64 = seal.state.signed_volume();
+        // The three delays, derived HERE rather than stored on
+        // `LiveCandleState`: the fold keeps the two receipt STAMPS (16 bytes,
+        // multiplied by TF_COUNT and by AGGREGATOR_MAX_SLOTS), and the window
+        // edges they are measured against are already known from the bucket
+        // start and the frame's own period. Storing three more derived figures
+        // per open bucket would pay fleet RAM for arithmetic that costs
+        // nothing at seal time.
+        //
+        // `0` on a stamp is the "no receipt" sentinel, so it maps to `None`
+        // and the writer emits NEITHER half of that pair. A seal that was
+        // spilled to disk and replayed arrives here with both stamps at `0`
+        // for exactly that reason — the 128-byte spill record is full and does
+        // not carry them, so a replayed bar reports its delays as unknown
+        // instead of fabricating an instant one.
+        let window_open_ist_nanos = timestamp_ist_nanos;
+        // The window CLOSE is the bucket end, clamped to the session close
+        // (15:40 IST, `TICK_PERSIST_END_SECS_OF_DAY_IST`). Without the clamp
+        // the last M30/M60 bar of the day measured its close delay against
+        // 16:00 or later — a minute-scale "delay" that was just the market
+        // shutting. Added 2026-09-22 (review findings A09/A13).
+        let bucket_start = i64::from(seal.state.bucket_start_ist_secs);
+        let bucket_end_secs = bucket_start.saturating_add(i64::from(seal.tf.seconds_per_bucket()));
+        let session_close_secs = bucket_start - bucket_start.rem_euclid(86_400)
+            + i64::from(TICK_PERSIST_END_SECS_OF_DAY_IST);
+        let window_close_secs = if bucket_start < session_close_secs {
+            bucket_end_secs.min(session_close_secs)
+        } else {
+            bucket_end_secs
+        };
+        let window_close_ist_nanos = window_close_secs.saturating_mul(1_000_000_000);
+        let first_receipt = seal.state.first_receipt_ist_nanos;
+        let last_receipt = seal.state.last_receipt_ist_nanos;
+        let open_latency_ns =
+            (first_receipt > 0).then(|| first_receipt.saturating_sub(window_open_ist_nanos));
+        let close_latency_ns =
+            (last_receipt > 0).then(|| window_close_ist_nanos.saturating_sub(last_receipt));
+        // Both stamps required: a span needs two real edges, and the fold
+        // seeds them together, so one present without the other cannot happen
+        // — the test is belt-and-braces rather than a case being handled.
+        let window_span_latency_ns = (first_receipt > 0 && last_receipt > 0)
+            .then(|| last_receipt.saturating_sub(first_receipt));
         Self {
             table_name: seal.tf.table_name(),
             timestamp_ist_nanos,
@@ -200,6 +269,9 @@ impl ShadowSealRow {
             open_gap_pct: seal.state.open_gap_pct,
             total_buy_qty: i64::from(seal.state.total_buy_qty),
             total_sell_qty: i64::from(seal.state.total_sell_qty),
+            open_latency_ns,
+            close_latency_ns,
+            window_span_latency_ns,
         }
     }
 }
@@ -217,7 +289,7 @@ mod tests {
         EXCHANGE_SEGMENT_NSE_EQ, EXCHANGE_SEGMENT_NSE_FNO,
     };
     use tickvault_common::feed::Feed;
-    use tickvault_trading::candles::{LiveCandleState, TfIndex};
+    use tickvault_trading::candles::{LiveCandleState, TF_COUNT, TfIndex};
 
     fn mk_seal(sid: u64, seg: u8, tf: TfIndex, bucket: u32, close: f64) -> BufferedSeal {
         let mut state = LiveCandleState::empty();
@@ -301,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn test_table_name_dispatches_correctly_for_all_twenty_one_tfs() {
+    fn test_table_name_dispatches_correctly_for_every_frame() {
         for tf in TfIndex::ALL {
             let row = ShadowSealRow::from_buffered_seal(&mk_seal(13, 0, tf, 1_716_000_900, 100.0));
             assert_eq!(
@@ -317,29 +389,30 @@ mod tests {
         // Pin the EXACT strings so a future refactor of TfIndex doesn't
         // silently change the ILP-emitted table name (which would split
         // candles across two tables — silent data loss class bug).
+        // 2026-09-19 nine-frame collapse. Two things this list gets right
+        // that the 21-entry version it replaces did not:
+        //   - it is COMPLETE. The old list pinned 21 of the then-24 frames;
+        //     M2, M30 and M60 had no entry at all, so their table names were
+        //     unpinned while the test's name claimed otherwise.
+        //   - the length is asserted against TF_COUNT below, so a frame added
+        //     without a pin fails the build instead of going unnoticed.
         let pairs = [
             (TfIndex::M1, "candles_1m"),
             (TfIndex::M3, "candles_3m"),
             (TfIndex::M5, "candles_5m"),
             (TfIndex::M15, "candles_15m"),
-            (TfIndex::D1, "candles_1d"),
             (TfIndex::S1, "candles_1s"),
-            (TfIndex::S2, "candles_2s"),
             (TfIndex::S3, "candles_3s"),
-            (TfIndex::S4, "candles_4s"),
             (TfIndex::S5, "candles_5s"),
-            (TfIndex::S6, "candles_6s"),
-            (TfIndex::S7, "candles_7s"),
-            (TfIndex::S8, "candles_8s"),
-            (TfIndex::S9, "candles_9s"),
-            (TfIndex::S10, "candles_10s"),
-            (TfIndex::S11, "candles_11s"),
-            (TfIndex::S12, "candles_12s"),
-            (TfIndex::S13, "candles_13s"),
-            (TfIndex::S14, "candles_14s"),
-            (TfIndex::S15, "candles_15s"),
-            (TfIndex::S30, "candles_30s"),
+            (TfIndex::M30, "candles_30m"),
+            (TfIndex::M60, "candles_60m"),
+            (TfIndex::M10, "candles_10m"),
         ];
+        assert_eq!(
+            pairs.len(),
+            TF_COUNT,
+            "every frame must have a pinned table name"
+        );
         for (tf, expected) in pairs {
             let row = ShadowSealRow::from_buffered_seal(&mk_seal(13, 0, tf, 1_716_000_900, 100.0));
             assert_eq!(row.table_name, expected, "TF {tf:?}");
@@ -615,5 +688,90 @@ mod tests {
         assert_eq!(row.volume, 1_000_000);
         assert_eq!(row.oi, 7_777_777);
         assert_eq!(row.tick_count, 42);
+    }
+
+    // ---- the three receipt delays (2026-09-22) --------------------------
+
+    /// An IST-naive day start: a whole multiple of 86,400.
+    const DAY: u32 = 1_789_948_800;
+    const SEC: i64 = 1_000_000_000;
+
+    fn seal_with_receipts(tf: TfIndex, bucket: u32, first: i64, last: i64) -> BufferedSeal {
+        let mut seal = mk_seal(13, EXCHANGE_SEGMENT_IDX_I, tf, bucket, 101.0);
+        seal.state.first_receipt_ist_nanos = first;
+        seal.state.last_receipt_ist_nanos = last;
+        seal
+    }
+
+    #[test]
+    fn from_buffered_seal_measures_the_three_delays_against_the_window() {
+        assert_eq!(DAY % 86_400, 0, "fixture must be a day start");
+        let bucket = DAY + 9 * 3600 + 15 * 60; // 09:15
+        let open = i64::from(bucket) * SEC;
+        let row = ShadowSealRow::from_buffered_seal(&seal_with_receipts(
+            TfIndex::M1,
+            bucket,
+            open + SEC,      // first trade received 1 s in
+            open + 59 * SEC, // last received 1 s before the close
+        ));
+        assert_eq!(row.open_latency_ns, Some(SEC));
+        assert_eq!(row.close_latency_ns, Some(SEC));
+        assert_eq!(row.window_span_latency_ns, Some(58 * SEC));
+    }
+
+    #[test]
+    fn from_buffered_seal_reports_no_receipt_as_unknown_never_zero() {
+        let row =
+            ShadowSealRow::from_buffered_seal(&seal_with_receipts(TfIndex::M1, DAY + 33_300, 0, 0));
+        assert_eq!(row.open_latency_ns, None);
+        assert_eq!(row.close_latency_ns, None);
+        assert_eq!(row.window_span_latency_ns, None);
+    }
+
+    #[test]
+    fn from_buffered_seal_single_receipt_has_a_real_zero_span() {
+        let bucket = DAY + 33_300;
+        let t = i64::from(bucket) * SEC + 30 * SEC;
+        let row = ShadowSealRow::from_buffered_seal(&seal_with_receipts(TfIndex::M1, bucket, t, t));
+        assert_eq!(row.window_span_latency_ns, Some(0));
+    }
+
+    /// A receipt stamped before its window (ring-dwell back-dating) is a
+    /// NEGATIVE open delay — reported as it is, not clamped to zero.
+    #[test]
+    fn from_buffered_seal_keeps_a_negative_open_delay() {
+        let bucket = DAY + 33_300;
+        let open = i64::from(bucket) * SEC;
+        let row = ShadowSealRow::from_buffered_seal(&seal_with_receipts(
+            TfIndex::M1,
+            bucket,
+            open - 2 * SEC,
+            open + 10 * SEC,
+        ));
+        assert_eq!(row.open_latency_ns, Some(-2 * SEC));
+    }
+
+    /// A09/A13: the last M60 bar (15:00) ends at the 15:40 session close, not
+    /// 16:00. A trade received at 15:39:59 is 1 s from the close, not 20 min.
+    #[test]
+    fn from_buffered_seal_clamps_the_last_bar_to_the_session_close() {
+        let bucket = DAY + 15 * 3600; // 15:00
+        let last = (i64::from(DAY) + 15 * 3600 + 39 * 60 + 59) * SEC; // 15:39:59
+        let row = ShadowSealRow::from_buffered_seal(&seal_with_receipts(
+            TfIndex::M60,
+            bucket,
+            i64::from(bucket) * SEC + SEC,
+            last,
+        ));
+        assert_eq!(row.close_latency_ns, Some(SEC));
+        // A mid-session M60 bar is NOT clamped.
+        let mid = DAY + 10 * 3600;
+        let row = ShadowSealRow::from_buffered_seal(&seal_with_receipts(
+            TfIndex::M60,
+            mid,
+            i64::from(mid) * SEC,
+            i64::from(mid) * SEC + 3599 * SEC,
+        ));
+        assert_eq!(row.close_latency_ns, Some(SEC));
     }
 }

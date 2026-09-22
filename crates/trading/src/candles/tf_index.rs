@@ -23,6 +23,14 @@
 //! per-instrument `[Mutex<LiveCandleState>; TF_COUNT]`, the ILP
 //! `[Sender; TF_COUNT]` writer, the audit-table `timeframe` SYMBOL column)
 //! breaks silently.
+//!
+//! ⚠ **HISTORY — the set is NINE frames since 2026-09-19** (`TF_COUNT = 9`:
+//! `M1 M3 M5 M15 S1 S3 S5 M30 M60`, ordinals 0..=8; `D1` is gone and `10m`
+//! is a view over `candles_1m`). The "21 timeframes", "`candles_1d`" and
+//! "ordinals frozen at 1m…1d 0..=4" text above describes the C3 era; the
+//! ordinals were RENUMBERED on 2026-09-19 (see [`TF_COUNT`]). Since
+//! 2026-09-22 the set is TEN: `M10` was appended at ordinal 9 when the
+//! operator retired every view, and `candles_10m` became a real table.
 
 /// Number of timeframes the live candle engine derives. Pinned here so
 /// the per-instrument slot array and the storage-side sender array
@@ -54,7 +62,30 @@
 /// stale doc manufacturing a false finding (see the O(1) table in
 /// CLAUDE.md). The claim is retained above rather than deleted, per house
 /// convention, so the correction is auditable.
-pub const TF_COUNT: usize = 24;
+///
+/// ⚠ **BOTH blocks above are HISTORY: the set is NINE, not 24, since
+/// 2026-09-19.** Every second-scale frame they argue about except `S1`,
+/// `S3` and `S5` is gone, along with `D1` and `M2`, on the operator's
+/// directive (`websocket-connection-scope-lock.md`, "THE FOLD COLLAPSES TO
+/// NINE FRAMES"): *"dude these shodu lnot even be considered or derived or
+/// calcualted anywhere dude okay?Not written anywhere 2s 4s 6s 10s 15s 30s
+/// 2m 1d"*. The surviving nine are `M1 M3 M5 M15 S1 S3 S5 M30 M60`; `10m`
+/// stays a VIEW over `candles_1m` rather than a tenth fold frame.
+///
+/// ⚠ **SUPERSEDED 2026-09-22 — the set is TEN.** The operator ruled "NO
+/// VIEWS ANYWHERE" (*"why the fuck candle 10 m is a view bro it should be
+/// the real table right"*), so `M10` became a native fold frame, APPENDED at
+/// ordinal 9. Appending renumbers nothing, so the spill format stays at 4:
+/// a v4 record never carries ordinal 9, and ordinal 9 now decodes as `M10`
+/// rather than being refused. Record in `websocket-connection-scope-lock.md`
+/// "2026-09-22 (SECOND) — NO VIEWS ANYWHERE".
+///
+/// **Ordinals RENUMBERED with that change**, which is why
+/// `SEAL_SPILL_FORMAT_VERSION` moved 3 → 4 in the same commit: the spill
+/// record stores the frame as a raw ordinal byte, `S1` was 5 and is now 4,
+/// and a byte in range decodes silently into the wrong frame rather than
+/// failing. A record older than 4 is REFUSED rather than reinterpreted.
+pub const TF_COUNT: usize = 10;
 
 /// 09:15:00 IST expressed as seconds-of-day (`9*3600 + 15*60`).
 /// The NSE regular trading session opens at 09:15:00 — every candle
@@ -293,115 +324,80 @@ pub enum TfIndex {
     M5 = 2,
     /// 15-minute candles (900 s).
     M15 = 3,
-    /// 1-day candles (86_400 s — UTC-aligned arithmetic; the
-    /// IST-midnight rollover task force-seals open bars at IST 00:00
-    /// every trading day so the UTC boundary does not produce stale
-    /// candles in practice).
-    D1 = 4,
-    // -- Second-scale frames (C3, operator directive 2026-07-21) ------
-    // APPENDED after D1 so every pre-existing seal-spill ordinal
-    // (0..=4) stays byte-stable (SEAL_SPILL_FORMAT_VERSION stays 1).
-    // WAS "STRUCTURAL ONLY: all 16 frames are GDF-feed-gated — ZERO rows
-    // until the GDF 1s live feed lands (separate lane)". CORRECTED
-    // 2026-08-19: the Dhan live lane was revived (2026-08-09) and switched
-    // on (2026-08-11), and the fold has no feed gate, so these frames carry
-    // real rows today. The REST 1m cadence fold half of that sentence still
-    // holds — a 1-minute vendor bar cannot open a sub-minute bucket.
+    // -- The three surviving second-scale frames ----------------------
+    // Sixteen second-scale frames were appended here on 2026-07-21 and
+    // fifteen of them — plus `D1` at the old ordinal 4 and `M2` at 21 —
+    // were REMOVED on 2026-09-19 by the operator's nine-frame directive
+    // (`websocket-connection-scope-lock.md`, "THE FOLD COLLAPSES TO NINE
+    // FRAMES"). The removal is what forced the ordinal renumbering below
+    // and the SEAL_SPILL_FORMAT_VERSION 3 -> 4 bump that goes with it:
+    // `S1` was ordinal 5 and is now 4, so an old spill record replayed
+    // against this table would decode into the WRONG frame silently.
     /// 1-second candles (1 s). Live on the Dhan tick lane since 2026-08-11.
-    S1 = 5,
-    /// 2-second candles (2 s). Live on the Dhan tick lane since 2026-08-11.
-    S2 = 6,
+    S1 = 4,
     /// 3-second candles (3 s). Live on the Dhan tick lane since 2026-08-11.
-    S3 = 7,
-    /// 4-second candles (4 s). Live on the Dhan tick lane since 2026-08-11.
-    S4 = 8,
+    S3 = 5,
     /// 5-second candles (5 s). Live on the Dhan tick lane since 2026-08-11.
-    S5 = 9,
-    /// 6-second candles (6 s). Live on the Dhan tick lane since 2026-08-11.
-    S6 = 10,
-    /// 7-second candles (7 s). Live on the Dhan tick lane since 2026-08-11.
-    S7 = 11,
-    /// 8-second candles (8 s). Live on the Dhan tick lane since 2026-08-11.
-    S8 = 12,
-    /// 9-second candles (9 s). Live on the Dhan tick lane since 2026-08-11.
-    S9 = 13,
-    /// 10-second candles (10 s). Live on the Dhan tick lane since 2026-08-11.
-    S10 = 14,
-    /// 11-second candles (11 s). Live on the Dhan tick lane since 2026-08-11.
-    S11 = 15,
-    /// 12-second candles (12 s). Live on the Dhan tick lane since 2026-08-11.
-    S12 = 16,
-    /// 13-second candles (13 s). Live on the Dhan tick lane since 2026-08-11.
-    S13 = 17,
-    /// 14-second candles (14 s). Live on the Dhan tick lane since 2026-08-11.
-    S14 = 18,
-    /// 15-second candles (15 s). Live on the Dhan tick lane since 2026-08-11.
-    S15 = 19,
-    /// 30-second candles (30 s). Live on the Dhan tick lane since 2026-08-11.
-    S30 = 20,
-    // -- Minute frames completing the operator's 13-frame set ---------
-    // APPENDED after S30 (2026-08-10) so every pre-existing ordinal
-    // (0..=20) stays byte-stable and SEAL_SPILL_FORMAT_VERSION stays 1.
-    //
-    // WHY these three and not others: operator Quote 13 (2026-08-08,
-    // `daily-universe-scope-expansion-2026-05-27.md` §0) specifies
-    // thirteen current-day timeframes — 1s/5s/10s/15s/30s, then
-    // 1m/2m/3m/5m/15m/30m/60m, then 1d. Ten of the thirteen already
-    // existed; M2, M30 and M60 did NOT, so three of the frames the
-    // r8g.xlarge upgrade was bought to serve were literally
-    // unrepresentable. These are the missing three.
-    //
-    // Unlike the second-scale block above, these are NOT structural
-    // placeholders: the minute-scale frames are derivable from the
-    // existing tick and REST-fold paths the moment a producer exists.
-    /// 2-minute candles (120 s).
-    M2 = 21,
+    S5 = 6,
+    // -- The two surviving appended minute frames ---------------------
     /// 30-minute candles (1_800 s).
-    M30 = 22,
-    /// 60-minute candles (3_600 s). NOTE the 09:15 IST session anchor
-    /// means the final 60m bucket of a regular session is PARTIAL —
-    /// the grid runs 09:15/10:15/…/15:15, so the last bar covers
-    /// 15:15–15:30 (15 minutes), not a full hour. Same for M30's
-    /// 15:15–15:30 bucket. That is a property of anchoring to the open
-    /// rather than to the hour, and it is deliberate: a bar that starts
-    /// at the open is comparable across days, one that starts at 09:00
-    /// is not.
-    M60 = 23,
+    M30 = 7,
+    /// 60-minute candles (3_600 s). The grid is anchored at the CANDLE
+    /// session open, `CANDLE_SESSION_OPEN_SECS_OF_DAY_IST` = **09:00 IST**
+    /// (see [`Self::bucket_start`]), so it runs 09:00/10:00/…/15:00. The
+    /// first bar therefore includes the 09:00–09:15 pre-open auction, and
+    /// the last bar of a regular session holds only 15:00–15:30 of trading,
+    /// not a full hour. M30 runs 09:00/09:30/…, so its 15:00 bar is full.
+    ///
+    /// ⚠ CORRECTED 2026-09-22: this doc said the grid was anchored at 09:15
+    /// and ran 09:15/10:15/…/15:15. The code has anchored at 09:00 since the
+    /// 2026-08-28 pre-open directive; only this comment still described the
+    /// old grid.
+    M60 = 8,
+    /// 10-minute candles (600 s). **APPENDED 2026-09-22** at the END of the
+    /// ordinal range (operator: *"why the fuck candle 10 m is a view bro it
+    /// should be the real table right"* — `websocket-connection-scope-lock.md`,
+    /// "NO VIEWS ANYWHERE"). Until then `candles_10m` was a VIEW over
+    /// `candles_1m`.
+    ///
+    /// It is appended rather than inserted beside the other minute frames on
+    /// purpose: the seal spill stores the frame as a raw ordinal byte, so an
+    /// append leaves every record already on disk decoding to the frame it was
+    /// written for, and no spill-format bump is needed. Inserting it would
+    /// renumber `S1`..`M60` and silently misfile every rescued bar.
+    ///
+    /// Grid: anchored at the 09:00 candle session open like `M30`/`M60`, so it
+    /// runs 09:00, 09:10, … 15:20; the regular session's last 10m bar is
+    /// `[15:20, 15:30)`.
+    M10 = 9,
 }
 
 impl TfIndex {
-    /// All 21 timeframes in ORDINAL (seal-spill append) order: the 5
-    /// legacy frames (1m/3m/5m/15m/1d) first, then the 16 GDF-gated
-    /// second-scale frames (1s..15s, 30s) appended by C3 — so the
-    /// array is deliberately NOT globally seconds-ascending. The index
-    /// of each entry equals its [`Self::as_ordinal`] value, which the
-    /// hot-path `[Mutex<LiveCandleState>; TF_COUNT]` array indexing
-    /// relies on.
+    /// All TEN timeframes in ORDINAL order: the 4 minute frames that
+    /// have held ordinals 0..=3 since the beginning, then the 3 surviving
+    /// second-scale frames, then M30 and M60, then M10 (appended
+    /// 2026-09-22) — so the array is
+    /// deliberately NOT globally seconds-ascending. The index of each
+    /// entry equals its [`Self::as_ordinal`] value, which the hot-path
+    /// `[Mutex<LiveCandleState>; TF_COUNT]` array indexing relies on.
+    ///
+    /// 2026-09-19: was 24 entries. `M1`..`M15` kept their ordinals; every
+    /// other survivor renumbered, because `ALL` is indexed BY ordinal and
+    /// [`Self::from_ordinal`] is its inverse, so the ordinals must stay
+    /// contiguous `0..TF_COUNT`. There is no arrangement that removes the
+    /// old ordinal 4 and leaves the rest where they were — which is
+    /// exactly why the spill format version moved with it.
     pub const ALL: [TfIndex; TF_COUNT] = [
         TfIndex::M1,
         TfIndex::M3,
         TfIndex::M5,
         TfIndex::M15,
-        TfIndex::D1,
         TfIndex::S1,
-        TfIndex::S2,
         TfIndex::S3,
-        TfIndex::S4,
         TfIndex::S5,
-        TfIndex::S6,
-        TfIndex::S7,
-        TfIndex::S8,
-        TfIndex::S9,
-        TfIndex::S10,
-        TfIndex::S11,
-        TfIndex::S12,
-        TfIndex::S13,
-        TfIndex::S14,
-        TfIndex::S15,
-        TfIndex::S30,
-        TfIndex::M2,
         TfIndex::M30,
         TfIndex::M60,
+        TfIndex::M10,
     ];
 
     /// Returns the ordinal (`0..TF_COUNT`) used to index the
@@ -425,26 +421,12 @@ impl TfIndex {
             1 => Some(Self::M3),
             2 => Some(Self::M5),
             3 => Some(Self::M15),
-            4 => Some(Self::D1),
-            5 => Some(Self::S1),
-            6 => Some(Self::S2),
-            7 => Some(Self::S3),
-            8 => Some(Self::S4),
-            9 => Some(Self::S5),
-            10 => Some(Self::S6),
-            11 => Some(Self::S7),
-            12 => Some(Self::S8),
-            13 => Some(Self::S9),
-            14 => Some(Self::S10),
-            15 => Some(Self::S11),
-            16 => Some(Self::S12),
-            17 => Some(Self::S13),
-            18 => Some(Self::S14),
-            19 => Some(Self::S15),
-            20 => Some(Self::S30),
-            21 => Some(Self::M2),
-            22 => Some(Self::M30),
-            23 => Some(Self::M60),
+            4 => Some(Self::S1),
+            5 => Some(Self::S3),
+            6 => Some(Self::S5),
+            7 => Some(Self::M30),
+            8 => Some(Self::M60),
+            9 => Some(Self::M10),
             _ => None,
         }
     }
@@ -460,26 +442,12 @@ impl TfIndex {
             Self::M3 => "candles_3m",
             Self::M5 => "candles_5m",
             Self::M15 => "candles_15m",
-            Self::D1 => "candles_1d",
             Self::S1 => "candles_1s",
-            Self::S2 => "candles_2s",
             Self::S3 => "candles_3s",
-            Self::S4 => "candles_4s",
             Self::S5 => "candles_5s",
-            Self::S6 => "candles_6s",
-            Self::S7 => "candles_7s",
-            Self::S8 => "candles_8s",
-            Self::S9 => "candles_9s",
-            Self::S10 => "candles_10s",
-            Self::S11 => "candles_11s",
-            Self::S12 => "candles_12s",
-            Self::S13 => "candles_13s",
-            Self::S14 => "candles_14s",
-            Self::S15 => "candles_15s",
-            Self::S30 => "candles_30s",
-            Self::M2 => "candles_2m",
             Self::M30 => "candles_30m",
             Self::M60 => "candles_60m",
+            Self::M10 => "candles_10m",
         }
     }
 
@@ -513,169 +481,23 @@ impl TfIndex {
             Self::M3 => 180,
             Self::M5 => 300,
             Self::M15 => 900,
-            Self::D1 => 86_400,
             Self::S1 => 1,
-            Self::S2 => 2,
             Self::S3 => 3,
-            Self::S4 => 4,
             Self::S5 => 5,
-            Self::S6 => 6,
-            Self::S7 => 7,
-            Self::S8 => 8,
-            Self::S9 => 9,
-            Self::S10 => 10,
-            Self::S11 => 11,
-            Self::S12 => 12,
-            Self::S13 => 13,
-            Self::S14 => 14,
-            Self::S15 => 15,
-            Self::S30 => 30,
-            Self::M2 => 120,
             Self::M30 => 1_800,
             Self::M60 => 3_600,
+            Self::M10 => 600,
         }
     }
 
-    /// True for the 16 GDF-gated second-scale frames (bucket < 60 s:
-    /// 1s..=15s + 30s). These frames are STRUCTURAL until the GDF 1s live
-    /// feed lands (separate lane) — ZERO rows are written today, the REST
-    /// 1m cadence folds only the 5-frame minute/day set, and the RAM store
-    /// allocates them as capacity-1 placeholders (never full session rings).
+    /// True for the second-scale frames (bucket < 60 s). Since 2026-09-19 that
+    /// is THREE — `S1`, `S3`, `S5` — and all three EMIT rows from the live
+    /// Dhan fold. (Until 2026-09-22 this doc said "the 16 GDF-gated frames …
+    /// ZERO rows are written today", which described the 24-frame era.)
     #[inline]
     #[must_use]
     pub const fn is_second_scale(self) -> bool {
         self.seconds_per_bucket() < 60
-    }
-
-    /// True for the NINE native timeframes the operator asks for today.
-    ///
-    /// Operator, 2026-08-08 (verbatim, typos preserved — the same quote the
-    /// r8g.xlarge was sized against, `daily-universe-scope-expansion` Quote 13):
-    ///
-    /// > "current day ticks secodns multiple seocdns tiemframes liek 1 seocnd
-    /// > 5 seconds 10 15 30 seocnds dude nad then even mintue level tiemframes
-    /// > liek 1,2,3,5,15,30,60 and 1 dya also"
-    ///
-    /// That is `S1 S5 S10 S15 S30` + `M1 M2 M3 M5 M15 M30 M60` + `D1` = 13.
-    ///
-    /// # Why this exists
-    ///
-    /// ⚠ **The three paragraphs below describe the 2026-08-08 set and are
-    /// SUPERSEDED by the 2026-09-18 section at the end of this doc.** They are
-    /// kept because the REASONING — gate emission, never delete variants — is
-    /// what this function still does; only the membership moved. Read the
-    /// named frames in them as history, not as the current set.
-    ///
-    /// The enum carries **24** variants, so **eleven** second-scale frames —
-    /// `S2 S3 S4 S6 S7 S8 S9 S11 S12 S13 S14` — are neither requested nor used
-    /// by anything. Before this gate the live lane sealed all 24 on every fold,
-    /// so those eleven wrote rows to disk every bucket, for nobody.
-    ///
-    /// The plan item that flagged this proposed gating **all sixteen**
-    /// second-scale frames off, citing the disk cost. That would have been
-    /// wrong in the opposite direction: it deletes `S1 S5 S10 S15 S30`, which
-    /// are five of the frames the operator explicitly requested and the
-    /// reason the 32 GiB instance was bought. Gating exactly the eleven
-    /// unrequested frames removes most of the cost while removing none of the
-    /// capability — the requirement and the disk concern were never actually
-    /// in conflict, only the two framings of the fix were.
-    ///
-    /// # Scope
-    ///
-    /// This gates ROW EMISSION, not folding. The aggregator still keeps its
-    /// `[_; TF_COUNT]` slots and ordinals, so nothing here changes the array
-    /// layout, the audit-table `timeframe` symbols, or ordinal decoding —
-    /// deleting variants would cascade through all of that for no benefit.
-    ///
-    /// Changing this set needs a fresh dated operator quote, exactly like the
-    /// constants it derives from; `tf_index_operator_set_is_the_operators_nine`
-    /// pins it.
-    ///
-    /// # 2026-08-25 — D1 removed (13 -> 12)
-    ///
-    /// Operator directive 2026-08-25: *"never evr do th edeirvation of 1day
-    /// usign these intenrla tiemframes clauclation"*. `D1` therefore leaves
-    /// this set, so the live lane stops emitting `candles_1d`. Recorded in
-    /// `.claude/rules/project/live-feed-purity.md` rule 10 BEFORE this edit,
-    /// per the rule-file-first law. The variant, its ordinal and its slot are
-    /// untouched — only EMISSION is gated, exactly as the eleven unrequested
-    /// second-scale frames already are.
-    ///
-    /// # 2026-09-18 — the set is REPLACED (12 -> 9 native), and 10m is DERIVED
-    ///
-    /// Operator directive 2026-09-18, recorded in
-    /// `websocket-connection-scope-lock.md` section "2026-09-18 — ELEVEN
-    /// TIMEFRAMES, ONE SIGNED VOLUME" BEFORE this edit, per the
-    /// rule-file-first law. Verbatim: *"we will have one and only candles
-    /// tables timeframe which is ticks, 1s, 3s, 5s, 1m, 3m, 5m, 10m, 15m,
-    /// 30m, 60m right dude only these timeframes alone dude okay?"*
-    ///
-    /// Net against the 2026-08-08 set: **`S3` GAINS** emission, and
-    /// **`S10` / `S15` / `S30` / `M2` LOSE** it. The DDL still creates all
-    /// 24 names from `TfIndex::ALL`, so those four tables keep existing and
-    /// keep the rows they already hold. Only new rows stop.
-    ///
-    /// ⚠ **CORRECTED 2026-09-18, hours after the line above was written.**
-    /// It originally closed *"and no populated table is ever dropped (SEBI
-    /// retention)"*. That is false twice over, and both halves are checkable
-    /// in one grep:
-    ///
-    /// 1. **Candle tables are NOT a SEBI never-delete class.** They are
-    ///    retention-swept like any other market-data table —
-    ///    `partition_manager.rs` iterates `candle_table_names()` and detaches
-    ///    DAY partitions past the cutoff. So "keeps every row it already
-    ///    holds" is true only inside the retention window; older partitions
-    ///    leave on schedule, exactly as they always have.
-    /// 2. **One candle table IS dropped by name, at boot.**
-    ///    `shadow_persistence::drop_legacy_candle_objects` carries a literal
-    ///    `DROP TABLE IF EXISTS candles_1s;` — written when `S1` was an
-    ///    Engine-A leftover. `S1` is now a frame the operator asked for, so
-    ///    that drop's original rationale no longer holds. It is version-gated
-    ///    behind a one-shot marker (`LEGACY_DROP_SWEEP_VERSION`) and the
-    ///    `candle_ddl_boot` site documents the consequence, so it does not
-    ///    fire on an ordinary boot — but the sentence claimed a guarantee
-    ///    ("never") that the tree does not make.
-    ///
-    /// Recorded rather than quietly reworded because the shape is the point:
-    /// "SEBI retention" is this repository's strongest never-delete claim, and
-    /// borrowing it for a class it does not cover reads as a guarantee to
-    /// anyone who does not re-check. The retirement of a frame's WRITER says
-    /// nothing about the fate of its TABLE, and the two must be checked
-    /// separately.
-    ///
-    /// ## Why this returns NINE for an eleven-item list
-    ///
-    /// The operator's list has eleven entries and two of them are not native
-    /// fold frames:
-    ///
-    /// | Entry | Where it comes from |
-    /// |---|---|
-    /// | `ticks` | the separate `ticks` table, not a candle frame at all |
-    /// | `10m` | **DERIVED** from `candles_1m`, never folded |
-    /// | the other nine | this set |
-    ///
-    /// `10m` is derived on the operator's own instruction (*"no 10s derive
-    /// the 10m dude okay"*) and there is no `M10` variant to add. That is
-    /// deliberate and load-bearing: a new variant would take ordinal 24,
-    /// move `TF_COUNT` 24 -> 25, resize every `[_; TF_COUNT]` array and the
-    /// seal ring with it, and add a 25th scalar fold to the per-tick path —
-    /// for a bar that is exactly `first(open) / max(high) / min(low) /
-    /// last(close)` over ten 1-minute bars. Deriving costs nothing per tick.
-    #[inline]
-    #[must_use]
-    pub const fn is_operator_requested(self) -> bool {
-        matches!(
-            self,
-            Self::S1
-                | Self::S3
-                | Self::S5
-                | Self::M1
-                | Self::M3
-                | Self::M5
-                | Self::M15
-                | Self::M30
-                | Self::M60
-        )
     }
 
     /// Short display name (`"1m"`, `"3m"`, ..., `"1d"`). Stable across
@@ -688,26 +510,12 @@ impl TfIndex {
             Self::M3 => "3m",
             Self::M5 => "5m",
             Self::M15 => "15m",
-            Self::D1 => "1d",
             Self::S1 => "1s",
-            Self::S2 => "2s",
             Self::S3 => "3s",
-            Self::S4 => "4s",
             Self::S5 => "5s",
-            Self::S6 => "6s",
-            Self::S7 => "7s",
-            Self::S8 => "8s",
-            Self::S9 => "9s",
-            Self::S10 => "10s",
-            Self::S11 => "11s",
-            Self::S12 => "12s",
-            Self::S13 => "13s",
-            Self::S14 => "14s",
-            Self::S15 => "15s",
-            Self::S30 => "30s",
-            Self::M2 => "2m",
             Self::M30 => "30m",
             Self::M60 => "60m",
+            Self::M10 => "10m",
         }
     }
 
@@ -889,38 +697,38 @@ mod tests {
     }
 
     #[test]
-    fn test_tf_index_all_has_twenty_four_distinct_variants() {
+    fn test_tf_index_all_has_ten_distinct_variants() {
         let mut seen = std::collections::HashSet::new();
         for tf in TfIndex::ALL {
             assert!(seen.insert(tf), "duplicate variant in TfIndex::ALL: {tf:?}");
         }
         assert_eq!(TfIndex::ALL.len(), TF_COUNT);
-        assert_eq!(TF_COUNT, 24);
+        assert_eq!(TF_COUNT, 10);
     }
 
-    /// C3 (2026-07-21): the 16 second-scale frames are APPENDED after
-    /// D1 so every pre-existing seal-spill ordinal (0..=4) stays
-    /// stable — `ALL` is therefore ordinal-ordered, NOT globally
-    /// seconds-ascending. This pin is strictly stronger than the old
-    /// ascending check: it pins the EXACT seconds sequence, and each
-    /// ordinal block stays strictly ascending within itself.
+    /// The ordinal sequence is NOT globally seconds-ascending, and since the
+    /// 2026-09-19 nine-frame collapse it is not two blocks either — it is
+    /// three: the original minute block `M1 M3 M5 M15`, the second-scale
+    /// survivors `S1 S3 S5` that C3 appended after it on 2026-07-21, and
+    /// `M30 M60` appended on 2026-08-10. The collapse removed fifteen frames
+    /// from the MIDDLE of that sequence and closed the gaps, so every
+    /// surviving ordinal above `M15` MOVED.
+    ///
+    /// This pin is the EXACT seconds sequence, and that is what makes such a
+    /// move fail the build: a round-trip test is structurally blind to a
+    /// renumbering, because `from_ordinal(n).as_ordinal() == n` holds under
+    /// ANY consistent table.
     #[test]
     fn test_tf_index_ordinal_order_pins_exact_seconds_sequence() {
         let secs: Vec<u32> = TfIndex::ALL
             .iter()
             .map(|tf| tf.seconds_per_bucket())
             .collect();
-        // Appended 2026-08-10: M2/M30/M60 (120/1800/3600) complete the
-        // operator's thirteen frames. They land at the END of the
-        // second-scale block, which keeps that block strictly ascending —
-        // the property the windows() check below relies on.
-        let expected: Vec<u32> = [60_u32, 180, 300, 900, 86_400]
-            .into_iter()
-            .chain(1..=15)
-            .chain([30, 120, 1_800, 3_600])
-            .collect();
+        // 2026-09-22: `M10` (600 s) APPENDED at ordinal 9 — a fourth block of
+        // one, since it sits after `M60` rather than inside the minute block.
+        let expected: Vec<u32> = vec![60, 180, 300, 900, 1, 3, 5, 1_800, 3_600, 600];
         assert_eq!(secs, expected, "ordinal seconds sequence drifted");
-        for block in [&secs[..5], &secs[5..]] {
+        for block in [&secs[..4], &secs[4..7], &secs[7..9], &secs[9..]] {
             for window in block.windows(2) {
                 assert!(
                     window[0] < window[1],
@@ -963,46 +771,42 @@ mod tests {
     }
 
     #[test]
-    fn test_tf_index_ordinals_are_append_only_literal_pins() {
+    fn test_tf_index_ordinals_are_literal_pins() {
+        // RENAMED from `..._append_only_literal_pins` on 2026-09-19, because
+        // the append-only property it asserted is exactly what the nine-frame
+        // collapse broke. Fifteen frames were REMOVED from the middle of the
+        // table and the gaps closed, so `S1` moved 5 → 4, `S5` 9 → 6, `M30`
+        // 22 → 7 and `M60` 23 → 8. A byte already on disk therefore decodes
+        // into a DIFFERENT frame, silently — every retired ordinal is still IN
+        // RANGE for the nine-entry table, so refusal-past-the-end cannot catch
+        // it. That is why `SEAL_SPILL_FORMAT_VERSION` went 3 → 4 in the same
+        // change: the version refusal is the guarantee, and these literals are
+        // what stop the table moving again without one.
         assert_eq!(TfIndex::M1 as u8, 0);
         assert_eq!(TfIndex::M3 as u8, 1);
         assert_eq!(TfIndex::M5 as u8, 2);
         assert_eq!(TfIndex::M15 as u8, 3);
-        assert_eq!(TfIndex::D1 as u8, 4);
-        assert_eq!(TfIndex::S1 as u8, 5);
-        assert_eq!(TfIndex::S2 as u8, 6);
-        assert_eq!(TfIndex::S3 as u8, 7);
-        assert_eq!(TfIndex::S4 as u8, 8);
-        assert_eq!(TfIndex::S5 as u8, 9);
-        assert_eq!(TfIndex::S6 as u8, 10);
-        assert_eq!(TfIndex::S7 as u8, 11);
-        assert_eq!(TfIndex::S8 as u8, 12);
-        assert_eq!(TfIndex::S9 as u8, 13);
-        assert_eq!(TfIndex::S10 as u8, 14);
-        assert_eq!(TfIndex::S11 as u8, 15);
-        assert_eq!(TfIndex::S12 as u8, 16);
-        assert_eq!(TfIndex::S13 as u8, 17);
-        assert_eq!(TfIndex::S14 as u8, 18);
-        assert_eq!(TfIndex::S15 as u8, 19);
-        assert_eq!(TfIndex::S30 as u8, 20);
-        // Appended 2026-08-10 to complete the operator's thirteen frames
-        // (Quote 13). ADD NEW FRAMES BELOW THIS LINE ONLY — inserting one
-        // above silently re-maps every already-spilled ordinal.
-        assert_eq!(TfIndex::M2 as u8, 21);
-        assert_eq!(TfIndex::M30 as u8, 22);
-        assert_eq!(TfIndex::M60 as u8, 23);
-        // The pinned block above must cover EVERY variant: a new appended
-        // frame that nobody pinned would slip through otherwise.
+        assert_eq!(TfIndex::S1 as u8, 4);
+        assert_eq!(TfIndex::S3 as u8, 5);
+        assert_eq!(TfIndex::S5 as u8, 6);
+        assert_eq!(TfIndex::M30 as u8, 7);
+        assert_eq!(TfIndex::M60 as u8, 8);
+        // 2026-09-22: M10 APPENDED at 9 — nothing above moved, so no
+        // SEAL_SPILL_FORMAT_VERSION bump.
+        assert_eq!(TfIndex::M10 as u8, 9);
+        // The pinned block above must cover EVERY variant: a frame added or
+        // removed without a pin here would slip through otherwise.
         assert_eq!(
-            TF_COUNT, 24,
-            "a frame was added — pin its literal ordinal above"
+            TF_COUNT, 10,
+            "a frame was added or removed — pin its literal ordinal above, \
+             and bump SEAL_SPILL_FORMAT_VERSION if any existing one moved"
         );
         // …and the seconds are pinned per-ordinal too, so a variant cannot be
         // re-pointed at a different bucket size while keeping its ordinal.
         assert_eq!(TfIndex::M1.seconds_per_bucket(), 60);
-        assert_eq!(TfIndex::D1.seconds_per_bucket(), 86_400);
         assert_eq!(TfIndex::S1.seconds_per_bucket(), 1);
-        assert_eq!(TfIndex::S30.seconds_per_bucket(), 30);
+        assert_eq!(TfIndex::S5.seconds_per_bucket(), 5);
+        assert_eq!(TfIndex::M60.seconds_per_bucket(), 3_600);
     }
     #[test]
     fn test_tf_index_ordinal_round_trip() {
@@ -1034,28 +838,14 @@ mod tests {
             "candles_3m",
             "candles_5m",
             "candles_15m",
-            "candles_1d",
+            // The second-scale block (2026-09-19 collapse): 1s/3s/5s only.
             "candles_1s",
-            "candles_2s",
             "candles_3s",
-            "candles_4s",
             "candles_5s",
-            "candles_6s",
-            "candles_7s",
-            "candles_8s",
-            "candles_9s",
-            "candles_10s",
-            "candles_11s",
-            "candles_12s",
-            "candles_13s",
-            "candles_14s",
-            "candles_15s",
-            "candles_30s",
-            // Appended 2026-08-10 with M2/M30/M60 — the three frames of the
-            // operator's thirteen that previously had no enum variant.
-            "candles_2m",
             "candles_30m",
             "candles_60m",
+            // APPENDED 2026-09-22 (was a VIEW over candles_1m until then).
+            "candles_10m",
         ];
         assert_eq!(names, expected);
         // No `_shadow` suffix anywhere — these are first-class tables.
@@ -1109,13 +899,18 @@ mod tests {
 
     #[test]
     fn test_tf_index_display_names_unique_and_stable() {
+        // The nine names in ORDINAL order (2026-09-19 collapse). The three
+        // blocks are the enum's own layout: the four legacy minute frames,
+        // then the second-scale frames, then the two long minute frames.
         let mut seen = std::collections::HashSet::new();
         let expected = [
-            "1m", "3m", "5m", "15m", "1d", "1s", "2s", "3s", "4s", "5s", "6s", "7s", "8s", "9s",
-            "10s", "11s", "12s", "13s", "14s", "15s",
-            "30s", // Appended 2026-08-10 (operator Quote 13's thirteen frames).
-            "2m", "30m", "60m",
+            "1m", "3m", "5m", "15m", "1s", "3s", "5s", "30m", "60m", "10m",
         ];
+        assert_eq!(
+            expected.len(),
+            TF_COUNT,
+            "the expected-name list must name every frame"
+        );
         for (idx, tf) in TfIndex::ALL.iter().enumerate() {
             let name = tf.display_name();
             assert_eq!(
@@ -1132,49 +927,59 @@ mod tests {
         assert_eq!(TfIndex::M3.seconds_per_bucket(), 180);
         assert_eq!(TfIndex::M5.seconds_per_bucket(), 300);
         assert_eq!(TfIndex::M15.seconds_per_bucket(), 900);
-        assert_eq!(TfIndex::D1.seconds_per_bucket(), 86_400);
-        // Second-scale frames (C3): S1..S15 are 1..=15 s, S30 is 30 s.
-        for ord in 5..=19_usize {
-            let tf = TfIndex::from_ordinal(ord).expect("second-scale ordinal");
-            assert_eq!(
-                tf.seconds_per_bucket(),
-                u32::try_from(ord - 4).expect("fits"),
-                "S-frame seconds drifted at ordinal {ord}"
-            );
-        }
-        assert_eq!(TfIndex::S30.seconds_per_bucket(), 30);
+        assert_eq!(TfIndex::M30.seconds_per_bucket(), 1_800);
+        assert_eq!(TfIndex::M60.seconds_per_bucket(), 3_600);
+        assert_eq!(TfIndex::M10.seconds_per_bucket(), 600);
+        // The three surviving second-scale frames.
+        assert_eq!(TfIndex::S1.seconds_per_bucket(), 1);
+        assert_eq!(TfIndex::S3.seconds_per_bucket(), 3);
+        assert_eq!(TfIndex::S5.seconds_per_bucket(), 5);
         // Every minute-class TF is a whole number of minutes.
-        for tf in [TfIndex::M1, TfIndex::M3, TfIndex::M5, TfIndex::M15] {
-            assert_eq!(tf.seconds_per_bucket() % 60, 0);
-        }
-    }
-
-    #[test]
-    fn test_tf_index_second_scale_gate_is_exactly_the_16_gdf_frames() {
-        // GDF-gate predicate: exactly the 16 sub-minute frames (S1..S15 +
-        // S30) are second-scale; the legacy 5-frame live set is NOT.
-        let second_scale: Vec<TfIndex> = TfIndex::ALL
-            .into_iter()
-            .filter(|tf| tf.is_second_scale())
-            .collect();
-        assert_eq!(second_scale.len(), 16, "second-scale frame count drifted");
         for tf in [
             TfIndex::M1,
             TfIndex::M3,
             TfIndex::M5,
             TfIndex::M15,
-            TfIndex::D1,
+            TfIndex::M30,
+            TfIndex::M60,
+            TfIndex::M10,
         ] {
-            assert!(!tf.is_second_scale(), "{tf:?} wrongly GDF-gated");
+            assert_eq!(tf.seconds_per_bucket() % 60, 0);
+        }
+    }
+
+    #[test]
+    fn test_tf_index_second_scale_gate_is_exactly_the_three_second_frames() {
+        // `is_second_scale` is a SECONDS predicate (`< 60`), never an
+        // ordinal range — which is why it survived the 2026-09-19 collapse
+        // untouched while the ordinals moved under it. Before the collapse
+        // this test named sixteen frames and asserted `as_ordinal() >= 5`;
+        // both were true of the 24-frame table and neither is true now
+        // (S1 is ordinal 4), so the assertion is stated as the SET instead.
+        let second_scale: Vec<TfIndex> = TfIndex::ALL
+            .into_iter()
+            .filter(|tf| tf.is_second_scale())
+            .collect();
+        assert_eq!(
+            second_scale,
+            vec![TfIndex::S1, TfIndex::S3, TfIndex::S5],
+            "the second-scale set is exactly the operator's three sub-minute frames"
+        );
+        for tf in [
+            TfIndex::M1,
+            TfIndex::M3,
+            TfIndex::M5,
+            TfIndex::M15,
+            TfIndex::M30,
+            TfIndex::M60,
+            TfIndex::M10,
+        ] {
+            assert!(!tf.is_second_scale(), "{tf:?} wrongly reads as sub-minute");
         }
         for tf in second_scale {
             assert!(
                 tf.seconds_per_bucket() < 60,
                 "{tf:?} gated but not sub-minute"
-            );
-            assert!(
-                tf.as_ordinal() >= 5,
-                "{tf:?} gated frame in legacy ordinals"
             );
         }
     }
@@ -1242,7 +1047,9 @@ mod tests {
 
     /// `Ord` sorts by the `repr(u8)` discriminant = the seal-spill
     /// APPEND order (C3) — which is exactly `ALL`'s order. Deliberately
-    /// NOT seconds order: D1 (ordinal 4) precedes S1 (ordinal 5).
+    /// NOT seconds order: M15 (ordinal 3, 900 s) precedes S1 (ordinal 4, 1 s)
+    /// (2026-09-22: this read "D1 (ordinal 4) precedes S1 (ordinal 5)", the
+    /// pre-2026-09-19 numbering; D1 no longer exists).
     #[test]
     fn test_tf_index_total_ordering_matches_ordinal_append_order() {
         let mut sorted = TfIndex::ALL.to_vec();
@@ -1250,99 +1057,101 @@ mod tests {
         assert_eq!(sorted, TfIndex::ALL);
     }
 
-    /// The operator-requested set is EXACTLY the nine native frames of the
-    /// 2026-09-18 directive.
+    /// `TfIndex::ALL` IS exactly the ten native frames the operator asked
+    /// for — the nine of 2026-09-18 plus `M10`, which was a view until the
+    /// 2026-09-22 "NO VIEWS ANYWHERE" ruling — no more, no fewer, and each
+    /// named individually.
     ///
-    /// Both halves are named individually rather than counted. A count alone
-    /// would pass if a requested frame were swapped for an unrequested one,
-    /// and that is precisely the mistake available here: the enum's
-    /// second-scale variants sit immediately adjacent to one another
-    /// (`S2`/`S3`/`S4`, `S4`/`S5`/`S6`), so an off-by-one in either direction
-    /// is a plausible edit that a length check would wave through — and the
-    /// 2026-09-18 change is itself exactly such an edit, moving `S3` in and
-    /// `S10`/`S15`/`S30`/`M2` out.
+    /// ## Why every frame is named rather than counted
     ///
-    /// The four that LEFT get their own assertion block rather than being
-    /// folded in with the never-requested eleven, for the same reason `D1`
-    /// has always had its own: "asked for, then withdrawn" and "never asked
-    /// for" are different facts, and a reader restoring one of them needs to
-    /// see which it is.
+    /// A count alone would pass if one frame were swapped for another, and
+    /// that is precisely the mistake available here: the second-scale
+    /// variants sit adjacent to one another (`S1`/`S3`/`S5`), so an
+    /// off-by-one in either direction is a plausible edit a length check
+    /// would wave through.
+    ///
+    /// ## Why this pins the ENUM and no longer a predicate
+    ///
+    /// Until 2026-09-19 the enum carried 24 variants and a predicate
+    /// (`is_operator_requested`) decided which of them emitted rows; this
+    /// test pinned that predicate's answer across four blocks — the nine
+    /// requested, the four withdrawn on 2026-09-18, `D1` (withdrawn
+    /// 2026-08-25 for a DIFFERENT reason — the operator ruled a day bar must
+    /// never be derived from the internal fold at all), and ten that were
+    /// never asked for.
+    ///
+    /// The 2026-09-19 directive DELETED those fifteen variants outright
+    /// (`TF_COUNT` 24 -> 9), so the predicate became tautologically true and
+    /// went with them. The guarantee it carried now belongs to the enum: a
+    /// frame cannot be emitted-but-unwanted, because an unwanted frame has
+    /// no variant to be. Restoring any of the fifteen means re-adding a
+    /// variant, which fails this test by name.
+    ///
+    /// The four-way split is NOT reproduced here, deliberately: "asked for,
+    /// then withdrawn" and "never asked for" are different facts about
+    /// variants that no longer exist, and the historical record of which was
+    /// which lives in the dated rule-file sections, not in a test over an
+    /// enum that cannot express them. What a reader needs from THIS test is
+    /// the live set.
     #[test]
-    fn tf_index_operator_set_is_the_operators_nine() {
-        let requested: Vec<TfIndex> = TfIndex::ALL
-            .iter()
-            .copied()
-            .filter(|tf| tf.is_operator_requested())
-            .collect();
+    fn tf_index_all_is_the_operators_ten() {
+        assert_eq!(
+            TfIndex::ALL.len(),
+            10,
+            "operator directive 2026-09-18 named eleven entries: `ticks` (not \
+             a candle frame) and ten candle frames. `10m` was a VIEW over \
+             candles_1m until 2026-09-22, when the operator ruled 'NO VIEWS \
+             ANYWHERE' and it became the tenth native frame, APPENDED at \
+             ordinal 9. Found {}. Changing this set needs a fresh dated quote.",
+            TfIndex::ALL.len()
+        );
 
         assert_eq!(
-            requested.len(),
-            9,
-            "operator directive 2026-09-18 named eleven entries: `ticks` (not a \
-             candle frame), `10m` (DERIVED from candles_1m, no TfIndex variant) \
-             and these NINE native frames. Found {}. Changing this set needs a \
-             fresh dated quote.",
-            requested.len()
+            TfIndex::ALL,
+            [
+                TfIndex::M1,
+                TfIndex::M3,
+                TfIndex::M5,
+                TfIndex::M15,
+                TfIndex::S1,
+                TfIndex::S3,
+                TfIndex::S5,
+                TfIndex::M30,
+                TfIndex::M60,
+                TfIndex::M10,
+            ],
+            "TfIndex::ALL must be exactly the operator's ten, in ordinal \
+             order. `ALL` is indexed BY ordinal and `from_ordinal` is its \
+             inverse, so the order is load-bearing, not cosmetic."
         );
 
-        // The nine that must emit rows.
-        for tf in [
-            TfIndex::S1,
-            TfIndex::S3,
-            TfIndex::S5,
-            TfIndex::M1,
-            TfIndex::M3,
-            TfIndex::M5,
-            TfIndex::M15,
-            TfIndex::M30,
-            TfIndex::M60,
+        // The retired names, asserted as ABSENT by table name rather than by
+        // variant — a deleted variant cannot be named in Rust, so this is the
+        // only form the guarantee can take here.
+        let live: Vec<&str> = TfIndex::ALL.iter().map(|tf| tf.table_name()).collect();
+        for retired in [
+            "candles_1d",
+            "candles_2s",
+            "candles_4s",
+            "candles_6s",
+            "candles_7s",
+            "candles_8s",
+            "candles_9s",
+            "candles_10s",
+            "candles_11s",
+            "candles_12s",
+            "candles_13s",
+            "candles_14s",
+            "candles_15s",
+            "candles_30s",
+            "candles_2m",
         ] {
             assert!(
-                tf.is_operator_requested(),
-                "{tf:?} is one of the operator's nine and must emit rows"
-            );
-        }
-
-        // Requested on 2026-08-08, WITHDRAWN on 2026-09-18. Their tables keep
-        // every row already written — the DDL still creates all 24 names and
-        // no populated table is ever dropped (SEBI retention). Only new rows
-        // stop.
-        for tf in [TfIndex::S10, TfIndex::S15, TfIndex::S30, TfIndex::M2] {
-            assert!(
-                !tf.is_operator_requested(),
-                "{tf:?} was dropped from the emission set by the 2026-09-18 \
-                 directive — restoring it needs a fresh dated quote"
-            );
-        }
-
-        // D1 — removed 2026-08-25, for a DIFFERENT reason than the four
-        // above: the operator ruled that a day bar must never be derived from
-        // the internal fold at all, not merely that he no longer wants the
-        // table.
-        assert!(
-            !TfIndex::D1.is_operator_requested(),
-            "operator 2026-08-25: 1d must NEVER be derived from the internal \
-             timeframe fold — the live lane must not emit candles_1d"
-        );
-
-        // The ten that exist but were NEVER asked for. `S3` left this list on
-        // 2026-09-18; it is now in the requested nine above.
-        for tf in [
-            TfIndex::S2,
-            TfIndex::S4,
-            TfIndex::S6,
-            TfIndex::S7,
-            TfIndex::S8,
-            TfIndex::S9,
-            TfIndex::S11,
-            TfIndex::S12,
-            TfIndex::S13,
-            TfIndex::S14,
-        ] {
-            assert!(
-                !tf.is_operator_requested(),
-                "{tf:?} was never requested — emitting it writes rows to disk \
-                 every bucket for nobody"
+                !live.contains(&retired),
+                "{retired} was retired by the 2026-09-19 directive — \
+                 restoring it needs a fresh dated quote, and its DROP entry \
+                 in shadow_persistence::RETIRED_CANDLE_TABLES would have to \
+                 move with it"
             );
         }
     }

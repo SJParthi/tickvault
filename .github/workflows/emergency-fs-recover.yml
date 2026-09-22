@@ -194,7 +194,7 @@ jobs:
           FSTYPE=$(findmnt -no FSTYPE /)
           if [ "$FSTYPE" = xfs ]; then sudo xfs_growfs -d / ; else sudo resize2fs "$ROOT"; fi
           echo "AFTER-GROW"; df -B1G / | tail -1
-          echo "=== 4. containerd + docker + QuestDB up, then drop the market-data tables + console views (Quote 21) ==="
+          echo "=== 4. containerd + docker + QuestDB up, then drop the market-data tables + retired console views (Quote 21) ==="
           # After a disk-full boot dockerd could not dial containerd (first live run);
           # restarting containerd and clearing docker's failed state fixed it.
           sudo systemctl restart containerd || true
@@ -209,8 +209,8 @@ jobs:
           q() { curl -fsS --max-time 600 -G --data-urlencode "query=$1" http://127.0.0.1:9000/exec 2>&1; }
           ALL=$(curl -fsS --max-time 30 -G --data-urlencode 'query=SELECT table_name FROM tables()' http://127.0.0.1:9000/exp | tail -n +2 | tr -d '"\r' | sed '/^$/d')
           echo "TABLES-BEFORE: $(echo "$ALL" | paste -sd' ' -)"
-          for v in ticks_named candles_named market_depth_named; do echo "VIEW $v: $(q "DROP VIEW IF EXISTS $v" | head -c 100)"; done
-          TARGETS=$(printf '%s\n' "$ALL" | awk '$0=="ticks" || $0=="market_depth" || index($0,"candles_")==1' | sort)
+          for v in ticks_named candles_named candles_10m market_depth_named; do echo "VIEW $v: $(q "DROP VIEW IF EXISTS $v" | head -c 100)"; done
+          TARGETS=$(printf '%s\n' "$ALL" | awk '$0=="ticks" || $0=="market_depth" || (index($0,"candles_")==1 && $0!="candles_named")' | sort)
           echo "WIPE-TARGETS $(echo "$TARGETS" | wc -w): $(echo "$TARGETS" | paste -sd' ' -)"
           failed=0
           for t in $TARGETS; do

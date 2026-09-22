@@ -42,7 +42,7 @@
 //! [`AggregatorCell::consume_tick`] is O(1): one ordinal index into a fixed
 //! array, a handful of scalar comparisons, no loop over data, no allocation.
 
-use tickvault_common::constants::MAX_PLAUSIBLE_LTP;
+use tickvault_common::constants::{IST_UTC_OFFSET_NANOS, MAX_PLAUSIBLE_LTP};
 use tickvault_common::price_precision::f32_to_f64_clean;
 use tickvault_common::tick_types::ParsedTick;
 
@@ -1048,7 +1048,12 @@ impl AggregatorCell {
                 if matches!(strategy.late_policy, LatePolicy::Refold)
                     && bucket_start == last.bucket_start_ist_secs
                 {
-                    fold_late_hlc(&mut self.last_sealed[ord], prices, fold_secs);
+                    fold_late_hlc(
+                        &mut self.last_sealed[ord],
+                        prices,
+                        fold_secs,
+                        tick.received_at_nanos,
+                    );
                     // SEAL SITE 5 of 6 — and the one that proves the guard
                     // earns its keep. I wrote this change believing there
                     // were four emission points; the source scan found this
@@ -1377,7 +1382,12 @@ impl AggregatorCell {
         if matches!(strategy.late_policy, LatePolicy::Refold) {
             let last = self.last_sealed[ord];
             if !last.is_uninitialised() && bucket_start == last.bucket_start_ist_secs {
-                fold_late_hlc(&mut self.last_sealed[ord], prices, fold_secs);
+                fold_late_hlc(
+                    &mut self.last_sealed[ord],
+                    prices,
+                    fold_secs,
+                    tick.received_at_nanos,
+                );
                 // SEAL SITE 4 of 6, and one of the two a careless fix misses: the
                 // late tick just moved `close`, so a percentage stamped at
                 // the original seal is now stale for the row that actually
@@ -1672,6 +1682,31 @@ fn usable_exchange_price(raw: f32) -> bool {
     raw.is_normal() && raw > 0.0 && raw <= MAX_PLAUSIBLE_LTP
 }
 
+/// A tick's UTC receipt instant as IST-NAIVE nanoseconds, preserving the
+/// "no receipt" sentinel.
+///
+/// `ParsedTick::received_at_nanos` is UTC. Every timestamp the fold reasons
+/// about — `bucket_start_ist_secs`, `close_ts_ist_secs` — is IST-naive, so the
+/// offset is applied HERE, exactly once, at the only two sites that record a
+/// receipt. Storing the raw UTC value instead would leave every later
+/// subtraction against a window edge wrong by 5h30m in a way that looks
+/// perfectly reasonable: `open_latency` would read as five and a half hours on
+/// every bar of every session.
+///
+/// `0` is the documented "this frame carries no receipt clock" value — a
+/// pre-`TVW3` WAL replay, `WAL_RECEIPT_UNKNOWN_NANOS`. It is passed through
+/// UNSHIFTED rather than offset, because the writer renders `0` as a NULL
+/// delay pair; shifting it would turn "unknown" into a confident 5h30m. A
+/// negative reading is treated identically, since it cannot be a real receipt.
+#[inline]
+fn receipt_ist_nanos(received_at_nanos: i64) -> i64 {
+    if received_at_nanos > 0 {
+        received_at_nanos.saturating_add(IST_UTC_OFFSET_NANOS)
+    } else {
+        0
+    }
+}
+
 /// Builds the state of a bucket being opened by `tick`.
 ///
 /// `use_day_open` makes the bar open at the exchange-published `day_open`
@@ -1780,6 +1815,12 @@ fn open_bucket(
         session_open: prices.day_open,
         open_pct: 0.0,
         open_gap_pct: 0.0,
+        // Both stamps seeded from the SAME reading, because a bucket with one
+        // tick has a zero span and both edges are that tick. `min`/`max` in
+        // `fold_in_bucket` then widen them, which is what makes arrival order
+        // irrelevant — see the field docs for why first-write would be wrong.
+        first_receipt_ist_nanos: receipt_ist_nanos(tick.received_at_nanos),
+        last_receipt_ist_nanos: receipt_ist_nanos(tick.received_at_nanos),
     };
     // The official open is a REAL matched trade (the pre-open call auction
     // equilibrium), so it genuinely belongs inside this bar's range. Widen
@@ -2079,6 +2120,31 @@ fn fold_in_bucket(
     if prices.day_open > 0.0 {
         state.session_open = prices.day_open;
     }
+    // The bucket's receipt WINDOW, widened by min/max over real readings.
+    //
+    // MIN and MAX, never first-write and last-write. This feed carries no
+    // sequence number, so arrival order is arbitrary: the tick that opens a
+    // bucket by EXCHANGE time is not necessarily the one that reached us
+    // first, and the tick that closes it is not necessarily the one that
+    // reached us last. First/last-write would report whichever packet the
+    // network happened to deliver at the edges; min/max report the window the
+    // bucket's data actually occupied, which is what the three delay columns
+    // claim to measure.
+    //
+    // Only a REAL reading widens. `0` is the "no receipt" sentinel, so a
+    // `min` against it would peg every bucket containing one replayed frame at
+    // zero — an `open_latency` of "the whole time since midnight" on a bar
+    // that was perfectly prompt. A bucket whose stamps are still `0` takes the
+    // first real reading it sees on both edges.
+    let receipt = receipt_ist_nanos(tick.received_at_nanos);
+    if receipt > 0 {
+        if state.first_receipt_ist_nanos == 0 || receipt < state.first_receipt_ist_nanos {
+            state.first_receipt_ist_nanos = receipt;
+        }
+        if receipt > state.last_receipt_ist_nanos {
+            state.last_receipt_ist_nanos = receipt;
+        }
+    }
 }
 
 /// Folds a LATE tick into an already-sealed bucket's high / low / close.
@@ -2090,8 +2156,32 @@ fn fold_in_bucket(
 /// truly-later close. `open` /
 /// `volume` / `oi` are untouched: `open` belongs to the first tick, and the
 /// cumulative snapshots are order-dependent and ambiguous for a latecomer.
+///
+/// The two RECEIPT stamps ARE widened by the late tick, exactly as
+/// `fold_in_bucket` widens them. This path re-emits the amended bar as
+/// `AmendedLate`, the writer recomputes the three delay columns from it, and
+/// the DEDUP upsert replaces the earlier row. Leaving the stamps alone would
+/// persist a row whose close moved on a tick received N seconds after the
+/// window closed while its `close_latency` still claims all data arrived
+/// before the close. *(Corrected 2026-09-22: this paragraph said the late
+/// path "re-emits only the amended bar" and that the delay figures "left with
+/// the seal" — the first half was true and made the second half false.)*
 #[inline]
-fn fold_late_hlc(state: &mut LiveCandleState, prices: TickPrices, fold_secs: u32) {
+fn fold_late_hlc(
+    state: &mut LiveCandleState,
+    prices: TickPrices,
+    fold_secs: u32,
+    received_at_nanos: i64,
+) {
+    let receipt = receipt_ist_nanos(received_at_nanos);
+    if receipt > 0 {
+        if state.first_receipt_ist_nanos == 0 || receipt < state.first_receipt_ist_nanos {
+            state.first_receipt_ist_nanos = receipt;
+        }
+        if receipt > state.last_receipt_ist_nanos {
+            state.last_receipt_ist_nanos = receipt;
+        }
+    }
     let price = prices.last_traded_price;
     if price > state.high {
         state.high = price;
@@ -2122,13 +2212,18 @@ fn fold_late_hlc(state: &mut LiveCandleState, prices: TickPrices, fold_secs: u32
 // mystery const-assert.
 //
 // Fleet cost at the slot ceiling, stated because this constant multiplies:
-//   24 TF × 136 B × 2 = 6_528 B, padded ≤ 6_784 B per instrument
-//   × AGGREGATOR_MAX_SLOTS (25,000) = ~170 MB
-// against the r8g.xlarge 32 GiB host (operator Quote 13) that is 0.52% —
-// up from ~141 MB at 21 frames and ~160 MB at 24 frames × 128 B. On the
-// retired 4 GiB t4g.medium the same table would have been ~4.1% of the
+//   9 TF × 152 B × 2 = 2_736 B, + 9 × 21 + 160 = 3_085 B per instrument
+//   × AGGREGATOR_MAX_SLOTS (25,000) = ~77 MB
+// against the r8g.xlarge 32 GiB host (operator Quote 13) that is 0.24%. On the
+// retired 4 GiB t4g.medium the same table would have been ~1.9% of the
 // entire machine, which is the sort of number that used to make "just add
 // three timeframes" a real decision.
+//
+// ⚠ This paragraph read "24 TF × 136 B × 2 = 6_528 B … ~170 MB" until
+// 2026-09-19. The FORMULA below is derived from TF_COUNT and followed the
+// nine-frame collapse on its own; the prose did not, which is precisely the
+// stale-figure class this file keeps recording. Re-derived from the constants
+// rather than scaled from the previous row.
 //
 // 128 → 136 RAISED 2026-09-10 for `LiveCandleState::net_volume_signed`, the
 // tick-rule net-volume accumulator. The per-instrument cost is +256 B and the
@@ -2136,7 +2231,7 @@ fn fold_late_hlc(state: &mut LiveCandleState, prices: TickPrices, fold_secs: u32
 // file over carries a further +4.8 MB, so the whole change is ~15 MB. Recorded
 // in `aws-budget.md` under the same date, per this assert's own instruction.
 //
-// The 136 stays a LITERAL and is deliberately NOT written as
+// The 152 stays a LITERAL and is deliberately NOT written as
 // `size_of::<LiveCandleState>()`. Deriving it from the thing it bounds would
 // make this assert vacuous — it would still catch a change to the CELL's own
 // layout while silently permitting unbounded growth of the state it holds,
@@ -2155,9 +2250,28 @@ fn fold_late_hlc(state: &mut LiveCandleState, prices: TickPrices, fold_secs: u32
 // What it buys, measured rather than argued: the seconds frame was 2,990 gross
 // units and 650 of net short of the minute frame on security 68407, on the
 // SAME ticks, because a frame that refuses a late tick had nowhere to put its
-// volume. 10 MB for a conservation guarantee across all 24 frames is the
-// cheapest line in this budget.
-const MAX_AGGREGATOR_CELL_BYTES: usize = TF_COUNT * 136 * 2 + TF_COUNT * 21 + 160;
+// volume. 10 MB for a conservation guarantee across all nine frames is the
+// cheapest line in this budget. (That sentence said "all 24 frames" until
+// 2026-09-19; the fold is nine frames since the collapse, and the conservation
+// guarantee is unchanged in kind.)
+//
+// 136 → 152 RAISED 2026-09-19 for the two receipt stamps
+// (`LiveCandleState::first_receipt_ist_nanos` + `last_receipt_ist_nanos`),
+// which are what let a candle row carry `open_latency`, `close_latency` and
+// `window_span_latency`. Re-derived from the constants rather than scaled:
+//   9 TF × 152 B × 2 = 2_736 B, + 9 × 21 + 160 = 3_085 B per instrument
+//   × AGGREGATOR_MAX_SLOTS (25,000) = ~77.1 MB   (was 2_797 B / ~69.9 MB)
+// so the fleet cost is +7.2 MB, 0.02% of the 32 GiB host, and the seal ring's
+// own budget one file over carries a further +3.6 MB. Recorded in
+// `aws-budget.md` under the same date, per this assert's own instruction.
+//
+// What it buys: `ts` is the EXCHANGE clock, so a bar built from data that
+// arrived instantly and one built from data that arrived four seconds late are
+// byte-identical in every other column. These two stamps are the only surface
+// that can tell them apart — and they MEASURE receipt against the window, they
+// never BUCKET by it (`fold_clock_ist_secs` stays the identity on
+// `exchange_timestamp`).
+const MAX_AGGREGATOR_CELL_BYTES: usize = TF_COUNT * 152 * 2 + TF_COUNT * 21 + 160;
 const _: () = assert!(
     std::mem::size_of::<AggregatorCell>() <= MAX_AGGREGATOR_CELL_BYTES,
     "AggregatorCell exceeded its per-instrument budget — this multiplies by AGGREGATOR_MAX_SLOTS (25,000); update aws-budget.md before raising."
@@ -3209,6 +3323,132 @@ mod tests {
         );
     }
 
+    // -- receipt stamps (2026-09-22, coverage finding A11) -----------------
+
+    fn tick_recv(ts: u32, price: f32, cum: u32, received_at_nanos: i64) -> ParsedTick {
+        ParsedTick {
+            received_at_nanos,
+            ..tick_at(ts, price, cum)
+        }
+    }
+
+    /// min / max over out-of-order receipts, a `0` ("no receipt") that must
+    /// NOT peg the first stamp, the IST shift, and a reset on bucket roll.
+    #[test]
+    fn receipt_stamps_take_min_and_max_skip_zero_and_reset_on_roll() {
+        const S: i64 = 1_000_000_000;
+        let base = 1_790_000_000 * S; // a UTC receipt instant
+        let mut cell = AggregatorCell::empty();
+        let st = FeedStrategy::DEFAULT;
+        let _ = cell.consume_tick(
+            TfIndex::M1,
+            &tick_recv(OPEN, 100.0, 1, base + 2 * S),
+            0,
+            st,
+            1,
+        );
+        let _ = cell.consume_tick(
+            TfIndex::M1,
+            &tick_recv(OPEN + 1, 101.0, 2, base + S),
+            0,
+            st,
+            2,
+        );
+        let _ = cell.consume_tick(TfIndex::M1, &tick_recv(OPEN + 2, 102.0, 3, 0), 0, st, 3);
+        let _ = cell.consume_tick(
+            TfIndex::M1,
+            &tick_recv(OPEN + 3, 103.0, 4, base + 3 * S),
+            0,
+            st,
+            4,
+        );
+        let bar = cell.snapshot(TfIndex::M1);
+        assert_eq!(bar.first_receipt_ist_nanos, base + S + IST_UTC_OFFSET_NANOS);
+        assert_eq!(
+            bar.last_receipt_ist_nanos,
+            base + 3 * S + IST_UTC_OFFSET_NANOS
+        );
+
+        // Roll into the next minute: both stamps re-seed from the new tick.
+        let _ = cell.consume_tick(
+            TfIndex::M1,
+            &tick_recv(OPEN + 60, 104.0, 5, base + 70 * S),
+            0,
+            st,
+            5,
+        );
+        let next = cell.snapshot(TfIndex::M1);
+        assert_eq!(
+            next.first_receipt_ist_nanos,
+            base + 70 * S + IST_UTC_OFFSET_NANOS
+        );
+        assert_eq!(
+            next.last_receipt_ist_nanos,
+            base + 70 * S + IST_UTC_OFFSET_NANOS
+        );
+    }
+
+    /// A bucket whose first ticks carry no receipt takes the first REAL one
+    /// on both edges rather than keeping `0`.
+    #[test]
+    fn a_bucket_opened_without_a_receipt_takes_the_first_real_one() {
+        const S: i64 = 1_000_000_000;
+        let base = 1_790_000_000 * S;
+        let mut cell = AggregatorCell::empty();
+        let st = FeedStrategy::DEFAULT;
+        let _ = cell.consume_tick(TfIndex::M1, &tick_recv(OPEN, 100.0, 1, 0), 0, st, 1);
+        assert_eq!(cell.snapshot(TfIndex::M1).first_receipt_ist_nanos, 0);
+        let _ = cell.consume_tick(TfIndex::M1, &tick_recv(OPEN + 1, 101.0, 2, base), 0, st, 2);
+        let bar = cell.snapshot(TfIndex::M1);
+        assert_eq!(bar.first_receipt_ist_nanos, base + IST_UTC_OFFSET_NANOS);
+        assert_eq!(bar.last_receipt_ist_nanos, base + IST_UTC_OFFSET_NANOS);
+    }
+
+    /// The late path re-emits the amended bar and the writer recomputes the
+    /// delays from it, so a late tick must widen `last_receipt` — otherwise
+    /// the rewritten row claims every tick arrived before the close.
+    ///
+    /// BITE PROOF: drop the receipt block from `fold_late_hlc` and the
+    /// `last_receipt` assertion reads the pre-amend value.
+    #[test]
+    fn a_late_tick_widens_the_amended_bars_last_receipt() {
+        const S: i64 = 1_000_000_000;
+        let base = 1_790_000_000 * S;
+        let mut cell = AggregatorCell::empty();
+        let _ = cell.consume_tick(
+            TfIndex::M1,
+            &tick_recv(OPEN + 50, 100.0, 10, base),
+            0,
+            FeedStrategy::REFOLD,
+            10,
+        );
+        let _ = cell.consume_tick(
+            TfIndex::M1,
+            &tick_recv(OPEN + 60, 105.0, 20, base + 11 * S),
+            10,
+            FeedStrategy::REFOLD,
+            20,
+        );
+        let out = cell.consume_tick(
+            TfIndex::M1,
+            &tick_recv(OPEN + 55, 99.0, 21, base + 40 * S),
+            10,
+            FeedStrategy::REFOLD,
+            21,
+        );
+        let ConsumeOutcome::AmendedLate { amended_state } = out else {
+            panic!("expected amend, got {out:?}");
+        };
+        assert_eq!(
+            amended_state.first_receipt_ist_nanos,
+            base + IST_UTC_OFFSET_NANOS
+        );
+        assert_eq!(
+            amended_state.last_receipt_ist_nanos,
+            base + 40 * S + IST_UTC_OFFSET_NANOS,
+            "the late receipt must reach the re-emitted row"
+        );
+    }
     #[test]
     fn test_feed_strategy_default_is_refold_and_is_documented() {
         assert_eq!(FeedStrategy::default(), FeedStrategy::REFOLD);
@@ -4269,33 +4509,38 @@ mod open_bucket_ordering_tests {
     }
 
     #[test]
-    fn the_daily_bars_close_survives_reordering_across_the_whole_session() {
-        // The same defect, at the scale where it hurt most. A 1-minute bucket
-        // gives a reordered packet a 60-second window to do damage; the daily
-        // bucket gives it the entire session, so ANY reordered packet could
-        // rewrite the day's close.
+    fn the_hour_bars_close_survives_reordering_across_the_whole_bucket() {
+        // The same defect, at the widest scale the fold still carries. A
+        // 1-minute bucket gives a reordered packet a 60-second window to do
+        // damage; the 60-minute bucket gives it a full hour, so ANY reordered
+        // packet could rewrite the hour's close.
+        //
+        // Until the 2026-09-19 nine-frame collapse this test ran on `D1` and
+        // spanned five hours — the daily frame was then the longest. `M60` is
+        // the longest now, so the ticks are re-anchored INSIDE one 09:00–10:00
+        // bucket; the property under test is unchanged.
         let mut cell = AggregatorCell::empty();
 
-        fold(&mut cell, TfIndex::D1, &tick_at(OPEN, 100.0, 10), 10);
+        fold(&mut cell, TfIndex::M60, &tick_at(OPEN, 100.0, 10), 10);
         fold(
             &mut cell,
-            TfIndex::D1,
-            &tick_at(OPEN + 5 * 3600, 250.0, 900),
+            TfIndex::M60,
+            &tick_at(OPEN + 40 * 60, 250.0, 900),
             900,
         );
-        // Fifty minutes stale, arriving last.
+        // Twenty minutes stale, arriving last.
         fold(
             &mut cell,
-            TfIndex::D1,
-            &tick_at(OPEN + 4 * 3600, 180.0, 700),
+            TfIndex::M60,
+            &tick_at(OPEN + 20 * 60, 180.0, 700),
             700,
         );
 
-        let s = cell.snapshot(TfIndex::D1);
+        let s = cell.snapshot(TfIndex::M60);
         assert_eq!(
             s.close,
             f32_to_f64_clean(250.0),
-            "the day's close must be the last TRADE, not the last delivery"
+            "the hour's close must be the last TRADE, not the last delivery"
         );
     }
 
@@ -4622,7 +4867,7 @@ mod open_bucket_ordering_tests {
         // Observable equivalence rather than field equality: the fields are
         // private and two cells that behave identically through the public
         // surface ARE the same cell as far as any caller can tell.
-        for tf in [TfIndex::S1, TfIndex::M1, TfIndex::D1] {
+        for tf in [TfIndex::S1, TfIndex::M1, TfIndex::M60] {
             assert_eq!(
                 from_default.last_sealed_snapshot(tf),
                 from_empty.last_sealed_snapshot(tf),

@@ -16,14 +16,23 @@
 //!   (operator 2026-06-19, "same tables + feed column") keeps Dhan and
 //!   Groww candles for the same minute/instrument distinct, never merged.
 //!
-//! ## Schema (18 columns)
+//! ## Schema (22 columns)
+//!
+//! Column ORDER is the operator's, verbatim (2026-09-19): `ts` first, then
+//! the three READABLE delays, then identity, then OHLCV, then the two
+//! percentages, and the three exact `_ns` twins LAST. A reader scanning left
+//! to right meets the bar's identity and its freshness before a price.
 //!
 //! ```sql
 //! CREATE TABLE IF NOT EXISTS candles_1m (
+//!     ts                       TIMESTAMP,
+//!     open_latency             VARCHAR,
+//!     close_latency            VARCHAR,
+//!     window_span_latency      VARCHAR,
 //!     feed                     SYMBOL,
 //!     segment                  SYMBOL,
 //!     security_id              LONG,
-//!     ts                       TIMESTAMP,
+//!     contract                 SYMBOL,
 //!     open                     DOUBLE,
 //!     high                     DOUBLE,
 //!     low                      DOUBLE,
@@ -31,12 +40,13 @@
 //!     volume                   LONG,   -- SIGNED: see the note below
 //!     oi                       LONG,
 //!     tick_count               LONG,
-//!     close_pct_from_prev_day  DOUBLE,
-//!     open_pct                 DOUBLE,
-//!     change_pct               DOUBLE,
-//!     open_gap_pct             DOUBLE,
+//!     percentage_change        DOUBLE,
+//!     open_percentage_change   DOUBLE,
 //!     total_buy_qty            LONG,
-//!     total_sell_qty           LONG
+//!     total_sell_qty           LONG,
+//!     open_latency_ns          LONG,
+//!     close_latency_ns         LONG,
+//!     window_span_latency_ns   LONG
 //! ) timestamp(ts) PARTITION BY DAY
 //!   DEDUP UPSERT KEYS(ts, security_id, segment, feed);
 //! ```
@@ -94,8 +104,6 @@ use tracing::{error, info, warn};
 use tickvault_common::config::QuestDbConfig;
 use tickvault_trading::candles::{TF_COUNT, TfIndex};
 
-use crate::shadow_candle_writer::CANDLE_FEED_DHAN;
-
 // ---------------------------------------------------------------------------
 // QuestDB table names — one per timeframe.
 //
@@ -134,6 +142,42 @@ use crate::shadow_candle_writer::CANDLE_FEED_DHAN;
 /// re-enabling DEDUP — so post-migration same-minute re-seals upsert cleanly.
 pub const DEDUP_KEY_CANDLES: &str = "ts, security_id, segment, feed";
 
+/// Every candle column the CREATE below still declares, paired with its type,
+/// for the boot self-heal that brings an OLDER table up to the current shape.
+///
+/// ⚠ This list holds ONLY columns that are in the CREATE. A removed column
+/// must never appear here: QuestDB can add a column but never drop or rename
+/// one, so a self-heal naming a removed column re-adds on the next boot
+/// exactly what the reset took out — the trap this repository already recorded
+/// for `net_volume`. `change_pct`, `open_pct`, `open_gap_pct`,
+/// `close_pct_from_prev_day` and `net_volume` are absent on purpose.
+///
+/// `ts` is excluded because it is the designated timestamp, which
+/// `ALTER TABLE ... ADD COLUMN` cannot create.
+pub(crate) const CANDLE_SELF_HEAL_COLUMNS: &[(&str, &str)] = &[
+    ("open_latency", "VARCHAR"),
+    ("close_latency", "VARCHAR"),
+    ("window_span_latency", "VARCHAR"),
+    ("feed", "SYMBOL"),
+    ("segment", "SYMBOL"),
+    ("security_id", "LONG"),
+    ("contract", "SYMBOL"),
+    ("open", "DOUBLE"),
+    ("high", "DOUBLE"),
+    ("low", "DOUBLE"),
+    ("close", "DOUBLE"),
+    ("volume", "LONG"),
+    ("oi", "LONG"),
+    ("tick_count", "LONG"),
+    ("percentage_change", "DOUBLE"),
+    ("open_percentage_change", "DOUBLE"),
+    ("total_buy_qty", "LONG"),
+    ("total_sell_qty", "LONG"),
+    ("open_latency_ns", "LONG"),
+    ("close_latency_ns", "LONG"),
+    ("window_span_latency_ns", "LONG"),
+];
+
 // ---------------------------------------------------------------------------
 // Public helpers — aggregate the table names for downstream consumers.
 // ---------------------------------------------------------------------------
@@ -160,8 +204,7 @@ pub fn candle_table_names() -> [&'static str; TF_COUNT] {
     names
 }
 
-/// The candle tables that are actually WRITTEN — one per timeframe whose
-/// [`TfIndex::is_operator_requested`] is true.
+/// The candle tables that are actually WRITTEN — one per fold frame.
 ///
 /// ## Why this exists separately from [`candle_table_names`]
 ///
@@ -169,38 +212,82 @@ pub fn candle_table_names() -> [&'static str; TF_COUNT] {
 /// seal-writer chain indexes its `[Sender; TF_COUNT]` ILP sender array by
 /// `TfIndex as usize`, so narrowing that array would silently re-point every
 /// frame at the wrong table. This function is the DDL/retention view of the
-/// same set — a filtered `Vec`, never an ordinal index.
+/// same set — a `Vec`, never an ordinal index.
 ///
-/// The operator's 2026-09-18 directive keeps exactly eleven frames: `ticks`
-/// plus `1s 3s 5s 1m 3m 5m 10m 15m 30m 60m`, of which `10m` is a derived VIEW
-/// over `candles_1m` (`console_views::candles_10m_view_ddl`) and not a fold
-/// frame. So NINE tables are created here, and the remaining fifteen ordinals
-/// get no table at all — see [`retired_candle_table_names`].
+/// ## 2026-09-19 — this is now every frame, and that is the point
+///
+/// It used to filter on `TfIndex::is_operator_requested`, because the enum
+/// carried fifteen frames the operator had retired and the predicate was what
+/// kept their tables from being created. The operator's 2026-09-19 directive
+/// deleted those variants outright (`TF_COUNT` 24 → 9), so the predicate
+/// became tautologically true and was removed — a gate that can only return
+/// true reads as a live filter to the next author.
+///
+/// The surviving ten are `1s 3s 5s 1m 3m 5m 10m 15m 30m 60m`. `10m` was a
+/// derived VIEW over `candles_1m` until 2026-09-22 and is now a folded table
+/// like the rest (the operator's "no views anywhere" directive).
 #[must_use]
-// TEST-EXEMPT: pure filter over the ordinal array; pinned by test_emitted_and_retired_partition_the_ordinal_set.
+// TEST-EXEMPT: pure map over the ordinal array; pinned by test_emitted_and_retired_partition_the_ordinal_set.
 pub fn emitted_candle_table_names() -> Vec<&'static str> {
-    TfIndex::ALL
-        .iter()
-        .filter(|tf| tf.is_operator_requested())
-        .map(|tf| tf.table_name())
-        .collect()
+    TfIndex::ALL.iter().map(|tf| tf.table_name()).collect()
 }
 
-/// The complement of [`emitted_candle_table_names`]: candle tables whose
-/// timeframe no longer emits, and which therefore must not exist.
+/// Candle tables this deployment once created and must now DROP.
 ///
-/// Fed to [`drop_retired_candle_tables`]. Derived, never a hand-written list —
-/// a hand-written list is what goes stale the next time the operator moves the
-/// frame set, and this repository has now been bitten by a stale hand-written
-/// table ledger twice.
+/// Fed to [`drop_retired_candle_tables`].
+///
+/// ## Why this is a HAND-WRITTEN list, reversing what this doc used to say
+///
+/// Until 2026-09-19 this was derived — `TfIndex::ALL` filtered on the inverse
+/// of `is_operator_requested` — under a doc that read *"Derived, never a
+/// hand-written list — a hand-written list is what goes stale the next time
+/// the operator moves the frame set."* That reasoning held while the retired
+/// frames were still enum variants carrying a false predicate. It stops
+/// holding the moment those variants are DELETED: a derivation over the
+/// surviving nine returns the EMPTY set, `drop_retired_candle_tables` returns
+/// early on `retired.is_empty()`, and fifteen orphan tables sit on a live box
+/// forever while every test still passes.
+///
+/// So this is a HISTORICAL FACT about what was once created, fixed at fifteen
+/// FOREVER, and NOT a mirror of `TfIndex::ALL`. Same shape, and for the same
+/// reason, as the scope lock's legacy `top_volume_rank_{1s,3s,5s,1m}` view
+/// sweep: *"fixed at four FOREVER — it is a historical fact about what was
+/// once created, not a mirror of `SnapshotCadence`."*
+///
+/// A tenth frame retired in the future ADDS an entry here (and bumps
+/// [`RETIRED_CANDLE_DROP_SWEEP_VERSION`]); it never rebuilds the list from the
+/// enum.
+///
+/// ⚠ Two names that must NEVER appear here:
+/// - `candles_10m` — a live folded TABLE (it was a derived view until 2026-09-22);
+/// - any survivor. Note `candles_15s` (retired) against `candles_15m`
+///   (survivor): the sweep matches EXACT names, never a prefix.
+const RETIRED_CANDLE_TABLES: [&str; 15] = [
+    // The day frame.
+    "candles_1d",
+    // The second-scale frames retired by the 2026-09-19 nine-frame directive.
+    "candles_2s",
+    "candles_4s",
+    "candles_6s",
+    "candles_7s",
+    "candles_8s",
+    "candles_9s",
+    "candles_10s",
+    "candles_11s",
+    "candles_12s",
+    "candles_13s",
+    "candles_14s",
+    "candles_15s",
+    "candles_30s",
+    // The two-minute frame.
+    "candles_2m",
+];
+
+/// See [`RETIRED_CANDLE_TABLES`] — the fifteen tables that must not exist.
 #[must_use]
-// TEST-EXEMPT: pure filter over the ordinal array; pinned by test_emitted_and_retired_partition_the_ordinal_set.
+// TEST-EXEMPT: pure const-array accessor; pinned by test_emitted_and_retired_partition_the_ordinal_set.
 pub fn retired_candle_table_names() -> Vec<&'static str> {
-    TfIndex::ALL
-        .iter()
-        .filter(|tf| !tf.is_operator_requested())
-        .map(|tf| tf.table_name())
-        .collect()
+    RETIRED_CANDLE_TABLES.to_vec()
 }
 
 // ---------------------------------------------------------------------------
@@ -293,12 +380,65 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) -> bool
                 "candle table dropped — security_id INT→LONG self-heal"
             );
         }
+        // ── The 2026-09-19 fresh-scratch candle row ──────────────────────
+        //
+        // Column ORDER is the operator's, verbatim (2026-09-19, recorded in
+        // `websocket-connection-scope-lock.md`): `ts` first, then the three
+        // READABLE delays, then feed / segment / security_id / contract, then
+        // OHLCV, then the percentages, and the three exact `_ns` twins LAST.
+        // A reader scanning left to right meets the bar's identity and its
+        // freshness before a single price. Reordering these is a REJECT.
+        //
+        // `ts` is the window OPEN, stamped from the EXCHANGE trade clock and
+        // nothing else (`fold_clock_ist_secs` is the identity on
+        // `exchange_timestamp` since 2026-09-18). The six delay columns MEASURE
+        // our receipt against that window; they never MOVE a trade into a
+        // different bar. That is the whole reason they exist: with the bar
+        // anchored on the vendor's clock, a bar built from data that arrived
+        // four seconds late is byte-identical to one built instantly, and these
+        // columns are the only surface that separates them.
+        //
+        // `volume` is SIGNED — one column that accepts a minus, matching the
+        // vendor's net volume with no derivation anywhere downstream.
+        //
+        // `contract` is the instrument's NAME, resolved O(1) ONCE PER SEALED
+        // BAR (never per tick) and left EMPTY when unresolved — a fabricated
+        // name is a REJECT. It carries the same column name as
+        // `top_volume.contract` so the two tables read and join identically.
+        //
+        // REMOVED here and NEVER self-healed back: `open_gap_pct`,
+        // `close_pct_from_prev_day` (a byte-identical duplicate of
+        // `change_pct` — `shadow_seal_columns::from_buffered_seal` fills both
+        // from the SAME `state.close_pct_from_prev_day`), and `net_volume`.
+        // RENAMED: `change_pct` -> `percentage_change`, `open_pct` ->
+        // `open_percentage_change`.
+        //
+        // ⚠ CORRECTED 2026-09-19, hours after the first draft of this block
+        // was written. That draft claimed `open_gap_pct` has "zero SQL
+        // readers, verified". THAT CLAIM IS FALSE and the same sentence went
+        // into the scope-lock rule file. `console_views.rs::candles_named_view_ddl`
+        // selects it, along with all three of the other percentages, so the
+        // `candles_named` view would have failed to create on a fresh volume
+        // and the operator would have lost the entire named candle face — the
+        // exact failure that file's own doc warns about for `net_volume`.
+        // `close_pct_from_prev_day` had a SECOND reader the draft also missed:
+        // `depth_rebalance.rs` ranks the depth-steering board from it, so a
+        // missed rename returns nothing, the board ranks nothing, and every
+        // counter and alarm stays green. Both readers are repointed in the
+        // same change as this correction. The reusable half: a claim that a
+        // column has no readers is one `grep -rn` away and must be RE-RUN at
+        // the moment of writing, never carried forward from a scan taken
+        // against a different column.
         let create_ddl = format!(
             "CREATE TABLE IF NOT EXISTS {table} (\
+                ts                          TIMESTAMP, \
+                open_latency                VARCHAR, \
+                close_latency               VARCHAR, \
+                window_span_latency         VARCHAR, \
                 feed                        SYMBOL, \
                 segment                     SYMBOL, \
                 security_id                 LONG, \
-                ts                          TIMESTAMP, \
+                contract                    SYMBOL, \
                 open                        DOUBLE, \
                 high                        DOUBLE, \
                 low                         DOUBLE, \
@@ -306,101 +446,45 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) -> bool
                 volume                      LONG, \
                 oi                          LONG, \
                 tick_count                  LONG, \
-                close_pct_from_prev_day     DOUBLE, \
-                open_pct                    DOUBLE, \
-                change_pct                  DOUBLE, \
-                open_gap_pct                DOUBLE, \
+                percentage_change           DOUBLE, \
+                open_percentage_change      DOUBLE, \
                 total_buy_qty               LONG, \
-                total_sell_qty              LONG\
+                total_sell_qty              LONG, \
+                open_latency_ns             LONG, \
+                close_latency_ns            LONG, \
+                window_span_latency_ns      LONG\
             ) timestamp(ts) PARTITION BY DAY \
             DEDUP UPSERT KEYS({DEDUP_KEY_CANDLES});"
         );
         all_keyed &= run_ddl(&client, &base_url, table, &create_ddl).await;
 
-        // Schema self-heal: candle tables created before the
-        // close_pct_from_prev_day column existed (pre-2026-05-28 Engine-B
-        // 10-col schema) auto-migrate. QuestDB ignores the ADD when the
-        // column already exists, so running every boot is free (per
-        // observability-architecture.md "Schema self-heal at boot").
-        let alter_ddl =
-            format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS close_pct_from_prev_day DOUBLE;");
-        let _ = run_ddl(&client, &base_url, table, &alter_ddl).await;
+        // Schema self-heal, for the NEW column set ONLY.
+        //
+        // ⚠ The distinction this turns on, because the first draft of this
+        // rewrite got it wrong and CI caught it: self-healing a column the
+        // CREATE above STILL DECLARES is REQUIRED — without it an upgraded
+        // deployment keeps its old table and every new column stays empty
+        // forever, silently. Self-healing a column the CREATE above REMOVED
+        // is the opposite error: QuestDB can add a column but never drop or
+        // rename one, so such a statement re-adds on the next boot exactly
+        // what the reset just took out — the trap this repository already
+        // recorded for `net_volume`.
+        //
+        // Every name in `CANDLE_SELF_HEAL_COLUMNS` therefore appears in the
+        // CREATE above, and none of the removed names does: `change_pct`,
+        // `open_pct`, `open_gap_pct`, `close_pct_from_prev_day` and
+        // `net_volume` are absent on purpose, and adding any of them back is
+        // a REJECT. On a table this CREATE just made, every statement here is
+        // a no-op.
+        for (column, ty) in CANDLE_SELF_HEAL_COLUMNS {
+            let add = format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {ty};");
+            all_keyed &= run_ddl(&client, &base_url, table, &add).await;
+        }
 
-        // §31 Option 2 (2026-06-01): self-heal the `open_pct` column for
-        // tables created before it existed. Free on every boot.
-        let alter_open_pct =
-            format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS open_pct DOUBLE;");
-        let _ = run_ddl(&client, &base_url, table, &alter_open_pct).await;
-
-        // Operator request 2026-06-02: self-heal the `change_pct` +
-        // `open_gap_pct` columns for tables created before they existed.
-        // Free on every boot (QuestDB ignores ADD when the column exists).
-        let alter_change_pct =
-            format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS change_pct DOUBLE;");
-        let _ = run_ddl(&client, &base_url, table, &alter_change_pct).await;
-        let alter_open_gap_pct =
-            format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS open_gap_pct DOUBLE;");
-        let _ = run_ddl(&client, &base_url, table, &alter_open_gap_pct).await;
-        // net volume — the bar's SIGNED ORDER FLOW: buy-initiated volume minus
-        // sell-initiated volume, accumulated per tick under the tick rule
-        // (uptick = buy-initiated, downtick = sell-initiated, unchanged price
-        // carries the previous direction). INFERRED, not observed: Dhan
-        // publishes no trade tape and no aggressor flag.
-        //
-        // NULL (never 0) when THIS PROCESS DID NOT CLASSIFY the bar — a
-        // disk-spill replay, a REST-folded bar, or a bar with no ticks or no
-        // volume. `0` would claim perfectly balanced flow about a bar nobody
-        // measured, which is a different fact.
-        //
-        // ⚠ CORRECTED 2026-09-10. This comment sits above the DDL that CREATES
-        // the column, so it is the definition of record — and until today it
-        // read "the bar's volume signed by whether it closed above or below the
-        // bar before it … NULL when there is no previous bar to compare
-        // against, so a first-of-day bar is blank rather than flat". BOTH
-        // halves are now false: the sign is flow, not direction, and a
-        // first-of-day bar with ticks now reports a real value. The arithmetic
-        // was fixed in `live_candle_state` / `multi_tf_aggregator`; this
-        // storage-layer comment was left behind, which is how a reader would
-        // have gone on trusting the retired definition.
-        //
-        // `total_buy_qty` / `total_sell_qty` are the vendor's PENDING
-        // order-book totals at the bar's last observed packet — resting
-        // orders, NOT executed volume. Nothing may treat their difference as
-        // a buy/sell imbalance of trades.
-        //
-        // Additive + idempotent like every self-heal above: an existing table
-        // gains the columns with NULLs for its historical rows, and no
-        // populated table is ever dropped (SEBI retention).
-        let alter_total_buy_qty =
-            format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS total_buy_qty LONG;");
-        let _ = run_ddl(&client, &base_url, table, &alter_total_buy_qty).await;
-        let alter_total_sell_qty =
-            format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS total_sell_qty LONG;");
-        let _ = run_ddl(&client, &base_url, table, &alter_total_sell_qty).await;
-        // Feed-provenance label (operator 2026-06-19, "same tables + feed
-        // column"): broker source (`'dhan'`/`'groww'`). It IS part of the DEDUP
-        // key now (`DEDUP_KEY_CANDLES` includes `feed`), so a Dhan candle and a
-        // Groww candle for the same minute/instrument are BOTH kept. MUST run
-        // BEFORE the DEDUP-ENABLE migration below so the key column exists on
-        // pre-existing tables. Additive + idempotent.
-        let alter_feed = format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS feed SYMBOL;");
-        let _ = run_ddl(&client, &base_url, table, &alter_feed).await;
-        // Brownfield NULL-feed backfill (worst-case coverage, no-hallucination):
-        // rows persisted under the OLD 3-col key have `feed=NULL`. Without this,
-        // a new `feed='dhan'` row for the same `(ts, security_id, segment)` is a
-        // DISTINCT key (NULL != 'dhan') → a DUPLICATE, not an upsert. Stamping
-        // `feed='dhan'` on every legacy NULL row BEFORE re-enabling DEDUP closes
-        // that overlap window. Idempotent + cheap on every subsequent boot:
-        // `WHERE feed IS NULL` matches nothing once backfilled. MUST run BEFORE
-        // the DEDUP-ENABLE below (UPDATE on the live key column is cleanest
-        // before the key is re-applied).
-        let backfill_feed =
-            format!("UPDATE {table} SET feed = '{CANDLE_FEED_DHAN}' WHERE feed IS NULL;");
-        let _ = run_ddl(&client, &base_url, table, &backfill_feed).await;
-        // Brownfield DEDUP migration: re-enable the UPSERT key with `feed`
-        // included so EXISTING candle tables (created before the feed-in-key
-        // change) get the new 4-col key. Idempotent — re-enabling the same key
-        // is a no-op; greenfield tables already have it from the CREATE DDL.
+        // Re-assert the UPSERT key. Idempotent — re-enabling the same key is a
+        // no-op, and a table this CREATE just made already carries it. Kept
+        // because it is the one statement that can still repair a table whose
+        // key was somehow lost, and it adds no column.
         let dedup_enable =
             format!("ALTER TABLE {table} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_CANDLES});");
         all_keyed &= run_ddl(&client, &base_url, table, &dedup_enable).await;
@@ -457,7 +541,7 @@ async fn candle_table_has_int_security_id(client: &Client, base_url: &str, table
 /// longer correspond to any live timeframe enum.
 ///
 /// NOTE: any future `candles_*` prefix sweep MUST exclude `*_named` views
-/// (`console_views::VIEW_TICKS_NAMED` / `VIEW_CANDLES_NAMED`).
+/// (`candles_named` — listed in `console_views::RETIRED_CONSOLE_VIEWS`).
 const LEGACY_CANDLE_TF_SUFFIXES: [&str; 9] =
     ["1m", "5m", "15m", "30m", "1h", "2h", "3h", "4h", "1d"];
 
@@ -1037,6 +1121,44 @@ async fn run_ddl(client: &Client, base_url: &str, table: &str, ddl: &str) -> boo
 mod tests {
     use super::*;
 
+    /// The self-heal list and the candle `CREATE` must name the SAME columns,
+    /// with the SAME types, in the SAME order. A name only in the CREATE is a
+    /// column an upgraded table never gets (it stays empty forever, silently);
+    /// a name only in the list re-adds, every boot, a column the reset removed.
+    /// Read from this file's own source so the pin cannot drift from the DDL.
+    #[test]
+    fn the_self_heal_list_is_the_candle_create_column_for_column() {
+        let src = include_str!("shadow_persistence.rs");
+        let start = src
+            .find("CREATE TABLE IF NOT EXISTS {table} (")
+            .expect("candle CREATE present");
+        let body = &src[start..];
+        let end = body.find(") timestamp(ts)").expect("CREATE terminator");
+        let mut create: Vec<(String, String)> = Vec::new();
+        for line in body[..end].lines().skip(1) {
+            let cleaned = line
+                .trim()
+                .trim_end_matches('\\')
+                .trim()
+                .trim_end_matches(',');
+            let mut parts = cleaned.split_whitespace();
+            if let (Some(name), Some(ty)) = (parts.next(), parts.next()) {
+                create.push((name.to_string(), ty.to_string()));
+            }
+        }
+        assert_eq!(create.first().map(|c| c.0.as_str()), Some("ts"));
+        let create: Vec<(String, String)> = create.into_iter().skip(1).collect();
+        let heal: Vec<(String, String)> = CANDLE_SELF_HEAL_COLUMNS
+            .iter()
+            .map(|(n, t)| ((*n).to_string(), (*t).to_string()))
+            .collect();
+        assert_eq!(
+            create, heal,
+            "candle CREATE (minus ts) and CANDLE_SELF_HEAL_COLUMNS diverged"
+        );
+        assert_eq!(heal.len(), 21, "22-column candle contract = ts + 21");
+    }
+
     // ========================================================================
     // P2c (coverage-gaps #1076): DDL-walk + legacy-drop arm coverage via a
     // file-local mock HTTP server (same idiom as tick_persistence::tests).
@@ -1123,7 +1245,7 @@ mod tests {
     #[test]
     fn test_candle_table_names_has_tf_count_entries() {
         assert_eq!(candle_table_names().len(), TF_COUNT);
-        assert_eq!(TF_COUNT, 24);
+        assert_eq!(TF_COUNT, 10);
     }
 
     #[test]
@@ -1462,38 +1584,25 @@ mod tests {
     }
 
     #[test]
-    fn test_candle_table_names_canonical_ordering_1m_to_1d() {
+    fn test_candle_table_names_canonical_ordering() {
         let names = candle_table_names();
-        // C3: legacy 5-frame prefix (ordinals 0..=4) byte-stable, the 16
-        // second-scale frames APPENDED after candles_1d (ordinals 5..=20).
+        // 2026-09-19 nine-frame collapse: the four-frame legacy prefix is
+        // unchanged, `candles_1d` is GONE, and the second-scale block that
+        // followed it is now exactly 1s/3s/5s. `candles_15s` (retired) and
+        // `candles_15m` (kept) differ by one letter — this list is the exact
+        // set, never a prefix match. 2026-09-22: `candles_10m` appended at
+        // ordinal 9 (it was a view; now a folded table).
         let expected = [
             "candles_1m",
             "candles_3m",
             "candles_5m",
             "candles_15m",
-            "candles_1d",
             "candles_1s",
-            "candles_2s",
             "candles_3s",
-            "candles_4s",
             "candles_5s",
-            "candles_6s",
-            "candles_7s",
-            "candles_8s",
-            "candles_9s",
-            "candles_10s",
-            "candles_11s",
-            "candles_12s",
-            "candles_13s",
-            "candles_14s",
-            "candles_15s",
-            "candles_30s",
-            // Appended 2026-08-10 with TfIndex::{M2, M30, M60} — the three
-            // frames of the operator's thirteen (Quote 13, 2026-08-08) that
-            // previously had no enum variant.
-            "candles_2m",
             "candles_30m",
             "candles_60m",
+            "candles_10m",
         ];
         assert_eq!(names, expected);
     }

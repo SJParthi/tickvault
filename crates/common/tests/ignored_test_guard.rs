@@ -49,6 +49,27 @@ fn repo_root() -> PathBuf {
 /// This list may SHRINK freely. Growing it is a deliberate edit, in the same
 /// change, with the reason visible to a reviewer.
 const ALLOWED_IGNORED: &[(&str, &str)] = &[
+    // Added 2026-09-19 with the radix A/B it belongs to: the same wall-clock
+    // shape as the other wall-clock harnesses here -- it times the leaderboard's
+    // comparator against a candidate radix sort at four sizes and prints both
+    // numbers, so a shared CI runner would make it a flake, and a flaky gate
+    // teaches people to ignore gates.
+    //
+    // It is NOT the merge condition for anything. The radix was MEASURED and
+    // REJECTED (release: comparator 1.0/7.0/42.0/692.7 us against radix
+    // 4.1/18.7/77.3/1074.3 us at n=100/500/2,000/20,220), so no production
+    // path calls it; the ordering it would have replaced is pinned by the
+    // ordinary tests in the same file.
+    //
+    // Two reasons it is worth keeping rather than deleting: re-running it is
+    // how the rejection stays honest if the row shape or the sizes change,
+    // and it asserts -- each round checks it ordered the `n` rows it claims
+    // and that both paths agree, so it cannot report a figure from an empty
+    // vector the way the withdrawn 900 us sweep number did.
+    (
+        "crates/app/src/volume_leaderboard.rs",
+        "radix_vs_comparator_at_every_measured_shape",
+    ),
     (
         "crates/trading/src/candles/multi_tf_aggregator.rs",
         "catch_up_seal_all_sweep_cost_at_the_authorized_ceiling",

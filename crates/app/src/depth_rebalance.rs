@@ -16,7 +16,7 @@
 //! | Engine needs | Comes from | New query? |
 //! |---|---|---|
 //! | Index chain snapshot (spot + CE/PE per strike) | the `DepthCandidate` slice the attach already builds every retry | **no** |
-//! | Today's stock moves, ranked | `candles_1m.close_pct_from_prev_day` joined to the lifecycle master for the symbol | **yes** |
+//! | Today's stock moves, ranked | `candles_1m.percentage_change` (aliased `close_pct_from_prev_day`) joined to the lifecycle master for the symbol | **yes** |
 //!
 //! Reusing `DepthCandidate` for the chain half is not a shortcut. It is the
 //! same slice `select_depth_universe` consumes, so the strikes the rebalance
@@ -26,11 +26,14 @@
 //!
 //! # The percentage this ranks on
 //!
-//! `close_pct_from_prev_day` — the move against YESTERDAY'S CLOSE. That is the
-//! column the operator confirmed on 2026-08-26 when he corrected the labelling,
-//! and [`crate::movers`] records at length why the other column produces a
-//! plausible, completely different list. This module's query names that column
-//! and no other.
+//! The move against YESTERDAY'S CLOSE. That is the quantity the operator
+//! confirmed on 2026-08-26 when he corrected the labelling, and
+//! [`crate::movers`] records at length why the other column produces a
+//! plausible, completely different list. Since the 2026-09-19 candle-column
+//! rename the stored column is `percentage_change` (formerly
+//! `close_pct_from_prev_day`); the query reads that column and aliases it back
+//! to `close_pct_from_prev_day`, which is the name the parser reads. It never
+//! reads `open_percentage_change` (formerly `open_pct`, close vs today's open).
 //!
 //! # This module is pure
 //!
@@ -694,8 +697,8 @@ pub fn build_movers_query(today_ist_micros: i64) -> String {
     let market_open_micros =
         today_ist_micros.saturating_add(MARKET_OPEN_SECS_OF_DAY_IST.saturating_mul(1_000_000));
     format!(
-        "SELECT c.security_id, il.symbol_name, c.close_pct_from_prev_day \
-         FROM (SELECT security_id, close_pct_from_prev_day FROM candles_1m \
+        "SELECT c.security_id, il.symbol_name, c.percentage_change AS close_pct_from_prev_day \
+         FROM (SELECT security_id, percentage_change FROM candles_1m \
          WHERE feed = 'dhan' AND segment = '{segment}' AND ts >= {market_open_micros} \
          LATEST ON ts PARTITION BY security_id) c \
          JOIN (SELECT security_id, symbol_name FROM instrument_lifecycle \
@@ -2572,16 +2575,29 @@ mod tests {
 
     #[test]
     fn the_movers_query_ranks_on_the_previous_day_column() {
+        // 2026-09-22: the previous form of this test was VACUOUS. It asserted
+        // `contains("close_pct_from_prev_day")` — satisfied by the SELECT
+        // ALIAS whatever column feeds it — and `!contains("open_pct")`, a
+        // column name that no longer exists after the 2026-09-19 rename to
+        // `open_percentage_change`. Pointing the query at the wrong column
+        // passed both. It now pins the SOURCE column, token-anchored, because
+        // `percentage_change` is a substring of `open_percentage_change`.
         let sql = build_movers_query(1_900_000_000_000_000);
         assert!(
-            sql.contains("close_pct_from_prev_day"),
-            "the operator's percentage change is against yesterday's close"
+            sql.contains("SELECT security_id, percentage_change FROM candles_1m"),
+            "the inner read must take the previous-day column from candles_1m: {sql}"
         );
         assert!(
-            !sql.contains("open_pct"),
-            "open_pct is the PRE-OPEN percentage — a plausible, completely \
-             different ranking: {sql}"
+            sql.contains("c.percentage_change AS close_pct_from_prev_day"),
+            "the outer select must alias that same column to the parser's name: {sql}"
         );
+        for forbidden in ["open_percentage_change", "open_pct", "open_gap_pct"] {
+            assert!(
+                !sql.contains(forbidden),
+                "{forbidden} is an open-anchored percentage — a plausible, \
+                 completely different ranking: {sql}"
+            );
+        }
     }
 
     #[test]

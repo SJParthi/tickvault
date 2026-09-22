@@ -3583,6 +3583,130 @@ mod tests {
         }
     }
 
+    /// `candles_named` is a VIEW that starts with the
+    /// `candles_` prefix the wipe uses to find candle TABLES. A `TRUNCATE
+    /// TABLE` on a view fails, prints TRUNCATE-FAILED on every wipe, and trains
+    /// the operator to ignore the line that would report a real failure. It is
+    /// excluded by name; the prefix arm still covers every real frame.
+    /// `candles_10m` was a view until 2026-09-22 and is now a real TABLE, so
+    /// it is deliberately NOT excluded — it must be truncated with the rest.
+    ///
+    /// 2026-09-22 — tightened in two directions, both of which the previous
+    /// form could not see:
+    ///
+    /// 1. **Semantics, not presence.** It asserted each `$0!="view"` string
+    ///    appeared ANYWHERE in the command. `index(..)==1 || $0!="candles_10m"`
+    ///    contains the same bytes and makes EVERY table (SEBI audit tables
+    ///    included) a truncate target. Now the prefix arm must be ONE
+    ///    parenthesised top-level `||` arm whose other conjuncts are exactly the
+    ///    view exclusions, ANDed — and no other arm may mention `candles_`.
+    /// 2. **Derived, not hard-coded.** The view list is read from the storage
+    ///    crate's `console_views.rs` (`pub const VIEW_*: &str = "candles_…"`),
+    ///    the file that CREATES the views. This crate does not depend on
+    ///    `tickvault-storage` (a Lambda should not link the storage stack), so
+    ///    the source is scanned rather than imported. A new `candles_*` view
+    ///    added there without an exclusion here now fails this test instead of
+    ///    printing TRUNCATE-FAILED on the next wipe.
+    #[test]
+    fn test_wipe_questdb_never_truncates_a_candle_view() {
+        // --- the source of truth: every console view named `candles_*` ---
+        let views_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../storage/src/console_views.rs");
+        let views_src = std::fs::read_to_string(&views_path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", views_path.display()));
+        // 2026-09-22 (no views anywhere): console_views.rs no longer CREATES
+        // any view. It carries the list of RETIRED view names it drops at
+        // boot, and the subset of those names that are now real TABLES
+        // (`candles_10m`). A retired `candles_*` name that is still a view
+        // must be excluded; a name that became a table must NOT be — excluding
+        // it would leave a real candle table out of the wipe.
+        let quoted_list = |const_name: &str| -> Vec<String> {
+            let start = views_src
+                .find(&format!("pub const {const_name}"))
+                .unwrap_or_else(|| panic!("console_views.rs lost `{const_name}`"));
+            let body = &views_src[start..];
+            let eq = body.find("= [").expect("array literal") + 3;
+            let close = eq + body[eq..].find("];").expect("array end");
+            body[eq..close]
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.starts_with("//"))
+                .flat_map(|l| l.split(','))
+                .filter_map(|s| {
+                    s.trim()
+                        .strip_prefix('"')
+                        .and_then(|r| r.strip_suffix('"'))
+                        .map(str::to_string)
+                })
+                .collect()
+        };
+        let retired = quoted_list("RETIRED_CONSOLE_VIEWS");
+        let now_tables = quoted_list("VIEW_NAMES_NOW_TABLES");
+        let mut candle_views: std::collections::BTreeSet<String> = retired
+            .iter()
+            .filter(|n| n.starts_with("candles_") && !now_tables.contains(n))
+            .cloned()
+            .collect();
+        // Anti-vacuity: a parser that matched nothing would make every
+        // assertion below trivially true.
+        assert!(
+            candle_views.contains("candles_named"),
+            "the view scan must find the candles_named view, found {candle_views:?}"
+        );
+        assert!(
+            now_tables.iter().any(|t| t == "candles_10m")
+                && retired.iter().any(|t| t == "candles_10m"),
+            "the scan must see candles_10m as a retired view that is now a table: \
+             retired={retired:?} now_tables={now_tables:?}"
+        );
+
+        // --- the awk program that selects truncate targets ---
+        let joined = WIPE_QUESTDB_COMMANDS.join("\n");
+        let program = joined
+            .split("awk '")
+            .skip(1)
+            .map(|rest| rest.split('\'').next().unwrap_or(""))
+            .find(|p| p.contains("index($0,\"candles_\")==1"))
+            .expect("the wipe must select targets with an awk program using the candles_ prefix");
+        let arms: Vec<&str> = program.split(" || ").map(str::trim).collect();
+
+        let prefix_arms: Vec<&&str> = arms.iter().filter(|a| a.contains("candles_")).collect();
+        assert_eq!(
+            prefix_arms.len(),
+            1,
+            "exactly one top-level `||` arm may mention candles_ — a second arm \
+             (e.g. a bare `$0!=\"candles_10m\"`) would admit every table: {arms:?}"
+        );
+        let arm = prefix_arms[0];
+        let inner = arm
+            .strip_prefix('(')
+            .and_then(|a| a.strip_suffix(')'))
+            .unwrap_or_else(|| panic!("the candles_ arm must be parenthesised: {arm}"));
+        let mut conjuncts = inner.split(" && ").map(str::trim);
+        assert_eq!(
+            conjuncts.next(),
+            Some("index($0,\"candles_\")==1"),
+            "the arm must LEAD with the prefix test: {arm}"
+        );
+        for c in conjuncts {
+            let name = c
+                .strip_prefix("$0!=\"")
+                .and_then(|r| r.strip_suffix('"'))
+                .unwrap_or_else(|| {
+                    panic!("every other conjunct must be a view exclusion, got `{c}`")
+                });
+            assert!(
+                candle_views.remove(name),
+                "the wipe excludes `{name}`, which is not a candle view in console_views.rs \
+                 — a real candle TABLE excluded here is never truncated"
+            );
+        }
+        assert!(
+            candle_views.is_empty(),
+            "console_views.rs declares candle view(s) {candle_views:?} that the wipe does not \
+             exclude — TRUNCATE TABLE on a view fails on every wipe"
+        );
+    }
     #[test]
     fn test_wipe_questdb_truncates_live_rest_tables_too() {
         // 2026-07-16 destructive-surface extension: a "fresh start" must also
@@ -3729,11 +3853,11 @@ mod tests {
                 if line.starts_with("//") {
                     continue;
                 }
-                if let Some(rest) = line.strip_prefix('"') {
-                    if let Some((name, _)) = rest.split_once('"') {
-                        out.push(name.to_owned());
-                        found += 1;
-                    }
+                if let Some(rest) = line.strip_prefix('"')
+                    && let Some((name, _)) = rest.split_once('"')
+                {
+                    out.push(name.to_owned());
+                    found += 1;
                 }
             }
             assert!(

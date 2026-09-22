@@ -5803,3 +5803,41 @@ green build proves the lane still dials — the boot floor is the risk, and the 
 is what proves it. **NOT claimed:** any measured post-deploy result; the first session
 after deploy is the measurement, and `dhan-no-ticks-flowing` staying green through an
 open is what would show the lane survived the floor's removal.
+
+## ITEM 44 — DESIGN ADDENDUM (added 2026-09-22): fast-lane silent-loss closures
+
+Authority: `websocket-connection-scope-lock.md` "2026-09-22 (FOURTH)" (operator quote recorded there). Crates: `crates/app` (dhan_feed_stack.rs), `crates/core` (websocket/pool_supervisor.rs), `crates/storage` (fresh_start_reset.rs, ws_frame_spill.rs, top_volume_rank_persistence.rs, tick_persistence.rs, depth_persistence.rs).
+
+- [x] 44a — in-session catch-up budget (dhan_feed_stack.rs)
+- [x] 44b — unknown packet skip validated by the next header (dhan_feed_stack.rs drain)
+- [x] 44c — fresh-start reset renames rather than drops post-first-boot rows; DROP VIEW IF EXISTS (fresh_start_reset.rs)
+- [x] 44d — WAL age prune respects the applied watermark; byte prune counts unapplied deletions (ws_frame_spill.rs)
+- [x] 44e — top_volume per-row append moves to the writer thread (top_volume_rank_persistence.rs + dhan_feed_stack.rs)
+- [x] 44f — socket reader never waits on swap wire writes (pool_supervisor.rs)
+- [x] 44g — flush-path counters pre-resolved; ILP buffers recycled (tick_persistence.rs, depth_persistence.rs)
+- [x] 44h — spot and index rows carry a contract name (dhan_contract_universe.rs, candle_contract_labels.rs, main.rs) — scope lock "2026-09-22 (FIFTH)"
+- [x] 44i — market_depth gains a contract SYMBOL, resolved once per packet (depth_persistence.rs) — scope lock "2026-09-22 (FIFTH)"
+
+### Design
+
+Each fix is local to its file and keeps the existing data flow except 44e and 44f. 44a makes `WAL_CATCHUP_BUDGET_SECS` clock-aware: full budget outside [09:00, 15:40) IST, a short in-session budget otherwise; leftover segments stay `*.wal`. 44b only skips when `message_length >= 8`, fits in the frame, and the header at the new offset carries a known code with an in-range length; else the current abandon path. 44c records the build's first-boot instant in a marker; a reset table whose newest row is at or after that instant is renamed `<name>_pre_reset_<yyyymmdd>` instead of dropped. 44d threads the applied watermark into the age prune only. 44e sends the ranked rows (a bounded, pre-sized batch) to the existing writer thread, which does the ILP append and flush. 44f splits the WebSocket stream so wire writes run on a writer task and report outcomes on a oneshot; the reader loop keeps polling `recv()`. 44g resolves `metrics::Counter` handles at construction and returns flushed buffers to the producer over a bounded channel.
+
+### Edge Cases
+
+Restart exactly at 09:00:00 / 15:40:00 (window boundaries are half-open); a backlog larger than one round in session; an unknown code whose length stamp is 0, < 8, past the frame end, or lands on another unknown code; two consecutive unknown packets; reset with a table that is empty, missing, a view, or holds only pre-boot rows; marker file absent or unreadable (fail closed: rename, never drop); prune when the watermark file is missing (treat every segment as unapplied for the age prune); a swap outcome arriving after the socket reconnected (generation check); buffer return channel full (drop the spare, allocate next time — never block).
+
+### Failure Modes
+
+A too-short in-session budget leaves more backlog for the next boot (bounded, recoverable, counted). A wrongly-trusted length stamp would fabricate packets — prevented by requiring a clean next header, and counted separately. A rename that fails leaves the table untouched and the reset id unwritten, so it retries. The byte prune on a full disk still deletes unapplied frames, counted and logged. The writer thread dying stops top_volume rows, as today; the drain never blocks on it. A writer task panic in 44f aborts (release `panic = "abort"`), as any task panic does today.
+
+### Test Plan
+
+Unit + proptest per item: 44a pure budget function over every minute of the day; 44b walk over synthetic frames with every stamp permutation (0, 1..7, exact, overrun, next-unknown, next-known); 44c pure decision function over (row-age, marker state, object kind); 44d prune decision over (age, watermark, byte cap) permutations; 44e source guard that the drain no longer calls `append_row` plus a channel round-trip test; 44f a mock sink that blocks for 2 s while frames keep arriving; 44g DHAT count on the flush path. Existing suites for storage/app/core must stay green.
+
+### Rollback
+
+Each item is one commit on PR 1928 and reverts independently. 44c's renamed tables are ordinary QuestDB tables and can be dropped by hand once inspected.
+
+### Observability
+
+Local `/metrics` counters plus coded log lines only (no EMF name, no alarm — see the scope-lock entry's budget note): `tv_dhan_wal_catchup_in_session_total`, `tv_dhan_feed_unknown_packet_skipped_total`, `tv_fresh_start_reset_renamed_total`, `tv_wal_pruned_unapplied_total`, and the existing swap wire histograms.

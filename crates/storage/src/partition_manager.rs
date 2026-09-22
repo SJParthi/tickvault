@@ -47,7 +47,20 @@ const PARTITION_DDL_TIMEOUT_SECS: u64 = 30;
 // belongs with `ticks` and `market_depth` rather than in the DAY list of
 // small audit tables. Leaving it EXEMPT would have been the quiet mistake:
 // an exempt table grows forever, and this one grows nearly a gigabyte a day.
-pub(crate) const HOUR_PARTITIONED_TABLES: &[&str] = &["ticks", "market_depth", "top_volume"];
+// 2026-09-22: the four DIRECT per-cadence tables `top_volume_1s` / `_3s` /
+// `_5s` / `_1m` replace the single `top_volume` table, and join the HOUR sweep
+// for the same reason it did. `top_volume` itself STAYS listed: no boot writes
+// it any more, but its already-captured partitions must still age out rather
+// than sit on the volume forever.
+pub(crate) const HOUR_PARTITIONED_TABLES: &[&str] = &[
+    "ticks",
+    "market_depth",
+    "top_volume",
+    "top_volume_1s",
+    "top_volume_3s",
+    "top_volume_5s",
+    "top_volume_1m",
+];
 
 /// DAY-partitioned **audit + daily-data** tables the retention sweep DETACHes
 /// past the hot window. The 5 live **candle** tables (`candles_1m` …
@@ -318,12 +331,16 @@ pub(crate) const RETENTION_EXEMPT_TABLES: &[&str] = &[
     "spot_1m_rest",
     "option_chain_1m",
     "option_contract_1m_rest",
-    // Pre-2026-09-12 name of `top_volume`, renamed forward at boot by
-    // `ensure_top_volume_rank_table`. Exempt for the same reason as the three
-    // above: the constant still exists, so the coverage guard demands a
-    // decision, and pointing a sweeper at a name the rename has already
-    // consumed would be the worse answer.
+    // Pre-2026-09-12 name of `top_volume`. Until 2026-09-22 a boot renamed it
+    // forward; since then nothing writes or renames it, and the one-shot
+    // fresh-start reset drops it. Exempt because the constant still exists, so
+    // the coverage guard demands a decision, and a sweeper pointed at a name
+    // with no writer would only ever find it absent.
     "top_volume_rank",
+    // The one-shot fresh-start reset's own log (`fresh_start_reset.rs`). One
+    // row per reset id, never partitioned, never swept: dropping a row would
+    // let the one-shot wipe run a SECOND time on the next out-of-session boot.
+    "schema_reset_log",
 ];
 
 /// Every table the retention system knows about, de-duplicated and sorted —
@@ -847,8 +864,26 @@ mod tests {
     fn test_hour_partitioned_list_is_ticks_depth_and_top_volume() {
         assert_eq!(
             HOUR_PARTITIONED_TABLES,
-            &["ticks", "market_depth", "top_volume"]
+            &[
+                "ticks",
+                "market_depth",
+                "top_volume",
+                "top_volume_1s",
+                "top_volume_3s",
+                "top_volume_5s",
+                "top_volume_1m",
+            ]
         );
+        // Every live per-cadence table is swept — pinned against the
+        // persistence module's own names, so a fifth cadence cannot land
+        // unswept.
+        for c in crate::top_volume_rank_persistence::SnapshotCadence::ALL {
+            assert!(
+                HOUR_PARTITIONED_TABLES.contains(&c.table_name()),
+                "{} is not in the HOUR sweep",
+                c.table_name()
+            );
+        }
     }
 
     #[test]
@@ -901,12 +936,28 @@ mod tests {
 
     #[test]
     fn test_candle_tables_are_real_plain_names_not_shadow() {
-        // The candle tables swept by detach_old_partitions come from the single
-        // source of truth. They MUST be plain `candles_<TF>` (no `_shadow`) and
-        // number 21 (M1/M3/M5/M15/D1 + S1..S15 + S30, TF-diet second-scale) —
-        // the exact bug #1022 had (phantom `_shadow` names).
+        // The candle tables swept by detach_old_partitions come from the
+        // single source of truth. They MUST be plain `candles_<TF>` with no
+        // `_shadow` — the exact bug #1022 had (phantom `_shadow` names).
+        //
+        // The COUNT is deliberately not asserted. It read `21` in the comment
+        // and `24` in the assertion for long enough that the two disagreed in
+        // the same test, and the 2026-09-19 collapse to 9 frames made both
+        // wrong at once. `candle_table_names()` returns `[&str; TF_COUNT]`, so
+        // a length assertion is a type-level tautology anyway: it can only
+        // ever restate the constant, never check anything.
+        //
+        // Distinctness IS a real property and nothing else here checked it: a
+        // duplicated arm in `TfIndex::table_name` would silently fold two
+        // frames into one table, and the sweep would then sweep that table on
+        // whichever class won the classifier.
         let names = crate::shadow_persistence::candle_table_names();
-        assert_eq!(names.len(), 24, "expected 24 live candle tables");
+        assert!(
+            !names.is_empty(),
+            "no candle tables — the source of truth has drifted and this \
+             guard is vacuous"
+        );
+        let mut seen: Vec<&str> = Vec::new();
         for name in names {
             assert!(
                 name.starts_with("candles_"),
@@ -916,6 +967,12 @@ mod tests {
                 !name.contains("_shadow"),
                 "candle table must be plain (no _shadow): {name}"
             );
+            assert!(
+                !seen.contains(&name),
+                "two fold frames share the table name {name} — one frame's \
+                 bars would land in the other's table"
+            );
+            seen.push(name);
         }
     }
 

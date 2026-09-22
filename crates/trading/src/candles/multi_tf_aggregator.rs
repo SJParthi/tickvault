@@ -189,7 +189,7 @@ pub struct ConsumeStats {
     /// `true` when the tick was refused before any state was touched because
     /// its price was `NaN` / `±Inf` / non-positive. Nothing was folded.
     pub refused_price: bool,
-    /// `true` when the tick fell outside the `[09:15, 15:40)` IST candle
+    /// `true` when the tick fell outside the `[09:00, 15:40)` IST candle
     /// window. Nothing was folded.
     pub out_of_session: bool,
     /// `true` when the vendor stamped this tick for a LATER IST day than our
@@ -1229,10 +1229,14 @@ impl MultiTfAggregator {
             };
         }
 
-        // Candle-window gate. The bucket grid is 09:15-ANCHORED
-        // (`TfIndex::bucket_start` clamps an earlier timestamp to the first
-        // bucket), so a pre-open tick that slipped past this gate would not
-        // form a pre-open candle — it would CORRUPT the 09:15 candle.
+        // Candle-window gate. The bucket grid is anchored at 09:00 (the
+        // CANDLE session open, `CANDLE_SESSION_OPEN_SECS_OF_DAY_IST` — so M60
+        // runs 09:00/10:00/…, not 09:15/10:15/…), and `TfIndex::bucket_start`
+        // clamps anything earlier into the first bucket; this gate is what
+        // keeps a tick before 09:00 from corrupting that first bucket.
+        // (Until 2026-09-22 this line said "09:15-ANCHORED … would CORRUPT
+        // the 09:15 candle", which described the pre-2026-08-28 grid — see
+        // the note below.)
         // 2026-08-28: gated on the FOLD clock, so the window a tick is
         // admitted to is the same window its bucket will be placed in. Gating
         // on one clock and bucketing on the other admits a tick the grid then
@@ -2280,7 +2284,7 @@ mod tests {
              prove nothing"
         );
 
-        let mut frames_checked = 0usize;
+        let mut frames_checked: Vec<TfIndex> = Vec::new();
         for tf in TfIndex::ALL {
             // Keep only frames whose buckets TILE this minute: the first starts
             // exactly on the minute and the last still starts inside it. That
@@ -2289,7 +2293,7 @@ mod tests {
             if tf.bucket_start(base) != base || tf.bucket_start(base + 59) >= base + 60 {
                 continue;
             }
-            frames_checked += 1;
+            frames_checked.push(tf);
             let closed: i64 = sealed
                 .iter()
                 .filter(|(t, _)| *t == tf)
@@ -2312,14 +2316,25 @@ mod tests {
             );
         }
 
-        // The second-scale family alone is 19 frames; if the tiling filter ever
-        // stops admitting them, this test goes quiet rather than red.
-        assert!(
-            frames_checked >= 10,
-            "only {frames_checked} frames were compared — the tiling filter is \
-             excluding frames it should admit, so this test is no longer \
-             checking what it claims"
-        );
+        // Pin the PROPERTY, not a count. A floor like `>= 10` was written when
+        // the second-scale family alone was 19 frames; the 2026-09-19 collapse
+        // took TF_COUNT to 9, so that floor became arithmetically impossible —
+        // a guard that can only fail. Naming the frames the tiling filter MUST
+        // admit is strictly stronger anyway, and it cannot go stale the next
+        // time TF_COUNT moves: every sub-minute frame tiles a minute by
+        // definition, and M1 is the minute itself.
+        for tf in TfIndex::ALL {
+            if !tf.is_second_scale() && tf != TfIndex::M1 {
+                continue;
+            }
+            assert!(
+                frames_checked.contains(&tf),
+                "{tf:?} tiles this minute but the filter excluded it — the \
+                 tiling filter is dropping frames it should admit, so this \
+                 test is no longer checking what it claims (admitted: \
+                 {frames_checked:?})"
+            );
+        }
     }
 
     /// The first tick for an instrument has no previous price to compare to.
@@ -2719,9 +2734,13 @@ mod tests {
             expected,
             "1m frames must tile the day exactly"
         );
-        assert_eq!(total(TfIndex::D1), expected, "the day bar is the same day");
+        assert_eq!(
+            total(TfIndex::M60),
+            expected,
+            "the widest frame spans the same window"
+        );
         assert_eq!(total(TfIndex::S1), total(TfIndex::M1));
-        assert_eq!(total(TfIndex::M1), total(TfIndex::D1));
+        assert_eq!(total(TfIndex::M1), total(TfIndex::M60));
     }
 
     /// The unattributed carry must be settled ONCE — the sharpest edge in the
@@ -2792,7 +2811,7 @@ mod tests {
         );
         // The day frame never refuses anything, so it is the independent
         // witness: if the 1m total exceeds it, the extra units are fabricated.
-        assert_eq!(total(TfIndex::D1), expected);
+        assert_eq!(total(TfIndex::M60), expected);
         assert_eq!(total(TfIndex::S1), expected);
     }
 
@@ -3731,10 +3750,10 @@ mod tests {
         // Same for the 1s frame: 600 elapsed 1s buckets, ONE bar.
         let s1: Vec<&SealRow> = seals.iter().filter(|r| r.3 == TfIndex::S1).collect();
         assert_eq!(s1.len(), 1, "600 elapsed 1s buckets must emit ONE bar");
-        // And 1d never crossed a boundary at all.
+        // And 60m never crossed a boundary at all.
         assert!(
-            !seals.iter().any(|r| r.3 == TfIndex::D1),
-            "the 1d bucket did not close — it must emit nothing"
+            !seals.iter().any(|r| r.3 == TfIndex::M60),
+            "the 60m bucket did not close — it must emit nothing"
         );
     }
 
@@ -3874,7 +3893,7 @@ mod tests {
             assert_eq!(stats.late_count, 0, "same second is never late");
         }
         // Even the finest frame (1s) keeps them all in ONE bucket.
-        for tf in [TfIndex::S1, TfIndex::M1, TfIndex::D1] {
+        for tf in [TfIndex::S1, TfIndex::M1, TfIndex::M60] {
             let s = agg.snapshot(Feed::Dhan, 13, SEG_IDX, tf).expect("slot");
             assert_eq!(
                 s.tick_count,
@@ -4825,9 +4844,9 @@ mod tests {
         let bars = hostile_run(SEQ);
         let expected = 1_700_u64 - 1_000;
         assert_eq!(
-            hostile_total(&bars, TfIndex::D1),
+            hostile_total(&bars, TfIndex::M60),
             expected,
-            "sanity: the day bar sweeps everything"
+            "sanity: the widest frame sweeps everything"
         );
         assert_eq!(
             hostile_total(&bars, TfIndex::M1),
@@ -4872,9 +4891,9 @@ mod tests {
 
         let expected = 1_500_u64 - 1_000;
         assert_eq!(
-            hostile_total(&bars, TfIndex::D1),
+            hostile_total(&bars, TfIndex::M60),
             expected,
-            "sanity: the day bar swept the late tick in-bucket"
+            "sanity: the widest frame swept the late tick in-bucket"
         );
         assert_eq!(
             hostile_total(&bars, TfIndex::S1),
@@ -4938,9 +4957,9 @@ mod tests {
 
         let expected = 1_500_u64 - 1_000;
         assert_eq!(
-            hostile_total(&bars, TfIndex::D1),
+            hostile_total(&bars, TfIndex::M60),
             expected,
-            "sanity: the day bar's bucket never closed, so it swept the late \
+            "sanity: the widest frame's bucket never closed, so it swept the late \
              tick in-bucket and must show the full span"
         );
         assert_eq!(
@@ -5603,12 +5622,12 @@ mod tests {
                 seq.push((off.min(110), cum));
             }
             let bars = hostile_run(&seq);
-            let d1 = hostile_total(&bars, TfIndex::D1);
+            let m60 = hostile_total(&bars, TfIndex::M60);
             let s1 = hostile_total(&bars, TfIndex::S1);
-            if s1 != d1 {
+            if s1 != m60 {
                 failures += 1;
                 if first.is_none() {
-                    first = Some((seq, s1, d1));
+                    first = Some((seq, s1, m60));
                 }
             }
         }
@@ -5651,17 +5670,17 @@ mod tests {
                 seq.push((off.min(110), cum));
             }
             let bars = hostile_run(&seq);
-            let d1 = hostile_total(&bars, TfIndex::D1);
+            let m60 = hostile_total(&bars, TfIndex::M60);
             let s1 = hostile_total(&bars, TfIndex::S1);
             let m1 = hostile_total(&bars, TfIndex::M1);
-            if s1 != d1 || m1 != d1 {
-                failures.push((seq, s1, m1, d1));
+            if s1 != m60 || m1 != m60 {
+                failures.push((seq, s1, m1, m60));
             }
         }
-        let over = failures.iter().filter(|(_, s1, _, d1)| s1 > d1).count();
-        let under = failures.iter().filter(|(_, s1, _, d1)| s1 < d1).count();
-        let m1_over = failures.iter().filter(|(_, _, m1, d1)| m1 > d1).count();
-        let m1_under = failures.iter().filter(|(_, _, m1, d1)| m1 < d1).count();
+        let over = failures.iter().filter(|(_, s1, _, m60)| s1 > m60).count();
+        let under = failures.iter().filter(|(_, s1, _, m60)| s1 < m60).count();
+        let m1_over = failures.iter().filter(|(_, _, m1, m60)| m1 > m60).count();
+        let m1_under = failures.iter().filter(|(_, _, m1, m60)| m1 < m60).count();
         let stale = failures
             .iter()
             .filter(|(seq, _, _, _)| seq.windows(2).any(|w| w[1].1 < w[0].1))
@@ -5679,7 +5698,7 @@ mod tests {
         let first_three = failures
             .iter()
             .take(3)
-            .map(|(seq, s1, m1, d1)| format!("  seq={seq:?}\n    S1={s1} M1={m1} D1={d1}"))
+            .map(|(seq, s1, m1, m60)| format!("  seq={seq:?}\n    S1={s1} M1={m1} M60={m60}"))
             .collect::<Vec<_>>()
             .join("\n");
         assert!(

@@ -82,13 +82,13 @@ mod global_qcfg_tests {
 }
 
 pub mod boot_probe;
-// Human-readable analyst console views (`ticks_named` / `candles_named`) —
-// plain QuestDB views LEFT-joining ticks/candles_1m against the
-// instrument_lifecycle master. Cold-path console tooling only (O(join) at
-// SELECT time, honestly O(N); zero hot-path impact). (The
-// `daily_universe_fetcher` feature that once gated the lifecycle-ensure
-// call inside was deleted in PR-C3, 2026-07-14 — everything here is
-// unconditional now.)
+// 2026-09-22 ("no views anywhere"): `console_views` no longer creates any
+// view. It DROPS every retired console view name at boot, before any table
+// DDL, so a leftover `candles_10m` VIEW cannot squat the name of the real
+// `candles_10m` table. Cold path, one statement per retired name.
+// 2026-09-22: the day's option-contract names, published by the app and
+// read once per sealed bar to fill `candles_<tf>.contract`.
+pub mod candle_contract_labels;
 pub mod console_views;
 // C2 (2026-07-03): HTTP-CLIENT-01 — panic-free reqwest client construction.
 // Shared OnceLock probe client for the repeating QuestDB readiness probes
@@ -217,6 +217,8 @@ pub mod pnl_audit_persistence;
 // — zero callers since its sole feeder `prev_day_ohlcv_boot.rs` died in
 // PR-C3 (2026-07-14). The `prev_day_ohlcv` TABLE stays read-only (forensic;
 // partition_manager sweep string retains it).
+// One-shot `2026-09-19-fresh-start` schema reset (scope lock: "THIS TIME ALONE").
+pub mod fresh_start_reset;
 pub mod questdb_health;
 pub mod seal_absorption;
 pub mod seal_dlq;

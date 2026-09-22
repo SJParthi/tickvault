@@ -317,6 +317,12 @@ pub const RESPAWN_METRIC: &str = "tv_dhan_ws_park_respawn_total";
 /// contract as dropped, and a stream that continues reads as a GHOST — one
 /// we caused, not one the vendor caused.
 ///
+/// ⚠ CORRECTED 2026-09-22 (plan item 44f): the "inner future is dropped"
+/// clause above described the pre-split code. Writes now run on the socket's
+/// writer task, so the swap's budget elapsing no longer drops the write and
+/// `unsubscribe_timeout` is reachable again — see the correction in
+/// `PoolSupervisor::new`. The false-ghost reasoning is unchanged.
+///
 /// A 2026-09-11 two-session read found these three counters are in NEITHER
 /// the EMF selector NOR seeded, so they had never reached CloudWatch at all.
 /// Their absence was therefore not a zero (the `tv_depth_rows_spilled_total`
@@ -2737,6 +2743,13 @@ pub const SWAP_WIRE_BUDGET: Duration = Duration::from_secs(1);
 // APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for; the scanner matches the declaration itself.
 pub const TOPUP_WIRE_BUDGET: Duration = Duration::from_secs(5);
 
+/// The most socket events one top-up pacing gap may handle before the next
+/// send (2026-09-22). A 25 ms gap at the 12,500 frames/s open burst is ~313
+/// frames, so this does not bind on a real socket; it exists so a socket that
+/// is never pending (or a paused test clock that never advances) cannot hold a
+/// top-up inside one gap.
+const TOPUP_GAP_MAX_EVENTS: usize = 1_024;
+
 /// A change to what a LIVE socket is subscribed to, sent while it is up.
 ///
 /// One channel carries both shapes deliberately. Two optional receivers on
@@ -3872,11 +3885,16 @@ impl PoolSupervisor {
         // outer budget always wins and the inner future is dropped before it
         // can increment
         // `tv_dhan_ws_subscribe_failed_total{reason="unsubscribe_timeout"}`.
-        // That reason is therefore VACUOUS in production — a zero on it is a
-        // tautology, not a measurement, and it must never be cited as evidence
-        // that an unsubscribe reached the wire. The three reachable
-        // `unsubscribe_*` reasons and the coded `WS-GAP-02` log lines are what
-        // carry that claim.
+        // That reason WAS therefore vacuous until 2026-09-22.
+        //
+        // ⚠ CORRECTED 2026-09-22 (plan item 44f): writes now run on the
+        // socket's writer task, and the swap's budget elapsing no longer
+        // DROPS the write — the writer keeps it until its own 10 s bound, so
+        // `unsubscribe_timeout` is REACHABLE again (once per stuck write, a
+        // few seconds after the swap already reported its timeout). A zero on
+        // it is now a measurement. It is still never evidence that an
+        // unsubscribe reached the wire: only the three `unsubscribe_*` failure
+        // reasons and the coded `WS-GAP-02` log lines speak to that.
         for metric in [
             SWAP_TOTAL_METRIC,
             SWAP_REFUSED_METRIC,
@@ -4099,11 +4117,29 @@ pub trait DhanFeedSocket: Send {
     fn last_dial_failure_reason(&self) -> &'static str {
         "unknown"
     }
-    /// Send ONE subscribe message for the given batch.
-    fn send_subscribe(
-        &mut self,
-        batch: &[SubscribeInstrument],
-    ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send;
+    /// The generation of the connection the NEXT write would go out on.
+    ///
+    /// Bumped by every successful [`Self::connect`]. Every [`WriteTicket`]
+    /// carries the generation it was issued under, and the drain refuses an
+    /// outcome whose generation no longer matches — so an answer from a
+    /// socket that has since been replaced can never be read as a write that
+    /// landed on the new one (2026-09-22, plan item 44f).
+    fn write_generation(&self) -> u64;
+    /// Queue ONE subscribe message for the given batch and return at once.
+    ///
+    /// **CHANGED 2026-09-22 (plan item 44f): a write no longer borrows the
+    /// socket while it is in flight.** It used to be an `async fn` taking
+    /// `&mut self`, which meant the read half could not be polled until the
+    /// write finished — a swap or top-up write that stalled for its whole
+    /// budget held `recv()` off the socket for that long, on the one task
+    /// whose job is never to stop reading. The write is now handed to the
+    /// transport's writer and its outcome arrives on the returned
+    /// [`WriteTicket`], which the drain awaits as a select arm BESIDE
+    /// `recv()`.
+    ///
+    /// The implementor copies what it needs out of `batch` before returning:
+    /// the slice is borrowed from the guard only for the call.
+    fn send_subscribe(&mut self, batch: &[SubscribeInstrument]) -> WriteTicket;
     /// Send ONE unsubscribe message for the given batch.
     ///
     /// **ADDED 2026-08-26** for the per-minute at-the-money re-selection. It
@@ -4113,12 +4149,12 @@ pub trait DhanFeedSocket: Send {
     /// instrument subscribed — puts a depth-200 connection over its
     /// one-instrument limit on the very next subscribe, and Dhan answers that
     /// with an 804 (one re-dial, then a permanent park).
-    fn send_unsubscribe(
-        &mut self,
-        batch: &[SubscribeInstrument],
-    ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send {
+    ///
+    /// Queued like [`Self::send_subscribe`]; the outcome arrives on the
+    /// returned [`WriteTicket`].
+    fn send_unsubscribe(&mut self, batch: &[SubscribeInstrument]) -> WriteTicket {
         let _ = batch;
-        async { Err(SocketFailure) }
+        WriteTicket::resolved(self.write_generation(), Err(SocketFailure))
     }
     /// Send ONE client-originated keepalive Ping.
     ///
@@ -4130,7 +4166,11 @@ pub trait DhanFeedSocket: Send {
     /// Driven ONLY for endpoints where
     /// [`DhanEndpointType::needs_client_keepalive_ping`] is true. The watchdog
     /// reset stays on the RECEIVED pong, never on this send.
-    fn send_ping(&mut self) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send;
+    ///
+    /// Queued like [`Self::send_subscribe`] (2026-09-22): the drain keeps the
+    /// ticket as a select arm instead of awaiting it inline, so a ping stuck
+    /// behind a full send buffer no longer stops the reader.
+    fn send_ping(&mut self) -> WriteTicket;
     /// Await the next socket event. This is the call that keeps the automatic
     /// pong flowing — nothing may be done between two of these but
     /// [`FrameSink::accept`].
@@ -4144,6 +4184,249 @@ pub trait DhanFeedSocket: Send {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("dhan socket failure")]
 pub struct SocketFailure;
+
+/// The pending outcome of ONE queued socket write (2026-09-22, plan item 44f).
+///
+/// A future that resolves to the write's result. It owns nothing of the
+/// socket, which is the whole point: the drain can poll it and `recv()` in
+/// the same `select!`, so the reader keeps draining frames while a write is
+/// in flight instead of waiting behind it.
+///
+/// A ticket whose writer went away before answering — the connection closed
+/// under it — resolves to `Err(SocketFailure)`: the same answer a write that
+/// failed on a dead socket has always produced, so no caller needs a new
+/// branch for it.
+#[must_use = "a write ticket carries the only report of whether the write reached the wire"]
+#[derive(Debug)]
+pub struct WriteTicket {
+    generation: u64,
+    state: WriteTicketState,
+}
+
+#[derive(Debug)]
+enum WriteTicketState {
+    /// Answered at submit time — a payload that could not be built, a socket
+    /// that was not connected, a transport that answers at submit time.
+    /// `None` once taken.
+    Resolved(Option<Result<(), SocketFailure>>),
+    /// Waiting on the writer.
+    Pending(tokio::sync::oneshot::Receiver<Result<(), SocketFailure>>),
+}
+
+/// The writer's half of a [`WriteTicket`]: exactly one answer, sent once.
+#[derive(Debug)]
+pub struct WriteReply(tokio::sync::oneshot::Sender<Result<(), SocketFailure>>);
+
+impl WriteReply {
+    /// Delivers the write's outcome. A ticket nobody is waiting on any more
+    /// (the drain returned) is not an error: the answer simply has no reader.
+    pub fn send(self, outcome: Result<(), SocketFailure>) {
+        if self.0.send(outcome).is_err() {
+            // The drain stopped waiting — nothing to do.
+        }
+    }
+}
+
+impl WriteTicket {
+    /// A ticket that is already answered.
+    pub const fn resolved(generation: u64, outcome: Result<(), SocketFailure>) -> Self {
+        Self {
+            generation,
+            state: WriteTicketState::Resolved(Some(outcome)),
+        }
+    }
+
+    /// A ticket answered later through the returned [`WriteReply`].
+    pub fn pending(generation: u64) -> (Self, WriteReply) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (
+            Self {
+                generation,
+                state: WriteTicketState::Pending(rx),
+            },
+            WriteReply(tx),
+        )
+    }
+
+    /// The connection generation this write was issued under.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+impl std::future::Future for WriteTicket {
+    type Output = Result<(), SocketFailure>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        match &mut this.state {
+            WriteTicketState::Resolved(outcome) => {
+                std::task::Poll::Ready(outcome.take().unwrap_or(Err(SocketFailure)))
+            }
+            WriteTicketState::Pending(rx) => std::pin::Pin::new(rx)
+                .poll(cx)
+                .map(|answer| answer.unwrap_or(Err(SocketFailure))),
+        }
+    }
+}
+
+/// A write's budget ran out before the writer answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WireElapsed;
+
+/// What waiting for one write produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WireWait {
+    /// `Ok(answer)` when the writer answered — or when the socket's fate was
+    /// decided mid-write, which is reported as `Ok(Err(SocketFailure))`, the
+    /// answer a write on a dead socket has always given. `Err(WireElapsed)`
+    /// when the budget ran out first.
+    outcome: Result<Result<(), SocketFailure>, WireElapsed>,
+    /// Set when a frame read DURING the write decided this socket's fate (a
+    /// `Closed`). The caller must hand this action back to the supervisor's
+    /// loop instead of inventing its own.
+    socket_decision: Option<SupervisorAction>,
+}
+
+/// Per-connection throttles for the three degraded frame outcomes; see the
+/// long note in [`drain`]. One struct so every read site — the select arm,
+/// the pacing gaps and the wait on a write — shares one ladder.
+#[derive(Debug, Default)]
+struct DrainThrottle {
+    ring_full_seen: u64,
+    wal_dropped_seen: u64,
+    captured_live_only_seen: u64,
+}
+
+/// Whether an answer can be trusted to describe THIS connection's wire.
+///
+/// A ticket issued under an older generation describes a socket that has
+/// since been replaced, and a success from it proves nothing about the
+/// socket in hand.
+const fn write_answer_is_current(issued: u64, current: u64) -> bool {
+    issued == current
+}
+
+/// Awaits one queued write while CONTINUING to read the socket
+/// (2026-09-22, plan item 44f).
+///
+/// Three things can end the wait, checked in this order every iteration:
+/// the writer answers; the budget (`deadline`, `None` for none) runs out;
+/// or a frame read in the meantime decides the socket's fate. Every frame
+/// read here goes through [`handle_socket_event`], the same handler the drain
+/// select uses, so nothing about per-frame handling changes — only that it
+/// no longer waits behind a write.
+///
+/// Zero allocation per frame: the ticket and the deadline are pinned once
+/// before the loop, and the loop body is the handler plus a counter.
+async fn await_write<S, K>(
+    socket: &mut S,
+    supervisor: &mut ConnectionSupervisor,
+    sink: &K,
+    throttle: &mut DrainThrottle,
+    mut ticket: WriteTicket,
+    deadline: Option<tokio::time::Instant>,
+) -> WireWait
+where
+    S: DhanFeedSocket,
+    K: FrameSink + ?Sized,
+{
+    let issued = ticket.generation();
+    // A far-future instant when there is no budget; the arm is disabled by
+    // its `if` in that case, so the value is never reached.
+    let until =
+        deadline.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86_400));
+    let budget = tokio::time::sleep_until(until);
+    tokio::pin!(budget);
+    let mut read_during_write = 0usize;
+    loop {
+        tokio::select! {
+            biased;
+            answer = &mut ticket => {
+                if !write_answer_is_current(issued, socket.write_generation()) {
+                    warn!(
+                        code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                        source = "stale_write_answer",
+                        endpoint = supervisor.slot().endpoint.as_str(),
+                        pool_index = supervisor.slot().pool_index,
+                        issued_generation = issued,
+                        current_generation = socket.write_generation(),
+                        "a write answer arrived from a connection that has since been \
+                         replaced — ignored, and treated as a write that did not land"
+                    );
+                    return WireWait {
+                        outcome: Ok(Err(SocketFailure)),
+                        socket_decision: None,
+                    };
+                }
+                return WireWait {
+                    outcome: Ok(answer),
+                    socket_decision: None,
+                };
+            }
+            () = &mut budget, if deadline.is_some() => {
+                return WireWait {
+                    outcome: Err(WireElapsed),
+                    socket_decision: None,
+                };
+            }
+            event = socket.recv() => {
+                let action = handle_socket_event(event, supervisor, sink, throttle);
+                if action != SupervisorAction::Continue {
+                    return WireWait {
+                        outcome: Ok(Err(SocketFailure)),
+                        socket_decision: Some(action),
+                    };
+                }
+                read_during_write = read_during_write.saturating_add(1);
+                // A socket that is never pending would otherwise keep this
+                // task busy without a break; hand the scheduler a turn so the
+                // writer (and its timer) can run.
+                if read_during_write.is_multiple_of(TOPUP_GAP_MAX_EVENTS) {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    }
+}
+
+/// Reads the socket until `resume_at` — the pacing gap between two writes.
+///
+/// Bounded three ways: the resume instant, [`TOPUP_GAP_MAX_EVENTS`] events
+/// (a paused test clock or a socket that is never pending cannot hold the
+/// caller here), and the first non-`Continue` decision, which is returned.
+/// Always returns at or after `resume_at` unless the socket decided.
+async fn read_until<S, K>(
+    socket: &mut S,
+    supervisor: &mut ConnectionSupervisor,
+    sink: &K,
+    throttle: &mut DrainThrottle,
+    resume_at: tokio::time::Instant,
+) -> Option<SupervisorAction>
+where
+    S: DhanFeedSocket,
+    K: FrameSink + ?Sized,
+{
+    let mut read_in_gap = 0usize;
+    while read_in_gap < TOPUP_GAP_MAX_EVENTS && tokio::time::Instant::now() < resume_at {
+        let Ok(event) = tokio::time::timeout_at(resume_at, socket.recv()).await else {
+            break;
+        };
+        read_in_gap += 1;
+        let action = handle_socket_event(event, supervisor, sink, throttle);
+        if action != SupervisorAction::Continue {
+            return Some(action);
+        }
+    }
+    // Only reached early when the cap was hit: the next write still waits
+    // out its interval.
+    tokio::time::sleep_until(resume_at).await;
+    None
+}
 
 /// Why a supervised connection loop returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4328,8 +4611,30 @@ where
 
             SupervisorAction::Subscribe => {
                 let slot = supervisor.slot();
-                let outcome =
-                    dispatch_subscribe(&mut socket, &guard, slot.endpoint, slot.pool_index).await;
+                // One throttle ladder per connection, shared by the replay and
+                // the drain that follows it: a reconnect restarts each ladder,
+                // which is deliberate (see the note in `drain`).
+                let mut throttle = DrainThrottle::default();
+                let (outcome, socket_decision) = dispatch_subscribe(
+                    &mut socket,
+                    &mut supervisor,
+                    sink.as_ref(),
+                    &mut throttle,
+                    &guard,
+                    slot.endpoint,
+                    slot.pool_index,
+                )
+                .await;
+                if let Some(decided) = socket_decision {
+                    // The socket's own fate was decided by a frame read DURING
+                    // the replay (2026-09-22, plan item 44f) — almost always a
+                    // `Closed`. The supervisor already chose what happens next,
+                    // so that choice is executed as-is; `SubscribeFailed` is
+                    // not layered on top of a decision it already made. As on
+                    // the failure arm below, `mark_confirmed` is not reached.
+                    action = decided;
+                    continue;
+                }
                 if outcome.stopped_early() {
                     // `mark_confirmed` is deliberately NOT reached: the guard
                     // still reads `needs_resubscribe`, so the retained set is
@@ -4359,6 +4664,7 @@ where
                     &mut socket,
                     &mut supervisor,
                     sink.as_ref(),
+                    &mut throttle,
                     action,
                     &mut guard,
                     commands.as_mut(),
@@ -4436,14 +4742,27 @@ impl SubscribeDispatch {
 ///
 /// Zero heap allocation in the loop: batches are borrowed slices, and both
 /// counters are resolved once before the first send rather than per message.
-async fn dispatch_subscribe<S>(
+///
+/// # The reader keeps reading (2026-09-22, plan item 44f)
+///
+/// Both the pacing gaps and every write are spent draining the socket
+/// through [`handle_socket_event`]: frames start arriving after the first
+/// batch, and a replay of dozens of batches used to hold `recv()` off the
+/// socket for its whole length. A frame read here that decides the socket's
+/// fate ends the dispatch and is returned as the second element; the caller
+/// executes that decision instead of `SubscribeFailed`.
+async fn dispatch_subscribe<S, K>(
     socket: &mut S,
+    supervisor: &mut ConnectionSupervisor,
+    sink: &K,
+    throttle: &mut DrainThrottle,
     guard: &SubscribeGuard,
     endpoint: DhanEndpointType,
     pool_index: u8,
-) -> SubscribeDispatch
+) -> (SubscribeDispatch, Option<SupervisorAction>)
 where
     S: DhanFeedSocket,
+    K: FrameSink + ?Sized,
 {
     let endpoint_label = endpoint.as_str();
     let batches_metric = metrics::counter!(SUBSCRIBE_BATCH_METRIC, "endpoint" => endpoint_label);
@@ -4460,15 +4779,30 @@ where
 
     let mut batches_sent = 0_usize;
     let mut instruments_sent = 0_usize;
+    let mut socket_decision = None;
 
     for (index, batch) in guard.batches().enumerate() {
         if index > 0 {
             // Paced BETWEEN messages. See `SUBSCRIBE_BATCH_INTERVAL` for why a
             // burst is dangerous rather than merely rude, and for the
-            // arithmetic showing this cannot miss the 09:12 deadline.
-            tokio::time::sleep(SUBSCRIBE_BATCH_INTERVAL).await;
+            // arithmetic showing this cannot miss the 09:12 deadline. The gap
+            // reads the socket instead of sleeping; it still ends no earlier
+            // than the interval.
+            let resume_at = tokio::time::Instant::now() + SUBSCRIBE_BATCH_INTERVAL;
+            if let Some(decided) = read_until(socket, supervisor, sink, throttle, resume_at).await {
+                socket_decision = Some(decided);
+                break;
+            }
         }
-        if socket.send_subscribe(batch).await.is_err() {
+        // No outer budget, exactly as before: the transport bounds each
+        // message with its own send timeout.
+        let ticket = socket.send_subscribe(batch);
+        let wait = await_write(socket, supervisor, sink, throttle, ticket, None).await;
+        if let Some(decided) = wait.socket_decision {
+            socket_decision = Some(decided);
+            break;
+        }
+        if !matches!(wait.outcome, Ok(Ok(()))) {
             break;
         }
         batches_sent = batches_sent.saturating_add(1);
@@ -4523,7 +4857,7 @@ where
         );
     }
 
-    outcome
+    (outcome, socket_decision)
 }
 
 /// The drain loop. Returns as soon as the supervisor asks for anything other
@@ -4536,6 +4870,7 @@ async fn drain<S, K>(
     socket: &mut S,
     supervisor: &mut ConnectionSupervisor,
     sink: &K,
+    throttle: &mut DrainThrottle,
     mut action: SupervisorAction,
     guard: &mut SubscribeGuard,
     mut commands: Option<&mut tokio::sync::mpsc::Receiver<LiveSubscriptionCommand>>,
@@ -4584,9 +4919,16 @@ where
     // the exact counts, so throttling the LINES loses no quantity — only
     // per-frame granularity on two outcomes whose per-frame detail nobody can
     // read at 12,500/sec anyway.
-    let mut ring_full_seen: u64 = 0;
-    let mut wal_dropped_seen: u64 = 0;
-    let mut captured_live_only_seen: u64 = 0;
+    //
+    // The three counters live in `DrainThrottle`, built ONCE per connection by
+    // the caller (2026-09-22) so the replay's reads and this loop's reads
+    // share one ladder; a reconnect still starts every ladder again.
+
+    // A keepalive ping on its way to the wire (2026-09-22, plan item 44f).
+    // Held here and awaited as a select arm, never inline: a ping stuck
+    // behind a full send buffer must not stop the reader, which is the one
+    // thing that can see the pong come back.
+    let mut pending_ping: Option<WriteTicket> = None;
 
     // When we last sent a client keepalive ping on this socket.
     //
@@ -4614,7 +4956,12 @@ where
         // on an enum discriminant, not an atomic, not a syscall. The cost is
         // present only in the handful of iterations between the socket coming
         // up and the attach sending, and it disappears permanently after.
-        if let Some(rx) = commands.as_mut() {
+        // Commands wait while a ping is on the wire, so a command's writes
+        // never queue behind it and one write stays in flight at a time —
+        // the ordering the inline ping await used to give for free.
+        if pending_ping.is_none()
+            && let Some(rx) = commands.as_mut()
+        {
             match rx.try_recv() {
                 Ok(LiveSubscriptionCommand::Extend { more, ack }) => {
                     let added = more.len();
@@ -4655,23 +5002,42 @@ where
                             let mut sent = 0usize;
                             let mut failed = false;
                             let mut budget_exhausted = false;
+                            // Set when a socket event read in a pacing gap
+                            // decided this socket's fate (a `Closed`). Handled
+                            // exactly like a failed send: the guard keeps the
+                            // whole set and the reconnect replay delivers it.
+                            let mut interrupted_by_socket = false;
                             for batch in guard.batches_from(start) {
                                 if tokio::time::Instant::now() >= deadline {
                                     budget_exhausted = true;
                                     break;
                                 }
-                                match tokio::time::timeout(
-                                    SWAP_WIRE_BUDGET,
-                                    socket.send_subscribe(batch),
+                                // The write is awaited BESIDE `recv()`
+                                // (2026-09-22, plan item 44f), under the
+                                // same per-message budget as before.
+                                let ticket = socket.send_subscribe(batch);
+                                let wait = await_write(
+                                    socket,
+                                    supervisor,
+                                    sink,
+                                    throttle,
+                                    ticket,
+                                    Some(tokio::time::Instant::now() + SWAP_WIRE_BUDGET),
                                 )
-                                .await
-                                {
+                                .await;
+                                if let Some(decided) = wait.socket_decision {
+                                    action = decided;
+                                    interrupted_by_socket = true;
+                                    failed = true;
+                                    break;
+                                }
+                                match wait.outcome {
                                     Ok(Ok(())) => sent += batch.len(),
                                     // A per-message timeout is a SICK SOCKET,
                                     // not a failed send: treating it as the
                                     // budget case keeps the guard truthful and
                                     // lets the reconnect ladder do its job.
-                                    Err(_) => {
+                                    Err(WireElapsed) => {
                                         budget_exhausted = true;
                                         break;
                                     }
@@ -4680,7 +5046,26 @@ where
                                         break;
                                     }
                                 }
-                                tokio::time::sleep(SUBSCRIBE_BATCH_INTERVAL).await;
+                                // THE PACING GAP READS THE SOCKET (2026-09-22,
+                                // scope lock "2026-09-22 (FOURTH)" item 6).
+                                // Until then this was a bare 25 ms sleep, so a
+                                // 42-message top-up held the reader off
+                                // `recv()` for ~1 s of pacing alone — on the
+                                // main-feed socket, the busiest one we have.
+                                // The gap still paces the NEXT send exactly as
+                                // before; it now spends the wait draining
+                                // frames through the same handler the select
+                                // arm uses. Bounds: see `read_until`.
+                                let resume_at =
+                                    tokio::time::Instant::now() + SUBSCRIBE_BATCH_INTERVAL;
+                                if let Some(decided) =
+                                    read_until(socket, supervisor, sink, throttle, resume_at).await
+                                {
+                                    action = decided;
+                                    interrupted_by_socket = true;
+                                    failed = true;
+                                    break;
+                                }
                             }
                             if budget_exhausted {
                                 // Keep the guard honest: it is the reconnect
@@ -4720,6 +5105,7 @@ where
                                     pool_index = supervisor.slot().pool_index,
                                     added,
                                     sent,
+                                    interrupted_by_socket,
                                     "live subscription top-up failed part-way — the reconnect \
                                      replay sends the whole set and reconciles it"
                                 );
@@ -4828,13 +5214,24 @@ where
                             // which must run on every arm including the timeout,
                             // can still read it.
                             let unsub_started = tokio::time::Instant::now();
+                            // A frame read DURING either wire call that decides
+                            // this socket's fate (a `Closed`) — 2026-09-22 plan
+                            // item 44f: the reader keeps polling while the write
+                            // is in flight, so the socket can close under it.
+                            let mut socket_decision: Option<SupervisorAction> = None;
                             if let Some(drop_this) = swap.unsubscribe {
-                                match tokio::time::timeout(
-                                    SWAP_WIRE_BUDGET,
-                                    socket.send_unsubscribe(&[drop_this]),
+                                let ticket = socket.send_unsubscribe(&[drop_this]);
+                                let wait = await_write(
+                                    socket,
+                                    supervisor,
+                                    sink,
+                                    throttle,
+                                    ticket,
+                                    Some(unsub_started + SWAP_WIRE_BUDGET),
                                 )
-                                .await
-                                {
+                                .await;
+                                socket_decision = wait.socket_decision;
+                                match wait.outcome {
                                     Ok(Ok(())) => {
                                         unsubscribe_succeeded = true;
                                         // THE OTHER HALF OF THE GHOST EVIDENCE.
@@ -4964,11 +5361,18 @@ where
                             }
                             if !wire_failed && let Some(add_this) = swap.subscribe {
                                 let sub_started = tokio::time::Instant::now();
-                                let sub_outcome = tokio::time::timeout(
-                                    SWAP_WIRE_BUDGET,
-                                    socket.send_subscribe(&[add_this]),
+                                let ticket = socket.send_subscribe(&[add_this]);
+                                let wait = await_write(
+                                    socket,
+                                    supervisor,
+                                    sink,
+                                    throttle,
+                                    ticket,
+                                    Some(sub_started + SWAP_WIRE_BUDGET),
                                 )
                                 .await;
+                                socket_decision = wait.socket_decision;
+                                let sub_outcome = wait.outcome;
                                 // Recorded before the match so an elapsed budget
                                 // is sampled too — see `SWAP_WIRE_MS_METRIC`.
                                 metrics::histogram!(
@@ -5106,8 +5510,19 @@ where
                                 // silent one.
                                 let unsubscribe_may_have_landed = unsubscribe_succeeded
                                     || (wire_timed_out && swap.unsubscribe.is_some());
-                                let lost_instruments =
-                                    unsubscribe_may_have_landed && swap.subscribe.is_some();
+                                // A socket that closed DURING the write is
+                                // already being redialled by its own decision
+                                // (`socket_decision`), and the replay lands
+                                // whatever the guard names — `old` when the
+                                // close cut the UNSUBSCRIBE (a write on a dead
+                                // socket is a failed write, so the refused arm
+                                // reverted), `new` when it cut the subscribe.
+                                // No second remediation, and no emptied-socket
+                                // count for a socket that is going away anyway.
+                                let interrupted_by_socket = socket_decision.is_some();
+                                let lost_instruments = unsubscribe_may_have_landed
+                                    && swap.subscribe.is_some()
+                                    && !interrupted_by_socket;
                                 let possibly_emptied = lost_instruments && !unsubscribe_succeeded;
                                 // The guard already carries the NEW instrument
                                 // — see `try_swap` for why it is recorded
@@ -5157,6 +5572,7 @@ where
                                     lost_instruments,
                                     possibly_emptied,
                                     wire_timed_out,
+                                    interrupted_by_socket,
                                     "live subscription swap failed on the wire. The retained set \
                                      already names the new instrument, so a reconnect replay lands \
                                      the right strike. When the unsubscribe succeeded OR timed out \
@@ -5207,6 +5623,12 @@ where
                                         },
                                     },
                                 );
+                                // The socket's own decision (a close read
+                                // during the write) is handed back to the loop
+                                // below rather than swallowed.
+                                if let Some(decided) = socket_decision {
+                                    action = decided;
+                                }
                             } else {
                                 info!(
                                     endpoint = supervisor.slot().endpoint.as_str(),
@@ -5312,15 +5734,23 @@ where
                         // that as "sent" is not a fiction — it is the whole
                         // action this arm requested, and it cannot fail.
                         let sent = if send_wire {
-                            match tokio::time::timeout(
-                                SWAP_WIRE_BUDGET,
-                                socket.send_unsubscribe(&[drop_this]),
+                            let ticket = socket.send_unsubscribe(&[drop_this]);
+                            let wait = await_write(
+                                socket,
+                                supervisor,
+                                sink,
+                                throttle,
+                                ticket,
+                                Some(tokio::time::Instant::now() + SWAP_WIRE_BUDGET),
                             )
-                            .await
-                            {
+                            .await;
+                            if let Some(decided) = wait.socket_decision {
+                                action = decided;
+                            }
+                            match wait.outcome {
                                 Ok(Ok(())) => true,
                                 Ok(Err(_)) => false,
-                                Err(_elapsed) => {
+                                Err(WireElapsed) => {
                                     timed_out = true;
                                     false
                                 }
@@ -5450,121 +5880,20 @@ where
             }
         }
 
+        // A top-up now READS the socket between its batches, so a `Closed`
+        // (or any other decision) can land inside the command block. Leave
+        // with it here, before the select: a parked supervisor answers every
+        // later event `Continue`, and a reconnecting one answers a frame
+        // `Continue` too, so one more `recv()` would silently swallow the
+        // disconnect that was just decided.
+        if action != SupervisorAction::Continue {
+            return action;
+        }
+
         tokio::select! {
             biased;
             event = socket.recv() => {
-                match event {
-                    // A Ping/Pong: proof the peer is alive, carrying no data.
-                    // One watchdog reset, no sink write, no frame count.
-                    SocketEvent::KeepAlive => {
-                        action = supervisor
-                            .on_event(ConnEvent::KeepAliveReceived, Instant::now());
-                    }
-                    SocketEvent::Frame(frame) => {
-                        // Two operations. That is the whole loop body.
-                        let outcome = sink.accept(frame);
-                        action = supervisor.on_event(ConnEvent::FrameReceived, Instant::now());
-                        if outcome == FrameSinkOutcome::WalDropped {
-                            // Loud, but the reader does NOT stop draining:
-                            // stopping would cost the pong and turn one lost
-                            // frame into a disconnect.
-                            //
-                            // Throttled by powers of two for the reason the
-                            // counter declaration gives at length: this arm
-                            // fires when the WAL writer is stalled behind a
-                            // saturated disk, i.e. thousands of times a
-                            // second, ON the task that owns the socket. An
-                            // unthrottled line here turns a disk problem into
-                            // a read-task stall, which is the one failure that
-                            // costs ticks upstream where no counter can see
-                            // them. The count is not lost: it is carried
-                            // exactly by `tv_dhan_ws_wal_dropped_total` and
-                            // repeated in the field below.
-                            wal_dropped_seen = wal_dropped_seen.saturating_add(1);
-                            if wal_dropped_seen.is_power_of_two() {
-                                error!(
-                                    code = ErrorCode::WsGapConnectionState.code_str(),
-                                    endpoint = supervisor.slot().endpoint.as_str(),
-                                    pool_index = supervisor.slot().pool_index,
-                                    lost_on_this_socket = wal_dropped_seen,
-                                    "write-ahead log refused a Dhan frame AND the ring refused \
-                                     it too — that frame is lost; the reader keeps draining so \
-                                     the socket is not also lost"
-                                );
-                            }
-                        }
-                        if outcome == FrameSinkOutcome::CapturedLiveOnly {
-                            // Degraded, not lost, and the difference is worth a
-                            // line of its own: the write-ahead queue refused
-                            // this frame but the ring took it, so its ticks DO
-                            // reach the database this session and only a crash
-                            // before the next flush would lose them. Before
-                            // 2026-09-05 this frame was discarded outright.
-                            //
-                            // Throttled for the same reason as the arm above,
-                            // and it needs it MORE: this outcome is the common
-                            // one under a stalled WAL writer (the ring is
-                            // healthy, only the write-ahead queue is full), so
-                            // it is the arm that would actually produce the
-                            // per-frame storm.
-                            captured_live_only_seen = captured_live_only_seen.saturating_add(1);
-                            if captured_live_only_seen.is_power_of_two() {
-                                warn!(
-                                    code = ErrorCode::WsGapConnectionState.code_str(),
-                                    endpoint = supervisor.slot().endpoint.as_str(),
-                                    pool_index = supervisor.slot().pool_index,
-                                    degraded_on_this_socket = captured_live_only_seen,
-                                    "write-ahead log refused a Dhan frame but the ring accepted \
-                                     it — the frame IS folded into the database this session and \
-                                     is NOT replayable, so only a crash before the next flush \
-                                     loses it"
-                                );
-                            }
-                        }
-                        if outcome == FrameSinkOutcome::RingFull {
-                            // 2026-08-11: this outcome used to bump a counter
-                            // and produce NO log line at all.
-                            //
-                            // The counter's documentation calls a full ring
-                            // "not capture loss — the consumer is behind",
-                            // and for a brief burst that is fair: the frame is
-                            // already in the WAL. But nothing re-folds WAL
-                            // frames into the database, so in practice a full
-                            // ring means those ticks and candles never arrive
-                            // — while the lane's health gauge still reads 1.
-                            // Silent permanent loss behind a green light is
-                            // exactly the class the charter forbids.
-                            //
-                            // Throttled by powers of two rather than rate-
-                            // limited: the first occurrence is always
-                            // reported, and a sustained storm degrades to a
-                            // handful of lines instead of one per frame. A
-                            // slow consumer must not be able to drown the log
-                            // it is being reported in.
-                            ring_full_seen = ring_full_seen.saturating_add(1);
-                            if ring_full_seen.is_power_of_two() {
-                                error!(
-                                    code = ErrorCode::WsGapConnectionState.code_str(),
-                                    endpoint = supervisor.slot().endpoint.as_str(),
-                                    pool_index = supervisor.slot().pool_index,
-                                    dropped_on_this_socket = ring_full_seen,
-                                    "the frame ring is FULL — the fold cannot keep up, so this \
-                                     frame is not being turned into ticks or candles NOW. It IS \
-                                     in the write-ahead log and the next boot re-folds it, so \
-                                     the tick ROWS come back; what does not come back is their \
-                                     CANDLE contribution, because by then the tick is outside \
-                                     the aggregating session and only the row is written. Treat \
-                                     this as lost candles, not lost ticks. Logged at \
-                                     1, 2, 4, 8 ... occurrences per socket to bound the noise."
-                                );
-                            }
-                        }
-                    }
-                    SocketEvent::Closed { code } => {
-                        action = supervisor
-                            .on_event(ConnEvent::Disconnected { code }, Instant::now());
-                    }
-                }
+                action = handle_socket_event(event, supervisor, sink, throttle);
             }
             _ = ticker.tick() => {
                 // Client-originated keepalive, for the endpoints Dhan does not
@@ -5610,9 +5939,7 @@ where
                     // — for that long. Once per interval is an accepted
                     // exposure; once per second would be a tenfold increase in
                     // the very stall this watchdog exists to catch.
-                    match socket.send_ping().await {
-                        Ok(()) | Err(SocketFailure) => {}
-                    }
+                    pending_ping = Some(socket.send_ping());
                 }
                 action = supervisor.poll(Instant::now());
                 // The ghost-instrument register, read on the SAME tick for the
@@ -5637,6 +5964,159 @@ where
                     action = supervisor.on_event(ConnEvent::ProbeCloseRequested, Instant::now());
                 }
             }
+            // The keepalive ping's answer, polled IN the select so the read
+            // arm above keeps running while the ping is on the wire (plan
+            // item 44f). Its outcome is counted and logged by the socket; there
+            // is nothing more for the supervisor to do with it — escalating a
+            // failed ping would turn "Dhan does not answer pings here" into a
+            // disconnect, worse than the behaviour being fixed.
+            () = async {
+                match pending_ping.as_mut() {
+                    Some(ticket) => match ticket.await {
+                        Ok(()) | Err(SocketFailure) => {}
+                    },
+                    None => std::future::pending::<()>().await,
+                }
+            }, if pending_ping.is_some() => {
+                pending_ping = None;
+            }
+        }
+    }
+    action
+}
+
+/// Handles ONE socket event: the body of the drain's read arm, lifted out so
+/// the top-up's pacing gaps can read the socket through the SAME code rather
+/// than a copy of it (2026-09-22, scope lock "2026-09-22 (FOURTH)" item 6).
+///
+/// Not async, on purpose: THE ONE RULE — one [`FrameSink::accept`] and one
+/// watchdog update per frame — cannot be broken by an `.await` that does not
+/// exist. The three throttle counters are passed by reference because they
+/// are per-drain state owned by [`drain`]; a copy would restart the
+/// power-of-two ladder on every call and re-open the log storm.
+fn handle_socket_event<K>(
+    event: SocketEvent,
+    supervisor: &mut ConnectionSupervisor,
+    sink: &K,
+    throttle: &mut DrainThrottle,
+) -> SupervisorAction
+where
+    K: FrameSink + ?Sized,
+{
+    let DrainThrottle {
+        ring_full_seen,
+        wal_dropped_seen,
+        captured_live_only_seen,
+    } = throttle;
+    let action;
+    match event {
+        // A Ping/Pong: proof the peer is alive, carrying no data.
+        // One watchdog reset, no sink write, no frame count.
+        SocketEvent::KeepAlive => {
+            action = supervisor.on_event(ConnEvent::KeepAliveReceived, Instant::now());
+        }
+        SocketEvent::Frame(frame) => {
+            // Two operations. That is the whole loop body.
+            let outcome = sink.accept(frame);
+            action = supervisor.on_event(ConnEvent::FrameReceived, Instant::now());
+            if outcome == FrameSinkOutcome::WalDropped {
+                // Loud, but the reader does NOT stop draining:
+                // stopping would cost the pong and turn one lost
+                // frame into a disconnect.
+                //
+                // Throttled by powers of two for the reason the
+                // counter declaration gives at length: this arm
+                // fires when the WAL writer is stalled behind a
+                // saturated disk, i.e. thousands of times a
+                // second, ON the task that owns the socket. An
+                // unthrottled line here turns a disk problem into
+                // a read-task stall, which is the one failure that
+                // costs ticks upstream where no counter can see
+                // them. The count is not lost: it is carried
+                // exactly by `tv_dhan_ws_wal_dropped_total` and
+                // repeated in the field below.
+                *wal_dropped_seen = wal_dropped_seen.saturating_add(1);
+                if wal_dropped_seen.is_power_of_two() {
+                    error!(
+                        code = ErrorCode::WsGapConnectionState.code_str(),
+                        endpoint = supervisor.slot().endpoint.as_str(),
+                        pool_index = supervisor.slot().pool_index,
+                        lost_on_this_socket = *wal_dropped_seen,
+                        "write-ahead log refused a Dhan frame AND the ring refused \
+                         it too — that frame is lost; the reader keeps draining so \
+                         the socket is not also lost"
+                    );
+                }
+            }
+            if outcome == FrameSinkOutcome::CapturedLiveOnly {
+                // Degraded, not lost, and the difference is worth a
+                // line of its own: the write-ahead queue refused
+                // this frame but the ring took it, so its ticks DO
+                // reach the database this session and only a crash
+                // before the next flush would lose them. Before
+                // 2026-09-05 this frame was discarded outright.
+                //
+                // Throttled for the same reason as the arm above,
+                // and it needs it MORE: this outcome is the common
+                // one under a stalled WAL writer (the ring is
+                // healthy, only the write-ahead queue is full), so
+                // it is the arm that would actually produce the
+                // per-frame storm.
+                *captured_live_only_seen = captured_live_only_seen.saturating_add(1);
+                if captured_live_only_seen.is_power_of_two() {
+                    warn!(
+                        code = ErrorCode::WsGapConnectionState.code_str(),
+                        endpoint = supervisor.slot().endpoint.as_str(),
+                        pool_index = supervisor.slot().pool_index,
+                        degraded_on_this_socket = *captured_live_only_seen,
+                        "write-ahead log refused a Dhan frame but the ring accepted \
+                         it — the frame IS folded into the database this session and \
+                         is NOT replayable, so only a crash before the next flush \
+                         loses it"
+                    );
+                }
+            }
+            if outcome == FrameSinkOutcome::RingFull {
+                // 2026-08-11: this outcome used to bump a counter
+                // and produce NO log line at all.
+                //
+                // The counter's documentation calls a full ring
+                // "not capture loss — the consumer is behind",
+                // and for a brief burst that is fair: the frame is
+                // already in the WAL. But nothing re-folds WAL
+                // frames into the database, so in practice a full
+                // ring means those ticks and candles never arrive
+                // — while the lane's health gauge still reads 1.
+                // Silent permanent loss behind a green light is
+                // exactly the class the charter forbids.
+                //
+                // Throttled by powers of two rather than rate-
+                // limited: the first occurrence is always
+                // reported, and a sustained storm degrades to a
+                // handful of lines instead of one per frame. A
+                // slow consumer must not be able to drown the log
+                // it is being reported in.
+                *ring_full_seen = ring_full_seen.saturating_add(1);
+                if ring_full_seen.is_power_of_two() {
+                    error!(
+                        code = ErrorCode::WsGapConnectionState.code_str(),
+                        endpoint = supervisor.slot().endpoint.as_str(),
+                        pool_index = supervisor.slot().pool_index,
+                        dropped_on_this_socket = *ring_full_seen,
+                        "the frame ring is FULL — the fold cannot keep up, so this \
+                         frame is not being turned into ticks or candles NOW. It IS \
+                         in the write-ahead log and the next boot re-folds it, so \
+                         the tick ROWS come back; what does not come back is their \
+                         CANDLE contribution, because by then the tick is outside \
+                         the aggregating session and only the row is written. Treat \
+                         this as lost candles, not lost ticks. Logged at \
+                         1, 2, 4, 8 ... occurrences per socket to bound the noise."
+                    );
+                }
+            }
+        }
+        SocketEvent::Closed { code } => {
+            action = supervisor.on_event(ConnEvent::Disconnected { code }, Instant::now());
         }
     }
     action
@@ -8432,14 +8912,14 @@ mod tests {
             async fn connect(&mut self) -> Result<(), SocketFailure> {
                 Err(SocketFailure)
             }
-            async fn send_subscribe(
-                &mut self,
-                _batch: &[SubscribeInstrument],
-            ) -> Result<(), SocketFailure> {
-                Err(SocketFailure)
+            fn write_generation(&self) -> u64 {
+                0
             }
-            async fn send_ping(&mut self) -> Result<(), SocketFailure> {
-                Err(SocketFailure)
+            fn send_subscribe(&mut self, _batch: &[SubscribeInstrument]) -> WriteTicket {
+                WriteTicket::resolved(0, Err(SocketFailure))
+            }
+            fn send_ping(&mut self) -> WriteTicket {
+                WriteTicket::resolved(0, Err(SocketFailure))
             }
             async fn recv(&mut self) -> SocketEvent {
                 SocketEvent::Closed { code: None }
@@ -9006,6 +9486,55 @@ mod tests {
         /// no real wall time -- which is the only reason a 40-message top-up
         /// against a 900 ms socket is testable at all.
         subscribe_delay: Option<Duration>,
+        /// How long `recv` waits before handing out its next scripted event.
+        /// The wait comes BEFORE the pop, so a `recv` cancelled mid-wait (the
+        /// top-up pacing gap timing out) consumes nothing — the same
+        /// cancel-safety the production read relies on.
+        recv_delay: Option<Duration>,
+        /// Subscribes and delivered socket events, interleaved in the order
+        /// they happened, so a test can see WHEN the reader ran relative to
+        /// the writes. Separate from `wire_calls` so the existing wire-order
+        /// assertions stay exactly as they were.
+        timeline: Vec<&'static str>,
+        /// How long each `send_unsubscribe` takes on the wire (plan item
+        /// 44f): the write is answered by a spawned task after this long, so
+        /// the reader keeps running meanwhile — the production shape.
+        unsubscribe_delay: Option<Duration>,
+        /// The connection generation `write_generation` reports.
+        write_generation: u64,
+        /// When set, a DELAYED write bumps `write_generation` just before it
+        /// answers — the shape of an answer arriving from a connection that
+        /// has since been replaced.
+        bump_generation_before_answer: bool,
+        /// Frames delivered so far, and — for every delayed write — the
+        /// frame count at the instant it answered. The difference between a
+        /// write's submit-time and answer-time count is the number of frames
+        /// the reader processed DURING that write.
+        frames_seen: usize,
+        write_answers: Vec<(&'static str, usize)>,
+        /// Frame count at each delayed write's SUBMISSION.
+        write_submits: Vec<(&'static str, usize)>,
+        /// When the script is exhausted, `recv` waits forever instead of
+        /// handing out the parking terminator. For tests that exercise a
+        /// write path and must not be ended by the reader.
+        idle_when_exhausted: bool,
+        /// Per scripted event, the subscribe count it waits for before it is
+        /// handed out (front pairs with the front of `recv_events`; an event
+        /// with no entry is ungated). Since plan item 44f the replay and the
+        /// top-up READ the socket during their writes, so a script meant to
+        /// arrive "after the replay" must say so instead of relying on the
+        /// reader being deaf while it writes.
+        recv_after_subscribes: VecDeque<usize>,
+        /// The parking terminator is withheld until this many subscribes
+        /// have been submitted AND `terminator_not_before` has passed.
+        terminator_after_subscribes: usize,
+        terminator_not_before: Option<tokio::time::Instant>,
+        /// Every security id handed to `send_subscribe`, in order — what the
+        /// socket was asked to carry, replay included.
+        subscribed_ids: Vec<u64>,
+        /// Submits (`kind>`) and answers (`<kind`) of DELAYED writes in the
+        /// order they happened, so a test can prove two writes never overlap.
+        write_log: Vec<&'static str>,
     }
 
     struct FakeSocket {
@@ -9029,71 +9558,117 @@ mod tests {
             }
         }
 
-        fn send_unsubscribe(
-            &mut self,
-            _batch: &[SubscribeInstrument],
-        ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send {
-            let state = std::sync::Arc::clone(&self.state);
-            async move {
-                let ok = match state.lock() {
-                    Ok(mut s) => {
-                        s.unsubscribes += 1;
-                        s.wire_calls.push("unsubscribe");
-                        s.unsubscribe_results.pop_front().unwrap_or(true)
-                    }
-                    Err(_) => true,
-                };
-                if ok { Ok(()) } else { Err(SocketFailure) }
-            }
+        fn write_generation(&self) -> u64 {
+            self.state.lock().map(|s| s.write_generation).unwrap_or(0)
         }
 
-        fn send_ping(
-            &mut self,
-        ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send {
-            let state = std::sync::Arc::clone(&self.state);
-            async move {
-                if let Ok(mut s) = state.lock() {
+        fn send_unsubscribe(&mut self, _batch: &[SubscribeInstrument]) -> WriteTicket {
+            let (ok, delay) = match self.state.lock() {
+                Ok(mut s) => {
+                    s.unsubscribes += 1;
+                    s.wire_calls.push("unsubscribe");
+                    (
+                        s.unsubscribe_results.pop_front().unwrap_or(true),
+                        s.unsubscribe_delay,
+                    )
+                }
+                Err(_) => (true, None),
+            };
+            fake_write(&self.state, "unsubscribe", ok, delay)
+        }
+
+        fn send_ping(&mut self) -> WriteTicket {
+            let generation = match self.state.lock() {
+                Ok(mut s) => {
                     s.pings += 1;
+                    s.write_generation
                 }
-                Ok(())
-            }
+                Err(_) => 0,
+            };
+            WriteTicket::resolved(generation, Ok(()))
         }
 
-        fn send_subscribe(
-            &mut self,
-            _batch: &[SubscribeInstrument],
-        ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send {
-            let state = std::sync::Arc::clone(&self.state);
-            async move {
-                let (ok, delay) = match state.lock() {
-                    Ok(mut s) => {
-                        s.subscribes += 1;
-                        s.wire_calls.push("subscribe");
-                        (
-                            s.subscribe_results.pop_front().unwrap_or(true),
-                            s.subscribe_delay,
-                        )
-                    }
-                    Err(_) => (true, None),
-                };
-                if let Some(d) = delay {
-                    tokio::time::sleep(d).await;
+        fn send_subscribe(&mut self, batch: &[SubscribeInstrument]) -> WriteTicket {
+            let (ok, delay) = match self.state.lock() {
+                Ok(mut s) => {
+                    s.subscribes += 1;
+                    s.subscribed_ids.extend(batch.iter().map(|i| i.security_id));
+                    s.wire_calls.push("subscribe");
+                    s.timeline.push("subscribe");
+                    (
+                        s.subscribe_results.pop_front().unwrap_or(true),
+                        s.subscribe_delay,
+                    )
                 }
-                if ok { Ok(()) } else { Err(SocketFailure) }
-            }
+                Err(_) => (true, None),
+            };
+            fake_write(&self.state, "subscribe", ok, delay)
         }
 
         fn recv(&mut self) -> impl std::future::Future<Output = SocketEvent> + Send {
             let state = std::sync::Arc::clone(&self.state);
             async move {
+                let delay = state.lock().ok().and_then(|s| s.recv_delay);
+                if let Some(d) = delay {
+                    tokio::time::sleep(d).await;
+                }
+                let idle = state
+                    .lock()
+                    .map(|s| s.recv_events.is_empty() && s.idle_when_exhausted)
+                    .unwrap_or(false);
+                if idle {
+                    std::future::pending::<()>().await;
+                }
+                // Gates: nothing is popped until the gate opens, so a `recv`
+                // cancelled while gated consumes nothing (cancel-safe).
+                loop {
+                    let (subscribe_gate_open, not_before) = match state.lock() {
+                        Ok(s) => {
+                            if s.recv_events.is_empty() {
+                                (
+                                    s.subscribes >= s.terminator_after_subscribes,
+                                    s.terminator_not_before,
+                                )
+                            } else {
+                                let gate = s.recv_after_subscribes.front().copied().unwrap_or(0);
+                                (s.subscribes >= gate, None)
+                            }
+                        }
+                        Err(_) => (true, None),
+                    };
+                    if let Some(t) = not_before
+                        && tokio::time::Instant::now() < t
+                    {
+                        tokio::time::sleep_until(t).await;
+                        continue;
+                    }
+                    if subscribe_gate_open {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
                 match state.lock() {
-                    Ok(mut s) => s.recv_events.pop_front().unwrap_or(
-                        // Terminator: a fatal code parks the loop, so an
-                        // exhausted script ends the test instead of hanging.
-                        SocketEvent::Closed {
-                            code: Some(DisconnectCode::AuthenticationFailed),
-                        },
-                    ),
+                    Ok(mut s) => {
+                        if !s.recv_events.is_empty() {
+                            let _ = s.recv_after_subscribes.pop_front();
+                        }
+                        let event = s.recv_events.pop_front().unwrap_or(
+                            // Terminator: a fatal code parks the loop, so an
+                            // exhausted script ends the test instead of hanging.
+                            SocketEvent::Closed {
+                                code: Some(DisconnectCode::AuthenticationFailed),
+                            },
+                        );
+                        if matches!(event, SocketEvent::Frame(_)) {
+                            s.frames_seen += 1;
+                        }
+                        s.timeline.push(match event {
+                            SocketEvent::Frame(_) => "frame",
+                            SocketEvent::KeepAlive => "keepalive",
+                            SocketEvent::Closed { .. } => "closed",
+                        });
+                        event
+                    }
                     Err(_) => SocketEvent::Closed {
                         code: Some(DisconnectCode::AuthenticationFailed),
                     },
@@ -9116,6 +9691,77 @@ mod tests {
             state: std::sync::Arc::clone(state),
         }
     }
+
+    /// Answers one fake write. Without a delay the ticket is answered at
+    /// submit time — the old inline behaviour, so every test that never set
+    /// a delay is unchanged. With one, a spawned task answers after the delay
+    /// while the caller keeps reading: the writer-task shape of production.
+    fn fake_write(
+        state: &std::sync::Arc<Mutex<FakeState>>,
+        kind: &'static str,
+        ok: bool,
+        delay: Option<Duration>,
+    ) -> WriteTicket {
+        let outcome = if ok { Ok(()) } else { Err(SocketFailure) };
+        let generation = match state.lock() {
+            Ok(mut s) => {
+                if delay.is_some() {
+                    let seen = s.frames_seen;
+                    s.write_submits.push((kind, seen));
+                    s.write_log.push(match kind {
+                        "subscribe" => "subscribe>",
+                        _ => "unsubscribe>",
+                    });
+                }
+                s.write_generation
+            }
+            Err(_) => 0,
+        };
+        let Some(delay) = delay else {
+            return WriteTicket::resolved(generation, outcome);
+        };
+        let (ticket, reply) = WriteTicket::pending(generation);
+        let state = std::sync::Arc::clone(state);
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            if let Ok(mut s) = state.lock() {
+                if s.bump_generation_before_answer {
+                    s.write_generation += 1;
+                }
+                let seen = s.frames_seen;
+                s.write_answers.push((kind, seen));
+                s.write_log.push(match kind {
+                    "subscribe" => "<subscribe",
+                    _ => "<unsubscribe",
+                });
+            }
+            reply.send(outcome);
+        });
+        ticket
+    }
+
+    /// Runs the replay dispatch against a fresh supervisor and sink — the
+    /// shape every dispatch test needs now that the replay READS the socket
+    /// between and during its writes (plan item 44f).
+    async fn dispatch_for_test<S: DhanFeedSocket>(
+        sock: &mut S,
+        guard: &SubscribeGuard,
+    ) -> SubscribeDispatch {
+        let mut supervisor = sup(DhanEndpointType::MainFeed, 0, t0());
+        let sink = RecordingSink::default();
+        let mut throttle = DrainThrottle::default();
+        dispatch_subscribe(
+            sock,
+            &mut supervisor,
+            &sink,
+            &mut throttle,
+            guard,
+            DhanEndpointType::MainFeed,
+            0,
+        )
+        .await
+        .0
+    }
     // -- subscribe dispatch pacing (WS-GAP-02) ------------------------------
 
     /// The defect: batches went out back to back with no spacing, and a
@@ -9125,14 +9771,17 @@ mod tests {
     /// Pacing is between messages, so `n` batches cost `n - 1` intervals.
     #[tokio::test(start_paused = true)]
     async fn subscribe_batches_are_paced_by_the_named_interval() {
-        let st = std::sync::Arc::new(Mutex::new(FakeState::default()));
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            idle_when_exhausted: true,
+            ..FakeState::default()
+        }));
         let mut sock = fake(&st);
         // 250 main-feed instruments = 3 messages at the documented 100/message.
         let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, (0..250).map(si).collect())
             .unwrap();
         assert_eq!(guard.batch_count(), 3, "documented 100 instruments/message");
 
-        let out = dispatch_subscribe(&mut sock, &guard, DhanEndpointType::MainFeed, 0).await;
+        let out = dispatch_for_test(&mut sock, &guard).await;
 
         assert_eq!(out.batches_sent, 3);
         assert_eq!(out.instruments_sent, 250);
@@ -9151,12 +9800,15 @@ mod tests {
     /// message to be polite to, and the deadline is waiting on it.
     #[tokio::test(start_paused = true)]
     async fn a_single_batch_dispatch_pays_no_pacing_cost() {
-        let st = std::sync::Arc::new(Mutex::new(FakeState::default()));
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            idle_when_exhausted: true,
+            ..FakeState::default()
+        }));
         let mut sock = fake(&st);
         let guard =
             SubscribeGuard::try_new(DhanEndpointType::MainFeed, (0..40).map(si).collect()).unwrap();
 
-        let out = dispatch_subscribe(&mut sock, &guard, DhanEndpointType::MainFeed, 0).await;
+        let out = dispatch_for_test(&mut sock, &guard).await;
 
         assert_eq!(out.batches_sent, 1);
         assert_eq!(out.elapsed, Duration::ZERO);
@@ -9167,11 +9819,14 @@ mod tests {
     /// instruments, would park itself on every connect.
     #[tokio::test(start_paused = true)]
     async fn an_empty_set_is_a_no_op_not_an_early_stop() {
-        let st = std::sync::Arc::new(Mutex::new(FakeState::default()));
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            idle_when_exhausted: true,
+            ..FakeState::default()
+        }));
         let mut sock = fake(&st);
         let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, Vec::new()).unwrap();
 
-        let out = dispatch_subscribe(&mut sock, &guard, DhanEndpointType::MainFeed, 0).await;
+        let out = dispatch_for_test(&mut sock, &guard).await;
 
         assert!(!out.stopped_early());
         assert_eq!(out.batches_total, 0);
@@ -9186,6 +9841,7 @@ mod tests {
     async fn a_mid_loop_send_failure_counts_the_undispatched_tail() {
         let st = std::sync::Arc::new(Mutex::new(FakeState {
             // batch 1 ok, batch 2 fails; batch 3 must never be attempted.
+            idle_when_exhausted: true,
             subscribe_results: VecDeque::from(vec![true, false]),
             ..FakeState::default()
         }));
@@ -9193,7 +9849,7 @@ mod tests {
         let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, (0..250).map(si).collect())
             .unwrap();
 
-        let out = dispatch_subscribe(&mut sock, &guard, DhanEndpointType::MainFeed, 0).await;
+        let out = dispatch_for_test(&mut sock, &guard).await;
 
         assert!(out.stopped_early(), "a short write must be reported");
         assert_eq!(out.batches_sent, 1);
@@ -9216,6 +9872,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_early_stop_leaves_the_guard_unconfirmed_for_a_whole_replay() {
         let st = std::sync::Arc::new(Mutex::new(FakeState {
+            idle_when_exhausted: true,
             subscribe_results: VecDeque::from(vec![false]),
             ..FakeState::default()
         }));
@@ -9224,7 +9881,7 @@ mod tests {
             SubscribeGuard::try_new(DhanEndpointType::MainFeed, (0..250).map(si).collect())
                 .unwrap();
 
-        let out = dispatch_subscribe(&mut sock, &guard, DhanEndpointType::MainFeed, 0).await;
+        let out = dispatch_for_test(&mut sock, &guard).await;
         // Mirrors the caller: `mark_confirmed` is reached only on a full send.
         if !out.stopped_early() {
             guard.mark_confirmed();
@@ -9308,6 +9965,11 @@ mod tests {
                 SocketEvent::Frame(Bytes::from_static(b"bbbbbbbb")),
                 SocketEvent::Frame(Bytes::from_static(b"cccccccc")),
             ]),
+            // The replay reads the socket while it writes (plan item 44f);
+            // hold the frames until all three batches are out so the
+            // terminator cannot end the replay part-way.
+            recv_after_subscribes: VecDeque::from(vec![3, 3, 3]),
+            terminator_after_subscribes: 3,
             ..FakeState::default()
         }));
         let sink = std::sync::Arc::new(RecordingSink::default());
@@ -9331,12 +9993,12 @@ mod tests {
         assert_eq!(s.subscribes, 3, "250 instruments = three 100-cap messages");
     }
 
-    /// The whole ATM +/- 25 mechanism, end to end through the real drain loop.
-    ///
-    /// A live socket carrying 250 instruments is topped up with 150 more, and
-    /// the assertion that matters is the SUBSCRIBE COUNT: 3 messages for the
-    /// initial 250, then exactly 2 for the 150 added — never 5, which is what
-    /// re-sending the whole set would produce and what Dhan answers with 804.
+    // The whole ATM +/- 25 mechanism, end to end through the real drain loop.
+    //
+    // A live socket carrying 250 instruments is topped up with 150 more, and
+    // the assertion that matters is the SUBSCRIBE COUNT: 3 messages for the
+    // initial 250, then exactly 2 for the 150 added — never 5, which is what
+    // re-sending the whole set would produce and what Dhan answers with 804.
     // ------------------------------------------------------------------
     // Swap over the live command channel (2026-08-26). The pure guard logic
     // is tested above; these pin the WIRE behaviour, which is where the
@@ -9836,74 +10498,76 @@ mod tests {
     async fn a_socket_that_never_answers_costs_the_drain_two_seconds_not_twenty() {
         struct HangingSocket {
             state: std::sync::Arc<Mutex<FakeState>>,
+            /// Replies to hung unsubscribes, held so their tickets never
+            /// resolve (dropping one would answer "failed" at once).
+            hung: Vec<WriteReply>,
         }
         impl DhanFeedSocket for HangingSocket {
             fn connect(
                 &mut self,
             ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send {
-                async { Ok(()) }
-            }
-            fn send_subscribe(
-                &mut self,
-                _batch: &[SubscribeInstrument],
-            ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send {
-                let state = std::sync::Arc::clone(&self.state);
-                async move {
-                    let first = match state.lock() {
-                        Ok(mut s) => {
-                            s.subscribes += 1;
-                            s.wire_calls.push("subscribe");
-                            s.subscribes == 1
-                        }
-                        Err(_) => true,
-                    };
-                    // Every subscribe answers. Since 2026-09-01 a timed-out
-                    // unsubscribe forces a REDIAL, and the redial replays the
-                    // guard through this same method; hanging it would only
-                    // test the fake. The hang this test exercises is the
-                    // unsubscribe below.
-                    let _ = first;
-                    Ok(())
-                }
-            }
-            fn send_unsubscribe(
-                &mut self,
-                _batch: &[SubscribeInstrument],
-            ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send {
                 let state = std::sync::Arc::clone(&self.state);
                 async move {
                     if let Ok(mut s) = state.lock() {
-                        s.unsubscribes += 1;
-                        s.wire_calls.push("unsubscribe");
+                        s.connects += 1;
                     }
-                    std::future::pending::<()>().await;
-                    unreachable!()
+                    Ok(())
                 }
             }
+            fn write_generation(&self) -> u64 {
+                0
+            }
+            fn send_subscribe(&mut self, _batch: &[SubscribeInstrument]) -> WriteTicket {
+                // Every subscribe answers. Since 2026-09-01 a timed-out
+                // unsubscribe forces a REDIAL, and the redial replays the
+                // guard through this same method; hanging it would only
+                // test the fake. The hang this test exercises is the
+                // unsubscribe below.
+                if let Ok(mut s) = self.state.lock() {
+                    s.subscribes += 1;
+                    s.wire_calls.push("subscribe");
+                }
+                WriteTicket::resolved(0, Ok(()))
+            }
+            fn send_unsubscribe(&mut self, _batch: &[SubscribeInstrument]) -> WriteTicket {
+                if let Ok(mut s) = self.state.lock() {
+                    s.unsubscribes += 1;
+                    s.wire_calls.push("unsubscribe");
+                }
+                let (ticket, reply) = WriteTicket::pending(0);
+                self.hung.push(reply);
+                ticket
+            }
             /// This fake exists to HANG a swap, not to exercise keepalive.
-            /// Answering immediately keeps it that way: a pending ping here
-            /// would stall the supervisor for a reason the test is not about,
-            /// and the resulting failure would point at the wrong thing.
-            fn send_ping(
-                &mut self,
-            ) -> impl std::future::Future<Output = Result<(), SocketFailure>> + Send {
-                async { Ok(()) }
+            /// Answering immediately keeps it that way.
+            fn send_ping(&mut self) -> WriteTicket {
+                WriteTicket::resolved(0, Ok(()))
             }
             fn recv(&mut self) -> impl std::future::Future<Output = SocketEvent> + Send {
                 let state = std::sync::Arc::clone(&self.state);
                 async move {
-                    let next = match state.lock() {
-                        Ok(mut s) => s.recv_events.pop_front(),
-                        Err(_) => None,
+                    let (next, first_connection) = match state.lock() {
+                        Ok(mut s) => (s.recv_events.pop_front(), s.connects <= 1),
+                        Err(_) => (None, false),
                     };
-                    next.unwrap_or(SocketEvent::Closed {
-                        code: Some(DisconnectCode::AuthenticationFailed),
-                    })
+                    match next {
+                        Some(event) => event,
+                        // On the FIRST connection the peer goes quiet rather
+                        // than closing: since plan item 44f the reader keeps
+                        // polling during the hung write, and a close read
+                        // there would end the write for a different reason
+                        // than the one under test — the budget.
+                        None if first_connection => {
+                            std::future::pending::<()>().await;
+                            SocketEvent::KeepAlive
+                        }
+                        None => SocketEvent::Closed {
+                            code: Some(DisconnectCode::AuthenticationFailed),
+                        },
+                    }
                 }
             }
-            fn close(&mut self) -> impl std::future::Future<Output = ()> + Send {
-                async {}
-            }
+            async fn close(&mut self) {}
         }
 
         let st = std::sync::Arc::new(Mutex::new(FakeState {
@@ -9927,6 +10591,7 @@ mod tests {
         let _ = run_connection_with_commands(
             HangingSocket {
                 state: std::sync::Arc::clone(&st),
+                hung: Vec::new(),
             },
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
@@ -9960,6 +10625,332 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // Plan item 44f (2026-09-22): the reader keeps polling `recv()` while a
+    // wire write is in flight. Every test below drives a DELAYED write — the
+    // fake answers it from a spawned task, the production writer-task shape —
+    // and asserts what the reader did in the meantime.
+    // ------------------------------------------------------------------
+
+    /// THE property. A subscribe held on the wire for two seconds, while 100
+    /// frames arrive: every one is processed DURING the write, not after it.
+    /// Before the split the reader was off `recv()` for the whole write, and
+    /// the frame count at the write's answer would have been zero.
+    #[tokio::test(start_paused = true)]
+    async fn every_frame_is_read_while_a_write_is_blocked_for_two_seconds() {
+        let frames: VecDeque<SocketEvent> = (0..100)
+            .map(|_| SocketEvent::Frame(Bytes::from_static(b"aaaaaaaa")))
+            .collect();
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: frames,
+            // 100 frames x 10 ms = 1 s of traffic, all inside the 2 s write.
+            recv_delay: Some(Duration::from_millis(10)),
+            subscribe_delay: Some(Duration::from_secs(2)),
+            terminator_not_before: Some(tokio::time::Instant::now() + Duration::from_secs(5)),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(1))
+            .expect("inside cap");
+
+        let exit = run_connection(
+            fake(&st),
+            sup(DhanEndpointType::MainFeed, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+        )
+        .await;
+
+        assert_eq!(exit, ConnectionExit::Parked(ParkReason::FatalDisconnect));
+        let s = st.lock().expect("fake state");
+        assert_eq!(s.write_submits, vec![("subscribe", 0)]);
+        assert_eq!(
+            s.write_answers,
+            vec![("subscribe", 100)],
+            "all 100 frames must be processed while the write is still on the wire"
+        );
+        assert_eq!(sink.accepted.lock().map(|g| g.len()).unwrap_or(0), 100);
+        assert_eq!(s.connects, 1, "a slow write is not a reason to re-dial");
+    }
+
+    /// The socket closes while a swap's unsubscribe is blocked on the wire.
+    /// The close is read DURING the write, the write resolves as a failure
+    /// without waiting out its budget, and the socket re-dials. A failed
+    /// write is a refusal, so the guard is reverted and the replay names the
+    /// instrument the socket was carrying.
+    #[tokio::test(start_paused = true)]
+    async fn a_socket_that_closes_under_a_blocked_write_fails_it_and_redials() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: VecDeque::from(vec![SocketEvent::Closed { code: None }]),
+            recv_after_subscribes: VecDeque::from(vec![1]),
+            recv_delay: Some(Duration::from_millis(300)),
+            // The unsubscribe would answer only after 5 s — far past both
+            // the close and the 1 s budget.
+            unsubscribe_delay: Some(Duration::from_secs(5)),
+            terminator_after_subscribes: 2,
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(LiveSubscriptionCommand::Swap {
+            old: si(1),
+            new: si(2),
+            ack: Some(ack_tx),
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let started = tokio::time::Instant::now();
+        let _ = run_connection_with_commands(
+            fake(&st),
+            sup(DhanEndpointType::Depth200, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        // The whole run — close, reconnect backoff, replay — finishes before
+        // the 5 s write could have answered.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the close must end the wait, not the write: took {:?}",
+            started.elapsed()
+        );
+        // REVERTED, not EMPTIED: the wait ended as a failed write (the
+        // close), not as an elapsed budget — a timeout is never reverted.
+        assert_eq!(
+            ack_rx.try_recv().ok(),
+            Some(SwapOutcome::NotHeld {
+                reason: SwapOutcome::REASON_WIRE_FAILED_REVERTED
+            })
+        );
+        let s = st.lock().expect("fake state");
+        assert!(
+            s.write_answers.is_empty(),
+            "the write never answered — the socket's close decided it"
+        );
+        assert_eq!(
+            s.connects, 2,
+            "the close read during the write must re-dial"
+        );
+        assert_eq!(
+            s.wire_calls,
+            vec!["subscribe", "unsubscribe", "subscribe"],
+            "no subscribe for the new instrument on the closed socket; the third \
+             call is the reconnect replay"
+        );
+        assert_eq!(
+            s.subscribed_ids,
+            vec![1, 1],
+            "the replay carries the reverted guard"
+        );
+    }
+
+    /// An answer stamped by a connection that has since been replaced must
+    /// not be believed. The fake reports SUCCESS here; the drain must treat
+    /// it as a write that did not land on this connection.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_answer_from_a_replaced_connection_is_ignored() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            unsubscribe_results: VecDeque::from(vec![true]),
+            unsubscribe_delay: Some(Duration::from_millis(200)),
+            bump_generation_before_answer: true,
+            terminator_not_before: Some(tokio::time::Instant::now() + Duration::from_secs(2)),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(LiveSubscriptionCommand::Swap {
+            old: si(1),
+            new: si(2),
+            ack: Some(ack_tx),
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let _ = run_connection_with_commands(
+            fake(&st),
+            sup(DhanEndpointType::Depth200, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        let s = st.lock().expect("fake state");
+        assert_eq!(
+            s.write_answers.len(),
+            1,
+            "the answer DID arrive — it must be the generation that rejects it"
+        );
+        assert_eq!(
+            ack_rx.try_recv().ok(),
+            Some(SwapOutcome::NotHeld {
+                reason: SwapOutcome::REASON_WIRE_FAILED_REVERTED
+            }),
+            "a success from an old connection proves nothing about this one"
+        );
+        assert_eq!(
+            s.wire_calls,
+            vec!["subscribe", "unsubscribe"],
+            "the swap's subscribe must not follow a stale answer"
+        );
+    }
+
+    /// Refused → the guard is reverted. Timed out → it is NOT: the frame may
+    /// have landed, and the guard naming the NEW instrument is what makes the
+    /// redial land the chosen strike. The replay's instrument ids are the
+    /// guard, read back through the wire.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_write_reverts_the_guard_and_a_timed_out_one_does_not() {
+        async fn swap_once(state: FakeState) -> (Option<SwapOutcome>, Vec<u64>, usize) {
+            let st = std::sync::Arc::new(Mutex::new(state));
+            let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+                .expect("one instrument");
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
+            tx.send(LiveSubscriptionCommand::Swap {
+                old: si(1),
+                new: si(2),
+                ack: Some(ack_tx),
+            })
+            .await
+            .expect("channel open");
+            drop(tx);
+            let _ = run_connection_with_commands(
+                fake(&st),
+                sup(DhanEndpointType::Depth200, 0, t0()),
+                guard,
+                std::sync::Arc::new(RecordingSink::default()),
+                || async {},
+                Some(rx),
+            )
+            .await;
+            let s = st.lock().expect("fake state");
+            (ack_rx.try_recv().ok(), s.subscribed_ids.clone(), s.connects)
+        }
+
+        // REFUSED: the wire answers with an error inside the budget.
+        let (ack, ids, connects) = swap_once(FakeState {
+            unsubscribe_results: VecDeque::from(vec![false]),
+            unsubscribe_delay: Some(Duration::from_millis(200)),
+            terminator_not_before: Some(tokio::time::Instant::now() + Duration::from_secs(2)),
+            ..FakeState::default()
+        })
+        .await;
+        assert_eq!(
+            ack,
+            Some(SwapOutcome::NotHeld {
+                reason: SwapOutcome::REASON_WIRE_FAILED_REVERTED
+            }),
+            "a refused unsubscribe must put the guard back"
+        );
+        assert_eq!(ids, vec![1], "no subscribe for the new instrument");
+        assert_eq!(
+            connects, 1,
+            "a refusal leaves the socket delivering its old strike"
+        );
+
+        // TIMED OUT: the write is still on the wire when the budget runs out.
+        let (ack, ids, connects) = swap_once(FakeState {
+            unsubscribe_delay: Some(Duration::from_secs(5)),
+            terminator_after_subscribes: 2,
+            ..FakeState::default()
+        })
+        .await;
+        assert_eq!(
+            ack,
+            Some(SwapOutcome::NotHeld {
+                reason: SwapOutcome::REASON_EMPTIED
+            })
+        );
+        assert_eq!(
+            connects, 2,
+            "a timed-out unsubscribe may have landed: re-dial"
+        );
+        assert_eq!(
+            ids,
+            vec![1, 2],
+            "the replay must carry the NEW instrument — a timeout is never reverted"
+        );
+    }
+
+    /// One write in flight at a time. Two swaps queued back to back: the
+    /// second's unsubscribe is not submitted until the first swap's subscribe
+    /// has ANSWERED.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_swap_waits_for_the_first_to_finish_on_the_wire() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            subscribe_delay: Some(Duration::from_millis(300)),
+            unsubscribe_delay: Some(Duration::from_millis(300)),
+            terminator_not_before: Some(tokio::time::Instant::now() + Duration::from_secs(5)),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let (ack1_tx, mut ack1_rx) = tokio::sync::oneshot::channel();
+        let (ack2_tx, mut ack2_rx) = tokio::sync::oneshot::channel();
+        tx.send(LiveSubscriptionCommand::Swap {
+            old: si(1),
+            new: si(2),
+            ack: Some(ack1_tx),
+        })
+        .await
+        .expect("channel open");
+        tx.send(LiveSubscriptionCommand::Swap {
+            old: si(2),
+            new: si(3),
+            ack: Some(ack2_tx),
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let _ = run_connection_with_commands(
+            fake(&st),
+            sup(DhanEndpointType::Depth200, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        assert_eq!(ack1_rx.try_recv().ok(), Some(SwapOutcome::Held));
+        assert_eq!(ack2_rx.try_recv().ok(), Some(SwapOutcome::Held));
+        let s = st.lock().expect("fake state");
+        assert_eq!(
+            s.write_log,
+            vec![
+                "subscribe>",
+                "<subscribe",
+                "unsubscribe>",
+                "<unsubscribe",
+                "subscribe>",
+                "<subscribe",
+                "unsubscribe>",
+                "<unsubscribe",
+                "subscribe>",
+                "<subscribe",
+            ],
+            "every write must answer before the next is submitted"
+        );
+        assert_eq!(s.subscribed_ids, vec![1, 2, 3]);
+    }
     /// Frames must keep flowing while a swap is processed. The command block
     /// runs before the select rather than as an arm of it precisely so it
     /// cannot be starved — but it must not starve the socket either.
@@ -10006,6 +10997,11 @@ mod tests {
                 SocketEvent::Frame(Bytes::from_static(b"aaaaaaaa")),
                 SocketEvent::Frame(Bytes::from_static(b"bbbbbbbb")),
             ]),
+            // Slower than a 25 ms pacing gap, so the top-up's gap reads time out
+            // and consume nothing: this test is about the DELTA size and the
+            // absent re-dial, and an always-ready script would otherwise be
+            // drained (terminator included) inside the first gap.
+            recv_delay: Some(Duration::from_millis(100)),
             ..FakeState::default()
         }));
         let sink = std::sync::Arc::new(RecordingSink::default());
@@ -10080,6 +11076,15 @@ mod tests {
             // Slow but NOT slow enough to trip the per-message timeout, so
             // what bites is the whole-top-up budget rather than one bad send.
             subscribe_delay: Some(Duration::from_millis(900)),
+            // As above: keeps the gap reads empty so what stops the top-up is
+            // the budget under test, not the script terminator read in a gap.
+            recv_delay: Some(Duration::from_millis(100)),
+            // The reader now runs during every write (plan item 44f), so the
+            // frame is released only after the replay, and the terminator
+            // only well after the top-up's budget has run out: replay ~2.75 s
+            // + the 5 s budget + one last in-flight send is under 9 s.
+            recv_after_subscribes: VecDeque::from(vec![3]),
+            terminator_not_before: Some(tokio::time::Instant::now() + Duration::from_secs(20)),
             ..FakeState::default()
         }));
         let sink = std::sync::Arc::new(RecordingSink::default());
@@ -10120,6 +11125,207 @@ mod tests {
              drain can be held past Dhan's 40-second close"
         );
         assert_eq!(s.connects, 1, "a bounded top-up must never re-dial");
+    }
+
+    /// Scope lock "2026-09-22 (FOURTH)" item 6: the top-up's pacing gaps READ
+    /// the socket instead of sleeping.
+    ///
+    /// Until 2026-09-22 each gap was a bare 25 ms sleep, so the reader was off
+    /// `recv()` for every batch AND every gap of a top-up. The timeline below
+    /// records subscribes and delivered events in the order they happened; a
+    /// frame must appear between every pair of consecutive top-up batches, and
+    /// every scripted frame must still reach the sink exactly once.
+    #[tokio::test(start_paused = true)]
+    async fn a_top_up_keeps_reading_the_socket_between_its_batches() {
+        let frames: VecDeque<SocketEvent> = (0..100)
+            .map(|_| SocketEvent::Frame(Bytes::from_static(b"aaaaaaaa")))
+            .collect();
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: frames,
+            // Frames trickle in faster than the 25 ms gap, so several land in
+            // each gap; writes are slow but inside the per-message budget.
+            recv_delay: Some(Duration::from_millis(10)),
+            subscribe_delay: Some(Duration::from_millis(200)),
+            // Frames start after the 3-batch replay (the replay reads too,
+            // since plan item 44f, and would otherwise drain the script), and
+            // the terminator waits until well after the top-up's ~0.9 s.
+            recv_after_subscribes: std::iter::repeat_n(3, 100).collect(),
+            terminator_not_before: Some(tokio::time::Instant::now() + Duration::from_secs(5)),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(250))
+            .expect("inside cap");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(LiveSubscriptionCommand::Extend {
+            more: instruments_from(250, 400),
+            ack: Some(ack_tx),
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let exit = run_connection_with_commands(
+            fake(&st),
+            sup(DhanEndpointType::MainFeed, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        assert_eq!(exit, ConnectionExit::Parked(ParkReason::FatalDisconnect));
+        assert_eq!(ack_rx.try_recv().ok(), Some(ExtendOutcome::Held));
+        let s = st.lock().expect("fake state");
+        assert_eq!(
+            s.connects, 1,
+            "reading in the gaps must never cost a re-dial"
+        );
+        assert_eq!(
+            s.subscribes,
+            3 + 4,
+            "3 initial messages + 4 for the 400 added"
+        );
+        let subs: Vec<usize> = s
+            .timeline
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| **e == "subscribe")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(subs.len(), 7);
+        for pair in subs[3..].windows(2) {
+            assert!(
+                s.timeline[pair[0] + 1..pair[1]].contains(&"frame"),
+                "no frame was read between two top-up batches — the pacing gap is \
+                 sleeping instead of reading: {:?}",
+                &s.timeline[pair[0]..=pair[1]]
+            );
+        }
+        assert_eq!(
+            sink.accepted.lock().map(|g| g.len()).unwrap_or(0),
+            100,
+            "every frame reaches the sink exactly once, gap-read or select-read"
+        );
+    }
+
+    /// A `Closed` read inside a pacing gap ENDS the top-up and is acted on.
+    ///
+    /// Two properties. The top-up stops (no more sends to a socket that just
+    /// closed) and acks `Held`, exactly like a failed send: the guard keeps
+    /// the whole set and the reconnect replay delivers it. And the decision is
+    /// NOT swallowed: without the pre-select check, the next `recv()` would
+    /// return the scripted frame, `FrameReceived` answers `Continue`, and the
+    /// re-dial the `Closed` scheduled would never happen.
+    #[tokio::test(start_paused = true)]
+    async fn a_socket_that_closes_inside_a_top_up_gap_stops_it_and_redials() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: VecDeque::from(vec![
+                SocketEvent::Closed { code: None },
+                SocketEvent::Frame(Bytes::from_static(b"aaaaaaaa")),
+            ]),
+            // The Closed lands after the 3-batch replay + ONE top-up batch,
+            // i.e. in the first top-up gap; the frame after the 7-batch
+            // reconnect replay (3 + 1 + 7). Both gates are needed since plan
+            // item 44f: the replay itself now reads the socket.
+            recv_after_subscribes: VecDeque::from(vec![4, 11]),
+            terminator_after_subscribes: 11,
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(250))
+            .expect("inside cap");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(LiveSubscriptionCommand::Extend {
+            more: instruments_from(250, 400),
+            ack: Some(ack_tx),
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let exit = run_connection_with_commands(
+            fake(&st),
+            sup(DhanEndpointType::MainFeed, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        assert_eq!(exit, ConnectionExit::Parked(ParkReason::FatalDisconnect));
+        assert_eq!(
+            ack_rx.try_recv().ok(),
+            Some(ExtendOutcome::Held),
+            "an interrupted top-up leaves the guard whole, so the caller must not re-offer"
+        );
+        let s = st.lock().expect("fake state");
+        assert_eq!(
+            s.connects, 2,
+            "the Closed read in the gap must re-dial — one connect means the decision \
+             was swallowed by the next recv()"
+        );
+        assert_eq!(
+            s.subscribes,
+            3 + 1 + 7,
+            "3 initial + ONE top-up batch before the close + the 650-instrument replay \
+             (7 messages); a top-up that kept sending after Closed shows more"
+        );
+        assert_eq!(sink.accepted.lock().map(|g| g.len()).unwrap_or(0), 1);
+    }
+
+    /// The per-gap cap bounds a socket that is NEVER pending. Under a paused
+    /// clock time cannot advance past the gap while events keep arriving
+    /// ready, so without the cap this test would spin forever inside one gap.
+    #[tokio::test(start_paused = true)]
+    async fn a_never_pending_socket_cannot_hold_a_top_up_inside_one_gap() {
+        let frames: VecDeque<SocketEvent> = (0..(TOPUP_GAP_MAX_EVENTS * 3))
+            .map(|_| SocketEvent::Frame(Bytes::from_static(b"aaaaaaaa")))
+            .collect();
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: frames,
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(250))
+            .expect("inside cap");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(LiveSubscriptionCommand::Extend {
+            more: instruments_from(250, 200),
+            ack: None,
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let _ = run_connection_with_commands(
+            fake(&st),
+            sup(DhanEndpointType::MainFeed, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        let s = st.lock().expect("fake state");
+        assert_eq!(s.subscribes, 3 + 2, "both top-up batches went out");
+        let subs: Vec<usize> = s
+            .timeline
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| **e == "subscribe")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            subs[4] - subs[3] - 1,
+            TOPUP_GAP_MAX_EVENTS,
+            "exactly one cap's worth of events is read in the gap, then the next batch goes"
+        );
     }
 
     /// A guard may only ever SHRINK, and shrinking is what keeps a
@@ -10173,6 +11379,9 @@ mod tests {
     async fn no_command_channel_is_byte_identical_to_before() {
         let st = std::sync::Arc::new(Mutex::new(FakeState {
             recv_events: VecDeque::from(vec![SocketEvent::Frame(Bytes::from_static(b"aaaaaaaa"))]),
+            // Held until the replay is out (the replay reads since 44f).
+            recv_after_subscribes: VecDeque::from(vec![3]),
+            terminator_after_subscribes: 3,
             ..FakeState::default()
         }));
         let sink = std::sync::Arc::new(RecordingSink::default());
@@ -10296,6 +11505,10 @@ mod tests {
     async fn test_run_connection_tears_down_when_a_subscribe_batch_fails() {
         let st = std::sync::Arc::new(Mutex::new(FakeState {
             subscribe_results: VecDeque::from(vec![true, false]),
+            // The terminator waits for the second dial's full replay (2 + 2):
+            // since 44f the replay reads the socket, and an ungated
+            // terminator would park the first dial before its failing batch.
+            terminator_after_subscribes: 4,
             ..FakeState::default()
         }));
         let sink = std::sync::Arc::new(RecordingSink::default());
@@ -10558,24 +11771,58 @@ mod tests {
             );
         }
 
-        // The counters must be per-drain-call locals, so a reconnect restarts
+        // The counters must be per-CONNECTION values, so a reconnect restarts
         // each ladder. A `static` would make the first backed-up socket of the
-        // session silence every later one.
+        // session silence every later one. Since 2026-09-22 (plan item 44f)
+        // they live in `DrainThrottle`, built fresh for every connection
+        // attempt, so the replay's reads and the drain's reads share one
+        // ladder; the per-connection restart is unchanged.
+        let throttle_struct = production
+            .split("struct DrainThrottle {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("DrainThrottle must exist");
         for counter in [
             "ring_full_seen",
             "wal_dropped_seen",
             "captured_live_only_seen",
         ] {
             assert!(
-                production.contains(&format!("let mut {counter}: u64 = 0;")),
-                "{counter} must be a per-drain-call local: a process-wide counter would let \
+                throttle_struct.contains(&format!("{counter}: u64,")),
+                "{counter} must be a DrainThrottle field: a process-wide counter would let \
                  one early storm mute every socket for the rest of the session"
             );
+            assert!(
+                !production.contains(&format!("static {counter}"))
+                    && !production.contains(&format!("static {}", counter.to_uppercase())),
+                "{counter} must never become a static"
+            );
         }
+        assert_eq!(
+            production
+                .matches("let mut throttle = DrainThrottle::default();")
+                .count(),
+            1,
+            "the throttle must be built fresh exactly once per connection attempt"
+        );
+        let per_attempt = production
+            .split("let mut throttle = DrainThrottle::default();")
+            .nth(1)
+            .expect("checked above");
+        assert!(
+            matches!(
+                (per_attempt.find("dispatch_subscribe("), per_attempt.find("fn drain<")),
+                (Some(call), Some(def)) if call < def
+            ),
+            "the fresh throttle must be the one the replay and drain of THIS connection use"
+        );
     }
 
-    /// The swap's outer budget wins, which makes one failure reason VACUOUS —
-    /// and this test exists so nobody cites that reason as evidence again.
+    /// The swap's outer budget wins. Until 2026-09-22 that made one failure
+    /// reason VACUOUS; since the writer task (plan item 44f) keeps a write
+    /// past the swap's budget, the reason is reachable again — see the
+    /// correction in `PoolSupervisor::new`. The ordering this test pins is
+    /// unchanged and still load-bearing.
     ///
     /// `send_unsubscribe` has exactly ONE production call site and it is
     /// wrapped in `tokio::time::timeout(SWAP_WIRE_BUDGET, ..)`. Inside,
@@ -10584,7 +11831,11 @@ mod tests {
     /// always elapses first and the inner future is DROPPED before its timeout
     /// arm can run — so
     /// `tv_dhan_ws_subscribe_failed_total{reason="unsubscribe_timeout"}` can
-    /// never increment from the swap path.
+    /// never increment from the swap path. **(That was the pre-split code. Since
+    /// 44f the writer task owns the write and keeps it past the swap budget,
+    /// so the reason IS reachable — by the swap's stuck write, by probe Arm A,
+    /// and by an unsubscribe-only swap. The paragraph is kept as the record of
+    /// why a 2026-09-11 zero on it proved nothing.)**
     ///
     /// That matters because on 2026-09-11 a two-session read used those four
     /// reasons to exclude "our unsubscribe never reached the wire" as the cause

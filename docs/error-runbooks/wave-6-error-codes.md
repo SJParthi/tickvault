@@ -33,8 +33,8 @@ paths:
 
 **Trigger:** the multi-TF aggregator sealed a candle, attempted to flush
 it via the ring buffer (`SEAL_BUFFER_CAPACITY`), the disk spill
-(`data/spill/seals-YYYYMMDD.bin`) and the NDJSON DLQ
-(`data/dlq/seals-*.ndjson`); ALL three absorbing tiers refused the row.
+(`data/spill/seals_v4-YYYY-MM-DD.bin`) and the NDJSON DLQ
+(`data/dlq/seals_v4-*.ndjson`); ALL three absorbing tiers refused the row.
 This is the only code path that constitutes silent data loss for a
 sealed candle. Severity::Critical.
 
@@ -151,8 +151,9 @@ so it routes through Telegram per `error_level_meta_guard.rs` Rule 5.
 **Triage:**
 1. Counter `tv_shadow_writer_buffered_total{table}` rate — if it
    sustains, QuestDB ILP is degraded; check `BOOT-01`/`BOOT-02`.
-2. Inspect `data/spill/seals-*.bin` size — growing means the ring is
-   filling and disk-spill is engaging.
+2. Inspect `data/spill/seals_v4-*.bin` size — growing means the ring is
+   filling and disk-spill is engaging. (Files named plain `seals-*` are
+   pre-v4 leftovers; the boot drain stages them but refuses their records.)
 
 **Source:** `crates/storage/src/shadow_persistence.rs::ShadowCandleWriter`
 + existing fix at `candle_persistence.rs::flush_buffer` (legacy path).

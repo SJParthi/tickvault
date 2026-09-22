@@ -210,14 +210,18 @@ fn dlq_n(dir: &Path, n: u64) -> Vec<(u64, u8, u32)> {
     keys
 }
 
-/// Count of live (un-staged) `seals-*` files directly in `dir`.
+/// Count of live (un-staged) seal files directly in `dir` - the current
+/// `seals_v4-*` name AND the legacy `seals-*` name the drain still globs.
 fn live_file_count(dir: &Path) -> usize {
     std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
         .filter(|e| e.path().is_file())
-        .filter(|e| e.file_name().to_string_lossy().starts_with("seals-"))
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.starts_with("seals_v4-") || n.starts_with("seals-")
+        })
         .count()
 }
 
