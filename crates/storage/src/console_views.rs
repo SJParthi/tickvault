@@ -398,50 +398,31 @@ pub fn depth_named_view_ddl() -> String {
 ///
 /// | column | is | example |
 /// |---|---|---|
-/// | `delta_units` | units traded in the window (stored) | `3200` |
 /// | `per_lot_quantity` | units per contract (stored) | `200` |
 /// | `total_lots_traded` | whole lots traded in the window (stored) | `16` |
 /// | `volume_percentage_change` | the whole-number rank key (stored) | `1500` |
-/// | `percentage_change` | close vs YESTERDAY's close — equals `candles_<tf>.change_pct` | `-0.62` |
-/// | `open_percentage_change` | close vs TODAY's 09:15 open — equals `candles_<tf>.open_pct` | `1.14` |
-/// | `open` `high` `low` `close` | the candle row's four prices (stored) | — |
-/// | `close_vs_prev_bar_pct` | close vs the PREVIOUS BAR — the comparison the volume's SIGN comes from | `-0.62` |
-/// | `candle_volume` | the fold's own signed volume for this window (stored) | `-3200` |
-/// | `candle_lots` | `candle_volume / per_lot_quantity` — SIGNED, so the minus survives | `-16.0` |
-/// | `candle_volume_chg_pct` | `(abs(candle_lots) - 1) * 100` — the SAME transform as the rank key, on the fold's number | `1500` |
+/// | `percentage_change` | close vs YESTERDAY's close — equals `candles_<tf>.percentage_change` | `-0.62` |
+/// | `open_percentage_change` | close vs TODAY's 09:15 open — equals `candles_<tf>.open_percentage_change` | `1.14` |
+/// | `volume` | the candle's own SIGNED volume for this window (stored) | `-3200` |
+/// | `candle_lots` | `volume / per_lot_quantity` — SIGNED, so the minus survives | `-16.0` |
 ///
-/// # Why `candle_lots` keeps the sign and `candle_volume_chg_pct` does not
+/// ⚠ CORRECTED 2026-09-22. This table and the two sections that followed it
+/// described `delta_units`, `close_vs_prev_bar_pct`, `candle_volume_signed`,
+/// `candle_volume_chg_pct` and three delay columns. None of them is in the
+/// 15-column `top_volume` table any more, and the SELECT below still named
+/// three (`open_latency`, `close_latency`, `window_span`) — so on a fresh
+/// volume every `CREATE OR REPLACE VIEW` here REFUSED and the operator's four
+/// per-cadence faces did not exist at all. The delay columns now live on
+/// `candles_<tf>` only. Pinned by
+/// `every_column_a_view_selects_exists_in_its_base_table`, which reads each
+/// view's `alias.column` references against the table DDL instead of trusting
+/// a hand-kept list.
 ///
-/// The operator asked for two things that pull in opposite directions: the
-/// volume *"precise as it is, evenw ith minus"*, and a volume-percentage
-/// change computed from the candle numbers that he can compare against the
-/// leaderboard's own. Signing BOTH would satisfy the first and destroy the
-/// second — `volume_percentage_change` is built from a non-negative window
-/// delta, so a signed percentage would disagree with it on every DOWN bar for
-/// a reason that has nothing to do with the measurement, and the Monday
-/// cross-verification would read as a mismatch on roughly half the board.
+/// # The derived column, and why it stays derived
 ///
-/// So the split is deliberate and it loses nothing: `candle_lots` carries the
-/// sign (and `candle_volume` carries it in raw units), while the percentage is
-/// taken from the MAGNITUDE and is therefore directly comparable to
-/// `volume_percentage_change` row for row. At `candle_bucket_skew_secs = 0` —
-/// the same instrument, the same window, the same lot size — the two
-/// percentages should agree; where they do not, one of the two volume paths is
-/// wrong, and that is exactly the question these columns exist to answer.
-///
-/// ⚠ The comparison is now coarser in ONE direction and that is stated rather
-/// than buried: `volume_percentage_change` is a whole number, so a row where
-/// the two paths differ by under one percent can no longer show it. The
-/// full-resolution inputs — `delta_units` and `per_lot_quantity` — are stored
-/// beside it, so the exact figure is recoverable by division whenever the
-/// coarse comparison flags a row worth looking at.
-///
-/// # The two derived columns, and why they stay derived
-///
-/// Both are pure arithmetic over `candle_volume_signed` and
-/// `per_lot_quantity`, which ARE stored. Computing them here costs zero ILP
-/// bytes, and a derived column cannot drift from its inputs — so `candle_lots`
-/// can never disagree with the `candle_volume` printed beside it.
+/// `candle_lots` is pure arithmetic over `volume` and `per_lot_quantity`,
+/// both stored. Computing it here costs zero ILP bytes and it can never
+/// disagree with the `volume` printed beside it.
 ///
 /// `CASE WHEN t.per_lot_quantity > 0` rather than a bare division: a zero lot
 /// size is refused upstream (`LegRefusal::MissingLotSize`), so this arm should
@@ -470,18 +451,39 @@ pub fn depth_named_view_ddl() -> String {
 /// its zero means something: `0` is exactly one lot, and a contract that
 /// traded LESS than one lot reads NEGATIVE rather than as a plausible `75%`.
 ///
-/// # Default ordering (2026-09-18 directive)
+/// # Default ordering (2026-09-18 directive) — and what is NOT proven
 ///
-/// The view carries `ORDER BY t.ts DESC, t.volume_percentage_change DESC`, so
-/// a bare `SELECT * FROM top_volume_1s` opens on the newest window with the
-/// biggest volume-percentage change first — the operator's own words:
-/// *"always have the volume percentage change desc for every timeframe of its
-/// respective timestamps"*. `ts` leads because the ordering is stated PER
-/// TIMESTAMP; ordering by the percentage alone would interleave windows.
+/// The operator's words: *"always have the volume percentage change desc for
+/// every timeframe of its respective timestamps"*. The view carries NO
+/// `ORDER BY` (the reasoning is at the `format!` below): rows are expected to
+/// come back `ts ASC, volume_percentage_change DESC` because `ts` is the
+/// designated timestamp and each sweep appends its slice in rank order.
 ///
-/// It sorts the STORED INTEGER, never a float alias. An integer cannot produce
-/// a NaN — the class of comparator defect this repository already records as
-/// corrupting a whole sort rather than misplacing one row.
+/// ⚠ CORRECTED 2026-09-22. This section said the view "carries
+/// `ORDER BY t.ts DESC, t.volume_percentage_change DESC`". It has not since
+/// 2026-09-19, and the within-`ts` half of the order now rests on QuestDB
+/// preserving insertion order among rows that share one timestamp through
+/// WAL apply and DEDUP — which this repository has never observed on a live
+/// table (no QuestDB is reachable from a dev container). It is therefore
+/// UNVERIFIED. The check, on the box, after one session: read rows in scan
+/// order and confirm every run of equal `ts` is non-increasing in
+/// `volume_percentage_change`:
+///
+/// ```text
+/// SELECT ts, volume_percentage_change FROM top_volume_1s
+/// WHERE ts IN today() LIMIT 5000;
+/// ```
+///
+/// A window-function `lag` cannot do this check: ordering BY `ts` inside a
+/// partition of equal `ts` is a tie, so it would compare rows in an order the
+/// query itself chose. An increase inside any one-`ts` run means an explicit
+/// `ORDER BY ts, volume_percentage_change DESC` must come back, whatever it
+/// costs — correctness outranks the sort's price. Until then, a reader who
+/// needs the order guaranteed writes it in the query.
+///
+/// Any sort here uses the STORED INTEGER, never a float alias. An integer
+/// cannot produce a NaN — the class of comparator defect this repository
+/// already records as corrupting a whole sort rather than misplacing one row.
 ///
 /// # `gain_pct` / `underlying_chg_pct` is GONE (operator, 2026-09-19)
 ///
@@ -543,7 +545,6 @@ pub fn top_volume_cadence_view_ddl(cadence: SnapshotCadence) -> String {
          CASE WHEN t.per_lot_quantity > 0 \
          THEN cast(t.volume AS DOUBLE) / cast(t.per_lot_quantity AS DOUBLE) \
          END AS candle_lots, \
-         t.open_latency, t.close_latency, t.window_span, \
          t.subscribed, t.underlying_id, \
          t.feed, t.segment, t.security_id, t.tf \
          FROM {NAMED_VIEW_TOP_VOLUME_BASE} t \
@@ -1643,5 +1644,157 @@ mod tests {
             crate::instrument_lifecycle_persistence::QUESTDB_TABLE_INSTRUMENT_LIFECYCLE,
             "NAMED_VIEW_LIFECYCLE_DIM drifted from the canonical lifecycle table name"
         );
+    }
+
+    /// Column names a `CREATE TABLE ... ( ... ) timestamp(ts)` statement
+    /// declares, read from the DDL string itself.
+    fn declared_columns(create_ddl: &str) -> Vec<String> {
+        let open = create_ddl.find('(').expect("DDL has a column list");
+        // Case-insensitive: `ticks` writes `TIMESTAMP(ts)`, the rest lowercase.
+        let close = create_ddl
+            .to_ascii_lowercase()
+            .find(") timestamp(ts)")
+            .expect("DDL declares a designated timestamp");
+        create_ddl[open + 1..close]
+            .split(',')
+            .filter_map(|c| c.split_whitespace().next().map(str::to_string))
+            .collect()
+    }
+
+    /// Every `alias.column` a view DDL references, excluding `alias.*`.
+    ///
+    /// The alias must start a token: `il.display_name` never yields a `d.`
+    /// reference, because the character before the `d` is not a boundary.
+    fn alias_references(ddl: &str, alias: &str) -> Vec<String> {
+        let needle = format!("{alias}.");
+        let bytes = ddl.as_bytes();
+        let mut out = Vec::new();
+        let mut from = 0;
+        while let Some(pos) = ddl[from..].find(&needle) {
+            let at = from + pos;
+            from = at + needle.len();
+            let boundary = at == 0 || {
+                let prev = bytes[at - 1];
+                !(prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'.')
+            };
+            if !boundary {
+                continue;
+            }
+            let ident: String = ddl[from..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !ident.is_empty() {
+                out.push(ident);
+            }
+        }
+        out
+    }
+
+    /// Every column a view SELECTs or JOINs on must exist in the table it
+    /// reads — checked against the table's own DDL, never a hand-kept list.
+    ///
+    /// The defect this pins (found 2026-09-22): the `top_volume` table lost
+    /// three delay columns in the 2026-09-19 schema reset while the four
+    /// per-cadence views still selected them, so on a fresh volume every one
+    /// of those `CREATE OR REPLACE VIEW` statements refused and the operator's
+    /// top-volume faces did not exist. `run_view_ddl` counts a refusal and
+    /// warns, so nothing failed loudly. A view is a SQL string resolved at
+    /// query time, so only a test that reads both sides can catch this.
+    #[test]
+    fn every_column_a_view_selects_exists_in_its_base_table() {
+        let mut candle_cols: Vec<String> = crate::shadow_persistence::CANDLE_SELF_HEAL_COLUMNS
+            .iter()
+            .map(|(c, _)| (*c).to_string())
+            .collect();
+        candle_cols.push("ts".to_string());
+        let lifecycle_dim: Vec<String> = [
+            "security_id",
+            "exchange_segment",
+            "feed",
+            "symbol_name",
+            "display_name",
+            "instrument_type",
+        ]
+        .iter()
+        .map(|c| (*c).to_string())
+        .collect();
+        let dim_sql = lifecycle_dim_subquery();
+        for col in &lifecycle_dim {
+            assert!(dim_sql.contains(col.as_str()), "dim subquery lost `{col}`");
+        }
+
+        let mut checked = 0usize;
+        let mut check = |view: &str, ddl: &str, alias: &str, cols: &[String]| {
+            let refs = alias_references(ddl, alias);
+            assert!(!refs.is_empty(), "{view}: found no `{alias}.` references");
+            for r in refs {
+                assert!(
+                    cols.iter().any(|c| *c == r),
+                    "{view} selects `{alias}.{r}`, which its base table does not declare — \
+                     the CREATE VIEW refuses on a fresh volume"
+                );
+                checked += 1;
+            }
+        };
+
+        let ticks = declared_columns(&crate::tick_persistence::ticks_create_ddl());
+        let depth = declared_columns(&crate::depth_persistence::market_depth_create_ddl());
+        let top =
+            declared_columns(&crate::top_volume_rank_persistence::top_volume_rank_create_ddl());
+
+        let t = ticks_named_view_ddl();
+        check("ticks_named", &t, "t", &ticks);
+        check("ticks_named", &t, "il", &lifecycle_dim);
+        let c = candles_named_view_ddl();
+        check("candles_named", &c, "c", &candle_cols);
+        check("candles_named", &c, "il", &lifecycle_dim);
+        let d = depth_named_view_ddl();
+        check("market_depth_named", &d, "d", &depth);
+        check("market_depth_named", &d, "il", &lifecycle_dim);
+        for cadence in SnapshotCadence::ALL {
+            let v = top_volume_cadence_view_ddl(cadence);
+            check(cadence.view_name(), &v, "t", &top);
+            check(cadence.view_name(), &v, "il", &lifecycle_dim);
+        }
+        // candles_10m reads bare names from candles_1m inside its innermost
+        // SELECT; those are checked by name.
+        let ten = candles_10m_view_ddl();
+        for col in [
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "oi",
+            "tick_count",
+            "security_id",
+            "segment",
+            "feed",
+            "ts",
+        ] {
+            assert!(ten.contains(col), "candles_10m no longer reads `{col}`");
+            assert!(
+                candle_cols.iter().any(|c| c == col),
+                "candles_10m reads `{col}` from candles_1m, which no longer declares it"
+            );
+        }
+        assert!(
+            checked > 40,
+            "the reference scan read suspiciously little: {checked}"
+        );
+    }
+
+    /// The scanner must CATCH a dropped column — proven on the exact shape
+    /// that shipped (`t.open_latency` against the 15-column table).
+    #[test]
+    fn the_view_column_scan_catches_a_column_the_table_dropped() {
+        let top =
+            declared_columns(&crate::top_volume_rank_persistence::top_volume_rank_create_ddl());
+        let stale = "SELECT t.ts, t.open_latency FROM top_volume t";
+        let refs = alias_references(stale, "t");
+        assert_eq!(refs, vec!["ts".to_string(), "open_latency".to_string()]);
+        assert!(!top.iter().any(|c| c == "open_latency"));
+        assert!(alias_references("SELECT il.display_name", "d").is_empty());
     }
 }

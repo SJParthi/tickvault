@@ -154,7 +154,7 @@ pub const DEDUP_KEY_CANDLES: &str = "ts, security_id, segment, feed";
 ///
 /// `ts` is excluded because it is the designated timestamp, which
 /// `ALTER TABLE ... ADD COLUMN` cannot create.
-const CANDLE_SELF_HEAL_COLUMNS: &[(&str, &str)] = &[
+pub(crate) const CANDLE_SELF_HEAL_COLUMNS: &[(&str, &str)] = &[
     ("open_latency", "VARCHAR"),
     ("close_latency", "VARCHAR"),
     ("window_span_latency", "VARCHAR"),
