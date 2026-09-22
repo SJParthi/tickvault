@@ -406,6 +406,7 @@ mod tests {
             (TfIndex::S5, "candles_5s"),
             (TfIndex::M30, "candles_30m"),
             (TfIndex::M60, "candles_60m"),
+            (TfIndex::M10, "candles_10m"),
         ];
         assert_eq!(
             pairs.len(),

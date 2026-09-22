@@ -223,9 +223,9 @@ pub fn candle_table_names() -> [&'static str; TF_COUNT] {
 /// became tautologically true and was removed — a gate that can only return
 /// true reads as a live filter to the next author.
 ///
-/// The surviving nine are `1s 3s 5s 1m 3m 5m 10m 15m 30m 60m` MINUS `10m`,
-/// which is a derived VIEW over `candles_1m`
-/// (`console_views::candles_10m_view_ddl`) and not a fold frame.
+/// The surviving ten are `1s 3s 5s 1m 3m 5m 10m 15m 30m 60m`. `10m` was a
+/// derived VIEW over `candles_1m` until 2026-09-22 and is now a folded table
+/// like the rest (the operator's "no views anywhere" directive).
 #[must_use]
 // TEST-EXEMPT: pure map over the ordinal array; pinned by test_emitted_and_retired_partition_the_ordinal_set.
 pub fn emitted_candle_table_names() -> Vec<&'static str> {
@@ -259,7 +259,7 @@ pub fn emitted_candle_table_names() -> Vec<&'static str> {
 /// enum.
 ///
 /// ⚠ Two names that must NEVER appear here:
-/// - `candles_10m` — a derived VIEW that IS wanted;
+/// - `candles_10m` — a live folded TABLE (it was a derived view until 2026-09-22);
 /// - any survivor. Note `candles_15s` (retired) against `candles_15m`
 ///   (survivor): the sweep matches EXACT names, never a prefix.
 const RETIRED_CANDLE_TABLES: [&str; 15] = [
@@ -541,7 +541,7 @@ async fn candle_table_has_int_security_id(client: &Client, base_url: &str, table
 /// longer correspond to any live timeframe enum.
 ///
 /// NOTE: any future `candles_*` prefix sweep MUST exclude `*_named` views
-/// (`console_views::VIEW_TICKS_NAMED` / `VIEW_CANDLES_NAMED`).
+/// (`candles_named` — listed in `console_views::RETIRED_CONSOLE_VIEWS`).
 const LEGACY_CANDLE_TF_SUFFIXES: [&str; 9] =
     ["1m", "5m", "15m", "30m", "1h", "2h", "3h", "4h", "1d"];
 
@@ -1245,7 +1245,7 @@ mod tests {
     #[test]
     fn test_candle_table_names_has_tf_count_entries() {
         assert_eq!(candle_table_names().len(), TF_COUNT);
-        assert_eq!(TF_COUNT, 9);
+        assert_eq!(TF_COUNT, 10);
     }
 
     #[test]
@@ -1590,7 +1590,8 @@ mod tests {
         // unchanged, `candles_1d` is GONE, and the second-scale block that
         // followed it is now exactly 1s/3s/5s. `candles_15s` (retired) and
         // `candles_15m` (kept) differ by one letter — this list is the exact
-        // set, never a prefix match.
+        // set, never a prefix match. 2026-09-22: `candles_10m` appended at
+        // ordinal 9 (it was a view; now a folded table).
         let expected = [
             "candles_1m",
             "candles_3m",
@@ -1601,6 +1602,7 @@ mod tests {
             "candles_5s",
             "candles_30m",
             "candles_60m",
+            "candles_10m",
         ];
         assert_eq!(names, expected);
     }

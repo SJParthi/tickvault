@@ -3981,8 +3981,8 @@ async fn build_shared_infra(
                     catchup_days = config.rest_candle_fold.catchup_days,
                     "rest_candle_fold: REST-era candle derivation ARMED — spot legs hand \
                      off persist-confirmed 1m bars; boot catch-up re-folds the stored \
-                     month into the six minute-scale timeframes (candles_1m..candles_60m; \
-                     the 1s/3s/5s frames need live ticks and 10m is a derived view)"
+                     month into the seven minute-scale timeframes (candles_1m..candles_60m; \
+                     the 1s/3s/5s frames need live ticks)"
                 );
             } else {
                 // LOW: first-wins refusal — a duplicate install means a second

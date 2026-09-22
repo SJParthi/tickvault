@@ -17,9 +17,9 @@
 //!
 //! ## RAM budget
 //!
-//! `SEAL_BUFFER_CAPACITY = AGGREGATOR_MAX_SLOTS × TF_COUNT` (25,000 × 9
-//! = 225,000) and `BufferedSeal` ≤ 168 bytes → **~37.8 MB worst-case**.
-//! 0.11% of the r8g.xlarge 32 GiB host (operator Quote 13, 2026-08-08).
+//! `SEAL_BUFFER_CAPACITY = AGGREGATOR_MAX_SLOTS × TF_COUNT` (25,000 × 10
+//! = 250,000 since 2026-09-22) and `BufferedSeal` ≤ 168 bytes → **~42.0 MB
+//! worst-case**. 0.13% of the r8g.xlarge 32 GiB host (operator Quote 13, 2026-08-08).
 //! Was a hardcoded 200,000 (~29 MB) until 2026-08-10 — see the constant's
 //! own doc for why that literal under-sized the midnight burst by 3×.
 //!
@@ -32,7 +32,8 @@
 //! ~86 MB → ~32 MB at the then-144-byte seal; ~37.8 MB once the
 //! 2026-09-19 receipt stamps took the seal to 168 bytes). Twice in five
 //! weeks, the same way. The numbers above are re-derived; if you are reading them long after 2026-09-19, verify
-//! against `TF_COUNT` rather than trusting them.
+//! against `TF_COUNT` rather than trusting them. It moved a THIRD time on
+//! 2026-09-22 (9 -> 10, `M10` became a native frame), and is re-derived above.
 //!
 //! ## Drop semantics on overflow
 //!
@@ -202,6 +203,10 @@ impl BufferedSeal {
 // data that arrived instantly from one built from data that arrived four
 // seconds late, because `ts` is the exchange clock and the two bars are
 // otherwise byte-identical.
+//
+// 2026-09-22: `M10` became a native frame (TF_COUNT 9 -> 10), so the derived
+// capacity is 250,000 and the ring is ~42.0 MB at 168 B, +4.2 MB. Recorded in
+// `websocket-connection-scope-lock.md` "NO VIEWS ANYWHERE".
 const _: () = assert!(
     std::mem::size_of::<BufferedSeal>() <= 168,
     "BufferedSeal exceeded 168-byte budget — ring RAM = SEAL_BUFFER_CAPACITY × this size; bumping requires updating aws-budget.md."
@@ -436,7 +441,8 @@ mod tests {
         // The old form asserted `== 200_000` while `force_seal_all` emits
         // AGGREGATOR_MAX_SLOTS × TF_COUNT (525,000 when that was written at
         // TF_COUNT=21; 600,000 after the 2026-08-10 raise to 24; 225,000
-        // since the 2026-09-19 nine-frame collapse) — so the ratchet was
+        // since the 2026-09-19 nine-frame collapse; 250,000 since M10 became a
+        // native frame on 2026-09-22) — so the ratchet was
         // actively PINNING a capacity 2.6× too small and reading as a safety
         // guarantee. Asserting the property instead of the number means
         // raising either input can never silently outgrow the ring again —

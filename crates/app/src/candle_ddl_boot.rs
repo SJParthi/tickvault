@@ -11,8 +11,9 @@
 //! - [`tickvault_storage::shadow_persistence::ensure_shadow_candle_tables`]
 //!   — `CREATE TABLE IF NOT EXISTS candles_<tf>` + `DEDUP ENABLE UPSERT
 //!   KEYS` for all 21 Engine-B candle tables.
-//! - [`tickvault_storage::console_views::ensure_named_views`] — the
-//!   read-only analyst console views.
+//! - [`tickvault_storage::console_views::drop_retired_views`] — removes
+//!   every console view this repository ever created (2026-09-22: the app
+//!   creates NO view; `candles_10m` is a real table).
 //!
 //! Meanwhile the REST-era bar-fold (`rest_candle_fold`) KEPT writing the
 //! `candles_*` tables through the shared seal-writer chain. On a FRESH
@@ -23,8 +24,8 @@
 //! boot path ran the ensure DDL anymore.
 //!
 //! This module re-homes the old main.rs wiring (pre-#1522 order:
-//! readiness → `drop_legacy_candle_objects` → `ensure_shadow_candle_tables`
-//! → `ensure_named_views`) behind a bounded QUIET readiness probe (the
+//! readiness → `drop_retired_views` → `drop_legacy_candle_objects` →
+//! `ensure_shadow_candle_tables`) behind a bounded QUIET readiness probe (the
 //! `index_constituency_boot` ts-pin precedent — 12 × 5s via
 //! `shared_probe_client`, never the paging BOOT-01/02 `wait_for_questdb_ready`).
 //!
@@ -58,7 +59,7 @@ pub const CANDLE_ENSURE_BACKOFF_SECS: u64 = 5;
 /// Seconds between readiness probe attempts.
 pub const CANDLE_DDL_READINESS_BACKOFF_SECS: u64 = 5;
 
-/// Run the retired-object sweep + candle-table ensure DDL + named views,
+/// Run the retired-view drop + retired-object sweep + candle-table ensure DDL,
 /// gated on a bounded quiet readiness probe.
 ///
 /// Degrade-safe, never blocks boot indefinitely:
@@ -129,10 +130,14 @@ pub async fn run_candle_ddl_at_boot(questdb: &QuestDbConfig) {
     // After the id is logged this is one count query per boot, forever.
     tickvault_storage::fresh_start_reset::run_fresh_start_reset_at_boot(questdb).await;
 
+    // 2026-09-22 (SECOND) — NO VIEWS ANYWHERE. Drop every retired console view
+    // BEFORE any table DDL: a surviving `candles_10m` VIEW occupies the name the
+    // `candles_10m` TABLE needs, and the CREATE below would be refused on it.
+    tickvault_storage::console_views::drop_retired_views(questdb).await;
+
     // Order is load-bearing (the pre-#1522 main.rs contract): the drop
     // sweep must free any legacy matview squatting a `candles_<tf>` name
-    // BEFORE the CREATE TABLE loop, and the named views validate their
-    // column references against the ensured tables.
+    // BEFORE the CREATE TABLE loop.
     tickvault_storage::shadow_persistence::drop_legacy_candle_objects(questdb).await;
 
     // 2026-09-18 operator directive — the fifteen non-emitting candle tables are
@@ -193,10 +198,9 @@ pub async fn run_candle_ddl_at_boot(questdb: &QuestDbConfig) {
         );
     }
 
-    tickvault_storage::console_views::ensure_named_views(questdb).await;
     info!(
         keyed,
-        "candle DDL boot complete — retired-object sweep + candle ensure attempted + named views"
+        "candle DDL boot complete — retired views dropped + retired-object sweep + candle ensure attempted"
     );
 }
 
@@ -210,32 +214,6 @@ pub async fn run_candle_ddl_at_boot(questdb: &QuestDbConfig) {
 pub const LIVE_TABLE_DDL_ATTEMPTS: u32 = 6;
 /// Seconds between `ticks` / `market_depth` DDL attempts.
 pub const LIVE_TABLE_DDL_BACKOFF_SECS: u64 = 5;
-
-/// Which base tables of the named console views have been CONFIRMED present
-/// by the live-table DDL loop. Drives the view re-ensure gate in
-/// [`run_live_table_ddl_at_boot`]: a pass runs only when this set GROWS.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct ViewBaseTables {
-    ticks: bool,
-    depth: bool,
-}
-
-impl ViewBaseTables {
-    /// True when `self` confirms a table that `covered` had not — i.e. a view
-    /// pass run now could build a view the previous pass could not.
-    const fn grew_over(self, covered: Self) -> bool {
-        (self.ticks && !covered.ticks) || (self.depth && !covered.depth)
-    }
-
-    /// Accumulate: a table once confirmed stays covered, so a table that
-    /// flaps back to refused on a later attempt never re-triggers a pass.
-    const fn union(self, other: Self) -> Self {
-        Self {
-            ticks: self.ticks || other.ticks,
-            depth: self.depth || other.depth,
-        }
-    }
-}
 
 /// Ensure the LIVE-writer tables — `ticks`, `market_depth` and the four
 /// direct `top_volume_<tf>` tables (since 2026-09-22) — with their DEDUP keys, retrying a refusal instead of running the session on
@@ -264,7 +242,6 @@ impl ViewBaseTables {
 /// consequence — never a panic, and never a silent continue.
 // TEST-EXEMPT: network I/O orchestration — the retry bound is unit-tested below, the give-up path is exercised against an unreachable port, and the boot call site is pinned by crates/app/tests/ensure_ddl_boot_wiring_guard.rs.
 pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
-    let mut views_covered = ViewBaseTables::default();
     for attempt in 1..=LIVE_TABLE_DDL_ATTEMPTS {
         let ticks_ok = tickvault_storage::tick_persistence::ensure_ticks_table(questdb).await;
         let depth_ok =
@@ -276,51 +253,14 @@ pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
         // security_id, segment`) and every replayed snapshot would duplicate.
         let volume_ok =
             tickvault_storage::top_volume_rank_persistence::ensure_top_volume_tables(questdb).await;
-        // Re-ensure the named views whenever a BASE TABLE they read is newly
-        // confirmed on this attempt — `ticks` or `market_depth`, each on its
-        // own. (The top-volume tables left this gate on 2026-09-22: they are
-        // no longer read through a view, so a view pass can gain nothing
-        // from their arrival.)
-        //
-        // ⚠ History, because two earlier shapes were wrong in a way a later
-        // edit could restore:
-        //
-        // * Until 2026-09-13 this sat inside an all-tables-ok condition, which
-        //   made the re-ensure hostage to tables it did not need.
-        // * 2026-09-13 → 2026-09-22 it was a ONE-SHOT latch keyed on the rank
-        //   table alone: `run_candle_ddl_at_boot` runs `ensure_named_views`
-        //   FIRST, before this fn creates `ticks` and `market_depth`, so on a
-        //   fresh volume `ticks_named` and `market_depth_named` warn-fail
-        //   there — and if the latch was spent on an attempt that REFUSED
-        //   `ticks`, the later successful `ticks` CREATE never triggered
-        //   another pass and the view stayed absent all session.
-        //
-        // The gate is therefore "did the set of confirmed base tables GROW",
-        // accumulated across attempts. Growth is monotone over two bits, so
-        // this runs at most TWO passes per boot, and a table that flaps back to
-        // refused never re-triggers a pass. Every statement in the pass is
-        // `CREATE OR REPLACE`, so a pass over an already-correct view is free.
-        let now = ViewBaseTables {
-            ticks: ticks_ok,
-            depth: depth_ok,
-        };
-        if now.grew_over(views_covered) {
-            views_covered = views_covered.union(now);
-            // Re-ensuring rather than MOVING the first call is deliberate: the
-            // candle ordering above is load-bearing (the legacy-matview drop
-            // sweep must precede the CREATE TABLE loop, and the candle views
-            // validate against those tables). Additive beats re-ordering on a
-            // boot path.
-            tickvault_storage::console_views::ensure_named_views(questdb).await;
-        }
+        // 2026-09-22 (SECOND): no view re-ensure here any more. The app
+        // creates NO view; the retired ones are dropped once, before any table
+        // DDL, by `run_candle_ddl_at_boot`.
         if ticks_ok && depth_ok && volume_ok {
             info!(
                 attempt,
                 "live-table DDL boot complete — ticks (5-key DEDUP) + market_depth \
-                 (depth_kind DEDUP) + top_volume_1s/3s/5s/1m (6-key DEDUP each) ensured. \
-                 The named views were re-attempted as each base table appeared; \
-                 that call reports its own outcome per view and returns nothing, so \
-                 this line claims the attempt, never its success."
+                 (depth_kind DEDUP) + top_volume_1s/3s/5s/1m (6-key DEDUP each) ensured."
             );
             return true;
         }
@@ -424,71 +364,6 @@ mod tests {
              same code the live-table exhaustion arm uses for the same \
              consequence"
         );
-    }
-
-    /// The view re-ensure gate fires exactly when the confirmed base-table set
-    /// GROWS. The case the old one-shot latch missed: attempt 1 confirms
-    /// `market_depth` but refuses `ticks`; attempt 2 confirms `ticks` — that
-    /// MUST trigger a second pass, or `ticks_named` stays absent all session.
-    #[test]
-    fn view_reensure_fires_when_a_base_table_is_newly_confirmed() {
-        let none = ViewBaseTables::default();
-        let depth_only = ViewBaseTables {
-            ticks: false,
-            depth: true,
-        };
-        let ticks_only = ViewBaseTables {
-            ticks: true,
-            depth: false,
-        };
-        let all = ViewBaseTables {
-            ticks: true,
-            depth: true,
-        };
-
-        // Normal fresh boot: attempt 1 confirms everything — one pass.
-        assert!(all.grew_over(none));
-        let covered = none.union(all);
-        assert!(
-            !all.grew_over(covered),
-            "a repeat of the same set is not growth"
-        );
-
-        // Depth first, ticks one attempt later: two passes.
-        assert!(depth_only.grew_over(none));
-        let covered = none.union(depth_only);
-        assert!(
-            all.grew_over(covered),
-            "a newly confirmed `ticks` table must re-run the view pass"
-        );
-        assert!(ticks_only.grew_over(none));
-
-        // A table flapping back to refused never re-triggers.
-        let covered = none.union(all);
-        assert!(!none.grew_over(covered));
-        assert!(!depth_only.grew_over(covered));
-        assert!(!ticks_only.grew_over(covered));
-
-        // Bounded: every one of the 4^5 = 1,024 five-attempt histories runs
-        // at most TWO passes — one per newly confirmed bit — and the union
-        // never loses a bit it has seen.
-        let states = [none, ticks_only, depth_only, all];
-        for code in 0..4usize.pow(5) {
-            let mut covered = none;
-            let mut passes = 0;
-            let mut c = code;
-            for _ in 0..5 {
-                let step = states[c % 4];
-                c /= 4;
-                let before = covered;
-                if step.grew_over(covered) {
-                    covered = covered.union(step);
-                    passes += 1;
-                }
-                assert!(covered.ticks >= before.ticks && covered.depth >= before.depth);
-            }
-            assert!(passes <= 2, "history {code} ran {passes} passes");
-        }
     }
 
     /// Against a port nothing listens on, every attempt fails, the loop

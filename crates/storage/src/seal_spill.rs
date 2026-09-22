@@ -2546,7 +2546,7 @@ mod tests {
 }
 
 /// Ordinal pins: the spill `tf_ordinal` byte round-trips every one of the
-/// 9 `TfIndex` frames, the four byte-stable frames keep ordinals 0..=3, and
+/// `TfIndex` frames (10 since 2026-09-22), the four byte-stable frames keep ordinals 0..=3, and
 /// out-of-range ordinals refuse cleanly (`None`) — never panic.
 ///
 /// ⚠ The module was named for the C3 second-scale change, which was
@@ -2567,7 +2567,10 @@ mod c3_tf_ordinal_pins {
         // `SEAL_SPILL_FORMAT_VERSION` is 4). The loop bound is derived from
         // TF_COUNT so a frame added or retired is actually exercised instead
         // of silently falling outside the range.
-        assert_eq!(TF_COUNT, 9);
+        assert_eq!(
+            TF_COUNT, 10,
+            "10 since 2026-09-22: M10 appended at ordinal 9 (a real table, not a view)"
+        );
         for ord in 0..TF_COUNT {
             let tf =
                 TfIndex::from_ordinal(ord).unwrap_or_else(|| panic!("ordinal {ord} must decode"));

@@ -326,8 +326,6 @@ pub struct TickRow {
     pub total_buy_qty: Option<i64>,
     /// Total sell quantity. `None` → NULL.
     pub total_sell_qty: Option<i64>,
-    /// Raw exchange timestamp (IST epoch SECONDS), verbatim audit column.
-    pub exchange_timestamp: Option<i64>,
     /// Local receive instant as IST nanoseconds. `None` → NULL.
     pub received_at_ist_nanos: Option<i64>,
     /// Deterministic content fingerprint (integrity column, NOT in the key).
@@ -465,7 +463,6 @@ impl TickRow {
                 .then(|| i64::from(tick.last_trade_quantity)),
             total_buy_qty: opt_qty(tick.total_buy_quantity),
             total_sell_qty: opt_qty(tick.total_sell_quantity),
-            exchange_timestamp: Some(i64::from(tick.exchange_timestamp)),
             received_at_ist_nanos,
             payload_hash: None,
         })
@@ -485,6 +482,9 @@ pub fn ticks_create_ddl() -> String {
     // APPROVED: table DDL, built once at boot in ticks_create_ddl
     format!(
         "CREATE TABLE IF NOT EXISTS {TICKS_TABLE} (\
+            received_at TIMESTAMP, \
+            ts TIMESTAMP, \
+            contract SYMBOL, \
             feed SYMBOL, \
             segment SYMBOL, \
             security_id LONG, \
@@ -499,17 +499,16 @@ pub fn ticks_create_ddl() -> String {
             last_trade_qty LONG, \
             total_buy_qty LONG, \
             total_sell_qty LONG, \
-            exchange_timestamp LONG, \
-            received_at TIMESTAMP, \
             payload_hash LONG, \
-            capture_seq LONG, \
-            ts TIMESTAMP\
+            capture_seq LONG\
         ) TIMESTAMP(ts) PARTITION BY HOUR WAL"
     )
 }
 
 /// Every `ticks` column with its type, for the per-column self-heal ALTERs.
 const TICKS_COLUMNS: &[(&str, &str)] = &[
+    ("received_at", "TIMESTAMP"),
+    ("contract", "SYMBOL"),
     ("feed", "SYMBOL"),
     ("segment", "SYMBOL"),
     ("security_id", "LONG"),
@@ -524,8 +523,6 @@ const TICKS_COLUMNS: &[(&str, &str)] = &[
     ("last_trade_qty", "LONG"),
     ("total_buy_qty", "LONG"),
     ("total_sell_qty", "LONG"),
-    ("exchange_timestamp", "LONG"),
-    ("received_at", "TIMESTAMP"),
     ("payload_hash", "LONG"),
     ("capture_seq", "LONG"),
 ];
@@ -1507,8 +1504,11 @@ fn ticks_ilp_http_conf(config: &QuestDbConfig) -> String {
 ///
 /// An LTT below [`MIN_PLAUSIBLE_EXCHANGE_TS_SECS`] is a sentinel, not a time,
 /// so the row is stamped with its RECEIPT time — which is the only real time
-/// such an observation has. The raw sentinel is NOT destroyed: it stays in the
-/// `exchange_timestamp` column, so "never traded" remains recoverable, and the
+/// such an observation has. The raw sentinel VALUE is not stored (the
+/// `exchange_timestamp` column was removed from `ticks` 2026-09-22, operator
+/// directive), but "never traded" stays recoverable in SQL: a real trade's `ts`
+/// is a whole second, while a fallback row's `ts` equals `received_at` to the
+/// nanosecond, so `WHERE ts = received_at` isolates them. The
 /// same floor the aggregator uses to refuse the candle is the one used here, so
 /// the two cannot drift apart.
 ///
@@ -2207,7 +2207,23 @@ impl TickWriter {
             .symbol("segment", sanitize_ilp_symbol(row.segment).as_ref())
             .context("segment")?
             .symbol("feed", sanitize_ilp_symbol(feed).as_ref())
-            .context("feed")?
+            .context("feed")?;
+        // `contract` — the option's NAME (`NIFTY-25Sep2026-24500-CE`), from the
+        // SAME table the candle writer reads (operator 2026-09-22: "put either
+        // contract or symbol name right in each and every table"). One ArcSwap
+        // load + one hash probe per row, zero allocation: the name is borrowed
+        // out of the published snapshot and `sanitize_ilp_symbol` returns it
+        // borrowed unless it needs escaping. Written only when the table knows
+        // this exact `(security_id, segment)`; otherwise OMITTED, so the cell
+        // reads NULL — never a guessed name. It must sit among the symbols:
+        // ILP rejects a symbol after the first column.
+        let labels = crate::candle_contract_labels::candle_contract_labels();
+        if let Some(name) = labels.get(&(row.security_id, row.segment)) {
+            self.buffer
+                .symbol("contract", sanitize_ilp_symbol(name).as_ref())
+                .context("contract")?;
+        }
+        self.buffer
             .column_i64("security_id", row.security_id)
             .context("security_id")?
             .column_f64("ltp", row.ltp)
@@ -2251,11 +2267,6 @@ impl TickWriter {
             self.buffer
                 .column_i64("total_sell_qty", v)
                 .context("total_sell_qty")?;
-        }
-        if let Some(v) = row.exchange_timestamp {
-            self.buffer
-                .column_i64("exchange_timestamp", v)
-                .context("exchange_timestamp")?;
         }
         if let Some(v) = row.received_at_ist_nanos {
             self.buffer
@@ -2771,7 +2782,8 @@ fn perform_tick_rescue(spill_dir: &Path, payload: &[u8], feed: Feed, dropped: us
                 spill_error = %err,
                 "tick flush failed AND the spill rescue also failed — these ticks \
                  are permanently lost and nothing re-inserts them. The raw frames \
-                 remain in the write-ahead log for manual recovery."
+                 remain in the write-ahead log ONLY if it accepted them -- a non-zero \
+                 tv_dhan_ws_wal_dropped_total means the disk refused them there too."
             );
             false
         }
@@ -3155,7 +3167,8 @@ impl TickWriterSink {
                     spill_error = %err,
                     "offloaded tick flush failed AND the spill rescue also failed — these \
                      ticks are permanently lost and nothing re-inserts them. The raw frames \
-                     remain in the write-ahead log for manual recovery."
+                     remain in the write-ahead log ONLY if it accepted them -- a non-zero \
+                 tv_dhan_ws_wal_dropped_total means the disk refused them there too."
                 );
             }
         }
@@ -3966,9 +3979,11 @@ mod tests {
         assert!(line.contains("capture_seq=42i"), "capture_seq: {line}");
         assert!(line.contains("volume=1234567i"), "volume: {line}");
         assert!(line.contains("oi=987654i"), "oi: {line}");
+        // The raw LTT column was removed 2026-09-22 (operator directive):
+        // the trade time is carried by the designated `ts` alone.
         assert!(
-            line.contains("exchange_timestamp=1779971400i"),
-            "ltt: {line}"
+            !line.contains("exchange_timestamp"),
+            "the removed raw-LTT column must never be written: {line}"
         );
         // Symbols must precede all field columns (ILP requirement).
         let first_field = line.find(" security_id=").expect("field section");
@@ -4219,6 +4234,95 @@ mod tests {
                 "live DDL lacks {col} {ty} — schema drift"
             );
         }
+    }
+
+    /// `ticks.contract` carries the option's name from the published table,
+    /// and is OMITTED (NULL) — never guessed — when the table does not know the
+    /// exact `(security_id, segment)`. Both arms, one test, under the publish
+    /// lock because the table is process-global.
+    #[test]
+    fn ticks_carry_the_contract_name_only_when_the_table_knows_it() {
+        let _g = crate::candle_contract_labels::TEST_PUBLISH_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let row = sample_row();
+        let mut m = crate::candle_contract_labels::CandleContractLabels::new();
+        m.insert(
+            (row.security_id, row.segment),
+            std::sync::Arc::<str>::from("NIFTY-25Sep2026-24500-CE"),
+        );
+        // Same id on a DIFFERENT segment must not lend its name (I-P1-11).
+        m.insert(
+            (row.security_id + 1, row.segment),
+            std::sync::Arc::<str>::from("OTHER-CONTRACT"),
+        );
+        crate::candle_contract_labels::publish_candle_contract_labels(m);
+
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_row(&row).expect("append");
+        let line = w.buffer_utf8();
+        assert!(
+            line.contains(",contract=NIFTY-25Sep2026-24500-CE"),
+            "a known contract must carry its name: {line}"
+        );
+        let first_field = line.find(" security_id=").expect("field section");
+        assert!(
+            line.find(",contract=").expect("contract tag") < first_field,
+            "contract is a SYMBOL and must precede every column: {line}"
+        );
+
+        crate::candle_contract_labels::publish_candle_contract_labels(
+            crate::candle_contract_labels::CandleContractLabels::new(),
+        );
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_row(&row).expect("append");
+        let line = w.buffer_utf8();
+        assert!(
+            !line.contains("contract="),
+            "an unknown contract must be NULL, never a guess: {line}"
+        );
+    }
+
+    /// The operator's 2026-09-22 (THIRD) layout: `received_at` is the FIRST
+    /// column, `ts` the SECOND, and the raw-LTT `exchange_timestamp` column is
+    /// gone — pinned in BOTH the boot DDL and the init script, which must agree.
+    #[test]
+    fn ticks_lead_with_received_at_then_ts_and_carry_no_raw_ltt_column() {
+        let script = std::fs::read_to_string(workspace_root().join("scripts/questdb-init.sh"))
+            .expect("init script");
+        let live = script
+            .split("CREATE TABLE IF NOT EXISTS ticks ")
+            .nth(1)
+            .and_then(|s| s.split('\n').next())
+            .expect("live ticks CREATE")
+            .to_string();
+        for (label, ddl) in [("boot DDL", ticks_create_ddl()), ("init script", live)] {
+            let body = ddl.split('(').nth(1).expect("column list");
+            let cols: Vec<&str> = body
+                .split(',')
+                .map(|c| c.split_whitespace().next().unwrap_or(""))
+                .collect();
+            assert_eq!(
+                cols.first(),
+                Some(&"received_at"),
+                "{label}: received_at must be first: {ddl}"
+            );
+            assert_eq!(
+                cols.get(1),
+                Some(&"ts"),
+                "{label}: ts must be second: {ddl}"
+            );
+            assert!(
+                !ddl.contains("exchange_timestamp"),
+                "{label}: the removed raw-LTT column is back: {ddl}"
+            );
+        }
+        assert!(
+            !TICKS_COLUMNS
+                .iter()
+                .any(|(c, _)| *c == "exchange_timestamp"),
+            "the self-heal must never re-add the removed column"
+        );
     }
 
     #[test]
@@ -5002,18 +5106,19 @@ mod tests {
     }
 
     #[test]
-    fn a_sentinel_row_keeps_its_raw_ltt_and_its_order_book() {
+    fn a_sentinel_row_is_stamped_at_receipt_and_keeps_its_order_book() {
         // The whole reason these rows are kept rather than dropped: they carry
         // a live book. This drives the REAL row builder and asserts the row is
-        // now findable in the live time range while losing NOTHING -- the raw
-        // sentinel survives in its own column, so "never traded" is still
-        // recoverable.
+        // findable in the live time range. The raw sentinel column is gone
+        // (2026-09-22); "never traded" stays recoverable because the row's
+        // `ts` is EXACTLY its receipt instant, which a real whole-second trade
+        // time never is -- `WHERE ts = received_at` in SQL.
         let mut tick = sample_tick();
         tick.exchange_timestamp = SENTINEL_LTT;
         tick.last_traded_price = 0.0;
         tick.total_buy_quantity = 8_397_000;
         tick.total_sell_quantity = 9_019_000;
-        tick.received_at_nanos = 1_787_300_000_000_000_000;
+        tick.received_at_nanos = 1_787_300_000_123_456_789;
 
         let row = TickRow::from_parsed_tick(&tick, 1).expect("a sentinel tick still builds a row");
 
@@ -5023,9 +5128,16 @@ mod tests {
             "the row must no longer be stamped into the 1980 partition"
         );
         assert_eq!(
-            row.exchange_timestamp,
-            Some(i64::from(SENTINEL_LTT)),
-            "the raw sentinel is preserved — nothing is destroyed"
+            Some(row.ts_ist_nanos),
+            row.received_at_ist_nanos,
+            "a sentinel row's ts IS its receipt instant, which is what makes it \
+             recoverable in SQL without the removed raw-LTT column"
+        );
+        assert_ne!(
+            row.ts_ist_nanos % 1_000_000_000,
+            0,
+            "the receipt carries nanoseconds, so it can never be mistaken for a \
+             whole-second trade time"
         );
         assert_eq!(row.total_buy_qty, Some(8_397_000), "the book survives");
         assert_eq!(row.total_sell_qty, Some(9_019_000), "the book survives");

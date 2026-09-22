@@ -82,13 +82,10 @@ mod global_qcfg_tests {
 }
 
 pub mod boot_probe;
-// Human-readable analyst console views (`ticks_named` / `candles_named`) —
-// plain QuestDB views LEFT-joining ticks/candles_1m against the
-// instrument_lifecycle master. Cold-path console tooling only (O(join) at
-// SELECT time, honestly O(N); zero hot-path impact). (The
-// `daily_universe_fetcher` feature that once gated the lifecycle-ensure
-// call inside was deleted in PR-C3, 2026-07-14 — everything here is
-// unconditional now.)
+// 2026-09-22 ("no views anywhere"): `console_views` no longer creates any
+// view. It DROPS every retired console view name at boot, before any table
+// DDL, so a leftover `candles_10m` VIEW cannot squat the name of the real
+// `candles_10m` table. Cold path, one statement per retired name.
 // 2026-09-22: the day's option-contract names, published by the app and
 // read once per sealed bar to fill `candles_<tf>.contract`.
 pub mod candle_contract_labels;

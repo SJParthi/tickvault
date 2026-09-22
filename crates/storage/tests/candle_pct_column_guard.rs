@@ -356,7 +356,7 @@ fn self_test_removal_check_would_catch_a_resurrected_column() {
 // ============================================================================
 
 /// Assert a LONG candle column is wired across DDL, self-heal manifest, ILP
-/// write, seal-row struct and the console view.
+/// write and seal-row struct (the console view was retired 2026-09-22).
 fn assert_long_column_wired_end_to_end(col: &str, row_type: &str) {
     let (sp_path, sp_raw) = storage_src("shadow_persistence.rs");
     let sp = squeeze(&code_only(&sp_raw));
@@ -391,15 +391,11 @@ fn assert_long_column_wired_end_to_end(col: &str, row_type: &str) {
         r_path.display()
     );
 
-    let (v_path, v_raw) = storage_src("console_views.rs");
-    let v = code_only(&v_raw);
-    assert!(
-        contains_token(&v, &format!("c.{col}")),
-        "{}: the `candles_named` analyst view must project `c.{col}` — a \
-         stored column an operator cannot see in the console is a column that \
-         does not exist as far as they are concerned.",
-        v_path.display()
-    );
+    // 2026-09-22 ("no views anywhere"): the `candles_named` analyst view that
+    // this helper used to require `c.{col}` in is GONE. The operator reads the
+    // `candles_<tf>` TABLES directly, and every candle table carries its own
+    // `contract` column, so a stored column IS a visible column — there is no
+    // projection layer left for it to go missing from.
 }
 
 // ⚠ RETIRED 2026-09-18 — `net_volume_column_wired_end_to_end` and

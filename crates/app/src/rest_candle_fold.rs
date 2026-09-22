@@ -2639,6 +2639,8 @@ mod tests {
                 // renumbered — M30 and M60 now sit at 7 and 8.
                 TfIndex::M30,
                 TfIndex::M60,
+                // 2026-09-22: M10 appended at ordinal 9 (no views anywhere).
+                TfIndex::M10,
             ],
             "one 1m bar must open exactly the minute-scale frames above 1m"
         );

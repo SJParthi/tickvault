@@ -303,7 +303,7 @@ not links in the library dependency order.)*
 | `ws_event_audit_persistence.rs` | `ws_event_audit` table — WebSocket lifecycle audit (AUDIT-WS-01) |
 | `partition_manager.rs` / `partition_archive.rs` | QuestDB partition lifecycle + archive→verify→drop retention (S3 cold) |
 | `questdb_health.rs` | QuestDB health poller |
-| `console_views.rs` | Analyst console views — `ticks_named` + `candles_named` |
+| `console_views.rs` | Retired-view sweep — DROPS `ticks_named` / `candles_named` / `market_depth_named` / the old `candles_10m` view at boot. The app creates NO view since 2026-09-22 ("no views anywhere"); `candles_10m` is a real table |
 | `feed_scoreboard_persistence.rs` / `feed_episode_audit_persistence.rs` | Daily feed scoreboard + feed-episode audit tables |
 | `shadow_candle_writer.rs` / `shadow_persistence.rs` / `shadow_seal_columns.rs` | Shadow candle-engine ILP append path |
 | *(live-vs-REST cross-verification writer — module DELETED 2026-09-16 with the 15:41 accuracy check; path removed from this cell so the codebase-map guard is not pointed at a deleted file. Retained as history per house convention.)* | The three audit tables (the raw vendor tape + the two cross-verify audit tables) and their rows are **RETAINED** and stay in the operator-console SEBI keep-list; only the writer is gone. ⚠ **With this writer there is ZERO mechanism anywhere in the workspace that compares captured market data against any external record** — the feed carries no sequence number and no snapshot-on-subscribe, so nothing else can answer "are the numbers right", only "did the machinery run". Full record: `no-rest-except-live-feed-2026-06-27.md` §12.10.3/§12.10.4. |

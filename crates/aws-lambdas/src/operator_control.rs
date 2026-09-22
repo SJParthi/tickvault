@@ -3583,11 +3583,13 @@ mod tests {
         }
     }
 
-    /// `candles_10m` and `candles_named` are VIEWS that start with the
+    /// `candles_named` is a VIEW that starts with the
     /// `candles_` prefix the wipe uses to find candle TABLES. A `TRUNCATE
     /// TABLE` on a view fails, prints TRUNCATE-FAILED on every wipe, and trains
-    /// the operator to ignore the line that would report a real failure. They
-    /// are excluded by name; the prefix arm still covers every real frame.
+    /// the operator to ignore the line that would report a real failure. It is
+    /// excluded by name; the prefix arm still covers every real frame.
+    /// `candles_10m` was a view until 2026-09-22 and is now a real TABLE, so
+    /// it is deliberately NOT excluded — it must be truncated with the rest.
     ///
     /// 2026-09-22 — tightened in two directions, both of which the previous
     /// form could not see:
@@ -3612,20 +3614,50 @@ mod tests {
             .join("../storage/src/console_views.rs");
         let views_src = std::fs::read_to_string(&views_path)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", views_path.display()));
-        let mut candle_views: std::collections::BTreeSet<String> = views_src
-            .lines()
-            .filter_map(|l| {
-                let rest = l.trim_start().strip_prefix("pub const VIEW_")?;
-                let (_, value) = rest.split_once(": &str = \"")?;
-                let name = value.strip_suffix("\";")?;
-                name.starts_with("candles_").then(|| name.to_string())
-            })
+        // 2026-09-22 (no views anywhere): console_views.rs no longer CREATES
+        // any view. It carries the list of RETIRED view names it drops at
+        // boot, and the subset of those names that are now real TABLES
+        // (`candles_10m`). A retired `candles_*` name that is still a view
+        // must be excluded; a name that became a table must NOT be — excluding
+        // it would leave a real candle table out of the wipe.
+        let quoted_list = |const_name: &str| -> Vec<String> {
+            let start = views_src
+                .find(&format!("pub const {const_name}"))
+                .unwrap_or_else(|| panic!("console_views.rs lost `{const_name}`"));
+            let body = &views_src[start..];
+            let eq = body.find("= [").expect("array literal") + 3;
+            let close = eq + body[eq..].find("];").expect("array end");
+            body[eq..close]
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.starts_with("//"))
+                .flat_map(|l| l.split(','))
+                .filter_map(|s| {
+                    s.trim()
+                        .strip_prefix('"')
+                        .and_then(|r| r.strip_suffix('"'))
+                        .map(str::to_string)
+                })
+                .collect()
+        };
+        let retired = quoted_list("RETIRED_CONSOLE_VIEWS");
+        let now_tables = quoted_list("VIEW_NAMES_NOW_TABLES");
+        let mut candle_views: std::collections::BTreeSet<String> = retired
+            .iter()
+            .filter(|n| n.starts_with("candles_") && !now_tables.contains(n))
+            .cloned()
             .collect();
         // Anti-vacuity: a parser that matched nothing would make every
         // assertion below trivially true.
         assert!(
-            candle_views.contains("candles_10m") && candle_views.contains("candles_named"),
-            "the view scan must find both known candle views, found {candle_views:?}"
+            candle_views.contains("candles_named"),
+            "the view scan must find the candles_named view, found {candle_views:?}"
+        );
+        assert!(
+            now_tables.iter().any(|t| t == "candles_10m")
+                && retired.iter().any(|t| t == "candles_10m"),
+            "the scan must see candles_10m as a retired view that is now a table: \
+             retired={retired:?} now_tables={now_tables:?}"
         );
 
         // --- the awk program that selects truncate targets ---

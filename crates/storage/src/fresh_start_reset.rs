@@ -122,8 +122,10 @@ pub const FRESH_START_RESET_ID: &str = "2026-09-19-fresh-start";
 /// verify-after-write step depends on.
 pub const SCHEMA_RESET_LOG_TABLE: &str = "schema_reset_log";
 
-/// Views dropped first. They are recreated by `ensure_named_views` later in
-/// the same boot. `candles_10m` is a VIEW over `candles_1m`, never a table.
+/// Views dropped first. NONE is recreated: since 2026-09-22 (SECOND — NO VIEWS
+/// ANYWHERE) the app creates no view. `candles_10m` was a VIEW over `candles_1m`
+/// until then and is a real TABLE since, so it is in BOTH lists (see
+/// [`reportable_refusals`]).
 pub const RESET_VIEWS: &[&str] = &[
     "candles_10m",
     "candles_named",
@@ -158,6 +160,10 @@ pub const RESET_TABLES: &[&str] = &[
     "candles_15m",
     "candles_30m",
     "candles_60m",
+    // The tenth fold frame (2026-09-22 SECOND). A VIEW on an older volume,
+    // so also in [`RESET_VIEWS`]. The same logical object the reset already
+    // dropped as a view, now dropped as the table it became — not a widening.
+    "candles_10m",
     // The four direct per-cadence tables (2026-09-22). Also in [`RESET_VIEWS`]
     // — on an older volume they are views.
     "top_volume_1s",
@@ -396,8 +402,8 @@ pub fn drop_statements() -> Vec<(&'static str, String)> {
 /// retry rounds.
 ///
 /// A name that is in BOTH [`RESET_VIEWS`] and [`RESET_TABLES`] (the four
-/// `top_volume_<tf>` names, a view on an older volume and a table on a newer
-/// one) gets two statements, and only one of them can match what is on disk.
+/// `top_volume_<tf>` names and `candles_10m`, each a view on an older volume
+/// and a table on a newer one) gets two statements, and only one of them can match what is on disk.
 /// Whether QuestDB answers `DROP VIEW IF EXISTS` on a TABLE's name with a
 /// no-op or an error is UNVERIFIED (no QuestDB is reachable from a dev
 /// container). If it errors, that refusal is the wrong-kind half of a
@@ -728,14 +734,15 @@ mod tests {
 
     #[test]
     fn the_allowlist_is_exactly_the_scope_lock_set() {
-        assert_eq!(RESET_TABLES.len(), 17);
+        assert_eq!(RESET_TABLES.len(), 18);
         let candles = RESET_TABLES
             .iter()
             .filter(|t| t.starts_with("candles_"))
             .count();
-        assert_eq!(candles, 9, "nine fold tables; candles_10m is a view");
+        assert_eq!(candles, 10, "ten fold tables, candles_10m included");
+        // A view on an older volume, a table since 2026-09-22 (SECOND).
         assert!(RESET_VIEWS.contains(&"candles_10m"));
-        assert!(!RESET_TABLES.contains(&"candles_10m"));
+        assert!(RESET_TABLES.contains(&"candles_10m"));
         for t in [
             "top_volume_1s",
             "top_volume_3s",
@@ -797,10 +804,11 @@ mod tests {
         }
     }
 
-    /// The only names in BOTH lists are the four per-cadence names — any other
+    /// The only names in BOTH lists are the four per-cadence names and
+    /// `candles_10m` — any other
     /// overlap would make [`reportable_refusals`] suppress a real refusal.
     #[test]
-    fn only_the_four_cadence_names_are_both_a_view_and_a_table() {
+    fn only_the_cadence_names_and_candles_10m_are_both_a_view_and_a_table() {
         let both: Vec<&str> = RESET_VIEWS
             .iter()
             .copied()
@@ -809,6 +817,7 @@ mod tests {
         assert_eq!(
             both,
             [
+                "candles_10m",
                 "top_volume_1s",
                 "top_volume_3s",
                 "top_volume_5s",
@@ -1384,13 +1393,13 @@ mod tests {
                 "{t} missing from the census"
             );
         }
-        assert!(!sql.contains("candles_10m"), "a view is not a table");
+        assert!(sql.contains("'candles_10m'"), "candles_10m is a table now");
         assert!(!sql.contains(SCHEMA_RESET_LOG_TABLE));
     }
 
     #[test]
     fn the_worst_case_bound_is_the_documented_sum() {
-        // 120 + 60 + 29 statements × 30 + 3 × (90 + 5) + 90.
-        assert_eq!(RESET_WORST_CASE_SECS, 1_425);
+        // 120 + 60 + 30 statements × 30 + 3 × (90 + 5) + 90.
+        assert_eq!(RESET_WORST_CASE_SECS, 1_455);
     }
 }

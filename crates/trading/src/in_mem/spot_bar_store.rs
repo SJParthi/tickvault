@@ -684,7 +684,10 @@ mod tests {
         assert_eq!(bars_per_day(TfIndex::M15), 27);
         assert_eq!(bars_per_day(TfIndex::M30), 14);
         assert_eq!(bars_per_day(TfIndex::M60), 7);
-        assert_eq!(total_bars_per_day_all_tfs(), 662);
+        // 2026-09-22: M10 became a native frame (NO VIEWS ANYWHERE), so the
+        // resident sum moves 662 -> 702 (+40 = 24_000 / 600).
+        assert_eq!(bars_per_day(TfIndex::M10), 40);
+        assert_eq!(total_bars_per_day_all_tfs(), 702);
         assert_eq!(SESSION_SECS, 24_000);
     }
 
@@ -693,13 +696,14 @@ mod tests {
         // The design envelope: 8 slots (2 feeds × 4 spot SIDs) × 35 days.
         assert_eq!(core::mem::size_of::<RamBar>(), 48, "RamBar must stay 48 B");
         let bytes = estimated_capacity_bytes(35, 8);
-        // 662 × 35 × 8 × 48 = 8_897_280 B ≈ 8.5 MiB
+        // 702 × 35 × 8 × 48 = 9_434_880 B ≈ 9.0 MiB
         // (2026-08-07: 601 -> 618 bars/day with the 385-minute session;
         //  2026-08-10: 618 -> 831 with M2/M30/M60, operator Quote 13;
         //  2026-08-28: 831 -> 863 with the 09:00 pre-open open;
         //  2026-09-19: 863 -> 662 with the nine-frame collapse — D1 and M2
-        //  lost their writers, so their rings are no longer allocated.)
-        assert_eq!(bytes, 8_897_280);
+        //  lost their writers, so their rings are no longer allocated;
+        //  2026-09-22: 662 -> 702 as M10 became a native frame.)
+        assert_eq!(bytes, 9_434_880);
         assert!(
             bytes < 40 * 1024 * 1024,
             "spot ring envelope must stay under 40 MB (got {bytes})"
@@ -886,8 +890,9 @@ mod tests {
         // Two slots × 1 day × 662 bars × 48 B of pre-allocated capacity
         // (400-min session since 2026-08-28; 618 -> 831 on 2026-08-10 with
         // M2/M30/M60, then 831 -> 863 with the 09:00 pre-open open, then
-        // 863 -> 662 with the 2026-09-19 nine-frame collapse).
-        assert_eq!(stats.estimated_bytes, 2 * 662 * 48);
+        // 863 -> 662 with the 2026-09-19 nine-frame collapse, then 662 -> 702
+        // when M10 became a native frame on 2026-09-22).
+        assert_eq!(stats.estimated_bytes, 2 * 702 * 48);
     }
 
     #[test]
@@ -923,12 +928,13 @@ mod tests {
         // 2026-08-10: 618 -> 831 with M2/M30/M60 (operator Quote 13);
         // 2026-09-19: 863 -> 662 as D1 and M2 lost their writers. M30/M60
         // are minute-scale, so unlike the GDF-gated second frames they ARE
-        // resident and DO count toward the byte estimate.
-        assert_eq!(total_bars_per_day_all_tfs(), 662);
+        // resident and DO count toward the byte estimate. 2026-09-22: 662 -> 702
+        // with M10 (minute-scale, so resident).
+        assert_eq!(total_bars_per_day_all_tfs(), 702);
         let store = SpotBarStore::new(35);
         store.append_sealed(key(), TfIndex::M1, bar(OPEN0, 1.0));
         let stats = store.stats();
-        assert_eq!(stats.estimated_bytes, 662 * 35 * 48);
+        assert_eq!(stats.estimated_bytes, 702 * 35 * 48);
         let slot = store.find_slot(key()).expect("slot exists");
         let rings = slot.rings.read();
         assert_eq!(rings.len(), TF_COUNT, "one ring per TfIndex ordinal");

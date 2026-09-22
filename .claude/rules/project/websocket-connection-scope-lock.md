@@ -7584,3 +7584,119 @@ rows per sweep to duplicate a dimension table.
 - Claims the within-`ts` physical order is guaranteed before the probe above has
   read clean on a live box.
 - Claims per-sweep O(1).
+
+### 2026-09-22 (SECOND) — NO VIEWS ANYWHERE: `candles_10m` becomes a real folded table, and every table carries its own contract name
+
+**The verbatim operator demands (2026-09-22, typed directly in-session — preserve
+EXACTLY, expletives and typos included):**
+
+> "See meanwhile I clealry told you to put either contract or symbol name right in each and every table to see it precisely right dude espeically when I want to query it manually dudde oaky?"
+
+> "See attached hy the fuck candle 10 m is a view bro it should be the real table right why the Fuck do we need even these views bro why"
+
+Recorded HERE **before any code**, per the rule-file-first law, because both
+reverse rows this file currently makes binding.
+
+#### What this REVERSES
+
+| Row | Where | Now |
+|---|---|---|
+| *"`10m` is DERIVED, never a new fold frame. No `TfIndex` variant, no ordinal, no `TF_COUNT` change, no seal-ring resize"* | §2026-09-18 clause 2 / clause 8 | **REVERSED.** `10m` is a native fold frame |
+| *"Adds an `M10` variant, or moves `TF_COUNT`"* / *"Adds a `TfIndex` variant, or changes `TF_COUNT`, to serve `10m`"* | the §2026-09-18 and §2026-09-19 REJECT lists | **LIFTED for `M10` alone.** Any OTHER new frame stays a REJECT without its own quote |
+| *"`10m` remains a VIEW over `candles_1m`"* | §2026-09-19 nine-frames narrowing | **REVERSED** |
+| The `ticks_named` / `candles_named` / `market_depth_named` console views | `console_views.rs` since 2026-08 | **RETIRED.** The name lives in the table itself |
+
+The §2026-09-18 "zero added per-tick work" reasoning is not ignored — it is
+priced and accepted: see the cost table below.
+
+#### The contract (LOCKED)
+
+| Aspect | Locked value |
+|---|---|
+| Views the app creates | **NONE.** `console_views.rs` creates no view. Boot issues `DROP VIEW IF EXISTS` for the four retired names (`ticks_named`, `candles_named`, `candles_10m`, `market_depth_named`) BEFORE any table DDL, so a box that still carries them converges and a `candles_10m` VIEW can never block the `candles_10m` TABLE |
+| `candles_10m` | a real table, same 22-column schema, same DEDUP key and DAY partitioning as every other `candles_<tf>`, written by the fold |
+| `TfIndex::M10` | **APPENDED** at ordinal **9** — never inserted. Appending renumbers nothing, so every seal-spill record already on disk still decodes to the frame it was written for, and no spill-format bump is needed |
+| `TF_COUNT` | **9 → 10** |
+| 10m grid | anchored at the candle session open (09:00 IST), like M30/M60: 09:00, 09:10, … — `600 % 900 != 0`, so it cannot share the 15-minute-aligned grid |
+| Name column | every market-data table carries a human-readable name for the instrument in the row: `candles_<tf>` and `top_volume_<tf>` already have `contract`; `ticks` and `market_depth` gain it; instrument-bearing audit tables gain it where they carry a `security_id` |
+| Name resolution cost | one O(1) hash probe per sealed bar / per tick row / per depth PACKET (never per depth level), pre-interned labels, zero allocation. An unknown id writes NULL, never a guessed name |
+
+#### Honest cost, stated rather than absorbed
+
+| Quantity | Before | After |
+|---|---:|---:|
+| Fold frames updated per tick | 9 | **10** (+11%) |
+| Seal ring capacity (`AGGREGATOR_MAX_SLOTS × TF_COUNT`) | 225,000 | **250,000** |
+| `candles_10m` rows per session | 0 (a view) | ~1/10th of `candles_1m` |
+| `market_depth` bytes per row for the name | 0 | +4 (a SYMBOL key) — on ~1.5 B rows/session ≈ **+6 GB/session** of disk |
+| `ticks` bytes per row for the name | 0 | +4 ≈ +0.3 GB/session |
+
+The depth figure is the one that matters: depth is ~80% of the disk burn, so
+this is roughly a **+5%** burn increase. It is the price of reading a depth row
+without a join, and the operator asked for exactly that.
+
+#### ⚠ What is LOST
+
+The three joined master fields the `_named` views added — `symbol_name`,
+`display_name`, `instrument_type` — are not copied into every row. `contract`
+carries the readable label; the fuller master fields stay one join away in
+`instrument_lifecycle`. The 10m view's `sum(abs(volume))` derivation, and the
+separate day-partitioned sign it computed, are replaced by the fold's own
+per-frame sign, which uses the same previous-close-of-the-same-frame rule and the
+same same-IST-day baseline refusal.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Creates any `VIEW` in the app, a boot script, or `questdb-init.sh`.
+- Removes the `DROP VIEW IF EXISTS` pre-step (an old box's `candles_10m` view
+  would then block the table forever).
+- Inserts `M10` at any ordinal other than the end, or bumps the spill format for
+  an append.
+- Adds any frame other than `M10` under cover of this quote.
+- Resolves a name per depth LEVEL, allocates while resolving it, or writes a
+  guessed name for an unknown instrument.
+- Claims any of this has been accepted by a live QuestDB before a boot has run.
+
+### 2026-09-22 (THIRD) — `ticks` drops `exchange_timestamp`; `received_at` is the FIRST column and `ts` the SECOND
+
+**The verbatim operator demand (2026-09-22, typed directly in-session — preserve EXACTLY, typos included):**
+
+> "See in ticks tavle I clealry told you to remove exchange timestamp and even I asked you to put received at as the first column and then ts second right dude do this change also bro okay?"
+
+Recorded HERE before the code, per the rule-file-first law.
+
+#### What changes
+
+| Surface | Before | After |
+|---|---|---|
+| `ticks` column order | `feed, segment, security_id, … , exchange_timestamp, received_at, payload_hash, capture_seq, ts` | **`received_at, ts, contract, feed, segment, security_id, …, payload_hash, capture_seq`** |
+| `contract SYMBOL` | absent | **ADDED** — the option's name (`NIFTY-25Sep2026-24500-CE`) from the same once-a-day table the candle writer reads, per the operator's earlier 2026-09-22 ask *"put either contract or symbol name right in each and every table"*. One lock-free load + one hash probe per row, zero allocation. NULL (never guessed) for spots, indices and futures — the table is built from option rows only. `market_depth` deliberately does NOT get it in this change: about 1.5 billion rows a session on the one write path QuestDB already cannot keep up with, so that cost goes to the operator first |
+| `exchange_timestamp LONG` column | written on every row | **REMOVED** — from the CREATE, the self-heal column list, the ILP write, `TickRow`, `scripts/questdb-init.sh` and the console runbook |
+| Designated timestamp | `ts` | `ts` — **UNCHANGED** |
+| DEDUP key | `(ts, security_id, segment, capture_seq, feed)` | **UNCHANGED** |
+| How `ts` is computed | `row_timestamp_ist_nanos(LTT, received_at)` | **UNCHANGED** |
+
+QuestDB cannot reorder or drop a column on an existing table, and the self-heal is `ADD COLUMN IF NOT EXISTS`, which can only add. The new order therefore takes effect **only when `ticks` is recreated**. `ticks` is already in `fresh_start_reset::RESET_TABLES`, and that reset has never run in production (the module is not on `main`), so the first boot of this build drops and recreates `ticks` in the new shape. An older volume that somehow keeps its `ticks` keeps the old column (never written again, NULL on new rows) — harmless, never wrong.
+
+#### ⚠ What is LOST, and the query that recovers most of it (Rule 11)
+
+The column held the vendor's raw last-trade time verbatim. Two things it answered:
+
+1. **"When did this trade happen?"** — still answered by `ts`, which IS that time for every in-band trade. Nothing lost.
+2. **"Is this row a real print, or a never-traded / garbage stamp?"** — `row_timestamp_ist_nanos` stamps a sentinel (LTT below 2020) or out-of-band (above the ceiling) row with its RECEIPT time instead. Before, the raw sentinel stayed visible in `exchange_timestamp`. Now it is not stored.
+
+**Recovery without the column:** a real trade's `ts` is a whole second (Dhan stamps whole seconds), while a fallback row's `ts` equals `received_at` to the nanosecond. So
+
+```sql
+-- rows whose stamp was a sentinel / out-of-band, i.e. NOT a real trade time
+SELECT * FROM ticks WHERE ts = received_at;
+```
+
+isolates them. The only way a real print could match is if the receipt instant were itself an exact whole second equal to the trade second — about one in a billion per row, since receipt carries nanoseconds and is back-dated by ring dwell. **NOT recoverable:** the raw sentinel VALUE itself (e.g. which garbage number the vendor sent). Nothing downstream reads it; the aggregator's refusal counters (`tv_aggregator_tick_refused_total{reason}`) still count every class.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Re-adds `exchange_timestamp` (or any raw-LTT column) to `ticks` without a fresh dated quote.
+- Changes the designated timestamp, the DEDUP key, or `row_timestamp_ist_nanos`'s fallback under cover of this change.
+- Reorders the CREATE without keeping `received_at` first and `ts` second.
+- Removes `ticks` from `RESET_TABLES` before the reset has run once in production (the new order would then never apply).

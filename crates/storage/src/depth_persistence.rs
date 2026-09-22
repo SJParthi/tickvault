@@ -1971,7 +1971,8 @@ impl DepthWriter {
                         ?err,
                         "market_depth flush FAILED and the spill rescue failed too — \
                          {dropped} depth row(s) are permanently gone from the table. The \
-                         raw frames remain in the write-ahead log"
+                         raw frames remain in the write-ahead log ONLY if it accepted them (check \
+                         tv_dhan_ws_wal_dropped_total)"
                     );
                 }
                 // APPROVED: flush-FAILURE error context, never the append path
@@ -2209,7 +2210,8 @@ fn perform_depth_rescue(
                 spill_error = %err,
                 "market_depth flush failed AND the depth spill rescue also failed — \
                  these levels are permanently lost and nothing re-inserts them. The \
-                 raw frames remain in the write-ahead log for manual recovery."
+                 raw frames remain in the write-ahead log ONLY if it accepted them -- a non-zero \
+                 tv_dhan_ws_wal_dropped_total means the disk refused them there too."
             );
             false
         }
@@ -2513,7 +2515,8 @@ impl DepthWriterSink {
                     spill_error = %err,
                     "offloaded market_depth flush failed AND the depth spill rescue also \
                      failed — these levels are permanently lost and nothing re-inserts \
-                     them. The raw frames remain in the write-ahead log for manual recovery."
+                     them. The raw frames remain in the write-ahead log ONLY if it accepted them -- a non-zero \
+                 tv_dhan_ws_wal_dropped_total means the disk refused them there too."
                 );
             }
         }

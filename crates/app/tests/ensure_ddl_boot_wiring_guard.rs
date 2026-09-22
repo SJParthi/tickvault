@@ -3,7 +3,7 @@
 //! The PR-C2 (#1522) Dhan-lane deletion and the #1581 Groww live-feed
 //! deletion removed the ONLY call sites of the candle-table DDL chain
 //! (`drop_legacy_candle_objects` → `ensure_shadow_candle_tables` →
-//! `ensure_named_views`) while the REST-era bar-fold KEPT writing the
+//! the console-view ensure) while the REST-era bar-fold KEPT writing the
 //! `candles_*` tables — so a fresh QuestDB volume auto-created them via
 //! ILP WITHOUT `DEDUP ENABLE UPSERT KEYS` (silent duplicate-row window).
 //!
@@ -14,7 +14,8 @@
 //!    `candle_ddl_boot::run_candle_ddl_at_boot` BEFORE the
 //!    `spawn_seal_writer_loop` call (DDL-before-first-ILP ordering).
 //! 2. `candle_ddl_boot.rs` actually calls the three storage DDL fns in
-//!    the load-bearing drop → ensure → views order (stub-guard).
+//!    the load-bearing view-drop → legacy-drop → ensure order (stub-guard;
+//!    since 2026-09-22 the app creates NO view).
 //! 3. Every LIVE-writer table's ensure fn keeps ≥1 production call site
 //!    (the writer → table → ensure → boot-call-site coverage table).
 
@@ -40,7 +41,7 @@ fn read_src(rel: &str) -> String {
 /// disable something — kept the guard green while the DDL never ran. It was
 /// not hypothetical for the coverage table below: its needles are BARE fn
 /// names, and `candle_ddl_boot.rs`'s own `//!` header names
-/// `ensure_shadow_candle_tables` and `ensure_named_views` (checked
+/// `ensure_shadow_candle_tables` and the (since retired) view creator (checked
 /// 2026-09-22), so those two rows were satisfied by documentation alone.
 fn production_region(src: &str) -> String {
     let region = match src.find("\n#[cfg(test)]") {
@@ -133,23 +134,29 @@ fn test_candle_ddl_boot_awaited_before_seal_writer_spawn_in_main() {
 }
 
 #[test]
-fn test_candle_ddl_boot_calls_drop_ensure_views_in_order() {
+fn test_candle_ddl_boot_drops_views_then_legacy_objects_then_ensures_tables() {
     let boot_src = production_region(&read_src("src/candle_ddl_boot.rs"));
 
+    let views_pos = boot_src
+        .find("console_views::drop_retired_views(questdb).await")
+        .expect("candle_ddl_boot must drop the retired console views");
     let drop_pos = boot_src
         .find("shadow_persistence::drop_legacy_candle_objects(questdb).await")
         .expect("candle_ddl_boot must run the retired-object drop sweep");
     let ensure_pos = boot_src
         .find("shadow_persistence::ensure_shadow_candle_tables(questdb).await")
-        .expect("candle_ddl_boot must ensure the 21 candle tables (DEDUP)");
-    let views_pos = boot_src
-        .find("console_views::ensure_named_views(questdb).await")
-        .expect("candle_ddl_boot must ensure the analyst console views");
+        .expect("candle_ddl_boot must ensure the candle tables (DEDUP)");
 
     assert!(
-        drop_pos < ensure_pos && ensure_pos < views_pos,
-        "load-bearing order: drop legacy objects (free squatted names) -> \
-         ensure candle tables -> named views (validate column refs)"
+        views_pos < drop_pos && drop_pos < ensure_pos,
+        "load-bearing order: drop retired views (a `candles_10m` VIEW squats the \
+         `candles_10m` TABLE name) -> drop legacy objects -> ensure candle tables"
+    );
+    // 2026-09-22 (SECOND) — NO VIEWS ANYWHERE. The app creates no view; the
+    // retired creator must never come back on the boot path.
+    assert!(
+        !boot_src.contains("ensure_named_views"),
+        "a view creator is back on the candle boot path"
     );
 }
 
@@ -182,9 +189,13 @@ fn the_fresh_start_reset_runs_once_before_every_table_ddl() {
     let ensure = boot_src
         .find("shadow_persistence::ensure_shadow_candle_tables(questdb).await")
         .unwrap();
+    let views = boot_src
+        .find("console_views::drop_retired_views(questdb).await")
+        .unwrap();
     assert!(
-        ready_gate < reset_pos && reset_pos < legacy && legacy < ensure,
-        "order: readiness gate -> fresh-start reset -> legacy sweep -> candle ensure"
+        ready_gate < reset_pos && reset_pos < views && views < legacy && legacy < ensure,
+        "order: readiness gate -> fresh-start reset -> retired-view drop -> legacy \
+         sweep -> candle ensure"
     );
 
     let main_src = production_region(&read_src("src/main.rs"));
@@ -212,8 +223,9 @@ fn test_every_live_table_ensure_fn_keeps_its_boot_call_site() {
     let coverage: &[(&str, &str)] = &[
         // candles_* (21 tables) — seal chain writer (rest_candle_fold)
         ("ensure_shadow_candle_tables", "src/candle_ddl_boot.rs"),
-        // analyst console views (read-only projections)
-        ("ensure_named_views", "src/candle_ddl_boot.rs"),
+        // retired console views (2026-09-22 SECOND — the app creates no view;
+        // this sweep must stay, or an old `candles_10m` VIEW blocks the table)
+        ("drop_retired_views", "src/candle_ddl_boot.rs"),
         // ---- The five REST-leg ensure rows are RETIRED 2026-09-17 ----
         //
         // They covered `spot_1m_rest` (×2 callers), `option_chain_1m` (×2) and
@@ -420,76 +432,26 @@ fn the_candle_ddl_is_awaited_before_the_live_table_ddl() {
     );
 }
 
-/// The view re-ensure must fire whenever ANY base table it reads is newly
-/// confirmed — never gated on all three together, and never a one-shot latch.
+/// The live-table DDL loop creates NO view (2026-09-22 SECOND — NO VIEWS
+/// ANYWHERE), and its success return still requires EVERY live table.
 ///
-/// It sat inside `if ticks_ok && depth_ok && rank_ok` until 2026-09-13, which
-/// made the remedy hostage to two unrelated tables: a `ticks` DDL that failed
-/// every attempt skipped the view pass even though `top_volume` had been
-/// created, leaving the four views absent for the whole session.
-///
-/// It was then `if rank_ok && !views_reensured` until 2026-09-22 — a one-shot
-/// latch keyed on the rank table alone, which opened the mirror image: attempt
-/// 1 confirms the rank table and REFUSES `ticks`, the latch is spent on a pass
-/// that cannot build `ticks_named`, and attempt 2's successful `ticks` CREATE
-/// never re-runs it. The gate is now "did the confirmed base-table set grow".
+/// Until 2026-09-22 this loop re-ran a view pass whenever a base table of the
+/// `_named` views appeared. Those views are retired; a re-ensure call returning
+/// here would recreate a view the boot just dropped.
 #[test]
-fn the_view_reensure_is_gated_on_base_table_growth() {
+fn the_live_table_loop_creates_no_view_and_requires_every_table() {
     let boot = production_region(&read_src("src/candle_ddl_boot.rs"));
-
-    // Both view-base verdicts feed the growth check — neither may be dropped.
-    let feed = boot
-        .find("let now = ViewBaseTables {")
-        .expect("the re-ensure gate must build the confirmed base-table set");
-    let feed_block = &boot[feed..];
-    let feed_end = feed_block.find("};").expect("struct literal must close");
-    let feed_block = &feed_block[..feed_end];
-    for field in ["ticks: ticks_ok", "depth: depth_ok"] {
-        assert!(
-            feed_block.contains(field),
-            "the confirmed base-table set must carry `{field}` — a base table \
-             missing from the growth check is a view that is never re-ensured \
-             once it appears"
-        );
-    }
-
-    let gate = boot.find("if now.grew_over(views_covered) {").expect(
-        "the view re-ensure must be gated on the confirmed base-table set \
-         GROWING — never on all three tables together, never on a one-shot latch",
+    let start = boot
+        .find(concat!("pub async ", "fn run_live_table_ddl_at_boot"))
+        .expect("the live-table boot fn must exist");
+    let body = &boot[start..];
+    assert!(
+        !body.contains("ensure_named_views") && !body.contains("ViewBaseTables"),
+        "a view pass is back inside the live-table DDL loop"
     );
     assert!(
-        !boot.contains("if rank_ok && !views_reensured {"),
-        "the one-shot rank latch is back — a `ticks` table confirmed on a later \
-         attempt would never get its `ticks_named` view"
-    );
-    assert!(
-        boot[gate..].contains("views_covered = views_covered.union(now);"),
-        "the covered set must ACCUMULATE, or a table flapping back to refused \
-         re-triggers the pass every attempt"
-    );
-    // Searched from the GATE onward, not from the start of the file.
-    // `run_candle_ddl_at_boot` makes the FIRST `ensure_named_views` call ~75
-    // lines earlier, so a plain `find` locates that one and then "proves" the
-    // gate comes after the call it is supposed to guard. The guard was looking
-    // at the wrong occurrence of a string that legitimately appears twice.
-    assert!(
-        boot[gate..].contains("console_views::ensure_named_views(questdb).await"),
-        "the growth gate must PRECEDE the re-ensure call it guards — no \
-         re-ensure call was found after the gate"
-    );
-
-    // And the success return stays gated on EVERY live table, the four
-    // top-volume tables included: reaching it means every live table is
-    // ready, which is a different claim from "the views were re-attempted".
-    assert!(
-        boot.contains("if ticks_ok && depth_ok && volume_ok {"),
-        "the boot-complete return must still require every live table — \
-         decoupling the view pass must not also weaken what `true` means"
-    );
-    assert!(
-        !feed_block.contains("volume_ok"),
-        "the top-volume tables are no longer read through a view, so their \
-         arrival must not trigger a view pass"
+        body.contains("if ticks_ok && depth_ok && volume_ok {"),
+        "the boot-complete return must still require every live table"
     );
 }
 

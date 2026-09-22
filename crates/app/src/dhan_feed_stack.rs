@@ -8165,7 +8165,7 @@ fn drain_depth_frame(
             // things go wrong without this gate, and the second is the worse
             // one:
             //
-            //   1. A NaN or absurd price renders through `market_depth_named`
+            //   1. A NaN or absurd price is stored in `market_depth`
             //      as a real book price.
             //   2. If the server REJECTS the resulting line, `flush` fails and
             //      `discard_pending` clears the ENTIRE pending buffer — up to

@@ -292,6 +292,8 @@ fn candle_tables_are_swept_via_single_source() {
         "candles_15m",
         "candles_30m",
         "candles_60m",
+        // Since 2026-09-22 ("no views anywhere") 10m is a folded table.
+        "candles_10m",
     ];
     let actual: std::collections::BTreeSet<&str> = names.iter().copied().collect();
     let want: std::collections::BTreeSet<&str> = expected.iter().copied().collect();
@@ -389,9 +391,9 @@ fn emitted_and_retired_candle_names_never_intersect() {
         "both sets must be non-empty or the assertions above are vacuous"
     );
 
-    // The operator's 2026-09-18 directive names the frames that keep a TABLE.
-    // `candles_10m` is deliberately absent: 10m is a DERIVED VIEW over
-    // candles_1m, not a fold frame, so it has no ordinal and no table here.
+    // The operator's 2026-09-18 directive names the frames that keep a TABLE;
+    // 2026-09-22 ("no views anywhere") turned `candles_10m` from a derived view
+    // over candles_1m into a folded table, so it is in the set now.
     let want: BTreeSet<&str> = [
         "candles_1s",
         "candles_3s",
@@ -402,12 +404,13 @@ fn emitted_and_retired_candle_names_never_intersect() {
         "candles_15m",
         "candles_30m",
         "candles_60m",
+        "candles_10m",
     ]
     .into_iter()
     .collect();
     assert_eq!(
         emitted, want,
-        "the emitted candle tables must be exactly the operator's nine fold frames \
-         (10m is a derived view, not a table)"
+        "the emitted candle tables must be exactly the operator's ten fold frames \
+         (10m has been a folded table since 2026-09-22)"
     );
 }
