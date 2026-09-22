@@ -2075,7 +2075,7 @@ mod tests {
     }
 
     #[test]
-    fn ist_date_rolls_at_ist_midnight_not_utc() {
+    fn ist_yyyymmdd_rolls_at_ist_midnight_not_utc() {
         assert_eq!(ist_yyyymmdd(OFF_HOURS_UTC), 20_260_921);
         // 18:29:59 UTC = 23:59:59 IST, same date; one second later rolls.
         assert_eq!(
@@ -2097,7 +2097,7 @@ mod tests {
     }
 
     #[test]
-    fn the_rename_target_is_deterministic_and_a_valid_identifier() {
+    fn rename_target_is_deterministic_and_a_valid_identifier() {
         for table in RESET_TABLES {
             let a = rename_target(table, 20_260_921, |_| false).unwrap();
             let b = rename_target(table, 20_260_921, |_| false).unwrap();
@@ -2127,7 +2127,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_count_and_long_and_table_names() {
+    fn parse_count_and_long_accepts_a_count_and_an_optional_long() {
         assert_eq!(
             parse_count_and_long(r#"{"dataset":[[2,1700000000000000]]}"#),
             Some((2, Some(1_700_000_000_000_000)))
@@ -2140,6 +2140,10 @@ mod tests {
         assert_eq!(parse_count_and_long(r#"{"dataset":[[-1,null]]}"#), None);
         assert_eq!(parse_count_and_long(r#"{"dataset":[[1]]}"#), None);
         assert_eq!(parse_count_and_long("nope"), None);
+    }
+
+    #[test]
+    fn parse_table_names_reads_one_name_per_row_or_refuses() {
         assert_eq!(
             parse_table_names(r#"{"dataset":[["ticks"],["candles_1m"]]}"#),
             Some(vec!["ticks".to_owned(), "candles_1m".to_owned()])

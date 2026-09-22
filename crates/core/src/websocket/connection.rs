@@ -1096,6 +1096,7 @@ const WIRE_WRITE_QUEUE_DEPTH: usize = 8;
 /// write half back. The writer answers a stop at its next poll — even
 /// mid-write, because the write is raced against the stop — so this is a
 /// safety bound, not a wait anyone should observe.
+// APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for; same shape as `PING_SEND_TIMEOUT` above.
 const WRITER_STOP_WAIT: Duration = Duration::from_secs(1);
 
 /// Which kind of write a job carries: selects the timeout, the counters and

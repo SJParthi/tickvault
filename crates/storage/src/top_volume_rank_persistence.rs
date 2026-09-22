@@ -3844,11 +3844,25 @@ mod row_handoff_tests {
     }
 
     #[test]
-    fn staging_keeps_every_column_and_drops_only_the_label() {
+    fn from_row_keeps_every_column_and_drops_only_the_label() {
         let original = row(7);
         let staged = TopVolumeStagedRow::from_row(&original);
         assert_eq!(staged.with_contract(original.contract), original);
-        assert_eq!(staged.with_contract("x").contract, "x");
+    }
+
+    #[test]
+    fn with_contract_swaps_in_the_label_and_nothing_else() {
+        let original = row(7);
+        let relabelled = TopVolumeStagedRow::from_row(&original).with_contract("x");
+        assert_eq!(relabelled.contract, "x");
+        assert_eq!(
+            TopVolumeRankRow {
+                contract: original.contract,
+                ..relabelled
+            },
+            original,
+            "only the contract column may differ"
+        );
     }
 
     #[test]
@@ -3876,7 +3890,7 @@ mod row_handoff_tests {
     }
 
     #[test]
-    fn a_batch_round_trips_through_the_channel_and_its_vector_is_recycled() {
+    fn write_batch_round_trips_a_handed_off_batch_and_recycles_its_vector() {
         let (mut producer, mut writer, rx) =
             TopVolumeRankWriter::for_test().split_rows_for_offload("unmapped");
         for id in [7, 8, 9] {
@@ -3930,7 +3944,7 @@ mod row_handoff_tests {
     }
 
     #[test]
-    fn a_gone_writer_drops_the_sweep() {
+    fn hand_off_to_a_gone_writer_drops_the_sweep() {
         let (mut producer, _writer, rx) =
             TopVolumeRankWriter::for_test().split_rows_for_offload("unmapped");
         drop(rx);

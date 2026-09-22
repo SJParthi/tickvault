@@ -90,7 +90,7 @@
 //     receipt, and `ts` is the first column of the `ticks` DEDUP key — a
 //     re-stamp splits one observation into two rows in two partitions.
 
-use std::fs::{File, OpenOptions}; // O(1) EXEMPT: import line only — uses are the cold writer thread + boot replay
+use std::fs::{File, Metadata, OpenOptions}; // O(1) EXEMPT: import line only — uses are the cold writer thread + boot replay
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -3965,7 +3965,7 @@ fn prune_wal_dir_at(
     // Every `*.wal` in the directory, open segment included — the open one
     // still bounds its predecessor's sequence range (item 44d). One entry per
     // segment, pre-sized to a typical steady-state count; cold path.
-    let mut segments: Vec<(PathBuf, Option<std::fs::Metadata>)> =
+    let mut segments: Vec<(PathBuf, Option<Metadata>)> =
         Vec::with_capacity(ARCHIVE_PRUNE_SURVIVOR_HINT);
     // O(1) EXEMPT: periodic cold archive prune, never the per-frame append
     let Ok(entries) = std::fs::read_dir(&archive_dir) else {
