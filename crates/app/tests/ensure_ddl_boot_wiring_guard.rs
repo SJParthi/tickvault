@@ -31,12 +31,72 @@ fn read_src(rel: &str) -> String {
 
 /// Production region = everything above the first column-0 `#[cfg(test)]`
 /// line (the house source-scan convention), so test-module mentions can
-/// never satisfy a production pin.
+/// never satisfy a production pin — WITH `//` comments stripped.
+///
+/// 2026-09-22: without the strip, a COMMENTED-OUT call satisfied every pin in
+/// this file. `// candle_ddl_boot::run_candle_ddl_at_boot(&config.questdb).await`
+/// contains the needle byte-for-byte, so deleting the real call and leaving
+/// the line behind as a comment — the most natural way to "temporarily"
+/// disable something — kept the guard green while the DDL never ran. It was
+/// not hypothetical for the coverage table below: its needles are BARE fn
+/// names, and `candle_ddl_boot.rs`'s own `//!` header names
+/// `ensure_shadow_candle_tables` and `ensure_named_views` (checked
+/// 2026-09-22), so those two rows were satisfied by documentation alone.
 fn production_region(src: &str) -> String {
-    match src.find("\n#[cfg(test)]") {
-        Some(idx) => src[..idx].to_string(),
-        None => src.to_string(),
+    let region = match src.find("\n#[cfg(test)]") {
+        Some(idx) => &src[..idx],
+        None => src,
+    };
+    strip_line_comments(region)
+}
+
+/// Removes `//`, `///` and `//!` comments, line by line, keeping every newline
+/// so line structure survives.
+///
+/// A whole-line comment becomes an empty line. A TRAILING comment is cut only
+/// when the `//` sits outside a string literal on that line (an even count of
+/// unescaped `"` before it), so `"https://…"` inside a string is kept.
+///
+/// Honest limits: string state is tracked per LINE, so a `//` on the
+/// continuation line of a multi-line string with no quote before it is cut.
+/// That can only REMOVE string text — never add a needle — so its failure
+/// direction is a false red, never a false green. Block comments (`/* */`)
+/// are not stripped; none of the scanned files contains `/*` (checked
+/// 2026-09-22 — re-check if a scanned file gains one).
+fn strip_line_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    for line in src.split_inclusive('\n') {
+        let (body, newline) = match line.strip_suffix('\n') {
+            Some(b) => (b, "\n"),
+            None => (line, ""),
+        };
+        if body.trim_start().starts_with("//") {
+            out.push_str(newline);
+            continue;
+        }
+        let bytes = body.as_bytes();
+        let mut in_str = false;
+        let mut cut = body.len();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' if in_str => {
+                    i += 2;
+                    continue;
+                }
+                b'"' => in_str = !in_str,
+                b'/' if !in_str && bytes.get(i + 1) == Some(&b'/') => {
+                    cut = i;
+                    break;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        out.push_str(&body[..cut]);
+        out.push_str(newline);
     }
+    out
 }
 
 #[test]
@@ -264,6 +324,44 @@ fn test_production_region_split_excises_test_modules() {
     assert!(!region.contains("needle()"));
 }
 
+/// Scanner self-test: a COMMENTED-OUT call must NOT satisfy a pin, while the
+/// same call as live code must — and a `//` inside a string literal is text,
+/// not a comment. Bite-proves `strip_line_comments` in both directions.
+#[test]
+fn test_production_region_ignores_commented_out_calls() {
+    const NEEDLE: &str = "candle_ddl_boot::run_candle_ddl_at_boot(&config.questdb).await";
+    let commented = format!(
+        "fn main() {{\n    // {NEEDLE};\n    /// {NEEDLE}\n    //! {NEEDLE}\n    \
+         let x = 1; // {NEEDLE}\n}}\n"
+    );
+    assert!(
+        !production_region(&commented).contains(NEEDLE),
+        "a commented-out call must not satisfy a production pin"
+    );
+
+    let live = format!("fn main() {{\n    {NEEDLE};\n}}\n");
+    assert_eq!(
+        production_region(&live).matches(NEEDLE).count(),
+        1,
+        "the live call must survive the strip exactly once"
+    );
+
+    let url = "fn f() { let u = \"https://example.invalid/x\"; g(u); } // tail\n";
+    let region = production_region(url);
+    assert!(
+        region.contains("\"https://example.invalid/x\"; g(u); }"),
+        "a `//` inside a string literal is text, not a comment: {region:?}"
+    );
+    assert!(!region.contains("tail"), "the trailing comment must be cut");
+
+    let escaped = "let s = \"a\\\"b // still string\"; real(); // gone\n";
+    let region = production_region(escaped);
+    assert!(
+        region.contains("still string") && region.contains("real();") && !region.contains("gone"),
+        "an escaped quote must not end the string early: {region:?}"
+    );
+}
+
 /// The candle DDL — which carries the LEGACY VIEW SWEEP — must be awaited
 /// BEFORE the live-table DDL, which carries the `top_volume_rank` → `top_volume`
 /// RENAME.
@@ -333,22 +431,52 @@ fn the_legacy_view_sweep_is_awaited_before_the_top_volume_rename() {
     );
 }
 
-/// The `top_volume` view re-ensure must NOT be gated on the tick or depth DDL.
+/// The view re-ensure must fire whenever ANY base table it reads is newly
+/// confirmed — never gated on all three together, and never a one-shot latch.
 ///
 /// It sat inside `if ticks_ok && depth_ok && rank_ok` until 2026-09-13, which
 /// made the remedy hostage to two unrelated tables: a `ticks` DDL that failed
 /// every attempt skipped the view pass even though `top_volume` had been
-/// created, leaving the four views absent for the whole session — precisely the
-/// failure the re-ensure exists to fix.
+/// created, leaving the four views absent for the whole session.
+///
+/// It was then `if rank_ok && !views_reensured` until 2026-09-22 — a one-shot
+/// latch keyed on the rank table alone, which opened the mirror image: attempt
+/// 1 confirms the rank table and REFUSES `ticks`, the latch is spent on a pass
+/// that cannot build `ticks_named`, and attempt 2's successful `ticks` CREATE
+/// never re-runs it. The gate is now "did the confirmed base-table set grow".
 #[test]
 fn the_view_reensure_is_gated_on_the_rank_table_alone() {
     let boot = production_region(&read_src("src/candle_ddl_boot.rs"));
 
-    let gate = boot.find("if rank_ok && !views_reensured {").expect(
-        "the view re-ensure must be gated on `rank_ok` ALONE (plus its \
-             once-per-boot latch), never on ticks_ok/depth_ok — coupling a fix \
-             to conditions it does not depend on makes it unavailable in the \
-             case it was written for",
+    // All three verdicts feed the growth check — none may be dropped from it.
+    let feed = boot
+        .find("let now = ViewBaseTables {")
+        .expect("the re-ensure gate must build the confirmed base-table set");
+    let feed_block = &boot[feed..];
+    let feed_end = feed_block.find("};").expect("struct literal must close");
+    let feed_block = &feed_block[..feed_end];
+    for field in ["ticks: ticks_ok", "depth: depth_ok", "rank: rank_ok"] {
+        assert!(
+            feed_block.contains(field),
+            "the confirmed base-table set must carry `{field}` — a base table \
+             missing from the growth check is a view that is never re-ensured \
+             once it appears"
+        );
+    }
+
+    let gate = boot.find("if now.grew_over(views_covered) {").expect(
+        "the view re-ensure must be gated on the confirmed base-table set \
+         GROWING — never on all three tables together, never on a one-shot latch",
+    );
+    assert!(
+        !boot.contains("if rank_ok && !views_reensured {"),
+        "the one-shot rank latch is back — a `ticks` table confirmed on a later \
+         attempt would never get its `ticks_named` view"
+    );
+    assert!(
+        boot[gate..].contains("views_covered = views_covered.union(now);"),
+        "the covered set must ACCUMULATE, or a table flapping back to refused \
+         re-triggers the pass every attempt"
     );
     // Searched from the GATE onward, not from the start of the file.
     // `run_candle_ddl_at_boot` makes the FIRST `ensure_named_views` call ~75
@@ -357,7 +485,7 @@ fn the_view_reensure_is_gated_on_the_rank_table_alone() {
     // at the wrong occurrence of a string that legitimately appears twice.
     assert!(
         boot[gate..].contains("console_views::ensure_named_views(questdb).await"),
-        "the `rank_ok` gate must PRECEDE the re-ensure call it guards — no \
+        "the growth gate must PRECEDE the re-ensure call it guards — no \
          re-ensure call was found after the gate"
     );
 

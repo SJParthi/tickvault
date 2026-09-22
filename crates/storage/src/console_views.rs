@@ -1730,7 +1730,7 @@ mod tests {
             assert!(!refs.is_empty(), "{view}: found no `{alias}.` references");
             for r in refs {
                 assert!(
-                    cols.iter().any(|c| *c == r),
+                    cols.contains(&r),
                     "{view} selects `{alias}.{r}`, which its base table does not declare — \
                      the CREATE VIEW refuses on a fresh volume"
                 );

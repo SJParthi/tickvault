@@ -4922,12 +4922,15 @@ mod tests {
     /// at the assertions.
     #[test]
     #[ignore = "wall-clock measurement, not a gate"]
+    // The printed table IS this harness's result (run with --nocapture), so
+    // the crate-wide print deny is lifted for this one test fn only.
+    #[allow(clippy::print_stdout)]
     fn radix_vs_comparator_at_every_measured_shape() {
         const ROUNDS: u32 = 50;
         println!("\n  n        comparator      radix        verdict");
         println!("  ------------------------------------------------");
         for &n in &[100usize, 500, 2_000, 20_220] {
-            let base = radix_fixture(n, 0x5DEE_CE66_D, 1_000_000);
+            let base = radix_fixture(n, 0x5_DEEC_E66D, 1_000_000);
             let mut rx = RadixScratch::new();
 
             // Warm both paths so neither pays a first-touch page fault.

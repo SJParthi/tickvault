@@ -298,7 +298,8 @@ fn rescue_one(
 // Lifted verbatim in shape from the WAL replay staging pattern
 // (`ws_frame_spill.rs` — the `replaying/` → confirm → `archive/` chain):
 //
-// 1. **Stage.** Every `seals-*` file in the spill / DLQ dir is MOVED into
+// 1. **Stage.** Every `seals_v4-*` (and legacy `seals-*`) file in the
+//    spill / DLQ dir is MOVED into
 //    `<dir>/replaying/`. Leftovers already sitting in `replaying/` from a
 //    prior crashed boot are re-globbed too, so a crash mid-recovery loses
 //    nothing.
@@ -419,7 +420,8 @@ enum StagedKind {
     Dlq,
 }
 
-/// Moves every `seals-*` file in `dir` into `dir/replaying/` and returns the
+/// Moves every `seals_v4-*` (and legacy `seals-*`) file in `dir` into
+/// `dir/replaying/` and returns the
 /// full staged set (including leftovers from a prior crashed boot).
 ///
 /// A file that cannot be moved is skipped with a `warn!` and left in place —
@@ -835,6 +837,24 @@ pub fn drain_recovered_seals<S: SealSink>(
             seals_reingested = outcome.seals_reingested,
             records_undecodable = outcome.records_undecodable,
             "seal recovery complete — every recovered seal re-ingested"
+        );
+    }
+
+    // Boot-only, so never on a hot path. A skipped record is NOT a re-ingested
+    // one, and until 2026-09-22 the only summary of it was a field on the
+    // `info!` success line above — so a boot that refused every record of a
+    // pre-v4 spill file read as a clean recovery. Name it at `warn!` level,
+    // with the module's own error code, so the skip is findable.
+    if outcome.records_undecodable > 0 {
+        warn!(
+            code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+            records_undecodable = outcome.records_undecodable,
+            current_format_version = SEAL_SPILL_FORMAT_VERSION,
+            "seal recovery SKIPPED {} record(s) it could not decode — most often \
+             files written by an older build in a different format. Those seals \
+             were NOT re-ingested into QuestDB; their files stay on disk (archive/ \
+             or replaying/) for inspection — this drain deletes nothing",
+            outcome.records_undecodable
         );
     }
 

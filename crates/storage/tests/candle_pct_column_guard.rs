@@ -113,6 +113,38 @@ fn squeeze(content: &str) -> String {
     out
 }
 
+/// `needle` occurs in `haystack` as a whole TOKEN: an identifier character at
+/// either EDGE of the needle may not be continued by one in the haystack.
+///
+/// 2026-09-22: every check here used a bare `contains`, and the 2026-09-19
+/// rename made that vacuous in the worst possible place. `percentage_change`
+/// is a SUFFIX of `open_percentage_change`, so `contains("percentage_change
+/// DOUBLE")` was satisfied by the OPEN column alone — deleting the
+/// `percentage_change` DDL line kept the wiring test green. The same shape
+/// applies to `c.total_buy_qty` inside `c.total_buy_qty_x`, and in the removal
+/// direction to a DIFFERENT column that merely ends in a removed name.
+///
+/// Edges that are not identifier characters (`(`, `"`, `.`) carry their own
+/// boundary, so they are not checked — which keeps every existing quoted
+/// needle behaving exactly as before.
+fn contains_token(haystack: &str, needle: &str) -> bool {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let check_left = needle.chars().next().is_some_and(is_ident);
+    let check_right = needle.chars().next_back().is_some_and(is_ident);
+    let mut from = 0;
+    while let Some(rel) = haystack[from..].find(needle) {
+        let at = from + rel;
+        let end = at + needle.len();
+        let left_ok = !check_left || !haystack[..at].chars().next_back().is_some_and(is_ident);
+        let right_ok = !check_right || !haystack[end..].chars().next().is_some_and(is_ident);
+        if left_ok && right_ok {
+            return true;
+        }
+        from = at + 1;
+    }
+    false
+}
+
 // ============================================================================
 // 1. Columns that must be WIRED — all five links, wire name vs struct field
 // ============================================================================
@@ -128,12 +160,12 @@ fn assert_pct_column_wired_end_to_end(wire: &str, field: &str) {
     let (sp_path, sp) = storage_src("shadow_persistence.rs");
     let sp = squeeze(&code_only(&sp));
     assert!(
-        sp.contains(&format!("{wire} DOUBLE")),
+        contains_token(&sp, &format!("{wire} DOUBLE")),
         "{}: candle CREATE TABLE DDL must declare `{wire} DOUBLE`.",
         sp_path.display()
     );
     assert!(
-        sp.contains(&format!("(\"{wire}\", \"DOUBLE\")")),
+        contains_token(&sp, &format!("(\"{wire}\", \"DOUBLE\")")),
         "{}: the candle schema self-heal manifest must carry \
          `(\"{wire}\", \"DOUBLE\")` so a table created before this column \
          existed backfills it via `ALTER TABLE .. ADD COLUMN IF NOT EXISTS`. \
@@ -145,7 +177,7 @@ fn assert_pct_column_wired_end_to_end(wire: &str, field: &str) {
     let (w_path, w) = storage_src("shadow_candle_writer.rs");
     let w = code_only(&w);
     assert!(
-        w.contains(&format!(".column_f64(\"{wire}\", row.{field})")),
+        contains_token(&w, &format!(".column_f64(\"{wire}\", row.{field})")),
         "{}: the ILP `append_seal` builder must emit \
          `.column_f64(\"{wire}\", row.{field})` — a DDL column never written \
          stays NULL, and a wire name fed from the wrong field is worse than an \
@@ -156,7 +188,7 @@ fn assert_pct_column_wired_end_to_end(wire: &str, field: &str) {
     let (r_path, r) = storage_src("shadow_seal_columns.rs");
     let r = code_only(&r);
     assert!(
-        r.contains(&format!("pub {field}: f64")),
+        contains_token(&r, &format!("pub {field}: f64")),
         "{}: the persisted seal-row struct must carry `pub {field}: f64` — it \
          is the source of the `{wire}` column.",
         r_path.display()
@@ -165,7 +197,7 @@ fn assert_pct_column_wired_end_to_end(wire: &str, field: &str) {
     let (s_path, s) = storage_src("seal_spill.rs");
     let s = code_only(&s);
     assert!(
-        s.contains(&format!("pub {field}: f64")),
+        contains_token(&s, &format!("pub {field}: f64")),
         "{}: the on-disk spill record must carry `pub {field}: f64` so a seal \
          that overflows the ring -> spill -> DLQ still re-persists `{wire}` on \
          replay (zero-loss inside the rescue envelope).",
@@ -198,13 +230,13 @@ fn assert_column_removed_from_the_wire(wire: &str) {
     let (sp_path, sp) = storage_src("shadow_persistence.rs");
     let sp_code = squeeze(&code_only(&sp));
     assert!(
-        !sp_code.contains(&format!("{wire} DOUBLE")),
+        !contains_token(&sp_code, &format!("{wire} DOUBLE")),
         "{}: `{wire}` was REMOVED from the candle schema on 2026-09-19 and \
          must not reappear in the CREATE TABLE body.",
         sp_path.display()
     );
     assert!(
-        !sp_code.contains(&format!("(\"{wire}\"")),
+        !contains_token(&sp_code, &format!("(\"{wire}\"")),
         "{}: `{wire}` must NEVER appear in the candle self-heal manifest. \
          QuestDB can ADD a column but can never DROP or RENAME one, so a stale \
          manifest entry re-adds on the next boot exactly what the reset took \
@@ -215,7 +247,7 @@ fn assert_column_removed_from_the_wire(wire: &str) {
     let (w_path, w) = storage_src("shadow_candle_writer.rs");
     let w_code = code_only(&w);
     assert!(
-        !w_code.contains(&format!(".column_f64(\"{wire}\"")),
+        !contains_token(&w_code, &format!(".column_f64(\"{wire}\"")),
         "{}: the ILP builder must not append `{wire}` — ILP AUTO-CREATES any \
          column a writer names, so one leftover append silently re-creates the \
          removed column on a fresh table.",
@@ -247,6 +279,45 @@ fn self_test_code_only_strips_comments_keeps_code() {
     let stripped = code_only(sample);
     assert!(!stripped.contains("in a comment"));
     assert!(stripped.contains("let x = close_pct_from_prev_day;"));
+}
+
+#[test]
+fn self_test_contains_token_refuses_a_column_that_merely_contains_another() {
+    // The live vacuity this closes: the OPEN column satisfied the plain
+    // `contains` check for `percentage_change`.
+    assert!(!contains_token(
+        "open_percentage_change DOUBLE,",
+        "percentage_change DOUBLE"
+    ));
+    assert!(contains_token(
+        "open_percentage_change DOUBLE, percentage_change DOUBLE,",
+        "percentage_change DOUBLE"
+    ));
+    assert!(!contains_token(
+        "pub close_change_pct: f64,",
+        "change_pct: f64"
+    ));
+    assert!(!contains_token(
+        "SELECT c.total_buy_qty_x",
+        "c.total_buy_qty"
+    ));
+    assert!(!contains_token(
+        "SELECT abc.total_buy_qty",
+        "c.total_buy_qty"
+    ));
+    assert!(contains_token(
+        "SELECT c.total_buy_qty, c.x",
+        "c.total_buy_qty"
+    ));
+    // A needle bounded by punctuation keeps plain-substring behaviour.
+    assert!(contains_token(
+        "x.column_f64(\"percentage_change\", row.change_pct)?",
+        ".column_f64(\"percentage_change\", row.change_pct)"
+    ));
+    assert!(!contains_token(
+        ".column_f64(\"open_percentage_change\", row.open_pct)",
+        ".column_f64(\"percentage_change\""
+    ));
 }
 
 #[test]
@@ -290,12 +361,12 @@ fn assert_long_column_wired_end_to_end(col: &str, row_type: &str) {
     let (sp_path, sp_raw) = storage_src("shadow_persistence.rs");
     let sp = squeeze(&code_only(&sp_raw));
     assert!(
-        sp.contains(&format!("{col} LONG")),
+        contains_token(&sp, &format!("{col} LONG")),
         "{}: candle CREATE TABLE DDL must declare `{col} LONG`.",
         sp_path.display()
     );
     assert!(
-        sp.contains(&format!("(\"{col}\", \"LONG\")")),
+        contains_token(&sp, &format!("(\"{col}\", \"LONG\")")),
         "{}: the candle schema self-heal manifest must carry \
          `(\"{col}\", \"LONG\")` so a table created before this column existed \
          backfills it. Without it an upgraded deployment keeps the old schema \
@@ -306,7 +377,7 @@ fn assert_long_column_wired_end_to_end(col: &str, row_type: &str) {
     let (w_path, w_raw) = storage_src("shadow_candle_writer.rs");
     let w = code_only(&w_raw);
     assert!(
-        w.contains(&format!(".column_i64(\"{col}\"")),
+        contains_token(&w, &format!(".column_i64(\"{col}\"")),
         "{}: the ILP append builder must emit `.column_i64(\"{col}\", ...)` — \
          a DDL column never written stays NULL forever.",
         w_path.display()
@@ -315,7 +386,7 @@ fn assert_long_column_wired_end_to_end(col: &str, row_type: &str) {
     let (r_path, r_raw) = storage_src("shadow_seal_columns.rs");
     let r = code_only(&r_raw);
     assert!(
-        r.contains(&format!("pub {col}: {row_type}")),
+        contains_token(&r, &format!("pub {col}: {row_type}")),
         "{}: the persisted seal-row struct must carry `pub {col}: {row_type}`.",
         r_path.display()
     );
@@ -323,7 +394,7 @@ fn assert_long_column_wired_end_to_end(col: &str, row_type: &str) {
     let (v_path, v_raw) = storage_src("console_views.rs");
     let v = code_only(&v_raw);
     assert!(
-        v.contains(&format!("c.{col}")),
+        contains_token(&v, &format!("c.{col}")),
         "{}: the `candles_named` analyst view must project `c.{col}` — a \
          stored column an operator cannot see in the console is a column that \
          does not exist as far as they are concerned.",

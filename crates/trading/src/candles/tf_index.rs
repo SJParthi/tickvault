@@ -23,6 +23,12 @@
 //! per-instrument `[Mutex<LiveCandleState>; TF_COUNT]`, the ILP
 //! `[Sender; TF_COUNT]` writer, the audit-table `timeframe` SYMBOL column)
 //! breaks silently.
+//!
+//! ⚠ **HISTORY — the set is NINE frames since 2026-09-19** (`TF_COUNT = 9`:
+//! `M1 M3 M5 M15 S1 S3 S5 M30 M60`, ordinals 0..=8; `D1` is gone and `10m`
+//! is a view over `candles_1m`). The "21 timeframes", "`candles_1d`" and
+//! "ordinals frozen at 1m…1d 0..=4" text above describes the C3 era; the
+//! ordinals were RENUMBERED on 2026-09-19 (see [`TF_COUNT`]).
 
 /// Number of timeframes the live candle engine derives. Pinned here so
 /// the per-instrument slot array and the storage-side sender array
@@ -326,14 +332,17 @@ pub enum TfIndex {
     // -- The two surviving appended minute frames ---------------------
     /// 30-minute candles (1_800 s).
     M30 = 7,
-    /// 60-minute candles (3_600 s). NOTE the 09:15 IST session anchor
-    /// means the final 60m bucket of a regular session is PARTIAL —
-    /// the grid runs 09:15/10:15/…/15:15, so the last bar covers
-    /// 15:15–15:30 (15 minutes), not a full hour. Same for M30's
-    /// 15:15–15:30 bucket. That is a property of anchoring to the open
-    /// rather than to the hour, and it is deliberate: a bar that starts
-    /// at the open is comparable across days, one that starts at 09:00
-    /// is not.
+    /// 60-minute candles (3_600 s). The grid is anchored at the CANDLE
+    /// session open, `CANDLE_SESSION_OPEN_SECS_OF_DAY_IST` = **09:00 IST**
+    /// (see [`Self::bucket_start`]), so it runs 09:00/10:00/…/15:00. The
+    /// first bar therefore includes the 09:00–09:15 pre-open auction, and
+    /// the last bar of a regular session holds only 15:00–15:30 of trading,
+    /// not a full hour. M30 runs 09:00/09:30/…, so its 15:00 bar is full.
+    ///
+    /// ⚠ CORRECTED 2026-09-22: this doc said the grid was anchored at 09:15
+    /// and ran 09:15/10:15/…/15:15. The code has anchored at 09:00 since the
+    /// 2026-08-28 pre-open directive; only this comment still described the
+    /// old grid.
     M60 = 8,
 }
 

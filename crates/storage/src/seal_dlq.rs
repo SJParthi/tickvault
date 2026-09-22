@@ -9,7 +9,7 @@
 //! - **Recoverable text**. The binary spill file is exact + compact
 //!   but operator-opaque. Once we are routing seals to the DLQ the
 //!   normal pipeline is already broken; the operator needs to be
-//!   able to `cat data/dlq/seals-YYYY-MM-DD.ndjson | jq` to inspect
+//!   able to `cat data/dlq/seals_v4-YYYY-MM-DD.ndjson | jq` to inspect
 //!   what was lost. NDJSON is the canonical text-streaming format
 //!   matching the existing `data/logs/errors.jsonl.*` rotation.
 //! - **Append-only single-line records.** A partial trailing line on
@@ -28,7 +28,7 @@
 //!   without re-deriving the trading-side `BufferedSeal`.
 //! - [`SealDlqWriter`] — append-only NDJSON file writer with the
 //!   exact `seal_spill.rs` API surface:
-//!   - IST-date file rotation (`seals-2026-05-10.ndjson`).
+//!   - IST-date file rotation (`seals_v4-2026-05-10.ndjson`).
 //!   - `append_record()` (one line per call).
 //!   - `read_all()` recovery scan that silently drops corrupt
 //!     lines with `warn!` so a single bad line does NOT stall replay.
@@ -238,7 +238,7 @@ impl From<&SealDlqRecord> for SerializedSeal {
     }
 }
 
-/// Returns today's IST date in `seals-YYYY-MM-DD.ndjson` form for the
+/// Returns today's IST date in `seals_v4-YYYY-MM-DD.ndjson` form for the
 /// DLQ filename. Pure function for testability (clock injected by
 /// caller in tests). Mirrors `seal_spill::ist_date_filename` but with
 /// the `.ndjson` suffix.
@@ -630,7 +630,7 @@ mod tests {
 
     #[test]
     fn test_seal_dlq_record_json_field_names_are_stable_for_jq() {
-        // Operator demand: `cat data/dlq/seals-*.ndjson | jq` must
+        // Operator demand: `cat data/dlq/seals_v4-*.ndjson | jq` must
         // work. Pin the exact JSON keys so a future serde rename
         // does not silently break operator tooling.
         let r = SealDlqRecord::from(&mk_serialized_seal(13, 0, 0, 1_716_000_900, 102.5));

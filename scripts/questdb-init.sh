@@ -121,7 +121,9 @@ apply_dedup_keys() {
 # Phase 3: Candle tables — owned by the app candle engine (NOT this script)
 # ---------------------------------------------------------------------------
 # Since the "one common candle engine" convergence (#1189), every candle
-# timeframe (candles_1m … candles_1d) is a REAL TABLE that the running app
+# timeframe (candles_1s, _3s, _5s, _1m, _3m, _5m, _15m, _30m, _60m — the
+# 10-minute frame is the derived `candles_10m` VIEW over candles_1m, and the
+# old 10s/15s/30s/2m/1d frames are retired) is a REAL TABLE that the running app
 # folds directly from `ticks` (O(1) per tick) and seals via its aggregator —
 # NOT a QuestDB materialized view. The app's idempotent boot DDL creates +
 # DEDUP-keys those tables and drops any stale matview squatting the name.

@@ -6,12 +6,18 @@
 //! At **15:40 IST** every trading day (after the Dhan 15:30:05 close-time
 //! force-seal + writer drain and the 15:31 cross-verify burst, before the
 //! 15:45 scoreboard), recompute every stored higher-timeframe candle — the
-//! **6** minute-scale TFs `2m`, `3m`, `5m`, `15m`, `30m`, `60m`
-//! (`tf_verify_targets` = `TfIndex::ALL` minus the 16 second-scale frames,
-//! minus `M1` the recompute baseline, minus `D1`, which is excluded by
-//! design: Dhan drops D1 at the write boundary per `live-feed-purity.md`
-//! rule 10) — from its constituent `candles_1m` rows and compare EXACTLY
-//! (integer-paise OHLC, exact i64 volume).
+//! **5** minute-scale TFs `3m`, `5m`, `15m`, `30m`, `60m`
+//! (`tf_verify_targets` = `TfIndex::ALL` minus the 3 second-scale frames
+//! `1s`/`3s`/`5s`, minus `M1` the recompute baseline) — from its constituent
+//! `candles_1m` rows and compare EXACTLY (integer-paise OHLC; volume compared
+//! as the GROSS magnitude, because `volume` is signed and a signed sum across
+//! frames is not the frame's own sign).
+//!
+//! *(**CORRECTED 2026-09-22:** this said "**6** … `2m` … minus the 16
+//! second-scale frames … minus `D1`" and "exact i64 volume". Since the
+//! 2026-09-19 nine-frame collapse `M2` and `D1` no longer exist, there are 3
+//! second-scale frames, and the volume compare is `checked_abs` on both
+//! sides.)*
 //!
 //! *(**CORRECTED 2026-08-25:** this said "the 3 TFs `3m..15m`". True when
 //! written; `M2`, `M30` and `M60` joined `TfIndex::ALL` afterwards and
@@ -841,9 +847,10 @@ pub fn select_1m_sql(
     )
 }
 
-/// Per-SID 3-way UNION ALL across `candles_3m..candles_15m`, each arm
-/// tagged with its display label. Pure; excludes `candles_1m` (the
-/// baseline) and `candles_1d` (excluded by design).
+/// Per-SID UNION ALL with one arm per [`tf_verify_targets`] frame (today
+/// 5: `candles_3m`, `_5m`, `_15m`, `_30m`, `_60m`), each arm tagged with its
+/// display label. Pure; excludes `candles_1m` (the baseline). There is no
+/// `candles_1d` to exclude since the 2026-09-19 nine-frame collapse.
 #[must_use]
 pub fn select_tf_union_sql(
     feed: &str,

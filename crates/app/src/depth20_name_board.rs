@@ -212,7 +212,9 @@ const _: () = assert!(
 /// the [`NameMove`] field of the same name, the comparator in [`rank_names`]
 /// that orders that field, and these doc links. **It finds no call site.**
 /// The key the board actually ranks on is produced by
-/// [`move_bps_from_pct`], from a QuestDB `close_pct_from_prev_day` column.
+/// [`move_bps_from_pct`], from the movers query's `close_pct_from_prev_day`
+/// field — a SELECT alias over `candles_1m.percentage_change` (the column was
+/// renamed 2026-09-19) or, pre-open, over tick arithmetic.
 ///
 /// It cannot be wired today, and the reason is structural rather than a
 /// missing line: its two inputs live in `SpotPriceStore` and `PrevCloseStore`,
@@ -556,8 +558,9 @@ const _: () = assert!(
 /// behind a lock on the hot path.
 ///
 /// What the steering loop does have is [`MoverRow::pct_change`], which is
-/// `close_pct_from_prev_day` read from QuestDB — the LATEST sealed `candles_1m`
-/// row for the underlying, or, before the first candle seals at ~09:16, a
+/// the previous-day move read from QuestDB — `candles_1m.percentage_change`
+/// (aliased `close_pct_from_prev_day`) on the LATEST sealed row for the
+/// underlying, or, before the first candle seals at ~09:16, a
 /// tick-derived pre-open ranking (`build_preopen_movers_query`). So it answers
 /// the same QUESTION from a different source with a different freshness:
 ///
@@ -674,8 +677,10 @@ pub fn name_moves(movers: &[MoverRow]) -> Vec<NameMove> {
 /// which was first written asserting the opposite and caught.
 ///
 /// `held` is what the board CHOSE last minute, not what the wire acked. The
-/// two differ while a swap is in flight — moving one name costs 24 swaps
-/// against a budget of 20 a minute — and choosing from the wire would let a
+/// two differ while a swap is in flight — moving one name costs 23 swaps
+/// (`slots_for_stock_name(5)`: a spot plus 22 option legs), spread over the
+/// sockets its flat-chunked slots land on, and a refused or unacknowledged
+/// swap carries into the next minute — and choosing from the wire would let a
 /// name the board is still placing read as "not held" and be re-contested
 /// every minute until it landed.
 ///
@@ -1167,7 +1172,7 @@ pub fn build_name_layout(
 //
 // Until this section, `grep -c 'metrics::'` over this module returned **0**.
 // Every outcome the board produces — how many names it chose, how many it
-// could not resolve, how many lost a future or a spot, how many swaps the
+// could not resolve, how many lost a spot, how many swaps the
 // per-socket cap refused — existed ONLY inside the caller's `tracing::info!`,
 // which is a line an operator reads after something ELSE has already told
 // them to look.
@@ -1509,9 +1514,10 @@ mod tests {
 
     #[test]
     fn a_name_that_slips_out_of_the_entry_set_keeps_its_slots_inside_the_band() {
-        // THE hysteresis test. Moving one name costs 24 of the 20 swaps a
-        // minute affords, so a board that evicted on a single-rank slip could
-        // never catch up to its own ranking.
+        // THE hysteresis test. Moving one name costs 23 swaps (a spot plus 22
+        // option legs), and every eviction is that many swaps whose books
+        // start blank (no snapshot-on-subscribe), so a board that evicted on a
+        // single-rank slip would spend the session chasing its own ranking.
         let ranked = rank_names((1..=30).map(|i| n(i, 1_000 - i as i64)).collect());
         let board = split_board(&ranked);
         let ninth = ranked[8];
@@ -2392,8 +2398,8 @@ mod tests {
         );
 
         // `swaps_planned`/`swaps_capped` are the caller's numbers, so they are
-        // exercised with a shape the wire can really produce: moving one name
-        // costs 24 swaps against the 20 a minute affords.
-        record_name_board_plan(&plan, 20, 4);
+        // exercised with a shape the wire can really produce: one name moved
+        // (23 swaps), four of which the per-socket cap refused this minute.
+        record_name_board_plan(&plan, 19, 4);
     }
 }

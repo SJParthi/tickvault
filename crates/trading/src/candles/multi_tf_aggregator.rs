@@ -189,7 +189,7 @@ pub struct ConsumeStats {
     /// `true` when the tick was refused before any state was touched because
     /// its price was `NaN` / `±Inf` / non-positive. Nothing was folded.
     pub refused_price: bool,
-    /// `true` when the tick fell outside the `[09:15, 15:40)` IST candle
+    /// `true` when the tick fell outside the `[09:00, 15:40)` IST candle
     /// window. Nothing was folded.
     pub out_of_session: bool,
     /// `true` when the vendor stamped this tick for a LATER IST day than our
@@ -1229,10 +1229,14 @@ impl MultiTfAggregator {
             };
         }
 
-        // Candle-window gate. The bucket grid is 09:15-ANCHORED
-        // (`TfIndex::bucket_start` clamps an earlier timestamp to the first
-        // bucket), so a pre-open tick that slipped past this gate would not
-        // form a pre-open candle — it would CORRUPT the 09:15 candle.
+        // Candle-window gate. The bucket grid is anchored at 09:00 (the
+        // CANDLE session open, `CANDLE_SESSION_OPEN_SECS_OF_DAY_IST` — so M60
+        // runs 09:00/10:00/…, not 09:15/10:15/…), and `TfIndex::bucket_start`
+        // clamps anything earlier into the first bucket; this gate is what
+        // keeps a tick before 09:00 from corrupting that first bucket.
+        // (Until 2026-09-22 this line said "09:15-ANCHORED … would CORRUPT
+        // the 09:15 candle", which described the pre-2026-08-28 grid — see
+        // the note below.)
         // 2026-08-28: gated on the FOLD clock, so the window a tick is
         // admitted to is the same window its bucket will be placed in. Gating
         // on one clock and bucketing on the other admits a tick the grid then

@@ -5,7 +5,7 @@
 //! when the in-memory ring (`crates/trading/src/candles/seal_ring.rs`,
 //! merged via PR #557) overflows, the evicted oldest entries flow
 //! through this module and land in
-//! `data/spill/seals-YYYYMMDD.bin` as fixed-size 128-byte binary
+//! `data/spill/seals_v4-YYYY-MM-DD.bin` as fixed-size 128-byte binary
 //! records. On recovery, the storage-side writer task re-reads the
 //! spill file and re-attempts the ILP send.
 //!
@@ -17,7 +17,7 @@
 //!   Self-contained; does NOT import `tickvault-trading` so this slice
 //!   adds no new workspace dep edge.
 //! - [`SealSpillWriter`] — append-only file writer with:
-//!   - IST-date file rotation (`seals-2026-05-10.bin`), on a LONG-LIVED
+//!   - IST-date file rotation (`seals_v4-2026-05-10.bin`), on a LONG-LIVED
 //!     handle: the file is opened once per IST day, not once per seal
 //!     (2026-08-10 — see [`SealSpillWriter::append_seal`]).
 //!   - Idempotent fixed-record append (`O(1)` per append, ONE `write(2)`).
@@ -928,10 +928,10 @@ impl SealSpillWriter {
                 ?path,
                 legacy_refused,
                 current_format_version = SEAL_SPILL_FORMAT_VERSION,
-                "refused spill records written under an OLDER format version (their \
-                 tf_ordinal belongs to a superseded TfIndex ordinal space, so \
-                 decoding them would file a seal under the wrong timeframe; deleted \
-                 with the file after drain)"
+                "refused spill records written under a DIFFERENT format version, \
+                 older or newer (their tf_ordinal belongs to another TfIndex \
+                 ordinal space, so decoding them would file a seal under the \
+                 wrong timeframe; deleted with the file after drain)"
             );
         }
         info!(?path, count = all.len(), "drained spill file");
@@ -1388,6 +1388,47 @@ mod tests {
 
         writer.clear_spill_for_date(now).expect("clear");
         assert!(!path.exists(), "spill file deleted after drain");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_all_refuses_a_future_version_record_like_an_older_one() {
+        // The gate is `!=`, not `<`: a record stamped by a NEWER binary (a
+        // deploy rollback reads it) is just as unreadable as an older one,
+        // because its tf_ordinal belongs to an ordinal space this binary does
+        // not know. Pin the forward direction so the gate can never be
+        // "simplified" back to `<` without failing the build.
+        let dir = temp_spill_dir("future-version-refusal");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = 1_716_000_000_i64;
+
+        let future = mk_seal(19, 0, 3, 1_716_001_200, 150.25);
+        let mut future_bytes = future.to_bytes();
+        future_bytes[7] = SEAL_SPILL_FORMAT_VERSION.wrapping_add(1);
+        assert!(
+            future_bytes[7] > SEAL_SPILL_FORMAT_VERSION,
+            "the forged record must be genuinely NEWER than the live constant",
+        );
+
+        let current = mk_seal(25, 1, 2, 1_716_001_500, 200.75);
+        let current_bytes = current.to_bytes();
+
+        let path = writer.spill_path(now);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        let mut raw = Vec::with_capacity(2 * SEAL_SPILL_RECORD_SIZE);
+        raw.extend_from_slice(&future_bytes);
+        raw.extend_from_slice(&current_bytes);
+        std::fs::write(&path, &raw).expect("write mixed spill file");
+
+        let drained = writer.read_all(now).expect("read");
+        assert_eq!(
+            drained.len(),
+            1,
+            "a future-version record must be refused, the current one drained"
+        );
+        assert_eq!(drained[0], current);
+
+        writer.clear_spill_for_date(now).expect("clear");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

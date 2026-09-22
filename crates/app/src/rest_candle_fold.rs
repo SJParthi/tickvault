@@ -2758,8 +2758,7 @@ mod tests {
         // whole-session bucket that no surviving frame produces.
         let last_m60 = sealed
             .iter()
-            .filter(|s| s.tf == TfIndex::M60)
-            .next_back()
+            .rfind(|s| s.tf == TfIndex::M60)
             .expect("the widest frame must seal at close");
         assert_eq!(last_m60.bucket.close, 200.5);
         assert_eq!(last_m60.bucket.volume, 2);

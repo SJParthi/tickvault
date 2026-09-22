@@ -23,6 +23,20 @@
 //! `top_volume`, and `ensure_named_views` recreates every view. The reset
 //! itself creates nothing but its own log.
 //!
+//! ## Schema
+//!
+//! ```sql
+//! CREATE TABLE IF NOT EXISTS schema_reset_log (
+//!     reset_id SYMBOL, ts TIMESTAMP
+//! ) timestamp(ts);
+//! ```
+//!
+//! Two fixed columns, no partitioning, no DEDUP key: it holds one row per
+//! reset id ever run (one today), and the read-back before each re-insert is
+//! what keeps a lost insert reply from doubling it. It has no generic
+//! `ADD COLUMN IF NOT EXISTS` self-heal because its shape is the reset's
+//! contract - a new column would be a new reset, with its own dated quote.
+//!
 //! # Why it cannot fire twice
 //!
 //! There is exactly ONE id and it is a compile-time constant. Minting a second

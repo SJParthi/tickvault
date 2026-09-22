@@ -268,15 +268,22 @@ older binaries do not read `format_version` at all.
 **How it is closed (mechanically, no operator step).** v4 files are named
 `seals_v4-YYYY-MM-DD.bin` and `seals_v4-YYYY-MM-DD.ndjson`. Every older binary
 selects files with `starts_with("seals-")`, which does not match `seals_v4-`, so
-after a rollback the older binary never opens a v4 file. The files stay on disk
-untouched and recoverable, and the next v4 binary drains them. The guarantee is
+after a rollback the older binary never opens a v4 file for replay, and the
+next v4 binary drains them. The guarantee is
 pinned by a compile-time assert in `seal_writer_task.rs` (the current prefix
 must not start with the legacy one) and by filename tests in `seal_spill.rs` and
 `seal_dlq.rs`.
 
 **What a rollback still costs:** any seals spilled by the v4 binary are NOT
 replayed while the older binary runs. They wait on disk until a v4-or-later
-binary boots again.
+binary boots again — but only for about a week. The spill retention sweep
+(`seal_spill::prune_spill_files`, run from the periodic health loop with
+`SPILL_FILE_MAX_AGE_SECS` = 7 days, in both old and new binaries) selects files
+by the `.bin` EXTENSION, not the name prefix, so it deletes a `seals_v4-*.bin`
+spill file once its last write is more than 7 days old. Roll forward within 7
+days, or copy `data/spill/seals_v4-*.bin` somewhere safe first. The DLQ
+(`data/dlq/`) is never pruned, so `seals_v4-*.ndjson` files are kept
+indefinitely.
 
 Rolling FORWARD is safe: the v4 drain still globs legacy `seals-*` files,
 REFUSES every record whose `format_version` is not 4, counts it, and archives

@@ -684,10 +684,16 @@ pub fn render_delay_into(out: &mut String, nanos: i64) {
 /// states are honest; a column that is written under one name and read under
 /// another would not be.
 ///
-/// `volume` is the one exception and is KEPT here on purpose: it is the
-/// Phase-2 target name for the candle's signed volume, so a fresh table should
-/// already have it. Nothing writes it during Phase 1 — see
-/// [`TopVolumeRankRow::cumulative_day_volume`].
+/// `volume` is NAMED here and IS written: it carries the candle's signed
+/// gross volume for the window (see [`TopVolumeRankRow::volume`]), the same
+/// number the `candles_<tf>` row carries. The fresh-start reset collapsed the
+/// old two-phase rename into one step, so there is no `candle_volume_signed`
+/// and no `cumulative_day_volume` column any more.
+///
+/// *(CORRECTED 2026-09-22: this paragraph said `volume` was a Phase-2 target
+/// that "nothing writes during Phase 1" and linked a
+/// `TopVolumeRankRow::cumulative_day_volume` field that no longer exists.
+/// Both described the pre-reset plan.)*
 #[must_use]
 pub fn top_volume_rank_create_ddl() -> String {
     format!(

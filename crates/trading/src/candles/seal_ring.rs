@@ -9,8 +9,8 @@
 //! ## Why a separate ring (vs reusing tick_persistence's machinery)
 //!
 //! Per locked decision L-C1: sealed candles are NOT ticks. The IST
-//! midnight burst force-seals every open bucket across all 21 TFs in a
-//! single tokio yield, and the persistence path differs (21 distinct
+//! midnight burst force-seals every open bucket across all `TF_COUNT` (9) TFs in a
+//! single tokio yield, and the persistence path differs (9 distinct
 //! plain candle tables, one ILP `Sender` per TF). A dedicated ring
 //! keeps the seal absorption budget independent of the (since-retired)
 //! tick path's rescue ring.
@@ -18,8 +18,8 @@
 //! ## RAM budget
 //!
 //! `SEAL_BUFFER_CAPACITY = AGGREGATOR_MAX_SLOTS × TF_COUNT` (25,000 × 9
-//! = 225,000) and `BufferedSeal` ≤ 144 bytes → **~32 MB worst-case**.
-//! 0.10% of the r8g.xlarge 32 GiB host (operator Quote 13, 2026-08-08).
+//! = 225,000) and `BufferedSeal` ≤ 168 bytes → **~37.8 MB worst-case**.
+//! 0.11% of the r8g.xlarge 32 GiB host (operator Quote 13, 2026-08-08).
 //! Was a hardcoded 200,000 (~29 MB) until 2026-08-10 — see the constant's
 //! own doc for why that literal under-sized the midnight burst by 3×.
 //!
@@ -29,8 +29,9 @@
 //! explicitly warns against doing exactly that — and this header did it
 //! anyway. It went stale a SECOND time on 2026-09-19, when the nine-frame
 //! collapse took `TF_COUNT` 24 → 9 and the ring with it (600,000 → 225,000,
-//! ~86 MB → ~32 MB). Twice in five weeks, the same way. The numbers above
-//! are re-derived; if you are reading them long after 2026-09-19, verify
+//! ~86 MB → ~32 MB at the then-144-byte seal; ~37.8 MB once the
+//! 2026-09-19 receipt stamps took the seal to 168 bytes). Twice in five
+//! weeks, the same way. The numbers above are re-derived; if you are reading them long after 2026-09-19, verify
 //! against `TF_COUNT` rather than trusting them.
 //!
 //! ## Drop semantics on overflow
@@ -40,7 +41,7 @@
 //! seal is evicted to make room for the new one. The caller (a future
 //! storage-crate writer task) is responsible for the spill-to-disk
 //! escalation: when ring length exceeds the high-watermark, the
-//! oldest-N entries spill to `data/spill/seals-YYYYMMDD.bin`. When
+//! oldest-N entries spill to `data/spill/seals_v4-YYYY-MM-DD.bin`. When
 //! disk also fails, NDJSON DLQ catches every payload.
 //!
 //! Drop-OLDEST (vs drop-newest) preserves the most recent seals which

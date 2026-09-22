@@ -120,7 +120,10 @@ pub struct LiveCandleState {
     /// This field and `total_buy_qty` together occupy the 8 bytes vacated by
     /// `volume_pct_from_prev_day` (same 2026-05-28 removal). The struct is
     /// therefore UNCHANGED at 128 bytes and every downstream size assertion
-    /// holds without being raised.
+    /// holds without being raised. (That was the 2026-05-28 size. The struct
+    /// is **152 bytes today** — 136 on 2026-09-10 for `net_volume_signed`,
+    /// 152 on 2026-09-19 for the two receipt stamps — pinned by
+    /// `the_state_is_152_bytes_and_every_size_assert_knows_it`.)
     pub total_sell_qty: u32,
     /// Today's SESSION open (the official 09:15 open). Static per trading
     /// day; last non-zero value wins. Feeds `open_pct` at seal.
@@ -827,8 +830,9 @@ mod tests {
     /// Their DDL columns were removed 2026-05-28 (spot has no OI, indices have
     /// no volume) and the fields then sat in every bar holding a permanent
     /// `0.0` — 16 bytes per state, multiplied by `TF_COUNT` slots and again by
-    /// `last_sealed`, in a struct pinned at exactly 128 bytes by three separate
-    /// compile-time assertions with zero slack between them.
+    /// `last_sealed`, in a struct pinned at exactly 128 bytes (at the time;
+    /// 152 today) by three separate compile-time assertions with zero slack
+    /// between them.
     ///
     /// Reclaiming those 16 bytes is what pays for `bucket_open_prev_close`
     /// (8) + `total_buy_qty` (4) + `total_sell_qty` (4). This test is the

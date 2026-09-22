@@ -1353,9 +1353,20 @@ mod tests {
         // lot, so the whole-lot figure is that over 1,000.
         let expected = (u64::from(u32::MAX) * 3 / 1_000) as i64;
         assert_eq!(p.rows[0].total_lots_traded, expected);
+        // Anti-vacuity, stated on the quantity that is actually widened.
+        //
+        // 2026-09-22: this compared the whole-LOT count against
+        // `u32::MAX / 1_000` under the message "must exceed a 32-bit lot
+        // count". The lot count (~1.29e7) is nowhere near 32 bits, so the
+        // message was false; the bound only held because dividing both sides
+        // by 1,000 made it a proxy for the real claim. The real claim is about
+        // the milli-lot KEY — the `u64` that `i64::try_from` widens — and it
+        // is now asserted directly against `u32::MAX`: a key that fits 32
+        // bits would let an `as u32` truncation on this path pass unnoticed.
         assert!(
-            expected > i64::from(u32::MAX) / 1_000,
-            "the fixture must exceed a 32-bit lot count, or it proves nothing"
+            ranked[0].window_lots_milli > u64::from(u32::MAX),
+            "the fixture's rank key must exceed u32::MAX, or a truncating cast \
+             of the key would go unnoticed and this test proves nothing"
         );
     }
 
