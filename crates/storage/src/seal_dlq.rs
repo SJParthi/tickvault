@@ -249,7 +249,7 @@ fn ist_date_filename(now_unix_secs: i64) -> String {
         .timestamp_opt(ist_secs, 0)
         .single()
         .unwrap_or_else(|| Utc.timestamp_opt(0, 0).single().unwrap_or_default());
-    dt.format("seals-%Y-%m-%d.ndjson").to_string()
+    dt.format("seals_v4-%Y-%m-%d.ndjson").to_string()
 }
 
 /// Append-only NDJSON DLQ writer. One instance lives in the writer
@@ -734,7 +734,12 @@ mod tests {
             .expect("valid")
             .timestamp();
         let name = ist_date_filename(utc_noon);
-        assert_eq!(name, "seals-2026-01-01.ndjson");
+        assert_eq!(name, "seals_v4-2026-01-01.ndjson");
+        assert!(name.starts_with(crate::seal_writer_task::SEAL_FILE_PREFIX));
+        assert!(
+            !name.starts_with(crate::seal_writer_task::LEGACY_SEAL_FILE_PREFIX),
+            "a v4 DLQ file must be invisible to a pre-v4 binary's drain"
+        );
         assert!(name.ends_with(".ndjson"));
     }
 
@@ -747,7 +752,7 @@ mod tests {
             .expect("valid")
             .timestamp();
         let name = ist_date_filename(utc);
-        assert_eq!(name, "seals-2026-05-10.ndjson");
+        assert_eq!(name, "seals_v4-2026-05-10.ndjson");
     }
 
     #[test]
@@ -773,7 +778,7 @@ mod tests {
             .expect("valid")
             .timestamp();
         let p = writer.dlq_path(utc_noon);
-        assert!(p.to_string_lossy().ends_with("seals-2026-05-10.ndjson"));
+        assert!(p.to_string_lossy().ends_with("seals_v4-2026-05-10.ndjson"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

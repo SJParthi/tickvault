@@ -1121,6 +1121,44 @@ async fn run_ddl(client: &Client, base_url: &str, table: &str, ddl: &str) -> boo
 mod tests {
     use super::*;
 
+    /// The self-heal list and the candle `CREATE` must name the SAME columns,
+    /// with the SAME types, in the SAME order. A name only in the CREATE is a
+    /// column an upgraded table never gets (it stays empty forever, silently);
+    /// a name only in the list re-adds, every boot, a column the reset removed.
+    /// Read from this file's own source so the pin cannot drift from the DDL.
+    #[test]
+    fn the_self_heal_list_is_the_candle_create_column_for_column() {
+        let src = include_str!("shadow_persistence.rs");
+        let start = src
+            .find("CREATE TABLE IF NOT EXISTS {table} (")
+            .expect("candle CREATE present");
+        let body = &src[start..];
+        let end = body.find(") timestamp(ts)").expect("CREATE terminator");
+        let mut create: Vec<(String, String)> = Vec::new();
+        for line in body[..end].lines().skip(1) {
+            let cleaned = line
+                .trim()
+                .trim_end_matches('\\')
+                .trim()
+                .trim_end_matches(',');
+            let mut parts = cleaned.split_whitespace();
+            if let (Some(name), Some(ty)) = (parts.next(), parts.next()) {
+                create.push((name.to_string(), ty.to_string()));
+            }
+        }
+        assert_eq!(create.first().map(|c| c.0.as_str()), Some("ts"));
+        let create: Vec<(String, String)> = create.into_iter().skip(1).collect();
+        let heal: Vec<(String, String)> = CANDLE_SELF_HEAL_COLUMNS
+            .iter()
+            .map(|(n, t)| ((*n).to_string(), (*t).to_string()))
+            .collect();
+        assert_eq!(
+            create, heal,
+            "candle CREATE (minus ts) and CANDLE_SELF_HEAL_COLUMNS diverged"
+        );
+        assert_eq!(heal.len(), 21, "22-column candle contract = ts + 21");
+    }
+
     // ========================================================================
     // P2c (coverage-gaps #1076): DDL-walk + legacy-drop arm coverage via a
     // file-local mock HTTP server (same idiom as tick_persistence::tests).

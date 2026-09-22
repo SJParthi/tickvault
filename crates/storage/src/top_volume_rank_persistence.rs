@@ -1,4 +1,4 @@
-//! `top_volume` table â a queryable record of WHICH option contracts
+//! `top_volume` table — a queryable record of WHICH option contracts
 //! were the busiest, and whether we were actually watching them.
 //!
 //! Operator directive 2026-09-06: *"ensure to capture the top volume gainers
@@ -10,8 +10,8 @@
 //! ## Why this table exists
 //!
 //! The ranking itself lives in RAM (`crates/app/src/volume_leaderboard.rs`)
-//! and dies with the process. That is correct for the DECISION path â a
-//! trading decision never reads the database â but it means three questions
+//! and dies with the process. That is correct for the DECISION path — a
+//! trading decision never reads the database — but it means three questions
 //! were unanswerable after a session ended:
 //!
 //! * which contracts were actually the heaviest, minute by minute?
@@ -25,12 +25,12 @@
 //! ## What a row is
 //!
 //! ONE row per (snapshot boundary, timeframe, family, contract). The
-//! designated `ts` is the SNAPSHOT boundary â a whole second â so a
+//! designated `ts` is the SNAPSHOT boundary — a whole second — so a
 //! re-emitted snapshot UPSERTs in place rather than duplicating (the
 //! scoreboard mechanic). A contract appears at most once per (snapshot,
 //! timeframe, family) already.
 //!
-//! ## â  `rank` was REMOVED 2026-09-13, and an existing table still has it
+//! ## ⚠ `rank` was REMOVED 2026-09-13, and an existing table still has it
 //!
 //! Operator: *"i clelary told you to rmeve the rank in top volume"*. The
 //! column is gone from the CREATE, from the ALTER manifest, from the row
@@ -38,7 +38,7 @@
 //!
 //! **What happens to a box that already has the table is worth stating
 //! plainly, because it is not what "removed" sounds like.** This module's
-//! self-heal is CREATE â `ADD COLUMN IF NOT EXISTS` â `DEDUP ENABLE`, and it
+//! self-heal is CREATE → `ADD COLUMN IF NOT EXISTS` → `DEDUP ENABLE`, and it
 //! contains no DROP by design (`top_volume_rank_ensure_statements_never_drop_
 //! and_end_with_dedup_enable` fails the build on one, because a DROP in a path
 //! that runs every boot deletes history on any boot). QuestDB cannot drop a
@@ -49,7 +49,7 @@
 //! every row before it keeps the value it had. It is not removed from disk, it
 //! is not reclaimed, and nothing here pretends otherwise. Actually dropping it
 //! is a one-line `ALTER TABLE top_volume DROP COLUMN rank` run by an operator
-//! against a table this repository never drops automatically â or it ages out
+//! against a table this repository never drops automatically — or it ages out
 //! with the 15-day `RetentionClass::MarketData` window on its own. A FRESH
 //! table (a new box, or after the retention sweep has cycled) never has the
 //! column at all.
@@ -71,7 +71,7 @@
 //!   DEDUP UPSERT KEYS(ts, tf, family, feed, security_id, segment);
 //! ```
 //!
-//! `PARTITION BY HOUR` matches `ticks` and `market_depth` â this is
+//! `PARTITION BY HOUR` matches `ticks` and `market_depth` — this is
 //! high-frequency snapshot data and the hour is the archival unit that makes
 //! same-day archive-then-drop possible. `underlying_id` is stored as the
 //! numeric id we actually hold, NOT a name: the ranking layer never sees a
@@ -95,7 +95,7 @@
 //!
 //! ## Honest volume
 //!
-//! â  EVERY FIGURE IN THIS SECTION WAS RE-DERIVED 2026-09-12, and the previous
+//! ⚠ EVERY FIGURE IN THIS SECTION WAS RE-DERIVED 2026-09-12, and the previous
 //! ones are recorded rather than deleted because all of them shared one
 //! premise that the operator's own change removed.
 //!
@@ -117,12 +117,12 @@
 //!   every tracked contract of both families to trade inside one second.
 //! * Per session: the four cadences fire 23,100 + 7,700 + 4,620 + 385 = **35,805**
 //!   times over 09:15-15:39. At an ASSUMED mean of 2,000 traded contracts per
-//!   sweep that is **71.6M rows, ~6.30 GB** at the ~88 B row width â roughly 5x
+//!   sweep that is **71.6M rows, ~6.30 GB** at the ~88 B row width — roughly 5x
 //!   the old figure and ~2% of the ~307 GB a session already writes.
 //!
-//!   â  CORRECTED 2026-09-12: this read "22,440 + 7,480 + 4,488 + 374 = ~34,782",
-//!   which is a 22,440-second window â i.e. a 15:29 close. The window is
-//!   `TICK_PERSIST_END` 56,400 â `TICK_PERSIST_START` 33,300 = **23,100 s**, as
+//!   ⚠ CORRECTED 2026-09-12: this read "22,440 + 7,480 + 4,488 + 374 = ~34,782",
+//!   which is a 22,440-second window — i.e. a 15:29 close. The window is
+//!   `TICK_PERSIST_END` 56,400 − `TICK_PERSIST_START` 33,300 = **23,100 s**, as
 //!   `the_capture_window_closes_after_the_1539_minute` pins. Understated 2.9%.
 //!   Small, and corrected because every figure below is derived from it.
 //!
@@ -143,11 +143,11 @@
 //! RETENTION, stated because it is a standing commitment and not a one-day
 //! cost: `HOUR_PARTITIONED_TABLES` membership puts this table in
 //! `RetentionClass::MarketData`, whose window is `market_data_hot_days`
-//! (default 15). â  CORRECTED 2026-09-12: this said "**92 GB resident** â¦ about
+//! (default 15). ⚠ CORRECTED 2026-09-12: this said "**92 GB resident** … about
 //! 15%", which multiplied the per-session figure by 15. `market_data_hot_days`
 //! is 15 CALENDAR days, and 15 calendar days is roughly **11 trading
-//! sessions** â the volume writes nothing on a weekend. At the corrected
-//! ~6.30 GB/session that is **â69 GB resident** on the 600 GB volume, about
+//! sessions** — the volume writes nothing on a weekend. At the corrected
+//! ~6.30 GB/session that is **≈69 GB resident** on the 600 GB volume, about
 //! **11.5%**, still well up from the 2.4% the old figures claimed. Wrong in
 //! the SAFE direction (it over-stated the commitment by ~33%), and corrected
 //! anyway: a sizing figure nobody can reproduce is a figure the next reader
@@ -165,12 +165,12 @@ use tracing::{error, warn};
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::error_code::ErrorCode;
 
-/// QuestDB table name â one row per (snapshot, timeframe, family, contract).
+/// QuestDB table name — one row per (snapshot, timeframe, family, contract).
 ///
-/// â  RENAMED 2026-09-12 from `top_volume_rank` to `top_volume` (operator:
+/// ⚠ RENAMED 2026-09-12 from `top_volume_rank` to `top_volume` (operator:
 /// "dotnt make it as top volume rank table meake the table name as top volume
 /// alone"). The rows already written under the old name are CARRIED FORWARD by
-/// [`LEGACY_TOP_VOLUME_RANK_TABLE`] below, never abandoned â a second table
+/// [`LEGACY_TOP_VOLUME_RANK_TABLE`] below, never abandoned — a second table
 /// holding half the history is the split this repo's own rename helper exists
 /// to detect and report.
 pub const TOP_VOLUME_RANK_TABLE: &str = "top_volume";
@@ -181,30 +181,30 @@ pub const TOP_VOLUME_RANK_TABLE: &str = "top_volume";
 /// [`TOP_VOLUME_RANK_TABLE`] BEFORE its CREATE, so a box that already holds
 /// rows carries them into the new name instead of stranding them in a table
 /// that is no longer swept by the partition manager. The rename fails on every
-/// boot after the first, and that failure is EXPECTED and not an error â see
+/// boot after the first, and that failure is EXPECTED and not an error — see
 /// `try_rename_legacy_table`, which additionally reports a SPLIT if both names
 /// somehow exist at once.
 pub const LEGACY_TOP_VOLUME_RANK_TABLE: &str = "top_volume_rank";
 
 /// DEDUP key. Designated `ts` FIRST (2026-04-28 regression rule); `segment`
-/// alongside `security_id` (I-P1-11 â the bare id is reused across segments
+/// alongside `security_id` (I-P1-11 — the bare id is reused across segments
 /// and two instruments would silently collapse into one row); `feed` in-key
 /// (operator override 2026-06-28, feed-in-key EVERYWHERE).
 ///
 /// Declared as a `DEDUP_KEY_*` const rather than an inline literal because
 /// `dedup_segment_meta_guard` discovers keys by scanning for that name
-/// pattern â an inline literal would put this key OUTSIDE the guard.
+/// pattern — an inline literal would put this key OUTSIDE the guard.
 ///
 /// The key is UNCHANGED by the 2026-09-13 column changes: `contract` and
 /// `net_volume_chg_milli_pct` are both leaf display columns, and `contract` in
-/// particular must stay OUT â it is a pure function of `security_id`, so
+/// particular must stay OUT — it is a pure function of `security_id`, so
 /// adding it would widen the key with no new identity while making a stale
 /// label able to duplicate a row.
 pub const DEDUP_KEY_TOP_VOLUME_RANK: &str = "ts, tf, family, feed, security_id, segment";
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
-/// Snapshot cadence label â the `tf` SYMBOL column. Stable wire strings.
+/// Snapshot cadence label — the `tf` SYMBOL column. Stable wire strings.
 ///
 /// `#[repr(u8)]` with EXPLICIT discriminants, following `TfIndex` (the
 /// workspace's other ordinal-indexed enum): the discriminant IS the array
@@ -219,14 +219,14 @@ const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum SnapshotCadence {
-    /// Every whole second â the fine-grained record.
+    /// Every whole second — the fine-grained record.
     OneSecond = 0,
     /// Every three seconds (operator 2026-09-12).
     ThreeSecond = 1,
-    /// Every five seconds â the boundary at which the depth set is re-steered,
+    /// Every five seconds — the boundary at which the depth set is re-steered,
     /// so these rows are the ones that actually drove a subscription decision.
     FiveSecond = 2,
-    /// Every minute (operator 2026-09-12) â the coarse frame, and the only one
+    /// Every minute (operator 2026-09-12) — the coarse frame, and the only one
     /// whose window spans a depth re-steer rather than coinciding with one.
     OneMinute = 3,
 }
@@ -238,7 +238,7 @@ impl SnapshotCadence {
     /// A const array rather than a derive, for the reason `LegRefusal::ALL`
     /// carries: adding a variant without adding it here is a silent
     /// under-count, and the ranking's per-cadence baselines are sized from
-    /// `ALL.len()` â an under-count there would alias two cadences onto one
+    /// `ALL.len()` — an under-count there would alias two cadences onto one
     /// baseline and make both boards report a window neither one measured.
     ///
     /// The const assert below proves this list is in ordinal order with no
@@ -246,7 +246,7 @@ impl SnapshotCadence {
     /// stable-Rust construct counts an enum's variants (`variant_count` is
     /// nightly), so a fifth variant added here and nowhere else still
     /// compiles. What stops that reaching production is
-    /// [`Self::slot`] â a checked index that REFUSES an unlisted cadence and
+    /// [`Self::slot`] — a checked index that REFUSES an unlisted cadence and
     /// counts the refusal, instead of indexing out of bounds on the frame
     /// drain, where `panic = "abort"` would take the process down mid-session.
     pub const ALL: [Self; 4] = [
@@ -256,7 +256,7 @@ impl SnapshotCadence {
         Self::OneMinute,
     ];
 
-    /// The array slot for this cadence â the `#[repr(u8)]` discriminant.
+    /// The array slot for this cadence — the `#[repr(u8)]` discriminant.
     ///
     /// Structural: there is no `match` to keep in step with [`Self::ALL`].
     /// Callers that index a `[_; ALL.len()]` array must go through
@@ -269,7 +269,7 @@ impl SnapshotCadence {
 
     /// The array slot, bounds-checked against [`Self::ALL`].
     ///
-    /// `None` means a variant exists that `ALL` does not list â the one
+    /// `None` means a variant exists that `ALL` does not list — the one
     /// failure the ordinal-order assert cannot rule out. Every caller that
     /// would otherwise write `array[cadence.index()]` uses this, so that
     /// mistake becomes a counted refusal on a cold path instead of an
@@ -294,7 +294,7 @@ impl SnapshotCadence {
         }
     }
 
-    /// Stable wire label. Never reworded â it is a persisted SYMBOL value.
+    /// Stable wire label. Never reworded — it is a persisted SYMBOL value.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -341,7 +341,7 @@ impl SnapshotCadence {
     }
 }
 
-/// `ALL` is in ordinal order, with no gaps and no duplicates â so
+/// `ALL` is in ordinal order, with no gaps and no duplicates — so
 /// `ALL[i].index() == i` for every slot, and `index()` can be used as an
 /// array subscript without a lookup. Adding a variant in the middle, or
 /// listing one twice, fails the BUILD rather than silently re-pointing one
@@ -363,12 +363,12 @@ const _: () = {
 /// One ranked contract at one snapshot boundary, ready for ILP write.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TopVolumeRankRow<'a> {
-    /// Designated timestamp â the SNAPSHOT boundary in IST nanoseconds.
+    /// Designated timestamp — the SNAPSHOT boundary in IST nanoseconds.
     /// A whole second, so a re-emit UPSERTs in place.
     pub snapshot_ts_ist_nanos: i64,
     /// Snapshot cadence (`1s` / `3s` / `5s` / `1m`).
     pub cadence: SnapshotCadence,
-    /// Option family â stock and index options are ranked in SEPARATE
+    /// Option family — stock and index options are ranked in SEPARATE
     /// leaderboards, and the column records which one this row came from.
     pub family: &'static str,
     /// Feed that produced the volume (`dhan`).
@@ -377,7 +377,7 @@ pub struct TopVolumeRankRow<'a> {
     ///
     /// `&'static str`, like `family` and `feed` beside it. It was `String`
     /// until 2026-09-08, and the producer filled it with
-    /// `contract.segment.as_str().to_string()` â where `ExchangeSegment::as_str`
+    /// `contract.segment.as_str().to_string()` — where `ExchangeSegment::as_str`
     /// ALREADY returns `&'static str` and this consumer immediately calls
     /// `.as_str()` on it again. A heap allocation and a copy, round-tripping a
     /// static string back to itself.
@@ -388,22 +388,22 @@ pub struct TopVolumeRankRow<'a> {
     /// already `&'static str`, so the type was the odd one out as well as the
     /// costly one.
     pub segment: &'static str,
-    /// The FULL human label for this contract â underlying, expiry, strike and
+    /// The FULL human label for this contract — underlying, expiry, strike and
     /// leg in one column: `NIFTY-25Sep2026-24500-CE`.
     ///
     /// Operator 2026-09-13: *"i need to know the precise symbol anme as well
     /// dude see suposoe if it has symbol contartc options strieks expriy emasn
     /// we ened to know evryhtign in a single column also as well"*. Before it,
     /// answering "which contract is this row" needed a join to
-    /// `instrument_lifecycle` â and `underlying_id` alone cannot distinguish
+    /// `instrument_lifecycle` — and `underlying_id` alone cannot distinguish
     /// two strikes of the same stock.
     ///
     /// # Why a borrow and not a `String`
     ///
     /// The projection runs on the FRAME-DRAIN task over up to
     /// `TOP_VOLUME_MAX_ROWS_PER_SWEEP` rows across four cadences. A `String`
-    /// here is one heap allocation per row per sweep â order 80,000 a second
-    /// at the ceiling â on the path whose first principle is zero allocation.
+    /// here is one heap allocation per row per sweep — order 80,000 a second
+    /// at the ceiling — on the path whose first principle is zero allocation.
     /// The label is CONSTANT for a given contract (underlying, expiry, strike
     /// and leg never change for a security id), so it is rendered ONCE when the
     /// day's contract map is published and this field borrows it out of that
@@ -419,14 +419,14 @@ pub struct TopVolumeRankRow<'a> {
     /// per-ROW-unique value.
     ///
     /// `contract_underlying_map::UNLABELLED_CONTRACT` when the label snapshot
-    /// has no entry â counted as `SnapshotRefusal::LabelUnavailable`, never
+    /// has no entry — counted as `SnapshotRefusal::LabelUnavailable`, never
     /// silently blank, and the row is still written.
     pub contract: &'a str,
     /// The contract's own security id.
     pub security_id: i64,
-    /// The underlying's numeric id. NOT a name â see the module header.
+    /// The underlying's numeric id. NOT a name — see the module header.
     pub underlying_id: i64,
-    /// Units per contract, from the day's master â the DENOMINATOR of the
+    /// Units per contract, from the day's master — the DENOMINATOR of the
     /// rank key. Stored as `per_lot_quantity` since 2026-09-19 (renamed from
     /// `lot_size` on the operator's plain-names instruction).
     ///
@@ -454,7 +454,7 @@ pub struct TopVolumeRankRow<'a> {
     /// the operator has ruled that the displayed number is worth more than
     /// that resolution.
     ///
-    /// â  **The rounding is real, and since 2026-09-19 it is NOT recoverable
+    /// ⚠ **The rounding is real, and since 2026-09-19 it is NOT recoverable
     /// from the row.** A contract that traded less than one whole lot in the
     /// window reads `0`, and two contracts that traded 1.2 and 1.8 lots both
     /// read `1`. Until the operator's 15-column narrowing the row also carried
@@ -473,7 +473,7 @@ pub struct TopVolumeRankRow<'a> {
     /// **The volume-percentage change, as a WHOLE NUMBER.**
     ///
     /// A 200-per-lot contract that traded 8,000 units in the window reads
-    /// **3900** â not `3900.0`, not `39.00`, and not the `3_900_000`
+    /// **3900** — not `3900.0`, not `39.00`, and not the `3_900_000`
     /// milli-percent the column carried until 2026-09-19.
     ///
     /// # Why the scale changed (operator, 2026-09-19)
@@ -484,9 +484,9 @@ pub struct TopVolumeRankRow<'a> {
     /// the operator reads this table directly and has ruled that a whole
     /// number is worth more than the three hidden decimals.
     ///
-    /// â  **It is a strictly-increasing transform of the lots figure, not
+    /// ⚠ **It is a strictly-increasing transform of the lots figure, not
     /// independent information.** The two rank identically, which is why the
-    /// comparator still sorts the leaderboard's own full-resolution integer â
+    /// comparator still sorts the leaderboard's own full-resolution integer —
     /// a float comparator is non-transitive on a NaN and corrupts a whole sort
     /// rather than misplacing one row. It is stored because the operator
     /// should not have to know the transform. If the two columns ever
@@ -495,9 +495,9 @@ pub struct TopVolumeRankRow<'a> {
     /// Integer, never a `DOUBLE`: it is derived from an integer key, and a
     /// float here could round two distinct keys onto one printed value.
     pub volume_percentage_change: i64,
-    /// **The candle fold's own signed volume for this window** â the exact
+    /// **The candle fold's own signed volume for this window** — the exact
     /// number `candles_<tf>.volume` carries for the same
-    /// `(ts, security_id, segment, feed)` â or `None` when the fold has no bar
+    /// `(ts, security_id, segment, feed)` — or `None` when the fold has no bar
     /// to read.
     ///
     /// # This column IS the candle's number, with no derivation (operator, 2026-09-19)
@@ -506,7 +506,7 @@ pub struct TopVolumeRankRow<'a> {
     /// in our candles tabels even in our top volume rigtht dude so that no
     /// extra claucltion or derivation"*. So the value is READ off the same
     /// `MultiTfAggregator` probe the candle writer seals from, never
-    /// recomputed here â if the two tables ever disagree, the bug is in the
+    /// recomputed here — if the two tables ever disagree, the bug is in the
     /// probe, not in an arithmetic difference between two derivations.
     ///
     /// It is **signed gross**: negative when the bar closed below the previous
@@ -519,7 +519,7 @@ pub struct TopVolumeRankRow<'a> {
     ///
     /// Until 2026-09-19 this number lived in `candle_volume_signed` while
     /// `volume` held the vendor's CUMULATIVE day counter, because QuestDB's
-    /// self-heal can add a column but can neither rename nor drop one â so
+    /// self-heal can add a column but can neither rename nor drop one — so
     /// re-pointing the name on a live table would have given one column two
     /// meanings across a partition boundary, with nothing in the row to tell a
     /// reader which meaning theirs carried. The operator's fresh-scratch
@@ -528,35 +528,35 @@ pub struct TopVolumeRankRow<'a> {
     /// second meaning to collide with, so Phase 1 and Phase 2 collapse into
     /// one and the column is simply called what it is.
     ///
-    /// Written as an ABSENT ILP field, i.e. NULL, when the fold has no bar â
+    /// Written as an ABSENT ILP field, i.e. NULL, when the fold has no bar —
     /// never a `0`, which would read as "traded nothing" when the truth is
     /// "did not trade in the window this grid measures".
     pub volume: Option<i64>,
-    /// **Close vs YESTERDAY's close**, in percent â the headline day change,
-    /// byte-identical to what `candles_<tf>.change_pct` carries for the same
+    /// **Close vs YESTERDAY's close**, in percent — the headline day change,
+    /// byte-identical to what `candles_<tf>.percentage_change` carries for the same
     /// `(ts, security_id, segment, feed)`.
     ///
     /// # Byte-identical by construction, not by coincidence (2026-09-19)
     ///
     /// Both columns are filled from the SAME `LiveCandleState` field,
     /// `close_pct_from_prev_day`, on the same bar: the candle writer reads it
-    /// in `shadow_seal_columns::from_buffered_seal` (which writes that one
-    /// field into BOTH its `close_pct_from_prev_day` and `change_pct`
-    /// columns), and this row reads it off the same probe that already
-    /// fetches [`Self::candle_volume_signed`]. Nothing is re-derived here â
+    /// in `shadow_seal_columns::from_buffered_seal` (the row field keeps its
+    /// old name `change_pct`; the COLUMN has been `percentage_change` since
+    /// 2026-09-19), and this row reads it off the same probe that already
+    /// fetches [`Self::volume`]. Nothing is re-derived here —
     /// operator 2026-09-19: *"no extra claucltion or derivation"*.
     ///
     /// `None` when the fold has no bar for this window, exactly as the
     /// candle-sourced columns beside it. A NULL here is not a defect: it means
     /// this contract did not trade inside the window the candle grid measures.
     pub percentage_change: Option<f64>,
-    /// **Close vs TODAY's 09:15 session open**, in percent â byte-identical to
+    /// **Close vs TODAY's 09:15 session open**, in percent — byte-identical to
     /// `candles_<tf>.open_pct` for the same bar, from the same
     /// `LiveCandleState::open_pct` field.
     ///
-    /// â  NOT the opening gap. That is `open_gap_pct`, a different candle
+    /// ⚠ NOT the opening gap. That is `open_gap_pct`, a different candle
     /// column measuring the session OPEN against yesterday's close, and it is
-    /// deliberately not carried here â the operator asked for "open percentage
+    /// deliberately not carried here — the operator asked for "open percentage
     /// change", which is the column whose name it matches.
     ///
     /// `0.0` at the source when `session_open` is `0.0` (the fold's
@@ -567,7 +567,7 @@ pub struct TopVolumeRankRow<'a> {
     /// snapshot. The column that makes the table an audit rather than trivia.
     ///
     /// Read from the steering loops' LAST publish, which happens once a
-    /// minute per pool â so inside one minute the value can lag a swap by up
+    /// minute per pool — so inside one minute the value can lag a swap by up
     /// to that minute, and always in the understating direction (a contract
     /// just swapped IN reads `false` until the next publish). See
     /// `depth_subscription_view` for why that direction is the honest one.
@@ -578,7 +578,7 @@ pub struct TopVolumeRankRow<'a> {
 ///
 /// Each band stops SHORT of the round number above it so a value never renders
 /// as `1000 microseconds` when `1 millisecond` is the true reading: the
-/// microsecond band ends at 999,499 ns (which rounds to 999 Âµs) and the
+/// microsecond band ends at 999,499 ns (which rounds to 999 µs) and the
 /// millisecond band begins at 999,500 ns (which rounds to 1 ms).
 const DELAY_MICRO_FLOOR_NANOS: i64 = 1_000;
 const DELAY_MILLI_FLOOR_NANOS: i64 = 999_500;
@@ -586,7 +586,7 @@ const DELAY_SECOND_FLOOR_NANOS: i64 = 999_500_000;
 
 /// Renders a nanosecond delay as whole units of ONE band, into `out`.
 ///
-/// # The contract (operator 2026-09-18, Â§19 Â§4)
+/// # The contract (operator 2026-09-18, §19 §4)
 ///
 /// > "if it is below microseconds I need to know it took 100 or 1000
 /// > microseconds, or if it is in milliseconds then the data should be like
@@ -597,10 +597,10 @@ const DELAY_SECOND_FLOOR_NANOS: i64 = 999_500_000;
 ///
 /// | nanoseconds | renders as |
 /// |---|---|
-/// | `< 1,000` | whole **nanoseconds** â `4 nanoseconds` |
-/// | `1,000 .. 999,499` | whole **microseconds** â `100 microseconds` |
-/// | `999,500 .. 999,499,999` | whole **milliseconds** â `123 milliseconds` |
-/// | `>= 999,500,000` | whole **seconds** â `1 second` |
+/// | `< 1,000` | whole **nanoseconds** — `4 nanoseconds` |
+/// | `1,000 .. 999,499` | whole **microseconds** — `100 microseconds` |
+/// | `999,500 .. 999,499,999` | whole **milliseconds** — `123 milliseconds` |
+/// | `>= 999,500,000` | whole **seconds** — `1 second` |
 ///
 /// Rounding is to NEAREST within the band, and singular/plural follows the
 /// number (`1 second`, `2 seconds`).
@@ -610,11 +610,11 @@ const DELAY_SECOND_FLOOR_NANOS: i64 = 999_500_000;
 /// `1 second` covers 999,500,000 .. 1,499,999,999 ns. That loss is the
 /// operator's own instruction and is confined to the SENTENCE: every delay is
 /// stored twice, and the `_ns` column always carries the exact signed figure.
-/// Nothing is lost from the table â only from the phrase.
+/// Nothing is lost from the table — only from the phrase.
 ///
 /// **And the `_ns` twin is not a convenience.** Text sorted descending
-/// compares the first character and stops, so four real delays â 1 second,
-/// 2 milliseconds, 3 microseconds, 4 nanoseconds â sort to `4, 3, 2, 1`: the
+/// compares the first character and stops, so four real delays — 1 second,
+/// 2 milliseconds, 3 microseconds, 4 nanoseconds — sort to `4, 3, 2, 1`: the
 /// exact REVERSE of their true order, and it looks entirely plausible. Any
 /// `ORDER BY` must use the `_ns` column; the rendered string is for a human to
 /// read, never for a query to sort.
@@ -623,15 +623,15 @@ const DELAY_SECOND_FLOOR_NANOS: i64 = 999_500_000;
 ///
 /// The drain back-dates `received_at_nanos` by ring dwell
 /// (`Utc::now() - frame.received_at.elapsed()`), so a tick can carry a receipt
-/// instant BEFORE the window it lands in. `unsigned_abs` takes the magnitude â
+/// instant BEFORE the window it lands in. `unsigned_abs` takes the magnitude —
 /// never `abs()`, which panics on `i64::MIN` under the release profile's
-/// `overflow-checks = true` â and the sign is carried as a leading `-` so the
+/// `overflow-checks = true` — and the sign is carried as a leading `-` so the
 /// sentence cannot silently claim a negative delay was positive.
 ///
 /// # Allocation
 ///
 /// Writes into a caller-owned buffer, which the caller CLEARS first. The naive
-/// `format!` shape would be three fresh `String`s per row â at the measured
+/// `format!` shape would be three fresh `String`s per row — at the measured
 /// 20,220-contract ceiling that is 60,660 allocations per sweep, on the frame
 /// drain, in a codebase whose first principle is zero allocation on the hot
 /// path. One reused buffer is the whole difference.
@@ -657,13 +657,13 @@ pub fn render_delay_into(out: &mut String, nanos: i64) {
     // `String`'s `fmt::Write` impl is infallible, so this Result can only ever
     // be `Ok`. It is DISCARDED rather than unwrapped because `unwrap_used` and
     // `expect_used` are both denied outside tests, and a panic path on the
-    // frame drain â under `panic = "abort"` â for an error that cannot occur
+    // frame drain — under `panic = "abort"` — for an error that cannot occur
     // is a worse trade than an ignored Ok.
     //
     // `_ =` rather than `let _ =`: clippy's `let_underscore_must_use` fires on
     // the second and not the first, and the destructuring-assignment form is
     // the modern idiom for a deliberate discard. No `#[allow]` is needed, so
-    // none is added â the house rule requires an `// APPROVED:` beside every
+    // none is added — the house rule requires an `// APPROVED:` beside every
     // allow, and an allow that can be avoided should be.
     _ = write!(out, "{value} {unit}");
     if value != 1 {
@@ -676,8 +676,8 @@ pub fn render_delay_into(out: &mut String, nanos: i64) {
 ///
 /// `lot_size`, `window_lots_milli` and `net_volume_chg_milli_pct` were RENAMED
 /// on 2026-09-19 (`per_lot_quantity`, `total_lots_traded`,
-/// `volume_percentage_change`), and `gain_pct` â the UNDERLYING's move, a
-/// different instrument's number sitting in a contract's row â was DELETED on
+/// `volume_percentage_change`), and `gain_pct` — the UNDERLYING's move, a
+/// different instrument's number sitting in a contract's row — was DELETED on
 /// the same instruction. QuestDB's self-heal can add a column but can neither
 /// rename nor drop one, so an EXISTING table keeps all four as orphans that go
 /// NULL from the deploy onward, while a FRESH table never grows them. Both
@@ -686,7 +686,7 @@ pub fn render_delay_into(out: &mut String, nanos: i64) {
 ///
 /// `volume` is the one exception and is KEPT here on purpose: it is the
 /// Phase-2 target name for the candle's signed volume, so a fresh table should
-/// already have it. Nothing writes it during Phase 1 â see
+/// already have it. Nothing writes it during Phase 1 — see
 /// [`TopVolumeRankRow::cumulative_day_volume`].
 #[must_use]
 pub fn top_volume_rank_create_ddl() -> String {
@@ -756,14 +756,14 @@ pub fn top_volume_rank_ensure_statements() -> Vec<String> {
 /// `STORAGE-GAP-03` and the walk continues, so one refused statement never
 /// hides the next. The honest consequence, stated rather than hidden: a
 /// failed ensure leaves the table to be auto-created by the first ILP write
-/// WITHOUT `DEDUP UPSERT KEYS` â a duplicate-row window until a later ensure
+/// WITHOUT `DEDUP UPSERT KEYS` — a duplicate-row window until a later ensure
 /// succeeds. Blocking the boot instead would trade a duplicate-row window
 /// for no session at all.
 ///
 /// Returns `true` only when EVERY statement was accepted, so the boot's
 /// bounded retry loop (`candle_ddl_boot::run_live_table_ddl_at_boot`) can
 /// re-run it beside `ticks` and `market_depth`. Until 2026-09-08 this fn
-/// returned `()` and had ZERO production callers â the table was written by
+/// returned `()` and had ZERO production callers — the table was written by
 /// its offload writer every second and ensured by nothing, so a fresh
 /// volume (the 2026-09-08 nuke) would have let the first ILP row auto-create
 /// it with no DEDUP key at all.
@@ -783,7 +783,7 @@ pub async fn ensure_top_volume_rank_table(questdb_config: &QuestDbConfig) -> boo
                 code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
                 stage = "ensure_client_build",
                 ?err,
-                "STORAGE-GAP-03: HTTP client build failed â top_volume_rank not \
+                "STORAGE-GAP-03: HTTP client build failed — top_volume_rank not \
                  ensured (the first ILP write may auto-create it WITHOUT dedup, \
                  a duplicate-row window until the next successful boot)"
             );
@@ -799,7 +799,7 @@ pub async fn ensure_top_volume_rank_table(questdb_config: &QuestDbConfig) -> boo
     //
     // The refusal is the NORMAL case from the second boot onward, which is why
     // this goes through `try_rename_legacy_table` rather than the DDL loop
-    // below â that loop fires a coded error and increments a persist-error
+    // below — that loop fires a coded error and increments a persist-error
     // counter, and an error whose steady state is "one per boot, forever"
     // trains the operator to discount the counter. The helper additionally
     // probes whether the legacy table still exists on a refusal and reports a
@@ -807,7 +807,7 @@ pub async fn ensure_top_volume_rank_table(questdb_config: &QuestDbConfig) -> boo
     //
     // The `== Split` arm is NOT optional, and an earlier draft of this call
     // discarded the verdict with `let _ =`. Both tables present means the
-    // history is halved â new rows in `top_volume`, everything before the
+    // history is halved — new rows in `top_volume`, everything before the
     // rename stranded in `top_volume_rank`, which is no longer in
     // `HOUR_PARTITIONED_TABLES` and so is never swept. That is the exact
     // failure the comment above is about, and swallowing the verdict made it
@@ -845,7 +845,7 @@ pub async fn ensure_top_volume_rank_table(questdb_config: &QuestDbConfig) -> boo
         // sets with two meanings. The `stage` label separates them and the
         // coded `error!` below is the real triage surface; a dedicated metric
         // name would cost ~$0.30/mo against a September forecast of $142.24
-        // and an automatic `STOP_EC2_INSTANCES` line at $135.00, which Â§2.3n of
+        // and an automatic `STOP_EC2_INSTANCES` line at $135.00, which §2.3n of
         // the noise lock says needs a LEVER and not a cost note. Recorded, not
         // spent.
         metrics::counter!(
@@ -859,7 +859,7 @@ pub async fn ensure_top_volume_rank_table(questdb_config: &QuestDbConfig) -> boo
             legacy_table = LEGACY_TOP_VOLUME_RANK_TABLE,
             current_table = TOP_VOLUME_RANK_TABLE,
             "STORAGE-GAP-03: both the legacy and current top-volume tables exist \
-             â the ranking history is SPLIT across two tables. New rows land in \
+             — the ranking history is SPLIT across two tables. New rows land in \
              the current name; everything written before the rename stays in the \
              legacy one, which is NOT in the hour-partitioned retention list and \
              is therefore never swept. Neither is dropped; merging is an operator \
@@ -887,7 +887,7 @@ pub async fn ensure_top_volume_rank_table(questdb_config: &QuestDbConfig) -> boo
                     ddl = ddl.as_str(),
                     body = %body.chars().take(200).collect::<String>(),
                     "STORAGE-GAP-03: top_volume_rank DDL returned non-2xx \
-                     (dedup may be missing â duplicate-row window)"
+                     (dedup may be missing — duplicate-row window)"
                 );
             }
             Err(err) => {
@@ -905,7 +905,7 @@ pub async fn ensure_top_volume_rank_table(questdb_config: &QuestDbConfig) -> boo
     all_accepted
 }
 
-/// ILP-over-HTTP conf â per-flush server ACK (the 2026-07-05
+/// ILP-over-HTTP conf — per-flush server ACK (the 2026-07-05
 /// fire-and-forget lesson): `retry_timeout=0` so questdb-rs does not run its
 /// own sleep-and-resend loop inside our flush, and a bounded
 /// `request_timeout` so a stalled server cannot hold the caller.
@@ -920,7 +920,7 @@ fn top_volume_rank_ilp_http_conf(config: &QuestDbConfig) -> String {
 ///
 /// Lazy: an unreachable QuestDB at construction still builds and buffers
 /// locally. On ANY failed flush the pending buffer is DISCARDED rather than
-/// retained â a server-REJECTED row kept across flushes replays forever and
+/// retained — a server-REJECTED row kept across flushes replays forever and
 /// poisons every later flush with it. Discarding is safe HERE specifically
 /// because these rows are an observability record of a ranking that is
 /// recomputed from scratch on the next tick: nothing downstream depends on
@@ -939,7 +939,7 @@ pub struct TopVolumeRankWriter {
     /// Set by [`TopVolumeRankWriter::split_for_offload`]. When present, `flush`
     /// hands the buffer to the writer thread instead of touching the network.
     ///
-    /// `None` means this writer still flushes synchronously â the shape that
+    /// `None` means this writer still flushes synchronously — the shape that
     /// must never reach the frame drain, because a 5,000 ms `request_timeout`
     /// on the drain task stalls the fold, fills the socket receive buffer, and
     /// Dhan skips a slow consumer forward to "the latest available state" with
@@ -953,13 +953,13 @@ pub struct TopVolumeRankWriter {
 }
 
 impl TopVolumeRankWriter {
-    /// Production constructor â ILP-over-HTTP sender, lazy on failure.
+    /// Production constructor — ILP-over-HTTP sender, lazy on failure.
     #[must_use]
     // TEST-EXEMPT: production ILP-connect constructor; the lazy contract and every append/flush path are covered via for_test() below.
     pub fn new(config: &QuestDbConfig) -> Self {
         // Seed the discard series at zero BEFORE the first row can be
         // dropped. A counter never incremented is ABSENT from the exporter,
-        // not zero â and an absent series reads as health. If this name is
+        // not zero — and an absent series reads as health. If this name is
         // ever EMF-selected, the CloudWatch agent's dropped-first-sample rule
         // turns that into total silence on the one episode that matters; that
         // rule cost 104,540 depth rows their classification on 2026-08-28.
@@ -967,7 +967,7 @@ impl TopVolumeRankWriter {
         // The SAME rule for every other outcome this writer can report. Only
         // `rows_discarded` was seeded until 2026-09-13; the other four were
         // registered by their own first increment, which is exactly the shape
-        // the comment above warns about â and `flush_width_capped` is a
+        // the comment above warns about — and `flush_width_capped` is a
         // ROW-DROPPING arm (it calls `discard_pending`), so its series was
         // absent from the exporter until the first loss. An operator or a
         // dashboard asking "has this writer ever capped?" saw no series at
@@ -997,7 +997,7 @@ impl TopVolumeRankWriter {
             Err(err) => {
                 warn!(
                     ?err,
-                    "top_volume_rank writer: QuestDB unreachable â buffering locally"
+                    "top_volume_rank writer: QuestDB unreachable — buffering locally"
                 );
                 Self {
                     sender: None,
@@ -1011,7 +1011,7 @@ impl TopVolumeRankWriter {
         }
     }
 
-    /// Test constructor â disconnected writer, empty buffer.
+    /// Test constructor — disconnected writer, empty buffer.
     #[must_use]
     // TEST-EXEMPT: test-only helper used by the append/flush unit tests below.
     pub fn for_test() -> Self {
@@ -1041,7 +1041,7 @@ impl TopVolumeRankWriter {
     /// Appends one ranked-contract row.
     ///
     /// A MARKER is set before the row and rewound if any step fails, so a
-    /// half-written row can never poison the buffer â see [`Self::append_row`].
+    /// half-written row can never poison the buffer — see [`Self::append_row`].
     ///
     /// # Errors
     /// Propagates ILP buffer errors (table/column append failure).
@@ -1058,7 +1058,7 @@ impl TopVolumeRankWriter {
             .context("feed")?
             .symbol("segment", r.segment)
             .context("segment")?
-            // The human label, as a SYMBOL beside the other four â interned by
+            // The human label, as a SYMBOL beside the other four — interned by
             // QuestDB, so ~22,000 distinct values cost a small integer per row.
             .symbol("contract", r.contract)
             .context("contract")?
@@ -1114,13 +1114,13 @@ impl TopVolumeRankWriter {
     /// `write_row` is a chain of `?`. If ANY step fails part-way, questdb-rs
     /// has already written bytes AND advanced its own state machine: `table()`
     /// sets `op_case = TableWritten`, and `check_op(Op::Table)` then REFUSES
-    /// every later `.table()` call â so one bad row silently killed this
+    /// every later `.table()` call — so one bad row silently killed this
     /// writer for the rest of the process. `at()` is the realistic trigger: it
     /// validates the timestamp only after the table, symbols and columns are
     /// already in the buffer.
     ///
     /// Nothing recovered it, either. `pending` is bumped only AFTER the last
-    /// `?`, so a part-way failure leaves it at 0 â and `flush` early-returns on
+    /// `?`, so a part-way failure leaves it at 0 — and `flush` early-returns on
     /// `pending == 0`, so the one path that calls `discard_pending` (the only
     /// code that clears the buffer) was unreachable in exactly the case that
     /// needed it.
@@ -1134,7 +1134,7 @@ impl TopVolumeRankWriter {
     /// # Errors
     /// Propagates ILP buffer errors (table/column append failure).
     pub fn append_row(&mut self, r: &TopVolumeRankRow<'_>) -> Result<()> {
-        // A marker may only be set on an empty buffer or after `at` â i.e.
+        // A marker may only be set on an empty buffer or after `at` — i.e.
         // exactly at a row boundary, which is where this always runs. If it is
         // refused the buffer is ALREADY mid-row from some path this reasoning
         // did not cover, and a total reset is the only way back.
@@ -1174,24 +1174,24 @@ impl TopVolumeRankWriter {
         // problem and this call must not touch it.
         if self.offload.is_some() {
             return match self.offload_flush() {
-                // Handed off, or held for the next flush â neither is an error
+                // Handed off, or held for the next flush — neither is an error
                 // to the caller. `QueueFull` in particular is BACKPRESSURE:
                 // reporting it as a failure would decay a health signal for
                 // rows that are still safely held.
                 TopVolumeOffloadOutcome::Sent(_) | TopVolumeOffloadOutcome::QueueFull(_) => Ok(()),
                 TopVolumeOffloadOutcome::WidthCapped(dropped) => anyhow::bail!(
-                    "top_volume_rank: writer thread stayed behind â {dropped} pending \
+                    "top_volume_rank: writer thread stayed behind — {dropped} pending \
                      row(s) dropped (no spill tier for a periodic snapshot)"
                 ),
                 TopVolumeOffloadOutcome::SinkGone(dropped) => anyhow::bail!(
-                    "top_volume_rank: writer thread is gone â {dropped} pending row(s) dropped"
+                    "top_volume_rank: writer thread is gone — {dropped} pending row(s) dropped"
                 ),
             };
         }
         if self.sender.is_none() {
             let dropped = self.discard_pending();
             anyhow::bail!(
-                "top_volume_rank: no ILP sender (QuestDB unreachable) â \
+                "top_volume_rank: no ILP sender (QuestDB unreachable) — \
                  {dropped} pending row(s) discarded"
             );
         }
@@ -1207,15 +1207,15 @@ impl TopVolumeRankWriter {
             Some(Err(err)) => {
                 let dropped = self.discard_pending();
                 Err(anyhow::Error::new(err).context(format!(
-                    "top_volume_rank ILP flush failed â {dropped} pending row(s) \
+                    "top_volume_rank ILP flush failed — {dropped} pending row(s) \
                      discarded (poisoned-buffer defense)"
                 )))
             }
-            // Unreachable (checked above) â treated as the no-sender arm.
+            // Unreachable (checked above) — treated as the no-sender arm.
             None => {
                 let dropped = self.discard_pending();
                 anyhow::bail!(
-                    "top_volume_rank: sender vanished â {dropped} pending row(s) discarded"
+                    "top_volume_rank: sender vanished — {dropped} pending row(s) discarded"
                 );
             }
         }
@@ -1226,7 +1226,7 @@ impl TopVolumeRankWriter {
     /// After this, `flush` hands the buffer to a bounded queue and returns
     /// without touching the network. That is the whole point: the caller is the
     /// frame drain, and a 5,000 ms `request_timeout` on the drain task stalls
-    /// the fold â after which the socket receive buffer fills and Dhan skips a
+    /// the fold — after which the socket receive buffer fills and Dhan skips a
     /// slow consumer forward with no sequence number, losing ticks at THEIR
     /// side where no counter of ours can see it.
     ///
@@ -1274,7 +1274,7 @@ impl TopVolumeRankWriter {
             rows,
         };
         let Some(tx) = self.offload.as_ref() else {
-            // Unreachable â `flush` checks. Treated as the gone arm rather than
+            // Unreachable — `flush` checks. Treated as the gone arm rather than
             // silently succeeding, because "we sent it" when nothing was sent
             // is the one report that must never be wrong.
             self.buffer = batch.buffer;
@@ -1289,7 +1289,7 @@ impl TopVolumeRankWriter {
             }
             Err(std::sync::mpsc::TrySendError::Full(returned)) => {
                 // Backpressure, not loss. Put the rows BACK and keep appending
-                // â the next flush retries. This arm is what makes the bounded
+                // — the next flush retries. This arm is what makes the bounded
                 // queue safe: without it a full queue would either block the
                 // drain (the original defect) or drop rows (a worse one).
                 metrics::counter!("tv_top_volume_rank_flush_queue_full_total").increment(1);
@@ -1304,7 +1304,7 @@ impl TopVolumeRankWriter {
                 {
                     metrics::counter!("tv_top_volume_rank_flush_width_capped_total").increment(1);
                     self.retained_spans = 0;
-                    // No spill tier for this table â see
+                    // No spill tier for this table — see
                     // `TopVolumeOffloadOutcome::WidthCapped` for why dropping
                     // is the right call here and rescuing is not.
                     let dropped = self.discard_pending();
@@ -1324,7 +1324,7 @@ impl TopVolumeRankWriter {
     /// `pub` since 2026-09-13 so the lane can account for retained rows at
     /// SHUTDOWN, the one moment nothing else calls it.
     ///
-    /// On a `QueueFull` the producer keeps its rows and `flush` returns `Ok` â
+    /// On a `QueueFull` the producer keeps its rows and `flush` returns `Ok` —
     /// correct, that is backpressure, not loss. But if the process then exits
     /// while rows are still retained, no later flush ever runs, and until this
     /// was reachable from the lane those rows skipped even the discard counter:
@@ -1336,7 +1336,7 @@ impl TopVolumeRankWriter {
         if dropped > 0 {
             metrics::counter!("tv_top_volume_rank_rows_discarded_total").increment(dropped as u64);
             self.discard_episodes = self.discard_episodes.saturating_add(1);
-            // The counter is NOT EMF-selected â deliberately. Shipping a new
+            // The counter is NOT EMF-selected — deliberately. Shipping a new
             // metric name costs ~$0.30/mo against a September forecast of
             // $142.24 with the automatic STOP_EC2_INSTANCES line at $135.00,
             // and this table is an observability record whose loss costs no
@@ -1346,7 +1346,7 @@ impl TopVolumeRankWriter {
             // THROTTLED to powers of two since 2026-09-13, matching both
             // app-side counterparts. Unthrottled, a DEAD writer thread makes
             // every subsequent flush take the `SinkGone` arm, which calls this
-            // â four cadences at roughly two flushes a second is ~8 coded
+            // — four cadences at roughly two flushes a second is ~8 coded
             // `error!` lines per second for the rest of the session, order
             // 180,000 lines, into the `errors.jsonl` stream that 25 CloudWatch
             // metric filters read. The onset and the magnitude are what an
@@ -1362,7 +1362,7 @@ impl TopVolumeRankWriter {
                     metric = "tv_top_volume_rank_rows_discarded_total",
                     dropped,
                     "STORAGE-GAP-03: top_volume_rank rows discarded after a \
-                     failed flush â the ranking record has a hole for those \
+                     failed flush — the ranking record has a hole for those \
                      snapshots. No tick is lost by this: the leaderboard is in \
                      RAM and the next snapshot rebuilds it. `episodes` is the \
                      running count for this writer, not the count since the \
@@ -1388,16 +1388,16 @@ impl TopVolumeRankWriter {
 /// and the three writer paths sharing a shape is what stops them drifting into
 /// different failure semantics.
 ///
-/// â  The rows/s figure this doc used to carry is RETIRED, not updated. It
+/// ⚠ The rows/s figure this doc used to carry is RETIRED, not updated. It
 /// read "~600 rows/s at most (500/s from the 1 s arm, ~100/s from the 5 s
-/// arm)", which was 250 x 2 families x 2 cadences â every term of which the
+/// arm)", which was 250 x 2 families x 2 cadences — every term of which the
 /// 2026-09-12 change moved: the per-family cut is gone and there are four
 /// cadences. There is no longer a constant to quote. The row count per sweep
 /// is one per contract that TRADED in the window, bounded above by
 /// `TOP_VOLUME_MAX_ROWS_PER_SWEEP` and in practice by the market.
 ///
 /// (Until 2026-09-08 the line before that read "250 rows at 1 s and 5 at 5 s,
-/// ~255 rows/s" â the 5 s figure was the depth-200 SOCKET count, not the row
+/// ~255 rows/s" — the 5 s figure was the depth-200 SOCKET count, not the row
 /// count, and the index family was not counted at all. Three versions, three
 /// wrong figures; the fourth is a derivation instead.)
 ///
@@ -1414,21 +1414,21 @@ pub const TOP_VOLUME_FLUSH_QUEUE_DEPTH: usize = 4;
 /// for the same reason as the queue depth: one shape across the three writer
 /// paths is what stops them drifting into different failure semantics.
 ///
-/// â  RE-DERIVED 2026-09-12 for the cadence expansion, and the intra-doc link
-/// above was BROKEN â it read `depth_persistence::MAX_TOP_VOLUME_RETAINED_FLUSH_SPANS`,
+/// ⚠ RE-DERIVED 2026-09-12 for the cadence expansion, and the intra-doc link
+/// above was BROKEN — it read `depth_persistence::MAX_TOP_VOLUME_RETAINED_FLUSH_SPANS`,
 /// a path that does not exist, so the "matching" claim pointed at nothing.
 ///
 /// The CONSTANT does not move; what moved is what it buys in WALL-CLOCK time,
 /// and that is worth stating because the number is a SPAN count and reads like
 /// a duration. A span is one flush attempt that found the queue full, so the
-/// tolerance is `spans Ã· flush rate`, and the flush rate is the cadence count:
+/// tolerance is `spans ÷ flush rate`, and the flush rate is the cadence count:
 ///
 /// | | flushes in the worst second | tolerance past a full queue |
 /// |---|---|---|
 /// | 2 cadences (1 s, 5 s), before 2026-09-12 | 2 | ~3 s |
 /// | 4 cadences (1 s, 3 s, 5 s, 1 m), now | 4 | ~2.2 s |
 ///
-/// One flush per `snapshot_top_volume` call, NOT one per family â the flush
+/// One flush per `snapshot_top_volume` call, NOT one per family — the flush
 /// sits outside the family loop (`dhan_feed_stack::snapshot_top_volume`), so
 /// the four arms coinciding at the minute mark is four attempts, not eight.
 /// Verified in source 2026-09-12 rather than assumed; a hostile review of this
@@ -1438,7 +1438,7 @@ pub const TOP_VOLUME_FLUSH_QUEUE_DEPTH: usize = 4;
 /// (4 queued batches + the retained spans). That is a REDUCTION and it is not
 /// raised here, for two reasons stated plainly rather than waved past: the
 /// failure it guards is a QuestDB stall, which this repository has on record
-/// at the 2026-08-25 and 2026-09-02 scale â MINUTES, not seconds, so neither 6
+/// at the 2026-08-25 and 2026-09-02 scale — MINUTES, not seconds, so neither 6
 /// nor 7 saves the snapshot; and what is lost when it fires is one snapshot of
 /// a leaderboard that is rebuilt from RAM a second later, never a tick. Raising
 /// it trades a bounded, logged, tickless hole for unbounded producer memory on
@@ -1447,13 +1447,13 @@ pub const MAX_TOP_VOLUME_RETAINED_FLUSH_SPANS: u32 = 2;
 
 /// Byte ceiling on the buffer the producer retains while the writer is behind.
 ///
-/// â  RE-DERIVED 2026-09-12, and the previous value was a live row-drop.
+/// ⚠ RE-DERIVED 2026-09-12, and the previous value was a live row-drop.
 ///
 /// It was a flat 4 MiB, justified as "~58 seconds of backlog" at a rate of
-/// "~600 rows/s of ~120 B ILP â 72 KB/s". Both halves of that came from the
+/// "~600 rows/s of ~120 B ILP ≈ 72 KB/s". Both halves of that came from the
 /// top-250-per-family cut. With the cut removed (operator: "pick the entire
 /// options contracts") a SINGLE worst-case sweep is
-/// [`TOP_VOLUME_MAX_ROWS_PER_SWEEP`] rows â 6 MB â so one sweep alone breached
+/// [`TOP_VOLUME_MAX_ROWS_PER_SWEEP`] rows — 6 MB — so one sweep alone breached
 /// a 4 MiB ceiling. Past the ceiling this producer DROPS: there is no spill
 /// tier for this table, unlike ticks and depth. The stale figure was not a
 /// stale comment; it was the number the drop decision was made against.
@@ -1462,7 +1462,7 @@ pub const MAX_TOP_VOLUME_RETAINED_FLUSH_SPANS: u32 = 2;
 /// cannot silently invalidate it again. Still well under the depth path's
 /// 32 MiB, which is the property the sizing test pins.
 ///
-/// â  **DERIVED since 2026-09-12 â both terms used to be bare literals.**
+/// ⚠ **DERIVED since 2026-09-12 — both terms used to be bare literals.**
 /// `25_000 * 2` restated the per-family cap and the family count with nothing
 /// linking either to its source, so raising `MAX_TRACKED_CONTRACTS` or adding
 /// a third family would have silently under-sized the drop ceiling on a table
@@ -1473,22 +1473,22 @@ pub const MAX_TOP_VOLUME_RETAINED_FLUSH_SPANS: u32 = 2;
 ///
 /// The family count stays a named literal: `OptionFamily` lives in the `app`
 /// crate, which `storage` cannot import (the dependency runs the other way).
-/// Naming it is the honest middle â a third family is now a visible edit here
+/// Naming it is the honest middle — a third family is now a visible edit here
 /// rather than an invisible factor inside an arithmetic expression.
 ///
-/// # â  CORRECTED 2026-09-19 â 2 â 1, and it had been wrong since 2026-09-12
+/// # ⚠ CORRECTED 2026-09-19 — 2 → 1, and it had been wrong since 2026-09-12
 ///
 /// The operator's 2026-09-12 (later) directive took `top_volume` to STOCK
-/// OPTIONS ONLY â the index board was dropped because it steered nothing and
+/// OPTIONS ONLY — the index board was dropped because it steered nothing and
 /// poisoned the default sort (`websocket-connection-scope-lock.md`
-/// Â§ "2026-09-18 (FOURTH)"). The single source of that policy,
+/// § "2026-09-18 (FOURTH)"). The single source of that policy,
 /// `dhan_feed_stack::RANKED_OPTION_FAMILIES`, has been a ONE-element array ever
 /// since, pinned by `top_volume_stock_only_guard`. This constant was not moved
 /// with it.
 ///
 /// So the sweep has been sized for **50,000** rows while the pipeline can
-/// produce at most **25,000**. Wrong in the SAFE direction â the ceiling was
-/// twice what it needed to be, so nothing was ever dropped by it â and wrong in
+/// produce at most **25,000**. Wrong in the SAFE direction — the ceiling was
+/// twice what it needed to be, so nothing was ever dropped by it — and wrong in
 /// a way that matters anyway, because it is the DENOMINATOR every row-width
 /// decision divides by. At 50,000 rows the depth comparison
 /// (`the_producer_byte_ceiling_stays_tighter_than_the_depth_path`) fails at
@@ -1499,24 +1499,24 @@ pub const MAX_TOP_VOLUME_RETAINED_FLUSH_SPANS: u32 = 2;
 /// That is the whole cost of this correction being late: a design was priced
 /// against a ceiling half its real size, and the argument that came out of it
 /// was wrong. Recorded rather than quietly edited, because the same stale
-/// factor of 2 has now been found in FOUR places â here, and in CLAUDE.md's
-/// "8 sweeps â 23.6 ms â 2.4% duty", which is 4 cadences Ã 2 families and is
+/// factor of 2 has now been found in FOUR places — here, and in CLAUDE.md's
+/// "8 sweeps ≈ 23.6 ms ≈ 2.4% duty", which is 4 cadences × 2 families and is
 /// really 4 sweeps.
 ///
 /// The comment below is unchanged and still governs: a third family is a
 /// VISIBLE edit here, never an invisible factor. It is now also a visible edit
-/// in `RANKED_OPTION_FAMILIES`, and the two must move together â the const
+/// in `RANKED_OPTION_FAMILIES`, and the two must move together — the const
 /// assert below is what makes that non-optional.
 const OPTION_FAMILIES: usize = 1;
 const TOP_VOLUME_MAX_ROWS_PER_SWEEP: usize =
     tickvault_common::constants::TOP_VOLUME_PERSIST_PER_FAMILY * OPTION_FAMILIES;
 /// Worst-case ILP line width for one `top_volume` row, DERIVED below.
 ///
-/// # â  CORRECTED 2026-09-12 â this was `120`, and it was wrong by ~2.2Ã
+/// # ⚠ CORRECTED 2026-09-12 — this was `120`, and it was wrong by ~2.2×
 ///
-/// The old value was labelled "measured â¦ rounded up" and no test measured it.
-/// Counted against the real `write_row` line â 4 symbols, 7 `i64` fields, an
-/// optional `f64`, a bool and a 19-digit nanosecond stamp â a worst-case row is
+/// The old value was labelled "measured … rounded up" and no test measured it.
+/// Counted against the real `write_row` line — 4 symbols, 7 `i64` fields, an
+/// optional `f64`, a bool and a 19-digit nanosecond stamp — a worst-case row is
 /// **~265 B** by hand and a typical one ~233 B:
 ///
 /// ⚠ The sketch below is the 2026-09-12 LINE SHAPE, kept as the audit
@@ -1529,10 +1529,10 @@ const TOP_VOLUME_MAX_ROWS_PER_SWEEP: usize =
 ///   top_volume                                       11
 ///   ,tf=1m,family=stock,feed=dhan,segment=NSE_FNO    ~45
 ///   ,contract=<UNDERLYING>-25Sep2026-123456.75-CE   ~ 48
-///   security_id=â¦i, underlying_id=â¦i,                ~ 53
-///   net_volume_chg_milli_pct=â¦i,                     ~ 45
-///   volume=â¦i, delta_units=â¦i, lot_size=â¦i,         ~ 58
-///   window_lots_milli=â¦i,                            ~33
+///   security_id=…i, underlying_id=…i,                ~ 53
+///   net_volume_chg_milli_pct=…i,                     ~ 45
+///   volume=…i, delta_units=…i, lot_size=…i,         ~ 58
+///   window_lots_milli=…i,                            ~33
 ///   gain_pct=-12.345678901234567,                    ~27
 ///   subscribed=t                                      13
 ///   <19-digit nanos>\n                                20
@@ -1540,18 +1540,18 @@ const TOP_VOLUME_MAX_ROWS_PER_SWEEP: usize =
 ///
 /// The consequence was not cosmetic. `MAX_TOP_VOLUME_PRODUCER_BUFFER_BYTES` is
 /// this number times the sweep size times [`TOP_VOLUME_SWEEPS_HELD`], and past
-/// that ceiling this producer **DROPS** â this table has no spill tier, so a
+/// that ceiling this producer **DROPS** — this table has no spill tier, so a
 /// dropped row is gone. At 120 B the ceiling claimed to hold two worst-case
 /// sweeps while actually holding less than one.
 ///
-/// â  **And the hand-derivation above was ITSELF short.** A first pass at this
+/// ⚠ **And the hand-derivation above was ITSELF short.** A first pass at this
 /// correction set the constant to 300 on the strength of that ~265 count, and
-/// `the_assumed_ilp_row_width_covers_a_real_worst_case_line` â written in the
-/// same change â immediately failed it: a real worst-case line **measures
+/// `the_assumed_ilp_row_width_covers_a_real_worst_case_line` — written in the
+/// same change — immediately failed it: a real worst-case line **measures
 /// 324 B**. The count under-estimated the `i64::MAX` fields, which are 19
 /// digits each across four columns.
 ///
-/// So the original constant was wrong by **2.7Ã**, not the 2.2Ã the hand count
+/// So the original constant was wrong by **2.7×**, not the 2.2× the hand count
 /// suggested, and the reusable half is that **a width is a measurement**: two
 /// successive careful derivations both came in low, and only running the line
 /// through `write_row` settled it. That is why the guard is a test that builds
@@ -1560,21 +1560,21 @@ const TOP_VOLUME_MAX_ROWS_PER_SWEEP: usize =
 /// 384 rather than 324: headroom for a longer symbol value or a wider `f64`
 /// repr without a third under-count, and the cost is only reserved address
 /// space in a buffer that is flushed every sweep.
-/// â  384 -> 448 on 2026-09-13, RE-MEASURED not re-derived. The schema change
+/// ⚠ 384 -> 448 on 2026-09-13, RE-MEASURED not re-derived. The schema change
 /// that day dropped `rank` (~26 B) and added `contract` (a SYMBOL up to ~48 B)
 /// and `net_volume_chg_milli_pct` (~45 B), a net widening the harness measured
 /// at 324 -> 401 B (the harness measures it; the hand count came in at ~393, low
 /// again, which is the third time a width derivation here has under-counted).
 /// 448 keeps the same ~12% headroom the 384 carried over 324.
 ///
-/// â  448 -> 596 on 2026-09-18, MEASURED by the same harness. The three fold
+/// ⚠ 448 -> 596 on 2026-09-18, MEASURED by the same harness. The three fold
 /// columns added that day (`candle_volume_signed`, `candle_bucket_skew_secs`,
 /// `candle_price_chg_pct`) widened the worst-case line 401 -> 531 B, and 596
 /// keeps the same ~12% headroom. **No hand count was attempted**, which is now
 /// the standing rule here: three successive derivations under-counted, and the
 /// harness is cheaper than any of them.
 ///
-/// # â  The binding constraint has MOVED, and it is no longer the wedge
+/// # ⚠ The binding constraint has MOVED, and it is no longer the wedge
 ///
 /// The old text read "500 B would be the arithmetic limit" for the wedge
 /// assert. That figure was computed when `TOP_VOLUME_SWEEPS_HELD` was 2; it
@@ -1585,17 +1585,17 @@ const TOP_VOLUME_MAX_ROWS_PER_SWEEP: usize =
 /// (`the_producer_byte_ceiling_stays_tighter_than_the_depth_path`): the ceiling
 /// is 50,000 x 596 = **29.8 MB** against depth's 32 MiB, an 11% margin where
 /// 448 carried 33%. So the next column added here can NOT be paid for by
-/// raising this constant again â roughly 671 B is where the depth assert
-/// fails â and would have to come from a lower `TOP_VOLUME_MAX_ROWS_PER_SWEEP`
+/// raising this constant again — roughly 671 B is where the depth assert
+/// fails — and would have to come from a lower `TOP_VOLUME_MAX_ROWS_PER_SWEEP`
 /// or a deliberate, argued change to that relationship. Recorded here because
 /// the previous occupant of this paragraph named the wrong ceiling, and a
 /// reader sizing the next change from it would have had ~450 B of imaginary
 /// room.
 ///
-/// # â  CORRECTED 2026-09-19 â both figures above divide by 50,000, and the
+/// # ⚠ CORRECTED 2026-09-19 — both figures above divide by 50,000, and the
 /// # real row count is 25,000
 ///
-/// `OPTION_FAMILIES` went 2 â 1 today (see its own note): the index board was
+/// `OPTION_FAMILIES` went 2 → 1 today (see its own note): the index board was
 /// dropped on 2026-09-12 and this factor was not moved with it. Every number in
 /// the two paragraphs above is therefore computed against twice the rows this
 /// pipeline can produce. Corrected:
@@ -1609,29 +1609,29 @@ const TOP_VOLUME_MAX_ROWS_PER_SWEEP: usize =
 /// The paragraphs are left standing per house convention; this table is the
 /// operative set. The sentence "the next column added here can NOT be paid for
 /// by raising this constant again" was TRUE against 671 B and is FALSE against
-/// 1,342 B â and that mattered: a 2026-09-19 design needing ~725 B/row was
+/// 1,342 B — and that mattered: a 2026-09-19 design needing ~725 B/row was
 /// priced as unaffordable against the stale ceiling before the factor was
 /// checked. **A derived constant carries the staleness of every term it
 /// derives from**, and this one had a stale term for a week while three
 /// separate notes above it were being carefully re-measured.
 ///
-/// â  596 -> 792 on 2026-09-19, MEASURED by the same harness, never derived.
+/// ⚠ 596 -> 792 on 2026-09-19, MEASURED by the same harness, never derived.
 /// The schema change that day removed `gain_pct` (~27 B) and added SEVEN
-/// columns â `cumulative_day_volume`, and the six candle passthroughs
+/// columns — `cumulative_day_volume`, and the six candle passthroughs
 /// `percentage_change`, `open_percentage_change`, `open`, `high`, `low`,
-/// `close` â on top of the three renames, and the worst-case line went
+/// `close` — on top of the three renames, and the worst-case line went
 /// **531 -> 707 B**. 792 keeps the same ~12% headroom every step since
 /// 2026-09-13 has carried.
 ///
 /// This is the fourth consecutive measurement and the standing rule held: no
 /// hand count was attempted. The corrected 25,000-row table below is what
-/// made it affordable â at 792 B the ceiling is 25,000 x 792 = **19.8 MB**
+/// made it affordable — at 792 B the ceiling is 25,000 x 792 = **19.8 MB**
 /// against depth's 32 MiB, a **41% margin**, and the wedge limit is 2,097 B.
 /// Against the stale 50,000-row figure the same width would have read 39.6 MB
 /// and breached depth, which is exactly the false unaffordability the note
 /// below records.
 ///
-/// â  792 -> 1040 on 2026-09-19 (LATER the same day), MEASURED by the same
+/// ⚠ 792 -> 1040 on 2026-09-19 (LATER the same day), MEASURED by the same
 /// harness. The three delay PAIRS added six columns, and the worst-case line
 /// went **707 -> 926 B**. 1040 keeps the same ~12% headroom every step since
 /// 2026-09-13 has carried.
@@ -1639,7 +1639,7 @@ const TOP_VOLUME_MAX_ROWS_PER_SWEEP: usize =
 /// **The measurement only happened because the harness was fixed first.** Its
 /// fixture left all three delays `None`, so it would have reported 707 B
 /// unchanged and the ceiling would have been under-sized by 219 B per row with
-/// every assert green â the exact silent row loss these constants exist to
+/// every assert green — the exact silent row loss these constants exist to
 /// prevent, arriving through the guard rather than around it. The fixture now
 /// sets all three to `i64::MIN`, their widest.
 ///
@@ -1647,10 +1647,10 @@ const TOP_VOLUME_MAX_ROWS_PER_SWEEP: usize =
 /// 32 MiB, a **22.5% margin** (was 41%). That margin is real and it is
 /// shrinking: two more schema additions of this size would breach the depth
 /// relationship, and the next one should re-derive rather than assume.
-/// â  1040 -> 748 on 2026-09-19 (LATER STILL the same day), MEASURED by the
+/// ⚠ 1040 -> 748 on 2026-09-19 (LATER STILL the same day), MEASURED by the
 /// same harness, and this is the first time the number has gone DOWN.
 ///
-/// The operator stripped `top_volume` to its ranking columns that afternoon â
+/// The operator stripped `top_volume` to its ranking columns that afternoon —
 /// `cumulative_day_volume`, `delta_units`, `candle_bucket_skew_secs`,
 /// `close_vs_prev_bar_pct` and the four OHLC passthroughs left the table, and
 /// `candle_volume_signed` became `volume`. Nine columns out, and the
@@ -1662,7 +1662,7 @@ const TOP_VOLUME_MAX_ROWS_PER_SWEEP: usize =
 /// it makes the producer ceiling claim more of the byte budget than the rows
 /// can possibly use, which is what made the six delay columns read as barely
 /// affordable one revision ago. At 748 B the ceiling is 25,000 x 748 =
-/// **18.7 MB** against depth's 32 MiB, a **44% margin** (was 22.5%) â room the
+/// **18.7 MB** against depth's 32 MiB, a **44% margin** (was 22.5%) — room the
 /// three delay pairs moving into the candle fold will hand straight back.
 /// ⚠ 748 -> 502 on 2026-09-19 (LATER STILL the same day), MEASURED by the
 /// same harness, and the second DECREASE in one afternoon.
@@ -1683,16 +1683,16 @@ const TOP_VOLUME_MAX_ROWS_PER_SWEEP: usize =
 const TOP_VOLUME_ILP_ROW_BYTES: usize = 502;
 /// Worst-case sweeps the producer may hold before it drops.
 ///
-/// # â  2 â 1, forced by the corrected width above (2026-09-12)
+/// # ⚠ 2 → 1, forced by the corrected width above (2026-09-12)
 ///
-/// This was `2`, and at the wrong 120 B width the ceiling it produced â
-/// 12 MB â could not hold even **one** worst-case sweep (50,000 Ã 324 B =
+/// This was `2`, and at the wrong 120 B width the ceiling it produced —
+/// 12 MB — could not hold even **one** worst-case sweep (50,000 × 324 B =
 /// 16.2 MB). So the declared "two sweeps" was never what shipped; the real
 /// behaviour was ~0.74 of one, and the vacuous assert could not say so.
 ///
 /// At the corrected width a true two sweeps is 32.4 MB, which collides with
 /// the sizing relationship `the_producer_byte_ceiling_stays_tighter_than_the_depth_path`
-/// pins against depth's 32 MiB. One sweep at 384 B is **19.2 MB** â still 60%
+/// pins against depth's 32 MiB. One sweep at 384 B is **19.2 MB** — still 60%
 /// MORE capacity than shipped today, comfortably under depth, and it satisfies
 /// the const-assert's actual requirement: hold at least one worst-case sweep.
 ///
@@ -1705,13 +1705,13 @@ const TOP_VOLUME_SWEEPS_HELD: usize = 1;
 pub const MAX_TOP_VOLUME_PRODUCER_BUFFER_BYTES: usize =
     TOP_VOLUME_MAX_ROWS_PER_SWEEP * TOP_VOLUME_ILP_ROW_BYTES * TOP_VOLUME_SWEEPS_HELD;
 
-// â  THE ASSERT THAT USED TO STAND HERE WAS VACUOUS, and that is why the wrong
+// ⚠ THE ASSERT THAT USED TO STAND HERE WAS VACUOUS, and that is why the wrong
 // constant above survived.
 //
 // It read `MAX_TOP_VOLUME_PRODUCER_BUFFER_BYTES >= ROWS * BYTES`, where the
-// left-hand side is defined as `ROWS * BYTES * 2`. So it asserted `2X >= X` â
+// left-hand side is defined as `ROWS * BYTES * 2`. So it asserted `2X >= X` —
 // TRUE FOR EVERY VALUE OF `BYTES`, including a value off by a factor of ten. Its
-// message named a real hazard ("a single sweep drops rows â¦ a dropped row is
+// message named a real hazard ("a single sweep drops rows … a dropped row is
 // gone") and it could not detect that hazard, which is worse than no assert: it
 // reads, in review, as though the hazard were checked.
 //
@@ -1736,8 +1736,8 @@ const _: () = assert!(
     TOP_VOLUME_ILP_ROW_BYTES >= MEASURED_WORST_CASE_ILP_ROW_BYTES,
     "the assumed ILP row width must cover the MEASURED worst-case line (see \
      the_assumed_ilp_row_width_covers_a_real_worst_case_line). Below it, one \
-     sweep overruns the producer ceiling and this table â which has NO spill \
-     tier â drops rows."
+     sweep overruns the producer ceiling and this table — which has NO spill \
+     tier — drops rows."
 );
 
 /// The worst-case ILP line width MEASURED by
@@ -1746,24 +1746,24 @@ const _: () = assert!(
 /// Separate from [`TOP_VOLUME_ILP_ROW_BYTES`] on purpose: that one is the
 /// ASSUMPTION the ceiling is sized from, this one is the OBSERVATION it must
 /// cover. Two independent terms are what make the asserts below capable of
-/// failing â the vacuous assert this replaced compared the ceiling to a factor
+/// failing — the vacuous assert this replaced compared the ceiling to a factor
 /// of itself.
-/// â  531 -> 707 on 2026-09-19. Not a re-derivation: the harness built the
-/// widest line the new 23-column `write_row` can emit â every integer at its
+/// ⚠ 531 -> 707 on 2026-09-19. Not a re-derivation: the harness built the
+/// widest line the new 23-column `write_row` can emit — every integer at its
 /// column's extreme and a full-width signed `f64` in all seven optional
-/// DOUBLEs â and reported 707 B. Update this by running the test and reading
+/// DOUBLEs — and reported 707 B. Update this by running the test and reading
 /// its message, never by counting.
-/// â  707 -> 926 on 2026-09-19 (LATER the same day). The three delay pairs
+/// ⚠ 707 -> 926 on 2026-09-19 (LATER the same day). The three delay pairs
 /// added six columns to `write_row`, and the widest line the 29-column writer
-/// can emit is 926 B â every integer at its column's extreme, a full-width
+/// can emit is 926 B — every integer at its column's extreme, a full-width
 /// signed `f64` in all seven optional DOUBLEs, and all three delays at
 /// `i64::MIN` (a 20-character exact column beside a 19-character
 /// `-9223372037 seconds` twin). Update this by running the test and reading
 /// its message, never by counting.
-/// â  926 -> 666 on 2026-09-19 (LATER STILL the same day), and this is the
+/// ⚠ 926 -> 666 on 2026-09-19 (LATER STILL the same day), and this is the
 /// first DECREASE this constant has ever recorded. The operator stripped nine
 /// columns off `top_volume` that afternoon, so the widest line the 21-column
-/// writer can emit is 666 B. Read from the test's own message, never counted â
+/// writer can emit is 666 B. Read from the test's own message, never counted —
 /// the same rule that has governed every rise.
 /// ⚠ 666 -> 447 on 2026-09-19 (LATER STILL the same day), the second
 /// DECREASE in one afternoon. The three delay pairs left this table for the
@@ -1780,7 +1780,7 @@ const _: () = assert!(
     MAX_TOP_VOLUME_PRODUCER_BUFFER_BYTES
         >= TOP_VOLUME_MAX_ROWS_PER_SWEEP * MEASURED_WORST_CASE_ILP_ROW_BYTES,
     "the producer ceiling must hold at least ONE worst-case sweep. Below that, \
-     a single sweep drops rows even with a perfectly healthy writer â and this \
+     a single sweep drops rows even with a perfectly healthy writer — and this \
      table has no spill tier, so a dropped row is gone."
 );
 
@@ -1810,7 +1810,7 @@ pub enum TopVolumeOffloadOutcome {
     /// [`MAX_TOP_VOLUME_RETAINED_FLUSH_SPANS`] or
     /// [`MAX_TOP_VOLUME_PRODUCER_BUFFER_BYTES`]. Rows DROPPED.
     ///
-    /// # Why dropped and not rescued â the one place this differs from depth
+    /// # Why dropped and not rescued — the one place this differs from depth
     ///
     /// The depth and tick paths rescue an over-wide payload to a spill tier,
     /// durable and re-ingestable. **There is no spill tier for this table, and
@@ -1827,7 +1827,7 @@ pub enum TopVolumeOffloadOutcome {
     SinkGone(usize),
 }
 
-/// The network half of a split [`TopVolumeRankWriter`] â owns the ILP `Sender`.
+/// The network half of a split [`TopVolumeRankWriter`] — owns the ILP `Sender`.
 ///
 /// Lives on its own OS thread. It never touches the aggregator, the ring, the
 /// leaderboard or anything the drain owns, which is the entire reason the split
@@ -1840,7 +1840,7 @@ pub struct TopVolumeRankWriterSink {
 impl TopVolumeRankWriterSink {
     /// Writes one batch. Returns the rows that actually LANDED in QuestDB.
     ///
-    /// Zero on any failure â the same contract [`TopVolumeRankWriter::flush`]
+    /// Zero on any failure — the same contract [`TopVolumeRankWriter::flush`]
     /// has, and for the same reason: a failed write must be reported as a
     /// failure rather than forged into a success.
     ///
@@ -1850,14 +1850,14 @@ impl TopVolumeRankWriterSink {
     /// synchronous path carried a single retry from 2026-08-25, the offload
     /// shipped three days later without it, and the measured price on
     /// 2026-09-03 was **41,204 coded flush failures in one session**, every one
-    /// reading `Connection reset by peer (os error 104)` â a transport class
+    /// reading `Connection reset by peer (os error 104)` — a transport class
     /// the buffer survives intact. Shipping this sink without the retry would
     /// repeat that mistake knowingly.
     ///
     /// Retrying is idempotent BY CONSTRUCTION, which is what makes one attempt
     /// safe rather than merely cheap: [`DEDUP_KEY_TOP_VOLUME_RANK`] is
     /// `ts, tf, family, feed, security_id, segment`, and every one of those is
-    /// fixed for a given snapshot â so a first POST that landed before the
+    /// fixed for a given snapshot — so a first POST that landed before the
     /// reset is collapsed by the same UPSERT that makes a manual re-ingest
     /// safe to repeat.
     ///
@@ -1904,7 +1904,7 @@ impl TopVolumeRankWriterSink {
     }
 
     /// Counts and LOGS a batch the network refused, through the same counter
-    /// and the same coded error the synchronous `discard_pending` uses â so an
+    /// and the same coded error the synchronous `discard_pending` uses — so an
     /// operator sees no difference between a synchronous and an offloaded loss.
     fn report_lost(batch: &mut TopVolumeFlushBatch, why: &str) {
         let dropped = batch.rows;
@@ -1918,7 +1918,7 @@ impl TopVolumeRankWriterSink {
             dropped,
             why,
             "STORAGE-GAP-03: top_volume_rank rows discarded by the offload \
-             writer â the ranking record has a hole for those snapshots. No \
+             writer — the ranking record has a hole for those snapshots. No \
              tick is lost by this: the leaderboard is in RAM and the next \
              snapshot rebuilds it."
         );
@@ -1934,21 +1934,21 @@ mod tests {
     fn every_cadence_is_in_the_all_list() {
         // `ALL.len()` sizes the ranking's per-contract baselines, one slot per
         // cadence. A variant missing from this list under-counts that array,
-        // and two cadences would then share a baseline â each board reporting
+        // and two cadences would then share a baseline — each board reporting
         // a window neither one measured, with nothing erroring.
         //
-        // â  The 2026-09-06 version of this test could not detect that. It
-        // iterated `ALL` and matched on the label with a `_ => panic!` arm â
+        // ⚠ The 2026-09-06 version of this test could not detect that. It
+        // iterated `ALL` and matched on the label with a `_ => panic!` arm —
         // but a variant absent from `ALL` is never YIELDED by that loop, so
         // the arm it was supposed to trip could not be reached. It asserted
         // against itself and passed vacuously.
         //
         // What actually bites, in three parts:
-        //   1. `from_index` is an exhaustive-by-construction decode â the
+        //   1. `from_index` is an exhaustive-by-construction decode — the
         //      slot a new variant takes must be spelled there or it decodes
         //      to `None` below;
         //   2. every slot `0..ALL.len()` must round-trip through
-        //      `from_index` â `index`, which catches a gap or a duplicate;
+        //      `from_index` → `index`, which catches a gap or a duplicate;
         //   3. `slot()` must be `Some` for every listed cadence and the
         //      first UNLISTED slot must decode to `None`, which is the
         //      boundary a fifth variant crosses.
@@ -1976,7 +1976,7 @@ mod tests {
         assert_eq!(
             SnapshotCadence::from_index(SnapshotCadence::ALL.len()),
             None,
-            "the slot one past the end must not decode â if it does, a \
+            "the slot one past the end must not decode — if it does, a \
              variant exists that ALL does not list, and every array sized \
              from ALL.len() is one slot short"
         );
@@ -2049,7 +2049,7 @@ mod tests {
             //
             // The three are internally consistent, so a projection that mixed
             // them up would be visible here: the window is 5 s, the first
-            // trade arrived 123 ms after it opened, the last one 1 Âµs before
+            // trade arrived 123 ms after it opened, the last one 1 µs before
             // it closed, and the span between them is therefore
             // 5s - 123ms - 1us = 4.876999 s -- which RENDERS as "5 seconds",
             // because the second band is whole-unit by the operator's own
@@ -2095,7 +2095,7 @@ mod tests {
     /// The DISPLAY columns stay OUT of the row's identity.
     ///
     /// `contract` is a pure function of `security_id`, so it adds no identity
-    /// â but a stale label on a re-emit would make the same contract a
+    /// — but a stale label on a re-emit would make the same contract a
     /// DIFFERENT key and duplicate the row, which is the collision the key
     /// exists to prevent. `volume_percentage_change` is the recorded value.
     ///
@@ -2105,7 +2105,7 @@ mod tests {
     /// again must not be able to put it in the key by accident. The RETIRED
     /// names (`net_volume_chg_milli_pct`, `window_lots_milli`, `lot_size`,
     /// `gain_pct`, `candle_price_chg_pct`) stay listed for exactly that
-    /// reason â a table written before 2026-09-19 still carries them.
+    /// reason — a table written before 2026-09-19 still carries them.
     #[test]
     fn the_display_columns_are_deliberately_absent_from_the_dedup_key() {
         for banned in [
@@ -2162,7 +2162,7 @@ mod tests {
     /// The stored percentage must FOLLOW from the stored inputs, exactly.
     ///
     /// It is a monotone transform of the lot count, not independent
-    /// information â so the one thing worth pinning is that the two never
+    /// information — so the one thing worth pinning is that the two never
     /// drift, in the direction the doc names: if they disagree, the percentage
     /// is the wrong one.
     ///
@@ -2217,7 +2217,7 @@ mod tests {
     }
 
     /// Families are ranked separately. Without `family` in the key that is
-    /// usually fine (security_id differs) â but a contract listed in BOTH
+    /// usually fine (security_id differs) — but a contract listed in BOTH
     /// families would collide. Pinned so the separation survives a refactor.
     #[test]
     fn the_family_is_in_the_key() {
@@ -2240,7 +2240,7 @@ mod tests {
     }
 
     /// Schema-self-heal order: CREATE, then every column, then DEDUP ENABLE.
-    /// Never a DROP â this table is append-only history.
+    /// Never a DROP — this table is append-only history.
     #[test]
     fn top_volume_rank_ensure_statements_never_drop_and_end_with_dedup_enable() {
         let statements = top_volume_rank_ensure_statements();
@@ -2265,13 +2265,13 @@ mod tests {
         // Both directions, and the name is the direction that was MISSING.
         //
         // Until 2026-09-12 this test iterated the MANIFEST and looked for each
-        // entry in the CREATE â the opposite of what its name promises, and
+        // entry in the CREATE — the opposite of what its name promises, and
         // the harmless direction. A column added to the CREATE and forgotten
         // in the manifest passed green, which is the direction that actually
         // bites: an ALREADY-CREATED table on the box never receives the
         // `ADD COLUMN`, so the first ILP write auto-creates it at whatever
         // type the wire value infers. Dev and prod then hold the same column
-        // at different types from the same binary â exactly the drift
+        // at different types from the same binary — exactly the drift
         // `table_schema_lockstep_guard`'s header describes.
         //
         // The type half was near-vacuous too: `ddl.contains("LONG")` is true
@@ -2305,7 +2305,7 @@ mod tests {
                 .find(|(col, _)| col == name)
                 .unwrap_or_else(|| {
                     panic!(
-                        "column {name} is in the CREATE but NOT in the self-heal manifest â a \
+                        "column {name} is in the CREATE but NOT in the self-heal manifest — a \
                          box that already has this table would never receive it"
                     )
                 });
@@ -2342,7 +2342,7 @@ mod tests {
         assert_eq!(
             created.len(),
             TOP_VOLUME_RANK_COLUMNS.len() + 1,
-            "parsed {created:?} â expected the manifest plus the designated `ts`"
+            "parsed {created:?} — expected the manifest plus the designated `ts`"
         );
         assert_eq!(created.first().map(|c| c.0.as_str()), Some("ts"));
         assert!(
@@ -2363,7 +2363,7 @@ mod tests {
     /// are already in the buffer, and `table()` has by then set questdb-rs to
     /// `TableWritten`, where every later `.table()` is REFUSED. Before the
     /// 2026-09-09 marker fix, one negative timestamp killed this writer for the
-    /// rest of the process â and `pending` stayed 0, so `flush`'s early return
+    /// rest of the process — and `pending` stayed 0, so `flush`'s early return
     /// meant nothing ever cleared it either.
     #[test]
     fn a_row_that_fails_part_way_does_not_poison_the_buffer() {
@@ -2437,25 +2437,25 @@ mod tests {
     /// array. This one derives its expectation from the manifest, so a new
     /// column is covered the moment it is declared.
     ///
-    /// # â  Why the match is ANCHORED (2026-09-19), and a correction
+    /// # ⚠ Why the match is ANCHORED (2026-09-19), and a correction
     ///
     /// It used to ask `line.contains("{col}=")`, which is satisfied by any
-    /// other column whose name ENDS with this one â `volume=` is a substring
+    /// other column whose name ENDS with this one — `volume=` is a substring
     /// of `cumulative_day_volume=`, so `volume` has been passing vacuously
     /// since Phase 1 began, on a line that never carried it.
     ///
     /// **An earlier draft of this note claimed the delay pairs added three
-    /// more of these â `open=` inside `open_latency=`, `close=` inside
+    /// more of these — `open=` inside `open_latency=`, `close=` inside
     /// `close_latency=`. That is FALSE and was refuted by bite-testing it:
     /// the `=` sits between them, so `open_latency=` does not contain
     /// `open=`.** The hazard is a SUFFIX collision, never a prefix one, and
     /// recording the wrong shape would have sent the next reader looking for
     /// the wrong thing. `volume` was and remains the only live instance.
     ///
-    /// â  2026-09-19: the six delay columns that example names left this
-    /// table with the 21â15 strip (they live on `candles_<tf>` now), so the
+    /// ⚠ 2026-09-19: the six delay columns that example names left this
+    /// table with the 21→15 strip (they live on `candles_<tf>` now), so the
     /// names no longer resolve here. The correction is kept because the
-    /// LESSON is the durable half â suffix, never prefix.
+    /// LESSON is the durable half — suffix, never prefix.
     ///
     /// The anchoring is kept regardless, for two reasons that survive the
     /// correction: it is what makes the `volume` carve-out below honest
@@ -2472,7 +2472,7 @@ mod tests {
         w.append_row(&row()).expect("append");
         let line = w.buffer_utf8();
         for (col, _) in TOP_VOLUME_RANK_COLUMNS {
-            // â  RETIRED 2026-09-19 â the `volume` carve-out that stood here
+            // ⚠ RETIRED 2026-09-19 — the `volume` carve-out that stood here
             // asserted the column must NOT reach the wire, because a two-phase
             // rename was holding `volume` empty for a retention window so one
             // column could never mean the vendor day total on Monday's rows and
@@ -2481,8 +2481,8 @@ mod tests {
             // Both halves of that reason are gone. The operator ordered a fresh
             // scratch database the same day, so no row anywhere holds the old
             // meaning and there is no partition boundary to straddle; and
-            // `cumulative_day_volume` â the column whose suffix made the
-            // unanchored match vacuous in the first place â left the table in
+            // `cumulative_day_volume` — the column whose suffix made the
+            // unanchored match vacuous in the first place — left the table in
             // the same change. `volume` is now an ordinary written column and
             // is proven by the loop below exactly like every other one.
             assert!(
@@ -2521,15 +2521,15 @@ mod tests {
     /// The label and the interval are two halves of the same claim: a row
     /// stamped `5s` asserts that the snapshot behind it was taken every five
     /// seconds. They are separate `match` arms, so nothing but a test stops
-    /// one from being edited without the other â and the drift would be
+    /// one from being edited without the other — and the drift would be
     /// invisible, because a wrongly-paced snapshot still writes a
     /// well-formed row under a label that reads correct.
     ///
-    /// â  The pre-2026-09-12 form of this test did
+    /// ⚠ The pre-2026-09-12 form of this test did
     /// `as_str().trim_end_matches('s').parse::<u64>()`, which reads `"1m"` as
     /// `"1m"` and PANICS. It was written when every label happened to end in
     /// `s`, and it would have failed the build the moment a minute cadence
-    /// arrived â as a parse panic naming nothing, not as a drift report. The
+    /// arrived — as a parse panic naming nothing, not as a drift report. The
     /// unit suffix is now part of what is checked.
     #[test]
     fn interval_secs_agrees_with_the_label_it_is_stored_under() {
@@ -2571,7 +2571,7 @@ mod tests {
         assert_eq!(w.pending(), 0, "pending must be cleared after a discard");
     }
 
-    /// Flushing nothing is a no-op, not an error â otherwise a quiet second
+    /// Flushing nothing is a no-op, not an error — otherwise a quiet second
     /// produces a spurious failure every time.
     #[test]
     fn flushing_an_empty_buffer_is_not_an_error() {
@@ -2579,7 +2579,7 @@ mod tests {
         assert!(w.flush().is_ok());
     }
 
-    /// `subscribed=false` is the whole point of the column â it must be
+    /// `subscribed=false` is the whole point of the column — it must be
     /// written, not skipped as a default.
     #[test]
     fn append_row_writes_subscribed_false_rather_than_omitting_it() {
@@ -2617,7 +2617,7 @@ mod tests {
         r.open_percentage_change = None;
         w.append_row(&r).expect("append");
         let line = w.buffer_utf8();
-        // â  The LEADING COMMA is load-bearing and is not decoration. Every ILP
+        // ⚠ The LEADING COMMA is load-bearing and is not decoration. Every ILP
         // field after the first is comma-prefixed, and `percentage_change` is a
         // SUFFIX of both `volume_percentage_change` and
         // `open_percentage_change` -- so a bare `"percentage_change="` matches
@@ -2660,7 +2660,7 @@ mod tests {
     /// # The guard the old constant did not have
     ///
     /// `TOP_VOLUME_ILP_ROW_BYTES` was `120` and labelled "measured", and
-    /// nothing measured it â the only assert over it compared `2X >= X`, which
+    /// nothing measured it — the only assert over it compared `2X >= X`, which
     /// is true for every value. This test builds the widest line `write_row`
     /// can actually emit (every integer at its column's extreme, a full-width
     /// `f64` in every optional DOUBLE, the longest real symbol values) and
@@ -2705,7 +2705,7 @@ mod tests {
             width <= MEASURED_WORST_CASE_ILP_ROW_BYTES,
             "one worst-case row measured {width} B against an assumed \
              {MEASURED_WORST_CASE_ILP_ROW_BYTES} B. The producer ceiling is derived from \
-             the assumption, and past it this writer DROPS with no spill tier â \
+             the assumption, and past it this writer DROPS with no spill tier — \
              so an under-count is silent row loss. Raise the constant (and the \
              literal in its sibling assert) to cover the measurement."
         );
@@ -2750,7 +2750,7 @@ mod tests {
         let (producer, sink, _rx) = TopVolumeRankWriter::for_test().split_for_offload();
         assert!(
             producer.is_offloaded(),
-            "the producer must know it is split â the drain reads this to refuse a synchronous flush"
+            "the producer must know it is split — the drain reads this to refuse a synchronous flush"
         );
         assert!(
             producer.sender.is_none(),
@@ -2759,7 +2759,7 @@ mod tests {
         );
         assert!(
             sink.sender.is_none(),
-            "for_test() has no sender to move â this pins the MOVE, not the presence"
+            "for_test() has no sender to move — this pins the MOVE, not the presence"
         );
     }
 
@@ -2803,7 +2803,7 @@ mod tests {
         assert_eq!(
             producer.pending(),
             1,
-            "the rows must be RETAINED â this is the arm that makes the bounded \
+            "the rows must be RETAINED — this is the arm that makes the bounded \
              queue safe. Without it a full queue either blocks the drain (the \
              original defect) or drops rows (a worse one)."
         );
@@ -2846,7 +2846,7 @@ mod tests {
             .count();
         assert_eq!(
             capped, 1,
-            "exactly one cut on the span AFTER the retained ones â the constant \
+            "exactly one cut on the span AFTER the retained ones — the constant \
              names how many may be RETAINED, so `>` and not `>=`. Got {outcomes:?}"
         );
         assert_eq!(
@@ -2907,7 +2907,7 @@ mod tests {
     fn the_sink_reports_the_rows_that_actually_landed() {
         // No sender means nothing can land; the positive direction is covered
         // by the live QuestDB path. What this pins is that an EMPTY batch is a
-        // no-op rather than an error â the drain flushes on a timer, and a
+        // no-op rather than an error — the drain flushes on a timer, and a
         // timer that fires on an idle second must not log a loss.
         let (_producer, mut sink, _rx) = TopVolumeRankWriter::for_test().split_for_offload();
         let mut empty = TopVolumeFlushBatch {
@@ -2919,14 +2919,14 @@ mod tests {
 
     #[test]
     fn the_producer_byte_ceiling_stays_tighter_than_the_depth_path() {
-        // Not a style preference â a sizing claim, pinned so it cannot drift
+        // Not a style preference — a sizing claim, pinned so it cannot drift
         // into depth's 32 MiB by copy-paste. Depth is a MEASURED ~63,800
         // rows/s and bursts 400 rows in ONE depth-200 snapshot; this table
         // emits at most one row per traded contract per sweep. A ceiling
         // sized for depth would hold minutes of stale rankings nothing
-        // downstream wants â every sweep supersedes the last.
+        // downstream wants — every sweep supersedes the last.
         //
-        // â  RENAMED 2026-09-18, from `..._is_far_tighter_than_...`. The three
+        // ⚠ RENAMED 2026-09-18, from `..._is_far_tighter_than_...`. The three
         // fold columns added that day took the row width 401 -> 531 B measured,
         // the assumed width 448 -> 596, and the ceiling 22.4 -> 29.8 MB. That
         // is an 11% margin under depth's 33.55 MB where it used to be 33%, and
@@ -2943,26 +2943,26 @@ mod tests {
         assert_eq!(
             TOP_VOLUME_FLUSH_QUEUE_DEPTH,
             crate::depth_persistence::DEPTH_FLUSH_QUEUE_DEPTH,
-            "the queue DEPTH is deliberately the same across writers â one \
+            "the queue DEPTH is deliberately the same across writers — one \
              number is one thing to keep true, and a shared shape is what stops \
              the three paths drifting into different failure semantics"
         );
     }
 
     /// `discard_pending` became `pub` on 2026-09-13 so the lane can account for
-    /// retained rows at SHUTDOWN â the one moment nothing else calls it.
+    /// retained rows at SHUTDOWN — the one moment nothing else calls it.
     ///
     /// On a `QueueFull` the producer keeps its rows and `flush` returns `Ok`,
     /// which is correct: that is backpressure, not loss. But if the process
     /// then exits while rows are retained, no later flush ever runs, and until
     /// this was reachable from the lane those rows skipped even the discard
-    /// counter â a real drop with every surface reading green.
+    /// counter — a real drop with every surface reading green.
     #[test]
     fn discard_pending_clears_the_buffer_and_reports_the_count() {
         let mut writer = TopVolumeRankWriter::for_test();
 
-        // Nothing pending: zero, no log, no counter movement, and â the part
-        // that matters for a shutdown path called unconditionally â no panic.
+        // Nothing pending: zero, no log, no counter movement, and — the part
+        // that matters for a shutdown path called unconditionally — no panic.
         assert_eq!(
             writer.discard_pending(),
             0,
@@ -2987,7 +2987,7 @@ mod tests {
         assert_eq!(
             writer.discard_pending(),
             0,
-            "the buffer must be CLEARED by the discard â a second call that \
+            "the buffer must be CLEARED by the discard — a second call that \
              re-reported the same rows would inflate the loss series on a \
              shutdown path that is reached from more than one place"
         );
@@ -2997,7 +2997,7 @@ mod tests {
     /// production constructor.
     ///
     /// A counter that is only ever registered by its own first increment is
-    /// ABSENT from the exporter until the event it reports happens â and an
+    /// ABSENT from the exporter until the event it reports happens — and an
     /// absent series reads exactly like a healthy zero. Worse, if the name is
     /// EMF-selected the CloudWatch agent computes counter deltas and DROPS the
     /// first sample of a series it has never seen, so the one episode that
@@ -3035,7 +3035,7 @@ mod tests {
         assert!(
             names.len() >= 5,
             "expected at least the five known writer counters; the scan found \
-             {} â a scan that finds nothing passes vacuously, which is the \
+             {} — a scan that finds nothing passes vacuously, which is the \
              failure this assertion exists to prevent: {names:?}",
             names.len()
         );
@@ -3053,7 +3053,7 @@ mod tests {
                  seeded at zero. Add `{seed}` to `TopVolumeRankWriter::new` \
                  beside the others. An unseeded counter is ABSENT from the \
                  exporter until its first event, and an absent series reads as \
-                 health â on a loss counter that is a false OK."
+                 health — on a loss counter that is a false OK."
             );
         }
     }
@@ -3092,7 +3092,7 @@ mod tests {
     ///
     /// Both halves matter. The drain back-dates a receipt by ring dwell, so a
     /// tick can legitimately carry an instant a hair before the boundary it
-    /// lands in â a clamp to zero would hide that. And `abs()` on `i64::MIN`
+    /// lands in — a clamp to zero would hide that. And `abs()` on `i64::MIN`
     /// PANICS under this workspace's release profile (`overflow-checks = true`),
     /// on the frame-drain task, so the renderer uses `unsigned_abs`.
     #[test]
@@ -3127,7 +3127,7 @@ mod tests {
     ///
     /// Four real delays, an order of magnitude apart each time. Sorted as TEXT
     /// they come out in the EXACT REVERSE of their true order, and the result
-    /// looks entirely plausible â which is what makes it dangerous. Sorted on
+    /// looks entirely plausible — which is what makes it dangerous. Sorted on
     /// the nanosecond twin they come out right. Any `ORDER BY` must use the
     /// `_ns` column; this test fails if someone ever decides one column was
     /// enough.
@@ -3145,7 +3145,7 @@ mod tests {
         assert_eq!(
             by_text.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
             vec![4, 3_000, 2_000_000, 1_000_000_000],
-            "text descending should be wrong â if this now matches the true \
+            "text descending should be wrong — if this now matches the true \
              order the fixture stopped demonstrating the hazard"
         );
 

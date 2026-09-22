@@ -3583,6 +3583,22 @@ mod tests {
         }
     }
 
+    /// `candles_10m` and `candles_named` are VIEWS that start with the
+    /// `candles_` prefix the wipe uses to find candle TABLES. A `TRUNCATE
+    /// TABLE` on a view fails, prints TRUNCATE-FAILED on every wipe, and trains
+    /// the operator to ignore the line that would report a real failure. They
+    /// are excluded by name; the prefix arm still covers every real frame.
+    #[test]
+    fn test_wipe_questdb_never_truncates_a_candle_view() {
+        let joined = WIPE_QUESTDB_COMMANDS.join("\n");
+        for view in ["candles_10m", "candles_named"] {
+            assert!(
+                joined.contains(&format!("$0!=\"{view}\"")),
+                "the wipe predicate must exclude the `{view}` view by name"
+            );
+        }
+        assert!(joined.contains("index($0,\"candles_\")==1"));
+    }
     #[test]
     fn test_wipe_questdb_truncates_live_rest_tables_too() {
         // 2026-07-16 destructive-surface extension: a "fresh start" must also

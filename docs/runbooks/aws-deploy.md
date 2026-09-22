@@ -252,3 +252,32 @@ terraform destroy
 ```
 
 See `aws-disaster-recovery.md` for post-go-live DR procedures.
+
+## ⚠ Rolling back ACROSS the 2026-09-22 spill format change (seal spill v4)
+
+This applies to any rollback from a binary that carries seal-spill format
+**version 4** (PR #1928 and later) to a binary built before it.
+
+**The hazard.** Version 4 renumbered the timeframe ordinals stored in byte 7
+of every 128-byte seal spill record, from 24 frames to 9. Older binaries
+refused only version-0 records. They would read a version-4 file, accept its
+ordinal byte under the OLD numbering, and replay each bar into the wrong
+`candles_<tf>` table without logging anything. The DLQ has the same problem:
+older binaries do not read `format_version` at all.
+
+**How it is closed (mechanically, no operator step).** v4 files are named
+`seals_v4-YYYY-MM-DD.bin` and `seals_v4-YYYY-MM-DD.ndjson`. Every older binary
+selects files with `starts_with("seals-")`, which does not match `seals_v4-`, so
+after a rollback the older binary never opens a v4 file. The files stay on disk
+untouched and recoverable, and the next v4 binary drains them. The guarantee is
+pinned by a compile-time assert in `seal_writer_task.rs` (the current prefix
+must not start with the legacy one) and by filename tests in `seal_spill.rs` and
+`seal_dlq.rs`.
+
+**What a rollback still costs:** any seals spilled by the v4 binary are NOT
+replayed while the older binary runs. They wait on disk until a v4-or-later
+binary boots again.
+
+Rolling FORWARD is safe: the v4 drain still globs legacy `seals-*` files,
+REFUSES every record whose `format_version` is not 4, counts it, and archives
+the file.

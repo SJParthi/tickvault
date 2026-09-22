@@ -117,10 +117,18 @@ ORDER BY t.ts DESC LIMIT 100;
 
 For candles, swap `FROM ticks t` → `FROM candles_1m c` (alias `c`) and
 the column list to
-`c.ts, il.symbol_name, il.display_name, il.instrument_type, c.open,
-c.high, c.low, c.close, c.volume, c.oi, c.tick_count, c.feed,
-c.segment, c.security_id, c.change_pct, c.close_pct_from_prev_day,
-c.open_pct, c.open_gap_pct`.
+`c.ts, c.contract, il.symbol_name, il.display_name, il.instrument_type,
+c.open, c.high, c.low, c.close, c.volume, c.oi, c.tick_count, c.feed,
+c.segment, c.security_id, c.percentage_change, c.open_percentage_change,
+c.total_buy_qty, c.total_sell_qty, c.open_latency, c.close_latency,
+c.window_span_latency`.
+
+> **2026-09-22:** this list named `change_pct`, `close_pct_from_prev_day`,
+> `open_pct` and `open_gap_pct`, all removed or renamed by the 2026-09-19
+> fresh-start reset — pasted as written it failed on the first missing
+> column. `volume` is SIGNED since that reset (negative when the bar closed
+> below the previous bar). `contract` is the option's name and is NULL for
+> spot, index and future candles.
 
 ## Introspection + definition changes
 

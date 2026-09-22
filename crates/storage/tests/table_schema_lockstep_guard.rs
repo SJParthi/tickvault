@@ -92,7 +92,9 @@ const NO_GENERIC_SELF_HEAL: &[(&str, &str)] = &[
     ),
     (
         "shadow_persistence.rs",
-        "five hand-rolled ALTERs across the shadow candle tables",
+        "one ADD COLUMN loop driven by `CANDLE_SELF_HEAL_COLUMNS`, which a unit \
+         test pins to the CREATE column-for-column (2026-09-22: this reason \
+         said five hand-rolled ALTERs, which the 2026-09-19 reset replaced)",
     ),
     (
         "ws_event_audit_persistence.rs",

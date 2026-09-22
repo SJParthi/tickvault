@@ -922,9 +922,6 @@ impl VolumeLeaderboard {
                         // leave a trap that a legitimate later climb trips,
                         // silently eating a real window.
                         resync_ceiling: stored,
-                        // RESEEDED to nothing, in lockstep with the baseline
-                        // one field up and for the same reason: the re-latch
-                        // declares the stored series garbage, and a first
                     };
                     slot.relatched = slot.relatched.saturating_add(1);
                     let relatched_total = slot.relatched;
@@ -1242,11 +1239,6 @@ impl VolumeLeaderboard {
                 dirty: 0,
                 // No ceiling is armed: this contract has never re-latched.
                 resync_ceiling: 0,
-                // A contract this process has never seen has no window open
-                // for it yet, so there is no first receipt to record and
-                // nothing to measure a span from. Both stay at the `0`
-                // sentinel until its first accepted ADVANCE, which is also
-                // the first instant its dirty bit is set.
             },
         );
         Observation::Accepted

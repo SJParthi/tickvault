@@ -450,11 +450,10 @@ impl TfIndex {
         }
     }
 
-    /// True for the 16 GDF-gated second-scale frames (bucket < 60 s:
-    /// 1s..=15s + 30s). These frames are STRUCTURAL until the GDF 1s live
-    /// feed lands (separate lane) — ZERO rows are written today, the REST
-    /// 1m cadence folds only the 5-frame minute/day set, and the RAM store
-    /// allocates them as capacity-1 placeholders (never full session rings).
+    /// True for the second-scale frames (bucket < 60 s). Since 2026-09-19 that
+    /// is THREE — `S1`, `S3`, `S5` — and all three EMIT rows from the live
+    /// Dhan fold. (Until 2026-09-22 this doc said "the 16 GDF-gated frames …
+    /// ZERO rows are written today", which described the 24-frame era.)
     #[inline]
     #[must_use]
     pub const fn is_second_scale(self) -> bool {
@@ -995,7 +994,9 @@ mod tests {
 
     /// `Ord` sorts by the `repr(u8)` discriminant = the seal-spill
     /// APPEND order (C3) — which is exactly `ALL`'s order. Deliberately
-    /// NOT seconds order: D1 (ordinal 4) precedes S1 (ordinal 5).
+    /// NOT seconds order: M15 (ordinal 3, 900 s) precedes S1 (ordinal 4, 1 s)
+    /// (2026-09-22: this read "D1 (ordinal 4) precedes S1 (ordinal 5)", the
+    /// pre-2026-09-19 numbering; D1 no longer exists).
     #[test]
     fn test_tf_index_total_ordering_matches_ordinal_append_order() {
         let mut sorted = TfIndex::ALL.to_vec();

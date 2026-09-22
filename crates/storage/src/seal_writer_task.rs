@@ -341,9 +341,45 @@ pub const SEAL_REPLAYING_SUBDIR: &str = "replaying";
 /// never re-inject.
 pub const SEAL_ARCHIVE_SUBDIR: &str = "archive";
 
-/// Filename prefix shared by both the spill (`.bin`) and DLQ (`.ndjson`)
-/// daily files (`seals-YYYY-MM-DD.*`).
-const SEAL_FILE_PREFIX: &str = "seals-";
+/// Filename prefix of the files the CURRENT writers produce, for both the
+/// spill (`.bin`) and the DLQ (`.ndjson`): `seals_v4-YYYY-MM-DD.*`.
+///
+/// ⚠ Renamed 2026-09-22 from `seals-` (hostile finding B2). Version 4
+/// renumbered the timeframe ordinals, and every earlier binary selects files
+/// by `name.starts_with("seals-")` and refuses only version-0 records. So after a
+/// rollback, an older binary would read a v4 file and file each bar under the
+/// OLD ordinal: an S3 bar into `candles_1s`, and an M30 bar into `candles_3s`.
+/// `seals_v4-` does not start with `seals-`, so an older binary never opens
+/// these files. A rollback strands them on disk, still recoverable, instead of
+/// corrupting two tables without logging anything.
+pub const SEAL_FILE_PREFIX: &str = "seals_v4-";
+
+/// The pre-v4 prefix. Still globbed, so files written by an older binary are
+/// staged, REFUSED by the version gate (every record in them has a stale
+/// `format_version`), and archived. They are never stranded and never re-read.
+pub const LEGACY_SEAL_FILE_PREFIX: &str = "seals-";
+
+// The whole rollback guarantee rests on this: the current prefix must not
+// match an older binary's `starts_with("seals-")` test.
+const _: () = assert!(!starts_with_const(
+    SEAL_FILE_PREFIX,
+    LEGACY_SEAL_FILE_PREFIX
+));
+
+const fn starts_with_const(s: &str, prefix: &str) -> bool {
+    let (s, p) = (s.as_bytes(), prefix.as_bytes());
+    if p.len() > s.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < p.len() {
+        if s[i] != p[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
 
 /// Outcome of one [`drain_recovered_seals`] pass. Every field maps to a
 /// `tv_seal_writer_drain_total{kind=...}` label emitted by the writer loop.
@@ -439,7 +475,7 @@ fn stage_pending_files(dir: &Path) -> Vec<PathBuf> {
     staged
 }
 
-/// `true` for a regular file named `seals-*.bin` or `seals-*.ndjson`.
+/// `true` for a regular file named `seals_v4-*` or legacy `seals-*`, ending `.bin` or `.ndjson`.
 fn is_seal_file(path: &Path) -> bool {
     if !path.is_file() {
         return false;
@@ -447,7 +483,8 @@ fn is_seal_file(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
-    name.starts_with(SEAL_FILE_PREFIX) && staged_kind(path).is_some()
+    (name.starts_with(SEAL_FILE_PREFIX) || name.starts_with(LEGACY_SEAL_FILE_PREFIX))
+        && staged_kind(path).is_some()
 }
 
 /// Classifies a staged file by extension. Collision-suffixed names
@@ -812,6 +849,37 @@ pub fn drain_recovered_seals<S: SealSink>(
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    /// B2 (2026-09-22): the drain stages BOTH names - the current one it
+    /// replays, and the legacy one whose stale records the version gate
+    /// refuses and archives - and nothing else.
+    #[test]
+    fn the_drain_globs_the_current_and_the_legacy_prefix_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "tv-seal-prefix-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, want) in [
+            ("seals_v4-2026-09-22.bin", true),
+            ("seals_v4-2026-09-22.ndjson", true),
+            ("seals-2026-09-18.bin", true),
+            ("seals-2026-09-18.ndjson", true),
+            ("seals_v4-2026-09-22.bin.1", true),
+            ("seals_v5-2026-09-22.bin", false),
+            ("notes-2026-09-22.bin", false),
+            ("seals_v4-2026-09-22.txt", false),
+        ] {
+            let p = dir.join(name);
+            std::fs::write(&p, b"x").unwrap();
+            assert_eq!(is_seal_file(&p), want, "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The three unreadable paths must be DISTINGUISHABLE from an empty file.
     ///

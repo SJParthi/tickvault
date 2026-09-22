@@ -594,8 +594,6 @@ where
         .unwrap_or(1)
         .saturating_mul(NANOS_PER_SECOND);
     let ts = boundary.saturating_sub(period_nanos);
-    // The same two boundaries in the RECEIPT clock's frame.
-    //
     // The row stamp in IST epoch SECONDS — the OPEN of the window this
     // snapshot describes, and the exact key the candle fold buckets on
     // (`LiveCandleState::bucket_start_ist_secs` is seconds). It is handed to
@@ -609,8 +607,9 @@ where
     let ts_secs = ts.div_euclid(NANOS_PER_SECOND);
     let window_open_secs = u32::try_from(ts_secs).ok();
     // `rows` IS pre-sized: it genuinely fills. Every contract on the board
-    // produces a row — the two refusals that can fire in the common case
-    // (`LabelUnavailable`) does NOT drop the row, it only NULLs a leaf column — so `ranked.len()` is the exact final length in
+    // produces a row — the common-case refusal (`LabelUnavailable`) does
+    // NOT drop the row, it only NULLs a leaf column — so `ranked.len()` is
+    // the exact final length in
     // every reachable case and one allocation is the whole cost.
     let mut rows = Vec::with_capacity(ranked.len());
     // `refusals` is NOT, and the comment that used to defend pre-sizing it
@@ -758,36 +757,12 @@ where
             .map(|bar| bar.open_pct)
             .filter(|p| p.is_finite());
 
-        // ---- the three receipt delays (operator, 2026-09-19 Quote D) -------
-        //
-        // Three questions the row could not answer before: how long after the
-        // window opened did the first trade REACH US, how long before it
-        // closed did the last one, and how far apart were those two.
-        //
-        // # The clock, and the one conversion that must happen exactly once
-        //
-        // received_at_nanos` — a **UTC** epoch instant, back-dated by ring
-        // dwell so it names the socket-receipt moment rather than the fold
-        // moment. `ts` and `boundary` are **IST-naive** nanos (the grid this
-        // table and `candles_<tf>` share). Subtracting one from the other
-        // without the conversion is a 5 h 30 m error that looks EXACTLY like
-        // a plausible delay, so the two UTC-frame boundaries are computed once
-        // per sweep above and both differences are taken in that one frame.
-        //
-        // # Why `0` means NULL rather than "instant"
-        //
-        // `WAL_RECEIPT_UNKNOWN_NANOS` is `0`: a pre-`TVW3` WAL frame carries no
-        // receipt at all. Rendering that as `0 nanoseconds` would report the
-        // fastest possible delivery for a tick whose delivery time is unknown,
-        // so both halves of a pair go NULL together and the column is honestly
-        // empty. `<= 0` rather than `== 0` because a negative epoch is not a
-        // receipt either.
-        //
-        // # Why each is `Option<i64>` and not a rendered string here
-        //
-        // The row stays allocation-free: the writer owns one reusable buffer
-        // and renders at append time. A `format!` per column per row would be
-        // 3 x 20,220 = 60,660 fresh allocations per sweep, on the frame drain.
+        // The three receipt-delay pairs (operator, 2026-09-19 Quote D) are NOT
+        // on this row: the 2026-09-19 fifteen-column contract removed them
+        // from `top_volume`, and they live on `candles_<tf>`, where the fold
+        // holds the receipt stamps. (2026-09-22: a comment block describing
+        // how this projection computed them stood here after the fields were
+        // gone.)
         rows.push(TopVolumeRankRow {
             snapshot_ts_ist_nanos: ts,
             cadence,

@@ -7185,8 +7185,24 @@ does NOT get a new one by writing code: minting a second reset id requires its o
 fresh dated operator quote in THIS file first. So the wipe cannot fire twice, cannot
 fire on a mid-session restart, and cannot be re-triggered by a later column change.
 
+> **SHIPPED 2026-09-22 (PR #1928).** Implemented in `crates/storage/src/fresh_start_reset.rs`,
+> called once from `candle_ddl_boot.rs` before any CREATE. It is refused inside the
+> 08:55–15:45 IST band, and it records `RefuseUnreadable` rather than dropping when
+> the log cannot be read. Not verified against a live QuestDB: no instance is
+> reachable from the build container, so the first out-of-session boot is the
+> measurement.
+
 **Allowlist (the ONLY tables the one-shot can reach):** `candles_<tf>` (all ten),
 `top_volume`, `ticks`, `market_depth`.
+
+> **2026-09-22 — `top_volume_rank` added: the SAME table under its pre-2026-09-12 name,
+> not a new one.** A hostile review found that without it, the reset drops `top_volume`
+> and the same boot's `ensure_top_volume_rank_table` then RENAMES any surviving legacy
+> table into its place, bringing every pre-reset row back under the new name. That
+> defeats the one-shot for exactly the table the operator most wanted fresh. Its four
+> legacy views are dropped first. Pinned against the persistence constant by
+> `the_reset_drops_top_volume_under_both_of_its_names`. No SEBI table is added. The
+> SEBI set stays const-asserted disjoint.
 
 **UNREACHABLE BY CONSTRUCTION — SEBI, five-year retention:**
 `instrument_lifecycle`, `instrument_lifecycle_audit`, `index_constituency`,
@@ -7351,6 +7367,16 @@ other. #20 lands first and #15 rides the same step.
   and a separate change; until it runs, a deployed box keeps the old tables with no
   writer. They are NOT SEBI tables, so this is a housekeeping matter, not a
   retention one.
+  > **⚠ CORRECTED 2026-09-22 — the tables ARE dropped, but not by the reset.**
+  > `fresh_start_reset.rs` (shipped the same day) drops ONLY its `RESET_TABLES` literal:
+  > the nine current `candles_<tf>` tables plus `top_volume`, `ticks` and `market_depth`.
+  > The fifteen retired frames are dropped by a DIFFERENT boot step,
+  > `shadow_persistence::drop_retired_candle_tables`. It is called from
+  > `candle_ddl_boot.rs`, runs before any candle CREATE, and is marker-gated so it sweeps
+  > once per sweep version. So the outcome this sentence describes is real, but the
+  > mechanism it names is wrong. Recorded because a first draft of THIS correction said
+  > nothing drops them. That draft was reasoned from the reset's allowlist without a grep
+  > for the second caller.
 
 #### What a PR that violates this section looks like (REJECT)
 
