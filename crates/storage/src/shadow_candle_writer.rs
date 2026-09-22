@@ -464,7 +464,20 @@ impl ShadowCandleWriter {
             .symbol("feed", row.feed)
             .with_context(|| "candle append: symbol(feed) failed")?
             .symbol("segment", row.segment)
-            .with_context(|| "candle append: symbol(segment) failed")?
+            .with_context(|| "candle append: symbol(segment) failed")?;
+        // `contract` — the option's NAME (`NIFTY-25Sep2026-24500-CE`), from the
+        // table the app publishes once per day. One ArcSwap load + one hash
+        // probe per SEALED BAR, zero allocation (the name is borrowed out of
+        // the snapshot). Written only when the table knows this exact
+        // `(security_id, segment)`; otherwise the symbol is OMITTED and the
+        // column reads NULL — never a guessed name. It must sit here, among
+        // the symbols: ILP rejects a symbol after the first column.
+        let labels = crate::candle_contract_labels::candle_contract_labels();
+        if let Some(name) = labels.get(&(row.security_id, row.segment)) {
+            buf.symbol("contract", &**name)
+                .with_context(|| "candle append: symbol(contract) failed")?;
+        }
+        let buf = buf
             .column_i64("security_id", row.security_id)
             .with_context(|| "candle append: column_i64(security_id) failed")?
             .column_f64("open", row.open)
@@ -1540,6 +1553,86 @@ mod tests {
             CANDLE_OUT_OF_WINDOW_REASONS[0], CANDLE_OUT_OF_WINDOW_REASONS[1],
             "two reasons must never share a metric label"
         );
+    }
+
+    // ---- `contract` (2026-09-22) ----
+
+    fn contract_row(security_id: i64, segment: &'static str) -> ShadowSealRow {
+        ShadowSealRow {
+            table_name: TfIndex::M1.table_name(),
+            timestamp_ist_nanos: 1_716_023_700_i64 * 1_000_000_000,
+            security_id,
+            segment,
+            feed: "dhan",
+            open: 100.0,
+            high: 105.0,
+            low: 99.0,
+            close: 101.0,
+            volume: 1234,
+            oi: 50_000,
+            tick_count: 5,
+            close_pct_from_prev_day: 1.5,
+            open_pct: 0.4,
+            change_pct: 1.5,
+            open_gap_pct: 0.2,
+            total_buy_qty: 0,
+            total_sell_qty: 0,
+            open_latency_ns: None,
+            close_latency_ns: None,
+            window_span_latency_ns: None,
+        }
+    }
+
+    fn publish_one(security_id: i64, segment: &'static str, name: &str) {
+        let mut m = std::collections::HashMap::new();
+        m.insert((security_id, segment), std::sync::Arc::<str>::from(name));
+        crate::candle_contract_labels::publish_candle_contract_labels(m);
+    }
+
+    /// A contract the day's table knows gets its NAME written, among the
+    /// symbols (ILP refuses a symbol after the first column).
+    #[test]
+    fn a_known_contract_writes_its_name_before_the_first_column() {
+        let _g = crate::candle_contract_labels::TEST_PUBLISH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_one(9_200_001, "NSE_FNO", "NIFTY-25Sep2026-24500-CE");
+        let mut w = ShadowCandleWriter::for_test();
+        w.append_row(&contract_row(9_200_001, "NSE_FNO"))
+            .expect("append");
+        let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
+        let name_at = s
+            .find("contract=NIFTY-25Sep2026-24500-CE")
+            .unwrap_or_else(|| panic!("the name must be written, got {s}"));
+        let first_column = s.find(" security_id=").expect("first column");
+        assert!(
+            name_at < first_column,
+            "contract is a SYMBOL and must precede every column, got {s}"
+        );
+    }
+
+    /// Anything the table does not know — a spot, a future, the same id on
+    /// another segment, a table not yet published — writes NO name. NULL,
+    /// never a guess.
+    #[test]
+    fn an_unknown_contract_omits_the_name_rather_than_guessing() {
+        let _g = crate::candle_contract_labels::TEST_PUBLISH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_one(9_200_101, "NSE_FNO", "BANKNIFTY-25Sep2026-55000-PE");
+        let mut w = ShadowCandleWriter::for_test();
+        // Same numeric id, different segment (I-P1-11): a different instrument.
+        w.append_row(&contract_row(9_200_101, "NSE_EQ"))
+            .expect("append");
+        // An id the table has never seen.
+        w.append_row(&contract_row(9_200_102, "NSE_FNO"))
+            .expect("append");
+        let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
+        assert!(
+            !s.contains("contract="),
+            "an unresolved contract must be OMITTED (NULL), got {s}"
+        );
+        assert_eq!(w.buffer_row_count(), 2, "both rows are still written");
     }
 
     // ---- the three delay pairs (2026-09-19, Task #15 step 6) ----

@@ -89,6 +89,9 @@ pub mod boot_probe;
 // `daily_universe_fetcher` feature that once gated the lifecycle-ensure
 // call inside was deleted in PR-C3, 2026-07-14 — everything here is
 // unconditional now.)
+// 2026-09-22: the day's option-contract names, published by the app and
+// read once per sealed bar to fill `candles_<tf>.contract`.
+pub mod candle_contract_labels;
 pub mod console_views;
 // C2 (2026-07-03): HTTP-CLIENT-01 — panic-free reqwest client construction.
 // Shared OnceLock probe client for the repeating QuestDB readiness probes

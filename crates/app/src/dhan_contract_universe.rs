@@ -1848,6 +1848,26 @@ fn parse_spot_rows(body: &str, floor: Option<i64>) -> Result<SpotPriceRows, Stri
     Ok(out)
 }
 
+/// Re-keys the app's contract-name table into the candle writer's shape:
+/// `(security_id as i64, segment string)` — exactly the fields a candle row
+/// carries. The segment string comes from the SAME `segment_code_to_str` the
+/// row uses, so the two can never spell a segment differently. An id that
+/// does not fit `i64` is dropped (no Dhan id is near 2^63; the candle row
+/// could not carry it either) — dropped means NULL, never a wrong name.
+fn candle_labels_from(
+    labels: &HashMap<crate::contract_underlying_map::ContractKey, std::sync::Arc<str>>,
+) -> tickvault_storage::candle_contract_labels::CandleContractLabels {
+    let mut out = HashMap::with_capacity(labels.len());
+    for ((id, segment), name) in labels {
+        let Ok(id) = i64::try_from(*id) else {
+            continue;
+        };
+        let seg = tickvault_common::segment::segment_code_to_str(segment.binary_code());
+        out.insert((id, seg), std::sync::Arc::clone(name));
+    }
+    out
+}
+
 /// IST "now" as epoch nanoseconds — wall clock plus the fixed IST offset, the
 /// same convention the `ticks` designated timestamp is written in.
 fn ist_now_nanos() -> i64 {
@@ -2035,9 +2055,22 @@ pub async fn load_contract_universe(
         // label for a contract the leaderboard already tracks, and the
         // leaderboard only tracks what the owner map admits — so this order
         // means a label is always present by the time anything can ask for it.
-        crate::contract_underlying_map::global_contract_underlying_map().publish_labels(
-            crate::contract_underlying_map::labels_from_artifact(&contracts),
+        let labels = crate::contract_underlying_map::labels_from_artifact(&contracts);
+        // The candle writer fills `candles_<tf>.contract` from the SAME names,
+        // re-keyed into the row's own `(security_id, segment-string)` shape
+        // (storage cannot see this crate's map). Built from the same table in
+        // the same pass, so a `top_volume` row and a candle row for one
+        // contract can never carry two different names. `Arc<str>` clones are
+        // refcount bumps; this runs once per attach, never on the tick path.
+        let candle_labels = candle_labels_from(&labels);
+        let published = tickvault_storage::candle_contract_labels::publish_candle_contract_labels(
+            candle_labels,
         );
+        tracing::info!(
+            candle_contract_names = published,
+            "candle contract names published — option candles now carry their contract name"
+        );
+        crate::contract_underlying_map::global_contract_underlying_map().publish_labels(labels);
         let build = crate::contract_underlying_map::global_contract_underlying_map()
             .publish_from_legs(&legs);
         tracing::info!(
@@ -2176,6 +2209,43 @@ pub async fn fetch_spot_prices(
 
 #[cfg(test)]
 mod tests {
+
+    /// The candle writer probes with `(row.security_id, row.segment)`, where
+    /// the segment is `segment_code_to_str(code)`. The re-keyed table must
+    /// spell it identically or every lookup misses and every option candle
+    /// silently reads NULL.
+    #[test]
+    fn candle_labels_are_keyed_exactly_as_a_candle_row_probes() {
+        use tickvault_common::types::ExchangeSegment;
+        let mut labels = std::collections::HashMap::new();
+        labels.insert(
+            (52_175_u64, ExchangeSegment::NseFno),
+            std::sync::Arc::<str>::from("NIFTY-25Sep2026-24500-CE"),
+        );
+        labels.insert(
+            (1_122_u64, ExchangeSegment::BseFno),
+            std::sync::Arc::<str>::from("SENSEX-25Sep2026-81000-PE"),
+        );
+        // An id no candle row can carry: dropped, never wrapped negative.
+        labels.insert(
+            (u64::MAX, ExchangeSegment::NseFno),
+            std::sync::Arc::<str>::from("IMPOSSIBLE"),
+        );
+        let out = super::candle_labels_from(&labels);
+        assert_eq!(out.len(), 2, "the out-of-range id must be dropped");
+        let nse =
+            tickvault_common::segment::segment_code_to_str(ExchangeSegment::NseFno.binary_code());
+        assert_eq!(nse, "NSE_FNO");
+        assert_eq!(
+            out.get(&(52_175, nse)).map(|s| &**s),
+            Some("NIFTY-25Sep2026-24500-CE")
+        );
+        assert_eq!(
+            out.get(&(1_122, "BSE_FNO")).map(|s| &**s),
+            Some("SENSEX-25Sep2026-81000-PE")
+        );
+        assert!(out.values().all(|v| &**v != "IMPOSSIBLE"));
+    }
     /// The cache is a process-global single slot, so these tests must not run
     /// concurrently with each other — one storing while another reads would
     /// make a genuine failure look like a flake and vice versa. Poisoning is
