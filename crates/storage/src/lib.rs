@@ -217,6 +217,8 @@ pub mod pnl_audit_persistence;
 // — zero callers since its sole feeder `prev_day_ohlcv_boot.rs` died in
 // PR-C3 (2026-07-14). The `prev_day_ohlcv` TABLE stays read-only (forensic;
 // partition_manager sweep string retains it).
+// One-shot `2026-09-19-fresh-start` schema reset (scope lock: "THIS TIME ALONE").
+pub mod fresh_start_reset;
 pub mod questdb_health;
 pub mod seal_absorption;
 pub mod seal_dlq;

@@ -121,6 +121,14 @@ pub async fn run_candle_ddl_at_boot(questdb: &QuestDbConfig) {
         return;
     }
 
+    // 2026-09-22 — the ONE-SHOT fresh-start reset (`2026-09-19-fresh-start`,
+    // scope lock "THIS TIME ALONE"). FIRST, before every other DDL: it drops
+    // the allowlisted tables and views, and everything below recreates them
+    // on the new schema in this same boot. `build_shared_infra` awaits this
+    // fn before the feed stack spawns, so no writer is live during the drops.
+    // After the id is logged this is one count query per boot, forever.
+    tickvault_storage::fresh_start_reset::run_fresh_start_reset_at_boot(questdb).await;
+
     // Order is load-bearing (the pre-#1522 main.rs contract): the drop
     // sweep must free any legacy matview squatting a `candles_<tf>` name
     // BEFORE the CREATE TABLE loop, and the named views validate their

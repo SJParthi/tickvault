@@ -93,6 +93,55 @@ fn test_candle_ddl_boot_calls_drop_ensure_views_in_order() {
     );
 }
 
+/// The one-shot fresh-start reset (`2026-09-19-fresh-start`) must run AFTER
+/// the readiness gate and BEFORE every table DDL: it DROPS the allowlisted
+/// tables, and the ensures below are what recreate them on the new schema in
+/// the same boot. Run after the ensures, it would drop freshly-created tables
+/// and leave them absent until the next boot; run before readiness, a
+/// still-starting QuestDB reads as an unreadable log (safe, but it would
+/// defer the reset for a whole day).
+///
+/// And `build_shared_infra` — which awaits this boot fn — must precede the
+/// feed-stack spawn in `main.rs`, so no writer is live while the drops run.
+#[test]
+fn the_fresh_start_reset_runs_once_before_every_table_ddl() {
+    const CALL: &str = "fresh_start_reset::run_fresh_start_reset_at_boot(questdb).await";
+    let boot_src = production_region(&read_src("src/candle_ddl_boot.rs"));
+    assert_eq!(
+        boot_src.matches(CALL).count(),
+        1,
+        "the fresh-start reset must be awaited exactly once in the candle boot"
+    );
+    let reset_pos = boot_src.find(CALL).unwrap();
+    let ready_gate = boot_src
+        .find("if !ready {")
+        .expect("the readiness gate must exist");
+    let legacy = boot_src
+        .find("shadow_persistence::drop_legacy_candle_objects(questdb).await")
+        .unwrap();
+    let ensure = boot_src
+        .find("shadow_persistence::ensure_shadow_candle_tables(questdb).await")
+        .unwrap();
+    assert!(
+        ready_gate < reset_pos && reset_pos < legacy && legacy < ensure,
+        "order: readiness gate -> fresh-start reset -> legacy sweep -> candle ensure"
+    );
+
+    let main_src = production_region(&read_src("src/main.rs"));
+    let infra = main_src
+        .find("= build_shared_infra(")
+        .expect("main must call build_shared_infra");
+    let feed = main_src
+        .find("dhan_feed_stack::spawn_dhan_feed_stack(")
+        .expect("main must spawn the feed stack");
+    assert!(
+        infra < feed,
+        "build_shared_infra (which runs the reset's DROPs) must complete before the \
+         feed stack spawns — a live writer during a DROP auto-creates the table \
+         without its DEDUP key"
+    );
+}
+
 /// The writer → table → ensure → boot-call-site coverage table: every
 /// LIVE-writer table's ensure fn must keep at least the named production
 /// call site. Losing one silently re-opens the fresh-volume no-DEDUP

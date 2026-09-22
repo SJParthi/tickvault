@@ -324,6 +324,10 @@ pub(crate) const RETENTION_EXEMPT_TABLES: &[&str] = &[
     // decision, and pointing a sweeper at a name the rename has already
     // consumed would be the worse answer.
     "top_volume_rank",
+    // The one-shot fresh-start reset's own log (`fresh_start_reset.rs`). One
+    // row per reset id, never partitioned, never swept: dropping a row would
+    // let the one-shot wipe run a SECOND time on the next out-of-session boot.
+    "schema_reset_log",
 ];
 
 /// Every table the retention system knows about, de-duplicated and sorted —
