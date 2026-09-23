@@ -3171,17 +3171,28 @@ async fn run_slow_boot_observability(
                         starved_reported,
                     ) {
                         starved_reported = true;
-                        error!(
-                            code = tickvault_common::error_code::ErrorCode::RiskGapTickGap
-                                .code_str(),
+                        // ⚠ DOWNGRADED 2026-09-23 — ERROR (coded) → WARN (uncoded).
+                        //
+                        // Since 2026-09-02 `ticks_observed` is structurally 0 (the
+                        // broadcast arm feeding it was deleted, see above), so with
+                        // the live lane enabled this notice is not a detection — it
+                        // is a CERTAINTY, emitted on every boot four scans in. As a
+                        // coded ERROR it matched the RISK-GAP-03 log-filter alarm and
+                        // paged the operator every trading morning (~08:34 IST) for a
+                        // fact that never changes. The real per-instrument silence
+                        // signal is the lane's own 30s scan in `dhan_feed_stack`,
+                        // which carries the code and IS gated to the continuous
+                        // session. This line keeps the honesty (it still says the
+                        // detector is blind) and the counter, and drops the page.
+                        warn!(
                             stale_scans,
                             "the per-instrument stall detector has run {stale_scans} scans and \
                              observed ZERO ticks while the live feed is enabled. It is reporting \
                              no stalled instruments because it can see no instruments — not \
                              because none are stalling. Its input is the process tick broadcast, \
                              which the live lane does not publish to; the lane's own 30s silence \
-                             scan (RISK-GAP-03) is the signal that IS wired. Treat this \
-                             detector's verdict as absent, not as healthy.",
+                             scan is the signal that IS wired. Treat this detector's verdict as \
+                             absent, not as healthy.",
                             stale_scans = stale_scans
                         );
                         metrics::counter!("tv_stall_detector_starved_total").increment(1);
@@ -4461,10 +4472,14 @@ async fn run_process_runloop(
                 "Dhan live feed: the lane task failed while shutting down — the day's tail may \
                  not have been persisted"
             ),
+            // The budget is read from the constant — this line said "within 20s"
+            // for a month after the budget was raised to 30 (2026-08-28).
             Err(_) => error!(
                 code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
-                "Dhan live feed: the shutdown seal+flush did NOT finish within 20s — exiting \
-                 anyway so systemd does not SIGKILL us, but the day's tail may be incomplete"
+                budget_secs = DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS,
+                "Dhan live feed: the shutdown seal+flush did NOT finish within \
+                 {DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS}s — exiting anyway so systemd does not \
+                 SIGKILL us, but the day's tail may be incomplete"
             ),
         }
     }
