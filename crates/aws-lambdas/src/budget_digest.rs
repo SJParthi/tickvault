@@ -23,19 +23,23 @@ pub const INR_PER_USD: f64 = 85.0;
 /// India GST 18%.
 pub const GST_MULT: f64 = 1.18;
 /// The REAL ceiling is the AWS Budget that auto-stops the box (budget.tf
-/// limit_amount): **$100/month** on UnblendedCost since the 2026-08-08
-/// operator ruling (Quote 13 — was $35 from 2026-07-31, $25 from the
-/// 2026-07-19 sub-1K step, itself down from $55). The instance moved to
-/// r8g.xlarge to serve the 13-timeframe + current-day tick-retention
-/// requirement; the bill's high estimate is $73.60/mo and the AUTOMATIC
-/// budget actions fire at 90%/100%, so a ceiling under ~$82 would stop the
-/// box mid-session. The 2026-07-19 downward ratchet ladder ($25 → $18 → $13
-/// → $10) is SUPERSEDED for the ceiling; the sub-₹1,000 TARGET still stands
-/// and is now BREACHED ~6× — recorded, not silently dropped. See the dated
-/// block in budget.tf + aws-budget.md. KEEP IN SYNC with budget.tf
-/// limit_amount + budget-guards.tf BUDGET_KILL_USD — the digest reads
-/// BUDGET_USD, the native Budget Action + killswitch fire at limit_amount.
-pub const BUDGET_USD: f64 = 150.0;
+/// limit_amount) and the hourly `hard_stop_guard` kill line.
+///
+/// 2026-09-23 (Quote 23, operator): **$225 for September 2026 ONLY**, so the
+/// month is not stopped at the old $150 line with ~a week of trading left;
+/// from October 2026 the standing ceiling is **$150** again. The one-month
+/// allowance is enforced in CODE, not by remembering to revert: the digest
+/// and the guard both read
+/// `hard_stop_guard::effective_budget_kill_usd(BUDGET_USD, year, month)`,
+/// which clamps every month except 2026-09 to
+/// `hard_stop_guard::STANDING_BUDGET_KILL_USD` ($150).
+///
+/// History: $55 → $25 (2026-07-19) → $35 (2026-07-31) → $100 (2026-08-08)
+/// → $130 (2026-08-19) → $150 (2026-08-25, Quote 19) → $225 September only.
+/// KEEP IN SYNC with budget.tf limit_amount + budget-guards.tf
+/// BUDGET_KILL_USD + hard_stop_guard::DEFAULT_BUDGET_KILL_USD —
+/// `budget_ceiling_lockstep_guard.rs` fails the build if they drift.
+pub const BUDGET_USD: f64 = 225.0;
 
 /// SNS subject — legacy parity: `'[BUDGET] daily AWS cost'`.
 pub const DIGEST_SUBJECT: &str = "[BUDGET] daily AWS cost";
@@ -141,8 +145,16 @@ pub fn render_digest(
     mtd_usd: f64,
     by_svc: &[(String, f64)],
 ) -> (String, f64) {
-    let pct = if BUDGET_USD != 0.0 {
-        (mtd_usd / BUDGET_USD) * 100.0
+    // The ceiling THIS month — the same function the hourly guard uses, so
+    // the digest and the kill line can never name different numbers.
+    // `today_utc` is the UTC billing day (Cost Explorer's own calendar).
+    let ceiling = crate::hard_stop_guard::effective_budget_kill_usd(
+        BUDGET_USD,
+        today_utc.year(),
+        today_utc.month(),
+    );
+    let pct = if ceiling != 0.0 {
+        (mtd_usd / ceiling) * 100.0
     } else {
         0.0
     };
@@ -153,9 +165,9 @@ pub fn render_digest(
         format!("{emoji} *AWS Cost — tickvault*"),
         format!("_Yesterday_:   ₹{:.0}   (${:.2})", inr(yday_usd), yday_usd),
         format!("_This month_:  ₹{:.0}   (${:.2})", inr(mtd_usd), mtd_usd),
-        // Derived from BUDGET_USD (was a hardcoded "$55" literal until the
-        // 2026-07-19 ceiling step) so future ratchet steps touch ONE constant.
-        format!("_Of ${BUDGET_USD:.0} stop-budget_: {pct:.0}%"),
+        // Derived from the EFFECTIVE ceiling (BUDGET_USD clamped to the
+        // standing $150 outside the one-month September 2026 allowance).
+        format!("_Of ${ceiling:.0} stop-budget_: {pct:.0}%"),
         format!(
             "_Forecast EOM_: ₹{:.0}   (${:.2})",
             inr(m.forecast_usd),
@@ -341,6 +353,27 @@ async fn get_by_service(
 mod tests {
     use super::*;
 
+    /// The fixtures below are dated July 2026, so the digest names the
+    /// STANDING ceiling, never the September-only allowance.
+    fn july_ceiling() -> f64 {
+        crate::hard_stop_guard::effective_budget_kill_usd(BUDGET_USD, 2026, 7)
+    }
+
+    #[test]
+    fn test_digest_names_the_september_allowance_only_in_september_2026() {
+        let sept = NaiveDate::from_ymd_opt(2026, 9, 23).unwrap();
+        let (msg, pct) = render_digest(sept, 5.0, 150.0, &[]);
+        assert!(msg.contains("_Of $225 stop-budget_: 67%"), "{msg}");
+        assert!((pct - 150.0 / 225.0 * 100.0).abs() < 1e-9);
+
+        // October: the same spend is 100% of the standing $150 line — red.
+        let oct = NaiveDate::from_ymd_opt(2026, 10, 5).unwrap();
+        let (msg, pct) = render_digest(oct, 5.0, 150.0, &[]);
+        assert!(msg.contains("_Of $150 stop-budget_: 100%"), "{msg}");
+        assert!(msg.starts_with("🔴"), "{msg}");
+        assert!((pct - 100.0).abs() < 1e-9);
+    }
+
     #[test]
     fn test_label_for_substring_matches() {
         assert_eq!(
@@ -431,7 +464,8 @@ mod tests {
         let (msg, pct) = render_digest(today, 0.53, 10.0, &by_svc);
         // pct = 10/100*100 = 10% → 🟢 (BUDGET_USD = 100 since 2026-08-08;
         // derived from the const so a future ceiling change updates in lockstep).
-        assert!((pct - (10.0 / BUDGET_USD) * 100.0).abs() < 1e-9);
+        let ceiling = july_ceiling();
+        assert!((pct - (10.0 / ceiling) * 100.0).abs() < 1e-9);
         assert!(msg.starts_with("🟢 *AWS Cost — tickvault*"));
         // inr(0.53) = 53.159 → "₹53"; USD keeps 2dp with a SINGLE dollar sign.
         assert!(msg.contains("_Yesterday_:   ₹53   ($0.53)"), "{msg}");
@@ -449,10 +483,10 @@ mod tests {
         // budget change into a spurious failure. What is worth pinning is
         // that the digest names the CURRENT ceiling and the spend's true
         // share of it.
-        let expected_pct = (10.00_f64 / BUDGET_USD * 100.0).round();
+        let expected_pct = (10.00_f64 / ceiling * 100.0).round();
         assert!(
             msg.contains(&format!(
-                "_Of ${BUDGET_USD:.0} stop-budget_: {expected_pct:.0}%"
+                "_Of ${ceiling:.0} stop-budget_: {expected_pct:.0}%"
             )),
             "{msg}"
         );
@@ -472,7 +506,7 @@ mod tests {
         let (msg, pct) = render_digest(today, 0.0, 0.0, &[]);
         assert_eq!(pct, 0.0);
         assert!(msg.contains("  (no spend yet this month)"));
-        assert!(msg.contains(&format!("_Of ${BUDGET_USD:.0} stop-budget_: 0%")));
+        assert!(msg.contains(&format!("_Of ${:.0} stop-budget_: 0%", july_ceiling())));
     }
 
     #[test]
@@ -481,7 +515,7 @@ mod tests {
         // Derived from the const so a future ceiling change can never
         // silently turn this into an under-budget case (it did exactly
         // that at the $35 -> $100 raise on 2026-08-08).
-        let (msg, pct) = render_digest(today, 1.0, BUDGET_USD * 1.2, &[]);
+        let (msg, pct) = render_digest(today, 1.0, july_ceiling() * 1.2, &[]);
         assert!(pct > 100.0);
         assert!(msg.starts_with("🔴"));
     }
