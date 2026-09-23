@@ -191,3 +191,50 @@ fn the_body_extractor_cannot_pass_vacuously() {
          'the drain calls the seed' would pass on the definition alone"
     );
 }
+
+#[test]
+fn the_ws_lag_exclusion_family_is_seeded_on_every_label_set() {
+    // ADDED 2026-09-23. `tv_dhan_ws_lag_excluded_total{reason}` lives behind the
+    // lazy `WsLagHandles`, so a label set that never fired was absent from the
+    // exporter, not zero. `ltt_not_advanced` counts repeated quotes kept out of
+    // the lag histogram; without a seed its first episode is dropped by the
+    // agent and the fix cannot be seen working.
+    let body = function_body(STACK, "fn seed_drain_loss_baselines()");
+    assert!(
+        body.contains(
+            "metrics::counter!(WS_LAG_EXCLUDED_COUNTER, \"reason\" => reason).increment(0)"
+        ),
+        "seed_drain_loss_baselines() does not seed tv_dhan_ws_lag_excluded_total"
+    );
+    // Every reason the handles emit must appear in the seed list. A handle
+    // label missing from the seed is the blind spot this closes.
+    let start = STACK
+        .find("impl WsLagHandles {")
+        .expect("impl WsLagHandles must exist");
+    let end = start
+        + STACK[start..]
+            .find("fn histogram_for")
+            .expect("histogram_for");
+    let ctor = &STACK[start..end];
+    let emitted: Vec<&str> = ctor
+        .split("\"reason\" => \"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .collect();
+    assert_eq!(
+        emitted.len(),
+        4,
+        "WsLagHandles::new reasons changed: {emitted:?}"
+    );
+    for reason in emitted {
+        assert!(
+            body.contains(&format!("\"{reason}\"")),
+            "tv_dhan_ws_lag_excluded_total reason `{reason}` is emitted but not seeded"
+        );
+    }
+    // A seeded latency HISTOGRAM would record a fabricated zero-ms reading.
+    assert!(
+        !body.contains(".record("),
+        "seed_drain_loss_baselines() records into a histogram — a fake latency sample"
+    );
+}
