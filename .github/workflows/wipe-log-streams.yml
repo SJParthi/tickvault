@@ -1,0 +1,170 @@
+# wipe-log-streams.yml — delete the prod CloudWatch log STREAMS for a
+# fresh-scratch boot. Groups, metric filters and alarms are never touched.
+#
+# Authorization: operator Quote 25, 2026-09-23 ("Meanwhile delete the entire
+# logs entire traces dude tomorrow it shoudl be the fresh scratch boot
+# application dydde oaky"), recorded in
+# .claude/rules/project/daily-universe-scope-expansion-2026-05-27.md.
+#
+# WHY THIS IS A WORKFLOW
+# ------------------------------------------------------------------------
+# The automation agent's identity cannot do it:
+#
+#   User: arn:aws:iam::208384284948:user/claude-code-agent is not
+#   authorized to perform: logs:DeleteLogStream
+#
+# The long-lived CI keys are the only stored credentials with mutation
+# grants (see grow-ebs-volume.yml). Whether they carry logs:DeleteLogStream
+# is not known from this repository, so step 3 probes it with a delete of a
+# stream that cannot exist: a granted caller gets ResourceNotFound, a
+# refused one gets AccessDenied, and nothing is deleted either way.
+#
+# WHAT IS DELETED, AND WHAT IS NOT
+# ------------------------------------------------------------------------
+# Deleted: every log STREAM in groups named /tickvault/prod/* and
+# /aws/lambda/tv-prod-*.
+# Kept: the groups themselves. Deleting a group deletes its metric filters,
+# and every alarm built on them would go dead. Kept: /aws/lambda/groww-*
+# (bruteX-owned, read-only lock 2026-07-18) — skipped by name even if a
+# future group matches a prefix above.
+# A deleted stream is gone for good. There is no undo.
+#
+# SECURITY: workflow_dispatch inputs are NEVER template-interpolated into
+# run: scripts — every input flows through a step env: block.
+
+name: wipe-log-streams
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type DELETE-PROD-LOG-STREAMS to confirm. Deletes every log stream under /tickvault/prod/* and /aws/lambda/tv-prod-*. Groups, filters and alarms are kept. Refused 09:00-15:45 IST on weekdays.'
+        required: true
+
+concurrency:
+  group: wipe-log-streams-prod
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  wipe:
+    name: Delete prod CloudWatch log streams (guarded)
+    runs-on: ubuntu-24.04
+    environment: prod
+    timeout-minutes: 60
+    env:
+      AWS_RETRY_MODE: adaptive
+      AWS_MAX_ATTEMPTS: '10'
+    steps:
+      - name: Check confirmation and the trading window
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          set -euo pipefail
+          if [ "$CONFIRM" != "DELETE-PROD-LOG-STREAMS" ]; then
+            echo "::error::confirm must be exactly DELETE-PROD-LOG-STREAMS."
+            exit 1
+          fi
+          # The logs of a live session are the only record of what it did.
+          # Never wipe them while the market is open.
+          DOW=$(TZ=Asia/Kolkata date +%u)
+          HM=$(TZ=Asia/Kolkata date +%H%M)
+          if [ "$DOW" -le 5 ] && [ "$HM" -ge 0900 ] && [ "$HM" -lt 1545 ]; then
+            echo "::error::refused: it is $(TZ=Asia/Kolkata date '+%a %H:%M') IST, inside the 09:00-15:45 weekday session."
+            exit 1
+          fi
+          echo "confirmed; outside the session window"
+
+      - name: Check the credentials exist at all
+        env:
+          HAS_KEY: ${{ secrets.AWS_ACCESS_KEY_ID != '' }}
+          HAS_SECRET: ${{ secrets.AWS_SECRET_ACCESS_KEY != '' }}
+        run: |
+          set -euo pipefail
+          if [ "$HAS_KEY" != "true" ] || [ "$HAS_SECRET" != "true" ]; then
+            echo "::error::AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY are not set."
+            exit 1
+          fi
+          echo "credentials present"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4 tag commit, 2026-07-15
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
+
+      - name: Probe logs:DeleteLogStream BEFORE any deletion
+        run: |
+          set -euo pipefail
+          aws sts get-caller-identity --output text
+          # A stream name that cannot exist. Granted -> ResourceNotFound;
+          # refused -> AccessDenied. Nothing is deleted in either case.
+          set +e
+          OUT=$(aws logs delete-log-stream \
+            --log-group-name /tickvault/prod/app \
+            --log-stream-name tv-permission-probe-does-not-exist 2>&1)
+          RC=$?
+          set -e
+          if [ "$RC" -eq 0 ] || echo "$OUT" | grep -q "ResourceNotFoundException"; then
+            echo "logs:DeleteLogStream GRANTED"
+          else
+            echo "::error::logs:DeleteLogStream is NOT granted to these credentials."
+            echo "$OUT"
+            exit 1
+          fi
+
+      - name: Delete every stream, group by group
+        run: |
+          set -euo pipefail
+          GROUPS_FILE=$(mktemp)
+          for prefix in /tickvault/prod/ /aws/lambda/tv-prod-; do
+            aws logs describe-log-groups --log-group-name-prefix "$prefix" \
+              --query 'logGroups[].logGroupName' --output text | tr '\t' '\n' \
+              | grep -v '^$' >> "$GROUPS_FILE" || true
+          done
+          APP_LEFT=0
+          TOTAL_FAILED=0
+          while IFS= read -r group; do
+            case "$group" in
+              *groww*) echo "SKIP $group (bruteX-owned, read-only)"; continue ;;
+            esac
+            deleted=0
+            failed=0
+            STREAMS=$(mktemp)
+            aws logs describe-log-streams --log-group-name "$group" \
+              --query 'logStreams[].logStreamName' --output text \
+              | tr '\t' '\n' | grep -v '^$' > "$STREAMS" || true
+            while IFS= read -r stream; do
+              if aws logs delete-log-stream --log-group-name "$group" \
+                   --log-stream-name "$stream" 2>/dev/null; then
+                deleted=$((deleted + 1))
+              else
+                failed=$((failed + 1))
+              fi
+            done < "$STREAMS"
+            left=$(aws logs describe-log-streams --log-group-name "$group" \
+              --query 'length(logStreams)' --output text)
+            TOTAL_FAILED=$((TOTAL_FAILED + failed))
+            case "$group" in /tickvault/prod/*) APP_LEFT=$((APP_LEFT + left)) ;; esac
+            echo "GROUP $group deleted=$deleted failed=$failed left=$left"
+          done < "$GROUPS_FILE"
+          echo "app/metrics streams left: $APP_LEFT; failed deletes: $TOTAL_FAILED"
+          if [ "$TOTAL_FAILED" -ne 0 ]; then
+            echo "::error::$TOTAL_FAILED stream deletes failed."
+            exit 1
+          fi
+          # A Lambda that fires during the run opens a fresh stream, so the
+          # Lambda groups are not required to end at zero. The app and
+          # metrics groups are written only by the box's agent: with the box
+          # stopped they must end empty.
+          STATE=$(aws ec2 describe-instances \
+            --filters Name=tag:Name,Values=tv-prod-app \
+            --query 'Reservations[].Instances[].State.Name' --output text)
+          echo "prod box state: $STATE"
+          if [ "$APP_LEFT" -ne 0 ] && [ "$STATE" = "stopped" ]; then
+            echo "::error::$APP_LEFT app/metrics streams remain while the box is stopped."
+            exit 1
+          fi
