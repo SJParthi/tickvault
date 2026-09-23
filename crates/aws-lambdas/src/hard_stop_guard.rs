@@ -52,7 +52,44 @@ use tracing::{error, info, warn};
 /// stale fallback was a flagged follow-up while it was harmless; raising the
 /// ceiling made it a defect, so it is fixed here in the same change rather than
 /// left as a note.
-pub const DEFAULT_BUDGET_KILL_USD: f64 = 150.0;
+pub const DEFAULT_BUDGET_KILL_USD: f64 = 225.0;
+
+/// The STANDING monthly kill line: from October 2026 the bill must stay within
+/// $150 (operator Quote 23, 2026-09-23 — daily-universe §0 + aws-budget.md).
+///
+/// The configured ceiling (`BUDGET_KILL_USD` / `DEFAULT_BUDGET_KILL_USD`, $225)
+/// is a September-2026-only allowance. `effective_budget_kill_usd` clamps
+/// every other month back to this value IN CODE, so October is protected even
+/// if the scheduled 1-Oct revert of the terraform value is late or never lands.
+pub const STANDING_BUDGET_KILL_USD: f64 = 150.0;
+
+// A clamp must never RAISE the line: the standing ceiling may not sit above
+// the configured (September-allowance) fallback.
+const _: () = assert!(STANDING_BUDGET_KILL_USD <= DEFAULT_BUDGET_KILL_USD);
+
+/// The one billing month (UTC year, month) the operator allowed above
+/// `STANDING_BUDGET_KILL_USD`.
+pub const SEPTEMBER_2026_ALLOWANCE: (i32, u32) = (2026, 9);
+
+/// The kill line that actually applies to one billing month.
+///
+/// **The month is the UTC calendar month, never IST, and that is load-bearing.**
+/// AWS bills and Cost Explorer reports month-to-date in UTC (`mtd_usd` reads
+/// `now_utc.date_naive()`). Between 00:00 and 05:30 IST on 1 October the IST
+/// month is already October while month-to-date still holds September's ~$190;
+/// an IST-keyed clamp would compare September's spend against October's $150
+/// line and stop the box for a month that was allowed. Keying both on UTC keeps
+/// the spend and the line describing the same month.
+///
+/// Never RAISES a configured value: a lower configured ceiling stays lower.
+/// O(1), no allocation.
+pub fn effective_budget_kill_usd(configured: f64, billing_year: i32, billing_month: u32) -> f64 {
+    if (billing_year, billing_month) == SEPTEMBER_2026_ALLOWANCE {
+        configured
+    } else {
+        configured.min(STANDING_BUDGET_KILL_USD)
+    }
+}
 /// Legacy parity default for the change-only ping-state SSM param
 /// (NOT under the banned groww/* namespace).
 pub const DEFAULT_PING_STATE_PARAM: &str = "/tickvault/prod/budget-guard/ping-state";
@@ -577,6 +614,20 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, C: CeApi, P: SsmApi>(
         // even in-window, a breached budget stops the box + kills the
         // morning restart. The breach stop is evaluated BEFORE any ping
         // state read — it can NEVER be gated on ping-state problems.
+        //
+        // 2026-09-23 (operator Quote 23): every kill decision, ping and
+        // breach message below uses the EFFECTIVE line for this UTC billing
+        // month — $225 in September 2026 only, $150 otherwise. Shadowing
+        // `env` makes it impossible for one branch to read the raw value.
+        let effective_env = GuardEnv {
+            budget_kill_usd: effective_budget_kill_usd(
+                env.budget_kill_usd,
+                now_utc.year(),
+                now_utc.month(),
+            ),
+            ..env.clone()
+        };
+        let env = &effective_env;
         let usd = mtd_usd(ce, now_utc).await;
         let action = classify_in_window_action(usd, env.budget_kill_usd);
         if action == "breach_stop" {
@@ -1858,5 +1909,110 @@ After investigating the spend, re-enable with:\n  aws events enable-rule --name 
             "an unreadable keep-alive is no override"
         );
         assert_eq!(*ec2.stopped.borrow(), vec![vec!["i-tvapp".to_string()]]);
+    }
+
+    // --- EffectiveBudgetKill (operator Quote 23, 2026-09-23) ---------------
+
+    #[test]
+    fn effective_ceiling_september_2026_keeps_the_allowance() {
+        assert_eq!(effective_budget_kill_usd(225.0, 2026, 9), 225.0);
+    }
+
+    #[test]
+    fn effective_ceiling_october_2026_is_clamped_to_the_standing_line() {
+        assert_eq!(effective_budget_kill_usd(225.0, 2026, 10), 150.0);
+        assert_eq!(effective_budget_kill_usd(225.0, 2026, 8), 150.0);
+    }
+
+    #[test]
+    fn effective_ceiling_other_years_september_is_still_clamped() {
+        // The allowance is one billing month, never "every September".
+        assert_eq!(effective_budget_kill_usd(225.0, 2027, 9), 150.0);
+        assert_eq!(effective_budget_kill_usd(225.0, 2025, 9), 150.0);
+    }
+
+    #[test]
+    fn effective_ceiling_never_raises_a_lower_configured_value() {
+        assert_eq!(effective_budget_kill_usd(55.0, 2026, 10), 55.0);
+        assert_eq!(effective_budget_kill_usd(55.0, 2026, 9), 55.0);
+        assert_eq!(effective_budget_kill_usd(150.0, 2026, 11), 150.0);
+    }
+
+    #[test]
+    fn test_effective_budget_kill_usd_is_keyed_on_the_utc_month_not_ist() {
+        // 2026-09-30 20:00 UTC = 01:30 IST on 1 October. Cost Explorer
+        // month-to-date is still September's, so the line must still be
+        // September's. An IST-keyed clamp would read October here.
+        let t = utc(2026, 9, 30, 20, 0);
+        assert_eq!(effective_budget_kill_usd(225.0, t.year(), t.month()), 225.0);
+        let ist_month = t.with_timezone(&ist()).month();
+        assert_eq!(ist_month, 10, "fixture must straddle the IST boundary");
+    }
+
+    #[tokio::test]
+    async fn effective_ceiling_october_breach_at_160_stops_even_with_a_225_config() {
+        // 2026-10-01 is a Thursday; 04:30 UTC = 10:00 IST, inside the window.
+        let env = GuardEnv {
+            budget_kill_usd: 225.0,
+            ..test_env()
+        };
+        let (ec2, sns, events) = (
+            FakeEc2::new("running"),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::new(None);
+        let out = run_guard(
+            &env,
+            &ec2,
+            &sns,
+            &events,
+            &FakeCe {
+                amount: Some(160.0),
+            },
+            &ssm,
+            utc(2026, 10, 1, 4, 30),
+        )
+        .await
+        .expect("run_guard ok");
+        assert_eq!(out["breach"], json!(true));
+        assert_eq!(*ec2.stopped.borrow(), vec![vec!["i-tvapp".to_string()]]);
+        let published = sns.published.borrow();
+        assert!(
+            published[0].message.contains(">= $150 stop-budget"),
+            "the breach page must name the EFFECTIVE line: {}",
+            published[0].message
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_ceiling_september_at_160_does_not_stop() {
+        // 2026-09-23 is a Wednesday; 04:30 UTC = 10:00 IST.
+        let env = GuardEnv {
+            budget_kill_usd: 225.0,
+            ..test_env()
+        };
+        let (ec2, sns, events) = (
+            FakeEc2::new("running"),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::new(None);
+        let out = run_guard(
+            &env,
+            &ec2,
+            &sns,
+            &events,
+            &FakeCe {
+                amount: Some(160.0),
+            },
+            &ssm,
+            utc(2026, 9, 23, 4, 30),
+        )
+        .await
+        .expect("run_guard ok");
+        assert_ne!(out["breach"], json!(true));
+        assert!(ec2.stopped.borrow().is_empty());
+        assert!(events.disabled.borrow().is_empty());
     }
 }

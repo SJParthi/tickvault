@@ -210,7 +210,16 @@ resource "aws_budgets_budget" "tv_monthly" {
   #   in our own code, with ec2:StopInstances scoped to the prod box. See the dated
   #   correction block in budget-guards.tf. Raising a ceiling still does
   #   not repair a native action; it no longer follows that no switch fires.
-  limit_amount      = "150"
+  #
+  # 2026-09-23 (operator Quote 23, daily-universe §0): $150 -> $225 for
+  #   SEPTEMBER 2026 ONLY. Measured live: actual $141.36, forecast $188.45, so a
+  #   $150 line would stop the box ~24-25 Sep and hard_stop_guard would disable
+  #   the morning start for the rest of the month. 90% of $225 = $202.50 clears
+  #   the forecast. From October the EFFECTIVE kill line is clamped back to $150
+  #   in hard_stop_guard::effective_budget_kill_usd (UTC billing month), and a
+  #   scheduled 1-Oct PR reverts this limit so the native 80%/100% notifications
+  #   and the 90%/100% actions return to percentages of $150.
+  limit_amount      = "225"
   limit_unit        = "USD"
   time_unit         = "MONTHLY"
   time_period_start = "2026-05-01_00:00"

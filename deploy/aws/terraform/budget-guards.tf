@@ -271,7 +271,11 @@ resource "aws_lambda_function" "tv_hard_stop_guard" {
       # fire at 90%/100%, so a $100 ceiling would put the 90% line at $90, BELOW
       # the new bill, and stop the trading box mid-session. $130 puts it at $117 —
       # $4.28 of room, thinner than the $7.28 this change was called in to fix.)
-      BUDGET_KILL_USD = "150"
+      # 2026-09-23 (operator Quote 23): $150 -> $225 for SEPTEMBER 2026 only.
+      # The Lambda clamps every other month to $150 in code
+      # (effective_budget_kill_usd), so October is protected even before the
+      # scheduled 1-Oct revert of this value lands.
+      BUDGET_KILL_USD = "225"
       # 2026-07-09: change-only ping state (matches the IAM statement's
       # single-parameter scope above).
       PING_STATE_PARAM = "/tickvault/${var.environment}/budget-guard/ping-state"

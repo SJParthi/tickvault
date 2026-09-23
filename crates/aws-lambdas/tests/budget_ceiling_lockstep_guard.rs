@@ -34,7 +34,10 @@
 use std::path::{Path, PathBuf};
 
 use tickvault_aws_lambdas::budget_digest::BUDGET_USD;
-use tickvault_aws_lambdas::hard_stop_guard::DEFAULT_BUDGET_KILL_USD;
+use tickvault_aws_lambdas::hard_stop_guard::{
+    DEFAULT_BUDGET_KILL_USD, SEPTEMBER_2026_ALLOWANCE, STANDING_BUDGET_KILL_USD,
+    effective_budget_kill_usd,
+};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -197,4 +200,47 @@ fn rule_files_record_the_current_ceiling() {
         budget_rules.contains(&dollars),
         "aws-budget.md must record the current kill ceiling ({dollars})"
     );
+}
+
+/// Quote 23 (2026-09-23): the September 2026 allowance is ONE month, and the
+/// standing ceiling after it is $150. Pinned so the allowance can never quietly
+/// become the new normal, and so the clamp can never sit ABOVE the configured
+/// ceiling (which would make it a raise, not a clamp).
+#[test]
+fn standing_cap_is_150_and_the_allowance_is_one_month() {
+    assert!(
+        (STANDING_BUDGET_KILL_USD - 150.0).abs() < f64::EPSILON,
+        "the standing ceiling moved off $150 without a dated operator quote"
+    );
+    // "The clamp never sits above the configured ceiling" is a compile-time
+    // assert in hard_stop_guard.rs, next to the two constants.
+    assert_eq!(SEPTEMBER_2026_ALLOWANCE, (2026, 9));
+
+    // Every month of the next three years EXCEPT 2026-09 resolves to $150.
+    for year in 2026..=2028 {
+        for month in 1..=12 {
+            let effective = effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, year, month);
+            if (year, month) == SEPTEMBER_2026_ALLOWANCE {
+                assert!((effective - DEFAULT_BUDGET_KILL_USD).abs() < f64::EPSILON);
+            } else {
+                assert!(
+                    (effective - STANDING_BUDGET_KILL_USD).abs() < f64::EPSILON,
+                    "{year}-{month:02} resolved to ${effective}, not the standing $150"
+                );
+            }
+        }
+    }
+
+    // Both rule files record BOTH numbers.
+    let root = repo_root();
+    for rel in [
+        ".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md",
+        ".claude/rules/project/aws-budget.md",
+    ] {
+        let body = read(&root.join(rel));
+        assert!(
+            body.contains("$150") && body.contains("$225"),
+            "{rel} must record $150 and $225"
+        );
+    }
 }
