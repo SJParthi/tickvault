@@ -1671,7 +1671,11 @@ impl PartitionArchiver {
                     // Nothing to archive: the table is not there. Counted on
                     // its own so the summary shows it, never as a failure.
                     summary.tables_absent = summary.tables_absent.saturating_add(1);
-                    debug!(
+                    // info!, not debug!: a live table that vanished would otherwise be
+                    // named nowhere at production level. Once per table per archive
+                    // cycle (bounded by the retention table list), and deliberately not
+                    // an error: after a fresh-start reset, retired tables are absent by design.
+                    info!(
                         table,
                         "partition list: table does not exist — nothing to archive"
                     );
