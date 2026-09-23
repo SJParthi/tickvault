@@ -1208,6 +1208,29 @@ pub struct ArchiveRunSummary {
     /// byte budget left) or a per-run warning for tables that legitimately do
     /// not exist yet.
     pub tables_list_failed: u32,
+    /// Tables that do NOT EXIST in QuestDB this run — not failures.
+    ///
+    /// # Why this is separate from [`Self::tables_list_failed`] (2026-09-23)
+    ///
+    /// The swept set is every table this binary knows how to retain: the
+    /// live tables PLUS the retained-history names of legs that were removed
+    /// (the per-minute REST tables, the renamed `top_volume`, retired candle
+    /// frames). On a fresh volume, or after the one-shot fresh-start reset,
+    /// those tables simply are not there. Until today the list query's
+    /// `table does not exist` answer was counted as a LIST FAILURE, and the
+    /// daily scheduler treats any list failure as an incomplete pass.
+    ///
+    /// MEASURED on the prod box 2026-09-23: every pass reported
+    /// `tables_list_failed = 19` with `partitions_considered = 0`, all six
+    /// attempts returned `table_list_failed`, the day never latched, and
+    /// `STORAGE-GAP-04` fired every evening for at least four days — for
+    /// tables that had nothing to archive because they did not exist.
+    ///
+    /// An absent table has nothing to move to S3, so it cannot make the day
+    /// incomplete. A table that EXISTS and whose list query fails for any
+    /// other reason (timeout, 5xx, malformed body) is still a real
+    /// `tables_list_failed` and still keeps the day unlatched.
+    pub tables_absent: u32,
     /// Rows durably archived to S3 across dropped partitions.
     pub rows_archived: u64,
     /// Compressed bytes uploaded to S3.
@@ -1331,6 +1354,41 @@ pub(crate) fn hour_window_decision(
         Some(h) if under_disk_pressure => HourWindowDecision::ForcedHours(h),
         Some(_) => HourWindowDecision::DeferredToDays,
     }
+}
+
+/// What a partition-list query found for one table.
+///
+/// `TableAbsent` exists because "this table is not on the volume" and
+/// "we could not ask" are different facts, and until 2026-09-23 they were
+/// counted as the same one. MEASURED on the box that day: 19 of the 48
+/// swept tables did not exist (retired REST legs, retired candle frames,
+/// renamed tables), every one returned QuestDB's "table does not exist",
+/// every one was counted in `tables_list_failed`, and so the daily pass
+/// reported `table_list_failed` on 6 of 6 attempts every day and never
+/// latched — firing STORAGE-GAP-04 daily for a pass that had done
+/// everything it could. An absent table has nothing to archive; that is
+/// a completed answer, not a failed one.
+#[derive(Debug, PartialEq, Eq)]
+enum PartitionListing {
+    /// The table exists; these partitions are eligible (possibly none).
+    Eligible(Vec<String>),
+    /// QuestDB said the table does not exist. Nothing to move.
+    TableAbsent,
+}
+
+/// `true` only for QuestDB's own "table does not exist" error envelope.
+///
+/// Requires BOTH the JSON `"error"` key AND the phrase, so a 2xx result set
+/// whose data happens to contain the words can never be read as absence,
+/// and every OTHER error (timeout, parse error, WAL-suspended table)
+/// stays a failure that keeps the day unlatched. Case-insensitive on the
+/// phrase because the wording is QuestDB's, not ours. O(body), cold path.
+#[must_use]
+fn is_table_absent_response(body: &str) -> bool {
+    if !body.contains("\"error\"") {
+        return false;
+    }
+    body.to_ascii_lowercase().contains("table does not exist")
 }
 
 impl PartitionArchiver {
@@ -1604,19 +1662,33 @@ impl PartitionArchiver {
             summary.tables_scanned = summary.tables_scanned.saturating_add(1);
             let hot_days = hot_window_days(table, &self.cfg);
             match self.list_eligible_partitions(table, hot_days).await {
-                Ok(names) => {
+                Ok(PartitionListing::Eligible(names)) => {
                     for name in names {
                         worklist.push((table, name));
                     }
+                }
+                Ok(PartitionListing::TableAbsent) => {
+                    // Nothing to archive: the table is not there. Counted on
+                    // its own so the summary shows it, never as a failure.
+                    summary.tables_absent = summary.tables_absent.saturating_add(1);
+                    debug!(
+                        table,
+                        "partition list: table does not exist — nothing to archive"
+                    );
                 }
                 Err(err) => {
                     // Counted so the cycle summary can report it: a list
                     // failure silently removes the table from this run, and
                     // this log line is invisible at production level.
+                    // A table that EXISTS but could not be listed. Since
+                    // 2026-09-23 absence is classified separately, so this
+                    // arm is now a real failure and is logged at warn —
+                    // it keeps the day unlatched and the operator must be
+                    // able to see which table did it.
                     summary.tables_list_failed = summary.tables_list_failed.saturating_add(1);
-                    debug!(
+                    warn!(
                         ?err,
-                        table, "partition list failed (table may not exist yet)"
+                        table, "partition list query failed for an existing table"
                     );
                 }
             }
@@ -1647,6 +1719,7 @@ impl PartitionArchiver {
         info!(
             tables_scanned = summary.tables_scanned,
             tables_list_failed = summary.tables_list_failed,
+            tables_absent = summary.tables_absent,
             partitions_considered = summary.partitions_considered,
             verified = summary.verified,
             dropped = summary.dropped,
@@ -2145,7 +2218,11 @@ impl PartitionArchiver {
 
     /// Lists a table's eligible (aged-out, inactive, well-formed-name)
     /// partitions via the SAME primitives the detach path uses.
-    async fn list_eligible_partitions(&self, table: &str, hot_days: u32) -> Result<Vec<String>> {
+    async fn list_eligible_partitions(
+        &self,
+        table: &str,
+        hot_days: u32,
+    ) -> Result<PartitionListing> {
         // Hour-granular where the table allows it, day-granular everywhere
         // else. `hot_window_hours` returns `None` for every table outside the
         // arrival-stamped allowlist and for a configured `0`, so the day path
@@ -2220,15 +2297,31 @@ impl PartitionArchiver {
             .await
             .context("partition list query failed")?;
         if !response.status().is_success() {
-            // Table may not exist yet — the detach path treats this as
-            // empty; mirror it (the caller logs at debug).
-            anyhow::bail!("partition list returned {}", response.status());
+            let status = response.status();
+            let body = read_body_capped(response).await.unwrap_or_default();
+            // An absent table is not a failure: there is nothing to move.
+            // Only QuestDB's own "table does not exist" answer qualifies —
+            // any other non-2xx stays an error and keeps the day unlatched.
+            if is_table_absent_response(&body) {
+                return Ok(PartitionListing::TableAbsent);
+            }
+            anyhow::bail!(
+                "partition list returned {status}: {}",
+                capture_rest_error_body(&body)
+            );
         }
         let body = read_body_capped(response)
             .await
             .context("failed to read partition list response")?;
+        if is_table_absent_response(&body) {
+            // QuestDB can answer a 200 with an error envelope on some
+            // versions; classify it the same way.
+            return Ok(PartitionListing::TableAbsent);
+        }
         let rows = parse_partition_rows(&body);
-        Ok(select_partitions_to_detach(&rows))
+        Ok(PartitionListing::Eligible(select_partitions_to_detach(
+            &rows,
+        )))
     }
 
     /// Streams the partition's `/exp` CSV through gzip into the temp dir,
@@ -2892,6 +2985,47 @@ mod fair_share_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::{PartitionListing, is_table_absent_response};
+
+    /// The exact envelope QuestDB returns for a missing table is absence,
+    /// not failure — the 2026-09-23 shape that kept the day unlatched.
+    #[test]
+    fn a_missing_table_reads_as_absent_not_failed() {
+        let body = r#"{"query":"SELECT name FROM table_partitions('rest_spot_1m')","error":"table does not exist [table=rest_spot_1m]","position":0}"#;
+        assert!(is_table_absent_response(body));
+        let upper = r#"{"error":"Table Does Not Exist [table=x]"}"#;
+        assert!(is_table_absent_response(upper));
+    }
+
+    /// Every OTHER error must stay a failure, or a real outage latches the day.
+    #[test]
+    fn other_errors_are_never_read_as_absence() {
+        for body in [
+            r#"{"error":"timeout, query aborted"}"#,
+            r#"{"error":"table is suspended [table=ticks]"}"#,
+            r#"{"error":"unexpected token"}"#,
+            "",
+            "service unavailable",
+        ] {
+            assert!(!is_table_absent_response(body), "misread: {body}");
+        }
+    }
+
+    /// A 2xx result set carrying the phrase as DATA has no error key and
+    /// must never be read as absence.
+    #[test]
+    fn the_phrase_without_an_error_envelope_is_not_absence() {
+        let body = r#"{"columns":[{"name":"name"}],"dataset":[["table does not exist"]]}"#;
+        assert!(!is_table_absent_response(body));
+    }
+
+    #[test]
+    fn partition_listing_variants_are_distinct() {
+        assert_ne!(
+            PartitionListing::TableAbsent,
+            PartitionListing::Eligible(Vec::new())
+        );
+    }
 
     /// Hour-granular archival must DEFER while a spill replay could still be
     /// POSTing rows back with their ORIGINAL timestamps.
