@@ -373,7 +373,7 @@ locals {
       eval        = 3
       dta         = 1
       ok_recovery = false # 2026-07-10: once-per-episode emitter - the auto-OK ~15 min later only means the datapoint aged out while the table may still be suspended (Rule-11 false-recovery; ws-reinject-01 precedent)
-      desc        = "WAL-SUSPEND-01: a QuestDB table's WAL apply is SUSPENDED - ingestion keeps ACKing rows while they silently stop becoming visible/applied (silent data-visibility loss; typical cause = a disk-full episode or a WAL apply error). Operator action: read the table/error_tag/error_message fields in the errors-jsonl stream, fix the underlying cause (df -h /data, QuestDB logs), then run ALTER TABLE <table> RESUME WAL in the QuestDB console - NEVER auto-executed (resuming into a still-broken disk replays the failure). NO recovered/OK page: the code fires once per suspension episode; recovery signal = the falling-edge recovery log + tv_questdb_wal_suspended_tables returning to 0. Runbook: .claude/rules/project/wal-suspension-error-codes.md"
+      desc        = "WAL-SUSPEND-01: a QuestDB table is not applying its WAL - rows are ACKed but not yet visible. Read the source field. apply_lag_growing: NOT suspended, falling behind under load, nothing lost, catches up by itself. probe_blind: the wal_tables() probe failed, so suspension state is unknown. No source: the table is SUSPENDED (disk-full or WAL apply error) - fix the cause first; the box tries one bounded RESUME WAL when the disk is healthy, else run ALTER TABLE <table> RESUME WAL. No OK page. Runbook: docs/error-runbooks/wal-suspension-error-codes.md"
     }
     # TICK-CONSERVE-01 (added 2026-07-14 — automation-gaps PR-3; RETIRED
     # 2026-07-18 — tick-conservation retirement, dead-WS sweep follow-up):
