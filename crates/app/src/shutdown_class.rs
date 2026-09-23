@@ -28,7 +28,10 @@
 //! budget alarm pages independently; both windows sit outside the
 //! [09:15, 15:30) trading session).
 
+use std::path::Path;
+
 use tickvault_core::notification::events::ShutdownClass;
+use tracing::warn;
 
 /// Start of the scheduled-stop IST window: 17:25:00 (the EventBridge stop
 /// cron fires 17:30 IST — `cron(0 12 ? * MON-FRI *)`, weekday-only and
@@ -128,9 +131,237 @@ pub fn classify_shutdown(
     }
 }
 
+/// Planned-stop marker the deploy pipeline writes immediately BEFORE it
+/// restarts the app or stops a box it started (`deploy-aws.yml`,
+/// `dhan-rest-only-noise-lock-2026-07-14.md` §2.3x, 2026-09-23). Relative to
+/// the app's working directory (`/opt/tickvault` under systemd), so the same
+/// path resolves under `data/` on the box and in a local run.
+///
+/// Why it exists: every deploy restart sent SIGTERM outside the 17:25–17:45
+/// quiet window, so [`classify_shutdown`] — correctly, from what it could
+/// see — paged "Unexpected stop" for a change the operator merged himself.
+/// Nothing in-process can tell a deploy SIGTERM from a manual one; the deploy
+/// has to say so, and this file is how it says so.
+pub const PLANNED_DEPLOY_MARKER_PATH: &str = "data/planned-restart.marker";
+
+/// Oldest marker still honoured. A deploy writes it and restarts within
+/// seconds; 15 minutes covers a slow SSM step while bounding how long a
+/// marker left by an aborted deploy could quiet a genuinely unexpected stop.
+pub const PLANNED_DEPLOY_MARKER_MAX_AGE_SECS: i64 = 900;
+
+/// A marker stamped in the "future" by at most this much is still honoured
+/// (the writer and the app read the same host clock, so any skew is tiny;
+/// anything larger is treated as garbage, i.e. loud).
+pub const PLANNED_DEPLOY_MARKER_MAX_FUTURE_SKEW_SECS: i64 = 60;
+
+/// Is the marker body a fresh deploy stamp? The body is the writer's
+/// `date +%s` (epoch seconds). Pure: unparseable, stale, or implausibly
+/// future ⇒ `false`, i.e. the stop stays loud.
+#[must_use]
+pub fn planned_deploy_marker_is_fresh(contents: &str, now_epoch_secs: i64) -> bool {
+    let Ok(written) = contents.trim().parse::<i64>() else {
+        return false;
+    };
+    let age = now_epoch_secs.saturating_sub(written);
+    (-PLANNED_DEPLOY_MARKER_MAX_FUTURE_SKEW_SECS..=PLANNED_DEPLOY_MARKER_MAX_AGE_SECS)
+        .contains(&age)
+}
+
+/// Read AND delete the planned-stop marker, returning whether it announced
+/// THIS stop. Consumed on every call — fresh or stale — so one deploy's
+/// announcement can never quiet a later stop.
+///
+/// Fail-loud direction throughout: an absent marker, an unreadable one, or
+/// one that cannot be deleted all return `false`. A marker that survives its
+/// own consumption would keep quieting stops until it aged out, so a failed
+/// delete is treated as "not announced" and logged.
+pub fn take_planned_deploy_marker(path: &Path, now_epoch_secs: i64) -> bool {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(err) => {
+            warn!(
+                ?err,
+                path = %path.display(),
+                "planned-deploy marker unreadable — classifying the stop normally"
+            );
+            // Best effort: a marker we cannot read must not linger either.
+            if let Err(remove_err) = std::fs::remove_file(path) {
+                warn!(
+                    ?remove_err,
+                    path = %path.display(),
+                    "unreadable planned-deploy marker could not be removed"
+                );
+            }
+            return false;
+        }
+    };
+    if let Err(err) = std::fs::remove_file(path) {
+        warn!(
+            ?err,
+            path = %path.display(),
+            "planned-deploy marker could not be consumed — classifying the stop \
+             normally so a surviving marker cannot quiet a later stop"
+        );
+        return false;
+    }
+    planned_deploy_marker_is_fresh(&contents, now_epoch_secs)
+}
+
+/// [`classify_shutdown`] plus the deploy's announcement. A fresh marker turns
+/// an AWS SIGTERM into [`ShutdownClass::PlannedDeployRestart`]; every other
+/// input — Ctrl+C, a local stop, an unknown signal, no marker — classifies
+/// exactly as [`classify_shutdown`] does, so the marker can only ever quiet a
+/// stop the deploy positively announced.
+#[must_use]
+pub fn classify_shutdown_with_deploy_marker(
+    signal: &str,
+    is_aws: bool,
+    ist_secs_of_day: u32,
+    is_weekday: bool,
+    is_trading_day: bool,
+    planned_deploy_marker: bool,
+) -> ShutdownClass {
+    if planned_deploy_marker && is_aws && signal == "sigterm" {
+        return ShutdownClass::PlannedDeployRestart;
+    }
+    classify_shutdown(signal, is_aws, ist_secs_of_day, is_weekday, is_trading_day)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scratch path unique to one test, removed by the test itself.
+    fn scratch_marker(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("tv-planned-marker-{name}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn test_classify_shutdown_with_deploy_marker_table() {
+        const MID_SESSION: u32 = 11 * 3600;
+        // (signal, is_aws, secs, marker) -> class
+        let cases = [
+            // The fix: a deploy SIGTERM mid-day is no longer "Unexpected".
+            (
+                "sigterm",
+                true,
+                MID_SESSION,
+                true,
+                ShutdownClass::PlannedDeployRestart,
+            ),
+            // Without the marker the same stop stays loud (unchanged).
+            (
+                "sigterm",
+                true,
+                MID_SESSION,
+                false,
+                ShutdownClass::ExternalStop,
+            ),
+            // Out-of-hours stop of a box the deploy started.
+            (
+                "sigterm",
+                true,
+                20 * 3600,
+                true,
+                ShutdownClass::PlannedDeployRestart,
+            ),
+            // The marker never quiets a non-AWS or non-SIGTERM stop.
+            (
+                "sigterm",
+                false,
+                MID_SESSION,
+                true,
+                ShutdownClass::OperatorStop,
+            ),
+            (
+                "ctrl_c",
+                true,
+                MID_SESSION,
+                true,
+                ShutdownClass::OperatorStop,
+            ),
+            (
+                "sighup",
+                true,
+                MID_SESSION,
+                true,
+                ShutdownClass::ExternalStop,
+            ),
+            // No marker, scheduled window: still the ordinary quiet stop.
+            (
+                "sigterm",
+                true,
+                STOP_CRON_SECS,
+                false,
+                ShutdownClass::ScheduledStop,
+            ),
+        ];
+        for (signal, is_aws, secs, marker, expected) in cases {
+            assert_eq!(
+                classify_shutdown_with_deploy_marker(signal, is_aws, secs, true, true, marker),
+                expected,
+                "signal={signal} is_aws={is_aws} secs={secs} marker={marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_planned_deploy_marker_is_fresh_boundaries() {
+        let now = 1_790_000_000_i64;
+        assert!(planned_deploy_marker_is_fresh(&now.to_string(), now));
+        assert!(planned_deploy_marker_is_fresh(&format!("{now}\n"), now));
+        let oldest = now - PLANNED_DEPLOY_MARKER_MAX_AGE_SECS;
+        assert!(planned_deploy_marker_is_fresh(&oldest.to_string(), now));
+        assert!(!planned_deploy_marker_is_fresh(
+            &(oldest - 1).to_string(),
+            now
+        ));
+        let future = now + PLANNED_DEPLOY_MARKER_MAX_FUTURE_SKEW_SECS;
+        assert!(planned_deploy_marker_is_fresh(&future.to_string(), now));
+        assert!(!planned_deploy_marker_is_fresh(
+            &(future + 1).to_string(),
+            now
+        ));
+        for garbage in [
+            "",
+            "   ",
+            "yesterday",
+            "12.5",
+            "-",
+            "9999999999999999999999",
+        ] {
+            assert!(
+                !planned_deploy_marker_is_fresh(garbage, now),
+                "garbage {garbage:?} must stay loud"
+            );
+        }
+    }
+
+    #[test]
+    fn test_take_planned_deploy_marker_consumes_fresh_and_stale() {
+        let now = 1_790_000_000_i64;
+
+        let fresh = scratch_marker("fresh");
+        std::fs::write(&fresh, now.to_string()).expect("write fresh marker");
+        assert!(take_planned_deploy_marker(&fresh, now));
+        assert!(!fresh.exists(), "a fresh marker must be consumed");
+        // Consumed ⇒ the next stop is NOT announced.
+        assert!(!take_planned_deploy_marker(&fresh, now));
+
+        let stale = scratch_marker("stale");
+        std::fs::write(&stale, (now - 3_600).to_string()).expect("write stale marker");
+        assert!(!take_planned_deploy_marker(&stale, now));
+        assert!(!stale.exists(), "a stale marker must be consumed too");
+
+        let absent = scratch_marker("absent");
+        assert!(!take_planned_deploy_marker(&absent, now));
+    }
+
+    #[test]
+    fn test_planned_deploy_marker_path_is_under_the_data_dir() {
+        assert_eq!(PLANNED_DEPLOY_MARKER_PATH, "data/planned-restart.marker");
+    }
 
     /// 17:30:00 IST — the EventBridge stop cron's nominal fire instant.
     const STOP_CRON_SECS: u32 = 17 * 3600 + 30 * 60;

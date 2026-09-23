@@ -463,6 +463,11 @@ pub fn spawn_order_runtime(params: OrderRuntimeParams) -> tokio::task::JoinHandl
             // REAL-account fill frames surface as loud orphan warns.
             error!(
                 code = ErrorCode::OmsGapDryRunSafety.code_str(),
+                // The ONE OMS-GAP-06 site that pages: the CloudWatch filter
+                // `oms-gap-06` matches `$.source = "runtime_respawn"` only,
+                // because the other three sites are self-test diagnostics.
+                // Renaming this value silences the page — keep it in lockstep.
+                source = "runtime_respawn",
                 reason,
                 backoff_secs,
                 consecutive_abnormal_exits,
@@ -748,6 +753,27 @@ impl SelfTestState {
             last_run_day: i64::MIN,
             started_at: std::time::Instant::now(),
         }
+    }
+
+    /// The self-test could not RUN, which is not the same as it FAILING
+    /// (2026-09-23). With no live mark producer (the per-minute REST legs
+    /// were removed on 2026-09-16, so the mark channel closes at boot) the
+    /// cycle has nothing to price its paper order against. Reporting that as
+    /// an `OMS-GAP-06` failure paged every trading morning for a machine that
+    /// was never exercised. It is a coded `warn!` plus
+    /// `tv_paper_selftest_total{outcome}` instead, latched once per day.
+    fn skip(&mut self, today: i64, outcome: &'static str) {
+        warn!(
+            code = ErrorCode::OmsGapDryRunSafety.code_str(),
+            source = "selftest_skipped",
+            outcome,
+            "paper self-test did not run today — no live price mark is \
+             available, so the order machinery was not exercised (this is not \
+             a failure of the machinery)"
+        );
+        metrics::counter!("tv_paper_selftest_total", "outcome" => outcome).increment(1);
+        self.phase = SelfTestPhase::Idle;
+        self.last_run_day = today;
     }
 
     fn fail(&mut self, today: i64, stage: &'static str) {
@@ -1488,7 +1514,10 @@ async fn run_order_runtime(
                 // cleanup cancels the outstanding self-test order).
                 drive_self_test_timers(
                     &mut self_test, &ctx, &mut oms, &risk, &mut book, secs_of_day, today,
-                    config.order_runtime.self_test,
+                    SelfTestGates {
+                        enabled: config.order_runtime.self_test,
+                        marks_available: mark_channel_open,
+                    },
                 ).await;
                 republish_marks_wanted(&ctx.marks_wanted, &oms, &risk, &self_test);
             }
@@ -1884,6 +1913,17 @@ fn report_dangling_self_test_position(risk: &RiskEngine, sid: u64, stage: &'stat
     }
 }
 
+/// The two switches that decide whether the daily self-test may arm this
+/// tick. Bundled so the timer driver stays under the argument budget.
+#[derive(Debug, Clone, Copy)]
+struct SelfTestGates {
+    /// `[order_runtime] self_test` — the operator switch.
+    enabled: bool,
+    /// The mark channel still has a producer. When it has closed, arming
+    /// would only wait out the timeout, so the day is skipped instead.
+    marks_available: bool,
+}
+
 /// Housekeeping-tick half: arm the daily cycle when gates pass; time out a
 /// stuck cycle (F17). C6 (fix-round 2026-07-14): the timeout path CANCELS
 /// the outstanding self-test order (previously a still-active entry order
@@ -1897,12 +1937,22 @@ async fn drive_self_test_timers(
     book: &mut BookState,
     secs_of_day: u32,
     today: i64,
-    enabled: bool,
+    gates: SelfTestGates,
 ) {
+    let SelfTestGates {
+        enabled,
+        marks_available,
+    } = gates;
     // Timeout first: a stuck cycle fails loudly + latches for the day.
     if self_test.phase != SelfTestPhase::Idle
         && self_test.started_at.elapsed() > Duration::from_secs(SELF_TEST_TIMEOUT_SECS)
     {
+        // No mark ever arrived: nothing was placed, so nothing failed. The
+        // machinery was simply never exercised — say so without paging.
+        if self_test.phase == SelfTestPhase::AwaitingMark {
+            self_test.skip(today, "no_mark");
+            return;
+        }
         // C6 cleanup: cancel the outstanding self-test order so the filler
         // can never fill it after the state machine stopped watching.
         let outstanding = match &self_test.phase {
@@ -1929,6 +1979,12 @@ async fn drive_self_test_timers(
         || !oms.is_dry_run()
         || !ctx.calendar.is_trading_day_today()
     {
+        return;
+    }
+    if !marks_available {
+        // The mark channel is closed (no producer): arming would only wait out
+        // the timeout. Skip once for the day instead.
+        self_test.skip(today, "skipped_no_marks");
         return;
     }
     info!("paper self-test armed — waiting for the first Dhan mark to pick a sid");
@@ -2829,7 +2885,10 @@ mod tests {
             &mut book,
             SELF_TEST_WINDOW_START_SECS_OF_DAY_IST,
             today,
-            true,
+            SelfTestGates {
+                enabled: true,
+                marks_available: true,
+            },
         )
         .await;
         assert_eq!(
@@ -3255,7 +3314,10 @@ mod tests {
             &mut book,
             12 * 3600,
             ist_day_number(chrono::Utc::now().timestamp()),
-            true,
+            SelfTestGates {
+                enabled: true,
+                marks_available: true,
+            },
         )
         .await;
         assert_eq!(self_test.phase, SelfTestPhase::Idle, "timeout latches");
@@ -3268,6 +3330,97 @@ mod tests {
         assert!(
             !book.has_pending_paper(13),
             "the pending index must drop the cancelled order"
+        );
+    }
+
+    /// 2026-09-23: a self-test that timed out while still WAITING FOR A MARK
+    /// placed nothing, so nothing failed. It must end as a skip (latched for
+    /// the day) and never leave an order behind — this is the shape that paged
+    /// `OMS-GAP-06` every morning once the mark producers were removed.
+    #[tokio::test]
+    async fn test_selftest_awaiting_mark_timeout_is_a_skip_not_a_failure() {
+        let ctx = make_ctx();
+        let mut oms = make_oms();
+        let risk = make_risk();
+        let mut book = BookState::new();
+        let mut self_test = SelfTestState::new();
+        self_test.phase = SelfTestPhase::AwaitingMark;
+        self_test.started_at = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(SELF_TEST_TIMEOUT_SECS + 5))
+            .expect("monotonic clock has > timeout of history"); // APPROVED: test
+        let today = ist_day_number(chrono::Utc::now().timestamp());
+        drive_self_test_timers(
+            &mut self_test,
+            &ctx,
+            &mut oms,
+            &risk,
+            &mut book,
+            12 * 3600,
+            today,
+            SelfTestGates {
+                enabled: true,
+                marks_available: true,
+            },
+        )
+        .await;
+        assert_eq!(self_test.phase, SelfTestPhase::Idle);
+        assert_eq!(self_test.last_run_day, today, "the skip latches the day");
+        assert!(!book.has_pending_paper(13), "no order was ever placed");
+    }
+
+    /// 2026-09-23: with the mark channel closed the self-test must never
+    /// ARM — arming could only wait out the timeout. Whether the calendar and
+    /// window gates pass on the day this runs, the phase can never become
+    /// `AwaitingMark`.
+    #[tokio::test]
+    async fn test_selftest_never_arms_without_a_mark_producer() {
+        let ctx = make_ctx();
+        let mut oms = make_oms();
+        let risk = make_risk();
+        let mut book = BookState::new();
+        let mut self_test = SelfTestState::new();
+        drive_self_test_timers(
+            &mut self_test,
+            &ctx,
+            &mut oms,
+            &risk,
+            &mut book,
+            SELF_TEST_WINDOW_START_SECS_OF_DAY_IST,
+            ist_day_number(chrono::Utc::now().timestamp()),
+            SelfTestGates {
+                enabled: true,
+                marks_available: false,
+            },
+        )
+        .await;
+        assert_ne!(
+            self_test.phase,
+            SelfTestPhase::AwaitingMark,
+            "a closed mark channel must never arm the self-test"
+        );
+    }
+
+    /// The paging filter scopes `OMS-GAP-06` to `$.source = "runtime_respawn"`.
+    /// A renamed or dropped field would leave the alarm matching nothing.
+    #[test]
+    fn test_respawn_error_carries_the_paged_source_field() {
+        let src = include_str!("order_runtime.rs");
+        let prod = src.split("\n#[cfg(test)]").next().unwrap_or(src);
+        // Count FIELD lines only — the comment beside the emit quotes the
+        // filter pattern, and a prose mention must never satisfy (or break)
+        // a scan for real code.
+        let field_lines = prod
+            .lines()
+            .filter(|l| l.trim_start() == "source = \"runtime_respawn\",")
+            .count();
+        assert_eq!(
+            field_lines, 1,
+            "exactly one production OMS-GAP-06 site carries the paged source"
+        );
+        let tf = include_str!("../../../deploy/aws/terraform/error-code-alarms.tf");
+        assert!(
+            tf.contains("$.source = \\\"runtime_respawn\\\""),
+            "the oms-gap-06 filter must match the same source value"
         );
     }
 

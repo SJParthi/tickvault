@@ -3766,6 +3766,159 @@ has nothing to measure from); or adds a per-INSTRUMENT dimension to any of them
 
 ---
 
+### §2.3x-i — 2026-09-23: the universe-collapse page is RESCOPED to boots that should have widened
+
+> **Numbering note (2026-09-23):** this section was first written as a second
+> `§2.3x`, colliding with the nine-false-pages section below that every code
+> comment cites as `§2.3x`. It is renumbered `§2.3x-i` so that citation stays
+> unambiguous; nothing in the code cites this section by number.
+
+**The verbatim operator demand (2026-09-23, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "meanwhile check so many errors false telegram ntofications dude fix and resolve evryhtign dude okaay?"
+
+**No new page is added and no alarm is changed.** This row records a
+RESCOPING of an existing family-(5) page, per §3.
+
+#### What was measured (CloudWatch alarm history + the app log, 2026-09-23)
+
+`tv-<env>-errcode-ws-gap-03-universe-collapse` fired on every boot outside the
+session: 2026-09-23 05:08 IST (Wed), Sun 2026-09-20 (twice), Sat 2026-09-19,
+2026-09-17 early morning, Sun 2026-09-13, Sat 2026-09-12, and 2026-09-11. The
+app log for each shows the same two lines: "not waiting... the daily rider's
+build hour is further away" and then "mapping artifact is unusable — falling
+back". Today's mapping artifact cannot exist before the 08:00 IST rider runs,
+or on a day with no session. **The 08:30 boot of every one of those trading
+days widened correctly (863/864 instruments).** Not one page was a real
+collapse.
+
+#### The change
+
+`dhan_live_universe::collapse_is_expected_for_this_boot(trading_day, now,
+rider_target)` is `!trading_day || now < rider_target`. `main.rs` computes it
+ONCE and passes the same value to `await_mapping_artifact` and
+`resolve_live_universe`. When it is true:
+
+| | Before | After |
+|---|---|---|
+| Fallback line | `error!`, `source = fell_back_to_indices` (paged) | `warn!`, `source = pre_rider_boot` (no filter matches it) |
+| `tv_dhan_live_universe_fallback_total` (alarmed) | incremented | **not** incremented |
+| `tv_dhan_live_universe_instruments` gauge | set | set |
+| `producer_too_far` prediction line | `error!` | `info!` |
+
+A trading-day boot at or after the rider hour is unchanged. That covers the
+scheduled 08:30 start and every mid-session restart, and it still pages exactly
+as before.
+
+#### ⚠ Honest residual
+
+A trading-day boot BEFORE 08:00 IST that stays up into the session would stay on
+4 instruments without a page. For that to happen the box has to start before
+08:00 and not be restarted. The start-watchdog curfew stops the box outside the
+operating window, and the 08:30 schedule starts a fresh boot that is judged on
+its own clock. The dark-lane case is also still owned by
+`dhan-no-ticks-flowing`, but 4 indices do tick, so that alarm cannot see a
+collapse. The residual is therefore real and bounded by the curfew; it is not
+covered by another alarm.
+
+#### Also recorded (same sweep): `OMS-GAP-06` was a filter that could not match
+
+The `oms-gap-06` filter requires `$.source = "runtime_respawn"`, but the order
+runtime's respawn `error!` did not carry that field. It carries it now, and the
+field is pinned by `test_respawn_error_carries_the_paged_source_field`. The paper
+self-test also no longer reports a FAILURE when no mark ever arrived: that
+outcome is now a counted SKIP. A session with no mark producer cannot place a
+paper order, so failing it measured the feed, not the order path.
+
+#### What a PR that violates §2.3x-i looks like (REJECT)
+
+- Makes the expected arm increment `tv_dhan_live_universe_fallback_total`, or
+  gives it `source = fell_back_to_indices`. Either one restores the off-hours
+  page.
+- Computes the verdict separately for the wait and the resolve. They could
+  then disagree.
+- Widens "expected" beyond a non-trading day or a pre-rider-hour boot. A
+  trading-day boot after 08:00 that collapses is the event this alarm exists
+  for.
+- Adds a CloudWatch filter on `pre_rider_boot`.
+
+### §2.3x — 2026-09-23: nine false pages on one morning, and each one's mechanism
+
+**The verbatim operator demand (2026-09-23, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "meanwhile check so many errors false telegram ntofications dude fix and resolve evryhtign dude okaay?"
+
+**No authorization is claimed, and none is needed.** Every change below REMOVES
+or RESCOPES a page, or corrects wording. None adds an alarm, an EMF metric name,
+or a Telegram family. §3 governs ADDING pages. This row records the removals so
+the next reader knows why a message they used to get has stopped. The section
+above covers the universe-collapse page and the `OMS-GAP-06` source field; this
+one covers the rest of the same sweep.
+
+| # | False page | Mechanism | Fix | Pinned by |
+|---|---|---|---|---|
+| 1 | `ws-no-alive-connections` before the open | The process boots at 08:30 and publishes `0` for the gauge until the lane dials at 09:00. It publishes `0` again after the post-close stand-down. `notBreaching` covers an ABSENT gauge, not a present zero. | Joins the market-hours gate's `ALARM_NAMES`, and ships `actions_enabled = false` | `breaching_alarms_are_gated_guard.rs` |
+| 2 | Gate-listed alarms re-armed after every `terraform apply` | Terraform's default is `actions_enabled = true`. Every apply re-armed `tick-spill-replay-failing`, `ticks-spilling` and `aggregator-refusal-rate-high` outside the window the gate Lambda owns. | All three ship `actions_enabled = false`. The gate is the only thing that arms them. | same guard: every gate-listed alarm must ship disarmed |
+| 3 | Log-filter alarms firing on the wrong minute | Neither `collect_list` entry had a `timestamp_format`, so the agent stamped each event with its READ time. `app.log` writes naive IST, so a naive parse puts events 5 h 30 m off. | Both entries get `timestamp_format = "%Y-%m-%dT%H:%M:%S.%f"`. `errors.jsonl` stays `UTC`; `app.log` becomes `Local`. | `cw_agent_selector_lockstep_guard.rs` |
+| 4 | `HOT-PATH-02` for rows that were RESCUED | A failed flush whose rows went to the spill file is on disk and re-ingestable, but it paged under "lost or could not write rows". | Those emit sites carry `source = "rescued_to_spill"` (`RESCUED_TO_SPILL_SOURCE`), and the filter excludes that one value. Every loss arm still pages. | `hot_path_02_rescued_filter_guard.rs` |
+| 5 | "Unexpected stop" on every deploy restart | The deploy's SIGTERM lands outside the 17:25–17:45 quiet window. Nothing in-process can tell a deploy SIGTERM from a manual one. | The workflow writes `/opt/tickvault/data/planned-restart.marker` immediately before each stop it CHOOSES: the release restart, and the out-of-window instance stop (via SSM, 60 s bounded). `shutdown_class` reads a fresh marker (age −60…900 s) and classifies the stop as `PlannedDeployRestart`, then consumes the marker. | `planned_deploy_marker_guard.rs` (3 tests, bite-proven) + `shutdown_class` unit tests |
+| 6 | Stop-window text said 4:30 PM | The window moved to 17:30 IST on 2026-08-08. The Telegram text never followed. | `events.rs` now says 5:30 PM. | `stop_window_lockstep_guard.rs` |
+| 7 | "Containers healthy: 0/0" at boot | `deploy/docker/docker-compose.yml` has `${VAR:?}` required interpolations. `docker compose ps` without those variables FAILS, and the failure was reported as zero containers. | `ps` gets the same environment `up` gets, built by the same function (`fetch_compose_env`). A failed read is `None`, and the boot message renders "Container health: UNKNOWN", never `0/0`. | `infra.rs` tests (the ps/up shared-builder test + the required-interpolation scan) + `events.rs` zero-total test |
+
+#### ⚠ Honest residuals (Rule 11)
+
+- **Row 4's filter syntax is UNVERIFIED live.** It is
+  `($.source NOT EXISTS || $.source != "rescued_to_spill")`. The OR is correct
+  whether or not a bare `!=` matches an event with no `source` field. But
+  `logs:TestMetricFilter` is denied to the agent, so the first `terraform apply`
+  is the parse check. A rejected update leaves the OLD filter in place: noisier,
+  never silent.
+- **Row 3 assumes the box timezone is `Asia/Kolkata`.** `"Local"` reads the
+  host's zone. If the host runs UTC, `app.log` stamps shift 5 h 30 m the other
+  way. `errors.jsonl` is unaffected either way, and 25 of the 27 coded filters
+  read that file.
+- **Row 5 has a quiet window of up to 900 s.** An ABORTED deploy that wrote the
+  marker and then did not restart leaves the next unrelated stop within 900 s
+  classified as planned. The failure-path `systemctl stop` in the workflow
+  writes NO marker by design, so a failed deploy still pages. The marker is
+  consumed on read, so it cannot quiet two stops.
+- **Row 7 may also render UNKNOWN** after a `ps` that succeeds but lists zero
+  containers. That output is indistinguishable from the failure it replaced,
+  and UNKNOWN is the honest reading of it.
+- **Nothing here has been observed live.** Each fix is checked against source,
+  terraform and fixtures only. The next trading morning is the measurement.
+- **Gating `ws-no-alive-connections` opens a 09:00–09:20 IST seam** (security
+  review, same day). The lane dials at 09:00. The gate arms at 09:20. If every
+  socket dies in between, this alarm cannot page. The whole gated family has
+  this seam; the 2026-07-09 handover note in
+  `daily-universe-scope-expansion-2026-05-27.md` §19 already records it. Inside
+  the seam, the 09:16:30 app-side market-open self-test is the only signal.
+  The trade was taken knowingly: an ungated alarm paged every trading morning
+  on a legitimate zero from 08:30.
+- **A gated discrete-event alarm's pre-09:20 ALARM is erased, not delayed.**
+  The gate resets state to OK BEFORE enabling actions (§2.3k), so a
+  `tick-spill-replay-failing` or `ticks-spilling` breach during boot never
+  pages. That erasure is NOT new. Both alarms were already in `ALARM_NAMES`,
+  and this change only stops terraform re-arming them outside the window. The
+  boot-time evidence survives as the coded `error!` lines and the cumulative
+  counters, which `tail_errors` and the dashboard still read. Un-gating them is
+  its own decision: both would then page on every off-hours replay.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Gate-lists an alarm without `actions_enabled = false`, or removes it from a
+  gate-listed alarm. Every apply then re-arms it outside the window.
+- Drops `timestamp_format` from either `collect_list` entry, or sets `app.log`
+  to `UTC` while it writes naive IST.
+- Filters `HOT-PATH-02` with a bare `$.source != …` and no `NOT EXISTS` arm, or
+  tags a LOSS arm `rescued_to_spill`.
+- Writes the planned-restart marker from the failure path, or on any stop the
+  workflow did not choose. Widening the freshness window past 900 s is also a
+  REJECT.
+- Renders a failed container read as a number.
+
 ## §2.4 — 2026-09-17: FAMILIES 1 AND 2 ARE RETIRED — their producers were removed by the SOCKETS-ONLY narrowing, and eleven variants could no longer be sent
 
 **No new authorization is claimed, and none is needed.** §3's REJECT list

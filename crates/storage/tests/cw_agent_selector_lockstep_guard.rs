@@ -235,3 +235,113 @@ fn selector_extractor_is_not_vacuous() {
         "selector regex should carry the tv_ metric alternation, got: {live}"
     );
 }
+
+/// The two `collect_list` entries of an agent config, as
+/// `(log_stream_name, timestamp_format, timezone)`. A missing key reads as
+/// the empty string so the assertions below name it instead of panicking in
+/// the extractor.
+fn collect_list_time_config(body: &str) -> Vec<(String, String, String)> {
+    let json: serde_json::Value =
+        serde_json::from_str(body).expect("cloudwatch-agent.json must be valid JSON"); // APPROVED: test
+    let list = json["logs"]["logs_collected"]["files"]["collect_list"]
+        .as_array()
+        .expect("logs.logs_collected.files.collect_list must be an array") // APPROVED: test
+        .clone();
+    list.iter()
+        .map(|entry| {
+            let field = |k: &str| entry[k].as_str().unwrap_or("").to_string();
+            (
+                field("log_stream_name"),
+                field("timestamp_format"),
+                field("timezone"),
+            )
+        })
+        .collect()
+}
+
+/// Every stream that isn't stamped with its OWN event time is a problem.
+/// Returns one human-readable offence per bad entry; empty means correct.
+fn collect_list_time_offences(body: &str) -> Vec<String> {
+    let mut offences = Vec::new();
+    for (stream, format, zone) in collect_list_time_config(body) {
+        if !format.starts_with("%Y-%m-%dT%H:%M:%S.%f") {
+            offences.push(format!(
+                "{stream}: timestamp_format `{format}` — must start with %Y-%m-%dT%H:%M:%S.%f"
+            ));
+        }
+        if format.contains("%z") {
+            offences.push(format!(
+                "{stream}: %z maps to [+-]HHMM and can never match app.log's `+05:30`"
+            ));
+        }
+        let expected_zone = if stream.ends_with("/errors-jsonl") {
+            "UTC"
+        } else if stream.ends_with("/app") {
+            "Local"
+        } else {
+            ""
+        };
+        if expected_zone.is_empty() {
+            offences.push(format!(
+                "{stream}: unknown stream — decide its timezone here"
+            ));
+        } else if zone != expected_zone {
+            offences.push(format!(
+                "{stream}: timezone `{zone}`, expected `{expected_zone}`"
+            ));
+        }
+    }
+    offences
+}
+
+/// ADDED 2026-09-23 (dhan-rest-only-noise-lock-2026-07-14.md §2.3x).
+///
+/// With no `timestamp_format`, the agent stamps each log event with the
+/// moment it READ the line, not the moment the line was written. A backlog
+/// read at boot (the `*.2*` globs match yesterday's rotated files too) then
+/// arrives in CloudWatch as a burst of "new" coded errors, and every metric
+/// filter on the group counts them into the current window — which is how
+/// yesterday's errors paged the operator before the open on 2026-09-23.
+///
+/// `errors.jsonl` writes UTC with a trailing `Z`, so it is parsed as UTC.
+/// `app.log` writes IST with `+05:30` (IstTimer, `%:z`). The agent's `%z`
+/// only matches `+0530`, so the offset cannot be parsed; the stream is
+/// read as `Local` instead, which is correct only while the box stays on
+/// Asia/Kolkata (set by user-data). That dependency is Assumed, not
+/// enforced here.
+#[test]
+fn both_log_streams_are_stamped_with_their_own_event_time() {
+    let root = repo_root();
+    let body = read(&root.join("deploy/aws/cloudwatch-agent.json"));
+    let entries = collect_list_time_config(&body);
+    assert_eq!(
+        entries.len(),
+        2,
+        "expected exactly the errors-jsonl and app streams, got {entries:?}"
+    );
+    let offences = collect_list_time_offences(&body);
+    assert!(
+        offences.is_empty(),
+        "cloudwatch-agent.json log streams are not stamped with event time — a boot \
+         backlog would replay old errors into today's alarm windows: {offences:#?}"
+    );
+}
+
+#[test]
+fn the_event_time_check_bites_on_a_missing_or_wrong_format() {
+    let fixture = r#"{"logs":{"logs_collected":{"files":{"collect_list":[
+        {"log_stream_name":"{instance_id}/errors-jsonl","timezone":"UTC"},
+        {"log_stream_name":"{instance_id}/app","timestamp_format":"%Y-%m-%dT%H:%M:%S.%f%z","timezone":"UTC"}
+    ]}}}}"#;
+    let offences = collect_list_time_offences(fixture);
+    assert_eq!(
+        offences.len(),
+        3,
+        "missing format, %z, and the wrong app timezone must all be reported: {offences:#?}"
+    );
+    let good = r#"{"logs":{"logs_collected":{"files":{"collect_list":[
+        {"log_stream_name":"{instance_id}/errors-jsonl","timestamp_format":"%Y-%m-%dT%H:%M:%S.%f","timezone":"UTC"},
+        {"log_stream_name":"{instance_id}/app","timestamp_format":"%Y-%m-%dT%H:%M:%S.%f","timezone":"Local"}
+    ]}}}}"#;
+    assert!(collect_list_time_offences(good).is_empty());
+}

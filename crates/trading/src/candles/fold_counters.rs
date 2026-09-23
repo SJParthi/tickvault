@@ -74,6 +74,21 @@ pub(crate) struct FoldCounters {
     pub(crate) cumulative_reanchored: metrics::Counter,
     pub(crate) slot_exhausted: metrics::Counter,
     pub(crate) slot_volume_baseline_seeded: metrics::Counter,
+    /// Packets that repeated the previous accepted TRADE exactly — same
+    /// last-trade time, same last-traded price, same day-cumulative volume.
+    ///
+    /// Dhan re-sends a Quote/Full packet whenever the order book or open
+    /// interest changes, carrying the OLD last-trade time. Until 2026-09-23
+    /// every such packet was folded as a new trade: `tick_count` rose, the
+    /// receipt stamps widened, and a sealed bar was re-emitted as an
+    /// amendment. MEASURED on the box that day: 64,585 one-minute bars whose
+    /// close latency exceeded 60 s, the worst about 113 minutes.
+    ///
+    /// A repeat updates only open interest and total buy/sell quantity on the
+    /// still-open bucket, and is counted here. Rising is NORMAL: on a liquid
+    /// contract most packets are book updates, not trades. Local `/metrics`
+    /// only — deliberately not an EMF name (the budget needs a lever first).
+    pub(crate) repeat_quote: metrics::Counter,
     /// `tick_refused` carries a `reason` label with **SEVEN** distinct values.
     /// One field per value, because collapsing them would merge seven
     /// independent refusal causes into one series and make the counter
@@ -180,6 +195,7 @@ impl FoldCounters {
             slot_volume_baseline_seeded: metrics::counter!(
                 "tv_aggregator_slot_volume_baseline_seeded_total"
             ),
+            repeat_quote: metrics::counter!("tv_candle_repeat_quote_total"),
             tick_refused_price: metrics::counter!(
                 "tv_aggregator_tick_refused_total",
                 "reason" => "price"
@@ -295,6 +311,9 @@ pub(crate) fn fold_counters() -> &'static FoldCounters {
         resolved.session_low_recovered.increment(0);
         resolved.session_extreme_regressed_high.increment(0);
         resolved.session_extreme_regressed_low.increment(0);
+        // Added 2026-09-23 with the repeat-quote filter, seeded for the same
+        // reason as the block above: the agent drops a series' first sample.
+        resolved.repeat_quote.increment(0);
         resolved
     })
 }

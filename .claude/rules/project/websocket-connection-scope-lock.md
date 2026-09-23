@@ -7434,7 +7434,7 @@ plausibly and meant nothing.
 | Rendering | `render_delay_into` from `top_volume_rank_persistence.rs`, **reused not duplicated** (same crate) — so the candle and `top_volume` delay text can never drift into two band tables |
 | Column names | `window_span_latency` / `window_span_latency_ns` on CANDLES, deliberately NOT `top_volume`'s `window_span` / `window_span_ns` (operator Turn-4, verbatim: *"amke window span as window span latency"*) |
 | Allocation | one writer-owned, writer-cleared `String` scratch reused across every row and every column — a naive `format!` is three allocations per row |
-| `fold_late_hlc` | deliberately does NOT move the stamps, and says so at the site |
+| `fold_late_hlc` | ~~deliberately does NOT move the stamps~~ **CORRECTED 2026-09-23 (FOURTH): it DOES widen them, because the amended bar is re-emitted and its row replaced** |
 | Spill record | **NOT carried.** `SEAL_SPILL_RECORD_SIZE = 128` is byte-for-byte full; a replayed seal arrives with both stamps `0` and renders NULL. No format bump, no stride change, no new flag |
 
 #### ⚠ The anchor rule, restated because it is the one way this could be read wrong
@@ -7493,8 +7493,10 @@ incidental one.
   row's text trails into the next.
 - Carries the stamps into the spill record without a `SEAL_SPILL_FORMAT_VERSION`
   bump and a size decision — the record is full.
-- Makes `fold_late_hlc` move the stamps: it amends a bar already written and
-  re-emits only that bar, so the moved figure would reach no row.
+- ~~Makes `fold_late_hlc` move the stamps: it amends a bar already written and
+  re-emits only that bar, so the moved figure would reach no row.~~
+  **SUPERSEDED 2026-09-23 (FOURTH)** — premise false; the amended bar IS
+  re-emitted and upserted, so the late path MUST widen the stamps.
 - Sorts any delay on the VARCHAR half (text descending puts 1s / 2ms / 3µs / 4ns
   in the order 4, 3, 2, 1 — the exact reverse, and it looks right).
 
@@ -7769,3 +7771,292 @@ A name is never fabricated: an id absent from both the symbol map and the option
 - Lets the boot publish REPLACE a non-empty table (wipes option names mid-session).
 - Gives a derivative id a spot's name because the numeric ids match (I-P1-11).
 - Adds `contract` to any DEDUP key — it is a label, never part of identity.
+
+### 2026-09-23 — DEPTH-200 IS STOCK OPTIONS AT EVERY STAGE, INCLUDING THE BOOT DIAL AND THE PRE-RANKING MINUTES
+
+**The verbatim operator demand (2026-09-23, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "i celalry told you to pick one and only stocks otpions for depth 200 right dude am i rgith dude tell me dude okay? why index options got subscribed dude why?"
+
+> "Dude I don't want any gaps or partial or any issues dude I clealry told you to fix and resolve everything dude and then merge and deploy it as well dude okay?"
+
+He is right, and the 2026-09-06 lock already said so. What it never reached was
+the part of the lane that runs BEFORE the volume ranking exists. Recorded HERE
+before the code, per the rule-file-first law.
+
+#### What actually put index options on the depth-200 sockets on 2026-09-23 (MEASURED)
+
+The 2026-09-06 lock made the RANKED steering stock-options-only. Three older
+paths around it were never converted, and together they dialed NIFTY and
+BANKNIFTY at-the-money contracts every morning:
+
+| # | Path | What it did |
+|---|---|---|
+| 1 | Boot dial — `select_depth_universe` | filled sockets 0–3 with NIFTY + BANKNIFTY ATM CE/PE pairs (`DEPTH_200_PRIORITY_UNDERLYINGS`) — the 2026-08-26 layout the 2026-09-06 lock retired |
+| 2 | Seed back-fill — `seed_first` | filled any slot the seed left empty from the dial's own choices, i.e. from path 1 |
+| 3 | Pre-ranking steering — `plan_minute` | the at-the-money tracker re-centred the pool on index pairs every minute until the first ranking published |
+
+The 2026-09-08 section already named path 1 as "still NOT delivered" (item 2:
+*"the boot dial still selects index at-the-money contracts for depth-200"*).
+This section is the delivery.
+
+A fourth defect sat underneath and made it worse: the movers query returned the
+lifecycle master's `symbol_name` — the COMPANY name (`Reliance Industries`) —
+while the option chain is keyed on the TICKER (`RELIANCE`). Every stock-mover
+lookup therefore found no ladder, so the stock side of every engine that joins a
+mover to its options came back empty. That is fixed in the same change (the
+movers queries now select `underlying_symbol`).
+
+#### The contract (LOCKED)
+
+| Stage | Before | Now |
+|---|---|---|
+| Boot dial | 4 index ATM legs + 1 top-mover stock leg | **up to 5 stock-option ATM legs, one per DISTINCT underlying**, taken from today's movers ranked by the absolute percentage move; the leg follows the direction (call on a riser, put on a faller) |
+| Fewer than 5 movers available (pre-open, flat morning) | index legs filled the gap | **the gap stays empty** and the attach loop's existing top-up (`depth_200_delta`) fills it on a later attempt. An empty socket is honest; an index option is the defect |
+| Seed back-fill | back-filled from index legs | back-fills from the stock-only boot set (the seed itself was already stock-only) |
+| Pre-ranking minutes | index ATM engine re-centred the pool | **the pool HOLDS** until the first volume ranking publishes |
+| After the first ranking | ranked steering | UNCHANGED |
+
+`select_depth_universe` still computes its depth-200 pair set, and that output
+is no longer dialed. It is left in place rather than deleted because its tests
+pin the pair and refusal logic the depth-20 half still shares; its depth-200
+output carries a dated note saying it is not a dial source.
+
+#### ⚠ Honest envelope
+
+- **Before ~09:07 no stock option can be chosen.** Equities first print at the
+  09:07 auction, and a mover needs a percentage move. So from the 09:00 boot
+  until the first movers exist, depth-200 carries NOTHING. That is the price of
+  "stock options only" and the operator chose it; the old dial filled those
+  minutes with index books he did not want.
+- **A thin stock-option book may be sparse.** The 2026-09-06 lock already
+  records this (FINNIFTY at 800 rows/minute against NIFTY at 100,800). It is
+  unchanged by this section.
+- **Distinct underlyings are guaranteed within one attempt, not across
+  attempts.** If the leading movers change between two attach attempts, the
+  top-up can add a second contract of an underlying the first attempt already
+  dialed. The ranked steering, which enforces distinct underlyings, takes over
+  within a minute of the first ranking and corrects it.
+- **The unsubscribe code is still ignored by the vendor** (2026-09-10/11
+  sections). Unchanged here.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Dials any `IdxI` instrument or any index option (`OPTIDX`) on a depth-200
+  socket at any stage — boot, seed back-fill, top-up, steering or probe.
+- Back-fills an empty depth-200 slot with an index leg to "use the socket".
+- Restores the at-the-money engine as the pre-ranking fallback for depth-200.
+- Joins a mover to its option ladder on the company name rather than the ticker.
+- Changes the socket budget (5) under cover of this section.
+
+#### 2026-09-23 (same day) — depth-200 ranks off the 3-SECOND board, not the 5-second one
+
+**The verbatim operator demand (2026-09-23, typed directly in-session — preserve EXACTLY, typos included):**
+
+> "see emanwhile i clealry told you to pick first 3 seconds top volume right i mean top 5 dude wsee even here also where it needs to be top 5 unique undelryiogn contarcts dude i mean if the tocks otpions is ltf different contarcts 5 of them emans then it shoudl pick top alone only that too always different different unique undelrying security id rogth dude am i rgith dude tell me dude okay?"
+
+**What changes:** the depth steering candidates (`wants_candidates` in
+`dhan_feed_stack.rs`) are published from the **3-second** stock-option
+board instead of the 5-second one. Both pools read that one publish, so
+depth-20's ranked list moves to the 3-second board with it.
+
+**What does NOT change, and why it is safe:**
+
+| | Before | After |
+|---|---|---|
+| Board the list is ranked from | 5 s | **3 s** |
+| How often the list is refreshed | every 5 s | every 3 s |
+| How often the sockets are CHANGED | once a minute | **once a minute — unchanged** |
+| Distinct underlying rule | top 5 distinct underlyings | **unchanged** |
+| Exit band | 20 underlyings | unchanged |
+
+The swap budget does not move, because the sockets are still re-steered
+once a minute from whatever list is newest. The distinct-underlying rule
+the operator restated ("if LTF has 5 different contracts in the top 5, keep
+LTF's top one only, then the next different underlying") is exactly what
+`distinct_underlying_over` already does, and is pinned by
+`rank_distinct_underlying`'s multi-strike test.
+
+**Honest cost:** a 3-second window holds 40% less trading than a 5-second
+one, so a thin stock option's rank moves more from one list to the next.
+The 20-underlying exit band absorbs that; if `tv_depth200_ranked_swaps_total`
+rises toward the per-minute cap, the band is the lever, never the board.
+
+**REJECT:** gating the candidate publish on the 1-second or 1-minute board;
+applying the list more than once a minute; dropping the distinct-underlying
+pass.
+
+### 2026-09-23 (THIRD) — a REPLAYED tick from an earlier session is written back, not discarded
+
+**No new scope is claimed.** The operator's standing demand is that not one captured tick is lost (*"I don't want any gaps or partial or any issues"*, 2026-09-23). This section NARROWS one REJECT row of the 2026-09-10 section ("Returns `stale_trading_day` or `future_trading_day` to the candle-only set") and is recorded BEFORE the code.
+
+#### The case, and why the 2026-09-10 rule never meant it
+
+The fold raises `stale_trading_day` for two different facts, and the 2026-09-23 `receipt_day_mismatch` qualifier already tells them apart:
+
+| Shape | Exchange day vs receipt day | What it is | Verdict |
+|---|---|---|---|
+| Connect snapshot of a dormant contract | exchange = yesterday, receipt = today | a back-dated last-trade time | **HARD refusal — the 2026-09-10 rule, UNCHANGED** |
+| WAL replay of a frame captured yesterday | exchange = receipt = yesterday | a real tick, captured the day it traded, never applied | **was HARD → now CANDLE-ONLY: the row is written, the bar is skipped** |
+
+The 2026-09-10 rule exists to stop a row whose `ts` would silently amend a closed day **it was not captured on**. The second row was captured ON that day. Writing it puts it in the partition it always belonged to; `ticks` DEDUP (`ts, security_id, segment, capture_seq, feed`) makes the write idempotent if the live path already landed it. Refusing it was real, permanent loss that `WS-SPILL-01` correctly paged on.
+
+#### Contract (LOCKED)
+
+| Aspect | Value |
+|---|---|
+| Qualifies | `stale_trading_day && !receipt_day_mismatch && received_at_nanos > 0` |
+| Row | written, under its own exchange-day `ts` |
+| Bar | skipped — folding it would rebuild a closed day's bar from a partial subset and UPSERT over the complete one (the reason the watermark seed exists) |
+| Leaderboard | not ranked (candle-only returns before it) |
+| No receipt (pre-TVW3 frame) | STAYS HARD — without a receipt the capture day is unknown, and the watermark is the only day guard left |
+| Connect snapshot (`receipt_day_mismatch`) | STAYS HARD — unchanged |
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Writes a `receipt_day_mismatch` tick, or a no-receipt stale tick.
+- Folds the replayed prior-session tick into a bar.
+- Ranks it on the volume board.
+- Moves `future_trading_day` to the candle-only set under cover of this row.
+
+### 2026-09-23 (FOURTH) — a REPEATED quote packet is not a trade; and the `fold_late_hlc` stamp row above is CORRECTED, not broken
+
+**The verbatim operator demand (2026-09-23, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "see mean while can you track capture montor audit log visualise dashbaord expeiclaly related to open latency claose latency window span latency and even whetehr our websocket latencies any latencies dude see ebcause these lkatencies are nowhere accepatbel rigth dude"
+
+Recorded HERE before the code lands, per the rule-file-first law. It changes how
+the candle fold treats one kind of packet and nothing else.
+
+#### What was measured, and why it was wrong
+
+Dhan's `LTT` is the LAST TRADE time, and a Full/Quote packet is re-sent whenever
+the book or the open interest changes — carrying the OLD trade time, the OLD
+price and the OLD day-cumulative volume. Until now every copy was folded as a new
+trade. MEASURED on the box, 2026-09-23 session:
+
+| Effect of folding a repeat | Consequence |
+|---|---|
+| `tick_count` rose | a bar claimed trades that never happened |
+| `last_receipt_ist_nanos` widened | `close_latency` measured the last BOOK update, not the last trade — **64,585 one-minute bars over 60 s, worst ~113 minutes** |
+| a sealed bar was re-emitted as `AmendedLate` | a finished bar was rewritten for a trade it already held |
+
+#### The rule (LOCKED)
+
+A packet is a **repeat** when ALL of these hold, evaluated ONCE per tick above the
+timeframe loop:
+
+| Condition | Why |
+|---|---|
+| the slot's volume baseline is seeded | the first packet can never be a repeat |
+| `fold_secs == last_trade_ts` | same exchange trade time |
+| `cumulative_volume == last_cumulative` | no new volume — a real trade inside the same second raises it |
+| `last_ltp` bits equal the packet's LTP bits | a different price is a different print; an index (volume always 0) is told apart by price alone. NaN never equals itself, so an unset `last_ltp` can never match |
+| `observe_session_extremes` reported nothing | a moved exchange day high/low is evidence of a print we never received — that packet is FOLDED |
+
+A repeat calls `AggregatorCell::refresh_repeat_quote` for every timeframe, which
+updates ONLY `oi`, `total_buy_qty` and `total_sell_qty` on the bucket the trade
+belongs to (a zero is "absent", never "now zero"), then returns. It never counts
+a tick, never moves a price or volume, never widens a receipt stamp, never
+reopens a bucket and never amends a sealed one. Counted on
+`tv_candle_repeat_quote_total` — **local `/metrics` only**: no EMF name and no
+alarm, because the budget sits at 93% of the $150 limit and §2.3n of
+`dhan-rest-only-noise-lock-2026-07-14.md` requires a lever for the next name.
+
+O(1): four integer/bit compares per tick, plus one bounded loop of `TF_COUNT`
+field writes on the repeat arm only. Zero allocation.
+
+#### ⚠ CORRECTION — the `fold_late_hlc` rows in the 2026-09-19 section are stale
+
+The table row *"`fold_late_hlc` | deliberately does NOT move the stamps"* and the
+REJECT row *"Makes `fold_late_hlc` move the stamps: it amends a bar already
+written and re-emits only that bar, so the moved figure would reach no row"* are
+**superseded**. Their premise was false: the late path re-emits the amended bar
+as `AmendedLate`, the writer recomputes the three delay columns FROM that bar,
+and the DEDUP upsert replaces the earlier row. So the moved figure DOES reach a
+row, and leaving the stamps alone would persist a close that moved on a tick
+received N seconds after the window while `close_latency` still claimed
+everything arrived in time. The code was corrected on 2026-09-22 and is pinned
+by `aggregator_cell::a_late_tick_widens_the_amended_bars_last_receipt`; this
+file was not. The widening STANDS.
+
+**The two changes compose.** Most of what used to reach `fold_late_hlc` after a
+seal was a repeat. Those now stop at the repeat check, so a late widening is left
+only for a genuinely late TRADE (new volume or a new price), which is exactly the
+case where widening is honest.
+
+#### ⚠ What this does NOT claim
+
+- That close latency is now small. It removes the repeats' inflation; a real
+  late trade still widens its bar, and delivery lag from the vendor is untouched.
+- That every repeat is caught. A repeat that also carries a moved session
+  extreme is folded on purpose — rare, and it costs at most one `tick_count`.
+- That this is measured live. The first session on this build is the
+  measurement: compare the day's close-latency p99 and `tv_candle_repeat_quote_total`.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Folds a repeat as a trade, or lets a repeat widen a receipt stamp.
+- Drops any of the five conditions (each one guards a real print from being
+  swallowed — the same-second extra unit, the index price move, the moved
+  session extreme).
+- Compares the price with `==` on floats instead of bits (NaN would then need
+  its own guard, and one day it would not have one).
+- Adds an EMF name or alarm for `tv_candle_repeat_quote_total` without a lever.
+- Restores the "does NOT move the stamps" wording for `fold_late_hlc`.
+
+### 2026-09-23 (FIFTH) — a REPEATED quote no longer counts as delivery lag
+
+**No new authorization is claimed.** This applies the (FOURTH) section's repeat
+rule to one more consumer, under the same operator quote (*"...even whetehr our
+websocket latencies any latencies dude..."*). Recorded HERE before the code
+lands, per the rule-file-first law.
+
+#### The defect
+
+`tv_dhan_ws_lag_ms` measures `receipt − LTT`. For a real trade that is delivery
+lag. For a REPEATED quote (the book or OI moved; the trade time, price and
+cumulative volume are unchanged) it measures **how long the instrument has been
+quiet**, which can be many minutes on a thin option. Each repeat was recorded as
+lag. MEASURED 2026-09-23: median about 1 s, p90 about 10 s. The p90 was the
+repeats, not the network. The day's scoreboard lag distribution is filled at the
+same call site, so it was inflated the same way.
+
+#### The rule (LOCKED)
+
+- The lag is recorded **after** the fold, from the fold's own verdict. The drain
+  no longer runs its own session or repeat test.
+- `IngestOutcome::Folded { repeat_quote: true, .. }` → NOT recorded. It is counted
+  on `tv_dhan_ws_lag_excluded_total{reason="ltt_not_advanced"}`.
+- Every other outcome records exactly as before.
+- Exactly ONE `record_ws_lag(frame.connection_index` site exists, and it sits
+  after the fold call. Pinned by
+  `test_record_ws_lag_repeat_excluded_counts_a_repeated_quote_and_skips_the_lag_histogram`.
+- O(1): one enum match and one pre-resolved counter increment. No allocation.
+
+#### ⚠ Visible side effect on an existing CloudWatch series
+
+`tv_dhan_ws_lag_excluded_total` is already EMF-selected. The EMF processor sums
+it per host and does not break it down by `reason`. It is not alarmed and not
+charted. From this build on, its summed value rises by the day's repeat count,
+which can be large. **That rise is the fix working, not a new fault.** No new EMF
+name and no new alarm were added (budget at 93% of the $150 limit; §2.3n requires
+a lever).
+
+#### ⚠ What this does NOT claim
+
+- That delivery lag is now small. Real trades are measured exactly as before.
+- That every repeat is excluded. A repeat whose packet is refused out of session,
+  or stamped on a stale trading day, never reaches the repeat check. It is still
+  recorded. In the continuous session it is rare.
+- A true same-second second trade (new volume or a new price) is NOT a repeat and
+  still counts. That is correct.
+- That this is measured live. The first session on this build is the measurement.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Records the lag before the fold, or adds a second lag call site.
+- Re-derives the repeat test in the drain instead of reading the fold's verdict.
+- Adds an EMF name or alarm for the excluded counter's `reason` split without a lever.

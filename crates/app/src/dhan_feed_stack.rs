@@ -1082,6 +1082,12 @@ pub enum IngestOutcome {
         sealed: u8,
         /// Timeframes that amended an already-sealed bucket.
         amended: u8,
+        /// The packet repeated the previous one's trade time, price and
+        /// cumulative volume — Dhan re-sending a quote because the book or OI
+        /// moved. The row is written (it carries the new OI), but no trade
+        /// happened, so its exchange stamp is NOT a delivery-lag sample: the
+        /// lag histogram excludes it (2026-09-23, FIFTH scope-lock row).
+        repeat_quote: bool,
     },
     /// The frame sequence would not narrow onto `capture_seq` (year-2262
     /// class). Nothing was folded, nothing was written.
@@ -1532,7 +1538,7 @@ impl LiveIngest {
         //
         // `wants_rows` is the original one: no writer, no rows to write.
         // `wants_candidates` is the depth-200 steering publish (2026-09-08),
-        // which reads the SAME Stock/5s ranking and must keep working when the
+        // which reads the SAME Stock/3s ranking (5s until 2026-09-23) and must keep working when the
         // top-volume writer thread failed to spawn -- steering is not a
         // persistence feature, and coupling it to one would make a rare degrade
         // of the table a silent degrade of the depth pool.
@@ -1545,8 +1551,10 @@ impl LiveIngest {
         // from a harness that was timing an empty sort -- see
         // `volume_leaderboard`'s header.)
         let wants_rows = self.top_volume.is_some();
+        // 2026-09-23: the 3-SECOND board (operator: "pick first 3 seconds top
+        // volume"), was 5 s. Applied to the sockets once a minute regardless.
         let wants_candidates =
-            cadence == tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond;
+            cadence == tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ThreeSecond;
         if !wants_rows && !wants_candidates {
             return (0, 0);
         }
@@ -3049,9 +3057,23 @@ impl LiveIngest {
         // Both directions, deliberately: `future_trading_day` is the same
         // defect mirrored, and leaving it candle-only would keep exactly half
         // the hole open.
+        // 2026-09-23 (THIRD) — ONE shape of `stale_trading_day` is NOT the
+        // 2026-09-10 day-rule refusal: a WAL-replayed tick that was captured
+        // on the day it traded (exchange day == receipt day, both earlier than
+        // today), refused only by the replay's seeded watermark. It is real
+        // captured data; discarding it is permanent loss. It writes its row
+        // (into the partition it always belonged to — DEDUP makes that
+        // idempotent) and skips the bar. A connect snapshot
+        // (`receipt_day_mismatch`) and a no-receipt frame stay HARD.
+        // `websocket-connection-scope-lock.md` 2026-09-23 (THIRD).
+        let prior_session_replay = stats.stale_trading_day
+            && !stats.receipt_day_mismatch
+            && tick.received_at_nanos > 0
+            && !stats.refused_price
+            && !stats.refused_timestamp;
         let hard_refusal = stats.refused_price
             || stats.refused_timestamp
-            || stats.stale_trading_day
+            || (stats.stale_trading_day && !prior_session_replay)
             || stats.future_trading_day;
 
         // Two refuse only the CANDLE and keep the row — see above. They are
@@ -3112,7 +3134,8 @@ impl LiveIngest {
             || stats.untraded_sentinel
             || stats.untraded_timestamp
             || stats.out_of_band_timestamp
-            || stats.slot_exhausted)
+            || stats.slot_exhausted
+            || prior_session_replay)
             && !hard_refusal;
 
         if hard_refusal {
@@ -3241,6 +3264,7 @@ impl LiveIngest {
         IngestOutcome::Folded {
             sealed: stats.sealed_count,
             amended: stats.amended_count,
+            repeat_quote: stats.repeat_quote,
         }
     }
 
@@ -7286,16 +7310,15 @@ pub fn drain_main_feed_frame(
                     // Unreachable: the match arm above admits only these two.
                     _ => unreachable!("arm admits only Tick and TickWithDepth"),
                 };
-                // Delivery lag, per SOCKET. Recorded here because this is the
-                // only point where the exchange stamp, the receipt instant and
-                // the originating connection are all in hand.
+                // Delivery lag is recorded AFTER the fold below (2026-09-23,
+                // FIFTH scope-lock row), because only the fold knows whether
+                // this packet is a REPEATED quote — same trade time, same
+                // price, same cumulative volume, re-sent because the book or
+                // OI moved. A repeat's exchange stamp is the time of a trade
+                // that happened earlier, so "receipt − LTT" on it measures
+                // how long the instrument has been quiet, not how late the
+                // packet was. It used to go straight into the histogram.
                 //
-                // Only packet types that actually carry an LTT reach this arm —
-                // OI, PrevClose and MarketStatus decode to non-`Tick` variants
-                // and never appear here — so a missing timestamp is a garbage
-                // timestamp, not an absent one, and is EXCLUDED rather than
-                // recorded as zero.
-                record_ws_lag(frame.connection_index, &tick, received_at_nanos);
                 // The price at-the-money is located from, recorded where it is
                 // decoded and nowhere else.
                 //
@@ -7357,7 +7380,24 @@ pub fn drain_main_feed_frame(
                 // `frame.seq` is per-FRAME, but `capture_seq` must be unique
                 // per ROW or two ticks in one message would collapse into one
                 // under the DEDUP key. The packet index is folded in.
-                match ingest.ingest_tick_at(&tick, frame.seq, packets, recv_millis) {
+                let outcome = ingest.ingest_tick_at(&tick, frame.seq, packets, recv_millis);
+                // Delivery lag, per SOCKET — see the note above the spot-price
+                // arm for why it now sits after the fold. Only packet types
+                // that carry an LTT reach this arm (OI, PrevClose and
+                // MarketStatus decode to non-`Tick` variants), so a missing
+                // timestamp is a garbage one and is EXCLUDED, never zero.
+                if matches!(
+                    outcome,
+                    IngestOutcome::Folded {
+                        repeat_quote: true,
+                        ..
+                    }
+                ) {
+                    record_ws_lag_repeat_excluded();
+                } else {
+                    record_ws_lag(frame.connection_index, &tick, received_at_nanos);
+                }
+                match outcome {
                     IngestOutcome::Folded { .. } => {
                         c.folded.increment(1);
                         out.folded = out.folded.saturating_add(1);
@@ -8580,6 +8620,10 @@ struct WsLagHandles {
     unknown_slot: metrics::Counter,
     excluded_clamped_negative: metrics::Counter,
     excluded_implausible_ltt: metrics::Counter,
+    /// A REPEATED quote (same trade time, price and cumulative volume as the
+    /// previous packet). Its stamp is the time of an earlier trade, so its
+    /// "lag" is how long the instrument has been quiet. Counted, not recorded.
+    excluded_ltt_not_advanced: metrics::Counter,
 }
 
 impl WsLagHandles {
@@ -8605,6 +8649,10 @@ impl WsLagHandles {
             excluded_implausible_ltt: metrics::counter!(
                 WS_LAG_EXCLUDED_COUNTER,
                 "reason" => "implausible_ltt"
+            ),
+            excluded_ltt_not_advanced: metrics::counter!(
+                WS_LAG_EXCLUDED_COUNTER,
+                "reason" => "ltt_not_advanced"
             ),
         }
     }
@@ -9056,6 +9104,19 @@ pub fn record_ws_lag(connection_index: u8, tick: &ParsedTick, received_at_nanos:
             handles.excluded_implausible_ltt.increment(1);
         }
     }
+}
+
+/// Counts a REPEATED quote as excluded from the delivery-lag measurement.
+///
+/// A repeat carries the trade time, price and cumulative volume of the
+/// previous packet — Dhan re-sending a quote because the book or OI moved. Its
+/// "receipt − LTT" is the time since the instrument last TRADED, not the time
+/// the packet spent in transit, so recording it would report a quiet market as
+/// a slow feed. Live on 2026-09-23 that was the difference between a ~1 s
+/// median and a ~10 s p90. One relaxed atomic add; no allocation. It feeds
+/// neither the histogram nor the 15:45 day distribution.
+pub fn record_ws_lag_repeat_excluded() {
+    ws_lag_handles().excluded_ltt_not_advanced.increment(1);
 }
 
 /// Outcome of [`ws_lag_ms`] for a tick that DOES carry a usable timestamp.
@@ -10080,12 +10141,13 @@ fn report_dial_shortfall(half: &'static str, planned: usize, dialed: usize, atte
 ///    `try_open` refuses the SECOND, which fails the whole depth plan — so a
 ///    retry that over-asks dials nothing at all, forever.
 ///
-/// When the delta is longer than the free budget the **tail** is kept, not the
-/// head. `top_mover_pick` appends the fifth socket last and `try_open` hands
-/// out `pool_index` from the current open count, so the last free depth-200
-/// connection IS `DEPTH_200_TOP_MOVER_SOCKET` — the socket the per-minute
-/// rebalance treats as the mover's. Trimming from the head is what keeps the
-/// mover on the socket that expects it.
+/// When the delta is longer than the free budget the **head** is kept. Since
+/// 2026-09-23 every depth-200 socket carries a stock-option mover chosen by
+/// `stock_option_boot_set`, which emits held contracts first and then ranks the
+/// rest by absolute move. No socket is reserved for a particular role any more,
+/// so the tail was the WEAKEST mover, and trimming from the head (the pre-2026-09-23
+/// shape, written when the fifth socket was the lone mover) would have dropped the
+/// strongest.
 #[must_use]
 fn depth_200_delta(
     selection: &[SubscribeInstrument],
@@ -10103,9 +10165,7 @@ fn depth_200_delta(
         .copied()
         .filter(|instrument| !on_wire.contains(&contract_identity(instrument)))
         .collect();
-    if delta.len() > free {
-        delta.drain(..delta.len().saturating_sub(free));
-    }
+    delta.truncate(free);
     delta
 }
 
@@ -10534,20 +10594,11 @@ async fn attach_depth_when_available(
             .unwrap_or_default()
         };
 
-        // The FIFTH depth-200 socket: the day's biggest mover.
-        //
-        // It cannot come from the pair selector. That selector fills in PAIRS
-        // and its budget is even precisely so a half-filled pair can never
-        // strand a lone leg on an odd socket. So the fifth is appended here,
-        // from a different question entirely — which stock has moved furthest
-        // today — and only when the four ATM sockets are already accounted
-        // for.
-        //
-        // Appended BEFORE planning, not dialed separately, because `plan_pool`
-        // assigns instruments to connections in order: five depth-200
-        // instruments become five connections at indices 0..4, and index 4 is
-        // exactly `DEPTH_200_TOP_MOVER_SOCKET`. Dialing it afterwards would
-        // need the pool a second time, which one task cannot hold twice.
+        // Depth-200 is re-chosen below from today's STOCK movers (scope lock
+        // 2026-09-23); the pair selector's depth-200 output above is not a
+        // dial source any more. Chosen BEFORE planning, not dialed separately,
+        // because `plan_pool` assigns instruments to connections in order and
+        // one task cannot hold the pool twice.
         let mut selection = selection;
         if !depth_done {
             // ONE load for both halves. Two loads a few seconds apart can
@@ -10594,57 +10645,59 @@ async fn attach_depth_when_available(
                 );
             }
 
-            // ---- depth-200: the fifth socket ----
+            // ---- depth-200: STOCK options only, from the first dial ----
             //
-            // Appended BEFORE planning, not dialed separately, because
-            // `plan_pool` assigns instruments to connections in order: five
-            // depth-200 instruments become five connections at indices 0..4,
-            // and index 4 is exactly `DEPTH_200_TOP_MOVER_SOCKET`. Dialing it
-            // afterwards would need the pool a second time, which one task
-            // cannot hold twice.
-            if selection.depth_200.len() == crate::dhan_depth_universe::DEPTH_200_MAX_SOCKETS {
-                match crate::depth_rebalance::top_mover_pick(&inputs.movers, &inputs.candidates)
-                    .and_then(|pick| {
-                        u64::try_from(pick.leg_security_id())
-                            .ok()
-                            .filter(|id| *id > 0)
-                            .map(|security_id| {
-                                tickvault_core::websocket::pool_supervisor::SubscribeInstrument {
-                                    security_id,
-                                    segment: pick.contract_segment,
-                                }
-                            })
-                    }) {
-                    Some(fifth) => {
-                        selection.depth_200.push(fifth);
-                        info!(
-                            security_id = fifth.security_id,
-                            "depth-200: the fifth socket takes the day's biggest mover"
-                        );
-                    }
-                    None => {
-                        // Normal before the open and on a flat morning: no
-                        // stock has a measurable move yet, so there is nothing
-                        // to put on it. The retry loop asks again; if the
-                        // whole session stays flat the socket simply goes
-                        // unused, which is honest.
-                        tracing::debug!(
-                            "depth-200: no leading mover yet — the fifth socket stays \
-                             undialed this attempt"
-                        );
-                    }
-                }
+            // Scope lock 2026-09-23. Until that day the pair selector above
+            // put NIFTY and BANKNIFTY at-the-money contracts on sockets 0-3
+            // and this block appended one stock leg as the fifth. The operator
+            // ruled depth-200 is stock options at EVERY stage, so the pair
+            // selector's depth-200 output is discarded here and replaced by
+            // the stock-only boot set: up to five at-the-money legs, one per
+            // distinct underlying, from today's movers by absolute move.
+            //
+            // Fewer than five movers (pre-open, a flat morning) dials FEWER
+            // than five — never an index leg to fill the gap. The top-up in
+            // the dial half (`depth_200_delta`) adds the rest on a later
+            // attempt, and `depth_done` stays false until all five are on the
+            // wire, so the loop keeps asking.
+            let index_pairs_discarded = selection.depth_200.len();
+            selection.depth_200 = crate::depth_rebalance::stock_option_boot_set(
+                &inputs.movers,
+                &inputs.candidates,
+                crate::dhan_depth_universe::DEPTH_200_TOTAL_SOCKETS,
+                &depth_200_on_wire,
+            );
+            // The lone-leg flag describes the pair selector's output, which is
+            // no longer dialed: a stock boot set is one contract per socket.
+            selection.depth_200_lone_leg = false;
+            if selection.depth_200.is_empty() {
+                // Normal before the 09:07 auction print and on a flat morning:
+                // no stock has a measurable move, so nothing is chosen. The
+                // retry loop asks again.
+                tracing::debug!(
+                    index_pairs_discarded,
+                    movers = inputs.movers.len(),
+                    "depth-200: no stock mover with an option ladder yet — the sockets stay \
+                     undialed this attempt (index options are never dialed on depth-200)"
+                );
+            } else {
+                info!(
+                    depth_200 = selection.depth_200.len(),
+                    index_pairs_discarded,
+                    movers = inputs.movers.len(),
+                    "depth-200: dialing stock-option at-the-money legs from today's movers"
+                );
             }
 
             // ---- the previous session's close, validated against today ----
             //
-            // 2026-09-08 (THIRD). Everything above chose index at-the-money
-            // contracts and the 2026-08-26 layout — the shapes the volume lock
-            // bans, kept only because pre-open has no volume to rank. The seed
+            // 2026-09-08 (THIRD). The depth-20 half above falls back to the
+            // 2026-08-26 layout — a shape the volume lock bans, kept only
+            // because pre-open has no volume to rank. The seed
             // replaces the LEADING slots with what the sockets held at
             // yesterday's close, after every row is checked against today's
             // contract artifact (`depth_seed` names each refusal). Applied
-            // LAST so it overrides the fifth-socket pick too, and BEFORE the
+            // LAST so it overrides the stock boot set too (2026-09-23), and BEFORE the
             // dial so `plan_pool` sees the seeded set. Re-applied on every
             // attempt until depth dials, because `selection` is rebuilt each
             // time; the file is the same, so the answer is the same.
@@ -11255,9 +11308,9 @@ async fn attach_depth_when_available(
                 ist_second_of_day = now_ist,
                 "depth attach is giving up on the outstanding depth-200 socket(s): {} of {} \
                  authorized 200-level sockets reached the wire and the rest carry NO data for \
-                 the remainder of this session. The fifth socket is the day's biggest mover \
-                 and needs traded prices — on a flat morning it can legitimately never \
-                 resolve. Proceeding so the per-minute at-the-money rebalance can start on \
+                 the remainder of this session. Every depth-200 socket carries a stock-option \
+                 mover and needs traded prices — on a flat morning some can legitimately \
+                 never resolve. Proceeding so the per-minute ranked rebalance can start on \
                  the sockets that DID dial.",
                 on_wire,
                 authorized
@@ -12251,9 +12304,14 @@ pub fn refold_wal_frames(
     //
     // Seeding refuses those frames as `stale_trading_day`, which is a
     // CANDLE-ONLY refusal (`refused_candle_only` below): the row still reaches
-    // `ticks` and only the bogus bar is skipped. Same-day frames -- the
-    // ordinary crash-restart case, and the one this path is used for daily --
-    // are unaffected, because their day index equals the seed's.
+    // `ticks` and only the bogus bar is skipped. (2026-09-23, THIRD rule in
+    // `websocket-connection-scope-lock.md`: this holds for a frame that
+    // CARRIES a receipt clock on the same day it traded. A connect snapshot
+    // -- receipt day != exchange day -- stays a HARD refusal by the
+    // 2026-09-10 rule, and a pre-TVW3 frame with no receipt clock is never
+    // written back, because nothing proves which day it arrived.) Same-day
+    // frames -- the ordinary crash-restart case, and the one this path is used
+    // for daily -- are unaffected, because their day index equals the seed's.
     //
     // Fail-safe direction, stated rather than assumed: if the host clock reads
     // a FUTURE day this refuses today's genuine replay bars while still
@@ -14887,6 +14945,48 @@ mod tests {
         assert!(
             !body.contains("metrics::histogram!"),
             "record_ws_lag must use pre-resolved handles, not the macro"
+        );
+    }
+
+    #[test]
+    fn test_record_ws_lag_repeat_excluded_counts_a_repeated_quote_and_skips_the_lag_histogram() {
+        // A repeat must land on the `ltt_not_advanced` exclusion counter, never
+        // on the clamp or garbage counters. Checked against the helper's body,
+        // because a counter handle cannot be read back in-process.
+        record_ws_lag_repeat_excluded();
+        let helper_src = include_str!("dhan_feed_stack.rs");
+        let helper = helper_src
+            .find("pub fn record_ws_lag_repeat_excluded() {")
+            .map(|at| &helper_src[at..])
+            .and_then(|tail| tail.find('}').map(|end| &tail[..end]))
+            .expect("the repeat-exclusion helper must exist");
+        assert!(
+            helper.contains(".excluded_ltt_not_advanced.increment(1)"),
+            "a repeat must increment the ltt_not_advanced exclusion counter, got: {helper}"
+        );
+
+        // Source-scan the drain: the lag is recorded AFTER the fold, and only
+        // on the non-repeat arm. Recording before the fold (the pre-2026-09-23
+        // shape) cannot know a packet is a repeat.
+        let src = include_str!("dhan_feed_stack.rs");
+        let prod = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+        let fold = prod
+            .find("let outcome = ingest.ingest_tick_at(&tick, frame.seq, packets, recv_millis);")
+            .expect("the drain's fold call must exist");
+        let excluded = prod
+            .find("record_ws_lag_repeat_excluded();")
+            .expect("the drain must count repeats as excluded");
+        let measured = prod
+            .find("record_ws_lag(frame.connection_index, &tick, received_at_nanos);")
+            .expect("the drain must still record real lag");
+        assert!(
+            fold < excluded && fold < measured,
+            "lag must be recorded after the fold, which is the only place a repeat is known"
+        );
+        assert_eq!(
+            prod.matches("record_ws_lag(frame.connection_index").count(),
+            1,
+            "exactly one live lag-recording site"
         );
     }
 
@@ -19988,7 +20088,7 @@ mod tests {
     fn the_delta_never_asks_for_more_connections_than_the_budget_can_open() {
         let pool = pool_with_depth_200_open(4);
         // Every strike moved, so nothing in the new selection is on the wire.
-        let selection: Vec<SubscribeInstrument> = [21, 22, 23, 24, 99]
+        let selection: Vec<SubscribeInstrument> = [99, 21, 22, 23, 24]
             .iter()
             .map(|id| depth_instrument(*id))
             .collect();
@@ -19997,8 +20097,8 @@ mod tests {
         assert_eq!(
             delta,
             vec![depth_instrument(99)],
-            "the TAIL is kept: the last free connection is DEPTH_200_TOP_MOVER_SOCKET, and \
-             the mover is what the rebalance expects to find on it"
+            "the HEAD is kept: the selection is ranked strongest-first, so the one free \
+             connection goes to the strongest mover"
         );
     }
 
@@ -20271,13 +20371,14 @@ mod wal_refold_tests {
     /// the receipt was today — refused by the operator's 2026-09-10 day rule,
     /// exactly as the live feed refused them when they first arrived.
     ///
-    /// Both halves are pinned, because the fix is only safe if the second one
-    /// holds: a tick that traded AND was received on an earlier day is real
-    /// captured data that the replay's watermark refuses, and it MUST still
-    /// read as loss. A fix that emptied `lost` for both would silence a real
-    /// page.
+    /// The second half is the 2026-09-23 (THIRD) rule in
+    /// `websocket-connection-scope-lock.md`: a tick that traded AND was
+    /// received on an earlier day is real captured data. Until that rule it
+    /// was refused outright and counted as LOST; now it is written back to
+    /// `ticks` (its row belongs to the day it happened) and only the candle is
+    /// skipped — so it is REFOLDED, not lost, and pages nothing.
     #[test]
-    fn a_replayed_wrong_day_snapshot_is_by_design_and_a_prior_session_tick_is_still_lost() {
+    fn a_replayed_wrong_day_snapshot_is_by_design_and_a_prior_session_tick_is_written_back() {
         let now_utc_secs = chrono::Utc::now().timestamp();
         let now_ist_secs =
             now_utc_secs + i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS);
@@ -20302,7 +20403,7 @@ mod wal_refold_tests {
         assert_eq!(out.refolded, 0);
 
         // Traded yesterday AND received yesterday: a real tick from an earlier
-        // session, refused here by the seeded watermark. This one is loss.
+        // session. It is written back (candle-only refusal), never lost.
         let prior_session = (
             2u64,
             (now_utc_secs - 86_400) * 1_000_000_000,
@@ -20311,11 +20412,32 @@ mod wal_refold_tests {
         );
         let out = refold_wal_frames(&mut ingest(), &[prior_session]);
         assert_eq!(
-            out.lost, 1,
-            "a tick received on the day it traded is real captured data — it \
-             must still be counted as lost so the page still fires"
+            out.lost, 0,
+            "a tick received on the day it traded is real captured data — its \
+             row is written back, so it is not loss"
         );
+        assert_eq!(out.refolded, 1, "the row reaches ticks");
         assert_eq!(out.refused_wrong_day, 0);
+    }
+
+    /// The no-receipt half of the same rule: a pre-`TVW3` frame carries no
+    /// receipt clock, so "received on the day it traded" cannot be proven and
+    /// the tick is NOT written back. Pinned so a later edit cannot drop the
+    /// `received_at_nanos > 0` condition and silently back-date guessed rows.
+    #[test]
+    fn a_stale_tick_with_no_receipt_clock_is_never_written_back() {
+        let now_utc_secs = chrono::Utc::now().timestamp();
+        let now_ist_secs =
+            now_utc_secs + i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS);
+        let yesterday_ist = u32::try_from(now_ist_secs - 86_400).expect("fits u32 until 2106");
+        let no_receipt = (
+            3u64,
+            WAL_RECEIPT_UNKNOWN_NANOS,
+            WalEndpoint::MainFeed,
+            replay_ticker(13, yesterday_ist),
+        );
+        let out = refold_wal_frames(&mut ingest(), &[no_receipt]);
+        assert_eq!(out.refolded, 0, "no receipt clock, no proof, no write-back");
     }
 
     /// A depth-20 frame exactly as the depth socket writes it: 12-byte header
@@ -23441,23 +23563,34 @@ mod late_seed_tests {
         }
     }
 
-    /// Depth-200 steering reads the 5-SECOND board and only that one.
+    /// Depth-200 steering reads the 3-SECOND board and only that one.
     ///
-    /// With four cadences this stopped being obvious. Wiring the 1s board into
-    /// `wants_candidates` would re-steer the deep pool 60 times a minute
-    /// against a per-minute swap budget of 5; wiring the 1m board in would
-    /// steer it off a window that spans a re-steer. Neither is a compile error
-    /// and neither shows up in any counter until the swap-refusal count moves.
+    /// 2026-09-23 (websocket-connection-scope-lock.md, "depth-200 ranks off the
+    /// 3-SECOND board"): moved from the 5-second board on the operator's
+    /// instruction. This test was `only_the_five_second_cadence_drives_depth_steering`.
+    ///
+    /// With four cadences this is not obvious. Wiring the 1s board into
+    /// `wants_candidates` would publish a list 60 times a minute from a window
+    /// too short to rank a thin option; wiring the 1m board in would steer off
+    /// a window that spans a re-steer. Neither is a compile error and neither
+    /// shows up in any counter until the swap-refusal count moves.
     #[test]
-    fn only_the_five_second_cadence_drives_depth_steering() {
-        let src = include_str!("dhan_feed_stack.rs");
+    fn only_the_three_second_cadence_drives_depth_steering() {
+        // Production half only: this test's own literals would otherwise
+        // satisfy the scan and it could never fail.
+        let full = include_str!("dhan_feed_stack.rs");
+        let src = &full[..full.find("#[cfg(test)]").unwrap_or(full.len())];
         assert!(
             src.contains(
-                "cadence == tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond"
+                "let wants_candidates =\n            cadence == tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ThreeSecond;"
             ),
-            "the depth-200 candidate publish must be gated on FiveSecond alone"
+            "the depth-200 candidate publish must be gated on ThreeSecond alone"
         );
-        for other in ["SnapshotCadence::ThreeSecond", "SnapshotCadence::OneMinute"] {
+        for other in [
+            "SnapshotCadence::OneSecond",
+            "SnapshotCadence::FiveSecond",
+            "SnapshotCadence::OneMinute",
+        ] {
             assert!(
                 !src.contains(&format!("wants_candidates =\n            cadence == tickvault_storage::top_volume_rank_persistence::{other}")),
                 "{other} must not gate the depth-200 candidate publish"
@@ -23763,14 +23896,14 @@ mod depth_rebalance_wiring_tests {
     /// also satisfies. Nothing here asserts an ABSENCE on the global, which is
     /// the assertion a parallel run could break.
     #[test]
-    fn the_five_second_pass_publishes_the_depth200_steering_candidates() {
+    fn the_three_second_pass_publishes_the_depth200_steering_candidates() {
         let _serial = lock_published_views();
         let mut ingest = ranking_fixture();
         let day: i64 = 1_779_321_600;
         let in_window = (day + 34_000) * 1_000_000_000;
         ingest.snapshot_top_volume(
             in_window,
-            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond,
+            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ThreeSecond,
         );
         let published = crate::depth200_candidates::global_depth200_candidates()
             .latest()
@@ -23796,7 +23929,7 @@ mod depth_rebalance_wiring_tests {
         let in_window = (day + 34_000) * 1_000_000_000;
         let (rows, refused) = ingest.snapshot_top_volume(
             in_window,
-            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond,
+            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ThreeSecond,
         );
         assert_eq!(
             (rows, refused),
@@ -23826,7 +23959,7 @@ mod depth_rebalance_wiring_tests {
         let in_window = (day + 34_000) * 1_000_000_000;
         ingest.snapshot_top_volume(
             in_window,
-            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond,
+            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ThreeSecond,
         );
         let published = crate::depth200_candidates::global_depth200_candidates()
             .latest()
@@ -24111,21 +24244,29 @@ mod depth20_layout_wiring_tests {
         );
     }
 
+    /// 2026-09-23 (websocket-connection-scope-lock.md, "DEPTH-200 IS STOCK
+    /// OPTIONS AT EVERY STAGE"). This test was
+    /// `the_fifth_socket_is_appended_before_planning_not_dialed_after`, which
+    /// pinned ONE top-mover socket appended beside four index sockets. The
+    /// whole depth-200 set is now the stock-only boot set; the ordering rule
+    /// it protected still holds: plan_pool assigns in order and one task
+    /// cannot hold the pool twice, so the set must be chosen BEFORE planning.
     #[test]
-    fn the_fifth_socket_is_appended_before_planning_not_dialed_after() {
-        // plan_pool assigns instruments to connections in order, so the
-        // append is what puts the top mover at index 4. Dialing it afterwards
-        // needs the pool a second time, which one task cannot hold twice.
+    fn the_stock_only_depth200_set_is_chosen_before_the_pool_is_planned() {
         let p = production();
-        let append = p
-            .find("selection.depth_200.push(fifth);")
-            .expect("the fifth socket must be appended");
+        let chosen = p
+            .find("selection.depth_200 = crate::depth_rebalance::stock_option_boot_set(")
+            .expect("the depth-200 set must come from the stock-only boot set");
         let plan = p
             .find("&selection.depth_200,")
             .expect("the plan must read depth_200");
         assert!(
-            append < plan,
-            "the fifth socket must be appended BEFORE the pool is planned"
+            chosen < plan,
+            "the stock-only set must be chosen BEFORE the pool is planned"
+        );
+        assert!(
+            !p.contains("selection.depth_200.push(fifth);"),
+            "the one-socket top mover beside index pairs must not return"
         );
     }
 }

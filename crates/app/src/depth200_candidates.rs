@@ -56,7 +56,7 @@
 //!
 //! * publish — O(k) in the published list. `k` is [`DEPTH200_EXIT_UNDERLYINGS`]
 //!   (20 — the entry budget of 5 plus the 15-rank hysteresis band), on the
-//!   drain's 5-second timer arm. **Never per packet.** One `Vec` of 20 and one
+//!   drain's 3-second timer arm (5-second until 2026-09-23). **Never per packet.** One `Vec` of 20 and one
 //!   `Arc`, on a path that already allocates the full ranking beside it.
 //!   *(⚠ CORRECTED 2026-09-13: read "k = 5", stale since the band widened
 //!   3 → 15 on 2026-09-11. The ENTRY set is 5; the PUBLISHED list is the band.)*
@@ -254,7 +254,7 @@ impl Depth200Candidate {
 
 /// The published depth-200 ranking.
 ///
-/// One writer (the frame drain's 5-second timer arm) and one reader (the
+/// One writer (the frame drain's 3-second timer arm; 5-second until 2026-09-23) and one reader (the
 /// per-minute steering loop), so the single slot has no clobbering hazard —
 /// unlike [`crate::depth_subscription_view`], which needs two slots precisely
 /// because it has two independent publishers.
@@ -488,7 +488,7 @@ mod tests {
 
     #[test]
     fn publish_replaces_rather_than_accumulates() {
-        // The ranking is recomputed from scratch every 5 seconds. Merging would
+        // The ranking is recomputed from scratch every 3 seconds (5 until 2026-09-23). Merging would
         // keep a contract that left the board alive forever, which is the
         // overstating direction — a socket would read correct after the reason
         // it was correct had gone.

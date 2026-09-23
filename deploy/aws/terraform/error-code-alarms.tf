@@ -527,8 +527,16 @@ locals {
     # this entry does not touch that lock. ok_recovery = false: a discrete
     # book-loss event - the zeroed paper positions do not come back when the
     # datapoint ages out (the aggregator-drop-01 precedent).
+    #
+    # NARROWED 2026-09-23 (dhan-rest-only-noise-lock-2026-07-14.md §2.3x):
+    # OMS-GAP-06 has FOUR error! sites in order_runtime.rs and three of them
+    # (paper self-test failed, dangling self-test position, non-PAPER id at
+    # the paper filler) are self-test diagnostics that paged every morning the
+    # paper self-test tripped, under this "book SILENTLY ZEROED" description,
+    # which none of them is. The page now matches only the respawn arm, which
+    # carries source = "runtime_respawn". The other three stay in errors.jsonl.
     "oms-gap-06" = {
-      pattern     = "{ $.code = \"OMS-GAP-06\" && $.level = \"ERROR\" }"
+      pattern     = "{ $.code = \"OMS-GAP-06\" && $.level = \"ERROR\" && $.source = \"runtime_respawn\" }"
       period      = 300
       threshold   = 1
       eval        = 3
@@ -1015,7 +1023,21 @@ resource "aws_cloudwatch_metric_alarm" "preopen_ready_late" {
 resource "aws_cloudwatch_log_metric_filter" "hot_path_02" {
   name           = "tv-${var.environment}-errcode-hot-path-02"
   log_group_name = aws_cloudwatch_log_group.tv_app.name
-  pattern        = "{ $.code = \"HOT-PATH-02\" && $.level = \"ERROR\" }"
+  # 2026-09-23 (dhan-rest-only-noise-lock-2026-07-14.md §2.3x): a RESCUED flush
+  # (rows written to the spill file, re-ingestable) is a degrade, not a loss,
+  # and paged the operator anyway. Those emit sites now carry
+  # `source = "rescued_to_spill"` and are excluded here. Every LOSS arm carries
+  # no such source and still pages.
+  #
+  # WHY `NOT EXISTS || !=` AND NOT A BARE `!=`: most HOT-PATH-02 emit sites
+  # (dhan_feed_stack, main, candle_ddl_boot, seal_writer_loop, ws_audit_consumer
+  # and the storage ensure arms) carry NO `source` field at all. Whether a bare
+  # `$.source != "x"` MATCHES an event with no `source` is UNVERIFIED from this
+  # repo (docs host blocked, logs:TestMetricFilter denied to the agent). The OR
+  # is correct under EITHER reading, so a missing field can never silence a
+  # loss. If the provider rejects the syntax at apply, the old filter survives
+  # the failed update — noisier, never silent.
+  pattern = "{ $.code = \"HOT-PATH-02\" && $.level = \"ERROR\" && ($.source NOT EXISTS || $.source != \"rescued_to_spill\") }"
   metric_transformation {
     name      = "tv_errcode_hot_path_02"
     namespace = "Tickvault/Prod"
@@ -1030,7 +1052,7 @@ resource "aws_cloudwatch_log_metric_filter" "hot_path_02" {
 
 resource "aws_cloudwatch_metric_alarm" "hot_path_02" {
   alarm_name          = "tv-${var.environment}-errcode-hot-path-02"
-  alarm_description   = "HOT-PATH-02: the persistence layer lost or could not write rows. Read the fields. `rescued` = a tick flush failed but the rows went to the named spill file; they are NOT in QuestDB and re-ingest is one safe, repeatable command (the ticks dedup key carries capture_seq). `dropped` with a spill_error = the rescue failed too and those ticks are permanently gone. On the DEPTH path `dropped` is always permanent - depth has no spill tier, so the writer discards its buffer to stop one rejected row wedging the session. stage=ensure_client_build or ensure_ddl is the quiet one: the ticks table may have been auto-created WITHOUT its 5-key DEDUP, which silently collapses intra-second ticks until a later ensure succeeds - verify with SHOW COLUMNS / the table's DEDUP keys. Raw frames remain in the write-ahead log. Runbook: docs/error-runbooks/wave-1-error-codes.md"
+  alarm_description   = "HOT-PATH-02: the persistence layer lost or could not write rows. Read the fields. A flush whose rows were RESCUED to the spill file (source=rescued_to_spill) does NOT page since 2026-09-23 - it is on disk and re-ingestable. `dropped` with a spill_error = the rescue failed too and those ticks are permanently gone. On the DEPTH path `dropped` is always permanent - depth has no spill tier, so the writer discards its buffer to stop one rejected row wedging the session. stage=ensure_client_build or ensure_ddl is the quiet one: the ticks table may have been auto-created WITHOUT its 5-key DEDUP, which silently collapses intra-second ticks until a later ensure succeeds - verify with SHOW COLUMNS / the table's DEDUP keys. Raw frames remain in the write-ahead log. Runbook: docs/error-runbooks/wave-1-error-codes.md"
   comparison_operator = "GreaterThanOrEqualToThreshold"
   evaluation_periods  = 3
   datapoints_to_alarm = 1

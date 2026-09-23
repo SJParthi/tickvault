@@ -933,6 +933,84 @@ impl AggregatorCell {
         )
     }
 
+    /// Applies a REPEAT QUOTE to ONE timeframe: a packet that carries no new
+    /// trade (same exchange trade time, same last price, same day-cumulative
+    /// volume as the last accepted tick for this instrument).
+    ///
+    /// Dhan's Full/Quote packet is re-sent whenever the order book or open
+    /// interest moves, and it carries the LAST TRADE TIME, not "now". Until
+    /// 2026-09-23 every such re-send was folded as if it were a trade:
+    ///
+    /// * `tick_count` rose once per book change, not once per trade;
+    /// * the receipt window widened to the re-send's arrival, so a 1-minute
+    ///   bar whose last TRADE was at 09:15:40 reported a close latency of
+    ///   hours (MEASURED 2026-09-23: 64,585 1m bars received > 60 s after
+    ///   their close, worst ~113 minutes, all on `NSE_FNO`);
+    /// * a re-send arriving after the bar sealed took the late-refold arm and
+    ///   rewrote the stored row once per book change.
+    ///
+    /// A repeat therefore touches ONLY what it can legitimately carry — the
+    /// open bucket's open interest and pending buy/sell totals, under the same
+    /// "anything beats nothing, otherwise newest wins" rule `fold_in_bucket`
+    /// uses. It never opens a bucket, never counts a tick, never moves a
+    /// receipt stamp, never touches high/low/close/volume, and never amends a
+    /// sealed bar. Returns `true` when the open bucket was refreshed.
+    ///
+    /// ONE exception, and it is the exchange's official open: a re-send can be
+    /// the first packet to carry `day_open` (a thin contract whose first
+    /// in-session trade arrived with `day_open = 0`). The in-bucket fold
+    /// stamps a late-arriving official open onto the day's first session
+    /// bucket; a repeat does the same, under the identical arm and bucket
+    /// test, so classifying the packet as a repeat can never cost the bar its
+    /// official open. Found by the 2026-09-23 hot-path review.
+    ///
+    /// # Complexity
+    /// O(1) — one array index and a handful of compares, no allocation.
+    pub fn refresh_repeat_quote(
+        &mut self,
+        tf: TfIndex,
+        tick: &ParsedTick,
+        prices: &TickPrices,
+        fold_secs: u32,
+    ) -> bool {
+        let ord = tf.as_ordinal();
+        if self.slots[ord].is_uninitialised()
+            || tf.bucket_start(fold_secs) != self.slots[ord].bucket_start_ist_secs
+        {
+            return false;
+        }
+        let open_start = self.slots[ord].bucket_start_ist_secs;
+        // Same arm, same bucket test and same widening as the in-bucket fold's
+        // late `day_open` stamp — see `consume_tick_prewidened`.
+        if self.armed_for_day_open[ord]
+            && prices.day_open > 0.0
+            && is_days_first_session_bucket(tf, open_start)
+        {
+            self.armed_for_day_open[ord] = false;
+            self.slots[ord].open = prices.day_open;
+            widen_range_to_include(&mut self.slots[ord], prices.day_open);
+        }
+        let slot = &mut self.slots[ord];
+        // Last NON-ZERO wins, exactly as `fold_in_bucket`.
+        if prices.day_open > 0.0 {
+            slot.session_open = prices.day_open;
+        }
+        if prices.day_close > 0.0 {
+            slot.prev_day_close = prices.day_close;
+        }
+        let tick_is_newest = fold_secs >= slot.close_ts_ist_secs;
+        if tick.open_interest != 0 && (slot.oi == 0 || tick_is_newest) {
+            slot.oi = i64::from(tick.open_interest);
+        }
+        if tick.total_buy_quantity != 0 && (slot.total_buy_qty == 0 || tick_is_newest) {
+            slot.total_buy_qty = tick.total_buy_quantity;
+        }
+        if tick.total_sell_quantity != 0 && (slot.total_sell_qty == 0 || tick_is_newest) {
+            slot.total_sell_qty = tick.total_sell_quantity;
+        }
+        true
+    }
+
     /// Folds one tick into ONE timeframe slot using PRE-WIDENED prices.
     ///
     /// Identical to [`AggregatorCell::consume_tick`] except the caller supplies
@@ -2644,6 +2722,78 @@ mod tests {
         }
     }
 
+    /// A repeated quote (same trade, new book/OI) refreshes ONLY the quote
+    /// fields of the bucket that trade belongs to. It never counts a tick,
+    /// never moves a price, and never touches a bucket it does not belong to.
+    #[test]
+    fn refresh_repeat_quote_updates_only_quote_fields_of_its_own_bucket() {
+        let mut cell = AggregatorCell::empty();
+        let strategy = FeedStrategy::DEFAULT;
+        let mut first = tick_at(OPEN + 10, 100.0, 1_000);
+        first.open_interest = 500;
+        first.total_buy_quantity = 40;
+        first.total_sell_quantity = 60;
+        cell.consume_tick(TfIndex::M1, &first, 1_000, strategy, 1_000);
+        let before = cell.snapshot(TfIndex::M1);
+
+        let mut repeat = first;
+        repeat.open_interest = 700;
+        repeat.total_buy_quantity = 45;
+        repeat.total_sell_quantity = 55;
+        assert!(cell.refresh_repeat_quote(
+            TfIndex::M1,
+            &repeat,
+            &TickPrices::from_tick(&repeat),
+            OPEN + 10
+        ));
+
+        let after = cell.snapshot(TfIndex::M1);
+        assert_eq!(after.oi, 700);
+        assert_eq!(after.total_buy_qty, 45);
+        assert_eq!(after.total_sell_qty, 55);
+        assert_eq!(
+            after.tick_count, before.tick_count,
+            "a repeat is not a trade"
+        );
+        assert_eq!(after.close.to_bits(), before.close.to_bits());
+        assert_eq!(after.high.to_bits(), before.high.to_bits());
+        assert_eq!(after.volume, before.volume);
+        assert_eq!(after.last_receipt_ist_nanos, before.last_receipt_ist_nanos);
+
+        // A zero quote field is "absent", never "now zero".
+        let mut blank = first;
+        blank.open_interest = 0;
+        blank.total_buy_quantity = 0;
+        blank.total_sell_quantity = 0;
+        assert!(cell.refresh_repeat_quote(
+            TfIndex::M1,
+            &blank,
+            &TickPrices::from_tick(&blank),
+            OPEN + 10
+        ));
+        assert_eq!(cell.snapshot(TfIndex::M1).oi, 700);
+
+        // A different bucket is refused and changes nothing.
+        let mut elsewhere = first;
+        elsewhere.open_interest = 999;
+        assert!(!cell.refresh_repeat_quote(
+            TfIndex::M1,
+            &elsewhere,
+            &TickPrices::from_tick(&elsewhere),
+            OPEN + 120
+        ));
+        assert_eq!(cell.snapshot(TfIndex::M1).oi, 700);
+
+        // A timeframe that never opened is refused.
+        assert!(!cell.refresh_repeat_quote(
+            TfIndex::M5,
+            &repeat,
+            &TickPrices::from_tick(&repeat),
+            OPEN + 10
+        ));
+        assert!(cell.snapshot(TfIndex::M5).is_uninitialised());
+    }
+
     /// `rebase_open_buckets` keeps what a bucket already counted and lets it
     /// keep rising across a cumulative RESTART.
     ///
@@ -2745,6 +2895,50 @@ mod tests {
             f32_to_f64_clean(24_000.25),
             "a day_open arriving after the bucket opened still belongs to it"
         );
+    }
+
+    /// A REPEAT (same trade re-sent on a book change) can be the first packet
+    /// to carry the official open. It must stamp the day's first bucket just
+    /// as a trade would — otherwise classifying it as a repeat would cost the
+    /// bar, and `session_open`, the exchange open for the whole day.
+    ///
+    /// BITE PROOF: delete the arm-and-stamp block in `refresh_repeat_quote`
+    /// and the `open` assertion reads the traded price 23,990.00.
+    #[test]
+    fn a_repeat_quote_carrying_the_late_day_open_still_stamps_the_first_bucket() {
+        let mut cell = AggregatorCell::empty();
+        let strategy = FeedStrategy::DEFAULT;
+        let first = tick_at(OPEN, 23_990.00, 5);
+        assert_eq!(first.day_open, 0.0, "fixture models the unpopulated case");
+        cell.consume_tick(TfIndex::M1, &first, 0, strategy, 5);
+
+        let mut repeat = first;
+        repeat.day_open = 24_000.25;
+        assert!(cell.refresh_repeat_quote(
+            TfIndex::M1,
+            &repeat,
+            &TickPrices::from_tick(&repeat),
+            OPEN
+        ));
+        let bar = cell.snapshot(TfIndex::M1);
+        assert_eq!(bar.open, f32_to_f64_clean(24_000.25));
+        assert_eq!(bar.session_open, f32_to_f64_clean(24_000.25));
+        assert!(
+            bar.low <= bar.open && bar.open <= bar.high,
+            "the stamped open must sit inside its own range"
+        );
+        assert_eq!(bar.tick_count, 1, "a repeat is still not a trade");
+
+        // The arm is spent: a second official-open re-send changes nothing.
+        let mut again = first;
+        again.day_open = 24_111.00;
+        assert!(cell.refresh_repeat_quote(
+            TfIndex::M1,
+            &again,
+            &TickPrices::from_tick(&again),
+            OPEN
+        ));
+        assert_eq!(cell.snapshot(TfIndex::M1).open, f32_to_f64_clean(24_000.25));
     }
 
     #[test]

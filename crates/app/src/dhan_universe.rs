@@ -458,6 +458,21 @@ fn distinct_instrument_count(mappings: &[MappingEntry]) -> usize {
 ///   emits is NSE cash equity by construction, so the segment half of the
 ///   I-P1-11 composite is a constant here — stated at the filter rather than
 ///   assumed, exactly as `nse_index_mappings` does one function below.
+/// The ticker of an NSE cash-equity master row.
+///
+/// Dhan's detailed master puts the trading symbol in `UNDERLYING_SYMBOL` for
+/// cash-equity rows too, and the COMPANY name in `SYMBOL_NAME`
+/// (`RELIANCE INDUSTRIES LTD` / `RELIANCE`, verified on prod 2026-09-23). A
+/// row with no `UNDERLYING_SYMBOL` falls back to `SYMBOL_NAME` rather than
+/// being dropped — never guessed from anything else. O(1), no allocation.
+fn equity_ticker(row: &tickvault_core::instrument::master_csv::MasterRow) -> &str {
+    if row.underlying_symbol.is_empty() {
+        row.symbol_name.as_str()
+    } else {
+        row.underlying_symbol.as_str()
+    }
+}
+
 fn fno_underlying_mappings(
     master: &[tickvault_core::instrument::master_csv::MasterRow],
 ) -> Vec<MappingEntry> {
@@ -494,7 +509,18 @@ fn fno_underlying_mappings(
         if row.series != "EQ" {
             continue;
         }
-        if !wanted.contains(row.symbol_name.as_str()) {
+        // The TICKER is the join key, and on a real NSE cash-equity row it
+        // lives in `underlying_symbol` — `symbol_name` carries the COMPANY
+        // name. Verified on prod 2026-09-23: security_id 2885 reads
+        // symbol_name="RELIANCE INDUSTRIES LTD", underlying_symbol="RELIANCE",
+        // while its future reads underlying_symbol="RELIANCE". Joining on
+        // `symbol_name` matched ONLY the vendor's test rows (whose company
+        // name happens to equal the ticker), so the 2026-09-23 artifact held
+        // 19 `NSETEST` dummies instead of ~208 real underlyings. Falls back
+        // to `symbol_name` for a row that carries no ticker, which is the
+        // shape the older fixtures use.
+        let ticker = equity_ticker(row);
+        if !wanted.contains(ticker) {
             continue;
         }
         // A zero id is the parser's "absent or unusable" answer. Subscribing
@@ -504,7 +530,9 @@ fn fno_underlying_mappings(
         }
         out.push(MappingEntry {
             index_name: FNO_UNDERLYING_TAG.to_owned(),
-            symbol: row.symbol_name.clone(),
+            // The ticker, not the company name: it is the key every consumer
+            // of this artifact joins on, and the label an operator reads.
+            symbol: ticker.to_owned(),
             isin: row.isin.clone(),
             security_id: row.security_id,
             exchange_segment: tickvault_common::types::ExchangeSegment::NseEquity.binary_code(),
@@ -2052,6 +2080,60 @@ mod tests {
             got.iter().all(|m| m.index_name == FNO_UNDERLYING_TAG),
             "every emitted row must be tagged so the consumer can filter without re-parsing"
         );
+    }
+
+    #[test]
+    fn fno_underlyings_join_on_the_ticker_not_the_company_name() {
+        // The REAL prod row shape, read off instrument_lifecycle 2026-09-23:
+        // a cash-equity row carries the COMPANY name in symbol_name and the
+        // ticker in underlying_symbol. Joining on symbol_name matched only
+        // the vendor's NSETEST dummies (company name == ticker), so the live
+        // artifact held 19 test rows instead of ~208 real stocks.
+        use tickvault_core::instrument::master_csv::InstrumentClass as C;
+        let master = vec![
+            mrow(
+                2885,
+                "RELIANCE INDUSTRIES LTD",
+                C::Equity,
+                "RELIANCE",
+                "EQ",
+                "NSE",
+            ),
+            mrow(70001, "RELIFUT", C::StockFuture, "RELIANCE", "", "NSE"),
+            mrow(1333, "HDFC BANK LTD", C::Equity, "HDFCBANK", "EQ", "NSE"),
+            mrow(70002, "HDBKFUT", C::StockFuture, "HDFCBANK", "", "NSE"),
+            // A cash-only company must still stay out.
+            mrow(3812, "ZEE ENTERTAINMENT", C::Equity, "ZEEL", "EQ", "NSE"),
+        ];
+        let got = fno_underlying_mappings(&master);
+        let ids: Vec<u64> = got.iter().map(|m| m.security_id).collect();
+        assert_eq!(
+            ids,
+            vec![2885, 1333],
+            "the ticker join must resolve real stocks"
+        );
+        let labels: Vec<&str> = got.iter().map(|m| m.symbol.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["RELIANCE", "HDFCBANK"],
+            "the emitted label is the ticker every consumer joins on, never the company name"
+        );
+    }
+
+    #[test]
+    fn equity_ticker_prefers_the_underlying_symbol_and_falls_back_to_the_name() {
+        use tickvault_core::instrument::master_csv::InstrumentClass as C;
+        let real = mrow(
+            2885,
+            "RELIANCE INDUSTRIES LTD",
+            C::Equity,
+            "RELIANCE",
+            "EQ",
+            "NSE",
+        );
+        assert_eq!(equity_ticker(&real), "RELIANCE");
+        let bare = mrow(9, "TCS", C::Equity, "", "EQ", "NSE");
+        assert_eq!(equity_ticker(&bare), "TCS");
     }
 
     #[test]
