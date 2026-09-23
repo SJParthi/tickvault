@@ -47,7 +47,20 @@ const PARTITION_DDL_TIMEOUT_SECS: u64 = 30;
 // belongs with `ticks` and `market_depth` rather than in the DAY list of
 // small audit tables. Leaving it EXEMPT would have been the quiet mistake:
 // an exempt table grows forever, and this one grows nearly a gigabyte a day.
-pub(crate) const HOUR_PARTITIONED_TABLES: &[&str] = &["ticks", "market_depth", "top_volume"];
+// 2026-09-22: the four DIRECT per-cadence tables `top_volume_1s` / `_3s` /
+// `_5s` / `_1m` replace the single `top_volume` table, and join the HOUR sweep
+// for the same reason it did. `top_volume` itself STAYS listed: no boot writes
+// it any more, but its already-captured partitions must still age out rather
+// than sit on the volume forever.
+pub(crate) const HOUR_PARTITIONED_TABLES: &[&str] = &[
+    "ticks",
+    "market_depth",
+    "top_volume",
+    "top_volume_1s",
+    "top_volume_3s",
+    "top_volume_5s",
+    "top_volume_1m",
+];
 
 /// DAY-partitioned **audit + daily-data** tables the retention sweep DETACHes
 /// past the hot window. The 5 live **candle** tables (`candles_1m` …
@@ -318,12 +331,16 @@ pub(crate) const RETENTION_EXEMPT_TABLES: &[&str] = &[
     "spot_1m_rest",
     "option_chain_1m",
     "option_contract_1m_rest",
-    // Pre-2026-09-12 name of `top_volume`, renamed forward at boot by
-    // `ensure_top_volume_rank_table`. Exempt for the same reason as the three
-    // above: the constant still exists, so the coverage guard demands a
-    // decision, and pointing a sweeper at a name the rename has already
-    // consumed would be the worse answer.
+    // Pre-2026-09-12 name of `top_volume`. Until 2026-09-22 a boot renamed it
+    // forward; since then nothing writes or renames it, and the one-shot
+    // fresh-start reset drops it. Exempt because the constant still exists, so
+    // the coverage guard demands a decision, and a sweeper pointed at a name
+    // with no writer would only ever find it absent.
     "top_volume_rank",
+    // The one-shot fresh-start reset's own log (`fresh_start_reset.rs`). One
+    // row per reset id, never partitioned, never swept: dropping a row would
+    // let the one-shot wipe run a SECOND time on the next out-of-session boot.
+    "schema_reset_log",
 ];
 
 /// Every table the retention system knows about, de-duplicated and sorted —
@@ -847,8 +864,26 @@ mod tests {
     fn test_hour_partitioned_list_is_ticks_depth_and_top_volume() {
         assert_eq!(
             HOUR_PARTITIONED_TABLES,
-            &["ticks", "market_depth", "top_volume"]
+            &[
+                "ticks",
+                "market_depth",
+                "top_volume",
+                "top_volume_1s",
+                "top_volume_3s",
+                "top_volume_5s",
+                "top_volume_1m",
+            ]
         );
+        // Every live per-cadence table is swept — pinned against the
+        // persistence module's own names, so a fifth cadence cannot land
+        // unswept.
+        for c in crate::top_volume_rank_persistence::SnapshotCadence::ALL {
+            assert!(
+                HOUR_PARTITIONED_TABLES.contains(&c.table_name()),
+                "{} is not in the HOUR sweep",
+                c.table_name()
+            );
+        }
     }
 
     #[test]

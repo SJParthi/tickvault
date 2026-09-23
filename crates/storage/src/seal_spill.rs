@@ -5,7 +5,7 @@
 //! when the in-memory ring (`crates/trading/src/candles/seal_ring.rs`,
 //! merged via PR #557) overflows, the evicted oldest entries flow
 //! through this module and land in
-//! `data/spill/seals-YYYYMMDD.bin` as fixed-size 128-byte binary
+//! `data/spill/seals_v4-YYYY-MM-DD.bin` as fixed-size 128-byte binary
 //! records. On recovery, the storage-side writer task re-reads the
 //! spill file and re-attempts the ILP send.
 //!
@@ -17,7 +17,7 @@
 //!   Self-contained; does NOT import `tickvault-trading` so this slice
 //!   adds no new workspace dep edge.
 //! - [`SealSpillWriter`] — append-only file writer with:
-//!   - IST-date file rotation (`seals-2026-05-10.bin`), on a LONG-LIVED
+//!   - IST-date file rotation (`seals_v4-2026-05-10.bin`), on a LONG-LIVED
 //!     handle: the file is opened once per IST day, not once per seal
 //!     (2026-08-10 — see [`SealSpillWriter::append_seal`]).
 //!   - Idempotent fixed-record append (`O(1)` per append, ONE `write(2)`).
@@ -44,7 +44,7 @@
 //! | 4    | 1 | `exchange_segment_code: u8`     |
 //! | 5    | 1 | `tf_ordinal: u8` (0..=8 per `TfIndex` — the operator's nine frames since 2026-09-19; the ordinal space has been renumbered twice, so the byte is meaningless without `format_version`) |
 //! | 6    | 1 | `feed_index: u8` (`Feed::index()` — 0=Dhan, 1=Groww; pre-feed records read 0=Dhan) |
-//! | 7    | 1 | `format_version: u8` (=4 since 2026-09-19; `read_all` REFUSES every record BELOW the live constant, because each bump renumbered `tf_ordinal` and a stale byte decodes into the wrong frame silently) |
+//! | 7    | 1 | `format_version: u8` (=4 since 2026-09-19; `read_all` and the boot drain REFUSE every record whose version is not the live constant (older or newer), because each bump renumbered `tf_ordinal` and a stale byte decodes into the wrong frame silently) |
 //! | 8    | 4 | `bucket_start_ist_secs: u32`    |
 //! | 12   | 4 | `tick_count: u32`               |
 //! | 16   | 8 | `volume: u64`                   |
@@ -203,15 +203,17 @@ pub const SEAL_SPILL_RECORD_SIZE: usize = 128;
 /// Worse than the C2 case: fifteen frames were RETIRED outright, so a v3
 /// record naming one of them would ILP-auto-create a candle table the
 /// retired-table sweep has just dropped, with no dedup key. `read_all`
-/// therefore refuses EVERY record below this version rather than trying to
+/// therefore refuses EVERY record whose version is not this one (older OR
+/// newer — the gate is `!=`, not `<`) rather than trying to
 /// recover the byte-stable `M1`..`M15` subset — the C2 precedent refused
 /// wholesale for the same reason, and the loss is bounded to one deploy
 /// boot's worth of spilled seals.
 ///
-/// Task #15's per-window receipt stamps ride THIS SAME bump: two version
-/// steps in two commits would leave a version-4 file correct for one change
-/// and wrong for the other, which is exactly the ambiguity a version byte
-/// exists to prevent.
+/// ⚠ CORRECTED 2026-09-22: this said task #15's per-window receipt stamps
+/// "ride this same bump". They do not — the 128-byte record is full and carries
+/// NO receipt field. A seal replayed from spill or the DLQ therefore writes all
+/// six delay columns as NULL (never a fabricated zero): the delays of a replayed
+/// bar are unknown, and the row says so.
 pub const SEAL_SPILL_FORMAT_VERSION: u8 = 4;
 
 /// ⚠ **RETIRED 2026-09-18.** Bytes 80..88 no longer carry a net volume in any
@@ -631,7 +633,7 @@ fn ist_date_filename(now_unix_secs: i64) -> String {
         .timestamp_opt(ist_secs, 0)
         .single()
         .unwrap_or_else(|| Utc.timestamp_opt(0, 0).single().unwrap_or_default());
-    dt.format("seals-%Y-%m-%d.bin").to_string()
+    dt.format("seals_v4-%Y-%m-%d.bin").to_string()
 }
 
 /// IST calendar-day number (days since the IST-shifted epoch) for a UTC
@@ -890,8 +892,9 @@ impl SealSpillWriter {
             match read_full_record(&mut reader, &mut buf) {
                 Ok(true) => {
                     // Format-version gate. Byte 7 is the record's
-                    // `SEAL_SPILL_FORMAT_VERSION`, and ANY value below the live
-                    // constant is refused — never partially recovered.
+                    // `SEAL_SPILL_FORMAT_VERSION`, and ANY value other than the live
+                    // constant is refused — never partially recovered. `!=`, not `<` (2026-09-22):
+                    // a NEWER record is equally unreadable, and a deploy rollback makes one.
                     //
                     // 2026-07-21 (C2, version 0 → 1): a byte-7 of 0 marks a
                     // pre-renumber record whose tf_ordinal lives in the OLD 12-frame
@@ -911,7 +914,7 @@ impl SealSpillWriter {
                     // legitimately mix older + current records via append across a
                     // deploy boundary. The loss is bounded to one deploy boot's
                     // worth of spilled seals.
-                    if buf[7] < SEAL_SPILL_FORMAT_VERSION {
+                    if buf[7] != SEAL_SPILL_FORMAT_VERSION {
                         legacy_refused += 1;
                         continue;
                     }
@@ -937,10 +940,10 @@ impl SealSpillWriter {
                 ?path,
                 legacy_refused,
                 current_format_version = SEAL_SPILL_FORMAT_VERSION,
-                "refused spill records written under an OLDER format version (their \
-                 tf_ordinal belongs to a superseded TfIndex ordinal space, so \
-                 decoding them would file a seal under the wrong timeframe; deleted \
-                 with the file after drain)"
+                "refused spill records written under a DIFFERENT format version, \
+                 older or newer (their tf_ordinal belongs to another TfIndex \
+                 ordinal space, so decoding them would file a seal under the \
+                 wrong timeframe; deleted with the file after drain)"
             );
         }
         info!(?path, count = all.len(), "drained spill file");
@@ -1401,6 +1404,47 @@ mod tests {
     }
 
     #[test]
+    fn test_read_all_refuses_a_future_version_record_like_an_older_one() {
+        // The gate is `!=`, not `<`: a record stamped by a NEWER binary (a
+        // deploy rollback reads it) is just as unreadable as an older one,
+        // because its tf_ordinal belongs to an ordinal space this binary does
+        // not know. Pin the forward direction so the gate can never be
+        // "simplified" back to `<` without failing the build.
+        let dir = temp_spill_dir("future-version-refusal");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = 1_716_000_000_i64;
+
+        let future = mk_seal(19, 0, 3, 1_716_001_200, 150.25);
+        let mut future_bytes = future.to_bytes();
+        future_bytes[7] = SEAL_SPILL_FORMAT_VERSION.wrapping_add(1);
+        assert!(
+            future_bytes[7] > SEAL_SPILL_FORMAT_VERSION,
+            "the forged record must be genuinely NEWER than the live constant",
+        );
+
+        let current = mk_seal(25, 1, 2, 1_716_001_500, 200.75);
+        let current_bytes = current.to_bytes();
+
+        let path = writer.spill_path(now);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        let mut raw = Vec::with_capacity(2 * SEAL_SPILL_RECORD_SIZE);
+        raw.extend_from_slice(&future_bytes);
+        raw.extend_from_slice(&current_bytes);
+        std::fs::write(&path, &raw).expect("write mixed spill file");
+
+        let drained = writer.read_all(now).expect("read");
+        assert_eq!(
+            drained.len(),
+            1,
+            "a future-version record must be refused, the current one drained"
+        );
+        assert_eq!(drained[0], current);
+
+        writer.clear_spill_for_date(now).expect("clear");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_serialized_seal_from_bytes_rejects_truncated_buffer() {
         let short = vec![0u8; SEAL_SPILL_RECORD_SIZE - 1];
         assert_eq!(SerializedSeal::from_bytes(&short), None);
@@ -1411,10 +1455,10 @@ mod tests {
         // Byte 6 is the feed index (0 = Dhan here); byte 7 carries the
         // spill format version (C2, 2026-07-21) so a record written under
         // an OLDER ordinal space is refusable on load — the gate is
-        // `buf[7] < SEAL_SPILL_FORMAT_VERSION` in `read_all`, not a
+        // `buf[7] != SEAL_SPILL_FORMAT_VERSION` in `read_all`, not a
         // `== 0` test: the 2026-09-19 nine-frame collapse renumbered the
-        // ordinals a second time, so every version below the live constant
-        // is refused, not just the pre-C2 zero. §31 Option 2 now
+        // ordinals a second time, so every version other than the live
+        // constant (older OR newer) is refused, not just the pre-C2 zero. §31 Option 2 now
         // uses bytes 96..104 for `open_pct`, so the zero-padding tail
         // starts at 104.
         let seal = mk_seal(13, 0, 0, 1_716_000_900, 100.0);
@@ -1469,7 +1513,12 @@ mod tests {
             .expect("valid")
             .timestamp();
         let name = ist_date_filename(utc_noon);
-        assert_eq!(name, "seals-2026-01-01.bin");
+        assert_eq!(name, "seals_v4-2026-01-01.bin");
+        assert!(name.starts_with(crate::seal_writer_task::SEAL_FILE_PREFIX));
+        assert!(
+            !name.starts_with(crate::seal_writer_task::LEGACY_SEAL_FILE_PREFIX),
+            "a v4 spill file must be invisible to a pre-v4 binary's drain"
+        );
         // Suppress unused
         let _ = ist_midnight_2026_05_10;
     }
@@ -1483,7 +1532,7 @@ mod tests {
             .expect("valid")
             .timestamp();
         let name = ist_date_filename(utc);
-        assert_eq!(name, "seals-2026-05-10.bin");
+        assert_eq!(name, "seals_v4-2026-05-10.bin");
     }
 
     #[test]
@@ -1598,7 +1647,7 @@ mod tests {
             .expect("valid")
             .timestamp();
         let p = writer.spill_path(utc_noon);
-        assert!(p.to_string_lossy().ends_with("seals-2026-05-10.bin"));
+        assert!(p.to_string_lossy().ends_with("seals_v4-2026-05-10.bin"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2509,7 +2558,7 @@ mod tests {
 }
 
 /// Ordinal pins: the spill `tf_ordinal` byte round-trips every one of the
-/// 9 `TfIndex` frames, the four byte-stable frames keep ordinals 0..=3, and
+/// `TfIndex` frames (10 since 2026-09-22), the four byte-stable frames keep ordinals 0..=3, and
 /// out-of-range ordinals refuse cleanly (`None`) — never panic.
 ///
 /// ⚠ The module was named for the C3 second-scale change, which was
@@ -2530,7 +2579,10 @@ mod c3_tf_ordinal_pins {
         // `SEAL_SPILL_FORMAT_VERSION` is 4). The loop bound is derived from
         // TF_COUNT so a frame added or retired is actually exercised instead
         // of silently falling outside the range.
-        assert_eq!(TF_COUNT, 9);
+        assert_eq!(
+            TF_COUNT, 10,
+            "10 since 2026-09-22: M10 appended at ordinal 9 (a real table, not a view)"
+        );
         for ord in 0..TF_COUNT {
             let tf =
                 TfIndex::from_ordinal(ord).unwrap_or_else(|| panic!("ordinal {ord} must decode"));

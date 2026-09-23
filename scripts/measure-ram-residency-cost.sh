@@ -61,10 +61,11 @@ q "SELECT max(n) peak_ticks_in_one_second
 echo
 echo "-- 3. SECOND BARS: sparse reality vs the dense assumption ------"
 echo "   dense would be instruments x 23,100. Measured is what actually opened."
-for tf in 1 5 10 15 30; do
-  printf '   candles_s%-3s ' "$tf"
+echo "   (the second-scale frames the candle engine emits: 1s, 3s, 5s)"
+for tf in 1s 3s 5s; do
+  printf '   candles_%-4s ' "$tf"
   q "SELECT count() bars, count_distinct(security_id) instruments
-     FROM candles_s${tf}
+     FROM candles_${tf}
      WHERE ts >= '${FROM}' AND ts <= '${TO}'" || echo "   (table absent)"
 done
 

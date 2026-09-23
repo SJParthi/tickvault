@@ -1048,7 +1048,12 @@ impl AggregatorCell {
                 if matches!(strategy.late_policy, LatePolicy::Refold)
                     && bucket_start == last.bucket_start_ist_secs
                 {
-                    fold_late_hlc(&mut self.last_sealed[ord], prices, fold_secs);
+                    fold_late_hlc(
+                        &mut self.last_sealed[ord],
+                        prices,
+                        fold_secs,
+                        tick.received_at_nanos,
+                    );
                     // SEAL SITE 5 of 6 — and the one that proves the guard
                     // earns its keep. I wrote this change believing there
                     // were four emission points; the source scan found this
@@ -1377,7 +1382,12 @@ impl AggregatorCell {
         if matches!(strategy.late_policy, LatePolicy::Refold) {
             let last = self.last_sealed[ord];
             if !last.is_uninitialised() && bucket_start == last.bucket_start_ist_secs {
-                fold_late_hlc(&mut self.last_sealed[ord], prices, fold_secs);
+                fold_late_hlc(
+                    &mut self.last_sealed[ord],
+                    prices,
+                    fold_secs,
+                    tick.received_at_nanos,
+                );
                 // SEAL SITE 4 of 6, and one of the two a careless fix misses: the
                 // late tick just moved `close`, so a percentage stamped at
                 // the original seal is now stale for the row that actually
@@ -2147,13 +2157,31 @@ fn fold_in_bucket(
 /// `volume` / `oi` are untouched: `open` belongs to the first tick, and the
 /// cumulative snapshots are order-dependent and ambiguous for a latecomer.
 ///
-/// The two RECEIPT stamps are untouched for a different and stronger reason:
-/// this path amends a bar that was already sealed and already written, and it
-/// re-emits only the amended bar. Moving `first_receipt_ist_nanos` or
-/// `last_receipt_ist_nanos` here would change a figure no row will ever
-/// carry — the delay columns for that bar left with the seal.
+/// The two RECEIPT stamps ARE widened by the late tick, exactly as
+/// `fold_in_bucket` widens them. This path re-emits the amended bar as
+/// `AmendedLate`, the writer recomputes the three delay columns from it, and
+/// the DEDUP upsert replaces the earlier row. Leaving the stamps alone would
+/// persist a row whose close moved on a tick received N seconds after the
+/// window closed while its `close_latency` still claims all data arrived
+/// before the close. *(Corrected 2026-09-22: this paragraph said the late
+/// path "re-emits only the amended bar" and that the delay figures "left with
+/// the seal" — the first half was true and made the second half false.)*
 #[inline]
-fn fold_late_hlc(state: &mut LiveCandleState, prices: TickPrices, fold_secs: u32) {
+fn fold_late_hlc(
+    state: &mut LiveCandleState,
+    prices: TickPrices,
+    fold_secs: u32,
+    received_at_nanos: i64,
+) {
+    let receipt = receipt_ist_nanos(received_at_nanos);
+    if receipt > 0 {
+        if state.first_receipt_ist_nanos == 0 || receipt < state.first_receipt_ist_nanos {
+            state.first_receipt_ist_nanos = receipt;
+        }
+        if receipt > state.last_receipt_ist_nanos {
+            state.last_receipt_ist_nanos = receipt;
+        }
+    }
     let price = prices.last_traded_price;
     if price > state.high {
         state.high = price;
@@ -3295,6 +3323,132 @@ mod tests {
         );
     }
 
+    // -- receipt stamps (2026-09-22, coverage finding A11) -----------------
+
+    fn tick_recv(ts: u32, price: f32, cum: u32, received_at_nanos: i64) -> ParsedTick {
+        ParsedTick {
+            received_at_nanos,
+            ..tick_at(ts, price, cum)
+        }
+    }
+
+    /// min / max over out-of-order receipts, a `0` ("no receipt") that must
+    /// NOT peg the first stamp, the IST shift, and a reset on bucket roll.
+    #[test]
+    fn receipt_stamps_take_min_and_max_skip_zero_and_reset_on_roll() {
+        const S: i64 = 1_000_000_000;
+        let base = 1_790_000_000 * S; // a UTC receipt instant
+        let mut cell = AggregatorCell::empty();
+        let st = FeedStrategy::DEFAULT;
+        let _ = cell.consume_tick(
+            TfIndex::M1,
+            &tick_recv(OPEN, 100.0, 1, base + 2 * S),
+            0,
+            st,
+            1,
+        );
+        let _ = cell.consume_tick(
+            TfIndex::M1,
+            &tick_recv(OPEN + 1, 101.0, 2, base + S),
+            0,
+            st,
+            2,
+        );
+        let _ = cell.consume_tick(TfIndex::M1, &tick_recv(OPEN + 2, 102.0, 3, 0), 0, st, 3);
+        let _ = cell.consume_tick(
+            TfIndex::M1,
+            &tick_recv(OPEN + 3, 103.0, 4, base + 3 * S),
+            0,
+            st,
+            4,
+        );
+        let bar = cell.snapshot(TfIndex::M1);
+        assert_eq!(bar.first_receipt_ist_nanos, base + S + IST_UTC_OFFSET_NANOS);
+        assert_eq!(
+            bar.last_receipt_ist_nanos,
+            base + 3 * S + IST_UTC_OFFSET_NANOS
+        );
+
+        // Roll into the next minute: both stamps re-seed from the new tick.
+        let _ = cell.consume_tick(
+            TfIndex::M1,
+            &tick_recv(OPEN + 60, 104.0, 5, base + 70 * S),
+            0,
+            st,
+            5,
+        );
+        let next = cell.snapshot(TfIndex::M1);
+        assert_eq!(
+            next.first_receipt_ist_nanos,
+            base + 70 * S + IST_UTC_OFFSET_NANOS
+        );
+        assert_eq!(
+            next.last_receipt_ist_nanos,
+            base + 70 * S + IST_UTC_OFFSET_NANOS
+        );
+    }
+
+    /// A bucket whose first ticks carry no receipt takes the first REAL one
+    /// on both edges rather than keeping `0`.
+    #[test]
+    fn a_bucket_opened_without_a_receipt_takes_the_first_real_one() {
+        const S: i64 = 1_000_000_000;
+        let base = 1_790_000_000 * S;
+        let mut cell = AggregatorCell::empty();
+        let st = FeedStrategy::DEFAULT;
+        let _ = cell.consume_tick(TfIndex::M1, &tick_recv(OPEN, 100.0, 1, 0), 0, st, 1);
+        assert_eq!(cell.snapshot(TfIndex::M1).first_receipt_ist_nanos, 0);
+        let _ = cell.consume_tick(TfIndex::M1, &tick_recv(OPEN + 1, 101.0, 2, base), 0, st, 2);
+        let bar = cell.snapshot(TfIndex::M1);
+        assert_eq!(bar.first_receipt_ist_nanos, base + IST_UTC_OFFSET_NANOS);
+        assert_eq!(bar.last_receipt_ist_nanos, base + IST_UTC_OFFSET_NANOS);
+    }
+
+    /// The late path re-emits the amended bar and the writer recomputes the
+    /// delays from it, so a late tick must widen `last_receipt` — otherwise
+    /// the rewritten row claims every tick arrived before the close.
+    ///
+    /// BITE PROOF: drop the receipt block from `fold_late_hlc` and the
+    /// `last_receipt` assertion reads the pre-amend value.
+    #[test]
+    fn a_late_tick_widens_the_amended_bars_last_receipt() {
+        const S: i64 = 1_000_000_000;
+        let base = 1_790_000_000 * S;
+        let mut cell = AggregatorCell::empty();
+        let _ = cell.consume_tick(
+            TfIndex::M1,
+            &tick_recv(OPEN + 50, 100.0, 10, base),
+            0,
+            FeedStrategy::REFOLD,
+            10,
+        );
+        let _ = cell.consume_tick(
+            TfIndex::M1,
+            &tick_recv(OPEN + 60, 105.0, 20, base + 11 * S),
+            10,
+            FeedStrategy::REFOLD,
+            20,
+        );
+        let out = cell.consume_tick(
+            TfIndex::M1,
+            &tick_recv(OPEN + 55, 99.0, 21, base + 40 * S),
+            10,
+            FeedStrategy::REFOLD,
+            21,
+        );
+        let ConsumeOutcome::AmendedLate { amended_state } = out else {
+            panic!("expected amend, got {out:?}");
+        };
+        assert_eq!(
+            amended_state.first_receipt_ist_nanos,
+            base + IST_UTC_OFFSET_NANOS
+        );
+        assert_eq!(
+            amended_state.last_receipt_ist_nanos,
+            base + 40 * S + IST_UTC_OFFSET_NANOS,
+            "the late receipt must reach the re-emitted row"
+        );
+    }
     #[test]
     fn test_feed_strategy_default_is_refold_and_is_documented() {
         assert_eq!(FeedStrategy::default(), FeedStrategy::REFOLD);

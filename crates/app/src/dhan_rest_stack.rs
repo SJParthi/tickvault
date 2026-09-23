@@ -277,6 +277,14 @@ pub fn dhan_rest_peer_page_due(attempt: u32, already_paged: bool) -> bool {
     !already_paged && attempt >= DHAN_REST_STACK_PEER_PAGE_MIN_ATTEMPT
 }
 
+/// True while an AlreadyHeld streak is still inside the window where the
+/// holder is most plausibly THIS machine's previous process whose 90s TTL
+/// has not yet lapsed — the same boundary the Telegram page waits for
+/// ([`DHAN_REST_STACK_PEER_PAGE_MIN_ATTEMPT`]). Pure — unit-tested.
+fn held_is_expected_self_stale(attempt: u32) -> bool {
+    attempt < DHAN_REST_STACK_PEER_PAGE_MIN_ATTEMPT
+}
+
 /// PARK decision for the lock-acquire loop (2026-07-13 lurk-and-steal fix):
 /// once the CUMULATIVE AlreadyHeld backoff reaches
 /// [`DHAN_REST_STACK_ALREADYHELD_PATIENCE_SECS`], the holder has out-lived
@@ -462,7 +470,28 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                 }
                 Ok(instance_lock::AcquireOutcome::AlreadyHeld { holder }) => {
                     held_attempt = held_attempt.saturating_add(1);
-                    if dhan_rest_retry_should_log(held_attempt) {
+                    if dhan_rest_retry_should_log(held_attempt)
+                        && held_is_expected_self_stale(held_attempt)
+                    {
+                        // 2026-09-23: a deploy/daily restart finds its OWN
+                        // predecessor's lock (the heartbeat never releases
+                        // on stop — module docs) until the 90s TTL lapses.
+                        // That is expected, not a dual instance, so it is
+                        // not an ERROR. Measured 05:08 IST 2026-09-23: an
+                        // ERROR fired on a routine redeploy against the
+                        // previous pid's own entry.
+                        warn!(
+                            stage = "already_held_self_stale_window",
+                            peer = %holder,
+                            lock_key = %lock_key,
+                            attempt = held_attempt,
+                            waited_secs = held_wait_secs,
+                            "Dhan REST-only stack: the dual-instance lock is still \
+                             held — expected right after a restart while the previous \
+                             process's entry ages out (90s); retrying, no mint before \
+                             the lock"
+                        );
+                    } else if dhan_rest_retry_should_log(held_attempt) {
                         error!(
                             code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
                             severity = ErrorCode::Resilience01DualInstanceDetected
@@ -1224,6 +1253,24 @@ mod tests {
             DHAN_REST_STACK_ALREADYHELD_PATIENCE_SECS
         ));
         assert!(dhan_rest_lock_park_due(u64::MAX), "no overflow / saturates");
+    }
+
+    #[test]
+    fn test_held_self_stale_window_is_exactly_the_pre_page_window() {
+        // The warn-not-error window and the Telegram-page gate are the SAME
+        // boundary: every attempt either reads as a restart's own stale entry
+        // (warn) or is eligible to page (error) — never both, never neither.
+        for attempt in 1..=DHAN_REST_STACK_PEER_PAGE_MIN_ATTEMPT + 3 {
+            assert_ne!(
+                held_is_expected_self_stale(attempt),
+                dhan_rest_peer_page_due(attempt, false),
+                "attempt {attempt}"
+            );
+        }
+        assert!(held_is_expected_self_stale(1));
+        assert!(!held_is_expected_self_stale(
+            DHAN_REST_STACK_PEER_PAGE_MIN_ATTEMPT
+        ));
     }
 
     /// Foreign-machine (genuine live peer) arm: the page fires ONCE, only

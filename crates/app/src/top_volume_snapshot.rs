@@ -509,6 +509,33 @@ pub struct CandleBarReading {
     pub open_pct: f64,
 }
 
+impl CandleBarReading {
+    /// Reads one bar the fold returned for a row's window.
+    ///
+    /// The sweep fires AT the window close, so that bar is usually still the
+    /// OPEN bucket — no tick stamped past the boundary has landed yet. The two
+    /// percentages are written only when a bucket seals, so on an open bucket
+    /// they still read 0.0, and 0.0 passes the finite filter and would be
+    /// stored as a real "unchanged on the day". Stamping this COPY runs the
+    /// exact function the seal runs, on the same close / previous-day close /
+    /// session open, so the value is the one the candle row will carry for the
+    /// ticks folded so far. Idempotent on a sealed bar.
+    ///
+    /// # Complexity
+    /// O(1): three percentage computations on a `Copy` value, no allocation.
+    #[must_use]
+    pub fn from_bar(
+        mut bar: tickvault_trading::candles::live_candle_state::LiveCandleState,
+    ) -> Self {
+        bar.stamp_seal_percentages();
+        Self {
+            signed_volume: bar.signed_volume(),
+            close_pct_from_prev_day: bar.close_pct_from_prev_day,
+            open_pct: bar.open_pct,
+        }
+    }
+}
+
 /// Projects one family's ranked slice into storable rows.
 ///
 /// `is_subscribed` is supplied by the caller because the leaderboard does not
@@ -594,8 +621,6 @@ where
         .unwrap_or(1)
         .saturating_mul(NANOS_PER_SECOND);
     let ts = boundary.saturating_sub(period_nanos);
-    // The same two boundaries in the RECEIPT clock's frame.
-    //
     // The row stamp in IST epoch SECONDS — the OPEN of the window this
     // snapshot describes, and the exact key the candle fold buckets on
     // (`LiveCandleState::bucket_start_ist_secs` is seconds). It is handed to
@@ -609,8 +634,9 @@ where
     let ts_secs = ts.div_euclid(NANOS_PER_SECOND);
     let window_open_secs = u32::try_from(ts_secs).ok();
     // `rows` IS pre-sized: it genuinely fills. Every contract on the board
-    // produces a row — the two refusals that can fire in the common case
-    // (`LabelUnavailable`) does NOT drop the row, it only NULLs a leaf column — so `ranked.len()` is the exact final length in
+    // produces a row — the common-case refusal (`LabelUnavailable`) does
+    // NOT drop the row, it only NULLs a leaf column — so `ranked.len()` is
+    // the exact final length in
     // every reachable case and one allocation is the whole cost.
     let mut rows = Vec::with_capacity(ranked.len());
     // `refusals` is NOT, and the comment that used to defend pre-sizing it
@@ -758,36 +784,12 @@ where
             .map(|bar| bar.open_pct)
             .filter(|p| p.is_finite());
 
-        // ---- the three receipt delays (operator, 2026-09-19 Quote D) -------
-        //
-        // Three questions the row could not answer before: how long after the
-        // window opened did the first trade REACH US, how long before it
-        // closed did the last one, and how far apart were those two.
-        //
-        // # The clock, and the one conversion that must happen exactly once
-        //
-        // received_at_nanos` — a **UTC** epoch instant, back-dated by ring
-        // dwell so it names the socket-receipt moment rather than the fold
-        // moment. `ts` and `boundary` are **IST-naive** nanos (the grid this
-        // table and `candles_<tf>` share). Subtracting one from the other
-        // without the conversion is a 5 h 30 m error that looks EXACTLY like
-        // a plausible delay, so the two UTC-frame boundaries are computed once
-        // per sweep above and both differences are taken in that one frame.
-        //
-        // # Why `0` means NULL rather than "instant"
-        //
-        // `WAL_RECEIPT_UNKNOWN_NANOS` is `0`: a pre-`TVW3` WAL frame carries no
-        // receipt at all. Rendering that as `0 nanoseconds` would report the
-        // fastest possible delivery for a tick whose delivery time is unknown,
-        // so both halves of a pair go NULL together and the column is honestly
-        // empty. `<= 0` rather than `== 0` because a negative epoch is not a
-        // receipt either.
-        //
-        // # Why each is `Option<i64>` and not a rendered string here
-        //
-        // The row stays allocation-free: the writer owns one reusable buffer
-        // and renders at append time. A `format!` per column per row would be
-        // 3 x 20,220 = 60,660 fresh allocations per sweep, on the frame drain.
+        // The three receipt-delay pairs (operator, 2026-09-19 Quote D) are NOT
+        // on this row: the 2026-09-19 fifteen-column contract removed them
+        // from `top_volume`, and they live on `candles_<tf>`, where the fold
+        // holds the receipt stamps. (2026-09-22: a comment block describing
+        // how this projection computed them stood here after the fields were
+        // gone.)
         rows.push(TopVolumeRankRow {
             snapshot_ts_ist_nanos: ts,
             cadence,
@@ -1351,9 +1353,20 @@ mod tests {
         // lot, so the whole-lot figure is that over 1,000.
         let expected = (u64::from(u32::MAX) * 3 / 1_000) as i64;
         assert_eq!(p.rows[0].total_lots_traded, expected);
+        // Anti-vacuity, stated on the quantity that is actually widened.
+        //
+        // 2026-09-22: this compared the whole-LOT count against
+        // `u32::MAX / 1_000` under the message "must exceed a 32-bit lot
+        // count". The lot count (~1.29e7) is nowhere near 32 bits, so the
+        // message was false; the bound only held because dividing both sides
+        // by 1,000 made it a proxy for the real claim. The real claim is about
+        // the milli-lot KEY — the `u64` that `i64::try_from` widens — and it
+        // is now asserted directly against `u32::MAX`: a key that fits 32
+        // bits would let an `as u32` truncation on this path pass unnoticed.
         assert!(
-            expected > i64::from(u32::MAX) / 1_000,
-            "the fixture must exceed a 32-bit lot count, or it proves nothing"
+            ranked[0].window_lots_milli > u64::from(u32::MAX),
+            "the fixture's rank key must exceed u32::MAX, or a truncating cast \
+             of the key would go unnoticed and this test proves nothing"
         );
     }
 
@@ -2077,5 +2090,171 @@ mod tests {
         // otherwise this test would pass by both sides being empty.
         assert_eq!(with.rows[0].volume, Some(-4_242));
         assert_eq!(without.rows[0].volume, None);
+    }
+
+    // -- direct-table ordering (2026-09-22) --------------------------------
+
+    /// Operator 2026-09-22: every `top_volume_<tf>` table must read
+    /// `ts ASC, volume_percentage_change DESC`. The writer appends rows in the
+    /// order this projection returns them, and sweeps arrive in time order,
+    /// so the guarantee reduces to: within ONE snapshot, every row carries the
+    /// same `ts` and the key never rises from one row to the next.
+    ///
+    /// Exhaustive over every length-4 board drawn from a pool that includes
+    /// ties, a zero-ish key and a huge key — 6^4 = 1,296 boards — sorted the
+    /// way `VolumeLeaderboard::rank` sorts them, on all four cadences. A
+    /// board is only ever descending on its way in; what this pins is that
+    /// the projection neither reorders, nor drops-and-shuffles, nor stamps
+    /// two timestamps into one snapshot.
+    #[test]
+    fn every_snapshot_is_one_ts_and_descending_by_volume_percentage() {
+        const POOL: [u32; 6] = [1, 2, 399, 400, 500, 1_000_000];
+        // Divisible by 1, 3, 5 and 60 seconds, so every cadence grid lands on
+        // it and no row is refused as off-grid.
+        let ts = 3_600 * NANOS_PER_SECOND;
+        let mut boards = 0_u32;
+        for cadence in SnapshotCadence::ALL {
+            for a in POOL {
+                for b in POOL {
+                    for c in POOL {
+                        for d in POOL {
+                            let mut vols = [a, b, c, d];
+                            // Descending, exactly as the leaderboard ranks.
+                            vols.sort_unstable_by(|x, y| y.cmp(x));
+                            let ranked: Vec<RankedContract> = vols
+                                .iter()
+                                .enumerate()
+                                .map(|(i, v)| contract(100 + i as u64, 1, *v))
+                                .collect();
+                            let snap = project_snapshot(
+                                ts,
+                                cadence,
+                                OptionFamily::Stock,
+                                &ranked,
+                                |_, _| true,
+                                TEST_LABEL,
+                                NO_CANDLE,
+                            );
+                            assert_eq!(snap.rows.len(), ranked.len(), "no row may be dropped");
+                            let first_ts = snap.rows[0].snapshot_ts_ist_nanos;
+                            for (row, want) in snap.rows.iter().zip(ranked.iter()) {
+                                assert_eq!(
+                                    row.snapshot_ts_ist_nanos, first_ts,
+                                    "one snapshot must carry one ts ({cadence:?})"
+                                );
+                                assert_eq!(
+                                    row.security_id,
+                                    i64::try_from(want.security_id).unwrap(),
+                                    "the projection must keep the rank order"
+                                );
+                                assert_eq!(row.cadence, cadence);
+                            }
+                            for pair in snap.rows.windows(2) {
+                                assert!(
+                                    pair[0].volume_percentage_change
+                                        >= pair[1].volume_percentage_change,
+                                    "key rose inside a snapshot: {} then {} ({vols:?}, {cadence:?})",
+                                    pair[0].volume_percentage_change,
+                                    pair[1].volume_percentage_change
+                                );
+                            }
+                            boards += 1;
+                        }
+                    }
+                }
+            }
+        }
+        // Anti-vacuity: the loops really ran every board on every cadence.
+        assert_eq!(boards, 1_296 * 4);
+    }
+
+    /// A refused row in the MIDDLE of a board (an id that cannot fit the
+    /// signed column) must not reorder its neighbours: the survivors stay in
+    /// rank order and stay descending.
+    #[test]
+    fn a_refused_middle_row_leaves_the_survivors_descending() {
+        let mut ranked = vec![
+            contract(10, 1, 900),
+            contract(11, 1, 700),
+            contract(12, 1, 500),
+            contract(13, 1, 300),
+        ];
+        ranked[1].security_id = u64::MAX; // refused: does not fit i64
+        let snap = project_snapshot(
+            NANOS_PER_SECOND,
+            SnapshotCadence::OneSecond,
+            OptionFamily::Stock,
+            &ranked,
+            |_, _| true,
+            TEST_LABEL,
+            NO_CANDLE,
+        );
+        let ids: Vec<i64> = snap.rows.iter().map(|r| r.security_id).collect();
+        assert_eq!(ids, vec![10, 12, 13]);
+        for pair in snap.rows.windows(2) {
+            assert!(pair[0].volume_percentage_change >= pair[1].volume_percentage_change);
+        }
+    }
+
+    // -- from_bar (2026-09-22, hostile finding B1) -------------------------
+
+    /// The sweep fires AT the window close, so the bar it probes is usually
+    /// still the OPEN bucket, whose two percentages are unstamped (0.0). A
+    /// field-by-field copy stored that 0.0 as a real "unchanged on the day"
+    /// while the candle row for the same bar later carried the true figure.
+    /// `from_bar` must stamp the copy with the seal's own function.
+    #[test]
+    fn from_bar_stamps_an_open_bucket_rather_than_copying_its_zeros() {
+        use tickvault_trading::candles::LiveCandleState;
+        let mut open = LiveCandleState::empty();
+        open.close = 110.0;
+        open.prev_day_close = 100.0;
+        open.session_open = 105.0;
+        // What an OPEN bucket carries: the seal has not stamped it yet.
+        open.close_pct_from_prev_day = 0.0;
+        open.open_pct = 0.0;
+
+        let r = CandleBarReading::from_bar(open);
+        assert_eq!(r.close_pct_from_prev_day, 10.0, "110 vs 100 is +10%");
+        assert_eq!(r.open_pct, 4.76, "110 vs 105 is +4.76% (2 dp)");
+
+        // It must equal what the seal itself stamps on the same bar, so the
+        // two tables agree by construction.
+        let mut sealed = open;
+        sealed.stamp_seal_percentages();
+        assert_eq!(r.close_pct_from_prev_day, sealed.close_pct_from_prev_day);
+        assert_eq!(r.open_pct, sealed.open_pct);
+        assert_eq!(r.signed_volume, sealed.signed_volume());
+    }
+
+    /// Idempotent on an already-sealed bar: stamping twice changes nothing.
+    #[test]
+    fn from_bar_is_idempotent_on_a_sealed_bar() {
+        use tickvault_trading::candles::LiveCandleState;
+        let mut bar = LiveCandleState::empty();
+        bar.close = 95.0;
+        bar.prev_day_close = 100.0;
+        bar.session_open = 100.0;
+        bar.stamp_seal_percentages();
+        let r = CandleBarReading::from_bar(bar);
+        assert_eq!(r.close_pct_from_prev_day, -5.0);
+        assert_eq!(r.open_pct, -5.0);
+    }
+
+    /// The feed stack's probe closure must go through `from_bar`. A revert
+    /// to a field-by-field struct literal re-opens B1 and compiles cleanly,
+    /// so it is pinned at the source.
+    #[test]
+    fn the_feed_stack_probe_reads_the_candle_through_from_bar() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        assert!(
+            prod.contains(".map(crate::top_volume_snapshot::CandleBarReading::from_bar)"),
+            "the top_volume candle probe must stamp via from_bar"
+        );
+        assert!(
+            !prod.contains("crate::top_volume_snapshot::CandleBarReading {"),
+            "a field-by-field CandleBarReading literal copies the open bucket's unstamped zeros"
+        );
     }
 }

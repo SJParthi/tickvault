@@ -326,8 +326,6 @@ pub struct TickRow {
     pub total_buy_qty: Option<i64>,
     /// Total sell quantity. `None` → NULL.
     pub total_sell_qty: Option<i64>,
-    /// Raw exchange timestamp (IST epoch SECONDS), verbatim audit column.
-    pub exchange_timestamp: Option<i64>,
     /// Local receive instant as IST nanoseconds. `None` → NULL.
     pub received_at_ist_nanos: Option<i64>,
     /// Deterministic content fingerprint (integrity column, NOT in the key).
@@ -465,7 +463,6 @@ impl TickRow {
                 .then(|| i64::from(tick.last_trade_quantity)),
             total_buy_qty: opt_qty(tick.total_buy_quantity),
             total_sell_qty: opt_qty(tick.total_sell_quantity),
-            exchange_timestamp: Some(i64::from(tick.exchange_timestamp)),
             received_at_ist_nanos,
             payload_hash: None,
         })
@@ -485,6 +482,9 @@ pub fn ticks_create_ddl() -> String {
     // APPROVED: table DDL, built once at boot in ticks_create_ddl
     format!(
         "CREATE TABLE IF NOT EXISTS {TICKS_TABLE} (\
+            received_at TIMESTAMP, \
+            ts TIMESTAMP, \
+            contract SYMBOL, \
             feed SYMBOL, \
             segment SYMBOL, \
             security_id LONG, \
@@ -499,17 +499,16 @@ pub fn ticks_create_ddl() -> String {
             last_trade_qty LONG, \
             total_buy_qty LONG, \
             total_sell_qty LONG, \
-            exchange_timestamp LONG, \
-            received_at TIMESTAMP, \
             payload_hash LONG, \
-            capture_seq LONG, \
-            ts TIMESTAMP\
+            capture_seq LONG\
         ) TIMESTAMP(ts) PARTITION BY HOUR WAL"
     )
 }
 
 /// Every `ticks` column with its type, for the per-column self-heal ALTERs.
 const TICKS_COLUMNS: &[(&str, &str)] = &[
+    ("received_at", "TIMESTAMP"),
+    ("contract", "SYMBOL"),
     ("feed", "SYMBOL"),
     ("segment", "SYMBOL"),
     ("security_id", "LONG"),
@@ -524,8 +523,6 @@ const TICKS_COLUMNS: &[(&str, &str)] = &[
     ("last_trade_qty", "LONG"),
     ("total_buy_qty", "LONG"),
     ("total_sell_qty", "LONG"),
-    ("exchange_timestamp", "LONG"),
-    ("received_at", "TIMESTAMP"),
     ("payload_hash", "LONG"),
     ("capture_seq", "LONG"),
 ];
@@ -1507,8 +1504,11 @@ fn ticks_ilp_http_conf(config: &QuestDbConfig) -> String {
 ///
 /// An LTT below [`MIN_PLAUSIBLE_EXCHANGE_TS_SECS`] is a sentinel, not a time,
 /// so the row is stamped with its RECEIPT time — which is the only real time
-/// such an observation has. The raw sentinel is NOT destroyed: it stays in the
-/// `exchange_timestamp` column, so "never traded" remains recoverable, and the
+/// such an observation has. The raw sentinel VALUE is not stored (the
+/// `exchange_timestamp` column was removed from `ticks` 2026-09-22, operator
+/// directive), but "never traded" stays recoverable in SQL: a real trade's `ts`
+/// is a whole second, while a fallback row's `ts` equals `received_at` to the
+/// nanosecond, so `WHERE ts = received_at` isolates them. The
 /// same floor the aggregator uses to refuse the candle is the one used here, so
 /// the two cannot drift apart.
 ///
@@ -1664,6 +1664,13 @@ pub struct TickWriter {
     /// This is the batch-WIDTH bound, and it is the one the live measurement
     /// made load-bearing — see [`MAX_RETAINED_FLUSH_SPANS`].
     retained_spans: u32,
+    /// Flush-path counter handles, resolved once at construction — see
+    /// [`TickFlushCounters`] (2026-09-22, item 44g).
+    flush_counters: TickFlushCounters,
+    /// Cleared buffers the writer thread hands back for reuse, so a hand-off
+    /// does not start the next batch from a zero-capacity buffer. `None`
+    /// until [`TickWriter::split_for_offload`] runs (item 44g).
+    spare_buffers: Option<std::sync::mpsc::Receiver<Buffer>>,
 }
 
 /// Pre-resolved refusal counters -- one handle per reason, per writer.
@@ -1954,6 +1961,8 @@ impl TickWriter {
                     offload: None,
                     rescue: None,
                     retained_spans: 0,
+                    flush_counters: TickFlushCounters::new(feed),
+                    spare_buffers: None,
                 }
             }
             Err(err) => {
@@ -1975,6 +1984,8 @@ impl TickWriter {
                     offload: None,
                     rescue: None,
                     retained_spans: 0,
+                    flush_counters: TickFlushCounters::new(feed),
+                    spare_buffers: None,
                 }
             }
         }
@@ -2014,6 +2025,8 @@ impl TickWriter {
             offload: None,
             rescue: None,
             retained_spans: 0,
+            flush_counters: TickFlushCounters::new(feed),
+            spare_buffers: None,
         }
     }
 
@@ -2175,7 +2188,7 @@ impl TickWriter {
                 "tick row could not be appended to the ILP buffer — LOST, counted on \
                  tv_ticks_dropped_total (the row never existed, so nothing spills)"
             );
-            metrics::counter!("tv_ticks_dropped_total", "feed" => self.feed.as_str()).increment(1);
+            self.flush_counters.append_dropped.increment(1);
         }
         outcome
     }
@@ -2207,7 +2220,23 @@ impl TickWriter {
             .symbol("segment", sanitize_ilp_symbol(row.segment).as_ref())
             .context("segment")?
             .symbol("feed", sanitize_ilp_symbol(feed).as_ref())
-            .context("feed")?
+            .context("feed")?;
+        // `contract` — the option's NAME (`NIFTY-25Sep2026-24500-CE`), from the
+        // SAME table the candle writer reads (operator 2026-09-22: "put either
+        // contract or symbol name right in each and every table"). One ArcSwap
+        // load + one hash probe per row, zero allocation: the name is borrowed
+        // out of the published snapshot and `sanitize_ilp_symbol` returns it
+        // borrowed unless it needs escaping. Written only when the table knows
+        // this exact `(security_id, segment)`; otherwise OMITTED, so the cell
+        // reads NULL — never a guessed name. It must sit among the symbols:
+        // ILP rejects a symbol after the first column.
+        let labels = crate::candle_contract_labels::candle_contract_labels();
+        if let Some(name) = labels.get(&(row.security_id, row.segment)) {
+            self.buffer
+                .symbol("contract", sanitize_ilp_symbol(name).as_ref())
+                .context("contract")?;
+        }
+        self.buffer
             .column_i64("security_id", row.security_id)
             .context("security_id")?
             .column_f64("ltp", row.ltp)
@@ -2251,11 +2280,6 @@ impl TickWriter {
             self.buffer
                 .column_i64("total_sell_qty", v)
                 .context("total_sell_qty")?;
-        }
-        if let Some(v) = row.exchange_timestamp {
-            self.buffer
-                .column_i64("exchange_timestamp", v)
-                .context("exchange_timestamp")?;
         }
         if let Some(v) = row.received_at_ist_nanos {
             self.buffer
@@ -2436,12 +2460,20 @@ impl TickWriter {
         mut self,
     ) -> (Self, TickWriterSink, std::sync::mpsc::Receiver<FlushBatch>) {
         let (tx, rx) = std::sync::mpsc::sync_channel(FLUSH_QUEUE_DEPTH);
+        // The return lane for spent buffers (item 44g). Same depth as the
+        // hand-off queue: there can never be more spares in flight than
+        // batches that produced them, and a full lane drops the spare rather
+        // than waiting.
+        let (spare_tx, spare_rx) = std::sync::mpsc::sync_channel(FLUSH_QUEUE_DEPTH);
         let sink = TickWriterSink {
             sender: self.sender.take(),
             feed: self.feed,
             spill_dir: self.spill_dir.clone(), // APPROVED: PathBuf moved into the offload writer, once per process at wiring
+            spare_return: Some(spare_tx),
+            counters: TickSinkCounters::new(self.feed),
         };
         self.offload = Some(tx);
+        self.spare_buffers = Some(spare_rx);
         (self, sink, rx)
     }
 
@@ -2521,11 +2553,11 @@ impl TickWriter {
                 self.pending = 0;
                 self.retained_spans = 0;
                 crate::wal_applied_watermark::applied_watermark().note_ticks_handed_off();
-                metrics::counter!(
-                    "tv_tick_flush_offloaded_total",
-                    "feed" => self.feed.as_str()
-                )
-                .increment(1);
+                self.flush_counters.offloaded.increment(1);
+                // Only NOW take a recycled spare: taking it before the send
+                // would drop it on the QueueFull arm, which puts the retained
+                // buffer back in place.
+                self.install_spare_buffer(protocol);
                 OffloadOutcome::Sent(rows)
             }
             Err(std::sync::mpsc::TrySendError::Full(returned)) => {
@@ -2535,11 +2567,7 @@ impl TickWriter {
                 // makes the bounded queue safe: without it a full queue would
                 // either block the drain (the original defect) or drop rows
                 // (a worse one).
-                metrics::counter!(
-                    "tv_tick_flush_queue_full_total",
-                    "feed" => self.feed.as_str()
-                )
-                .increment(1);
+                self.flush_counters.queue_full.increment(1);
                 let held = returned.buffer.as_bytes().len();
                 self.buffer = returned.buffer;
                 self.retained_spans = self.retained_spans.saturating_add(1);
@@ -2559,11 +2587,7 @@ impl TickWriter {
                 if self.retained_spans > MAX_RETAINED_FLUSH_SPANS
                     || held >= MAX_PRODUCER_BUFFER_BYTES
                 {
-                    metrics::counter!(
-                        "tv_tick_flush_width_capped_total",
-                        "feed" => self.feed.as_str()
-                    )
-                    .increment(1);
+                    self.flush_counters.width_capped.increment(1);
                     self.retained_spans = 0;
                     // Rescue rather than keep widening. Durable, counted, and
                     // re-ingestable — the same tier a failed flush uses.
@@ -2579,6 +2603,28 @@ impl TickWriter {
                 let dropped = self.discard_pending();
                 OffloadOutcome::SinkGone(dropped)
             }
+        }
+    }
+
+    /// Replaces the just-emptied buffer with a recycled spare from the writer
+    /// thread, when one is waiting (2026-09-22, item 44g).
+    ///
+    /// Called only after a hand-off SUCCEEDED, when `self.buffer` is the
+    /// zero-capacity `Buffer::new` the swap left behind (which never
+    /// allocated). Without this every batch regrew its ILP buffer from zero —
+    /// several reallocations per flush on the drain task. A spare of another
+    /// protocol version is dropped rather than used, because the next batch
+    /// must speak the protocol the sender negotiated. `try_recv`, never
+    /// `recv`: no spare simply means the next append allocates as before.
+    fn install_spare_buffer(&mut self, protocol: ProtocolVersion) {
+        let Some(spares) = self.spare_buffers.as_ref() else {
+            return;
+        };
+        if let Ok(mut spare) = spares.try_recv()
+            && spare.protocol_version() == protocol
+        {
+            spare.clear();
+            self.buffer = spare;
         }
     }
 
@@ -2642,16 +2688,13 @@ impl TickWriter {
             };
             match tx.try_send(batch) {
                 Ok(()) => {
-                    metrics::counter!(
-                        TICK_RESCUE_QUEUED_COUNTER,
-                        "feed" => self.feed.as_str()
-                    )
-                    .increment(dropped as u64);
+                    self.flush_counters.rescue_queued.increment(dropped as u64);
                     // Counted like a writer hand-off, so a replay confirm waits
                     // for the rescue thread too — a payload in THIS queue is
                     // not yet in any file.
                     crate::wal_applied_watermark::applied_watermark().note_ticks_handed_off();
                     self.pending = 0;
+                    self.install_spare_buffer(protocol);
                     return dropped;
                 }
                 Err(std::sync::mpsc::TrySendError::Full(returned)) => {
@@ -2659,21 +2702,11 @@ impl TickWriter {
                     // write inline below — slower, but nothing is lost and
                     // nothing is reported as lost.
                     self.buffer = returned.buffer;
-                    metrics::counter!(
-                        TICK_RESCUE_INLINE_FALLBACK_COUNTER,
-                        "feed" => self.feed.as_str(),
-                        "reason" => "queue_full"
-                    )
-                    .increment(1);
+                    self.flush_counters.rescue_fallback_queue_full.increment(1);
                 }
                 Err(std::sync::mpsc::TrySendError::Disconnected(returned)) => {
                     self.buffer = returned.buffer;
-                    metrics::counter!(
-                        TICK_RESCUE_INLINE_FALLBACK_COUNTER,
-                        "feed" => self.feed.as_str(),
-                        "reason" => "thread_gone"
-                    )
-                    .increment(1);
+                    self.flush_counters.rescue_fallback_thread_gone.increment(1);
                 }
             }
         }
@@ -2771,7 +2804,8 @@ fn perform_tick_rescue(spill_dir: &Path, payload: &[u8], feed: Feed, dropped: us
                 spill_error = %err,
                 "tick flush failed AND the spill rescue also failed — these ticks \
                  are permanently lost and nothing re-inserts them. The raw frames \
-                 remain in the write-ahead log for manual recovery."
+                 remain in the write-ahead log ONLY if it accepted them -- a non-zero \
+                 tv_dhan_ws_wal_dropped_total means the disk refused them there too."
             );
             false
         }
@@ -2991,6 +3025,69 @@ pub enum OffloadOutcome {
     SinkGone(usize),
 }
 
+/// Flush-path counter handles for the PRODUCER half, resolved once per writer
+/// (2026-09-22, item 44g).
+///
+/// Same mechanism as [`OutOfWindowCounters`]: a `feed` label taken from a
+/// variable drops the `metrics!` macro to its allocating arm (a fresh label
+/// vector plus a registry probe per call). The hand-off counter fired on EVERY
+/// flush, on the drain task, so it paid that cost ~twice a second per feed for
+/// nothing. Names and labels are exactly the ones the call sites used before.
+#[derive(Debug, Clone)]
+struct TickFlushCounters {
+    offloaded: metrics::Counter,
+    queue_full: metrics::Counter,
+    width_capped: metrics::Counter,
+    rescue_queued: metrics::Counter,
+    rescue_fallback_queue_full: metrics::Counter,
+    rescue_fallback_thread_gone: metrics::Counter,
+    /// `tv_ticks_dropped_total` on the ILP-append failure arm. Its seed stays
+    /// in [`register_drop_baseline`]; this is the same series, pre-resolved.
+    append_dropped: metrics::Counter,
+}
+
+impl TickFlushCounters {
+    fn new(feed: Feed) -> Self {
+        let feed = feed.as_str();
+        Self {
+            offloaded: metrics::counter!("tv_tick_flush_offloaded_total", "feed" => feed),
+            queue_full: metrics::counter!("tv_tick_flush_queue_full_total", "feed" => feed),
+            width_capped: metrics::counter!("tv_tick_flush_width_capped_total", "feed" => feed),
+            rescue_queued: metrics::counter!(TICK_RESCUE_QUEUED_COUNTER, "feed" => feed),
+            rescue_fallback_queue_full: metrics::counter!(
+                TICK_RESCUE_INLINE_FALLBACK_COUNTER,
+                "feed" => feed,
+                "reason" => "queue_full"
+            ),
+            rescue_fallback_thread_gone: metrics::counter!(
+                TICK_RESCUE_INLINE_FALLBACK_COUNTER,
+                "feed" => feed,
+                "reason" => "thread_gone"
+            ),
+            append_dropped: metrics::counter!("tv_ticks_dropped_total", "feed" => feed),
+        }
+    }
+}
+
+/// Rescue-arm counter handles for the writer-thread half (item 44g). The
+/// `dropped == spilled` pair keeps its meaning: both are incremented together
+/// on a landed rescue, `dropped` alone on a failed one.
+#[derive(Debug, Clone)]
+struct TickSinkCounters {
+    dropped: metrics::Counter,
+    spilled: metrics::Counter,
+}
+
+impl TickSinkCounters {
+    fn new(feed: Feed) -> Self {
+        let feed = feed.as_str();
+        Self {
+            dropped: metrics::counter!("tv_ticks_dropped_total", "feed" => feed),
+            spilled: metrics::counter!("tv_ticks_spilled_total", "feed" => feed),
+        }
+    }
+}
+
 /// The network half of a split [`TickWriter`] — owns the ILP `Sender`.
 ///
 /// Lives on its own OS thread. It never touches the aggregator, the ring, or
@@ -3001,6 +3098,10 @@ pub struct TickWriterSink {
     sender: Option<Sender>,
     feed: Feed,
     spill_dir: PathBuf,
+    /// Return lane for spent buffers — see [`TickWriterSink::return_spare_buffer`].
+    spare_return: Option<std::sync::mpsc::SyncSender<Buffer>>,
+    /// Rescue-arm counter handles, resolved once at the split (item 44g).
+    counters: TickSinkCounters,
 }
 
 impl TickWriterSink {
@@ -3022,7 +3123,36 @@ impl TickWriterSink {
         let wm = crate::wal_applied_watermark::applied_watermark();
         wm.note_ticks_completed();
         wm.persist_if_due_now();
+        self.return_spare_buffer(batch);
         landed
+    }
+
+    /// Hands the batch's spent buffer back to the producer for reuse
+    /// (2026-09-22, item 44g). Called by [`TickWriterSink::write`] once the
+    /// batch is done; `pub` only so the zero-allocation gate can drive the
+    /// return lane without a live QuestDB.
+    ///
+    /// Three refusals, each of which DROPS the buffer and never waits:
+    /// - capacity above [`MAX_PRODUCER_BUFFER_BYTES`] — a burst-sized buffer
+    ///   kept as a spare would pin that memory for the session;
+    /// - the return lane is full — the producer already has spares;
+    /// - the producer is gone — nobody to return to.
+    ///
+    /// The buffer is cleared before it leaves, so a spare can never carry a
+    /// row into the next batch.
+    pub fn return_spare_buffer(&self, batch: &mut FlushBatch) {
+        let Some(spare_return) = self.spare_return.as_ref() else {
+            return;
+        };
+        let protocol = batch.buffer.protocol_version();
+        // `Buffer::new` does not allocate (its `Vec` starts empty).
+        let mut spent = std::mem::replace(&mut batch.buffer, Buffer::new(protocol));
+        if spent.capacity() > MAX_PRODUCER_BUFFER_BYTES {
+            return;
+        }
+        spent.clear();
+        // Full or disconnected: the buffer is dropped here, never waited on.
+        let _dropped_if_refused = spare_return.try_send(spent);
     }
 
     fn write_inner(&mut self, batch: &mut FlushBatch) -> usize {
@@ -3125,10 +3255,8 @@ impl TickWriterSink {
         match spill_failed_ilp(&self.spill_dir, batch.buffer.as_bytes(), self.feed, now) {
             Ok(path) => {
                 note_rescue_outcome_ticks(true, (batch.min_seq, batch.max_seq), true);
-                metrics::counter!("tv_ticks_dropped_total", "feed" => self.feed.as_str())
-                    .increment(rows as u64);
-                metrics::counter!("tv_ticks_spilled_total", "feed" => self.feed.as_str())
-                    .increment(rows as u64);
+                self.counters.dropped.increment(rows as u64);
+                self.counters.spilled.increment(rows as u64);
                 error!(
                     code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                     feed = self.feed.as_str(),
@@ -3145,8 +3273,7 @@ impl TickWriterSink {
             }
             Err(err) => {
                 note_rescue_outcome_ticks(false, (batch.min_seq, batch.max_seq), true);
-                metrics::counter!("tv_ticks_dropped_total", "feed" => self.feed.as_str())
-                    .increment(rows as u64);
+                self.counters.dropped.increment(rows as u64);
                 error!(
                     code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                     feed = self.feed.as_str(),
@@ -3155,7 +3282,8 @@ impl TickWriterSink {
                     spill_error = %err,
                     "offloaded tick flush failed AND the spill rescue also failed — these \
                      ticks are permanently lost and nothing re-inserts them. The raw frames \
-                     remain in the write-ahead log for manual recovery."
+                     remain in the write-ahead log ONLY if it accepted them -- a non-zero \
+                 tv_dhan_ws_wal_dropped_total means the disk refused them there too."
                 );
             }
         }
@@ -3966,9 +4094,11 @@ mod tests {
         assert!(line.contains("capture_seq=42i"), "capture_seq: {line}");
         assert!(line.contains("volume=1234567i"), "volume: {line}");
         assert!(line.contains("oi=987654i"), "oi: {line}");
+        // The raw LTT column was removed 2026-09-22 (operator directive):
+        // the trade time is carried by the designated `ts` alone.
         assert!(
-            line.contains("exchange_timestamp=1779971400i"),
-            "ltt: {line}"
+            !line.contains("exchange_timestamp"),
+            "the removed raw-LTT column must never be written: {line}"
         );
         // Symbols must precede all field columns (ILP requirement).
         let first_field = line.find(" security_id=").expect("field section");
@@ -3984,11 +4114,13 @@ mod tests {
     /// rather than a misleading `0`.
     #[test]
     fn test_ticker_shape_row_omits_absent_columns_as_null() {
-        let mut tick = ParsedTick::default();
-        tick.security_id = 25;
-        tick.exchange_segment_code = 0;
-        tick.last_traded_price = 51_234.55;
-        tick.exchange_timestamp = 1_779_971_400;
+        let tick = ParsedTick {
+            security_id: 25,
+            exchange_segment_code: 0,
+            last_traded_price: 51_234.55,
+            exchange_timestamp: 1_779_971_400,
+            ..ParsedTick::default()
+        };
         let row = TickRow::from_parsed_tick(&tick, 9).expect("row");
         assert_eq!(row.open, None);
         assert_eq!(row.high, None);
@@ -4219,6 +4351,95 @@ mod tests {
                 "live DDL lacks {col} {ty} — schema drift"
             );
         }
+    }
+
+    /// `ticks.contract` carries the option's name from the published table,
+    /// and is OMITTED (NULL) — never guessed — when the table does not know the
+    /// exact `(security_id, segment)`. Both arms, one test, under the publish
+    /// lock because the table is process-global.
+    #[test]
+    fn ticks_carry_the_contract_name_only_when_the_table_knows_it() {
+        let _g = crate::candle_contract_labels::TEST_PUBLISH_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let row = sample_row();
+        let mut m = crate::candle_contract_labels::CandleContractLabels::new();
+        m.insert(
+            (row.security_id, row.segment),
+            std::sync::Arc::<str>::from("NIFTY-25Sep2026-24500-CE"),
+        );
+        // Same id on a DIFFERENT segment must not lend its name (I-P1-11).
+        m.insert(
+            (row.security_id + 1, row.segment),
+            std::sync::Arc::<str>::from("OTHER-CONTRACT"),
+        );
+        crate::candle_contract_labels::publish_candle_contract_labels(m);
+
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_row(&row).expect("append");
+        let line = w.buffer_utf8();
+        assert!(
+            line.contains(",contract=NIFTY-25Sep2026-24500-CE"),
+            "a known contract must carry its name: {line}"
+        );
+        let first_field = line.find(" security_id=").expect("field section");
+        assert!(
+            line.find(",contract=").expect("contract tag") < first_field,
+            "contract is a SYMBOL and must precede every column: {line}"
+        );
+
+        crate::candle_contract_labels::publish_candle_contract_labels(
+            crate::candle_contract_labels::CandleContractLabels::new(),
+        );
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_row(&row).expect("append");
+        let line = w.buffer_utf8();
+        assert!(
+            !line.contains("contract="),
+            "an unknown contract must be NULL, never a guess: {line}"
+        );
+    }
+
+    /// The operator's 2026-09-22 (THIRD) layout: `received_at` is the FIRST
+    /// column, `ts` the SECOND, and the raw-LTT `exchange_timestamp` column is
+    /// gone — pinned in BOTH the boot DDL and the init script, which must agree.
+    #[test]
+    fn ticks_lead_with_received_at_then_ts_and_carry_no_raw_ltt_column() {
+        let script = std::fs::read_to_string(workspace_root().join("scripts/questdb-init.sh"))
+            .expect("init script");
+        let live = script
+            .split("CREATE TABLE IF NOT EXISTS ticks ")
+            .nth(1)
+            .and_then(|s| s.split('\n').next())
+            .expect("live ticks CREATE")
+            .to_string();
+        for (label, ddl) in [("boot DDL", ticks_create_ddl()), ("init script", live)] {
+            let body = ddl.split('(').nth(1).expect("column list");
+            let cols: Vec<&str> = body
+                .split(',')
+                .map(|c| c.split_whitespace().next().unwrap_or(""))
+                .collect();
+            assert_eq!(
+                cols.first(),
+                Some(&"received_at"),
+                "{label}: received_at must be first: {ddl}"
+            );
+            assert_eq!(
+                cols.get(1),
+                Some(&"ts"),
+                "{label}: ts must be second: {ddl}"
+            );
+            assert!(
+                !ddl.contains("exchange_timestamp"),
+                "{label}: the removed raw-LTT column is back: {ddl}"
+            );
+        }
+        assert!(
+            !TICKS_COLUMNS
+                .iter()
+                .any(|(c, _)| *c == "exchange_timestamp"),
+            "the self-heal must never re-add the removed column"
+        );
     }
 
     #[test]
@@ -4512,6 +4733,166 @@ mod tests {
                 >= 1,
             "the rows must be DURABLE on disk — capping width may never mean \
              dropping rows"
+        );
+    }
+
+    // ---- buffer recycling (2026-09-22, item 44g) -------------------------
+
+    /// A spent batch with a real, non-zero capacity, for the recycle tests.
+    fn spent_batch(capacity: usize) -> FlushBatch {
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        buffer.reserve(capacity);
+        FlushBatch {
+            buffer,
+            rows: 0,
+            min_seq: 0,
+            max_seq: 0,
+        }
+    }
+
+    #[test]
+    fn a_written_buffer_round_trips_back_to_the_producer_empty() {
+        let dir = scratch_dir("recycle-round-trip");
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_tick_with_seq(&sample_tick(), 1).expect("append");
+        let (mut producer, mut sink, rx) = w.split_for_offload();
+        sink.spill_dir = dir;
+        producer.flush().expect("hand off");
+
+        let mut batch = rx.try_recv().expect("batch queued");
+        let spent_capacity = batch.buffer.capacity();
+        assert!(spent_capacity > 0, "a batch that held a row has capacity");
+        // `write` rescues (no sender in for_test) and then returns the buffer.
+        let _landed = sink.write(&mut batch);
+
+        producer
+            .append_tick_with_seq(&sample_tick(), 2)
+            .expect("append");
+        producer.flush().expect("second hand-off");
+        assert_eq!(
+            producer.buffer.capacity(),
+            spent_capacity,
+            "the next batch must reuse the spent buffer, not regrow from zero"
+        );
+        assert!(
+            producer.buffer.as_bytes().is_empty(),
+            "a recycled buffer must arrive EMPTY — a leftover row would be \
+             written twice"
+        );
+    }
+
+    #[test]
+    fn return_spare_buffer_drops_every_buffer_it_must_not_return() {
+        // (case, capacity, pre-fill the lane, drop the producer, expect spares)
+        let cases: [(&str, usize, bool, bool, usize); 4] = [
+            ("normal buffer is returned", 1024, false, false, 1),
+            (
+                "oversized buffer is never returned",
+                MAX_PRODUCER_BUFFER_BYTES + 1,
+                false,
+                false,
+                0,
+            ),
+            (
+                "full lane drops the spare",
+                1024,
+                true,
+                false,
+                FLUSH_QUEUE_DEPTH,
+            ),
+            ("gone producer drops the spare", 1024, false, true, 0),
+        ];
+        for (case, capacity, prefill, drop_producer, expect) in cases {
+            let (producer, sink, _rx) = TickWriter::for_test(Feed::Dhan).split_for_offload();
+            if prefill {
+                for _ in 0..FLUSH_QUEUE_DEPTH {
+                    sink.return_spare_buffer(&mut spent_batch(16));
+                }
+            }
+            let spares = if drop_producer {
+                drop(producer);
+                None
+            } else {
+                Some(producer)
+            };
+
+            let mut batch = spent_batch(capacity);
+            // Must return — never block — in every case.
+            sink.return_spare_buffer(&mut batch);
+
+            assert_eq!(
+                batch.buffer.capacity(),
+                0,
+                "{case}: the spent buffer always leaves the batch"
+            );
+            if let Some(p) = spares {
+                let lane = p.spare_buffers.as_ref().expect("split opens the lane");
+                let mut got = 0;
+                while let Ok(spare) = lane.try_recv() {
+                    assert!(spare.as_bytes().is_empty(), "{case}: spares are empty");
+                    assert!(
+                        spare.capacity() <= MAX_PRODUCER_BUFFER_BYTES,
+                        "{case}: no spare may exceed the producer bound"
+                    );
+                    got += 1;
+                }
+                assert_eq!(got, expect, "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_spare_of_another_protocol_is_never_installed() {
+        let (mut producer, sink, _rx) = TickWriter::for_test(Feed::Dhan).split_for_offload();
+        let mut foreign = Buffer::new(ProtocolVersion::V2);
+        foreign.reserve(4096);
+        sink.spare_return
+            .as_ref()
+            .expect("split opens the lane")
+            .try_send(foreign)
+            .expect("lane has room");
+
+        producer
+            .append_tick_with_seq(&sample_tick(), 1)
+            .expect("append");
+        producer.flush().expect("hand off");
+
+        assert_eq!(
+            producer.buffer.protocol_version(),
+            ProtocolVersion::V1,
+            "the next batch must speak the protocol the sender negotiated"
+        );
+        assert_eq!(
+            producer.buffer.capacity(),
+            0,
+            "the foreign spare was dropped"
+        );
+    }
+
+    #[test]
+    fn a_full_queue_does_not_swallow_a_waiting_spare() {
+        // The spare is taken only AFTER a successful hand-off. On the Full arm
+        // the retained buffer comes back into the producer; a spare taken
+        // earlier would have been silently dropped.
+        let (mut producer, sink, _rx) = TickWriter::for_test(Feed::Dhan).split_for_offload();
+        for i in 0..FLUSH_QUEUE_DEPTH {
+            let seq = 1 + i64::try_from(i).expect("loop bound fits i64");
+            producer
+                .append_tick_with_seq(&sample_tick(), seq)
+                .expect("append");
+            producer.flush().expect("fills the queue");
+        }
+        // Drain whatever spares the fills could have taken (none: lane empty).
+        sink.return_spare_buffer(&mut spent_batch(512));
+        producer
+            .append_tick_with_seq(&sample_tick(), 99)
+            .expect("append");
+        producer.flush().expect("backpressure is not a failure");
+        assert_eq!(producer.pending(), 1, "the row is retained");
+        let lane = producer.spare_buffers.as_ref().expect("lane");
+        assert!(
+            lane.try_recv().is_ok(),
+            "the spare must still be waiting — the Full arm must not take it"
         );
     }
 
@@ -5002,18 +5383,19 @@ mod tests {
     }
 
     #[test]
-    fn a_sentinel_row_keeps_its_raw_ltt_and_its_order_book() {
+    fn a_sentinel_row_is_stamped_at_receipt_and_keeps_its_order_book() {
         // The whole reason these rows are kept rather than dropped: they carry
         // a live book. This drives the REAL row builder and asserts the row is
-        // now findable in the live time range while losing NOTHING -- the raw
-        // sentinel survives in its own column, so "never traded" is still
-        // recoverable.
+        // findable in the live time range. The raw sentinel column is gone
+        // (2026-09-22); "never traded" stays recoverable because the row's
+        // `ts` is EXACTLY its receipt instant, which a real whole-second trade
+        // time never is -- `WHERE ts = received_at` in SQL.
         let mut tick = sample_tick();
         tick.exchange_timestamp = SENTINEL_LTT;
         tick.last_traded_price = 0.0;
         tick.total_buy_quantity = 8_397_000;
         tick.total_sell_quantity = 9_019_000;
-        tick.received_at_nanos = 1_787_300_000_000_000_000;
+        tick.received_at_nanos = 1_787_300_000_123_456_789;
 
         let row = TickRow::from_parsed_tick(&tick, 1).expect("a sentinel tick still builds a row");
 
@@ -5023,9 +5405,16 @@ mod tests {
             "the row must no longer be stamped into the 1980 partition"
         );
         assert_eq!(
-            row.exchange_timestamp,
-            Some(i64::from(SENTINEL_LTT)),
-            "the raw sentinel is preserved — nothing is destroyed"
+            Some(row.ts_ist_nanos),
+            row.received_at_ist_nanos,
+            "a sentinel row's ts IS its receipt instant, which is what makes it \
+             recoverable in SQL without the removed raw-LTT column"
+        );
+        assert_ne!(
+            row.ts_ist_nanos % 1_000_000_000,
+            0,
+            "the receipt carries nanoseconds, so it can never be mistaken for a \
+             whole-second trade time"
         );
         assert_eq!(row.total_buy_qty, Some(8_397_000), "the book survives");
         assert_eq!(row.total_sell_qty, Some(9_019_000), "the book survives");

@@ -189,7 +189,7 @@ pub struct ConsumeStats {
     /// `true` when the tick was refused before any state was touched because
     /// its price was `NaN` / `±Inf` / non-positive. Nothing was folded.
     pub refused_price: bool,
-    /// `true` when the tick fell outside the `[09:15, 15:40)` IST candle
+    /// `true` when the tick fell outside the `[09:00, 15:40)` IST candle
     /// window. Nothing was folded.
     pub out_of_session: bool,
     /// `true` when the vendor stamped this tick for a LATER IST day than our
@@ -298,6 +298,24 @@ pub struct ConsumeStats {
     /// "did not capture". Only the FOLD is skipped, because folding it is what
     /// fabricates a bar on a day that already closed.
     pub stale_trading_day: bool,
+    /// QUALIFIER, not a refusal of its own (2026-09-23): `true` when the
+    /// `stale_trading_day` or `future_trading_day` flag above was raised by
+    /// the RECEIPT-clock comparison — the exchange day is not the day OUR
+    /// machine received the tick on. `false` when `stale_trading_day` came
+    /// from the WATERMARK comparison instead (an older day than a tick we
+    /// already folded).
+    ///
+    /// The two are different facts and a WAL replay must not confuse them.
+    /// A receipt-day mismatch is refused by the operator's 2026-09-10
+    /// directive (`websocket-connection-scope-lock.md`, "A TICK WHOSE
+    /// EXCHANGE DAY IS NOT THE RECEIPT DAY IS REFUSED OUTRIGHT") — replaying it
+    /// reaches exactly the verdict the live feed reached, so it is not loss. A
+    /// watermark refusal of a replayed frame can be a genuinely captured tick
+    /// from an earlier session, and that one IS loss and must still page.
+    ///
+    /// Deliberately excluded from [`Self::folded`]: it never occurs without
+    /// one of the two refusal flags, which already make `folded()` false.
+    pub receipt_day_mismatch: bool,
 }
 
 impl ConsumeStats {
@@ -1147,6 +1165,7 @@ impl MultiTfAggregator {
                     .increment(1);
                 return ConsumeStats {
                     future_trading_day: true,
+                    receipt_day_mismatch: true,
                     ..ConsumeStats::default()
                 };
             }
@@ -1184,6 +1203,7 @@ impl MultiTfAggregator {
                     .increment(1);
                 return ConsumeStats {
                     stale_trading_day: true,
+                    receipt_day_mismatch: true,
                     ..ConsumeStats::default()
                 };
             }
@@ -1229,10 +1249,14 @@ impl MultiTfAggregator {
             };
         }
 
-        // Candle-window gate. The bucket grid is 09:15-ANCHORED
-        // (`TfIndex::bucket_start` clamps an earlier timestamp to the first
-        // bucket), so a pre-open tick that slipped past this gate would not
-        // form a pre-open candle — it would CORRUPT the 09:15 candle.
+        // Candle-window gate. The bucket grid is anchored at 09:00 (the
+        // CANDLE session open, `CANDLE_SESSION_OPEN_SECS_OF_DAY_IST` — so M60
+        // runs 09:00/10:00/…, not 09:15/10:15/…), and `TfIndex::bucket_start`
+        // clamps anything earlier into the first bucket; this gate is what
+        // keeps a tick before 09:00 from corrupting that first bucket.
+        // (Until 2026-09-22 this line said "09:15-ANCHORED … would CORRUPT
+        // the 09:15 candle", which described the pre-2026-08-28 grid — see
+        // the note below.)
         // 2026-08-28: gated on the FOLD clock, so the window a tick is
         // admitted to is the same window its bucket will be placed in. Gating
         // on one clock and bucketing on the other admits a tick the grid then
@@ -4224,6 +4248,7 @@ mod tests {
             refused_timestamp: _,
             untraded_sentinel: _,
             stale_trading_day: _,
+            receipt_day_mismatch: _,
             future_trading_day: _,
             untraded_timestamp: _,
             out_of_band_timestamp: _,
@@ -6196,6 +6221,59 @@ mod day_gate_permutation_sweep {
         assert!(
             agg.lookup(Feed::Dhan, 66_422, SEG_IDX).is_none(),
             "and it must not take a slot"
+        );
+    }
+
+    /// `receipt_day_mismatch` separates the two ways `stale_trading_day` is
+    /// raised, and a WAL replay depends on the difference (2026-09-23).
+    ///
+    /// The morning replay on 2026-09-23 counted 4 ticks as LOST and paged
+    /// `WS-SPILL-01`. All 4 were connect snapshots whose trade date was the
+    /// previous session while the receipt was today — the receipt-clock arm,
+    /// the operator's 2026-09-10 rule, the same verdict the live feed reaches.
+    /// A tick received on the day it traded and replayed the NEXT morning is
+    /// different: it is refused by the watermark, it is real captured data, and
+    /// it must still read as loss. One flag, three arms, all pinned here.
+    #[test]
+    fn receipt_day_mismatch_is_set_by_the_receipt_arms_and_never_by_the_watermark() {
+        // Receipt-clock STALE: traded yesterday, received today.
+        let mut agg = MultiTfAggregator::default();
+        let yesterday_1529 = DAY - 86_400 + 15 * 3_600 + 29 * 60;
+        let mut stale = tick(66_422, SEG_IDX, yesterday_1529, 142.50, 12_000);
+        stale.received_at_nanos = receipt_at_ist(i64::from(TODAY_0916));
+        let stats = agg.consume_tick(Feed::Dhan, &stale, None, |_, _, _, _, _| {});
+        assert!(stats.stale_trading_day && stats.receipt_day_mismatch);
+
+        // Receipt-clock FUTURE: stamped tomorrow, received today.
+        let mut agg = MultiTfAggregator::default();
+        let mut future = tick(13, SEG_IDX, TODAY_0916 + 86_400, 100.0, 1);
+        future.received_at_nanos = receipt_at_ist(i64::from(TODAY_0916));
+        let stats = agg.consume_tick(Feed::Dhan, &future, None, |_, _, _, _, _| {});
+        assert!(stats.future_trading_day && stats.receipt_day_mismatch);
+
+        // WATERMARK stale: a fresh tick today moves the watermark; then a tick
+        // that traded AND was received yesterday arrives (a replayed frame).
+        // Its receipt matches its trade day, so the receipt arm passes it and
+        // the watermark refuses it — and this one is real data.
+        let mut agg = MultiTfAggregator::default();
+        let mut today = tick(13, SEG_IDX, TODAY_0916, 100.0, 1);
+        today.received_at_nanos = receipt_at_ist(i64::from(TODAY_0916));
+        let first = agg.consume_tick(Feed::Dhan, &today, None, |_, _, _, _, _| {});
+        assert!(
+            first.folded(),
+            "fixture: today's tick must fold and set the watermark"
+        );
+        let mut replayed = tick(13, SEG_IDX, yesterday_1529, 99.0, 1);
+        replayed.received_at_nanos = receipt_at_ist(i64::from(yesterday_1529));
+        let stats = agg.consume_tick(Feed::Dhan, &replayed, None, |_, _, _, _, _| {});
+        assert!(
+            stats.stale_trading_day,
+            "fixture: the watermark arm must be what refuses this tick"
+        );
+        assert!(
+            !stats.receipt_day_mismatch,
+            "a tick received on the day it traded is NOT a receipt-day mismatch — \
+             marking it would let a replay report real lost data as by-design"
         );
     }
 

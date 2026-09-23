@@ -2639,6 +2639,8 @@ mod tests {
                 // renumbered — M30 and M60 now sit at 7 and 8.
                 TfIndex::M30,
                 TfIndex::M60,
+                // 2026-09-22: M10 appended at ordinal 9 (no views anywhere).
+                TfIndex::M10,
             ],
             "one 1m bar must open exactly the minute-scale frames above 1m"
         );
@@ -2758,8 +2760,7 @@ mod tests {
         // whole-session bucket that no surviving frame produces.
         let last_m60 = sealed
             .iter()
-            .filter(|s| s.tf == TfIndex::M60)
-            .next_back()
+            .rfind(|s| s.tf == TfIndex::M60)
             .expect("the widest frame must seal at close");
         assert_eq!(last_m60.bucket.close, 200.5);
         assert_eq!(last_m60.bucket.volume, 2);

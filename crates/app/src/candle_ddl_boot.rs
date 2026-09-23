@@ -11,8 +11,9 @@
 //! - [`tickvault_storage::shadow_persistence::ensure_shadow_candle_tables`]
 //!   — `CREATE TABLE IF NOT EXISTS candles_<tf>` + `DEDUP ENABLE UPSERT
 //!   KEYS` for all 21 Engine-B candle tables.
-//! - [`tickvault_storage::console_views::ensure_named_views`] — the
-//!   read-only analyst console views.
+//! - [`tickvault_storage::console_views::drop_retired_views`] — removes
+//!   every console view this repository ever created (2026-09-22: the app
+//!   creates NO view; `candles_10m` is a real table).
 //!
 //! Meanwhile the REST-era bar-fold (`rest_candle_fold`) KEPT writing the
 //! `candles_*` tables through the shared seal-writer chain. On a FRESH
@@ -23,8 +24,8 @@
 //! boot path ran the ensure DDL anymore.
 //!
 //! This module re-homes the old main.rs wiring (pre-#1522 order:
-//! readiness → `drop_legacy_candle_objects` → `ensure_shadow_candle_tables`
-//! → `ensure_named_views`) behind a bounded QUIET readiness probe (the
+//! readiness → `drop_retired_views` → `drop_legacy_candle_objects` →
+//! `ensure_shadow_candle_tables`) behind a bounded QUIET readiness probe (the
 //! `index_constituency_boot` ts-pin precedent — 12 × 5s via
 //! `shared_probe_client`, never the paging BOOT-01/02 `wait_for_questdb_ready`).
 //!
@@ -58,7 +59,7 @@ pub const CANDLE_ENSURE_BACKOFF_SECS: u64 = 5;
 /// Seconds between readiness probe attempts.
 pub const CANDLE_DDL_READINESS_BACKOFF_SECS: u64 = 5;
 
-/// Run the retired-object sweep + candle-table ensure DDL + named views,
+/// Run the retired-view drop + retired-object sweep + candle-table ensure DDL,
 /// gated on a bounded quiet readiness probe.
 ///
 /// Degrade-safe, never blocks boot indefinitely:
@@ -121,10 +122,22 @@ pub async fn run_candle_ddl_at_boot(questdb: &QuestDbConfig) {
         return;
     }
 
+    // 2026-09-22 — the ONE-SHOT fresh-start reset (`2026-09-19-fresh-start`,
+    // scope lock "THIS TIME ALONE"). FIRST, before every other DDL: it drops
+    // the allowlisted tables and views, and everything below recreates them
+    // on the new schema in this same boot. `build_shared_infra` awaits this
+    // fn before the feed stack spawns, so no writer is live during the drops.
+    // After the id is logged this is one count query per boot, forever.
+    tickvault_storage::fresh_start_reset::run_fresh_start_reset_at_boot(questdb).await;
+
+    // 2026-09-22 (SECOND) — NO VIEWS ANYWHERE. Drop every retired console view
+    // BEFORE any table DDL: a surviving `candles_10m` VIEW occupies the name the
+    // `candles_10m` TABLE needs, and the CREATE below would be refused on it.
+    tickvault_storage::console_views::drop_retired_views(questdb).await;
+
     // Order is load-bearing (the pre-#1522 main.rs contract): the drop
     // sweep must free any legacy matview squatting a `candles_<tf>` name
-    // BEFORE the CREATE TABLE loop, and the named views validate their
-    // column references against the ensured tables.
+    // BEFORE the CREATE TABLE loop.
     tickvault_storage::shadow_persistence::drop_legacy_candle_objects(questdb).await;
 
     // 2026-09-18 operator directive — the fifteen non-emitting candle tables are
@@ -185,10 +198,9 @@ pub async fn run_candle_ddl_at_boot(questdb: &QuestDbConfig) {
         );
     }
 
-    tickvault_storage::console_views::ensure_named_views(questdb).await;
     info!(
         keyed,
-        "candle DDL boot complete — retired-object sweep + candle ensure attempted + named views"
+        "candle DDL boot complete — retired views dropped + retired-object sweep + candle ensure attempted"
     );
 }
 
@@ -203,9 +215,8 @@ pub const LIVE_TABLE_DDL_ATTEMPTS: u32 = 6;
 /// Seconds between `ticks` / `market_depth` DDL attempts.
 pub const LIVE_TABLE_DDL_BACKOFF_SECS: u64 = 5;
 
-/// Ensure the three LIVE-writer tables — `ticks`, `market_depth` and
-/// `top_volume_rank` — with
-/// their DEDUP keys, retrying a refusal instead of running the session on
+/// Ensure the LIVE-writer tables — `ticks`, `market_depth` and the four
+/// direct `top_volume_<tf>` tables (since 2026-09-22) — with their DEDUP keys, retrying a refusal instead of running the session on
 /// whatever ILP auto-creates.
 ///
 /// # Why a retry, when the candle DDL above gets one probe and one shot
@@ -226,78 +237,30 @@ pub const LIVE_TABLE_DDL_BACKOFF_SECS: u64 = 5;
 /// already-accepted table is free: every statement is `IF NOT EXISTS` or an
 /// idempotent `DEDUP ENABLE`.
 ///
-/// Returns `true` when all three tables were ensured on some attempt. On
+/// Returns `true` when every live table was ensured on some attempt. On
 /// exhaustion it returns `false` after a coded `error!` naming the
 /// consequence — never a panic, and never a silent continue.
 // TEST-EXEMPT: network I/O orchestration — the retry bound is unit-tested below, the give-up path is exercised against an unreachable port, and the boot call site is pinned by crates/app/tests/ensure_ddl_boot_wiring_guard.rs.
 pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
-    let mut views_reensured = false;
     for attempt in 1..=LIVE_TABLE_DDL_ATTEMPTS {
         let ticks_ok = tickvault_storage::tick_persistence::ensure_ticks_table(questdb).await;
         let depth_ok =
             tickvault_storage::depth_persistence::ensure_market_depth_table(questdb).await;
-        // top_volume_rank — the 1s/3s/5s/1m volume-ranking snapshot table
-        // (2026-09-06). Its offload writer appends every second from the
-        // first ranking sweep; until 2026-09-08 NOTHING ensured the table,
-        // so on a fresh volume the first ILP row would have auto-created it
-        // with no DEDUP key (`ts, tf, family, feed, security_id, segment`)
-        // and every replayed or re-flushed snapshot would have duplicated.
-        let rank_ok =
-            tickvault_storage::top_volume_rank_persistence::ensure_top_volume_rank_table(questdb)
-                .await;
-        // Re-ensure the named views as soon as the RANK TABLE exists — gated on
-        // `rank_ok` ALONE, never on the other two.
-        //
-        // ⚠ This sat inside `if ticks_ok && depth_ok && rank_ok` until
-        // 2026-09-13, and that made the re-ensure hostage to two UNRELATED
-        // tables. A `ticks` or `market_depth` DDL that failed all
-        // LIVE_TABLE_DDL_ATTEMPTS would skip the view pass even though
-        // `top_volume` had been created successfully — so on a fresh volume the
-        // four `top_volume_*` views would stay ABSENT for the whole session,
-        // which is precisely the failure this re-ensure was added to fix. The
-        // same held when `rank_ok` was false only because the idempotent
-        // `DEDUP ENABLE` was refused after the CREATE had already succeeded.
-        //
-        // Coupling a fix to conditions it does not depend on is how a remedy
-        // becomes unavailable in the case it was written for.
-        if rank_ok && !views_reensured {
-            // ONCE per boot, not once per attempt. Decoupling the pass from
-            // `ticks_ok`/`depth_ok` means it can now be reached on an attempt
-            // that goes on to retry, and the statements are idempotent but not
-            // free — six DROP-and-recreate passes on a boot whose `ticks` DDL
-            // is failing would be noise in the one log an operator reads while
-            // diagnosing that failure.
-            views_reensured = true;
-            // Re-ensure the named views now that `top_volume_rank` EXISTS.
-            //
-            // `run_candle_ddl_at_boot` already ran `ensure_named_views`, and it
-            // runs FIRST — before this function creates `top_volume_rank`. So on
-            // any boot where that table was absent (a fresh volume, or the
-            // 2026-09-08 nuke) the two per-cadence views
-            // `top_volume_rank_1s` / `top_volume_rank_5s` referenced a table
-            // that did not yet exist, their DDL warn-failed, and nothing retried
-            // it in-boot: the base table then filled all session while
-            // `SELECT * FROM top_volume_rank_1s` answered "table does not
-            // exist". The operator's own words for this table were *"only using
-            // db i can see this"*, so the views failing is the failure mode he
-            // would actually meet.
-            //
-            // Re-ensuring rather than MOVING the first call is deliberate: the
-            // candle ordering above is load-bearing (the legacy-matview drop
-            // sweep must precede the CREATE TABLE loop, and the candle views
-            // validate against those tables), and every statement here is
-            // `CREATE OR REPLACE`, so a second pass on an already-correct view
-            // is free. Additive beats re-ordering on a boot path.
-            tickvault_storage::console_views::ensure_named_views(questdb).await;
-        }
-        if ticks_ok && depth_ok && rank_ok {
+        // The four direct `top_volume_<tf>` tables (2026-09-22; before that ONE
+        // `top_volume` table viewed four ways). Their offload writer appends
+        // from the first ranking sweep, so an un-ensured table would be
+        // ILP-auto-created with no DEDUP key (`ts, tf, family, feed,
+        // security_id, segment`) and every replayed snapshot would duplicate.
+        let volume_ok =
+            tickvault_storage::top_volume_rank_persistence::ensure_top_volume_tables(questdb).await;
+        // 2026-09-22 (SECOND): no view re-ensure here any more. The app
+        // creates NO view; the retired ones are dropped once, before any table
+        // DDL, by `run_candle_ddl_at_boot`.
+        if ticks_ok && depth_ok && volume_ok {
             info!(
                 attempt,
                 "live-table DDL boot complete — ticks (5-key DEDUP) + market_depth \
-                 (depth_kind DEDUP) + top_volume_rank (6-key DEDUP) ensured. The named \
-                 views were then RE-ATTEMPTED against the now-existing rank table; \
-                 that call reports its own outcome per view and returns nothing, so \
-                 this line claims the attempt, never its success."
+                 (depth_kind DEDUP) + top_volume_1s/3s/5s/1m (6-key DEDUP each) ensured."
             );
             return true;
         }
@@ -307,7 +270,7 @@ pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
                 attempts = LIVE_TABLE_DDL_ATTEMPTS,
                 ticks_ok,
                 depth_ok,
-                rank_ok,
+                volume_ok,
                 backoff_secs = LIVE_TABLE_DDL_BACKOFF_SECS,
                 "live-table DDL refused — retrying so the session does not run on an \
                  ILP-auto-created table with the DEDUP key missing"
@@ -319,7 +282,7 @@ pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
         code = tickvault_common::error_code::ErrorCode::HotPath02WriterQueueDrop.code_str(),
         attempts = LIVE_TABLE_DDL_ATTEMPTS,
         backoff_secs = LIVE_TABLE_DDL_BACKOFF_SECS,
-        "live-table DDL boot EXHAUSTED — ticks, market_depth and/or top_volume_rank could not be \
+        "live-table DDL boot EXHAUSTED — ticks, market_depth and/or a top_volume_<tf> table could not be \
          ensured. Consequence: the first ILP write may auto-create the table \
          WITHOUT its DEDUP key — a replay then duplicates ticks and the two depth \
          pools overwrite each other's levels — until a later boot's ensure succeeds. \

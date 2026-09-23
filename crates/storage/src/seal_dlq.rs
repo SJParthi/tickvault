@@ -9,7 +9,7 @@
 //! - **Recoverable text**. The binary spill file is exact + compact
 //!   but operator-opaque. Once we are routing seals to the DLQ the
 //!   normal pipeline is already broken; the operator needs to be
-//!   able to `cat data/dlq/seals-YYYY-MM-DD.ndjson | jq` to inspect
+//!   able to `cat data/dlq/seals_v4-YYYY-MM-DD.ndjson | jq` to inspect
 //!   what was lost. NDJSON is the canonical text-streaming format
 //!   matching the existing `data/logs/errors.jsonl.*` rotation.
 //! - **Append-only single-line records.** A partial trailing line on
@@ -28,7 +28,7 @@
 //!   without re-deriving the trading-side `BufferedSeal`.
 //! - [`SealDlqWriter`] — append-only NDJSON file writer with the
 //!   exact `seal_spill.rs` API surface:
-//!   - IST-date file rotation (`seals-2026-05-10.ndjson`).
+//!   - IST-date file rotation (`seals_v4-2026-05-10.ndjson`).
 //!   - `append_record()` (one line per call).
 //!   - `read_all()` recovery scan that silently drops corrupt
 //!     lines with `warn!` so a single bad line does NOT stall replay.
@@ -57,7 +57,7 @@ use tracing::{info, warn};
 use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
 use tickvault_common::feed::Feed;
 
-use crate::seal_spill::SerializedSeal;
+use crate::seal_spill::{SEAL_SPILL_FORMAT_VERSION, SerializedSeal};
 
 /// Production DLQ directory — sibling of `data/spill/` so operators
 /// looking at `data/` see all three absorption tiers next to each
@@ -71,7 +71,8 @@ const SEAL_DLQ_DIR: &str = "data/dlq";
 ///
 /// Field-by-field correspondence with `SerializedSeal`:
 /// - `security_id`, `exchange_segment_code` — composite key (I-P1-11).
-/// - `tf_ordinal` — `TfIndex::as_ordinal()` (0..=20).
+/// - `tf_ordinal` — `TfIndex::as_ordinal()` (0..`TF_COUNT`; nine frames since
+///   2026-09-19). Its MEANING depends on `format_version` — see that field.
 /// - `bucket_start_ist_secs`, `tick_count`, `volume`,
 ///   `bucket_start_cumulative`, `oi`, `open`, `high`, `low`, `close`
 ///   — `LiveCandleState` payload.
@@ -84,6 +85,22 @@ const SEAL_DLQ_DIR: &str = "data/dlq";
 // path, so a `Clone`-only record is fine — every conversion uses `&self`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SealDlqRecord {
+    /// The seal-record format this line was written under — the SAME number
+    /// as byte 7 of a binary spill record, [`SEAL_SPILL_FORMAT_VERSION`],
+    /// because the two tiers carry the same `tf_ordinal` space.
+    ///
+    /// Added 2026-09-22. Until then the DLQ carried NO version at all, so a
+    /// line written under the 24-frame ordinal space (before 2026-09-19)
+    /// decoded silently into the nine-frame space: `tf_ordinal` 5 was `S1`
+    /// and is now `M30`, so a one-second bar was re-ingested as a thirty-minute
+    /// bar with nothing in any log to say so. The binary spill had a version
+    /// byte for exactly this reason; the NDJSON sibling never did.
+    ///
+    /// `#[serde(default)]` makes every pre-2026-09-22 line read as `0`, which
+    /// is below every real version, so readers REFUSE it — the only safe
+    /// reading of a record whose ordinal space cannot be known.
+    #[serde(default)]
+    pub format_version: u8,
     // `u64` (2026-06-29 widening) — the seal DLQ carries BOTH Dhan (≤u32) and
     // Groww (bit-62 index ids > u32) seals; NDJSON round-trips u64 natively.
     #[serde(default)]
@@ -159,6 +176,10 @@ impl From<&SerializedSeal> for SealDlqRecord {
     #[inline]
     fn from(s: &SerializedSeal) -> Self {
         Self {
+            // Stamped on EVERY write, so every line this build produces is
+            // readable by this build and refused by any build whose ordinal
+            // space differs.
+            format_version: SEAL_SPILL_FORMAT_VERSION,
             security_id: s.security_id,
             exchange_segment_code: s.exchange_segment_code,
             // Round-trip feed provenance through the DLQ NDJSON.
@@ -217,7 +238,7 @@ impl From<&SealDlqRecord> for SerializedSeal {
     }
 }
 
-/// Returns today's IST date in `seals-YYYY-MM-DD.ndjson` form for the
+/// Returns today's IST date in `seals_v4-YYYY-MM-DD.ndjson` form for the
 /// DLQ filename. Pure function for testability (clock injected by
 /// caller in tests). Mirrors `seal_spill::ist_date_filename` but with
 /// the `.ndjson` suffix.
@@ -228,7 +249,7 @@ fn ist_date_filename(now_unix_secs: i64) -> String {
         .timestamp_opt(ist_secs, 0)
         .single()
         .unwrap_or_else(|| Utc.timestamp_opt(0, 0).single().unwrap_or_default());
-    dt.format("seals-%Y-%m-%d.ndjson").to_string()
+    dt.format("seals_v4-%Y-%m-%d.ndjson").to_string()
 }
 
 /// Append-only NDJSON DLQ writer. One instance lives in the writer
@@ -315,6 +336,7 @@ impl SealDlqWriter {
             .with_context(|| format!("failed to open dlq file {path:?}"))?;
         let reader = BufReader::new(file);
         let mut all = Vec::new();
+        let mut stale_refused = 0usize;
         for (line_no, line_result) in reader.lines().enumerate() {
             let line = match line_result {
                 Ok(l) => l,
@@ -335,6 +357,12 @@ impl SealDlqWriter {
                 continue;
             }
             match serde_json::from_str::<SealDlqRecord>(trimmed) {
+                // `!=`, never `<`: a record from a NEWER build is exactly as
+                // unreadable as an older one — the case is a deploy rollback,
+                // where this binary meets lines its successor wrote.
+                Ok(rec) if rec.format_version != SEAL_SPILL_FORMAT_VERSION => {
+                    stale_refused += 1;
+                }
                 Ok(rec) => all.push(rec),
                 Err(err) => {
                     warn!(
@@ -345,6 +373,16 @@ impl SealDlqWriter {
                     );
                 }
             }
+        }
+        if stale_refused > 0 {
+            warn!(
+                ?path,
+                stale_refused,
+                current_format_version = SEAL_SPILL_FORMAT_VERSION,
+                "refused dlq lines written under a DIFFERENT seal format version \
+                 (their tf_ordinal belongs to another timeframe numbering, so \
+                 decoding them would file a bar under the wrong timeframe)"
+            );
         }
         info!(?path, count = all.len(), "drained dlq file");
         Ok(all)
@@ -592,7 +630,7 @@ mod tests {
 
     #[test]
     fn test_seal_dlq_record_json_field_names_are_stable_for_jq() {
-        // Operator demand: `cat data/dlq/seals-*.ndjson | jq` must
+        // Operator demand: `cat data/dlq/seals_v4-*.ndjson | jq` must
         // work. Pin the exact JSON keys so a future serde rename
         // does not silently break operator tooling.
         let r = SealDlqRecord::from(&mk_serialized_seal(13, 0, 0, 1_716_000_900, 102.5));
@@ -696,7 +734,12 @@ mod tests {
             .expect("valid")
             .timestamp();
         let name = ist_date_filename(utc_noon);
-        assert_eq!(name, "seals-2026-01-01.ndjson");
+        assert_eq!(name, "seals_v4-2026-01-01.ndjson");
+        assert!(name.starts_with(crate::seal_writer_task::SEAL_FILE_PREFIX));
+        assert!(
+            !name.starts_with(crate::seal_writer_task::LEGACY_SEAL_FILE_PREFIX),
+            "a v4 DLQ file must be invisible to a pre-v4 binary's drain"
+        );
         assert!(name.ends_with(".ndjson"));
     }
 
@@ -709,7 +752,7 @@ mod tests {
             .expect("valid")
             .timestamp();
         let name = ist_date_filename(utc);
-        assert_eq!(name, "seals-2026-05-10.ndjson");
+        assert_eq!(name, "seals_v4-2026-05-10.ndjson");
     }
 
     #[test]
@@ -735,7 +778,7 @@ mod tests {
             .expect("valid")
             .timestamp();
         let p = writer.dlq_path(utc_noon);
-        assert!(p.to_string_lossy().ends_with("seals-2026-05-10.ndjson"));
+        assert!(p.to_string_lossy().ends_with("seals_v4-2026-05-10.ndjson"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

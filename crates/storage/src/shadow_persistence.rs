@@ -154,7 +154,7 @@ pub const DEDUP_KEY_CANDLES: &str = "ts, security_id, segment, feed";
 ///
 /// `ts` is excluded because it is the designated timestamp, which
 /// `ALTER TABLE ... ADD COLUMN` cannot create.
-const CANDLE_SELF_HEAL_COLUMNS: &[(&str, &str)] = &[
+pub(crate) const CANDLE_SELF_HEAL_COLUMNS: &[(&str, &str)] = &[
     ("open_latency", "VARCHAR"),
     ("close_latency", "VARCHAR"),
     ("window_span_latency", "VARCHAR"),
@@ -223,9 +223,9 @@ pub fn candle_table_names() -> [&'static str; TF_COUNT] {
 /// became tautologically true and was removed — a gate that can only return
 /// true reads as a live filter to the next author.
 ///
-/// The surviving nine are `1s 3s 5s 1m 3m 5m 10m 15m 30m 60m` MINUS `10m`,
-/// which is a derived VIEW over `candles_1m`
-/// (`console_views::candles_10m_view_ddl`) and not a fold frame.
+/// The surviving ten are `1s 3s 5s 1m 3m 5m 10m 15m 30m 60m`. `10m` was a
+/// derived VIEW over `candles_1m` until 2026-09-22 and is now a folded table
+/// like the rest (the operator's "no views anywhere" directive).
 #[must_use]
 // TEST-EXEMPT: pure map over the ordinal array; pinned by test_emitted_and_retired_partition_the_ordinal_set.
 pub fn emitted_candle_table_names() -> Vec<&'static str> {
@@ -259,7 +259,7 @@ pub fn emitted_candle_table_names() -> Vec<&'static str> {
 /// enum.
 ///
 /// ⚠ Two names that must NEVER appear here:
-/// - `candles_10m` — a derived VIEW that IS wanted;
+/// - `candles_10m` — a live folded TABLE (it was a derived view until 2026-09-22);
 /// - any survivor. Note `candles_15s` (retired) against `candles_15m`
 ///   (survivor): the sweep matches EXACT names, never a prefix.
 const RETIRED_CANDLE_TABLES: [&str; 15] = [
@@ -541,7 +541,7 @@ async fn candle_table_has_int_security_id(client: &Client, base_url: &str, table
 /// longer correspond to any live timeframe enum.
 ///
 /// NOTE: any future `candles_*` prefix sweep MUST exclude `*_named` views
-/// (`console_views::VIEW_TICKS_NAMED` / `VIEW_CANDLES_NAMED`).
+/// (`candles_named` — listed in `console_views::RETIRED_CONSOLE_VIEWS`).
 const LEGACY_CANDLE_TF_SUFFIXES: [&str; 9] =
     ["1m", "5m", "15m", "30m", "1h", "2h", "3h", "4h", "1d"];
 
@@ -1121,6 +1121,44 @@ async fn run_ddl(client: &Client, base_url: &str, table: &str, ddl: &str) -> boo
 mod tests {
     use super::*;
 
+    /// The self-heal list and the candle `CREATE` must name the SAME columns,
+    /// with the SAME types, in the SAME order. A name only in the CREATE is a
+    /// column an upgraded table never gets (it stays empty forever, silently);
+    /// a name only in the list re-adds, every boot, a column the reset removed.
+    /// Read from this file's own source so the pin cannot drift from the DDL.
+    #[test]
+    fn the_self_heal_list_is_the_candle_create_column_for_column() {
+        let src = include_str!("shadow_persistence.rs");
+        let start = src
+            .find("CREATE TABLE IF NOT EXISTS {table} (")
+            .expect("candle CREATE present");
+        let body = &src[start..];
+        let end = body.find(") timestamp(ts)").expect("CREATE terminator");
+        let mut create: Vec<(String, String)> = Vec::new();
+        for line in body[..end].lines().skip(1) {
+            let cleaned = line
+                .trim()
+                .trim_end_matches('\\')
+                .trim()
+                .trim_end_matches(',');
+            let mut parts = cleaned.split_whitespace();
+            if let (Some(name), Some(ty)) = (parts.next(), parts.next()) {
+                create.push((name.to_string(), ty.to_string()));
+            }
+        }
+        assert_eq!(create.first().map(|c| c.0.as_str()), Some("ts"));
+        let create: Vec<(String, String)> = create.into_iter().skip(1).collect();
+        let heal: Vec<(String, String)> = CANDLE_SELF_HEAL_COLUMNS
+            .iter()
+            .map(|(n, t)| ((*n).to_string(), (*t).to_string()))
+            .collect();
+        assert_eq!(
+            create, heal,
+            "candle CREATE (minus ts) and CANDLE_SELF_HEAL_COLUMNS diverged"
+        );
+        assert_eq!(heal.len(), 21, "22-column candle contract = ts + 21");
+    }
+
     // ========================================================================
     // P2c (coverage-gaps #1076): DDL-walk + legacy-drop arm coverage via a
     // file-local mock HTTP server (same idiom as tick_persistence::tests).
@@ -1207,7 +1245,7 @@ mod tests {
     #[test]
     fn test_candle_table_names_has_tf_count_entries() {
         assert_eq!(candle_table_names().len(), TF_COUNT);
-        assert_eq!(TF_COUNT, 9);
+        assert_eq!(TF_COUNT, 10);
     }
 
     #[test]
@@ -1552,7 +1590,8 @@ mod tests {
         // unchanged, `candles_1d` is GONE, and the second-scale block that
         // followed it is now exactly 1s/3s/5s. `candles_15s` (retired) and
         // `candles_15m` (kept) differ by one letter — this list is the exact
-        // set, never a prefix match.
+        // set, never a prefix match. 2026-09-22: `candles_10m` appended at
+        // ordinal 9 (it was a view; now a folded table).
         let expected = [
             "candles_1m",
             "candles_3m",
@@ -1563,6 +1602,7 @@ mod tests {
             "candles_5s",
             "candles_30m",
             "candles_60m",
+            "candles_10m",
         ];
         assert_eq!(names, expected);
     }

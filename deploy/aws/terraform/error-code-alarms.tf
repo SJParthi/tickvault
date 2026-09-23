@@ -158,7 +158,7 @@
 # even reach its threshold: the systemd unit set no memory directive, the
 # cgroup reported `max`, and the resolver fell back to MemTotal (~31 GiB), so
 # its 80% line sat above anything the kernel would tolerate. The unit now
-# sets MemoryHigh=15G (a throttle, never a kill) and OOMScoreAdjust=-900,
+# sets MemoryHigh=20G (raised from 15G; see the unit file) (a throttle, never a kill) and OOMScoreAdjust=-900,
 # so the page and the throttle share one real ceiling. Coded filter, eval
 # 3 / dta 1, ok_recovery = true: a repeat-emitter whose OK genuinely tracks
 # the RSS falling back under the line.
@@ -286,7 +286,7 @@ locals {
     # it was unreachable: the systemd unit set no memory directive, so the
     # cgroup reported `max`, the resolver fell back to MemTotal (~31 GiB), and
     # 80% of the whole machine is a line the kernel acts before. The unit now
-    # carries MemoryHigh=15G (a THROTTLE — deliberately no MemoryMax, which
+    # carries MemoryHigh=20G (a THROTTLE — deliberately no MemoryMax, which
     # would turn a spike into a kill of the only tick-capture process) and
     # OOMScoreAdjust=-900 (killed AFTER QuestDB, whose loss the spill tier
     # absorbs). This alarm is the page that pairs with that throttle.
@@ -307,7 +307,7 @@ locals {
       eval        = 3
       dta         = 1
       ok_recovery = true
-      desc        = "RESOURCE-02: the trading app's resident memory is at or above 80% of its ceiling (MemoryHigh=15G on the systemd unit). Past the ceiling the kernel THROTTLES this process - it is not killed (no MemoryMax by design) - but a throttled tick decoder falls behind the socket and the vendor drops ticks upstream. Triage NOW: tv_process_rss_bytes + the tv_subsystem_memory_bytes components (which one is growing?); tv_spill_dir_free_bytes + tv_questdb_wal_suspended_tables (a stalled database backs up every writer queue). If a queue grows without bound, restart the app in the next quiet window; under host exhaustion QuestDB (-500) is killed before this process (-900) and the spill tier absorbs that. OK = RSS fell back under the line. Runbook: docs/error-runbooks/wave-4-error-codes.md + dhan-rest-only-noise-lock-2026-07-14.md section 2.3p"
+      desc        = "RESOURCE-02: the trading app's resident memory is at or above 80% of its ceiling (MemoryHigh=20G on the systemd unit, so the line is 16 GB). Past the ceiling the kernel THROTTLES this process - it is not killed (no MemoryMax by design) - but a throttled tick decoder falls behind the socket and the vendor drops ticks upstream. Triage NOW: tv_process_rss_bytes + the tv_subsystem_memory_bytes components (which one is growing?); tv_spill_dir_free_bytes + tv_questdb_wal_suspended_tables (a stalled DB backs up the writers). If a queue grows without bound, restart the app in the next quiet window; under host exhaustion QuestDB (-500) is killed before this process (-900) and the spill tier absorbs that. OK = RSS fell back under the line. Runbook: docs/error-runbooks/wave-4-error-codes.md + dhan-rest-only-noise-lock-2026-07-14.md section 2.3p"
     }
     # AGGREGATOR-DROP-01 (added 2026-07-09 — audit finding): the ONLY
     # silent-data-loss path for a sealed candle (ring + spill + DLQ all

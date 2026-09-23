@@ -1848,6 +1848,81 @@ fn parse_spot_rows(body: &str, floor: Option<i64>) -> Result<SpotPriceRows, Stri
     Ok(out)
 }
 
+/// Re-keys the app's contract-name table into the candle writer's shape:
+/// `(security_id as i64, segment string)` — exactly the fields a candle row
+/// carries. The segment string comes from the SAME `segment_code_to_str` the
+/// row uses, so the two can never spell a segment differently. An id that
+/// does not fit `i64` is dropped (no Dhan id is near 2^63; the candle row
+/// could not carry it either) — dropped means NULL, never a wrong name.
+fn candle_labels_from(
+    labels: &HashMap<crate::contract_underlying_map::ContractKey, std::sync::Arc<str>>,
+) -> tickvault_storage::candle_contract_labels::CandleContractLabels {
+    let mut out = HashMap::with_capacity(labels.len());
+    for ((id, segment), name) in labels {
+        let Ok(id) = i64::try_from(*id) else {
+            continue;
+        };
+        let seg = tickvault_common::segment::segment_code_to_str(segment.binary_code());
+        out.insert((id, seg), std::sync::Arc::clone(name));
+    }
+    out
+}
+
+/// Spot and index names for the same table, from the day's symbol map
+/// (added 2026-09-22 — until then every spot and index `ticks` / candle row
+/// wrote a NULL `contract`, because the table was built from option rows only).
+///
+/// Only the three spot segments are taken: IDX_I (0), NSE_EQ (1), BSE_EQ (4).
+/// A derivative id in the symbol map is not a spot and must not borrow a
+/// spot's name. When two symbols map to the same `(id, segment)` (an alias in
+/// the artifact), the lexically smallest wins so the choice is reproducible
+/// from the file rather than from hash iteration order.
+#[must_use]
+pub fn spot_labels_from(
+    symbols: &HashMap<String, (u64, u8)>,
+) -> tickvault_storage::candle_contract_labels::CandleContractLabels {
+    let mut out: tickvault_storage::candle_contract_labels::CandleContractLabels =
+        HashMap::with_capacity(symbols.len());
+    for (name, (id, code)) in symbols {
+        if !matches!(*code, 0 | 1 | 4) {
+            continue;
+        }
+        let Ok(id) = i64::try_from(*id) else {
+            continue;
+        };
+        let seg = tickvault_common::segment::segment_code_to_str(*code);
+        match out.entry((id, seg)) {
+            std::collections::hash_map::Entry::Occupied(mut held) => {
+                if name.as_str() < &**held.get() {
+                    held.insert(std::sync::Arc::from(name.as_str()));
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(std::sync::Arc::from(name.as_str()));
+            }
+        }
+    }
+    out
+}
+
+/// Publishes spot and index names at boot, before any contract attach, so the
+/// 09:00 pre-open index ticks carry a name. Uses the if-empty publish so it can
+/// never wipe a table the attach has already filled. Returns how many names it
+/// published (0 when the artifact is unreadable or the table was already set —
+/// both leave the column NULL until the attach, never wrong).
+pub fn publish_spot_contract_labels_at_boot(date_ist: &str) -> usize {
+    let Ok(symbols) = read_symbol_map(date_ist) else {
+        return 0;
+    };
+    let labels = spot_labels_from(&symbols);
+    let n = labels.len();
+    if tickvault_storage::candle_contract_labels::publish_candle_contract_labels_if_empty(labels) {
+        n
+    } else {
+        0
+    }
+}
+
 /// IST "now" as epoch nanoseconds — wall clock plus the fixed IST offset, the
 /// same convention the `ticks` designated timestamp is written in.
 fn ist_now_nanos() -> i64 {
@@ -2029,15 +2104,41 @@ pub async fn load_contract_universe(
                  set — the ranking cannot see any subscribed contract"
             );
         }
-        // Labels come from the SAME `&[ContractRow]` the legs came from, in the
-        // same pass, so the two snapshots can never describe different contract
-        // sets. Published BEFORE the owner map: the projection only reads a
-        // label for a contract the leaderboard already tracks, and the
-        // leaderboard only tracks what the owner map admits — so this order
-        // means a label is always present by the time anything can ask for it.
-        crate::contract_underlying_map::global_contract_underlying_map().publish_labels(
-            crate::contract_underlying_map::labels_from_artifact(&contracts),
+        // Labels come from the SAME `&[ContractRow]` the legs came from, with
+        // the SAME selected-first priority, so under the shared 25,000 cap a
+        // subscribed contract is labelled whenever the owner map admits it.
+        // (Until 2026-09-22 this walked the artifact in FILE order, and every
+        // subscribed option past row 25,000 wrote candles with a NULL
+        // `contract`; the comment here claimed the two maps could never
+        // differ.) They can still differ on a contract the owner map REFUSES
+        // for a reason this pass cannot see (unresolved underlying, no lot
+        // size) — an extra label, which is harmless. Published BEFORE the
+        // owner map: the projection only reads a label for a contract the
+        // leaderboard already tracks.
+        let labels = crate::contract_underlying_map::labels_from_artifact_selected_first(
+            &contracts,
+            &selection.instruments,
         );
+        // The candle writer fills `candles_<tf>.contract` from the SAME names,
+        // re-keyed into the row's own `(security_id, segment-string)` shape
+        // (storage cannot see this crate's map). Built from the same table in
+        // the same pass, so a `top_volume` row and a candle row for one
+        // contract can never carry two different names. `Arc<str>` clones are
+        // refcount bumps; this runs once per attach, never on the tick path.
+        // Spots and indices first, then options: the keys never collide (spot
+        // segments vs NSE_FNO / BSE_FNO), so the order only matters for
+        // readability. The whole table is REPLACED, so the spot names the boot
+        // published must be included again here or this publish would drop them.
+        let mut candle_labels = spot_labels_from(&symbols);
+        candle_labels.extend(candle_labels_from(&labels));
+        let published = tickvault_storage::candle_contract_labels::publish_candle_contract_labels(
+            candle_labels,
+        );
+        tracing::info!(
+            candle_contract_names = published,
+            "candle contract names published — option candles now carry their contract name"
+        );
+        crate::contract_underlying_map::global_contract_underlying_map().publish_labels(labels);
         let build = crate::contract_underlying_map::global_contract_underlying_map()
             .publish_from_legs(&legs);
         tracing::info!(
@@ -2176,6 +2277,43 @@ pub async fn fetch_spot_prices(
 
 #[cfg(test)]
 mod tests {
+
+    /// The candle writer probes with `(row.security_id, row.segment)`, where
+    /// the segment is `segment_code_to_str(code)`. The re-keyed table must
+    /// spell it identically or every lookup misses and every option candle
+    /// silently reads NULL.
+    #[test]
+    fn candle_labels_are_keyed_exactly_as_a_candle_row_probes() {
+        use tickvault_common::types::ExchangeSegment;
+        let mut labels = std::collections::HashMap::new();
+        labels.insert(
+            (52_175_u64, ExchangeSegment::NseFno),
+            std::sync::Arc::<str>::from("NIFTY-25Sep2026-24500-CE"),
+        );
+        labels.insert(
+            (1_122_u64, ExchangeSegment::BseFno),
+            std::sync::Arc::<str>::from("SENSEX-25Sep2026-81000-PE"),
+        );
+        // An id no candle row can carry: dropped, never wrapped negative.
+        labels.insert(
+            (u64::MAX, ExchangeSegment::NseFno),
+            std::sync::Arc::<str>::from("IMPOSSIBLE"),
+        );
+        let out = super::candle_labels_from(&labels);
+        assert_eq!(out.len(), 2, "the out-of-range id must be dropped");
+        let nse =
+            tickvault_common::segment::segment_code_to_str(ExchangeSegment::NseFno.binary_code());
+        assert_eq!(nse, "NSE_FNO");
+        assert_eq!(
+            out.get(&(52_175, nse)).map(|s| &**s),
+            Some("NIFTY-25Sep2026-24500-CE")
+        );
+        assert_eq!(
+            out.get(&(1_122, "BSE_FNO")).map(|s| &**s),
+            Some("SENSEX-25Sep2026-81000-PE")
+        );
+        assert!(out.values().all(|v| &**v != "IMPOSSIBLE"));
+    }
     /// The cache is a process-global single slot, so these tests must not run
     /// concurrently with each other — one storing while another reads would
     /// make a genuine failure look like a flake and vice versa. Poisoning is
@@ -3971,6 +4109,57 @@ mod tests {
     fn a_malformed_symbol_map_is_an_error_not_an_empty_universe() {
         assert!(parse_symbol_map("not json").is_err());
         assert!(parse_symbol_map(r#"{"resolved":7}"#).is_err());
+    }
+
+    #[test]
+    fn spot_labels_from_names_only_spot_segments_under_their_own_segment() {
+        let mut symbols = HashMap::new();
+        symbols.insert("NIFTY 50".to_string(), (13u64, 0u8));
+        symbols.insert("RELIANCE".to_string(), (2885u64, 1u8));
+        symbols.insert("RELIANCE-BSE".to_string(), (500_325u64, 4u8));
+        // A derivative id must never borrow a spot name.
+        symbols.insert("SOMEFUT".to_string(), (13u64, 2u8));
+        symbols.insert("MCXTHING".to_string(), (77u64, 5u8));
+        let labels = spot_labels_from(&symbols);
+        assert_eq!(labels.len(), 3);
+        assert_eq!(labels.get(&(13, "IDX_I")).map(|s| &**s), Some("NIFTY 50"));
+        assert_eq!(
+            labels.get(&(2885, "NSE_EQ")).map(|s| &**s),
+            Some("RELIANCE")
+        );
+        assert_eq!(
+            labels.get(&(500_325, "BSE_EQ")).map(|s| &**s),
+            Some("RELIANCE-BSE")
+        );
+        // Same numeric id on a derivative segment: absent, never borrowed.
+        assert!(labels.get(&(13, "NSE_FNO")).is_none());
+        assert!(labels.get(&(77, "MCX_COMM")).is_none());
+    }
+
+    #[test]
+    fn spot_labels_from_breaks_an_alias_tie_by_the_smallest_name() {
+        // Every insertion order must give the same answer.
+        for order in [["NIFTY", "NIFTY 50"], ["NIFTY 50", "NIFTY"]] {
+            let mut symbols = HashMap::new();
+            for name in order {
+                symbols.insert(name.to_string(), (13u64, 0u8));
+            }
+            let labels = spot_labels_from(&symbols);
+            assert_eq!(labels.len(), 1);
+            assert_eq!(labels.get(&(13, "IDX_I")).map(|s| &**s), Some("NIFTY"));
+        }
+    }
+
+    #[test]
+    fn spot_labels_from_an_empty_map_is_empty() {
+        assert!(spot_labels_from(&HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn publish_spot_contract_labels_at_boot_publishes_nothing_without_an_artifact() {
+        // No mapping artifact exists for this date, so nothing is read and
+        // nothing is published — the column stays NULL rather than wrong.
+        assert_eq!(publish_spot_contract_labels_at_boot("1999-01-01"), 0);
     }
 
     #[test]

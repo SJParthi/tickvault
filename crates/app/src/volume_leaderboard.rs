@@ -922,9 +922,6 @@ impl VolumeLeaderboard {
                         // leave a trap that a legitimate later climb trips,
                         // silently eating a real window.
                         resync_ceiling: stored,
-                        // RESEEDED to nothing, in lockstep with the baseline
-                        // one field up and for the same reason: the re-latch
-                        // declares the stored series garbage, and a first
                     };
                     slot.relatched = slot.relatched.saturating_add(1);
                     let relatched_total = slot.relatched;
@@ -1242,11 +1239,6 @@ impl VolumeLeaderboard {
                 dirty: 0,
                 // No ceiling is armed: this contract has never re-latched.
                 resync_ceiling: 0,
-                // A contract this process has never seen has no window open
-                // for it yet, so there is no first receipt to record and
-                // nothing to measure a span from. Both stay at the `0`
-                // sentinel until its first accepted ADVANCE, which is also
-                // the first instant its dirty bit is set.
             },
         );
         Observation::Accepted
@@ -1514,7 +1506,7 @@ impl VolumeLeaderboard {
                         delta_units = delta,
                         lot_size = lot,
                         zero_lot_total,
-                        "volume_leaderboard: a contract that TRADED in this window ranked zero milli-lots and was left off the board. Rare by design. If this is sustained and concentrated on large lot sizes, the ranking key's unit premise is wrong -- settle it on a live box with: SELECT per_lot_quantity, total_lots_traded FROM top_volume WHERE tf='1s' LIMIT 50. total_lots_traded clustering near 1000 (one lot) on the LARGEST per_lot_quantity values means volume arrives in LOTS and the key is inverted; values unrelated to lot size mean the premise holds. NOTE: the direct check -- the raw traded-unit count against the lot size -- is no longer storable, because the traded-unit column was removed from this table on 2026-09-19; this is the strongest test the surviving columns support."
+                        "volume_leaderboard: a contract that TRADED in this window ranked zero milli-lots and was left off the board. Rare by design. If this is sustained and concentrated on large lot sizes, the ranking key's unit premise is wrong -- settle it on a live box with: SELECT per_lot_quantity, total_lots_traded FROM top_volume_1s LIMIT 50. total_lots_traded clustering near 1000 (one lot) on the LARGEST per_lot_quantity values means volume arrives in LOTS and the key is inverted; values unrelated to lot size mean the premise holds. NOTE: the direct check -- the raw traded-unit count against the lot size -- is no longer storable, because the traded-unit column was removed from this table on 2026-09-19; this is the strongest test the surviving columns support."
                     );
                 }
                 continue;
@@ -4930,12 +4922,15 @@ mod tests {
     /// at the assertions.
     #[test]
     #[ignore = "wall-clock measurement, not a gate"]
+    // The printed table IS this harness's result (run with --nocapture), so
+    // the crate-wide print deny is lifted for this one test fn only.
+    #[allow(clippy::print_stdout)]
     fn radix_vs_comparator_at_every_measured_shape() {
         const ROUNDS: u32 = 50;
         println!("\n  n        comparator      radix        verdict");
         println!("  ------------------------------------------------");
         for &n in &[100usize, 500, 2_000, 20_220] {
-            let base = radix_fixture(n, 0x5DEE_CE66_D, 1_000_000);
+            let base = radix_fixture(n, 0x5_DEEC_E66D, 1_000_000);
             let mut rx = RadixScratch::new();
 
             // Warm both paths so neither pays a first-touch page fault.

@@ -7185,8 +7185,24 @@ does NOT get a new one by writing code: minting a second reset id requires its o
 fresh dated operator quote in THIS file first. So the wipe cannot fire twice, cannot
 fire on a mid-session restart, and cannot be re-triggered by a later column change.
 
+> **SHIPPED 2026-09-22 (PR #1928).** Implemented in `crates/storage/src/fresh_start_reset.rs`,
+> called once from `candle_ddl_boot.rs` before any CREATE. It is refused inside the
+> 08:55–15:45 IST band, and it records `RefuseUnreadable` rather than dropping when
+> the log cannot be read. Not verified against a live QuestDB: no instance is
+> reachable from the build container, so the first out-of-session boot is the
+> measurement.
+
 **Allowlist (the ONLY tables the one-shot can reach):** `candles_<tf>` (all ten),
 `top_volume`, `ticks`, `market_depth`.
+
+> **2026-09-22 — `top_volume_rank` added: the SAME table under its pre-2026-09-12 name,
+> not a new one.** A hostile review found that without it, the reset drops `top_volume`
+> and the same boot's `ensure_top_volume_rank_table` then RENAMES any surviving legacy
+> table into its place, bringing every pre-reset row back under the new name. That
+> defeats the one-shot for exactly the table the operator most wanted fresh. Its four
+> legacy views are dropped first. Pinned against the persistence constant by
+> `the_reset_drops_top_volume_under_both_of_its_names`. No SEBI table is added. The
+> SEBI set stays const-asserted disjoint.
 
 **UNREACHABLE BY CONSTRUCTION — SEBI, five-year retention:**
 `instrument_lifecycle`, `instrument_lifecycle_audit`, `index_constituency`,
@@ -7351,6 +7367,16 @@ other. #20 lands first and #15 rides the same step.
   and a separate change; until it runs, a deployed box keeps the old tables with no
   writer. They are NOT SEBI tables, so this is a housekeeping matter, not a
   retention one.
+  > **⚠ CORRECTED 2026-09-22 — the tables ARE dropped, but not by the reset.**
+  > `fresh_start_reset.rs` (shipped the same day) drops ONLY its `RESET_TABLES` literal:
+  > the nine current `candles_<tf>` tables plus `top_volume`, `ticks` and `market_depth`.
+  > The fifteen retired frames are dropped by a DIFFERENT boot step,
+  > `shadow_persistence::drop_retired_candle_tables`. It is called from
+  > `candle_ddl_boot.rs`, runs before any candle CREATE, and is marker-gated so it sweeps
+  > once per sweep version. So the outcome this sentence describes is real, but the
+  > mechanism it names is wrong. Recorded because a first draft of THIS correction said
+  > nothing drops them. That draft was reasoned from the reset's allowlist without a grep
+  > for the second caller.
 
 #### What a PR that violates this section looks like (REJECT)
 
@@ -7471,3 +7497,275 @@ incidental one.
   re-emits only that bar, so the moved figure would reach no row.
 - Sorts any delay on the VARCHAR half (text descending puts 1s / 2ms / 3µs / 4ns
   in the order 4, 3, 2, 1 — the exact reverse, and it looks right).
+
+### 2026-09-22 — `top_volume` BECOMES FOUR DIRECT TABLES, one per timeframe, rows written `ts ASC, volume_percentage_change DESC`
+
+**The verbatim operator demand (2026-09-22, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "See meanwhile for this top volume also I clearly told you to make the table itself per timeframe per timestamp shoudl be always sorted by volume percentage desc always timestamp asc right dude that too always O(1) dude see meanwhile I clealry told you to make it as direct tables dude why focusing on view dude why"
+
+Recorded HERE before the code, per the rule-file-first law. It SUPERSEDES the
+2026-09-12 (SAME DAY, LATER) arrangement of ONE `top_volume` table plus four
+per-cadence VIEWS filtered on `tf`.
+
+#### What changes
+
+| Surface | Before | After |
+|---|---|---|
+| Storage | one table `top_volume`, all four cadences mixed, `tf` column separates them | **four tables** `top_volume_1s`, `top_volume_3s`, `top_volume_5s`, `top_volume_1m` |
+| Per-cadence reading surface | four VIEWS over `top_volume` + a LEFT JOIN to the lifecycle dimension | the tables themselves — no view, no join, no `WHERE tf=` filter |
+| Writer routing | every row to `top_volume` | each row to its own cadence's table, chosen by `SnapshotCadence::table_name()` — a `const fn`, O(1), no allocation |
+| Columns | 15 | **the same 15**, unchanged. `tf` is KEPT (constant per table) so a UNION across the four stays self-describing and the DEDUP key does not change shape |
+| DEDUP key | `ts, tf, family, feed, security_id, segment` | unchanged, per table |
+| Partitioning | `PARTITION BY HOUR`, one table | `PARTITION BY HOUR`, each of the four; all four join `HOUR_PARTITIONED_TABLES` |
+| The legacy `top_volume` table | live | **RETIRED as a write target.** Kept in `HOUR_PARTITIONED_TABLES` so its existing rows age out under the 15-day market-data window rather than sitting un-swept forever |
+
+**Why the view names are reused as table names, and the one step that makes it
+safe.** A QuestDB view and a table share one namespace, so `CREATE TABLE
+top_volume_1s` fails against a box where `top_volume_1s` is still the old view.
+The ensure path therefore issues `DROP VIEW IF EXISTS <name>` immediately before
+each `CREATE TABLE IF NOT EXISTS <name>`. On the first boot it removes the view;
+on every later boot the name is a table, the drop is refused, and that refusal
+is expected and logged at debug — never counted as a failure.
+
+#### The ordering contract — what "always sorted" means, stated exactly
+
+A sweep ranks one window's contracts by `window_lots_milli` descending, and
+`volume_percentage_change = window_lots_milli / 10 - 100` is monotone in it, so
+the rows of one sweep are appended in `volume_percentage_change` DESCENDING
+order. Sweeps run in time order, so windows arrive in `ts` ASCENDING order. The
+designated timestamp keeps each table physically ordered by `ts`.
+
+| Claim | Status |
+|---|---|
+| Rows are WRITTEN `ts ASC, volume_percentage_change DESC` | **Verified** — pinned by test on the writer's projection |
+| Each cadence's rows land in its own table only | **Verified** — pinned by test on the ILP line |
+| QuestDB PRESERVES arrival order among rows that share one `ts`, through WAL apply and DEDUP | **UNVERIFIED** — no live QuestDB is reachable from the build environment. Probe on the box: `SELECT ts, volume_percentage_change FROM top_volume_1s WHERE ts IN today() LIMIT 500` and check the second column never rises within one `ts` |
+
+**Until that probe reads clean, a reader who needs the order guaranteed writes
+`ORDER BY ts ASC, volume_percentage_change DESC`.** The rows are already in that
+order, so the sort is close to a no-op — but it is the only form this repository
+can promise today.
+
+#### O(1) — the honest statement
+
+| Operation | Cost |
+|---|---|
+| Choosing the table for a row | **O(1)** — a `const fn` match, no allocation |
+| Writing one row | **O(1)** — one ILP append |
+| Reading one window of one cadence | **O(log n)** partition seek + **O(k)** for the k rows returned. No join, no filter over the other three cadences, no sort at read time |
+| The sort itself | **O(m log m)** once per sweep, at write time, over the m contracts that traded in the window |
+
+Per-SWEEP O(1) is arithmetically impossible — a sweep's output is one row per
+traded contract — and is NOT claimed anywhere. What the split buys is that a
+read never pays for the other three cadences' rows, and never pays a join.
+
+#### ⚠ What is LOST, stated rather than implied
+
+The four views carried three joined columns from the instrument master —
+`symbol_name`, `display_name`, `instrument_type`. **The direct tables do not
+carry them.** The `contract` column still holds the human-readable contract
+label written at snapshot time, which is what the operator reads; the fuller
+master fields are one join away in `instrument_lifecycle` for anyone who needs
+them. Carrying them in every row would add ~100 bytes per row across ~20,000
+rows per sweep to duplicate a dimension table.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Re-introduces per-cadence VIEWS over a shared table (the arrangement this
+  section retires).
+- Writes a row to a table other than its own cadence's.
+- Drops `tf` from the tables or from the DEDUP key.
+- Removes the `DROP VIEW IF EXISTS` pre-step, or counts its expected refusal as
+  a failure (the second boot would then report an error forever).
+- Removes the legacy `top_volume` from `HOUR_PARTITIONED_TABLES` before its rows
+  have aged out.
+- Claims the within-`ts` physical order is guaranteed before the probe above has
+  read clean on a live box.
+- Claims per-sweep O(1).
+
+### 2026-09-22 (SECOND) — NO VIEWS ANYWHERE: `candles_10m` becomes a real folded table, and every table carries its own contract name
+
+**The verbatim operator demands (2026-09-22, typed directly in-session — preserve
+EXACTLY, expletives and typos included):**
+
+> "See meanwhile I clealry told you to put either contract or symbol name right in each and every table to see it precisely right dude espeically when I want to query it manually dudde oaky?"
+
+> "See attached hy the fuck candle 10 m is a view bro it should be the real table right why the Fuck do we need even these views bro why"
+
+Recorded HERE **before any code**, per the rule-file-first law, because both
+reverse rows this file currently makes binding.
+
+#### What this REVERSES
+
+| Row | Where | Now |
+|---|---|---|
+| *"`10m` is DERIVED, never a new fold frame. No `TfIndex` variant, no ordinal, no `TF_COUNT` change, no seal-ring resize"* | §2026-09-18 clause 2 / clause 8 | **REVERSED.** `10m` is a native fold frame |
+| *"Adds an `M10` variant, or moves `TF_COUNT`"* / *"Adds a `TfIndex` variant, or changes `TF_COUNT`, to serve `10m`"* | the §2026-09-18 and §2026-09-19 REJECT lists | **LIFTED for `M10` alone.** Any OTHER new frame stays a REJECT without its own quote |
+| *"`10m` remains a VIEW over `candles_1m`"* | §2026-09-19 nine-frames narrowing | **REVERSED** |
+| The `ticks_named` / `candles_named` / `market_depth_named` console views | `console_views.rs` since 2026-08 | **RETIRED.** The name lives in the table itself |
+
+The §2026-09-18 "zero added per-tick work" reasoning is not ignored — it is
+priced and accepted: see the cost table below.
+
+#### The contract (LOCKED)
+
+| Aspect | Locked value |
+|---|---|
+| Views the app creates | **NONE.** `console_views.rs` creates no view. Boot issues `DROP VIEW IF EXISTS` for the four retired names (`ticks_named`, `candles_named`, `candles_10m`, `market_depth_named`) BEFORE any table DDL, so a box that still carries them converges and a `candles_10m` VIEW can never block the `candles_10m` TABLE |
+| `candles_10m` | a real table, same 22-column schema, same DEDUP key and DAY partitioning as every other `candles_<tf>`, written by the fold |
+| `TfIndex::M10` | **APPENDED** at ordinal **9** — never inserted. Appending renumbers nothing, so every seal-spill record already on disk still decodes to the frame it was written for, and no spill-format bump is needed |
+| `TF_COUNT` | **9 → 10** |
+| 10m grid | anchored at the candle session open (09:00 IST), like M30/M60: 09:00, 09:10, … — `600 % 900 != 0`, so it cannot share the 15-minute-aligned grid |
+| Name column | every market-data table carries a human-readable name for the instrument in the row: `candles_<tf>` and `top_volume_<tf>` already have `contract`; `ticks` and `market_depth` gain it; instrument-bearing audit tables gain it where they carry a `security_id` |
+| Name resolution cost | one O(1) hash probe per sealed bar / per tick row / per depth PACKET (never per depth level), pre-interned labels, zero allocation. An unknown id writes NULL, never a guessed name |
+
+#### Honest cost, stated rather than absorbed
+
+| Quantity | Before | After |
+|---|---:|---:|
+| Fold frames updated per tick | 9 | **10** (+11%) |
+| Seal ring capacity (`AGGREGATOR_MAX_SLOTS × TF_COUNT`) | 225,000 | **250,000** |
+| `candles_10m` rows per session | 0 (a view) | ~1/10th of `candles_1m` |
+| `market_depth` bytes per row for the name | 0 | +4 (a SYMBOL key) — on ~1.5 B rows/session ≈ **+6 GB/session** of disk |
+| `ticks` bytes per row for the name | 0 | +4 ≈ +0.3 GB/session |
+
+The depth figure is the one that matters: depth is ~80% of the disk burn, so
+this is roughly a **+5%** burn increase. It is the price of reading a depth row
+without a join, and the operator asked for exactly that.
+
+#### ⚠ What is LOST
+
+The three joined master fields the `_named` views added — `symbol_name`,
+`display_name`, `instrument_type` — are not copied into every row. `contract`
+carries the readable label; the fuller master fields stay one join away in
+`instrument_lifecycle`. The 10m view's `sum(abs(volume))` derivation, and the
+separate day-partitioned sign it computed, are replaced by the fold's own
+per-frame sign, which uses the same previous-close-of-the-same-frame rule and the
+same same-IST-day baseline refusal.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Creates any `VIEW` in the app, a boot script, or `questdb-init.sh`.
+- Removes the `DROP VIEW IF EXISTS` pre-step (an old box's `candles_10m` view
+  would then block the table forever).
+- Inserts `M10` at any ordinal other than the end, or bumps the spill format for
+  an append.
+- Adds any frame other than `M10` under cover of this quote.
+- Resolves a name per depth LEVEL, allocates while resolving it, or writes a
+  guessed name for an unknown instrument.
+- Claims any of this has been accepted by a live QuestDB before a boot has run.
+
+### 2026-09-22 (THIRD) — `ticks` drops `exchange_timestamp`; `received_at` is the FIRST column and `ts` the SECOND
+
+**The verbatim operator demand (2026-09-22, typed directly in-session — preserve EXACTLY, typos included):**
+
+> "See in ticks tavle I clealry told you to remove exchange timestamp and even I asked you to put received at as the first column and then ts second right dude do this change also bro okay?"
+
+Recorded HERE before the code, per the rule-file-first law.
+
+#### What changes
+
+| Surface | Before | After |
+|---|---|---|
+| `ticks` column order | `feed, segment, security_id, … , exchange_timestamp, received_at, payload_hash, capture_seq, ts` | **`received_at, ts, contract, feed, segment, security_id, …, payload_hash, capture_seq`** |
+| `contract SYMBOL` | absent | **ADDED** — the option's name (`NIFTY-25Sep2026-24500-CE`) from the same once-a-day table the candle writer reads, per the operator's earlier 2026-09-22 ask *"put either contract or symbol name right in each and every table"*. One lock-free load + one hash probe per row, zero allocation. NULL (never guessed) for spots, indices and futures — the table is built from option rows only. `market_depth` deliberately does NOT get it in this change: about 1.5 billion rows a session on the one write path QuestDB already cannot keep up with, so that cost goes to the operator first |
+| `exchange_timestamp LONG` column | written on every row | **REMOVED** — from the CREATE, the self-heal column list, the ILP write, `TickRow`, `scripts/questdb-init.sh` and the console runbook |
+| Designated timestamp | `ts` | `ts` — **UNCHANGED** |
+| DEDUP key | `(ts, security_id, segment, capture_seq, feed)` | **UNCHANGED** |
+| How `ts` is computed | `row_timestamp_ist_nanos(LTT, received_at)` | **UNCHANGED** |
+
+QuestDB cannot reorder or drop a column on an existing table, and the self-heal is `ADD COLUMN IF NOT EXISTS`, which can only add. The new order therefore takes effect **only when `ticks` is recreated**. `ticks` is already in `fresh_start_reset::RESET_TABLES`, and that reset has never run in production (the module is not on `main`), so the first boot of this build drops and recreates `ticks` in the new shape. An older volume that somehow keeps its `ticks` keeps the old column (never written again, NULL on new rows) — harmless, never wrong.
+
+#### ⚠ What is LOST, and the query that recovers most of it (Rule 11)
+
+The column held the vendor's raw last-trade time verbatim. Two things it answered:
+
+1. **"When did this trade happen?"** — still answered by `ts`, which IS that time for every in-band trade. Nothing lost.
+2. **"Is this row a real print, or a never-traded / garbage stamp?"** — `row_timestamp_ist_nanos` stamps a sentinel (LTT below 2020) or out-of-band (above the ceiling) row with its RECEIPT time instead. Before, the raw sentinel stayed visible in `exchange_timestamp`. Now it is not stored.
+
+**Recovery without the column:** a real trade's `ts` is a whole second (Dhan stamps whole seconds), while a fallback row's `ts` equals `received_at` to the nanosecond. So
+
+```sql
+-- rows whose stamp was a sentinel / out-of-band, i.e. NOT a real trade time
+SELECT * FROM ticks WHERE ts = received_at;
+```
+
+isolates them. The only way a real print could match is if the receipt instant were itself an exact whole second equal to the trade second — about one in a billion per row, since receipt carries nanoseconds and is back-dated by ring dwell. **NOT recoverable:** the raw sentinel VALUE itself (e.g. which garbage number the vendor sent). Nothing downstream reads it; the aggregator's refusal counters (`tv_aggregator_tick_refused_total{reason}`) still count every class.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Re-adds `exchange_timestamp` (or any raw-LTT column) to `ticks` without a fresh dated quote.
+- Changes the designated timestamp, the DEDUP key, or `row_timestamp_ist_nanos`'s fallback under cover of this change.
+- Reorders the CREATE without keeping `received_at` first and `ts` second.
+- Removes `ticks` from `RESET_TABLES` before the reset has run once in production (the new order would then never apply).
+
+### 2026-09-22 (FOURTH) — the fast-lane silent-loss closures, and the drain loses its last database write
+
+**The verbatim operator demand (2026-09-22, typed directly in-session — preserve EXACTLY, typos included):**
+
+> "Dude meanwhile eveen entilrey related to this dhans fast lane also ensure to fix and resolve everything dude especially to achieve O(1) dude okay? See because we always need to achieve this dhans super fast lane dude see we need to use our entire Aws instance including Unix Linux sockets pinning core affinity reading modifying enhancing adjusting pinning ram memory app db pressure wal ring bugger etc etc etc etc etc everything entirely to achieve the extreme super fast lane to always achieve O(1) dude okay?"
+
+> "Try to attack evrythign to find all kinds of extreme worst case eprmuations and combinations as well"
+
+Given in DIRECT response to a message that ENUMERATED the four ways the lane can still lose ticks without paging anyone, plus the reader/writer split and moving the `top_volume` append off the drain, and said each was designed but not yet built. That is the §28.2/§28.3 authorization shape this repository already accepts. It is also the dated line the 2026-09-13 correction above requires before the `top_volume` append moves off the frame drain (*"Moving it off the drain changes the data flow of a scope-locked module, so it needs its own dated line here first"*). Recorded HERE before any code.
+
+#### What this authorizes
+
+| # | Change | Why it is a silent-loss or stall path today |
+|---|---|---|
+| 1 | **An in-session restart dials sooner.** The boot WAL catch-up keeps its 300 s budget outside the capture window and takes a SHORT budget inside it; whatever is left stays a `*.wal` file for the next out-of-session boot | The catch-up runs BEFORE the sockets dial. A restart at 10:30 with a backlog kept all sixteen sockets dark for up to five minutes, and Dhan has no snapshot-on-subscribe and no sequence number, so those ticks are gone at source |
+| 2 | **An unknown packet code no longer discards the rest of its frame** when the vendor's own `message_length` stamp is plausible AND the header it points at decodes cleanly. Otherwise the existing abandon-and-count behaviour stands | One unlisted code threw away every packet stacked after it, including a disconnect packet |
+| 3 | **The fresh-start reset never destroys rows written after this build first booted.** Such a table is RENAMED aside instead of dropped; names in the view list are always dropped with `DROP VIEW IF EXISTS` | A reset refused mid-session let the day write into the old tables, and the next boot dropped them |
+| 4 | **The WAL AGE prune keeps any segment the applied watermark has not passed.** The BYTE-cap prune stays as the disk-full last resort, and when it deletes an unapplied segment that is counted and logged | The prune never consulted the watermark, so shed frames could be deleted before any replay reached them |
+| 5 | **The `top_volume` per-row ILP append leaves the frame drain** and runs on the writer thread that already owns the flush | MEASURED 14,932 µs at the ceiling, on the task that reads ticks |
+| 6 | **The socket reader no longer waits on a depth swap's wire writes** | A swap or top-up held the reader for up to ~2 s (per swap) to ~6 s (per top-up) while the kernel receive buffer filled |
+| 7 | **Flush-path counters are resolved once, and ILP buffers are recycled** instead of allocated per flush | Allocation and label-keyed map probes on the persistence path |
+
+#### ⚠ What this does NOT authorize, and two items it deliberately leaves out
+
+- **No new CloudWatch alarm, EMF name or Telegram page.** The September forecast is $142.24 against a $135.00 automatic `STOP_EC2_INSTANCES` line, and §2.3n of the noise lock requires a LEVER, not a cost note. Every new counter here is local `/metrics` plus a coded log line. Paging on abandoned bytes or on a reset refusal needs its own dated row in `dhan-rest-only-noise-lock-2026-07-14.md` with a lever.
+- **`MemoryHigh=20G` is NOT lowered.** An audit recommended 16G. The unit file records why 20G is load-bearing: a 21 GB spill read whole drove RSS to 20.96 GiB and the watchdog SIGABRTed a working process every ~9 minutes; 15G re-enters that loop. The audit was wrong on this point and is recorded as wrong rather than acted on.
+- **No instance, volume, IOPS or core-count change.** A separate volume for the WAL and spill tiers, or a larger instance so QuestDB and the app get disjoint cores, are money decisions for the operator.
+- No change to the socket budget (16), the four endpoint types, the subscription set, `dry_run`, or the §28 frozen area.
+
+#### ⚠ Honest envelope
+
+Per tick and per lookup the lane stays O(1) and allocation-free (DHAT-gated). NOT claimed: that a restart is now free — the short in-session budget shortens the blind window, it does not remove it, and anything the WAL did not capture is not recoverable by anyone. NOT claimed: that an unknown packet is now always recovered — the skip trusts a vendor length stamp whose semantics are still UNVERIFIED-LIVE for every code, which is why it is gated on the next header decoding cleanly and falls back to abandoning. NOT claimed: that the byte-cap prune can never delete unreplayed frames — on a full disk it must, and it now says so.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Skips an unknown packet on its length stamp alone, without validating the header it lands on.
+- Drops a table in the fresh-start reset that holds a row newer than the build's first boot.
+- Makes the byte-cap prune respect the watermark unconditionally (turns a pruned backlog into a full disk).
+- Lengthens the in-session catch-up budget back toward 300 s.
+- Adds an alarm, EMF name or page for any of the above without a lever.
+- Lowers `MemoryHigh` below 20G citing this section.
+
+### 2026-09-22 (FIFTH) — the contract name reaches spots, indices and `market_depth`; the last "your call" rows are closed
+
+**The verbatim operator demand (2026-09-22, typed directly in-session — preserve EXACTLY, typos included):**
+
+> "Dude I don't want any gaps or partial or any issues dude I clealry told you to fix and resolve everything dude and then merge and deploy it as well dude okay?"
+
+Given in DIRECT response to a published comparison page whose rows included, verbatim, *"Contract name on spot / index ticks — Gap — Those rows leave the name blank today"* and *"Contract name on market_depth — Your call — About 1.5 billion rows a session: adding a text column there costs real disk. Held until you decide."* The operator was shown both rows with their cost and answered "no gaps". That is the §28.2/§28.3 authorization shape, and it is the operator decision the (SECOND) section above said `market_depth` was waiting for. Recorded HERE before the code.
+
+#### What this authorizes
+
+| # | Change | Cost, stated |
+|---|---|---|
+| 1 | **Spot and index rows carry a name.** The day's mapping-artifact symbol map is turned into `(security_id, segment) -> symbol` for IDX_I / NSE_EQ / BSE_EQ only and merged into the SAME name table the candle and tick writers already read. Published at boot (if-empty, so it can never wipe option names) and again with the options at contract attach | Zero per-row cost change: the same one load + one hash probe per row already paid for options |
+| 2 | **`market_depth` gains `contract SYMBOL`.** Filled from the same table, resolved once per depth PACKET (never per level) and handed to every level row as a borrowed `&str` | Disk: a SYMBOL column is stored as a 4-byte key, ~1.53 B rows x 4 B = **~6 GB per session**, about 5.5% of the ~110 GB logical depth rows. ILP wire: each depth row now carries the name text (~20-25 bytes) to QuestDB — roughly **+25-30% of depth ILP payload**. That load lands on the depth WRITER THREAD, which has been off the frame drain since 2026-08-28, so a slower depth write backs up into the depth spill tier (recoverable), not into tick loss |
+
+#### ⚠ Honest envelope
+
+A name is never fabricated: an id absent from both the symbol map and the option table still writes NULL. Futures carry no name (they are no longer subscribed). The mapping artifact is written by the 08:30 daily rider; a boot that finds no artifact publishes nothing and the column stays NULL until the attach. NOT claimed: that the extra depth ILP bytes are free — they are the one real cost here and the depth spill counters are the read-out. NOT claimed: any dollar change — none (no instance, volume or IOPS change).
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Resolves the depth name per LEVEL instead of per packet (200x the probes on depth-200).
+- Allocates the name per row (`to_string`, `format!`) instead of borrowing it from the published snapshot.
+- Lets the boot publish REPLACE a non-empty table (wipes option names mid-session).
+- Gives a derivative id a spot's name because the numeric ids match (I-P1-11).
+- Adds `contract` to any DEDUP key — it is a label, never part of identity.

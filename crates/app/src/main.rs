@@ -2881,6 +2881,18 @@ async fn async_main() -> Result<()> {
     )
     .await;
 
+    // Spot and index names for `ticks.contract` / `candles_<tf>.contract`
+    // BEFORE the lane dials, so the 09:00 pre-open index ticks carry one. The
+    // contract attach later replaces the table with spots + options; this
+    // publish only fills an EMPTY table, so it can never wipe option names.
+    let spot_names = tickvault_app::dhan_contract_universe::publish_spot_contract_labels_at_boot(
+        &universe_date_ist,
+    );
+    info!(
+        spot_contract_names = spot_names,
+        "spot and index contract names published at boot"
+    );
+
     // Give the lane the `/health` websocket reporter BEFORE it dials, so the
     // first socket that comes up is the one that arms the row.
     //
@@ -3159,17 +3171,28 @@ async fn run_slow_boot_observability(
                         starved_reported,
                     ) {
                         starved_reported = true;
-                        error!(
-                            code = tickvault_common::error_code::ErrorCode::RiskGapTickGap
-                                .code_str(),
+                        // ⚠ DOWNGRADED 2026-09-23 — ERROR (coded) → WARN (uncoded).
+                        //
+                        // Since 2026-09-02 `ticks_observed` is structurally 0 (the
+                        // broadcast arm feeding it was deleted, see above), so with
+                        // the live lane enabled this notice is not a detection — it
+                        // is a CERTAINTY, emitted on every boot four scans in. As a
+                        // coded ERROR it matched the RISK-GAP-03 log-filter alarm and
+                        // paged the operator every trading morning (~08:34 IST) for a
+                        // fact that never changes. The real per-instrument silence
+                        // signal is the lane's own 30s scan in `dhan_feed_stack`,
+                        // which carries the code and IS gated to the continuous
+                        // session. This line keeps the honesty (it still says the
+                        // detector is blind) and the counter, and drops the page.
+                        warn!(
                             stale_scans,
                             "the per-instrument stall detector has run {stale_scans} scans and \
                              observed ZERO ticks while the live feed is enabled. It is reporting \
                              no stalled instruments because it can see no instruments — not \
                              because none are stalling. Its input is the process tick broadcast, \
                              which the live lane does not publish to; the lane's own 30s silence \
-                             scan (RISK-GAP-03) is the signal that IS wired. Treat this \
-                             detector's verdict as absent, not as healthy.",
+                             scan is the signal that IS wired. Treat this detector's verdict as \
+                             absent, not as healthy.",
                             stale_scans = stale_scans
                         );
                         metrics::counter!("tv_stall_detector_starved_total").increment(1);
@@ -3757,12 +3780,14 @@ async fn build_shared_infra(
     }
 
     // --- Candle DDL + retired-object sweep (Track A, 2026-07-18) ---
-    // AWAITED INLINE, BEFORE the seal-writer spawn: the 21 `candles_<tf>`
+    // AWAITED INLINE, BEFORE the seal-writer spawn: the nine `candles_<tf>`
     // tables must be ensured WITH `DEDUP ENABLE UPSERT KEYS` before the
     // REST-era bar-fold's first seal can reach ILP, or a fresh QuestDB
     // volume auto-creates them WITHOUT DEDUP (silent duplicate-row window
     // — the bug the PR-C2/#1581 lane deletions left behind). Bounded by
-    // the module's 60s quiet-probe; a down QuestDB skips the DDL loudly.
+    // the module's readiness probe; a down QuestDB skips the DDL loudly. The
+    // one-shot fresh-start reset inside it has its own bound
+    // (`fresh_start_reset::RESET_WORST_CASE_SECS`).
     // Ordering pinned by crates/app/tests/ensure_ddl_boot_wiring_guard.rs.
     tickvault_app::candle_ddl_boot::run_candle_ddl_at_boot(&config.questdb).await;
 
@@ -3979,7 +4004,8 @@ async fn build_shared_infra(
                     catchup_days = config.rest_candle_fold.catchup_days,
                     "rest_candle_fold: REST-era candle derivation ARMED — spot legs hand \
                      off persist-confirmed 1m bars; boot catch-up re-folds the stored \
-                     month into all 21 timeframes (candles_1m..candles_1d populate again)"
+                     month into the seven minute-scale timeframes (candles_1m..candles_60m; \
+                     the 1s/3s/5s frames need live ticks)"
                 );
             } else {
                 // LOW: first-wins refusal — a duplicate install means a second
@@ -4446,10 +4472,14 @@ async fn run_process_runloop(
                 "Dhan live feed: the lane task failed while shutting down — the day's tail may \
                  not have been persisted"
             ),
+            // The budget is read from the constant — this line said "within 20s"
+            // for a month after the budget was raised to 30 (2026-08-28).
             Err(_) => error!(
                 code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
-                "Dhan live feed: the shutdown seal+flush did NOT finish within 20s — exiting \
-                 anyway so systemd does not SIGKILL us, but the day's tail may be incomplete"
+                budget_secs = DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS,
+                "Dhan live feed: the shutdown seal+flush did NOT finish within \
+                 {DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS}s — exiting anyway so systemd does not \
+                 SIGKILL us, but the day's tail may be incomplete"
             ),
         }
     }
