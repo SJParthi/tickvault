@@ -4291,6 +4291,26 @@ fn seed_drain_loss_baselines() {
     c.depth_refused.increment(0);
     c.depth_dropped.increment(0);
     c.depth_length_mismatch.increment(0);
+    // ADDED 2026-09-23. The ws-lag EXCLUSION family: ticks we deliberately
+    // kept out of `tv_dhan_ws_lag_ms`. Its handles live in the lazy
+    // `WsLagHandles`, built at the first tick, and building a handle emits no
+    // sample, so each label set stayed absent until its first event. The
+    // `ltt_not_advanced` arm (repeated quotes) is the one that matters: its
+    // rise is the evidence the repeat fix is working, and the agent drops the
+    // first sample of a series it has never seen. All four label sets, for
+    // the per-label-set reason above. The histograms are NOT seeded: a seeded
+    // latency sample would be a fabricated reading.
+    // Seeded through the same name and label values `WsLagHandles::new` uses,
+    // so the key is identical; a drift between the two is caught by
+    // `the_ws_lag_exclusion_family_is_seeded_on_every_label_set`.
+    for reason in [
+        "ltt_not_advanced",
+        "clamped_negative",
+        "implausible_ltt",
+        "unknown_connection_slot",
+    ] {
+        metrics::counter!(WS_LAG_EXCLUDED_COUNTER, "reason" => reason).increment(0);
+    }
 }
 
 /// Counter: daily cross-verification attempts, by outcome. Anything other than
