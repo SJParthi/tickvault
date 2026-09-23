@@ -172,6 +172,10 @@ impl PassOutcome {
 /// - `tables_list_failed` — a table contributed nothing to the worklist and
 ///   is indistinguishable from a table with no eligible partitions in every
 ///   other field of the summary.
+///   A table QuestDB reports as NOT EXISTING is counted in `tables_absent`
+///   instead and never blocks the latch: there is nothing to move. Until
+///   2026-09-23 the 19 retired tables in the sweep list were counted here,
+///   and the day never latched on 6 of 6 attempts, every day.
 /// - `failed` — at least one partition was kept for a reason that will recur
 ///   unless something changes.
 /// - budget exhaustion — the worklist was truncated, so there is provably
@@ -345,6 +349,7 @@ async fn run_one_pass(
                 dropped = summary.dropped,
                 failed = summary.failed,
                 tables_list_failed = summary.tables_list_failed,
+                tables_absent = summary.tables_absent,
                 rows_archived = summary.rows_archived,
                 gzip_bytes_uploaded = summary.gzip_bytes_uploaded,
                 csv_bytes_exported = summary.csv_bytes_exported,
@@ -577,6 +582,28 @@ mod tests {
             tables_list_failed: list_failed,
             ..ArchiveRunSummary::default()
         }
+    }
+
+    /// 2026-09-23: 19 retired tables made the day unlatchable. An absent
+    /// table must latch; a real list failure beside it must still not.
+    #[test]
+    fn absent_tables_latch_the_day_but_a_real_list_failure_does_not() {
+        let absent_only = ArchiveRunSummary {
+            tables_absent: 19,
+            ..summary(0, 0, 0)
+        };
+        assert!(matches!(
+            pass_verdict(&absent_only, 200),
+            PassVerdict::Complete
+        ));
+        let absent_and_failed = ArchiveRunSummary {
+            tables_absent: 19,
+            ..summary(0, 0, 1)
+        };
+        assert!(matches!(
+            pass_verdict(&absent_and_failed, 200),
+            PassVerdict::Incomplete("table_list_failed")
+        ));
     }
 
     // ---- the tick decision -------------------------------------------------
