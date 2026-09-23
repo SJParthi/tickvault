@@ -2433,6 +2433,27 @@ the disk/QuestDB flush path, which a bigger instance does not change. It would a
 roughly $35–50/mo, which breaks the October $150 target on its own. Quote 15
 (r8g.xlarge FINALISED) stands.
 
+#### Quote 23b (2026-09-23, same day — preserve EXACTLY, typos included)
+
+> "See if this month it goes till 200 also accept dude next month onwards if shoudl be 150 dude okay?"
+
+**This confirms Quote 23 and does not change any number.** It sets a floor on what
+the operator accepts, not a new kill line: a September bill of $200 is acceptable.
+The $225 ceiling already covers it:
+
+| September bill | What happens |
+|---|---|
+| up to $200 | nothing — both lines are above it |
+| $202.50 | AWS native 90% action (currently `EXECUTION_FAILURE`) |
+| $225.00 | our hourly guard stops the box and disables the 08:30 start |
+
+Lowering the ceiling TO $200 was considered and NOT taken: its native 90% line
+would be $180.00, below the $188.45 forecast, so the box would be told to stop
+about a week before month end. That contradicts "accept up to 200".
+
+From 1 October the kill line is $150, enforced in code by
+`effective_budget_kill_usd`, whether or not the revert PR has landed.
+
 #### What a PR that violates Quote 23 looks like (REJECT)
 
 - Keeps the $225 ceiling in any of the four sites after September 2026.
