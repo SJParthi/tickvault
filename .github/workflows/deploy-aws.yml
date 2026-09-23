@@ -1006,6 +1006,7 @@ jobs:
               "if [ \"$QDB_BEFORE\" != \"$QDB_AFTER\" ]; then echo \"questdb-mem: CORRECTED [$QDB_BEFORE] -> [$QDB_AFTER] — recreating questdb so the new cap takes effect\"; (cd /opt/tickvault/repo/deploy/docker && { docker compose up -d --force-recreate tv-questdb || { docker compose ps -aq 2>/dev/null | xargs -r docker rm -f >/dev/null 2>&1 || true; docker compose up -d; }; }) || echo \"questdb-mem: WARNING recreate failed — cap applies on next container start\"; else echo \"questdb-mem: already $QDB_AFTER\"; fi",
               "systemctl is-active tickvault-host-tuning >/dev/null 2>&1 && echo \"host-tuning: applied\" || echo \"host-tuning: WARNING not active - check journalctl -u tickvault-host-tuning\"",
               "cat /opt/tickvault/net-tuning.status 2>/dev/null || echo \"host-tuning: no net-tuning.status yet\"",
+              "if systemctl is-active --quiet tickvault; then date +%s > /opt/tickvault/data/planned-restart.marker && chown ec2-user:ec2-user /opt/tickvault/data/planned-restart.marker && echo PLANNED-RESTART-MARKER-WRITTEN || echo WARN: planned-restart marker not written - this restart will page as an unexpected stop; else echo planned-restart-marker: app not running, no stop to announce; fi",
               "systemctl restart tickvault --no-block || (echo ===== systemctl restart dispatch failed ===== && systemctl status tickvault.service --no-pager -l || true; echo ===== journalctl -xeu last 100 ===== && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1)",
               "READY_OK=no; for i in $(seq 1 150); do if systemctl is-active --quiet tickvault; then READY_OK=yes; break; fi; sleep 5; done",
               "if [ \"$READY_OK\" != yes ]; then echo ===== tickvault not active within 750s - app likely never sent READY=1 - start job continues in background ===== && systemctl status tickvault.service --no-pager -l || true; echo ===== app stdout/stderr ONLY last 200 ===== && journalctl -u tickvault.service -n 200 --no-pager --output=cat || true; echo ===== journalctl -xeu last 100 ===== && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1; fi",
@@ -1558,6 +1559,23 @@ jobs:
             exit 0
           fi
           echo "Outside the up-window (dow=$DOW time=$HHMM) and THIS run started the box — stopping it to avoid an out-of-window bill."
+          # Announce the stop to the app first (dhan-rest-only-noise-lock
+          # §2.3x, 2026-09-23): the SIGTERM this stop delivers lands outside
+          # the 17:25-17:45 quiet window, so without the planned-restart
+          # marker the app pages "Unexpected stop" for a stop this workflow
+          # chose. Best effort and bounded: if the marker cannot be written,
+          # the stop still happens and simply pages — the loud direction.
+          MARK_ID=$(aws ssm send-command --region "$REGION" --instance-ids "$IID" \
+            --document-name AWS-RunShellScript \
+            --parameters 'commands=["date +%s > /opt/tickvault/data/planned-restart.marker && chown ec2-user:ec2-user /opt/tickvault/data/planned-restart.marker && echo PLANNED-RESTART-MARKER-WRITTEN"]' \
+            --query 'Command.CommandId' --output text 2>/dev/null || true)
+          if [ -n "$MARK_ID" ] && [ "$MARK_ID" != "None" ]; then
+            timeout 60 aws ssm wait command-executed --region "$REGION" --command-id "$MARK_ID" --instance-id "$IID" \
+              && echo "planned-restart marker written before the stop" \
+              || echo "WARN: planned-restart marker not confirmed — this stop may page as unexpected"
+          else
+            echo "WARN: could not send the planned-restart marker — this stop may page as unexpected"
+          fi
           aws ec2 stop-instances --region "$REGION" --instance-ids "$IID" >/dev/null \
             && echo "stop-instances dispatched for $IID" \
             || echo "(could not dispatch stop — AWS creds likely not configured at this stage)"

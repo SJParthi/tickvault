@@ -483,6 +483,49 @@ pub const MASTER_SOURCING_FALLBACK_REASONS: &[&str] = &[
 /// Gauge: how many instruments the live lane actually subscribed.
 pub const LIVE_UNIVERSE_SIZE_GAUGE: &str = "tv_dhan_live_universe_instruments";
 
+/// Is this boot one whose index-universe fallback is EXPECTED rather than a
+/// defect?
+///
+/// True on a non-trading day, and on a trading day before the daily rider's
+/// build hour (`[dhan_universe] target_secs_of_day_ist`). Either way today's
+/// mapping artifact cannot exist yet, so a collapse to the index universe is
+/// the correct outcome of THIS boot — and the scheduled 08:30 IST start is the
+/// boot that widens the session.
+///
+/// # Why this exists (MEASURED 2026-09-23, CloudWatch alarm history)
+///
+/// `tv-<env>-errcode-ws-gap-03-universe-collapse` fired on every off-hours
+/// boot: 2026-09-23 05:08 IST (Wed), Sun 2026-09-20, Sat 2026-09-19,
+/// 2026-09-17 03:42 IST, Sun 2026-09-13, Sat 2026-09-12 and more. The app
+/// log for each shows the same pair — "not waiting... the rider's build hour
+/// is further away" then "mapping artifact is unusable — falling back" — and
+/// the 08:30 boot of every one of those trading days widened correctly
+/// (863/864 instruments). A page that fires every time the box is touched
+/// outside the session and never once on a real collapse trains the operator
+/// to ignore the one alarm that reports a 99.98% loss of market data.
+///
+/// # Honest residual
+///
+/// A pre-rider boot on a trading day that stays up INTO the session would
+/// stay collapsed without a page. That shape needs the box to be started
+/// before 08:00 IST and not restarted: the start-watchdog curfew stops it
+/// outside the operating window and the 08:30 schedule starts a fresh boot,
+/// which is judged on its own clock. A boot at or after the rider hour on a
+/// trading day — including every mid-session restart — still pages.
+#[must_use]
+pub const fn collapse_is_expected_for_this_boot(
+    trading_day: bool,
+    now_ist_secs: u32,
+    rider_target_ist_secs: u32,
+) -> bool {
+    !trading_day || now_ist_secs < rider_target_ist_secs
+}
+
+/// `source` label carried by the EXPECTED (pre-rider / non-trading-day)
+/// fallback line. Deliberately NOT `fell_back_to_indices`, so the collapse
+/// alarm's metric filter cannot match it.
+pub const PRE_RIDER_BOOT_SOURCE: &str = "pre_rider_boot";
+
 /// Resolve the session's subscription set, reading the master only when the
 /// operator has turned that on.
 ///
@@ -502,6 +545,7 @@ pub fn resolve_live_universe(
     index_universe: Vec<SubscribeInstrument>,
     date_ist: &str,
     capacity: usize,
+    collapse_expected: bool,
 ) -> Vec<SubscribeInstrument> {
     // Seed every fallback reason before the decision is made.
     //
@@ -648,6 +692,31 @@ pub fn resolve_live_universe(
             match read_master_artifact(&path) {
                 Ok(m) => m,
                 Err(failure) => {
+                    if collapse_expected {
+                        // EXPECTED fallback: a non-trading day, or a trading
+                        // day before the rider's build hour — today's artifact
+                        // cannot exist yet. See
+                        // `collapse_is_expected_for_this_boot`. The gauge is
+                        // still published so the size is visible, but the
+                        // alarmed fallback COUNTER is not moved and the line
+                        // carries `source = pre_rider_boot`, which the
+                        // collapse alarm's filter cannot match.
+                        #[allow(clippy::cast_precision_loss)]
+                        // APPROVED: bounded by MAX_DAILY_UNIVERSE_SIZE, far below 2^53.
+                        metrics::gauge!(LIVE_UNIVERSE_SIZE_GAUGE).set(index_universe.len() as f64);
+                        tracing::warn!(
+                            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState
+                                .code_str(),
+                            source = PRE_RIDER_BOOT_SOURCE,
+                            detail = failure.detail(),
+                            path = %path.display(),
+                            "live universe: today's mapping artifact does not exist yet \
+                             (non-trading day, or before the daily rider's build hour) — \
+                             subscribing the index universe for this boot. Expected; the \
+                             scheduled morning start is the boot that widens the session."
+                        );
+                        return index_universe;
+                    }
                     record_master_sourcing_fallback(failure.mapping_reason(), index_universe.len());
                     tracing::error!(
                         code =
@@ -1099,6 +1168,7 @@ async fn settle_for_narrowed_spot_artifact(
 pub async fn await_mapping_artifact(
     cfg: &tickvault_common::config::DhanUniverseConfig,
     date_ist: &str,
+    collapse_expected: bool,
 ) {
     // Nothing to wait for: the lane is not master-sourced this boot.
     if !cfg.live_subscription_from_master {
@@ -1147,6 +1217,19 @@ pub async fn await_mapping_artifact(
     let now_ist = tickvault_common::market_hours::now_ist_secs_of_day();
     let Some(end_ist) = mapping_wait_end_ist_secs(now_ist, cfg.target_secs_of_day_ist) else {
         metrics::counter!(MAPPING_WAIT_COUNTER, "outcome" => "producer_too_far").increment(1);
+        if collapse_expected {
+            // The overnight / weekend shape: nothing is wrong, the rider has
+            // simply not run yet. Logged, never an ERROR.
+            tracing::info!(
+                now_ist_secs = now_ist,
+                rider_target_ist_secs = cfg.target_secs_of_day_ist,
+                path = %path.display(),
+                "live universe: not waiting for today's mapping — non-trading day or before \
+                 the daily rider's build hour. This boot subscribes the index universe; the \
+                 scheduled morning start widens the session."
+            );
+            return;
+        }
         // COLLAPSE-ALARM-EXEMPT: prediction, not outcome — see the arm at the
         // top of this function. `resolve_live_universe` emits the labelled
         // collapse line immediately after this returns.
@@ -2285,7 +2368,7 @@ mod tests {
             ..Default::default()
         };
         let t0 = std::time::Instant::now();
-        await_mapping_artifact(&cfg, "2099-01-06").await;
+        await_mapping_artifact(&cfg, "2099-01-06", false).await;
         assert!(
             t0.elapsed() < std::time::Duration::from_millis(200),
             "master sourcing off means nothing to wait for; waited {:?}",
@@ -2305,11 +2388,124 @@ mod tests {
             ..Default::default()
         };
         let t0 = std::time::Instant::now();
-        await_mapping_artifact(&cfg, "2099-01-07").await;
+        await_mapping_artifact(&cfg, "2099-01-07", false).await;
         assert!(
             t0.elapsed() < std::time::Duration::from_millis(200),
             "a disabled rider must fail fast, not stall boot; waited {:?}",
             t0.elapsed()
         );
+    }
+
+    /// The off-session verdict, on the real boot times that paged.
+    #[test]
+    fn collapse_is_expected_only_off_session() {
+        const RIDER: u32 = 8 * 3_600; // [dhan_universe] target_secs_of_day_ist default
+        let at = |h: u32, m: u32| h * 3_600 + m * 60;
+        // Measured paging boots (IST): 05:08 Wed, 03:42 on a trading day.
+        assert!(super::collapse_is_expected_for_this_boot(
+            true,
+            at(5, 8),
+            RIDER
+        ));
+        assert!(super::collapse_is_expected_for_this_boot(
+            true,
+            at(3, 42),
+            RIDER
+        ));
+        // Any time on a non-trading day — weekends, holidays.
+        assert!(super::collapse_is_expected_for_this_boot(
+            false,
+            at(10, 0),
+            RIDER
+        ));
+        assert!(super::collapse_is_expected_for_this_boot(
+            false,
+            at(8, 30),
+            RIDER
+        ));
+        // The scheduled 08:30 start and every mid-session restart must still page.
+        assert!(!super::collapse_is_expected_for_this_boot(
+            true,
+            at(8, 30),
+            RIDER
+        ));
+        assert!(!super::collapse_is_expected_for_this_boot(
+            true,
+            at(11, 45),
+            RIDER
+        ));
+        // Boundary: AT the rider hour the artifact is due — no longer expected.
+        assert!(!super::collapse_is_expected_for_this_boot(
+            true, RIDER, RIDER
+        ));
+        assert!(super::collapse_is_expected_for_this_boot(
+            true,
+            RIDER - 1,
+            RIDER
+        ));
+    }
+
+    /// The expected-fallback line must be invisible to the collapse alarm, and
+    /// must not move the alarmed counter.
+    #[test]
+    fn the_expected_fallback_cannot_reach_the_collapse_alarm() {
+        assert_ne!(
+            super::PRE_RIDER_BOOT_SOURCE,
+            UniverseSource::FellBackToIndices.as_str(),
+            "the expected-fallback source must differ from the one the collapse alarm filters on"
+        );
+        let tf = include_str!("../../../deploy/aws/terraform/error-code-alarms.tf");
+        assert!(
+            !tf.contains(super::PRE_RIDER_BOOT_SOURCE),
+            "no CloudWatch filter may match the expected pre-rider fallback"
+        );
+
+        let src = include_str!("dhan_live_universe.rs");
+        let start = src
+            .find(concat!(
+                "if collapse_",
+                "expected {\n                        // EXPECTED"
+            ))
+            .expect("the expected-fallback arm must exist in resolve_live_universe");
+        let arm_end = start
+            + src[start..]
+                .find("return index_universe;")
+                .expect("the expected arm must return the index universe");
+        let arm = &src[start..arm_end];
+        assert!(
+            arm.contains("PRE_RIDER_BOOT_SOURCE"),
+            "arm must carry the pre-rider source"
+        );
+        assert!(
+            !arm.contains(concat!("record_master_sourcing_", "fallback(")),
+            "the expected arm must NOT increment the alarmed fallback counter"
+        );
+        assert!(
+            !arm.contains(concat!("tracing::err", "or!(")),
+            "the expected arm must not log at ERROR"
+        );
+        // And it must run BEFORE the paging arm, or it is unreachable.
+        let paging = src[start..]
+            .find(concat!("record_master_sourcing_", "fallback(failure"))
+            .expect("the paging arm must still exist");
+        assert!(
+            paging > arm_end - start,
+            "expected arm must precede the paging arm"
+        );
+    }
+
+    /// The wait and the resolve must be judged by the SAME verdict, computed
+    /// once — otherwise the wait could predict one outcome and the resolve
+    /// report another.
+    #[test]
+    fn main_passes_one_off_session_verdict_to_both_calls() {
+        let main = include_str!("main.rs");
+        assert_eq!(
+            main.matches("universe_collapse_expected").count(),
+            3,
+            "main.rs must compute `universe_collapse_expected` once and pass it to BOTH \
+             await_mapping_artifact and resolve_live_universe"
+        );
+        assert!(main.contains("trading_calendar.is_trading_day_today()"));
     }
 }

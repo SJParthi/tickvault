@@ -2875,9 +2875,20 @@ async fn async_main() -> Result<()> {
     // 4,565, silently. This wait is bounded and fail-soft: on timeout the
     // resolve below takes its existing, loudly-logged fallback.
     let universe_date_ist = tickvault_app::dhan_universe::today_ist_date();
+    // Off-session boots (non-trading day, or before the rider's build hour)
+    // fall back to the index universe BY DESIGN — the artifact cannot exist
+    // yet. Judged ONCE here so the wait and the resolve agree, and so the
+    // collapse page fires only for a boot that should have widened.
+    let universe_collapse_expected =
+        tickvault_app::dhan_live_universe::collapse_is_expected_for_this_boot(
+            trading_calendar.is_trading_day_today(),
+            tickvault_common::market_hours::now_ist_secs_of_day(),
+            config.dhan_universe.target_secs_of_day_ist,
+        );
     tickvault_app::dhan_live_universe::await_mapping_artifact(
         &config.dhan_universe,
         &universe_date_ist,
+        universe_collapse_expected,
     )
     .await;
 
@@ -2947,6 +2958,7 @@ async fn async_main() -> Result<()> {
                 &universe_date_ist,
                 tickvault_core::websocket::pool_budget::DhanEndpointType::MainFeed
                     .subscription_capacity(),
+                universe_collapse_expected,
             ),
             // Empty by design — the stack late-attaches depth after 09:16 IST.
             depth_20_instruments: Vec::new(),
@@ -4309,7 +4321,7 @@ async fn run_process_runloop(
 
     // 2026-07-15 shutdown classification: the signal kind that actually
     // ended the run (previously logged then DROPPED) is threaded into the
-    // ShutdownInitiated event so a scheduled 4:30 PM IST stop renders one
+    // ShutdownInitiated event so a scheduled 5:30 PM IST stop renders one
     // quiet line instead of paging like an incident.
     let final_signal: &'static str = if shutdown_reason == "market_close" {
         info!("market close reached — post-market housekeeping, API stays alive");
@@ -4417,12 +4429,20 @@ async fn run_process_runloop(
             tickvault_core::notification::source_badge::runtime_source(),
             tickvault_core::notification::source_badge::RuntimeSource::Aws
         );
-        tickvault_app::shutdown_class::classify_shutdown(
+        // A deploy announces its own restart by writing a marker just before
+        // it stops the service; without this, every release paged as an
+        // unexpected stop. Consumed here, so a marker never outlives one stop.
+        let planned_deploy = tickvault_app::shutdown_class::take_planned_deploy_marker(
+            std::path::Path::new(tickvault_app::shutdown_class::PLANNED_DEPLOY_MARKER_PATH),
+            chrono::Utc::now().timestamp(),
+        );
+        tickvault_app::shutdown_class::classify_shutdown_with_deploy_marker(
             final_signal,
             is_aws,
             now_ist.time().num_seconds_from_midnight(),
             is_weekday,
             trading_calendar.is_trading_day(today_ist),
+            planned_deploy,
         )
     };
     info!(

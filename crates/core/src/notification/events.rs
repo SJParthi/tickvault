@@ -146,20 +146,29 @@ pub enum DispatchPolicy {
 /// coordinator-relayed directive 2026-07-15).
 ///
 /// Every restart used to pair a boot bubble with a `[MEDIUM] Shutdown
-/// initiated` page — even the daily scheduled 4:30 PM IST stop. The app-side
+/// initiated` page — even the daily scheduled 5:30 PM IST stop. The app-side
 /// classifier (`classify_shutdown` in the app crate) derives this class from
 /// the signal kind, the runtime source (AWS vs local), the IST clock, and
 /// the trading calendar. Fail-safe direction: ANY classifier doubt lands
 /// [`Self::ExternalStop`] — today's Medium loudness, never quieter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShutdownClass {
-    /// The daily scheduled stop — the 4:30 PM IST weekday auto-stop window,
+    /// The daily scheduled stop — the 5:30 PM IST weekday auto-stop window,
     /// or the holiday-gate self-stop on a non-trading day. Quiet (Low).
     ScheduledStop,
     /// A local operator stop (Ctrl+C / local SIGTERM from `make stop` or a
     /// container stop). Quiet (Low) — the operator did it themselves.
     OperatorStop,
-    /// Anything else — deploy restart, budget killswitch, manual AWS stop
+    /// A stop the deploy pipeline announced BEFORE sending it: the release
+    /// restart, or the out-of-hours stop of a box the deploy itself started.
+    /// The deploy writes a timestamped marker file immediately before, and
+    /// the app consumes it at shutdown (`dhan-rest-only-noise-lock` §2.3x,
+    /// 2026-09-23). Quiet (Low) — the operator merged the change that caused
+    /// it. A missing, stale or unreadable marker falls back to the ordinary
+    /// classification, so this arm can only ever make a stop quieter when
+    /// the deploy positively said so.
+    PlannedDeployRestart,
+    /// Anything else — unannounced deploy restart, budget killswitch, manual AWS stop
     /// outside the daily window. Stays Medium and loud.
     ExternalStop,
 }
@@ -2391,7 +2400,20 @@ impl NotificationEvent {
                 services_healthy,
                 services_total,
             } => {
-                format!("<b>Boot health check</b>\nHealthy: {services_healthy}/{services_total}")
+                // §2.3x (2026-09-23): (0, 0) is the "check could not run"
+                // sentinel (`infra::container_health_counts`), never a real
+                // "0 of 0 healthy". Rendering it as a fraction paged the
+                // operator about a box whose containers were all up.
+                if *services_total == 0 {
+                    "<b>Boot health check</b>\nContainer health: UNKNOWN — the check could not \
+                     run on this boot. The app keeps running; nothing to do unless other \
+                     alerts follow."
+                        .to_string()
+                } else {
+                    format!(
+                        "<b>Boot health check</b>\nHealthy: {services_healthy}/{services_total}"
+                    )
+                }
             }
             Self::OrphanPositionDetected {
                 count,
@@ -2493,12 +2515,15 @@ impl NotificationEvent {
             Self::ShutdownInitiated { class } => match class {
                 // One quiet line each (2026-07-15): a scheduled/operator
                 // stop is routine, never an incident.
-                ShutdownClass::ScheduledStop => "\u{1f6d1} Scheduled stop — daily 4:30 PM IST \
+                ShutdownClass::ScheduledStop => "\u{1f6d1} Scheduled stop — daily 5:30 PM IST \
                                                  window (or holiday). Back at next start."
                     .to_string(),
                 ShutdownClass::OperatorStop => "\u{1f6d1} Stopped by operator.".to_string(),
+                ShutdownClass::PlannedDeployRestart => "\u{1f504} Planned stop for a software \
+                                                        update — no action needed."
+                    .to_string(),
                 ShutdownClass::ExternalStop => "<b>Unexpected stop</b> — outside the daily \
-                                                4:30 PM IST window. If you didn't do this, \
+                                                5:30 PM IST window. If you didn't do this, \
                                                 check the box (deploy / budget stop / manual)."
                     .to_string(),
             },
@@ -2989,7 +3014,9 @@ impl NotificationEvent {
             // are routine (Low — one quiet coalesced line); only an
             // unexpected external stop keeps the historical Medium loudness.
             Self::ShutdownInitiated { class } => match class {
-                ShutdownClass::ScheduledStop | ShutdownClass::OperatorStop => Severity::Low,
+                ShutdownClass::ScheduledStop
+                | ShutdownClass::OperatorStop
+                | ShutdownClass::PlannedDeployRestart => Severity::Low,
                 ShutdownClass::ExternalStop => Severity::Medium,
             },
             Self::CircuitBreakerClosed => Severity::Medium,
@@ -4097,7 +4124,7 @@ mod tests {
         };
         let msg = event.to_message();
         assert!(msg.contains("Scheduled stop"), "{msg}");
-        assert!(msg.contains("4:30 PM IST"), "{msg}");
+        assert!(msg.contains("5:30 PM IST"), "{msg}");
         assert!(msg.contains("Back at next start"), "{msg}");
         assert_eq!(msg.lines().count(), 1, "one-line body: {msg}");
         assert!(
@@ -4116,13 +4143,28 @@ mod tests {
     }
 
     #[test]
+    fn test_shutdown_initiated_planned_deploy_restart_is_one_quiet_line() {
+        // §2.3x (2026-09-23): a stop the deploy announced must never read as
+        // "Unexpected", and must stay Low like the other routine stops.
+        let event = NotificationEvent::ShutdownInitiated {
+            class: ShutdownClass::PlannedDeployRestart,
+        };
+        let msg = event.to_message();
+        assert_eq!(msg.lines().count(), 1, "one-line body: {msg}");
+        assert!(msg.contains("software update"), "{msg}");
+        assert!(msg.contains("no action needed"), "{msg}");
+        assert!(!msg.contains("Unexpected"), "{msg}");
+        assert_eq!(event.severity(), Severity::Low);
+    }
+
+    #[test]
     fn test_shutdown_initiated_message_external_stop_stays_loud() {
         let event = NotificationEvent::ShutdownInitiated {
             class: ShutdownClass::ExternalStop,
         };
         let msg = event.to_message();
         assert!(msg.contains("<b>Unexpected stop</b>"), "{msg}");
-        assert!(msg.contains("4:30 PM IST"), "{msg}");
+        assert!(msg.contains("5:30 PM IST"), "{msg}");
         assert!(
             msg.contains("deploy / budget stop / manual"),
             "the body must name the likely external causes: {msg}"
@@ -4710,6 +4752,18 @@ mod tests {
         let msg = event.to_message();
         assert!(msg.contains("Boot health check"));
         assert!(msg.contains("7/8"));
+        assert_eq!(event.severity(), Severity::Low);
+    }
+
+    #[test]
+    fn test_boot_health_check_zero_total_renders_unknown_not_zero_of_zero() {
+        let event = NotificationEvent::BootHealthCheck {
+            services_healthy: 0,
+            services_total: 0,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("UNKNOWN"), "got: {msg}");
+        assert!(!msg.contains("0/0"), "0/0 reads as everything down: {msg}");
         assert_eq!(event.severity(), Severity::Low);
     }
 

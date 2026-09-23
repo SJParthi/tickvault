@@ -150,6 +150,17 @@ pub const TICK_FEED_DHAN: &str = Feed::Dhan.as_str();
 /// `feed` SYMBOL value for TrueData-sourced rows.
 pub const TICK_FEED_TRUEDATA: &str = Feed::Truedata.as_str();
 
+/// `source` label on every HOT-PATH-02 line whose rows were RESCUED to the
+/// spill tier (tick AND depth). Added 2026-09-23
+/// (`dhan-rest-only-noise-lock-2026-07-14.md` §2.3x): the
+/// `tv-<env>-errcode-hot-path-02` pager filter excludes it, because a rescued
+/// batch is on disk and re-ingestable — a degrade, never a loss. Every arm that
+/// truly LOSES rows (rescue failed, append failed, quarantine pruned, ensure
+/// failed) deliberately carries no such source and still pages. The literal is
+/// pinned against `deploy/aws/terraform/error-code-alarms.tf` by
+/// `crates/storage/tests/hot_path_02_rescued_filter_guard.rs`.
+pub const RESCUED_TO_SPILL_SOURCE: &str = "rescued_to_spill";
+
 /// Timeout for the idempotent QuestDB DDL HTTP requests.
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
@@ -2781,6 +2792,9 @@ fn perform_tick_rescue(spill_dir: &Path, payload: &[u8], feed: Feed, dropped: us
                 code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                 feed = feed.as_str(),
                 rescued = dropped,
+                // §2.3x (2026-09-23): the pager filter excludes this source —
+                // the rows are on disk, so it is a degrade, not a loss.
+                source = RESCUED_TO_SPILL_SOURCE,
                 bytes = payload_len,
                 path = %path.display(),
                 "tick flush failed — the buffered rows were RESCUED to the tick \
@@ -3261,6 +3275,7 @@ impl TickWriterSink {
                     code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                     feed = self.feed.as_str(),
                     rescued = rows,
+                    source = RESCUED_TO_SPILL_SOURCE,
                     bytes = payload_len,
                     reason = why,
                     path = %path.display(),

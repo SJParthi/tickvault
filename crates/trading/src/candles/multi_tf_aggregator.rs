@@ -171,6 +171,16 @@ struct InstrumentSlot {
     /// `LiveCandleState`, where it would have cost 24 bytes per instrument and
     /// pushed a second budget assert.
     last_tick_sign: i8,
+    /// Fold-clock second (the exchange last-trade time) of the last ACCEPTED,
+    /// non-stale packet for this instrument. `0` before the first one.
+    ///
+    /// Half of the repeat-quote test in `consume_tick`: a packet whose trade
+    /// time, price AND day-cumulative all equal the previous accepted packet's
+    /// describes the SAME trade, re-sent by Dhan because the book or open
+    /// interest changed. 4 bytes per instrument, ~100 KB at the 25,000-slot
+    /// ceiling, and it lives on the slot that already exists per instrument
+    /// for the same reason `last_ltp` does.
+    last_trade_ts: u32,
 }
 
 /// Per-tick outcome, coalesced across all [`TF_COUNT`](crate::candles::TF_COUNT)
@@ -311,11 +321,28 @@ pub struct ConsumeStats {
     /// EXCHANGE DAY IS NOT THE RECEIPT DAY IS REFUSED OUTRIGHT") — replaying it
     /// reaches exactly the verdict the live feed reached, so it is not loss. A
     /// watermark refusal of a replayed frame can be a genuinely captured tick
-    /// from an earlier session, and that one IS loss and must still page.
+    /// from an earlier session.
+    ///
+    /// ⚠ CORRECTED 2026-09-23 (same day): this said such a tick "IS loss and
+    /// must still page". The app's replay path now WRITES that row back to
+    /// `ticks` and skips only the candle (the THIRD 2026-09-23 section of
+    /// `websocket-connection-scope-lock.md`), so it is neither lost nor paged.
+    /// The distinction this flag carries is unchanged — it is exactly what the
+    /// write-back keys on.
     ///
     /// Deliberately excluded from [`Self::folded`]: it never occurs without
     /// one of the two refusal flags, which already make `folded()` false.
     pub receipt_day_mismatch: bool,
+    /// `true` when this packet repeated the previous accepted TRADE exactly —
+    /// same last-trade time, same last-traded price, same day-cumulative
+    /// volume — and was therefore applied as a QUOTE REFRESH rather than a
+    /// trade: open interest and total buy/sell quantity were updated on the
+    /// open bucket, and nothing else moved (see `refresh_repeat_quote`).
+    ///
+    /// Informational, and deliberately NOT part of [`Self::folded`]: the
+    /// packet was accepted and its row is written; it simply carried no new
+    /// trade for a candle to count.
+    pub repeat_quote: bool,
 }
 
 impl ConsumeStats {
@@ -801,6 +828,7 @@ impl MultiTfAggregator {
             last_cumulative: 0,
             last_ltp: f64::NAN,
             last_tick_sign: 0,
+            last_trade_ts: 0,
             // Deliberately NOT a baseline — see the field doc. The first tick
             // this slot folds replaces it with a real observation.
             volume_baseline_seeded: false,
@@ -1335,8 +1363,33 @@ impl MultiTfAggregator {
         // discounted in the output.
         let is_stale_packet =
             slot.volume_baseline_seeded && cumulative_volume < slot.last_cumulative;
+        // REPEAT-QUOTE TEST (2026-09-23). Dhan's Quote/Full packet carries the
+        // LAST TRADE TIME, and Dhan re-sends it whenever the order book or open
+        // interest changes — so one trade arrives many times, each copy
+        // carrying the same trade time, the same price and the same
+        // day-cumulative volume. Every copy was folded as a new trade: it
+        // raised `tick_count`, widened the receipt stamps (so a bar's close
+        // latency measured when the LAST book update arrived, not the last
+        // trade), and — once the bar had sealed — re-emitted it as an
+        // amendment. MEASURED on the box that day: 64,585 one-minute bars with
+        // close latency over 60 s, the worst about 113 minutes.
+        //
+        // All three must match. A different price at the same second is a
+        // different trade (and an index, whose volume is always 0, is told
+        // apart by its price alone). A different cumulative is new volume.
+        // The price compares BITS: `last_ltp` is NaN until the first accepted
+        // tick, and NaN never equals itself, which is exactly right here.
+        //
+        // Evaluated BEFORE `last_ltp` is overwritten below; it is the only
+        // instant both values exist. A stale packet can never match — its
+        // cumulative is below the stored one by definition.
+        let repeat_candidate = slot.volume_baseline_seeded
+            && fold_secs == slot.last_trade_ts
+            && cumulative_volume == slot.last_cumulative
+            && slot.last_ltp.to_bits() == prices.last_traded_price.to_bits();
         if !is_stale_packet {
             slot.last_ltp = prices.last_traded_price;
+            slot.last_trade_ts = fold_secs;
         }
         if !slot.volume_baseline_seeded {
             slot.volume_baseline_seeded = true;
@@ -1361,6 +1414,26 @@ impl MultiTfAggregator {
         // against itself for 23 of the 24 timeframes and silently destroy the
         // delta. It must stay above the loop.
         let extremes = slot.cell.observe_session_extremes(tick, fold_secs);
+
+        // A repeat that ALSO moved a session extreme is not treated as a
+        // repeat: the exchange's own running high or low reports a print we
+        // never received, and the fold below is what attributes it. Rare, and
+        // folding it costs one tick of `tick_count` — the safe direction.
+        if repeat_candidate && extremes.is_empty() {
+            for tf in TfIndex::ALL {
+                // `false` means the bucket this trade belongs to has already
+                // sealed (catch-up or rollover). Nothing is reopened and nothing
+                // is amended: the sealed bar already holds this trade.
+                let _still_open = slot.cell.refresh_repeat_quote(tf, tick, &prices, fold_secs);
+            }
+            crate::candles::fold_counters::fold_counters()
+                .repeat_quote
+                .increment(1);
+            return ConsumeStats {
+                repeat_quote: true,
+                ..ConsumeStats::default()
+            };
+        }
 
         // TICK-RULE CLASSIFICATION — derived ONCE per tick, for the same
         // reason `extremes` two lines up is: it is a comparison against the
@@ -1641,6 +1714,10 @@ impl MultiTfAggregator {
             // enough: with `last_tick_sign` at 0, the first zero tick of the
             // new day is refused as unclassified rather than mis-signed.
             slot.last_tick_sign = 0;
+            // The repeat-quote test already stands down while the baseline is
+            // unseeded; clearing the trade time too means a stale value can
+            // never be what makes a new day's first packet read as a repeat.
+            slot.last_trade_ts = 0;
             for tf in TfIndex::ALL {
                 if let Some(state) = slot.cell.force_seal(tf) {
                     emitted = emitted.saturating_add(1);
@@ -4228,6 +4305,184 @@ mod tests {
         );
         assert!(good.folded(), "a real price must still fold");
     }
+
+    // -- repeated quote packets (2026-09-23) --------------------------------
+    //
+    // Dhan re-sends a Full/Quote packet whenever the BOOK or OI changes, with
+    // the OLD last-trade time, price and cumulative volume. Before the filter
+    // every copy counted as a trade. These pin both halves: a repeat changes
+    // nothing but the quote fields, and a REAL trade is never mistaken for one.
+
+    const REPEAT_SID: u64 = 4_242;
+    const SEG_FNO: u8 = 2;
+
+    fn quote(ts: u32, price: f32, cum: u32, oi: u32, received_at_nanos: i64) -> ParsedTick {
+        let mut t = tick(REPEAT_SID, SEG_FNO, ts, price, cum);
+        t.open_interest = oi;
+        t.received_at_nanos = received_at_nanos;
+        t
+    }
+
+    fn m1(agg: &MultiTfAggregator) -> LiveCandleState {
+        agg.snapshot(Feed::Dhan, REPEAT_SID, SEG_FNO, TfIndex::M1)
+            .expect("slot exists")
+    }
+
+    #[test]
+    fn a_repeated_quote_is_not_counted_as_a_trade_but_refreshes_oi() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        // A UTC receipt one second after the trade: the day gate compares the
+        // IST receipt day with the trade day, so the fixture must be same-day.
+        let base_ns: i64 = i64::from(OPEN + 21 - 19_800) * 1_000_000_000;
+        let first = agg.consume_tick(
+            Feed::Dhan,
+            &quote(OPEN + 20, 101.25, 500, 1_000, base_ns),
+            None,
+            |_, _, _, _, _| {},
+        );
+        assert!(first.folded() && !first.repeat_quote);
+        let before = m1(&agg);
+
+        let again = agg.consume_tick(
+            Feed::Dhan,
+            &quote(OPEN + 20, 101.25, 500, 1_200, base_ns + 30_000_000_000),
+            None,
+            |_, _, _, _, _| {},
+        );
+        assert!(
+            again.repeat_quote,
+            "same time, price and volume is a repeat"
+        );
+        assert_eq!(
+            again.sealed_count + again.late_count,
+            0,
+            "a repeat seals and amends nothing"
+        );
+
+        let after = m1(&agg);
+        assert_eq!(
+            after.tick_count, 1,
+            "tick_count must stay at the one real trade"
+        );
+        assert_eq!(after.oi, 1_200, "the quote field still updates");
+        assert_eq!(
+            after.last_receipt_ist_nanos, before.last_receipt_ist_nanos,
+            "a repeat arriving 30 s later must not stretch the close latency"
+        );
+        assert_eq!(after.volume, before.volume);
+    }
+
+    #[test]
+    fn a_hundred_repeats_after_the_seal_emit_no_amendment() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let t = quote(OPEN + 5, 250.5, 9_000, 10, 0);
+        let _ = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+        let sealed = agg.catch_up_seal_all(OPEN + 61, |_, _, _, _, _| {});
+        assert!(sealed > 0, "the fixture must actually seal something");
+
+        let mut emitted = 0_usize;
+        for i in 0..100_u32 {
+            let copy = quote(OPEN + 5, 250.5, 9_000, 10 + i, 0);
+            let stats = agg.consume_tick(Feed::Dhan, &copy, None, |_, _, _, _, _| {
+                emitted += 1;
+            });
+            assert!(stats.repeat_quote, "copy {i} must read as a repeat");
+            assert_eq!(stats.late_count, 0, "copy {i} must not amend a sealed bar");
+        }
+        assert_eq!(emitted, 0, "no sealed bar may be re-emitted for a repeat");
+    }
+
+    #[test]
+    fn a_real_trade_at_the_same_second_is_never_a_repeat() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &quote(OPEN + 30, 99.0, 700, 0, 0),
+            None,
+            |_, _, _, _, _| {},
+        );
+        // One more unit traded inside the same second.
+        let more = agg.consume_tick(
+            Feed::Dhan,
+            &quote(OPEN + 30, 99.0, 701, 0, 0),
+            None,
+            |_, _, _, _, _| {},
+        );
+        assert!(!more.repeat_quote && more.folded());
+        // Same volume, different price: an index trades with volume 0 always,
+        // so its price is the only thing that tells two prints apart.
+        let moved = agg.consume_tick(
+            Feed::Dhan,
+            &quote(OPEN + 30, 99.05, 701, 0, 0),
+            None,
+            |_, _, _, _, _| {},
+        );
+        assert!(!moved.repeat_quote && moved.folded());
+        // Same price and volume, a later trade time: a new print.
+        let later = agg.consume_tick(
+            Feed::Dhan,
+            &quote(OPEN + 31, 99.05, 701, 0, 0),
+            None,
+            |_, _, _, _, _| {},
+        );
+        assert!(!later.repeat_quote && later.folded());
+        assert_eq!(m1(&agg).tick_count, 4);
+    }
+
+    #[test]
+    fn an_index_print_with_zero_volume_and_a_new_price_still_counts() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        for price in [23_146.45_f32, 23_146.75, 23_146.45] {
+            let s = agg.consume_tick(
+                Feed::Dhan,
+                &tick(13, SEG_IDX, OPEN + 40, price, 0),
+                None,
+                |_, _, _, _, _| {},
+            );
+            assert!(!s.repeat_quote, "price {price} moved, so it is a print");
+        }
+        let s = agg
+            .snapshot(Feed::Dhan, 13, SEG_IDX, TfIndex::M1)
+            .expect("slot exists");
+        assert_eq!(s.tick_count, 3);
+    }
+
+    #[test]
+    fn a_repeat_that_reports_a_new_session_high_is_still_folded() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let mut first = quote(OPEN + 50, 100.0, 300, 0, 0);
+        first.day_high = 101.0;
+        first.day_low = 99.0;
+        let _ = agg.consume_tick(Feed::Dhan, &first, None, |_, _, _, _, _| {});
+        // Identical trade, but the exchange's running high moved: a print we
+        // never received happened, and the fold is what attributes it.
+        let mut copy = first;
+        copy.day_high = 102.0;
+        let s = agg.consume_tick(Feed::Dhan, &copy, None, |_, _, _, _, _| {});
+        assert!(
+            !s.repeat_quote,
+            "a moved session extreme is evidence, not a repeat"
+        );
+        assert!(
+            m1(&agg).high >= 102.0,
+            "the unseen print must widen the bar"
+        );
+    }
+
+    #[test]
+    fn the_very_first_packet_is_never_a_repeat() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        // Zero volume, zero price bits would collide with a zeroed baseline if
+        // the seeded flag were ignored.
+        let s = agg.consume_tick(
+            Feed::Dhan,
+            &quote(OPEN + 1, 50.0, 0, 0, 0),
+            None,
+            |_, _, _, _, _| {},
+        );
+        assert!(!s.repeat_quote && s.folded());
+    }
+
     /// `folded()` reports success by the ABSENCE of every refusal flag, so a
     /// newly-added refusal that is not wired into it makes a refused tick
     /// claim it folded — a false-OK.
@@ -4252,6 +4507,8 @@ mod tests {
             future_trading_day: _,
             untraded_timestamp: _,
             out_of_band_timestamp: _,
+            // Informational, not a refusal — see the field doc.
+            repeat_quote: _,
         } = ConsumeStats::default();
 
         assert!(

@@ -588,6 +588,12 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         aws_cloudwatch_metric_alarm.deploy_watchdog_not_invoked.alarm_name,
         aws_cloudwatch_metric_alarm.market_open_readiness_not_invoked.alarm_name,
         aws_cloudwatch_metric_alarm.boot_heartbeat_gate_not_invoked.alarm_name,
+        # Joined 2026-09-23 (dhan-rest-only-noise-lock-2026-07-14.md §2.3x).
+        # The process publishes 0 for this gauge from its 08:30 boot until the
+        # lane dials at 09:00, and again after the post-close stand-down, so
+        # two legitimate-zero windows paged the operator before the open. It
+        # ships actions_enabled = false and is armed here only in-session.
+        aws_cloudwatch_metric_alarm.ws_no_alive_connections.alarm_name,
         # tick_gap_instruments_silent retired in PR-C3 (2026-07-14).
         # boundary_catchup_storm_dhan retired 2026-07-17 (stage-3 dead-WS
         # sweep — its metric's writer, the tick aggregator, is deleted).
@@ -635,6 +641,10 @@ resource "aws_cloudwatch_log_group" "tv_market_hours_liveness_gate" {
 # INVOKES the Lambda (scheduler drop / disabled rule) produces no Errors
 # datapoint at all (notBreaching -> silent) — the explicit state = "ENABLED"
 # pins + the liveness alarms are the backstop.
+# (2026-09-23: the count history above stopped being maintained after
+# 2026-07-17 — it still read 2 while the live list held 12, and the list is
+# now 13 with ws-no-alive-connections. Count ALARM_NAMES; never quote a
+# number from this comment.)
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "market_hours_gate_lambda_errors" {
   alarm_name = "tv-${var.environment}-market-hours-gate-errors"

@@ -301,48 +301,12 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
         return;
     }
 
-    // Fetch infra credentials from SSM concurrently.
-    let (questdb_creds, telegram_creds) = match tokio::join!(
-        secret_manager::fetch_questdb_credentials(),
-        secret_manager::fetch_telegram_credentials(),
-    ) {
-        (Ok(q), Ok(t)) => (q, t),
-        (q_result, t_result) => {
-            if let Err(ref err) = q_result {
-                warn!(
-                    ?err,
-                    "failed to fetch QuestDB credentials from SSM — cannot auto-start Docker"
-                );
-            }
-            if let Err(ref err) = t_result {
-                warn!(
-                    ?err,
-                    "failed to fetch Telegram credentials from SSM — cannot auto-start Docker"
-                );
-            }
-            return;
-        }
+    // Fetch infra credentials from SSM and build the compose environment —
+    // the SAME builder `container_health_snapshot` uses, so `up` and `ps`
+    // can never disagree about what the compose file needs to parse.
+    let Some(env_vars) = fetch_compose_env("cannot auto-start Docker").await else {
+        return;
     };
-
-    // Build env vars for docker-compose.
-    let env_vars = [
-        (
-            "TV_QUESTDB_PG_USER",
-            questdb_creds.pg_user.expose_secret().to_string(),
-        ),
-        (
-            "TV_QUESTDB_PG_PASSWORD",
-            questdb_creds.pg_password.expose_secret().to_string(),
-        ),
-        (
-            "TV_TELEGRAM_BOT_TOKEN",
-            telegram_creds.bot_token.expose_secret().to_string(),
-        ),
-        (
-            "TV_TELEGRAM_CHAT_ID",
-            telegram_creds.chat_id.expose_secret().to_string(),
-        ),
-    ];
 
     // Ensure the machine app.log placeholder exists before Docker mounts it.
     // Alloy container mounts ../../data/logs → /var/log/tv-app to watch the
@@ -982,45 +946,126 @@ pub fn parse_container_health(ps_stdout: &str) -> (usize, usize, Vec<String>) {
     (total, unhealthy, unhealthy_names)
 }
 
+/// The environment variables `docker compose` needs merely to PARSE the
+/// compose file, in the order [`compose_env`] emits them.
+///
+/// Two of them are `${VAR:?…}` REQUIRED interpolations in
+/// `deploy/docker/docker-compose.yml` (the QuestDB PG credentials), so ANY
+/// compose subcommand run without them — `ps` included, not just `up` —
+/// exits non-zero before it looks at a single container. That is the
+/// mechanism behind the boot ping that read `Healthy: 0/0` on a box whose
+/// containers were all up (`dhan-rest-only-noise-lock-2026-07-14.md` §2.3x).
+/// Both call sites build their environment through this one list, and
+/// `infra::tests` pins every required interpolation in the compose file to it.
+pub(crate) const COMPOSE_ENV_KEYS: [&str; 4] = [
+    "TV_QUESTDB_PG_USER",
+    "TV_QUESTDB_PG_PASSWORD",
+    "TV_TELEGRAM_BOT_TOKEN",
+    "TV_TELEGRAM_CHAT_ID",
+];
+
+/// A fully-built compose environment: one `(key, value)` pair per
+/// [`COMPOSE_ENV_KEYS`] entry, in that order.
+type ComposeEnv = [(&'static str, String); COMPOSE_ENV_KEYS.len()];
+
+/// Pure: pairs [`COMPOSE_ENV_KEYS`] with values supplied in the same order.
+///
+/// Takes plain values rather than the SSM credential types so the key set is
+/// testable without AWS. Cold path (boot + one boot-time health check).
+fn compose_env(values: [String; COMPOSE_ENV_KEYS.len()]) -> ComposeEnv {
+    let [pg_user, pg_password, bot_token, chat_id] = values;
+    [
+        (COMPOSE_ENV_KEYS[0], pg_user),
+        (COMPOSE_ENV_KEYS[1], pg_password),
+        (COMPOSE_ENV_KEYS[2], bot_token),
+        (COMPOSE_ENV_KEYS[3], chat_id),
+    ]
+}
+
+/// Fetches the compose credentials from SSM (concurrently) and builds the
+/// shared compose environment. `None` when either fetch fails — each failure
+/// is logged with `consequence` naming what the caller cannot do without it.
+async fn fetch_compose_env(consequence: &'static str) -> Option<ComposeEnv> {
+    match tokio::join!(
+        secret_manager::fetch_questdb_credentials(),
+        secret_manager::fetch_telegram_credentials(),
+    ) {
+        (Ok(questdb_creds), Ok(telegram_creds)) => Some(compose_env([
+            questdb_creds.pg_user.expose_secret().to_string(),
+            questdb_creds.pg_password.expose_secret().to_string(),
+            telegram_creds.bot_token.expose_secret().to_string(),
+            telegram_creds.chat_id.expose_secret().to_string(),
+        ])),
+        (q_result, t_result) => {
+            if let Err(ref err) = q_result {
+                warn!(
+                    ?err,
+                    consequence, "failed to fetch QuestDB credentials from SSM"
+                );
+            }
+            if let Err(ref err) = t_result {
+                warn!(
+                    ?err,
+                    consequence, "failed to fetch Telegram credentials from SSM"
+                );
+            }
+            None
+        }
+    }
+}
+
 /// One-shot `(services_healthy, services_total)` snapshot for the boot-time
-/// `BootHealthCheck` ping. Runs `docker compose ps` once via the same format as
-/// the watchdog and reuses [`parse_container_health`]. Returns `(0, 0)` when the
-/// Docker daemon is down or the command fails — an honest "nothing healthy"
-/// (the operator wants the ping to fire with the real counts either way).
+/// `BootHealthCheck` ping, or `None` when the check could not run at all.
+///
+/// Runs `docker compose ps` once via the same format as the watchdog and
+/// reuses [`parse_container_health`]. It passes the SAME environment `up`
+/// gets ([`fetch_compose_env`]) — without it the compose file's required
+/// interpolations make `ps` exit non-zero, which until 2026-09-23 was
+/// reported as `(0, 0)` and paged the operator "Healthy: 0/0" on a box whose
+/// containers were all up.
+///
+/// `None` means UNKNOWN (daemon down, no compose CLI, no credentials, the
+/// command failed) — never "nothing is healthy". `Some((0, 0))` is reserved
+/// for a check that ran and genuinely found no containers.
 // TEST-EXEMPT: thin docker-compose-ps shell-out; the (healthy, total) math is
-// fully covered by parse_container_health unit tests.
-pub async fn container_health_counts() -> (usize, usize) {
+// covered by parse_container_health unit tests, the env key set by
+// compose_env tests.
+pub async fn container_health_snapshot() -> Option<(usize, usize)> {
     use tokio::process::Command;
 
     if !is_docker_daemon_running().await {
-        return (0, 0);
+        warn!("container_health_snapshot: Docker daemon not running — health UNKNOWN");
+        return None;
     }
     // Issue #1505: resolve a working compose front-end first — a broken
-    // `docker compose` CLI made this `ps` exit 125 with empty stdout, which
-    // parsed as an unlabelled (0, 0) instead of an honest failure.
+    // `docker compose` CLI made this `ps` exit 125 with empty stdout.
     let Some(cli) = resolve_compose_cli().await else {
-        warn!(
-            "container_health_counts: no usable Docker Compose CLI — \
-             reporting (0, 0)"
-        );
-        return (0, 0);
+        warn!("container_health_snapshot: no usable Docker Compose CLI — health UNKNOWN");
+        return None;
     };
+    let env_vars = fetch_compose_env("container health UNKNOWN").await?;
+    // Chained, and the program on its own line: `infra_spawn_seam_guard`
+    // exempts exactly this READ-ONLY `ps` site by the text
+    // `cli.program())`. It is deliberately NOT seam-routed — `ps` changes
+    // nothing on the machine.
     let output = match Command::new(cli.program())
         .args(compose_cli_args(
             cli,
-            // Same resolution as the up path — a health count taken against a
-            // missing file reports (0, 0), which reads as "no containers" and
-            // is indistinguishable from "everything is down".
+            // Same resolution as the up path.
             resolve_compose_path().unwrap_or(DOCKER_COMPOSE_PATH),
             &["ps", "--format", "{{.Name}} {{.State}}"],
         ))
+        .envs(env_vars.iter().map(|(key, value)| (*key, value.as_str())))
         .output()
         .await
     {
         Ok(o) => o,
         Err(err) => {
-            warn!(?err, "container_health_counts: docker compose ps failed");
-            return (0, 0);
+            warn!(
+                ?err,
+                "container_health_snapshot: docker compose ps failed — health UNKNOWN"
+            );
+            return None;
         }
     };
     if !output.status.success() {
@@ -1028,13 +1073,21 @@ pub async fn container_health_counts() -> (usize, usize) {
         warn!(
             exit = ?output.status.code(),
             stderr = %stderr.trim(),
-            "container_health_counts: docker compose ps failed — reporting (0, 0)"
+            "container_health_snapshot: docker compose ps failed — health UNKNOWN"
         );
-        return (0, 0);
+        return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let (total, unhealthy, _names) = parse_container_health(&stdout);
-    (total.saturating_sub(unhealthy), total)
+    Some((total.saturating_sub(unhealthy), total))
+}
+
+/// Compatibility wrapper over [`container_health_snapshot`]: an UNKNOWN
+/// result becomes `(0, 0)`. Kept so existing callers compile; the boot ping
+/// should move to the snapshot so it can say "unknown" instead of "0/0".
+// TEST-EXEMPT: one-line map over container_health_snapshot.
+pub async fn container_health_counts() -> (usize, usize) {
+    container_health_snapshot().await.unwrap_or((0, 0))
 }
 
 // ---------------------------------------------------------------------------
@@ -1386,6 +1439,119 @@ mod tests {
         // Blank lines are skipped, not counted.
         let (total, unhealthy, _) = parse_container_health("\n   \n\n");
         assert_eq!((total, unhealthy), (0, 0));
+    }
+
+    // --- §2.3x (2026-09-23): `ps` must get the same env `up` gets -----------
+
+    /// Production source only — cut at the test module so the literals in
+    /// these tests can never satisfy their own scans.
+    fn production_src() -> &'static str {
+        let full = include_str!("infra.rs");
+        let cut = full
+            .find("\n#[cfg(test)]\nmod tests")
+            .expect("infra.rs has a test module"); // APPROVED: test
+        &full[..cut]
+    }
+
+    /// Body of the top-level fn whose signature starts with `sig`.
+    fn fn_body<'a>(src: &'a str, sig: &str) -> &'a str {
+        let start = src
+            .find(sig)
+            .unwrap_or_else(|| panic!("`{sig}` not found in infra.rs"));
+        let rest = &src[start..];
+        // `\x7D` / `\x7B` spell the braces so the banned-pattern scanner's
+        // brace-depth count cannot mistake a string literal for a block end.
+        let end = rest.find("\n\x7D\n").expect("fn has a closing brace"); // APPROVED: test
+        &rest[..end]
+    }
+
+    #[test]
+    fn test_compose_env_emits_exactly_the_shared_keys_in_order() {
+        let env = compose_env([
+            "u".to_string(),
+            "p".to_string(),
+            "t".to_string(),
+            "c".to_string(),
+        ]);
+        let keys: Vec<&str> = env.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, COMPOSE_ENV_KEYS.to_vec());
+        let values: Vec<&str> = env.iter().map(|(_, v)| v.as_str()).collect();
+        assert_eq!(values, vec!["u", "p", "t", "c"]);
+    }
+
+    #[test]
+    fn test_ps_and_up_build_their_env_from_the_same_builder() {
+        let src = production_src();
+        let up = fn_body(src, "pub async fn ensure_infra_running(");
+        let ps = fn_body(src, "pub async fn container_health_snapshot(");
+        assert!(
+            up.contains("fetch_compose_env("),
+            "ensure_infra_running must build the compose env via fetch_compose_env"
+        );
+        assert!(
+            ps.contains("fetch_compose_env("),
+            "container_health_snapshot must build the compose env via fetch_compose_env — \
+             `ps` without it exits non-zero on the compose file's required \
+             interpolations and the boot ping reads 0/0"
+        );
+        assert!(
+            ps.contains(".envs(env_vars."),
+            "container_health_snapshot must apply the env to the ps command"
+        );
+        // Neither site may keep a private inline key list that could drift.
+        for key in COMPOSE_ENV_KEYS {
+            let quoted = format!("\"{key}\"");
+            assert!(
+                !up.contains(&quoted) && !ps.contains(&quoted),
+                "{key} is spelled inline at a call site — build it from COMPOSE_ENV_KEYS"
+            );
+        }
+    }
+
+    #[test]
+    fn test_every_required_compose_interpolation_is_a_shared_key() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let compose = std::fs::read_to_string(root.join("deploy/docker/docker-compose.yml"))
+            .expect("read docker-compose.yml"); // APPROVED: test
+        let required = required_interpolations(&compose);
+        assert!(
+            !required.is_empty(),
+            "no `${{VAR:?…}}` found — the scan is vacuous or the compose file moved"
+        );
+        for var in &required {
+            assert!(
+                COMPOSE_ENV_KEYS.contains(&var.as_str()),
+                "docker-compose.yml requires `{var}` but COMPOSE_ENV_KEYS does not \
+                 supply it — every compose subcommand (ps included) would fail"
+            );
+        }
+    }
+
+    #[test]
+    fn test_required_interpolation_scan_bites() {
+        assert_eq!(
+            required_interpolations("a: ${TV_X:?need it}\nb: ${TV_Y:-default}\nc: ${TV_Z}\n"),
+            vec!["TV_X".to_string()]
+        );
+        assert!(required_interpolations("no vars here").is_empty());
+    }
+
+    /// Names of every `${VAR:?…}` (required) interpolation in `text`.
+    fn required_interpolations(text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = text;
+        while let Some(i) = rest.find("$\x7B") {
+            rest = &rest[i + 2..];
+            let name_len = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            if rest[name_len..].starts_with(":?") {
+                out.push(rest[..name_len].to_string());
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
     }
 
     #[test]

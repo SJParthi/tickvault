@@ -227,3 +227,135 @@ fn the_deaf_socket_alarm_is_gated_even_though_it_is_not_breaching() {
          rather than invented. Lowering it needs a measured baseline"
     );
 }
+
+/// Every member of the gate's `ALARM_NAMES` join, parsed from COMMENT-STRIPPED
+/// source so a commented-out member line cannot count.
+fn gate_members(gate_src: &str) -> Vec<String> {
+    let gate = code_only(gate_src);
+    let names_at = gate
+        .find("ALARM_NAMES")
+        .expect("the gate Lambda must still take an ALARM_NAMES env list");
+    let tail = &gate[names_at..];
+    let block_end = tail.find("])").expect("ALARM_NAMES must be a join() list");
+    tail[..block_end]
+        .lines()
+        .filter_map(|l| {
+            l.trim()
+                .strip_prefix("aws_cloudwatch_metric_alarm.")
+                .and_then(|rest| rest.split(".alarm_name").next())
+                .map(str::to_owned)
+        })
+        .filter(|n| !n.is_empty())
+        .collect()
+}
+
+/// True iff a code line of the block sets `actions_enabled` to `false`,
+/// tolerant of terraform-fmt alignment padding around the `=`.
+fn declares_disarmed(block: &str) -> bool {
+    block.lines().any(|l| {
+        let mut parts = l.splitn(2, '=');
+        matches!(
+            (parts.next().map(str::trim), parts.next().map(str::trim)),
+            (Some("actions_enabled"), Some("false"))
+        )
+    })
+}
+
+/// The gate members whose resource block does NOT ship `actions_enabled = false`.
+/// A member whose resource cannot be found at all is reported too — a list
+/// entry pointing at nothing is a broken arming path, never a pass.
+fn members_not_shipped_disarmed(gate_src: &str, tf_sources: &[String]) -> Vec<String> {
+    let stripped: Vec<String> = tf_sources.iter().map(|s| code_only(s)).collect();
+    gate_members(gate_src)
+        .into_iter()
+        .filter(|name| {
+            let needle = format!("resource \"aws_cloudwatch_metric_alarm\" \"{name}\"");
+            match stripped.iter().find(|s| s.contains(&needle)) {
+                Some(src) => !declares_disarmed(alarm_block(src, name)),
+                None => true,
+            }
+        })
+        .collect()
+}
+
+fn all_terraform_sources() -> Vec<String> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<String>) {
+        let entries =
+            std::fs::read_dir(dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
+        for entry in entries {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "tf") {
+                out.push(
+                    std::fs::read_to_string(&path)
+                        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display())),
+                );
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/aws/terraform");
+    let mut out = Vec::new();
+    walk(&root, &mut out);
+    out
+}
+
+/// WIDENED 2026-09-23 (dhan-rest-only-noise-lock-2026-07-14.md §2.3x).
+///
+/// The scan above checks only BREACHING alarms, and only in one file. But the
+/// gate owns the arming of EVERY alarm in its list, breaching or not: it
+/// enables actions at 09:20 IST and disables them at close. Terraform's
+/// default for `actions_enabled` is TRUE, so any member that omits the line
+/// is re-armed by every apply and pages outside the window the gate exists to
+/// keep quiet. Three members did exactly that on 2026-09-23
+/// (`tick_spill_replay_failing`, `ticks_spilling`,
+/// `aggregator_refusal_rate_high`), and the one that paged that morning,
+/// `ws_no_alive_connections`, was not in the list at all.
+///
+/// This derives the membership from the gate itself, so a future member is
+/// covered without anyone remembering to add it here.
+#[test]
+fn every_gate_listed_alarm_ships_disarmed() {
+    let members = gate_members(GATE);
+    assert!(
+        members.len() >= 10,
+        "expected at least ten gate members, parsed {} ({members:?}). A broken parser \
+         reporting zero members would make this guard pass vacuously.",
+        members.len()
+    );
+    let offenders = members_not_shipped_disarmed(GATE, &all_terraform_sources());
+    assert!(
+        offenders.is_empty(),
+        "these market-hours-gated alarms do not ship `actions_enabled = false` (or their \
+         resource was not found): {offenders:?}. The gate Lambda only ENABLES actions for \
+         the session; an alarm that ships armed is re-armed by every terraform apply and \
+         pages all night and all weekend."
+    );
+}
+
+#[test]
+fn the_disarmed_gate_scan_bites_on_an_armed_member() {
+    // Anti-vacuity: an armed member, a member with no resource, and a
+    // commented-out member must be handled correctly.
+    let gate = "ALARM_NAMES = join(\",\", [\n\
+                aws_cloudwatch_metric_alarm.ok_one.alarm_name,\n\
+                aws_cloudwatch_metric_alarm.armed_one.alarm_name,\n\
+                aws_cloudwatch_metric_alarm.missing_one.alarm_name,\n\
+                # aws_cloudwatch_metric_alarm.commented_one.alarm_name,\n\
+                ])";
+    let tf = vec![String::from(
+        "resource \"aws_cloudwatch_metric_alarm\" \"ok_one\" {\n  actions_enabled   = false\n}\n\
+         resource \"aws_cloudwatch_metric_alarm\" \"armed_one\" {\n  # actions_enabled = false\n  alarm_actions = []\n}\n",
+    )];
+    assert_eq!(
+        gate_members(gate),
+        vec!["ok_one", "armed_one", "missing_one"],
+        "a commented-out member must never count"
+    );
+    assert_eq!(
+        members_not_shipped_disarmed(gate, &tf),
+        vec!["armed_one", "missing_one"],
+        "an armed member (even one whose disarm line is only a COMMENT) and a member \
+         with no resource must both be reported"
+    );
+}
