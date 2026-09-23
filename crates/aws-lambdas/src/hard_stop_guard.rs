@@ -82,8 +82,21 @@ pub const SEPTEMBER_2026_ALLOWANCE: (i32, u32) = (2026, 9);
 /// the spend and the line describing the same month.
 ///
 /// Never RAISES a configured value: a lower configured ceiling stays lower.
+///
+/// **A non-finite or non-positive configured value is REFUSED** and replaced
+/// by `DEFAULT_BUDGET_KILL_USD` before the month clamp. Rust parses `"nan"`,
+/// `"inf"` and `"-5"` as valid `f64`s, so the env parse's fail-soft arm never
+/// sees them. Unguarded, NaN would make every `mtd >= line` compare false and
+/// the September box could never be stopped (fail-OPEN), while `0` or a
+/// negative line would stop the box every hour. The default is the safe
+/// middle: it still stops, and the month clamp still applies to it.
 /// O(1), no allocation.
 pub fn effective_budget_kill_usd(configured: f64, billing_year: i32, billing_month: u32) -> f64 {
+    let configured = if configured.is_finite() && configured > 0.0 {
+        configured
+    } else {
+        DEFAULT_BUDGET_KILL_USD
+    };
     if (billing_year, billing_month) == SEPTEMBER_2026_ALLOWANCE {
         configured
     } else {
@@ -1929,6 +1942,28 @@ After investigating the spend, re-enable with:\n  aws events enable-rule --name 
         // The allowance is one billing month, never "every September".
         assert_eq!(effective_budget_kill_usd(225.0, 2027, 9), 150.0);
         assert_eq!(effective_budget_kill_usd(225.0, 2025, 9), 150.0);
+    }
+
+    #[test]
+    fn test_effective_budget_kill_usd_refuses_non_finite_and_non_positive() {
+        // NaN in September would make `mtd >= line` always false: the box
+        // could never be stopped. It must fall back to a real line.
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -0.0, -5.0] {
+            assert_eq!(
+                effective_budget_kill_usd(bad, 2026, 9),
+                DEFAULT_BUDGET_KILL_USD,
+                "September must fall back to the default for {bad}"
+            );
+            assert_eq!(
+                effective_budget_kill_usd(bad, 2026, 10),
+                STANDING_BUDGET_KILL_USD,
+                "October must still clamp to the standing line for {bad}"
+            );
+        }
+        // Every result is a finite, positive line a spend compare can cross.
+        let line = effective_budget_kill_usd(f64::NAN, 2026, 9);
+        assert!(line.is_finite() && line > 0.0);
+        assert!(140.0_f64 < line && 230.0_f64 >= line);
     }
 
     #[test]
