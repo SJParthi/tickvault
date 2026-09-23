@@ -1384,7 +1384,7 @@ enum PartitionListing {
 /// stays a failure that keeps the day unlatched. Case-insensitive on the
 /// phrase because the wording is QuestDB's, not ours. O(body), cold path.
 #[must_use]
-pub(crate) fn is_table_absent_response(body: &str) -> bool {
+fn is_table_absent_response(body: &str) -> bool {
     if !body.contains("\"error\"") {
         return false;
     }
