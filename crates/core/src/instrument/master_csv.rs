@@ -180,7 +180,15 @@ pub struct MasterRow {
     pub strike_paise: i64,
     /// `OPTION_TYPE` — which leg, or [`OptionLeg::None`].
     pub option_leg: OptionLeg,
-    /// `UNDERLYING_SYMBOL`, uppercased. Empty for non-derivative rows.
+    /// `UNDERLYING_SYMBOL`, uppercased.
+    ///
+    /// ⚠ CORRECTED 2026-09-23: this said "Empty for non-derivative rows".
+    /// FALSE on the live master — an NSE cash-equity row carries its TICKER
+    /// here (`RELIANCE`) while `symbol_name` holds the COMPANY name
+    /// (`RELIANCE INDUSTRIES LTD`), verified on prod `instrument_lifecycle`.
+    /// A consumer joining a cash-equity row to its derivatives must key on
+    /// THIS field; `dhan_universe::fno_underlying_mappings` joined on
+    /// `symbol_name` and resolved only the vendor's test rows because of it.
     ///
     /// The grouping key for contract selection. `UNDERLYING_SECURITY_ID` is
     /// deliberately NOT carried: it is an id without its segment, and an id

@@ -420,3 +420,21 @@ This rule activates when editing:
   `[order_runtime]`
 - Any file containing `spawn_order_runtime`, `MarkForwarder`, `FillEvent`,
   or `tv_order_runtime_up`
+
+**2026-09-23 — the paper self-test SKIPS instead of FAILING when no mark
+exists.** Operator verbatim (preserve exactly): *"meanwhile check so many
+errors false telegram ntofications dude fix and resolve evryhtign dude
+okaay?"*. The self-test places a paper order that can only fill on a mark.
+With no mark producer it cannot pass, so failing it reported a missing FEED
+as a broken ORDER PATH. Two changes, both counted and never silent:
+(1) the self-test does not arm while the mark channel is closed
+(`skip("skipped_no_marks")`); (2) the 180 s AwaitingMark timeout is a
+`skip("no_mark")`, not a failure. A self-test that GETS a mark and then
+misbehaves still fails loudly on OMS-GAP-06. The runtime-respawn `error!`
+now carries `source = "runtime_respawn"`, the field the `oms-gap-06`
+CloudWatch filter has always required. Before this, that filter could not
+match the line it was written for. Pinned by
+`test_selftest_awaiting_mark_timeout_is_a_skip_not_a_failure`,
+`test_selftest_never_arms_without_a_mark_producer` and
+`test_respawn_error_carries_the_paged_source_field`. Full record:
+`dhan-rest-only-noise-lock-2026-07-14.md` §2.3x.

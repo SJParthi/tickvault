@@ -1941,15 +1941,31 @@ impl DepthWriter {
             };
         }
         let Some(sender) = self.sender.as_mut() else {
+            let rescued_before = self.rescued;
             let dropped = self.discard_pending();
-            error!(
-                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
-                feed = self.feed.as_str(),
-                dropped,
-                "market_depth flush with no QuestDB connection — {dropped} depth row(s) left \
-                 the buffer; see the preceding line for whether they were rescued to the \
-                 depth spill tier or permanently lost"
-            );
+            // §2.3x (2026-09-23): split by outcome so the pager filter can
+            // exclude the rescued arm by `source` — a rescued batch is on disk.
+            if self.rescued > rescued_before {
+                error!(
+                    code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                    feed = self.feed.as_str(),
+                    dropped,
+                    rescued = true,
+                    source = crate::tick_persistence::RESCUED_TO_SPILL_SOURCE,
+                    "market_depth flush with no QuestDB connection — {dropped} depth row(s) \
+                     left the buffer and were RESCUED to the depth spill tier (see the \
+                     preceding line); they are NOT lost and NOT in QuestDB"
+                );
+            } else {
+                error!(
+                    code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                    feed = self.feed.as_str(),
+                    dropped,
+                    rescued = false,
+                    "market_depth flush with no QuestDB connection — {dropped} depth row(s) \
+                     left the buffer and the rescue failed; see the preceding line"
+                );
+            }
             anyhow::bail!("market_depth writer disconnected; {dropped} row(s) discarded");
         };
         let started = std::time::Instant::now();
@@ -2033,6 +2049,7 @@ impl DepthWriter {
                         feed = self.feed.as_str(),
                         dropped,
                         rescued = true,
+                        source = crate::tick_persistence::RESCUED_TO_SPILL_SOURCE,
                         ?err,
                         "market_depth flush FAILED — {dropped} depth row(s) left the buffer \
                          and were RESCUED to the depth spill file named on the preceding \
@@ -2256,6 +2273,7 @@ fn perform_depth_rescue(
                 code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                 feed = feed.as_str(),
                 rescued = rows,
+                source = crate::tick_persistence::RESCUED_TO_SPILL_SOURCE,
                 bytes = payload_len,
                 path = %path.display(),
                 "market_depth flush failed — the buffered levels were RESCUED to the \
@@ -2664,6 +2682,7 @@ impl DepthWriterSink {
                     code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                     feed = self.feed.as_str(),
                     rescued = rows,
+                    source = crate::tick_persistence::RESCUED_TO_SPILL_SOURCE,
                     bytes = payload_len,
                     reason = why,
                     path = %path.display(),

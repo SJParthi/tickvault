@@ -41,7 +41,7 @@
 //! holds no state, so every edge below is a unit test rather than a live
 //! surprise.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use tickvault_common::types::ExchangeSegment;
 use tickvault_core::websocket::pool_supervisor::{
@@ -49,8 +49,8 @@ use tickvault_core::websocket::pool_supervisor::{
 };
 
 use crate::depth200_atm::{
-    ChainMinute, Depth200AtmConfig, Depth200AtmTracker, NoTopMoverSwitch, PlannedSwap, StrikePair,
-    TOP_MOVER_CONFIRM_OBSERVATIONS, TopMoverPick, TopMoverSocket, plan_swaps,
+    ChainMinute, Depth200AtmTracker, NoTopMoverSwitch, PlannedSwap, StrikePair, TopMoverPick,
+    TopMoverSocket, plan_swaps,
 };
 use crate::dhan_depth_universe::{DepthCandidate, contract_segment_for_underlying};
 use crate::dhan_feed_stack::ist_second_of_day_now;
@@ -645,6 +645,150 @@ pub fn top_mover_pick(rows: &[MoverRow], candidates: &[DepthCandidate]) -> Optio
     })
 }
 
+/// How many movers the boot set may try per depth-200 socket before it stops.
+///
+/// Each try is an [`atm_pair_for`] call, which is three passes over the
+/// candidate slice. Bounding the tries bounds the boot attempt at
+/// `DEPTH_200_TOTAL_SOCKETS × this × 3` passes.
+///
+/// CORRECTED 2026-09-23 (hostile review): a try is counted only when
+/// [`atm_pair_for`] is actually CALLED. Until then a mover with no option
+/// ladder at all (a Nifty Total Market name outside F&O) and a repeated
+/// underlying each consumed a try, so on an ordinary morning the walk could
+/// give up after four non-F&O leaders and dial FEWER than five sockets —
+/// leaving `depth_done` false until the attach gave up at `out_of_time`. Both
+/// are now rejected by an O(1) set probe before the budget is touched.
+pub const DEPTH_200_BOOT_MOVER_TRIES_PER_SOCKET: usize = 4;
+
+/// The depth-200 boot dial: up to `budget` STOCK-option at-the-money legs, one
+/// per DISTINCT underlying, taken from today's movers in order of absolute move.
+///
+/// Scope lock 2026-09-23: depth-200 is stock options at every stage. Until
+/// that day the boot dial put NIFTY and BANKNIFTY at-the-money pairs on four of
+/// the five sockets, because the volume ranking that chooses stock options does
+/// not exist before the open. This is the stock-only replacement.
+///
+/// # What is and is not chosen
+///
+/// * Only candidates with `is_index_option == false` are considered, so an
+///   index contract cannot reach a depth-200 socket through this path even if
+///   a mover's symbol collided with an index name.
+/// * `held` is the I-P1-11 key of every depth-200 contract whose connection
+///   slot is already spent. Each held contract is kept in the output and its
+///   UNDERLYING is marked taken, so a later attempt whose movers re-ordered
+///   (or whose leader flipped from a rise to a fall) can never place a second
+///   contract of an underlying that already holds a socket. Held slots count
+///   against `budget`.
+/// * One contract per underlying: the call on a riser, the put on a faller —
+///   the same leg rule [`TopMoverPick::leg_security_id`] uses, because the side
+///   of the move is where the order flow is.
+/// * A mover with a non-finite or zero move is skipped (it has no direction).
+/// * A mover whose symbol has no stock-option ladder is skipped WITHOUT
+///   spending a try (see [`DEPTH_200_BOOT_MOVER_TRIES_PER_SOCKET`]).
+/// * Fewer than `budget` usable movers means FEWER than `budget` legs. The gap
+///   is never filled with an index contract; the attach loop asks again.
+///
+/// # Complexity
+///
+/// O(candidates) to build the ladder and held-underlying sets, O(movers log
+/// movers) to rank, then at most `budget × DEPTH_200_BOOT_MOVER_TRIES_PER_SOCKET`
+/// calls to [`atm_pair_for`], each O(candidates). Every per-mover rejection is
+/// an O(1) hash probe. Cold path: once per attach attempt, before depth dials.
+#[must_use]
+pub fn stock_option_boot_set(
+    rows: &[MoverRow],
+    candidates: &[DepthCandidate],
+    budget: usize,
+    held: &HashSet<(u64, u8)>,
+) -> Vec<SubscribeInstrument> {
+    if budget == 0 {
+        return Vec::new();
+    }
+    let stock_candidates: Vec<DepthCandidate> = candidates
+        .iter()
+        .filter(|c| !c.is_index_option)
+        .cloned()
+        .collect();
+    let stock_segment_code = STOCK_OPTION_SEGMENT.binary_code();
+    let mut out: Vec<SubscribeInstrument> = Vec::with_capacity(budget);
+    // Underlyings that have at least one stock-option contract today.
+    let mut laddered: HashSet<&str> = HashSet::with_capacity(stock_candidates.len());
+    // Underlyings that already hold a socket, or were placed this call.
+    let mut taken: HashSet<&str> = HashSet::with_capacity(budget);
+    // Held contracts already emitted, so a contract listed twice in the
+    // artifact is kept once.
+    let mut held_emitted: HashSet<u64> = HashSet::with_capacity(held.len());
+    for candidate in &stock_candidates {
+        laddered.insert(candidate.underlying.as_str());
+        let Some(security_id) = u64::try_from(candidate.contract_security_id)
+            .ok()
+            .filter(|id| *id > 0)
+        else {
+            continue;
+        };
+        if held.contains(&(security_id, stock_segment_code)) {
+            taken.insert(candidate.underlying.as_str());
+            if held_emitted.insert(security_id) {
+                out.push(SubscribeInstrument {
+                    security_id,
+                    segment: STOCK_OPTION_SEGMENT,
+                });
+            }
+        }
+    }
+    // A held slot the artifact no longer names still occupies a connection.
+    let remaining = budget.saturating_sub(held.len().max(out.len()));
+    if remaining == 0 {
+        return out;
+    }
+
+    let mut ranked: Vec<&MoverRow> = rows
+        .iter()
+        .filter(|r| r.pct_change.is_finite() && r.pct_change != 0.0)
+        .collect();
+    // Largest absolute move first; ties broken on the id so two runs over the
+    // same rows choose the same set.
+    ranked.sort_by(|a, b| {
+        b.pct_change
+            .abs()
+            .total_cmp(&a.pct_change.abs())
+            .then(a.security_id.cmp(&b.security_id))
+    });
+
+    let max_tries = budget.saturating_mul(DEPTH_200_BOOT_MOVER_TRIES_PER_SOCKET);
+    let mut tries: usize = 0;
+    let mut placed: usize = 0;
+    for row in ranked {
+        if placed >= remaining || tries >= max_tries {
+            break;
+        }
+        let symbol = row.symbol.as_str();
+        // Both O(1), and neither spends a try.
+        if taken.contains(symbol) || !laddered.contains(symbol) {
+            continue;
+        }
+        tries = tries.saturating_add(1);
+        let Some(pair) = atm_pair_for(&stock_candidates, symbol) else {
+            continue;
+        };
+        let leg = if row.pct_change > 0.0 {
+            pair.ce_security_id
+        } else {
+            pair.pe_security_id
+        };
+        let Some(security_id) = u64::try_from(leg).ok().filter(|id| *id > 0) else {
+            continue;
+        };
+        taken.insert(symbol);
+        placed = placed.saturating_add(1);
+        out.push(SubscribeInstrument {
+            security_id,
+            segment: STOCK_OPTION_SEGMENT,
+        });
+    }
+    out
+}
+
 /// The per-minute movers query.
 ///
 /// # Why `LATEST ON` and not `max(ts)`
@@ -696,12 +840,18 @@ pub fn build_movers_query(today_ist_micros: i64) -> String {
     // identical to what was measured.
     let market_open_micros =
         today_ist_micros.saturating_add(MARKET_OPEN_SECS_OF_DAY_IST.saturating_mul(1_000_000));
+    // 2026-09-23: the mover's name is the TICKER (`underlying_symbol`,
+    // "RELIANCE"), never `symbol_name` (the company name, "RELIANCE
+    // INDUSTRIES LTD"). The name is a join key into the option candidates,
+    // which are keyed on the contract's UNDERLYING_SYMBOL — the company name
+    // matched nothing, and the depth-20 name board resolved zero stocks all
+    // session while its fallback engine ran instead.
     format!(
-        "SELECT c.security_id, il.symbol_name, c.percentage_change AS close_pct_from_prev_day \
+        "SELECT c.security_id, il.underlying_symbol, c.percentage_change AS close_pct_from_prev_day \
          FROM (SELECT security_id, percentage_change FROM candles_1m \
          WHERE feed = 'dhan' AND segment = '{segment}' AND ts >= {market_open_micros} \
          LATEST ON ts PARTITION BY security_id) c \
-         JOIN (SELECT security_id, symbol_name FROM instrument_lifecycle \
+         JOIN (SELECT security_id, underlying_symbol FROM instrument_lifecycle \
          WHERE feed = 'dhan' AND exchange_segment = '{segment}') il \
          ON c.security_id = il.security_id;"
     )
@@ -746,7 +896,7 @@ pub fn build_movers_query(today_ist_micros: i64) -> String {
 pub fn build_preopen_movers_query(today_ist_micros: i64) -> String {
     let segment = MOVER_UNDERLYING_SEGMENT.as_str();
     format!(
-        "SELECT t.security_id, il.symbol_name,          ((t.ltp - t.close) / t.close) * 100.0 AS close_pct_from_prev_day          FROM (SELECT security_id, ltp, close FROM ticks          WHERE feed = 'dhan' AND segment = '{segment}' AND ts >= {today_ist_micros}          AND ltp > 0 AND close > 0          LATEST ON ts PARTITION BY security_id) t          JOIN (SELECT security_id, symbol_name FROM instrument_lifecycle          WHERE feed = 'dhan' AND exchange_segment = '{segment}') il          ON t.security_id = il.security_id;"
+        "SELECT t.security_id, il.underlying_symbol,          ((t.ltp - t.close) / t.close) * 100.0 AS close_pct_from_prev_day          FROM (SELECT security_id, ltp, close FROM ticks          WHERE feed = 'dhan' AND segment = '{segment}' AND ts >= {today_ist_micros}          AND ltp > 0 AND close > 0          LATEST ON ts PARTITION BY security_id) t          JOIN (SELECT security_id, underlying_symbol FROM instrument_lifecycle          WHERE feed = 'dhan' AND exchange_segment = '{segment}') il          ON t.security_id = il.security_id;"
     )
 }
 
@@ -834,6 +984,15 @@ impl RebalanceDecision {
 }
 
 /// One minute of rebalance, decided but not sent.
+///
+/// ⚠ 2026-09-23: NO LONGER A PRODUCTION STEER SOURCE. The rebalance loop
+/// stopped calling this when depth-200 became stock-options-only at every
+/// stage (websocket-connection-scope-lock.md, "DEPTH-200 IS STOCK OPTIONS AT
+/// EVERY STAGE"): its four index sockets are NIFTY/BANKNIFTY at-the-money
+/// pairs, which that lock bans from depth-200. It is kept, with its tests,
+/// only because its tracker and top-mover machinery remain the tested
+/// reference for the chain-minute grouping; re-wiring it into the loop is a
+/// REJECT under that section.
 ///
 /// # Why both engines run on one call
 ///
@@ -1456,22 +1615,6 @@ pub async fn run_depth_rebalance(
     // never-created series reads as missing data rather than as stale.
     let heartbeat = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
     spawn_rebalance_heartbeat(std::sync::Arc::clone(&heartbeat));
-    let mut tracker = Depth200AtmTracker::new(Depth200AtmConfig::default());
-    // Seed the fifth socket's tracker from what the dial actually put on it.
-    //
-    // A fresh tracker holds nothing, so its first minute would report a first
-    // adoption and subscribe a contract the connection is already holding.
-    // Dhan answers a duplicate subscription with an 804, which is Fatal and
-    // drops the connection — losing the socket on its first minute from a
-    // message that was never needed. Read from the socket rather than passed
-    // in, so the seed cannot disagree with the wire.
-    let mut top_mover = match sockets
-        .get(crate::depth200_atm::DEPTH_200_TOP_MOVER_SOCKET)
-        .and_then(|s| s.held)
-    {
-        Some(held) => TopMoverSocket::seeded(held, TOP_MOVER_CONFIRM_OBSERVATIONS),
-        None => TopMoverSocket::default(),
-    };
     tracing::info!(
         sockets = sockets.len(),
         offset_secs = REBALANCE_OFFSET_SECS,
@@ -2006,10 +2149,15 @@ pub async fn run_depth_rebalance(
             None if crate::depth_seed::boot_seeded(crate::depth_seed::SeedPool::Depth200) => {
                 (RebalanceDecision::default(), "seed_until_first_ranking")
             }
-            None => (
-                plan_minute(&mut tracker, &mut top_mover, &held, &candidates, &movers),
-                "atm_until_first_ranking",
-            ),
+            // 2026-09-23 (websocket-connection-scope-lock.md, "DEPTH-200 IS
+            // STOCK OPTIONS AT EVERY STAGE"): before the first ranking the
+            // pool HOLDS what the boot dial placed — up to five stock-option
+            // at-the-money legs from distinct movers. It is NOT handed to
+            // `plan_minute`, whose four index sockets would re-centre the pool
+            // onto NIFTY/BANKNIFTY options: the exact class the operator
+            // banned from depth-200. An empty slot stays empty until the
+            // ranking fills it; an index option is never a gap-filler.
+            None => (RebalanceDecision::default(), "hold_until_first_ranking"),
         };
         if decision.is_quiet() {
             // The overwhelmingly common minute. No log line: ~375 of these a
@@ -2639,6 +2787,29 @@ mod tests {
             "a LEFT join returns rows that can rank but never resolve: {sql}"
         );
         assert!(sql.contains("instrument_lifecycle"), "{sql}");
+    }
+
+    /// 2026-09-23 incident: the name board resolved ZERO stock names all
+    /// session (`names_unresolved` 378, `names_chosen` 0) because both movers
+    /// queries returned `symbol_name` — the COMPANY name, "RELIANCE
+    /// INDUSTRIES LTD" — while every option candidate is keyed on the
+    /// contract's `UNDERLYING_SYMBOL`, the TICKER "RELIANCE". Verified live:
+    /// `instrument_lifecycle` security_id 2885 carries both, and only the
+    /// ticker matches an OPTSTK row. The mover's name is a JOIN KEY into the
+    /// option chain, so it must be the column the chain is keyed on.
+    #[test]
+    fn both_movers_queries_return_the_ticker_the_option_chain_is_keyed_on() {
+        for sql in [build_movers_query(1), build_preopen_movers_query(1)] {
+            assert!(
+                sql.contains("il.underlying_symbol"),
+                "the mover name must be the ticker (underlying_symbol): {sql}"
+            );
+            assert!(
+                !sql.contains("symbol_name"),
+                "symbol_name is the company name and never matches an option's \
+                 underlying — the 2026-09-23 name-board outage: {sql}"
+            );
+        }
     }
 
     // ---- parse_movers_dataset ----
@@ -3568,36 +3739,58 @@ mod fifth_socket_tests {
         );
     }
 
+    /// 2026-09-23 (websocket-connection-scope-lock.md, "DEPTH-200 IS STOCK
+    /// OPTIONS AT EVERY STAGE"). This test replaced
+    /// `the_attach_dials_the_fifth_socket_from_the_same_rule_that_steers_it`,
+    /// which pinned the boot dial to `top_mover_pick` for ONE socket beside
+    /// four NIFTY/BANKNIFTY index sockets — the shape the operator banned. The
+    /// boot dial now fills ALL depth-200 sockets from `stock_option_boot_set`,
+    /// and must never again take its depth-200 set from the index selector.
     #[test]
-    fn the_attach_dials_the_fifth_socket_from_the_same_rule_that_steers_it() {
-        // If the dial picked by a different rule, the socket's first contract
-        // would be one the rebalance would never have chosen, and its first
-        // real minute would be a swap away from it — a wasted wire call on
-        // every session start.
+    fn the_attach_dials_depth200_from_the_stock_only_boot_set() {
         let source = include_str!("dhan_feed_stack.rs");
         let production = source
             .split_once("\n#[cfg(test)]")
             .map_or(source, |(before, _)| before);
         assert!(
-            production.contains("crate::depth_rebalance::top_mover_pick("),
-            "the fifth socket must be dialed by top_mover_pick — the SAME function \
-             plan_minute calls, so the dialed contract is one the rebalance would \
-             have chosen"
+            production.contains("crate::depth_rebalance::stock_option_boot_set("),
+            "the depth-200 boot dial must come from stock_option_boot_set"
+        );
+        assert!(
+            !production.contains("crate::depth_rebalance::top_mover_pick("),
+            "the boot dial must not reintroduce the one-socket top-mover beside index pairs"
         );
     }
 
+    /// 2026-09-23. Replaced
+    /// `the_loop_seeds_its_tracker_from_the_socket_rather_than_a_parameter`:
+    /// the loop no longer runs the index at-the-money engine at all, so there
+    /// is no tracker to seed. Before the first ranking the pool HOLDS; it is
+    /// never handed to `plan_minute`, whose four index sockets would put
+    /// NIFTY/BANKNIFTY options back on depth-200.
     #[test]
-    fn the_loop_seeds_its_tracker_from_the_socket_rather_than_a_parameter() {
-        // A seed passed in can disagree with the wire; a seed read from the
-        // socket cannot. And an unseeded tracker re-subscribes what the dial
-        // already placed, which Dhan answers with a Fatal 804.
+    fn test_run_depth_rebalance_holds_depth200_until_the_first_ranking_and_never_runs_the_index_engine()
+     {
         let source = include_str!("depth_rebalance.rs");
         let production = source
             .split_once("\n#[cfg(test)]")
             .map_or(source, |(before, _)| before);
+        let loop_start = production
+            .find("pub async fn run_depth_rebalance")
+            .or_else(|| production.find("async fn run_depth_rebalance"))
+            .expect("the rebalance loop exists");
+        let loop_body = &production[loop_start..];
         assert!(
-            production.contains("TopMoverSocket::seeded(held,"),
-            "the rebalance loop must seed the top-mover tracker from what the socket holds"
+            !loop_body.contains("plan_minute(&mut"),
+            "the rebalance loop must not call the index at-the-money engine"
+        );
+        assert!(
+            !loop_body.contains("Depth200AtmTracker::new("),
+            "the rebalance loop must not build an index at-the-money tracker"
+        );
+        assert!(
+            loop_body.contains("\"hold_until_first_ranking\""),
+            "before the first ranking depth-200 must hold, under its own engine label"
         );
     }
 
@@ -4299,5 +4492,240 @@ mod expiry_permutation_tests {
             "the pre-2026-09-13 cap of four cut 20 of a name's 24 swaps, which \
              is the six-minute rotation this change exists to end"
         );
+    }
+}
+
+/// 2026-09-23 ratchets for the stock-only depth-200 boot set
+/// (websocket-connection-scope-lock.md, "DEPTH-200 IS STOCK OPTIONS AT EVERY
+/// STAGE"). Kept at the END of the file on purpose: the source-scan tests
+/// above slice "production" at the FIRST `#[cfg(test)]`, so a test module
+/// placed earlier would silently hide the rebalance loop from them.
+#[cfg(test)]
+mod stock_boot_set_tests {
+    use super::*;
+
+    fn candidate(underlying: &str, strike: f64, leg: &str, id: i64, spot: f64) -> DepthCandidate {
+        DepthCandidate {
+            underlying: underlying.to_owned(),
+            contract_security_id: id,
+            expiry_micros: 1_900_000_000_000_000,
+            strike,
+            spot,
+            leg: leg.to_owned(),
+            is_index_option: underlying == "NIFTY" || underlying == "BANKNIFTY",
+        }
+    }
+
+    /// One at-the-money CE/PE pair: CE id = `base`, PE id = `base + 1`.
+    fn ladder(underlying: &str, spot: f64, base: i64) -> Vec<DepthCandidate> {
+        vec![
+            candidate(underlying, spot, "CE", base, spot),
+            candidate(underlying, spot, "PE", base + 1, spot),
+        ]
+    }
+
+    fn mover(id: u64, symbol: &str, pct: f64) -> MoverRow {
+        MoverRow {
+            security_id: id,
+            segment: MOVER_UNDERLYING_SEGMENT,
+            symbol: symbol.to_owned(),
+            pct_change: pct,
+        }
+    }
+
+    fn ids(set: &[SubscribeInstrument]) -> Vec<u64> {
+        set.iter().map(|i| i.security_id).collect()
+    }
+
+    #[test]
+    fn test_stock_option_boot_set_never_admits_an_index_option_even_when_the_index_is_the_biggest_mover()
+     {
+        let mut candidates = ladder("NIFTY", 24_500.0, 900);
+        candidates.extend(ladder("RELIANCE", 2_900.0, 100));
+        let movers = [mover(13, "NIFTY", 9.0), mover(2885, "RELIANCE", 1.0)];
+        let set = stock_option_boot_set(&movers, &candidates, 5, &HashSet::new());
+        assert_eq!(ids(&set), vec![100]);
+        assert!(set.iter().all(|i| i.segment == STOCK_OPTION_SEGMENT));
+    }
+
+    #[test]
+    fn one_socket_per_underlying_even_when_it_appears_twice() {
+        let candidates = ladder("RELIANCE", 2_900.0, 100);
+        let movers = [mover(2885, "RELIANCE", 4.0), mover(2885, "RELIANCE", 3.0)];
+        assert_eq!(
+            ids(&stock_option_boot_set(
+                &movers,
+                &candidates,
+                5,
+                &HashSet::new()
+            )),
+            vec![100]
+        );
+    }
+
+    #[test]
+    fn a_riser_takes_the_call_and_a_faller_takes_the_put() {
+        let mut candidates = ladder("RELIANCE", 2_900.0, 100);
+        candidates.extend(ladder("TCS", 4_100.0, 200));
+        let movers = [mover(2885, "RELIANCE", 3.0), mover(11536, "TCS", -2.0)];
+        assert_eq!(
+            ids(&stock_option_boot_set(
+                &movers,
+                &candidates,
+                5,
+                &HashSet::new()
+            )),
+            vec![100, 201]
+        );
+    }
+
+    #[test]
+    fn the_largest_absolute_move_is_placed_first_and_the_budget_is_a_hard_cap() {
+        let mut candidates = Vec::new();
+        let mut movers = Vec::new();
+        for n in 0..8_u64 {
+            let symbol = format!("STK{n}");
+            let base = i64::try_from(1_000 + n * 10).expect("small");
+            candidates.extend(ladder(&symbol, 1_000.0, base));
+            // Movers 1% .. 8%; the biggest must win.
+            let pct = f64::from(u32::try_from(n + 1).expect("small"));
+            movers.push(mover(500 + n, &symbol, pct));
+        }
+        let set = stock_option_boot_set(&movers, &candidates, 5, &HashSet::new());
+        assert_eq!(set.len(), 5);
+        assert_eq!(ids(&set), vec![1_070, 1_060, 1_050, 1_040, 1_030]);
+    }
+
+    #[test]
+    fn empty_movers_zero_budget_and_flat_or_unpriced_rows_place_nothing() {
+        let candidates = ladder("RELIANCE", 2_900.0, 100);
+        assert!(stock_option_boot_set(&[], &candidates, 5, &HashSet::new()).is_empty());
+        assert!(
+            stock_option_boot_set(
+                &[mover(1, "RELIANCE", 3.0)],
+                &candidates,
+                0,
+                &HashSet::new()
+            )
+            .is_empty()
+        );
+        let flat = [mover(1, "RELIANCE", 0.0), mover(2, "RELIANCE", f64::NAN)];
+        assert!(stock_option_boot_set(&flat, &candidates, 5, &HashSet::new()).is_empty());
+    }
+
+    /// CORRECTED 2026-09-23 (hostile review). This test was
+    /// `the_walk_gives_up_after_its_try_budget_rather_than_scanning_every_mover`
+    /// and it pinned the DEFECT: four non-F&O leaders spent the whole try
+    /// budget and the slot stayed empty. A mover with no option ladder is now
+    /// rejected by an O(1) set probe BEFORE a try is spent.
+    #[test]
+    fn ladderless_movers_are_skipped_without_spending_the_try_budget() {
+        let mut movers: Vec<MoverRow> = (0..40_u64)
+            .map(|n| mover(700 + n, &format!("NOLADDER{n}"), 9.0))
+            .collect();
+        movers.push(mover(2885, "RELIANCE", 1.0));
+        let candidates = ladder("RELIANCE", 2_900.0, 100);
+        assert_eq!(
+            ids(&stock_option_boot_set(
+                &movers,
+                &candidates,
+                1,
+                &HashSet::new()
+            )),
+            vec![100]
+        );
+    }
+
+    #[test]
+    fn a_repeated_underlying_does_not_spend_the_try_budget_either() {
+        let mut movers: Vec<MoverRow> = (0..40_u64)
+            .map(|n| {
+                mover(
+                    2885,
+                    "RELIANCE",
+                    9.0 - f64::from(u32::try_from(n).expect("small")) * 0.1,
+                )
+            })
+            .collect();
+        movers.push(mover(11536, "TCS", 0.5));
+        let mut candidates = ladder("RELIANCE", 2_900.0, 100);
+        candidates.extend(ladder("TCS", 4_100.0, 200));
+        assert_eq!(
+            ids(&stock_option_boot_set(
+                &movers,
+                &candidates,
+                2,
+                &HashSet::new()
+            )),
+            vec![100, 200]
+        );
+    }
+
+    #[test]
+    fn the_walk_still_gives_up_after_its_try_budget_on_movers_with_no_pair() {
+        // A one-legged ladder IS a ladder, so it passes the free probe, but
+        // `atm_pair_for` finds no CE/PE pair — that IS a try. With budget 1
+        // the walk may try 4 such rows and never reaches the fifth.
+        let mut movers: Vec<MoverRow> = (0..4_u64)
+            .map(|n| mover(700 + n, &format!("ONELEG{n}"), 9.0))
+            .collect();
+        movers.push(mover(2885, "RELIANCE", 1.0));
+        let mut candidates = ladder("RELIANCE", 2_900.0, 100);
+        for n in 0..4_i64 {
+            candidates.push(candidate(
+                &format!("ONELEG{n}"),
+                1_000.0,
+                "CE",
+                500 + n,
+                1_000.0,
+            ));
+        }
+        assert!(stock_option_boot_set(&movers, &candidates, 1, &HashSet::new()).is_empty());
+        assert_eq!(
+            DEPTH_200_BOOT_MOVER_TRIES_PER_SOCKET, 4,
+            "the try budget is part of the bounded-walk claim; move it deliberately"
+        );
+    }
+
+    /// Hostile review 2026-09-23: the movers re-order between attempts, and a
+    /// leader can flip from a rise to a fall. Without the held set the next
+    /// attempt picked RELIANCE's PUT while its CALL was already on a socket,
+    /// and the top-up dialed a SECOND contract of the same underlying.
+    #[test]
+    fn a_held_underlying_is_never_given_a_second_socket() {
+        let mut candidates = ladder("RELIANCE", 2_900.0, 100);
+        candidates.extend(ladder("TCS", 4_100.0, 200));
+        // Attempt 1 placed RELIANCE's call (id 100).
+        let held: HashSet<(u64, u8)> = [(100_u64, STOCK_OPTION_SEGMENT.binary_code())]
+            .into_iter()
+            .collect();
+        // Attempt 2: RELIANCE now falls, TCS rises.
+        let movers = [mover(2885, "RELIANCE", -6.0), mover(11536, "TCS", 2.0)];
+        let set = stock_option_boot_set(&movers, &candidates, 5, &held);
+        assert_eq!(
+            ids(&set),
+            vec![100, 200],
+            "the held call stays; no RELIANCE put"
+        );
+    }
+
+    #[test]
+    fn held_slots_count_against_the_budget() {
+        let mut candidates = ladder("RELIANCE", 2_900.0, 100);
+        candidates.extend(ladder("TCS", 4_100.0, 200));
+        candidates.extend(ladder("INFY", 1_600.0, 300));
+        let segment = STOCK_OPTION_SEGMENT.binary_code();
+        let held: HashSet<(u64, u8)> = [(100_u64, segment), (200_u64, segment)]
+            .into_iter()
+            .collect();
+        let movers = [mover(1594, "INFY", 3.0)];
+        assert_eq!(
+            ids(&stock_option_boot_set(&movers, &candidates, 2, &held)),
+            vec![100, 200],
+            "two held slots fill a budget of two; INFY waits"
+        );
+        // A held id the artifact no longer names still occupies its slot.
+        let ghost: HashSet<(u64, u8)> = [(999_u64, segment)].into_iter().collect();
+        assert!(stock_option_boot_set(&movers, &candidates, 1, &ghost).is_empty());
     }
 }

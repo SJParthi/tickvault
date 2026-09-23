@@ -22,7 +22,7 @@
 //!
 //! # What it does NOT do (honest limits)
 //!
-//! * It applies the 5-second ranking ONCE A MINUTE, on the steering loop's
+//! * It applies the 3-second ranking (5-second until 2026-09-23) ONCE A MINUTE, on the steering loop's
 //!   own cadence. The set therefore reflects the ranking as of the last sweep
 //!   before the minute mark. Moving the apply onto the 5-second timer would
 //!   put swap I/O on the frame drain, which the same lock forbids.

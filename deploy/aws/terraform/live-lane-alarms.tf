@@ -391,7 +391,17 @@ resource "aws_cloudwatch_metric_alarm" "ws_no_alive_connections" {
   # would page every evening.
   treat_missing_data = "notBreaching"
 
-  alarm_actions = local.app_alarm_actions
+  # 2026-09-23: GATED (dhan-rest-only-noise-lock-2026-07-14.md §2.3x). The
+  # notBreaching note above covers ABSENCE, but the gauge is not always
+  # absent off-hours: the process boots at 08:30 IST and publishes 0 for
+  # this gauge until the lane dials at 09:00, and publishes 0 again after
+  # the lane stands down post-close while the process is still up. Two
+  # consecutive 5-minute windows of that legitimate zero paged the operator
+  # before the market opened. The market-hours gate Lambda now enables this
+  # alarm's actions at 09:20 IST and disables them at close; it must ship
+  # DISARMED, because the gate cannot disarm an alarm that terraform arms.
+  actions_enabled = false
+  alarm_actions   = local.app_alarm_actions
   # An OK here is a genuine recovery — sockets came back — so it is worth
   # sending, unlike the loss alarms above where recovery is impossible.
   ok_actions = local.app_alarm_actions
@@ -749,7 +759,11 @@ resource "aws_cloudwatch_metric_alarm" "tick_spill_replay_failing" {
   dimensions         = local.app_dimensions
   treat_missing_data = "notBreaching"
 
-  alarm_actions = local.app_alarm_actions
+  # 2026-09-23 (dhan-rest-only-noise-lock §2.3x): gate-listed, so it ships
+  # DISARMED — terraform's default is armed, and every apply would re-arm it
+  # outside the window the market-hours gate Lambda owns.
+  actions_enabled = false
+  alarm_actions   = local.app_alarm_actions
   # The counter is cumulative and only a successful round changes the outcome.
   # A round succeeding does not un-happen the failure that preceded it.
   ok_actions = []
@@ -776,8 +790,12 @@ resource "aws_cloudwatch_metric_alarm" "ticks_spilling" {
   dimensions          = local.app_dimensions
   treat_missing_data  = "notBreaching"
 
-  alarm_actions = local.app_alarm_actions
-  ok_actions    = []
+  # 2026-09-23 (dhan-rest-only-noise-lock §2.3x): gate-listed, so it ships
+  # DISARMED — terraform's default is armed, and every apply would re-arm it
+  # outside the window the market-hours gate Lambda owns.
+  actions_enabled = false
+  alarm_actions   = local.app_alarm_actions
+  ok_actions      = []
 }
 
 # ---------------------------------------------------------------------------
@@ -1319,7 +1337,11 @@ resource "aws_cloudwatch_metric_alarm" "aggregator_refusal_rate_high" {
     }
   }
 
-  alarm_actions = local.app_alarm_actions
+  # 2026-09-23 (dhan-rest-only-noise-lock §2.3x): gate-listed, so it ships
+  # DISARMED — terraform's default is armed, and every apply would re-arm it
+  # outside the window the market-hours gate Lambda owns.
+  actions_enabled = false
+  alarm_actions   = local.app_alarm_actions
   # NO ok_actions. A ratio falling back is the vendor recovering or the window
   # ageing out - neither is a repair anyone performed.
   ok_actions = []

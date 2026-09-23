@@ -275,6 +275,25 @@ fn operator_facing_stop_times_are_in_lockstep() {
          operator-facing body (operator widened the window to 5:30 PM IST on \
          2026-08-08, Quote 14)."
     );
+
+    // EIGHTH site (added 2026-09-23, dhan-rest-only-noise-lock §2.3x): the
+    // app's own shutdown Telegram (`NotificationEvent::ShutdownInitiated`)
+    // told the operator "daily 4:30 PM IST window" for 46 days after the stop
+    // moved to 17:30 — and the ExternalStop body said a stop OUTSIDE "the
+    // 4:30 PM IST window" was unexpected, so every ordinary 5:30 PM stop read
+    // as a contradiction on the phone. Same silent-wrong-answer class, a
+    // different crate this guard never opened.
+    let events = read(&root.join("crates/core/src/notification/events.rs"));
+    assert!(
+        events.contains(&current),
+        "notification/events.rs shutdown bodies must name the CURRENT stop time \
+         as `{current}`"
+    );
+    assert!(
+        !events.contains("4:30 PM"),
+        "the retired 4:30 PM IST stop time must not reappear in \
+         notification/events.rs — it is rendered straight onto the operator's phone"
+    );
 }
 
 /// The FIFTH site: `.github/workflows/deploy-aws.yml`.
