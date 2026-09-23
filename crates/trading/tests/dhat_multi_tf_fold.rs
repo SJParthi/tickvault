@@ -108,6 +108,31 @@ fn dhat_consume_tick_zero_alloc_in_bucket_and_across_boundaries() {
                 "boundary crossings must actually seal — otherwise this test \
                  measures nothing and passes vacuously"
             );
+
+            // (c) 10,000 REPEATED QUOTES, added 2026-09-23 with the
+            // repeat-quote filter. A packet re-sent because the book or OI
+            // moved carries the SAME trade time, price and day-cumulative as
+            // the last accepted trade, and takes a different branch:
+            // `refresh_repeat_quote` across every timeframe instead of a fold.
+            // Phase (a) could never reach it, because its cumulative changes
+            // on every tick, so this branch ran on every quiet instrument all
+            // session with no allocation guard.
+            let repeat = tick_at(OPEN + 60 * 60, 24_000.0 + 60.0, 100_060);
+            let mut repeats = 0usize;
+            for _ in 0..10_000u32 {
+                if agg
+                    .consume_tick(Feed::Dhan, &repeat, None, |_, _, _, _, _| {})
+                    .repeat_quote
+                {
+                    repeats += 1;
+                }
+            }
+            assert!(
+                repeats >= 9_999,
+                "the repeated packets must take the repeat-quote branch, or \
+                 phase (c) measures the ordinary fold and passes vacuously; \
+                 got {repeats} of 10,000"
+            );
         },
     );
 

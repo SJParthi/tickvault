@@ -2461,6 +2461,108 @@ From 1 October the kill line is $150, enforced in code by
 - Raises the October ceiling above $150 without a fresh dated quote.
 - Changes the instance type under cover of this quote.
 
+**Quote 24 (2026-09-23, delete ALL S3 data before tonight's bare nuke — preserve EXACTLY, typos included):**
+> "See dude anyhwow tonight I will do the bare nuke dude and tomorrow everything will be entirely fresh new dude see meanwhile can you delete the entire S3 data as well dudde okay?"
+
+Recorded HERE before the deletion, per the rule-file-first law.
+
+#### What was in the bucket (measured 2026-09-23, `aws s3 ls --recursive --summarize`)
+
+`tv-prod-cold` is the only S3 bucket this repository declares (`main.tf`,
+`aws_s3_bucket.tv_cold`). Versioning was never enabled
+(`get-bucket-versioning` returns empty), so a delete is final: no hidden
+versions and no lingering storage charge.
+
+| Prefix | Objects | Size | What it is |
+|---|---:|---:|---|
+| `questdb-partitions/market_depth/` | 53 | 23.2 GB | archived depth partitions |
+| `questdb-partitions/ticks/` | 48 | 7.3 GB | archived tick partitions |
+| `questdb-partitions/candles_1s/` | 5 | 4.6 GB | archived candles |
+| `questdb-partitions/candles_5s/` | 5 | 1.5 GB | |
+| `questdb-partitions/candles_10s/` | 3 | 0.67 GB | retired frame |
+| `questdb-partitions/candles_15s/` | 3 | 0.53 GB | retired frame |
+| `questdb-partitions/candles_30s/` | 3 | 0.34 GB | retired frame |
+| `questdb-partitions/candles_3s/` | 1 | 0.16 GB | |
+| `deploys/` | 30 | 0.34 GB | release binaries, one folder per commit |
+| **Total** | **151** | **~38.7 GB** | |
+
+**No SEBI table was ever archived here.** Every prefix is market data or a
+deploy package. `instrument_lifecycle`, `instrument_lifecycle_audit`,
+`index_constituency`, `order_audit`, `order_update_events`,
+`position_update_events` and `ws_event_audit` have no S3 copy, so this delete
+cannot touch them.
+
+`deploys/` is safe to empty: `deploy-aws.yml` uploads `deploys/<sha>/` and the
+box downloads that same `<sha>` in the same run (lines 724-727 and 982-983).
+No path reads an older folder, and the next deploy uploads its own.
+
+#### ⚠ What this costs, stated rather than absorbed
+
+1. **The 5-year S3 tick retention this repository documents ends for these
+   dates.** `data-integrity.md` says "S3 cold: 5 years" and the bucket
+   lifecycle rule carries `expiration { days = 1825 } # 5 years per SEBI
+   retention`. The operator's own Quote 21 already classed `ticks`,
+   `market_depth` and every `candles_<tf>` as market data rather than SEBI
+   tables, and dropped their live copies on the box. Deleting the archives
+   removes the last copy of those dates. That is the operator's call and he
+   has made it; it is recorded so nobody later assumes the archives exist.
+2. **`partition_archive_audit` becomes a record of files that no longer
+   exist.** That table is on the SEBI keep-list and is never deleted. Its rows
+   say "archived to `questdb-partitions/<table>/<partition>.csv.gz`, verified".
+   After this delete those keys return 404. The full list of deleted keys,
+   with sizes, is committed at
+   `docs/audits/2026-09-23-s3-cold-deletion-manifest.txt`, so anyone
+   following an audit row can find why the file is gone. It lives in the repo
+   and not in the bucket because `s3:PutObject` is denied to
+   `claude-code-agent`: the tombstone upload was attempted and refused
+   (AccessDenied), so nothing was written to S3 besides the deletes.
+
+#### What a PR or action that violates Quote 24 looks like (REJECT)
+
+- Deletes anything outside `s3://tv-prod-cold/`.
+- Deletes a SEBI or audit TABLE ROW under cover of this quote. It covers S3 objects only.
+- Turns off the lifecycle rule, versioning or public-access block as part of the delete.
+- Deletes or edits the committed deletion manifest.
+- Presents the deleted dates as still retained anywhere.
+
+**Quote 25 (2026-09-23, bare nuke + delete all logs and traces for a fresh-scratch boot — preserve EXACTLY, typos included):**
+> "Do the bare nuke also dude okay? Meanwhile delete the entire logs entire traces dude tomorrow it shoudl be the fresh scratch boot application dydde oaky"
+
+Recorded HERE before the box is touched, per the rule-file-first law.
+
+#### What this authorizes
+
+| Surface | Disposition |
+|---|---|
+| Prod box `tv-prod-app` | **BARE NUKE**, run once, outside market hours: the existing `DOCKER_NUKE_BARE_COMMANDS` sequence (stop app → export SEBI tables → remove every container, image and volume → remove the data caches → re-enable the app) |
+| On-box app logs (`/opt/tickvault/data/logs/*`) and the systemd journal | **DELETED** |
+| CloudWatch **log streams** in `/tickvault/prod/app`, `/tickvault/prod/metrics` and every `/aws/lambda/tv-prod-*` group | **DELETED** (streams only) |
+| Next boot | Starts from scratch at the next scheduled 08:30 IST start: QuestDB recreated empty by `ensure-questdb.sh`, tables created by the boot DDL |
+
+#### What this does NOT touch
+
+| Surface | Why |
+|---|---|
+| SEBI and audit tables | The nuke EXPORTS them to `/opt/tickvault/data/sebi-preserve/<ts>/` first and ABORTS if an export fails. That directory is never deleted. This is the only copy left after the nuke. |
+| CloudWatch log **groups** | Deleting a group deletes its metric filters, and the alarms built on them would go dead. Only the streams inside are removed. |
+| `/aws/lambda/groww-token-minter` | bruteX-owned (`brutex-readonly-lock-2026-07-18.md`). Not ours to delete. |
+| Published CloudWatch metrics and alarm history | They cannot be deleted by API. They age out on AWS's own schedule. |
+| S3, EBS size, instance type, `limit_amount` | Unchanged. |
+
+#### ⚠ What is lost (stated, not absorbed)
+
+- All captured market data on the box (ticks, depth, candles, top_volume) and all app and Lambda log history.
+- SEBI data survives only as the on-box CSV export. The S3 cold copies were already deleted under Quote 24.
+- The first session after this boot runs on the boot dial: the instrument cache is gone and the daily rider rebuilds it that morning. The depth seed is also gone, so depth starts from the boot dial until the first volume ranking.
+
+#### What an action that violates Quote 25 looks like (REJECT)
+
+- Runs the nuke inside 09:00–15:45 IST.
+- Deletes `/opt/tickvault/data/sebi-preserve/`, or proceeds after a failed SEBI export.
+- Deletes a CloudWatch log group, metric filter or alarm under cover of this quote.
+- Deletes the `groww-token-minter` log group or its streams.
+- Leaves `tickvault.service` disabled after the nuke, so the next morning's start does nothing.
+
 
 ---
 
