@@ -1103,6 +1103,25 @@ pub enum IngestOutcome {
     /// The code twenty lines up already explains the real behaviour — only
     /// this variant's doc disagreed with it.
     AggregatorRefused,
+    /// The exchange day of the tick is not the day OUR clock received it on,
+    /// so it was refused outright — nothing folded, nothing written — by the
+    /// operator's 2026-09-10 directive (`websocket-connection-scope-lock.md`,
+    /// "A TICK WHOSE EXCHANGE DAY IS NOT THE RECEIPT DAY IS REFUSED
+    /// OUTRIGHT").
+    ///
+    /// Split out of `AggregatorRefused` on 2026-09-23 because a WAL replay
+    /// must not report it as LOSS. The live feed and the replay reach the same
+    /// verdict on the same receipt clock, so a replayed connect snapshot
+    /// carrying yesterday's trade time is refused by design, exactly as it
+    /// was when it first arrived. Until this variant existed the replay
+    /// counted it `lost` and paged `WS-SPILL-01` every trading morning at
+    /// ~08:31 IST (4 such ticks on 2026-09-23, all `stale_trading_day`).
+    ///
+    /// NOT everything that reads `stale_trading_day` lands here: the
+    /// WATERMARK arm of the fold can refuse a tick that traded and was
+    /// received on the same earlier day — genuinely captured data — and that
+    /// one stays `AggregatorRefused`, so a replay still reports it as loss.
+    RefusedWrongDay,
     /// The tick fell OUTSIDE the candle session, so no bucket could open — but
     /// the tick itself is perfectly valid and IS written to `ticks`.
     ///
@@ -3124,6 +3143,12 @@ impl LiveIngest {
             // as a delta by the 30s drain timer instead — visible, bounded,
             // and impossible to flood.
             counters().refused(reason).increment(1);
+            // `receipt_day_mismatch` only ever rides a day refusal, and price
+            // and timestamp are judged first above — so this is exactly "the
+            // day rule refused it, and nothing else did".
+            if stats.receipt_day_mismatch && !stats.refused_price && !stats.refused_timestamp {
+                return IngestOutcome::RefusedWrongDay;
+            }
             return IngestOutcome::AggregatorRefused;
         }
 
@@ -6641,19 +6666,28 @@ async fn run_frame_drain(
                 // case the ROW IS WRITTEN and only the candle bucket is
                 // skipped, so this is a trend to watch, never a tick-loss
                 // count and never a 2am page.
+                //
+                // ⚠ CORRECTED 2026-09-23: "in every case the ROW IS WRITTEN"
+                // stopped being true on 2026-09-10, when the stale and future
+                // trading-day reasons became HARD refusals on the operator's
+                // directive. Only out-of-band keeps its row. The line below
+                // said the opposite for thirteen days — to an operator reading
+                // it beside the daily replay page, it contradicted the page.
                 if d_stale > 0 || d_oob > 0 || d_future > 0 {
                     warn!(
                         refused_stale_trading_day = d_stale,
                         refused_out_of_band_timestamp = d_oob,
                         refused_future_trading_day = d_future,
-                        "Dhan live feed: the aggregator skipped the candle bucket for \
-                         some ticks in the last 30s because the vendor stamped them for \
-                         another trading day or outside the plausible time band. The \
-                         ROWS ARE STILL WRITTEN -- this is not tick loss. A rising rate \
-                         is a vendor data-quality signal. A non-zero \
-                         refused_future_trading_day is the rarest of the three and the \
-                         only one that cannot be explained by a dormant contract: it \
-                         means a stamp AHEAD of our own clock."
+                        "Dhan live feed: some ticks in the last 30s carried a vendor \
+                         stamp for another trading day or outside the plausible time band. \
+                         OUT-OF-BAND ticks are candle-only -- the row IS written. \
+                         STALE and FUTURE trading-day ticks are refused outright by design \
+                         (no candle, no row) because their trade date is not the day we \
+                         received them -- almost always a dormant contract's connect \
+                         snapshot carrying its last trade time. Neither is a capture \
+                         failure; a rising rate is a vendor data-quality signal. A non-zero \
+                         refused_future_trading_day is the rarest and the only one a \
+                         dormant contract cannot explain: a stamp AHEAD of our own clock."
                     );
                 }
 
@@ -7339,7 +7373,12 @@ pub fn drain_main_feed_frame(
                         out.folded = out.folded.saturating_add(1);
                     }
                     IngestOutcome::SeqUnrepresentable => c.seq_unrepresentable.increment(1),
-                    IngestOutcome::AggregatorRefused => c.aggregator_refused.increment(1),
+                    // Same live counter as before the 2026-09-23 split: the
+                    // live frame mix is unchanged, only the replay's loss
+                    // verdict needed the distinction.
+                    IngestOutcome::AggregatorRefused | IngestOutcome::RefusedWrongDay => {
+                        c.aggregator_refused.increment(1)
+                    }
                     IngestOutcome::WriteFailed => c.write_failed.increment(1),
                 }
             }
@@ -11686,9 +11725,10 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
 
 /// What a WAL re-fold actually recovered.
 ///
-/// `refolded` and `lost` are mutually exclusive per tick — a tick is folded XOR
-/// lost, never both — so `refolded + lost` is the total the batch contained and
-/// neither number can flatter the other.
+/// `refolded`, `lost` and `refused_wrong_day` are mutually exclusive per tick —
+/// a tick lands in exactly one — so `refolded + lost + refused_wrong_day` is the
+/// total the batch contained and none of the three can flatter another.
+/// (`refused_wrong_day` split out of `lost` on 2026-09-23.)
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct WalRefoldOutcome {
     /// Ticks successfully folded into the aggregator and queued for the DB.
@@ -11696,6 +11736,15 @@ pub struct WalRefoldOutcome {
     /// Ticks parsed but REFUSED by the fold (sequence unrepresentable,
     /// aggregator refusal, write failure). Real, counted loss.
     pub lost: u64,
+    /// Ticks parsed and refused because their exchange day is not the day
+    /// they were received on (2026-09-23) — `IngestOutcome::RefusedWrongDay`.
+    ///
+    /// NOT loss: the live feed refused the very same tick, on the very same
+    /// receipt clock, when it first arrived (operator directive 2026-09-10).
+    /// Counted separately so a replay of a dormant contract's connect
+    /// snapshot reads as the rule working rather than paging `WS-SPILL-01`
+    /// every morning, while a genuinely lost tick still pages.
+    pub refused_wrong_day: u64,
     /// Frames whose bytes could not be parsed at all.
     pub unparseable: u64,
     /// Packets the decoder REFUSED (2026-08-28).
@@ -11952,6 +12001,32 @@ pub fn report_unfolded_wal_frames(frames: &[(u64, i64, WalEndpoint, bytes::Bytes
     .increment(dropped);
 }
 
+/// The ONE sanctioned early return before the WAL re-fold that does NOT call
+/// [`report_unfolded_wal_frames`]: a planned shutdown that lands while the
+/// lane is still waiting for authentication.
+///
+/// A stop is not a refusal. `report_unfolded_wal_frames` increments the
+/// alarmed `tv_ws_frame_wal_reinjected_dropped_total`, so reporting here would
+/// page on every deploy or daily stop that happened to land in this wait
+/// (measured 2026-09-23, 05:10 IST: a routine redeploy spent its whole
+/// shutdown budget in this wait and logged a false shutdown-timeout ERROR).
+/// The frames are genuinely deferred, not lost: boot stopped confirming WAL
+/// segments on the lane's behalf on 2026-08-28, so they stay in the replay
+/// staging area and the next boot re-offers them. The line still names the
+/// count so a stop with a backlog is visible.
+fn note_wal_frames_deferred_by_shutdown(
+    frames: &[(u64, i64, WalEndpoint, bytes::Bytes)],
+    waited_secs: u64,
+) {
+    info!(
+        waited_secs,
+        staged_frames = frames.len(),
+        "Dhan live feed: shutdown arrived while waiting for authentication — no \
+         socket was dialed, nothing to seal or flush; any staged write-ahead log \
+         frames stay staged and are re-offered on the next boot"
+    );
+}
+
 /// Fold ONE replayed tick and classify the outcome.
 ///
 /// Extracted 2026-08-28 when the caller's `if let Ok(..)` became an exhaustive
@@ -12012,6 +12087,12 @@ fn refold_one_tick(
         // was produced. It is a row, so it belongs on the row side.
         IngestOutcome::Folded { .. } | IngestOutcome::WrittenOutOfSession => {
             out.refolded = out.refolded.saturating_add(1);
+        }
+        // Refused by the day rule, on the same receipt clock the live feed
+        // used — not loss, and not recovered either. Its own bucket, so the
+        // loss count stays a count of LOSS (2026-09-23).
+        IngestOutcome::RefusedWrongDay => {
+            out.refused_wrong_day = out.refused_wrong_day.saturating_add(1);
         }
         IngestOutcome::SeqUnrepresentable
         | IngestOutcome::AggregatorRefused
@@ -12384,6 +12465,10 @@ pub fn refold_wal_frames(
     metrics::counter!("tv_dhan_wal_refolded_total", "outcome" => "refolded")
         .increment(out.refolded);
     metrics::counter!("tv_dhan_wal_refolded_total", "outcome" => "lost").increment(out.lost);
+    // A label value on the EXISTING series, not a new metric name — the EMF
+    // processor sums labels per host, so this costs nothing in CloudWatch.
+    metrics::counter!("tv_dhan_wal_refolded_total", "outcome" => "wrong_day")
+        .increment(out.refused_wrong_day);
     // The two outcomes the swallowing `if let` hid, on the SAME metric so an
     // operator reading one series sees the whole verdict for a replay (2026-08-28).
     //
@@ -12450,6 +12535,20 @@ pub fn refold_wal_frames(
             rows = out.inline_depth_rows,
             "WAL replay: inline depth levels re-appended — until 2026-08-28 the refold \
              discarded them while the live path persisted them"
+        );
+    }
+    // 2026-09-23: ticks the day rule refused are REPORTED, never paged. They
+    // are what the live feed refused on the same receipt clock; the one line
+    // below says so, so nobody mistakes an empty `lost` for "nothing refused".
+    if out.refused_wrong_day > 0 {
+        info!(
+            refused_wrong_day = out.refused_wrong_day,
+            refolded = out.refolded,
+            frames = frames.len(),
+            "WAL replay: {} tick(s) carried a trade date that is not the day they were \
+             received on and were refused by design — the same rule the live feed applies. \
+             Not loss.",
+            out.refused_wrong_day
         );
     }
     // FINDING 12 (2026-09-02): ONE coded line per replay when ticks were LOST.
@@ -12691,10 +12790,36 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             client_id = Some(id);
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_secs(
-            TOKEN_MANAGER_WAIT_INTERVAL_SECS,
-        ))
-        .await;
+        // SHUTDOWN-AWARE (2026-09-23). This wait can run for the full
+        // `TOKEN_MANAGER_WAIT_ATTEMPTS × TOKEN_MANAGER_WAIT_INTERVAL_SECS`
+        // (300 s) — for example while the REST stack sits in its dual-instance
+        // lock patience after a restart. It used to be a bare `sleep`, so a
+        // stop arriving here was never seen: `main` waited its whole shutdown
+        // budget and then logged "the shutdown seal+flush did NOT finish" at
+        // ERROR (observed 2026-09-23 05:10 IST, a deploy restart). Nothing was
+        // lost — no socket had been dialed — but the line claimed otherwise.
+        //
+        // `notify_one` stores a permit when nobody is waiting, so a stop sent
+        // before this future is polled is still seen on the next iteration.
+        // Staged WAL frames are NOT reported as refused here: a planned stop
+        // is not a refusal, and `report_unfolded_wal_frames` increments the
+        // alarmed `tv_ws_frame_wal_reinjected_dropped_total` — so routing a
+        // shutdown through it would page on every stop that lands in this
+        // wait. The segments stay unconfirmed in the replay staging area
+        // (boot stopped confirming on the lane's behalf on 2026-08-28) and
+        // the next boot re-offers them — deferred, not lost.
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_secs(
+                TOKEN_MANAGER_WAIT_INTERVAL_SECS,
+            )) => {}
+            () = params.shutdown.notified() => {
+                note_wal_frames_deferred_by_shutdown(
+                    &params.wal_replay_live_feed,
+                    attempt.saturating_mul(TOKEN_MANAGER_WAIT_INTERVAL_SECS),
+                );
+                return;
+            }
+        }
     }
     let Some(client_id) = client_id else {
         error!(
@@ -18017,8 +18142,9 @@ mod tests {
         let outcome = ingest.ingest_tick(&tick, 42, 1_779_321_600_000);
 
         assert!(
-            matches!(outcome, IngestOutcome::AggregatorRefused),
-            "a forward-stamped tick must be refused outright — not folded, and \
+            matches!(outcome, IngestOutcome::RefusedWrongDay),
+            "a forward-stamped tick must be refused outright, as the BY-DESIGN day \
+             refusal (2026-09-23 split) so a replay never reports it as loss — not folded, and \
              not written to a day that is not today; got {outcome:?}"
         );
         assert_eq!(
@@ -18083,8 +18209,10 @@ mod tests {
         let outcome = ingest.ingest_tick(&tick, 42, 1_779_321_600_000);
 
         assert!(
-            matches!(outcome, IngestOutcome::AggregatorRefused),
-            "a prior-day snapshot must be refused outright; got {outcome:?}"
+            matches!(outcome, IngestOutcome::RefusedWrongDay),
+            "a prior-day snapshot must be refused outright, as the BY-DESIGN day \
+             refusal (2026-09-23 split) — this is the exact shape the morning \
+             replay counted as LOST and paged on; got {outcome:?}"
         );
         assert_eq!(
             ingest.pending_rows(),
@@ -20124,6 +20252,70 @@ mod wal_refold_tests {
 
     fn ingest() -> LiveIngest {
         LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4)
+    }
+
+    /// A ticker packet on IDX_I, the shape the 2026-09-23 replay carried.
+    fn replay_ticker(security_id: u32, ltt_ist_secs: u32) -> bytes::Bytes {
+        let mut p = [0u8; 16];
+        p[0] = 2; // response code: ticker
+        p[1] = 16; // message length
+        p[4..8].copy_from_slice(&security_id.to_le_bytes());
+        p[8..12].copy_from_slice(&24_000.0_f32.to_le_bytes());
+        p[12..16].copy_from_slice(&ltt_ist_secs.to_le_bytes());
+        bytes::Bytes::copy_from_slice(&p)
+    }
+
+    /// THE 08:31 FALSE PAGE (2026-09-23). Every trading morning the boot
+    /// replay counted a handful of ticks as LOST and paged `WS-SPILL-01`. All
+    /// were connect snapshots whose trade date was the previous session while
+    /// the receipt was today — refused by the operator's 2026-09-10 day rule,
+    /// exactly as the live feed refused them when they first arrived.
+    ///
+    /// Both halves are pinned, because the fix is only safe if the second one
+    /// holds: a tick that traded AND was received on an earlier day is real
+    /// captured data that the replay's watermark refuses, and it MUST still
+    /// read as loss. A fix that emptied `lost` for both would silence a real
+    /// page.
+    #[test]
+    fn a_replayed_wrong_day_snapshot_is_by_design_and_a_prior_session_tick_is_still_lost() {
+        let now_utc_secs = chrono::Utc::now().timestamp();
+        let now_ist_secs =
+            now_utc_secs + i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS);
+        let yesterday_ist = u32::try_from(now_ist_secs - 86_400).expect("fits u32 until 2106");
+
+        // Traded yesterday, received NOW: the connect-snapshot shape.
+        let snapshot = (
+            1u64,
+            now_utc_secs * 1_000_000_000,
+            WalEndpoint::MainFeed,
+            replay_ticker(13, yesterday_ist),
+        );
+        let out = refold_wal_frames(&mut ingest(), &[snapshot]);
+        assert_eq!(
+            out.refused_wrong_day, 1,
+            "the day rule refused it by design"
+        );
+        assert_eq!(
+            out.lost, 0,
+            "and it is NOT loss — counting it as loss is what paged every morning"
+        );
+        assert_eq!(out.refolded, 0);
+
+        // Traded yesterday AND received yesterday: a real tick from an earlier
+        // session, refused here by the seeded watermark. This one is loss.
+        let prior_session = (
+            2u64,
+            (now_utc_secs - 86_400) * 1_000_000_000,
+            WalEndpoint::MainFeed,
+            replay_ticker(13, yesterday_ist),
+        );
+        let out = refold_wal_frames(&mut ingest(), &[prior_session]);
+        assert_eq!(
+            out.lost, 1,
+            "a tick received on the day it traded is real captured data — it \
+             must still be counted as lost so the page still fires"
+        );
+        assert_eq!(out.refused_wrong_day, 0);
     }
 
     /// A depth-20 frame exactly as the depth socket writes it: 12-byte header
@@ -23329,22 +23521,47 @@ mod late_seed_tests {
             .expect("the re-fold call must exist — it is what these returns precede");
         let before_refold = &body[..upto];
 
+        // The ONE sanctioned exception (2026-09-23): a planned shutdown during
+        // the authentication wait is not a refusal, and its frames are
+        // deferred to the next boot rather than lost — see
+        // `note_wal_frames_deferred_by_shutdown`. Its call spans several lines,
+        // so the return is accepted when the helper opened within the last few
+        // non-empty lines. Capped at exactly one site below, so it cannot
+        // become a general escape hatch.
+        const SHUTDOWN_HELPER: &str = "note_wal_frames_deferred_by_shutdown(";
+        const SHUTDOWN_HELPER_REACH: usize = 4;
         let mut unguarded = Vec::new();
+        let mut sanctioned = 0usize;
         let mut previous = "";
+        let mut since_helper: Option<usize> = None;
         for (idx, raw) in before_refold.lines().enumerate() {
             let line = raw.trim();
             if line == "return;" && !previous.contains("report_unfolded_wal_frames(") {
-                unguarded.push(format!("{}: {previous}", idx + 1));
+                if since_helper.is_some_and(|n| n <= SHUTDOWN_HELPER_REACH) {
+                    sanctioned += 1;
+                } else {
+                    unguarded.push(format!("{}: {previous}", idx + 1));
+                }
             }
             if !line.is_empty() {
+                since_helper = if line.contains(SHUTDOWN_HELPER) {
+                    Some(0)
+                } else {
+                    since_helper.map(|n| n + 1)
+                };
                 previous = line;
             }
         }
         assert!(
             unguarded.is_empty(),
             "every early return before the WAL re-fold must first call \
-             report_unfolded_wal_frames — otherwise frames main.rs handed over, and \
-             whose segments are already archived, vanish with no log line. Unguarded: {unguarded:?}"
+             report_unfolded_wal_frames — otherwise frames main.rs handed over vanish \
+             from the database with no log line. Unguarded: {unguarded:?}"
+        );
+        assert_eq!(
+            sanctioned, 1,
+            "exactly one early return may defer by shutdown (the authentication wait); \
+             a second one needs its own reasoning, not a copy of this exemption"
         );
 
         // Non-vacuous: the scan must actually be looking at real returns.
