@@ -1480,7 +1480,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ps_and_up_build_their_env_from_the_same_builder() {
+    fn test_container_health_snapshot_ps_and_up_build_their_env_from_the_same_builder() {
         let src = production_src();
         let up = fn_body(src, "pub async fn ensure_infra_running(");
         let ps = fn_body(src, "pub async fn container_health_snapshot(");

@@ -8033,7 +8033,7 @@ same call site, so it was inflated the same way.
 - Every other outcome records exactly as before.
 - Exactly ONE `record_ws_lag(frame.connection_index` site exists, and it sits
   after the fold call. Pinned by
-  `a_repeated_quote_is_counted_as_excluded_and_never_reaches_the_lag_histogram`.
+  `test_record_ws_lag_repeat_excluded_counts_a_repeated_quote_and_skips_the_lag_histogram`.
 - O(1): one enum match and one pre-resolved counter increment. No allocation.
 
 #### ⚠ Visible side effect on an existing CloudWatch series

@@ -238,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_with_deploy_marker_table() {
+    fn test_classify_shutdown_with_deploy_marker_table() {
         const MID_SESSION: u32 = 11 * 3600;
         // (signal, is_aws, secs, marker) -> class
         let cases = [
@@ -307,7 +307,7 @@ mod tests {
     }
 
     #[test]
-    fn test_planned_deploy_marker_freshness_boundaries() {
+    fn test_planned_deploy_marker_is_fresh_boundaries() {
         let now = 1_790_000_000_i64;
         assert!(planned_deploy_marker_is_fresh(&now.to_string(), now));
         assert!(planned_deploy_marker_is_fresh(&format!("{now}\n"), now));

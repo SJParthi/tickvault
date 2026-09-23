@@ -3769,7 +3769,8 @@ mod fifth_socket_tests {
     /// never handed to `plan_minute`, whose four index sockets would put
     /// NIFTY/BANKNIFTY options back on depth-200.
     #[test]
-    fn the_loop_holds_depth200_until_the_first_ranking_and_never_runs_the_index_engine() {
+    fn test_run_depth_rebalance_holds_depth200_until_the_first_ranking_and_never_runs_the_index_engine()
+     {
         let source = include_str!("depth_rebalance.rs");
         let production = source
             .split_once("\n#[cfg(test)]")
@@ -4537,7 +4538,8 @@ mod stock_boot_set_tests {
     }
 
     #[test]
-    fn an_index_option_never_enters_even_when_the_index_is_the_biggest_mover() {
+    fn test_stock_option_boot_set_never_admits_an_index_option_even_when_the_index_is_the_biggest_mover()
+     {
         let mut candidates = ladder("NIFTY", 24_500.0, 900);
         candidates.extend(ladder("RELIANCE", 2_900.0, 100));
         let movers = [mover(13, "NIFTY", 9.0), mover(2885, "RELIANCE", 1.0)];

@@ -14949,7 +14949,7 @@ mod tests {
     }
 
     #[test]
-    fn a_repeated_quote_is_counted_as_excluded_and_never_reaches_the_lag_histogram() {
+    fn test_record_ws_lag_repeat_excluded_counts_a_repeated_quote_and_skips_the_lag_histogram() {
         // A repeat must land on the `ltt_not_advanced` exclusion counter, never
         // on the clamp or garbage counters. Checked against the helper's body,
         // because a counter handle cannot be read back in-process.
