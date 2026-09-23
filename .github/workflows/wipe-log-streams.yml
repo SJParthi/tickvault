@@ -53,7 +53,7 @@ jobs:
     name: Delete prod CloudWatch log streams (guarded)
     runs-on: ubuntu-24.04
     environment: prod
-    timeout-minutes: 60
+    timeout-minutes: 180
     env:
       AWS_RETRY_MODE: adaptive
       AWS_MAX_ATTEMPTS: '10'
@@ -117,43 +117,98 @@ jobs:
           fi
 
       - name: Delete every stream, group by group
+        env:
+          # Parallel deletes per group. DeleteLogStream's per-account TPS
+          # quota is not known from this repository; 8 in flight with the
+          # adaptive retry mode above backs off rather than failing.
+          PARALLEL: '8'
         run: |
           set -euo pipefail
+          # The logs of a live session are the only record of what it did.
+          # Re-checked before EVERY group, not only at the start: a large
+          # group can take minutes, and a run that crosses 09:00 must stop.
+          in_session() {
+            local dow hm
+            dow=$(TZ=Asia/Kolkata date +%u)
+            hm=$(TZ=Asia/Kolkata date +%H%M)
+            [ "$dow" -le 5 ] && [ "$hm" -ge 0900 ] && [ "$hm" -lt 1545 ]
+          }
+          # One stream. ResourceNotFound means it is already gone (a
+          # Lambda can rotate a stream between list and delete), which is
+          # the outcome we want, so it counts as success. Any other error
+          # is printed with its reason and counted as a failure.
+          del_one() {
+            local out
+            if out=$(aws logs delete-log-stream --log-group-name "$WIPE_GROUP" \
+                       --log-stream-name "$1" 2>&1); then
+              echo ok
+            elif printf '%s' "$out" | grep -q ResourceNotFoundException; then
+              echo gone
+            else
+              printf 'FAILED %s: %s\n' "$1" "$out" >&2
+              echo fail
+            fi
+          }
+          export -f del_one
+
+          # Group discovery. A failed DescribeLogGroups must FAIL the job:
+          # an empty list here would otherwise delete nothing and go green.
           GROUPS_FILE=$(mktemp)
           for prefix in /tickvault/prod/ /aws/lambda/tv-prod-; do
-            aws logs describe-log-groups --log-group-name-prefix "$prefix" \
-              --query 'logGroups[].logGroupName' --output text | tr '\t' '\n' \
-              | grep -v '^$' >> "$GROUPS_FILE" || true
+            if ! LIST=$(aws logs describe-log-groups --log-group-name-prefix "$prefix" \
+                          --query 'logGroups[].logGroupName' --output text); then
+              echo "::error::describe-log-groups failed for prefix $prefix"
+              exit 1
+            fi
+            printf '%s\n' "$LIST" | tr '\t' '\n' | { grep -v -e '^$' -e '^None$' || true; } >> "$GROUPS_FILE"
           done
+          GROUP_COUNT=$(grep -c . "$GROUPS_FILE" || true)
+          if ! grep -qx '/tickvault/prod/app' "$GROUPS_FILE"; then
+            echo "::error::/tickvault/prod/app was not found ($GROUP_COUNT groups listed). Refusing to report success on a list that is missing the main group."
+            exit 1
+          fi
+          echo "groups found: $GROUP_COUNT"
+
           APP_LEFT=0
           TOTAL_FAILED=0
+          TOTAL_DELETED=0
           while IFS= read -r group; do
             case "$group" in
               *groww*) echo "SKIP $group (bruteX-owned, read-only)"; continue ;;
             esac
-            deleted=0
-            failed=0
+            if in_session; then
+              echo "::error::stopped before $group: it is now $(TZ=Asia/Kolkata date '+%a %H:%M') IST, inside the 09:00-15:45 weekday session. Re-run after 15:45."
+              exit 1
+            fi
             STREAMS=$(mktemp)
-            aws logs describe-log-streams --log-group-name "$group" \
-              --query 'logStreams[].logStreamName' --output text \
-              | tr '\t' '\n' | grep -v '^$' > "$STREAMS" || true
-            while IFS= read -r stream; do
-              if aws logs delete-log-stream --log-group-name "$group" \
-                   --log-stream-name "$stream" 2>/dev/null; then
-                deleted=$((deleted + 1))
-              else
-                failed=$((failed + 1))
-              fi
-            done < "$STREAMS"
-            left=$(aws logs describe-log-streams --log-group-name "$group" \
-              --query 'length(logStreams)' --output text)
+            if ! LIST=$(aws logs describe-log-streams --log-group-name "$group" \
+                          --query 'logStreams[].logStreamName' --output text); then
+              echo "::error::describe-log-streams failed for $group"
+              exit 1
+            fi
+            printf '%s\n' "$LIST" | tr '\t' '\n' | { grep -v -e '^$' -e '^None$' || true; } > "$STREAMS"
+            RESULTS=$(mktemp)
+            WIPE_GROUP="$group" xargs -d '\n' -r -P "$PARALLEL" -n 1 \
+              bash -c 'del_one "$1"' _ < "$STREAMS" > "$RESULTS"
+            deleted=$(grep -cx -e ok -e gone "$RESULTS" || true)
+            failed=$(grep -cx fail "$RESULTS" || true)
+            # Count what remains by listing names, one per line. A
+            # length() query with text output prints one number per
+            # 50-stream page, which is not a number.
+            if ! LEFT_LIST=$(aws logs describe-log-streams --log-group-name "$group" \
+                               --query 'logStreams[].logStreamName' --output text); then
+              echo "::error::describe-log-streams (recount) failed for $group"
+              exit 1
+            fi
+            left=$(printf '%s\n' "$LEFT_LIST" | tr '\t' '\n' | { grep -v -e '^$' -e '^None$' || true; } | grep -c . || true)
             TOTAL_FAILED=$((TOTAL_FAILED + failed))
+            TOTAL_DELETED=$((TOTAL_DELETED + deleted))
             case "$group" in /tickvault/prod/*) APP_LEFT=$((APP_LEFT + left)) ;; esac
             echo "GROUP $group deleted=$deleted failed=$failed left=$left"
           done < "$GROUPS_FILE"
-          echo "app/metrics streams left: $APP_LEFT; failed deletes: $TOTAL_FAILED"
+          echo "deleted: $TOTAL_DELETED; failed: $TOTAL_FAILED; app/metrics streams left: $APP_LEFT"
           if [ "$TOTAL_FAILED" -ne 0 ]; then
-            echo "::error::$TOTAL_FAILED stream deletes failed."
+            echo "::error::$TOTAL_FAILED stream deletes failed (reasons above)."
             exit 1
           fi
           # A Lambda that fires during the run opens a fresh stream, so the
@@ -162,7 +217,7 @@ jobs:
           # stopped they must end empty.
           STATE=$(aws ec2 describe-instances \
             --filters Name=tag:Name,Values=tv-prod-app \
-            --query 'Reservations[].Instances[].State.Name' --output text)
+            --query 'Reservations[].Instances[].State.Name' --output text | tr '\t' ' ')
           echo "prod box state: $STATE"
           if [ "$APP_LEFT" -ne 0 ] && [ "$STATE" = "stopped" ]; then
             echo "::error::$APP_LEFT app/metrics streams remain while the box is stopped."
