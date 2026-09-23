@@ -5846,10 +5846,20 @@ Local `/metrics` counters plus coded log lines only (no EMF name, no alarm — s
 
 **Why it belongs in a feed-hardening plan:** a mid-month budget kill stops the box AND disables the 08:30 start rule for the rest of the month. That is the largest tick-loss event this system can have. September's forecast is $188.45 against a $150 kill line, so the hourly guard is expected to stop capture around 24–25 Sep.
 
-- [ ] Rule files first: `daily-universe-scope-expansion-2026-05-27.md` Quote 23 + `aws-budget.md` ruling.
-- [ ] Four lockstep sites 150 → 225: `deploy/aws/terraform/budget.tf`, `deploy/aws/terraform/budget-guards.tf`, `crates/aws-lambdas/src/budget_digest.rs`, `crates/aws-lambdas/src/hard_stop_guard.rs`.
-- [ ] `hard_stop_guard::effective_budget_kill_usd` clamps every UTC billing month except 2026-09 to `STANDING_BUDGET_KILL_USD` = 150; wired into the breach check, the ping decision and the ping text.
-- [ ] Daily digest shows the effective ceiling for its month.
+- [x] Rule files first: `daily-universe-scope-expansion-2026-05-27.md` Quote 23 + `aws-budget.md` ruling.
+- [x] Four lockstep sites 150 → 225: `deploy/aws/terraform/budget.tf`, `deploy/aws/terraform/budget-guards.tf`, `crates/aws-lambdas/src/budget_digest.rs`, `crates/aws-lambdas/src/hard_stop_guard.rs`.
+- [x] `hard_stop_guard::effective_budget_kill_usd` clamps every UTC billing month except 2026-09 to `STANDING_BUDGET_KILL_USD` = 150; wired into the breach check, the ping decision and the ping text.
+- [x] Daily digest shows the effective ceiling for its month.
 - Tests: `effective_ceiling_*` unit tests in `hard_stop_guard.rs`; `budget_ceiling_lockstep_guard.rs` gains `standing_cap_is_150_and_never_above_the_fallback` and records both $150 and $225 in the rule files.
 
 **Rollback:** revert the commit; the four sites go back to $150 and the clamp disappears. **Observability:** unchanged surfaces — the running ping and the daily digest now print the effective ceiling. **Failure mode:** if the 1-Oct revert PR never lands, the code clamp still holds October at $150; the native AWS actions would stay at percentages of $225 until it does.
+
+## ITEM 22 — ARCHIVE ADDENDUM (added 2026-09-23, operator: "See what happened to this s3 move")
+
+**Measured on the box 2026-09-23:** the daily archive pass reported `table_list_failed` on 6 of 6 attempts every day since at least 09-20 and never latched, firing STORAGE-GAP-04 daily. 19 of the 48 swept tables do not exist (retired REST legs, retired candle frames, renamed tables) and QuestDB's "table does not exist" was counted as a list failure.
+
+- [x] `crates/storage/src/partition_archive.rs`: `PartitionListing { Eligible, TableAbsent }` + `is_table_absent_response` (needs the JSON `"error"` key AND the phrase); `ArchiveRunSummary.tables_absent`; a real list failure on an existing table is now `warn!` and still counts in `tables_list_failed`.
+- [x] `crates/app/src/daily_archive_boot.rs`: logs `tables_absent`; doc records that absent tables never block the latch.
+- Tests: `a_missing_table_reads_as_absent_not_failed`, `other_errors_are_never_read_as_absence`, `the_phrase_without_an_error_envelope_is_not_absence`, `partition_listing_variants_are_distinct`, `absent_tables_latch_the_day_but_a_real_list_failure_does_not`.
+
+**Rollback:** revert the commit; absent tables count as failures again and the day stays unlatched (the pre-fix behaviour, loud but harmless to data). **Observability:** `tables_absent` on the pass-complete line; STORAGE-GAP-04 unchanged. **Failure mode:** if QuestDB rewords the error, absent tables fall back to failures — the loud direction, never a false latch. **NOT fixed:** the 09-21 hours 12–15 and all of 09-22 were dropped by the operator-authorized fresh-start reset before any archive ran; that market data is gone and is not SEBI data.
