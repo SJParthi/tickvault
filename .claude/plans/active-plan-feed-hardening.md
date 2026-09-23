@@ -5841,3 +5841,15 @@ Each item is one commit on PR 1928 and reverts independently. 44c's renamed tabl
 ### Observability
 
 Local `/metrics` counters plus coded log lines only (no EMF name, no alarm — see the scope-lock entry's budget note): `tv_dhan_wal_catchup_in_session_total`, `tv_dhan_feed_unknown_packet_skipped_total`, `tv_fresh_start_reset_renamed_total`, `tv_wal_pruned_unapplied_total`, and the existing swap wire histograms.
+
+## ITEM 21 — BUDGET ADDENDUM (added 2026-09-23, operator: "see as of now for this month alone accept this billing but from next mponth onwards try to keep it within 150 usd and monitor track cpature evruthign entirley dude okay?")
+
+**Why it belongs in a feed-hardening plan:** a mid-month budget kill stops the box AND disables the 08:30 start rule for the rest of the month. That is the largest tick-loss event this system can have. September's forecast is $188.45 against a $150 kill line, so the hourly guard is expected to stop capture around 24–25 Sep.
+
+- [ ] Rule files first: `daily-universe-scope-expansion-2026-05-27.md` Quote 23 + `aws-budget.md` ruling.
+- [ ] Four lockstep sites 150 → 225: `deploy/aws/terraform/budget.tf`, `deploy/aws/terraform/budget-guards.tf`, `crates/aws-lambdas/src/budget_digest.rs`, `crates/aws-lambdas/src/hard_stop_guard.rs`.
+- [ ] `hard_stop_guard::effective_budget_kill_usd` clamps every UTC billing month except 2026-09 to `STANDING_BUDGET_KILL_USD` = 150; wired into the breach check, the ping decision and the ping text.
+- [ ] Daily digest shows the effective ceiling for its month.
+- Tests: `effective_ceiling_*` unit tests in `hard_stop_guard.rs`; `budget_ceiling_lockstep_guard.rs` gains `standing_cap_is_150_and_never_above_the_fallback` and records both $150 and $225 in the rule files.
+
+**Rollback:** revert the commit; the four sites go back to $150 and the clamp disappears. **Observability:** unchanged surfaces — the running ping and the daily digest now print the effective ceiling. **Failure mode:** if the 1-Oct revert PR never lands, the code clamp still holds October at $150; the native AWS actions would stay at percentages of $225 until it does.

@@ -38,6 +38,23 @@ paths:
 >
 > **⚠ OPERATOR RULING 2026-07-19 — 30 GB accepted, t4g.medium as-of-now, NEW HARD TARGET < ₹1,000/mo:** verbatim quote + the itemized sub-1K path live in the dedicated "OPERATOR RULING 2026-07-19" section below. The base bill alone (~₹1,077/mo at the ~176-hr auto-schedule basis) EXCEEDS the target — <₹1,000 is UNREACHABLE without at least one operator-gated lever; see the lever table.
 
+## OPERATOR RULING 2026-09-23 — September kill-ceiling $150 → $225; October clamped back to $150
+
+Operator, 2026-09-23 (verbatim, typos preserved):
+
+> "see as of now for this month alone accept this billing but from next mponth onwards try to keep it within 150 usd and monitor track cpature evruthign entirley dude okay?"
+
+Full record, measured position and lever table: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 23.
+
+| | Value |
+|---|---|
+| September actual / forecast (2026-09-23) | $141.36 / $188.45 |
+| Four lockstep sites for September | **$225** (native 90% line $202.50) |
+| Standing cap from October | **$150** — enforced in `hard_stop_guard::effective_budget_kill_usd` (UTC billing month), and the four sites revert to $150 by a scheduled 1-Oct PR |
+| October projection at today's config | ~$150 pre-tax, ~$175–180 with tax — **over $150 unless an operator lever is taken** |
+
+Honest limit: until the 1-Oct revert PR merges, the native budget notifications and actions sit at percentages of $225. The code clamp is what holds October at $150 in the meantime.
+
 ## OPERATOR RULING 2026-08-19 — kill-ceiling RAISED $100 → $130 (gp3 IOPS 3000→6000 + throughput 125→500)
 
 **The verbatim operator demand (2026-08-19 — typed directly in-session, preserve EXACTLY, typos included):**

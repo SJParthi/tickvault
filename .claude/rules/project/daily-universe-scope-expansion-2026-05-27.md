@@ -2368,6 +2368,79 @@ Monday headroom, nothing more).
 > grep for its call sites), and must be re-run at the moment of writing rather than carried
 > forward. Two statements of it were carried forward for five days.
 
+**Quote 23 (2026-09-23, September billing accepted; from October the bill stays within $150 — preserve EXACTLY, typos included):**
+> "see as of now for this month alone accept this billing but from next mponth onwards try to keep it within 150 usd and monitor track cpature evruthign entirley dude okay? see why not ima skign about r8g2dx large isntance dude okay?"
+
+**This quote SUPERSEDES Quote 19's $150 cap for SEPTEMBER 2026 ONLY.** Quote 19
+("even if we need to reach the max 150 usd") stays the standing cap from October.
+Recorded HERE before the terraform and the code, per the rule-file-first law.
+
+#### Why the ceiling has to move at all this month (measured 2026-09-23)
+
+| Reading | Value |
+|---|---|
+| September actual spend | **$141.36** |
+| September forecast | **$188.45** |
+| Weekday burn | ~$6/day |
+| Live `limit_amount` | $150 |
+| Native 90% action (`stop_at_90`) | **EXECUTION_FAILURE** (tried and failed) |
+| Our hourly `tv_hard_stop_guard` kill line | $150 — expected to cross around **24–25 Sep** |
+
+At $150 the hourly guard stops the box AND disables the 08:30 start rule for the
+rest of the month. That is 4–5 trading days with no capture at all — the largest
+tick-loss event this system can have. The operator chose to pay September's bill
+rather than lose those days.
+
+#### What this authorizes
+
+| Surface | September 2026 | From 1 October 2026 |
+|---|---|---|
+| `budget.tf limit_amount` + `BUDGET_KILL_USD` + `BUDGET_USD` + `DEFAULT_BUDGET_KILL_USD` | **$225** (all four in lockstep) | reverted to **$150** by a scheduled PR on 1 Oct |
+| `tv_hard_stop_guard` effective kill line | $225 | **$150, enforced in code** (`effective_budget_kill_usd` clamps every month except 2026-09 to `STANDING_BUDGET_KILL_USD` = 150), even before the revert PR lands |
+| Native 90% action | $202.50 — above the $188.45 forecast | $135 once reverted |
+
+**Why $225:** 90% of 225 = $202.50, which clears the $188.45 forecast by ~$14.
+Anything lower either still trips the native action or has no margin. It is a
+one-month number, not a new standing ceiling.
+
+**The month is the AWS billing month (UTC)**, the same calendar Cost Explorer uses
+for month-to-date. Using the IST month would clamp to $150 during 00:00–05:30 IST
+on 1 October while Cost Explorer still reports September's full spend.
+
+#### ⚠ October is NOT yet inside $150 — stated, not assumed
+
+The projected October bill at the current configuration is about **$150 before
+tax, $175–180 with tax**. The code clamp will stop the box when that is crossed.
+Keeping October under $150 without a mid-month stop needs one of these, each an
+operator decision:
+
+| Lever | Saves/mo |
+|---|---:|
+| Revert gp3 IOPS 6000→3000 and throughput 500→125 | $34.20 |
+| Throughput 500 → 250 MiB/s only | $11.40 |
+| IOPS 6000 → 4000 only | $11.40 |
+| Release the Elastic IP (needs an instance recreate) | $3.60 |
+| Shrink the EBS volume | impossible (gp3 never shrinks) |
+
+The next measurement is the 7-day peak IOPS and throughput on the root volume,
+which decides whether the provisioned I/O can come down safely.
+
+#### r8g.2xlarge — NOT authorized, and the reason is measured
+
+The operator asked about r8g.2xlarge (8 vCPU / 64 GiB). It is not needed: process
+RSS stays at or below ~1.5 GiB of 32 GiB, CPU runs at 12–13%, and the bottleneck is
+the disk/QuestDB flush path, which a bigger instance does not change. It would add
+roughly $35–50/mo, which breaks the October $150 target on its own. Quote 15
+(r8g.xlarge FINALISED) stands.
+
+#### What a PR that violates Quote 23 looks like (REJECT)
+
+- Keeps the $225 ceiling in any of the four sites after September 2026.
+- Removes or weakens `effective_budget_kill_usd`'s clamp, or makes it clamp on the IST month.
+- Raises the October ceiling above $150 without a fresh dated quote.
+- Changes the instance type under cover of this quote.
+
+
 ---
 
 ## ⚠ CORRECTED 2026-09-06 — the ten `EXECUTION_FAILURE` / `AccessDenied` flags in this file are STALE
