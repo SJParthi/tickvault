@@ -2525,6 +2525,44 @@ No path reads an older folder, and the next deploy uploads its own.
 - Deletes or edits the committed deletion manifest.
 - Presents the deleted dates as still retained anywhere.
 
+**Quote 25 (2026-09-23, bare nuke + delete all logs and traces for a fresh-scratch boot — preserve EXACTLY, typos included):**
+> "Do the bare nuke also dude okay? Meanwhile delete the entire logs entire traces dude tomorrow it shoudl be the fresh scratch boot application dydde oaky"
+
+Recorded HERE before the box is touched, per the rule-file-first law.
+
+#### What this authorizes
+
+| Surface | Disposition |
+|---|---|
+| Prod box `tv-prod-app` | **BARE NUKE**, run once, outside market hours: the existing `DOCKER_NUKE_BARE_COMMANDS` sequence (stop app → export SEBI tables → remove every container, image and volume → remove the data caches → re-enable the app) |
+| On-box app logs (`/opt/tickvault/data/logs/*`) and the systemd journal | **DELETED** |
+| CloudWatch **log streams** in `/tickvault/prod/app`, `/tickvault/prod/metrics` and every `/aws/lambda/tv-prod-*` group | **DELETED** (streams only) |
+| Next boot | Starts from scratch at the next scheduled 08:30 IST start: QuestDB recreated empty by `ensure-questdb.sh`, tables created by the boot DDL |
+
+#### What this does NOT touch
+
+| Surface | Why |
+|---|---|
+| SEBI and audit tables | The nuke EXPORTS them to `/opt/tickvault/data/sebi-preserve/<ts>/` first and ABORTS if an export fails. That directory is never deleted. This is the only copy left after the nuke. |
+| CloudWatch log **groups** | Deleting a group deletes its metric filters, and the alarms built on them would go dead. Only the streams inside are removed. |
+| `/aws/lambda/groww-token-minter` | bruteX-owned (`brutex-readonly-lock-2026-07-18.md`). Not ours to delete. |
+| Published CloudWatch metrics and alarm history | They cannot be deleted by API. They age out on AWS's own schedule. |
+| S3, EBS size, instance type, `limit_amount` | Unchanged. |
+
+#### ⚠ What is lost (stated, not absorbed)
+
+- All captured market data on the box (ticks, depth, candles, top_volume) and all app and Lambda log history.
+- SEBI data survives only as the on-box CSV export. The S3 cold copies were already deleted under Quote 24.
+- The first session after this boot runs on the boot dial: the instrument cache is gone and the daily rider rebuilds it that morning. The depth seed is also gone, so depth starts from the boot dial until the first volume ranking.
+
+#### What an action that violates Quote 25 looks like (REJECT)
+
+- Runs the nuke inside 09:00–15:45 IST.
+- Deletes `/opt/tickvault/data/sebi-preserve/`, or proceeds after a failed SEBI export.
+- Deletes a CloudWatch log group, metric filter or alarm under cover of this quote.
+- Deletes the `groww-token-minter` log group or its streams.
+- Leaves `tickvault.service` disabled after the nuke, so the next morning's start does nothing.
+
 
 ---
 
