@@ -1939,7 +1939,7 @@ After investigating the spend, re-enable with:\n  aws events enable-rule --name 
     }
 
     #[test]
-    fn effective_ceiling_is_keyed_on_the_utc_month_not_ist() {
+    fn test_effective_budget_kill_usd_is_keyed_on_the_utc_month_not_ist() {
         // 2026-09-30 20:00 UTC = 01:30 IST on 1 October. Cost Explorer
         // month-to-date is still September's, so the line must still be
         // September's. An IST-keyed clamp would read October here.
