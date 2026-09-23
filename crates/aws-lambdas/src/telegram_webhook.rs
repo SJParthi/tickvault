@@ -551,7 +551,11 @@ pub const ALARM_PHRASES: [(&str, &str); 105] = [
     ),
     (
         "errcode-wal-suspend-01",
-        "The database has STOPPED applying writes to a table — rows are accepted and sit in its write-ahead log but never become visible, and it will NOT catch up by itself. The box tries a bounded auto-resume first; if that fails someone must resume that table by hand (the runbook has the exact command), and if the disk was full, fix that before resuming",
+        // 2026-09-23: this ONE filter also matches the `apply_lag_growing`
+        // and `probe_blind` sources, where the table is NOT suspended. The
+        // old text said "STOPPED" for all three and paged a falling-behind
+        // table as a dead one. Worded to cover every source it can match.
+        "A database table is not keeping up with writes, so new rows are saved but do not show in queries yet. The server log line says which case: \"apply_lag_growing\" means the table is still working but falling further behind at every check, nothing is lost, and it catches up when the load drops; no case named means the table has STOPPED and will NOT catch up by itself (the box tries a bounded auto-resume first, and if that fails someone must resume it by hand; the runbook has the exact command). If the disk is full, fix that first",
     ),
     (
         "errcode-ws-spill-01",

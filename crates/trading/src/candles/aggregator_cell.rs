@@ -2941,6 +2941,78 @@ mod tests {
         assert_eq!(cell.snapshot(TfIndex::M1).open, f32_to_f64_clean(24_000.25));
     }
 
+    /// The previous-close half, and a bucket that is not the day's first:
+    /// a late `day_close` becomes the bar's `prev_day_close`, and a late
+    /// `day_open` still updates `session_open` but can NEVER re-open a bar
+    /// that is not the day's first bucket.
+    #[test]
+    fn a_repeat_quote_refreshes_prev_close_and_never_reopens_a_later_bucket() {
+        let mut cell = AggregatorCell::empty();
+        let strategy = FeedStrategy::DEFAULT;
+        let later = OPEN + 600;
+        let first = tick_at(later, 101.0, 5);
+        cell.consume_tick(TfIndex::M1, &first, 0, strategy, 5);
+        let before = cell.snapshot(TfIndex::M1);
+
+        let mut repeat = first;
+        repeat.day_close = 99.5;
+        repeat.day_open = 100.25;
+        assert!(cell.refresh_repeat_quote(
+            TfIndex::M1,
+            &repeat,
+            &TickPrices::from_tick(&repeat),
+            later
+        ));
+        let bar = cell.snapshot(TfIndex::M1);
+        assert_eq!(bar.prev_day_close, f32_to_f64_clean(99.5));
+        assert_eq!(bar.session_open, f32_to_f64_clean(100.25));
+        assert_eq!(
+            bar.open.to_bits(),
+            before.open.to_bits(),
+            "a later bucket is never re-opened at the official open"
+        );
+    }
+
+    /// A repeat that is OLDER than the bucket's last trade may only fill a
+    /// quote field the bucket has never seen; it can never overwrite one a
+    /// newer packet already set.
+    #[test]
+    fn an_older_repeat_quote_fills_empty_fields_but_never_overwrites_newer_ones() {
+        let mut cell = AggregatorCell::empty();
+        let strategy = FeedStrategy::DEFAULT;
+        let mut first = tick_at(OPEN + 30, 100.0, 5);
+        first.open_interest = 500;
+        cell.consume_tick(TfIndex::M1, &first, 0, strategy, 5);
+
+        let mut older = first;
+        older.open_interest = 400;
+        older.total_buy_quantity = 11;
+        older.total_sell_quantity = 22;
+        assert!(cell.refresh_repeat_quote(
+            TfIndex::M1,
+            &older,
+            &TickPrices::from_tick(&older),
+            OPEN + 10
+        ));
+        let bar = cell.snapshot(TfIndex::M1);
+        assert_eq!(bar.oi, 500, "an older packet never overwrites a newer OI");
+        assert_eq!(bar.total_buy_qty, 11, "an empty field is filled");
+        assert_eq!(bar.total_sell_qty, 22, "an empty field is filled");
+
+        let mut older_again = older;
+        older_again.total_buy_quantity = 99;
+        older_again.total_sell_quantity = 98;
+        assert!(cell.refresh_repeat_quote(
+            TfIndex::M1,
+            &older_again,
+            &TickPrices::from_tick(&older_again),
+            OPEN + 10
+        ));
+        let bar = cell.snapshot(TfIndex::M1);
+        assert_eq!(bar.total_buy_qty, 11);
+        assert_eq!(bar.total_sell_qty, 22);
+    }
+
     #[test]
     fn test_the_day_open_arm_cannot_be_spent_by_any_bucket_after_the_first() {
         // The other half, and the reason the roll disarms: once the day's

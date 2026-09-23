@@ -763,7 +763,7 @@ resource "aws_cloudwatch_metric_alarm" "tick_spill_replay_failing" {
   # DISARMED — terraform's default is armed, and every apply would re-arm it
   # outside the window the market-hours gate Lambda owns.
   actions_enabled = false
-  alarm_actions = local.app_alarm_actions
+  alarm_actions   = local.app_alarm_actions
   # The counter is cumulative and only a successful round changes the outcome.
   # A round succeeding does not un-happen the failure that preceded it.
   ok_actions = []
@@ -794,8 +794,8 @@ resource "aws_cloudwatch_metric_alarm" "ticks_spilling" {
   # DISARMED — terraform's default is armed, and every apply would re-arm it
   # outside the window the market-hours gate Lambda owns.
   actions_enabled = false
-  alarm_actions = local.app_alarm_actions
-  ok_actions    = []
+  alarm_actions   = local.app_alarm_actions
+  ok_actions      = []
 }
 
 # ---------------------------------------------------------------------------
@@ -1341,7 +1341,7 @@ resource "aws_cloudwatch_metric_alarm" "aggregator_refusal_rate_high" {
   # DISARMED — terraform's default is armed, and every apply would re-arm it
   # outside the window the market-hours gate Lambda owns.
   actions_enabled = false
-  alarm_actions = local.app_alarm_actions
+  alarm_actions   = local.app_alarm_actions
   # NO ok_actions. A ratio falling back is the vendor recovering or the window
   # ageing out - neither is a repair anyone performed.
   ok_actions = []
