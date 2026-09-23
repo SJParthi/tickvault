@@ -8060,3 +8060,69 @@ a lever).
 - Records the lag before the fold, or adds a second lag call site.
 - Re-derives the repeat test in the drain instead of reading the fold's verdict.
 - Adds an EMF name or alarm for the excluded counter's `reason` split without a lever.
+
+### 2026-09-23 (SIXTH) — ARM THE DEPTH-200 UNSUBSCRIBE PROBE; on a failing verdict, email Dhan and prepare the MadeForTrade post
+
+**The verbatim operator demand (2026-09-23, typed directly in-session, with the
+current Dhan PDFs dated 9/11/26 attached — preserve EXACTLY, typos included):**
+
+> "dude for depth 200 as of now you need to chekc the unsubscribe dude and only then if it doesnt work we need to trigegr an email adn even mesage in madefortrade also dude okay? becuase they told unsubscribe but if it doesnt worj we need to notify and find it out the issues dude espeicllay focusing on resusbcribe dude okay?"
+
+This is the fresh dated quote the 2026-09-12 section's REJECT list requires in
+two places: before the probe is ARMED on a live session, and before an email to
+Dhan is sent from its result. Recorded HERE before either happens.
+
+#### What the vendor documents, re-read from the attached PDFs
+
+| Source (dated 9/11/26) | What it says |
+|---|---|
+| Full Market Depth guide | subscribe = `23`; the only other code shown is `12` (Feed Disconnect — closes the whole socket). No per-instrument unsubscribe example. |
+| Annexure, Feed Request Code | `25` = Unsubscribe — Full Market Depth. The table skips `24`. |
+
+So `25` stays the code we send (the 2026-09-11 SECOND section, unchanged). The
+probe answers whether Dhan acts on it.
+
+#### What this authorizes
+
+| # | Authorized | How |
+|---|---|---|
+| 1 | Arm BOTH probe arms on the live box, from the next trading session | an on-box `[depth_unsubscribe_probe]` block in `/opt/tickvault/config/local.toml`, written by SSM AFTER the evening deploy. **`config/base.toml` stays all-false** — `every_probe_flag_ships_off` is unchanged and still binds. Every deploy's `cp -f repo/config/*.toml` overwrites the on-box file, so a deploy DISARMS it: the fail-safe direction. |
+| 2 | Keep it armed across days until one run is CONCLUSIVE | the day latch still caps it at ONE run per trading day; an inconclusive day simply tries again the next day |
+| 3 | Disarm after a conclusive verdict | restore the on-box `local.toml` from the repo copy by SSM |
+| 4 | On a conclusive `ignored` from either arm: SEND the support email | update `docs/dhan-support/2026-09-13-depth-unsubscribe-ignored.md` with the run's real evidence, commit it, then send one email to `apihelp@dhan.co` from the operator's Gmail carrying the GitHub link (the README workflow). One email per conclusive finding, never per day. |
+| 5 | On a conclusive `ignored`: PREPARE the MadeForTrade post | paste-ready text only. MadeForTrade has no API this repository can call; **the operator posts it**. |
+| 6 | Resubscribe focus | Arm B (close → re-dial → replay without the contract) IS the resubscribe path, and every Arm A run ends with a RESTORE (re-subscribe) whose outcome is logged as `probe_restore_ok` / `probe_restore_failed`. The ticket reports both. |
+
+#### What each outcome triggers
+
+| Arm A (code 25) | Arm B (close + redial + replay) | Meaning | Action |
+|---|---|---|---|
+| `honoured` | `honoured` | Dhan acts on 25. The ghost stream is OUR bug. | No email. Open the in-repo investigation. |
+| `ignored` | `honoured` | 25 is ignored; a fresh connection's replay does stop the stream. | **Email + post.** Ask for the supported per-instrument stop. |
+| `ignored` | `ignored` | Even a new connection keeps streaming a contract it never subscribed. | **Email + post**, marked urgent. |
+| `honoured` | `ignored` | Strange: the close failed where the code worked. | Email + post, plus a repo investigation of the replay. |
+| any inconclusive | — | The probe declined to answer. | No email. Stay armed; next day retries. |
+
+#### ⚠ Honest envelope
+
+- **A thin stock-option book can make a day inconclusive.** Depth-200 carries
+  stock options only (2026-09-23 section above), and the verdict needs the
+  contract to have printed during the 60-second baseline. An
+  `inconclusive_thin_book` morning costs nothing and retries.
+- **The box does NOT send the email.** No mailbox credential exists on the box
+  and none will be added. The session reads the verdict from CloudWatch and
+  sends from the operator's Gmail. If no session is running that morning, the
+  verdict waits in the log; nothing is lost.
+- **One run is one data point** on one account at one time of day
+  (2026-09-12 Part 6, unchanged).
+- **`RequestCode 12` is still untested.** It closes the whole socket, which Arm
+  B already does as a close.
+
+#### What a PR or action that violates this section looks like (REJECT)
+
+- Sets any probe flag `true` in a COMMITTED config file.
+- Sends the email on an inconclusive verdict, or more than once per finding.
+- Sends it without the committed, evidence-filled support draft it links to.
+- Auto-posts to MadeForTrade by any means.
+- Arms the probe inside 09:00–15:45 IST by restarting the app (arming is a file
+  write; it takes effect at the next boot, never by a restart in session).
