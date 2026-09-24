@@ -41,8 +41,41 @@
 //! the operator can SEE what normal looks like before judging anything.
 //!
 //! Cold path, best-effort, once a day. Never on the tick hot path. Writes
-//! ONLY the two tables below — NEVER `ticks`, `candles_*` or
+//! ONLY the three tables below — NEVER `ticks`, `candles_*` or
 //! `historical_candles` (the live-feed purity rule).
+//!
+//! # Schema
+//!
+//! ```text
+//! CREATE TABLE IF NOT EXISTS dhan_live_crossverify_cell_audit (
+//!     ts TIMESTAMP, trading_date_ist TIMESTAMP, feed SYMBOL,
+//!     security_id LONG, segment SYMBOL, minute_ts_ist TIMESTAMP,
+//!     kind SYMBOL, field SYMBOL,
+//!     live_value DOUBLE, rest_value DOUBLE,
+//!     live_volume LONG, rest_volume LONG, diff_paise LONG
+//! ) timestamp(ts) PARTITION BY DAY
+//! DEDUP UPSERT KEYS(ts, trading_date_ist, feed, security_id, segment,
+//!                   minute_ts_ist, kind, field)
+//!
+//! CREATE TABLE IF NOT EXISTS dhan_live_crossverify_daily (
+//!     ts TIMESTAMP, trading_date_ist TIMESTAMP, feed SYMBOL,
+//!     instruments LONG, minutes_compared LONG, cells_diverged LONG,
+//!     missing_live LONG, missing_live_traded LONG,
+//!     missing_live_zero_volume LONG, missing_rest LONG,
+//!     tail_unsealed LONG, out_of_session LONG,
+//!     noise_p50_paise LONG, noise_p95_paise LONG, noise_max_paise LONG,
+//!     tolerance_paise LONG, outcome SYMBOL
+//! ) timestamp(ts) PARTITION BY DAY
+//! DEDUP UPSERT KEYS(ts, trading_date_ist, feed, outcome)
+//!
+//! CREATE TABLE IF NOT EXISTS dhan_rest_1m_tape (
+//!     ts TIMESTAMP, trading_date_ist TIMESTAMP, feed SYMBOL, source SYMBOL,
+//!     security_id LONG, segment SYMBOL, instrument SYMBOL,
+//!     open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE,
+//!     volume LONG, fetched_at TIMESTAMP
+//! ) timestamp(ts) PARTITION BY DAY
+//! DEDUP UPSERT KEYS(ts, security_id, segment, feed, source)
+//! ```
 
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
