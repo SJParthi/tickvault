@@ -8126,3 +8126,80 @@ probe answers whether Dhan acts on it.
 - Auto-posts to MadeForTrade by any means.
 - Arms the probe inside 09:00–15:45 IST by restarting the app (arming is a file
   write; it takes effect at the next boot, never by a restart in session).
+
+### 2026-09-24 — DEPTH-20 IS A STATIC DAY SET; DEPTH-200 ROTATES BY RECONNECT, ONE SOCKET AT A TIME
+
+**The verbatim operator demand (2026-09-24, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "see i clelry told you to pick entire fno undelryign stocks as the fixed once at 9 am itslef tis finailised til leod right dude meanwhiel for nifty and abnknfity aloen once rpe market is finalsied alone only then we ened to makr up either atm plus or minus 3 or 4 right dude til leod roght to fill up the entrie 250 slots right so that our depth 20 entire day shdou leb completely fixed static right dude am i irght dude but only for depth 200 alone for the first 3 seocnds based on top volume top volume 3 seconds based on timestamo asc and volume percnetage change descendign opick the otp 5 udnique underlyign secuirty id resoective stocks otpions cntarct right dude am i irght bro then startign 9.16 am onwards same process shdou lbe repeated but nwo base done. evry top volume 1 min it hsodu lbe reocnencted right dude of top 5 right dude because till now dhan ahsnt confirmed about unsunscirbe right dude am i rigth dude tell me dude okay?"
+
+**The authorization (same session):**
+
+> "See fix and resolve and build and implement everything entilrey dude why stopping dude why"
+
+Recorded HERE before any code, per the rule-file-first law.
+
+#### What this SUPERSEDES
+
+| Surface | Was (2026-09-11 THIRD/FOURTH, 2026-09-13) | Now |
+|---|---|---|
+| depth-20 selection | top-6 mover name board, re-planned every minute | **STATIC for the day**: every F&O underlying NSE_EQ spot (~208) from the 09:00 attach, plus NIFTY + BANKNIFTY options ATM ±k (k ≤ 4) once the pre-open price is final (≥ 09:12) |
+| depth-20 per-minute steering | name board, then ranked contract list | **REMOVED** — no depth-20 swap, no depth-20 unsubscribe, all day |
+| depth-20 index futures | none (2026-09-18 THIRD) | none — unchanged |
+| depth-200 ranking | 3 s board, applied once a minute | 3 s board for the FIRST ranking (~09:15), then the **1-minute** board from 09:16 onward |
+| depth-200 change mechanism | unsubscribe (code 25) + subscribe on the same socket | **close the socket and redial it** with the new contract as its only instrument |
+
+The depth-200 REST of the contract stands: stock options only, top 5 DISTINCT
+underlyings, the 20-underlying hysteresis band, at most 5 changes a minute, no
+index options, no BSE. The unsubscribe RequestCode stays **25** and is simply no
+longer sent by the depth-200 steering path.
+
+#### ⚠ This REVERSES the 2026-09-11 (FOURTH) refusal — findings 1–5, engaged by name
+
+That section refused socket hang-up as the routine swap mechanism and its REJECT
+list requires a fresh dated quote engaging its five findings. Each one, and what
+answers it now:
+
+| # | Finding | Answer |
+|---|---|---|
+| 1 | No deliberate-close concept in `ConnEvent` | A new `ConnEvent::RotationRequested`, reached ONLY through a new `LiveSubscriptionCommand::RotateByRedial` on a depth-200 connection holding exactly one instrument. The steering loop cannot reach any other close path. |
+| 2 | Every redial records a flap | A new `ReconnectReason::RankedRotation` is exempt from the flap record, the same way `ProbeClose` is, and the exemption stays INSIDE `enter_backoff` (the single choke point is kept). A genuine fault still records a flap. |
+| 3 | Once a minute sits at 5 of a ceiling of 6 | Point 2 removes rotations from the damper's count, so a real vendor drop is judged against real faults only. The cap stays one change per socket per minute and five per minute pool-wide. |
+| 4 | A rebuilt socket counts healthy only once a frame arrives | Unchanged, and accepted: a rotated socket whose new book is silent is the same "not yet proven" state as a first dial. The per-minute cap means a socket is rotated at most once a minute. |
+| 5 | The blind window after a subscribe (no snapshot-on-subscribe) | Unchanged, and accepted: it is the same window the unsubscribe+subscribe path already had. `tv_depth_first_packet_latency_ms` keeps measuring it. |
+
+**The 805 / 429 risk, which the refusal also named.** Dhan documents 805 as "may
+result in user being blocked". A process-wide `ROTATION_HALTED` flag is set the
+first time ANY socket receives 805 (PoolOverflow). From then until the process
+restarts, no rotation is sent. The pool holds its last set, and each skipped
+rotation is counted. Five rotations a minute across five sockets is ~375 redials a
+session in the worst case, against the unknown per-account connect cap. That is
+the operator's accepted cost, and the breaker is what bounds it.
+
+#### ⚠ Honest envelope
+
+- **NSE_EQ depth is UNVERIFIED-LIVE.** ~208 of the 244 depth-20 slots are equity
+  spots, and no session has yet sent an NSE_EQ depth subscribe. If Dhan answers
+  with silence, the static pool carries only the ~36 index-option legs. The
+  first session is the measurement.
+- **Why k ≤ 4.** The index legs cost (2k+1) × 2 legs × 2 indices. With 208 spots,
+  k = 4 needs 36 legs for a total of 244 of 250. k is the largest value ≤ 4 that
+  fits, chosen fail-closed from the real spot count, so a larger F&O list shrinks
+  k rather than breaching the pool.
+- **A rotation has a blind window**: the old stream stops, the redial takes
+  about 0.3 s, then the new book is blank until it next changes. This is no
+  worse than the old path, whose unsubscribe was ignored on both codes.
+- **A dial-level 429 is not classified**, so the breaker catches only 805.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Re-adds any per-minute depth-20 steering, swap, or unsubscribe.
+- Puts an index spot (`IDX_I`), a future, or a BSE contract on a depth socket.
+- Lets `RotateByRedial` act on a socket holding more than one instrument, or
+  sends it to depth-20.
+- Removes the `ROTATION_HALTED` breaker, or clears it within a session.
+- Records a flap for `RankedRotation`, or exempts any other reason from the flap
+  record without its own dated quote.
+- Raises the rotation cap above one per socket per minute or five pool-wide.
+- Chooses k by any rule other than "largest k ≤ 4 that fits the 250 budget".

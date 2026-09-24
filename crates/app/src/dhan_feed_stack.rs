@@ -1464,6 +1464,30 @@ const fn fold_frame_for_cadence(
     }
 }
 
+/// Whether THIS ranking sweep publishes the depth steering candidates
+/// (operator 2026-09-24).
+///
+/// The first depth-200 ranking of the session comes from the 3-second board,
+/// so the five sockets can move at the first :08 after the open instead of
+/// waiting a whole minute. Once a list exists, only the 1-minute board
+/// publishes: from 09:16 the sockets follow the busiest names of the last
+/// full minute, which is steadier than a 3-second window and is what the
+/// once-a-minute rotation actually applies.
+///
+/// # Complexity
+/// O(1) — one match, no allocation.
+const fn depth200_candidates_due(
+    cadence: tickvault_storage::top_volume_rank_persistence::SnapshotCadence,
+    already_ranked: bool,
+) -> bool {
+    use tickvault_storage::top_volume_rank_persistence::SnapshotCadence;
+    match cadence {
+        SnapshotCadence::ThreeSecond => !already_ranked,
+        SnapshotCadence::OneMinute => true,
+        SnapshotCadence::OneSecond | SnapshotCadence::FiveSecond => false,
+    }
+}
+
 impl LiveIngest {
     /// Enables persistence of the 5 depth levels that ride inline in every
     /// Full-mode tick packet.
@@ -1551,10 +1575,18 @@ impl LiveIngest {
         // from a harness that was timing an empty sort -- see
         // `volume_leaderboard`'s header.)
         let wants_rows = self.top_volume.is_some();
-        // 2026-09-23: the 3-SECOND board (operator: "pick first 3 seconds top
-        // volume"), was 5 s. Applied to the sockets once a minute regardless.
-        let wants_candidates =
-            cadence == tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ThreeSecond;
+        // 2026-09-24 (operator): the FIRST depth-200 ranking of the session
+        // comes from the 3-SECOND board, so the five sockets move within
+        // seconds of the open; from then on the 1-MINUTE board drives it
+        // (09:16 onward). Applied to the sockets once a minute regardless.
+        // `depth200_candidates_due` is the pure rule; the published list's
+        // presence is the "first ranking done" latch.
+        let wants_candidates = depth200_candidates_due(
+            cadence,
+            crate::depth200_candidates::global_depth200_candidates()
+                .latest()
+                .is_some(),
+        );
         if !wants_rows && !wants_candidates {
             return (0, 0);
         }
@@ -15183,6 +15215,11 @@ mod tests {
                         operator-armed probe on a depth-200 socket, never to a top-up"
                 )
             }
+            LiveSubscriptionCommand::RotateByRedial { .. } => {
+                panic!(
+                    "a top-up sent a RotateByRedial — rotation belongs to the depth-200 steering loop, never to a top-up"
+                )
+            }
         }
     }
 
@@ -15208,6 +15245,11 @@ mod tests {
                 panic!(
                     "a top-up sent a ProbeUnsubscribe — that command belongs to the\
                         operator-armed probe on a depth-200 socket, never to a top-up"
+                )
+            }
+            LiveSubscriptionCommand::RotateByRedial { .. } => {
+                panic!(
+                    "a top-up sent a RotateByRedial — rotation belongs to the depth-200 steering loop, never to a top-up"
                 )
             }
         }
@@ -23583,38 +23625,52 @@ mod late_seed_tests {
         }
     }
 
-    /// Depth-200 steering reads the 3-SECOND board and only that one.
+    /// Depth-200 steering reads the 3-SECOND board for the FIRST list of the
+    /// session, then the 1-MINUTE board from then on.
     ///
-    /// 2026-09-23 (websocket-connection-scope-lock.md, "depth-200 ranks off the
-    /// 3-SECOND board"): moved from the 5-second board on the operator's
-    /// instruction. This test was `only_the_five_second_cadence_drives_depth_steering`.
+    /// 2026-09-24 (websocket-connection-scope-lock.md, "DEPTH-20 IS A STATIC
+    /// DAY SET; DEPTH-200 ROTATES BY RECONNECT"). This test was
+    /// `only_the_three_second_cadence_drives_depth_steering` (2026-09-23),
+    /// and before that the five-second one.
     ///
-    /// With four cadences this is not obvious. Wiring the 1s board into
-    /// `wants_candidates` would publish a list 60 times a minute from a window
-    /// too short to rank a thin option; wiring the 1m board in would steer off
-    /// a window that spans a re-steer. Neither is a compile error and neither
-    /// shows up in any counter until the swap-refusal count moves.
+    /// Wiring the 1s board in would publish 60 lists a minute from a window
+    /// too short to rank a thin option; leaving the 3s board in after the
+    /// first list would steer off a window that ignores the minute the
+    /// rotation applies. Neither is a compile error, so it is pinned here.
     #[test]
-    fn only_the_three_second_cadence_drives_depth_steering() {
+    fn depth200_candidates_come_from_the_three_second_board_first_then_the_minute_board() {
         // Production half only: this test's own literals would otherwise
         // satisfy the scan and it could never fail.
         let full = include_str!("dhan_feed_stack.rs");
         let src = &full[..full.find("#[cfg(test)]").unwrap_or(full.len())];
         assert!(
-            src.contains(
-                "let wants_candidates =\n            cadence == tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ThreeSecond;"
-            ),
-            "the depth-200 candidate publish must be gated on ThreeSecond alone"
+            src.contains("let wants_candidates = depth200_candidates_due("),
+            "the depth-200 candidate publish must be gated by depth200_candidates_due"
         );
-        for other in [
-            "SnapshotCadence::OneSecond",
-            "SnapshotCadence::FiveSecond",
-            "SnapshotCadence::OneMinute",
-        ] {
-            assert!(
-                !src.contains(&format!("wants_candidates =\n            cadence == tickvault_storage::top_volume_rank_persistence::{other}")),
-                "{other} must not gate the depth-200 candidate publish"
-            );
+        assert_eq!(
+            src.matches("let wants_candidates =").count(),
+            1,
+            "exactly one wants_candidates gate"
+        );
+    }
+
+    #[test]
+    fn depth200_candidates_due_truth_table() {
+        use tickvault_storage::top_volume_rank_persistence::SnapshotCadence;
+        // First list of the session: the 3s board publishes.
+        assert!(depth200_candidates_due(SnapshotCadence::ThreeSecond, false));
+        // Once a list exists the 3s board goes quiet.
+        assert!(!depth200_candidates_due(SnapshotCadence::ThreeSecond, true));
+        // The minute board always publishes.
+        assert!(depth200_candidates_due(SnapshotCadence::OneMinute, false));
+        assert!(depth200_candidates_due(SnapshotCadence::OneMinute, true));
+        // 1s and 5s never publish.
+        for ranked in [false, true] {
+            assert!(!depth200_candidates_due(SnapshotCadence::OneSecond, ranked));
+            assert!(!depth200_candidates_due(
+                SnapshotCadence::FiveSecond,
+                ranked
+            ));
         }
     }
 
