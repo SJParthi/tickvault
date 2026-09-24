@@ -666,12 +666,16 @@ mod tests {
                 calls += 1;
                 (calls > 3).then_some(7u8)
             },
-            5,
-            60,
+            TOKEN_WAIT_POLL_SECS,
+            TOKEN_WAIT_MAX_POLLS,
         )
         .await;
         assert_eq!(got, Some((7, 3)));
-        assert_eq!(start.elapsed(), Duration::from_secs(15));
+        // Three sleeps before the fourth check finds the value.
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_secs(TOKEN_WAIT_POLL_SECS * 3)
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -683,13 +687,21 @@ mod tests {
                 calls += 1;
                 None
             },
-            5,
-            60,
+            TOKEN_WAIT_POLL_SECS,
+            TOKEN_WAIT_MAX_POLLS,
         )
         .await;
         assert_eq!(got, None);
-        assert_eq!(calls, 61, "61 checks");
-        assert_eq!(start.elapsed(), Duration::from_secs(300), "60 sleeps");
+        assert_eq!(
+            calls,
+            TOKEN_WAIT_MAX_POLLS + 1,
+            "one check per sleep plus the first"
+        );
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_secs(TOKEN_WAIT_POLL_SECS * u64::from(TOKEN_WAIT_MAX_POLLS)),
+            "one sleep per poll"
+        );
     }
 
     #[test]
