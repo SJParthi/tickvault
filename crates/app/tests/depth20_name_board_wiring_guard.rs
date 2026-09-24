@@ -14,9 +14,8 @@
 //!
 //! | Pinned here | What its loss costs |
 //! |---|---|
-//! | the board is reached from the steering loop | the module is dormant again, and nothing says so |
-//! | the board is PRIMARY, ahead of the volume ranking | the 2026-09-11 authorization is recorded and not applied |
-//! | `held_names` is carried forward | the exit band is computed and discarded — churn control that reports control it does not have |
+//! | depth-20 is NOT steered — no name board, no ranked list, no per-minute swap (inverted 2026-09-24) | a swap whose unsubscribe Dhan ignores comes back, and the "static all day" set churns |
+//! | the attach dials the static day set exactly once | the replacement engine is dormant and depth-20 opens nothing |
 //! | the slot arithmetic still sums to 230 ≤ 250 | `plan_pool` refuses the WHOLE pool fail-closed: a session with no depth at all |
 //! | NIFTY and BANKNIFTY cannot be displaced | the two deepest books lose their sockets to a mover |
 //! | a missing price ranks `None`, never `0` | an unpriced name ties with a genuinely flat one and takes a socket it did not earn |
@@ -37,12 +36,22 @@
 //! 2026-09-13 an adversarial hunt found the **thirteenth** vacuous guard HERE:
 //! the carried-forward test asserted `declared < consumed`, an ordering Rust
 //! already guarantees, so it could not fail for the regression its own message
-//! described. See [`held_names_outlives_the_loop`] for the corrected property
-//! and `guard_self_test` block `(c2)` for the fixture that bite-proves both
-//! the withdrawn assertion's vacuity and the replacement's bite. The fourth
-//! rule the finding adds: **name the property in code, not only in the failure
-//! message** — an assertion whose message describes something stronger than
-//! the expression evaluates is a vacuous guard wearing a correct comment.
+//! described. The corrected check (`held_names_outlives_the_loop`) was
+//! RETIRED on 2026-09-24 together with the steering it guarded. The fourth
+//! rule the finding adds still binds: **name the property in code, not only in
+//! the failure message** — an assertion whose message describes something
+//! stronger than the expression evaluates is a vacuous guard wearing a correct
+//! comment.
+//!
+//! # 2026-09-24 — the wiring half is INVERTED
+//!
+//! The operator retired per-minute depth-20 steering: depth-20 is now a STATIC
+//! day set (every F&O spot from 09:00, NIFTY and BANKNIFTY ATM ±k once the
+//! pre-open price is final, no swap and no unsubscribe all day). The board's
+//! arithmetic, ranking and comparator tests below stay — the module is
+//! retained — but the "reached every minute" pins are replaced by the opposite
+//! property: nothing in the steering loop steers depth-20 any more, and the
+//! attach dials `depth20_static::build_static_depth20` exactly once.
 
 use std::fs;
 
@@ -109,219 +118,73 @@ fn offset_of_only(haystack: &str, needle: &str, want: usize) -> usize {
         .unwrap_or_else(|| panic!("{needle:?} not found"))
 }
 
-/// [`offset_of_only`] as a `Result`, so a checker built on it can be
-/// bite-proven against a fixture without `catch_unwind`.
-fn only_offset(haystack: &str, needle: &str) -> Result<usize, String> {
-    let found = haystack.matches(needle).count();
-    if found != 1 {
-        return Err(format!(
-            "expected exactly 1 occurrence of {needle:?}, found {found} — a \
-             positional assertion against a moved or missing anchor proves nothing"
-        ));
-    }
-    haystack
-        .find(needle)
-        .ok_or_else(|| format!("{needle:?} not found"))
-}
+/// Every call that would STEER depth-20 once a minute.
+///
+/// Since 2026-09-24 depth-20 is a STATIC day set (`websocket-connection-scope-lock.md`
+/// "2026-09-24 — DEPTH-20 IS A STATIC DAY SET"): every F&O spot from the 09:00
+/// attach, NIFTY and BANKNIFTY at-the-money ±k added once the pre-open price is
+/// final, and no swap and no unsubscribe for the rest of the session. The scope
+/// lock's REJECT list names "re-adds any per-minute depth-20 steering, swap, or
+/// unsubscribe" — these are the calls that would do it.
+const DEPTH20_STEERING_CALLS: [&str; 6] = [
+    "build_name_layout(",
+    "plan_depth20_ranked_minute(",
+    "plan_depth20_minute(",
+    "build_depth20_layout(",
+    "cap_depth20_socket_swaps(",
+    "held_names",
+];
 
-/// The carried-forward check, as a pure function over source text so
-/// [`guard_self_test`] can bite-prove it against a fixture in which the
-/// declaration has been moved INSIDE the loop.
-///
-/// # The thirteenth vacuous guard (found and corrected 2026-09-13)
-///
-/// Until today this property was asserted as `declared < consumed` — the
-/// offset of `let mut held_names:` against the offset of `&held_names`.
-/// **That ordering cannot fail for the regression it names.** Rust already
-/// forbids use-before-declaration, so `declared < consumed` holds whether the
-/// declaration sits above `loop {` or is its first statement. PROVEN: moving
-/// the declaration inside the loop in `depth_rebalance.rs` left all nine tests
-/// green, `guard_self_test` included.
-///
-/// The property is `declared < loop_start` — the declaration must precede the
-/// `loop {` TOKEN, not merely precede its use. `\n    loop {` is the steering
-/// loop's own four-space indentation and occurs exactly once in the scanned
-/// production source; the inner `loop {` of the heartbeat spawn is eight-space
-/// indented and cannot match, which `only_offset`'s count assertion pins.
-fn held_names_outlives_the_loop(body: &str) -> Result<(), String> {
-    let declared = only_offset(body, "let mut held_names:")?;
-    let loop_start = only_offset(body, "\n    loop {")?;
-    // Anchored WITHOUT trailing punctuation: `cargo fmt` owns whether the call
-    // wraps (trailing comma) or fits one line (closing paren), and it collapsed
-    // this very call when the futures argument was removed on 2026-09-18 -
-    // turning a real property into a formatting assertion that failed on
-    // correct code. `&held_names` occurs once; the declaration has no `&`.
-    let consumed = only_offset(body, "&held_names")?;
-    if declared >= loop_start {
-        return Err(format!(
-            "`held_names` is declared at byte {declared}, at or after the \
-             steering `loop {{` at byte {loop_start} — declared INSIDE the loop \
-             it is a fresh empty set every minute, `NameBoard::keeps` is handed \
-             nothing, `DEPTH20_NAME_EXIT_RANK` never bites, and the swap \
-             counters report churn control the code does not have"
-        ));
-    }
-    if loop_start >= consumed {
-        return Err(format!(
-            "`&held_names` at byte {consumed} is not inside the steering loop \
-             that starts at byte {loop_start} — the board is not being told \
-             what it chose last minute"
-        ));
-    }
-    Ok(())
+/// The steering calls present in `body`, as a pure function so
+/// [`guard_self_test`] can bite-prove the scan against a fixture that DOES
+/// steer.
+fn depth20_steering_calls_in(body: &str) -> Vec<&'static str> {
+    DEPTH20_STEERING_CALLS
+        .iter()
+        .copied()
+        .filter(|call| body.contains(call))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
-// 1. The board is REACHED, and it is PRIMARY.
+// 1. Depth-20 is a STATIC day set. The name board is no longer reached.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn the_steering_loop_builds_the_name_board_every_minute() {
+fn the_steering_loop_no_longer_steers_depth20() {
+    // The 2026-09-13 guard pinned the OPPOSITE: that the board was reached every
+    // minute. The operator's 2026-09-24 directive retired per-minute depth-20
+    // steering outright ("our depth 20 entire day shdou leb completely fixed
+    // static"), so what must now never come back is the steering itself.
     let loop_body = production_source("src/depth_rebalance.rs");
-    offset_of_only(
-        &loop_body,
-        "crate::depth20_name_board::build_name_layout(",
-        1,
-    );
+    let present = depth20_steering_calls_in(&loop_body);
     assert!(
-        loop_body.contains("name_plan.is_steerable()"),
-        "the steering loop no longer asks the name board whether it can steer — \
-         the module is dormant again and nothing says so"
+        present.is_empty(),
+        "depth-20 is a static day set, but the steering loop still calls {present:?} \
+         — a per-minute depth-20 swap is a REJECT under the 2026-09-24 scope lock"
+    );
+    // Nor may the loop keep seeding the retired board's counters: a series
+    // seeded every boot and never incremented reads as "this never happens".
+    assert!(
+        !loop_body.contains("pre_register_name_board_counters("),
+        "the name board no longer drives anything; seeding its counters \
+         publishes a permanently-flat series"
     );
 }
 
 #[test]
-fn the_name_board_is_primary_and_the_older_engines_are_the_fallback() {
-    // The 2026-09-11 (THIRD) authorization makes the name board the depth-20
-    // engine. If the volume ranking were consulted FIRST the authorization
-    // would be recorded and not applied — a change that reads as shipped.
-    let loop_body = production_source("src/depth_rebalance.rs");
-    let steerable = offset_of_only(&loop_body, "if name_plan.is_steerable() {", 1);
-    let fallback = offset_of_only(&loop_body, "match ranking_20.as_deref() {", 1);
+fn the_attach_dials_the_static_day_set() {
+    // The replacement engine must be REACHED, exactly once, from the attach.
+    let stack = production_source("src/dhan_feed_stack.rs");
+    offset_of_only(&stack, "crate::depth20_static::build_static_depth20(", 1);
+    // ...and the attach must not fall back to a steered layout either.
+    let present = depth20_steering_calls_in(&stack);
     assert!(
-        steerable < fallback,
-        "the volume ranking is being consulted before the name board — the \
-         name board must be PRIMARY, with the older engines behind it for the \
-         pre-09:07 window in which it cannot yet produce a layout"
-    );
-    // and the fallback must still exist: it is the ONLY engine between 09:00
-    // and the first resolvable movers ranking.
-    for arm in [
-        "plan_depth20_ranked_minute(",
-        "seed_until_first_ranking",
-        "layout_until_first_ranking",
-    ] {
-        assert!(
-            loop_body.contains(arm),
-            "the {arm} fallback arm is gone — the pre-open window has no engine"
-        );
-    }
-}
-
-#[test]
-fn the_exit_band_governs_the_next_minute_because_the_choice_is_carried_forward() {
-    // THE hysteresis wiring. `NameBoard::keeps` is inert unless the names the
-    // board chose are fed back in as `held`: without this line the band is
-    // computed and discarded every minute, the board re-orders freely, and the
-    // swap counters report churn control it does not have.
-    let loop_body = production_source("src/depth_rebalance.rs");
-    offset_of_only(&loop_body, "held_names = name_plan.chosen_keys();", 1);
-    // `declared < consumed` is NOT this property — Rust forbids
-    // use-before-declaration, so that ordering holds on BOTH sides of the
-    // regression. The declaration must precede the `loop {` TOKEN.
-    if let Err(why) = held_names_outlives_the_loop(&loop_body) {
-        panic!("{why}");
-    }
-    // A COMPILE-TIME assertion, not a runtime one: both sides are consts, so
-    // a runtime `assert!` here could never fail a test run that compiled. This
-    // fails the BUILD if someone narrows the band to the entry set - which
-    // would leave `keeps` equal to `admits` and the hysteresis inert while
-    // every name above still reported that churn was controlled.
-    const {
-        assert!(
-            DEPTH20_NAME_EXIT_RANK > DEPTH20_NAME_ENTRY_RANK,
-            "a band no wider than the entry set is not a band"
-        );
-    }
-}
-
-#[test]
-fn the_plan_is_capped_to_what_one_connection_can_queue() {
-    // Rotating one name is 24 contracts out and 24 in against a command
-    // channel four deep. Uncapped, the excess becomes a `channel_full` refusal
-    // — the swap is lost either way, and capping makes the loss deliberate,
-    // deterministic and countable rather than a queue overflow.
-    let loop_body = production_source("src/depth_rebalance.rs");
-    offset_of_only(&loop_body, "cap_depth20_socket_swaps(", 2);
-    assert!(
-        loop_body.contains("MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE"),
-        "the cap must be the socket's own command-channel depth, never a \
-         literal that can drift away from it"
+        present.is_empty(),
+        "the attach still calls {present:?} — the static day set is the only \
+         depth-20 engine"
     );
 }
-
-#[test]
-fn the_band_is_cleared_the_moment_the_board_stops_driving() {
-    // `held_names` is written from the board.s CHOICE, not from the wire. That
-    // is right while the board IS the engine and wrong the instant another one
-    // takes over: a fallback minute rewrites every socket from the volume
-    // ranking, so a name the board chose before the fallback is no longer
-    // subscribed anywhere. Carried forward, the next steerable minute would
-    // PREFER those phantom incumbents over names that genuinely out-moved
-    // them, and the exit band would be protecting contracts nothing holds.
-    //
-    // The property is POSITIONAL and it is the whole test: the clear must sit
-    // on the FALLBACK arm. A `clear()` moved into the steerable arm compiles,
-    // keeps a `contains` assertion green, and destroys the hysteresis outright
-    // by emptying the band on the very minutes it exists to govern.
-    let body = production_source("src/depth_rebalance.rs");
-    let chose = offset_of_only(&body, "held_names = name_plan.chosen_keys();", 1);
-    let steerable_arm_ends = offset_of_only(&body, "(planned, \"name_board\")", 1);
-    let cleared = offset_of_only(&body, "held_names.clear();", 1);
-    let fallback_begins_work = offset_of_only(&body, "match ranking_20.as_deref() {", 1);
-    assert!(
-        chose < steerable_arm_ends,
-        "the carry-forward write must be inside the steerable arm"
-    );
-    assert!(
-        steerable_arm_ends < cleared && cleared < fallback_begins_work,
-        "held_names.clear() must sit on the FALLBACK arm — after the steerable \
-         arm.s own tail expression and before the fallback picks an engine — \
-         or the band is emptied on the minutes it is supposed to govern"
-    );
-}
-
-#[test]
-fn every_planning_minute_reaches_the_name_board_counters() {
-    // The board became the PRIMARY depth-20 engine on 2026-09-13 and shipped
-    // with no metric of its own, while the ranked counters it displaced freeze
-    // the moment it takes over. So the one signal an operator had for depth-20
-    // steering went flat exactly when the engine changed — green by absence.
-    //
-    // Two call sites, not one, and that is the defect this pins. The board is
-    // BUILT every minute and only DRIVES on some; the three counters that
-    // explain a refusal (`names_unresolved`, `index_unresolved`,
-    // `spots_missing`) can therefore only move on a minute it did NOT drive.
-    // Recording just the steerable arm would leave them at their seeded zero
-    // forever — a refusal metric structurally unable to report a refusal.
-    let body = production_source("src/depth_rebalance.rs");
-    offset_of_only(&body, "pre_register_name_board_counters();", 1);
-    let first = offset_of_only(&body, "record_name_board_plan(", 2);
-    let last = body
-        .rfind("record_name_board_plan(")
-        .expect("counted two occurrences above");
-    let steerable_arm_ends = offset_of_only(&body, "(planned, \"name_board\")", 1);
-    assert!(
-        first < steerable_arm_ends,
-        "the steerable minute must record its own plan and swap counts"
-    );
-    assert!(
-        last > steerable_arm_ends,
-        "the FALLBACK minute must record too, or the refusal counters can \
-         never leave zero"
-    );
-}
-
 #[test]
 fn pre_register_name_board_counters_seeds_every_label_the_recorder_can_emit() {
     // The CloudWatch agent computes a counter as the delta between consecutive
@@ -745,73 +608,42 @@ fn guard_self_test() {
     );
     assert_eq!(offset_of_only("a needle b", "needle", 1), 2);
 
-    // (c2) THE THIRTEENTH VACUOUS GUARD, bite-proven in both directions.
+    // (c2) The "not steered" scan must bite in BOTH directions.
     //
-    //      `held_names` declared as the loop's FIRST STATEMENT is the exact
-    //      regression the carried-forward test names: a fresh empty set every
-    //      minute, so the exit band never bites. Both fixtures below are
-    //      byte-identical apart from where that one line sits.
-    let carried = concat!(
+    //      A loop that steers depth-20 once a minute is exactly the regression
+    //      the 2026-09-24 scope lock forbids, so a fixture that does it must be
+    //      caught, and one that does not must pass. A scan that could only
+    //      return empty would satisfy the real-file test while enforcing
+    //      nothing.
+    let steered = concat!(
         "fn steer() {\n",
-        "    let mut held_names: BTreeSet<(u64, u8)> = BTreeSet::new();\n",
+        "    let mut held_names = BTreeSet::new();\n",
         "    loop {\n",
-        "        let plan = build(\n",
-        "            &held_names,\n",
-        "        );\n",
-        "        held_names = plan.chosen_keys();\n",
+        "        let plan = crate::depth20_name_board::build_name_layout(&c, &m, &held_names);\n",
+        "        cap_depth20_socket_swaps(&mut plan, 24);\n",
         "    }\n",
         "}\n",
     );
-    let relocated = concat!(
-        "fn steer() {\n",
-        "    loop {\n",
-        "        let mut held_names: BTreeSet<(u64, u8)> = BTreeSet::new();\n",
-        "        let plan = build(\n",
-        "            &held_names,\n",
-        "        );\n",
-        "        held_names = plan.chosen_keys();\n",
-        "    }\n",
-        "}\n",
-    );
-    // The WITHDRAWN assertion — `declared < consumed` — is TRUE of the
-    // relocated fixture. That is the whole finding: it could not fail for the
-    // regression its own message described, because Rust forbids
-    // use-before-declaration whichever side of `loop {` the declaration is on.
-    let stale_declared = relocated
-        .find("let mut held_names:")
-        .unwrap_or_else(|| panic!("fixture must declare held_names"));
-    let stale_consumed = relocated
-        .find("&held_names,")
-        .unwrap_or_else(|| panic!("fixture must consume held_names"));
+    let caught_calls = depth20_steering_calls_in(steered);
+    assert!(caught_calls.contains(&"build_name_layout("));
+    assert!(caught_calls.contains(&"cap_depth20_socket_swaps("));
+    assert!(caught_calls.contains(&"held_names"));
+    let static_only = "fn attach() {\n    let set = build_static_depth20(&spots, &legs);\n}\n";
     assert!(
-        stale_declared < stale_consumed,
-        "the withdrawn assertion must still hold on the relocated fixture — if \
-         it does not, this fixture is not reproducing the 2026-09-13 finding"
-    );
-    // The replacement MUST reject it.
-    assert!(
-        held_names_outlives_the_loop(relocated).is_err(),
-        "a declaration moved inside the steering loop must FAIL the check — \
-         this is the regression the guard exists to catch"
-    );
-    assert!(
-        held_names_outlives_the_loop(carried).is_ok(),
-        "the carried-forward shape must PASS — a guard that rejects correct \
-         code is abandoned, and an abandoned guard enforces nothing"
-    );
-    // ...and a missing anchor must fail rather than silently proving nothing.
-    let no_loop =
-        "fn steer() {\n    let mut held_names: BTreeSet<(u64, u8)> = x;\n    &held_names,\n}\n";
-    assert!(
-        held_names_outlives_the_loop(no_loop).is_err(),
-        "an absent `loop {{` anchor must fail the check, never pass it"
+        depth20_steering_calls_in(static_only).is_empty(),
+        "the static day set must not read as steering — a guard that rejects \
+         correct code is abandoned, and an abandoned guard enforces nothing"
     );
 
     // (d) The real files must still satisfy what the fixtures describe — so a
     //     scan that can fail is also a scan that currently passes for the
     //     right reason.
     let loop_body = production_source("src/depth_rebalance.rs");
-    assert!(loop_body.contains("crate::depth20_name_board::build_name_layout("));
+    assert!(depth20_steering_calls_in(&loop_body).is_empty());
+    assert!(
+        production_source("src/dhan_feed_stack.rs")
+            .contains("crate::depth20_static::build_static_depth20(")
+    );
     assert!(production_source("src/depth20_name_board.rs").contains("names.sort_unstable_by("));
 
     // (e) And the arithmetic assertions must be sensitive: widening the stock
