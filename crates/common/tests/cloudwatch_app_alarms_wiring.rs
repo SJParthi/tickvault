@@ -2993,11 +2993,22 @@ fn every_ws_gap_03_filter_carries_a_source_discriminator() {
     // `$.source = "fell_back_to_indices"`) is alive, and one is still enough
     // to make the discriminator loop non-vacuous. Lower it no further — at 0
     // this guard stops being a guard.
+    //
+    // ⚠ FLOOR RAISED 1 -> 4 on 2026-09-24. The operator restored the 1-minute
+    // cross-verification ("Bro use the 1 min cross verification alone …" —
+    // `no-rest-except-live-feed-2026-06-27.md` §12.15), and with it the three
+    // `ws-gap-03-xverify-{vacuous,failed,diverged}` filters
+    // (`dhan-rest-only-noise-lock-2026-07-14.md` §2.5). Their emit sites live
+    // in `dhan_live_crossverify_boot.rs`. Four is the measured count: the
+    // universe-collapse filter plus the three restored verdicts. A drop below
+    // four means one of them vanished from terraform without this floor being
+    // re-derived.
     assert!(
-        !patterns.is_empty(),
-        "expected at least the 1 surviving WS-GAP-03 filter (universe-collapse); found \
-         none — if it was renamed or removed, update this guard deliberately rather than \
-         letting the discriminator loop below pass over an empty list",
+        patterns.len() >= 4,
+        "expected the 4 WS-GAP-03 filters (universe-collapse + 3 xverify verdicts); \
+         found {} — if one was renamed or removed, update this guard deliberately rather \
+         than letting the discriminator loop below check fewer filters than exist",
+        patterns.len(),
     );
 
     for p in patterns {
@@ -3006,8 +3017,8 @@ fn every_ws_gap_03_filter_carries_a_source_discriminator() {
             "this WS-GAP-03 filter has no `$.source` discriminator, so it matches all \
              ~50 connection-state emit sites and will page on every reconnect:\n  {p}\n\
              Add the `$.source = \"...\"` condition that identifies the specific emit \
-             (see ws-gap-03-universe-collapse — the only surviving example since the \
-             xverify filters were retired 2026-09-16)."
+             (see ws-gap-03-universe-collapse and the three ws-gap-03-xverify-* \
+             filters restored 2026-09-24)."
         );
     }
 }

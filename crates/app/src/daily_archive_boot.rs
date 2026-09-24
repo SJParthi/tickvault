@@ -68,7 +68,7 @@ use tickvault_common::config::{PartitionRetentionConfig, QuestDbConfig};
 use tickvault_common::constants::MARKET_CLOSE_DRAIN_BUFFER_SECS;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::trading_calendar::ist_offset;
-use tickvault_storage::partition_archive::{ArchiveRunSummary, PartitionArchiver};
+use tickvault_storage::partition_archive::{ArchiveRunSummary, PartitionArchiver, VerifiedDayGate};
 use tracing::{debug, error, info, warn};
 
 /// How often the loop asks whether the sweep is due.
@@ -337,9 +337,17 @@ fn now_ist() -> (NaiveDate, u32) {
 async fn run_one_pass(
     questdb: &QuestDbConfig,
     cfg: &PartitionRetentionConfig,
+    verified_day_gate: Option<&VerifiedDayGate>,
 ) -> (PassOutcome, ArchiveRunSummary) {
     match PartitionArchiver::new(questdb, cfg).await {
-        Ok(Some(mut archiver)) => {
+        Ok(Some(archiver)) => {
+            // The cross-verification hold (no-rest lock §12.15): a day's
+            // partitions wait for that day's 1-minute check. Only THIS leg
+            // carries the gate — the disk-pressure leg never waits on it.
+            let mut archiver = match verified_day_gate {
+                Some(gate) => archiver.with_verified_day_gate(std::sync::Arc::clone(gate)),
+                None => archiver,
+            };
             let summary = archiver.archive_and_drop_old_partitions().await;
             let verdict = pass_verdict(&summary, cfg.max_partitions_per_run);
             info!(
@@ -351,6 +359,7 @@ async fn run_one_pass(
                 tables_list_failed = summary.tables_list_failed,
                 tables_absent = summary.tables_absent,
                 rows_archived = summary.rows_archived,
+                held_unverified = summary.held_unverified,
                 gzip_bytes_uploaded = summary.gzip_bytes_uploaded,
                 csv_bytes_exported = summary.csv_bytes_exported,
                 verdict = ?verdict,
@@ -382,6 +391,7 @@ pub fn spawn_supervised_daily_archive_loop(
     questdb: QuestDbConfig,
     cfg: PartitionRetentionConfig,
     market_close_time: String,
+    verified_day_gate: Option<VerifiedDayGate>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !cfg.archive_enabled {
         info!("daily partition archive disabled by config — no sweep will be scheduled");
@@ -413,8 +423,9 @@ pub fn spawn_supervised_daily_archive_loop(
         loop {
             let q = questdb.clone();
             let c = cfg.clone();
+            let g = verified_day_gate.clone();
             let handle =
-                tokio::spawn(async move { run_daily_archive_loop(q, c, window_open).await });
+                tokio::spawn(async move { run_daily_archive_loop(q, c, window_open, g).await });
             match handle.await {
                 Ok(()) => {
                     info!("daily archive loop returned cleanly — not respawning");
@@ -441,6 +452,7 @@ async fn run_daily_archive_loop(
     questdb: QuestDbConfig,
     cfg: PartitionRetentionConfig,
     window_open: u32,
+    verified_day_gate: Option<VerifiedDayGate>,
 ) {
     let mut ledger = AttemptLedger::default();
     let mut ticker = tokio::time::interval(DAILY_ARCHIVE_POLL);
@@ -517,7 +529,7 @@ async fn run_daily_archive_loop(
             "daily partition archive sweep starting"
         );
 
-        let (outcome, _summary) = run_one_pass(&questdb, &cfg).await;
+        let (outcome, _summary) = run_one_pass(&questdb, &cfg, verified_day_gate.as_ref()).await;
         metrics::counter!("tv_daily_archive_attempts_total", "outcome" => outcome.as_str())
             .increment(1);
 
@@ -1037,7 +1049,7 @@ mod spawn_refusal_tests {
             ..PartitionRetentionConfig::default()
         };
         assert!(
-            spawn_supervised_daily_archive_loop(test_questdb(), cfg, "15:30:00".to_string())
+            spawn_supervised_daily_archive_loop(test_questdb(), cfg, "15:30:00".to_string(), None)
                 .is_none(),
             "archive_enabled = false must spawn no task at all"
         );
@@ -1052,8 +1064,13 @@ mod spawn_refusal_tests {
     fn spawn_supervised_daily_archive_loop_refuses_a_malformed_close_time() {
         for bad in ["", "half past three", "15:30", "99:99:99"] {
             assert!(
-                spawn_supervised_daily_archive_loop(test_questdb(), enabled_cfg(), bad.to_string())
-                    .is_none(),
+                spawn_supervised_daily_archive_loop(
+                    test_questdb(),
+                    enabled_cfg(),
+                    bad.to_string(),
+                    None,
+                )
+                .is_none(),
                 "close time {bad:?} must REFUSE to schedule rather than \
                  defaulting the window to midnight"
             );
@@ -1068,6 +1085,7 @@ mod spawn_refusal_tests {
             test_questdb(),
             enabled_cfg(),
             "15:30:00".to_string(),
+            None,
         );
         assert!(
             handle.is_some(),

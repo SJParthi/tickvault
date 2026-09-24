@@ -153,7 +153,7 @@ pub const GENERIC_SAFE_LINE: &str = "🔔 Alert received — details are in the 
 ///
 /// O(n) scan per lookup — cold path (a handful of alarm renders per SNS
 /// batch), deliberately not a hash map so the table stays a reviewable literal.
-pub const ALARM_PHRASES: [(&str, &str); 105] = [
+pub const ALARM_PHRASES: [(&str, &str); 108] = [
     // ---- capacity + candle building ----
     (
         "aggregator-refusal-rate-high",
@@ -581,21 +581,25 @@ pub const ALARM_PHRASES: [(&str, &str); 105] = [
         "errcode-ws-gap-03-universe-collapse",
         "🔷 DHAN: fell back to just four indices — almost the whole instrument list is missing",
     ),
-    // ---- Three cross-verification phrases RETIRED 2026-09-17 ----
+    // ---- Three cross-verification phrases RESTORED 2026-09-24 ----
     //
-    // `errcode-ws-gap-03-xverify-diverged`, `-failed` and `-vacuous` translated
-    // the three verdicts of the 15:41 live-vs-broker price cross-check. The
-    // comparator is gone (§12.10.3 removed it AND the boot floor that gated all
-    // sixteen sockets on it), so all three filters were removed from terraform
-    // and no SNS record can carry these names again.
-    //
-    // ⚠ Worth reading rather than skimming: the phrases these replaced were the
-    // operator-facing wording for the ONLY check that ever compared our captured
-    // prices against an external record — "our recorded prices disagree badly
-    // with the broker's own record". After this there is no such check anywhere
-    // in the workspace (§12.10.4), so no future phrase should be written that
-    // implies one exists. What survives says whether the machinery RAN, never
-    // whether the numbers are RIGHT.
+    // Retired 2026-09-17 with the 15:41 comparator; restored with it on the
+    // operator's instruction (`no-rest-except-live-feed-2026-06-27.md`
+    // §12.15, noise lock §2.5). The check compares our 1-minute candles
+    // against Dhan's own 1-minute record, and the S3 daily archive waits for
+    // it, so the vacuous and failed phrases also say the archive is held.
+    (
+        "errcode-ws-gap-03-xverify-diverged",
+        "🔷 DHAN: our recorded prices disagree badly with the broker's own record",
+    ),
+    (
+        "errcode-ws-gap-03-xverify-failed",
+        "🔷 DHAN: the end-of-day price cross-check could not run — today's backup to S3 is on hold",
+    ),
+    (
+        "errcode-ws-gap-03-xverify-vacuous",
+        "🔷 DHAN: the end-of-day price cross-check compared nothing at all — today's backup to S3 is on hold",
+    ),
 ];
 
 /// Cached SSM reads — Lambda containers stay warm for ~15 min. Re-fetch

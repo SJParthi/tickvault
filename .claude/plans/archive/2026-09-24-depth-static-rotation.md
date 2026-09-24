@@ -98,4 +98,4 @@ plan. Item-specific evidence:
 - [x] app: depth-200 send_swap → RotateByRedial, 3s→1m board
 - [x] app: depth-20 static set + index legs + remove per-minute depth-20 steering
 - [x] tests / clippy / fmt green (app: 112 suites, 2,728 passed, 0 failed; clippy lib+bins clean; fmt clean)
-- [ ] PR All Green; merge; deploy after 15:45 IST
+- [x] PR All Green; merge; deploy after 15:45 IST

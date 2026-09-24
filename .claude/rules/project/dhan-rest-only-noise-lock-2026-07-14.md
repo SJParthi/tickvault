@@ -4033,3 +4033,31 @@ that the sixteen live sockets stop, which is larger than what the sentence says.
   live-lane family (5) is the Dhan surface now, and it is nineteen signals, not
   two.
 - Claims the REST legs are monitored. They are gone.
+
+---
+
+## §2.5 — 2026-09-24: the three cross-verification alarms are RESTORED with the check
+
+**Authority:** the operator's 2026-09-24 quotes recorded verbatim in
+`no-rest-except-live-feed-2026-06-27.md` §12.15.0 ("Bro use the 1 min cross
+verification alone … Fix and resoleve everything dude and then merge and deploy
+it dude okay?"). This dated row is the §3 record required before any page
+returns. Recorded BEFORE the terraform.
+
+| Alarm | Pattern | Why |
+|---|---|---|
+| `tv-<env>-errcode-ws-gap-03-xverify-vacuous` | `{ $.code = "WS-GAP-03" && $.level = "ERROR" && $.source = "xverify_vacuous" }` | the check compared zero minutes; today's S3 archive is now also held |
+| `tv-<env>-errcode-ws-gap-03-xverify-failed` | same shape, `xverify_failed` | the check could not run; S3 is held |
+| `tv-<env>-errcode-ws-gap-03-xverify-diverged` | same shape, `xverify_diverged` | more than half the compared price fields disagree |
+
+Shape, thresholds and `ok_recovery = false` are exactly the §2.3f / §2.3k
+entries removed on 2026-09-17. Nothing new is invented.
+
+**Cost and lever.** 3 alarms ≈ $0.30/mo. The same 2026-09-17 removal deleted
+four REST-leg alarms (`spot1m-01-escalation`, `chain-02-escalation`, `chain-01`,
+`chain-04-warmup`, ≈ $0.40/mo) whose producers stay deleted. Net change against
+the pre-removal bill is −$0.10/mo. No new EMF metric name.
+
+**What a PR that violates §2.5 looks like (REJECT):** filters on `WS-GAP-03`
+alone; sets `ok_recovery = true`; adds a fourth xverify alarm without its own
+dated row.

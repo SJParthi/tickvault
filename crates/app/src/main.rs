@@ -2263,6 +2263,26 @@ async fn async_main() -> Result<()> {
             config.questdb.clone(),
             config.partition_retention.clone(),
             config.trading.market_close_time.clone(),
+            // The S3 hold gate (`no-rest-except-live-feed-2026-06-27.md`
+            // §12.15.2): a trading day's partitions archive only once the
+            // 15:41 cross-verification wrote its measured-verdict marker. A
+            // non-trading day is treated as verified — there is nothing to
+            // compare. Past `MAX_CROSSVERIFY_HOLD_DAYS` the archiver proceeds
+            // anyway and says so loudly, so the disk can never fill waiting.
+            // With the Dhan lane OFF no cross-verification runs, so there is
+            // nothing to wait for and the archive is not gated at all.
+            config.feeds.dhan_enabled.then(|| {
+                let calendar = std::sync::Arc::clone(&trading_calendar);
+                let gate: tickvault_storage::partition_archive::VerifiedDayGate =
+                    std::sync::Arc::new(move |day: chrono::NaiveDate| {
+                        !calendar.is_trading_day(day)
+                            || tickvault_app::daily_task_marker::daily_marker_exists(
+                                tickvault_app::dhan_live_crossverify_boot::CROSSVERIFY_MARKER_TASK,
+                                day,
+                            )
+                    });
+                gate
+            }),
         );
 
     // W2 PR#6 (WAL-SUSPEND-01, 2026-07-10, audit follow-up row 10):
@@ -2927,6 +2947,17 @@ async fn async_main() -> Result<()> {
         );
     }
 
+    // Resolved ONCE and shared, so the daily cross-verification below checks
+    // exactly the universe the lane subscribed — never a second resolution
+    // that could land on a different artifact.
+    let main_feed_instruments = tickvault_app::dhan_live_universe::resolve_live_universe(
+        &config.dhan_universe,
+        tickvault_app::dhan_feed_stack::hardcoded_index_universe(),
+        &universe_date_ist,
+        tickvault_core::websocket::pool_budget::DhanEndpointType::MainFeed.subscription_capacity(),
+        universe_collapse_expected,
+    );
+
     let dhan_feed_stack_monitor = tickvault_app::dhan_feed_stack::spawn_dhan_feed_stack(
         tickvault_app::dhan_feed_stack::DhanFeedStackParams {
             shutdown: std::sync::Arc::clone(&dhan_feed_shutdown),
@@ -2952,14 +2983,7 @@ async fn async_main() -> Result<()> {
             // carve-out — "re-pointing the lane… must not be smuggled in" — is
             // honoured in substance: the live set does not move until a human
             // flips the flag and restarts.
-            main_feed_instruments: tickvault_app::dhan_live_universe::resolve_live_universe(
-                &config.dhan_universe,
-                tickvault_app::dhan_feed_stack::hardcoded_index_universe(),
-                &universe_date_ist,
-                tickvault_core::websocket::pool_budget::DhanEndpointType::MainFeed
-                    .subscription_capacity(),
-                universe_collapse_expected,
-            ),
+            main_feed_instruments: main_feed_instruments.clone(),
             // Empty by design — the stack late-attaches depth after 09:16 IST.
             depth_20_instruments: Vec::new(),
             depth_200_instruments: Vec::new(),
@@ -2985,6 +3009,31 @@ async fn async_main() -> Result<()> {
             rest_fold_writes_dhan_candles: config.rest_candle_fold.enabled,
         },
     );
+
+    // Daily 1-minute cross-verification (`no-rest-except-live-feed` §12.15,
+    // 2026-09-24): our `candles_1m` against Dhan's own tape after the close.
+    // Its own task — the lane above never waits for it. Only with the Dhan
+    // lane ON: with it off there are no `feed='dhan'` candles to compare, and
+    // the S3 gate above is not armed either.
+    let _dhan_crossverify = config.feeds.dhan_enabled.then(|| {
+        tickvault_app::dhan_live_crossverify_boot::spawn_dhan_live_crossverify(
+            tickvault_app::dhan_live_crossverify_boot::CrossverifyBootDeps {
+                questdb_exec_url: format!(
+                    "http://{}:{}/exec",
+                    config.questdb.host, config.questdb.http_port
+                ),
+                intraday_url: format!(
+                    "{}{}",
+                    config.dhan.rest_api_base_url,
+                    tickvault_common::constants::DHAN_CHARTS_INTRADAY_PATH
+                ),
+                config: tickvault_app::dhan_live_crossverify::DhanLiveCrossverifyConfig::default(),
+                questdb: config.questdb.clone(),
+                calendar: std::sync::Arc::clone(&trading_calendar),
+            },
+            &main_feed_instruments,
+        )
+    });
 
     // =======================================================================
     // Boot completion signals (deploy-hang fix 2026-07-13; unconditional +
@@ -3850,23 +3899,19 @@ async fn build_shared_infra(
     let _live_tables_ensured =
         tickvault_app::candle_ddl_boot::run_live_table_ddl_at_boot(&config.questdb).await;
 
-    // --- Dhan live-vs-REST cross-verification audit tables ---
+    // --- Dhan 1-minute cross-verification audit tables ---
     //
-    // The DDL call here was REMOVED 2026-09-16 with the comparator that
-    // wrote these tables (`no-rest-except-live-feed-2026-06-27.md` §12.10).
-    //
-    // The THREE tables — `dhan_rest_1m_tape` and its two audit siblings —
-    // are RETAINED with every row already in them, and they are in the
-    // operator console's SEBI keep-list, so the wipe command protects them.
-    // What is gone is the writer, and with it the only caller of their DDL.
-    //
-    // ⚠ The honest consequence, recorded rather than left to be discovered:
-    // on a FRESH volume these three tables are no longer created at boot, so
-    // a reader gets "table does not exist" instead of an empty result. They
-    // are not alone in that — §12.8(g) of the rule file records the same for
-    // the other retained REST tables, and re-homing a DDL caller into a
-    // surviving boot step is a decision that belongs to whoever decides how
-    // long the frozen history is kept queryable, not to this removal.
+    // RESTORED 2026-09-24 with the comparator (`no-rest-except-live-feed`
+    // §12.15). The three tables — `dhan_rest_1m_tape` and its two audit
+    // siblings — were retained with every row through the 2026-09-16 removal;
+    // their writer is back, so their DDL is back. Awaited inline so the
+    // tables exist before the first 15:41 run can write to them. The helper
+    // logs its own failures; boot continues, and the run's flush error then
+    // reports a missing table.
+    tickvault_storage::dhan_live_crossverify_persistence::ensure_dhan_live_crossverify_tables(
+        &config.questdb,
+    )
+    .await;
 
     // --- Seal-writer (installs the process-wide global_seal_sender) ---
     spawn_seal_writer_loop(&config.questdb);
