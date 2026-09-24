@@ -46,3 +46,20 @@ Revert the PR. No schema, config or alarm change.
 - `tv_dhan_xverify_retries_total{reason}` (local `/metrics`).
 - `warn!` per attempt with `source = xverify_retry` / `xverify_attempt_*`.
 - Existing `xverify_failed` / `xverify_vacuous` / `xverify_diverged` alarms, now paged once per day.
+
+## Per-Item Guarantee Matrix
+
+See per-wave-guarantee-matrix.md. All 15 rows of the guarantee matrix and all 7
+rows of the resilience matrix apply to every item in this plan. Where a row does
+not apply:
+
+- Performance: N/A. This is a cold path that runs once a day, not the hot path.
+  The retry decision is O(1). The comparison stays O(minutes × instruments) and
+  is flagged as such.
+- Zero tick loss / WS reconnect: N/A. This change touches no socket and no tick
+  path.
+- Alerting: no new alarm and no new metric name. Final failures page through the
+  existing `xverify_failed` and `xverify_vacuous` filters.
+
+Every other row is proven by the tests listed under Test Plan. That coverage holds
+inside the tested envelope, with ratcheted regression coverage.

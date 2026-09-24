@@ -508,11 +508,10 @@ fn report_final_failure(
     attempts: u32,
     targets: usize,
 ) {
-    let code = ErrorCode::WsGapConnectionState.code_str();
     let reason = failure.as_str();
     match failure {
         AttemptFailure::Vacuous => error!(
-            code,
+            code = ErrorCode::WsGapConnectionState.code_str(),
             source = "xverify_vacuous",
             %today,
             attempts,
@@ -526,7 +525,7 @@ fn report_final_failure(
         | AttemptFailure::RunFailed
         | AttemptFailure::NotPersisted
         | AttemptFailure::Incomplete => error!(
-            code,
+            code = ErrorCode::WsGapConnectionState.code_str(),
             source = "xverify_failed",
             %today,
             attempts,
