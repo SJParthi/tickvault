@@ -2090,3 +2090,31 @@ Quote 2 rejects the alternative this session offered (gating S3 on the internal
 - Gates the disk-pressure archive leg.
 - Holds a partition past `MAX_CROSSVERIFY_HOLD_DAYS` without a loud coded error.
 - Writes the vendor tape into `ticks` or `candles_*`.
+
+### §12.15.5 — 2026-09-24: a failed check RETRIES THE SAME DAY instead of waiting until tomorrow
+
+**The verbatim operator demand (2026-09-24, typed directly in-session — preserve EXACTLY, typos included):**
+
+> "fix the same-day retry gap and merge deploy it dude.Always achieve O(1) everywhere."
+
+Recorded before the code, per the rule-file-first law. It changes WHEN the §12.15 check runs, not WHAT it compares.
+
+**The gap.** When the 15:41 IST run failed (no token, a run error, zero minutes compared, rows not persisted, or an incomplete run), the loop slept until the next day. The day never got its marker, so §12.15.2 held that day's S3 archive for the full `MAX_CROSSVERIFY_HOLD_DAYS` and then archived it unverified.
+
+| Aspect | Locked value |
+|---|---|
+| Attempts per trading day | at most `XVERIFY_MAX_ATTEMPTS_PER_DAY` = **4**, the first included |
+| Gap between attempts | `XVERIFY_RETRY_INTERVAL_SECS` = **900 s** |
+| Longest attempt | token wait (300 s) + `run_budget_secs` (600 s default) + 60 s persist margin = **960 s** |
+| Last start | an attempt is started only if it can finish by the **17:30 IST** evening stop |
+| Worst case with the default budget | all 4 attempts fit before 17:30 exactly (pinned by test) |
+| Page | ONCE per day, after the last attempt: `xverify_vacuous` or `xverify_failed`. Each attempt only logs a `warn!` with a source no filter matches |
+| Divergence page | fires on the first attempt that measures it; a retry never pages it again |
+| Marker rule | unchanged — `should_write_marker && run_is_complete`, now expressed by `classify_attempt` and proven equal across every outcome |
+| Counter | `tv_dhan_xverify_retries_total{reason}` — local `/metrics` only, no EMF name, no alarm |
+
+**What does NOT change:** the alarms and their filters, the S3 hold and its ceiling, the disk-pressure leg, the live lane (it never waits for this check), and every §12.15.4 REJECT row.
+
+**⚠ Honest limit.** A boot catch-up that starts after about 17:14 IST gets no retry, because its next attempt could not finish before 17:30. That day falls back to the §12.15.2 hold ceiling, as before.
+
+**What a PR that violates §12.15.5 looks like (REJECT):** pages `xverify_failed` or `xverify_vacuous` on every attempt; starts an attempt that could still be running at 17:30; raises the attempt count or shortens the interval without re-checking the evening-stop fit; writes the marker on any condition other than `classify_attempt` returning `Ok`.
