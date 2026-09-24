@@ -1,6 +1,6 @@
 # Implementation Plan: 1-minute cross-verification restored + S3 archive waits for it
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-09-24
 **Approved by:** Parthiban (operator) — "Bro use the 1 min cross verification alone as whatever I have discussed it to you as the requirement provide it dude okay? ... then go ahead with this S3 also dude okay? Fix and resoleve everything dude and then merge and deploy it dude okay?"
 **Authority:** `.claude/rules/project/no-rest-except-live-feed-2026-06-27.md` §12.15; `.claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md` §2.5
@@ -108,4 +108,4 @@ plan. Item-specific evidence:
 - [x] storage `VerifiedDayGate` + hold decision + daily archive wiring
 - [x] Terraform alarms + Telegram phrases + guard floors
 - [x] tests / clippy / fmt green
-- [ ] PR All Green; merge; deploy after 15:45 IST
+- [x] PR All Green; merge; deploy after 15:45 IST — merged d52008c, deployed 2026-09-24 (build d52008c); boot catch-up token-wait fix follows in its own PR
