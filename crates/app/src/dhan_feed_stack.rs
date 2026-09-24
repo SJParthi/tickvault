@@ -10471,6 +10471,13 @@ async fn attach_depth_when_available(
         std::collections::HashSet::new();
     let mut depth_ready = false;
     let mut depth_done = false;
+    // Depth-20 is a STATIC day set (scope lock 2026-09-24): the F&O spots dial
+    // first, and the NIFTY/BANKNIFTY at-the-money legs join once the 09:12
+    // pre-open price is final. `depth_20_index_added` is true once every leg
+    // the budget allows is on the wire — `depth_done` waits for it, so the
+    // attach keeps retrying the top-up instead of declaring success early.
+    let mut depth_20_index_added = false;
+    let mut depth20_spots_unreadable_logged = false;
     // The contract overflow may be handed to the live spot connection exactly
     // once. `SubscribeGuard::try_extend` refuses only PAST the per-connection
     // cap — below it a second send silently DOUBLE-SUBSCRIBES the same
@@ -10652,6 +10659,12 @@ async fn attach_depth_when_available(
         // because `plan_pool` assigns instruments to connections in order and
         // one task cannot hold the pool twice.
         let mut selection = selection;
+        // Per attempt: the index legs chosen this time round, and how many the
+        // budget allows in full. Declared out here because the dial half reads
+        // them to top the already-open depth-20 sockets up.
+        let mut depth20_index_legs: Vec<SubscribeInstrument> = Vec::new();
+        let mut depth20_index_full_cost = 0usize;
+        let mut depth20_index_due = false;
         if !depth_done {
             // ONE load for both halves. Two loads a few seconds apart can
             // disagree, and a disagreement here fills the movers sockets from
@@ -10666,36 +10679,62 @@ async fn attach_depth_when_available(
             )
             .await;
 
-            // ---- depth-20: the operator's layout, when it can be built ----
+            // ---- depth-20: a STATIC day set (scope lock 2026-09-24) ----
             //
-            // The adaptive selection stays as the FALLBACK, and that ordering
-            // is deliberate. Before the chain publishes, the layout has no
-            // strikes to centre on and returns nothing; overwriting a working
-            // selection with an empty one would trade "the wrong 250" for
-            // "no depth at all", which is strictly worse. So the layout is
-            // taken only when it actually produced instruments.
-            let layout =
-                crate::depth20_layout::build_depth20_layout(&inputs.candidates, &inputs.movers);
-            if layout.instrument_count() > 0 {
-                let flattened = layout.flattened();
-                info!(
-                    instruments = flattened.len(),
-                    sockets = layout.sockets.len(),
-                    index_unresolved = layout.index_underlyings_unresolved.len(),
-                    movers_unresolved = layout.movers_unresolved,
-                    gainers = layout.ranking.gainers.len(),
-                    losers = layout.ranking.losers.len(),
-                    "depth-20: using the operator layout — index windows plus today's movers"
-                );
-                selection.depth_20 = flattened;
-            } else {
-                // Normal before ~09:16, when no chain has published yet.
-                tracing::debug!(
-                    adaptive_instruments = selection.depth_20.len(),
-                    "depth-20: the operator layout has nothing to build from yet — keeping \
-                     the adaptive selection for this attempt"
-                );
-            }
+            // Every F&O underlying's NSE_EQ spot from the 09:00 attach, then
+            // NIFTY and BANKNIFTY at-the-money ±k once the pre-open price is
+            // final (09:12). k is the widest window, capped at 4, that still
+            // fits the 250-instrument budget beside the spots. The set is
+            // never steered: nothing is swapped or unsubscribed all day.
+            //
+            // Before 09:12 the index legs are left out, never guessed. They
+            // are added to the already-open sockets by the Extend top-up in
+            // the dial half, so the spots are not held back waiting for them.
+            let spots = match crate::depth20_static::read_fno_spot_instruments(&today_date) {
+                Ok(spots) => spots,
+                Err(err) => {
+                    if !depth20_spots_unreadable_logged {
+                        depth20_spots_unreadable_logged = true;
+                        warn!(
+                            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                            source = "depth20_spots_unreadable",
+                            %err,
+                            "depth-20: today's F&O underlying list is unreadable — the static \
+                             set carries index legs only until it appears (retried every \
+                             attempt; logged once)"
+                        );
+                    }
+                    Vec::new()
+                }
+            };
+            let index_due = ist_second_of_day_now() >= PREOPEN_READY_DEADLINE_IST_SECS;
+            depth20_index_due = index_due;
+            let each_side = crate::depth20_static::index_strikes_each_side(
+                spots.len(),
+                crate::depth20_static::DEPTH20_STATIC_BUDGET,
+                crate::depth20_static::DEPTH20_INDEX_MAX_EACH_SIDE,
+            );
+            depth20_index_legs = match (index_due, each_side) {
+                (true, Some(k)) => {
+                    depth20_index_full_cost = crate::depth20_static::index_legs_cost(k);
+                    crate::depth20_static::index_legs(&inputs.candidates, k)
+                }
+                _ => Vec::new(),
+            };
+            selection.depth_20 = crate::depth20_static::build_static_depth20(
+                &spots,
+                &depth20_index_legs,
+                crate::depth20_static::DEPTH20_STATIC_BUDGET,
+            );
+            info!(
+                spots = spots.len(),
+                index_legs = depth20_index_legs.len(),
+                index_legs_wanted = depth20_index_full_cost,
+                index_strikes_each_side = ?each_side,
+                index_due,
+                depth_20 = selection.depth_20.len(),
+                "depth-20: static day set — F&O spots plus the index windows"
+            );
 
             // ---- depth-200: STOCK options only, from the first dial ----
             //
@@ -10753,8 +10792,13 @@ async fn attach_depth_when_available(
             // dial so `plan_pool` sees the seeded set. Re-applied on every
             // attempt until depth dials, because `selection` is rebuilt each
             // time; the file is the same, so the answer is the same.
-            if let Some(seed) = crate::depth_seed::read_depth_seed(&crate::depth_seed::seed_path())
+            if let Some(mut seed) =
+                crate::depth_seed::read_depth_seed(&crate::depth_seed::seed_path())
             {
+                // Depth-20 is a static day set chosen fresh each morning
+                // (scope lock 2026-09-24); yesterday's depth-20 holdings must
+                // never replace it. Only the depth-200 half of the seed applies.
+                seed.depth_20.clear();
                 match crate::dhan_contract_universe::read_contract_artifact(&today_date) {
                     Ok(rows) => {
                         let applied = crate::depth_seed::apply_depth_seed(
@@ -11129,6 +11173,37 @@ async fn attach_depth_when_available(
                 let depth_200_plan =
                     depth_200_delta(&selection.depth_200, &depth_200_on_wire, &pool);
 
+                // The 09:12 index legs join the depth-20 sockets that already
+                // carry the spots (scope lock 2026-09-24). An ADD on the same
+                // sockets, never a swap: nothing is unsubscribed all day.
+                let mut depth20_index_outstanding = 0usize;
+                if depth_20_dialed && !depth_20_index_added && !depth20_index_legs.is_empty() {
+                    let topup = extend_depth20_index_legs(
+                        &depth20_index_legs,
+                        &mut depth_commands,
+                        attempts,
+                    )
+                    .await;
+                    depth20_index_outstanding = topup.outstanding;
+                    if !topup.newly_held.is_empty() {
+                        let added = topup.newly_held.len();
+                        if let Err(err) = seed_tx.try_send(topup.newly_held) {
+                            warn!(
+                                %err,
+                                added,
+                                "depth-20 index legs added but could not be seeded into the \
+                                 silence detector"
+                            );
+                        }
+                        info!(
+                            added,
+                            outstanding = topup.outstanding,
+                            attempts,
+                            "depth-20: the 09:12 index legs joined the open sockets"
+                        );
+                    }
+                }
+
                 if depth_20_plan.is_empty() && depth_200_plan.is_empty() {
                     // Normal before the open: depth-20 and the four ATM
                     // depth-200 sockets are already up and the day's biggest
@@ -11182,9 +11257,8 @@ async fn attach_depth_when_available(
                                 depth_200_on_wire.insert(contract_identity(instrument));
                             }
                             depth_ready = true;
-                            depth_done = depth_20_dialed
-                                && depth_200_on_wire.len()
-                                    >= crate::dhan_depth_universe::DEPTH_200_TOTAL_SOCKETS;
+                            // `depth_done` is derived once, below both arms,
+                            // after the index legs are settled.
                             // Same as the contract half: depth legs are real
                             // subscriptions and a silently-dead one has no other
                             // evidence. Seeds only what THIS plan carried — the
@@ -11207,7 +11281,6 @@ async fn attach_depth_when_available(
                                 depth_200_on_wire = depth_200_on_wire.len(),
                                 depth_200_authorized =
                                     crate::dhan_depth_universe::DEPTH_200_TOTAL_SOCKETS,
-                                depth_done,
                                 contracts_done,
                                 "late-attach dialed DEPTH sockets"
                             );
@@ -11224,6 +11297,49 @@ async fn attach_depth_when_available(
                         ),
                     }
                 }
+
+                // The 09:12 index legs are SETTLED once the window is due, every
+                // offered leg is confirmed held, and either the full ATM±k window
+                // was offered or 09:20 has passed (a short ladder is accepted then,
+                // loudly). Until then `depth_done` stays false so the attach loop
+                // keeps offering the top-up — the static day set is not complete
+                // without them.
+                if depth_20_dialed
+                    && !depth_20_index_added
+                    && crate::depth20_static::index_legs_settled(
+                        depth20_index_due,
+                        depth20_index_legs.len(),
+                        depth20_index_full_cost,
+                        depth20_index_outstanding,
+                        now_ist >= crate::depth20_static::DEPTH20_INDEX_SETTLE_DEADLINE_IST_SECS,
+                    )
+                {
+                    depth_20_index_added = true;
+                    if depth20_index_legs.len() < depth20_index_full_cost {
+                        warn!(
+                            legs = depth20_index_legs.len(),
+                            full_cost = depth20_index_full_cost,
+                            attempts,
+                            "depth-20: settling the index legs with a SHORT at-the-money window \
+                             — the full window never became available by 09:20. The day set \
+                             stays static with what was offered."
+                        );
+                    } else {
+                        info!(
+                            legs = depth20_index_legs.len(),
+                            attempts,
+                            "depth-20: the static day set is complete (spots + index legs)"
+                        );
+                    }
+                }
+
+                // Derived once, below both arms: depth is DONE only when the
+                // static depth-20 set (spots AND index legs) is on the wire and
+                // every authorized depth-200 socket is dialed.
+                depth_done = depth_20_dialed
+                    && depth_20_index_added
+                    && depth_200_on_wire.len()
+                        >= crate::dhan_depth_universe::DEPTH_200_TOTAL_SOCKETS;
             }
 
             // The readiness verdict rides `depth_ready`, NOT `depth_done`.
@@ -11357,6 +11473,7 @@ async fn attach_depth_when_available(
                 depth_200_on_wire = on_wire,
                 depth_200_authorized = authorized,
                 depth_20_dialed,
+                depth_20_index_added,
                 ist_second_of_day = now_ist,
                 "depth attach is giving up on the outstanding depth-200 socket(s): {} of {} \
                  authorized 200-level sockets reached the wire and the rest carry NO data for \
@@ -11570,6 +11687,142 @@ pub fn preopen_retry_secs(now_ist_secs: u32) -> u64 {
 /// The elements, in order: which endpoint the connection serves, the
 /// pool-wide slot it occupies, the channel a swap travels down, and the
 /// instruments it was dialed holding.
+/// How long the attach loop waits for one depth-20 connection to answer an
+/// index-leg `Extend`. The connection task gives up on its own wire writes at
+/// `TOPUP_WIRE_BUDGET`, so two seconds past that is enough for the answer to
+/// arrive; a missing answer is treated as "not held" and re-offered.
+const DEPTH20_INDEX_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
+    tickvault_core::websocket::pool_supervisor::TOPUP_WIRE_BUDGET.as_secs() + 2,
+);
+
+/// What one index-leg top-up did.
+#[derive(Debug, Default)]
+struct Depth20IndexTopUp {
+    /// Legs a depth-20 connection confirmed it now holds.
+    newly_held: Vec<SubscribeInstrument>,
+    /// Legs still not held after this attempt (no room, refused, unanswered).
+    outstanding: usize,
+}
+
+/// Adds the 09:12 NIFTY and BANKNIFTY legs to the depth-20 sockets already on
+/// the wire (scope lock 2026-09-24).
+///
+/// The spots dial at 09:00 and the index strikes are only final at 09:12, so
+/// the legs arrive later on the SAME five sockets. It is an add, never a swap:
+/// nothing is unsubscribed, so no ghost stream can follow it.
+///
+/// Only legs no depth-20 connection holds yet are offered, and no connection is
+/// filled past its 50-slot cap (Dhan answers an over-limit subscribe with 804).
+/// Each connection's held list is extended with exactly what it confirmed, so
+/// the next attempt re-offers only what is still missing. Re-offering is safe:
+/// the connection's guard ignores an instrument it already holds.
+///
+/// Honest limit: an unanswered `Extend` may still have reached the wire. The
+/// leg is then re-offered next attempt, normally to the same connection
+/// because rooms have not changed, where the guard dedups it.
+///
+/// Cold path: at most a handful of calls per session, O(held + legs).
+async fn extend_depth20_index_legs(
+    legs: &[SubscribeInstrument],
+    depth_commands: &mut DialedDepthCommands,
+    attempts: u32,
+) -> Depth20IndexTopUp {
+    let held: std::collections::HashSet<(u64, ExchangeSegment)> = depth_commands
+        .iter()
+        .filter(|(endpoint, ..)| *endpoint == DhanEndpointType::Depth20)
+        .flat_map(|(.., holding)| holding.iter().map(|i| (i.security_id, i.segment)))
+        .collect();
+    let missing = crate::depth20_static::not_yet_held(legs, &held);
+    if missing.is_empty() {
+        return Depth20IndexTopUp::default();
+    }
+    let depth20_slots: Vec<usize> = depth_commands
+        .iter()
+        .enumerate()
+        .filter(|(_, (endpoint, ..))| *endpoint == DhanEndpointType::Depth20)
+        .map(|(index, _)| index)
+        .collect();
+    let rooms: Vec<usize> = depth20_slots
+        .iter()
+        .map(|&index| {
+            crate::depth20_layout::DEPTH_20_PER_SOCKET.saturating_sub(depth_commands[index].3.len())
+        })
+        .collect();
+    let (chunks, unplaced) = crate::depth20_static::assign_by_room(&rooms, &missing);
+    let mut outcome = Depth20IndexTopUp {
+        newly_held: Vec::with_capacity(missing.len()),
+        outstanding: unplaced,
+    };
+    for (room_index, chunk) in chunks {
+        let command_index = depth20_slots[room_index];
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let offered = chunk.len();
+        if let Err(err) =
+            depth_commands[command_index]
+                .2
+                .try_send(LiveSubscriptionCommand::Extend {
+                    more: chunk.clone(),
+                    ack: Some(ack_tx),
+                })
+        {
+            outcome.outstanding += offered;
+            warn!(
+                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                source = "depth20_index_extend_send",
+                attempts,
+                offered,
+                %err,
+                "a depth-20 connection would not accept the 09:12 index legs — they are \
+                 offered again next attempt"
+            );
+            continue;
+        }
+        let confirmed: Vec<SubscribeInstrument> =
+            match tokio::time::timeout(DEPTH20_INDEX_ACK_TIMEOUT, ack_rx).await {
+                Ok(Ok(ExtendOutcome::Held)) => chunk,
+                Ok(Ok(ExtendOutcome::Truncated { not_held })) => {
+                    let dropped: std::collections::HashSet<(u64, ExchangeSegment)> = not_held
+                        .iter()
+                        .map(|i| (i.security_id, i.segment))
+                        .collect();
+                    chunk
+                        .into_iter()
+                        .filter(|i| !dropped.contains(&(i.security_id, i.segment)))
+                        .collect()
+                }
+                Ok(Ok(ExtendOutcome::Refused)) | Ok(Err(_)) | Err(_) => Vec::new(),
+            };
+        let missed = offered - confirmed.len();
+        if missed > 0 {
+            outcome.outstanding += missed;
+            warn!(
+                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                source = "depth20_index_extend_partial",
+                attempts,
+                offered,
+                confirmed = confirmed.len(),
+                "a depth-20 connection did not confirm every 09:12 index leg — the rest are \
+                 offered again next attempt"
+            );
+        }
+        depth_commands[command_index]
+            .3
+            .extend(confirmed.iter().copied());
+        outcome.newly_held.extend(confirmed);
+    }
+    if unplaced > 0 {
+        error!(
+            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+            source = "depth20_index_no_room",
+            attempts,
+            unplaced,
+            "the 09:12 index legs did not fit on the depth-20 sockets — the static set was \
+             sized to fit, so this means a socket holds more than it was dialed with"
+        );
+    }
+    outcome
+}
+
 type DialedDepthCommand = (
     DhanEndpointType,
     u8,
@@ -24278,27 +24531,39 @@ mod depth20_layout_wiring_tests {
     }
 
     #[test]
-    fn the_attach_dials_the_operator_layout_not_the_adaptive_window() {
-        // The adaptive window fills all 250 slots with two indices at strikes
-        // fifty steps out and carries no stock at all. It is a valid selection
-        // and completely the wrong one.
+    fn the_attach_dials_the_static_day_set_not_a_steered_layout() {
+        // Scope lock 2026-09-24: depth-20 is every F&O spot from 09:00 plus
+        // NIFTY/BANKNIFTY at-the-money ±k from 09:12, fixed until the close.
+        // The mover layout (which swaps names every minute) must never come
+        // back as the depth-20 dial source.
+        let p = production();
         assert!(
-            production().contains("crate::depth20_layout::build_depth20_layout("),
-            "the attach must build the operator layout for depth-20"
+            p.contains("crate::depth20_static::build_static_depth20("),
+            "the attach must build the static depth-20 day set"
+        );
+        assert!(
+            !p.contains("crate::depth20_layout::build_depth20_layout("),
+            "the steered mover layout must not be the depth-20 dial source"
         );
     }
 
     #[test]
-    fn an_empty_layout_never_wipes_a_working_selection() {
-        // Before the chain publishes the layout has no strikes to centre on
-        // and returns nothing. Overwriting a working adaptive selection with
-        // an empty one trades "the wrong 250" for "no depth at all", which is
-        // strictly worse — and it would look like the layout succeeding.
+    fn depth_is_not_done_until_the_index_legs_are_settled() {
+        // The spots dial at 09:00; the index legs only exist from 09:12. If
+        // `depth_done` ignored them, the attach loop would stop before 09:12
+        // and the static set would be missing both indices all day.
         let p = production();
-        let guarded = p.contains("if layout.instrument_count() > 0 {");
         assert!(
-            guarded,
-            "the layout must be taken only when it produced instruments"
+            p.contains("crate::depth20_static::index_legs_settled("),
+            "the index legs must be settled before depth-20 counts as complete"
+        );
+        assert!(
+            p.contains("&& depth_20_index_added"),
+            "depth_done must wait for the index legs"
+        );
+        assert!(
+            p.contains("extend_depth20_index_legs("),
+            "the index legs must be added to the open sockets, never by a swap"
         );
     }
 

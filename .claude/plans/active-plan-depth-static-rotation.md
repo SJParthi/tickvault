@@ -77,8 +77,9 @@ nothing else is deleted. No schema change, no config change, no data migration.
 
 ## Plan Items
 
-- [ ] Rule-file section 2026-09-24
-- [ ] core: RankedRotation + RotationRequested + RotateByRedial + ROTATION_HALTED + tests
-- [ ] app: depth-200 send_swap → RotateByRedial, 3s→1m board
-- [ ] app: depth-20 static set + index legs + remove per-minute depth-20 steering
-- [ ] tests / clippy / fmt green; PR All Green; merge; deploy after 15:45 IST
+- [x] Rule-file section 2026-09-24
+- [x] core: RankedRotation + RotationRequested + RotateByRedial + ROTATION_HALTED + tests
+- [x] app: depth-200 send_swap → RotateByRedial, 3s→1m board
+- [x] app: depth-20 static set + index legs + remove per-minute depth-20 steering
+- [x] tests / clippy / fmt green (app: 112 suites, 2,728 passed, 0 failed; clippy lib+bins clean; fmt clean)
+- [ ] PR All Green; merge; deploy after 15:45 IST

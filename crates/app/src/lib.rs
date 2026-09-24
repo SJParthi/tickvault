@@ -93,6 +93,7 @@ pub mod depth200_ranked_steer;
 pub mod depth20_layout;
 pub mod depth20_name_board;
 pub mod depth20_ranked_steer;
+pub mod depth20_static;
 pub mod depth20_track;
 pub mod depth_first_packet;
 pub mod depth_rebalance;
