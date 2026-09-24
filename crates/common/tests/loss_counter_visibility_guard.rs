@@ -150,11 +150,10 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
         "tv_dhan_feed_seals_dropped",
         "gauge twin — VERIFIED 2026-08-12: this is the session GAUGE (SEALS_DROPPED_GAUGE, set once per drain in run_frame_drain). Its COUNTER twin tv_dhan_feed_seals_dropped_total IS in the EMF selector, so the loss itself is shipped and alarmable; the gauge is the same number in instantaneous form and shipping both would double-bill one signal.",
     ),
-    // REMOVED 2026-09-16: `tv_dhan_live_xverify_audit_rows_discarded_total` —
-    // same shape as the chain row above. Its writer was
-    // `dhan_live_crossverify_persistence.rs`, deleted with the 15:41
-    // cross-verification (§12.10.3: NOTHING replaces the verification floor —
-    // the honest loss is recorded there, not exempted here).
+    (
+        "tv_dhan_live_xverify_audit_rows_discarded_total",
+        "poisoned-buffer discard — the counter lives in discard_pending(); every caller is a flush arm that surfaces the returned count one function away, via error!, bail!, or a propagated Err with the count in its .context(). Removed 2026-09-16 with the 15:41 cross-verification and restored 2026-09-24 with it (no-rest-except-live-feed-2026-06-27.md §12.15).",
+    ),
     // REMOVED 2026-08-14: `tv_dhan_ws_dial_failed_total` is now in the EMF
     // selector. This is the counter that would have made the 2026-08-12
     // blackout visible — 12 consecutive HTTP 400 dial failures that reached

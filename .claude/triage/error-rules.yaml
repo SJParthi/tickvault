@@ -1810,14 +1810,24 @@ rules:
       auto-executed. Recovery confirmed by the falling-edge log +
       tv_questdb_wal_suspended_tables returning to 0.
 
-  # DHAN-LIVE-XVERIFY-01 triage rule REMOVED 2026-09-16 with the 15:41
-  # live-vs-REST cross-verification itself (operator: "Bro just remove per
-  # minute price falls and 3.41 pm accuracy check alone dude okay" —
-  # `no-rest-except-live-feed-2026-06-27.md` §12.10). The rule was right and
-  # is kept here as history BECAUSE it was right: it called this comparison
-  # "the ONLY ground truth the revived Dhan feed has", and §12.10.4 records
-  # that nothing replaces it. A triage rule for a code with no emit site is
-  # a classifier arm that can never fire, so it goes with the code.
+  # DHAN-LIVE-XVERIFY-01: removed 2026-09-16 with the 15:41 check
+  # (§12.10), RESTORED 2026-09-24 with it (§12.15 of
+  # `no-rest-except-live-feed-2026-06-27.md`). The rule is the one that
+  # stood before the removal, unchanged.
+  - name: dhan-live-xverify-01-run-degraded-escalate
+    match:
+      code: DHAN-LIVE-XVERIFY-01
+    action: escalate
+    runbook_path: docs/error-runbooks/dhan-live-crossverify-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      DHAN-LIVE-XVERIFY-01 = the daily live-vs-REST comparison degraded or
+      went blind. Read-only cold path — capture and trading are unaffected —
+      but a blind run means we cannot vouch for the day's candles against the
+      vendor's own tape, and that day's S3 archive is held until it runs.
+      Escalate so the operator re-runs it after fixing the underlying
+      condition; never auto-action a data-comparability signal.
 
   # -----------------------------------------------------------------------
   # Per-minute spot 1m REST pipeline (operator grant 2026-07-12, PR-2)
