@@ -106,6 +106,11 @@ pub mod ilp_overflow;
 // Groww — both DELETED in SP5). Both feeds write here. See live-feed-purity.md
 // rule 11 + docs/design/sp5-unified-parity-audit-design.md. The two old physical
 // QuestDB tables are RETAINED on disk (SEBI 5y) but no longer written.
+/// Daily post-market Dhan LIVE-vs-REST 1-minute cross-verification audit.
+/// Deleted 2026-09-16, RESTORED 2026-09-24 (`no-rest-except-live-feed-2026-06-27.md`
+/// §12.15): the only external check on the captured candles, and the gate the
+/// daily S3 archive waits on.
+pub mod dhan_live_crossverify_persistence;
 /// Dual-feed scoreboard (operator 2026-07-10): one classified row per feed
 /// EPISODE (disconnect / stall / process death) with the blame verdict
 /// persisted — the month-end "who caused it" system-of-record.

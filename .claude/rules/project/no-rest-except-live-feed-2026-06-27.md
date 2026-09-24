@@ -2027,3 +2027,66 @@ of flipping it; makes one of the three unreachable arms reachable without
 correcting its Groww clause; re-adds a test assertion requiring an
 operator-facing message to state something false; or silences the depth-20
 proptest by deleting its seed, loosening its assertion, or marking it `#[ignore]`.
+
+---
+
+## §12.15 — 2026-09-24: the 1-MINUTE ACCURACY CHECK IS RESTORED, and S3 archival waits for it
+
+> **Authority:** this section PARTIALLY REVERSES §12.10 for the VERIFICATION class
+> only. The per-minute price pulls stay removed. The socket boot floor stays
+> removed (§12.10.3 stands). Recorded BEFORE any code, per the rule-file-first law.
+
+### §12.15.0 The verbatim operator demands (preserve EXACTLY, typos included)
+
+**Quote 1 (2026-09-24):**
+> "See one and only when our cross verification of one min us fully finished alone right then our s3 archival should happened entilrey right dude"
+
+**Quote 2 (2026-09-24, the authorization):**
+> "Bro use the 1 min cross verification alone as whatever I have discussed it to you as the requirement provide it dude okay? Note only one min cross verification dude don't need to rebuild internal timeframes for this cross verification dude then go ahead with this S3 also dude okay? Fix and resoleve everything dude and then merge and deploy it dude okay? Always achieve O(1) everywhere."
+
+Quote 2 rejects the alternative this session offered (gating S3 on the internal
+`tf_consistency` rebuild). The gate is the EXTERNAL comparison: our `candles_1m`
+(`feed='dhan'`) against Dhan's own 1-minute `charts/intraday` tape.
+
+### §12.15.1 What comes back, and what does not
+
+| Surface | Disposition |
+|---|---|
+| `POST /v2/charts/intraday`, interval `"1"`, ONCE per trading day after 15:41 IST, for the main-feed spot/index targets | **RESTORED — verification only.** Never written to `ticks` / `candles_*`. The raw vendor answer goes to `dhan_rest_1m_tape` only |
+| `dhan_live_crossverify_cell_audit`, `dhan_live_crossverify_daily`, `dhan_rest_1m_tape` writers | **RESTORED** (the tables were retained; only the writers were deleted) |
+| The comparator (`dhan_live_crossverify.rs`) | **RESTORED** from `53ea4b6b6^`, adapted: a local sequential pacer replaces the deleted shared Data-API limiter |
+| The three `ws-gap-03-xverify-{vacuous,failed,diverged}` log-filter alarms | **RESTORED** (dated row in `dhan-rest-only-noise-lock-2026-07-14.md` §2.5) |
+| Per-minute spot-1m pull, per-minute option-chain pull, expirylist | **STAY REMOVED** |
+| The boot floor that refused to open sockets without the verifier | **STAYS REMOVED.** The verifier is its own task; the live lane never waits for it |
+| An internal timeframe rebuild as the gate | **NOT used** (Quote 2) |
+
+### §12.15.2 The S3 gate (LOCKED)
+
+| Aspect | Locked value |
+|---|---|
+| What is held | the DAILY post-market archive leg's partitions of trading day D |
+| Held until | a `dhan_live_crossverify` day marker exists for D. A marker is written only on a MEASURED verdict (clean or diverged). A vacuous or failed run writes no marker |
+| Non-trading day | treated as verified — there is nothing to compare |
+| Hold ceiling | `MAX_CROSSVERIFY_HOLD_DAYS`. Past it the partition archives anyway, with a loud coded error — the disk must never fill waiting on a check that cannot finish |
+| Disk-pressure leg | **NOT gated.** Losing the box to a full disk costs more than archiving an unverified day. It logs that it archived unverified data |
+| Held partitions | counted (`held_unverified`), never counted as failures, and never block the daily verdict |
+
+### §12.15.3 Honest envelope
+
+> "The check compares every in-scope minute of the spot/index targets at
+> integer-paise precision, once per trading day, and holds that day's S3
+> archive until it has run. **NOT claimed:** coverage of F&O contracts — their
+> Dhan `instrument` string is not derivable from the segment, so they are
+> counted as unverifiable and skipped, as before. **NOT claimed:** that the
+> vendor tape is ground truth — it is an independent record, and a divergence
+> means the two disagree, not which one is wrong. **NOT claimed:** that the
+> hold never expires — past the ceiling the day archives unverified, loudly."
+
+### §12.15.4 What a PR that violates §12.15 looks like (REJECT)
+
+- Re-adds any per-minute REST pull under cover of this section.
+- Makes the live lane wait for, or refuse to start without, the verifier.
+- Writes a marker on a vacuous or failed run.
+- Gates the disk-pressure archive leg.
+- Holds a partition past `MAX_CROSSVERIFY_HOLD_DAYS` without a loud coded error.
+- Writes the vendor tape into `ticks` or `candles_*`.

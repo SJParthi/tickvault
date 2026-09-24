@@ -1286,6 +1286,13 @@ pub struct ArchiveRunSummary {
     /// budget, paged that the archive had not completed on a box where it was
     /// completing, and then abandoned the daily sweep for that day.
     pub contended: bool,
+    /// Partitions HELD this run because their trading day has not been
+    /// cross-verified yet (daily leg only; §12.15.2 of the REST lock).
+    ///
+    /// Not a failure and deliberately not read by the daily scheduler's
+    /// latch: a held partition is retried by the next day's pass, and the
+    /// hold itself is bounded by [`MAX_CROSSVERIFY_HOLD_DAYS`].
+    pub held_unverified: u32,
 }
 
 /// Outcome of streaming one partition's `/exp` CSV through gzip to disk.
@@ -1320,6 +1327,67 @@ pub struct PartitionArchiver {
     temp_dir: PathBuf,
     cfg: PartitionRetentionConfig,
     audit: PartitionArchiveAuditWriter,
+    /// Answers "has trading day D been cross-verified?" — `None` means the
+    /// pass is ungated (the disk-pressure leg). Set ONLY by the daily leg,
+    /// per `no-rest-except-live-feed-2026-06-27.md` §12.15.2.
+    verified_day_gate: Option<VerifiedDayGate>,
+}
+
+/// Predicate the daily archive leg injects: `true` when day D is verified
+/// (a measured cross-verification ran, or D was not a trading day).
+///
+/// A closure rather than a direct marker read because the marker helpers
+/// live in the app crate, which this crate cannot depend on. Cold path — at
+/// most one call per eligible partition per pass.
+pub type VerifiedDayGate = std::sync::Arc<dyn Fn(chrono::NaiveDate) -> bool + Send + Sync>;
+
+/// How many CALENDAR days a partition may be held waiting for its day's
+/// cross-verification before it is archived anyway, loudly.
+///
+/// The hold must never become the reason the disk fills: a verifier that is
+/// broken for a week would otherwise pin a week of partitions on EBS. Three
+/// days covers a Friday verify failure over a weekend plus the Monday retry.
+pub const MAX_CROSSVERIFY_HOLD_DAYS: i64 = 3;
+
+/// What the daily gate decides for one partition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrossverifyHold {
+    /// Day is verified (or there is no gate) — archive normally.
+    Proceed,
+    /// Day is not verified yet and is inside the hold window — keep it.
+    Hold,
+    /// Day is not verified and the hold window has run out — archive it
+    /// anyway and say so loudly.
+    OverrideAfterCeiling,
+    /// The partition name has no parseable date — archive normally; the
+    /// gate never blocks on something it cannot read.
+    Unparseable,
+}
+
+/// Pure decision for one partition. O(1), no allocation.
+///
+/// `partition` is a QuestDB partition name (`YYYY-MM-DD` or
+/// `YYYY-MM-DDTHH`); only the first ten characters are read.
+pub fn crossverify_hold_decision(
+    partition: &str,
+    today_ist: chrono::NaiveDate,
+    is_verified: impl Fn(chrono::NaiveDate) -> bool,
+) -> CrossverifyHold {
+    let Some(day_part) = partition.get(..10) else {
+        return CrossverifyHold::Unparseable;
+    };
+    let Ok(day) = chrono::NaiveDate::parse_from_str(day_part, "%Y-%m-%d") else {
+        return CrossverifyHold::Unparseable;
+    };
+    if is_verified(day) {
+        return CrossverifyHold::Proceed;
+    }
+    let age_days = today_ist.signed_duration_since(day).num_days();
+    if age_days > MAX_CROSSVERIFY_HOLD_DAYS {
+        CrossverifyHold::OverrideAfterCeiling
+    } else {
+        CrossverifyHold::Hold
+    }
 }
 
 /// Which partition-list window a table gets this run.
@@ -1442,6 +1510,7 @@ impl PartitionArchiver {
             temp_dir: PathBuf::from(ARCHIVE_TEMP_DIR),
             cfg: cfg.clone(),
             audit: PartitionArchiveAuditWriter::new(questdb),
+            verified_day_gate: None,
         }))
     }
 
@@ -1479,7 +1548,81 @@ impl PartitionArchiver {
             temp_dir,
             cfg,
             audit,
+            verified_day_gate: None,
         })
+    }
+
+    /// Holds each partition whose trading day has not been cross-verified.
+    ///
+    /// The daily post-market leg calls this; the disk-pressure leg does NOT,
+    /// because losing the box to a full disk costs more than archiving an
+    /// unverified day (`no-rest-except-live-feed-2026-06-27.md` §12.15.2).
+    #[must_use]
+    // TEST-EXEMPT: builder setter that stores the gate; the hold it drives is tested through crossverify_hold_decision
+    pub fn with_verified_day_gate(mut self, gate: VerifiedDayGate) -> Self {
+        self.verified_day_gate = Some(gate);
+        self
+    }
+
+    /// Applies the cross-verification hold to the worklist. Held partitions
+    /// are counted, never failed; an over-ceiling partition is logged loudly
+    /// and archived.
+    fn apply_crossverify_hold(
+        &self,
+        worklist: Vec<(&'static str, String)>,
+        summary: &mut ArchiveRunSummary,
+    ) -> Vec<(&'static str, String)> {
+        let Some(gate) = self.verified_day_gate.as_ref() else {
+            return worklist;
+        };
+        let today_ist = chrono::Utc::now()
+            .with_timezone(&tickvault_common::trading_calendar::ist_offset())
+            .date_naive();
+        let mut kept = Vec::with_capacity(worklist.len());
+        // One loud line per pass, not one per partition: an hour-partitioned
+        // table contributes up to 24 partitions per day, so a per-partition
+        // `error!` would flood the sink for a single unverified day.
+        let mut overridden: u32 = 0;
+        let mut first_overridden: Option<(&'static str, String)> = None;
+        for (table, partition) in worklist {
+            match crossverify_hold_decision(&partition, today_ist, |d| gate(d)) {
+                CrossverifyHold::Hold => {
+                    summary.held_unverified = summary.held_unverified.saturating_add(1);
+                }
+                CrossverifyHold::OverrideAfterCeiling => {
+                    overridden = overridden.saturating_add(1);
+                    if first_overridden.is_none() {
+                        first_overridden = Some((table, partition.clone()));
+                    }
+                    kept.push((table, partition));
+                }
+                CrossverifyHold::Proceed | CrossverifyHold::Unparseable => {
+                    kept.push((table, partition));
+                }
+            }
+        }
+        if let Some((table, partition)) = first_overridden {
+            metrics::counter!("tv_partition_archive_hold_overridden_total")
+                .increment(u64::from(overridden));
+            error!(
+                code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                overridden,
+                first_table = table,
+                first_partition = %partition,
+                hold_ceiling_days = MAX_CROSSVERIFY_HOLD_DAYS,
+                "partitions archived WITHOUT a cross-verification: their day was never \
+                 verified and the hold ceiling has passed — archiving now so the disk \
+                 cannot fill waiting on a check that is not finishing"
+            );
+        }
+        if summary.held_unverified > 0 {
+            info!(
+                held_unverified = summary.held_unverified,
+                "partition archive: partitions HELD until their day's 1-minute \
+                 cross-verification finishes (not a failure; retried next pass)"
+            );
+        }
+        kept
     }
 
     /// Runs one archive→verify→drop cycle over every retention-swept table.
@@ -1703,6 +1846,9 @@ impl PartitionArchiver {
         // table with an older backlog cannot starve a newer one out of the
         // per-run budget entirely. See `fair_share_worklist` for the measured
         // incident this replaces.
+        // Cross-verification hold BEFORE the per-run cap, so a held partition
+        // never consumes budget a verified one could have used.
+        let worklist = self.apply_crossverify_hold(worklist, &mut summary);
         let worklist = fair_share_worklist(worklist, self.cfg.max_partitions_per_run as usize);
         summary.partitions_considered = worklist.len() as u32;
 
@@ -1729,6 +1875,7 @@ impl PartitionArchiver {
             dropped = summary.dropped,
             failed = summary.failed,
             rows_archived = summary.rows_archived,
+            held_unverified = summary.held_unverified,
             gzip_bytes_uploaded = summary.gzip_bytes_uploaded,
             csv_bytes_exported = summary.csv_bytes_exported,
             bucket = %self.bucket,
@@ -4249,6 +4396,75 @@ mod tests {
                 .contains(&delta),
             "ist-utc delta must be ~+5:30: {delta}"
         );
+    }
+
+    // ---- cross-verification hold (no-rest lock §12.15) ----
+
+    fn d(y: i32, m: u32, day: u32) -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(y, m, day).unwrap_or_default()
+    }
+
+    #[test]
+    fn crossverify_hold_decision_lets_a_verified_day_proceed() {
+        let today = d(2026, 9, 24);
+        let out = crossverify_hold_decision("2026-09-23", today, |_| true);
+        assert_eq!(out, CrossverifyHold::Proceed);
+    }
+
+    #[test]
+    fn an_unverified_day_inside_the_ceiling_is_held() {
+        let today = d(2026, 9, 24);
+        for age in 0..=MAX_CROSSVERIFY_HOLD_DAYS {
+            let day = today - chrono::Duration::days(age);
+            let name = day.format("%Y-%m-%d").to_string();
+            assert_eq!(
+                crossverify_hold_decision(&name, today, |_| false),
+                CrossverifyHold::Hold,
+                "age {age} must hold"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unverified_day_past_the_ceiling_is_archived_anyway() {
+        let today = d(2026, 9, 24);
+        let day = today - chrono::Duration::days(MAX_CROSSVERIFY_HOLD_DAYS + 1);
+        let name = day.format("%Y-%m-%d").to_string();
+        assert_eq!(
+            crossverify_hold_decision(&name, today, |_| false),
+            CrossverifyHold::OverrideAfterCeiling
+        );
+    }
+
+    #[test]
+    fn an_hour_partition_reads_its_day() {
+        let today = d(2026, 9, 24);
+        let seen = std::cell::Cell::new(None);
+        let out = crossverify_hold_decision("2026-09-23T14", today, |day| {
+            seen.set(Some(day));
+            false
+        });
+        assert_eq!(out, CrossverifyHold::Hold);
+        assert_eq!(seen.get(), Some(d(2026, 9, 23)));
+    }
+
+    #[test]
+    fn an_unparseable_partition_never_blocks() {
+        let today = d(2026, 9, 24);
+        for name in ["", "2026", "default", "not-a-date", "2026-13-40"] {
+            assert_eq!(
+                crossverify_hold_decision(name, today, |_| false),
+                CrossverifyHold::Unparseable,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_hold_ceiling_is_bounded() {
+        // A longer hold would let a broken verifier pin a week of partitions
+        // on EBS; a shorter one would archive a Friday failure before Monday.
+        assert!((1..=7).contains(&MAX_CROSSVERIFY_HOLD_DAYS));
     }
 }
 
