@@ -306,6 +306,164 @@ pub fn take_ring_dwell_max_ms() -> f64 {
     f64::from(micros) / 1_000.0
 }
 
+/// Worst delivery delay, whole milliseconds, of a NEW trade since the last
+/// publish. Same single-writer / `Relaxed` reasoning as
+/// [`RING_DWELL_MAX_NANOS`].
+static WS_LAG_MAX_MILLIS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Records one NEW trade's delivery delay into the window maximum.
+///
+/// The caller passes only folded, non-repeat ticks from a live socket. O(1):
+/// a few integer operations and one uncontended `fetch_max`; no allocation.
+/// A non-positive lag (the ±1 s truncation floor) adds nothing to a maximum,
+/// so it is skipped rather than stored.
+fn record_ws_lag_max(exchange_timestamp: u32, received_at_nanos: i64) {
+    if let Some(lag_ms) = ws_lag_whole_ms(exchange_timestamp, received_at_nanos)
+        && lag_ms > 0
+    {
+        WS_LAG_MAX_MILLIS.fetch_max(lag_ms, Ordering::Relaxed);
+    }
+}
+
+/// Takes the lag maximum and RESETS it, in milliseconds. Lossless: saturates
+/// at `u32::MAX` ms (~49 days), which no real delay reaches.
+fn take_ws_lag_max_ms() -> f64 {
+    let millis = WS_LAG_MAX_MILLIS.swap(0, Ordering::Relaxed);
+    f64::from(u32::try_from(millis).unwrap_or(u32::MAX))
+}
+
+/// Length of one peak-hold window, in milliseconds.
+///
+/// Tied to the CloudWatch agent's collection interval
+/// (`deploy/aws/cloudwatch-agent.json` `metrics_collection_interval: 60`,
+/// `deploy/aws/prometheus.yaml` `scrape_interval: 60s`). Equal lengths mean
+/// each window's peak is read about once: a shorter window would drop peaks
+/// between reads, a longer one would count one peak into two alarm periods.
+/// Pinned by `test_peak_hold_window_equals_the_agent_collection_interval`.
+const PEAK_HOLD_WINDOW_MS: i64 = 60_000;
+
+/// One peak-hold's decision state, separate from its atomics so the rule is a
+/// pure function that can be tested without a clock.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PeakHoldState {
+    /// Start of the in-progress window; `None` before the first publish.
+    window_start_ms: Option<i64>,
+    /// Maximum seen so far in the in-progress window.
+    current: f64,
+    /// Maximum of the last completed window; `None` until one completes.
+    completed: Option<f64>,
+}
+
+/// Folds one reset-on-read `sample` into the peak hold and returns the value
+/// to publish.
+///
+/// - Before any window completes, the in-progress maximum is published, so
+///   the first minute after boot is visible rather than a fabricated zero.
+/// - When the window has run its length, the sample is credited to the window
+///   it was collected in (publishes are at most ~500 ms apart), that window
+///   closes, and its maximum becomes the published value until the next close.
+/// - A gap longer than a window (a stalled drain) closes one window on the
+///   next publish; the stall itself shows up as the ring-dwell sample.
+///
+/// O(1): two compares and a max. `f64::max` ignores NaN, and samples are
+/// produced from `u32` so none is NaN.
+fn peak_hold_step(
+    state: PeakHoldState,
+    sample: f64,
+    now_ms: i64,
+    window_ms: i64,
+) -> (PeakHoldState, f64) {
+    let Some(start) = state.window_start_ms else {
+        let next = PeakHoldState {
+            window_start_ms: Some(now_ms),
+            current: sample,
+            completed: None,
+        };
+        return (next, sample);
+    };
+    if now_ms.saturating_sub(start) >= window_ms {
+        let closed = state.current.max(sample);
+        let next = PeakHoldState {
+            window_start_ms: Some(now_ms),
+            current: 0.0,
+            completed: Some(closed),
+        };
+        return (next, closed);
+    }
+    let current = state.current.max(sample);
+    let published = state.completed.unwrap_or(current);
+    (
+        PeakHoldState {
+            window_start_ms: Some(start),
+            current,
+            completed: state.completed,
+        },
+        published,
+    )
+}
+
+/// Sentinel for "no window started" in [`PeakHoldCell::window_start_ms`].
+const PEAK_HOLD_NO_WINDOW: i64 = i64::MIN;
+/// Sentinel for "no window completed". `u64::MAX` is a NaN bit pattern, which
+/// no sample can produce (samples come from `u32`).
+const PEAK_HOLD_NO_COMPLETED: u64 = u64::MAX;
+
+/// Lock-free storage for one [`PeakHoldState`].
+///
+/// Single writer (the drain task publishes), so plain `Relaxed` loads and
+/// stores are sound — there is no concurrent writer to race.
+struct PeakHoldCell {
+    window_start_ms: std::sync::atomic::AtomicI64,
+    current_bits: std::sync::atomic::AtomicU64,
+    completed_bits: std::sync::atomic::AtomicU64,
+}
+
+impl PeakHoldCell {
+    const fn new() -> Self {
+        Self {
+            window_start_ms: std::sync::atomic::AtomicI64::new(PEAK_HOLD_NO_WINDOW),
+            current_bits: std::sync::atomic::AtomicU64::new(0),
+            completed_bits: std::sync::atomic::AtomicU64::new(PEAK_HOLD_NO_COMPLETED),
+        }
+    }
+
+    /// Folds `sample` in at `now_ms` and returns the value to publish. O(1).
+    fn publish(&self, sample: f64, now_ms: i64) -> f64 {
+        let start = self.window_start_ms.load(Ordering::Relaxed);
+        let completed = self.completed_bits.load(Ordering::Relaxed);
+        let state = PeakHoldState {
+            window_start_ms: (start != PEAK_HOLD_NO_WINDOW).then_some(start),
+            current: f64::from_bits(self.current_bits.load(Ordering::Relaxed)),
+            completed: (completed != PEAK_HOLD_NO_COMPLETED).then(|| f64::from_bits(completed)),
+        };
+        let (next, published) = peak_hold_step(state, sample, now_ms, PEAK_HOLD_WINDOW_MS);
+        self.window_start_ms.store(
+            next.window_start_ms.unwrap_or(PEAK_HOLD_NO_WINDOW),
+            Ordering::Relaxed,
+        );
+        self.current_bits
+            .store(next.current.to_bits(), Ordering::Relaxed);
+        self.completed_bits.store(
+            next.completed.map_or(PEAK_HOLD_NO_COMPLETED, f64::to_bits),
+            Ordering::Relaxed,
+        );
+        published
+    }
+}
+
+/// Peak hold for [`RING_DWELL_MAX_MS_GAUGE`].
+static RING_DWELL_PEAK: PeakHoldCell = PeakHoldCell::new();
+/// Peak hold for [`WS_LAG_MAX_MS_GAUGE`].
+static WS_LAG_PEAK: PeakHoldCell = PeakHoldCell::new();
+
+/// Milliseconds since the first call, on the monotonic clock, so a wall-clock
+/// step can never corrupt a window. Saturates rather than wrapping.
+fn monotonic_ms() -> i64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let elapsed = EPOCH.get_or_init(Instant::now).elapsed().as_millis();
+    i64::try_from(elapsed).unwrap_or(i64::MAX)
+}
+
 /// RAII counter for [`ALIVE_CONNECTIONS`].
 ///
 /// The increment happens OUTSIDE the socket task, deliberately, so the gauge
@@ -5014,7 +5172,23 @@ pub fn unknown_packet_skip(frame: &[u8], offset: usize) -> Option<usize> {
 ///
 /// Reset to zero after each publish, deliberately: a sticky maximum reads
 /// alarming forever after one stall, which is how a signal stops being read.
+///
+/// **2026-09-24: published through [`RING_DWELL_PEAK`].** The reset happens on
+/// every 500 ms publish while CloudWatch reads once a minute, so the raw value
+/// showed a scrape only the last ~500 ms of each minute. The published value is
+/// now the maximum of the last COMPLETED 60-second window — see
+/// `dhan-rest-only-noise-lock-2026-07-14.md` §2.3u addendum.
 pub const RING_DWELL_MAX_MS_GAUGE: &str = "tv_dhan_feed_ring_dwell_max_ms";
+
+/// Gauge: the worst delivery delay (receipt minus the vendor's last-trade
+/// stamp, whole-second resolution) of any NEW trade on a live socket in the
+/// last completed 60-second window. Repeats and WAL replays are excluded.
+///
+/// One series, not the per-socket histogram: the EMF processor folds labels
+/// into one summed series, so sixteen distributions would ship as a
+/// meaningless sum. Cost and caveats: `aws-budget.md` COST NOTE 2026-09-24.
+/// Unalarmed by decision (§2.3n lever rule not met).
+pub const WS_LAG_MAX_MS_GAUGE: &str = "tv_dhan_ws_lag_max_ms";
 
 /// Gauge: rows appended to the ILP buffer but not yet flushed to QuestDB.
 /// A buffer is a staging area, not storage — a rising value means rows are
@@ -7448,6 +7622,14 @@ pub fn drain_main_feed_frame(
                     record_ws_lag_repeat_excluded();
                 } else {
                     record_ws_lag(frame.connection_index, &tick, received_at_nanos);
+                    // Worst delay of a NEW trade on a LIVE socket only: a
+                    // replayed WAL frame (`u8::MAX`) carries its replay time,
+                    // and a refused tick is not a trade we kept.
+                    if frame.connection_index != u8::MAX
+                        && matches!(outcome, IngestOutcome::Folded { .. })
+                    {
+                        record_ws_lag_max(tick.exchange_timestamp, received_at_nanos);
+                    }
                 }
                 match outcome {
                     IngestOutcome::Folded { .. } => {
@@ -8609,15 +8791,7 @@ pub const WS_LAG_EXCLUDED_COUNTER: &str = "tv_dhan_ws_lag_excluded_total";
 /// can recover precision the vendor never transmitted.
 #[must_use]
 pub fn ws_lag_ms(exchange_timestamp: u32, received_at_nanos: i64) -> Option<WsLag> {
-    if exchange_timestamp
-        < tickvault_trading::candles::multi_tf_aggregator::MIN_PLAUSIBLE_EXCHANGE_TS_SECS
-    {
-        return None;
-    }
-    let ltt_utc_secs = i64::from(exchange_timestamp)
-        - i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS);
-    let received_ms = received_at_nanos / 1_000_000;
-    let lag_ms = received_ms - ltt_utc_secs.saturating_mul(1_000);
+    let lag_ms = ws_lag_whole_ms(exchange_timestamp, received_at_nanos)?;
     if lag_ms < 0 {
         return Some(WsLag::ClampedNegative);
     }
@@ -8629,6 +8803,24 @@ pub fn ws_lag_ms(exchange_timestamp: u32, received_at_nanos: i64) -> Option<WsLa
     // APPROVED: lossy range (>2^53 ms ~ 285,000 years) is unreachable for a lag.
     #[allow(clippy::cast_precision_loss)]
     Some(WsLag::Measured(lag_ms as f64))
+}
+
+/// Signed delivery lag in whole milliseconds, or `None` for an implausible
+/// stamp. The ONE place the lag arithmetic lives: [`ws_lag_ms`] (the
+/// histogram) and [`record_ws_lag_max`] (the worst-delay gauge) both call it,
+/// so the two can never disagree about what a tick's delay was. O(1), no
+/// allocation. A negative result is the ±1 s truncation floor, not a fault.
+#[must_use]
+fn ws_lag_whole_ms(exchange_timestamp: u32, received_at_nanos: i64) -> Option<i64> {
+    if exchange_timestamp
+        < tickvault_trading::candles::multi_tf_aggregator::MIN_PLAUSIBLE_EXCHANGE_TS_SECS
+    {
+        return None;
+    }
+    let ltt_utc_secs = i64::from(exchange_timestamp)
+        - i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS);
+    let received_ms = received_at_nanos / 1_000_000;
+    Some(received_ms - ltt_utc_secs.saturating_mul(1_000))
 }
 
 /// Record one tick's delivery lag against the socket it arrived on.
@@ -9209,7 +9401,13 @@ fn publish_fold_depth(ingest: &LiveIngest) {
     // and the whole point of this measurement is that the drain loop is not
     // being starved — a signal that adds a new way to starve it would be
     // measuring a problem it helped cause.
-    metrics::gauge!(RING_DWELL_MAX_MS_GAUGE).set(take_ring_dwell_max_ms());
+    // Both maxima go through a one-minute peak hold: publishes run every
+    // ~500 ms but CloudWatch reads once a minute, so a raw reset-on-read value
+    // shows the alarm about one second in sixty (§2.3u addendum, 2026-09-24).
+    let now_ms = monotonic_ms();
+    metrics::gauge!(RING_DWELL_MAX_MS_GAUGE)
+        .set(RING_DWELL_PEAK.publish(take_ring_dwell_max_ms(), now_ms));
+    metrics::gauge!(WS_LAG_MAX_MS_GAUGE).set(WS_LAG_PEAK.publish(take_ws_lag_max_ms(), now_ms));
 }
 
 /// The WebSocket base URL for one MARKET-DATA endpoint type.
@@ -15201,6 +15399,122 @@ mod tests {
         }
         // The floor itself is inclusive-valid.
         assert!(ws_lag_ms(1_600_000_000, SIMULTANEOUS_RECV_NANOS).is_some());
+    }
+
+    #[test]
+    fn test_ws_lag_whole_ms_matches_the_histogram_arithmetic() {
+        // One arithmetic, two consumers: the histogram and the worst-delay
+        // gauge must never disagree about a tick's delay.
+        for extra_ms in [0_i64, 1, 999, 1_000, 46_370, 198_690] {
+            let recv = SIMULTANEOUS_RECV_NANOS + extra_ms * 1_000_000;
+            let whole = ws_lag_whole_ms(LTT_IST_SECS, recv);
+            assert_eq!(whole, Some(extra_ms));
+            assert!(matches!(
+                ws_lag_ms(LTT_IST_SECS, recv),
+                Some(WsLag::Measured(v)) if (v - extra_ms as f64).abs() < f64::EPSILON
+            ));
+        }
+        let early = SIMULTANEOUS_RECV_NANOS - 500_000_000;
+        assert_eq!(ws_lag_whole_ms(LTT_IST_SECS, early), Some(-500));
+        assert!(matches!(
+            ws_lag_ms(LTT_IST_SECS, early),
+            Some(WsLag::ClampedNegative)
+        ));
+        assert_eq!(ws_lag_whole_ms(0, SIMULTANEOUS_RECV_NANOS), None);
+    }
+
+    #[test]
+    fn test_ws_lag_max_takes_the_largest_and_resets() {
+        let _ = take_ws_lag_max_ms();
+        record_ws_lag_max(LTT_IST_SECS, SIMULTANEOUS_RECV_NANOS + 2_000_000_000);
+        record_ws_lag_max(LTT_IST_SECS, SIMULTANEOUS_RECV_NANOS + 46_000_000_000);
+        record_ws_lag_max(LTT_IST_SECS, SIMULTANEOUS_RECV_NANOS + 5_000_000);
+        // A negative (truncation floor) and a garbage stamp add nothing.
+        record_ws_lag_max(LTT_IST_SECS, SIMULTANEOUS_RECV_NANOS - 900_000_000);
+        record_ws_lag_max(0, SIMULTANEOUS_RECV_NANOS);
+        assert!((take_ws_lag_max_ms() - 46_000.0).abs() < f64::EPSILON);
+        assert!(
+            take_ws_lag_max_ms().abs() < f64::EPSILON,
+            "must reset on read"
+        );
+    }
+
+    #[test]
+    fn test_peak_hold_first_window_publishes_in_progress_max() {
+        let empty = PeakHoldState {
+            window_start_ms: None,
+            current: 0.0,
+            completed: None,
+        };
+        let (s, p) = peak_hold_step(empty, 3.0, 1_000, 60_000);
+        assert!((p - 3.0).abs() < f64::EPSILON);
+        let (s, p) = peak_hold_step(s, 9.0, 1_500, 60_000);
+        assert!((p - 9.0).abs() < f64::EPSILON);
+        // A smaller sample later in the window does not lower the published max.
+        let (_, p) = peak_hold_step(s, 1.0, 2_000, 60_000);
+        assert!((p - 9.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_peak_hold_publishes_completed_window_after_rollover() {
+        // A 5 s spike inside one minute of ~0 ms samples: every publish in the
+        // NEXT minute shows 5,000, so a once-a-minute scrape cannot miss it.
+        let mut s = PeakHoldState {
+            window_start_ms: None,
+            current: 0.0,
+            completed: None,
+        };
+        let mut now = 0_i64;
+        let mut published = 0.0;
+        for i in 0..120 {
+            let sample = if i == 37 { 5_000.0 } else { 0.5 };
+            (s, published) = peak_hold_step(s, sample, now, 60_000);
+            now += 500;
+        }
+        assert!((published - 5_000.0).abs() < f64::EPSILON);
+        // Every publish in the minute after the spike carries it.
+        for _ in 0..119 {
+            let (next, p) = peak_hold_step(s, 0.5, now, 60_000);
+            assert!(p >= 5_000.0 || now >= 120_000, "spike hidden at {now}");
+            s = next;
+            now += 500;
+        }
+    }
+
+    #[test]
+    fn test_peak_hold_gap_spanning_windows_keeps_the_last_completed_max() {
+        let s = PeakHoldState {
+            window_start_ms: Some(0),
+            current: 7.0,
+            completed: Some(2.0),
+        };
+        // A stalled drain: the next publish comes 5 minutes later with a huge
+        // dwell sample. It is credited to the window being closed.
+        let (s, p) = peak_hold_step(s, 300_000.0, 300_000, 60_000);
+        assert!((p - 300_000.0).abs() < f64::EPSILON);
+        assert_eq!(s.window_start_ms, Some(300_000));
+        assert_eq!(s.completed, Some(300_000.0));
+        let (_, p) = peak_hold_step(s, 0.0, 300_500, 60_000);
+        assert!((p - 300_000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_peak_hold_cell_round_trips_through_its_atomics() {
+        let cell = PeakHoldCell::new();
+        assert!((cell.publish(4.0, 0) - 4.0).abs() < f64::EPSILON);
+        assert!((cell.publish(1.0, 30_000) - 4.0).abs() < f64::EPSILON);
+        assert!((cell.publish(2.0, 60_000) - 4.0).abs() < f64::EPSILON);
+        assert!((cell.publish(0.0, 90_000) - 4.0).abs() < f64::EPSILON);
+        assert!((cell.publish(0.0, 120_000) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_peak_hold_window_equals_the_agent_collection_interval() {
+        let agent = include_str!("../../../deploy/aws/cloudwatch-agent.json");
+        let prom = include_str!("../../../deploy/aws/prometheus.yaml");
+        assert!(agent.contains("\"metrics_collection_interval\": 60"));
+        assert!(prom.contains("scrape_interval: 60s"));
+        assert_eq!(PEAK_HOLD_WINDOW_MS, 60_000);
     }
 
     #[test]
