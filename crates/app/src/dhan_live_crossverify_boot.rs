@@ -165,6 +165,30 @@ pub fn should_write_marker(cmp: &DayComparison, persisted_ok: bool) -> bool {
     persisted_ok && !cmp.is_vacuous() && cmp.outcome.is_measured()
 }
 
+/// The largest share of targets, in percent, whose vendor fetch may fail
+/// while the run still counts as complete enough to release the S3 hold.
+pub const MAX_MARKER_REST_FAILURE_PERCENT: usize = 5;
+
+/// Whether the run covered enough of the day to release the S3 hold.
+///
+/// A run cut short by its time budget, or whose live read was truncated, did
+/// not look at the whole day. A run where more than
+/// [`MAX_MARKER_REST_FAILURE_PERCENT`] of targets failed to fetch did not look
+/// at most instruments. Either can still be `Partial`, which is measured, so
+/// the outcome alone cannot catch it. Pure, O(1).
+#[must_use]
+pub const fn run_is_complete(
+    budget_elapsed: bool,
+    live_truncated: bool,
+    rest_failures: usize,
+    targets: usize,
+) -> bool {
+    !budget_elapsed
+        && !live_truncated
+        && rest_failures.saturating_mul(100)
+            <= targets.saturating_mul(MAX_MARKER_REST_FAILURE_PERCENT)
+}
+
 /// Whether the divergence page fires: more than half of the compared price
 /// fields disagree. Pure.
 #[must_use]
@@ -196,7 +220,10 @@ fn now_ist_secs_of_day() -> u64 {
 /// Seconds between token checks while the boot catch-up waits for login.
 pub const TOKEN_WAIT_POLL_SECS: u64 = 5;
 
-/// Token checks before the run gives up: 60 × 5 s = 5 minutes.
+/// Sleeps between token checks before the run gives up: 60 × 5 s = 5 minutes.
+///
+/// There are `TOKEN_WAIT_MAX_POLLS + 1` checks (one before the first sleep)
+/// and `TOKEN_WAIT_MAX_POLLS` sleeps.
 ///
 /// 2026-09-24: the first live run was a boot catch-up at 18:32 IST. It started
 /// before the token manager had loaded a token and failed at once, so the day
@@ -204,31 +231,48 @@ pub const TOKEN_WAIT_POLL_SECS: u64 = 5;
 /// token within seconds; five minutes covers a slow mint with room to spare.
 pub const TOKEN_WAIT_MAX_POLLS: u32 = 60;
 
-/// Waits for the token manager to hold a token. O(1) per poll, bounded.
-async fn wait_for_jwt() -> Option<SecretString> {
-    for poll in 0..=TOKEN_WAIT_MAX_POLLS {
-        if let Some(jwt) = current_jwt() {
-            if poll > 0 {
-                info!(
-                    waited_secs = TOKEN_WAIT_POLL_SECS * u64::from(poll),
-                    "Dhan 1-minute cross-verification: token became available"
-                );
-            }
-            return Some(jwt);
+/// Calls `read` until it returns `Some`, sleeping `poll_secs` between calls,
+/// at most `max_polls` sleeps. Returns the value and the number of sleeps
+/// taken. O(1) per call, bounded in total. Generic so the bound is testable
+/// against a paused clock without a live token manager.
+pub async fn poll_until<T>(
+    mut read: impl FnMut() -> Option<T>,
+    poll_secs: u64,
+    max_polls: u32,
+) -> Option<(T, u32)> {
+    for poll in 0..=max_polls {
+        if let Some(value) = read() {
+            return Some((value, poll));
         }
-        if poll < TOKEN_WAIT_MAX_POLLS {
-            tokio::time::sleep(Duration::from_secs(TOKEN_WAIT_POLL_SECS)).await;
+        if poll < max_polls {
+            tokio::time::sleep(Duration::from_secs(poll_secs)).await;
         }
     }
     None
 }
 
+/// Waits for the token manager to hold an unexpired token.
+async fn wait_for_jwt() -> Option<SecretString> {
+    let (jwt, polls) = poll_until(current_jwt, TOKEN_WAIT_POLL_SECS, TOKEN_WAIT_MAX_POLLS).await?;
+    if polls > 0 {
+        info!(
+            waited_secs = TOKEN_WAIT_POLL_SECS * u64::from(polls),
+            "Dhan 1-minute cross-verification: token became available"
+        );
+    }
+    Some(jwt)
+}
+
+/// The current token, or `None` if there is none or it has expired. An expired
+/// token loaded from the crash cache counts as absent, so the wait continues
+/// until the fresh mint lands instead of sending a dead token to Dhan.
 fn current_jwt() -> Option<SecretString> {
     let manager = global_token_manager()?;
     let guard = manager.token_handle().load();
     guard
         .as_ref()
         .as_ref()
+        .filter(|state| state.is_valid())
         .map(|state| SecretString::from(state.access_token().expose_secret().to_string()))
 }
 
@@ -382,9 +426,26 @@ async fn run_once(
                      a pass; it is no measurement at all."
                 );
             }
-            if should_write_marker(c, persisted_ok) {
+            let complete = run_is_complete(
+                report.budget_elapsed,
+                report.live_truncated,
+                report.rest_failures,
+                targets.len(),
+            );
+            if should_write_marker(c, persisted_ok) && complete {
                 write_daily_marker(CROSSVERIFY_MARKER_TASK, today);
                 info!(%today, "Dhan 1-minute cross-verification recorded — today's S3 archive may proceed");
+            } else if should_write_marker(c, persisted_ok) {
+                error!(
+                    code = ErrorCode::WsGapConnectionState.code_str(),
+                    source = "xverify_failed",
+                    targets = targets.len(),
+                    rest_failures = report.rest_failures,
+                    budget_elapsed = report.budget_elapsed,
+                    live_truncated = report.live_truncated,
+                    "Dhan 1-minute cross-verification ran but did not cover the whole day — \
+                     today's S3 archive stays held."
+                );
             }
         }
         Err(err) => {
@@ -584,7 +645,7 @@ mod tests {
         let body = src
             .split("async fn run_once(")
             .nth(1)
-            .and_then(|s| s.split("\nasync fn ").next())
+            .and_then(|s| s.split("\n}\n").next())
             .unwrap_or("");
         assert!(
             body.contains("wait_for_jwt().await"),
@@ -593,6 +654,82 @@ mod tests {
         assert!(
             !body.contains("= current_jwt()"),
             "run_once reads the token once and fails on a slow login"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_poll_until_returns_once_the_value_appears() {
+        let start = tokio::time::Instant::now();
+        let mut calls = 0u32;
+        let got = poll_until(
+            || {
+                calls += 1;
+                (calls > 3).then_some(7u8)
+            },
+            5,
+            60,
+        )
+        .await;
+        assert_eq!(got, Some((7, 3)));
+        assert_eq!(start.elapsed(), Duration::from_secs(15));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_poll_until_gives_up_after_the_bound() {
+        let start = tokio::time::Instant::now();
+        let mut calls = 0u32;
+        let got: Option<(u8, u32)> = poll_until(
+            || {
+                calls += 1;
+                None
+            },
+            5,
+            60,
+        )
+        .await;
+        assert_eq!(got, None);
+        assert_eq!(calls, 61, "61 checks");
+        assert_eq!(start.elapsed(), Duration::from_secs(300), "60 sleeps");
+    }
+
+    #[test]
+    fn test_current_jwt_skips_an_expired_token() {
+        let src = include_str!("dhan_live_crossverify_boot.rs");
+        let body = src
+            .split("fn current_jwt()")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap_or("");
+        assert!(
+            body.contains(".filter(|state| state.is_valid())"),
+            "an expired cached token must count as absent"
+        );
+    }
+
+    #[test]
+    fn test_run_is_complete_holds_s3_on_a_short_run() {
+        assert!(run_is_complete(false, false, 0, 868));
+        // 5% of 868 is 43.4, so 43 failures pass and 44 do not.
+        assert!(run_is_complete(false, false, 43, 868));
+        assert!(!run_is_complete(false, false, 44, 868));
+        assert!(!run_is_complete(true, false, 0, 868));
+        assert!(!run_is_complete(false, true, 0, 868));
+        // No targets: nothing failed, nothing to hold on.
+        assert!(run_is_complete(false, false, 0, 0));
+        assert!(!run_is_complete(false, false, 1, 0));
+    }
+
+    #[test]
+    fn test_marker_write_needs_a_complete_run() {
+        let src = include_str!("dhan_live_crossverify_boot.rs");
+        let body = src
+            .split("async fn run_once(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap_or("");
+        assert!(
+            body.contains("should_write_marker(c, persisted_ok) && complete"),
+            "the marker must also require a complete run"
         );
     }
 
