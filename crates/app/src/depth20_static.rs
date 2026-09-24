@@ -258,14 +258,14 @@ mod tests {
     }
 
     #[test]
-    fn test_208_spots_give_plus_minus_four_and_244_slots() {
+    fn test_index_strikes_each_side_208_spots_give_plus_minus_four_and_244_slots() {
         let k = index_strikes_each_side(208, DEPTH20_STATIC_BUDGET, DEPTH20_INDEX_MAX_EACH_SIDE);
         assert_eq!(k, Some(4));
         assert_eq!(208 + index_legs_cost(4), 244);
     }
 
     #[test]
-    fn test_more_spots_shrink_the_window_rather_than_breach_the_budget() {
+    fn test_index_strikes_each_side_more_spots_shrink_rather_than_breach() {
         // 250 - 216 = 34 < 36, so ±3 (28) is the widest that fits.
         assert_eq!(index_strikes_each_side(216, 250, 4), Some(3));
         assert_eq!(index_strikes_each_side(246, 250, 4), Some(0));
@@ -278,7 +278,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fno_spots_keep_nse_equity_only_and_dedup() {
+    fn test_fno_spot_instruments_keep_nse_equity_only_and_dedup() {
         let entries = [
             entry(13, ExchangeSegment::IdxI),
             entry(2885, ExchangeSegment::NseEquity),
@@ -298,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_puts_spots_first_dedups_and_caps() {
+    fn test_build_static_depth20_puts_spots_first_dedups_and_caps() {
         let spots = [eq(1), eq(2), eq(3)];
         let index = [fno(10), eq(2), fno(11), fno(12)];
         assert_eq!(
