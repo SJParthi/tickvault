@@ -3305,6 +3305,50 @@ which is the half we can control; the half before it remains undetectable.
   stands).
 - Presents it as detection of upstream tick loss. It is not, and cannot be.
 
+#### §2.3u addendum — 2026-09-24: the alarm could see about one second in every sixty
+
+**The verbatim operator demand (2026-09-24, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "i dont want any agps ir any issues dude can you coevr all tehse dude okay?Always achieve O(1) everywhere."
+
+Given in direct response to the Feed Watchtower report. **No new alarm, no
+threshold change.** This records a sensitivity fix to the alarm above and one
+unalarmed gauge beside it, per the rule-file-first law.
+
+**The defect, verified in source.** `take_ring_dwell_max_ms` does `swap(0)` on
+every publish, and `publish_fold_depth` runs on the 500 ms flush timer
+(`FLUSH_INTERVAL_MILLIS`) and every 1,024 frames. The CloudWatch agent scrapes
+once a minute (`metrics_collection_interval: 60`, `scrape_interval: 60s`). So
+each scrape saw only the maximum of the LAST publish window — at most ~500 ms
+of the 60 s. A 3-second stall that ended 10 seconds before the scrape was
+reset away before anyone read it. The alarm above could only fire if a stall
+happened to straddle a scrape. The "23.7 ms worst ring wait" reported on
+2026-09-24 was that sample, not the day's worst.
+
+**The fix — a completed-window peak hold.** The published value is now the
+maximum over the last COMPLETED 60-second window (the first window publishes
+its in-progress maximum). The window length equals the agent interval, so each
+minute's peak is read about once and never counted into two alarm periods. At
+most ~60 s of added latency, against an alarm that already needs 2 × 300 s.
+Per publish: two atomic loads, one compare, one store — O(1), no allocation,
+single writer (the drain task).
+
+**`tv_dhan_ws_lag_max_ms` ships UNALARMED** beside it, through the same peak
+hold: the worst `receipt − last-trade` delay of any NEW trade in the window
+(repeats and WAL replays excluded). Cost and the not-claimed list are in
+`aws-budget.md` "COST NOTE 2026-09-24". No alarm because §2.3n's lever rule is
+not satisfied.
+
+**⚠ Honest consequence.** The ring-dwell alarm will now see stalls it was blind
+to. If it starts paging where it never did, that is the alarm working — the
+threshold (2,000 ms, 2 × 300 s, `Maximum`) is unchanged.
+
+**What a PR that violates this addendum looks like (REJECT):** restores a
+reset-on-read publish without the peak hold; sets the window to anything but
+the agent's collection interval; adds an alarm on `tv_dhan_ws_lag_max_ms`
+without a lever; records a replayed or repeated tick into the lag maximum.
+
 ## ⚠ CORRECTED 2026-09-06 — the budget kill-switch is ARMED AND HEALTHY. Fifteen statements across three rule files say it may be broken, and the read they call impossible now works.
 
 **This section authorizes NOTHING.** It records a live measurement and retires a

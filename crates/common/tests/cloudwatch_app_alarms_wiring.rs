@@ -1109,10 +1109,20 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // two levers, unchanged: the already-approved Quote 10 Elastic IP release
     // (-$3.60/mo, which alone returns the maximal month to under both lines),
     // or an operator decision on limit_amount.
+    //
+    // 2026-09-24: 98 -> 99, tv_dhan_ws_lag_max_ms -- the worst exchange-to-us
+    // delay of a new trade on a live socket, held for one minute so the
+    // one-minute scrape sees it. Until now the lag existed only as a local
+    // histogram and CloudWatch could not show a slow minute at all.
+    // Unalarmed on purpose: dhan-rest-only-noise-lock-2026-07-14.md §2.3u
+    // addendum (2026-09-24) records why. +$0.30/mo, cost note in aws-budget.md
+    // "COST NOTE 2026-09-24".
     assert_eq!(
         names.len(),
-        98,
-        "Z+ L2 VERIFY ratchet: expected exactly 98 names in the MAIN EMF \
+        99,
+        "Z+ L2 VERIFY ratchet: expected exactly 99 names in the MAIN EMF \
+         (2026-09-24: 98 -> 99, tv_dhan_ws_lag_max_ms, see aws-budget.md \
+         COST NOTE 2026-09-24.) \
          (2026-09-16 TWELFTH: 110 -> 98, a REMOVAL of twelve and the second \
          time this ratchet has been given a LEVER rather than another cost \
          note. All twelve lost their producers on the same day, under the \
