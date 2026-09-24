@@ -193,6 +193,36 @@ fn now_ist_secs_of_day() -> u64 {
     u64::from(chrono::Timelike::num_seconds_from_midnight(&ist.time()))
 }
 
+/// Seconds between token checks while the boot catch-up waits for login.
+pub const TOKEN_WAIT_POLL_SECS: u64 = 5;
+
+/// Token checks before the run gives up: 60 × 5 s = 5 minutes.
+///
+/// 2026-09-24: the first live run was a boot catch-up at 18:32 IST. It started
+/// before the token manager had loaded a token and failed at once, so the day
+/// stayed unverified and its S3 archive stayed held. A normal boot has the
+/// token within seconds; five minutes covers a slow mint with room to spare.
+pub const TOKEN_WAIT_MAX_POLLS: u32 = 60;
+
+/// Waits for the token manager to hold a token. O(1) per poll, bounded.
+async fn wait_for_jwt() -> Option<SecretString> {
+    for poll in 0..=TOKEN_WAIT_MAX_POLLS {
+        if let Some(jwt) = current_jwt() {
+            if poll > 0 {
+                info!(
+                    waited_secs = TOKEN_WAIT_POLL_SECS * u64::from(poll),
+                    "Dhan 1-minute cross-verification: token became available"
+                );
+            }
+            return Some(jwt);
+        }
+        if poll < TOKEN_WAIT_MAX_POLLS {
+            tokio::time::sleep(Duration::from_secs(TOKEN_WAIT_POLL_SECS)).await;
+        }
+    }
+    None
+}
+
 fn current_jwt() -> Option<SecretString> {
     let manager = global_token_manager()?;
     let guard = manager.token_handle().load();
@@ -259,11 +289,12 @@ async fn run_once(
     today: chrono::NaiveDate,
     day_start_ist_nanos: i64,
 ) {
-    let Some(jwt) = current_jwt() else {
+    let Some(jwt) = wait_for_jwt().await else {
         metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "no_token").increment(1);
         error!(
             code = ErrorCode::WsGapConnectionState.code_str(),
             source = "xverify_failed",
+            waited_secs = TOKEN_WAIT_POLL_SECS * u64::from(TOKEN_WAIT_MAX_POLLS),
             "Dhan 1-minute cross-verification could not run: no Dhan token available. \
              Today's candles are UNVERIFIED and today's S3 archive stays held."
         );
@@ -534,6 +565,35 @@ mod tests {
         let (targets, skipped) = crossverify_targets_with_skipped(&feed);
         assert!(targets.is_empty());
         assert_eq!(skipped, 1);
+    }
+
+    #[test]
+    fn test_run_once_waits_for_the_token_before_failing() {
+        // The 2026-09-24 boot catch-up failed because it read the token once,
+        // before login finished. The wait must be long enough for a slow mint
+        // and short enough to report a real login failure the same evening.
+        let budget = TOKEN_WAIT_POLL_SECS * u64::from(TOKEN_WAIT_MAX_POLLS);
+        assert!(budget >= 60, "wait too short to cover login: {budget}s");
+        assert!(
+            budget <= 600,
+            "wait too long to report a dead login: {budget}s"
+        );
+
+        // run_once must go through the waiting read, never a single read.
+        let src = include_str!("dhan_live_crossverify_boot.rs");
+        let body = src
+            .split("async fn run_once(")
+            .nth(1)
+            .and_then(|s| s.split("\nasync fn ").next())
+            .unwrap_or("");
+        assert!(
+            body.contains("wait_for_jwt().await"),
+            "run_once must wait for the token"
+        );
+        assert!(
+            !body.contains("= current_jwt()"),
+            "run_once reads the token once and fails on a slow login"
+        );
     }
 
     #[test]
