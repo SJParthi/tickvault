@@ -231,6 +231,116 @@ pub const TOKEN_WAIT_POLL_SECS: u64 = 5;
 /// token within seconds; five minutes covers a slow mint with room to spare.
 pub const TOKEN_WAIT_MAX_POLLS: u32 = 60;
 
+/// Seconds between a failed attempt and the next same-day attempt.
+///
+/// 2026-09-24: before this, a failed 15:41 run slept until the next day. The
+/// day then never got a marker, and its S3 archive waited the full hold
+/// ceiling before archiving unverified. A same-day retry gives a transient
+/// failure (slow token, QuestDB busy, vendor blip) three more chances.
+pub const XVERIFY_RETRY_INTERVAL_SECS: u64 = 900;
+
+/// The most attempts one trading day gets, the first one included.
+pub const XVERIFY_MAX_ATTEMPTS_PER_DAY: u32 = 4;
+
+/// 17:30 IST — the scheduled evening stop of the box. An attempt that could
+/// still be running at this time is not started, because the stop would kill
+/// it half-way.
+pub const EVENING_STOP_SECS_OF_DAY_IST: u64 = 17 * 3_600 + 30 * 60;
+
+/// Room left after the run budget for the audit flush and the marker write.
+const PERSIST_MARGIN_SECS: u64 = 60;
+
+/// Same-day retries, by the reason the previous attempt failed. Local
+/// `/metrics` only; the final failure still pages through the existing
+/// `xverify_failed` / `xverify_vacuous` log filters.
+pub const XVERIFY_RETRIES_COUNTER: &str = "tv_dhan_xverify_retries_total";
+
+/// Why one attempt did not record the day.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptFailure {
+    /// No unexpired token after the full token wait.
+    NoToken,
+    /// The run itself returned an error (QuestDB read, request build, ...).
+    RunFailed,
+    /// The run compared zero minutes.
+    Vacuous,
+    /// The comparison ran but its audit rows did not land.
+    NotPersisted,
+    /// The comparison ran but did not cover the day (budget, truncation,
+    /// too many vendor fetch failures, or a non-measured outcome).
+    Incomplete,
+}
+
+impl AttemptFailure {
+    /// Stable label for logs and the retry counter.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoToken => "no_token",
+            Self::RunFailed => "run_failed",
+            Self::Vacuous => "vacuous",
+            Self::NotPersisted => "not_persisted",
+            Self::Incomplete => "incomplete",
+        }
+    }
+}
+
+/// The longest one attempt can take: the token wait, the run budget, and the
+/// persist margin. Pure, O(1).
+#[must_use]
+pub const fn attempt_max_secs(run_budget_secs: u64) -> u64 {
+    TOKEN_WAIT_POLL_SECS
+        .saturating_mul(TOKEN_WAIT_MAX_POLLS as u64)
+        .saturating_add(run_budget_secs)
+        .saturating_add(PERSIST_MARGIN_SECS)
+}
+
+/// Seconds to wait before the next same-day attempt, or `None` when there is
+/// no next attempt: the day's attempts are used up, or the next attempt could
+/// still be running at the evening stop. Pure, O(1).
+#[must_use]
+pub const fn retry_delay_secs(
+    attempts_made: u32,
+    now_secs_of_day: u64,
+    attempt_max_secs: u64,
+) -> Option<u64> {
+    if attempts_made >= XVERIFY_MAX_ATTEMPTS_PER_DAY {
+        return None;
+    }
+    let next_end = now_secs_of_day
+        .saturating_add(XVERIFY_RETRY_INTERVAL_SECS)
+        .saturating_add(attempt_max_secs);
+    if next_end > EVENING_STOP_SECS_OF_DAY_IST {
+        return None;
+    }
+    Some(XVERIFY_RETRY_INTERVAL_SECS)
+}
+
+/// Whether one finished attempt recorded the day, and if not, why. The
+/// checks run in a fixed order so the reason names the first thing that went
+/// wrong. `Ok` is exactly the condition under which the marker is written.
+/// Pure, O(1).
+pub fn classify_attempt(
+    vacuous: bool,
+    measured: bool,
+    persisted_ok: bool,
+    complete: bool,
+) -> Result<(), AttemptFailure> {
+    if vacuous {
+        return Err(AttemptFailure::Vacuous);
+    }
+    if !measured {
+        return Err(AttemptFailure::Incomplete);
+    }
+    if !persisted_ok {
+        return Err(AttemptFailure::NotPersisted);
+    }
+    if !complete {
+        return Err(AttemptFailure::Incomplete);
+    }
+    Ok(())
+}
+
 /// Calls `read` until it returns `Some`, sleeping `poll_secs` between calls,
 /// at most `max_polls` sleeps. Returns the value and the number of sleeps
 /// taken. O(1) per call, bounded in total. Generic so the bound is testable
@@ -277,7 +387,7 @@ fn current_jwt() -> Option<SecretString> {
 }
 
 /// Spawns the daily cross-verification task for the subscribed universe.
-// TEST-EXEMPT: spawns a tokio task that waits for 15:41 IST and calls the vendor; its pure decisions (targets, schedule, catch-up, marker, divergence) are tested above and its emit contract by test_every_xverify_alarm_source_has_a_live_error_emit
+// TEST-EXEMPT: spawns a tokio task that waits for 15:41 IST and calls the vendor; its pure decisions (targets, schedule, catch-up, marker, divergence, same-day retry bound, attempt classification) are tested above and its emit contract by test_every_xverify_alarm_source_has_a_live_error_emit
 pub fn spawn_dhan_live_crossverify(
     deps: CrossverifyBootDeps,
     main_feed: &[SubscribeInstrument],
@@ -322,27 +432,136 @@ pub fn spawn_dhan_live_crossverify(
                 info!(%today, "Dhan 1-minute cross-verification already recorded for today");
                 continue;
             }
-            run_once(&deps, &targets, today, day_start_ist_nanos).await;
+            run_day(&deps, &targets, today, day_start_ist_nanos).await;
         }
     })
 }
 
-async fn run_once(
+/// Runs today's check, retrying on the same day until it records the day or
+/// the retry window closes. Each attempt is bounded by the token wait and the
+/// run budget; the number of attempts is bounded by
+/// [`XVERIFY_MAX_ATTEMPTS_PER_DAY`] and by the evening stop.
+async fn run_day(
     deps: &CrossverifyBootDeps,
     targets: &[XverifyTarget],
     today: chrono::NaiveDate,
     day_start_ist_nanos: i64,
 ) {
-    let Some(jwt) = wait_for_jwt().await else {
-        metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "no_token").increment(1);
-        error!(
+    let max_attempt_secs = attempt_max_secs(deps.config.run_budget_secs);
+    let mut attempts: u32 = 0;
+    let mut divergence_paged = false;
+    loop {
+        attempts = attempts.saturating_add(1);
+        let outcome = run_once(
+            deps,
+            targets,
+            today,
+            day_start_ist_nanos,
+            &mut divergence_paged,
+        )
+        .await;
+        let failure = match outcome {
+            Ok(()) => {
+                if attempts > 1 {
+                    info!(%today, attempts, "Dhan 1-minute cross-verification recorded on a same-day retry");
+                }
+                return;
+            }
+            Err(failure) => failure,
+        };
+        match retry_delay_secs(attempts, now_ist_secs_of_day(), max_attempt_secs) {
+            Some(delay) => {
+                metrics::counter!(XVERIFY_RETRIES_COUNTER, "reason" => failure.as_str())
+                    .increment(1);
+                warn!(
+                    code = ErrorCode::WsGapConnectionState.code_str(),
+                    source = "xverify_retry",
+                    %today,
+                    reason = failure.as_str(),
+                    attempt = attempts,
+                    max_attempts = XVERIFY_MAX_ATTEMPTS_PER_DAY,
+                    retry_in_secs = delay,
+                    "Dhan 1-minute cross-verification did not record today — retrying later today"
+                );
+                tokio::time::sleep(Duration::from_secs(delay)).await;
+                // The day can only change here if the process ran past
+                // midnight, which the evening-stop bound rules out; checked
+                // anyway so a retry can never verify the wrong day.
+                if today_ist().0 != today {
+                    return;
+                }
+            }
+            None => {
+                report_final_failure(failure, today, attempts, targets.len());
+                return;
+            }
+        }
+    }
+}
+
+/// Pages once, after the last attempt of the day. Each arm is its own
+/// `error!` so every alarmed `source` stays a literal the alarm filter can
+/// match.
+fn report_final_failure(
+    failure: AttemptFailure,
+    today: chrono::NaiveDate,
+    attempts: u32,
+    targets: usize,
+) {
+    let reason = failure.as_str();
+    match failure {
+        AttemptFailure::Vacuous => error!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            source = "xverify_vacuous",
+            %today,
+            attempts,
+            targets,
+            reason,
+            "Dhan 1-minute cross-verification compared ZERO minutes on every attempt \
+             today — today's candles are UNVERIFIED and today's S3 archive stays held. \
+             This is not a pass; it is no measurement at all."
+        ),
+        AttemptFailure::NoToken
+        | AttemptFailure::RunFailed
+        | AttemptFailure::NotPersisted
+        | AttemptFailure::Incomplete => error!(
             code = ErrorCode::WsGapConnectionState.code_str(),
             source = "xverify_failed",
+            %today,
+            attempts,
+            targets,
+            reason,
+            "Dhan 1-minute cross-verification did not record today after every \
+             same-day attempt — today's candles are UNVERIFIED and today's S3 archive \
+             stays held"
+        ),
+    }
+}
+
+/// One attempt. Returns `Ok` only when the day's marker was written.
+///
+/// Per-attempt problems log at `warn!` with sources no alarm filter matches;
+/// the page fires once, from [`report_final_failure`], after the last attempt.
+/// The divergence page is the exception: it is a finding about the data, not
+/// about the attempt, so it fires on the first attempt that measures it and
+/// `divergence_paged` stops a retry from paging it again.
+async fn run_once(
+    deps: &CrossverifyBootDeps,
+    targets: &[XverifyTarget],
+    today: chrono::NaiveDate,
+    day_start_ist_nanos: i64,
+    divergence_paged: &mut bool,
+) -> Result<(), AttemptFailure> {
+    let Some(jwt) = wait_for_jwt().await else {
+        metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "no_token").increment(1);
+        warn!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            source = "xverify_attempt_no_token",
             waited_secs = TOKEN_WAIT_POLL_SECS * u64::from(TOKEN_WAIT_MAX_POLLS),
-            "Dhan 1-minute cross-verification could not run: no Dhan token available. \
-             Today's candles are UNVERIFIED and today's S3 archive stays held."
+            "Dhan 1-minute cross-verification attempt could not run: no Dhan token \
+             available"
         );
-        return;
+        return Err(AttemptFailure::NoToken);
     };
     let client = reqwest::Client::new();
     let result = run_cross_verification(
@@ -398,7 +617,8 @@ async fn run_once(
                 day_start_ist_nanos,
                 deps.config.tolerance_paise,
             );
-            if is_catastrophic_divergence(c) {
+            if is_catastrophic_divergence(c) && !*divergence_paged {
+                *divergence_paged = true;
                 metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "diverged").increment(1);
                 error!(
                     code = ErrorCode::WsGapConnectionState.code_str(),
@@ -414,49 +634,55 @@ async fn run_once(
                      as untrustworthy until this is explained."
                 );
             }
-            if c.is_vacuous() {
-                error!(
-                    code = ErrorCode::WsGapConnectionState.code_str(),
-                    source = "xverify_vacuous",
-                    targets = targets.len(),
-                    missing_live = c.missing_live,
-                    missing_rest = c.missing_rest,
-                    "Dhan 1-minute cross-verification compared ZERO minutes — today's \
-                     candles are UNVERIFIED and today's S3 archive stays held. This is not \
-                     a pass; it is no measurement at all."
-                );
-            }
             let complete = run_is_complete(
                 report.budget_elapsed,
                 report.live_truncated,
                 report.rest_failures,
                 targets.len(),
             );
-            if should_write_marker(c, persisted_ok) && complete {
-                write_daily_marker(CROSSVERIFY_MARKER_TASK, today);
-                info!(%today, "Dhan 1-minute cross-verification recorded — today's S3 archive may proceed");
-            } else if should_write_marker(c, persisted_ok) {
-                error!(
+            let verdict = classify_attempt(
+                c.is_vacuous(),
+                c.outcome.is_measured(),
+                persisted_ok,
+                complete,
+            );
+            // The marker condition must stay exactly `should_write_marker`
+            // plus a complete run; the two pure functions agree by test.
+            debug_assert_eq!(
+                verdict.is_ok(),
+                should_write_marker(c, persisted_ok) && complete
+            );
+            match verdict {
+                Ok(()) => {
+                    write_daily_marker(CROSSVERIFY_MARKER_TASK, today);
+                    info!(%today, "Dhan 1-minute cross-verification recorded — today's S3 archive may proceed");
+                }
+                Err(failure) => warn!(
                     code = ErrorCode::WsGapConnectionState.code_str(),
-                    source = "xverify_failed",
+                    source = "xverify_attempt_unrecorded",
+                    reason = failure.as_str(),
                     targets = targets.len(),
+                    minutes_compared = c.minutes_compared,
+                    missing_live = c.missing_live,
+                    missing_rest = c.missing_rest,
                     rest_failures = report.rest_failures,
                     budget_elapsed = report.budget_elapsed,
                     live_truncated = report.live_truncated,
-                    "Dhan 1-minute cross-verification ran but did not cover the whole day — \
-                     today's S3 archive stays held."
-                );
+                    persisted_ok,
+                    "Dhan 1-minute cross-verification attempt did not record today"
+                ),
             }
+            verdict
         }
         Err(err) => {
             metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "failed").increment(1);
-            error!(
+            warn!(
                 code = ErrorCode::WsGapConnectionState.code_str(),
-                source = "xverify_failed",
+                source = "xverify_attempt_failed",
                 %err,
-                "Dhan 1-minute cross-verification FAILED to run — today's candles are \
-                 UNVERIFIED and today's S3 archive stays held"
+                "Dhan 1-minute cross-verification attempt FAILED to run"
             );
+            Err(AttemptFailure::RunFailed)
         }
     }
 }
@@ -530,7 +756,7 @@ fn persist_report(
             metrics::counter!(XVERIFY_PERSIST_ERRORS_COUNTER).increment(1);
             error!(
                 code = ErrorCode::WsGapConnectionState.code_str(),
-                source = "xverify_failed",
+                source = "xverify_persist_failed",
                 ?err,
                 discarded,
                 "Dhan 1-minute cross-verification could NOT be persisted — today's \
@@ -740,9 +966,179 @@ mod tests {
             .and_then(|s| s.split("\n}\n").next())
             .unwrap_or("");
         assert!(
-            body.contains("should_write_marker(c, persisted_ok) && complete"),
+            body.contains("classify_attempt("),
+            "the marker decision must go through classify_attempt"
+        );
+        assert!(
+            body.contains("run_is_complete("),
             "the marker must also require a complete run"
         );
+        assert_eq!(
+            body.matches("write_daily_marker(").count(),
+            1,
+            "exactly one marker write, on the Ok arm"
+        );
+        let ok_arm = body.find("Ok(()) => {").unwrap_or(usize::MAX);
+        assert_ne!(ok_arm, usize::MAX, "an Ok arm must exist");
+        let write = body.find("write_daily_marker(").unwrap_or(0);
+        assert!(
+            write > ok_arm,
+            "the marker write must sit inside the Ok arm"
+        );
+    }
+
+    /// `classify_attempt` returns `Ok` exactly when the old marker rule held:
+    /// `should_write_marker && complete`. Checked over every outcome, both
+    /// vacuous and measured minute counts, and every persisted/complete pair.
+    #[test]
+    fn test_classify_attempt_agrees_with_the_marker_rule_everywhere() {
+        let outcomes = [
+            DhanLiveXverifyOutcome::Clean,
+            DhanLiveXverifyOutcome::Diverged,
+            DhanLiveXverifyOutcome::Partial,
+            DhanLiveXverifyOutcome::NoData,
+            DhanLiveXverifyOutcome::Blind,
+            DhanLiveXverifyOutcome::Degraded,
+        ];
+        for outcome in outcomes {
+            for minutes in [0_i64, 375] {
+                let c = comparison(outcome, minutes, 0);
+                for persisted_ok in [false, true] {
+                    for complete in [false, true] {
+                        let verdict = classify_attempt(
+                            c.is_vacuous(),
+                            c.outcome.is_measured(),
+                            persisted_ok,
+                            complete,
+                        );
+                        assert_eq!(
+                            verdict.is_ok(),
+                            should_write_marker(&c, persisted_ok) && complete,
+                            "{outcome:?} minutes={minutes} persisted={persisted_ok} \
+                             complete={complete}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_classify_attempt_names_the_first_problem() {
+        use AttemptFailure::*;
+        assert_eq!(classify_attempt(true, true, true, true), Err(Vacuous));
+        assert_eq!(classify_attempt(true, false, false, false), Err(Vacuous));
+        // Degraded with minutes compared: not vacuous, not measured.
+        assert_eq!(classify_attempt(false, false, true, true), Err(Incomplete));
+        assert_eq!(
+            classify_attempt(false, true, false, true),
+            Err(NotPersisted)
+        );
+        assert_eq!(
+            classify_attempt(false, true, false, false),
+            Err(NotPersisted)
+        );
+        assert_eq!(classify_attempt(false, true, true, false), Err(Incomplete));
+        assert_eq!(classify_attempt(false, true, true, true), Ok(()));
+    }
+
+    #[test]
+    fn test_attempt_failure_labels_are_distinct() {
+        let all = [
+            AttemptFailure::NoToken,
+            AttemptFailure::RunFailed,
+            AttemptFailure::Vacuous,
+            AttemptFailure::NotPersisted,
+            AttemptFailure::Incomplete,
+        ];
+        let mut labels: Vec<&str> = all.iter().map(|f| f.as_str()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), all.len());
+    }
+
+    #[test]
+    fn test_attempt_max_secs_is_token_wait_plus_budget_plus_margin() {
+        let token_wait = TOKEN_WAIT_POLL_SECS * u64::from(TOKEN_WAIT_MAX_POLLS);
+        assert_eq!(
+            attempt_max_secs(600),
+            token_wait + 600 + PERSIST_MARGIN_SECS
+        );
+        assert_eq!(attempt_max_secs(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn test_retry_delay_secs_bounds() {
+        let max = attempt_max_secs(600);
+        let run = XVERIFY_RUN_AT_SECS_OF_DAY_IST;
+        // A failed first attempt gets a retry.
+        assert_eq!(
+            retry_delay_secs(1, run, max),
+            Some(XVERIFY_RETRY_INTERVAL_SECS)
+        );
+        // The day's attempts are used up.
+        assert_eq!(
+            retry_delay_secs(XVERIFY_MAX_ATTEMPTS_PER_DAY, run, max),
+            None
+        );
+        assert_eq!(retry_delay_secs(u32::MAX, run, max), None);
+        // The next attempt would still be running at the evening stop.
+        let last_start = EVENING_STOP_SECS_OF_DAY_IST - XVERIFY_RETRY_INTERVAL_SECS - max;
+        assert!(retry_delay_secs(1, last_start, max).is_some());
+        assert_eq!(retry_delay_secs(1, last_start + 1, max), None);
+        // After the stop (a manual evening boot catch-up): no retry, no overflow.
+        assert_eq!(retry_delay_secs(1, EVENING_STOP_SECS_OF_DAY_IST, max), None);
+        assert_eq!(retry_delay_secs(1, u64::MAX, max), None);
+        assert_eq!(retry_delay_secs(1, run, u64::MAX), None);
+    }
+
+    /// With the default budget, a 15:41 run whose every attempt takes the
+    /// longest it can still gets all its attempts in before 17:30.
+    #[test]
+    fn test_worst_case_day_fits_every_attempt_before_the_evening_stop() {
+        let max = attempt_max_secs(600);
+        let mut now = XVERIFY_RUN_AT_SECS_OF_DAY_IST;
+        let mut attempts = 0_u32;
+        loop {
+            attempts += 1;
+            now += max;
+            assert!(now <= EVENING_STOP_SECS_OF_DAY_IST);
+            match retry_delay_secs(attempts, now, max) {
+                Some(delay) => now += delay,
+                None => break,
+            }
+        }
+        assert_eq!(attempts, XVERIFY_MAX_ATTEMPTS_PER_DAY);
+    }
+
+    /// The retry loop must use the pure bound and page only after it, and
+    /// `run_once` must never emit an alarmed source itself except the
+    /// once-per-day divergence page.
+    #[test]
+    fn test_run_day_retries_through_the_pure_bound() {
+        let src = include_str!("dhan_live_crossverify_boot.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        let body = prod
+            .split("async fn run_day(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap_or("");
+        assert!(body.contains("retry_delay_secs("));
+        assert!(body.contains("report_final_failure("));
+        assert!(body.contains("divergence_paged"));
+        let run_once = prod
+            .split("async fn run_once(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap_or("");
+        for alarmed in ["\"xverify_failed\"", "\"xverify_vacuous\""] {
+            assert!(
+                !run_once.contains(alarmed),
+                "run_once must not page {alarmed} per attempt"
+            );
+        }
+        assert!(run_once.contains("!*divergence_paged"));
+        assert!(prod.contains("run_day(&deps, &targets, today, day_start_ist_nanos)"));
     }
 
     #[test]
