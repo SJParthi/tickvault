@@ -1167,12 +1167,13 @@ pub const REBALANCE_SWAPS_REFUSED: &str = "tv_depth_rebalance_swaps_refused_tota
 /// swap that is decided and then quietly dropped is the worst outcome
 /// available, because the socket stays on a stale contract while every log
 /// line says the rebalance is working.
-pub const REBALANCE_REFUSAL_REASONS: [&str; 5] = [
+pub const REBALANCE_REFUSAL_REASONS: [&str; 6] = [
     "no_socket",
     "channel_full",
     "channel_closed",
     "not_held",
     "ack_pending",
+    "rotation_halted",
 ];
 
 /// Pre-register the counters so a session that never refuses anything still
@@ -1196,6 +1197,15 @@ pub fn pre_register_rebalance_counters() {
 /// state with no sequence number for us to detect the loss. A full channel is
 /// a refusal, counted, and retried next minute; a stalled drain is tick loss.
 fn send_swap(socket: &mut RebalanceSocket, swap: &PlannedSwap) -> bool {
+    // 2026-09-24: a swap is a close-and-redial now (Dhan has not confirmed the
+    // unsubscribe works). Once any socket has taken an 805 ("too many
+    // requests/connections"), every further rotation this session is refused:
+    // the pools keep what they hold, which is safe, while another redial could
+    // get the account blocked. See `pool_supervisor::rotation_halted`.
+    if tickvault_core::websocket::pool_supervisor::rotation_halted() {
+        metrics::counter!(REBALANCE_SWAPS_REFUSED, "reason" => "rotation_halted").increment(1);
+        return false;
+    }
     // A socket with an UNRECONCILED ack takes no second swap.
     //
     // `socket.pending` holds ONE oneshot receiver. Overwriting it drops the
@@ -1218,7 +1228,7 @@ fn send_swap(socket: &mut RebalanceSocket, swap: &PlannedSwap) -> bool {
         return false;
     }
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-    let command = LiveSubscriptionCommand::Swap {
+    let command = LiveSubscriptionCommand::RotateByRedial {
         old: swap.old,
         new: swap.new,
         ack: Some(ack_tx),
@@ -3281,11 +3291,11 @@ mod apply_tests {
         assert_eq!(apply_decision(&mut sockets, &decision), 1);
         assert!(r0.try_recv().is_err(), "socket 0 must be untouched");
         match r1.try_recv().expect("socket 1 receives") {
-            LiveSubscriptionCommand::Swap { old, new, .. } => {
+            LiveSubscriptionCommand::RotateByRedial { old, new, .. } => {
                 assert_eq!(old.security_id, 2_000);
                 assert_eq!(new.security_id, 2_001);
             }
-            other => panic!("expected a swap, got {other:?}"),
+            other => panic!("expected a rotation, got {other:?}"),
         }
     }
 
@@ -3336,8 +3346,8 @@ mod apply_tests {
         rx: &mut tokio::sync::mpsc::Receiver<LiveSubscriptionCommand>,
     ) -> tokio::sync::oneshot::Sender<SwapOutcome> {
         match rx.try_recv().expect("one command") {
-            LiveSubscriptionCommand::Swap { ack: Some(ack), .. } => ack,
-            other => panic!("expected a swap carrying an ack, got {other:?}"),
+            LiveSubscriptionCommand::RotateByRedial { ack: Some(ack), .. } => ack,
+            other => panic!("expected a rotation carrying an ack, got {other:?}"),
         }
     }
 
@@ -3576,10 +3586,10 @@ mod apply_tests {
             (&mut r3, 4_001),
         ] {
             match rx.try_recv().expect("one command") {
-                LiveSubscriptionCommand::Swap { new, .. } => {
+                LiveSubscriptionCommand::RotateByRedial { new, .. } => {
                     assert_eq!(new.security_id, expected);
                 }
-                other => panic!("expected a swap, got {other:?}"),
+                other => panic!("expected a rotation, got {other:?}"),
             }
             assert!(rx.try_recv().is_err(), "exactly one command per socket");
         }

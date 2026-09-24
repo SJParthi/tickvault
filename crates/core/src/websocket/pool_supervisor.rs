@@ -592,6 +592,15 @@ pub const SWAP_GUARD_REVERTED_METRIC: &str = "tv_dhan_ws_swap_guard_reverted_tot
 /// later is a config-free change; the counter exists now so the number is
 /// there when someone has a lever to spend.
 pub const PROBE_UNSUBSCRIBE_METRIC: &str = "tv_dhan_ws_probe_unsubscribe_total";
+/// Counter: outcomes of a depth-200 rotate-by-reconnect
+/// ([`LiveSubscriptionCommand::RotateByRedial`]). Label: `outcome`
+/// (`rotated` | `no_op` | `not_live` | `guard_refused` | `not_exactly_old` |
+/// `rotation_halted`).
+///
+/// In-process only — not EMF-selected, not alarmed (the same budget position
+/// as [`PROBE_UNSUBSCRIBE_METRIC`]). The coded `warn!` on every refusal arm is
+/// the operator surface.
+pub const ROTATE_BY_REDIAL_METRIC: &str = "tv_dhan_ws_rotate_by_redial_total";
 
 // ---------------------------------------------------------------------------
 // Disconnect classification (WS-GAP-01)
@@ -766,6 +775,11 @@ pub enum ConnEvent {
     /// ([`request_probe_close`]). Live sockets only; at most once per socket
     /// per process. Scope lock 2026-09-12, Arm B.
     ProbeCloseRequested,
+    /// The depth-200 steering loop rotated this socket's single contract by
+    /// swapping the guard and asking for a close-and-redial
+    /// ([`LiveSubscriptionCommand::RotateByRedial`]). Live sockets only.
+    /// Scope lock 2026-09-24.
+    RotationRequested,
     /// Orderly shutdown.
     ShutdownRequested,
 }
@@ -930,6 +944,23 @@ pub fn take_ghost_redial(connection_index: u8) -> bool {
     GHOST_PENDING
         .get(usize::from(connection_index))
         .is_some_and(|p| p.swap(false, std::sync::atomic::Ordering::AcqRel))
+}
+
+/// The rotate-by-reconnect circuit breaker (2026-09-24 scope lock).
+///
+/// Set the FIRST time any socket is closed by Dhan with 805 ("too many
+/// requests/connections"). From then on every depth-200 rotation is refused
+/// for the rest of the process lifetime: the steering loop holds its current
+/// contracts instead of dialling more sockets into an account the vendor has
+/// already said is over its connection budget. Never cleared in-process — a
+/// fresh boot is the only reset, which is the fail-closed direction.
+static ROTATION_HALTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether depth-200 rotate-by-reconnect is halted for this process
+/// (see [`ROTATION_HALTED`]). O(1), one relaxed-acquire load.
+#[must_use]
+pub fn rotation_halted() -> bool {
+    ROTATION_HALTED.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// A probe close is PENDING for this slot.
@@ -1223,15 +1254,22 @@ pub enum ReconnectReason {
     /// and re-dialed so the replay can be observed WITHOUT the probed
     /// instrument (scope lock, 2026-09-12, Arm B).
     ///
-    /// This is the ONLY reason that is not a fault, and it is the only one
+    /// Together with [`Self::RankedRotation`] it is one of the TWO reasons
+    /// that are not a fault, and the only two
     /// [`ReconnectReason::records_flap`] answers `false` for. See that method
     /// for why that exemption exists and why it is deliberately narrow.
     ProbeClose,
+    /// The depth-200 steering loop rotated this one-instrument socket onto a
+    /// new contract by closing it and redialling
+    /// ([`LiveSubscriptionCommand::RotateByRedial`]). The guard already names
+    /// the new contract, so the replay subscribes it and never sends the old
+    /// one. Scope lock 2026-09-24. Not a fault, so it records no flap.
+    RankedRotation,
 }
 
 impl ReconnectReason {
     /// Every reason, for pre-registration and the label-uniqueness pin.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::DialFailed,
         Self::SubscribeFailed,
         Self::Disconnected,
@@ -1239,6 +1277,7 @@ impl ReconnectReason {
         Self::IdleSilence,
         Self::GhostInstrument,
         Self::ProbeClose,
+        Self::RankedRotation,
     ];
 
     /// Stable lowercase tag for logs and metric labels.
@@ -1252,6 +1291,7 @@ impl ReconnectReason {
             Self::IdleSilence => "idle_silence",
             Self::GhostInstrument => "ghost_instrument",
             Self::ProbeClose => "probe_close",
+            Self::RankedRotation => "ranked_rotation",
         }
     }
 
@@ -1279,9 +1319,18 @@ impl ReconnectReason {
     /// attempt counter advances, the phase drops to backoff, health is
     /// reset, and the reconnect counter increments under `probe_close`, so
     /// the redial is never invisible.
+    ///
+    /// # 2026-09-24 — the second exemption
+    ///
+    /// [`Self::RankedRotation`] is the steering loop moving a depth-200 socket
+    /// onto a new contract (scope lock 2026-09-24). It is requested, capped at
+    /// one per socket per minute and five per minute pool-wide, and it is not
+    /// a symptom. Recording it would let the steering loop fill the flap
+    /// window on its own and damp the next genuine fault — finding 2 of the
+    /// 2026-09-11 (FOURTH) refusal, answered here rather than by a bypass.
     #[must_use]
     pub const fn records_flap(self) -> bool {
-        !matches!(self, Self::ProbeClose)
+        !matches!(self, Self::ProbeClose | Self::RankedRotation)
     }
 }
 
@@ -1627,6 +1676,10 @@ impl ConnectionSupervisor {
                              a healthy sibling instead of recovering this one — parking. Check \
                              for a second process holding Dhan sockets on this account."
                         );
+                        // 2026-09-24 circuit breaker: an 805 anywhere halts
+                        // depth-200 rotate-by-reconnect for the process, so
+                        // steering never dials into an over-budget account.
+                        ROTATION_HALTED.store(true, std::sync::atomic::Ordering::Release);
                         self.park(ParkReason::PoolOverflow, now)
                     }
                     DisconnectClass::Fatal => {
@@ -1797,6 +1850,27 @@ impl ConnectionSupervisor {
                      be observed without the probed instrument"
                 );
                 self.schedule_redial(ReconnectReason::ProbeClose, now)
+            }
+
+            ConnEvent::RotationRequested => {
+                // Same liveness gate as the probe arm. The caller checks the
+                // returned action: a `Continue` here means the socket was not
+                // Live, so the caller reverts the guard swap it made.
+                if self.phase != ConnPhase::Live {
+                    return SupervisorAction::Continue;
+                }
+                // Not counted in `self.reconnects` for the same reason as the
+                // probe arm; visible under `ranked_rotation` in
+                // `enter_backoff`.
+                info!(
+                    endpoint = self.slot.endpoint.as_str(),
+                    pool_index = self.slot.pool_index,
+                    source = "ranked_rotation",
+                    frames_on_this_connection = self.frames,
+                    "depth steering rotated this socket onto a new contract — closing and \
+                     redialling so the replay subscribes only the new one"
+                );
+                self.schedule_redial(ReconnectReason::RankedRotation, now)
             }
         }
     }
@@ -2854,6 +2928,35 @@ pub enum LiveSubscriptionCommand {
         /// typed `Option` for the same reason theirs are: tests that only
         /// care about the wire effect should not have to build a channel.
         ack: Option<tokio::sync::oneshot::Sender<ProbeUnsubscribeOutcome>>,
+    },
+    /// Move a depth-200 socket from `old` to `new` by RECONNECTING instead of
+    /// by an unsubscribe frame (scope lock, 2026-09-24).
+    ///
+    /// Dhan ignored the per-instrument depth unsubscribe on two consecutive
+    /// sessions, so a swap left the old contract streaming as a ghost. This
+    /// command never puts an unsubscribe on the wire: it rewrites the guard
+    /// (the reconnect replay) to name `new`, then closes the socket. The
+    /// redial subscribes ONLY what the guard names, so the vendor's view is
+    /// rebuilt from ours.
+    ///
+    /// Depth-200-only BY CONSTRUCTION, exactly like
+    /// [`Self::ProbeUnsubscribe`]: refused unless the guard holds EXACTLY ONE
+    /// instrument and it IS `old`. Refused outright once
+    /// [`rotation_halted`] reads true (any 805 this process). Refused, with
+    /// the guard restored, if the socket is not Live — a rotation must never
+    /// turn a dial in progress into a second dial.
+    ///
+    /// The close is NOT recorded as a flap (`ReconnectReason::RankedRotation`
+    /// is exempt), so a once-a-minute rotation cannot pathologise the socket's
+    /// reconnect ladder.
+    RotateByRedial {
+        /// The one instrument this socket holds now.
+        old: SubscribeInstrument,
+        /// The instrument the redial must subscribe instead.
+        new: SubscribeInstrument,
+        /// `Held` = the guard names `new` and a redial is scheduled (or the
+        /// rotation was a no-op). `NotHeld{refused}` = nothing changed.
+        ack: Option<tokio::sync::oneshot::Sender<SwapOutcome>>,
     },
 }
 
@@ -5869,6 +5972,96 @@ where
                         );
                     }
                 }
+                Ok(LiveSubscriptionCommand::RotateByRedial { old, new, ack }) => {
+                    // ROTATE BY RECONNECT (scope lock, 2026-09-24).
+                    //
+                    // Nested if/else, never `continue`, for the same reason
+                    // the probe arm above gives: the select below is what
+                    // polls `recv()` and so emits the pong.
+                    let held_one = guard.len() == 1;
+                    let holds_old = guard
+                        .batches()
+                        .flatten()
+                        .next()
+                        .copied()
+                        .is_some_and(|held| held == old);
+                    let refusal: Option<&'static str> = if rotation_halted() {
+                        Some("rotation_halted")
+                    } else if !(held_one && holds_old) {
+                        Some("not_exactly_old")
+                    } else {
+                        None
+                    };
+                    if let Some(why) = refusal {
+                        answer_swap(
+                            ack,
+                            SwapOutcome::NotHeld {
+                                reason: SwapOutcome::REASON_REFUSED,
+                            },
+                        );
+                        metrics::counter!(ROTATE_BY_REDIAL_METRIC, "outcome" => why).increment(1);
+                        warn!(
+                            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                            source = "rotate_by_redial_refused",
+                            endpoint = supervisor.slot().endpoint.as_str(),
+                            pool_index = supervisor.slot().pool_index,
+                            held = guard.len(),
+                            reason = why,
+                            "depth rotation REFUSED before any close — nothing changed on \
+                             this socket; it keeps the contract it has"
+                        );
+                    } else {
+                        match guard.try_swap(old, new) {
+                            Ok(swap) if swap == SubscribeSwap::NO_OP => {
+                                answer_swap(ack, SwapOutcome::Held);
+                                metrics::counter!(ROTATE_BY_REDIAL_METRIC, "outcome" => "no_op")
+                                    .increment(1);
+                            }
+                            Ok(_) => {
+                                let decided = supervisor
+                                    .on_event(ConnEvent::RotationRequested, Instant::now());
+                                if decided == SupervisorAction::Continue {
+                                    // Not Live: the socket is not in a state
+                                    // where a close is a rotation. Put the
+                                    // guard back so the replay is unchanged.
+                                    let _reverted = guard.undo_swap(new, old);
+                                    answer_swap(
+                                        ack,
+                                        SwapOutcome::NotHeld {
+                                            reason: SwapOutcome::REASON_REFUSED,
+                                        },
+                                    );
+                                    metrics::counter!(
+                                        ROTATE_BY_REDIAL_METRIC,
+                                        "outcome" => "not_live"
+                                    )
+                                    .increment(1);
+                                } else {
+                                    answer_swap(ack, SwapOutcome::Held);
+                                    metrics::counter!(
+                                        ROTATE_BY_REDIAL_METRIC,
+                                        "outcome" => "rotated"
+                                    )
+                                    .increment(1);
+                                    action = decided;
+                                }
+                            }
+                            Err(_) => {
+                                answer_swap(
+                                    ack,
+                                    SwapOutcome::NotHeld {
+                                        reason: SwapOutcome::REASON_REFUSED,
+                                    },
+                                );
+                                metrics::counter!(
+                                    ROTATE_BY_REDIAL_METRIC,
+                                    "outcome" => "guard_refused"
+                                )
+                                .increment(1);
+                            }
+                        }
+                    }
+                }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                     // Every sender is gone: the attach sent its one overflow
@@ -7111,7 +7304,10 @@ mod tests {
     fn every_reason_except_the_probe_close_still_records_a_flap() {
         let now = t0();
         for reason in ReconnectReason::ALL {
-            if reason == ReconnectReason::ProbeClose {
+            if matches!(
+                reason,
+                ReconnectReason::ProbeClose | ReconnectReason::RankedRotation
+            ) {
                 continue;
             }
             let mut s = sup(DhanEndpointType::Depth200, 0, now);
@@ -7144,8 +7340,9 @@ mod tests {
         );
     }
 
-    /// Exactly one reason is exempt, and it is the probe close. A future
-    /// reason must not inherit the exemption by resembling this one.
+    /// Exactly two reasons are exempt: the probe close and (2026-09-24) the
+    /// ranked depth-200 rotation. A future reason must not inherit the
+    /// exemption by resembling these.
     #[test]
     fn exactly_one_reconnect_reason_is_exempt_from_the_flap_record() {
         let exempt: Vec<&'static str> = ReconnectReason::ALL
@@ -7155,7 +7352,7 @@ mod tests {
             .collect();
         assert_eq!(
             exempt,
-            vec!["probe_close"],
+            vec!["probe_close", "ranked_rotation"],
             "the flap exemption is deliberately narrow — adding a reason to it needs its own \
              dated quote in websocket-connection-scope-lock.md"
         );
@@ -12267,6 +12464,186 @@ mod tests {
         }
         assert!(ProbeUnsubscribeOutcome::Dropped.needs_restore());
         assert!(ProbeUnsubscribeOutcome::Dropped.verdict_admissible());
+    }
+
+    // --- Rotate by reconnect (scope lock, 2026-09-24) -------------------
+
+    /// Sends one `RotateByRedial` and runs the loop to completion. Returns
+    /// the ack (if one came back) and the fake socket's final state.
+    async fn run_one_rotation(
+        endpoint: DhanEndpointType,
+        held: Vec<SubscribeInstrument>,
+        old: SubscribeInstrument,
+        new: SubscribeInstrument,
+    ) -> (Option<SwapOutcome>, FakeState) {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: one_scripted_frame(),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(endpoint, held).expect("valid guard");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(LiveSubscriptionCommand::RotateByRedial {
+            old,
+            new,
+            ack: Some(ack_tx),
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+
+        let _ = run_connection_with_commands(
+            fake(&st),
+            sup(endpoint, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            Some(rx),
+        )
+        .await;
+
+        let ack = ack_rx.try_recv().ok();
+        let state = std::mem::take(&mut *st.lock().expect("fake state"));
+        (ack, state)
+    }
+
+    /// THE HAPPY PATH, and the wire shape is the whole point: the socket is
+    /// closed and re-dialled, the replay subscribes ONLY the new contract,
+    /// and NO unsubscribe frame is ever sent. Dhan has not confirmed that it
+    /// honours a depth unsubscribe, so rotation must not depend on one.
+    #[tokio::test(start_paused = true)]
+    async fn a_rotation_redials_and_the_replay_carries_only_the_new_contract() {
+        let (ack, s) =
+            run_one_rotation(DhanEndpointType::Depth200, vec![si(1)], si(1), si(9)).await;
+        assert_eq!(ack, Some(SwapOutcome::Held));
+        assert_eq!(
+            s.connects, 2,
+            "ANTI-VACUITY: the rotation must actually re-dial, or the replay assertion \
+             below proves nothing"
+        );
+        assert_eq!(
+            s.subscribed_ids,
+            vec![1, 9],
+            "the first dial subscribes the old contract; the redial's replay must carry \
+             the new one and nothing else"
+        );
+        assert_eq!(
+            s.unsubscribes, 0,
+            "rotation must never send an unsubscribe frame"
+        );
+    }
+
+    /// Rotating onto the contract the socket already holds changes nothing:
+    /// no close, no redial, and the ack says the socket carries it.
+    #[tokio::test(start_paused = true)]
+    async fn a_rotation_onto_the_same_contract_is_a_no_op() {
+        let (ack, s) =
+            run_one_rotation(DhanEndpointType::Depth200, vec![si(1)], si(1), si(1)).await;
+        assert_eq!(ack, Some(SwapOutcome::Held));
+        assert_eq!(s.connects, 1, "a no-op must never close the socket");
+        assert_eq!(s.unsubscribes, 0);
+    }
+
+    /// A socket that holds a DIFFERENT contract from the one the planner
+    /// believed is refused before any close: redialling it would replay a
+    /// set nobody chose.
+    #[tokio::test(start_paused = true)]
+    async fn a_rotation_naming_the_wrong_old_contract_is_refused_without_a_close() {
+        let (ack, s) =
+            run_one_rotation(DhanEndpointType::Depth200, vec![si(2)], si(1), si(9)).await;
+        assert_eq!(
+            ack,
+            Some(SwapOutcome::NotHeld {
+                reason: SwapOutcome::REASON_REFUSED
+            })
+        );
+        assert_eq!(
+            s.connects, 1,
+            "a refused rotation must never close the socket"
+        );
+        assert_eq!(s.subscribed_ids, vec![2], "the replay set is unchanged");
+    }
+
+    /// Rotation is a depth-200 shape — one instrument per socket. A socket
+    /// holding more than one is refused, because closing it would drop the
+    /// others' books for the length of a redial.
+    #[tokio::test(start_paused = true)]
+    async fn a_rotation_on_a_socket_holding_two_contracts_is_refused() {
+        let (ack, s) =
+            run_one_rotation(DhanEndpointType::Depth20, vec![si(1), si(2)], si(1), si(9)).await;
+        assert_eq!(
+            ack,
+            Some(SwapOutcome::NotHeld {
+                reason: SwapOutcome::REASON_REFUSED
+            })
+        );
+        assert_eq!(s.connects, 1);
+        assert_eq!(s.unsubscribes, 0);
+    }
+
+    /// The supervisor half: a rotation request on a socket that is not Live
+    /// decides nothing. The connection loop reads that `Continue` and puts
+    /// the guard back, so the replay is never changed for a socket that did
+    /// not close.
+    #[test]
+    fn a_rotation_request_before_the_socket_is_live_decides_nothing() {
+        let mut s = sup(DhanEndpointType::Depth200, 0, t0());
+        assert_eq!(
+            s.on_event(ConnEvent::RotationRequested, t0()),
+            SupervisorAction::Continue
+        );
+    }
+
+    /// A rotation redial is a CHOSEN close, so it must not feed the flap
+    /// damper. Otherwise five rotations a minute would read as a flapping
+    /// socket and push the next genuine fault onto the slow ladder.
+    #[test]
+    fn a_ranked_rotation_does_not_record_a_flap() {
+        assert!(!ReconnectReason::RankedRotation.records_flap());
+        assert_eq!(ReconnectReason::RankedRotation.as_str(), "ranked_rotation");
+    }
+
+    /// The 805 breaker, pinned by source because the flag is process-global:
+    /// setting it in a test would break every other rotation test running in
+    /// parallel. The PoolOverflow arm must set it, and the rotation arm must
+    /// read it before doing anything else.
+    #[test]
+    fn an_805_halts_every_later_rotation() {
+        let src = include_str!("pool_supervisor.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("production half");
+        let overflow = prod
+            .find("ROTATION_HALTED.store(true")
+            .expect("the PoolOverflow arm must latch the breaker");
+        let park = prod[overflow..]
+            .find("self.park(")
+            .expect("the latch must sit before the park it guards");
+        assert!(
+            prod[overflow + park..].starts_with("self.park(ParkReason::PoolOverflow"),
+            "the breaker must be latched in the 805 arm, immediately before its park"
+        );
+        let rotate = prod
+            .find("Ok(LiveSubscriptionCommand::RotateByRedial")
+            .expect("rotation arm");
+        let arm = &prod[rotate..];
+        let halted = arm
+            .find("rotation_halted()")
+            .expect("the arm reads the breaker");
+        let swap = arm.find("try_swap(").expect("the arm swaps the guard");
+        assert!(
+            halted < swap,
+            "the breaker must be read BEFORE the guard is touched"
+        );
+    }
+
+    #[test]
+    fn test_rotation_halted_reads_the_process_latch() {
+        // Read-only on purpose: the latch is process-global, and setting it
+        // here would refuse every rotation test running in parallel.
+        assert_eq!(
+            rotation_halted(),
+            ROTATION_HALTED.load(std::sync::atomic::Ordering::Acquire)
+        );
     }
 
     // --- Arm B: the probe-close register ------------------------------
