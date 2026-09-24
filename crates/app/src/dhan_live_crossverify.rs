@@ -1751,12 +1751,6 @@ impl RestPacer {
         }
     }
 
-    /// Current gap in milliseconds.
-    #[must_use]
-    pub const fn gap_ms(&self) -> u64 {
-        self.gap_ms
-    }
-
     /// Sleep until at least the current gap has passed since the last request.
     pub async fn wait(&mut self) {
         if let Some(last) = self.last {
@@ -2215,7 +2209,7 @@ mod tests {
     /// The wire estimate must be an UPPER bound, or the budget it feeds waves
     /// through queries the server will refuse.
     #[test]
-    fn the_wire_estimate_never_under_counts_the_encoded_form() {
+    fn url_query_wire_len_never_under_counts_the_encoded_form() {
         // Alphanumerics pass through untouched.
         assert_eq!(url_query_wire_len("abc123"), 6);
         // Everything else is assumed to become a 3-byte escape.
@@ -3389,7 +3383,7 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[test]
-    fn every_failure_kind_has_a_distinct_stable_label() {
+    fn classify_http_status_and_every_failure_kind_has_a_distinct_stable_label() {
         let all = XverifyFetchFailureKind::all();
         let labels: std::collections::BTreeSet<&str> = all.iter().map(|k| k.as_str()).collect();
         assert_eq!(
@@ -3703,7 +3697,17 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_target_list_does_not_divide_by_zero() {
+    fn fetched_at_ist_nanos_now_is_utc_now_shifted_to_ist() {
+        let before = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let stamped = fetched_at_ist_nanos_now();
+        let after = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let offset = tickvault_common::constants::IST_UTC_OFFSET_NANOS;
+        assert!(stamped >= before.saturating_add(offset));
+        assert!(stamped <= after.saturating_add(offset));
+    }
+
+    #[test]
+    fn rotation_start_with_an_empty_target_list_does_not_divide_by_zero() {
         // The only loss detector in the system must not panic on a universe
         // that failed to resolve. A wrong start is survivable; a panic here
         // takes the day's verification with it.
@@ -3819,7 +3823,7 @@ mod tests {
     }
 
     #[test]
-    fn an_instrument_never_requested_produces_no_findings_at_all() {
+    fn compare_day_in_scope_ignores_an_instrument_never_requested() {
         // THE DEFECT, in one assertion. Live carries contracts we never fetch;
         // calling their minutes "missing from the vendor" is a scope mismatch
         // dressed as data loss.

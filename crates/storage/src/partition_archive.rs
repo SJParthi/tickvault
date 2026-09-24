@@ -1558,6 +1558,7 @@ impl PartitionArchiver {
     /// because losing the box to a full disk costs more than archiving an
     /// unverified day (`no-rest-except-live-feed-2026-06-27.md` §12.15.2).
     #[must_use]
+    // TEST-EXEMPT: builder setter that stores the gate; the hold it drives is tested through crossverify_hold_decision
     pub fn with_verified_day_gate(mut self, gate: VerifiedDayGate) -> Self {
         self.verified_day_gate = Some(gate);
         self
@@ -4404,7 +4405,7 @@ mod tests {
     }
 
     #[test]
-    fn a_verified_day_proceeds() {
+    fn crossverify_hold_decision_lets_a_verified_day_proceed() {
         let today = d(2026, 9, 24);
         let out = crossverify_hold_decision("2026-09-23", today, |_| true);
         assert_eq!(out, CrossverifyHold::Proceed);

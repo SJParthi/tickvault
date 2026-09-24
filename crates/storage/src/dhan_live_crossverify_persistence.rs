@@ -1324,7 +1324,7 @@ mod tests {
     /// no-op, because on the live path reaching a flush per row would turn one
     /// round trip into hundreds of thousands.
     #[test]
-    fn the_buffer_is_bounded_by_bytes_not_by_row_count() {
+    fn flush_if_large_bounds_the_buffer_by_bytes_not_row_count() {
         let mut w = DhanLiveXverifyAuditWriter::for_test();
         // Well under the threshold: nothing should be offered for flush.
         for _ in 0..50 {
@@ -1568,7 +1568,17 @@ mod tests {
     }
 
     #[test]
-    fn the_tape_designated_timestamp_is_the_minute_not_the_run() {
+    fn dhan_rest_1m_tape_create_ddl_is_idempotent_day_partitioned_and_deduped() {
+        let ddl = dhan_rest_1m_tape_create_ddl();
+        assert!(ddl.starts_with("CREATE TABLE IF NOT EXISTS "));
+        assert!(ddl.contains(DHAN_REST_1M_TAPE_TABLE));
+        assert!(ddl.contains("timestamp(ts) PARTITION BY DAY"));
+        assert!(ddl.contains(&format!("DEDUP UPSERT KEYS({DEDUP_KEY_DHAN_REST_1M_TAPE})")));
+        assert!(!ddl.to_ascii_uppercase().contains("DROP"));
+    }
+
+    #[test]
+    fn append_rest_tape_stamps_the_minute_not_the_run() {
         // If `ts` were the run time, every candle of the day would file under
         // one instant and "what was the 09:16 price" becomes unanswerable —
         // which is the question this table was added to answer.

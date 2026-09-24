@@ -203,6 +203,7 @@ fn current_jwt() -> Option<SecretString> {
 }
 
 /// Spawns the daily cross-verification task for the subscribed universe.
+// TEST-EXEMPT: spawns a tokio task that waits for 15:41 IST and calls the vendor; its pure decisions (targets, schedule, catch-up, marker, divergence) are tested above and its emit contract by test_every_xverify_alarm_source_has_a_live_error_emit
 pub fn spawn_dhan_live_crossverify(
     deps: CrossverifyBootDeps,
     main_feed: &[SubscribeInstrument],
@@ -485,7 +486,7 @@ mod tests {
     }
 
     #[test]
-    fn test_index_and_equity_are_targeted_fno_is_skipped() {
+    fn test_crossverify_targets_with_skipped_targets_index_and_equity_not_fno() {
         let feed = [
             instrument(13, ExchangeSegment::IdxI),
             instrument(2885, ExchangeSegment::NseEquity),
@@ -503,6 +504,31 @@ mod tests {
     }
 
     #[test]
+    fn test_dhan_intraday_instrument_for_maps_only_index_and_equity() {
+        assert_eq!(
+            dhan_intraday_instrument_for(ExchangeSegment::IdxI),
+            Some("INDEX")
+        );
+        assert_eq!(
+            dhan_intraday_instrument_for(ExchangeSegment::NseEquity),
+            Some("EQUITY")
+        );
+        assert_eq!(
+            dhan_intraday_instrument_for(ExchangeSegment::BseEquity),
+            Some("EQUITY")
+        );
+        for skipped in [
+            ExchangeSegment::NseFno,
+            ExchangeSegment::BseFno,
+            ExchangeSegment::NseCurrency,
+            ExchangeSegment::BseCurrency,
+            ExchangeSegment::McxComm,
+        ] {
+            assert_eq!(dhan_intraday_instrument_for(skipped), None);
+        }
+    }
+
+    #[test]
     fn test_out_of_range_security_id_is_skipped_not_zeroed() {
         let feed = [instrument(u64::MAX, ExchangeSegment::IdxI)];
         let (targets, skipped) = crossverify_targets_with_skipped(&feed);
@@ -511,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn test_secs_until_next_run_before_and_after() {
+    fn test_secs_until_next_run_ist_before_and_after() {
         let run = XVERIFY_RUN_AT_SECS_OF_DAY_IST;
         assert_eq!(secs_until_next_run_ist(run - 60), 60);
         assert_eq!(secs_until_next_run_ist(run), SECS_PER_DAY);
@@ -520,12 +546,12 @@ mod tests {
     }
 
     #[test]
-    fn test_run_time_is_after_the_session_close() {
+    fn test_run_at_ist_hhmm_is_after_the_session_close() {
         assert_eq!(run_at_ist_hhmm(), "15:41");
     }
 
     #[test]
-    fn test_catch_up_only_after_run_time_and_without_marker() {
+    fn test_should_catch_up_only_after_run_time_and_without_marker() {
         let run = XVERIFY_RUN_AT_SECS_OF_DAY_IST;
         assert!(!should_catch_up(run - 1, false));
         assert!(should_catch_up(run, false));
@@ -534,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn test_marker_needs_a_measured_persisted_comparison() {
+    fn test_should_write_marker_needs_a_measured_persisted_comparison() {
         let clean = comparison(DhanLiveXverifyOutcome::Clean, 375, 0);
         assert!(should_write_marker(&clean, true));
         assert!(!should_write_marker(&clean, false));
@@ -557,7 +583,7 @@ mod tests {
     }
 
     #[test]
-    fn test_divergence_page_needs_more_than_half_the_price_fields() {
+    fn test_is_catastrophic_divergence_needs_more_than_half_the_price_fields() {
         // 100 minutes -> 400 price fields.
         assert!(!is_catastrophic_divergence(&comparison(
             DhanLiveXverifyOutcome::Diverged,
