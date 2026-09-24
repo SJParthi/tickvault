@@ -75,6 +75,22 @@ nothing else is deleted. No schema change, no config change, no data migration.
 - Existing: `tv_depth_first_packet_latency_ms`, `tv_dhan_feed_depth_total`,
   `REBALANCE_SWAPS_SENT/REFUSED`.
 
+## Per-Item Guarantee Matrix
+
+See `per-wave-guarantee-matrix.md`. All 15 rows of the 100% Guarantee Matrix
+and all 7 rows of the Resilience Demand Matrix apply to every item in this
+plan. Item-specific evidence:
+
+| Row | This plan |
+|---|---|
+| Testing | depth20_static (16), name-board wiring guard inverted (9), apply properties (11), core rotation tests |
+| Code checks | plan-gate, banned-pattern, secret, pub-fn test, pub-fn wiring: all PASS |
+| Performance | no hot-path change; depth-20 is dialled once, depth-200 swaps stay capped at 5/min |
+| Zero ticks lost | no new drop path; WAL → ring → spill → DLQ unchanged |
+| WS disconnects | a rotation is a deliberate redial, exempt from the flap count; the first 805 latches `ROTATION_HALTED` |
+| Uniqueness | the depth sets are deduped on `(security_id, segment)` |
+| Honest limit | NSE_EQ depth delivery and Dhan's reconnect cap are UNVERIFIED-LIVE; the first session is the measurement |
+
 ## Plan Items
 
 - [x] Rule-file section 2026-09-24
