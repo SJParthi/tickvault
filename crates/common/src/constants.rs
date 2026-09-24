@@ -1596,6 +1596,12 @@ pub const DHAN_RENEW_TOKEN_PATH: &str = "/RenewToken";
 /// Endpoint: POST <https://api.dhan.co/v2/charts/historical>
 pub const DHAN_CHARTS_HISTORICAL_PATH: &str = "/charts/historical";
 
+/// Path for intraday minute candle data (appended to rest_api_base_url).
+/// Endpoint: POST <https://api.dhan.co/v2/charts/intraday>
+/// RESTORED 2026-09-24 (no-rest-except-live-feed §12.15) for the daily
+/// post-market 1-minute cross-verification ONLY — never a per-minute pull.
+pub const DHAN_CHARTS_INTRADAY_PATH: &str = "/charts/intraday";
+
 // ---------------------------------------------------------------------------
 // Authentication — User Profile & IP Management Endpoints
 // ---------------------------------------------------------------------------
@@ -4178,6 +4184,7 @@ mod tests {
             DHAN_GENERATE_TOKEN_PATH,
             DHAN_RENEW_TOKEN_PATH,
             DHAN_CHARTS_HISTORICAL_PATH,
+            DHAN_CHARTS_INTRADAY_PATH,
             DHAN_USER_PROFILE_PATH,
             DHAN_SET_IP_PATH,
             DHAN_MODIFY_IP_PATH,

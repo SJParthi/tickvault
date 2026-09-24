@@ -120,6 +120,10 @@ pub mod dhan_feed_stack;
 /// Dhan live-WS retirement (the spot-1m legs must outlive the cross-verify
 /// module the Phase C deletion PRs remove). Pure move, zero behavior change.
 pub mod dhan_intraday_parse;
+/// Daily post-market 1-minute cross-verification: our `candles_1m`
+/// (feed=dhan) against Dhan's own `charts/intraday` tape, integer paise
+/// (no-rest-except-live-feed §12.15, 2026-09-24).
+pub mod dhan_live_crossverify;
 pub mod dhan_lifecycle;
 pub mod dhan_live_universe;
 /// 🔷 DHAN order-update PAPER-MODE push consumer (operator directive

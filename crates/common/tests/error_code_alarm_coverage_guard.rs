@@ -305,13 +305,14 @@ const LOG_SINK_ONLY_EXEMPT: &[&str] = &[
     "ORDER-READY-01",
     "ORPHAN-POSITION-01",
     "PREVCLOSE-03",
-    // DHAN-LIVE-XVERIFY-01 RETIRED 2026-09-16 — the 15:41 live-vs-REST
-    // comparison was removed with the per-minute REST legs, so the code has
-    // no emit site and no variant. Its exemption said an alarm "needs a dated
-    // operator row"; what it got instead was the subject's deletion. The loss
-    // is real and is recorded at no-rest-except-live-feed-2026-06-27.md
-    // §12.10.4: nothing in this workspace now compares captured market data
-    // against any external record.
+    // DHAN-LIVE-XVERIFY-01 RESTORED 2026-09-24 (no-rest-except-live-feed-
+    // 2026-06-27.md §12.15) as LOG-SINK-ONLY, exactly as it was before its
+    // 2026-09-16 retirement. The verdicts that page are the three
+    // ws-gap-03-xverify-{vacuous,failed,diverged} filters (noise lock §2.5);
+    // this code marks a degraded RUN (client build, query or flush failure),
+    // whose day then stays unverified and holds its S3 archive — the hold is
+    // what the operator sees, so a second page for the same run is not added.
+    "DHAN-LIVE-XVERIFY-01",
     "RAMSTORE-01",
     "RESILIENCE-01",
     "RESILIENCE-03",

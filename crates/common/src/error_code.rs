@@ -738,11 +738,21 @@ pub enum ErrorCode {
     /// (`TICKVAULT_SCOREBOARD_NOW`) backfill the day. Severity::Medium,
     /// auto-triage-safe.
     Scoreboard01AggregationDegraded,
-    // DHAN-LIVE-XVERIFY-01 and SPOT1M-01 RETIRED 2026-09-16: the 15:41
-    // cross-verification and the per-minute spot-1m REST fetch were both
-    // removed under the operator's sockets-only directive, so neither code
-    // had an emit site left. SPOT1M-02 below SURVIVES — its remaining
-    // emitter is the per-contract 1m leg, not the spot leg.
+    /// DHAN-LIVE-XVERIFY-01 — the daily Dhan live-vs-REST cross-verification
+    /// run degraded: an HTTP client build failure, an `/exec` query failure or
+    /// truncation, an audit-flush failure, or a run past its wall-clock
+    /// budget. Read-only over `candles_1m` and the REST tape; writes only its
+    /// own audit tables, so the live feed and tick capture are NEVER affected.
+    ///
+    /// Retired 2026-09-16 with the sockets-only directive, RESTORED 2026-09-24
+    /// (`no-rest-except-live-feed-2026-06-27.md` §12.15): it is the only
+    /// external check on the captured candles, and the daily S3 archive now
+    /// waits for its verdict. A degraded or blind run never renders as a
+    /// pass. Severity::High, auto-triage-safe.
+    DhanLiveXverify01RunDegraded,
+    // SPOT1M-01 RETIRED 2026-09-16 with the per-minute spot-1m REST fetch.
+    // SPOT1M-02 below SURVIVES — its remaining emitter is the per-contract
+    // 1m leg, not the spot leg.
     /// SPOT1M-02 (per-minute REST pipeline PR-2, 2026-07-12) — a per-minute
     /// REST persist leg failed (ensure-DDL non-2xx / unreachable, ILP append
     /// rejected, or the ILP-over-HTTP flush refused by the server ACK).
@@ -1151,6 +1161,7 @@ impl ErrorCode {
             Self::Futidx02CrossFeedExpiryMismatch => "FUTIDX-02",
             // Dual-feed scoreboard PR-A (2026-07-10)
             Self::Scoreboard01AggregationDegraded => "SCOREBOARD-01",
+            Self::DhanLiveXverify01RunDegraded => "DHAN-LIVE-XVERIFY-01",
             // Per-minute REST pipeline (operator grant 2026-07-12).
             Self::Spot1m02PersistFailed => "SPOT1M-02",
             // Daily timeframe-consistency verifier (operator 2026-07-13)
@@ -1400,6 +1411,9 @@ impl ErrorCode {
             // aggregate degraded; feeds/capture/trading unaffected, the
             // DEDUP-idempotent re-run backfills. Medium.
             | Self::Scoreboard01AggregationDegraded => Severity::Medium,
+            // DHAN-LIVE-XVERIFY-01 — the only external check on the captured
+            // candles ran degraded or blind. Loud (High), never a halt.
+            Self::DhanLiveXverify01RunDegraded => Severity::High,
             // FEED-GAP-01 (2026-07-14): gap-episode forensics degraded —
             // annotation-only side record; capture/recovery unaffected. Medium.
             Self::FeedGap01EpisodeDegraded => Severity::Medium,
@@ -1613,6 +1627,9 @@ impl ErrorCode {
             }
             Self::Scoreboard01AggregationDegraded => {
                 "docs/error-runbooks/dual-feed-scoreboard-error-codes.md"
+            }
+            Self::DhanLiveXverify01RunDegraded => {
+                "docs/error-runbooks/dhan-live-crossverify-error-codes.md"
             }
             // Per-minute REST pipeline (operator grant 2026-07-12). Only the
             // contract-1m leg still emits in this family; see SPOT1M-02.
@@ -1837,6 +1854,7 @@ impl ErrorCode {
             Self::Futidx02CrossFeedExpiryMismatch,
             // Dual-feed scoreboard PR-A (2026-07-10)
             Self::Scoreboard01AggregationDegraded,
+            Self::DhanLiveXverify01RunDegraded,
             // Per-minute REST pipeline (operator grant 2026-07-12). SPOT1M-02
             // is the sole survivor — see its docblock.
             Self::Spot1m02PersistFailed,
