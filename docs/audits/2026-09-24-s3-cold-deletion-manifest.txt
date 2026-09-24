@@ -1,0 +1,17 @@
+Deleted 2026-09-24 by operator instruction (Quote 26, .claude/rules/project/daily-universe-scope-expansion-2026-05-27.md).
+13 objects, 90,634,524 bytes: questdb-partitions (2026-09-23 candles_1s/3s/5s, ticks T09/T10) and deploys/. No SEBI table was ever archived in this bucket.
+Rows in partition_archive_audit that point at the keys below refer to files that no longer exist.
+
+2026-09-24 10:59:11    1249416 deploys/08a8fe73df2988205b55c670537453f6e346cf04/smoke_test
+2026-09-24 10:59:06   21101992 deploys/08a8fe73df2988205b55c670537453f6e346cf04/tickvault
+2026-09-23 18:15:17    1249416 deploys/6559dc540fac9303c0fd0927df33529acd6fcb89/smoke_test
+2026-09-23 18:15:12   21101920 deploys/6559dc540fac9303c0fd0927df33529acd6fcb89/tickvault
+2026-09-23 15:04:12    1249416 deploys/6b7c484896d8e3fe7ec30241ca7bffa7b7b5a1f7/smoke_test
+2026-09-23 15:04:07   21101920 deploys/6b7c484896d8e3fe7ec30241ca7bffa7b7b5a1f7/tickvault
+2026-09-24 13:01:15    1249416 deploys/d52008c53b63a3e0f25c96cab69b7fac71b5df64/smoke_test
+2026-09-24 13:01:09   21167992 deploys/d52008c53b63a3e0f25c96cab69b7fac71b5df64/tickvault
+2026-09-24 10:11:03     386954 questdb-partitions/candles_1s/2026-09-23.csv.gz
+2026-09-24 10:11:03     377838 questdb-partitions/candles_3s/2026-09-23.csv.gz
+2026-09-24 10:11:04     369716 questdb-partitions/candles_5s/2026-09-23.csv.gz
+2026-09-24 10:11:04      11470 questdb-partitions/ticks/2026-09-23T09.csv.gz
+2026-09-24 10:11:04      17058 questdb-partitions/ticks/2026-09-23T10.csv.gz
