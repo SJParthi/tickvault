@@ -12636,6 +12636,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_rotation_halted_reads_the_process_latch() {
+        // Read-only on purpose: the latch is process-global, and setting it
+        // here would refuse every rotation test running in parallel.
+        assert_eq!(
+            rotation_halted(),
+            ROTATION_HALTED.load(std::sync::atomic::Ordering::Acquire)
+        );
+    }
+
     // --- Arm B: the probe-close register ------------------------------
 
     /// ONE probe close per socket per session, and the latch is never
