@@ -1396,3 +1396,43 @@ replayed seal arrives with both at `0`, which is already the documented
 rather than claiming a zero delay. No format bump, no stride change, no new
 flag. The candles table's own row width DOES grow by six columns; that is a
 disk figure and it is not measured here.
+
+---
+
+## COST NOTE 2026-09-24 — `tv_dhan_ws_lag_max_ms`, the worst feed delay per minute (+~$0.30/mo, NO alarm)
+
+**Authorization:** operator, 2026-09-24, verbatim: *"i dont want any agps ir any
+issues dude can you coevr all tehse dude okay?Always achieve O(1) everywhere."*
+Given in direct response to the Feed Watchtower report, whose first open row was
+*"Feed delay is not in CloudWatch — it is on the box only."* Recorded here before
+the selector change, per the rule-file-first law.
+
+| Item | Cost |
+|---|---:|
+| `tv_dhan_ws_lag_max_ms` EMF name | $0.30 |
+| Alarm | **none** — $0.00 |
+| **Total** | **~$0.30/mo** |
+
+**Why one gauge, not the histogram.** The per-socket histogram
+`tv_dhan_ws_lag_ms` has 16 connection labels; the EMF processor folds labels
+to `{host}` by summing, so shipping it would publish a meaningless sum of
+sixteen distributions. One window-maximum answers the question an operator asks
+— "was any socket slow in the last minute?" — for one name.
+
+**Budget position, read live 2026-09-24, not inherited.** September: actual
+**$149.68**, forecast **$192.09**, limit **$225** (the one-month Quote 23
+ceiling). October returns to **$150**, enforced in code by
+`effective_budget_kill_usd`, and the October projection sits at about that
+line. This note adds 0.2% of it.
+
+**§2.3n's lever rule is NOT satisfied, and this note does not pretend
+otherwise.** No lever is taken. That is also why NO alarm ships: an alarm is
+the part that needs a lever, and the gauge alone is visible on the dashboard at
+a third of the price. Paging on it is a separate decision.
+
+**What is NOT claimed.** That the number is the network's delay: it is receipt
+time minus the vendor's last-trade stamp, whole-second resolution, so it
+includes the ±1 s truncation floor. For about the first minute after a restart
+it can show a quiet contract's age rather than a delay — the first packet of a
+contract never seen before carries its old trade time. Repeats are excluded
+(2026-09-23 FIFTH), and WAL-replayed frames are excluded.

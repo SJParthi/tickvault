@@ -204,10 +204,10 @@ const KNOWN_GAUGES: &[&str] = &[
     "tv_questdb_wal_apply_lag_max",
     "tv_rest_1m_fire_heartbeat",
     // ADDED 2026-09-05 with the ring-dwell alarm (noise-lock §2.3u). Emitted as
-    // `metrics::gauge!(RING_DWELL_MAX_MS_GAUGE).set(take_ring_dwell_max_ms())`
-    // in `dhan_feed_stack.rs` — a per-window MAXIMUM that is published verbatim
-    // and reset after each publish, so there is no delta and no dropped first
-    // sample. Same class as `tv_depth_rebalance_age_secs` above.
+    // `metrics::gauge!(RING_DWELL_MAX_MS_GAUGE)` in `dhan_feed_stack.rs`,
+    // through the one-minute peak hold (2026-09-24, §2.3u addendum) — a
+    // per-window MAXIMUM that is published verbatim, so there is no delta and
+    // no dropped first sample. Same class as `tv_depth_rebalance_age_secs`.
     "tv_dhan_feed_ring_dwell_max_ms",
 ];
 

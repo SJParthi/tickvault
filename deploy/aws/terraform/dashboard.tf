@@ -530,7 +530,10 @@ resource "aws_cloudwatch_dashboard" "operator" {
           region = local.dash_region
           view   = "timeSeries"
           metrics = [
-            [local.dash_namespace, "tv_dhan_feed_ring_dwell_max_ms", { label = "worst ring wait", stat = "Maximum" }]
+            [local.dash_namespace, "tv_dhan_feed_ring_dwell_max_ms", { label = "worst ring wait", stat = "Maximum" }],
+            # 2026-09-24: worst exchange-to-us delay of a new trade, same
+            # one-minute peak hold. Unalarmed (noise lock §2.3u addendum).
+            [local.dash_namespace, "tv_dhan_ws_lag_max_ms", { label = "worst feed delay", stat = "Maximum" }]
           ]
           period = 300
         }

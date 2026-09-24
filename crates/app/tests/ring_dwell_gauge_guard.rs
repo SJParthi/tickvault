@@ -145,10 +145,17 @@ fn the_gauge_is_published_and_the_recorder_is_wired_into_the_drain() {
          call the whole signal is dead code with a gauge in front of it"
     );
     assert!(
-        production
-            .contains("metrics::gauge!(RING_DWELL_MAX_MS_GAUGE).set(take_ring_dwell_max_ms())"),
+        production.contains("metrics::gauge!(RING_DWELL_MAX_MS_GAUGE)")
+            && production.contains("RING_DWELL_PEAK.publish(take_ring_dwell_max_ms(), now_ms)"),
         "the gauge must be SET on the periodic publish; a maximum that is \
          collected and never written is the same defect one layer up"
+    );
+    // 2026-09-24: and it must go through the one-minute peak hold. A raw
+    // reset-on-read value published every ~500 ms and scraped once a minute
+    // shows the alarm about one second in sixty.
+    assert!(
+        !production.contains(".set(take_ring_dwell_max_ms())"),
+        "the ring-dwell gauge must be published through RING_DWELL_PEAK, never raw"
     );
     // It rides the existing periodic publish. A dedicated timer would be a new
     // `select!` arm on the drain loop — a new way to starve the very loop this
