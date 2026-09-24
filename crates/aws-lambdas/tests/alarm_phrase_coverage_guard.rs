@@ -284,8 +284,15 @@ fn guard_self_test_parser_bites() {
     // does a coded alarm vanishing from terraform without this floor being
     // re-derived. Adding an alarm never fails it, so the ratchet only ever
     // costs a deliberate edit in the direction that deserves one.
+    //
+    // ⚠ FLOOR RAISED 18 -> 21 on 2026-09-24. The three `ws-gap-03-xverify-*`
+    // verdicts came back with the restored 1-minute cross-verification
+    // (`no-rest-except-live-feed-2026-06-27.md` §12.15,
+    // `dhan-rest-only-noise-lock-2026-07-14.md` §2.5), and their three
+    // ALARM_PHRASES rows came back in the same change. The four REST-leg
+    // filters stay deleted. 18 + 3 = 21, measured.
     assert!(
-        keys.len() >= 18,
+        keys.len() >= 21,
         "error_code_alerts key extraction found only {} keys",
         keys.len()
     );

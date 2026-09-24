@@ -14302,6 +14302,16 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
 // the floor site above, and `no-rest-except-live-feed-2026-06-27.md`
 // §12.10.3/§12.10.4.
 //
+// ⚠ RESTORED 2026-09-24 — but NOT here, and NOT as a floor. The operator
+// ordered the 1-minute check back ("use the 1 min cross verification alone …
+// then go ahead with this S3 also", §12.15 of the REST lock). It now lives
+// in `dhan_live_crossverify.rs` (the pure comparator) and
+// `dhan_live_crossverify_boot.rs` (the once-a-day task), spawned from
+// `main.rs` as its OWN task. The live lane never waits for it: the refusal
+// floor stays removed, exactly as §12.15.1 requires. What it gates instead
+// is the DAILY S3 archive leg, through its day marker. The three writers
+// above are back; the tables were never dropped.
+//
 // The three time helpers that used to sit at the end of this section —
 // `is_within_market_hours_ist`, `now_ist_secs_of_day` and
 // `ist_secs_of_day_from_millis` — are NOT part of the comparator and survive
@@ -17358,6 +17368,13 @@ mod tests {
     // guarded no longer exists: §12.10.4 records that this workspace now has
     // ZERO mechanism comparing captured market data against any external
     // record, and that is a LOSS on the record, not a gap a test can close.
+    //
+    // ⚠ RESTORED 2026-09-24 (REST lock §12.15, noise lock §2.5). The check is
+    // back, and so are the three `xverify` alarms. The tests that pin it now
+    // live next to the code, in `dhan_live_crossverify.rs` and
+    // `dhan_live_crossverify_boot.rs`: the `$.source` contract, the
+    // measured/vacuous counter split, and the chunked persist. They are not
+    // re-added here because nothing in this file emits them any more.
 
     #[test]
     fn test_pre_open_tick_is_written_even_though_it_opens_no_candle() {
@@ -24033,34 +24050,15 @@ mod late_seed_tests {
         );
     }
 
-    #[test]
-    fn the_fetched_vendor_tape_is_persisted_not_discarded() {
-        // OPERATOR INSTRUCTION 2026-08-26. Until today this comparison
-        // fetched Dhan's tape, judged it in memory, and threw it away — only
-        // the cells that DISAGREED survived. So "what did Dhan say for this
-        // instrument at 09:16?" was unanswerable unless that minute happened
-        // to diverge, and re-verifying meant ~868 more rate-limited requests.
-        //
-        // A source scan rather than a runtime assertion because the persist
-        // sits behind a live QuestDB connection.
-        let src = include_str!("dhan_feed_stack.rs");
-        let marker = "fn persist_xverify_report";
-        let idx = src.find(marker).expect("the persist fn must exist");
-        let body = &src[idx..];
-        let end = body.find("\n}\n").unwrap_or(body.len());
-        let body = &body[..end];
-
-        assert!(
-            body.contains("append_rest_tape"),
-            "the fetched vendor tape must be written, or this reverts to \
-             fetch-compare-discard and the raw record exists nowhere"
-        );
-        assert!(
-            body.contains("tape_errors"),
-            "a partial tape write must be counted — an audit table that \
-             silently drops rows is worse than one honestly incomplete"
-        );
-    }
+    // ---- `the_fetched_vendor_tape_is_persisted_not_discarded`: MOVED
+    //      2026-09-24 with the restored 1-minute cross-verification ----
+    //
+    // The persist step now lives in `dhan_live_crossverify_boot.rs`
+    // (`persist_report`), so the guard moved with it:
+    // `dhan_live_crossverify_boot::tests::
+    // test_the_fetched_vendor_tape_is_persisted_not_discarded`. The operator
+    // instruction it pins (2026-08-26: the fetched vendor tape is written,
+    // never discarded after the compare) is unchanged.
 
     // ---- `the_tape_is_stamped_per_target_not_once_per_run`: REMOVED
     //      2026-09-16 with the comparator ----

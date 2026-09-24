@@ -105,8 +105,10 @@
 #   what each dated change added or retired, and it is kept for that. It is NOT
 #   the current shape, and has not been since 2026-09-16. Counted in the file
 #   rather than carried forward: 5 standalone `aws_cloudwatch_log_metric_filter`
-#   resources, 4 standalone `aws_cloudwatch_metric_alarm` resources, and 18 live
-#   `error_code_alerts` map entries. Re-count with:
+#   resources, 4 standalone `aws_cloudwatch_metric_alarm` resources, and 21 live
+#   `error_code_alerts` map entries (was 18 on 2026-09-17; +3 on 2026-09-24,
+#   when the three `ws-gap-03-xverify-*` verdicts came back with the restored
+#   1-minute cross-verification — noise-lock §2.5). Re-count with:
 #     grep -c '^resource "aws_cloudwatch_log_metric_filter"' <this file>
 #     grep -c '^resource "aws_cloudwatch_metric_alarm"'      <this file>
 #   A count in a comment is a claim, and a claim carries a date — this repo has
@@ -725,44 +727,58 @@ locals {
       desc        = "WS-GAP-03 universe collapse: the DHAN live feed fell back to the 4-instrument index universe. Either today's master exceeded the authorized capacity envelope, or it produced no usable widening (artifact unreadable, absent or empty). The session is running 4 instruments instead of the authorized ~24,600 - a 99.98% loss of market data - and nothing else reports it: the 4 indices still tick, so the no-ticks alarm stays green and every loss counter reads a healthy zero. Triage from the same log line: capacity vs master_entries at/over the cap means the universe outgrew 25,000 (a vendor option-chain expansion is the usual cause); master_entries 0 means the artifact did not load. Runbook: .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md"
     }
 
-    # ── RETIRED 2026-09-16: the three cross-verify filters ────────────────
+    # ── RESTORED 2026-09-24: the three cross-verify filters ───────────────
     #
-    # `ws-gap-03-xverify-vacuous`, `-failed` and `-diverged` lived here. All
-    # three were CloudWatch metric filters keyed on `$.source`, matching the
-    # three verdicts of the 15:41 live-vs-official cross-verification.
+    # Retired 2026-09-16 with the comparator (sockets-only narrowing,
+    # `no-rest-except-live-feed-2026-06-27.md` §12.10). RESTORED 2026-09-24
+    # with it, on the operator's instruction recorded verbatim in §12.15:
+    # "Bro use the 1 min cross verification alone ... then go ahead with this
+    # S3 also dude okay?". The dated noise-lock row is
+    # `dhan-rest-only-noise-lock-2026-07-14.md` §2.5.
     #
-    # That comparison was REMOVED on 2026-09-16 under the operator's
-    # sockets-only directive — "Bro just remove per minute price falls and
-    # 3.41 pm accuracy check alone dude okay", the narrowing quote recorded in
-    # `no-rest-except-live-feed-2026-06-27.md` §12.10. With
-    # `dhan_live_crossverify.rs` deleted there is NO emit site left for any of
-    # the three `$.source` values, so all three filters could only ever match
-    # nothing.
+    # Emit sites: `crates/app/src/dhan_live_crossverify_boot.rs`, one per
+    # `$.source` value. Shape, thresholds and `ok_recovery = false` are the
+    # removed entries unchanged — nothing new is invented.
     #
-    # ⚠ THEY GO IN THE SAME CHANGE AS THE EMIT SITE, and that is not tidiness.
-    # A filter whose producer is gone reads PERMANENTLY GREEN — the dead-monitor
-    # class this repository has already retired twice (`ws-reinject-01`
-    # 2026-07-17, `tick-conserve-01` 2026-07-18). Three of them at once, on the
-    # one check that told the operator whether the feed's numbers were right,
-    # would be the most reassuring lie on this dashboard.
+    # What is new is the consequence: the day marker the S3 daily archive
+    # waits for is written ONLY on a measured verdict, so a vacuous or failed
+    # run also HOLDS that day's S3 archive (bounded at
+    # MAX_CROSSVERIFY_HOLD_DAYS). These two alarms are how the operator learns
+    # the archive is waiting.
     #
-    # ⚠ WHAT THIS COSTS, stated rather than absorbed: §12.10.4 of the rule file
-    # records it in full — after this change there is ZERO mechanism anywhere in
-    # this workspace that compares captured market data against any external
-    # record. Every remaining signal answers "did the machinery run", never "are
-    # the numbers right". Removing these filters does not create that gap; it
-    # stops the dashboard from implying the gap is watched.
-    #
-    # Cost: −3 alarms ≈ −$0.30/mo. Their derived metrics were sparse (billed
-    # only in hours a code fired) and had not fired since the removal, so the
-    # real saving is the three green tiles nobody can now misread.
-    #
-    # The `ws-gap-03-universe-collapse` filter directly above is UNTOUCHED: its
-    # emit site (`dhan_live_universe.rs`, `$.source = "fell_back_to_indices"`)
-    # is alive, and it is the reason this map still carries a WS-GAP-03 entry at
-    # all. `cloudwatch_app_alarms_wiring.rs` pinned `patterns.len() >= 3` on
-    # WS-GAP-03 precisely because three of the four here were xverify; that
-    # assertion moved to 1 in this same change, with its own dated note.
+    # Cost: +3 alarms ≈ $0.30/mo. The same removal deleted four REST-leg
+    # filters (spot1m-01-escalation, chain-02-escalation, chain-01,
+    # chain-04-warmup, ≈ $0.40/mo) whose producers stay deleted, so the bill is
+    # $0.10/mo lower than before 2026-09-16. No new EMF metric name.
+    "ws-gap-03-xverify-vacuous" = {
+      pattern     = "{ $.code = \"WS-GAP-03\" && $.level = \"ERROR\" && $.source = \"xverify_vacuous\" }"
+      period      = 3600
+      threshold   = 1
+      eval        = 1
+      dta         = 1
+      ok_recovery = false # runs once per session - an auto-OK means the datapoint aged out, not that the next run compared
+      desc        = "WS-GAP-03 cross-verify VACUOUS: the 15:41 comparison of our 1-minute candles against Dhan's own 1-minute record RAN and compared ZERO minutes. This is not a pass - it is no measurement at all. Today's S3 archive is HELD until a measured run lands (at most 3 days, then it archives anyway with a loud error). Triage from the same log line: missing_live high means the live lane produced no candles (check tv_dhan_feed_last_tick_age_secs and the no-ticks alarm); missing_rest high means Dhan's historical API did not serve the day. Runbook: .claude/rules/project/no-rest-except-live-feed-2026-06-27.md"
+    }
+
+    "ws-gap-03-xverify-failed" = {
+      pattern     = "{ $.code = \"WS-GAP-03\" && $.level = \"ERROR\" && $.source = \"xverify_failed\" }"
+      period      = 3600
+      threshold   = 1
+      eval        = 1
+      dta         = 1
+      ok_recovery = false # runs once per session - an auto-OK means the datapoint aged out, not that the next run ran
+      desc        = "WS-GAP-03 cross-verify FAILED TO RUN: the 15:41 comparison of our 1-minute candles against Dhan's own 1-minute record errored out, so the day's candles are UNVERIFIED and today's S3 archive is HELD (at most 3 days). A restart of the app re-runs the check immediately. Triage: the same log line carries the underlying error in its err field; a token or QuestDB failure is the usual cause. Runbook: .claude/rules/project/no-rest-except-live-feed-2026-06-27.md"
+    }
+
+    "ws-gap-03-xverify-diverged" = {
+      pattern     = "{ $.code = \"WS-GAP-03\" && $.level = \"ERROR\" && $.source = \"xverify_diverged\" }"
+      period      = 3600
+      threshold   = 1
+      eval        = 1
+      dta         = 1
+      ok_recovery = false # runs once per session - an auto-OK means the datapoint aged out, not that the next run agreed
+      desc        = "WS-GAP-03 cross-verify MASS DIVERGENCE: the 15:41 comparison ran and found MORE THAN HALF of the compared open/high/low/close prices disagreeing with Dhan's own 1-minute record. That is not sampling noise - the two records are not describing the same market, so treat the day's candles as untrustworthy until explained. The day counts as measured, so the S3 archive proceeds. Triage from the same log line: minutes_compared is the denominator, cells_diverged the numerator, noise_p95_paise / noise_max_paise say whether it is a small systematic offset or wholesale (wrong instruments, clock fault). Runbook: .claude/rules/project/no-rest-except-live-feed-2026-06-27.md"
+    }
 
     # ADDED 2026-08-28 (noise-lock section 2.3m). A depth-200 socket that
     # UNSUBSCRIBED its old contract and then failed to subscribe the new one is
