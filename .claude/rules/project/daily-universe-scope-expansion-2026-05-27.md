@@ -2525,6 +2525,22 @@ No path reads an older folder, and the next deploy uploads its own.
 - Deletes or edits the committed deletion manifest.
 - Presents the deleted dates as still retained anywhere.
 
+**Quote 26 (2026-09-24, after the operator ran the bare nuke — delete whatever reached S3 since Quote 24; preserve EXACTLY, typos included):**
+> "see i did the bare nuke udde so now even f anythign si oved to s3 means then remove that alsi dyde oikjay?"
+
+Same scope as Quote 24 and bound by its REJECT list. Recorded here before the delete.
+
+Between the Quote 24 wipe and this quote, the bucket gained 13 objects (90,634,524 bytes, read with `aws s3 ls --recursive --summarize` at 21:54 IST):
+
+| Prefix | Objects | What it is |
+|---|---:|---|
+| `questdb-partitions/` | 5 | the daily archive leg ran at 15:41 IST on 2026-09-24 and uploaded 2026-09-23's `candles_1s`, `candles_3s`, `candles_5s` and two `ticks` hour partitions |
+| `deploys/` | 8 | four release packages; the next deploy uploads its own |
+
+All 13 are deleted. No SEBI table is in this bucket. The key list is committed at `docs/audits/2026-09-24-s3-cold-deletion-manifest.txt`, so any `partition_archive_audit` row that names one of these keys can be traced.
+
+**Why the archive leg still uploaded:** the cross-verification S3 hold was deployed at 18:32 IST, after the 15:41 upload. From the next session the daily leg holds a day until its 1-minute cross-verification has a measured verdict.
+
 **Quote 25 (2026-09-23, bare nuke + delete all logs and traces for a fresh-scratch boot — preserve EXACTLY, typos included):**
 > "Do the bare nuke also dude okay? Meanwhile delete the entire logs entire traces dude tomorrow it shoudl be the fresh scratch boot application dydde oaky"
 
