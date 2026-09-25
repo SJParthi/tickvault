@@ -101,6 +101,44 @@ fn the_stamp_sits_on_the_success_arm_and_not_on_a_refusal() {
     }
 }
 
+/// 2026-09-25: a contract swapped OUT before its first packet arrived used to
+/// keep its pending stamp, age out at the first-packet window, and be counted
+/// `silent_window` — a "blank new contract" that was really just removed from
+/// the socket. On a churning board that inflates the
+/// `dhan-depth-new-contract-blank` ratio. Each dispatch site must therefore
+/// `forget` the departing contract on the success arm, immediately before it
+/// stamps the arriving one.
+#[test]
+fn the_departing_contract_is_forgotten_just_before_the_arrival_is_stamped() {
+    for (path, departing) in [
+        ("src/depth20_track.rs", "release.security_id"),
+        ("src/depth_rebalance.rs", "departing.security_id"),
+    ] {
+        let body = read_without_comments(path);
+        let stamp = body
+            .find(".record_subscribe_at(")
+            .unwrap_or_else(|| panic!("{path} has no first-packet stamp"));
+        let forget = body[..stamp].rfind(".forget(").unwrap_or_else(|| {
+            panic!(
+                "{path}: no `forget` precedes the first-packet stamp — a contract \
+                 swapped out before its first packet ages into a false \
+                 `silent_window` and pages as a blank new contract"
+            )
+        });
+        let gap = stamp - forget;
+        assert!(
+            gap < 900,
+            "{path}: the departing-contract `forget` sits {gap} bytes before the \
+             stamp — it is no longer on the same success arm"
+        );
+        assert!(
+            body[forget..stamp].contains(departing),
+            "{path}: the `forget` before the stamp does not name the DEPARTING \
+             contract (`{departing}`)"
+        );
+    }
+}
+
 #[test]
 fn the_drain_observes_once_per_packet_and_before_the_level_loop() {
     let drain = read_without_comments("src/dhan_feed_stack.rs");

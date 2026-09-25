@@ -855,6 +855,39 @@ pub const fn option_pass_fits(now_secs_of_day: u64) -> bool {
         <= EVENING_STOP_SECS_OF_DAY_IST
 }
 
+/// Every `outcome` label the option pass can publish. Seeded at zero at the
+/// start of each pass so a label reads as a real zero on `/metrics` rather
+/// than an absent series.
+pub const XVERIFY_OPTION_PASS_OUTCOMES: [&str; 8] = [
+    "skipped_late",
+    "no_targets",
+    "no_token",
+    "vacuous",
+    "measured",
+    "partial",
+    "diverged",
+    "failed",
+];
+
+/// The label for a pass that ran. `vacuous` when nothing was compared;
+/// `partial` when the run stopped at its budget or some vendor fetches failed,
+/// so part of the target list was never compared; `measured` only when every
+/// target was fetched. Pure, O(1).
+#[must_use]
+pub const fn option_pass_outcome(
+    vacuous: bool,
+    budget_elapsed: bool,
+    rest_failures: usize,
+) -> &'static str {
+    if vacuous {
+        "vacuous"
+    } else if budget_elapsed || rest_failures > 0 {
+        "partial"
+    } else {
+        "measured"
+    }
+}
+
 /// The after-close check of the day's depth-held option contracts.
 ///
 /// It never writes or blocks the day marker, never appends a daily row, and
@@ -864,6 +897,9 @@ async fn run_option_pass(
     today: chrono::NaiveDate,
     day_start_ist_nanos: i64,
 ) {
+    for label in XVERIFY_OPTION_PASS_OUTCOMES {
+        metrics::counter!(XVERIFY_OPTION_PASS_COUNTER, "outcome" => label).increment(0);
+    }
     if !option_pass_fits(now_ist_secs_of_day()) {
         metrics::counter!(XVERIFY_OPTION_PASS_COUNTER, "outcome" => "skipped_late").increment(1);
         info!(%today, "Dhan option cross-check skipped — it could not finish before the evening stop");
@@ -919,11 +955,8 @@ async fn run_option_pass(
         Ok(report) => {
             let c = &report.comparison;
             let persisted_ok = persist_option_findings(&deps.questdb, &report);
-            let label = if c.is_vacuous() {
-                "vacuous"
-            } else {
-                "measured"
-            };
+            let label =
+                option_pass_outcome(c.is_vacuous(), report.budget_elapsed, report.rest_failures);
             metrics::counter!(XVERIFY_OPTION_PASS_COUNTER, "outcome" => label).increment(1);
             info!(
                 %today,
@@ -1692,5 +1725,43 @@ mod tests {
         assert!(body.contains("global_contract_underlying_map()"));
         assert!(body.contains("option_pass_fits("));
         assert!(body.contains("XVERIFY_OPTION_PASS_BUDGET_SECS"));
+    }
+
+    #[test]
+    fn test_option_pass_outcome_marks_an_incomplete_run_partial() {
+        assert_eq!(option_pass_outcome(true, false, 0), "vacuous");
+        assert_eq!(option_pass_outcome(true, true, 9), "vacuous");
+        assert_eq!(option_pass_outcome(false, false, 0), "measured");
+        assert_eq!(option_pass_outcome(false, true, 0), "partial");
+        assert_eq!(option_pass_outcome(false, false, 1), "partial");
+    }
+
+    #[test]
+    fn test_every_option_pass_label_is_seeded_and_every_published_label_is_listed() {
+        let body = fn_body(prod_src(), "async fn run_option_pass(");
+        assert!(
+            body.contains("for label in XVERIFY_OPTION_PASS_OUTCOMES"),
+            "the pass must seed every label at zero"
+        );
+        assert!(body.contains("option_pass_outcome("));
+        // Every literal label the pass publishes must be in the seeded list.
+        let marker = "XVERIFY_OPTION_PASS_COUNTER, \"outcome\" => \"";
+        let mut rest = body;
+        let mut found = 0;
+        while let Some(at) = rest.find(marker) {
+            let after = &rest[at + marker.len()..];
+            let end = after.find('"').expect("closing quote");
+            let label = &after[..end];
+            assert!(
+                XVERIFY_OPTION_PASS_OUTCOMES.contains(&label),
+                "published label {label} is not seeded"
+            );
+            found += 1;
+            rest = &after[end..];
+        }
+        assert!(found >= 5, "scan found only {found} literal labels");
+        for label in ["vacuous", "measured", "partial"] {
+            assert!(XVERIFY_OPTION_PASS_OUTCOMES.contains(&label));
+        }
     }
 }

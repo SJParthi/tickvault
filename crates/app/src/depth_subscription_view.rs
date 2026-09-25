@@ -187,6 +187,10 @@ pub struct DepthSubscriptionView {
     /// the two once-a-minute publishes, so a `Mutex` costs nothing on a hot
     /// path; bounded by [`MAX_DEPTH_HELD_TODAY`].
     held_today: std::sync::Mutex<HeldToday>,
+    /// Where the held-today set is persisted, once
+    /// [`Self::enable_held_today_persistence`] has run. Unset (the default,
+    /// and every test that does not ask for it) means RAM only.
+    held_today_file: std::sync::OnceLock<std::path::PathBuf>,
 }
 
 /// The day-scoped union behind [`DepthSubscriptionView::held_today_snapshot`].
@@ -198,6 +202,8 @@ struct HeldToday {
     /// Latched once a refusal has been logged this IST day, so a full set
     /// logs once per day rather than on every per-minute publish.
     refusal_logged: bool,
+    /// Latched once a persist failure has been logged this IST day.
+    persist_failure_logged: bool,
 }
 
 impl DepthSubscriptionView {
@@ -272,8 +278,10 @@ impl DepthSubscriptionView {
             guard.ist_day = day;
             guard.keys.clear();
             guard.refusal_logged = false;
+            guard.persist_failure_logged = false;
         }
         let mut refused: u64 = 0;
+        let mut inserted = false;
         for key in next {
             if guard.keys.contains(key) {
                 continue;
@@ -283,13 +291,27 @@ impl DepthSubscriptionView {
                 continue;
             }
             guard.keys.insert(*key);
+            inserted = true;
         }
         let first_refusal_today = refused > 0 && !guard.refusal_logged;
         if first_refusal_today {
             guard.refusal_logged = true;
         }
         let tracked = guard.keys.len();
+        // Copy the set out only when it grew AND persistence is on: the file
+        // is written outside the lock, and a publish that added nothing has
+        // nothing new to save.
+        let to_persist = match self.held_today_file.get() {
+            Some(path) if inserted => {
+                let keys: Vec<Key> = guard.keys.iter().copied().collect();
+                Some((path, day, keys))
+            }
+            _ => None,
+        };
         drop(guard);
+        if let Some((path, persist_day, keys)) = to_persist {
+            self.persist_held_today(path, persist_day, keys);
+        }
         if refused > 0 {
             metrics::counter!(HELD_TODAY_REFUSED_COUNTER).increment(refused);
         }
@@ -307,6 +329,74 @@ impl DepthSubscriptionView {
                 "depth held-today set is full; later contracts are not checked by the after-close option cross-verification today"
             );
         }
+    }
+
+    /// Writes the held-today set to `path`. A failure is logged once per IST
+    /// day and is otherwise harmless: the set stays correct in RAM, and only a
+    /// restart later the same day would lose the unsaved part.
+    fn persist_held_today(&self, path: &std::path::Path, day: i64, keys: Vec<Key>) {
+        let Err(err) = write_held_today_file(path, day, keys) else {
+            return;
+        };
+        let mut guard = self
+            .held_today
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let first = !guard.persist_failure_logged;
+        guard.persist_failure_logged = true;
+        drop(guard);
+        if first {
+            tracing::warn!(
+                code =
+                    tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching.code_str(),
+                source = "held_today_persist_failed",
+                path = %path.display(),
+                %err,
+                "could not save the depth held-today set; a restart later today would lose the contracts held before it from the after-close option check"
+            );
+        }
+    }
+
+    /// Turns on held-today persistence at `path` and reloads today's set from
+    /// it, so a restart during the session does not shrink the after-close
+    /// option cross-verification to the contracts held since the restart.
+    ///
+    /// A file from an earlier IST day, a missing file, or an unreadable file
+    /// loads nothing. Loaded keys respect [`MAX_DEPTH_HELD_TODAY`]. Called once
+    /// at the steering spawn boundary, before the first publish; a second call
+    /// keeps the first path. Returns how many keys were reloaded.
+    pub fn enable_held_today_persistence(&self, path: std::path::PathBuf, now_secs: i64) -> usize {
+        let day = Self::ist_day_of(now_secs);
+        let restored = match read_held_today_file(&path) {
+            Some(file) if file.ist_day == day => file.keys,
+            _ => Vec::new(),
+        };
+        let mut guard = self
+            .held_today
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.ist_day != day {
+            guard.ist_day = day;
+            guard.keys.clear();
+            guard.refusal_logged = false;
+            guard.persist_failure_logged = false;
+        }
+        let mut loaded = 0_usize;
+        for key in restored {
+            if guard.keys.len() >= MAX_DEPTH_HELD_TODAY {
+                break;
+            }
+            if guard.keys.insert(key) {
+                loaded = loaded.saturating_add(1);
+            }
+        }
+        drop(guard);
+        if self.held_today_file.set(path).is_err() {
+            tracing::debug!(
+                "depth held-today persistence was already enabled; keeping the first path"
+            );
+        }
+        loaded
     }
 
     /// Every contract either pool held at any publish during the IST day of
@@ -585,6 +675,56 @@ impl DepthSubscriptionView {
             .store(true, std::sync::atomic::Ordering::Release);
         refused
     }
+}
+
+/// Directory of the held-today file — the same daily-artifact directory the
+/// depth seed and the contract artifacts use.
+const HELD_TODAY_DIR: &str = "data/instrument-cache";
+/// File name of the persisted held-today set.
+const HELD_TODAY_FILE: &str = "depth-held-today.json";
+
+/// Where the held-today set is persisted across restarts.
+#[must_use]
+pub fn held_today_path() -> std::path::PathBuf {
+    std::path::Path::new(HELD_TODAY_DIR).join(HELD_TODAY_FILE)
+}
+
+/// The on-disk shape of the held-today set: the IST day it belongs to, and
+/// every `(security_id, segment wire byte)` pair held that day.
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct HeldTodayFile {
+    ist_day: i64,
+    keys: Vec<Key>,
+}
+
+/// Writes the set to `path` as a temp file then a rename, so a reader never
+/// sees a half-written file under the final name.
+///
+/// No `fsync`: this runs on the steering task up to once a minute, and the
+/// file is a coverage aid, not a record. After a power loss the worst case is
+/// a missing or empty file, which [`read_held_today_file`] reads as "nothing
+/// to reload".
+fn write_held_today_file(
+    path: &std::path::Path,
+    ist_day: i64,
+    keys: Vec<Key>,
+) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let body =
+        serde_json::to_vec(&HeldTodayFile { ist_day, keys }).map_err(std::io::Error::other)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Reads the persisted set, or `None` when the file is missing or cannot be
+/// parsed. Fail-soft: "nothing to reload" is the behaviour before this file
+/// existed.
+fn read_held_today_file(path: &std::path::Path) -> Option<HeldTodayFile> {
+    let body = std::fs::read(path).ok()?;
+    serde_json::from_slice(&body).ok()
 }
 
 /// The process-wide view.
@@ -1273,5 +1413,94 @@ mod tests {
         assert_eq!(snap.len(), MAX_DEPTH_HELD_TODAY);
         assert!(snap.contains(&(0, NSE_FNO.binary_code())));
         assert!(!snap.contains(&(999_999, NSE_FNO.binary_code())));
+    }
+
+    /// A per-test scratch path, so parallel tests never share a file.
+    fn held_today_test_path(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tv-held-today-{tag}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        dir.join("depth-held-today.json")
+    }
+
+    #[test]
+    fn test_write_held_today_file_then_read_held_today_file_roundtrips() {
+        let path = held_today_test_path("roundtrip");
+        let keys = vec![(42, NSE_FNO.binary_code()), (13, IDX.binary_code())];
+        write_held_today_file(&path, 20_356, keys.clone()).expect("write");
+        let file = read_held_today_file(&path).expect("read back");
+        assert_eq!(
+            file,
+            HeldTodayFile {
+                ist_day: 20_356,
+                keys
+            }
+        );
+        // The temp file is renamed away, never left beside the real one.
+        assert!(!path.with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn test_enable_held_today_persistence_restores_todays_set_after_a_restart() {
+        let path = held_today_test_path("restart");
+        let t = NOON_IST_2026_09_25;
+        let before = DepthSubscriptionView::new();
+        assert_eq!(before.enable_held_today_persistence(path.clone(), t), 0);
+        before.publish_depth20_at([(42, NSE_FNO)], t);
+        before.publish_depth200_at([(7, NSE_FNO)], t);
+        before.publish_depth20_at([(43, NSE_FNO)], t + 60);
+        // A new process: a fresh view reloads the file for the same IST day.
+        let after = DepthSubscriptionView::new();
+        assert_eq!(after.enable_held_today_persistence(path, t + 3_600), 3);
+        let code = NSE_FNO.binary_code();
+        assert_eq!(
+            after.held_today_snapshot(t + 3_600),
+            vec![(7, code), (42, code), (43, code)]
+        );
+    }
+
+    #[test]
+    fn test_enable_held_today_persistence_loads_nothing_from_an_earlier_day() {
+        let path = held_today_test_path("stale-day");
+        let t = NOON_IST_2026_09_25;
+        let yesterday = DepthSubscriptionView::new();
+        yesterday.enable_held_today_persistence(path.clone(), t - 86_400);
+        yesterday.publish_depth20_at([(42, NSE_FNO)], t - 86_400);
+        let today = DepthSubscriptionView::new();
+        assert_eq!(today.enable_held_today_persistence(path, t), 0);
+        assert!(today.held_today_snapshot(t).is_empty());
+    }
+
+    #[test]
+    fn test_enable_held_today_persistence_loads_nothing_from_an_unreadable_file() {
+        let path = held_today_test_path("garbage");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, b"not json").expect("write garbage");
+        let view = DepthSubscriptionView::new();
+        assert_eq!(
+            view.enable_held_today_persistence(path, NOON_IST_2026_09_25),
+            0
+        );
+        assert!(view.held_today_snapshot(NOON_IST_2026_09_25).is_empty());
+    }
+
+    #[test]
+    fn test_held_today_is_written_only_when_the_set_grows() {
+        let path = held_today_test_path("grow-only");
+        let t = NOON_IST_2026_09_25;
+        let view = DepthSubscriptionView::new();
+        view.enable_held_today_persistence(path.clone(), t);
+        view.publish_depth20_at([(42, NSE_FNO)], t);
+        std::fs::remove_file(&path).expect("file was written on growth");
+        // Same set again: nothing new, so nothing is written.
+        view.publish_depth20_at([(42, NSE_FNO)], t + 60);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_held_today_path_is_the_file_the_rule_names() {
+        assert_eq!(
+            held_today_path(),
+            std::path::Path::new("data/instrument-cache/depth-held-today.json")
+        );
     }
 }

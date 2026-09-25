@@ -2152,3 +2152,32 @@ Given in DIRECT response to a list whose second item was: *"An after-close check
 - No live run has happened yet. The first session with this build is the measurement.
 
 **What a PR that violates §12.15.6 looks like (REJECT):** lets the option pass affect the day marker or the retry verdict; appends a daily row from the option pass; guesses an instrument string for an unresolved contract; checks futures or `BSE_FNO` under cover of this section; raises the cap or the budget without re-checking the 17:30 fit; adds an alarm or EMF name for the option pass without its own dated row and a lever.
+
+### §12.15.6-i — 2026-09-25 (same day): the held-today set survives a restart, and a cut-short pass is labelled `partial`
+
+**No new authorization is claimed.** This closes the first honest limit of
+§12.15.6 ("A restart forgets contracts held only before it") and sharpens the
+pass counter. It does not change what the pass compares, its cap, its budget,
+or its independence from the day marker.
+
+| Change | Mechanism |
+|---|---|
+| The held-today set is saved | `data/instrument-cache/depth-held-today.json`, holding the IST day and the keys. Written only when the set GROWS, via tmp + rename, with no fsync. The write happens outside the lock, on the steering task, never on the frame drain. |
+| It is reloaded at startup | When depth steering starts, the file is read. Its keys are loaded only if its IST day is today. A missing, unreadable or earlier-day file loads nothing, and the pass runs on what this process sees. |
+| A failed write is loud once | The first failure of the IST day logs `warn!(code = WS-GAP-02, source = "held_today_persist_failed")`. No page. See the noise lock §2.3w addendum. |
+| `partial` outcome | A pass that compared something but stopped at its budget, or had one or more vendor fetches fail, is counted `partial`, never `measured`. |
+| All 8 labels seeded | `skipped_late`, `no_targets`, `no_token`, `vacuous`, `measured`, `partial`, `diverged`, `failed` are each seeded with `increment(0)` at the start of every pass, so a first occurrence is never lost to the agent's first-sample rule. Local `/metrics` only: no EMF name, no alarm. |
+
+**⚠ Honest limits (Rule 11).**
+- With no fsync, a HOST crash (not a process restart) can lose the last write.
+  The next growth rewrites the whole set, so the loss is bounded to the
+  contracts added since the previous write.
+- The file is capped by the same `MAX_DEPTH_HELD_TODAY` as the set, so it
+  cannot grow without bound.
+- Still no live run. The first session with this build is the measurement.
+
+**What a PR that violates §12.15.6-i looks like (REJECT):** writes the file on
+every publish instead of on growth; writes it while holding the set's lock or
+from the frame drain; reloads keys from an earlier IST day; counts a cut-short
+pass as `measured`; or adds an alarm or EMF name for the pass counter without
+its own dated row and a lever.

@@ -1427,7 +1427,7 @@ resource "aws_cloudwatch_metric_alarm" "dhan_feed_delay_high" {
 
 resource "aws_cloudwatch_metric_alarm" "dhan_main_reconnect_slow" {
   alarm_name        = "tv-${var.environment}-dhan-main-reconnect-slow"
-  alarm_description = "A Dhan MAIN-FEED socket took 15 seconds or more to deliver its first data after re-dialling. Normal is about 2 seconds. The main feed was blind for that long on one reconnect. Counts RE-dials only (a socket that has delivered before), inside 09:15-15:30 IST only, so the morning's first dial and a reconnect across the close never count. Depth sockets are excluded on purpose: depth-200 re-dials about once a minute by design. Triage: (1) tv_dhan_ws_reconnect_total - one slow reconnect or many. (2) tv_dhan_ws_dial_ms - was the DIAL slow (network) or the first frame (vendor). (3) The WS-GAP-03 log lines for the socket."
+  alarm_description = "A Dhan MAIN-FEED socket took 15 seconds or more to deliver its first data after the connection was lost, counting every failed re-dial and the waits between them. Normal is about 2 seconds. The main feed was blind for that long on one outage. Counts RE-dials only (a socket that has delivered before), inside 09:15-15:30 IST only, so the morning's first dial and a reconnect across the close never count. Depth sockets are excluded on purpose: depth-200 re-dials about once a minute by design. Triage: (1) tv_dhan_ws_reconnect_total - one slow reconnect or many. (2) tv_dhan_ws_dial_ms - was the DIAL slow (network) or the first frame (vendor). (3) The WS-GAP-03 log lines for the socket."
 
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 15000
@@ -1445,6 +1445,9 @@ resource "aws_cloudwatch_metric_alarm" "dhan_main_reconnect_slow" {
   ok_actions         = []
 }
 
+# A contract swapped OUT of a depth socket is forgotten by the first-packet
+# tracker before the new one is stamped (§2.6-iii), so a departing contract
+# can never age into the silent count and inflate this ratio.
 resource "aws_cloudwatch_metric_alarm" "dhan_depth_new_contract_blank" {
   alarm_name        = "tv-${var.environment}-dhan-depth-new-contract-blank"
   alarm_description = "Most newly subscribed Dhan depth contracts are delivering nothing. In 30 minutes, at least 5 new subscriptions were measured and at least 80% of them sent no depth packet within 2 minutes. One silent contract is normal (it may simply not have traded); most of them silent means the vendor is not serving new subscriptions. Triage: (1) tv_dhan_ws_alive_connections - are the depth sockets up. (2) tv_dhan_feed_depth_total - is ANY depth arriving. (3) The depth ranked-rotation log lines - which contracts were subscribed."
