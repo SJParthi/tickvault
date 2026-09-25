@@ -1791,10 +1791,13 @@ impl ConnectionSupervisor {
                             code = ErrorCode::WsGapDisconnectClassification.code_str(),
                             endpoint = self.slot.endpoint.as_str(),
                             pool_index = self.slot.pool_index,
+                            rotation_halted = true,
                             "Dhan closed this socket with 805 (too many connections). Dhan kills \
                              the OLDEST socket per extra connection, so re-dialing would destroy \
-                             a healthy sibling instead of recovering this one — parking. Check \
-                             for a second process holding Dhan sockets on this account."
+                             a healthy sibling instead of recovering this one — parking. Depth-200 \
+                             rotate-by-reconnect is now halted until the app restarts: the \
+                             depth-200 sockets keep their current contracts. Check for a second \
+                             process holding Dhan sockets on this account."
                         );
                         // 2026-09-24 circuit breaker: an 805 anywhere halts
                         // depth-200 rotate-by-reconnect for the process, so
