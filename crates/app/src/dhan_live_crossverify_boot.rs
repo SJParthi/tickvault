@@ -38,6 +38,7 @@ use crate::dhan_live_crossverify::{
     SESSION_CLOSE_SECS_OF_DAY_IST, XverifyTarget, daily_row, deterministic_run_ts_nanos,
     run_cross_verification,
 };
+use crate::volume_leaderboard::OptionFamily;
 
 /// Marker task name. The S3 archive gate in `main.rs` reads the same constant,
 /// so the writer and the reader can never disagree about the file name.
@@ -465,7 +466,7 @@ async fn run_day(
                 if attempts > 1 {
                     info!(%today, attempts, "Dhan 1-minute cross-verification recorded on a same-day retry");
                 }
-                return;
+                break;
             }
             Err(failure) => failure,
         };
@@ -493,10 +494,13 @@ async fn run_day(
             }
             None => {
                 report_final_failure(failure, today, attempts, targets.len());
-                return;
+                break;
             }
         }
     }
+    // §12.15.6: the depth-held option pass runs ONCE, after the spot check's
+    // outcome is final. It never writes the day marker and never pages.
+    run_option_pass(deps, today, day_start_ist_nanos).await;
 }
 
 /// Pages once, after the last attempt of the day. Each arm is its own
@@ -761,6 +765,267 @@ fn persist_report(
                 discarded,
                 "Dhan 1-minute cross-verification could NOT be persisted — today's \
                  comparison exists only in this log stream and today's S3 archive stays held"
+            );
+            false
+        }
+    }
+}
+
+// ── §12.15.6 — the day's depth-held OPTION contracts, checked separately ──
+
+/// Most option contracts one day's option pass compares. Taken in
+/// `security_id` order; the rest are counted as truncated, never guessed at.
+pub const XVERIFY_MAX_OPTION_TARGETS: usize = 300;
+
+/// Run budget of the option pass. 300 contracts at the 334 ms pacer is about
+/// 100 s; the budget leaves room for the live-candle query.
+pub const XVERIFY_OPTION_PASS_BUDGET_SECS: u64 = 150;
+
+/// Option-pass outcomes, labelled by `outcome`. Local `/metrics` only — no EMF
+/// name and no alarm (§12.15.6).
+pub const XVERIFY_OPTION_PASS_COUNTER: &str = "tv_dhan_xverify_option_pass_total";
+
+/// The option pass's targets and what was left out.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct OptionTargets {
+    /// Contracts the pass will compare, sorted by `security_id`.
+    pub targets: Vec<XverifyTarget>,
+    /// Held contracts the contract map could not classify. Skipped, never
+    /// guessed: a wrong Dhan instrument type returns another contract's tape.
+    pub unresolved: usize,
+    /// Contracts beyond [`XVERIFY_MAX_OPTION_TARGETS`].
+    pub truncated: usize,
+    /// Held keys on a segment other than `NSE_FNO`.
+    pub not_fno: usize,
+}
+
+/// Builds the option pass's targets from the day's depth-held keys.
+///
+/// `family_of` answers the contract's option family from the daily master;
+/// `OptionFamily::Index` becomes `OPTIDX`, `OptionFamily::Stock` becomes
+/// `OPTSTK`. O(held · log held) for the sort, once a day, cold.
+pub fn option_targets_from_depth_held<F>(
+    held: &[(u64, u8)],
+    family_of: F,
+    cap: usize,
+) -> OptionTargets
+where
+    F: Fn(u64, ExchangeSegment) -> Option<OptionFamily>,
+{
+    let fno = ExchangeSegment::NseFno.binary_code();
+    let mut keys: Vec<u64> = Vec::with_capacity(held.len());
+    let mut out = OptionTargets::default();
+    for &(id, seg) in held {
+        if seg == fno {
+            keys.push(id);
+        } else {
+            out.not_fno = out.not_fno.saturating_add(1);
+        }
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    for id in keys {
+        let family = family_of(id, ExchangeSegment::NseFno);
+        let (Some(family), Ok(security_id)) = (family, i64::try_from(id)) else {
+            out.unresolved = out.unresolved.saturating_add(1);
+            continue;
+        };
+        if out.targets.len() >= cap {
+            out.truncated = out.truncated.saturating_add(1);
+            continue;
+        }
+        let instrument = match family {
+            OptionFamily::Index => "OPTIDX",
+            OptionFamily::Stock => "OPTSTK",
+        };
+        out.targets.push(XverifyTarget {
+            security_id,
+            segment: ExchangeSegment::NseFno.as_str().to_string(),
+            instrument: instrument.to_string(),
+        });
+    }
+    out
+}
+
+/// Whether the option pass can still finish before the evening stop, starting
+/// now. Pure, O(1).
+#[must_use]
+pub const fn option_pass_fits(now_secs_of_day: u64) -> bool {
+    now_secs_of_day.saturating_add(attempt_max_secs(XVERIFY_OPTION_PASS_BUDGET_SECS))
+        <= EVENING_STOP_SECS_OF_DAY_IST
+}
+
+/// The after-close check of the day's depth-held option contracts.
+///
+/// It never writes or blocks the day marker, never appends a daily row, and
+/// never pages: a catastrophic divergence is one `warn!` (§12.15.6).
+async fn run_option_pass(
+    deps: &CrossverifyBootDeps,
+    today: chrono::NaiveDate,
+    day_start_ist_nanos: i64,
+) {
+    if !option_pass_fits(now_ist_secs_of_day()) {
+        metrics::counter!(XVERIFY_OPTION_PASS_COUNTER, "outcome" => "skipped_late").increment(1);
+        info!(%today, "Dhan option cross-check skipped — it could not finish before the evening stop");
+        return;
+    }
+    let held = crate::depth_subscription_view::global_depth_subscription_view()
+        .held_today_snapshot(chrono::Utc::now().timestamp());
+    let map = crate::contract_underlying_map::global_contract_underlying_map();
+    let built = option_targets_from_depth_held(
+        &held,
+        |id, seg| map.owner_of(id, seg).map(|owner| owner.family),
+        XVERIFY_MAX_OPTION_TARGETS,
+    );
+    if built.targets.is_empty() {
+        metrics::counter!(XVERIFY_OPTION_PASS_COUNTER, "outcome" => "no_targets").increment(1);
+        info!(
+            %today,
+            held = held.len(),
+            unresolved = built.unresolved,
+            not_fno = built.not_fno,
+            "Dhan option cross-check had no option contracts to compare today"
+        );
+        return;
+    }
+    let Some(jwt) = wait_for_jwt().await else {
+        metrics::counter!(XVERIFY_OPTION_PASS_COUNTER, "outcome" => "no_token").increment(1);
+        warn!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            source = "xverify_options_no_token",
+            %today,
+            "Dhan option cross-check could not run: no Dhan token available"
+        );
+        return;
+    };
+    let cfg = DhanLiveCrossverifyConfig {
+        run_budget_secs: XVERIFY_OPTION_PASS_BUDGET_SECS,
+        ..deps.config
+    };
+    let client = reqwest::Client::new();
+    let result = run_cross_verification(
+        &client,
+        &deps.questdb_exec_url,
+        &deps.intraday_url,
+        jwt.expose_secret(),
+        &built.targets,
+        today,
+        day_start_ist_nanos,
+        &cfg,
+    )
+    .await;
+    drop(jwt);
+    match result {
+        Ok(report) => {
+            let c = &report.comparison;
+            let persisted_ok = persist_option_findings(&deps.questdb, &report);
+            let label = if c.is_vacuous() {
+                "vacuous"
+            } else {
+                "measured"
+            };
+            metrics::counter!(XVERIFY_OPTION_PASS_COUNTER, "outcome" => label).increment(1);
+            info!(
+                %today,
+                targets = built.targets.len(),
+                unresolved = built.unresolved,
+                truncated = built.truncated,
+                not_fno = built.not_fno,
+                outcome = c.outcome.as_str(),
+                instruments = c.instruments,
+                minutes_compared = c.minutes_compared,
+                cells_diverged = c.cells_diverged,
+                missing_live = c.missing_live,
+                missing_rest = c.missing_rest,
+                rest_failures = report.rest_failures,
+                budget_elapsed = report.budget_elapsed,
+                persisted_ok,
+                "Dhan option cross-check finished"
+            );
+            if is_catastrophic_divergence(c) {
+                metrics::counter!(XVERIFY_OPTION_PASS_COUNTER, "outcome" => "diverged")
+                    .increment(1);
+                warn!(
+                    code = ErrorCode::WsGapConnectionState.code_str(),
+                    source = "xverify_options_diverged",
+                    %today,
+                    minutes_compared = c.minutes_compared,
+                    cells_diverged = c.cells_diverged,
+                    "Dhan option cross-check found MORE THAN HALF of the compared price \
+                     fields of the depth-held option contracts disagreeing with Dhan's \
+                     own record"
+                );
+            }
+        }
+        Err(err) => {
+            metrics::counter!(XVERIFY_OPTION_PASS_COUNTER, "outcome" => "failed").increment(1);
+            warn!(
+                code = ErrorCode::WsGapConnectionState.code_str(),
+                source = "xverify_options_failed",
+                %today,
+                %err,
+                "Dhan option cross-check FAILED to run"
+            );
+        }
+    }
+}
+
+/// Persists the option pass's cell findings and vendor tape. NO daily row: the
+/// daily DEDUP key `(ts, trading_date_ist, feed, outcome)` would collide with
+/// the spot row. Returns `true` when the final flush succeeded.
+fn persist_option_findings(questdb: &QuestDbConfig, report: &RunReport) -> bool {
+    let c = &report.comparison;
+    let mut writer = DhanLiveXverifyAuditWriter::new(questdb);
+    let mut row_errors = 0_usize;
+    let mut batch_errors = 0_usize;
+    let mut flush_if_full = |w: &mut DhanLiveXverifyAuditWriter| {
+        let failed = if w.pending() >= PERSIST_BATCH_ROWS {
+            w.flush().is_err()
+        } else {
+            w.flush_if_large().is_err()
+        };
+        if failed {
+            batch_errors = batch_errors.saturating_add(1);
+        }
+    };
+    for finding in &c.findings {
+        if writer.append_cell(finding).is_err() {
+            row_errors = row_errors.saturating_add(1);
+        }
+        flush_if_full(&mut writer);
+    }
+    for row in &report.rest_tape {
+        if writer.append_rest_tape(row).is_err() {
+            row_errors = row_errors.saturating_add(1);
+        }
+        flush_if_full(&mut writer);
+    }
+    match writer.flush() {
+        Ok(()) => {
+            metrics::counter!(XVERIFY_PERSIST_ROWS_COUNTER)
+                .increment(c.findings.len() as u64 + report.rest_tape.len() as u64);
+            if row_errors > 0 || batch_errors > 0 {
+                error!(
+                    code = ErrorCode::WsGapConnectionState.code_str(),
+                    source = "xverify_options_persist_partial",
+                    row_errors,
+                    batch_errors,
+                    "Dhan option cross-check persisted with gaps — the audit tables are \
+                     incomplete for today's option contracts"
+                );
+            }
+            true
+        }
+        Err(err) => {
+            let discarded = writer.discard_pending();
+            metrics::counter!(XVERIFY_PERSIST_ERRORS_COUNTER).increment(1);
+            error!(
+                code = ErrorCode::WsGapConnectionState.code_str(),
+                source = "xverify_options_persist_failed",
+                ?err,
+                discarded,
+                "Dhan option cross-check could NOT be persisted — today's option \
+                 comparison exists only in this log stream"
             );
             false
         }
@@ -1262,5 +1527,170 @@ mod tests {
                 );
             }
         }
+    }
+    // ---- §12.15.6 depth-held option pass ----
+
+    const FNO: u8 = 2;
+
+    fn family_by_parity(id: u64, _seg: ExchangeSegment) -> Option<OptionFamily> {
+        match id % 3 {
+            0 => Some(OptionFamily::Index),
+            1 => Some(OptionFamily::Stock),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn test_option_targets_from_depth_held_maps_family_to_instrument() {
+        let held = [(3_u64, FNO), (4_u64, FNO)];
+        let built = option_targets_from_depth_held(&held, family_by_parity, 300);
+        assert_eq!(built.targets.len(), 2);
+        assert_eq!(built.targets[0].security_id, 3);
+        assert_eq!(built.targets[0].instrument, "OPTIDX");
+        assert_eq!(built.targets[1].security_id, 4);
+        assert_eq!(built.targets[1].instrument, "OPTSTK");
+        for t in &built.targets {
+            assert_eq!(t.segment, "NSE_FNO");
+        }
+    }
+
+    #[test]
+    fn test_option_targets_from_depth_held_skips_non_fno_segments() {
+        // NSE_EQ (1) and IDX_I (0) spot keys held on depth-20 are never
+        // option contracts and must not be sent as OPTIDX/OPTSTK.
+        let held = [(3_u64, 1_u8), (3_u64, 0_u8), (6_u64, FNO)];
+        let built = option_targets_from_depth_held(&held, family_by_parity, 300);
+        assert_eq!(built.not_fno, 2);
+        assert_eq!(built.targets.len(), 1);
+        assert_eq!(built.targets[0].security_id, 6);
+    }
+
+    #[test]
+    fn test_option_targets_from_depth_held_never_guesses_an_unresolved_contract() {
+        let held = [(5_u64, FNO), (8_u64, FNO), (9_u64, FNO)];
+        let built = option_targets_from_depth_held(&held, family_by_parity, 300);
+        assert_eq!(built.unresolved, 2);
+        assert_eq!(built.targets.len(), 1);
+        assert_eq!(built.targets[0].security_id, 9);
+    }
+
+    #[test]
+    fn test_option_targets_from_depth_held_refuses_ids_beyond_i64() {
+        let held = [(u64::MAX, FNO)];
+        let built = option_targets_from_depth_held(&held, |_, _| Some(OptionFamily::Stock), 300);
+        assert!(built.targets.is_empty());
+        assert_eq!(built.unresolved, 1);
+    }
+
+    #[test]
+    fn test_option_targets_from_depth_held_sorts_dedups_and_caps() {
+        let held = [
+            (30_u64, FNO),
+            (3, FNO),
+            (30, FNO),
+            (12, FNO),
+            (21, FNO),
+            (3, FNO),
+        ];
+        let built = option_targets_from_depth_held(&held, |_, _| Some(OptionFamily::Index), 2);
+        let ids: Vec<i64> = built.targets.iter().map(|t| t.security_id).collect();
+        assert_eq!(ids, vec![3, 12]);
+        assert_eq!(built.truncated, 2, "21 and 30 are beyond the cap");
+        assert_eq!(built.unresolved, 0);
+    }
+
+    #[test]
+    fn test_option_targets_from_depth_held_empty_input() {
+        let built = option_targets_from_depth_held(&[], family_by_parity, 300);
+        assert_eq!(built, OptionTargets::default());
+    }
+
+    #[test]
+    fn test_option_targets_from_depth_held_zero_cap_truncates_everything() {
+        let held = [(3_u64, FNO), (6, FNO)];
+        let built = option_targets_from_depth_held(&held, family_by_parity, 0);
+        assert!(built.targets.is_empty());
+        assert_eq!(built.truncated, 2);
+    }
+
+    #[test]
+    fn test_option_pass_fits_respects_the_evening_stop() {
+        let need = attempt_max_secs(XVERIFY_OPTION_PASS_BUDGET_SECS);
+        assert!(option_pass_fits(EVENING_STOP_SECS_OF_DAY_IST - need));
+        assert!(!option_pass_fits(EVENING_STOP_SECS_OF_DAY_IST - need + 1));
+        assert!(!option_pass_fits(EVENING_STOP_SECS_OF_DAY_IST));
+        assert!(!option_pass_fits(u64::MAX), "saturating add never wraps");
+        assert!(option_pass_fits(0));
+    }
+
+    #[test]
+    fn test_option_pass_budget_fits_its_target_cap_at_the_pacer() {
+        // 300 contracts at the 334 ms REST pacer is ~100 s; the budget must
+        // cover that or the pass times out before it compares the tail.
+        let needed_ms = XVERIFY_MAX_OPTION_TARGETS as u64
+            * crate::dhan_live_crossverify::XVERIFY_REST_MIN_GAP_MS;
+        assert!(needed_ms <= XVERIFY_OPTION_PASS_BUDGET_SECS * 1_000);
+    }
+
+    fn prod_src() -> &'static str {
+        include_str!("dhan_live_crossverify_boot.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or("")
+    }
+
+    fn fn_body<'a>(prod: &'a str, header: &str) -> &'a str {
+        prod.split(header)
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap_or("")
+    }
+
+    #[test]
+    fn test_run_option_pass_runs_after_the_spot_retry_loop_ends() {
+        let body = fn_body(prod_src(), "async fn run_day(");
+        let call = body.find("run_option_pass(deps, today, day_start_ist_nanos)");
+        let last_break = body.rfind("break;");
+        assert!(call.is_some(), "run_day must call run_option_pass");
+        assert!(
+            call > last_break,
+            "the option pass must run after the spot loop, never inside a retry"
+        );
+        let run_once = fn_body(prod_src(), "async fn run_once(");
+        assert!(!run_once.contains("run_option_pass"));
+    }
+
+    #[test]
+    fn test_run_option_pass_never_touches_the_marker_the_daily_row_or_a_page() {
+        let prod = prod_src();
+        for body in [
+            fn_body(prod, "async fn run_option_pass("),
+            fn_body(prod, "fn persist_option_findings("),
+        ] {
+            assert!(!body.is_empty());
+            assert!(!body.contains("write_daily_marker"));
+            assert!(!body.contains("append_daily"));
+            assert!(!body.contains("daily_row("));
+            for alarmed in [
+                "source = \"xverify_vacuous\"",
+                "source = \"xverify_failed\"",
+                "source = \"xverify_diverged\"",
+            ] {
+                assert!(
+                    !body.contains(alarmed),
+                    "option pass must not page {alarmed}"
+                );
+            }
+            assert!(!body.contains("XVERIFY_RUNS_COUNTER"));
+        }
+    }
+
+    #[test]
+    fn test_run_option_pass_reads_the_held_today_snapshot_and_the_contract_map() {
+        let body = fn_body(prod_src(), "async fn run_option_pass(");
+        assert!(body.contains("held_today_snapshot("));
+        assert!(body.contains("global_contract_underlying_map()"));
+        assert!(body.contains("option_pass_fits("));
+        assert!(body.contains("XVERIFY_OPTION_PASS_BUDGET_SECS"));
     }
 }

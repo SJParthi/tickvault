@@ -4105,3 +4105,136 @@ the pre-removal bill is −$0.10/mo. No new EMF metric name.
 **What a PR that violates §2.5 looks like (REJECT):** filters on `WS-GAP-03`
 alone; sets `ok_recovery = true`; adds a fourth xverify alarm without its own
 dated row.
+
+---
+
+## §2.6 — 2026-09-25: three live-lane pages for DELAY, not only for loss — feed delay, main-feed reconnect time, blank new depth contracts
+
+**The verbatim operator authorization (2026-09-25, typed directly in-session — preserve EXACTLY):**
+
+> "go ahead with all of these dude okay?"
+
+Given in DIRECT response to a four-item list whose first item read verbatim:
+*"Paging alarms for feed delay, reconnect time and blank new contracts, at about
+₹40 a month each."* That is the §28.2/§28.3 authorization shape this repository
+accepts: a general go-ahead that answers an ENUMERATED ask selects the enumerated
+work. This dated row is the §3 record required before any new Dhan-scoped page,
+and it is written BEFORE the terraform. It also SUPERSEDES the §2.3u addendum's
+REJECT row *"adds an alarm on `tv_dhan_ws_lag_max_ms` without a lever"* for the
+ONE alarm below. The lever gap it names is priced in `aws-budget.md` "COST NOTE
+2026-09-25". It is not hidden.
+
+**Why these three.** Every family-(5) alarm answers "did something break or get
+lost". None answers "is the data arriving LATE". A lane whose ticks arrive 60
+seconds late reads fully green today.
+
+| Alarm | Metric | Fires when | Why this shape |
+|---|---|---|---|
+| `tv-<env>-dhan-feed-delay-high` | `tv_dhan_ws_lag_max_ms` (already shipped 2026-09-24) | `Minimum >= 60000` over 300 s, for 2 of 2 periods | The gauge is each minute's WORST new-trade delay. **Minimum** over the period means every minute in 5 minutes had a trade at least 60 s late, and 2 periods means 10 minutes. One late print after a reconnect, which is a known first-minute artefact, cannot page. |
+| `tv-<env>-dhan-main-reconnect-slow` | `tv_dhan_ws_main_reconnect_recovery_max_ms` (NEW gauge) | `Maximum >= 15000` in one 300 s period | Time from a MAIN-FEED dial to its first frame. Normal is about 2 s. 15 s means the main feed was blind for 15 s on one reconnect. **Main feed only, on purpose:** a depth-200 socket re-dials about once a minute by design (`RankedRotation`), and its first frame waits for a thin book to change, so including depth would page on the design working. |
+| `tv-<env>-dhan-depth-new-contract-blank` | ratio of `tv_depth_first_packet_silent_total` to (silent + `tv_depth_first_packet_arrived_total`) (TWO new counters) | at least 5 samples in 1800 s AND at least 80% silent | A freshly subscribed depth contract that delivers no packet in 120 s. A single one is normal, because the contract may just not have traded. Most of them going blank means the vendor is not serving new subscriptions. |
+
+All three are `treat_missing_data = notBreaching` and ungated. Each is absent or
+zero off-hours by construction, and the dark-lane case is already owned by
+`dhan-no-ticks-flowing`. None takes `ok_actions`: a peak or a ratio falling back
+is the window ageing out, not a repair anyone performed.
+
+**The labelled series cannot be used.** `tv_depth_first_packet_total{outcome}` and
+the `tv_dhan_ws_reconnect_recovery_ms{endpoint}` histogram both fold to one summed
+`{host}` series in the EMF processor. So an alarm needs its own unlabelled series,
+which is why two counters and one gauge are new.
+
+**What a PR that violates §2.6 looks like (REJECT):**
+- Alarms the feed-delay gauge on `Maximum`. One stale first packet after a
+  restart would then page.
+- Includes depth endpoints in the reconnect gauge. It would page on every
+  planned rotation.
+- Pages on a single `silent_window`.
+- Adds `ok_actions` to any of the three.
+- Adds a per-connection or per-instrument dimension. The §2.3 cardinality rule
+  stands.
+
+**NOT claimed:**
+- That 60 s, 15 s and 80% are measured-optimal. `tv_dhan_ws_lag_max_ms` has no
+  full session of data yet, since it shipped on 2026-09-24 evening, and the
+  first-packet counters have never reached CloudWatch. Each threshold is set
+  where the condition is unambiguously bad. Tightening one needs a measured
+  baseline and its own dated row.
+- That the feed-delay alarm sees loss upstream at Dhan. It measures the delay
+  of trades that DID arrive.
+
+### §2.6-i — 2026-09-25 (same day): two gates on the reconnect gauge, and one residual on the delay alarm
+
+Recorded before the code, because both gates change WHICH dials the gauge sees.
+
+**Gate 1: RE-dials only.** The first dial of the day waits for the 09:15 open
+before its first frame arrives. Timing that dial would put roughly 3 minutes
+into the gauge every morning, and the alarm would page daily. The supervisor
+now keeps a never-reset `ever_delivered` flag per socket. The gauge records
+only a dial on a socket that has delivered at least once before.
+
+**Gate 2: the continuous session only.** Both the dial start and the first
+frame must fall inside 09:15–15:30 IST. A reconnect at 15:29 whose first
+frame lands after the close measures a shut market, not a slow reconnect.
+
+**Residual, not fixed:** a mid-session restart dials a NEW process whose
+sockets have never delivered, so that dial is excluded by gate 1. A slow
+reconnect after a restart is therefore not seen by this alarm. It is still
+seen by `dhan-no-ticks-flowing` and `dhan-live-lane-down`.
+
+**Residual on the delay alarm:** after a mid-session restart, the first packet
+of a quiet contract can carry a last-trade time from much earlier in the day,
+and it counts as a new trade. This alarm uses `Minimum` over two 5-minute
+periods, so one such minute cannot page. A restart that brings many quiet
+contracts back at once could hold the minimum up for one period, never two
+in a row, unless the contracts stay quiet.
+
+### §2.6-ii — 2026-09-25 (same day): the reconnect gauge timed only the LAST dial of an outage
+
+**No new authorization is claimed.** A hostile review of §2.6 found that the
+gauge could not see the case it was built for, and it is fixed before the
+alarm has ever run.
+
+**The defect.** Recovery time was measured from the per-dial stamp, and every
+`BeginDial` overwrote it. An outage made of four fast-failing dials and one
+good one, 40 s in total, reported only the last dial's ~2 s. So
+`tv-<env>-dhan-main-reconnect-slow` could never fire on a slow recovery built
+from failed retries, which is the common shape of a real outage.
+
+**The fix.** A separate `outage_started_at` stamp in the connection
+supervisor:
+
+| Event | Per-dial stamp | Outage stamp |
+|---|---|---|
+| redial scheduled (`enter_backoff`) | unchanged | set, only if empty |
+| `BeginDial` | overwritten | set, only if empty (covers the day's first dial) |
+| `DialSucceeded` | read, for transport time | unchanged |
+| first frame | cleared | taken, for recovery time |
+
+So recovery now runs from the LOSS, backoff sleep included, to the first
+frame. Transport time is unchanged. Pinned by
+`recovery_is_timed_from_the_loss_across_failed_redials`, and the source-scan
+markers moved to the new stamp.
+
+**Honest effect.** Reported recovery times will be LONGER than before, because
+they now include the backoff and every failed dial. That is the true blind
+window. The 15 s threshold is unchanged; if it pages more often, that is the
+gauge finally seeing what it was meant to see.
+
+**What a PR that violates §2.6-ii looks like (REJECT):** measures recovery from
+the per-dial stamp again; resets the outage stamp on `BeginDial` or on a failed
+dial; or clears it anywhere but the first frame.
+
+### §2.3w addendum — 2026-09-25: the held-today refusal is a LOG-ONLY `WS-GAP-02` source
+
+`depth_subscription_view.rs` keeps the day's set of contracts held by either
+depth pool, for the §12.15.6 after-close option cross-check. It is capped at
+`MAX_DEPTH_HELD_TODAY`. Past the cap a new contract is refused, counted on
+`tv_depth_view_held_today_refused_total`, and logged ONCE per IST day as
+`warn!(code = WS-GAP-02, source = "held_today_full")`.
+
+No page, no EMF name, no alarm. The cost of a refusal is that the refused
+contract is not cross-checked that evening; capture itself is untouched. The
+§2.3m filter is scoped to `swap_emptied_socket` and cannot see this source,
+by design. The `warn!` exists so the counter reaches an operator surface, as
+`loss_counter_visibility_guard` requires.

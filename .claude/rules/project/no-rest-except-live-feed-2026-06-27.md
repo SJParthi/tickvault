@@ -2118,3 +2118,37 @@ Recorded before the code, per the rule-file-first law. It changes WHEN the §12.
 **⚠ Honest limit.** A boot catch-up that starts after about 17:14 IST gets no retry, because its next attempt could not finish before 17:30. That day falls back to the §12.15.2 hold ceiling, as before.
 
 **What a PR that violates §12.15.5 looks like (REJECT):** pages `xverify_failed` or `xverify_vacuous` on every attempt; starts an attempt that could still be running at 17:30; raises the attempt count or shortens the interval without re-checking the evening-stop fit; writes the marker on any condition other than `classify_attempt` returning `Ok`.
+
+### §12.15.6 — 2026-09-25: the depth-held OPTION contracts are checked too, in a separate pass
+
+**The verbatim operator authorization (2026-09-25, typed directly in-session):**
+
+> "go ahead with all of these dude okay?"
+
+Given in DIRECT response to a list whose second item was: *"An after-close check of the day's depth-held OPTION contracts against Dhan's own 1-minute record. A dated rule amendment must land first."* That is the §28.2/§28.3 authorization shape: a general go-ahead answering an ENUMERATED list selects the enumerated work. Recorded HERE before the code, per the rule-file-first law.
+
+**The gap.** §12.15 compares spot and index targets only. F&O contracts were skipped because `dhan_intraday_instrument_for` cannot derive a Dhan `instrument` string from the segment alone (§12.15.3). So the contracts the depth sockets watched all day — the ones the operator cares most about — were never checked against any external record.
+
+**Why it is derivable now.** A depth-held contract is always an option (depth-20 and depth-200 carry stock and index options, never futures — 2026-09-18 THIRD). The contract map already classifies every option as `OptionFamily::Index` or `OptionFamily::Stock` from the daily master, which is exactly `OPTIDX` or `OPTSTK`. No guessing.
+
+| Aspect | Locked value |
+|---|---|
+| Scope | contracts held by EITHER depth pool at any publish during the IST day, segment `NSE_FNO` only |
+| Instrument string | `OPTIDX` for `OptionFamily::Index`, `OPTSTK` for `OptionFamily::Stock`, from the contract map. A contract the map cannot resolve is COUNTED and skipped, never guessed |
+| Cap | `XVERIFY_MAX_OPTION_TARGETS` = **300**, taken in `security_id` order; the rest are counted as truncated |
+| When | ONCE per trading day, after the spot check's outcome is final (success or last attempt), same task |
+| Budget | its own `run_budget_secs` (`XVERIFY_OPTION_PASS_BUDGET_SECS` = **150**); the pass starts only if it can finish by **17:30 IST** |
+| Pacing | the existing 334 ms REST pacer — ≤ 3 requests/s, ~100 s for 300 contracts |
+| Persisted | cell and tape rows only, into the same audit tables. **NO daily row** — the daily DEDUP key `(ts, trading_date_ist, feed, outcome)` would collide with the spot row |
+| Marker / S3 hold | **UNAFFECTED.** The option pass never writes, blocks or delays the §12.15.2 day marker, and never changes the retry verdict |
+| Page | **NONE.** A catastrophic divergence logs one `warn!` with `source = "xverify_options_diverged"`; no filter matches it |
+| Counter | `tv_dhan_xverify_option_pass_total{outcome}` — local `/metrics` only, no EMF name, no alarm |
+| `oi` | stays `false` in the request body, as for the spot check |
+
+**⚠ Honest limits (Rule 11).**
+- The held-today set lives in RAM. A restart forgets contracts held only before it; those are not checked that day.
+- It checks the MAIN-FEED CANDLES of the depth-held contracts, not the depth books. Dhan publishes no historical depth record to compare against.
+- A thin option can have legitimate `missing_live` / `missing_rest` minutes; they are reported, not treated as divergence.
+- No live run has happened yet. The first session with this build is the measurement.
+
+**What a PR that violates §12.15.6 looks like (REJECT):** lets the option pass affect the day marker or the retry verdict; appends a daily row from the option pass; guesses an instrument string for an unresolved contract; checks futures or `BSE_FNO` under cover of this section; raises the cap or the budget without re-checking the 17:30 fit; adds an alarm or EMF name for the option pass without its own dated row and a lever.

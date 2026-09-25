@@ -147,6 +147,15 @@ pub const MAX_DROPPED_TRACKED: usize = 4096;
 /// Counter: dropped-map inserts refused at [`MAX_DROPPED_TRACKED`]. Expected 0.
 pub const DROPPED_REFUSED_COUNTER: &str = "tv_depth_view_dropped_refused_total";
 
+/// Ceiling on the day-scoped held-today set (§12.15.6). Both pools together
+/// hold at most 255 contracts at once; 4,096 leaves room for a full day of
+/// rotation. Past it a NEW key is refused and counted, never an old one
+/// evicted — the option check then under-covers, it never mis-covers.
+pub const MAX_DEPTH_HELD_TODAY: usize = 4096;
+
+/// Counts keys refused by [`MAX_DEPTH_HELD_TODAY`]. Local `/metrics` only.
+pub const HELD_TODAY_REFUSED_COUNTER: &str = "tv_depth_view_held_today_refused_total";
+
 /// One pool's published set, plus the two-slot view over both pools.
 ///
 /// Cloned by `Arc` at the boot site: the two steering loops each hold a handle
@@ -172,6 +181,23 @@ pub struct DepthSubscriptionView {
     /// refused when the frame's clock has run more than
     /// [`GHOST_VERDICT_MAX_PUBLISH_AGE_SECS`] past it — see that constant.
     last_publish_secs: std::sync::atomic::AtomicI64,
+    /// Every contract either pool held at ANY publish during the current IST
+    /// day. Read once, after close, by the option cross-verification pass
+    /// (`no-rest-except-live-feed-2026-06-27.md` §12.15.6). Written only on
+    /// the two once-a-minute publishes, so a `Mutex` costs nothing on a hot
+    /// path; bounded by [`MAX_DEPTH_HELD_TODAY`].
+    held_today: std::sync::Mutex<HeldToday>,
+}
+
+/// The day-scoped union behind [`DepthSubscriptionView::held_today_snapshot`].
+#[derive(Debug, Default)]
+struct HeldToday {
+    /// IST day number (days since the epoch, IST) the set belongs to.
+    ist_day: i64,
+    keys: HashSet<Key>,
+    /// Latched once a refusal has been logged this IST day, so a full set
+    /// logs once per day rather than on every per-minute publish.
+    refusal_logged: bool,
 }
 
 impl DepthSubscriptionView {
@@ -202,6 +228,7 @@ impl DepthSubscriptionView {
     {
         let next = Self::collect(held);
         let previous = self.depth20.load_full();
+        self.accumulate_held_today(&next, now_secs);
         let _refused = self.record_dropped(&previous, &next, now_secs);
         self.depth20.store(Arc::new(next));
     }
@@ -221,8 +248,87 @@ impl DepthSubscriptionView {
     {
         let next = Self::collect(held);
         let previous = self.depth200.load_full();
+        self.accumulate_held_today(&next, now_secs);
         let _refused = self.record_dropped(&previous, &next, now_secs);
         self.depth200.store(Arc::new(next));
+    }
+
+    /// IST day number for an epoch-seconds instant.
+    fn ist_day_of(now_secs: i64) -> i64 {
+        now_secs
+            .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_SECONDS_I64)
+            .div_euclid(i64::from(tickvault_common::constants::SECONDS_PER_DAY))
+    }
+
+    /// Unions one publish into the day-scoped held-today set, resetting it
+    /// when the IST day changes. O(|next|), once a minute per pool.
+    fn accumulate_held_today(&self, next: &HashSet<Key>, now_secs: i64) {
+        let day = Self::ist_day_of(now_secs);
+        let mut guard = self
+            .held_today
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.ist_day != day {
+            guard.ist_day = day;
+            guard.keys.clear();
+            guard.refusal_logged = false;
+        }
+        let mut refused: u64 = 0;
+        for key in next {
+            if guard.keys.contains(key) {
+                continue;
+            }
+            if guard.keys.len() >= MAX_DEPTH_HELD_TODAY {
+                refused = refused.saturating_add(1);
+                continue;
+            }
+            guard.keys.insert(*key);
+        }
+        let first_refusal_today = refused > 0 && !guard.refusal_logged;
+        if first_refusal_today {
+            guard.refusal_logged = true;
+        }
+        let tracked = guard.keys.len();
+        drop(guard);
+        if refused > 0 {
+            metrics::counter!(HELD_TODAY_REFUSED_COUNTER).increment(refused);
+        }
+        // Once per IST day: a set at its cap refuses on every later publish,
+        // and one line says what the counter says without a line a minute.
+        if first_refusal_today {
+            tracing::warn!(
+                code =
+                    tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching.code_str(),
+                source = "held_today_full",
+                counter = HELD_TODAY_REFUSED_COUNTER,
+                refused,
+                tracked,
+                cap = MAX_DEPTH_HELD_TODAY,
+                "depth held-today set is full; later contracts are not checked by the after-close option cross-verification today"
+            );
+        }
+    }
+
+    /// Every contract either pool held at any publish during the IST day of
+    /// `now_secs`, sorted by `(security_id, segment code)`. Empty if nothing
+    /// was published today (a set from an earlier day is never returned).
+    ///
+    /// Read once after close by the option cross-verification pass. O(n log n)
+    /// in the day's held set, n <= [`MAX_DEPTH_HELD_TODAY`].
+    #[must_use]
+    pub fn held_today_snapshot(&self, now_secs: i64) -> Vec<Key> {
+        let day = Self::ist_day_of(now_secs);
+        let guard = self
+            .held_today
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.ist_day != day {
+            return Vec::new();
+        }
+        let mut out: Vec<Key> = guard.keys.iter().copied().collect();
+        drop(guard);
+        out.sort_unstable();
+        out
     }
 
     fn collect<I>(held: I) -> HashSet<Key>
@@ -521,6 +627,7 @@ pub fn global_depth_subscription_view() -> &'static Arc<DepthSubscriptionView> {
 /// `pre_register_*` seeds, so the ordering rule lives in one place.
 pub fn pre_register_view_counters() {
     metrics::counter!(DROPPED_REFUSED_COUNTER).increment(0);
+    metrics::counter!(HELD_TODAY_REFUSED_COUNTER).increment(0);
 }
 
 #[cfg(test)]
@@ -1092,5 +1199,79 @@ mod tests {
              every site; a literal at one of them is how a seed and an \
              increment drift onto two different names"
         );
+    }
+
+    // 2026-09-25 12:00 IST = 06:30 UTC, as epoch seconds.
+    const NOON_IST_2026_09_25: i64 = 1_790_317_800;
+
+    #[test]
+    fn held_today_snapshot_unions_both_pools_and_keeps_a_dropped_contract() {
+        let view = DepthSubscriptionView::new();
+        let t = NOON_IST_2026_09_25;
+        view.publish_depth20_at([(42, NSE_FNO)], t);
+        view.publish_depth200_at([(7, NSE_FNO)], t);
+        // 42 leaves depth-20 a minute later — it was still held TODAY.
+        view.publish_depth20_at([(43, NSE_FNO)], t + 60);
+        let code = NSE_FNO.binary_code();
+        assert_eq!(
+            view.held_today_snapshot(t + 120),
+            vec![(7, code), (42, code), (43, code)]
+        );
+    }
+
+    #[test]
+    fn held_today_snapshot_is_empty_on_a_different_ist_day() {
+        let view = DepthSubscriptionView::new();
+        let t = NOON_IST_2026_09_25;
+        view.publish_depth20_at([(42, NSE_FNO)], t);
+        assert!(view.held_today_snapshot(t + 86_400).is_empty());
+        assert!(view.held_today_snapshot(t - 86_400).is_empty());
+    }
+
+    #[test]
+    fn held_today_snapshot_resets_when_the_ist_day_changes() {
+        let view = DepthSubscriptionView::new();
+        let t = NOON_IST_2026_09_25;
+        view.publish_depth20_at([(42, NSE_FNO)], t);
+        view.publish_depth20_at([(43, NSE_FNO)], t + 86_400);
+        assert_eq!(
+            view.held_today_snapshot(t + 86_400),
+            vec![(43, NSE_FNO.binary_code())]
+        );
+    }
+
+    #[test]
+    fn held_today_snapshot_uses_the_ist_day_not_the_utc_day() {
+        // 00:10 IST on 26 Sep is still 25 Sep in UTC. The set published at
+        // noon IST on the 25th must NOT be returned — it is a different
+        // trading day.
+        let view = DepthSubscriptionView::new();
+        let t = NOON_IST_2026_09_25;
+        view.publish_depth20_at([(42, NSE_FNO)], t);
+        let ten_past_midnight_ist = t + 12 * 3600 + 600;
+        assert!(view.held_today_snapshot(ten_past_midnight_ist).is_empty());
+    }
+
+    #[test]
+    fn held_today_snapshot_keeps_the_segment_so_a_collision_stays_two_keys() {
+        let view = DepthSubscriptionView::new();
+        let t = NOON_IST_2026_09_25;
+        view.publish_depth20_at([(13, NSE_FNO), (13, IDX)], t);
+        assert_eq!(view.held_today_snapshot(t).len(), 2);
+    }
+
+    #[test]
+    fn held_today_refuses_new_keys_past_the_cap_and_never_evicts() {
+        let view = DepthSubscriptionView::new();
+        let t = NOON_IST_2026_09_25;
+        let first: Vec<(u64, ExchangeSegment)> = (0..MAX_DEPTH_HELD_TODAY as u64)
+            .map(|id| (id, NSE_FNO))
+            .collect();
+        view.publish_depth20_at(first, t);
+        view.publish_depth20_at([(999_999, NSE_FNO)], t + 60);
+        let snap = view.held_today_snapshot(t + 60);
+        assert_eq!(snap.len(), MAX_DEPTH_HELD_TODAY);
+        assert!(snap.contains(&(0, NSE_FNO.binary_code())));
+        assert!(!snap.contains(&(999_999, NSE_FNO.binary_code())));
     }
 }

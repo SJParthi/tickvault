@@ -209,6 +209,13 @@ const KNOWN_GAUGES: &[&str] = &[
     // per-window MAXIMUM that is published verbatim, so there is no delta and
     // no dropped first sample. Same class as `tv_depth_rebalance_age_secs`.
     "tv_dhan_feed_ring_dwell_max_ms",
+    // ADDED 2026-09-25 with the feed-delay and slow-reconnect alarms
+    // (noise-lock §2.6). Both are published through the same one-minute
+    // peak hold as the ring-dwell gauge: a per-window MAXIMUM set with
+    // `metrics::gauge!(..).set(..)`, published verbatim, so there is no delta
+    // and no dropped first sample.
+    "tv_dhan_ws_lag_max_ms",
+    "tv_dhan_ws_main_reconnect_recovery_max_ms",
 ];
 
 /// Maps `const NAME: &str = "tv_...";` to its literal, workspace-wide, so a

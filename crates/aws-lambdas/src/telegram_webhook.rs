@@ -153,7 +153,7 @@ pub const GENERIC_SAFE_LINE: &str = "🔔 Alert received — details are in the 
 ///
 /// O(n) scan per lookup — cold path (a handful of alarm renders per SNS
 /// batch), deliberately not a hash map so the table stays a reviewable literal.
-pub const ALARM_PHRASES: [(&str, &str); 108] = [
+pub const ALARM_PHRASES: [(&str, &str); 111] = [
     // ---- capacity + candle building ----
     (
         "aggregator-refusal-rate-high",
@@ -344,6 +344,18 @@ pub const ALARM_PHRASES: [(&str, &str); 108] = [
     (
         "dhan-ring-dwell-high",
         "🔷 DHAN: prices are waiting too long in the incoming buffer — this is the early warning that comes BEFORE prices start being refused",
+    ),
+    (
+        "dhan-feed-delay-high",
+        "🔷 DHAN: live prices are reaching us more than a minute after the trade happened, for 10 minutes straight",
+    ),
+    (
+        "dhan-main-reconnect-slow",
+        "🔷 DHAN: the main price connection dropped and took more than 15 seconds to start delivering prices again",
+    ),
+    (
+        "dhan-depth-new-contract-blank",
+        "🔷 DHAN: most newly added order-book contracts stayed blank for 2 minutes after being added",
     ),
     (
         "dhan-wal-dropped",
