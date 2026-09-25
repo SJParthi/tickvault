@@ -9,8 +9,8 @@ Share the GitHub link in the Gmail reply — do NOT copy-paste plain text.
 
 **To:** apihelp@dhan.co
 **From:** sjparthi93@gmail.com
-**Subject:** New Ticket — Full Market Depth: is RequestCode 25 implemented on the Indian feed, or is RequestCode 12 (Feed Disconnect) the only way to change a depth socket's instrument set? (two full sessions of measurements inside)
-**Date:** 2026-09-13
+**Subject:** New Ticket — Full Market Depth: is RequestCode 25 implemented on the Indian feed, or is RequestCode 12 (Feed Disconnect) the only way to change a depth socket's instrument set? (three sessions of measurements inside)
+**Date:** 2026-09-13 (drafted) · 2026-09-25 (sent, with the 2026-09-24 session and our current design added)
 
 ---
 
@@ -74,11 +74,15 @@ On 2026-09-11 the identical frames were sent with `"RequestCode":24`.
 
 This is itself part of our question. The socket does not close, no error frame arrives, no disconnect packet (feed code 50) arrives, and no acknowledgement arrives. From our side a delivered-and-ignored unsubscribe and a never-received unsubscribe are indistinguishable.
 
-### Honesty note — we cannot yet name the ghosting contracts
+### Honesty note — why this report names no contracts
 
-Your support process, and our own, normally requires a precise contract label and a SecurityId for every instrument cited. **For these two sessions we cannot supply them, and we will not guess.** Until 2026-09-11 the log line that records a ghost carried only the connection index, the endpoint, the ghost packet count and the redial count — it did **not** carry an instrument identifier. Per-contract identification was added on 2026-09-11 and ships from the next session onward.
+Your support process, and our own, normally requires a precise contract label and a SecurityId for every instrument cited. **We are not citing any, and we will not guess.**
 
-So this report gives you **counts, codes and frame shapes**, which are exact, and no contract labels, which we do not have for these dates. **We will follow up with named contracts — precise labels plus SecurityIds — from the next session.** If you would rather wait for that follow-up before investigating, please say so and we will send it as soon as it exists.
+- On 2026-09-10 and 2026-09-11 the log line that records a ghost did not yet carry an instrument identifier.
+- We added one, and a third session on **2026-09-24** (`RequestCode 25`, 1,724 unsubscribes: 1,517 on 200-level sockets and 207 on 20-level sockets) produced **41 ghost verdicts**, each naming a SecurityId.
+- When we traced those 41 back to our own send log, **most could not be matched to an unsubscribe of that instrument on the same socket.** Our selection moves an instrument between sockets within a minute, and our detector cannot attribute a late packet cleanly when that happens. Some of those verdicts may be our own misattribution, not your servers.
+
+So this report gives you **counts, codes and frame shapes**, which are exact, and makes no per-contract claim. The clean way to settle it is the single-socket test offered at the end: one named contract, one socket, one unsubscribe, and nothing else that could move.
 
 ---
 
@@ -173,7 +177,9 @@ Field ABSENT on 2026-09-10 and 2026-09-11 : security_id  (added 2026-09-11, ship
 
 ---
 
-We are happy to run any diagnostic tests you need: a packet capture of the exact unsubscribe frames we send; a **single-socket controlled test** on one named contract at a time of your choosing, so you can watch one instrument on your side while we watch it on ours; and testing any alternative RequestCode you nominate, on any endpoint and in any session window you prefer. We can also supply per-contract identification from our next session onward. This is blocking our ability to rotate depth subscriptions without re-dialling connections, and we would prefer to stop re-dialling.
+**What we changed in the meantime.** From 2026-09-25 we stopped relying on the per-instrument unsubscribe. Our 20-level sockets now hold one fixed instrument set for the whole day. Our 200-level sockets change instrument by closing the socket and dialling a fresh one, at most once per socket per minute, and never more than five times a minute in total. That works, but it costs a reconnect every time, and your answer to question 3 decides whether it is the right design.
+
+We are happy to run any diagnostic tests you need: a packet capture of the exact unsubscribe frames we send; a **single-socket controlled test** on one named contract at a time of your choosing, so you can watch one instrument on your side while we watch it on ours; and testing any alternative RequestCode you nominate, on any endpoint and in any session window you prefer. If a per-instrument unsubscribe does work, we would rather use it than keep re-dialling.
 
 Thank you,
 **Parthiban Subramanian**
