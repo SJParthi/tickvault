@@ -1117,10 +1117,21 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // Unalarmed on purpose: dhan-rest-only-noise-lock-2026-07-14.md §2.3u
     // addendum (2026-09-24) records why. +$0.30/mo, cost note in aws-budget.md
     // "COST NOTE 2026-09-24".
+    //
+    // 2026-09-25: 99 -> 102, the three §2.6 alarm inputs --
+    // tv_dhan_ws_main_reconnect_recovery_max_ms (worst main-feed re-dial
+    // recovery, re-dials only, 09:15-15:30 IST only) and the unlabelled
+    // twins tv_depth_first_packet_arrived_total / _silent_total (the EMF
+    // processor folds labels, so the labelled outcome counter cannot be
+    // alarmed as a ratio). Authorized by dhan-rest-only-noise-lock-2026-07-14.md
+    // §2.6. +$0.90/mo names + 3 alarms $0.30 + metric-math ~$0.10 = ~$1.30/mo; aws-budget.md
+    // "COST NOTE 2026-09-25" records that §2.3n's lever rule is NOT met.
     assert_eq!(
         names.len(),
-        99,
-        "Z+ L2 VERIFY ratchet: expected exactly 99 names in the MAIN EMF \
+        102,
+        "Z+ L2 VERIFY ratchet: expected exactly 102 names in the MAIN EMF \
+         (2026-09-25: 99 -> 102, the three §2.6 alarm inputs, see aws-budget.md \
+         COST NOTE 2026-09-25.) \
          (2026-09-24: 98 -> 99, tv_dhan_ws_lag_max_ms, see aws-budget.md \
          COST NOTE 2026-09-24.) \
          (2026-09-16 TWELFTH: 110 -> 98, a REMOVAL of twelve and the second \

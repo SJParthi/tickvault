@@ -153,6 +153,20 @@ pub const FIRST_PACKET_LATENCY_MS: &str = "tv_depth_first_packet_latency_ms";
 /// Counter, labelled `outcome`: how each awaited subscribe resolved.
 pub const FIRST_PACKET_OUTCOME: &str = "tv_depth_first_packet_total";
 
+/// Unlabelled twin of the `arrived` outcome, read by the
+/// `tv-<env>-dhan-depth-new-contract-blank` alarm (noise lock §2.6).
+///
+/// It exists because the CloudWatch EMF processor folds every label value of a
+/// counter into one summed `{host}` series, so `tv_depth_first_packet_total`
+/// in CloudWatch is arrived + silent + refused + unmeasurable + reordered, and
+/// no alarm can read one outcome from it. Incremented beside the labelled
+/// counter, at the same site, by the same amount.
+pub const FIRST_PACKET_ARRIVED_TOTAL: &str = "tv_depth_first_packet_arrived_total";
+
+/// Unlabelled twin of the `silent_window` outcome — the numerator of the
+/// blank-contract alarm. See [`FIRST_PACKET_ARRIVED_TOTAL`].
+pub const FIRST_PACKET_SILENT_TOTAL: &str = "tv_depth_first_packet_silent_total";
+
 /// Every `outcome` label value, so all five series exist at zero from boot.
 ///
 /// The CloudWatch agent drops the first sample of a series it has never seen,
@@ -388,6 +402,7 @@ impl DepthFirstPacketTracker {
         }
         let elapsed = at_nanos.saturating_sub(subscribed_at);
         metrics::counter!(FIRST_PACKET_OUTCOME, "outcome" => "arrived").increment(1);
+        metrics::counter!(FIRST_PACKET_ARRIVED_TOTAL).increment(1);
         // FLOAT division. `(elapsed / NANOS_PER_MILLI) as f64` divides as
         // INTEGERS first, so every sub-millisecond arrival records as 0.0 —
         // and the fast end is the end this instrument exists to see.
@@ -428,6 +443,7 @@ impl DepthFirstPacketTracker {
         if expired > 0 {
             metrics::counter!(FIRST_PACKET_OUTCOME, "outcome" => "silent_window")
                 .increment(expired as u64);
+            metrics::counter!(FIRST_PACKET_SILENT_TOTAL).increment(expired as u64);
         }
         expired
     }
@@ -445,6 +461,11 @@ pub fn pre_register_first_packet_counters() {
     for outcome in FIRST_PACKET_OUTCOMES {
         metrics::counter!(FIRST_PACKET_OUTCOME, "outcome" => outcome).increment(0);
     }
+    // The two alarmed twins. Both are the numerator/denominator of a ratio
+    // alarm, and a first increment that the agent drops would silently shift
+    // that ratio on exactly the session it first fires.
+    metrics::counter!(FIRST_PACKET_ARRIVED_TOTAL).increment(0);
+    metrics::counter!(FIRST_PACKET_SILENT_TOTAL).increment(0);
 }
 
 /// The one tracker. The steering task writes it, the frame drain reads it —
@@ -789,6 +810,26 @@ mod tests {
         assert!(FIRST_PACKET_OUTCOMES.contains(&"unmeasurable"));
         assert!(FIRST_PACKET_OUTCOMES.contains(&"reordered"));
         pre_register_first_packet_counters();
+    }
+
+    /// The blank-contract alarm reads these two by exact name; a rename on
+    /// either side leaves a ratio of nothing over nothing, which is green.
+    #[test]
+    fn the_alarmed_twins_keep_their_wire_names_and_are_seeded() {
+        assert_eq!(
+            FIRST_PACKET_ARRIVED_TOTAL,
+            "tv_depth_first_packet_arrived_total"
+        );
+        assert_eq!(
+            FIRST_PACKET_SILENT_TOTAL,
+            "tv_depth_first_packet_silent_total"
+        );
+        let src = include_str!("depth_first_packet.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or_default();
+        assert!(prod.contains("counter!(FIRST_PACKET_ARRIVED_TOTAL).increment(1)"));
+        assert!(prod.contains("counter!(FIRST_PACKET_SILENT_TOTAL).increment(expired as u64)"));
+        assert!(prod.contains("counter!(FIRST_PACKET_ARRIVED_TOTAL).increment(0)"));
+        assert!(prod.contains("counter!(FIRST_PACKET_SILENT_TOTAL).increment(0)"));
     }
 
     /// The bug this pins: `record_subscribe_at` keyed on `segment as u8`

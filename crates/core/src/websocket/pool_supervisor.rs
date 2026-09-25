@@ -542,6 +542,84 @@ pub const DIAL_MS_METRIC: &str = "tv_dhan_ws_dial_ms";
 /// per-frame work on a path that sees every frame.
 pub const RECONNECT_RECOVERY_MS_METRIC: &str = "tv_dhan_ws_reconnect_recovery_ms";
 
+/// Gauge: the WORST main-feed reconnect recovery, in milliseconds, since the
+/// last read. It is the value behind `tv-<env>-dhan-main-reconnect-slow`.
+///
+/// # Why a separate series
+///
+/// [`RECONNECT_RECOVERY_MS_METRIC`] is a histogram labelled by `endpoint`.
+/// The EMF processor folds labels into one summed `{host}` series, so an
+/// alarm on it would mix depth rotations with main-feed reconnects. This
+/// series carries the main feed only, and only the dials that count (see
+/// [`main_recovery_sample_ms`]).
+///
+/// Published by the app's frame drain through a 60 s peak hold. This crate
+/// only keeps the running maximum and hands it over with
+/// [`take_main_feed_reconnect_recovery_max_ms`].
+pub const MAIN_RECONNECT_RECOVERY_MAX_MS_GAUGE: &str = "tv_dhan_ws_main_reconnect_recovery_max_ms";
+
+/// The end of the window a main-feed reconnect is timed in: 15:30 IST, the
+/// close of continuous trading. A reconnect whose first frame lands after the
+/// close measures a shut market, not a slow reconnect.
+pub const MAIN_RECOVERY_WINDOW_CLOSE_SECS_OF_DAY_IST: u32 = 15 * 3600 + 30 * 60;
+
+const _: () = assert!(
+    CONTINUOUS_SESSION_OPEN_SECS_OF_DAY_IST < MAIN_RECOVERY_WINDOW_CLOSE_SECS_OF_DAY_IST,
+    "the reconnect timing window must open before it closes"
+);
+
+/// The running maximum behind [`MAIN_RECONNECT_RECOVERY_MAX_MS_GAUGE`]. Zero
+/// means no qualifying reconnect since the last take.
+static MAIN_FEED_RECOVERY_MAX_MS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+/// Decides whether one first-frame transition is a main-feed reconnect worth
+/// timing, and returns the sample if it is.
+///
+/// A sample counts only when ALL of these hold:
+/// - the socket is a main-feed socket (depth-200 re-dials every minute by
+///   design, so its dials would page on the design working);
+/// - the socket had delivered at least once before this dial (the day's first
+///   dial waits for the 09:15 open and would read as a 3-minute reconnect);
+/// - the first frame lands before 15:30 IST;
+/// - the dial started at or after 09:15 IST.
+///
+/// Pure and O(1): two compares and one subtraction, no clock read.
+#[must_use]
+pub const fn main_recovery_sample_ms(
+    is_main_feed: bool,
+    was_ever_delivered: bool,
+    elapsed_ms: i64,
+    now_secs_of_day_ist: u32,
+) -> Option<i64> {
+    if !is_main_feed || !was_ever_delivered || elapsed_ms < 0 {
+        return None;
+    }
+    if now_secs_of_day_ist >= MAIN_RECOVERY_WINDOW_CLOSE_SECS_OF_DAY_IST {
+        return None;
+    }
+    let dial_started_ms = (now_secs_of_day_ist as i64) * 1000 - elapsed_ms;
+    if dial_started_ms < (CONTINUOUS_SESSION_OPEN_SECS_OF_DAY_IST as i64) * 1000 {
+        return None;
+    }
+    Some(elapsed_ms)
+}
+
+/// Records one qualifying sample into the running maximum. O(1), lock-free.
+fn record_main_feed_recovery_ms(sample_ms: i64) {
+    MAIN_FEED_RECOVERY_MAX_MS.fetch_max(sample_ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Hands over the worst main-feed reconnect recovery since the last call, in
+/// milliseconds, and resets it to zero. The app's frame drain calls this on
+/// every publish and feeds the value into its 60 s peak hold.
+///
+/// Zero means no qualifying reconnect happened in that interval.
+#[must_use]
+pub fn take_main_feed_reconnect_recovery_max_ms() -> f64 {
+    MAIN_FEED_RECOVERY_MAX_MS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64
+}
+
 /// Histogram: wall-clock milliseconds ONE leg of a depth swap spent on the
 /// wire. Labels: `endpoint`, `leg` (`unsubscribe` | `subscribe`).
 ///
@@ -1450,6 +1528,14 @@ pub struct ConnectionSupervisor {
     /// a fresh budget on the strength of the good hours is how "one bounded
     /// re-dial" turns into an unbounded loop with extra steps.
     respawn_used: bool,
+    /// Whether this slot has EVER delivered a frame this session.
+    ///
+    /// Never reset. It separates a RE-dial from the day's first dial for the
+    /// main-feed reconnect-time gauge: the first dial of the morning always
+    /// takes as long as the pre-open silence, so timing it would page every
+    /// trading day for a socket that is healthy. Only a socket that was
+    /// delivering, lost it, and came back is a reconnect.
+    ever_delivered: bool,
 }
 
 impl ConnectionSupervisor {
@@ -1473,6 +1559,7 @@ impl ConnectionSupervisor {
             reconnects: 0,
             park_reason: None,
             respawn_used: false,
+            ever_delivered: false,
         }
     }
 
@@ -1624,13 +1711,27 @@ impl ConnectionSupervisor {
                     // The true blind window: dial -> subscribe dispatch -> Dhan
                     // applying it -> the book next changing. TAKEN, so a second
                     // frame cannot record a second sample for one dial.
+                    let was_ever_delivered = self.ever_delivered;
                     if let Some(started) = self.dial_started_at.take() {
+                        let elapsed = now.saturating_duration_since(started);
                         metrics::histogram!(
                             RECONNECT_RECOVERY_MS_METRIC,
                             "endpoint" => self.slot.endpoint.as_str()
                         )
-                        .record(now.saturating_duration_since(started).as_secs_f64() * 1000.0);
+                        .record(elapsed.as_secs_f64() * 1000.0);
+                        // The alarmed main-feed peak: re-dials only, inside
+                        // the continuous session (see main_recovery_sample_ms).
+                        let elapsed_ms = i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX);
+                        if let Some(sample_ms) = main_recovery_sample_ms(
+                            self.slot.endpoint == DhanEndpointType::MainFeed,
+                            was_ever_delivered,
+                            elapsed_ms,
+                            tickvault_common::market_hours::now_ist_secs_of_day(),
+                        ) {
+                            record_main_feed_recovery_ms(sample_ms);
+                        }
                     }
+                    self.ever_delivered = true;
                     // Start the health clock at the FIRST frame. The attempt
                     // reset above is retained for compatibility with the
                     // ladder's own semantics, but it no longer implies an
@@ -13180,6 +13281,111 @@ mod tests {
             production.len() < src.len(),
             "the production cut must actually remove the test module, or this file's own \
              assertion text counts as production source"
+        );
+    }
+
+    // ---- main-feed reconnect-time gauge (dhan-rest-only-noise-lock §2.6-i) ----
+
+    const T_1000: u32 = 10 * 3600;
+
+    #[test]
+    fn test_main_recovery_sample_ms_inside_the_session_is_sampled() {
+        assert_eq!(
+            main_recovery_sample_ms(true, true, 4_200, T_1000),
+            Some(4_200)
+        );
+    }
+
+    #[test]
+    fn the_first_dial_of_the_day_is_never_sampled() {
+        assert_eq!(main_recovery_sample_ms(true, false, 4_200, T_1000), None);
+    }
+
+    #[test]
+    fn a_depth_socket_is_never_sampled() {
+        assert_eq!(main_recovery_sample_ms(false, true, 4_200, T_1000), None);
+    }
+
+    #[test]
+    fn a_first_frame_at_or_after_1530_is_never_sampled() {
+        assert_eq!(
+            main_recovery_sample_ms(
+                true,
+                true,
+                1_000,
+                MAIN_RECOVERY_WINDOW_CLOSE_SECS_OF_DAY_IST
+            ),
+            None
+        );
+        assert_eq!(
+            main_recovery_sample_ms(
+                true,
+                true,
+                1_000,
+                MAIN_RECOVERY_WINDOW_CLOSE_SECS_OF_DAY_IST - 1
+            ),
+            Some(1_000)
+        );
+    }
+
+    #[test]
+    fn a_dial_that_started_before_0915_is_never_sampled() {
+        // First frame at 09:16:00, dial started 09:14:00 (120 s before).
+        let first_frame = CONTINUOUS_SESSION_OPEN_SECS_OF_DAY_IST + 60;
+        assert_eq!(
+            main_recovery_sample_ms(true, true, 120_000, first_frame),
+            None
+        );
+        // Same first frame, dial started exactly at 09:15:00 — counts.
+        assert_eq!(
+            main_recovery_sample_ms(true, true, 60_000, first_frame),
+            Some(60_000)
+        );
+    }
+
+    #[test]
+    fn a_negative_elapsed_is_never_sampled() {
+        assert_eq!(main_recovery_sample_ms(true, true, -1, T_1000), None);
+    }
+
+    #[test]
+    fn a_huge_elapsed_cannot_overflow_the_window_check() {
+        assert_eq!(main_recovery_sample_ms(true, true, i64::MAX, T_1000), None);
+    }
+
+    #[test]
+    fn test_take_main_feed_reconnect_recovery_max_ms_hands_over_the_running_maximum() {
+        // A unique, very large value so a concurrent test cannot exceed it.
+        record_main_feed_recovery_ms(987_654_321);
+        record_main_feed_recovery_ms(5);
+        assert!(take_main_feed_reconnect_recovery_max_ms() >= 987_654_321.0);
+    }
+
+    #[test]
+    fn the_first_frame_block_feeds_the_main_feed_gauge() {
+        let src = include_str!("pool_supervisor.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src
+            .split_once(&format!("\n{test_marker}"))
+            .map_or(src, |(head, _)| head);
+        let block = production
+            .find("ConnEvent::FrameReceived => {")
+            .expect("the first-frame arm must exist");
+        let tail = &production[block..];
+        let end = tail.find("SupervisorAction::Continue").expect("arm end");
+        let arm = &tail[..end];
+        for marker in [
+            "let was_ever_delivered = self.ever_delivered;",
+            "main_recovery_sample_ms(",
+            "record_main_feed_recovery_ms(sample_ms)",
+            "self.ever_delivered = true;",
+        ] {
+            assert!(arm.contains(marker), "first-frame arm lost {marker:?}");
+        }
+        assert!(
+            arm.find("let was_ever_delivered").unwrap_or(usize::MAX)
+                < arm.find("self.ever_delivered = true;").unwrap_or(0),
+            "the flag must be read BEFORE it is set, or every dial reads as a re-dial"
         );
     }
 }

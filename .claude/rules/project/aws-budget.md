@@ -1436,3 +1436,39 @@ includes the ±1 s truncation floor. For about the first minute after a restart
 it can show a quiet contract's age rather than a delay — the first packet of a
 contract never seen before carries its old trade time. Repeats are excluded
 (2026-09-23 FIFTH), and WAL-replayed frames are excluded.
+
+---
+
+## COST NOTE 2026-09-25 — three delay pages: feed delay, main-feed reconnect time, blank new depth contracts (+~$1.30/mo)
+
+**Authorization:** operator, 2026-09-25, verbatim: *"go ahead with all of these
+dude okay?"*. Given in direct response to a list whose first row priced this
+work at *"about ₹40 a month each"*. The full contract is in
+`dhan-rest-only-noise-lock-2026-07-14.md` §2.6. It is recorded here before the
+terraform, per the rule-file-first law.
+
+| Item | Cost |
+|---|---:|
+| `tv_dhan_ws_main_reconnect_recovery_max_ms` EMF name | $0.30 |
+| `tv_depth_first_packet_silent_total` EMF name | $0.30 |
+| `tv_depth_first_packet_arrived_total` EMF name | $0.30 |
+| `dhan-feed-delay-high` alarm (1 metric) | $0.10 |
+| `dhan-main-reconnect-slow` alarm (1 metric) | $0.10 |
+| `dhan-depth-new-contract-blank` alarm (metric math over 2 metrics) | $0.20 |
+| **Total** | **~$1.30/mo** (the operator's figure was ~₹40 × 3 ≈ $1.40) |
+
+**Budget position, read live 2026-09-25, not inherited.** September: actual
+**$154.24**, forecast **$192.79**, limit **$225** (the one-month Quote 23
+ceiling). October returns to **$150**, enforced in code by
+`effective_budget_kill_usd`. The October projection is already about $150 before
+tax, so this change adds about 0.9% to a month that is projected at the line
+without it.
+
+**§2.3n's lever rule is NOT satisfied.** No lever is taken here. The operator
+authorized the spend knowing the price. The October overrun is a separate open
+decision, and it existed before this change. The largest recorded lever is still
+the gp3 IOPS/throughput revert (−$34.20/mo). That lever has a tick-loss
+consequence, so it remains the operator's call.
+
+**What is NOT claimed.** That the three thresholds are measured-optimal (see
+§2.6). That these alarms reduce cost or risk; they only make delay visible.
