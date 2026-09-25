@@ -1493,16 +1493,26 @@ pub struct ConnectionSupervisor {
     /// connection then re-dialled instantly, forever. `healthy_since` answers
     /// the question that actually matters: *for how long* did it carry frames.
     healthy_since: Option<Instant>,
-    /// When the CURRENT dial began. Set on `BeginDial`, READ on `DialSucceeded`,
-    /// and TAKEN on the first frame.
+    /// When the CURRENT dial began. Set on `BeginDial`, READ on `DialSucceeded`
+    /// for the transport-time histogram, and CLEARED on the first frame.
     ///
-    /// Two measurements share one timestamp because they are two ends of the
-    /// same question. `DialSucceeded` reads it and leaves it in place for the
-    /// transport time; the first frame takes it for the true recovery time.
-    /// Taking it there is what stops a second frame re-recording, and
     /// `BeginDial` overwriting it is what keeps a failed dial from leaking into
-    /// the next attempt.
+    /// the next attempt's transport time. Recovery time does NOT use this
+    /// stamp any more (2026-09-25): it reads [`Self::outage_started_at`],
+    /// because a per-dial stamp times only the last dial of a multi-dial
+    /// outage.
     dial_started_at: Option<Instant>,
+    /// When the CURRENT outage began: the first redial scheduled (or, for a
+    /// fresh socket, the first `BeginDial`) since the socket last delivered a
+    /// frame. Set only when empty, TAKEN on the first frame.
+    ///
+    /// Separate from [`Self::dial_started_at`] on purpose. That stamp is
+    /// per-DIAL and is overwritten by every retry, which is right for the
+    /// transport-time histogram and wrong for recovery time: an outage that
+    /// took four failed dials and 40 s to recover would otherwise report only
+    /// the last dial's ~2 s, and the reconnect-time alarm could never see a
+    /// slow recovery made of fast-failing dials.
+    outage_started_at: Option<Instant>,
     /// Monotonic timestamps of recent re-dials, newest overwriting oldest.
     ///
     /// A fixed inline array, never a `Vec`: this is written on the disconnect
@@ -1553,6 +1563,7 @@ impl ConnectionSupervisor {
             proven_healthy: false,
             healthy_since: None,
             dial_started_at: None,
+            outage_started_at: None,
             redial_history: [None; FLAP_HISTORY_SLOTS],
             redial_cursor: 0,
             frames: 0,
@@ -1651,6 +1662,11 @@ impl ConnectionSupervisor {
                 self.proven_healthy = false;
                 self.healthy_since = None;
                 self.dial_started_at = Some(now);
+                // Only the FIRST dial of an outage starts the outage clock; a
+                // retry after a failed dial keeps the original start.
+                if self.outage_started_at.is_none() {
+                    self.outage_started_at = Some(now);
+                }
                 // Reset here, not on dial completion: the watchdog must also
                 // cover a dial that hangs forever without ever completing.
                 self.watchdog.record_activity(now);
@@ -1708,11 +1724,14 @@ impl ConnectionSupervisor {
                 if !self.proven_healthy {
                     self.proven_healthy = true;
                     self.attempt = 0;
-                    // The true blind window: dial -> subscribe dispatch -> Dhan
-                    // applying it -> the book next changing. TAKEN, so a second
-                    // frame cannot record a second sample for one dial.
+                    // The true blind window: FIRST dial of the outage -> every
+                    // retry -> subscribe dispatch -> Dhan applying it -> the
+                    // book next changing. TAKEN, so a second frame cannot
+                    // record a second sample for one outage. The per-dial
+                    // stamp is cleared too, so it cannot outlive its dial.
                     let was_ever_delivered = self.ever_delivered;
-                    if let Some(started) = self.dial_started_at.take() {
+                    self.dial_started_at = None;
+                    if let Some(started) = self.outage_started_at.take() {
                         let elapsed = now.saturating_duration_since(started);
                         metrics::histogram!(
                             RECONNECT_RECOVERY_MS_METRIC,
@@ -2107,6 +2126,12 @@ impl ConnectionSupervisor {
         self.phase = ConnPhase::Backoff;
         self.proven_healthy = false;
         self.healthy_since = None;
+        // The outage starts HERE, at the loss — not at the next dial — so the
+        // backoff sleep is inside the measured blind window. Only the first
+        // redial of an outage stamps it; a retry after a failed dial keeps it.
+        if self.outage_started_at.is_none() {
+            self.outage_started_at = Some(now);
+        }
         // The flap history records FAULTS, not everything that dials. Every
         // reason but one is a fault and is recorded; the operator-armed probe
         // close is the measurement itself, and charging it to the damper would
@@ -13190,6 +13215,60 @@ mod tests {
         );
     }
 
+    /// The recovery clock spans the WHOLE outage. A socket that was live,
+    /// lost the connection, failed two dials and then recovered must be timed
+    /// from the loss — not from its last (fast) dial, which is what a
+    /// per-dial stamp reported before 2026-09-25.
+    #[test]
+    fn recovery_is_timed_from_the_loss_across_failed_redials() {
+        let start = Instant::now();
+        let mut conn = sup(DhanEndpointType::MainFeed, 0, start);
+
+        // A healthy session first, so the next loss is a genuine re-dial.
+        conn.on_event(ConnEvent::BeginDial, start);
+        conn.on_event(ConnEvent::DialSucceeded, start + Duration::from_millis(100));
+        conn.on_event(
+            ConnEvent::SubscribeAcked,
+            start + Duration::from_millis(150),
+        );
+        conn.on_event(ConnEvent::FrameReceived, start + Duration::from_millis(200));
+        assert!(conn.outage_started_at.is_none(), "the first frame takes it");
+
+        let lost = start + Duration::from_secs(60);
+        conn.on_event(ConnEvent::Disconnected { code: None }, lost);
+        assert_eq!(
+            conn.outage_started_at,
+            Some(lost),
+            "the outage starts at the loss, so the backoff sleep is measured"
+        );
+
+        // Two failed dials: the per-dial stamp moves, the outage stamp does not.
+        conn.on_event(ConnEvent::BeginDial, lost + Duration::from_secs(1));
+        conn.on_event(ConnEvent::DialFailed, lost + Duration::from_secs(2));
+        let last_dial = lost + Duration::from_secs(20);
+        conn.on_event(ConnEvent::BeginDial, last_dial);
+        assert_eq!(conn.dial_started_at, Some(last_dial));
+        assert_eq!(
+            conn.outage_started_at,
+            Some(lost),
+            "a retry must never restart the outage clock"
+        );
+
+        conn.on_event(
+            ConnEvent::DialSucceeded,
+            last_dial + Duration::from_millis(100),
+        );
+        conn.on_event(
+            ConnEvent::SubscribeAcked,
+            last_dial + Duration::from_millis(150),
+        );
+        conn.on_event(ConnEvent::FrameReceived, last_dial + Duration::from_secs(1));
+        assert!(
+            conn.outage_started_at.is_none() && conn.dial_started_at.is_none(),
+            "recovery consumes both stamps, so the next outage starts clean"
+        );
+    }
+
     /// Placement, not existence. Each of these is a way the measurement could
     /// be present and wrong.
     #[test]
@@ -13223,7 +13302,7 @@ mod tests {
              per-frame arm"
         );
         assert!(
-            first_frame_block.contains("self.dial_started_at.take()"),
+            first_frame_block.contains("self.outage_started_at.take()"),
             "it must TAKE the stamp — reading it would record one sample per frame"
         );
 
@@ -13263,7 +13342,7 @@ mod tests {
         for marker in [
             "ConnEvent::BeginDial => {",
             "if !self.proven_healthy {",
-            "self.dial_started_at.take()",
+            "self.outage_started_at.take()",
             "if let Some(drop_this) = swap.unsubscribe {",
             "let unsub_started = tokio::time::Instant::now();",
         ] {
