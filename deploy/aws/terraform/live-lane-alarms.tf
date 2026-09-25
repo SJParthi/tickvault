@@ -1391,3 +1391,121 @@ resource "aws_cloudwatch_metric_alarm" "dhan_ring_dwell_high" {
   # self-evidently the fold catching up -- a genuine recovery worth telling.
   ok_actions = local.app_alarm_actions
 }
+
+# ---------------------------------------------------------------------------
+# DELAY pages -- authorized 2026-09-25, dhan-rest-only-noise-lock-2026-07-14.md
+# §2.6 (+ §2.6-i). Every alarm above answers "did something break or get
+# lost". None answered "is the data arriving LATE", so a lane whose ticks
+# arrive a minute late read fully green. Cost: aws-budget.md "COST NOTE
+# 2026-09-25" -- the §2.3n lever requirement is NOT met, and that note says so.
+# ---------------------------------------------------------------------------
+
+resource "aws_cloudwatch_metric_alarm" "dhan_feed_delay_high" {
+  alarm_name        = "tv-${var.environment}-dhan-feed-delay-high"
+  alarm_description = "New Dhan trades are arriving at least 60 seconds after the exchange stamped them, for 10 minutes in a row. The gauge is each minute's WORST delay of a NEW trade (repeated quotes and replayed frames are excluded). Minimum over 5 minutes, for 2 periods, means EVERY minute for 10 minutes had a trade at least a minute late, so one stale first packet after a reconnect cannot page. Triage: (1) tv_dhan_feed_ring_dwell_max_ms - if high, the delay is on OUR side (the fold is behind). (2) tv_dhan_ws_worst_conn_tick_age_secs - one deaf socket. (3) If both are normal, the delay is Dhan's delivery, and the only action is to note it for the support ticket. NOT a detector of ticks Dhan never sent."
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 60000
+  evaluation_periods  = 2
+  datapoints_to_alarm = 2
+  metric_name         = "tv_dhan_ws_lag_max_ms"
+  namespace           = local.app_namespace
+  period              = 300
+  # Minimum, NOT Maximum (§2.6 REJECT row): the gauge is already a per-minute
+  # peak, so Maximum would page on ONE late print. Minimum pages only when the
+  # delay is sustained across every minute of the window.
+  statistic  = "Minimum"
+  dimensions = local.app_dimensions
+
+  # Published only while the drain runs; the box is stopped overnight.
+  treat_missing_data = "notBreaching"
+  actions_enabled    = true
+  alarm_actions      = local.app_alarm_actions
+  # NO ok_actions (§2.6): a peak falling back is the window ageing out.
+  ok_actions = []
+}
+
+resource "aws_cloudwatch_metric_alarm" "dhan_main_reconnect_slow" {
+  alarm_name        = "tv-${var.environment}-dhan-main-reconnect-slow"
+  alarm_description = "A Dhan MAIN-FEED socket took 15 seconds or more to deliver its first data after re-dialling. Normal is about 2 seconds. The main feed was blind for that long on one reconnect. Counts RE-dials only (a socket that has delivered before), inside 09:15-15:30 IST only, so the morning's first dial and a reconnect across the close never count. Depth sockets are excluded on purpose: depth-200 re-dials about once a minute by design. Triage: (1) tv_dhan_ws_reconnect_total - one slow reconnect or many. (2) tv_dhan_ws_dial_ms - was the DIAL slow (network) or the first frame (vendor). (3) The WS-GAP-03 log lines for the socket."
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 15000
+  evaluation_periods  = 1
+  metric_name         = "tv_dhan_ws_main_reconnect_recovery_max_ms"
+  namespace           = local.app_namespace
+  period              = 300
+  statistic           = "Maximum"
+  dimensions          = local.app_dimensions
+
+  # Zero on every window without a re-dial; absent overnight.
+  treat_missing_data = "notBreaching"
+  actions_enabled    = true
+  alarm_actions      = local.app_alarm_actions
+  ok_actions         = []
+}
+
+resource "aws_cloudwatch_metric_alarm" "dhan_depth_new_contract_blank" {
+  alarm_name        = "tv-${var.environment}-dhan-depth-new-contract-blank"
+  alarm_description = "Most newly subscribed Dhan depth contracts are delivering nothing. In 30 minutes, at least 5 new subscriptions were measured and at least 80% of them sent no depth packet within 2 minutes. One silent contract is normal (it may simply not have traded); most of them silent means the vendor is not serving new subscriptions. Triage: (1) tv_dhan_ws_alive_connections - are the depth sockets up. (2) tv_dhan_feed_depth_total - is ANY depth arriving. (3) The depth ranked-rotation log lines - which contracts were subscribed."
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 80
+  evaluation_periods  = 1
+  treat_missing_data  = "notBreaching"
+
+  metric_query {
+    id = "blank_pct"
+    # 5-sample floor: below it the ratio is noise, so it reads 0. The small
+    # constant keeps the (unused) true branch finite when the total is 0.
+    expression  = "IF(total >= 5, 100 * silent_f / (total + 0.000001), 0)"
+    label       = "New depth contracts silent after 2 minutes (%%)"
+    return_data = true
+  }
+
+  metric_query {
+    id          = "total"
+    expression  = "silent_f + arrived_f"
+    return_data = false
+  }
+
+  metric_query {
+    id          = "silent_f"
+    expression  = "FILL(silent, 0)"
+    return_data = false
+  }
+
+  metric_query {
+    id          = "arrived_f"
+    expression  = "FILL(arrived, 0)"
+    return_data = false
+  }
+
+  metric_query {
+    id          = "silent"
+    return_data = false
+    metric {
+      metric_name = "tv_depth_first_packet_silent_total"
+      namespace   = local.app_namespace
+      period      = 1800
+      stat        = "Sum"
+      dimensions  = local.app_dimensions
+    }
+  }
+
+  metric_query {
+    id          = "arrived"
+    return_data = false
+    metric {
+      metric_name = "tv_depth_first_packet_arrived_total"
+      namespace   = local.app_namespace
+      period      = 1800
+      stat        = "Sum"
+      dimensions  = local.app_dimensions
+    }
+  }
+
+  actions_enabled = true
+  alarm_actions   = local.app_alarm_actions
+  ok_actions      = []
+}

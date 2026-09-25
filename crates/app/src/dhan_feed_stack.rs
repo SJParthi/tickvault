@@ -114,8 +114,9 @@ use tickvault_core::websocket::pool_budget::{
 };
 use tickvault_core::websocket::pool_supervisor::{
     CapturedFrame, ConnectionSupervisor, ExtendOutcome, FrameSilenceGate, LiveSubscriptionCommand,
-    PoolSupervisor, RingByteBudget, SubscribeGuard, SubscribeGuardRefusal, SubscribeInstrument,
-    WalRingSink, run_connection_with_commands,
+    MAIN_RECONNECT_RECOVERY_MAX_MS_GAUGE, PoolSupervisor, RingByteBudget, SubscribeGuard,
+    SubscribeGuardRefusal, SubscribeInstrument, WalRingSink, run_connection_with_commands,
+    take_main_feed_reconnect_recovery_max_ms,
 };
 use tickvault_storage::depth_persistence::{
     DEPTH_KIND_5, DEPTH_KIND_20, DEPTH_KIND_200, DEPTH_SIDE_ASK, DEPTH_SIDE_BID, DepthRow,
@@ -455,6 +456,10 @@ impl PeakHoldCell {
 static RING_DWELL_PEAK: PeakHoldCell = PeakHoldCell::new();
 /// Peak hold for [`WS_LAG_MAX_MS_GAUGE`].
 static WS_LAG_PEAK: PeakHoldCell = PeakHoldCell::new();
+/// Peak hold for [`MAIN_RECONNECT_RECOVERY_MAX_MS_GAUGE`] — the slowest
+/// main-feed re-dial of the window, alarmed by
+/// `tv-<env>-dhan-main-reconnect-slow` (noise lock §2.6).
+static MAIN_RECONNECT_PEAK: PeakHoldCell = PeakHoldCell::new();
 
 /// Milliseconds since the first call, on the monotonic clock, so a wall-clock
 /// step can never corrupt a window. Saturates rather than wrapping.
@@ -9408,6 +9413,8 @@ fn publish_fold_depth(ingest: &LiveIngest) {
     metrics::gauge!(RING_DWELL_MAX_MS_GAUGE)
         .set(RING_DWELL_PEAK.publish(take_ring_dwell_max_ms(), now_ms));
     metrics::gauge!(WS_LAG_MAX_MS_GAUGE).set(WS_LAG_PEAK.publish(take_ws_lag_max_ms(), now_ms));
+    metrics::gauge!(MAIN_RECONNECT_RECOVERY_MAX_MS_GAUGE)
+        .set(MAIN_RECONNECT_PEAK.publish(take_main_feed_reconnect_recovery_max_ms(), now_ms));
 }
 
 /// The WebSocket base URL for one MARKET-DATA endpoint type.
