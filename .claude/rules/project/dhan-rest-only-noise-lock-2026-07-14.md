@@ -4225,6 +4225,24 @@ gauge finally seeing what it was meant to see.
 the per-dial stamp again; resets the outage stamp on `BeginDial` or on a failed
 dial; or clears it anywhere but the first frame.
 
+### §2.6-iii — 2026-09-25 (same day): a swap no longer leaves the OLD contract's stamp to age into "blank"
+
+**No new authorization is claimed.** A second hostile read of §2.6 found one
+more way the blank-contract ratio could be inflated by our own bookkeeping, and
+two stale texts. All three are fixed before any of the three alarms has run.
+
+| # | Finding | Fix |
+|---|---|---|
+| 1 | A swap stamped the ARRIVING contract, and the DEPARTING contract's own stamp (if it had not yet delivered) stayed pending. It then aged into `silent_window` 120 s later, counting as a "new contract that went blank" for a contract we had already dropped. On a busy steering minute that inflates `dhan-depth-new-contract-blank` by our own swaps. | Both swap arms call `DepthFirstPacketTracker::forget(departing, pool)` BEFORE `record_subscribe_at(arriving)`: `depth20_track.rs` (release) and `depth_rebalance.rs` `send_swap` (the `before` contract). Pinned by `the_departing_contract_is_forgotten_just_before_the_arrival_is_stamped` in `depth_first_packet_wiring_guard.rs`. |
+| 2 | The `dhan-main-reconnect-slow` alarm description still said recovery was timed per dial. After §2.6-ii it is timed from the LOSS. | Description corrected: "after the connection was lost, counting every failed re-dial and the waits between them". |
+| 3 | The 805 (PoolOverflow) error line did not say that it also halts depth-200 rotation for the rest of the process. | The line now carries `rotation_halted = true` and says so in its text. |
+
+**Cost:** zero. No alarm, EMF name or threshold changes.
+
+**What a PR that violates §2.6-iii looks like (REJECT):** stamps the arrival
+before forgetting the departure; forgets on a REFUSED swap (the old contract is
+still held); or describes the reconnect alarm as timing one dial.
+
 ### §2.3w addendum — 2026-09-25: the held-today refusal is a LOG-ONLY `WS-GAP-02` source
 
 `depth_subscription_view.rs` keeps the day's set of contracts held by either
@@ -4238,3 +4256,20 @@ contract is not cross-checked that evening; capture itself is untouched. The
 §2.3m filter is scoped to `swap_emptied_socket` and cannot see this source,
 by design. The `warn!` exists so the counter reaches an operator surface, as
 `loss_counter_visibility_guard` requires.
+
+### §2.3w addendum — 2026-09-25 (same day): the held-today persistence failure is a LOG-ONLY `WS-GAP-02` source
+
+The held-today set is now saved to `data/instrument-cache/depth-held-today.json`
+so a mid-session restart does not forget the contracts the depth pools held
+before it. The file is written only when the set grows. The write is tmp +
+rename, with no fsync.
+
+If a write fails, the set in memory is unchanged and the next growth retries.
+The first failure of each IST day logs
+`warn!(code = WS-GAP-02, source = "held_today_persist_failed")`. Later failures
+that day are silent.
+
+No page, no EMF name, no alarm. The cost of a failed write is narrow: after a
+restart, contracts held only before the restart are not checked that evening.
+Capture itself is untouched. The §2.3m filter is scoped to
+`swap_emptied_socket` and cannot see this source, by design.

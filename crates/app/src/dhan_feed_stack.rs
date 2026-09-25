@@ -11847,6 +11847,20 @@ fn spawn_depth_rebalance(
         info!("depth rebalance not started: neither depth pool has a steerable connection");
         return;
     }
+    // Before the first publish: reload today's held-today set so a mid-session
+    // restart does not shrink the after-close option cross-check to the
+    // contracts held since the restart. A file from an earlier day loads
+    // nothing. The file is written by the steering task only when the set
+    // grows, never on the frame drain.
+    let reloaded = crate::depth_subscription_view::global_depth_subscription_view()
+        .enable_held_today_persistence(
+            crate::depth_subscription_view::held_today_path(),
+            chrono::Utc::now().timestamp(),
+        );
+    info!(
+        reloaded,
+        "depth held-today set: persistence on, reloaded today's contracts"
+    );
     let questdb = questdb.clone();
     let date_ist = date_ist.to_owned();
     tokio::spawn(crate::depth_rebalance::run_depth_rebalance(

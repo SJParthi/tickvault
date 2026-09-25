@@ -1257,6 +1257,18 @@ fn send_swap(socket: &mut RebalanceSocket, swap: &PlannedSwap) -> bool {
             // the contract on a depth socket: an ignored unsubscribe leaves it
             // streaming from the OLD socket, and that packet would answer this
             // stamp with a fabricated ~0 ms. See `record_subscribe_at`.
+            //
+            // Drop any pending stamp for the DEPARTING contract first
+            // (2026-09-25). A depth-200 contract rotated out before its first
+            // packet would otherwise age into `silent_window` and be counted
+            // as a blank new contract. A missing entry is the normal case.
+            if let Some(departing) = before {
+                crate::depth_first_packet::global_depth_first_packet_tracker().forget(
+                    departing.security_id,
+                    departing.segment,
+                    tickvault_core::parser::depth::DepthFeedKind::TwoHundred,
+                );
+            }
             let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
             let may_already_be_streaming =
                 crate::depth_subscription_view::global_depth_subscription_view()
