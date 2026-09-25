@@ -195,6 +195,9 @@ struct HeldToday {
     /// IST day number (days since the epoch, IST) the set belongs to.
     ist_day: i64,
     keys: HashSet<Key>,
+    /// Latched once a refusal has been logged this IST day, so a full set
+    /// logs once per day rather than on every per-minute publish.
+    refusal_logged: bool,
 }
 
 impl DepthSubscriptionView {
@@ -268,6 +271,7 @@ impl DepthSubscriptionView {
         if guard.ist_day != day {
             guard.ist_day = day;
             guard.keys.clear();
+            guard.refusal_logged = false;
         }
         let mut refused: u64 = 0;
         for key in next {
@@ -280,9 +284,28 @@ impl DepthSubscriptionView {
             }
             guard.keys.insert(*key);
         }
+        let first_refusal_today = refused > 0 && !guard.refusal_logged;
+        if first_refusal_today {
+            guard.refusal_logged = true;
+        }
+        let tracked = guard.keys.len();
         drop(guard);
         if refused > 0 {
             metrics::counter!(HELD_TODAY_REFUSED_COUNTER).increment(refused);
+        }
+        // Once per IST day: a set at its cap refuses on every later publish,
+        // and one line says what the counter says without a line a minute.
+        if first_refusal_today {
+            tracing::warn!(
+                code =
+                    tickvault_common::error_code::ErrorCode::WsGapSubscriptionBatching.code_str(),
+                source = "held_today_full",
+                counter = HELD_TODAY_REFUSED_COUNTER,
+                refused,
+                tracked,
+                cap = MAX_DEPTH_HELD_TODAY,
+                "depth held-today set is full; later contracts are not checked by the after-close option cross-verification today"
+            );
         }
     }
 

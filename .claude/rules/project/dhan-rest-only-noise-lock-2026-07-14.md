@@ -4188,3 +4188,53 @@ and it counts as a new trade. This alarm uses `Minimum` over two 5-minute
 periods, so one such minute cannot page. A restart that brings many quiet
 contracts back at once could hold the minimum up for one period, never two
 in a row, unless the contracts stay quiet.
+
+### §2.6-ii — 2026-09-25 (same day): the reconnect gauge timed only the LAST dial of an outage
+
+**No new authorization is claimed.** A hostile review of §2.6 found that the
+gauge could not see the case it was built for, and it is fixed before the
+alarm has ever run.
+
+**The defect.** Recovery time was measured from the per-dial stamp, and every
+`BeginDial` overwrote it. An outage made of four fast-failing dials and one
+good one, 40 s in total, reported only the last dial's ~2 s. So
+`tv-<env>-dhan-main-reconnect-slow` could never fire on a slow recovery built
+from failed retries, which is the common shape of a real outage.
+
+**The fix.** A separate `outage_started_at` stamp in the connection
+supervisor:
+
+| Event | Per-dial stamp | Outage stamp |
+|---|---|---|
+| redial scheduled (`enter_backoff`) | unchanged | set, only if empty |
+| `BeginDial` | overwritten | set, only if empty (covers the day's first dial) |
+| `DialSucceeded` | read, for transport time | unchanged |
+| first frame | cleared | taken, for recovery time |
+
+So recovery now runs from the LOSS, backoff sleep included, to the first
+frame. Transport time is unchanged. Pinned by
+`recovery_is_timed_from_the_loss_across_failed_redials`, and the source-scan
+markers moved to the new stamp.
+
+**Honest effect.** Reported recovery times will be LONGER than before, because
+they now include the backoff and every failed dial. That is the true blind
+window. The 15 s threshold is unchanged; if it pages more often, that is the
+gauge finally seeing what it was meant to see.
+
+**What a PR that violates §2.6-ii looks like (REJECT):** measures recovery from
+the per-dial stamp again; resets the outage stamp on `BeginDial` or on a failed
+dial; or clears it anywhere but the first frame.
+
+### §2.3w addendum — 2026-09-25: the held-today refusal is a LOG-ONLY `WS-GAP-02` source
+
+`depth_subscription_view.rs` keeps the day's set of contracts held by either
+depth pool, for the §12.15.6 after-close option cross-check. It is capped at
+`MAX_DEPTH_HELD_TODAY`. Past the cap a new contract is refused, counted on
+`tv_depth_view_held_today_refused_total`, and logged ONCE per IST day as
+`warn!(code = WS-GAP-02, source = "held_today_full")`.
+
+No page, no EMF name, no alarm. The cost of a refusal is that the refused
+contract is not cross-checked that evening; capture itself is untouched. The
+§2.3m filter is scoped to `swap_emptied_socket` and cannot see this source,
+by design. The `warn!` exists so the counter reaches an operator surface, as
+`loss_counter_visibility_guard` requires.
