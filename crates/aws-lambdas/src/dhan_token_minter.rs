@@ -60,8 +60,24 @@ pub const DHAN_AUTH_BASE_URL_ENV: &str = "DHAN_AUTH_BASE_URL";
 /// Path appended to the auth base URL to mint a token.
 pub const DHAN_GENERATE_TOKEN_PATH: &str = "/app/generateAccessToken";
 
-/// SSM service segment for every Dhan parameter.
+/// SSM service segment for the PRIMARY Dhan account's parameters.
 pub const SSM_DHAN_SERVICE: &str = "dhan";
+
+/// SSM service segment for the depth-only second Dhan account
+/// (`groww-shared-token-minter-2026-07-02.md` §10.9). Its minter is a separate
+/// Lambda built from THIS code; the two never share a segment, so neither can
+/// read the other's credentials or overwrite the other's token.
+pub const SSM_DHAN_DEPTH_SERVICE: &str = "dhan-depth";
+
+/// Environment variable naming which account this deployment mints for.
+///
+/// Unset means the primary account, so the existing Lambda keeps working
+/// without a terraform change. Any value outside [`ALLOWED_SSM_SERVICES`] fails
+/// the mint loudly: a typo must never mint into a guessed namespace.
+pub const SSM_SERVICE_ENV: &str = "SSM_SERVICE";
+
+/// The closed set of service segments a minter may target: one per account.
+pub const ALLOWED_SSM_SERVICES: [&str; 2] = [SSM_DHAN_SERVICE, SSM_DHAN_DEPTH_SERVICE];
 
 /// The parameter this Lambda WRITES — the shared token consumers read.
 pub const DHAN_ACCESS_TOKEN_SECRET: &str = "access-token";
@@ -461,12 +477,14 @@ impl TokenMinter for DhanHttpMinter<'_> {
 pub async fn fetch_credentials_from<S: SecretStore>(
     store: &S,
     environment: &str,
+    service: &str,
 ) -> Result<DhanCredentials, MintError> {
-    let client_id_path = build_ssm_path(environment, SSM_DHAN_SERVICE, DHAN_CLIENT_ID_SECRET);
-    let pin_path = build_ssm_path(environment, SSM_DHAN_SERVICE, DHAN_CLIENT_SECRET_SECRET);
-    let totp_path = build_ssm_path(environment, SSM_DHAN_SERVICE, DHAN_TOTP_SECRET);
+    let client_id_path = build_ssm_path(environment, service, DHAN_CLIENT_ID_SECRET);
+    let pin_path = build_ssm_path(environment, service, DHAN_CLIENT_SECRET_SECRET);
+    let totp_path = build_ssm_path(environment, service, DHAN_TOTP_SECRET);
 
     info!(
+        service,
         client_id_path = %client_id_path,
         pin_path = %pin_path,
         totp_path = %totp_path,
@@ -721,9 +739,10 @@ pub fn describe_transport_error(err: &reqwest::Error) -> String {
 pub async fn publish_token_to<S: SecretStore>(
     store: &S,
     environment: &str,
+    service: &str,
     token: &SecretString,
 ) -> Result<String, MintError> {
-    let path = build_ssm_path(environment, SSM_DHAN_SERVICE, DHAN_ACCESS_TOKEN_SECRET);
+    let path = build_ssm_path(environment, service, DHAN_ACCESS_TOKEN_SECRET);
     store.write_secure(path.clone(), token.clone()).await?;
     Ok(path)
 }
@@ -740,8 +759,9 @@ pub async fn run_mint_and_publish_with<S: SecretStore, M: TokenMinter>(
     store: &S,
     minter: &M,
     environment: &str,
+    service: &str,
 ) -> Result<String, MintError> {
-    let credentials = fetch_credentials_from(store, environment).await?;
+    let credentials = fetch_credentials_from(store, environment, service).await?;
     let token = minter.mint(&credentials).await?;
 
     // THE GATE. A non-JWT value never reaches the write, so an error body or a
@@ -766,7 +786,7 @@ pub async fn run_mint_and_publish_with<S: SecretStore, M: TokenMinter>(
         "mint succeeded; publishing to SSM"
     );
 
-    let path = publish_token_to(store, environment, &token).await?;
+    let path = publish_token_to(store, environment, service, &token).await?;
 
     info!(
         parameter = %path,
@@ -785,12 +805,14 @@ pub async fn run_mint_and_publish(
     ssm: &SsmClient,
     http: &reqwest::Client,
     environment: &str,
+    service: &str,
     auth_base_url: &str,
 ) -> Result<String, MintError> {
     run_mint_and_publish_with(
         &SsmSecretStore::new(ssm),
         &DhanHttpMinter::new(http, auth_base_url),
         environment,
+        service,
     )
     .await
 }
@@ -843,6 +865,41 @@ pub fn resolve_auth_base_url() -> Result<String, MintError> {
     }
 }
 
+/// Maps the raw [`SSM_SERVICE_ENV`] value to the service segment to mint for.
+///
+/// `None` or blank → the primary account ([`SSM_DHAN_SERVICE`]). A value in
+/// [`ALLOWED_SSM_SERVICES`] → that segment. Anything else is a deployment error.
+///
+/// # Errors
+///
+/// Returns [`MintError::Configuration`] for a value outside the allowlist.
+pub fn parse_ssm_service(raw: Option<&str>) -> Result<&'static str, MintError> {
+    let value = match raw.map(str::trim) {
+        None | Some("") => return Ok(SSM_DHAN_SERVICE),
+        Some(value) => value,
+    };
+    ALLOWED_SSM_SERVICES
+        .iter()
+        .copied()
+        .find(|allowed| *allowed == value)
+        .ok_or_else(|| {
+            MintError::Configuration(format!(
+                "{SSM_SERVICE_ENV}={value:?} is not one of {ALLOWED_SSM_SERVICES:?} — \
+                 refusing to mint into an unknown namespace"
+            ))
+        })
+}
+
+/// Resolves the service segment from the [`SSM_SERVICE_ENV`] environment variable.
+///
+/// # Errors
+///
+/// Returns [`MintError::Configuration`] for a value outside the allowlist.
+pub fn resolve_ssm_service() -> Result<&'static str, MintError> {
+    let raw = std::env::var(SSM_SERVICE_ENV).ok();
+    parse_ssm_service(raw.as_deref())
+}
+
 /// Lambda entry point.
 ///
 /// Mints and publishes, then reports which parameter was written. A failure
@@ -857,16 +914,18 @@ pub fn resolve_auth_base_url() -> Result<String, MintError> {
 // TEST-EXEMPT: Lambda entry point — builds live AWS clients; the logic it delegates to is unit-tested and the failure mapping is covered by the stage-label test.
 pub async fn handle(_event: serde_json::Value) -> Result<serde_json::Value, lambda_runtime::Error> {
     let environment = resolve_environment();
+    let service = resolve_ssm_service()?;
     let auth_base_url = resolve_auth_base_url()?;
 
     let config = crate::clients::sdk_config().await;
     let ssm = crate::clients::ssm(&config);
     let http = build_http_client()?;
 
-    match run_mint_and_publish(&ssm, &http, &environment, &auth_base_url).await {
+    match run_mint_and_publish(&ssm, &http, &environment, service, &auth_base_url).await {
         Ok(path) => Ok(serde_json::json!({
             "status": "ok",
             "environment": environment,
+            "service": service,
             "parameter": path,
         })),
         Err(err) => {
@@ -874,6 +933,7 @@ pub async fn handle(_event: serde_json::Value) -> Result<serde_json::Value, lamb
             // failing stage and never the token, PIN or TOTP.
             tracing::error!(
                 code = "LAMBDA-MINT-01",
+                service,
                 stage = err.stage(),
                 reason = %err,
                 "Dhan token mint FAILED — consumers will keep serving a stale token \
@@ -1354,6 +1414,26 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_ssm_service_reads_the_env_var_through_the_allowlist() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let _guard = EnvGuard::set(SSM_SERVICE_ENV, None);
+            assert_eq!(resolve_ssm_service(), Ok(SSM_DHAN_SERVICE));
+        }
+        {
+            let _guard = EnvGuard::set(SSM_SERVICE_ENV, Some("dhan-depth"));
+            assert_eq!(resolve_ssm_service(), Ok(SSM_DHAN_DEPTH_SERVICE));
+        }
+        {
+            let _guard = EnvGuard::set(SSM_SERVICE_ENV, Some("groww"));
+            assert_eq!(
+                resolve_ssm_service().map_err(|err| err.stage()),
+                Err("configuration")
+            );
+        }
+    }
+
+    #[test]
     fn test_build_http_client_succeeds_and_is_bounded() {
         assert!(
             build_http_client().is_ok(),
@@ -1420,17 +1500,21 @@ mod tests {
 
     impl FakeStore {
         fn healthy(env: &str) -> Self {
+            Self::healthy_for(env, SSM_DHAN_SERVICE)
+        }
+
+        fn healthy_for(env: &str, service: &str) -> Self {
             let mut reads = HashMap::new();
             reads.insert(
-                build_ssm_path(env, SSM_DHAN_SERVICE, DHAN_CLIENT_ID_SECRET),
+                build_ssm_path(env, service, DHAN_CLIENT_ID_SECRET),
                 Some("1106656882".to_string()),
             );
             reads.insert(
-                build_ssm_path(env, SSM_DHAN_SERVICE, DHAN_CLIENT_SECRET_SECRET),
+                build_ssm_path(env, service, DHAN_CLIENT_SECRET_SECRET),
                 Some("123456".to_string()),
             );
             reads.insert(
-                build_ssm_path(env, SSM_DHAN_SERVICE, DHAN_TOTP_SECRET),
+                build_ssm_path(env, service, DHAN_TOTP_SECRET),
                 Some("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string()),
             );
             Self {
@@ -1497,7 +1581,7 @@ mod tests {
         let jwt = sample_jwt();
         let minter = FakeMinter(Ok(jwt.clone()));
 
-        let path = run_mint_and_publish_with(&store, &minter, "prod")
+        let path = run_mint_and_publish_with(&store, &minter, "prod", SSM_DHAN_SERVICE)
             .await
             .expect("the healthy flow must publish");
 
@@ -1514,7 +1598,7 @@ mod tests {
         let store = FakeStore::healthy("staging");
         let minter = FakeMinter(Ok(sample_jwt()));
 
-        let path = run_mint_and_publish_with(&store, &minter, "staging")
+        let path = run_mint_and_publish_with(&store, &minter, "staging", SSM_DHAN_SERVICE)
             .await
             .expect("the staging flow must publish");
 
@@ -1529,7 +1613,7 @@ mod tests {
         let store = FakeStore::healthy("prod");
         let minter = FakeMinter(Ok(sample_jwt()));
 
-        run_mint_and_publish_with(&store, &minter, "prod")
+        run_mint_and_publish_with(&store, &minter, "prod", SSM_DHAN_SERVICE)
             .await
             .expect("the healthy flow must publish");
 
@@ -1549,7 +1633,7 @@ mod tests {
         let store = FakeStore::healthy("prod");
         let minter = FakeMinter(Ok("{\"status\":\"error\"}".to_string()));
 
-        let err = run_mint_and_publish_with(&store, &minter, "prod")
+        let err = run_mint_and_publish_with(&store, &minter, "prod", SSM_DHAN_SERVICE)
             .await
             .expect_err("a non-JWT value must be refused");
 
@@ -1565,7 +1649,7 @@ mod tests {
         let store = FakeStore::healthy("prod");
         let minter = FakeMinter(Ok(String::new()));
 
-        let err = run_mint_and_publish_with(&store, &minter, "prod")
+        let err = run_mint_and_publish_with(&store, &minter, "prod", SSM_DHAN_SERVICE)
             .await
             .expect_err("an empty value must be refused");
 
@@ -1581,7 +1665,7 @@ mod tests {
         let store = FakeStore::healthy("prod");
         let minter = FakeMinter(Err(MintError::DhanError("wrong TOTP".to_string())));
 
-        let err = run_mint_and_publish_with(&store, &minter, "prod")
+        let err = run_mint_and_publish_with(&store, &minter, "prod", SSM_DHAN_SERVICE)
             .await
             .expect_err("a rejected mint must fail the job");
 
@@ -1600,7 +1684,7 @@ mod tests {
             None,
         );
 
-        let err = run_mint_and_publish_with(&store, &NeverMinter, "prod")
+        let err = run_mint_and_publish_with(&store, &NeverMinter, "prod", SSM_DHAN_SERVICE)
             .await
             .expect_err("a missing credential must fail the job");
 
@@ -1614,7 +1698,7 @@ mod tests {
         store.write_fails = true;
         let minter = FakeMinter(Ok(sample_jwt()));
 
-        let err = run_mint_and_publish_with(&store, &minter, "prod")
+        let err = run_mint_and_publish_with(&store, &minter, "prod", SSM_DHAN_SERVICE)
             .await
             .expect_err("a failed write must fail the job");
 
@@ -1636,7 +1720,7 @@ mod tests {
         let jwt = sample_jwt();
         let minter = FakeMinter(Ok(jwt.clone()));
 
-        let err = run_mint_and_publish_with(&store, &minter, "prod")
+        let err = run_mint_and_publish_with(&store, &minter, "prod", SSM_DHAN_SERVICE)
             .await
             .expect_err("a failed write must fail the job");
 
@@ -1649,7 +1733,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_credentials_from_reads_exactly_the_three_dhan_paths() {
         let store = FakeStore::healthy("prod");
-        let creds = fetch_credentials_from(&store, "prod")
+        let creds = fetch_credentials_from(&store, "prod", SSM_DHAN_SERVICE)
             .await
             .expect("the healthy reads must succeed");
 
@@ -1671,7 +1755,7 @@ mod tests {
 
         // Deliberately NOT `expect_err` — that needs `Debug` on the Ok side, and
         // DhanCredentials must never gain a Debug impl it does not need.
-        let stage = match fetch_credentials_from(&store, "prod").await {
+        let stage = match fetch_credentials_from(&store, "prod", SSM_DHAN_SERVICE).await {
             Ok(_) => panic!("an empty PIN must fail rather than mint blank"),
             Err(err) => err.stage(),
         };
@@ -1682,11 +1766,98 @@ mod tests {
     async fn publish_token_to_targets_the_access_token_path() {
         let store = FakeStore::healthy("prod");
         let token = SecretString::from(sample_jwt());
-        let path = publish_token_to(&store, "prod", &token)
+        let path = publish_token_to(&store, "prod", SSM_DHAN_SERVICE, &token)
             .await
             .expect("the write must succeed");
         assert_eq!(path, "/tickvault/prod/dhan/access-token");
         assert_eq!(store.writes().len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // One minter per account (§10.9): the service segment is chosen by
+    // SSM_SERVICE from a closed list of two, and a depth-account run reads and
+    // writes ONLY the dhan-depth segment.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_ssm_service_defaults_to_the_primary_account_when_unset_or_blank() {
+        assert_eq!(parse_ssm_service(None), Ok(SSM_DHAN_SERVICE));
+        assert_eq!(parse_ssm_service(Some("")), Ok(SSM_DHAN_SERVICE));
+        assert_eq!(parse_ssm_service(Some("   ")), Ok(SSM_DHAN_SERVICE));
+    }
+
+    #[test]
+    fn parse_ssm_service_accepts_exactly_the_two_account_segments() {
+        assert_eq!(parse_ssm_service(Some("dhan")), Ok(SSM_DHAN_SERVICE));
+        assert_eq!(
+            parse_ssm_service(Some("dhan-depth")),
+            Ok(SSM_DHAN_DEPTH_SERVICE)
+        );
+        assert_eq!(
+            parse_ssm_service(Some(" dhan-depth ")),
+            Ok(SSM_DHAN_DEPTH_SERVICE)
+        );
+    }
+
+    #[test]
+    fn parse_ssm_service_refuses_anything_outside_the_allowlist() {
+        for bad in [
+            "groww",
+            "dhan/",
+            "dhan-depth-2",
+            "DHAN",
+            "*",
+            "dhan/*",
+            "api",
+        ] {
+            let err = parse_ssm_service(Some(bad))
+                .expect_err("an unknown service segment must fail the mint");
+            assert_eq!(err.stage(), "configuration", "value {bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_two_account_segments_never_share_a_parameter_path() {
+        for secret in [
+            DHAN_CLIENT_ID_SECRET,
+            DHAN_CLIENT_SECRET_SECRET,
+            DHAN_TOTP_SECRET,
+            DHAN_ACCESS_TOKEN_SECRET,
+        ] {
+            let primary = build_ssm_path("prod", SSM_DHAN_SERVICE, secret);
+            let depth = build_ssm_path("prod", SSM_DHAN_DEPTH_SERVICE, secret);
+            assert_ne!(primary, depth);
+            // A prefix match would let a `/dhan/*`-style grant reach the other
+            // account; the segment boundary must separate them.
+            assert!(!depth.starts_with(&format!("/tickvault/prod/{SSM_DHAN_SERVICE}/")));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_depth_account_run_reads_and_writes_only_the_depth_segment() {
+        let store = FakeStore::healthy_for("prod", SSM_DHAN_DEPTH_SERVICE);
+        let minter = FakeMinter(Ok(sample_jwt()));
+
+        let path = run_mint_and_publish_with(&store, &minter, "prod", SSM_DHAN_DEPTH_SERVICE)
+            .await
+            .expect("the depth-account mint must succeed");
+
+        assert_eq!(path, "/tickvault/prod/dhan-depth/access-token");
+        let writes = store.writes();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, "/tickvault/prod/dhan-depth/access-token");
+    }
+
+    #[tokio::test]
+    async fn a_depth_account_run_never_falls_back_to_the_primary_credentials() {
+        // The store holds ONLY the primary account's credentials. A depth run
+        // must fail at the read, never mint with the primary account's secrets.
+        let store = FakeStore::healthy("prod");
+        let err = run_mint_and_publish_with(&store, &NeverMinter, "prod", SSM_DHAN_DEPTH_SERVICE)
+            .await
+            .expect_err("missing depth credentials must fail the job");
+        assert_eq!(err.stage(), "credential_read");
+        assert!(store.writes().is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -2174,7 +2345,7 @@ mod tests {
         let store = FakeStore::healthy("prod");
         let minter = DhanHttpMinter::new(&http, &base);
 
-        let path = run_mint_and_publish_with(&store, &minter, "prod")
+        let path = run_mint_and_publish_with(&store, &minter, "prod", SSM_DHAN_SERVICE)
             .await
             .expect("the end-to-end flow must publish");
 
