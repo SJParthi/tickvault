@@ -269,6 +269,26 @@ pub fn board_order(a: &RankedContract, b: &RankedContract) -> std::cmp::Ordering
         .then_with(|| (a.segment as u8).cmp(&(b.segment as u8)))
 }
 
+/// [`board_order`] as a radix key, for the drain's sliced radix sort (audit
+/// PR4c, 2026-09-26): most significant word first, compared ascending.
+///
+/// The rank key is inverted (`!window_lots_milli`) so ascending is "most
+/// milli-lots first"; `security_id` and the segment code follow ascending.
+/// Every field of `board_order` is in the key and nothing else is, so a sort by
+/// this key and a sort by `board_order` produce the same board — pinned by
+/// `board_radix_key_sorts_identically_to_board_order`.
+///
+/// O(1), no allocation.
+#[must_use]
+// WIRING-EXEMPT: passed BY VALUE as the sort key (`sort.step(.., board_radix_key)`) in `LiveIngest::step_top_volume_sweep`, which the guard's `name(` pattern cannot see.
+pub fn board_radix_key(row: &RankedContract) -> [u64; crate::top_volume_sweep::RADIX_WORDS] {
+    [
+        !row.window_lots_milli,
+        row.security_id,
+        u64::from(row.segment as u8),
+    ]
+}
+
 /// Outcome of [`VolumeLeaderboard::begin_sweep`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SweepBegin {
@@ -4098,7 +4118,7 @@ mod tests {
     #[test]
     #[ignore = "wall-clock measurement, not a gate"]
     fn sliced_sweep_step_cost_at_the_authorized_ceiling() {
-        use crate::top_volume_sweep::{SliceSort, TOP_VOLUME_SWEEP_STEP_ROWS};
+        use crate::top_volume_sweep::{SliceRadixSort, TOP_VOLUME_SWEEP_STEP_ROWS};
         const CONTRACTS: u64 = 20_220;
         const ROUNDS: u64 = 20;
         let lots: std::collections::HashMap<ContractKey, u32> = (0..CONTRACTS)
@@ -4113,7 +4133,7 @@ mod tests {
             );
         }
         let mut rows = Vec::with_capacity(MAX_TRACKED_CONTRACTS);
-        let mut sorter = SliceSort::with_capacity(MAX_TRACKED_CONTRACTS);
+        let mut sorter = SliceRadixSort::with_capacity(MAX_TRACKED_CONTRACTS);
         let mut walk = GainerWalk::with_capacity(300);
         let mut max_step = [std::time::Duration::ZERO; 3];
         let mut total = std::time::Duration::ZERO;
@@ -4148,7 +4168,7 @@ mod tests {
             sorter.reset();
             loop {
                 let t = std::time::Instant::now();
-                let done = sorter.step(&mut rows, TOP_VOLUME_SWEEP_STEP_ROWS, board_order);
+                let done = sorter.step(&mut rows, TOP_VOLUME_SWEEP_STEP_ROWS, board_radix_key);
                 let e = t.elapsed();
                 phase_max[1] = phase_max[1].max(e);
                 total += e;
@@ -5606,10 +5626,45 @@ mod tests {
             panic!("no sweep of this cadence may be in flight at the start");
         }
         while !lb.sweep_step(OptionFamily::Stock, cadence, budget, lot1, all, &mut rows) {}
-        let mut sorter = crate::top_volume_sweep::SliceSort::with_capacity(rows.len());
+        let mut sorter = crate::top_volume_sweep::SliceRadixSort::with_capacity(rows.len());
         sorter.reset();
-        while !sorter.step(&mut rows, budget, board_order) {}
+        while !sorter.step(&mut rows, budget, board_radix_key) {}
         rows
+    }
+
+    proptest::proptest! {
+        /// Audit PR4c: sorting by `board_radix_key` produces exactly the board
+        /// `board_order` produces — including ties on the rank key, broken by
+        /// security id and then segment, and keys near both ends of `u64`.
+        #[test]
+        fn board_radix_key_sorts_identically_to_board_order(
+            rows in proptest::collection::vec(
+                (proptest::prelude::any::<u64>(), 0u64..40, proptest::prelude::any::<bool>(), 0u8..3),
+                0..800,
+            ),
+        ) {
+            let segments = [ExchangeSegment::NseFno, ExchangeSegment::BseFno, ExchangeSegment::NseEquity];
+            let mut seen = std::collections::HashSet::new();
+            let mut data: Vec<RankedContract> = Vec::new();
+            for (i, (key, narrow, use_narrow, seg)) in rows.iter().enumerate() {
+                let segment = segments[usize::from(*seg)];
+                // A small id space so the segment tie-break is reached too.
+                let id = (i as u64) % 300;
+                if !seen.insert((id, segment as u8)) {
+                    continue;
+                }
+                let mut row = stock(id, id % 17, 1);
+                row.segment = segment;
+                row.window_lots_milli = if *use_narrow { *narrow } else { *key };
+                data.push(row);
+            }
+            let mut expected = data.clone();
+            expected.sort_unstable_by(board_order);
+            let mut sorter = crate::top_volume_sweep::SliceRadixSort::with_capacity(data.len());
+            sorter.reset();
+            while !sorter.step(&mut data, 97, board_radix_key) {}
+            proptest::prop_assert_eq!(data, expected);
+        }
     }
 
     proptest::proptest! {

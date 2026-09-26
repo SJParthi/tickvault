@@ -13,9 +13,11 @@
 //!
 //! # What changed, and what did not
 //!
-//! The work is the SAME work and the total is the same order — O(k log k) in
-//! contracts that traded, which is inherent: the output is one sorted row per
-//! traded contract. What changed is its SHAPE on the drain:
+//! The work is the SAME work; what changed is its SHAPE on the drain. The total
+//! is O(k) in contracts that traded since audit PR4c (2026-09-26), when the
+//! board's sliced merge sort (O(k log k)) became a sliced LSD radix sort on the
+//! integer rank key ([`SliceRadixSort`]). O(k) is the floor, not a shortfall:
+//! the output is one sorted row per traded contract. On the drain:
 //!
 //! - the timer arm pays **O(1)**: it swaps each family's work list into an
 //!   in-flight slot ([`crate::volume_leaderboard::VolumeLeaderboard::begin_sweep`])
@@ -50,7 +52,6 @@
 //!   projects after its window has rolled out of the fold stores those columns
 //!   empty. Counted on [`TOP_VOLUME_SWEEP_CANDLE_MISS_COUNTER`] and logged.
 
-use std::cmp::Ordering;
 use std::collections::VecDeque;
 
 use tickvault_storage::top_volume_rank_persistence::{SnapshotCadence, TopVolumeLabelMap};
@@ -80,149 +81,219 @@ pub const TOP_VOLUME_ROLL_INLINE_COUNTER: &str = "tv_top_volume_roll_inline_tota
 /// row was projected, so its candle columns were stored empty.
 pub const TOP_VOLUME_SWEEP_CANDLE_MISS_COUNTER: &str = "tv_top_volume_candle_bar_missing_total";
 
-/// Length of the runs the sliced sort sorts in place before merging.
-const SORT_RUN: usize = 256;
+/// Words in a radix sort key, most significant first.
+pub const RADIX_WORDS: usize = 3;
 
-/// A merge sort that runs a bounded amount of work per call.
+/// Byte digits in a radix sort key: eight per word.
+const RADIX_DIGITS: usize = RADIX_WORDS * 8;
+
+/// Buckets per digit: one per byte value.
+const RADIX_BUCKETS: usize = 256;
+
+/// An LSD radix sort that runs a bounded amount of work per call (audit
+/// PR4c, 2026-09-26).
 ///
-/// Sorts runs of [`SORT_RUN`] elements in place, then merges them bottom-up
-/// through a second buffer, swapping the two at the end of each pass. With a
-/// comparator that is a TOTAL order over distinct elements the result is the
-/// same sequence `sort_unstable_by` produces — pinned by the property test
-/// below. Both buffers keep their capacity, so a sort allocates nothing once
-/// the buffers are sized.
+/// The sort key is `[u64; RADIX_WORDS]`, compared word by word, most
+/// significant first, ascending. The sort visits one byte of the key per pass,
+/// least significant first, and scatters stably through a second buffer, so
+/// the result is the key order with every tie resolved by the key itself.
+/// When the key encodes a TOTAL order over the elements, the result is the
+/// same sequence `sort_unstable_by` produces with that order (pinned by the
+/// property tests below and by `board_radix_key`'s own test).
+///
+/// # Complexity
+///
+/// **O(n × live digits)** in total, where a "live" digit is a key byte that
+/// is not the same in every element. A first scan finds them with one OR and
+/// one AND per word, so a byte that never varies (for example the high bytes
+/// of a small security id, or a segment every row shares) costs nothing
+/// after that scan. At most [`RADIX_DIGITS`] passes, each of two walks, so
+/// the sort is O(n) with a constant bounded by the key width, where the merge
+/// sort it replaced was O(n log n). Each call does about `budget` element
+/// visits, plus at most one 256-entry prefix sum.
+///
+/// Zero allocation once sized: both buffers keep their capacity and the
+/// counters are a fixed array.
 #[derive(Debug)]
-pub struct SliceSort<T: Copy> {
+pub struct SliceRadixSort<T: Copy> {
     aux: Vec<T>,
-    phase: SortPhase,
+    counts: [usize; RADIX_BUCKETS],
+    or_mask: [u64; RADIX_WORDS],
+    and_mask: [u64; RADIX_WORDS],
+    phase: RadixPhase,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SortPhase {
-    Runs {
+enum RadixPhase {
+    /// Copies the data into the second buffer and records which bytes vary.
+    Scan {
         next: usize,
     },
-    Merge {
-        width: usize,
-        start: usize,
-        left: usize,
-        right: usize,
+    /// Counts the elements per byte value of one digit.
+    Count {
+        digit: usize,
+        next: usize,
+    },
+    /// Scatters the elements, in order, into their bucket positions.
+    Scatter {
+        digit: usize,
+        next: usize,
     },
     Done,
 }
 
-impl<T: Copy> SliceSort<T> {
-    /// A sorter whose merge buffer holds `capacity` elements without growing.
+/// The byte of `key` at `digit`, digit 0 being the least significant byte of
+/// the least significant word.
+#[inline]
+fn radix_byte(key: &[u64; RADIX_WORDS], digit: usize) -> usize {
+    let word = RADIX_WORDS.saturating_sub(1).saturating_sub(digit / 8);
+    let shift = (digit % 8) * 8;
+    key.get(word).map_or(0, |w| ((w >> shift) & 0xFF) as usize)
+}
+
+impl<T: Copy> SliceRadixSort<T> {
+    /// A sorter whose second buffer holds `capacity` elements without growing.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             aux: Vec::with_capacity(capacity),
-            phase: SortPhase::Done,
+            counts: [0; RADIX_BUCKETS],
+            or_mask: [0; RADIX_WORDS],
+            and_mask: [u64::MAX; RADIX_WORDS],
+            phase: RadixPhase::Done,
         }
     }
 
     /// Starts a new sort. The data passed to the following `step` calls must
-    /// not change length until the sort finishes.
+    /// not change until the sort finishes.
     pub fn reset(&mut self) {
         self.aux.clear();
-        self.phase = SortPhase::Runs { next: 0 };
+        self.or_mask = [0; RADIX_WORDS];
+        self.and_mask = [u64::MAX; RADIX_WORDS];
+        self.phase = RadixPhase::Scan { next: 0 };
     }
 
-    /// Advances the sort by about `budget` element moves. Returns `true` when
-    /// `data` is fully sorted.
-    pub fn step<F>(&mut self, data: &mut Vec<T>, budget: usize, cmp: F) -> bool
+    /// The first digit at or after `from` whose byte is not the same in every
+    /// element. O(`RADIX_DIGITS`).
+    fn next_live_digit(&self, from: usize) -> Option<usize> {
+        (from..RADIX_DIGITS).find(|&digit| {
+            let word = RADIX_WORDS.saturating_sub(1).saturating_sub(digit / 8);
+            let shift = (digit % 8) * 8;
+            let varies = match (self.or_mask.get(word), self.and_mask.get(word)) {
+                (Some(or), Some(and)) => or ^ and,
+                _ => 0,
+            };
+            (varies >> shift) & 0xFF != 0
+        })
+    }
+
+    /// The phase that follows a finished pass over the digits before `from`.
+    fn begin_digit_from(&mut self, from: usize) -> RadixPhase {
+        match self.next_live_digit(from) {
+            Some(digit) => {
+                self.counts = [0; RADIX_BUCKETS];
+                RadixPhase::Count { digit, next: 0 }
+            }
+            None => RadixPhase::Done,
+        }
+    }
+
+    /// Advances the sort by about `budget` element visits. Returns `true` when
+    /// `data` is fully sorted by `key`.
+    pub fn step<K>(&mut self, data: &mut Vec<T>, budget: usize, key: K) -> bool
     where
-        F: Fn(&T, &T) -> Ordering,
+        K: Fn(&T) -> [u64; RADIX_WORDS],
     {
         let len = data.len();
         let mut work = 0usize;
         loop {
             match self.phase {
-                SortPhase::Done => return true,
-                SortPhase::Runs { next } => {
+                RadixPhase::Done => return true,
+                RadixPhase::Scan { next } => {
                     if next >= len {
-                        if len <= SORT_RUN {
-                            self.phase = SortPhase::Done;
-                            return true;
-                        }
-                        self.aux.clear();
-                        self.phase = SortPhase::Merge {
-                            width: SORT_RUN,
-                            start: 0,
-                            left: 0,
-                            right: SORT_RUN,
+                        self.phase = if len <= 1 {
+                            RadixPhase::Done
+                        } else {
+                            self.begin_digit_from(0)
                         };
                         continue;
                     }
-                    let end = next.saturating_add(SORT_RUN).min(len);
-                    if let Some(run) = data.get_mut(next..end) {
-                        run.sort_unstable_by(&cmp);
+                    let end = next
+                        .saturating_add(budget.saturating_sub(work).max(1))
+                        .min(len);
+                    if let Some(chunk) = data.get(next..end) {
+                        for element in chunk {
+                            let words = key(element);
+                            for ((or, and), word) in self
+                                .or_mask
+                                .iter_mut()
+                                .zip(self.and_mask.iter_mut())
+                                .zip(words)
+                            {
+                                *or |= word;
+                                *and &= word;
+                            }
+                            self.aux.push(*element);
+                        }
                     }
                     work = work.saturating_add(end - next);
-                    self.phase = SortPhase::Runs { next: end };
+                    self.phase = RadixPhase::Scan { next: end };
                 }
-                SortPhase::Merge {
-                    width,
-                    start,
-                    mut left,
-                    mut right,
-                } => {
-                    if start >= len {
-                        // One pass merged: the merged sequence is in `aux`.
-                        std::mem::swap(data, &mut self.aux);
-                        self.aux.clear();
-                        let doubled = width.saturating_mul(2);
-                        if doubled >= len {
-                            self.phase = SortPhase::Done;
-                            return true;
+                RadixPhase::Count { digit, next } => {
+                    if next >= len {
+                        // Exclusive prefix sum: each bucket's first position.
+                        let mut position = 0usize;
+                        for count in &mut self.counts {
+                            let this = *count;
+                            *count = position;
+                            position = position.saturating_add(this);
                         }
-                        self.phase = SortPhase::Merge {
-                            width: doubled,
-                            start: 0,
-                            left: 0,
-                            right: doubled.min(len),
-                        };
+                        work = work.saturating_add(RADIX_BUCKETS);
+                        self.phase = RadixPhase::Scatter { digit, next: 0 };
                         continue;
                     }
-                    let mid = start.saturating_add(width).min(len);
-                    let end = start.saturating_add(width.saturating_mul(2)).min(len);
-                    while work < budget && (left < mid || right < end) {
-                        let take_left = match (data.get(left), data.get(right)) {
-                            (Some(l), Some(r)) if left < mid && right < end => {
-                                cmp(l, r) != Ordering::Greater
+                    let end = next
+                        .saturating_add(budget.saturating_sub(work).max(1))
+                        .min(len);
+                    if let Some(chunk) = data.get(next..end) {
+                        for element in chunk {
+                            if let Some(count) =
+                                self.counts.get_mut(radix_byte(&key(element), digit))
+                            {
+                                *count = count.saturating_add(1);
                             }
-                            _ => left < mid,
-                        };
-                        let from = if take_left { left } else { right };
-                        if let Some(value) = data.get(from) {
-                            self.aux.push(*value);
                         }
-                        if take_left {
-                            left = left.saturating_add(1);
-                        } else {
-                            right = right.saturating_add(1);
-                        }
-                        work = work.saturating_add(1);
                     }
-                    self.phase = if left >= mid && right >= end {
-                        SortPhase::Merge {
-                            width,
-                            start: end,
-                            left: end,
-                            right: end.saturating_add(width).min(len),
+                    work = work.saturating_add(end - next);
+                    self.phase = RadixPhase::Count { digit, next: end };
+                }
+                RadixPhase::Scatter { digit, next } => {
+                    if next >= len {
+                        // The pass is complete in `aux`; the next pass reads it.
+                        std::mem::swap(data, &mut self.aux);
+                        self.phase = self.begin_digit_from(digit.saturating_add(1));
+                        continue;
+                    }
+                    let end = next
+                        .saturating_add(budget.saturating_sub(work).max(1))
+                        .min(len);
+                    if let Some(chunk) = data.get(next..end) {
+                        for element in chunk {
+                            let bucket = radix_byte(&key(element), digit);
+                            if let Some(slot) = self.counts.get_mut(bucket) {
+                                if let Some(target) = self.aux.get_mut(*slot) {
+                                    *target = *element;
+                                }
+                                *slot = slot.saturating_add(1);
+                            }
                         }
-                    } else {
-                        SortPhase::Merge {
-                            width,
-                            start,
-                            left,
-                            right,
-                        }
-                    };
+                    }
+                    work = work.saturating_add(end - next);
+                    self.phase = RadixPhase::Scatter { digit, next: end };
                 }
             }
             if work >= budget {
-                return self.phase == SortPhase::Done;
+                return self.phase == RadixPhase::Done;
             }
         }
     }
@@ -297,8 +368,8 @@ pub struct TopVolumeSweep {
     pub active: Option<ActiveSweep>,
     /// The collected rows of the family being worked, sorted in place.
     pub rows: Vec<RankedContract>,
-    /// The sliced sorter for `rows`.
-    pub sort: SliceSort<RankedContract>,
+    /// The sliced radix sorter for `rows` (audit PR4c).
+    pub sort: SliceRadixSort<RankedContract>,
     /// The sliced gainer walk over `rows`.
     pub gainers: GainerWalk,
     /// The label snapshot the running family's projection reads, taken on
@@ -322,7 +393,7 @@ impl TopVolumeSweep {
             busy_mask: 0,
             active: None,
             rows: Vec::with_capacity(row_capacity),
-            sort: SliceSort::with_capacity(row_capacity),
+            sort: SliceRadixSort::with_capacity(row_capacity),
             gainers: GainerWalk::with_capacity(gainer_capacity),
             labels: None,
             deferred: 0,
@@ -436,15 +507,23 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    use std::cmp::Ordering;
+
     fn total(a: &(u64, u64), b: &(u64, u64)) -> Ordering {
         b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1))
     }
 
+    /// `total` as a radix key: the first component descending, the second
+    /// ascending.
+    fn total_key(a: &(u64, u64)) -> [u64; RADIX_WORDS] {
+        [!a.0, a.1, 0]
+    }
+
     fn run_to_end(data: &mut Vec<(u64, u64)>, budget: usize) -> usize {
-        let mut sorter = SliceSort::with_capacity(data.len());
+        let mut sorter = SliceRadixSort::with_capacity(data.len());
         sorter.reset();
         let mut steps = 0usize;
-        while !sorter.step(data, budget, total) {
+        while !sorter.step(data, budget, total_key) {
             steps += 1;
             assert!(steps < 1_000_000, "the sliced sort must terminate");
         }
@@ -453,13 +532,19 @@ mod tests {
 
     proptest! {
         #[test]
-        fn slice_sort_step_matches_sort_unstable_by(
-            keys in proptest::collection::vec(0u64..50, 0..3_000),
+        fn slice_radix_sort_step_matches_sort_unstable_by(
+            keys in proptest::collection::vec(any::<u64>(), 0..3_000),
+            small in any::<bool>(),
             budget in 1usize..2_000,
         ) {
-            // Distinct second component: the order is TOTAL, as `board_order` is.
-            let mut data: Vec<(u64, u64)> =
-                keys.iter().enumerate().map(|(i, k)| (*k, i as u64)).collect();
+            // Distinct second component: the order is TOTAL, as `board_order`
+            // is. `small` folds the keys into a narrow range so ties on the
+            // first component are common and the tie-break is exercised.
+            let mut data: Vec<(u64, u64)> = keys
+                .iter()
+                .enumerate()
+                .map(|(i, k)| (if small { k % 50 } else { *k }, (i as u64).wrapping_mul(0x9E37_79B9)))
+                .collect();
             let mut expected = data.clone();
             expected.sort_unstable_by(total);
             let _steps = run_to_end(&mut data, budget);
@@ -468,7 +553,7 @@ mod tests {
     }
 
     #[test]
-    fn slice_sort_step_bounds_the_work_of_one_call() {
+    fn slice_radix_sort_step_bounds_the_work_of_one_call() {
         let mut data: Vec<(u64, u64)> = (0..20_000u64).map(|i| (i % 97, i)).collect();
         let mut expected = data.clone();
         expected.sort_unstable_by(total);
@@ -480,18 +565,58 @@ mod tests {
     }
 
     #[test]
-    fn slice_sort_step_keeps_both_buffers_capacity() {
+    fn slice_radix_sort_step_skips_the_digits_that_never_vary() {
+        // Keys below 256 and a constant second component: exactly ONE byte
+        // varies, so after the scan the sort is one count and one scatter —
+        // three walks of the data in all, not one per key byte.
+        let mut data: Vec<(u64, u64)> = (0..1_000u64).map(|i| ((i * 7) % 256, 5)).collect();
+        let mut sorter = SliceRadixSort::with_capacity(data.len());
+        sorter.reset();
+        // A budget large enough for the whole job in one call.
+        assert!(sorter.step(&mut data, usize::MAX, total_key));
+        assert_eq!(sorter.next_live_digit(0), Some(16));
+        assert_eq!(sorter.next_live_digit(17), None);
+        assert!(
+            data.windows(2)
+                .all(|w| total(&w[0], &w[1]) != Ordering::Greater)
+        );
+    }
+
+    #[test]
+    fn slice_radix_sort_step_keeps_both_buffers_capacity() {
         let mut data: Vec<(u64, u64)> = Vec::with_capacity(4_096);
         data.extend((0..4_000u64).map(|i| (i % 13, i)));
-        let mut sorter = SliceSort::with_capacity(4_096);
+        let mut sorter = SliceRadixSort::with_capacity(4_096);
         sorter.reset();
-        while !sorter.step(&mut data, 300, total) {}
+        while !sorter.step(&mut data, 300, total_key) {}
         assert!(data.capacity() >= 4_096);
         assert!(sorter.aux.capacity() >= 4_096);
         assert!(
             data.windows(2)
                 .all(|w| total(&w[0], &w[1]) != Ordering::Greater)
         );
+    }
+
+    #[test]
+    fn slice_radix_sort_step_handles_empty_and_single_inputs() {
+        let mut sorter = SliceRadixSort::with_capacity(4);
+        let mut empty: Vec<(u64, u64)> = Vec::new();
+        sorter.reset();
+        assert!(sorter.step(&mut empty, 1, total_key));
+        let mut one = vec![(3u64, 9u64)];
+        sorter.reset();
+        assert!(sorter.step(&mut one, 1, total_key) || sorter.step(&mut one, 1, total_key));
+        assert_eq!(one, vec![(3, 9)]);
+    }
+
+    #[test]
+    fn test_radix_byte_reads_least_significant_word_first() {
+        let key = [0x0102, 0x0304, 0x0506];
+        assert_eq!(radix_byte(&key, 0), 0x06);
+        assert_eq!(radix_byte(&key, 1), 0x05);
+        assert_eq!(radix_byte(&key, 8), 0x04);
+        assert_eq!(radix_byte(&key, 16), 0x02);
+        assert_eq!(radix_byte(&key, 23), 0x00);
     }
 
     #[test]
@@ -551,7 +676,7 @@ mod tests {
         assert!(sweep.queue.capacity() >= WINDOW_COUNT);
         assert!(sweep.active.is_none());
         assert!(sweep.labels.is_none());
-        let sorter: SliceSort<u64> = SliceSort::with_capacity(64);
+        let sorter: SliceRadixSort<u64> = SliceRadixSort::with_capacity(64);
         assert!(sorter.aux.capacity() >= 64);
     }
 
