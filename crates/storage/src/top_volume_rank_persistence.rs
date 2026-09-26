@@ -2227,9 +2227,17 @@ impl TopVolumeRowProducer {
     /// Drops staged rows that will never be handed off, counts and logs them.
     /// Called at shutdown, the one moment nothing else hands them off.
     pub fn discard_pending(&mut self) -> usize {
+        self.discard_staged("the lane shut down with rows staged")
+    }
+
+    /// Drops staged rows for a reason other than shutdown, counts and logs
+    /// them under `why` (audit PR4, 2026-09-26: the daily ranking reset drops
+    /// a sweep that was part-way through staging its rows, and those rows
+    /// must not ride out on the next day's first hand-off).
+    pub fn discard_staged(&mut self, why: &'static str) -> usize {
         let dropped = self.rows.len();
         self.rows.clear();
-        self.count_discard(dropped, "the lane shut down with rows staged");
+        self.count_discard(dropped, why);
         dropped
     }
 
@@ -3966,6 +3974,23 @@ mod row_handoff_tests {
         assert_eq!(producer.rows.capacity(), capacity, "the vector never grew");
         assert_eq!(producer.discard_pending(), TOP_VOLUME_MAX_ROWS_PER_SWEEP);
         assert_eq!(producer.pending(), 0);
+    }
+
+    #[test]
+    fn test_discard_staged_empties_the_buffer_and_keeps_its_capacity() {
+        let (mut producer, _writer, _rx) =
+            TopVolumeRankWriter::for_test().split_rows_for_offload("unmapped");
+        let capacity = producer.rows.capacity();
+        assert_eq!(producer.discard_staged("nothing staged"), 0);
+        for _ in 0..3 {
+            assert!(producer.stage(&row(7)));
+        }
+        assert_eq!(
+            producer.discard_staged("the daily reset dropped a sweep"),
+            3
+        );
+        assert_eq!(producer.pending(), 0);
+        assert_eq!(producer.rows.capacity(), capacity);
     }
 
     #[test]

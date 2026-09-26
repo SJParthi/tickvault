@@ -257,6 +257,31 @@ impl OptionFamily {
 /// volumes into one leaderboard entry.
 pub type ContractKey = (u64, ExchangeSegment);
 
+/// The board's order: most milli-lots in the window first, then
+/// `security_id`, then segment. A TOTAL order over distinct keys, so an
+/// unstable sort, a merge sort and a sort done in slices all produce the same
+/// board — which is what lets the drain sort in slices (audit PR4).
+#[must_use]
+pub fn board_order(a: &RankedContract, b: &RankedContract) -> std::cmp::Ordering {
+    b.window_lots_milli
+        .cmp(&a.window_lots_milli)
+        .then_with(|| a.security_id.cmp(&b.security_id))
+        .then_with(|| (a.segment as u8).cmp(&(b.segment as u8)))
+}
+
+/// Outcome of [`VolumeLeaderboard::begin_sweep`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepBegin {
+    /// The work list was swapped in; `sweep_step` will visit it.
+    Started,
+    /// The previous sweep of this cadence is still visiting its keys; the
+    /// work list is left in place. The drain then rolls it with
+    /// [`VolumeLeaderboard::roll_baselines`], so that window is skipped.
+    Busy,
+    /// The cadence has no baseline slot (counted in `window_slot`).
+    Refused,
+}
+
 /// One contract's ranking row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RankedContract {
@@ -675,6 +700,23 @@ struct Family {
     /// — 32,768 × 80 B ≈ 2.6 MB. An earlier version of this line said "~4 MB",
     /// which counted the value and not the inline key).
     dirty: [Vec<ContractKey>; WINDOW_COUNT],
+    /// The work list a SLICED sweep is currently consuming, one per window.
+    ///
+    /// Added 2026-09-26 (audit PR4) so the drain never sorts on its tick
+    /// loop. [`VolumeLeaderboard::begin_sweep`] SWAPS `dirty[w]` into this
+    /// slot — an O(1) exchange of two pre-sized vectors, no copy and no
+    /// allocation — and [`VolumeLeaderboard::sweep_step`] pops a bounded
+    /// number of keys per call. The invariant on `dirty` therefore reads, for
+    /// every window `w`: a key's bit is set ⟺ the key is on `dirty[w]` OR on
+    /// `in_flight[w]`, on at most one of them, at most once. A key being
+    /// swept keeps its bit until its step clears it, so a trade landing in
+    /// between is folded into the delta it is about to take instead of being
+    /// pushed a second time.
+    ///
+    /// Pre-sized like `dirty`, and the cost is stated for the same reason:
+    /// another `WINDOW_COUNT × MAX_TRACKED_CONTRACTS × 16 B` ≈ 1.6 MB per
+    /// family.
+    in_flight: [Vec<ContractKey>; WINDOW_COUNT],
     non_monotonic: u64,
     at_capacity: u64,
     relatched: u64,
@@ -759,6 +801,7 @@ impl Family {
             // Pre-sized for the same reason, and `from_fn` rather than an
             // array literal because a `Vec` is not `Copy`.
             dirty: std::array::from_fn(|_| Vec::with_capacity(MAX_TRACKED_CONTRACTS)),
+            in_flight: std::array::from_fn(|_| Vec::with_capacity(MAX_TRACKED_CONTRACTS)),
             non_monotonic: 0,
             at_capacity: 0,
             relatched: 0,
@@ -783,6 +826,11 @@ impl Family {
         // re-creates the whole-universe walk this list exists to avoid, on the
         // first sweep after every daily reset.
         for window in &mut self.dirty {
+            window.clear();
+        }
+        // The in-flight half goes with it, for the same reason: a sliced
+        // sweep that resumes after a reset must find nothing to visit.
+        for window in &mut self.in_flight {
             window.clear();
         }
         self.non_monotonic = 0;
@@ -1330,78 +1378,70 @@ impl VolumeLeaderboard {
         slot.dirty[idx] = pending;
     }
 
-    pub fn rank<F, L>(
+    /// Starts a SLICED sweep of one cadence: swaps the cadence's work list
+    /// into the in-flight slot. **O(1)** — one exchange of two pre-sized
+    /// vectors, no copy, no allocation — which is the only part of a sweep
+    /// the drain's timer arm now pays (audit PR4, 2026-09-26).
+    ///
+    /// `Busy` means the previous sweep of this cadence has not finished
+    /// visiting its keys; the work list is left where it is. Left alone it
+    /// would accumulate and the next sweep would report two windows under
+    /// one `ts`, so the drain rolls it (`roll_baselines`) and counts the
+    /// skipped window instead.
+    pub fn begin_sweep(&mut self, family: OptionFamily, cadence: SnapshotCadence) -> SweepBegin {
+        let Some(idx) = window_slot(cadence) else {
+            return SweepBegin::Refused;
+        };
+        let slot = self.family_mut(family);
+        if !slot.in_flight[idx].is_empty() {
+            return SweepBegin::Busy;
+        }
+        // Both vectors keep their capacity: the drained in-flight list goes
+        // back as the empty work list, so the per-tick `push` never grows.
+        std::mem::swap(&mut slot.dirty[idx], &mut slot.in_flight[idx]);
+        SweepBegin::Started
+    }
+
+    /// Whether a sliced sweep of this cadence still has keys to visit.
+    #[must_use]
+    pub fn sweep_pending(&self, family: OptionFamily, cadence: SnapshotCadence) -> bool {
+        cadence
+            .slot()
+            .is_some_and(|idx| !self.family_ref(family).in_flight[idx].is_empty())
+    }
+
+    /// Visits at most `budget` in-flight keys of one cadence: computes each
+    /// contract's window delta, rolls its baseline, and pushes the eligible
+    /// rows into `out` UNSORTED. Returns `true` once the in-flight list is
+    /// empty.
+    ///
+    /// **O(budget)** per call — one hash probe per key, plus the lot probe
+    /// when the row carries none. The order keys are visited in does not
+    /// matter: the caller sorts the collected rows with [`board_order`], a
+    /// total order, so the board is the same whichever way they arrived.
+    pub fn sweep_step<F, L>(
         &mut self,
         family: OptionFamily,
         cadence: SnapshotCadence,
-        k: usize,
+        budget: usize,
         lot_of: L,
         eligible: F,
-    ) -> &[RankedContract]
+        out: &mut Vec<RankedContract>,
+    ) -> bool
     where
         F: Fn(&RankedContract) -> bool,
         L: Fn(&RankedContract) -> Option<u32>,
     {
         let Some(idx) = window_slot(cadence) else {
-            // Refused and counted in `window_slot`. An empty ranking is the
-            // honest answer — the alternative is indexing a baseline array
-            // that is one slot short, on the frame drain, under
-            // `panic = "abort"`.
-            return &[];
+            return true;
         };
-        // `take` rather than a direct fill: the buffer and the family map both
-        // live on `self`, so filling one from the other needs two borrows. Take
-        // moves the Vec out WITH its capacity, so the allocation is still made
-        // once at construction and reused for the life of the process.
-        let mut scratch = std::mem::take(&mut self.scratch);
-        scratch.clear();
-
-        // ONE pass over the contracts that TRADED in this window, and it does
-        // three things that must not be split apart: computes each contract's
-        // delta against ITS baseline, pushes the eligible ones, and rolls
-        // EVERY TRADED baseline forward — ranked or not.
-        //
-        // "Every traded, ranked or not" is the load-bearing phrase, and the
-        // baseline roll below sits ABOVE the eligibility test for exactly that
-        // reason. Rolling forward only the RANKED contracts would let an
-        // ineligible one accumulate across windows and arrive with a delta
-        // measuring minutes the moment it became eligible — it would take a
-        // depth socket on a number no other contract on the board was measured
-        // over.
-        //
-        // ⚠ 2026-09-12 — this comment said "rolls EVERY baseline forward" and
-        // the loop walked the whole map. It now walks the work list, and the
-        // two are EQUIVALENT rather than merely close:
-        //
-        //   a contract is absent from `dirty[idx]` ⟺ its bit for `idx` is
-        //   clear ⟺ no accepted advance since this window's last sweep ⟹
-        //   `baseline[idx] == volume` ⟹ `delta == 0` ⟹ `lots == 0` ⟹ the
-        //   loop would have `continue`d, after writing a baseline it already
-        //   held.
-        //
-        // The arrows are DIRECTIONAL past the third step and that is not a
-        // typographic nicety — the last two do not hold in reverse.
-        // `lots == delta * 1000 / lot_size` is an integer division, so a
-        // delta of 1 on a 2,000-unit lot yields `lots == 0` with `delta != 0`;
-        // and the loop also `continue`s when the lot size is MISSING, whatever
-        // the delta. Neither reverse direction is needed: the claim being
-        // proven is one-way — absent from the list ⟹ the old walk would have
-        // skipped it — so left-to-right is the whole proof. (Stated because an
-        // earlier version of this comment wrote ⟺ throughout, which asserts
-        // two things that are false and would mislead anyone auditing the
-        // skip by reading the chain rather than the code.)
-        //
-        // The middle step is what every writer of `Tracked` is arranged to
-        // keep true: insert seeds the baseline to the current volume, an
-        // accepted advance marks the bit, a re-latch reseeds the baseline AND
-        // preserves the mask, and a refusal changes neither the volume nor the
-        // baseline. So skipping an unmarked contract is not an approximation
-        // of the old walk — it produces the same board, byte for byte, and
-        // the same stored baselines. Pinned by
-        // `a_contract_that_traded_is_never_skipped_by_the_sweep_that_follows`.
         let slot = self.family_mut(family);
-        let mut pending = std::mem::take(&mut slot.dirty[idx]);
-        for key in pending.drain(..) {
+        let mut visited = 0usize;
+        while visited < budget {
+            let Some(key) = slot.in_flight[idx].pop() else {
+                break;
+            };
+            visited = visited.saturating_add(1);
             // A key on the list whose entry is gone can only mean a daily
             // reset landed between the mark and the sweep, and `clear` empties
             // both halves together — so this is the defensive arm, and it
@@ -1519,11 +1559,121 @@ impl VolumeLeaderboard {
             row.delta_units = delta;
             row.lot_size = lot;
             if eligible(&row) {
-                scratch.push(row);
+                out.push(row);
             }
         }
-        // Drained, so this hands the CAPACITY back, not the contents.
-        slot.dirty[idx] = pending;
+        slot.in_flight[idx].is_empty()
+    }
+
+    /// Publishes the tracked / ranked gauges for one finished sweep — the
+    /// same two gauges [`Self::rank`] sets, for the sliced path.
+    pub fn publish_sweep_gauges(
+        &self,
+        family: OptionFamily,
+        cadence: SnapshotCadence,
+        ranked_len: usize,
+    ) {
+        let Some(idx) = cadence.slot() else {
+            return;
+        };
+        let slot = self.family_ref(family);
+        slot.tracked_gauge[idx].set(slot.volumes.len() as f64);
+        slot.ranked_gauge[idx].set(ranked_len as f64);
+    }
+
+    pub fn rank<F, L>(
+        &mut self,
+        family: OptionFamily,
+        cadence: SnapshotCadence,
+        k: usize,
+        lot_of: L,
+        eligible: F,
+    ) -> &[RankedContract]
+    where
+        F: Fn(&RankedContract) -> bool,
+        L: Fn(&RankedContract) -> Option<u32>,
+    {
+        let Some(idx) = window_slot(cadence) else {
+            // Refused and counted in `window_slot`. An empty ranking is the
+            // honest answer — the alternative is indexing a baseline array
+            // that is one slot short, on the frame drain, under
+            // `panic = "abort"`.
+            return &[];
+        };
+        // `take` rather than a direct fill: the buffer and the family map both
+        // live on `self`, so filling one from the other needs two borrows. Take
+        // moves the Vec out WITH its capacity, so the allocation is still made
+        // once at construction and reused for the life of the process.
+        let mut scratch = std::mem::take(&mut self.scratch);
+        scratch.clear();
+
+        // ONE pass over the contracts that TRADED in this window, and it does
+        // three things that must not be split apart: computes each contract's
+        // delta against ITS baseline, pushes the eligible ones, and rolls
+        // EVERY TRADED baseline forward — ranked or not.
+        //
+        // "Every traded, ranked or not" is the load-bearing phrase, and the
+        // baseline roll below sits ABOVE the eligibility test for exactly that
+        // reason. Rolling forward only the RANKED contracts would let an
+        // ineligible one accumulate across windows and arrive with a delta
+        // measuring minutes the moment it became eligible — it would take a
+        // depth socket on a number no other contract on the board was measured
+        // over.
+        //
+        // ⚠ 2026-09-12 — this comment said "rolls EVERY baseline forward" and
+        // the loop walked the whole map. It now walks the work list, and the
+        // two are EQUIVALENT rather than merely close:
+        //
+        //   a contract is absent from `dirty[idx]` ⟺ its bit for `idx` is
+        //   clear ⟺ no accepted advance since this window's last sweep ⟹
+        //   `baseline[idx] == volume` ⟹ `delta == 0` ⟹ `lots == 0` ⟹ the
+        //   loop would have `continue`d, after writing a baseline it already
+        //   held.
+        //
+        // The arrows are DIRECTIONAL past the third step and that is not a
+        // typographic nicety — the last two do not hold in reverse.
+        // `lots == delta * 1000 / lot_size` is an integer division, so a
+        // delta of 1 on a 2,000-unit lot yields `lots == 0` with `delta != 0`;
+        // and the loop also `continue`s when the lot size is MISSING, whatever
+        // the delta. Neither reverse direction is needed: the claim being
+        // proven is one-way — absent from the list ⟹ the old walk would have
+        // skipped it — so left-to-right is the whole proof. (Stated because an
+        // earlier version of this comment wrote ⟺ throughout, which asserts
+        // two things that are false and would mislead anyone auditing the
+        // skip by reading the chain rather than the code.)
+        //
+        // The middle step is what every writer of `Tracked` is arranged to
+        // keep true: insert seeds the baseline to the current volume, an
+        // accepted advance marks the bit, a re-latch reseeds the baseline AND
+        // preserves the mask, and a refusal changes neither the volume nor the
+        // baseline. So skipping an unmarked contract is not an approximation
+        // of the old walk — it produces the same board, byte for byte, and
+        // the same stored baselines. Pinned by
+        // `a_contract_that_traded_is_never_skipped_by_the_sweep_that_follows`.
+        // The SAME walk the drain now takes in slices (`begin_sweep` +
+        // `sweep_step`), run to completion here. A sliced sweep of this
+        // cadence may still be in flight when a synchronous rank is asked
+        // for; its keys are finished first, then the fresh list is taken, so
+        // no traded key is left marked and unvisited.
+        if self.begin_sweep(family, cadence) == SweepBegin::Busy {
+            self.sweep_step(
+                family,
+                cadence,
+                usize::MAX,
+                &lot_of,
+                &eligible,
+                &mut scratch,
+            );
+            let _fresh = self.begin_sweep(family, cadence);
+        }
+        self.sweep_step(
+            family,
+            cadence,
+            usize::MAX,
+            &lot_of,
+            &eligible,
+            &mut scratch,
+        );
 
         // Most lots traded in the window first, then a DETERMINISTIC tiebreak
         // on the composite identity. Without the tiebreak, equal keys order by
@@ -1543,12 +1693,7 @@ impl VolumeLeaderboard {
         // sort rather than misplacing one row. Integer key, percentage
         // presentation. Pinned by
         // `ranking_by_volume_percentage_is_the_same_order_as_ranking_by_lots`.
-        scratch.sort_unstable_by(|a, b| {
-            b.window_lots_milli
-                .cmp(&a.window_lots_milli)
-                .then_with(|| a.security_id.cmp(&b.security_id))
-                .then_with(|| (a.segment as u8).cmp(&(b.segment as u8)))
-        });
+        scratch.sort_unstable_by(board_order);
         scratch.truncate(k);
         self.scratch = scratch;
 
@@ -1892,34 +2037,107 @@ pub fn gainer_eligible<F>(
 where
     F: Fn(u64) -> GainerVerdict,
 {
-    let mut out: Vec<RankedContract> = Vec::with_capacity(ranked.len().min(limit));
-    let mut tally = GainerTally::default();
-    // One verdict per UNDERLYING, not per row. A stock's ~102 strikes share
-    // one spot and one previous close, so the verdict is identical for every
-    // one of them; without the memo a down day — every underlying falling,
-    // nothing collected, the walk running to the END of the population —
-    // paid two store probes per row across all ~20,000. The memo caps the
-    // probes at the number of underlyings (~210) whatever the day looks like.
-    // Sized for the measured F&O underlying count; a larger day grows it
-    // once. Cold path: one 5-second sweep, never per tick.
-    let mut memo: HashMap<u64, GainerVerdict> = HashMap::with_capacity(GAINER_MEMO_CAPACITY);
-    for row in ranked {
-        if out.len() >= limit {
-            break;
-        }
-        let verdict = *memo
-            .entry(row.underlying_id)
-            .or_insert_with(|| verdict_of(row.underlying_id));
-        match verdict {
-            GainerVerdict::Gainer => {
-                tally.gainer = tally.gainer.saturating_add(1);
-                out.push(*row);
-            }
-            GainerVerdict::NotGainer => tally.not_gainer = tally.not_gainer.saturating_add(1),
-            GainerVerdict::Unknown => tally.unknown = tally.unknown.saturating_add(1),
+    // The one walk, run to completion. The drain runs the SAME walk in
+    // slices through `GainerWalk` (audit PR4), so the two cannot disagree
+    // about which contracts qualify.
+    let mut walk = GainerWalk::with_capacity(ranked.len().min(limit));
+    walk.reset(limit);
+    let _done = walk.step(ranked, usize::MAX, verdict_of);
+    (walk.out, walk.tally)
+}
+
+/// [`gainer_eligible`] as a resumable walk, so the drain can run it a bounded
+/// number of rows at a time instead of in one pass over up to ~20,000 rows.
+///
+/// The per-underlying verdict memo is carried across steps, so the probe
+/// bound is the same as the one-pass walk's: at most one verdict per
+/// underlying per sweep. Buffers are reused across sweeps — `reset` clears
+/// them and keeps their capacity.
+#[derive(Debug)]
+pub struct GainerWalk {
+    out: Vec<RankedContract>,
+    tally: GainerTally,
+    /// One verdict per UNDERLYING, not per row. A stock's ~102 strikes share
+    /// one spot and one previous close, so the verdict is identical for every
+    /// one of them; without the memo a down day — every underlying falling,
+    /// nothing collected, the walk running to the END of the population —
+    /// paid two store probes per row across all ~20,000. The memo caps the
+    /// probes at the number of underlyings (~210) whatever the day looks like.
+    /// Sized for the measured F&O underlying count; a larger day grows it
+    /// once, and `reset` keeps the grown capacity.
+    memo: HashMap<u64, GainerVerdict>,
+    pos: usize,
+    limit: usize,
+}
+
+impl GainerWalk {
+    /// A walk whose output buffer holds `out_capacity` rows without growing.
+    #[must_use]
+    pub fn with_capacity(out_capacity: usize) -> Self {
+        Self {
+            out: Vec::with_capacity(out_capacity),
+            tally: GainerTally::default(),
+            memo: HashMap::with_capacity(GAINER_MEMO_CAPACITY),
+            pos: 0,
+            limit: 0,
         }
     }
-    (out, tally)
+
+    /// Starts a new walk that stops once `limit` gainers are collected.
+    pub fn reset(&mut self, limit: usize) {
+        self.out.clear();
+        self.tally = GainerTally::default();
+        self.memo.clear();
+        self.pos = 0;
+        self.limit = limit;
+    }
+
+    /// Visits at most `budget` more rows of `ranked`. Returns `true` when
+    /// the walk is finished — `limit` gainers found or the rows exhausted.
+    /// `ranked` must be the same slice on every step of one walk.
+    pub fn step<F>(&mut self, ranked: &[RankedContract], budget: usize, verdict_of: F) -> bool
+    where
+        F: Fn(u64) -> GainerVerdict,
+    {
+        let mut visited = 0usize;
+        while visited < budget {
+            if self.out.len() >= self.limit {
+                return true;
+            }
+            let Some(row) = ranked.get(self.pos) else {
+                return true;
+            };
+            self.pos = self.pos.saturating_add(1);
+            visited = visited.saturating_add(1);
+            let verdict = *self
+                .memo
+                .entry(row.underlying_id)
+                .or_insert_with(|| verdict_of(row.underlying_id));
+            match verdict {
+                GainerVerdict::Gainer => {
+                    self.tally.gainer = self.tally.gainer.saturating_add(1);
+                    self.out.push(*row);
+                }
+                GainerVerdict::NotGainer => {
+                    self.tally.not_gainer = self.tally.not_gainer.saturating_add(1);
+                }
+                GainerVerdict::Unknown => self.tally.unknown = self.tally.unknown.saturating_add(1),
+            }
+        }
+        self.out.len() >= self.limit || self.pos >= ranked.len()
+    }
+
+    /// The gainers collected so far, in board order.
+    #[must_use]
+    pub fn gainers(&self) -> &[RankedContract] {
+        &self.out
+    }
+
+    /// The verdict tally so far.
+    #[must_use]
+    pub const fn tally(&self) -> GainerTally {
+        self.tally
+    }
 }
 
 /// Pre-size for the per-underlying verdict memo in [`gainer_eligible`]:
@@ -2245,7 +2463,10 @@ mod tests {
         for (window, pending) in slot.dirty.iter().enumerate() {
             let bit = 1u8 << window;
             let mut seen = std::collections::HashSet::new();
-            for key in pending {
+            // A key is on the work list OR on the in-flight list of a sliced
+            // sweep (audit PR4), never both and never twice.
+            let in_flight = slot.in_flight.get(window).map_or(&[][..], Vec::as_slice);
+            for key in pending.iter().chain(in_flight) {
                 assert!(
                     seen.insert(*key),
                     "{note}: {family:?} window {window} lists {key:?} twice — the lists \
@@ -2347,8 +2568,9 @@ mod tests {
         // author has to come here and say which list they are pushing into.
         //
         // The five are: the work-list producer (the only one that matters
-        // here), `scratch.push(row)` in `rank`, `seen.push`/`out.push` in
-        // `distinct_underlying_over`, and `out.push` in `gainer_eligible`.
+        // here), `out.push(row)` in `sweep_step`, `seen.push`/`out.push` in
+        // `distinct_underlying_over`, and `self.out.push` in
+        // `GainerWalk::step`.
         // The last four all push into buffers that die at the end of the call
         // and index nothing.
         assert_eq!(
@@ -2366,37 +2588,58 @@ mod tests {
             production.contains("if was_dirty & (1u8 << window) == 0 {"),
             "the push must be guarded on the window's bit being CLEAR"
         );
-        // Exactly two drains: `rank` and `roll_baselines`. A third consumer
-        // that takes the list without clearing the matching bits would leave
-        // contracts marked-but-unlisted, which is a trade silently folded into
-        // a later window.
+        // Exactly two consumers of a work list: `roll_baselines`, which takes
+        // it and clears the bits itself, and `begin_sweep`, which SWAPS it
+        // into the in-flight slot that `sweep_step` then drains, clearing the
+        // bits one key at a time (audit PR4, 2026-09-26 — `rank` now goes
+        // through `begin_sweep` too). A third consumer that takes the list
+        // without clearing the matching bits would leave contracts
+        // marked-but-unlisted, which is a trade silently folded into a later
+        // window.
         assert_eq!(
             production
                 .matches("std::mem::take(&mut slot.dirty[idx])")
                 .count(),
-            2,
-            "only `rank` and `roll_baselines` may drain a work list"
+            1,
+            "only `roll_baselines` may take a work list"
         );
-        // Same evasion, same close: the assertion above matches one spelling,
+        assert_eq!(
+            production
+                .matches("std::mem::swap(&mut slot.dirty[idx], &mut slot.in_flight[idx]);")
+                .count(),
+            1,
+            "only `begin_sweep` may move a work list into the in-flight slot"
+        );
+        // Same evasion, same close: the assertions above match one spelling,
         // so `slot.dirty[i]` or `slot.dirty[idx].drain(..)` would be a THIRD
-        // consumer it cannot see. Pinning every access to a work-list slot
-        // catches any of them. The four are the take and the restore inside
-        // each of the two drains.
+        // consumer they cannot see. Pinning every access to a work-list slot
+        // catches any of them. The three are the take and the restore in
+        // `roll_baselines`, and the swap in `begin_sweep`.
         assert_eq!(
             production.matches("slot.dirty[").count(),
-            4,
-            "a new access to a work-list slot appeared. Only `rank` and `roll_baselines` may \
-             touch one, and each does exactly twice — take, then restore. A third consumer \
-             that drains without clearing the matching bits leaves contracts marked-but-\
+            3,
+            "a new access to a work-list slot appeared. Only `roll_baselines` (take, then \
+             restore) and `begin_sweep` (one swap) may touch one. A third consumer that \
+             drains without clearing the matching bits leaves contracts marked-but-\
              unlisted, which is a trade silently folded into a later window"
+        );
+        // And the in-flight slot: `begin_sweep` checks it is empty and swaps
+        // into it; `sweep_step` pops from it and reports whether it is empty.
+        // Nothing else may touch it — in particular nothing may PUSH into it,
+        // or a key could sit on both lists at once.
+        assert_eq!(
+            production.matches("slot.in_flight[").count(),
+            4,
+            "a new access to an in-flight slot appeared; only `begin_sweep` and \
+             `sweep_step` may touch one"
         );
         assert_eq!(
             production
                 .matches("tracked.dirty &= !(1u8 << idx);")
                 .count(),
             2,
-            "and each drain must clear the bit it consumes, or the contract stays marked \
-             with nothing on the list to visit it"
+            "and each drain (`roll_baselines`, `sweep_step`) must clear the bit it \
+             consumes, or the contract stays marked with nothing on the list to visit it"
         );
 
         // Scoped to the gauge macros, not to the bare label text — the
@@ -3613,6 +3856,107 @@ mod tests {
     /// and a pre-sorted input measures the best case.
     fn base_volume(id: u64) -> u32 {
         ((id.wrapping_mul(2_654_435_761)) % 5_000_000) as u32 + 1
+    }
+
+    /// MEASURES the longest single STEP of the sliced sweep at the ceiling —
+    /// the bound on how long a queued frame waits behind the ranking since
+    /// audit PR4 (2026-09-26). Every one of 20,220 contracts traded, a real
+    /// lot map, and the collect, sort and gainer phases each timed per step.
+    /// `#[ignore]`d for the same reason as the harness below.
+    #[test]
+    #[ignore = "wall-clock measurement, not a gate"]
+    fn sliced_sweep_step_cost_at_the_authorized_ceiling() {
+        use crate::top_volume_sweep::{SliceSort, TOP_VOLUME_SWEEP_STEP_ROWS};
+        const CONTRACTS: u64 = 20_220;
+        const ROUNDS: u64 = 20;
+        let lots: std::collections::HashMap<ContractKey, u32> = (0..CONTRACTS)
+            .map(|id| ((id, ExchangeSegment::NseFno), 1 + (id as u32 % 4) * 25))
+            .collect();
+        let mut lb = VolumeLeaderboard::new();
+        for id in 0..CONTRACTS {
+            observe_no_receipt(
+                &mut lb,
+                stock(id, id % 220, base_volume(id)),
+                OptionFamily::Stock,
+            );
+        }
+        let mut rows = Vec::with_capacity(MAX_TRACKED_CONTRACTS);
+        let mut sorter = SliceSort::with_capacity(MAX_TRACKED_CONTRACTS);
+        let mut walk = GainerWalk::with_capacity(300);
+        let mut max_step = [std::time::Duration::ZERO; 3];
+        let mut total = std::time::Duration::ZERO;
+        let mut steps = 0u64;
+        for round in 0..=ROUNDS {
+            for id in 0..CONTRACTS {
+                let volume = base_volume(id) + (round as u32 + 1) * (1 + (id as u32 % 97));
+                observe_no_receipt(&mut lb, stock(id, id % 220, volume), OptionFamily::Stock);
+            }
+            rows.clear();
+            let _started = lb.begin_sweep(OptionFamily::Stock, S1);
+            let lot_of = |c: &RankedContract| lots.get(&(c.security_id, c.segment)).copied();
+            let mut phase_max = [std::time::Duration::ZERO; 3];
+            loop {
+                let t = std::time::Instant::now();
+                let done = lb.sweep_step(
+                    OptionFamily::Stock,
+                    S1,
+                    TOP_VOLUME_SWEEP_STEP_ROWS,
+                    lot_of,
+                    all,
+                    &mut rows,
+                );
+                let e = t.elapsed();
+                phase_max[0] = phase_max[0].max(e);
+                total += e;
+                steps += 1;
+                if done {
+                    break;
+                }
+            }
+            sorter.reset();
+            loop {
+                let t = std::time::Instant::now();
+                let done = sorter.step(&mut rows, TOP_VOLUME_SWEEP_STEP_ROWS, board_order);
+                let e = t.elapsed();
+                phase_max[1] = phase_max[1].max(e);
+                total += e;
+                steps += 1;
+                if done {
+                    break;
+                }
+            }
+            walk.reset(300);
+            loop {
+                let t = std::time::Instant::now();
+                // Every underlying falling: the walk runs to the end, the
+                // honest worst case of the gainer filter.
+                let done = walk.step(&rows, TOP_VOLUME_SWEEP_STEP_ROWS, |_| {
+                    GainerVerdict::NotGainer
+                });
+                let e = t.elapsed();
+                phase_max[2] = phase_max[2].max(e);
+                total += e;
+                steps += 1;
+                if done {
+                    break;
+                }
+            }
+            assert_eq!(rows.len(), CONTRACTS as usize, "every contract traded");
+            if round > 0 {
+                for (m, p) in max_step.iter_mut().zip(phase_max) {
+                    *m = (*m).max(p);
+                }
+            }
+        }
+        println!(
+            "sliced sweep, {CONTRACTS} traded, {TOP_VOLUME_SWEEP_STEP_ROWS} rows/step: \
+             longest step collect {:?}, sort {:?}, gainer walk {:?}; \
+             mean step {:?} over {steps} steps",
+            max_step[0],
+            max_step[1],
+            max_step[2],
+            total / u32::try_from(steps).unwrap_or(u32::MAX),
+        );
     }
 
     /// MEASURES the real sweep cost at the authorized ceiling.
@@ -5014,5 +5358,186 @@ mod tests {
             );
         }
         println!();
+    }
+
+    // ---- audit PR4 (2026-09-26): the sliced sweep ----
+
+    /// Runs one sliced sweep of `cadence` to completion with a small budget,
+    /// then sorts the rows in slices — the drain's path, end to end.
+    fn sliced_board(
+        lb: &mut VolumeLeaderboard,
+        cadence: SnapshotCadence,
+        budget: usize,
+    ) -> Vec<RankedContract> {
+        let mut rows = Vec::new();
+        if lb.begin_sweep(OptionFamily::Stock, cadence) == SweepBegin::Busy {
+            panic!("no sweep of this cadence may be in flight at the start");
+        }
+        while !lb.sweep_step(OptionFamily::Stock, cadence, budget, lot1, all, &mut rows) {}
+        let mut sorter = crate::top_volume_sweep::SliceSort::with_capacity(rows.len());
+        sorter.reset();
+        while !sorter.step(&mut rows, budget, board_order) {}
+        rows
+    }
+
+    proptest::proptest! {
+        /// `merged_cadence_buffers_rank_identically`: two leaderboards fed the
+        /// same trades, one ranked by `rank`, one by the sliced sweep with a
+        /// random budget, publish the same board and keep the same baselines.
+        #[test]
+        fn begin_sweep_and_sweep_step_rank_identically_to_rank(
+            trades in proptest::collection::vec((1u64..400, 1u32..5_000), 1..1_500),
+            budget in 1usize..700,
+        ) {
+            let mut inline = VolumeLeaderboard::new();
+            let mut sliced = VolumeLeaderboard::new();
+            let mut volume: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+            // Two sweeps, so the second one measures from rolled baselines.
+            for half in trades.chunks(trades.len().div_ceil(2)) {
+                for (id, add) in half {
+                    let v = volume.entry(*id).or_insert(0);
+                    *v = v.saturating_add(*add);
+                    let c = stock(*id, *id % 17, *v);
+                    let _a = observe_no_receipt(&mut inline, c, OptionFamily::Stock);
+                    let _b = observe_no_receipt(&mut sliced, c, OptionFamily::Stock);
+                }
+                let expected = inline.rank(OptionFamily::Stock, S1, usize::MAX, lot1, all).to_vec();
+                let got = sliced_board(&mut sliced, S1, budget);
+                proptest::prop_assert_eq!(got, expected);
+                assert_dirty_invariant(&sliced, OptionFamily::Stock, "after a sliced sweep");
+            }
+        }
+    }
+
+    #[test]
+    fn test_begin_sweep_is_busy_until_sweep_step_drains_and_sweep_pending_clears() {
+        let mut lb = VolumeLeaderboard::new();
+        for id in 1..=10u64 {
+            observe_no_receipt(&mut lb, stock(id, 100, 1_000), OptionFamily::Stock);
+            observe_no_receipt(
+                &mut lb,
+                stock(id, 100, 1_000 + id as u32),
+                OptionFamily::Stock,
+            );
+        }
+        assert_eq!(lb.begin_sweep(OptionFamily::Stock, S1), SweepBegin::Started);
+        assert!(lb.sweep_pending(OptionFamily::Stock, S1));
+        assert!(!lb.sweep_pending(OptionFamily::Stock, S5));
+        assert_eq!(lb.begin_sweep(OptionFamily::Stock, S1), SweepBegin::Busy);
+        let mut rows = Vec::new();
+        assert!(!lb.sweep_step(OptionFamily::Stock, S1, 4, lot1, all, &mut rows));
+        assert_eq!(rows.len(), 4, "a step visits at most its budget");
+        // A contract still in flight trades again: it is NOT pushed a second
+        // time, and its visit takes the whole move.
+        let in_flight_id = lb.family_ref(OptionFamily::Stock).in_flight[0][0].0;
+        observe_no_receipt(
+            &mut lb,
+            stock(in_flight_id, 100, 5_000),
+            OptionFamily::Stock,
+        );
+        assert_dirty_invariant(&lb, OptionFamily::Stock, "a trade during a sliced sweep");
+        assert!(lb.family_ref(OptionFamily::Stock).dirty[0].is_empty());
+        while !lb.sweep_step(OptionFamily::Stock, S1, 4, lot1, all, &mut rows) {}
+        assert_eq!(rows.len(), 10);
+        let moved = rows
+            .iter()
+            .find(|r| r.security_id == in_flight_id)
+            .expect("the in-flight contract is on the board");
+        assert_eq!(
+            moved.delta_units, 4_000,
+            "its visit took the trade made mid-sweep"
+        );
+        assert!(!lb.sweep_pending(OptionFamily::Stock, S1));
+        assert_eq!(lb.begin_sweep(OptionFamily::Stock, S1), SweepBegin::Started);
+        assert_dirty_invariant(&lb, OptionFamily::Stock, "after the sliced sweep");
+    }
+
+    #[test]
+    fn begin_sweep_swaps_without_losing_either_lists_capacity() {
+        let mut lb = VolumeLeaderboard::new();
+        observe_no_receipt(&mut lb, stock(1, 100, 1_000), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, 1_500), OptionFamily::Stock);
+        assert_eq!(lb.begin_sweep(OptionFamily::Stock, S1), SweepBegin::Started);
+        let slot = lb.family_ref(OptionFamily::Stock);
+        // Neither half ever grows on the per-tick push: both stay pre-sized.
+        assert!(slot.dirty[0].capacity() >= MAX_TRACKED_CONTRACTS);
+        assert!(slot.in_flight[0].capacity() >= MAX_TRACKED_CONTRACTS);
+        assert_eq!(slot.in_flight[0].len(), 1);
+    }
+
+    #[test]
+    fn rank_finishes_an_in_flight_sweep_before_taking_the_fresh_list() {
+        let mut lb = VolumeLeaderboard::new();
+        observe_no_receipt(&mut lb, stock(1, 100, 1_000), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, 1_300), OptionFamily::Stock);
+        assert_eq!(lb.begin_sweep(OptionFamily::Stock, S1), SweepBegin::Started);
+        observe_no_receipt(&mut lb, stock(2, 100, 1_000), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(2, 100, 1_200), OptionFamily::Stock);
+        let ranked = lb.rank(OptionFamily::Stock, S1, usize::MAX, lot1, all);
+        assert_eq!(
+            ranked.len(),
+            2,
+            "both the in-flight and the fresh contract ranked"
+        );
+        assert!(!lb.sweep_pending(OptionFamily::Stock, S1));
+        assert_dirty_invariant(
+            &lb,
+            OptionFamily::Stock,
+            "after rank finished a sliced sweep",
+        );
+    }
+
+    #[test]
+    fn test_gainer_walk_with_capacity_steps_in_slices_and_gainers_match_gainer_eligible() {
+        let ranked: Vec<RankedContract> = (1..=900u64).map(|i| stock(i, i % 37, 10)).collect();
+        let verdict = |u: u64| match u % 3 {
+            0 => GainerVerdict::Gainer,
+            1 => GainerVerdict::NotGainer,
+            _ => GainerVerdict::Unknown,
+        };
+        let (expected, expected_tally) = gainer_eligible(&ranked, 250, verdict);
+        let mut walk = GainerWalk::with_capacity(250);
+        walk.reset(250);
+        let mut steps = 0;
+        while !walk.step(&ranked, 7, verdict) {
+            steps += 1;
+        }
+        assert!(steps > 1, "the walk really was sliced");
+        assert_eq!(walk.gainers(), expected.as_slice());
+        assert_eq!(walk.tally(), expected_tally);
+        // Reused for a second walk: same answer, buffers kept.
+        walk.reset(250);
+        while !walk.step(&ranked, 1_000, verdict) {}
+        assert_eq!(walk.gainers(), expected.as_slice());
+    }
+
+    #[test]
+    fn publish_sweep_gauges_is_safe_for_every_cadence() {
+        let lb = VolumeLeaderboard::new();
+        for cadence in SnapshotCadence::ALL {
+            lb.publish_sweep_gauges(OptionFamily::Stock, cadence, 3);
+        }
+        assert_eq!(lb.tracked(OptionFamily::Stock), 0);
+    }
+
+    #[test]
+    fn board_order_is_a_total_order_on_distinct_keys() {
+        let mut a = stock(1, 1, 1);
+        a.window_lots_milli = 5;
+        let mut b = stock(2, 1, 1);
+        b.window_lots_milli = 5;
+        let mut c = stock(3, 1, 1);
+        c.window_lots_milli = 9;
+        assert_eq!(
+            board_order(&c, &a),
+            std::cmp::Ordering::Less,
+            "more lots first"
+        );
+        assert_eq!(
+            board_order(&a, &b),
+            std::cmp::Ordering::Less,
+            "then security_id"
+        );
+        assert_eq!(board_order(&a, &a), std::cmp::Ordering::Equal);
     }
 }

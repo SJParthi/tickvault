@@ -578,6 +578,94 @@ where
     L: Fn(u64, ExchangeSegment) -> Option<&'a str>,
     C: Fn(u64, ExchangeSegment, u32) -> Option<CandleBarReading>,
 {
+    // `rows` IS pre-sized: it genuinely fills. Every contract on the board
+    // produces a row — the common-case refusal (`LabelUnavailable`) does
+    // NOT drop the row, it only NULLs a leaf column — so `ranked.len()` is
+    // the exact final length in
+    // every reachable case and one allocation is the whole cost.
+    let mut rows = Vec::with_capacity(ranked.len());
+    // `refusals` is NOT, and the comment that used to defend pre-sizing it
+    // argued about the allocation COUNT while being silent about the BYTES.
+    //
+    // # ⚠ CORRECTED 2026-09-13 — `Vec::with_capacity(ranked.len())` was a
+    // # multi-hundred-KB allocation per sweep, on the drain, to hold nothing
+    //
+    // The prior text read "it makes the projection's allocation count a
+    // constant 2 rather than a function of the market". True of the count and
+    // false about what it costs. One entry is `(u64, SnapshotRefusal)` — 8 B
+    // of id plus a one-byte fieldless enum, padded to **16 B** by the u64's
+    // alignment. Since the operator's 2026-09-12 directive removed the
+    // top-250-per-family persistence cut, `ranked.len()` is market-bounded
+    // (~20,220 traded option contracts measured, ceiling
+    // `TOP_VOLUME_PERSIST_PER_FAMILY` = 25,000), so that line reserved
+    //
+    //     20,220 x 16 B  =  ~323 KB   per family per cadence
+    //
+    // and the cadences are FOUR since the same directive (1s/3s/5s/1m). In the
+    // second where all four arms land together across both families that is
+    // **8 x ~323 KB = ~2.6 MB allocated and dropped per second** on the frame
+    // drain, for a buffer whose steady-state length is ZERO.
+    //
+    // The count claim did not even hold on its own terms when it was written:
+    // `LabelUnavailable` and the then-existing `GainUnavailable` could BOTH
+    // fire for one contract, so the true worst case was `2 x ranked.len()`
+    // entries and `ranked.len()` of capacity would have reallocated anyway.
+    //
+    // ⚠ 2026-09-19: the degraded window that argument turned on is GONE.
+    // `GainUnavailable` fired on every row between the open and the first
+    // priced underlying (measured at up to ~30 minutes on 2026-09-08), and it
+    // was deleted with the `gain_pct` column. The remaining two reasons are
+    // unreachable arithmetic and real snapshot drift, so the steady-state
+    // length is now zero in every session, not merely most of one. The fixed
+    // capacity STAYS: geometric growth costs nothing when it never grows, and
+    // ~1 KiB once per sweep is the honest price of keeping a drift buffer that
+    // does not have to be sized against the market.
+    let mut refusals = Vec::with_capacity(SNAPSHOT_REFUSAL_PREALLOC);
+    project_snapshot_with(
+        snapshot_ts_ist_nanos,
+        cadence,
+        family,
+        ranked,
+        is_subscribed,
+        label_of,
+        candle_of,
+        |row| rows.push(row),
+        |security_id, reason| refusals.push((security_id, reason)),
+    );
+    SnapshotProjection { rows, refusals }
+}
+
+/// [`project_snapshot`] without its two vectors: each row goes to `emit` and
+/// each refusal to `refuse` as it is produced (audit PR4, 2026-09-26).
+///
+/// The sliced sweep projects one 512-row chunk per drain step, so collecting
+/// into vectors would allocate twice per chunk, ~80 times per full sweep,
+/// where the pre-PR4 code allocated twice per family. The rows cannot sit in a
+/// buffer kept across chunks either: they borrow their label from the sweep's
+/// label snapshot. Streaming them straight into the writer's pre-sized staging
+/// vector removes the allocation instead of moving it.
+///
+/// Same arithmetic, same order, same refusals as [`project_snapshot`], which
+/// is now a wrapper over this; every test of that function tests this one.
+// APPROVED: the four closures are the function's inputs and outputs; a struct would only rename them.
+#[allow(clippy::too_many_arguments)]
+pub fn project_snapshot_with<'a, S, L, C, E, R>(
+    snapshot_ts_ist_nanos: i64,
+    cadence: SnapshotCadence,
+    family: OptionFamily,
+    ranked: &[RankedContract],
+    is_subscribed: S,
+    label_of: L,
+    candle_of: C,
+    mut emit: E,
+    mut refuse: R,
+) where
+    S: Fn(u64, ExchangeSegment) -> bool,
+    L: Fn(u64, ExchangeSegment) -> Option<&'a str>,
+    C: Fn(u64, ExchangeSegment, u32) -> Option<CandleBarReading>,
+    E: FnMut(TopVolumeRankRow<'a>),
+    R: FnMut(u64, SnapshotRefusal),
+{
     // FLOORED TO THE CADENCE GRID, not merely to the second.
     //
     // # The stall that put a row where no candle can see it (2026-09-12)
@@ -633,67 +721,24 @@ where
     // bar as if it were a measurement.
     let ts_secs = ts.div_euclid(NANOS_PER_SECOND);
     let window_open_secs = u32::try_from(ts_secs).ok();
-    // `rows` IS pre-sized: it genuinely fills. Every contract on the board
-    // produces a row — the common-case refusal (`LabelUnavailable`) does
-    // NOT drop the row, it only NULLs a leaf column — so `ranked.len()` is
-    // the exact final length in
-    // every reachable case and one allocation is the whole cost.
-    let mut rows = Vec::with_capacity(ranked.len());
-    // `refusals` is NOT, and the comment that used to defend pre-sizing it
-    // argued about the allocation COUNT while being silent about the BYTES.
-    //
-    // # ⚠ CORRECTED 2026-09-13 — `Vec::with_capacity(ranked.len())` was a
-    // # multi-hundred-KB allocation per sweep, on the drain, to hold nothing
-    //
-    // The prior text read "it makes the projection's allocation count a
-    // constant 2 rather than a function of the market". True of the count and
-    // false about what it costs. One entry is `(u64, SnapshotRefusal)` — 8 B
-    // of id plus a one-byte fieldless enum, padded to **16 B** by the u64's
-    // alignment. Since the operator's 2026-09-12 directive removed the
-    // top-250-per-family persistence cut, `ranked.len()` is market-bounded
-    // (~20,220 traded option contracts measured, ceiling
-    // `TOP_VOLUME_PERSIST_PER_FAMILY` = 25,000), so that line reserved
-    //
-    //     20,220 x 16 B  =  ~323 KB   per family per cadence
-    //
-    // and the cadences are FOUR since the same directive (1s/3s/5s/1m). In the
-    // second where all four arms land together across both families that is
-    // **8 x ~323 KB = ~2.6 MB allocated and dropped per second** on the frame
-    // drain, for a buffer whose steady-state length is ZERO.
-    //
-    // The count claim did not even hold on its own terms when it was written:
-    // `LabelUnavailable` and the then-existing `GainUnavailable` could BOTH
-    // fire for one contract, so the true worst case was `2 x ranked.len()`
-    // entries and `ranked.len()` of capacity would have reallocated anyway.
-    //
-    // ⚠ 2026-09-19: the degraded window that argument turned on is GONE.
-    // `GainUnavailable` fired on every row between the open and the first
-    // priced underlying (measured at up to ~30 minutes on 2026-09-08), and it
-    // was deleted with the `gain_pct` column. The remaining two reasons are
-    // unreachable arithmetic and real snapshot drift, so the steady-state
-    // length is now zero in every session, not merely most of one. The fixed
-    // capacity STAYS: geometric growth costs nothing when it never grows, and
-    // ~1 KiB once per sweep is the honest price of keeping a drift buffer that
-    // does not have to be sized against the market.
-    let mut refusals = Vec::with_capacity(SNAPSHOT_REFUSAL_PREALLOC);
 
     for contract in ranked {
         let Ok(security_id) = i64::try_from(contract.security_id) else {
-            refusals.push((
+            refuse(
                 contract.security_id,
                 SnapshotRefusal::IdTooLargeForSignedColumn,
-            ));
+            );
             continue;
         };
         let Ok(underlying_id) = i64::try_from(contract.underlying_id) else {
-            refusals.push((
+            refuse(
                 contract.security_id,
                 SnapshotRefusal::IdTooLargeForSignedColumn,
-            ));
+            );
             continue;
         };
         let Ok(window_lots_milli) = i64::try_from(contract.window_lots_milli) else {
-            refusals.push((contract.security_id, SnapshotRefusal::LotsOutOfRange));
+            refuse(contract.security_id, SnapshotRefusal::LotsOutOfRange);
             continue;
         };
         // The percentage the operator reads, as a WHOLE NUMBER (operator,
@@ -729,7 +774,7 @@ where
         let Some(volume_percentage_change) =
             net_volume_chg_milli_pct(window_lots_milli).map(|milli| milli / MILLI_PER_WHOLE)
         else {
-            refusals.push((contract.security_id, SnapshotRefusal::LotsOutOfRange));
+            refuse(contract.security_id, SnapshotRefusal::LotsOutOfRange);
             continue;
         };
         // Whole lots, per the same quote. `floor(floor(1000d/L)/1000)` is
@@ -742,7 +787,7 @@ where
         // on the frame drain — the label was rendered once at attach.
         let contract_label = label_of(contract.security_id, contract.segment);
         if contract_label.is_none() {
-            refusals.push((contract.security_id, SnapshotRefusal::LabelUnavailable));
+            refuse(contract.security_id, SnapshotRefusal::LabelUnavailable);
         }
 
         // ---- the candle fold's OWN reading of this contract (2026-09-18) ----
@@ -790,7 +835,7 @@ where
         // holds the receipt stamps. (2026-09-22: a comment block describing
         // how this projection computed them stood here after the fields were
         // gone.)
-        rows.push(TopVolumeRankRow {
+        emit(TopVolumeRankRow {
             snapshot_ts_ist_nanos: ts,
             cadence,
             family: family.as_str(),
@@ -819,8 +864,6 @@ where
             open_percentage_change,
         });
     }
-
-    SnapshotProjection { rows, refusals }
 }
 
 #[cfg(test)]
@@ -1147,6 +1190,54 @@ mod tests {
             p.refusals,
             vec![(u64::MAX, SnapshotRefusal::IdTooLargeForSignedColumn)]
         );
+    }
+
+    /// Audit PR4: the streaming form hands each row and each refusal to its
+    /// callbacks in slice order, and yields exactly what `project_snapshot`
+    /// collects — the drain streams, the wrapper collects, one projection.
+    #[test]
+    fn test_project_snapshot_with_streams_what_project_snapshot_collects() {
+        let ranked = [
+            contract(u64::MAX, 1, 700),
+            contract(10, 91, 500),
+            contract(11, 92, 400),
+        ];
+        let collected = project_snapshot(
+            NANOS_PER_SECOND,
+            SnapshotCadence::OneSecond,
+            OptionFamily::Stock,
+            &ranked,
+            |id, _| id == 10,
+            TEST_LABEL,
+            NO_CANDLE,
+        );
+        let mut rows = Vec::new();
+        let mut refusals = Vec::new();
+        project_snapshot_with(
+            NANOS_PER_SECOND,
+            SnapshotCadence::OneSecond,
+            OptionFamily::Stock,
+            &ranked,
+            |id, _| id == 10,
+            TEST_LABEL,
+            NO_CANDLE,
+            |row| rows.push(row),
+            |id, why| refusals.push((id, why)),
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter().map(|r| r.security_id).collect::<Vec<_>>(),
+            collected
+                .rows
+                .iter()
+                .map(|r| r.security_id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            rows.iter().map(|r| r.subscribed).collect::<Vec<_>>(),
+            vec![true, false]
+        );
+        assert_eq!(refusals, collected.refusals);
     }
 
     #[test]
