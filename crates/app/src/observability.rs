@@ -477,8 +477,13 @@ where
 
 /// Every registered lossy sink, published by [`publish_log_drop_counters`].
 /// Boot-time registration only (≤ 8 sinks), read on a slow timer.
+/// Each entry keeps the total last published so a NEW drop can be logged.
 static LOG_DROP_COUNTERS: std::sync::Mutex<
-    Vec<(&'static str, tracing_appender::non_blocking::ErrorCounter)>,
+    Vec<(
+        &'static str,
+        tracing_appender::non_blocking::ErrorCounter,
+        u64,
+    )>,
 > = std::sync::Mutex::new(Vec::new());
 
 /// Registers a non-blocking sink's dropped-line counter under `sink`. Also
@@ -489,7 +494,7 @@ pub fn register_log_drop_counter(
     writer: &tracing_appender::non_blocking::NonBlocking,
 ) {
     if let Ok(mut sinks) = LOG_DROP_COUNTERS.lock() {
-        sinks.push((sink, writer.error_counter()));
+        sinks.push((sink, writer.error_counter(), 0));
     }
 }
 
@@ -497,10 +502,23 @@ pub fn register_log_drop_counter(
 /// from a slow timer task in `main.rs`; O(sinks), sinks ≤ 8, never on the
 /// tick path.
 pub fn publish_log_drop_counters() {
-    if let Ok(sinks) = LOG_DROP_COUNTERS.lock() {
-        for (sink, counter) in sinks.iter() {
+    if let Ok(mut sinks) = LOG_DROP_COUNTERS.lock() {
+        for (sink, counter, last) in sinks.iter_mut() {
             let dropped = u64::try_from(counter.dropped_lines()).unwrap_or(u64::MAX);
-            metrics::counter!(LOG_LINES_DROPPED_METRIC, "sink" => *sink).absolute(dropped);
+            metrics::counter!("tv_log_lines_dropped_total", "sink" => *sink).absolute(dropped);
+            if dropped > *last {
+                // At most one line per sink per publish interval. It goes
+                // through the same lossy sinks, which is fine: a drop burst
+                // ends, and the next interval reports the cumulative total.
+                tracing::warn!(
+                    sink = *sink,
+                    newly_dropped = dropped - *last,
+                    total_dropped = dropped,
+                    "log lines were DROPPED because a log sink's queue was full — \
+                     the tick path was not blocked; the lines are gone"
+                );
+                *last = dropped;
+            }
         }
     }
 }
