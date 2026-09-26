@@ -301,6 +301,20 @@ pub enum TickRowError {
 // Row
 // ---------------------------------------------------------------------------
 
+/// Counter for float columns of a tick row that were non-finite at append
+/// time (QuestDB would store them as NULL). Expected to stay at zero.
+pub const TICK_NONFINITE_COLUMNS_COUNTER: &str = "tv_tick_nonfinite_columns_total";
+
+/// How many of a tick row's float columns (`ltp` plus the optional OHLC and
+/// average price) are NaN or infinite. An absent optional column is not
+/// counted: it is written as NULL on purpose. O(1): at most six compares.
+#[must_use]
+pub fn count_nonfinite_tick_floats(row: &TickRow) -> u64 {
+    let optional = [row.open, row.high, row.low, row.close, row.avg_price];
+    u64::from(!row.ltp.is_finite())
+        + optional.iter().flatten().filter(|v| !v.is_finite()).count() as u64
+}
+
 /// One `ticks` row, ready for ILP append. Feed-agnostic and `Copy`.
 ///
 /// Per-feed OPTIONAL columns are `Option<T>`: `None` OMITS the ILP token so
@@ -1637,6 +1651,12 @@ pub struct TickWriter {
     /// learn which captured frames this batch covers once it LANDS.
     pending_min_seq: u64,
     pending_max_seq: u64,
+    /// True once any pending row has NO write-ahead-log backing (a zero or
+    /// freshly minted capture sequence). Such a buffer is never deferred to
+    /// the WAL; it keeps the inline spill (2026-09-26 audit fix PR3).
+    /// Cleared only when `discard_pending` consumes it — a stale `true` is
+    /// conservative (inline spill, the old behaviour), never a loss.
+    pending_unbacked: bool,
     /// The `feed` SYMBOL stamped on every row from this writer.
     feed: Feed,
     /// Pre-resolved session-window refusal counters -- see
@@ -1965,6 +1985,7 @@ impl TickWriter {
                     pending: 0,
                     pending_min_seq: 0,
                     pending_max_seq: 0,
+                    pending_unbacked: false,
                     feed,
                     out_of_window: tick_out_of_window_counters(feed),
                     last_capture_seq: 0,
@@ -1988,6 +2009,7 @@ impl TickWriter {
                     pending: 0,
                     pending_min_seq: 0,
                     pending_max_seq: 0,
+                    pending_unbacked: false,
                     feed,
                     out_of_window: tick_out_of_window_counters(feed),
                     last_capture_seq: 0,
@@ -2029,6 +2051,7 @@ impl TickWriter {
             pending: 0,
             pending_min_seq: 0,
             pending_max_seq: 0,
+            pending_unbacked: false,
             feed,
             out_of_window: tick_out_of_window_counters(feed),
             last_capture_seq: 0,
@@ -2073,6 +2096,9 @@ impl TickWriter {
     /// # Errors
     /// [`TickRow::from_parsed_tick`] refusals and ILP buffer errors.
     pub fn append_tick(&mut self, tick: &ParsedTick) -> Result<()> {
+        // A freshly MINTED sequence is not in the write-ahead log, so this row
+        // can never be deferred to it (2026-09-26 audit fix PR3).
+        self.pending_unbacked = true;
         self.append_tick_with_seq(tick, next_capture_seq())
     }
 
@@ -2235,6 +2261,14 @@ impl TickWriter {
     /// # Errors
     /// Propagates ILP buffer errors (table/column append failure).
     pub(crate) fn append_row(&mut self, row: &TickRow) -> Result<()> {
+        // Tripwire (2026-09-26 audit fix PR2), the tick twin of the candle
+        // writer's. QuestDB stores a non-finite ILP float as NULL with no
+        // trace; this makes it visible. Six float compares per row, and the
+        // counter is touched only on a hit.
+        let nonfinite = count_nonfinite_tick_floats(row);
+        if nonfinite > 0 {
+            metrics::counter!(TICK_NONFINITE_COLUMNS_COUNTER).increment(nonfinite);
+        }
         let feed = self.feed.as_str();
         self.buffer
             .table(TICKS_TABLE)
@@ -2331,6 +2365,7 @@ impl TickWriter {
     fn note_pending_seq(&mut self, capture_seq: i64) {
         let seq = u64::try_from(capture_seq).unwrap_or(0);
         if seq == 0 {
+            self.pending_unbacked = true;
             return;
         }
         if self.pending_min_seq == 0 || seq < self.pending_min_seq {
@@ -2700,6 +2735,8 @@ impl TickWriter {
         // MOVED, and the replacement is the same empty one `offload_flush`
         // already installs on every successful hand-off.
         let range = self.take_pending_range();
+        let unbacked = std::mem::take(&mut self.pending_unbacked);
+        let mut rescue_unavailable = false;
         if let Some(tx) = self.rescue.as_ref() {
             let protocol = self.buffer.protocol_version();
             let batch = RescueBatch {
@@ -2725,12 +2762,53 @@ impl TickWriter {
                     // nothing is reported as lost.
                     self.buffer = returned.buffer;
                     self.flush_counters.rescue_fallback_queue_full.increment(1);
+                    rescue_unavailable = true;
                 }
                 Err(std::sync::mpsc::TrySendError::Disconnected(returned)) => {
                     self.buffer = returned.buffer;
                     self.flush_counters.rescue_fallback_thread_gone.increment(1);
+                    rescue_unavailable = true;
                 }
             }
+        }
+
+        // 2026-09-26 audit fix PR3 — the drain never writes the spill file.
+        //
+        // Until this date a full rescue queue (or a gone rescue thread) fell
+        // back to `perform_tick_rescue` INLINE: a `df` fork plus up to 32 MiB
+        // of file write on the frame-drain task, at exactly the moment the
+        // disk was slowest. Every row carrying a capture sequence is already
+        // in the capture-at-receipt WAL, so the rescue is handed to the WAL
+        // instead: the range is marked unapplied (the next replay re-offers
+        // it, and this boot will not archive it) and the buffer is dropped.
+        // O(1) apart from the bounded bucket marking; no syscall.
+        //
+        // Counted on the ALARMED `tv_ticks_dropped_total` as well as its own
+        // counter, because until the WAL replays them these rows are not in
+        // QuestDB — reporting less would be a false-OK. Rows WITHOUT a capture
+        // sequence (`range.0 == 0`) exist nowhere else, so they keep the
+        // inline spill: a slow drain is bad, a lost tick is worse.
+        if rescue_unavailable && range.0 != 0 && !unbacked {
+            note_rescue_outcome_ticks(false, range, false);
+            self.flush_counters.append_dropped.increment(dropped as u64);
+            self.flush_counters
+                .rescue_deferred_to_wal
+                .increment(dropped as u64);
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                feed = self.feed.as_str(),
+                deferred = dropped,
+                min_seq = range.0,
+                max_seq = range.1,
+                source = RESCUE_DEFERRED_TO_WAL_SOURCE,
+                "tick flush failed and the rescue thread is busy — the rows were \
+                 handed to the write-ahead log for replay instead of being written \
+                 to disk on the tick task. They are NOT in QuestDB until the WAL \
+                 replays them."
+            );
+            self.buffer.clear();
+            self.pending = 0;
+            return dropped;
         }
 
         let landed =
@@ -2864,6 +2942,15 @@ pub const TICK_RESCUE_QUEUED_COUNTER: &str = "tv_tick_rescue_queued_total";
 /// either the rescue thread was behind (`queue_full`) or it was gone
 /// (`thread_gone`). Not a loss: nothing is dropped on either arm.
 pub const TICK_RESCUE_INLINE_FALLBACK_COUNTER: &str = "tv_tick_rescue_inline_fallback_total";
+
+/// Rows a full rescue queue handed to the capture-at-receipt WAL rather than
+/// spilling inline on the drain (2026-09-26 audit fix PR3).
+pub const TICK_RESCUE_DEFERRED_TO_WAL_COUNTER: &str = "tv_tick_rescue_deferred_to_wal_total";
+
+/// `source` on the deferred-to-WAL ERROR line. Deliberately NOT the
+/// rescued-to-spill source the pager excludes: the rows are not on disk in
+/// any re-ingestable file until the WAL replays them.
+pub const RESCUE_DEFERRED_TO_WAL_SOURCE: &str = "rescue_deferred_to_wal";
 
 /// Rescue payloads abandoned because the rescue thread did not finish.
 ///
@@ -3069,6 +3156,9 @@ struct TickFlushCounters {
     /// `tv_ticks_dropped_total` on the ILP-append failure arm. Its seed stays
     /// in [`register_drop_baseline`]; this is the same series, pre-resolved.
     append_dropped: metrics::Counter,
+    /// Rows handed to the capture-at-receipt WAL instead of an inline spill
+    /// write on the drain (2026-09-26 audit fix PR3).
+    rescue_deferred_to_wal: metrics::Counter,
     /// Append failures seen by this writer. Drives the power-of-two log
     /// throttle only — every failure is still counted on `append_dropped`.
     append_failures: u64,
@@ -3093,6 +3183,11 @@ impl TickFlushCounters {
                 "reason" => "thread_gone"
             ),
             append_dropped: metrics::counter!("tv_ticks_dropped_total", "feed" => feed),
+            // Literal, not the const, so the shipped-metrics guard can see it.
+            rescue_deferred_to_wal: metrics::counter!(
+                "tv_tick_rescue_deferred_to_wal_total",
+                "feed" => feed
+            ),
             append_failures: 0,
         }
     }
@@ -3784,6 +3879,50 @@ mod tests {
     }
     fn sample_row() -> TickRow {
         TickRow::from_parsed_tick(&sample_tick(), 42).expect("sample tick must build")
+    }
+
+    /// 2026-09-26 audit fix PR2: the tick tripwire counts exactly the
+    /// non-finite float columns that are present; an absent optional column is
+    /// a deliberate NULL and is not counted.
+    #[test]
+    fn test_count_nonfinite_tick_floats_counts_present_nan_and_inf_only() {
+        let mut row = sample_row();
+        assert_eq!(
+            count_nonfinite_tick_floats(&row),
+            0,
+            "a parsed tick is finite"
+        );
+        row.ltp = f64::NAN;
+        row.open = Some(f64::INFINITY);
+        row.high = None;
+        row.low = Some(f64::NEG_INFINITY);
+        row.close = Some(1.0);
+        row.avg_price = None;
+        assert_eq!(count_nonfinite_tick_floats(&row), 3);
+        row.ltp = 10.0;
+        row.open = None;
+        row.low = None;
+        assert_eq!(count_nonfinite_tick_floats(&row), 0);
+    }
+
+    #[test]
+    fn append_row_runs_the_nonfinite_tripwire_before_the_ilp_append() {
+        // The first occurrence is the production fn: it precedes this module.
+        let src = include_str!("tick_persistence.rs");
+        let start = src
+            .find("pub(crate) fn append_row(&mut self, row: &TickRow)")
+            .expect("append_row must exist");
+        // Unbounded on purpose: the first `.column_f64(` after the signature
+        // is inside `append_row`, which writes `ltp` before any other float.
+        let body = &src[start..];
+        let tripwire = body
+            .find("count_nonfinite_tick_floats(row)")
+            .expect("append_row must count non-finite floats");
+        let first_column = body.find(".column_f64(").expect("append_row writes floats");
+        assert!(
+            tripwire < first_column,
+            "the count runs before the first float column"
+        );
     }
 
     // ======================================================================
@@ -5015,6 +5154,11 @@ mod tests {
     /// The whole point of the fallback: a slow drain is bad, a lost tick is
     /// worse. If this ever became a refusal, the change would have traded a
     /// stall for exactly the loss it was built to prevent.
+    ///
+    /// Since 2026-09-26 (audit fix PR3) this holds for rows with NO
+    /// write-ahead-log backing (a minted sequence, as `append_tick` uses).
+    /// WAL-backed rows are deferred to the WAL instead — see
+    /// `full_rescue_queue_defers_to_wal_without_file_io`.
     #[test]
     fn a_full_rescue_queue_writes_inline_rather_than_dropping() {
         let dir = scratch_dir("rescue-full");
@@ -5023,11 +5167,11 @@ mod tests {
 
         // Fill the queue: RESCUE_QUEUE_DEPTH payloads with nothing draining.
         for _ in 0..RESCUE_QUEUE_DEPTH {
-            w.append_tick_with_seq(&sample_tick(), 1).expect("append");
+            w.append_tick(&sample_tick()).expect("append");
             assert_eq!(w.discard_pending(), 1);
         }
         // The next one cannot be queued and must therefore land on disk.
-        w.append_tick_with_seq(&sample_tick(), 1).expect("append");
+        w.append_tick(&sample_tick()).expect("append");
         assert_eq!(w.discard_pending(), 1);
 
         let files = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
@@ -5299,6 +5443,64 @@ mod tests {
             "a zero-byte rescue would report success while losing the rows"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2026-09-26 audit fix PR3: with the rescue thread gone, rows that carry
+    /// a capture sequence are handed to the WAL and NO spill file is written
+    /// on the drain.
+    #[test]
+    fn full_rescue_queue_defers_to_wal_without_file_io() {
+        let dir = scratch_dir("defer-wal");
+        let mut writer = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (_sink, rx) = writer.split_rescue_offload();
+        drop(rx); // thread gone -> Disconnected on try_send
+        writer
+            .append_tick_with_seq(&sample_tick(), 1 << 20)
+            .expect("buffers without a sender");
+        assert_eq!(writer.pending(), 1);
+
+        let moved = writer.discard_pending();
+
+        assert_eq!(moved, 1, "the row left the buffer");
+        assert_eq!(writer.pending(), 0);
+        let spilled = std::fs::read_dir(&dir)
+            .map(|d| d.filter_map(std::result::Result::ok).count())
+            .unwrap_or(0);
+        assert_eq!(spilled, 0, "the drain must not write a spill file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Rows WITHOUT a capture sequence exist nowhere else, so they keep the
+    /// inline spill even when the rescue thread is gone.
+    #[test]
+    fn deferred_rows_without_capture_seq_still_spill_inline() {
+        let dir = scratch_dir("defer-noseq");
+        let mut writer = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (_sink, rx) = writer.split_rescue_offload();
+        drop(rx);
+        writer.append_tick(&sample_tick()).expect("buffers");
+
+        assert_eq!(writer.discard_pending(), 1);
+
+        let spilled = std::fs::read_dir(&dir)
+            .expect("the inline rescue created the dir")
+            .filter_map(std::result::Result::ok)
+            .count();
+        assert_eq!(
+            spilled, 1,
+            "no capture sequence -> inline spill, never a drop"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deferred_to_wal_names_are_pinned() {
+        assert_eq!(
+            TICK_RESCUE_DEFERRED_TO_WAL_COUNTER,
+            "tv_tick_rescue_deferred_to_wal_total"
+        );
+        assert_eq!(RESCUE_DEFERRED_TO_WAL_SOURCE, "rescue_deferred_to_wal");
+        assert_ne!(RESCUE_DEFERRED_TO_WAL_SOURCE, RESCUED_TO_SPILL_SOURCE);
     }
 
     // -- never-traded sentinel timestamp (2026-08-21) -----------------------
