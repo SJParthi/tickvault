@@ -66,6 +66,16 @@ pub const TOP_VOLUME_SWEEP_STEP_ROWS: usize = 512;
 /// running, so their window was skipped.
 pub const TOP_VOLUME_SWEEP_DEFERRED_COUNTER: &str = "tv_top_volume_sweep_deferred_total";
 
+/// Keys a single step of a sliced baseline roll may visit (audit PR4b). A
+/// roll visit is one hash probe and two integer writes, several times cheaper
+/// than a sweep row, so a step of this many keys stays in the same tens of
+/// microseconds as one sweep step.
+pub const TOP_VOLUME_ROLL_STEP_KEYS: usize = 2_048;
+
+/// Counts rolls that ran in ONE pass on the timer arm because the previous
+/// roll of the same cadence had not finished (the saturation fallback).
+pub const TOP_VOLUME_ROLL_INLINE_COUNTER: &str = "tv_top_volume_roll_inline_total";
+
 /// Counts projected rows whose candle bar was no longer in the fold when the
 /// row was projected, so its candle columns were stored empty.
 pub const TOP_VOLUME_SWEEP_CANDLE_MISS_COUNTER: &str = "tv_top_volume_candle_bar_missing_total";
@@ -296,6 +306,8 @@ pub struct TopVolumeSweep {
     pub labels: Option<std::sync::Arc<TopVolumeLabelMap>>,
     deferred: u64,
     deferred_counter: metrics::Counter,
+    roll_inline: u64,
+    roll_inline_counter: metrics::Counter,
     candle_misses: u64,
     candle_miss_counter: metrics::Counter,
 }
@@ -315,6 +327,8 @@ impl TopVolumeSweep {
             labels: None,
             deferred: 0,
             deferred_counter: metrics::counter!(TOP_VOLUME_SWEEP_DEFERRED_COUNTER),
+            roll_inline: 0,
+            roll_inline_counter: metrics::counter!(TOP_VOLUME_ROLL_INLINE_COUNTER),
             candle_misses: 0,
             candle_miss_counter: metrics::counter!(TOP_VOLUME_SWEEP_CANDLE_MISS_COUNTER),
         }
@@ -350,6 +364,14 @@ impl TopVolumeSweep {
         self.deferred = self.deferred.saturating_add(1);
         self.deferred_counter.increment(1);
         self.deferred
+    }
+
+    /// Counts a baseline roll that ran in one pass on the timer arm, and
+    /// returns the running total so the caller can log on powers of two.
+    pub fn record_inline_roll(&mut self) -> u64 {
+        self.roll_inline = self.roll_inline.saturating_add(1);
+        self.roll_inline_counter.increment(1);
+        self.roll_inline
     }
 
     /// Counts `misses` rows projected without a candle bar. Returns the new
@@ -587,6 +609,13 @@ mod tests {
         assert_eq!(sweep.record_deferred(), 1);
         assert_eq!(sweep.record_deferred(), 2);
         assert_eq!(sweep.record_deferred(), 3);
+    }
+
+    #[test]
+    fn test_record_inline_roll_counts_every_fallback() {
+        let mut sweep = TopVolumeSweep::with_capacity(4, 4);
+        assert_eq!(sweep.record_inline_roll(), 1);
+        assert_eq!(sweep.record_inline_roll(), 2);
     }
 
     #[test]
