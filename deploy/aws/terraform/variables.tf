@@ -200,3 +200,15 @@ variable "daily_loss_alarm_inr" {
   type        = number
   default     = 20000
 }
+
+variable "dhan_depth_account_enabled" {
+  # groww-shared-token-minter-2026-07-02.md §10.9: the depth account's minter
+  # schedule is created DISABLED until the account exists and its three SSM
+  # credential parameters are seeded, and its not-invoked alarm is gated on this
+  # same switch (a disabled schedule would otherwise page every morning).
+  # Turning the account on is this one flag plus `[dhan_depth_account] enabled`
+  # in the app config.
+  description = "Enable the second (depth-only) Dhan account's daily token mint: turns its EventBridge schedule ON and creates its not-invoked alarm. Leave false until /tickvault/<env>/dhan-depth/{client-id,client-secret,totp-secret} are seeded."
+  type        = bool
+  default     = false
+}
