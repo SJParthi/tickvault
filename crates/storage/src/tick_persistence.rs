@@ -2189,17 +2189,28 @@ impl TickWriter {
             // permanent-loss side of that subtraction, which is where it
             // belongs. Same `feed` label as the seeded baseline so the series
             // exists from boot rather than registering on the first failure.
-            error!(
-                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
-                feed = self.feed.as_str(),
-                security_id = tick.security_id,
-                capture_seq,
-                source = "ilp_append_failed",
-                error = %err,
-                "tick row could not be appended to the ILP buffer — LOST, counted on \
-                 tv_ticks_dropped_total (the row never existed, so nothing spills)"
-            );
             self.flush_counters.append_dropped.increment(1);
+            self.flush_counters.append_failures =
+                self.flush_counters.append_failures.saturating_add(1);
+            // Power-of-two throttle (2026-09-26 audit fix, PR1): this arm is
+            // per TICK, and a poisoned buffer fails every tick. One log line
+            // per tick would put a synchronous-looking write storm on the
+            // drain and bury the sink; the loss itself is still counted
+            // per tick on the alarmed `tv_ticks_dropped_total` above.
+            if self.flush_counters.append_failures.is_power_of_two() {
+                error!(
+                    code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                    feed = self.feed.as_str(),
+                    security_id = tick.security_id,
+                    capture_seq,
+                    source = "ilp_append_failed",
+                    failures_so_far = self.flush_counters.append_failures,
+                    error = %err,
+                    "tick row could not be appended to the ILP buffer — LOST, counted on \
+                     tv_ticks_dropped_total (the row never existed, so nothing spills). \
+                     Logged at powers of two; failures_so_far is the exact count."
+                );
+            }
         }
         outcome
     }
@@ -3058,6 +3069,9 @@ struct TickFlushCounters {
     /// `tv_ticks_dropped_total` on the ILP-append failure arm. Its seed stays
     /// in [`register_drop_baseline`]; this is the same series, pre-resolved.
     append_dropped: metrics::Counter,
+    /// Append failures seen by this writer. Drives the power-of-two log
+    /// throttle only — every failure is still counted on `append_dropped`.
+    append_failures: u64,
 }
 
 impl TickFlushCounters {
@@ -3079,6 +3093,7 @@ impl TickFlushCounters {
                 "reason" => "thread_gone"
             ),
             append_dropped: metrics::counter!("tv_ticks_dropped_total", "feed" => feed),
+            append_failures: 0,
         }
     }
 }
@@ -3313,6 +3328,28 @@ impl TickWriterSink {
 
 #[cfg(test)]
 mod tests {
+    /// 2026-09-26 audit fix PR1: the ILP append-failure arm is per TICK, so
+    /// its ERROR line must sit behind the power-of-two throttle while the
+    /// alarmed drop counter stays per tick.
+    #[test]
+    fn ilp_append_failure_log_is_throttled() {
+        let src = include_str!("tick_persistence.rs");
+        let arm = src
+            .split("source = \"ilp_append_failed\"")
+            .next()
+            .expect("arm present");
+        let tail = &arm[arm.len().saturating_sub(900)..];
+        assert!(
+            tail.contains("append_failures.is_power_of_two()"),
+            "the append-failure error! must be gated by the power-of-two throttle"
+        );
+        assert!(
+            tail.contains("append_dropped.increment(1)"),
+            "every failure must still be counted before the throttle"
+        );
+        assert!(!(0u64).is_power_of_two() && 1u64.is_power_of_two());
+    }
+
     use super::*;
     use std::path::PathBuf;
 
