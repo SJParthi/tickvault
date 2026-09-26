@@ -8,7 +8,7 @@
 //! minter; if it stops publishing the token, any peer consumer of the same
 //! account must mint its own — which invalidates tickvault's token and starts
 //! a flapping re-mint war. Operator directive 2026-08-08, contract in
-//! `.claude/rules/project/groww-shared-token-minter-2026-07-02.md` §9.
+//! `docs/claude-rules-full/project/groww-shared-token-minter-2026-07-02.md` §9.
 //!
 //! These are source-scan meta-guards: they fail the BUILD if a future refactor
 //! silently drops the publish, awaits it on the mint path, moves the SSM write
@@ -202,7 +202,7 @@ fn publish_targets_the_dhan_service_path() {
 /// The rule file must carry the contract, so the 'why' survives this code.
 #[test]
 fn rule_file_pins_the_shared_token_contract() {
-    let rule = read("../../.claude/rules/project/groww-shared-token-minter-2026-07-02.md");
+    let rule = read("../../docs/claude-rules-full/project/groww-shared-token-minter-2026-07-02.md");
     for phrase in [
         "§9",
         "dhan_token_publisher",

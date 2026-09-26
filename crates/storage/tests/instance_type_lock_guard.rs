@@ -1,6 +1,6 @@
 //! Source-scan ratchet pinning the **r8g.xlarge instance type lock** AND the
 //! **multi-AZ shape** documented in
-//! `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md` §7.
+//! `docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md` §7.
 //!
 //! Lock history: 2026-05-18 t4g.medium → 2026-05-27 t4g.large → 2026-05-29
 //! m8g.large (8 GiB) → 2026-06-30 r8g.large (Graviton4, 16 GiB — operator
@@ -30,11 +30,11 @@
 //!     `r8g.xlarge`.
 //!
 //! See:
-//! - `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`
+//! - `docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md`
 //! - `.claude/rules/project/aws-budget.md`
 //! - `docs/architecture/aws-indices-only-locked-architecture.md` §5
-//! - `.claude/rules/project/websocket-connection-scope-lock.md`
-//! - `.claude/rules/project/operator-charter-forever.md` §I
+//! - `docs/claude-rules-full/project/websocket-connection-scope-lock.md`
+//! - `docs/claude-rules-full/project/operator-charter-forever.md` §I
 
 #![cfg(test)]
 
@@ -61,7 +61,8 @@ fn read(path: &Path) -> String {
 #[test]
 fn instance_lock_authoritative_rule_file_pins_r8g_xlarge() {
     let root = repo_root();
-    let path = root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md");
+    let path =
+        root.join("docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md");
     assert!(
         path.exists(),
         "authoritative rule file missing at {}",
@@ -102,8 +103,9 @@ fn instance_lock_authoritative_rule_file_pins_r8g_xlarge() {
 #[test]
 fn instance_lock_az_stays_unpinned() {
     let root = repo_root();
-    let body =
-        read(&root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md"));
+    let body = read(
+        &root.join("docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md"),
+    );
     assert!(
         body.contains("NOT PINNED"),
         "§7 must record that the availability zone is NOT pinned (Quote 13, 2026-08-08)"
@@ -234,7 +236,8 @@ fn instance_lock_supersession_markers_present_in_architecture_doc() {
 #[test]
 fn instance_lock_supersession_markers_present_in_websocket_scope_lock() {
     let root = repo_root();
-    let body = read(&root.join(".claude/rules/project/websocket-connection-scope-lock.md"));
+    let body =
+        read(&root.join("docs/claude-rules-full/project/websocket-connection-scope-lock.md"));
     assert!(
         body.contains("SUPERSEDED 2026-05-27"),
         "websocket-connection-scope-lock.md must carry the 2026-05-27 supersession marker"
@@ -248,7 +251,7 @@ fn instance_lock_supersession_markers_present_in_websocket_scope_lock() {
 #[test]
 fn instance_lock_supersession_markers_present_in_operator_charter() {
     let root = repo_root();
-    let body = read(&root.join(".claude/rules/project/operator-charter-forever.md"));
+    let body = read(&root.join("docs/claude-rules-full/project/operator-charter-forever.md"));
     assert!(
         body.contains("SUPERSEDED 2026-05-27"),
         "operator-charter-forever.md §I must carry the 2026-05-27 supersession marker"
@@ -276,8 +279,9 @@ fn instance_lock_supersession_markers_present_in_operator_charter() {
 #[test]
 fn instance_lock_monthly_bill_pinned_to_current_r8g_xlarge_range() {
     let root = repo_root();
-    let body =
-        read(&root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md"));
+    let body = read(
+        &root.join("docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md"),
+    );
     // 2026-08-07 (Quote 12): the CURRENT bill is the t4g.large one. The old
     // t4g.medium figures below stay asserted because the file retains them as
     // dated history — but the guard would otherwise have kept passing while
@@ -353,8 +357,9 @@ fn instance_lock_monthly_bill_pinned_to_current_r8g_xlarge_range() {
 #[test]
 fn instance_lock_2026_07_19_sub_1k_ruling_pinned() {
     let root = repo_root();
-    let daily =
-        read(&root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md"));
+    let daily = read(
+        &root.join("docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md"),
+    );
     assert!(
         daily.contains("just 30 gn enough and onl yt4g medium as of now"),
         "daily-universe §0 must carry the 2026-07-19 Quote 9 verbatim (typos included)"
@@ -413,13 +418,15 @@ fn instance_lock_2026_07_19_eip_release_ruling_pinned() {
         budget.contains("docs/runbooks/eip-release.md"),
         "aws-budget.md must point at the bundled-recreate execution runbook"
     );
-    let daily =
-        read(&root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md"));
+    let daily = read(
+        &root.join("docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md"),
+    );
     assert!(
         daily.contains("Quote 10"),
         "daily-universe §0 must carry the 2026-07-19 Quote 10 EIP-release ruling"
     );
-    let scope = read(&root.join(".claude/rules/project/websocket-connection-scope-lock.md"));
+    let scope =
+        read(&root.join("docs/claude-rules-full/project/websocket-connection-scope-lock.md"));
     assert!(
         scope.contains("Static IP / EIP ruling"),
         "websocket-connection-scope-lock.md must carry the 2026-07-19 static-IP ruling section"
@@ -441,8 +448,9 @@ fn instance_lock_2026_07_19_eip_release_ruling_pinned() {
 #[test]
 fn instance_lock_schedule_pinned_to_0830_1730_ist_window() {
     let root = repo_root();
-    let body =
-        read(&root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md"));
+    let body = read(
+        &root.join("docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md"),
+    );
     assert!(
         body.contains("CURRENT LIVE SCHEDULE: 08:30–17:30 IST"),
         "rule file §7 must pin 08:30 IST as the CURRENT LIVE schedule. The bare \

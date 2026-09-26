@@ -48,7 +48,7 @@ fn read(rel: &str) -> String {
 
 const LANE_ALARMS: &str = "deploy/aws/terraform/live-lane-alarms.tf";
 const ERRCODE_ALARMS: &str = "deploy/aws/terraform/error-code-alarms.tf";
-const NOISE_LOCK: &str = ".claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md";
+const NOISE_LOCK: &str = "docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md";
 
 /// Signals that are BOTH permanent and evidence-free, so a dashboard alone is
 /// not enough. Each entry names why it cannot wait for someone to look.

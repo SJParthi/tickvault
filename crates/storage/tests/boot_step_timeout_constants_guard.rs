@@ -40,8 +40,8 @@ fn repo_root() -> PathBuf {
 }
 
 fn rule_file_body() -> String {
-    let path =
-        repo_root().join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md");
+    let path = repo_root()
+        .join("docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md");
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()))
 }
 
