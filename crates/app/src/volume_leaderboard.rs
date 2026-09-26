@@ -280,6 +280,7 @@ pub fn board_order(a: &RankedContract, b: &RankedContract) -> std::cmp::Ordering
 ///
 /// O(1), no allocation.
 #[must_use]
+// WIRING-EXEMPT: passed BY VALUE as the sort key (`sort.step(.., board_radix_key)`) in `LiveIngest::step_top_volume_sweep`, which the guard's `name(` pattern cannot see.
 pub fn board_radix_key(row: &RankedContract) -> [u64; crate::top_volume_sweep::RADIX_WORDS] {
     [
         !row.window_lots_milli,
