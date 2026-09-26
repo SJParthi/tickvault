@@ -1919,7 +1919,7 @@ impl LiveIngest {
                 if sweep.sort.step(
                     &mut sweep.rows,
                     budget,
-                    crate::volume_leaderboard::board_order,
+                    crate::volume_leaderboard::board_radix_key,
                 ) {
                     // ---- the depth steering publish (2026-09-08) ----
                     //
