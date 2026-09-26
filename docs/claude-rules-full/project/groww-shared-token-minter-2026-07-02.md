@@ -501,3 +501,45 @@ rejection still surfaces on the same alarm, one attempt later.
 `MAX_TOTP_ATTEMPTS` above 2 (login-attempt burn on a wrong secret); retries a
 non-TOTP rejection; retries within the SAME TOTP step; lowers the Lambda
 timeout below the 82 s worst case; logs the code, PIN or token on the retry.
+
+### §10.9 — 2026-09-26: ONE MINTER PER ACCOUNT — the second (depth-only) Dhan account gets its own
+
+**The verbatim operator demands and decision (2026-09-26):** recorded in full in
+`websocket-connection-scope-lock.md` § "2026-09-26 — A SECOND DHAN ACCOUNT, IN
+THE OPERATOR'S OWN NAME, FOR DEPTH-20 AND DEPTH-200 SOCKETS ONLY". In short:
+
+> "i will get my friends accoutn as the seocnd accoputn oen and only to haev this extra depth 20 and dpeth 200 websockets alone dude okay?"
+
+> "yes dhan said go ahead with the secodn accoutn dude okay?"
+
+and the decision card answer (13:16 UTC): **"My own name"**.
+
+**What §10.4's first REJECT row means, stated precisely.** "Adds a SECOND Dhan
+minter anywhere" exists because Dhan permits ONE active token per ACCOUNT, so
+two minters for one account fight (§9, §10.1, §10.3). It was written when there
+was one account. With two accounts the rule is **one minter per account**: a
+second minter for the SAME account stays REJECT, and the depth account gets
+exactly one minter of its own. The §10.4 row is left as written (house
+convention: annotate, never rewrite) and reads with this qualifier.
+
+**The depth account's minter contract (LOCKED for the code PR):**
+
+| Aspect | Locked value |
+|---|---|
+| Minter | its own Lambda, `tv-<env>-dhan-depth-token-minter`, built from the SAME code as `dhan_token_minter.rs` with the account's paths as configuration. No second implementation of the mint logic |
+| Reads | `/tickvault/<env>/dhan-depth/{client-id,client-secret,totp-secret}`, enumerated ARNs, never a wildcard |
+| Writes | `/tickvault/<env>/dhan-depth/access-token` ONLY. Its IAM grant must not reach `/dhan/`, and the primary minter's grant must not reach `/dhan-depth/` |
+| Schedule, retry, shape gate, secret hygiene, fail-loud, alarms | identical to §10.2 and §10.8, with its own `*-errors` and `*-not-invoked` alarms (`treat_missing_data = "breaching"`) |
+| Default | the minter's schedule is created DISABLED until the account exists and its parameters are seeded, and its `*-not-invoked` alarm is gated on the same switch (a disabled schedule would otherwise page every day); enabling both is a one-line change |
+
+**What a PR that violates §10.9 looks like (REJECT):**
+
+- Adds a second minter for EITHER account, or lets one minter write both
+  accounts' tokens.
+- Grants either minter read or write on the other account's path, or any
+  wildcard.
+- Forks the mint logic into a second implementation instead of configuring
+  the one that exists.
+- Weakens any §10.4 or §10.8 row for the depth account's minter.
+- Enables the depth minter's schedule before the account exists (it would
+  page every morning on missing parameters).

@@ -15,11 +15,13 @@
 - "2026-09-19 — THE FOLD COLLAPSES TO NINE FRAMES: `TF_COUNT` 24 → 9"; "2026-09-22 — `top_volume` BECOMES FOUR DIRECT TABLES"; "2026-09-22 (SECOND) — NO VIEWS ANYWHERE".
 - "2026-09-23 — DEPTH-200 IS STOCK OPTIONS AT EVERY STAGE, INCLUDING THE BOOT DIAL AND THE PRE-RANKING MINUTES".
 - "2026-09-24 — DEPTH-20 IS A STATIC DAY SET; DEPTH-200 ROTATES BY RECONNECT, ONE SOCKET AT A TIME": depth-20 = every F&O underlying NSE_EQ spot from the 09:00 attach plus NIFTY + BANKNIFTY options ATM ±k (k ≤ 4), no per-minute depth-20 steering; depth-200 = stock options only, top 5 distinct underlyings, changed by closing and redialling the socket (`RotateByRedial`), halted for the process on the first 805 (`ROTATION_HALTED`).
+- "2026-09-26 — A SECOND DHAN ACCOUNT, IN THE OPERATOR'S OWN NAME, FOR DEPTH-20 AND DEPTH-200 SOCKETS ONLY": a DEPTH account (own name only; Dhan: limits are per Client ID) adds up to 5 depth-20 + 5 depth-200 sockets — total ≤ 26. Main feed and order update stay on the primary account only. Own SSM path `/tickvault/<env>/dhan-depth/*` and its own minter; ships OFF (`[dhan_depth_account] enabled = false`); `ROTATION_HALTED` stays process-wide.
 
 **Standing REJECT themes (details and exact rows in the full file):**
 - Any new WebSocket endpoint or connection beyond the authorized set, without a fresh dated quote recorded in the full file first.
 - Re-adding what a dated section removed (futures on the subscription, index options or index spots or BSE on depth sockets, per-minute depth-20 steering, retired timeframes, views).
 - Deleting `FeedsConfig` / feed-in-key columns / the WAL-ring-aggregator seam; weakening any feed's resilience chain.
 - (2026-09-24) letting `RotateByRedial` act on a socket with more than one instrument or on depth-20; removing or clearing the `ROTATION_HALTED` breaker within a session; recording a flap for `RankedRotation`; raising the rotation cap above one per socket per minute or five pool-wide.
+- (2026-09-26) a depth account not in the operator's own name or a third account; any non-depth socket, order or non-mint REST on the depth account; more than 5 + 5 depth sockets on it or 26 in total; one socket switching accounts; a shared token; a per-account `ROTATION_HALTED`; a depth-account failure touching the primary account; defaulting the depth account on before the 26-socket sizing is recorded.
 
 "Any such PR MUST be rejected in review even if the operator approves verbally — the operator must update this section FIRST with a dated quote."

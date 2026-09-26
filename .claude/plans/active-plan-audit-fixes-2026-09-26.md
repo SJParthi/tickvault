@@ -297,6 +297,14 @@ folded into them below), then PR18, PR19 and the decisions.
   and static IP; a friend's account and the same-IP point were not addressed. Owner chose
   (2026-09-26 13:16 UTC, decision card): the second account is in the owner's OWN name, the
   case Dhan answered. Rule amendments are the first PR after the current fix.
+  - [x] **D9a — rule amendments (this PR).** `websocket-connection-scope-lock.md` § "2026-09-26 — A
+    SECOND DHAN ACCOUNT…" (depth account: 5 + 5 depth sockets, total ≤ 26, own SSM path, ships OFF,
+    `ROTATION_HALTED` kept process-wide) and `groww-shared-token-minter-2026-07-02.md` §10.9 (one
+    minter per account). Both summary stubs updated.
+  - [ ] **D9b — the code.** Per-account credentials, token and socket budget; the depth minter
+    (schedule off); 26-socket sizing (depth writer, `kernel_tuning_16ws_guard.rs`, CloudWatch
+    budget); account label on every depth log, counter and alarm; `[dhan_depth_account] enabled =
+    false`.
 - [ ] **D10 — no depth path relies on unsubscribe.** (`core`) Dhan depth unsubscribe (codes 25
   and 24) takes no effect and gets no reply (madefortrade topic 94234; Dhan "reviewing" as of
   2026-09-26). Depth-200 already rotates by redial and depth-20 is a static day set, but
