@@ -36,7 +36,7 @@
 //!  8. `validate_super_order_prices` regresses to `#[allow(dead_code)]`
 //!     or loses its exit-region call site.
 //!  9. The authoritative rule file
-//!     `.claude/rules/project/dhan-exit-order-lockout-2026-07-14.md`
+//!     `docs/claude-rules-full/project/dhan-exit-order-lockout-2026-07-14.md`
 //!     disappears or stops carrying the lock contract.
 //! 10. The TOML section scanner itself regresses (self-test fixtures —
 //!     incl. inline-table + dotted-key forms via the `toml`-crate doc
@@ -49,9 +49,9 @@
 //!     the S6-G1 only-caller pin (M6c).
 //!
 //! See:
-//! - `.claude/rules/project/dhan-exit-order-lockout-2026-07-14.md`
-//! - `.claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md` §2
-//! - `.claude/rules/project/merge-gate-lock-2026-07-04.md` (All Green)
+//! - `docs/claude-rules-full/project/dhan-exit-order-lockout-2026-07-14.md`
+//! - `docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md` §2
+//! - `docs/claude-rules-full/project/merge-gate-lock-2026-07-04.md` (All Green)
 //! - `crates/storage/tests/groww_scale_aws_lockout_guard.rs` (the house
 //!   lockout-guard template this mirrors)
 
@@ -63,9 +63,9 @@ use tickvault_common::config::ExitOrdersConfig;
 
 const LOCK_MSG: &str = "operator lock 2026-07-14 — the DHAN exit-order layer ships default-off \
      behind four independent locks; see \
-     .claude/rules/project/dhan-exit-order-lockout-2026-07-14.md";
+     docs/claude-rules-full/project/dhan-exit-order-lockout-2026-07-14.md";
 
-const RULE_FILE: &str = ".claude/rules/project/dhan-exit-order-lockout-2026-07-14.md";
+const RULE_FILE: &str = "docs/claude-rules-full/project/dhan-exit-order-lockout-2026-07-14.md";
 
 /// The six exit methods whose dry-run-before-token source order is pinned
 /// (design Ruling 1: the `// LIVE-EXIT-ARM` marker + source-order pin).
@@ -671,8 +671,9 @@ fn exit_layer_emits_no_telegram_dispatch() {
         }
     }
     if !dispatch_sites.is_empty() {
-        let noise_lock =
-            read(&root.join(".claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md"));
+        let noise_lock = read(
+            &root.join("docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md"),
+        );
         assert!(
             noise_lock.to_lowercase().contains("order execution"),
             "order-path NotificationEvent dispatch sites appeared without an \

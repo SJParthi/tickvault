@@ -8,7 +8,7 @@
 //!
 //! **2026-08-09 (operator, dated quote):** the Dhan live main-feed WebSocket
 //! was REVIVED, and the revival section of
-//! `.claude/rules/project/websocket-connection-scope-lock.md` names the
+//! `docs/claude-rules-full/project/websocket-connection-scope-lock.md` names the
 //! tick-gap detector explicitly in its "What the revival MUST rebuild" list.
 //! The tombstone's own release condition — "re-introduction needs a fresh
 //! dated quote in websocket-connection-scope-lock.md first" — is therefore
@@ -38,7 +38,8 @@ use std::path::PathBuf;
 
 const APP_MAIN_RS: &str = "src/main.rs";
 const DETECTOR_REL: &str = "../core/src/pipeline/tick_gap_detector.rs";
-const SCOPE_LOCK_REL: &str = "../../.claude/rules/project/websocket-connection-scope-lock.md";
+const SCOPE_LOCK_REL: &str =
+    "../../docs/claude-rules-full/project/websocket-connection-scope-lock.md";
 
 fn manifest_join(rel: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel)

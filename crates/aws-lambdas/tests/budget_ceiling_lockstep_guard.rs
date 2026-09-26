@@ -26,7 +26,7 @@
 //! safety argument still reading "kills later, never earlier". A comment
 //! cannot catch that. This test can.
 //!
-//! Authority: `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`
+//! Authority: `docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md`
 //! §0 Quote 13 + §7; `.claude/rules/project/aws-budget.md`.
 
 #![cfg(test)]
@@ -189,8 +189,9 @@ fn rule_files_record_the_current_ceiling() {
     );
     let dollars = format!("${}", tf_limit as i64);
 
-    let daily =
-        read(&root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md"));
+    let daily = read(
+        &root.join("docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md"),
+    );
     assert!(
         daily.contains(&dollars),
         "daily-universe §7 must record the current kill ceiling ({dollars})"
@@ -234,7 +235,7 @@ fn standing_cap_is_150_and_the_allowance_is_one_month() {
     // Both rule files record BOTH numbers.
     let root = repo_root();
     for rel in [
-        ".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md",
+        "docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md",
         ".claude/rules/project/aws-budget.md",
     ] {
         let body = read(&root.join(rel));
