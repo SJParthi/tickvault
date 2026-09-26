@@ -53,15 +53,37 @@ inline (PR2, PR8, PR14).
     Rows are recovered by WAL replay (PR12 makes that mid-session, not boot-only).
   - DONE AS BUILT (2026-09-26): the same shape for the depth rescue, counted on
     `tv_depth_rescue_deferred_to_wal_total`.
-- [ ] **PR4 — the top-volume sort runs off the tick task.** (`app`)
-  - `snapshot_top_volume` (dhan_feed_stack.rs:1701) runs `rank` → `sort_unstable_by`
+- [x] **PR4 — the top-volume sort runs off the tick task.** (`app`)
+  - `snapshot_top_volume` (dhan_feed_stack.rs:1701) ran `rank` → `sort_unstable_by`
     (volume_leaderboard.rs:1546) inside the drain's biased `select!` timer arms (1s :6684,
     3s :6693, 5s :6702, 1m :6711). Measured cost 2.95 ms at the ceiling — the drain reads no
-    frame for that long. The drain keeps only the O(1)-per-tick `observe`; on each cadence it
-    swaps its per-cadence dirty buffer (O(1) pointer swap, pre-allocated pair) and sends it on a
-    bounded channel to a dedicated ranking thread, which owns baselines, sort, gainer filter,
-    distinct-underlying pass and the ILP batch. A full channel keeps the buffer and merges the
-    next cadence into it (counted), never blocks the drain.
+    frame for that long.
+  - **Design change, recorded (2026-09-26):** a dedicated ranking thread was NOT taken. The
+    row projection reads the candle fold (`bar_for_window`) for every row, and the aggregator
+    is single-owner `&mut` on the drain by a documented decision; sharing it would put a lock
+    or an epoch on the per-tick fold. Instead the sweep is SLICED on the drain:
+    - the cadence arm pays O(1): `VolumeLeaderboard::begin_sweep` swaps the per-cadence work
+      list into a pre-sized in-flight slot and queues a `SweepJob`;
+    - an idle arm placed LAST in the biased select runs `LiveIngest::step_top_volume_sweep`,
+      one bounded step of `TOP_VOLUME_SWEEP_STEP_ROWS` (512) rows at a time: collect
+      (`sweep_step`), sliced merge sort (`SliceSort`), gainer walk (`GainerWalk`), candidate
+      publish, projection in chunks, one hand-off;
+    - a cadence that fires while its previous job is queued or running is deferred: its
+      baselines are rolled so the skipped window is dropped rather than merged (a merged
+      window would publish a volume change over two windows under one cadence label),
+      counted on `tv_top_volume_sweep_deferred_total` and logged.
+  - Files: volume_leaderboard.rs, top_volume_sweep.rs (new), dhan_feed_stack.rs, lib.rs,
+    tests/dhat_top_volume_sweep.rs (new).
+  - Tests: `begin_sweep_and_sweep_step_rank_identically_to_rank` (proptest, = the planned
+    `merged_cadence_buffers_rank_identically`), `drain_cadence_arm_does_no_sort`,
+    `slice_sort_step_matches_sort_unstable_by` (proptest),
+    `dhat_top_volume_sweep_begin_and_steps_zero_allocation`,
+    `sliced_sweep_step_cost_at_the_authorized_ceiling` (ignored harness).
+- [ ] **PR4b — the catch-up seal sweep runs in slices too.** (`trading`, `app`) — found while
+  doing PR4. `catch_up_seal_all` is O(slots × TF_COUNT) on the drain's 5 s `catchup_timer`
+  arm; measured 9.67 ms at the 25,000 × 24 ceiling (2026-08-21), ~3.6 ms at today's
+  TF_COUNT = 9. Same shape of fix: a resumable cursor over the slots, advanced from the idle
+  arm. Tests: `catch_up_seal_in_slices_seals_the_same_bars` (proptest vs `catch_up_seal_all`).
 - [ ] **PR5 — honest panic handling.** (all crates)
   - Keep `panic = "abort"` (Cargo.toml:275) — a half-dead process holding sockets is worse
     than a clean restart by systemd. The two production `catch_unwind` sites are dead under

@@ -70,6 +70,19 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
         "crates/app/src/volume_leaderboard.rs",
         "radix_vs_comparator_at_every_measured_shape",
     ),
+    // Added 2026-09-26 (audit PR4) with the sliced sweep it times: the same
+    // wall-clock shape as the rank harness above. It reports the longest
+    // single step of each phase at the 20,220-contract ceiling, which is the
+    // bound on how long a frame waits behind the sweep. It asserts the board
+    // it timed was full, so it cannot report a figure from an empty board;
+    // the sliced and unsliced rankings are proven equal by the proptest
+    // `begin_sweep_and_sweep_step_rank_identically_to_rank`, which is a gate. Measured 2026-09-26 (release, x86 dev
+    // container): longest step collect 433 us, sort 197 us, gainer walk
+    // 60 us; mean step 11.6 us over 8,316 steps.
+    (
+        "crates/app/src/volume_leaderboard.rs",
+        "sliced_sweep_step_cost_at_the_authorized_ceiling",
+    ),
     (
         "crates/trading/src/candles/multi_tf_aggregator.rs",
         "catch_up_seal_all_sweep_cost_at_the_authorized_ceiling",

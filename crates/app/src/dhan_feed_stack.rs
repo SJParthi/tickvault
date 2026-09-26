@@ -1561,6 +1561,10 @@ pub struct LiveIngest {
     /// a tick is seen, and a structure reached through `&mut self` on a
     /// single-owner path needs no concurrent map.
     leaderboard: crate::volume_leaderboard::VolumeLeaderboard,
+    /// The top-volume sweep, run in slices off the drain's idle arm (audit
+    /// PR4, 2026-09-26). The cadence timer arms only queue a job here; see
+    /// [`crate::top_volume_sweep`] for why and for what that costs.
+    top_volume_sweep: crate::top_volume_sweep::TopVolumeSweep,
     /// `true` while [`refold_wal_frames`] is re-folding a WAL backlog through
     /// this ingest. The ranking observer is SKIPPED for the duration.
     ///
@@ -1687,22 +1691,21 @@ impl LiveIngest {
         self
     }
 
-    /// Ranks both families and appends one snapshot's rows, then flushes.
+    /// Starts one snapshot of `cadence` — the part the drain's timer arm
+    /// pays, and it is **O(1)** in the board (audit PR4, 2026-09-26): it
+    /// swaps each ranked family's work list into its in-flight slot and
+    /// queues a job. The ranking, the gainer filter, the candidate publish
+    /// and the row projection run later in bounded steps from
+    /// [`Self::step_top_volume_sweep`], on the drain's idle arm.
     ///
-    /// Returns `(rows_appended, refusals)`. `(0, 0)` is the normal answer
-    /// outside the capture window and before any contract has traded.
-    ///
-    /// # Complexity
-    ///
-    /// O(n log n) in TRACKED CONTRACTS per call, from the ranking sort -- the
-    /// same sort the depth steering already pays. Deliberately NOT on the
-    /// per-tick path: it runs on a timer, and the write it triggers is handed
-    /// to another thread rather than performed here.
-    pub fn snapshot_top_volume(
+    /// Outside the capture window it rolls the baselines instead, exactly as
+    /// before — O(traded) integer writes on a population that is near-empty
+    /// before 09:15.
+    pub fn begin_top_volume_sweep(
         &mut self,
         now_ist_nanos: i64,
         cadence: tickvault_storage::top_volume_rank_persistence::SnapshotCadence,
-    ) -> (usize, usize) {
+    ) {
         // The clock gate FIRST, before any ranking work. Outside the window
         // there is nothing to publish, and ranking to discover that would pay
         // the sort ~23,000 times a session for nothing.
@@ -1719,7 +1722,7 @@ impl LiveIngest {
             for family in RANKED_OPTION_FAMILIES {
                 self.leaderboard.roll_baselines(family, cadence);
             }
-            return (0, 0);
+            return;
         }
         // Two consumers of this pass now, and they are gated separately.
         //
@@ -1751,125 +1754,206 @@ impl LiveIngest {
                 .is_some(),
         );
         if !wants_rows && !wants_candidates {
-            return (0, 0);
+            return;
         }
 
+        // One job per cadence at a time. A fire that finds its cadence still
+        // queued or running is DEFERRED. Swapping the list in anyway would
+        // hand the queued job the NEXT window's contracts under THIS window's
+        // timestamp.
+        //
+        // The deferred window is DROPPED, not merged: its baselines are rolled
+        // here, so the next job measures its own window. Merging would store
+        // two windows' volume under one window's `ts`, beside a one-window
+        // candle, and roughly double that row's `volume_percentage_change`
+        // with nothing on the row to say so. A missing window is visible (the
+        // counter and the log below); a doubled one is not. O(traded in the
+        // skipped window) integer writes, no sort, and only on a deferral.
+        let in_flight = RANKED_OPTION_FAMILIES
+            .iter()
+            .any(|family| self.leaderboard.sweep_pending(*family, cadence));
+        if in_flight || self.top_volume_sweep.is_busy(cadence) {
+            for family in RANKED_OPTION_FAMILIES {
+                self.leaderboard.roll_baselines(family, cadence);
+            }
+            let deferred = self.top_volume_sweep.record_deferred();
+            if deferred.is_power_of_two() {
+                warn!(
+                    code = ErrorCode::WsGapConnectionState.code_str(),
+                    counter = crate::top_volume_sweep::TOP_VOLUME_SWEEP_DEFERRED_COUNTER,
+                    source = "top_volume_sweep_deferred",
+                    cadence = cadence.as_str(),
+                    deferred,
+                    "top_volume: a cadence fired while its previous sweep was still queued or \
+                     running, so this window was skipped: it has no rows, and the next board \
+                     measures only its own window. The candle tables still carry this window's \
+                     volume. Sustained growth means the drain has no idle time to finish a sweep."
+                );
+            }
+            return;
+        }
+        for family in RANKED_OPTION_FAMILIES {
+            let _started = self.leaderboard.begin_sweep(family, cadence);
+        }
+        self.top_volume_sweep
+            .enqueue(crate::top_volume_sweep::SweepJob {
+                cadence,
+                ts_ist_nanos: now_ist_nanos,
+                wants_rows,
+                wants_candidates,
+            });
+    }
+
+    /// Whether a top-volume sweep is queued or running — the guard on the
+    /// drain's idle arm.
+    #[must_use]
+    pub fn top_volume_sweep_pending(&self) -> bool {
+        self.top_volume_sweep.has_work()
+    }
+
+    /// Advances the running top-volume sweep by ONE step of at most
+    /// [`crate::top_volume_sweep::TOP_VOLUME_SWEEP_STEP_ROWS`] rows, and
+    /// returns the job's totals when that step finishes it.
+    ///
+    /// # Complexity
+    ///
+    /// **O(step rows)** per call — the bound on how long a queued frame waits
+    /// behind the sweep. The whole sweep is still O(k log k) in contracts that
+    /// traded in the window; it is spread over as many calls as it needs.
+    pub fn step_top_volume_sweep(&mut self) -> Option<crate::top_volume_sweep::SweepDone> {
+        use crate::top_volume_sweep::{SweepPhase, TOP_VOLUME_SWEEP_STEP_ROWS};
+        if !self.top_volume_sweep.activate_next() {
+            return None;
+        }
+        let active = self.top_volume_sweep.active?;
+        let job = active.job;
+        let Some(&family) = RANKED_OPTION_FAMILIES.get(active.family_idx) else {
+            return self.top_volume_sweep.finish_active();
+        };
+        let budget = TOP_VOLUME_SWEEP_STEP_ROWS;
         let mut appended = 0usize;
         let mut refused = 0usize;
-        for family in RANKED_OPTION_FAMILIES {
-            // The `!wants_rows && family != Stock` skip that used to stand here
-            // is GONE with the Index family (2026-09-18 FOURTH) -- with one
-            // family in the list it could never fire, and a guard that cannot
-            // fire reads as though a case is still covered. The `!wants_rows`
-            // exit further down, after the candidates publish, is the live one.
-            // Disjoint-field borrows, taken BEFORE the ranking borrow: the
-            // gainer pass below reads these two stores while `rank`'s slice is
-            // still alive, and the borrow checker allows that only because
-            // they are named as fields rather than reached through `self`.
-            let spot_prices = &self.spot_prices;
-            let prev_close = &self.prev_close;
-            // Ranked WITHOUT a cut. The sort is over every contract that traded
-            // in the window either way — truncation happens after it — so the
-            // only cost of `usize::MAX` is the copy below, which is bounded to
-            // the per-family budget, not the population.
-            //
-            // The cut moved OUT of `rank` on 2026-09-08 because the gainer
-            // filter was being applied AFTER a top-250 cut: what reached the
-            // depth pool was `top250 ∩ gainers`, routinely far fewer than 250,
-            // while eligible gainers ranked 251st and below never appeared at
-            // all. The operator's rule is "gainers are the eligibility filter,
-            // volume decides the order" — the top 250 AMONG the eligible.
-            let ranked_all: &[crate::volume_leaderboard::RankedContract] = self.leaderboard.rank(
-                family,
-                cadence,
-                usize::MAX,
-                // The SAME map the drain already probes per tick, so the
-                // lot size that normalises a contract's volume is the one
-                // its own master row carried. A second source here could
-                // disagree with the subscription about what a lot is.
-                |c| {
-                    crate::contract_underlying_map::global_contract_underlying_map()
-                        .owner_of(c.security_id, c.segment)
-                        .map(|owner| owner.lot_size)
-                },
-                |_| true,
-            );
-
-            // ---- the depth steering publish (2026-09-08) ----
-            //
-            // Off THIS pass, deliberately, and NOT via
-            // `rank_distinct_underlying`: that method ranks, and a second rank
-            // on the same cadence in the same tick would measure a window this
-            // one has already consumed -- every delta 0, the order collapsed to
-            // the security_id tie-break, silently. See its own doc comment.
-            //
-            // Computed BEFORE the `is_empty` skip so an empty ranking publishes
-            // an EMPTY list rather than nothing at all. Those are different
-            // answers: "nothing traded" is a reading, "we have not ranked" is
-            // the absence of one, and the reader refuses to claim a divergence
-            // from the second.
-            //
-            // Stock only, per the 2026-09-06 lock: index options are banned
-            // from depth entirely, so publishing them would hand the steering
-            // loop the very set the lock forbids.
-            //
-            // ---- the gainer ELIGIBILITY filter (2026-09-06 lock) ----
-            //
-            // "An instrument qualifies if its underlying is in the day's
-            // gainers; volume then decides the order." Applied on the FULL
-            // volume-ordered population, stopping once the depth-20 exit set
-            // is filled, so membership is the underlying's day gain and order
-            // is still lots-in-window. Not applied inside `rank`, because the
-            // persisted `top_volume_rank` rows must keep recording which
-            // contracts were busiest whether or not their stock rose.
-            //
-            // Both probes are RAM: the spot store the drain writes and the
-            // previous-close store the same packet walk fills. An underlying
-            // with no spot today or no previous close is `Unknown` — counted,
-            // never treated as falling.
-            //
-            // HONEST CONSEQUENCE, recorded rather than smoothed over: on a day
-            // where every stock falls, this publishes an EMPTY list, and both
-            // planners move nothing on an empty ranking, so the sockets hold
-            // whatever they held. That is what the operator's rule produces on
-            // a down day; the tally is how an operator reads "no gainers"
-            // apart from "nothing could be judged".
-            let steering = if family == crate::volume_leaderboard::OptionFamily::Stock
-                && wants_candidates
-            {
-                Some(crate::volume_leaderboard::gainer_eligible(
-                    ranked_all,
-                    crate::depth20_ranked_steer::DEPTH20_EXIT_RANKS,
-                    |underlying_id| {
-                        let segment = crate::volume_leaderboard::STOCK_OPTION_UNDERLYING_SEGMENT;
-                        crate::volume_leaderboard::underlying_gainer_verdict(
-                            spot_prices.latest_paise(underlying_id, segment),
-                            prev_close.get(underlying_id, segment),
-                        )
+        // `None` = this family is finished.
+        let next: Option<SweepPhase> = match active.phase {
+            SweepPhase::Collect => {
+                // Ranked WITHOUT a cut, as `rank(.., usize::MAX, ..)` did: the
+                // sort is over every contract that traded in the window. The
+                // cut moved OUT of the ranking on 2026-09-08 because the gainer
+                // filter was being applied AFTER a top-250 cut — see
+                // `gainer_eligible`.
+                let done = self.leaderboard.sweep_step(
+                    family,
+                    job.cadence,
+                    budget,
+                    // The SAME map the drain already probes per tick, so the
+                    // lot size that normalises a contract's volume is the one
+                    // its own master row carried. A second source here could
+                    // disagree with the subscription about what a lot is.
+                    |c| {
+                        crate::contract_underlying_map::global_contract_underlying_map()
+                            .owner_of(c.security_id, c.segment)
+                            .map(|owner| owner.lot_size)
                     },
-                ))
-            } else {
-                None
-            };
-            // The persisted rows: every contract that traded in the window
-            // (`TOP_VOLUME_PERSIST_PER_FAMILY`, operator 2026-09-12), whether
-            // or not their stock rose. COPIED out because the closures below
-            // need `self` again.
-            //
-            // ⚠ HONEST COST of removing the 250 cut, stated rather than
-            // absorbed: this copy used to be bounded by a constant — 250 rows
-            // × 40 B ≈ 10 KB per sweep. It is now bounded by the MARKET: one
-            // entry per contract with a non-zero window delta, hard-capped
-            // only by `MAX_TRACKED_CONTRACTS` (25,000/family ≈ 1 MB). It is on
-            // the drain's TIMER arm, not the per-tick path, and the allocation
-            // reuses no buffer. If the sweep cost moves, this line is one of
-            // the two places to look; the other is the sort in `rank`.
-            let ranked: Vec<crate::volume_leaderboard::RankedContract> = ranked_all[..ranked_all
-                .len()
-                .min(tickvault_common::constants::TOP_VOLUME_PERSIST_PER_FAMILY)]
-                .to_vec();
-
-            if let Some((gainers, tally)) = steering {
+                    |_| true,
+                    &mut self.top_volume_sweep.rows,
+                );
+                if done {
+                    self.leaderboard.publish_sweep_gauges(
+                        family,
+                        job.cadence,
+                        self.top_volume_sweep.rows.len(),
+                    );
+                    self.top_volume_sweep.sort.reset();
+                    Some(SweepPhase::Sort)
+                } else {
+                    Some(SweepPhase::Collect)
+                }
+            }
+            SweepPhase::Sort => {
+                let sweep = &mut self.top_volume_sweep;
+                if sweep.sort.step(
+                    &mut sweep.rows,
+                    budget,
+                    crate::volume_leaderboard::board_order,
+                ) {
+                    // ---- the depth steering publish (2026-09-08) ----
+                    //
+                    // Off THIS pass, deliberately, and NOT via
+                    // `rank_distinct_underlying`: that method ranks, and a second rank
+                    // on the same cadence in the same tick would measure a window this
+                    // one has already consumed -- every delta 0, the order collapsed to
+                    // the security_id tie-break, silently. See its own doc comment.
+                    //
+                    // Computed BEFORE the `is_empty` skip so an empty ranking publishes
+                    // an EMPTY list rather than nothing at all. Those are different
+                    // answers: "nothing traded" is a reading, "we have not ranked" is
+                    // the absence of one, and the reader refuses to claim a divergence
+                    // from the second.
+                    //
+                    // Stock only, per the 2026-09-06 lock: index options are banned
+                    // from depth entirely, so publishing them would hand the steering
+                    // loop the very set the lock forbids.
+                    //
+                    // ---- the gainer ELIGIBILITY filter (2026-09-06 lock) ----
+                    //
+                    // "An instrument qualifies if its underlying is in the day's
+                    // gainers; volume then decides the order." Applied on the FULL
+                    // volume-ordered population, stopping once the depth-20 exit set
+                    // is filled, so membership is the underlying's day gain and order
+                    // is still lots-in-window. Not applied inside `rank`, because the
+                    // persisted `top_volume_rank` rows must keep recording which
+                    // contracts were busiest whether or not their stock rose.
+                    //
+                    // Both probes are RAM: the spot store the drain writes and the
+                    // previous-close store the same packet walk fills. An underlying
+                    // with no spot today or no previous close is `Unknown` — counted,
+                    // never treated as falling.
+                    //
+                    // HONEST CONSEQUENCE, recorded rather than smoothed over: on a day
+                    // where every stock falls, this publishes an EMPTY list, and both
+                    // planners move nothing on an empty ranking, so the sockets hold
+                    // whatever they held. That is what the operator's rule produces on
+                    // a down day; the tally is how an operator reads "no gainers"
+                    // apart from "nothing could be judged".
+                    if family == crate::volume_leaderboard::OptionFamily::Stock
+                        && job.wants_candidates
+                    {
+                        sweep
+                            .gainers
+                            .reset(crate::depth20_ranked_steer::DEPTH20_EXIT_RANKS);
+                        Some(SweepPhase::Gainers)
+                    } else {
+                        Self::projection_phase(job, sweep.rows.is_empty())
+                    }
+                } else {
+                    Some(SweepPhase::Sort)
+                }
+            }
+            SweepPhase::Gainers => {
+                // Disjoint-field borrows: the walk reads the two RAM stores
+                // while the sweep's own buffers are borrowed mutably.
+                let spot_prices = &self.spot_prices;
+                let prev_close = &self.prev_close;
+                let sweep = &mut self.top_volume_sweep;
+                let done = sweep.gainers.step(&sweep.rows, budget, |underlying_id| {
+                    let segment = crate::volume_leaderboard::STOCK_OPTION_UNDERLYING_SEGMENT;
+                    crate::volume_leaderboard::underlying_gainer_verdict(
+                        spot_prices.latest_paise(underlying_id, segment),
+                        prev_close.get(underlying_id, segment),
+                    )
+                });
+                Some(if done {
+                    SweepPhase::Publish
+                } else {
+                    SweepPhase::Gainers
+                })
+            }
+            SweepPhase::Publish => {
+                // O(depth-20 exit set): the tally, the two candidate lists and
+                // the distinct-underlying pass over at most 300 gainers.
+                let tally = self.top_volume_sweep.gainers.tally();
+                let gainers = self.top_volume_sweep.gainers.gainers();
+                let ranked = &self.top_volume_sweep.rows;
                 crate::volume_leaderboard::record_gainer_tally(tally);
                 // Every verdict Unknown while the board is non-empty means the
                 // gainer filter has NO inputs — no spot or no previous close
@@ -1900,183 +1984,270 @@ impl LiveIngest {
                 // taken from the first 250, a held contract is kept while it
                 // stays inside the list — the hysteresis band the 2026-09-07
                 // lock names as the remedy for a churning board.
-                crate::depth20_ranked_steer::global_depth20_candidates()
-                    .publish(crate::depth200_candidates::candidates_from_ranked(&gainers));
-                // The distinct-underlying pass is depth-200's rule only. The
-                // list runs to `DEPTH200_EXIT_UNDERLYINGS`, not the socket
-                // budget: the first five are the entry set, the rest is the
-                // hysteresis band that keeps a held contract from being
-                // swapped out on a single window in which it slipped to
-                // sixth.
-                let picked = crate::volume_leaderboard::distinct_underlying_over(
-                    &gainers,
-                    crate::depth200_candidates::DEPTH200_EXIT_UNDERLYINGS,
+                // Re-checked HERE, not only at the fire: a 3s job queued behind
+                // a running 1m job latched "due" when no list existed yet, and
+                // publishing it after the 1m job would replace the minute board
+                // with a three-second one until the next minute.
+                let still_due = depth200_candidates_due(
+                    job.cadence,
+                    crate::depth200_candidates::global_depth200_candidates()
+                        .latest()
+                        .is_some(),
                 );
-                crate::depth200_candidates::global_depth200_candidates()
-                    .publish(crate::depth200_candidates::candidates_from_ranked(&picked));
+                if still_due {
+                    crate::depth20_ranked_steer::global_depth20_candidates()
+                        .publish(crate::depth200_candidates::candidates_from_ranked(gainers));
+                    // The distinct-underlying pass is depth-200's rule only. The
+                    // list runs to `DEPTH200_EXIT_UNDERLYINGS`, not the socket
+                    // budget: the first five are the entry set, the rest is the
+                    // hysteresis band that keeps a held contract from being
+                    // swapped out on a single window in which it slipped to
+                    // sixth.
+                    let picked = crate::volume_leaderboard::distinct_underlying_over(
+                        gainers,
+                        crate::depth200_candidates::DEPTH200_EXIT_UNDERLYINGS,
+                    );
+                    crate::depth200_candidates::global_depth200_candidates()
+                        .publish(crate::depth200_candidates::candidates_from_ranked(&picked));
+                }
+                Self::projection_phase(job, ranked.is_empty())
             }
-
-            if ranked.is_empty() {
-                continue;
-            }
-            if !wants_rows {
-                continue;
-            }
-
-            // A disjoint field borrow, on the same rule as `spot_prices`
-            // above: the candle-fold probe in the projection below runs while
-            // `rank`'s slice is still alive, and the borrow checker permits
-            // that only because both are named as fields rather than reached
-            // through `self`.
-            //
-            // A third, `prev_close`, was taken here until 2026-09-19 for the
-            // `gain_pct` closure the operator removed. Its store is still read
-            // by the gainer filter a few lines above; only this borrow is gone.
-            let aggregator = &self.aggregator;
-            // Resolved ONCE per sweep, not per contract — the cadence is fixed
-            // for the whole pass, so a per-row match would be ~20,000 wasted
-            // branches a second at the ceiling.
-            let fold_frame = fold_frame_for_cadence(cadence);
-            let view = crate::depth_subscription_view::global_depth_subscription_view();
-            // ONE atomic load for the whole sweep. Held across the projection
-            // AND the append loop below, because the rows BORROW their label
-            // out of it — which is what makes the per-row label cost a pointer
-            // copy instead of the `format!` that up to 80,000 rows a second on
-            // this task would otherwise pay. The label itself was rendered once
-            // at contract attach; see `contract_underlying_map::labels_from_artifact`.
-            let labels =
-                crate::contract_underlying_map::global_contract_underlying_map().label_snapshot();
-            let projection = crate::top_volume_snapshot::project_snapshot(
-                now_ist_nanos,
-                cadence,
-                family,
-                &ranked,
-                |security_id, segment| view.is_subscribed(security_id, segment),
-                |security_id, segment| labels.get(&(security_id, segment)).map(AsRef::as_ref),
-                |security_id, segment, window_open_ist_secs| {
-                    // ONE O(1) probe into the fold the drain has already been
-                    // filling this window: one hash lookup, one slot index,
-                    // at most two `LiveCandleState` copies. No allocation.
-                    //
-                    // This is the whole of the operator's 2026-09-18 ask. The
-                    // leaderboard cannot answer it — `RankedContract` carries
-                    // traded UNITS and a cumulative counter and NO PRICE — so
-                    // neither the candle table's SIGNED volume nor the
-                    // contract's own price move was expressible from the
-                    // ranking alone. Both are read here, from the SAME bar, on
-                    // the same probe.
-                    //
-                    // `aggregator` is a disjoint field borrow taken beside
-                    // `spot_prices` and `prev_close` above, for the same
-                    // reason: `rank`'s slice is still alive, and the borrow
-                    // checker permits this only because all three are named as
-                    // fields rather than reached through `self`.
-                    // `bar_for_window`, not `snapshot`: the probe asks for
-                    // THIS ROW'S window and gets that bar or nothing. Reading
-                    // the currently-open bucket instead — which is what
-                    // `snapshot` returns — systematically hands back the NEXT
-                    // window for exactly the contracts a volume board exists
-                    // to rank, because a busy contract has already rolled by
-                    // the time the sweep reaches it. It returned the right
-                    // window only for the quiet tail.
-                    aggregator
-                        .bar_for_window(
-                            Feed::Dhan,
-                            security_id,
-                            segment.binary_code(),
-                            fold_frame,
-                            window_open_ist_secs,
-                        )
-                        // `from_bar`, never a field-by-field copy: the bar is
-                        // usually still the OPEN bucket at the sweep instant,
-                        // whose two percentages are not stamped until it seals.
-                        // `from_bar` stamps a copy with the seal's own function
-                        // so the stored figures are the candle row's figures —
-                        // copied, never re-derived (operator 2026-09-19 Quote
-                        // A). Three fields, not nine: the operator stripped the
-                        // OHLC, the bar-over-bar percentage and the bucket skew
-                        // off `top_volume` on 2026-09-19.
-                        .map(crate::top_volume_snapshot::CandleBarReading::from_bar)
-                },
-            );
-
-            refused = refused.saturating_add(projection.refusal_count());
-            for (security_id, reason) in &projection.refusals {
-                let idx = reason.index();
-                self.top_volume_snapshot_refusal_counters[idx].increment(1);
-                self.top_volume_snapshot_refusals[idx] =
-                    self.top_volume_snapshot_refusals[idx].saturating_add(1);
-                let seen = self.top_volume_snapshot_refusals[idx];
-                // `counter` is a FIELD, not decoration: an operator who greps
-                // the counter name lands here, and the loss-counter visibility
-                // guard can only SEE that a loss-shaped counter has a surface
-                // if its name appears beside a log. Throttled on powers of two
-                // because the open can refuse many contracts at once -- the
-                // 1st, 2nd, 4th ... of the session is logged, which reports the
-                // onset immediately and the MAGNITUDE without flooding.
-                //
-                // PER REASON since 2026-09-12 — see the field's own doc. A
-                // shared counter let the then-benign `gain_unavailable` flood at
-                // the open suppress the first occurrence of the reasons that
-                // actually lose a row. That flood is gone with the reason
-                // itself (2026-09-19), and the per-reason split STAYS: it is
-                // what keeps a rare arithmetic refusal visible beside a common
-                // drift refusal, whichever of them is the common one next.
-                if seen.is_power_of_two() {
-                    tracing::warn!(
-                        code = tickvault_common::error_code::ErrorCode::WsGapConnectionState
-                            .code_str(),
-                        counter = TOP_VOLUME_SNAPSHOT_REFUSAL_COUNTER,
-                        source = "top_volume_snapshot_refused",
-                        reason = reason.as_str(),
-                        security_id = *security_id,
-                        // THIS REASON's count, not the session total across
-                        // reasons — a shared number here would read as though
-                        // this reason had fired that many times.
-                        refusals = seen,
-                        "top_volume: a contract was refused by the snapshot projection. `label_unavailable` still STORES the row -- only the display name is missing, so no volume is lost -- and means the label and owner snapshots have drifted. Any OTHER reason drops the row. All of them are zero on a healthy session."
+            SweepPhase::Project { pos } => {
+                let persist = self
+                    .top_volume_sweep
+                    .rows
+                    .len()
+                    .min(tickvault_common::constants::TOP_VOLUME_PERSIST_PER_FAMILY);
+                let end = pos.saturating_add(budget).min(persist);
+                // ONE label snapshot for the whole family, taken on its first
+                // chunk: every chunk reads it and the hand-off below carries
+                // it, so the writer thread resolves every row against the
+                // identical map. The rows BORROW their label out of it — which
+                // is what makes the per-row label cost a pointer copy instead
+                // of the `format!` that up to 80,000 rows a second on this task
+                // would otherwise pay. The label itself was rendered once at
+                // contract attach; see `contract_underlying_map::labels_from_artifact`.
+                let labels =
+                    std::sync::Arc::clone(self.top_volume_sweep.labels.get_or_insert_with(|| {
+                        crate::contract_underlying_map::global_contract_underlying_map()
+                            .label_snapshot()
+                    }));
+                let ranked = self.top_volume_sweep.rows.get(pos..end).unwrap_or(&[]);
+                let cadence = job.cadence;
+                let now_ist_nanos = job.ts_ist_nanos;
+                // A disjoint field borrow: the candle-fold probe in the
+                // projection below runs while the sweep's row slice is still
+                // borrowed, and the borrow checker permits that only because
+                // both are named as fields rather than reached through `self`.
+                let aggregator = &self.aggregator;
+                // Resolved ONCE per chunk, not per contract — the cadence is
+                // fixed for the whole pass, so a per-row match would be ~20,000
+                // wasted branches a second at the ceiling.
+                let fold_frame = fold_frame_for_cadence(cadence);
+                let view = crate::depth_subscription_view::global_depth_subscription_view();
+                // The two sink closures below capture disjoint FIELDS of
+                // `self` (the writer, the refusal counters and tallies), which
+                // is what lets them run while the row slice and the fold are
+                // borrowed.
+                // Two tallies, one per sink closure: each closure needs its own
+                // `&mut`, and they are summed into `refused` after the call.
+                let mut stage_refused = 0usize;
+                let mut projection_refused = 0usize;
+                // Rows whose bar had already left the fold: the candle probe
+                // is a `Fn`, so the tally is a `Cell`.
+                let candle_misses = std::cell::Cell::new(0usize);
+                crate::top_volume_snapshot::project_snapshot_with(
+                    now_ist_nanos,
+                    cadence,
+                    family,
+                    ranked,
+                    |security_id, segment| view.is_subscribed(security_id, segment),
+                    |security_id, segment| labels.get(&(security_id, segment)).map(AsRef::as_ref),
+                    |security_id, segment, window_open_ist_secs| {
+                        // ONE O(1) probe into the fold the drain has already been
+                        // filling this window: one hash lookup, one slot index,
+                        // at most two `LiveCandleState` copies. No allocation.
+                        //
+                        // This is the whole of the operator's 2026-09-18 ask. The
+                        // leaderboard cannot answer it — `RankedContract` carries
+                        // traded UNITS and a cumulative counter and NO PRICE — so
+                        // neither the candle table's SIGNED volume nor the
+                        // contract's own price move was expressible from the
+                        // ranking alone. Both are read here, from the SAME bar, on
+                        // the same probe.
+                        //
+                        // `aggregator` is a disjoint field borrow, for the
+                        // reason given where it is taken.
+                        // `bar_for_window`, not `snapshot`: the probe asks for
+                        // THIS ROW'S window and gets that bar or nothing. Reading
+                        // the currently-open bucket instead — which is what
+                        // `snapshot` returns — systematically hands back the NEXT
+                        // window for exactly the contracts a volume board exists
+                        // to rank, because a busy contract has already rolled by
+                        // the time the sweep reaches it. It returned the right
+                        // window only for the quiet tail.
+                        aggregator
+                            .bar_for_window(
+                                Feed::Dhan,
+                                security_id,
+                                segment.binary_code(),
+                                fold_frame,
+                                window_open_ist_secs,
+                            )
+                            // `from_bar`, never a field-by-field copy: the bar is
+                            // usually still the OPEN bucket at the sweep instant,
+                            // whose two percentages are not stamped until it seals.
+                            // `from_bar` stamps a copy with the seal's own function
+                            // so the stored figures are the candle row's figures —
+                            // copied, never re-derived (operator 2026-09-19 Quote
+                            // A). Three fields, not nine: the operator stripped the
+                            // OHLC, the bar-over-bar percentage and the bucket skew
+                            // off `top_volume` on 2026-09-19.
+                            .map(crate::top_volume_snapshot::CandleBarReading::from_bar)
+                            .or_else(|| {
+                                candle_misses.set(candle_misses.get().saturating_add(1));
+                                None
+                            })
+                    },
+                    // Rows go straight into the writer's pre-sized staging vector
+                    // and refusals straight to their counters: no per-chunk vector.
+                    |row| {
+                        // STAGED, not appended (2026-09-22, item 44e). Until then this loop
+                        // called the ILP `append_row` per row: float formatting, symbol
+                        // escaping and the delay renderer on the frame-drain task, measured
+                        // at 14,932 µs for a 20,220-row sweep -- 14.5x the sort above it.
+                        // `stage` is a copy of the row's plain data into a pre-sized,
+                        // recycled vector; the append runs on the writer thread, whose
+                        // per-row refusals are counted there on
+                        // `TOP_VOLUME_APPEND_FAILURE_COUNTER`.
+                        //
+                        // A consequence worth stating: an append refusal can no longer be
+                        // folded into this function's `refused` return, because it now
+                        // happens after the return. `appended` here means rows STAGED and
+                        // offered to the writer.
+                        if let Some(writer) = self.top_volume.as_mut() {
+                            if writer.stage(&row) {
+                                appended = appended.saturating_add(1);
+                            } else {
+                                // Past the sweep's row bound. The producer counts and
+                                // logs it as a discard; the drain only reports it.
+                                stage_refused = stage_refused.saturating_add(1);
+                            }
+                        }
+                    },
+                    |security_id, reason| {
+                        projection_refused = projection_refused.saturating_add(1);
+                        let idx = reason.index();
+                        self.top_volume_snapshot_refusal_counters[idx].increment(1);
+                        self.top_volume_snapshot_refusals[idx] =
+                            self.top_volume_snapshot_refusals[idx].saturating_add(1);
+                        let seen = self.top_volume_snapshot_refusals[idx];
+                        // `counter` is a FIELD, not decoration: an operator who greps
+                        // the counter name lands here, and the loss-counter visibility
+                        // guard can only SEE that a loss-shaped counter has a surface
+                        // if its name appears beside a log. Throttled on powers of two
+                        // because the open can refuse many contracts at once -- the
+                        // 1st, 2nd, 4th ... of the session is logged, which reports the
+                        // onset immediately and the MAGNITUDE without flooding.
+                        //
+                        // PER REASON since 2026-09-12 — see the field's own doc. A
+                        // shared counter let the then-benign `gain_unavailable` flood at
+                        // the open suppress the first occurrence of the reasons that
+                        // actually lose a row. That flood is gone with the reason
+                        // itself (2026-09-19), and the per-reason split STAYS: it is
+                        // what keeps a rare arithmetic refusal visible beside a common
+                        // drift refusal, whichever of them is the common one next.
+                        if seen.is_power_of_two() {
+                            tracing::warn!(
+                                code =
+                                    tickvault_common::error_code::ErrorCode::WsGapConnectionState
+                                        .code_str(),
+                                counter = TOP_VOLUME_SNAPSHOT_REFUSAL_COUNTER,
+                                source = "top_volume_snapshot_refused",
+                                reason = reason.as_str(),
+                                security_id,
+                                // THIS REASON's count, not the session total across
+                                // reasons — a shared number here would read as though
+                                // this reason had fired that many times.
+                                refusals = seen,
+                                "top_volume: a contract was refused by the snapshot projection. `label_unavailable` still STORES the row -- only the display name is missing, so no volume is lost -- and means the label and owner snapshots have drifted. Any OTHER reason drops the row. All of them are zero on a healthy session."
+                            );
+                        }
+                    },
+                );
+                refused = refused
+                    .saturating_add(stage_refused)
+                    .saturating_add(projection_refused);
+                if let Some(total) = self
+                    .top_volume_sweep
+                    .record_candle_misses(candle_misses.get())
+                {
+                    warn!(
+                        code = ErrorCode::WsGapConnectionState.code_str(),
+                        counter = crate::top_volume_sweep::TOP_VOLUME_SWEEP_CANDLE_MISS_COUNTER,
+                        source = "top_volume_candle_bar_missing",
+                        cadence = cadence.as_str(),
+                        missing = total,
+                        "top_volume: rows were stored with empty candle columns because their \
+                         window had already rolled out of the candle fold when the row was \
+                         projected. The volume ranking on those rows is correct; only the \
+                         candle figures are missing. Growth means sweeps are finishing late."
                     );
                 }
-            }
-            let Some(writer) = self.top_volume.as_mut() else {
-                return (appended, refused);
-            };
-            // STAGED, not appended (2026-09-22, item 44e). Until then this loop
-            // called the ILP `append_row` per row: float formatting, symbol
-            // escaping and the delay renderer on the frame-drain task, measured
-            // at 14,932 µs for a 20,220-row sweep -- 14.5x the sort above it.
-            // `stage` is a copy of the row's plain data into a pre-sized,
-            // recycled vector; the append runs on the writer thread, whose
-            // per-row refusals are counted there on
-            // `TOP_VOLUME_APPEND_FAILURE_COUNTER`.
-            //
-            // A consequence worth stating: an append refusal can no longer be
-            // folded into this function's `refused` return, because it now
-            // happens after the return. `appended` here means rows STAGED and
-            // offered to the writer.
-            for row in &projection.rows {
-                if writer.stage(row) {
-                    appended = appended.saturating_add(1);
+                if end >= persist
+                    && let Some(writer) = self.top_volume.as_mut()
+                {
+                    // ONE `try_send` per family per sweep, carrying the SAME
+                    // label snapshot every chunk read, so the writer thread
+                    // resolves every row against the identical map. It never
+                    // blocks: a full queue DROPS the sweep and counts it on the
+                    // discard series rather than retaining it, because the next
+                    // sweep re-ranks the whole board. The outcome is ignored
+                    // deliberately -- the producer has already counted and
+                    // logged every arm that loses a row.
+                    let _handoff = writer.hand_off(labels);
+                }
+                if end >= persist {
+                    self.top_volume_sweep.labels = None;
+                    None
                 } else {
-                    // Past the sweep's row bound. The producer counts and logs
-                    // it as a discard; the drain only reports it.
-                    refused = refused.saturating_add(1);
+                    Some(SweepPhase::Project { pos: end })
                 }
             }
-            // ONE `try_send` per family per sweep, carrying the SAME label
-            // snapshot the projection just read, so the writer thread resolves
-            // every row against the identical map. It never blocks: a full
-            // queue DROPS the sweep and counts it on the discard series rather
-            // than retaining it, because the next sweep re-ranks the whole
-            // board. The outcome is ignored deliberately -- the producer has
-            // already counted and logged every arm that loses a row.
-            let _handoff = writer.hand_off(std::sync::Arc::clone(&labels));
+        };
+        let sweep = &mut self.top_volume_sweep;
+        let active = sweep.active.as_mut()?;
+        active.appended = active.appended.saturating_add(appended);
+        active.refused = active.refused.saturating_add(refused);
+        match next {
+            Some(phase) => {
+                active.phase = phase;
+                None
+            }
+            None => {
+                active.family_idx = active.family_idx.saturating_add(1);
+                active.phase = SweepPhase::Collect;
+                sweep.rows.clear();
+                if active.family_idx >= RANKED_OPTION_FAMILIES.len() {
+                    sweep.finish_active()
+                } else {
+                    None
+                }
+            }
         }
+    }
 
-        // The end-of-function `flush` that stood here until 2026-09-22 is gone
-        // with the retained-rows concept it existed for: nothing is held across
-        // sweeps any more, so there is nothing for a later sweep to re-offer.
-        (appended, refused)
+    /// The phase after the candidates: project this family's rows when there
+    /// are rows and a writer to take them, or finish the family.
+    const fn projection_phase(
+        job: crate::top_volume_sweep::SweepJob,
+        rows_empty: bool,
+    ) -> Option<crate::top_volume_sweep::SweepPhase> {
+        if rows_empty || !job.wants_rows {
+            None
+        } else {
+            Some(crate::top_volume_sweep::SweepPhase::Project { pos: 0 })
+        }
     }
 
     /// The lane's ONE depth sink.
@@ -2228,6 +2399,13 @@ impl LiveIngest {
                 }),
             gainer_all_unknown_reported: false,
             leaderboard: crate::volume_leaderboard::VolumeLeaderboard::new(),
+            // Sized once, here: the collected rows of one family (bounded by
+            // the tracked-contract cap) and the gainer walk's output (bounded
+            // by the depth-20 exit set). No step of a sweep grows either.
+            top_volume_sweep: crate::top_volume_sweep::TopVolumeSweep::with_capacity(
+                crate::volume_leaderboard::MAX_TRACKED_CONTRACTS,
+                crate::depth20_ranked_steer::DEPTH20_EXIT_RANKS,
+            ),
             replaying_wal: false,
             top_volume: None,
         }
@@ -2617,10 +2795,17 @@ impl LiveIngest {
         }
         // The top-volume queue closes when its PRODUCER drops — there is no
         // `close_offload()` on that writer, because the producer half owns the
-        // only sender. Account for STAGED rows first: since 2026-09-22 (item
-        // 44e) a sweep hands its rows off before returning, so this is
-        // normally zero -- but a row staged and never handed off is a row
-        // nothing will ever write, and it must reach the discard counter.
+        // only sender. A sweep still queued or part-way through is FINISHED
+        // first (audit PR4, 2026-09-26): since the sweep is sliced, rows can be
+        // staged across several drain steps, and at shutdown there is no frame
+        // to yield to. Finishing it hands its rows off. Bounded: a sweep is a
+        // finite list of steps and at most one job per cadence is queued.
+        while self.top_volume_sweep_pending() {
+            let _done = self.step_top_volume_sweep();
+        }
+        // Then account for STAGED rows: normally zero after the loop above --
+        // a row staged and never handed off is a row nothing will ever write,
+        // and it must reach the discard counter.
         if let Some(writer) = self.top_volume.as_mut() {
             let dropped = writer.discard_pending();
             if dropped > 0 {
@@ -3597,6 +3782,16 @@ impl LiveIngest {
     /// contract. Nothing errors; the board is simply wrong all day.
     pub fn reset_ranking_daily(&mut self) {
         self.leaderboard.reset_daily();
+        // Queued and running sweeps go with the lists they would have
+        // visited: a job resuming after the reset would publish an EMPTY
+        // candidate list as though nothing had traded.
+        self.top_volume_sweep.clear();
+        // Rows a dropped job had already staged go with it: left in place they
+        // would ride out on the next day's first hand-off, under yesterday's
+        // `ts` and a different label snapshot.
+        if let Some(writer) = self.top_volume.as_mut() {
+            let _dropped = writer.discard_staged("the daily ranking reset dropped a sweep");
+        }
         self.prev_close.reset_daily();
         // The spot store rides the SAME reset, and joining it here rather than
         // adding a second rollover site is the point: one place decides what a
@@ -6680,7 +6875,10 @@ async fn run_frame_drain(
                 }
             }
             // The snapshot arms sit AFTER the frame arm's `biased` priority, so
-            // a snapshot can never preempt draining queued frames. They touch
+            // a snapshot can never preempt draining queued frames. Since audit
+            // PR4 (2026-09-26) each arm only QUEUES its sweep — an O(1) swap
+            // of the work lists — and the ranking itself runs in bounded steps
+            // from the idle arm at the END of this select. They touch
             // the leaderboard and the aggregator read-only-ish and cannot
             // starve each other: all four are timers, not queues.
             //
@@ -6692,38 +6890,22 @@ async fn run_frame_drain(
             _ = snapshot_1s_timer.tick() => {
                 let cadence =
                     tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond;
-                let (rows, refused) = ingest.snapshot_top_volume(now_ist_nanos(), cadence);
-                if let Some(slot) = cadence.slot() {
-                    snapshot_rows[slot] = snapshot_rows[slot].saturating_add(rows as u64);
-                }
-                snapshot_refused = snapshot_refused.saturating_add(refused as u64);
+                ingest.begin_top_volume_sweep(now_ist_nanos(), cadence);
             }
             _ = snapshot_3s_timer.tick() => {
                 let cadence =
                     tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ThreeSecond;
-                let (rows, refused) = ingest.snapshot_top_volume(now_ist_nanos(), cadence);
-                if let Some(slot) = cadence.slot() {
-                    snapshot_rows[slot] = snapshot_rows[slot].saturating_add(rows as u64);
-                }
-                snapshot_refused = snapshot_refused.saturating_add(refused as u64);
+                ingest.begin_top_volume_sweep(now_ist_nanos(), cadence);
             }
             _ = snapshot_5s_timer.tick() => {
                 let cadence =
                     tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond;
-                let (rows, refused) = ingest.snapshot_top_volume(now_ist_nanos(), cadence);
-                if let Some(slot) = cadence.slot() {
-                    snapshot_rows[slot] = snapshot_rows[slot].saturating_add(rows as u64);
-                }
-                snapshot_refused = snapshot_refused.saturating_add(refused as u64);
+                ingest.begin_top_volume_sweep(now_ist_nanos(), cadence);
             }
             _ = snapshot_1m_timer.tick() => {
                 let cadence =
                     tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneMinute;
-                let (rows, refused) = ingest.snapshot_top_volume(now_ist_nanos(), cadence);
-                if let Some(slot) = cadence.slot() {
-                    snapshot_rows[slot] = snapshot_rows[slot].saturating_add(rows as u64);
-                }
-                snapshot_refused = snapshot_refused.saturating_add(refused as u64);
+                ingest.begin_top_volume_sweep(now_ist_nanos(), cadence);
             }
             _ = silence_timer.tick() => {
                 // Re-anchor the four snapshot timers against the wall clock.
@@ -7230,6 +7412,32 @@ async fn run_frame_drain(
                             }
                         );
                     }
+                }
+            }
+            // The top-volume sweep, one bounded step at a time (audit PR4,
+            // 2026-09-26). LAST in this `biased` select and ready only while
+            // a sweep is queued or running, so it runs only when no frame,
+            // timer or seed is ready: a frame arriving mid-sweep waits for at
+            // most one step of `TOP_VOLUME_SWEEP_STEP_ROWS` rows, never for
+            // the whole board. Under a sustained frame burst it yields
+            // entirely; a cadence that fires again before its sweep finishes
+            // is deferred and counted (`TOP_VOLUME_SWEEP_DEFERRED_COUNTER`).
+            //
+            // `consume_budget`, not `std::future::ready`: a ready future never
+            // spends tokio's cooperative budget, so once the frame receiver
+            // and the timers have spent it (they return Pending until the
+            // task yields) a ready arm would keep winning and run the rest of
+            // the sweep back to back without reading a frame. `consume_budget`
+            // spends one unit per step and returns Pending when the budget is
+            // gone, which makes the whole select yield and re-poll the frame
+            // arm first.
+            () = tokio::task::coop::consume_budget(), if ingest.top_volume_sweep_pending() => {
+                if let Some(done) = ingest.step_top_volume_sweep() {
+                    if let Some(slot) = done.cadence.slot() {
+                        snapshot_rows[slot] =
+                            snapshot_rows[slot].saturating_add(done.appended as u64);
+                    }
+                    snapshot_refused = snapshot_refused.saturating_add(done.refused as u64);
                 }
             }
         }
@@ -14603,6 +14811,33 @@ const SESSION_0916_IST_MILLIS: u64 = (3 * 3_600 + 46 * 60) * 1_000;
 /// 10:00 IST — a plain in-session instant.
 #[cfg(test)]
 const IN_SESSION_1000_IST_MILLIS: u64 = (4 * 3_600 + 30 * 60) * 1_000;
+
+/// Test driver: one snapshot of `cadence` run to completion — the timer
+/// arm's O(1) queue step, then every step of the sliced sweep, back to back.
+/// Returns `(rows staged, refusals)` for this cadence's job, `(0, 0)` when
+/// none was queued (outside the window, or nothing wants the ranking).
+#[cfg(test)]
+impl LiveIngest {
+    fn snapshot_top_volume(
+        &mut self,
+        now_ist_nanos: i64,
+        cadence: tickvault_storage::top_volume_rank_persistence::SnapshotCadence,
+    ) -> (usize, usize) {
+        self.begin_top_volume_sweep(now_ist_nanos, cadence);
+        let mut result = (0, 0);
+        let mut steps = 0usize;
+        while self.top_volume_sweep_pending() {
+            steps += 1;
+            assert!(steps < 10_000_000, "a sliced sweep must finish");
+            if let Some(done) = self.step_top_volume_sweep()
+                && done.cadence == cadence
+            {
+                result = (done.appended, done.refused);
+            }
+        }
+        result
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -24258,6 +24493,61 @@ mod late_seed_tests {
         }
     }
 
+    /// `drain_cadence_arm_does_no_sort` (audit PR4, 2026-09-26): each cadence
+    /// timer arm only QUEUES its sweep, and the ranking runs from the idle arm
+    /// placed LAST in the `biased` select, one bounded step at a time. A
+    /// cadence arm that ranked inline would stall frame reads for the whole
+    /// board again — 2.95 ms at the ceiling for the sort alone.
+    #[test]
+    fn drain_cadence_arm_does_no_sort() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let drain = src
+            .split_once("async fn run_frame_drain")
+            .expect("the drain must exist")
+            .1;
+        let drain = drain.split("#[cfg(test)]").next().unwrap_or(drain);
+        for cadence in tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ALL {
+            let arm_start = format!("_ = snapshot_{}_timer.tick() =>", cadence.as_str());
+            let arm = drain
+                .split_once(&arm_start)
+                .expect("every cadence has a timer arm")
+                .1;
+            let arm = arm
+                .split_once("\n            }\n")
+                .map_or(arm, |(body, _)| body);
+            assert!(
+                arm.contains("ingest.begin_top_volume_sweep(now_ist_nanos(), cadence);"),
+                "the {} arm must only queue its sweep",
+                cadence.as_str()
+            );
+            for forbidden in [".rank(", "snapshot_top_volume", "step_top_volume_sweep"] {
+                assert!(
+                    !arm.contains(forbidden),
+                    "the {} arm must not rank inline (found `{forbidden}`)",
+                    cadence.as_str()
+                );
+            }
+        }
+        // The idle arm is the LAST arm of the select: under `biased;` that is
+        // what makes it yield to every frame, timer and seed.
+        let idle =
+            "() = tokio::task::coop::consume_budget(), if ingest.top_volume_sweep_pending() =>";
+        let idle_at = drain.find(idle).expect("the sweep must have an idle arm");
+        let after = &drain[idle_at..];
+        let select_end = after
+            .find("\n        }\n    }\n")
+            .expect("the select ends after the idle arm");
+        assert!(
+            !after[idle.len()..select_end].contains(") =>")
+                && !after[idle.len()..select_end].contains("_ = "),
+            "no select arm may follow the sweep's idle arm"
+        );
+        assert!(
+            after[..select_end].contains("ingest.step_top_volume_sweep()"),
+            "the idle arm advances the sweep by one step"
+        );
+    }
+
     /// Depth-200 steering reads the 3-SECOND board for the FIRST list of the
     /// session, then the 1-MINUTE board from then on.
     ///
@@ -24572,6 +24862,96 @@ mod depth_rebalance_wiring_tests {
         assert!(
             rows >= 1,
             "the same board with the writer attached must write rows, got {rows}"
+        );
+    }
+
+    /// Audit PR4: the timer arm only QUEUES. `begin_top_volume_sweep` leaves
+    /// the work for the idle arm, and a second fire of the same cadence while
+    /// the first is still queued is skipped rather than queued twice.
+    #[test]
+    fn test_begin_top_volume_sweep_queues_one_job_per_cadence() {
+        let _serial = lock_published_views();
+        let day: i64 = 1_779_321_600;
+        let in_window = (day + 34_000) * 1_000_000_000;
+        let cadence = tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond;
+        let mut ingest = ranking_ingest(true);
+        assert!(!ingest.top_volume_sweep_pending(), "nothing queued yet");
+
+        ingest.begin_top_volume_sweep(in_window, cadence);
+        assert!(
+            ingest.top_volume_sweep_pending(),
+            "the timer arm must queue the sweep, not run it"
+        );
+        ingest.begin_top_volume_sweep(in_window + 1_000_000_000, cadence);
+
+        let mut finished = 0usize;
+        let mut steps = 0usize;
+        while ingest.top_volume_sweep_pending() {
+            steps += 1;
+            assert!(steps < 1_000_000, "a sliced sweep must finish");
+            if ingest
+                .step_top_volume_sweep()
+                .is_some_and(|done| done.cadence == cadence)
+            {
+                finished += 1;
+            }
+        }
+        assert_eq!(
+            finished, 1,
+            "a fire that finds its cadence busy is skipped, never queued a second time"
+        );
+    }
+
+    /// Outside the capture window the timer arm rolls baselines and queues
+    /// nothing, so the idle arm never wakes before 09:15.
+    #[test]
+    fn test_begin_top_volume_sweep_outside_the_window_queues_nothing() {
+        let _serial = lock_published_views();
+        let day: i64 = 1_779_321_600;
+        // 08:00 IST in the fixture's clock: day + 34,000 s is inside the
+        // window, and 8 × 3,600 s is well before 09:15.
+        let before_open = (day + 8 * 3_600) * 1_000_000_000;
+        let mut ingest = ranking_ingest(true);
+        ingest.begin_top_volume_sweep(
+            before_open,
+            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond,
+        );
+        assert!(
+            !ingest.top_volume_sweep_pending(),
+            "no sweep may be queued outside the capture window"
+        );
+    }
+
+    /// `step_top_volume_sweep` runs the queued job to a `SweepDone` carrying
+    /// the staged rows, then clears `top_volume_sweep_pending`, and a step with
+    /// nothing queued is a no-op.
+    #[test]
+    fn test_step_top_volume_sweep_finishes_and_clears_top_volume_sweep_pending() {
+        let _serial = lock_published_views();
+        let day: i64 = 1_779_321_600;
+        let in_window = (day + 34_000) * 1_000_000_000;
+        let cadence = tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond;
+        let mut ingest = ranking_ingest(true);
+        assert!(
+            ingest.step_top_volume_sweep().is_none(),
+            "a step with nothing queued must do nothing"
+        );
+        ingest.begin_top_volume_sweep(in_window, cadence);
+        let mut done = None;
+        let mut steps = 0usize;
+        while ingest.top_volume_sweep_pending() {
+            steps += 1;
+            assert!(steps < 1_000_000, "a sliced sweep must finish");
+            if let Some(d) = ingest.step_top_volume_sweep() {
+                done = Some(d);
+            }
+        }
+        let done = done.expect("the queued job must report when it finishes");
+        assert_eq!(done.cadence, cadence);
+        assert!(done.appended >= 1, "the fixture contract must be staged");
+        assert!(
+            ingest.step_top_volume_sweep().is_none(),
+            "a finished sweep leaves nothing to step"
         );
     }
 
@@ -25476,8 +25856,8 @@ mod item_44_tests {
         let src = include_str!("dhan_feed_stack.rs");
         let prod = src.split("#[cfg(test)]").next().unwrap_or("");
         let start = prod
-            .find("pub fn snapshot_top_volume(")
-            .expect("snapshot_top_volume must exist");
+            .find("pub fn step_top_volume_sweep(")
+            .expect("step_top_volume_sweep must exist");
         let body = &prod[start..];
         let end = body.find("\n    }\n").unwrap_or(body.len());
         let body = &body[..end];
@@ -25485,7 +25865,7 @@ mod item_44_tests {
             !body.contains(".append_row("),
             "the per-row ILP append must stay on the writer thread, not the drain"
         );
-        assert!(body.contains("writer.stage(row)"), "rows must be STAGED");
+        assert!(body.contains("writer.stage(&row)"), "rows must be STAGED");
         assert!(
             body.contains("writer.hand_off("),
             "each sweep must be handed off"
