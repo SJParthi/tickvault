@@ -171,6 +171,7 @@ pub mod spot_price_store;
 /// Projects the in-RAM volume leaderboard into `top_volume_rank` rows —
 /// the pure step between the ranking and the table the operator asked for.
 pub mod top_volume_snapshot;
+pub mod top_volume_sweep;
 pub mod volume_leaderboard;
 /// Settles what the Dhan WebSocket `volume` field actually MEANS (running day
 /// total vs per-packet quantity) from data already on disk — the premise the

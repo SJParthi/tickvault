@@ -87,14 +87,17 @@ fn no_family_loop_hardcodes_a_family_beside_the_list() {
     );
 
     let loops = code.matches("for family in").count();
+    // Three since audit PR4 (2026-09-26): the out-of-window baseline roll,
+    // the roll that skips a deferred window, and the sweep start.
     assert_eq!(
-        loops, 2,
-        "expected exactly two family loops (the out-of-window baseline roll and the \
-         ranking sweep), found {loops}. A new one must read RANKED_OPTION_FAMILIES too."
+        loops, 3,
+        "expected exactly three family loops (the out-of-window baseline roll, the \
+         deferred-window roll and the sweep start), found {loops}. A new one must read \
+         RANKED_OPTION_FAMILIES too."
     );
     let from_list = code.matches("for family in RANKED_OPTION_FAMILIES").count();
     assert_eq!(
-        from_list, 2,
+        from_list, 3,
         "all {loops} family loops must iterate RANKED_OPTION_FAMILIES; {from_list} do. \
          A loop over an inline array is a second source of truth."
     );

@@ -749,6 +749,7 @@ jobs:
           expected=$(LC_ALL=C sort <<'EOF'
           crates/app/tests/dhat_live_ingest_seam.rs
           crates/app/tests/dhat_mark_forward.rs
+          crates/app/tests/dhat_top_volume_sweep.rs
           crates/app/tests/dhat_ws_lag.rs
           crates/core/tests/dhat_allocation.rs
           crates/core/tests/dhat_depth_packet_zero_alloc.rs
@@ -945,6 +946,7 @@ jobs:
           cargo test -p tickvault-app \
             --test dhat_live_ingest_seam \
             --test dhat_mark_forward \
+            --test dhat_top_volume_sweep \
             --test dhat_ws_lag \
             2>&1 | tee /tmp/dhat-app.log
           if grep -q 'running 0 tests' /tmp/dhat-app.log; then
@@ -960,9 +962,12 @@ jobs:
           # a silently-dropped flag and a silently-added one look identical to
           # the run step, so the count is the only thing that notices. Bumping
           # it is the fix; loosening it to >= would delete the guard.
+          #
+          # 4 since audit PR4 (2026-09-26): dhat_top_volume_sweep gates the
+          # sliced top-volume sweep that moved off the drain's timer arms.
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-app.log || true)
-          if [ "$ran" -ne 3 ]; then
-            echo "::error::app DHAT step executed $ran targets, expected 3 — a --test flag was dropped from this step."
+          if [ "$ran" -ne 4 ]; then
+            echo "::error::app DHAT step executed $ran targets, expected 4 — a --test flag was dropped from this step."
             exit 1
           fi
 
