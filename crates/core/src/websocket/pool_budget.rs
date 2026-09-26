@@ -1501,7 +1501,7 @@ mod tests {
     }
 
     #[test]
-    fn test_both_accounts_tile_all_twenty_six_slots_exactly_once() {
+    fn test_slot_owner_both_accounts_tile_all_twenty_six_slots_exactly_once() {
         let mut budget = PoolBudget::new();
         let mut globals = BTreeSet::new();
         for account in DhanAccount::ALL {
@@ -1550,7 +1550,7 @@ mod tests {
     }
 
     #[test]
-    fn test_the_two_accounts_are_counted_independently() {
+    fn test_try_open_on_open_count_on_and_total_open_on_count_each_account_independently() {
         let mut budget = PoolBudget::new();
         for _ in 0..5 {
             assert!(budget.try_open(DhanEndpointType::Depth200).is_ok());
@@ -1593,7 +1593,7 @@ mod tests {
     }
 
     #[test]
-    fn test_depth_account_ceiling_is_ten_and_refuses_the_eleventh() {
+    fn test_connection_ceiling_depth_account_is_ten_and_refuses_the_eleventh() {
         let mut budget = PoolBudget::new();
         for endpoint in [DhanEndpointType::Depth20, DhanEndpointType::Depth200] {
             for _ in 0..5 {

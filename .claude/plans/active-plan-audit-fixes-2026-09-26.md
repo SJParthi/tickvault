@@ -318,7 +318,7 @@ folded into them below), then PR18, PR19 and the decisions.
       depth-200 tick-age exclusion range, `kernel_tuning_16ws_guard.rs` and the sysctl budget text.
       Done: `pool_budget::{DhanAccount, slot_owner, PoolBudget::try_open_on, release_on}`,
       `RECONNECT_JITTER_SLOTS = 26`, `dhan_feed_stack::endpoint_for_slot` via `slot_owner`.
-      Tests: `test_both_accounts_tile_all_twenty_six_slots_exactly_once`,
+      Tests: `test_slot_owner_both_accounts_tile_all_twenty_six_slots_exactly_once`,
       `test_depth_account_refuses_main_feed_and_order_update_without_mutating`,
       `test_reconnect_jitter_ms_unchanged_for_the_primary_account_slots`,
       `the_depth_accounts_slots_follow_the_same_rules`,
