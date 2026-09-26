@@ -60,11 +60,11 @@ fn dhat_top_volume_sweep_begin_and_steps_zero_allocation() {
     let mut sorter = SliceSort::with_capacity(MAX_TRACKED_CONTRACTS);
     let mut walk = GainerWalk::with_capacity(300);
     let mut round: u32 = 0;
-    let mut sweep = |lb: &mut VolumeLeaderboard,
-                     rows: &mut Vec<RankedContract>,
-                     sorter: &mut SliceSort<RankedContract>,
-                     walk: &mut GainerWalk,
-                     round: &mut u32| {
+    let sweep = |lb: &mut VolumeLeaderboard,
+                 rows: &mut Vec<RankedContract>,
+                 sorter: &mut SliceSort<RankedContract>,
+                 walk: &mut GainerWalk,
+                 round: &mut u32| {
         *round += 1;
         for id in 0..CONTRACTS {
             let volume = 1_000 + *round * (1 + (id as u32 % 97));

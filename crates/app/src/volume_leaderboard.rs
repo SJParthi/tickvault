@@ -276,8 +276,21 @@ pub enum SweepBegin {
     Started,
     /// The previous sweep of this cadence is still visiting its keys; the
     /// work list is left in place. The drain then rolls it with
-    /// [`VolumeLeaderboard::roll_baselines`], so that window is skipped.
+    /// [`VolumeLeaderboard::begin_roll`], so that window is skipped.
     Busy,
+    /// The cadence has no baseline slot (counted in `window_slot`).
+    Refused,
+}
+
+/// What [`VolumeLeaderboard::begin_roll`] did with a cadence's work list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollBegin {
+    /// The work list was swapped into the rolling slot; `roll_step` will
+    /// visit it from the idle arm.
+    Queued,
+    /// The previous roll of this cadence had not finished, so the list was
+    /// rolled in one pass here (the saturation fallback, counted by the caller).
+    Inline,
     /// The cadence has no baseline slot (counted in `window_slot`).
     Refused,
 }
@@ -717,6 +730,27 @@ struct Family {
     /// another `WINDOW_COUNT × MAX_TRACKED_CONTRACTS × 16 B` ≈ 1.6 MB per
     /// family.
     in_flight: [Vec<ContractKey>; WINDOW_COUNT],
+    /// A work list whose baselines are being ROLLED in slices, one per window.
+    ///
+    /// Added 2026-09-26 (audit PR4b). A window is rolled rather than ranked
+    /// on two paths: before the capture window opens, and when a cadence
+    /// fires while its previous sweep is still running (that window is
+    /// skipped). Until then both paths walked the whole list on the drain's
+    /// timer arm. [`VolumeLeaderboard::begin_roll`] now SWAPS `dirty[w]` in
+    /// here — O(1), no copy — and [`VolumeLeaderboard::roll_step`] visits a
+    /// bounded number of keys per call from the drain's idle arm.
+    ///
+    /// The invariant widens once more: a key's bit for `w` is set ⟺ the key
+    /// is on exactly one of `dirty[w]`, `in_flight[w]` or `rolling[w]`, at
+    /// most once. A key waiting here keeps its bit, so a trade landing before
+    /// its visit is not pushed a second time; the visit then rolls the
+    /// baseline to the volume it holds AT THE VISIT, so that trade is dropped
+    /// with the skipped window. That is the same limit the sliced sweep
+    /// states (a window ends when its key is visited), and the roll steps run
+    /// first on the idle arm to keep it short.
+    ///
+    /// Pre-sized like `dirty`: another ≈ 1.6 MB per family.
+    rolling: [Vec<ContractKey>; WINDOW_COUNT],
     non_monotonic: u64,
     at_capacity: u64,
     relatched: u64,
@@ -802,6 +836,7 @@ impl Family {
             // array literal because a `Vec` is not `Copy`.
             dirty: std::array::from_fn(|_| Vec::with_capacity(MAX_TRACKED_CONTRACTS)),
             in_flight: std::array::from_fn(|_| Vec::with_capacity(MAX_TRACKED_CONTRACTS)),
+            rolling: std::array::from_fn(|_| Vec::with_capacity(MAX_TRACKED_CONTRACTS)),
             non_monotonic: 0,
             at_capacity: 0,
             relatched: 0,
@@ -831,6 +866,10 @@ impl Family {
         // The in-flight half goes with it, for the same reason: a sliced
         // sweep that resumes after a reset must find nothing to visit.
         for window in &mut self.in_flight {
+            window.clear();
+        }
+        // And the rolling half, for the same reason (audit PR4b).
+        for window in &mut self.rolling {
             window.clear();
         }
         self.non_monotonic = 0;
@@ -1376,6 +1415,69 @@ impl VolumeLeaderboard {
         }
         // Drained, so this hands the CAPACITY back, not the contents.
         slot.dirty[idx] = pending;
+    }
+
+    /// Starts a SLICED roll of one cadence's baselines: swaps the cadence's
+    /// work list into the rolling slot, which [`Self::roll_step`] then visits
+    /// from the drain's idle arm. **O(1)** on the normal path — one exchange
+    /// of two pre-sized vectors (audit PR4b, 2026-09-26).
+    ///
+    /// `Inline` is the saturation fallback: the previous roll of this cadence
+    /// has not finished, which means the drain had no idle time for a whole
+    /// cadence period. The list is then rolled here, in one pass —
+    /// O(traded in the window) integer writes, no sort, no allocation — and
+    /// the caller counts it. Swapping anyway is not an option: the rolling
+    /// slot is not empty, and appending to it would be a copy of the same
+    /// size as the roll it replaces.
+    pub fn begin_roll(&mut self, family: OptionFamily, cadence: SnapshotCadence) -> RollBegin {
+        let Some(idx) = window_slot(cadence) else {
+            return RollBegin::Refused;
+        };
+        let slot = self.family_mut(family);
+        if slot.rolling[idx].is_empty() {
+            // Both vectors keep their capacity: the drained rolling list goes
+            // back as the empty work list, so the per-tick `push` never grows.
+            std::mem::swap(&mut slot.dirty[idx], &mut slot.rolling[idx]);
+            return RollBegin::Queued;
+        }
+        self.roll_baselines(family, cadence);
+        RollBegin::Inline
+    }
+
+    /// Whether any family has a sliced roll with keys still to visit.
+    #[must_use]
+    pub fn roll_pending(&self) -> bool {
+        [&self.index, &self.stock]
+            .iter()
+            .any(|family| family.rolling.iter().any(|list| !list.is_empty()))
+    }
+
+    /// Visits at most `budget` keys waiting on a rolling list, across every
+    /// family and cadence: clears each key's bit and rolls its baseline to
+    /// its current cumulative volume. Returns `true` once no rolling list has
+    /// a key left.
+    ///
+    /// **O(budget)** per call — one hash probe and two integer writes per key.
+    pub fn roll_step(&mut self, budget: usize) -> bool {
+        let mut visited = 0usize;
+        for slot in [&mut self.index, &mut self.stock] {
+            for idx in 0..WINDOW_COUNT {
+                while visited < budget {
+                    let Some(key) = slot.rolling[idx].pop() else {
+                        break;
+                    };
+                    visited = visited.saturating_add(1);
+                    // Gone only if a daily reset landed in between, and
+                    // `clear` empties this list with the map — defensive.
+                    let Some(tracked) = slot.volumes.get_mut(&key) else {
+                        continue;
+                    };
+                    tracked.dirty &= !(1u8 << idx);
+                    tracked.baseline[idx] = tracked.contract.volume;
+                }
+            }
+        }
+        !self.roll_pending()
     }
 
     /// Starts a SLICED sweep of one cadence: swaps the cadence's work list
@@ -2463,10 +2565,12 @@ mod tests {
         for (window, pending) in slot.dirty.iter().enumerate() {
             let bit = 1u8 << window;
             let mut seen = std::collections::HashSet::new();
-            // A key is on the work list OR on the in-flight list of a sliced
-            // sweep (audit PR4), never both and never twice.
+            // A key is on the work list, the in-flight list of a sliced
+            // sweep (audit PR4) or the rolling list of a sliced roll (audit
+            // PR4b) — exactly one of them, never twice.
             let in_flight = slot.in_flight.get(window).map_or(&[][..], Vec::as_slice);
-            for key in pending.iter().chain(in_flight) {
+            let rolling = slot.rolling.get(window).map_or(&[][..], Vec::as_slice);
+            for key in pending.iter().chain(in_flight).chain(rolling) {
                 assert!(
                     seen.insert(*key),
                     "{note}: {family:?} window {window} lists {key:?} twice — the lists \
@@ -2610,18 +2714,35 @@ mod tests {
             1,
             "only `begin_sweep` may move a work list into the in-flight slot"
         );
+        assert_eq!(
+            production
+                .matches("std::mem::swap(&mut slot.dirty[idx], &mut slot.rolling[idx]);")
+                .count(),
+            1,
+            "only `begin_roll` may move a work list into the rolling slot"
+        );
         // Same evasion, same close: the assertions above match one spelling,
         // so `slot.dirty[i]` or `slot.dirty[idx].drain(..)` would be a THIRD
         // consumer they cannot see. Pinning every access to a work-list slot
-        // catches any of them. The three are the take and the restore in
-        // `roll_baselines`, and the swap in `begin_sweep`.
+        // catches any of them. The four are the take and the restore in
+        // `roll_baselines`, the swap in `begin_sweep` and the swap in
+        // `begin_roll` (audit PR4b).
         assert_eq!(
             production.matches("slot.dirty[").count(),
-            3,
+            4,
             "a new access to a work-list slot appeared. Only `roll_baselines` (take, then \
-             restore) and `begin_sweep` (one swap) may touch one. A third consumer that \
-             drains without clearing the matching bits leaves contracts marked-but-\
-             unlisted, which is a trade silently folded into a later window"
+             restore), `begin_sweep` (one swap) and `begin_roll` (one swap) may touch one. \
+             Another consumer that drains without clearing the matching bits leaves \
+             contracts marked-but-unlisted, which is a trade silently folded into a later \
+             window"
+        );
+        // The rolling slot: `begin_roll` checks it is empty and swaps into
+        // it; `roll_step` pops from it. Nothing may PUSH into it.
+        assert_eq!(
+            production.matches("slot.rolling[").count(),
+            3,
+            "a new access to a rolling slot appeared; only `begin_roll` and `roll_step` \
+             may touch one"
         );
         // And the in-flight slot: `begin_sweep` checks it is empty and swaps
         // into it; `sweep_step` pops from it and reports whether it is empty.
@@ -2637,9 +2758,9 @@ mod tests {
             production
                 .matches("tracked.dirty &= !(1u8 << idx);")
                 .count(),
-            2,
-            "and each drain (`roll_baselines`, `sweep_step`) must clear the bit it \
-             consumes, or the contract stays marked with nothing on the list to visit it"
+            3,
+            "and each drain (`roll_baselines`, `sweep_step`, `roll_step`) must clear the bit \
+             it consumes, or the contract stays marked with nothing on the list to visit it"
         );
 
         // Scoped to the gauge macros, not to the bare label text — the
@@ -2919,6 +3040,117 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The sliced roll (audit PR4b) must leave every baseline exactly where
+    /// the one-pass `roll_baselines` leaves it, across several steps, and the
+    /// work-list invariant must hold before, during and after.
+    #[test]
+    fn test_begin_roll_then_roll_step_rolls_like_roll_baselines() {
+        // More contracts than one step visits, so the roll takes several calls.
+        let contracts: u64 = 1_300;
+        let budget = 512;
+        let seed = |lb: &mut VolumeLeaderboard| {
+            for id in 1..=contracts {
+                observe_no_receipt(lb, stock(id, 100, 1_000), OptionFamily::Stock);
+                observe_no_receipt(lb, stock(id, 100, 5_000), OptionFamily::Stock);
+            }
+        };
+        let mut inline = VolumeLeaderboard::new();
+        seed(&mut inline);
+        inline.roll_baselines(OptionFamily::Stock, S1);
+
+        let mut sliced = VolumeLeaderboard::new();
+        seed(&mut sliced);
+        assert_eq!(
+            sliced.begin_roll(OptionFamily::Stock, S1),
+            RollBegin::Queued
+        );
+        assert!(sliced.roll_pending(), "a queued roll is pending");
+        assert_dirty_invariant(&sliced, OptionFamily::Stock, "after begin_roll");
+        let mut steps = 0;
+        while !sliced.roll_step(budget) {
+            steps += 1;
+            assert_dirty_invariant(&sliced, OptionFamily::Stock, "mid roll");
+            assert!(steps < 100, "the roll must finish");
+        }
+        assert!(
+            steps >= 2,
+            "{contracts} keys at {budget} per step take several steps"
+        );
+        assert!(!sliced.roll_pending());
+        assert_dirty_invariant(&sliced, OptionFamily::Stock, "after the roll");
+
+        for lb in [&mut inline, &mut sliced] {
+            for id in 1..=contracts {
+                observe_no_receipt(lb, stock(id, 100, 5_000 + id as u32), OptionFamily::Stock);
+            }
+        }
+        let a = inline.rank(OptionFamily::Stock, S1, usize::MAX, lot1, all);
+        let b = sliced.rank(OptionFamily::Stock, S1, usize::MAX, lot1, all);
+        assert_eq!(
+            a, b,
+            "the sliced roll must rank exactly like the one-pass roll"
+        );
+        assert_eq!(a.len(), contracts as usize);
+        assert_eq!(
+            a.iter().map(|r| r.delta_units).max(),
+            Some(contracts as u32),
+            "each window measures only what traded after the roll"
+        );
+    }
+
+    /// A trade that lands while its key waits on the rolling list keeps the
+    /// key on ONE list, and a second roll of the same cadence before the
+    /// first finishes falls back to the one-pass roll (the saturation arm).
+    #[test]
+    fn test_begin_roll_falls_back_inline_while_the_last_roll_is_unfinished() {
+        let mut lb = VolumeLeaderboard::new();
+        observe_no_receipt(&mut lb, stock(1, 100, 1_000), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(1, 100, 2_000), OptionFamily::Stock);
+        assert_eq!(lb.begin_roll(OptionFamily::Stock, S1), RollBegin::Queued);
+
+        // Contract 1 trades again while waiting: its bit is still set, so it
+        // must not be pushed onto the work list a second time.
+        observe_no_receipt(&mut lb, stock(1, 100, 2_500), OptionFamily::Stock);
+        assert_dirty_invariant(&lb, OptionFamily::Stock, "trade while rolling");
+
+        // Contract 2 trades into the NEXT window's work list.
+        observe_no_receipt(&mut lb, stock(2, 100, 1_000), OptionFamily::Stock);
+        observe_no_receipt(&mut lb, stock(2, 100, 3_000), OptionFamily::Stock);
+        assert_eq!(
+            lb.begin_roll(OptionFamily::Stock, S1),
+            RollBegin::Inline,
+            "the rolling slot is busy, so the second roll runs in one pass"
+        );
+        assert_dirty_invariant(&lb, OptionFamily::Stock, "after the inline fallback");
+        assert!(
+            lb.roll_pending(),
+            "the first roll still has contract 1 to visit"
+        );
+        assert!(lb.roll_step(512));
+        assert_dirty_invariant(&lb, OptionFamily::Stock, "after the roll finished");
+
+        // Both baselines now sit at the volume they held when rolled, so a
+        // board taken now is empty.
+        assert!(
+            lb.rank(OptionFamily::Stock, S1, usize::MAX, lot1, all)
+                .is_empty(),
+            "both skipped windows must be dropped, not carried into the next board"
+        );
+    }
+
+    /// Nothing queued: the step reports done, and a cadence with no slot is
+    /// refused rather than rolled.
+    #[test]
+    fn test_roll_step_and_roll_pending_on_nothing_queued() {
+        let mut lb = VolumeLeaderboard::new();
+        assert!(!lb.roll_pending());
+        assert!(lb.roll_step(512));
+        assert!(
+            lb.roll_step(0),
+            "an empty queue is done even with no budget"
+        );
     }
 
     const S1: SnapshotCadence = SnapshotCadence::OneSecond;

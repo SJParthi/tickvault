@@ -1565,6 +1565,13 @@ pub struct LiveIngest {
     /// PR4, 2026-09-26). The cadence timer arms only queue a job here; see
     /// [`crate::top_volume_sweep`] for why and for what that costs.
     top_volume_sweep: crate::top_volume_sweep::TopVolumeSweep,
+    /// The catch-up seal sweep in progress, if any (audit PR4b, 2026-09-26).
+    /// The 5 s timer arm only sets this; the drain's idle arm advances it
+    /// [`CATCHUP_SEAL_STEP_SLOTS`] slots at a time.
+    catch_up: Option<CatchUpSweep>,
+    /// Timer fires that found the previous catch-up sweep still running.
+    catch_up_overruns: u64,
+    catch_up_overrun_counter: metrics::Counter,
     /// `true` while [`refold_wal_frames`] is re-folding a WAL backlog through
     /// this ingest. The ranking observer is SKIPPED for the duration.
     ///
@@ -1698,9 +1705,9 @@ impl LiveIngest {
     /// and the row projection run later in bounded steps from
     /// [`Self::step_top_volume_sweep`], on the drain's idle arm.
     ///
-    /// Outside the capture window it rolls the baselines instead, exactly as
-    /// before — O(traded) integer writes on a population that is near-empty
-    /// before 09:15.
+    /// Outside the capture window, and when the cadence's previous job is
+    /// still running, it queues a baseline roll instead (audit PR4b): also
+    /// O(1) here, with the keys visited from the idle arm.
     pub fn begin_top_volume_sweep(
         &mut self,
         now_ist_nanos: i64,
@@ -1714,14 +1721,12 @@ impl LiveIngest {
         ) {
             // Roll the baselines anyway. Ticks fold from the candle session
             // open (09:00) but this gate holds ranking to 09:15, and the
-            // baseline is otherwise rolled ONLY inside `rank` -- so the first
+            // baseline is otherwise rolled ONLY by a sweep -- so the first
             // in-window sweep would measure from a contract's first observe
-            // and report ~15 minutes of volume as one window. O(tracked)
-            // integer writes on a population that is near-empty before the
-            // window opens; no sort, no allocation.
-            for family in RANKED_OPTION_FAMILIES {
-                self.leaderboard.roll_baselines(family, cadence);
-            }
+            // and report ~15 minutes of volume as one window. Queued, not
+            // walked: O(1) here, the keys are visited from the idle arm
+            // (audit PR4b).
+            self.roll_top_volume_baselines(cadence);
             return;
         }
         // Two consumers of this pass now, and they are gated separately.
@@ -1767,15 +1772,13 @@ impl LiveIngest {
         // two windows' volume under one window's `ts`, beside a one-window
         // candle, and roughly double that row's `volume_percentage_change`
         // with nothing on the row to say so. A missing window is visible (the
-        // counter and the log below); a doubled one is not. O(traded in the
-        // skipped window) integer writes, no sort, and only on a deferral.
+        // counter and the log below); a doubled one is not. The roll is
+        // queued like the one above: O(1) here, visited from the idle arm.
         let in_flight = RANKED_OPTION_FAMILIES
             .iter()
             .any(|family| self.leaderboard.sweep_pending(*family, cadence));
         if in_flight || self.top_volume_sweep.is_busy(cadence) {
-            for family in RANKED_OPTION_FAMILIES {
-                self.leaderboard.roll_baselines(family, cadence);
-            }
+            self.roll_top_volume_baselines(cadence);
             let deferred = self.top_volume_sweep.record_deferred();
             if deferred.is_power_of_two() {
                 warn!(
@@ -1802,6 +1805,48 @@ impl LiveIngest {
                 wants_rows,
                 wants_candidates,
             });
+    }
+
+    /// Queues a baseline roll of one cadence for every ranked family: the
+    /// window is skipped rather than ranked (audit PR4b).
+    ///
+    /// **O(1)** on the normal path — one list swap per family; the keys are
+    /// visited by [`Self::step_idle_work`]. When the previous roll of the
+    /// same cadence has not finished, the drain had no idle time for a whole
+    /// cadence period, and the list is rolled in one pass instead —
+    /// O(traded in the window), counted on
+    /// [`crate::top_volume_sweep::TOP_VOLUME_ROLL_INLINE_COUNTER`] and logged
+    /// on powers of two.
+    fn roll_top_volume_baselines(
+        &mut self,
+        cadence: tickvault_storage::top_volume_rank_persistence::SnapshotCadence,
+    ) {
+        for family in RANKED_OPTION_FAMILIES {
+            if self.leaderboard.begin_roll(family, cadence)
+                == crate::volume_leaderboard::RollBegin::Inline
+            {
+                let inline = self.top_volume_sweep.record_inline_roll();
+                if inline.is_power_of_two() {
+                    warn!(
+                        code = ErrorCode::WsGapConnectionState.code_str(),
+                        counter = crate::top_volume_sweep::TOP_VOLUME_ROLL_INLINE_COUNTER,
+                        source = "top_volume_roll_inline",
+                        cadence = cadence.as_str(),
+                        inline,
+                        "top_volume: a baseline roll ran in one pass on the timer arm because \
+                         the previous roll of this cadence had not finished. The drain had no \
+                         idle time for a whole cadence period; no data is wrong, but the tick \
+                         loop paid the walk."
+                    );
+                }
+            }
+        }
+    }
+
+    /// Whether any sliced baseline roll still has keys to visit.
+    #[must_use]
+    pub fn top_volume_roll_pending(&self) -> bool {
+        self.leaderboard.roll_pending()
     }
 
     /// Whether a top-volume sweep is queued or running — the guard on the
@@ -2406,6 +2451,9 @@ impl LiveIngest {
                 crate::volume_leaderboard::MAX_TRACKED_CONTRACTS,
                 crate::depth20_ranked_steer::DEPTH20_EXIT_RANKS,
             ),
+            catch_up: None,
+            catch_up_overruns: 0,
+            catch_up_overrun_counter: metrics::counter!(CATCHUP_SEAL_OVERRUN_COUNTER),
             replaying_wal: false,
             top_volume: None,
         }
@@ -4300,19 +4348,135 @@ impl LiveIngest {
     /// # Complexity
     /// O(slots × TF). COLD — every [`CATCHUP_SEAL_INTERVAL`], never per tick.
     pub fn catch_up_seal(&mut self) -> (u64, u64) {
-        let cutoff = self
-            .aggregator
-            .watermark_secs()
-            .saturating_sub(CATCHUP_LATENESS_MARGIN_SECS);
+        let cutoff = self.catch_up_cutoff();
         if cutoff == 0 {
             return (0, 0);
         }
+        let (emitted, dropped, _next) = self.catch_up_seal_slots(cutoff, 0, usize::MAX);
+        (emitted, dropped)
+    }
+
+    /// `watermark − CATCHUP_LATENESS_MARGIN_SECS`, saturating at 0 (seal
+    /// nothing) before the session's watermark has moved.
+    fn catch_up_cutoff(&self) -> u32 {
+        self.aggregator
+            .watermark_secs()
+            .saturating_sub(CATCHUP_LATENESS_MARGIN_SECS)
+    }
+
+    /// Starts a sliced catch-up seal — the only part the drain's 5 s timer
+    /// arm pays, and it is **O(1)** (audit PR4b, 2026-09-26). The slots are
+    /// visited by [`Self::step_idle_work`], [`CATCHUP_SEAL_STEP_SLOTS`] at a
+    /// time. Until then this arm walked every slot × `TF_COUNT` in one go
+    /// (measured 9.67 ms at the 25,000 × 24 ceiling).
+    ///
+    /// A fire that finds the previous sweep still running does not restart
+    /// it: the sweep keeps its cursor and takes the newer cutoff, the slots it
+    /// already passed are sealed by the next sweep, and the overrun is
+    /// counted. Restarting would let a drain with little idle time revisit
+    /// the first slots forever and never reach the last ones.
+    pub fn begin_catch_up_seal(&mut self) {
+        let cutoff = self.catch_up_cutoff();
+        if cutoff == 0 {
+            return;
+        }
+        if let Some(sweep) = self.catch_up.as_mut() {
+            sweep.cutoff = sweep.cutoff.max(cutoff);
+            self.catch_up_overruns = self.catch_up_overruns.saturating_add(1);
+            self.catch_up_overrun_counter.increment(1);
+            if self.catch_up_overruns.is_power_of_two() {
+                warn!(
+                    code = ErrorCode::WsGapConnectionState.code_str(),
+                    counter = CATCHUP_SEAL_OVERRUN_COUNTER,
+                    overruns = self.catch_up_overruns,
+                    "candle catch-up: the 5 s sweep fired while the previous one was still \
+                     running. It continues with the newer cutoff; bars for quiet instruments \
+                     close up to one extra interval late. Sustained growth means the drain has \
+                     no idle time."
+                );
+            }
+            return;
+        }
+        self.catch_up = Some(CatchUpSweep {
+            cutoff,
+            next_slot: 0,
+            emitted: 0,
+            dropped: 0,
+        });
+    }
+
+    /// Whether any sliced idle work is queued: a baseline roll, a catch-up
+    /// seal or a top-volume sweep — the guard on the drain's idle arm.
+    #[must_use]
+    pub fn idle_work_pending(&self) -> bool {
+        self.top_volume_roll_pending() || self.catch_up.is_some() || self.top_volume_sweep_pending()
+    }
+
+    /// Runs ONE bounded step of the idle work, in priority order:
+    ///
+    /// 1. a baseline roll ([`crate::top_volume_sweep::TOP_VOLUME_ROLL_STEP_KEYS`]
+    ///    keys) — the cheapest, and the one whose delay drops trades;
+    /// 2. the catch-up seal ([`CATCHUP_SEAL_STEP_SLOTS`] slots) — candles
+    ///    are the primary data;
+    /// 3. the top-volume sweep ([`crate::top_volume_sweep::TOP_VOLUME_SWEEP_STEP_ROWS`] rows).
+    ///
+    /// # Complexity
+    /// **O(one step)** per call — the bound on how long a queued frame waits.
+    pub fn step_idle_work(&mut self) -> IdleStep {
+        if self.leaderboard.roll_pending() {
+            let _done = self
+                .leaderboard
+                .roll_step(crate::top_volume_sweep::TOP_VOLUME_ROLL_STEP_KEYS);
+            return IdleStep::default();
+        }
+        if self.catch_up.is_some() {
+            return IdleStep {
+                catch_up_done: self.step_catch_up_seal(),
+                ..IdleStep::default()
+            };
+        }
+        IdleStep {
+            sweep_done: self.step_top_volume_sweep(),
+            ..IdleStep::default()
+        }
+    }
+
+    /// One step of the running catch-up sweep. Returns the sweep's
+    /// `(emitted, dropped)` totals when this step finishes it.
+    fn step_catch_up_seal(&mut self) -> Option<(u64, u64)> {
+        let mut sweep = self.catch_up?;
+        let (emitted, dropped, next) =
+            self.catch_up_seal_slots(sweep.cutoff, sweep.next_slot, CATCHUP_SEAL_STEP_SLOTS);
+        sweep.emitted = sweep.emitted.saturating_add(emitted);
+        sweep.dropped = sweep.dropped.saturating_add(dropped);
+        sweep.next_slot = next;
+        if next >= self.aggregator.len() {
+            self.catch_up = None;
+            return Some((sweep.emitted, sweep.dropped));
+        }
+        self.catch_up = Some(sweep);
+        None
+    }
+
+    /// Seals at most `max_slots` aggregator slots from `from_slot` and hands
+    /// every bar to the seal writer. Returns `(emitted, dropped, next_slot)`.
+    ///
+    /// # Complexity
+    /// O(`max_slots` × TF). `usize::MAX` visits the whole book.
+    fn catch_up_seal_slots(
+        &mut self,
+        cutoff: u32,
+        from_slot: usize,
+        max_slots: usize,
+    ) -> (u64, u64, usize) {
         let mut emitted = 0u64;
         let mut dropped = 0u64;
         let mut rescued = 0u64;
         let sender = tickvault_storage::seal_writer_runner::global_seal_sender();
-        let bars = self.aggregator.catch_up_seal_all(
+        let (bars, next) = self.aggregator.catch_up_seal_slots(
             cutoff,
+            from_slot,
+            max_slots,
             |feed, security_id, segment_code, tf, state| {
                 // Every frame the fold produces is emitted. The enum carries
                 // exactly the nine native timeframes the operator asked for
@@ -4362,7 +4526,7 @@ impl LiveIngest {
         debug_assert_eq!(
             bars as u64,
             emitted.saturating_add(dropped),
-            "every bar catch_up_seal_all produced must be accounted as emitted or dropped"
+            "every bar catch_up_seal_slots produced must be accounted as emitted or dropped"
         );
         self.seals_emitted = self.seals_emitted.saturating_add(emitted);
         self.seals_dropped = self.seals_dropped.saturating_add(dropped);
@@ -4376,7 +4540,7 @@ impl LiveIngest {
         if rescued > 0 {
             counters().seals_rescued.increment(rescued);
         }
-        (emitted, dropped)
+        (emitted, dropped, next)
     }
 
     /// Instruments the gap detector is tracking. O(1).
@@ -5788,6 +5952,40 @@ pub const CATCHUP_SEAL_INTERVAL_SECS: u64 = 5;
 const CATCHUP_SEAL_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(CATCHUP_SEAL_INTERVAL_SECS);
 
+/// Aggregator slots one step of the sliced catch-up seal visits (audit PR4b,
+/// 2026-09-26). Each slot is `TF_COUNT` cell checks at the measured ~16 ns
+/// per cell, so a step that seals nothing is tens of microseconds — the
+/// longest a queued frame waits behind it. A step that seals a bar also pays
+/// one channel send per bar.
+pub const CATCHUP_SEAL_STEP_SLOTS: usize = 256;
+
+/// Counts catch-up timer fires that found the previous sliced sweep still
+/// running. The running sweep keeps its cursor and takes the newer cutoff;
+/// the slots it already visited are sealed by the next sweep.
+pub const CATCHUP_SEAL_OVERRUN_COUNTER: &str = "tv_candle_catch_up_overrun_total";
+
+/// A catch-up seal sweep part-way through the aggregator's slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CatchUpSweep {
+    /// Seal buckets whose exclusive end is at or before this second.
+    cutoff: u32,
+    /// The next aggregator slot to visit.
+    next_slot: usize,
+    /// Bars handed to the seal writer so far in this sweep.
+    emitted: u64,
+    /// Bars lost so far in this sweep (both disk tiers refused them).
+    dropped: u64,
+}
+
+/// What one call of [`LiveIngest::step_idle_work`] finished, if anything.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct IdleStep {
+    /// A top-volume job that this step finished.
+    pub sweep_done: Option<crate::top_volume_sweep::SweepDone>,
+    /// `(emitted, dropped)` totals of a catch-up sweep this step finished.
+    pub catch_up_done: Option<(u64, u64)>,
+}
+
 /// How far BEHIND the watermark the catch-up cutoff sits.
 ///
 /// The watermark is the highest FOLD-CLOCK second across ALL instruments, and
@@ -6812,24 +7010,12 @@ async fn run_frame_drain(
             // in source order but with no `biased` dependency between them —
             // they touch disjoint state (aggregator vs detector) and neither
             // starves the other, because both are timers, not a queue.
+            //
+            // Since audit PR4b (2026-09-26) this arm only STARTS the sweep —
+            // O(1). The slots are visited from the idle arm below, a bounded
+            // step at a time, and the sweep's totals are reported there.
             _ = catchup_timer.tick() => {
-                let (emitted, dropped) = ingest.catch_up_seal();
-                if emitted > 0 || dropped > 0 {
-                    publish_fold_depth(&ingest);
-                }
-                if dropped > 0 {
-                    // Same class as a per-tick seal drop: the candle was
-                    // computed and thrown away. Counted in the shared totals
-                    // by `catch_up_seal`; named here so the operator learns
-                    // WHICH path lost it.
-                    warn!(
-                        code = ErrorCode::WsGapConnectionState.code_str(),
-                        emitted,
-                        dropped,
-                        "catch-up seal dropped {dropped} computed candle(s) — the seal \
-                         writer was absent or its queue was full"
-                    );
-                }
+                ingest.begin_catch_up_seal();
             }
             // The detector's read-out. Until 2026-08-12 the lane fed this
             // detector on every tick and never asked it anything, so a
@@ -7431,13 +7617,37 @@ async fn run_frame_drain(
             // spends one unit per step and returns Pending when the budget is
             // gone, which makes the whole select yield and re-poll the frame
             // arm first.
-            () = tokio::task::coop::consume_budget(), if ingest.top_volume_sweep_pending() => {
-                if let Some(done) = ingest.step_top_volume_sweep() {
+            //
+            // Audit PR4b widened it from the top-volume sweep to all sliced
+            // idle work — the baseline rolls and the catch-up seal too — one
+            // bounded step per call, in the priority `step_idle_work` states.
+            () = tokio::task::coop::consume_budget(), if ingest.idle_work_pending() => {
+                let step = ingest.step_idle_work();
+                if let Some(done) = step.sweep_done {
                     if let Some(slot) = done.cadence.slot() {
                         snapshot_rows[slot] =
                             snapshot_rows[slot].saturating_add(done.appended as u64);
                     }
                     snapshot_refused = snapshot_refused.saturating_add(done.refused as u64);
+                }
+                if let Some((emitted, dropped)) = step.catch_up_done {
+                    if emitted > 0 || dropped > 0 {
+                        publish_fold_depth(&ingest);
+                    }
+                    if dropped > 0 {
+                        // Same class as a per-tick seal drop: the candle was
+                        // computed and thrown away. Counted in the shared
+                        // totals by the sweep; named here so the operator
+                        // learns WHICH path lost it.
+                        error!(
+                            code = ErrorCode::WsGapConnectionState.code_str(),
+                            emitted,
+                            dropped,
+                            "catch-up seal dropped {dropped} computed candle(s) — the seal \
+                             writer was absent or its queue was full and both disk tiers \
+                             refused them"
+                        );
+                    }
                 }
             }
         }
@@ -19584,6 +19794,124 @@ mod tests {
         );
     }
 
+    /// Folds one ticker tick per instrument at `ts`, then one tick for a
+    /// separate instrument far enough later that the catch-up cutoff clears
+    /// every bucket the first ticks opened.
+    fn catch_up_book(instruments: u32) -> LiveIngest {
+        let mut ingest =
+            LiveIngest::new(TickWriter::for_test(Feed::Dhan), instruments as usize + 1);
+        let ts = 1_779_355_000;
+        for sid in 1..=instruments {
+            let packet = ticker_packet(1_000 + sid, 100.0 + sid as f32, ts);
+            let ParsedFrame::Tick(tick) =
+                dispatch_frame(&packet, i64::from(ts) * 1_000_000_000).expect("parse")
+            else {
+                panic!("expected a tick");
+            };
+            ingest.ingest_tick(&tick, 7, u64::from(ts) * 1_000);
+        }
+        let later = ts + CATCHUP_LATENESS_MARGIN_SECS + 180;
+        let packet = ticker_packet(999, 50.0, later);
+        let ParsedFrame::Tick(tick) =
+            dispatch_frame(&packet, i64::from(later) * 1_000_000_000).expect("parse")
+        else {
+            panic!("expected a tick");
+        };
+        ingest.ingest_tick(&tick, 7, u64::from(later) * 1_000);
+        ingest
+    }
+
+    /// Audit PR4b: the drain's timer arm now only starts the catch-up seal,
+    /// and the idle arm runs it in steps. The steps must seal exactly as
+    /// many bars as the one-call sweep, and report the totals once, when the
+    /// last step finishes.
+    #[test]
+    fn test_begin_catch_up_seal_then_step_idle_work_seals_like_catch_up_seal() {
+        // More instruments than one step visits, so the sweep takes several.
+        let instruments = (CATCHUP_SEAL_STEP_SLOTS * 2 + 17) as u32;
+        let mut whole = catch_up_book(instruments);
+        let (emitted, dropped) = whole.catch_up_seal();
+        let expected = emitted + dropped;
+        assert!(
+            expected >= u64::from(instruments),
+            "the fixture must seal at least one bar per early instrument, got {expected}"
+        );
+
+        let mut sliced = catch_up_book(instruments);
+        assert!(
+            !sliced.idle_work_pending(),
+            "nothing queued before the timer fires"
+        );
+        sliced.begin_catch_up_seal();
+        assert!(
+            sliced.idle_work_pending(),
+            "the timer arm must queue the sweep, not run it"
+        );
+        let mut reported = None;
+        let mut steps = 0usize;
+        while sliced.idle_work_pending() {
+            steps += 1;
+            assert!(steps < 100, "the sliced catch-up must finish");
+            let step = sliced.step_idle_work();
+            assert!(step.sweep_done.is_none(), "no top-volume job was queued");
+            if let Some(done) = step.catch_up_done {
+                assert!(reported.is_none(), "the totals are reported exactly once");
+                reported = Some(done);
+            }
+        }
+        assert!(
+            steps >= 3,
+            "{instruments} slots at {CATCHUP_SEAL_STEP_SLOTS} per step"
+        );
+        let (e, d) = reported.expect("the last step reports the totals");
+        assert_eq!(
+            e + d,
+            expected,
+            "sliced and whole sweeps seal the same bars"
+        );
+        assert_eq!(
+            sliced.catch_up_seal(),
+            (0, 0),
+            "a finished sliced sweep leaves nothing for the next one to seal"
+        );
+    }
+
+    /// Before the watermark moves the cutoff is 0: starting a sweep queues
+    /// nothing, so the idle arm stays asleep.
+    #[test]
+    fn test_idle_work_pending_stays_false_before_the_watermark_moves() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        ingest.begin_catch_up_seal();
+        assert!(!ingest.idle_work_pending());
+        assert_eq!(ingest.step_idle_work(), IdleStep::default());
+    }
+
+    /// A fire that finds the previous sweep still running keeps its cursor,
+    /// takes the newer cutoff and counts the overrun, rather than restarting
+    /// from slot 0.
+    #[test]
+    fn test_begin_catch_up_seal_during_a_running_sweep_keeps_the_cursor() {
+        let instruments = (CATCHUP_SEAL_STEP_SLOTS * 2) as u32;
+        let mut ingest = catch_up_book(instruments);
+        ingest.begin_catch_up_seal();
+        let _ = ingest.step_idle_work();
+        let running = ingest.catch_up.expect("one step does not finish the sweep");
+        assert_eq!(running.next_slot, CATCHUP_SEAL_STEP_SLOTS);
+
+        ingest.begin_catch_up_seal();
+        let after = ingest.catch_up.expect("still running");
+        assert_eq!(after.next_slot, running.next_slot, "the cursor is kept");
+        assert!(
+            after.cutoff >= running.cutoff,
+            "the cutoff never moves back"
+        );
+        assert_eq!(ingest.catch_up_overruns, 1);
+        while ingest.idle_work_pending() {
+            let _ = ingest.step_idle_work();
+        }
+        assert!(ingest.catch_up.is_none());
+    }
+
     /// The catch-up seal is wired into the drain loop and does not ride the
     /// flush timer.
     ///
@@ -19600,6 +19928,9 @@ mod tests {
         for needle in [
             "let mut catchup_timer",
             "catchup_timer.tick()",
+            // The timer arm starts the sliced sweep (audit PR4b); the
+            // shutdown path still seals the whole book in one call.
+            "ingest.begin_catch_up_seal()",
             "ingest.catch_up_seal()",
         ] {
             assert!(
@@ -24530,8 +24861,7 @@ mod late_seed_tests {
         }
         // The idle arm is the LAST arm of the select: under `biased;` that is
         // what makes it yield to every frame, timer and seed.
-        let idle =
-            "() = tokio::task::coop::consume_budget(), if ingest.top_volume_sweep_pending() =>";
+        let idle = "() = tokio::task::coop::consume_budget(), if ingest.idle_work_pending() =>";
         let idle_at = drain.find(idle).expect("the sweep must have an idle arm");
         let after = &drain[idle_at..];
         let select_end = after
@@ -24543,9 +24873,33 @@ mod late_seed_tests {
             "no select arm may follow the sweep's idle arm"
         );
         assert!(
-            after[..select_end].contains("ingest.step_top_volume_sweep()"),
-            "the idle arm advances the sweep by one step"
+            after[..select_end].contains("ingest.step_idle_work()"),
+            "the idle arm advances the sliced work by one step"
         );
+        // Audit PR4b: the catch-up timer arm only STARTS its sweep. A body
+        // that sealed the book inline would stall frame reads for every
+        // slot x TF again (9.67 ms measured at the ceiling).
+        let catch_up_arm = drain
+            .split_once("_ = catchup_timer.tick() =>")
+            .expect("the catch-up timer has an arm")
+            .1;
+        let catch_up_arm = catch_up_arm
+            .split_once("\n            }\n")
+            .map_or(catch_up_arm, |(body, _)| body);
+        assert!(
+            catch_up_arm.contains("ingest.begin_catch_up_seal();"),
+            "the catch-up arm must only start its sweep"
+        );
+        for forbidden in [
+            "ingest.catch_up_seal()",
+            "catch_up_seal_all",
+            "step_idle_work",
+        ] {
+            assert!(
+                !catch_up_arm.contains(forbidden),
+                "the catch-up arm must not seal inline (found `{forbidden}`)"
+            );
+        }
     }
 
     /// Depth-200 steering reads the 3-SECOND board for the FIRST list of the
@@ -24905,7 +25259,7 @@ mod depth_rebalance_wiring_tests {
     /// Outside the capture window the timer arm rolls baselines and queues
     /// nothing, so the idle arm never wakes before 09:15.
     #[test]
-    fn test_begin_top_volume_sweep_outside_the_window_queues_nothing() {
+    fn test_begin_top_volume_sweep_outside_the_window_leaves_only_top_volume_roll_pending() {
         let _serial = lock_published_views();
         let day: i64 = 1_779_321_600;
         // 08:00 IST in the fixture's clock: day + 34,000 s is inside the
@@ -24920,6 +25274,17 @@ mod depth_rebalance_wiring_tests {
             !ingest.top_volume_sweep_pending(),
             "no sweep may be queued outside the capture window"
         );
+        // Audit PR4b: the baselines are rolled from the idle arm, not walked
+        // on the timer arm. The fixture contract traded, so a roll is queued,
+        // and the idle steps finish it without queuing a sweep.
+        assert!(
+            ingest.top_volume_roll_pending(),
+            "the out-of-window fire must queue a baseline roll"
+        );
+        while ingest.idle_work_pending() {
+            assert_eq!(ingest.step_idle_work(), IdleStep::default());
+        }
+        assert!(!ingest.top_volume_roll_pending());
     }
 
     /// `step_top_volume_sweep` runs the queued job to a `SweepDone` carrying
