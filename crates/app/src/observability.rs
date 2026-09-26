@@ -847,6 +847,17 @@ mod tests {
         let (writer, guard) = init_lossy_non_blocking(std::io::sink(), "test_sink");
         register_log_drop_counter("test_sink_again", &writer);
         publish_log_drop_counters();
+        {
+            let sinks = LOG_DROP_COUNTERS.lock().expect("registry lock");
+            let entry = sinks
+                .iter()
+                .find(|(name, _, _)| *name == "test_sink_again")
+                .expect("registered sink is tracked");
+            // Nothing was written, so nothing was dropped and the
+            // last-published total stays at zero.
+            assert_eq!(entry.2, 0);
+            assert_eq!(entry.1.dropped_lines(), 0);
+        }
         drop(guard);
     }
 
