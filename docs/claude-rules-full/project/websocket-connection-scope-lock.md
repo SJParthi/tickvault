@@ -1,0 +1,8205 @@
+# WebSocket Connection Scope Lock — Operator Lock 2026-05-15
+
+> **⚠ DHAN LIVE WS RETIRED 2026-07-13 (operator directive — Phase A banner; FULL AMENDMENT: the "2026-07-13 Amendment" §-section below):** the Dhan main-feed live WebSocket is RETIRED. Operator verbatim: *"now remove this entire Dhan live websocket feed instruments subscription even entire live websocket feed itself... As of now only Groww and Dhan historical api pull as we discussed last night along with option chain."* Rationale verbatim: *"when we checked the live websocket feed candles and historical data api candles for Dhan has a massive major mismatches... that's why I want to remove this. For Groww let us have live websocket feed api as of now."* (Both operator 2026-07-13, relayed verbatim via the coordinator session.) Effect: `dhan_enabled = false` in base + production config; the PR-E runtime-toggle **ON-half is REVOKED** (a runtime Dhan enable is refused API-side with 409 — re-enable requires a config change + restart + a fresh dated quote); **Groww is the sole live feed**; Dhan is retained for REST pulls only (`spot_1m_rest` / `option_chain_1m` / historical per `no-rest-except-live-feed-2026-06-27.md` §8) **plus the order-update WS — KEPT functional-dormant, rewired into `dhan_rest_stack` (operator Q4-i "agreed dude" ruling, 2026-07-13 — supersedes this banner's original "pending a separate operator decision" wording; the rewire lands in Phase C — see the amendment §A below)**. Lock semantics of the Dhan REST-only stack: `dual-instance-lock-2026-07-04.md` §3.5.
+>
+> **⚠ ALLOWED-INSTRUMENTS SUPERSEDED 2026-05-27 by [`daily-universe-scope-expansion-2026-05-27.md`](./daily-universe-scope-expansion-2026-05-27.md):** main-feed subscription expanded from 4 IDX_I SIDs (`LOCKED_UNIVERSE`) to ~250 daily-fetched SIDs (all NSE indices + 1 BSE SENSEX + unique F&O underlyings); all in Quote mode (was Ticker for IDX_I). `SubscriptionScope::Indices4Only` retires; replaced by `SubscriptionScope::DailyUniverse`. The 2-WebSocket lock itself (1 main-feed + 1 order-update) is UNCHANGED. Contents below retained as 2026-05-15 historical audit.
+>
+> **⚠ SECOND-FEED EXTENSION 2026-06-19 by [`groww-second-feed-scope-2026-06-19.md`](./groww-second-feed-scope-2026-06-19.md):** the 2-**Dhan**-WebSocket lock below is UNCHANGED. The operator authorized adding **GROWW** as an independent, **default-OFF** second market-data feed (feed #2) under a per-feed enable/disable contract. Groww is **native tickvault Rust** (brutex is reference only — no code pulled) reusing the same WAL/ring/spill/DLQ/aggregator chain; it adds NO Dhan connection and touches NO Dhan code. See that file for the verbatim authorization + full contract.
+>
+> **⚠ DHAN RUNTIME-TOGGLE AUTHORIZED 2026-06-21 (PR-E):** the **count + scope** of Dhan connections is UNCHANGED (still exactly 1 main-feed + 1 order-update, same endpoints, same locked universe). What changed: Dhan is no longer *config+restart only* — it is now **runtime enable/disable-able** from the feed-control webpage, exactly like Groww. Operator verbatim 2026-06-21: *"if I want to switch off or on dhan also it should be accepted right dude"* + (AskUserQuestion) **"Fully disconnect Dhan"** = OFF closes the Dhan WS(es) + stops storing; ON reconnects + re-subscribes (via the existing `SubscribeRxGuard` + dormant-reconnect machinery). Implementation: an `Arc<AtomicBool> dhan_enabled` flag (sourced from `FeedRuntimeState`) is read by the Dhan connection read/reconnect loop — OFF → close + dormant-idle polling the flag; ON → reconnect. **Safety guard (operator-approved 2026-06-21):** Dhan runtime-disable is allowed ONLY while no real orders are live (`dry_run = true` / no open orders+positions); once live trading is on, the toggle REFUSES to disable Dhan so the system can never be blinded mid-trade. This preserves the original "primary trading feed" safety intent that made Dhan config+restart-only. This authorization changes ONLY the lifecycle (start/stop), NOT the 2-connection lock, the endpoints, or the universe.
+>
+> **⚠ 2026-07-04 OPERATOR UPDATE — FEED TOGGLE BEARER-GATED IN ALL MODES:** the mutating `POST /api/feeds/{feed}` now requires **bearer auth REGARDLESS of trading mode** — the 2026-06-23 (PR-E lineage, AskUserQuestion "tokenless toggle in dev") carve-out that made the toggle PUBLIC when `feed_toggle_public = true` (dry-run/sandbox) is **RETIRED**. Operator verbatim 2026-07-04: *"whicghever is recommended go ahea dudde okay?"* — given in direct response to the recommendation to bearer-gate the publicly-funnelled tokenless feed toggle (the 3001 Tailscale funnel made the tokenless dry-run toggle a feed-disable DoS surface on the public internet; adversarial re-review 2026-07-04, HIGH). Effect: `crates/api/src/lib.rs::build_router_with_auth` places `POST /api/feeds/{feed}` in the bearer-protected router **UNCONDITIONALLY**; the `feed_toggle_public` parameter is accepted-but-ignored (kept only to avoid an 11-call-site signature cascade — it changes NOTHING). Localhost dry-run toggling now uses the SAME token as live mode: fetch it via `aws ssm get-parameter --name /tickvault/<env>/api/bearer-token --with-decryption --query Parameter.Value --output text` and paste it into the `/feeds` page token field (the page already sends `Authorization: Bearer <token>` from sessionStorage — no UI change needed), or curl with the 0600 header-file pattern consistent with `scripts/tv-tunnel/doctor.sh`: `HDR="$(umask 077 && mktemp)"; printf 'Authorization: Bearer %s\n' "$TOK" >"$HDR"; curl -H @"$HDR" -X POST http://localhost:3001/api/feeds/groww -H 'content-type: application/json' -d '{"enabled":true}'; rm -f "$HDR"` (header FILE, never argv — no `ps`/cmdline leak). The read-only `GET /api/feeds` + `GET /api/feeds/health` stay PUBLIC (2026-06-23 "public read, authed toggle" — the READ half of that ruling is unchanged); the Dhan-disable safety gate (`can_disable_dhan`) is unchanged. Ratchets: `crates/api/src/lib.rs` tests `test_feeds_post_requires_auth_401_without_token_in_both_modes` + `test_feeds_post_with_valid_token_not_401_in_both_modes`.
+>
+> **⚠ FUTIDX-4 EXTENSION 2026-07-08 by
+> [`daily-universe-scope-expansion-2026-05-27.md`](./daily-universe-scope-expansion-2026-05-27.md) §36:**
+> the single main-feed conn additionally subscribes ALL available monthly-expiry index-futures
+> contracts of the 4 underlyings (§36.7, 2026-07-10; typically ~12, envelope ≤24;
+> NIFTY/BANKNIFTY/MIDCPNIFTY = NSE_FNO, SENSEX = BSE_FNO; nearest expiry first; NEVER rolls;
+> Quote mode). The 2-WebSocket lock is UNCHANGED. The "Index F&O full-chain" ban below still
+> holds — monthly futures serials only, never an options chain. `should_subscribe_index_derivatives`
+> remains `false` FOREVER (the FUTIDX path is the DailyUniverse `IndexFuture` role, not that
+> legacy gate). OPTIDX/FUTSTK/OPTSTK remain forbidden. Operator verbatim 2026-07-08: *"for both
+> dhan and groww we need to add futures and those also should be subscribed along with this,
+> especially only for nifty banknifty and sensex nifty midcap."* Operator verbatim 2026-07-10
+> (relayed via the coordinator session): *"instead of only one current month futures contracts
+> just take all the futures of these indices — I mean take all available applicable months
+> futures."*
+>
+> **Authority:** CLAUDE.md > `operator-charter-forever.md` §I > this file > defaults.
+> **Scope:** PERMANENT. Every Phase. Every PR. Every future Claude/Cowork session.
+> **Operator-locked:** 2026-05-15 (verbatim quote below).
+> **Auto-load trigger:** Always loaded (path is in `.claude/rules/project/`).
+
+---
+
+> **[ARCHIVED 2026-07-20]** 2026-05-15 historical body (verbatim demand, allowed-set/FORBIDS tables, reconnect parity, mechanical guards, REJECT list, re-approval protocol, auto-driver — all superseded by the 2026-07-13/2026-07-15 amendments; retained as historical audit) — moved verbatim to `docs/rules-archive/websocket-connection-scope-lock-archive.md` (context-size incident; content unchanged).
+
+## 2026-07-13 Amendment — Dhan live main-feed RETIRED; order-update WS functional-dormant; Groww sole live feed
+
+> **Authority for this section:** the four verbatim operator quotes of 2026-07-13
+> (relayed via the coordinator session), preserved exactly:
+>
+> **Q1:** "now remove this entire Dhan live websocket feed instruments subscription even
+> entire live websocket feed itself... As of now only Groww and Dhan historical api pull as
+> we discussed last night along with option chain."
+>
+> **Q2:** "when we checked the live websocket feed candles and historical data api candles
+> for Dhan has a massive major mismatches... that's why I want to remove this. For Groww
+> let us have live websocket feed api as of now. But for Dhan as we discussed last night
+> only those should be needed and included [the REST pulls: spot 1m per minute + option
+> chain + historical]."
+>
+> **Q3:** "Just Dhan live websocket feed instruments download — I mean the entire process
+> completely related to Dhan live websocket feed itself should be switched off entirely or
+> removed." (+ verbatim intent: "hereafter no Dhan instrument download/parsing — just
+> direct hardcoded security IDs passed to spot 1m and option chain.")
+>
+> **Q4:** "agreed dude" — agreement to (i) the order-update WS rewire into
+> `dhan_rest_stack` (functional-dormant), (ii) tick-gap detector + WS-GAP-06 deletion
+> (the Groww feed-stall watchdog owns stall detection), (iii) `SubscriptionScope` enum
+> deletion via THIS rule edit.
+
+### §A. The new LOCKED state (supersedes the 2026-05-15 "complete allowed set" table)
+
+| Connection | State (2026-07-13) | Detail |
+|---|---|---|
+| **Dhan main-feed live WS** (`wss://api-feed.dhan.co`) | **RETIRED — deletion authorized** | Phase A (PR #1496) flipped `dhan_enabled = false` (base + production), revoked the PR-E runtime ON-half (API-side 409), and brought up the REST-only stack (`crates/app/src/dhan_rest_stack.rs`). The Phase C code PRs DELETE the lane: WS pool, subscription planner, `SubscriptionScope` enum, daily-universe fetch chain, tick-gap detector. Re-introduction requires a fresh dated operator quote HERE first (§D). |
+| **Dhan order-update WS** (`wss://api-order-update.dhan.co`) | **SPAWN RETIRED 2026-07-14 (module RETAINED DORMANT)** — supersedes the Q4-i functional-dormant KEEP | Per the §A.1 2026-07-14 subsection below: the `dhan_rest_stack` Phase 5a spawn is DELETED — no process opens this socket anymore. The core module `crates/core/src/websocket/order_update_connection.rs` (+ its unit tests) is RETAINED DORMANT for the future live-trading re-wire: re-spawning it OR deleting the module each requires a fresh dated operator quote HERE first. Historical Q4-i context: it was rewired into `dhan_rest_stack` by PR-C1 (2026-07-13), connected + authenticated, events counted-then-DISCARDED (no WAL, no OMS) — a daily socket to a demonstrably RST-flaky Dhan endpoint that protected nothing while dry_run=true, and the stack's ONLY HIGH-page noise source (WS-GAP-10). Its WAL replay staging (`ws_type=order_update`) is process-global and unaffected. |
+| **Groww live feed** (native NATS-over-WS, 1 connection) | **THE SOLE LIVE MARKET-DATA FEED** | Per `groww-second-feed-scope-2026-06-19.md` (contract unchanged) + `groww-scale-aws-lockout-2026-07-06.md` (1 connection). Same WAL→ring→spill→DLQ→aggregator chain, rows tagged `feed='groww'`. |
+| **Dhan REST retained surface** | KEPT (not a WS) | Token/auth stack + per-minute `spot_1m_rest` + per-minute `option_chain_1m` (+ probe) + historical, per `no-rest-except-live-feed-2026-06-27.md` §8; SIDs are the HARDCODED `SPOT_1M_REST_INDICES` (NIFTY=13, BANKNIFTY=25, SENSEX=51 — `constants.rs`), per Q3 verbatim intent. Lock semantics: `dual-instance-lock-2026-07-04.md` §3.5. |
+| **GDF (feed #3)** | Separate lock — NOT governed here | `gdf-third-feed-scope-2026-07-13.md` (default OFF, trial-first). This amendment deliberately leaves the pluggable seam clean for it: `FeedsConfig`, feed-in-key shared tables, WAL/ring/spill/aggregator are all UNTOUCHED by the Dhan deletions. |
+
+**Total live market-data WebSocket connections: 1 (Groww).** Total Dhan WebSocket
+connections: **TODAY (post-Phase-A): 0 · AFTER the Phase C rewire: ≤1** (order-update,
+functional-dormant). The 2026-05-15 "two Dhan phone lines" lock text below is retained
+as historical audit; THIS table is the effective contract.
+
+> Footnote (tense honesty): the order-update WS is spawned today ONLY from the Dhan-gated
+> fast crash-recovery arm + `start_dhan_lane` — both OFF with `dhan_enabled = false` — so
+> the live Dhan WS count is 0 until the Phase C rewire spawns it from `dhan_rest_stack`
+> (functional-dormant, ≤1).
+>
+> **2026-07-13 PR-C1 note (Q4-i rewire SHIPPED):** `dhan_rest_stack` now spawns the
+> order-update WS (functional-dormant — Phase 5a, after the family-claim tripwire), so a
+> dhan-off boot opens **≤1 Dhan WS (order-update only)**; the legacy fast-arm/lane spawn
+> sites remain dead code until the Phase C2 deletion, after which the stack is the sole
+> call site. **Dormancy honesty (2026-07-13, PR-C1 round-2):** while functionally
+> dormant, incoming order-update frames are parsed, counted
+> (`tv_order_update_dormant_events_total`) and DISCARDED — no WAL capture, no OMS
+> consumer; durable order-event capture returns with live trading (the OMS wiring), and
+> boot-staged order-update WAL segments remain undrained on dhan-off boots (pre-existing
+> Phase A residual, C2 target).
+>
+> **2026-07-14 Amendment (order-runtime dry-run PR — SOCKET-FREE under the same-day
+> §A.1 noise lock):** with `[order_runtime].enabled = true` (base.toml ON; the serde
+> default stays OFF) the dhan-OFF REST stack spawns the DRY-RUN ORDER RUNTIME
+> (`.claude/rules/project/order-runtime-dryrun.md`) — a paper OMS + RiskEngine fed by
+> paper fills and Groww marks, `dry_run` hard-true, ZERO live orders. It opens NO Dhan
+> WebSocket and performs NO order-update WAL capture/drain: the runtime's order-update
+> broadcast channel is created with ZERO producers, honoring the §A.1 spawn retirement.
+> The LIVE RE-ARM is one quoted follow-up unit — (1) the order-update socket spawn with
+> the runtime consumer wired, (2) durable WAL frame capture + the boot drain/conditional
+> confirm, (3) the two CloudWatch order-update alarms §A.1 deleted — re-armed together
+> only after a fresh dated operator quote lands in
+> `dhan-rest-only-noise-lock-2026-07-14.md` §3 + §A.1 here. Ratchets:
+> `test_rest_stack_spawns_no_order_update_ws_and_no_canary` (the socket ban) +
+> `test_rest_stack_wires_order_runtime` (the socket-free/WAL-free runtime shape).
+
+### §A.1 — 2026-07-14 subsection: Dhan REST-only NOISE lock (order-update spawn retired; Dhan alert surface narrowed to 4)
+
+**The verbatim operator demand (2026-07-14, relayed verbatim via the coordinator
+session — preserve exactly, expletives included):**
+
+> "for Dhan except spot 1m and option chain nothing else should work… these fucking
+> issues of mid profile and all other fucking issues of Dhan should be entirely
+> removed… always make the telegram messages/notifications cleaner, always mention
+> precisely which broker."
+
+This quote is exactly the class of fresh dated quote the pre-2026-07-14 §D REJECT row
+("Removes the order-update WS instead of rewiring it…") demanded — it SUPERSEDES the
+Q4-i functional-dormant ruling for the SPAWN:
+
+1. **The `dhan_rest_stack` Phase 5a order-update spawn is RETIRED** (with its dormant
+   drain task, auth-Telegram listener, ws_event_audit consumer wiring, and the two
+   CloudWatch alarms `tv-<env>-order-update-ws-inactive` +
+   `tv-<env>-order-update-reconnect-storm`). Zero Dhan WebSocket connections exist on
+   any boot path until live trading re-wires it.
+2. **The core module `order_update_connection.rs` is RETAINED DORMANT** (its unit
+   tests stay) — the live-trading re-wire restores the spawn from git history. A fresh
+   dated quote is required HERE first to re-spawn it OR to delete the module.
+3. The full Dhan noise contract (the 4-item alert set, the profile/canary/no-tick/
+   fast-boot-validation/token-gauge deletions) lives in
+   `.claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md`.
+
+The §A table's order-update row above is edited in place per house style; the
+"AFTER the Phase C rewire: ≤1" total in the paragraph below the table reads **0**
+as of 2026-07-14 (the rewire's spawn is retired; the module is dormant code).
+
+### §B. What the Phase C deletion PRs MAY remove (authorized by Q1/Q3/Q4; consumer map Verified 2026-07-13)
+
+Per the Phase B dependency map (`(security_id, exchange_segment)` consumer analysis, every
+row Verified with file:line evidence):
+
+1. **The Dhan main-feed WS lane:** connection pool, per-slot supervised loops, subscription
+   builder/dispatcher, `SubscribeRxGuard`, the lane FSM (`LaneState` / `start_dhan_lane` /
+   `stop_dhan_lane` / `run_dhan_lane_runtime`), the pool watchdog, the lane-owned SLO
+   publisher wiring, WAL live-feed re-injection arms specific to the Dhan pool.
+2. **`SubscriptionScope` enum + planner (Q4-iii — THIS edit is the dated rule-file
+   authorization the enum's own guards demand):** `subscription_planner.rs`, the
+   `SubscriptionScope` enum in `config.rs`, `LOCKED_UNIVERSE`,
+   `effective_main_feed_pool_size`, and the ratchet
+   `crates/core/tests/indices4only_scope_lock_guard.rs` (which exists to pin that enum).
+3. **The Dhan instrument-download chain (Q3):** `csv_downloader`, `csv_parser`,
+   `fno_underlying_extractor`, `daily_universe(.rs/_orchestrator/_boot)`,
+   `instr_fetch_{loop,runner,retry_*}`, `today_instrument`,
+   `lifecycle_reconcile_*` (app modules), `constituent_resolver`, the core
+   `index_constituency/` module + the lane mapping half of `index_constituency_boot`
+   (the process-global ts-pin MIGRATION half is KEPT), `instr_fetch_audit_writer`,
+   `prev_day_ohlcv_boot`, `cross_verify_1m_boot` (after relocating
+   `parse_intraday_1m_candles` + `MinuteCandle`, consumed by `spot_1m_rest_boot`),
+   `InstrumentRegistry`, plan-snapshot files.
+4. **Tick-gap detector + WS-GAP-06 (Q4-ii):** the detector, its seeding, the far-month
+   alarm-gate exclusion sites, `tv_tick_gap_*` metrics — AND the CloudWatch alarm on
+   `tv_tick_gap_instruments_silent`
+   (`aws_cloudwatch_metric_alarm.tick_gap_instruments_silent` =
+   `tv-<env>-tick-gap-instruments-silent`, `deploy/aws/terraform/app-alarms.tf`,
+   including its market-hours window-gate membership + the file's alarm-count/cost
+   note), which retires WITH the detector — otherwise Phase C orphans a dead monitor
+   (the gauge is never written again once the detector dies). Groww stall detection is
+   the FEED-level stall watchdog (`feed-stall-watchdog-error-codes.md`) — see the honest
+   envelope in §C.
+5. **Error codes** whose only emit sites die with the chain: INSTR-FETCH-01..04,
+   NTM-CONSTITUENCY-01, PREVDAY-01, CROSS-VERIFY-1M-01/02, DHAN-LANE-01..04, WS-GAP-06
+   (retirement banners in their rule files; enum variants deleted in the Phase C PRs so
+   the cross-ref tests stay green in both directions).
+
+**What Phase C MUST KEEP/REWIRE (the Groww/shared seam — scope-lock obligations):**
+`index_extractor` (`NSE_INDEX_ALLOWLIST` + `canonicalize_index_symbol`),
+`index_futures.rs` (the §36 selector — DE-GATED from the `daily_universe_fetcher` cargo
+feature, else the Groww §36.7 futures silently drop = a scope violation),
+`instrument_snapshot::is_valid_trading_date`, `presence_registration::ist_day_from_date` *(retired 2026-07-18, stage-4 — caller-less after the presence registry deleted; the scoreboard derives the IST day itself)*,
+`storage::lifecycle_reconciler::classify_transition`, the `instrument_lifecycle` /
+`index_constituency` / `instrument_fetch_audit` TABLES (SEBI never-delete), the ts-pin
+migration, the Groww `shared_master_writer`, the scoreboard, `feed_presence`, and the
+constants `INDEX_CONSTITUENCY_BASE_URL` / `GROWW_INSTRUMENT_CSV_URL` /
+`SPOT_1M_REST_INDICES` / `DHAN_OPTION_CHAIN_*`.
+
+### §C. Honest envelope (mandatory per operator-charter §F)
+
+> "100% inside the tested envelope, with ratcheted regression coverage: Groww capture
+> keeps the full bounded zero-tick-loss chain (WAL-before-broadcast → ring → NDJSON spill
+> → DLQ; ring constant retired 2026-07-18 with the dead tick chain — the live absorption
+> tier is the 200,000-seal ring, `SEAL_BUFFER_CAPACITY`/`seal_ring.rs`); the Dhan REST stack keeps lock-before-mint +
+> RESILIENCE-03 (`dual-instance-lock-2026-07-04.md` §3.5); the retirement is
+> config-reversible until Phase C deletes the code, and irreversible-without-a-fresh-quote
+> after. NOT claimed: (a) any Dhan live tick capture — by design, per Q1/Q2 there is NONE;
+> Dhan market data is the per-minute official REST candles only, so intraminute Dhan price
+> movement is invisible between fetches; (b) per-SID silence detection — WS-GAP-06 and the
+> tick-gap detector die with the Dhan WS (Q4-ii); Groww's stall watchdog is FEED-level
+> (whole-universe last-tick), so a single silent Groww instrument is visible only via the
+> scoreboard presence/coverage columns and the 15:45 scorecard, not a 30s per-SID page;
+> (c) a second live feed as cross-check — until GDF (feed #3) goes live, Groww is a
+> single-source live feed and the §37/§38 REST comparisons are the only independent OHLCV
+> parity signals."
+
+### §D. What a PR that violates this amendment looks like (REJECT)
+
+- Re-introduces ANY Dhan market-data WebSocket (main-feed, depth, or a new endpoint)
+  without a fresh dated operator quote added to THIS section first.
+- Re-adds a `SubscriptionScope` enum, `LOCKED_UNIVERSE`, a subscription planner, or any
+  Dhan instrument CSV download/parse path (Q3: hardcoded SIDs only).
+- Restores the PR-E runtime Dhan-enable ON-half (the 409 refusal is the contract; a Dhan
+  re-enable is config + restart + a fresh dated quote).
+- Deletes or breaks the KEEP/REWIRE seam items in §B (the Groww §36 futures selector, the
+  canonicalizer, the SEBI tables, the ts-pin migration, `parse_intraday_1m_candles`).
+- Removes the order-update WS instead of rewiring it into `dhan_rest_stack` (Q4-i keeps
+  it functional-dormant), or spawns it anywhere OTHER than `dhan_rest_stack`.
+  *(2026-07-14 note — PARTIALLY SUPERSEDED by §A.1, the house §37.6-precedent in-place
+  annotation: the operator's 2026-07-14 Dhan noise directive RETIRED the functional-dormant
+  SPAWN itself — `dhan_rest_stack` Phase 5a no longer opens the socket, so "spawns it
+  anywhere OTHER than dhan_rest_stack" now reads "spawns it ANYWHERE at all" pending the
+  live-trading re-wire quote. The MODULE-DELETION half of this row STANDS unchanged:
+  deleting `order_update_connection.rs` remains REJECT — the dormant module is the
+  live-trading re-wire target.)*
+- Deletes `FeedsConfig` / feed-in-key columns / the WAL-ring-aggregator seam "because only
+  one feed remains" — the pluggable contract must stay clean for GDF
+  (`gdf-third-feed-scope-2026-07-13.md`).
+- Weakens the Groww feed's resilience chain in the name of the Dhan deletion.
+
+Any such PR MUST be rejected in review even if the operator approves verbally — the
+operator must update this section FIRST with a dated quote.
+
+### §E. The "why" record — quantified evidence behind Q2 (for the permanent record)
+
+The operator's "massive major mismatches" rationale is backed by committed, quantified
+evidence (all Verified, sources cited):
+
+| # | Evidence | Value | Source |
+|---|---|---|---|
+| 1 | Dhan main-feed delivery lag (exchange LTT → our receive), 2026-07-06, all trading day, 776-SID Quote subscription, 10-min windows | p50 1.38 s / p90 8.50 s / p95 14.93 s / **p99 46.37 s / max 198.69 s** | `docs/dhan-support/2026-07-08-orderupdate-rst-and-feed-lag.md` (Incident 3 table + timeline row) |
+| 2 | Independent comparison feed (Groww), SAME host, SAME minutes | **p99 = 562 ms** — ~82× better at p99; rules out our host/NIC/network/pipeline. Dhan's whole-second LTT quantization explains ≤ ~1 s, not 46 s | same doc, Incident 3 + "Key observation" §3 |
+| 3 | Per-minute silent instruments on the Dhan feed, 2026-07-06 | **29–67 instruments/minute** with tick gaps of 300–978 s; **590 gap events** logged | same doc, timeline row "per-minute tick gaps" |
+| 4 | The 15:31 IST Dhan cross-verify was **BLIND SINCE BIRTH** | The `candles_1m`-side SELECT used NANOSECOND literals against QuestDB's MICROSECOND timestamp comparison — the WHERE window sat ~year 58502 and matched ZERO rows on every run since the feature shipped; `compared=0` reported honestly as BLIND, so no mismatch page ever fired. Fixed by PR #1474 (commit `f84b4398`, merged 2026-07-11) — the first sessions with a WORKING comparison are what surfaced the live-vs-historical candle mismatches behind Q2 | PR #1474 commit body (`git show f84b4398`); `crates/app/src/cross_verify_1m_boot.rs` digit-magnitude ratchets |
+| 5 | Cross-verify design expectation vs observation | `cross-verify-1m-error-codes.md` §1 documents that NON-ZERO High/Low sampling noise is expected (Dhan WS is a ~2–4 ticks/sec SAMPLED stream vs their full-tape candle API) — "track the trend, not the absolute count". The post-#1474 observed divergence + the Incident-3 lag class exceeded that expected-noise envelope in the operator's judgment (Q2: "massive major mismatches") | `.claude/rules/project/cross-verify-1m-error-codes.md` §1; operator Q2 |
+| 6 | Server-side transport instability (supporting) | 2026-07-06: token invalidated server-side with ZERO mints from our box (DH-906 for 4+ hours); 39+ order-update RST-after-accepted-login cycles. 2026-07-08 13:55–14:06 IST: 7 bare-RST main-feed disconnect cycles + a ~2-min full outage — continuing the 2026-07-02 RST pattern | same support doc, Incidents 1/2/4; `docs/dhan-support/2026-07-02-mainfeed-tcp-resets.md` (the file on disk; the 2026-07-08 doc's own cross-link cites the same name) |
+
+Honest note on row 5: the WS-sampled-vs-full-tape asymmetry means SOME candle divergence
+was always expected by design; the retirement decision is the operator's judgment call on
+its magnitude (Q2 verbatim) reinforced by rows 1–3 (delivery lag + silence), which are
+NOT explainable by sampling. Neither side of any candle comparison is claimed as ground
+truth (the §37 doctrine). Provenance honesty: the 2026-07-11 first-honest-run mismatch
+COUNTS are NOT repo-quantified — they exist only in the AWS box's `cross_verify_1m_audit`
+table, the day's `data/cross-verify/` CSV, and the Telegram summary; the "massive major
+mismatches" magnitude is the operator's own observation of those outputs (Q2), not a
+number reproducible from this repository.
+
+### §F. Auto-driver / Insta-reel explanation
+
+> Sir, the juice shop had two price boards. Supplier Dhan's live board kept freezing —
+> some days a price took 46 seconds, once over 3 minutes, to appear, while supplier
+> Groww's board on the SAME wall showed the same price in half a second. Worse, when we
+> finally fixed our checking machine (it had been comparing against the wrong year for
+> weeks!), Dhan's live board didn't even match Dhan's OWN official record book. So the
+> owner said: take Dhan's live board DOWN. Keep Groww's live board as the only live one.
+> From Dhan we now take just the official printed price card once a minute (the REST
+> pulls) — and we keep one Dhan phone line plugged in but silent (the order-confirmation
+> line), ready for the day we place orders again. A third supplier (GDF) is being
+> auditioned separately — the wall hooks stay ready for their board.
+
+## 2026-07-15 Amendment — Groww live WS retired; live market-data WS count 1 → 0 (REST-only runtime)
+
+> **Operator directive 2026-07-15 (received directly in this session):** Q1: *"remove the whole Groww live feed; keep only spot 1m and option chain for both brokers; go."*
+> Approval Q2 (typos preserved): *"go aehad approv ed dude"*.
+
+Effects: the Groww live NATS-over-WS feed — the SOLE live market-data feed per the 2026-07-13 amendment —
+is RETIRED. **Total live market-data WebSocket connections: 0.** Market data is REST-only for BOTH brokers:
+the Dhan §8 spot-1m + option-chain pulls and the Groww §9/§38 spot-1m + option-chain (+ bounded contract)
+pulls (`no-rest-except-live-feed-2026-06-27.md`). Order/position live-push channels remain a SEPARATE,
+authorized surface per the operator's 2026-07-15 order-side directive (recorded by the order-side session;
+see the cluster-A rule updates) — market data = per-minute REST pull, order/position events = live push;
+the dormant `order_update_connection.rs` module ruling in §A.1 is UNCHANGED. The GDF lock
+(`gdf-third-feed-scope-2026-07-13.md`) is UNTOUCHED — it is the ONLY path to any future live market-data
+WebSocket. Where the 2026-07-13 amendment's §A table names Groww "THE SOLE LIVE MARKET-DATA FEED", this
+amendment supersedes that row.
+
+---
+
+## Trigger (auto-loaded paths)
+
+Always loaded. Activates on any session that:
+- Edits `crates/app/src/main.rs` (boot sequence)
+- Edits any file under `crates/core/src/websocket/`
+- Edits `crates/common/src/config.rs` `SubscriptionScope` or related enums
+- Edits `crates/app/src/phase2_recovery.rs`
+- Edits `config/base.toml` `[subscription]` or `[websocket]` sections
+- Adds any new `wss://` URL constant
+- Calls any `spawn_*_connection` or `spawn_*_pipeline` function
+- Edits `crates/app/src/dhan_rest_stack.rs` or any file containing `SPOT_1M_REST_INDICES` (the post-retirement Dhan surface)
+### 2026-07-16 — Groww + Dhan order/position/trade-update PUSH channels authorized (operator directive)
+
+Operator Parthiban, 2026-07-16, verbatim (event 38df2073-eecb-43cf-876d-a4a809dde269):
+> "Build real-time order, position and trade-update WebSockets for both Dhan and Groww, paper mode / off by default, no live orders yet. Edit the scope-lock rule files to allow it and use the socket-token the Groww channel needs. Everything's staged on branch claude/groww-order-position-push and PR #1597 — continue from there."
+Confirmed after a permission prompt about this rule-file write (event 157f7cd0-dfdf-4c4e-b93a-9f9aff3317c2): OK to record the instruction here and open the two sockets, paper mode / off by default.
+
+GROWW order/position/trade PUSH channel: ONE NEW dedicated NATS-over-WS connection (`wss://socket-api.groww.in`) carrying ORDER / POSITION / TRADE events ONLY — never market data (market data stays REST-only per the 2026-07-15 amendment). Config key `order_push_enabled` under `[groww_orders]` (serde default OFF); module tree `crates/trading/src/oms/groww/push/`; error codes GROWW-PUSH-01..04; `WsType::GrowwOrderUpdate`. Receive-only, paper mode; `GROWW_ORDER_LIVE_FIRE` stays false; no live orders.
+
+2026-07-16 (operator directive above, events 38df2073 + 157f7cd0): the dormant `order_update_connection.rs` is authorized for re-spawn as a PAPER-MODE, receive-only, DEFAULT-OFF channel from `dhan_rest_stack` Phase 5a, gated on `[dhan_order_push] enabled = false`, with `notifier: None` (Telegram-silent — the Dhan 4-item noise-lock family unchanged, the 2 deleted CloudWatch alarms stay deleted). Events are consumed into `order_audit` rows feed='dhan'/mode='paper'. Module DELETION remains REJECT; live order fire remains locked (dry_run untouched).
+
+### 2026-07-19 — Static IP / EIP ruling: release APPROVED for the no-real-orders period (Dhan static-IP whitelist dormant until live re-enable)
+
+Operator Parthiban, 2026-07-19, verbatim (preserve EXACTLY, typos included):
+> "until or unless we flip the real orders static ip is not needed due okay?"
+
+Effects (docs-only record; NO terraform flip ships with this note): the Elastic IP
+(`13.234.145.177` — the Dhan static-IP whitelist address) is release-APPROVED for the
+no-real-orders period. The operator's safety order — VERIFY outbound-without-EIP FIRST,
+release SECOND — was executed as a live verification (coordinator session, 2026-07-19,
+live describe evidence): a STANDALONE release is UNSAFE (ephemeral-public-IP assignment is
+a launch-time ENI attribute; the live ENI `eni-01fdeec2412f55587` can never mint one, so
+release-today = no public IPv4 = no SSM/feeds/deploys). Execution is therefore BUNDLED
+with the erase-window instance RECREATE per `docs/runbooks/eip-release.md` (recreate →
+prove the fresh ENI mints an ephemeral IP → merge the `enable_eip=false` terraform PR —
+the path-filtered terraform-apply auto lane is the sanctioned release mechanism).
+The Dhan static-IP surface stays consistent with the existing retirements: the Step 6a
+boot IP gate + Step 5.5 IP verification already retired with the Dhan live-WS lane (PR-C2,
+2026-07-13 — `ip_verifier` has zero production callers, Verified 2026-07-19), and the Dhan
+DATA REST pulls (§8 spot-1m/chain) carry no static-IP requirement — only the ORDER APIs do.
+**RE-ENABLE PROTOCOL (live trading):** ≥7 days BEFORE the first live order (Dhan's static-IP
+modify cooldown): fresh dated operator quote HERE + daily-universe §7 → `enable_eip=true`
+terraform PR (allocates a NEW address — the old one is gone forever) → Dhan
+`POST /v2/ip/setIP` (PRIMARY) registration → update the EIP literal consumers
+(`downsize-instance.yml` `EXPECTED_EIP`, SSM `/tickvault/<env>/network/static-ip`) → re-wire
+the boot IP gate before live fire. A PR that flips `enable_eip` in EITHER direction without
+the matching dated note here + §7 = REJECT.
+
+### 2026-07-21 — PAPER order-push ACTIVATION prep (DRAFT PR; do not merge without the operator's go)
+
+Prep lane (coordinator-routed, 2026-07-21): `config/base.toml` flips
+`[groww_orders] order_push_enabled` and `[dhan_order_push] enabled` to `true` so the
+already-BUILT receive-only PAPER order-push channels (authorized 2026-07-16 — events
+38df2073-eecb-43cf-876d-a4a809dde269 + 157f7cd0-dfdf-4c4e-b93a-9f9aff3317c2: the Groww
+order/position/trade NATS-over-WS channel and the Dhan order-update re-spawn from
+`dhan_rest_stack`) begin capturing broker events. Serde defaults stay OFF; `dry_run`
+stays true; `GROWW_ORDER_LIVE_FIRE` stays false — zero live orders; market data stays
+REST-only (this activates the ORDER-side push surface the 2026-07-15 amendment
+explicitly kept separate). The operator's go for the merge lands here verbatim:
+**Operator go (2026-07-31, typed directly in-session — verbatim, typos preserved):**
+> "Okay then merge all these PRs dude okay? see dont mereg speartely make it a s a
+> clubbed PR and mereg dud eokay?"
+>
+> "just as a single clubbed PR dud eokay?"
+
+Merged 2026-07-31 as part of the single clubbed integration PR (this PR), together
+with the two dependabot bumps and the second-scale frame diet. `dry_run` stays true;
+`GROWW_ORDER_LIVE_FIRE` stays false; serde defaults stay OFF — capture only, zero
+live orders.
+
+### 2026-08-09 — DHAN LIVE MAIN-FEED WS REVIVAL AUTHORIZED (reverses the 2026-07-13 retirement)
+
+**The verbatim operator demand (2026-08-09, typed directly in-session — preserve EXACTLY, typos included):**
+
+> "do thsi dude opkay? but ensiure to sue oen and onl yRUST O(1) dude okay?C — revive Dhan live WS	r8g.xlarge justified	~₹5,824–7,382	Needs a dated quote reversing your 13 July retirement — and that retirement was because Dhan's live data didn't match its own historical record."
+
+Given in direct response to a presented three-option table in which **Option C** read
+verbatim *"revive Dhan live WS · r8g.xlarge justified · ~₹5,824–7,382 · Needs a dated
+quote reversing your 13 July retirement — and that retirement was because Dhan's live
+data didn't match its own historical record."* The operator selected C, quoting the row
+back including its warning, and added the standing **Rust-O(1)-only** constraint.
+
+**This is the fresh dated quote the §D REJECT row demands.** It authorizes
+re-introducing the Dhan main-feed market-data WebSocket, reversing the 2026-07-13
+retirement (Q1/Q2/Q3 of the "2026-07-13 Amendment" above).
+
+**Why the operator needs it (recorded):** with TrueData explicitly excluded from this
+instance (operator, 2026-08-09: *"as of now dont add or implement anm.y truedata i said
+this isntance is one and onlmy for dhan dude okay?"*) and both Groww and GDF off, the
+Dhan live WS is the **ONLY tick source the account can reach**. Without it there are
+zero ticks, so the 5 second-scale timeframes (1s/5s/10s/15s/30s) of the 13-timeframe
+requirement are unachievable and the r8g.xlarge 32 GiB has nothing to hold. Reviving it
+is what makes the Quote 13 instance sizing coherent.
+
+**⚠ WHAT THIS DOES NOT FIX — the retirement reason is UNADDRESSED (Rule 11, no false-OK).**
+The 2026-07-13 retirement was not arbitrary; §E of this file quantifies it, and reviving
+the lane changes NONE of it because every cause is Dhan-side:
+
+| Measured on 2026-07-06 (776-SID Quote subscription, all trading day) | Value |
+|---|---|
+| Delivery lag (exchange LTT → our receive) | p50 1.38 s · p90 8.50 s · p95 14.93 s · **p99 46.37 s · max 198.69 s** |
+| Groww, SAME host, SAME minutes | **p99 562 ms — ~82× better** (rules out our host/NIC/pipeline) |
+| Silent instruments per minute | **29–67**, gaps 300–978 s, **590 gap events** |
+| Live-vs-historical candle agreement | operator verdict: *"massive major mismatches"* |
+
+The operator has accepted this knowingly by selecting an option whose own text named the
+reason. **The revival must therefore ship the mismatch DETECTION, not a claim that the
+mismatch is gone:** the 15:31 cross-verify (fixed 2026-07-11, PR #1474 — it had been
+BLIND SINCE BIRTH on a nanosecond-vs-microsecond literal bug) must be live from day one,
+and its divergence counts are the honest measure of whether this feed is usable.
+
+**O(1) status (Verified, not assumed):** the Dhan binary parser SURVIVED the July
+deletions in full — `crates/core/src/parser/{header,ticker,quote,full_packet,oi,previous_close,disconnect,dispatcher,market_status,read_helpers}.rs`
+are all present. That is the fixed-offset `from_le_bytes` hot path with its DHAT
+zero-alloc tests, so the O(1) core needs **no rebuild** and the operator's
+Rust-O(1)-only constraint is met by existing, already-gated code.
+
+**What the revival MUST rebuild (all deleted 2026-07-13/17 — Verified by file scan):**
+main-feed connection + reconnect/pool, subscription builder (hardcoded SIDs per Q3 —
+**NOT** the CSV download chain), `MultiTfAggregator` (tick→timeframe), `tick_persistence.rs`
++ `DEDUP_KEY_TICKS` as a **const** (never an inline literal — an inline key evades the
+feed-in-key allowlist guard), the tick-gap detector, and the WAL→ring→spill→DLQ wiring.
+
+**What stays FORBIDDEN even under this revival** (unchanged from §D unless separately
+quoted): the Dhan instrument CSV download/parse chain (Q3 stands — hardcoded SIDs only);
+depth-20 / depth-200 / any additional Dhan WS endpoint; live order fire (`dry_run` stays
+true); the §28 indicator/strategy boundary.
+
+**Companion plan:** `.claude/plans/proposals/2026-08-09-dhan-live-ws-revival.md`
+(DRAFT — implementation may not start until the operator flips it to APPROVED, per the
+design-first wall).
+
+### 2026-08-09 (SAME DAY, SECOND QUOTE) — 16 CONNECTIONS + depth-20/depth-200 AUTHORIZED
+
+**The verbatim operator demand (2026-08-09, typed directly in-session — preserve
+EXACTLY, expletives and typos included):**
+
+> "what the fuck bro our idea is toa dd live feed so oevrall 16 websocket
+> conbections rigth what na why the fuck puir arhcietctrue design plan fixes
+> solutions ntohign is hsown or applciabel here mtoehrfucke rhwy?"
+
+Reaffirmed moments later: *"whta the fuck we have deisgne dveeyhtign in PR 1731
+right?"*
+
+Given in direct response to a plan that had WRONGLY listed the feed choice as an
+open operator decision, when the revival had already been authorized earlier the
+same day by the quote in the section above. The operator is stating the intended
+SHAPE of that already-authorized revival: **a live feed totalling 16 WebSocket
+connections.**
+
+**This is the fresh dated quote that
+`.claude/plans/proposals/2026-08-09-dhan-16-connection-architecture.md` (PR #1731)
+names as its own precondition.** That proposal states it "cannot be implemented as
+written without a dated operator quote covering (1) depth-20 / depth-200, which
+that file currently lists as FORBIDDEN, and (2) a 5-connection main-feed pool,
+since the existing lock is 1 connection." Both are granted here.
+
+**What this quote authorizes, precisely:**
+
+| Surface | Before | Now |
+|---|---|---|
+| Main-feed connections | 1 | **up to 5** |
+| depth-20 (`depth-api-feed.dhan.co/twentydepth`) | FORBIDDEN | **ALLOWED, up to 5** |
+| depth-200 (`full-depth-api.dhan.co`) | FORBIDDEN | **ALLOWED, up to 5** |
+| Order-update WS | 1 (dormant module) | unchanged, 1 |
+| **Total live WebSocket connections** | 0 | **≤ 16** |
+
+The 16 figure is the operator's stated target and is consistent with Dhan's own
+limits: Dhan confirmed 2026-04-06 that the 5-connection cap applies **per endpoint
+type independently**, so 5 + 5 + 5 + 1 = 16. The binding constraint was never
+Dhan's — it was this file's own lock, and that lock is lifted to 16 here.
+
+The "What stays FORBIDDEN even under this revival" row four paragraphs above listed
+"depth-20 / depth-200 / any additional Dhan WS endpoint" — the depth-20 and
+depth-200 half of that row is SUPERSEDED by this quote (house convention: annotate
+in place, never rewrite). "Any ADDITIONAL Dhan WS endpoint" beyond these four
+stands FORBIDDEN.
+
+**What this quote does NOT authorize (unchanged, still REJECT):**
+
+- More than 16 total live WebSocket connections, or any endpoint beyond
+  main-feed / depth-20 / depth-200 / order-update.
+- Live ORDER FIRE. `dry_run` stays true and the §39 four-gate lattice is untouched
+  — this is a MARKET-DATA authorization only.
+- The Dhan instrument CSV download/parse chain (Q3 of the 2026-07-13 amendment
+  stands — hardcoded SIDs only, no daily master fetch).
+- Any edit to the §28 indicator/strategy frozen area beyond the recorded lifts.
+
+**The honest envelope carried over from the revival section above — NOT weakened by
+this quote:** the 2026-07-13 retirement reason remains UNADDRESSED, because every
+cause was Dhan-side. Measured 2026-07-06: p99 delivery lag 46.37 s (max 198.69 s)
+against Groww's 562 ms on the SAME host in the SAME minutes; 29–67 silent
+instruments per minute; live-vs-historical candle mismatches. Reviving the lane
+repairs none of that. Additionally, per PR #1731's protocol findings, the India
+feed has **no snapshot-on-subscribe** (documented only for the US global-stocks
+socket, feed code 29) and **no sequence number**, so packet loss is undetectable at
+the protocol level. The 15:31 REST cross-verification is therefore the ONLY
+available ground truth and must be live from day one — not a supplementary check.
+
+**Companion plans, both unblocked by this quote:**
+`.claude/plans/proposals/2026-08-09-dhan-live-ws-revival.md` and
+`.claude/plans/proposals/2026-08-09-dhan-16-connection-architecture.md` (PR #1731).
+
+### 2026-08-11 — THE DEFAULT IS FLIPPED ON (the lane goes live, not just buildable)
+
+**The verbatim operator demand (2026-08-11, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "switch the dhan feed on espeic llay to cpature all tehs eirght dude am i irght dude?"
+
+This is the **change of DEFAULT** that the 2026-08-09 quotes deliberately did not
+make. Those quotes authorized the CODE and the 16-socket budget; the lane still
+shipped dark behind a double gate. This quote opens both gates:
+
+| Gate | Before | After |
+|---|---|---|
+| `[feeds] dhan_enabled` (base.toml + production.toml) | `false` | **`true`** |
+| `TICKVAULT_DHAN_LIVE_FEED` env opt-in | unset | **`=1`** in `deploy/systemd/tickvault.service` |
+
+It is also the "fresh dated operator quote" that
+`crates/app/tests/dhan_live_off_phase_a_guard.rs` and
+`crates/common/tests/production_config_wiring.rs` name as the precondition for
+flipping the flag; both guards are INVERTED in the same PR to pin the ON state,
+so the flag can never silently drift back OFF either.
+
+**The coupled change this forces — `[rest_candle_fold]` goes OFF.** The live lane
+and the REST candle fold both seal into the same `candles_<tf>` tables stamped
+`feed='dhan'`, and the dedup key `(ts, security_id, segment, feed)` has no column
+that separates them: one silently overwrites the other, and the 15:31
+cross-verification would compare the REST record against itself and agree every
+time. The lane's exclusivity floor already REFUSES to open a socket while the fold
+is on, so leaving the fold enabled would have made this flip a no-op wearing a
+success message. The fold is therefore disabled here. **Honest cost:** its 35-day
+`catchup_days` backfill of historical minute candles stops running; live capture
+replaces it going forward but does NOT backfill the past. Re-enabling it means
+turning the live lane off again, until a source discriminator is added to the
+candle key — a schema decision, deliberately not taken here.
+
+**⚠ WHAT THIS QUOTE CANNOT DELIVER — 11 of the 16 sockets stay shut, and not for
+lack of code.** The operator's words are "capture all these", so this must be said
+plainly rather than left to be discovered:
+
+- **Main feed: 1 socket of the 5 granted.** The universe is
+  `SPOT_1M_REST_INDICES` — NIFTY, BANKNIFTY, SENSEX, INDIA VIX. Four instruments
+  fit one connection; the pool shards by need, so four more sockets are authorized
+  and unused. Widening the universe is blocked by Q3 of the 2026-07-13 amendment
+  ("hardcoded security IDs only, no instrument download/parsing"), which this
+  quote does not touch.
+- **depth-20 and depth-200: 0 sockets of the 10 granted.** Both instrument lists
+  are empty, and `plan_pool` opens nothing for an empty set. This is a **rule
+  conflict, not a gap**: depth needs a tradeable order book, indices do not have
+  one, and reaching real option/future contracts requires either the instrument
+  master download (forbidden by Q3) or a hardcoded contract list that expires
+  every week. Populating depth needs its own dated quote resolving that conflict —
+  it is not a config flip.
+- **Ticks are captured; the 5 second-scale timeframes are not yet proven.** The
+  13-timeframe requirement (Quote 13, 2026-08-08) is what the r8g.xlarge was sized
+  for; this flip starts the tick flow that feeds it.
+
+So the accurate one-line summary of this change is: **the Dhan live feed goes from
+zero sockets to one, carrying four index instruments** — a real and necessary
+first step, and materially less than "all these".
+
+**Everything else stays REJECT** exactly as the 2026-08-09 sections state: no live
+order fire (`dry_run` stays true), no CSV download, no fifth endpoint type, no
+edit to the §28 frozen area.
+
+### 2026-08-11 (SAME DAY, SECOND QUOTE) — ALL 16 SOCKETS ORDERED OPEN; per-minute REST KEPT RUNNING ALONGSIDE
+
+**The verbatim operator demand (2026-08-11, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "bro fix all tehse issues whatevr is mentioend dude see emanhwiel ensure to enable connect estbalish al lteh 16 ocnenctions defintitley ddue okay? Meanwhile elt the current rest api hit of evry minute for btoh dhan and groww shodu land let ir run dude okay? do youu nderstand whayt imasnkign ddue okay?"
+
+Given in DIRECT response to a message that stated the opposite of what the
+operator wanted and named the blocker: that 11 of the 16 authorized sockets were
+shut, that depth-20 and depth-200 sat at ZERO because depth needs a tradeable
+order book which an index does not have, and that reaching real contracts
+"requires either the instrument master download (forbidden by Q3) or a hardcoded
+contract list that expires every week … it is not a config flip." The operator
+read that and answered **"definitely"**. This section is the dated quote the
+2026-08-09 sections' own REJECT rows demand before that shape changes.
+
+**What this quote authorizes, precisely:**
+
+| Surface | Before this quote | Now |
+|---|---|---|
+| Main feed | 5 authorized, **1** open | 5 authorized, **open as many as the instrument set needs** |
+| depth-20 | 5 authorized, **0** open — no instrument list | 5 authorized, **ORDERED OPEN** |
+| depth-200 | 5 authorized, **0** open — no instrument list | 5 authorized, **ORDERED OPEN** |
+| Order-update | 1, paper-mode receive-only | unchanged, 1 |
+| Per-minute REST (Dhan + Groww) | running | **explicitly ORDERED to keep running** alongside the live lane |
+| **Total** | 1 socket carrying data | **16** |
+
+**The REST half is an explicit KEEP, not an afterthought.** The operator's
+second sentence — *"let the current rest api hit of every minute for both dhan
+and groww … let it run"* — makes the per-minute REST legs a KEPT surface that
+the live lane must COEXIST with, never replace. Any change that stands a REST
+leg down "because the live feed covers it now" is a REJECT under this quote.
+The two write DIFFERENT tables (`ticks` / `candles_<tf>` for the live lane;
+`spot_1m_rest` / `option_chain_1m` / `option_contract_1m_rest` for the REST
+legs), which is what makes coexistence structurally safe — and is exactly why
+the earlier same-day `[rest_candle_fold]` stand-down was correct and is NOT
+touched by this quote: that fold wrote into `candles_<tf>`, the live lane's own
+table, under a key that cannot separate them. REST legs that write their own
+tables coexist; a REST fold that writes the live lane's table does not.
+
+**⚠ THE CONSTRAINT THIS QUOTE DOES *NOT* LIFT (Rule 11, no false-OK).**
+The operator ordered the sockets open. He did NOT authorize an instrument-master
+CSV download, and **Q3 of the 2026-07-13 amendment stands** (*"hereafter no Dhan
+instrument download/parsing — just direct hardcoded security IDs"*). Depth needs
+tradeable contract security-ids, and there are exactly three ways to obtain them:
+
+| Source | Rule status | Automation status |
+|---|---|---|
+| Dhan instrument-master CSV | **FORBIDDEN** by Q3 — not lifted by this quote | would be automatic |
+| A hardcoded contract list in Rust | permitted by Q3's letter | **FAILS** the operator's own standing "no manual intervention" mandate — option contracts expire weekly, so a hardcoded list needs a human edit every week and silently goes stale between edits |
+| **An already-authorized live source that carries contract security-ids** | permitted — no new fetch class | automatic, self-rolling |
+
+Only the third satisfies BOTH this quote and the operator's standing
+zero-manual-intervention rule at the same time. **The implementation MUST use
+the third form.** A depth lane fed by a stale hardcoded list would subscribe
+expired contracts, receive nothing, and report healthy: the exact false-OK class
+this file exists to prevent.
+
+#### The third form EXISTS for OPTIONS — resolved 2026-08-11, same day
+
+The already-authorized, already-running per-minute Dhan option-chain pull
+(`POST /v2/optionchain`, the §8 grant of
+`no-rest-except-live-feed-2026-06-27.md`) returns a **per-leg
+`security_id`** — the tradeable contract's own Dhan id. It is already parsed
+(`crates/app/src/option_chain_1m_boot.rs:431`, `ParsedLeg.contract_security_id`)
+and already persisted every minute (`option_chain_1m.contract_security_id LONG`,
+`crates/storage/src/option_chain_1m_persistence.rs:776`). The vendor doc states
+it outright: *"gives you the SecurityId of each option contract directly, no
+instrument master lookup needed for subscriptions"*
+(`docs/dhan-ref/06-option-chain.md:195`).
+
+> **⚠ CORRECTED 2026-09-16 — this sentence was true for ~50 lines and the code
+> stopped depending on it the SAME DAY.** The THIRD quote of 2026-08-11, below
+> in this file, REVERSED the instrument-master ban that forced the chain to be
+> the source (*"Q3 IS REVERSED: the daily Dhan master CSV … is ORDERED BACK"*).
+> The code followed; this prose did not. **Verified in source 2026-09-16:**
+> `dhan_depth_universe.rs:1097` (`load_depth_candidates`, the per-minute
+> steering path) opens with `read_contract_artifact(date_ist)` and returns
+> `Vec::new()` on failure — it does NOT query the chain; `dhan_feed_stack.rs:10151`
+> calls `load_depth_universe_from_master` FIRST with the `option_chain_1m` SQL
+> only as the `None` fallback at `:10161`; and `depth_seed.rs:28` validates every
+> seeded id against TODAY's contract artifact. The master is strictly richer —
+> 121,674 contracts with lot size, strike, expiry and leg, against the chain's
+> ~1,250 INDEX-option legs, which cannot represent a stock option at all
+> (`contract_underlying_map.rs:20`, measured). Left standing per house
+> convention because the sentence records a real 2026-08-11 decision; annotated
+> because a session trusting it would conclude that removing the option-chain
+> REST pull kills depth, which is the false-finding class the `day_ohlc_tracker`
+> row records. Removal authorization: `no-rest-except-live-feed-2026-06-27.md`
+> §12 (2026-09-16).
+
+**This is the sanctioned depth instrument source.** It costs no new fetch class,
+adds no REST call, breaks no rule, and self-rolls: when the expiry changes the
+chain returns the new contracts and the depth set follows automatically — the
+zero-manual-intervention property the hardcoded-list option cannot provide.
+
+Two things this source does NOT give, both recorded rather than papered over:
+
+1. **The contract's EXCHANGE SEGMENT is absent from the response.** The stored
+   `exchange_segment` is the UNDERLYING's (`IDX_I`, hardcoded at
+   `option_chain_1m_persistence.rs:108`). Depth subscription needs the
+   CONTRACT's segment (`NSE_FNO` = 2 for NIFTY/BANKNIFTY, `BSE_FNO` = 8 for
+   SENSEX). That mapping is deterministic from the underlying but is OUR
+   assumption, not vendor-supplied — it must be a named, tested, single-source
+   mapping, never an inline literal, and it must fail closed on an unknown
+   underlying rather than guessing a segment.
+2. **`contract_security_id` populated-in-practice is UNVERIFIED-LIVE.** The
+   parser defaults it to `0` when the field is absent, and the field is marked
+   "added v2.5" upstream. One query settles it —
+   `SELECT count(*) FROM option_chain_1m WHERE contract_security_id = 0` — and
+   the implementation MUST treat a `0` id as REFUSED-and-counted, never
+   subscribed. A zero id would otherwise subscribe instrument 0 and look fine.
+
+#### FUTURES depth is NOT reachable — stated plainly, not silently dropped
+
+There is **no path from any authorized Dhan source to a FUTIDX `security_id`**.
+`/v2/optionchain` returns `ce`/`pe` legs only; the expiry-list endpoint returns
+DATES, not ids; and `index_futures.rs::select_index_future_expiries` is a pure
+date filter fed exclusively by the **Groww** master CSV, whose ids are a
+different id space entirely (`exchange_token`, not Dhan `security_id`).
+
+So depth on index FUTURES needs the forbidden CSV, a monthly-expiring hardcoded
+list, or its own fresh operator quote. **It is therefore OUT of this quote's
+deliverable**, and any claim that "all 16 sockets carry data" must not be read as
+including futures depth. Option depth is what this quote can actually deliver.
+
+**What a PR that violates this section looks like (REJECT):**
+
+- Revives the Dhan instrument-master CSV download/parse chain (Q3 stands; this
+  quote does not lift it).
+- Hardcodes an expiring option/future contract list as the depth instrument
+  source (breaks the standing no-manual-intervention mandate and goes silently
+  stale).
+- Stands down, disables, or starves ANY per-minute REST leg for Dhan or Groww
+  in the name of the live lane (the explicit KEEP above).
+- Opens a fifth Dhan endpoint type, or exceeds 16 total live connections.
+- Reports depth as "enabled" when its instrument set is empty — an empty set
+  opens zero sockets, and calling that success is the false-OK this file forbids.
+- Flips `dry_run`, touches the §28 frozen area, or arms live order fire — none
+  of which this quote mentions.
+
+### 2026-08-11 (SAME DAY, THIRD QUOTE) — Q3 IS REVERSED: the daily Dhan master CSV + NSE India indices download is ORDERED BACK
+
+**The verbatim operator demand (2026-08-11, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "yes go ahead dude we ened to downlaod the dhan master csv evry day startign right dude espeiclaly to udpate the mappigns and its data entirley always a swell right dude menahwiel see from nse india websote alwyas evryday mornign you need to downlaod all teh indices as well right i mean. to find the rpeicse mappigns between nse india websoite nse idncies csv data with our daily downlaoded new master instruemnts scirpt csv fiel dtaa rigth ddue am i irght dude tell me dude okay?"
+
+Given in DIRECT response to a message that laid out the two options side by side
+— keep Q3 and accept that futures depth is impossible, or reverse Q3 and rebuild
+the deleted download chain — and named the rebuild cost. The operator chose the
+rebuild, and named the JOIN between the two files as the actual deliverable.
+
+**This quote REVERSES Q3 of the 2026-07-13 amendment.** That directive read
+*"hereafter no Dhan instrument download/parsing — just direct hardcoded security
+IDs passed to spot 1m and option chain"*, and it is the authority every "no CSV
+download" REJECT row in this file cites — including the two rows written earlier
+TODAY (the 2026-08-11 first and second quotes). Those rows are superseded to
+exactly the extent stated here and no further.
+
+#### What is authorized
+
+| Surface | Before this quote | Now |
+|---|---|---|
+| Dhan instrument-master CSV | FORBIDDEN (Q3); every module DELETED | **DAILY DOWNLOAD ORDERED** |
+| NSE India (niftyindices) index constituent lists | one list (NIFTY Total Market) fetched as a Groww watch-build input | **ALL index lists, every morning, as a first-class pipeline** |
+| The ISIN join between them | did not exist | **THE DELIVERABLE** — precise constituent → Dhan `security_id` mapping |
+| Live-lane universe | 4 hardcoded index SIDs | may be sourced from the rebuilt master (a SEPARATE step; see below) |
+| Everything else | — | UNCHANGED |
+
+#### What this quote does NOT authorize (Rule 11 — no scope smuggling)
+
+- **Live order fire.** `dry_run` stays true. Not mentioned, not touched.
+- **A fifth Dhan WS endpoint type**, or more than 16 total connections.
+- **Any edit to the §28 frozen indicator/strategy area.**
+- **Standing down the per-minute REST legs** — the second 2026-08-11 quote's
+  explicit KEEP stands and is reinforced, not replaced, by this one.
+- **Automatically widening the live subscription set.** The download produces a
+  MAPPING; pointing the live lane at it changes what we subscribe and is its own
+  decision with its own bandwidth and cost consequences. Building the pipeline is
+  ordered here; re-pointing the lane is not, and must not be smuggled in.
+
+#### The mapping contract is ALREADY LOCKED — build to it, do not reinvent it
+
+`daily-universe-scope-expansion-2026-05-27.md` §31.1 (operator-confirmed
+2026-06-06) already specifies precisely the join this quote asks for, and it
+stands unamended:
+
+1. **PRIMARY KEY = ISIN.** Match the NSE list's `ISIN Code` against the Dhan
+   master's `ISIN`, filtered to `EXCH_ID == NSE AND SEGMENT == E AND SERIES == EQ`.
+   The matched row's `SECURITY_ID` is the answer.
+2. **SECONDARY / cross-check = `(Symbol, Series=EQ, NSE, Equity)`.** Symbol-ALONE
+   is BANNED as a primary key — tickers are reused and renamed, so a symbol join
+   can silently map to the WRONG security, which is worse than failing.
+3. **O(1) build.** One `HashMap<ISIN, (security_id, ExchangeSegment)>` built once
+   from the Dhan NSE-EQ rows; each constituent is then an O(1) lookup. Never a
+   per-constituent scan of the master.
+4. **Fail-closed.** An unresolved constituent is COUNTED and LOGGED BY NAME,
+   never silently dropped. Past the tolerance, REJECT the whole build.
+5. **Dedup** by the I-P1-11 composite `(security_id, exchange_segment)`.
+6. **Role tagging** so `index_constituent` vs `fno_underlying` is an O(1) filter.
+
+The §18 downloader hardening contract (redirect policy `none`, 50 MB body cap,
+content-type assertion, cache-path validation, 10s connect / 60s read timeouts,
+never log the URL) is likewise already locked and binds this rebuild verbatim.
+
+#### The honest envelope
+
+- **Two tolerances, deliberately different, and they must not be merged:** the
+  NSE membership-list tolerance (2%, raised from 0.5% after the 2026-06-08 live
+  boot degraded the universe over 5 stragglers out of 748) and the order-critical
+  Dhan-master F&O dangling guard (0.5%, unchanged). Collapsing them into one
+  number breaks one of the two.
+- **A same-wrong-on-both-sides input is invisible by construction.** The join
+  detects disagreement between the two files; it cannot detect two files that are
+  consistently wrong. Nothing here claims otherwise.
+- **Derivative security_ids are documented by Dhan as unstable across days.** The
+  mapping is therefore a POINT-IN-TIME artifact per trading day — which is why
+  the SEBI tables are append-with-history and never overwritten in place.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Joins on SYMBOL as the primary key, or drops the ISIN cross-check.
+- Silently skips unresolved constituents instead of counting + naming them.
+- Merges the 2% membership tolerance and the 0.5% F&O dangling tolerance.
+- Ships the downloader without the §18 hardening (a redirect-following client,
+  an uncapped body, or no content-type assertion is a REJECT on its own).
+- Logs the CSV URL with query parameters, or writes outside the validated cache
+  directory.
+- Re-points the live subscription set at the new master without its own dated
+  quote (see "does NOT authorize" above).
+- Presents a build that resolved zero constituents as success — a zero-row join
+  passing a "no mismatches" check is the false-OK class this file exists to stop.
+
+### 2026-08-11 (FOURTH QUOTE) — master-sourced live universe authorized to be BUILT, shipped DEFAULT-OFF
+
+**The verbatim operator demand (2026-08-11, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "Just go ahead and fix everything dude okau"
+
+**Read this section before treating that quote as broader than it is.** It is a
+GENERAL reaffirmation, not a targeted instruction about the subscription set.
+What makes it usable here is what it answered: the immediately preceding message
+named this work explicitly — *"Fork B (widening the live subscription)"* — and
+stated its magnitude, *"from 4 instruments to ~25,000"*, alongside the
+recommendation that it be built but not activated before the first live probe.
+The operator read that and said fix everything.
+
+That is the same authorization shape §28.2 and §28.3 of
+`daily-universe-scope-expansion-2026-05-27.md` already accept ("go ahead and fix
+and implement eveuthign dude okay>" and "fi everyhtugn dude oaky?"), where a
+general go-ahead selected work the preceding message had enumerated. It is
+recorded HERE, before any implementation, because this file's own third-quote
+section requires exactly that.
+
+#### The tension with the THIRD quote, stated rather than glossed
+
+The third quote of the same day carved this out in as many words: *"the rider
+emits a mapping; it does NOT re-point the live subscription set at it… Building
+the pipeline is ordered here; re-pointing the lane is not, and must not be
+smuggled in."*
+
+A general "fix everything" does not obviously overturn a specific carve-out, and
+this section does not pretend that it does. It resolves the tension the only way
+that is safe in both directions:
+
+| | |
+|---|---|
+| **Authorized here** | BUILDING the master-sourced universe path, and landing it in the tree |
+| **NOT authorized here** | Any change to what we actually subscribe |
+| **Mechanism** | The path ships **DEFAULT-OFF**. Nothing is re-pointed; the live set stays the 4 hardcoded index SIDs until a human flips the flag |
+
+So the carve-out is honoured in substance — the thing it protects is the live
+subscription set, and that set does not move. What lands is code that *can* move
+it, sitting behind an off switch.
+
+#### Flipping the default needs its own explicit go, and should wait for the probe
+
+Not merely as protocol. **2026-08-12 is this lane's first live session since the
+2026-07-13 retirement** — it has never received a Dhan tick. Taking that session
+from 4 instruments to ~25,000 means any failure arrives as an unreadable pile
+instead of a diagnosable signal. The 4-index probe first, then widen, is the only
+ordering that produces an answer.
+
+The recorded reasons for the retirement are also still unrepaired, because they
+were never ours to repair: p99 delivery lag 46.37 s (max 198.69 s) against
+Groww's 562 ms on the same host in the same minutes, and 29–67 silent
+instruments per minute. Widening the universe multiplies whatever that feed
+actually does; it does not improve it.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Ships the master-sourced universe **enabled by default**, in any config file,
+  env var, deploy script, or serde default.
+- Widens the live set without the boot-time envelope check, so a master that
+  returns more SIDs than the authorized 5 main-feed connections can carry takes
+  the WHOLE lane down (`plan_pool` refuses the entire pool, not just the excess).
+- Subscribes an instrument the master did not resolve, or one whose segment was
+  inferred rather than read.
+- Presents an empty or partial master-sourced set as "widened" — an empty set
+  silently falls back to the index universe, and reporting that as success is the
+  false-OK this file exists to stop.
+- Flips the default ON without a fresh dated quote in THIS section recording the
+  operator's explicit go AFTER a live probe.
+
+### 2026-08-12 — the probe RAN, the lane was BROKEN, and the master-sourced universe is now ON
+
+**The verbatim operator demand (2026-08-12, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "i need all 16 sow hatevr is needed fix and impelemnt dude okay>"
+
+This is the fresh dated quote the REJECT row immediately above requires, and it
+is recorded HERE before the config flip, per this file's own rule-file-first
+law. It follows the same-day operator instruction to fix and implement whatever
+the 16 connections need.
+
+#### The probe ran. It did not validate the feed — it found a bug.
+
+The fourth quote conditioned the flip on "a live probe". **2026-08-12 was that
+probe: the lane's first live session since the 2026-07-13 retirement.** It must
+not be reported as a pass, because it was not one. What it produced:
+
+| Evidence (CloudWatch `/tickvault/prod/app`, 2026-08-12) | Value |
+|---|---|
+| Main-feed dial attempts | **12, all failed** — `WS-GAP-03`, `"HTTP error: 400 Bad Request"`, every 30s from 09:29:28 IST |
+| Daily cross-verification | `outcome: Degraded`, **`compared: 0`, `missing_live: 373`**, `missing_rest: 0` |
+| depth-200 subscribe | `WS-GAP-02` at 09:06:49 — `"... got: BSE_FNO"`, socket opened and torn down |
+| Sockets planned vs carrying data | 8 planned; **only the order-update socket alive** |
+
+So the live lane produced **zero candles for the entire 373-minute session**,
+and the main feed never completed a handshake even once.
+
+**Both causes were found and fixed the same day, and neither was Dhan's:**
+
+1. **A missing `/`.** `build_feed_url` appended `?` directly to a pathless base
+   URL, so tungstenite — which writes `GET {path_and_query} HTTP/1.1` — put
+   `GET ?version=2&token=… HTTP/1.1` on the wire. An origin-form request-target
+   must begin with `/` (RFC 9112 §3.2.1), so Dhan's edge answered 400 before the
+   upgrade was ever considered. The main feed was the ONLY endpoint without a
+   path, which is why it was the only one failing.
+2. **BSE_FNO in the depth sets.** SENSEX options are `BSE_FNO` and Dhan serves
+   depth on NSE only, so a SENSEX depth socket can only ever die on connect
+   (depth-200) or sit live and silent (depth-20, which had no builder check at
+   all). Refused at selection time now, and counted.
+
+#### What is flipped, and the honest risk
+
+`[dhan_universe] live_subscription_from_master` moves `false → true` in
+`config/base.toml`. The **serde default stays `false`** — an absent section
+still means the 4 hardcoded index SIDs, so the fail-safe is unchanged and the
+REJECT row above ("enabled by default … or serde default") is not breached.
+
+Why the flip is needed at all: 16 sockets is arithmetically impossible without
+it. The main feed spreads its set across the 5 authorized connections one shard
+each, and the index universe is **4 instruments** — four sockets, and an empty
+fifth is refused by design (an empty subscribe is `EmptyBatch`). Reaching the
+fifth main-feed socket requires a fifth instrument, and the master is the only
+authorized source of one.
+
+**The honest risk, stated rather than buried.** The fourth quote's own warning
+still applies and is not retired by this section: this widens the set from 4
+instruments to whatever today's master resolves (**4,565** on 2026-08-12) on a
+lane that has **never successfully received a single tick**. If something is
+still wrong after the two fixes above, it now arrives across 4,565 instruments
+instead of 4. That is a real cost and it was accepted deliberately, on the
+operator's explicit instruction, against a box (r8g.xlarge, 32 GiB) sized for
+exactly this load.
+
+> **⚠ CORRECTED 2026-08-22 — 4,565 is the MAPPING-ROW count, not the
+> instrument count, and the real live set is roughly 870.**
+>
+> `join_constituents` dedups on `(index_name, security_id, segment)` — scoped
+> to the INDEX — so a stock belonging to twelve of the forty-six downloaded
+> NSE India index lists produces TWELVE resolved rows. The artifact's
+> `mappings` array is that sum across all 46 lists WITH the duplicates, plus
+> one row per NSE index. 4,565 is what that array holds.
+>
+> The subscribe path has always deduped on the I-P1-11 composite key
+> (`dhan_live_universe::select_live_universe`, `seen: HashSet<(SecurityId,
+> ExchangeSegment)>`), so the number of instruments the lane DIALS is the
+> distinct count: about **120 NSE indices + ~750 unique NIFTY Total Market
+> stocks ≈ 870**. NTM is the broadest basket and contains the other lists'
+> members, which is why the distinct total lands near its own size rather than
+> near the sum.
+>
+> Pinned by `dhan_live_universe.rs::a_stock_repeated_across_many_index_lists_
+> is_subscribed_once`, which feeds exactly 4,565 rows in and asserts the
+> instrument count out, so this cannot be re-derived wrongly a third time.
+>
+> **What the wrong number changed downstream, so each is checked rather than
+> assumed:**
+>
+> * The packing table below reads "boot spots (4,565) → 1 connection". The
+>   CONCLUSION is unchanged and is now stronger: at ~870 the boot pass takes
+>   one connection with far more room to spare, and `ceil(870/5000) = 1` the
+>   same as `ceil(4565/5000) = 1`.
+> * `dhan-rest-only-noise-lock-2026-07-14.md` uses 4,565 to price
+>   per-instrument CloudWatch metrics at ~$1,369/mo. At ~870 that is ~$261/mo
+>   — still far above what the budget can absorb, so the decision to dimension
+>   latency per CONNECTION rather than per instrument stands unchanged.
+> * Sizing arguments that treat the boot pass as "already spending ~4,565 of
+>   the 25,000 slots" are working from the row count. The spot pass spends
+>   about 870, leaving correspondingly more headroom for contracts.
+>
+> No live figure is claimed here: `distinct_instruments` and
+> `tv_dhan_universe_distinct_instruments` were added the same day and publish
+> the measured value from the next 08:30 build onward. Until one lands, ~870
+> is what the code must produce, not what the box reported.
+
+Three things bound it, none of which is a promise that it works:
+- **Fail-soft, loudly.** An unreadable or unparseable mapping artifact falls
+  back to the 4 index SIDs with a coded `error!` saying master sourcing was
+  REQUESTED and is NOT in effect — never a silent partial widening.
+- **Fail-closed on the envelope.** A master resolving more SIDs than the 5
+  connections can carry refuses the WHOLE pool rather than truncating.
+- **Reversible in one line.** Setting the flag back to `false` restores the
+  4-SID universe with a restart.
+
+#### What is still NOT delivered, at 16 sockets or otherwise
+
+- **Futures depth remains unreachable.** No authorized Dhan source yields a
+  FUTIDX `security_id` (§ the 2026-08-11 second quote). Unchanged.
+- **The 2026-07-13 retirement reasons remain unrepaired** — p99 46.37s delivery
+  lag, 29–67 silent instruments/minute — because every one of them is Dhan-side.
+- **Nothing here proves the feed works.** The 400 fix explains and removes a
+  handshake failure; it does not demonstrate tick delivery. **The measurement
+  that settles it is the same cross-verification line that exposed the outage:
+  a non-zero `compared`.** Until a session reports one, "the Dhan live feed is
+  working" is not a claim this repository can make.
+
+### 2026-08-25 — THE DAY OPEN IS THE PRE-OPEN EQUILIBRIUM PRICE, NOT OUR FIRST OBSERVED TICK
+
+**The verbatim operator demand (2026-08-25, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "firts tell me whtehr all thsi sorted ourt meanwhiel whatve rthe 9.12 am ckose rpcie shdou lbe eth 9.15 am open price rigth ddue see we need to make the rpe market price as 9.15 am open price always right dude am i irgth ddue see emanhwiel alogn with this to fidn each and evry one minute of high low tarckign cpaturing also we beed to tarck pature and do it irtght dude am i irght dude tell me dude okay?"
+
+**Authorization to implement (same session, immediately after the plan was
+listed back with this item marked as needing his decision):**
+
+> "yes dude fix evrythgin dud ehwtevr i have stared and discusse ddude oaky?"
+
+This section is the dated record the rule-file-first law requires, written
+BEFORE the code change. It REVERSES a behaviour that is currently deliberate
+and test-defended, so it cannot land on a verbal reading alone.
+
+#### What the code does TODAY, and why it was written that way
+
+`crates/app/src/day_ohlc_orchestrator.rs` states it in its own header:
+
+> *"`day_open` is the first live SESSION tick (not a pre-market value) … the
+> 09:15:00 tick IS the day open"*
+
+`day_ohlc_session_accepts` REFUSES every pre-open timestamp, and
+`test_preopen_tick_never_arms_day_open_then_0915_tick_is_the_open` exists
+specifically to keep it that way. That was a defensible choice when the
+pre-market buffer had just been deleted and the only alternative was a
+half-removed code path.
+
+#### Why the operator is right, and why the fix is not what it first looks like
+
+On NSE the 09:15 opening price **is** the pre-open equilibrium price,
+discovered in the 09:08–09:12 matching window. So "the 09:12 close is the
+09:15 open" is not a preference — it is how the exchange defines the open.
+
+Taking "the first tick we happen to observe at or after 09:15:00" is a
+DIFFERENT number for any instrument that does not trade in the first moments
+of the session. For a thin stock option that first prints at 09:31, our
+recorded `open` was a 09:31 price wearing the day's opening label. Across
+20,268 stock options that is a systematic error, not an edge case.
+
+**The fix is therefore NOT to synthesise an open from pre-open ticks.** The
+exchange already sends its own value: `ParsedTick.day_open`, present in every
+Quote and Full packet (`crates/common/src/tick_types.rs:38` — *"Day open price
+(from Quote/Full; 0.0 for Ticker)"*). The authoritative open is already on the
+wire and is being discarded in favour of a derived one.
+
+#### The contract
+
+| Aspect | Locked value |
+|---|---|
+| Source of `day_open` | the EXCHANGE field `ParsedTick.day_open` when finite and > 0 |
+| Fallback | first in-session tick LTP, exactly as today — Ticker-mode packets carry `day_open = 0.0` and must not be broken |
+| Pre-open gate | UNCHANGED for high/low/close. This section changes where OPEN comes from; it does not admit pre-open ticks into the day's range |
+| Per-minute high/low | UNCHANGED — already folded per tick into the 1m bucket and 23 other frames |
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Synthesises a day open from a pre-open tick LTP instead of reading the
+  exchange's own `day_open` field.
+- Lets a `day_open` of `0.0` (the documented Ticker-mode absent sentinel)
+  overwrite a real open with zero.
+- Admits pre-open ticks into day HIGH/LOW/CLOSE under cover of this quote —
+  it authorizes the OPEN only.
+- Removes the first-tick fallback, which is the only source for a Ticker-mode
+  instrument.
+
+
+
+### 2026-08-26 (SECOND) — DEPTH-200 IS NIFTY + BANKNIFTY ATM, AND IT MUST TRACK ATM ALL SESSION
+
+**The verbatim operator demand (2026-08-26, typed directly in-session — preserve
+EXACTLY, expletives and typos included):**
+
+> "see meanwhile clealry ntoe for evry one minute alwyas espeiclaly for dpeth 200 esppeiclaly as of now nifty atm ce atm pe always for every one minute resusbcribe dude okay even for bancknfity atm ce atm pe also dude okay are you doign this dude as of now or nto dude okay"
+
+**The authorization (same session, in direct response to the three open items
+being listed back to him):**
+
+> "fix and resolve evryhtign dude okay?"
+
+#### What was actually happening — measured, not inferred
+
+The five depth-200 sockets on 2026-08-26 carried:
+
+| Slot | Contract | Rows in the 09:20 minute |
+|---|---|---|
+| 1 | NIFTY Sep-26 24150 CE | 100,800 |
+| 2 | FINNIFTY Sep-26 26250 CE | **800** |
+| 3 | FINNIFTY Sep-26 26250 PE | **800** |
+| 4 | MIDCPNIFTY Sep-26 15000 CE | 100,000 |
+| 5 | MIDCPNIFTY Sep-26 15000 PE | 100,800 |
+
+**BANKNIFTY got ZERO sockets**, and NIFTY got one lone leg. Two of the five
+went to FINNIFTY strikes delivering ~125x less than the others.
+
+**The cause is `atm_distance`**, which returns `|strike - spot|` — a RAW
+ABSOLUTE price distance — and `select_depth_universe` sorts one `pair_pool`
+mixing every underlying by that number. Absolute rupee distance is not
+comparable across underlyings with different price levels and strike
+spacings: a FINNIFTY strike 50 points from a ~26,200 spot outranks a
+BANKNIFTY strike 100 points from a ~57,500 spot, though the BANKNIFTY strike
+is nearer in every sense that matters and vastly more liquid.
+
+That mis-ranking also caused a second, separate fault: connections 12 and 13
+redialled **112 and 210 times** (against 19 each for the other three) because
+the 50-second idle-silence watchdog reads a sparse deep book as a dead socket.
+Putting liquid ATM contracts in those slots removes the churn as a side
+effect — one fix, two faults.
+
+#### The contract (LOCKED)
+
+| Aspect | Locked value |
+|---|---|
+| Priority | **NIFTY first, then BANKNIFTY.** Their ATM CE/PE pairs claim four of the five sockets before any other underlying is considered |
+| Ranking within an underlying | nearest-ATM, unchanged |
+| Ranking ACROSS underlyings | **normalised**, never raw rupees — absolute distance is not comparable between a 24,000 index and a 57,000 one |
+| 5th socket | unchanged: the next-nearest lone leg, with `depth_200_lone_leg` still reporting it |
+| Budget | UNCHANGED — 5 instruments, 5 sockets. This changes WHICH five, never how many |
+| ATM tracking | the selected strike must follow spot through the session, not freeze at the boot-time value |
+
+#### What this reverses, stated rather than quietly applied
+
+`dhan_feed_stack` skips re-selection once `depth_done`, on the recorded
+grounds that "re-running two QuestDB queries a minute for a set that is
+already subscribed buys nothing". That was true of a set chosen by identity
+and false of a set chosen by ATM: an ATM contract picked at 09:10 is not ATM
+at 14:00 if the index moved, so the boot-time choice decays all session. The
+operator's instruction is that it must track.
+
+**Edge-triggered, NOT unconditional.** "Re-subscribe every minute" taken
+literally is ~375 re-subscribes per socket per session, on the very feed whose
+reconnect churn this same change is fixing. The re-subscribe fires only when
+the resolved ATM strike actually CHANGES, which yields the operator's outcome
+at a fraction of the cost. A no-op minute must cost no socket action.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Ranks depth-200 candidates across underlyings by raw `|strike - spot|`.
+- Lets any underlying outside NIFTY/BANKNIFTY take a socket while a NIFTY or
+  BANKNIFTY ATM pair is available.
+- Changes the socket or instrument budget (5 remains 5).
+- Re-subscribes unconditionally every minute rather than on an ATM change.
+- Hardcodes contract security-ids — they expire; the chain leg is the source.
+### 2026-08-26 — THE OPEN RULE RE-AFFIRMED, AND WHAT WAS ACTUALLY MISSING
+
+**The verbatim operator demand (2026-08-26, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "Always ensure the finalised pre open 9.12 close price as 9.15 am open price dude menawhile fix and resolve evryhrinf else Dus eokay"
+
+This is the THIRD statement of the same requirement (2026-08-25 twice, now
+again), and it is recorded because the operator restated it, not because
+anything about the contract changed. **The §"2026-08-25" contract above is
+UNCHANGED and remains the authority**: `day_open` comes from the EXCHANGE field
+`ParsedTick.day_open` when finite and plausible, with the first in-session tick
+LTP as the fallback, and the pre-open gate on HIGH/LOW/CLOSE is untouched.
+
+**This quote does NOT authorize folding pre-open ticks into candles.** The
+operator's words are about the OPEN PRICE, which is a different mechanism from
+the `out_of_session` ingest gate (402,549 ticks refused on 2026-08-26). The
+2026-08-25 section already says so in as many words — *"it authorizes the OPEN
+only"* — and that carve-out stands. Reading a re-affirmation of a rule as an
+expansion of it is the scope-smuggling this file's REJECT lists exist to stop.
+
+#### VERIFIED WORKING, live, before this note was written
+
+Queried on the prod box mid-session, 2026-08-26 — `ticks`, security_id 13
+(NIFTY):
+
+| IST | `ltp` | `open` |
+|---|---|---|
+| 09:00:02 | 24035.25 | **NULL** — pre-open; Dhan sends no day-open field yet |
+| 09:15:00 | 24343.05 | **24341.95** — the exchange's equilibrium open |
+
+Two things this proves, and both matter:
+
+1. **The exchange's open is what we store**, and it DIFFERS from the 09:15 LTP
+   (24341.95 vs 24343.05). So "the first tick at or after 09:15" would ALSO
+   have been wrong; only the vendor's own field is right.
+2. Every one of the 101,348 null-`open` rows that day was `IDX_I`, and they sit
+   before 09:15. Indices legitimately have no exchange open during pre-open.
+
+#### THE GAP THAT WAS REAL — a ratchet, not the behaviour
+
+The behaviour was already correct: `update_tick_with_exchange_open` assigns
+`self.day_open = exchange_day_open` unconditionally on every plausible open, so
+a late-arriving exchange open CORRECTS a fallback taken from a pre-open print.
+What did not exist was a test for that path. The one test on this rule
+(`the_exchange_open_replaces_the_first_tick_we_happened_to_see`) covers the
+open arriving WITH the first tick — not the shape indices hit every single
+morning, where the first several ticks carry no open at all.
+
+So a refactor that made the adoption first-write-wins would have left NIFTY's
+recorded day open at **24035.25, a pre-open price, wrong by ~307 points on the
+headline index every day**, and every existing test would still have passed.
+
+Added, using the live numbers above as the fixture:
+`a_late_exchange_open_corrects_the_preopen_price_we_fell_back_to` and
+`many_preopen_prints_still_end_on_the_exchange_open`
+(`crates/trading/src/in_mem/day_ohlc_tracker.rs`).
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Makes the exchange-open adoption first-write-wins, or otherwise lets a
+  pre-open print survive as the day open once the exchange has published one.
+- Deletes or weakens either new test.
+- Treats this re-affirmation as authorization to fold pre-open ticks into
+  candles, or into day HIGH/LOW/CLOSE — it is not, and the 2026-08-25 carve-out
+  binds.
+- Uses "the first tick at or after 09:15" as the open instead of the exchange's
+  own field (measured above: they differ).
+
+### 2026-07-24 — TrueData live market-data WS authorized as feed #4 (default-OFF, trial-first)
+
+Operator Parthiban, 2026-07-24 (verbatim quotes preserved in
+`.claude/rules/project/truedata-feed-scope-2026-07-24.md` §0): authorized preparing
+**TrueData** as a fourth, **default-OFF** live-tick market-data feed for a trial
+("our plan is to do the trial version with true data … the truedata websocket live feed
+entirely … not even miss even a single tick … entirely RUST O(1)").
+
+Effect on this lock: the 2026-07-15 amendment's "total live market-data WebSocket
+connections: 0; GDF is the ONLY path to any future live market-data WebSocket" is AMENDED
+— TrueData (`wss://push.truedata.in:<port>`, feed='truedata') is a SECOND sanctioned
+live-market-data-WS path, **default-OFF** (`feeds.truedata_enabled = false`, serde
+default). When `truedata_enabled = true` the live-market-data-WS count is 1 (TrueData);
+default remains 0. Groww/Dhan live WS stay retired; the Dhan/Groww order-push channels are
+unaffected. Native Rust only (TrueData SDK reference-only). Full contract + the 90-byte
+tick layout + the zero-tick-loss / O(1) / instance / reversibility envelope:
+`truedata-feed-scope-2026-07-24.md`. Companion plan:
+`.claude/plans/active-plan-truedata-feed.md` (DRAFT — operator flips to APPROVED before any
+implementation PR).
+
+### 2026-08-15 — FULL-MODE, FULL-UNIVERSE SUBSCRIPTION SCOPE (the ~24,600-instrument set)
+
+**The verbatim operator demand (2026-08-15, typed directly in-session — preserve
+EXACTLY, expletives and typos included):**
+
+> "bro see clelary note our entire NTM and entire nse idncies indices and thee ntire ntm and nse indices neitre futures of all the expirires shdou lbe fully subscribed dude wiht full mdoe dude and tehn see one and onl yfor indcies for nifty and banknifty entire options contarcts shodu lbe fully subscribed dude that too alwyas one and onl yfor the current expiry dude okay? then onely fir stocks the max atm plus or minus 25 for btoh call and put should be entirley susbcribed that toto here also current expireis alone right dude alwyas full mdoe right due am i irgth dude tell me dude okay? see emanwhiel what ahpepend to this fuckign 250 dpeth 20 and 5 depth 200 and its precise tabels also ddue okay?"
+
+**The authorization (2026-08-15, same session, in direct response to a message
+that laid out the counted scope, the three blockers, and the depth finding):**
+
+> "fix all of thes eneitrley dude okay?"
+
+That second quote is the go. It was given AFTER the reply that named
+`MAX_DAILY_UNIVERSE_SIZE = 1200`, the Quote-mode scope lock, and the fact that
+depth has no table — so it authorizes those three specifically, not a vague
+"do more".
+
+#### The authorized subscription set
+
+| Class | Mode | Expiry scope | Count |
+|---|---|---|---|
+| All NSE indices | **Full** | n/a | ~30 |
+| NTM constituents (spot) | **Full** | n/a | ~750 |
+| Index futures | **Full** | **ALL expiries** | ~21 (Assumed 7 × 3) |
+| Stock futures | **Full** | **ALL expiries** | ~660 (Assumed 220 × 3) |
+| NIFTY + BANKNIFTY options | **Full** | **current expiry ONLY** | ~700 (Assumed) |
+| Stock options, **ATM ± 25 both legs** | **Full** | **current expiry ONLY** | 22,440 (220 × 51 × 2) |
+| **TOTAL** | | | **~24,600 of 25,000** |
+
+The set is sized to the 5 × 5,000 main-feed capacity with ~400 spare. Only the
+stock-option row is arithmetic; every other count is **Assumed** until the
+master resolves live.
+
+#### What this quote CHANGES (each needs its own lockstep edit)
+
+1. **`MAX_DAILY_UNIVERSE_SIZE` 1,200 → 25,000.** The authorized set is 20×
+   the current boot-halt envelope. Without this the lane refuses to boot.
+2. **`DEFAULT_MAIN_FEED_MODE` Quote → Full.** 50 B → 162 B per packet, 3.24×
+   the bytes. The test `test_the_default_feed_mode_is_the_scope_locked_quote_mode`
+   pins the old value and must be re-blessed in the SAME change.
+3. **Universe builder gains contracts.** It resolves SPOT only today (4,565).
+   Options and futures selection does not exist and must self-roll at expiry —
+   a hardcoded contract list is a REJECT (it goes stale weekly, breaching the
+   standing no-manual-intervention mandate).
+4. **Depth gets tables, or depth stops dialing.** See below.
+
+#### The depth finding this quote responds to (Verified in source, 2026-08-15)
+
+The operator asked what happened to the 250 depth-20 and 5 depth-200 and their
+tables. Traced end to end:
+
+- The drain routes `Depth20 | Depth200` frames to a `depth_unconsumed` counter.
+  Its own comment: *"Captured durably in the WAL, counted here, and NOT folded:
+  no depth consumer exists yet."*
+- `ls crates/storage/src/ | grep -i depth` → **NONE**. `market_depth` and
+  `deep_market_depth` were deleted with the earlier live-feed retirements.
+  Only the packet-layout constants survive in `constants.rs`.
+
+So today depth-200 pulls 512 KiB frames and **discards every one**. That is the
+largest wasted bandwidth in the design and the reason the 2026-08-14 ring split
+(`MAIN_FEED_RING_MAX_BYTES` 3:1) exists — a discarded stream must not evict the
+kept one.
+
+**BINDING:** depth sockets may not be dialed against instrument sets whose
+frames have no consumer. Either the vertical (parser call → DDL → writer →
+dedup keys → retention → alarms) lands, or the depth pools stay at zero
+instruments. Opening 255 sockets that discard everything is strictly worse
+than opening none, and reporting them as "connected" is the false-OK this file
+exists to stop.
+
+#### Honest envelope
+
+- **Full mode already carries 5 levels of bid/ask** inside its 162 bytes. Full
+  mode on 25,000 instruments therefore overlaps much of what depth-20 is for;
+  whether depth-20 is still wanted on the SAME instruments is an open operator
+  question, not a settled part of this authorization.
+- **CPU at this scale is UNMEASURED.** ~12,500 packets/sec at the open × (decode
+  + 24-timeframe fold + ILP append) has never run. Memory fits 32 GiB per the
+  Quote-13 sizing; CPU has no such analysis.
+- **Nothing here makes the feed work.** No Dhan tick has been received since
+  2026-07-13. The measurement that settles it is a non-zero `compared` from the
+  15:31 cross-verification.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Raises the universe cap without raising it in lockstep across the constant,
+  this file, and the ratchet that pins it.
+- Flips the feed mode without re-blessing the scope-lock test in the same PR.
+- Sources option/future contracts from a hardcoded list (goes stale weekly).
+- Dials depth sockets whose frames still have no consumer, or reports an
+  instrument-less depth pool as "enabled".
+- Claims any of this is working before a non-zero `compared`.
+
+#### 2026-08-19 — APPLIED: the two constants this section's REJECT list names
+
+The 2026-08-15 authorization above listed four things it changes. **Two were
+recorded and never applied**, which is worth stating plainly: for four days the
+rule file said Full mode and 25,000 while the code said Quote and 1,200. This
+subsection closes that gap and is the lockstep record its own REJECT rows demand.
+
+| Constant | Was | Now | Ratchet re-blessed in the same change |
+|---|---|---|---|
+| `connection.rs::DEFAULT_MAIN_FEED_MODE` | `FeedMode::Quote` (code 17, 50 B) | **`FeedMode::Full`** (code 21, 162 B) | `test_the_default_feed_mode_is_the_scope_locked_full_mode` + `test_the_main_feed_payload_carries_the_full_request_code` |
+| `constants.rs::MAX_DAILY_UNIVERSE_SIZE` | `1200` | **`25_000`** | `max_daily_universe_size_pinned_at_25000` + the rule-file cross-ref |
+
+The second test on the mode row is the one that matters: a constant changed
+while `subscription_builder` still emitted 17 would subscribe Quote packets
+while every document claimed Full, and the only symptom would be a quiet
+`unparseable` counter. It asserts 21 is present **and** 17 is gone.
+
+**What the mode flip does NOT deliver (Rule 11).** Every Full packet carries 5
+levels of bid/ask, and the drain discards them — `ParsedFrame::TickWithDepth(tick, _)`
+folds the tick and drops the depth, because no depth writer and no depth table
+exist. So the lane now pays **3.24× the bandwidth** and consumes the tick half.
+That is deliberate, not an oversight: the same section's second quote binds
+depth to "either the vertical lands, or the depth pools stay at zero
+instruments", and a writer must exist before anything is claimed as captured.
+The 5-level depth inside Full is the *cheapest* future source for that writer —
+it arrives on a socket already open — but wiring it is its own unit of work.
+
+**Neither constant makes the feed work, and neither is the measurement.** The
+universe cap in particular enforces nothing at all — see the corrected §2
+envelope note in `daily-universe-scope-expansion-2026-05-27.md`, which records
+that the live lane ran at 4,565 SIDs for a week against a stated 1,200 "cap"
+with no halt, because the enforcing function was deleted on 2026-07-13. The
+measurement that settles whether any of this works remains a non-zero
+`compared` from the 15:31 cross-verification.
+
+### 2026-08-15 (SAME DAY, SECOND QUOTE) — DEPTH IS CAPTURED IN FULL, INTO ONE COMMON TABLE; NOTHING IS DROPPED
+
+**The verbatim operator demand (2026-08-15, typed directly in-session — preserve
+EXACTLY, expletives and typos included):**
+
+> "nope mtoehrufcker we ened depth 20 and dpeth 200 shdou lbe shwon and vsisibil in one common atbek dude we need all of them eevry ticks dude okay? we need everyhtign we cnanot miss or hdi or wipe fof nayhtign dude okay?"
+
+Given in DIRECT response to a message that had recommended the opposite — it
+reported that depth-200 persistence "fills 100 GB in 1.6–6.5 days" and offered
+top-5 levels, derived aggregates, or sampled snapshots as alternatives. The
+operator read that and rejected all three. **This section overrules that
+recommendation.** It is recorded here rather than argued, because the cost is
+the operator's to accept and he has accepted it explicitly.
+
+#### What this authorizes
+
+| Surface | Before this quote | Now |
+|---|---|---|
+| depth-20 frames | captured to WAL, counted `depth_unconsumed`, **discarded** | **PERSISTED IN FULL** — all 20 levels, both sides, every update |
+| depth-200 frames | same — captured then discarded | **PERSISTED IN FULL** — all 200 levels, both sides, every update |
+| Destination | none — the writers were deleted with the earlier live-feed retirements | **ONE COMMON TABLE** carrying both depths together |
+| Sampling / truncation / top-N | recommended | **FORBIDDEN.** "we cannot miss or hide or wipe off anything" |
+
+#### The DEDUP key finding — the one thing that would have silently "wiped off" data
+
+A single table holding both depths is only safe if the DEDUP key distinguishes
+them. depth-20 and depth-200 both emit a level 5 bid for the same instrument at
+the same timestamp, and those are DIFFERENT observations from DIFFERENT sockets.
+A key of `(ts, security_id, exchange_segment, feed, side, level)` makes them
+collide, and QuestDB's UPSERT semantics mean **one silently overwrites the
+other** — the exact "wipe off" this quote forbids, produced by the schema rather
+than by any code path.
+
+**BINDING:** the common depth table's DEDUP key MUST carry a depth-kind
+discriminator (`d20` / `d200`) alongside the I-P1-11 composite and `feed`. A PR
+that ships this table without it is a REJECT, regardless of how the writer
+behaves.
+
+#### The honest cost — arithmetic, not a warning
+
+> **⚠ CORRECTED 2026-08-15 (same day), operator-caught.** The first version of
+> this table said **~70 GB/day** and **~350 GB/day**. Both were wrong by
+> **3.4×**, and the reason matters more than the numbers: the rate was
+> multiplied by **86,400 seconds — a full calendar day**. Depth frames only
+> arrive while the sockets are up, which is the persistence window 09:00–15:40
+> IST = **24,000 seconds**. Costing a market-data stream over a 24-hour day
+> credits it for the 62,400 seconds the exchange is shut. The row width was
+> also carried as a round "≈68 B" rather than derived; it is 72 B, shown below.
+
+Row width, derived: 4 SYMBOL columns (`feed`, `segment`, `depth_kind`, `side`)
+at 4 B of interned key each = 16 B, plus 7 eight-byte columns (`security_id`,
+`level`, `price`, `quantity`, `orders`, `capture_seq`, `ts`) = 56 B → **72 B**.
+depth-20 emits 40 rows/update (20 levels × 2 sides); depth-200 emits 400.
+Session = 24,000 s.
+
+| Pool | Instruments | Rows/update | At 1 update/s | At 5 updates/s |
+|---|---|---|---|---|
+| depth-20 | 250 | 40 | 17.3 GB/day | 86 GB/day |
+| depth-200 | 5 | 400 | 3.5 GB/day | 17 GB/day |
+| **Total** | | | **≈ 21 GB/day** | **≈ 104 GB/day** |
+
+**The 250-instrument depth-20 pool dominates, not depth-200.** That inverts the
+intuition the earlier recommendation was built on: the 5 deep sockets are the
+cheap half — and it survives the correction, because both pools scaled by the
+same wrong factor. The update rate is the unmeasured multiplier and still swings
+the answer 5×; it is **Assumed**, and the first live session measures it.
+
+> ### ✅ SETTLED 2026-09-06 — the Assumed multiplier is now MEASURED, and it is the HIGH column
+>
+> The paragraph above closes by saying the update rate "is **Assumed**, and the
+> first live session measures it." That session happened, and the measurement has
+> been sitting in `depth_persistence.rs`'s own module header since 2026-08-24
+> without ever being carried back to this table.
+>
+> | | rows/session |
+> |---|---:|
+> | This table's model at **1 update/s** | 288,000,000 |
+> | This table's model at **5 updates/s** | 1,440,000,000 |
+> | **MEASURED, 2026-08-24** | **1,530,651,649** |
+>
+> Implied rate: **5.31 updates/second** — slightly ABOVE this table's own high
+> column. At 72 B/row that is **110.2 GB/session** of logical depth rows: the
+> high column (104 GB) was right to within 6%, and **the low column (21 GB) is
+> understated 5.2×**.
+>
+> **That matters because the LOW column is the one the sizing decisions quote.**
+> `daily-universe-scope-expansion-2026-05-27.md` reasons that a 100 → 200 GB grow
+> "buys roughly +4.8 days at the low estimate and +1 day at the high one." Only
+> the second half was ever true. The same paragraph in this file says a 100 GB
+> root is "~4.8 days at the low estimate and ~23 hours at the high one" — it is
+> ~23 hours, full stop.
+>
+> **And 110 GB is not the disk burn.** The measured consumption is **~307 GB per
+> session** (booted 2026-09-01 at ~309.6 GB free, ended at 2.4 GB), i.e. **2.8×**
+> the logical depth rows once ticks, 24 candle frames, the raw-frame WAL, the
+> spill tiers and QuestDB's own write amplification are counted. A row-width
+> model is a floor on disk consumption, never an estimate of it — and this table
+> has been read as the latter.
+>
+> **What it cost.** On 2026-09-03 the volume reached 0 bytes free; on 2026-09-04
+> the box booted onto a full disk, captured **zero** ticks all day, and dropped
+> **2,000,238** frames before the write-ahead log — permanent loss, because a WAL
+> that cannot append cannot rescue. A 600 GB volume against a 307 GB session is
+> under two sessions of room, not the ~28 days the low column implies.
+>
+> Nothing about the SCOPE changes here — this is the measurement the table asked
+> for, recorded where the table is, so the next disk decision starts from the
+> right column.
+
+Against a **100 GB root** that is **~4.8 days at the low estimate and ~23 hours
+at the high one** — not the ~1.4 days and ~7 hours the wrong figure implied. gp3
+grows online in one command and `variables.tf` permits up to 200 GB.
+
+A further **~17% is available and deliberately NOT taken**: `level` (≤200),
+`quantity` and `orders` are `u32` on the wire and stored as `LONG`, costing
+12 B/row. Narrowing them to `INT` needs an i64→INT ILP coercion for which this
+crate has no existing precedent to copy, and getting that wrong fails every
+depth write. Measure it against a live QuestDB before shipping it.
+
+#### How "nothing is dropped" is actually delivered
+
+Capturing everything and keeping everything on EBS are different requirements,
+and only the first is what the operator asked for. The mechanism that satisfies
+this quote without a disk that cannot exist:
+
+**Same-day S3 archival.** `partition_archive.rs` already implements
+archive → verify → drop against the S3 cold bucket; today it runs at >90 days.
+The depth table registers with a same-day (or same-hour) partition policy: every
+row is written, verified in S3, and only then dropped from EBS. **Nothing is
+missed, hidden, or wiped — the hot window on local disk is simply short.** A
+drop that has not been verified in S3 first is a REJECT.
+
+Storage cost is real and belongs in front of the operator rather than inside a
+follow-up. **Recomputed on the corrected 21 GB/day** (22 trading days, not 30
+calendar days — the same session-vs-calendar error, applied to the month):
+~**460 GB/month**. In S3 Standard that is ~**$10.6/mo**; in Glacier Instant
+Retrieval ~**$1.8/mo**; in Deep Archive ~**$0.45/mo**. The storage-class choice
+still changes the bill by ~24×, but at this corrected volume even the most
+expensive tier is a fraction of the AWS ceiling rather than half of it — which
+materially weakens the case for aggressive tiering and strengthens the case for
+keeping the data readily queryable. At the 5-updates/sec end every figure
+multiplies by five (~2.3 TB/mo, ~$53 Standard).
+
+*(The pre-correction text said "~2.1 TB/month … ~$48/mo … over half the current
+AWS ceiling on its own". That framing drove the original
+don't-persist-depth-200 recommendation the operator overruled. He was right on
+both counts: the recommendation AND the number behind it.)*
+
+#### What this quote does NOT change
+
+- The 16-connection budget and the four endpoint types. Unchanged.
+- `dry_run` stays true; no live order fire; the §28 frozen area is untouched.
+- The per-minute REST legs keep running (the 2026-08-11 second-quote KEEP).
+- The finding that **depth needs tradeable contract security-ids**, and that the
+  only sanctioned source is the already-running option-chain pull's per-leg
+  `security_id` (2026-08-11 second quote). Persisting depth does not create
+  instruments to subscribe; that constraint stands.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Ships the common depth table without a depth-kind discriminator in the DEDUP
+  key (silent overwrite between the two pools).
+- Persists top-N levels, sampled snapshots, or derived aggregates INSTEAD of the
+  full book — explicitly rejected by this quote.
+- Drops an EBS partition that has not been verified present in S3 first.
+- Opens depth sockets before the writer exists (the previous section's binding
+  rule stands — a captured-then-discarded frame is still a discarded frame).
+- Reports depth as "captured" while `depth_unconsumed` is still incrementing.
+
+### 2026-08-20 — MAIN-FEED PACKS ITS FIRST PASS (the 2026-08-12 spread directive, amended so it can actually be delivered)
+
+**The verbatim operator demand (2026-08-20, typed directly in-session — preserve
+EXACTLY, expletives and typos included):**
+
+> "See without building our entire plan why the fuck you stopped motjerfuxker youcfinaih everything entirely fully motherucker rokah"
+
+Given in DIRECT response to a report that said 6 of the 16 authorized sockets
+carry data, that contracts do not dial, and that closing it "needs your decision:
+pack the spot universe onto fewer sockets to leave room for contracts, or keep it
+spread across all 5." The operator's answer is that there was no decision to
+escalate — finish it. This section is the dated record that house law requires
+before the code changes.
+
+#### What this amends
+
+The 2026-08-12 directive told `plan_pool` to **SPREAD** across the authorized
+connections rather than pack into the fewest. That was correct for the shape it
+was written for: the main feed carried ONLY the ~4,565 spot universe, and four
+authorized sockets sat idle.
+
+The main feed is now dialed in **two passes** — spots at boot, and the ~20,000
+option/future contracts once post-open prices exist. Under spread, pass 1 takes
+`min(5, 4565)` = **all five** connections, so pass 2 is refused by the stateful
+`pool.admit`; and because `MainFeed` is the first endpoint in
+`build_feed_stack_plan`'s loop, that refusal aborted **Depth20 and Depth200
+planning as well**. Spreading the small first pass is precisely what starved the
+sockets the spread directive existed to fill.
+
+| pass | PACKED | SPREAD |
+|---|---|---|
+| boot spots (4,565) | 1 connection | 5 connections |
+| contracts (~20,000) | 4 connections | 0 — REFUSED |
+| **main-feed sockets carrying data** | **5** | **1** |
+| **depth planned at all?** | yes | **no — aborted by the main-feed refusal** |
+
+#### The amendment (narrow)
+
+**The MAIN FEED packs: `connections_to_use = ceil(len / cap).min(available)`.
+DEPTH continues to SPREAD, unchanged.**
+
+Depth must keep spreading and this is not a detail: depth-200 admits ONE
+instrument per connection, so packing it would open a single socket and strand
+four. The 2026-08-12 reasoning — failure isolation, head-of-line blocking,
+decode parallelism — stands verbatim for depth and stands for the main feed too
+once both passes have run, because the end state is the same five sockets.
+
+**At the 25,000 target the two policies converge exactly**
+(`ceil(25000/5000)` = 5 = `min(5, 25000)`), so this changes nothing at full
+scale and everything today.
+
+#### What this does NOT change
+
+The 16-connection budget; the four endpoint types; `dry_run` stays true; no live
+order fire; the §28 frozen indicator/strategy area; the per-minute REST KEEP; the
+Q3 ban on a hardcoded expiring contract list. Contract security-ids continue to
+come from the already-running option-chain leg, which self-rolls at expiry.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Packs DEPTH (strands four depth-200 sockets on one connection).
+- Lets `main_feed_connections_for` and `plan_pool`'s main-feed arm disagree —
+  that disagreement is the exact defect this amends, and it cost depth an entire
+  session while reporting a depth problem that did not exist.
+- Reports main-feed capacity without clamping to what the pool actually has
+  free (`.min(available)`), which asks for room that does not exist and earns a
+  refusal of the WHOLE pool.
+- Claims sockets are "carrying data" on the strength of a dial rather than a
+  received frame (see the same-day up-gauge correction).
+
+### 2026-08-21 — FULL MODE EVERYWHERE, and the ONE segment that cannot take it
+
+**The verbatim operator demands (2026-08-21, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "see evrythgin enitlrey it shdou lbe always full mode with depth 5 dude okay? why ti fialed bro what ahppened what si the issue we need evryhtign in palce and shdou lwork roght dude?"
+
+> "yes fix evrythgin. dude see i need the entire websokcet coenctions of 16 websocket coennections shdou lebe fully started to recieve the ticks startign from 9 am pre makret price and even market price startign 91.5 am also right dude am i irght dude tlem e dude okay?  so fix an dreoslev evrythgind dude okay?"
+
+Given in DIRECT response to a report that the 119 subscribed NSE indices had
+produced ZERO ticks since being subscribed, while 8,868 tradeable instruments
+were flowing normally at 17.5M ticks/session. This dated section is the
+rule-file-first record the 2026-08-15 §"APPLIED" subsection's own REJECT list
+requires before `DEFAULT_MAIN_FEED_MODE` behaviour changes.
+
+**Full mode with 5-level depth is CONFIRMED and is NOT changed.** Measured on
+the box the same day: 163,934 packets walked frame-by-frame out of the live
+capture log were **every one** `code 8` (Full, 162 bytes, 5 depth levels) —
+135,892 NSE_FNO and 28,042 NSE_EQ. The operator's requirement is already met
+for every instrument that has an order book, and this change does not touch it.
+
+**What this section authorizes is narrow: `IDX_I` — and ONLY `IDX_I` —
+subscribes in Quote (17) instead of Full (21).**
+
+| Segment class | Mode | Depth levels |
+|---|---|---|
+| NSE_EQ, NSE_FNO, BSE_EQ, BSE_FNO — everything with a book | **Full (21)** — unchanged | 5 |
+| **IDX_I only** | **Quote (17)** | none exist |
+
+**Why this is not a downgrade of anything real.** An index is a computed
+number, not a traded instrument. NIFTY has no bids, no asks, no order book —
+there is no depth-5 for Dhan to send. Asking for it requests something that
+does not exist, and Dhan's answer is not an error but SILENCE, which is
+indistinguishable from a quiet instrument. Quote still carries LTP plus day
+open/high/low/close at fixed offsets. Nothing is lost, because indices have no
+depth to lose.
+
+**The evidence (all measured 2026-08-21, not inferred):**
+
+| Finding | Value |
+|---|---|
+| IDX_I packets in 163,934 captured frames | **0** |
+| `code 6` PrevClose for IDX_I — which Dhan support CONFIRMED (Ticket #5525125) is emitted for IDX_I on ANY subscription in ANY mode | **0** |
+| `RISK-GAP-03` never-ticked count | **119** — exactly the index count (it was **4** on 2026-08-20, when four seeds were subscribed) |
+| IDX_I rows in `ticks`, any day on record | **0** |
+| Index IDs correct? | yes — master-sourced, segment 0, NIFTY=13 / BANKNIFTY=25 present in `instrument_lifecycle` |
+
+A subscription that never draws even its one guaranteed packet was never
+accepted. This is not a parser, registry or persistence fault — nothing arrived
+to parse.
+
+**This RESTORES a partition that already existed and was lost in the rebuild.**
+`docs/rules-archive/live-market-feed-subscription.md:279` records the
+pre-retirement design: *"the `WebSocketConnection` constructor pre-sorts IDX_I
+instruments into a separate Quote-mode subscription batch (`connection.rs`, the
+`idx_instruments` partition)"*, chosen so the exchange-computed day OHLC came
+from the packet rather than being tracked app-side. The lane was hard-deleted
+2026-07-17 and rebuilt in the 2026-08-09 revival with ONE global mode and no
+partition — `idx_instruments` has zero occurrences on the tree. The 2026-08-19
+flip to Full and the 2026-08-20 arrival of the 119 master index ids then made
+the loss visible for the first time.
+
+**⚠ UNVERIFIED-LIVE, and deliberately not claimed (Rule 11).** Whether Quote
+(17) is SERVED for IDX_I on this account is not settled in this repository:
+`docs/dhan-support/2026-05-18-idx-i-quote-full-mode-support.md` asked Dhan this
+exact question and **no answer is recorded**, and an older uncited note claimed
+Dhan forces Ticker (15) for indices. If Quote is also refused the failure is
+identical in shape — silence — so the verification is explicit: the
+`RISK-GAP-03` never-ticked count for the index set must fall to **zero** on the
+first session after this lands, and `SELECT count() FROM ticks WHERE
+segment='IDX_I'` must be non-zero. If it does not, `IDX_I_FEED_MODE` is the one
+line to change and `Ticker` is the next value to try. **Nothing here claims the
+indices now work; it claims the request we send is no longer one Dhan is known
+to answer with silence.**
+
+**What this section does NOT authorize:** any change to the mode of any other
+segment; a fifth endpoint type; more than 16 connections; any universe
+widening; any live order fire (`dry_run` stays true); or any edit to the §28
+frozen indicator/strategy area.
+
+**What a PR that violates this section looks like (REJECT):** subscribes IDX_I
+in Full or Ticker without a fresh dated quote here; applies the index override
+to a segment that has an order book (that would silently drop all ~24,600
+tradeable instruments off depth-5); sends a mixed-segment batch as ONE message
+(one Dhan message carries exactly one RequestCode, so one half would get the
+wrong mode); or reports the index set as covered while its never-ticked count
+is non-zero.
+
+### 2026-08-21 — SPOT UNIVERSE NARROWED to indices + F&O underlyings (the change that makes the authorized contract set fit)
+
+**The verbatim operator demands (2026-08-21, typed directly in-session — preserve EXACTLY, typos included):**
+
+> "See for nifty and banknifty indices alone only enifr cuurent options of current expiry right dude but for entire stocks options of fno alone only w ehsoud always pull current expiries of atm plus minus 25 alone right dude oaky."
+
+> "Go ahead and fix evrfhbrin fuxd eokay?"
+
+The first quote SPECIFIES the contract shape; the second authorizes the work.
+Both are recorded here BEFORE any code, per this file's own rule-file-first law.
+
+#### What the first quote CONFIRMS (already true — no change authorized or needed)
+
+| Operator's words | Code today | Status |
+|---|---|---|
+| NIFTY + BANKNIFTY: "entire options of current expiry" | `FULL_CHAIN_INDEX_UNDERLYINGS = ["NIFTY","BANKNIFTY"]`, full chain, current expiry, NO ATM window (`dhan_contract_universe.rs:223,655`) | **already correct** |
+| F&O stocks: "current expiries of atm plus minus 25 alone" | `STOCK_OPTION_ATM_STRIKES_EACH_SIDE = 25` (`constants.rs:995`) | **already correct** |
+
+This retires the executor's earlier recommendation to CAP the index chains. The
+operator has now explicitly ruled the opposite: index chains stay UNCAPPED. That
+is a decision on the record, not a loose end — and it means index-chain depth
+(measured 542 contracts on 2026-07-13, and 2,037 for three indices on
+2026-04-25) is a vendor-controlled swing the design accepts.
+
+#### What the second quote AUTHORIZES (the actual change)
+
+**The spot universe narrows from the master-sourced constituent set to NSE
+indices + F&O stock underlyings only.**
+
+The arithmetic, on MEASURED figures:
+
+| Component | Slots | Source |
+|---|---|---|
+| NSE indices (spot) | 119 | MEASURED — never-ticked count, 2026-08-21 |
+| F&O stock spots (required to compute ATM) | 216 | MEASURED — live QuestDB, 2026-04-25 (`constants.rs:981-983`) |
+| NIFTY+BANKNIFTY current-expiry options, full chain | 542–~1,200 | MEASURED range |
+| NIFTY+BANKNIFTY futures, all expiries | 6 | 2 × 3 |
+| F&O stock futures, all expiries | 648 | 216 × 3 |
+| F&O stock options, ATM ± 25 | 22,042 | MEASURED (`constants.rs:981-983`) |
+| **TOTAL** | **23,573–24,231** | **fits, 769–1,427 spare** |
+
+Against the CURRENT spot universe (`live_subscription_from_master = true`,
+measured **4,565** SIDs) the same contract set totals **~27,800–28,500** —
+over by ~3,000. The code says so itself at `dhan_feed_stack.rs:4855-4862`:
+*"leaving 4 whole connections plus ~435 spare ≈ 20,435 for contracts. The
+authorized contract set is ~23,820, so it ALREADY does not fit."*
+
+**So the spot universe is the ONLY lever left, and narrowing it is what makes
+the operator's stated design fit.** Nothing about the contract shape changes.
+
+#### The mechanical contract
+
+| Aspect | Locked value |
+|---|---|
+| New spot set | NSE indices (all, as today) + the F&O stock UNDERLYING set derived from `FUTSTK`/`OPTSTK` rows of the daily master |
+| Derivation point | artifact build time — `dhan_universe.rs` already holds `&[MasterRow]` with `InstrumentClass` (`:276`), so no new fetch and no new parse pass |
+| Artifact shape | a SEPARATE artifact listing F&O underlying ids. The existing mapping artifact is **not** re-shaped — an additive file cannot break a consumer that never reads it |
+| Default | **OFF.** Serde default false; an absent section keeps today's behaviour byte-for-byte |
+| Fail-soft | an unreadable/absent F&O artifact falls back to today's master-sourced set with a coded error — never a silent narrowing, and never an empty spot set |
+| Unchanged | the 16-connection budget, the 4 endpoint types, `dry_run`, the §28 frozen area, the per-minute REST legs, and the contract selection in every respect |
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Ships the narrowed spot universe **enabled by default**, in any config file, env var, deploy script, or serde default.
+- Caps, windows, or otherwise narrows the NIFTY/BANKNIFTY option chains — the operator explicitly ruled them UNCAPPED in the first quote above.
+- Changes `STOCK_OPTION_ATM_STRIKES_EACH_SIDE` away from 25.
+- Derives the F&O underlying set from anything other than the daily master's own `FUTSTK`/`OPTSTK` rows (a hardcoded list goes stale weekly — the standing no-manual-intervention mandate).
+- Lets an unreadable F&O artifact produce a SILENT fallback, or an empty spot set.
+- Re-shapes the existing mapping artifact rather than adding a separate one.
+
+#### Honest envelope
+
+The 22,042 stock-option figure is **2026-04-25** at **216** stocks. If today's
+F&O list or ladder depth has grown, the 769–1,427 spare shrinks accordingly —
+and at the top of the measured index-chain range the margin is already under
+800. `scripts/count-current-expiry-universe.sh` exists to replace April's
+number with a measured one; until it has been run on the box, **this section's
+"fits" verdict rests on a four-month-old measurement** and is stated as such.
+
+### 2026-08-21 (THIRD quote of the day) — THE ENTIRE GROWW FEED IS ORDERED REMOVED
+
+**The verbatim operator demand (2026-08-21, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "Dude along with all these see clealry note whqtber is entirely related to groww feed remove everything entilrey dude okay? Do you understand what I'm asking dude"
+
+This is the fresh dated quote that this file's own §"2026-08-11 (SAME DAY, SECOND
+QUOTE)" REJECT list demands before any Groww surface is stood down. It is recorded
+HERE, BEFORE any code change, per the rule-file-first law.
+
+#### What this REVERSES — stated plainly, because it is a reversal
+
+The 2026-08-11 second quote said, verbatim: *"Meanwhile elt the current rest api
+hit of evry minute for btoh dhan and groww shodu land let ir run dude okay?"* —
+and this file turned that into a REJECT row reading **"Stands down, disables, or
+starves ANY per-minute REST leg for Dhan or Groww in the name of the live lane"**.
+
+Ten days later the operator has ordered the opposite for the Groww half. The later
+instruction governs; the earlier one is recorded here rather than quietly
+overwritten, so the reversal is auditable. **The DHAN half of that KEEP is
+UNTOUCHED** — Dhan's per-minute spot-1m and option-chain legs keep running exactly
+as they do today. Nothing in this quote mentions Dhan.
+
+#### What is authorized
+
+| Surface | Disposition |
+|---|---|
+| Groww live NATS-over-WS market-data feed | already RETIRED 2026-07-15 — nothing to remove |
+| Groww per-minute REST legs (spot-1m, option-chain, per-contract 1m) | **REMOVED** — reverses the 2026-08-11 KEEP |
+| Groww order/position/trade PUSH channel + the §39 order-side lattice | **REMOVED** |
+| Groww daily master CSV / watch build / universe rider | **REMOVED** as a live path |
+| Groww cadence-scheduler executor arm | **REMOVED** |
+| Groww CloudWatch alarms, dashboard widgets, EMF metric names | **REMOVED in lockstep** — see the dead-monitor rule below |
+| Groww SSM token READ (`fetch_groww_access_token`) | **REMOVED** — tickvault never minted it (the bruteX Lambda owns minting; that Lambda is not ours and is unaffected) |
+
+#### ⚠ What this quote CANNOT mean, and must not be read as (SEBI)
+
+**`instrument_lifecycle`, `instrument_lifecycle_audit` and `index_constituency`
+rows carrying `feed='groww'` are NEVER deleted.** §5/§6/§25 of
+`daily-universe-scope-expansion-2026-05-27.md` bind them to SEBI 5-year
+point-in-time retention, and that obligation does not depend on whether we still
+consume the feed that produced them. Removing the WRITER is authorized; deleting
+the ROWS is not, and no PR under this quote may issue a `DROP`, `DELETE` or
+`TRUNCATE` against those tables. This is the single most important line in this
+section: "remove everything related to Groww" is a CODE instruction, and reading
+it as a DATA instruction would destroy regulatory history that cannot be rebuilt.
+
+#### ⚠ What is LOST by this removal (Rule 11 — no false-OK)
+
+1. **Dhan becomes single-source with no independent parity check.** The §37/§38
+   cross-verification compares our data against a Groww-derived record. With Groww
+   gone there is no second vendor to disagree with us, so a Dhan-side error becomes
+   undetectable by comparison — only by internal consistency. The 15:31 REST
+   cross-verify against Dhan's OWN historical API remains, and that is a weaker
+   signal: it can only catch us disagreeing with Dhan, never Dhan being wrong.
+2. **Any comparator left pointing at a feed that no longer publishes will report a
+   vacuous pass** — `compared = 0` rendering as "no mismatches". That is the
+   false-OK class this repo has retired twice. Every such comparator must be
+   removed or made to fail loudly on a zero-row comparison, in the SAME change.
+3. **Alarms on `tv_groww_*` metrics become permanently-green dead monitors** the
+   moment nothing publishes them. They must be deleted in lockstep, not left
+   sitting green.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Deletes, drops or truncates any `feed='groww'` row from the SEBI tables.
+- Stands down, disables or starves any **DHAN** per-minute REST leg under cover of
+  this quote — the 2026-08-11 KEEP still binds the Dhan half.
+- Leaves a `tv_groww_*` alarm, dashboard widget or EMF metric name in place after
+  its producer is gone (a permanently-green dead monitor).
+- Leaves a cross-verify or parity path that now compares against nothing and
+  renders `compared = 0` as success.
+- Removes shared, feed-generic machinery (the cadence scheduler, the `Feed` enum,
+  `spot_1m_rest` / `option_chain_1m` / `rest_fetch_audit` tables and their
+  writers) because "only Dhan is left" — the pluggable seam must stay clean for
+  GDF and TrueData, whose scope locks are untouched by this quote.
+- Ships the removal without the ratchet re-blessing it forces (the EMF
+  metric-name count, the Groww guard tests, the alarm-wiring pins).
+
+### 2026-08-22 — SPOT UNIVERSE = NSE INDICES + NIFTY TOTAL MARKET ONLY (supersedes the 2026-08-21 F&O-underlyings narrowing)
+
+**The verbatim operator demand (2026-08-22, typed directly in-session — preserve EXACTLY, expletives and typos included):**
+
+> "what the fick i clelayrl otld you o skip bse and aske dyout uckign pcik only nifty toal marjet stcoks and enitre nse indices aloen rigth mtoehrfucker then whyt he fuck stills truggligj motherufcke rhwy ? see emanhwiel why the fuck you didnt do the crsoss ebrificatione ntorley with nse india real nse idncies svcsv fiels downlaod becuase onl ywhen yo uhave thsoe aloen only then you cna do the cross verifictaion of each and eveyr data to preicsley fidn nifty total amrket symbsols repsectively rigtnh dude do yoir elaly udnerstand dude because if im not worn nse idnices woudl comeb anywhere between 120 and nifty total amrket would be aorudn 750 or 755 right dude then whyt he fuck still tehse are msisin dud ehwy if you dont do that then always you mtoehrukcxer wil lawlays tell me 4500 spots onl ywrist do thes emtoherucke rokay?"
+
+This is the dated quote the rule-file-first law requires, recorded BEFORE the
+code change it authorizes.
+
+#### What was already true, and what was actually missing
+
+The operator's two premises were checked against source before anything moved.
+One was already satisfied; the other was not, and he is right that it was not.
+
+| Premise | Verdict |
+|---|---|
+| "skip BSE" | **ALREADY DONE.** The spot path is NSE-only by construction — `nse_index_mappings` and `fno_underlying_mappings` both filter `row.exch_id != "NSE"`, and two tests pin it (`"NSE cash equities only: no BSE rows, no index legs"`, `"SENSEX is BSE — the operator narrowed to NSE alone"`). |
+| "you didn't do the cross-verification with the real NSE India index CSVs" | **HALF TRUE, and the half that is false matters less than the half that is true.** The download and the ISIN join DO exist and DO run: `build_once` fetches all **49** `INDEX_CONSTITUENCY_SLUGS` from `niftyindices.com` — `ind_niftytotalmarket_list` among them — and joins every constituent to the Dhan master **by ISIN** through `join_constituents`, fail-closed at a 2% unresolved tolerance and a 10% failed-list ceiling. So the cross-verification is built and gated. |
+| "then why do you still tell me 4,500 spots" | **THE REAL DEFECT.** The join's dedup key is `(index_name, security_id, segment)` — scoped PER LIST. The artifact therefore carries the **UNION of all 49 lists**, and `select_live_universe` dedupes that to the recorded **~4,565** SIDs. Nifty Total Market's ~750 rows are IN there, tagged `index_name = "Nifty Total Market"`, and **nothing ever selected them**. The data was resolved and then thrown into a pile. |
+
+So the machinery he asked for exists; what never existed is a selector that
+takes the ONE list he named out of the pile.
+
+#### What this quote changes
+
+| Surface | Before | After |
+|---|---|---|
+| Spot set, as configured | union of all 49 index lists (~4,565) | **NSE indices + Nifty Total Market constituents only (~869)** |
+| 2026-08-21 narrowing (indices + F&O underlyings, ~335) | the only narrowing that existed; OFF | **SUPERSEDED as the default choice**, key retained and still honoured when NTM is off |
+| BSE | excluded | excluded (unchanged) |
+| Contract shape | NIFTY+BANKNIFTY full current-expiry chains, stock options ATM ±25, all futures expiries | **unchanged — this quote does not touch it** |
+
+Precedence when both narrowing keys are on: **NTM wins**, because it is the
+later dated instruction. Stated in the config and pinned by a test rather than
+left to the order of two `if` blocks.
+
+#### The arithmetic this fixes (the reason the operator kept hitting a wall)
+
+| Spot set | Spot | Contracts authorized | Total vs the 25,000 cap |
+|---|---|---|---|
+| Union of 49 lists (today) | ~4,565 | ~23,820 | **~28,385 — OVER by ~3,385** |
+| Indices + F&O underlyings (2026-08-21) | ~335 | ~23,820 | ~24,155 — fits, 845 spare |
+| **Indices + NTM (this quote)** | **~869** | ~23,820 | **~24,689 — fits, ~311 spare** |
+
+The margin is thinner than the F&O-underlyings option and that is stated
+plainly: at the top of the measured index-chain range (2,037 legs for two
+underlyings) the total breaches the cap and `plan_pool` refuses the WHOLE pool
+fail-closed rather than truncating. That refusal is loud and is the correct
+failure — but it is a session-ending one, so the headroom here is real and
+small.
+
+#### Honest envelope
+
+- **~119 indices and ~750 NTM constituents are EXPECTED, not measured.** The
+  index count comes from the master's NSE `INDEX` rows and the NTM count from
+  whatever `ind_niftytotalmarket_list` serves on the day. Neither is a constant
+  in this repository and neither can be verified from a dev container. The
+  operator's own figures (~120 and ~750–755) match the expectation.
+- **Nothing here makes the feed work.** It changes which instruments are asked
+  for. A non-zero `compared` from the 15:31 cross-verification remains the only
+  evidence this repository can offer that ticks arrive at all.
+- **Fail-soft direction is UNCHANGED and deliberate:** an unreadable or
+  unparseable NTM artifact falls THROUGH to the full master-sourced set with a
+  coded error — the session subscribes MORE than was asked for, never less. A
+  silent narrowing would drop ~3,700 instruments with nothing to say so.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Sources the NTM set from anything other than `ind_niftytotalmarket_list`
+  joined to the Dhan master **by ISIN** (symbol-alone joins are banned by
+  §31.1 of `daily-universe-scope-expansion-2026-05-27.md` — tickers are reused
+  and renamed).
+- Hardcodes an NTM constituent list (it rebalances; a hardcoded list goes
+  stale and breaches the standing no-manual-intervention mandate).
+- Re-admits BSE to the spot set.
+- Lets an unreadable NTM artifact produce a SILENT fallback, or an empty spot
+  set.
+- Changes the contract shape (chain scope, ATM ±25, futures expiries) under
+  cover of this quote — it says nothing about contracts.
+- Flips `dry_run`, touches the §28 frozen area, or arms live order fire.
+
+#### 2026-08-22 (SAME DAY) — MEASURED ON THE BOX: the "~4,565 spot" figure in the section above is WRONG, and so is its capacity table
+
+The section above was written from source and from the figures this repository
+has been repeating since 2026-08-12. Both were then checked against the live
+box (`aws logs filter-log-events`, `/tickvault/prod/app`, session of
+2026-08-21). The correction matters more than the change it corrects.
+
+**The live spot set is 868. It has been 868. Nothing was ever subscribing 4,565.**
+
+```
+"live universe: widened from today's resolved master"
+  instruments: 868   master_entries: 4636   deduped: 3771   capacity: 25000
+```
+
+`4,565` / `4,636` is the **artifact ROW count** — one row per
+(index list, stock) membership pair, because `join_constituents` dedupes per
+list. `select_live_universe` then dedupes on `(security_id, segment)` and
+**3,771 of those rows collapse**. The union of 49 NSE index lists is ~749
+distinct stocks, which is essentially Nifty Total Market's own membership,
+because NTM is the superset the other broad lists are drawn from.
+
+**What this does to the capacity table above.** Measured the same session:
+
+| Line | This file said | Box says |
+|---|---:|---:|
+| Spot | ~4,565 | **868** |
+| F&O underlyings with ladders | 216 | **208** |
+| Index futures | ~6 | **18** |
+| Stock futures | ~648 | **640** |
+| Index options (current expiry) | 542–2,037 | **1,250** |
+| Stock options at ATM ±25 | 22,032 | **20,220** |
+| **Total subscribed** | ~28,385 (OVER by 3,385) | **22,996 — 2,004 spare** |
+| ATM window actually applied | "would silently shrink" | **25, `dropped_for_capacity: 0`** |
+
+So the capacity problem the section above was written to solve **did not
+exist**. ±25 fits at full width today with 2,004 slots spare.
+
+**What the NTM change therefore is, honestly.** Not a capacity fix — it
+changes the subscribed count by roughly nothing (868 → ~869). What it does
+buy is real but narrower: the set becomes **deliberately** NSE indices + Nifty
+Total Market instead of **incidentally** the union of 49 lists that happens to
+dedupe to the same membership. That removes a dependency on 48 lists nobody
+selected, makes the set reproducible from one named source, and shrinks the
+artifact from ~4,600 rows to ~869. The commit message and the section above
+claim a ~3,700-instrument saving. **That claim is withdrawn.**
+
+**How this file came to carry a wrong number for ten days.** The 4,565 figure
+entered on 2026-08-12 from a log line, was copied into `config/base.toml`'s
+comments, into `dhan_feed_stack`'s own reasoning ("~4,565 spot instruments
+leave ~20,435 for contracts"), into `config.rs`'s doc comment, and into the
+2026-08-21 narrowing rationale — each copy citing the last. Nobody re-read the
+line it came from, which reports `instruments` and `master_entries` as
+separate fields. A number that is only ever quoted is not evidence.
+
+**Still true, and unaffected by the correction:** the NTM rows really were
+being resolved and never selected; BSE really is excluded; the ISIN join
+really does run fail-closed. Those were checked in source, not quoted.
+
+### 2026-08-28 — CANDLES FROM 09:00, OHLCV ON THE RECEIPT CLOCK, PER-MINUTE ATM RE-FIT, AND THE PERCENTAGE COLUMNS
+
+**The verbatim operator demands (2026-08-28, typed directly in-session — preserve
+EXACTLY, expletives and typos included):**
+
+> "Yes fox and resolve everything always ensure to start eelvery candles starting at 9 am dude okay"
+
+> "Meanwhile ensure to achieve this ohlcv based on one and only received at dude okay?"
+
+> "See clealry ensure whenever the pre marketbope ticks and candles get finished ensure to provide this fucking atm plus minus depths also dude and starting 9.16 am every one minute resubscribe also right dude of current atm and what about pre oopem marketbpercentage change and even percentage change also dude okay?"
+
+**Preceding demands from the same session (2026-08-27), which these reaffirm:**
+
+> "still now nowhere I can see our entire ohlcv is nowhere captured based on revived at still it is looking at Ts soclelary ensure to use received at dude okay?"
+
+> "see meanwhile at 3.40 pm we need to pull all the entire underlying spots data right that too one and only for one minute right to do the cross verification between these and our cnaldes 1 min right whether everything is entirely mat he'd right dud eam I right dude"
+
+> "high low shoudl be on place base don current second and current minute to precisely capture day high day low"
+
+This dated record is written BEFORE any code, per the rule-file-first law.
+
+#### ⚠ The reaffirmation, recorded so the decision is auditable
+
+The receipt-clock instruction was given, measured against, reported back with
+contrary evidence, and then **reaffirmed**. The measurement is recorded here in
+full because it constrains HOW the instruction must be implemented, not whether:
+
+| Measured on production, 2026-08-27, NIFTY | Exchange clock | `received_at` clock |
+|---|---|---|
+| Session minutes present | 385 / 385 | **351 / 385** |
+| Bars exactly matching the vendor's own tape | 382 (99.2%) | 321 (83.4%) |
+| Phantom bars stamped outside market hours | 0 | **4** |
+| Ticks filed on the WRONG DAY | 0 | **4,319** |
+| **Ticks that would change minute on the LIVE path** | — | **0 of 83,871** |
+
+The last row is the load-bearing one. On the live path the two clocks are not
+merely close, they are **identical** — the exchange stamps whole seconds and we
+receive inside the same second, so the minute is never in dispute. The clocks
+diverge **only** on ticks replayed from the WAL, and there `received_at` carries
+the moment of REPLAY rather than the moment of receipt.
+
+**That is a DEFECT in how `received_at` is populated, not a property of the
+clock.** The true receipt instant is captured correctly and early — `FrameSink::
+accept` stamps it BEFORE the WAL append — and is then discarded at the WAL record
+boundary, because the record format carries `ws_type`, `frame_seq` and the frame
+bytes and nothing else. Replay therefore re-stamps with `now()`.
+
+**So the instruction is implementable and, once the defect is repaired, the
+receipt clock is strictly BETTER than today**: identical on the live path, correct
+on the replay path where today's exchange-clock rows are merely lucky, and it
+retires the entire late-arrival/refold policy because receipt is monotone per
+drain. The operator's instruction stands and is adopted.
+
+#### What is authorized
+
+| # | Surface | From | To |
+|---|---|---|---|
+| 1 | WAL record format | `TVW2` (ws_type, frame_seq, frame) | **`TVW3`** — adds an 8-byte LE `received_at_nanos`. Replay restores it instead of re-stamping `now()`. `TVW1`/`TVW2` records replay with `0`, which the persistence layer already maps to NULL — never a lying timestamp |
+| 2 | Candle bucketing clock | `exchange_timestamp` | **`received_at`**, for every timeframe |
+| 3 | Candle session start | 09:15:00 | **09:00:00**, for every timeframe |
+| 4 | ATM re-fit cadence | once at attach, top-up until 09:30 | **every minute from 09:16**, additive-only |
+| 5 | Percentage columns | four columns, all hard-coded `0.0` | **computed** — `change_pct`, `close_pct_from_prev_day`, `open_pct`, `open_gap_pct` (the pre-open gap) |
+| 6 | Cross-verification | already runs 15:41 over ~868 spots | **UNCHANGED in scope** — the operator's ask is already met; only the time budget is a real gap |
+
+#### ⚠ What must NOT move, and why (getting this wrong breaks the only ground truth)
+
+**`MARKET_OPEN_IST_NANOS` (09:15) STAYS.** It gates tick *persistence* and the
+DAY OHLC tracker — not candles. Moving it would admit pre-open ticks into the day
+high/low/close, which this file's own 2026-08-25 section forbids in as many
+words: *"Admits pre-open ticks into day HIGH/LOW/CLOSE under cover of this quote
+— it authorizes the OPEN only."* Only the trading-crate candle constant moves.
+The compile-time cross-assert that currently binds the two must be **deliberately
+severed with a comment**, never silently deleted, or the day gate follows the
+candle gate and the 2026-08-25 rule is breached by accident.
+
+**The cross-verification's 09:15 / 385-minute window STAYS.** Dhan's own tape has
+no pre-open minutes. Widening it would report 09:00–09:14 as `missing_rest` on
+every instrument every day and destroy the only ground truth the revived feed
+has. Pre-open live rows must be EXCLUDED from the comparison, never counted as
+missing.
+
+#### ⚠ MEASURED: the per-minute ATM re-fit will almost always be a no-op
+
+Recorded because the operator asked for a mechanism, and the mechanism should be
+built knowing what it will actually do:
+
+| Measured, 210 F&O underlyings, current expiry, 2026-08-27 | Value |
+|---|---|
+| Median strike spacing | **2.63% of price** |
+| Average intraday drift from the open | 2.20% = **0.8 strikes** |
+| Worst single underlying that day (15.86%) | **6.0 strikes** |
+| Window half-width | **25 strikes** |
+| Ladders where ±25 ALREADY takes every strike that exists | **81 of 210 (39%)** |
+
+The worst stock on that day moved **6 strikes inside a 25-strike buffer**, and
+for 39% of underlyings there is nowhere to re-centre to because the window
+already covers the entire ladder. The re-fit is therefore built **additive-only
+and delta-driven**: it recomputes every minute, and on a normal day it sends
+nothing. It is not built as a swap.
+
+**Additive-only is not a preference, it is the only safe shape today**, for four
+independent reasons: the transport has no `send_unsubscribe`; `SubscribeGuard`
+has no removal API and its instrument set IS the reconnect replay, so an
+unsubscribed instrument silently returns on the next reconnect; unsubscribe
+acknowledgement is undocumented; and error 805 is a DISCONNECT, so doubling wire
+traffic to reclaim slots trades bounded memory for tick loss — the wrong
+direction against the operator's own no-tick-loss mandate.
+
+**What bounds it, stated plainly:** ~2,000 spare aggregator slots against ~23,000
+already subscribed. A drift of one strike per underlying per minute would exhaust
+that in ~10 minutes. The measured drift is 0.8 strikes per DAY, so the headroom is
+ample in practice — but the re-fit must carry a per-minute cap and must fail
+CLOSED and LOUD at the ceiling: it stops adding, counts the refusal, and reports.
+It must never silently narrow the window.
+
+#### ⚠ What the pre-open candles will actually contain
+
+Not a uniform 15 extra minutes. A bucket exists only if a tick opens it; there is
+no synthetic fill and no carry-forward. Measured on 2026-08-27:
+
+- **~120 indices** tick continuously from 09:00 → full coverage across all frames.
+- **~750 equities** deliver one stale snapshot at ~08:30 (outside the window, so
+  rejected) and then **nothing until the 09:07 auction print** → the 09:00–09:06
+  buckets produce **no rows at all**, one bar at 09:07, then nothing until 09:15.
+
+Any consumer assuming "N bars per session" must treat pre-open absence as NORMAL,
+not as a gap. `tf_consistency` and the cross-verify comparator both make that
+assumption today and must be taught the difference.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Moves `MARKET_OPEN_IST_NANOS`, the day-OHLC gate, or the cross-verify window to
+  09:00 (breaches the 2026-08-25 rule and blinds the only ground truth).
+- Deletes rather than deliberately severs the compile-time assert binding the
+  candle gate to the persistence gate.
+- Switches the bucketing clock WITHOUT the `TVW3` receipt-preserving WAL record —
+  that is the combination measured to lose 8.8% of a session.
+- Implements the ATM re-fit as a SWAP, or wires unsubscribe, without first
+  building `send_unsubscribe`, a `SubscribeGuard` removal API, and aggregator slot
+  release with a full cell reset (a reused slot inheriting a foreign volume
+  baseline is the documented 9.2×-volume corruption class).
+- Lets the re-fit run on the socket reader task, or sends full sets rather than
+  deltas, or omits the 25 ms inter-batch pacing.
+- Computes a percentage change without guarding a zero or non-finite previous
+  close (this codebase has already been bitten by a NaN poisoning indicator state
+  for the life of the process).
+- Reports a pre-open minute with no ticks as a missing bar rather than as normal.
+
+### 2026-09-06 — DEPTH IS STOCK OPTIONS ONLY, RANKED BY VOLUME, WITH THE TWO OPTION FAMILIES RANKED SEPARATELY
+
+**The verbatim operator demands (2026-09-06, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+**Quote A (the requirement):**
+> "Dude clealry note for depth 20 check every 5 seconds top volume of stocks options strikes contracts alone dude I mean pick top 250 top volume aligned wirh top gainers dude okay? For depth 200 also always pick top 5 volume gainers stocks options strikes contracts dude but ensure on depth 200 top 5 should never ever be same symbols strike ddue okay?"
+
+**Quote B (the narrowing, minutes later):**
+> "See clelwry note for depth 20 and depth 200 only stocks options contracts strikes dude oaky? No underlying spot or futures or indices or indices fmo dude okay? Meanwhile we need to split this top volume gainers purely based on indices options vs stocks options dude okay?"
+
+**Quote C (the authorization):**
+> "See whatever I mentioned go ahead with that dude okay?"
+
+Quote C was given in DIRECT response to a message that ENUMERATED exactly what was
+blocked and why — removing NIFTY/BANKNIFTY from depth-20, the depth-200 change, and
+the SEBI deletion — so it selects the enumerated work. That is the §28.2/§28.3
+authorization shape this repository already accepts. Recorded HERE before any code,
+per the rule-file-first law.
+
+#### What this SUPERSEDES
+
+This is a reversal of the 2026-08-26 (SECOND) depth-200 lock and of the index half
+of the depth-20 layout the same day authorized. Both are recorded rather than
+quietly overwritten:
+
+| Surface | 2026-08-26 locked value | 2026-09-06 |
+|---|---|---|
+| depth-20 socket 1 | NIFTY ATM ±12, CE + PE (50 slots) | **stock options** |
+| depth-20 socket 2 | BANKNIFTY ATM ±12, CE + PE (50 slots) | **stock options** |
+| depth-20 sockets 3–5 | 37 gainers + 37 losers + 1 = 75 stocks, ATM CE/PE, ranked by PERCENT CHANGE | same shape, **ranked by VOLUME**, widened to fill 250 |
+| depth-200 | NIFTY ATM CE/PE + BANKNIFTY ATM CE/PE + 1 lone mover | **top 5 stock-option contracts, distinct underlyings** |
+| Ranking key | `close_pct_from_prev_day` | **cumulative day volume**, gainers as an eligibility filter |
+| Cadence | once a minute at :08, edge-triggered on an ATM change | **rank every 5 s**; re-subscribe still edge-triggered (see the envelope) |
+
+The 2026-08-26 REJECT row *"Lets any underlying outside NIFTY/BANKNIFTY take a
+socket while a NIFTY or BANKNIFTY ATM pair is available"* is **RETIRED by Quote B**,
+which excludes those underlyings from depth entirely. Its sibling rows — the socket
+budget (5 remains 5), no hardcoded contract ids, and normalised rather than raw
+cross-underlying comparison — all STAND.
+
+#### The contract (LOCKED)
+
+| Aspect | Locked value |
+|---|---|
+| Instrument class | **stock options only** (`OPTSTK`). NO spot, NO futures (stock or index), NO indices, NO index options. Quote B is explicit on all four |
+| Segment | `NSE_FNO` only. **SENSEX and BANKEX can never have depth** — they are `BSE_FNO` and Dhan serves depth on NSE alone; the existing refusal stands unchanged |
+| depth-20 | **250 instruments** = 5 sockets × 50, the highest-volume stock-option contracts |
+| depth-200 | **5 instruments** = 5 sockets × 1, the highest-volume stock-option contracts, **each a distinct underlying** |
+| Budget | UNCHANGED — 250 + 5. This changes WHICH, never how many |
+| Ranking key | **cumulative day volume**, read at byte offset 22 (`QUOTE_OFFSET_VOLUME`, const-asserted; the field is shared by the Quote AND Full layouts, not Full-only, and is ABSENT — reading 0 — in Ticker mode). ✅ **PROVEN CUMULATIVE 2026-09-09, live.** This row previously read "INFERRED, not proven … the single most load-bearing unproven input in the design", and called running the Track 2 SELECT "the cheapest high-value verification available". It was run: **9,879,724 ticks across 8,675 instruments in one session, 157 monotonicity violations = 0.0016%** (`.claude/plans/research/track-2-result-2026-09-09.md`; the runbook `docs/operator/track-2-monotonicity-select.md` carries the resolved banner). A per-packet delta field would fall on roughly half of all ticks, not on one in 630,000. The 157 are arrival artefacts — intra-second transposition and the documented slow-consumer skip — and are exactly what `VolumeLeaderboard`'s monotonicity gate refuses; the measurement now SIZES that gate's workload rather than leaving it hypothetical. The FALSE citation this row once carried ("Dhan Ticket #5525125", which is about PrevClose routing and contains zero volume facts) stays retired. Also measured the same run: **IDX_I carries `volume = 0` on every one of 866,796 index ticks**, so an index can never be ranked by volume and only its option contracts can — a property the design already relies on and had never checked. |
+| Gainer role | **eligibility filter, not the sort key.** An instrument qualifies if its underlying is in the day's gainers; volume then decides the order. This keeps the ordered set monotonic, and therefore stable |
+| **Family split** | index options and stock options are ranked in **SEPARATE leaderboards**, never one blended list |
+| Ranking cadence | every **5 seconds** |
+| Re-subscribe cadence | **delta-only, edge-triggered, capped per window** — NOT a 5-second full re-subscribe (see the envelope) |
+| Contract source | the daily master artifact. Hardcoding contract ids remains a REJECT — they expire |
+
+#### Why the family split is mandatory, not stylistic
+
+Quote B asks for the split and it is the load-bearing requirement, not a
+refinement. Measured on the box 2026-08-22: **1,250 index-option contracts against
+20,220 stock-option contracts**, and a single NIFTY weekly at-the-money strike
+out-trades stock-option strikes by orders of magnitude.
+
+**A single blended top-250 by raw volume returns 250 index strikes and zero stock
+options.** Not approximately — the stock options this lock exists to capture would
+never appear, and the selector would silently return the exact opposite of the
+requirement while every counter read green. The split is what makes a stock-option
+ranking exist at all.
+
+This is the same reasoning the 2026-08-26 lock already applies one level up, where
+cross-underlying ranking is normalised rather than raw rupees because a 24,000 index
+and a 57,000 index are not comparable. Volume across the two option families is that
+problem an order of magnitude worse.
+
+#### ⚠ The honest envelope (mandatory per operator-charter §F)
+
+**Three defects must ship WITH this change or the ranking is unsafe.** All three were
+found by the 2026-09-06 five-agent sweep and all three are live today:
+
+1. **`ParsedTick.volume` is `u32` with NO overflow guard on the Dhan path.** This
+   file's own TrueData section records that a liquid index/future day *exceeds*
+   `u32::MAX`. On wrap, cumulative volume falls from ~4.29e9 to near zero and the
+   most liquid contract silently leaves the leaderboard. A saturating read with a
+   refusal counter is REQUIRED.
+2. **`VOLUME-MONO-01` has an error code but its `volume_monotonicity_guard` module
+   was DELETED.** Cumulative volume is NOT monotonic in practice — WAL replay
+   re-injects older frames after newer ones, Dhan skips a slow consumer forward with
+   no sequence number, and the counter resets at 09:00. **One garbage value near the
+   ceiling pins the leaderboard threshold at a value nothing can ever beat, the depth
+   set freezes for the session, and every counter reads green.** A falling volume must
+   be refused, counted and logged, and must never move the threshold.
+3. **Percent gain divides by the previous close, which is a PROVEN NaN source** —
+   the quote parser carries a test that asserts it — and `0.0` is a live sentinel. A
+   non-finite comparator is non-transitive, so a heap ordered by it corrupts wholesale
+   rather than in one entry. This is the §28.4 poisoning class one module over; a
+   finite gate on the ingest side is REQUIRED.
+
+**NOT claimed — the thin-book risk, which is the operator's to accept.** NIFTY and
+BANKNIFTY held the depth-200 sockets because they are the only books deep enough to
+fill 200 levels. The 2026-08-26 incident measured two FINNIFTY strikes delivering
+**800 rows/minute against NIFTY's 100,800** — a 125× difference — and the idle
+watchdog read the sparse sockets as dead and redialled them **112 and 210 times**
+against 19 for the healthy ones. **Stock-option books are thinner than FINNIFTY's.**
+Putting all five 200-level sockets on stock options is expected to produce
+mostly-empty books and reconnect churn. That is a measurement, not an opinion; it is
+recorded here so the outcome is a decision rather than a surprise, and it is
+reversible by a fresh dated quote.
+
+**NOT claimed — that a 5-second full RE-SEND is possible.** (⚠ REFRAMED by the FOURTH quote below: the operator's requirement is that the SUBSCRIBED SET be current every 5 seconds, and delta-only delivers exactly that. This row states the refusal badly; read it with the reframe.) Swaps are one-for-one with
+no bulk API, each carries a 2 s wire budget on the drain task, and 250 swaps
+serialise to **up to 500 s against a 5-second window**. At 5 s the session runs
+**4,680** cycles (09:00–15:30 = 23,400 s), the per-socket command channel is depth 4,
+Dhan closes a socket silent for 40 s, error 804 parks a socket for the session, and 805
+is "Too many requests/connections — may result in user being blocked" (Dhan's own
+wording, `docs/dhan-ref/08-annexure-enums.md:348` — *may*, which this line previously
+asserted flatly as "an account block"). **The RANKING runs every 5 seconds (⚠ CORRECTED: this said "measured ~70 µs,
+0.0014%". That was the `scan_silence` constant borrowed from a LINEAR scan and
+applied to a `sort_unstable_by` — an invalid transfer, and it was the number used to
+argue the heap design away. ⚠ CORRECTED AGAIN 2026-09-12: the replacement figure "900 µs, a 0.018% duty cycle" was ALSO not a measurement — that harness was timing an EMPTY sort under a constant lot stub. Re-measured with the harness repaired and asserting a filled board: 2.95 ms at the ceiling where every contract traded, 123 µs at the assumed realistic shape. The CONCLUSION is unchanged twice over — even 2.95 ms is a 0.295% duty at 1 s and the heap's threshold-poisoning is still catastrophic — but the number was first understated 15x, then overstated 3.3x, and is now real); the SUBSCRIPTION moves only the delta, edge-triggered and capped per
+window**, which is the shape the existing re-fit already uses and for these reasons.
+
+**NOT claimed — that this improves capture.** 2026-09-04 captured ZERO ticks and
+dropped 2,000,238 frames before the write-ahead log because the volume was full. That
+sits upstream of every word here.
+
+#### ⚠ What this quote does NOT authorize
+
+- **Any deletion of SEBI or audit rows.** `instrument_lifecycle`,
+  `instrument_lifecycle_audit`, `index_constituency`, `order_audit`,
+  `order_update_events`, `position_update_events` and `ws_event_audit` are NEVER
+  deleted. A general "go ahead" is precisely the shape §5-class REJECT lists name as
+  insufficient — *"even if the operator approves verbally"* — and the retention is a
+  five-year regulatory obligation that cannot be rebuilt. Authorizing it needs its own
+  dated quote naming those tables.
+- Any change to the socket or instrument budget (250 + 5 remain).
+- Any fifth Dhan endpoint type, or more than 16 total connections.
+- Live order fire; `dry_run` stays true.
+- Any edit to the §28 frozen indicator/strategy area.
+- Depth on `BSE_FNO` — structurally impossible, unchanged.
+
+
+#### 2026-09-06 (FOURTH quote, same day) — the reaffirmation, and the one thing it changes
+
+**The verbatim operator demand (preserve EXACTLY, typos included):**
+
+> "See for depth 20 and depth 200 never ever use the index options dude see every 5 seconds it shoudl he reussbribed to this stocks options strikes contracts alone only that too top volume gainers dude see for depth 20 pick top 250 but for depth 200 always ensure to to have top 5 as different symbols dude okay? If same symbols multiple strikes contracts mejas then have it as unique dude okay?"
+
+Three of its four clauses restate the contract above **exactly** and change nothing:
+index options never reach depth, depth-20 takes 250, depth-200 takes 5 distinct
+underlyings. They are recorded because a third statement of the same requirement is
+evidence about what matters to the operator, not noise — and because the last clause
+sharpens the depth-200 rule into a form worth pinning by test (below).
+
+**The fourth clause — "every 5 seconds it should be resubscribed" — is the second
+time this has been asked for, and the envelope above framed the answer badly.**
+
+##### The reframe: delta-only IS the 5-second resubscribe
+
+The envelope reads *"NOT claimed — that a 5-second RE-SUBSCRIBE is possible"*, which
+states a refusal. That is the wrong frame and it is corrected here. What the operator
+is asking for is a PROPERTY of the subscribed set:
+
+> at every 5-second boundary, the 250 instruments Dhan is streaming ARE the current
+> top 250 by volume.
+
+**Delta-only delivers exactly that property.** It is not a reduced version of the
+requirement — it is the only implementation of it that survives contact with the
+vendor, for a reason that is Dhan's, not ours:
+
+| | |
+|---|---|
+| What a literal full re-send does | re-subscribes instruments the socket already holds |
+| What we expect Dhan to answer | **804 — "Requested number of instruments exceeds limit"** (`docs/dhan-ref/08-annexure-enums.md:347`). ⚠ **The doc supports the WORDING of 804 only. That a DUPLICATE subscribe triggers it is THIS REPOSITORY'S INFERENCE** — nothing in `docs/dhan-ref/` documents duplicate-counting — and it is repeated in ~8 code comments, which is how an inference starts reading like a vendor fact. The reasoning: a duplicate counts again against the per-connection cap, so re-sending 50 held instruments to a 50-slot socket asks for 100. Sound for depth-200 (cap 1, so 2 > 1 regardless); UNPROVEN for depth-20, where it holds only if Dhan adds rather than de-duplicates |
+| What 804 costs | `classify_disconnect` files it **Fatal**: the socket closes and does not re-dial. `SubscribeGuard` replays the same retained set, so a re-dial earns the identical rejection — deterministic, for the session |
+| What the churn itself risks | **805 — "Too many requests/connections — may result in user being blocked"** (same table, line 348). *May*, in Dhan's own word — not a certainty, and not something to test against a live account |
+
+So a literal 5-second full re-send does not deliver the requirement more faithfully;
+it **destroys the sockets on the first cycle** and the set becomes permanently stale
+at whatever it held. The delta is what keeps the property true.
+
+**What is unchanged and what tightens:**
+
+| | |
+|---|---|
+| Ranking cadence | every **5 seconds** — unchanged, and it is free (~60 µs, a 0.0012% duty cycle) |
+| Set freshness | the subscribed set reflects the ranking **as of the last 5-second sweep** — this is the operator's requirement, met |
+| Wire traffic | only instruments that ENTERED or LEFT the top 250. A quiet window costs **zero** socket actions |
+| Per-window cap | a bounded number of swaps per window, with the refusal counted — so a churning market cannot serialise 250 two-second swaps into a 5-second window |
+
+##### The depth-200 clause, pinned rather than assumed
+
+*"If same symbols multiple strikes contracts means then have it as unique"* is the
+precise statement of the distinct-underlying rule: when the top five by volume
+contain several strikes of ONE stock, keep that stock's heaviest contract and take
+the next DISTINCT underlying for the remaining sockets. Greedy over the volume order
+does exactly this, and `rank_distinct_underlying` implements it — but the operator
+has now stated the multi-strike case explicitly, so it is pinned by its own named
+test rather than left as a property of the general case.
+
+##### ⚠ The blocking prerequisite nobody had named
+
+Raising the cadence multiplies one existing, UNVERIFIED risk by 12x, and it must be
+probed before any cadence increase ships.
+
+`docs/dhan-ref/08-annexure-enums.md` records the depth UNSUBSCRIBE RequestCode as a
+cross-surface split — **24 vs 25** — with the weight of evidence "SHIFTED toward 24"
+and the conclusion **"UNVERIFIED-LIVE both ways"**. `constants.rs:397` ships
+`FEED_UNSUBSCRIBE_TWENTY_DEPTH = 25`. *(⚠ SUPERSEDED 2026-09-10 — the constant is now 24; the live session proved 25 ignored. See "2026-09-10 — THE DEPTH UNSUBSCRIBE REQUESTCODE IS SETTLED LIVE".)*
+
+If 25 is the wrong code, every unsubscribe is a silent no-op at Dhan's side and every
+swap becomes an ADD. A depth-200 socket then reaches 2 instruments against a cap of 1
+— 804, Fatal, parked for the session. `send_unsubscribe` is fire-and-forget
+(`connection.rs:1131`): `Ok` means bytes were written, not that Dhan removed anything,
+so there is no ack to detect it from. Today that risk fires at most 5 times a minute;
+at a 5-second cadence it fires twelve times more often.
+
+**So the ordering is: probe the unsubscribe code on a live session FIRST, then raise
+the cadence.** Shipping the cadence first is the one change here that could park all
+five depth-200 sockets for a session with no recovery path.
+
+**The thin-book cost is unchanged and still stated:** when the true top five ARE five
+strikes of one stock, this forces four substitutions into thinner books — the shape
+that measured 800 rows/minute against 100,800 on 2026-08-26. That is the operator's
+call and he has now made it twice.
+#### What a PR that violates this section looks like (REJECT)
+
+- Ranks index options and stock options in ONE blended leaderboard (returns zero
+  stock options — the defect this lock exists to prevent).
+- Subscribes any spot, future, index or index option to a depth socket.
+- Ships the volume ranking without the saturating read, the monotonicity gate, or the
+  finite gate on percent gain.
+- Re-subscribes unconditionally every 5 seconds rather than moving the delta.
+- Sorts by percent gain rather than using it as an eligibility filter (breaks
+  monotonicity and therefore stability).
+- Hardcodes contract security-ids.
+- Reports a depth pool as enabled while its instrument set is empty — including the
+  pre-open case, where volume is zero for everything and the ranking is meaningless.
+- Deletes a SEBI or audit row under cover of this quote.
+
+### 2026-09-07 — THE RANKING KEY BECOMES LOTS TRADED IN THE WINDOW, NOT UNITS TRADED SINCE OPEN
+
+**The verbatim operator demand (2026-09-07, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "see i decided to put our sort by volume liek this dude see based on lot quantity size it hsodul be chekced rigth suppose lets say per lot quantity is 200 and every second if it is having somwhwre or somehtign like 20k volume means and even per 5 seocnd also if the veolume is 25k means then you need to chekc the quantiyt to volume difference rigth then you will get the precise voluem percentage rigth dude so that eaisly we can sort it out right do youu dnerstand what im even aksing dude?"
+
+**The authorization (2026-09-07, same session, in DIRECT response to a message
+that enumerated this work, named the rule-file row it changes, and said it needed
+his word first):**
+
+> "Bro fix and resolve everything dude okay?"
+
+That is the §28.2/§28.3 authorization shape this repository already accepts — a
+general go-ahead answering an ENUMERATED ask selects the enumerated work.
+Recorded HERE before the code, per the rule-file-first law.
+
+#### What this SUPERSEDES
+
+The 2026-09-06 contract table row:
+
+| Aspect | 2026-09-06 locked value | 2026-09-07 |
+|---|---|---|
+| Ranking key | **cumulative day volume** | **lots traded IN THE WINDOW** = `(units traded since the last snapshot of this cadence × 1000) ÷ lot size` |
+| Unit | raw exchange units | milli-lots (integer, 3 decimal places of a lot) |
+| Horizon | since 09:15 | the 1s or 5s window that just closed |
+
+Everything else in that section STANDS unchanged and is not re-litigated here:
+stock options only, `NSE_FNO` only, 250 depth-20 + 5 depth-200, the two option
+families ranked in SEPARATE leaderboards, gainers as an eligibility FILTER and
+never the sort key, distinct underlyings on depth-200, delta-only edge-triggered
+re-subscribe, no hardcoded contract ids.
+
+#### The operator's own arithmetic, which is the specification
+
+His numbers define it exactly:
+
+| His words | Meaning |
+|---|---|
+| "per lot quantity is 200" | lot size = 200 units |
+| "every second ... 20k volume" | 20,000 units traded in that 1-second window |
+| "per 5 second also ... 25k" | 25,000 units traded in that 5-second window |
+| "check the quantiyt to volume difference" | divide volume by lot quantity |
+| "you will get the precise voluem percentage" | 20,000 ÷ 200 = **100 lots**; 25,000 ÷ 200 = **125 lots** |
+| "so that eaisly we can sort it out" | those figures are the sort key |
+
+Both halves matter and both are changes:
+
+1. **NORMALISE by lot size.** Without it the board compares a 15-unit lot
+   against a 1,800-unit lot and the big-lot contract wins on units while
+   trading fewer actual contracts. Ranking is supposed to find the BUSIEST
+   book, and units are not comparable across contracts; lots are.
+2. **Measure the WINDOW, not the day.** His figures are explicitly per-second
+   and per-5-seconds. Cumulative-since-open answers "who has been busy today",
+   which by mid-afternoon is a fact about the morning. The depth sockets should
+   sit on what is busy NOW.
+
+#### The contract (LOCKED)
+
+| Aspect | Locked value |
+|---|---|
+| Sort key | `lots_milli = (delta_units as u64 * 1000) / lot_size as u64` — integer, no float anywhere on the path |
+| `delta_units` | `stored_cumulative - baseline[cadence]`, saturating; a contract whose cumulative FELL is refused by the existing monotonicity gate before this is ever computed |
+| Baseline | per contract, PER CADENCE — the 1s and 5s windows are independent and each keeps its own; updated in the same pass that reads it |
+| First window after a contract is first tracked | baseline is seeded to the contract's CURRENT cumulative, so its first delta is **0** and it ranks nothing until it trades inside a real window |
+| Lot size | from `ContractOwner.lot_size`, guaranteed non-zero by `LegRefusal::MissingLotSize` |
+| Tie-break | unchanged — `security_id` then `segment`, so the order is total and stable |
+| Scale | `× 1000` (milli-lots). Integer division alone would collapse every contract trading under one lot in a 1-second window to 0 and make the bottom of a 250-deep board an arbitrary tie |
+| Overflow | `u32::MAX × 1000 = 4.295e12`, inside `u64`. Const-asserted, never `as` |
+| Cumulative pipeline | **UNCHANGED** — the monotonicity gate, `RELATCH_AFTER_CONSECUTIVE_LOWER`, the capacity cap and the refusal counters all stay exactly as they are. They guard the INPUT; this changes only the key derived from it |
+
+#### ⚠ The honest cost, which is a real behaviour change and not a detail
+
+**The board stops being monotonic, and that is the point of the change rather
+than a defect in it.** Today's key only ever rises, so the top-250 set is
+stable by construction and the delta-only re-subscribe sends almost nothing. A
+per-window rate rises AND falls, so the set will genuinely churn more, and every
+entry and exit is a depth swap on a socket.
+
+Three things bound that, and none of them is new machinery:
+
+* The re-subscribe is already **edge-triggered and delta-only** — a contract
+  that stays in the set costs nothing, however its rank moves inside the set.
+* It is already **capped per window**, with the refusal counted, so a violently
+  churning market cannot serialise 250 two-second swaps into a 5-second window.
+* The 5-second board is inherently steadier than the 1-second one, and it is
+  the 5s board that has the larger sample.
+
+**NOT claimed:** that the churn is small. Nobody has measured it, because no
+session has yet ranked on this key. `tv_depth_swaps_total` against the existing
+budget-refusal counter is the measurement, and the first live session is when it
+exists. If the swap budget is hit routinely, the answer is a longer window or a
+hysteresis band on entry/exit — NOT reverting to cumulative, which answers a
+different question.
+
+**NOT claimed:** that a 1-second window is statistically meaningful for a thin
+stock option. Many will trade zero units in any given second and rank 0, which
+is correct and not a bug; the 5s board is where a thin book gets a fair reading.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Ranks on raw units without dividing by lot size (the defect this fixes).
+- Uses a float anywhere in the sort key — a non-finite comparator is
+  non-transitive and corrupts a sort wholesale, which this file already records
+  once.
+- Defaults a missing lot size to 1 rather than refusing the contract.
+- Seeds a newly-tracked contract's baseline to 0, which makes its first window
+  report the WHOLE DAY and hands it a depth socket it did not earn.
+- Shares one baseline between the 1s and 5s cadences — each window must measure
+  its own interval.
+- Weakens or removes the monotonicity gate, the re-latch, or the capacity cap
+  because "the key is a delta now". They guard the cumulative INPUT and are
+  still exactly as load-bearing.
+- Re-subscribes unconditionally rather than on the delta, or removes the
+  per-window swap cap, on the grounds that the set churns more.
+
+### 2026-09-08 — DEPTH-200 RANKED STEERING WIRED; depth-20 NOT, and the dial still puts index options on the wire
+
+**No new authorization is claimed.** This is the record of the 2026-09-06 and
+2026-09-07 sections above being ACTED ON, and of exactly how far. PR #1890
+built the lots-in-window ranking and published its top five distinct
+underlyings (`depth200_candidates`), then only LOGGED the divergence between
+that ranking and what the five depth-200 sockets held — every socket kept
+following the at-the-money engine the lock bans. Recorded here because the
+`REJECT` list above says re-subscribing unconditionally is a violation, and the
+next reader needs to know which half of the lock is on the wire and which is
+not.
+
+#### What is now on the wire (`crates/app/src/depth200_ranked_steer.rs`)
+
+| Property the lock makes binding | Implementation |
+|---|---|
+| Delta-only | a socket already holding a ranked contract is never touched; only sockets holding something OFF the ranking swap, and only onto contracts held nowhere |
+| Edge-triggered | a minute where holdings and ranking agree costs zero wire calls |
+| Capped per window | `MAX_RANKED_SWAPS_PER_MINUTE` = 5, and never more than one swap per socket per minute (the reconcile-before-plan discipline the loop already had); refusals counted as `tv_depth200_ranked_swaps_total{outcome="capped"}` |
+| Distinct underlyings | inherited from the published ranking (`distinct_underlying_over`), not re-derived at a second site |
+| I-P1-11 | held-vs-ranked comparison on the `(security_id, segment)` composite; a held index option never reads as "already holding" the stock option that shares its number (pinned by test) |
+
+The at-the-money engine is consulted only until the FIRST ranking of the
+session is published; from then on it is bypassed for the rest of the session.
+`Some(empty)` (the ranking ran and selected nothing) moves nothing — it is not a
+fallback to the banned engine.
+
+#### ⚠ What is NOT delivered (Rule 11)
+
+1. ~~**depth-20 still runs the 2026-08-26 layout**~~ **DELIVERED later the same
+   day — see "2026-09-08 (SECOND)" below.** The ranking layer publishes the
+   gainer-eligible top set (up to 300 rows) for depth-20 and
+   `depth20_ranked_steer::plan_depth20_ranked_minute` steers the five
+   50-instrument sockets from it with a per-socket cap; the 2026-08-26 layout
+   survives only as the pre-first-ranking fallback. The strikethrough is kept
+   because this item was true when the section above it was written that
+   morning.
+2. **The boot dial still selects index at-the-money contracts for depth-200**
+   (`select_depth_universe`). For the first minute(s) of a session, until the
+   drain's first 5-second ranking exists, the five sockets carry the banned
+   class. Pre-open there is no volume to rank on, so this is the honest
+   starting state — but it means the lock is met from ~09:16, not 09:00.
+3. **The apply cadence is one minute, not five seconds.** The ranking is
+   recomputed every 5 s on the drain; the steering loop applies the latest
+   ranking once a minute at :08. Applying every 5 s would put swap I/O on the
+   frame drain, which this same lock forbids. The subscribed set therefore
+   reflects the ranking as of the last sweep before the minute mark.
+4. **The unsubscribe RequestCode (24 vs 25) is still UNVERIFIED-LIVE**, exactly
+   as the FOURTH-quote section records. *(⚠ RESOLVED 2026-09-10: 25 was proven IGNORED on the wire and 24 now ships — see the 2026-09-10 section.)* Ranked steering does not raise the
+   swap cadence — it is still at most one swap per socket per minute — so it
+   multiplies that risk by nothing, but it does not retire it either.
+5. **Churn is UNMEASURED.** `tv_depth200_ranked_swaps_total{outcome}` is the
+   measurement; the first live session is when it exists. A routinely non-zero
+   `capped` count is the signal the 2026-09-07 section names for a longer
+   window or a hysteresis band — never for reverting the key.
+6. **A socket is never emptied.** With fewer than five ranked contracts, a
+   socket holding an off-ranking contract keeps it rather than being
+   unsubscribed to nothing (an empty depth socket delivers nothing, and the
+   unsubscribe code is unverified). A socket that never subscribed (`None`)
+   cannot take a swap and is counted `socket_empty`.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Applies the ranking every 5 s from the frame drain (swap I/O on the hot path).
+- Removes the per-minute cap, or lets one socket take two swaps in a minute.
+- Falls back to the at-the-money engine after a ranking has been published.
+- Empties a socket to "match" a short ranking.
+- Claims depth-20 is on the volume ranking without the 2026-09-08 (SECOND) contract below — entry at 250, exit at 300, gainer filter before the cut, zero-lot rows excluded.
+
+### 2026-09-08 (SECOND, same day) — DEPTH-20 IS NOW RANKED TOO, and what the wiring audit found on the way
+
+**No new authorization is claimed.** This is the record of item 1 of the section
+above being delivered, plus the defects an adversarial audit of the ranking
+pipeline found while it was wired — each fixed in the same change and stated
+here because the next reader will otherwise find the fixed shape and wonder
+what the old one was.
+
+#### What is now on the wire (`crates/app/src/depth20_ranked_steer.rs`)
+
+| Property the lock makes binding | Implementation |
+|---|---|
+| Stock options only | the published list is the STOCK family's gainer-eligible top set; index options never reach it |
+| Top 250 | entries are taken from the first `DEPTH20_ENTRY_RANKS` = 250 by lots-in-window |
+| Delta-only, edge-triggered | a held contract inside the published list is never touched; only ranked-but-unheld contracts arrive, and only into slots freed by held-but-off-list departures |
+| Capped per window | at most `DEPTH_SWAP_COMMAND_CHANNEL_DEPTH` (4) swaps per socket per minute; the rest is retried next minute and counted |
+| Hysteresis | `DEPTH20_EXIT_RANKS` = 300: a held contract that slips to rank 251–300 is KEPT. The 2026-09-07 section names a hysteresis band as the remedy for a churning per-window board; this is it, at 50 ranks |
+| Composite key | held-vs-ranked comparison on `(security_id, segment)`; the first draft compared on the id alone and the test that pins it fails on that draft |
+| Gainer filter BEFORE the cut | the filter runs over the FULL volume-ordered population and stops once 300 gainers are collected. The first draft cut to 250 and THEN filtered, so a gainer ranked 251st by volume could never reach depth while a non-gainer above it consumed the slot |
+| Zero-lot rows excluded | a contract with 0 lots in the window is not on the board. Before this the board was PADDED with every seeded contract at key 0 in `security_id` order — a depth set of "whichever low ids ticked first", which is the arbitrary tie the 2026-09-06 section forbids |
+| Replay is not trading | a WAL replay re-seeds every window baseline (`rebaseline_all`) after the refold, so a 2M-frame backlog cannot read as one window's volume and hand out 250 sockets at the bell |
+| Previous close from the packet | the gainer verdict needs the stock's previous close; the code-6 packet is one door, and since today the `day_close` field of a Full/Quote packet on `NSE_EQ` is the second (first write wins). Without it every verdict was `Unknown` on any morning the code-6 packet did not arrive |
+| All-unknown latch | if every gainer verdict is `Unknown` on a non-empty board, one coded `error!` (`source = "gainer_verdicts_all_unknown"`, log-sink only) says so once per session, instead of two green depth pools holding the boot dial all day |
+| Post-close gate | after 15:40 IST the steering loop plans nothing: the frozen last ranking was being re-planned every minute until the box stopped |
+| No-ranking detection | at 09:20 IST a steering view that is still `None` logs one coded `error!` (`source = "no_ranking_by_0920"`, log-sink only) — the 2026-09-08 morning's thirty silent minutes would have been one line at 09:20 |
+| Refused unsubscribe | `SubscribeGuard::undo_swap` puts the OLD instrument back when the wire REFUSES the unsubscribe (`Ok(Err)`), so the guard never names a strike the socket does not carry; a TIMEOUT is deliberately not reverted (the frame may have landed, and the redial must replay the chosen strike) |
+
+The DHAT gate on the ingest seam now publishes a contract map before it
+measures, so the per-tick `observe` runs INSIDE the measured window; until
+today the gate measured a seam that skipped the ranking board, which is the
+vacuous-pass shape closed in #1884 arriving one structure later.
+
+#### ⚠ What is STILL not delivered (Rule 11)
+
+1. **The boot dial still puts index at-the-money contracts on the depth sockets
+   until the first ranking (~09:15–09:16).** Seeding the dial from the previous
+   session's persisted `top_volume_rank` is designed but NOT built: yesterday's
+   contract ids can be expired on an expiry rollover, so the seed must be
+   validated against today's attached contract set, and the boot-time QuestDB
+   read has the WAL-apply-lag exposure `SpotPriceStore` was built to escape.
+   Item 2 of the section above stands.
+2. **The unsubscribe RequestCode is still UNVERIFIED-LIVE.** The operator's
+   Dhan pack (uploaded 2026-09-08) reads `25 = Unsubscribe — Full Market Depth`,
+   which is what ships; the 24-vs-25 split recorded in the annexure is not
+   retired by a document, only by a live probe. *(⚠ The live probe happened on 2026-09-10: 25 was ignored, 24 ships — see the 2026-09-10 section.)*
+3. **Depth-200 has no hysteresis band.** Its planner is one contract per socket
+   and swaps whenever the top five distinct underlyings change; churn is
+   measured by `tv_depth200_ranked_swaps_total`, not bounded by a band.
+4. **A frame arriving for an instrument the guard does not hold is not
+   detected.** If the unsubscribe silently fails at Dhan's side, the socket
+   keeps delivering the OLD contract and nothing counts it. Detecting it needs
+   a per-socket held-set lookup on the depth decode path, and that is a hot-path
+   change with its own DHAT gate — recorded, not smuggled in.
+5. **The per-minute steering applies a ranking that is one 5-second window
+   old.** That is the cadence the operator asked for; on a thin option it means
+   a contract can leave the board because it did not trade in that one window.
+   The exit band is what keeps that from being a swap.
+6. **Churn is UNMEASURED** for depth-20 as it is for depth-200; the first live
+   session is the measurement, and `tv_depth20_ranked_swaps_total{outcome}` is
+   where it lands.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Filters gainers AFTER cutting to the top 250 (drops gainers below the cut).
+- Ranks a zero-lot contract (pads the board with arbitrary low ids).
+- Removes the exit band, or lets a held contract leave the board on a single
+  window in which it did not trade while an arrival funds it.
+- Reverts the guard on a TIMED-OUT unsubscribe (the frame may have landed).
+- Applies the depth-20 ranking from the frame drain, or lets one socket take
+  more than four swaps in a minute.
+- Presents the boot dial as ranked before the first 5-second sweep exists.
+
+### 2026-09-08 (THIRD, same day) — the boot dial is SEEDED from the previous close, depth-200 gains its band, and an ignored unsubscribe now redials the socket
+
+**No new authorization is claimed.** This is the record of items 1, 3 and 4 of
+the (SECOND) section's "STILL not delivered" list being delivered, in one
+change, with the properties the lock makes binding stated per item.
+
+#### Item 1 — the boot dial (`crates/app/src/depth_seed.rs`)
+
+| Property | Implementation |
+|---|---|
+| Source | the socket HOLDINGS at the capture-window close (15:40 IST), written to `data/instrument-cache/depth-seed-latest.json` only if a ranking was published that session. Never the ranking itself: what the sockets held is what was ranked AND admitted, which is the honest "yesterday's best" |
+| Validation | every seeded id is checked against TODAY's contract artifact — `OPTSTK`, CE/PE, `NSE_FNO`, expiry ≥ today. An expired or unknown id is refused per contract and counted (`tv_depth_seed_rows_total{outcome}`); a seed that survives partially fills the lead slots and the boot dial fills the rest |
+| Hold | a seeded pool HOLDS STILL until the first ranking of the session (`seed_until_first_ranking`), so the index at-the-money dial no longer runs for ~15 minutes on sockets that already carry yesterday's top set |
+| Fail direction | absent, unreadable, wrong-day, or all-refused seed → the existing boot dial, with an `info!` naming the outcome. Never an empty socket |
+| Bounded | ≤ 250 + ≤ 5 entries by construction; the validation index is built once per boot |
+
+The bare nuke of 2026-09-08 deleted `instrument-cache`, so the first session
+after it runs on the boot dial — the seed appears from the second session.
+
+#### Item 3 — depth-200 hysteresis (`depth200_candidates.rs`, `depth200_ranked_steer.rs`)
+
+`DEPTH200_EXIT_UNDERLYINGS` = 5 + `DEPTH200_HYSTERESIS_RANKS` (3) = 8. The
+published list is the top 8 distinct underlyings; the ENTRY set is its first 5.
+A held contract anywhere in the 8 is kept; only a contract outside the 8 is
+swapped, and only for an unheld contract inside the first 5. Band contracts are
+never placed. Same shape as depth-20's 250/300, at the scale of five sockets.
+
+#### Item 4 — the ghost instrument (`depth_subscription_view.rs`, `dhan_feed_stack.rs`, core `pool_supervisor.rs`)
+
+The FOURTH-quote section named the unsubscribe RequestCode (24 vs 25) as
+UNVERIFIED-LIVE and said a socket that silently keeps delivering an
+unsubscribed contract "is not detected". It is now:
+
+| Property | Implementation |
+|---|---|
+| Detection | each depth PACKET on a live socket is classified O(1) against the published held sets and a dropped map. Only an instrument THIS process dropped ≥ `GHOST_GRACE_SECS` (90 s) ago, still arriving, is a ghost. Never-held is `Unknown` — the swap-in window is that shape and must not redial |
+| Counted | `tv_dhan_feed_depth_total{outcome="ghost" \| "unsubscribed_grace" \| "ghost_redial"}` |
+| Remedy | `request_ghost_redial(connection_index)` arms a per-socket register (cooldown 180 s); the connection task takes it on its existing 1 s idle tick and redials through the normal backoff ladder as `ReconnectReason::GhostInstrument`. The replay re-subscribes the guard's CURRENT set, which excludes the ghost, so the vendor's view is rebuilt from ours |
+| Rows | STILL WRITTEN. The levels arrived; capture is not suspended for an instrument we did not want. Only the verdict and the redial are new |
+| Log | one `error!` per armed redial (`code = WS-GAP-02`, `source = "unsubscribe_ignored"`), log-sink only; the cooldown is the throttle |
+
+**This is the safety net the FOURTH-quote section said must exist before the
+apply cadence is raised.** If code 25 is wrong for an endpoint, every swap
+becomes an add, the ghost shows within 90 s, and the socket is rebuilt within
+the cooldown instead of sitting at 804 for the session. *(⚠ 2026-09-10: this is exactly what happened — no socket parked. Code 25 WAS wrong; 24 ships since the 2026-09-10 section. **⚠ The counts once given here, "20 ignored unsubscribes, 10 redials", are WRONG — measured 2026-09-11 the session carried 80 lines across all ten sockets and both endpoints; see the dated correction under the 2026-09-10 section.**)*
+
+#### Also delivered: the two per-cadence faces of `top_volume_rank`
+
+`top_volume_rank_1s` and `top_volume_rank_5s` (`console_views.rs`) — views over
+the ONE table filtered on `tf`, joined to the instrument master. The operator's
+words were "1s table and 5s tables also separately"; one stored table with two
+faces gives that without writing every row twice.
+
+#### ⚠ STILL not delivered (Rule 11)
+
+1. **The apply cadence is one minute, not five seconds.** The ranking runs every
+   5 s; the delta is applied once a minute at :08. The operator asked for the
+   5-second cadence a fourth time on 2026-09-08 (*"every 5 seconds needs to be
+   resubscribed … in O(1) latency"*). The FOURTH-quote section's ordering —
+   probe the unsubscribe code live FIRST, then raise the cadence — still binds;
+   the ghost redial above makes a wrong code SELF-HEALING rather than fatal,
+   which is what makes the raise safe to do next, but the raise itself needs
+   its own dated row and is not smuggled in here.
+2. **A swap is not O(1) on the wire.** Ranking is O(n log n) at 123 µs realistic / 2.95 ms at the ceiling (MEASURED 2026-09-12; the "900 µs" this line carried came from a harness timing an empty sort); the
+   subscription CHANGE is one unsubscribe + one subscribe per swap with a 2 s
+   wire budget, serialised per socket. The honest claim is "delta-only, capped
+   per socket, edge-triggered" — never "O(1) resubscribe".
+3. **Churn is UNMEASURED** for both pools until the first live session with
+   this build; `tv_depth20_ranked_swaps_total` / `tv_depth200_ranked_swaps_total`
+   are the read-out.
+4. **The unsubscribe RequestCode is still UNVERIFIED-LIVE.** The ghost counter
+   is now the instrument that verifies it: a session with `ghost = 0` and
+   `unsubscribed_grace > 0` is the evidence that 25 works. *(⚠ 2026-09-10: the
+   session read the OPPOSITE — every code-25 unsubscribe ignored, so 25 does NOT
+work and
+   24 now ships; the same counter pair is the verdict instrument for 24. See
+   "2026-09-10 — THE DEPTH UNSUBSCRIBE REQUESTCODE IS SETTLED LIVE".)*
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Seeds from the ranking rather than the holdings, or applies a seed without
+  validating every id against today's contract set.
+- Lets a seeded pool be re-dialled by the index engine before the first ranking.
+- Places a band contract into a depth-200 socket, or evicts a held contract
+  that is inside the band.
+- Classifies a never-held instrument as a ghost (redials healthy sockets on
+  every swap).
+- Drops ghost rows instead of writing them.
+- Raises the apply cadence under cover of this section.
+
+### 2026-09-09 — THE VOLUME RANKING BECOMES VISIBLE; and the 5-SECOND APPLY CADENCE IS ORDERED BUT NOT SHIPPED, with the reason
+
+**The verbatim operator demands (2026-09-09, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "Dude just remove this one minute swap dude what happened to new volume ranking tables dude because we have now 5second swap right that too focusing only on options strikes top right"
+
+> "Morning will I see the precise volume ranking or not bro meanwhile Ar eyou sure about precise volume ranking vaze don its quantity percentage diff and in this also how will you always find ghe per engage change dude that's my main question because morning I need evryhhting need to be ready dude okay"
+
+#### Part 1 — the answer to the ranking question was NO, and three defects said so
+
+The honest answer to *"will I see the precise volume ranking"* on the build that
+was live this morning is **no, the table would have been EMPTY**, and the reason
+was not one bug but three, each verified in source before it was touched:
+
+| # | Defect | Evidence | Consequence at 09:15 |
+|---|---|---|---|
+| 1 | The snapshot asked the previous-close store for the **CONTRACT's** own close on `NSE_FNO`. The store's ONE production write door, `record_prev_close_from_tick`, returns early unless the segment is `NseEquity` — so the probe returned `None` on every row → `NaN` → refused as `NonFiniteGain` | `dhan_feed_stack.rs` (the `project_snapshot` closure) vs `:2656`; `record_prev_close` has zero production callers | **Every row of every snapshot dropped. The table empty all session while every counter read healthy.** |
+| 2 | `window_lots_milli` — **the actual sort key since the 2026-09-07 lock** — was on `RankedContract` and was NOT a column of `TopVolumeRankRow`. Only cumulative `volume` was stored | `top_volume_rank_persistence.rs` column list | Rank 1 could hold less volume than rank 40 with nothing in the row to explain the order |
+| 3 | `console_views::ensure_named_views` runs inside `run_candle_ddl_at_boot`, which `main.rs` calls BEFORE `run_live_table_ddl_at_boot` creates `top_volume_rank`. The view DDL warn-fails and is never retried in-boot | `main.rs:3745` vs `:3792`; `console_views.rs:288-296` | On a fresh volume `top_volume_rank_1s` / `_5s` **do not exist for the whole session** — the operator's own words for this table were *"only using db i can see this"* |
+
+**Fixed, in this order.** (1) `gain_pct` is now the **UNDERLYING's** percent
+change, computed by `underlying_gain_pct` from the **same two RAM inputs** that
+`underlying_gainer_verdict` turns into the gainer boolean — so the column and the
+filter cannot disagree, and the closure is keyed on `underlying_id` so the wrong
+lookup is unrepresentable rather than merely corrected. This is also what
+`eligible_gain_pct` was written for: its own `MAX_PLAUSIBLE_GAIN_PCT` doc states a
+deep-out-of-the-money option "can move that far" and is "not what this function is
+fed", so the old call site was wrong twice. (2) `window_lots_milli LONG` joins the
+table through the house `CREATE → ADD COLUMN IF NOT EXISTS → DEDUP ENABLE`
+self-heal, so the order is checkable from the row rather than taken on trust.
+(3) The named views are **re-ensured** after the rank table exists — additive
+rather than a re-order, because the candle ordering above it is load-bearing and
+every view statement is `CREATE OR REPLACE`.
+
+**So the answer to "how will you always find the percentage change":** it is the
+underlying stock's move — spot against its previous close, both from RAM, both
+the gainer filter's own inputs. It is NOT the option contract's own move: nothing
+in this system has ever stored a previous close for an `NSE_FNO` contract, and
+inventing one would be a fabricated number in the column that decides eligibility.
+
+#### Part 2 — the 5-second apply cadence is NOT shipped, and this is the evidence
+
+The operator ordered the one-minute swap removed in favour of the 5-second swap.
+**It is not shipped today**, and the reason is a specific, checkable fact rather
+than caution:
+
+| Fact | Evidence |
+|---|---|
+| Dhan error 804 is classified `DisconnectClass::Fatal` | `pool_supervisor.rs:521-543` |
+| Fatal ⇒ `park(ParkReason::FatalDisconnect)`, and `allows_one_respawn()` returns **`false`** for it | `pool_supervisor.rs:1247-1256`, `:866-871` |
+| `take_ghost_redial` is consulted **only** while `action == SupervisorAction::Continue`. A parked socket has LEFT that loop | `pool_supervisor.rs:4634-4638` |
+| **Therefore the ghost-redial detector shipped 2026-09-08 (THIRD) structurally CANNOT recover an 804-parked socket.** Parking bypasses the redial ladder | derived from the three rows above |
+| depth-200 socket capacity is **1**. If the unsubscribe RequestCode (24 vs 25, still UNVERIFIED-LIVE) is wrong, swap #1 asks Dhan for 2 > 1 ⇒ 804 on the **first swap, at any cadence** | `pool_supervisor.rs:2058`, `:2136-2146` |
+
+The 2026-09-08 (THIRD) section claimed the ghost redial "makes a wrong code
+SELF-HEALING rather than fatal, which is what makes the raise safe to do next."
+**That claim is WITHDRAWN.** It is true for a socket that keeps *delivering* a
+ghost, and false for one that has been *parked* — and 804 parks. The cadence raise
+would therefore be session-ending, not self-healing, and 5 s gives twelve times the
+chances per hour to reach it.
+
+Three further blockers stack behind that one, each independently sufficient:
+per-socket swap caps are enforced per CALL and hold no cross-call state
+(`depth20_ranked_steer.rs:77,87,116`), so 5 s yields 240 swaps/socket/minute
+against a documented budget of 4; `send_swap` sets `socket.pending` with no
+`pending.is_some()` guard, so a second dispatch corrupts the revert target
+(`depth_rebalance.rs:987-990`); the per-iteration `load_depth_candidates` +
+`fetch_movers` are two QuestDB queries whose RAM-empty budget is **10 s**, longer
+than a 5 s tick (`dhan_contract_universe.rs:1423-1428`); and
+`depth_steering_stalled`'s 180 s threshold, written against a 60 s loop, becomes 36
+missed iterations (`live-lane-alarms.tf:829`).
+
+**The ordering the 2026-09-06 FOURTH-quote section already binds stands: probe the
+unsubscribe code on a live session FIRST, then raise the cadence.** The instrument
+for that probe now exists and is live — `tv_dhan_feed_depth_total{outcome="ghost"}`
+against `{outcome="unsubscribed_grace"}`. A session that ends with `ghost = 0` and
+`unsubscribed_grace > 0` is the evidence that code 25 works, and the cadence raise
+becomes a small change the following day. *(⚠ 2026-09-10: the evidence came back the other way for 25 — see the 2026-09-10 section; the same counter pair is now the verdict instrument for 24.)*
+
+**What a PR that violates this section looks like (REJECT):** raises the apply
+cadence before that probe reads clean; ships the raise without converting the
+per-call swap caps to rolling per-minute budgets, guarding `send_swap` on
+`pending`, moving the two QuestDB queries off the per-iteration path, and lowering
+the stall threshold in the same change; computes `gain_pct` from the CONTRACT's
+previous close (nothing writes one); or drops `window_lots_milli` from the row on
+the grounds that `volume` is already there — `volume` has not been the sort key
+since 2026-09-07.
+
+### 2026-09-09 — STOCK FUTURES BECOME THE PRIMARY PRICE FOR ATM ±25, AND THE WINDOW FREEZES FOR THE DAY
+
+**The verbatim operator demand (2026-09-09, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "dude see dotn sue futures as the fallback dude just use futures as the primary dude espeically to fidn this atm plus minus and stickign fully with that for the entire current day dude okay?"
+
+Given in DIRECT response to a design study that recommended futures as a
+**fallback** for lot size and spot price and recommended **against** using them
+to centre the strike window. The operator read that recommendation and reversed
+its central conclusion. **That is his call and it governs.** The study's reasoning
+is preserved below rather than deleted, because the numbers in it are measured and
+the next reader is entitled to see what was traded away.
+
+#### What this authorizes
+
+| Surface | Was | Now |
+|---|---|---|
+| Price used to centre the stock-option **ATM ±25** window | the stock's SPOT last-traded price | **the stock's nearest-expiry FUTURE's last-traded price, as PRIMARY** |
+| Spot price | the only source | the **fallback**, used when the future has not printed |
+| Window lifetime | re-fit until 09:30, then frozen | **chosen once and frozen for the whole trading day** |
+| Lot size | option's own `z`, refuse if absent | unchanged by this quote — the futures lot-size fallback stays a separate decision |
+
+**The futures are already subscribed and this costs no new connection or fetch.**
+All 1,270 `FUTSTK` contracts are classified at `dhan_contract_universe.rs:813`,
+pushed at priority 1–2 into `picked`, surfaced as `ContractSelection::instruments`
+and dialled onto the main feed in Full mode. Their ticks already reach the drain,
+are lag-recorded and folded. The ONLY thing stopping a future's price reaching the
+selector is the binding pattern at `dhan_feed_stack.rs:6172-6176`, which admits
+`IdxI | NseEquity | BseEquity` and nothing else. Widening it to `NseFno` is one
+enum arm; `SpotPriceStore::record` is already segment-agnostic and keyed on the
+I-P1-11 composite, and ~1,270 futures against a 25,000 cap with ~870 live entries
+is inside the ceiling.
+
+#### ⚠ The honest measurement, which argued the other way
+
+Recorded because the operator overruled it knowingly and a future reader must not
+mistake this for a numbers-driven decision:
+
+| Quantity | Measured |
+|---|---|
+| Median strike spacing, 210 F&O underlyings, current expiry (2026-08-27) | **2.63% of price** |
+| Gap needed to move the nearest-strike pick by ONE step (half a spacing) | **1.32%** |
+| Typical near-month equity futures premium (cost of carry, ~1 month) | **~0.5%** — *Assumed, not derivable in-repo* |
+
+So on the median name the futures price does not change which strike is chosen,
+and when it does the ±25 window shifts by one strike — 24 of 25 per side unchanged.
+**The measured benefit to centring accuracy is therefore approximately zero.**
+
+**What the change DOES buy, and it is real:** coverage. A stock with no spot print
+is refused into `underlyings_without_spot` and gets no options at all that day —
+measured 2026-08-21: 725 priced, **8 without**, ≈780 option contracts absent for
+the session. A future that printed when the spot did not now supplies the centre.
+How many of those 8 had a futures tick is **Unknown** — no counter exists, and a
+stock too illiquid to print a spot usually has an equally illiquid future.
+
+#### The freeze is the half with real consequences, in both directions
+
+"Sticking fully with that for the entire current day" makes the window **immutable
+once chosen**. That is stricter than today, where a top-up runs until 09:30.
+
+- **For:** the subscribed set stops moving, so a contract cannot silently leave
+  depth mid-session, and the day's capture is reproducible from one decision.
+- **Against, stated plainly:** if the underlying moves more than 25 strikes from
+  where it was centred, the true at-the-money leaves the captured window and
+  **nothing re-centres it**. Measured drift is 2.20% ≈ 0.8 strikes on an average
+  day and **6.0 strikes** on the worst single underlying of 2026-08-27 — well
+  inside 25, so this is a tail risk rather than a daily one. It must be COUNTED:
+  a session where the live price leaves the window is exactly the case the
+  operator would want to know about, and freezing removes the mechanism that
+  would otherwise hide it.
+
+#### What this quote does NOT authorize
+
+- **Previous close from futures.** A future's previous close is not the stock's;
+  feeding it to the gainer test invents a percentage change from two unrelated
+  numbers. The `PrevCloseStore` gate at `dhan_feed_stack.rs:2796-2800` stays
+  `IdxI | NseEquity`. This is the one row that would manufacture a confidently
+  wrong answer, and it stays shut.
+- Any change to `STOCK_OPTION_ATM_STRIKES_EACH_SIDE` (25), the 60% pricing quorum,
+  the socket or instrument budgets, or the subscription set.
+- Index options: NIFTY/BANKNIFTY full-chain selection is unchanged and takes no
+  futures price.
+- Live order fire; `dry_run` stays true; the §28 frozen area is untouched.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Uses a far-month future rather than the **nearest non-expired** expiry — a stale
+  far-month print would centre a ladder on an hours-old number.
+- Lets a futures price overwrite a **fresher** spot print (the store's
+  later-exchange-time-wins rule and its trading-day floor both still bind).
+- Widens `PrevCloseStore` to `NseFno`.
+- Re-centres the window after it is frozen, or freezes it without counting the
+  case where the live price leaves the window.
+- Presents futures centring as an accuracy improvement — the measurement above
+  says it is a coverage change, and the honest claim is the coverage one.
+
+### 2026-09-10 — THE DEPTH UNSUBSCRIBE REQUESTCODE IS SETTLED LIVE: 25 IS IGNORED, 24 SHIPS
+
+**The verbatim operator demand (2026-09-10, typed directly in-session — preserve
+EXACTLY):**
+
+> "Fix and resolve everything I don't want any open items dude okay?"
+
+Given in DIRECT response to a live-health report that listed, as its first open
+item, that Dhan was ignoring the depth unsubscribe on the wire. That is the
+§28.2/§28.3 authorization shape this repository already accepts: a general
+go-ahead answering an ENUMERATED ask selects the enumerated work. Recorded HERE
+before the constant moves, per the rule-file-first law.
+
+#### The verdict the FOURTH-quote section asked for, read from the first session that could give it
+
+The 2026-09-06 FOURTH-quote section bound the ordering *"probe the unsubscribe
+code on a live session FIRST, then raise the cadence"*, and the 2026-09-09 section
+named the instrument: `tv_dhan_feed_depth_total{outcome="ghost"}` against
+`{outcome="unsubscribed_grace"}`, seeded at zero on 2026-09-10 so the answer could
+be read at all. The session of 2026-09-10 (build carrying #1903, first ranked
+swaps from 09:16 IST) is that probe, and it answered in the OTHER direction:
+
+| Reading, 09:16–09:46 IST, 2026-09-10 | Value |
+|---|---:|
+| `WS-GAP-02` / `source = "unsubscribe_ignored"` ERROR lines | **20** |
+| Ghost redials armed (`outcome = "ghost_redial"`) | **10** |
+| Distinct instruments streaming depth-200 | **8**, on **5** single-instrument sockets |
+| Code on the wire for every one of those unsubscribes | **25** (`FEED_UNSUBSCRIBE_TWENTY_DEPTH`) |
+
+> ### ⚠ CORRECTED 2026-09-11 — the "20" and the "10" in the table above are BOTH WRONG, and the real numbers make the verdict STRONGER, not weaker
+>
+> Re-queried today against the source rather than carried forward
+> (`aws logs filter-log-events --log-group-name /tickvault/prod/app
+> --filter-pattern '{ $.fields.source = "unsubscribe_ignored" }'`), because this
+> table is the evidence a vendor support ticket will cite and a number quoted
+> from a quote is not a measurement:
+>
+> | 2026-09-10, code 25 | table said | MEASURED 2026-09-11 |
+> |---|---:|---:|
+> | `unsubscribe_ignored` ERROR lines, full session | 20 | **80** |
+> | …inside the table's own 09:16–09:46 window | 20 | **48** |
+> | Ghost redials armed | 10 | **80** (one per line; `redials_taken` reaches **8**, the session ceiling, on every socket) |
+> | Endpoints affected | depth-200 implied | **40 depth-200 AND 40 depth-20** |
+> | Distinct sockets affected | 5 implied | **10** — `connection_index` 5 through 14, i.e. EVERY depth socket |
+> | First / last line | — | 09:20:09.059 / 10:46:11.440 IST |
+>
+> **20 matches no window.** It is not the session total and it is not the
+> 30-minute total; where it came from is unrecoverable, which is exactly why it
+> should never have been written without the query beside it.
+>
+> **The same query for 2026-09-11 (code 24) returns the SAME SHAPE:** 80 lines,
+> 40/40 across both endpoints, all ten sockets, `redials_taken` max 8, first
+> 09:18:38.073 and last 10:21:39.074 IST, `ghost_packets` 1–24.
+>
+> #### Why this is the most important line in the section
+>
+> The two codes do not merely both fail — **they fail IDENTICALLY**: same line
+> count, same even split across two different endpoints, same ten sockets, same
+> exhaustion of the redial ceiling roughly an hour into the session. A code that
+> was simply *wrong* would be expected to differ from another wrong code in at
+> least one of those dimensions. **That both produce a byte-identical failure
+> signature is evidence the problem may not be the RequestCode at all** — and it
+> is the single strongest thing to put in front of Dhan engineering, which the
+> "20 vs 10" framing was too small to show.
+>
+> > ##### ⚠ CORRECTED 2026-09-11 (same day, by an adversarial re-read) — "byte-identical" is TRUE and is NOT EVIDENCE OF ANYTHING. 80 is our own ceiling, and this section refutes itself two paragraphs down.
+> >
+> > The paragraph above calls the identical signature "the single strongest
+> > thing to put in front of Dhan engineering." **It is the weakest, because
+> > every number in it is pinned by OUR code and could not have come out any
+> > other way.**
+> >
+> > | "signature" dimension | what actually fixes it |
+> > |---|---|
+> > | **80** lines | `GHOST_REDIAL_SESSION_CEILING` = 8 × **10** depth sockets = **80**. Arithmetic maximum. |
+> > | **40 / 40** split | 5 depth-20 + 5 depth-200 sockets × 8 = 40 each. Forced. |
+> > | **all ten** sockets | there are exactly ten. |
+> > | ceiling reached ~1 h in | the line is emitted ONLY inside the `Ok(())` arm of `request_ghost_redial`, which returns `Err(SessionCeiling)` past 8. |
+> >
+> > So the two sessions did not produce the same number because Dhan behaved
+> > the same way — **they produced the same number because a counter that
+> > saturates at 80 reported 80 twice.** A vendor that honoured code 24 on
+> > 30% of frames and ignored 25 entirely would still print 80/40/40 as long
+> > as *any* ghost survived per socket. **A metric that can only report one
+> > value is not evidence**, and the section immediately below this one says
+> > so without noticing: *"every socket reaches `GHOST_REDIAL_SESSION_CEILING`
+> > (8) and stands down by design."*
+> >
+> > **What IS non-forced, and is therefore the real evidence:** `ghost`
+> > (5,345,436) and `unsubscribed_grace` (1,686,468) have no ceiling. No
+> > 2026-09-10 counterparts were recorded, so the one comparison that could
+> > discriminate between the two codes was never taken.
+> >
+> > ##### ✅ STEP 1 DONE 2026-09-11 (same evening) — the 09-10 counters WERE still recoverable, and the two days are NOT alike
+> >
+> > The block above says the 2026-09-10 counterparts "were never recorded, so
+> > the one comparison that could discriminate between the two codes was never
+> > taken." That was true of what anyone had written down, and **false of what
+> > still existed**: the CloudWatch EMF group keeps the per-outcome split, and
+> > `filter-log-events` can still read it. It was taken.
+> >
+> > **Method, and why it is trustworthy.** The EMF record carries a **delta per
+> > scrape**, not a cumulative, so a session total is the SUM of ~538 samples.
+> > `logs:StartQuery` is denied to `claude-code-agent`, so the aggregation is
+> > client-side over `filter-log-events`. **The method validates itself:** run
+> > against 2026-09-11 it reproduces every already-known figure EXACTLY — ghost
+> > 5,345,436 · grace 1,686,468 · rows 793,936,960 · depth-20 swaps 7,662 ·
+> > depth-200 swaps 1,799. A method that reproduces five known numbers to the
+> > unit is trusted for the sixth.
+> >
+> > | Full session, one continuous run each | **2026-09-10 · code 25** | **2026-09-11 · code 24** | ratio |
+> > |---|---:|---:|---:|
+> > | boots inside the window | 1 | 1 | — |
+> > | depth-20 swaps sent | 6,068 | 7,662 | 1.26x |
+> > | depth-200 swaps sent | 1,712 | 1,799 | 1.05x |
+> > | **total unsubscribes** | **7,780** | **9,461** | **1.22x** |
+> > | depth rows stored | 226,667,920 | 793,936,960 | 3.50x |
+> > | **ghost packets** | **110,114** | **5,345,436** | **48.5x** |
+> > | **unsubscribed_grace** | **55,160** | **1,686,468** | **30.6x** |
+> > | ghost_redial | 80 | 80 | **1.00 — the ceiling** |
+> > | ghost_exhausted | 10 | 10 | **1.00 — the ceiling** |
+> >
+> > **The only two numbers that matched are the only two that COULD NOT differ.**
+> > That is the circularity above, now demonstrated with data rather than
+> > arithmetic: `ghost_redial` is 8 x 10 sockets on both days, and everything
+> > without a ceiling differs by one to two orders of magnitude.
+> >
+> > **Three independent normalisations, because ghost scales with traffic:**
+> >
+> > | normalised measure | 09-10 (25) | 09-11 (24) | ratio |
+> > |---|---:|---:|---:|
+> > | ghost packets per unsubscribe | 14.2 | 565.0 | **40x** |
+> > | ghost packets per 1M depth rows | 486 | 6,733 | **13.9x** |
+> > | **ghost / grace — traffic-independent** | **1.996** | **3.170** | **1.59x** |
+> > | implied mean streaming tail, `T = 90(1+r)` | **~270 s** | **~375 s** | |
+> > | ratio if NEVER honoured (`510/90`) | **4.667 ⇒ 510 s** | same | |
+> >
+> > The `ghost / grace` row is the one to lead with: it is two counters over the
+> > SAME packet stream in two different windows, so it cancels traffic by
+> > construction. All three point the same way.
+> >
+> > **What this DOES establish:**
+> > 1. **The byte-identical argument is refuted by measurement, not only by
+> >    arithmetic.** The days differ enormously wherever a ceiling does not
+> >    forbid it. This needs no causal claim at all.
+> > 2. **Neither code is fully honoured** — ghost > 0 on both days.
+> > 3. **Neither code is fully IGNORED either**, which is new: both ratios sit
+> >    BELOW the never-honoured ceiling of 4.667, so some unsubscribes are
+> >    taking effect. "Dhan ignores it" is too strong for either day.
+> >
+> > **⚠ What this does NOT establish — the cause.** Four other PRs merged
+> > between the two deployed builds (`55126249b`, `ad778aa50`, `16190ce2a`,
+> > `61f6e448e`, `0e6f95fc8`), and `ad778aa50` carried a "subscribed-first
+> > contract map" alongside the code flip. **Depth traffic also differed 3.50x
+> > between the two days and that difference is itself unexplained.** So the
+> > honest statement is *"the two sessions behaved very differently and code 25
+> > ghosted far less on every normalisation"*, NOT *"code 25 is better because
+> > it is 25"*. The one-socket probe (step 2) is still what settles cause,
+> > and it is still unrun.
+> >
+> > **One bounded measurement caveat, stated because it cuts the convenient
+> > way.** `55126249b` ("seed the depth ghost family ... so the unsubscribe-code
+> > verdict is readable") merged at 08:52 IST on 09-10, twenty-two minutes AFTER
+> > that session booted — so 09-10 ran unseeded, and the agent drops the FIRST
+> > sample of a series it has never seen. That under-counts **09-10**, the day
+> > with fewer ghosts, so correcting it would NARROW the gap. It is bounded at
+> > one sample of 538 (~0.2%), far too small to move any row above.
+> >
+> > **This is not a claim that 24 or 25 works.** Both were almost certainly
+> > ignored. It is a claim that **the argument as recorded cannot survive
+> > vendor scrutiny**, and a ticket built on it invites "we cannot reproduce;
+> > send a capture."
+> >
+> > **What the next session must do instead, in order:**
+> >
+> > 1. **Record the unbounded counters on BOTH days** — those are the numbers
+> >    that can differ.
+> > 2. **Run the one-socket probe.** A depth-200 socket holds **exactly one**
+> >    instrument, so "did the stream stop?" has nothing to mask it: send the
+> >    unsubscribe, **do not re-subscribe**, watch that `connection_index` for
+> >    frame silence (`FrameSilenceElapsed` already measures it). Silence ⇒ 25
+> >    works and the ghost verdict is OURS. Continued delivery ⇒ vendor-side,
+> >    decisively, from one socket and about four minutes.
+> > 3. **Try `RequestCode 12`.** The vendor's own depth guide documents only
+> >    `23` (subscribe) and `12` (disconnect) — **no per-instrument
+> >    unsubscribe at all** — and `build_disconnect_message` exists with
+> >    **ZERO production callers** (`FEED_REQUEST_DISCONNECT` appears only in
+> >    `constants.rs` and two test files). The only stop mechanism the vendor
+> >    documents has never been sent.
+> > 4. **Ask the right question.** Not *"why is 25 ignored?"* but **"what is
+> >    the supported way to stop a depth stream for one instrument — is 25
+> >    implemented on the Indian feed, or is 12 the only mechanism?"**
+> >
+> > **Also not ruled out, and it is ours:** a wire-FAILED unsubscribe still
+> > produces a ghost. `held` advances on `try_send` Ok — command *queued*,
+> > not sent — and reconcile KEEPS that advanced belief on both wire-failure
+> > arms, so the view publishes a contract as dropped that the socket was
+> > never told to drop. Only `tv_dhan_ws_subscribe_failed_total{unsubscribe_*}`
+> > = 0 excludes this, and that must be re-read PER REASON, not as a rollup.
+> >
+> > ##### ✅ STEP 2 DONE 2026-09-11 (same evening) — the wire-failure alternative is EXCLUDED, but the instrument named above is one-quarter tautology
+> >
+> > The paragraph above says *"Only `tv_dhan_ws_subscribe_failed_total{unsubscribe_*}`
+> > = 0 excludes this, and that must be re-read PER REASON, not as a rollup."*
+> > It was re-read per reason. The answer is **zero on every reason on both
+> > days** — and the instruction was RIGHT to insist on per-reason, because
+> > the raw EMF records carry `endpoint` and `reason` as fields even though
+> > the CloudWatch METRIC folds them to `host` alone. The split is readable
+> > from `filter-log-events`; it is not readable from `get-metric-statistics`.
+> >
+> > | endpoint × reason (8 reasons × 3 endpoints) | 10 Sep · code 25 | 11 Sep · code 24 |
+> > |---|---:|---:|
+> > | every one of the 24 series | **0** | **0** |
+> > | samples per series | 537–538 | 537–538 |
+> >
+> > 537 samples at zero is a *reporting* zero, not an absent series — these
+> > are seeded in `DhanSocketParams::new`, so the first-sample rule that hid
+> > `tv_depth_rows_spilled_total` does not apply here.
+> >
+> > **But one of the four unsubscribe reasons could not have been anything
+> > but zero.** `send_unsubscribe` has exactly ONE production call site
+> > (`pool_supervisor.rs`, the swap) and it is wrapped in
+> > `tokio::time::timeout(SWAP_WIRE_BUDGET, ..)` — **1 second** — while the
+> > socket write inside `send_unsubscribe_in_mode` is bounded by
+> > `SUBSCRIBE_SEND_TIMEOUT` — **10 seconds**. The outer budget always
+> > elapses first and drops the inner future, so the inner timeout arm never
+> > runs and `reason="unsubscribe_timeout"` **can never increment in
+> > production**. Citing four zeros is citing three measurements and a
+> > tautology. That is the `capped`-counter class of the same day's
+> > findings list, arriving in a second file.
+> >
+> > **So the claim rests on three reachable reasons plus a fourth
+> > instrument** — and finding that fourth is what closed the hole. The
+> > outer-timeout arm sets `wire_failed` and emits a coded `WS-GAP-02` line
+> > with `source = "swap_wire_failed"` (or `"swap_emptied_socket"`), and
+> > `origin/main` carried that `source` field during BOTH sessions, so it
+> > would have been emitted had the arm fired:
+> >
+> > | app-log query, both schemas | 10 Sep | 11 Sep |
+> > |---|---:|---:|
+> > | `$.fields.source = "swap_wire_failed"` | **0** | **0** |
+> > | `$.fields.source = "swap_emptied_socket"` | **0** | **0** |
+> >
+> > **Every arm of the unsubscribe chain is now covered by a live instrument,
+> > and every one reads zero.** Across **7,780** (code 25) and **9,461**
+> > (code 24) depth unsubscribes, not one failed on our side: the payload
+> > built, the socket was connected, the write succeeded, and it completed
+> > inside the one-second budget. **The wire-failure alternative is
+> > EXCLUDED** — the ghosts are not our unsubscribes failing to reach the
+> > socket.
+> >
+> > **⚠ The honest limit, which is narrow and real.** `send_unsubscribe` is
+> > fire-and-forget and Dhan sends no ack: `Ok` means the bytes were written
+> > into the sink and flushed, not that the vendor processed them. This
+> > proves our side did its job up to the socket boundary and no further. A
+> > TCP-level failure on a live connection WOULD have surfaced as
+> > `unsubscribe_send`, and that is zero — so the remaining gap is bytes
+> > written to a healthy socket that the vendor then ignored, which is
+> > precisely the vendor ticket's claim.
+> >
+> > **⚠ A second defect found on the way, and it is the one that could have
+> > bitten silently.** The whole swap wire-outcome family —
+> > `tv_dhan_ws_swap_{total,refused,failed,timeout,emptied_socket,guard_reverted}_total`
+> > — is in NEITHER the EMF selector NOR seeded, so none of the six had ever
+> > reached CloudWatch. Their absence was not a zero, and the arm that can
+> > manufacture a FALSE ghost (the 1-second budget elapsing, where the guard
+> > is deliberately NOT reverted because the frame may have landed) was
+> > readable only by luck — the coded log line beside the counter. §2.3m of
+> > `dhan-rest-only-noise-lock-2026-07-14.md` alarmed `swap_emptied_socket`
+> > and left `swap_wire_failed` unalarmed.
+> >
+> > **FIXED the same evening**, free: six named consts replace the literal
+> > emit sites, all six are seeded at zero in `PoolSupervisor::new`, and
+> > `unsubscribe_timeout` is annotated at its seed site with why a zero there
+> > proves nothing. Three guards, each bite-proven in both directions
+> > (`the_swap_budget_wins_so_the_inner_unsubscribe_timeout_is_vacuous`,
+> > `every_swap_wire_outcome_counter_is_seeded_from_its_own_const`). **NOT
+> > fixed:** none of the six is EMF-selected, so none is alarmable — that is
+> > ~$0.30/mo each against a September forecast of $142.24 and a $135
+> > automatic-stop line, so §2.3n's lever requirement is unmet and is not
+> > assumed.
+> >
+> > **The reusable half, and it is about the guard rather than the code:**
+> > the seeding guard was itself VACUOUS on first write — it searched the
+> > source for the seeding line and found its own assertion message, so
+> > deleting the baseline left it green. Caught by bite-proving it, which is
+> > the only thing that could have caught it. A guard that quotes the text it
+> > searches for is a guard that cannot fail, and this file has now recorded
+> > the same shape three times: a saturated ceiling, an unreachable counter,
+> > and a self-satisfying scan.
+> >
+> > The reusable half is the one this file keeps recording, now about a
+> > measurement rather than a constant: **before citing a number as evidence,
+> > ask what its maximum is.** This one had been written down three times,
+> > beside its own ceiling, without anyone computing 8 × 10.
+>
+> **Why the lines stop around 10:21–10:46 and not at the 15:40 close:** every
+> socket reaches `GHOST_REDIAL_SESSION_CEILING` (8) and stands down by design.
+> The ghosts kept streaming for the remaining ~5 hours with no further redial —
+> which is where the session's 5,250,076 `ghost` packets come from. Silence in
+> the log after 10:46 is the ceiling working, NOT the problem resolving.
+>
+> **NOT re-verified:** the "8 distinct instruments on 5 sockets" row. These log
+> lines carry `connection_index`, `endpoint`, `ghost_packets` and
+> `redials_taken` and **no instrument identifier at all** — see the flagged gap
+> below. That row stands as originally recorded and was not re-checked.
+>
+> #### ⚠ A REAL GAP this re-query exposed: no ghost can be NAMED
+>
+> The successful depth-swap path logs **no `security_id`** — `depth20_track.rs`
+> increments `DEPTH20_SWAPS_SENT` and logs only on the REFUSAL arms, which carry
+> `socket`, not the instrument. So across two full sessions of a confirmed
+> vendor-side failure, **this process cannot say which contract ghosted.** The
+> operator's own Dhan-support workflow requires "precise contract labels …
+> SecurityId for every contract cited", and today that requirement cannot be met
+> from our telemetry. Adding `security_id` + `segment` to the ghost line is the
+> prerequisite for a ticket that names contracts; it is NOT fixed here.
+>
+> > ##### ✅ RESOLVED 2026-09-11 (same day) — and it was TWO sites, not one
+> >
+> > The paragraph above names the ghost line. Acting on it found the gap has a
+> > second half, and the second half is the one that mattered more:
+> >
+> > | Site | Logged before | What its silence cost |
+> > |---|---|---|
+> > | the ghost `error!` (`dhan_feed_stack.rs`) | connection, endpoint, `ghost_packets`, `redials_taken` | which contract was still arriving |
+> > | the unsubscribe **SUCCESS** arm (`pool_supervisor.rs`) | **nothing at all** | which contract we asked to drop, and *when*, and *with which request code* |
+> >
+> > Only the REFUSAL arm named an instrument — and a refusal is the case that
+> > did not happen. **All 160 ignored unsubscribes across the code-25 and
+> > code-24 sessions took the silent path**, so there was no record of the ask
+> > to pair the ghost against.
+> >
+> > Both now carry `security_id` + `segment`; the success arm additionally
+> > carries `request_code`, because **25 and 24 have BOTH shipped** and a
+> > session's evidence is worthless if the reader has to guess which binary
+> > produced it. Pinned by
+> > `crates/app/tests/ghost_instrument_named_guard.rs` (5 tests, both sites
+> > bite-proven in both directions).
+> >
+> > **It also answers the question the log could not.** The 2026-09-10 record
+> > states plainly that the log *"CANNOT distinguish (a) the same contract
+> > surviving 8 reconnects from (b) 8 different contracts each newly ignored"* —
+> > opposite diagnoses, and no counter separates them. A named id does.
+> >
+> > **NOT claimed:** that this stops a ghost, changes a request code, or makes
+> > Dhan honour an unsubscribe. It makes the failure *reportable*. The vendor
+> > ticket the section above calls for stays the remedy; this is the evidence
+> > it needs. Cost: zero new metric, zero alarm, zero EMF name — one `info!`
+> > at the measured swap rate (~9,500 lines a session, ~24 a minute) and two
+> > fields on an `error!` that is already throttled to once per socket per
+> > 180 s cooldown.
+
+A socket that was told to drop a contract kept receiving it past the 90 s grace,
+on every socket that swapped, every time. **Dhan did not honour a single code-25
+unsubscribe.** The ghost detector did exactly what the 2026-09-08 (THIRD) section
+built it for — it detected, it redialled, and the redial rebuilt the vendor's view
+from ours — so nothing was lost and no socket parked. What it cannot do is make 25
+mean "unsubscribe" to the vendor.
+
+#### What changes
+
+| Surface | Was | Now |
+|---|---|---|
+| `constants.rs::FEED_UNSUBSCRIBE_TWENTY_DEPTH` | 25 | **24** |
+| depth-20 and depth-200 unsubscribe frames | `RequestCode: 25` | `RequestCode: 24` |
+| The pin test | `test_depth_unsubscribe_code_is_25` | `test_depth_unsubscribe_code_is_24_and_is_subscribe_plus_one` |
+| Every doc, rule and comment asserting "25, NOT 24" | asserted | annotated with this date |
+
+24 is not a guess: it is the ONLY other value either vendor surface names. The
+classic annexure page (stable across every crawl since 2026-06-02) lists
+`24 | Unsubscribe - Full Market Depth`, and the vendor's own reference client
+derives every unsubscribe as `subscribe_code + 1`, which is how Ticker (15→16),
+Quote (17→18) and Full (21→22) already work in this codebase — depth (23→24) now
+follows the same rule the other three have always followed. The "25" came from
+the portal export alone, and the live wire has now disagreed with the portal.
+
+#### ⚠ What this does NOT claim (Rule 11)
+
+- **24 is UNVERIFIED-LIVE until the next session reads it.** The verdict
+  instrument is unchanged: a session that ends with `ghost = 0` and
+  `unsubscribed_grace > 0` is the evidence that 24 works. If 24 is ALSO ignored,
+  the same detector will say so within 90 s of the first swap, the redial will
+  keep every socket alive exactly as it did on 2026-09-10, and the honest next
+  step is a support ticket with both codes' evidence — not a third guess.
+- **The apply cadence does NOT move.** The FOURTH-quote ordering binds until 24
+  reads clean on a live session; the 2026-09-09 section's blockers on the
+  cadence raise (804 parks the socket and the redial cannot reach a parked
+  socket; per-call swap caps; `send_swap` unguarded on `pending`; two QuestDB
+  queries per iteration; the stall threshold) all stand.
+- **Nothing was lost on 2026-09-10.** Ghost rows are STILL WRITTEN by design; the
+  cost of the wrong code was redial churn and stale depth-200 books, not data.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Reverts the constant to 25 without a dated live reading showing 24 ignored AND
+  25 honoured — a document is not a wire.
+- Raises the apply cadence on the strength of this change before a session has
+  read `ghost = 0` with `unsubscribed_grace > 0` on code 24.
+- Leaves any doc, rule or comment asserting "25, NOT 24" un-annotated — a stale
+  assertion in this direction sends the next reader back to the code that was
+  proven ignored.
+
+### 2026-09-10 — A TICK WHOSE EXCHANGE DAY IS NOT THE RECEIPT DAY IS REFUSED OUTRIGHT, not just kept out of candles
+
+**The verbatim operator demand (2026-09-10, typed directly in-session — preserve
+EXACTLY, expletives and typos included):**
+
+> "ssee just now i saw one query which is this nse fno securityid dude which had ticks recievd at is 9.15 am but why the fuck ts is last even 3.29 pm motherfucker see clealry note this motherufcker which is clealry ntoe our recievd at shodu lbe between 9.15 am till 3.49 pm for fno right meanwhiel ts also shodul be always between 9.15 am till 3.49 pm for fno right  okay can you fix this issue and assure this also dude okay? see because whenevr we manually or fix or deploy soemthigna nd if the server starts means then the incoming recivign ticks shdou lneevr ver be inegtsed right into db right do you understand my point tel me dude okay?"
+
+The operator additionally CHOSE the refusal shape from an enumerated three-way
+question — *"Refuse the row entirely"*, over stamping it with the receipt time
+and over also tightening the seconds-of-day window. Both halves are recorded
+because the second is what makes this a narrow change rather than a wide one.
+
+#### The row he found, and why it exists
+
+`security_id 66422` (NSE_FNO, `web.dhan.co/Charts?exch=NSE&seg=D&secid=66422`)
+carried `received_at` = today 09:15 and `ts` = 15:29. Nothing was broken at the
+receipt end; the row is the documented consequence of a decision taken here on
+2026-08-26.
+
+**Dhan sends LAST TRADE TIME, never "now".** A dormant contract snapshotted at
+the 09:15 connect therefore carries the stamp of whenever it last actually
+traded. `multi_tf_aggregator.rs` records the measurement in its own words:
+*"measured mean 5 hours, max 34 days"*, and *"verified live as 8,898 fabricated
+bars in a database created empty that same morning."*
+
+That was found and fixed on 2026-08-26 — **for candles only.** The refusal was
+made CANDLE-ONLY, and the code says so verbatim:
+
+> *"a prior-day frame is then refused as `stale_trading_day`, which is a
+> CANDLE-ONLY refusal, so its row is still written to `ticks` and only the
+> bogus bar is skipped. Recovery keeps everything it could legitimately keep."*
+
+The stated reason — *"the ROW is a real last-traded price and is kept"* — is
+defensible about a price and wrong about **this table**.
+
+#### Why keeping the row was wrong, specifically
+
+`ts` is QuestDB's **designated timestamp**. A row stamped with a previous
+session's LTT does not merely look odd next to its `received_at`: it lands in a
+**previous day's partition**, silently amending a day that already closed. And
+once there it is indistinguishable from a genuine 15:29 trade on that day —
+nobody reading the table later can tell the back-dated snapshot from the real
+tick. That is the false-OK class, written into the one table the whole system
+treats as ground truth.
+
+**The operator's second sentence names the delivery mechanism exactly.** Every
+reconnect and every deploy restart draws a fresh snapshot burst, so each one
+injected a batch of these rows. That is why the shape appears at 09:15 and
+after every manual restart.
+
+#### The contract (LOCKED)
+
+| Aspect | Locked value |
+|---|---|
+| Gate | A tick whose IST exchange DAY differs from its IST receipt DAY is **HARD-refused** — no row in `ticks`, no candle, no leaderboard entry |
+| Direction | Both. `stale_trading_day` (exchange day BEFORE receipt day) and `future_trading_day` (exchange day AFTER receipt day) are refused identically |
+| Counted | `tv_dhan_feed_ingest_refused_total{reason}` with the reason preserved — a refusal that reaches no counter is a silent drop, which is what this section exists to stop |
+| No receipt | `received_at_nanos <= 0` is the documented "no receipt" sentinel (pre-`TVW3` WAL frames). With no second clock there is nothing to compare, so the gate STANDS DOWN rather than guessing. Those frames are replay, not live |
+| Seconds-of-day window | **UNCHANGED** at 09:00–15:40 (`TICK_PERSIST_START/END_SECS_OF_DAY_IST`) — see below |
+
+#### ⚠ What this does NOT change, and why the operator was told before choosing
+
+The operator's message asks for **09:15–15:49**. The window is deliberately NOT
+moved, and he selected the option that leaves it alone after being shown why:
+
+- The **09:00** start is authorized and load-bearing. The 2026-08-28 section of
+  this file moved candle bucketing to a 09:00 session start to capture the
+  pre-open, and `CONTINUOUS_SESSION_START_SECS_OF_DAY_IST` (09:15) exists as a
+  SEPARATE, narrower constant precisely so silence detection does not page
+  during the pre-open. Indices tick continuously from 09:00; moving the persist
+  start to 09:15 would discard that data.
+- The **15:40** end is 10 minutes past the 15:30 close, which already covers the
+  closing tail. Extending to 15:49 buys nine minutes in which nothing trades.
+
+The row that prompted this was never a window problem. `15:29` is INSIDE the
+existing window on both ends — that is exactly why it passed. The defect was
+always the DAY, never the time of day, and the day gate is what this section
+adds.
+
+#### ⚠ Honest cost (Rule 11)
+
+A dormant contract now leaves **no row at all** until it genuinely trades. Before
+this change it left one row per snapshot, back-dated. There is no third option
+that keeps a record without either back-dating a closed partition or fabricating
+a trade at the receipt instant — the operator was shown all three and chose the
+refusal. If a last-traded-price record for dormant contracts is ever wanted, it
+belongs in its own table with an honest schema, never back-dated into `ticks`.
+
+**NOT claimed:** that this repairs rows already written. It does not. Existing
+back-dated rows remain in their prior-day partitions and would need a separate,
+operator-authorized cleanup — which is a DELETE against `ticks`, a SEBI-retention
+table, and is therefore deliberately not started here.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Returns `stale_trading_day` or `future_trading_day` to the candle-only set.
+- Writes a day-mismatched tick under a receipt-derived `ts` (the fabrication the
+  operator declined).
+- Refuses a day-mismatched tick without counting it.
+- Applies the gate when `received_at_nanos <= 0` — that is a WAL replay frame
+  with no second clock, and guessing there re-creates the 2026-08-26 defect from
+  the other direction.
+- Moves `TICK_PERSIST_START_SECS_OF_DAY_IST` off 09:00 under cover of this
+  quote — the operator chose the option that leaves the window alone.
+
+### 2026-09-11 — THE CODE-24 VERDICT IS IN, AND IT IS NEGATIVE: Dhan IGNORES 24 TOO
+
+**No new authorization is claimed.** This records the live reading the
+2026-09-10 section explicitly asked for, in the exact terms it set, plus one
+stale claim it carries.
+
+#### The verdict instrument, and what it read
+
+The 2026-09-10 section set the acceptance test verbatim: *"a session that ends
+with `ghost = 0` and `unsubscribed_grace > 0` is the evidence that 24 works."*
+
+Read from the running box at 15:46 IST on 2026-09-11, the first full session on
+the code-24 build:
+
+| counter | value |
+|---|---:|
+| `tv_dhan_feed_depth_total{outcome="ghost"}` | **5,250,076** |
+| `tv_dhan_feed_depth_total{outcome="unsubscribed_grace"}` | 1,664,266 |
+| `tv_dhan_feed_depth_total{outcome="ghost_redial"}` | 80 |
+| `tv_dhan_feed_depth_total{outcome="ghost_exhausted"}` | **10** |
+| `tv_dhan_feed_depth_total{outcome="rows"}` | 793,936,720 |
+
+**`ghost` is not 0. It is 5,250,076. On the stated test, code 24 is ignored.**
+
+#### The caveat that section named is CLOSED — the box genuinely ran the 24 build
+
+The 2026-09-08 (THIRD) section's residual 4 and the 2026-09-10 section both
+leave open whether the running binary carried the flip. Verified:
+
+| check | reading |
+|---|---|
+| `/tickvault/prod/deploy/binary-git-sha` | `23701dfca0cbaa02710e55003054948b57ca2ca7` |
+| `git merge-base --is-ancestor ad778aa50 23701dfca` | **true** — the build CONTAINS the 25 → 24 flip |
+| `systemctl show tickvault -p NRestarts` | **0** |
+| process start | **08:30:49 IST**, running 7h40m at the time of reading |
+
+One continuous session, no restarts, on a build that contains code 24.
+
+#### The derived streaming tail
+
+Grace is `GHOST_GRACE_SECS` = 90 s and the dropped map remembers for
+`DROPPED_RETENTION_SECS` = 600 s, so the ghost window is 510 s and the
+never-honoured ceiling ratio is 510/90 = 5.67. Observed ratio:
+5,250,076 / 1,664,266 = **3.155**. Solving `(T − 90)/90 = 3.155` gives
+**T ≈ 374 s** — the average unsubscribed contract kept streaming for about
+**six minutes** after we told Dhan to stop. Approximate: it assumes a steady
+packet rate and ignores contracts that re-entered the top 250 and reverted to
+`Held`.
+
+At 20 levels per depth-20 packet that is ≈ **105 million stored rows, ~13.2% of
+the session's 793,936,720**, for contracts this process had unsubscribed. Waste,
+never loss — `dhan_feed_stack.rs` writes them by design and says so.
+
+#### What this means, and what it does NOT
+
+**Two codes have now been proven ignored on two consecutive sessions**, and the
+vendor's own annexure contradicts itself about which is correct. Per the
+2026-09-10 section's own instruction, **the honest next step is a support ticket
+with both sessions' evidence, not a third guess.** No local strategy choice
+repairs it.
+
+**NOT claimed:** that a third code exists to try. **NOT claimed:** that anything
+was lost — ghost rows are written, `ghost_exhausted = 10` means ten sockets
+stopped redialling after `GHOST_REDIAL_SESSION_CEILING` and kept their working
+set. **The apply cadence still does NOT move**: the FOURTH-quote ordering binds
+on a clean read, and this read is the opposite of clean.
+
+#### ⚠ RE-MEASURED 2026-09-11 (same evening) — three of the numbers above are LOW, the provenance is wrong by 17 minutes, and the REDIAL BOUGHT NOTHING
+
+The table above says *"Read from the running box at 15:46 IST."* It was read at
+**15:29 IST** — the running cumulative crosses all three claimed values at that
+minute — and the session had not finished: ghost kept accruing to **15:43** and
+rows to **16:01**. Re-queried from `/tickvault/prod/metrics`, the EMF log group
+(`tv_dhan_feed_depth_total` in CloudWatch carries only a `host` dimension — it
+folds `outcome` away, so the per-outcome split is **not verifiable from
+CloudWatch metrics at all** and the EMF group is the only source):
+
+| counter | table above | MEASURED session total | low by |
+|---|---:|---:|---:|
+| `ghost` | 5,250,076 | **5,345,436** | 95,360 (1.8%) |
+| `unsubscribed_grace` | 1,664,266 | **1,686,468** | 22,202 (1.3%) |
+| `rows` | 793,936,720 | **793,936,960** | 240 |
+| `ghost_redial` | 80 | 80 | — |
+| `ghost_exhausted` | 10 | 10 | — |
+
+The derived tail is unchanged in substance: 5,345,436 / 1,686,468 = 3.170 ⇒
+**T ≈ 375 s** against the 374 s recorded above.
+
+**The finding that matters is not the 1.8%.** `GHOST_REDIAL_SESSION_CEILING`
+is 8 and there are ten depth sockets, so **80 is the arithmetic maximum** — the
+number is a saturated ceiling, not a measurement of ghost frequency. Every
+socket hit it: all five depth-20 exhausted by **09:43 IST**, all five depth-200
+by **10:22 IST**, firing at the 180 s cooldown floor back to back (conn 5:
+09:19:18 → 09:22:18 → 09:25:38 → 09:28:38 → …), a fresh ghost verdict at the
+earliest legal instant, eight times.
+
+| ghost packets | count | share |
+|---|---:|---:|
+| before the last exhaustion (10:22 IST) | 1,151,204 | 21.5% |
+| **after** | **4,194,232** | **78.5%** |
+
+**Four fifths of the session's ghosting happened with no redial budget left**,
+flat across five hours (hourly IST: 09h 624,792 · 10h 1,326,090 · 11h 963,876 ·
+12h 746,296 · 13h 684,950 · 14h 634,604 · 15h 364,828). The remedy shipped on
+2026-09-08 to make a wrong unsubscribe code self-healing **did not heal it**;
+it spent its budget in the first hour and then watched.
+
+**⚠ A CLAIM MADE IN THIS SESSION IS REFUTED AND IS WITHDRAWN: "every ordinary
+swap arms a socket re-dial."** Measured: depth-20 **7,662 swaps → 40 redials =
+0.52%**; depth-200 **1,799 → 40 = 2.22%**; combined **9,461 → 80 = 0.85%**.
+It is wrong by two orders of magnitude and was stated without checking the
+arithmetic against the swap counters that were already in hand. **And the
+refutation must not be read the other way either** — 91% of all swaps
+(depth-20: 7,122 of 7,662; depth-200: 1,502 of 1,799) happened AFTER that
+pool's redial budget was already spent, so they could not have armed one
+whatever they did. The honest statement is that **the ghost detector was
+budget-blind for most of the session**, and the swap-to-ghost rate is unknown.
+
+**Also measured, and it is the reassuring half:** `SubscriptionRejected`,
+`ParkReason`, `InstrumentsExceedLimit`, `FatalDisconnect` and `parked` each
+return **0 events**; `tv_dhan_ws_park_total` is 0 on all four reasons across
+8,640 EMF records; `tv_depth_rebalance_swaps_refused_total` is 0 on all five
+reasons. **No socket parked.** The wrong unsubscribe code costs redial churn
+and stale books, not sockets.
+
+**Still Unknown, and the gap is the one already flagged:** no `WS-GAP-02` line
+carries an instrument id (`{ $.fields.security_id = * && $.fields.code =
+"WS-GAP-02" }` → **0 events**), so the per-contract tail cannot be measured
+directly and the 375 s figure remains a ratio derivation assuming a steady
+packet rate. Adding `security_id` + `segment` to the ghost line is the
+prerequisite, and it is also what a Dhan support ticket needs.
+
+**Two counters this session quoted are in NO CloudWatch metric at all** —
+`tv_depth_rebalance_swaps_sent_total` and `tv_depth20_track_swaps_sent_total`
+exist only in the EMF log group and the local exporter. They are correct
+(1,799 and 7,662, verified exactly); they are simply not alarmable today.
+
+#### ⚠ CORRECTED in the same pass — "804 parks the socket" is STALE in TWO places
+
+The 2026-09-09 section's blocker list says *"804 parks the socket and the redial
+cannot reach a parked socket"*, and the 2026-09-08 (SECOND) section says a
+depth-200 over-subscribe is *"804, Fatal, parked for the session."*
+
+**Both were true until 2026-09-10 and are now wrong.** `classify_disconnect`
+maps `DisconnectCode::InstrumentsExceedLimit` to
+`DisconnectClass::SubscriptionRejected`, and `ParkReason::SubscriptionRejected`
+is the **only** reason in the tree whose `allows_one_respawn()` returns `true`.
+Its own docblock records the reasoning: neither overflow nor credential, the
+worst case of being wrong is one wasted dial on that slot alone, and *"a fresh
+connection resets the vendor's count"*.
+
+So 804 costs **one bounded respawn — riding the normal backoff ladder, the
+per-slot stagger and the flap floor — and then a park**, not an instant
+session-ending park.
+
+**This matters because the overstatement has already cost work:** the
+2026-09-09 section used the permanent-park reading to WITHDRAW the claim that
+the ghost detector makes a wrong unsubscribe code self-healing. That withdrawal
+was correct about a socket that has already parked and wrong about the blast
+radius. The blocker list itself STANDS — the cadence raise is still blocked by
+the per-call swap caps, the unguarded `send_swap` pending slot, the two QuestDB
+queries per iteration and the stall threshold — but the 804 row in it is
+smaller than written.
+
+**Both passages are left in place per house convention and corrected here.**
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Ships a third unsubscribe RequestCode on a guess, without a vendor answer or a
+  live reading that distinguishes it.
+- Raises the apply cadence citing this section — the read is negative, so the
+  FOURTH-quote ordering binds harder, not less.
+- Repeats "804 parks the socket for the session" without the one-respawn
+  correction.
+- Reports the 5,250,076 ghosts as data loss. They are written.
+- Cites the 80/40/40 "byte-identical signature" as evidence about the vendor —
+  it is `GHOST_REDIAL_SESSION_CEILING` × socket count and could report no other
+  number (see the CORRECTED block above).
+
+#### ⚠ 2026-09-11 — five traps in reading the NEXT session's data, found before it was read
+
+A ghost line and an ask line are now both instrumented, but a naive join of
+them (or of either against `market_depth`) returns a **clean-looking wrong
+answer**. Each of these was verified in source; none is a defect in the lane,
+and all five are properties of how the evidence must be QUERIED.
+
+| # | Trap | Why a naive read is wrong |
+|---|---|---|
+| 1 | **`Held` short-circuits over the UNION of both pools** (`depth_subscription_view.rs`: `depth20.contains \|\| depth200.contains` is tested BEFORE `dropped`) | A contract dropped from depth-200 while depth-20 still holds it classifies `Held`, never `Ghost`, and is never logged. That file's own docblock measures depth-200's entry set as *"by construction almost always inside depth-20's top 250 — roughly 19 of every 20."* **So depth-200 unsubscribes are nearly INVISIBLE to the ghost test, and their absence reads as "depth-200 unsubscribes worked."** The short-circuit is CORRECT for its real job — never redial a socket for a contract we legitimately hold elsewhere — so it must not be "fixed"; the reading must account for it. |
+| 2 | **`d5` rows are not depth-socket rows** | `market_depth` holds three `depth_kind`s, and `d5` comes from Full-mode MAIN-FEED packets. Since the 2026-09-11 FOURTH board puts SPOT on depth-20, and every spot is also a main-feed Full instrument, `d5` rows keep arriving after a spot unsubscribe — innocently, forever. **Filter `depth_kind IN ('d20','d200')` or every spot unsubscribe is unfalsifiable.** |
+| 3 | **Timestamp frames differ** | `market_depth.ts` is `received_at_nanos + IST_UTC_OFFSET_NANOS` — naive IST in a UTC-typed column — while the log timer emits a real `+05:30` offset. Comparing the log stamp as an instant against `ts` as UTC is out by **5 h 30 m**, so every row reads as "after" every ask. |
+| 4 | **Ring dwell back-dates rows** | `received_at_nanos = Utc::now() − frame.received_at.elapsed()`, so a row that physically arrived AFTER the ask can be stamped BEFORE it by up to the ring dwell (alarmed only at 2,000 ms, worst at the open). Early post-ask rows go missing from a strict `ts > ask` window. |
+| 5 | **`top_volume_rank` cannot defeat the re-subscribe confound for the contracts under test** | It persists only the top `TOP_VOLUME_RANK_PER_FAMILY` (250), and a contract is dropped *because* it fell off the board — so it usually has **no row at all**, not a `subscribed=false` row. `subscribed` also comes from the per-MINUTE publish while snapshots write at 1 s/5 s, so a re-subscribed contract reads `false` for up to 60 s. |
+
+**Two worst cases that are byte-identical to success, and must be excluded
+before any conclusion:** (a) a session where nothing left the top 250 produces
+zero asks AND zero ghosts — indistinguishable from "unsubscribe now works";
+the only separator is `unsubscribed_grace > 0`. (b) The deploy not shipping
+produces ghost lines with no ids — identical to 2026-09-10/11; **verify the
+binary sha before trusting a null result.**
+
+**What survives all five:** the ASK record (`depth_unsubscribe_sent`) has no
+redial ceiling, so it is the only surface covering the 78.5% of ghosting that
+happens after every socket exhausts its redials — and the one-socket depth-200
+probe in the CORRECTED block above needs none of these joins at all.
+
+### 2026-09-11 (SECOND) — the depth-200 hysteresis band widens 3 → 15, under the remedy the 2026-09-07 lock already prescribes
+
+**No new authorization is claimed, and none is needed.** The 2026-09-07 section
+legislates for this exact condition in advance, verbatim: *"If the swap budget
+is hit routinely, the answer is a longer window or a hysteresis band on
+entry/exit — NOT reverting to cumulative."* The swap budget is being hit
+routinely. This is that remedy, applied to the pool that is hitting it.
+
+#### The measurement that triggers it
+
+Read from the box, 2026-09-11, one continuous session (process up 08:30:49 IST,
+`NRestarts=0`):
+
+| reading | value |
+|---|---:|
+| `tv_depth_rebalance_swaps_sent_total` — **depth-200 pool, 5 sockets** | **1,799** |
+| Steering cycles in the capture window (23,100 s ÷ 60) | 385 |
+| Swaps per cycle, against `MAX_RANKED_SWAPS_PER_MINUTE` = 5 | **4.67 — 93.5% of the cap** |
+| Mean hold per depth-200 contract | **1.07 minutes** |
+| `tv_depth_rebalance_swaps_refused_total{*}` | **0 for every reason** |
+
+A deep socket held a contract for about one minute all session, and the pool sat
+pressed against its own safety valve. Every refusal counter reads zero — the
+machinery is not misbehaving; it is doing exactly what it was told, 1,799 times.
+
+#### ⚠ A correction to this file's own arithmetic, recorded because it was quoted
+
+The 2026-09-11 depth-subscription review quoted 1,799 as the whole system's swap
+count. **It is the depth-200 pool alone.** depth-20 keeps a separate counter that
+had never been read. Read the same day:
+
+| counter | value |
+|---|---:|
+| `tv_depth20_track_swaps_sent_total` | **7,662** |
+| `tv_depth20_ranked_swaps_total{outcome="planned"}` | 7,662 |
+| `tv_depth20_ranked_swaps_total{outcome="capped"}` | **24,607** |
+| `tv_depth20_ranked_swaps_total{outcome="unplaced"}` | 13,386 |
+| `tv_depth20_ranked_swaps_total{outcome="unfunded_departure"}` | 121 |
+| `tv_depth20_track_swaps_refused_total{*}` | 0 for every reason |
+
+**Both pools together: 9,461 swaps performed against 32,269 wanted — the caps
+refused 76% of the system's own appetite.** Each of the 250 depth-20 slots
+changed contract ~31 times (mean hold ~12.6 minutes), which is far calmer than
+depth-200's 1.07 minutes and is why this change touches depth-200 only.
+
+#### What changes
+
+`DEPTH200_HYSTERESIS_RANKS` 3 → **15**, so `DEPTH200_EXIT_UNDERLYINGS` moves
+8 → **20**. Entry is unchanged at the socket budget of 5.
+
+| | entry | exit | share of the ~208 live F&O underlyings |
+|---|---:|---:|---|
+| before | top 5 | top 8 | a held name lost its socket on falling out of the top **3.8%** |
+| after | top 5 | top 20 | it must fall out of the top **~10%** |
+
+**Nothing else moves.** The socket budget is 5, the instrument budget is 250 + 5,
+the per-minute swap cap is unchanged, placement still comes from the ENTRY set
+only, the ranking cadence is still 5 s and the apply cadence is still once a
+minute. Stock-options-only stands; index options and futures remain banned.
+
+#### Why 15, and the honest limit of the choice
+
+**It is not derived.** Nobody has measured how far an underlying's rank drifts
+between five-second windows — that is the number that would set this exactly,
+and it does not exist. 15 is the first value with a defensible MEANING: *entered
+as one of the five busiest names, keeps its socket until it is no longer among
+the busiest tenth.* Top-8-of-208 is not a statement about a name being busy; at a
+five-second sampling window on stock-option books this file already calls
+*"thinner than FINNIFTY's"*, it is rank noise — and 93.5% of cap is what rank
+noise looks like from the outside.
+
+**The depth-20 ratio is deliberately NOT the model.** That pool enters at 250 and
+exits at 300 — a 1.2× band — and copying the ratio would give depth-200 a band of
+ONE, which is worse than today. The pools differ in the COST of being wrong, not
+in proportion: losing a contract costs depth-20 one slot in 250 and costs
+depth-200 **one socket in five**, on a feed with **no snapshot-on-subscribe**, so
+the replacement book is silent until its next update.
+
+**The cost of being too wide, stated plainly:** the pool can hold names ranked
+16–20 while 6–15 sit unheld, because placement only happens into a socket whose
+contract has left the list entirely. Every such name entered as a top-five, so
+the set is "recently busiest", never arbitrary — and against a measured
+one-minute hold on a book that starts silent, a continuous hold on a
+recently-top-five name is very likely the better capture. **That is a judgement,
+and it is labelled as one.**
+
+#### NOT fixed by this, and it is a second churn source
+
+The published list carries **one contract per underlying**, and the planner keeps
+a socket only while that exact contract is still the list's pick for its name. If
+the underlying stays busy but its busiest STRIKE moves, the held contract falls
+off and the socket swaps — **even though the NAME never left the band.** Widening
+the band does nothing for that case. Keying the keep-test on the underlying
+rather than the contract is a semantic change to what a depth-200 socket
+promises, and it deserves its own decision rather than riding along here.
+
+#### NOT claimed
+
+That this fixes the churn. It is the first measured step, and
+`tv_depth200_ranked_swaps_total{outcome}` against the 1.07-minute mean hold is
+what tunes it: still near the cap next session means still too narrow; swaps
+collapsing to near zero with a stale held set means too wide. **Nothing may be
+reported as fixed until those move.** It also does nothing about the
+unsubscribe-code failure recorded in the section above — ghosts are a property of
+Dhan ignoring the instruction, not of how often we send it, though fewer swaps
+does mean fewer ghosts.
+
+#### The ratchet
+
+`depth200_candidates::tests::the_hysteresis_band_stays_wide_enough_to_mean_the_name_is_still_busy`
+asserts a FLOOR (`DEPTH200_HYSTERESIS_RANKS >= 2 × DEPTH_200_SOCKET_BUDGET`),
+never equality — tuning upward on the next measurement must not fail the build,
+narrowing back toward 3 must. Bite-proven in both directions on 2026-09-11:
+reverting the constant to 3 fails it; restoring 15 passes 85 depth-200 tests and
+the full 2,134-test app suite.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Narrows the band below the ratchet floor without a measurement showing rank
+  drift is small.
+- Widens the band by widening the ENTRY set — entry is the socket budget and
+  stays there; only the keep-test moves.
+- Changes the socket or instrument budgets under cover of this change.
+- Applies the same widening to depth-20, whose 50-rank band measured a 12.6-minute
+  mean hold and zero refusals.
+- Reports the churn as fixed before `tv_depth200_ranked_swaps_total` says so.
+
+### 2026-09-11 — THE DARK WINDOW AFTER A SUBSCRIBE IS MEASURED FOR THE FIRST TIME
+
+**The verbatim operator authorization (2026-09-11, typed directly in-session):**
+
+> "go ahead and add the time to first packet measurement dude okay?"
+
+Given in DIRECT response to a report whose "what I would do next" list opened
+with, verbatim: *"**Measure time-to-first-packet after every subscribe.** One
+timestamp on swap, one on the first depth frame for that contract, one
+histogram."* That is the §28.2/§28.3 authorization shape this repository
+already accepts — a general go-ahead answering an ENUMERATED ask selects the
+enumerated work. Recorded HERE, in the same change as the code, per the
+rule-file-first law.
+
+#### The gap it closes
+
+The operator asked how long a depth-20 resubscribe takes during a swap. Every
+number this repository could offer was a **BUDGET, not a measurement**:
+
+| Number | What it actually is |
+|---|---|
+| `SWAP_WIRE_BUDGET` = 1 s per side | the ceiling we WAIT before giving up |
+| `SUBSCRIBE_SEND_TIMEOUT` = 10 s | the transport's own send ceiling |
+| 1 swap/socket/minute | the rate the unreconciled-ack gate permits |
+
+None answers the question. They bound how long we wait; they say nothing about
+how long Dhan takes to start delivering the new book — and the India feed has
+**no snapshot-on-subscribe** (the "First Tick Snapshot" is documented only on
+the US global-stocks socket), so a freshly subscribed contract is not merely
+late, it is **BLANK until the book next changes**, and nothing in this process
+measured that window.
+
+#### What ships
+
+`crates/app/src/depth_first_packet.rs` — one tracker, four call sites:
+
+| Site | Cadence | Cost |
+|---|---|---|
+| depth-20 dispatch, `Ok(())` arm only | ≤ 20/min | O(1) |
+| depth-200 dispatch, `Ok(())` arm only | ≤ 5/min | O(1) |
+| frame drain, beside the ghost check, **before the level loop** | per depth PACKET | **one relaxed atomic load** when idle; + one hash probe while a swap is outstanding |
+| per-minute sweep, beside the swap-ack reconcile | 1/min | O(pending), capped at `MAX_PENDING` = 1,024 |
+
+> **⚠ CORRECTED 2026-09-11 — the depth-20 cadence in the table above read
+> “≤ 5/min” and the real figure is ≤ 20/min, four times higher.** Found by the
+> same 6-agent sweep that found the three code bugs in this module, and it is
+> the identical mistake this file records elsewhere in prose: the depth-200
+> cap IS five a minute pool-wide (`MAX_RANKED_SWAPS_PER_MINUTE` =
+> `DEPTH_200_SOCKET_BUDGET`, one per socket × five sockets, and its own
+> docblock says so in those words), and that figure was carried across to the
+> depth-20 row where it does not hold. depth-20 permits
+> `MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE` = 4 per socket
+> (`DEPTH_SWAP_COMMAND_CHANNEL_DEPTH`, const-asserted ≤ the channel depth
+> because “a cap above the depth is not a cap”) across five sockets.
+>
+> **Read the depth-200 row as correct and unchanged.** Only the depth-20 cell
+> moved.
+>
+> **What the wrong number understated:** the stamp rate into the pending set,
+> which is the input to the `MAX_PENDING` = 1,024 ceiling and to the
+> per-minute sweep's O(pending) cost. Neither conclusion changes — at 25
+> stamps a minute against a 120 s lifetime the set holds on the order of 50,
+> two orders of magnitude under the cap — but a reader sizing that ceiling
+> from this table would have been working from a quarter of the real rate.
+>
+> The reusable half is the one this file keeps recording: **a per-socket
+> figure and a pool-wide figure are different claims, and the two depth pools
+> express their caps in different units.** Quoting one pool's number into the
+> other pool's row is how they get conflated — and the two rows sitting
+> adjacent with the same value is exactly what made it look checked.
+
+Series (local `/metrics` only — see the budget row below):
+`tv_depth_first_packet_latency_ms` (histogram) and
+`tv_depth_first_packet_total{outcome="arrived"|"silent_window"|"refused"}`,
+all three seeded at zero at boot.
+
+#### ⚠ What the number composes — it is NOT a network round-trip
+
+The clock starts when the steering task successfully QUEUES the swap and stops
+at the first depth packet for that contract. Four terms, and only the first two
+are ours: queue wait · the connection task's wire writes · Dhan applying the
+subscription · **time until the contract's book next changes**. The fourth is
+the market's, and on a thin stock option it can be the whole figure. It is
+deliberately the UPPER bound — *how long until data flows again after we decide
+to swap* — because that is the number a fill depends on.
+
+Measuring from DISPATCH rather than from the wire write is also what keeps this
+an app-crate change: the wire write happens on the connection task in `core`,
+and reaching it would thread a clock through the transport for a term already
+bounded by `SWAP_WIRE_BUDGET`.
+
+#### ⚠ Why `silent_window` is not called a failure
+
+A contract with no depth packet inside `FIRST_PACKET_WINDOW_SECS` (120 s) may
+simply not have traded. Naming that "never arrived" would be a claim in the
+ALARMING direction about a book doing nothing wrong — the mislabel class this
+file keeps correcting. What it IS good for is the shape nobody could see
+before: a swap that acknowledged and then delivered nothing at all. With the
+unsubscribe code proven ignored on both 25 (2026-09-10) and 24 (2026-09-11),
+the arrival half is the only half left to check.
+
+#### ⚠ Budget: LOCAL ONLY, and that is the decision not an oversight
+
+No EMF selector entry, no CloudWatch alarm, **$0.00/mo**. The September
+forecast read live 2026-09-06 is **$142.24** against an automatic
+`STOP_EC2_INSTANCES` action line of **$135.00**, and §2.3n of
+`dhan-rest-only-noise-lock-2026-07-14.md` requires the next addition to arrive
+with a LEVER, not a cost note. This change carries no lever, so it carries no
+CloudWatch cost. It is the number an operator reads AFTER an existing page.
+
+#### ⚠ CORRECTED 2026-09-11 (same day) — the instrument had TWO fabricated-zero paths, and both biased it toward zero
+
+A six-agent adversarial sweep of this module, run hours after it landed and
+before it had ever produced a live reading, found two independent ways for it
+to record a **0 ms arrival that never happened**. Both are fixed; both are
+bite-proven in each direction. They are recorded rather than quietly patched
+because they are the same class as the pool-byte defect this section already
+carries — and because an instrument that is wrong toward zero is wrong in the
+direction that reads as good news.
+
+| # | Defect | Why it fires | Fix |
+|---|---|---|---|
+| **1** | A **ghost stream answers a fresh stamp.** `Key` is `(security_id, wire_segment, pool)` — the pool byte separates depth-20 from depth-200, but **nothing separates socket 3 from socket 7 inside one pool.** | Dhan ignores the unsubscribe (proven for code 25 on 2026-09-10 and code 24 on 2026-09-11; mean ghost tail ~374 s). A dropped contract keeps streaming from the OLD socket, leaves `held_anywhere`, is legally re-taken onto a DIFFERENT socket, and the next in-flight ghost packet resolves the new stamp at ~0 ms for a socket that has delivered nothing. | `record_subscribe_at` gains `may_already_be_streaming`, answered at both dispatch sites from `DepthSubscriptionView::classify_raw`. Anything but `Unknown` means this process has a recent record of the contract on a depth socket → refuse the measurement and count `unmeasurable`. |
+| **2** | A **back-dated receipt clamped to zero and counted as `arrived`.** | NOT an NTP edge case. The drain's `received_at_nanos` is deliberately back-dated by ring dwell (`Utc::now()` minus `frame.received_at.elapsed()`) while the stamp is a raw `Utc::now()`. Ring dwell has its own alarm at 2,000 ms, so under any backlog a packet received before the dispatch and drained after lands here. The old code did `.max(0)` and still counted `arrived`. | A receipt preceding its subscribe is counted `reordered` and records NO sample. The entry is still CONSUMED — the contract has delivered a packet, so it must not also age into `silent_window`. |
+| **3** | A **wire-REFUSED swap aged into a false `silent_window`.** | The stamp fires on the `Ok(())` arm of `try_send`, which proves the command reached a CHANNEL, not that the connection took it. On a `NotHeld`/refused/sender-dropped ack the believed hold is reverted — but the stamp survived and was swept at 120 s as a dark window for a subscribe that never happened. | `forget()`, called from both reconcile revert arms. Idempotent. |
+
+**Two honest limits, stated rather than left to be found.** The gate
+deliberately OVER-refuses the harmless cross-pool case, because `classify_raw`
+is pool-blind — depth-20 holding a contract now refuses a depth-200 stamp the
+pool byte would already have protected. Over-refusing costs one sample;
+under-refusing costs the series' credibility. And the module header's claim of
+*"Zero allocation on every arm"* was **false in the deallocation direction**
+and is corrected in place: `pin()` returns a `seize` guard whose drop runs that
+collector's deferred reclamation, so the drain — which pins far more often than
+the steering task — performs essentially all of this map's frees.
+
+**Also hardened in the same change, and it closes a finding in both
+directions:** `depth_first_packet_wiring_guard.rs` was the only guard of its
+family scanning RAW source while ten siblings strip comments first, so a
+deleted call site left behind as `// record_subscribe_at(...)` would have kept
+every assertion green. The inverse is not theoretical either — the explanatory
+sentence added to a dispatch site the same day moved the scan's anchor and
+turned a placement test RED against correct code. It now strips comments,
+anchors on the CALL rather than the bare name, carries a `guard_self_test`
+bite-proving it can fail, and drops an assertion that was **vacuous**
+(`level_loop > 0`, an offset that cannot be zero once the `find` succeeded).
+
+#### ⚠ What this does NOT do (Rule 11)
+
+- **It does not make a swap faster.** It reports how long the new contract
+  stays dark. The remedies — a fixed universe that never resubscribes, or a
+  vendor answer on the unsubscribe code — are unchanged.
+- **It does not measure the OTHER 49 instruments' exposure.** While a swap's
+  two wire calls run on the connection task, that task is not polling `recv()`,
+  so every instrument on that socket queues kernel-side. That is a separate
+  measurement and is NOT claimed here.
+- **No live reading exists yet.** The first session with this build is the
+  measurement; until then "a swap takes N ms" is not a claim this repository
+  can make, and the 2 s figure remains a CEILING that has never been observed.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Moves the observation INSIDE the depth level loop (a depth-200 frame carries
+  200 levels; the question has one answer per packet).
+- Drops the `connection_index != u8::MAX` gate (a replayed WAL frame reports a
+  latency against a clock that never ran).
+- Stamps the clock on a REFUSED dispatch arm (ages into a false
+  `silent_window`).
+- Runs the O(pending) sweep on the frame drain.
+- Removes the sweep (a dark contract is never counted, AND the hot-path gate
+  stays above zero for the session, so every depth packet pays a probe).
+- Quotes the histogram as a network round-trip, or as proof a swap is fast —
+  term 4 above is the market's, not ours.
+- Adds an EMF name or alarm for these series without a LEVER in the same
+  change.
+
+### 2026-09-11 (THIRD) — DEPTH-20 IS TOP 7 UNDERLYINGS BY PERCENTAGE MOVE, FUTURES + OPTIONS, FROM PRE-OPEN — and the 5-second cadence ask is WITHDRAWN
+
+**The verbatim operator demands (2026-09-11, typed directly in-session — preserve
+EXACTLY, expletives and typos included):**
+
+**Quote A (the withdrawal — this is what unblocks everything else):**
+> "yes go ahead with thsi newer requiremente which i have sated clealry dude okay firget the fucking dpeth 20 seconds level resuscoirbe bro okay? just go ehad wiht this newer mintue level resubscrbe newer requirmeen t aloen dude okay? do you really udnerstadn ddue okay?"
+
+**Quote B (the requirement):**
+> "see its simplembro just pcik the percnetage mvoe dude to fidn the top 7 that too startign pre oprn itself shodu lbe spotted dude okay? so after evry one minute also it shodu lobe chekd dude okay? do you understand my ppioitn dude okay? nwo did you get my point dude okay? i clelaury told yo uto pick top 7 futures startign pre makret based on percnetage change dude see that too after 9.15 am also startign 9l.16 am always check the same top 7 percnetage change current expiry futures dude and its repsective options of atm plus or minus also rigth for btoh calla nd ptu dude okay? and then for index only nifty and bankn ifty futures and its repscetive options atm plus or min us 10 rigth dude now chekc this and tell me will it sit udner 250 slots and how will yo usubscibre this also dude see because evry unique fno shouslbe be subscirbe dspeartely rigth dide becuase if you need to swap with subscirbe reusbscirbe emans then tell me dude okay?"
+
+**Quote A was given in DIRECT response to a message that had just reported the
+capacity arithmetic (247/250 at ATM±5), the swap-clock blocker (23 swaps to move
+one name against a 20/minute budget), and the five REJECT rows this reverses —
+and that closed by asking for his words on the record before any code. He
+answered by authorizing the design AND withdrawing the cadence ask that was the
+hardest blocker.** Recorded HERE, before the code, per the rule-file-first law.
+
+#### What Quote A RETIRES — and this is the most consequential line in this section
+
+The 5-second apply cadence has been asked for four times (2026-09-06 Quote A,
+the 2026-09-06 FOURTH quote, 2026-09-08, 2026-09-09) and refused four times for
+reasons recorded above: the per-call swap caps hold no cross-call state, the
+unguarded `send_swap` pending slot, two QuestDB queries per iteration against a
+5-second tick, and the 180 s stall threshold written for a 60 s loop.
+
+**Quote A withdraws it: "forget the … depth 20 seconds level resubscribe …
+just go ahead with this newer minute level resubscribe."** The apply cadence is
+therefore **ONE MINUTE, by the operator's own instruction**, and the four
+blockers above are moot rather than deferred. The FOURTH-quote ordering ("probe
+the unsubscribe code FIRST, then raise the cadence") is likewise moot for THIS
+design: there is no raise. It stands unchanged for any FUTURE cadence proposal.
+
+#### What this SUPERSEDES
+
+This reverses the 2026-09-06 depth lock on three of its four axes, and the
+2026-09-07 sort-key lock on one. Recorded rather than overwritten:
+
+| Surface | 2026-09-06 / 09-07 locked value | 2026-09-11 (THIRD) |
+|---|---|---|
+| Instrument class | stock options ONLY (`OPTSTK`); *"No underlying spot or futures or indices or indices fmo"* | **stock options + STOCK FUTURES + INDEX futures + INDEX options** (NIFTY/BANKNIFTY only) |
+| Selection unit | individual CONTRACTS, top 250 by volume | **top 7 UNDERLYINGS**, each contributing its future + ladder |
+| Sort key | `window_lots_milli` (lots traded in the window) | **absolute percentage move of the UNDERLYING**, in integer basis points |
+| Gainer role | eligibility FILTER, never the sort key | **the sort key itself** — and it is the ABSOLUTE move, so a faller ranks equally with a riser |
+| Ranking start | 09:15 (`within_capture_window`) | **09:00 — pre-open** |
+| Apply cadence | once a minute at :08 | **unchanged, once a minute** |
+| depth-200 | unchanged by this quote | **UNCHANGED** — top 5 distinct underlyings by lots-in-window, band of 20 |
+
+**depth-200 is NOT touched by this quote.** Quote B says *"this is purely
+related to depth 20"* in its 2026-09-06 ancestor and says nothing about the deep
+pool here. The 2026-09-11 (SECOND) band widening stands, the volume key stands,
+and stock-options-only stands for depth-200.
+
+#### The contract (LOCKED)
+
+| Aspect | Locked value |
+|---|---|
+| Selection unit | **UNDERLYING**, not contract |
+| Sort key | `move_bps = ((ltp_paise − prev_close_paise).abs() × 10_000) / prev_close_paise` — **i64, integer, no float anywhere on the path** |
+| Direction | **ABSOLUTE.** A −8% faller and a +8% riser rank identically. This follows the operator's 2026-09-06 words *"top 7 among between top gainers losers combined"*; it is the one place this section ASSUMES rather than quotes, and it is a one-constant flip (`DEPTH20_RANK_ABSOLUTE_MOVE`) if he means gainers only |
+| Inputs | `SpotPriceStore` (ltp) and `PrevCloseStore` (prev close) — both integer paise, both already live from 09:00, both already the gainer filter's own inputs |
+| Stock names | **top 7** by `move_bps` |
+| Per stock name | its **nearest-expiry FUTURE** (1 slot) + its options **ATM ± `DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE` = 5**, CE and PE (22 slots) = **23** |
+| Index names | **NIFTY and BANKNIFTY only**, unconditionally — never ranked, never displaced |
+| Per index name | its **nearest-expiry FUTURE** (1 slot) + its options **ATM ± `DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE` = 10**, CE and PE (42 slots) = **43** |
+| Total | 2 × 43 + 7 × 23 = **247 of 250** |
+| Ranking cadence | every minute, from **09:00** |
+| Apply cadence | every minute at :08 — **UNCHANGED** (Quote A) |
+| Entry / exit | enter at rank ≤ 7; **keep until rank > `DEPTH20_NAME_EXIT_RANK` = 12** |
+| Budget | 250 depth-20 instruments, 5 sockets × 50. UNCHANGED |
+| Segment | `NSE_FNO` only. SENSEX / BANKEX remain structurally impossible (BSE_FNO, Dhan serves depth on NSE alone) |
+| Contract source | the daily master artifact. Hardcoding contract ids remains a REJECT — they expire |
+
+#### The capacity arithmetic, and why ATM±5 is a CEILING not a preference
+
+| Block | Contracts | Slots |
+|---|---|---:|
+| NIFTY future | 1 | 1 |
+| BANKNIFTY future | 1 | 1 |
+| NIFTY options ATM±10 | 21 strikes × CE+PE | 42 |
+| BANKNIFTY options ATM±10 | 21 strikes × CE+PE | 42 |
+| 7 stock futures | 7 | 7 |
+| 7 stock ladders ATM±5 | 11 strikes × CE+PE × 7 | 154 |
+| **Total** | | **247** |
+| Ceiling (`5 × 50`) | | 250 |
+| **Spare** | | **3** |
+
+ATM±6 for stocks gives 275 — **over by 25**, and `plan_pool` refuses the WHOLE
+pool fail-closed rather than truncating, which is a session-ending failure. So
+±5 is the arithmetic ceiling in the operator's stated shape, not a judgement.
+
+**⚠ The packing caveat, stated because it changes the answer.** 250 is
+`5 sockets × 50` and a contract cannot straddle a socket. Under FREE packing
+(contracts fill any socket) 247 fits. Under SOCKET-AFFINE packing (all of one
+name's contracts on one socket, so a rotation touches one socket) NIFTY takes 43
+of 50 and BANKNIFTY takes 43 of 50, stranding 14 slots, and 7 × 23 = 161 does not
+fit the remaining 150 — ATM±4 (19/name → 133) does. **Free packing is what
+ships**, because the wider ladder is worth more than the cheaper swap at a
+one-minute cadence, and `plan_pool` already packs the main feed this way.
+
+#### ⚠ The swap clock — the honest cost, and why the band exists
+
+| Fact | Value |
+|---|---:|
+| Swaps per socket per minute | 4 (`MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE`, const-asserted = channel depth) |
+| Pool-wide per minute | **20** |
+| One stock name rotating out | 23 out + 23 in = **23 swaps** |
+| Minutes to apply ONE name change | **2** |
+| Whole board turning over | 250 ÷ 20 = **12.5 minutes** |
+
+A percentage-move key re-orders in BOTH directions every minute, unlike
+cumulative volume which only ever rises. **Without a band the board would chase a
+list it can never match**, and that is not a hypothetical: the 2026-09-11 (SECOND)
+section measured depth-200 at 93.5% of its swap cap with a 1.07-minute mean hold,
+on a key that at least rises monotonically.
+
+`DEPTH20_NAME_EXIT_RANK = 12` is the remedy the 2026-09-07 lock already
+prescribes verbatim — *"the answer is a longer window or a hysteresis band on
+entry/exit"* — applied at the NAME level: a name entered as a top-7 keeps its 23
+slots until it falls out of the top 12 (~6% of the ~208 live F&O underlyings).
+It is the same shape as depth-20's existing 250/300 contract band and
+depth-200's 5/20 name band, and it is **not derived** — no measurement of
+minute-to-minute rank drift on this key exists, because no session has ever
+ranked on it. `tv_depth20_name_swaps_total{outcome}` is the read-out that tunes
+it.
+
+#### ⚠ The honest envelope (mandatory per operator-charter §F)
+
+**Pre-open ranking is the cleanest part of this design and the operator is right
+about it.** Volume is zero for everything before 09:15, which is exactly why the
+2026-09-06 lock's own REJECT row calls a pre-open volume ranking *"meaningless"*.
+A percentage-move ranking has no such failure mode: both its inputs are live from
+09:00. The `within_capture_window` gate that starts at 09:15 exists to stop a
+midnight-spanning process publishing YESTERDAY's volumes — a volume-specific
+hazard — so opening the percentage ranking earlier is a narrow, reasoned unlock
+and NOT a weakening of that gate, which stays exactly as it is for the volume
+board.
+
+**NOT claimed — pre-open coverage is partial, and by how much is measured.** The
+2026-08-28 measurement in this file records that ~750 equities deliver one stale
+snapshot at ~08:30 (rejected, outside the window) and then **nothing until the
+09:07 auction print**. So between 09:00 and 09:07 most stock underlyings have no
+spot price and cannot be ranked at all; the board fills from whatever HAS printed
+and completes after the auction. An instrument with no spot must rank NOTHING —
+never zero, which would tie it with a genuinely flat name and hand it a socket.
+
+**NOT claimed — that this improves capture.** 2026-09-10 and 2026-09-11 both
+ended with every depth socket at `GHOST_REDIAL_SESSION_CEILING` and 5,250,076
+ghost packets still arriving, because Dhan ignored the unsubscribe on BOTH code
+25 and code 24. **Every swap this design performs is a swap whose unsubscribe the
+vendor is currently proven to ignore.** Fewer swaps means fewer ghosts, and a
+name-level band means far fewer swaps than a contract-level board — so this
+design is strictly better for that failure than what it replaces. It does not fix
+it, and the support ticket the 2026-09-11 section calls for remains the only
+real remedy.
+
+**NOT claimed — that a thin stock has a ±5 ladder.** 81 of 210 underlyings
+measured 2026-08-27 have ladders where ±25 already takes EVERY strike that
+exists. ±5 is 11 strikes, well inside that, so it is almost always available —
+but `fit_atm_window` returning fewer strikes than asked must fill the remainder
+from the next-ranked name, never leave slots idle and never silently narrow
+another name's window.
+
+**NOT claimed — that percentage move is the right key.** It is the operator's
+key. The measured argument for volume was that it finds the BUSIEST book;
+percentage move finds the most MOVED name, which is a different and equally
+defensible question for a depth capture. Recorded so the trade is on the record.
+
+#### ⚠ What this quote does NOT authorize
+
+- **Any change to depth-200.** Its key, band, budget and stock-options-only
+  restriction are untouched.
+- **Any deletion of SEBI or audit rows** — `instrument_lifecycle`,
+  `instrument_lifecycle_audit`, `index_constituency`, `order_audit`,
+  `order_update_events`, `position_update_events`, `ws_event_audit`. A general
+  "go ahead" is exactly the shape §5-class REJECT lists name as insufficient.
+- Any change to the socket or instrument budget (250 + 5 remain).
+- Any fifth Dhan endpoint type, or more than 16 total connections.
+- Raising the apply cadence — Quote A withdraws that ask outright.
+- Live order fire; `dry_run` stays true.
+- Any edit to the §28 frozen indicator/strategy area.
+- Widening `PrevCloseStore` to `NseFno` — the 2026-09-09 section's one
+  never-open row. The ranking uses the UNDERLYING's prev close, which is
+  `NseEquity` and already written.
+- Depth on `BSE_FNO`.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Uses a **float** anywhere in the sort key. The 2026-09-07 lock's reasoning
+  binds unchanged: a non-finite comparator is non-transitive and corrupts a sort
+  wholesale, and `prev_close = 0` is a proven NaN source in this repository.
+  Integer basis points remove the failure mode rather than guard against it.
+- Ranks a name whose spot or prev close is missing as 0% — that ties it with a
+  genuinely flat name and hands it a socket it did not earn.
+- Divides by a zero or non-positive prev close without refusing and counting.
+- Removes the name-level exit band, or lets a name lose its 23 slots on a single
+  minute in which it slipped to rank 8.
+- Applies the ranking from the frame drain, or more than once a minute.
+- Raises the apply cadence citing this section — Quote A withdraws the ask.
+- Lets a stock name displace NIFTY or BANKNIFTY, which are unconditional.
+- Ships ATM±6 or wider for stocks (275 > 250, and the pool is refused whole).
+- Hardcodes contract security-ids.
+- Reports the pool as enabled while its instrument set is empty — including the
+  09:00–09:07 window, where most equities have not printed.
+- Changes depth-200 under cover of this quote.
+
+### 2026-09-11 (SECOND) — THE VENDOR DOCUMENTATION SETTLES THE UNSUBSCRIBE CODE: it is 25, and 24 exists nowhere
+
+**The operator's instruction (2026-09-11, with four Dhan PDFs and a complete
+10,263-line documentation dump attached — preserve EXACTLY, typos included):**
+
+> "even take this also for reference and cross verification dude okay? i dont have the confidnece how wdo you assur eme dude i ene dth real tiem proevn gauarbteed assured verificatio n dude okay?"
+
+He supplied the vendor's own current documentation and asked for cross
+verification rather than assertion. This section is that cross verification, and
+it **overturns the 2026-09-10 change made by this repository.**
+
+#### What the vendor's own documentation says
+
+Pulled from `docs.dhanhq.co` on 2026-09-11 at 9:05 PM and supplied by the
+operator. The Annexure's **Feed Request Code** table, verbatim and complete:
+
+| Code | Action |
+|---|---|
+| 11 | Connect Feed |
+| 12 | Disconnect Feed |
+| 15 / 16 | Subscribe / Unsubscribe — Ticker Packet |
+| 17 / 18 | Subscribe / Unsubscribe — Quote Packet |
+| 21 / 22 | Subscribe / Unsubscribe — Full Packet |
+| **23** | **Subscribe — Full Market Depth** |
+| **25** | **Unsubscribe — Full Market Depth** |
+
+**The table skips 24.** And a search for the literal `24` as a request code
+across **all 10,263 lines** of the complete v2 documentation returns **ZERO**.
+
+The Full Market Depth guide itself is narrower still: it documents
+`RequestCode 23` (subscribe, in two payload shapes — the 20-level LIST form and
+the 200-level FLAT form) and `RequestCode 12` (**Feed Disconnect** — close the
+whole socket). It shows **no unsubscribe example at all**, and its own "Response
+Fields" tables list `Values: 23` and nothing else.
+
+#### What this overturns
+
+The 2026-09-10 section above changed the constant 25 → 24 and justified it:
+*"24 is not a guess: it is the ONLY other value either vendor surface names. The
+classic annexure page (stable across every crawl since 2026-06-02) lists
+`24 | Unsubscribe - Full Market Depth`."* **The operator's fresh pull refutes
+that.** 24 is named by no vendor surface in the documentation he supplied, and
+what shipped on 2026-09-10 was therefore an **undocumented code**.
+
+The constant is restored to **25** in the same change as this section, along
+with the three rule files and the builder docblock that carried the 24 claim.
+
+#### Why the restore is right even though 25 does not work either
+
+Both codes are now proven ignored, and — the load-bearing fact — **they fail
+IDENTICALLY**: 80 `unsubscribe_ignored` lines, split 40/40 across depth-20 and
+depth-200, on all ten sockets, every socket reaching
+`GHOST_REDIAL_SESSION_CEILING`, on each of two consecutive sessions. A code that
+was merely *wrong* would be expected to differ from another wrong code in at
+least one dimension. **Two byte-identical signatures is the evidence that the
+RequestCode is not the variable.**
+
+> **⚠ CORRECTED 2026-09-11 (same day) — the "byte-identical signature" argument
+> is CIRCULAR and must not be put in a vendor ticket.** 80 = `GHOST_REDIAL_
+> SESSION_CEILING` (8) × 10 depth sockets, and the 40/40 split is 5+5 sockets ×
+> 8: the line is emitted only inside the `Ok(())` arm of `request_ghost_redial`,
+> which refuses past the ceiling. Two saturated ceilings are identical by
+> construction, whatever the vendor did. The unbounded counters (`ghost`,
+> `unsubscribed_grace`) are the only discriminating numbers and were recorded
+> for one day only. **The CONCLUSION may well be right; the evidence offered
+> cannot support it.** Full correction, the one-socket probe that settles it in
+> ~4 minutes, and the untried `RequestCode 12`: see the dated block under
+> "⚠ RE-MEASURED 2026-09-11" above.
+
+When neither value works, the value's job changes. It stops being *"make it
+work"* and becomes *"make the vendor ticket unarguable"* — and
+*"we send the code your own annexure documents, and you ignore it"* is
+unarguable, while *"we send 24"* invites the reply *"24 is not a code"*. Shipping
+the documented value is also the only position that survives Dhan implementing
+the unsubscribe later without us noticing.
+
+#### Two further facts from the same documents, recorded because they close open questions
+
+1. **Depth breaks the `subscribe_code + 1` rule, by the vendor's own table.**
+   Ticker 15→16, Quote 17→18, Full 21→22, but depth 23→**25**. That asymmetry is
+   the vendor's, is now pinned by test, and must not be "corrected" back to 24 by
+   a future reader restoring the pattern.
+2. **Dhan documents no per-instrument depth unsubscribe in the depth guide at
+   all** — only `12`, which closes the socket. That is consistent with the wire
+   behaviour we measured, and it means **disconnect-and-resubscribe may be the
+   only mechanism the vendor actually implements** for changing a depth socket's
+   set. That bears directly on the socket-layout question and is recorded here
+   rather than left to be rediscovered.
+
+#### ⚠ What is NOT claimed
+
+That 25 works. It does not. This change does not stop a single ghost packet, and
+the depth sockets will keep receiving contracts this process unsubscribed until
+Dhan honours the request or the redial rebuilds the socket. The verdict
+instrument is unchanged: a session reading `ghost = 0` with
+`unsubscribed_grace > 0` on `tv_dhan_feed_depth_total`.
+
+**The apply cadence still does NOT move**, and the vendor ticket remains the
+only real remedy — now with the vendor's own annexure as its first exhibit.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Ships 24, or any other value absent from the vendor's Feed Request Code table.
+- "Restores" the `subscribe_code + 1` pattern for depth — the vendor's table
+  goes 23 → 25, and a test pins the asymmetry.
+- Ships a third guessed code instead of opening the vendor ticket.
+- Cites the 2026-09-10 section's "the classic annexure lists 24" claim without
+  re-pulling the documentation — that claim is refuted by the operator's own
+  2026-09-11 full-doc pull.
+- Reports the restore as a fix for the ghosts. It is a correctness fix for what
+  we SEND, not a repair of what Dhan DOES.
+
+### 2026-09-11 (FOURTH) — SIX MOVERS WITH THEIR SPOT, INDEX AT ATM ±11; AND THE SOCKET HANG-UP IS REFUSED ON MEASURED EVIDENCE
+
+**The verbatim operator demands (2026-09-11, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+**Quote A (the shape):**
+> "sso can we goa head with as per your reocmmedation dude which is top 6 alone dude see in that top 6 try ot add its udnerlying spot also dude okay? so now can we can duretcly disocnenct and reocnnect the ntire socket within a seocnd rigth dude for evry minute chekc rigth dude am i rgith dude see that too frehsly you can check this precisley on tuesdya rigth dude am i rgith dude tell me dude okay? ... see meanwhile to fill uo th entire index slots can we add one which is instea dof atm plus or minus 10 can we go ahead with plus or minus 11 dude okay?"
+
+**Quote B (the authorization):**
+> "whatve ror whichevr is reocmmended from your side go ahea ddude okay?"
+
+Quote B was given in DIRECT response to a message that ended with exactly one
+enumerated question — *"drop the socket hang-up and raise the swap budget
+instead — yes or no?"* — after the five findings below were put to him in full.
+That is the §28.2/§28.3 authorization shape this repository already accepts: a
+general go-ahead answering an ENUMERATED ask selects the enumerated work.
+Recorded HERE, before the code, per the rule-file-first law.
+
+#### What this AUTHORIZES
+
+| Surface | 2026-09-11 (THIRD) | Now |
+|---|---|---|
+| Stock movers | **7** | **6** (`DEPTH20_NAME_ENTRY_RANK`) |
+| Per stock name | future + options ATM±5 = **23** | **spot + future + options ATM±5 = 24** |
+| Stock spot segment | banned (`NSE_FNO only`) | **`NSE_EQ` ADMITTED for the six movers** |
+| Index ATM window | ±10 → 43 slots | **±11 → 47 slots** |
+| Board cost | 247 of 250 | **238 of 250**, 12 spare |
+| Apply cadence | once a minute | **unchanged — once a minute** |
+
+Everything else in the (THIRD) contract STANDS unchanged: NIFTY and BANKNIFTY
+unconditional and never displaced; ranking on the ABSOLUTE percentage move of
+the UNDERLYING in integer basis points; the name-level hysteresis band at
+`DEPTH20_NAME_EXIT_RANK = 12`; NSE_FNO for every contract; no BSE; no index
+spot; no hardcoded contract ids; `dry_run` true; §28 frozen.
+
+#### ⚠ The arithmetic makes the three changes ONE change
+
+`slots_for_name(N) = 1 + (2N+1) × 2` (`depth20_name_board.rs:317`).
+
+| Shape | Board cost | Verdict |
+|---|---|---|
+| index ±10, 7 stocks ±5 (authorized) | 2×43 + 7×23 = **247** | fits |
+| **index ±11, 7 stocks kept** | 2×47 + 7×23 = **255** | ❌ **the compile-time assert at `:331` FAILS THE BUILD** |
+| index ±11, 6 stocks, no spot | 2×47 + 6×23 = **232** | fits, 18 spare |
+| **index ±11, 6 stocks + spot** | 2×47 + 6×24 = **238** | ✅ fits, 12 spare |
+| index ±12 + future | `slots_for_name(12)` = **51** | ❌ one socket over on its own |
+
+So ±11 cannot ship with seven names, and the freed slots cannot buy a wider
+stock ladder either (6 × 27 + 94 = 256) or a seventh name (7 × 24 + 94 = 262).
+**Spot is the only thing that fits in the room ±11 creates.** Six is forced by
+the budget, not chosen.
+
+**Honest note on direction:** ±11 is a step UP from the (THIRD) authorization
+(±10) and a step DOWN from what is LIVE today — `depth20_layout.rs:58` runs
+`DEPTH_20_INDEX_STRIKES_EACH_SIDE = 12` with **no index future** (50 option legs
+filling the socket). Against the live shape this trades 2 strikes each side for
+the index future that centres the ATM window under the 2026-09-09 lock.
+
+#### ⚠ WHAT THIS REFUSES — the socket hang-up, and why
+
+Quote A proposes replacing the vendor-ignored per-instrument unsubscribe by
+CLOSING a depth socket and re-dialling it with a changed set, once a minute.
+**That is REFUSED**, and the refusal is the substance of Quote B. Five findings,
+all measured or in source:
+
+| # | Severity | Finding | Evidence |
+|---|---|---|---|
+| 1 | **FATAL** | No deliberate-close concept exists. `ConnEvent` has 11 variants; none means "our set changed" | `pool_supervisor.rs:614-647` |
+| 2 | **FATAL** | Every redial is recorded as a flap, with no way to mark one intentional — `enter_backoff` is the single site and records unconditionally | `pool_supervisor.rs:1569-1577` |
+| 3 | **HIGH** | Once a minute sits at 5 of a ceiling of 6. One vendor drop that minute breaches it → forced 30 s floor, socket classed pathological | `reconnect_ladder.rs:159,182,188` |
+| 4 | **HIGH** | A rebuilt socket counts as healthy only once a FRAME arrives — not on dial, not on ack. A thin book silent for 30 s makes the NEXT rebuild a short-session flap | `reconnect_ladder.rs:140,321-325` |
+| 5 | **HIGH** | The blind window is NOT the 0.31 s transport redial. The India feed has **no snapshot-on-subscribe**, so a re-subscribed contract is BLANK until its book next changes; the tracker gives up at `FIRST_PACKET_WINDOW_SECS = 120`, and a 09:50 delivery cliff where no new contract delivered at all is already measured | `depth_first_packet.rs:14-17,177` |
+
+> **⚠ CORRECTED 2026-09-12 — finding 1's variant COUNT was wrong, and it is the
+> one number in this table a reader can check in a second.** `ConnEvent` had
+> **12** variants when this table was written, not 11 — and has **13** since the
+> probe added `ProbeCloseRequested`. Counted rather than quoted:
+> `BeginDial · DialSucceeded · DialFailed · SubscribeAcked · SubscribeFailed ·
+> FrameReceived · KeepAliveReceived · Disconnected · IdleElapsed ·
+> FrameSilenceElapsed · GhostInstrumentDetected · ProbeCloseRequested ·
+> ShutdownRequested`. The line:column citation is also stale — the enum has
+> moved since.
+>
+> **The FINDING is UNCHANGED and is re-verified in source**: no variant meant
+> "our set changed", which is what makes the refusal correct. Only the count was
+> wrong, and it was wrong in the direction that looks careless rather than the
+> direction that misleads — but this file has now recorded the same shape five
+> times (the byte budget, the $130 ceiling, the September forecast, the
+> AccessDenied flag, the 80/40/40 signature), and the lesson each time is the
+> same: **a count is a measurement, and a measurement quoted from memory is not
+> one.** `awk '/^pub enum ConnEvent/,/^}/'` answers it.
+>
+> **What the 2026-09-12 probe section changes about finding 1, precisely:** it
+> ADDS the deliberate-close variant this finding says does not exist — scoped to
+> the probe alone, unreachable from the steering loop, and a REJECT to widen.
+> The refusal of the ROUTINE mechanism stands untouched: what it refuses is five
+> sockets every minute for 375 minutes, and the probe is one close per socket per
+> session, which is finding 3's own arithmetic read the other way (1 of 6, not
+> 5 of 6 — and 0 of 6 once finding 2 is neutralised by the `records_flap()`
+> condition INSIDE `enter_backoff`, never a bypass of it).
+**And the vendor evidence points the same way, harder.** Dhan documents 805 as
+*"Too many requests or connections. Further requests may result in the user
+being blocked"* (`docs/dhan-ref/08-annexure-enums.md:348`), our code parks a
+805'd socket PERMANENTLY (`pool_supervisor.rs:534,1285`), and
+`docs/dhan-support/2026-06-01-live-feed-429-from-cloud-ip.md:52` records this
+very account being refused with **HTTP 429** on the feed, our own hypothesis
+being *"our reconnect logic retried too aggressively"* — with the question *"is
+there a cap on new connection attempts per minute per dhanClientId?"* sent to
+Dhan and **never answered**. Hanging up five sockets once a minute is ~300
+connection attempts per session against that unknown.
+
+**A PR that adds a deliberate-close-and-redial path for depth is a REJECT**
+without its own fresh dated quote that engages findings 1-5 by name.
+
+#### The REPLACEMENT, authorized in its place
+
+The problem Quote A was solving is real and measured: **moving one name takes
+six minutes.** A name is 24 contracts and the per-socket budget is
+`MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE = 4`
+(`depth20_ranked_steer.rs:87`), which is not a wire limit — it is const-asserted
+equal to `DEPTH_SWAP_COMMAND_CHANNEL_DEPTH`, a queue depth. **Raising both so a
+whole name moves in one minute is authorized**, with three binding conditions:
+
+1. **It ships WITH the name board, never before it.** The current volume-keyed
+   contract board already refuses 24,607 swaps a session against 7,662
+   performed (MEASURED 2026-09-11) — raising the cap under THAT board
+   multiplies ghosts fourfold for nothing.
+2. **The cap stays const-asserted `<=` the channel depth.** A cap above the
+   queue is not a cap.
+3. **Socket-affinity is NOT adopted.** It was only ever needed to make hanging
+   up cheap; with hang-up refused it actively harms, because a name confined to
+   one socket draws on one 4-swap budget while a freely-packed name draws on
+   several. `plan_pool`'s flat `chunks()` shard (`dhan_feed_stack.rs:848-852`)
+   therefore stays as it is.
+
+**Why more ghosts is the safe direction, MEASURED across two full sessions:**
+sockets carried 50 wanted + ~25 ghosts = 75 against a documented cap of 50, for
+6.4 hours, and `tv_dhan_ws_park_total` was **0 on every reason**,
+`tv_dhan_ws_subscribe_failed_total` **0 on all eight reasons including all four
+`unsubscribe_*`**, with zero 804 and zero 805. Ghost cost is ~13.5% of depth
+rows ≈ 2.5% of the session's disk burn.
+
+#### ⚠ Honest envelope (mandatory per operator-charter §F)
+
+- **The 09:00 pre-open requirement CANNOT be met, and no code can meet it.**
+  MEASURED (`:2072`, 2026-08-27): equities deliver one stale ~08:30 snapshot
+  carrying YESTERDAY's timestamp — hard-refused since 2026-09-10 — and then
+  **nothing until the 09:07 auction print**. That print carries the LTP and the
+  previous close on the SAME packet, so ~208 names become rankable together at
+  ~09:07, eight minutes before the bell. 09:00-09:07 the pools hold the
+  previous session's validated seed (`depth_rebalance.rs:1673`, reason
+  `seed_until_first_ranking`) — which is already built and already wired, and
+  is the correct behaviour, not a gap.
+- **A name with a missing price ranks `None`, NEVER 0%** (`:194`, pinned by
+  `a_missing_price_is_not_rankable_and_is_never_zero`). Between 09:00 and 09:07
+  that is most of the equity universe, and ranking them 0 would tie them with
+  genuinely flat names.
+- **NSE_EQ depth is UNVERIFIED-LIVE.** Dhan documents it as supported and uses
+  it as their own subscribe example (`04-full-market-depth-websocket.md:13,274`
+  and the `"NSE_EQ","SecurityId":"1333"` samples at `:84,:96`); our guards
+  already admit it (`subscription_builder.rs:437-462`); the parser stores the
+  segment byte raw and `segment` is in the depth DEDUP key. **But no session has
+  ever sent one.** `IDX_I` by contrast is REFUSED at build time by our own
+  guard, which is why index SPOT can never join a depth socket.
+- **Stock spot depth is an INCREMENT, not new coverage.** The main feed runs
+  Full mode and already persists 5 levels of every equity's book via
+  `append_inline_depth` (`dhan_feed_stack.rs:6375`). This buys levels 6-20.
+- **Name-board churn is UNMEASURED** — the board has never run, so how often the
+  top 6 changes behind a band at rank 12 is Unknown. The swap counters are the
+  read-out and **they reach no AWS surface at all** (MEASURED: absent from the
+  namespace AND from the EMF group), so today they are unalarmable.
+- **NOT claimed:** that any of this improves capture. The unsubscribe remains
+  broken on the vendor's side; the fix is the support ticket, which is itself
+  blocked because no ghost log line carries a `security_id`.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Adds a deliberate socket close-and-redial path for depth without a fresh dated
+  quote engaging findings 1-5 by name.
+- Ships index ±11 while keeping seven movers (the build fails; do not "fix" it
+  by raising `DEPTH20_INSTRUMENT_BUDGET`, which is 5 sockets × 50 and is the
+  vendor's number).
+- Puts an `IDX_I` instrument on a depth socket, or a BSE segment.
+- Raises the swap cap before the name board is wired, or above the command
+  channel depth, or without keeping the const-assert.
+- Adopts socket-affine packing for depth-20 on the strength of this section.
+- Ranks a name with a missing price as 0%.
+- Presents the board as rankable at 09:00, or reports an empty 09:00 board as a
+  defect rather than as the exchange's own timetable.
+- Claims NSE_EQ depth works before a session has actually delivered one.
+
+### 2026-09-12 — THE TWO-ARMED UNSUBSCRIBE PROBE: code 25 CONFIRMED, a deliberate close is AUTHORIZED for the probe only, and a vendor report is drafted on failure
+
+**The verbatim operator demands (2026-09-12, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+**Quote A (the methodological point, which is the authority for the two-armed shape):**
+> "Why bro youdidnf include so key disconnect and reconnect dude because of we don't check both of them then nowhere we will easily identify which one is working right dude"
+
+**Quote B (the authorization, the code decision, and the vendor-report ask):**
+> "Yescheck everything dude so whenever something fails especially for unsubscribe we will clearly drop an email and drop the message even in madefortrade also to them dude okay? Meanwhile lets us check all these dude see for unsubscribe clearly note dude which is only 25 dude so we need to check socket disconnect and reconnect dude okay?"
+
+Quote B was given in DIRECT response to a message that enumerated the two-armed
+probe, named its one real piece of work (the deliberate close that must not
+record a flap), priced its cost at **one extra connection attempt rather than
+~300**, and asked for his word before building. That is the §28.2/§28.3
+authorization shape this repository already accepts. This dated section is the
+rule-file edit the section above demands **by name** — its REJECT list reads
+*"Adds a deliberate socket close-and-redial path for depth without a fresh dated
+quote engaging findings 1-5 by name"* — and §5 of this file's own law. Recorded
+BEFORE the code.
+
+#### Part 1 — the unsubscribe RequestCode is CONFIRMED at 25
+
+Quote B settles the decision that has blocked PR #1909: *"for unsubscribe
+clearly note dude which is only 25"*. `FEED_UNSUBSCRIBE_TWENTY_DEPTH = 25`
+stands, matching the vendor's own Feed Request Code table (23 subscribe → 25
+unsubscribe, skipping 24), and the 2026-09-10 flip to the undocumented 24 stays
+retired. **No third code may be guessed at.**
+
+#### Part 2 — WHY the operator is right, and what the one-armed design got wrong
+
+The executor proposed a ONE-armed probe (unsubscribe only). Quote A rejects it,
+correctly: a negative result on unsubscribe alone says *"this mechanism failed"*
+and cannot say *"the other one would have worked"*. Two mechanisms, one test
+each, or the session produces a third negative result and no decision.
+
+**And the executor's own prior answer was WRONG in a way this section corrects.**
+A previous turn told the operator that disconnect/reconnect "does not exist" and
+would not run on Tuesday. False: `ReconnectReason::GhostInstrument`
+(`pool_supervisor.rs`) is exactly disconnect-and-reconnect as a removal
+mechanism, it is wired, and it has already run ~80 times per session on two
+sessions. What was REFUSED in the section above is disconnect/reconnect as the
+**routine swap mechanism** — 5 sockets x every minute x 375 minutes, ~300
+connection attempts a session against a 429 question Dhan has never answered.
+Conflating a bounded test with an unbounded mechanism is what produced the wrong
+answer, and the distinction is load-bearing for everything below.
+
+#### Part 3 — the contract (LOCKED)
+
+| Aspect | Locked value |
+|---|---|
+| Shape | **TWO arms, one shot each, one session.** Arm A = unsubscribe and do not re-subscribe. Arm B = remove from the retained set, deliberately close, redial so the replay excludes it |
+| Scope | **depth-200 only**, because a depth-200 socket holds **exactly one** instrument, so nothing on that socket can mask the verdict. Never depth-20 |
+| Sockets | **two**, one per arm, so the arms cannot contaminate each other |
+| Runs | **ONCE per session**, operator-armed, never scheduled, never automatic |
+| Default | **OFF.** Serde default false; an absent section means the probe does not exist |
+| Restore | each arm **re-subscribes its instrument** when its watch window closes, so the pool is never left short for the session |
+| Verdict | four outcomes (A silent/not x B silent/not), each recorded with the contract id, the mechanism, the baseline and the observed counts |
+
+#### Part 4 — findings 1-5 of the refusal, engaged BY NAME as that REJECT row requires
+
+| # | The finding (verbatim shape) | Why it does not apply at probe scale, or how it is neutralised |
+|---|---|---|
+| **1** | *No deliberate-close concept exists. `ConnEvent` has no variant meaning "our set changed"* | **This probe ADDS one, and its scope is the probe.** A new reason variant exists solely so a probe close is distinguishable from a fault. It does NOT become available to the steering loop, and wiring it into a swap path is a REJECT below |
+| **2** | *Every redial is recorded as a flap; `enter_backoff` is the single site and records unconditionally* | **This is the one real piece of work.** The probe close must reach `enter_backoff` WITHOUT calling `record_redial`, or a deliberate close poisons the damper and the next genuine fault is mis-damped. The single-choke-point property of `enter_backoff` is PRESERVED — the flap recording becomes conditional on the reason, never a second bypassing path |
+| **3** | *Once a minute sits at 5 of a ceiling of 6* | **The probe is once per SESSION, not once per minute — 1 of 6, not 5 of 6.** And with finding 2 neutralised it is 0 of 6. The arithmetic that made the routine mechanism fatal is precisely what makes the one-shot safe |
+| **4** | *A rebuilt socket counts healthy only once a frame arrives; a thin book silent for 30 s makes the NEXT rebuild a short-session flap* | **Silence is the probe's SUCCESS signal, so "not proven healthy" is expected, not a defect.** The residual is real and is handled: the socket carries a not-proven-healthy state after Arm B, so the restore step must re-subscribe and the probe must not run inside the last 30 minutes of the session, where a lingering not-healthy state would meet the close |
+| **5** | *The blind window is not the transport redial; with no snapshot-on-subscribe a contract is BLANK until its book next changes* | **This is the probe's central measurement hazard and it is designed for, not waved away.** Silence after the action could mean the mechanism worked OR that the book simply went quiet. Therefore each arm MUST measure a **BASELINE FIRST** — frames observed on that socket in the N seconds before the action — and a verdict is only admissible when the baseline proves the book was active. A thin book disqualifies the run, and the probe reports `inconclusive_thin_book` rather than a false positive |
+
+**Finding 5 is the one that decides whether the probe is worth anything.** A
+contract delivering 100 frames a minute before the action and 0 after is
+evidence. A contract delivering 2 frames a minute is noise wearing the costume
+of evidence, and reporting it as a verdict would be the false-OK class this file
+exists to stop.
+
+#### Part 5 — the vendor report on failure (Quote B)
+
+When a run ends with a failing verdict, the operator wants Dhan told: *"we will
+clearly drop an email and drop the message even in madefortrade also to them"*.
+
+| Surface | What ships | What does NOT ship |
+|---|---|---|
+| Evidence | the probe writes a complete, committed support draft under `docs/dhan-support/` from the house `TEMPLATE.md`, filled from the REAL run: contract labels, SecurityId per contract, microsecond IST timestamps, the baseline and post-action frame counts, the request code sent, and the verbatim log lines | — |
+| Delivery | the verdict is a coded log line and the draft is a committed file; the operator reads both and sends | **No automated send, and NO new Telegram page.** The process does NOT email Dhan, does NOT post to MadeForTrade, and does NOT add a fifth Dhan-scoped alert family |
+
+**Why delivery is NOT automated, stated plainly rather than quietly omitted.**
+Three reasons, and none of them is capability: (a) `docs/dhan-support/README.md`
+mandates that every technical email is a committed markdown file shared as a
+GitHub rendered link, *"never as pasted plain text in Gmail"* — an auto-send
+would break the house workflow the operator himself wrote; (b) a message to a
+broker's support desk and a public post in their community are **outward-facing
+and irreversible**, and a false positive from a thin-book run would spam the
+vendor with a defect that does not exist, which costs exactly the credibility
+the ticket needs; (c) the draft is worth more than the send — the reason two
+prior sessions produced no ticket is that no log line named a contract, not that
+nobody could open Gmail.
+
+**If the operator wants the send automated as well, that is its own dated quote
+in this section**, and it should arrive only after the first draft has been read
+and judged accurate.
+
+#### Part 6 — honest envelope (mandatory per operator-charter §F)
+
+> "The probe answers ONE question: on this account, on this endpoint, does an
+> unsubscribe stop the stream, and does a close-and-redial stop it? Four outcomes,
+> each decisive in a different direction, each recorded with the contract id and
+> the baseline that makes it admissible. **NOT claimed:** that either mechanism
+> works — the probe is built precisely because nobody knows. **NOT claimed:** that
+> a silent socket proves the mechanism, absent a baseline that proves the book was
+> active; a thin-book run reports `inconclusive_thin_book` and no verdict. **NOT
+> claimed:** that one session generalises — one run on two sockets on one account
+> at one time of day is one data point, and a vendor may behave differently under
+> load. **NOT claimed:** that the probe fixes anything. It produces evidence and a
+> draft; the remedy is still Dhan's. **NOT claimed:** that `RequestCode 12` is
+> covered — the only stop mechanism the vendor's depth guide documents still has
+> zero production callers and is NOT in this probe."
+
+#### Part 7 — what a PR that violates this section looks like (REJECT)
+
+- Makes the deliberate-close reason available to the steering loop, the swap
+  path, or anything other than the probe — finding 2 of the refusal is
+  neutralised **for the probe**, never lifted.
+- Adds a second path that bypasses `enter_backoff` instead of making the flap
+  recording conditional inside it — that destroys the single-choke-point
+  property the guard pins.
+- Ships the probe enabled by default, on a schedule, or more than once per
+  session.
+- Runs either arm on a depth-20 socket (50 instruments mask the verdict).
+- Reports a verdict without a baseline, or reports a thin-book run as anything
+  other than `inconclusive_thin_book`.
+- Leaves an instrument unsubscribed after the watch window — each arm restores.
+- Runs inside the last 30 minutes of the session (finding 4's residual).
+- **Auto-sends an email to Dhan or auto-posts to MadeForTrade** without its own
+  fresh dated quote here.
+- Ships a support draft missing any identifier `CLAUDE.md` makes mandatory
+  (Client ID, Name, UCC, per-contract SecurityId, microsecond IST timestamps).
+- Guesses a third unsubscribe RequestCode.
+- Changes the socket or instrument budgets, `dry_run`, or the §28 frozen area
+  under cover of this quote.
+
+**Why no Telegram page, stated rather than silently omitted.** A "draft is
+ready" page would be a FIFTH Dhan-scoped alert family, and
+`dhan-rest-only-noise-lock-2026-07-14.md` §3 makes that a REJECT without its own
+dated quote in THAT file — *"Adds ANY new Dhan-scoped Telegram page outside the
+§2 4-item set"*. It would also cost ~$0.10/mo against a September forecast of
+**$142.24** and an automatic `STOP_EC2_INSTANCES` line at **$135.00**, where
+§2.3n requires a LEVER and this carries none. And it buys nothing: the probe is
+ONE-SHOT and OPERATOR-ARMED, so the operator already knows it ran. The four-item
+Dhan family is UNCHANGED by this section.
+
+#### Part 8 — the collision the design had to be changed for (MEASURED in source, not assumed)
+
+The first design of Arm A would have been **silently contaminated by Arm B**,
+and the mechanism is worth recording because nothing about it is visible from
+the call site.
+
+`DepthSubscriptionView` classifies an instrument this process dropped, still
+arriving past `GHOST_GRACE_SECS` (**90 s**), as a ghost; the drain then calls
+`request_ghost_redial(frame.connection_index, …)`. Arm A unsubscribes and
+deliberately does NOT re-subscribe — which is **exactly** the shape that
+classifies as a ghost. So ninety seconds into Arm A's watch window the ghost
+detector would close and redial Arm A's socket, applying **Arm B's mechanism to
+Arm A's measurement**, and the resulting silence would prove nothing about
+either.
+
+**The fix is a constraint, not a flag:** Arm A's watch window is
+const-asserted **strictly shorter than `GHOST_GRACE_SECS`**, so the ghost
+machinery can never engage during it. A suppression flag was rejected as the
+weaker form — a flag can drift out of lockstep with the grace constant and the
+failure would be silent, whereas an assert fails the build.
+
+This is also why the window is short enough to be scientifically sound only
+against a baseline: a liquid depth-200 contract delivers on the order of a
+hundred thousand rows a minute, so tens of seconds of true silence is
+overwhelming evidence, while the same window on a thin book is worth nothing.
+That is finding 5, and it is why Part 4 makes the baseline admissibility a
+condition rather than a nicety.
+
+### 2026-09-12 — FOUR CADENCES, EVERY TRADED OPTION CONTRACT, RANKED ON VOLUME-PERCENTAGE CHANGE
+
+**The verbatim operator demands (2026-09-12, typed directly in-session — preserve
+EXACTLY, typos and expletives included):**
+
+**Quote A (the cadences and the cut):**
+> "Bro try to have 1s, 3s and even 5s also dude okay? Do you understand what I'm even asking dude. See if memory is not at all a big deal then have all these dude don't pick top 250 ick the entire options contracts dude okay?"
+
+**Quote B (the fourth cadence, and the latency requirement):**
+> "see whatever it is i need O(1) tracking latency espeicllay for this top volume rank dude thta too cosnider to take 1s,3s,5s and even inclduign one minute also dude okay? make eveythign as 100 percentage common runtime dynamic incremental scalable approach"
+
+**Quote C (the ranking key — first statement):**
+> "see clealry n toe have the lots and normal price prcenatage chnage but purely do thtis top volume rank purely absed on one an donly with this volume percnetage dude okay?"
+
+**Quote D (the ranking key — sharpened minutes later):**
+> "but i dont want this lots dude i just need this volume percentage chnage alone dude okay? but still let us keep this lots and normal price percnetage change dude okay?"
+
+**Quote E (the authorization):**
+> "go ahead with this ank on volume-percentage alone for all tehe ntire options contartcs enitlrey that too for every 1s,3s,5s and even 1m inclduign as well dude okay? taht too achieveign this O(1) dude okay?"
+
+Quote E was given in DIRECT response to a published ledger that enumerated this
+work, priced it, named the three defects that block it, and stated plainly that
+per-sweep O(1) is impossible. That is the §28.2/§28.3 authorization shape this
+repository already accepts. Recorded HERE before any code, per the
+rule-file-first law.
+
+#### What this authorizes
+
+| Surface | Before | After |
+|---|---|---|
+| Snapshot cadences | 2 — `1s`, `5s` | **4 — `1s`, `3s`, `5s`, `1m`** |
+| Persisted set per family per sweep | top 250 by rank | **every option contract that traded in the window** |
+| Named ranking key | `window_lots_milli` (lots ×1000) | **volume-percentage change**, persisted as its own integer column |
+| `window_lots_milli` | the key | **KEPT as a column** (Quote D) |
+| `gain_pct` (the UNDERLYING's price move) | a column | **KEPT as a column** (Quote D) |
+| Sweep iteration | every tracked contract | **only the contracts that traded in that window** |
+| Everything else | — | UNCHANGED |
+
+#### ⚠ The ordering does not change, and that is the point
+
+The volume-percentage change and the lots figure are **monotone transforms of one
+another** — `net_volume_chg_pct = window_lots_milli / 10 − 100`, so the two differ
+by a fixed scale and offset and rank identically on every row. Ranking "purely on
+volume percentage" therefore produces the **byte-identical order** that ships
+today. What changes is that the figure is named, stored, and ranked-by in the
+table rather than derived only in a view.
+
+**The comparator MUST keep sorting the integer.** This file's own REJECT list bans
+a float in a sort key — *"a non-finite comparator is non-transitive and corrupts a
+sort wholesale"* — and `gain_pct` is an `f64` produced by dividing by a previous
+close. Because the two forms are monotone transforms, sorting the integer and
+naming the result by the percentage is not a compromise: it is the same answer,
+reached safely. The persisted percentage column is likewise an INTEGER
+(milli-percent), never a float.
+
+#### ⚠ O(1): what is granted, and what is arithmetically impossible
+
+Quote B asks for "O(1) tracking latency" and Quote E for "achieving this O(1)".
+Three operations hide under that phrase and they do not have the same answer:
+
+| Layer | Runs | Complexity | Verdict |
+|---|---|---|---|
+| **Track** — record one contract's volume | per tick | **O(1)**, one hash probe, zero allocation, map pre-sized so it cannot resize | **already met, and four cadences do not change it** |
+| **Collect** — which contracts traded in this window | per sweep | O(tracked) today → **O(traded)** | **this is the work** |
+| **Order** — assign a rank | per sweep | O(m log m) | inherent |
+
+**Per-sweep O(1) is impossible and is NOT claimed anywhere.** The sweep's output
+is one row per contract that traded; producing m rows costs at least m. Any design
+that claims otherwise is silently reintroducing a top-k cut, which is exactly what
+Quote A removes.
+
+**What IS granted and delivered: O(1) in the size of the universe.** The sweep
+stops scaling with how many contracts EXIST and scales only with how many TRADED.
+Adding 20,000 quiet contracts costs nothing. The mechanism is a per-window dirty
+set: the tick marks a contract when its volume actually advances (a bit test and a
+bounded push on the accepted arm only, allocation-free because the buffers are
+pre-sized and the bitmask caps them at one push per contract per window), and the
+sweep drains only that buffer.
+
+**The correctness invariant this rests on, stated because it was written down
+nowhere:** a zero delta means the baseline already equals the volume, so the
+sweep's baseline write for an untraded contract is a no-op. It holds because every
+path that writes volume also settles the baseline. **It must be pinned by a test
+in the same change**, or a later unrelated edit can break it and the dirty-set
+sweep starts silently dropping contracts from the board.
+
+#### ⚠ CORRECTION — the 900 µs figure this file and CLAUDE.md both cite is not a measurement
+
+`rank_sweep_cost_at_the_authorized_ceiling` seeds its contracts through `observe`,
+which sets every baseline equal to the contract's volume. Every subsequent `rank`
+therefore computes a zero delta, which is dropped before the sort — **the sort ran
+over an empty list on all fifty measured rounds.** The harness additionally passes
+a constant stub where production performs an atomic load plus a hash probe per
+contract per sweep to fetch the lot size.
+
+So the 900 µs omits **both the sort and the per-contract probe** — the two costs a
+wider window and an uncapped set increase. The true sweep cost is higher by an
+unknown factor. Two further errors in CLAUDE.md's O(1) table, found alongside: it
+states the measurement was taken at **25,000** contracts when the harness uses
+**20,220**, and it states the database appends are "inside the measured 900 µs"
+when the harness executes no append at all.
+
+**The harness must be repaired in the same change** so it ranks contracts that
+actually traded and uses a real lot-size lookup. No duty-cycle claim may cite the
+old number.
+
+#### ✅ REPAIRED AND MEASURED 2026-09-12 — and the true ceiling is 3.3× WORSE
+
+`rank_sweep_cost_at_the_authorized_ceiling` now advances contracts before every
+timed round, probes a real lot-size `HashMap` per contract (production resolves
+through `global_contract_underlying_map().owner_of(..)` — a global load plus a
+probe, which the constant `lot1` stub let the optimiser delete), times ONLY the
+sweep, and **ASSERTS it filled the board** — so it can no longer report a number
+from an empty sort. Release, x86 dev container, 20,220 tracked contracts:
+
+| contracts that TRADED in the window | sweep | duty at 1 s |
+|---|---:|---:|
+| 20,220 — every one (the ceiling) | **2.95 ms** | 0.295% |
+| 2,000 (Assumed realistic) | **123 µs** | 0.012% |
+| 500 | 28.7 µs | 0.003% |
+| 100 | 6.4 µs | 0.0006% |
+| 20,220, full rank + distinct(5) | 2.50 ms | 0.050% at 5 s |
+
+**The withdrawn figure was optimistic by 3.3×, not pessimistic.** Two separate
+omissions compounded: the empty sort, and the folded-away lot probe — which
+alone accounts for 1.78 ms → 2.95 ms, measured by running the repaired harness
+once with the stub and once with the probe.
+
+**What the dirty sets buy, on these numbers:** 2.95 ms → 123 µs at the assumed
+realistic shape, a **24× reduction**, and 460× at 100 traded. The worst SECOND —
+all four cadence arms landing together, both families, every contract trading —
+is 8 sweeps ≈ **23.6 ms, a 2.4% duty cycle** on the drain task; at the realistic
+shape it is ~1 ms, ~0.1%.
+
+**Still Assumed:** the 2,000-traded row. Nobody has measured how many of ~20,000
+strikes trade in one second; the measuring query is named in
+`top_volume_rank_persistence`'s header. It is SWEPT here rather than asserted,
+so a reader sees the shape instead of one number they would then quote.
+
+#### ⚠ The defects that must be fixed BEFORE a cadence is added
+
+1. **The compile error trains you to write the bug.** Adding a cadence correctly
+   fails to compile at the cadence→slot mapping. The obvious fix — map the new one
+   to slot 2 — compiles, while the per-contract baseline array is still sized from
+   a SEPARATE hand-written `ALL` list nobody was forced to touch. The result is an
+   out-of-range write on the frame drain; the release profile aborts rather than
+   unwinds, so the process dies mid-session and takes tick capture with it.
+2. **The guard for it cannot catch it.** `every_cadence_is_in_the_all_list`
+   iterates `ALL` — the very list that would be missing the variant — and matches
+   on the wire label rather than on the type. Its own comment claims it fails the
+   exhaustive match. It does not.
+3. **The views are on a separate wire.** `console_views::TopVolumeCadence` is a
+   SECOND cadence enum with its own hand-written `ALL`, linked to
+   `SnapshotCadence` by nothing. A new cadence would write rows whose view is
+   never created, and the guarding test passes green because it checks its own
+   list against itself.
+4. **A missing timer arm is caught by nothing.** Forget a `select!` arm and that
+   cadence simply never fires — no error, no counter, no log.
+5. **The tracked/ranked gauges carry no cadence label**, so four cadences alias
+   into one series, last writer wins.
+
+**The sanctioned fix for 1–4 is ONE shape: a single declaration list from which
+the enum, `ALL`, the labels, the interval seconds, the array index and the view
+name are all generated**, so the compiler enforces agreement instead of three
+hand-written lists and tests that check each against itself. Adding a cadence must
+become a one-line edit.
+
+#### What this does NOT authorize
+
+- **Any change to depth steering.** `TOP_VOLUME_RANK_PER_FAMILY` is ALSO
+  `DEPTH20_ENTRY_RANKS`. The persistence cut is removed by changing the
+  PERSISTENCE bound; the constant itself stays pinned at 250 and depth-20 keeps
+  entry 250 / exit 300. Depth-200 is untouched, as every prior section states.
+- Any change to the socket or instrument budgets (250 + 5 remain).
+- Any change to the depth apply cadence — Quote A of 2026-09-11 (THIRD) withdrew
+  that ask and it stays withdrawn.
+- Live order fire; `dry_run` stays true.
+- Any edit to the §28 frozen indicator/strategy area.
+- Any deletion of SEBI or audit rows.
+- Any new CloudWatch metric name or alarm. This pipeline's nine counters reach no
+  deployment surface today, and adding one costs ~$0.30/mo against a September
+  forecast of $142.24 with an automatic `STOP_EC2_INSTANCES` line at $135.00.
+  §2.3n of `dhan-rest-only-noise-lock-2026-07-14.md` requires a LEVER, not a cost
+  note. The observability gap is RECORDED here and deliberately NOT closed.
+
+#### Honest envelope (mandatory per operator-charter §F)
+
+> "100% inside the tested envelope, with ratcheted regression coverage: the
+> per-tick path is O(1) and allocation-free, pinned by a build-failing DHAT gate;
+> the cadence list, its labels, its intervals, its array index and its view names
+> are generated from one declaration so they cannot drift; the zero-delta
+> invariant the dirty set depends on is pinned by its own test; the persisted
+> percentage column is an integer and the comparator stays integer-only.
+> **NOT claimed:** per-sweep O(1) — impossible, and the honest floor is Θ(traded).
+> **NOT claimed:** any duty-cycle figure derived from the old 900 µs harness —
+> withdrawn, and replaced by the repaired harness's measured 2.95 ms ceiling /
+> 123 µs realistic. **NOT claimed:** that the 2,000-traded figure those
+> realistic numbers assume is measured — it is not, and it is swept rather than
+> asserted for exactly that reason.
+> **NOT claimed:** measured row counts for the 3s, 5s or 1m windows without the
+> cut — those are modelled from one session's distinct-instrument count; only the
+> 1-second case was ever read from the database. **NOT claimed:** that any of this
+> has run at a market open with four cadences. **NOT claimed:** that the pipeline
+> is observable outside the box — all nine of its counters reach zero deployment
+> surfaces, and three of its failure modes are entirely silent."
+
+#### ⚠ The 1-minute boundary, decided rather than discovered
+
+The sweep timers start when the drain starts, not on a window boundary. At one
+second the resulting quantisation error is at most one second. **At sixty seconds
+the first in-window row can measure from up to 59 seconds before the open, and the
+last 0–59 seconds before the capture cutoff land in NO one-minute row at all** —
+the next sweep is out of window and rolls the baseline away. This is accepted as
+the cost of a fixed-interval timer, it is recorded here so it is not later
+reported as a defect, and a future change may align the 1-minute timer to the
+wall-clock minute under its own note.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Sorts on a float, or persists the percentage as a float.
+- Changes `TOP_VOLUME_RANK_PER_FAMILY`, or otherwise moves depth-20 entry/exit.
+- Adds a cadence without the single-source declaration, or leaves either the
+  second cadence enum or the self-referential guard in place.
+- Ships a dirty-set sweep without a test pinning the zero-delta invariant.
+- Cites the old 900 µs figure as a measurement, or ships the cadences without
+  repairing the harness.
+- Claims per-sweep O(1) anywhere, in code, comment, commit message or PR body.
+- Removes the persistence bound entirely rather than raising it — the write path
+  has no spill tier, and a batch too wide is DROPPED.
+- Adds a CloudWatch metric name or alarm without a lever, per §2.3n.
+
+### 2026-09-12 (SAME DAY, LATER) — THE TABLE IS `top_volume`, AND ITS FOUR ORPHANED VIEWS ARE SWEPT
+
+**The verbatim operator demand (2026-09-12, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "dotnt make it as top volume rank table meake the table name as top volume alone dude okay?"
+
+This dated row is the rule-file record the rule-file-first law requires for a
+persisted-table name change. It is recorded here rather than in a new section
+because the section above is the one that governs this table, and a wire name
+that lives in two places is a wire name that drifts.
+
+#### What moved
+
+| Surface | Was | Now |
+|---|---|---|
+| The table | `top_volume_rank` | **`top_volume`** |
+| Its four per-cadence views | `top_volume_rank_{1s,3s,5s,1m}` | **`top_volume_{1s,3s,5s,1m}`** |
+| `HOUR_PARTITIONED_TABLES` | the old name | the new one, so it is still swept |
+| `RETENTION_EXEMPT_TABLES` | — | gains the LEGACY name, so the coverage guard demands a decision about it rather than silently ignoring it |
+
+#### What deliberately did NOT move
+
+The module, function and type names (`top_volume_rank_persistence`,
+`ensure_top_volume_rank_table`, `TopVolumeRankWriter`) are Rust identifiers, not
+wire names, and renaming them would churn the codebase-map guard for nothing.
+The six `tv_top_volume_rank_*_total` metric names likewise stay: verified
+against `deploy/`, they have **zero** hits — local `/metrics` only, in no EMF
+selector and no alarm — so renaming them breaks nothing, buys nothing, and
+would churn a rule-file row that names one of them verbatim. A metric name is
+its own namespace and need not track a table name.
+
+#### The history is CARRIED, not abandoned
+
+A one-shot `RENAME TABLE` at boot, issued **BEFORE** the CREATE DDL loop. The
+ordering is the whole safety property: a `CREATE TABLE IF NOT EXISTS
+top_volume` against a box already holding `top_volume_rank` rows succeeds
+against an EMPTY new table, and QuestDB then refuses the rename **forever** —
+stranding the old table outside `HOUR_PARTITIONED_TABLES`, never swept, growing
+on a volume this repository has already filled to zero twice. The `Split`
+verdict (both tables present) is escalated as a coded error rather than
+discarded; an earlier draft swallowed it with a bare `let _ =`, which made a
+halved history SILENT.
+
+#### The four orphaned views, and why the sweep runs where it does
+
+A QuestDB view is stored as its SQL **text** and resolved at query time, so the
+rename does not carry its views across: the four old faces still named a table
+that no longer exists. Left alone they are four permanently-broken surfaces in
+the table list beside the four working ones — created by this repository, on
+this repository's own box, by a rename this repository performed.
+`ensure_named_views` now issues `DROP VIEW IF EXISTS` for exactly those four
+names, and it runs **before** `ensure_top_volume_rank_table` on the boot path,
+so the sweep lands before the rename is attempted.
+
+**That ordering is a possible PRECONDITION, not tidiness.** Whether QuestDB
+REFUSES to rename a table that views depend on is **UNVERIFIED** — no QuestDB
+was reachable (no docker daemon in the dev container), so it could not be
+probed. If it does refuse, a rename attempted with those views present fails
+every boot forever and the pre-rename history stays stranded. Dropping them
+first removes that failure mode whether or not it exists; dropping them second
+would not.
+
+The sweep is **four literals, never a prefix match**: `top_volume_rank` — the
+legacy TABLE, holding every ranking row written before the rename — is a strict
+prefix of all four view names, so a prefix sweep would have the legacy table's
+own name in its blast radius. `shadow_persistence` already records what that
+costs, in its own words: a table carrying real tick volume whose name sat in a
+`DROP TABLE IF EXISTS` sweep. The list is fixed at four FOREVER — it is a
+historical fact about what was once created, not a mirror of `SnapshotCadence`,
+so a fifth cadence must never be added to it.
+
+#### ⚠ The measuring query in the sibling docs changed with it
+
+`CLAUDE.md`'s storage-map row carried the settling query naming the old table —
+a statement an operator would paste, which would now fail. Corrected there with
+its own dated note. **The reusable half is narrower than "names go stale":** a
+stale prose name costs a reader one grep; a stale name inside a *runnable
+command* costs them a failed query and a doubt about the whole row. A
+copy-pasteable statement in a document is an executable claim and goes stale
+like any other.
+
+#### ⚠ NOT claimed
+
+That the rename, the drop sweep, or `DROP VIEW IF EXISTS` has been executed
+against a live QuestDB. The drop syntax is the one
+`docs/runbooks/questdb-console-queries.md` already documents as the rollback
+for these same console views on the pinned 9.3.5, and `run_view_ddl` degrades a
+refusal to a counted warn rather than blocking the four CREATEs behind it — but
+no probe was possible, and the first boot after deploy is the measurement.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Writes the table name as a literal anywhere instead of reading
+  `TOP_VOLUME_RANK_TABLE` — the rename exists precisely because the wire name
+  had to move in one place.
+- Issues the `CREATE TABLE IF NOT EXISTS` before the `RENAME` (makes the rename
+  permanently impossible and strands the history outside the retention sweep).
+- Discards the `Split` verdict, or downgrades it below a coded error.
+- Turns the legacy-view sweep into a prefix match, or derives it from
+  `SnapshotCadence` — either one puts the legacy TABLE, or a name that never
+  existed, into a DROP statement.
+- Drops the `IF EXISTS`, which makes the sweep warn on every boot from the
+  second onward — the "one error per boot, forever" shape that trains an
+  operator to discount a counter.
+- Renames the module, the functions, the types or the six metric names in the
+  name of consistency: they are not wire names, and the churn buys nothing.
+
+#### 2026-09-13 — the fourth adversarial round, and the three findings it deliberately did NOT fix
+
+**No new authorization is claimed.** This records an eight-agent parallel attack
+on the 2026-09-12 change, what it found, and — more usefully — the three
+confirmed defects that were FLAGGED rather than repaired, each with the reason
+the obvious fix is worse than the gap.
+
+**Fixed in the same change** (listed so a reader knows which of the eight
+findings are closed): the snapshot timers' boot-only wall/monotonic anchor,
+which at 500 ppm NTP slew collides ~12 windows per session into one grid cell
+where the DEDUP key silently upserts one over the other; three guards on this
+branch that could not fail; the `Split` verdict counter registering itself as
+ZERO inside its own detection arm; the view re-ensure being gated on two
+unrelated tables; the third offload writer having no shutdown accounting; an
+unthrottled `error!` that a dead writer thread turns into ~180,000 lines per
+session.
+
+##### FLAGGED 1 — a re-latch clobbers a LONGER cadence's in-flight window
+
+`volume_leaderboard.rs`. `RELATCH_AFTER_CONSECUTIVE_LOWER` fires after 32
+consecutive lower readings and reseeds `baseline: [contract.volume; WINDOW_COUNT]`
+— **all four cadences at once**, including a 1-minute window that may be only
+seconds old. The genuine trading in that window becomes unrecoverable; after the
+resync restores `[ceiling; 4]` the 1-minute board reports `volume − ceiling`
+rather than `volume − pre_dip_baseline`, under-reporting by the amount traded
+between the window's open and the abandoned high. A genuinely busy contract can
+therefore read `zero_lot` for one minute and lose a depth-200 socket to a
+quieter one. The re-latch comment concedes only that "its first window after a
+re-latch reports nothing", which covers the window it lands in and not the
+clobbering of a longer cadence mid-flight.
+
+**Why the obvious fix is REFUSED.** Saving the pre-dip baselines at re-latch and
+restoring them at resync (`resync_baseline: [u32; WINDOW_COUNT]` in place of the
+scalar `resync_ceiling`) looks clean and is WRONG: sweeps continue to fire
+between the re-latch and the resync, and any sweep that visits the contract
+rolls that cadence's baseline forward. Restoring a saved baseline over a rolled
+one **double-counts** the interval — reporting volume that was already reported.
+Getting it right needs per-slot tracking of which windows have closed since the
+re-latch, which is new state on a hot-path struct with 1 B of real padding left.
+
+Under-reporting one window after a rare 32-consecutive-lower episode is bounded
+and self-correcting on the next window. Double-counting is neither. **The
+current behaviour is the safer error**, and this file's own house rule applies:
+an inherently imperfect step is FLAGGED with its constraint and its chosen
+alternative, never papered over with a subtly-wrong repair at the end of a long
+session.
+
+##### FLAGGED 2 — the ILP writer is live ~900 boot-lines before the RENAME
+
+`main.rs` spawns the feed stack at ~2890; the one-shot
+`RENAME top_volume_rank → top_volume` runs at ~3797. If any snapshot row reaches
+`top_volume` before the rename, QuestDB auto-creates the table and the rename
+returns `Split`: pre-rename history stranded in a table no longer in
+`HOUR_PARTITIONED_TABLES`, plus a new table with no DEDUP key.
+
+The happens-before rests on the 09:15 ranking gate — i.e. on wall-clock luck,
+and a **mid-session restart narrows it to seconds**. It is detected and counted
+(and, as of this change, counted with a number rather than a zero), never
+prevented.
+
+**NOT fixed here** because the shape is PRE-EXISTING — before the rename, the
+same race auto-created `top_volume_rank` without its DEDUP key — and the repair
+is a boot re-order that moves DDL ahead of the lane spawn on a path where
+`ensure_ddl_boot_wiring_guard` already pins four separate orderings for four
+separate reasons. Re-sequencing that at the end of a four-round PR is a larger
+risk than the gap it closes.
+
+##### FLAGGED 3 — `table_exists` reads any non-2xx as "absent"
+
+`http_client.rs` maps every non-success response to `Some(false)`, so a
+WAL-suspended or otherwise erroring legacy table reads as NotNeeded and a real
+Split is never reported. The comment at the site states *"the conservative
+direction is the opposite"* and then ships the non-conservative branch.
+
+**NOT fixed here:** the helper is shared by FOUR table renames
+(`spot_1m_rest`, `option_chain_1m`, `option_contract_1m_rest`, and this one), so
+changing its semantics changes three surfaces this PR never touched. It is
+pre-existing, it suppresses a REPORT rather than losing data, and it deserves
+its own change.
+
+##### ⚠ What this round says about the guards themselves
+
+Three of the eight findings were guards written ON THIS BRANCH that could not
+fail — one anchored on a string occurring only in its own argument, one
+satisfied by a neighbouring field's initialiser, one satisfied by its own
+assertion message. That brings this repository's vacuous-guard tally to
+**eight**, and it is the reusable half of the round: **a source scan run against
+the whole file can always be satisfied by the assertion that names it.** Every
+such scan in the changed files now slices below the first `#[cfg(test)]` and
+asserts an occurrence COUNT before comparing positions. A guard that cannot fail
+is worse than no guard, because it also certifies that the case is covered — the
+same cost this file records for `day_ohlc_tracker` (2026-08-12) and
+`WAL-SUSPEND-01` (2026-08-25).
+
+**What a PR that violates this section looks like (REJECT):** restores a
+whole-file `contains` on a string that also appears in its own assertion text;
+seeds a metric series inside the arm that detects the event it counts; reseeds
+all cadence baselines on re-latch AND restores saved baselines at resync without
+tracking which windows closed in between (double-counting); or reports any of
+the three flagged items as fixed.
+
+### 2026-09-13 — THE WIRING GO-AHEAD: the top-6 name board becomes the depth-20 engine, and the probe is made able to tell the truth
+
+**The verbatim operator authorization (2026-09-13, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "dude then fix and reosleve vrythign entilrey as peor oru requiremnet dude okay?"
+
+Given in DIRECT response to a message that ENUMERATED six items and said explicitly that
+two of them needed his word because they change behaviour inside this scope-locked module:
+*"Items 1 and 2 change behaviour inside a scope-locked module, so they need a dated record
+in `websocket-connection-scope-lock.md` before the code moves. Say which you want."* He
+answered "everything, as per our requirement". That is the §28.2/§28.3 authorization shape
+this repository already accepts — a general go-ahead answering an ENUMERATED ask selects the
+enumerated work. Recorded HERE before any code, per the rule-file-first law.
+
+The six items, as put to him:
+
+1. Make Arm B of the unsubscribe probe tell the truth.
+2. Wire the top-6 name board, or decide out loud not to.
+3. Close the two verdict-corrupting HIGHs: the generation check and the refused-stamp
+   inversion.
+4. Make the probe once-per-DAY, not once-per-process.
+5. Fix vacuous guard #11, the `break` that loses `kept`, and the depth-20 cap ordering.
+6. Write the Dhan support draft.
+
+#### ⚠ Item 2 is a DELIVERY, not a new scope — and it changes which engine drives depth-20
+
+The shape was already authorized on 2026-09-11: the THIRD quote of that day moved depth-20
+from "top 250 CONTRACTS by volume" to "top N UNDERLYINGS by absolute percentage move", and
+the FOURTH narrowed it to **six** mover stocks (spot + nearest future + options ATM±5) plus
+NIFTY and BANKNIFTY (future + options ATM±11) = **238 of 250**. `depth20_name_board.rs` was
+written that day and has carried **ZERO production call sites** ever since — 785 lines that
+compile, are tested, and never run. The wiring commit was never written.
+
+So this section authorizes no new instrument class and no new socket. What it does
+authorize, and what must be stated because it is not a detail, is the **engine
+precedence**: after this change the name board is the PRIMARY depth-20 engine, and the
+volume ranking no longer drives depth-20. Before it, `depth_rebalance.rs`'s three-branch
+match hands depth-20 to `plan_depth20_ranked_minute` (top 250 by `window_lots_milli`)
+every minute from the first ranking at ~09:15, so wiring the board into the pre-ranking
+`None` arm alone would have run it for about one minute a day and left the 2026-09-11
+requirement undelivered. The band, the exit rank and the slot arithmetic are unchanged
+from the day they were locked.
+
+**depth-200 is NOT touched.** Its volume key, its 5/20 hysteresis band, its
+distinct-underlying rule and its stock-options-only restriction all stand exactly as
+2026-09-06 and 2026-09-11 (SECOND) left them.
+
+#### ⚠ Item 1: the probe's Arm B contradicted the probe's own header, and the header was right
+
+The module header describes Arm B's mechanism as *"close, re-dial, replay a set WITHOUT the
+contract"*. The implementation did the opposite and said so in `act_socket_close`'s own
+docstring: *"The guard is UNTOUCHED, so the replay re-subscribes the same contract."*
+
+Both arms then share one verdict mapping — `if arrived { Ignored } else { Honoured }`. With
+the guard untouched the redial re-subscribes the contract, frames always resume, `arrived`
+is always true, and **Arm B returns `Ignored` whatever Dhan does.** The control built to
+separate the vendor's behaviour from ours could only ever return the vendor-blaming answer.
+A vendor ticket quoting it would be quoting our own replay.
+
+Arm B is therefore rebuilt to the header's design: drop the contract from the retained set
+WITHOUT a wire frame, then close, so the replay comes back without it. Two consequences
+follow and both are handled rather than absorbed — Arm B must now RESTORE like Arm A, and
+silence alone is no longer proof, because a socket that never redialled is also silent. A
+`Honoured` verdict requires a positive liveness witness; without one the run reports
+`InconclusiveNotRedialled` and says nothing about the vendor.
+
+#### ⚠ Item 3: two ways the probe could produce a confident wrong answer
+
+**(a) The generation defence was specified in a code comment and never implemented.** The
+supervisor's own `ProbeUnsubscribe` arm says it verbatim: *"Both need the same defence and
+the caller owns it: record `guard.generation()` when the probe is armed and invalidate the
+verdict if it moved."* The caller never captured it. A redial inside the watch window
+therefore produces a **false `Honoured`** for Arm A — the emptied guard replays nothing, so
+the silence is ours. `finish()` already carries a hand-written warning telling the reader to
+check `ws_event_audit` by hand; a residual an operator must remember to check is not a
+defence.
+
+**(b) A refused stamp read as "a frame arrived".** `any_frame_within` ignored the return of
+`record_subscribe_at` and inferred arrival from `!forget(..)`. When the tracker REFUSES a
+stamp — the pending map at `MAX_PENDING`, or the already-streaming gate — no entry exists,
+`forget` returns false, and the helper reports `true`: *a frame arrived*. In the baseline
+that passes an inadmissible run; in the watch it returns `Ignored`, a false vendor-blaming
+finding, from a measurement that never started.
+
+#### ⚠ Item 4: both probe latches are in-memory
+
+The probe is documented once-per-session and is in fact once-per-PROCESS. `Restart=always`
+plus a mid-session deploy re-arms it, so a day can carry several runs — each costing a
+depth-200 socket two minutes of stale strikes, and each re-closing a socket. It becomes
+once per TRADING DAY.
+
+#### Honest envelope (mandatory per operator-charter §F)
+
+> "The name board's ranking, its band, its slot arithmetic and its refusal to rank a name
+> with a missing price are pure and ratcheted. **NOT claimed: that the board's `move_bps`
+> is fed the inputs it was designed for.** `PrevCloseStore` is owned `&mut` by the frame
+> drain and is not reachable from the steering loop, so the wiring converts the movers
+> table's `close_pct_from_prev_day` to basis points instead. It is the same quantity from a
+> different source with a different lag — QuestDB candles rather than the drain's live
+> pair — and that substitution is recorded here rather than hidden behind a function name.
+> **NOT claimed: that NSE_EQ depth delivers.** The board puts each mover's SPOT on a depth
+> socket; no session has ever sent an `NSE_EQ` depth subscribe on this account, so the six
+> spot slots are UNVERIFIED-LIVE and the first session is the probe. **NOT claimed: that a
+> name rotates inside a minute.** A name is 24 slots against a 4-swap-per-socket-per-minute
+> budget, so one name changing takes several minutes to apply; the board's own test pins
+> this. The operator's 'rotate every minute' is delivered as *the board is RECOMPUTED every
+> minute and the delta is applied under the existing cap*, never as a full set swap.
+> **NOT claimed: that the probe now answers whether code 25 works.** It is armed by an
+> operator, it is default-OFF, and it has never run."
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Restores the shared `if arrived { Ignored } else { Honoured }` mapping for Arm B, or lets
+  Arm B report `Honoured` without a liveness witness.
+- Leaves Arm B without a restore now that it empties the guard — that strands a depth-200
+  socket dark for the session.
+- Infers "a frame arrived" from a stamp whose acceptance was not checked.
+- Ships a probe verdict without comparing the guard generation captured at arm time.
+- Re-runs the probe more than once per TRADING DAY.
+- Gives depth-20's name board a socket or instrument budget other than 250, or a board cost
+  other than the const-asserted 238 — a wider stock window costs 262 and the assert fails
+  the build, which is the intended outcome.
+- Applies the name-level hysteresis band inside the planner rather than when CHOOSING the
+  six names. `plan_depth20_minute` diffs against a desired layout, so a band applied at plan
+  time is inert and the exit rank silently does nothing.
+- Changes depth-200 under cover of this section.
+- Ranks a name whose spot or previous close is missing as 0% — that ties it with a genuinely
+  flat name and hands it 24 slots it did not earn.
+- Auto-sends the Dhan draft to anyone. The 2026-09-12 section's REJECT row stands: the draft
+  is a committed markdown file a human reads and sends.
+
+#### ⚠ CORRECTED 2026-09-13 (same day, hours later) — the board was wired and, for the INDEX half, silently never dialled
+
+**No new authorization is claimed.** The section above authorizes this work; this
+records what an adversarial re-audit of it found, and is the correction the
+rule-file-first law expects when a section's own claim turns out to be false in
+practice.
+
+The section above says the name board "becomes the PRIMARY depth-20 engine".
+It was wired, it ran, and it logged `engine="name_board"`. **For NIFTY and
+BANKNIFTY it dialled nothing at all**, for the whole session, and every counter
+read healthy while it did.
+
+#### The mechanism, and why no existing signal could see it
+
+`depth20_track::match_sockets_by_overlap` paired a wire socket to a layout
+socket by equal held-count, then by largest key overlap, and left anything
+matching neither UNPAIRED — a docstring defended that as "refusing to guess".
+`plan_depth20_minute` treats an unpaired socket as
+`sockets_left_alone += 1; continue`, so the socket is never touched, `held`
+never changes, and the identical non-match recurs on every later minute.
+
+That is the HANDOVER, not a corner case. The volume board is stock options only
+(the 2026-09-06 lock) and this section's first two sockets are NIFTY and
+BANKNIFTY, so the two key sets are **disjoint by construction**: the count pass
+cannot match them (50 held vs 47 wanted) and the overlap pass cannot either
+(zero overlap). The two UNCONDITIONAL index names this section makes
+undisplaceable were the exact pair the matcher could never re-aim.
+
+**FIXED** by a third pass that assigns the leftovers by POSITION — an unclaimed
+want is one no socket recognised, so handing it to a socket no want recognised
+takes nothing from anyone. The count-matched and overlap cases are unchanged.
+
+**The test that defended it is WITHDRAWN in place**, not deleted:
+`an_unrecognisable_socket_holds_position_rather_than_guessing` asserted
+`plan.is_quiet()` on exactly this shape. It was the defect, written down and
+guarded, and the reasoning is kept at the site so nobody restores it.
+
+#### Two further findings against THIS section's own contract
+
+* **The probe could arm inside the last 30 minutes.** The 2026-09-12 section's
+  REJECT list says "Runs inside the last 30 minutes of the session" in as many
+  words and **nothing enforced it**. Now `PROBE_NO_ARM_BEFORE_CLOSE_SECS`.
+* **The probe made its own stall alarm fire.** `spawn_rebalance_heartbeat`
+  publishes `now − stamp` from a stamp only the steering loop writes, so a
+  probe blocking past 180 s paged `depth_steering_stalled` about itself. The
+  loop now stamps either side of the probe block. Residual stated at the site:
+  a probe blocking LONGER than 180 s still pages, correctly.
+
+#### ⚠ NOT FIXED, and it is the operator's call
+
+The per-row `top_volume` ILP append still runs **on the frame-drain task** —
+MEASURED **14,932 µs** at the 20,220-row ceiling against the sort's **1,030 µs**,
+i.e. **14.5×** the cost the 2026-09-12 section measured and reported as the
+sweep's dominant term. Moving it off the drain changes the data flow of a
+scope-locked module, so it needs its own dated line here first and is recorded
+rather than taken.
+
+#### The reusable half
+
+This section was written, reviewed and shipped believing the board drove all
+five sockets. What made the gap invisible is that **every signal it had was a
+signal about intent** — the engine label in the log line, the swap counters —
+and none was a signal about the wire. The board also shipped with no metric of
+its own while the ranked counters it displaced freeze at handover, so the one
+depth-20 read-out went flat exactly when the engine changed: green by absence,
+the shape this file has now recorded on `tv_binary_main_sha_mismatch`,
+`tv_depth_rows_spilled_total` and here. **A new engine needs its own counter in
+the same change that makes it primary** — `tv_depth20_name_board_outcomes_total`
+and `tv_depth20_name_board_names_chosen` now exist, seeded at boot, recorded on
+BOTH arms so the refusal labels can report a refusal.
+
+**What a PR that violates this correction looks like (REJECT):** removes the
+third matching pass, or restores a docstring claiming an unpaired socket is
+safely left alone; re-adds a test asserting `is_quiet()` on a disjoint handover;
+lets the probe arm inside the last 30 minutes; removes the heartbeat stamps
+around the probe block; records the name board on the steerable arm only (the
+refusal counters then can never leave zero); or moves the ILP append off the
+drain without its own dated operator line.
+
+### 2026-09-13 (SECOND) — THE PER-MINUTE SWAP BUDGET IS RAISED SO A WHOLE NAME MOVES IN ONE MINUTE
+
+**The verbatim operator demand (2026-09-13, typed directly in-session — preserve
+EXACTLY, expletives and typos included):**
+
+> "why the fuck per mintue depth 20 is not yet implemented mtoherfucker why? fix and reosleve an dimpelemnt this also ddue okay?"
+
+**No NEW authorization is claimed, and none is needed.** The 2026-09-11 (FOURTH)
+section already authorized this work in as many words — *"Raising both so a whole
+name moves in one minute is authorized"* — under three binding conditions, the
+first of which was *"It ships WITH the name board, never before it."* The name
+board shipped **earlier today** (the 2026-09-13 section above makes it the PRIMARY
+depth-20 engine), so condition 1 is now satisfied and the raise is unblocked. This
+dated row records that, and records the operator asking for the half that was
+deliberately deferred.
+
+#### What was already per-minute, and what was not
+
+The complaint is precise and the answer has three parts, only one of which is a gap:
+
+| Stage | Cadence | State |
+|---|---|---|
+| The name board is RECOMPUTED from the movers table | every minute, at `REBALANCE_OFFSET_SECS` (:08) past the boundary | **already per-minute** |
+| The delta against what the sockets hold is PLANNED | every minute, same pass | **already per-minute** |
+| The delta is APPLIED to the wire | **capped at 4 swaps per socket** | **THE GAP** |
+
+A stock name is `slots_for_stock_name(5)` = 1 spot + 1 future + 22 options = **24
+instruments**. Against a per-socket cap of 4 that is **six minutes to rotate one
+name**, and a name leaving mid-list re-chunks the three stock sockets so all three
+carry ~24 swaps at once — still six minutes, because the cap is per socket. So the
+board chose the right six names every minute and the wire took six minutes to
+agree with it.
+
+#### Why the cap was 4, and why that reason has expired
+
+`MAX_RANKED_DEPTH20_SWAPS_PER_SOCKET_PER_MINUTE` was const-asserted equal to
+`DEPTH_SWAP_COMMAND_CHANNEL_DEPTH`, and 4 was the CHANNEL's number, not the wire's
+— the frame stack's own words: *"enough that a busy minute cannot block the
+sender, small enough that a wedged connection surfaces as a refused `try_send` the
+caller LOGS rather than as a queue that hides it."* That figure was chosen for the
+volume-ranked engine, whose healthy minute produced **two** swaps a socket. A name
+board's healthy minute produces **24**. The cap was never a vendor limit and never
+a wire limit; it was a queue depth sized for a different engine.
+
+#### The contract (LOCKED)
+
+| Aspect | Locked value |
+|---|---|
+| Per-socket per-minute cap | **`DEPTH20_NAME_SWAP_COST` = 24** — DERIVED from `slots_for_stock_name(DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE)`, never a literal, so a wider stock ladder moves the cap with it |
+| Channel depth (depth-20) | raised in lockstep to the same 24 — **condition 2 of the 2026-09-11 grant is preserved**: the cap stays const-asserted `<=` the channel depth, because a cap above the queue is not a cap |
+| Channel depth (depth-200) | **UNCHANGED at 4** — its own cap is 1 per socket per minute, so a deeper queue there would only delay its wedge signal for nothing |
+| Wire-time ceiling | const-asserted: `cap x 2 x SWAP_WIRE_BUDGET < REBALANCE_INTERVAL_SECS` — 24 swaps x 2 legs x 1 s = **48 s inside a 60 s minute**, 12 s of margin. A cap that cannot drain inside its own minute is not a cap either |
+| Socket affinity | **NOT adopted** — condition 3 of the 2026-09-11 grant, unchanged. `plan_depth20_minute` still diffs each socket by SET via `match_sockets_by_overlap`, never by position |
+| Everything else | UNCHANGED — 250 + 5 instrument budgets, 5 + 5 sockets, entry 6 / exit 12 name band, ATM±5 stocks / ATM±11 indices, the 238-slot board cost, `dry_run` true, the §28 frozen area |
+
+#### ⚠ The honest cost, stated rather than absorbed
+
+**The wedge signal is one minute later than it was.** At a channel depth of 4 a
+wedged connection refused the fifth `try_send` inside the same minute. At 24 the
+whole minute's plan queues, and the refusal arrives on the NEXT minute's first
+send — still counted as `channel_full`, still logged, one minute delayed. That is
+the price of the operator's requirement and there is no shape that avoids it: a
+queue that can hold a name is a queue that can hide a wedge for a name's worth of
+sends.
+
+**The 48 s figure is a CEILING, not a measurement.** `SWAP_WIRE_BUDGET` is a
+`timeout`, and this repository has now recorded three times that a bound is not a
+measurement. The real per-leg wire time is a socket write and should be
+sub-millisecond, which would make a full name rotation ~50 ms — but nobody has
+measured it, because the histogram that measures it
+(`tv_dhan_ws_swap_wire_ms`, shipped earlier today) has never seen a live session.
+**The first session on this build is the measurement**, and if a leg genuinely
+approaches its budget the cap must come down, not the budget up.
+
+**It does not make Dhan honour the unsubscribe.** Both code 25 and code 24 are
+proven ignored (2026-09-10, 2026-09-11), so every swap this raises the rate of is
+a swap whose unsubscribe the vendor currently discards. Six times the swap rate is
+six times the ghost rate, bounded by the same `GHOST_REDIAL_SESSION_CEILING` and
+counted by the same `tv_dhan_feed_depth_total{outcome="ghost"}`. The remedy for
+that is the support ticket, not this cap.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Raises the cap above the channel depth, or drops the const-assert binding them
+  (condition 2 of the 2026-09-11 grant).
+- Writes the cap as a literal 24 instead of deriving it from
+  `slots_for_stock_name` — a wider ladder would then silently exceed its minute.
+- Raises the cap without the wire-time const-assert, or past the point where the
+  worst case drains inside `REBALANCE_INTERVAL_SECS`.
+- Raises the DEPTH-200 channel depth under cover of this section — its cap is 1
+  per socket per minute and a deeper queue only delays its wedge signal.
+- Adopts socket-affine packing for depth-20 (condition 3, unchanged).
+- Changes the socket or instrument budgets, the name band, or the ATM windows.
+- Reports the 48 s worst case as a measured figure.
+
+### 2026-09-13 — DHAN-ONLY, RESTATED: the Groww token minter, and the false strings the 2026-08-21 removal left behind
+
+**The verbatim operator demand (2026-09-13, typed directly in-session — preserve
+EXACTLY, expletives and typos included):**
+
+> "remove that fuckign groww token mitner also see clealry ntoe in this appllciation we ened to always ahve one an donly dhan related data dude okay? no groww accepatbela t any poitn dude okay?"
+
+**No new scope is claimed.** The 2026-08-21 directive ("2026-08-21 (THIRD quote of
+the day)") already ordered the entire Groww surface removed; this is that directive
+executed on the residue it left, plus the operator naming one AWS resource it never
+covered. Recorded per the rule-file-first law.
+
+#### What was MEASURED, 2026-09-13 — better than expected in code, worse in AWS
+
+| Surface | Reading |
+|---|---|
+| `fetch_groww_access_token` | **does not exist** — the only 3 hits are historical comments |
+| `Feed::Groww` enum variant | **does not exist** — `Feed::ALL` is `[Dhan, Truedata]`; the single textual hit is inside a comment |
+| Groww mentions in `crates/` | 1,765 lines, of which **1,202 are comments** and only **80 are production code** |
+| Tickvault Terraform declaring a Groww resource | **ZERO** — all 13 `.tf` files that mention the word do so in comments |
+| EventBridge rule `groww-token-minter-daily` | **ENABLED**, `cron(35 0 * * ? *)`, and it **minted at 06:05 IST that morning** |
+| `/tickvault/prod/groww/{access-token,api-key,totp-secret}` | present; access-token `LastModifiedDate` = today |
+
+#### ⚠ The minter is NOT tickvault's to delete, and that is the honest blocker
+
+`groww-shared-token-minter-2026-07-02.md` §1 records that the Lambda's Terraform
+lives in the **bruteX repo**, and `brutex-readonly-lock-2026-07-18.md` makes
+tickvault READ-ONLY there. So the rule and the trigger sit in the operator's shared
+AWS account while their source of truth is a repo this session may not write. A
+disable from here is reverted by bruteX's next `terraform apply`, and bruteX loses
+its Groww token in between. The executing identity also lacks `events:DisableRule`
+and every `lambda:*` action (both verified by attempting them).
+
+**It is therefore an operator action, not an executor one**, and it is recorded
+here rather than half-done: EventBridge → Rules → `groww-token-minter-daily` →
+Disable, then delete the three SSM parameters.
+
+#### What WAS fixed in tickvault (the operator-visible half)
+
+Four Telegram/log surfaces stated, in production, that a second broker exists:
+
+| Site | Said | Reachability |
+|---|---|---|
+| `events.rs` `StartupComplete` ×4 arms | "(Groww per-minute legs report separately)" | **every boot** |
+| `events.rs` `Chain1mUnderlyingNotServed` / `…ServedRecovered` | "the second broker (🟢 GROWW) … check the Groww copy" | a §2.1 allowed-family page, live |
+| `events.rs` `DualFeedScorecardAborted` | "the 3:45 PM IST Dhan-vs-Groww scorecard" | live |
+| `order_runtime.rs:1282, :1914` | "Groww marks" / "waiting for the first Groww mark" | **`[order_runtime] enabled = true`, `self_test = true`** — both fire, and the mark producer has been `dhan_cadence_executor` since 2026-08-21, pinned by `cadence_mark_source_guard::test_dhan_cadence_executor_is_now_the_mark_producer`, a test INVERTED that day to assert exactly that |
+
+Every one is corrected, and the tests that asserted the old wording now assert its
+**ABSENCE** (`assert!(!msg.contains("Groww"))`) so it cannot creep back.
+
+**One claim CORRECTED rather than repeated.** A review of this work reported
+`feed_scoreboard_boot.rs:3448` as a live bug — `match feed { Dhan => dhan_on, _ =>
+groww_on }` now routing TrueData through a Groww variable. The call site
+(`main.rs:5409-5411`) passes `(is_enabled(Dhan), is_enabled(Truedata))`, so the
+**VALUE is correct and only the NAME was stale**. Renamed `groww_on` →
+`secondary_on`. Recorded because "misleading name" and "wrong behaviour" are
+different findings and only one of them was true.
+
+#### NOT done, and deliberately
+
+The feed-generic seam stays exactly as the 2026-08-21 REJECT list requires — the
+`Feed` enum, the cadence scheduler, and the `spot_1m_rest` / `option_chain_1m` /
+`rest_fetch_audit` tables and their writers are UNTOUCHED, because GDF and TrueData
+plug into them and their scope locks are unaffected by this quote. The dead
+`*_FEED_GROWW` constants, the dormant `FUTIDX-02` cross-feed comparator, and the
+`groww_symbol` / `groww_minutes` DDL columns are left for a separate change: the
+columns in particular are **not free** to remove, because the self-heal is
+`ADD COLUMN IF NOT EXISTS` and can never drop one, so a live `ALTER TABLE … DROP
+COLUMN` is an operator decision rather than a code edit.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Re-introduces any operator-facing string naming a second broker.
+- Removes the feed-generic seam "because only Dhan is left" (the 2026-08-21 row).
+- Deletes a SEBI/audit row, or a `feed='groww'` row from `instrument_lifecycle`,
+  `instrument_lifecycle_audit` or `index_constituency` — removing the WRITER was
+  authorized, deleting the ROWS never was.
+- Writes to the bruteX repo to remove the minter (read-only lock, 2026-07-18).
+- Reports the minter as removed on the strength of a tickvault-side change.
+
+### 2026-09-16 — SOCKETS ONLY: the per-minute REST KEEP is REVERSED
+
+**The verbatim operator demand (2026-09-16, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "Dude except sockets remove all the entire remaining rest api call related implementations ddue okay?"
+
+This REVERSES one REJECT row of the 2026-08-11 SECOND quote above, verbatim:
+*"Stands down, disables, or starves ANY per-minute REST leg for Dhan or Groww in
+the name of the live lane."* That row was written on a day when the Dhan live
+WebSocket had been retired for a month and REST was the only market data the
+system had. Sixteen sockets have carried the same instruments live since the
+2026-08-11 flip, so the row now protects a duplicate rather than a source.
+
+**The full disposition, the depth analysis, and the honest loss list live in
+`no-rest-except-live-feed-2026-06-27.md` §12** (recorded the same day, before
+any code). Summary of what it settles, all Verified in source:
+
+| | |
+|---|---|
+| **AUTH REST stays** | `connection.rs:1326` embeds the JWT in the socket URL; `current_feed_token`'s own docblock says *"there is no second credential path."* Removing it dials nothing. |
+| **Instrument-master REST stays** | `ParsedTick` carries id + segment + prices and **no symbol, strike, expiry, leg or lot size** — a socket can only echo ids you already subscribed. Identity must come from outside the socket. |
+| **Market-data REST goes** | spot-1m, option-chain, expirylist. |
+| **Depth survives it** | the live steering path reads the master contract artifact, not `option_chain_1m` — see the 2026-09-16 correction annotated at the "sanctioned depth instrument source" line above. |
+| **The cross-verification goes, and that is a real loss** | it is the ONLY ground truth this feed has. §12.4. |
+| **The legs were never actually off** | `[spot_1m_rest]`/`[option_chain_1m]` read `enabled = false` in base.toml while the cadence executor re-fires the same HTTP. §12.5. |
+
+**What this section does NOT authorize:** any change to the socket budget (16),
+the endpoint types (4), the order-side REST surface, `dry_run`, the §28 frozen
+indicator/strategy area, or any deletion of a SEBI/audit table row.
+
+### 2026-09-18 — ELEVEN TIMEFRAMES, ONE SIGNED VOLUME, AND `top_volume` ORDERED BY VOLUME-PERCENTAGE CHANGE
+
+**The verbatim operator demands (2026-09-18 and the two sessions before it — preserve
+EXACTLY, typos included):**
+
+**Quote A (the timeframe + column requirement, stated twice, verbatim the second time):**
+> "See as of now we will have one and only candles tables timeframe which is ticks, 1s, 3s, 5s, 1m, 3m, 5m, 10m, 15m, 30m, 60m right dude only these timeframes alone dude okay? See meanwhile in all these tables also we planned to remove net volume right dude and instead of this net volume we just planned to use one and only direct volume where it should accept m nus symbol right dude because our current volume is providing the precise timeframe timestamps jet volume dude okay? See meanwhile in top volume table also just have one and only 1s, 3s, 5s and 1m table where it shoudl also delete this net volume column and where it should have one and only direct volume precise to candles table dude so that obviously it will have the precise direct volume right dude precise to candles table volume right dude so both of them should be precisely matchable right dude even in our top volume table right dude so even here also we shoudl remove net volume column right dude meanwhile in top volume by default our plan is to always have the volume percentage change desc for every timeframe of its respective timestamps right dude am I right dude check whether all these in place or not dude okay?"
+
+**Quote B (the sign rule, with two Dhan chart screenshots attached):**
+> "see its simple our current volume si rpecisley correct dude but we just need to accept this negative sign thats it dude okay see ebcause if we see the rpecise volue anyhwo it is the net volume rigth if you see in dhan cahrts based on previous timeframe timestampt comapred to oits current tienfraen current tiemstamp if the close is lesser tehn its negative right dude am i irgith dude tlel me udd eokay?"
+
+**Quote C (2026-09-18 — the `10m` ruling and the authorization):**
+> "no 10s derive the 10m dude okay see whatver i asked use eevrythign as the main requirmenet dude okay?"
+
+Quote C answers the two questions this session put to the operator: `10m` is REAL and is
+to be **DERIVED** (not a typo for `10s`), and the whole of Quote A is the specification.
+This dated section is the rule-file-first record required before any timeframe or schema
+code moves.
+
+#### What this SUPERSEDES
+
+`daily-universe-scope-expansion-2026-05-27.md` §0 Quote 13 (2026-08-08) specified
+**thirteen** current-day timeframes — `1s/5s/10s/15s/30s · 1m/2m/3m/5m/15m/30m/60m · 1d`.
+That list is REPLACED by Quote A's set. Recorded rather than silently overwritten,
+because the 2026-08-08 set is why `TfIndex::is_operator_requested()` reads the way it
+does, and a reader of that gate needs to know which directive it now answers to.
+
+| | 2026-08-08 (Quote 13) | **2026-09-18 (Quote A)** |
+|---|---|---|
+| Candle frames | 13 | **10** + the `ticks` table |
+| Second-scale | 1s, 5s, 10s, 15s, 30s | **1s, 3s, 5s** |
+| Minute-scale | 1m, 2m, 3m, 5m, 15m, 30m, 60m | **1m, 3m, 5m, 10m, 15m, 30m, 60m** |
+| Day | 1d | — |
+
+Net: **3s gains** emission, **10s / 15s / 30s / 2m lose** it, **10m is new**, **1d leaves**.
+
+#### ⚠ A drift found while verifying, recorded because the gate is the thing being changed
+
+`dhan_feed_stack.rs`'s three `is_operator_requested` gate comments call the emitted set
+*"the thirteen timeframes the operator asked for"*. It is **twelve**. The comment
+enumerates eleven excluded second-scale frames and forgets that `D1` is excluded too, so
+`24 − 12 = 12` emit, not 13. The 2026-08-08 directive did list thirteen; the gate has only
+ever implemented twelve.
+
+> **⚠ ANNOTATED 2026-09-18 (same day, by the session that landed the code).** The sentence
+> above closed *"Corrected with this change"*, and at the moment it was written the change
+> in question was this rule-file edit — which corrects nothing in `dhan_feed_stack.rs`. The
+> comments were still wrong when that sentence shipped. They are corrected now, in the PR
+> that moves `is_operator_requested` from twelve to nine; all three now name the nine and
+> say why the operator's eleven-entry list yields nine fold frames.
+>
+> Recorded rather than quietly fixed because it is this file's own recurring shape one
+> level down: a claim written in the present tense about work that had not happened yet
+> reads, to the next session, exactly like a claim about work that had. The original
+> citation was also a LINE NUMBER, which the O(1) table's `multi_tf_aggregator` row records
+> being wrong five times for the same reason — it is a symbol reference above.
+
+#### The contract (LOCKED)
+
+| # | Locked value |
+|---|---|
+| 1 | **Candle frames emitting rows: exactly 10** — `1s, 3s, 5s, 1m, 3m, 5m, 10m, 15m, 30m, 60m` — plus the separate `ticks` table. `is_operator_requested()` gains `S3`, loses `S10`/`S15`/`S30`/`M2`. |
+| 2 | **`10m` is DERIVED, never a new fold frame.** No `TfIndex` variant, no ordinal, no `TF_COUNT` change, no seal-ring resize, **zero added per-tick work**. See the derivability proof below — it is what makes Quote C's "derive" both possible and correct. |
+| 3 | **One `volume` column per candle table, signed.** `net_volume` is removed from the `CREATE TABLE` DDL and its `ADD COLUMN IF NOT EXISTS` self-heal is deleted. The column type is already `LONG` (signed); only the writer changes. |
+| 4 | **The sign rule, verbatim from Quote B:** compare this bar's `close` against the PREVIOUS bar's close **of the same timeframe**. Lower → the bar's whole volume is negative. Not lower → positive. The magnitude is **never** altered — Quote B: *"our current volume is precisely correct … we just need to accept this negative sign."* |
+| 5 | **`top_volume` cadences: exactly `1s, 3s, 5s, 1m`** — already true, unchanged. |
+| 6 | **`top_volume` carries one signed per-window `volume` that equals the candle bar's `volume`** for the same instrument and the same window. |
+| 7 | **The four `top_volume_{1s,3s,5s,1m}` views default to `ORDER BY` volume-percentage change `DESC`.** |
+| 8 | **The `ts` offset is closed** — see below; without it clause 6 is unachievable by any column change. |
+
+#### ⚠ Why `10m` is exactly derivable — and the one decision it forces
+
+Under clause 4, `signed = ±gross`, so **`abs(signed) == gross` for every bar**. Nothing is
+lost. A 10-minute bar is therefore recoverable from the 1-minute bars with no extra
+storage and no extra per-tick work: `first(open)`, `max(high)`, `min(low)`, `last(close)`,
+`sum(abs(volume))` for the gross, then clause 4's sign applied at the 10m level against the
+previous 10m close.
+
+**That identity is destroyed if a flat bar is zeroed.** TradingView's built-in Net Volume —
+which is what the Dhan chart in Quote B's screenshots runs — returns `0` when
+`close == close[1]`. Adopting that would make `abs(signed) != gross` for flat bars, and
+`10m` could no longer be derived from `1m` at all.
+
+**DECISION (labelled Assumed, not quoted — the operator did not address the flat case):
+a flat close is POSITIVE, not zero.** Grounds: Quote B says the magnitude is already
+correct and the ONLY change is the sign, and its stated rule fires on *"if the close is
+lesser"* alone. Zeroing a bar changes its magnitude, which Quote B excludes.
+
+**⚠ The honest cost of that decision, stated rather than buried:** on a bar whose close
+equals the previous close, the Dhan chart will show `0` and this table will show `+gross`.
+That is a real, visible divergence from the chart Quote B cites, and it is most frequent on
+the `1s` frame, where a flat close is common. It is reversible by a fresh dated quote — but
+reversing it makes `10m` a native fold frame (`TfIndex` ordinal 24, `TF_COUNT` 24 → 25,
+seal ring 600,000 → 625,000, one more scalar fold per tick), which is the more expensive
+shape Quote C's "derive" appears to reject.
+
+#### ⚠ The `ts` offset — clause 6 is impossible without this, and no column change fixes it
+
+MEASURED: **candle bars stamp the window OPEN; `top_volume` rows stamp the window CLOSE.**
+`TfIndex::bucket_start()` returns the window open; `top_volume_snapshot.rs:518` floors the
+snapshot timer's FIRE instant, which is the close. So a `top_volume` row and a
+`candles_<tf>` row carrying the same `ts` describe **different windows**, one period apart,
+on every row of every cadence — while `top_volume_snapshot.rs`'s own module comment claims
+the shared grid anchor "lets a `top_volume` row and a `candles_<tf>` row share a `ts` and be
+joined." It does not. `top_volume` must stamp the window OPEN, and that comment is a claim
+to correct in the same change.
+
+Five further blockers behind it, all recorded so none is rediscovered: `candles_3s` has no
+rows at all until clause 1 lands; the two sides use different clocks (per-tick receipt clock
+vs `now_ist_nanos()` at timer fire); `top_volume` applies a monotonicity re-latch
+(`RELATCH_AFTER_CONSECUTIVE_LOWER = 32`) that candles do not; the populations differ
+(candles = every instrument from 09:00, `top_volume` = option contracts from 09:15); and no
+test, guard or query anywhere cross-references the two tables.
+
+#### ⚠ What this section does NOT authorize (Rule 11)
+
+- **Any physical `DROP COLUMN`.** The candle self-heal is `ADD COLUMN IF NOT EXISTS` and can
+  never drop one, so removing `net_volume` from the DDL leaves the column present with stale
+  data on every existing table. Reclaiming it is an operator `ALTER TABLE … DROP COLUMN`,
+  not a code edit.
+- **Any new `TfIndex` variant or `TF_COUNT` change** — clause 2 exists to avoid exactly that.
+- Any change to the socket budget (16), the four endpoint types, `dry_run`, the §28 frozen
+  indicator/strategy area, or any deletion of a SEBI/audit row.
+- Any claim that this is deployed: push-to-main is path-filtered and the no-deploy band is
+  09:00–15:45 IST Mon–Fri.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Adds a `TfIndex` variant, or changes `TF_COUNT`, to serve `10m`.
+- Derives `10m` by SUMMING the signed 1m volumes — signed volume is **not additive across
+  timeframes** (five 1s bars of `+100, −100, +100, −100, +100` sum to `+100` while the 5s
+  bar reads `±500`). The gross must be summed and the sign applied at the 10m level.
+- Zeroes a flat bar without a fresh dated quote AND making `10m` a native frame in the same
+  change — the two are one decision, not two.
+- Removes `net_volume` from the DDL while leaving the `ADD COLUMN IF NOT EXISTS` self-heal,
+  which silently re-adds it on the next boot.
+- Ships clause 6 while `top_volume` still stamps the window close — the rows cannot match,
+  whatever the columns are called.
+- Leaves `top_volume_snapshot.rs`'s "share a `ts` and be joined" comment standing.
+- Reports clause 1 as done while `candles_3s` still has zero rows, or while `10s`/`15s`/
+  `30s`/`2m` are still emitting.
+- Deletes or weakens `every_sub_minute_frame_sums_to_the_same_minute_net_volume` instead of
+  re-scoping it: under clause 4 that property genuinely no longer holds for the SIGNED
+  number, and it must be re-scoped to the GROSS, not removed.
+
+#### 2026-09-18 (same day, later) — the operator confirms the shape, and it SETTLES the flat-bar question
+
+**Verbatim:**
+> "see if we use volume to accept the negative sign then it would be so easy rigth dude where as we can match the precise dhan net volume of respective tiemframe respective tiemstamps rigth dide am i rigth dude okay?"
+
+He is right, and the confirmation names the objective function explicitly: **match Dhan's
+net volume for the respective timeframe at the respective timestamp.** That is the thing
+clause 4 exists to do.
+
+**It also settles the flat-bar decision above, which the section records as `Assumed`.**
+The argument that settles it is INFORMATION PRESERVATION, not a reading of his words:
+
+| Stored form | Can a VIEW render the other form? |
+|---|---|
+| **flat → `+gross`** (this section's decision) | **YES.** `CASE WHEN close > lag(close) THEN abs(volume) WHEN close < lag(close) THEN -abs(volume) ELSE 0 END` reproduces TradingView's built-in Net Volume **exactly**, flat bars included. |
+| flat → `0` | **NO.** A zeroed bar has destroyed its own magnitude. Nothing downstream can recover it — not a view, not a query, not a re-read. |
+
+So the stored column keeps the magnitude (Quote B: *"our current volume is precisely
+correct … we just need to accept this negative sign"*), and the chart-exact rendering is a
+view away whenever it is wanted. The reverse is impossible. One direction is reversible and
+the other is not, and this file's standing discipline is to take the reversible one.
+
+**⚠ And the flat-bar behaviour of the Dhan chart is `Unknown`, not Verified.** Neither
+screenshot in Quote B shows a bar whose close equals the previous close; TradingView's
+built-in formula returning `0` there is an INFERENCE from the chart being a TradingView
+chart, never an observation. Storing the information-preserving form means that inference
+never has to be right — if the chart turns out to carry `+gross` on a flat bar, the stored
+column already matches it with no re-fold.
+
+**This retires the "10m becomes a native frame" branch.** That branch existed only as the
+consequence of zeroing flat bars; with the magnitude preserved, `abs(signed) == gross`
+holds on every bar and clause 2's derived `10m` stands unconditionally — no `TfIndex`
+variant, no `TF_COUNT` change, no seal-ring resize, zero added per-tick work.
+
+### 2026-09-18 (SECOND) — OHLCV AND VOLUME BUCKET ON THE EXCHANGE `ts`, NOT `received_at`
+
+**The verbatim operator demand (2026-09-18, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "dude just now foudn one more issue which is see dude as fo now to set the rpecise ohlcv we used the recived at right dude but now we have a catch bro which is see we need to use this ts dude nowhere hereafetr we hsodu luse received at to define our ohlcv dude okay? our only apporach si to use this ts to set our ohlcv everyhwere dude okay even volume also ddue okay?"
+
+This dated section is the rule-file-first record required before any bucketing
+code moves. **It REVERSES the operator's own 2026-08-28 directive** recorded
+above ("CANDLES FROM 09:00, OHLCV ON THE RECEIPT CLOCK"), which is why it gets
+its own section rather than an edit in place.
+
+#### ⚠ This is a reversal of a reversal, and the earlier record says so
+
+The 2026-08-28 section opens with a block headed *"The reaffirmation, recorded
+so the decision is auditable"*, and its own words are: the receipt-clock
+instruction *"was given, measured against, reported back with contrary evidence,
+and then **reaffirmed**."* So the operator has now moved back to the clock that
+the contrary evidence favoured. That is not a contradiction to be papered over —
+it is the measurement winning, one directive later.
+
+#### The measurement, quoted from the section this one reverses
+
+| Measured on production, 2026-08-27, NIFTY | Exchange clock (`ts`) | `received_at` |
+|---|---|---|
+| Session minutes present | **385 / 385** | 351 / 385 |
+| Bars exactly matching the vendor's own tape | **382 (99.2%)** | 321 (83.4%) |
+| Phantom bars stamped outside market hours | **0** | 4 |
+| Ticks filed on the WRONG DAY | **0** | 4,319 |
+| Ticks that would change minute on the LIVE path | — | 0 of 83,871 |
+
+**The exchange clock won on every dimension that was measured.** The last row is
+why the 2026-08-28 choice was defensible at the time: on the LIVE path the two
+clocks are identical, because Dhan stamps whole seconds and we receive inside the
+same second. They diverge only on WAL replay — and there `received_at` carried
+the moment of REPLAY rather than the moment of receipt, which was a DEFECT in how
+`received_at` was populated, closed the same day by the `TVW3` record format.
+
+So the honest statement of this reversal: the 2026-08-28 directive fixed a
+`received_at` defect and then kept the clock whose own measurements were worse.
+This directive takes the better-measured clock.
+
+#### ⚠ CORRECTED 2026-09-18 (same day, hours later) — the "catch" first written
+#### here was WRONG on BOTH counts, and it was wrong in the blocking direction
+
+The first draft of this subsection told the operator that `ts` bucketing would
+re-create the **8,898 fabricated bars** defect and that today's bucketing is
+`received_at`. **Neither is true.** Both were asserted from the 2026-08-28
+section's prose rather than from the function that actually buckets a tick, and
+the function's own doc retracts the exact argument that was quoted. The wrong
+text is replaced rather than annotated, because leaving a false BLOCKER standing
+is how a session ends up refusing work the code already supports.
+
+**What actually buckets a tick today — `tf_index.rs::fold_clock_ist_secs`:**
+
+```rust
+if received_at_nanos <= 0 { return exchange_timestamp; }      // no receipt -> ts
+let delta = receipt_ist_secs - exchange_timestamp;
+if delta > MAX_PLAUSIBLE_RECEIPT_LAG_SECS      // +300
+    || delta < -MAX_PLAUSIBLE_RECEIPT_LEAD_SECS { //  -10
+    return exchange_timestamp;                                 // implausible -> ts
+}
+receipt_ist_secs                                               // else -> receipt
+```
+
+It is a **DELTA-BOUNDED HYBRID**, not `received_at`. It prefers the receipt clock
+ONLY inside `[-10 s, +300 s]` of the trade stamp, and falls back to `ts`
+everywhere else.
+
+| Case | Clock used TODAY | Clock under this directive | Changes? |
+|---|---|---|---|
+| Live tick, delivered inside 300 s | receipt | `ts` | **yes — this is the only real change** |
+| Dormant snapshot, LTT hours/days old | **`ts` already** (fails +300 s) | `ts` | no |
+| Clock lead > 10 s | **`ts` already** | `ts` | no |
+| Pre-TVW3 WAL frame, `received_at_nanos == 0` | **`ts` already** (sentinel arm) | `ts` | no |
+
+**So the stale-LTT case the draft called a blocker has been bucketing on `ts`
+since the delta guard was written.** `fold_clock_ist_secs`'s own doc says so, and
+retracts the justification the draft borrowed, verbatim: *"An earlier draft of
+this doc justified the change with the DORMANT CONTRACT case… **That
+justification was FALSE**, and the test written to demonstrate it failed instead
+— which is how it was caught. The delta guard below refuses any receipt more than
+[MAX_PLAUSIBLE_RECEIPT_LAG_SECS] past the trade, so a stale snapshot falls
+straight back to its trade stamp."*
+
+**And the fabricated-bar defect is NOT guarded by the clock — it is guarded by a
+clock-INDEPENDENT day gate** (`multi_tf_aggregator.rs`, the `fold_day` vs
+`receipt_day` comparison on both arms): a fold whose IST DAY differs from the
+receipt day is refused as `stale_trading_day` / `future_trading_day` **whichever
+clock produced `fold_secs`**. That gate is untouched by this directive and keeps
+working identically after it.
+
+#### What this directive ACTUALLY changes, stated honestly
+
+It deletes the **≤300 s delivery-lag correction** on the live path, and nothing
+else. The consequence, stated plainly rather than minimised:
+
+* A trade the exchange stamps **09:29:59** that reaches us at **09:30:01** files
+  into the **09:29** bar under `ts` (correct by EVENT time — it is what the
+  vendor's own tape shows) instead of the **09:30** bar under the hybrid (correct
+  by the bar a live decision was reading at that instant).
+* The measured live impact is **zero**: `0 of 83,871` ticks changed minute on the
+  live path (the 2026-08-28 table above), because Dhan stamps whole seconds and we
+  receive inside the same second. It bites only when delivery lag exceeds the
+  seconds remaining in the bucket — rare per tick at a p50 of 1.38 s, and
+  systematically more likely on the 1-second frame than the 1-minute one.
+* **That is the trade the operator has chosen**, and it is the one the measured
+  table favours: the exchange clock won 385/385 minutes, 99.2% tape agreement,
+  0 phantom bars, 0 wrong-day ticks.
+
+#### The ONE residual, which is pre-existing and is NOT introduced here
+
+A pre-TVW3 WAL frame carries `received_at_nanos == 0` — the documented "no
+receipt" sentinel. Both day gates stand down there rather than guess, so such a
+frame is protected only by the replay watermark's ordering. Under the hybrid it
+ALREADY buckets on `ts`, so this directive changes nothing about it. Recorded so
+it is not mistaken for a new hole opened by the clock change.
+
+#### `ws_lag_ms` MUST NOT follow this directive
+
+The delivery-lag gauge measures `received_at − ts` **by definition**. Refactoring
+it onto `fold_secs` would collapse it to a constant 0 and blind
+`tv-<env>-dhan-worst-socket-deaf`, which is the only alarm that can see a socket
+that pongs but has stopped delivering. `ws_lag_clock_guard.rs` exists for exactly
+this and stays.
+
+#### The 09:00 → 15:39:59 window clause — ALREADY SHIPPED, and it already keys on `ts`
+
+Operator, same message (2026-09-18, verbatim): *"meanwhiel now ensure to recieve
+the data starting 9 am till 3.39.59 pm dude okay so now we need to use ts dude
+isntead of received at dude okay?"*
+
+**This half needs no code.** `crates/common/src/session_window.rs` shipped
+2026-09-05 against the operator's own earlier verbatim rule — which that module
+quotes in its header — and it is WIRED, not dormant:
+
+| Property | Value, verified in source |
+|---|---|
+| Window | `[TICK_PERSIST_START_SECS_OF_DAY_IST, TICK_PERSIST_END_SECS_OF_DAY_IST)` = `[32_400, 56_400)` = **09:00:00 → 15:39:59.999999999 IST** |
+| Refusal key | **`ts` ALONE** (`WindowVerdict::is_refusal` matches `TsOutOfWindow` only) |
+| `received_at` out of window | **COUNTED and LOGGED, never refused** |
+| Production call sites | `tick_persistence.rs`, `depth_persistence.rs`, `shadow_candle_writer.rs`, `tick_spill_replay.rs` |
+| Complexity | **O(1)** — two integer divisions, two compares, zero allocation |
+
+The end being EXCLUSIVE is what makes it read "till 3.39 pm": the last accepted
+instant is 15:39:59.999999999. The module's own doc warns against "fixing" 56_400
+to 56_340, which would discard the entire 15:39 minute **including the closing
+auction**.
+
+**The receipt leg was deliberately made non-refusing**, and that decision is the
+operator's first principle applied: at the measured Dhan p99 delivery lag of
+46.37 s, refusing on receipt discarded the last ~46 seconds of every session for
+the slowest 1% of ticks — silently, with no replay. `ts` says WHAT THE ROW IS;
+`received_at` says how fast the network was, and a real print must never be
+dropped because the vendor was slow.
+
+#### What this directive does NOT authorize
+
+- Moving `TICK_PERSIST_START_SECS_OF_DAY_IST`, the day-OHLC gate, or any session
+  window. This changes WHICH CLOCK buckets a tick, never which ticks are admitted.
+- Re-admitting pre-open ticks into day HIGH/LOW/CLOSE (the 2026-08-25 carve-out
+  stands, and the 2026-08-26 re-affirmation stands with it).
+- Any change to the `ticks` table's own `ts`, which has stored the exchange
+  timestamp since it was written and is unaffected.
+- Any change to the socket budget, the endpoint types, `dry_run`, or the §28
+  frozen indicator/strategy area.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Buckets on `ts` without a stale-LTT guard — that is the 8,898-fabricated-bar
+  defect, restored by name.
+- Silently drops a stale-LTT tick instead of counting it: the refusal families
+  (`stale_trading_day`, `future_trading_day`, `untraded_timestamp`,
+  `untraded_sentinel`, `out_of_band_timestamp`) exist so a refusal is countable,
+  and a new one must be too.
+- Buckets OHLC on `ts` and leaves VOLUME on `received_at`, or vice versa — the
+  directive says "even volume also", and a split clock makes the two
+  unreconcilable by construction.
+- Claims the two clocks now agree on the replay path without re-measuring: the
+  2026-08-27 table is a measurement with a date, and the `TVW3` record format
+  changed one of its inputs.
+
+#### 2026-09-18 (SECOND, continued) — SHIPPED, and the one constant the clock change forced with it
+
+**The verbatim operator authorization for the follow-through (2026-09-18, typed
+directly in-session):**
+
+> "go ahead and implement the ts bucketing now dude."
+
+> "fix and resolve everything dude okay?"
+
+The second was given in DIRECT response to a message that ended with one
+enumerated question — *"resize the seal margin inside this same change against a
+real measured inter-instrument trade-clock spread, or ship the clock fix and
+take the margin as its own change?"* — alongside the three findings the
+implementation had surfaced. That is the §28.2/§28.3 authorization shape this
+repository already accepts: a general go-ahead answering an ENUMERATED ask
+selects the enumerated work. Recorded HERE with the code, per the
+rule-file-first law.
+
+##### What shipped
+
+`tf_index::fold_clock_ist_secs` is now `const fn (exchange_timestamp: u32) ->
+u32`, the IDENTITY, and **the receipt parameter is REMOVED rather than
+ignored** — a two-argument signature whose second argument is unused reads at
+fourteen call sites as though the receipt still matters, and a later edit could
+start honouring it with no call site changing. Removing it makes that a compile
+error instead of a review question. `MAX_PLAUSIBLE_RECEIPT_LAG_SECS` (300) and
+`MAX_PLAUSIBLE_RECEIPT_LEAD_SECS` (10) are deleted, not merely unused.
+
+##### ⚠ The constant the clock change FORCED, and why it was resized rather than deferred
+
+`CATCHUP_LATENESS_MARGIN_SECS` moves **2 s → 240 s**, and the resize is a
+consequence of the directive rather than a separate opinion:
+
+| | before | after |
+|---|---|---|
+| what the catch-up watermark measures | the RECEIPT clock — every trusted tick stamped at essentially "now", inter-instrument spread sub-second | the TRADE clock — two instruments delivered 46 s apart carry fold values 46 s apart |
+| margin that covers it | 2 s | the delivery-lag SPREAD |
+
+The derivation is in the constant's own doc and is arithmetic, not judgement: a
+tick stamped `T` reaches the fold at `T + lag`, by which time the fastest-
+delivered instrument has dragged the watermark to `≈ T + lag − lag_min`, so
+`margin ≥ lag − lag_min`. Against the measured 2026-07-06 distribution (§E of
+this file: p50 1.38 s · p99 46.37 s · **max 198.69 s**) the bound is the MAX,
+which `MEASURED_MAX_DELIVERY_LAG_SECS = 199` now names, rounded up to the next
+whole minute. Two build-failing asserts pin BOTH the floor and the derivation,
+so the margin cannot be lowered below the measurement and cannot drift back
+into being a magic number.
+
+**Why the MAX and not the p99**, stated as a trade: a margin too SMALL discards
+a late tick's PRICE once it is 2+ buckets behind (volume survives —
+`carry_unattributed` runs BEFORE the `LatePolicy` branch); a margin too LARGE
+delays a catch-up bar. One is irreversible and one is latency, against a
+standing mandate that not one tick be missed. Sizing to p99 would knowingly
+discard the top 1% of late prices every session.
+
+**⚠ Honest cost, not buried:** every CATCH-UP bar now lands ~4 minutes after its
+close instead of ~2 seconds. That is a real latency regression on the 1s/3s/5s
+frames for any consumer of catch-up bars — and NOT a regression against the
+alternative those bars actually have, which is the 15:30 close sweep. The
+NORMAL rollover is untouched: an instrument that keeps ticking still seals on
+its own next tick at no added latency, which is every liquid instrument.
+
+##### ⚠ What is NOT fixed, and is not claimed to be (Rule 11)
+
+1. **The normal-rollover late path.** The margin governs the CATCH-UP seal only.
+   A bucket sealed by an instrument's own next tick is unreachable by any
+   margin, and under the trade clock a vendor re-ordering two prints of the
+   SAME instrument can seal early and discard the earlier price when it is 2+
+   buckets behind. Widening it needs `last_sealed` to remember more than one
+   bucket per (slot, timeframe) — a memory and design change with its own
+   measurement. Under the receipt clock this shape was impossible (receipt is
+   monotone per drain), so the clock change genuinely opens it.
+2. **The 199 s is a MEASUREMENT and carries a date.** One session, a 776-SID
+   subscription. The authorized universe is ~24,600 instruments across 16
+   sockets and nothing here claims the distribution is unchanged at that scale.
+   `tv_dhan_ws_lag_ms` is the live read-out; a worse measured max moves the
+   constant.
+3. **A third finding was raised and RETRACTED rather than "fixed".**
+   `last_observed_ts` is assigned from a now-non-monotone clock, which an
+   adversarial pass flagged HIGH. Working it through says it is not: the
+   consumer asks `bucket_start(prev) == bucket_start(current)` — a BUCKET
+   question, never an ordering one — so two stamps inside one bucket attribute
+   correctly whichever arrived first, and two stamps in different buckets
+   REFUSE. The guard's own comment already names the "late-routed" case. A
+   monotone `max(..)` was considered and rejected as the WRONG direction: it
+   narrows the attribution interval, which is how an extreme gets credited to a
+   window it did not happen in. Both halves are recorded at the site, because
+   the next reader will have the same suspicion.
+
+##### What a PR that violates this subsection looks like (REJECT)
+
+- Re-adds a receipt parameter to `fold_clock_ist_secs`, or a delta band in any
+  form — the whole directive undone, and it would pass every behavioural test.
+- Lowers `CATCHUP_LATENESS_MARGIN_SECS` below `MEASURED_MAX_DELIVERY_LAG_SECS`,
+  or writes it as a literal instead of deriving it (both fail the build; do not
+  weaken the asserts to pass).
+- Raises `MEASURED_MAX_DELIVERY_LAG_SECS` without a dated live measurement — it
+  is the one input the margin trusts.
+- Makes `last_observed_ts` monotone (narrows the attribution interval).
+- Removes `received_at_nanos` from `multi_tf_aggregator`, the `TVW3` WAL record,
+  or `ReplayedFrame` "because we bucket on ts now" — the cross-day gates and
+  `row_timestamp_ist_nanos` (which feeds the `ticks` DEDUP key) both still
+  require it.
+- Claims the catch-up latency cost is zero, or that the normal-rollover late
+  path is covered.
+
+---
+
+### 2026-09-18 (THIRD) — CLAUSE 4 IS THE RULE THIS REPOSITORY RETIRED ON 2026-09-10, and three blockers the contract section does not name
+
+**No new authorization is claimed and no scope changes.** The 2026-09-18 contract
+section above stands; this records what a source audit found when the code for it
+was scoped, and it is written BEFORE any signed-volume code per the
+rule-file-first law. Every row below is verified at the cited symbol.
+
+#### ⚠ Finding 1 — the close-vs-close sign rule already shipped here, and was WITHDRAWN as producing the WRONG sign
+
+Clause 4 of the contract above reads: *"compare this bar's `close` against the
+PREVIOUS bar's close of the same timeframe. Lower → the bar's whole volume is
+negative."* That is the operator's Quote B, and it is also, verbatim, the rule
+this repository implemented and then retired eight days earlier.
+
+`crates/trading/src/candles/live_candle_state.rs`, on the `net_volume_signed`
+field, under its own heading **"What replaced what (2026-09-10)"**:
+
+> "Until today `net_volume()` DERIVED a sign at seal time by comparing the bar's
+> close against the previous bar's close, and signed the WHOLE bar's volume with
+> it. That is a bar-DIRECTION proxy, not net volume: a bar that traded 900 lots
+> on the offer and 1,000 on the bid but happened to close one tick up reported
+> `+1,900`, when the honest answer is `-100`. The proxy is not merely imprecise —
+> it has the **WRONG SIGN** whenever a bar's close disagrees with its flow, which
+> is exactly the divergence a net-volume reader is looking for."
+
+What replaced it is the **classic tick rule**, evaluated once per tick above the
+timeframe loop: volume since the previous tick is BUY-initiated when the price is
+above the previous tick's, SELL-initiated when below, and carries the previous
+tick's direction when unchanged. That value is `net_volume_signed: i64`, and it
+is what the `net_volume` column has carried since 2026-09-10.
+
+**So the directive and the code disagree about what "signed volume" means**, and
+the two are not refinements of one another — they answer different questions:
+
+| | clause 4 (close vs previous close) | `net_volume_signed` (tick rule) |
+|---|---|---|
+| What the sign reports | the bar's **direction** | the bar's **order flow** |
+| Sign of a bar that closed up on net selling | `+` | `−` |
+| Derivable from stored columns at query time | **YES** — `close` and `lag(close)` are both stored | no — needs per-tick state |
+| Matches a Dhan/TradingView Net Volume pane | **that is the operator's stated objective** | not claimed |
+
+**Neither is wrong; they are different measures, and this is the operator's
+choice to make.** What must not happen is the code silently adopting one while
+the rule file names the other, which is the state the two would be in today if
+clause 4 were implemented as a rewrite of `net_volume`.
+
+**The recommended shape, because it is the only one that loses nothing:** keep
+`net_volume_signed` as the stored per-tick measure, and deliver clause 4 as the
+**view expression the contract section above already writes out** —
+`CASE WHEN close > lag(close) THEN abs(volume) WHEN close < lag(close) THEN -abs(volume) ELSE abs(volume) END`.
+That is information-preserving in the direction this file's standing discipline
+requires: the tick-rule value cannot be recovered from a close-vs-close column,
+while a close-vs-close column is one window function away from the stored
+`close`. Adopting clause 4 as the STORED value instead is a decision that needs
+its own dated line here, because it discards the 2026-09-10 work.
+
+#### ⚠ Finding 2 — the seal spill record is FULL, and v2 reclaimed the exact field a stored close-vs-close sign needs
+
+`crates/storage/src/seal_spill.rs`: `SEAL_SPILL_RECORD_SIZE = 128`,
+`SEAL_SPILL_FORMAT_VERSION = 2`. Bytes 80..88 held `bucket_open_prev_close: f64`
+in v1 — **the previous sealed bar's close, i.e. precisely the baseline clause 4
+needs** — and v2 reclaimed them for `net_volume_signed` after a reference scan
+found the field had *"no production reader anywhere."*
+
+Two consequences, both stated so neither is rediscovered:
+
+1. **Spill replay already preserves the sign correctly** for the tick-rule
+   measure. An earlier reading of this path recorded that a replayed bar would be
+   "always positive"; that is **WITHDRAWN** — v2 round-trips `net_volume_signed`
+   and uses `i64::MIN` as an out-of-range "not classified" sentinel, so a
+   replayed v2 bar reports real flow and a v1 bar reports SQL NULL, which is what
+   it reported when it was written.
+2. **A STORED close-vs-close sign needs a v3 record**, because the baseline it
+   requires is the field v2 spent. And the record has no room: the module's own
+   closing paragraph says *"the trailing 8-byte padding region (bytes 120..128) is
+   reserved for future field additions"*, while its own layout table four
+   paragraphs above assigns 120..128 to `security_id: u64` (2026-06-29). **The
+   doc contradicts itself and the table is the true half** — the record is
+   byte-for-byte full, so a v3 field means the record GROWS, which changes every
+   spill file's stride. That sentence is a correction owed in the same change.
+
+#### ⚠ Finding 3 — `recompute_window` breaks on day one of a signed `volume` column
+
+`crates/app/src/tf_consistency_boot.rs::recompute_window` accumulates
+`volume = volume.checked_add(m.volume)?` over a window's 1-minute members, and
+its SQL (`:803`) selects the bare `volume` column. Under a signed `volume` the
+members carry signed values, so the check compares **Σ(signed 1m)** against the
+higher-TF bar's **own** sign — and those are different numbers for any window
+containing both up and down minutes.
+
+The contract section above already records the arithmetic
+(*"five 1s bars of +100, −100, +100, −100, +100 sum to +100 while the 5s bar
+reads ±500"*) as a REJECT row about deriving `10m`. It applies with equal force
+to the verifier, and there it is not a design error but a **daily false alarm**:
+a mismatch on nearly every window, every instrument, driving `TF-VERIFY-01` and
+one `NotificationEvent::TfConsistencySummary` (`DispatchPolicy::Immediate`) — a
+Telegram page every trading day, and a 10,000-row audit budget consumed by noise
+so that genuine M30/M60 mismatches degrade to count-only.
+
+That is the same failure shape as the C1 defect fixed in this branch, and it is
+**in the same file**. The verifier must move to `Σ abs(m.volume)` compared
+against `abs(recorded)`, with the sign checked separately as its own field, in
+the SAME change that signs the column — never after.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Rewrites `net_volume_signed` from the tick rule to close-vs-close without a
+  fresh dated line here — that discards the 2026-09-10 work and re-adopts a rule
+  this repository withdrew as WRONG-SIGNED.
+- Ships a close-vs-close sign as a STORED seal field without growing the spill
+  record to v3 (the baseline byte range is spent) and without correcting the
+  module's self-contradicting "reserved padding" paragraph.
+- Signs the `volume` column while leaving `recompute_window` on `Σ signed` — a
+  daily Telegram page and an exhausted audit budget, in the file that has just
+  been fixed for the identical shape.
+- Claims spill replay loses the sign — v2 round-trips it; the withdrawn claim is
+  recorded above so it is not repeated.
+
+### 2026-09-18 (FOURTH) — THE SIGNED-VOLUME DECISION IS TAKEN: `volume` BECOMES ±GROSS, `net_volume` IS DELETED, AND THE TICK-RULE FLOW VALUE IS LOST
+
+**The verbatim operator authorization (2026-09-18, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "see whatever is your recommendation go ahead dude okay ? but ensiure to fix resolve merge and deploy it dude okay?"
+
+Given in DIRECT response to a message that put the clause-4 conflict to him for the
+SECOND time — naming that his rule is the one this repository withdrew on 2026-09-10 as
+producing the wrong sign, showing the direction-vs-flow comparison, and asking which of
+the two stored forms he wanted. That is the §28.2/§28.3 authorization shape this
+repository already accepts: a general go-ahead answering an ENUMERATED ask selects the
+enumerated work. The preceding turn is the reaffirmation that makes it binding —
+*"is everyhtign entirley fixed and resolved and emrged and deploye ddude okay?"* — so
+the operator has now been told the objection twice and has ruled twice.
+
+This section is the rule-file-first record, written BEFORE the code it governs.
+
+#### ⚠ FIRST, a correction to the recommendation this quote answers — it was internally inconsistent
+
+The message he answered recommended, verbatim: *"store the tick-rule value, and deliver
+your rule as the view expression — it is the only arrangement that loses nothing."*
+
+**That recommendation quietly KEPT `net_volume`, which clause 3 of his own directive
+says twice to delete.** Both cannot be true. A single column cannot carry both the GROSS
+magnitude and the NET flow, because `|net_flow| != gross`: a bar that traded 1,000 into
+the bid and 900 into the offer has gross 1,900 and net −100, and no function recovers
+1,900 from −100.
+
+Re-derived against the contract already merged in the 2026-09-18 section above, the
+information-preserving direction is the opposite of what was recommended, and it is his
+directive read literally:
+
+| Stored form | `abs()` recovers gross? | Can a view render the other form? |
+|---|---|---|
+| **±gross (his clause 4)** | **YES** — `abs(v) == volume`, always | **YES** — TradingView's zero-on-flat is `CASE WHEN close = lag(close) THEN 0 ELSE v END`; his own form is the stored value |
+| net flow (the tick rule) | no — gross is destroyed | no — neither gross nor ±gross is recoverable |
+
+So ±gross is the reversible direction and net flow is the irreversible one. The
+recommendation is corrected here rather than quietly changed, because the operator acted
+on the wording and the wording was wrong.
+
+#### The decision (LOCKED)
+
+| # | Locked value |
+|---|---|
+| 1 | **One column, `volume`, signed.** Magnitude is the CURRENT gross volume, unaltered — his words: *"our current volume si rpecisley correct dude but we just need to accept this negative sign thats it"*. |
+| 2 | **Sign rule:** this bar's `close` against the PREVIOUS bar's close **of the same timeframe** (`LiveCandleState::bucket_open_prev_close`). Lower → negative. Not lower → positive. |
+| 3 | **A flat bar is POSITIVE, never zero** — carried unchanged from the 2026-09-18 contract above. Zeroing destroys the magnitude and breaks `abs(v) == gross`, which is what makes `10m` derivable and what lets a view render the chart-exact form. The reverse is impossible. |
+| 4 | **A bar with no previous close is POSITIVE** (session's first bucket, `bucket_open_prev_close == 0.0`). There is no previous close, so nothing fell. |
+| 5 | **`net_volume` is DELETED** — from the candle `CREATE`, from its `ADD COLUMN IF NOT EXISTS` self-heal, and from the `candles_named` view. The DDL and the self-heal must move in the SAME change or the next boot re-adds the column. |
+| 6 | **`top_volume` stamps the window OPEN**, not the window close, so a `top_volume` row and a `candles_<tf>` row carrying the same `ts` describe the same window. Without this, clause 5 of the directive (*"both of them should be precisely matchable"*) is unachievable by any column change. |
+| 7 | **The four `top_volume_{1s,3s,5s,1m}` views default to `ORDER BY ts DESC, net_volume_chg_milli_pct DESC`** — the integer column, never the float view alias. |
+| 8 | **`10m` is DERIVED, never a `TfIndex` variant** — `TF_COUNT` does not move, the seal ring does not resize, and no per-tick work is added. Clause 2 of the 2026-09-18 contract, unchanged. |
+
+#### ⚠ WHAT IS LOST (Rule 11 — no false-OK)
+
+**The tick-rule flow value (`net_volume_signed`) stops being PERSISTED.** No column
+carries it, no spill record carries it, and no query can reach it after this change.
+The in-memory accumulator on `LiveCandleState` is deliberately RETAINED — it costs one
+`i64` add per tick that was already being paid, and keeping it is what makes restoring
+the value later a purely ADDITIVE change (a new column under its own name and its own
+dated line) rather than a re-litigation of the fold. That retention must not be read as
+the value still being available: it lives for the length of one bucket and is then
+discarded.
+
+`live_candle_state.rs` records what the substitution costs, in its own words: the
+close-vs-close sign *"has the **WRONG SIGN** whenever a bar's close disagrees with its
+flow, which is exactly the divergence a net-volume reader is looking for."* A bar that
+traded net −100 and closed one tick up will report `+1,900`.
+
+That is a real, measured objection. It was put to the operator on 2026-09-18 and again in
+the turn this quote answers, and he ruled both times. Per the standing rule that a
+reaffirmed instruction ends the discussion, it proceeds — recorded here so the trade is on
+the record and not rediscovered as a defect.
+
+**Restoring the flow value later is a separate, additive decision**: a new column under its
+own name, with its own dated line. It is NOT recovered by renaming, and it is NOT what
+this change deletes by accident.
+
+#### The spill record — bytes 80..88 return to what v1 held, at format version 3
+
+Deleting `net_volume_signed` frees the 8 bytes v2 spent on it, and the field the new sign
+needs — `bucket_open_prev_close: f64` — is **exactly what v1 wrote at that same offset**.
+So the record returns to its v1 meaning at v3, with no stride change and no growth (the
+record is byte-for-byte full; the 2026-09-18 correction above records that any GROWTH would
+be a stride break across every `.bin` on disk).
+
+| version | bytes 80..88 | a v3 reader must |
+|---|---|---|
+| 1 | `bucket_open_prev_close: f64` | read it — same meaning |
+| 2 | `net_volume_signed: i64` | **NOT** read it as `f64`; sign unknown → write `+gross` |
+| 3 | `bucket_open_prev_close: f64` | read it |
+
+The v2 arm is the one that matters: an `i64` net volume reinterpreted as an `f64` price is
+a fabricated baseline, and the existing version gate (`SEAL_SPILL_FIRST_NET_VOLUME_VERSION`)
+is the precedent for refusing it rather than guessing.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Stores the tick-rule net flow in `volume` (destroys the gross magnitude; `abs(v) != gross`
+  then breaks the `10m` derivation and every view that renders the other form).
+- Zeroes a flat bar in the STORED column (same destruction, one bar at a time).
+- Removes `net_volume` from the `CREATE` while leaving its `ADD COLUMN IF NOT EXISTS`
+  self-heal, which silently re-adds the column on the next boot.
+- Derives `10m` by SUMMING signed 1m volumes — signed volume is **not additive across
+  timeframes** (five 1s bars of `+100, −100, +100, −100, +100` sum to `+100` while the 5s
+  bar reads `±500`). Sum `abs()` for the gross, then apply the sign at the 10m level.
+- Leaves `recompute_window` summing the bare `volume` — under a signed column it compares
+  `Σ(signed 1m)` against the higher-TF bar's own sign, which differ for any window mixing
+  up and down minutes. That is the same daily-false-page shape #1919 fixed, in the same
+  file, and it must move to `Σ abs()` with the sign checked separately IN THE SAME CHANGE.
+- Reads bytes 80..88 of a format-2 spill record as an `f64` baseline.
+- Adds an `M10` variant, or moves `TF_COUNT`.
+- Claims the tick-rule flow value is preserved anywhere.
+
+#### 2026-09-18 (FOURTH, same day) — SHIPPED, and the three things the implementation settled that the section above could only specify
+
+**No new authorization is claimed.** This records what landed against the contract
+above, and the three points where writing the code decided something the ruling had
+left open.
+
+##### 1. The spill record reached v3 with NO growth, and the const assert is what forced the right shape
+
+The section above predicts bytes 80..88 return to their v1 meaning. They did —
+`SEAL_SPILL_FORMAT_VERSION` 2 → **3**, `SEAL_SPILL_RECORD_SIZE` unchanged at 128, no
+stride break on any `.bin` already on disk.
+
+**What is NOT in the section above, because nobody knew it until the compiler said
+so:** adding `bucket_open_prev_close: f64` to `SerializedSeal` while keeping
+`net_volume_signed: i64` and `net_volume_classified: bool` fails the build —
+`const _: () = assert!(size_of::<SerializedSeal>() <= SEAL_SPILL_RECORD_SIZE)`, error
+`E0080`. The struct was already full.
+
+That assert made the design decision rather than merely reporting a size. The two
+options were to raise `SEAL_SPILL_RECORD_SIZE` — a stride break across every spill
+file in existence — or to accept that **a format which cannot represent a field
+should not reserve memory for it**. The second is right and is what shipped: both
+net fields are gone from `SerializedSeal` and from `SealDlqRecord`, replaced by the
+baseline. Recorded because a future reader will see a struct that looks like it has
+room and will not know it does not.
+
+##### 2. A pre-v3 record is REFUSED, not reinterpreted — and the fixture proves it in the strong direction
+
+`SEAL_SPILL_FIRST_PREV_CLOSE_VERSION = 3` gates the read. A v1 or v2 record decodes
+`0.0`, which `signed_volume()` treats as "no baseline" and signs **POSITIVE**.
+
+The test fixture therefore seals with a baseline of **24,400.0 — deliberately ABOVE
+both call-site closes** (102.5 and 24,341.95), so every fixture bar signs NEGATIVE.
+A lost baseline decodes 0.0 and signs positive, so the round-trip test cannot pass by
+accidentally agreeing with the default. Both round-trip tests also keep WHOLE-STRUCT
+equality, comparing against an `expected` copy with only the retired pair cleared, so
+a future field that silently fails to round-trip still fails.
+
+The DLQ is JSON and needs no version gate: no `deny_unknown_fields`, every field
+`serde(default)`, so a line from EITHER earlier era parses — the pre-2026-09-10 shape
+carries the baseline and keeps it, the 2026-09-10..09-18 flow-era shape carries the
+two retired keys and they are ignored. One test covers both eras rather than two
+covering one each.
+
+##### 3. `candles_10m` is a VIEW, and it is UNVERIFIED against a live QuestDB
+
+Clause 8 says derive. It is `console_views::candles_10m_view_ddl()` — a
+`CREATE OR REPLACE VIEW` over `candles_1m`: `SAMPLE BY 10m` for the OHLC and
+`sum(abs(volume))` for the gross, then a `lag(close)` window applied at the
+**10-minute** level to sign it. No `TfIndex` variant, no `TF_COUNT` change, no
+seal-ring resize, zero added per-tick work.
+
+Two details are load-bearing and are pinned by test rather than left to a reader:
+
+- It sums `abs(volume)` and **never** `sum(volume)` — the REJECT row above says why,
+  and `the_ten_minute_view_sums_the_magnitude_never_the_signed_value` asserts the
+  presence of one and the absence of the other.
+- The no-predecessor guard is `prev_close > 0`, **not** `IS NOT NULL`, so a first
+  bucket with no predecessor and a bucket whose baseline is genuinely zero take the
+  SAME branch and both sign positive.
+  `a_ten_minute_bucket_with_no_predecessor_falls_through_to_positive` asserts
+  `IS NOT NULL` is absent, so a later "tidy-up" cannot split them.
+
+**⚠ NOT claimed: that this DDL has ever been accepted by QuestDB.** No docker daemon
+exists in the build container and port 9000 is unreachable, so it could not be run.
+It is the first view in the module to use `SAMPLE BY` or a window function — there is
+no precedent in the repo to copy — and it is placed AFTER `ticks_named` /
+`candles_named` and BEFORE the depth views in `ensure_named_views` deliberately:
+`run_view_ddl` degrades a refusal to a counted warn and cannot block the statements
+behind it, so a dialect rejection costs an analyst nothing they open daily and shows
+up as one warn line. The first boot after deploy is the measurement.
+
+##### What a PR that violates this subsection looks like (REJECT)
+
+- Raises `SEAL_SPILL_RECORD_SIZE` to make room (stride break on every existing spill
+  file; the const assert exists to stop exactly this).
+- Reads bytes 80..88 without the `SEAL_SPILL_FIRST_PREV_CLOSE_VERSION` gate.
+- Lowers the test fixture's baseline below a call-site close, which lets a dropped
+  baseline pass by agreeing with the positive default.
+- Relaxes either round-trip test from whole-struct equality to field spot-checks.
+- Replaces `prev_close > 0` with `IS NOT NULL` in the 10m view.
+- Reports `candles_10m` as verified before a boot log shows the CREATE accepted.
+
+#### 2026-09-18 (FOURTH, same day, hours later) — the 10m view signed its first bucket of every day against YESTERDAY's close
+
+**No new authorization is claimed.** This is a defect in the change the section
+above records as SHIPPED, found by an adversarial sweep of that change and
+fixed before it merged. Recorded because the native fold refuses exactly this
+baseline, in a docstring that names the consequence — and the view I wrote to
+derive `10m` from `1m` re-created it one layer up.
+
+##### The defect
+
+`aggregator_cell::net_volume_baseline` returns `0.0` when the last sealed bar
+belongs to a different IST day, and says why verbatim:
+
+> *"Signing today's first bar against yesterday's close reports an OVERNIGHT
+> GAP as intraday direction, on exactly the bar an operator looks at hardest."*
+
+`candles_10m_view_ddl` computed its baseline as
+`lag(a.close) OVER (PARTITION BY a.security_id, a.segment, a.feed ORDER BY a.ts)`
+— **no day key, no `WHERE`**. So the 09:00–09:10 bucket of every session took
+its sign from the previous session's last bucket.
+
+**The failure, concretely.** NIFTY closes 24,500 on day N−1. Day N gaps down,
+opens 24,300, and the first bucket closes 24,350 — it ROSE 50 points. The view
+reads `24,350 < 24,500` and reports `−gross`. `candles_1m` for the same
+minutes reports positive. **The two tables contradict each other on the first
+bucket of every trading day, every instrument, and worse across a weekend or a
+holiday** — on the bar an operator opens the session by reading.
+
+##### The fix
+
+`date_trunc('day', a.ts)` joins the `PARTITION BY` list, which reproduces the
+native fold's IST-day refusal exactly (both tables store naive IST in a
+UTC-typed column, so the day is a plain truncation with no timezone hop).
+
+`date_trunc` is deliberately the construct chosen: **it is already live against
+this QuestDB** — `feed_scoreboard_boot` runs
+`select distinct date_trunc('minute', ts) from ticks` in production — so unlike
+`SAMPLE BY` and `lag()`, which this view is the repository's first user of, it
+is not a first use and adds no new dialect risk.
+
+Pinned by `the_ten_minute_sign_never_crosses_a_day_boundary`, which asserts the
+day key is present AND that it sits inside the `PARTITION BY` list rather than
+the `ORDER BY` — ordering by a truncated day would tie every bucket of a
+session together and make `lag` pick an arbitrary neighbour, which is a
+different bug with the same ingredients.
+
+##### Two more findings from the same sweep, fixed in the same change
+
+1. **A VACUOUS test.** `test_volume_saturates_when_above_i64_max` asserted
+   *"saturated volume MUST stay positive"* on a `LiveCandleState::empty()`
+   fixture whose `bucket_open_prev_close` is `0.0` — so `signed_volume()`
+   returned early on the no-baseline rule and the assertion could not fail
+   whatever the saturation arm did. It now drives the NEGATING arm (baseline
+   above the close) and asserts `-i64::MAX`, which proves the saturation AND
+   that `i64::MIN` is unreachable; a second case keeps the positive arm.
+   That is the ninth vacuous guard this repository has recorded, and the
+   shape is the same every time: **a fixture that satisfies the assertion by
+   a different rule than the one under test.**
+2. **The removal guard matched LITERALS, so three ordinary edits evaded it.**
+   `net_volume_is_gone_from_every_link_of_the_chain` checked for
+   `"net_volume"`, `net_volume:`, `net_volume LONG` and `c.net_volume`. A
+   different SQL alias (`b.net_volume` — which this very view's nesting
+   produces naturally), a different column type (`net_volume DOUBLE`), or a
+   name spliced through `format!` from a const each passed green. It now
+   carves out `net_volume_chg_milli_pct` and refuses the bare WORD, which
+   closes all three at once. Bite-proven both directions: adding
+   `b.net_volume` to the 10m view fails it by name; removing it passes.
+
+##### ⚠ What this does NOT fix (Rule 11)
+
+- **`fold_late_hlc` can still leave a stored sign contradicting the stored
+  closes in the same table.** A late tick amends bar N's close in place and
+  re-emits only bar N; bar N+1's sign was already computed and written from
+  the pre-amendment close. The sign is right for the data as it stood at seal
+  and wrong against the row now beside it, and `tf_consistency` is
+  structurally blind to it because it compares `abs()` on both sides. This is
+  a documented residual at the field site, not something this change
+  introduces or repairs.
+- **The higher-timeframe SIGN is verified by nothing.** `recompute_window`
+  sums `checked_abs` and compares against `checked_abs` of the stored value —
+  correct, and deliberately so, because a signed sum across frames does not
+  equal the frame's own sign. But it means an inverted 15m/30m/60m sign passes
+  the daily verifier silently. The rule text above asks for "the sign checked
+  separately as its own field"; that half is NOT implemented.
+- **The 10m view has still never been accepted by a live QuestDB.** No docker
+  daemon and no reachable port 9000 in this environment. `run_view_ddl`
+  degrades a refusal to a counted `warn!` that no alarm reads, so a rejected
+  view costs one log line and is otherwise silent — the first boot is the
+  measurement, and `SELECT count() FROM candles_10m WHERE ts IN today()`
+  returning "table does not exist" is the tell.
+
+### 2026-09-18 (THIRD) — FUTURES ARE REMOVED FROM THE SUBSCRIPTION: equity underlying spots and options only
+
+**The verbatim operator demand (2026-09-18, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "See dude one more point dude which is see dude as of now let us go ahead with one and only equity underlying spots and only options dude remove the futures subscription itself dude okay? Do you understand dude what I'm even askign dude okay? It's simple dude we just need to remove this entire futures subscriptions alone dude okay?"
+
+Recorded HERE before any code, per the rule-file-first law. It NARROWS the
+2026-08-15 full-universe authorization, RETIRES the 2026-09-09 futures-as-primary
+centring lock, and MOVES the 2026-09-11 (THIRD/FOURTH) depth-20 name-board slot
+arithmetic.
+
+#### What is removed
+
+| Surface | Today | After |
+|---|---|---|
+| Main feed — `FUTIDX` contracts, ALL expiries | ~21 (Assumed 7 × 3) | **0** |
+| Main feed — `FUTSTK` contracts, ALL expiries | ~660 (Assumed 220 × 3) | **0** |
+| depth-20 — the future slot on EVERY name | 1 per name × 8 names = **8 slots** | **0** |
+| Equity underlying SPOT | kept | **kept** |
+| Index + stock OPTIONS | kept | **kept** |
+
+Sites: `dhan_contract_universe.rs` (`InstrumentClass::IndexFuture` /
+`StockFuture` push arms and their priority-1/2 block),
+`depth20_name_board.rs` (`slots_for_index_name`'s leading `1`,
+`slots_for_stock_name`, `future_index`, the two claim sites, `futures_missing`),
+`dhan_lifecycle.rs` (the `FUTIDX` / `FUTSTK` master rows).
+
+#### ⚠ THE FINDING THAT MAKES THIS CHEAP — the 2026-09-09 lock was NEVER IMPLEMENTED
+
+The 2026-09-09 section of this file authorized **stock futures as the PRIMARY
+price for centring the stock-option ATM±25 window**, with spot as the fallback,
+and stated the one-line change it needed:
+
+> "The ONLY thing stopping a future's price reaching the selector is the binding
+> pattern at `dhan_feed_stack.rs:6172-6176`, which admits `IdxI | NseEquity |
+> BseEquity` and nothing else. Widening it to `NseFno` is one enum arm."
+
+**That arm was never added.** Verified in source 2026-09-18: the live
+`record_spot_price` call site still binds
+`ExchangeSegment::IdxI | ExchangeSegment::NseEquity | ExchangeSegment::BseEquity`,
+and `SpotPriceStore` therefore holds no futures price. The sibling
+`PrevCloseStore` gate is narrower still (`IdxI | NseEquity`) exactly as that lock
+required.
+
+**So no futures price has ever centred a ladder.** The 2026-09-09 lock is retired
+by DELETION of the thing it would have applied to, not by a behaviour reversal —
+centring has been SPOT-primary the whole time and stays SPOT-primary. Its own
+measurement said the accuracy cost of that was **approximately zero** (median
+strike spacing 2.63%, one strike step needs 1.32%, futures premium ~0.5%); what
+it hoped to buy was COVERAGE for the handful of stocks that print no spot (8 of
+733 on 2026-08-21), and that coverage was never actually bought. Removing futures
+therefore loses a benefit this system never had.
+
+Recorded as a correction rather than an edit-in-place because the shape is the
+one this repository keeps paying for: **an authorization was written down, the
+code was not written, and four weeks of later sections reasoned as though it
+had been.** A scope lock records what is PERMITTED; only a call site records
+what RUNS, and the two must be checked separately.
+
+#### What it frees, and what that buys
+
+| | before | after |
+|---|---:|---:|
+| `slots_for_index_name(11)` | 47 | **46** |
+| `slots_for_stock_name(5)` | 24 | **23** |
+| `board_slot_cost()` = 2 index + 6 stock | **238** | **230** |
+| `DEPTH20_INSTRUMENT_BUDGET` | 250 | 250 |
+| spare depth-20 slots | 12 | **20** |
+| main-feed contracts | ~24,600 | **~23,920** |
+
+The const-assert `board_slot_cost() <= DEPTH20_INSTRUMENT_BUDGET` holds with more
+room, so the removal cannot fail the build in that direction.
+
+**What the 8 freed slots do and do not buy**, computed rather than guessed:
+
+| candidate | cost | verdict |
+|---|---:|---|
+| index ATM ±11 → ±12 | 238 | fits |
+| **index ATM ±11 → ±13** | **246** | **fits — the widest that does** |
+| index ATM ±11 → ±14 | 254 | over |
+| a 7th mover stock name | 253 | over |
+| stock ladder ±5 → ±6 | 254 | over |
+
+**NONE of these is taken by this quote.** Widening the index window is its own
+decision with its own dated row; this section removes futures and leaves the
+20 slots spare rather than spending them in the same change.
+
+#### ⚠ What is LOST (Rule 11 — no false-OK)
+
+- **No future ever ticks again.** `ticks` and every `candles_<tf>` frame stop
+  receiving `FUTIDX` / `FUTSTK` rows from the moment this lands. Rows already
+  written are RETAINED; only the writer stops.
+- **Futures leave `instrument_lifecycle` as a live class.** The rows already
+  there are NEVER deleted (SEBI, §5/§6/§25 of
+  `daily-universe-scope-expansion-2026-05-27.md`); the daily build simply stops
+  emitting new ones, exactly as the Groww removal of 2026-08-21 did.
+- **`futures_missing` becomes unreachable** and must be removed with its emit
+  sites, not left as a permanently-zero counter — a metric with no producer is
+  the dead-monitor class this repository has retired three times.
+- **Futures depth was already unreachable** and stays so: the 2026-08-11 second
+  quote records that no authorized Dhan source yields a FUTIDX `security_id` for
+  a depth subscription. Nothing changes there.
+- **The §36 / §36.7 FUTIDX grant** (`daily-universe-scope-expansion-2026-05-27.md`,
+  "ALL available monthly expiries of the 4 underlyings") is SUPERSEDED for the
+  revived Dhan lane by this quote. It remains the historical record of why
+  futures were ever subscribed.
+
+#### ⚠ NOT claimed
+
+- That this makes anything faster. It removes ~680 of ~24,600 main-feed
+  instruments — under 3% of the subscribed set — so the measured sweep and fold
+  costs move by roughly that fraction and nothing else changes shape.
+- That the freed depth slots are used. They are not, by design of this section.
+- That any future price was being read anywhere. It was not, and that is the
+  finding above rather than an assumption.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Subscribes any `FUTIDX` or `FUTSTK` contract on the main feed, or restores the
+  future slot to `slots_for_index_name` / `slots_for_stock_name`.
+- Spends the freed 8 slots (index ±12/±13, a 7th name, a wider stock ladder)
+  under cover of this quote — each needs its own dated row.
+- Deletes a `FUTIDX` / `FUTSTK` row from `instrument_lifecycle`,
+  `instrument_lifecycle_audit` or `index_constituency` (removing the WRITER is
+  authorized; deleting the ROWS never is).
+- Leaves `futures_missing`, `future_index` or the futures selection counters in
+  place with no producer.
+- Widens the `record_spot_price` binding to `NseFno` — the 2026-09-09 lock that
+  asked for it is retired by this section.
+- Removes equity underlying SPOT, or any option contract, in the name of this
+  narrowing. The quote names futures ALONE.
+
+### 2026-09-18 (FOURTH) — `top_volume` IS STOCK OPTIONS ONLY: the index family is dropped from the board
+
+**The verbatim operator demand (2026-09-18, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "See top volume will should pick one and only options either index options or stocks options right dude am I right dude"
+
+> "Just go ahead with the stocks options alone for top volume dude"
+
+The first is the operator's QUESTION; the second is the decision, given in DIRECT
+response to a reply that named the two families, showed what each costs, and
+stated that the index board already steers nothing. Recorded HERE before the
+code, per the rule-file-first law, because this NARROWS the 2026-09-06 lock that
+created the two-family split.
+
+#### What this SUPERSEDES
+
+The 2026-09-06 contract's family row, in that section's own words: *"index
+options and stock options are ranked in **SEPARATE leaderboards**, never one
+blended list."* That rule was written to stop a single blended top-250 returning
+250 index strikes and zero stock options, and its reasoning is UNCHANGED and
+still correct. This section goes one step further and removes the index board
+entirely.
+
+| Surface | 2026-09-06 | 2026-09-18 (FOURTH) |
+|---|---|---|
+| Boards ranked per cadence | **2** — `OptionFamily::Index` + `OptionFamily::Stock` | **1** — Stock only |
+| Rows persisted per sweep | ≤ 21,470 (1,250 index + 20,220 stock, MEASURED 2026-08-22) | **≤ 20,220** |
+| Sorts per second at four cadences | 8 | **4** |
+| Per-tick `observe` on an index-option tick | one hash probe | **none** |
+| The `family` column, and its place in the DEDUP key | present | **UNCHANGED — present, and still in the key** |
+
+#### The decisive finding: the index board already steers NOTHING
+
+This is not a preference. `dhan_feed_stack.rs`'s ranking loop carries the
+admission in its own comment, verbatim:
+
+> *"Only the Stock family feeds the candidates, so with no writer there is
+> nothing the Index pass could produce. Skipping it keeps the writer-less
+> degrade at ONE sort per 5 seconds instead of two."*
+
+with the guard `if !wants_rows && family != OptionFamily::Stock { continue; }`.
+So the Index board's ONLY consumer is the `top_volume` writer. Depth-20 and
+depth-200 both read the Stock ranking — and both have been **stock options only**
+since the 2026-09-06 lock, which forbids an index option on a depth socket in as
+many words. Dropping the Index family therefore removes a board that ranks, sorts
+and persists for one reader and steers nothing.
+
+#### The READ-TIME damage, which is what the operator would actually feel
+
+The 2026-09-06 split protects the RANKING. It does not protect the QUERY.
+
+The default sort locked on 2026-09-18 is `ORDER BY ts ASC,
+volume_percentage_change DESC`, and it does not carry a family predicate. With
+both families in one table, **index strikes sit on top of every page**: a single
+NIFTY weekly at-the-money strike out-trades stock-option strikes by orders of
+magnitude, and there are 1,250 index-option contracts against 20,220 stock-option
+contracts (MEASURED 2026-08-22). So the operator's own default query returns the
+index board's head and the stock board's tail, on every page, forever — unless
+every reader remembers a `WHERE family = 'stock'` that the default sort does not
+include.
+
+One family removes that failure mode by construction rather than by a predicate a
+reader has to remember.
+
+#### The contract (LOCKED)
+
+| Aspect | Locked value |
+|---|---|
+| Ranked families | **`OptionFamily::Stock` ONLY.** `OptionFamily::Index` is not ranked, not sorted, not persisted |
+| Per-tick observe | index-option ticks are NOT observed into the leaderboard — one hash probe saved per such tick on the frame drain |
+| `family` column | **KEPT**, in the row and in `DEDUP_KEY_TOP_VOLUME_RANK`. It becomes constant (`stock`), and that is deliberate: the self-heal is `ADD COLUMN IF NOT EXISTS` and can NEVER drop a column, so removing it from the key would strand a live column outside the key; keeping it makes re-adding a family a pure additive change |
+| `OptionFamily` enum | **KEPT** — `contract_underlying_map.rs` classifies `OPTIDX` vs `OPTSTK` from the master and that classification is what makes the exclusion possible. Deleting the variant would delete the ability to recognise an index option |
+| Everything else | UNCHANGED — four cadences (1s/3s/5s/1m), every traded contract persisted (no top-N cut), the volume-percentage sort key, depth-20 and depth-200 steering, the socket and instrument budgets, `dry_run`, the §28 frozen area |
+
+#### ⚠ What is LOST (Rule 11 — no false-OK)
+
+**Index-option volume stops having a record anywhere in this system.** Nothing
+reads it today — that is the finding above — but `top_volume` is the only place
+that number has ever been written, so after this change a question like "how busy
+was the NIFTY 24500 CE in the 09:20 minute" has no answer in the database at all.
+
+That is a real loss and it is the operator's to accept. It is reversible: the
+`family` column and the `OptionFamily` classification both stay, so restoring the
+index board is adding one arm back to one loop — not a migration.
+
+#### ⚠ NOT claimed
+
+- That this makes anything faster in a way a human would notice. It halves the
+  sweep count (8 → 4 per second at four cadences) and removes ~6% of the rows.
+  The measured ceiling sweep is 2.95 ms and the realistic one is 123 µs; the
+  saving is real and is small.
+- That it improves the ranking. The Stock board's contents and order are
+  **byte-identical** before and after — the families were already ranked
+  separately, so removing one changes nothing inside the other.
+- That depth is affected. Both pools already read Stock only.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Ranks, sorts or persists the index family into `top_volume` without a fresh
+  dated quote here.
+- Drops the `family` column, or removes it from the DEDUP key — the self-heal
+  cannot drop a column, so a key that no longer names a live column is a key that
+  no longer matches the table.
+- Deletes the `OptionFamily` enum or its `OPTIDX` classification — that is what
+  identifies an index option, and without it the exclusion cannot be enforced.
+- Blends the two families into one board on the grounds that only one is left
+  (the 2026-09-06 blending ban stands and is the reason a future second family
+  must be a separate board).
+- Reports the index board as "removed for performance" — the measured saving is
+  small; the reason is that it steers nothing and it poisons the default sort.
+
+### 2026-09-19 — `top_volume` CARRIES THE CANDLE ROW: plain column names, whole-number volume percentage, and the three delay pairs
+
+**No new SCOPE is claimed.** The 2026-09-18 governing section above already
+locks the ten timeframes, the four `top_volume` cadences, the removal of
+`net_volume`, and the volume-percentage default sort. This section records the
+COLUMN CONTRACT that four later operator messages settled and that no rule file
+covers — the plain names, the whole-number percentage, `total_lots_traded` as an
+integer, the deletion of `gain_pct`, the candle numbers copied into the row, and
+the three delay pairs. Recorded BEFORE any code, per the rule-file-first law.
+
+#### §0 The verbatim operator demands (preserve EXACTLY, typos included)
+
+**Quote A (the heart piece — the candle number IS the number, no re-derivation):**
+> "see meanwhiel how our current top volume timeframe timestamos volume percnetage will be precisely calcuted i mean just we need to sue the rpecise volume which is avialable in our candles tabels even in our top volume rigtht dude so that no extra claucltion or derivation right dude so that it will be easily our volume percnetage will be eaisly calcualetd based on per lot quantity with volume so that precise voluem percnetage will be precisley calculated right see that too always our sortign descendign that tto base don volume percnetage always sorted right dude am i rgith dude"
+
+**Quote B (integers where integers belong; the candle numbers must MATCH):**
+> "See total lots traded shoudl be the long right why decimal here bro why the fuck bro why see meanwhile percentage change volume open percentage change shoudl be completely precise to same candles table right dude inside top volume table right dude am I right dude tellcme dude okay?"
+
+**Quote C (drop the underlying's move; name the shared numbers plainly):**
+> "See as of now I believe we don't need this underlying percentage change right dude see meanwhile what is this fucking four shared candle numbers dude this point alone I can't understand dude is this related to first received at and last received at dude"
+
+**Quote D (the delay display rule — whole units, never a decimal):**
+> "if it is below microseconds I need to know it took 100 or 1000 microseconds, or if it is in milliseconds then the data should be like this 100 or 200 or 123 milliseconds, or if it is in seconds then I want to see this as 1 second or 2 seconds"
+
+**The authorization to build (2026-09-19):**
+> "Then fix and resolve and ship everything dude okay?"
+
+#### §1 The rule — one paragraph
+
+A `top_volume` row stops being a pointer at a candle and BECOMES the candle row
+for that (contract, timeframe, timestamp): it carries the same `open`, `high`,
+`low`, `close`, the same signed `volume`, the same `percentage_change`, and the
+same `open_percentage_change` the `candles_<tf>` row carries for that identical
+window — **copied, never re-derived** (Quote A). Every column is named plainly,
+so a reader comparing the two tables compares like with like. The sort key
+`volume_percentage_change` becomes a WHOLE NUMBER (a 200-per-lot contract that
+traded 8,000 units in the window reads **3900**, not 3900.0 and not 39.00),
+`total_lots_traded` becomes a whole-lot LONG (Quote B), `gain_pct` — the
+UNDERLYING's move, which is a different instrument's number sitting in a
+contract's row — is DELETED (Quote C), and three delay measurements arrive as
+paired columns: a human-readable whole-unit string plus its exact nanosecond
+twin (Quote D).
+
+#### §2 The LOCKED column contract
+
+| Column | Type | Meaning | Status |
+|---|---|---|---|
+| `ts` | TIMESTAMP | window OPEN, the same grid the candle row uses | unchanged |
+| `tf` · `family` · `feed` · `segment` · `contract` | SYMBOL | identity | unchanged |
+| `security_id` · `underlying_id` | LONG | identity | unchanged |
+| `subscribed` | BOOLEAN | did this contract hold a depth socket at the snapshot | unchanged |
+| `delta_units` | LONG | raw units traded in the window | unchanged |
+| `candle_bucket_skew_secs` | LONG | grid disagreement between the two writers, 0 when they agree | unchanged |
+| `per_lot_quantity` | LONG | the contract's lot size | **RENAMED** from `lot_size` |
+| `total_lots_traded` | LONG | **WHOLE LOTS**, never milli-lots, never a decimal (Quote B) | **RENAMED + RETYPED** from `window_lots_milli` |
+| `volume_percentage_change` | LONG | **WHOLE NUMBER.** 200/lot, 8,000 units ⇒ **3900**. The DEFAULT DESCENDING SORT KEY | **RENAMED + RETYPED** from `net_volume_chg_milli_pct` |
+| `percentage_change` | DOUBLE | the candle's own close-vs-previous-close move, **2 decimals**, byte-equal to the candle row | **RENAMED** from `candle_price_chg_pct` |
+| `open_percentage_change` | DOUBLE | the candle's open-vs-previous-close move, **2 decimals** | **NEW** |
+| `open` · `high` · `low` · `close` | DOUBLE | the candle row's four prices, copied | **NEW** |
+| `volume` | LONG | **see §3 — this name is mid-migration and is the one dangerous column in the table** | **PHASED** |
+| `open_latency` / `open_latency_ns` | VARCHAR / LONG | delay between the window opening and the first trade we received in it | **NEW PAIR** |
+| `close_latency` / `close_latency_ns` | VARCHAR / LONG | delay between the last trade we received and the window closing | **NEW PAIR** |
+| `window_span` / `window_span_ns` | VARCHAR / LONG | first received trade to last received trade | **NEW PAIR** |
+| ~~`gain_pct`~~ | — | the UNDERLYING's percentage move | **DELETED** (Quote C) |
+| ~~`candle_volume_signed`~~ | — | the candle's signed volume under a temporary name | **RETIRED into `volume`** at Phase 2 (§3) |
+
+`family` STAYS in the row and in the DEDUP key even though R18 left one family:
+the self-heal is `ADD COLUMN IF NOT EXISTS` and can never DROP a column, so a key
+that stops naming a live column is a key that stops matching the table.
+
+#### §3 ⚠ THE `volume` RENAME IS TWO-PHASE AND TIME-GATED — the one place this contract cannot be honoured today
+
+The operator wants ONE plainly-named `volume` in `top_volume` that equals the
+candle's signed volume. **A column named `volume` already exists in this table and
+holds a completely different number** — the vendor's CUMULATIVE DAY volume, the
+running total since 09:15, documented as such in that module's own header.
+
+QuestDB's self-heal can only ADD a column. It cannot rename one and it cannot
+drop one. So re-pointing `volume` at the candle number in a single change gives
+one column two meanings across a partition boundary: rows written before the
+deploy hold a day-cumulative figure and rows written after hold a per-window
+signed figure, under the same name, in the same table, with nothing in the row to
+tell them apart. A reader summing that column, or sorting on it, or comparing two
+days, gets a silently wrong answer. That is the exact silent-corruption class this
+repository has retired repeatedly.
+
+**THE DECISION — two phases, separated by the retention window:**
+
+| | Phase 1 (this change) | Phase 2 (≥15 calendar days later) |
+|---|---|---|
+| `cumulative_day_volume` | **ADDED**, and the vendor total is written HERE | still written here |
+| `volume` | **STOPS BEING WRITTEN.** Old rows keep their old meaning and age out | **STARTS carrying the candle's signed volume** |
+| `candle_volume_signed` | still written (the candle number's temporary home) | **STOPS being written**; `volume` is its name from then on |
+| Reader sees | two honestly-named columns; `volume` visibly going stale | one plainly-named `volume`, every row meaning the same thing |
+
+**Why ≥15 calendar days and not sooner:** `top_volume` sits in
+`HOUR_PARTITIONED_TABLES` ⇒ `RetentionClass::MarketData` ⇒ `market_data_hot_days`,
+which is **15** in `config/base.toml`. Once that window has rolled, not one row
+written under the old meaning is still on the volume, so the name can change with
+no row anywhere holding the other number. Phase 2 is therefore SAFE BY THE CLOCK,
+not by anyone remembering.
+
+**⚠ The cost, stated rather than buried:** for those ~15 days the operator sees
+`candle_volume_signed` where he asked to see `volume`, and a `volume` column that
+has stopped moving. That is a real gap between what he asked for and what the
+table shows, and it is the price of never having one column mean two things.
+
+**He can overrule this in one word.** If he says to re-point `volume` now, the
+correct execution is a `DROP TABLE` + recreate — which discards the existing
+`top_volume` history, is NOT a SEBI table, and is a decision only he can make. It
+is recorded here so the option exists and so no session takes it unasked.
+
+#### §4 The delay display rule (Quote D) — four bands, whole units, no decimals
+
+Stored unit is NANOSECONDS. The VARCHAR twin is rendered by these bands, and each
+band stops SHORT of the round number so a value never renders as `1000
+microseconds` when `1 millisecond` is the true reading:
+
+| Nanoseconds | Renders as | Example |
+|---|---|---|
+| `< 1,000` | whole **nanoseconds** | `4 nanoseconds` |
+| `1,000` – `999,499` | whole **microseconds** | `100 microseconds` |
+| `999,500` – `999,499,999` | whole **milliseconds** | `123 milliseconds` |
+| `>= 999,500,000` | whole **seconds** | `1 second` |
+
+Singular/plural follows the number (`1 second`, `2 seconds`).
+
+**Why BOTH columns and not just the readable one.** Text sorted descending
+compares the first character and stops. Four real delays — 1 second, 2
+milliseconds, 3 microseconds, 4 nanoseconds — sort to `4, 3, 2, 1`: the EXACT
+REVERSE of their true order, and it looks plausible. The `_ns` twin is what any
+`ORDER BY` must use; the VARCHAR is what a human reads.
+
+**Rounding loss is real and is the operator's own instruction.** `1 second`
+covers 999,500,000 – 1,499,999,999 ns; `123 milliseconds` covers 122,500,000 –
+123,499,999. The `_ns` column always holds the exact figure, so nothing is lost
+from the table — only from the sentence.
+
+**VARCHAR, never SYMBOL.** SYMBOL is for a small repeated vocabulary; these
+strings are near-unique per row, so SYMBOL would build a dictionary the size of
+the table.
+
+**BLANK, never `0 nanoseconds`, when there is no receipt.**
+`WAL_RECEIPT_UNKNOWN_NANOS = 0` is the documented "no receipt" sentinel
+(`ws_frame_spill.rs`), and `received_at_nanos <= 0` means the frame carries no
+receipt clock at all — a pre-`TVW3` WAL replay. Rendering that as a delay of zero
+would report the fastest possible delivery for a frame whose delivery time is
+unknown. Both columns of the pair go NULL together.
+
+**A negative delay is genuinely possible and must not overflow.** The drain
+back-dates `received_at_nanos` by ring dwell
+(`Utc::now().timestamp_nanos_opt()… .saturating_sub(queued_nanos)`), so a frame
+can be stamped before the window it lands in. `abs()` on `i64::MIN` panics under
+the release profile's `overflow-checks = true` (pinned in CLAUDE.md), so the sign
+must be stripped with `unsigned_abs()` or an equivalent that cannot overflow.
+
+
+#### §4a — 2026-09-19 (later the same day): SHIPPED, and the two things the build caught on the way
+
+**No new authorization is claimed.** §4 above is the locked contract; this
+records what landed against it and what the guards found, because both findings
+are the kind a future reader would otherwise have to rediscover.
+
+**What shipped, exactly as §4 specifies:** three paired columns on
+`top_volume` — `open_latency` / `open_latency_ns`, `close_latency` /
+`close_latency_ns`, `window_span` / `window_span_ns`. The four bands stop short
+of the round number above them (999,499 ns renders `999 microseconds`; 999,500
+renders `1 millisecond`), the sign is stripped with `unsigned_abs` so `i64::MIN`
+cannot panic under `overflow-checks`, a missing receipt leaves BOTH halves of a
+pair NULL rather than writing `0 nanoseconds`, and the readable half is VARCHAR
+rendered into one writer-owned buffer — a `format!` per column per row would be
+3 × 20,220 = **60,660 fresh allocations per sweep** on the frame-drain task.
+
+**The measurement the stamps rest on.** `first_receipt_nanos` is PER-CADENCE
+(`[i64; WINDOW_COUNT]`) because the four windows open at four different
+instants; `last_receipt_nanos` is ONE shared value, because a window closes at
+the sweep and its last tick is the last tick whichever cadence asks. The open
+stamp is taken only when that cadence's dirty bit is CLEAR — a clear bit means
+the previous sweep consumed everything before it, so this tick is the window's
+first. Stamping unconditionally would make `open_latency` report the delay to
+the LATEST trade and collapse `window_span` toward zero on exactly the busiest
+contracts.
+
+#### ⚠ Finding 1 — the worst-case row is 926 B, not 707, and the harness that
+#### measures it would have reported 707 unchanged
+
+`MEASURED_WORST_CASE_ILP_ROW_BYTES` is re-derived **707 → 926** and the assumed
+`TOP_VOLUME_ILP_ROW_BYTES` **792 → 1040**, keeping the ~12% headroom every step
+since 2026-09-13 has carried.
+
+**The measurement only happened because the harness was fixed first.** Its
+worst-case fixture left all three delays `None`, so it would have measured a row
+WITHOUT the six new columns, reported 707 B, and passed — leaving the producer
+ceiling under-sized by 219 B per row with every assert green. Past that ceiling
+this writer DROPS and `top_volume` has **no spill tier**, so the failure mode is
+silent row loss with a perfectly healthy writer. The fixture now sets all three
+to `i64::MIN`, their widest (a 20-character exact column beside a 19-character
+`-9223372037 seconds` twin).
+
+At 1040 B the ceiling is 25,000 × 1040 = **26.0 MB** against depth's 32 MiB — a
+**22.5% margin, down from 41%**. That margin is real and shrinking: two more
+schema additions of this size would breach the depth relationship, and the next
+one must re-derive rather than assume.
+
+#### ⚠ Finding 2 — a column-manifest guard had been passing vacuously on `volume`
+
+`every_declared_column_actually_reaches_the_wire` asked
+`line.contains("{col}=")`, unanchored. That is satisfied by any column whose
+name ENDS with the one being checked — so `volume` has been passing on the
+substring inside `cumulative_day_volume=`, on a line that never carried it,
+since Phase 1 of the rename began. It is now anchored on the ILP field
+separator, and `volume` carries an explicit INVERTED assertion that fails if
+Phase 1 ever writes it.
+
+**An earlier draft of this note claimed the delay pairs added three more
+collisions of the same kind — `open=` inside `open_latency=`. That is FALSE and
+was refuted by bite-testing it:** the `=` sits between them, so `open_latency=`
+does not contain `open=`. The hazard is a SUFFIX collision, never a prefix one,
+and recording the wrong shape would have sent the next reader looking for the
+wrong thing. `volume` was and remains the only live instance.
+
+#### The bite-tests, and one test doc corrected by them
+
+Three ways, on the clear-bit guard that holds the open stamp:
+
+| broken | first-receipt test | per-cadence test |
+|---|---|---|
+| inner per-window bit test only | passes | **FAILS** |
+| outer early-out only | passes | passes |
+| both | **FAILS** | **FAILS** |
+
+The first-receipt test's own doc claimed it proved the inner bit test. It does
+not: with a single cadence ever swept all four bits move in lockstep, so the
+outer early-out alone holds the stamp and the inner condition is never reached.
+**The doc is corrected in place** rather than left standing — a test that cannot
+fail for the reason its comment gives is the vacuity class this repository keeps
+recording, here caught before it shipped rather than after.
+
+#### ⚠ Finding 3 — a helper went dormant when an ALREADY-MERGED PR deleted its
+#### only caller, and the push blocked on it
+
+The pre-push wiring guard refused the commit naming
+`volume_leaderboard::underlying_segment` as dormant. It is not part of this
+work: `git diff HEAD~1 HEAD` for that symbol returns **0**. Its last call site
+was the `gain_pct` closure, removed by **`035551a60` (PR #1926)** when the
+operator's 2026-09-18 ruling took the underlying's percentage change off the
+row — so the function was left behind, already-merged, and surfaced on the next
+push that happened to run the guard.
+
+**It is genuinely unreachable, and its siblings are not.** Checked one at a
+time rather than assumed as a group:
+
+| symbol | verdict |
+|---|---|
+| `STOCK_OPTION_UNDERLYING_SEGMENT` | **LIVE** — three production sites in `dhan_feed_stack.rs` |
+| `underlying_gainer_verdict` | **LIVE** — the gainer filter's own call site |
+| `eligible_gain_pct` | reachable only from `underlying_gain_pct` and tests, but doc-cross-referenced by **three** other modules |
+| `underlying_gain_pct` | test-only since PR #1926 |
+| `underlying_segment` | **unreachable, and referenced by nothing** |
+
+So only the last one is deleted. Widening this into a purge of the whole
+`gain_pct` family would orphan the cross-references in `prev_close_store.rs`,
+`depth20_name_board.rs` and `dhan_feed_stack.rs` that cite
+`eligible_gain_pct`'s reasoning by name, and it is not what blocked the push.
+**The remaining dormancy is RECORDED here rather than acted on** — it is a
+decision for its own change, which is this file's own standing discipline for a
+structure with no live reader.
+
+**What was NOT thrown away with it.** The deleted helper's docstring recorded a
+real hazard: an index option's `underlying_id` is an index id (NIFTY=13), and
+probing `(13, NSE_EQ)` is the I-P1-11 collision this repository bans — at worst
+an NSE cash equity carries id 13 and the row is ACCEPTED carrying that stock's
+percentage under an index's name, with no NaN to catch it. That warning is
+folded into `STOCK_OPTION_UNDERLYING_SEGMENT`'s own doc, so the next change that
+pairs an underlying id with a segment meets it. Deleting the code and the
+reasoning together would have been the cheaper half of the job.
+
+#### ⚠ NOT claimed
+
+- **That the delay strings have ever been rendered against live rows.** Port
+  9000 is unreachable from here and there is no docker daemon, so no DDL has
+  been executed against a live QuestDB and no row has been read back. The first
+  boot with this build is the measurement.
+- **That the columns make anything faster.** They make three durations readable
+  that were previously unknowable — the same claim §2.3's sixth addendum in
+  `dhan-rest-only-noise-lock-2026-07-14.md` makes for the reconnect histograms.
+- **That a delay is a network round trip.** It composes queue wait, wire write,
+  vendor processing and — on a thin option — the time until the contract's book
+  next changes. It is deliberately the UPPER bound.
+- **Any CloudWatch surface.** No EMF name and no alarm: the September forecast
+  measured 2026-09-06 is **$142.24** against an automatic `STOP_EC2_INSTANCES`
+  line of **$135.00**, and §2.3n requires a LEVER for the next addition, not a
+  cost note. The columns ARE the observability — they live in the table the
+  operator reads.
+
+#### §5 Honest envelope (mandatory per operator-charter §F)
+
+> "**O(1) per trade and per row, and nothing anywhere that grows faster than the
+> number of rows you asked for.** Every OPERATION is constant-cost and identical
+> at 4 contracts or 25,000: a trade arriving is one hash probe, a window opening
+> is one slot write, a window closing is one row build, a row written is one ILP
+> append, and a row read is one index seek. **NOT claimed: that the SWEEP is
+> O(1).** It is Θ(rows) and cannot be otherwise — producing one row per traded
+> contract costs at least one row per traded contract, and any design that claims
+> otherwise has silently reintroduced a top-N cut. The measured sweep is 2.95 ms
+> if all 20,220 contracts trade in one window and **123 µs** at a realistic
+> ~2,000; the new columns take the worst second from ~64 ms to ~71 ms (7.1% duty)
+> and the realistic second from ~6.4 ms to ~7.2 ms (0.7%). **NOT claimed: that
+> QuestDB accepts these columns.** Port 9000 is closed here and there is no docker
+> daemon, so no DDL has been executed against a live database; the first boot with
+> this build is the measurement. **NOT claimed: that the delay columns have ever
+> been rendered against live rows.** **NOT claimed: that `volume` means the candle
+> number today** — §3 is explicit that it does not, for ~15 days. **NOT claimed:
+> that a trade the broker never sent us can be detected** — their feed carries no
+> sequence number, and no column in this table can see a gap that arrived as
+> silence."
+
+#### §6 Two figures that were stale and are corrected by this change
+
+1. **`OPTION_FAMILIES: usize = 2` is wrong post-R18** and is corrected to **1**.
+   It multiplies `TOP_VOLUME_PERSIST_PER_FAMILY` (25,000) into
+   `TOP_VOLUME_MAX_ROWS_PER_SWEEP`, so the sweep has been sized for **50,000**
+   rows since the index board was dropped. Corrected, the per-row byte ceiling
+   doubles from ~671 B to **~1,342 B**, and the new columns need ~725 B — a **46%
+   margin** against the depth path's 32 MiB producer bound rather than a breach.
+   **This correction is load-bearing: without it the new columns look unaffordable
+   and are not.** An earlier cost argument of mine rested on the stale ~671 B
+   figure and is WITHDRAWN.
+2. **CLAUDE.md's "8 sweeps ≈ 23.6 ms ≈ 2.4% duty"** is 4 cadences × 2 families.
+   Post-R18 it is **4 sweeps**. Same stale factor, fourth place it appears.
+
+#### §7 What a PR that violates this section looks like (REJECT)
+
+- Re-points `volume` at the candle number in ONE change (§3 — one column, two
+  meanings, across a partition boundary).
+- Ships Phase 2 before the 15-day retention window has rolled past every Phase-1
+  row, or without confirming `market_data_hot_days` is still 15.
+- Stores `volume_percentage_change` or `total_lots_traded` as a DOUBLE, or with
+  any fractional part (Quote B says LONG, in as many words).
+- Re-derives any candle number inside the `top_volume` writer instead of copying
+  the fold's own value (Quote A: *"no extra claucltion or derivation"*).
+- Keeps `gain_pct`, or re-adds the underlying's move under another name (Quote C).
+- Sorts any delay on the VARCHAR column — that is the exact-reverse bug in §4.
+- Renders a missing receipt (`received_at_nanos <= 0`) as `0 nanoseconds` rather
+  than leaving both columns NULL.
+- Uses `abs()` on the delay (panics on `i64::MIN` under `overflow-checks`).
+- Renders a delay with a decimal point, or as `1000 microseconds` where
+  `1 millisecond` is the band (§4 bands stop short of the round number for exactly
+  this reason).
+- Stores a delay as SYMBOL.
+- Allocates per row on the frame-drain task: the naive `format!` shape is
+  **60,660 fresh allocations per sweep** (three strings × 20,220 rows) on the task
+  that already carries a 14,932 µs ILP append, in a codebase whose first principle
+  is zero allocation on the hot path. The in-repo precedent is on THIS struct —
+  `TopVolumeRankRow<'a>.segment` was a `String` until 2026-09-08 and was removed
+  for exactly this. Use a reused buffer.
+- Leaves `OPTION_FAMILIES` at 2, or raises the assumed row width without the
+  measured basis (§6).
+- Drops `family` from the row or the DEDUP key.
+- Claims the sweep is O(1) anywhere — in code, a comment, a commit message or a
+  PR body (§5).
+
+#### ⚠ §8 CORRECTED 2026-09-19 (same day, hours later) — §2 names the WRONG SOURCE for BOTH percentage columns, and one of the two would have shipped a number the candles table does not contain
+
+**No scope changes and no operator quote is reinterpreted.** §2 above was
+written from the column NAMES rather than from the code that fills them. Tracing
+both writers proved two of its rows false, and the first one is false in the
+direction that matters: it would have shipped a column claiming candles-table
+parity while carrying a number the candles table has never held. Quote B asks for
+the opposite in as many words — *"completely precise to same candles table"* — so
+this is not a refinement, it is the difference between honouring that quote and
+breaking it. §2 stands per house convention; where it and §8 conflict, §8 wins.
+
+##### The four percentages the candles row actually carries, and where each comes from
+
+Verified in source, not inferred (`shadow_seal_columns.rs` `from_buffered_seal`,
+and the field docs on `LiveCandleState`):
+
+| candles column | filled from | what it MEANS |
+|---|---|---|
+| `close_pct_from_prev_day` | `state.close_pct_from_prev_day` | close vs **yesterday's** close |
+| `change_pct` | `state.close_pct_from_prev_day` — **the same field** | the headline day change; byte-identical to the row above |
+| `open_pct` | `state.open_pct` | close vs **today's 09:15 session open** |
+| `open_gap_pct` | `state.open_gap_pct` | session open vs yesterday's close (the opening gap) |
+
+`change_pct` and `close_pct_from_prev_day` are literally the same number under
+two names — the extraction site says so in its own comment. That duplication is
+what made the naming confusing enough to produce Quote C, and it is why §2's
+"four shared candle numbers" phrasing landed badly.
+
+##### Correction 1 — `percentage_change` is NOT a rename of `candle_price_chg_pct`
+
+`top_volume`'s existing `candle_price_chg_pct` is filled from
+`bar.close_chg_pct_from_prev_bar()`, whose baseline is
+`LiveCandleState::bucket_open_prev_close` — **the close of the PREVIOUS SEALED BAR
+of the same timeframe**. That is a third quantity, and the candles table does not
+carry it in any of its seventeen columns.
+
+So renaming that column `percentage_change` and describing it as "byte-equal to
+the candle row" would have been FALSE, and false in the reassuring direction: the
+name would have invited exactly the cross-table comparison Quote B asks for, and
+the two numbers would have disagreed on almost every row, with nothing in either
+table explaining why.
+
+**`percentage_change` is sourced from `LiveCandleState::close_pct_from_prev_day`**
+— the same field the candles row's `change_pct` column is filled from, so the two
+match by construction rather than by coincidence. It is a NEW column;
+`candle_price_chg_pct` is not renamed into it.
+
+##### Correction 2 — `open_percentage_change` is not the opening gap
+
+§2 describes it as *"the candle's open-vs-previous-close move"*. That is
+`open_gap_pct`, a different column. **`open_percentage_change` is sourced from
+`LiveCandleState::open_pct`** — close vs today's 09:15 session open — which is the
+column whose NAME matches what the operator asked for, and is the least-inference
+reading of Quote B's *"open percentage change"* against the candle columns he is
+looking at.
+
+##### Correction 3 — the bar-over-bar number is KEPT, honestly renamed, because it is the only thing in the row that explains the sign of `volume`
+
+The obvious follow-through from corrections 1 and 2 is to delete
+`candle_price_chg_pct` outright. **That would be wrong**, and the reason is the
+governing directive's own heart: the single `volume` column that accepts a minus.
+
+`LiveCandleState::signed_volume()` chooses that sign with
+`if self.close < self.bucket_open_prev_close { -gross } else { gross }` — the
+**identical baseline** `close_chg_pct_from_prev_bar()` uses. The two are the same
+comparison expressed twice, which the fold's own test asserts side by side. So
+that percentage is the one field in the row that answers *"why is this volume
+negative?"*, and none of the three candles-sourced percentages can answer it: a
+contract can close up on the day and down against the previous bar, and then the
+row shows a positive `percentage_change` beside a negative `volume` with nothing
+to reconcile them.
+
+It is therefore **RENAMED `close_vs_prev_bar_pct`** — a name that says what it is
+and claims no candles-table parity — rather than deleted or passed off as
+`percentage_change`.
+
+##### The corrected rows, replacing their §2 equivalents
+
+| Column | Type | Source | Meaning | Status vs §2 |
+|---|---|---|---|---|
+| `percentage_change` | DOUBLE, 2dp | `LiveCandleState::close_pct_from_prev_day` | close vs yesterday's close — equals the candle row's `change_pct` | **NEW** (§2 wrongly called it a rename) |
+| `open_percentage_change` | DOUBLE, 2dp | `LiveCandleState::open_pct` | close vs today's 09:15 session open — equals the candle row's `open_pct` | **NEW** (§2 described the wrong quantity) |
+| `close_vs_prev_bar_pct` | DOUBLE, 2dp | `LiveCandleState::close_chg_pct_from_prev_bar()` | close vs the previous sealed bar of this timeframe; **the sign of `volume` comes from this same comparison** | **RENAMED** from `candle_price_chg_pct` — NOT a candles-table column, and must never be presented as one |
+
+Every other row of §2 stands unchanged.
+
+##### Consequences for the rest of this section
+
+- **§5's honest envelope gains one line:** three percentages now ride the row
+  instead of one, so the per-row width estimate rises by ~16 B over the §6
+  figure. Against the corrected ~1,342 B ceiling that is noise, not a breach.
+- **`CandleBarReading` must widen by two fields, not one.** It carries three
+  fields today (`signed_volume`, `open_bucket_advance_secs`, `price_chg_pct`) and
+  must carry `open`/`high`/`low`/`close` plus `close_pct_from_prev_day` and
+  `open_pct`. All six are already on `LiveCandleState` at the construction site
+  (`dhan_feed_stack.rs`, the `bar_for_window` arm), so this is a copy, never a
+  re-derivation — Quote A holds.
+- **§7 gains two REJECT rows** (below).
+
+##### Added to the §7 REJECT list
+
+- Sources `percentage_change` from `close_chg_pct_from_prev_bar()`, or from
+  anything other than `close_pct_from_prev_day` — that is the exact defect this
+  correction exists to stop, and it ships a column that silently disagrees with
+  the candles table it names.
+- Sources `open_percentage_change` from `open_gap_pct` (the opening gap) rather
+  than `open_pct`.
+- Deletes the bar-over-bar percentage without replacing the explanation for the
+  sign of `volume` — a signed volume nothing in the row accounts for is worse
+  than an extra column.
+- Presents `close_vs_prev_bar_pct` as a candles-table column, or renames it back
+  into the `percentage_change` family.
+
+##### The reusable half
+
+§2 was written from column names and from what a rename would plausibly mean,
+with the code that fills each column one grep away. This file records the same
+shape repeatedly — a claim about a MECHANISM is checkable in one command and must
+be checked at the moment of writing. A schema contract is a claim about
+mechanisms in every row, and a rename is the most dangerous kind: it asserts that
+two things are the same number, which is precisely the assertion a name cannot
+carry on its own.
+
+### 2026-09-19 — FRESH-SCRATCH SCHEMA: the candle row is rebuilt around `ts`, and the three delays move into it
+
+**The verbatim operator demands (2026-09-19, typed directly in-session — preserve
+EXACTLY, typos and expletives included):**
+
+**Quote A (the column moves):**
+> "dude i clealry told you to make the candle table as to remove this close_pct_from_prev_day and rename the column name change_pct to percnetage_change and rename the column name open_pct to open_percentage_change dude okay? see meanwhile i clealry asked you to remvoe these right in top voluem tabel dude rmeove these columns dude okay?candle_volume_signed , candle_bucket_skew_secs, close_vs_prev_bar_pct and meanwhiel remvoe this fuckign ohlc fromt hsi top volume dude see meanwhiel put tehse columns into candles table dude not top voluem tbale dude okay? open_latency, open_latency_ns, close_latency, close_latency_ns, window_span, window_span_ns meanwhiel remvoe these also delta_units , cumulative_day_volume from top volume table dude okay? why dude first udnerstand my requirmenet why again and again making so many issues bro why once again chaneg the rpecise design dude okay?"
+
+**Quote B (fresh scratch):**
+> "jsut make this as the newer approach dude whereas it should consider this as a frehs acratch application fresh db eveyrhtign needs to ebe entirley fresh new dude okay?"
+
+**Quote C (the column ORDER + the go-ahead):**
+> "see in canlde table make the ts as first column always dude and open latency secodn column clsoe latency thrid column and window span foruth column dude and then following feed segment security id open high low close volume oi tick count etc ettc go ahead dude okay? yes bro evrythign needs ti eb the fresh new start dude okay?"
+
+**Quote D (the final placement + the name column + the anchor question):**
+> "bro put open latncy ns and close latency ns and window span ns to the final end dude okay? clelary ntoe dude ts, open latency close latency and amke window span as window span latency dude okay? then following feed etc etc etc dude okay? dude so meanwhiel now the entire feed will wokr enitltey ohlcv entilrey pruely based on this ts right dude am i rgith dude see thats why we have introduced this newer 6 columns right dude okay? remove this fuckign column dude okay? open_gap_pct. see emanwhile volume will accept this minus right dude okay dude okay? dude emanwhiel wheer si this fuckign symbol name inside candle dude i mean symbol name or contratc name or whatevr it is dude provide it dude okay? then go ahead entirley with your recommendation dude okay?"
+
+This section SUPERSEDES the 2026-09-19 §5 `top_volume` column contract and the
+2026-09-18 candle-column set. Recorded BEFORE the code, per the rule-file-first law.
+
+#### The operator's anchor question, answered on the record
+
+*"the entire feed will work entirely ohlcv entirely purely based on this ts right?"*
+**Yes — and it has been since the 2026-09-18 (SECOND) directive**, which made
+`fold_clock_ist_secs` the IDENTITY on the exchange timestamp. A trade lands in a bar
+by its EXCHANGE clock and by nothing else; the receipt clock cannot move it.
+
+The six delay columns exist because of that, not in spite of it: with the bar anchored
+on the vendor's clock, a bar built from data that arrived four seconds late is
+byte-identical to one built from data that arrived instantly. The delays are the only
+surface that separates them. They MEASURE receipt against the window; they never
+BUCKET by it. A PR that lets any delay value influence which bar a trade enters is a
+REJECT.
+
+#### `candles_<tf>` — the LOCKED column order, 22 columns
+
+| # | Column | Type |
+|---|---|---|
+| 1 | `ts` | TIMESTAMP |
+| 2 | `open_latency` | VARCHAR |
+| 3 | `close_latency` | VARCHAR |
+| 4 | `window_span_latency` | VARCHAR |
+| 5 | `feed` | SYMBOL |
+| 6 | `segment` | SYMBOL |
+| 7 | `security_id` | LONG |
+| 8 | `contract` | SYMBOL |
+| 9-12 | `open` `high` `low` `close` | DOUBLE |
+| 13 | `volume` | LONG (signed) |
+| 14 | `oi` | LONG |
+| 15 | `tick_count` | LONG |
+| 16 | `percentage_change` | DOUBLE |
+| 17 | `open_percentage_change` | DOUBLE |
+| 18 | `total_buy_qty` | LONG |
+| 19 | `total_sell_qty` | LONG |
+| 20 | `open_latency_ns` | LONG |
+| 21 | `close_latency_ns` | LONG |
+| 22 | `window_span_latency_ns` | LONG |
+
+`timestamp(ts) PARTITION BY DAY`, `DEDUP UPSERT KEYS(ts, security_id, segment, feed)`.
+Timeframes: `1s 3s 5s 1m 3m 5m 10m 15m 30m 60m` (`10m` derived as a view).
+
+**RENAMED:** `change_pct` → `percentage_change`; `open_pct` → `open_percentage_change`;
+`window_span` → `window_span_latency` (and its twin).
+**REMOVED:** `close_pct_from_prev_day`, `open_gap_pct`, `net_volume`.
+**ADDED:** the six delay columns and `contract`.
+
+#### `contract` — the name column, and why it is that name
+
+Candles carried NO name at all: an analyst reading `candles_1m` saw `security_id`
+and had to join `instrument_lifecycle` to learn what it was. `top_volume` already
+carries `contract`, so candles uses the SAME name — one name for one thing, which is
+what makes the two tables read and join identically. For an index the value is the
+index name; for an equity, the trading symbol.
+
+Resolution is O(1) and happens ONCE PER SEALED BAR, never per tick: one hash probe of
+the contract map (the same probe the volume leaderboard already makes for lot size),
+falling back to the daily master for non-option instruments. **An unresolved
+instrument leaves the column EMPTY — a guessed or fabricated name is a REJECT.**
+QuestDB SYMBOL is dictionary-encoded, so the per-row cost is the key, not the string.
+
+#### `open_gap_pct` — removed, and it costs nothing
+
+Verified 2026-09-19 by workspace scan: `open_gap_pct` has **ZERO SQL readers**. Every
+occurrence is a write site, a struct field, a spill-record byte range or a test. It has
+been written on every candle row since 2026-06-02 and read back by nothing. The FIELD
+survives on `LiveCandleState`/`SerializedSeal` (removing it would move every spill byte
+offset); only the column goes.
+
+#### `top_volume` — 15 columns, unchanged from the 2026-09-19 ruling
+
+`ts` `tf` `family` `feed` `segment` `contract` `security_id` `underlying_id` `volume`
+`per_lot_quantity` `total_lots_traded` `volume_percentage_change` `percentage_change`
+`open_percentage_change` `subscribed`.
+
+`volume_percentage_change` is THE SORT KEY, always DESCENDING. `volume` carries the
+candle's own signed number — copied, never re-derived (Quote A of 2026-09-19:
+*"no extra claucltion or derivation"*).
+
+**REMOVED (15):** `candle_volume_signed`, `candle_bucket_skew_secs`,
+`close_vs_prev_bar_pct`, `open`, `high`, `low`, `close`, `open_latency`,
+`open_latency_ns`, `close_latency`, `close_latency_ns`, `window_span`,
+`window_span_ns`, `delta_units`, `cumulative_day_volume`.
+
+**This collapses the two-phase `volume` rename** recorded in the 2026-09-19 §3. That
+phasing existed to stop one column meaning two things across a partition boundary;
+under fresh-scratch there is no old partition, so `volume` carries the candle's signed
+number from the first row.
+
+#### The fresh-scratch mechanism — ONE TIME, THIS TIME ALONE
+
+**Operator, 2026-09-19 (verbatim, typos included):**
+> "see as of now for this time alone only it shoudl be the fresh newer approach dude okay see clealry ntoe it hsodul be the fresh boot scratch fresher newer applciation dude okay?"
+
+This is NOT a standing schema-migration mechanism. It is a SINGLE NAMED ONE-SHOT,
+and the narrowing is the operator's own and is binding.
+
+A `schema_reset_log` table holds one row per reset id. At boot the app checks for
+the id **`2026-09-19-fresh-start`**. Absent → the allowlisted tables are DROPPED,
+CREATED fresh, and the id is written. Present → nothing happens, on that boot and
+on every boot after it, forever.
+
+There is exactly ONE id and it is a compile-time constant. A future schema change
+does NOT get a new one by writing code: minting a second reset id requires its own
+fresh dated operator quote in THIS file first. So the wipe cannot fire twice, cannot
+fire on a mid-session restart, and cannot be re-triggered by a later column change.
+
+> **SHIPPED 2026-09-22 (PR #1928).** Implemented in `crates/storage/src/fresh_start_reset.rs`,
+> called once from `candle_ddl_boot.rs` before any CREATE. It is refused inside the
+> 08:55–15:45 IST band, and it records `RefuseUnreadable` rather than dropping when
+> the log cannot be read. Not verified against a live QuestDB: no instance is
+> reachable from the build container, so the first out-of-session boot is the
+> measurement.
+
+**Allowlist (the ONLY tables the one-shot can reach):** `candles_<tf>` (all ten),
+`top_volume`, `ticks`, `market_depth`.
+
+> **2026-09-22 — `top_volume_rank` added: the SAME table under its pre-2026-09-12 name,
+> not a new one.** A hostile review found that without it, the reset drops `top_volume`
+> and the same boot's `ensure_top_volume_rank_table` then RENAMES any surviving legacy
+> table into its place, bringing every pre-reset row back under the new name. That
+> defeats the one-shot for exactly the table the operator most wanted fresh. Its four
+> legacy views are dropped first. Pinned against the persistence constant by
+> `the_reset_drops_top_volume_under_both_of_its_names`. No SEBI table is added. The
+> SEBI set stays const-asserted disjoint.
+
+**UNREACHABLE BY CONSTRUCTION — SEBI, five-year retention:**
+`instrument_lifecycle`, `instrument_lifecycle_audit`, `index_constituency`,
+`order_audit`, `order_update_events`, `position_update_events`, `ws_event_audit`.
+
+The allowlist is a literal `&[&str]` checked against the SEBI set at build time, so a
+SEBI table added to it fails the build rather than the boot.
+
+Every self-heal `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` for a removed column is
+DELETED in the same change. QuestDB can add a column but never drop or rename one, so
+a surviving self-heal silently re-adds what the CREATE just removed — the trap this
+file already records for `net_volume`.
+
+**Fail direction:** an unreadable or unwritable `schema_reset_log` REFUSES the wipe and
+boots on whatever schema exists, loudly — it never wipes on a guess. A wipe that ran but
+whose id could not be written would repeat, so the id write and the drops are ordered
+id-last-but-verified: the boot re-reads the id it just wrote and fails loudly if absent.
+
+#### ⚠ NOT claimed
+
+- That the DDL has been accepted by a live QuestDB. Port 9000 is unreachable from the
+  build container; the first boot after deploy is the measurement.
+- That the delay columns make anything faster. They make three durations readable that
+  were previously unknowable.
+- That a delay is a network round trip. It composes queue wait, wire write, vendor
+  processing, and — on a thin option — the time until the book next changes. It is
+  deliberately the UPPER bound.
+- Any CloudWatch surface. These are columns in the table the operator reads, not
+  metrics; §2.3n of the noise lock requires a LEVER for the next alarm, not a cost note.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Lets any delay value influence which bar a trade enters (`ts` alone buckets).
+- Reorders the candle columns away from the locked order above.
+- Ships a `_ns` twin anywhere but the final three positions.
+- Keeps a self-heal `ALTER` for `open_gap_pct`, `close_pct_from_prev_day`,
+  `net_volume`, `change_pct` or `open_pct`.
+- Sorts any delay on the VARCHAR column — text descending puts `1 second`,
+  `2 milliseconds`, `3 microseconds`, `4 nanoseconds` in the order 4, 3, 2, 1: the
+  exact reverse, and it looks plausible.
+- Renders a missing receipt as `0 nanoseconds` rather than leaving BOTH halves NULL.
+- Uses `abs()` on a delay (panics on `i64::MIN` under `overflow-checks`).
+- Stores a delay as SYMBOL (near-unique per row — the dictionary would be the table).
+- Fabricates a `contract` name for an unresolved instrument.
+- Re-derives any candle number inside the `top_volume` writer instead of copying it.
+- Points the fresh-scratch allowlist at ANY SEBI or audit table.
+- Mints a SECOND reset id, or makes the id anything but a compile-time constant, without its own fresh dated operator quote here first (the operator narrowed this to THIS TIME ALONE).
+- Runs the wipe on a mid-session restart, or on any boot after the id is written.
+- Allocates per row on the frame-drain task: the naive `format!` shape is three strings
+  per row; use the writer-owned reusable buffer.
+
+### 2026-09-19 — THE FOLD COLLAPSES TO NINE FRAMES: `TF_COUNT` 24 → 9, and the existing "no `TF_COUNT` change" REJECT rows are NARROWED, not broken
+
+**The verbatim operator demand (2026-09-19, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "dude these shodu lnot even be considered or derived or calcualted anywhere dude okay?Not written anywhere 2s 4s 6s 10s 15s 30s 2m 1d"
+
+> "i clealry told you to acheive my requirements alone rigth dude okay? Always achieve O(1) everywhere."
+
+Given in DIRECT response to a table listing every timeframe the fold currently
+computes against the ten he authorized on 2026-09-18. Recorded HERE **before any
+code**, per the rule-file-first law, because three REJECT rows in this same file
+forbid touching `TF_COUNT` and each of them has to be read correctly before this
+work can land.
+
+#### ⚠ FIRST — the narrowing, because a blanket read of the existing rows blocks this
+
+This file already says, in three places:
+
+| Line | Row |
+|---|---|
+| §2026-09-18 (FOURTH), REJECT list | *"**Any new `TfIndex` variant or `TF_COUNT` change** — clause 2 exists to avoid exactly that."* |
+| same list | *"Adds a `TfIndex` variant, or changes `TF_COUNT`, to serve `10m`."* |
+| §2026-09-19 (fresh-scratch), REJECT list | *"Adds an `M10` variant, or moves `TF_COUNT`."* |
+
+and clause 2 / clause 8 of those sections: *"`10m` is DERIVED, never a new fold
+frame. No `TfIndex` variant, no ordinal, no `TF_COUNT` change, no seal-ring
+resize, **zero added per-tick work**."*
+
+**Every one of those was written to forbid an ADDITION** — specifically, `10m`
+arriving as a 25th fold frame when a view over `candles_1m` already answers it.
+Read literally today they would also forbid a REDUCTION, which is the opposite of
+what they protect: their stated purpose is *zero ADDED per-tick work*, and this
+change removes 15 frames of it.
+
+**They are NARROWED, and only in that one direction:**
+
+- Adding a `TfIndex` variant, or raising `TF_COUNT`, remains a **REJECT** without
+  its own fresh dated quote. Unchanged.
+- `10m` remains a **VIEW** over `candles_1m` (`console_views.rs`), never a fold
+  frame. Clause 2's substance is untouched.
+- REMOVING frames the operator has ruled must not exist is **AUTHORIZED** by the
+  quotes above, and `TF_COUNT` moves DOWN as its consequence.
+
+#### The authority for WHICH frames survive is the RETAIN list, not the remove list
+
+The operator's message enumerates `2s 4s 6s 10s 15s 30s 2m 1d`. That is an
+abbreviation — `S7`…`S9` and `S11`…`S14` are not named in it and are equally not
+wanted. The binding list is the **GOVERNING DIRECTIVE of 2026-09-18**, which names
+what is KEPT: ticks plus `1s 3s 5s 1m 3m 5m 10m 15m 30m 60m`. Anything outside
+that list goes, whether or not he typed it.
+
+**Note `15s`/`30s` are removed while `15m`/`30m` are retained** — the two lists
+agree, and the near-collision is why the retain list is the authority.
+
+#### What moves
+
+| | before | after |
+|---|---:|---:|
+| `TF_COUNT` | 24 | **9** |
+| Folded frames per tick | 24 | **9** — 2.67× less per-tick fold work |
+| `SEAL_BUFFER_CAPACITY` (= `AGGREGATOR_MAX_SLOTS × TF_COUNT`, derived) | 600,000 | **225,000** |
+| `SEAL_SPILL_FORMAT_VERSION` | 3 | **4** |
+| Candle tables written | 24 | **9 folded + `candles_10m` (a VIEW) = 10**, plus `ticks` |
+
+**REMOVED (15):** `D1`, `S2`, `S4`, `S6`, `S7`, `S8`, `S9`, `S10`, `S11`, `S12`,
+`S13`, `S14`, `S15`, `S30`, `M2`.
+
+**SURVIVING (9), in their new contiguous ordinal order:**
+`M1=0, M3=1, M5=2, M15=3, S1=4, S3=5, S5=6, M30=7, M60=8`.
+
+`M1`…`M15` keep ordinals 0–3; every other survivor renumbers, because `TfIndex::ALL`
+is indexed BY ordinal and `from_ordinal` is its inverse, so the ordinals must stay
+contiguous `0..TF_COUNT`. There is no arrangement that removes `D1` at ordinal 4
+and leaves the rest where they were.
+
+#### ⚠ The `SEAL_SPILL_FORMAT_VERSION` bump is MANDATORY, not hygiene
+
+`seal_spill.rs` persists the frame as a raw **`tf_ordinal` byte**. `S1` is ordinal
+5 in every spill file on disk today and ordinal 4 after this change. Replaying an
+old file against the new table would decode `S1` rows as `D1`… except `D1` no
+longer exists, so in practice it decodes them as whichever survivor now holds that
+number — **silently, with no parse error**, because a byte in range is a byte in
+range.
+
+So the version moves **3 → 4** in the same change, and a record older than 4 is
+REFUSED rather than reinterpreted. This is the same discipline
+`SEAL_SPILL_FIRST_PREV_CLOSE_VERSION` already applies to bytes 80..88.
+
+**Task #15 (the three delay pairs moving into the candle fold) folds into THIS
+version bump.** Both changes alter what a spill record means; two bumps in two
+commits would leave a version 4 that is correct for one of them and wrong for the
+other. #20 lands first and #15 rides the same step.
+
+#### ⚠ NOT claimed
+
+- **That any of this has been accepted by a live QuestDB.** Port 9000 is
+  unreachable from the build container and there is no docker daemon; the first
+  boot after deploy is the measurement. `candles_10m` in particular remains a view
+  no live database has ever parsed.
+- **That the 2.67× is a measured latency improvement.** It is an exact count of
+  fold frames, which is what `catch_up_seal_all`'s 600,000 cell visits and the
+  per-tick `[Mutex<LiveCandleState>; TF_COUNT]` walk both scale with. The measured
+  figure this repository holds is `catch_up_seal_all` at **9.67 ms / 16.1 ns per
+  cell / 600,000 cells**; at 225,000 cells the same constant predicts ~3.6 ms, and
+  that prediction has NOT been re-measured. Re-run the harness rather than quoting
+  this line — the withdrawn "900 µs" sweep figure recorded at
+  `volume_leaderboard.rs` is what a quoted-not-measured number costs.
+- **That the 15 removed frames' existing rows disappear.** Their tables are dropped
+  by the one-shot fresh-scratch wipe (`2026-09-19-fresh-start`), which is task #17
+  and a separate change; until it runs, a deployed box keeps the old tables with no
+  writer. They are NOT SEBI tables, so this is a housekeeping matter, not a
+  retention one.
+  > **⚠ CORRECTED 2026-09-22 — the tables ARE dropped, but not by the reset.**
+  > `fresh_start_reset.rs` (shipped the same day) drops ONLY its `RESET_TABLES` literal:
+  > the nine current `candles_<tf>` tables plus `top_volume`, `ticks` and `market_depth`.
+  > The fifteen retired frames are dropped by a DIFFERENT boot step,
+  > `shadow_persistence::drop_retired_candle_tables`. It is called from
+  > `candle_ddl_boot.rs`, runs before any candle CREATE, and is marker-gated so it sweeps
+  > once per sweep version. So the outcome this sentence describes is real, but the
+  > mechanism it names is wrong. Recorded because a first draft of THIS correction said
+  > nothing drops them. That draft was reasoned from the reset's allowlist without a grep
+  > for the second caller.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Adds a `TfIndex` variant, or raises `TF_COUNT`, citing this section — the
+  narrowing is one-directional and the addition REJECT rows stand verbatim.
+- Makes `10m` a fold frame. It is a view over `candles_1m`; clause 2 is untouched.
+- Renumbers ordinals without bumping `SEAL_SPILL_FORMAT_VERSION` in the same
+  change — that is the silent mis-decode above, and it leaves no error to find.
+- Bumps the spill version twice for #20 and #15 separately.
+- Leaves `is_operator_requested` in place. With the fold reduced to exactly the
+  requested set it is tautologically `true`, and a gate that can only return true
+  reads as a live filter to the next author.
+- Leaves any `assert_eq!(TF_COUNT, 24)` behind. Four sites pin the literal
+  (`tf_index.rs` ×2, `seal_spill.rs`, `shadow_persistence.rs`); each exists to make
+  a frame change fail loudly, so each must move to 9 deliberately rather than be
+  deleted.
+- Keeps a `candles_<tf>` DDL, self-heal entry, table-name list or retention
+  registration for a removed frame — QuestDB's self-heal can ADD a column but never
+  drop a table, so a surviving name is a table that gets re-created empty forever.
+
+### 2026-09-19 — THE CANDLE FOLD MEASURES ITS OWN DELAYS: two receipt stamps per open bucket, three pairs derived at seal
+
+**No new scope is claimed and no operator quote is reinterpreted.** The
+2026-09-19 FRESH-SCRATCH SCHEMA section above already locks the 22-column
+candle order and already names the six delay columns as columns 2–4 and 20–22.
+What it does NOT say is where those six numbers come from, and until this
+change the honest answer was *nowhere* — the DDL declared them and no writer
+ever filled them. This dated section records the mechanism, per the
+rule-file-first law, and it is written BEFORE the verification sweep.
+
+#### The gap it closes
+
+The three delay pairs shipped on 2026-09-19 into `top_volume` (§4a above),
+measured by the snapshot path from its own per-cadence receipt stamps. The
+candle fold is a different producer on a different clock grid, and the
+operator's Turn-1 directive moved these columns *"into candles table dude not
+top voluem tbale"* — so the candle row needs its OWN measurement, not a copy of
+a `top_volume` figure taken against a different window.
+
+Copying would have been worse than absent: a `top_volume` 1s window and a
+`candles_1s` bucket share a grid but not a population, and a 60m candle has no
+`top_volume` counterpart at all. A borrowed number would have rendered
+plausibly and meant nothing.
+
+#### The contract (LOCKED)
+
+| Aspect | Locked value |
+|---|---|
+| Stored per open bucket | **exactly two** `i64`s on `LiveCandleState` — `first_receipt_ist_nanos`, `last_receipt_ist_nanos` |
+| Frame | **IST-naive**, and the frame is IN the field name. `ParsedTick::received_at_nanos` is UTC; `bucket_start_ist_secs` is IST-naive. The offset is applied ONCE, in `receipt_ist_nanos` |
+| Widening rule | **min/max over non-zero**, never first-write/last-write. The feed carries no sequence number, so the tick that OPENS a bucket by exchange time is not necessarily the earliest-arriving |
+| Derivation | at seal, in `ShadowSealRow::from_buffered_seal`: `open_latency = first − window_open`, `close_latency = window_close − last`, `window_span_latency = last − first`, where `window_close = window_open + tf.seconds_per_bucket()` |
+| Unknown | both stamps `0` ⇒ all three are `None` ⇒ all six columns omitted from the ILP row ⇒ NULL. `0` is the documented `WAL_RECEIPT_UNKNOWN_NANOS` convention |
+| Type | `Option<i64>` on `ShadowSealRow`, **never a sentinel** — `Some(0)` is a REAL reading (a single-tick bucket has a zero span) and must render `0 nanoseconds`; unknown and genuinely-instant must not share a value |
+| Rendering | `render_delay_into` from `top_volume_rank_persistence.rs`, **reused not duplicated** (same crate) — so the candle and `top_volume` delay text can never drift into two band tables |
+| Column names | `window_span_latency` / `window_span_latency_ns` on CANDLES, deliberately NOT `top_volume`'s `window_span` / `window_span_ns` (operator Turn-4, verbatim: *"amke window span as window span latency"*) |
+| Allocation | one writer-owned, writer-cleared `String` scratch reused across every row and every column — a naive `format!` is three allocations per row |
+| `fold_late_hlc` | ~~deliberately does NOT move the stamps~~ **CORRECTED 2026-09-23 (FOURTH): it DOES widen them, because the amended bar is re-emitted and its row replaced** |
+| Spill record | **NOT carried.** `SEAL_SPILL_RECORD_SIZE = 128` is byte-for-byte full; a replayed seal arrives with both stamps `0` and renders NULL. No format bump, no stride change, no new flag |
+
+#### ⚠ The anchor rule, restated because it is the one way this could be read wrong
+
+The operator's Turn-4 question — *"now the entire feed will wokr enitltey ohlcv
+entilrey pruely based on this ts right dude"* — is answered YES, and these six
+columns do not qualify it. `fold_clock_ist_secs` has been the IDENTITY on
+`exchange_timestamp` since the 2026-09-18 (SECOND) directive, so nothing but
+the exchange clock decides which bar a trade enters. The delays MEASURE receipt
+against the window; they never BUCKET by it. **A PR letting any delay value
+influence which bar a trade enters is a REJECT** — that row already stands in
+the FRESH-SCRATCH section and is reaffirmed here.
+
+#### ⚠ Honest cost, measured rather than argued
+
+Two `i64` per open bucket is **+10.8 MB of host RAM** at the 25,000-slot
+ceiling — 0.0314% of the 32 GiB host — split 7.2 MB on the aggregator cell and
+3.6 MB on the seal ring. Every figure is `size_of`-measured and re-derived from
+`TF_COUNT = 9`, never scaled from the previous row; the full derivation is the
+**RAM NOTE 2026-09-19** in `aws-budget.md`, which both const-asserts demanded
+before they would let the change build. **Dollar cost is ZERO** — no instance
+change, no EBS change, no new metric, no alarm, no EMF name.
+
+`BufferedSeal` now sits at **exactly** its 168-byte bound with zero slack, so
+the next field added to `LiveCandleState` fails the build. That is the assert
+working, and it means the next change here is a budget decision rather than an
+incidental one.
+
+#### ⚠ What is NOT claimed
+
+- **That any of this has been read back from a live QuestDB.** Port 9000 is
+  unreachable from here; the first boot with this build is the measurement, and
+  `SELECT open_latency, open_latency_ns FROM candles_1m WHERE ts IN today()` is
+  what settles it.
+- **That a delay is a network round trip.** It composes queue wait, wire read,
+  ring dwell and — on a thin contract — the time until that instrument next
+  trades inside the window. It is deliberately the UPPER bound.
+- **That a replayed bar carries them.** It cannot, by the spill-record decision
+  above, and NULL is the honest rendering of that.
+- **That the candle and `top_volume` figures for the same instrument and window
+  will agree.** They measure different populations on different producers; only
+  the RENDERING is shared.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Stores the three derived delays per open bucket instead of the two stamps
+  (pays fleet RAM for arithmetic that costs nothing once).
+- Applies the IST offset anywhere but `receipt_ist_nanos`, or compares a UTC
+  receipt against an IST bucket start — the result is wrong by 5h30m on every
+  bar and looks plausible.
+- Uses first-write/last-write instead of min/max over non-zero.
+- Replaces `Option<i64>` with a sentinel, collapsing "unknown" and "zero".
+- Duplicates the band table instead of calling `render_delay_into`.
+- Renames the candle columns to `top_volume`'s `window_span` / `window_span_ns`.
+- Allocates per row on the seal path, or drops the `clear()` before reuse so one
+  row's text trails into the next.
+- Carries the stamps into the spill record without a `SEAL_SPILL_FORMAT_VERSION`
+  bump and a size decision — the record is full.
+- ~~Makes `fold_late_hlc` move the stamps: it amends a bar already written and
+  re-emits only that bar, so the moved figure would reach no row.~~
+  **SUPERSEDED 2026-09-23 (FOURTH)** — premise false; the amended bar IS
+  re-emitted and upserted, so the late path MUST widen the stamps.
+- Sorts any delay on the VARCHAR half (text descending puts 1s / 2ms / 3µs / 4ns
+  in the order 4, 3, 2, 1 — the exact reverse, and it looks right).
+
+### 2026-09-22 — `top_volume` BECOMES FOUR DIRECT TABLES, one per timeframe, rows written `ts ASC, volume_percentage_change DESC`
+
+**The verbatim operator demand (2026-09-22, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "See meanwhile for this top volume also I clearly told you to make the table itself per timeframe per timestamp shoudl be always sorted by volume percentage desc always timestamp asc right dude that too always O(1) dude see meanwhile I clealry told you to make it as direct tables dude why focusing on view dude why"
+
+Recorded HERE before the code, per the rule-file-first law. It SUPERSEDES the
+2026-09-12 (SAME DAY, LATER) arrangement of ONE `top_volume` table plus four
+per-cadence VIEWS filtered on `tf`.
+
+#### What changes
+
+| Surface | Before | After |
+|---|---|---|
+| Storage | one table `top_volume`, all four cadences mixed, `tf` column separates them | **four tables** `top_volume_1s`, `top_volume_3s`, `top_volume_5s`, `top_volume_1m` |
+| Per-cadence reading surface | four VIEWS over `top_volume` + a LEFT JOIN to the lifecycle dimension | the tables themselves — no view, no join, no `WHERE tf=` filter |
+| Writer routing | every row to `top_volume` | each row to its own cadence's table, chosen by `SnapshotCadence::table_name()` — a `const fn`, O(1), no allocation |
+| Columns | 15 | **the same 15**, unchanged. `tf` is KEPT (constant per table) so a UNION across the four stays self-describing and the DEDUP key does not change shape |
+| DEDUP key | `ts, tf, family, feed, security_id, segment` | unchanged, per table |
+| Partitioning | `PARTITION BY HOUR`, one table | `PARTITION BY HOUR`, each of the four; all four join `HOUR_PARTITIONED_TABLES` |
+| The legacy `top_volume` table | live | **RETIRED as a write target.** Kept in `HOUR_PARTITIONED_TABLES` so its existing rows age out under the 15-day market-data window rather than sitting un-swept forever |
+
+**Why the view names are reused as table names, and the one step that makes it
+safe.** A QuestDB view and a table share one namespace, so `CREATE TABLE
+top_volume_1s` fails against a box where `top_volume_1s` is still the old view.
+The ensure path therefore issues `DROP VIEW IF EXISTS <name>` immediately before
+each `CREATE TABLE IF NOT EXISTS <name>`. On the first boot it removes the view;
+on every later boot the name is a table, the drop is refused, and that refusal
+is expected and logged at debug — never counted as a failure.
+
+#### The ordering contract — what "always sorted" means, stated exactly
+
+A sweep ranks one window's contracts by `window_lots_milli` descending, and
+`volume_percentage_change = window_lots_milli / 10 - 100` is monotone in it, so
+the rows of one sweep are appended in `volume_percentage_change` DESCENDING
+order. Sweeps run in time order, so windows arrive in `ts` ASCENDING order. The
+designated timestamp keeps each table physically ordered by `ts`.
+
+| Claim | Status |
+|---|---|
+| Rows are WRITTEN `ts ASC, volume_percentage_change DESC` | **Verified** — pinned by test on the writer's projection |
+| Each cadence's rows land in its own table only | **Verified** — pinned by test on the ILP line |
+| QuestDB PRESERVES arrival order among rows that share one `ts`, through WAL apply and DEDUP | **UNVERIFIED** — no live QuestDB is reachable from the build environment. Probe on the box: `SELECT ts, volume_percentage_change FROM top_volume_1s WHERE ts IN today() LIMIT 500` and check the second column never rises within one `ts` |
+
+**Until that probe reads clean, a reader who needs the order guaranteed writes
+`ORDER BY ts ASC, volume_percentage_change DESC`.** The rows are already in that
+order, so the sort is close to a no-op — but it is the only form this repository
+can promise today.
+
+#### O(1) — the honest statement
+
+| Operation | Cost |
+|---|---|
+| Choosing the table for a row | **O(1)** — a `const fn` match, no allocation |
+| Writing one row | **O(1)** — one ILP append |
+| Reading one window of one cadence | **O(log n)** partition seek + **O(k)** for the k rows returned. No join, no filter over the other three cadences, no sort at read time |
+| The sort itself | **O(m log m)** once per sweep, at write time, over the m contracts that traded in the window |
+
+Per-SWEEP O(1) is arithmetically impossible — a sweep's output is one row per
+traded contract — and is NOT claimed anywhere. What the split buys is that a
+read never pays for the other three cadences' rows, and never pays a join.
+
+#### ⚠ What is LOST, stated rather than implied
+
+The four views carried three joined columns from the instrument master —
+`symbol_name`, `display_name`, `instrument_type`. **The direct tables do not
+carry them.** The `contract` column still holds the human-readable contract
+label written at snapshot time, which is what the operator reads; the fuller
+master fields are one join away in `instrument_lifecycle` for anyone who needs
+them. Carrying them in every row would add ~100 bytes per row across ~20,000
+rows per sweep to duplicate a dimension table.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Re-introduces per-cadence VIEWS over a shared table (the arrangement this
+  section retires).
+- Writes a row to a table other than its own cadence's.
+- Drops `tf` from the tables or from the DEDUP key.
+- Removes the `DROP VIEW IF EXISTS` pre-step, or counts its expected refusal as
+  a failure (the second boot would then report an error forever).
+- Removes the legacy `top_volume` from `HOUR_PARTITIONED_TABLES` before its rows
+  have aged out.
+- Claims the within-`ts` physical order is guaranteed before the probe above has
+  read clean on a live box.
+- Claims per-sweep O(1).
+
+### 2026-09-22 (SECOND) — NO VIEWS ANYWHERE: `candles_10m` becomes a real folded table, and every table carries its own contract name
+
+**The verbatim operator demands (2026-09-22, typed directly in-session — preserve
+EXACTLY, expletives and typos included):**
+
+> "See meanwhile I clealry told you to put either contract or symbol name right in each and every table to see it precisely right dude espeically when I want to query it manually dudde oaky?"
+
+> "See attached hy the fuck candle 10 m is a view bro it should be the real table right why the Fuck do we need even these views bro why"
+
+Recorded HERE **before any code**, per the rule-file-first law, because both
+reverse rows this file currently makes binding.
+
+#### What this REVERSES
+
+| Row | Where | Now |
+|---|---|---|
+| *"`10m` is DERIVED, never a new fold frame. No `TfIndex` variant, no ordinal, no `TF_COUNT` change, no seal-ring resize"* | §2026-09-18 clause 2 / clause 8 | **REVERSED.** `10m` is a native fold frame |
+| *"Adds an `M10` variant, or moves `TF_COUNT`"* / *"Adds a `TfIndex` variant, or changes `TF_COUNT`, to serve `10m`"* | the §2026-09-18 and §2026-09-19 REJECT lists | **LIFTED for `M10` alone.** Any OTHER new frame stays a REJECT without its own quote |
+| *"`10m` remains a VIEW over `candles_1m`"* | §2026-09-19 nine-frames narrowing | **REVERSED** |
+| The `ticks_named` / `candles_named` / `market_depth_named` console views | `console_views.rs` since 2026-08 | **RETIRED.** The name lives in the table itself |
+
+The §2026-09-18 "zero added per-tick work" reasoning is not ignored — it is
+priced and accepted: see the cost table below.
+
+#### The contract (LOCKED)
+
+| Aspect | Locked value |
+|---|---|
+| Views the app creates | **NONE.** `console_views.rs` creates no view. Boot issues `DROP VIEW IF EXISTS` for the four retired names (`ticks_named`, `candles_named`, `candles_10m`, `market_depth_named`) BEFORE any table DDL, so a box that still carries them converges and a `candles_10m` VIEW can never block the `candles_10m` TABLE |
+| `candles_10m` | a real table, same 22-column schema, same DEDUP key and DAY partitioning as every other `candles_<tf>`, written by the fold |
+| `TfIndex::M10` | **APPENDED** at ordinal **9** — never inserted. Appending renumbers nothing, so every seal-spill record already on disk still decodes to the frame it was written for, and no spill-format bump is needed |
+| `TF_COUNT` | **9 → 10** |
+| 10m grid | anchored at the candle session open (09:00 IST), like M30/M60: 09:00, 09:10, … — `600 % 900 != 0`, so it cannot share the 15-minute-aligned grid |
+| Name column | every market-data table carries a human-readable name for the instrument in the row: `candles_<tf>` and `top_volume_<tf>` already have `contract`; `ticks` and `market_depth` gain it; instrument-bearing audit tables gain it where they carry a `security_id` |
+| Name resolution cost | one O(1) hash probe per sealed bar / per tick row / per depth PACKET (never per depth level), pre-interned labels, zero allocation. An unknown id writes NULL, never a guessed name |
+
+#### Honest cost, stated rather than absorbed
+
+| Quantity | Before | After |
+|---|---:|---:|
+| Fold frames updated per tick | 9 | **10** (+11%) |
+| Seal ring capacity (`AGGREGATOR_MAX_SLOTS × TF_COUNT`) | 225,000 | **250,000** |
+| `candles_10m` rows per session | 0 (a view) | ~1/10th of `candles_1m` |
+| `market_depth` bytes per row for the name | 0 | +4 (a SYMBOL key) — on ~1.5 B rows/session ≈ **+6 GB/session** of disk |
+| `ticks` bytes per row for the name | 0 | +4 ≈ +0.3 GB/session |
+
+The depth figure is the one that matters: depth is ~80% of the disk burn, so
+this is roughly a **+5%** burn increase. It is the price of reading a depth row
+without a join, and the operator asked for exactly that.
+
+#### ⚠ What is LOST
+
+The three joined master fields the `_named` views added — `symbol_name`,
+`display_name`, `instrument_type` — are not copied into every row. `contract`
+carries the readable label; the fuller master fields stay one join away in
+`instrument_lifecycle`. The 10m view's `sum(abs(volume))` derivation, and the
+separate day-partitioned sign it computed, are replaced by the fold's own
+per-frame sign, which uses the same previous-close-of-the-same-frame rule and the
+same same-IST-day baseline refusal.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Creates any `VIEW` in the app, a boot script, or `questdb-init.sh`.
+- Removes the `DROP VIEW IF EXISTS` pre-step (an old box's `candles_10m` view
+  would then block the table forever).
+- Inserts `M10` at any ordinal other than the end, or bumps the spill format for
+  an append.
+- Adds any frame other than `M10` under cover of this quote.
+- Resolves a name per depth LEVEL, allocates while resolving it, or writes a
+  guessed name for an unknown instrument.
+- Claims any of this has been accepted by a live QuestDB before a boot has run.
+
+### 2026-09-22 (THIRD) — `ticks` drops `exchange_timestamp`; `received_at` is the FIRST column and `ts` the SECOND
+
+**The verbatim operator demand (2026-09-22, typed directly in-session — preserve EXACTLY, typos included):**
+
+> "See in ticks tavle I clealry told you to remove exchange timestamp and even I asked you to put received at as the first column and then ts second right dude do this change also bro okay?"
+
+Recorded HERE before the code, per the rule-file-first law.
+
+#### What changes
+
+| Surface | Before | After |
+|---|---|---|
+| `ticks` column order | `feed, segment, security_id, … , exchange_timestamp, received_at, payload_hash, capture_seq, ts` | **`received_at, ts, contract, feed, segment, security_id, …, payload_hash, capture_seq`** |
+| `contract SYMBOL` | absent | **ADDED** — the option's name (`NIFTY-25Sep2026-24500-CE`) from the same once-a-day table the candle writer reads, per the operator's earlier 2026-09-22 ask *"put either contract or symbol name right in each and every table"*. One lock-free load + one hash probe per row, zero allocation. NULL (never guessed) for spots, indices and futures — the table is built from option rows only. `market_depth` deliberately does NOT get it in this change: about 1.5 billion rows a session on the one write path QuestDB already cannot keep up with, so that cost goes to the operator first |
+| `exchange_timestamp LONG` column | written on every row | **REMOVED** — from the CREATE, the self-heal column list, the ILP write, `TickRow`, `scripts/questdb-init.sh` and the console runbook |
+| Designated timestamp | `ts` | `ts` — **UNCHANGED** |
+| DEDUP key | `(ts, security_id, segment, capture_seq, feed)` | **UNCHANGED** |
+| How `ts` is computed | `row_timestamp_ist_nanos(LTT, received_at)` | **UNCHANGED** |
+
+QuestDB cannot reorder or drop a column on an existing table, and the self-heal is `ADD COLUMN IF NOT EXISTS`, which can only add. The new order therefore takes effect **only when `ticks` is recreated**. `ticks` is already in `fresh_start_reset::RESET_TABLES`, and that reset has never run in production (the module is not on `main`), so the first boot of this build drops and recreates `ticks` in the new shape. An older volume that somehow keeps its `ticks` keeps the old column (never written again, NULL on new rows) — harmless, never wrong.
+
+#### ⚠ What is LOST, and the query that recovers most of it (Rule 11)
+
+The column held the vendor's raw last-trade time verbatim. Two things it answered:
+
+1. **"When did this trade happen?"** — still answered by `ts`, which IS that time for every in-band trade. Nothing lost.
+2. **"Is this row a real print, or a never-traded / garbage stamp?"** — `row_timestamp_ist_nanos` stamps a sentinel (LTT below 2020) or out-of-band (above the ceiling) row with its RECEIPT time instead. Before, the raw sentinel stayed visible in `exchange_timestamp`. Now it is not stored.
+
+**Recovery without the column:** a real trade's `ts` is a whole second (Dhan stamps whole seconds), while a fallback row's `ts` equals `received_at` to the nanosecond. So
+
+```sql
+-- rows whose stamp was a sentinel / out-of-band, i.e. NOT a real trade time
+SELECT * FROM ticks WHERE ts = received_at;
+```
+
+isolates them. The only way a real print could match is if the receipt instant were itself an exact whole second equal to the trade second — about one in a billion per row, since receipt carries nanoseconds and is back-dated by ring dwell. **NOT recoverable:** the raw sentinel VALUE itself (e.g. which garbage number the vendor sent). Nothing downstream reads it; the aggregator's refusal counters (`tv_aggregator_tick_refused_total{reason}`) still count every class.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Re-adds `exchange_timestamp` (or any raw-LTT column) to `ticks` without a fresh dated quote.
+- Changes the designated timestamp, the DEDUP key, or `row_timestamp_ist_nanos`'s fallback under cover of this change.
+- Reorders the CREATE without keeping `received_at` first and `ts` second.
+- Removes `ticks` from `RESET_TABLES` before the reset has run once in production (the new order would then never apply).
+
+### 2026-09-22 (FOURTH) — the fast-lane silent-loss closures, and the drain loses its last database write
+
+**The verbatim operator demand (2026-09-22, typed directly in-session — preserve EXACTLY, typos included):**
+
+> "Dude meanwhile eveen entilrey related to this dhans fast lane also ensure to fix and resolve everything dude especially to achieve O(1) dude okay? See because we always need to achieve this dhans super fast lane dude see we need to use our entire Aws instance including Unix Linux sockets pinning core affinity reading modifying enhancing adjusting pinning ram memory app db pressure wal ring bugger etc etc etc etc etc everything entirely to achieve the extreme super fast lane to always achieve O(1) dude okay?"
+
+> "Try to attack evrythign to find all kinds of extreme worst case eprmuations and combinations as well"
+
+Given in DIRECT response to a message that ENUMERATED the four ways the lane can still lose ticks without paging anyone, plus the reader/writer split and moving the `top_volume` append off the drain, and said each was designed but not yet built. That is the §28.2/§28.3 authorization shape this repository already accepts. It is also the dated line the 2026-09-13 correction above requires before the `top_volume` append moves off the frame drain (*"Moving it off the drain changes the data flow of a scope-locked module, so it needs its own dated line here first"*). Recorded HERE before any code.
+
+#### What this authorizes
+
+| # | Change | Why it is a silent-loss or stall path today |
+|---|---|---|
+| 1 | **An in-session restart dials sooner.** The boot WAL catch-up keeps its 300 s budget outside the capture window and takes a SHORT budget inside it; whatever is left stays a `*.wal` file for the next out-of-session boot | The catch-up runs BEFORE the sockets dial. A restart at 10:30 with a backlog kept all sixteen sockets dark for up to five minutes, and Dhan has no snapshot-on-subscribe and no sequence number, so those ticks are gone at source |
+| 2 | **An unknown packet code no longer discards the rest of its frame** when the vendor's own `message_length` stamp is plausible AND the header it points at decodes cleanly. Otherwise the existing abandon-and-count behaviour stands | One unlisted code threw away every packet stacked after it, including a disconnect packet |
+| 3 | **The fresh-start reset never destroys rows written after this build first booted.** Such a table is RENAMED aside instead of dropped; names in the view list are always dropped with `DROP VIEW IF EXISTS` | A reset refused mid-session let the day write into the old tables, and the next boot dropped them |
+| 4 | **The WAL AGE prune keeps any segment the applied watermark has not passed.** The BYTE-cap prune stays as the disk-full last resort, and when it deletes an unapplied segment that is counted and logged | The prune never consulted the watermark, so shed frames could be deleted before any replay reached them |
+| 5 | **The `top_volume` per-row ILP append leaves the frame drain** and runs on the writer thread that already owns the flush | MEASURED 14,932 µs at the ceiling, on the task that reads ticks |
+| 6 | **The socket reader no longer waits on a depth swap's wire writes** | A swap or top-up held the reader for up to ~2 s (per swap) to ~6 s (per top-up) while the kernel receive buffer filled |
+| 7 | **Flush-path counters are resolved once, and ILP buffers are recycled** instead of allocated per flush | Allocation and label-keyed map probes on the persistence path |
+
+#### ⚠ What this does NOT authorize, and two items it deliberately leaves out
+
+- **No new CloudWatch alarm, EMF name or Telegram page.** The September forecast is $142.24 against a $135.00 automatic `STOP_EC2_INSTANCES` line, and §2.3n of the noise lock requires a LEVER, not a cost note. Every new counter here is local `/metrics` plus a coded log line. Paging on abandoned bytes or on a reset refusal needs its own dated row in `dhan-rest-only-noise-lock-2026-07-14.md` with a lever.
+- **`MemoryHigh=20G` is NOT lowered.** An audit recommended 16G. The unit file records why 20G is load-bearing: a 21 GB spill read whole drove RSS to 20.96 GiB and the watchdog SIGABRTed a working process every ~9 minutes; 15G re-enters that loop. The audit was wrong on this point and is recorded as wrong rather than acted on.
+- **No instance, volume, IOPS or core-count change.** A separate volume for the WAL and spill tiers, or a larger instance so QuestDB and the app get disjoint cores, are money decisions for the operator.
+- No change to the socket budget (16), the four endpoint types, the subscription set, `dry_run`, or the §28 frozen area.
+
+#### ⚠ Honest envelope
+
+Per tick and per lookup the lane stays O(1) and allocation-free (DHAT-gated). NOT claimed: that a restart is now free — the short in-session budget shortens the blind window, it does not remove it, and anything the WAL did not capture is not recoverable by anyone. NOT claimed: that an unknown packet is now always recovered — the skip trusts a vendor length stamp whose semantics are still UNVERIFIED-LIVE for every code, which is why it is gated on the next header decoding cleanly and falls back to abandoning. NOT claimed: that the byte-cap prune can never delete unreplayed frames — on a full disk it must, and it now says so.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Skips an unknown packet on its length stamp alone, without validating the header it lands on.
+- Drops a table in the fresh-start reset that holds a row newer than the build's first boot.
+- Makes the byte-cap prune respect the watermark unconditionally (turns a pruned backlog into a full disk).
+- Lengthens the in-session catch-up budget back toward 300 s.
+- Adds an alarm, EMF name or page for any of the above without a lever.
+- Lowers `MemoryHigh` below 20G citing this section.
+
+### 2026-09-22 (FIFTH) — the contract name reaches spots, indices and `market_depth`; the last "your call" rows are closed
+
+**The verbatim operator demand (2026-09-22, typed directly in-session — preserve EXACTLY, typos included):**
+
+> "Dude I don't want any gaps or partial or any issues dude I clealry told you to fix and resolve everything dude and then merge and deploy it as well dude okay?"
+
+Given in DIRECT response to a published comparison page whose rows included, verbatim, *"Contract name on spot / index ticks — Gap — Those rows leave the name blank today"* and *"Contract name on market_depth — Your call — About 1.5 billion rows a session: adding a text column there costs real disk. Held until you decide."* The operator was shown both rows with their cost and answered "no gaps". That is the §28.2/§28.3 authorization shape, and it is the operator decision the (SECOND) section above said `market_depth` was waiting for. Recorded HERE before the code.
+
+#### What this authorizes
+
+| # | Change | Cost, stated |
+|---|---|---|
+| 1 | **Spot and index rows carry a name.** The day's mapping-artifact symbol map is turned into `(security_id, segment) -> symbol` for IDX_I / NSE_EQ / BSE_EQ only and merged into the SAME name table the candle and tick writers already read. Published at boot (if-empty, so it can never wipe option names) and again with the options at contract attach | Zero per-row cost change: the same one load + one hash probe per row already paid for options |
+| 2 | **`market_depth` gains `contract SYMBOL`.** Filled from the same table, resolved once per depth PACKET (never per level) and handed to every level row as a borrowed `&str` | Disk: a SYMBOL column is stored as a 4-byte key, ~1.53 B rows x 4 B = **~6 GB per session**, about 5.5% of the ~110 GB logical depth rows. ILP wire: each depth row now carries the name text (~20-25 bytes) to QuestDB — roughly **+25-30% of depth ILP payload**. That load lands on the depth WRITER THREAD, which has been off the frame drain since 2026-08-28, so a slower depth write backs up into the depth spill tier (recoverable), not into tick loss |
+
+#### ⚠ Honest envelope
+
+A name is never fabricated: an id absent from both the symbol map and the option table still writes NULL. Futures carry no name (they are no longer subscribed). The mapping artifact is written by the 08:30 daily rider; a boot that finds no artifact publishes nothing and the column stays NULL until the attach. NOT claimed: that the extra depth ILP bytes are free — they are the one real cost here and the depth spill counters are the read-out. NOT claimed: any dollar change — none (no instance, volume or IOPS change).
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Resolves the depth name per LEVEL instead of per packet (200x the probes on depth-200).
+- Allocates the name per row (`to_string`, `format!`) instead of borrowing it from the published snapshot.
+- Lets the boot publish REPLACE a non-empty table (wipes option names mid-session).
+- Gives a derivative id a spot's name because the numeric ids match (I-P1-11).
+- Adds `contract` to any DEDUP key — it is a label, never part of identity.
+
+### 2026-09-23 — DEPTH-200 IS STOCK OPTIONS AT EVERY STAGE, INCLUDING THE BOOT DIAL AND THE PRE-RANKING MINUTES
+
+**The verbatim operator demand (2026-09-23, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "i celalry told you to pick one and only stocks otpions for depth 200 right dude am i rgith dude tell me dude okay? why index options got subscribed dude why?"
+
+> "Dude I don't want any gaps or partial or any issues dude I clealry told you to fix and resolve everything dude and then merge and deploy it as well dude okay?"
+
+He is right, and the 2026-09-06 lock already said so. What it never reached was
+the part of the lane that runs BEFORE the volume ranking exists. Recorded HERE
+before the code, per the rule-file-first law.
+
+#### What actually put index options on the depth-200 sockets on 2026-09-23 (MEASURED)
+
+The 2026-09-06 lock made the RANKED steering stock-options-only. Three older
+paths around it were never converted, and together they dialed NIFTY and
+BANKNIFTY at-the-money contracts every morning:
+
+| # | Path | What it did |
+|---|---|---|
+| 1 | Boot dial — `select_depth_universe` | filled sockets 0–3 with NIFTY + BANKNIFTY ATM CE/PE pairs (`DEPTH_200_PRIORITY_UNDERLYINGS`) — the 2026-08-26 layout the 2026-09-06 lock retired |
+| 2 | Seed back-fill — `seed_first` | filled any slot the seed left empty from the dial's own choices, i.e. from path 1 |
+| 3 | Pre-ranking steering — `plan_minute` | the at-the-money tracker re-centred the pool on index pairs every minute until the first ranking published |
+
+The 2026-09-08 section already named path 1 as "still NOT delivered" (item 2:
+*"the boot dial still selects index at-the-money contracts for depth-200"*).
+This section is the delivery.
+
+A fourth defect sat underneath and made it worse: the movers query returned the
+lifecycle master's `symbol_name` — the COMPANY name (`Reliance Industries`) —
+while the option chain is keyed on the TICKER (`RELIANCE`). Every stock-mover
+lookup therefore found no ladder, so the stock side of every engine that joins a
+mover to its options came back empty. That is fixed in the same change (the
+movers queries now select `underlying_symbol`).
+
+#### The contract (LOCKED)
+
+| Stage | Before | Now |
+|---|---|---|
+| Boot dial | 4 index ATM legs + 1 top-mover stock leg | **up to 5 stock-option ATM legs, one per DISTINCT underlying**, taken from today's movers ranked by the absolute percentage move; the leg follows the direction (call on a riser, put on a faller) |
+| Fewer than 5 movers available (pre-open, flat morning) | index legs filled the gap | **the gap stays empty** and the attach loop's existing top-up (`depth_200_delta`) fills it on a later attempt. An empty socket is honest; an index option is the defect |
+| Seed back-fill | back-filled from index legs | back-fills from the stock-only boot set (the seed itself was already stock-only) |
+| Pre-ranking minutes | index ATM engine re-centred the pool | **the pool HOLDS** until the first volume ranking publishes |
+| After the first ranking | ranked steering | UNCHANGED |
+
+`select_depth_universe` still computes its depth-200 pair set, and that output
+is no longer dialed. It is left in place rather than deleted because its tests
+pin the pair and refusal logic the depth-20 half still shares; its depth-200
+output carries a dated note saying it is not a dial source.
+
+#### ⚠ Honest envelope
+
+- **Before ~09:07 no stock option can be chosen.** Equities first print at the
+  09:07 auction, and a mover needs a percentage move. So from the 09:00 boot
+  until the first movers exist, depth-200 carries NOTHING. That is the price of
+  "stock options only" and the operator chose it; the old dial filled those
+  minutes with index books he did not want.
+- **A thin stock-option book may be sparse.** The 2026-09-06 lock already
+  records this (FINNIFTY at 800 rows/minute against NIFTY at 100,800). It is
+  unchanged by this section.
+- **Distinct underlyings are guaranteed within one attempt, not across
+  attempts.** If the leading movers change between two attach attempts, the
+  top-up can add a second contract of an underlying the first attempt already
+  dialed. The ranked steering, which enforces distinct underlyings, takes over
+  within a minute of the first ranking and corrects it.
+- **The unsubscribe code is still ignored by the vendor** (2026-09-10/11
+  sections). Unchanged here.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Dials any `IdxI` instrument or any index option (`OPTIDX`) on a depth-200
+  socket at any stage — boot, seed back-fill, top-up, steering or probe.
+- Back-fills an empty depth-200 slot with an index leg to "use the socket".
+- Restores the at-the-money engine as the pre-ranking fallback for depth-200.
+- Joins a mover to its option ladder on the company name rather than the ticker.
+- Changes the socket budget (5) under cover of this section.
+
+#### 2026-09-23 (same day) — depth-200 ranks off the 3-SECOND board, not the 5-second one
+
+**The verbatim operator demand (2026-09-23, typed directly in-session — preserve EXACTLY, typos included):**
+
+> "see emanwhile i clealry told you to pick first 3 seconds top volume right i mean top 5 dude wsee even here also where it needs to be top 5 unique undelryiogn contarcts dude i mean if the tocks otpions is ltf different contarcts 5 of them emans then it shoudl pick top alone only that too always different different unique undelrying security id rogth dude am i rgith dude tell me dude okay?"
+
+**What changes:** the depth steering candidates (`wants_candidates` in
+`dhan_feed_stack.rs`) are published from the **3-second** stock-option
+board instead of the 5-second one. Both pools read that one publish, so
+depth-20's ranked list moves to the 3-second board with it.
+
+**What does NOT change, and why it is safe:**
+
+| | Before | After |
+|---|---|---|
+| Board the list is ranked from | 5 s | **3 s** |
+| How often the list is refreshed | every 5 s | every 3 s |
+| How often the sockets are CHANGED | once a minute | **once a minute — unchanged** |
+| Distinct underlying rule | top 5 distinct underlyings | **unchanged** |
+| Exit band | 20 underlyings | unchanged |
+
+The swap budget does not move, because the sockets are still re-steered
+once a minute from whatever list is newest. The distinct-underlying rule
+the operator restated ("if LTF has 5 different contracts in the top 5, keep
+LTF's top one only, then the next different underlying") is exactly what
+`distinct_underlying_over` already does, and is pinned by
+`rank_distinct_underlying`'s multi-strike test.
+
+**Honest cost:** a 3-second window holds 40% less trading than a 5-second
+one, so a thin stock option's rank moves more from one list to the next.
+The 20-underlying exit band absorbs that; if `tv_depth200_ranked_swaps_total`
+rises toward the per-minute cap, the band is the lever, never the board.
+
+**REJECT:** gating the candidate publish on the 1-second or 1-minute board;
+applying the list more than once a minute; dropping the distinct-underlying
+pass.
+
+### 2026-09-23 (THIRD) — a REPLAYED tick from an earlier session is written back, not discarded
+
+**No new scope is claimed.** The operator's standing demand is that not one captured tick is lost (*"I don't want any gaps or partial or any issues"*, 2026-09-23). This section NARROWS one REJECT row of the 2026-09-10 section ("Returns `stale_trading_day` or `future_trading_day` to the candle-only set") and is recorded BEFORE the code.
+
+#### The case, and why the 2026-09-10 rule never meant it
+
+The fold raises `stale_trading_day` for two different facts, and the 2026-09-23 `receipt_day_mismatch` qualifier already tells them apart:
+
+| Shape | Exchange day vs receipt day | What it is | Verdict |
+|---|---|---|---|
+| Connect snapshot of a dormant contract | exchange = yesterday, receipt = today | a back-dated last-trade time | **HARD refusal — the 2026-09-10 rule, UNCHANGED** |
+| WAL replay of a frame captured yesterday | exchange = receipt = yesterday | a real tick, captured the day it traded, never applied | **was HARD → now CANDLE-ONLY: the row is written, the bar is skipped** |
+
+The 2026-09-10 rule exists to stop a row whose `ts` would silently amend a closed day **it was not captured on**. The second row was captured ON that day. Writing it puts it in the partition it always belonged to; `ticks` DEDUP (`ts, security_id, segment, capture_seq, feed`) makes the write idempotent if the live path already landed it. Refusing it was real, permanent loss that `WS-SPILL-01` correctly paged on.
+
+#### Contract (LOCKED)
+
+| Aspect | Value |
+|---|---|
+| Qualifies | `stale_trading_day && !receipt_day_mismatch && received_at_nanos > 0` |
+| Row | written, under its own exchange-day `ts` |
+| Bar | skipped — folding it would rebuild a closed day's bar from a partial subset and UPSERT over the complete one (the reason the watermark seed exists) |
+| Leaderboard | not ranked (candle-only returns before it) |
+| No receipt (pre-TVW3 frame) | STAYS HARD — without a receipt the capture day is unknown, and the watermark is the only day guard left |
+| Connect snapshot (`receipt_day_mismatch`) | STAYS HARD — unchanged |
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Writes a `receipt_day_mismatch` tick, or a no-receipt stale tick.
+- Folds the replayed prior-session tick into a bar.
+- Ranks it on the volume board.
+- Moves `future_trading_day` to the candle-only set under cover of this row.
+
+### 2026-09-23 (FOURTH) — a REPEATED quote packet is not a trade; and the `fold_late_hlc` stamp row above is CORRECTED, not broken
+
+**The verbatim operator demand (2026-09-23, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "see mean while can you track capture montor audit log visualise dashbaord expeiclaly related to open latency claose latency window span latency and even whetehr our websocket latencies any latencies dude see ebcause these lkatencies are nowhere accepatbel rigth dude"
+
+Recorded HERE before the code lands, per the rule-file-first law. It changes how
+the candle fold treats one kind of packet and nothing else.
+
+#### What was measured, and why it was wrong
+
+Dhan's `LTT` is the LAST TRADE time, and a Full/Quote packet is re-sent whenever
+the book or the open interest changes — carrying the OLD trade time, the OLD
+price and the OLD day-cumulative volume. Until now every copy was folded as a new
+trade. MEASURED on the box, 2026-09-23 session:
+
+| Effect of folding a repeat | Consequence |
+|---|---|
+| `tick_count` rose | a bar claimed trades that never happened |
+| `last_receipt_ist_nanos` widened | `close_latency` measured the last BOOK update, not the last trade — **64,585 one-minute bars over 60 s, worst ~113 minutes** |
+| a sealed bar was re-emitted as `AmendedLate` | a finished bar was rewritten for a trade it already held |
+
+#### The rule (LOCKED)
+
+A packet is a **repeat** when ALL of these hold, evaluated ONCE per tick above the
+timeframe loop:
+
+| Condition | Why |
+|---|---|
+| the slot's volume baseline is seeded | the first packet can never be a repeat |
+| `fold_secs == last_trade_ts` | same exchange trade time |
+| `cumulative_volume == last_cumulative` | no new volume — a real trade inside the same second raises it |
+| `last_ltp` bits equal the packet's LTP bits | a different price is a different print; an index (volume always 0) is told apart by price alone. NaN never equals itself, so an unset `last_ltp` can never match |
+| `observe_session_extremes` reported nothing | a moved exchange day high/low is evidence of a print we never received — that packet is FOLDED |
+
+A repeat calls `AggregatorCell::refresh_repeat_quote` for every timeframe, which
+updates ONLY `oi`, `total_buy_qty` and `total_sell_qty` on the bucket the trade
+belongs to (a zero is "absent", never "now zero"), then returns. It never counts
+a tick, never moves a price or volume, never widens a receipt stamp, never
+reopens a bucket and never amends a sealed one. Counted on
+`tv_candle_repeat_quote_total` — **local `/metrics` only**: no EMF name and no
+alarm, because the budget sits at 93% of the $150 limit and §2.3n of
+`dhan-rest-only-noise-lock-2026-07-14.md` requires a lever for the next name.
+
+O(1): four integer/bit compares per tick, plus one bounded loop of `TF_COUNT`
+field writes on the repeat arm only. Zero allocation.
+
+#### ⚠ CORRECTION — the `fold_late_hlc` rows in the 2026-09-19 section are stale
+
+The table row *"`fold_late_hlc` | deliberately does NOT move the stamps"* and the
+REJECT row *"Makes `fold_late_hlc` move the stamps: it amends a bar already
+written and re-emits only that bar, so the moved figure would reach no row"* are
+**superseded**. Their premise was false: the late path re-emits the amended bar
+as `AmendedLate`, the writer recomputes the three delay columns FROM that bar,
+and the DEDUP upsert replaces the earlier row. So the moved figure DOES reach a
+row, and leaving the stamps alone would persist a close that moved on a tick
+received N seconds after the window while `close_latency` still claimed
+everything arrived in time. The code was corrected on 2026-09-22 and is pinned
+by `aggregator_cell::a_late_tick_widens_the_amended_bars_last_receipt`; this
+file was not. The widening STANDS.
+
+**The two changes compose.** Most of what used to reach `fold_late_hlc` after a
+seal was a repeat. Those now stop at the repeat check, so a late widening is left
+only for a genuinely late TRADE (new volume or a new price), which is exactly the
+case where widening is honest.
+
+#### ⚠ What this does NOT claim
+
+- That close latency is now small. It removes the repeats' inflation; a real
+  late trade still widens its bar, and delivery lag from the vendor is untouched.
+- That every repeat is caught. A repeat that also carries a moved session
+  extreme is folded on purpose — rare, and it costs at most one `tick_count`.
+- That this is measured live. The first session on this build is the
+  measurement: compare the day's close-latency p99 and `tv_candle_repeat_quote_total`.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Folds a repeat as a trade, or lets a repeat widen a receipt stamp.
+- Drops any of the five conditions (each one guards a real print from being
+  swallowed — the same-second extra unit, the index price move, the moved
+  session extreme).
+- Compares the price with `==` on floats instead of bits (NaN would then need
+  its own guard, and one day it would not have one).
+- Adds an EMF name or alarm for `tv_candle_repeat_quote_total` without a lever.
+- Restores the "does NOT move the stamps" wording for `fold_late_hlc`.
+
+### 2026-09-23 (FIFTH) — a REPEATED quote no longer counts as delivery lag
+
+**No new authorization is claimed.** This applies the (FOURTH) section's repeat
+rule to one more consumer, under the same operator quote (*"...even whetehr our
+websocket latencies any latencies dude..."*). Recorded HERE before the code
+lands, per the rule-file-first law.
+
+#### The defect
+
+`tv_dhan_ws_lag_ms` measures `receipt − LTT`. For a real trade that is delivery
+lag. For a REPEATED quote (the book or OI moved; the trade time, price and
+cumulative volume are unchanged) it measures **how long the instrument has been
+quiet**, which can be many minutes on a thin option. Each repeat was recorded as
+lag. MEASURED 2026-09-23: median about 1 s, p90 about 10 s. The p90 was the
+repeats, not the network. The day's scoreboard lag distribution is filled at the
+same call site, so it was inflated the same way.
+
+#### The rule (LOCKED)
+
+- The lag is recorded **after** the fold, from the fold's own verdict. The drain
+  no longer runs its own session or repeat test.
+- `IngestOutcome::Folded { repeat_quote: true, .. }` → NOT recorded. It is counted
+  on `tv_dhan_ws_lag_excluded_total{reason="ltt_not_advanced"}`.
+- Every other outcome records exactly as before.
+- Exactly ONE `record_ws_lag(frame.connection_index` site exists, and it sits
+  after the fold call. Pinned by
+  `test_record_ws_lag_repeat_excluded_counts_a_repeated_quote_and_skips_the_lag_histogram`.
+- O(1): one enum match and one pre-resolved counter increment. No allocation.
+
+#### ⚠ Visible side effect on an existing CloudWatch series
+
+`tv_dhan_ws_lag_excluded_total` is already EMF-selected. The EMF processor sums
+it per host and does not break it down by `reason`. It is not alarmed and not
+charted. From this build on, its summed value rises by the day's repeat count,
+which can be large. **That rise is the fix working, not a new fault.** No new EMF
+name and no new alarm were added (budget at 93% of the $150 limit; §2.3n requires
+a lever).
+
+#### ⚠ What this does NOT claim
+
+- That delivery lag is now small. Real trades are measured exactly as before.
+- That every repeat is excluded. A repeat whose packet is refused out of session,
+  or stamped on a stale trading day, never reaches the repeat check. It is still
+  recorded. In the continuous session it is rare.
+- A true same-second second trade (new volume or a new price) is NOT a repeat and
+  still counts. That is correct.
+- That this is measured live. The first session on this build is the measurement.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Records the lag before the fold, or adds a second lag call site.
+- Re-derives the repeat test in the drain instead of reading the fold's verdict.
+- Adds an EMF name or alarm for the excluded counter's `reason` split without a lever.
+
+### 2026-09-23 (SIXTH) — ARM THE DEPTH-200 UNSUBSCRIBE PROBE; on a failing verdict, email Dhan and prepare the MadeForTrade post
+
+**The verbatim operator demand (2026-09-23, typed directly in-session, with the
+current Dhan PDFs dated 9/11/26 attached — preserve EXACTLY, typos included):**
+
+> "dude for depth 200 as of now you need to chekc the unsubscribe dude and only then if it doesnt work we need to trigegr an email adn even mesage in madefortrade also dude okay? becuase they told unsubscribe but if it doesnt worj we need to notify and find it out the issues dude espeicllay focusing on resusbcribe dude okay?"
+
+This is the fresh dated quote the 2026-09-12 section's REJECT list requires in
+two places: before the probe is ARMED on a live session, and before an email to
+Dhan is sent from its result. Recorded HERE before either happens.
+
+#### What the vendor documents, re-read from the attached PDFs
+
+| Source (dated 9/11/26) | What it says |
+|---|---|
+| Full Market Depth guide | subscribe = `23`; the only other code shown is `12` (Feed Disconnect — closes the whole socket). No per-instrument unsubscribe example. |
+| Annexure, Feed Request Code | `25` = Unsubscribe — Full Market Depth. The table skips `24`. |
+
+So `25` stays the code we send (the 2026-09-11 SECOND section, unchanged). The
+probe answers whether Dhan acts on it.
+
+#### What this authorizes
+
+| # | Authorized | How |
+|---|---|---|
+| 1 | Arm BOTH probe arms on the live box, from the next trading session | an on-box `[depth_unsubscribe_probe]` block in `/opt/tickvault/config/local.toml`, written by SSM AFTER the evening deploy. **`config/base.toml` stays all-false** — `every_probe_flag_ships_off` is unchanged and still binds. Every deploy's `cp -f repo/config/*.toml` overwrites the on-box file, so a deploy DISARMS it: the fail-safe direction. |
+| 2 | Keep it armed across days until one run is CONCLUSIVE | the day latch still caps it at ONE run per trading day; an inconclusive day simply tries again the next day |
+| 3 | Disarm after a conclusive verdict | restore the on-box `local.toml` from the repo copy by SSM |
+| 4 | On a conclusive `ignored` from either arm: SEND the support email | update `docs/dhan-support/2026-09-13-depth-unsubscribe-ignored.md` with the run's real evidence, commit it, then send one email to `apihelp@dhan.co` from the operator's Gmail carrying the GitHub link (the README workflow). One email per conclusive finding, never per day. |
+| 5 | On a conclusive `ignored`: PREPARE the MadeForTrade post | paste-ready text only. MadeForTrade has no API this repository can call; **the operator posts it**. |
+| 6 | Resubscribe focus | Arm B (close → re-dial → replay without the contract) IS the resubscribe path, and every Arm A run ends with a RESTORE (re-subscribe) whose outcome is logged as `probe_restore_ok` / `probe_restore_failed`. The ticket reports both. |
+
+#### What each outcome triggers
+
+| Arm A (code 25) | Arm B (close + redial + replay) | Meaning | Action |
+|---|---|---|---|
+| `honoured` | `honoured` | Dhan acts on 25. The ghost stream is OUR bug. | No email. Open the in-repo investigation. |
+| `ignored` | `honoured` | 25 is ignored; a fresh connection's replay does stop the stream. | **Email + post.** Ask for the supported per-instrument stop. |
+| `ignored` | `ignored` | Even a new connection keeps streaming a contract it never subscribed. | **Email + post**, marked urgent. |
+| `honoured` | `ignored` | Strange: the close failed where the code worked. | Email + post, plus a repo investigation of the replay. |
+| any inconclusive | — | The probe declined to answer. | No email. Stay armed; next day retries. |
+
+#### ⚠ Honest envelope
+
+- **A thin stock-option book can make a day inconclusive.** Depth-200 carries
+  stock options only (2026-09-23 section above), and the verdict needs the
+  contract to have printed during the 60-second baseline. An
+  `inconclusive_thin_book` morning costs nothing and retries.
+- **The box does NOT send the email.** No mailbox credential exists on the box
+  and none will be added. The session reads the verdict from CloudWatch and
+  sends from the operator's Gmail. If no session is running that morning, the
+  verdict waits in the log; nothing is lost.
+- **One run is one data point** on one account at one time of day
+  (2026-09-12 Part 6, unchanged).
+- **`RequestCode 12` is still untested.** It closes the whole socket, which Arm
+  B already does as a close.
+
+#### What a PR or action that violates this section looks like (REJECT)
+
+- Sets any probe flag `true` in a COMMITTED config file.
+- Sends the email on an inconclusive verdict, or more than once per finding.
+- Sends it without the committed, evidence-filled support draft it links to.
+- Auto-posts to MadeForTrade by any means.
+- Arms the probe inside 09:00–15:45 IST by restarting the app (arming is a file
+  write; it takes effect at the next boot, never by a restart in session).
+
+### 2026-09-24 — DEPTH-20 IS A STATIC DAY SET; DEPTH-200 ROTATES BY RECONNECT, ONE SOCKET AT A TIME
+
+**The verbatim operator demand (2026-09-24, typed directly in-session — preserve
+EXACTLY, typos included):**
+
+> "see i clelry told you to pick entire fno undelryign stocks as the fixed once at 9 am itslef tis finailised til leod right dude meanwhiel for nifty and abnknfity aloen once rpe market is finalsied alone only then we ened to makr up either atm plus or minus 3 or 4 right dude til leod roght to fill up the entrie 250 slots right so that our depth 20 entire day shdou leb completely fixed static right dude am i irght dude but only for depth 200 alone for the first 3 seocnds based on top volume top volume 3 seconds based on timestamo asc and volume percnetage change descendign opick the otp 5 udnique underlyign secuirty id resoective stocks otpions cntarct right dude am i irght bro then startign 9.16 am onwards same process shdou lbe repeated but nwo base done. evry top volume 1 min it hsodu lbe reocnencted right dude of top 5 right dude because till now dhan ahsnt confirmed about unsunscirbe right dude am i rigth dude tell me dude okay?"
+
+**The authorization (same session):**
+
+> "See fix and resolve and build and implement everything entilrey dude why stopping dude why"
+
+Recorded HERE before any code, per the rule-file-first law.
+
+#### What this SUPERSEDES
+
+| Surface | Was (2026-09-11 THIRD/FOURTH, 2026-09-13) | Now |
+|---|---|---|
+| depth-20 selection | top-6 mover name board, re-planned every minute | **STATIC for the day**: every F&O underlying NSE_EQ spot (~208) from the 09:00 attach, plus NIFTY + BANKNIFTY options ATM ±k (k ≤ 4) once the pre-open price is final (≥ 09:12) |
+| depth-20 per-minute steering | name board, then ranked contract list | **REMOVED** — no depth-20 swap, no depth-20 unsubscribe, all day |
+| depth-20 index futures | none (2026-09-18 THIRD) | none — unchanged |
+| depth-200 ranking | 3 s board, applied once a minute | 3 s board for the FIRST ranking (~09:15), then the **1-minute** board from 09:16 onward |
+| depth-200 change mechanism | unsubscribe (code 25) + subscribe on the same socket | **close the socket and redial it** with the new contract as its only instrument |
+
+The depth-200 REST of the contract stands: stock options only, top 5 DISTINCT
+underlyings, the 20-underlying hysteresis band, at most 5 changes a minute, no
+index options, no BSE. The unsubscribe RequestCode stays **25** and is simply no
+longer sent by the depth-200 steering path.
+
+#### ⚠ This REVERSES the 2026-09-11 (FOURTH) refusal — findings 1–5, engaged by name
+
+That section refused socket hang-up as the routine swap mechanism and its REJECT
+list requires a fresh dated quote engaging its five findings. Each one, and what
+answers it now:
+
+| # | Finding | Answer |
+|---|---|---|
+| 1 | No deliberate-close concept in `ConnEvent` | A new `ConnEvent::RotationRequested`, reached ONLY through a new `LiveSubscriptionCommand::RotateByRedial` on a depth-200 connection holding exactly one instrument. The steering loop cannot reach any other close path. |
+| 2 | Every redial records a flap | A new `ReconnectReason::RankedRotation` is exempt from the flap record, the same way `ProbeClose` is, and the exemption stays INSIDE `enter_backoff` (the single choke point is kept). A genuine fault still records a flap. |
+| 3 | Once a minute sits at 5 of a ceiling of 6 | Point 2 removes rotations from the damper's count, so a real vendor drop is judged against real faults only. The cap stays one change per socket per minute and five per minute pool-wide. |
+| 4 | A rebuilt socket counts healthy only once a frame arrives | Unchanged, and accepted: a rotated socket whose new book is silent is the same "not yet proven" state as a first dial. The per-minute cap means a socket is rotated at most once a minute. |
+| 5 | The blind window after a subscribe (no snapshot-on-subscribe) | Unchanged, and accepted: it is the same window the unsubscribe+subscribe path already had. `tv_depth_first_packet_latency_ms` keeps measuring it. |
+
+**The 805 / 429 risk, which the refusal also named.** Dhan documents 805 as "may
+result in user being blocked". A process-wide `ROTATION_HALTED` flag is set the
+first time ANY socket receives 805 (PoolOverflow). From then until the process
+restarts, no rotation is sent. The pool holds its last set, and each skipped
+rotation is counted. Five rotations a minute across five sockets is ~375 redials a
+session in the worst case, against the unknown per-account connect cap. That is
+the operator's accepted cost, and the breaker is what bounds it.
+
+#### ⚠ Honest envelope
+
+- **NSE_EQ depth is UNVERIFIED-LIVE.** ~208 of the 244 depth-20 slots are equity
+  spots, and no session has yet sent an NSE_EQ depth subscribe. If Dhan answers
+  with silence, the static pool carries only the ~36 index-option legs. The
+  first session is the measurement.
+- **Why k ≤ 4.** The index legs cost (2k+1) × 2 legs × 2 indices. With 208 spots,
+  k = 4 needs 36 legs for a total of 244 of 250. k is the largest value ≤ 4 that
+  fits, chosen fail-closed from the real spot count, so a larger F&O list shrinks
+  k rather than breaching the pool.
+- **A rotation has a blind window**: the old stream stops, the redial takes
+  about 0.3 s, then the new book is blank until it next changes. This is no
+  worse than the old path, whose unsubscribe was ignored on both codes.
+- **A dial-level 429 is not classified**, so the breaker catches only 805.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Re-adds any per-minute depth-20 steering, swap, or unsubscribe.
+- Puts an index spot (`IDX_I`), a future, or a BSE contract on a depth socket.
+- Lets `RotateByRedial` act on a socket holding more than one instrument, or
+  sends it to depth-20.
+- Removes the `ROTATION_HALTED` breaker, or clears it within a session.
+- Records a flap for `RankedRotation`, or exempts any other reason from the flap
+  record without its own dated quote.
+- Raises the rotation cap above one per socket per minute or five pool-wide.
+- Chooses k by any rule other than "largest k ≤ 4 that fits the 250 budget".

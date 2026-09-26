@@ -274,6 +274,11 @@ fn load_all_rule_text() -> String {
     // scan the runbook directory alongside the rules tree.
     let runbooks_dir = root.join("docs").join("error-runbooks");
     collect_markdown_contents(&runbooks_dir, &mut combined);
+    // Phase-3 rules-tree diet (2026-09-26): always-loaded rule files over
+    // 15 KB moved verbatim to `docs/claude-rules-full/` (same relative path);
+    // a short summary stub stays at the original `.claude/rules/` path.
+    let full_rules_dir = root.join("docs").join("claude-rules-full");
+    collect_markdown_contents(&full_rules_dir, &mut combined);
     combined
 }
 

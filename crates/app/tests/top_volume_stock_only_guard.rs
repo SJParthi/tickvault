@@ -3,7 +3,7 @@
 //!
 //! Operator, verbatim: *"Just go ahead with the stocks options alone for top
 //! volume dude"*. Full dated record, the decisive finding and the REJECT list:
-//! `.claude/rules/project/websocket-connection-scope-lock.md`
+//! `docs/claude-rules-full/project/websocket-connection-scope-lock.md`
 //! § "2026-09-18 (FOURTH)".
 //!
 //! # Why a SOURCE scan and not a behavioural test
@@ -143,7 +143,8 @@ fn the_family_column_and_its_dedup_key_are_untouched() {
 
 #[test]
 fn the_scope_lock_records_the_narrowing() {
-    let lock = include_str!("../../../.claude/rules/project/websocket-connection-scope-lock.md");
+    let lock =
+        include_str!("../../../docs/claude-rules-full/project/websocket-connection-scope-lock.md");
 
     assert!(
         lock.contains("Just go ahead with the stocks options alone for top volume dude"),

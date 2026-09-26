@@ -52,7 +52,7 @@ const MATRIX_PATH: &str = "../../.claude/rules/project/per-wave-guarantee-matrix
 // matrix row 1 + §F honest-100% template were re-pointed to the live
 // seal-ring envelope in the same sweep — pin them here so they cannot
 // silently regress to the retired tick-ring wording.
-const CHARTER_PATH: &str = "../../.claude/rules/project/operator-charter-forever.md";
+const CHARTER_PATH: &str = "../../docs/claude-rules-full/project/operator-charter-forever.md";
 
 fn read(rel: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);

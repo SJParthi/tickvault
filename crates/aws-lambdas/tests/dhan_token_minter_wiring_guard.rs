@@ -43,7 +43,7 @@ fn strip_hcl_comments(source: &str) -> String {
 }
 
 const TF: &str = "deploy/aws/terraform/dhan-token-minter-lambda.tf";
-const RULE: &str = ".claude/rules/project/groww-shared-token-minter-2026-07-02.md";
+const RULE: &str = "docs/claude-rules-full/project/groww-shared-token-minter-2026-07-02.md";
 
 #[test]
 fn terraform_defines_the_lambda_and_its_log_group() {
