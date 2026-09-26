@@ -431,6 +431,124 @@ pub fn init_app_log_appender(
     Ok((non_blocking, guard))
 }
 
+/// Buffered-line bound for the sinks moved off the calling thread on
+/// 2026-09-26 (errors.log, stdout). Same figure as `tracing_appender`'s own
+/// default, stated here so the bound is a named, tested constant rather
+/// than a library default that could move under a version bump.
+pub const LOG_SINK_BUFFERED_LINES: usize = 128_000;
+
+/// The counter every lossy log sink publishes its dropped-line total on,
+/// labelled `sink`.
+pub const LOG_LINES_DROPPED_METRIC: &str = "tv_log_lines_dropped_total";
+
+/// How often [`publish_log_drop_counters`] runs.
+pub const LOG_DROP_PUBLISH_INTERVAL_SECS: u64 = 10;
+
+/// Wraps `writer` in a bounded, LOSSY, non-blocking appender.
+///
+/// **Why (2026-09-26 audit fix, PR1):** until this date errors.log was
+/// `.with_writer(std::sync::Mutex::new(file))` and stdout used the default
+/// `io::stdout` writer, so every WARN+ line was a blocking `write(2)` under a
+/// lock ON THE CALLING THREAD — including the frame-drain task that reads the
+/// sockets. A slow disk or a burst of warnings stalled tick draining. Now the
+/// caller only pushes onto a bounded channel; a dedicated thread writes.
+///
+/// Lossy is deliberate: when the channel is full a line is DROPPED and
+/// counted on [`LOG_LINES_DROPPED_METRIC`] rather than blocking the caller.
+/// A log line is never worth a tick. The panic path does not depend on this
+/// sink — see [`append_panic_line_sync`].
+///
+/// The caller MUST keep the returned `WorkerGuard` alive for the process.
+pub fn init_lossy_non_blocking<W>(
+    writer: W,
+    sink: &'static str,
+) -> (tracing_appender::non_blocking::NonBlocking, WorkerGuard)
+where
+    W: std::io::Write + Send + 'static,
+{
+    let (non_blocking, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .lossy(true)
+        .buffered_lines_limit(LOG_SINK_BUFFERED_LINES)
+        .thread_name("tv-log-sink")
+        .finish(writer);
+    register_log_drop_counter(sink, &non_blocking);
+    (non_blocking, guard)
+}
+
+/// Every registered lossy sink, published by [`publish_log_drop_counters`].
+/// Boot-time registration only (≤ 8 sinks), read on a slow timer.
+/// Each entry keeps the total last published so a NEW drop can be logged.
+static LOG_DROP_COUNTERS: std::sync::Mutex<
+    Vec<(
+        &'static str,
+        tracing_appender::non_blocking::ErrorCounter,
+        u64,
+    )>,
+> = std::sync::Mutex::new(Vec::new());
+
+/// Registers a non-blocking sink's dropped-line counter under `sink`. Also
+/// used for the pre-existing app.log / errors.jsonl / category appenders,
+/// which were already lossy but whose drops nothing reported.
+pub fn register_log_drop_counter(
+    sink: &'static str,
+    writer: &tracing_appender::non_blocking::NonBlocking,
+) {
+    if let Ok(mut sinks) = LOG_DROP_COUNTERS.lock() {
+        sinks.push((sink, writer.error_counter(), 0));
+    }
+}
+
+/// Publishes each registered sink's cumulative dropped-line count. Called
+/// from a slow timer task in `main.rs`; O(sinks), sinks ≤ 8, never on the
+/// tick path.
+pub fn publish_log_drop_counters() {
+    if let Ok(mut sinks) = LOG_DROP_COUNTERS.lock() {
+        for (sink, counter, last) in sinks.iter_mut() {
+            let dropped = u64::try_from(counter.dropped_lines()).unwrap_or(u64::MAX);
+            metrics::counter!("tv_log_lines_dropped_total", "sink" => *sink).absolute(dropped);
+            if dropped > *last {
+                // At most one line per sink per publish interval. It goes
+                // through the same lossy sinks, which is fine: a drop burst
+                // ends, and the next interval reports the cumulative total.
+                tracing::warn!(
+                    sink = *sink,
+                    newly_dropped = dropped - *last,
+                    total_dropped = dropped,
+                    "log lines were DROPPED because a log sink's queue was full — \
+                     the tick path was not blocked; the lines are gone"
+                );
+                *last = dropped;
+            }
+        }
+    }
+}
+
+/// Appends one JSON line to `path` SYNCHRONOUSLY. Used only by the panic
+/// hook: under `panic = "abort"` the process dies before any non-blocking
+/// sink's worker thread can flush, so the one line that explains a crash
+/// must not ride a queue. Best-effort — a failure here is ignored because
+/// the default hook still prints the panic to stderr (journald).
+pub fn append_panic_line_sync(path: &std::path::Path, location: &str, payload: &str) {
+    use std::io::Write as _;
+    let line = serde_json::json!({
+        "level": "ERROR",
+        "target": "tickvault_app::panic",
+        "fields": {
+            "message": "PANIC: tickvault crashed",
+            "panic_location": location,
+            "panic_payload": payload,
+        },
+    });
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        // Best-effort: the default hook still prints the panic to stderr.
+        let _best_effort: std::io::Result<()> = writeln!(file, "{line}");
+    }
+}
+
 /// 2026-05-02 — generic per-category log appender. Mirrors
 /// [`init_app_log_appender`] but parameterized over (`dir`, `prefix`)
 /// so the 5 [`LogCategory`] variants can each get their own
@@ -678,6 +796,105 @@ pub fn cap_errors_log_size(path: &std::path::Path, max_bytes: u64) -> std::io::R
 
 #[cfg(test)]
 mod tests {
+    // ----- 2026-09-26 audit fix PR1: non-blocking sinks -----
+
+    /// A writer that blocks forever on every write. If the appender wrote on
+    /// the calling thread, `write` below would never return.
+    struct BlockingWriter(std::sync::Arc<std::sync::Barrier>);
+    impl std::io::Write for BlockingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.wait();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_init_lossy_non_blocking_errors_log_writer_is_non_blocking() {
+        use std::io::Write as _;
+        // Barrier of 2 that the test never joins: the sink thread parks on
+        // its first write for the whole test.
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let (mut writer, guard) =
+            init_lossy_non_blocking(BlockingWriter(barrier.clone()), "test_blocking");
+        let started = std::time::Instant::now();
+        // Far more lines than the buffer holds: every one must return
+        // immediately, the overflow dropped rather than waited on.
+        for _ in 0..(LOG_SINK_BUFFERED_LINES + 1_000) {
+            let _ = writer.write(b"x\n");
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "a lossy non-blocking sink must never block the caller"
+        );
+        assert!(writer.error_counter().dropped_lines() > 0);
+        // Release the parked sink thread so the guard can drop cleanly.
+        barrier.wait();
+        std::mem::forget(guard);
+    }
+
+    #[test]
+    fn log_sink_buffer_bound_is_pinned() {
+        assert_eq!(LOG_SINK_BUFFERED_LINES, 128_000);
+        assert_eq!(LOG_LINES_DROPPED_METRIC, "tv_log_lines_dropped_total");
+        assert_eq!(LOG_DROP_PUBLISH_INTERVAL_SECS, 10);
+    }
+
+    #[test]
+    fn test_register_log_drop_counter_then_publish_log_drop_counters() {
+        let (writer, guard) = init_lossy_non_blocking(std::io::sink(), "test_sink");
+        register_log_drop_counter("test_sink_again", &writer);
+        publish_log_drop_counters();
+        {
+            let sinks = LOG_DROP_COUNTERS.lock().expect("registry lock");
+            let entry = sinks
+                .iter()
+                .find(|(name, _, _)| *name == "test_sink_again")
+                .expect("registered sink is tracked");
+            // Nothing was written, so nothing was dropped and the
+            // last-published total stays at zero.
+            assert_eq!(entry.2, 0);
+            assert_eq!(entry.1.dropped_lines(), 0);
+        }
+        drop(guard);
+    }
+
+    #[test]
+    fn test_append_panic_line_sync_panic_hook_writes_errors_log_synchronously() {
+        let dir = std::env::temp_dir().join(format!(
+            "tv-panic-line-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("errors.log");
+        append_panic_line_sync(&path, "src/x.rs:1:2", "boom \"quoted\"");
+        // Readable immediately after return: no queue, no worker thread.
+        let body = std::fs::read_to_string(&path).expect("read");
+        let line: serde_json::Value =
+            serde_json::from_str(body.trim_end()).expect("one valid JSON line");
+        assert_eq!(line["level"], "ERROR");
+        assert_eq!(line["fields"]["panic_location"], "src/x.rs:1:2");
+        assert_eq!(line["fields"]["panic_payload"], "boom \"quoted\"");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn main_rs_has_no_mutex_log_writer() {
+        let main = include_str!("main.rs");
+        assert!(
+            !main.contains("with_writer(std::sync::Mutex::new("),
+            "a Mutex-wrapped file writer logs synchronously on the calling thread"
+        );
+        assert!(main.contains("init_lossy_non_blocking(file, \"errors_log\")"));
+        assert!(main.contains("init_lossy_non_blocking(std::io::stdout(), \"stdout\")"));
+        assert!(main.contains("append_panic_line_sync("));
+    }
+
     use super::*;
     use tickvault_common::config::ObservabilityConfig;
 

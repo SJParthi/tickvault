@@ -1409,12 +1409,19 @@ async fn async_main() -> Result<()> {
     // File logging (data/logs/) is always active regardless of this flag.
     let fmt_boxed: Option<Box<dyn tracing_subscriber::Layer<_> + Send + Sync + 'static>> =
         if config.logging.log_to_stdout {
+            // Non-blocking since 2026-09-26 (audit fix PR1): the default
+            // `io::stdout` writer wrote synchronously on the calling thread,
+            // including the frame-drain task.
+            let (stdout_writer, stdout_guard) =
+                tickvault_app::observability::init_lossy_non_blocking(std::io::stdout(), "stdout");
+            Box::leak(Box::new(stdout_guard));
             let fmt_layer = tracing_subscriber::fmt::layer()
                 .with_target(true)
                 .with_thread_ids(true)
                 .with_file(false)
                 .with_line_number(false)
-                .with_timer(ist_timer.clone());
+                .with_timer(ist_timer.clone())
+                .with_writer(stdout_writer);
             if config.logging.format == "json" {
                 Some(Box::new(fmt_layer.json()))
             } else {
@@ -1441,6 +1448,7 @@ async fn async_main() -> Result<()> {
             Ok((writer, guard)) => {
                 use tracing_subscriber::Layer as _;
                 Box::leak(Box::new(guard));
+                tickvault_app::observability::register_log_drop_counter("app_log", &writer);
                 // Per-target DEBUG suppression for the FILE appender only.
                 // Stdout + errors.log + errors.jsonl keep the configured
                 // global level. See `build_app_log_filter_directive` for
@@ -1475,6 +1483,14 @@ async fn async_main() -> Result<()> {
         match create_error_log_writer() {
             Some(file) => {
                 use tracing_subscriber::Layer as _;
+                // Non-blocking since 2026-09-26 (audit fix PR1). Until then
+                // this was `std::sync::Mutex::new(file)`: a blocking write
+                // under a lock on whichever thread logged a WARN — the frame
+                // drain included. The panic hook writes its line to this
+                // file synchronously, so a crash is never lost in the queue.
+                let (error_writer, error_guard) =
+                    tickvault_app::observability::init_lossy_non_blocking(file, "errors_log");
+                Box::leak(Box::new(error_guard));
                 let error_fmt = tracing_subscriber::fmt::layer()
                     .with_target(true)
                     .with_thread_ids(true)
@@ -1482,7 +1498,7 @@ async fn async_main() -> Result<()> {
                     .with_line_number(true)
                     .with_timer(ist_timer.clone())
                     .json()
-                    .with_writer(std::sync::Mutex::new(file))
+                    .with_writer(error_writer)
                     .with_filter(tracing_subscriber::filter::LevelFilter::WARN);
                 Some(Box::new(error_fmt))
             }
@@ -1504,6 +1520,7 @@ async fn async_main() -> Result<()> {
                 // Keep the worker guard alive for the process lifetime —
                 // dropping it stops the background flush thread.
                 Box::leak(Box::new(guard));
+                tickvault_app::observability::register_log_drop_counter("errors_jsonl", &writer);
                 let layer = tracing_subscriber::fmt::layer()
                     .json()
                     // CRITICAL: flatten_event(true) hoists `code`, `severity`,
@@ -1556,6 +1573,7 @@ async fn async_main() -> Result<()> {
             {
                 Ok((writer, guard)) => {
                     Box::leak(Box::new(guard));
+                    tickvault_app::observability::register_log_drop_counter(cat.prefix(), &writer);
                     let mut targets = tracing_subscriber::filter::Targets::new();
                     for prefix in tickvault_app::observability::build_category_targets(cat) {
                         targets = targets
@@ -1868,6 +1886,14 @@ async fn async_main() -> Result<()> {
         } else {
             "unknown panic payload".to_string()
         };
+        // Synchronous FIRST: every tracing sink is non-blocking, and under
+        // `panic = "abort"` the process dies before their worker threads
+        // flush. This line is the one record that must not ride a queue.
+        tickvault_app::observability::append_panic_line_sync(
+            std::path::Path::new(tickvault_app::boot_helpers::ERROR_LOG_FILE_PATH),
+            &location,
+            &payload,
+        );
         tracing::error!(
             panic_location = %location,
             panic_payload = %payload,
@@ -1875,6 +1901,18 @@ async fn async_main() -> Result<()> {
         );
         default_panic_hook(panic_info);
     }));
+
+    // Dropped-line publisher for every lossy log sink (2026-09-26 audit fix
+    // PR1). A slow timer on its own task — never the tick path.
+    tokio::spawn(async {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+            tickvault_app::observability::LOG_DROP_PUBLISH_INTERVAL_SECS,
+        ));
+        loop {
+            ticker.tick().await;
+            tickvault_app::observability::publish_log_drop_counters();
+        }
+    });
 
     info!(
         version = env!("CARGO_PKG_VERSION"),

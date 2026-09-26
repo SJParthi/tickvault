@@ -3030,15 +3030,19 @@ impl LiveIngest {
             None => {
                 self.seq_refused = self.seq_refused.saturating_add(1);
                 counters().ingest_seq_refused.increment(1);
-                error!(
-                    code = ErrorCode::WsGapConnectionState.code_str(),
-                    frame_seq,
-                    packet_index,
-                    security_id = tick.security_id,
-                    "live tick refused: packet index exceeds the bits reserved in \
+                // Power-of-two throttle (2026-09-26 audit fix, PR1): per-tick
+                // arm; every refusal is still counted above.
+                if self.seq_refused.is_power_of_two() {
+                    error!(
+                        code = ErrorCode::WsGapConnectionState.code_str(),
+                        frame_seq,
+                        packet_index,
+                        security_id = tick.security_id,
+                        "live tick refused: packet index exceeds the bits reserved in \
                      capture_seq. The tick was NOT folded and NOT written — a counted \
                      loss, never a fresh sequence that would duplicate on WAL replay."
-                );
+                    );
+                }
                 return IngestOutcome::SeqUnrepresentable;
             }
         };
@@ -3048,14 +3052,18 @@ impl LiveIngest {
         let Some(capture_seq) = capture_seq_from_frame_seq(frame_seq) else {
             self.seq_refused = self.seq_refused.saturating_add(1);
             counters().ingest_seq_refused.increment(1);
-            error!(
-                code = ErrorCode::WsGapConnectionState.code_str(),
-                frame_seq,
-                security_id = tick.security_id,
-                "live tick refused: frame sequence does not fit the capture_seq column. \
+            // Power-of-two throttle (2026-09-26 audit fix, PR1): per-tick
+            // arm; every refusal is still counted above.
+            if self.seq_refused.is_power_of_two() {
+                error!(
+                    code = ErrorCode::WsGapConnectionState.code_str(),
+                    frame_seq,
+                    security_id = tick.security_id,
+                    "live tick refused: frame sequence does not fit the capture_seq column. \
                  The tick was NOT folded and NOT written — this is a real, counted loss, \
                  never a silent stamp that would collapse two rows under the DEDUP key."
-            );
+                );
+            }
             return IngestOutcome::SeqUnrepresentable;
         };
 
@@ -14598,6 +14606,26 @@ const IN_SESSION_1000_IST_MILLIS: u64 = (4 * 3_600 + 30 * 60) * 1_000;
 
 #[cfg(test)]
 mod tests {
+    /// 2026-09-26 audit fix PR1: both sequence-refusal arms are per TICK; each
+    /// ERROR line must be gated by the power-of-two throttle on
+    /// `seq_refused`, while the refusal counter stays per tick.
+    #[test]
+    fn seq_refused_log_is_power_of_two_throttled() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let start = src.find("pub fn ingest_tick_at(").expect("fn present");
+        let body = &src[start..start + 6_000];
+        assert_eq!(
+            body.matches("if self.seq_refused.is_power_of_two() {")
+                .count(),
+            2,
+            "both refusal arms must throttle their log line"
+        );
+        assert_eq!(
+            body.matches("counters().ingest_seq_refused.increment(1);")
+                .count(),
+            2
+        );
+    }
 
     // -- WAL catch-up memory stop (2026-09-02) --------------------------------
     //
