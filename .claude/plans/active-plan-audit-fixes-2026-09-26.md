@@ -312,10 +312,17 @@ folded into them below), then PR18, PR19 and the decisions.
       phrases added. Tests: `dhan_token_minter::tests::parse_ssm_service_*`,
       `a_depth_account_run_*`, `the_two_account_segments_never_share_a_parameter_path`,
       `crates/aws-lambdas/tests/dhan_depth_token_minter_wiring_guard.rs`.
-    - [ ] **D9b-2 — widen 16 to 26 with no behaviour change.** Per-account `PoolBudget` counters
+    - [x] **D9b-2 — widen 16 to 26 with no behaviour change.** Per-account `PoolBudget` counters
       (depth account at global indices 16..25), `MAX_TOTAL_DHAN_CONNECTIONS`, the slot-label
       array, `RECONNECT_JITTER_SLOTS`, the per-connection arrays, `endpoint_for_slot`, the
       depth-200 tick-age exclusion range, `kernel_tuning_16ws_guard.rs` and the sysctl budget text.
+      Done: `pool_budget::{DhanAccount, slot_owner, PoolBudget::try_open_on, release_on}`,
+      `RECONNECT_JITTER_SLOTS = 26`, `dhan_feed_stack::endpoint_for_slot` via `slot_owner`.
+      Tests: `test_both_accounts_tile_all_twenty_six_slots_exactly_once`,
+      `test_depth_account_refuses_main_feed_and_order_update_without_mutating`,
+      `test_reconnect_jitter_ms_unchanged_for_the_primary_account_slots`,
+      `the_depth_accounts_slots_follow_the_same_rules`,
+      `the_twenty_six_socket_budget_is_recorded_and_gates_the_depth_account`.
     - [ ] **D9b-3 — wire the pool behind `[dhan_depth_account] enabled = false`.** Own client id;
       a READ-ONLY token source re-read from `/dhan-depth/access-token` (an 807 on the depth account
       re-reads, never mints: minting from the box would fight its Lambda); `account` label on

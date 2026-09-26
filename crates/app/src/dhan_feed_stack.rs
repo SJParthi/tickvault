@@ -9429,13 +9429,14 @@ pub fn worst_connection_tick_age_secs(now_millis: i64) -> Option<u64> {
     // for exactly this reason and named the depth-200 case verbatim — it just
     // did not carry the reasoning to a slot that ticked once and went quiet.
     //
-    // Range comes from `jitter_base`, which tiles the slots in endpoint order,
-    // so this cannot drift from the pool layout without the tiling test failing.
-    let d200_start = DhanEndpointType::Depth200.jitter_base() as usize;
-    let d200_end = DhanEndpointType::OrderUpdate.jitter_base() as usize;
+    // The owner comes from `endpoint_for_slot`, which reads the same pool
+    // layout the budget grants slots from, so BOTH accounts' depth-200 slots
+    // (10..15 primary, 21..26 depth account, 2026-09-26) are excluded and the
+    // exclusion cannot drift from the layout.
     let mut worst: Option<u64> = None;
     for (index, slot) in PER_CONN_LAST_TICK_MILLIS.iter().enumerate() {
-        if (d200_start..d200_end).contains(&index) {
+        let owner = u8::try_from(index).ok().and_then(endpoint_for_slot);
+        if owner == Some(DhanEndpointType::Depth200) {
             continue; // one contract per socket — see above
         }
         let last = slot.load(Ordering::Relaxed);
@@ -9478,17 +9479,16 @@ pub const CONN_FRAMES_GAUGE: &str = "tv_dhan_ws_conn_frames";
 
 /// Which endpoint a global socket slot belongs to, from the pool tiling.
 ///
-/// The slots are tiled in `DhanEndpointType::ALL` order with each type's
-/// `jitter_base()` as its first slot, so the answer is a range test per type —
-/// four comparisons, no table to keep in step with the pool. `None` for a slot
-/// past the ceiling, which the planner cannot produce.
+/// The slots of BOTH accounts are tiled from the same `jitter_base()` and
+/// caps the pool budget grants them from (`pool_budget::slot_owner`), so the
+/// answer is at most eight range tests, no table to keep in step with the
+/// pool. The depth account's slots 16..26 (2026-09-26) map to depth-20 and
+/// depth-200. `None` for a slot past the ceiling, which the planner cannot
+/// produce.
 #[must_use]
 pub fn endpoint_for_slot(connection_index: u8) -> Option<DhanEndpointType> {
-    DhanEndpointType::ALL.into_iter().find(|endpoint| {
-        let start = endpoint.jitter_base();
-        let end = start.saturating_add(endpoint.max_connections());
-        (start..end).contains(&connection_index)
-    })
+    tickvault_core::websocket::pool_budget::slot_owner(connection_index)
+        .map(|(_, endpoint)| endpoint)
 }
 
 /// One connection's delivery record, as the console shows it.
@@ -25800,6 +25800,36 @@ mod deaf_socket_gauge_scope_tests {
         let worst = worst_connection_tick_age_secs(now).expect("some slot has ticked");
         assert_eq!(worst, 1_800, "depth-20 silence stays diagnostic");
     }
+
+    /// 2026-09-26: the depth account's depth-200 slots (21..26) carry one
+    /// contract each too, so the same exclusion must cover them. Its depth-20
+    /// slots (16..21) stay diagnostic, like the primary account's.
+    #[test]
+    fn the_depth_accounts_slots_follow_the_same_rules() {
+        use tickvault_core::websocket::pool_budget::DhanAccount;
+        let _guard = lock_slots();
+        let now = 1_800_000_000_000_i64;
+
+        seed_all_fresh(now);
+        let depth_d200 = DhanAccount::Depth.jitter_base(DhanEndpointType::Depth200);
+        assert_eq!(depth_d200, 21);
+        record_connection_tick(depth_d200 + 4, now - 3_600_000);
+        let worst = worst_connection_tick_age_secs(now).expect("some slot has ticked");
+        assert!(
+            worst < 60,
+            "a quiet depth-account depth-200 contract must not drive the gauge; got {worst}s"
+        );
+
+        seed_all_fresh(now);
+        let depth_d20 = DhanAccount::Depth.jitter_base(DhanEndpointType::Depth20);
+        assert_eq!(depth_d20, 16);
+        record_connection_tick(depth_d20, now - 1_800_000);
+        let worst = worst_connection_tick_age_secs(now).expect("some slot has ticked");
+        assert_eq!(
+            worst, 1_800,
+            "depth-account depth-20 silence stays diagnostic"
+        );
+    }
 }
 
 /// The per-connection delivery rows the operator console reads.
@@ -25807,22 +25837,33 @@ mod deaf_socket_gauge_scope_tests {
 mod connection_delivery_tests {
     use super::*;
 
-    /// The tiling is `DhanEndpointType::ALL` order: 5 main-feed, 5 depth-20,
-    /// 5 depth-200, 1 order-update. A slot past the ceiling is nobody's.
+    /// The primary account tiles `DhanEndpointType::ALL` order: 5 main-feed,
+    /// 5 depth-20, 5 depth-200, 1 order-update (slots 0..16). The depth
+    /// account follows with 5 depth-20 and 5 depth-200 (slots 16..26,
+    /// 2026-09-26). A slot past the ceiling is nobody's.
     #[test]
     fn endpoint_for_slot_maps_every_slot_to_the_pool_that_dials_it() {
+        use tickvault_core::websocket::pool_budget::{DhanAccount, slot_owner};
         for slot in 0..MAX_TOTAL_DHAN_CONNECTIONS {
             let endpoint = endpoint_for_slot(slot).expect("every slot under the ceiling is tiled");
-            let start = endpoint.jitter_base();
+            let (account, owner) = slot_owner(slot).expect("same tiling");
+            assert_eq!(owner, endpoint);
+            let start = account.jitter_base(endpoint);
             assert!(
-                slot >= start && slot < start + endpoint.max_connections(),
-                "slot {slot} landed in {endpoint:?}, whose range starts at {start}"
+                slot >= start && slot < start + account.max_connections(endpoint),
+                "slot {slot} landed in {account:?} {endpoint:?}, whose range starts at {start}"
             );
         }
         assert_eq!(endpoint_for_slot(0), Some(DhanEndpointType::MainFeed));
+        assert_eq!(endpoint_for_slot(15), Some(DhanEndpointType::OrderUpdate));
+        assert_eq!(endpoint_for_slot(16), Some(DhanEndpointType::Depth20));
         assert_eq!(
             endpoint_for_slot(MAX_TOTAL_DHAN_CONNECTIONS - 1),
-            Some(DhanEndpointType::OrderUpdate)
+            Some(DhanEndpointType::Depth200)
+        );
+        assert_eq!(
+            slot_owner(MAX_TOTAL_DHAN_CONNECTIONS - 1).map(|(a, _)| a),
+            Some(DhanAccount::Depth)
         );
         assert_eq!(
             endpoint_for_slot(MAX_TOTAL_DHAN_CONNECTIONS),
