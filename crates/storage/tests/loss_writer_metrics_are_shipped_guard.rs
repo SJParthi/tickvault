@@ -37,6 +37,24 @@
 /// in writing, not a way to make the build green.
 const DELIBERATELY_LOCAL_ONLY: &[(&str, &str)] = &[
     (
+        "tv_tick_rescue_deferred_to_wal_total",
+        "ADDED 2026-09-26 (audit fix PR3). A CAUSE counter, not the loss \
+     counter: every row it counts is ALSO counted on the shipped and alarmed \
+     `tv_ticks_dropped_total` in the same arm, so the pager already fires, and \
+     the arm writes a coded ERROR with `source = rescue_deferred_to_wal` naming \
+     the cause and the sequence range. What is not available in CloudWatch is \
+     the split between `deferred to the WAL` and `lost`. Held local for the \
+     same budget lever as `tv_spill_free_probe_blind_total` below: ship it in \
+     the change that takes that lever.",
+    ),
+    (
+        "tv_depth_rescue_deferred_to_wal_total",
+        "ADDED 2026-09-26 (audit fix PR3). The depth twin of the row above: \
+     every row it counts is also counted on the shipped `tv_depth_rows_dropped_total` \
+     in the same arm, with a coded ERROR carrying \
+     `source = depth_rescue_deferred_to_wal`. Held local for the same budget lever.",
+    ),
+    (
         "tv_tick_volume_saturated_total",
         "UNREACHABLE today, by construction. `saturate_volume_to_i64` narrows a \
      u64 cumulative volume onto the LONG column, and every live source is \

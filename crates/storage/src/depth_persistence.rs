@@ -1010,6 +1010,12 @@ pub struct DepthWriter {
     /// the WAL applied-watermark learns the frames a batch covers from these.
     pending_min_seq: u64,
     pending_max_seq: u64,
+    /// True once any pending row has NO write-ahead-log backing (a zero or
+    /// freshly minted capture sequence). Such a buffer is never deferred to
+    /// the WAL; it keeps the inline spill (2026-09-26 audit fix PR3).
+    /// Cleared only when `discard_pending` consumes it — a stale `true` is
+    /// conservative (inline spill, the old behaviour), never a loss.
+    pending_unbacked: bool,
     feed: Feed,
     /// Pre-resolved session-window refusal counters. See
     /// [`DEPTH_OUT_OF_WINDOW_REASONS`] for why depth speaks a different
@@ -1163,6 +1169,7 @@ impl DepthWriter {
                     pending: 0,
                     pending_min_seq: 0,
                     pending_max_seq: 0,
+                    pending_unbacked: false,
                     feed,
                     out_of_window: depth_out_of_window_counters(feed),
                     dropped: 0,
@@ -1190,6 +1197,7 @@ impl DepthWriter {
                     pending: 0,
                     pending_min_seq: 0,
                     pending_max_seq: 0,
+                    pending_unbacked: false,
                     feed,
                     out_of_window: depth_out_of_window_counters(feed),
                     dropped: 0,
@@ -1224,6 +1232,7 @@ impl DepthWriter {
             pending: 0,
             pending_min_seq: 0,
             pending_max_seq: 0,
+            pending_unbacked: false,
             feed,
             out_of_window: depth_out_of_window_counters(feed),
             dropped: 0,
@@ -1559,6 +1568,7 @@ impl DepthWriter {
     fn note_pending_seq(&mut self, capture_seq: i64) {
         let seq = u64::try_from(capture_seq).unwrap_or(0);
         if seq == 0 {
+            self.pending_unbacked = true;
             return;
         }
         if self.pending_min_seq == 0 || seq < self.pending_min_seq {
@@ -1669,6 +1679,8 @@ impl DepthWriter {
         // MOVED, and the replacement is the same empty one `offload_flush`
         // already installs on every successful hand-off.
         let range = self.take_pending_range();
+        let unbacked = std::mem::take(&mut self.pending_unbacked);
+        let mut rescue_unavailable = false;
         if let Some(tx) = self.rescue.as_ref() {
             let protocol = self.buffer.protocol_version();
             let batch = DepthRescueBatch {
@@ -1698,12 +1710,45 @@ impl DepthWriter {
                 Err(std::sync::mpsc::TrySendError::Full(returned)) => {
                     self.buffer = returned.buffer;
                     self.flush_counters.rescue_fallback_queue_full.increment(1);
+                    rescue_unavailable = true;
                 }
                 Err(std::sync::mpsc::TrySendError::Disconnected(returned)) => {
                     self.buffer = returned.buffer;
                     self.flush_counters.rescue_fallback_thread_gone.increment(1);
+                    rescue_unavailable = true;
                 }
             }
+        }
+
+        // 2026-09-26 audit fix PR3 — the drain never writes the spill file.
+        // Same reasoning as `TickPersistenceWriter::discard_pending`: every
+        // row with a capture sequence is already in the capture-at-receipt
+        // WAL, so a busy rescue thread hands the range to the WAL (marked
+        // unapplied, replayed, never archived unread) instead of a `df` fork
+        // and a large file write on the frame-drain task. Rows without a
+        // capture sequence keep the inline spill.
+        if rescue_unavailable && range.0 != 0 && !unbacked {
+            note_rescue_outcome_depth(false, range, false);
+            self.flush_counters.rows_dropped.increment(rows as u64);
+            self.flush_counters
+                .rescue_deferred_to_wal
+                .increment(rows as u64);
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                feed = self.feed.as_str(),
+                deferred = rows,
+                min_seq = range.0,
+                max_seq = range.1,
+                source = DEPTH_RESCUE_DEFERRED_TO_WAL_SOURCE,
+                "depth flush failed and the rescue thread is busy — the rows were \
+                 handed to the write-ahead log for replay instead of being written \
+                 to disk on the tick task. They are NOT in QuestDB until the WAL \
+                 replays them."
+            );
+            self.buffer.clear();
+            self.pending = 0;
+            self.dropped = self.dropped.saturating_add(rows as u64);
+            return rows;
         }
 
         let landed = perform_depth_rescue(
@@ -2171,6 +2216,13 @@ pub const DEPTH_RESCUE_QUEUED_COUNTER: &str = "tv_depth_rescue_queued_total";
 /// Not a loss: nothing is dropped on either arm.
 pub const DEPTH_RESCUE_INLINE_FALLBACK_COUNTER: &str = "tv_depth_rescue_inline_fallback_total";
 
+/// Depth rows a full rescue queue handed to the capture-at-receipt WAL rather
+/// than spilling inline on the drain (2026-09-26 audit fix PR3).
+pub const DEPTH_RESCUE_DEFERRED_TO_WAL_COUNTER: &str = "tv_depth_rescue_deferred_to_wal_total";
+
+/// `source` on the depth deferred-to-WAL ERROR line.
+pub const DEPTH_RESCUE_DEFERRED_TO_WAL_SOURCE: &str = "depth_rescue_deferred_to_wal";
+
 /// Depth rescue payloads abandoned because the rescue thread did not finish.
 pub const DEPTH_RESCUE_ABANDONED_COUNTER: &str = "tv_depth_rescue_abandoned_total";
 
@@ -2460,6 +2512,11 @@ struct DepthFlushCounters {
     rescue_queued: metrics::Counter,
     rescue_fallback_queue_full: metrics::Counter,
     rescue_fallback_thread_gone: metrics::Counter,
+    /// Rows handed to the capture-at-receipt WAL instead of an inline spill
+    /// write on the drain (2026-09-26 audit fix PR3).
+    rescue_deferred_to_wal: metrics::Counter,
+    /// `tv_depth_rows_dropped_total`, pre-resolved for the deferral arm.
+    rows_dropped: metrics::Counter,
 }
 
 impl DepthFlushCounters {
@@ -2480,6 +2537,12 @@ impl DepthFlushCounters {
                 "feed" => feed,
                 "reason" => "thread_gone"
             ),
+            // Literal, not the const, so the shipped-metrics guard can see it.
+            rescue_deferred_to_wal: metrics::counter!(
+                "tv_depth_rescue_deferred_to_wal_total",
+                "feed" => feed
+            ),
+            rows_dropped: metrics::counter!("tv_depth_rows_dropped_total", "feed" => feed),
         }
     }
 }
@@ -3220,10 +3283,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A full depth rescue queue falls back to the OLD behaviour, never a drop.
+    /// A full depth rescue queue falls back to the OLD behaviour, never a drop,
+    /// for rows with NO write-ahead-log backing (capture sequence 0). Rows
+    /// that ARE in the WAL are deferred to it instead — see the next test.
     #[test]
     fn a_full_depth_rescue_queue_writes_inline_rather_than_dropping() {
         let dir = spill_tmp("depth-rescue-full");
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (_sink, _rx) = w.split_rescue_offload();
+        let unbacked = DepthRow {
+            capture_seq: 0,
+            ..row()
+        };
+
+        for _ in 0..DEPTH_RESCUE_QUEUE_DEPTH {
+            w.append_row(&unbacked).expect("append");
+            assert_eq!(w.discard_pending(), 1);
+        }
+        w.append_row(&unbacked).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+
+        assert!(
+            !spill_files(&dir).is_empty(),
+            "with the queue full the rescue must have been written inline"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2026-09-26 audit fix PR3: WAL-backed depth rows with a full rescue
+    /// queue are handed to the WAL — the drain writes NO spill file.
+    #[test]
+    fn a_full_depth_rescue_queue_defers_wal_backed_rows_without_file_io() {
+        let dir = spill_tmp("depth-rescue-defer");
         let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
         let (_sink, _rx) = w.split_rescue_offload();
 
@@ -3232,11 +3323,15 @@ mod tests {
             assert_eq!(w.discard_pending(), 1);
         }
         w.append_row(&row()).expect("append");
-        assert_eq!(w.discard_pending(), 1);
-
+        assert_eq!(w.discard_pending(), 1, "the rows are accounted for");
+        assert_eq!(w.pending(), 0);
         assert!(
-            !spill_files(&dir).is_empty(),
-            "with the queue full the rescue must have been written inline"
+            spill_files(&dir).is_empty(),
+            "the drain must not write the depth spill file"
+        );
+        assert_eq!(
+            DEPTH_RESCUE_DEFERRED_TO_WAL_COUNTER,
+            "tv_depth_rescue_deferred_to_wal_total"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

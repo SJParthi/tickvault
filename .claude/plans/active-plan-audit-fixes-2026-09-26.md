@@ -19,7 +19,7 @@ inline (PR2, PR8, PR14).
 
 ## Design
 
-- [ ] **PR1 — nothing on the tick path writes a log line synchronously.** (`app`, `storage`)
+- [x] **PR1 — nothing on the tick path writes a log line synchronously.** (`app`, `storage`)
   - `errors.log` is `.with_writer(std::sync::Mutex::new(file))` (main.rs:1485, file from
     boot_helpers.rs:266): every WARN+ line is a blocking `write(2)` under a mutex on the calling
     thread, including the frame-drain task. stdout (main.rs:1412) is the same when enabled.
@@ -31,20 +31,28 @@ inline (PR2, PR8, PR14).
     power-of-two throttle shape (`seal_loss_alarm.rs:131`); counters stay per-event.
   - A panic hook line is written synchronously to `errors.log` before abort, so the non-blocking
     switch cannot lose the one line that explains a crash.
-- [ ] **PR2 — a non-finite price can never reach an ILP float column.** (`storage`)
+- [x] **PR2 — a non-finite price can never reach an ILP float column.** (`storage`)
   - Correction: the aggregator already refuses NaN/inf LTP (multi_tf_aggregator.rs:1071, :1085),
     so no NaN candle is produced today. The WRITER is still undefended
     (shadow_candle_writer.rs:483-505) and tick-row OHLC / pct columns
     (tick_persistence.rs:2257-2267) were not checked. Add one `finite_or_skip` helper: a
     non-finite value omits the column (QuestDB stores NULL) and increments
     `tv_ilp_nonfinite_skipped_total{table}`.
-- [ ] **PR3 — the tick rescue never writes to disk on the drain task.** (`storage`)
+  - DONE AS BUILT (2026-09-26): a counter tripwire, not a skip. QuestDB already stores a
+    non-finite ILP float as NULL, so omitting the column changes nothing on disk; what was
+    missing was the signal. `count_nonfinite_candle_floats` counts the six float columns of each
+    sealed bar on `tv_candle_nonfinite_columns_total` before the append, and
+    `count_nonfinite_tick_floats` does the same for each tick row (`ltp` plus the present optional
+    OHLC and average price) on `tv_tick_nonfinite_columns_total`.
+- [x] **PR3 — the tick rescue never writes to disk on the drain task.** (`storage`)
   - When the rescue queue (`RESCUE_QUEUE_DEPTH` = 2, tick_persistence.rs:2841) is full, the
     buffer is spilled inline on the drain (tick_persistence.rs:2711-2726). The capture-at-receipt
     WAL already holds every one of those frames, and `note_unapplied_range` (:2752) already marks
     WAL ranges for replay. Replace the inline spill with `note_unapplied_range` + drop the buffer
     (counted as `tv_tick_rescue_deferred_to_wal_total`), so the drain never does file I/O.
     Rows are recovered by WAL replay (PR12 makes that mid-session, not boot-only).
+  - DONE AS BUILT (2026-09-26): the same shape for the depth rescue, counted on
+    `tv_depth_rescue_deferred_to_wal_total`.
 - [ ] **PR4 — the top-volume sort runs off the tick task.** (`app`)
   - `snapshot_top_volume` (dhan_feed_stack.rs:1701) runs `rank` → `sort_unstable_by`
     (volume_leaderboard.rs:1546) inside the drain's biased `select!` timer arms (1s :6684,

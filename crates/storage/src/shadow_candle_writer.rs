@@ -477,6 +477,16 @@ impl ShadowCandleWriter {
             buf.symbol("contract", &**name)
                 .with_context(|| "candle append: symbol(contract) failed")?;
         }
+        // Tripwire (2026-09-26 audit fix PR2). The fold refuses non-finite
+        // prices before they reach a bar and `pct_change` maps a bad baseline
+        // to 0, so this should never fire. If an upstream guard regresses,
+        // QuestDB silently stores NaN/±inf as NULL — this makes that visible
+        // instead of silent. Six float compares per sealed bar; the counter is
+        // touched only on a hit.
+        let nonfinite = count_nonfinite_candle_floats(row);
+        if nonfinite > 0 {
+            metrics::counter!(CANDLE_NONFINITE_COLUMNS_COUNTER).increment(nonfinite);
+        }
         let buf = buf
             .column_i64("security_id", row.security_id)
             .with_context(|| "candle append: column_i64(security_id) failed")?
@@ -723,6 +733,27 @@ impl ShadowCandleWriter {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Counter for float columns of a sealed candle that were non-finite at write
+/// time (QuestDB would store them as NULL). Expected to stay at zero.
+pub const CANDLE_NONFINITE_COLUMNS_COUNTER: &str = "tv_candle_nonfinite_columns_total";
+
+/// How many of a sealed bar's float columns (OHLC plus the two percentage
+/// columns) are NaN or infinite. O(1): six compares.
+#[must_use]
+pub fn count_nonfinite_candle_floats(row: &ShadowSealRow) -> u64 {
+    [
+        row.open,
+        row.high,
+        row.low,
+        row.close,
+        row.change_pct,
+        row.open_pct,
+    ]
+    .iter()
+    .filter(|v| !v.is_finite())
+    .count() as u64
+}
 
 #[cfg(test)]
 mod tests {
@@ -1581,6 +1612,32 @@ mod tests {
             close_latency_ns: None,
             window_span_latency_ns: None,
         }
+    }
+
+    /// 2026-09-26 audit fix PR2: the tripwire counts exactly the non-finite
+    /// float columns, and a normal bar counts zero.
+    #[test]
+    fn test_count_nonfinite_candle_floats_counts_only_nan_and_inf() {
+        let mut row = contract_row(1, "NSE_EQ");
+        assert_eq!(count_nonfinite_candle_floats(&row), 0);
+        row.open = f64::NAN;
+        row.close = f64::INFINITY;
+        row.open_pct = f64::NEG_INFINITY;
+        assert_eq!(count_nonfinite_candle_floats(&row), 3);
+        // Finite extremes are data, not faults.
+        let mut edge = contract_row(1, "NSE_EQ");
+        edge.high = f64::MAX;
+        edge.low = -0.0;
+        edge.change_pct = f64::MIN_POSITIVE / 2.0;
+        assert_eq!(count_nonfinite_candle_floats(&edge), 0);
+    }
+
+    #[test]
+    fn nonfinite_counter_name_is_pinned() {
+        assert_eq!(
+            CANDLE_NONFINITE_COLUMNS_COUNTER,
+            "tv_candle_nonfinite_columns_total"
+        );
     }
 
     fn publish_one(security_id: i64, segment: &'static str, name: &str) {
