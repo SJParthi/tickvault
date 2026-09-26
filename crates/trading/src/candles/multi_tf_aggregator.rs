@@ -1774,21 +1774,57 @@ impl MultiTfAggregator {
     /// three weeks after the harness landed.
     /// The literal `21` this line once carried was stale; cite the
     /// constant so it cannot go stale again.)
-    pub fn catch_up_seal_all<F>(&mut self, cutoff_secs: u32, mut on_seal: F) -> usize
+    pub fn catch_up_seal_all<F>(&mut self, cutoff_secs: u32, on_seal: F) -> usize
     where
         F: FnMut(Feed, u64, u8, TfIndex, LiveCandleState),
     {
+        self.catch_up_seal_slots(cutoff_secs, 0, usize::MAX, on_seal)
+            .0
+    }
+
+    /// The same catch-up seal over at most `max_slots` slots starting at
+    /// `from_slot` — the resumable form the frame drain runs in bounded steps
+    /// from its idle arm (audit PR4b, 2026-09-26), so a frame waits for one
+    /// step rather than for the whole book.
+    ///
+    /// Returns `(emitted, next_slot)`. The sweep is finished when `next_slot`
+    /// reaches [`Self::len`]. Slots are only ever appended, never removed or
+    /// reordered, so a cursor stays valid across calls: a slot created
+    /// mid-sweep lands past the cursor and is visited by this sweep too.
+    ///
+    /// Sealing one slot's cells is independent of every other slot, so the
+    /// bars a sweep produces are the same whether it runs in one call or many
+    /// with the same `cutoff_secs` (pinned by
+    /// `catch_up_seal_in_slices_seals_the_same_bars`).
+    ///
+    /// # Complexity
+    /// O(`max_slots` × [`TF_COUNT`]) per call.
+    pub fn catch_up_seal_slots<F>(
+        &mut self,
+        cutoff_secs: u32,
+        from_slot: usize,
+        max_slots: usize,
+        mut on_seal: F,
+    ) -> (usize, usize)
+    where
+        F: FnMut(Feed, u64, u8, TfIndex, LiveCandleState),
+    {
+        let len = self.slots.len();
+        let start = from_slot.min(len);
+        let end = start.saturating_add(max_slots).min(len);
         let mut emitted = 0_usize;
-        for slot in &mut self.slots {
-            let (feed, sid, seg) = slot.key;
-            for tf in TfIndex::ALL {
-                if let Some(state) = slot.cell.catch_up_seal(tf, cutoff_secs) {
-                    emitted = emitted.saturating_add(1);
-                    on_seal(feed, sid, seg, tf, state);
+        if let Some(range) = self.slots.get_mut(start..end) {
+            for slot in range {
+                let (feed, sid, seg) = slot.key;
+                for tf in TfIndex::ALL {
+                    if let Some(state) = slot.cell.catch_up_seal(tf, cutoff_secs) {
+                        emitted = emitted.saturating_add(1);
+                        on_seal(feed, sid, seg, tf, state);
+                    }
                 }
             }
         }
-        emitted
+        (emitted, end)
     }
 }
 
@@ -3921,6 +3957,97 @@ mod tests {
         let mut later: Vec<TfIndex> = Vec::new();
         let _ = agg.catch_up_seal_all(OPEN + 60, |_, _, _, tf, _| later.push(tf));
         assert!(later.contains(&TfIndex::M1));
+    }
+
+    /// Builds an aggregator whose instruments tick at scattered times, so a
+    /// catch-up cutoff seals a mix of frames per slot.
+    fn scattered_book(instruments: u64, seed: u64) -> MultiTfAggregator {
+        let mut agg = MultiTfAggregator::default();
+        for sid in 1..=instruments {
+            let mix = sid.wrapping_mul(2_654_435_761).wrapping_add(seed);
+            let first = OPEN + (mix % 170) as u32;
+            let _ = agg.consume_tick(
+                Feed::Dhan,
+                &tick(sid, SEG_EQ, first, 100.0 + (mix % 50) as f32, 10),
+                None,
+                |_, _, _, _, _| {},
+            );
+            if mix % 3 == 0 {
+                let _ = agg.consume_tick(
+                    Feed::Dhan,
+                    &tick(sid, SEG_EQ, first + (mix % 7) as u32, 101.0, 25),
+                    None,
+                    |_, _, _, _, _| {},
+                );
+            }
+        }
+        agg
+    }
+
+    type Sealed = (Feed, u64, u8, TfIndex, LiveCandleState);
+
+    /// Audit PR4b: the drain now runs the catch-up seal in slices. Whatever
+    /// the slice size, the bars sealed must be exactly the bars one
+    /// `catch_up_seal_all` call seals, in the same order, and the cursor
+    /// must end at the slot count.
+    #[test]
+    fn catch_up_seal_in_slices_seals_the_same_bars() {
+        let mut sealed_any = 0_usize;
+        for (instruments, seed) in [(0_u64, 0_u64), (1, 7), (37, 3), (300, 11), (1_031, 5)] {
+            for cutoff in [OPEN, OPEN + 30, OPEN + 61, OPEN + 200] {
+                let mut whole = scattered_book(instruments, seed);
+                let mut want: Vec<Sealed> = Vec::new();
+                let n = whole.catch_up_seal_all(cutoff, |f, s, g, tf, st| {
+                    want.push((f, s, g, tf, st));
+                });
+                assert_eq!(n, want.len());
+                sealed_any += n;
+
+                for step in [1_usize, 2, 7, 256, 5_000] {
+                    let mut sliced = scattered_book(instruments, seed);
+                    let mut got: Vec<Sealed> = Vec::new();
+                    let mut cursor = 0_usize;
+                    let mut total = 0_usize;
+                    let mut calls = 0_usize;
+                    loop {
+                        let (emitted, next) =
+                            sliced.catch_up_seal_slots(cutoff, cursor, step, |f, s, g, tf, st| {
+                                got.push((f, s, g, tf, st));
+                            });
+                        total += emitted;
+                        assert!(next >= cursor, "the cursor never moves backwards");
+                        cursor = next;
+                        calls += 1;
+                        if cursor >= sliced.len() {
+                            break;
+                        }
+                        assert!(calls <= instruments as usize + 1, "the slices must finish");
+                    }
+                    assert_eq!(
+                        got, want,
+                        "{instruments} slots, step {step}, cutoff {cutoff}: the sliced \
+                         catch-up sealed different bars"
+                    );
+                    assert_eq!(total, n);
+                    assert_eq!(cursor, sliced.len());
+                }
+            }
+        }
+        assert!(
+            sealed_any > 1_000,
+            "the fixture must seal real bars, sealed {sealed_any}"
+        );
+    }
+
+    /// A cursor past the end (the book never shrinks, but a caller could hold
+    /// a stale one) seals nothing and reports the slot count, never panics.
+    #[test]
+    fn catch_up_seal_slots_past_the_end_is_a_no_op() {
+        let mut agg = scattered_book(5, 1);
+        let (emitted, next) = agg.catch_up_seal_slots(OPEN + 200, 99, 10, |_, _, _, _, _| {});
+        assert_eq!((emitted, next), (0, 5));
+        let (emitted, next) = agg.catch_up_seal_slots(OPEN + 200, 0, 0, |_, _, _, _, _| {});
+        assert_eq!((emitted, next), (0, 0), "a zero budget visits nothing");
     }
 
     /// I-P1-11 + the 2026-06-19 feed-in-key lock, in one test.

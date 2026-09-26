@@ -79,11 +79,39 @@ inline (PR2, PR8, PR14).
     `slice_sort_step_matches_sort_unstable_by` (proptest),
     `dhat_top_volume_sweep_begin_and_steps_zero_allocation`,
     `sliced_sweep_step_cost_at_the_authorized_ceiling` (ignored harness).
-- [ ] **PR4b — the catch-up seal sweep runs in slices too.** (`trading`, `app`) — found while
-  doing PR4. `catch_up_seal_all` is O(slots × TF_COUNT) on the drain's 5 s `catchup_timer`
-  arm; measured 9.67 ms at the 25,000 × 24 ceiling (2026-08-21), ~3.6 ms at today's
-  TF_COUNT = 9. Same shape of fix: a resumable cursor over the slots, advanced from the idle
-  arm. Tests: `catch_up_seal_in_slices_seals_the_same_bars` (proptest vs `catch_up_seal_all`).
+- [x] **PR4b — the catch-up seal sweep and the baseline rolls run in slices too.** (`trading`,
+  `app`) — found while doing PR4. DONE (as built):
+  - `catch_up_seal_all` was O(slots × TF_COUNT) on the drain's 5 s `catchup_timer` arm
+    (measured 9.67 ms at the 25,000 × 24 ceiling, 2026-08-21). The arm now only calls
+    `LiveIngest::begin_catch_up_seal` (O(1)); `MultiTfAggregator::catch_up_seal_slots` seals
+    `CATCHUP_SEAL_STEP_SLOTS` (256) slots per idle-arm step with a resumable cursor. A fire that
+    finds the sweep still running keeps the cursor, takes the newer cutoff and is counted on
+    `tv_candle_catch_up_overrun_total`. The shutdown path still seals the whole book in one call.
+  - PR4's leftover: `roll_baselines` walked every dirty key on the timer arm before 09:15 and on
+    a deferred window. `VolumeLeaderboard::begin_roll` now swaps the list into a pre-sized
+    `rolling` slot (O(1)) and `roll_step` visits `TOP_VOLUME_ROLL_STEP_KEYS` (2,048) keys per
+    idle step. If the previous roll of that cadence is unfinished (no idle time for a whole
+    cadence period) it falls back to the one-pass roll, counted on
+    `tv_top_volume_roll_inline_total`.
+  - One idle arm drives all three kinds of sliced work, one step per call, in priority order:
+    roll, catch-up seal, top-volume sweep (`LiveIngest::step_idle_work`).
+  - The catch-up "dropped seals" line is now `error!` (was `warn!`; re-check gap).
+  - Tests: `catch_up_seal_in_slices_seals_the_same_bars`,
+    `test_begin_catch_up_seal_then_step_idle_work_seals_like_catch_up_seal`,
+    `test_begin_roll_then_roll_step_rolls_like_roll_baselines`,
+    `test_begin_roll_falls_back_inline_while_the_last_roll_is_unfinished`, and the drain
+    ratchet `drain_cadence_arm_does_no_sort` extended to the catch-up arm.
+- [ ] **PR4c — each top-volume board is sorted once, at its candle close, from the candle's own
+  volume.** (`app`) Owner, 2026-09-26 12:34 UTC (decision card "At close") and 12:35 UTC: "when
+  canldes table respective timeframes timestamps gets finsihed and done means then its
+  respective top volume also shodu lrun right dude". Per tick stays O(1) count updates. Each
+  1s/3s/5s/1m board is ranked once when that timeframe's bar closes, from that same bar's volume
+  (fold `bar_for_window`, TF S1/S3/S5/M1 map 1:1 to the cadences), so the board and the candle
+  tables agree by construction (today the board measures by arrival time, candles by exchange
+  timestamp). The sort key `window_lots_milli` is an integer, so the sliced merge sort becomes a
+  sliced LSD radix sort: O(k) per close, i.e. amortized O(1) per tick. Not a per-tick sorted tree
+  (O(log n) per tick × 4 boards). Tests: `radix_board_order_matches_board_order` (proptest),
+  `board_volume_equals_candle_volume_for_the_same_window`.
 - [ ] **PR5 — honest panic handling.** (all crates)
   - Keep `panic = "abort"` (Cargo.toml:275) — a half-dead process holding sockets is worse
     than a clean restart by systemd. The two production `catch_unwind` sites are dead under
@@ -173,6 +201,107 @@ inline (PR2, PR8, PR14).
   - `deploy/aws/holiday-gate.sh` (132 lines, tickvault-holiday-gate.service:36) and
     `scripts/ensure-questdb.sh` (230 lines, tickvault.service:106 `ExecStartPre=-`) become
     subcommands of the app binary; the unit files call them; `rust_only_guard.rs` allowlist shrinks.
+
+
+### Added 2026-09-26 (second re-check, 26 new open gaps), riskiest first
+
+Source: the re-check comparison page, rows marked "New this check". Each location below is
+from that check and is re-read against the code when its PR is written; a row that turns out
+wrong is corrected in this file, not silently dropped.
+
+Order of work: D9 rule amendments → PR4c → PR15 → PR16 → PR17, then PR5–PR14 as before (with the additions
+folded into them below), then PR18, PR19 and the decisions.
+
+- [ ] **PR15 — candle seals never write a file on the drain.** (`storage`, `app`)
+  - When both seal queues are full the seal spill takes a lock and writes a file on the drain
+    (seal_writer_runner.rs:466-497, seal_spill.rs:798-833). D2 covers ticks, not seals. Give the
+    seal spill its own writer thread behind a bounded hand-off, the tick path's shape.
+  - The seal spill is replayed only at boot (`read_all` has no mid-session caller): replay it
+    after QuestDB has been healthy for 60 s, rate-capped, like PR12.
+  - Dropped seals were logged with `warn!` (dhan_feed_stack.rs:6634): DONE in PR4b.
+- [ ] **PR16 — nothing blocks the shared worker threads, and the drain gets its own thread.**
+  (`storage`, `app`)
+  - `df` is forked with no time limit from seven sites (disk_health_watcher.rs:121, :163, :239;
+    disk_pressure_boot.rs:266; resource_monitor.rs:606; wal_suspension_watcher.rs:1225;
+    partition_archive.rs:1724). Read free space with `statvfs` through `nix`/`libc` if already a
+    workspace dependency, else `spawn_blocking` with a timeout (no new dependency without approval).
+  - Spill replay reads up to 32 MiB with blocking calls (tick_spill_replay.rs:539, :593): move to
+    `spawn_blocking`.
+  - The disk-pressure archive gzips gigabytes on the shared pool during market hours
+    (partition_archive.rs:2500-2522, disk_pressure_boot.rs:546): run it on its own thread. The
+    archive stays O(bytes); only where it runs changes.
+  - The frame drain shares the multi-thread runtime (dhan_feed_stack.rs:14291, main.rs:505):
+    run it on a dedicated current-thread runtime on its own OS thread, so no other task can hold
+    its worker.
+- [ ] **PR17 — spill files survive a host crash and a torn line.** (`storage`, `core`)
+  - Spill, dead-letter and replay-marker files are never flushed to disk before the marker moves
+    (ws_frame_spill.rs:566; tick_persistence.rs:1344-1349, :2837, :3383): `sync_data` before the
+    marker advances, off the drain.
+  - A torn last line quarantines the whole hour (tick_spill_replay.rs:620-623): skip and count
+    the torn line, keep the rest.
+  - A frame the capture log refused and later deferred to it is labelled "deferred"
+    (pool_supervisor.rs:3924-4002, tick_persistence.rs:2791): fix the label; counter and alarm
+    are already right.
+  - Market data packed in the same frame as a disconnect message is thrown away
+    (connection.rs:1885-1915): capture the frame before closing. Lands with PR9's walker if that
+    PR is first.
+- [ ] **Folded into existing PRs:**
+  - PR5: seven more dead crash-recovery sites under `panic = "abort"` (order_leg_pnl_boot.rs:221,
+    day_ohlc_orchestrator.rs:315, tf_consistency_boot.rs:2287, order_runtime.rs:437,
+    dhan_order_push_observability.rs:390, disk_health_watcher.rs:302, order_readiness.rs:346).
+  - PR6: the pending paper-order list is rebuilt after every event (order_runtime.rs:915-925).
+  - PR7: the 162-byte full packet has no bench; the seal ring has no allocation test.
+  - PR10: two more per-tick maps (volume_leaderboard.rs:651, contract_underlying_map.rs:670).
+  - PR12: the tick-spill replay floods QuestDB when it comes back (tick_spill_replay.rs:1050-1124);
+    the same rate cap applies.
+  - D6: four more shell scripts (deploy/aws/user-data.sh.tftpl, host-tuning/apply-host-tuning.sh,
+    sysctl/verify-net-tuning.sh, tickvault-host-tuning.service:119-147, operator_control.rs:1913).
+- [ ] **PR18 — order-side lookups are O(1) and segment-keyed.** (`trading`, `app`)
+  - Unrealised P&L for the daily-loss check walks every position (risk/engine.rs:834): keep a
+    running total updated on each fill and mark.
+  - Paper-fill lookups use the security id alone (order_runtime.rs:915-929, risk/engine.rs:778):
+    composite `(security_id, segment)` key. Paper mode only; `dry_run` is not touched.
+- [ ] **PR19 — small cleanups.** (`app`, `core`, `api`, `tickvault-logs-mcp`, CI, deploy)
+  - Per-minute depth steering reloads data it never uses (depth_rebalance.rs:1888, :1895,
+    :2044-2051): drop the reload.
+  - Token-failure `error!` lines carry no error code (token_manager.rs:1436, :1464).
+  - Quote endpoint caches and queries by id without segment and builds an HTTP client per miss
+    (api/src/handlers/quote.rs:71, :84, :91, :140-145; response_cache.rs:176-180).
+  - Log-query tool runs any SQL (tickvault-logs-mcp/src/tools.rs:669-684): read-only statements only.
+  - The benchmark gate does not block merges (bench.yml:56-59): make its regression fail the run.
+  - Stale restart-limit comments (deploy/systemd/tickvault.service:120-121, :333).
+- [ ] **D7 — every socket refused at once (805, second login).** (`core`) All sockets park together
+  and D3 has no spare to move to (pool_supervisor.rs:738-748, :1786-1832). Owner asked
+  2026-09-26; the recommended option is: wait 5 minutes, redial one socket as a test, bring the
+  rest back only if Dhan accepts it, critical alert either way. Until the owner picks another option, that default is what gets built.
+- [ ] **D8 — index ids from the instrument file replace the fixed four.** (`app`) When the master
+  yields any index rows they REPLACE the four seeds (dhan_live_universe.rs:269-277). That swap is
+  deliberate and evidence-backed (seed ids measured receiving zero packets, comment above it), so
+  it stays. The gap is that an index the fixed list names (for example India VIX) can vanish
+  silently if the master's index rows omit it. Default chosen: keep the swap, and when a fixed
+  index has no master counterpart by symbol, keep that seed and raise one coded error naming it.
+- [ ] **D9 — a second Dhan account for the depth sockets only.** (`core`, `app`, `aws-lambdas`,
+  terraform) Owner, 2026-09-26 13:05 UTC: "i will get my friends accoutn as the seocnd accoputn
+  oen and only to haev this extra depth 20 and dpeth 200 websockets alone"; 13:09 UTC: "yes dhan
+  said go ahead with the secodn accoutn dude okay?". Not started until the
+  account exists and the rule files are amended FIRST (rule-file-first law): the WebSocket scope
+  lock (today ≤ 16 connections on ONE account) and the token-minter lock (§10.4 rejects a second
+  Dhan minter "anywhere"). Shape when it lands: a second credential set under its own SSM path,
+  its own minter publishing its own token parameter, a per-account socket budget (main feed and
+  order updates stay on the owner's account), 805/807 handling and the D7 probe run per account,
+  and every alarm and log line names which account.
+  Dhan's answer (madefortrade topic 94246, post 4, DhanStaff, 2026-09-24): depth limits "are
+  fixed and cannot be increased", "applicable on a per Client ID basis", and "you may consider
+  using multiple Client IDs, as the limits are tracked independently for each Client ID". The
+  question it answered described a second account in the owner's OWN name on the same server
+  and static IP; a friend's account and the same-IP point were not addressed. Owner chose
+  (2026-09-26 13:16 UTC, decision card): the second account is in the owner's OWN name, the
+  case Dhan answered. Rule amendments are the first PR after the current fix.
+- [ ] **D10 — no depth path relies on unsubscribe.** (`core`) Dhan depth unsubscribe (codes 25
+  and 24) takes no effect and gets no reply (madefortrade topic 94234; Dhan "reviewing" as of
+  2026-09-26). Depth-200 already rotates by redial and depth-20 is a static day set, but
+  `send_unsubscribe` still has depth-pool call sites (pool_supervisor.rs swap paths). Verify
+  each is unreachable for depth endpoints or make it redial-only, and pin that with a guard.
 
 ## Edge Cases
 
