@@ -112,6 +112,19 @@ inline (PR2, PR8, PR14).
   sliced LSD radix sort: O(k) per close, i.e. amortized O(1) per tick. Not a per-tick sorted tree
   (O(log n) per tick × 4 boards). Tests: `radix_board_order_matches_board_order` (proptest),
   `board_volume_equals_candle_volume_for_the_same_window`.
+  Split into two PRs (2026-09-26), because the two halves fail independently:
+  - [x] **PR4c-1 — the sliced radix sort.** `top_volume_sweep::SliceRadixSort` replaces the sliced
+    merge sort; `volume_leaderboard::board_radix_key` encodes `board_order` as a 3-word key
+    (`!window_lots_milli`, `security_id`, segment). A first scan ORs/ANDs each key word so a byte
+    that never varies costs no pass. Done: tests `board_radix_key_sorts_identically_to_board_order`
+    (the planned `radix_board_order_matches_board_order`, named for the guard),
+    `slice_radix_sort_step_matches_sort_unstable_by` (proptest),
+    `slice_radix_sort_step_skips_the_digits_that_never_vary`; `dhat_top_volume_sweep` still zero-alloc.
+  - [ ] **PR4c-2 — rank at the window's close, from the candle's own volume.** The trigger moves
+    from the wall-clock timer to the fold's exchange-time watermark crossing the window's end;
+    the rank key becomes the window's bar volume (`bar_for_window`), replacing the per-cadence
+    baselines and their rolls; a contract already trading in a later window stays marked for
+    that window's sweep.
 - [ ] **PR5 — honest panic handling.** (all crates)
   - Keep `panic = "abort"` (Cargo.toml:275) — a half-dead process holding sockets is worse
     than a clean restart by systemd. The two production `catch_unwind` sites are dead under

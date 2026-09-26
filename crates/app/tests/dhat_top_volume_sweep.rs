@@ -1,7 +1,7 @@
 //! Audit PR4 (2026-09-26) — DHAT zero-alloc test for the SLICED top-volume
 //! sweep: the O(1) swap the drain's cadence arm now pays
 //! (`VolumeLeaderboard::begin_sweep`) and the bounded steps the idle arm
-//! runs after it (`sweep_step`, `SliceSort::step`, `GainerWalk::step`).
+//! runs after it (`sweep_step`, `SliceRadixSort::step`, `GainerWalk::step`).
 //!
 //! Every buffer is sized once, outside the measured window. Inside it, a
 //! thousand full sweeps — trades, swap, collect, sort, gainer walk — must
@@ -24,10 +24,10 @@
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-use tickvault_app::top_volume_sweep::{SliceSort, TOP_VOLUME_SWEEP_STEP_ROWS};
+use tickvault_app::top_volume_sweep::{SliceRadixSort, TOP_VOLUME_SWEEP_STEP_ROWS};
 use tickvault_app::volume_leaderboard::{
     GainerVerdict, GainerWalk, MAX_TRACKED_CONTRACTS, OptionFamily, RankedContract,
-    VolumeLeaderboard, board_order,
+    VolumeLeaderboard, board_order, board_radix_key,
 };
 use tickvault_common::types::ExchangeSegment;
 use tickvault_storage::top_volume_rank_persistence::SnapshotCadence;
@@ -57,12 +57,12 @@ fn dhat_top_volume_sweep_begin_and_steps_zero_allocation() {
         let _ = lb.observe(contract(id, 1_000), OptionFamily::Stock);
     }
     let mut rows: Vec<RankedContract> = Vec::with_capacity(MAX_TRACKED_CONTRACTS);
-    let mut sorter = SliceSort::with_capacity(MAX_TRACKED_CONTRACTS);
+    let mut sorter = SliceRadixSort::with_capacity(MAX_TRACKED_CONTRACTS);
     let mut walk = GainerWalk::with_capacity(300);
     let mut round: u32 = 0;
     let sweep = |lb: &mut VolumeLeaderboard,
                  rows: &mut Vec<RankedContract>,
-                 sorter: &mut SliceSort<RankedContract>,
+                 sorter: &mut SliceRadixSort<RankedContract>,
                  walk: &mut GainerWalk,
                  round: &mut u32| {
         *round += 1;
@@ -81,7 +81,7 @@ fn dhat_top_volume_sweep_begin_and_steps_zero_allocation() {
             rows,
         ) {}
         sorter.reset();
-        while !sorter.step(rows, TOP_VOLUME_SWEEP_STEP_ROWS, board_order) {}
+        while !sorter.step(rows, TOP_VOLUME_SWEEP_STEP_ROWS, board_radix_key) {}
         walk.reset(300);
         while !walk.step(rows, TOP_VOLUME_SWEEP_STEP_ROWS, |u| {
             if u % 2 == 0 {
