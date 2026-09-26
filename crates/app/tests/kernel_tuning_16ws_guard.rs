@@ -38,8 +38,15 @@ use std::process::Command;
 // The 16 sockets, from websocket-connection-scope-lock.md (operator, 2026-08-09)
 // ---------------------------------------------------------------------------
 
-/// 5 main-feed + 5 depth-20 + 5 depth-200 + 1 order-update.
+/// 5 main-feed + 5 depth-20 + 5 depth-200 + 1 order-update, on the PRIMARY account.
 const AUTHORIZED_WEBSOCKETS: u64 = 16;
+
+/// The second, depth-only Dhan account (websocket-connection-scope-lock.md
+/// § "2026-09-26 — A SECOND DHAN ACCOUNT"): 5 depth-20 + 5 depth-200 more.
+/// It ships OFF. Its sockets count toward the budget below only when the
+/// terraform switch `dhan_depth_account_enabled` defaults to `true`, which is
+/// exactly the moment they can exist.
+const DEPTH_ACCOUNT_WEBSOCKETS: u64 = 10;
 
 /// Dhan pings every 10 s and CLOSES if the client has not answered within 40 s.
 /// Documented for BOTH the live feed (`docs/dhan-ref/03`) and full market depth
@@ -142,6 +149,35 @@ fn locked_instance_type(tf: &str) -> Option<String> {
     Some(v.trim().trim_matches('"').to_string())
 }
 
+/// The terraform `dhan_depth_account_enabled` default. Absent or unparseable
+/// reads as `true` — fail-closed: a switch this guard cannot read must not be
+/// allowed to hide ten sockets from the budget.
+fn depth_account_enabled_default(tf: &str) -> bool {
+    let Some(idx) = tf.find("variable \"dhan_depth_account_enabled\"") else {
+        return true;
+    };
+    let rest = &tf[idx..];
+    let block_end = rest[1..].find("variable \"").map_or(rest.len(), |n| n + 1);
+    let Some(line) = rest[..block_end]
+        .lines()
+        .find(|l| l.trim_start().starts_with("default"))
+    else {
+        return true;
+    };
+    line.split_once('=')
+        .is_none_or(|(_, v)| v.trim() != "false")
+}
+
+/// Sockets that can exist at once: the primary account's 16, plus the depth
+/// account's 10 when its switch is on.
+fn authorized_websockets(tf: &str) -> u64 {
+    if depth_account_enabled_default(tf) {
+        AUTHORIZED_WEBSOCKETS + DEPTH_ACCOUNT_WEBSOCKETS
+    } else {
+        AUTHORIZED_WEBSOCKETS
+    }
+}
+
 const GIB: u64 = 1024 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
@@ -170,7 +206,8 @@ fn sixteen_sockets_of_receive_buffer_fit_the_locked_instance() {
         });
 
     // Worst case: every authorized socket pinned at the per-socket ceiling.
-    let socket_worst_case = rmem_max * AUTHORIZED_WEBSOCKETS;
+    let sockets = authorized_websockets(&read(TF_VARS));
+    let socket_worst_case = rmem_max * sockets;
 
     let questdb = compose_mem_limit_bytes(&read(COMPOSE), "tv-questdb")
         .expect("docker-compose.yml no longer declares a QuestDB mem_limit default");
@@ -200,7 +237,6 @@ fn sixteen_sockets_of_receive_buffer_fit_the_locked_instance() {
          connection app-side to (budget / actual connection count) so the total \
          is bounded by design (PR #1738), or move to a bigger instance under a \
          dated operator quote.",
-        sockets = AUTHORIZED_WEBSOCKETS,
         per = rmem_max / (1024 * 1024),
         sock = socket_worst_case / (1024 * 1024),
         qdb = questdb / (1024 * 1024),
@@ -219,6 +255,51 @@ fn sixteen_sockets_of_receive_buffer_fit_the_locked_instance() {
          not a margin, it is a coincidence",
         headroom / (1024 * 1024)
     );
+}
+
+/// 2026-09-26: the scope lock REJECTS "defaulting the depth account on before
+/// the 26-socket sizing is recorded". This is where it is recorded, and this
+/// test keeps the record honest: the conf file must state the 26-socket
+/// arithmetic, and while that arithmetic does not leave the same 1 GiB
+/// headroom the 16-socket budget must, the switch must stay off.
+#[test]
+fn the_twenty_six_socket_budget_is_recorded_and_gates_the_depth_account() {
+    let conf = read(SYSCTL_CONF);
+    assert!(
+        conf.contains("26 sockets x 128 MiB ceiling = 3.25 GiB"),
+        "99-tickvault-net.conf must record the 26-socket arithmetic for the \
+         second, depth-only Dhan account (websocket-connection-scope-lock.md \
+         § 2026-09-26)"
+    );
+
+    let rmem_max = sysctl_value(&conf, "net.core.rmem_max").expect("no rmem_max");
+    let instance = locked_instance_type(&read(TF_VARS)).expect("no instance_type default");
+    let host_gib = INSTANCE_RAM_GIB
+        .iter()
+        .find(|(name, _)| *name == instance)
+        .map(|(_, gib)| *gib)
+        .expect("instance type is in the RAM table (the budget test above pins this)");
+    let questdb = compose_mem_limit_bytes(&read(COMPOSE), "tv-questdb").expect("no QuestDB cap");
+    let total = rmem_max * (AUTHORIZED_WEBSOCKETS + DEPTH_ACCOUNT_WEBSOCKETS)
+        + questdb
+        + NON_QUESTDB_NON_SOCKET_GIB_HIGH * GIB;
+    let host = host_gib * GIB;
+    let fits_with_headroom = total + GIB <= host;
+
+    if !fits_with_headroom {
+        assert!(
+            !depth_account_enabled_default(&read(TF_VARS)),
+            "the depth account is switched on, but 26 sockets x {} MiB + QuestDB \
+             {} MiB + {} MiB worst case = {} MiB leaves under 1 GiB of the {} MiB \
+             host. Bound the total first (per-connection SO_RCVBUF, or a smaller \
+             QuestDB cap), then switch the account on.",
+            rmem_max / (1024 * 1024),
+            questdb / (1024 * 1024),
+            NON_QUESTDB_NON_SOCKET_GIB_HIGH * 1024,
+            total / (1024 * 1024),
+            host / (1024 * 1024),
+        );
+    }
 }
 
 #[test]
@@ -438,4 +519,20 @@ fn parsers_are_self_tested() {
     let tf = "variable \"instance_type\" {\n  type = string\n  default = \"r8g.xlarge\"\n}\n";
     assert_eq!(locked_instance_type(tf), Some("r8g.xlarge".to_string()));
     assert_eq!(locked_instance_type("variable \"other\" {}"), None);
+
+    let off = "variable \"dhan_depth_account_enabled\" {\n  type = bool\n  default = false\n}\n\
+               variable \"next\" {\n  default = true\n}\n";
+    assert!(!depth_account_enabled_default(off));
+    assert_eq!(authorized_websockets(off), 16);
+    let on = "variable \"dhan_depth_account_enabled\" {\n  type = bool\n  default = true\n}\n";
+    assert!(depth_account_enabled_default(on));
+    assert_eq!(authorized_websockets(on), 26);
+    // Fail-closed: a switch the guard cannot find or read counts as ON, and
+    // the NEXT variable's default must never be read as this one's.
+    assert!(depth_account_enabled_default("variable \"other\" {}"));
+    let no_default = "variable \"dhan_depth_account_enabled\" {\n  type = bool\n}\n\
+                      variable \"next\" {\n  default = false\n}\n";
+    assert!(depth_account_enabled_default(no_default));
+    // The live file ships the account OFF.
+    assert!(!depth_account_enabled_default(&read(TF_VARS)));
 }
