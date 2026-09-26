@@ -153,7 +153,7 @@ pub const GENERIC_SAFE_LINE: &str = "🔔 Alert received — details are in the 
 ///
 /// O(n) scan per lookup — cold path (a handful of alarm renders per SNS
 /// batch), deliberately not a hash map so the table stays a reviewable literal.
-pub const ALARM_PHRASES: [(&str, &str); 111] = [
+pub const ALARM_PHRASES: [(&str, &str); 113] = [
     // ---- capacity + candle building ----
     (
         "aggregator-refusal-rate-high",
@@ -446,6 +446,10 @@ pub const ALARM_PHRASES: [(&str, &str); 111] = [
         "🔷 DHAN: the daily access-key helper is failing",
     ),
     (
+        "dhan-depth-token-minter-errors",
+        "🔷 DHAN: the second (depth-only) account's daily access-key helper is failing — only its extra depth sockets are affected",
+    ),
+    (
         "operator-control-errors",
         "The operator control page is failing",
     ),
@@ -489,6 +493,10 @@ pub const ALARM_PHRASES: [(&str, &str); 111] = [
     (
         "dhan-token-minter-not-invoked",
         "🔷 DHAN: the daily access-key helper did not run — its schedule was dropped",
+    ),
+    (
+        "dhan-depth-token-minter-not-invoked",
+        "🔷 DHAN: the second (depth-only) account's daily access-key helper did not run — its schedule was dropped",
     ),
     // ---- coded errors (the error!-to-phone route) ----
     (

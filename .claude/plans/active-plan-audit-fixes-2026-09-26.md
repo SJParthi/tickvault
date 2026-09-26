@@ -297,14 +297,29 @@ folded into them below), then PR18, PR19 and the decisions.
   and static IP; a friend's account and the same-IP point were not addressed. Owner chose
   (2026-09-26 13:16 UTC, decision card): the second account is in the owner's OWN name, the
   case Dhan answered. Rule amendments are the first PR after the current fix.
-  - [x] **D9a — rule amendments (this PR).** `websocket-connection-scope-lock.md` § "2026-09-26 — A
+  - [x] **D9a — rule amendments (#1949, merged).** `websocket-connection-scope-lock.md` § "2026-09-26 — A
     SECOND DHAN ACCOUNT…" (depth account: 5 + 5 depth sockets, total ≤ 26, own SSM path, ships OFF,
     `ROTATION_HALTED` kept process-wide) and `groww-shared-token-minter-2026-07-02.md` §10.9 (one
     minter per account). Both summary stubs updated.
-  - [ ] **D9b — the code.** Per-account credentials, token and socket budget; the depth minter
-    (schedule off); 26-socket sizing (depth writer, `kernel_tuning_16ws_guard.rs`, CloudWatch
-    budget); account label on every depth log, counter and alarm; `[dhan_depth_account] enabled =
-    false`.
+  - [ ] **D9b — the code, in three PRs.**
+    - [x] **D9b-1 — the depth account's minter (this PR).** `dhan_token_minter.rs` reads
+      `SSM_SERVICE` against a closed list of two (`dhan`, `dhan-depth`; unset = `dhan`, anything
+      else fails the mint) and threads the segment through the read and the write. New
+      `deploy/aws/terraform/dhan-depth-token-minter-lambda.tf`: same zip, own role reading the
+      three enumerated `/dhan-depth/` credentials and writing `/dhan-depth/access-token` only;
+      schedule `state` and the not-invoked alarm gated on `var.dhan_depth_account_enabled`
+      (default `false`). Primary minter sets `SSM_SERVICE = "dhan"` explicitly. Two alarm
+      phrases added. Tests: `dhan_token_minter::tests::parse_ssm_service_*`,
+      `a_depth_account_run_*`, `the_two_account_segments_never_share_a_parameter_path`,
+      `crates/aws-lambdas/tests/dhan_depth_token_minter_wiring_guard.rs`.
+    - [ ] **D9b-2 — widen 16 to 26 with no behaviour change.** Per-account `PoolBudget` counters
+      (depth account at global indices 16..25), `MAX_TOTAL_DHAN_CONNECTIONS`, the slot-label
+      array, `RECONNECT_JITTER_SLOTS`, the per-connection arrays, `endpoint_for_slot`, the
+      depth-200 tick-age exclusion range, `kernel_tuning_16ws_guard.rs` and the sysctl budget text.
+    - [ ] **D9b-3 — wire the pool behind `[dhan_depth_account] enabled = false`.** Own client id;
+      a READ-ONLY token source re-read from `/dhan-depth/access-token` (an 807 on the depth account
+      re-reads, never mints: minting from the box would fight its Lambda); `account` label on
+      every depth log, counter and alarm; the second pool static (no steering) until measured.
 - [ ] **D10 — no depth path relies on unsubscribe.** (`core`) Dhan depth unsubscribe (codes 25
   and 24) takes no effect and gets no reply (madefortrade topic 94234; Dhan "reviewing" as of
   2026-09-26). Depth-200 already rotates by redial and depth-20 is a static day set, but

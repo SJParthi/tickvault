@@ -114,7 +114,10 @@ resource "aws_lambda_function" "dhan_token_minter" {
       # scanner forbids hardcoded URLs in production source), so an absent
       # value fails the mint loudly instead of guessing a host.
       DHAN_AUTH_BASE_URL = "https://auth.dhan.co"
-      LOG_LEVEL          = "INFO"
+      # The PRIMARY account (§10.9: one minter per account). The depth
+      # account has its own function in dhan-depth-token-minter-lambda.tf.
+      SSM_SERVICE = "dhan"
+      LOG_LEVEL   = "INFO"
     }
   }
 
