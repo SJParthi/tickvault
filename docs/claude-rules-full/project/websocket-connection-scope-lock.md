@@ -8203,3 +8203,93 @@ the operator's accepted cost, and the breaker is what bounds it.
   record without its own dated quote.
 - Raises the rotation cap above one per socket per minute or five pool-wide.
 - Chooses k by any rule other than "largest k ≤ 4 that fits the 250 budget".
+
+### 2026-09-26 — A SECOND DHAN ACCOUNT, IN THE OPERATOR'S OWN NAME, FOR DEPTH-20 AND DEPTH-200 SOCKETS ONLY
+
+**The verbatim operator demands (2026-09-26, typed directly in the project
+thread — preserve EXACTLY, typos included):**
+
+> "what secodn account dude cant understand see i will get my friends accoutn as the seocnd accoputn oen and only to haev this extra depth 20 and dpeth 200 websockets alone dude okay?"
+>
+> (13:05 UTC)
+
+> "yes dhan said go ahead with the secodn accoutn dude okay?https://madefortrade.in/t/full-market-depth-limits-increase/94246/3. https://madefortrade.in/t/full-market-depth-20-and-200-unsubscribe-does-not-work-and-gets-no-response/94234/2."
+>
+> (13:09 UTC, with two screenshots of Dhan support ticket #6353597)
+
+**The operator's decision (2026-09-26 13:16 UTC, decision card "Whose name is
+the second account in?"):** **"My own name".** The second account is opened in
+the operator's OWN name. A friend's account is NOT authorized by this section.
+
+**What Dhan said (madefortrade topic 94246, post 4, DhanStaff, 2026-09-24,
+read 2026-09-26):** the depth limits "are fixed and cannot be increased", they
+are "applicable on a per Client ID basis", and "you may consider using multiple
+Client IDs, as the limits are tracked independently for each Client ID". The
+question that answer replied to described a second account in the asker's OWN
+name, on the same server and static IP. It did not address another person's
+account, which is why this section authorizes only the own-name case.
+
+Recorded HERE before any code, per the rule-file-first law.
+
+#### What this AMENDS
+
+| Surface | Was (2026-08-09 SECOND QUOTE) | Now |
+|---|---|---|
+| Dhan accounts | one (client `1106656882`) | **two**: the PRIMARY account unchanged, plus ONE DEPTH account in the operator's own name |
+| Main-feed connections | up to 5, primary account | unchanged: up to 5, **primary account only** |
+| Order-update WS | 1, primary account | unchanged: 1, **primary account only** |
+| depth-20 | up to 5, primary account | up to 5 on the primary account **plus up to 5 on the depth account** |
+| depth-200 | up to 5, primary account | up to 5 on the primary account **plus up to 5 on the depth account** |
+| **Total live WebSocket connections** | **≤ 16** | **≤ 26** (16 on the primary account + 10 on the depth account) |
+
+The depth account carries depth sockets and NOTHING ELSE: no main feed, no
+order update, no orders, no REST beyond minting its own token. Every other
+depth rule in this file applies unchanged to its sockets (stock options only
+on depth-200, the depth-20 static day set, rotation by redial, the per-socket
+and pool-wide rotation caps, no index spot, future or BSE contract on a depth
+socket).
+
+#### The mechanical contract for the code that follows
+
+| Aspect | Locked value |
+|---|---|
+| Credentials | `/tickvault/<env>/dhan-depth/{client-id,client-secret,totp-secret}` in SSM, read-only from tickvault, `Secret<String>` in memory, never logged. A separate service segment, so no read or write scope of the primary account's `/dhan/` path can reach them |
+| Token | minted by its OWN minter and published to `/tickvault/<env>/dhan-depth/access-token` only (see `groww-shared-token-minter-2026-07-02.md` §10.9). One minter per ACCOUNT, never two for one account |
+| Socket budget | per account, per endpoint type: 5 depth-20 + 5 depth-200 on the depth account. A depth socket carries the credentials of exactly one account for its whole life, including every redial |
+| Disconnect handling | 805 and 807 are handled per account: an 807 on one account refreshes only that account's token. The process-wide `ROTATION_HALTED` breaker is KEPT process-wide: an 805 on EITHER account halts depth-200 rotation on BOTH until the process restarts, because whether Dhan correlates two accounts on one IP is Unknown and the cautious answer costs only rotations |
+| Observability | every log line, counter label and alarm that names a depth socket also names its account (`primary` / `depth`), never a client id in a Telegram body |
+| Default | the depth account ships **OFF** (`[dhan_depth_account] enabled = false`). Turning it on is a config flip once the account exists and its SSM parameters are seeded |
+| Degrade | a missing, expired or refused depth-account token never touches the primary account: its sockets stay down, a coded error names the account, and the primary account's feed, depth and orders carry on |
+
+#### ⚠ Honest envelope
+
+- **The account does not exist yet.** Nothing here is live until the operator
+  opens it, subscribes it to Dhan's data plan (Assumed to be required per
+  account, as the depth limits are), and seeds the three SSM parameters.
+- **Doubling the depth sockets doubles the depth row volume.** Depth is
+  already the largest payload in the process (24× ticks, measured
+  2026-08-28). The code PR must size the depth writer, the host memory
+  arithmetic (`kernel_tuning_16ws_guard.rs` pins 16 sockets today) and the
+  CloudWatch budget for 26 sockets before the flag can default on.
+- **Same IP, two accounts** is the case Dhan's staff answer described; whether
+  Dhan throttles per IP as well as per client id is Unknown.
+- **The depth unsubscribe still does nothing** (topic 94234, Dhan "reviewing"
+  as of 2026-09-26). The second account inherits the redial-only rotation; no
+  depth path may rely on unsubscribe on either account (plan item D10).
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Wires an account that is not in the operator's own name, or a third account,
+  without a fresh dated quote HERE first.
+- Opens a main-feed or order-update socket, places an order, or calls any REST
+  endpoint other than the token mint on the depth account.
+- Exceeds 5 depth-20 or 5 depth-200 sockets on either account, or 26 in total.
+- Lets one socket switch accounts across a redial, or shares one token between
+  the two accounts.
+- Makes `ROTATION_HALTED` per account, or clears it within a session.
+- Lets a depth-account failure halt, redial or re-mint anything on the primary
+  account.
+- Ships `[dhan_depth_account] enabled = true` as the default before the sizing
+  above is done and recorded.
+- Logs a client id, PIN, TOTP or token of either account, or puts a client id
+  in a Telegram body.
