@@ -34,6 +34,14 @@
 //! | order-update | `api-order-update.dhan.co` (`17-live-order-update.md:27`) | 1 | n/a |
 //! | **total** | | **16** | |
 //!
+//! **2026-09-26 — a second, depth-only account.** The operator added a second
+//! Dhan account in the operator's own name, used ONLY for extra depth-20 and
+//! depth-200 sockets (`websocket-connection-scope-lock.md` § "2026-09-26 — A
+//! SECOND DHAN ACCOUNT"). Dhan counts every cap per Client ID, so that account
+//! adds its own 5 + 5 and never a main-feed or order-update socket: 16 + 10 =
+//! 26 slots in total. See [`DhanAccount`] for the slot layout. The account
+//! ships OFF, so the live count stays at 16 until it is switched on.
+//!
 //! **`global-stocks-api-feed.dhan.co` (`25-global-stocks.md:544`) — the US
 //! global-stocks feed — is a FIFTH endpoint type on a different host and is
 //! FORBIDDEN.** Operator constraint, 2026-08-09: India feed only, never the US
@@ -63,7 +71,7 @@
 //! this refusal is counter-and-log visible rather than a page.
 //!
 //! # Allocation
-//! [`PoolBudget`] is four `u8` counters on the stack; every method is integer
+//! [`PoolBudget`] is six `u8` counters on the stack; every method is integer
 //! comparison and saturating arithmetic. No heap, no locks, no indexing.
 
 use tracing::warn;
@@ -99,12 +107,35 @@ pub const MAX_DEPTH_200_CONNECTIONS: u8 = MAX_TWO_HUNDRED_DEPTH_CONNECTIONS as u
 /// a MARKET-DATA authorization; live order fire stays locked.
 pub const MAX_ORDER_UPDATE_CONNECTIONS: u8 = 1;
 
-/// Hard ceiling across every Dhan endpoint type. Equals the sum of the four
-/// per-type caps — pinned by
+/// Connections the PRIMARY account may hold: the sum of the four per-type caps,
+/// 5 + 5 + 5 + 1 = 16. Pinned by
 /// `test_max_connections_per_type_sums_to_the_total_ceiling`, which is what
-/// makes a seventeenth connection arithmetically unreachable rather than merely
-/// unlikely.
-pub const MAX_TOTAL_DHAN_CONNECTIONS: u8 = 16;
+/// makes a seventeenth primary connection arithmetically unreachable rather
+/// than merely unlikely.
+pub const MAX_PRIMARY_ACCOUNT_CONNECTIONS: u8 = MAX_MAIN_FEED_CONNECTIONS
+    + MAX_DEPTH_20_CONNECTIONS
+    + MAX_DEPTH_200_CONNECTIONS
+    + MAX_ORDER_UPDATE_CONNECTIONS;
+
+/// Max depth-20 connections on the second, DEPTH-only account
+/// (`websocket-connection-scope-lock.md` § "2026-09-26 — A SECOND DHAN
+/// ACCOUNT"). Dhan's limits are per Client ID, so this account has its own five.
+pub const MAX_DEPTH_ACCOUNT_DEPTH_20_CONNECTIONS: u8 = MAX_DEPTH_20_CONNECTIONS;
+
+/// Max depth-200 connections on the DEPTH account (same section, same reason).
+pub const MAX_DEPTH_ACCOUNT_DEPTH_200_CONNECTIONS: u8 = MAX_DEPTH_200_CONNECTIONS;
+
+/// Connections the DEPTH account may hold: 5 depth-20 + 5 depth-200. It never
+/// opens a main-feed or order-update socket.
+pub const MAX_DEPTH_ACCOUNT_CONNECTIONS: u8 =
+    MAX_DEPTH_ACCOUNT_DEPTH_20_CONNECTIONS + MAX_DEPTH_ACCOUNT_DEPTH_200_CONNECTIONS;
+
+/// Hard ceiling across every account and every endpoint type: 16 primary + 10
+/// depth-account = 26 (2026-09-26). The depth account ships OFF, so in
+/// production today the live count stays at 16; this is the size of the slot
+/// space, which every per-socket table is dimensioned from.
+pub const MAX_TOTAL_DHAN_CONNECTIONS: u8 =
+    MAX_PRIMARY_ACCOUNT_CONNECTIONS + MAX_DEPTH_ACCOUNT_CONNECTIONS;
 
 /// The metric label for every global socket slot, resolved at compile time.
 ///
@@ -115,7 +146,8 @@ pub const MAX_TOTAL_DHAN_CONNECTIONS: u8 = 16;
 /// is refused on principle: a label set that is bounded and known at compile
 /// time has no reason to allocate at all.
 pub const CONNECTION_SLOT_LABELS: [&str; MAX_TOTAL_DHAN_CONNECTIONS as usize] = [
-    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15",
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16",
+    "17", "18", "19", "20", "21", "22", "23", "24", "25",
 ];
 
 /// The `"connection"` label for a global slot; `"unknown"` past the ceiling,
@@ -212,8 +244,9 @@ pub const DEPTH_20_INSTRUMENTS_PER_SUBSCRIBE_MESSAGE: u32 = 50;
 // module's own source to keep it that way.
 
 /// Metric incremented on every refused connection open.
-/// Labels: `endpoint` (the endpoint type), `reason` (`endpoint_at_capacity` or
-/// `total_at_capacity`).
+/// Labels: `account` (`primary` or `depth`), `endpoint` (the endpoint type),
+/// `reason` (`endpoint_at_capacity`, `total_at_capacity` or
+/// `endpoint_not_permitted`). Local `/metrics` only — not EMF-selected.
 pub const POOL_BUDGET_REFUSED_METRIC: &str = "tv_dhan_pool_budget_refused_total";
 
 // ---------------------------------------------------------------------------
@@ -374,12 +407,14 @@ impl DhanEndpointType {
 
     /// First global connection index owned by this endpoint type.
     ///
-    /// The four types tile the global index space `0..16` contiguously and
+    /// The PRIMARY account's slots. The four types tile `0..16` contiguously and
     /// without overlap (`main-feed 0..5`, `depth-20 5..10`, `depth-200 10..15`,
     /// `order-update 15..16`), so every live connection has a unique global
     /// index and therefore — via
     /// [`super::reconnect_ladder::reconnect_jitter_ms`] — a unique reconnect
-    /// stagger. Pinned by `test_jitter_base_tiles_the_sixteen_slots_exactly`.
+    /// stagger. Pinned by `test_jitter_base_tiles_the_sixteen_slots_exactly`. The
+    /// depth account's pools sit after these, at `16..26` — see
+    /// [`DhanAccount::jitter_base`].
     #[must_use]
     pub const fn jitter_base(self) -> u8 {
         match self {
@@ -412,6 +447,133 @@ impl core::fmt::Display for DhanEndpointType {
 }
 
 // ---------------------------------------------------------------------------
+// Account
+// ---------------------------------------------------------------------------
+
+/// Which Dhan account a socket is opened on (2026-09-26).
+///
+/// Dhan counts connections per Client ID, and an over-limit socket is not
+/// refused: the OLDEST one of that type on that account is killed with 805. So
+/// every cap in this module is per account, and the two accounts' sockets live
+/// in disjoint slices of the global slot space:
+///
+/// | account | endpoint | global slots |
+/// |---|---|---|
+/// | primary | main feed | 0..5 |
+/// | primary | depth-20 | 5..10 |
+/// | primary | depth-200 | 10..15 |
+/// | primary | order update | 15 |
+/// | depth | depth-20 | 16..21 |
+/// | depth | depth-200 | 21..26 |
+///
+/// The primary block is exactly the pre-2026-09-26 layout, so a socket on the
+/// primary account keeps its slot, its metric label and its reconnect stagger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DhanAccount {
+    /// The operator's trading account: main feed, depth, order updates.
+    Primary,
+    /// The second account, in the operator's own name, used ONLY for extra
+    /// depth-20 and depth-200 sockets. It never opens a main-feed or
+    /// order-update socket and never places an order.
+    Depth,
+}
+
+impl DhanAccount {
+    /// Both accounts, in slot order.
+    pub const ALL: [Self; 2] = [Self::Primary, Self::Depth];
+
+    /// Whether this account may open `endpoint` at all.
+    #[must_use]
+    pub const fn permits(self, endpoint: DhanEndpointType) -> bool {
+        match self {
+            Self::Primary => true,
+            Self::Depth => matches!(
+                endpoint,
+                DhanEndpointType::Depth20 | DhanEndpointType::Depth200
+            ),
+        }
+    }
+
+    /// Max simultaneous `endpoint` connections on this account; `0` for an
+    /// endpoint the account may not open.
+    #[must_use]
+    pub const fn max_connections(self, endpoint: DhanEndpointType) -> u8 {
+        match (self, endpoint) {
+            (Self::Primary, _) => endpoint.max_connections(),
+            (Self::Depth, DhanEndpointType::Depth20) => MAX_DEPTH_ACCOUNT_DEPTH_20_CONNECTIONS,
+            (Self::Depth, DhanEndpointType::Depth200) => MAX_DEPTH_ACCOUNT_DEPTH_200_CONNECTIONS,
+            (Self::Depth, DhanEndpointType::MainFeed | DhanEndpointType::OrderUpdate) => 0,
+        }
+    }
+
+    /// Every connection this account may hold at once.
+    #[must_use]
+    pub const fn connection_ceiling(self) -> u8 {
+        match self {
+            Self::Primary => MAX_PRIMARY_ACCOUNT_CONNECTIONS,
+            Self::Depth => MAX_DEPTH_ACCOUNT_CONNECTIONS,
+        }
+    }
+
+    /// First global slot of this account's `endpoint` pool. For an endpoint
+    /// the account may not open this is the ceiling itself, so the pool's
+    /// range `base..base + 0` is empty and names no slot.
+    #[must_use]
+    pub const fn jitter_base(self, endpoint: DhanEndpointType) -> u8 {
+        match (self, endpoint) {
+            (Self::Primary, _) => endpoint.jitter_base(),
+            (Self::Depth, DhanEndpointType::Depth20) => MAX_PRIMARY_ACCOUNT_CONNECTIONS,
+            (Self::Depth, DhanEndpointType::Depth200) => {
+                MAX_PRIMARY_ACCOUNT_CONNECTIONS + MAX_DEPTH_ACCOUNT_DEPTH_20_CONNECTIONS
+            }
+            (Self::Depth, DhanEndpointType::MainFeed | DhanEndpointType::OrderUpdate) => {
+                MAX_TOTAL_DHAN_CONNECTIONS
+            }
+        }
+    }
+
+    /// Stable lowercase tag for logs and metric labels.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Depth => "depth",
+        }
+    }
+}
+
+impl core::fmt::Display for DhanAccount {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The account and endpoint that own a global slot; `None` past the ceiling.
+///
+/// Eight range tests at most (two accounts × four endpoints), no table to keep
+/// in step with the pool: the ranges come from the same `jitter_base` and
+/// `max_connections` the budget grants slots from.
+#[must_use]
+pub const fn slot_owner(global_index: ConnectionId) -> Option<(DhanAccount, DhanEndpointType)> {
+    let mut a = 0;
+    while a < DhanAccount::ALL.len() {
+        let account = DhanAccount::ALL[a];
+        let mut e = 0;
+        while e < DhanEndpointType::ALL.len() {
+            let endpoint = DhanEndpointType::ALL[e];
+            let start = account.jitter_base(endpoint);
+            let end = start.saturating_add(account.max_connections(endpoint));
+            if global_index >= start && global_index < end {
+                return Some((account, endpoint));
+            }
+            e += 1;
+        }
+        a += 1;
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Refusal
 // ---------------------------------------------------------------------------
 
@@ -422,31 +584,50 @@ impl core::fmt::Display for DhanEndpointType {
 /// fully-subscribed socket with code 805.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum PoolBudgetRefusal {
-    /// This endpoint type already holds its maximum connections.
+    /// This endpoint type already holds its maximum connections on this
+    /// account.
     #[error(
-        "refused to open a {endpoint} connection: {open}/{max} already open for this endpoint \
-         type; opening a further one would make Dhan silently disconnect the OLDEST with code 805"
+        "refused to open a {endpoint} connection on the {account} account: {open}/{max} already \
+         open for this endpoint type; opening a further one would make Dhan silently disconnect \
+         the OLDEST with code 805"
     )]
     EndpointTypeAtCapacity {
+        /// The account whose pool is full.
+        account: DhanAccount,
         /// The endpoint type that is full.
         endpoint: DhanEndpointType,
-        /// Connections currently open for that type.
+        /// Connections currently open for that type on that account.
         open: u8,
-        /// The type's cap.
+        /// The type's cap on that account.
         max: u8,
     },
-    /// The global 16-connection ceiling is already reached.
+    /// The account's connection ceiling is already reached (16 primary, 10
+    /// depth).
     #[error(
-        "refused to open a {endpoint} connection: {open}/{max} total Dhan connections already \
-         open (the operator-authorized ceiling)"
+        "refused to open a {endpoint} connection on the {account} account: {open}/{max} total \
+         connections already open on that account (the operator-authorized ceiling)"
     )]
     TotalAtCapacity {
+        /// The account whose ceiling is reached.
+        account: DhanAccount,
         /// The endpoint type that was requested.
         endpoint: DhanEndpointType,
-        /// Total connections currently open across all types.
+        /// Total connections currently open on that account.
         open: u16,
-        /// The global ceiling.
+        /// That account's ceiling.
         max: u16,
+    },
+    /// The account may never open this endpoint type: the depth account opens
+    /// depth sockets only (`websocket-connection-scope-lock.md` § 2026-09-26).
+    #[error(
+        "refused to open a {endpoint} connection on the {account} account: that account is \
+         authorized for depth-20 and depth-200 sockets only"
+    )]
+    EndpointNotPermittedOnAccount {
+        /// The account that was asked.
+        account: DhanAccount,
+        /// The endpoint type it may not open.
+        endpoint: DhanEndpointType,
     },
 }
 
@@ -457,6 +638,7 @@ impl PoolBudgetRefusal {
         match self {
             Self::EndpointTypeAtCapacity { .. } => "endpoint_at_capacity",
             Self::TotalAtCapacity { .. } => "total_at_capacity",
+            Self::EndpointNotPermittedOnAccount { .. } => "endpoint_not_permitted",
         }
     }
 
@@ -465,7 +647,18 @@ impl PoolBudgetRefusal {
     pub const fn endpoint(self) -> DhanEndpointType {
         match self {
             Self::EndpointTypeAtCapacity { endpoint, .. }
-            | Self::TotalAtCapacity { endpoint, .. } => endpoint,
+            | Self::TotalAtCapacity { endpoint, .. }
+            | Self::EndpointNotPermittedOnAccount { endpoint, .. } => endpoint,
+        }
+    }
+
+    /// The account whose open was refused.
+    #[must_use]
+    pub const fn account(self) -> DhanAccount {
+        match self {
+            Self::EndpointTypeAtCapacity { account, .. }
+            | Self::TotalAtCapacity { account, .. }
+            | Self::EndpointNotPermittedOnAccount { account, .. } => account,
         }
     }
 }
@@ -478,11 +671,14 @@ impl PoolBudgetRefusal {
 /// connection task needs; holding one is what entitles a caller to dial.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConnectionSlot {
+    /// Which account this slot's socket is opened on.
+    pub account: DhanAccount,
     /// Which endpoint type this slot belongs to.
     pub endpoint: DhanEndpointType,
     /// Zero-based index of this connection WITHIN its own pool (`0..max`).
     pub pool_index: u8,
-    /// Zero-based index of this connection across ALL pools (`0..16`).
+    /// Zero-based index of this connection across ALL pools of BOTH accounts
+    /// (`0..MAX_TOTAL_DHAN_CONNECTIONS`).
     /// Feeds [`super::reconnect_ladder::reconnect_jitter_ms`].
     pub global_index: ConnectionId,
 }
@@ -503,6 +699,10 @@ pub struct PoolBudget {
     depth_20: u8,
     depth_200: u8,
     order_update: u8,
+    /// Depth-20 sockets open on the DEPTH account.
+    depth_account_depth_20: u8,
+    /// Depth-200 sockets open on the DEPTH account.
+    depth_account_depth_200: u8,
 }
 
 impl PoolBudget {
@@ -512,90 +712,149 @@ impl PoolBudget {
         Self::default()
     }
 
-    /// Connections currently open for `endpoint`.
+    /// Connections currently open for `endpoint` on the PRIMARY account.
     #[must_use]
     pub const fn open_count(&self, endpoint: DhanEndpointType) -> u8 {
-        match endpoint {
-            DhanEndpointType::MainFeed => self.main_feed,
-            DhanEndpointType::Depth20 => self.depth_20,
-            DhanEndpointType::Depth200 => self.depth_200,
-            DhanEndpointType::OrderUpdate => self.order_update,
+        self.open_count_on(DhanAccount::Primary, endpoint)
+    }
+
+    /// Connections currently open for `endpoint` on `account`. Always `0` for
+    /// an endpoint the account may not open.
+    #[must_use]
+    pub const fn open_count_on(&self, account: DhanAccount, endpoint: DhanEndpointType) -> u8 {
+        match (account, endpoint) {
+            (DhanAccount::Primary, DhanEndpointType::MainFeed) => self.main_feed,
+            (DhanAccount::Primary, DhanEndpointType::Depth20) => self.depth_20,
+            (DhanAccount::Primary, DhanEndpointType::Depth200) => self.depth_200,
+            (DhanAccount::Primary, DhanEndpointType::OrderUpdate) => self.order_update,
+            (DhanAccount::Depth, DhanEndpointType::Depth20) => self.depth_account_depth_20,
+            (DhanAccount::Depth, DhanEndpointType::Depth200) => self.depth_account_depth_200,
+            (DhanAccount::Depth, DhanEndpointType::MainFeed | DhanEndpointType::OrderUpdate) => 0,
         }
     }
 
-    /// Total connections currently open across every endpoint type.
+    /// Total connections currently open on `account`.
+    #[must_use]
+    pub const fn total_open_on(&self, account: DhanAccount) -> u16 {
+        match account {
+            DhanAccount::Primary => {
+                (self.main_feed as u16)
+                    + (self.depth_20 as u16)
+                    + (self.depth_200 as u16)
+                    + (self.order_update as u16)
+            }
+            DhanAccount::Depth => {
+                (self.depth_account_depth_20 as u16) + (self.depth_account_depth_200 as u16)
+            }
+        }
+    }
+
+    /// Total connections currently open across every account and endpoint type.
     ///
     /// `u16` so the sum is representable even if a future cap edit pushes the
     /// total past 255 — the arithmetic can never wrap into a falsely-small
     /// total that would let the ceiling check pass.
     #[must_use]
     pub const fn total_open(&self) -> u16 {
-        (self.main_feed as u16)
-            + (self.depth_20 as u16)
-            + (self.depth_200 as u16)
-            + (self.order_update as u16)
+        self.total_open_on(DhanAccount::Primary) + self.total_open_on(DhanAccount::Depth)
     }
 
-    /// Attempts to reserve one connection of `endpoint`.
-    ///
-    /// Checks the global ceiling first, then the per-type cap, and only then
-    /// mutates. On refusal NOTHING is mutated, the typed refusal is returned,
-    /// [`POOL_BUDGET_REFUSED_METRIC`] is incremented and a `warn!` is logged.
+    /// Attempts to reserve one PRIMARY-account connection of `endpoint`.
     ///
     /// # Errors
-    /// [`PoolBudgetRefusal::TotalAtCapacity`] when the 16-connection ceiling is
-    /// reached; [`PoolBudgetRefusal::EndpointTypeAtCapacity`] when the endpoint
-    /// type is full.
+    /// As [`Self::try_open_on`].
     pub fn try_open(
         &mut self,
         endpoint: DhanEndpointType,
     ) -> Result<ConnectionSlot, PoolBudgetRefusal> {
-        let total = self.total_open();
-        if total >= u16::from(MAX_TOTAL_DHAN_CONNECTIONS) {
+        self.try_open_on(DhanAccount::Primary, endpoint)
+    }
+
+    /// Attempts to reserve one connection of `endpoint` on `account`.
+    ///
+    /// Checks that the account may open the endpoint at all, then the
+    /// account's ceiling, then the per-type cap, and only then mutates. On
+    /// refusal NOTHING is mutated, the typed refusal is returned,
+    /// [`POOL_BUDGET_REFUSED_METRIC`] is incremented and a `warn!` is logged.
+    ///
+    /// # Errors
+    /// [`PoolBudgetRefusal::EndpointNotPermittedOnAccount`] for a main-feed or
+    /// order-update socket on the depth account;
+    /// [`PoolBudgetRefusal::TotalAtCapacity`] when the account's ceiling is
+    /// reached; [`PoolBudgetRefusal::EndpointTypeAtCapacity`] when the endpoint
+    /// type is full on that account.
+    pub fn try_open_on(
+        &mut self,
+        account: DhanAccount,
+        endpoint: DhanEndpointType,
+    ) -> Result<ConnectionSlot, PoolBudgetRefusal> {
+        if !account.permits(endpoint) {
+            return Err(
+                self.refuse(PoolBudgetRefusal::EndpointNotPermittedOnAccount { account, endpoint })
+            );
+        }
+
+        let total = self.total_open_on(account);
+        let ceiling = u16::from(account.connection_ceiling());
+        if total >= ceiling {
             return Err(self.refuse(PoolBudgetRefusal::TotalAtCapacity {
+                account,
                 endpoint,
                 open: total,
-                max: u16::from(MAX_TOTAL_DHAN_CONNECTIONS),
+                max: ceiling,
             }));
         }
 
-        let open = self.open_count(endpoint);
-        let max = endpoint.max_connections();
+        let open = self.open_count_on(account, endpoint);
+        let max = account.max_connections(endpoint);
         if open >= max {
             return Err(self.refuse(PoolBudgetRefusal::EndpointTypeAtCapacity {
+                account,
                 endpoint,
                 open,
                 max,
             }));
         }
 
-        let next = open.saturating_add(1);
-        match endpoint {
-            DhanEndpointType::MainFeed => self.main_feed = next,
-            DhanEndpointType::Depth20 => self.depth_20 = next,
-            DhanEndpointType::Depth200 => self.depth_200 = next,
-            DhanEndpointType::OrderUpdate => self.order_update = next,
-        }
+        self.set_open_count(account, endpoint, open.saturating_add(1));
 
         Ok(ConnectionSlot {
+            account,
             endpoint,
             pool_index: open,
-            global_index: endpoint.jitter_base().saturating_add(open),
+            global_index: account.jitter_base(endpoint).saturating_add(open),
         })
     }
 
-    /// Returns one connection of `endpoint` to the budget.
+    /// Returns one PRIMARY-account connection of `endpoint` to the budget.
+    pub fn release(&mut self, endpoint: DhanEndpointType) {
+        self.release_on(DhanAccount::Primary, endpoint);
+    }
+
+    /// Returns one connection of `endpoint` on `account` to the budget.
     ///
     /// Saturates at zero, so a double-release can never underflow into a huge
     /// count that would then let the budget over-open. A release of a type with
-    /// nothing open is a no-op.
-    pub fn release(&mut self, endpoint: DhanEndpointType) {
-        let next = self.open_count(endpoint).saturating_sub(1);
-        match endpoint {
-            DhanEndpointType::MainFeed => self.main_feed = next,
-            DhanEndpointType::Depth20 => self.depth_20 = next,
-            DhanEndpointType::Depth200 => self.depth_200 = next,
-            DhanEndpointType::OrderUpdate => self.order_update = next,
+    /// nothing open — or one the account may not open — is a no-op.
+    pub fn release_on(&mut self, account: DhanAccount, endpoint: DhanEndpointType) {
+        let next = self.open_count_on(account, endpoint).saturating_sub(1);
+        self.set_open_count(account, endpoint, next);
+    }
+
+    /// Writes one counter. The (depth account, main feed / order update) pair
+    /// has no counter and is ignored: `try_open_on` refuses it before reaching
+    /// here, and a release of it has nothing to return.
+    fn set_open_count(&mut self, account: DhanAccount, endpoint: DhanEndpointType, value: u8) {
+        match (account, endpoint) {
+            (DhanAccount::Primary, DhanEndpointType::MainFeed) => self.main_feed = value,
+            (DhanAccount::Primary, DhanEndpointType::Depth20) => self.depth_20 = value,
+            (DhanAccount::Primary, DhanEndpointType::Depth200) => self.depth_200 = value,
+            (DhanAccount::Primary, DhanEndpointType::OrderUpdate) => self.order_update = value,
+            (DhanAccount::Depth, DhanEndpointType::Depth20) => self.depth_account_depth_20 = value,
+            (DhanAccount::Depth, DhanEndpointType::Depth200) => {
+                self.depth_account_depth_200 = value;
+            }
+            (DhanAccount::Depth, DhanEndpointType::MainFeed | DhanEndpointType::OrderUpdate) => {}
         }
     }
 
@@ -603,11 +862,13 @@ impl PoolBudget {
     fn refuse(&self, refusal: PoolBudgetRefusal) -> PoolBudgetRefusal {
         metrics::counter!(
             POOL_BUDGET_REFUSED_METRIC,
+            "account" => refusal.account().as_str(),
             "endpoint" => refusal.endpoint().as_str(),
             "reason" => refusal.reason_str(),
         )
         .increment(1);
         warn!(
+            account = refusal.account().as_str(),
             endpoint = refusal.endpoint().as_str(),
             reason = refusal.reason_str(),
             total_open = self.total_open(),
@@ -638,12 +899,23 @@ mod tests {
             .sum();
         assert_eq!(
             sum,
-            u16::from(MAX_TOTAL_DHAN_CONNECTIONS),
+            u16::from(MAX_PRIMARY_ACCOUNT_CONNECTIONS),
             "5 main-feed + 5 depth-20 + 5 depth-200 + 1 order-update must equal 16"
         );
         assert_eq!(
-            MAX_TOTAL_DHAN_CONNECTIONS, 16,
-            "operator-authorized ceiling"
+            MAX_PRIMARY_ACCOUNT_CONNECTIONS, 16,
+            "operator-authorized primary-account ceiling"
+        );
+        // 2026-09-26: the depth account adds its own 5 + 5, and nothing else.
+        let depth_sum: u16 = DhanEndpointType::ALL
+            .iter()
+            .map(|e| u16::from(DhanAccount::Depth.max_connections(*e)))
+            .sum();
+        assert_eq!(depth_sum, u16::from(MAX_DEPTH_ACCOUNT_CONNECTIONS));
+        assert_eq!(MAX_DEPTH_ACCOUNT_CONNECTIONS, 10);
+        assert_eq!(
+            MAX_TOTAL_DHAN_CONNECTIONS, 26,
+            "16 primary + 10 depth-account = 26"
         );
     }
 
@@ -805,7 +1077,7 @@ mod tests {
             .map(|e| u16::from(e.max_connections()))
             .sum();
         assert_eq!(total, 16, "5 + 5 + 5 + 1 = 16");
-        assert_eq!(u16::from(MAX_TOTAL_DHAN_CONNECTIONS), total);
+        assert_eq!(u16::from(MAX_PRIMARY_ACCOUNT_CONNECTIONS), total);
     }
 
     #[test]
@@ -893,13 +1165,8 @@ mod tests {
             expected_next = expected_next.saturating_add(endpoint.max_connections());
         }
         assert_eq!(
-            expected_next, MAX_TOTAL_DHAN_CONNECTIONS,
-            "the four pools must tile 0..16 exactly"
-        );
-        assert_eq!(
-            expected_next, RECONNECT_JITTER_SLOTS,
-            "the tiling must match the jitter slot count or a connection wraps \
-             onto another's stagger"
+            expected_next, MAX_PRIMARY_ACCOUNT_CONNECTIONS,
+            "the four primary pools must tile 0..16 exactly"
         );
     }
 
@@ -958,6 +1225,7 @@ mod tests {
             assert_eq!(
                 refusal,
                 PoolBudgetRefusal::EndpointTypeAtCapacity {
+                    account: DhanAccount::Primary,
                     endpoint,
                     open: 5,
                     max: 5,
@@ -983,6 +1251,7 @@ mod tests {
         assert_eq!(
             refusal,
             PoolBudgetRefusal::EndpointTypeAtCapacity {
+                account: DhanAccount::Primary,
                 endpoint: DhanEndpointType::OrderUpdate,
                 open: 1,
                 max: 1,
@@ -1027,6 +1296,7 @@ mod tests {
             assert_eq!(
                 refusal,
                 PoolBudgetRefusal::TotalAtCapacity {
+                    account: DhanAccount::Primary,
                     endpoint,
                     open: 16,
                     max: 16,
@@ -1139,11 +1409,13 @@ mod tests {
     #[test]
     fn test_reason_str_and_endpoint_accessors_cover_both_refusal_arms() {
         let a = PoolBudgetRefusal::EndpointTypeAtCapacity {
+            account: DhanAccount::Primary,
             endpoint: DhanEndpointType::Depth200,
             open: 5,
             max: 5,
         };
         let b = PoolBudgetRefusal::TotalAtCapacity {
+            account: DhanAccount::Primary,
             endpoint: DhanEndpointType::Depth20,
             open: 16,
             max: 16,
@@ -1153,6 +1425,206 @@ mod tests {
         assert_eq!(a.endpoint(), DhanEndpointType::Depth200);
         assert_eq!(b.endpoint(), DhanEndpointType::Depth20);
         assert_ne!(a.reason_str(), b.reason_str());
+        let c = PoolBudgetRefusal::EndpointNotPermittedOnAccount {
+            account: DhanAccount::Depth,
+            endpoint: DhanEndpointType::OrderUpdate,
+        };
+        assert_eq!(c.reason_str(), "endpoint_not_permitted");
+        assert_eq!(c.endpoint(), DhanEndpointType::OrderUpdate);
+        assert_eq!(c.account(), DhanAccount::Depth);
+        assert_eq!(a.account(), DhanAccount::Primary);
+        assert_eq!(b.account(), DhanAccount::Primary);
+        let reasons: BTreeSet<&str> = [a, b, c].iter().map(|r| r.reason_str()).collect();
+        assert_eq!(reasons.len(), 3, "reason labels must not collide");
+    }
+
+    // -- the second, depth-only account (2026-09-26) ------------------------
+
+    #[test]
+    fn test_account_as_str_is_stable_and_unique() {
+        assert_eq!(DhanAccount::Primary.as_str(), "primary");
+        assert_eq!(DhanAccount::Depth.as_str(), "depth");
+        assert_eq!(DhanAccount::Depth.to_string(), "depth");
+        let tags: BTreeSet<&str> = DhanAccount::ALL.iter().map(|a| a.as_str()).collect();
+        assert_eq!(tags.len(), DhanAccount::ALL.len());
+    }
+
+    #[test]
+    fn test_depth_account_permits_depth_sockets_only() {
+        for endpoint in DhanEndpointType::ALL {
+            assert!(DhanAccount::Primary.permits(endpoint));
+            assert_eq!(
+                DhanAccount::Primary.max_connections(endpoint),
+                endpoint.max_connections(),
+                "the primary account's caps are the pre-2026-09-26 caps, unchanged"
+            );
+            assert_eq!(
+                DhanAccount::Primary.jitter_base(endpoint),
+                endpoint.jitter_base(),
+                "the primary account's slots are the pre-2026-09-26 slots, unchanged"
+            );
+        }
+        assert!(DhanAccount::Depth.permits(DhanEndpointType::Depth20));
+        assert!(DhanAccount::Depth.permits(DhanEndpointType::Depth200));
+        assert!(!DhanAccount::Depth.permits(DhanEndpointType::MainFeed));
+        assert!(!DhanAccount::Depth.permits(DhanEndpointType::OrderUpdate));
+        assert_eq!(
+            DhanAccount::Depth.max_connections(DhanEndpointType::MainFeed),
+            0
+        );
+        assert_eq!(
+            DhanAccount::Depth.max_connections(DhanEndpointType::OrderUpdate),
+            0
+        );
+    }
+
+    #[test]
+    fn test_depth_account_refuses_main_feed_and_order_update_without_mutating() {
+        let mut budget = PoolBudget::new();
+        for endpoint in [DhanEndpointType::MainFeed, DhanEndpointType::OrderUpdate] {
+            let refusal = budget
+                .try_open_on(DhanAccount::Depth, endpoint)
+                .expect_err("the depth account never opens this endpoint");
+            assert_eq!(
+                refusal,
+                PoolBudgetRefusal::EndpointNotPermittedOnAccount {
+                    account: DhanAccount::Depth,
+                    endpoint,
+                }
+            );
+            assert!(refusal.to_string().contains("depth-20 and depth-200"));
+        }
+        assert_eq!(budget, PoolBudget::new(), "a refusal must not mutate");
+        // Releasing a pair with no counter is a harmless no-op.
+        budget.release_on(DhanAccount::Depth, DhanEndpointType::MainFeed);
+        assert_eq!(budget, PoolBudget::new());
+    }
+
+    #[test]
+    fn test_slot_owner_both_accounts_tile_all_twenty_six_slots_exactly_once() {
+        let mut budget = PoolBudget::new();
+        let mut globals = BTreeSet::new();
+        for account in DhanAccount::ALL {
+            for endpoint in DhanEndpointType::ALL {
+                for expected_pool_index in 0..account.max_connections(endpoint) {
+                    let slot = budget.try_open_on(account, endpoint).expect("within cap");
+                    assert_eq!(slot.account, account);
+                    assert_eq!(slot.endpoint, endpoint);
+                    assert_eq!(slot.pool_index, expected_pool_index);
+                    assert!(
+                        globals.insert(slot.global_index),
+                        "slot {} granted twice",
+                        slot.global_index
+                    );
+                    assert_eq!(
+                        slot_owner(slot.global_index),
+                        Some((account, endpoint)),
+                        "slot_owner must name the pool that granted slot {}",
+                        slot.global_index
+                    );
+                }
+            }
+        }
+        let expected: BTreeSet<u8> = (0..MAX_TOTAL_DHAN_CONNECTIONS).collect();
+        assert_eq!(
+            globals, expected,
+            "the two accounts must tile 0..26 exactly"
+        );
+        assert_eq!(budget.total_open(), u16::from(MAX_TOTAL_DHAN_CONNECTIONS));
+        assert_eq!(budget.total_open_on(DhanAccount::Primary), 16);
+        assert_eq!(budget.total_open_on(DhanAccount::Depth), 10);
+        // Every slot gets its own reconnect stagger.
+        assert_eq!(
+            MAX_TOTAL_DHAN_CONNECTIONS, RECONNECT_JITTER_SLOTS,
+            "the slot space must match the jitter slot count or a connection wraps \
+             onto another's stagger"
+        );
+        let jitters: BTreeSet<u64> = globals.iter().map(|i| reconnect_jitter_ms(*i)).collect();
+        assert_eq!(jitters.len(), usize::from(MAX_TOTAL_DHAN_CONNECTIONS));
+        // The depth account's slots are exactly 16..26.
+        for slot in 16..26 {
+            assert_eq!(slot_owner(slot).map(|(a, _)| a), Some(DhanAccount::Depth));
+        }
+        assert_eq!(slot_owner(MAX_TOTAL_DHAN_CONNECTIONS), None);
+        assert_eq!(slot_owner(u8::MAX), None);
+    }
+
+    #[test]
+    fn test_try_open_on_open_count_on_and_total_open_on_count_each_account_independently() {
+        let mut budget = PoolBudget::new();
+        for _ in 0..5 {
+            assert!(budget.try_open(DhanEndpointType::Depth200).is_ok());
+        }
+        // The primary depth-200 pool is full; the depth account's is untouched.
+        assert!(budget.try_open(DhanEndpointType::Depth200).is_err());
+        for i in 0..5 {
+            let slot = budget
+                .try_open_on(DhanAccount::Depth, DhanEndpointType::Depth200)
+                .expect("the depth account has its own five");
+            assert_eq!(slot.global_index, 21 + i);
+        }
+        let refusal = budget
+            .try_open_on(DhanAccount::Depth, DhanEndpointType::Depth200)
+            .expect_err("sixth depth-account depth-200");
+        assert_eq!(
+            refusal,
+            PoolBudgetRefusal::EndpointTypeAtCapacity {
+                account: DhanAccount::Depth,
+                endpoint: DhanEndpointType::Depth200,
+                open: 5,
+                max: 5,
+            }
+        );
+        assert_eq!(budget.open_count(DhanEndpointType::Depth200), 5);
+        assert_eq!(
+            budget.open_count_on(DhanAccount::Depth, DhanEndpointType::Depth200),
+            5
+        );
+        // Releasing on one account never frees the other's slot.
+        budget.release_on(DhanAccount::Depth, DhanEndpointType::Depth200);
+        assert_eq!(budget.open_count(DhanEndpointType::Depth200), 5);
+        assert_eq!(
+            budget.open_count_on(DhanAccount::Depth, DhanEndpointType::Depth200),
+            4
+        );
+        budget.release(DhanEndpointType::Depth200);
+        assert_eq!(budget.open_count(DhanEndpointType::Depth200), 4);
+        assert_eq!(budget.total_open(), 8);
+    }
+
+    #[test]
+    fn test_connection_ceiling_depth_account_is_ten_and_refuses_the_eleventh() {
+        let mut budget = PoolBudget::new();
+        for endpoint in [DhanEndpointType::Depth20, DhanEndpointType::Depth200] {
+            for _ in 0..5 {
+                assert!(budget.try_open_on(DhanAccount::Depth, endpoint).is_ok());
+            }
+        }
+        for endpoint in [DhanEndpointType::Depth20, DhanEndpointType::Depth200] {
+            let refusal = budget
+                .try_open_on(DhanAccount::Depth, endpoint)
+                .expect_err("eleventh depth-account socket");
+            assert_eq!(
+                refusal,
+                PoolBudgetRefusal::TotalAtCapacity {
+                    account: DhanAccount::Depth,
+                    endpoint,
+                    open: 10,
+                    max: 10,
+                }
+            );
+            assert!(refusal.to_string().contains("depth account"));
+        }
+        // The primary account is untouched by a full depth account.
+        assert!(budget.try_open(DhanEndpointType::MainFeed).is_ok());
+    }
+
+    #[test]
+    fn test_connection_slot_label_covers_every_slot_of_both_accounts() {
+        for slot in 0..MAX_TOTAL_DHAN_CONNECTIONS {
+            assert_eq!(connection_slot_label(slot), slot.to_string());
+        }
+        assert_eq!(connection_slot_label(MAX_TOTAL_DHAN_CONNECTIONS), "unknown");
     }
 
     /// TVW4 (2026-09-02): the WAL endpoint byte is the ONLY thing that lets a

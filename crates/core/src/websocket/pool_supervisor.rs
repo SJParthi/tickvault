@@ -6964,6 +6964,7 @@ mod tests {
 
     fn slot(endpoint: DhanEndpointType, pool_index: u8) -> ConnectionSlot {
         ConnectionSlot {
+            account: crate::websocket::pool_budget::DhanAccount::Primary,
             endpoint,
             pool_index,
             global_index: endpoint.jitter_base().saturating_add(pool_index),
@@ -8164,19 +8165,24 @@ mod tests {
         // 5 main + 5 depth-20 + 5 depth-200 + 1 order-update = 16 sockets,
         // each addressed by its global index. The register must cover the
         // highest global index any endpoint can produce.
-        let max_global = [
-            DhanEndpointType::MainFeed,
-            DhanEndpointType::Depth20,
-            DhanEndpointType::Depth200,
-        ]
-        .iter()
-        .map(|e| {
-            usize::from(e.jitter_base())
-                .saturating_add(usize::from(e.max_connections()))
-                .saturating_sub(1)
-        })
-        .max()
-        .unwrap_or(0);
+        // 2026-09-26: plus the depth account's 5 depth-20 + 5 depth-200 at
+        // global slots 16..26 — every pool of BOTH accounts.
+        use crate::websocket::pool_budget::DhanAccount;
+        let max_global = DhanAccount::ALL
+            .iter()
+            .flat_map(|account| {
+                DhanEndpointType::ALL
+                    .iter()
+                    .filter(|e| account.max_connections(**e) > 0)
+                    .map(|e| {
+                        usize::from(account.jitter_base(*e))
+                            .saturating_add(usize::from(account.max_connections(*e)))
+                            .saturating_sub(1)
+                    })
+            })
+            .max()
+            .unwrap_or(0);
+        assert_eq!(max_global, usize::from(MAX_TOTAL_DHAN_CONNECTIONS) - 1);
         assert!(
             max_global < GHOST_REDIAL_SLOTS,
             "highest global connection index {max_global} must fit in {GHOST_REDIAL_SLOTS} slots"
@@ -8792,6 +8798,7 @@ mod tests {
             let endpoint = DhanEndpointType::ALL[endpoint_idx];
             let mut s = ConnectionSupervisor::new(
                 ConnectionSlot {
+            account: crate::websocket::pool_budget::DhanAccount::Primary,
                     endpoint,
                     pool_index,
                     global_index: endpoint.jitter_base().saturating_add(pool_index),
@@ -9762,6 +9769,7 @@ mod tests {
 
         // A slot with a global index the pool has never issued.
         let bogus = ConnectionSlot {
+            account: crate::websocket::pool_budget::DhanAccount::Primary,
             endpoint: DhanEndpointType::MainFeed,
             global_index: u8::MAX,
             pool_index: u8::MAX,
@@ -12965,6 +12973,7 @@ mod tests {
         let now = t0();
         let mut s = ConnectionSupervisor::new(
             ConnectionSlot {
+                account: crate::websocket::pool_budget::DhanAccount::Primary,
                 endpoint: DhanEndpointType::Depth200,
                 pool_index: 0,
                 global_index: PROD_WIRING_SLOT,
