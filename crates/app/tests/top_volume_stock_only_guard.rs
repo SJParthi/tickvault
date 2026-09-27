@@ -87,13 +87,14 @@ fn no_family_loop_hardcodes_a_family_beside_the_list() {
     );
 
     let loops = code.matches("for family in").count();
-    // Two since audit PR4b (2026-09-26): the queued baseline roll (shared by
-    // the out-of-window path and the deferred-window path) and the sweep
-    // start. It was three in PR4, when each roll path had its own loop.
+    // Two since the audit PR4c-2 review (2026-09-27): the sweep start and
+    // `record_board_seal`, which copies each sealed board-frame bar into the
+    // leaderboard's sealed-window history. The baseline rolls of PR4/PR4b,
+    // which had their own loops, no longer exist.
     assert_eq!(
         loops, 2,
-        "expected exactly two family loops (the queued baseline roll and the sweep \
-         start), found {loops}. A new one must read RANKED_OPTION_FAMILIES too."
+        "expected exactly two family loops (the sweep start and the seal copy), found \
+         {loops}. A new one must read RANKED_OPTION_FAMILIES too."
     );
     let from_list = code.matches("for family in RANKED_OPTION_FAMILIES").count();
     assert_eq!(
