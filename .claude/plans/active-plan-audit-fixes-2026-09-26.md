@@ -618,12 +618,40 @@ line coded, every loss counted and shipped), then the remaining order from the f
     cap as written, so they are bounded only by the 8 MiB reply cap.
   - Plan correction: `crates/tickvault-logs-mcp/tests/parity.rs` does not exist in the tree
     (the parity harness was retired), so there is no pin to bump.
-- [ ] **PR30 — a budget stop stays stopped for the day.** (`aws-lambdas`, `scripts`, deploy)
+- [x] **PR30a — a budget stop stays stopped for the day.** (`aws-lambdas`, `scripts`, deploy)
   - The 08:45 start watchdog, `aws-autopilot.sh` and the 15:50 terraform apply each undo a
     budget stop the same day (start_watchdog.rs:819-835; aws-autopilot.sh:216-224;
     terraform main.tf:498-507; terraform-apply.yml:64-66). A breach latch (one SSM parameter,
     written by the kill-switch, cleared only on a new billing day or by the operator) that all
     three read before starting the box. Pinned by a test per reader.
+  - Plan correction: the latch lasts for the BILLING MONTH, not the day. The ceiling is on
+    month-to-date spend, which only restarts at the next UTC month, and the hourly guard
+    already stops a breached box every hour for the rest of the month; a day-long latch
+    would only move the restart war to the next morning.
+  - Done: `budget_stop_latch.rs`. `/tickvault-guard/<env>/budget-stop-month` holds the UTC billing
+    month of the stop. Writers: the hard-stop guard's breach stop (after the stop, before
+    the rule disable; write only, a failed write is paged and never blocks the stop) and
+    the AWS-Budgets kill-switch (after the stop). Readers, all fail-open: the start
+    watchdog skips its 08:45 self-start; the autopilot skips its up-window start; the
+    terraform-apply workflow sets `TF_VAR_daily_start_enabled=false`, so `main.tf` plans
+    the daily-start rule DISABLED. Least-privilege IAM per leg. One ratchet test per writer
+    and reader (`budget_stop_latch_wiring_guard.rs`) plus unit tests for each leg.
+  - Review fixes (security + hostile passes, same PR): the apply job re-plans on its own
+    runner, so it reads the latch too (the first draft only read it in the plan job, which
+    left the real apply re-enabling the rule); `deploy-aws.yml` no longer starts a latched
+    box (`DEPLOY_SKIP_REASON=budget_stop`); the path moved out of `/tickvault/<env>/*`,
+    where the box's own role can write, to `/tickvault-guard/<env>/`; the hourly guard
+    re-enables the rule once when the latch names an earlier month (`events:EnableRule` on
+    the one rule, then `released-<month>`); the kill-switch dates its latch six hours back
+    (a late notification for the old month never latches the new one) and bounds the write
+    at 5 s; the watchdog sends one short "box off today" note each trading morning instead
+    of staying silent; pages name the outcome, never raw AWS error text.
+  - Left as is: the native AWS Budget action at 90% stops the box without writing the latch,
+    so after that stop the box starts again the next morning and runs until the 100% line,
+    where the kill-switch and the hourly guard stop it and latch. Latching at 90% would move
+    the effective ceiling to $202.50 in September and $135 from October, which is the
+    owner's call.
+- [ ] **PR30b — the October $150 ceiling in terraform.** (deploy; on or after 2026-10-01)
   - The October $150 ceiling is enforced in code (`effective_budget_kill_usd`) but budget.tf and
     budget-guards.tf still say $225 (budget.tf:220-222; budget-guards.tf:278). Quote 23 keeps
     $225 for September, so the terraform change is a dated PR on or after 2026-10-01, in all four

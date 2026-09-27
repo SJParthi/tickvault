@@ -94,6 +94,16 @@ data "aws_iam_policy_document" "budget_killswitch_permissions" {
     resources = [aws_sns_topic.tv_alerts.arn]
   }
 
+  # Audit PR30 (2026-09-27): write the budget-stop latch after the stop so
+  # the start watchdog, the autopilot and the terraform apply do not
+  # restart the box for the rest of the billing month. Write only, one ARN.
+  statement {
+    sid       = "WriteBudgetStopLatch"
+    effect    = "Allow"
+    actions   = ["ssm:PutParameter"]
+    resources = ["arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/tickvault-guard/${var.environment}/budget-stop-month"]
+  }
+
   # Lambda's own CloudWatch Log stream.
   statement {
     sid    = "LambdaLogs"
@@ -148,9 +158,10 @@ resource "aws_lambda_function" "budget_killswitch" {
 
   environment {
     variables = {
-      EC2_INSTANCE_ID  = aws_instance.tv_app.id
-      ALERTS_TOPIC_ARN = aws_sns_topic.tv_alerts.arn
-      LOG_LEVEL        = "INFO"
+      EC2_INSTANCE_ID   = aws_instance.tv_app.id
+      ALERTS_TOPIC_ARN  = aws_sns_topic.tv_alerts.arn
+      LOG_LEVEL         = "INFO"
+      BUDGET_STOP_PARAM = "/tickvault-guard/${var.environment}/budget-stop-month"
     }
   }
 

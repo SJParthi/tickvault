@@ -27,6 +27,7 @@
 pub mod alarm_gate;
 pub mod budget_digest;
 pub mod budget_killswitch;
+pub mod budget_stop_latch;
 pub mod clients;
 pub mod deploy_watchdog;
 pub mod dhan_token_minter;

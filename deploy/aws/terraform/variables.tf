@@ -201,6 +201,17 @@ variable "daily_loss_alarm_inr" {
   default     = 20000
 }
 
+variable "daily_start_enabled" {
+  # Audit PR30 (2026-09-27): the budget-stop latch. The hourly hard-stop guard
+  # DISABLES the daily-start rule on a budget breach; before this variable the
+  # next terraform apply set it straight back to ENABLED and the box restarted
+  # the following morning. terraform-apply.yml sets this to false while the
+  # SSM latch /tickvault-guard/<env>/budget-stop-month names the current UTC month.
+  description = "Whether the 08:30 IST daily-start rule is ENABLED. CI sets false while the budget-stop latch names the current UTC billing month; leave true otherwise."
+  type        = bool
+  default     = true
+}
+
 variable "dhan_depth_account_enabled" {
   # groww-shared-token-minter-2026-07-02.md §10.9: the depth account's minter
   # schedule is created DISABLED until the account exists and its three SSM
