@@ -2703,4 +2703,48 @@ mod tests {
         );
         cleanup(&spill, &dlq);
     }
+
+    #[test]
+    fn staging_with_appends_paused_sends_the_next_seal_to_a_fresh_live_file() {
+        // Audit PR40c. The race test above cannot fail when the pause is
+        // removed: its appender almost never holds the lock at the instant of
+        // a rename. This one is deterministic. The first appends leave the
+        // writer holding an open handle on the live file; staging moves that
+        // file. The pause drops the handle, so the next append opens a fresh
+        // live file. If `with_appends_paused` ran its closure without closing
+        // the handle, the next seal would go into the MOVED inode, a file the
+        // replay may already have read and archived, and nothing would ever
+        // read it again. Verified by hand on 2026-09-27: with the `*open = None`
+        // line removed from `with_appends_paused`, this test fails on the first
+        // assertion below while the race test above still passes.
+        let (spill, dlq) = temp_pair("replay-stage-pause");
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let t0 = jan1_noon_utc();
+        spill_n(&writer, 3, t0);
+        assert_eq!(stage_live_spill_files(&writer, &spill), 1);
+        assert_eq!(count_bin(&spill), 0, "the live file was staged");
+
+        let late = SerializedSeal::from(&mk_seal(13, 0, TfIndex::M1, 7, 101.5));
+        writer.append_seal(&late, t0).expect("spill append");
+
+        let live_len = std::fs::metadata(writer.spill_path(t0))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert_eq!(
+            live_len, SEAL_SPILL_RECORD_SIZE as u64,
+            "a seal appended after staging must open a fresh live file"
+        );
+        let replaying = spill.join(SEAL_REPLAYING_SUBDIR);
+        let staged: Vec<u64> = std::fs::read_dir(&replaying)
+            .expect("staging dir")
+            .flatten()
+            .map(|e| e.metadata().expect("meta").len())
+            .collect();
+        assert_eq!(
+            staged,
+            vec![3 * SEAL_SPILL_RECORD_SIZE as u64],
+            "the staged file keeps exactly the seals written before the pause"
+        );
+        cleanup(&spill, &dlq);
+    }
 }
