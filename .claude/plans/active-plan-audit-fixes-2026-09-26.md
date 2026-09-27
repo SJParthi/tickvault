@@ -459,7 +459,7 @@ PR25–PR27, PR18, PR19 and the decisions. One PR open at a time, as before.
     is capped AT the wall clock (each frame's arrival time), not wall + 2 s. Tests:
     `busy_contract_is_ranked_after_the_fold_sealed_over_its_window`,
     `windows_that_close_together_are_each_ranked_in_turn`,
-    `test_sealed_window_history_ranks_a_contract_the_fold_sealed_over`,
+    `test_record_sealed_window_ranks_a_contract_the_fold_sealed_over`,
     `test_window_close_clock_catches_up_oldest_first_within_the_bound`,
     `test_far_future_watermark_never_closes_a_window_ending_after_the_wall`,
     `test_a_bar_with_no_volume_is_quiet_not_a_zero_lot_fault`.
