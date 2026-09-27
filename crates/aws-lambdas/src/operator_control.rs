@@ -2769,13 +2769,18 @@ mod tests {
         // minutes and reporting "still running", and a run refused by the
         // on-box lock guard or stopped by the SEBI save now says so instead
         // of "nuke finished (Failed)".
+        //
+        // RE-BLESSED 2026-09-27 (audit PR36a) — 46,985 -> 46,999 bytes, comment
+        // only, no new lines. The note above the `#key=` link reader no longer
+        // says a Telegram alert sends that link: the alert now carries the
+        // portal URL alone, because the key reached email and SMS history.
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CONSOLE_HTML.as_bytes());
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "be86602dfa57ae803066d29c7d43a7e311f588f5efc1e7084ec33ceb9af5b25c"
+            "b0a0323d54b75560d1cfd3ad4fec5469e47200e8dee7f3460f75b0a85cf2cf06"
         );
-        assert_eq!(CONSOLE_HTML.len(), 46_985);
+        assert_eq!(CONSOLE_HTML.len(), 46_999);
     }
 
     // --------------------------------------------------------- class ParseView
