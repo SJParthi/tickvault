@@ -535,7 +535,7 @@ the code when each PR is written; a wrong row is corrected here, never dropped.
 
 Order of work: PR15 finishes first. Then, riskiest first: PR28 (SEBI data off one disk, console
 wipe; split 2026-09-27 into PR28a, the console, and PR28b, the locked cloud copy) → PR29 (log tool can change the live database) → PR30 (budget stop undone the same day) →
-PR31 (a restart can overwrite fuller candles; split 2026-09-27 into PR31a and PR31b) → PR32 (tick rescue and spill ordering) → PR33
+PR31 (a restart can overwrite fuller candles; split 2026-09-27 into PR31a, PR31b and the PR31c follow-ups) → PR32 (tick rescue and spill ordering) → PR33
 (token and socket gaps) → PR34 (hung app never restarted) → PR35 (deploys) → PR36 (security) →
 PR37 (Dhan documentation mismatches) → PR38 (risk book across a restart) → PR39 (every error
 line coded, every loss counted and shipped), then the remaining order from the fourth re-check
@@ -670,7 +670,7 @@ line coded, every loss counted and shipped), then the remaining order from the f
     (candle_ddl_boot.rs:245-290; top_volume_rank_persistence.rs:862-924): both writers now refuse
     to send until their ensure has succeeded in this process (`CANDLE_TABLES_KEYED`,
     `TOP_VOLUME_TABLES_KEYED`). Refused candles go to the disk spill and replay once keyed;
-    refused top-volume rows are counted as discarded (the leaderboard is in RAM, no tick is lost).
+    refused top-volume rows are counted as discarded (no tick is lost, but the stored board is; closed by PR31c).
     When the boot gives up, `candle_ddl_boot::spawn_ensure_until_keyed` keeps re-running the
     ensure (30 s doubling to 10 min) instead of waiting for the next boot. Ticks and depth are
     NOT gated (refusing them would lose data); their ensure is in the background re-run, whose
@@ -700,6 +700,25 @@ line coded, every loss counted and shipped), then the remaining order from the f
     the oldest open bucket minus lateness, with tick writes suppressed; a replayed frame whose
     bucket ended before the warm-up start gets no candle; plus a per-slot, per-frame refusal as a
     safety net, counted.
+- [ ] **PR31c — PR31a's honest limits, closed one by one (zero data loss on every path,
+  owner 2026-09-27).** (`storage`, `app`) Added 2026-09-27 so none of these lives only in the
+  PR #1962 text. Each lands as its own small PR after PR31b.
+  - Top-volume rows refused while the tables are unkeyed are counted and DROPPED
+    (`TopVolumeSink::write`, `TopVolumeWriter::flush`). That is a loss of the stored board even
+    though no tick is lost. Spill them to a bounded NDJSON file, as the candles do, and replay
+    them once `TOP_VOLUME_TABLES_KEYED` is set; count the spill and the replay.
+  - Ticks and depth are not held back. While their table is keyless (ILP auto-created it), a
+    replay can write a duplicate, and `DEDUP ENABLE` repairs only rows written after it. Route
+    them into their existing spill tiers until keyed (no row refused, none lost), or prove the
+    ensure always runs before the first write and record that proof as a ratchet.
+  - One latch covers all nine candle tables, so one table that never keys spills every candle.
+    Make the latch per table, so only that table's candles wait.
+  - A refused-seal file is archived after `SEAL_REFUSED_FILE_RETRY_SECS` (2 days) and its rows
+    are never re-ingested automatically. Re-ingest archived refused files once the tables are
+    keyed, and page (coded error) if any remain.
+  - The shared receipt stamp can run slightly ahead of the wall clock and nudge the top-volume
+    close clock (review finding #8, unmeasured). Measure it; clamp the close clock to the wall
+    clock if it matters.
 - [ ] **PR32 — a tick batch is never marked applied before it is on disk.** (`storage`, `app`)
   - A rescue batch queued to the rescue thread but not yet written is skipped by the next
     replay if a later batch was already confirmed (tick_persistence.rs:2739-2757, :3354-3358;
