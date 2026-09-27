@@ -228,12 +228,24 @@ pub fn drain_once(
             // Finding S3: seal-time ILP flush failure is a persist
             // failure — logged at `error!` with the AGGREGATOR-SEAL-01
             // code per `error_level_meta_guard.rs` Rule 5.
-            error!(
-                code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
-                ?flush_err,
-                count = popped.len(),
-                "candle flush failed — rescuing in-flight seals to spill/DLQ"
-            );
+            //
+            // Audit PR31a: a refusal because the candle tables are not yet
+            // keyed was already logged once, coded, by the writer; repeating
+            // it here would be a coded `error!` every 100 ms until the ensure
+            // succeeds. The seals take the same rescue path below.
+            if flush_err.is::<crate::shadow_candle_writer::CandleTablesNotKeyed>() {
+                tracing::debug!(
+                    count = popped.len(),
+                    "candle flush refused (tables not yet keyed) — rescuing to spill"
+                );
+            } else {
+                error!(
+                    code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                    ?flush_err,
+                    count = popped.len(),
+                    "candle flush failed — rescuing in-flight seals to spill/DLQ"
+                );
+            }
             for seal in popped {
                 rescue_one(pipeline, &mut outcome, seal, now_unix_secs);
             }
@@ -401,6 +413,10 @@ pub struct BootDrainOutcome {
     /// Records that could not be decoded (corrupt tail / legacy format /
     /// unknown timeframe ordinal). Their bytes survive in `archive/`.
     pub records_undecodable: usize,
+    /// Decoded seals the writer refused to append. Their file is NOT archived
+    /// (audit PR31): it stays in `replaying/` so the next boot retries it, and
+    /// these seals are also counted in `seals_left_pending`.
+    pub seals_append_failed: usize,
 }
 
 impl BootDrainOutcome {
@@ -739,6 +755,10 @@ pub fn drain_recovered_seals<S: SealSink>(
 
         let mut committed = 0usize;
         let mut file_ok = true;
+        // Seals of this file the writer refused. Until 2026-09-27 the refusal
+        // was logged and skipped, the file was archived as if every seal had
+        // landed, and the boot printed "every recovered seal re-ingested".
+        let mut append_failed = 0usize;
         for chunk in records.chunks(batch) {
             let mut appended = 0usize;
             for record in chunk {
@@ -776,8 +796,10 @@ pub fn drain_recovered_seals<S: SealSink>(
                         code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
                         ?append_err,
                         security_id = seal.security_id,
-                        "seal recovery: append failed for a recovered seal"
+                        "seal recovery: append failed for a recovered seal — its file \
+                         stays staged for the next boot"
                     );
+                    append_failed += 1;
                     continue;
                 }
                 appended += 1;
@@ -804,8 +826,16 @@ pub fn drain_recovered_seals<S: SealSink>(
         }
 
         outcome.seals_reingested += committed;
+        outcome.seals_append_failed += append_failed;
 
-        if file_ok {
+        if file_ok && append_failed > 0 {
+            // The database is up (every flush landed), so the remaining files
+            // are still worth trying: no `halted`. Re-reading this file on the
+            // next boot re-sends the seals that did land, and the DEDUP key
+            // collapses them.
+            outcome.files_left_pending += 1;
+            outcome.seals_left_pending += append_failed;
+        } else if file_ok {
             match archive_staged(path) {
                 Ok(()) => outcome.files_archived += 1,
                 Err(err) => {
@@ -828,6 +858,7 @@ pub fn drain_recovered_seals<S: SealSink>(
             code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
             files_pending = outcome.files_left_pending,
             seals_pending = outcome.seals_left_pending,
+            seals_append_failed = outcome.seals_append_failed,
             seals_reingested = outcome.seals_reingested,
             "seal recovery INCOMPLETE — sealed candles are on DISK and NOT in QuestDB"
         );
@@ -1947,6 +1978,37 @@ mod tests {
             pipeline.ring_len(),
             0,
             "rescued seals MUST go to spill, NOT re-buffer into ring"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    /// Audit PR31a: a flush refused because the candle tables are not yet
+    /// keyed is not a database failure, but its seals must still reach the
+    /// spill — the quieter log line must never mean a quieter rescue.
+    #[test]
+    fn drain_once_rescues_every_seal_when_the_candle_tables_are_not_keyed() {
+        static LOCAL_KEYED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        let (spill, dlq) = temp_pair("unkeyed");
+        let mut pipeline =
+            SealAbsorptionPipeline::with_capacity_and_dirs_for_test(64, spill.clone(), dlq.clone());
+        let now = jan1_noon_utc();
+        for i in 0..3 {
+            pipeline.submit(mk_seal(13, 0, TfIndex::M1, 1_716_023_700 + i, 100.0), now);
+        }
+        let mut writer = ShadowCandleWriter::for_test().with_keyed_for_test(&LOCAL_KEYED);
+        let outcome = drain_once(&mut pipeline, &mut writer, 16, now);
+        assert!(!outcome.flushed_ok);
+        assert_eq!(outcome.ring_seals_popped, 3);
+        assert_eq!(
+            outcome.rescued_to_spill + outcome.rescued_to_dlq,
+            3,
+            "every refused seal must be rescued"
+        );
+        assert_eq!(
+            writer.pending_count(),
+            0,
+            "the refused buffer is discarded after rescue"
         );
         cleanup(&spill, &dlq);
     }

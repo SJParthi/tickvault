@@ -317,6 +317,10 @@ fn record_boot_drain_observability(outcome: &BootDrainOutcome) {
         metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_pending")
             .increment(outcome.seals_left_pending as u64);
     }
+    if outcome.seals_append_failed > 0 {
+        metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_append_failed")
+            .increment(outcome.seals_append_failed as u64);
+    }
 }
 
 /// Returns the current UTC unix timestamp in seconds. Used to
@@ -504,6 +508,7 @@ pub async fn run_seal_writer_loop(
             files_left_pending = boot.files_left_pending,
             seals_left_pending = boot.seals_left_pending,
             records_undecodable = boot.records_undecodable,
+            seals_append_failed = boot.seals_append_failed,
             "seal writer boot recovery drain finished"
         );
     }
@@ -1108,6 +1113,7 @@ mod tests {
             files_left_pending: 1,
             seals_left_pending: 50,
             records_undecodable: 2,
+            seals_append_failed: 3,
         });
     }
 

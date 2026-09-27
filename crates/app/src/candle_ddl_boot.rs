@@ -113,12 +113,18 @@ pub async fn run_candle_ddl_at_boot(questdb: &QuestDbConfig) {
             attempts = CANDLE_DDL_READINESS_ATTEMPTS,
             backoff_secs = CANDLE_DDL_READINESS_BACKOFF_SECS,
             "candle DDL boot: QuestDB not ready within the quiet probe bound — \
-             candle DDL SKIPPED this boot. Consequence: if the candle tables do \
-             not exist yet, the first ILP write may auto-create them WITHOUT \
-             DEDUP UPSERT KEYS (duplicate-row window until a later boot's ensure \
-             succeeds). The retired-object sweep marker is not written, so the \
-             sweep also retries next boot."
+             candle DDL SKIPPED this boot. Consequence: the candle writer refuses \
+             to send until the tables are confirmed keyed, so sealed candles go to \
+             the disk spill meanwhile; the ensure re-runs in the background and \
+             the spill replays once it succeeds. The retired-object sweep marker \
+             is not written, so the sweep retries next boot."
         );
+        // Audit PR31a: the candle writer refuses to send until these tables are
+        // keyed, so re-run the ensure in the background rather than wait a day.
+        drop(spawn_ensure_until_keyed(
+            questdb.clone(),
+            DdlTables::Candles,
+        ));
         return;
     }
 
@@ -189,13 +195,17 @@ pub async fn run_candle_ddl_at_boot(questdb: &QuestDbConfig) {
             code = tickvault_common::error_code::ErrorCode::HotPath02WriterQueueDrop.code_str(),
             attempts = CANDLE_ENSURE_ATTEMPTS,
             "candle DDL boot: candle tables NOT confirmed keyed after every \
-             attempt. Consequence: any candle table that does not exist will be \
-             auto-created by the first ILP row WITHOUT its DEDUP UPSERT KEYS, \
-             and every replayed bar then duplicates into it instead of \
-             collapsing — silently, for the life of that table. The next boot \
-             re-runs this ensure; a table already created key-less is NOT \
-             repaired by it."
+             attempt. Consequence: the candle writer refuses to send until they \
+             are, so sealed candles go to the disk spill meanwhile. The ensure \
+             keeps re-running in the background, and the spill replays once it \
+             succeeds."
         );
+        // Audit PR31a: the candle writer refuses to send until these tables are
+        // keyed, so keep re-running the ensure for this session.
+        drop(spawn_ensure_until_keyed(
+            questdb.clone(),
+            DdlTables::Candles,
+        ));
     }
 
     info!(
@@ -285,12 +295,109 @@ pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
         "live-table DDL boot EXHAUSTED — ticks, market_depth and/or a top_volume_<tf> table could not be \
          ensured. Consequence: the first ILP write may auto-create the table \
          WITHOUT its DEDUP key — a replay then duplicates ticks and the two depth \
-         pools overwrite each other's levels — until a later boot's ensure succeeds. \
+         pools overwrite each other's levels. The ensure keeps re-running in the \
+         background (the boot spawns it), and top_volume rows are refused until it \
+         succeeds. \
          Check QuestDB's WAL state (`wal_tables()`) before the next session."
     );
     false
 }
 
+/// First delay of the background re-run of a table ensure the boot gave up on.
+///
+/// Audit PR31a (2026-09-27). Before this, a boot whose ensure was refused
+/// left the tables un-keyed for the whole session: nothing ran the DDL again
+/// until the next boot. The candle and `top_volume_<tf>` writers now REFUSE to
+/// send until their tables are keyed, so without a re-run a transient refusal
+/// at 09:00 would send every candle to the disk spill until the next morning.
+pub const DDL_BACKGROUND_RETRY_FIRST_SECS: u64 = 30;
+/// Ceiling on the background re-run's doubling delay. Every failed ensure
+/// writes its own coded errors, so a fixed 30 s would log them ~2,900 times a
+/// day against a database that keeps refusing; doubling to ten minutes keeps a
+/// long outage to a few dozen episodes while a short one still clears fast.
+pub const DDL_BACKGROUND_RETRY_MAX_SECS: u64 = 600;
+
+/// Which ensure a background re-run repeats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DdlTables {
+    /// Every emitted `candles_<tf>` table ([`run_candle_ddl_at_boot`]'s ensure).
+    Candles,
+    /// `ticks`, `market_depth` and the four `top_volume_<tf>` tables
+    /// ([`run_live_table_ddl_at_boot`]'s ensures).
+    Live,
+}
+
+async fn ensure_tables_once(questdb: &QuestDbConfig, tables: DdlTables) -> bool {
+    match tables {
+        DdlTables::Candles => {
+            tickvault_storage::shadow_persistence::ensure_shadow_candle_tables(questdb).await
+        }
+        DdlTables::Live => {
+            let ticks_ok = tickvault_storage::tick_persistence::ensure_ticks_table(questdb).await;
+            let depth_ok =
+                tickvault_storage::depth_persistence::ensure_market_depth_table(questdb).await;
+            let volume_ok =
+                tickvault_storage::top_volume_rank_persistence::ensure_top_volume_tables(questdb)
+                    .await;
+            ticks_ok && depth_ok && volume_ok
+        }
+    }
+}
+
+/// Re-runs the ensure for `tables` until every statement is accepted, waiting
+/// `first_delay` after the first refusal and doubling up to `max_delay`.
+/// Returns the number of attempts it took.
+///
+/// Never gives up: the tables it ensures are ones whose writers refuse to send
+/// until they are keyed, so giving up would park those writes for the session.
+/// Every statement is `IF NOT EXISTS` or an idempotent `DEDUP ENABLE`, so a
+/// re-run against a table the boot already created is free, and a
+/// `DEDUP ENABLE` re-run is what repairs a table ILP auto-created without its
+/// key.
+pub async fn ensure_until_keyed(
+    questdb: &QuestDbConfig,
+    tables: DdlTables,
+    first_delay: std::time::Duration,
+    max_delay: std::time::Duration,
+) -> u32 {
+    let mut attempt: u32 = 0;
+    let mut delay = first_delay;
+    loop {
+        attempt = attempt.saturating_add(1);
+        if ensure_tables_once(questdb, tables).await {
+            info!(
+                ?tables,
+                attempt, "DDL background retry: tables confirmed keyed — writes to them resume"
+            );
+            return attempt;
+        }
+        tokio::time::sleep(delay).await;
+        delay = delay.saturating_mul(2).min(max_delay);
+    }
+}
+
+/// Spawns [`ensure_until_keyed`] for `tables` on the production delays. Called
+/// when the boot's bounded ensure gives up, so the session keys its tables as
+/// soon as QuestDB accepts the DDL instead of on the next boot.
+pub fn spawn_ensure_until_keyed(
+    questdb: QuestDbConfig,
+    tables: DdlTables,
+) -> tokio::task::JoinHandle<u32> {
+    warn!(
+        ?tables,
+        first_retry_in_secs = DDL_BACKGROUND_RETRY_FIRST_SECS,
+        "DDL background retry started — the boot could not confirm these tables keyed"
+    );
+    tokio::spawn(async move {
+        ensure_until_keyed(
+            &questdb,
+            tables,
+            std::time::Duration::from_secs(DDL_BACKGROUND_RETRY_FIRST_SECS),
+            std::time::Duration::from_secs(DDL_BACKGROUND_RETRY_MAX_SECS),
+        )
+        .await
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,6 +485,101 @@ mod tests {
             ilp_port: 1,
         };
         assert!(!run_live_table_ddl_at_boot(&questdb).await);
+    }
+
+    fn unreachable_questdb() -> QuestDbConfig {
+        QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        }
+    }
+
+    /// A loopback QuestDB stand-in that accepts every statement.
+    async fn spawn_accept_everything_http() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 8192];
+                        let _ = stream.read(&mut buf).await;
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                            .await;
+                    });
+                }
+            }
+        });
+        port
+    }
+
+    /// Audit PR31a: the background re-run never gives up on a database that
+    /// keeps refusing — an hour of paused time spans several doubled delays
+    /// and the future is still pending.
+    #[tokio::test(start_paused = true)]
+    async fn ensure_until_keyed_keeps_retrying_a_database_that_refuses() {
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(3_600),
+            ensure_until_keyed(
+                &unreachable_questdb(),
+                DdlTables::Candles,
+                std::time::Duration::from_secs(DDL_BACKGROUND_RETRY_FIRST_SECS),
+                std::time::Duration::from_secs(DDL_BACKGROUND_RETRY_MAX_SECS),
+            ),
+        )
+        .await;
+        assert!(outcome.is_err(), "it must still be retrying after an hour");
+    }
+
+    /// Against a database that accepts every statement the re-run returns
+    /// after its first attempt, for both table sets.
+    #[tokio::test]
+    async fn ensure_until_keyed_returns_once_every_statement_is_accepted() {
+        let port = spawn_accept_everything_http().await;
+        let questdb = QuestDbConfig {
+            http_port: port,
+            ..unreachable_questdb()
+        };
+        let quick = std::time::Duration::from_millis(1);
+        assert_eq!(
+            ensure_until_keyed(&questdb, DdlTables::Candles, quick, quick).await,
+            1
+        );
+        assert_eq!(
+            ensure_until_keyed(&questdb, DdlTables::Live, quick, quick).await,
+            1
+        );
+    }
+
+    /// The spawned form runs the same loop to completion on its own task.
+    #[tokio::test]
+    async fn spawn_ensure_until_keyed_finishes_once_the_tables_are_keyed() {
+        let port = spawn_accept_everything_http().await;
+        let questdb = QuestDbConfig {
+            http_port: port,
+            ..unreachable_questdb()
+        };
+        let attempts = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            spawn_ensure_until_keyed(questdb, DdlTables::Candles),
+        )
+        .await
+        .expect("an accepting database keys the tables at once")
+        .expect("the task must not panic");
+        assert_eq!(attempts, 1);
+    }
+
+    /// The doubling delay starts at half a minute and stops at ten.
+    #[test]
+    fn ddl_background_retry_delays_are_pinned() {
+        assert_eq!(DDL_BACKGROUND_RETRY_FIRST_SECS, 30);
+        assert_eq!(DDL_BACKGROUND_RETRY_MAX_SECS, 600);
     }
 
     /// The inline await in `build_shared_infra` is bounded by the quiet

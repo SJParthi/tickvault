@@ -6935,10 +6935,29 @@ async fn run_frame_drain(
                 // then dropped, so the one number that says how far behind our
                 // own drain is existed for a microsecond and reached nothing.
                 record_ring_dwell(queued_nanos);
-                let received_at_nanos = chrono::Utc::now()
-                    .timestamp_nanos_opt()
-                    .unwrap_or(0)
-                    .saturating_sub(queued_nanos);
+                // The receipt the WAL record carries, read off the frame
+                // rather than re-derived as `now() - queued` (audit PR31).
+                // Replay stamps rows with the WAL's value, and the depth and
+                // tick keys include that stamp, so a second derivation of the
+                // same instant made every replayed row a new row. The dwell
+                // above still comes from the monotonic clock.
+                //
+                // The WAL stores an implausible receipt as the unknown
+                // sentinel, never as-is. Such a frame keeps the old derivation
+                // here, so no row is ever stamped with the sentinel; its
+                // replay then cannot collapse onto it, which is the case this
+                // change could not fix anyway.
+                let received_at_nanos = if tickvault_storage::ws_frame_spill::plausible_receipt_nanos(
+                    frame.received_at_nanos,
+                ) == tickvault_storage::ws_frame_spill::WAL_RECEIPT_UNKNOWN_NANOS
+                {
+                    chrono::Utc::now()
+                        .timestamp_nanos_opt()
+                        .unwrap_or(0)
+                        .saturating_sub(queued_nanos)
+                } else {
+                    frame.received_at_nanos
+                };
                 // The gap detector's clock is a millisecond reading; the same
                 // wall-clock instant is used so a frame's arrival and its
                 // silence-accounting can never disagree.
@@ -13704,6 +13723,7 @@ pub fn refold_wal_frames(
                             // never reads it; the receipt it DOES use is
                             // the WAL's `received_at_nanos` beside it.
                             received_at: std::time::Instant::now(),
+                            received_at_nanos: *wal_received_at_nanos,
                             // APPROVED: `Bytes::clone` is an atomic refcount bump on a cold boot-replay path, NOT a copy of the frame payload.
                             bytes: bytes.clone(),
                         };
@@ -17963,6 +17983,9 @@ mod tests {
             endpoint,
             connection_index: 5,
             received_at: std::time::Instant::now(),
+            received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
+                std::time::Instant::now(),
+            ),
             bytes: bytes::Bytes::from(bytes),
         }
     }
@@ -18196,6 +18219,37 @@ mod tests {
             replay.pending_ilp(),
             first,
             "a replayed frame must emit byte-identical rows, or it lands as a duplicate book"
+        );
+    }
+
+    /// Audit PR31: the live drain must stamp rows with the receipt the frame
+    /// carries — the WAL record's value — so a replayed depth or tick row
+    /// lands on its live twin. `now() - queued` was a second derivation of
+    /// the same instant and never matched to the nanosecond.
+    #[test]
+    fn the_live_drain_stamps_rows_with_the_wal_receipt() {
+        let source = include_str!("dhan_feed_stack.rs");
+        let production_half = source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(prod, _)| prod);
+        let drain = production_half
+            .split_once("async fn run_frame_drain(")
+            .map(|(_, rest)| rest)
+            .expect("run_frame_drain must exist");
+        let stamp = drain
+            .split_once("let received_at_nanos =")
+            .map(|(_, rest)| rest)
+            .expect("the drain stamps each frame");
+        let (expr, _) = stamp
+            .split_once("let recv_millis")
+            .expect("the stamp is followed by the gap detector's clock");
+        assert!(
+            expr.contains("frame.received_at_nanos"),
+            "the drain must read the frame's WAL receipt, not re-derive it"
+        );
+        assert!(
+            expr.contains("plausible_receipt_nanos("),
+            "an implausible receipt must fall back rather than stamp the sentinel"
         );
     }
 
@@ -20497,6 +20551,9 @@ mod tests {
             endpoint: DhanEndpointType::MainFeed,
             connection_index: 0,
             received_at: std::time::Instant::now(),
+            received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
+                std::time::Instant::now(),
+            ),
             bytes: bytes::Bytes::copy_from_slice(&ticker_packet(
                 13,
                 23_146.45,
@@ -20572,6 +20629,9 @@ mod tests {
             endpoint: DhanEndpointType::MainFeed,
             connection_index: 0,
             received_at: std::time::Instant::now(),
+            received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
+                std::time::Instant::now(),
+            ),
             bytes: bytes::Bytes::copy_from_slice(&ticker_packet(
                 13,
                 23_146.45,
@@ -20673,6 +20733,9 @@ mod tests {
             endpoint: DhanEndpointType::Depth20,
             connection_index: 5,
             received_at: std::time::Instant::now(),
+            received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
+                std::time::Instant::now(),
+            ),
             bytes: bytes::Bytes::from_static(&[0x0C, 0x00, 0x29, 0x00, 0x0D, 0x00, 0x00, 0x00]),
         })
         .await
@@ -24378,6 +24441,9 @@ mod frame_walk_accounting_tests {
                 endpoint: DhanEndpointType::MainFeed,
                 connection_index: 0,
                 received_at: std::time::Instant::now(),
+                received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
+                    std::time::Instant::now(),
+                ),
                 bytes: bytes.into(),
             },
             any_recv_nanos(),
@@ -24556,6 +24622,9 @@ mod frame_walk_accounting_tests {
                 endpoint: DhanEndpointType::MainFeed,
                 connection_index: 0,
                 received_at: std::time::Instant::now(),
+                received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
+                    std::time::Instant::now(),
+                ),
                 bytes: bytes.into(),
             },
             any_recv_nanos(),
@@ -24582,6 +24651,9 @@ mod frame_walk_accounting_tests {
                 endpoint: DhanEndpointType::MainFeed,
                 connection_index: 0,
                 received_at: std::time::Instant::now(),
+                received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
+                    std::time::Instant::now(),
+                ),
                 bytes: bytes.into(),
             },
             any_recv_nanos(),
@@ -24672,6 +24744,9 @@ mod frame_walk_accounting_tests {
                 endpoint: DhanEndpointType::MainFeed,
                 connection_index: 0,
                 received_at: std::time::Instant::now(),
+                received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
+                    std::time::Instant::now(),
+                ),
                 bytes: bytes.into(),
             },
             any_recv_nanos(),
@@ -24707,6 +24782,9 @@ mod frame_walk_accounting_tests {
                 endpoint: DhanEndpointType::MainFeed,
                 connection_index: 0,
                 received_at: std::time::Instant::now(),
+                received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
+                    std::time::Instant::now(),
+                ),
                 bytes: bytes.into(),
             },
             any_recv_nanos(),
@@ -24737,6 +24815,9 @@ mod frame_walk_accounting_tests {
                 endpoint: DhanEndpointType::MainFeed,
                 connection_index: 0,
                 received_at: std::time::Instant::now(),
+                received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
+                    std::time::Instant::now(),
+                ),
                 bytes: bytes.into(),
             },
             any_recv_nanos(),
@@ -24863,6 +24944,9 @@ mod frame_walk_accounting_tests {
                 endpoint: DhanEndpointType::MainFeed,
                 connection_index: 0,
                 received_at: std::time::Instant::now(),
+                received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
+                    std::time::Instant::now(),
+                ),
                 bytes: bytes.into(),
             },
             any_recv_nanos(),
@@ -24904,6 +24988,9 @@ mod frame_walk_accounting_tests {
                 endpoint: DhanEndpointType::MainFeed,
                 connection_index: 0,
                 received_at: std::time::Instant::now(),
+                received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
+                    std::time::Instant::now(),
+                ),
                 bytes: bytes.into(),
             },
             any_recv_nanos(),
@@ -24952,6 +25039,9 @@ mod frame_walk_accounting_tests {
                 endpoint: DhanEndpointType::MainFeed,
                 connection_index: 0,
                 received_at: std::time::Instant::now(),
+                received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
+                    std::time::Instant::now(),
+                ),
                 bytes: bytes.into(),
             },
             any_recv_nanos(),
@@ -24998,6 +25088,9 @@ mod frame_walk_accounting_tests {
                 endpoint: DhanEndpointType::MainFeed,
                 connection_index: 0,
                 received_at: std::time::Instant::now(),
+                received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
+                    std::time::Instant::now(),
+                ),
                 bytes: bytes.into(),
             },
             any_recv_nanos(),

@@ -938,7 +938,44 @@ pub async fn ensure_top_volume_tables(questdb_config: &QuestDbConfig) -> bool {
             }
         }
     }
+    if all_accepted {
+        TOP_VOLUME_TABLES_KEYED.store(true, std::sync::atomic::Ordering::Release);
+    }
     all_accepted
+}
+
+/// Set once [`ensure_top_volume_tables`] has had every statement for every
+/// `top_volume_<tf>` table accepted in this process. Never cleared.
+///
+/// Read by [`TopVolumeRankWriterSink::write`] and the synchronous
+/// [`TopVolumeRankWriter::flush`], which refuse to send a row until it is set
+/// (2026-09-27, audit PR31a): an ILP row reaching a missing table makes QuestDB
+/// create it WITHOUT its DEDUP key, and every re-sent snapshot then duplicates
+/// for the life of the table. Refused rows are counted on
+/// `tv_top_volume_rank_rows_discarded_total`; the leaderboard itself is in RAM
+/// and no tick is lost. One Acquire load per batch, never per row.
+pub(crate) static TOP_VOLUME_TABLES_KEYED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Latches the one coded `error!` an unkeyed refusal writes, so a session whose
+/// DDL never succeeds logs the cause once instead of four times a second.
+static TOP_VOLUME_UNKEYED_REFUSAL_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Writes the one coded `error!` for an unkeyed refusal, the first time only.
+fn log_unkeyed_refusal_once(rows: usize) {
+    if TOP_VOLUME_UNKEYED_REFUSAL_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    error!(
+        code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+        metric = "tv_top_volume_rank_rows_discarded_total",
+        rows,
+        "STORAGE-GAP-03: top_volume rows refused — the top_volume_<tf> tables are \
+         not yet confirmed to carry their DEDUP key, and a row sent now could \
+         auto-create one without it. Refused rows are counted until the ensure \
+         succeeds; no tick is lost (logged once per process)."
+    );
 }
 
 /// ILP-over-HTTP conf — per-flush server ACK (the 2026-07-05
@@ -986,6 +1023,11 @@ pub struct TopVolumeRankWriter {
     /// Consecutive flushes the producer has retained because the queue was
     /// full. Bounded by [`MAX_TOP_VOLUME_RETAINED_FLUSH_SPANS`].
     retained_spans: u32,
+    /// The "top_volume tables are keyed" latch this writer and its sink obey
+    /// before they send a row (audit PR31a, 2026-09-27). Always the
+    /// process-wide [`TOP_VOLUME_TABLES_KEYED`] outside this module's own
+    /// tests, which point it at a local flag.
+    keyed: &'static std::sync::atomic::AtomicBool,
 }
 
 impl TopVolumeRankWriter {
@@ -1028,6 +1070,7 @@ impl TopVolumeRankWriter {
                     discard_episodes: 0,
                     offload: None,
                     retained_spans: 0,
+                    keyed: &TOP_VOLUME_TABLES_KEYED,
                 }
             }
             Err(err) => {
@@ -1042,6 +1085,7 @@ impl TopVolumeRankWriter {
                     discard_episodes: 0,
                     offload: None,
                     retained_spans: 0,
+                    keyed: &TOP_VOLUME_TABLES_KEYED,
                 }
             }
         }
@@ -1058,6 +1102,7 @@ impl TopVolumeRankWriter {
             discard_episodes: 0,
             offload: None,
             retained_spans: 0,
+            keyed: &TOP_VOLUME_TABLES_KEYED,
         }
     }
 
@@ -1231,6 +1276,14 @@ impl TopVolumeRankWriter {
                  {dropped} pending row(s) discarded"
             );
         }
+        if !self.keyed.load(std::sync::atomic::Ordering::Acquire) {
+            log_unkeyed_refusal_once(self.pending);
+            let dropped = self.discard_pending();
+            anyhow::bail!(
+                "top_volume_rank: tables not yet keyed — {dropped} pending row(s) \
+                 discarded rather than let ILP auto-create a table without its DEDUP key"
+            );
+        }
         let flushed = self
             .sender
             .as_mut()
@@ -1282,6 +1335,7 @@ impl TopVolumeRankWriter {
         let (tx, rx) = std::sync::mpsc::sync_channel(TOP_VOLUME_FLUSH_QUEUE_DEPTH);
         let sink = TopVolumeRankWriterSink {
             sender: self.sender.take(),
+            keyed: self.keyed,
         };
         self.offload = Some(tx);
         (self, sink, rx)
@@ -1876,6 +1930,8 @@ pub enum TopVolumeOffloadOutcome {
 /// waiting, instead of the task that empties the socket.
 pub struct TopVolumeRankWriterSink {
     sender: Option<Sender>,
+    /// Copied from the writer at the split; see [`TopVolumeRankWriter`]'s field.
+    keyed: &'static std::sync::atomic::AtomicBool,
 }
 
 impl TopVolumeRankWriterSink {
@@ -1915,6 +1971,15 @@ impl TopVolumeRankWriterSink {
             Self::report_lost(batch, "no ILP sender (QuestDB unreachable)");
             return 0;
         };
+        if !self.keyed.load(std::sync::atomic::Ordering::Acquire) {
+            // Audit PR31a: counted like every other loss arm, logged once.
+            log_unkeyed_refusal_once(batch.rows);
+            metrics::counter!("tv_top_volume_rank_rows_discarded_total")
+                .increment(batch.rows as u64);
+            batch.buffer.clear();
+            batch.rows = 0;
+            return 0;
+        }
         let started = std::time::Instant::now();
         let first = sender.flush(&mut batch.buffer);
         let first_elapsed = started.elapsed();
@@ -2359,6 +2424,7 @@ impl TopVolumeRankWriter {
         let (spare_tx, spare_rx) = std::sync::mpsc::sync_channel(TOP_VOLUME_ROW_RECYCLE_DEPTH);
         let sink = TopVolumeRankWriterSink {
             sender: self.sender.take(),
+            keyed: self.keyed,
         };
         self.offload = None;
         let writer = TopVolumeRowWriter {
@@ -3009,6 +3075,99 @@ mod tests {
     /// A disconnected writer must not silently retain rows: a buffer kept
     /// across flushes replays a rejected row forever and poisons every later
     /// flush with it.
+    /// A loopback HTTP server that answers every ILP POST with 204 and counts
+    /// the connections it accepted, so a test can prove a write never reached
+    /// the network.
+    fn spawn_counting_ilp_server() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 65_536];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        (port, hits)
+    }
+
+    fn loopback_cfg(http_port: u16) -> QuestDbConfig {
+        QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port,
+            pg_port: 1,
+            ilp_port: 1,
+        }
+    }
+
+    /// Audit PR31a: the offload sink sends NOTHING until the `top_volume_<tf>`
+    /// tables are confirmed keyed, and counts the refused rows; once the latch
+    /// is set the same sink reaches the network. A local flag, so no other test
+    /// can flip it underneath.
+    #[test]
+    fn the_sink_sends_nothing_until_the_top_volume_tables_are_keyed() {
+        static LOCAL_KEYED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        let (port, hits) = spawn_counting_ilp_server();
+        let mut w = TopVolumeRankWriter::new(&loopback_cfg(port));
+        w.keyed = &LOCAL_KEYED;
+        let (mut producer, mut sink, rx) = w.split_for_offload();
+
+        producer.append_row(&row()).expect("append");
+        producer.flush().expect("hand-off");
+        let mut batch = rx.try_recv().expect("batch");
+        assert_eq!(sink.write(&mut batch), 0, "an unkeyed write lands nothing");
+        assert_eq!(batch.rows(), 0, "the refused rows are counted and cleared");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an unkeyed write must never reach QuestDB"
+        );
+
+        LOCAL_KEYED.store(true, std::sync::atomic::Ordering::Release);
+        producer.append_row(&row()).expect("append");
+        producer.flush().expect("hand-off");
+        let mut batch = rx.try_recv().expect("batch");
+        let _landed = sink.write(&mut batch);
+        assert!(
+            hits.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "once keyed the sink must send"
+        );
+    }
+
+    /// The synchronous flush obeys the same latch, and discards (never sends).
+    #[test]
+    fn a_synchronous_flush_refuses_until_the_top_volume_tables_are_keyed() {
+        static LOCAL_KEYED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        let (port, hits) = spawn_counting_ilp_server();
+        let mut w = TopVolumeRankWriter::new(&loopback_cfg(port));
+        w.keyed = &LOCAL_KEYED;
+        w.append_row(&row()).expect("append");
+        let err = w.flush().expect_err("an unkeyed flush must be refused");
+        assert!(format!("{err}").contains("not yet keyed"), "{err}");
+        assert_eq!(w.pending(), 0);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// Every constructor obeys the ONE process-wide latch the ensure sets.
+    #[test]
+    fn every_top_volume_writer_obeys_the_process_wide_keyed_latch() {
+        assert!(std::ptr::eq(
+            TopVolumeRankWriter::for_test().keyed,
+            &TOP_VOLUME_TABLES_KEYED
+        ));
+        assert!(std::ptr::eq(
+            TopVolumeRankWriter::new(&loopback_cfg(1)).keyed,
+            &TOP_VOLUME_TABLES_KEYED
+        ));
+    }
+
     #[test]
     fn a_flush_without_a_sender_discards_and_reports() {
         let mut w = TopVolumeRankWriter::for_test();
