@@ -445,3 +445,103 @@ fn r17_ci_test_matrix_runs_integration_tests_not_just_lib() {
          Coverage & Perf job (#988 root cause). Run the full per-crate suite."
     );
 }
+
+/// Audit PR36a (2026-09-27): the operator console key was published to the
+/// alerts topic as `${URL}#key=${KEY}`, and that topic also delivers to email
+/// and SMS, so the key sat in plaintext mail and text history. `add-mask`
+/// only hides the Actions log. No workflow may put the key, or a `#key=`
+/// link, into any published message, and the portal step must not read the
+/// stored key at all.
+#[test]
+fn r20_no_workflow_publishes_the_operator_key() {
+    let dir = repo_root().join(".github/workflows");
+    let mut scanned = 0usize;
+    for entry in fs::read_dir(&dir).expect("workflows dir readable") {
+        let path = entry.expect("dir entry").path();
+        let is_yaml = matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("yml") | Some("yaml")
+        );
+        if !is_yaml {
+            continue;
+        }
+        scanned += 1;
+        let body = fs::read_to_string(&path).expect("workflow readable");
+        let name = path.display();
+        assert!(
+            !body.contains("#key="),
+            "{name}: builds a #key= link; the operator key must never be sent (audit PR36a)"
+        );
+        for (i, line) in body.lines().enumerate() {
+            if line.contains("--message") || line.contains("MESSAGE=") {
+                assert!(
+                    !line.contains("KEY}") && !line.contains("$KEY") && !line.contains("LINK}"),
+                    "{name}:{}: a published message references the key: {line}",
+                    i + 1
+                );
+            }
+        }
+    }
+    assert!(scanned > 0, "no workflow files scanned");
+
+    let body = read(WORKFLOW);
+    let start = body
+        .find("- name: Send the operator-portal link to Telegram")
+        .expect("portal link step present");
+    let rest = &body[start + 1..];
+    let step = &rest[..rest.find("\n      - name:").unwrap_or(rest.len())];
+    assert!(
+        !step.contains("--with-decryption"),
+        "the portal step must not read the stored operator key"
+    );
+    must_contain(
+        step,
+        "The key is never sent in a message.",
+        "portal message tells the operator where the key is instead",
+    );
+    // Rotation (owner chose "Rotate after fix", 2026-09-27): only the exact
+    // word "rotate" overwrites the stored key, and a failed overwrite fails
+    // the step instead of reporting success.
+    must_contain(step, "rotate_console_key", "rotation is a manual input");
+    must_contain(
+        step,
+        "[ \"$ROTATE_CONSOLE_KEY\" = \"rotate\" ]",
+        "rotation needs the exact word",
+    );
+    must_contain(step, "--overwrite", "rotation replaces the stored key");
+    must_contain(
+        step,
+        "console key rotation FAILED",
+        "a failed rotation is loud",
+    );
+    // Security review (PR36a): the first-time save and the key itself are
+    // checked too, so neither an empty key nor a failed save is reported as
+    // a live portal.
+    must_contain(
+        step,
+        "[ ${#KEY} -ne 40 ]",
+        "a key is stored only after its length is checked",
+    );
+    must_contain(
+        step,
+        "console key generation FAILED",
+        "an empty or short key is loud",
+    );
+    must_contain(
+        step,
+        "console key creation FAILED",
+        "a failed first-time save is loud",
+    );
+    must_contain(
+        step,
+        "could not read the stored key; the old key is still in place",
+        "a rotation that fell into the create branch is not reported as done",
+    );
+    let rotate_input = body
+        .find("      rotate_console_key:")
+        .expect("rotate_console_key dispatch input declared");
+    assert!(
+        body[rotate_input..].contains("default: ''"),
+        "rotation defaults to off"
+    );
+}

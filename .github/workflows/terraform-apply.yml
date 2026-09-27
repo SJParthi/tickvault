@@ -78,6 +78,10 @@ on:
         description: 'DANGER: terraform force-unlock this state lock ID before planning. Leave EMPTY unless an ORPHANED lock from a killed run is blocking every terraform operation. Never use while an apply is genuinely running.'
         required: false
         default: ''
+      rotate_console_key:
+        description: 'Type "rotate" to replace the operator console key with a fresh one (needs skip_apply = no, outside market hours). The new key is written only to Parameter Store (operator control-secret) and is never sent; every device must paste it once. Leave EMPTY otherwise.'
+        required: false
+        default: ''
 
 concurrency:
   # PRs get their OWN per-branch group; every apply-capable event keeps the
@@ -628,13 +632,21 @@ jobs:
           echo "INSTANCE_ID=${INSTANCE_ID}"
           echo "ELASTIC_IP=${EIP}"
 
-      - name: Send ready-made operator-portal link to Telegram
-        # Zero-touch: if the portal is enabled, generate the device key in SSM
-        # (once), then DM the operator a single tappable link with the key in
-        # the URL fragment (#key=...). The fragment never reaches the server;
-        # the operator opens it and is unlocked with no typing. The key is
-        # NEVER printed to the Actions log — only published to the private
-        # SNS->Telegram channel.
+      - name: Send the operator-portal link to Telegram
+        # If the portal is enabled, generate the device key in SSM (once), then
+        # send the operator the portal URL. The KEY IS NEVER PUBLISHED (audit
+        # PR36a, 2026-09-27): the alerts topic also delivers to email and SMS,
+        # so a key in the message sat in plaintext mail and text history, and
+        # `add-mask` only ever hid the Actions log. The operator reads the key
+        # once from Parameter Store and pastes it on the portal's unlock page,
+        # which remembers it on that device.
+        #
+        # Rotation: a manual run with rotate_console_key = "rotate" overwrites
+        # the stored key with a fresh one. Both console Lambdas cache the key
+        # for 60 s, so the old key stops working within a minute. A failed
+        # rotation fails the step loudly; it never reports success.
+        env:
+          ROTATE_CONSOLE_KEY: ${{ github.event.inputs.rotate_console_key }}
         run: |
           set +e
           URL=$(terraform -chdir=${{ env.TF_DIR }} output -raw operator_portal_url 2>/dev/null)
@@ -642,24 +654,64 @@ jobs:
             echo "operator portal disabled — nothing to publish"; exit 0
           fi
           SECRET_NAME="/tickvault/prod/operator/control-secret"
-          if ! aws ssm get-parameter --name "$SECRET_NAME" --region ${{ env.AWS_REGION }} >/dev/null 2>&1; then
+          ROTATED=no
+          # A key is only ever stored after it is checked to be 40 characters
+          # (30 random bytes, base64). An empty or short key fails the step.
+          new_console_key() {
             KEY=$(openssl rand -base64 30 | tr -d '\n')
+            if [ ${#KEY} -ne 40 ]; then
+              unset KEY
+              echo "::error::console key generation FAILED: openssl did not return a 40-character key; nothing was stored" | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
             echo "::add-mask::${KEY}"
-            aws ssm put-parameter --name "$SECRET_NAME" --type SecureString \
-              --value "$KEY" --region ${{ env.AWS_REGION }} >/dev/null
-            echo "generated a new operator device key (stored in SSM SecureString)"
-          else
-            KEY=$(aws ssm get-parameter --name "$SECRET_NAME" --with-decryption \
-              --query Parameter.Value --output text --region ${{ env.AWS_REGION }})
-            echo "::add-mask::${KEY}"
+          }
+          if ! aws ssm get-parameter --name "$SECRET_NAME" --region ${{ env.AWS_REGION }} >/dev/null 2>&1; then
+            new_console_key
+            PUT_ERR=$(aws ssm put-parameter --name "$SECRET_NAME" --type SecureString \
+                --value "$KEY" --region ${{ env.AWS_REGION }} 2>&1 >/dev/null)
+            PUT_RC=$?
+            unset KEY
+            if [ "$PUT_RC" -eq 0 ]; then
+              echo "generated a new operator device key (stored in SSM SecureString)"
+            elif printf '%s' "$PUT_ERR" | grep -q ParameterAlreadyExists; then
+              # The read above failed for another reason (throttle, network)
+              # but a key is stored; keep it. A requested rotation did not
+              # happen, so say so rather than report success.
+              if [ "$ROTATE_CONSOLE_KEY" = "rotate" ]; then
+                echo "::error::console key rotation FAILED: could not read the stored key; the old key is still in place" | tee -a "$GITHUB_STEP_SUMMARY"
+                exit 1
+              fi
+              echo "a device key already exists; kept it"
+            else
+              echo "::error::console key creation FAILED: no key is stored, so the portal cannot be unlocked" | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+          elif [ "$ROTATE_CONSOLE_KEY" = "rotate" ]; then
+            new_console_key
+            if ! aws ssm put-parameter --name "$SECRET_NAME" --type SecureString --overwrite \
+                --value "$KEY" --region ${{ env.AWS_REGION }} >/dev/null; then
+              unset KEY
+              echo "::error::console key rotation FAILED: the old key is still in place" | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            unset KEY
+            ROTATED=yes
+            echo "rotated the operator device key (stored in SSM SecureString)"
           fi
-          LINK="${URL}#key=${KEY}"
+          if [ "$ROTATED" = "yes" ]; then
+            SUBJECT="Operator console key replaced"
+            MESSAGE="Your tickvault operator console key was replaced. The old key stops working within a minute. Open ${URL} on each device and paste the new key from AWS Parameter Store (operator control-secret). The key is never sent in a message."
+          else
+            SUBJECT="Operator portal ready"
+            MESSAGE="Your tickvault operator portal is live: ${URL} — open it and paste your device key (AWS Parameter Store, operator control-secret). The key is never sent in a message."
+          fi
           aws sns publish --region ${{ env.AWS_REGION }} \
             --topic-arn "arn:aws:sns:${{ env.AWS_REGION }}:${{ steps.aws_account.outputs.account_id }}:tv-prod-alerts" \
-            --subject "Operator portal ready" \
-            --message "Your tickvault operator portal is live. Tap to open (your key is baked in — do NOT forward this message): ${LINK}" >/dev/null
-          echo "✅ Published the ready-made portal link to Telegram (key NOT shown here)."
-          echo "Operator portal URL (key sent privately via Telegram): ${URL}" >> "$GITHUB_STEP_SUMMARY"
+            --subject "$SUBJECT" \
+            --message "$MESSAGE" >/dev/null
+          echo "✅ Published the portal URL to Telegram (the key is never sent; rotated=${ROTATED})."
+          echo "Operator portal URL: ${URL} (key rotated: ${ROTATED})" >> "$GITHUB_STEP_SUMMARY"
 
       - name: "Deploy gate: console shell GET / must return 200 within 5s"
         # Console smoke gate (B4 r3 shell-hang fix, 2026-07-06; simplified to a
