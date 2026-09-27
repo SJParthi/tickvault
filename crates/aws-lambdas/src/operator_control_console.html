@@ -136,7 +136,7 @@
           <label class="switch"><input type="checkbox" id="force_inst"> force (override market-hours guard)</label>
           <span class="muted" id="updated"></span>
         </div>
-        <div class="muted" style="margin-top:8px">One button, context-aware: ▶ Start when the box is stopped, ■ Stop when it is running. Stop is blocked 9:15 AM–3:30 PM IST Mon–Fri unless force is ticked.</div>
+        <div class="muted" style="margin-top:8px">One button, context-aware: ▶ Start when the box is stopped, ■ Stop when it is running. Stop is blocked 9:15 AM–3:40 PM IST Mon–Fri unless force is ticked.</div>
       </div>
       <div class="card">
         <details class="fold" id="awsdetails">
@@ -214,13 +214,13 @@
           <button class="b-amb" onclick="act('restart-app')">♻ Restart app</button>
           <button class="b-amb" onclick="act('restart-questdb')">♻ Restart QuestDB</button>
           <button class="b-stop" onclick="act('stop-app')">⏹ Stop app</button></div>
-        <div class="muted" style="margin-top:10px">Stop / restart are blocked 9:15 AM–3:30 PM IST Mon–Fri.</div>
+        <div class="muted" style="margin-top:10px">Stop / restart are blocked 9:15 AM–3:40 PM IST Mon–Fri.</div>
         <label class="switch" style="margin-top:8px"><input type="checkbox" id="force"> force (override market-hours guard)</label>
       </div>
       <div class="card">
         <details class="fold" id="danger">
           <summary><span class="lbl" style="display:inline">⚠️ danger zone — destructive data actions (tap to open)</span> <span class="muted" style="font-size:11px">(contains: Wipe ALL · Docker reset · Bare nuke)</span></summary>
-          <div class="warn" id="dangerlock" hidden style="margin-top:10px">🔒 Locked until 3:40 PM IST — data-destructive actions are refused during market hours, even with force. A mid-market wipe destroys data that can never be re-fetched.</div>
+          <div class="warn" id="dangerlock" hidden style="margin-top:10px">🔒 Locked 9:00 AM–3:45 PM IST, every day — data-destructive actions are refused in that window, even with force. A wipe in or around the session destroys data that can never be re-fetched.</div>
           <div class="muted" style="margin-top:10px">Pick ONE severity, then Execute. Every action still asks you to type its own confirm word — nothing fires from a mis-click.</div>
           <label class="danger-opt"><input type="radio" name="danger" value="wipe">
             <span><b>🗑️ Wipe ALL data → fresh start</b> — <span class="muted">deletes every legacy tick &amp; candle table AND today's official minute candles + the fetch log (spot / option-chain / per-contract tables) for BOTH brokers, plus every capture/replay file so NOTHING resurrects after restart — SEBI audit tables kept. Run when the box is RUNNING; next session = fresh data. Asks you to type WIPE.</span></span></label>
@@ -303,7 +303,7 @@ async function loadOverview(){ $('refbtn').innerHTML='<span class="spin">🔄</s
   $('p_mkt').innerHTML='<span class="'+(j.market_hours?'warn':'')+'">'+(j.market_hours?'OPEN':'closed')+'</span>';
   // Danger-zone hard-lock label: data-destructive actions are server-refused
   // (409, no force escape) while the market is open — surface that BEFORE a click.
-  const dl=$('dangerlock'); if(dl) dl.hidden=!j.market_hours;
+  const dl=$('dangerlock'); if(dl) dl.hidden=!(j.data_destructive_locked===undefined?j.market_hours:j.data_destructive_locked);
   // Per-broker split of today's official minute rows — summed across the
   // three live tables, rendered generically from whatever feeds QuestDB
   // reports (no hardcoding; a future broker appears automatically).

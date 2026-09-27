@@ -16,8 +16,9 @@
 //! * Destructive box actions (stop/reboot/restart-app/stop-app) are blocked
 //!   during market hours (09:15-15:40 IST Mon-Fri) unless `{"force": true}`.
 //! * DATA-DESTRUCTIVE actions (wipe-questdb/docker-reset/docker-nuke-bare)
-//!   are HARD-LOCKED during market hours — refused with 409 even with
-//!   `{"force": true}` (operator incident 2026-07-02 15:05 IST).
+//!   are HARD-LOCKED 09:00-15:45 IST every day — refused with 409 even with
+//!   `{"force": true}` (operator incident 2026-07-02 15:05 IST; window widened
+//!   to daily-universe Quote 25's by audit PR20, 2026-09-27).
 //! * The SQL box is READ-ONLY: only SELECT/SHOW/EXPLAIN/WITH are accepted;
 //!   any mutating keyword is rejected before it ever reaches QuestDB.
 //!
@@ -55,10 +56,26 @@ pub const DESTRUCTIVE: [&str; 7] = [
 // possible.
 pub const DATA_DESTRUCTIVE: [&str; 3] = ["wipe-questdb", "docker-reset", "docker-nuke-bare"];
 
-/// legacy: handler.py:125-129 (`_DATA_DESTRUCTIVE_LOCK_MSG`) — verbatim.
-pub const DATA_DESTRUCTIVE_LOCK_MSG: &str = "Data-destructive actions are locked during market hours \
-(09:15-15:40 IST) — a mid-market wipe destroys data that can never \
-be re-fetched. Run after 15:40.";
+/// Refusal text for [`DATA_DESTRUCTIVE`] inside the lock window.
+///
+/// 2026-09-27 (audit PR20): was "(09:15-15:40 IST) ... Run after 15:40" and
+/// followed [`is_market_hours`]. The rule the lock enforces is wider —
+/// daily-universe Quote 25 REJECTs a nuke "inside 09:00–15:45 IST" — so the
+/// lock now has its own window, [`is_data_destructive_locked`].
+pub const DATA_DESTRUCTIVE_LOCK_MSG: &str = "Data-destructive actions are locked 09:00-15:45 IST \
+every day (market hours plus a margin either side) — a wipe then destroys data \
+that can never be re-fetched. Run after 15:45.";
+
+/// Start of the data-destructive lock, 09:00 IST (seconds-of-day).
+///
+/// Wider than [`MKT_OPEN_SECS`] on purpose: the pre-open session and the
+/// boot's capture start at 09:00, and daily-universe Quote 25's REJECT list
+/// names "Runs the nuke inside 09:00–15:45 IST". Pinned against that rule
+/// text by `test_data_destructive_lock_window_matches_the_rule_file`.
+pub const DATA_DESTRUCTIVE_LOCK_OPEN_SECS: u32 = 9 * 3600;
+/// End of the data-destructive lock, 15:45 IST (seconds-of-day, exclusive).
+/// Five minutes past [`MKT_CLOSE_SECS`], for the same rule.
+pub const DATA_DESTRUCTIVE_LOCK_CLOSE_SECS: u32 = 15 * 3600 + 45 * 60;
 
 /// legacy: `_MKT_OPEN_SECS = 9 * 3600 + 15 * 60` (09:15 IST, seconds-of-day).
 pub const MKT_OPEN_SECS: u32 = 9 * 3600 + 15 * 60;
@@ -171,6 +188,20 @@ pub fn is_market_hours(now_utc: DateTime<Utc>) -> bool {
     }
     let sod = ist.hour() * 3600 + ist.minute() * 60 + ist.second();
     (MKT_OPEN_SECS..MKT_CLOSE_SECS).contains(&sod)
+}
+
+/// True inside the data-destructive lock, 09:00 ≤ t < 15:45 IST, on EVERY
+/// day of the week.
+///
+/// Every day and not Mon–Fri, unlike [`is_market_hours`]: the rule's window
+/// carries no weekday qualifier, and a weekend special session (Muhurat
+/// trading, a budget-day Saturday) is still a session whose data cannot be
+/// re-fetched. A weekend wipe waits until 15:45, which costs an operator a
+/// few hours; a wrong guess about which weekends trade costs a day's data.
+pub fn is_data_destructive_locked(now_utc: DateTime<Utc>) -> bool {
+    let ist = now_utc + TimeDelta::seconds(IST_OFFSET_SECS);
+    let sod = ist.hour() * 3600 + ist.minute() * 60 + ist.second();
+    (DATA_DESTRUCTIVE_LOCK_OPEN_SECS..DATA_DESTRUCTIVE_LOCK_CLOSE_SECS).contains(&sod)
 }
 
 /// legacy: `_http_method` (handler.py:202-206). Fail closed: a malformed
@@ -1195,6 +1226,8 @@ pub trait OpsShell {
     async fn control_secret(&self) -> String;
     /// legacy `_is_market_hours(datetime.datetime.utcnow())`.
     fn market_hours_now(&self) -> bool;
+    /// [`is_data_destructive_locked`] at the current instant.
+    fn data_destructive_locked_now(&self) -> bool;
     /// legacy `int(time.time())`.
     fn now_epoch(&self) -> i64;
     /// legacy `os.environ.get(key, "")`.
@@ -1287,10 +1320,11 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
     let action = payload_str(&payload, "action").to_string();
     let force = truthy(payload.get("force").unwrap_or(&Value::Bool(false)));
 
-    // HARD gate first: data-destructive actions have NO force escape during
-    // market hours (audit fix #2 — see DATA_DESTRUCTIVE above). Must run
-    // BEFORE the soft gate below because DATA_DESTRUCTIVE ⊂ DESTRUCTIVE.
-    if DATA_DESTRUCTIVE.contains(&action.as_str()) && shell.market_hours_now() {
+    // HARD gate first: data-destructive actions have NO force escape inside
+    // the lock window (audit fix #2 — see DATA_DESTRUCTIVE above; the window
+    // is 09:00-15:45 every day since audit PR20). Must run BEFORE the soft
+    // gate below because DATA_DESTRUCTIVE ⊂ DESTRUCTIVE.
+    if DATA_DESTRUCTIVE.contains(&action.as_str()) && shell.data_destructive_locked_now() {
         return resp(
             409,
             &json!({
@@ -1556,10 +1590,11 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
             };
             let snap = parse_view(&stdout);
             let mh = shell.market_hours_now();
+            let dl = shell.data_destructive_locked_now();
             resp(
                 200,
                 &merged(
-                    json!({"ok": true, "action": "view", "instance_state": state, "market_hours": mh}),
+                    json!({"ok": true, "action": "view", "instance_state": state, "market_hours": mh, "data_destructive_locked": dl}),
                     &snap,
                 ),
             )
@@ -1846,6 +1881,10 @@ impl OpsShell for AwsShell {
 
     fn market_hours_now(&self) -> bool {
         is_market_hours(Utc::now())
+    }
+
+    fn data_destructive_locked_now(&self) -> bool {
+        is_data_destructive_locked(Utc::now())
     }
 
     fn now_epoch(&self) -> i64 {
@@ -2406,6 +2445,10 @@ mod tests {
     struct MockShell {
         secret: String,
         market_hours: bool,
+        /// `None` = the data-destructive lock follows `market_hours` (every
+        /// pre-PR20 test's assumption); `Some(v)` pins it independently, for
+        /// the 09:00-09:15 and 15:40-15:45 edges where the two differ.
+        destructive_locked: Option<bool>,
         now: i64,
         env: std::collections::HashMap<String, String>,
         ssm_result: Result<String, String>,
@@ -2427,6 +2470,7 @@ mod tests {
             Self {
                 secret: AUTH_SECRET.to_string(),
                 market_hours: false,
+                destructive_locked: None,
                 now: 1_780_000_000,
                 env: std::collections::HashMap::new(),
                 ssm_result: Ok("cid-1".to_string()),
@@ -2461,6 +2505,9 @@ mod tests {
         }
         fn market_hours_now(&self) -> bool {
             self.market_hours
+        }
+        fn data_destructive_locked_now(&self) -> bool {
+            self.destructive_locked.unwrap_or(self.market_hours)
         }
         fn now_epoch(&self) -> i64 {
             self.now
@@ -2693,13 +2740,22 @@ mod tests {
         //   3. nothing else — the Data tab was RE-POINTED in place, so its
         //      bars, hero and dedup shield keep their markup and only their
         //      keys, table names and the 4 -> 5 expectation moved.
+        //
+        // RE-BLESSED 2026-09-27 (audit PR20) — 46,394 -> 46,484 bytes, no new
+        // lines. Three labels told the operator a window the server does not
+        // enforce: the danger-zone lock said "until 3:40 PM" while the rule it
+        // enforces is 09:00-15:45 every day, and two stop/restart captions
+        // still said 3:30 PM, a close that moved to 3:40 on 2026-08-03. The
+        // danger-zone line now also reads the server's own
+        // `data_destructive_locked` flag, falling back to `market_hours` for a
+        // Lambda that predates it, so the label and the 409 cannot disagree.
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CONSOLE_HTML.as_bytes());
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "b364d3dacb24fb069f8374de122f32eb389eb2c35302018a00dd2e375e2bede1"
+            "fc85fb0b586fc63cf6eceecba1a7a323c297cf5c9efa6e082ae3fc7668165523"
         );
-        assert_eq!(CONSOLE_HTML.len(), 46_394);
+        assert_eq!(CONSOLE_HTML.len(), 46_484);
     }
 
     // --------------------------------------------------------- class ParseView
@@ -3906,8 +3962,11 @@ mod tests {
 
             // Every destructive step must come after the export.
             for (i, c) in cmds.iter().enumerate() {
+                // `docker volume ls` alone is a READ (the preserve step lists
+                // volumes to find the database one, audit PR20); the bare
+                // nuke's destroying line pipes it into `docker volume rm`,
+                // which the first term catches.
                 let destroys = c.contains("docker volume rm")
-                    || c.contains("docker volume ls")
                     || c.contains("compose down -v")
                     || c.contains("system prune");
                 assert!(
@@ -3931,15 +3990,47 @@ mod tests {
                 "{name}: a failed export of an EXISTING regulatory table must abort the \
                  action, not be logged and stepped over"
             );
-            // And it must NOT refuse when QuestDB is simply unreachable —
-            // this action is also the remedy for a wedged QuestDB, and a
-            // recovery tool that cannot run during the failure it recovers
-            // from is not a recovery tool.
+            // An unreachable QuestDB is NOT "nothing to export" (audit
+            // PR20, 2026-09-27): the tables are still on the volume this
+            // action deletes. It must copy them off the volume, verified,
+            // and stop on any step it cannot prove — while staying the
+            // remedy for a wedged QuestDB.
             assert!(
-                block.contains("SEBI-PRESERVE-UNAVAILABLE"),
-                "{name}: an unreachable QuestDB must be reported and stepped over, never \
-                 treated as unexported data"
+                block.contains("SEBI-PRESERVE-UNAVAILABLE")
+                    && block.contains("SEBI-PRESERVED-RAW")
+                    && block.contains("docker stop tv-questdb"),
+                "{name}: an unreachable QuestDB must lead to a raw copy of the tables off \
+                 the stopped volume, never to deleting them unsaved"
             );
+            assert!(
+                !block.contains("Proceeding, because"),
+                "{name}: the old 'QuestDB did not answer, proceeding' step-over is back — \
+                 that deletes every 5-year table unsaved (daily-universe Quote 25 REJECT)"
+            );
+            // Every exit path out of the preserve step that did not prove the
+            // tables saved must go through sebi_abort, which restores the box
+            // and pages. A bare `exit 1` would leave the app disabled.
+            let preserve = &cmds[preserve_at];
+            assert_eq!(
+                preserve.matches("exit 1").count(),
+                1,
+                "{name}: the only `exit 1` in the preserve step must be the one inside \
+                 sebi_abort, so every refusal restores the box and pages"
+            );
+            for needle in [
+                "code=LAMBDA-PORTAL-01",
+                "systemctl enable tickvault",
+                "systemctl start tickvault",
+                "aws sns publish",
+                "du -sb",
+                "SELECT count() FROM",
+            ] {
+                assert!(
+                    preserve.contains(needle),
+                    "{name}: the preserve step lost `{needle}` — a refusal must restore the \
+                     app, page, and every save must be verified, not assumed"
+                );
+            }
             // The export target must be outside every path this action wipes.
             assert!(
                 block.contains("/opt/tickvault/data/sebi-preserve/"),
@@ -4748,9 +4839,9 @@ data-pull phase, so the system is never blinded mid-trade";
             let body = body_of(&resp);
             assert_eq!(body["market_hours_locked"], true, "{action}");
             let err = body["error"].as_str().unwrap();
-            assert!(err.contains("locked during market hours"));
+            assert!(err.contains("locked 09:00-15:45 IST"));
             assert!(err.contains("never be re-fetched"));
-            assert!(err.contains("Run after 15:40"));
+            assert!(err.contains("Run after 15:45"));
         }
     }
 
@@ -4811,6 +4902,96 @@ data-pull phase, so the system is never blinded mid-trade";
         assert!(shell.captured_joined().contains("WIPE-COMPLETE"));
     }
 
+    /// Audit PR20 (2026-09-27): the data-destructive lock is its own window,
+    /// 09:00 ≤ t < 15:45 IST, on every day — wider than market hours at both
+    /// ends and not skipped at the weekend.
+    #[test]
+    fn test_is_data_destructive_locked_boundaries() {
+        // 2026-06-01 is a Monday, 2026-06-06 a Saturday; IST = UTC + 05:30.
+        let cases = [
+            ((1, 3, 29, 59), false), // Mon 08:59:59 IST
+            ((1, 3, 30, 0), true),   // Mon 09:00:00 IST — locked (market opens 09:15)
+            ((1, 3, 44, 59), true),  // Mon 09:14:59 IST — locked, market_hours is not
+            ((1, 10, 10, 0), true),  // Mon 15:40:00 IST — locked, market_hours is not
+            ((1, 10, 14, 59), true), // Mon 15:44:59 IST
+            ((1, 10, 15, 0), false), // Mon 15:45:00 IST — open
+            ((6, 5, 30, 0), true),   // Sat 11:00 IST — weekends are locked too
+            ((6, 12, 0, 0), false),  // Sat 17:30 IST
+        ];
+        for ((d, h, m, sec), locked) in cases {
+            let utc = Utc.with_ymd_and_hms(2026, 6, d, h, m, sec).unwrap();
+            assert_eq!(is_data_destructive_locked(utc), locked, "{utc}");
+        }
+        assert_eq!(DATA_DESTRUCTIVE_LOCK_OPEN_SECS, 32_400);
+        assert_eq!(DATA_DESTRUCTIVE_LOCK_CLOSE_SECS, 56_700);
+    }
+
+    /// The two constants are the rule's window, read from the rule file
+    /// itself so a later edit to either side fails here.
+    #[test]
+    fn test_data_destructive_lock_window_matches_the_rule_file() {
+        let rule = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+                "../../docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md",
+            ),
+        )
+        .expect("the daily-universe rule file is the authority for this window");
+        assert!(
+            rule.contains("Runs the nuke inside 09:00–15:45 IST."),
+            "the rule's nuke window moved; move DATA_DESTRUCTIVE_LOCK_*_SECS with it"
+        );
+        let hhmm = |secs: u32| format!("{:02}:{:02}", secs / 3600, (secs % 3600) / 60);
+        assert_eq!(hhmm(DATA_DESTRUCTIVE_LOCK_OPEN_SECS), "09:00");
+        assert_eq!(hhmm(DATA_DESTRUCTIVE_LOCK_CLOSE_SECS), "15:45");
+        assert!(DATA_DESTRUCTIVE_LOCK_MSG.contains("09:00-15:45"));
+    }
+
+    /// 09:05 and 15:42: market_hours is false, the lock is on. Every
+    /// data-destructive action is refused even with force, and a lifecycle
+    /// action (which follows market hours) is not.
+    #[tokio::test]
+    async fn test_data_destructive_lock_holds_outside_market_hours_edges() {
+        let shell = MockShell {
+            market_hours: false,
+            destructive_locked: Some(true),
+            forbid_ssm: Some("SSM must not be called inside the data-destructive lock"),
+            ..MockShell::default()
+        };
+        for (action, word) in [
+            ("wipe-questdb", "WIPE"),
+            ("docker-reset", "NUKE-DOCKER"),
+            ("docker-nuke-bare", "ERASE"),
+        ] {
+            let resp = post(
+                &shell,
+                json!({"action": action, "force": true, "confirm": word}),
+            )
+            .await;
+            assert_eq!(status_of(&resp), 409, "{action}");
+            assert_eq!(body_of(&resp)["market_hours_locked"], true, "{action}");
+        }
+        let lifecycle = MockShell {
+            market_hours: false,
+            destructive_locked: Some(true),
+            ..MockShell::default()
+        };
+        let resp = post(&lifecycle, json!({"action": "reboot"})).await;
+        assert_ne!(status_of(&resp), 409, "reboot follows market hours, not the wipe lock");
+    }
+
+    #[tokio::test]
+    async fn test_view_reports_the_data_destructive_lock() {
+        let shell = MockShell {
+            market_hours: false,
+            destructive_locked: Some(true),
+            ..MockShell::default()
+        };
+        let resp = post(&shell, json!({"action": "view"})).await;
+        assert_eq!(status_of(&resp), 200);
+        assert_eq!(body_of(&resp)["data_destructive_locked"], true);
+        assert_eq!(body_of(&resp)["market_hours"], false);
+    }
+
     #[test]
     fn test_boundary_minutes_pin_exact_semantics() {
         // Pinned lock window semantics: 09:15:00 ≤ t < 15:40:00 IST Mon-Fri.
@@ -4836,10 +5017,16 @@ data-pull phase, so the system is never blinded mid-trade";
     fn test_danger_zone_shows_lock_label_when_market_open() {
         // The label exists, starts hidden, and names the lock honestly.
         assert!(CONSOLE_HTML.contains(r#"id="dangerlock""#));
-        assert!(CONSOLE_HTML.contains("Locked until 3:40 PM IST"));
+        assert!(CONSOLE_HTML.contains("Locked 9:00 AM–3:45 PM IST, every day"));
         assert!(CONSOLE_HTML.contains("even with force"));
-        // loadOverview un-hides it from the server's market_hours flag.
-        assert!(CONSOLE_HTML.contains("dl.hidden=!j.market_hours"));
+        // loadOverview un-hides it from the server's own lock flag (the
+        // same predicate the 409 gate reads), falling back to market_hours.
+        assert!(CONSOLE_HTML.contains(
+            "dl.hidden=!(j.data_destructive_locked===undefined?j.market_hours:j.data_destructive_locked)"
+        ));
+        // No caption may name a close the server does not enforce.
+        assert!(!CONSOLE_HTML.contains("3:30 PM"));
+        assert!(!CONSOLE_HTML.contains("Locked until 3:40 PM"));
     }
 
     // ----------------------------------- class LegacyLiveFeedPanelsRemoved

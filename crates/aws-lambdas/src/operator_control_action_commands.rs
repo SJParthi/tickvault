@@ -68,11 +68,14 @@ pub const DOCKER_RESET_COMMANDS: [&str; 18] = [
     // path in this action, so the data survives the reset with no credentials
     // and no S3 dependency.
     //
-    // The abort rule is deliberately asymmetric. QuestDB unreachable =>
-    // continue: this action exists partly to recover a wedged QuestDB, and
-    // there is nothing to export from a server that cannot answer. A table
-    // that EXISTS and fails to export => abort: that is data we could have
-    // saved and chose not to.
+    // The abort rule WAS asymmetric: QuestDB unreachable => continue, on the
+    // reasoning that there is nothing to export from a server that cannot
+    // answer. That was wrong — the tables are still on the volume this
+    // action then deletes. Since 2026-09-27 (audit PR20) an unreachable
+    // QuestDB means the tables are copied straight off the volume, and ANY
+    // step that cannot prove they are saved stops the action, restores the
+    // box and pages (`sebi_abort`). The action is still the remedy for a
+    // wedged QuestDB: it just saves the files before it deletes them.
     r#"QDB='http://127.0.0.1:9000'
 OUT=/opt/tickvault/data/sebi-preserve/$(date -u +%Y%m%dT%H%M%SZ)
 # 2026-09-05: was FOUR names. The other 32 tables the repository's own
@@ -87,26 +90,87 @@ OUT=/opt/tickvault/data/sebi-preserve/$(date -u +%Y%m%dT%H%M%SZ)
 # and the guard can never again assert a list against itself.
 SEBI='brutex_crossverify_cell_audit brutex_crossverify_daily cross_verify_1m_audit dhan_live_crossverify_cell_audit dhan_live_crossverify_daily dhan_rest_1m_tape feed_coverage_daily feed_episode_audit feed_parity_1m_audit feed_scoreboard_daily groww_cross_verify_1m_audit index_constituency instrument_fetch_audit instrument_lifecycle instrument_lifecycle_audit option_chain_1m option_contract_1m_rest order_audit order_leg_pnl order_update_events partition_archive_audit pnl_audit position_update_events prev_day_ohlcv rest_fetch_audit rest_option_chain_1m rest_option_contract_1m rest_spot_1m schema_reset_log spot_1m_rest spot_crossverify_cell_audit spot_crossverify_daily table_storage_daily tf_consistency_audit tick_conservation_audit ws_connection_daily ws_event_audit'
 ALL=$(curl -fsS --max-time 15 --get --data-urlencode 'query=SELECT table_name FROM tables()' "$QDB/exp" 2>/dev/null | tail -n +2 | tr -d '"\r' | sed '/^$/d')
+# 2026-09-27 (audit PR20): the "QuestDB did not answer => proceed" branch is
+# GONE. It deleted the volume with every 5-year table still inside it and
+# printed one line, which daily-universe Quote 25 names as a REJECT ("proceeds
+# after a failed SEBI export"). A wedged QuestDB is exactly when the tables
+# are still on disk, so this now copies them straight off the volume instead,
+# with QuestDB stopped so the files are quiescent. Any step that cannot prove
+# the tables are saved STOPS the action, restores the box and pages.
+sebi_abort() {
+  echo "ABORTED: $1"
+  echo "code=LAMBDA-PORTAL-01 SEBI-PRESERVE-ABORT: nothing was deleted; the database and the app are being restarted."
+  docker start tv-questdb >/dev/null 2>&1 || true
+  systemctl enable tickvault >/dev/null 2>&1 || true
+  systemctl start tickvault >/dev/null 2>&1 || true
+  ACCT=$(timeout 20 aws sts get-caller-identity --query Account --output text 2>/dev/null)
+  if [ -n "$ACCT" ]; then
+    timeout 20 aws sns publish --region ap-south-1 --topic-arn "arn:aws:sns:ap-south-1:$ACCT:tv-prod-alerts" --subject 'Database reset stopped' --message "🔴 Database reset STOPPED before deleting anything. The 5-year records could not be saved first: $1 The app was restarted. Check the box before trying again." >/dev/null 2>&1 || echo 'SEBI-PRESERVE-PAGE-FAILED: the alert could not be sent'
+  else
+    echo 'SEBI-PRESERVE-PAGE-FAILED: the alert could not be sent'
+  fi
+  exit 1
+}
 if [ -z "$ALL" ]; then
-  echo 'SEBI-PRESERVE-UNAVAILABLE: QuestDB did not answer — nothing could be exported. Proceeding, because this action is also the remedy for a wedged QuestDB.'
+  echo 'SEBI-PRESERVE-UNAVAILABLE: QuestDB did not answer — copying the 5-year tables straight off the database volume instead.'
+  VOLS=$(docker volume ls -q 2>/dev/null) || sebi_abort 'Docker did not answer, so the database volume could not be checked.'
+  if printf '%s\n' "$VOLS" | grep -qx tv-questdb-data; then
+    docker stop tv-questdb >/dev/null 2>&1 || true
+    MP=$(docker volume inspect -f '{{.Mountpoint}}' tv-questdb-data 2>/dev/null)
+    [ -n "$MP" ] && [ -d "$MP/db" ] || sebi_abort 'The database files could not be found on the volume.'
+    DIRS=''
+    for t in $SEBI; do
+      FOUND=0
+      for d in "$MP/db/$t" "$MP/db/$t"~*; do
+        [ -d "$d" ] || continue
+        FOUND=1; DIRS="$DIRS $d"
+      done
+      [ "$FOUND" = 0 ] && echo "SEBI-ABSENT $t"
+    done
+    if [ -n "$DIRS" ]; then
+      # shellcheck disable=SC2086
+      NEED=$(du -sbc $DIRS 2>/dev/null | tail -n 1 | cut -f1)
+      mkdir -p "$OUT/raw" || sebi_abort 'The save folder could not be created.'
+      FREE=$(df -B1 --output=avail "$OUT/raw" 2>/dev/null | tail -n 1 | tr -d ' ')
+      [ -n "$NEED" ] && [ -n "$FREE" ] && [ "$FREE" -gt "$NEED" ] || sebi_abort "Not enough free disk to save them (need ${NEED:-?} bytes, free ${FREE:-?})."
+      for d in $DIRS; do
+        n=$(basename "$d")
+        if cp -a "$d" "$OUT/raw/$n" && [ "$(du -sb "$d" | cut -f1)" = "$(du -sb "$OUT/raw/$n" | cut -f1)" ]; then
+          echo "SEBI-PRESERVED-RAW $n $(du -sb "$OUT/raw/$n" | cut -f1) bytes -> $OUT/raw/$n"
+        else
+          echo "SEBI-PRESERVE-FAILED $n"
+          sebi_abort "Copying the table $n off the volume failed or came out a different size."
+        fi
+      done
+    fi
+  else
+    echo 'SEBI-VOLUME-ABSENT: there is no database volume, so there is nothing to lose.'
+  fi
 else
-  mkdir -p "$OUT" || true
-  FAIL=0
+  mkdir -p "$OUT" || sebi_abort 'The save folder could not be created.'
   for t in $SEBI; do
     if printf '%s\n' "$ALL" | grep -qx "$t"; then
       if curl -fsS --max-time 300 --get --data-urlencode "query=SELECT * FROM $t" "$QDB/exp" -o "$OUT/$t.csv"; then
-        echo "SEBI-PRESERVED $t $(wc -c <"$OUT/$t.csv" | tr -d ' ') bytes -> $OUT/$t.csv"
+        # Verified, not assumed: the file must hold at least as many rows as
+        # the table (header excluded). A quoted newline inside a value can only
+        # ADD lines, so a short file is a truncated export and never passes.
+        ROWS=$(curl -fsS --max-time 30 --get --data-urlencode "query=SELECT count() FROM $t" "$QDB/exp" 2>/dev/null | tail -n 1 | tr -d '"\r ')
+        LINES=$(awk 'END{print NR}' "$OUT/$t.csv")
+        case "$ROWS" in ''|*[!0-9]*) echo "SEBI-PRESERVE-FAILED $t"; sebi_abort "The row count of $t could not be read to check its export." ;; esac
+        if [ "$LINES" -ge 1 ] && [ $((LINES - 1)) -ge "$ROWS" ]; then
+          echo "SEBI-PRESERVED $t $ROWS rows $(wc -c <"$OUT/$t.csv" | tr -d ' ') bytes -> $OUT/$t.csv"
+        else
+          echo "SEBI-PRESERVE-FAILED $t"
+          sebi_abort "The export of $t came out short ($((LINES - 1)) of $ROWS rows)."
+        fi
       else
-        echo "SEBI-PRESERVE-FAILED $t"; FAIL=1
+        echo "SEBI-PRESERVE-FAILED $t"
+        sebi_abort "The table $t exists and could not be exported."
       fi
     else
       echo "SEBI-ABSENT $t"
     fi
   done
-  if [ "$FAIL" = 1 ]; then
-    echo 'ABORTED: a 5-year SEBI table exists and could NOT be exported — refusing to destroy the database volume. Fix the export, or move the table aside deliberately, then re-run.'
-    exit 1
-  fi
 fi"#,
     r#"docker ps -aq --filter volume=tv-questdb-data | xargs -r docker rm -f 2>/dev/null || true"#,
     r#"docker rm -f tv-questdb tv-loki tv-alloy 2>/dev/null || true"#,
@@ -143,11 +207,14 @@ pub const DOCKER_NUKE_BARE_COMMANDS: [&str; 12] = [
     // path in this action, so the data survives the reset with no credentials
     // and no S3 dependency.
     //
-    // The abort rule is deliberately asymmetric. QuestDB unreachable =>
-    // continue: this action exists partly to recover a wedged QuestDB, and
-    // there is nothing to export from a server that cannot answer. A table
-    // that EXISTS and fails to export => abort: that is data we could have
-    // saved and chose not to.
+    // The abort rule WAS asymmetric: QuestDB unreachable => continue, on the
+    // reasoning that there is nothing to export from a server that cannot
+    // answer. That was wrong — the tables are still on the volume this
+    // action then deletes. Since 2026-09-27 (audit PR20) an unreachable
+    // QuestDB means the tables are copied straight off the volume, and ANY
+    // step that cannot prove they are saved stops the action, restores the
+    // box and pages (`sebi_abort`). The action is still the remedy for a
+    // wedged QuestDB: it just saves the files before it deletes them.
     r#"QDB='http://127.0.0.1:9000'
 OUT=/opt/tickvault/data/sebi-preserve/$(date -u +%Y%m%dT%H%M%SZ)
 # 2026-09-05: was FOUR names. The other 32 tables the repository's own
@@ -162,26 +229,87 @@ OUT=/opt/tickvault/data/sebi-preserve/$(date -u +%Y%m%dT%H%M%SZ)
 # and the guard can never again assert a list against itself.
 SEBI='brutex_crossverify_cell_audit brutex_crossverify_daily cross_verify_1m_audit dhan_live_crossverify_cell_audit dhan_live_crossverify_daily dhan_rest_1m_tape feed_coverage_daily feed_episode_audit feed_parity_1m_audit feed_scoreboard_daily groww_cross_verify_1m_audit index_constituency instrument_fetch_audit instrument_lifecycle instrument_lifecycle_audit option_chain_1m option_contract_1m_rest order_audit order_leg_pnl order_update_events partition_archive_audit pnl_audit position_update_events prev_day_ohlcv rest_fetch_audit rest_option_chain_1m rest_option_contract_1m rest_spot_1m schema_reset_log spot_1m_rest spot_crossverify_cell_audit spot_crossverify_daily table_storage_daily tf_consistency_audit tick_conservation_audit ws_connection_daily ws_event_audit'
 ALL=$(curl -fsS --max-time 15 --get --data-urlencode 'query=SELECT table_name FROM tables()' "$QDB/exp" 2>/dev/null | tail -n +2 | tr -d '"\r' | sed '/^$/d')
+# 2026-09-27 (audit PR20): the "QuestDB did not answer => proceed" branch is
+# GONE. It deleted the volume with every 5-year table still inside it and
+# printed one line, which daily-universe Quote 25 names as a REJECT ("proceeds
+# after a failed SEBI export"). A wedged QuestDB is exactly when the tables
+# are still on disk, so this now copies them straight off the volume instead,
+# with QuestDB stopped so the files are quiescent. Any step that cannot prove
+# the tables are saved STOPS the action, restores the box and pages.
+sebi_abort() {
+  echo "ABORTED: $1"
+  echo "code=LAMBDA-PORTAL-01 SEBI-PRESERVE-ABORT: nothing was deleted; the database and the app are being restarted."
+  docker start tv-questdb >/dev/null 2>&1 || true
+  systemctl enable tickvault >/dev/null 2>&1 || true
+  systemctl start tickvault >/dev/null 2>&1 || true
+  ACCT=$(timeout 20 aws sts get-caller-identity --query Account --output text 2>/dev/null)
+  if [ -n "$ACCT" ]; then
+    timeout 20 aws sns publish --region ap-south-1 --topic-arn "arn:aws:sns:ap-south-1:$ACCT:tv-prod-alerts" --subject 'Database reset stopped' --message "🔴 Database reset STOPPED before deleting anything. The 5-year records could not be saved first: $1 The app was restarted. Check the box before trying again." >/dev/null 2>&1 || echo 'SEBI-PRESERVE-PAGE-FAILED: the alert could not be sent'
+  else
+    echo 'SEBI-PRESERVE-PAGE-FAILED: the alert could not be sent'
+  fi
+  exit 1
+}
 if [ -z "$ALL" ]; then
-  echo 'SEBI-PRESERVE-UNAVAILABLE: QuestDB did not answer — nothing could be exported. Proceeding, because this action is also the remedy for a wedged QuestDB.'
+  echo 'SEBI-PRESERVE-UNAVAILABLE: QuestDB did not answer — copying the 5-year tables straight off the database volume instead.'
+  VOLS=$(docker volume ls -q 2>/dev/null) || sebi_abort 'Docker did not answer, so the database volume could not be checked.'
+  if printf '%s\n' "$VOLS" | grep -qx tv-questdb-data; then
+    docker stop tv-questdb >/dev/null 2>&1 || true
+    MP=$(docker volume inspect -f '{{.Mountpoint}}' tv-questdb-data 2>/dev/null)
+    [ -n "$MP" ] && [ -d "$MP/db" ] || sebi_abort 'The database files could not be found on the volume.'
+    DIRS=''
+    for t in $SEBI; do
+      FOUND=0
+      for d in "$MP/db/$t" "$MP/db/$t"~*; do
+        [ -d "$d" ] || continue
+        FOUND=1; DIRS="$DIRS $d"
+      done
+      [ "$FOUND" = 0 ] && echo "SEBI-ABSENT $t"
+    done
+    if [ -n "$DIRS" ]; then
+      # shellcheck disable=SC2086
+      NEED=$(du -sbc $DIRS 2>/dev/null | tail -n 1 | cut -f1)
+      mkdir -p "$OUT/raw" || sebi_abort 'The save folder could not be created.'
+      FREE=$(df -B1 --output=avail "$OUT/raw" 2>/dev/null | tail -n 1 | tr -d ' ')
+      [ -n "$NEED" ] && [ -n "$FREE" ] && [ "$FREE" -gt "$NEED" ] || sebi_abort "Not enough free disk to save them (need ${NEED:-?} bytes, free ${FREE:-?})."
+      for d in $DIRS; do
+        n=$(basename "$d")
+        if cp -a "$d" "$OUT/raw/$n" && [ "$(du -sb "$d" | cut -f1)" = "$(du -sb "$OUT/raw/$n" | cut -f1)" ]; then
+          echo "SEBI-PRESERVED-RAW $n $(du -sb "$OUT/raw/$n" | cut -f1) bytes -> $OUT/raw/$n"
+        else
+          echo "SEBI-PRESERVE-FAILED $n"
+          sebi_abort "Copying the table $n off the volume failed or came out a different size."
+        fi
+      done
+    fi
+  else
+    echo 'SEBI-VOLUME-ABSENT: there is no database volume, so there is nothing to lose.'
+  fi
 else
-  mkdir -p "$OUT" || true
-  FAIL=0
+  mkdir -p "$OUT" || sebi_abort 'The save folder could not be created.'
   for t in $SEBI; do
     if printf '%s\n' "$ALL" | grep -qx "$t"; then
       if curl -fsS --max-time 300 --get --data-urlencode "query=SELECT * FROM $t" "$QDB/exp" -o "$OUT/$t.csv"; then
-        echo "SEBI-PRESERVED $t $(wc -c <"$OUT/$t.csv" | tr -d ' ') bytes -> $OUT/$t.csv"
+        # Verified, not assumed: the file must hold at least as many rows as
+        # the table (header excluded). A quoted newline inside a value can only
+        # ADD lines, so a short file is a truncated export and never passes.
+        ROWS=$(curl -fsS --max-time 30 --get --data-urlencode "query=SELECT count() FROM $t" "$QDB/exp" 2>/dev/null | tail -n 1 | tr -d '"\r ')
+        LINES=$(awk 'END{print NR}' "$OUT/$t.csv")
+        case "$ROWS" in ''|*[!0-9]*) echo "SEBI-PRESERVE-FAILED $t"; sebi_abort "The row count of $t could not be read to check its export." ;; esac
+        if [ "$LINES" -ge 1 ] && [ $((LINES - 1)) -ge "$ROWS" ]; then
+          echo "SEBI-PRESERVED $t $ROWS rows $(wc -c <"$OUT/$t.csv" | tr -d ' ') bytes -> $OUT/$t.csv"
+        else
+          echo "SEBI-PRESERVE-FAILED $t"
+          sebi_abort "The export of $t came out short ($((LINES - 1)) of $ROWS rows)."
+        fi
       else
-        echo "SEBI-PRESERVE-FAILED $t"; FAIL=1
+        echo "SEBI-PRESERVE-FAILED $t"
+        sebi_abort "The table $t exists and could not be exported."
       fi
     else
       echo "SEBI-ABSENT $t"
     fi
   done
-  if [ "$FAIL" = 1 ]; then
-    echo 'ABORTED: a 5-year SEBI table exists and could NOT be exported — refusing to destroy the database volume. Fix the export, or move the table aside deliberately, then re-run.'
-    exit 1
-  fi
 fi"#,
     r#"docker ps -aq | xargs -r docker rm -f 2>/dev/null || true"#,
     r#"docker images -aq | xargs -r docker rmi -f 2>/dev/null || true"#,
