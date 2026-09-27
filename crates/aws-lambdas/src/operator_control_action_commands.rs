@@ -54,7 +54,12 @@ done"#,
 /// legacy: `lambda_handler docker-reset cmds` (handler.py:1258-1306) — captured from the RUNNING oracle.
 pub const DOCKER_RESET_COMMANDS: [&str; 18] = [
     r#"set +e"#,
-    r#"systemctl stop tickvault || true"#,
+    // 2026-09-27 (audit PR20): also DISABLED while the action runs. The
+    // 15-minute autopilot restarts a stopped-but-enabled app, and the app
+    // brings QuestDB back up, which would write the volume mid-save. A
+    // disabled unit reads as intentional and is left alone; every path out
+    // of this action (success below, or `sebi_abort`) re-enables it.
+    r#"systemctl stop tickvault || true; systemctl disable tickvault || true"#,
     // ---- SEBI PRESERVE (added 2026-08-25) ----
     //
     // The sibling `wipe-questdb` action carefully allowlists ONLY market-data
@@ -99,7 +104,7 @@ ALL=$(curl -fsS --max-time 15 --get --data-urlencode 'query=SELECT table_name FR
 # the tables are saved STOPS the action, restores the box and pages.
 sebi_abort() {
   echo "ABORTED: $1"
-  echo "code=LAMBDA-PORTAL-01 SEBI-PRESERVE-ABORT: nothing was deleted; the database and the app are being restarted."
+  echo "code=LAMBDA-PORTAL-01 SEBI-PRESERVE-ABORT: nothing was deleted; the database and the app are being restarted. Any partial save is left in $OUT."
   docker start tv-questdb >/dev/null 2>&1 || true
   systemctl enable tickvault >/dev/null 2>&1 || true
   systemctl start tickvault >/dev/null 2>&1 || true
@@ -111,49 +116,138 @@ sebi_abort() {
   fi
   exit 1
 }
+# One reset at a time. A second run that finds the lock held stops before it
+# touches anything and leaves the box to the run that holds it (exit 2, not
+# sebi_abort: restarting the app here would fight the other run).
+if command -v flock >/dev/null 2>&1; then
+  exec 9>/run/tv-sebi-preserve.lock
+  flock -n 9 || { echo 'SEBI-PRESERVE-BUSY: another database reset is already running; this one stopped before touching anything.'; exit 2; }
+fi
+# The whole save must finish inside the SSM command's default 3,600 s
+# execution timeout, or SSM kills the script mid-copy and sebi_abort never
+# runs. 45 minutes leaves the restore and the page room to run.
+START=$(date +%s); BUDGET=2700
+left() { echo $((START + BUDGET - $(date +%s))); }
+budget_check() { [ "$(left)" -gt 60 ] || sebi_abort 'The save ran out of time (45 minutes) before it finished.'; }
+# The console refuses this action 09:00-15:45 IST, but only when it is sent.
+# A long save can carry the deletion past 09:00, so the box re-checks the
+# same window (DATA_DESTRUCTIVE_LOCK_OPEN_SECS / _CLOSE_SECS, seconds of the
+# IST day) right before the first step that deletes anything.
+lock_check() {
+  NOW=$(date -u +%s)
+  case "$NOW" in ''|*[!0-9]*) sebi_abort 'The box clock could not be read to re-check the 09:00-15:45 IST lock.' ;; esac
+  SOD=$(((NOW + 19800) % 86400))
+  if [ "$SOD" -ge 32400 ] && [ "$SOD" -lt 56700 ]; then
+    sebi_abort 'The save finished inside the 09:00-15:45 IST lock, so nothing was deleted. Run it again after 15:45.'
+  fi
+}
+# Files and bytes under a directory, file contents only. `du -sb` also counts
+# directory entries, whose size differs between the source and a fresh copy,
+# so it cannot prove a copy complete.
+fbytes() { find "$1" -type f -printf '%s\n' 2>/dev/null | awk '{s += $1; n++} END {print n + 0 ":" s + 0}'; }
+# Everything that could be writing the volume: any running container that
+# mounts it, plus the database container's own run state and start time. If
+# this changes during a copy, something restarted the database (the 15-minute
+# autopilot starts the database container when it finds it down) and the copy
+# is of files that were moving.
+qdb_quiet() { printf '%s|%s' "$(docker ps -q --filter volume=tv-questdb-data 2>/dev/null | tr -d '\n')" "$(docker inspect -f '{{.State.Running}} {{.State.StartedAt}}' tv-questdb 2>/dev/null)"; }
+# The table folders of the 5-year tables on the volume (a WAL table's folder
+# holds its unapplied WAL segments too), into DIRS.
+sebi_dirs() {
+  DIRS=''
+  for t in $SEBI; do
+    FOUND=0
+    for d in "$MP/db/$t" "$MP/db/$t"~*; do
+      [ -d "$d" ] || continue
+      FOUND=1; DIRS="$DIRS $d"
+    done
+    [ "$FOUND" = 0 ] && echo "SEBI-ABSENT $t"
+  done
+}
+# Free space must cover the save plus a fifth, and still leave 5 GiB for the
+# app afterwards.
+room_for() {
+  FREE=$(df -B1 --output=avail "$1" 2>/dev/null | tail -n 1 | tr -d ' ')
+  WANT=$(($2 + $2 / 5 + 5368709120))
+  case "$FREE" in ''|*[!0-9]*) sebi_abort 'The free disk space could not be read.' ;; esac
+  [ "$FREE" -gt "$WANT" ] || sebi_abort "Not enough free disk to save them (need $WANT bytes with margin, free $FREE)."
+}
+# How many 5-year WAL tables still hold rows QuestDB has not applied, or are
+# suspended. `SELECT *` and `count()` both read only APPLIED rows, so an
+# export of a table that is behind misses rows and its own check passes.
+wal_behind() {
+  WT=$(curl -fsS --max-time 15 --get --data-urlencode 'query=SELECT name, suspended, writerTxn, sequencerTxn FROM wal_tables()' "$QDB/exp" 2>/dev/null) || { echo unknown; return; }
+  printf '%s\n' "$WT" | tail -n +2 | tr -d '"\r' | awk -F, -v s=" $SEBI " 'index(s, " " $1 " ") && ($2 == "true" || $3 != $4) {n++} END {print n + 0}'
+}
+MODE=export
 if [ -z "$ALL" ]; then
+  MODE=raw
   echo 'SEBI-PRESERVE-UNAVAILABLE: QuestDB did not answer — copying the 5-year tables straight off the database volume instead.'
+else
+  i=0; BEHIND=$(wal_behind)
+  while [ "$BEHIND" != 0 ] && [ "$i" -lt 24 ]; do sleep 5; i=$((i + 1)); BEHIND=$(wal_behind); done
+  if [ "$BEHIND" != 0 ]; then
+    MODE=raw
+    echo "SEBI-PRESERVE-WAL-BEHIND: $BEHIND of the 5-year tables still have rows QuestDB has not applied (or it could not say), so an export would miss them — copying them straight off the database volume instead."
+  fi
+fi
+if [ "$MODE" = raw ]; then
   VOLS=$(docker volume ls -q 2>/dev/null) || sebi_abort 'Docker did not answer, so the database volume could not be checked.'
   if printf '%s\n' "$VOLS" | grep -qx tv-questdb-data; then
     docker stop tv-questdb >/dev/null 2>&1 || true
+    [ -z "$(docker ps -q --filter volume=tv-questdb-data 2>/dev/null)" ] || sebi_abort 'The database could not be stopped, so its files cannot be copied safely.'
+    Q0=$(qdb_quiet)
     MP=$(docker volume inspect -f '{{.Mountpoint}}' tv-questdb-data 2>/dev/null)
     [ -n "$MP" ] && [ -d "$MP/db" ] || sebi_abort 'The database files could not be found on the volume.'
-    DIRS=''
-    for t in $SEBI; do
-      FOUND=0
-      for d in "$MP/db/$t" "$MP/db/$t"~*; do
-        [ -d "$d" ] || continue
-        FOUND=1; DIRS="$DIRS $d"
-      done
-      [ "$FOUND" = 0 ] && echo "SEBI-ABSENT $t"
-    done
+    sebi_dirs
     if [ -n "$DIRS" ]; then
       # shellcheck disable=SC2086
       NEED=$(du -sbc $DIRS 2>/dev/null | tail -n 1 | cut -f1)
+      case "$NEED" in ''|*[!0-9]*) sebi_abort 'The size of the tables to save could not be read.' ;; esac
       mkdir -p "$OUT/raw" || sebi_abort 'The save folder could not be created.'
-      FREE=$(df -B1 --output=avail "$OUT/raw" 2>/dev/null | tail -n 1 | tr -d ' ')
-      [ -n "$NEED" ] && [ -n "$FREE" ] && [ "$FREE" -gt "$NEED" ] || sebi_abort "Not enough free disk to save them (need ${NEED:-?} bytes, free ${FREE:-?})."
+      room_for "$OUT/raw" "$NEED"
+      # The name-to-folder registry, so a restore can map the folders back.
+      for f in "$MP/db"/tables.d* "$MP/db"/_tab_index.d; do
+        [ -f "$f" ] || continue
+        cp -a "$f" "$OUT/raw/" || sebi_abort 'The table registry could not be copied off the volume.'
+      done
       for d in $DIRS; do
+        budget_check
+        [ "$(qdb_quiet)" = "$Q0" ] || sebi_abort 'Something restarted the database during the copy, so the copied files may be incomplete.'
         n=$(basename "$d")
-        if cp -a "$d" "$OUT/raw/$n" && [ "$(du -sb "$d" | cut -f1)" = "$(du -sb "$OUT/raw/$n" | cut -f1)" ]; then
-          echo "SEBI-PRESERVED-RAW $n $(du -sb "$OUT/raw/$n" | cut -f1) bytes -> $OUT/raw/$n"
+        if timeout "$(left)" cp -a "$d" "$OUT/raw/$n" && [ "$(fbytes "$d")" = "$(fbytes "$OUT/raw/$n")" ]; then
+          echo "SEBI-PRESERVED-RAW $n $(fbytes "$OUT/raw/$n") files:bytes -> $OUT/raw/$n"
         else
           echo "SEBI-PRESERVE-FAILED $n"
-          sebi_abort "Copying the table $n off the volume failed or came out a different size."
+          sebi_abort "Copying the table $n off the volume failed or came out different."
         fi
       done
+      [ "$(qdb_quiet)" = "$Q0" ] || sebi_abort 'Something restarted the database during the copy, so the copied files may be incomplete.'
     fi
   else
     echo 'SEBI-VOLUME-ABSENT: there is no database volume, so there is nothing to lose.'
   fi
 else
   mkdir -p "$OUT" || sebi_abort 'The save folder could not be created.'
+  # Size the export from the tables' own folders when the volume can be read;
+  # otherwise only the 5 GiB floor applies.
+  EST=0
+  MP=$(docker volume inspect -f '{{.Mountpoint}}' tv-questdb-data 2>/dev/null)
+  if [ -n "$MP" ] && [ -d "$MP/db" ]; then
+    sebi_dirs >/dev/null
+    # shellcheck disable=SC2086
+    [ -n "$DIRS" ] && EST=$(du -sbc $DIRS 2>/dev/null | tail -n 1 | cut -f1)
+    case "$EST" in ''|*[!0-9]*) EST=0 ;; esac
+  fi
+  room_for "$OUT" "$EST"
   for t in $SEBI; do
     if printf '%s\n' "$ALL" | grep -qx "$t"; then
+      budget_check
       if curl -fsS --max-time 300 --get --data-urlencode "query=SELECT * FROM $t" "$QDB/exp" -o "$OUT/$t.csv"; then
         # Verified, not assumed: the file must hold at least as many rows as
         # the table (header excluded). A quoted newline inside a value can only
         # ADD lines, so a short file is a truncated export and never passes.
+        # The WAL check above is what makes count() the whole table.
         ROWS=$(curl -fsS --max-time 30 --get --data-urlencode "query=SELECT count() FROM $t" "$QDB/exp" 2>/dev/null | tail -n 1 | tr -d '"\r ')
         LINES=$(awk 'END{print NR}' "$OUT/$t.csv")
         case "$ROWS" in ''|*[!0-9]*) echo "SEBI-PRESERVE-FAILED $t"; sebi_abort "The row count of $t could not be read to check its export." ;; esac
@@ -171,7 +265,8 @@ else
       echo "SEBI-ABSENT $t"
     fi
   done
-fi"#,
+fi
+lock_check"#,
     r#"docker ps -aq --filter volume=tv-questdb-data | xargs -r docker rm -f 2>/dev/null || true"#,
     r#"docker rm -f tv-questdb tv-loki tv-alloy 2>/dev/null || true"#,
     r#"cd /opt/tickvault/repo/deploy/docker || exit 0"#,
@@ -238,7 +333,7 @@ ALL=$(curl -fsS --max-time 15 --get --data-urlencode 'query=SELECT table_name FR
 # the tables are saved STOPS the action, restores the box and pages.
 sebi_abort() {
   echo "ABORTED: $1"
-  echo "code=LAMBDA-PORTAL-01 SEBI-PRESERVE-ABORT: nothing was deleted; the database and the app are being restarted."
+  echo "code=LAMBDA-PORTAL-01 SEBI-PRESERVE-ABORT: nothing was deleted; the database and the app are being restarted. Any partial save is left in $OUT."
   docker start tv-questdb >/dev/null 2>&1 || true
   systemctl enable tickvault >/dev/null 2>&1 || true
   systemctl start tickvault >/dev/null 2>&1 || true
@@ -250,49 +345,138 @@ sebi_abort() {
   fi
   exit 1
 }
+# One reset at a time. A second run that finds the lock held stops before it
+# touches anything and leaves the box to the run that holds it (exit 2, not
+# sebi_abort: restarting the app here would fight the other run).
+if command -v flock >/dev/null 2>&1; then
+  exec 9>/run/tv-sebi-preserve.lock
+  flock -n 9 || { echo 'SEBI-PRESERVE-BUSY: another database reset is already running; this one stopped before touching anything.'; exit 2; }
+fi
+# The whole save must finish inside the SSM command's default 3,600 s
+# execution timeout, or SSM kills the script mid-copy and sebi_abort never
+# runs. 45 minutes leaves the restore and the page room to run.
+START=$(date +%s); BUDGET=2700
+left() { echo $((START + BUDGET - $(date +%s))); }
+budget_check() { [ "$(left)" -gt 60 ] || sebi_abort 'The save ran out of time (45 minutes) before it finished.'; }
+# The console refuses this action 09:00-15:45 IST, but only when it is sent.
+# A long save can carry the deletion past 09:00, so the box re-checks the
+# same window (DATA_DESTRUCTIVE_LOCK_OPEN_SECS / _CLOSE_SECS, seconds of the
+# IST day) right before the first step that deletes anything.
+lock_check() {
+  NOW=$(date -u +%s)
+  case "$NOW" in ''|*[!0-9]*) sebi_abort 'The box clock could not be read to re-check the 09:00-15:45 IST lock.' ;; esac
+  SOD=$(((NOW + 19800) % 86400))
+  if [ "$SOD" -ge 32400 ] && [ "$SOD" -lt 56700 ]; then
+    sebi_abort 'The save finished inside the 09:00-15:45 IST lock, so nothing was deleted. Run it again after 15:45.'
+  fi
+}
+# Files and bytes under a directory, file contents only. `du -sb` also counts
+# directory entries, whose size differs between the source and a fresh copy,
+# so it cannot prove a copy complete.
+fbytes() { find "$1" -type f -printf '%s\n' 2>/dev/null | awk '{s += $1; n++} END {print n + 0 ":" s + 0}'; }
+# Everything that could be writing the volume: any running container that
+# mounts it, plus the database container's own run state and start time. If
+# this changes during a copy, something restarted the database (the 15-minute
+# autopilot starts the database container when it finds it down) and the copy
+# is of files that were moving.
+qdb_quiet() { printf '%s|%s' "$(docker ps -q --filter volume=tv-questdb-data 2>/dev/null | tr -d '\n')" "$(docker inspect -f '{{.State.Running}} {{.State.StartedAt}}' tv-questdb 2>/dev/null)"; }
+# The table folders of the 5-year tables on the volume (a WAL table's folder
+# holds its unapplied WAL segments too), into DIRS.
+sebi_dirs() {
+  DIRS=''
+  for t in $SEBI; do
+    FOUND=0
+    for d in "$MP/db/$t" "$MP/db/$t"~*; do
+      [ -d "$d" ] || continue
+      FOUND=1; DIRS="$DIRS $d"
+    done
+    [ "$FOUND" = 0 ] && echo "SEBI-ABSENT $t"
+  done
+}
+# Free space must cover the save plus a fifth, and still leave 5 GiB for the
+# app afterwards.
+room_for() {
+  FREE=$(df -B1 --output=avail "$1" 2>/dev/null | tail -n 1 | tr -d ' ')
+  WANT=$(($2 + $2 / 5 + 5368709120))
+  case "$FREE" in ''|*[!0-9]*) sebi_abort 'The free disk space could not be read.' ;; esac
+  [ "$FREE" -gt "$WANT" ] || sebi_abort "Not enough free disk to save them (need $WANT bytes with margin, free $FREE)."
+}
+# How many 5-year WAL tables still hold rows QuestDB has not applied, or are
+# suspended. `SELECT *` and `count()` both read only APPLIED rows, so an
+# export of a table that is behind misses rows and its own check passes.
+wal_behind() {
+  WT=$(curl -fsS --max-time 15 --get --data-urlencode 'query=SELECT name, suspended, writerTxn, sequencerTxn FROM wal_tables()' "$QDB/exp" 2>/dev/null) || { echo unknown; return; }
+  printf '%s\n' "$WT" | tail -n +2 | tr -d '"\r' | awk -F, -v s=" $SEBI " 'index(s, " " $1 " ") && ($2 == "true" || $3 != $4) {n++} END {print n + 0}'
+}
+MODE=export
 if [ -z "$ALL" ]; then
+  MODE=raw
   echo 'SEBI-PRESERVE-UNAVAILABLE: QuestDB did not answer — copying the 5-year tables straight off the database volume instead.'
+else
+  i=0; BEHIND=$(wal_behind)
+  while [ "$BEHIND" != 0 ] && [ "$i" -lt 24 ]; do sleep 5; i=$((i + 1)); BEHIND=$(wal_behind); done
+  if [ "$BEHIND" != 0 ]; then
+    MODE=raw
+    echo "SEBI-PRESERVE-WAL-BEHIND: $BEHIND of the 5-year tables still have rows QuestDB has not applied (or it could not say), so an export would miss them — copying them straight off the database volume instead."
+  fi
+fi
+if [ "$MODE" = raw ]; then
   VOLS=$(docker volume ls -q 2>/dev/null) || sebi_abort 'Docker did not answer, so the database volume could not be checked.'
   if printf '%s\n' "$VOLS" | grep -qx tv-questdb-data; then
     docker stop tv-questdb >/dev/null 2>&1 || true
+    [ -z "$(docker ps -q --filter volume=tv-questdb-data 2>/dev/null)" ] || sebi_abort 'The database could not be stopped, so its files cannot be copied safely.'
+    Q0=$(qdb_quiet)
     MP=$(docker volume inspect -f '{{.Mountpoint}}' tv-questdb-data 2>/dev/null)
     [ -n "$MP" ] && [ -d "$MP/db" ] || sebi_abort 'The database files could not be found on the volume.'
-    DIRS=''
-    for t in $SEBI; do
-      FOUND=0
-      for d in "$MP/db/$t" "$MP/db/$t"~*; do
-        [ -d "$d" ] || continue
-        FOUND=1; DIRS="$DIRS $d"
-      done
-      [ "$FOUND" = 0 ] && echo "SEBI-ABSENT $t"
-    done
+    sebi_dirs
     if [ -n "$DIRS" ]; then
       # shellcheck disable=SC2086
       NEED=$(du -sbc $DIRS 2>/dev/null | tail -n 1 | cut -f1)
+      case "$NEED" in ''|*[!0-9]*) sebi_abort 'The size of the tables to save could not be read.' ;; esac
       mkdir -p "$OUT/raw" || sebi_abort 'The save folder could not be created.'
-      FREE=$(df -B1 --output=avail "$OUT/raw" 2>/dev/null | tail -n 1 | tr -d ' ')
-      [ -n "$NEED" ] && [ -n "$FREE" ] && [ "$FREE" -gt "$NEED" ] || sebi_abort "Not enough free disk to save them (need ${NEED:-?} bytes, free ${FREE:-?})."
+      room_for "$OUT/raw" "$NEED"
+      # The name-to-folder registry, so a restore can map the folders back.
+      for f in "$MP/db"/tables.d* "$MP/db"/_tab_index.d; do
+        [ -f "$f" ] || continue
+        cp -a "$f" "$OUT/raw/" || sebi_abort 'The table registry could not be copied off the volume.'
+      done
       for d in $DIRS; do
+        budget_check
+        [ "$(qdb_quiet)" = "$Q0" ] || sebi_abort 'Something restarted the database during the copy, so the copied files may be incomplete.'
         n=$(basename "$d")
-        if cp -a "$d" "$OUT/raw/$n" && [ "$(du -sb "$d" | cut -f1)" = "$(du -sb "$OUT/raw/$n" | cut -f1)" ]; then
-          echo "SEBI-PRESERVED-RAW $n $(du -sb "$OUT/raw/$n" | cut -f1) bytes -> $OUT/raw/$n"
+        if timeout "$(left)" cp -a "$d" "$OUT/raw/$n" && [ "$(fbytes "$d")" = "$(fbytes "$OUT/raw/$n")" ]; then
+          echo "SEBI-PRESERVED-RAW $n $(fbytes "$OUT/raw/$n") files:bytes -> $OUT/raw/$n"
         else
           echo "SEBI-PRESERVE-FAILED $n"
-          sebi_abort "Copying the table $n off the volume failed or came out a different size."
+          sebi_abort "Copying the table $n off the volume failed or came out different."
         fi
       done
+      [ "$(qdb_quiet)" = "$Q0" ] || sebi_abort 'Something restarted the database during the copy, so the copied files may be incomplete.'
     fi
   else
     echo 'SEBI-VOLUME-ABSENT: there is no database volume, so there is nothing to lose.'
   fi
 else
   mkdir -p "$OUT" || sebi_abort 'The save folder could not be created.'
+  # Size the export from the tables' own folders when the volume can be read;
+  # otherwise only the 5 GiB floor applies.
+  EST=0
+  MP=$(docker volume inspect -f '{{.Mountpoint}}' tv-questdb-data 2>/dev/null)
+  if [ -n "$MP" ] && [ -d "$MP/db" ]; then
+    sebi_dirs >/dev/null
+    # shellcheck disable=SC2086
+    [ -n "$DIRS" ] && EST=$(du -sbc $DIRS 2>/dev/null | tail -n 1 | cut -f1)
+    case "$EST" in ''|*[!0-9]*) EST=0 ;; esac
+  fi
+  room_for "$OUT" "$EST"
   for t in $SEBI; do
     if printf '%s\n' "$ALL" | grep -qx "$t"; then
+      budget_check
       if curl -fsS --max-time 300 --get --data-urlencode "query=SELECT * FROM $t" "$QDB/exp" -o "$OUT/$t.csv"; then
         # Verified, not assumed: the file must hold at least as many rows as
         # the table (header excluded). A quoted newline inside a value can only
         # ADD lines, so a short file is a truncated export and never passes.
+        # The WAL check above is what makes count() the whole table.
         ROWS=$(curl -fsS --max-time 30 --get --data-urlencode "query=SELECT count() FROM $t" "$QDB/exp" 2>/dev/null | tail -n 1 | tr -d '"\r ')
         LINES=$(awk 'END{print NR}' "$OUT/$t.csv")
         case "$ROWS" in ''|*[!0-9]*) echo "SEBI-PRESERVE-FAILED $t"; sebi_abort "The row count of $t could not be read to check its export." ;; esac
@@ -310,7 +494,8 @@ else
       echo "SEBI-ABSENT $t"
     fi
   done
-fi"#,
+fi
+lock_check"#,
     r#"docker ps -aq | xargs -r docker rm -f 2>/dev/null || true"#,
     r#"docker images -aq | xargs -r docker rmi -f 2>/dev/null || true"#,
     r#"docker volume ls -q | xargs -r docker volume rm -f 2>/dev/null || true"#,

@@ -4022,8 +4022,20 @@ mod tests {
                 "systemctl enable tickvault",
                 "systemctl start tickvault",
                 "aws sns publish",
-                "du -sb",
                 "SELECT count() FROM",
+                // a copy is proven by file count and file bytes, not `du -sb`
+                // (which also counts directory entries and differs on a
+                // fresh copy)
+                "fbytes",
+                // an export only sees APPLIED rows; a table behind on its WAL
+                // is copied raw instead
+                "wal_tables()",
+                "SEBI-PRESERVE-WAL-BEHIND",
+                // a database restarted mid-copy is detected, not trusted
+                "qdb_quiet",
+                // one reset at a time, and inside the SSM timeout
+                "flock -n 9",
+                "BUDGET=2700",
             ] {
                 assert!(
                     preserve.contains(needle),
@@ -4031,6 +4043,34 @@ mod tests {
                      app, page, and every save must be verified, not assumed"
                 );
             }
+            // The lock is re-checked ON THE BOX as the preserve step's last
+            // act, right before the first deletion: the console checks it
+            // only when the action is sent, and a long save can run past
+            // 09:00 IST.
+            assert!(
+                preserve.trim_end().ends_with("lock_check"),
+                "{name}: the preserve step must end by re-checking the 09:00-15:45 IST \
+                 lock on the box, right before the first step that deletes anything"
+            );
+            assert!(
+                preserve.contains(&format!("\"$SOD\" -ge {DATA_DESTRUCTIVE_LOCK_OPEN_SECS} ]"))
+                    && preserve.contains(&format!(
+                        "\"$SOD\" -lt {DATA_DESTRUCTIVE_LOCK_CLOSE_SECS} ]"
+                    )),
+                "{name}: the on-box lock window drifted from \
+                 DATA_DESTRUCTIVE_LOCK_OPEN_SECS / _CLOSE_SECS"
+            );
+            // The app must be disabled before the save, or the 15-minute
+            // autopilot restarts it and it brings QuestDB back up mid-copy.
+            let disable_at = cmds
+                .iter()
+                .position(|c| c.contains("systemctl disable tickvault"))
+                .unwrap_or(usize::MAX);
+            assert!(
+                disable_at < preserve_at,
+                "{name}: tickvault must be DISABLED before the SEBI save (step {preserve_at}); \
+                 a stopped-but-enabled app is restarted by the autopilot"
+            );
             // The export target must be outside every path this action wipes.
             assert!(
                 block.contains("/opt/tickvault/data/sebi-preserve/"),
@@ -4930,11 +4970,9 @@ data-pull phase, so the system is never blinded mid-trade";
     /// itself so a later edit to either side fails here.
     #[test]
     fn test_data_destructive_lock_window_matches_the_rule_file() {
-        let rule = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
-                "../../docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md",
-            ),
-        )
+        let rule = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md",
+        ))
         .expect("the daily-universe rule file is the authority for this window");
         assert!(
             rule.contains("Runs the nuke inside 09:00–15:45 IST."),
@@ -4976,7 +5014,11 @@ data-pull phase, so the system is never blinded mid-trade";
             ..MockShell::default()
         };
         let resp = post(&lifecycle, json!({"action": "reboot"})).await;
-        assert_ne!(status_of(&resp), 409, "reboot follows market hours, not the wipe lock");
+        assert_ne!(
+            status_of(&resp),
+            409,
+            "reboot follows market hours, not the wipe lock"
+        );
     }
 
     #[tokio::test]
