@@ -992,7 +992,7 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     so it is visible in the process list of the single-use hosted runner for that call. Anyone with
     write access can dispatch the rotation; whether the `prod` environment requires a reviewer is
     not visible from the repository (Unknown).
-- [ ] **PR36b — a manual deploy needs All Green on the commit it ships.**
+- [x] **PR36b — a manual deploy needs All Green on the commit it ships.**
   (`.github/workflows/deploy-aws.yml`) Found by re-check 6: `workflow_dispatch` from any
   branch reaches the `deploy` job's `environment: prod` (deploy-aws.yml:403), so a manual run
   can ship a commit that never passed All Green. Refuse a dispatch whose ref is not `main`,
@@ -1000,6 +1000,27 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
   - Re-check 6 (2026-09-27): also restrict the deploy role's trust to the main branch
     (deploy/aws/terraform/oidc.tf:72-80), so the job check is not the only barrier
     (deploy-aws.yml:394-403).
+  - Done: the preflight job refuses a manual run that is not on main, or whose commit has no
+    successful All Green posted by GitHub Actions, either on the commit itself or on the head of
+    the pull request squash-merged as it (deploy-aws.yml "Refuse a manual deploy of a commit that
+    did not pass All Green"). Any API failure refuses; the next after-close cron retries. Every
+    automatic dispatcher (after-close cron, post-merge catch-up, deploy watchdog, operator
+    console) already dispatches main. Checked against the live API: main 01f216425 has no All
+    Green of its own (a bot merge, whose push run GitHub suppresses) and passes through PR #1964,
+    whose head passed.
+  - Finding, not fixable in the repository: the role trust cannot be narrowed to main here. A job
+    that runs in the `prod` environment presents the subject `environment:prod`, not its branch,
+    and the trust accepts that subject, so any branch that reaches `prod` can assume the role
+    (deploy, terraform-apply, downsize-instance, grow-ebs-volume, wipe-log-streams). The
+    in-workflow check stops mistakes only: a branch can delete it. The real barrier is the `prod`
+    environment's deployment-branch rule (main plus tags v*), a repository setting only the owner
+    can change. The preflight now reports on every run whether that rule is set (warning when it
+    is not, never fatal); whether it is set today is Unknown (the API path is blocked here).
+  - Tests: github_workflow_guard r21_manual_deploy_needs_main_and_all_green (bite-checked: it fails
+    when the merge-commit match is removed). The gate script, extracted from the workflow, was run
+    against a stubbed gh in 12 cases (feature branch, tag, own All Green, via merged PR, PR head
+    red, All Green from another app, no PR, open PR, PR merged as another commit, and three API
+    failures): only the two genuine passes exited 0. The environment report was run in 3 cases.
 - [ ] **PR40 — a crash never loses queued candle seals uncounted, and PR15's loose ends
   close.** (`storage`, `app`, deploy)
   - A crash (abort, out of memory, hard kill) loses every queued seal uncounted: up to 250,000
