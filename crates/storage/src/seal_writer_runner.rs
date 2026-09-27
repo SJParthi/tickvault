@@ -343,10 +343,19 @@ impl SealEscalationSink {
     /// so no record of the run is left half-written in the spill; a record
     /// that did land before the failure and is ALSO in the DLQ is collapsed by
     /// the candle tables' DEDUP keys when both are replayed.
-    fn write_batch<F>(&self, batch: &[SealEscalationItem], scratch: &mut Vec<u8>, on_lost: &F)
+    ///
+    /// Returns how many spill writes it made: one per IST-day run, so 1 for
+    /// almost every batch and 2 for one that straddles midnight (audit PR40c).
+    fn write_batch<F>(
+        &self,
+        batch: &[SealEscalationItem],
+        scratch: &mut Vec<u8>,
+        on_lost: &F,
+    ) -> usize
     where
         F: Fn(&crate::seal_spill::SerializedSeal),
     {
+        let mut spill_writes = 0usize;
         let mut start = 0;
         while start < batch.len() {
             let day = crate::seal_spill::ist_day_number(batch[start].now_unix_secs);
@@ -357,6 +366,7 @@ impl SealEscalationSink {
                 end += 1;
             }
             let run = &batch[start..end];
+            spill_writes += 1;
             let written = self.spill.append_seals(
                 run.iter().map(|item| &item.seal),
                 scratch,
@@ -382,6 +392,7 @@ impl SealEscalationSink {
                 .fetch_sub(run_written, std::sync::atomic::Ordering::Relaxed);
             start = end;
         }
+        spill_writes
     }
 
     /// Drain the queue until the sender is gone, or until the stop flag is set
@@ -390,12 +401,17 @@ impl SealEscalationSink {
     /// `on_lost` is called for a seal both disk tiers refused. It exists as a
     /// callback rather than a direct call because the paging path
     /// (`AGGREGATOR-DROP-01`) lives in the app crate, above this one.
-    pub fn run<F>(self, on_lost: F)
+    ///
+    /// Returns what the thread did (audit PR40c), so a test can prove the
+    /// batching by counting writes rather than only checking where the
+    /// records landed. The production thread discards it.
+    pub fn run<F>(self, on_lost: F) -> SealEscalationRunSummary
     where
         F: Fn(&crate::seal_spill::SerializedSeal),
     {
         use std::sync::atomic::Ordering;
         use std::sync::mpsc::RecvTimeoutError;
+        let mut summary = SealEscalationRunSummary::default();
         // Reused across batches: after the first full batch neither grows.
         let mut batch: Vec<SealEscalationItem> = Vec::with_capacity(SEAL_ESCALATION_BATCH);
         let mut scratch: Vec<u8> =
@@ -414,20 +430,34 @@ impl SealEscalationSink {
                             Err(_) => break,
                         }
                     }
-                    self.write_batch(&batch, &mut scratch, &on_lost);
+                    summary.batches += 1;
+                    summary.records += batch.len();
+                    summary.spill_writes += self.write_batch(&batch, &mut scratch, &on_lost);
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     // Only exit on an EMPTY queue: a pending item always
                     // returns `Ok` above, so a stop request can never cut the
                     // drain short.
                     if self.stop.load(Ordering::Acquire) {
-                        return;
+                        return summary;
                     }
                 }
-                Err(RecvTimeoutError::Disconnected) => return,
+                Err(RecvTimeoutError::Disconnected) => return summary,
             }
         }
     }
+}
+
+/// What one run of the escalation thread did (audit PR40c).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SealEscalationRunSummary {
+    /// Batches taken off the queue, each at most [`SEAL_ESCALATION_BATCH`].
+    pub batches: usize,
+    /// Seals in those batches.
+    pub records: usize,
+    /// Spill writes made: one per batch, plus one for a batch that straddles
+    /// IST midnight. Each is one `append_seals` call, i.e. one `write(2)`.
+    pub spill_writes: usize,
 }
 
 /// What happened to a seal the writer channel refused.
@@ -581,9 +611,16 @@ impl SealOverflow {
     /// Since audit PR15 the queue holds one whole close burst, so the refused
     /// arm needs a full burst of refusals against a disk that has stopped
     /// writing. When it does fire, its inline write also waits for the spill
-    /// lock, which the escalation thread holds for one batch write (at most
-    /// 128 KiB): a known, bounded wait on the drain in a state that is
-    /// already losing ticks to a stalled disk.
+    /// lock, which the escalation thread holds for one batch write.
+    ///
+    /// **The bound on that wait is BYTES, not TIME (corrected in audit
+    /// PR40c).** The lock is held for one write of at most 128 KiB, but a
+    /// write to a disk that has stopped answering does not return, so the
+    /// caller's wait lasts as long as the stall does: seconds on a slow
+    /// device, unbounded on a hung one. This note used to call the wait
+    /// "known, bounded", which was true of its size and false of its length.
+    /// No seal is lost while it waits; the cost is the frame drain, which
+    /// stops emptying the socket for the same time.
     ///
     /// With NO offload installed (pre-2026-08-28 shape, and every unit test
     /// that does not call `split_escalation_offload`) every escalation is the
@@ -819,7 +856,26 @@ impl SealWriterRunner {
         mpsc_capacity: usize,
         max_drain_per_cycle: usize,
     ) -> Self {
-        let writer = ShadowCandleWriter::for_test();
+        Self::with_writer_for_test(
+            ShadowCandleWriter::for_test(),
+            spill_dir,
+            dlq_dir,
+            ring_capacity,
+            mpsc_capacity,
+            max_drain_per_cycle,
+        )
+    }
+
+    /// [`Self::for_test`] with a caller-built writer, so a test can point a
+    /// REAL `ShadowCandleWriter` at a fake database (audit PR40c).
+    fn with_writer_for_test(
+        writer: ShadowCandleWriter,
+        spill_dir: std::path::PathBuf,
+        dlq_dir: std::path::PathBuf,
+        ring_capacity: usize,
+        mpsc_capacity: usize,
+        max_drain_per_cycle: usize,
+    ) -> Self {
         let pipeline = SealAbsorptionPipeline::with_capacity_and_dirs_for_test(
             ring_capacity,
             spill_dir.clone(),
@@ -1878,7 +1934,21 @@ mod tests {
             );
         }
         stop.store(true, std::sync::atomic::Ordering::Release);
-        sink.run(|_| {});
+        let summary = sink.run(|_| {});
+
+        // Audit PR40c: prove the batching itself, not only where the records
+        // landed. Everything was queued before the thread ran, so it must take
+        // four full batches and one of seven, and make exactly one spill write
+        // per batch. A per-record writer would report `total` writes here.
+        assert_eq!(
+            summary,
+            SealEscalationRunSummary {
+                batches: 5,
+                records: total,
+                spill_writes: 5,
+            },
+            "a queued burst must be written SEAL_ESCALATION_BATCH records per write"
+        );
 
         let records = read_spill_records(&spill);
         assert_eq!(
@@ -1893,6 +1963,48 @@ mod tests {
                 "records must land in the order they were queued"
             );
         }
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn the_escalation_thread_writes_a_lone_refusal_at_once_as_its_own_batch() {
+        // Audit PR40c: the thread never waits for company. A seal that
+        // arrives alone is one batch and one write, and a second one that
+        // arrives after the thread has written the first is another.
+        let (spill, dlq) = temp_pair("escalate-lone-refusal");
+        let runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 16);
+        let mut overflow = runner.overflow();
+        let sink = overflow.split_escalation_offload();
+        let stop = sink.stop_flag();
+        let pending = sink.pending_count();
+        let thread = std::thread::spawn(move || sink.run(|_| {}));
+
+        let now = jan1_noon_utc();
+        for i in 0..2u32 {
+            assert_eq!(
+                overflow.escalate(&mk_seal(13, 0, TfIndex::M1, 34_200 + i, 101.5), now),
+                OverflowOutcome::Queued
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while pending.load(std::sync::atomic::Ordering::Acquire) != 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the thread never wrote a lone seal"
+                );
+                std::thread::yield_now();
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        let summary = thread.join().expect("escalation thread must not panic");
+        assert_eq!(
+            summary,
+            SealEscalationRunSummary {
+                batches: 2,
+                records: 2,
+                spill_writes: 2,
+            }
+        );
+        assert_eq!(read_spill_records(&spill).len(), 2);
         cleanup(&spill, &dlq);
     }
 
@@ -1917,7 +2029,12 @@ mod tests {
             let _ = overflow.escalate(&mk_seal(13, 0, TfIndex::M1, 200 + i, 1.0), midnight);
         }
         stop.store(true, std::sync::atomic::Ordering::Release);
-        sink.run(|_| {});
+        let summary = sink.run(|_| {});
+        assert_eq!(
+            (summary.batches, summary.spill_writes),
+            (1, 2),
+            "one batch across midnight is two writes, one per day's file"
+        );
 
         let records = read_spill_records(&spill);
         let day1 = records
@@ -2046,5 +2163,261 @@ mod tests {
             tickvault_trading::candles::SEAL_BUFFER_CAPACITY
         );
         assert!(SEAL_ESCALATION_QUEUE_DEPTH >= SEAL_MPSC_CAPACITY);
+    }
+
+    // -----------------------------------------------------------------------
+    // Outage and recovery against a real writer (audit PR40c)
+    // -----------------------------------------------------------------------
+
+    /// A stand-in for QuestDB's ILP-over-HTTP endpoint. While `outage` is set
+    /// it answers every write with 503, so the real writer's flush fails the
+    /// way it does when the database is down. Otherwise it answers 204 and
+    /// keeps the rows it acknowledged: only rows the database said it took
+    /// count as written.
+    struct FakeIlpServer {
+        port: u16,
+        outage: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        acked_rows: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    fn spawn_fake_ilp_server() -> FakeIlpServer {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake ILP server");
+        let port = listener.local_addr().expect("local addr").port();
+        let outage = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let acked_rows = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (thread_outage, thread_rows) = (
+            std::sync::Arc::clone(&outage),
+            std::sync::Arc::clone(&acked_rows),
+        );
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let outage = std::sync::Arc::clone(&thread_outage);
+                let rows = std::sync::Arc::clone(&thread_rows);
+                std::thread::spawn(move || serve_fake_ilp_connection(stream, &outage, &rows));
+            }
+        });
+        FakeIlpServer {
+            port,
+            outage,
+            acked_rows,
+        }
+    }
+
+    /// One keep-alive connection: read each request (fixed length or
+    /// chunked body), answer it, and record the body's rows on a 204.
+    fn serve_fake_ilp_connection(
+        mut stream: std::net::TcpStream,
+        outage: &std::sync::atomic::AtomicBool,
+        rows: &std::sync::Mutex<Vec<String>>,
+    ) {
+        use std::io::{BufRead, Read, Write};
+        let Ok(read_half) = stream.try_clone() else {
+            return;
+        };
+        let mut reader = std::io::BufReader::new(read_half);
+        loop {
+            let mut content_length = 0usize;
+            let mut chunked = false;
+            let mut expect_continue = false;
+            let mut saw_request_line = false;
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+                let line = line.trim_end();
+                if line.is_empty() {
+                    if saw_request_line {
+                        break;
+                    }
+                    continue;
+                }
+                saw_request_line = true;
+                let lower = line.to_ascii_lowercase();
+                if let Some(value) = lower.strip_prefix("content-length:") {
+                    content_length = value.trim().parse().unwrap_or(0);
+                } else if lower.starts_with("transfer-encoding:") && lower.contains("chunked") {
+                    chunked = true;
+                } else if lower.starts_with("expect:") && lower.contains("100-continue") {
+                    expect_continue = true;
+                }
+            }
+            if expect_continue {
+                let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+            }
+            let mut body = Vec::new();
+            if chunked {
+                loop {
+                    let mut size_line = String::new();
+                    if reader.read_line(&mut size_line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let size = usize::from_str_radix(
+                        size_line.trim().split(';').next().unwrap_or("0"),
+                        16,
+                    )
+                    .unwrap_or(0);
+                    let mut chunk = vec![0u8; size + 2];
+                    if reader.read_exact(&mut chunk).is_err() {
+                        return;
+                    }
+                    if size == 0 {
+                        break;
+                    }
+                    body.extend_from_slice(&chunk[..size]);
+                }
+            } else {
+                body.resize(content_length, 0);
+                if reader.read_exact(&mut body).is_err() {
+                    return;
+                }
+            }
+            let response: &[u8] = if outage.load(std::sync::atomic::Ordering::Acquire) {
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}"
+            } else {
+                if let Ok(mut acked) = rows.lock() {
+                    acked.extend(
+                        String::from_utf8_lossy(&body)
+                            .lines()
+                            .filter(|l| !l.is_empty())
+                            .map(str::to_string),
+                    );
+                }
+                b"HTTP/1.1 204 No Content\r\n\r\n"
+            };
+            if stream.write_all(response).is_err() {
+                return;
+            }
+        }
+    }
+
+    /// IST-epoch seconds of 09:30:00 on Thursday 2026-09-24, inside the
+    /// session window the writer enforces.
+    fn session_bucket(offset_secs: u32) -> u32 {
+        let base = chrono::NaiveDate::from_ymd_opt(2026, 9, 24)
+            .and_then(|d| d.and_hms_opt(9, 30, 0))
+            .expect("valid IST time")
+            .and_utc()
+            .timestamp();
+        u32::try_from(base).expect("fits u32") + offset_secs
+    }
+
+    static PR40C_TABLES_KEYED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(true);
+
+    #[test]
+    fn chaos_a_database_outage_spills_every_seal_and_recovery_replays_each_once() {
+        // Audit PR40c: the replay tests use a fake sink, so none of them
+        // proves the REAL writer puts spilled seals back in the database. Here
+        // the real `ShadowCandleWriter` speaks real ILP over HTTP to a fake
+        // endpoint that goes down and comes back:
+        //   1. outage: every flush is refused, so every seal goes to the spill;
+        //   2. recovery: live seals flush again, the health gate opens after
+        //      sixty clean seconds, and the mid-session replay re-sends the
+        //      spilled seals through the same writer;
+        //   3. every seal, live or spilled, is acknowledged EXACTLY once and
+        //      the spill ends empty with its file archived.
+        let fake = spawn_fake_ilp_server();
+        let config = tickvault_common::config::QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: fake.port,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        let writer = ShadowCandleWriter::new(&config)
+            .expect("writer builds")
+            .with_keyed_for_test(&PR40C_TABLES_KEYED);
+        let (spill, dlq) = temp_pair("chaos-outage-recovery");
+        let mut runner =
+            SealWriterRunner::with_writer_for_test(writer, spill.clone(), dlq.clone(), 64, 64, 64);
+        let tx = runner.sender();
+        let mut now = jan1_noon_utc();
+        let mut expected: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+        let mut next_offset = 0u32;
+        let mut send = |count: u32, expected: &mut std::collections::BTreeSet<i64>| {
+            for _ in 0..count {
+                let bucket = session_bucket(next_offset);
+                next_offset += 1;
+                tx.try_send(mk_seal(13, 0, TfIndex::M1, bucket, 101.5))
+                    .expect("channel has room");
+                expected.insert(i64::from(bucket) * 1_000_000_000);
+            }
+        };
+
+        // 1. Outage.
+        fake.outage
+            .store(true, std::sync::atomic::Ordering::Release);
+        const OUTAGE_CYCLES: usize = 12;
+        const OUTAGE_SEALS_PER_CYCLE: u32 = 50;
+        let mut spilled = 0usize;
+        let mut to_dlq = 0usize;
+        for _ in 0..OUTAGE_CYCLES {
+            send(OUTAGE_SEALS_PER_CYCLE, &mut expected);
+            let (cycle, replay) = runner.run_one_cycle_with_replay(now);
+            assert!(!cycle.drain.flushed_ok, "the database is down");
+            assert!(replay.is_idle(), "nothing replays into a failing database");
+            spilled += cycle.drain.rescued_to_spill;
+            to_dlq += cycle.drain.rescued_to_dlq;
+            now += 1;
+        }
+        let outage_seals = OUTAGE_CYCLES * OUTAGE_SEALS_PER_CYCLE as usize;
+        assert_eq!(
+            spilled, outage_seals,
+            "every refused seal went to the spill ({to_dlq} went to the DLQ instead: the \
+             spill refuses below SEAL_ESCALATION_MIN_FREE_BYTES of free disk)"
+        );
+        assert!(
+            fake.acked_rows.lock().expect("rows").is_empty(),
+            "nothing was acknowledged during the outage"
+        );
+
+        // 2. Recovery: one live seal a second until the spill is drained.
+        fake.outage
+            .store(false, std::sync::atomic::Ordering::Release);
+        let mut reingested = 0usize;
+        let mut archived = 0usize;
+        for _ in 0..600 {
+            send(1, &mut expected);
+            let (cycle, replay) = runner.run_one_cycle_with_replay(now);
+            assert!(cycle.drain.flushed_ok, "the database is back");
+            reingested += replay.seals_reingested;
+            archived += replay.files_archived;
+            now += 1;
+            if reingested == outage_seals && archived >= 1 {
+                break;
+            }
+        }
+        assert_eq!(
+            reingested, outage_seals,
+            "the replay re-sent every spilled seal"
+        );
+        assert!(archived >= 1, "the replayed file was archived");
+        let live_left = std::fs::read_dir(&spill)
+            .expect("spill dir")
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("bin"))
+            .count();
+        assert_eq!(live_left, 0, "no spill file is left to replay");
+
+        // 3. Exactly once.
+        let acked = fake.acked_rows.lock().expect("rows").clone();
+        let mut seen: std::collections::BTreeMap<i64, usize> = std::collections::BTreeMap::new();
+        for row in &acked {
+            let ts: i64 = row
+                .rsplit(' ')
+                .next()
+                .and_then(|t| t.parse().ok())
+                .expect("every ILP row ends with its timestamp");
+            *seen.entry(ts).or_default() += 1;
+        }
+        let twice: Vec<_> = seen.iter().filter(|(_, n)| **n > 1).collect();
+        assert!(
+            twice.is_empty(),
+            "rows acknowledged more than once: {twice:?}"
+        );
+        let got: std::collections::BTreeSet<i64> = seen.keys().copied().collect();
+        assert_eq!(got, expected, "every seal acknowledged, none invented");
+        cleanup(&spill, &dlq);
     }
 }

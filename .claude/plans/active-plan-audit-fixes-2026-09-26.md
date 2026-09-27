@@ -1079,8 +1079,33 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     `test_prune_spill_files_at_applies_the_live_guard_only_at_the_top_level`,
     `test_report_unrecovered_seals_is_silent_at_zero_and_reports_the_count`,
     `test_report_unrecovered_seals_is_wired_into_both_recovery_paths`.
-- [ ] **PR40c — PR15's tests prove batching, the pause and the real replay, and the inline
-  fallback has a decision.** (`storage`) The last two bullets below.
+- [x] **PR40c — PR15's tests prove batching, the pause and the real replay, and the inline
+  fallback's note is corrected.** (`storage`) The last two bullets below, except the decision,
+  which is PR40d.
+  - Done: `SealEscalationSink::run` returns a `SealEscalationRunSummary` (batches, records,
+    spill writes; the production thread discards it), so the batching test asserts 4,103
+    queued seals go out in exactly 5 batches and 5 spill writes, a batch across IST midnight in
+    2 writes, and a lone seal in its own batch at once. A deterministic pause test stages the
+    live file while the writer holds its handle and asserts the next seal opens a fresh live
+    file. Measured by hand: with `*open = None` removed from `with_appends_paused` the new test
+    fails and the older race test still passes. A chaos test drives the REAL
+    `ShadowCandleWriter` over ILP/HTTP against a local stand-in that answers 503 during an
+    outage and 204 after it: all 600 outage seals go to the spill, the health gate opens after
+    sixty clean seconds, the mid-session replay re-sends them, and every seal (outage and live)
+    is acknowledged exactly once with no spill file left. The inline fallback's doc now says the
+    wait is bounded in BYTES (one 128 KiB batch holds the lock), not in TIME: a hung disk holds
+    the frame drain for as long as it hangs.
+  - Not done: the chaos test runs against a stand-in, not QuestDB; it proves the writer's wire
+    behaviour and the replay loop, not QuestDB's DEDUP.
+  - Tests: `the_escalation_thread_batches_a_burst_and_writes_every_record_in_order`,
+    `the_escalation_thread_writes_a_lone_refusal_at_once_as_its_own_batch`,
+    `a_batch_that_straddles_ist_midnight_files_each_record_under_its_own_day`,
+    `staging_with_appends_paused_sends_the_next_seal_to_a_fresh_live_file`,
+    `chaos_a_database_outage_spills_every_seal_and_recovery_replays_each_once`.
+- [ ] **PR40d — the inline fallback's stalled-disk wait has an owner decision.** (`storage`)
+  Asked on 2026-09-27 with three options: accept the wait and make it loud (recommended), a
+  second disk as a third store, or a memory overflow. A new page needs a dated noise-lock
+  section with the owner's words first.
 - Original PR40 text, kept as the source for 40a–40c:
   - A crash (abort, out of memory, hard kill) loses every queued seal uncounted: up to 250,000
     in the escalation queue, 750,000 across writer channel, ring and escalation queue
