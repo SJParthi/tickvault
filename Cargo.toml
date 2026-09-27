@@ -77,7 +77,7 @@ opentelemetry-otlp = { version = "=0.32.0", features = ["grpc-tonic"] }
 # ---- Section 5: Observability — Tracing ----
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["json", "env-filter"] }
-tracing-opentelemetry = "=0.33.0"
+tracing-opentelemetry = "=0.34.0"
 # Phase 2 of plans/active-plan.md: hourly-rotated ERROR-only JSONL stream
 # at data/logs/errors.jsonl so Claude Code / Loki / summary_writer can tail
 # a structured, append-only file instead of parsing journald prose.
