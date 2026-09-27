@@ -526,6 +526,275 @@ PR25–PR27, PR18, PR19 and the decisions. One PR open at a time, as before.
   - CLAUDE.md: the catch-up sweep measured 4.73 ms at 25,000 × 10 timeframes; the 9.67 ms row
     assumes `TF_COUNT` 24 and is stale. Corrected in the PR that next touches that row.
 
+
+### Added 2026-09-27 (fifth re-check, 138 findings), riskiest first
+
+Source: re-check 5 on main c0e4829 (comparison page version 6; the full list with evidence is
+`/mnt/project-files/audit/recheck5-gaps.md`). Locations are that check's and are re-read against
+the code when each PR is written; a wrong row is corrected here, never dropped.
+
+Order of work: PR15 finishes first. Then, riskiest first: PR28 (SEBI data off one disk, console
+wipe) → PR29 (log tool can change the live database) → PR30 (budget stop undone the same day) →
+PR31 (a restart can overwrite fuller candles) → PR32 (tick rescue and spill ordering) → PR33
+(token and socket gaps) → PR34 (hung app never restarted) → PR35 (deploys) → PR36 (security) →
+PR37 (Dhan documentation mismatches) → PR38 (risk book across a restart) → PR39 (every error
+line coded, every loss counted and shipped), then the remaining order from the fourth re-check
+(PR16, PR17, PR23, PR24, PR5–PR14, PR25–PR27, PR18, PR19, decisions). One PR open at a time.
+
+- [ ] **PR28 — never-delete data does not live on one disk, and the console cannot wipe it.**
+  (`aws-lambdas`, `storage`, deploy)
+  - `instrument_lifecycle`, `instrument_lifecycle_audit` and `index_constituency` exist only on
+    the server disk, and the reset-time SEBI save goes to that same disk
+    (partition_manager.rs:327; operator_control_action_commands.rs:85, :314). A daily export of
+    the three tables to the cold bucket, verified by row count, with a coded error and a page on
+    failure; the reset-time save is uploaded and capped too.
+  - The console wipe targets include `rest_fetch_audit` and the kept `rest_*` tables
+    (operator_control_action_commands.rs:44, :47, :96). Exclude the whole SEBI/keep list, pinned
+    by a guard that reads the keep list from one place.
+  - A cut-off table list lets reset delete an unsaved SEBI table: abort if any SEBI table with a
+    folder on disk was not exported (:97, :235-266, :472-495).
+  - Reset and nuke stop the app before their lock check, and a wipe delivered late by SSM can run
+    in market hours: the box checks the 09:00–15:45 lock before the FIRST stop, and SSM delivery
+    gets a short timeout (:8-52, :62, :269, :290, :498; operator_control.rs:1947-1960). Every exit
+    re-enables the app (:62, :270-282).
+  - The cold bucket has no versioning (deploy/aws/terraform/main.tf:692): versioning on, with a
+    short non-current expiry, so a bad delete is recoverable.
+  - SEBI audit rows leave QuestDB after 90 days (partition_manager.rs:77-232, :327-345;
+    partition_archive.rs:353-373). OWNER DECIDED 2026-09-27 11:15 UTC ("Lock the cloud copy"):
+    keep the 90-day drop, and make the S3 copy of the SEBI tables write-once (object lock /
+    retention for 5 years) so nothing can delete it; the daily export above lands in that
+    locked prefix. The drop only runs after the locked copy is verified.
+- [ ] **PR29 — the log tool can never change the live database.** (`tickvault-logs-mcp`)
+  - Free SQL goes to the live database raw, so `drop` and `truncate` pass
+    (tickvault-logs-mcp/src/tools.rs:669). Reuse the operator console's read-only SQL gate, cap
+    rows and reply size (:704), bound log reads, and remove the shell-outs (:679, :1017-1021).
+    The runbook finder also searches `docs/error-runbooks` and `docs/claude-rules-full`
+    (:609-615). This takes over the log-tool bullet in PR19. The MCP parity pin
+    (`crates/tickvault-logs-mcp/tests/parity.rs`) is bumped deliberately in the same PR.
+- [ ] **PR30 — a budget stop stays stopped for the day.** (`aws-lambdas`, `scripts`, deploy)
+  - The 08:45 start watchdog, `aws-autopilot.sh` and the 15:50 terraform apply each undo a
+    budget stop the same day (start_watchdog.rs:819-835; aws-autopilot.sh:216-224;
+    terraform main.tf:498-507; terraform-apply.yml:64-66). A breach latch (one SSM parameter,
+    written by the kill-switch, cleared only on a new billing day or by the operator) that all
+    three read before starting the box. Pinned by a test per reader.
+  - The October $150 ceiling is enforced in code (`effective_budget_kill_usd`) but budget.tf and
+    budget-guards.tf still say $225 (budget.tf:220-222; budget-guards.tf:278). Quote 23 keeps
+    $225 for September, so the terraform change is a dated PR on or after 2026-10-01, in all four
+    lockstep sites.
+- [ ] **PR31 — a restart can never replace a fuller candle with a partial one.** (`storage`,
+  `app`, `trading`)
+  - A restart in market hours rebuilds the open candles from the ticks it replays, which may be
+    only part of them, and the UPSERT overwrites the fuller row already stored
+    (ws_frame_spill.rs:4680-4685; shadow_persistence.rs:143). Same class: a same-day replay of a
+    missed slice (wal_applied_watermark.rs:186-218; dhan_feed_stack.rs:13474-13933). Rebuild the
+    open bars from the stored ticks, or mark a post-restart bar partial and never let it replace
+    a row with more volume. PR23's "replay may rebuild them" is verified false: PR23 tests the
+    crash case without relying on replay.
+  - The boot candle recovery says "all re-ingested" when some failed (seal_writer_task.rs:772-840):
+    keep the file and report the real count.
+  - Top-volume and candle tables can be auto-created by an ILP write without their DEDUP key
+    (candle_ddl_boot.rs:245-290; top_volume_rank_persistence.rs:862-924): refuse the write until
+    the DDL has succeeded.
+  - Replayed depth rows get a new arrival time, so the key does not collapse them
+    (depth_persistence.rs:221-222; dhan_feed_stack.rs:6936-6941): derive the replayed arrival
+    time the live way, or take arrival time out of the depth key.
+- [ ] **PR32 — a tick batch is never marked applied before it is on disk.** (`storage`, `app`)
+  - A rescue batch queued to the rescue thread but not yet written is skipped by the next
+    replay if a later batch was already confirmed (tick_persistence.rs:2739-2757, :3354-3358;
+    dhan_feed_stack.rs:3199-3219). Mark its range unapplied when it is queued and when shutdown
+    abandons it; clear it when it lands.
+  - A late append is erased at the hour boundary (tick_spill_replay.rs:896-958): truncate only
+    under the writer's lock, or rename then drain.
+  - The unapplied-slice table overflows silently (wal_applied_watermark.rs:342-344, :650-690):
+    a counter, and stale slots cleared.
+  - Rows replayed into an hour the archive already dropped (partition_archive.rs:2348-2368,
+    :2680-2695): the archive sees the capture log's deferrals.
+  - Boot re-reads the same leftovers while the database's apply lag persists
+    (dhan_feed_stack.rs:13228-13262; ws_frame_spill.rs:3027-3040): break the loop.
+  - fsync of spill, dead-letter and marker files, and the database commit mode, go to PR17
+    (tick_persistence.rs:1348; wal_applied_watermark.rs:819-856).
+- [ ] **PR33 — token and socket gaps.** (`core`, `app`)
+  - A token refused at the connect handshake (HTTP 401/403 on the upgrade) is never renewed
+    (connection.rs:1806-1816; pool_supervisor.rs:1719, :1889): classify it as token-stale and
+    refresh once before redialling.
+  - A failed renewal is retried by every queued socket (token_manager.rs:1286-1362): share the
+    failed outcome for a short cooldown.
+  - Two other callers replace the token without the PR22 generation guard
+    (token_manager.rs:1655-1705, :1723-1730; order_update_connection.rs:569): pass the caller's
+    last-seen generation.
+  - A socket spawned just before an 805 still connects (pool_supervisor.rs:1683-1698,
+    :4845-4848): the task reads the stop switch before every first-ever dial, main feed included.
+  - A queued depth-200 rotation can hide an 805 (pool_supervisor.rs:6127-6199;
+    connection.rs:2023-2025): drain an owed close before a queued command. Rotation refuses a
+    socket that is not depth-200 (:6127-6145).
+  - Depth dials refused after an 805 are still booked as dialled (dhan_feed_stack.rs:12148-12193):
+    set the flags and seed the silence detector only for sockets actually spawned.
+  - The unsubscribe probe reads a refused close as "ignored" (depth_unsubscribe_probe.rs:408-436,
+    :462): check the 805 refusal counter first.
+  - A half-open socket is redialled before Dhan closes its end (idle_watchdog.rs:96, :105;
+    reconnect_ladder.rs:60): hold the redial past Dhan's 40 s server close. A half-open
+    order-update socket takes 4 hours to notice (activity_watchdog.rs:134;
+    order_update_connection.rs:669-672, :737-758): a read deadline well under that.
+  - Depth-20 spots are never added when the underlying list arrives late
+    (dhan_feed_stack.rs:11577-11607, :12176-12178): add them when it appears, and count it.
+  - The depth seed looks contracts up by id alone across exchanges (depth_seed.rs:224-232,
+    :416-436): key on `(security_id, segment)` (I-P1-11).
+  - The 808 policy (pool_supervisor.rs:743-748, :1831-1841) and the main-feed half of row 99
+    (dhan_feed_stack.rs:11956-11979, :12865-12870) are D7's, see below.
+- [ ] **PR34 — a hung app is restarted and a stuck drain is visible.** (`app`, deploy, `scripts`,
+  `aws-lambdas`)
+  - The systemd watchdog ping does not follow drain or runtime progress, and boot steps are
+    unbounded (main.rs:2063-2079; tickvault.service:117, :155): tie the ping to progress.
+  - A stuck drain keeps the liveness gauge green (dhan_feed_stack.rs:7600-7620;
+    observability.rs:276-290): publish tick age from a separate task.
+  - Clock health reads the last offset, so a clock service that lost its source reads as zero
+    skew, and the check falls back to the same host's database (infra.rs:541-625); the chrony
+    call has no time limit (infra.rs:551, :657). Read the sync status, bound the call, drop the
+    fallback.
+  - The autopilot restarts a crash loop every 15 minutes (aws-autopilot.sh:292-373): leave a
+    unit at its restart limit alone and page. Its database repair uses the wrong folder (:385).
+  - A box down at 09:20 means no liveness paging all day (market_hours_gate.rs:77-87,
+    :176-183): re-check on instance start.
+- [ ] **PR35 — a deploy cannot break the morning or leak logs.** (`.github/workflows/`, deploy)
+  - A deploy can restart the app just before 09:00 (deploy-aws.yml:754-765, :958-1011): refuse
+    one that cannot finish with boot before 08:55.
+  - A failed deploy stops the app even after a good rollback (:1310-1318, :1452-1506); a
+    half-failed one leaves new settings with an old build (:969-985, :1122-1125): use the
+    deployed commit's settings and roll back on any failure.
+  - Failed deploys copy app logs into public CI logs (:1010-1012, :1260-1261): keep the journal
+    on the box.
+  - All Green does not check terraform or the production aarch64-musl build (ci.yml:1121-1132;
+    terraform-apply.yml:50-53): add both, and add them to `all-green`'s `needs:` in the same
+    change (merge-gate lock §5).
+- [ ] **PR36 — security hardening.** (deploy, `core`, `app`, `aws-lambdas`)
+  - SSH is open to 0.0.0.0/0 (terraform-apply.yml:123; main.tf:144-150): close 22 or pin a CIDR.
+  - The scheduler role can pass any role (main.tf:624-633): scope PassRole to its own ARN.
+  - The token cache is briefly readable by other users (token_cache.rs:106-113): create it with
+    mode 0o600 in one step.
+  - The console control secret can be replayed (operator_control.rs:230-246): signed,
+    time-limited requests.
+  - A weak API bearer token is accepted silently (main.rs:4185-4209; api/src/lib.rs:174-181):
+    minimum length at boot.
+  - `config/local.toml` holds production's database address and is loaded in production
+    (main.rs:562-569): production values move to `production.toml`.
+- [ ] **PR37 — Dhan documentation mismatches.** (`core`, `common`, `app`) Checked against the
+  owner's 2026-09-27 upload (same files as 2026-09-26).
+  - Quote byte 38 / Full byte 50: the PDF says "Day Close Value, only sent post market close";
+    Dhan support ticket #5525125 (2026-04-10, recorded in `.claude/rules/dhan/live-market-feed.md`)
+    says it is the previous day's close, and for NSE_EQ there is no code-6 packet. The two
+    sources disagree, so the first step is a live measurement, not a code change: at 09:15 and
+    after 15:30 compare the field with yesterday's stored close for a sample of stocks. Only then
+    decide the source. The first-write-wins latch (dhan_feed_stack.rs:3894, :3928-3990) is
+    changed either way so a later, different value is counted rather than silently ignored.
+  - `ExpiryCode` is 0/1/2 in code and 1/2/3 in the annexure, with no production caller
+    (instrument_types.rs:128-143): renumber to the doc or delete it.
+  - A second, older disconnect policy disagrees with the live one on 804, 809 and 811–814 and
+    has only test callers (websocket/types.rs:137-157): delete it or route it to
+    `classify_disconnect`.
+  - Depth-200 dials the root path; the PDF says `/twohundreddepth`. Deliberate (2026-04-23), but
+    the same change also switched TLS, so the evidence does not isolate the path. No change
+    without a live probe of the documented path on one socket; a recorded note only.
+  - Codes 1 and 7 sizes are not documented (dispatcher.rs:168, :309, :314): assumed from the
+    SDK and stated as such in the code.
+- [ ] **PR38 — the risk book survives a restart.** (`trading`, `app`) A restart forgets
+  positions, realised P&L and the halt latch, so an automatic halt is lifted
+  (risk/engine.rs:208-228, :717-733): rebuild them at boot from the order audit, or persist
+  them. The expired-contract check is never fed (oms/engine.rs:3496-3506): set `expiry_date` on
+  option orders and compare against the IST date. Paper mode only; `dry_run` is not touched.
+- [ ] **PR39 — every error line is coded and every loss is counted where it pages.** (all crates,
+  deploy)
+  - 78 production `error!` lines carry no code: add codes and a guard that every production
+    `error!` has one (common/tests/error_code_tag_guard.rs). Takes over PR19's token-failure
+    bullet and row 146 (main.rs:346, :2801; dhan_universe.rs:1653-1654; the dead WAL-replay
+    branch main.rs:1057-1062).
+  - Row losses logged as warnings become coded `error!` (dhan_rest_stack.rs:909-927;
+    partition_archive.rs:2709-2720), and the phrase-list guard is fixed
+    (error_level_meta_guard.rs:23-62). Lost candle spill files log an unknown code: add
+    SPILL-RETENTION-01 with runbook and alarm (seal_spill.rs:1170-1181). Board and candle-table
+    loss lines get codes (volume_leaderboard.rs:1405-1418; multi_tf_aggregator.rs:794-806).
+  - Instrument lifecycle audit rows and index membership writes get their own code and counter,
+    and index membership retries once (dhan_lifecycle.rs:599; dhan_universe.rs:1207).
+  - Top-volume discards page (top_volume_rank_persistence.rs:1955); the log-drop counter ships
+    and the two coded log lines alarm (cloudwatch-agent.json:24; observability.rs:438).
+  - Five low-rate writers use the library's default network timeouts (ws_event_audit_persistence.rs:214
+    and siblings): `retry_timeout=0`, `request_timeout=5000`, socket-audit flush off the shared pool.
+  - The critical token page understates its impact (events.rs:1680-1712, :3870;
+    mid_session_watchdog.rs:254, :372): reword it and its pinning test.
+- [ ] **Folded into existing PRs (fifth re-check):**
+  - PR16: the error summary rebuilt from 48 h of logs every minute
+    (summary_writer.rs:128-172, :397-409) and the depth-seed write (depth_seed.rs:283-306).
+  - PR17: fsync of spill, dead-letter and marker files; the database commit mode (from PR32).
+  - PR23: test the crash case without relying on replay (see PR31).
+  - PR24: name the candle watermark and the 5 s catch-up cutoff; the capture-log marker uses our
+    own clock, not vendor stamps (multi_tf_aggregator.rs:1295; ws_frame_spill.rs:1943-1965).
+  - PR25: `deny_unknown_fields` on the root struct too; delete `[cross_verify]`, the three dead
+    keys in production.toml and the `[cadence]` keys in the same PR.
+  - PR26: correction — the SDK retry setting never touches the Dhan POST. Set
+    `maximum_retry_attempts = 0` on an event-invoke config for BOTH minters
+    (dhan-token-minter-lambda.tf:152-166; dhan-depth-token-minter-lambda.tf:123), pinned by a
+    terraform guard.
+  - PR27: correction — boot already adopts the SSM token first; the fix is the 807 renew/mint
+    path re-reading SSM before minting (token_manager.rs:1283-1360, :402-470).
+  - PR7: drop the telegram-dispatcher sub-item (the DHAT job already runs it with the feature on,
+    ci.yml:812-832). Add: the socket-reader allocation test checks a copy
+    (dhat_ws_reader_zero_alloc.rs:66-78); the depth drain has none (dhan_feed_stack.rs:9060);
+    the board sweep test skips publish and hand-off; two unlocked tests share the heap counter
+    (dhat_live_ingest_seam.rs:243, :493); packet types and order paths missing
+    (dhat_allocation.rs:106-160); three timing harnesses can time an empty workload; the board
+    sweep step time is unmeasured since #1953; the production allocator is unmeasured on
+    aarch64-musl. The bench gate checks less than the rules say (bench-gate.sh:167; bench.yml).
+  - PR8: a quick-failure retry gate on the candle writer (shadow_candle_writer.rs:609-670).
+  - PR9: since #1955 depth frames are walked twice too (connection.rs:951-970).
+  - PR10: the per-seal board lookup and the tick writer's label table
+    (dhan_feed_stack.rs:1702-1724; candle_contract_labels.rs:38; tick_persistence.rs:2289-2294),
+    the keepalive counters (connection.rs:1893-1898, :1995-2000), the tick writer's uncounted
+    buffer regrowth (tick_persistence.rs:2676-2686), the spot price table pre-size
+    (spot_price_store.rs:336), and the per-tick delay timer allocating with the real exporter
+    installed (dhan_feed_stack.rs:9964-10006).
+  - PR4c follow-ups: a late trade left off the short boards is counted and the close margin tied
+    to measured lag (top_volume_sweep.rs:94-130; volume_leaderboard.rs:1203-1229); a contract's
+    first live window after a restart is marked (volume_leaderboard.rs:1265-1282); a volume spike
+    after a feed gap is named on the board (aggregator_cell.rs:1405-1414); busy 1-second rows'
+    empty candle columns are kept or documented (dhan_feed_stack.rs:2318-2346); the contract
+    attach seeds ~20,000 instruments in one go, sliced on the idle arm (:7252-7280). Shipped as
+    one PR after PR39.
+  - PR12: marked frames wait for a restart when the live drain queue is full
+    (dhan_feed_stack.rs:5444); mid-session catch-up covers them.
+  - PR19: the quote handler checks the reply status (quote.rs:149-155, :184-192); request logging
+    moves inside the limiter (middleware.rs:654-678); the debug board caps the error file read
+    (debug.rs:345-376); the app stops opening a browser on the server (infra.rs:443,
+    :1250-1259); two uncalled candle functions are deleted or wired
+    (multi_tf_aggregator.rs:600-605, :1704-1730); test builds that crash on a rescued seal
+    (dhan_feed_stack.rs:4201-4214, :4728-4732); stale comments and CLAUDE.md facts;
+    `plan-verify.sh` is wired into the push gate or the docs stop saying it is; bench compiles in
+    PR CI (ci.yml:255); the holiday gate shares the app's config loader (main.rs:115-119).
+  - D3: cite the contract-overflow drop when the spot socket's channel is closed
+    (dhan_feed_stack.rs:11923-11948) and the pre-08:00 boot collapse
+    (dhan_live_universe.rs:507-522, :700-719).
+  - D6: a shrink-only shell budget (files, workflow `run:` lines, shell in Rust strings); name the
+    console SEBI-save program and its aws CLI calls; list the deploy/ops files; the corrected
+    orphan list (8 files; sync-to-integration and test-coverage-guard are called); container
+    health checks use shell (docker-compose.yml:436, :511, :554).
+  - D7: covers the 808 policy (default: re-read the token once, then park and page) and the
+    main-feed half of row 99 (PR21 fixed depth only): after an 805, no NEW main-feed socket is
+    dialled; the contracts it would have carried stay pending and come back through D7's probe
+    and resume. No subscribed instrument is dropped (owner rule).
+  - D11: widen to hard_stop_guard, the start-watchdog curfew, the MON–FRI start, heartbeat and
+    liveness crons, the deploy no-go band and the destructive-action lock
+    (hard_stop_guard.rs:242-250; main.tf:501, :527).
+  - A new D12 — a full availability zone costs a day: script and test the zone move
+    (main.tf:362, :384; variables.tf:39-49). Keeps the multi-AZ shape (Quote 13).
+  - PR21 note: the ticked item covered depth only; its first bullet named the contract dials.
+    The main-feed half is D7's (above).
+  - PR4c follow-up (measured by the re-check, release build, busy 4-core x86): the PR4c-1 radix
+    sort was SLOWER than the comparator sort it replaced at every size (20,220 rows: 1,126 µs vs
+    976 µs; 100–2,000 rows about 2x; harness `radix_vs_comparator_at_every_measured_shape`).
+    Re-measure both on the Graviton host and keep whichever is faster there; slicing works with
+    either. Also: a full board `rank` measured 4.14 ms at 20,220 (the CLAUDE.md row says
+    2.95 ms, stale); the sliced sweep's mean step is 7–12 µs, worst step 0.17 ms in one run and
+    ~4.2 ms in two (likely a host pause, unproven until measured on a quiet host). Correct the
+    CLAUDE.md figures in the same PR.
+
 ## Edge Cases
 
 - PR1: log burst larger than the non-blocking buffer → lines dropped and counted, never blocking.
