@@ -925,7 +925,10 @@ pub fn drain_recovered_seals<S: SealSink>(
             "seal recovery SKIPPED {} record(s) it could not decode — most often \
              files written by an older build in a different format. Those seals \
              were NOT re-ingested into QuestDB; their files stay on disk (archive/ \
-             or replaying/) for inspection — this drain deletes nothing",
+             or replaying/) for inspection — this drain deletes nothing, and the \
+             spill retention sweep removes them once they are older than its window. \
+             The page for them is the AGGREGATOR-DROP-01 line with \
+             source=seal_unrecovered",
             outcome.records_undecodable
         );
     }

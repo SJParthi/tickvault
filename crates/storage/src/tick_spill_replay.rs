@@ -32,7 +32,9 @@
 //! # Why success TRUNCATES rather than deletes
 //!
 //! `seal_spill::prune_spill_files` distinguishes an aged-out EMPTY file from
-//! an aged-out file that still HELD records, and fires `SPILL-RETENTION-01` on
+//! an aged-out file that still HELD records, and pages AGGREGATOR-DROP-01
+//! (`source = "spill_retention"`; until audit PR40b it logged the
+//! unregistered `SPILL-RETENTION-01`, which paged nobody) on
 //! the latter with "the replay path has been broken for longer than the
 //! retention window". A drained file must therefore end up empty, not absent,
 //! or that distinction silently stops working.
@@ -2054,7 +2056,7 @@ mod tests {
             std::fs::metadata(&closed).expect("meta").len(),
             0,
             "a drained CLOSED file must be EMPTY, not absent — prune_spill_files \
-             distinguishes the two and fires SPILL-RETENTION-01 on the other"
+             distinguishes the two and pages AGGREGATOR-DROP-01 on the other"
         );
         assert_eq!(
             std::fs::read(&live).expect("read live").as_slice(),

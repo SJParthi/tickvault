@@ -1054,9 +1054,31 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     `a_clean_shutdown_rewrites_the_marker_and_the_next_boot_reports_nothing`,
     `the_loop_reads_the_previous_marker_before_it_writes_its_own`,
     `unwritten_mark_file_is_outside_every_spill_and_dlq_filter`.
-- [ ] **PR40b — old spill folders are pruned and an unrecovered seal pages.** (`storage`,
+- [x] **PR40b — old spill folders are pruned and an unrecovered seal pages.** (`storage`,
   deploy) The archive/replaying pruning, the replay-skipped and boot-undecodable seals as a
   coded error with an alarm (rule file first: a new page needs a dated noise-lock section).
+  - Done: no new page, so no noise-lock section. Every seal a recovery path gives up on (boot
+    drain: undecodable or refused; replay: every `records_skipped`) now fires the EXISTING
+    AGGREGATOR-DROP-01 errcode alarm with `source = "seal_unrecovered"` and `stage`
+    (`seal_writer_loop.rs::report_unrecovered_seals`), one line per drain or replay step, the
+    same route as PR40a's `crash_unwritten`. The spill retention line that deletes aged files
+    still holding seals carried the unregistered `SPILL-RETENTION-01` and paged nobody; it is
+    now AGGREGATOR-DROP-01 with `source = "spill_retention"` (this closes PR39's
+    SPILL-RETENTION-01 bullet by reuse rather than a new code). Alarm description and the
+    wave-6 runbook cover (d) and (e).
+  - Done: `prune_spill_files_at` now also sweeps `replaying/` (aged file = unreplayed, counted
+    as lost like the top level) and `archive/` (counted apart as `archive_deleted`, not a loss),
+    and both count toward `tv_seal_spill_bytes`. The live-writer guard stays top-level only.
+  - Not done, by choice: no new EMF selector for `tv_seal_replay_total{kind="skipped"}`. The
+    series already ships in the `/tickvault/<env>/metrics` log group and the page is the log
+    line; a selector adds a paid custom metric for no extra signal.
+  - Honest limit: a staged file older than 7 days that the replay is reading at the moment of
+    the sweep is deleted under it; the next step cannot reopen it and the loss is counted and
+    paged as `spill_retention`. Reaching it needs the replay stuck for a week.
+  - Tests: `test_prune_spill_files_at_sweeps_replaying_as_loss_and_archive_as_not`,
+    `test_prune_spill_files_at_applies_the_live_guard_only_at_the_top_level`,
+    `test_report_unrecovered_seals_is_silent_at_zero_and_reports_the_count`,
+    `test_report_unrecovered_seals_is_wired_into_both_recovery_paths`.
 - [ ] **PR40c — PR15's tests prove batching, the pause and the real replay, and the inline
   fallback has a decision.** (`storage`) The last two bullets below.
 - Original PR40 text, kept as the source for 40a–40c:
