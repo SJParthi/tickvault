@@ -187,6 +187,11 @@ inline (PR2, PR8, PR14).
   - Criterion benches: `MultiTfAggregator::consume_tick` (hit, new slot, seal-crossing),
     seal ring push/pop, tick ILP append, candle ILP append. Budgets added to
     `quality/benchmark-budgets.toml` from the first measured run (never guessed).
+  - Re-check 6 (2026-09-27): name the seal channel that allocates on the drain
+    (seal_writer_runner.rs:773); measure how often the capture-log hand-off wakes the writer thread
+    and batch the wakes only if it matters (ws_frame_spill.rs:1183, :1639); the ~50 ns per-price
+    conversion figure is unmeasured, so restore the per-call bench or delete the claim
+    (common/src/price_precision.rs:44-50).
 - [ ] **PR8 — `block_in_place` on shared runtimes.** (`app`, `storage`)
   - Correction: no per-tick dynamic metric label exists on the drain (checked 7403-8285; all
     handles pre-built), so the "label cache" half is closed with no change.
@@ -194,6 +199,8 @@ inline (PR2, PR8, PR14).
     dhan_feed_stack.rs:5843, order_observability.rs:488, dhan_order_push_observability.rs:185,
     seal_writer_loop.rs:398). Each is moved to its own thread or `spawn_blocking` where it runs on
     the shared multi-thread runtime; the drain-side one (5843) is reduced to the shutdown path only.
+  - Re-check 6 (2026-09-27): line correction, the seal writer site is seal_writer_loop.rs:445 (live)
+    and :455 (shutdown), not :398.
 - [ ] **PR9 — each main-feed frame is walked once, by one audited walker, and fuzzed.** (`core`, `app`)
   - Today the connection task walks every frame for a stacked disconnect
     (connection.rs:916 → dispatcher.rs:343) and the drain walks it again (dhan_feed_stack.rs:7428).
@@ -208,6 +215,10 @@ inline (PR2, PR8, PR14).
     SipHash. Switch to `ahash::RandomState` — `ahash =0.8.12` is ALREADY a workspace dependency
     (Cargo.toml:140) and already used by `TickGapDetector`, so no new dependency. Keys stay the
     composite `(security_id, segment)`. Bench before/after in the PR (PR7 benches).
+  - Re-check 6 (2026-09-27): the depth writer's buffer regrows from empty after each hand-off
+    (depth_persistence.rs:1606-1617); pre-size it next to the tick writer's and count the miss. The
+    tick row writer has the database client re-check column names on every row (row 105,
+    tick_persistence.rs:2263-2362); no item covered it until now.
 - [ ] **PR11 — disk ballast and token recovery without a restart.** (`storage`, `core`, `app`)
   - Disk headroom gauges and alarms already exist (disk_pressure_boot.rs:242, app-alarms.tf:312,
     :376). Missing: an ENOSPC ballast — a pre-allocated reserve file on the data volume, released
@@ -236,6 +247,10 @@ inline (PR2, PR8, PR14).
     the single order-runtime `select!` (order_runtime.rs:1335). Move the retry ladder into a
     spawned task per request that reports back on a bounded channel; the loop keeps serving every
     other arm. Unreachable today (dry_run hard-true); `dry_run` itself is not touched.
+  - Re-check 6 (2026-09-27): row 158, ladder resends are not counted against our own limits; route
+    them through the per-second limit and the daily budget (api_client.rs:1851-1938). The order
+    limiter's comment claims a rolling, never-looser daily window (row 162, rate_limiter.rs:114):
+    make the code match it or correct the comment.
 - [ ] **D2 — covered by PR3 + PR12.**
 - [ ] **D3 — no silent instrument drop.** (`app`, `core`)
   - Universe over capacity (dhan_live_universe.rs:280-287): today the WHOLE widened set is
@@ -246,15 +261,38 @@ inline (PR2, PR8, PR14).
     main-feed capacity (5 × 5,000); when none is free, a critical coded alarm names the count and
     the current set is kept. The exact boot-time behaviour when the master alone exceeds 25,000 is
     an operator decision, asked in the thread before this PR is written.
+  - Re-check 6 (2026-09-27): late option top-up refusals do not page; fold both arms in with a
+    counter and an alarm that matches (dhan_feed_stack.rs:10889-10903, :10966-10981;
+    error-code-alarms.tf:802). The contract top-up log promises a retry that never comes: fix the
+    text and count only contracts actually subscribed (dhan_feed_stack.rs:10761-10763, :10778-10781,
+    :12428-12440). Stocks with no trade by 09:30 get no options: publish the count as a gauge at
+    hand-off (dhan_feed_stack.rs:12437-12448). Depth sockets are PR44's, not this item's.
 - [ ] **D4 — stale-price gate on entries.** (`trading` risk, not strategy)
   - No price-age check exists (risk/engine.rs:262). Add one to `check_order_in_segment`: an ENTRY
     whose last price is older than 5 s is refused with a coded reason; exits are never gated.
+  - Re-check 6 (2026-09-27): correction. As written, D4 would refuse every paper entry. The paper
+    order book has had no price source since 16 September (the per-minute price pulls were removed),
+    so every entry reads as having no price. D4 first wires a price source into the paper book (from
+    the live feed's in-memory prices), then adds the 5 s gate; the Edge Case 'no price is a stale
+    price' stays. Also (row 160): an open position with no price or a non-finite one adds zero to
+    the loss (risk/engine.rs:852-869); count it and alarm, since the gate covers entries only.
 - [ ] **D5 — headroom alarms.** Already present for disk (used %, fill rate) and host memory
   (app-alarms.tf:535). Only the ballast-released signal from PR11 is new; it rides that PR.
 - [ ] **D6 — the two remaining shell scripts become Rust.** (`app`)
   - `deploy/aws/holiday-gate.sh` (132 lines, tickvault-holiday-gate.service:36) and
     `scripts/ensure-questdb.sh` (230 lines, tickvault.service:106 `ExecStartPre=-`) become
     subcommands of the app binary; the unit files call them; `rust_only_guard.rs` allowlist shrinks.
+  - Re-check 6 (2026-09-27): corrections. The finish tests cover neither a port nor a budget on
+    shell inside Rust strings, and 'allowlist shrank' is vacuous against empty allowlists, so the
+    test compares against the recorded counts (files, workflow `run:` lines, shell in Rust strings).
+    The log tool's doctor script is an item line, not a note (tools.rs:1252-1257), and the two Node
+    launchers in .mcp.json (:4, :14) are named. The console shell grew to 393 lines with PR28a,
+    including the 263-line SEBI-save program copied into reset and nuke (PR48 makes it one constant
+    first). The inventory rows the plan does not cover yet (deploy and ops workflows, autopilot and
+    upgrade scripts, CI gate scripts, other workflow steps, git hooks, Claude hooks, the Makefile,
+    operator and dev tooling, manual-only hooks) each get a stated verdict: product path (port or
+    budget) or not product path (recorded as out of the rust-only scope). The All Green matrix
+    script is rule-locked to shell and needs an owner quote before it changes.
 
 
 ### Added 2026-09-26 (second re-check, 26 new open gaps), riskiest first
@@ -291,6 +329,18 @@ folded into them below), then PR18, PR19 and the decisions.
   - The seal spill is replayed only at boot (`read_all` has no mid-session caller): replay it
     after QuestDB has been healthy for 60 s, rate-capped, like PR12.
   - Dropped seals were logged with `warn!` (dhan_feed_stack.rs:6634): DONE in PR4b.
+  - Re-check 6 (2026-09-27): correction. The title overstates. The inline fallback still writes on
+    the drain once both queues are full, and its bounded wait is in bytes, not time, so a stalled
+    disk makes it wait without limit (row 27, seal_writer_runner.rs:562-569, :575-615;
+    seal_spill.rs:725-729, :795-846). The seal figure in this item and in the code comments is
+    wrong: one close burst is 250,000 seals (25,000 × `TF_COUNT` 10), not 225,000, and the three
+    queues (writer channel, ring, escalation queue) hold up to 750,000 between them, of which PR15
+    added 245,904 by growing the escalation queue from 4,096 to 250,000. None of it is counted on an
+    abort. The last three bullets of this item (the seal spill's own thread, the boot-only replay,
+    and the `warn!` line) are the pre-PR15 text and are superseded by the DONE bullet. The open work
+    (counting or persisting queued seals at a crash, pruning the archive and replaying folders,
+    shipping the seal loss counters, the tests that prove batching, the pause and the real replay,
+    and a decision on the inline fallback) is carried by PR40.
 - [ ] **PR16 — nothing blocks the shared worker threads, and the drain gets its own thread.**
   (`storage`, `app`)
   - `df` is forked with no time limit from seven sites (disk_health_watcher.rs:121, :163, :239;
@@ -305,6 +355,13 @@ folded into them below), then PR18, PR19 and the decisions.
   - The frame drain shares the multi-thread runtime (dhan_feed_stack.rs:14291, main.rs:505):
     run it on a dedicated current-thread runtime on its own OS thread, so no other task can hold
     its worker.
+  - Re-check 6 (2026-09-27): also, the boot candle recovery (seal_writer_loop.rs:496; main.rs:3619)
+    and the 15:41 cross-check write (dhan_live_crossverify_boot.rs:617-622, :957) block a shared
+    worker; the web handlers do blocking file work on shared threads
+    (api/src/feed_state_persist.rs:167-195; api/src/handlers/debug.rs:146, :176, :346), including
+    the board error-file endpoint's listing and sort on every poll (row 176, debug.rs:345-376); the
+    drain can free the old contract-name table in place (dhan_feed_stack.rs:2443-2446), so drop it
+    off the drain.
 - [ ] **PR17 — spill files survive a host crash and a torn line.** (`storage`, `core`)
   - Spill, dead-letter and replay-marker files are never flushed to disk before the marker moves
     (ws_frame_spill.rs:566; tick_persistence.rs:1344-1349, :2837, :3383): `sync_data` before the
@@ -318,6 +375,12 @@ folded into them below), then PR18, PR19 and the decisions.
     (connection.rs:1885-1915): capture the frame before closing. Lands with PR9's walker if that
     PR is first.
     **Done in PR21 (2026-09-27).**
+  - Re-check 6 (2026-09-27): a disk that fills in the middle of a spill write can leave a torn line
+    anywhere, not only last, so skip and count every torn line (row 133,
+    tick_spill_replay.rs:710-740). The sync bullet also covers the candle spill, now written in
+    batches of 1,024 records and still never synced. Recorded as a limitation, not a fix: the
+    capture log segment can lose up to 1 s of records on power loss (`WAL_FSYNC_INTERVAL_MS_DEFAULT`
+    = 1,000), and an environment value of 0 turns syncing off.
 - [ ] **Folded into existing PRs:**
   - PR5: seven more dead crash-recovery sites under `panic = "abort"` (order_leg_pnl_boot.rs:221,
     day_ohlc_orchestrator.rs:315, tf_consistency_boot.rs:2287, order_runtime.rs:437,
@@ -337,16 +400,39 @@ folded into them below), then PR18, PR19 and the decisions.
 - [ ] **PR19 — small cleanups.** (`app`, `core`, `api`, `tickvault-logs-mcp`, CI, deploy)
   - Per-minute depth steering reloads data it never uses (depth_rebalance.rs:1888, :1895,
     :2044-2051): drop the reload.
-  - Token-failure `error!` lines carry no error code (token_manager.rs:1436, :1464).
   - Quote endpoint caches and queries by id without segment and builds an HTTP client per miss
     (api/src/handlers/quote.rs:71, :84, :91, :140-145; response_cache.rs:176-180).
   - Log-query tool runs any SQL (tickvault-logs-mcp/src/tools.rs:669-684): read-only statements only.
   - The benchmark gate does not block merges (bench.yml:56-59): make its regression fail the run.
   - Stale restart-limit comments (deploy/systemd/tickvault.service:120-121, :333).
+  - Re-check 6 (2026-09-27): the token-failure bullet is removed (PR39 took it over).
+    'CLAUDE.md facts' names the wrong values, for example 15 routes, not 12. Name the stale
+    log messages, alarm text and the memory gauge with no source (row 188). The quote endpoint's own
+    3-second client timeout still reads as 404 after the reply-status check (row 172, quote.rs:24,
+    :149-155). The board error-file endpoint answers 404 with a path on any read error (row 176,
+    debug.rs:345-376). A request flood fills the lossy log sink: bad-token warnings, other routes
+    and unknown paths still log per request (row 173, middleware.rs:519-546; lib.rs:284-299). A
+    read-only query can still tie up the database: set a server query time limit
+    (docker-compose.yml; sql_gate.rs:136-161). The boot log claims a deleted tick feed for the day
+    high/low tracker (main.rs:2577-2580). The in-memory tick store for the 2026-09-01 directive is
+    not wired (tick_ram_arena.rs:52-60): wire it or record the directive as withdrawn. Notes that
+    describe costs and limits the code lacks (response_cache.rs:102-110; public_guard.rs:1-12;
+    handlers/board.rs:61-65; constants.rs:40-41; spot_price_store.rs:240-251). Code nothing calls:
+    the two instrument modules with their scope guard, the disconnect builder and the code-3
+    constants (core/src/instrument/mod.rs:49-50;
+    storage/tests/daily_universe_scope_guard.rs:115-216), and the two spill readers with no
+    production caller (seal_spill.rs:991; seal_dlq.rs:330), deleted or marked test-only. The
+    cloud-log retention comment that says cold storage keeps older logs is false (logs expire after
+    14 days and nothing exports them): fix the comment; an export is the owner's cost call.
 - [ ] **D7 — every socket refused at once (805, second login).** (`core`) All sockets park together
   and D3 has no spare to move to (pool_supervisor.rs:738-748, :1786-1832). Owner asked
   2026-09-26; the recommended option is: wait 5 minutes, redial one socket as a test, bring the
   rest back only if Dhan accepts it, critical alert either way. Until the owner picks another option, that default is what gets built.
+  - Re-check 6 (2026-09-27): row 64, state that depth stays dark until a restart after an 805,
+    because every depth dial refuses once the stop switch is set, or get an owner decision on a
+    separate resume permit. The one-socket test dial must watch every socket for an 805 over a
+    window, since Dhan accepts a new socket and closes the oldest (pool_supervisor.rs:1818-1829;
+    dhan_feed_stack.rs:12102, :12865-12887).
 - [ ] **D8 — index ids from the instrument file replace the fixed four.** (`app`) When the master
   yields any index rows they REPLACE the four seeds (dhan_live_universe.rs:269-277). That swap is
   deliberate and evidence-backed (seed ids measured receiving zero packets, comment above it), so
@@ -477,6 +563,13 @@ PR25–PR27, PR18, PR19 and the decisions. One PR open at a time, as before.
   - Unknown keys are silently ignored, so a typo in `live_subscription_from_master` silently
     runs the four-index fallback (common/src/config.rs:21-110). `#[serde(deny_unknown_fields)]`
     on every config section, with a test per section. Touches `common`, so workspace tests.
+  - Re-check 6 (2026-09-27): row 179, production.toml has a fourth unread key, `max_position_lots`
+    (config/production.toml:25; config.rs:2713-2717; trading_pipeline.rs:133), which PR25 must
+    delete or the production boot fails; the gap list says PR25 must land after PR35 (the reason is
+    re-checked when PR25 is written). A missing production settings file is skipped silently
+    (main.rs:562-569): require the named environment's file. Three Dhan settings change nothing
+    (base.toml:175-176, :755): delete or wire `target_rps`, `instrument_csv_url` and the
+    compact-file fallback.
 - [ ] **PR26 — the token minter retries at most twice in total.** (`aws-lambdas`)
   - The AWS SDK adds platform retries (up to 6 attempts) under the §10.8 cap of two TOTP
     attempts. Set the SDK retry config so the whole mint is two attempts, pinned by a test.
@@ -484,6 +577,11 @@ PR25–PR27, PR18, PR19 and the decisions. One PR open at a time, as before.
   - The box still mints at boot while the Lambda also mints (§10.3), so a box running across
     06:05 IST can clash with the Lambda. Switch the box to READ `/dhan/access-token`, keeping a
     mint only as a loud, coded last resort if the parameter is missing or expired.
+  - Re-check 6 (2026-09-27): row 128, the 807-path re-read of the stored token needs a time limit
+    and must probe the token before adopting it, because the SDK client has no operation timeout and
+    the renewal lock is held (secret_manager.rs:117-124; token_manager.rs:1308). The shared token
+    can be overwritten by an older one (dhan_token_publisher.rs:66-74, :94-106): order the
+    publishes, or check expiry before overwriting, and add a time limit.
 - [ ] **D11 — Muhurat trading is captured.** (`common`, `aws-lambdas`) Sunday 2026-11-08 is never
   captured: the holiday gate and the weekday start window keep the box off
   (common/src/session_window.rs:164-181; start_watchdog.rs:127-135). Default: add a dated
@@ -534,12 +632,25 @@ Source: re-check 5 on main c0e4829 (comparison page version 6; the full list wit
 the code when each PR is written; a wrong row is corrected here, never dropped.
 
 Order of work: PR15 finishes first. Then, riskiest first: PR28 (SEBI data off one disk, console
-wipe; split 2026-09-27 into PR28a, the console, and PR28b, the locked cloud copy) → PR29 (log tool can change the live database; PR29b closes its base_url bypass) → PR30 (budget stop undone the same day) →
-PR31 (a restart can overwrite fuller candles; split 2026-09-27 into PR31a, PR31b and the PR31c follow-ups) → PR32 (tick rescue and spill ordering) → PR33
-(token and socket gaps) → PR34 (hung app never restarted) → PR35 (deploys) → PR36 (security) →
-PR37 (Dhan documentation mismatches) → PR38 (risk book across a restart) → PR39 (every error
-line coded, every loss counted and shipped), then the remaining order from the fourth re-check
-(PR16, PR17, PR23, PR24, PR5–PR14, PR25–PR27, PR18, PR19, decisions). One PR open at a time.
+wipe; split 2026-09-27 into PR28a, the console, and PR28b, the locked cloud copy) → PR29 (log
+tool can change the live database; PR29b closes its base_url bypass, merged as #1963) → PR36a
+(console key sent to the alerts topic) → PR36b (manual deploy without All Green) → PR40 (a crash
+loses queued seals) → PR41 (a replayed seal overwrites a newer candle) → PR31b (a restart can
+overwrite fuller candles; shares PR41's never-replace check, so it follows it) → PR42 (order and
+P&L audit rows dropped while the database is down) → PR43 (index option legs dropped from
+depth-20 past 246 spots) → PR44 (a depth socket parked without an 805 stays dark) → PR45 (the
+09:16 self-test never runs) → PR46 (box role and Docker socket) → PR47 (Telegram Critical page
+lost in a burst) → PR48 (console follow-ups) → PR49 (budget stop follow-ups) → PR50 (holiday
+gate) → PR31c (PR31a's honest limits) → PR32 (tick rescue and spill ordering) → PR33 (token and
+socket gaps) → PR34 (hung app never restarted) → PR35 (deploys) → PR36 (security) → PR37 (Dhan
+documentation mismatches) → PR38 (risk book across a restart) → PR39 (every error line coded,
+every loss counted and shipped) → PR51 (every cited guard exists; extends PR39's guards) → the
+PR4c follow-ups → PR52 (board sort; needs a Graviton measurement, so the box up), then the
+remaining order from the fourth re-check (PR16, PR17, PR23, PR24, PR5–PR14, PR25–PR27, PR18,
+PR19, decisions). PR30 (budget stop undone the same day) and PR31 (a restart can overwrite
+fuller candles) were split 2026-09-27: PR30a and PR31a are done, PR30b stays date-bound (on or
+after 2026-10-01) and takes the first slot free on that date, and PR31b and PR31c sit where
+shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at a time.
 
 - [x] **PR28a — the console cannot wipe kept data, and nothing destructive runs in the lock.**
   (`aws-lambdas`) Split out of PR28 on 2026-09-27: this half needs no cloud change and no cost.
@@ -570,6 +681,10 @@ line coded, every loss counted and shipped), then the remaining order from the f
   - Honest limits: the cloud copy goes to the unlocked cold bucket until PR28b; the size check
     is per object, not a per-file checksum (the CLI checksums each upload part); the on-box
     guard trusts the box clock.
+  - Re-check 6 (2026-09-27): found four holes, carried by PR48: a reset or nuke started 08:30-08:59
+    runs into the open; a reset that outlives the SSM execution time limit (3600 s by default) can
+    leave the app disabled; a failed count query still prints WIPE-COMPLETE; and there is no Muhurat
+    lock (that last one is D11's, per its fifth re-check fold).
 - [ ] **PR28b — never-delete data does not live on one disk, and nobody can delete the cloud
   copy.** (`storage`, deploy) Waits on the owner's typed choice of lock strength
   (compliance or governance, asked 2026-09-27) and on a measured size for the budget rule.
@@ -610,6 +725,10 @@ line coded, every loss counted and shipped), then the remaining order from the f
     `cargo check` and `validate-automation.sh`) belongs to D6 with the other shell scripts.
     `git log` and `docker compose ps` stay: fixed argument lists, external programs rather than
     scripts; the only caller input is `git log`'s line count, parsed as an integer first.
+  - Re-check 6 (2026-09-27): correction. The title did not hold at merge. `tickvault_api` reached
+    the database's /exec endpoint around the SQL gate (tools.rs:978-1021; config.rs:125-129), and
+    the prebuilt binary sessions ran predated the fix. Both are closed by PR29b (#1963); the title
+    is true only once #1963 merges.
 - [x] **PR29b — `tickvault_api` cannot reach the database around the SQL gate.**
   (`tickvault-logs-mcp`) Found by re-check 6 after PR29 merged: `tickvault_api` took
   `base_url` from the caller (tools.rs `tool_tickvault_api`, config.rs `endpoint_url`), so a
@@ -672,11 +791,17 @@ line coded, every loss counted and shipped), then the remaining order from the f
     where the kill-switch and the hourly guard stop it and latch. Latching at 90% would move
     the effective ceiling to $202.50 in September and $135 from October, which is the
     owner's call.
+  - Re-check 6 (2026-09-27): found three holes, carried by PR49: the shell latch readers fail open
+    with a clean-day message (terraform-apply.yml:386-395); the kill-switch stop leaves the 08:30
+    start rule on (budget_killswitch.rs:208-287; main.tf:646-655); a late budget notice latches the
+    wrong month (budget_killswitch.rs:208-270), which the six-hour back-dating above does not
+    settle, so the period is read from the notice itself.
 - [ ] **PR30b — the October $150 ceiling in terraform.** (deploy; on or after 2026-10-01)
   - The October $150 ceiling is enforced in code (`effective_budget_kill_usd`) but budget.tf and
     budget-guards.tf still say $225 (budget.tf:220-222; budget-guards.tf:278). Quote 23 keeps
     $225 for September, so the terraform change is a dated PR on or after 2026-10-01, in all four
     lockstep sites.
+  - Re-check 6 (2026-09-27): line correction, budget-guards.tf:278 is now :300.
 - PR31 — a restart can never replace a fuller candle with a partial one. (`storage`, `app`,
   `core`, `trading`) Split 2026-09-27 into PR31a (the three smaller items) and PR31b (the
   restart rebuild itself), so each lands and is reviewed on its own.
@@ -740,6 +865,8 @@ line coded, every loss counted and shipped), then the remaining order from the f
   - The shared receipt stamp can run slightly ahead of the wall clock and nudge the top-volume
     close clock (review finding #8, unmeasured). Measure it; clamp the close clock to the wall
     clock if it matters.
+  - Re-check 6 (2026-09-27): name the ticks from never-traded instruments that are keyed on arrival
+    time (row 144).
 - [ ] **PR32 — a tick batch is never marked applied before it is on disk.** (`storage`, `app`)
   - A rescue batch queued to the rescue thread but not yet written is skipped by the next
     replay if a later batch was already confirmed (tick_persistence.rs:2739-2757, :3354-3358;
@@ -755,6 +882,10 @@ line coded, every loss counted and shipped), then the remaining order from the f
     (dhan_feed_stack.rs:13228-13262; ws_frame_spill.rs:3027-3040): break the loop.
   - fsync of spill, dead-letter and marker files, and the database commit mode, go to PR17
     (tick_persistence.rs:1348; wal_applied_watermark.rs:819-856).
+  - Re-check 6 (2026-09-27): also, a write error inside the capture log (row 135,
+    ws_frame_spill.rs:1692-1699, :1813-1852): count it per frame and mark the frames already
+    deferred or marked for replay as lost; and the depth shed inline under apply lag is never marked
+    for replay (row 145, ingest_shed.rs:353-360).
 - [ ] **PR33 — token and socket gaps.** (`core`, `app`)
   - A token refused at the connect handshake (HTTP 401/403 on the upgrade) is never renewed
     (connection.rs:1806-1816; pool_supervisor.rs:1719, :1889): classify it as token-stale and
@@ -783,6 +914,14 @@ line coded, every loss counted and shipped), then the remaining order from the f
     :416-436): key on `(security_id, segment)` (I-P1-11).
   - The 808 policy (pool_supervisor.rs:743-748, :1831-1841) and the main-feed half of row 99
     (dhan_feed_stack.rs:11956-11979, :12865-12870) are D7's, see below.
+  - Re-check 6 (2026-09-27): also, the order-update socket's connect and login have no time limit
+    and no watchdog, and PR33's read deadline does not reach them (row 124,
+    order_update_connection.rs:669-672, :719-722, :746-758): bound both and cap the message size.
+    The scheduled token sweep is a third caller of the same renew function; define the generation a
+    timer-driven caller passes (row 215, dhan_rest_stack.rs:1109-1112). Name the order-update
+    same-token redial and its 4-hour renewal threshold (row 216, order_update_connection.rs:569).
+    Seed the late contract top-up into the silence detector and count seed-queue refusals
+    (dhan_feed_stack.rs:12008-12016).
 - [ ] **PR34 — a hung app is restarted and a stuck drain is visible.** (`app`, deploy, `scripts`,
   `aws-lambdas`)
   - The systemd watchdog ping does not follow drain or runtime progress, and boot steps are
@@ -797,6 +936,13 @@ line coded, every loss counted and shipped), then the remaining order from the f
     unit at its restart limit alone and page. Its database repair uses the wrong folder (:385).
   - A box down at 09:20 means no liveness paging all day (market_hours_gate.rs:77-87,
     :176-183): re-check on instance start.
+  - Re-check 6 (2026-09-27): once the autopilot's database repair works it must skip while a reset
+    holds its lock or the app is disabled (aws-autopilot.sh:389-402). Bound the pre-ready boot steps
+    too, including the Docker status call (infra.rs:1097-1110). Health reads the tick writer as
+    connected while nothing lands (dhan_feed_stack.rs:3289-3295; tick_persistence.rs:2408-2419):
+    report connected only on a landed batch and count hand-offs apart from good flushes. The
+    spill-status check reads zero during an outage (api/src/handlers/debug.rs:106, :160, :191;
+    tick_spill_replay.rs:101): count the .ilp spill files and file the candle spill under candles.
 - [ ] **PR35 — a deploy cannot break the morning or leak logs.** (`.github/workflows/`, deploy)
   - A deploy can restart the app just before 09:00 (deploy-aws.yml:754-765, :958-1011): refuse
     one that cannot finish with boot before 08:55.
@@ -808,7 +954,14 @@ line coded, every loss counted and shipped), then the remaining order from the f
   - All Green does not check terraform or the production aarch64-musl build (ci.yml:1121-1132;
     terraform-apply.yml:50-53): add both, and add them to `all-green`'s `needs:` in the same
     change (merge-gate lock §5).
-- [ ] **PR36a — the console key is never sent to the alerts topic.** (`.github/workflows/`)
+  - Re-check 6 (2026-09-27): adds the ops workflows: the disk-recovery workflow can wipe market data
+    during the session and leaves the app disabled on failure (emergency-fs-recover.yml:101-116,
+    :171-173), and the control workflow's database restart has an octal clock guard
+    (aws-control.yml:147-176, :381-388). One decimal 09:00-15:45 guard checked on the box covers
+    both, and every exit re-enables the app. A Lambda-only fix waits for the next weekday apply: add
+    the Lambda code to the terraform push filter (terraform-apply.yml:49-57). Docs-only merges
+    trigger a full deploy: path-check before dispatch (postmerge-catchup.yml:186-229).
+- [x] **PR36a — the console key is never sent to the alerts topic.** (`.github/workflows/`)
   Found by re-check 6, verified by reading terraform-apply.yml. Taken next after PR29b,
   ahead of PR31b, because it is a live secret leak. Every terraform apply publishes
   `LINK="${URL}#key=${KEY}"` (terraform-apply.yml:656) to `tv-prod-alerts`, which forwards
@@ -816,11 +969,196 @@ line coded, every loss counted and shipped), then the remaining order from the f
   only hides the Actions log. Publish the console URL only, never the key. Rotating the
   current key is the owner's call (past copies sit in Telegram and email history); asked in
   the fix thread on 2026-09-27, recommending rotation.
+  - Done: the portal alert carries the portal URL only; the key is never read back or sent
+    (terraform-apply.yml "Send the operator-portal link to Telegram"). A manual run with
+    rotate_console_key = "rotate" overwrites the stored key (--overwrite) and sends a "key replaced"
+    notice without the key; a failed overwrite fails the step loudly. Both console Lambdas cache the
+    key for 60 s, so an old key stops working within a minute. The owner chose "Rotate after fix" on
+    2026-09-27; the rotation itself runs only after the owner types "rotate" in the fix thread.
+    Security review fixes in the same PR: a key is stored only after it is checked to be 40
+    characters; a failed first-time save fails the step instead of announcing a live portal; a
+    first-time save that finds a key already stored (the read failed for another reason) keeps it,
+    and fails loudly if a rotation was asked for.
+  - Tests: github_workflow_guard r20_no_workflow_publishes_the_operator_key (no workflow builds a
+    #key= link or puts the key in a published message; the portal step never reads the stored key;
+    rotation needs the exact word, overwrites, and fails loudly; the key length, a failed
+    first-time save and a rotation that could not read the key are all loud; the input defaults to
+    off). The step script, extracted from the workflow, was run locally against a stubbed
+    aws/terraform/openssl in ten cases (new key, keep, rotate, wrong word, failed overwrite, failed
+    first save, read flake with and without rotate, openssl failure with and without rotate): only
+    a clean "rotate" overwrote, every failure exited 1 with nothing published, every stored key was
+    40 characters, and no published message carried the key.
+  - Accepted, not fixed: the key is passed to `aws ssm put-parameter --value` on the command line,
+    so it is visible in the process list of the single-use hosted runner for that call. Anyone with
+    write access can dispatch the rotation; whether the `prod` environment requires a reviewer is
+    not visible from the repository (Unknown).
 - [ ] **PR36b — a manual deploy needs All Green on the commit it ships.**
   (`.github/workflows/deploy-aws.yml`) Found by re-check 6: `workflow_dispatch` from any
   branch reaches the `deploy` job's `environment: prod` (deploy-aws.yml:403), so a manual run
   can ship a commit that never passed All Green. Refuse a dispatch whose ref is not `main`,
   or whose head has no successful All Green, before the build.
+  - Re-check 6 (2026-09-27): also restrict the deploy role's trust to the main branch
+    (deploy/aws/terraform/oidc.tf:72-80), so the job check is not the only barrier
+    (deploy-aws.yml:394-403).
+- [ ] **PR40 — a crash never loses queued candle seals uncounted, and PR15's loose ends
+  close.** (`storage`, `app`, deploy)
+  - A crash (abort, out of memory, hard kill) loses every queued seal uncounted: up to 250,000
+    in the escalation queue, 750,000 across writer channel, ring and escalation queue
+    (seal_writer_runner.rs:223, :671; main.rs:4695-4718). The ticks behind them survive. Persist
+    or count them: either a durable per-cadence seal watermark so the next boot re-folds every
+    window after it from the capture log (PR31b's warm-up, extended to sealed but unwritten
+    windows), or at minimum a shipped queue-depth gauge sampled every flush so a crash's loss is
+    bounded and visible. The PR states which, with a measurement.
+  - Correct the figure everywhere it is written: 250,000 per burst (25,000 × `TF_COUNT` 10), not
+    225,000.
+  - The archive and replaying folders are never pruned, and files moved into replaying are
+    outside the 7-day retention sweep (seal_spill.rs:1245-1256): prune by age and count them
+    against the disk budget.
+  - Ship the seal loss counters to CloudWatch: the replay skipped counter is pre-seeded but not in
+    the metric list (cloudwatch-agent.json:24); alarm AGGREGATOR-SEAL-01 on it.
+  - Boot recovery skips unreadable candle seals with a warning only
+    (seal_writer_task.rs:560-575, :732-737): coded error with an alarm.
+  - The inline fallback waits without a time limit on a stalled disk (row 27): correct the doc
+    (the bound is bytes, not time), then build a third durable tier or record an owner ruling
+    that the wait is accepted.
+  - PR15's tests do not prove batching, the pause or the real replay
+    (seal_writer_runner.rs:1811-1846; seal_writer_task.rs:2560-2598): assert write counts, test
+    replay under a no-op pause, and add an outage-and-recovery chaos test.
+- [ ] **PR41 — a replayed candle never replaces a fuller one, and one stuck spill file never
+  holds the rest.** (`storage`, `trading`)
+  - A replayed seal overwrites a newer corrected candle (a late trade re-folded a sealed bar),
+    uncounted (seal_writer_task.rs:903-917, :1127-1175; aggregator_cell.rs:261-268). PR31 states
+    the never-replace rule for restarts only, and PR31a did not change this path: the honest-limits
+    comment on the current checkout (95cf140, after #1962) still says "Last write wins"
+    (seal_writer_task.rs:986-989). Skip or version a replayed seal older than the stored row, and
+    count it, in both the mid-session replay and the boot drain. The check is shared with PR31b's
+    "never let it replace a row with more volume".
+  - A candle the replay cannot flush is skipped and later files wait
+    (seal_writer_task.rs:1209-1262): tell a flapping database from a bad record before skipping,
+    and move past a stuck file.
+  - Staged spill files replay in name order (seal_writer_task.rs:476, :1109): sort by write time.
+  - The replay trusts acknowledgements while the table is suspect (seal_writer_task.rs:1026-1040):
+    keep the file until the table is healthy.
+  - The replay gate opens only on live traffic, so a spill made after the last live write waits
+    for the next boot: reopen it on a database health check too.
+  - The candle spill has no record checksum (row 136, seal_spill.rs:832-841, :907-916): cut back a
+    torn single-record write the way the batch does, check alignment before a batch, add a
+    checksum.
+- [ ] **PR42 — order and P&L audit rows survive a database outage.** (`storage`, `app`, deploy)
+  - Order and P&L audit rows are thrown away while the database is down
+    (order_audit_persistence.rs:478-521; pnl_audit_persistence.rs:488;
+    order_leg_pnl_persistence.rs:403). These are SEBI rows. Give them a disk tier (the candle
+    spill shape: bounded NDJSON spill, replayed under their DEDUP keys) and ship and alarm the
+    P&L-audit and leg-P&L discard counters (cloudwatch-agent.json:24).
+  - The order-push event channel to the paper order audit writer holds 1,024 events; a reader
+    stalled for about 100 s of events (for example on a hung database write) skips them and they
+    never become audit rows, counted on the box only with an uncoded warning. Code the warning,
+    ship the lag counter, and reconcile on lag. (PR14 names the order-runtime channel and PR39 a
+    different line; neither covers this one.) Paper mode only; `dry_run` is not touched.
+- [ ] **PR43 — no NIFTY or BANKNIFTY depth-20 option leg is dropped silently.** (`app`)
+  - Past 246 spot instruments every index option leg leaves depth-20 while the settle log says
+    complete; shrinking starts at 215 spots, and today is about 208
+    (depth20_static.rs:108-119, :218-226; dhan_feed_stack.rs:12242-12255). This is close to the
+    owner's rule that no subscribed instrument is dropped. Count every dropped leg, make the
+    settle log say how many legs are missing, and raise a critical coded alarm when any are.
+  - Which side gives way at the 250-slot cap (spots or index legs), and whether the depth
+    account's five depth-20 sockets (D9) take the overflow once enabled, is an owner decision
+    asked before this PR is written. Until it is answered, placement does not change; this PR
+    ships the count, the alarm and the honest log.
+- [ ] **PR44 — a depth socket parked without an 805 comes back.** (`core`, `app`)
+  - A depth-20 or depth-200 socket parked for a reason other than 805 stays dark all day
+    (row 61, pool_supervisor.rs:2234-2291, :4779-4800; depth20_static.rs:137-155). D3 covers only
+    the main feed. Restore it on the normal backoff ladder, or re-home its instruments on spare
+    authorized depth capacity; a critical coded alarm names the socket and the count either way.
+    After an 805 the socket stays down under `ROTATION_HALTED`, as D7 records.
+- [ ] **PR45 — the 09:16 market-open self-test runs, or its claims go.** (`core`, `app`)
+  - The self-test never runs, although config turns it on (config/base.toml:603) and
+    instance_lock relies on it to silence lock renewal (market_open_self_test.rs:187;
+    instance_lock.rs:745-747). Wire it (the guarantee matrix names a 09:16:30 IST self-test), or
+    delete the setting, the lock-renewal silencing and the rule claims in the same PR. Wiring it
+    is the recommendation, because the rules and the lock already assume it.
+- [ ] **PR46 — the box cannot rewrite its own settings or drive Docker.** (deploy terraform,
+  `app`)
+  - The box role can write every /tickvault/prod/* parameter (main.tf:217-251): narrow write to
+    the token and lock parameters.
+  - The app can use the Docker socket (the gap list gives no line; located when the PR is
+    written): remove that access, or confine it to the one status call that needs it.
+  - The box role can overwrite any object in the cold bucket (no delete), with no undo until
+    PR28b's versioning: narrow its write to the prefixes it writes.
+  - The budget-action role may stop any instance (budget.tf:374-380): scope it to the box.
+  - Database ports and a default login fallback (docker-compose.yml:221-224; deploy-aws.yml:1006):
+    bind to the host and fail the deploy on a missing password.
+- [ ] **PR47 — an urgent Telegram page is never lost uncounted.** (`core`)
+  - A Critical page can be lost in a burst, uncounted, while the SMS copy still goes out
+    (core/src/notification/service.rs:462, :489-494, :2109-2131, :2316-2345): honour the
+    retry-after reply, count the final failure, and count SMS failures too.
+- [ ] **PR48 — console destructive actions finish before the open and never report a false
+  complete.** (`aws-lambdas`) The open holes of ticked PR28a.
+  - A reset or nuke started 08:30-08:59 runs into the open
+    (operator_control_action_commands.rs:21, :88, :172-181): refuse one that cannot finish before
+    08:55.
+  - A reset that outlives the SSM execution time limit (3600 s by default) leaves the app switched
+    off (operator_control.rs:1958-1966; operator_control_action_commands.rs:357-359): pass an
+    explicit execution time limit and enable the app before the image pull.
+  - The wipe can report complete without checking (operator_control_action_commands.rs:79;
+    operator_control.rs:3833-3843): a failed count query is a failure, every wiped table is
+    checked, and the shell runs in a test.
+  - The 263-line SEBI-save program is copied byte for byte into reset and nuke and never parsed
+    (operator_control_action_commands.rs:92-354, :387-649): one constant plus a syntax-check test.
+  - The reset trusts a byte count never checked on the box (operator_control_action_commands.rs:334-352):
+    run one reset on a scratch volume and record the result.
+  - The Muhurat lock is D11's (fifth re-check fold); this item does not duplicate it.
+- [ ] **PR49 — budget stop follow-ups: fail loud, stop the start rule, the right month.**
+  (`aws-lambdas`, `.github/workflows/`, `scripts`) The open holes of ticked PR30a.
+  - The shell latch readers fail open with a clean-day message (terraform-apply.yml:386-395; the
+    three workflow copies and the autopilot's fourth): a read failure prints a distinct coded line
+    and pages. Whether a failed read keeps failing open (PR30a's choice) is the owner's call.
+  - A kill-switch stop leaves the 08:30 start rule on (budget_killswitch.rs:208-287;
+    main.tf:646-655): the kill-switch disables the rule too.
+  - A late budget notice acts on the wrong month (budget_killswitch.rs:208-270): read the billing
+    period from the notice itself.
+  - The new-month release overrides a deliberate pause (hard_stop_guard.rs:643-690): release only
+    what the guard itself latched.
+  - False pages on budget-stopped and holiday mornings (alarm_gate.rs:64-121): the alarm gate and
+    the readiness check read the latch and the holiday marker.
+- [ ] **PR50 — the holiday gate actually holds the app back.** (deploy, `.github/workflows/`,
+  `common`)
+  - The holiday gate did not stop two weekend boots. The lead is that deploys never enable its
+    unit (deploy-aws.yml:992, :1009-1011; user-data.sh.tftpl:263): find why, and enable it on
+    every deploy.
+  - The gate does not hold the app back (tickvault-holiday-gate.service:28, :39): the app unit
+    requires the gate and treats exit 1 as failure.
+  - One next-year holiday silences the coverage page (trading_calendar.rs:271-277): count
+    holidays per year. Touches `common`, so workspace tests.
+  - Lands before D6 ports the gate script to Rust, so D6 ports a gate that is known to work.
+- [ ] **PR51 — every guard the rules cite exists and bites.** (`common` tests, `.claude/rules`,
+  `.claude/hooks`, `.config/nextest.toml`)
+  - Nothing checks the ID-plus-exchange rule where new code lives
+    (banned-pattern-scanner.sh:497-526): a general bare-key guard over all crates.
+  - Always-loaded rules cite checks that do not exist and a wrong seal-ring size
+    (per-wave-guarantee-matrix.md:64-66): fix the rule files and add a test that every cited
+    file exists.
+  - Frontend script budgets are not exact (browser_surface_and_toolchain_guard.rs:801-822, :889):
+    fail when a page is below budget too, so the budget ratchets down.
+  - CI retries every failed test once (.config/nextest.toml): turn retries off. Failing All Green
+    on a flaky result instead would change the All Green evaluator, which the merge-gate lock
+    §5.1 allows only with a dated owner quote, so retries-off is the default.
+  - Touches `common`, so workspace tests.
+- [ ] **PR52 — the board sort is whichever is faster on the production host.** (`app`)
+  Takes over the radix-sort bullet of the fifth re-check's PR4c follow-ups.
+  - Re-check 6 measured the PR4c-1 radix sort still slower than the comparator sort it replaced,
+    at every size, and by a wider margin than check 5 found: 1,385 vs 767 µs and 1,190 vs 820 µs
+    at 20,220 rows (check 5: 1,126 vs 976 µs), release build on the x86 dev container under
+    shared load (harness `radix_vs_comparator_at_every_measured_shape`).
+  - Re-measure both sorts on Graviton (the production r8g) and keep whichever is faster there. If
+    the radix sort is not faster, revert the sliced sort to `sort_unstable_by(board_order)`
+    (slicing works with either). Either way the proptest equivalence
+    (`board_radix_key_sorts_identically_to_board_order`,
+    `slice_radix_sort_step_matches_sort_unstable_by`, or the comparator's equivalent) and the
+    zero-alloc DHAT gate (`dhat_top_volume_sweep`) stay, and the CLAUDE.md complexity row for
+    `top_volume_sweep.rs` is corrected in the same PR with the measured figures and the host.
+  - Not dangerous (the drain waits for one step either way; the sliced sweep's worst step
+    measured about 121 µs), so it is ordered with the PR4c follow-ups.
 - [ ] **PR36 — security hardening.** (deploy, `core`, `app`, `aws-lambdas`)
   - SSH is open to 0.0.0.0/0 (terraform-apply.yml:123; main.tf:144-150): close 22 or pin a CIDR.
   - The scheduler role can pass any role (main.tf:624-633): scope PassRole to its own ARN.
@@ -832,6 +1170,14 @@ line coded, every loss counted and shipped), then the remaining order from the f
     minimum length at boot.
   - `config/local.toml` holds production's database address and is loaded in production
     (main.rs:562-569): production values move to `production.toml`.
+  - Re-check 6 (2026-09-27): the alert re-send of the console secret is PR36a, the any-branch deploy
+    trust is PR36b, and the box role wildcard and the budget-action role are PR46. The signed
+    requests here use the same console secret that PR36a stops publishing, so they build on whatever
+    secret the owner's rotation decision leaves. The token cache fix must also refuse an existing
+    file or link. `config/local.toml` is tracked although .gitignore excludes it (row 181,
+    .gitignore:43). The console page writes box output unescaped and keeps the secret in the browser
+    (operator_control_console.html:245, :249). The query console back end checks only the first
+    query value (qdb_console_proxy.rs:333-356).
 - [ ] **PR37 — Dhan documentation mismatches.** (`core`, `common`, `app`) Checked against the
   owner's 2026-09-27 upload (same files as 2026-09-26).
   - Quote byte 38 / Full byte 50: the PDF says "Day Close Value, only sent post market close";
@@ -851,6 +1197,15 @@ line coded, every loss counted and shipped), then the remaining order from the f
     without a live probe of the documented path on one socket; a recorded note only.
   - Codes 1 and 7 sizes are not documented (dispatcher.rs:168, :309, :314): assumed from the
     SDK and stated as such in the code.
+  - Re-check 6 (2026-09-27): the 'latch changed so a later value is counted' step is already done
+    (dhan_feed_stack.rs:3990-3999; dispatcher.rs:57-70); the missing piece is an alarm on the
+    disagreement counter plus a per-exchange previous-close (code 6) packet count, both before the
+    live measurement, since nothing answers 'does NSE_EQ get code 6' today (an offline scan of the
+    archived capture log could, but no tool does). The codes 1 and 7 bullet does more than a
+    comment: when the length stamp disagrees with the assumed size on an undocumented code, stop the
+    walk and count it, so no phantom packet is decoded (dhan_feed_stack.rs:8119-8142, :8407;
+    dispatcher.rs:309, :314); shares PR9's walker. Minor: the intraday `oi` parameter type is
+    unverified against a PDF; if refused, the daily check fails loudly (Assumed).
 - [ ] **PR38 — the risk book survives a restart.** (`trading`, `app`) A restart forgets
   positions, realised P&L and the halt latch, so an automatic halt is lifted
   (risk/engine.rs:208-228, :717-733): rebuild them at boot from the order audit, or persist
@@ -875,6 +1230,20 @@ line coded, every loss counted and shipped), then the remaining order from the f
     and siblings): `retry_timeout=0`, `request_timeout=5000`, socket-audit flush off the shared pool.
   - The critical token page understates its impact (events.rs:1680-1712, :3870;
     mid_session_watchdog.rs:254, :372): reword it and its pinning test.
+  - Re-check 6 (2026-09-27): corrections. 'row 146' points at a different finding; the two read_all
+    sites (seal_spill/seal_dlq) are dead code (PR19); state a severity for each newly coded line;
+    the guard must blank field-level test attributes and string contents before scanning;
+    SPILL-RETENTION-01 lines are now seal_spill.rs:1318-1329. Adds: a coded warning cannot page
+    through the log alarms (error-code-alarms.tf:221), so make each loss an error or give it a
+    counter alarm; extend the literal-code guard to every crate
+    (lambda_error_code_literal_guard.rs:87); prune or wire the 28 error codes never raised
+    (error_code.rs); code the board and drain loss warnings (row 103,
+    volume_leaderboard.rs:1514-1526; dhan_feed_stack.rs:2016-2030), the two candle warning sites
+    (seal_writer_task.rs:849, :1289) and the skipped-window level (dhan_feed_stack.rs:2016); ship
+    the three board loss counters in the metric list (cloudwatch-agent.json:24); the cross-check
+    says recorded after its marker write failed (daily_task_marker.rs:60-76), so return the error
+    and log it coded; every loss counter is pre-seeded at zero, because a series first created at a
+    loss is dropped as baseline.
 - [ ] **Folded into existing PRs (fifth re-check):**
   - PR16: the error summary rebuilt from 48 h of logs every minute
     (summary_writer.rs:128-172, :397-409) and the depth-seed write (depth_seed.rs:283-306).
@@ -913,6 +1282,17 @@ line coded, every loss counted and shipped), then the remaining order from the f
     empty candle columns are kept or documented (dhan_feed_stack.rs:2318-2346); the contract
     attach seeds ~20,000 instruments in one go, sliced on the idle arm (:7252-7280). Shipped as
     one PR after PR39.
+    - Re-check 6 (2026-09-27): also, a mid-session stop loses queued board jobs
+      (dhan_feed_stack.rs:7892-7960), so finish or count them at shutdown; the volume that arrives
+      after a feed gap also stays wrong and uncounted in the candle itself, not only on the board
+      (row 168, aggregator_cell.rs:1405-1414), so count it in the candle and name it there; name the
+      misleading late-sweep warning (row 99) and the boot-window partial ranking (row 100). The
+      radix-sort bullet of this fold is taken over by PR52. Measured by re-check 6 (release, x86 dev
+      box under shared load): a full board `rank` at 20,220 contracts is 4.43 ms (check 5: 4.14 ms;
+      the CLAUDE.md row still says 2.95 ms); the sliced sweep's mean step is 4.7 to 5.1 µs and its
+      worst step about 121 µs (check 5: 7 to 12 µs, worst 0.17 to 4.2 ms), so the check-5
+      multi-millisecond worst steps did not recur; the gainer filter is 226 µs and
+      `select_depth_universe` 3.37 ms. Correct the CLAUDE.md figures in the same PR.
   - PR12: marked frames wait for a restart when the live drain queue is full
     (dhan_feed_stack.rs:5444); mid-session catch-up covers them.
   - PR19: the quote handler checks the reply status (quote.rs:149-155, :184-192); request logging

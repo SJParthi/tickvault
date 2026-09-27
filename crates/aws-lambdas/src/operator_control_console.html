@@ -551,9 +551,9 @@ function startAuto(){ stopAuto(); if($('auto').checked) timer=setInterval(()=>{ 
 function stopAuto(){ if(timer){ clearInterval(timer); timer=null; } }
 function autotoggle(){ $('auto').checked?startAuto():stopAuto(); }
 
-// Ready-made link support: a URL ending in #key=<secret> (or ?key=) auto-saves
-// the device key, strips it from the address bar, and unlocks — so the Telegram
-// link "just works" with zero typing. The fragment never reaches the server.
+// A URL ending in #key=<secret> (or ?key=) saves the device key, strips it from the
+// address bar and unlocks. No alert sends such a link since 2026-09-27 (audit PR36a:
+// the key reached email and SMS history); the paste form above is the normal path.
 (function(){ var k=(location.hash.match(/key=([^&]+)/)||[])[1] || new URLSearchParams(location.search).get('key');
   if(k){ try{ k=decodeURIComponent(k); }catch(e){} TOKEN=k; localStorage.setItem('tv_token',TOKEN);
     try{ history.replaceState(null,'',location.pathname); }catch(e){} } })();
