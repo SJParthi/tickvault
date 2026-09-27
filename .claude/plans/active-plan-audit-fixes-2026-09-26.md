@@ -1021,8 +1021,45 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     against a stubbed gh in 12 cases (feature branch, tag, own All Green, via merged PR, PR head
     red, All Green from another app, no PR, open PR, PR merged as another commit, and three API
     failures): only the two genuine passes exited 0. The environment report was run in 3 cases.
-- [ ] **PR40 — a crash never loses queued candle seals uncounted, and PR15's loose ends
-  close.** (`storage`, `app`, deploy)
+- PR40 — a crash never loses queued candle seals uncounted, and PR15's loose ends close.
+  (`storage`, `app`, deploy) Split 2026-09-27 into PR40a (count a crash's loss, correct the
+  figure), PR40b (prune the spill folders, alarm the unrecovered seals) and PR40c (the tests
+  and the inline-fallback decision), so each lands and is reviewed on its own.
+- [x] **PR40a — a crash's unwritten candle seals are counted and reported, and the 250,000
+  figure is right.** (`storage`, `app`, deploy)
+  - Done: counting, not a durable per-window watermark, because the re-fold that would consume a
+    watermark is PR31b's warm-up, which does not exist yet; the watermark rides PR31b.
+    `SealWriterRunner::unwritten_seals` (writer channel + ring + escalation queue, O(1)) is set
+    on the gauge `tv_seal_unwritten` every writer cycle (100 ms), so the value before a crash is
+    in the metrics log group. The same count is written to `seal-unwritten.mark` in the spill
+    directory at most once a second when it changes (write then rename); a clean shutdown
+    rewrites it `clean=1` after the final drain. The next boot reads it before anything else and,
+    when it is unclean and holds seals, fires AGGREGATOR-DROP-01 with `source =
+    "crash_unwritten"` (existing errcode page, description extended; no new alarm) and adds the
+    number to `tv_seal_crash_unwritten_total`.
+  - Honest limits: the count is up to one second plus one cycle stale, and the seals the cycle
+    in progress popped into the ILP buffer (at most `max_drain_per_cycle`) are in neither sample;
+    the marker is not fsynced, so it survives a process crash, not a host crash; the seals are
+    reported, not recovered.
+  - Figure corrected where it states the current value: 250,000 per burst (25,000 × `TF_COUNT`
+    10) in seal_writer_runner.rs, main.rs, the shutdown-budget guard, guarantees.md and a dated
+    note in aws-budget.md (the ring is 42.0 MB, the escalation queue ~36 MB, up to 750,000 seals
+    across the three queues). Dated history that said 225,000 at nine frames is left as written.
+  - Tests: `unwritten_seals_counts_channel_ring_and_escalation_queue`,
+    `unwritten_mark_writes_only_on_change_and_at_most_once_a_second`,
+    `test_unwritten_seal_record_to_line_round_trips_and_parse_refuses_anything_else`,
+    `test_unwritten_mark_in_dir_read_previous_reports_an_unreadable_file_as_unreadable`,
+    `unwritten_mark_write_failure_is_counted_not_fatal`,
+    `test_report_previous_unwritten_only_for_an_unclean_marker_holding_seals`,
+    `a_clean_shutdown_rewrites_the_marker_and_the_next_boot_reports_nothing`,
+    `the_loop_reads_the_previous_marker_before_it_writes_its_own`,
+    `unwritten_mark_file_is_outside_every_spill_and_dlq_filter`.
+- [ ] **PR40b — old spill folders are pruned and an unrecovered seal pages.** (`storage`,
+  deploy) The archive/replaying pruning, the replay-skipped and boot-undecodable seals as a
+  coded error with an alarm (rule file first: a new page needs a dated noise-lock section).
+- [ ] **PR40c — PR15's tests prove batching, the pause and the real replay, and the inline
+  fallback has a decision.** (`storage`) The last two bullets below.
+- Original PR40 text, kept as the source for 40a–40c:
   - A crash (abort, out of memory, hard kill) loses every queued seal uncounted: up to 250,000
     in the escalation queue, 750,000 across writer channel, ring and escalation queue
     (seal_writer_runner.rs:223, :671; main.rs:4695-4718). The ticks behind them survive. Persist

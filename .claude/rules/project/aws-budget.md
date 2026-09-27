@@ -1364,6 +1364,16 @@ Every actual above is MEASURED with `size_of` on 2026-09-19, not estimated:
 `LiveCandleState` 152 · `AggregatorCell` 2,920 · `BufferedSeal` 168 ·
 `TF_COUNT` 9 · `AGGREGATOR_MAX_SLOTS` 25,000 · `SEAL_BUFFER_CAPACITY` 225,000.
 
+> **⚠ 2026-09-27 (audit PR40a) — these are the 2026-09-19 figures, and one
+> input has moved since.** `M10` became a native frame on 2026-09-22, so
+> `TF_COUNT` is **10** and `SEAL_BUFFER_CAPACITY` is **250,000**: the ring at
+> 168 B is **42.0 MB**, not 37.8 MB. The same capacity sizes the writer
+> channel (lazy, up to ~42 MB) and the escalation queue (committed up front,
+> ~36 MB), so up to **750,000** sealed candles can sit in memory at once
+> across the three, and a crash loses whatever they hold. Audit PR40a counts
+> that loss (`tv_seal_unwritten`, and a marker the next boot reports); it
+> does not change any of these sizes.
+
 **The figures are RE-DERIVED from those constants, never scaled from the row
 above.** The 2026-09-11 note's fleet numbers (~164 MB → ~175 MB) were correct
 when written at `TF_COUNT = 24` and are now arithmetically stale — the
