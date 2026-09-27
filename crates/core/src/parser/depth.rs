@@ -643,6 +643,58 @@ pub fn split_depth_frame(raw: &[u8], kind: DepthFeedKind) -> DepthFrameIter<'_> 
     }
 }
 
+/// The reason code of a disconnect packet STACKED inside a depth frame, or
+/// `None` when the frame carries none or does not walk cleanly end to end.
+///
+/// The depth sibling of
+/// [`crate::parser::dispatcher::stacked_disconnect_reason`]. A depth frame can
+/// carry `[book packets…][disconnect]`, and until audit PR21 (2026-09-27) the
+/// connection task read only a LONE 14-byte disconnect: a stacked one became
+/// data, the drain counted it and threw its reason away, and the socket later
+/// closed with no code. An 805 there therefore read as a routine drop — the
+/// socket redialled (one more connection into an account Dhan had just called
+/// full) and the process-wide 805 breaker was never set.
+///
+/// The whole frame must walk to [`DepthSplitStop::Complete`] before a
+/// disconnect inside it counts, for the reason the main-feed walker states: a
+/// code read out of a mis-framed tail would park a healthy socket on a reason
+/// we invented. The FIRST disconnect wins.
+///
+/// # Performance
+/// O(packets), bounded by `max_packets`; zero allocation.
+#[must_use]
+pub fn stacked_depth_disconnect_reason(
+    frame: &[u8],
+    kind: DepthFeedKind,
+    max_packets: u32,
+) -> Option<u16> {
+    let mut iter = split_depth_frame(frame, kind);
+    let mut found: Option<u16> = None;
+    let mut packets = 0u32;
+    for packet in iter.by_ref() {
+        packets = packets.saturating_add(1);
+        if packets > max_packets {
+            return None;
+        }
+        if found.is_none()
+            && packet.get(DEEP_DEPTH_HEADER_OFFSET_FEED_CODE).copied()
+                == Some(RESPONSE_CODE_DISCONNECT)
+        {
+            let end = DEPTH_DISCONNECT_OFFSET_REASON.checked_add(2)?;
+            let raw: [u8; 2] = packet
+                .get(DEPTH_DISCONNECT_OFFSET_REASON..end)?
+                .try_into()
+                .ok()?;
+            found = Some(u16::from_le_bytes(raw));
+        }
+    }
+    if iter.stop_reason() == Some(DepthSplitStop::Complete) {
+        found
+    } else {
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1332,6 +1384,105 @@ mod tests {
         assert_eq!(packets.len(), 2);
         assert_eq!(packets[1].len(), DEPTH_DISCONNECT_PACKET_SIZE);
         assert_eq!(iter.stop_reason(), Some(DepthSplitStop::Complete));
+    }
+
+    #[test]
+    fn test_stacked_depth_disconnect_reason_reads_805_behind_book_packets() {
+        let mut frame = build_twenty(DEEP_DEPTH_FEED_CODE_BID, 1, 1333, 1);
+        frame.extend_from_slice(&build_twenty(DEEP_DEPTH_FEED_CODE_ASK, 1, 1333, 2));
+        frame.extend_from_slice(&build_depth_disconnect(805));
+        assert_eq!(
+            stacked_depth_disconnect_reason(&frame, DepthFeedKind::Twenty, 64),
+            Some(805)
+        );
+    }
+
+    #[test]
+    fn test_stacked_depth_disconnect_reason_none_for_pure_book_frame() {
+        let mut frame = build_twenty(DEEP_DEPTH_FEED_CODE_BID, 1, 1333, 1);
+        frame.extend_from_slice(&build_twenty(DEEP_DEPTH_FEED_CODE_ASK, 1, 1333, 2));
+        assert_eq!(
+            stacked_depth_disconnect_reason(&frame, DepthFeedKind::Twenty, 64),
+            None
+        );
+    }
+
+    #[test]
+    fn test_stacked_depth_disconnect_reason_refuses_a_frame_that_does_not_walk() {
+        // A disconnect followed by a truncated tail: the frame is mis-framed,
+        // so the code inside it is not trusted.
+        let mut frame = build_twenty(DEEP_DEPTH_FEED_CODE_BID, 1, 1333, 1);
+        frame.extend_from_slice(&build_depth_disconnect(805));
+        frame.extend_from_slice(&[0u8; 5]);
+        assert_eq!(
+            stacked_depth_disconnect_reason(&frame, DepthFeedKind::Twenty, 64),
+            None
+        );
+    }
+
+    #[test]
+    fn test_stacked_depth_disconnect_reason_first_disconnect_wins() {
+        let mut frame = build_depth_disconnect(805);
+        frame.extend_from_slice(&build_depth_disconnect(807));
+        assert_eq!(
+            stacked_depth_disconnect_reason(&frame, DepthFeedKind::Twenty, 64),
+            Some(805)
+        );
+    }
+
+    #[test]
+    fn test_stacked_depth_disconnect_reason_packet_cap_refuses() {
+        let mut frame = build_twenty(DEEP_DEPTH_FEED_CODE_BID, 1, 1333, 1);
+        frame.extend_from_slice(&build_twenty(DEEP_DEPTH_FEED_CODE_ASK, 1, 1333, 2));
+        frame.extend_from_slice(&build_depth_disconnect(805));
+        assert_eq!(
+            stacked_depth_disconnect_reason(&frame, DepthFeedKind::Twenty, 2),
+            None,
+            "more packets than the cap allows is refused, never partially trusted"
+        );
+    }
+
+    #[test]
+    fn test_stacked_depth_disconnect_reason_reads_805_behind_depth200_books() {
+        // Depth-200 packets carry a row count in the header; the walk must
+        // size each one from it and still find the control packet behind.
+        let mut frame = build_two_hundred(DEEP_DEPTH_FEED_CODE_BID, 2, 52_175, 3);
+        frame.extend_from_slice(&build_two_hundred(DEEP_DEPTH_FEED_CODE_ASK, 2, 52_175, 0));
+        frame.extend_from_slice(&build_depth_disconnect(805));
+        assert_eq!(
+            stacked_depth_disconnect_reason(&frame, DepthFeedKind::TwoHundred, 64),
+            Some(805)
+        );
+    }
+
+    #[test]
+    fn test_stacked_depth_disconnect_reason_reads_a_disconnect_ahead_of_book_packets() {
+        // The control packet FIRST, market data after it: still a disconnect,
+        // and the frame still walks to its end.
+        let mut frame = build_depth_disconnect(807);
+        frame.extend_from_slice(&build_twenty(DEEP_DEPTH_FEED_CODE_BID, 1, 1333, 1));
+        assert_eq!(
+            stacked_depth_disconnect_reason(&frame, DepthFeedKind::Twenty, 64),
+            Some(807)
+        );
+    }
+
+    #[test]
+    fn test_stacked_depth_disconnect_reason_empty_frame_is_none() {
+        assert_eq!(
+            stacked_depth_disconnect_reason(&[], DepthFeedKind::TwoHundred, 64),
+            None
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn prop_stacked_depth_disconnect_reason_never_panics(
+            bytes in proptest::collection::vec(any::<u8>(), 0..2048)
+        ) {
+            let _ = stacked_depth_disconnect_reason(&bytes, DepthFeedKind::Twenty, 64);
+            let _ = stacked_depth_disconnect_reason(&bytes, DepthFeedKind::TwoHundred, 64);
+        }
     }
 
     #[test]

@@ -7040,7 +7040,16 @@ async fn run_frame_drain(
                                 // the `error!` fires at most once per cooldown
                                 // per socket -- inherently throttled, no
                                 // power-of-two ladder needed.
-                                if outcome.ghost > 0 {
+                                //
+                                // After an 805 no ghost redial is ASKED for
+                                // (audit PR21): the connection task would
+                                // refuse it anyway, and asking first spent the
+                                // per-socket ceiling and logged a redial that
+                                // never happened. The ghost itself is still
+                                // counted above; one relaxed load, no store.
+                                if outcome.ghost > 0
+                                    && !tickvault_core::websocket::pool_supervisor::rotation_halted()
+                                {
                                     use tickvault_core::websocket::pool_supervisor::{
                                         GHOST_REDIAL_SESSION_CEILING, GhostRedialRefusal,
                                         ghost_ceiling_first_hit, ghost_redials_taken,
@@ -11007,6 +11016,9 @@ fn report_dial_shortfall(half: &'static str, planned: usize, dialed: usize, atte
         return;
     }
     let missing = planned.saturating_sub(dialed);
+    // The spawn gate refuses a depth socket after an 805 (audit PR21), so a
+    // shortfall can also be the breaker, not a missing supervisor.
+    let halted_by_805 = tickvault_core::websocket::pool_supervisor::rotation_halted();
     error!(
         code = ErrorCode::WsGapConnectionState.code_str(),
         half,
@@ -11014,9 +11026,12 @@ fn report_dial_shortfall(half: &'static str, planned: usize, dialed: usize, atte
         dialed,
         missing,
         attempts,
+        halted_by_805,
         "the dial spawned FEWER connections than were planned — {missing} planned socket(s) \
          carry no data this session and their pool slots are already spent, so they cannot be \
-         re-planned. Look for a planned connection whose supervisor was not registered."
+         re-planned. If `halted_by_805` is true, Dhan closed a socket with 805 (too many \
+         connections) and the depth sockets were refused on purpose; otherwise look for a \
+         planned connection whose supervisor was not registered."
     );
     metrics::counter!(
         DIAL_INCOMPLETE_COUNTER,
@@ -11313,6 +11328,9 @@ async fn attach_depth_when_available(
     //   sockets accounted for. This is the terminal gate: the success return
     //   and `spawn_depth_rebalance` wait for it.
     let mut depth_20_dialed = false;
+    // Edge latch for the 805-breaker refusal below: one error per process,
+    // the counter carries every refused attempt.
+    let mut depth_halted_by_805 = false;
     let mut depth_200_on_wire: std::collections::HashSet<(u64, u8)> =
         std::collections::HashSet::new();
     let mut depth_ready = false;
@@ -12061,6 +12079,37 @@ async fn attach_depth_when_available(
                         "depth: nothing new to add this attempt — waiting for the outstanding \
                          socket(s) to resolve"
                     );
+                } else if tickvault_core::websocket::pool_supervisor::rotation_halted() {
+                    // The 805 breaker (audit PR21, 2026-09-27). Dhan has closed
+                    // a socket with 805 (too many connections) in this process,
+                    // and Dhan answers each extra connection by closing the
+                    // OLDEST healthy one. Opening the planned depth sockets now
+                    // would trade a live socket for a new one, over and over.
+                    // Planning is skipped BEFORE `build_feed_stack_plan`, so no
+                    // slot is spent; the sockets already on the wire keep what
+                    // they hold, and adding legs to them (above) continues.
+                    metrics::counter!(
+                        tickvault_core::websocket::pool_supervisor::DIAL_REFUSED_AFTER_805_METRIC,
+                        "path" => "attach"
+                    )
+                    .increment(1);
+                    if !depth_halted_by_805 {
+                        depth_halted_by_805 = true;
+                        error!(
+                            code = ErrorCode::WsGapDisconnectClassification.code_str(),
+                            source = "dial_refused_after_805",
+                            attempts,
+                            depth_20_planned = depth_20_plan.len(),
+                            depth_200_planned = depth_200_plan.len(),
+                            depth_200_on_wire = depth_200_on_wire.len(),
+                            "depth attach: NOT opening the planned depth socket(s) — Dhan closed \
+                             a socket with 805 (too many connections) earlier in this process, \
+                             and each extra connection makes Dhan close a healthy one. The \
+                             depth sockets already on the wire keep their instruments; the \
+                             rest of today's depth is not captured. Check for a second process \
+                             or login holding Dhan sockets on this account, then restart."
+                        );
+                    }
                 } else {
                     match build_feed_stack_plan(
                         &mut pool,
@@ -12092,6 +12141,15 @@ async fn attach_depth_when_available(
                                 },
                             );
                             report_dial_shortfall(DIAL_HALF_DEPTH, planned, dialed, attempts);
+                            // An 805 that landed between the breaker check
+                            // above and the spawn: the spawn gate refused the
+                            // sockets, so the give-up bound must treat this
+                            // half as halted too (audit PR21).
+                            if dialed < planned
+                                && tickvault_core::websocket::pool_supervisor::rotation_halted()
+                            {
+                                depth_halted_by_805 = true;
+                            }
                             // Recorded on the PLAN, not on the dial: the
                             // connection slot is spent either way, so an
                             // instrument whose spawn was skipped must never be
@@ -12310,7 +12368,12 @@ async fn attach_depth_when_available(
         // sockets carry nothing, and letting the rebalance take the ones that
         // do. Never silently — a socket that was authorized and never dialed
         // is the false-OK this whole file exists to stop.
-        if depth_ready && !depth_done && out_of_time {
+        //
+        // An 805 ends the chase too (audit PR21): the planned sockets can never
+        // be opened this process, so without this a depth half that was not
+        // yet ready when the 805 landed would poll selection until 15:30 and
+        // never hand its channels to the rebalance.
+        if (depth_ready || depth_halted_by_805) && !depth_done && out_of_time {
             let authorized = crate::dhan_depth_universe::DEPTH_200_TOTAL_SOCKETS;
             let on_wire = depth_200_on_wire.len();
             error!(
@@ -12320,13 +12383,16 @@ async fn attach_depth_when_available(
                 depth_200_authorized = authorized,
                 depth_20_dialed,
                 depth_20_index_added,
+                halted_by_805 = depth_halted_by_805,
                 ist_second_of_day = now_ist,
                 "depth attach is giving up on the outstanding depth-200 socket(s): {} of {} \
                  authorized 200-level sockets reached the wire and the rest carry NO data for \
-                 the remainder of this session. Every depth-200 socket carries a stock-option \
-                 mover and needs traded prices — on a flat morning some can legitimately \
-                 never resolve. Proceeding so the per-minute ranked rebalance can start on \
-                 the sockets that DID dial.",
+                 the remainder of this session. If `halted_by_805` is true, Dhan closed a socket \
+                 with 805 (too many connections) and no new depth socket may be opened this \
+                 process. Otherwise every depth-200 socket carries a stock-option mover and \
+                 needs traded prices, and on a flat morning some can legitimately never \
+                 resolve. Proceeding so the per-minute ranked rebalance can start on the \
+                 sockets that DID dial.",
                 on_wire,
                 authorized
             );
@@ -12773,6 +12839,31 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
             );
             continue;
         };
+        // Last line of defence for the 805 breaker (audit PR21): this is the
+        // ONLY production spawn of a feed socket, so a depth socket refused
+        // here is refused on every path, including any future caller that
+        // forgets the check. The attach checks first so no slot is planned.
+        if matches!(
+            endpoint,
+            DhanEndpointType::Depth20 | DhanEndpointType::Depth200
+        ) && tickvault_core::websocket::pool_supervisor::rotation_halted()
+        {
+            metrics::counter!(
+                tickvault_core::websocket::pool_supervisor::DIAL_REFUSED_AFTER_805_METRIC,
+                "path" => "spawn"
+            )
+            .increment(1);
+            error!(
+                code = ErrorCode::WsGapDisconnectClassification.code_str(),
+                source = "dial_refused_after_805",
+                endpoint = endpoint.as_str(),
+                pool_index = planned.slot.pool_index,
+                "refusing to open a depth socket: Dhan closed a socket with 805 (too many \
+                 connections) earlier in this process, and each extra connection makes Dhan \
+                 close a healthy one."
+            );
+            continue;
+        }
         let Some(supervisor) = pool.connection_mut(planned.slot.global_index).map(|s| {
             // Take the supervisor's state by value: `run_connection` drives one
             // connection for its whole life and must own its policy object.
@@ -21601,6 +21692,97 @@ mod tests {
         );
     }
 
+    /// Audit PR21 (2026-09-27): after an 805, nothing opens another depth
+    /// socket. Before this, only the rotation arm read the breaker; the
+    /// morning attach kept planning and spawning depth sockets, and each one
+    /// made Dhan close a healthy sibling.
+    #[test]
+    fn every_depth_dial_site_checks_the_805_breaker() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+
+        // 1. The attach reads the breaker BEFORE it plans (so no slot is spent).
+        let depth_arm = production
+            .split_once("// ---- half 2: DEPTH ----")
+            .expect("the depth dial arm must exist")
+            .1;
+        let breaker = depth_arm
+            .find("pool_supervisor::rotation_halted()")
+            .expect("the depth attach must read the 805 breaker");
+        let plan = depth_arm
+            .find("build_feed_stack_plan(")
+            .expect("the depth attach must plan with build_feed_stack_plan");
+        assert!(
+            breaker < plan,
+            "the depth attach must check the 805 breaker BEFORE planning, or a refused \
+             attempt still spends a connection slot"
+        );
+
+        // 2. The only spawn refuses depth sockets while the breaker is set.
+        let dial = production
+            .split_once("fn dial_planned_connections(")
+            .expect("dial_planned_connections must exist")
+            .1;
+        let dial = dial.split_once("\nfn ").map_or(dial, |(body, _)| body);
+        let gate = dial
+            .find("pool_supervisor::rotation_halted()")
+            .expect("dial_planned_connections must refuse depth sockets after an 805");
+        let spawn = dial
+            .find("tokio::spawn(")
+            .expect("dial_planned_connections spawns the connection task");
+        assert!(gate < spawn, "the 805 check must come before the spawn");
+        assert!(
+            dial[..gate].contains("DhanEndpointType::Depth20 | DhanEndpointType::Depth200"),
+            "the spawn gate must be limited to the depth endpoints: the main feed carries \
+             the ticks and is not a rotation"
+        );
+
+        // 3. dial_planned_connections stays the ONLY production spawn, so the
+        //    gate above covers every path that opens a feed socket.
+        assert_eq!(
+            production.matches("run_connection_with_commands(").count(),
+            1,
+            "a second production call to run_connection_with_commands opens sockets that \
+             bypass the 805 gate in dial_planned_connections; route it through that function"
+        );
+
+        // 4. The drain asks for no ghost redial after an 805: asking first
+        //    spent the per-socket ceiling and logged a redial that the
+        //    connection task then refused.
+        let ghost = production
+            .find("request_ghost_redial(\n")
+            .expect("the drain must still request ghost redials");
+        let guard = production[..ghost]
+            .rfind("if outcome.ghost > 0")
+            .expect("the ghost request sits under its own guard");
+        assert!(
+            production[guard..ghost]
+                .contains("!tickvault_core::websocket::pool_supervisor::rotation_halted()"),
+            "the ghost request must check the 805 breaker before arming the register"
+        );
+    }
+
+    /// Arm B of the unsubscribe probe is refused BEFORE its drop after an 805
+    /// (audit PR21): the connection task would refuse the close, and a drop
+    /// with no close reads as "the vendor ignored it".
+    #[test]
+    fn probe_arm_b_checks_the_805_breaker_before_dropping() {
+        let src = include_str!("depth_unsubscribe_probe.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+        let drop_at = production
+            .find("ProbeArm::SocketClose => act_drop(")
+            .expect("Arm B's drop must exist");
+        let gate = production[..drop_at]
+            .rfind("arm == ProbeArm::SocketClose")
+            .expect("Arm B must be gated before its drop");
+        assert!(
+            production[gate..drop_at].contains("rotation_halted()"),
+            "the Arm B gate must read the 805 breaker"
+        );
+    }
+
     /// The latch itself. `depth_done` must be COMPUTED, never asserted.
     #[test]
     fn depth_done_is_never_latched_on_a_successful_plan() {
@@ -21647,7 +21829,9 @@ mod tests {
              depth_done (the complete set)"
         );
         assert!(
-            production.contains("if depth_ready && !depth_done && out_of_time {"),
+            production.contains(
+                "if (depth_ready || depth_halted_by_805) && !depth_done && out_of_time {"
+            ),
             "an outstanding depth socket must be given up at the SAME deadline the other \
              give-up arms use — otherwise the terminal return never fires and \
              spawn_depth_rebalance never starts"
