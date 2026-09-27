@@ -125,6 +125,37 @@ does it at boot.
 
 **Source:** `crates/storage/src/seal_writer_loop.rs::report_previous_unwritten`.
 
+### 2026-09-27 Update (audit PR40b) — seals a recovery path gave up on, and aged spill files
+
+Two more sources now page through the same errcode alarm (no new alarm):
+
+- `source = "seal_unrecovered"`, field `stage` = `boot_drain` or `replay`,
+  field `seals_unrecovered`. The boot drain could not decode a record (most
+  often a file from an older build) or the writer refused a seal, or the
+  mid-session replay skipped a seal the database refused in every attempt.
+  Nothing retries them. One line per boot drain or replay step, never per
+  seal. Counters: `tv_seal_writer_drain_total{kind="boot_undecodable" |
+  "boot_append_failed"}` and `tv_seal_replay_total{kind="skipped"}`.
+- `source = "spill_retention"`, fields `files` and `records_lost`. The retention
+  sweep deleted spill files older than `SPILL_FILE_MAX_AGE_SECS` (7 days) that
+  still held seals, at the top level of `data/spill/` or in `replaying/`. Until
+  PR40b this line carried the unregistered code `SPILL-RETENTION-01` and paged
+  nobody.
+
+The sweep now also covers `data/spill/replaying/` (unreplayed: an aged file is
+counted as lost) and `data/spill/archive/` (finished with: counted apart as
+`archive_deleted`, logged at `info!`). Both count toward `tv_seal_spill_bytes`.
+
+**Triage for `seal_unrecovered`:** the files are in `data/spill/archive/`
+until they are 7 days old. A format mismatch after an upgrade is the usual
+cause; the seals' ticks are still in `ticks` and in the capture log.
+**Triage for `spill_retention`:** the replay has not drained these files for a
+week. Check why the writer cannot reach QuestDB, and the earlier
+`seal_unrecovered` or AGGREGATOR-SEAL-01 lines.
+
+**Source:** `crates/storage/src/seal_writer_loop.rs::report_unrecovered_seals`,
+`crates/storage/src/seal_spill.rs::prune_spill_files`.
+
 ### 2026-05-11 Update — 4-alert drop-class family is now live
 
 Per Wave 6 Sub-PR #1 items 1.4j/l/n/o (merged #584/#587/#589/#590) the
