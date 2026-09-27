@@ -634,7 +634,7 @@ fn ist_date_filename(now_unix_secs: i64) -> String {
 /// [`ist_date_filename`] (which formats the same IST-shifted epoch as a UTC
 /// calendar date); pinned by
 /// `test_ist_day_number_agrees_with_ist_date_filename_across_boundaries`.
-fn ist_day_number(now_unix_secs: i64) -> i64 {
+pub(crate) fn ist_day_number(now_unix_secs: i64) -> i64 {
     now_unix_secs
         .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS))
         .div_euclid(86_400)
@@ -843,6 +843,129 @@ impl SealSpillWriter {
         Ok(())
     }
 
+    /// Append several serialised seals with ONE `write(2)` (audit PR15).
+    ///
+    /// The escalation thread's batch path. Every seal in `seals` is filed
+    /// under the IST day of `now_unix_secs`, exactly as [`Self::append_seal`]
+    /// would file each one; the caller groups by day before calling.
+    ///
+    /// `scratch` is the caller's reusable byte buffer, so a steady stream of
+    /// batches allocates nothing after the first one of the largest size.
+    ///
+    /// # Failure is all-or-nothing, as far as the filesystem allows
+    ///
+    /// A failed `write_all` may have written part of the batch. The file is
+    /// then cut back to the length it had before the write, so the caller can
+    /// escalate every seal of the batch one by one without writing any of
+    /// them twice and, more importantly, without leaving a torn record that
+    /// would shift every later record off its 128-byte boundary. Readers stop
+    /// only at a SHORT read, so a torn record in the middle of a file would
+    /// make every record after it unreadable, not just itself.
+    ///
+    /// If the cut ALSO fails, the file is renamed aside (`<name>.<n>`, a name
+    /// both drains still read) with the handle already closed, so the tear is
+    /// the last thing in that file and reads as its end; the next append
+    /// starts a fresh file. If the rename fails too, the torn tail stays in
+    /// the day file and every record appended after it is misaligned: those
+    /// records are refused on read and their bytes survive in `archive/`.
+    /// That third failure in a row is the one case this does not cover.
+    ///
+    /// # Complexity
+    /// O(seals) to serialise, one `write(2)` in steady state, plus one
+    /// `fstat` for the rollback length. Runs on the `tv-seal-escalate`
+    /// thread, never on the frame drain.
+    pub fn append_seals<'a>(
+        &self,
+        seals: impl IntoIterator<Item = &'a SerializedSeal>,
+        scratch: &mut Vec<u8>,
+        now_unix_secs: i64,
+    ) -> Result<()> {
+        scratch.clear();
+        for seal in seals {
+            scratch.extend_from_slice(&seal.to_bytes());
+        }
+        if scratch.is_empty() {
+            return Ok(());
+        }
+        let day = ist_day_number(now_unix_secs);
+        let mut open = self.lock_open();
+        let stale = match open.as_ref() {
+            Some(current) => current.ist_day != day,
+            None => true,
+        };
+        if stale {
+            *open = None;
+            let path = self.spill_path(now_unix_secs);
+            let file = self.open_append_handle(&path)?;
+            *open = Some(OpenSpillFile { ist_day: day, file });
+        }
+        let Some(current) = open.as_mut() else {
+            self.err_no_handle.increment(1);
+            anyhow::bail!(
+                "seal spill handle missing after open — refusing to claim a durable write"
+            );
+        };
+        let before = match current.file.metadata() {
+            Ok(meta) => meta.len(),
+            Err(err) => {
+                *open = None;
+                self.err_write.increment(1);
+                let path = self.spill_path(now_unix_secs);
+                return Err(err).with_context(|| format!("failed to stat spill file {path:?}"));
+            }
+        };
+        if let Err(err) = current.file.write_all(scratch) {
+            // Cut the torn tail before dropping the handle. Best effort: a
+            // failure here is reported in the error chain, not swallowed.
+            let cut = current.file.set_len(before);
+            *open = None;
+            self.err_write.increment(1);
+            let path = self.spill_path(now_unix_secs);
+            return match cut {
+                Ok(()) => Err(err).with_context(|| {
+                    format!("failed to write a seal batch to {path:?} (torn tail cut back)")
+                }),
+                Err(cut_err) => {
+                    // The torn tail stays, and every record appended after it
+                    // would sit off its 128-byte boundary: readers would
+                    // refuse all of them as if they were another format. Move
+                    // the file out of rotation instead, under a name both
+                    // drains still read, so the records before the tear are
+                    // recovered, the tear ends that file, and the next append
+                    // starts a clean one. The handle is already closed (held
+                    // lock, `*open = None` above), so nothing follows the move.
+                    let aside = set_aside_torn_file(&path);
+                    Err(err).with_context(|| {
+                        format!(
+                            "failed to write a seal batch to {path:?}, cutting the torn tail \
+                             back ALSO failed ({cut_err}); file set aside: {aside:?}"
+                        )
+                    })
+                }
+            };
+        }
+        Ok(())
+    }
+
+    /// Run `f` while no append can reach the spill file (audit PR15).
+    ///
+    /// Holds the append lock for the duration of `f` and closes the cached
+    /// handle first, so `f` may rename or move the day's file: the next
+    /// append reopens by NAME and creates a fresh file, and no append can land
+    /// in the moved inode. This is what lets the mid-session replay take the
+    /// live file without losing a seal appended at the same instant.
+    ///
+    /// Every appender — the escalation thread, the drain's inline fallback
+    /// and the writer's own rescue — waits on this lock while `f` runs, so
+    /// `f` must be short: a directory listing and a few renames.
+    pub fn with_appends_paused<R>(&self, f: impl FnOnce() -> R) -> R {
+        let mut open = self.lock_open();
+        *open = None;
+        let result = f();
+        drop(open);
+        result
+    }
+
     /// Closes the cached append handle, if any.
     ///
     /// MUST be called whenever the underlying file is unlinked or replaced:
@@ -957,6 +1080,30 @@ impl SealSpillWriter {
         info!(?path, "spill file cleared after successful drain");
         Ok(())
     }
+}
+
+/// Move a spill file whose tail is torn to `<name>.<n>` in the same
+/// directory, the collision-suffix form the boot drain and the mid-session
+/// replay both read as a spill file (audit PR15).
+///
+/// Returns the new path, or the rename error. Bounded at 10,000 probes, the
+/// same bound as the drain's own collision naming.
+fn set_aside_torn_file(path: &Path) -> std::io::Result<PathBuf> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    for suffix in 1..10_000u32 {
+        let candidate = dir.join(format!("{name}.{suffix}"));
+        if !candidate.exists() {
+            std::fs::rename(path, &candidate)?;
+            return Ok(candidate);
+        }
+    }
+    Err(std::io::Error::other(
+        "no free set-aside name for a torn spill file",
+    ))
 }
 
 impl Default for SealSpillWriter {
@@ -1906,6 +2053,110 @@ mod tests {
             .expect("append after recovery");
         assert_eq!(writer.read_all(now).expect("read"), vec![seal]);
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn test_append_seals_writes_a_batch_with_one_call_and_reads_back_in_order() {
+        let dir = temp_spill_dir("append-seals-batch");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = 1_700_000_000_i64;
+        let seals: Vec<SerializedSeal> = (0..50u32)
+            .map(|i| mk_seal(13, 0, 1, 34_200 + i, 100.0 + f64::from(i)))
+            .collect();
+        let mut scratch = Vec::new();
+        writer
+            .append_seals(seals.iter(), &mut scratch, now)
+            .expect("batch append");
+        // An empty batch is a no-op, not an error.
+        writer
+            .append_seals(std::iter::empty(), &mut scratch, now)
+            .expect("empty batch");
+        let back = writer.read_all(now).expect("read back");
+        assert_eq!(back, seals);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_append_seals_errors_while_the_spill_dir_is_unusable() {
+        let dir = temp_spill_dir("append-seals-dead");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::write(&dir, b"not a directory").expect("blocker");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let seal = mk_seal(13, 0, 1, 34_200, 1.0);
+        let mut scratch = Vec::new();
+        assert!(
+            writer
+                .append_seals(std::iter::once(&seal), &mut scratch, 1_700_000_000)
+                .is_err(),
+            "a batch that cannot be written must say so, so the caller can escalate it"
+        );
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn test_a_torn_file_set_aside_keeps_its_records_readable_and_the_next_append_starts_clean() {
+        let dir = temp_spill_dir("torn-set-aside");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = 1_700_000_000_i64;
+        writer
+            .append_seal(&mk_seal(13, 0, 1, 1, 1.0), now)
+            .expect("append");
+        // Simulate the double fault: a torn half-record the cut could not remove.
+        let live = writer.spill_path(now);
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&live)
+                .expect("open");
+            f.write_all(&[7u8; 40]).expect("torn bytes");
+        }
+        writer.close_open_handle();
+        let aside = set_aside_torn_file(&live).expect("set aside");
+        let aside_name = aside
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            aside_name.ends_with(".bin.1"),
+            "the set-aside name must stay a spill file for both drains: {aside_name}"
+        );
+        writer
+            .append_seal(&mk_seal(13, 0, 1, 2, 2.0), now)
+            .expect("append after");
+        assert_eq!(
+            std::fs::metadata(&live).expect("fresh file").len(),
+            SEAL_SPILL_RECORD_SIZE as u64,
+            "the next append must start a clean, aligned file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_with_appends_paused_lets_the_day_file_move_without_losing_an_append() {
+        let dir = temp_spill_dir("appends-paused");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = 1_700_000_000_i64;
+        writer
+            .append_seal(&mk_seal(13, 0, 1, 1, 1.0), now)
+            .expect("first append");
+        let moved = dir.join("moved.bin");
+        let live = writer.spill_path(now);
+        writer.with_appends_paused(|| std::fs::rename(&live, &moved).expect("rename"));
+        writer
+            .append_seal(&mk_seal(13, 0, 1, 2, 2.0), now)
+            .expect("second append");
+        assert_eq!(
+            std::fs::metadata(&moved).expect("moved").len(),
+            SEAL_SPILL_RECORD_SIZE as u64,
+            "no append may follow the moved file"
+        );
+        assert_eq!(
+            writer.read_all(now).expect("read").len(),
+            1,
+            "the next append must open a fresh day file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

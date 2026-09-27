@@ -266,7 +266,25 @@ wrong is corrected in this file, not silently dropped.
 Order of work: D9 rule amendments → PR4c → PR15 → PR16 → PR17, then PR5–PR14 as before (with the additions
 folded into them below), then PR18, PR19 and the decisions.
 
-- [ ] **PR15 — candle seals never write a file on the drain.** (`storage`, `app`)
+- [x] **PR15 — candle seals never write a file on the drain.** (`storage`, `app`)
+  - DONE (2026-09-27): the escalation thread already existed (2026-08-28); what was left was its
+    4,096 queue (under 2% of one 225,000-seal close burst) and one `write(2)` per record. The queue
+    is now `SEAL_BUFFER_CAPACITY` deep (~32 MB committed, stated) and the thread writes
+    `SEAL_ESCALATION_BATCH` (1,024) records per write, cutting a torn tail back on failure
+    (`SealSpillWriter::append_seals`). The inline fallback stays, counted, as the last resort past
+    one whole burst against a stalled disk. Mid-session replay: `MidSessionReplay` in
+    seal_writer_task.rs, stepped from the writer loop's tick only (never the shutdown drain):
+    60 s of clean live flushes, live ring empty, ≤ 512 seals per 100 ms (half capacity, WAL apply
+    lag), live file staged under the spill append lock (`with_appends_paused`), `replaying/` →
+    `archive/` like boot, a failed flush discards, keeps the file's position and halves the next
+    step; two failures at a step of one record skip that record (poison row). Known limits stated
+    in code: a replayed older seal can overwrite a newer amended bar (same as the boot drain); the
+    gate needs live traffic to reopen; a full queue on a disk that refuses writes does not drain
+    inside the 5 s shutdown budget (the rest is counted as abandoned). Counters `tv_seal_replay_total{kind}` seeded at 0.
+    Tests: `replay_*`, `staging_the_live_file_while_appends_race_loses_no_seal`,
+    `the_escalation_thread_batches_a_burst_*`, `a_failed_batch_write_falls_back_*`,
+    `the_queue_depth_is_drainable_inside_the_shutdown_budget` (rewritten),
+    `one_poison_record_is_isolated_and_skipped_and_every_other_record_lands`.
   - When both seal queues are full the seal spill takes a lock and writes a file on the drain
     (seal_writer_runner.rs:466-497, seal_spill.rs:798-833). D2 covers ticks, not seals. Give the
     seal spill its own writer thread behind a bounded hand-off, the tick path's shape.
