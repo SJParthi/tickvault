@@ -534,36 +534,61 @@ Source: re-check 5 on main c0e4829 (comparison page version 6; the full list wit
 the code when each PR is written; a wrong row is corrected here, never dropped.
 
 Order of work: PR15 finishes first. Then, riskiest first: PR28 (SEBI data off one disk, console
-wipe) → PR29 (log tool can change the live database) → PR30 (budget stop undone the same day) →
+wipe; split 2026-09-27 into PR28a, the console, and PR28b, the locked cloud copy) → PR29 (log tool can change the live database) → PR30 (budget stop undone the same day) →
 PR31 (a restart can overwrite fuller candles) → PR32 (tick rescue and spill ordering) → PR33
 (token and socket gaps) → PR34 (hung app never restarted) → PR35 (deploys) → PR36 (security) →
 PR37 (Dhan documentation mismatches) → PR38 (risk book across a restart) → PR39 (every error
 line coded, every loss counted and shipped), then the remaining order from the fourth re-check
 (PR16, PR17, PR23, PR24, PR5–PR14, PR25–PR27, PR18, PR19, decisions). One PR open at a time.
 
-- [ ] **PR28 — never-delete data does not live on one disk, and the console cannot wipe it.**
-  (`aws-lambdas`, `storage`, deploy)
-  - `instrument_lifecycle`, `instrument_lifecycle_audit` and `index_constituency` exist only on
-    the server disk, and the reset-time SEBI save goes to that same disk
-    (partition_manager.rs:327; operator_control_action_commands.rs:85, :314). A daily export of
-    the three tables to the cold bucket, verified by row count, with a coded error and a page on
-    failure; the reset-time save is uploaded and capped too.
-  - The console wipe targets include `rest_fetch_audit` and the kept `rest_*` tables
-    (operator_control_action_commands.rs:44, :47, :96). Exclude the whole SEBI/keep list, pinned
-    by a guard that reads the keep list from one place.
-  - A cut-off table list lets reset delete an unsaved SEBI table: abort if any SEBI table with a
-    folder on disk was not exported (:97, :235-266, :472-495).
-  - Reset and nuke stop the app before their lock check, and a wipe delivered late by SSM can run
-    in market hours: the box checks the 09:00–15:45 lock before the FIRST stop, and SSM delivery
-    gets a short timeout (:8-52, :62, :269, :290, :498; operator_control.rs:1947-1960). Every exit
-    re-enables the app (:62, :270-282).
+- [x] **PR28a — the console cannot wipe kept data, and nothing destructive runs in the lock.**
+  (`aws-lambdas`) Split out of PR28 on 2026-09-27: this half needs no cloud change and no cost.
+  - The console wipe truncated `prev_day_ohlcv` and the four `rest_*` tables, all on the
+    never-delete list and named KEPT by daily-universe Quote 21. Its targets are now `ticks`,
+    `market_depth` and the candle tables only (`operator_control_action_commands.rs`
+    `WIPE_QUESTDB_COMMANDS`), pinned by `test_wipe_never_targets_a_never_delete_table`, which
+    reads the never-delete list from `partition_manager.rs`.
+  - Wipe, reset and nuke now re-check the 09:00–15:45 IST lock on the box BEFORE the first stop
+    (`ON_BOX_LOCK_GUARD`, exit 3, nothing stopped); the reset's end-of-save `lock_check` stays.
+    SSM gives up on a command the box has not picked up within 120 s
+    (`SSM_DELIVERY_TIMEOUT_SECS`), and the console reports that as not run
+    (`DeliveryTimedOut`). Tests `test_on_box_lock_guard_runs_before_the_first_stop`,
+    `test_ssm_shell_sets_a_short_delivery_timeout`.
+  - A kept table missing from the one `tables()` reply (reply cut short, metadata not loaded,
+    folder under a renamed table's old name) was treated as absent and deleted with the volume.
+    Every kept-table folder that was not exported is now copied off the volume raw and checked
+    file for file (`raw_copy`, shared with the raw mode). A volume whose folders cannot be read
+    stops the action.
+  - The save is streamed to `s3://tv-prod-cold/sebi-preserve/<stamp>.tar` as one object and
+    its size in the bucket must equal the bytes tar wrote before anything is deleted; the box
+    copy is kept (Quote 25 forbids deleting it, so it is NOT capped). Test
+    `destructive_actions_refuse_an_unsaved_table_and_copy_the_save_off_the_box`.
+  - Reset exits no longer leave the app disabled: `cd … || exit 0` is gone, and the
+    `docker-reset-FAILED` exit brings QuestDB back, re-enables and restarts the app. Test
+    `test_every_exit_after_the_disable_re_enables_the_app` (the save step's only `exit 2` is
+    the flock-busy line, whose lock holder re-enables).
+  - Honest limits: the cloud copy goes to the unlocked cold bucket until PR28b; the size check
+    is per object, not a per-file checksum (the CLI checksums each upload part); the on-box
+    guard trusts the box clock.
+- [ ] **PR28b — never-delete data does not live on one disk, and nobody can delete the cloud
+  copy.** (`storage`, deploy) Waits on the owner's typed choice of lock strength
+  (compliance or governance, asked 2026-09-27) and on a measured size for the budget rule.
+  - `instrument_lifecycle` and `index_constituency` are pinned to ts=0, exempt from the sweep,
+    and exist only on the server disk. A daily export of both to the locked location, verified
+    by row count, with a coded error and a page on failure.
   - The cold bucket has no versioning (deploy/aws/terraform/main.tf:692): versioning on, with a
-    short non-current expiry, so a bad delete is recoverable.
-  - SEBI audit rows leave QuestDB after 90 days (partition_manager.rs:77-232, :327-345;
-    partition_archive.rs:353-373). OWNER DECIDED 2026-09-27 11:15 UTC ("Lock the cloud copy"):
-    keep the 90-day drop, and make the S3 copy of the SEBI tables write-once (object lock /
-    retention for 5 years) so nothing can delete it; the daily export above lands in that
-    locked prefix. The drop only runs after the locked copy is verified.
+    short non-current expiry, so a bad delete is recoverable. Quote 24 records that versioning
+    was never on; that sentence is updated in the same change.
+  - SEBI audit rows leave QuestDB after 90 days (partition_manager.rs `DAY_PARTITIONED_TABLES`;
+    partition_archive.rs `RetentionClass`). OWNER DECIDED 2026-09-27 11:15 UTC ("Lock the cloud
+    copy"): keep the 90-day drop, and make the S3 copy of the SEBI tables write-once for 5
+    years. The archive already drops a partition only after a verified upload
+    (`partition_archive_guard.rs::drop_partition_requires_verified_archive_proof`); the SEBI
+    tables' archive and the daily export move to a dedicated bucket created with Object Lock,
+    so the drop runs only after the locked copy is verified. The reset-time save moves there
+    too.
+  - Terraform applies live on merge (terraform-apply.yml), and Object Lock cannot be switched
+    off, so the dated owner quote goes into the daily-universe rule file first.
 - [ ] **PR29 — the log tool can never change the live database.** (`tickvault-logs-mcp`)
   - Free SQL goes to the live database raw, so `drop` and `truncate` pass
     (tickvault-logs-mcp/src/tools.rs:669). Reuse the operator console's read-only SQL gate, cap

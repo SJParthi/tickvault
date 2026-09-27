@@ -77,6 +77,17 @@ pub const DATA_DESTRUCTIVE_LOCK_OPEN_SECS: u32 = 9 * 3600;
 /// Five minutes past [`MKT_CLOSE_SECS`], for the same rule.
 pub const DATA_DESTRUCTIVE_LOCK_CLOSE_SECS: u32 = 15 * 3600 + 45 * 60;
 
+/// How long SSM may hold a command for a box that has not picked it up
+/// before it gives up on it (SSM `TimeoutSeconds`, minimum 30).
+///
+/// Without it the SSM default is 3,600 s: a wipe or reset sent at 08:55 to a
+/// box whose agent was reconnecting could start at 09:40. The box-side
+/// `ON_BOX_LOCK_GUARD` refuses that run anyway; this bounds how late any
+/// console command can start, so a refused run is the rare case rather than
+/// the only defence. Two minutes covers an agent reconnect; a box that is
+/// down for longer gets a failed command instead of a surprise later.
+pub const SSM_DELIVERY_TIMEOUT_SECS: i32 = 120;
+
 /// legacy: `_MKT_OPEN_SECS = 9 * 3600 + 15 * 60` (09:15 IST, seconds-of-day).
 pub const MKT_OPEN_SECS: u32 = 9 * 3600 + 15 * 60;
 /// Market close, 15:40 IST (seconds-of-day). Legacy oracle value was
@@ -1951,6 +1962,7 @@ impl OpsShell for AwsShell {
             .instance_ids(&self.instance_id)
             .document_name("AWS-RunShellScript")
             .parameters("commands", commands.to_vec())
+            .timeout_seconds(SSM_DELIVERY_TIMEOUT_SECS)
             .send()
             .await
             .map_err(|e| format!("{e:?}"))?;
@@ -1982,7 +1994,7 @@ impl OpsShell for AwsShell {
             };
             if matches!(
                 status.as_str(),
-                "Success" | "Failed" | "Cancelled" | "TimedOut"
+                "Success" | "Failed" | "Cancelled" | "TimedOut" | "DeliveryTimedOut"
             ) {
                 return format!("{stdout}{stderr}");
             }
@@ -2749,13 +2761,21 @@ mod tests {
         // danger-zone line now also reads the server's own
         // `data_destructive_locked` flag, falling back to `market_hours` for a
         // Lambda that predates it, so the label and the 409 cannot disagree.
+        //
+        // RE-BLESSED 2026-09-27 (audit PR28) — 46,484 -> 46,985 bytes, three new
+        // lines in `pollNuke`: a command SSM dropped because the box did not
+        // pick it up in time (`DeliveryTimedOut`, from the new delivery
+        // timeout) now says it was NOT run instead of polling for three
+        // minutes and reporting "still running", and a run refused by the
+        // on-box lock guard or stopped by the SEBI save now says so instead
+        // of "nuke finished (Failed)".
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CONSOLE_HTML.as_bytes());
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "fc85fb0b586fc63cf6eceecba1a7a323c297cf5c9efa6e082ae3fc7668165523"
+            "be86602dfa57ae803066d29c7d43a7e311f588f5efc1e7084ec33ceb9af5b25c"
         );
-        assert_eq!(CONSOLE_HTML.len(), 46_484);
+        assert_eq!(CONSOLE_HTML.len(), 46_985);
     }
 
     // --------------------------------------------------------- class ParseView
@@ -3529,7 +3549,9 @@ mod tests {
             disable_pos < rm_pos,
             "unit must be disabled before the wipe body"
         );
-        assert!(joined.contains("$0==\"prev_day_ohlcv\""));
+        // 2026-09-27 (audit PR28): prev_day_ohlcv is on the never-delete
+        // list and is no longer a wipe target.
+        assert!(!joined.contains("$0==\"prev_day_ohlcv\""));
         assert!(joined.contains("systemctl enable tickvault || true"));
     }
 
@@ -3613,8 +3635,10 @@ mod tests {
                 verified.push(part[..end].to_string());
             }
         }
+        // 2026-09-27 (audit PR28): the equality arms are now `ticks` and
+        // `market_depth` only; the candle tables are the prefix arm.
         assert!(
-            targets.len() >= 6 && verified.len() >= 6,
+            targets.len() >= 2 && verified.len() >= 3,
             "wipe predicate/verification parse looks vacuous (targets={}, \
              verified={}) — the scanner, not the commands, is broken",
             targets.len(),
@@ -3763,48 +3787,50 @@ mod tests {
              exclude — TRUNCATE TABLE on a view fails on every wipe"
         );
     }
+    /// The wipe truncates market data only, never a table on the
+    /// never-delete list.
+    ///
+    /// Until 2026-09-27 it also truncated `prev_day_ohlcv` and the four
+    /// `rest_*` tables (a 2026-07-16 extension), and a test pinned that. All
+    /// five are on `DAY_PARTITIONED_TABLES`, the list the reset saves before
+    /// it deletes anything, and daily-universe Quote 21 names
+    /// `rest_fetch_audit` and the REST minute tables as KEPT by a fresh-start
+    /// wipe. The list is read from the storage source, so a table added to
+    /// the never-delete list later is covered without editing this test.
     #[test]
-    fn test_wipe_questdb_truncates_live_rest_tables_too() {
-        // 2026-07-16 destructive-surface extension: a "fresh start" must also
-        // drop today's official minute candles + the fetch log — the four
-        // LIVE tables the REST pulls write. rest_fetch_audit is per-fetch
-        // forensics, NOT a SEBI never-delete table; the SEBI *_audit family
-        // stays preserved by the dynamic filter.
+    fn test_wipe_never_targets_a_never_delete_table() {
+        let kept = never_delete_tables();
         let joined = WIPE_QUESTDB_COMMANDS.join("\n");
-        // 2026-08-01: the target predicate is now an awk expression (the
-        // embedded interpreter program was retired). Each of the four LIVE
-        // REST tables must still appear as its own equality arm.
-        for live in [
-            "rest_spot_1m",
-            "rest_option_chain_1m",
-            "rest_option_contract_1m",
-            "rest_fetch_audit",
-        ] {
+        let mut targets: Vec<String> = Vec::new();
+        for part in joined.split("$0==\"").skip(1) {
+            if let Some(end) = part.find('"') {
+                targets.push(part[..end].to_string());
+            }
+        }
+        assert!(
+            targets.iter().any(|t| t == "ticks"),
+            "the target scan found nothing — it is broken, not the commands: {targets:?}"
+        );
+        for t in &targets {
             assert!(
-                joined.contains(&format!("$0==\"{live}\"")),
-                "wipe target predicate lost the {live} arm"
+                !kept.contains(t),
+                "the wipe truncates `{t}`, which is on the never-delete list"
             );
         }
-        // Review fix M2 (2026-07-16): honest completion verifies EVERY
-        // truncate-target family — the legacy pair AND all FOUR live REST
-        // tables.
-        for t in [
-            "ticks",
-            "candles_1m",
-            "rest_spot_1m",
-            "rest_option_chain_1m",
-            "rest_option_contract_1m",
-            "rest_fetch_audit",
-        ] {
-            assert!(joined.contains(&format!("$(qc {t})")), "{t}");
+        // The prefix arm must not reach a kept table either.
+        for k in &kept {
+            assert!(
+                !k.starts_with("candles_"),
+                "never-delete table `{k}` starts with `candles_`, so the wipe's prefix arm \
+                 would truncate it"
+            );
+            assert!(
+                !joined.contains(&format!("$(qc {k})")),
+                "the wipe verifies `{k}` reached zero, so it expects to empty a kept table"
+            );
         }
-        assert!(joined.contains("rest_spot_1m=${S:-?}"));
-        // Review fix M2: a missing/erroring count defaults to 0 (absent
-        // table = nothing left = wiped). The old default-to-1 made EVERY
-        // post-nuke wipe read WIPE-PARTIAL forever.
-        for default in [
-            "${T:-0}", "${C:-0}", "${S:-0}", "${O:-0}", "${K:-0}", "${A:-0}",
-        ] {
+        // A missing count reads 0 (absent table = nothing left), never 1.
+        for default in ["${T:-0}", "${D:-0}", "${C:-0}"] {
             assert!(joined.contains(default), "{default}");
             assert!(
                 !joined.contains(&default.replace(":-0", ":-1")),
@@ -3812,6 +3838,203 @@ mod tests {
             );
         }
         assert!(joined.contains("TRUNCATE-FAILED"));
+    }
+
+    /// Every console command carries a short SSM delivery timeout, so a
+    /// command the box picks up late is dropped rather than run long after
+    /// the console's lock check passed.
+    #[test]
+    fn test_ssm_shell_sets_a_short_delivery_timeout() {
+        assert!(
+            (30..=600).contains(&SSM_DELIVERY_TIMEOUT_SECS),
+            "SSM accepts 30 s minimum; more than 10 minutes defeats the point"
+        );
+        let src = include_str!("operator_control.rs");
+        let send = src
+            .find(".document_name(\"AWS-RunShellScript\")")
+            .expect("ssm_shell sends AWS-RunShellScript");
+        let tail = &src[send..send + 400];
+        assert!(
+            tail.contains(".timeout_seconds(SSM_DELIVERY_TIMEOUT_SECS)"),
+            "ssm_shell lost its delivery timeout"
+        );
+    }
+
+    /// Every data-destructive action re-checks the 09:00–15:45 IST lock on
+    /// the box BEFORE it stops the app, with the same window as the console.
+    ///
+    /// The console refuses these actions inside the lock only at send time; a
+    /// command SSM delivers late would otherwise run inside it. Before
+    /// 2026-09-27 the reset and nuke checked the box clock only at the end of
+    /// their save, after the app was already stopped, and the wipe never
+    /// checked it at all.
+    #[test]
+    fn test_on_box_lock_guard_runs_before_the_first_stop() {
+        use crate::operator_control_action_commands::ON_BOX_LOCK_GUARD;
+        assert!(
+            ON_BOX_LOCK_GUARD.contains(&format!("-ge {DATA_DESTRUCTIVE_LOCK_OPEN_SECS}")),
+            "the on-box guard must open at DATA_DESTRUCTIVE_LOCK_OPEN_SECS"
+        );
+        assert!(
+            ON_BOX_LOCK_GUARD.contains(&format!("-lt {DATA_DESTRUCTIVE_LOCK_CLOSE_SECS}")),
+            "the on-box guard must close at DATA_DESTRUCTIVE_LOCK_CLOSE_SECS"
+        );
+        assert!(
+            ON_BOX_LOCK_GUARD.contains("+ 19800"),
+            "IST is UTC + 19,800 s"
+        );
+        assert!(
+            !ON_BOX_LOCK_GUARD.contains("exit 1"),
+            "exit 1 is reserved for sebi_abort in the reset's save step"
+        );
+        for (name, cmds) in [
+            ("wipe-questdb", WIPE_QUESTDB_COMMANDS.as_slice()),
+            ("docker-reset", DOCKER_RESET_COMMANDS.as_slice()),
+            ("docker-nuke-bare", DOCKER_NUKE_BARE_COMMANDS.as_slice()),
+        ] {
+            let guard_at = cmds
+                .iter()
+                .position(|c| *c == ON_BOX_LOCK_GUARD)
+                .unwrap_or_else(|| panic!("{name} has no on-box lock guard"));
+            let stop_at = cmds
+                .iter()
+                .position(|c| c.contains("systemctl stop tickvault"))
+                .unwrap_or_else(|| panic!("{name} never stops the app"));
+            assert!(
+                guard_at < stop_at,
+                "{name}: the lock guard (element {guard_at}) must run before the first \
+                 stop (element {stop_at})"
+            );
+        }
+    }
+
+    /// SSM runs a command list as ONE script, so an `exit` in any element
+    /// ends the whole action. An exit after the app was disabled must
+    /// re-enable it in the same element, or the unit stays off and the
+    /// 15-minute autopilot reads that as intentional.
+    ///
+    /// Before 2026-09-27 the reset had `cd … || exit 0` and a
+    /// `docker-reset-FAILED; exit 1` branch that both left it disabled.
+    /// Allowed exits: the on-box lock guard (runs before anything is stopped),
+    /// the save step (its only `exit 1` is inside `sebi_abort`, which
+    /// re-enables; its `exit 2` leaves the box to the run holding the lock).
+    #[test]
+    fn test_every_exit_after_the_disable_re_enables_the_app() {
+        use crate::operator_control_action_commands::ON_BOX_LOCK_GUARD;
+        for (name, cmds) in [
+            ("wipe-questdb", WIPE_QUESTDB_COMMANDS.as_slice()),
+            ("docker-reset", DOCKER_RESET_COMMANDS.as_slice()),
+            ("docker-nuke-bare", DOCKER_NUKE_BARE_COMMANDS.as_slice()),
+        ] {
+            for (i, c) in cmds.iter().enumerate() {
+                if *c == ON_BOX_LOCK_GUARD {
+                    continue;
+                }
+                if c.contains("sebi_abort()") {
+                    // The save step's exits: `exit 1` only inside sebi_abort
+                    // (which re-enables), and `exit 2` only when another reset
+                    // holds the lock and will re-enable the app itself.
+                    let busy = c
+                        .lines()
+                        .filter(|l| l.contains("exit 2") && !l.trim_start().starts_with('#'))
+                        .collect::<Vec<_>>();
+                    assert!(
+                        busy.len() == 1 && busy[0].contains("flock -n 9"),
+                        "{name}: `exit 2` must appear only on the flock-busy line: {busy:?}"
+                    );
+                    continue;
+                }
+                // Every `exit` word, bare or with a code: `exit`, `exit;`,
+                // `exit 0`. A word boundary on both sides keeps `exited` out.
+                let bytes = c.as_bytes();
+                let mut from = 0;
+                while let Some(off) = c[from..].find("exit") {
+                    let at = from + off;
+                    from = at + 4;
+                    let left_ok = at == 0 || !bytes[at - 1].is_ascii_alphanumeric();
+                    let right_ok = bytes
+                        .get(at + 4)
+                        .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_');
+                    if !(left_ok && right_ok) {
+                        continue;
+                    }
+                    assert!(
+                        c[..at].contains("systemctl enable tickvault"),
+                        "{name} element {i}: an `exit` without re-enabling the app first: {c}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The reset and nuke refuse to delete the volume while a kept table is
+    /// on it unsaved, and copy the save off the box before deleting anything.
+    ///
+    /// Two holes closed on 2026-09-27: the export trusted ONE table-list
+    /// query, so a list cut short made a kept table read as absent and the
+    /// volume holding it was then deleted; and the save lived only on the
+    /// box's own disk.
+    #[test]
+    fn destructive_actions_refuse_an_unsaved_table_and_copy_the_save_off_the_box() {
+        for (name, cmds) in [
+            ("docker-reset", DOCKER_RESET_COMMANDS.as_slice()),
+            ("docker-nuke-bare", DOCKER_NUKE_BARE_COMMANDS.as_slice()),
+        ] {
+            let preserve = cmds
+                .iter()
+                .find(|c| c.contains("SEBI-PRESERVED"))
+                .unwrap_or_else(|| panic!("{name} has no save step"));
+            for needle in [
+                "MODE=export; EXPORTED=''",
+                "EXPORTED=\"$EXPORTED $t\"",
+                "case \" $EXPORTED \" in *\" $t \"*) continue ;; esac",
+                "SEBI-PRESERVE-UNLISTED:",
+                "its folders could not be read",
+            ] {
+                assert!(
+                    preserve.contains(needle),
+                    "{name}: save step lost `{needle}`"
+                );
+            }
+            // The folders QuestDB did not list are copied raw, after the
+            // export loop and before the upload.
+            let unlisted = preserve
+                .find("SEBI-PRESERVE-UNLISTED:")
+                .unwrap_or_else(|| panic!("{name}: no raw copy of unlisted folders"));
+            let copy_call = preserve[unlisted..]
+                .find("raw_copy")
+                .map(|o| unlisted + o)
+                .unwrap_or_else(|| panic!("{name}: unlisted folders are never copied"));
+            let upload = preserve
+                .find("| timeout \"$(left)\" aws s3 cp")
+                .unwrap_or_else(|| panic!("{name}: the save is never copied off the box"));
+            assert!(
+                preserve.contains("set -o pipefail; tar --totals"),
+                "{name}: the upload must fail when tar fails, not only when the upload does"
+            );
+            let compare = preserve
+                .find("[ \"$TBYTES\" = \"$RBYTES\" ] || sebi_abort")
+                .unwrap_or_else(|| panic!("{name}: the cloud copy is never checked"));
+            assert!(
+                copy_call < upload,
+                "{name}: unlisted folders must be copied before the upload"
+            );
+            let last_export = preserve
+                .rfind("SEBI-PRESERVED ")
+                .unwrap_or_else(|| panic!("{name}: no export line"));
+            assert!(
+                last_export < upload && upload < compare,
+                "{name}: save, then upload, then compare"
+            );
+            assert!(
+                preserve.trim_end().ends_with("lock_check"),
+                "{name}: the lock re-check must stay the save step's last act"
+            );
+            assert!(
+                !preserve.contains("rm -rf \"$OUT") && !preserve.contains("rm -rf $OUT"),
+                "{name}: the save step must never delete the box copy (daily-universe Quote 25)"
+            );
+        }
     }
 
     /// AUTO-START GUARANTEE ratchet (2026-08-20 incident).
