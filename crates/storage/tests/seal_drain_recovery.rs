@@ -41,7 +41,8 @@ use tickvault_storage::seal_dlq::{SealDlqRecord, SealDlqWriter};
 use tickvault_storage::seal_spill::{SealSpillWriter, SerializedSeal};
 use tickvault_storage::seal_writer_runner::SealWriterRunner;
 use tickvault_storage::seal_writer_task::{
-    SEAL_ARCHIVE_SUBDIR, SEAL_REPLAYING_SUBDIR, SealSink, drain_once, drain_recovered_seals,
+    SEAL_ARCHIVE_SUBDIR, SEAL_REFUSED_FILE_RETRY_SECS, SEAL_REPLAYING_SUBDIR, SealSink, drain_once,
+    drain_recovered_seals,
 };
 use tickvault_storage::shadow_candle_writer::ShadowCandleWriter;
 use tickvault_trading::candles::{BufferedSeal, LiveCandleState, TfIndex};
@@ -381,6 +382,42 @@ fn a_refused_append_keeps_the_file_staged_and_is_counted() {
     assert_eq!(second.seals_append_failed, 0);
     assert_eq!(second.files_archived, 1);
     assert_eq!(healthy.committed_keys(), expected);
+
+    cleanup(&spill, &dlq);
+}
+
+/// The retry is BOUNDED: a file whose seals were refused and which is older
+/// than the retry window is archived (bytes kept) instead of being re-read, and
+/// re-sent over newer bars, on every boot forever.
+#[test]
+fn a_refused_append_in_a_file_past_the_retry_window_is_archived_not_retried() {
+    let (spill, dlq) = unique_dirs("refused-old");
+    let expected = spill_n(&spill, 3);
+    let refused = expected[1].0;
+    let aged = std::time::SystemTime::now()
+        - std::time::Duration::from_secs(SEAL_REFUSED_FILE_RETRY_SECS + 3_600);
+    for entry in std::fs::read_dir(&spill).expect("spill dir") {
+        let path = entry.expect("entry").path();
+        if path.is_file() {
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .expect("open spill file")
+                .set_modified(aged)
+                .expect("age the spill file");
+        }
+    }
+
+    let mut sink = FakeSink {
+        refuse_append_for: Some(refused),
+        ..FakeSink::healthy()
+    };
+    let outcome = drain_recovered_seals(&mut sink, &spill, &dlq, 4);
+    assert_eq!(outcome.seals_reingested, 2);
+    assert_eq!(outcome.seals_append_failed, 1, "still counted");
+    assert_eq!(outcome.files_left_pending, 0, "not kept for another boot");
+    assert_eq!(outcome.files_archived, 1, "archived, bytes kept");
+    assert_eq!(subdir_file_count(&spill, SEAL_ARCHIVE_SUBDIR), 1);
 
     cleanup(&spill, &dlq);
 }

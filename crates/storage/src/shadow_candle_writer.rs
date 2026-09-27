@@ -519,12 +519,12 @@ impl ShadowCandleWriter {
                 // Cannot fail: the marker was set just above. If it ever did,
                 // the half row stays, the next flush fails on it, and that
                 // flush's recovery rescues every popped seal (see above).
-                if let Err(rewind_err) = self.buffer.rewind_to_marker() {
-                    return Err(err.context(format!(
+                match self.buffer.rewind_to_marker() {
+                    Ok(()) => Err(err),
+                    Err(rewind_err) => Err(err.context(format!(
                         "candle append: rewinding the half-written row also failed: {rewind_err}"
-                    )));
+                    ))),
                 }
-                Err(err)
             }
         }
     }
@@ -860,6 +860,12 @@ pub fn count_nonfinite_candle_floats(row: &ShadowSealRow) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    /// Audit PR31a: tests that exercise `flush` past the keyed gate hold it
+    /// OPEN through this flag, so they reach the reconnect path they prove
+    /// whatever order the ensure tests run in.
+    static KEYED_FOR_TESTS: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(true);
+
     use super::*;
     use tickvault_common::constants::{EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_NSE_EQ};
     use tickvault_common::feed::Feed;
@@ -981,7 +987,7 @@ mod tests {
         // the writer's retained ILP buffer, so a server-rejected row can never
         // replay forever and the buffer can never grow across cycles toward
         // the questdb-rs 100 MiB max_buf_size cliff.
-        let mut w = ShadowCandleWriter::for_test();
+        let mut w = ShadowCandleWriter::for_test().with_keyed_for_test(&KEYED_FOR_TESTS);
         w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("append");
         w.append_seal(&mk_seal(25, 0, TfIndex::M1, 1_716_024_300, 200.0))
@@ -1328,7 +1334,7 @@ mod tests {
         // empty-Ok never masks a real persist failure. A flush WITH pending rows on
         // a disconnected writer still Errs — see
         // `test_flush_returns_err_when_disconnected_with_pending_rows`.
-        let mut w = ShadowCandleWriter::for_test();
+        let mut w = ShadowCandleWriter::for_test().with_keyed_for_test(&KEYED_FOR_TESTS);
         let result = w.flush();
         assert!(
             result.is_ok(),
@@ -1396,7 +1402,7 @@ mod tests {
 
     #[test]
     fn test_flush_returns_err_when_disconnected_with_pending_rows() {
-        let mut w = ShadowCandleWriter::for_test();
+        let mut w = ShadowCandleWriter::for_test().with_keyed_for_test(&KEYED_FOR_TESTS);
         w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("append");
         assert_eq!(w.pending_count(), 1);
@@ -1440,7 +1446,7 @@ mod tests {
         // reconnect attempts (for_test writer has an empty conf → reconnect fails)
         // must RETAIN the buffered candles + pending so drain_once can rescue them
         // to spill/DLQ AND a later cycle re-attempts — no silent candle loss.
-        let mut w = ShadowCandleWriter::for_test();
+        let mut w = ShadowCandleWriter::for_test().with_keyed_for_test(&KEYED_FOR_TESTS);
         w.append_seal(&mk_seal(
             13,
             EXCHANGE_SEGMENT_IDX_I,
@@ -1474,7 +1480,7 @@ mod tests {
         // subsequent flush attempt (reconnect + replay each cycle), so the
         // moment QuestDB comes back the backlog commits. Proven here by two
         // consecutive failed flushes both retaining the identical buffer.
-        let mut w = ShadowCandleWriter::for_test();
+        let mut w = ShadowCandleWriter::for_test().with_keyed_for_test(&KEYED_FOR_TESTS);
         w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("append");
         let bytes = w.buffer_byte_count();
@@ -1490,7 +1496,7 @@ mod tests {
     #[test]
     fn test_shadow_writer_empty_buffer_flush_is_noop_ok() {
         // An empty buffer flush is a no-op Ok — no reconnect attempt, no error.
-        let mut w = ShadowCandleWriter::for_test();
+        let mut w = ShadowCandleWriter::for_test().with_keyed_for_test(&KEYED_FOR_TESTS);
         assert!(w.flush().is_ok(), "empty flush must be Ok (no-op)");
     }
 
