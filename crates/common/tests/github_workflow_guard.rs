@@ -545,3 +545,69 @@ fn r20_no_workflow_publishes_the_operator_key() {
         "rotation defaults to off"
     );
 }
+
+/// Audit PR36b (2026-09-27): a manual deploy could be started from any
+/// branch and reach the prod environment, shipping a commit that never
+/// passed All Green. The deploy workflow's preflight refuses a manual run
+/// that is not on main or whose commit has no successful All Green (its own,
+/// or the head of the pull request squash-merged as it), fail-closed on any
+/// API error, and reports whether the prod environment has a
+/// deployment-branch rule (the barrier a branch cannot delete).
+#[test]
+fn r21_manual_deploy_needs_main_and_all_green() {
+    let body = read(DEPLOY_AWS_WORKFLOW);
+    let start = body
+        .find("- name: Refuse a manual deploy of a commit that did not pass All Green")
+        .expect("manual-deploy gate step present");
+    let pre = &body[..start];
+    assert!(
+        pre.rfind("\n  preflight:") > pre.rfind("\n  build:"),
+        "the gate sits in the preflight job, before the build"
+    );
+    let rest = &body[start + 1..];
+    let step = &rest[..rest.find("\n      - name:").unwrap_or(rest.len())];
+    must_contain(
+        step,
+        "if: github.event_name == 'workflow_dispatch'",
+        "the gate runs on every manual run",
+    );
+    must_contain(
+        step,
+        "[ \"$RUN_REF\" != \"refs/heads/main\" ]",
+        "only main can be deployed by hand",
+    );
+    must_contain(step, "check_name=All%20Green", "reads the All Green check");
+    must_contain(
+        step,
+        ".app.slug == \"github-actions\"",
+        "only an All Green posted by GitHub Actions counts",
+    );
+    must_contain(
+        step,
+        ".merge_commit_sha == \\\"${RUN_SHA}\\\"",
+        "the pull request must be the one merged as this commit",
+    );
+    must_contain(step, "could not read", "an API failure refuses the deploy");
+    assert!(
+        !step.contains("continue-on-error"),
+        "the gate must be able to fail the run"
+    );
+    let job = &body[pre.rfind("\n  preflight:").expect("preflight job")..];
+    let job = &job[..job.find("\n  build:").expect("build job after preflight")];
+    must_contain(job, "checks: read", "preflight may read check runs");
+    must_contain(
+        job,
+        "pull-requests: read",
+        "preflight may read pull requests",
+    );
+    must_contain(
+        job,
+        "- name: Report whether the prod environment is limited to main",
+        "the prod environment's branch rule is reported on every run",
+    );
+    must_contain(
+        job,
+        "prod environment accepts runs from ANY branch",
+        "a missing branch rule is a visible warning",
+    );
+}
