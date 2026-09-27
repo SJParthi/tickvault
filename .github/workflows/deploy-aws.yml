@@ -91,9 +91,90 @@ jobs:
   preflight:
     name: Preflight — check bootstrap secrets
     runs-on: ubuntu-24.04
+    # Read-only API access for the two checks below (audit PR36b). This job
+    # assumes no AWS role, so it needs no id-token.
+    permissions:
+      contents: read
+      checks: read
+      pull-requests: read
+      actions: read
     outputs:
       bootstrap_ready: ${{ steps.check.outputs.bootstrap_ready }}
     steps:
+      # Audit PR36b: a manual run (workflow_dispatch) could be started from
+      # any branch and reach the prod environment, shipping a commit that
+      # never passed All Green. Every automatic dispatcher (after-close cron,
+      # post-merge catch-up, deploy watchdog, operator console) dispatches
+      # main, so this refuses nothing they send. A manual run must be on main
+      # AND its commit must have a successful All Green, either on the commit
+      # itself or on the head of the pull request that was squash-merged as
+      # it. Any API failure refuses (fail-closed); the next after-close cron
+      # retries. Honest limit: this check lives in the workflow file, so a
+      # run from a branch that deletes it is not stopped here. That barrier
+      # is the prod environment's deployment-branch rule (next step).
+      - name: Refuse a manual deploy of a commit that did not pass All Green
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_REF: ${{ github.ref }}
+          RUN_SHA: ${{ github.sha }}
+        run: |
+          set -uo pipefail
+          refuse() {
+            echo "::error::manual deploy refused: $1" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          }
+          if [ "$RUN_REF" != "refs/heads/main" ]; then
+            refuse "it was started from ${RUN_REF}; only main can be deployed by hand"
+          fi
+          # Prints the number of successful All Green runs (posted by GitHub
+          # Actions, latest attempt only) on a commit, or nothing on an API
+          # failure.
+          all_green_count() {
+            gh api "repos/${REPO}/commits/$1/check-runs?check_name=All%20Green&filter=latest&per_page=100" \
+              --jq '[.check_runs[] | select(.app.slug == "github-actions" and .conclusion == "success")] | length' \
+              2>/dev/null
+          }
+          direct=$(all_green_count "$RUN_SHA")
+          [[ "$direct" =~ ^[0-9]+$ ]] || refuse "could not read the checks of ${RUN_SHA}"
+          if [ "$direct" -ge 1 ]; then
+            echo "✅ ${RUN_SHA} passed All Green itself." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          pr=$(gh api "repos/${REPO}/commits/${RUN_SHA}/pulls" \
+            --jq "[.[] | select(.merged_at != null and .base.ref == \"main\" and .merge_commit_sha == \"${RUN_SHA}\")][0] | if . == null then \"\" else \"\(.number) \(.head.sha)\" end" \
+            2>/dev/null) || refuse "could not read the pull request behind ${RUN_SHA}"
+          [ -n "$pr" ] || refuse "${RUN_SHA} has no All Green of its own and is not the merge of a pull request into main"
+          pr_number=${pr%% *}
+          pr_head=${pr##* }
+          via_pr=$(all_green_count "$pr_head")
+          [[ "$via_pr" =~ ^[0-9]+$ ]] || refuse "could not read the checks of pull request #${pr_number}"
+          if [ "$via_pr" -ge 1 ]; then
+            echo "✅ ${RUN_SHA} is the merge of pull request #${pr_number}, whose head ${pr_head} passed All Green." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          refuse "pull request #${pr_number} (head ${pr_head}) has no successful All Green"
+
+      # Audit PR36b: the AWS role trusts any job that runs in the prod
+      # environment, whatever its branch (oidc.tf, the environment:prod
+      # subject). What stops a run from another branch is the environment's
+      # own deployment-branch rule, a repository setting this file cannot
+      # set. Report it on every run so a missing rule is visible. Never
+      # fatal: a deploy is not blocked on a setting.
+      - name: Report whether the prod environment is limited to main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          policy=$(gh api "repos/${REPO}/environments/prod" \
+            --jq 'if .deployment_branch_policy == null then "none" else "set" end' 2>/dev/null) || policy="unreadable"
+          case "$policy" in
+            set)  echo "✅ prod environment has a deployment-branch rule." | tee -a "$GITHUB_STEP_SUMMARY" ;;
+            none) echo "::warning::prod environment accepts runs from ANY branch; set Settings > Environments > prod > Deployment branches and tags to main plus tags v*" | tee -a "$GITHUB_STEP_SUMMARY" ;;
+            *)    echo "::warning::could not read the prod environment's deployment-branch rule" | tee -a "$GITHUB_STEP_SUMMARY" ;;
+          esac
+
       - name: Check whether AWS bootstrap secrets are configured
         id: check
         env:
