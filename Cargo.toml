@@ -70,7 +70,7 @@ metrics-exporter-prometheus = "=0.18.3"
 # opentelemetry/opentelemetry_sdk/opentelemetry-otlp ^0.32. Bump all 4 together
 # or none (single-crate bumps split the dependency tree and fail to compile —
 # see .claude/plans/research/dep-decisions.md §1, dependabot PR #938 post-mortem).
-opentelemetry = "=0.32.0"
+opentelemetry = "=0.33.0"
 opentelemetry_sdk = { version = "=0.32.1", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "=0.32.0", features = ["grpc-tonic"] }
 
