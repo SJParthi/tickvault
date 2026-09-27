@@ -4,9 +4,26 @@
 //! `_ssm_shell` (`scratchpad/w4-dump-actions.py`), NEVER hand-transcribed.
 //! Byte-exact with the SSM command lists each action dispatches.
 
+/// Checked on the box, before the first `systemctl stop`, by every action
+/// that deletes data (wipe, reset, nuke).
+///
+/// The console refuses these actions 09:00–15:45 IST, but only at the moment
+/// it sends them. SSM can deliver a command minutes later (the box was
+/// booting, the agent was reconnecting), so the refusal at send time does
+/// not stop a late delivery from running inside the lock. This line re-reads
+/// the box clock and stops before anything has been stopped or deleted, so a
+/// refused run leaves the app exactly as it was. The window is the same
+/// seconds-of-day as `DATA_DESTRUCTIVE_LOCK_OPEN_SECS` /
+/// `DATA_DESTRUCTIVE_LOCK_CLOSE_SECS` (pinned by
+/// `test_on_box_lock_guard_runs_before_the_first_stop`).
+///
+/// Exit 3, not 1: the reset's SEBI step reserves `exit 1` for `sebi_abort`.
+pub const ON_BOX_LOCK_GUARD: &str = r#"NOW=$(date -u +%s); case "$NOW" in ''|*[!0-9]*) echo 'LOCKED-ON-BOX: the box clock could not be read, so nothing was stopped or deleted.'; exit 3 ;; esac; SOD=$(((NOW + 19800) % 86400)); if [ "$SOD" -ge 32400 ] && [ "$SOD" -lt 56700 ]; then echo 'LOCKED-ON-BOX: this reached the box inside the 09:00-15:45 IST lock, so nothing was stopped or deleted. Run it again after 15:45.'; exit 3; fi"#;
+
 /// legacy: `lambda_handler wipe-questdb cmds` (handler.py:1126-1197) — captured from the RUNNING oracle.
-pub const WIPE_QUESTDB_COMMANDS: [&str; 10] = [
+pub const WIPE_QUESTDB_COMMANDS: [&str; 11] = [
     r#"set +e"#,
+    ON_BOX_LOCK_GUARD,
     r#"systemctl stop tickvault || true"#,
     r#"systemctl disable tickvault || true"#,
     r#"rm -rf /opt/tickvault/data/ws_wal /opt/tickvault/data/groww /opt/tickvault/data/spill /opt/tickvault/data/dlq /opt/tickvault/data/instrument-cache 2>/dev/null || true"#,
@@ -39,21 +56,33 @@ pub const WIPE_QUESTDB_COMMANDS: [&str; 10] = [
     // It is in BOTH halves now. Verification-only would have been worse than
     // useless: the tool would report WIPE-PARTIAL forever while never
     // truncating the table it complains about.
+    //
+    // 2026-09-27 (audit PR28): the wipe no longer truncates `prev_day_ohlcv`
+    // or the four `rest_*` tables. Every one of them is on the never-delete
+    // list (`DAY_PARTITIONED_TABLES` in the storage crate's
+    // partition_manager.rs, the same list the reset saves before it deletes
+    // anything), and daily-universe Quote 21 names `rest_fetch_audit` and the
+    // REST minute tables as KEPT by a fresh-start wipe. The 2026-07-16
+    // extension that added them predates both. The targets are now the
+    // market data only: `ticks`, `market_depth` and the candle tables.
+    // `test_wipe_never_targets_a_never_delete_table` reads the storage list
+    // and fails if any target is on it.
     r#"QDB='http://127.0.0.1:9000'
 ALL=$(curl -fsS --max-time 15 --get --data-urlencode 'query=SELECT table_name FROM tables()' "$QDB/exp" | tail -n +2 | tr -d '"\r' | sed '/^$/d')
-TARGETS=$(printf '%s\n' "$ALL" | awk '$0=="ticks" || $0=="market_depth" || (index($0,"candles_")==1 && $0!="candles_named") || $0=="prev_day_ohlcv" || $0=="rest_spot_1m" || $0=="rest_option_chain_1m" || $0=="rest_option_contract_1m" || $0=="rest_fetch_audit"' | sort)
+TARGETS=$(printf '%s\n' "$ALL" | awk '$0=="ticks" || $0=="market_depth" || (index($0,"candles_")==1 && $0!="candles_named")' | sort)
 echo "WIPE-TARGETS $(printf '%s\n' "$TARGETS" | sed '/^$/d' | wc -l | tr -d ' ') $(printf '%s\n' "$TARGETS" | sed '/^$/d' | paste -sd' ' -)"
 for t in $TARGETS; do
   if curl -fsS --max-time 30 --get --data-urlencode "query=TRUNCATE TABLE $t" "$QDB/exec" >/dev/null; then echo "TRUNCATED $t"; else echo "TRUNCATE-FAILED $t"; fi
 done"#,
     r#"systemctl enable tickvault || true"#,
     r#"systemctl start tickvault || true"#,
-    r#"sleep 3; qc() { curl -fsS "http://127.0.0.1:9000/exec?query=SELECT%20count()%20FROM%20$1" 2>/dev/null | grep -o '\[\[[0-9]*' | grep -o '[0-9]*'; }; T=$(qc ticks); D=$(qc market_depth); C=$(qc candles_1m); P=$(qc prev_day_ohlcv); S=$(qc rest_spot_1m); O=$(qc rest_option_chain_1m); K=$(qc rest_option_contract_1m); A=$(qc rest_fetch_audit); echo "WIPE-RESULT ticks=${T:-?} market_depth=${D:-?} candles_1m=${C:-?} prev_day_ohlcv=${P:-?} rest_spot_1m=${S:-?} rest_option_chain_1m=${O:-?} rest_option_contract_1m=${K:-?} rest_fetch_audit=${A:-?}"; if [ "${T:-0}" = 0 ] && [ "${D:-0}" = 0 ] && [ "${C:-0}" = 0 ] && [ "${P:-0}" = 0 ] && [ "${S:-0}" = 0 ] && [ "${O:-0}" = 0 ] && [ "${K:-0}" = 0 ] && [ "${A:-0}" = 0 ]; then echo WIPE-COMPLETE; else echo 'WIPE-PARTIAL: rows remain — inspect the counts + TRUNCATE-FAILED lines above'; fi"#,
+    r#"sleep 3; qc() { curl -fsS "http://127.0.0.1:9000/exec?query=SELECT%20count()%20FROM%20$1" 2>/dev/null | grep -o '\[\[[0-9]*' | grep -o '[0-9]*'; }; T=$(qc ticks); D=$(qc market_depth); C=$(qc candles_1m); echo "WIPE-RESULT ticks=${T:-?} market_depth=${D:-?} candles_1m=${C:-?}"; if [ "${T:-0}" = 0 ] && [ "${D:-0}" = 0 ] && [ "${C:-0}" = 0 ]; then echo WIPE-COMPLETE; else echo 'WIPE-PARTIAL: rows remain — inspect the counts + TRUNCATE-FAILED lines above'; fi"#,
 ];
 
 /// legacy: `lambda_handler docker-reset cmds` (handler.py:1258-1306) — captured from the RUNNING oracle.
 pub const DOCKER_RESET_COMMANDS: [&str; 18] = [
     r#"set +e"#,
+    ON_BOX_LOCK_GUARD,
     // 2026-09-27 (audit PR20): also DISABLED while the action runs. The
     // 15-minute autopilot restarts a stopped-but-enabled app, and the app
     // brings QuestDB back up, which would write the volume mid-save. A
@@ -179,7 +208,41 @@ wal_behind() {
   WT=$(curl -fsS --max-time 15 --get --data-urlencode 'query=SELECT name, suspended, writerTxn, sequencerTxn FROM wal_tables()' "$QDB/exp" 2>/dev/null) || { echo unknown; return; }
   printf '%s\n' "$WT" | tail -n +2 | tr -d '"\r' | awk -F, -v s=" $SEBI " 'index(s, " " $1 " ") && ($2 == "true" || $3 != $4) {n++} END {print n + 0}'
 }
-MODE=export
+# Stop the database so its files are quiescent, and record what is running
+# against the volume so a restart during the copy is caught.
+stop_qdb() {
+  docker stop tv-questdb >/dev/null 2>&1 || true
+  [ -z "$(docker ps -q --filter volume=tv-questdb-data 2>/dev/null)" ] || sebi_abort 'The database could not be stopped, so its files cannot be copied safely.'
+  Q0=$(qdb_quiet)
+}
+# Copy the table folders in DIRS off the volume into $OUT/raw, each checked
+# file for file and byte for byte against its source. The database must be
+# stopped first (stop_qdb).
+raw_copy() {
+  # shellcheck disable=SC2086
+  NEED=$(du -sbc $DIRS 2>/dev/null | tail -n 1 | cut -f1)
+  case "$NEED" in ''|*[!0-9]*) sebi_abort 'The size of the tables to save could not be read.' ;; esac
+  mkdir -p "$OUT/raw" || sebi_abort 'The save folder could not be created.'
+  room_for "$OUT/raw" "$NEED"
+  # The name-to-folder registry, so a restore can map the folders back.
+  for f in "$MP/db"/tables.d* "$MP/db"/_tab_index.d; do
+    [ -f "$f" ] || continue
+    cp -a "$f" "$OUT/raw/" || sebi_abort 'The table registry could not be copied off the volume.'
+  done
+  for d in $DIRS; do
+    budget_check
+    [ "$(qdb_quiet)" = "$Q0" ] || sebi_abort 'Something restarted the database during the copy, so the copied files may be incomplete.'
+    n=$(basename "$d")
+    if timeout "$(left)" cp -a "$d" "$OUT/raw/$n" && [ "$(fbytes "$d")" = "$(fbytes "$OUT/raw/$n")" ]; then
+      echo "SEBI-PRESERVED-RAW $n $(fbytes "$OUT/raw/$n") files:bytes -> $OUT/raw/$n"
+    else
+      echo "SEBI-PRESERVE-FAILED $n"
+      sebi_abort "Copying the table $n off the volume failed or came out different."
+    fi
+  done
+  [ "$(qdb_quiet)" = "$Q0" ] || sebi_abort 'Something restarted the database during the copy, so the copied files may be incomplete.'
+}
+MODE=export; EXPORTED=''
 if [ -z "$ALL" ]; then
   MODE=raw
   echo 'SEBI-PRESERVE-UNAVAILABLE: QuestDB did not answer — copying the 5-year tables straight off the database volume instead.'
@@ -194,35 +257,12 @@ fi
 if [ "$MODE" = raw ]; then
   VOLS=$(docker volume ls -q 2>/dev/null) || sebi_abort 'Docker did not answer, so the database volume could not be checked.'
   if printf '%s\n' "$VOLS" | grep -qx tv-questdb-data; then
-    docker stop tv-questdb >/dev/null 2>&1 || true
-    [ -z "$(docker ps -q --filter volume=tv-questdb-data 2>/dev/null)" ] || sebi_abort 'The database could not be stopped, so its files cannot be copied safely.'
-    Q0=$(qdb_quiet)
+    stop_qdb
     MP=$(docker volume inspect -f '{{.Mountpoint}}' tv-questdb-data 2>/dev/null)
     [ -n "$MP" ] && [ -d "$MP/db" ] || sebi_abort 'The database files could not be found on the volume.'
     sebi_dirs
     if [ -n "$DIRS" ]; then
-      # shellcheck disable=SC2086
-      NEED=$(du -sbc $DIRS 2>/dev/null | tail -n 1 | cut -f1)
-      case "$NEED" in ''|*[!0-9]*) sebi_abort 'The size of the tables to save could not be read.' ;; esac
-      mkdir -p "$OUT/raw" || sebi_abort 'The save folder could not be created.'
-      room_for "$OUT/raw" "$NEED"
-      # The name-to-folder registry, so a restore can map the folders back.
-      for f in "$MP/db"/tables.d* "$MP/db"/_tab_index.d; do
-        [ -f "$f" ] || continue
-        cp -a "$f" "$OUT/raw/" || sebi_abort 'The table registry could not be copied off the volume.'
-      done
-      for d in $DIRS; do
-        budget_check
-        [ "$(qdb_quiet)" = "$Q0" ] || sebi_abort 'Something restarted the database during the copy, so the copied files may be incomplete.'
-        n=$(basename "$d")
-        if timeout "$(left)" cp -a "$d" "$OUT/raw/$n" && [ "$(fbytes "$d")" = "$(fbytes "$OUT/raw/$n")" ]; then
-          echo "SEBI-PRESERVED-RAW $n $(fbytes "$OUT/raw/$n") files:bytes -> $OUT/raw/$n"
-        else
-          echo "SEBI-PRESERVE-FAILED $n"
-          sebi_abort "Copying the table $n off the volume failed or came out different."
-        fi
-      done
-      [ "$(qdb_quiet)" = "$Q0" ] || sebi_abort 'Something restarted the database during the copy, so the copied files may be incomplete.'
+      raw_copy
     fi
   else
     echo 'SEBI-VOLUME-ABSENT: there is no database volume, so there is nothing to lose.'
@@ -253,6 +293,7 @@ else
         case "$ROWS" in ''|*[!0-9]*) echo "SEBI-PRESERVE-FAILED $t"; sebi_abort "The row count of $t could not be read to check its export." ;; esac
         if [ "$LINES" -ge 1 ] && [ $((LINES - 1)) -ge "$ROWS" ]; then
           echo "SEBI-PRESERVED $t $ROWS rows $(wc -c <"$OUT/$t.csv" | tr -d ' ') bytes -> $OUT/$t.csv"
+          EXPORTED="$EXPORTED $t"
         else
           echo "SEBI-PRESERVE-FAILED $t"
           sebi_abort "The export of $t came out short ($((LINES - 1)) of $ROWS rows)."
@@ -265,15 +306,68 @@ else
       echo "SEBI-ABSENT $t"
     fi
   done
+  # 2026-09-27 (audit PR28): the table list above came from ONE bounded
+  # query. A list cut short (a timeout mid-body, a partial reply), a table
+  # whose metadata QuestDB could not load, or a folder left under a table's
+  # old name after a rename all made a kept table read as absent, and the
+  # volume holding it was then deleted. Every folder of a kept table that was
+  # not exported is now copied off the volume as it is, the same way the
+  # raw mode copies it. When the volume exists but its folders cannot be
+  # read, nothing can be proven, so that stops the action.
+  if [ -n "$MP" ] && [ -d "$MP/db" ]; then
+    DIRS=''
+    for t in $SEBI; do
+      case " $EXPORTED " in *" $t "*) continue ;; esac
+      for d in "$MP/db/$t" "$MP/db/$t"~*; do
+        [ -d "$d" ] && DIRS="$DIRS $d"
+      done
+    done
+    if [ -n "$DIRS" ]; then
+      echo "SEBI-PRESERVE-UNLISTED:$DIRS are folders of 5-year tables that QuestDB did not list, so they were not exported. Copying them straight off the database volume."
+      stop_qdb
+      raw_copy
+    fi
+  elif docker volume inspect tv-questdb-data >/dev/null 2>&1; then
+    sebi_abort 'The database volume exists but its folders could not be read, so it cannot be proven that every 5-year table was saved.'
+  fi
+fi
+# 2026-09-27 (audit PR28): a copy on this box's own disk is lost with the
+# disk. The save is streamed to the cold bucket as ONE tar object (a raw save
+# is a database's folder tree, often hundreds of thousands of files, which a
+# file-by-file upload and listing could not finish inside the budget), and
+# the object's size in the bucket must equal the bytes tar wrote before
+# anything is deleted. The upload carries the CLI's own part checksums. The
+# box copy is kept too; nothing here deletes a saved folder (Quote 25).
+if [ -d "$OUT" ] && [ -n "$(find "$OUT" -type f -print -quit 2>/dev/null)" ]; then
+  budget_check
+  KEY="sebi-preserve/$(basename "$OUT").tar"
+  TLOG=/run/tv-sebi-preserve-tar.log
+  HINT=$(du -sb "$OUT" 2>/dev/null | cut -f1)
+  case "$HINT" in ''|*[!0-9]*) HINT=0 ;; esac
+  ( set -o pipefail; tar --totals -C "$OUT" -cf - . 2>"$TLOG" | timeout "$(left)" aws s3 cp --only-show-errors --region ap-south-1 --expected-size $((HINT + 1073741824)) - "s3://tv-prod-cold/$KEY" ) || sebi_abort "The saved tables could not be copied to the cloud bucket (s3://tv-prod-cold/$KEY)."
+  TBYTES=$(sed -n 's/^Total bytes written: \([0-9]*\).*/\1/p' "$TLOG" | tail -n 1)
+  RBYTES=$(timeout 60 aws s3api head-object --region ap-south-1 --bucket tv-prod-cold --key "$KEY" --query ContentLength --output text 2>/dev/null)
+  case "$TBYTES" in ''|*[!0-9]*) sebi_abort 'The size of the cloud copy could not be read back from tar.' ;; esac
+  [ "$TBYTES" = "$RBYTES" ] || sebi_abort "The cloud copy does not match the save (tar wrote $TBYTES bytes, the bucket holds ${RBYTES:-nothing})."
+  echo "SEBI-PRESERVED-CLOUD $TBYTES bytes -> s3://tv-prod-cold/$KEY"
 fi
 lock_check"#,
     r#"docker ps -aq --filter volume=tv-questdb-data | xargs -r docker rm -f 2>/dev/null || true"#,
     r#"docker rm -f tv-questdb tv-loki tv-alloy 2>/dev/null || true"#,
-    r#"cd /opt/tickvault/repo/deploy/docker || exit 0"#,
-    r#"docker compose down -v --remove-orphans || true"#,
+    // 2026-09-27 (audit PR28): was `cd … || exit 0` followed by the compose
+    // line. SSM runs this list as ONE script, so that `exit 0` ended the whole
+    // action with the app stopped and disabled, and the 15-minute autopilot
+    // reads a disabled unit as intentional. A missing compose folder now only
+    // skips the compose step; the enable and restart below still run.
+    r#"if cd /opt/tickvault/repo/deploy/docker; then docker compose down -v --remove-orphans || true; else echo 'DOCKER-RESET-NOTE: no compose folder, compose step skipped'; fi"#,
     r#"docker volume rm -f tv-questdb-data 2>/dev/null || true"#,
     r#"docker system prune -af --volumes || true"#,
-    r#"if docker volume inspect tv-questdb-data >/dev/null 2>&1; then echo 'DOCKER-RESET-FAILED: tv-questdb-data still present (in-use) — NOT recreating to avoid re-attaching stale data. Holders:'; docker ps -a --filter volume=tv-questdb-data --format '{{.Names}} ({{.Status}})'; echo docker-reset-FAILED; exit 1; fi"#,
+    // 2026-09-27 (audit PR28): this failure exit brings the database
+    // container back (the steps above removed it) and re-enables and restarts
+    // the app first. Before, it left the unit disabled (see the compose note
+    // above). The volume was NOT removed here, so the database comes back on
+    // the data it already had.
+    r#"if docker volume inspect tv-questdb-data >/dev/null 2>&1; then echo 'DOCKER-RESET-FAILED: tv-questdb-data still present (in-use) — NOT recreating to avoid re-attaching stale data. Holders:'; docker ps -a --filter volume=tv-questdb-data --format '{{.Names}} ({{.Status}})'; echo docker-reset-FAILED; bash /opt/tickvault/repo/scripts/ensure-questdb.sh || true; systemctl enable tickvault || true; systemctl start tickvault || true; exit 1; fi"#,
     r#"echo 'OK: tv-questdb-data removed'"#,
     r#"rm -rf /opt/tickvault/data/instrument-cache /opt/tickvault/data/spill /opt/tickvault/data/dlq /opt/tickvault/data/ws_wal /opt/tickvault/data/groww 2>/dev/null || true"#,
     r#"rm -f /opt/tickvault/data/*/live-ticks.ndjson /opt/tickvault/data/*/*-status.json 2>/dev/null || true"#,
@@ -285,8 +379,9 @@ lock_check"#,
 ];
 
 /// legacy: `lambda_handler docker-nuke-bare cmds` (handler.py:1338-1368) — captured from the RUNNING oracle.
-pub const DOCKER_NUKE_BARE_COMMANDS: [&str; 12] = [
+pub const DOCKER_NUKE_BARE_COMMANDS: [&str; 13] = [
     r#"set +e"#,
+    ON_BOX_LOCK_GUARD,
     r#"systemctl stop tickvault || true"#,
     r#"systemctl disable tickvault || true"#,
     // ---- SEBI PRESERVE (added 2026-08-25) ----
@@ -408,7 +503,41 @@ wal_behind() {
   WT=$(curl -fsS --max-time 15 --get --data-urlencode 'query=SELECT name, suspended, writerTxn, sequencerTxn FROM wal_tables()' "$QDB/exp" 2>/dev/null) || { echo unknown; return; }
   printf '%s\n' "$WT" | tail -n +2 | tr -d '"\r' | awk -F, -v s=" $SEBI " 'index(s, " " $1 " ") && ($2 == "true" || $3 != $4) {n++} END {print n + 0}'
 }
-MODE=export
+# Stop the database so its files are quiescent, and record what is running
+# against the volume so a restart during the copy is caught.
+stop_qdb() {
+  docker stop tv-questdb >/dev/null 2>&1 || true
+  [ -z "$(docker ps -q --filter volume=tv-questdb-data 2>/dev/null)" ] || sebi_abort 'The database could not be stopped, so its files cannot be copied safely.'
+  Q0=$(qdb_quiet)
+}
+# Copy the table folders in DIRS off the volume into $OUT/raw, each checked
+# file for file and byte for byte against its source. The database must be
+# stopped first (stop_qdb).
+raw_copy() {
+  # shellcheck disable=SC2086
+  NEED=$(du -sbc $DIRS 2>/dev/null | tail -n 1 | cut -f1)
+  case "$NEED" in ''|*[!0-9]*) sebi_abort 'The size of the tables to save could not be read.' ;; esac
+  mkdir -p "$OUT/raw" || sebi_abort 'The save folder could not be created.'
+  room_for "$OUT/raw" "$NEED"
+  # The name-to-folder registry, so a restore can map the folders back.
+  for f in "$MP/db"/tables.d* "$MP/db"/_tab_index.d; do
+    [ -f "$f" ] || continue
+    cp -a "$f" "$OUT/raw/" || sebi_abort 'The table registry could not be copied off the volume.'
+  done
+  for d in $DIRS; do
+    budget_check
+    [ "$(qdb_quiet)" = "$Q0" ] || sebi_abort 'Something restarted the database during the copy, so the copied files may be incomplete.'
+    n=$(basename "$d")
+    if timeout "$(left)" cp -a "$d" "$OUT/raw/$n" && [ "$(fbytes "$d")" = "$(fbytes "$OUT/raw/$n")" ]; then
+      echo "SEBI-PRESERVED-RAW $n $(fbytes "$OUT/raw/$n") files:bytes -> $OUT/raw/$n"
+    else
+      echo "SEBI-PRESERVE-FAILED $n"
+      sebi_abort "Copying the table $n off the volume failed or came out different."
+    fi
+  done
+  [ "$(qdb_quiet)" = "$Q0" ] || sebi_abort 'Something restarted the database during the copy, so the copied files may be incomplete.'
+}
+MODE=export; EXPORTED=''
 if [ -z "$ALL" ]; then
   MODE=raw
   echo 'SEBI-PRESERVE-UNAVAILABLE: QuestDB did not answer — copying the 5-year tables straight off the database volume instead.'
@@ -423,35 +552,12 @@ fi
 if [ "$MODE" = raw ]; then
   VOLS=$(docker volume ls -q 2>/dev/null) || sebi_abort 'Docker did not answer, so the database volume could not be checked.'
   if printf '%s\n' "$VOLS" | grep -qx tv-questdb-data; then
-    docker stop tv-questdb >/dev/null 2>&1 || true
-    [ -z "$(docker ps -q --filter volume=tv-questdb-data 2>/dev/null)" ] || sebi_abort 'The database could not be stopped, so its files cannot be copied safely.'
-    Q0=$(qdb_quiet)
+    stop_qdb
     MP=$(docker volume inspect -f '{{.Mountpoint}}' tv-questdb-data 2>/dev/null)
     [ -n "$MP" ] && [ -d "$MP/db" ] || sebi_abort 'The database files could not be found on the volume.'
     sebi_dirs
     if [ -n "$DIRS" ]; then
-      # shellcheck disable=SC2086
-      NEED=$(du -sbc $DIRS 2>/dev/null | tail -n 1 | cut -f1)
-      case "$NEED" in ''|*[!0-9]*) sebi_abort 'The size of the tables to save could not be read.' ;; esac
-      mkdir -p "$OUT/raw" || sebi_abort 'The save folder could not be created.'
-      room_for "$OUT/raw" "$NEED"
-      # The name-to-folder registry, so a restore can map the folders back.
-      for f in "$MP/db"/tables.d* "$MP/db"/_tab_index.d; do
-        [ -f "$f" ] || continue
-        cp -a "$f" "$OUT/raw/" || sebi_abort 'The table registry could not be copied off the volume.'
-      done
-      for d in $DIRS; do
-        budget_check
-        [ "$(qdb_quiet)" = "$Q0" ] || sebi_abort 'Something restarted the database during the copy, so the copied files may be incomplete.'
-        n=$(basename "$d")
-        if timeout "$(left)" cp -a "$d" "$OUT/raw/$n" && [ "$(fbytes "$d")" = "$(fbytes "$OUT/raw/$n")" ]; then
-          echo "SEBI-PRESERVED-RAW $n $(fbytes "$OUT/raw/$n") files:bytes -> $OUT/raw/$n"
-        else
-          echo "SEBI-PRESERVE-FAILED $n"
-          sebi_abort "Copying the table $n off the volume failed or came out different."
-        fi
-      done
-      [ "$(qdb_quiet)" = "$Q0" ] || sebi_abort 'Something restarted the database during the copy, so the copied files may be incomplete.'
+      raw_copy
     fi
   else
     echo 'SEBI-VOLUME-ABSENT: there is no database volume, so there is nothing to lose.'
@@ -482,6 +588,7 @@ else
         case "$ROWS" in ''|*[!0-9]*) echo "SEBI-PRESERVE-FAILED $t"; sebi_abort "The row count of $t could not be read to check its export." ;; esac
         if [ "$LINES" -ge 1 ] && [ $((LINES - 1)) -ge "$ROWS" ]; then
           echo "SEBI-PRESERVED $t $ROWS rows $(wc -c <"$OUT/$t.csv" | tr -d ' ') bytes -> $OUT/$t.csv"
+          EXPORTED="$EXPORTED $t"
         else
           echo "SEBI-PRESERVE-FAILED $t"
           sebi_abort "The export of $t came out short ($((LINES - 1)) of $ROWS rows)."
@@ -494,6 +601,50 @@ else
       echo "SEBI-ABSENT $t"
     fi
   done
+  # 2026-09-27 (audit PR28): the table list above came from ONE bounded
+  # query. A list cut short (a timeout mid-body, a partial reply), a table
+  # whose metadata QuestDB could not load, or a folder left under a table's
+  # old name after a rename all made a kept table read as absent, and the
+  # volume holding it was then deleted. Every folder of a kept table that was
+  # not exported is now copied off the volume as it is, the same way the
+  # raw mode copies it. When the volume exists but its folders cannot be
+  # read, nothing can be proven, so that stops the action.
+  if [ -n "$MP" ] && [ -d "$MP/db" ]; then
+    DIRS=''
+    for t in $SEBI; do
+      case " $EXPORTED " in *" $t "*) continue ;; esac
+      for d in "$MP/db/$t" "$MP/db/$t"~*; do
+        [ -d "$d" ] && DIRS="$DIRS $d"
+      done
+    done
+    if [ -n "$DIRS" ]; then
+      echo "SEBI-PRESERVE-UNLISTED:$DIRS are folders of 5-year tables that QuestDB did not list, so they were not exported. Copying them straight off the database volume."
+      stop_qdb
+      raw_copy
+    fi
+  elif docker volume inspect tv-questdb-data >/dev/null 2>&1; then
+    sebi_abort 'The database volume exists but its folders could not be read, so it cannot be proven that every 5-year table was saved.'
+  fi
+fi
+# 2026-09-27 (audit PR28): a copy on this box's own disk is lost with the
+# disk. The save is streamed to the cold bucket as ONE tar object (a raw save
+# is a database's folder tree, often hundreds of thousands of files, which a
+# file-by-file upload and listing could not finish inside the budget), and
+# the object's size in the bucket must equal the bytes tar wrote before
+# anything is deleted. The upload carries the CLI's own part checksums. The
+# box copy is kept too; nothing here deletes a saved folder (Quote 25).
+if [ -d "$OUT" ] && [ -n "$(find "$OUT" -type f -print -quit 2>/dev/null)" ]; then
+  budget_check
+  KEY="sebi-preserve/$(basename "$OUT").tar"
+  TLOG=/run/tv-sebi-preserve-tar.log
+  HINT=$(du -sb "$OUT" 2>/dev/null | cut -f1)
+  case "$HINT" in ''|*[!0-9]*) HINT=0 ;; esac
+  ( set -o pipefail; tar --totals -C "$OUT" -cf - . 2>"$TLOG" | timeout "$(left)" aws s3 cp --only-show-errors --region ap-south-1 --expected-size $((HINT + 1073741824)) - "s3://tv-prod-cold/$KEY" ) || sebi_abort "The saved tables could not be copied to the cloud bucket (s3://tv-prod-cold/$KEY)."
+  TBYTES=$(sed -n 's/^Total bytes written: \([0-9]*\).*/\1/p' "$TLOG" | tail -n 1)
+  RBYTES=$(timeout 60 aws s3api head-object --region ap-south-1 --bucket tv-prod-cold --key "$KEY" --query ContentLength --output text 2>/dev/null)
+  case "$TBYTES" in ''|*[!0-9]*) sebi_abort 'The size of the cloud copy could not be read back from tar.' ;; esac
+  [ "$TBYTES" = "$RBYTES" ] || sebi_abort "The cloud copy does not match the save (tar wrote $TBYTES bytes, the bucket holds ${RBYTES:-nothing})."
+  echo "SEBI-PRESERVED-CLOUD $TBYTES bytes -> s3://tv-prod-cold/$KEY"
 fi
 lock_check"#,
     r#"docker ps -aq | xargs -r docker rm -f 2>/dev/null || true"#,

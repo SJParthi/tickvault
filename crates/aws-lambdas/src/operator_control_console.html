@@ -535,8 +535,11 @@ async function bareNuke(){
 async function pollNuke(cid,n){
   if(n>40){ toast('⏳ still running after 3+ min — re-check the box manually'); setTimeout(loadOverview,4000); return; }
   const s=await call('command-status',{command_id:cid}); const st=(s&&s.status)||'', out=(s&&s.stdout_tail)||'';
+  if(st==='DeliveryTimedOut'){ toast('⏳ the box did not pick this up within 2 minutes, so it was NOT run. Nothing was deleted.'); setTimeout(loadOverview,4000); return; }
   if(st==='Success'||st==='Failed'||st==='Cancelled'||st==='TimedOut'){
-    if(out.indexOf('DOCKER-RESET-FAILED')>=0){ toast('🔴 NUKE FAILED — QuestDB volume still in use, data NOT wiped. Check the box.'); }
+    if(out.indexOf('LOCKED-ON-BOX')>=0){ toast('🔒 refused on the box: it is inside the 9:00 AM to 3:45 PM lock. Nothing was stopped or deleted.'); }
+    else if(out.indexOf('SEBI-PRESERVE-ABORT')>=0){ toast('🔴 stopped before deleting anything: the 5-year records could not be saved first. The app was restarted.'); }
+    else if(out.indexOf('DOCKER-RESET-FAILED')>=0){ toast('🔴 NUKE FAILED — QuestDB volume still in use, data NOT wiped. Check the box.'); }
     else if(out.indexOf('bare-nuke-complete')>=0){ toast('☢️ BARE NUKE complete — 0 containers, 0 images, 0 volumes. Box is empty + DEAD (redeploy to restart).'); }
     else if(out.indexOf('bare-nuke-PARTIAL')>=0){ toast('🟠 bare nuke PARTIAL — something is still in-use. '+(out.match(/BARE-NUKE-RESULT[^\n]*/)||[''])[0]); }
     else if(out.indexOf('docker-reset-dispatched')>=0){ toast('✅ nuke complete — empty DB; app restarting'); }
