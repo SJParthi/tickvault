@@ -299,6 +299,7 @@ folded into them below), then PR18, PR19 and the decisions.
   - Market data packed in the same frame as a disconnect message is thrown away
     (connection.rs:1885-1915): capture the frame before closing. Lands with PR9's walker if that
     PR is first.
+    **Done in PR21 (2026-09-27).**
 - [ ] **Folded into existing PRs:**
   - PR5: seven more dead crash-recovery sites under `panic = "abort"` (order_leg_pnl_boot.rs:221,
     day_ohlc_orchestrator.rs:315, tf_consistency_boot.rs:2287, order_runtime.rs:437,
@@ -415,7 +416,7 @@ PR25–PR27, PR18, PR19 and the decisions. One PR open at a time, as before.
     the first deletion. `is_data_destructive_locked` + `DATA_DESTRUCTIVE_LOCK_{OPEN,CLOSE}_SECS`
     (09:00–15:45 every day). Tests: `destructive_actions_export_the_sebi_tables_before_destroying_the_volume`,
     `test_is_data_destructive_locked_boundaries`, `test_data_destructive_lock_window_matches_the_rule_file`.
-- [ ] **PR21 — after an 805, nothing dials another depth socket.** (`app`, `core`)
+- [x] **PR21 — after an 805, nothing dials another depth socket.** (`app`, `core`)
   - Only `depth_rebalance.rs:1205` checks `ROTATION_HALTED`; the morning depth attach and the
     contract top-up keep dialling, and each extra socket makes Dhan close a healthy sibling
     (dhan_feed_stack.rs attach loop 10946-12260, :11862-11876). Every depth dial site checks
@@ -424,6 +425,13 @@ PR25–PR27, PR18, PR19 and the decisions. One PR open at a time, as before.
     routine drop, so an 805 there closes a sibling without setting the breaker
     (core/src/websocket/connection.rs:916-950; dhan_feed_stack.rs:8959-8963). Read the reason
     code before the data. Shares the frame walker with PR9 and the PR17 capture fix.
+  - Done 2026-09-27: `classify_frame` walks depth frames with `stacked_depth_disconnect_reason`
+    (depth.rs); the attach, the one production spawn (`dial_planned_connections`), the drain's
+    ghost request, the connection task's ghost/probe close and probe Arm B all read
+    `rotation_halted()` first, counted on `tv_depth_dial_refused_after_805_total{path}`;
+    source-scan tests pin each site. Routine reconnects of an existing socket stay allowed
+    (they keep coverage). The PR17 capture bullet is also done here: a disconnect stacked
+    behind data now hands the frame up and closes on the next read (`pending_close`).
 - [ ] **PR22 — an 807 renews the token at most once.** (`core`)
   - The "already renewed" generation is read when the call starts, not when the 807 arrives,
     so two sockets can each trigger a renewal (token_manager.rs:1272-1297;
