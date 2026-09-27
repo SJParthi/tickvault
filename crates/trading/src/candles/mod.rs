@@ -67,6 +67,6 @@ pub use aggregator_cell::{
     AggregatorCell, ConsumeOutcome, FeedStrategy, LatePolicy, tick_price_is_sane,
 };
 pub use live_candle_state::LiveCandleState;
-pub use multi_tf_aggregator::{AGGREGATOR_MAX_SLOTS, ConsumeStats, MultiTfAggregator};
+pub use multi_tf_aggregator::{AGGREGATOR_MAX_SLOTS, ConsumeStats, MultiTfAggregator, WindowBar};
 pub use seal_ring::{BufferOutcome, BufferedSeal, SEAL_BUFFER_CAPACITY, SealRing};
 pub use tf_index::{TF_COUNT, TfIndex};

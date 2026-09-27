@@ -37,17 +37,35 @@
 //!
 //! # Honest consequences
 //!
-//! - A contract's window now ends when its key is visited, not at the timer
-//!   instant — up to one sweep's duration later. Volume is cumulative and each
-//!   visit rolls the baseline it read, so nothing is lost or counted twice; a
-//!   trade in that gap is reported in this window instead of the next.
-//! - If a cadence fires while its previous job is still queued or running, the
-//!   fire is DEFERRED and its window is DROPPED: the fire rolls that window's
-//!   baselines, so the next job measures only its own window instead of two
-//!   windows under one `ts`. The skipped window has no rows; the candle tables
-//!   still carry its volume. Counted on [`TOP_VOLUME_SWEEP_DEFERRED_COUNTER`]
-//!   and logged.
-//! - The candle columns are read when the row is projected, not at the fire.
+//! - Since audit PR4c-2 (2026-09-26) a window is ranked once, after its candle
+//!   closes ([`WindowCloseClock`]), and each contract's volume is read from
+//!   that window's own candle bar in the fold. There is no baseline and no
+//!   roll. The board reads the bar when the key is visited: a tick that
+//!   reaches the fold after the close margin but before the visit is in the
+//!   board if its contract was already on the job's list, and one that
+//!   arrives after the visit is in the candle and not in the board.
+//! - **A late tick for a contract NOT already on the job's list** (its only
+//!   trade in the window arrives after the list was taken, i.e. more than the
+//!   one-second close margin behind the newest tick of the feed, as a lagging
+//!   socket can deliver) is in that window's candle and on no board: the next
+//!   job reads the next window's bar and finds none. Not counted, because a
+//!   visit cannot tell it apart from a key left over from a window before the
+//!   capture window. The candle table is the record of it.
+//! - A window that closes while its cadence's previous job is still queued or
+//!   running WAITS: the close clock reports windows oldest first and is only
+//!   advanced when a board can be queued, so windows that close together are
+//!   each ranked. Only when it falls more than
+//!   [`WINDOW_CLOSE_CATCH_UP_WINDOWS`] behind are the oldest skipped, counted
+//!   on [`TOP_VOLUME_SWEEP_DEFERRED_COUNTER`] and logged; the candle tables
+//!   still carry their volume.
+//! - The fold keeps only a contract's open bar and its last sealed one, and a
+//!   contract that trades every second seals over a 1-second window's bar
+//!   before any sweep can reach it. So every seal of a board frame also
+//!   leaves the window's volume in the leaderboard
+//!   ([`crate::volume_leaderboard::SEALED_WINDOW_HISTORY`] windows deep),
+//!   and the board reads it there. A contract whose window is gone from both
+//!   is left off the board and counted, not ranked on a guess.
+//! - The candle columns are read when the row is projected, not at the close.
 //!   The fold keeps the open bar and the last sealed one, so a job that
 //!   projects after its window has rolled out of the fold stores those columns
 //!   empty. Counted on [`TOP_VOLUME_SWEEP_CANDLE_MISS_COUNTER`] and logged.
@@ -56,26 +74,165 @@ use std::collections::VecDeque;
 
 use tickvault_storage::top_volume_rank_persistence::{SnapshotCadence, TopVolumeLabelMap};
 
-use crate::volume_leaderboard::{GainerWalk, RankedContract, WINDOW_COUNT};
+use crate::volume_leaderboard::{GainerWalk, RankedContract, SEALED_WINDOW_HISTORY, WINDOW_COUNT};
 
 /// Rows a single step of the sweep may touch. At the measured ~50–150 ns per
 /// row (one to three hash probes and a row build), one step is tens of
 /// microseconds — the longest a queued frame waits behind the sweep.
 pub const TOP_VOLUME_SWEEP_STEP_ROWS: usize = 512;
 
-/// Counts cadence fires that found their previous job still queued or
-/// running, so their window was skipped.
+/// Counts windows that got no board: a cadence closed while its previous job
+/// was still queued or running, or the drain only noticed a later close.
 pub const TOP_VOLUME_SWEEP_DEFERRED_COUNTER: &str = "tv_top_volume_sweep_deferred_total";
 
-/// Keys a single step of a sliced baseline roll may visit (audit PR4b). A
-/// roll visit is one hash probe and two integer writes, several times cheaper
-/// than a sweep row, so a step of this many keys stays in the same tens of
-/// microseconds as one sweep step.
-pub const TOP_VOLUME_ROLL_STEP_KEYS: usize = 2_048;
+/// Seconds the CANDLE clock (the fold's watermark, the newest exchange second
+/// it has consumed) must run past a window's close before the window is
+/// ranked. Dhan stamps a tick with a whole exchange second, so a tick of the
+/// window's last second can still arrive after the first tick of the next
+/// second; one second of margin lets it land in the bar before the board
+/// reads that bar.
+pub const WINDOW_CLOSE_LATENESS_SECS: u32 = 1;
 
-/// Counts rolls that ran in ONE pass on the timer arm because the previous
-/// roll of the same cadence had not finished (the saturation fallback).
-pub const TOP_VOLUME_ROLL_INLINE_COUNTER: &str = "tv_top_volume_roll_inline_total";
+/// Seconds the WALL clock must run past a window's close before the window is
+/// ranked even though no tick moved the candle clock: a quiet contract set, a
+/// feed gap, or the minutes before the first tick of the day.
+pub const WINDOW_CLOSE_GRACE_SECS: u32 = 5;
+
+/// The instant, IST epoch seconds, up to which windows count as closed:
+/// the candle clock less [`WINDOW_CLOSE_LATENESS_SECS`], capped AT the wall
+/// clock, and never earlier than the wall clock less
+/// [`WINDOW_CLOSE_GRACE_SECS`].
+///
+/// The cap is the wall itself, with no lead: one future-dated tick moves the
+/// watermark for the rest of the day, and any lead would let it rank a window
+/// whose end has not happened yet, from a partial bar. Capped at the wall, a
+/// board is never ranked before its window has ended by our own clock, and
+/// the candle clock only ever makes a close EARLIER than the grace would.
+///
+/// # Complexity
+/// O(1): two saturating subtractions and two compares.
+#[must_use]
+pub const fn window_close_reference_secs(watermark_secs: u32, wall_secs: u32) -> u32 {
+    let by_candles = watermark_secs.saturating_sub(WINDOW_CLOSE_LATENESS_SECS);
+    let by_candles = if by_candles > wall_secs {
+        wall_secs
+    } else {
+        by_candles
+    };
+    let by_wall = wall_secs.saturating_sub(WINDOW_CLOSE_GRACE_SECS);
+    if by_candles > by_wall {
+        by_candles
+    } else {
+        by_wall
+    }
+}
+
+/// Closed windows of one cadence the clock still catches up on, oldest
+/// first. Older ones are skipped and counted: by the time the clock is that
+/// far behind, a contract that trades every window may have sealed over the
+/// oldest one's bar in the leaderboard's sealed-window history
+/// ([`SEALED_WINDOW_HISTORY`] deep), so its board could no longer be read
+/// in full.
+pub const WINDOW_CLOSE_CATCH_UP_WINDOWS: u32 = SEALED_WINDOW_HISTORY as u32 - 1;
+
+const _: () = assert!(
+    WINDOW_CLOSE_CATCH_UP_WINDOWS >= 1,
+    "the clock must be able to report at least the newest closed window"
+);
+
+/// A window the clock just saw close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowClosed {
+    /// The window's open, IST epoch seconds.
+    pub window_open_ist_secs: u32,
+    /// Earlier windows of the same IST day that closed and will never be
+    /// reported: the clock fell more than [`WINDOW_CLOSE_CATCH_UP_WINDOWS`]
+    /// windows behind. They get no board.
+    pub skipped: u64,
+}
+
+/// Per-cadence record of the next window to close (audit PR4c-2).
+///
+/// The boards are ranked once per window, when its candle closes — the
+/// operator's 2026-09-26 rule — so something has to notice the close. This
+/// is that something: fed the reference instant from
+/// [`window_close_reference_secs`], it reports each window once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WindowCloseClock {
+    next_open: [Option<u32>; WINDOW_COUNT],
+}
+
+impl WindowCloseClock {
+    /// A clock that has seen nothing; its first reading only sets it.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            next_open: [None; WINDOW_COUNT],
+        }
+    }
+
+    /// Reports the OLDEST window of `cadence` that closed at or before
+    /// `reference_secs` and has not been reported yet, and moves past it. One
+    /// window per call: when several closed at once (a frame whose ticks
+    /// crossed two seconds, or a caller that could not queue a board for a
+    /// while), each later call reports the next, so no window with trades in
+    /// it is dropped for arriving together with another. Only when more than
+    /// [`WINDOW_CLOSE_CATCH_UP_WINDOWS`] are waiting are the oldest skipped,
+    /// and counted in `skipped`.
+    ///
+    /// The FIRST reading of a cadence reports nothing and only records where
+    /// the clock stands: a process that boots mid-session would otherwise
+    /// rank a window it saw only the tail of. A reading that moved backwards
+    /// (the wall clock stepped back) reports nothing. A reading on a later
+    /// IST day restarts at that day's newest closed window, counting nothing.
+    ///
+    /// # Complexity
+    /// O(1): a division and a few compares. No allocation.
+    pub fn advance(
+        &mut self,
+        cadence: SnapshotCadence,
+        reference_secs: u32,
+    ) -> Option<WindowClosed> {
+        const SECS_PER_DAY: u32 = 86_400;
+        let slot = cadence.slot()?;
+        let period = u32::try_from(cadence.interval_secs()).ok()?;
+        if period == 0 {
+            return None;
+        }
+        let current_open = reference_secs - reference_secs % period;
+        let closed_open = current_open.checked_sub(period)?;
+        let entry = self.next_open.get_mut(slot)?;
+        let Some(next) = *entry else {
+            *entry = Some(current_open);
+            return None;
+        };
+        if closed_open < next {
+            return None;
+        }
+        // `next ..= closed_open` have closed unreported; `behind` of them are
+        // older than the newest.
+        let behind = (closed_open - next) / period;
+        let (oldest, skipped) = if closed_open / SECS_PER_DAY != next / SECS_PER_DAY {
+            (closed_open, 0)
+        } else if behind >= WINDOW_CLOSE_CATCH_UP_WINDOWS {
+            let oldest = closed_open - (WINDOW_CLOSE_CATCH_UP_WINDOWS - 1) * period;
+            (oldest, u64::from((oldest - next) / period))
+        } else {
+            (next, 0)
+        };
+        *entry = Some(oldest.saturating_add(period));
+        Some(WindowClosed {
+            window_open_ist_secs: oldest,
+            skipped,
+        })
+    }
+
+    /// Forgets every cadence, as at boot. The daily reset calls it so the new
+    /// day starts from its own first reading.
+    pub fn clear(&mut self) {
+        self.next_open = [None; WINDOW_COUNT];
+    }
+}
 
 /// Counts projected rows whose candle bar was no longer in the fold when the
 /// row was projected, so its candle columns were stored empty.
@@ -304,14 +461,32 @@ impl<T: Copy> SliceRadixSort<T> {
 pub struct SweepJob {
     /// The cadence that fired.
     pub cadence: SnapshotCadence,
-    /// The fire instant, IST nanoseconds — the snapshot's `ts` is derived from
-    /// THIS, never from when a later step happens to run, so a sliced job
-    /// writes the same grid cell an inline one would have.
+    /// The window's CLOSE instant, IST nanoseconds (audit PR4c-2; it was the
+    /// timer fire instant, which sat on the same grid). The snapshot's `ts` —
+    /// the window's open — is derived from THIS, never from when a later step
+    /// happens to run.
     pub ts_ist_nanos: i64,
     /// A `top_volume` writer exists, so rows are projected and handed off.
     pub wants_rows: bool,
     /// The depth-200 candidates are due from this cadence.
     pub wants_candidates: bool,
+}
+
+impl SweepJob {
+    /// The open of the window this job ranks, IST epoch seconds: the instant
+    /// floored to the cadence grid, less one period — the same window the
+    /// projection stamps as the row's `ts`, so the volume and the row can
+    /// never name different windows. Saturates at 0 for an instant before the
+    /// epoch, which no production job carries.
+    #[must_use]
+    pub fn window_open_ist_secs(&self) -> u32 {
+        let close_secs = u32::try_from(self.ts_ist_nanos.div_euclid(1_000_000_000)).unwrap_or(0);
+        let period = u32::try_from(self.cadence.interval_secs()).unwrap_or(0);
+        if period == 0 {
+            return close_secs;
+        }
+        (close_secs - close_secs % period).saturating_sub(period)
+    }
 }
 
 /// Where the running job is, per family.
@@ -377,8 +552,6 @@ pub struct TopVolumeSweep {
     pub labels: Option<std::sync::Arc<TopVolumeLabelMap>>,
     deferred: u64,
     deferred_counter: metrics::Counter,
-    roll_inline: u64,
-    roll_inline_counter: metrics::Counter,
     candle_misses: u64,
     candle_miss_counter: metrics::Counter,
 }
@@ -398,8 +571,6 @@ impl TopVolumeSweep {
             labels: None,
             deferred: 0,
             deferred_counter: metrics::counter!(TOP_VOLUME_SWEEP_DEFERRED_COUNTER),
-            roll_inline: 0,
-            roll_inline_counter: metrics::counter!(TOP_VOLUME_ROLL_INLINE_COUNTER),
             candle_misses: 0,
             candle_miss_counter: metrics::counter!(TOP_VOLUME_SWEEP_CANDLE_MISS_COUNTER),
         }
@@ -437,12 +608,19 @@ impl TopVolumeSweep {
         self.deferred
     }
 
-    /// Counts a baseline roll that ran in one pass on the timer arm, and
-    /// returns the running total so the caller can log on powers of two.
-    pub fn record_inline_roll(&mut self) -> u64 {
-        self.roll_inline = self.roll_inline.saturating_add(1);
-        self.roll_inline_counter.increment(1);
-        self.roll_inline
+    /// Counts `windows` closed windows that were never ranked because the
+    /// drain only noticed a LATER close (a stalled drain or a feed gap long
+    /// enough that neither clock was polled). Same counter as
+    /// [`Self::record_deferred`]: both mean "this window has no board".
+    /// Returns the running total when this call crossed a power of two.
+    pub fn record_windows_skipped(&mut self, windows: u64) -> Option<u64> {
+        if windows == 0 {
+            return None;
+        }
+        let before = self.deferred;
+        self.deferred = before.saturating_add(windows);
+        self.deferred_counter.increment(windows);
+        (before.checked_ilog2() != self.deferred.checked_ilog2()).then_some(self.deferred)
     }
 
     /// Counts `misses` rows projected without a candle bar. Returns the new
@@ -737,13 +915,6 @@ mod tests {
     }
 
     #[test]
-    fn test_record_inline_roll_counts_every_fallback() {
-        let mut sweep = TopVolumeSweep::with_capacity(4, 4);
-        assert_eq!(sweep.record_inline_roll(), 1);
-        assert_eq!(sweep.record_inline_roll(), 2);
-    }
-
-    #[test]
     fn test_activate_next_does_not_replace_a_running_job() {
         let mut sweep = TopVolumeSweep::with_capacity(4, 4);
         assert!(!sweep.activate_next(), "nothing queued");
@@ -788,5 +959,235 @@ mod tests {
         assert!(!sweep.is_busy(SnapshotCadence::FiveSecond));
         assert!(sweep.rows.is_empty());
         assert!(sweep.labels.is_none());
+    }
+
+    /// 09:15:00 IST on an arbitrary day, as IST epoch seconds: a whole
+    /// minute, so every cadence's grid lines up on it.
+    const OPEN_0915: u32 = 1_790_000_000 - 1_790_000_000 % 86_400 + 9 * 3_600 + 15 * 60;
+
+    #[test]
+    fn test_window_close_reference_secs_follows_the_candle_clock_inside_its_bounds() {
+        // Candles behind the wall but past its grace: the candle clock less
+        // the lateness margin.
+        assert_eq!(window_close_reference_secs(1_000, 1_001), 999);
+        // The watermark at the wall: capped at the wall, never past it.
+        assert_eq!(window_close_reference_secs(1_002, 1_001), 1_001);
+        // A future-dated tick poisons the watermark: capped at the wall.
+        assert_eq!(window_close_reference_secs(9_999, 1_000), 1_000);
+        assert_eq!(window_close_reference_secs(u32::MAX, 1_000), 1_000);
+        // No tick moved the candle clock: the wall less the grace closes it.
+        assert_eq!(
+            window_close_reference_secs(0, 1_000),
+            1_000 - WINDOW_CLOSE_GRACE_SECS
+        );
+        // Saturates rather than wrapping at the bottom of the range.
+        assert_eq!(window_close_reference_secs(0, 0), 0);
+        assert_eq!(
+            window_close_reference_secs(u32::MAX, u32::MAX),
+            u32::MAX - WINDOW_CLOSE_LATENESS_SECS,
+            "no overflow at the top of the range"
+        );
+    }
+
+    #[test]
+    fn test_window_close_clock_new_first_reading_only_sets_the_clock() {
+        let mut clock = WindowCloseClock::new();
+        assert_eq!(clock, WindowCloseClock::default());
+        assert_eq!(
+            clock.advance(SnapshotCadence::OneSecond, OPEN_0915 + 30),
+            None,
+            "a clock that booted mid-window ranks nothing it saw only the tail of"
+        );
+        assert_eq!(
+            clock.advance(SnapshotCadence::OneSecond, OPEN_0915 + 30),
+            None,
+            "the same second again closes nothing"
+        );
+        assert_eq!(
+            clock.advance(SnapshotCadence::OneSecond, OPEN_0915 + 31),
+            Some(WindowClosed {
+                window_open_ist_secs: OPEN_0915 + 30,
+                skipped: 0,
+            })
+        );
+    }
+
+    /// Hot-path review of audit PR4c-2: a far-future watermark must never
+    /// close a window whose end is after the wall clock, on any cadence, at
+    /// any wall second of a minute.
+    #[test]
+    fn test_far_future_watermark_never_closes_a_window_ending_after_the_wall() {
+        for cadence in SnapshotCadence::ALL {
+            let period = u32::try_from(cadence.interval_secs()).expect("period fits");
+            let mut clock = WindowCloseClock::new();
+            let _ = clock.advance(cadence, OPEN_0915);
+            for offset in 1..=180 {
+                let wall = OPEN_0915 + offset;
+                let reference = window_close_reference_secs(u32::MAX, wall);
+                if let Some(closed) = clock.advance(cadence, reference) {
+                    assert!(
+                        closed.window_open_ist_secs + period <= wall,
+                        "{} window opening at {} ends after the wall {wall}",
+                        cadence.as_str(),
+                        closed.window_open_ist_secs
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_window_close_clock_advance_reports_each_window_once_per_cadence() {
+        let mut clock = WindowCloseClock::new();
+        for cadence in SnapshotCadence::ALL {
+            assert_eq!(clock.advance(cadence, OPEN_0915), None);
+        }
+        // Three seconds later: the 1s and 3s windows opened at 09:15:00 have
+        // closed; the 5s and 1m windows have not. Three 1s windows closed at
+        // once: each is reported, oldest first, one per call.
+        let t = OPEN_0915 + 3;
+        for open in OPEN_0915..t {
+            assert_eq!(
+                clock.advance(SnapshotCadence::OneSecond, t),
+                Some(WindowClosed {
+                    window_open_ist_secs: open,
+                    skipped: 0,
+                }),
+                "windows that closed together are each ranked, oldest first"
+            );
+        }
+        assert_eq!(clock.advance(SnapshotCadence::OneSecond, t), None);
+        assert_eq!(
+            clock.advance(SnapshotCadence::ThreeSecond, t),
+            Some(WindowClosed {
+                window_open_ist_secs: OPEN_0915,
+                skipped: 0,
+            })
+        );
+        assert_eq!(clock.advance(SnapshotCadence::FiveSecond, t), None);
+        assert_eq!(clock.advance(SnapshotCadence::OneMinute, t), None);
+        assert_eq!(
+            clock.advance(SnapshotCadence::OneMinute, OPEN_0915 + 60),
+            Some(WindowClosed {
+                window_open_ist_secs: OPEN_0915,
+                skipped: 0,
+            })
+        );
+        // A reading that stepped backwards reports nothing and moves nothing.
+        assert_eq!(clock.advance(SnapshotCadence::OneSecond, OPEN_0915), None);
+        assert_eq!(
+            clock.advance(SnapshotCadence::OneSecond, t + 1),
+            Some(WindowClosed {
+                window_open_ist_secs: t,
+                skipped: 0,
+            })
+        );
+    }
+
+    /// Review of audit PR4c-2: a frame whose ticks move the candle clock
+    /// across two seconds closes two windows; both are ranked. Only when the
+    /// clock is more than the catch-up bound behind are the oldest skipped.
+    #[test]
+    fn test_window_close_clock_catches_up_oldest_first_within_the_bound() {
+        let mut clock = WindowCloseClock::new();
+        let _ = clock.advance(SnapshotCadence::OneSecond, OPEN_0915);
+        // Windows 09:15:00 and :01 close together.
+        let two = OPEN_0915 + 2;
+        assert_eq!(
+            clock
+                .advance(SnapshotCadence::OneSecond, two)
+                .map(|c| c.window_open_ist_secs),
+            Some(OPEN_0915)
+        );
+        assert_eq!(
+            clock
+                .advance(SnapshotCadence::OneSecond, two)
+                .map(|c| c.window_open_ist_secs),
+            Some(OPEN_0915 + 1)
+        );
+        assert_eq!(clock.advance(SnapshotCadence::OneSecond, two), None);
+        // Ten seconds of no reading: :02 .. :11 closed. Only the newest
+        // WINDOW_CLOSE_CATCH_UP_WINDOWS are ranked; the rest are counted.
+        let later = OPEN_0915 + 12;
+        let first = clock
+            .advance(SnapshotCadence::OneSecond, later)
+            .expect("windows closed");
+        let kept = WINDOW_CLOSE_CATCH_UP_WINDOWS;
+        assert_eq!(first.window_open_ist_secs, later - kept);
+        assert_eq!(first.skipped, u64::from(10 - kept));
+        for offset in (1..kept).rev() {
+            assert_eq!(
+                clock.advance(SnapshotCadence::OneSecond, later),
+                Some(WindowClosed {
+                    window_open_ist_secs: later - offset,
+                    skipped: 0,
+                })
+            );
+        }
+        assert_eq!(clock.advance(SnapshotCadence::OneSecond, later), None);
+    }
+
+    #[test]
+    fn test_window_close_clock_advance_does_not_count_windows_across_a_day() {
+        let mut clock = WindowCloseClock::new();
+        let _ = clock.advance(SnapshotCadence::OneMinute, OPEN_0915);
+        let next_day = OPEN_0915 + 86_400 + 120;
+        let closed = clock
+            .advance(SnapshotCadence::OneMinute, next_day)
+            .expect("a later window closed");
+        assert_eq!(closed.window_open_ist_secs, next_day - 60);
+        assert_eq!(closed.skipped, 0, "the night is not a skipped window");
+    }
+
+    #[test]
+    fn test_window_close_clock_clear_forgets_every_cadence() {
+        let mut clock = WindowCloseClock::new();
+        let _ = clock.advance(SnapshotCadence::OneSecond, OPEN_0915);
+        clock.clear();
+        assert_eq!(clock, WindowCloseClock::new());
+        assert_eq!(
+            clock.advance(SnapshotCadence::OneSecond, OPEN_0915 + 10),
+            None,
+            "after a clear the next reading is a first reading again"
+        );
+    }
+
+    #[test]
+    fn test_window_open_ist_secs_is_the_window_before_the_close_instant() {
+        let close = |cadence, secs: u32| SweepJob {
+            cadence,
+            ts_ist_nanos: i64::from(secs) * 1_000_000_000,
+            wants_rows: true,
+            wants_candidates: false,
+        };
+        assert_eq!(
+            close(SnapshotCadence::OneSecond, OPEN_0915 + 1).window_open_ist_secs(),
+            OPEN_0915
+        );
+        assert_eq!(
+            close(SnapshotCadence::OneMinute, OPEN_0915 + 60).window_open_ist_secs(),
+            OPEN_0915
+        );
+        // An instant inside a window names the window before the one it is in.
+        assert_eq!(
+            close(SnapshotCadence::FiveSecond, OPEN_0915 + 7).window_open_ist_secs(),
+            OPEN_0915
+        );
+        let before_epoch = SweepJob {
+            ts_ist_nanos: -5,
+            ..close(SnapshotCadence::OneSecond, 0)
+        };
+        assert_eq!(before_epoch.window_open_ist_secs(), 0, "saturates at 0");
+    }
+
+    #[test]
+    fn test_record_windows_skipped_shares_the_deferred_count_and_reports_on_powers_of_two() {
+        let mut sweep = TopVolumeSweep::with_capacity(4, 4);
+        assert_eq!(sweep.record_windows_skipped(0), None, "nothing skipped");
+        assert_eq!(sweep.record_windows_skipped(1), Some(1));
+        assert_eq!(sweep.record_deferred(), 2, "one counter for both causes");
+        assert_eq!(sweep.record_windows_skipped(1), None, "3 is inside [2, 4)");
+        assert_eq!(sweep.record_windows_skipped(10), Some(13));
+        assert_eq!(sweep.record_windows_skipped(u64::MAX), Some(u64::MAX));
     }
 }

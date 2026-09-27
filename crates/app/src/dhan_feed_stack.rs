@@ -126,7 +126,7 @@ use tickvault_storage::tick_persistence::TickWriter;
 use tickvault_storage::ws_frame_spill::{WalEndpoint, WsFrameSpill, WsType};
 use tickvault_trading::candles::multi_tf_aggregator::AGGREGATOR_MAX_SLOTS;
 use tickvault_trading::candles::{
-    BufferedSeal, ConsumeStats, FeedStrategy, MultiTfAggregator, TfIndex,
+    BufferedSeal, ConsumeStats, FeedStrategy, LiveCandleState, MultiTfAggregator, TfIndex,
 };
 use tracing::{error, info, warn};
 
@@ -1565,6 +1565,14 @@ pub struct LiveIngest {
     /// PR4, 2026-09-26). The cadence timer arms only queue a job here; see
     /// [`crate::top_volume_sweep`] for why and for what that costs.
     top_volume_sweep: crate::top_volume_sweep::TopVolumeSweep,
+    /// Where each cadence's next window closes (audit PR4c-2): a board is
+    /// ranked once its candle has closed, noticed by the candle clock after
+    /// each frame or by the wall clock on the timer arms.
+    top_volume_close_clock: crate::top_volume_sweep::WindowCloseClock,
+    /// The wall clock, IST epoch seconds, at the last timer poll; `0` until
+    /// the first. The per-frame poll caps the candle clock against it without
+    /// reading a clock of its own.
+    top_volume_wall_secs: u32,
     /// The catch-up seal sweep in progress, if any (audit PR4b, 2026-09-26).
     /// The 5 s timer arm only sets this; the drain's idle arm advances it
     /// [`CATCHUP_SEAL_STEP_SLOTS`] slots at a time.
@@ -1638,6 +1646,83 @@ const fn fold_frame_for_cadence(
     }
 }
 
+/// The rank key's source (audit PR4c-2): what the fold holds for `contract`
+/// in the window opening at `window_open_ist_secs`, on the fold frame whose
+/// bar IS that window's candle. The one place the board reads a volume, so
+/// the board and `candles_<tf>` carry the same figure for the same window.
+///
+/// # Complexity
+/// O(1): one hash probe into the fold and two bar copies. No allocation.
+fn window_read(
+    aggregator: &MultiTfAggregator,
+    contract: &crate::volume_leaderboard::RankedContract,
+    fold_frame: TfIndex,
+    window_open_ist_secs: u32,
+) -> crate::volume_leaderboard::WindowRead {
+    crate::volume_leaderboard::WindowRead::from_window_bar(
+        aggregator.window_bar(
+            Feed::Dhan,
+            contract.security_id,
+            contract.segment.binary_code(),
+            fold_frame,
+            window_open_ist_secs,
+        ),
+        window_open_ist_secs,
+    )
+}
+
+/// The board cadence whose candle IS fold frame `tf`, if any: the inverse of
+/// [`fold_frame_for_cadence`].
+///
+/// # Complexity
+/// O(1) — a match, no allocation.
+const fn board_cadence_for_fold_frame(
+    tf: TfIndex,
+) -> Option<tickvault_storage::top_volume_rank_persistence::SnapshotCadence> {
+    use tickvault_storage::top_volume_rank_persistence::SnapshotCadence;
+    match tf {
+        TfIndex::S1 => Some(SnapshotCadence::OneSecond),
+        TfIndex::S3 => Some(SnapshotCadence::ThreeSecond),
+        TfIndex::S5 => Some(SnapshotCadence::FiveSecond),
+        TfIndex::M1 => Some(SnapshotCadence::OneMinute),
+        _ => None,
+    }
+}
+
+/// Hands a bar the fold just SEALED to the leaderboard when it is a board
+/// frame's bar, so the window's board can still read its volume after the
+/// contract has sealed a later bar over it in the fold (audit PR4c-2, see
+/// `volume_leaderboard::SEALED_WINDOW_HISTORY`). Called from BOTH seal
+/// callbacks — the per-tick fold and the idle-arm catch-up — so every seal
+/// of a board frame reaches it.
+///
+/// # Complexity
+/// O(1): a match, then one hash probe per ranked family (one today). A spot
+/// or a future misses the probe. No allocation.
+fn record_board_seal(
+    leaderboard: &mut crate::volume_leaderboard::VolumeLeaderboard,
+    security_id: u64,
+    segment_code: u8,
+    tf: TfIndex,
+    state: &LiveCandleState,
+) {
+    let Some(cadence) = board_cadence_for_fold_frame(tf) else {
+        return;
+    };
+    let Some(segment) = ExchangeSegment::from_byte(segment_code) else {
+        return;
+    };
+    for family in RANKED_OPTION_FAMILIES {
+        leaderboard.record_sealed_window(
+            family,
+            (security_id, segment),
+            cadence,
+            state.bucket_start_ist_secs,
+            state.volume,
+        );
+    }
+}
+
 /// Whether THIS ranking sweep publishes the depth steering candidates
 /// (operator 2026-09-24).
 ///
@@ -1705,9 +1790,12 @@ impl LiveIngest {
     /// and the row projection run later in bounded steps from
     /// [`Self::step_top_volume_sweep`], on the drain's idle arm.
     ///
-    /// Outside the capture window, and when the cadence's previous job is
-    /// still running, it queues a baseline roll instead (audit PR4b): also
-    /// O(1) here, with the keys visited from the idle arm.
+    /// `now_ist_nanos` is the window's CLOSE instant (audit PR4c-2): the
+    /// drain calls this from [`Self::poll_top_volume_window_close`] once the
+    /// candle of that window has closed, never on a bare timer. Outside the
+    /// capture window, and when the cadence's previous job is still running,
+    /// nothing is queued and nothing needs undoing: each visit reads its own
+    /// window's candle, so a key left listed costs the next job one probe.
     pub fn begin_top_volume_sweep(
         &mut self,
         now_ist_nanos: i64,
@@ -1716,17 +1804,27 @@ impl LiveIngest {
         // The clock gate FIRST, before any ranking work. Outside the window
         // there is nothing to publish, and ranking to discover that would pay
         // the sort ~23,000 times a session for nothing.
+        //
+        // Gated on the window's OPEN, not the close instant `now_ist_nanos`
+        // carries (review of audit PR4c-2): the boards cover the windows that
+        // START inside the capture window, so the second before 09:15 is not
+        // ranked and the 15:39 minute, which closes at 15:40:00, is.
+        let window_open_ist_secs = crate::top_volume_sweep::SweepJob {
+            cadence,
+            ts_ist_nanos: now_ist_nanos,
+            wants_rows: false,
+            wants_candidates: false,
+        }
+        .window_open_ist_secs();
         if !crate::top_volume_snapshot::within_capture_window(
-            crate::top_volume_snapshot::secs_of_day_ist(now_ist_nanos),
+            crate::top_volume_snapshot::secs_of_day_ist(
+                i64::from(window_open_ist_secs).saturating_mul(1_000_000_000),
+            ),
         ) {
-            // Roll the baselines anyway. Ticks fold from the candle session
-            // open (09:00) but this gate holds ranking to 09:15, and the
-            // baseline is otherwise rolled ONLY by a sweep -- so the first
-            // in-window sweep would measure from a contract's first observe
-            // and report ~15 minutes of volume as one window. Queued, not
-            // walked: O(1) here, the keys are visited from the idle arm
-            // (audit PR4b).
-            self.roll_top_volume_baselines(cadence);
+            // Nothing to undo: the keys stay listed and the first in-window
+            // job reads only its own window's candle, so the pre-09:15
+            // volume never reaches a board (until audit PR4c-2 a baseline
+            // roll here was what kept it out).
             return;
         }
         // Two consumers of this pass now, and they are gated separately.
@@ -1767,18 +1865,12 @@ impl LiveIngest {
         // hand the queued job the NEXT window's contracts under THIS window's
         // timestamp.
         //
-        // The deferred window is DROPPED, not merged: its baselines are rolled
-        // here, so the next job measures its own window. Merging would store
-        // two windows' volume under one window's `ts`, beside a one-window
-        // candle, and roughly double that row's `volume_percentage_change`
-        // with nothing on the row to say so. A missing window is visible (the
-        // counter and the log below); a doubled one is not. The roll is
-        // queued like the one above: O(1) here, visited from the idle arm.
-        let in_flight = RANKED_OPTION_FAMILIES
-            .iter()
-            .any(|family| self.leaderboard.sweep_pending(*family, cadence));
-        if in_flight || self.top_volume_sweep.is_busy(cadence) {
-            self.roll_top_volume_baselines(cadence);
+        // The deferred window is DROPPED: it gets no board. Nothing is rolled
+        // or merged, because the next job reads its OWN window's candle bar
+        // for every listed key; a key that traded only in the dropped window
+        // reads as quiet there and falls off the list. A missing window is
+        // visible (the counter and the log below); a doubled one would not be.
+        if self.top_volume_cadence_busy(cadence) {
             let deferred = self.top_volume_sweep.record_deferred();
             if deferred.is_power_of_two() {
                 warn!(
@@ -1807,46 +1899,134 @@ impl LiveIngest {
             });
     }
 
-    /// Queues a baseline roll of one cadence for every ranked family: the
-    /// window is skipped rather than ranked (audit PR4b).
+    /// Whether `cadence` still has a board queued or running, so a newly
+    /// closed window must wait for it (one job per cadence at a time).
     ///
-    /// **O(1)** on the normal path — one list swap per family; the keys are
-    /// visited by [`Self::step_idle_work`]. When the previous roll of the
-    /// same cadence has not finished, the drain had no idle time for a whole
-    /// cadence period, and the list is rolled in one pass instead —
-    /// O(traded in the window), counted on
-    /// [`crate::top_volume_sweep::TOP_VOLUME_ROLL_INLINE_COUNTER`] and logged
-    /// on powers of two.
-    fn roll_top_volume_baselines(
-        &mut self,
+    /// # Complexity
+    /// O(1): one flag per ranked family and one queue flag.
+    fn top_volume_cadence_busy(
+        &self,
         cadence: tickvault_storage::top_volume_rank_persistence::SnapshotCadence,
+    ) -> bool {
+        RANKED_OPTION_FAMILIES
+            .iter()
+            .any(|family| self.leaderboard.sweep_pending(*family, cadence))
+            || self.top_volume_sweep.is_busy(cadence)
+    }
+
+    /// The timer half of the close trigger (audit PR4c-2): stores the wall
+    /// clock, then ranks any cadence's window that either clock has closed.
+    ///
+    /// The timer arms still exist, and they are now only the WALL-clock
+    /// backstop: in a quiet market, or before the first tick of the day, no
+    /// frame moves the candle clock, and without them a window would never be
+    /// seen to close. Every cadence is checked, not only `_fired`: an arm
+    /// fires on its own grid, where the wall less the grace always lands a
+    /// period back, so a 1-minute window closed by the wall alone would
+    /// otherwise wait a whole extra minute for its own arm.
+    ///
+    /// # Complexity
+    /// O(1): per cadence a division, a few compares, and on a close one O(1)
+    /// queue step.
+    pub fn poll_top_volume_window_close(
+        &mut self,
+        wall_ist_nanos: i64,
+        _fired: tickvault_storage::top_volume_rank_persistence::SnapshotCadence,
     ) {
-        for family in RANKED_OPTION_FAMILIES {
-            if self.leaderboard.begin_roll(family, cadence)
-                == crate::volume_leaderboard::RollBegin::Inline
-            {
-                let inline = self.top_volume_sweep.record_inline_roll();
-                if inline.is_power_of_two() {
-                    warn!(
-                        code = ErrorCode::WsGapConnectionState.code_str(),
-                        counter = crate::top_volume_sweep::TOP_VOLUME_ROLL_INLINE_COUNTER,
-                        source = "top_volume_roll_inline",
-                        cadence = cadence.as_str(),
-                        inline,
-                        "top_volume: a baseline roll ran in one pass on the timer arm because \
-                         the previous roll of this cadence had not finished. The drain had no \
-                         idle time for a whole cadence period; no data is wrong, but the tick \
-                         loop paid the walk."
-                    );
-                }
-            }
+        self.store_top_volume_wall(wall_ist_nanos);
+        self.close_top_volume_windows();
+    }
+
+    /// The per-frame half of the close trigger (audit PR4c-2): ranks every
+    /// cadence whose window the CANDLE clock has just closed, so a board runs
+    /// as soon as the fold has moved past its window instead of waiting for a
+    /// timer.
+    ///
+    /// `wall_ist_nanos` is the frame's own arrival reading, already taken for
+    /// the gap detector, so this reads no clock. It is stored because the
+    /// candle clock is capped AT the wall clock: a window whose end has not
+    /// yet happened by the wall is never ranked, however far a future-dated
+    /// tick moved the watermark.
+    ///
+    /// # Complexity
+    /// O(1): four readings of one integer against four stored window opens.
+    pub fn poll_top_volume_window_closes_by_candles(&mut self, wall_ist_nanos: i64) {
+        self.store_top_volume_wall(wall_ist_nanos);
+        self.close_top_volume_windows();
+    }
+
+    /// Checks every cadence against the stored clocks. O(1).
+    fn close_top_volume_windows(&mut self) {
+        for cadence in tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ALL {
+            self.close_top_volume_window(cadence);
         }
     }
 
-    /// Whether any sliced baseline roll still has keys to visit.
-    #[must_use]
-    pub fn top_volume_roll_pending(&self) -> bool {
-        self.leaderboard.roll_pending()
+    /// Stores a wall-clock reading, whole IST seconds, for the close clock.
+    /// A reading that does not fit (before the epoch, or past 2106) is
+    /// ignored and the previous one kept.
+    fn store_top_volume_wall(&mut self, wall_ist_nanos: i64) {
+        if let Ok(wall_secs) = u32::try_from(wall_ist_nanos.div_euclid(1_000_000_000)) {
+            self.top_volume_wall_secs = wall_secs;
+        }
+    }
+
+    /// Queues the board of `cadence`'s window if the close clock says it has
+    /// just closed, and counts the windows it jumped over.
+    fn close_top_volume_window(
+        &mut self,
+        cadence: tickvault_storage::top_volume_rank_persistence::SnapshotCadence,
+    ) {
+        use crate::top_volume_sweep::window_close_reference_secs;
+        // No wall reading yet: the cap on the candle clock is not known, and
+        // one future-dated tick could close windows that have not happened.
+        if self.top_volume_wall_secs == 0 {
+            return;
+        }
+        // The cadence's previous board has not finished: the closed window
+        // WAITS on the clock (it is not consumed), and the next poll after
+        // that board finishes queues it. The clock stops catching up past
+        // `WINDOW_CLOSE_CATCH_UP_WINDOWS`, so the wait is bounded.
+        if self.top_volume_cadence_busy(cadence) {
+            return;
+        }
+        let reference = window_close_reference_secs(
+            self.aggregator.watermark_secs(),
+            self.top_volume_wall_secs,
+        );
+        let Some(closed) = self.top_volume_close_clock.advance(cadence, reference) else {
+            return;
+        };
+        let period = u32::try_from(cadence.interval_secs()).unwrap_or(0);
+        let close_ist_nanos = i64::from(closed.window_open_ist_secs.saturating_add(period))
+            .saturating_mul(1_000_000_000);
+        // Counted only inside the capture window, on purpose: outside it no
+        // window gets a board at all, so a window skipped there lost nothing,
+        // and counting it would put benign pre-open and post-close stalls on
+        // the same counter as a board that was actually owed.
+        if closed.skipped > 0
+            && crate::top_volume_snapshot::within_capture_window(
+                crate::top_volume_snapshot::secs_of_day_ist(
+                    i64::from(closed.window_open_ist_secs).saturating_mul(1_000_000_000),
+                ),
+            )
+            && let Some(total) = self.top_volume_sweep.record_windows_skipped(closed.skipped)
+        {
+            warn!(
+                code = ErrorCode::WsGapConnectionState.code_str(),
+                counter = crate::top_volume_sweep::TOP_VOLUME_SWEEP_DEFERRED_COUNTER,
+                source = "top_volume_window_skipped",
+                cadence = cadence.as_str(),
+                skipped = closed.skipped,
+                total,
+                "top_volume: the close clock fell more than its catch-up bound behind, so the \
+                 oldest closed windows were skipped and have no board. The candle tables still \
+                 carry their volume. Either the drain was not polled for several windows (a \
+                 stall, or a gap in both clocks) or boards are taking longer than a window to \
+                 finish."
+            );
+        }
+        self.begin_top_volume_sweep(close_ist_nanos, cadence);
     }
 
     /// Whether a top-volume sweep is queued or running — the guard on the
@@ -1886,10 +2066,20 @@ impl LiveIngest {
                 // cut moved OUT of the ranking on 2026-09-08 because the gainer
                 // filter was being applied AFTER a top-250 cut — see
                 // `gainer_eligible`.
+                // The window this job ranks, and the fold frame whose bar is
+                // that window's candle (audit PR4c-2). The rank key is read
+                // from THAT bar: the board and the candle row of the same
+                // window carry the same volume by construction.
+                let window_open_ist_secs = job.window_open_ist_secs();
+                let fold_frame = fold_frame_for_cadence(job.cadence);
+                let aggregator = &self.aggregator;
                 let done = self.leaderboard.sweep_step(
                     family,
                     job.cadence,
                     budget,
+                    // ONE O(1) probe per visited key: a hash lookup and two
+                    // bar copies, no allocation.
+                    |c| window_read(aggregator, c, fold_frame, window_open_ist_secs),
                     // The SAME map the drain already probes per tick, so the
                     // lot size that normalises a contract's volume is the one
                     // its own master row carried. A second source here could
@@ -2451,6 +2641,8 @@ impl LiveIngest {
                 crate::volume_leaderboard::MAX_TRACKED_CONTRACTS,
                 crate::depth20_ranked_steer::DEPTH20_EXIT_RANKS,
             ),
+            top_volume_close_clock: crate::top_volume_sweep::WindowCloseClock::new(),
+            top_volume_wall_secs: 0,
             catch_up: None,
             catch_up_overruns: 0,
             catch_up_overrun_counter: metrics::counter!(CATCHUP_SEAL_OVERRUN_COUNTER),
@@ -3341,11 +3533,15 @@ impl LiveIngest {
         let mut dropped = 0u64;
         let mut rescued = 0u64;
         let sender = tickvault_storage::seal_writer_runner::global_seal_sender();
+        let leaderboard = &mut self.leaderboard;
         let stats: ConsumeStats = self.aggregator.consume_tick(
             Feed::Dhan,
             tick,
             None,
             |feed, security_id, segment_code, tf, state| {
+                // The board's copy of a sealed window (audit PR4c-2): before
+                // the seal leaves for the writer, O(1).
+                record_board_seal(leaderboard, security_id, segment_code, tf, &state);
                 // Every frame the fold produces is emitted. The enum carries
                 // exactly the nine native timeframes the operator asked for
                 // (directive 2026-09-18: 1s 3s 5s 1m 3m 5m 15m 30m 60m — his
@@ -3834,6 +4030,9 @@ impl LiveIngest {
         // visited: a job resuming after the reset would publish an EMPTY
         // candidate list as though nothing had traded.
         self.top_volume_sweep.clear();
+        // The new day starts from its own first reading, so no window of
+        // yesterday is reported as skipped or ranked today.
+        self.top_volume_close_clock.clear();
         // Rows a dropped job had already staged go with it: left in place they
         // would ride out on the next day's first hand-off, under yesterday's
         // `ts` and a different label snapshot.
@@ -4405,38 +4604,38 @@ impl LiveIngest {
         });
     }
 
-    /// Whether any sliced idle work is queued: a baseline roll, a catch-up
-    /// seal or a top-volume sweep — the guard on the drain's idle arm.
+    /// Whether any sliced idle work is queued: a catch-up seal or a
+    /// top-volume sweep — the guard on the drain's idle arm.
     #[must_use]
     pub fn idle_work_pending(&self) -> bool {
-        self.top_volume_roll_pending() || self.catch_up.is_some() || self.top_volume_sweep_pending()
+        self.catch_up.is_some() || self.top_volume_sweep_pending()
     }
 
     /// Runs ONE bounded step of the idle work, in priority order:
     ///
-    /// 1. a baseline roll ([`crate::top_volume_sweep::TOP_VOLUME_ROLL_STEP_KEYS`]
-    ///    keys) — the cheapest, and the one whose delay drops trades;
-    /// 2. the catch-up seal ([`CATCHUP_SEAL_STEP_SLOTS`] slots) — candles
+    /// 1. the catch-up seal ([`CATCHUP_SEAL_STEP_SLOTS`] slots) — candles
     ///    are the primary data;
-    /// 3. the top-volume sweep ([`crate::top_volume_sweep::TOP_VOLUME_SWEEP_STEP_ROWS`] rows).
+    /// 2. the top-volume sweep ([`crate::top_volume_sweep::TOP_VOLUME_SWEEP_STEP_ROWS`] rows).
     ///
     /// # Complexity
     /// **O(one step)** per call — the bound on how long a queued frame waits.
     pub fn step_idle_work(&mut self) -> IdleStep {
-        if self.leaderboard.roll_pending() {
-            let _done = self
-                .leaderboard
-                .roll_step(crate::top_volume_sweep::TOP_VOLUME_ROLL_STEP_KEYS);
-            return IdleStep::default();
-        }
         if self.catch_up.is_some() {
             return IdleStep {
                 catch_up_done: self.step_catch_up_seal(),
                 ..IdleStep::default()
             };
         }
+        let sweep_done = self.step_top_volume_sweep();
+        if sweep_done.is_some() {
+            // A cadence just became free: a window that closed while its
+            // previous board was running waited on the clock, and is queued
+            // now rather than at the next frame or timer (review of audit
+            // PR4c-2). Four O(1) checks against the stored clocks.
+            self.close_top_volume_windows();
+        }
         IdleStep {
-            sweep_done: self.step_top_volume_sweep(),
+            sweep_done,
             ..IdleStep::default()
         }
     }
@@ -4473,11 +4672,14 @@ impl LiveIngest {
         let mut dropped = 0u64;
         let mut rescued = 0u64;
         let sender = tickvault_storage::seal_writer_runner::global_seal_sender();
+        let leaderboard = &mut self.leaderboard;
         let (bars, next) = self.aggregator.catch_up_seal_slots(
             cutoff,
             from_slot,
             max_slots,
             |feed, security_id, segment_code, tf, state| {
+                // The board's copy of a sealed window (audit PR4c-2), O(1).
+                record_board_seal(leaderboard, security_id, segment_code, tf, &state);
                 // Every frame the fold produces is emitted. The enum carries
                 // exactly the nine native timeframes the operator asked for
                 // (directive 2026-09-18: 1s 3s 5s 1m 3m 5m 15m 30m 60m — his
@@ -6770,6 +6972,16 @@ async fn run_frame_drain(
                         // to remove. `folded > 0` is the honest bar.
                         if outcome.folded > 0 {
                             record_connection_tick(frame.connection_index, recv_millis_i64);
+                            // The candle clock may have just closed a
+                            // window: its board is ranked now, not at the
+                            // next timer (audit PR4c-2). Four compares. The
+                            // frame's arrival instant is the wall reading the
+                            // candle clock is capped at.
+                            ingest.poll_top_volume_window_closes_by_candles(
+                                received_at_nanos.saturating_add(
+                                    tickvault_common::constants::IST_UTC_OFFSET_NANOS,
+                                ),
+                            );
                         }
                     }
                     DhanEndpointType::Depth20 | DhanEndpointType::Depth200 => {
@@ -7064,7 +7276,10 @@ async fn run_frame_drain(
             // a snapshot can never preempt draining queued frames. Since audit
             // PR4 (2026-09-26) each arm only QUEUES its sweep — an O(1) swap
             // of the work lists — and the ranking itself runs in bounded steps
-            // from the idle arm at the END of this select. They touch
+            // from the idle arm at the END of this select. Since audit PR4c-2
+            // the arms are the WALL-clock half of the close trigger: a board is
+            // queued once its window's candle has closed, normally noticed by
+            // the candle clock after a frame, and here when no frame moved it. They touch
             // the leaderboard and the aggregator read-only-ish and cannot
             // starve each other: all four are timers, not queues.
             //
@@ -7076,22 +7291,22 @@ async fn run_frame_drain(
             _ = snapshot_1s_timer.tick() => {
                 let cadence =
                     tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond;
-                ingest.begin_top_volume_sweep(now_ist_nanos(), cadence);
+                ingest.poll_top_volume_window_close(now_ist_nanos(), cadence);
             }
             _ = snapshot_3s_timer.tick() => {
                 let cadence =
                     tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ThreeSecond;
-                ingest.begin_top_volume_sweep(now_ist_nanos(), cadence);
+                ingest.poll_top_volume_window_close(now_ist_nanos(), cadence);
             }
             _ = snapshot_5s_timer.tick() => {
                 let cadence =
                     tickvault_storage::top_volume_rank_persistence::SnapshotCadence::FiveSecond;
-                ingest.begin_top_volume_sweep(now_ist_nanos(), cadence);
+                ingest.poll_top_volume_window_close(now_ist_nanos(), cadence);
             }
             _ = snapshot_1m_timer.tick() => {
                 let cadence =
                     tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneMinute;
-                ingest.begin_top_volume_sweep(now_ist_nanos(), cadence);
+                ingest.poll_top_volume_window_close(now_ist_nanos(), cadence);
             }
             _ = silence_timer.tick() => {
                 // Re-anchor the four snapshot timers against the wall clock.
@@ -24847,8 +25062,8 @@ mod late_seed_tests {
                 .split_once("\n            }\n")
                 .map_or(arm, |(body, _)| body);
             assert!(
-                arm.contains("ingest.begin_top_volume_sweep(now_ist_nanos(), cadence);"),
-                "the {} arm must only queue its sweep",
+                arm.contains("ingest.poll_top_volume_window_close(now_ist_nanos(), cadence);"),
+                "the {} arm must only poll the close trigger, which at most queues a sweep",
                 cadence.as_str()
             );
             for forbidden in [".rank(", "snapshot_top_volume", "step_top_volume_sweep"] {
@@ -25129,6 +25344,17 @@ mod depth_rebalance_wiring_tests {
         ranking_ingest(true)
     }
 
+    /// The close instant, IST nanoseconds, of the `cadence` window that holds
+    /// `secs` — what the drain hands `begin_top_volume_sweep` since audit
+    /// PR4c-2, when a board is ranked once its window's candle has closed.
+    fn close_of_window_holding(
+        secs: i64,
+        cadence: tickvault_storage::top_volume_rank_persistence::SnapshotCadence,
+    ) -> i64 {
+        let period = i64::try_from(cadence.interval_secs()).unwrap_or(1);
+        (secs - secs.rem_euclid(period) + period) * 1_000_000_000
+    }
+
     /// The same board, built with or without the snapshot writer attached.
     fn ranking_ingest(attach_writer: bool) -> LiveIngest {
         use tickvault_common::types::ExchangeSegment;
@@ -25200,7 +25426,10 @@ mod depth_rebalance_wiring_tests {
     fn with_top_volume_writer_is_what_turns_silence_into_rows() {
         let _serial = lock_published_views();
         let day: i64 = 1_779_321_600;
-        let in_window = (day + 34_000) * 1_000_000_000;
+        let in_window = close_of_window_holding(
+            day + 34_000,
+            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond,
+        );
         let cadence = tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond;
 
         let mut without = ranking_ingest(false);
@@ -25226,7 +25455,10 @@ mod depth_rebalance_wiring_tests {
     fn test_begin_top_volume_sweep_queues_one_job_per_cadence() {
         let _serial = lock_published_views();
         let day: i64 = 1_779_321_600;
-        let in_window = (day + 34_000) * 1_000_000_000;
+        let in_window = close_of_window_holding(
+            day + 34_000,
+            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond,
+        );
         let cadence = tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond;
         let mut ingest = ranking_ingest(true);
         assert!(!ingest.top_volume_sweep_pending(), "nothing queued yet");
@@ -25256,10 +25488,11 @@ mod depth_rebalance_wiring_tests {
         );
     }
 
-    /// Outside the capture window the timer arm rolls baselines and queues
-    /// nothing, so the idle arm never wakes before 09:15.
+    /// Outside the capture window a close queues nothing and leaves no idle
+    /// work at all, so the idle arm never wakes before 09:15 (audit PR4c-2:
+    /// there is no baseline to roll any more).
     #[test]
-    fn test_begin_top_volume_sweep_outside_the_window_leaves_only_top_volume_roll_pending() {
+    fn test_begin_top_volume_sweep_outside_the_window_queues_no_idle_work() {
         let _serial = lock_published_views();
         let day: i64 = 1_779_321_600;
         // 08:00 IST in the fixture's clock: day + 34,000 s is inside the
@@ -25274,17 +25507,10 @@ mod depth_rebalance_wiring_tests {
             !ingest.top_volume_sweep_pending(),
             "no sweep may be queued outside the capture window"
         );
-        // Audit PR4b: the baselines are rolled from the idle arm, not walked
-        // on the timer arm. The fixture contract traded, so a roll is queued,
-        // and the idle steps finish it without queuing a sweep.
         assert!(
-            ingest.top_volume_roll_pending(),
-            "the out-of-window fire must queue a baseline roll"
+            !ingest.idle_work_pending(),
+            "the fixture contract traded, and still nothing may wait for the idle arm"
         );
-        while ingest.idle_work_pending() {
-            assert_eq!(ingest.step_idle_work(), IdleStep::default());
-        }
-        assert!(!ingest.top_volume_roll_pending());
     }
 
     /// `step_top_volume_sweep` runs the queued job to a `SweepDone` carrying
@@ -25294,7 +25520,10 @@ mod depth_rebalance_wiring_tests {
     fn test_step_top_volume_sweep_finishes_and_clears_top_volume_sweep_pending() {
         let _serial = lock_published_views();
         let day: i64 = 1_779_321_600;
-        let in_window = (day + 34_000) * 1_000_000_000;
+        let in_window = close_of_window_holding(
+            day + 34_000,
+            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond,
+        );
         let cadence = tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond;
         let mut ingest = ranking_ingest(true);
         assert!(
@@ -25320,6 +25549,366 @@ mod depth_rebalance_wiring_tests {
         );
     }
 
+    /// The fixture's traded exchange second (09:26:40 IST on the fixture day).
+    const FIXTURE_TRADE_SECS: u32 = 1_779_321_600 + 34_000;
+
+    /// One more print of the fixture contract at `secs`, cumulative `volume`.
+    fn trade_fixture_contract(ingest: &mut LiveIngest, secs: u32, volume: u32, seq: u64) {
+        let mut tick = tickvault_common::tick_types::ParsedTick::default();
+        tick.security_id = 777;
+        tick.exchange_segment_code = tickvault_common::types::ExchangeSegment::NseFno.binary_code();
+        tick.last_traded_price = 110.0;
+        tick.volume = volume;
+        tick.exchange_timestamp = secs;
+        tick.received_at_nanos = i64::from(secs) * 1_000_000_000;
+        let _ = ingest.ingest_tick_at(&tick, seq, 0, 1);
+    }
+
+    /// The window close instant of the queued job, IST seconds, after
+    /// activating it — `None` when nothing was queued.
+    fn queued_close_secs(ingest: &mut LiveIngest) -> Option<i64> {
+        if !ingest.top_volume_sweep.activate_next() {
+            return None;
+        }
+        ingest
+            .top_volume_sweep
+            .active
+            .map(|a| a.job.ts_ist_nanos.div_euclid(1_000_000_000))
+    }
+
+    fn run_queued_sweeps(ingest: &mut LiveIngest) -> usize {
+        let mut appended = 0usize;
+        let mut steps = 0usize;
+        while ingest.top_volume_sweep_pending() {
+            steps += 1;
+            assert!(steps < 1_000_000, "a sliced sweep must finish");
+            if let Some(done) = ingest.step_top_volume_sweep() {
+                appended += done.appended;
+            }
+        }
+        appended
+    }
+
+    /// Audit PR4c-2: the board's figure for a contract IS the volume of that
+    /// contract's candle bar for the same window, on every cadence's frame.
+    #[test]
+    fn board_volume_equals_candle_volume_for_the_same_window() {
+        use tickvault_storage::top_volume_rank_persistence::SnapshotCadence;
+        let _serial = lock_published_views();
+        let mut ingest = ranking_fixture();
+        for cadence in SnapshotCadence::ALL {
+            let frame = fold_frame_for_cadence(cadence);
+            let period = u32::try_from(cadence.interval_secs()).unwrap_or(1);
+            let window = FIXTURE_TRADE_SECS - FIXTURE_TRADE_SECS % period;
+            let candle = ingest
+                .aggregator
+                .window_bar(
+                    Feed::Dhan,
+                    777,
+                    tickvault_common::types::ExchangeSegment::NseFno.binary_code(),
+                    frame,
+                    window,
+                )
+                .and_then(|w| w.bar)
+                .expect("the fold holds the fixture's bar for its own window");
+            assert_eq!(
+                candle.volume, 75,
+                "one lot traded inside the window ({cadence:?})"
+            );
+            let aggregator = &ingest.aggregator;
+            let ranked = ingest.leaderboard.rank(
+                crate::volume_leaderboard::OptionFamily::Stock,
+                cadence,
+                usize::MAX,
+                |c| window_read(aggregator, c, frame, window),
+                |_| Some(75),
+                |_| true,
+            );
+            let row = ranked
+                .iter()
+                .find(|r| r.security_id == 777)
+                .expect("the fixture contract is on the board");
+            assert_eq!(
+                u64::from(row.delta_units),
+                candle.volume,
+                "the board and the candle carry the same volume ({cadence:?})"
+            );
+            assert_eq!(row.window_lots_milli, 1_000, "exactly one lot");
+        }
+    }
+
+    /// `window_read` names the bar of the window it is asked about, never a
+    /// neighbour: an earlier window reads quiet-but-busy-later, and a window
+    /// the fold has already sealed over reads missing.
+    #[test]
+    fn test_window_volume_reads_the_bar_of_the_named_window() {
+        use crate::volume_leaderboard::WindowRead;
+        let _serial = lock_published_views();
+        let mut ingest = ranking_fixture();
+        let contract = crate::volume_leaderboard::RankedContract {
+            security_id: 777,
+            segment: tickvault_common::types::ExchangeSegment::NseFno,
+            underlying_id: 13,
+            volume: 5_000,
+            window_lots_milli: 0,
+            delta_units: 0,
+            lot_size: 75,
+        };
+        let s0 = FIXTURE_TRADE_SECS;
+        assert_eq!(
+            window_read(&ingest.aggregator, &contract, TfIndex::S1, s0),
+            WindowRead::Bar {
+                volume: 75,
+                later_activity: false
+            }
+        );
+        assert_eq!(
+            window_read(&ingest.aggregator, &contract, TfIndex::S1, s0 - 1),
+            WindowRead::Quiet {
+                later_activity: true
+            },
+            "the second before the trade: quiet, and trading later"
+        );
+        // Two more seconds of trade: the s0 bar sealed, then s0+1 sealed
+        // over it.
+        trade_fixture_contract(&mut ingest, s0 + 1, 5_050, 2);
+        trade_fixture_contract(&mut ingest, s0 + 2, 5_060, 3);
+        assert_eq!(
+            window_read(&ingest.aggregator, &contract, TfIndex::S1, s0 + 1),
+            WindowRead::Bar {
+                volume: 50,
+                later_activity: true
+            },
+            "the last-sealed bar is still readable"
+        );
+        assert_eq!(
+            window_read(&ingest.aggregator, &contract, TfIndex::S1, s0),
+            WindowRead::Missing {
+                later_activity: true,
+                window_open_ist_secs: s0,
+            },
+            "a later seal overwrote the window's bar"
+        );
+        // The 1-minute frame still holds the whole minute.
+        let minute = s0 - s0 % 60;
+        assert_eq!(
+            window_read(&ingest.aggregator, &contract, TfIndex::M1, minute),
+            WindowRead::Bar {
+                volume: 135,
+                later_activity: false
+            }
+        );
+        let unknown = crate::volume_leaderboard::RankedContract {
+            security_id: 778,
+            ..contract
+        };
+        assert_eq!(
+            window_read(&ingest.aggregator, &unknown, TfIndex::S1, s0),
+            WindowRead::Missing {
+                later_activity: false,
+                window_open_ist_secs: s0,
+            },
+            "no fold slot"
+        );
+    }
+
+    /// Audit PR4c-2: a board is queued when its window's candle closes —
+    /// by the candle clock on a frame, or by the wall clock after the grace
+    /// when no tick moves the candles. Before the first wall reading nothing
+    /// closes, and the candle clock never closes a window whose end is after
+    /// the wall clock — not even when a future-dated tick poisoned it.
+    #[test]
+    fn window_close_fires_on_watermark_crossing_and_on_wall_clock_grace() {
+        use crate::top_volume_sweep::WINDOW_CLOSE_GRACE_SECS;
+        use tickvault_storage::top_volume_rank_persistence::SnapshotCadence;
+        let _serial = lock_published_views();
+        // The fixture trades 777 at s0, so the candle clock stands at s0.
+        let s0 = FIXTURE_TRADE_SECS;
+        let nanos = |secs: u32| i64::from(secs) * 1_000_000_000;
+        let mut ingest = ranking_ingest(true);
+
+        // A wall reading that does not fit is ignored: still no wall, so the
+        // candle clock alone closes nothing.
+        ingest.poll_top_volume_window_closes_by_candles(-1);
+        assert!(!ingest.top_volume_sweep_pending());
+
+        // The first wall reading only sets the clocks.
+        ingest.poll_top_volume_window_close(nanos(s0), SnapshotCadence::OneSecond);
+        assert!(!ingest.top_volume_sweep_pending());
+
+        // A print stamped two seconds ahead of our own clock (exchange clock
+        // skew) moves the candle clock past s0's close, but the wall is still
+        // s0: only the window that ENDED by s0 closes, not s0's own.
+        trade_fixture_contract(&mut ingest, s0 + 2, 5_100, 2);
+        ingest.poll_top_volume_window_closes_by_candles(nanos(s0));
+        assert_eq!(
+            queued_close_secs(&mut ingest),
+            Some(i64::from(s0)),
+            "window s0 ends at s0+1, after the wall s0: it must not close"
+        );
+        let _ = run_queued_sweeps(&mut ingest);
+        ingest.poll_top_volume_window_closes_by_candles(nanos(s0));
+        assert!(
+            !ingest.top_volume_sweep_pending(),
+            "nothing more by wall s0"
+        );
+
+        // The same candle clock seen at wall s0+2: window s0 closes on the
+        // frame, long before the wall-clock grace would close it.
+        ingest.poll_top_volume_window_closes_by_candles(nanos(s0 + 2));
+        assert_eq!(
+            queued_close_secs(&mut ingest),
+            Some(i64::from(s0) + 1),
+            "the 1-second window s0 closed at s0+1"
+        );
+        assert!(
+            run_queued_sweeps(&mut ingest) >= 1,
+            "the window's trade is on its board"
+        );
+
+        // No more ticks. The wall clock closes the next windows once it is
+        // the grace past them, oldest first.
+        let wall = s0 + 2 + 1 + WINDOW_CLOSE_GRACE_SECS;
+        ingest.poll_top_volume_window_close(nanos(wall), SnapshotCadence::OneSecond);
+        assert_eq!(
+            queued_close_secs(&mut ingest),
+            Some(i64::from(s0) + 2),
+            "the oldest unranked window closes first"
+        );
+        let _ = run_queued_sweeps(&mut ingest);
+
+        // A future-dated print, then polls until the clock is caught up:
+        // every window that closes ends by the wall.
+        trade_fixture_contract(&mut ingest, s0 + 500, 5_200, 3);
+        let mut closes = 0usize;
+        loop {
+            ingest.poll_top_volume_window_closes_by_candles(nanos(wall));
+            let Some(close) = queued_close_secs(&mut ingest) else {
+                break;
+            };
+            assert!(
+                close <= i64::from(wall),
+                "a window closing at {close} ended after the wall {wall}"
+            );
+            let _ = run_queued_sweeps(&mut ingest);
+            closes += 1;
+            assert!(closes < 64, "the clock must catch up");
+        }
+        assert!(closes >= 1, "the windows up to the wall did close");
+    }
+
+    /// Review of audit PR4c-2: a contract that trades every second seals its
+    /// window's bar over in the fold before the board can reach it. The
+    /// board still ranks it, at the window's own candle volume, from the
+    /// seal's copy in the leaderboard.
+    #[test]
+    fn busy_contract_is_ranked_after_the_fold_sealed_over_its_window() {
+        use tickvault_storage::top_volume_rank_persistence::SnapshotCadence;
+        let _serial = lock_published_views();
+        let mut ingest = ranking_fixture();
+        let s0 = FIXTURE_TRADE_SECS;
+        // s0's bar (75) is sealed at s0+1, and s0+1's (50) seals over it in
+        // the fold at s0+2.
+        trade_fixture_contract(&mut ingest, s0 + 1, 5_050, 2);
+        trade_fixture_contract(&mut ingest, s0 + 2, 5_060, 3);
+        let aggregator = &ingest.aggregator;
+        let ranked = ingest.leaderboard.rank(
+            crate::volume_leaderboard::OptionFamily::Stock,
+            SnapshotCadence::OneSecond,
+            usize::MAX,
+            |c| window_read(aggregator, c, TfIndex::S1, s0),
+            |_| Some(75),
+            |_| true,
+        );
+        let row = ranked
+            .iter()
+            .find(|r| r.security_id == 777)
+            .expect("the busy contract is on the board of its sealed-over window");
+        assert_eq!(row.delta_units, 75, "at the window's own candle volume");
+        assert_eq!(
+            ingest
+                .leaderboard
+                .window_bars_missing(crate::volume_leaderboard::OptionFamily::Stock),
+            0
+        );
+    }
+
+    /// Review of audit PR4c-2: one frame can close two windows (its ticks
+    /// crossed a second boundary). Both are ranked, oldest first: the second
+    /// waits on the clock while the first board runs, and is queued the
+    /// moment that board finishes.
+    #[test]
+    fn windows_that_close_together_are_each_ranked_in_turn() {
+        use tickvault_storage::top_volume_rank_persistence::SnapshotCadence;
+        let _serial = lock_published_views();
+        let s0 = FIXTURE_TRADE_SECS;
+        let nanos = |secs: u32| i64::from(secs) * 1_000_000_000;
+        let mut ingest = ranking_ingest(true);
+        ingest.poll_top_volume_window_close(nanos(s0), SnapshotCadence::OneSecond);
+        assert!(!ingest.top_volume_sweep_pending(), "first readings only");
+        trade_fixture_contract(&mut ingest, s0 + 1, 5_100, 2);
+        trade_fixture_contract(&mut ingest, s0 + 2, 5_200, 3);
+        // One frame: the candle clock went from s0 to s0+2, so the 1-second
+        // windows s0-1 and s0 have both closed.
+        ingest.poll_top_volume_window_closes_by_candles(nanos(s0 + 2));
+        let mut one_second_closes = Vec::new();
+        let mut steps = 0usize;
+        while ingest.idle_work_pending() {
+            steps += 1;
+            assert!(steps < 1_000_000, "idle work must finish");
+            if let Some(active) = ingest.top_volume_sweep.active
+                && active.job.cadence == SnapshotCadence::OneSecond
+                && one_second_closes.last() != Some(&active.job.ts_ist_nanos)
+            {
+                one_second_closes.push(active.job.ts_ist_nanos);
+            }
+            let _ = ingest.step_idle_work();
+            if let Some(active) = ingest.top_volume_sweep.active
+                && active.job.cadence == SnapshotCadence::OneSecond
+                && one_second_closes.last() != Some(&active.job.ts_ist_nanos)
+            {
+                one_second_closes.push(active.job.ts_ist_nanos);
+            }
+        }
+        assert_eq!(
+            one_second_closes,
+            vec![nanos(s0), nanos(s0 + 1)],
+            "both 1-second windows were ranked, oldest first"
+        );
+    }
+
+    /// The per-frame poll ranks EVERY cadence whose window closed, not only
+    /// the one a timer arm fired for.
+    #[test]
+    fn test_poll_top_volume_window_closes_by_candles_covers_every_cadence() {
+        use tickvault_storage::top_volume_rank_persistence::SnapshotCadence;
+        let _serial = lock_published_views();
+        let mut ingest = ranking_ingest(true);
+        // 09:26:59 IST: one second before a 1-minute boundary, which is
+        // also a 1s, 3s and 5s boundary.
+        let base = FIXTURE_TRADE_SECS - FIXTURE_TRADE_SECS % 60 + 59;
+        for cadence in SnapshotCadence::ALL {
+            ingest.poll_top_volume_window_close(i64::from(base) * 1_000_000_000, cadence);
+        }
+        assert!(!ingest.top_volume_sweep_pending(), "first readings only");
+        trade_fixture_contract(&mut ingest, base + 2, 5_100, 2);
+        ingest.poll_top_volume_window_closes_by_candles(i64::from(base + 2) * 1_000_000_000);
+        let mut finished = Vec::new();
+        let mut steps = 0usize;
+        while ingest.top_volume_sweep_pending() {
+            steps += 1;
+            assert!(steps < 1_000_000, "a sliced sweep must finish");
+            if let Some(done) = ingest.step_top_volume_sweep() {
+                finished.push(done.cadence);
+            }
+        }
+        finished.sort_by_key(|c| c.interval_secs());
+        assert_eq!(
+            finished,
+            SnapshotCadence::ALL.to_vec(),
+            "every cadence's window closed on the minute boundary"
+        );
+    }
     /// The depth-200 steering publish rides the 5-SECOND ranking pass.
     ///
     /// Asserts on the process-wide view because that is the seam under test —
@@ -25335,7 +25924,10 @@ mod depth_rebalance_wiring_tests {
         let _serial = lock_published_views();
         let mut ingest = ranking_fixture();
         let day: i64 = 1_779_321_600;
-        let in_window = (day + 34_000) * 1_000_000_000;
+        let in_window = close_of_window_holding(
+            day + 34_000,
+            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ThreeSecond,
+        );
         ingest.snapshot_top_volume(
             in_window,
             tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ThreeSecond,
@@ -25361,7 +25953,10 @@ mod depth_rebalance_wiring_tests {
         let _serial = lock_published_views();
         let mut ingest = ranking_ingest(false);
         let day: i64 = 1_779_321_600;
-        let in_window = (day + 34_000) * 1_000_000_000;
+        let in_window = close_of_window_holding(
+            day + 34_000,
+            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ThreeSecond,
+        );
         let (rows, refused) = ingest.snapshot_top_volume(
             in_window,
             tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ThreeSecond,
@@ -25391,7 +25986,10 @@ mod depth_rebalance_wiring_tests {
         let _serial = lock_published_views();
         let mut ingest = ranking_fixture();
         let day: i64 = 1_779_321_600;
-        let in_window = (day + 34_000) * 1_000_000_000;
+        let in_window = close_of_window_holding(
+            day + 34_000,
+            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ThreeSecond,
+        );
         ingest.snapshot_top_volume(
             in_window,
             tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ThreeSecond,
@@ -25412,7 +26010,10 @@ mod depth_rebalance_wiring_tests {
         let _serial = lock_published_views();
         let mut ingest = ranking_fixture();
         let day: i64 = 1_779_321_600;
-        let in_window = (day + 34_000) * 1_000_000_000;
+        let in_window = close_of_window_holding(
+            day + 34_000,
+            tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond,
+        );
         let (rows, _refused) = ingest.snapshot_top_volume(
             in_window,
             tickvault_storage::top_volume_rank_persistence::SnapshotCadence::OneSecond,

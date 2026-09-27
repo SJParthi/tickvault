@@ -101,7 +101,7 @@ inline (PR2, PR8, PR14).
     `test_begin_roll_then_roll_step_rolls_like_roll_baselines`,
     `test_begin_roll_falls_back_inline_while_the_last_roll_is_unfinished`, and the drain
     ratchet `drain_cadence_arm_does_no_sort` extended to the catch-up arm.
-- [ ] **PR4c — each top-volume board is sorted once, at its candle close, from the candle's own
+- [x] **PR4c — each top-volume board is sorted once, at its candle close, from the candle's own
   volume.** (`app`) Owner, 2026-09-26 12:34 UTC (decision card "At close") and 12:35 UTC: "when
   canldes table respective timeframes timestamps gets finsihed and done means then its
   respective top volume also shodu lrun right dude". Per tick stays O(1) count updates. Each
@@ -120,11 +120,52 @@ inline (PR2, PR8, PR14).
     (the planned `radix_board_order_matches_board_order`, named for the guard),
     `slice_radix_sort_step_matches_sort_unstable_by` (proptest),
     `slice_radix_sort_step_skips_the_digits_that_never_vary`; `dhat_top_volume_sweep` still zero-alloc.
-  - [ ] **PR4c-2 — rank at the window's close, from the candle's own volume.** The trigger moves
+  - [x] **PR4c-2 — rank at the window's close, from the candle's own volume.** The trigger moves
     from the wall-clock timer to the fold's exchange-time watermark crossing the window's end;
     the rank key becomes the window's bar volume (`bar_for_window`), replacing the per-cadence
     baselines and their rolls; a contract already trading in a later window stays marked for
-    that window's sweep.
+    that window's sweep. Design (written 2026-09-26, before code):
+    - **Rank key.** A new fold accessor `MultiTfAggregator::window_volume(feed, sid, seg, tf,
+      bucket_open)` returns the bar's own volume for window W plus whether the contract already
+      has a bar AFTER W (one hash probe, O(1), no allocation). `sweep_step` takes that reading
+      through a closure instead of `volume - baseline`; `delta_units` becomes the bar volume, so
+      the board figure and the `candles_<tf>` row for (contract, W) are the same number.
+    - **Later activity stays marked.** A contract whose open bucket is already past W is
+      re-marked dirty for its cadence after it is ranked for W, so the next window's sweep
+      still visits it. No bar at all for W (open bucket two or more windows later) is counted on
+      a new, non-EMF counter and the contract is left off that board, never guessed.
+    - **Baselines go.** `baseline[]`, `roll_baselines`, `begin_roll`/`roll_step`, the `rolling`
+      lists, `RollBegin`, the drain's roll call and `tv_top_volume_roll_inline_total` are deleted;
+      the per-tick `observe` keeps its monotonic gate and dirty marking. `rank` (the synchronous
+      test form) reads the same closure, so the two stay identical. This also closes re-check 3's
+      one new gap (2026-09-26 17:10 UTC): `begin_roll`'s saturation fallback ran `roll_baselines`
+      inline on the timer arm, O(traded) during the heaviest bursts. With no baselines there is
+      nothing to roll, so a skipped or pre-09:15 window simply leaves its keys on the work list
+      and the next window's read drops the ones that did not trade in it.
+    - **Trigger.** Window `[o, o+p)` of a cadence closes when the fold's exchange-time watermark
+      reaches `o+p` (checked after each drained frame, 4 integer compares), or when the IST wall
+      clock reaches `o+p+5 s` (the existing timer arms, for a quiet exchange and the 15:30 tail).
+      The job carries `window_open_ist_secs`; projection writes that as `ts`. Windows outside
+      [09:15, 15:30) or from another day are skipped. A cadence still busy with the previous
+      window skips W and counts it, exactly as today's deferral.
+    - **Honest limit.** Bars seal per contract on that contract's next tick, so the board reads a
+      bar that may still be open; a late tick from a lagging socket can grow the candle after the
+      board was written. The board is the bar as of the close, not a sealed-bar guarantee.
+    - **Tests.** `board_volume_equals_candle_volume_for_the_same_window`,
+      `test_window_volume_reads_the_bar_of_the_named_window`,
+      `window_close_fires_on_watermark_crossing_and_on_wall_clock_grace`,
+      `contract_trading_in_a_later_window_is_ranked_in_both`, the DHAT sweep test unchanged at
+      zero allocations, and the drain guard tests updated for the new trigger.
+    - **Done (2026-09-27).** As designed, with three names changed while building it. The fold
+      accessor is `MultiTfAggregator::window_bar` (it returns the bar plus the open and
+      last-sealed bucket starts; `volume_leaderboard::WindowRead::from_window_bar` classifies it
+      as Bar / Quiet / Missing). The close trigger is `top_volume_sweep::WindowCloseClock`, fed by
+      `window_close_reference_secs` (watermark less 1 s, capped at wall + 2 s, floored at wall −
+      5 s) from `LiveIngest::poll_top_volume_window_close` (timer arms) and
+      `poll_top_volume_window_closes_by_candles` (after each frame). The missing-bar count is
+      `tv_volume_leaderboard_refused_total{reason="window_bar_missing"}`, which is not an EMF
+      metric. All six named tests exist and pass, plus clock, classifier and skip-count tests;
+      `dhat_top_volume_sweep` still passes at zero allocations with half the keys re-listed.
 - [ ] **PR5 — honest panic handling.** (all crates)
   - Keep `panic = "abort"` (Cargo.toml:275) — a half-dead process holding sockets is worse
     than a clean restart by systemd. The two production `catch_unwind` sites are dead under
@@ -345,6 +386,103 @@ folded into them below), then PR18, PR19 and the decisions.
   2026-09-26). Depth-200 already rotates by redial and depth-20 is a static day set, but
   `send_unsubscribe` still has depth-pool call sites (pool_supervisor.rs swap paths). Verify
   each is unreachable for depth endpoints or make it redial-only, and pin that with a guard.
+
+
+### Added 2026-09-27 (fourth re-check, 15 new open gaps), riskiest first
+
+Source: re-check 4 on main 98813f1 (comparison page version 5, rows "Open" + "New this check").
+Locations are that check's and are re-read against the code when each PR is written; a wrong
+row is corrected here, never dropped.
+
+Order of work: PR20 goes NEXT, ahead of PR15, because it can delete SEBI rows. Then PR21 →
+PR22 → PR15 → PR16 → PR17 → PR23 → PR24, then PR5–PR14 (with the additions folded in below),
+PR25–PR27, PR18, PR19 and the decisions. One PR open at a time, as before.
+
+- [ ] **PR20 — the operator console can never delete SEBI rows.** (`aws-lambdas`)
+  - Docker reset and a bare nuke delete the whole database volume, SEBI tables included, when
+    QuestDB does not answer; the SEBI export is skipped with one printed line
+    (operator_control_action_commands.rs:90-92, :165-167). Daily-universe Quote 25 REJECTs
+    exactly this. Fail closed: no volume delete unless the SEBI export for the day succeeded and
+    was verified; a failed or skipped export stops the action with a coded error and a page.
+  - The destructive-action lock is 09:15–15:40 but the rule says 09:00–15:45
+    (operator_control.rs:63, :79, :166-174). Widen it to the rule's window and pin the two
+    constants with a guard test.
+- [ ] **PR21 — after an 805, nothing dials another depth socket.** (`app`, `core`)
+  - Only `depth_rebalance.rs:1205` checks `ROTATION_HALTED`; the morning depth attach and the
+    contract top-up keep dialling, and each extra socket makes Dhan close a healthy sibling
+    (dhan_feed_stack.rs attach loop 10946-12260, :11862-11876). Every depth dial site checks
+    the breaker; a guard test scans for dial sites that do not.
+  - A depth disconnect packed in a frame with data loses its reason code and is redialled as a
+    routine drop, so an 805 there closes a sibling without setting the breaker
+    (core/src/websocket/connection.rs:916-950; dhan_feed_stack.rs:8959-8963). Read the reason
+    code before the data. Shares the frame walker with PR9 and the PR17 capture fix.
+- [ ] **PR22 — an 807 renews the token at most once.** (`core`)
+  - The "already renewed" generation is read when the call starts, not when the 807 arrives,
+    so two sockets can each trigger a renewal (token_manager.rs:1272-1297;
+    pool_supervisor.rs:1834-1867). Capture the generation at 807 arrival and compare-and-swap.
+- [ ] **PR23 — the day's last candles are sealed at the close, not at shutdown.** (`app`, `trading`)
+  - Candles after ~15:36 and the day's last 15/30/60-minute candles are sealed only at shutdown
+    (dhan_feed_stack.rs:6125, :4361-4365, :7668); a crash loses them unless the next boot's WAL
+    replay rebuilds them (Assumed, not verified). Seal every open bar at the session close on
+    the drain's idle arm, the PR4b catch-up shape, and test the crash case.
+- [ ] **PR24 — a future-dated timestamp cannot move a watermark past what is durable.**
+  (`storage`, `trading`)
+  - One future-dated vendor timestamp can push the WAL "applied" watermark ahead of what is
+    durable, and the archive ignores apply lag. Cap each watermark at the wall clock (the
+    PR4c-2 `window_close_reference_secs` shape, which caps the top-volume close clock at the
+    wall with no lead) and gate the archive on applied, not written.
+- [ ] **PR25 — a misspelled config key fails the boot.** (`common`)
+  - Unknown keys are silently ignored, so a typo in `live_subscription_from_master` silently
+    runs the four-index fallback (common/src/config.rs:21-110). `#[serde(deny_unknown_fields)]`
+    on every config section, with a test per section. Touches `common`, so workspace tests.
+- [ ] **PR26 — the token minter retries at most twice in total.** (`aws-lambdas`)
+  - The AWS SDK adds platform retries (up to 6 attempts) under the §10.8 cap of two TOTP
+    attempts. Set the SDK retry config so the whole mint is two attempts, pinned by a test.
+- [ ] **PR27 — the box reads the token instead of minting it.** (`core`, `app`)
+  - The box still mints at boot while the Lambda also mints (§10.3), so a box running across
+    06:05 IST can clash with the Lambda. Switch the box to READ `/dhan/access-token`, keeping a
+    mint only as a loud, coded last resort if the parameter is missing or expired.
+- [ ] **D11 — Muhurat trading is captured.** (`common`, `aws-lambdas`) Sunday 2026-11-08 is never
+  captured: the holiday gate and the weekday start window keep the box off
+  (common/src/session_window.rs:164-181; start_watchdog.rs:127-135). Default: add a dated
+  special-session entry that opens the capture window for that evening only. The owner confirms
+  the date and hours before it ships.
+- [ ] **Folded into existing PRs (fourth re-check):**
+  - PR4c-2 (done): the reviewer's design risk ("the fold keeps only the last sealed bar, so a
+    late sweep reads the wrong bar or drops rows") is handled: `window_bar` returns a bar only
+    when its bucket start IS the named window, a bar already sealed over is `Missing`, counted
+    (`reason="window_bar_missing"`) and left off the board, never replaced by a neighbour. The
+    PR4c-2 review (2026-09-27) found that "sealed over" was the COMMON case for a contract
+    trading every second, so each board-frame seal also keeps the window's volume in a
+    4-deep per-contract history in the leaderboard, and the board reads it there; the close
+    clock ranks windows that close together oldest first (catch-up bound 3); the candle clock
+    is capped AT the wall clock (each frame's arrival time), not wall + 2 s. Tests:
+    `busy_contract_is_ranked_after_the_fold_sealed_over_its_window`,
+    `windows_that_close_together_are_each_ranked_in_turn`,
+    `test_record_sealed_window_ranks_a_contract_the_fold_sealed_over`,
+    `test_window_close_clock_catches_up_oldest_first_within_the_bound`,
+    `test_far_future_watermark_never_closes_a_window_ending_after_the_wall`,
+    `test_a_bar_with_no_volume_is_quiet_not_a_zero_lot_fault`.
+  - PR5: about eight more `JoinError::is_panic` arms.
+  - PR7: `dhat_telegram_dispatcher` runs zero tests without `--features dhat`, so it proves
+    nothing in CI; make it run in the normal test lane. Tick parser measured 14.6 ns against a
+    10 ns budget: re-baseline or fix, never hide.
+  - PR12: state that it lifts the 512 MiB boot cap.
+  - PR16: the other `df` sites (~15 callers through one probe: fix inside the probe), the
+    prunes, the universe rebuild, and the token-cache write + fsync done while holding the
+    renewal lock on a shared worker.
+  - PR19: `/api/quote` with an unknown id does a full scan; the HTTP server has no timeouts or
+    connection cap. Liveness paging stops at 15:35 against the 15:40 close.
+  - D3: the wording names the contract-layer trim as well as the subscription cap.
+  - D6: the cited line is tickvault-host-tuning.service:74 (not 119-147). Scope grows to the
+    operator console's ~13 shell call sites, the deploy/ops scripts, the `chronyc` and `docker`
+    shell-outs in Rust and 8 orphan scripts. `rust_only_guard` still allows bash/sh everywhere
+    (104 shell files, ~18.2k lines, plus the Makefile, CI run steps, a systemd `sh -c` and SSM
+    command strings), so the allowlist shrink D6 promised is empty today: D6 shrinks it for real.
+  - D9b-3 (still paused on the owner's rotation decision): a retire bug and a flag that is read
+    but ignored, per the page rows marked D9b-3.
+  - CLAUDE.md: the catch-up sweep measured 4.73 ms at 25,000 × 10 timeframes; the 9.67 ms row
+    assumes `TF_COUNT` 24 and is stale. Corrected in the PR that next touches that row.
 
 ## Edge Cases
 

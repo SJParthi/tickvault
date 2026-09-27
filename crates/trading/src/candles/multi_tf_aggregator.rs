@@ -183,6 +183,21 @@ struct InstrumentSlot {
     last_trade_ts: u32,
 }
 
+/// What the fold holds for one named window of one instrument — returned by
+/// [`MultiTfAggregator::window_bar`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WindowBar {
+    /// The bar whose bucket IS the named window: the open bucket, else the
+    /// last-sealed one, else `None`.
+    pub bar: Option<LiveCandleState>,
+    /// Bucket-open IST second of the cell's currently open bucket (`0` when
+    /// the frame never opened).
+    pub open_bucket_ist_secs: u32,
+    /// Bucket-open IST second of the cell's last-sealed bucket (`0` when
+    /// nothing has sealed today).
+    pub last_sealed_bucket_ist_secs: u32,
+}
+
 /// Per-tick outcome, coalesced across all [`TF_COUNT`](crate::candles::TF_COUNT)
 /// timeframes so the caller emits ONE log line / counter set per tick rather
 /// than 21.
@@ -690,6 +705,46 @@ impl MultiTfAggregator {
         }
         cell.last_sealed_snapshot(tf)
             .filter(|s| s.bucket_start_ist_secs == bucket_open_ist_secs)
+    }
+
+    /// The bar for ONE named window, together with where the cell's open and
+    /// last-sealed buckets sit, or `None` when the fold holds no slot for
+    /// this instrument.
+    ///
+    /// [`Self::bar_for_window`] answers only "is there a bar for W". A ranker
+    /// that reads the window's volume also needs to know WHY there is none:
+    /// the instrument did not trade in W (both buckets are elsewhere and the
+    /// sealed one is older than W), or its W bar was overwritten because it
+    /// already sealed a LATER bucket — and whether it is trading after W at
+    /// all, so the next window's reader still visits it. Both answers come
+    /// from the two bucket starts this returns beside the bar.
+    ///
+    /// # Complexity
+    /// O(1) average — one hash lookup and two array indexes, no allocation.
+    #[must_use]
+    pub fn window_bar(
+        &self,
+        feed: Feed,
+        security_id: u64,
+        segment_code: u8,
+        tf: TfIndex,
+        bucket_open_ist_secs: u32,
+    ) -> Option<WindowBar> {
+        let idx = *self.index.get(&(feed, security_id, segment_code))? as usize;
+        let cell = &self.slots.get(idx)?.cell;
+        let open = cell.snapshot(tf);
+        let sealed = cell.last_sealed_snapshot(tf);
+        let last_sealed_bucket_ist_secs = sealed.map_or(0, |s| s.bucket_start_ist_secs);
+        let bar = if open.bucket_start_ist_secs == bucket_open_ist_secs {
+            Some(open)
+        } else {
+            sealed.filter(|s| s.bucket_start_ist_secs == bucket_open_ist_secs)
+        };
+        Some(WindowBar {
+            bar,
+            open_bucket_ist_secs: open.bucket_start_ist_secs,
+            last_sealed_bucket_ist_secs,
+        })
     }
 
     /// Read-only slot lookup. A pure query can never consume capacity.
@@ -1995,6 +2050,61 @@ mod tests {
             agg.bar_for_window(Feed::Dhan, 77, SEG_IDX, TfIndex::S1, OPEN + 60),
             None,
             "a window the cell never held must be absent, never the nearest bar"
+        );
+    }
+
+    /// `window_bar` hands back the same bar `bar_for_window` does, plus the
+    /// two bucket starts a ranker needs to tell "did not trade in W" from
+    /// "its W bar was already overwritten". Three states, one cell.
+    #[test]
+    fn test_window_bar_reports_the_bar_and_both_bucket_starts() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let sink = |_: Feed, _: u64, _: u8, _: TfIndex, _: LiveCandleState| {};
+        assert_eq!(
+            agg.window_bar(Feed::Dhan, 77, SEG_IDX, TfIndex::S1, OPEN),
+            None,
+            "no slot: the fold never saw this instrument"
+        );
+        let _ = agg.consume_tick(
+            Feed::Dhan,
+            &tick(77, SEG_IDX, OPEN, 100.0, 1_000),
+            None,
+            sink,
+        );
+        let only_open = agg
+            .window_bar(Feed::Dhan, 77, SEG_IDX, TfIndex::S1, OPEN)
+            .expect("slot exists");
+        assert_eq!(only_open.open_bucket_ist_secs, OPEN);
+        assert_eq!(
+            only_open.last_sealed_bucket_ist_secs, 0,
+            "nothing sealed yet"
+        );
+        assert_eq!(only_open.bar.map(|b| b.bucket_start_ist_secs), Some(OPEN));
+
+        // Two more seconds: OPEN seals, OPEN+1 seals, OPEN+2 is open. The OPEN
+        // bar has now been overwritten by the later seal.
+        for (dt, cum) in [(1_u32, 1_100_u32), (2, 1_250)] {
+            let _ = agg.consume_tick(
+                Feed::Dhan,
+                &tick(77, SEG_IDX, OPEN + dt, 101.0, cum),
+                None,
+                sink,
+            );
+        }
+        let rolled = agg
+            .window_bar(Feed::Dhan, 77, SEG_IDX, TfIndex::S1, OPEN)
+            .expect("slot exists");
+        assert_eq!(rolled.bar, None, "the OPEN bar left the fold");
+        assert_eq!(rolled.open_bucket_ist_secs, OPEN + 2);
+        assert_eq!(rolled.last_sealed_bucket_ist_secs, OPEN + 1);
+
+        let sealed = agg
+            .window_bar(Feed::Dhan, 77, SEG_IDX, TfIndex::S1, OPEN + 1)
+            .expect("slot exists");
+        assert_eq!(
+            sealed.bar.map(|b| b.volume),
+            Some(100),
+            "the OPEN+1 bar is read from the last-sealed bucket, its own volume"
         );
     }
 
