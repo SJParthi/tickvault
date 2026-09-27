@@ -97,7 +97,9 @@ use tickvault_common::source_scan::strip_rust_comments;
 /// them; four of those carried an assertion-free test. Nothing was rewritten
 /// to reach this number — the budget follows the corpus down, as this
 /// ratchet's own failure message demands.
-const ASSERTION_FREE_BUDGET: usize = 160;
+/// 160 -> 159 on 2026-09-27: measured by CI on the PR31a keyed-latch PR,
+/// which gave an existing candle-writer flush test real assertions.
+const ASSERTION_FREE_BUDGET: usize = 159;
 
 /// Substrings whose presence means the body asserts something.
 const ASSERTION_MARKERS: [&str; 12] = [
