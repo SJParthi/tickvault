@@ -10082,6 +10082,26 @@ const fn base_url_for(endpoint: DhanEndpointType) -> Option<&'static str> {
     }
 }
 
+/// Reads the token like [`current_feed_token`], but first records the token
+/// manager's generation in `dialled_generation` (audit PR22).
+///
+/// The generation is read BEFORE the token. The manager stores a new token
+/// and only then bumps the generation, so the value recorded here is never
+/// newer than the token presented. The safe direction: if the two straddle a
+/// replacement, a later 807 finds the generation moved and re-dials with the
+/// current token rather than renewing a second time.
+fn feed_token_recording_generation(
+    dialled_generation: &std::sync::atomic::AtomicU64,
+) -> Option<FeedTokenBuffer<String>> {
+    if let Some(manager) = global_token_manager() {
+        dialled_generation.store(
+            manager.renew_generation(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    current_feed_token()
+}
+
 /// Reads the CURRENT Dhan JWT from the process-global token manager.
 ///
 /// A function, not a captured string: the token rotates roughly every 23 hours
@@ -12887,9 +12907,17 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
             continue;
         };
 
+        // Audit PR22: the token generation this socket last dialled with. The
+        // token source writes it; the post-807 refresh below reads it, so a
+        // socket whose credential a sibling already replaced re-dials with
+        // the newer token instead of renewing (and invalidating) it again.
+        let dialled_generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let socket = DhanFeedSocketImpl::new(
             DhanSocketParams::new(endpoint, base_url.to_string(), client_id.to_string()),
-            current_feed_token,
+            {
+                let dialled_generation = std::sync::Arc::clone(&dialled_generation);
+                move || feed_token_recording_generation(&dialled_generation)
+            },
         );
         // Endpoint decides the budget. Depth may exhaust depth; it may not
         // evict the feed that actually carries ticks.
@@ -12989,10 +13017,16 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
                     // Post-807/809 re-dial: ask the token manager for a fresh JWT
                     // before presenting a credential again. Failure is logged by
                     // the manager and left to the reconnect ladder — re-dialing
-                    // with the stale token is the supervisor's own next step and
-                    // it will park after the ladder is exhausted.
+                    // with the stale token is the supervisor's own next step, on
+                    // the damped token-stale ladder (it does not park).
+                    //
+                    // Audit PR22: renew only if the token THIS socket dialled
+                    // with is still current. A sibling that got the same 807
+                    // may have renewed it already; renewing again would expire
+                    // the token that sibling just re-dialled with.
+                    let dialled = dialled_generation.load(std::sync::atomic::Ordering::Relaxed);
                     if let Some(manager) = global_token_manager()
-                        && let Err(err) = manager.force_renewal().await
+                        && let Err(err) = manager.force_renewal_unless_replaced(dialled).await
                     {
                         warn!(
                             code = ErrorCode::WsGapConnectionState.code_str(),
@@ -21761,6 +21795,57 @@ mod tests {
                 .contains("!tickvault_core::websocket::pool_supervisor::rotation_halted()"),
             "the ghost request must check the 805 breaker before arming the register"
         );
+    }
+
+    /// Audit PR22: every production feed socket records the token generation
+    /// it dials with, and its post-807 refresh renews only against THAT
+    /// generation. The generation is read before the token, so the recorded
+    /// value is never newer than the credential presented.
+    #[test]
+    fn stale_credential_refresh_renews_against_the_dialled_generation() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+        assert!(
+            production.contains("move || feed_token_recording_generation(&dialled_generation)"),
+            "the socket's token source must record the dialled generation"
+        );
+        assert!(
+            production.contains(
+                "let dialled = dialled_generation.load(std::sync::atomic::Ordering::Relaxed);"
+            ) && production.contains("manager.force_renewal_unless_replaced(dialled)"),
+            "the post-807 refresh must renew against the dialled generation"
+        );
+        assert!(
+            !production.contains("manager.force_renewal().await"),
+            "no feed socket may renew unconditionally after an 807"
+        );
+        let helper = production
+            .find("fn feed_token_recording_generation(")
+            .expect("the recording token source must exist");
+        let body = &production[helper..];
+        let generation_at = body
+            .find("manager.renew_generation()")
+            .expect("the helper reads the generation");
+        let token_at = body
+            .find("current_feed_token()")
+            .expect("the helper reads the token");
+        assert!(
+            generation_at < token_at,
+            "the generation must be read before the token"
+        );
+    }
+
+    /// No token manager registered (the unit-test process): the helper reads
+    /// no token and leaves the recorded generation untouched.
+    #[test]
+    fn test_feed_token_recording_generation_without_a_manager() {
+        if global_token_manager().is_some() {
+            return;
+        }
+        let cell = std::sync::atomic::AtomicU64::new(7);
+        assert!(feed_token_recording_generation(&cell).is_none());
+        assert_eq!(cell.load(std::sync::atomic::Ordering::Relaxed), 7);
     }
 
     /// Arm B of the unsubscribe probe is refused BEFORE its drop after an 805

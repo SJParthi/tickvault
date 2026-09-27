@@ -450,6 +450,13 @@ impl TokenManager {
                                     now_ist,
                                 );
                                 manager.token.store(Arc::new(Some(state)));
+                                // Audit PR22 hardening: every install of a
+                                // usable token bumps the generation, so a socket
+                                // that recorded an older one can never mistake
+                                // this token for the one it dialled with.
+                                manager
+                                    .renew_generation
+                                    .fetch_add(1, std::sync::atomic::Ordering::Release);
 
                                 // PROVE it works before committing to it.
                                 //
@@ -561,6 +568,10 @@ impl TokenManager {
                 token_cache::load_token_cache(&manager.credentials.client_id)
         {
             manager.token.store(Arc::new(Some(cached_token)));
+            // Audit PR22 hardening: see the SSM adoption above.
+            manager
+                .renew_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
             // PROBE BEFORE ADOPTING — the same one HTTP call the SSM branch
             // above makes, for the same reason, which this branch was missing.
             //
@@ -1275,9 +1286,25 @@ impl TokenManager {
         // of each other now produce ONE renewal: the first through the gate
         // does the work, the other fifteen wake, observe the generation has
         // moved, and return that caller's success as their own.
-        let seen_generation = self
-            .renew_generation
-            .load(std::sync::atomic::Ordering::Acquire);
+        let seen_generation = self.renew_generation();
+        self.renew_with_fallback_since(seen_generation).await
+    }
+
+    /// [`Self::renew_with_fallback`] against a generation the CALLER sampled.
+    ///
+    /// Audit PR22 (2026-09-27): sampling when the call starts is too late for
+    /// a socket. Its 807 names the token it DIALLED with, but the call comes
+    /// after a 5 s floor plus up to 375 ms of jitter, and a sibling's renewal
+    /// finishes inside that gap. A late socket then sampled the NEW
+    /// generation, found the gate free and renewed again — invalidating the
+    /// token its sibling had just installed, which sent the sibling back to
+    /// 807. `seen_generation` is therefore the generation the caller's
+    /// credential belongs to; if the token has moved on since, nothing is
+    /// renewed and the caller simply presents the newer token.
+    async fn renew_with_fallback_since(
+        &self,
+        seen_generation: u64,
+    ) -> Result<(), ApplicationError> {
         let _flight = self.renew_gate.lock().await;
         let current_generation = self
             .renew_generation
@@ -1700,6 +1727,43 @@ impl TokenManager {
         )
         .increment(1);
         self.renew_with_fallback().await
+    }
+
+    /// The number of successful token replacements so far (mints plus
+    /// renewals). One `Acquire` load, O(1).
+    ///
+    /// A socket reads this BEFORE it reads the token it dials with, so the
+    /// value it records is never newer than the token it presented; see
+    /// [`Self::force_renewal_unless_replaced`].
+    pub fn renew_generation(&self) -> u64 {
+        self.renew_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Audit PR22 (2026-09-27) — renew after a stale-credential disconnect
+    /// (807/809) ONLY if the token the socket dialled with is still current.
+    ///
+    /// `dialled_generation` is [`Self::renew_generation`] as the socket read
+    /// it when it dialled. If any mint or renewal has completed since, that
+    /// socket's credential is already replaced: the call returns `Ok(())`
+    /// without a request (counted on `tv_token_renew_coalesced_total`) and
+    /// the socket's next dial presents the newer token. Otherwise it renews
+    /// exactly as [`Self::force_renewal`] does, under the same single-flight
+    /// gate, so sixteen sockets that dialled with one token renew it once.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the underlying renew/generate error.
+    pub async fn force_renewal_unless_replaced(
+        &self,
+        dialled_generation: u64,
+    ) -> Result<(), ApplicationError> {
+        metrics::counter!(
+            "tv_token_force_renewal_total",
+            "trigger" => "stale_credential"
+        )
+        .increment(1);
+        self.renew_with_fallback_since(dialled_generation).await
     }
 
     /// Wave 2 Item 5.4 (G1) — current token expiry timestamp.
@@ -3305,6 +3369,155 @@ mod tests {
         );
 
         server_handle.abort();
+    }
+
+    /// Starts a local server that answers EVERY request with `body` and
+    /// counts the requests it received (audit PR22).
+    async fn start_counting_mock_server(
+        body: &'static str,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let url = format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().expect("local addr").port()
+        );
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let handle = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (url, hits, handle)
+    }
+
+    /// The 807 at-most-once proof (audit PR22). Two sockets dialled with the
+    /// SAME token and both got 807. The first renews. The second arrives
+    /// AFTER that renewal finished — the case the call-time sample missed,
+    /// because its jittered 5 s sleep outlasted the first renewal — and must
+    /// not renew again: a second RenewToken would expire the token the first
+    /// socket just re-dialled with.
+    #[tokio::test]
+    async fn test_force_renewal_unless_replaced_renews_once_for_two_late_sockets() {
+        let renew_body = r#"{"dhanClientId":"test","accessToken":"renewed-jwt","expiryTime":"2026-03-02T13:00:00+05:30"}"#;
+        let (url, hits, server) = start_counting_mock_server(renew_body).await;
+        let initial = DhanAuthResponseData {
+            access_token: "old-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        let manager = make_mock_manager(&url, &url, Some(TokenState::from_response(&initial)));
+
+        // Both sockets dialled with the same token.
+        let socket_a = manager.renew_generation();
+        let socket_b = manager.renew_generation();
+
+        manager
+            .force_renewal_unless_replaced(socket_a)
+            .await
+            .expect("the first socket renews");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(manager.renew_generation(), socket_a + 1);
+
+        // The late sibling: the gate is free and the renewal is over.
+        manager
+            .force_renewal_unless_replaced(socket_b)
+            .await
+            .expect("the late socket must succeed without a request");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the late socket renewed a token that had already been replaced; that second \
+             RenewToken expires the token its sibling just re-dialled with"
+        );
+        assert_eq!(manager.renew_generation(), socket_a + 1);
+
+        // Not an always-coalesce: a socket that dialled with the CURRENT token
+        // and then gets 807 does renew.
+        let socket_c = manager.renew_generation();
+        manager
+            .force_renewal_unless_replaced(socket_c)
+            .await
+            .expect("a socket on the current token renews");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(manager.renew_generation(), socket_c + 1);
+
+        server.abort();
+    }
+
+    /// With the credential already replaced, no request is made at all: the
+    /// base URL is unroutable, so any attempt would return `Err`.
+    #[tokio::test]
+    async fn test_force_renewal_unless_replaced_skips_a_replaced_credential() {
+        let manager = make_test_manager(None);
+        let dialled = manager.renew_generation();
+        manager
+            .renew_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        assert!(
+            manager.force_renewal_unless_replaced(dialled).await.is_ok(),
+            "a socket whose token was already replaced must not issue a request"
+        );
+        assert!(
+            manager
+                .force_renewal_unless_replaced(manager.renew_generation())
+                .await
+                .is_err(),
+            "a socket on the current token must take the real path (unroutable here)"
+        );
+    }
+
+    /// Audit PR22 ratchet: every production install of a usable token bumps
+    /// `renew_generation` within the next few lines. A store that skips it
+    /// would let a socket that dialled with the previous token skip its
+    /// renewal forever, or renew a token it never presented.
+    #[test]
+    fn every_token_install_bumps_the_renew_generation() {
+        let src = include_str!("token_manager.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+        let lines: Vec<&str> = production.lines().collect();
+        let mut installs = 0usize;
+        for (i, line) in lines.iter().enumerate() {
+            if line.contains("token.store(Arc::new(Some(") {
+                installs += 1;
+                let window = lines[i + 1..(i + 12).min(lines.len())].join("\n");
+                assert!(
+                    window.contains("renew_generation") && window.contains("fetch_add(1"),
+                    "token install at line {} is not followed by a renew_generation bump",
+                    i + 1
+                );
+            }
+        }
+        assert_eq!(
+            installs, 4,
+            "expected the mint, renewal, SSM and cache installs"
+        );
+    }
+
+    #[test]
+    fn test_renew_generation_reads_the_replacement_count() {
+        let manager = make_test_manager(None);
+        assert_eq!(manager.renew_generation(), 0);
+        manager
+            .renew_generation
+            .fetch_add(2, std::sync::atomic::Ordering::Release);
+        assert_eq!(manager.renew_generation(), 2);
     }
 
     // -----------------------------------------------------------------------
