@@ -192,7 +192,7 @@ pub struct SealOverflow {
 /// Bounded depth of the escalation hand-off queue.
 ///
 /// **DERIVED from `SEAL_BUFFER_CAPACITY` since 2026-09-27 (audit PR15).** It
-/// was 4,096. A refused seal reaches this queue only when the 225,000-deep
+/// was 4,096. A refused seal reaches this queue only when the 250,000-deep
 /// seal channel in front of the writer is itself full, and the one burst
 /// that fills that channel is the close force-seal: `AGGREGATOR_MAX_SLOTS ×
 /// TF_COUNT` seals at once. At 4,096 the queue held under 2% of such a
@@ -202,12 +202,12 @@ pub struct SealOverflow {
 /// can take every refusal of that burst while the disk does nothing at all.
 ///
 /// **Cost, stated plainly:** `std::sync::mpsc::sync_channel` allocates its
-/// slots up front, so this is committed memory, not lazy: 225,000 slots of
-/// one [`SealEscalationItem`] plus a stamp each, ~32 MB, the same order as
+/// slots up front, so this is committed memory, not lazy: 250,000 slots of
+/// one [`SealEscalationItem`] plus a stamp each, ~36 MB, the same order as
 /// the seal ring and the channel in front of it (0.1% of the 32 GiB host).
 ///
 /// **Shutdown:** the thread writes up to [`SEAL_ESCALATION_BATCH`] records
-/// per `write(2)`, so a full queue drains in ~220 writes, ~29 MB. That fits
+/// per `write(2)`, so a full queue drains in ~245 writes, ~32 MB. That fits
 /// the 5 s `SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS` at 10 ms per write or at a
 /// degraded 20 MB/s, pinned by
 /// `the_queue_depth_is_drainable_inside_the_shutdown_budget`. It does NOT fit
@@ -226,7 +226,7 @@ pub const SEAL_ESCALATION_QUEUE_DEPTH: usize = tickvault_trading::candles::SEAL_
 ///
 /// 1,024 records × 128 bytes = 128 KiB per write. Batching is what lets one
 /// thread keep up with a full burst: one syscall per record was the old
-/// cost, and at a degraded disk that alone could not drain a 225,000-deep
+/// cost, and at a degraded disk that alone could not drain a 250,000-deep
 /// queue inside the shutdown budget.
 pub const SEAL_ESCALATION_BATCH: usize = 1_024;
 
@@ -462,11 +462,28 @@ impl SealOverflow {
         spill: std::sync::Arc<crate::seal_spill::SealSpillWriter>,
         dlq: std::sync::Arc<crate::seal_dlq::SealDlqWriter>,
     ) -> Self {
+        Self::with_pending(
+            spill,
+            dlq,
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )
+    }
+
+    /// Build an escalator whose queued-seal count is shared with its caller
+    /// (audit PR40a). [`SealWriterRunner::overflow`] passes its own counter,
+    /// so the writer can include the escalation queue in
+    /// [`SealWriterRunner::unwritten_seals`] without a handle to the thread.
+    #[must_use]
+    pub fn with_pending(
+        spill: std::sync::Arc<crate::seal_spill::SealSpillWriter>,
+        dlq: std::sync::Arc<crate::seal_dlq::SealDlqWriter>,
+        pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
         Self {
             spill,
             dlq,
             offload: None,
-            pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            pending,
             queued: metrics::counter!(SEAL_ESCALATION_QUEUED_COUNTER),
             inline_fallback: metrics::counter!(SEAL_ESCALATION_INLINE_FALLBACK_COUNTER),
         }
@@ -489,7 +506,8 @@ impl SealOverflow {
     /// seal writer holds on every ring eviction: measured on the prod box
     /// 2026-08-20, `spilled: 541,519` in a single session with the ring at
     /// 598,976/600,000 — its capacity at the time, 25,000 × TF_COUNT=24; the
-    /// 2026-09-19 nine-frame collapse took that derived ceiling to 225,000, so
+    /// 2026-09-19 nine-frame collapse took that derived ceiling to 225,000 and
+    /// `M10` becoming a native frame on 2026-09-22 took it to 250,000, so
     /// re-read the constant rather than this dated pair. A producer-side
     /// escalation queues behind all of that.
     ///
@@ -645,14 +663,14 @@ pub fn global_seal_overflow() -> Option<&'static SealOverflow> {
 /// arithmetically FALSE at the configured ceiling.
 ///
 /// This channel sits IN FRONT OF the ring. `force_seal_all` emits
-/// `AGGREGATOR_MAX_SLOTS × TF_COUNT` = 25,000 × 9 = **225,000** seals
+/// `AGGREGATOR_MAX_SLOTS × TF_COUNT` = 25,000 × 10 = **250,000** seals
 /// in one burst, and every one of them must pass through here before it
 /// can reach the ring's three absorbing tiers. At 200,000 the channel
 /// force-dropped the remainder on `try_send` — counter-only, no log line,
 /// no alarm — every midnight, while the ring behind it was correctly sized
 /// for the full burst and sat mostly empty. The shortfall was **400,000**
-/// when this was written at TF_COUNT=24; the 2026-09-19 nine-frame collapse
-/// puts the burst at 225,000, so a literal 200_000 would drop 25,000 today.
+/// when this was written at TF_COUNT=24; at today's TF_COUNT=10 the burst is
+/// 250,000, so a literal 200_000 would drop 50,000 today.
 /// The number moved; the DEFECT is that a literal cannot follow it, which is
 /// why this constant is derived.
 ///
@@ -666,7 +684,7 @@ pub fn global_seal_overflow() -> Option<&'static SealOverflow> {
 /// Cost at the derived value: the mpsc allocates its buffer lazily per
 /// queued item (tokio `mpsc` does NOT pre-allocate capacity slots), so
 /// the steady-state cost is ~0 and the worst case equals the burst
-/// itself — 225,000 × ≤144 B ≈ **32 MB**, matching the ring, 0.10% of
+/// itself — 250,000 × ≤168 B ≈ **42 MB**, matching the ring, 0.12% of
 /// the r8g.xlarge 32 GiB host (operator Quote 13, 2026-08-08).
 pub const SEAL_MPSC_CAPACITY: usize = tickvault_trading::candles::SEAL_BUFFER_CAPACITY;
 
@@ -757,6 +775,9 @@ pub struct SealWriterRunner {
     spill: std::sync::Arc<SealSpillWriter>,
     /// Mid-session replay of the spill (audit PR15).
     replay: MidSessionReplay,
+    /// Seals queued to the escalation thread and not yet on disk, shared with
+    /// the [`SealOverflow`] that [`Self::overflow`] builds (audit PR40a).
+    escalation_pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl SealWriterRunner {
@@ -781,6 +802,7 @@ impl SealWriterRunner {
             dlq_dir: production_dlq_dir(),
             spill,
             replay: MidSessionReplay::default(),
+            escalation_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -815,6 +837,7 @@ impl SealWriterRunner {
             dlq_dir,
             spill,
             replay: MidSessionReplay::default(),
+            escalation_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -862,7 +885,11 @@ impl SealWriterRunner {
     /// installs belong on adjacent lines.
     #[must_use]
     pub fn overflow(&self) -> SealOverflow {
-        SealOverflow::new(self.pipeline.spill_handle(), self.pipeline.dlq_handle())
+        SealOverflow::with_pending(
+            self.pipeline.spill_handle(),
+            self.pipeline.dlq_handle(),
+            std::sync::Arc::clone(&self.escalation_pending),
+        )
     }
 
     /// Currently buffered ring depth (item observed by future
@@ -870,6 +897,30 @@ impl SealWriterRunner {
     #[must_use]
     pub fn ring_len(&self) -> usize {
         self.pipeline.ring_len()
+    }
+
+    /// Sealed candles this process holds in memory and has not yet written
+    /// anywhere durable (audit PR40a): the writer channel, the ring, and the
+    /// escalation queue in front of the spill. A crash (abort, out of memory,
+    /// hard kill) loses exactly these.
+    ///
+    /// Not included, and stated so the bound is honest: the seals of the
+    /// cycle in progress, popped from the ring into the ILP buffer and not
+    /// yet flushed (at most [`Self::max_drain_per_cycle`]), which exist only
+    /// between two samples.
+    ///
+    /// # Complexity
+    /// O(1): three length reads (`tokio::sync::mpsc::Receiver::len` is a
+    /// counter read, not a walk).
+    #[must_use]
+    pub fn unwritten_seals(&self) -> usize {
+        self.receiver
+            .len()
+            .saturating_add(self.pipeline.ring_len())
+            .saturating_add(
+                self.escalation_pending
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
     }
 
     /// Configured max-drain bound per cycle.
