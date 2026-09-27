@@ -113,8 +113,8 @@ Every surface of the tickvault stack is reachable through one MCP server
 | `list_novel_signatures` | first-seen signatures over a time window |
 | `signature_history` | all events matching a signature hash |
 | `triage_log_tail` | `data/logs/auto-fix.log` |
-| `find_runbook_for_code` | `.claude/rules/**` runbook lookup |
-| `questdb_sql` | any SQL against all 20 QuestDB tables |
+| `find_runbook_for_code` | runbook lookup across `docs/runbooks`, `docs/error-runbooks`, `.claude/rules`, `docs/claude-rules-full` |
+| `questdb_sql` | READ-ONLY SQL (one SELECT/SHOW/EXPLAIN/WITH, the operator console gate); 1000-row and 8 MiB caps |
 | `run_doctor` | `make doctor` parsed output |
 | `grep_codebase` | ripgrep over workspace |
 | `git_recent_log` | last N commits |

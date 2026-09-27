@@ -589,13 +589,35 @@ line coded, every loss counted and shipped), then the remaining order from the f
     too.
   - Terraform applies live on merge (terraform-apply.yml), and Object Lock cannot be switched
     off, so the dated owner quote goes into the daily-universe rule file first.
-- [ ] **PR29 — the log tool can never change the live database.** (`tickvault-logs-mcp`)
+- [x] **PR29 — the log tool can never change the live database.** (`tickvault-logs-mcp`)
   - Free SQL goes to the live database raw, so `drop` and `truncate` pass
     (tickvault-logs-mcp/src/tools.rs:669). Reuse the operator console's read-only SQL gate, cap
     rows and reply size (:704), bound log reads, and remove the shell-outs (:679, :1017-1021).
     The runbook finder also searches `docs/error-runbooks` and `docs/claude-rules-full`
-    (:609-615). This takes over the log-tool bullet in PR19. The MCP parity pin
-    (`crates/tickvault-logs-mcp/tests/parity.rs`) is bumped deliberately in the same PR.
+    (:609-615). This takes over the log-tool bullet in PR19.
+  - Done: `sql_gate.rs` copies the console's gate (one statement, no comments, first word
+    select/show/explain/with, 25 banned words) and its 1000-row cap. The test
+    `gate_source_is_identical_to_the_operator_console` reads the console's source at compile
+    time and fails if any copied item differs by one byte, so the two cannot drift. Refused
+    text never reaches the database (`questdb_sql_refuses_a_destructive_query_before_connecting`).
+    Replies over 8 MiB are refused (questdb_sql and tickvault_api). Log reads take at most the
+    last 32 MiB of a file and tails at most 5,000 lines, and each reply says when a file was
+    cut. `app_log_tail` refuses a `date` that is not YYYY-MM-DD (before, a path-shaped date such
+    as `x/../../secret` could reach a `.log` file outside the log directory whenever a folder
+    named `app.x` existed there). The runbook finder searches all four trees.
+  - Shell-outs: the `aws` CLI fallback is removed (the native SigV4 path does the same read).
+    `run_doctor` still runs `bash scripts/doctor.sh`; porting that script (it runs
+    `cargo check` and `validate-automation.sh`) belongs to D6 with the other shell scripts.
+    `git log` and `docker compose ps` stay: fixed argument lists, external programs rather than
+    scripts; the only caller input is `git log`'s line count, parsed as an integer first.
+  - Follow-ups found by the reviews, not fixed here: (a) the SQL gate's word boundary is
+    Unicode-aware, so a banned word glued to a non-ASCII letter is not caught; the fix must
+    land in all three copies at once (the console, the query console front and `sql_gate.rs`)
+    and goes with PR19. (b) `grep_codebase` accepts a relative path that climbs out of the
+    repository (older than this PR; PR19). (c) `LIMIT lo,hi` and negative limits pass the row
+    cap as written, so they are bounded only by the 8 MiB reply cap.
+  - Plan correction: `crates/tickvault-logs-mcp/tests/parity.rs` does not exist in the tree
+    (the parity harness was retired), so there is no pin to bump.
 - [ ] **PR30 — a budget stop stays stopped for the day.** (`aws-lambdas`, `scripts`, deploy)
   - The 08:45 start watchdog, `aws-autopilot.sh` and the 15:50 terraform apply each undo a
     budget stop the same day (start_watchdog.rs:819-835; aws-autopilot.sh:216-224;
