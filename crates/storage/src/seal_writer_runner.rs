@@ -65,7 +65,10 @@ use tickvault_trading::candles::BufferedSeal;
 use crate::seal_absorption::{SealAbsorptionPipeline, SubmitOutcome};
 use crate::seal_dlq::SealDlqWriter;
 use crate::seal_spill::SealSpillWriter;
-use crate::seal_writer_task::{BootDrainOutcome, DrainOutcome, drain_once, drain_recovered_seals};
+use crate::seal_writer_task::{
+    BootDrainOutcome, DrainOutcome, MidSessionReplay, ReplayOutcome, drain_once,
+    drain_recovered_seals,
+};
 use crate::shadow_candle_writer::ShadowCandleWriter;
 
 /// Production spill directory, derived through the public `SealSpillWriter`
@@ -161,6 +164,11 @@ pub struct SealOverflow {
     /// on whatever task called it. Once installed, an escalation costs a
     /// channel `try_send` and the disk work happens on `tv-seal-escalate`.
     offload: Option<std::sync::mpsc::SyncSender<SealEscalationItem>>,
+    /// Seals handed to the escalation thread and not yet written (audit
+    /// PR15). One relaxed add per queued seal, one subtract per written run.
+    /// Read at shutdown so an abandoned queue reports how many seals it held,
+    /// not merely that it held some.
+    pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Pre-resolved counter handles for the two per-tick outcomes.
     ///
     /// [`Self::escalate`] is reached from the per-tick fold closure on the
@@ -183,15 +191,44 @@ pub struct SealOverflow {
 
 /// Bounded depth of the escalation hand-off queue.
 ///
-/// 4,096 records of ~128 bytes each is ~512 KiB of shock absorption — enough
-/// to cover a multi-second disk stall at the seal rates this path sees, and
-/// small enough that draining it at shutdown fits inside
-/// `SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS` even at a degraded ~1 ms/write.
+/// **DERIVED from `SEAL_BUFFER_CAPACITY` since 2026-09-27 (audit PR15).** It
+/// was 4,096. A refused seal reaches this queue only when the 225,000-deep
+/// seal channel in front of the writer is itself full, and the one burst
+/// that fills that channel is the close force-seal: `AGGREGATOR_MAX_SLOTS ×
+/// TF_COUNT` seals at once. At 4,096 the queue held under 2% of such a
+/// burst, so a burst that met a slow disk ran the rest of its refusals
+/// through the inline cascade — a file write on the frame-drain task, the
+/// defect this queue exists to prevent. Sized to one whole burst, the queue
+/// can take every refusal of that burst while the disk does nothing at all.
 ///
-/// Overflow is NOT a loss: a full queue falls back to the inline cascade,
-/// which is exactly what this path did before the offload existed. The
-/// worst case is therefore "as slow as it used to be", never "lossy".
-pub const SEAL_ESCALATION_QUEUE_DEPTH: usize = 4_096;
+/// **Cost, stated plainly:** `std::sync::mpsc::sync_channel` allocates its
+/// slots up front, so this is committed memory, not lazy: 225,000 slots of
+/// one [`SealEscalationItem`] plus a stamp each, ~32 MB, the same order as
+/// the seal ring and the channel in front of it (0.1% of the 32 GiB host).
+///
+/// **Shutdown:** the thread writes up to [`SEAL_ESCALATION_BATCH`] records
+/// per `write(2)`, so a full queue drains in ~220 writes, ~29 MB. That fits
+/// the 5 s `SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS` at 10 ms per write or at a
+/// degraded 20 MB/s, pinned by
+/// `the_queue_depth_is_drainable_inside_the_shutdown_budget`. It does NOT fit
+/// when the disk refuses the batch: the seals then go to the DLQ one record
+/// at a time, and whatever is still queued at the deadline is counted as
+/// abandoned at shutdown.
+///
+/// Overflow is still NOT a loss: a full queue falls back to the inline
+/// cascade, degraded rather than lossy. Past one full burst of refusals
+/// against a stalled disk there are only three choices — block the drain,
+/// drop the seal, or grow without bound — and the inline write is the
+/// least bad; `tv_seal_escalation_inline_fallback_total` counts it.
+pub const SEAL_ESCALATION_QUEUE_DEPTH: usize = tickvault_trading::candles::SEAL_BUFFER_CAPACITY;
+
+/// Most records the escalation thread writes with one `write(2)`.
+///
+/// 1,024 records × 128 bytes = 128 KiB per write. Batching is what lets one
+/// thread keep up with a full burst: one syscall per record was the old
+/// cost, and at a degraded disk that alone could not drain a 225,000-deep
+/// queue inside the shutdown budget.
+pub const SEAL_ESCALATION_BATCH: usize = 1_024;
 
 /// How often the escalation thread wakes to re-check its stop flag while the
 /// queue is empty.
@@ -276,6 +313,7 @@ pub struct SealEscalationSink {
     spill: std::sync::Arc<crate::seal_spill::SealSpillWriter>,
     dlq: std::sync::Arc<crate::seal_dlq::SealDlqWriter>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl SealEscalationSink {
@@ -285,6 +323,65 @@ impl SealEscalationSink {
     #[must_use]
     pub fn stop_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         std::sync::Arc::clone(&self.stop)
+    }
+
+    /// How many handed-over seals the thread has not yet written (audit PR15).
+    /// Take a clone before moving the sink into its thread, like
+    /// [`Self::stop_flag`]; shutdown reads it to count an abandoned queue.
+    #[must_use]
+    pub fn pending_count(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        std::sync::Arc::clone(&self.pending)
+    }
+
+    /// Write one batch: one `write(2)` per run of records that share an IST
+    /// day (a batch straddles midnight at most once), and on a failed write
+    /// every record of that run goes to the DLQ, one line each.
+    ///
+    /// A seal the DLQ also refuses reaches `on_lost`, which is the page. The
+    /// failed batch write cut its torn tail back, or set the file aside when
+    /// it could not (see [`crate::seal_spill::SealSpillWriter::append_seals`]),
+    /// so no record of the run is left half-written in the spill; a record
+    /// that did land before the failure and is ALSO in the DLQ is collapsed by
+    /// the candle tables' DEDUP keys when both are replayed.
+    fn write_batch<F>(&self, batch: &[SealEscalationItem], scratch: &mut Vec<u8>, on_lost: &F)
+    where
+        F: Fn(&crate::seal_spill::SerializedSeal),
+    {
+        let mut start = 0;
+        while start < batch.len() {
+            let day = crate::seal_spill::ist_day_number(batch[start].now_unix_secs);
+            let mut end = start + 1;
+            while end < batch.len()
+                && crate::seal_spill::ist_day_number(batch[end].now_unix_secs) == day
+            {
+                end += 1;
+            }
+            let run = &batch[start..end];
+            let written = self.spill.append_seals(
+                run.iter().map(|item| &item.seal),
+                scratch,
+                run[0].now_unix_secs,
+            );
+            let run_written = run.len();
+            if written.is_err() {
+                // Straight to the DLQ: the spill just refused a whole batch,
+                // and retrying it per record would pay a reopen per seal on a
+                // failing disk — the case most likely to hold a full queue at
+                // shutdown, where every syscall counts against the budget.
+                for item in run {
+                    let record = crate::seal_dlq::SealDlqRecord::from(&item.seal);
+                    if self.dlq.append_record(&record, item.now_unix_secs).is_err() {
+                        metrics::counter!(SEAL_ESCALATION_LOST_COUNTER).increment(1);
+                        on_lost(&item.seal);
+                    }
+                }
+            }
+            // Written, sent to the DLQ or reported lost: either way no longer
+            // waiting in the queue.
+            self.pending
+                .fetch_sub(run_written, std::sync::atomic::Ordering::Relaxed);
+            start = end;
+        }
     }
 
     /// Drain the queue until the sender is gone, or until the stop flag is set
@@ -299,19 +396,25 @@ impl SealEscalationSink {
     {
         use std::sync::atomic::Ordering;
         use std::sync::mpsc::RecvTimeoutError;
+        // Reused across batches: after the first full batch neither grows.
+        let mut batch: Vec<SealEscalationItem> = Vec::with_capacity(SEAL_ESCALATION_BATCH);
+        let mut scratch: Vec<u8> =
+            Vec::with_capacity(SEAL_ESCALATION_BATCH * crate::seal_spill::SEAL_SPILL_RECORD_SIZE);
         loop {
             match self.rx.recv_timeout(SEAL_ESCALATION_STOP_POLL) {
-                Ok(item) => {
-                    if SealOverflow::escalate_inline(
-                        &self.spill,
-                        &self.dlq,
-                        &item.seal,
-                        item.now_unix_secs,
-                    ) == OverflowOutcome::Lost
-                    {
-                        metrics::counter!(SEAL_ESCALATION_LOST_COUNTER).increment(1);
-                        on_lost(&item.seal);
+                Ok(first) => {
+                    // Take whatever else is already queued, up to one batch.
+                    // `try_recv` never waits, so a lone refusal is written at
+                    // once rather than held back for company.
+                    batch.clear();
+                    batch.push(first);
+                    while batch.len() < SEAL_ESCALATION_BATCH {
+                        match self.rx.try_recv() {
+                            Ok(item) => batch.push(item),
+                            Err(_) => break,
+                        }
                     }
+                    self.write_batch(&batch, &mut scratch, &on_lost);
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     // Only exit on an EMPTY queue: a pending item always
@@ -363,6 +466,7 @@ impl SealOverflow {
             spill,
             dlq,
             offload: None,
+            pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             queued: metrics::counter!(SEAL_ESCALATION_QUEUED_COUNTER),
             inline_fallback: metrics::counter!(SEAL_ESCALATION_INLINE_FALLBACK_COUNTER),
         }
@@ -401,6 +505,7 @@ impl SealOverflow {
             spill: std::sync::Arc::clone(&self.spill),
             dlq: std::sync::Arc::clone(&self.dlq),
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pending: std::sync::Arc::clone(&self.pending),
         }
     }
 
@@ -455,6 +560,13 @@ impl SealOverflow {
     /// a way to know how often it fires — [`SEAL_ESCALATION_INLINE_FALLBACK_COUNTER`]
     /// is that number, and before it existed the frequency was Unknown.
     ///
+    /// Since audit PR15 the queue holds one whole close burst, so the refused
+    /// arm needs a full burst of refusals against a disk that has stopped
+    /// writing. When it does fire, its inline write also waits for the spill
+    /// lock, which the escalation thread holds for one batch write (at most
+    /// 128 KiB): a known, bounded wait on the drain in a state that is
+    /// already losing ticks to a stalled disk.
+    ///
     /// With NO offload installed (pre-2026-08-28 shape, and every unit test
     /// that does not call `split_escalation_offload`) every escalation is the
     /// inline cascade.
@@ -470,6 +582,11 @@ impl SealOverflow {
                 seal: serialised,
                 now_unix_secs,
             };
+            // Counted BEFORE the send: the thread may write and subtract the
+            // seal before `try_send` even returns, and counting after would
+            // let the subtraction run first and wrap the counter.
+            self.pending
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             match tx.try_send(item) {
                 Ok(()) => {
                     self.queued.increment(1);
@@ -482,6 +599,8 @@ impl SealOverflow {
                     std::sync::mpsc::TrySendError::Full(item)
                     | std::sync::mpsc::TrySendError::Disconnected(item),
                 ) => {
+                    self.pending
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     self.inline_fallback.increment(1);
                     return Self::escalate_inline(
                         &self.spill,
@@ -633,6 +752,11 @@ pub struct SealWriterRunner {
     spill_dir: std::path::PathBuf,
     /// DLQ directory — same reasoning as `spill_dir`.
     dlq_dir: std::path::PathBuf,
+    /// The pipeline's own spill writer, shared with the escalation thread.
+    /// The mid-session replay stages the live file under its append lock.
+    spill: std::sync::Arc<SealSpillWriter>,
+    /// Mid-session replay of the spill (audit PR15).
+    replay: MidSessionReplay,
 }
 
 impl SealWriterRunner {
@@ -645,6 +769,7 @@ impl SealWriterRunner {
     ) -> anyhow::Result<Self> {
         let writer = ShadowCandleWriter::new(questdb_config)?;
         let pipeline = SealAbsorptionPipeline::new();
+        let spill = pipeline.spill_handle();
         let (sender, receiver) = mpsc::channel(SEAL_MPSC_CAPACITY);
         Ok(Self {
             sender,
@@ -654,6 +779,8 @@ impl SealWriterRunner {
             max_drain_per_cycle,
             spill_dir: production_spill_dir(),
             dlq_dir: production_dlq_dir(),
+            spill,
+            replay: MidSessionReplay::default(),
         })
     }
 
@@ -676,6 +803,7 @@ impl SealWriterRunner {
             spill_dir.clone(),
             dlq_dir.clone(),
         );
+        let spill = pipeline.spill_handle();
         let (sender, receiver) = mpsc::channel(mpsc_capacity);
         Self {
             sender,
@@ -685,6 +813,8 @@ impl SealWriterRunner {
             max_drain_per_cycle,
             spill_dir,
             dlq_dir,
+            spill,
+            replay: MidSessionReplay::default(),
         }
     }
 
@@ -788,6 +918,30 @@ impl SealWriterRunner {
         );
 
         outcome
+    }
+
+    /// One live cycle, then at most one mid-session replay step (audit PR15).
+    ///
+    /// The writer loop's tick calls this; the shutdown drain calls
+    /// [`Self::run_one_cycle`] alone, so a stopping process never starts
+    /// re-reading the spill. The replay runs only after the live drain has
+    /// emptied the ring and the database has flushed cleanly for
+    /// [`crate::seal_writer_task::SEAL_REPLAY_HEALTHY_SECS`].
+    pub fn run_one_cycle_with_replay(
+        &mut self,
+        now_unix_secs: i64,
+    ) -> (CycleOutcome, ReplayOutcome) {
+        let cycle = self.run_one_cycle(now_unix_secs);
+        self.replay.observe(&cycle.drain, now_unix_secs);
+        let ring_is_empty = self.pipeline.ring_len() == 0;
+        let replay = self.replay.step(
+            &mut self.writer,
+            &self.spill,
+            &self.spill_dir,
+            ring_is_empty,
+            now_unix_secs,
+        );
+        (cycle, replay)
     }
 }
 
@@ -1588,21 +1742,258 @@ mod tests {
 
     #[test]
     fn the_queue_depth_is_drainable_inside_the_shutdown_budget() {
-        // Arithmetic pin, not a wall-clock measurement. The shutdown budget
-        // is 5s and each queued record costs one ~128-byte `write(2)`; at a
-        // badly degraded 1ms/write the full queue takes
-        // SEAL_ESCALATION_QUEUE_DEPTH milliseconds. Raising the depth without
-        // raising the budget (which the systemd guard would then catch) makes
-        // the shutdown drain unable to finish, and an undrained bounded queue
-        // at exit is a silent loss.
-        const DEGRADED_WRITE_MICROS: usize = 1_000;
+        // Arithmetic pin, not a wall-clock measurement (audit PR15 rewrite).
+        // The thread writes up to SEAL_ESCALATION_BATCH records per write(2),
+        // so a full queue costs ceil(depth / batch) writes. Two independent
+        // degraded-disk models must BOTH fit the 5s budget: a slow syscall
+        // (10ms per write, whatever its size) and a slow device (20 MB/s).
+        // Raising the depth or shrinking the batch without raising the budget
+        // (which the systemd guard would then catch) makes the shutdown drain
+        // unable to finish, and an undrained bounded queue at exit is a loss.
+        const DEGRADED_WRITE_MICROS: usize = 10_000;
+        const DEGRADED_BYTES_PER_SEC: usize = 20 * 1_000_000;
         const BUDGET_MICROS: usize = 5 * 1_000_000;
+        let writes = SEAL_ESCALATION_QUEUE_DEPTH.div_ceil(SEAL_ESCALATION_BATCH);
         assert!(
-            SEAL_ESCALATION_QUEUE_DEPTH * DEGRADED_WRITE_MICROS < BUDGET_MICROS,
-            "SEAL_ESCALATION_QUEUE_DEPTH = {SEAL_ESCALATION_QUEUE_DEPTH} cannot drain inside \
-             the 5s SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS at a degraded 1ms/write. Raise the \
+            writes * DEGRADED_WRITE_MICROS < BUDGET_MICROS,
+            "{writes} batched writes cannot drain inside the 5s \
+             SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS at a degraded 10ms/write. Raise the \
              budget in main.rs (and the systemd TimeoutStopSec the guard derives from it), \
-             or lower the depth."
+             raise SEAL_ESCALATION_BATCH, or lower the depth."
         );
+        let bytes = SEAL_ESCALATION_QUEUE_DEPTH * crate::seal_spill::SEAL_SPILL_RECORD_SIZE;
+        let micros = bytes * 1_000 / (DEGRADED_BYTES_PER_SEC / 1_000);
+        assert!(
+            micros < BUDGET_MICROS,
+            "{bytes} queued bytes cannot drain inside the 5s budget at a degraded 20 MB/s"
+        );
+        // Both degradations at once: every write pays the slow syscall AND
+        // the slow device. ~2.2 s + ~1.4 s = ~3.6 s, still inside 5 s.
+        assert!(
+            writes * DEGRADED_WRITE_MICROS + micros < BUDGET_MICROS,
+            "the combined slow-syscall + slow-device model does not fit the 5s budget"
+        );
+    }
+
+    /// Reads every record of every `.bin` file in `dir`, in name order.
+    fn read_spill_records(
+        dir: &std::path::Path,
+    ) -> Vec<(String, crate::seal_spill::SerializedSeal)> {
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .expect("spill dir readable")
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("bin"))
+            .collect();
+        files.sort();
+        let mut out = Vec::new();
+        for path in files {
+            let bytes = std::fs::read(&path).expect("spill file readable");
+            assert_eq!(
+                bytes.len() % crate::seal_spill::SEAL_SPILL_RECORD_SIZE,
+                0,
+                "a batched write must never leave a torn record"
+            );
+            let name = path
+                .file_name()
+                .expect("name")
+                .to_string_lossy()
+                .into_owned();
+            for chunk in bytes.chunks(crate::seal_spill::SEAL_SPILL_RECORD_SIZE) {
+                let seal = crate::seal_spill::SerializedSeal::from_bytes(chunk)
+                    .expect("every batched record decodes");
+                out.push((name.clone(), seal));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_escalation_thread_batches_a_burst_and_writes_every_record_in_order() {
+        // Audit PR15: more than four batches' worth, queued before the thread
+        // runs, so the thread really takes them SEAL_ESCALATION_BATCH at a time.
+        let (spill, dlq) = temp_pair("escalate-batched-burst");
+        let runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 16);
+        let mut overflow = runner.overflow();
+        let sink = overflow.split_escalation_offload();
+        let stop = sink.stop_flag();
+
+        let total = SEAL_ESCALATION_BATCH * 4 + 7;
+        let now = jan1_noon_utc();
+        for i in 0..total {
+            assert_eq!(
+                overflow.escalate(&mk_seal(13, 0, TfIndex::M1, 34_200 + i as u32, 101.5), now),
+                OverflowOutcome::Queued
+            );
+        }
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        sink.run(|_| {});
+
+        let records = read_spill_records(&spill);
+        assert_eq!(
+            records.len(),
+            total,
+            "every queued seal must land exactly once"
+        );
+        for (i, (_, seal)) in records.iter().enumerate() {
+            assert_eq!(
+                seal.bucket_start_ist_secs,
+                34_200 + i as u32,
+                "records must land in the order they were queued"
+            );
+        }
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn a_batch_that_straddles_ist_midnight_files_each_record_under_its_own_day() {
+        let (spill, dlq) = temp_pair("escalate-batch-midnight");
+        let runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 16);
+        let mut overflow = runner.overflow();
+        let sink = overflow.split_escalation_offload();
+        let stop = sink.stop_flag();
+
+        // IST midnight of 2026-01-02 is 18:30 UTC on 2026-01-01.
+        let midnight = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 18, 30, 0)
+            .single()
+            .expect("valid")
+            .timestamp();
+        for i in 0..3u32 {
+            let _ = overflow.escalate(&mk_seal(13, 0, TfIndex::M1, 100 + i, 1.0), midnight - 1);
+        }
+        for i in 0..5u32 {
+            let _ = overflow.escalate(&mk_seal(13, 0, TfIndex::M1, 200 + i, 1.0), midnight);
+        }
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        sink.run(|_| {});
+
+        let records = read_spill_records(&spill);
+        let day1 = records
+            .iter()
+            .filter(|(n, _)| n.contains("2026-01-01"))
+            .count();
+        let day2 = records
+            .iter()
+            .filter(|(n, _)| n.contains("2026-01-02"))
+            .count();
+        assert_eq!((day1, day2), (3, 5), "one batch, two days, two files");
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn a_failed_batch_write_falls_back_to_the_dlq_record_by_record() {
+        // The spill tier is dead (a plain file where its directory belongs),
+        // the DLQ is fine: every record of the batch must reach the DLQ and
+        // none may be reported lost.
+        let (spill, dlq) = temp_pair("escalate-batch-fallback");
+        let _ = std::fs::remove_dir_all(&spill);
+        std::fs::write(&spill, b"not a directory").expect("write blocker");
+        let runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 16);
+        let mut overflow = runner.overflow();
+        let sink = overflow.split_escalation_offload();
+        let stop = sink.stop_flag();
+
+        let now = jan1_noon_utc();
+        for i in 0..10u32 {
+            let _ = overflow.escalate(&mk_seal(13, 0, TfIndex::M1, 34_200 + i, 101.5), now);
+        }
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        let lost = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&lost);
+        sink.run(move |_| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        assert_eq!(lost.load(std::sync::atomic::Ordering::Relaxed), 0);
+        let lines: usize = std::fs::read_dir(&dlq)
+            .expect("dlq dir readable")
+            .filter_map(Result::ok)
+            .map(|e| {
+                std::fs::read_to_string(e.path())
+                    .unwrap_or_default()
+                    .lines()
+                    .count()
+            })
+            .sum();
+        assert_eq!(
+            lines, 10,
+            "every record of the failed batch must reach the DLQ"
+        );
+        let _ = std::fs::remove_file(&spill);
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn run_one_cycle_with_replay_never_replays_while_the_database_cannot_flush() {
+        // The test writer is permanently disconnected, so every live flush
+        // fails: the health gate can never open and the spilled seals must
+        // stay exactly where they are, however long the loop runs.
+        let (spill, dlq) = temp_pair("cycle-with-replay-unhealthy");
+        let mut runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 16);
+        let tx = runner.sender();
+        let t0 = jan1_noon_utc();
+        for i in 0..3u32 {
+            tx.try_send(mk_seal(
+                13,
+                0,
+                TfIndex::M1,
+                1_716_023_700 + i,
+                100.0 + f64::from(i),
+            ))
+            .expect("try_send");
+        }
+        let (cycle, replay) = runner.run_one_cycle_with_replay(t0);
+        assert_eq!(cycle.drain.rescued_to_spill, 3, "{cycle:?}");
+        assert!(replay.is_idle());
+        for step in 1..=20 {
+            let (_, replay) = runner.run_one_cycle_with_replay(t0 + step * 60);
+            assert!(replay.is_idle(), "no replay without a clean flush");
+        }
+        assert_eq!(
+            read_spill_records(&spill).len(),
+            3,
+            "the spilled seals stay in the live file"
+        );
+        assert!(!spill.join("replaying").exists());
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn the_pending_count_tracks_queued_seals_until_the_thread_writes_them() {
+        let (spill, dlq) = temp_pair("escalate-pending-count");
+        let runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 16);
+        let mut overflow = runner.overflow();
+        let sink = overflow.split_escalation_offload();
+        let pending = sink.pending_count();
+        let stop = sink.stop_flag();
+        let now = jan1_noon_utc();
+        for i in 0..10u32 {
+            let _ = overflow.escalate(&mk_seal(13, 0, TfIndex::M1, 34_200 + i, 1.0), now);
+        }
+        assert_eq!(pending.load(std::sync::atomic::Ordering::Relaxed), 10);
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        sink.run(|_| {});
+        assert_eq!(
+            pending.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "every written seal must leave the pending count"
+        );
+        // A refused send never counts: the queue is gone, so this goes inline.
+        let _ = overflow.escalate(&mk_seal(13, 0, TfIndex::M1, 99, 1.0), now);
+        assert_eq!(pending.load(std::sync::atomic::Ordering::Relaxed), 0);
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn the_queue_holds_one_whole_close_burst() {
+        // Audit PR15: the queue is sized to the one burst that can fill the
+        // seal channel in front of it, so every refusal of that burst is
+        // queued instead of written on the frame drain.
+        assert_eq!(
+            SEAL_ESCALATION_QUEUE_DEPTH,
+            tickvault_trading::candles::SEAL_BUFFER_CAPACITY
+        );
+        assert!(SEAL_ESCALATION_QUEUE_DEPTH >= SEAL_MPSC_CAPACITY);
     }
 }

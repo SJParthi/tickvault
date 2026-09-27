@@ -66,7 +66,7 @@ use tracing::{debug, error, info};
 use tickvault_common::error_code::ErrorCode;
 
 use crate::seal_writer_runner::{CycleOutcome, SealWriterRunner};
-use crate::seal_writer_task::BootDrainOutcome;
+use crate::seal_writer_task::{BootDrainOutcome, ReplayOutcome};
 
 /// Drain interval — the loop wakes every 100 ms during normal
 /// operation and drains the mpsc + ring through the ILP buffer.
@@ -144,6 +144,48 @@ impl SealWriterProgress {
     /// next reporting window.
     pub fn take(&mut self) -> Self {
         std::mem::take(self)
+    }
+}
+
+/// Counter for the mid-session spill replay (audit PR15). One series per
+/// `kind`: `files_staged`, `reingested`, `skipped`, `files_archived`,
+/// `flush_failed`.
+pub const SEAL_REPLAY_COUNTER: &str = "tv_seal_replay_total";
+
+/// The five `kind` labels of [`SEAL_REPLAY_COUNTER`].
+const SEAL_REPLAY_KINDS: [&str; 5] = [
+    "files_staged",
+    "reingested",
+    "skipped",
+    "files_archived",
+    "flush_failed",
+];
+
+/// Put every replay series on the wire at zero when the loop starts, so "the
+/// replay never ran" and "the replay found nothing" read differently from "the
+/// replay is not installed" (the first-sample baseline the EMF agent drops).
+fn register_replay_baseline() {
+    for kind in SEAL_REPLAY_KINDS {
+        metrics::counter!(SEAL_REPLAY_COUNTER, "kind" => kind).increment(0);
+    }
+}
+
+/// Emit one replay step's counters. Silent when the step did nothing.
+fn record_replay_observability(replay: &ReplayOutcome) {
+    if replay.is_idle() {
+        return;
+    }
+    let values = [
+        replay.files_staged,
+        replay.seals_reingested,
+        replay.records_skipped,
+        replay.files_archived,
+        usize::from(replay.flush_failed),
+    ];
+    for (kind, value) in SEAL_REPLAY_KINDS.into_iter().zip(values) {
+        if value > 0 {
+            metrics::counter!(SEAL_REPLAY_COUNTER, "kind" => kind).increment(value as u64);
+        }
     }
 }
 
@@ -391,6 +433,21 @@ fn final_drain(runner: &mut SealWriterRunner, progress: &mut SealWriterProgress)
     total
 }
 
+/// [`run_cycle`] plus one mid-session replay step, for the loop's tick. The
+/// shutdown drain keeps calling [`run_cycle`] alone.
+fn run_cycle_with_replay(
+    runner: &mut SealWriterRunner,
+    now_unix_secs: i64,
+) -> (CycleOutcome, ReplayOutcome) {
+    if tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        tokio::task::block_in_place(|| runner.run_one_cycle_with_replay(now_unix_secs))
+    } else {
+        runner.run_one_cycle_with_replay(now_unix_secs)
+    }
+}
+
 fn run_cycle(runner: &mut SealWriterRunner, now_unix_secs: i64) -> CycleOutcome {
     if tokio::runtime::Handle::current().runtime_flavor()
         == tokio::runtime::RuntimeFlavor::MultiThread
@@ -450,6 +507,8 @@ pub async fn run_seal_writer_loop(
             "seal writer boot recovery drain finished"
         );
     }
+
+    register_replay_baseline();
 
     let mut ticker = tokio::time::interval(interval);
     // If the runtime stalls and we miss multiple ticks (e.g. tokio
@@ -525,9 +584,10 @@ pub async fn run_seal_writer_loop(
             }
             _ = ticker.tick() => {
                 let now = utc_now_secs();
-                let outcome = run_cycle(&mut runner, now);
+                let (outcome, replay) = run_cycle_with_replay(&mut runner, now);
                 let dropped = progress.absorb(&outcome);
                 record_cycle_observability(&outcome, dropped);
+                record_replay_observability(&replay);
                 if !outcome.is_idle() {
                     debug!(
                         submitted_from_mpsc = outcome.submitted_from_mpsc,
