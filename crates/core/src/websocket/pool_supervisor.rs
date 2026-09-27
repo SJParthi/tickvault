@@ -1041,6 +1041,29 @@ pub fn rotation_halted() -> bool {
     ROTATION_HALTED.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// Counter of voluntary depth dials refused because an 805 has halted them
+/// for the process (audit PR21). Labelled by the path that asked, a fixed set:
+/// `ghost_redial`, `probe_close`, `attach`, `spawn`.
+pub const DIAL_REFUSED_AFTER_805_METRIC: &str = "tv_depth_dial_refused_after_805_total";
+
+/// Records one voluntary redial refused by the 805 breaker: a counter and a
+/// coded warning. The socket keeps running with what it holds; only the
+/// deliberate close-and-redial is dropped. O(1).
+pub fn refuse_voluntary_redial_after_805(slot: ConnectionSlot, path: &'static str) {
+    metrics::counter!(DIAL_REFUSED_AFTER_805_METRIC, "path" => path).increment(1);
+    error!(
+        code = ErrorCode::WsGapDisconnectClassification.code_str(),
+        source = "dial_refused_after_805",
+        path,
+        endpoint = slot.endpoint.as_str(),
+        pool_index = slot.pool_index,
+        "a deliberate close-and-redial of this socket was refused: Dhan closed a socket \
+         with 805 (too many connections) earlier in this process, and every redial is one \
+         more connection into an account already over its budget. The socket keeps its \
+         current instruments; a restart clears the stop."
+    );
+}
+
 /// A probe close is PENDING for this slot.
 static PROBE_CLOSE_PENDING: [std::sync::atomic::AtomicBool; GHOST_REDIAL_SLOTS] =
     [const { std::sync::atomic::AtomicBool::new(false) }; GHOST_REDIAL_SLOTS];
@@ -6269,10 +6292,22 @@ where
                 // to hold this task away from `recv`. One atomic swap a
                 // second. Only consulted when nothing else has already
                 // decided this socket's fate.
+                //
+                // Both registers ask for a VOLUNTARY close-and-redial, the same
+                // shape as rotate-by-reconnect, so both honour the 805 breaker
+                // the rotation arm reads (audit PR21, 2026-09-27): after Dhan
+                // has said the account is over its connection budget, a
+                // deliberate redial is one more connection into it. The
+                // request is taken (cleared) and refused, never left pending.
                 if action == SupervisorAction::Continue
                     && take_ghost_redial(supervisor.slot().global_index)
                 {
-                    action = supervisor.on_event(ConnEvent::GhostInstrumentDetected, Instant::now());
+                    if rotation_halted() {
+                        refuse_voluntary_redial_after_805(supervisor.slot(), "ghost_redial");
+                    } else {
+                        action =
+                            supervisor.on_event(ConnEvent::GhostInstrumentDetected, Instant::now());
+                    }
                 }
                 // The probe-close register, read on the same tick and AFTER
                 // the ghost register on purpose: if a socket has both pending,
@@ -6283,7 +6318,11 @@ where
                 if action == SupervisorAction::Continue
                     && take_probe_close(supervisor.slot().global_index)
                 {
-                    action = supervisor.on_event(ConnEvent::ProbeCloseRequested, Instant::now());
+                    if rotation_halted() {
+                        refuse_voluntary_redial_after_805(supervisor.slot(), "probe_close");
+                    } else {
+                        action = supervisor.on_event(ConnEvent::ProbeCloseRequested, Instant::now());
+                    }
                 }
             }
             // The keepalive ping's answer, polled IN the select so the read
@@ -12739,6 +12778,52 @@ mod tests {
     fn a_ranked_rotation_does_not_record_a_flap() {
         assert!(!ReconnectReason::RankedRotation.records_flap());
         assert_eq!(ReconnectReason::RankedRotation.as_str(), "ranked_rotation");
+    }
+
+    /// Audit PR21: the ghost and probe registers ask for a VOLUNTARY
+    /// close-and-redial, so both read the 805 breaker before acting, exactly
+    /// like the rotation arm.
+    #[test]
+    fn voluntary_redials_check_the_805_breaker_before_acting() {
+        let src = include_str!("pool_supervisor.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+        for (register, event) in [
+            (
+                "take_ghost_redial(supervisor",
+                "ConnEvent::GhostInstrumentDetected",
+            ),
+            (
+                "take_probe_close(supervisor",
+                "ConnEvent::ProbeCloseRequested",
+            ),
+        ] {
+            let at = production
+                .find(register)
+                .unwrap_or_else(|| panic!("{register} must still be read in the drain"));
+            let tail = &production[at..];
+            let breaker = tail
+                .find("rotation_halted()")
+                .unwrap_or_else(|| panic!("{register} must check the 805 breaker"));
+            let acts = tail
+                .find(event)
+                .unwrap_or_else(|| panic!("{event} must follow {register}"));
+            assert!(
+                breaker < acts,
+                "{register}: the 805 breaker must be read before {event} is raised"
+            );
+        }
+    }
+
+    #[test]
+    fn test_refuse_voluntary_redial_after_805_does_not_panic_and_names_the_path() {
+        let slot = slot(DhanEndpointType::Depth20, 0);
+        refuse_voluntary_redial_after_805(slot, "ghost_redial");
+        refuse_voluntary_redial_after_805(slot, "probe_close");
+        assert_eq!(
+            DIAL_REFUSED_AFTER_805_METRIC,
+            "tv_depth_dial_refused_after_805_total"
+        );
     }
 
     /// The 805 breaker, pinned by source because the flag is process-global:

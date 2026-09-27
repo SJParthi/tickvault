@@ -384,6 +384,27 @@ pub async fn run_arm(socket: &mut RebalanceSocket, arm: ProbeArm) -> ProbeVerdic
     // close then fail, and the single `Err` return skipped the restore
     // entirely: the depth-200 socket carried NOTHING for the rest of the
     // session, with one `probe_close_refused` warn as the only evidence.
+    // After an 805 the connection task refuses every voluntary close (audit
+    // PR21), so Arm B could drop the contract, never close, watch the frames
+    // keep coming and report `ignored`. Refused here, BEFORE the drop, so
+    // nothing changes and the verdict says the close could not be armed.
+    if arm == ProbeArm::SocketClose && tickvault_core::websocket::pool_supervisor::rotation_halted()
+    {
+        warn!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            source = "probe_close_refused",
+            connection_index,
+            reason = "rotation_halted_805",
+            "unsubscribe probe Arm B not run: Dhan closed a socket with 805 earlier in this \
+             process, so no voluntary socket close is allowed"
+        );
+        return finish(
+            arm,
+            connection_index,
+            instrument,
+            ProbeVerdict::InconclusiveWireFailed,
+        );
+    }
     let dropped = match arm {
         ProbeArm::Unsubscribe => act_drop(socket, instrument, true).await,
         ProbeArm::SocketClose => act_drop(socket, instrument, false).await,
