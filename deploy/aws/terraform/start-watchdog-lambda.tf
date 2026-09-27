@@ -83,6 +83,8 @@ resource "aws_iam_role_policy" "start_watchdog" {
         Resource = [
           "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/tickvault/${var.environment}/keep-alive-until",
           "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/tickvault/${var.environment}/holiday-stop-date",
+          # Audit PR30: the budget-stop latch (read-only here).
+          "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/tickvault-guard/${var.environment}/budget-stop-month",
         ]
       },
       {
@@ -141,6 +143,9 @@ resource "aws_lambda_function" "start_watchdog" {
       # holiday-gate.sh stamps today's IST date here before its self-stop;
       # the 08:45 check skips the self-start + Critical page when it matches.
       HOLIDAY_STOP_PARAM = "/tickvault/${var.environment}/holiday-stop-date"
+      # Audit PR30: the budget-stop latch — the 08:45 check skips the
+      # self-start while it names the current UTC billing month.
+      BUDGET_STOP_PARAM = "/tickvault-guard/${var.environment}/budget-stop-month"
     }
   }
 

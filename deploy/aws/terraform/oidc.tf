@@ -162,9 +162,14 @@ resource "aws_iam_role_policy" "github_deploy" {
         # the intentional holiday stop — the pre-fix boot/stop war could
         # bracket the 09:20 IST alarm-gate sample and restore the holiday
         # false page. Read-only, scoped to exactly that one parameter.
-        Effect   = "Allow"
-        Action   = ["ssm:GetParameter"]
-        Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/holiday-stop-date"
+        # Audit PR30 (2026-09-27): plus the budget-stop latch, read the same
+        # way so the self-start never undoes a budget stop.
+        Effect = "Allow"
+        Action = ["ssm:GetParameter"]
+        Resource = [
+          "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/holiday-stop-date",
+          "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault-guard/${var.environment}/budget-stop-month",
+        ]
       },
       {
         # LOG-INGESTION-SMOKE (deploy-aws.yml): after the verified swap, the

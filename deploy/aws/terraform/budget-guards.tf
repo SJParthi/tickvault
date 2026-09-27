@@ -197,6 +197,15 @@ resource "aws_iam_role_policy" "tv_hard_stop_guard" {
         Resource = aws_cloudwatch_event_rule.daily_start.arn
       },
       {
+        # Audit PR30 (2026-09-27): when the budget-stop latch names an
+        # EARLIER billing month, the guard turns the same rule back on once,
+        # so the box starts normally in the new month. Same one-rule scope.
+        Sid      = "ReleaseDailyStartRuleNextMonth"
+        Effect   = "Allow"
+        Action   = ["events:EnableRule"]
+        Resource = aws_cloudwatch_event_rule.daily_start.arn
+      },
+      {
         Effect   = "Allow"
         Action   = "sns:Publish"
         Resource = aws_sns_topic.tv_alerts.arn
@@ -225,6 +234,19 @@ resource "aws_iam_role_policy" "tv_hard_stop_guard" {
         Effect   = "Allow"
         Action   = ["ssm:GetParameter"]
         Resource = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/tickvault/${var.environment}/keep-alive-until"
+      },
+      {
+        # Audit PR30 (2026-09-27): the breach stop WRITES the budget-stop
+        # latch so the start watchdog, the autopilot and the terraform apply
+        # do not restart the box for the rest of the billing month (the
+        # breach path only writes it, it never reads SSM). The READ is the
+        # new-month release, which runs only while the box is stopped.
+        # Scoped to the single ARN, created lazily by
+        # PutParameter(Overwrite=true).
+        Sid      = "WriteBudgetStopLatch"
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter", "ssm:PutParameter"]
+        Resource = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/tickvault-guard/${var.environment}/budget-stop-month"
       },
       {
         Effect   = "Allow"
@@ -283,6 +305,8 @@ resource "aws_lambda_function" "tv_hard_stop_guard" {
       # parameter as start-watchdog-lambda.tf KEEP_ALIVE_PARAM — one marker,
       # two readers, so the guards cannot disagree).
       KEEP_ALIVE_PARAM = "/tickvault/${var.environment}/keep-alive-until"
+      # Audit PR30: the budget-stop latch the breach stop writes.
+      BUDGET_STOP_PARAM = "/tickvault-guard/${var.environment}/budget-stop-month"
     }
   }
 }

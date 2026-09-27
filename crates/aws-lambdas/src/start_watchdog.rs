@@ -75,6 +75,10 @@ pub struct WatchdogEnv {
     pub dashboard_port: String,
     pub keep_alive_param: String,
     pub holiday_stop_param: String,
+    /// The budget-stop latch (`budget_stop_latch`): the month a budget stop
+    /// happened in. While it names this UTC month the 08:45 self-start is
+    /// skipped, so the watchdog never undoes a budget stop.
+    pub budget_stop_param: String,
 }
 
 impl WatchdogEnv {
@@ -87,6 +91,9 @@ impl WatchdogEnv {
                 .unwrap_or_else(|_| DEFAULT_KEEP_ALIVE_PARAM.to_string()),
             holiday_stop_param: std::env::var("HOLIDAY_STOP_PARAM")
                 .unwrap_or_else(|_| DEFAULT_HOLIDAY_STOP_PARAM.to_string()),
+            budget_stop_param: std::env::var("BUDGET_STOP_PARAM").unwrap_or_else(|_| {
+                crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM.to_string()
+            }),
         }
     }
 }
@@ -539,6 +546,24 @@ pub async fn holiday_stop_is_today<S: SsmApi>(
     }
 }
 
+/// `true` when the budget-stop latch names the current UTC billing month.
+/// FAIL-OPEN: an unreadable or missing latch keeps the self-start; the
+/// hourly hard-stop guard still stops a breached box from Cost Explorer.
+pub async fn budget_stop_is_this_month<S: SsmApi>(
+    ssm: &S,
+    param: &str,
+    now_utc: DateTime<Utc>,
+) -> bool {
+    let raw = match ssm.get_parameter(param).await {
+        Ok(raw) => Some(raw),
+        Err(exc) => {
+            info!(error = %exc, "budget-stop latch unavailable — treating as not latched");
+            None
+        }
+    };
+    crate::budget_stop_latch::budget_stop_is_latched(raw.as_deref(), now_utc)
+}
+
 /// Legacy `_publish` — skips (with a warning) when the topic ARN is unset.
 async fn publish<N: SnsApi>(
     sns: &N,
@@ -828,6 +853,44 @@ for AWS-StartEC2Instance, and the EventBridge rule's FailedInvocations."
         return Ok(json!({
             "mode": "check", "state": state, "alerted": false, "self_started": false,
             "skipped": "holiday_stop"
+        }));
+    }
+
+    // Budget stop (audit PR30): the hourly guard or the AWS-Budgets
+    // kill-switch stopped the box this billing month and latched it.
+    // Starting it would only run until the guard stops it again, paging
+    // both ways every morning. So no self-start, and one short note each
+    // trading morning instead of the Critical "box down" page, so a stopped
+    // box on a trading day is never silent.
+    if budget_stop_is_this_month(ssm, &env.budget_stop_param, now).await {
+        info!(
+            state = %state,
+            "check — box is stopped and the budget-stop latch names this month; not self-starting"
+        );
+        let month = crate::budget_stop_latch::billing_month_utc(now);
+        let message = format!(
+            "⏸ *Box is off today: the monthly budget stop for {month} holds*\n\
+The box stays off until the next billing month. Nothing to do unless you want it \
+back sooner: delete the parameter {param} and enable the daily-start rule.\n",
+            param = env.budget_stop_param,
+        );
+        let noted = match publish(
+            sns,
+            env,
+            "[BUDGET] box off today — budget stop holds",
+            &message,
+        )
+        .await
+        {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(error = %e, "could not send the budget-stop morning note");
+                false
+            }
+        };
+        return Ok(json!({
+            "mode": "check", "state": state, "alerted": noted, "self_started": false,
+            "skipped": "budget_stop"
         }));
     }
 
@@ -1192,6 +1255,7 @@ mod tests {
             dashboard_port: "3001".to_string(),
             keep_alive_param: DEFAULT_KEEP_ALIVE_PARAM.to_string(),
             holiday_stop_param: DEFAULT_HOLIDAY_STOP_PARAM.to_string(),
+            budget_stop_param: crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM.to_string(),
         }
     }
 
@@ -1549,6 +1613,55 @@ mod tests {
         assert_eq!(out["alerted"], json!(true));
         assert_eq!(out["self_started"], json!(true));
         assert_eq!(*ec2.start_calls.borrow(), vec!["i-0test".to_string()]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Budget-stop latch (audit PR30). FakeSsm answers every name with one
+    // value, so "2026-06" is the latch for June and never today's holiday
+    // marker (a full date).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_budget_stop_is_this_month_latch_skips_the_self_start() {
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("stopped"));
+        let ssm = FakeSsm::with(Some("2026-06"));
+        let out = run(json!({"mode": "check"}), &ec2, &ssm, &sns, in_window_now()).await;
+        assert_eq!(out["alerted"], json!(true));
+        assert_eq!(out["self_started"], json!(false));
+        assert_eq!(out["skipped"], json!("budget_stop"));
+        assert!(ec2.start_calls.borrow().is_empty()); // the budget stop holds
+        // One short note, never the Critical "box down" page.
+        let published = sns.published.borrow();
+        assert_eq!(published.len(), 1);
+        assert!(published[0].subject.contains("budget stop holds"));
+        assert!(
+            published[0]
+                .message
+                .contains("budget stop for 2026-06 holds")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_budget_stop_is_this_month_last_months_latch_still_self_starts() {
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("stopped"));
+        let ssm = FakeSsm::with(Some("2026-05"));
+        let out = run(json!({"mode": "check"}), &ec2, &ssm, &sns, in_window_now()).await;
+        assert_eq!(out["self_started"], json!(true));
+        assert_eq!(*ec2.start_calls.borrow(), vec!["i-0test".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_budget_stop_is_this_month_fails_open_on_a_read_error() {
+        assert!(
+            !budget_stop_is_this_month(
+                &FakeSsm::raising(),
+                crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM,
+                in_window_now()
+            )
+            .await
+        );
     }
 
     #[tokio::test]

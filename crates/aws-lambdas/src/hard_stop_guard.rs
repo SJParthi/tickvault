@@ -3,11 +3,14 @@
 //!
 //! Hourly EventBridge cron; the budget/schedule never-cross safety net:
 //!
-//! * Instance already stopped/stopping -> no-op.
+//! * Instance already stopped/stopping -> no-op, except the new-month
+//!   release of an expired budget stop (audit PR30,
+//!   `release_expired_budget_stop`): re-enable the daily-start rule once.
 //! * Running OUTSIDE the Mon-Fri 08:30-17:30 IST up-window -> force stop +
 //!   Telegram (the legacy never-cross guard, unchanged).
 //! * Running INSIDE the up-window:
-//!     - MTD spend >= BUDGET_KILL_USD -> stop the instance, DISABLE the
+//!     - MTD spend >= BUDGET_KILL_USD -> stop the instance, write the
+//!       budget-stop latch (audit PR30, `budget_stop_latch`), DISABLE the
 //!       tv-<env>-daily-start EventBridge rule, page the operator (GAP 1:
 //!       without the disable, the next morning's start cron restarts the
 //!       killed box and runs it daily, unkilled, for the rest of the month).
@@ -25,8 +28,8 @@
 //!
 //! The AWS calls are abstracted behind tiny async traits so the unit tests
 //! drive the FULL flow with fakes exactly like the legacy monkeypatched
-//! `boto3.client` fakes did (including the ExplodingSsm "SSM was never
-//! touched" ratchets). The real SDK impls are thin, uncovered-by-design
+//! `boto3.client` fakes did (including the "SSM is never read on the breach
+//! path" ratchet). The real SDK impls are thin, uncovered-by-design
 //! shells (UNPROVEN until deploy — a live Lambda invoke is the only probe).
 
 use chrono::{DateTime, Datelike, Duration, FixedOffset, Offset, Timelike, Utc};
@@ -132,6 +135,10 @@ pub struct GuardEnv {
     /// honoured here too since 2026-09-08, so the two hourly guards over
     /// the same box agree on what "deliberately running late" means.
     pub keep_alive_param: String,
+    /// The budget-stop latch (`budget_stop_latch`), WRITTEN by the breach
+    /// stop so the start watchdog, the autopilot and the terraform apply do
+    /// not restart the box for the rest of the billing month.
+    pub budget_stop_param: String,
 }
 
 /// Grace: never out-of-window-stop a box within this many minutes of its
@@ -182,6 +189,9 @@ impl GuardEnv {
             keep_alive_param: std::env::var("KEEP_ALIVE_PARAM").unwrap_or_else(|_| {
                 crate::start_watchdog::DEFAULT_KEEP_ALIVE_PARAM.to_string()
             }),
+            budget_stop_param: std::env::var("BUDGET_STOP_PARAM").unwrap_or_else(|_| {
+                crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM.to_string()
+            }),
         }
     }
 }
@@ -209,11 +219,13 @@ pub trait SnsApi {
     async fn publish(&self, topic_arn: &str, subject: &str, message: &str) -> Result<(), String>;
 }
 
-/// EventBridge surface — `events:DisableRule` only. Errors are CAUGHT by
-/// the breach path (page-don't-crash) and reported honestly in the page.
+/// EventBridge surface — `events:DisableRule` (the breach stop) and
+/// `events:EnableRule` (the new-month release, audit PR30). Errors are
+/// CAUGHT (page-don't-crash) and reported honestly, never fatal.
 #[allow(async_fn_in_trait)] // APPROVED: handler is generic over the trait (no dyn); futures awaited inline.
 pub trait EventsApi {
     async fn disable_rule(&self, name: &str) -> Result<(), String>;
+    async fn enable_rule(&self, name: &str) -> Result<(), String>;
 }
 
 /// Cost Explorer surface — the raw `Amount` strings per result period
@@ -499,20 +511,51 @@ pub async fn save_ping_state<P: SsmApi>(ssm: &P, param: &str, state: &Value) -> 
     }
 }
 
-/// Legacy `_execute_breach_stop` — stop the box + disable the morning start
-/// rule + page (GAP 1). Ordering is deliberate: stop FIRST (caps spend even
-/// if the disable fails), then disable the start rule, then page — the page
-/// honestly reports whether the disable landed so the operator can finish
-/// by hand.
-pub async fn execute_breach_stop<E: Ec2Api, N: SnsApi, V: EventsApi>(
+/// Legacy `_execute_breach_stop` — stop the box + latch the stop + disable
+/// the morning start rule + page (GAP 1). Ordering is deliberate: stop FIRST
+/// (caps spend even if everything after it fails), then write the
+/// budget-stop latch (audit PR30), then disable the start rule, then page —
+/// the page honestly reports whether the latch and the disable landed so the
+/// operator can finish by hand.
+///
+/// The latch is WRITE-only here: the breach path never reads SSM, so no SSM
+/// outage can gate the stop, and a failed write is reported, never fatal.
+#[allow(clippy::too_many_arguments)] // APPROVED: the four injected AWS surfaces plus the breach facts; a wrapper struct would only rename them.
+pub async fn execute_breach_stop<E: Ec2Api, N: SnsApi, V: EventsApi, P: SsmApi>(
     env: &GuardEnv,
     ec2: &E,
     sns: &N,
     events: &V,
+    ssm: &P,
     mtd: f64,
     was_state: &str,
+    now_utc: DateTime<Utc>,
 ) -> Result<Value, String> {
     ec2.stop_instances(&env.instance_id).await?;
+
+    let month = crate::budget_stop_latch::billing_month_utc(now_utc);
+    let (latch_ok, latch_line) = match ssm.put_parameter(&env.budget_stop_param, &month).await {
+        Ok(()) => (
+            true,
+            format!(
+                "Budget-stop latch set for {month} (UTC billing month): the 8:45 AM \
+rescue, the autopilot and the terraform apply will not restart the box \
+until the next billing month starts.\n"
+            ),
+        ),
+        Err(e) => {
+            // The full SSM error goes to the log only; the page names the
+            // outcome, never AWS internals.
+            error!(code = "LAMBDA-AWS-02", error = %e, param = %env.budget_stop_param, "ssm:PutParameter for the budget-stop latch failed");
+            (
+                false,
+                "⚠ could NOT write the budget-stop latch (SSM refused the write; see the \
+Lambda log) — the 8:45 AM rescue may restart the box tomorrow; this guard stops it \
+again within the hour.\n"
+                    .to_string(),
+            )
+        }
+    };
 
     let mut disable_ok = false;
     let disable_err;
@@ -561,14 +604,17 @@ _instance_: `{instance_id}`\n\
 _was_state_: {was_state}\n\
 _MTD spend_: ~${mtd:.2} >= ${kill:.0} stop-budget\n\
 {disable_line}\n\
+{latch_line}\
 Why: the native AWS Budget stop-actions fire only ONCE per\n\
 month-crossing. Without disabling the start rule, tomorrow's\n\
 8:30 AM auto-start would restart the box and it would run\n\
 every day for the rest of the month, unkilled.\n\
-After investigating the spend, re-enable with:\n  aws events enable-rule --name {rule}\n",
+After investigating the spend, clear the latch and re-enable with:\n  \
+aws ssm delete-parameter --name {param}\n  aws events enable-rule --name {rule}\n",
         instance_id = env.instance_id,
         kill = env.budget_kill_usd,
         rule = env.start_rule_name,
+        param = env.budget_stop_param,
     );
     sns.publish(&env.alerts_topic_arn, &subject_capped, &message)
         .await?;
@@ -577,8 +623,71 @@ After investigating the spend, re-enable with:\n  aws events enable-rule --name 
         "noop": false,
         "breach": true,
         "disable_ok": disable_ok,
+        "latch_ok": latch_ok,
         "was_state": was_state,
     }))
+}
+
+/// The new-month release of a budget stop (audit PR30). Runs only while the
+/// box is stopped. When the latch names an EARLIER billing month, the stop
+/// it recorded has expired, so the `daily-start` rule the breach stop
+/// disabled is turned back on, the latch is overwritten with
+/// `released-<month>` (so this happens once), and the operator gets one
+/// short note. Without it the rule stayed off all of the next month and
+/// the 8:45 AM rescue paged every morning.
+///
+/// Fail-safe in every direction: an unreadable latch, a current-month
+/// latch or any other value does nothing; a failed enable is logged and
+/// leaves the latch in place, so the next hourly run tries again.
+/// Returns `true` only when the rule was re-enabled.
+pub async fn release_expired_budget_stop<N: SnsApi, V: EventsApi, P: SsmApi>(
+    env: &GuardEnv,
+    sns: &N,
+    events: &V,
+    ssm: &P,
+    now_utc: DateTime<Utc>,
+) -> bool {
+    if env.start_rule_name.is_empty() {
+        return false;
+    }
+    let raw = ssm.get_parameter(&env.budget_stop_param).await.ok();
+    if !crate::budget_stop_latch::latch_names_an_earlier_month(raw.as_deref(), now_utc) {
+        return false;
+    }
+    let old_month = raw
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    if let Err(e) = events.enable_rule(&env.start_rule_name).await {
+        error!(code = "LAMBDA-AWS-02", error = %e, rule = %env.start_rule_name, "events:EnableRule for the new-month budget-stop release failed");
+        return false;
+    }
+    if let Err(e) = ssm
+        .put_parameter(&env.budget_stop_param, &format!("released-{old_month}"))
+        .await
+    {
+        // The rule is back on, which is what matters; a stale latch only
+        // means the next run re-enables an already-enabled rule.
+        warn!(error = %e, param = %env.budget_stop_param, "could not mark the budget-stop latch released");
+    }
+    info!(month = %old_month, rule = %env.start_rule_name, "budget stop released for the new billing month");
+    let message = format!(
+        "🟢 *New billing month: the budget stop from {old_month} is released*\n\
+The morning auto-start is back on, so the box starts at 8:30 AM on the next \
+trading day. Nothing to do.\n"
+    );
+    if let Err(e) = sns
+        .publish(
+            &env.alerts_topic_arn,
+            "[BUDGET] new month — auto-start re-enabled",
+            &message,
+        )
+        .await
+    {
+        warn!(error = %e, "could not send the budget-stop release note");
+    }
+    true
 }
 
 /// Legacy `lambda_handler` — hourly EventBridge cron entry (event unused).
@@ -618,8 +727,9 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, C: CeApi, P: SsmApi>(
         state.as_str(),
         "stopped" | "stopping" | "shutting-down" | "terminated"
     ) {
-        info!(instance = %env.instance_id, state = %state, "already stopped, no-op");
-        return Ok(json!({"ok": true, "noop": true, "state": state}));
+        let released = release_expired_budget_stop(env, sns, events, ssm, now_utc).await;
+        info!(instance = %env.instance_id, state = %state, released, "already stopped, no-op");
+        return Ok(json!({"ok": true, "noop": true, "state": state, "released": released}));
     }
 
     if in_up_window(now_utc) {
@@ -645,7 +755,17 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, C: CeApi, P: SsmApi>(
         let action = classify_in_window_action(usd, env.budget_kill_usd);
         if action == "breach_stop" {
             // breach_stop implies usd is Some; 0.0 fallback is unreachable.
-            return execute_breach_stop(env, ec2, sns, events, usd.unwrap_or(0.0), &state).await;
+            return execute_breach_stop(
+                env,
+                ec2,
+                sns,
+                events,
+                ssm,
+                usd.unwrap_or(0.0),
+                &state,
+                now_utc,
+            )
+            .await;
         }
 
         // 2026-07-09 (operator escalation — Telegram noise N2): the running
@@ -817,6 +937,16 @@ impl EventsApi for SdkEvents {
     async fn disable_rule(&self, name: &str) -> Result<(), String> {
         self.client
             .disable_rule()
+            .name(name)
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    async fn enable_rule(&self, name: &str) -> Result<(), String> {
+        self.client
+            .enable_rule()
             .name(name)
             .send()
             .await
@@ -1016,6 +1146,7 @@ mod tests {
     struct FakeEvents {
         fail: bool,
         disabled: RefCell<Vec<String>>,
+        enabled: RefCell<Vec<String>>,
     }
 
     impl FakeEvents {
@@ -1023,12 +1154,13 @@ mod tests {
             Self {
                 fail: false,
                 disabled: RefCell::new(Vec::new()),
+                enabled: RefCell::new(Vec::new()),
             }
         }
         fn failing() -> Self {
             Self {
                 fail: true,
-                disabled: RefCell::new(Vec::new()),
+                ..Self::new()
             }
         }
     }
@@ -1039,6 +1171,14 @@ mod tests {
                 return Err("AccessDeniedException".to_string());
             }
             self.disabled.borrow_mut().push(name.to_string());
+            Ok(())
+        }
+
+        async fn enable_rule(&self, name: &str) -> Result<(), String> {
+            if self.fail {
+                return Err("AccessDeniedException".to_string());
+            }
+            self.enabled.borrow_mut().push(name.to_string());
             Ok(())
         }
     }
@@ -1111,18 +1251,6 @@ mod tests {
         }
     }
 
-    /// An SSM client whose ANY use panics — proves a path never touches it.
-    struct ExplodingSsm;
-
-    impl SsmApi for ExplodingSsm {
-        async fn get_parameter(&self, name: &str) -> Result<String, String> {
-            panic!("SSM must never be used on this path: get_parameter {name}");
-        }
-        async fn put_parameter(&self, name: &str, _value: &str) -> Result<(), String> {
-            panic!("SSM must never be used on this path: put_parameter {name}");
-        }
-    }
-
     fn test_env() -> GuardEnv {
         GuardEnv {
             instance_id: "i-tvapp".to_string(),
@@ -1131,6 +1259,7 @@ mod tests {
             budget_kill_usd: 55.0,
             ping_state_param: DEFAULT_PING_STATE_PARAM.to_string(),
             keep_alive_param: crate::start_watchdog::DEFAULT_KEEP_ALIVE_PARAM.to_string(),
+            budget_stop_param: crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM.to_string(),
         }
     }
 
@@ -1309,6 +1438,11 @@ mod tests {
         .await;
         assert_eq!(out["breach"], json!(true));
         assert_eq!(out["disable_ok"], json!(true));
+        assert_eq!(out["latch_ok"], json!(true));
+        // Audit PR30: the breach latches this UTC billing month, and the
+        // breach path only WRITES SSM (no ping-state read).
+        assert_eq!(*ssm.writes.borrow(), vec!["2026-07".to_string()]);
+        assert_eq!(*ssm.reads.borrow(), 0);
         assert_eq!(*ec2.stopped.borrow(), vec![vec!["i-tvapp".to_string()]]);
         assert_eq!(
             *events.disabled.borrow(),
@@ -1320,12 +1454,13 @@ mod tests {
         assert!(msg.contains("Budget breached"));
         assert!(msg.contains("auto-start DISABLED"));
         assert!(msg.contains("aws events enable-rule --name tv-prod-daily-start"));
-        // Byte-exact legacy-oracle parity (rendered by RUNNING
+        // Byte-exact message. It began as legacy-oracle parity (rendered by RUNNING
         // `_execute_breach_stop` from handler.py @ 9b1c2e6a1^ with the same
         // inputs: INSTANCE_ID=i-tvapp, START_RULE_NAME=tv-prod-daily-start,
         // BUDGET_KILL_USD=55, mtd=57.31, was_state=running, disable ok).
         // Fix round F1: the 2-space indent before the enable-rule command
         // must survive — a `\n\` source continuation stripped it.
+        // Audit PR30 added the latch line and the delete-parameter step.
         assert_eq!(
             msg.as_str(),
             "🛑 *Budget breached — box stopped + morning auto-start DISABLED \
@@ -1334,11 +1469,16 @@ _instance_: `i-tvapp`\n\
 _was_state_: running\n\
 _MTD spend_: ~$57.31 >= $55 stop-budget\n\
 Morning auto-start rule `tv-prod-daily-start` DISABLED.\n\
+Budget-stop latch set for 2026-07 (UTC billing month): the 8:45 AM rescue, \
+the autopilot and the terraform apply will not restart the box until the \
+next billing month starts.\n\
 Why: the native AWS Budget stop-actions fire only ONCE per\n\
 month-crossing. Without disabling the start rule, tomorrow's\n\
 8:30 AM auto-start would restart the box and it would run\n\
 every day for the rest of the month, unkilled.\n\
-After investigating the spend, re-enable with:\n  aws events enable-rule --name tv-prod-daily-start\n"
+After investigating the spend, clear the latch and re-enable with:\n  \
+aws ssm delete-parameter --name /tickvault-guard/prod/budget-stop-month\n  \
+aws events enable-rule --name tv-prod-daily-start\n"
         );
         assert!(published[0].subject.chars().count() <= 99);
     }
@@ -1663,6 +1803,61 @@ After investigating the spend, re-enable with:\n  aws events enable-rule --name 
         assert!(sns.published.borrow().is_empty());
     }
 
+    fn stopped_with_latch(latch: Option<&str>) -> (FakeEc2, FakeSns, FakeEvents, FakeCe, FakeSsm) {
+        (
+            FakeEc2::new("stopped"),
+            FakeSns::default(),
+            FakeEvents::new(),
+            FakeCe { amount: Some(0.4) },
+            FakeSsm::new(latch),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_release_expired_budget_stop_re_enables_the_rule_once_in_the_new_month() {
+        // in_window() is in July; the latch names June.
+        let (ec2, sns, events, ce, ssm) = stopped_with_latch(Some("2026-06"));
+        let out = run_scenario(&ec2, &sns, &events, &ce, in_window(), &ssm).await;
+        assert_eq!(out["noop"], json!(true));
+        assert_eq!(out["released"], json!(true));
+        assert!(ec2.stopped.borrow().is_empty());
+        assert_eq!(*events.enabled.borrow(), vec!["tv-prod-daily-start"]);
+        assert_eq!(*ssm.writes.borrow(), vec!["released-2026-06"]);
+        assert_eq!(sns.published.borrow().len(), 1);
+        assert!(
+            sns.published.borrow()[0]
+                .message
+                .contains("budget stop from 2026-06 is released")
+        );
+
+        // The marker never releases again.
+        *ssm.value.borrow_mut() = Some("released-2026-06".to_string());
+        let again = run_scenario(&ec2, &sns, &events, &ce, in_window(), &ssm).await;
+        assert_eq!(again["released"], json!(false));
+        assert_eq!(events.enabled.borrow().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_release_expired_budget_stop_leaves_a_current_month_stop_alone() {
+        let (ec2, sns, events, ce, ssm) = stopped_with_latch(Some("2026-07"));
+        let out = run_scenario(&ec2, &sns, &events, &ce, in_window(), &ssm).await;
+        assert_eq!(out["released"], json!(false));
+        assert!(events.enabled.borrow().is_empty());
+        assert!(ssm.writes.borrow().is_empty());
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_release_expired_budget_stop_keeps_the_latch_when_the_enable_fails() {
+        let (ec2, sns, _, ce, ssm) = stopped_with_latch(Some("2026-06"));
+        let events = FakeEvents::failing();
+        let out = run_scenario(&ec2, &sns, &events, &ce, in_window(), &ssm).await;
+        assert_eq!(out["released"], json!(false));
+        // No marker: the next hourly run tries again.
+        assert!(ssm.writes.borrow().is_empty());
+        assert!(sns.published.borrow().is_empty());
+    }
+
     // --- ChangeOnlyPingClassifier (pure classifier tests, 2026-07-09) ------
 
     #[test]
@@ -1851,9 +2046,22 @@ After investigating the spend, re-enable with:\n  aws events enable-rule --name 
     }
 
     #[tokio::test]
-    async fn test_breach_stop_ignores_ping_state() {
+    async fn test_execute_breach_stop_ignores_ping_state() {
         // RATCHET: the breach stop is evaluated BEFORE any state read — an
-        // SSM outage (or poisoned state) can never gate the stop.
+        // SSM outage (or poisoned state) can never gate the stop. Since
+        // audit PR30 the breach path WRITES the budget-stop latch; a read
+        // still panics here, and a failing write must not stop the stop,
+        // the disable or the page.
+        struct ReadExplodesWriteFails;
+        impl SsmApi for ReadExplodesWriteFails {
+            async fn get_parameter(&self, name: &str) -> Result<String, String> {
+                panic!("SSM must never be READ on the breach path: get_parameter {name}");
+            }
+            async fn put_parameter(&self, name: &str, _value: &str) -> Result<(), String> {
+                assert_eq!(name, crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM);
+                Err("simulated SSM outage".to_string())
+            }
+        }
         let (ec2, sns, events) = (
             FakeEc2::new("running"),
             FakeSns::default(),
@@ -1867,12 +2075,20 @@ After investigating the spend, re-enable with:\n  aws events enable-rule --name 
             &FakeCe {
                 amount: Some(57.31),
             },
-            &ExplodingSsm,
+            &ReadExplodesWriteFails,
             in_window(),
         )
         .await
         .expect("run_guard ok");
         assert_eq!(out["breach"], json!(true));
+        assert_eq!(out["latch_ok"], json!(false));
+        let published = sns.published.borrow();
+        assert_eq!(published.len(), 1);
+        assert!(
+            published[0]
+                .message
+                .contains("could NOT write the budget-stop latch")
+        );
         assert_eq!(*ec2.stopped.borrow(), vec![vec!["i-tvapp".to_string()]]);
         assert_eq!(
             *events.disabled.borrow(),
