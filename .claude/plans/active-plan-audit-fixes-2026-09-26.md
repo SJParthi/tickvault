@@ -432,10 +432,18 @@ PR25–PR27, PR18, PR19 and the decisions. One PR open at a time, as before.
     source-scan tests pin each site. Routine reconnects of an existing socket stay allowed
     (they keep coverage). The PR17 capture bullet is also done here: a disconnect stacked
     behind data now hands the frame up and closes on the next read (`pending_close`).
-- [ ] **PR22 — an 807 renews the token at most once.** (`core`)
+- [x] **PR22 — an 807 renews the token at most once.** (`core`)
   - The "already renewed" generation is read when the call starts, not when the 807 arrives,
     so two sockets can each trigger a renewal (token_manager.rs:1272-1297;
     pool_supervisor.rs:1834-1867). Capture the generation at 807 arrival and compare-and-swap.
+  - Done 2026-09-27, one step earlier than planned: each feed socket records the generation
+    at DIAL (`feed_token_recording_generation`, read before the token), and its post-807
+    refresh calls `TokenManager::force_renewal_unless_replaced(dialled)`, compared under the
+    existing single-flight gate. Arrival-time capture would still renew twice after a
+    scheduled renewal replaced the token the sockets dialled with. The two boot adoption
+    installs now bump the generation too (ratchet `every_token_install_bumps_the_renew_generation`).
+    Not changed: the mid-session watchdog's `force_renewal()` (not an 807 path; sockets now
+    re-dial instead of renewing if it replaces a fresh token).
 - [ ] **PR23 — the day's last candles are sealed at the close, not at shutdown.** (`app`, `trading`)
   - Candles after ~15:36 and the day's last 15/30/60-minute candles are sealed only at shutdown
     (dhan_feed_stack.rs:6125, :4361-4365, :7668); a crash loses them unless the next boot's WAL
