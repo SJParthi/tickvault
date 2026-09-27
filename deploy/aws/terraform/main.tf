@@ -503,7 +503,10 @@ resource "aws_cloudwatch_event_rule" "daily_start" {
   # so terraform re-enables this rule. The Jul 4 pause set state = "DISABLED";
   # the #1404 revert REMOVED the attribute, and with `state` absent the AWS
   # provider stops managing rule state - the rule stayed DISABLED on AWS.
-  state = "ENABLED"
+  # Audit PR30 (2026-09-27): DISABLED while the budget-stop latch holds, so
+  # an apply never re-enables the rule the hard-stop guard disabled on a
+  # budget breach (variables.tf daily_start_enabled; terraform-apply.yml).
+  state = var.daily_start_enabled ? "ENABLED" : "DISABLED"
 }
 
 # 2026-08-08 (operator Quote 14): stop moved 16:30 -> 17:30 IST for the 9-hour

@@ -211,8 +211,18 @@ elif [ "$STATE" = "stopped" ]; then
     HOLIDAY_MARKER=$(aws ssm get-parameter --region "$REGION" \
       --name "/tickvault/${ENVIRONMENT}/holiday-stop-date" \
       --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+    # Budget-stop latch (audit PR30, 2026-09-27): the hourly hard-stop guard
+    # or the AWS-Budgets kill-switch stopped the box this UTC billing month
+    # and wrote the month here. Starting it would only run until the guard
+    # stops it again. FAIL-OPEN like the holiday marker: an unreadable or
+    # missing latch keeps the self-start.
+    BUDGET_LATCH=$(aws ssm get-parameter --region "$REGION" \
+      --name "/tickvault-guard/${ENVIRONMENT}/budget-stop-month" \
+      --query 'Parameter.Value' --output text 2>/dev/null || echo "")
     if [ -n "$HOLIDAY_MARKER" ] && [ "$HOLIDAY_MARKER" = "$(TZ='Asia/Kolkata' date +%F)" ]; then
       note_ok "EC2 instance stopped (expected — NSE-holiday self-stop marker for today)"
+    elif [ -n "$BUDGET_LATCH" ] && [ "$BUDGET_LATCH" = "$(date -u +%Y-%m)" ]; then
+      note_ok "EC2 instance stopped (expected — budget-stop latch holds for ${BUDGET_LATCH}; delete /tickvault-guard/${ENVIRONMENT}/budget-stop-month to allow a restart)"
     else
       # The box should be RUNNING for the whole 08:30-16:30 IST window. Stopped
       # here = the 08:30 EventBridge start failed. Diagnose WHICH layer broke,

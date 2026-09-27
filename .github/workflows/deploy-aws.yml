@@ -641,6 +641,21 @@ jobs:
             exit 0
           fi
 
+          # Audit PR30 (2026-09-27): a budget stop stays stopped for the UTC
+          # billing month. The latch is read before the start, for every
+          # event type (the post-merge catch-up dispatches by
+          # workflow_dispatch too). FAIL-OPEN: an unreadable latch starts the
+          # box as before; the hourly hard-stop guard still stops a breached
+          # box within the hour. The raw value is never echoed.
+          LATCH=$(aws ssm get-parameter --region "$REGION" \
+            --name "/tickvault-guard/prod/budget-stop-month" \
+            --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+          if [ -n "$LATCH" ] && [ "$LATCH" = "$(date -u +%Y-%m)" ]; then
+            echo "DEPLOY_SKIP_REASON=budget_stop" >> "$GITHUB_ENV"
+            echo "::notice::Box is stopped by the monthly budget stop for $(date -u +%Y-%m) — not starting it, skipping deploy. To deploy anyway, delete /tickvault-guard/prod/budget-stop-month and re-enable the daily-start rule, then re-run."
+            exit 0
+          fi
+
           echo "box stopped but SHOULD be up — starting it (EventBridge start likely failed)"
           # Record that THIS run started a stopped box, so the final auto-stop
           # step below can stop it again if we are now OUTSIDE the 08:30-17:30

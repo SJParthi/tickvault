@@ -375,6 +375,24 @@ jobs:
       - name: terraform validate
         run: terraform -chdir=${{ env.TF_DIR }} validate
 
+      # Audit PR30 (2026-09-27): while the budget-stop latch names the current
+      # UTC billing month, plan the daily-start rule as DISABLED so this
+      # apply never undoes a budget stop. FAIL-OPEN: an unreadable or missing
+      # latch plans the rule ENABLED as before (the hourly hard-stop guard
+      # still stops a breached box within the hour and disables it again).
+      - name: Read the budget-stop latch
+        run: |
+          set -uo pipefail
+          LATCH=$(aws ssm get-parameter --name "/tickvault-guard/prod/budget-stop-month" \
+            --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+          MONTH=$(date -u +%Y-%m)
+          if [ -n "${LATCH}" ] && [ "${LATCH}" = "${MONTH}" ]; then
+            echo "::warning::budget-stop latch holds for ${MONTH} — planning the daily-start rule DISABLED"
+            echo "TF_VAR_daily_start_enabled=false" >> "$GITHUB_ENV"
+          else
+            echo "budget-stop latch not set for ${MONTH} — daily-start rule planned ENABLED"
+          fi
+
       - name: terraform plan
         id: plan
         run: |
@@ -566,6 +584,24 @@ jobs:
             -backend-config="region=${{ env.AWS_REGION }}" \
             -backend-config="dynamodb_table=tv-terraform-locks" \
             -backend-config="encrypt=true"
+
+      # Audit PR30: the apply job RE-PLANS on its own runner (see the next
+      # step), and $GITHUB_ENV from the plan job does not cross jobs, so the
+      # latch is read again here. Without this step the real apply planned
+      # the daily-start rule ENABLED on every run and undid a budget stop.
+      # Same fail-open read as the plan job; the raw value is never echoed.
+      - name: Read the budget-stop latch
+        run: |
+          set -uo pipefail
+          LATCH=$(aws ssm get-parameter --name "/tickvault-guard/prod/budget-stop-month" \
+            --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+          MONTH=$(date -u +%Y-%m)
+          if [ -n "${LATCH}" ] && [ "${LATCH}" = "${MONTH}" ]; then
+            echo "::warning::budget-stop latch holds for ${MONTH} — applying the daily-start rule DISABLED"
+            echo "TF_VAR_daily_start_enabled=false" >> "$GITHUB_ENV"
+          else
+            echo "budget-stop latch not set for ${MONTH} — daily-start rule applied ENABLED"
+          fi
 
       - name: terraform apply
         # Re-plan + apply on THIS runner instead of applying the saved tfplan.
