@@ -534,7 +534,7 @@ Source: re-check 5 on main c0e4829 (comparison page version 6; the full list wit
 the code when each PR is written; a wrong row is corrected here, never dropped.
 
 Order of work: PR15 finishes first. Then, riskiest first: PR28 (SEBI data off one disk, console
-wipe; split 2026-09-27 into PR28a, the console, and PR28b, the locked cloud copy) → PR29 (log tool can change the live database) → PR30 (budget stop undone the same day) →
+wipe; split 2026-09-27 into PR28a, the console, and PR28b, the locked cloud copy) → PR29 (log tool can change the live database; PR29b closes its base_url bypass) → PR30 (budget stop undone the same day) →
 PR31 (a restart can overwrite fuller candles; split 2026-09-27 into PR31a, PR31b and the PR31c follow-ups) → PR32 (tick rescue and spill ordering) → PR33
 (token and socket gaps) → PR34 (hung app never restarted) → PR35 (deploys) → PR36 (security) →
 PR37 (Dhan documentation mismatches) → PR38 (risk book across a restart) → PR39 (every error
@@ -610,6 +610,27 @@ line coded, every loss counted and shipped), then the remaining order from the f
     `cargo check` and `validate-automation.sh`) belongs to D6 with the other shell scripts.
     `git log` and `docker compose ps` stay: fixed argument lists, external programs rather than
     scripts; the only caller input is `git log`'s line count, parsed as an integer first.
+- [x] **PR29b — `tickvault_api` cannot reach the database around the SQL gate.**
+  (`tickvault-logs-mcp`) Found by re-check 6 after PR29 merged: `tickvault_api` took
+  `base_url` from the caller (tools.rs `tool_tickvault_api`, config.rs `endpoint_url`), so a
+  GET to `127.0.0.1:9000/exec?query=DROP ...` reached QuestDB without passing the read-only
+  gate, and the API bearer token went to whatever host was named.
+  - Done: a caller `base_url` is refused before any connection (`API_BASE_OVERRIDE_REFUSAL`)
+    and is no longer in the tool's schema; the path must be `/health` or under `/api/`, with
+    no `..`, `%`, `@`, `\`, `#`, `://`, spaces or control characters (`api_path_is_allowed`);
+    and the call is refused when the configured API address is the database's, spellings of
+    loopback and default ports folded (`same_origin`, unparseable fails closed). The tools'
+    HTTP client no longer follows redirects, so a 3xx reply cannot send the next request to
+    the database (found by the security review; reqwest keeps the bearer header on a
+    same-host redirect to another port). The bearer token therefore only goes to the
+    configured API. The launcher no longer runs a prebuilt binary older than its sources
+    (it rebuilds instead), so PR29 and this fix actually run once checked out.
+  - Tests: `tickvault_api_can_never_reach_questdb_exec_around_the_sql_gate`,
+    `api_path_is_allowed_only_for_the_app_read_routes`,
+    `same_origin_folds_loopback_spellings_and_default_ports`,
+    `tickvault_api_refuses_a_caller_base_url_before_any_network`; the redirect case is
+    in `questdb_sql_and_tickvault_api_against_local_mock` (a 302 to `/exec` is reported,
+    not followed).
   - Follow-ups found by the reviews, not fixed here: (a) the SQL gate's word boundary is
     Unicode-aware, so a banned word glued to a non-ASCII letter is not caught; the fix must
     land in all three copies at once (the console, the query console front and `sql_gate.rs`)
@@ -787,6 +808,19 @@ line coded, every loss counted and shipped), then the remaining order from the f
   - All Green does not check terraform or the production aarch64-musl build (ci.yml:1121-1132;
     terraform-apply.yml:50-53): add both, and add them to `all-green`'s `needs:` in the same
     change (merge-gate lock §5).
+- [ ] **PR36a — the console key is never sent to the alerts topic.** (`.github/workflows/`)
+  Found by re-check 6, verified by reading terraform-apply.yml. Taken next after PR29b,
+  ahead of PR31b, because it is a live secret leak. Every terraform apply publishes
+  `LINK="${URL}#key=${KEY}"` (terraform-apply.yml:656) to `tv-prod-alerts`, which forwards
+  to Telegram, the always-on email subscription and SMS when a phone is set; the `add-mask`
+  only hides the Actions log. Publish the console URL only, never the key. Rotating the
+  current key is the owner's call (past copies sit in Telegram and email history); asked in
+  the fix thread on 2026-09-27, recommending rotation.
+- [ ] **PR36b — a manual deploy needs All Green on the commit it ships.**
+  (`.github/workflows/deploy-aws.yml`) Found by re-check 6: `workflow_dispatch` from any
+  branch reaches the `deploy` job's `environment: prod` (deploy-aws.yml:403), so a manual run
+  can ship a commit that never passed All Green. Refuse a dispatch whose ref is not `main`,
+  or whose head has no successful All Green, before the build.
 - [ ] **PR36 — security hardening.** (deploy, `core`, `app`, `aws-lambdas`)
   - SSH is open to 0.0.0.0/0 (terraform-apply.yml:123; main.tf:144-150): close 22 or pin a CIDR.
   - The scheduler role can pass any role (main.tf:624-633): scope PassRole to its own ARN.
