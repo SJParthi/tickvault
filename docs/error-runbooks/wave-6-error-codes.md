@@ -101,6 +101,30 @@ inside the boot prefix) but route 1 still sees its ERROR line; the delta
 counter shape is not live-verified from the sandbox — if it ever proved
 cumulative, Sum over-pages (fail-loud, never a silent miss).
 
+### 2026-09-27 Update (audit PR40a) — a crash's unwritten seals, reported at the next boot
+
+A crash (abort, out of memory, hard kill) loses every sealed candle still in
+memory: the writer channel, the ring and the escalation queue, each sized to
+`SEAL_BUFFER_CAPACITY` (250,000 at `TF_COUNT` 10). The writer now publishes
+that count every cycle as the gauge `tv_seal_unwritten`, and writes it to
+`seal-unwritten.mark` in the spill directory at most once a second when it
+changes. A clean shutdown rewrites the marker with `clean=1` after its final
+drain. The next boot reads it first: a marker that is not clean and holds
+seals fires this code with `source = "crash_unwritten"` and fields
+`seals_unwritten`, `sampled_at_unix_secs` and `sample_age_secs`, and adds the
+number to `tv_seal_crash_unwritten_total`. It pages through the existing
+errcode alarm; no new alarm.
+
+**Triage for `source = "crash_unwritten"`:** the loss already happened in the
+previous process. Find why it died (`journalctl -u tickvault`, the OOM
+monitor, the previous `errors.jsonl`). The reported number is the count at
+the last sample, up to one second before the process died. The candles of the
+windows involved are missing from `candles_*`; their ticks are in `ticks` and
+in the capture log, so a rebuild is possible by hand until PR31b's warm-up
+does it at boot.
+
+**Source:** `crates/storage/src/seal_writer_loop.rs::report_previous_unwritten`.
+
 ### 2026-05-11 Update — 4-alert drop-class family is now live
 
 Per Wave 6 Sub-PR #1 items 1.4j/l/n/o (merged #584/#587/#589/#590) the

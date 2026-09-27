@@ -3388,11 +3388,12 @@ static SEAL_ESCALATION_THREAD: std::sync::Mutex<Option<std::thread::JoinHandle<(
 /// Budget for draining the seal-escalation queue at shutdown.
 ///
 /// DERIVED, not guessed: the queue holds at most
-/// `SEAL_ESCALATION_QUEUE_DEPTH` records (225,000 since audit PR15, one whole
-/// close burst) of 128 bytes, written `SEAL_ESCALATION_BATCH` (1,024) per
-/// `write(2)`: ~220 writes, ~29 MB. On a healthy volume that is well under a
-/// second; at a degraded 10 ms/write it is ~2.2 s and at a degraded 20 MB/s
-/// ~1.4 s, so 5s covers both with a margin. The storage test
+/// `SEAL_ESCALATION_QUEUE_DEPTH` records (250,000 at `TF_COUNT` 10, one whole
+/// close burst; the figure read 225,000 until audit PR40a) of 128 bytes,
+/// written `SEAL_ESCALATION_BATCH` (1,024) per `write(2)`: ~245 writes,
+/// ~32 MB. On a healthy volume that is well under a second; at a degraded
+/// 10 ms/write it is ~2.5 s and at a degraded 20 MB/s ~1.6 s, so 5s covers
+/// both with a margin. The storage test
 /// `the_queue_depth_is_drainable_inside_the_shutdown_budget` pins both.
 ///
 /// What it does NOT cover: a disk that REFUSES the batch write. Each seal of
@@ -4711,7 +4712,7 @@ async fn run_process_runloop(
             // Counted in SEALS since audit PR15 (the counter's own name says
             // "seals still queued"). It used to add 1 per abandonment
             // whatever the queue held, which read the same for one seal and
-            // for a whole 225,000-seal burst.
+            // for a whole 250,000-seal burst.
             let seals_abandoned = SEAL_ESCALATION_PENDING
                 .get()
                 .map_or(0, |p| p.load(std::sync::atomic::Ordering::Relaxed));
