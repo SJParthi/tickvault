@@ -670,6 +670,24 @@ impl SealSink for ShadowCandleWriter {
     }
 }
 
+/// How long a staged recovery file whose seals the writer REFUSED stays staged
+/// for another boot's retry (audit PR31a, 2026-09-27). Two days covers the next
+/// trading morning's boot. Past it the refusal is in the data rather than the
+/// moment, and re-reading the file every boot would re-send its good seals over
+/// any newer bar with the same key.
+pub const SEAL_REFUSED_FILE_RETRY_SECS: u64 = 2 * 24 * 60 * 60;
+
+/// `true` when a staged file was last written more than
+/// [`SEAL_REFUSED_FILE_RETRY_SECS`] ago. An unreadable time reads as young, so
+/// the file is kept rather than archived on a guess.
+fn staged_file_is_past_refusal_retry(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|written| std::time::SystemTime::now().duration_since(written).ok())
+        .is_some_and(|age| age.as_secs() > SEAL_REFUSED_FILE_RETRY_SECS)
+}
+
 /// Boot-time recovery: reads every orphaned spill / DLQ file back and
 /// re-ingests it into QuestDB through `writer`.
 ///
@@ -828,7 +846,7 @@ pub fn drain_recovered_seals<S: SealSink>(
         outcome.seals_reingested += committed;
         outcome.seals_append_failed += append_failed;
 
-        if file_ok && append_failed > 0 {
+        if file_ok && append_failed > 0 && !staged_file_is_past_refusal_retry(path) {
             // The database is up (every flush landed), so the remaining files
             // are still worth trying: no `halted`. Re-reading this file on the
             // next boot re-sends the seals that did land, and the DEDUP key
@@ -836,6 +854,20 @@ pub fn drain_recovered_seals<S: SealSink>(
             outcome.files_left_pending += 1;
             outcome.seals_left_pending += append_failed;
         } else if file_ok {
+            if append_failed > 0 {
+                // Bounded retry: a file older than the retry window has been
+                // refused on every boot since, so the refusal is in the data,
+                // not the moment. Archive it (its bytes stay in archive/) rather
+                // than re-send its good seals over newer bars every morning.
+                error!(
+                    code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                    ?path,
+                    append_failed,
+                    retry_secs = SEAL_REFUSED_FILE_RETRY_SECS,
+                    "seal recovery: seals in this file were refused on every boot for the \
+                     whole retry window — archived NOT re-ingested; the bytes stay in archive/"
+                );
+            }
             match archive_staged(path) {
                 Ok(()) => outcome.files_archived += 1,
                 Err(err) => {
@@ -861,6 +893,15 @@ pub fn drain_recovered_seals<S: SealSink>(
             seals_append_failed = outcome.seals_append_failed,
             seals_reingested = outcome.seals_reingested,
             "seal recovery INCOMPLETE — sealed candles are on DISK and NOT in QuestDB"
+        );
+    } else if outcome.seals_append_failed > 0 {
+        error!(
+            code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+            seals_append_failed = outcome.seals_append_failed,
+            seals_reingested = outcome.seals_reingested,
+            files_archived = outcome.files_archived,
+            "seal recovery finished with refused seals archived NOT re-ingested — \
+             their bytes are in archive/"
         );
     } else {
         info!(

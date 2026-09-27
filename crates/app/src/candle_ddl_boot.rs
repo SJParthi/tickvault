@@ -115,15 +115,16 @@ pub async fn run_candle_ddl_at_boot(questdb: &QuestDbConfig) {
             "candle DDL boot: QuestDB not ready within the quiet probe bound — \
              candle DDL SKIPPED this boot. Consequence: the candle writer refuses \
              to send until the tables are confirmed keyed, so sealed candles go to \
-             the disk spill meanwhile; the ensure re-runs in the background and \
-             the spill replays once it succeeds. The retired-object sweep marker \
+             the disk spill meanwhile; the ensure re-runs in the background; the \
+             spill replays after the live flushes are clean again, or at the next boot. The retired-object sweep marker \
              is not written, so the sweep retries next boot."
         );
         // Audit PR31a: the candle writer refuses to send until these tables are
-        // keyed, so re-run the ensure in the background rather than wait a day.
+        // keyed, so re-run the skipped steps in the background rather than
+        // wait a day.
         drop(spawn_ensure_until_keyed(
             questdb.clone(),
-            DdlTables::Candles,
+            DdlTables::CandlesWithSkippedSweep,
         ));
         return;
     }
@@ -197,8 +198,8 @@ pub async fn run_candle_ddl_at_boot(questdb: &QuestDbConfig) {
             "candle DDL boot: candle tables NOT confirmed keyed after every \
              attempt. Consequence: the candle writer refuses to send until they \
              are, so sealed candles go to the disk spill meanwhile. The ensure \
-             keeps re-running in the background, and the spill replays once it \
-             succeeds."
+             keeps re-running in the background; the spill replays after the live \
+             flushes are clean again, or at the next boot."
         );
         // Audit PR31a: the candle writer refuses to send until these tables are
         // keyed, so keep re-running the ensure for this session.
@@ -322,6 +323,15 @@ pub const DDL_BACKGROUND_RETRY_MAX_SECS: u64 = 600;
 pub enum DdlTables {
     /// Every emitted `candles_<tf>` table ([`run_candle_ddl_at_boot`]'s ensure).
     Candles,
+    /// The same, for a boot that SKIPPED the candle DDL because QuestDB never
+    /// answered its readiness probe: each attempt first runs the three drop
+    /// steps that boot skipped (retired views, the legacy-object sweep, the
+    /// retired candle tables), because a legacy object squatting a
+    /// `candles_<tf>` name would otherwise refuse the CREATE all session.
+    /// Safe with the lane live: the candle writer sends nothing until the
+    /// tables are keyed. The one-shot fresh-start reset is NOT re-run here —
+    /// it drops live-writer tables and belongs to the boot only.
+    CandlesWithSkippedSweep,
     /// `ticks`, `market_depth` and the four `top_volume_<tf>` tables
     /// ([`run_live_table_ddl_at_boot`]'s ensures).
     Live,
@@ -330,6 +340,12 @@ pub enum DdlTables {
 async fn ensure_tables_once(questdb: &QuestDbConfig, tables: DdlTables) -> bool {
     match tables {
         DdlTables::Candles => {
+            tickvault_storage::shadow_persistence::ensure_shadow_candle_tables(questdb).await
+        }
+        DdlTables::CandlesWithSkippedSweep => {
+            tickvault_storage::console_views::drop_retired_views(questdb).await;
+            tickvault_storage::shadow_persistence::drop_legacy_candle_objects(questdb).await;
+            tickvault_storage::shadow_persistence::drop_retired_candle_tables(questdb).await;
             tickvault_storage::shadow_persistence::ensure_shadow_candle_tables(questdb).await
         }
         DdlTables::Live => {
@@ -553,6 +569,10 @@ mod tests {
         );
         assert_eq!(
             ensure_until_keyed(&questdb, DdlTables::Live, quick, quick).await,
+            1
+        );
+        assert_eq!(
+            ensure_until_keyed(&questdb, DdlTables::CandlesWithSkippedSweep, quick, quick).await,
             1
         );
     }

@@ -376,6 +376,7 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) -> bool
     };
 
     let mut all_keyed = true;
+    let mut self_heal_refused: usize = 0;
     // 2026-09-18 — the EMITTED set, not all TF_COUNT ordinals. `drop_retired_candle_tables`
     // drops the other fifteen; creating them here in the same boot would undo that drop
     // silently and leave a keyless auto-create window behind it.
@@ -492,7 +493,15 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) -> bool
         // a no-op.
         for (column, ty) in CANDLE_SELF_HEAL_COLUMNS {
             let add = format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {ty};");
-            all_keyed &= run_ddl(&client, &base_url, table, &add).await;
+            // Best-effort, as this fn's doc says: a missing back-filled column
+            // is a gap in old rows, not a table that dedups wrongly. It must
+            // not fold into `all_keyed`, because that verdict now opens the
+            // candle writer's gate (audit PR31a), and one refused self-heal
+            // would otherwise hold every candle out of QuestDB all session.
+            // `run_ddl` logs the refusal itself.
+            if !run_ddl(&client, &base_url, table, &add).await {
+                self_heal_refused = self_heal_refused.saturating_add(1);
+            }
         }
 
         // Re-assert the UPSERT key. Idempotent — re-enabling the same key is a
@@ -502,6 +511,13 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) -> bool
         let dedup_enable =
             format!("ALTER TABLE {table} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_CANDLES});");
         all_keyed &= run_ddl(&client, &base_url, table, &dedup_enable).await;
+    }
+    if self_heal_refused > 0 {
+        warn!(
+            self_heal_refused,
+            "candle ensure: some column self-heals were refused — old rows keep a gap \
+             in those columns; the DEDUP key verdict is unaffected"
+        );
     }
     if all_keyed {
         CANDLE_TABLES_KEYED.store(true, std::sync::atomic::Ordering::Release);
