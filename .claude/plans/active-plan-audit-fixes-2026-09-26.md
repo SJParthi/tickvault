@@ -535,7 +535,7 @@ the code when each PR is written; a wrong row is corrected here, never dropped.
 
 Order of work: PR15 finishes first. Then, riskiest first: PR28 (SEBI data off one disk, console
 wipe; split 2026-09-27 into PR28a, the console, and PR28b, the locked cloud copy) → PR29 (log tool can change the live database) → PR30 (budget stop undone the same day) →
-PR31 (a restart can overwrite fuller candles) → PR32 (tick rescue and spill ordering) → PR33
+PR31 (a restart can overwrite fuller candles; split 2026-09-27 into PR31a and PR31b) → PR32 (tick rescue and spill ordering) → PR33
 (token and socket gaps) → PR34 (hung app never restarted) → PR35 (deploys) → PR36 (security) →
 PR37 (Dhan documentation mismatches) → PR38 (risk book across a restart) → PR39 (every error
 line coded, every loss counted and shipped), then the remaining order from the fourth re-check
@@ -656,8 +656,39 @@ line coded, every loss counted and shipped), then the remaining order from the f
     budget-guards.tf still say $225 (budget.tf:220-222; budget-guards.tf:278). Quote 23 keeps
     $225 for September, so the terraform change is a dated PR on or after 2026-10-01, in all four
     lockstep sites.
-- [ ] **PR31 — a restart can never replace a fuller candle with a partial one.** (`storage`,
-  `app`, `trading`)
+- PR31 — a restart can never replace a fuller candle with a partial one. (`storage`, `app`,
+  `core`, `trading`) Split 2026-09-27 into PR31a (the three smaller items) and PR31b (the
+  restart rebuild itself), so each lands and is reviewed on its own.
+- [x] **PR31a — recovery counts, one arrival time, and no keyless tables.** (`storage`, `app`,
+  `core`)
+  - The boot candle recovery said "all re-ingested" when some failed (seal_writer_task.rs:772-840):
+    a refused seal now keeps its file staged for the next boot and is counted
+    (`BootDrainOutcome::seals_append_failed`, `tv_seal_writer_boot_drain_total{kind="boot_append_failed"}`).
+    A failed candle row is rewound off the ILP buffer with a marker, so it can no longer take the
+    good rows batched with it down (`ShadowCandleWriter::append_row`).
+  - Top-volume and candle tables could be auto-created by an ILP write without their DEDUP key
+    (candle_ddl_boot.rs:245-290; top_volume_rank_persistence.rs:862-924): both writers now refuse
+    to send until their ensure has succeeded in this process (`CANDLE_TABLES_KEYED`,
+    `TOP_VOLUME_TABLES_KEYED`). Refused candles go to the disk spill and replay once keyed;
+    refused top-volume rows are counted as discarded (the leaderboard is in RAM, no tick is lost).
+    When the boot gives up, `candle_ddl_boot::spawn_ensure_until_keyed` keeps re-running the
+    ensure (30 s doubling to 10 min) instead of waiting for the next boot. Ticks and depth are
+    NOT gated (refusing them would lose data); their ensure is in the background re-run, whose
+    `DEDUP ENABLE` repairs a table ILP auto-created.
+  - Replayed depth and tick rows got a new arrival time, so the key did not collapse them
+    (depth_persistence.rs:221-222; dhan_feed_stack.rs:6936-6941): the frame handed to the drain
+    now carries the SAME receipt value written to its WAL record
+    (`CapturedFrame::received_at_nanos`), and the drain uses it, so the live and replayed copies
+    stamp one value.
+  - Tests: `test_append_row_on_a_mid_row_buffer_errs_without_dropping_good_rows`,
+    `a_refused_append_keeps_the_file_staged_and_is_counted`,
+    `the_frame_and_its_wal_record_carry_one_receipt_value`,
+    `the_live_drain_stamps_rows_with_the_wal_receipt`,
+    `test_flush_refuses_until_the_candle_tables_are_keyed`,
+    `the_sink_sends_nothing_until_the_top_volume_tables_are_keyed`,
+    `ensure_until_keyed_keeps_retrying_a_database_that_refuses`.
+- [ ] **PR31b — the restart rebuild never overwrites a fuller candle.** (`app`, `storage`,
+  `trading`)
   - A restart in market hours rebuilds the open candles from the ticks it replays, which may be
     only part of them, and the UPSERT overwrites the fuller row already stored
     (ws_frame_spill.rs:4680-4685; shadow_persistence.rs:143). Same class: a same-day replay of a
@@ -665,14 +696,10 @@ line coded, every loss counted and shipped), then the remaining order from the f
     open bars from the stored ticks, or mark a post-restart bar partial and never let it replace
     a row with more volume. PR23's "replay may rebuild them" is verified false: PR23 tests the
     crash case without relying on replay.
-  - The boot candle recovery says "all re-ingested" when some failed (seal_writer_task.rs:772-840):
-    keep the file and report the real count.
-  - Top-volume and candle tables can be auto-created by an ILP write without their DEDUP key
-    (candle_ddl_boot.rs:245-290; top_volume_rank_persistence.rs:862-924): refuse the write until
-    the DDL has succeeded.
-  - Replayed depth rows get a new arrival time, so the key does not collapse them
-    (depth_persistence.rs:221-222; dhan_feed_stack.rs:6936-6941): derive the replayed arrival
-    time the live way, or take arrival time out of the depth key.
+  - Chosen approach: a candle-only warm-up from the WAL (archived segments included) starting at
+    the oldest open bucket minus lateness, with tick writes suppressed; a replayed frame whose
+    bucket ended before the warm-up start gets no candle; plus a per-slot, per-frame refusal as a
+    safety net, counted.
 - [ ] **PR32 — a tick batch is never marked applied before it is on disk.** (`storage`, `app`)
   - A rescue batch queued to the rescue thread but not yet written is skipped by the next
     replay if a later batch was already confirmed (tick_persistence.rs:2739-2757, :3354-3358;

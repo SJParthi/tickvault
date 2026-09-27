@@ -302,6 +302,20 @@ pub fn retired_candle_table_names() -> Vec<&'static str> {
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
+/// Set once `ensure_shadow_candle_tables` has had EVERY key-bearing statement
+/// accepted in this process. Never cleared: a table that has its DEDUP key keeps
+/// it, and the only DDL that could remove one (the retired-object drops) runs
+/// at boot BEFORE the ensure.
+///
+/// Read by `ShadowCandleWriter::flush`, which refuses to send a row until it is
+/// set (2026-09-27, audit PR31a). An ILP row reaching a candle table that does
+/// not exist yet makes QuestDB create it WITHOUT `DEDUP UPSERT KEYS`, and every
+/// replayed bar then duplicates into it for the life of the table. Refused rows
+/// take the seal writer's rescue path to the disk spill, which is replayed once
+/// the tables are keyed. One Acquire load per flush, never per row.
+pub(crate) static CANDLE_TABLES_KEYED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Create every plain candle table + the per-seal audit table if they do not
 /// already exist, with DEDUP UPSERT enabled on each.
 ///
@@ -488,6 +502,9 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) -> bool
         let dedup_enable =
             format!("ALTER TABLE {table} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_CANDLES});");
         all_keyed &= run_ddl(&client, &base_url, table, &dedup_enable).await;
+    }
+    if all_keyed {
+        CANDLE_TABLES_KEYED.store(true, std::sync::atomic::Ordering::Release);
     }
     all_keyed
 }
@@ -1200,7 +1217,12 @@ mod tests {
     #[tokio::test]
     async fn test_ensure_shadow_candle_tables_with_mock_200() {
         let port = p2c_spawn_mock_http(P2C_HTTP_200).await;
-        ensure_shadow_candle_tables(&p2c_cfg(port)).await;
+        assert!(ensure_shadow_candle_tables(&p2c_cfg(port)).await);
+        // Audit PR31a: a fully accepted ensure opens the candle writer's gate.
+        // Only the set direction is asserted: the latch is process-wide and
+        // never cleared, so "still false after a refusal" is not observable
+        // once any test in this binary has run this one.
+        assert!(CANDLE_TABLES_KEYED.load(std::sync::atomic::Ordering::Acquire));
     }
 
     /// P2c: a 400-everything QuestDB exercises every error/warn arm of the

@@ -322,6 +322,9 @@ fn out_of_window_refusal_does_not_allocate_per_tick() {
             endpoint: DhanEndpointType::MainFeed,
             connection_index: (n % 4) as u8,
             received_at: std::time::Instant::now(),
+            received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
+                std::time::Instant::now(),
+            ),
             bytes: bytes.into(),
         }
     }
@@ -429,6 +432,9 @@ fn frame_drain_seam_does_not_allocate_per_tick() {
             endpoint: DhanEndpointType::MainFeed,
             connection_index: (n % 4) as u8,
             received_at: std::time::Instant::now(),
+            received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
+                std::time::Instant::now(),
+            ),
             bytes: bytes.into(),
         }
     }
@@ -517,6 +523,9 @@ fn frame_drain_gate_is_not_vacuous() {
             endpoint: DhanEndpointType::MainFeed,
             connection_index: 0,
             received_at: std::time::Instant::now(),
+            received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
+                std::time::Instant::now(),
+            ),
             bytes: buf.into(),
         },
         SESSION_RECEIPT_NANOS,
@@ -612,6 +621,9 @@ fn full_mode_frame_with_inline_depth_does_not_allocate_per_tick() {
             endpoint: DhanEndpointType::MainFeed,
             connection_index: (n % 4) as u8,
             received_at: std::time::Instant::now(),
+            received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
+                std::time::Instant::now(),
+            ),
             bytes: bytes.into(),
         }
     }

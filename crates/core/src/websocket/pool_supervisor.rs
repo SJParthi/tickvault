@@ -3538,6 +3538,18 @@ pub struct CapturedFrame {
     /// Costs one vDSO read per frame on a task that already performs one for
     /// the watchdog. No allocation: `Bytes` remains the only heap member.
     pub received_at: std::time::Instant,
+    /// The wall-clock receipt, UTC epoch nanoseconds: EXACTLY the value this
+    /// frame's WAL record carries (`receipt_nanos_from(received_at)`, computed
+    /// once in `FrameSink::accept`).
+    ///
+    /// Why the drain must use this and not `now() - received_at.elapsed()`
+    /// (audit PR31): replay stamps each row with the WAL's receipt, and the
+    /// depth and tick tables key on that stamp. Two derivations of "the same"
+    /// instant differ by clock-read jitter and anchor drift, so a replayed row
+    /// never landed on its live twin and was stored a second time. One value,
+    /// read the same way live and on replay, makes the key collapse them.
+    /// An `i64` copy: no allocation, and still no wall-clock read in this file.
+    pub received_at_nanos: i64,
     /// The frame exactly as it arrived. Never parsed on the read task.
     pub bytes: Bytes,
 }
@@ -3914,6 +3926,9 @@ impl FrameSink for WalRingSink {
         // work after this line must NOT be charged to the vendor.
         // Monotonic, never wall-clock — see `CapturedFrame::received_at`.
         let received_at = Instant::now();
+        // The WAL record's receipt, derived ONCE so the frame and its record
+        // carry the same value — see `CapturedFrame::received_at_nanos`.
+        let received_at_nanos = tickvault_storage::ws_frame_spill::receipt_nanos_from(received_at);
         // Minted ONCE, here, at the read instant — see `CapturedFrame`.
         let seq = next_frame_seq();
         // Step 1 — durability. `Bytes` into the WAL is an Arc refcount bump.
@@ -3940,7 +3955,7 @@ impl FrameSink for WalRingSink {
             // APPROVED: `Bytes::clone` is an atomic refcount increment, NOT a copy of the frame payload — the whole point of `Bytes` on this path.
             frame.clone(),
             seq,
-            tickvault_storage::ws_frame_spill::receipt_nanos_from(received_at),
+            received_at_nanos,
             // TVW4: resolved at construction, one copied byte on the hot path.
             self.wal_endpoint,
         ) == AppendOutcome::Dropped;
@@ -3998,6 +4013,7 @@ impl FrameSink for WalRingSink {
                 endpoint: self.endpoint,
                 connection_index: self.connection_index,
                 received_at,
+                received_at_nanos,
                 bytes: frame,
             })
             .is_err()
@@ -12041,6 +12057,51 @@ mod tests {
             !production_half.contains("append_with_seq(self.ws_type"),
             "no production append may go through append_with_seq — it hardcodes the \
              unknown-receipt sentinel"
+        );
+    }
+
+    /// Audit PR31: the frame the drain folds and the WAL record replay reads
+    /// must carry ONE receipt value, derived once. The depth and tick keys
+    /// include the row stamp, so two derivations of the same instant made a
+    /// replayed row miss its live twin and land as a second row.
+    #[test]
+    fn the_frame_and_its_wal_record_carry_one_receipt_value() {
+        let source = include_str!("pool_supervisor.rs");
+        let production_half = source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(prod, _)| prod);
+        let accept = production_half
+            .split_once("fn accept(&self, frame: Bytes) -> FrameSinkOutcome {")
+            .map(|(_, rest)| rest)
+            .expect("FrameSink::accept must exist");
+        assert_eq!(
+            accept.matches("receipt_nanos_from(").count(),
+            1,
+            "accept must derive the receipt exactly once"
+        );
+        assert!(
+            accept.contains(
+                "let received_at_nanos = tickvault_storage::ws_frame_spill::receipt_nanos_from(received_at);"
+            ),
+            "the one derivation must be bound to `received_at_nanos`"
+        );
+        let wal = accept
+            .split_once("append_with_seq_at(")
+            .map(|(_, rest)| rest)
+            .expect("the WAL append");
+        assert!(
+            wal.split_once("== AppendOutcome::Dropped")
+                .is_some_and(|(args, _)| args.contains("received_at_nanos,")),
+            "the WAL record must be written with that same value"
+        );
+        let ring = accept
+            .split_once(".try_send(CapturedFrame {")
+            .map(|(_, rest)| rest)
+            .expect("the ring hand-off");
+        assert!(
+            ring.split_once('}')
+                .is_some_and(|(fields, _)| fields.contains("received_at_nanos,")),
+            "the published frame must carry that same value"
         );
     }
 
