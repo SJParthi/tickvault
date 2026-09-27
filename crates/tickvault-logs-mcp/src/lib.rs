@@ -59,11 +59,10 @@
 //!          ok:true with 0 matches. Divergence class: ok-empty-vs-error,
 //!          rust in the FAIL-SAFE direction (empty result, no error text,
 //!          no data exposure). Deliberately unchanged.
-//!   - app_log_tail `date` echoes: PARITY-MATCHED since review r3 — the
-//!     joined log path is pathlib-normalized (`.` components dropped;
-//!     since review r4 the `//`-root rule matches pathlib too), so a
-//!     dotted date like "x/./y" echoes `app.x/y.log` on both sides
-//!     byte-for-byte. No residual.
+//!   - app_log_tail `date`: REFUSED unless YYYY-MM-DD since 2026-09-27
+//!     (the date is joined into a path, so a path-shaped value reached
+//!     files outside the log directory). The old review-r3 parity for a
+//!     dotted date like "x/./y" is retired with it.
 //!   - list_novel_signatures `since_minutes` overflow: PARITY-MATCHED
 //!     since review r6 (2026-07-18) — the bare `Duration::minutes` call
 //!     PANICKED (whole-process abort, all later requests dropped) for
@@ -122,4 +121,5 @@ pub mod rpc;
 pub mod selftest;
 pub mod signature;
 pub mod sigv4;
+pub mod sql_gate;
 pub mod tools;

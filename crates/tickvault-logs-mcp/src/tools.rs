@@ -30,8 +30,8 @@ use crate::legacy_compat::{
 };
 use crate::signature::signature_hash;
 use crate::sigv4::{
-    AmzNow, build_cloudwatch_filter_args, build_cloudwatch_sigv4_request,
-    filter_and_trim_portal_events, parse_cloudwatch_events, parse_portal_logs_raw,
+    AmzNow, build_cloudwatch_sigv4_request, filter_and_trim_portal_events, parse_cloudwatch_events,
+    parse_portal_logs_raw,
 };
 
 pub const ERRORS_JSONL_PREFIX: &str = "errors.jsonl";
@@ -92,8 +92,6 @@ const DOCTOR_TIMEOUT_SECS: u64 = 120;
 const GIT_LOG_TIMEOUT_SECS: u64 = 10;
 /// Subprocess timeout for `docker compose ps` (parity: the retired reference implementation timeout=15).
 const DOCKER_PS_TIMEOUT_SECS: u64 = 15;
-/// Subprocess timeout for the read-only aws CLI fallback (parity: the retired reference implementation timeout=30).
-const AWS_CLI_TIMEOUT_SECS: u64 = 30;
 
 /// Raw bytes of the retired runtime's own name. WIRE VALUE, not prose — two
 /// tool error strings and one advertised `inputSchema` description echo it
@@ -241,12 +239,134 @@ fn event_signature(ev: &Map<String, Value>) -> String {
 // File-backed tools
 // ---------------------------------------------------------------------------
 
+/// Bytes one log-file read may hold, taken from the END of the file. 32 MiB.
+///
+/// Every file tool used `std::fs::read`, which loads the whole file: a
+/// day's `app.YYYY-MM-DD.log` on the box runs to gigabytes, and one tool
+/// call held all of it (plus its line index) in this process's heap. Tail
+/// tools only ever wanted the end, so the end is what is read. Each reply
+/// says when a file was cut (`truncated` / `truncated_files`), so a short
+/// history never reads as a complete one.
+pub const LOG_READ_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Lines `app_log_tail` and `triage_log_tail` may return in one reply.
+/// `limit <= 0` used to mean "every line", which on a full log was the
+/// whole file as one JSON reply.
+pub const LOG_TAIL_MAX_LINES: i64 = 5_000;
+
+/// Bytes one call may read across ALL `errors.jsonl.*` files. 128 MiB.
+///
+/// Each file is already capped at `LOG_READ_MAX_BYTES`, but the files rotate
+/// hourly and are never pruned by this tool, so a per-file cap alone scales
+/// with how many hours of history sit in the directory. Files past the budget
+/// are named in `skipped_files`, newest files first read.
+pub const LOG_SCAN_MAX_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Bytes one runbook or rule file may hold before the runbook finder skips
+/// it. 4 MiB: the largest file in the four trees is about 540 KB today.
+pub const RUNBOOK_FILE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Read at most the last `cap` bytes of `path`. `Ok((bytes, true))` when the
+/// file was longer: the cut lands mid-line, so the partial first line is
+/// dropped and only whole lines come back.
+fn read_tail_capped(path: &Path, cap: u64) -> std::io::Result<(Vec<u8>, bool)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let mut out = Vec::new();
+    if len <= cap {
+        // Read the length seen at the size check, not to EOF: a file that
+        // grows meanwhile would otherwise end mid-line while reporting
+        // `truncated = false`.
+        file.take(len).read_to_end(&mut out)?;
+        return Ok((out, false));
+    }
+    // One byte before the window says whether the window starts on a line
+    // boundary: if that byte is a newline the first line is whole and kept;
+    // otherwise it is the tail of a cut line and is dropped.
+    file.seek(SeekFrom::Start(len - cap - 1))?;
+    file.take(cap + 1).read_to_end(&mut out)?;
+    let starts_on_boundary = out.first() == Some(&b'\n');
+    if out.is_empty() {
+        return Ok((out, true));
+    }
+    out.remove(0);
+    if !starts_on_boundary {
+        match out.iter().position(|&b| b == b'\n') {
+            Some(newline) => {
+                out.drain(..=newline);
+            }
+            None => out.clear(),
+        }
+    }
+    Ok((out, true))
+}
+
+/// Keep only the last `limit` newline-terminated lines of `bytes` (plus an
+/// unterminated last line), so the line index built afterwards is sized by
+/// the reply rather than by the 32 MiB read. Returns the number of lines
+/// the buffer held before trimming, counted by newline bytes.
+///
+/// Splitting on `\n` alone keeps at least `limit` lines under the legacy
+/// splitter too, which also breaks on `\r` and a few other separators.
+fn keep_last_lines(bytes: &mut Vec<u8>, limit: i64) -> usize {
+    let unterminated = usize::from(bytes.last().is_some_and(|&b| b != b'\n'));
+    let total = bytes.iter().filter(|&&b| b == b'\n').count() + unterminated;
+    let keep = usize::try_from(limit).unwrap_or(usize::MAX);
+    if total > keep {
+        // The newline that ends line (total - keep - 1), counting from 0.
+        let mut seen = 0usize;
+        let skip = total - keep;
+        if let Some(cut) = bytes.iter().position(|&b| {
+            if b == b'\n' {
+                seen += 1;
+            }
+            seen == skip
+        }) {
+            bytes.drain(..=cut);
+        }
+    }
+    total
+}
+
+fn clamp_tail_limit(limit: i64) -> i64 {
+    if limit <= 0 || limit > LOG_TAIL_MAX_LINES {
+        LOG_TAIL_MAX_LINES
+    } else {
+        limit
+    }
+}
+
+/// Read a whole UTF-8 file through ONE open, refusing it past `cap`:
+/// `Ok(None)` when the file holds more than `cap` bytes. A separate size
+/// check followed by `read_to_string` would still load a file that grew in
+/// between.
+fn read_whole_capped(path: &Path, cap: u64) -> std::io::Result<Option<String>> {
+    use std::io::Read;
+    let mut out = String::new();
+    std::fs::File::open(path)?
+        .take(cap.saturating_add(1))
+        .read_to_string(&mut out)?;
+    if out.len() as u64 > cap {
+        return Ok(None);
+    }
+    Ok(Some(out))
+}
+
 /// the retired reference implementation `tool_tail_errors`.
 pub fn tool_tail_errors(ctx: &Ctx, limit: i64, code: Option<&str>) -> Value {
+    let limit = clamp_tail_limit(limit);
     let dir_path = ctx.machine_logs_dir();
     let files = iter_errors_jsonl_files(&dir_path);
     let mut events: Vec<Value> = Vec::new();
-    for (_, f) in &files {
+    let mut truncated_files: Vec<String> = Vec::new();
+    let mut skipped_files: Vec<String> = Vec::new();
+    let mut scanned_bytes: u64 = 0;
+    for (name, f) in &files {
+        if scanned_bytes >= LOG_SCAN_MAX_TOTAL_BYTES {
+            skipped_files.push(name.clone());
+            continue;
+        }
         // 2026-07-18 review LOW-1: lossy-decode (the app_log_tail
         // behavior) instead of silently dropping a WHOLE errors file on
         // invalid UTF-8 while still listing it in files_scanned — every
@@ -254,9 +374,13 @@ pub fn tool_tail_errors(ctx: &Ctx, limit: i64, code: Option<&str>) -> Value {
         // per-line JSON parse and is skipped by the existing per-line
         // semantics. A genuinely unreadable file (io error) keeps the
         // skip-continue.
-        let Ok(bytes) = std::fs::read(f) else {
+        let Ok((bytes, cut)) = read_tail_capped(f, LOG_READ_MAX_BYTES) else {
             continue;
         };
+        scanned_bytes = scanned_bytes.saturating_add(bytes.len() as u64);
+        if cut {
+            truncated_files.push(name.clone());
+        }
         let raw = decode_utf8_replace(&bytes);
         let text = legacy_textmode(&raw);
         let lines = legacy_splitlines(&text);
@@ -286,6 +410,8 @@ pub fn tool_tail_errors(ctx: &Ctx, limit: i64, code: Option<&str>) -> Value {
         "dir": dir_path.to_string_lossy(),
         "count": events.len(),
         "files_scanned": files.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+        "truncated_files": truncated_files,
+        "skipped_files": skipped_files,
         "events": events,
     })
 }
@@ -388,7 +514,14 @@ pub fn tool_list_novel_signatures(ctx: &Ctx, since_minutes: i64) -> Result<Value
 
     let mut order: Vec<String> = Vec::new();
     let mut first_seen: HashMap<String, NovelInfo> = HashMap::new();
-    for (_, f) in &files {
+    let mut truncated_files: Vec<String> = Vec::new();
+    let mut skipped_files: Vec<String> = Vec::new();
+    let mut scanned_bytes: u64 = 0;
+    for (name, f) in &files {
+        if scanned_bytes >= LOG_SCAN_MAX_TOTAL_BYTES {
+            skipped_files.push(name.clone());
+            continue;
+        }
         // 2026-07-18 review LOW-1: lossy-decode (the app_log_tail
         // behavior) instead of silently dropping a WHOLE errors file on
         // invalid UTF-8 while still listing it in files_scanned — every
@@ -396,9 +529,13 @@ pub fn tool_list_novel_signatures(ctx: &Ctx, since_minutes: i64) -> Result<Value
         // per-line JSON parse and is skipped by the existing per-line
         // semantics. A genuinely unreadable file (io error) keeps the
         // skip-continue.
-        let Ok(bytes) = std::fs::read(f) else {
+        let Ok((bytes, cut)) = read_tail_capped(f, LOG_READ_MAX_BYTES) else {
             continue;
         };
+        scanned_bytes = scanned_bytes.saturating_add(bytes.len() as u64);
+        if cut {
+            truncated_files.push(name.clone());
+        }
         let raw = decode_utf8_replace(&bytes);
         let text = legacy_textmode(&raw);
         for line in legacy_splitlines(&text) {
@@ -467,6 +604,16 @@ pub fn tool_list_novel_signatures(ctx: &Ctx, since_minutes: i64) -> Result<Value
         "cutoff_utc": legacy_isoformat(&cutoff_fixed),
         "novel_count": novel.len(),
         "novel": novel,
+        // Novelty is judged only over what was read: a file cut to its last
+        // LOG_READ_MAX_BYTES, or skipped past the scan budget, loses its
+        // oldest lines, so a signature first seen ONLY there reads as novel.
+        "caveat": if truncated_files.is_empty() && skipped_files.is_empty() {
+            Value::Null
+        } else {
+            json!("some error files were cut or skipped (truncated_files, skipped_files); a signature first seen only in the unread part is reported as novel, with a later first_seen_ts")
+        },
+        "truncated_files": truncated_files,
+        "skipped_files": skipped_files,
     }))
 }
 
@@ -486,14 +633,22 @@ pub fn tool_summary_snapshot(ctx: &Ctx) -> Value {
             "markdown": "",
         });
     }
-    match std::fs::read_to_string(&path) {
+    // The summary writer keeps this file to a page; a file past the log-read
+    // ceiling is not the summary, and is refused rather than loaded whole.
+    match read_whole_capped(&path, LOG_READ_MAX_BYTES) {
+        Ok(None) => json!({
+            "path": path.to_string_lossy(),
+            "exists": true,
+            "error": format!("summary file is over the {LOG_READ_MAX_BYTES}-byte read ceiling"),
+            "markdown": "",
+        }),
         Err(err) => json!({
             "path": path.to_string_lossy(),
             "exists": true,
             "error": err.to_string(), // OS error text — documented deviation
             "markdown": "",
         }),
-        Ok(raw) => {
+        Ok(Some(raw)) => {
             let markdown = legacy_textmode(&raw);
             let line_count = markdown.matches('\n').count();
             json!({
@@ -512,8 +667,8 @@ pub fn tool_triage_log_tail(ctx: &Ctx, limit: i64) -> Value {
     if !path.exists() {
         return json!({"path": path.to_string_lossy(), "exists": false, "lines": []});
     }
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(raw) => raw,
+    let (bytes, truncated) = match read_tail_capped(&path, LOG_READ_MAX_BYTES) {
+        Ok(read) => read,
         Err(err) => {
             return json!({
                 "path": path.to_string_lossy(),
@@ -523,7 +678,10 @@ pub fn tool_triage_log_tail(ctx: &Ctx, limit: i64) -> Value {
             });
         }
     };
-    let text = legacy_textmode(&raw);
+    let limit = clamp_tail_limit(limit);
+    let mut bytes = bytes;
+    let lines_read = keep_last_lines(&mut bytes, limit);
+    let text = legacy_textmode(&decode_utf8_replace(&bytes));
     let lines = legacy_splitlines(&text);
     let tail: &[&str] = if lines.len() as i64 > limit {
         legacy_neg_slice(&lines, limit)
@@ -533,8 +691,11 @@ pub fn tool_triage_log_tail(ctx: &Ctx, limit: i64) -> Value {
     json!({
         "path": path.to_string_lossy(),
         "exists": true,
-        "total_lines": lines.len(),
+        // Lines in the part that was read; the whole file when `truncated`
+        // is false.
+        "total_lines": if lines_read as i64 > limit { lines_read } else { lines.len() },
         "returned": tail.len(),
+        "truncated": truncated,
         "lines": tail,
     })
 }
@@ -542,11 +703,19 @@ pub fn tool_triage_log_tail(ctx: &Ctx, limit: i64) -> Value {
 /// the retired reference implementation `tool_signature_history`. `signature` is echoed verbatim
 /// (legacy echoes whatever JSON value was passed).
 pub fn tool_signature_history(ctx: &Ctx, signature: &Value, limit: i64) -> Value {
+    let limit = clamp_tail_limit(limit);
     let want = signature.as_str();
     let dir_path = ctx.machine_logs_dir();
     let files = iter_errors_jsonl_files(&dir_path);
     let mut matches: Vec<Value> = Vec::new();
-    for (_, f) in &files {
+    let mut truncated_files: Vec<String> = Vec::new();
+    let mut skipped_files: Vec<String> = Vec::new();
+    let mut scanned_bytes: u64 = 0;
+    for (name, f) in &files {
+        if scanned_bytes >= LOG_SCAN_MAX_TOTAL_BYTES {
+            skipped_files.push(name.clone());
+            continue;
+        }
         // 2026-07-18 review LOW-1: lossy-decode (the app_log_tail
         // behavior) instead of silently dropping a WHOLE errors file on
         // invalid UTF-8 while still listing it in files_scanned — every
@@ -554,9 +723,13 @@ pub fn tool_signature_history(ctx: &Ctx, signature: &Value, limit: i64) -> Value
         // per-line JSON parse and is skipped by the existing per-line
         // semantics. A genuinely unreadable file (io error) keeps the
         // skip-continue.
-        let Ok(bytes) = std::fs::read(f) else {
+        let Ok((bytes, cut)) = read_tail_capped(f, LOG_READ_MAX_BYTES) else {
             continue;
         };
+        scanned_bytes = scanned_bytes.saturating_add(bytes.len() as u64);
+        if cut {
+            truncated_files.push(name.clone());
+        }
         let raw = decode_utf8_replace(&bytes);
         let text = legacy_textmode(&raw);
         for line in legacy_splitlines(&text) {
@@ -582,6 +755,8 @@ pub fn tool_signature_history(ctx: &Ctx, signature: &Value, limit: i64) -> Value
         "signature": signature,
         "count": matches.len(),
         "events": matches,
+        "truncated_files": truncated_files,
+        "skipped_files": skipped_files,
     })
 }
 
@@ -610,16 +785,24 @@ pub fn tool_find_runbook_for_code(ctx: &Ctx, code: &str) -> Value {
     let root = &ctx.repo_root;
     let runbooks_dir = root.join("docs").join("runbooks");
     let rules_dir = root.join(".claude").join("rules");
+    // Since the 2026-07-20 rules-tree diet the per-code runbooks live in
+    // docs/error-runbooks, and the full rule texts behind the summary stubs
+    // in docs/claude-rules-full — searching only the first two trees missed
+    // most codes.
+    let error_runbooks_dir = root.join("docs").join("error-runbooks");
+    let rules_full_dir = root.join("docs").join("claude-rules-full");
 
     let mut matches: Vec<Value> = Vec::new();
-    for search_dir in [runbooks_dir, rules_dir] {
+    for search_dir in [runbooks_dir, error_runbooks_dir, rules_dir, rules_full_dir] {
         if !search_dir.exists() {
             continue;
         }
         let mut md_files = Vec::new();
         rglob_md(&search_dir, &mut md_files);
         for md in md_files {
-            let Ok(raw) = std::fs::read_to_string(&md) else {
+            // Skipped when over RUNBOOK_FILE_MAX_BYTES or not UTF-8, like an
+            // unreadable file before.
+            let Ok(Some(raw)) = read_whole_capped(&md, RUNBOOK_FILE_MAX_BYTES) else {
                 continue;
             };
             let text = legacy_textmode(&raw);
@@ -665,8 +848,54 @@ fn http_client(timeout_secs: u64) -> Result<reqwest::blocking::Client, String> {
         .map_err(|e| format!("http client build failed: {e}"))
 }
 
-/// the retired reference implementation `tool_questdb_sql`.
+/// Bytes one HTTP reply may hold before the tool refuses it. 8 MiB, the same
+/// ceiling as one captured subprocess stream (`PROC_CAPTURE_MAX_BYTES`).
+///
+/// `resp.bytes()` had no ceiling: a `select *` over a large table, or a
+/// `LIMIT lo,hi` range (which the row cap deliberately leaves alone), could
+/// grow this process's heap by gigabytes and then hand all of it to the
+/// caller as one reply.
+pub const HTTP_REPLY_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Why the questdb tool refused a query before sending it.
+pub const QUESTDB_READ_ONLY_REFUSAL: &str = "refused: this tool is read-only. Send exactly ONE \
+     statement starting with SELECT, SHOW, EXPLAIN or WITH, with no comments and no \
+     data-changing keyword (insert, update, delete, drop, alter, truncate, create, copy and the \
+     rest of the operator console's list). SELECT and WITH are capped at 1000 rows.";
+
+/// Read a reply body up to `cap` bytes. `Ok((bytes, true))` when the body
+/// was LONGER than `cap` — the caller refuses it rather than parse a cut.
+fn read_body_capped<R: std::io::Read>(body: R, cap: u64) -> Result<(Vec<u8>, bool), String> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    body.take(cap.saturating_add(1))
+        .read_to_end(&mut out)
+        .map_err(|e| e.to_string())?;
+    let over = out.len() as u64 > cap;
+    if over {
+        out.truncate(usize::try_from(cap).unwrap_or(usize::MAX));
+    }
+    Ok((out, over))
+}
+
+fn reply_too_large_error() -> String {
+    format!(
+        "reply larger than {} MiB — narrow the query (fewer columns, a smaller LIMIT, or an \
+         aggregate)",
+        HTTP_REPLY_MAX_BYTES / (1024 * 1024)
+    )
+}
+
+/// the retired reference implementation `tool_questdb_sql`, behind the
+/// operator console's read-only gate (2026-09-27): the text is refused
+/// before any connection unless `sql_gate::is_safe_sql` passes it, and
+/// SELECT/WITH carry a 1000-row cap. `query` in the reply is what the
+/// caller sent; `sent_query` is what reached the database.
 pub fn tool_questdb_sql(ctx: &Ctx, query: &str) -> Value {
+    if !crate::sql_gate::is_safe_sql(query) {
+        return json!({"ok": false, "query": query, "error": QUESTDB_READ_ONLY_REFUSAL});
+    }
+    let sent = crate::sql_gate::cap_sql_rows(query);
     let env = RealEnv;
     let qdb = config::endpoint_url(
         &env,
@@ -676,10 +905,10 @@ pub fn tool_questdb_sql(ctx: &Ctx, query: &str) -> Value {
         "http://127.0.0.1:9000",
         None,
     );
-    let full = format!("{qdb}/exec?query={}", legacy_urllib_quote(query));
+    let full = format!("{qdb}/exec?query={}", legacy_urllib_quote(&sent));
     let client = match http_client(15) {
         Ok(c) => c,
-        Err(e) => return json!({"ok": false, "query": query, "error": e}),
+        Err(e) => return json!({"ok": false, "query": query, "sent_query": sent, "error": e}),
     };
     let resp = match client.get(&full).send() {
         Ok(r) => r,
@@ -688,7 +917,7 @@ pub fn tool_questdb_sql(ctx: &Ctx, query: &str) -> Value {
             // deviation the parity transcript AVOIDS (the mock HTTP server
             // is always up, so this arm is unreachable in parity); the
             // harness does NOT mask transport-error text.
-            return json!({"ok": false, "query": query, "error": e.to_string()});
+            return json!({"ok": false, "query": query, "sent_query": sent, "error": e.to_string()});
         }
     };
     let status = resp.status();
@@ -701,15 +930,18 @@ pub fn tool_questdb_sql(ctx: &Ctx, query: &str) -> Value {
             "error": format!("HTTP Error {}: {}", status.as_u16(), reason),
         });
     }
-    let body = match resp.bytes() {
-        Ok(b) => decode_utf8_replace(&b),
-        Err(e) => return json!({"ok": false, "query": query, "error": e.to_string()}),
+    let body = match read_body_capped(resp, HTTP_REPLY_MAX_BYTES) {
+        Ok((_, true)) => {
+            return json!({"ok": false, "query": query, "sent_query": sent, "error": reply_too_large_error()});
+        }
+        Ok((b, false)) => decode_utf8_replace(&b),
+        Err(e) => return json!({"ok": false, "query": query, "sent_query": sent, "error": e}),
     };
     match serde_json::from_str::<Value>(&body) {
-        Ok(parsed) => json!({"ok": true, "query": query, "response": parsed}),
+        Ok(parsed) => json!({"ok": true, "query": query, "sent_query": sent, "response": parsed}),
         Err(e) => {
             // legacy JSONDecodeError text differs — documented deviation.
-            json!({"ok": false, "query": query, "error": e.to_string()})
+            json!({"ok": false, "query": query, "sent_query": sent, "error": e.to_string()})
         }
     }
 }
@@ -803,9 +1035,12 @@ pub fn tool_tickvault_api(ctx: &Ctx, path: &str, base_url: Option<&str>) -> Valu
         });
     }
     let status_code = status.as_u16();
-    let body = match resp.bytes() {
-        Ok(b) => decode_utf8_replace(&b),
-        Err(e) => return json!({"ok": false, "error": e.to_string(), "url": full}),
+    let body = match read_body_capped(resp, HTTP_REPLY_MAX_BYTES) {
+        Ok((_, true)) => {
+            return json!({"ok": false, "error": reply_too_large_error(), "url": full});
+        }
+        Ok((b, false)) => decode_utf8_replace(&b),
+        Err(e) => return json!({"ok": false, "error": e, "url": full}),
     };
     match serde_json::from_str::<Value>(&body) {
         Ok(parsed) => json!({"ok": true, "status": status_code, "url": full, "json": parsed}),
@@ -1143,11 +1378,15 @@ pub fn tool_app_log_tail(ctx: &Ctx, limit: i64, date: Option<&str>) -> Value {
         Some(d) => d.to_string(),
         None => chrono::Utc::now().format("%Y-%m-%d").to_string(),
     };
-    // PARITY (review r3 LOW-b): legacy builds `log_dir / f"app.{date}.log"`
-    // with pathlib, which drops `.` components at parse time — an
-    // arg-derived date like "x/./y" must echo `.../app.x/y.log`, never
-    // `.../app.x/./y.log`. Same file on disk either way (POSIX); only the
-    // echoed string differs.
+    if !is_log_date(&date) {
+        return json!({
+            "ok": false,
+            "error": format!("date must be YYYY-MM-DD, got {:?}", legacy_slice_chars(&date, 40)),
+            "log_dir": log_dir.to_string_lossy(),
+        });
+    }
+    // `pathlib_lexical` kept from the parity port; with the date shape
+    // checked above there is no `.` component left for it to drop.
     let log_file = config::pathlib_lexical(&log_dir.join(format!("app.{date}.log")));
     if !log_file.exists() {
         return json!({
@@ -1156,8 +1395,8 @@ pub fn tool_app_log_tail(ctx: &Ctx, limit: i64, date: Option<&str>) -> Value {
             "log_dir": log_dir.to_string_lossy(),
         });
     }
-    let bytes = match std::fs::read(&log_file) {
-        Ok(b) => b,
+    let (bytes, truncated) = match read_tail_capped(&log_file, LOG_READ_MAX_BYTES) {
+        Ok(read) => read,
         Err(err) => {
             return json!({
                 "ok": false,
@@ -1166,20 +1405,39 @@ pub fn tool_app_log_tail(ctx: &Ctx, limit: i64, date: Option<&str>) -> Value {
             });
         }
     };
+    let limit = clamp_tail_limit(limit);
+    let mut bytes = bytes;
+    let lines_read = keep_last_lines(&mut bytes, limit);
     let text = legacy_textmode(&decode_utf8_replace(&bytes));
     let lines = legacy_file_lines(&text);
-    let tail: &[&str] = if limit > 0 {
-        legacy_neg_slice(&lines, limit)
-    } else {
-        &lines
-    };
+    let tail: &[&str] = legacy_neg_slice(&lines, limit);
     json!({
         "ok": true,
         "path": log_file.to_string_lossy(),
-        "total_lines": lines.len(),
+        // Lines in the part that was read; the whole file when `truncated`
+        // is false.
+        "total_lines": if lines_read as i64 > limit { lines_read } else { lines.len() },
         "returned": tail.len(),
+        "truncated": truncated,
         "lines": tail,
     })
+}
+
+/// True for a `YYYY-MM-DD` shape: ten bytes, digits with `-` at 4 and 7.
+///
+/// `date` is joined into a path, so before 2026-09-27 a value such as
+/// `x/../../../etc/y` named any `*.log` file on the machine. Only the shape
+/// is checked — a well-shaped impossible date simply finds no file.
+fn is_log_date(date: &str) -> bool {
+    let b = date.as_bytes();
+    b.len() == 10
+        && b.iter().enumerate().all(|(i, c)| {
+            if i == 4 || i == 7 {
+                *c == b'-'
+            } else {
+                c.is_ascii_digit()
+            }
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -1372,7 +1630,7 @@ pub fn tool_grep_codebase(
 }
 
 // ---------------------------------------------------------------------------
-// cloudwatch_logs — SigV4 -> portal -> aws CLI fallback chain
+// cloudwatch_logs — SigV4 -> portal chain (the aws CLI fallback was removed 2026-09-27)
 // ---------------------------------------------------------------------------
 
 fn cloudwatch_log_group(env: &dyn Env) -> String {
@@ -1623,9 +1881,15 @@ fn legacy_truthy(v: &Value) -> bool {
     }
 }
 
-/// the retired reference implementation `tool_cloudwatch_logs` — SigV4 -> portal -> aws CLI.
+/// the retired reference implementation `tool_cloudwatch_logs` — SigV4 -> portal.
+///
+/// The third, `aws` CLI, path was removed on 2026-09-27: it spawned an
+/// external interpreter-based program, and the SigV4 path above it does the
+/// same read natively in Rust with the same read-only key. An environment
+/// whose only credential is an `aws` CLI profile now gets the
+/// "no log reader configured" answer, which names both remaining paths.
 pub fn tool_cloudwatch_logs(
-    ctx: &Ctx,
+    _ctx: &Ctx,
     minutes: i64,
     filter_pattern: Option<&str>,
     limit: i64,
@@ -1638,51 +1902,10 @@ pub fn tool_cloudwatch_logs(
     if !portal_url(&env).is_empty() && !portal_token(&env).is_empty() {
         return cloudwatch_via_portal(&env, filter_pattern, limit);
     }
-    let region = aws_region(&env);
-    let group = cloudwatch_log_group(&env);
-    let now_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64();
-    let start_ms = ((now_unix - (minutes.max(1) as f64) * 60.0) * 1000.0) as i64;
-    let argv = build_cloudwatch_filter_args(&group, &region, start_ms, limit, filter_pattern);
-    let out = match run_with_timeout(
-        &argv[0],
-        &argv[1..],
-        &ctx.repo_root,
-        Duration::from_secs(AWS_CLI_TIMEOUT_SECS),
-    ) {
-        Ok(out) => out,
-        Err(ProcError::Spawn(_)) => {
-            return json!({
-                "ok": false,
-                "error": "no log reader configured — set AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY (+ AWS_DEFAULT_REGION) for the direct SigV4 path (no aws CLI, no portal), OR set TICKVAULT_PORTAL_URL + TICKVAULT_PORTAL_TOKEN to read via the operator dashboard, OR wire a read-only AWS credential + aws CLI. None is present in this session.",
-                "log_group": group,
-            });
-        }
-        Err(ProcError::Timeout) => {
-            return json!({"ok": false, "error": "aws logs filter-log-events timed out after 30s"});
-        }
-    };
-    if out.code != 0 {
-        return json!({
-            "ok": false,
-            "exit_code": out.code,
-            "error": "aws logs call failed — most likely no read-only AWS credentials in this environment yet. Prefer the direct SigV4 path (AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY) or the portal path (TICKVAULT_PORTAL_URL + TICKVAULT_PORTAL_TOKEN). stderr below.",
-            "stderr": legacy_slice_chars(out.stderr.trim(), 800),
-            "log_group": group,
-        });
-    }
-    let events = parse_cloudwatch_events(&out.stdout, limit);
     json!({
-        "ok": true,
-        "source": "aws_cli",
-        "log_group": group,
-        "region": region,
-        "lookback_minutes": minutes,
-        "filter_pattern": filter_pattern.unwrap_or(""),
-        "returned": events.len(),
-        "events": events,
+        "ok": false,
+        "error": "no log reader configured — set AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY (+ AWS_DEFAULT_REGION) for the direct SigV4 path, OR set TICKVAULT_PORTAL_URL + TICKVAULT_PORTAL_TOKEN to read via the operator dashboard. Neither is present in this session.", // secret-scan-ignore: env-var NAMES, no credential value
+        "log_group": cloudwatch_log_group(&env),
     })
 }
 
@@ -1710,18 +1933,17 @@ pub const TOOL_NAMES: [&str; 14] = [
 const DESC_TAIL_ERRORS: &str = "Return the last N ERROR events from data/logs/machine/errors.jsonl.*. Optionally filter by `code` (e.g. 'I-P1-11', 'DH-904').";
 const DESC_NOVEL: &str = "Signatures first observed within the last N minutes. Uses the same FNV-1a signature hash as the Rust summary_writer.";
 const DESC_SUMMARY: &str = "Return the current errors.summary.md markdown. Regenerated every 60s by the Rust summary_writer task.";
-const DESC_TRIAGE: &str =
-    "Last N lines of data/logs/auto-fix.log — audit trail of the error-triage hook's actions.";
+const DESC_TRIAGE: &str = "Last N lines of data/logs/auto-fix.log — audit trail of the error-triage hook's actions. Reads at most the last 32 MiB and returns at most 5000 lines; `truncated` says when the file was longer.";
 const DESC_SIG_HISTORY: &str = "All events whose computed signature hash equals `signature`. Use after list_novel_signatures to drill into a specific signature's full history.";
-const DESC_RUNBOOK: &str = "Given an ErrorCode string (e.g. 'DH-904', 'I-P1-11'), search every file under docs/runbooks/ AND .claude/rules/ for the code and return matching file paths + a preview of the relevant section. Lets Claude jump from a Telegram alert to the operator runbook in one tool call.";
-const DESC_QUESTDB: &str = "Run arbitrary SQL against the local QuestDB (HTTP /exec). Returns columnar JSON. Lets Claude query the trading data plane — ticks, orders, historical_candles, materialized views — without pg CLI.";
+const DESC_RUNBOOK: &str = "Given an ErrorCode string (e.g. 'DH-904', 'I-P1-11'), search every file under docs/runbooks/, docs/error-runbooks/, .claude/rules/ AND docs/claude-rules-full/ for the code and return matching file paths + a preview of the relevant section. Lets Claude jump from a Telegram alert to the operator runbook in one tool call.";
+const DESC_QUESTDB: &str = "Run READ-ONLY SQL against the local QuestDB (HTTP /exec). Exactly one SELECT, SHOW, EXPLAIN or WITH statement, no comments, no data-changing keyword (the operator console's gate); anything else is refused before it is sent. SELECT and WITH are capped at 1000 rows and a reply at 8 MiB. Returns columnar JSON. Lets Claude query the trading data plane — ticks, orders, candles — without pg CLI.";
 const DESC_GREP: &str = "Regex-search the repo for a pattern. Skips target/, .git/, node_modules/, data/, .terraform/. Returns up to 200 matches of {file, line, text}. Lets Claude find any function, error string, config key, test name across the workspace in one call.";
 const DESC_DOCTOR: &str = "Invoke `bash scripts/doctor.sh` and return the parsed output as {pass_count, fail_count, rows[{status, detail}]}. One-call total-system health check for Claude.";
 const DESC_GIT: &str = "Return the last N commits on the current branch with sha/author/date/subject. Lets Claude investigate 'what changed recently' without leaving the MCP surface.";
 const DESC_API: &str = "HTTP GET against the tickvault app's own REST API (port 3001 by default). Paths: /health, /api/stats, /api/quote/{security_id}, /api/instruments/diagnostic, /api/option-chain, /api/pcr, /api/index-constituency. Returns status + json (or text).";
 const DESC_DOCKER: &str = "Return `docker compose ps --format json` for the tickvault stack. Gives Claude container name/service/state/health without shelling into the host.";
-const DESC_APP_LOG: &str = "Last N lines of data/logs/app.YYYY-MM-DD.log (full INFO/DEBUG output, not just ERRORs). Optional `date` (YYYY-MM-DD) picks a different day; defaults to today UTC.";
-const DESC_CLOUDWATCH: &str = "Read recent PROD logs — fully automated, no human paste/download. PREFERRED: direct CloudWatch read via a SigV4-signed HTTPS request — the ONLY input is a read-only AWS key in the env (AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY [+ AWS_SESSION_TOKEN], AWS_DEFAULT_REGION); no aws CLI, no portal, no boto3. NEXT: the operator-control dashboard's logs endpoint (TICKVAULT_PORTAL_URL + TICKVAULT_PORTAL_TOKEN). FALLBACK: read-only aws CLI on /tickvault/prod/app. Args: minutes (lookback; SigV4 + aws paths), filter_pattern (CloudWatch filter on SigV4 + aws, substring on portal, e.g. \"ERROR\" or \"WS-GAP-05\"), limit (default 100). The AWS secret/token is NEVER logged nor returned. Clear ok=false error if no path is configured."; // secret-scan-ignore: env-var NAMES in a tool description, no credential value
+const DESC_APP_LOG: &str = "Last N lines of data/logs/app.YYYY-MM-DD.log (full INFO/DEBUG output, not just ERRORs). Optional `date` (YYYY-MM-DD) picks a different day; defaults to today UTC. Reads at most the last 32 MiB of the file and returns at most 5000 lines; `truncated` says when the file was longer.";
+const DESC_CLOUDWATCH: &str = "Read recent PROD logs — fully automated, no human paste/download. PREFERRED: direct CloudWatch read via a SigV4-signed HTTPS request — the ONLY input is a read-only AWS key in the env (AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY [+ AWS_SESSION_TOKEN], AWS_DEFAULT_REGION); no aws CLI, no portal, no boto3. NEXT: the operator-control dashboard's logs endpoint (TICKVAULT_PORTAL_URL + TICKVAULT_PORTAL_TOKEN). Args: minutes (lookback; SigV4 path), filter_pattern (CloudWatch filter on SigV4, substring on portal, e.g. \"ERROR\" or \"WS-GAP-05\"), limit (default 100). The AWS secret/token is NEVER logged nor returned. Clear ok=false error if no path is configured."; // secret-scan-ignore: env-var NAMES in a tool description, no credential value
 
 /// (name, description) pairs in registry order — used by the self-test.
 pub fn tool_descriptions() -> Vec<(&'static str, &'static str)> {
@@ -2622,22 +2844,169 @@ mod tests {
     }
 
     #[test]
-    fn app_log_tail_dotted_date_error_echo_is_pathlib_normalized() {
-        // Review r3 LOW-b: legacy echoes `.../app.x/y.log` (pathlib drops
-        // the `.` component at parse time); the Rust echo must match.
+    fn app_log_tail_refuses_a_date_that_is_not_yyyy_mm_dd() {
+        // Replaces the 2026-07 parity test that echoed `app.x/y.log` for the
+        // date "x/./y": a path-shaped date named files outside the log
+        // directory, so it is now refused before any path is built.
+        let base = std::env::temp_dir().join(format!("tv-mcp-date-{}", std::process::id()));
+        let logs = base.join("data").join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(base.join("data").join("secret.log"), "outside\n").unwrap();
         let ctx = Ctx {
-            repo_root: std::env::temp_dir().join(format!("tv-mcp-alt-{}", std::process::id())),
+            repo_root: base.clone(),
             cfg: config::EndpointsConfig::default(),
         };
-        let out = tool_app_log_tail(&ctx, 5, Some("x/./y"));
-        assert_eq!(out["ok"], json!(false));
-        let err = out["error"].as_str().unwrap();
-        assert!(err.starts_with("log file not found: "), "{err}");
-        assert!(
-            err.ends_with("app.x/y.log"),
-            "legacy drops the `.` component: {err}"
+        for date in [
+            "x/./y",
+            "x/../../secret",
+            "../secret",
+            "2026-09-2",
+            "2026/09/27",
+            "2026-09-27x",
+        ] {
+            let out = tool_app_log_tail(&ctx, 5, Some(date));
+            assert_eq!(out["ok"], json!(false), "{date}");
+            let err = out["error"].as_str().unwrap();
+            assert!(err.starts_with("date must be YYYY-MM-DD"), "{date}: {err}");
+        }
+        // A well-shaped date still reads normally.
+        std::fs::write(logs.join("app.2026-09-27.log"), "a\nb\n").unwrap();
+        let out = tool_app_log_tail(&ctx, 5, Some("2026-09-27"));
+        assert_eq!(out["ok"], json!(true), "{out}");
+        assert_eq!(out["lines"], json!(["a", "b"]));
+        assert_eq!(out["truncated"], json!(false));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn read_tail_capped_keeps_only_whole_lines_from_the_end() {
+        let dir = std::env::temp_dir().join(format!("tv-mcp-tail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.log");
+        std::fs::write(&path, "first line\nsecond\nthird\n").unwrap();
+        // Under the cap: the whole file, not cut.
+        let (all, cut) = read_tail_capped(&path, 1024).unwrap();
+        assert_eq!(
+            (all.as_slice(), cut),
+            (b"first line\nsecond\nthird\n".as_slice(), false)
         );
-        assert!(!err.contains("/./"), "{err}");
+        // A cap that lands mid-line drops the partial line.
+        let (tail, cut) = read_tail_capped(&path, 10).unwrap();
+        assert!(cut);
+        assert_eq!(tail, b"third\n");
+        // A cap inside the last line leaves nothing rather than half a line.
+        let (none, cut) = read_tail_capped(&path, 3).unwrap();
+        assert!(cut);
+        assert!(none.is_empty());
+        // A window that starts exactly on a line boundary keeps that line
+        // (the off-by-one the first version had: it dropped it).
+        let (tail, cut) = read_tail_capped(&path, 6).unwrap();
+        assert!(cut);
+        assert_eq!(tail, b"third\n");
+        let (tail, cut) = read_tail_capped(&path, 13).unwrap();
+        assert!(cut);
+        assert_eq!(tail, b"second\nthird\n");
+        // A last line with no trailing newline survives a cut too.
+        let open_ended = dir.join("g.log");
+        std::fs::write(&open_ended, "a\nb\nc").unwrap();
+        let (tail, cut) = read_tail_capped(&open_ended, 3).unwrap();
+        assert!(cut);
+        assert_eq!(tail, b"b\nc");
+        // Exactly at the file length is not a cut.
+        let len = std::fs::metadata(&path).unwrap().len();
+        let (_, cut) = read_tail_capped(&path, len).unwrap();
+        assert!(!cut);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tail_limit_is_clamped() {
+        assert_eq!(clamp_tail_limit(0), LOG_TAIL_MAX_LINES);
+        assert_eq!(clamp_tail_limit(-3), LOG_TAIL_MAX_LINES);
+        assert_eq!(clamp_tail_limit(LOG_TAIL_MAX_LINES + 1), LOG_TAIL_MAX_LINES);
+        assert_eq!(clamp_tail_limit(7), 7);
+    }
+
+    #[test]
+    fn keep_last_lines_sizes_the_index_by_the_reply() {
+        let mut b = b"1\n2\n3\n4\n".to_vec();
+        assert_eq!(keep_last_lines(&mut b, 2), 4);
+        assert_eq!(b, b"3\n4\n");
+        // An unterminated last line counts as a line and is kept.
+        let mut b = b"1\n2\n3".to_vec();
+        assert_eq!(keep_last_lines(&mut b, 2), 3);
+        assert_eq!(b, b"2\n3");
+        // Fewer lines than the limit: untouched.
+        let mut b = b"1\n2\n".to_vec();
+        assert_eq!(keep_last_lines(&mut b, 5), 2);
+        assert_eq!(b, b"1\n2\n");
+        // Empty input.
+        let mut b = Vec::new();
+        assert_eq!(keep_last_lines(&mut b, 3), 0);
+        assert!(b.is_empty());
+    }
+
+    #[test]
+    fn read_whole_capped_refuses_a_file_over_the_cap() {
+        let dir = std::env::temp_dir().join(format!("tv-mcp-whole-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.json");
+        std::fs::write(&path, "abcdef").unwrap();
+        assert_eq!(
+            read_whole_capped(&path, 6).unwrap().as_deref(),
+            Some("abcdef")
+        );
+        assert_eq!(read_whole_capped(&path, 5).unwrap(), None);
+        assert!(read_whole_capped(&dir.join("missing"), 5).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn app_log_tail_returns_the_last_lines_of_a_long_file() {
+        let base = std::env::temp_dir().join(format!("tv-mcp-long-{}", std::process::id()));
+        let logs = base.join("data").join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let body: String = (0..10).map(|i| format!("line{i}\n")).collect();
+        std::fs::write(logs.join("app.2026-09-27.log"), body).unwrap();
+        let ctx = Ctx {
+            repo_root: base.clone(),
+            cfg: config::EndpointsConfig::default(),
+        };
+        let out = tool_app_log_tail(&ctx, 3, Some("2026-09-27"));
+        assert_eq!(out["ok"], json!(true), "{out}");
+        assert_eq!(out["lines"], json!(["line7", "line8", "line9"]));
+        assert_eq!(out["total_lines"], json!(10));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn read_body_capped_refuses_a_reply_over_the_cap() {
+        let (b, over) = read_body_capped(&b"abcdef"[..], 6).unwrap();
+        assert_eq!((b.as_slice(), over), (b"abcdef".as_slice(), false));
+        let (b, over) = read_body_capped(&b"abcdefg"[..], 6).unwrap();
+        assert!(over);
+        assert_eq!(b.len(), 6);
+    }
+
+    #[test]
+    fn questdb_sql_refuses_a_destructive_query_before_connecting() {
+        // The gate runs before any endpoint is resolved or any client is
+        // built, so a refused query comes back as the read-only refusal —
+        // never a connection error — whatever the environment points at.
+        let cfg = config::EndpointsConfig::default();
+        let ctx = Ctx {
+            repo_root: std::env::temp_dir(),
+            cfg,
+        };
+        for q in [
+            "drop table ticks",
+            "truncate table ticks",
+            "select 1; drop table ticks",
+        ] {
+            let out = tool_questdb_sql(&ctx, q);
+            assert_eq!(out["ok"], json!(false), "{q}");
+            assert_eq!(out["error"], json!(QUESTDB_READ_ONLY_REFUSAL), "{q}");
+        }
     }
 
     /// 2026-07-18 review LOW-1: an errors.jsonl file containing an
