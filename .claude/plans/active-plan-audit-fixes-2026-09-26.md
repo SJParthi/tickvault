@@ -623,7 +623,8 @@ line coded, every loss counted and shipped), then the remaining order from the f
     HTTP client no longer follows redirects, so a 3xx reply cannot send the next request to
     the database (found by the security review; reqwest keeps the bearer header on a
     same-host redirect to another port). The bearer token therefore only goes to the
-    configured API.
+    configured API. The launcher no longer runs a prebuilt binary older than its sources
+    (it rebuilds instead), so PR29 and this fix actually run once checked out.
   - Tests: `tickvault_api_can_never_reach_questdb_exec_around_the_sql_gate`,
     `api_path_is_allowed_only_for_the_app_read_routes`,
     `same_origin_folds_loopback_spellings_and_default_ports`,
