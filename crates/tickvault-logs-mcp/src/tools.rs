@@ -841,9 +841,14 @@ pub fn tool_find_runbook_for_code(ctx: &Ctx, code: &str) -> Value {
 // HTTP tools (blocking reqwest — cold path, out-of-process)
 // ---------------------------------------------------------------------------
 
+/// Every tool talks to one fixed address (QuestDB, the app API, CloudWatch
+/// Logs, the portal) and none of them answers with a redirect. Following one
+/// would let a reply send the next request somewhere the tool never checked,
+/// such as the database behind the read-only SQL gate, so redirects are off.
 fn http_client(timeout_secs: u64) -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| format!("http client build failed: {e}"))
 }
@@ -975,8 +980,78 @@ fn split_scheme_host(url: &str) -> (String, Option<String>) {
     }
 }
 
-/// the retired reference implementation `tool_tickvault_api`.
+/// Refusal for a caller-supplied `base_url` (audit PR29b, 2026-09-27).
+pub const API_BASE_OVERRIDE_REFUSAL: &str = "refused: base_url is no longer accepted. \
+     tickvault_api only calls the configured app API (TICKVAULT_API_URL or the active \
+     profile's tickvault_api_url).";
+
+/// Refusal for a path outside the app API's read routes (audit PR29b).
+pub const API_PATH_REFUSAL: &str = "refused: path must be /health or start with /api/, with \
+     no '..', '%', '@', '\\', '#', '://', spaces or control characters.";
+
+/// Refusal when the configured API base is the database's own address
+/// (audit PR29b): a GET there would skip the read-only SQL gate.
+pub const API_BASE_IS_QUESTDB_REFUSAL: &str = "refused: the configured tickvault API address \
+     is the database's address, so a GET there would bypass questdb_sql's read-only gate. Fix \
+     TICKVAULT_API_URL / tickvault_api_url.";
+
+/// A `tickvault_api` path is allowed only when it is one of the app's own
+/// read routes and carries nothing that could redirect the request
+/// (audit PR29b). O(len) over the path.
+pub fn api_path_is_allowed(path: &str) -> bool {
+    let route_ok = path == "/health" || path.starts_with("/health?") || path.starts_with("/api/");
+    let chars_ok = path
+        .chars()
+        .all(|c| !c.is_control() && !c.is_whitespace() && !matches!(c, '%' | '@' | '\\' | '#'));
+    route_ok && chars_ok && !path.contains("..") && !path.contains("://")
+}
+
+/// (scheme, host, port) of a URL with loopback names folded together and
+/// the scheme's default port filled in, so two spellings of one address
+/// compare equal. `None` when the URL has no host.
+fn url_origin(url: &str) -> Option<(String, String, u16)> {
+    let (scheme, host) = split_scheme_host(url);
+    let host = host?;
+    let rest = url.split_once("://").map_or("", |(_, r)| r);
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let netloc = rest[..end].rsplit('@').next().unwrap_or("");
+    let port_text = if let Some(after) = netloc.strip_prefix('[') {
+        after.split_once("]:").map(|(_, p)| p)
+    } else {
+        netloc.rsplit_once(':').map(|(_, p)| p)
+    };
+    let default_port = if scheme == "https" { 443 } else { 80 };
+    let port = match port_text {
+        Some(p) if !p.is_empty() => p.parse::<u16>().ok()?,
+        _ => default_port,
+    };
+    let host = match host.as_str() {
+        // APPROVED: loopback spellings folded for an address comparison, never a connection target.
+        "localhost" | "::1" | "0.0.0.0" => "127.0.0.1".to_string(),
+        _ => host,
+    };
+    Some((scheme, host, port))
+}
+
+/// True when the two URLs name the same address. An unparseable URL
+/// compares as the same, so the check fails closed.
+pub fn same_origin(a: &str, b: &str) -> bool {
+    match (url_origin(a), url_origin(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => true,
+    }
+}
+
+/// the retired reference implementation `tool_tickvault_api`, narrowed by
+/// audit PR29b (2026-09-27): the caller can no longer name the host, the
+/// path must be one of the app's read routes, and the call is refused
+/// when the configured API address is the database's, so a GET can never
+/// reach QuestDB's `/exec` around the read-only SQL gate and the bearer
+/// token only ever goes to the configured API.
 pub fn tool_tickvault_api(ctx: &Ctx, path: &str, base_url: Option<&str>) -> Value {
+    if base_url.is_some_and(|b| !b.is_empty()) {
+        return json!({"ok": false, "error": API_BASE_OVERRIDE_REFUSAL});
+    }
     let env = RealEnv;
     let api_url = config::endpoint_url(
         &env,
@@ -984,13 +1059,27 @@ pub fn tool_tickvault_api(ctx: &Ctx, path: &str, base_url: Option<&str>) -> Valu
         "tickvault_api_url",
         "TICKVAULT_API_URL",
         "http://127.0.0.1:3001",
-        base_url,
+        None,
     );
     let path = if path.starts_with('/') {
         path.to_string()
     } else {
         format!("/{path}")
     };
+    if !api_path_is_allowed(&path) {
+        return json!({"ok": false, "error": API_PATH_REFUSAL, "path": path});
+    }
+    let qdb_url = config::endpoint_url(
+        &env,
+        &ctx.cfg,
+        "questdb_url",
+        "TICKVAULT_QUESTDB_URL",
+        "http://127.0.0.1:9000",
+        None,
+    );
+    if same_origin(&api_url, &qdb_url) {
+        return json!({"ok": false, "error": API_BASE_IS_QUESTDB_REFUSAL});
+    }
     let full = format!("{api_url}{path}");
     let bearer = env
         .get("TICKVAULT_API_BEARER_TOKEN")
@@ -2119,10 +2208,6 @@ pub fn tools_list_json() -> Value {
                         "type": "string",
                         "description": "API path starting with /",
                     },
-                    "base_url": {
-                        "type": "string",
-                        "description": "Override TICKVAULT_API_URL for a single call.",
-                    },
                 },
                 "required": ["path"],
             },
@@ -3046,5 +3131,83 @@ mod tests {
             "exactly the two valid events (binary line skipped per-line): {out}"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn api_path_is_allowed_only_for_the_app_read_routes() {
+        for ok in [
+            "/health",
+            "/health?x=1",
+            "/api/stats",
+            "/api/quote/13",
+            "/api/debug/logs/summary",
+        ] {
+            assert!(api_path_is_allowed(ok), "{ok}");
+        }
+        for bad in [
+            "/",
+            "/exec?query=SELECT 1",
+            "/exec",
+            "/imp",
+            "/healthz",
+            "/api",
+            "/api/../exec",
+            "/api/%2e%2e/exec",
+            "//127.0.0.1:9000/exec",
+            "/api/x@127.0.0.1:9000/x",
+            "/api/x\\y",
+            "/health#/exec",
+            "/api/http://127.0.0.1:9000/exec",
+            "/api/x y",
+            "/api/x\ny",
+            "/api/x\ty",
+        ] {
+            assert!(!api_path_is_allowed(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn same_origin_folds_loopback_spellings_and_default_ports() {
+        assert!(same_origin(
+            "http://127.0.0.1:9000",
+            "http://localhost:9000"
+        ));
+        assert!(same_origin("http://127.0.0.1:9000/", "http://[::1]:9000"));
+        assert!(same_origin(
+            "http://0.0.0.0:9000",
+            "http://127.0.0.1:9000/exec"
+        ));
+        assert!(same_origin("http://host", "http://host:80"));
+        assert!(same_origin("https://host", "https://host:443"));
+        assert!(same_origin(
+            "http://user@127.0.0.1:9000",
+            "http://127.0.0.1:9000"
+        ));
+        assert!(!same_origin(
+            "http://127.0.0.1:3001",
+            "http://127.0.0.1:9000"
+        ));
+        assert!(!same_origin(
+            "http://127.0.0.1:9000",
+            "https://127.0.0.1:9000"
+        ));
+        assert!(!same_origin("http://a:9000", "http://b:9000"));
+        // Unparseable fails closed (reads as the same address).
+        assert!(same_origin("not a url", "http://127.0.0.1:9000"));
+        assert!(same_origin(
+            "http://127.0.0.1:notaport",
+            "http://127.0.0.1:9000"
+        ));
+    }
+
+    #[test]
+    fn tickvault_api_refuses_a_caller_base_url_before_any_network() {
+        let ctx = Ctx {
+            repo_root: std::path::PathBuf::from("/nonexistent"),
+            cfg: config::EndpointsConfig::default(),
+        };
+        let out = tool_tickvault_api(&ctx, "/health", Some("http://127.0.0.1:9000"));
+        assert_eq!(out["ok"], false);
+        assert_eq!(out["error"], API_BASE_OVERRIDE_REFUSAL);
     }
 }

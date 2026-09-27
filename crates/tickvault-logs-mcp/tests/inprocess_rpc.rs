@@ -37,6 +37,7 @@ use serde_json::{Value, json};
 
 use tickvault_logs_mcp::config::{Ctx, EndpointsConfig};
 use tickvault_logs_mcp::rpc;
+use tickvault_logs_mcp::tools;
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -174,6 +175,14 @@ fn spawn_mock_http() -> u16 {
                 }
                 let text = String::from_utf8_lossy(&req);
                 let path = text.split_whitespace().nth(1).unwrap_or("/").to_string();
+                if path == "/api/redirect" {
+                    // A reply that points the next request at the database
+                    // behind the SQL gate. The tool must not follow it.
+                    let _ = s.write_all(
+                        b"HTTP/1.1 302 Found\r\nLocation: /exec?query=SELECT%201\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    return;
+                }
                 let (status_line, ctype, body): (&str, &str, String) = if path.contains("hugebody")
                 {
                     // One byte over the tool's 8 MiB reply ceiling.
@@ -203,7 +212,7 @@ fn spawn_mock_http() -> u16 {
                         "application/json",
                         r#"{"status":"ok","service":"tickvault"}"#.to_string(),
                     )
-                } else if path == "/text" {
+                } else if path == "/api/text" {
                     ("200 OK", "text/plain", "hello mcp\nline two".to_string())
                 } else {
                     ("404 Not Found", "text/plain", "nope".to_string())
@@ -904,7 +913,7 @@ fn questdb_sql_and_tickvault_api_against_local_mock() {
         let _env = EnvGuard::set(&[("TICKVAULT_API_URL", base.as_str())]);
         // No leading slash -> the tool normalizes it, and a non-JSON body
         // falls back to the `text` field.
-        let resp = call_tool_via_line(&ctx, 60, "tickvault_api", json!({"path": "/hugebody"}));
+        let resp = call_tool_via_line(&ctx, 60, "tickvault_api", json!({"path": "/api/hugebody"}));
         let out = inner_result(&resp);
         assert_eq!(out["ok"], false, "a reply over 8 MiB is refused: {out}");
         assert!(
@@ -913,7 +922,7 @@ fn questdb_sql_and_tickvault_api_against_local_mock() {
                 .expect("error is a string")
                 .starts_with("reply larger than 8 MiB")
         );
-        let resp = call_tool_via_line(&ctx, 6, "tickvault_api", json!({"path": "text"}));
+        let resp = call_tool_via_line(&ctx, 6, "tickvault_api", json!({"path": "api/text"}));
         let out = inner_result(&resp);
         assert_eq!(out["ok"], true);
         assert!(
@@ -925,7 +934,7 @@ fn questdb_sql_and_tickvault_api_against_local_mock() {
     }
     {
         let _env = EnvGuard::set(&[("TICKVAULT_API_URL", base.as_str())]);
-        let resp = call_tool_via_line(&ctx, 7, "tickvault_api", json!({"path": "/nope"}));
+        let resp = call_tool_via_line(&ctx, 7, "tickvault_api", json!({"path": "/api/nope"}));
         let out = inner_result(&resp);
         assert_eq!(out["ok"], false);
         assert!(
@@ -934,14 +943,32 @@ fn questdb_sql_and_tickvault_api_against_local_mock() {
                 .expect("error is a string")
                 .starts_with("HTTP Error 404")
         );
+        // A redirect is reported, never followed (audit PR29b): the mock
+        // points the next request at the database, and the tool stops at
+        // the 302 instead of running that query.
+        let resp = call_tool_via_line(&ctx, 8, "tickvault_api", json!({"path": "/api/redirect"}));
+        let out = inner_result(&resp);
+        assert_eq!(out["status"], 302, "the tool stops at the redirect: {out}");
+        assert!(
+            out.get("json").is_none(),
+            "the database reply behind the redirect never arrives: {out}"
+        );
+        assert!(
+            out["url"]
+                .as_str()
+                .expect("url is a string")
+                .ends_with("/api/redirect"),
+            "no request went past the redirect: {out}"
+        );
     }
     {
         let _env = EnvGuard::set(&[
             ("TICKVAULT_API_URL", base.as_str()),
             ("TICKVAULT_API_BEARER_TOKEN", "dummy-inprocess-test-token"),
         ]);
-        // A bearer token must never cross a plaintext connection to a
-        // non-local host — refused before any network attempt.
+        // The caller can no longer name the host (audit PR29b): a
+        // base_url is refused before any network attempt, so the bearer
+        // token can never be sent to a host the caller picked.
         let resp = call_tool_via_line(
             &ctx,
             8,
@@ -950,18 +977,121 @@ fn questdb_sql_and_tickvault_api_against_local_mock() {
         );
         let out = inner_result(&resp);
         assert_eq!(out["ok"], false);
-        assert!(
-            out["error"]
-                .as_str()
-                .expect("error is a string")
-                .contains("refusing to send")
-        );
+        assert_eq!(out["error"], tools::API_BASE_OVERRIDE_REFUSAL);
 
         // The SAME bearer token IS allowed over plaintext to localhost.
         let resp = call_tool_via_line(&ctx, 9, "tickvault_api", json!({"path": "/health"}));
         let out = inner_result(&resp);
         assert_eq!(out["ok"], true);
     }
+    {
+        // A configured non-local plaintext API still never receives the
+        // bearer token — refused before any network attempt.
+        let _env = EnvGuard::set(&[
+            ("TICKVAULT_API_URL", "http://example.invalid:9"),
+            ("TICKVAULT_API_BEARER_TOKEN", "dummy-inprocess-test-token"),
+        ]);
+        let resp = call_tool_via_line(&ctx, 10, "tickvault_api", json!({"path": "/health"}));
+        let out = inner_result(&resp);
+        assert_eq!(out["ok"], false);
+        assert!(
+            out["error"]
+                .as_str()
+                .expect("error is a string")
+                .contains("refusing to send")
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 5b. tickvault_api can never reach the database around the SQL gate
+//     (audit PR29b, 2026-09-27). Every case would get a 200 or 400 from the
+//     mock if it reached it; each must be refused before any connection.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tickvault_api_can_never_reach_questdb_exec_around_the_sql_gate() {
+    let port = spawn_mock_http();
+    let base = format!("http://127.0.0.1:{port}");
+    let ctx = empty_ctx();
+
+    // 1. The reported bypass: base_url pointed at the database's /exec.
+    for (id, base_url) in [
+        (1, base.as_str()),
+        (2, "http://127.0.0.1:9000"),
+        (3, "http://localhost:9000"),
+    ] {
+        let resp = call_tool_via_line(
+            &ctx,
+            id,
+            "tickvault_api",
+            json!({"path": "/exec?query=drop%20table%20ticks", "base_url": base_url}),
+        );
+        let out = inner_result(&resp);
+        assert_eq!(out["ok"], false, "{base_url}");
+        assert_eq!(out["error"], tools::API_BASE_OVERRIDE_REFUSAL, "{base_url}");
+    }
+
+    // 2. Paths outside the app's read routes, or shaped to redirect.
+    {
+        let _env = EnvGuard::set(&[("TICKVAULT_API_URL", base.as_str())]);
+        for (id, path) in [
+            (10, "/exec?query=drop table ticks"),
+            (11, "exec?query=SELECT 1"),
+            (12, "/api/../exec?query=SELECT 1"),
+            (13, "/api/%2e%2e/exec?query=SELECT 1"),
+            (14, "//127.0.0.1:9000/exec?query=SELECT 1"),
+            (15, "/api/x@127.0.0.1:9000/exec"),
+            (16, "/api/x\\..\\exec"),
+            (17, "/health#/exec"),
+            (18, "/api/http://127.0.0.1:9000/exec"),
+            (19, "/imp"),
+            (20, "/api/x\nHost: evil"),
+        ] {
+            let resp = call_tool_via_line(&ctx, id, "tickvault_api", json!({"path": path}));
+            let out = inner_result(&resp);
+            assert_eq!(out["ok"], false, "{path}");
+            assert_eq!(out["error"], tools::API_PATH_REFUSAL, "{path}: {out}");
+        }
+    }
+
+    // 3. The configured API address is the database's own: refused, even
+    //    for an allowed path, and even spelled differently.
+    for (id, api, qdb) in [
+        (30, base.clone(), base.clone()),
+        (31, format!("http://localhost:{port}"), base.clone()),
+        (
+            32,
+            format!("http://127.0.0.1:{port}/"),
+            format!("http://[::1]:{port}"),
+        ),
+    ] {
+        let _env = EnvGuard::set(&[
+            ("TICKVAULT_API_URL", api.as_str()),
+            ("TICKVAULT_QUESTDB_URL", qdb.as_str()),
+        ]);
+        let resp = call_tool_via_line(&ctx, id, "tickvault_api", json!({"path": "/health"}));
+        let out = inner_result(&resp);
+        assert_eq!(out["ok"], false, "{api} vs {qdb}");
+        assert_eq!(
+            out["error"],
+            tools::API_BASE_IS_QUESTDB_REFUSAL,
+            "{api} vs {qdb}"
+        );
+    }
+
+    // 4. The schema no longer offers base_url.
+    let resp = rpc::process_line(
+        &ctx,
+        &json!({"jsonrpc": "2.0", "id": 40, "method": "tools/list"}).to_string(),
+    )
+    .expect("tools/list responds");
+    let tools_list = resp["result"]["tools"].as_array().expect("tools array");
+    let api = tools_list
+        .iter()
+        .find(|t| t["name"] == "tickvault_api")
+        .expect("tickvault_api listed");
+    assert!(api["inputSchema"]["properties"].get("base_url").is_none());
 }
 
 // ---------------------------------------------------------------------------
