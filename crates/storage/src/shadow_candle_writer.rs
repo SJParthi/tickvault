@@ -43,7 +43,7 @@ use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
 use secrecy::{ExposeSecret, SecretString};
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_trading::candles::BufferedSeal;
@@ -105,6 +105,28 @@ fn build_ilp_conf_string(host: &str, http_port: u16) -> String {
 /// still fails in milliseconds. 5s is generous for a ≤1024-row (~256 KB)
 /// LAN batch.
 const SEAL_FLUSH_REQUEST_TIMEOUT_MS: u64 = 5_000;
+
+/// The error [`ShadowCandleWriter::flush`] returns while the candle tables are
+/// not yet confirmed keyed (audit PR31a). A distinct type so the seal drain can
+/// tell this expected, already-logged refusal from a database failure and not
+/// repeat a coded `error!` on every 100 ms cycle; the seals still take the
+/// rescue path either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CandleTablesNotKeyed;
+
+impl std::fmt::Display for CandleTablesNotKeyed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("shadow flush: candle tables not yet keyed — refused, rows retained")
+    }
+}
+
+impl std::error::Error for CandleTablesNotKeyed {}
+
+/// Latches the one coded `error!` a refused (not-yet-keyed) flush writes, so a
+/// session whose candle DDL never succeeds logs the cause once rather than on
+/// every 100 ms drain cycle. The seals themselves are counted by the rescue path.
+static CANDLE_UNKEYED_REFUSAL_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// questdb-rs INTERNAL retry budget, in milliseconds. Pinned to 0 —
 /// disabled — because [`ShadowCandleWriter::flush`]'s bounded
@@ -269,6 +291,12 @@ pub struct ShadowCandleWriter {
     /// Read by `reconnect()` (the broken-pipe recovery path) — no
     /// longer dead since the candle-writer reconnect landed 2026-06-30.
     ilp_conf_string: SecretString,
+    /// The "candle tables are keyed" latch this writer obeys before it sends a
+    /// row (audit PR31a, 2026-09-27). Always the process-wide
+    /// [`crate::shadow_persistence::CANDLE_TABLES_KEYED`] outside this
+    /// module's own tests, which point it at a local flag so a test elsewhere
+    /// that runs the ensure cannot change what they measure.
+    keyed: &'static std::sync::atomic::AtomicBool,
 }
 
 impl ShadowCandleWriter {
@@ -303,6 +331,7 @@ impl ShadowCandleWriter {
             delay_scratch: String::new(),
             ilp_conf_string: SecretString::from(conf_string),
             out_of_window: CandleOutOfWindowCounters::new(),
+            keyed: &crate::shadow_persistence::CANDLE_TABLES_KEYED,
         })
     }
 
@@ -320,7 +349,19 @@ impl ShadowCandleWriter {
             delay_scratch: String::new(),
             ilp_conf_string: SecretString::from(String::new()),
             out_of_window: CandleOutOfWindowCounters::new(),
+            keyed: &crate::shadow_persistence::CANDLE_TABLES_KEYED,
         }
+    }
+
+    /// Test-only: obey `keyed` instead of the process-wide latch, so a test
+    /// can hold the gate shut regardless of any other test running the ensure.
+    #[cfg(test)]
+    pub(crate) fn with_keyed_for_test(
+        mut self,
+        keyed: &'static std::sync::atomic::AtomicBool,
+    ) -> Self {
+        self.keyed = keyed;
+        self
     }
 
     /// Returns `true` when the writer holds a live ILP `Sender`.
@@ -451,8 +492,51 @@ impl ShadowCandleWriter {
                 return Ok(());
             }
         }
-        let buf = self
-            .buffer
+        // One sealed bar is ~20 ILP calls, and several of them validate their
+        // input (the timestamp in `at` last of all). A failure part-way used
+        // to leave a HALF row in the buffer: every later `table()` then
+        // failed on the unfinished line and the next flush sent — or was
+        // refused for — a malformed row, so one bad bar could take every
+        // good bar batched with it down too (audit PR31). The marker drops
+        // only the bad row, as `TopVolumeRowWriter::append_row` does. Both
+        // calls are O(1) and allocation-free.
+        //
+        // Neither failure below clears the buffer. Clearing would silently
+        // drop the good rows already batched, which the caller counts as
+        // written. Returning `Err` instead sends this seal down the caller's
+        // rescue path, and a buffer left mid-row fails its next flush, whose
+        // own recovery rescues every popped seal before it discards.
+        self.buffer
+            .set_marker()
+            .context("candle append: the buffer is mid-row, so no marker can be set")?;
+        match Self::write_row(&mut self.buffer, &mut self.delay_scratch, row) {
+            Ok(()) => {
+                self.buffer.clear_marker();
+                self.pending_count += 1;
+                Ok(())
+            }
+            Err(err) => {
+                // Cannot fail: the marker was set just above. If it ever did,
+                // the half row stays, the next flush fails on it, and that
+                // flush's recovery rescues every popped seal (see above).
+                match self.buffer.rewind_to_marker() {
+                    Ok(()) => Err(err),
+                    Err(rewind_err) => Err(err.context(format!(
+                        "candle append: rewinding the half-written row also failed: {rewind_err}"
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// Serialise one row into `buffer`. Split out of [`Self::append_row`] so
+    /// the caller can wrap it in a marker and drop a half-written row.
+    fn write_row(
+        buffer: &mut Buffer,
+        delay_scratch: &mut String,
+        row: &ShadowSealRow,
+    ) -> Result<()> {
+        let buf = buffer
             .table(row.table_name)
             .with_context(|| format!("candle append: invalid table name {}", row.table_name))?
             // Feed-provenance label (operator 2026-06-19, "same tables + feed
@@ -542,7 +626,7 @@ impl ShadowCandleWriter {
         // The `_ns` twin is NOT optional garnish: text sorted descending
         // puts "1 second" after "4 nanoseconds", the exact reverse of the
         // true order, so every ORDER BY must use the exact column.
-        let scratch = &mut self.delay_scratch;
+        let scratch = delay_scratch;
         for (readable, exact, value) in [
             ("open_latency", "open_latency_ns", row.open_latency_ns),
             ("close_latency", "close_latency_ns", row.close_latency_ns),
@@ -562,7 +646,6 @@ impl ShadowCandleWriter {
         }
         buf.at(TimestampNanos::new(row.timestamp_ist_nanos))
             .with_context(|| "candle append: at(TimestampNanos) failed")?;
-        self.pending_count += 1;
         Ok(())
     }
 
@@ -610,6 +693,26 @@ impl ShadowCandleWriter {
         if self.buffer.is_empty() {
             self.pending_count = 0;
             return Ok(());
+        }
+        // Audit PR31a (2026-09-27): refuse until every candle table has been
+        // created WITH its DEDUP key. An ILP row reaching a missing table makes
+        // QuestDB auto-create it keyless, and every replayed bar then duplicates
+        // into it for the life of the table. The buffer and `pending_count` are
+        // left untouched, so the caller rescues these seals to the disk spill
+        // exactly as it does for an unreachable database.
+        if !self.keyed.load(std::sync::atomic::Ordering::Acquire) {
+            if !CANDLE_UNKEYED_REFUSAL_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::HotPath02WriterQueueDrop
+                        .code_str(),
+                    pending = self.pending_count,
+                    "candle writer: refusing to send — the candle tables are not yet \
+                     confirmed to carry their DEDUP key, and a row sent now could \
+                     auto-create one without it. Seals go to the disk spill until the \
+                     ensure succeeds (logged once per process)."
+                );
+            }
+            return Err(anyhow::Error::new(CandleTablesNotKeyed));
         }
         let mut reconnected = false;
         for attempt in 0..=crate::ilp_flush_reconnect::ILP_FLUSH_RECONNECT_MAX_RETRIES {
@@ -757,6 +860,12 @@ pub fn count_nonfinite_candle_floats(row: &ShadowSealRow) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    /// Audit PR31a: tests that exercise `flush` past the keyed gate hold it
+    /// OPEN through this flag, so they reach the reconnect path they prove
+    /// whatever order the ensure tests run in.
+    static KEYED_FOR_TESTS: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(true);
+
     use super::*;
     use tickvault_common::constants::{EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_NSE_EQ};
     use tickvault_common::feed::Feed;
@@ -878,7 +987,7 @@ mod tests {
         // the writer's retained ILP buffer, so a server-rejected row can never
         // replay forever and the buffer can never grow across cycles toward
         // the questdb-rs 100 MiB max_buf_size cliff.
-        let mut w = ShadowCandleWriter::for_test();
+        let mut w = ShadowCandleWriter::for_test().with_keyed_for_test(&KEYED_FOR_TESTS);
         w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("append");
         w.append_seal(&mk_seal(25, 0, TfIndex::M1, 1_716_024_300, 200.0))
@@ -914,6 +1023,28 @@ mod tests {
         w.append_seal(&mk_seal(25, 0, TfIndex::M1, 1_716_024_300, 200.0))
             .expect("append");
         assert_eq!(w.pending_count(), 2);
+    }
+
+    /// Audit PR31: a buffer left mid-row must never be cleared by the next
+    /// append, because that would silently drop good rows the caller already
+    /// counts as buffered. The append returns `Err` (the caller's rescue path
+    /// takes that seal) and the good row stays.
+    #[test]
+    fn test_append_row_on_a_mid_row_buffer_errs_without_dropping_good_rows() {
+        let mut w = ShadowCandleWriter::for_test();
+        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
+            .expect("good row");
+        // Force the buffer into the state a part-way failure used to leave.
+        w.buffer.table("candles_1m").expect("start a line");
+        let before = w.buffer_bytes().to_vec();
+        let err = w.append_seal(&mk_seal(25, 0, TfIndex::M1, 1_716_024_300, 200.0));
+        assert!(err.is_err(), "a mid-row buffer refuses the append");
+        assert_eq!(w.pending_count(), 1, "the good row is still counted");
+        assert_eq!(
+            w.buffer_bytes(),
+            &before[..],
+            "nothing cleared, nothing added"
+        );
     }
 
     #[test]
@@ -1203,7 +1334,7 @@ mod tests {
         // empty-Ok never masks a real persist failure. A flush WITH pending rows on
         // a disconnected writer still Errs — see
         // `test_flush_returns_err_when_disconnected_with_pending_rows`.
-        let mut w = ShadowCandleWriter::for_test();
+        let mut w = ShadowCandleWriter::for_test().with_keyed_for_test(&KEYED_FOR_TESTS);
         let result = w.flush();
         assert!(
             result.is_ok(),
@@ -1211,9 +1342,67 @@ mod tests {
         );
     }
 
+    /// Audit PR31a: a flush before the candle tables are confirmed keyed sends
+    /// NOTHING and keeps every row for the rescue path; once the latch is set
+    /// the same flush reaches the network arm. A local flag, not the global one,
+    /// because another test in this crate runs the ensure against a mock that
+    /// accepts everything and would flip the global under this one.
+    #[test]
+    fn test_flush_refuses_until_the_candle_tables_are_keyed() {
+        static LOCAL_KEYED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        let mut w = ShadowCandleWriter::for_test();
+        w.keyed = &LOCAL_KEYED;
+        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
+            .expect("append");
+        let before = w.buffer_bytes().to_vec();
+
+        let err = w.flush().expect_err("an unkeyed flush must be refused");
+        assert!(
+            format!("{err:#}").contains("not yet keyed"),
+            "the refusal must name its cause: {err:#}"
+        );
+        assert_eq!(w.pending_count(), 1, "the refused row stays counted");
+        assert_eq!(
+            w.buffer_bytes(),
+            before.as_slice(),
+            "the refused row stays buffered"
+        );
+
+        LOCAL_KEYED.store(true, std::sync::atomic::Ordering::Release);
+        let err = w
+            .flush()
+            .expect_err("disconnected, so the network arm still fails");
+        assert!(
+            !format!("{err:#}").contains("not yet keyed"),
+            "once keyed the flush must get past the gate: {err:#}"
+        );
+    }
+
+    /// Every constructor obeys the ONE process-wide latch the ensure sets.
+    #[test]
+    fn test_every_candle_writer_obeys_the_process_wide_keyed_latch() {
+        let w = ShadowCandleWriter::for_test();
+        assert!(std::ptr::eq(
+            w.keyed,
+            &crate::shadow_persistence::CANDLE_TABLES_KEYED
+        ));
+        let cfg = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        let w = ShadowCandleWriter::new(&cfg).expect("lazy construction");
+        assert!(std::ptr::eq(
+            w.keyed,
+            &crate::shadow_persistence::CANDLE_TABLES_KEYED
+        ));
+    }
+
     #[test]
     fn test_flush_returns_err_when_disconnected_with_pending_rows() {
-        let mut w = ShadowCandleWriter::for_test();
+        let mut w = ShadowCandleWriter::for_test().with_keyed_for_test(&KEYED_FOR_TESTS);
         w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("append");
         assert_eq!(w.pending_count(), 1);
@@ -1257,7 +1446,7 @@ mod tests {
         // reconnect attempts (for_test writer has an empty conf → reconnect fails)
         // must RETAIN the buffered candles + pending so drain_once can rescue them
         // to spill/DLQ AND a later cycle re-attempts — no silent candle loss.
-        let mut w = ShadowCandleWriter::for_test();
+        let mut w = ShadowCandleWriter::for_test().with_keyed_for_test(&KEYED_FOR_TESTS);
         w.append_seal(&mk_seal(
             13,
             EXCHANGE_SEGMENT_IDX_I,
@@ -1291,7 +1480,7 @@ mod tests {
         // subsequent flush attempt (reconnect + replay each cycle), so the
         // moment QuestDB comes back the backlog commits. Proven here by two
         // consecutive failed flushes both retaining the identical buffer.
-        let mut w = ShadowCandleWriter::for_test();
+        let mut w = ShadowCandleWriter::for_test().with_keyed_for_test(&KEYED_FOR_TESTS);
         w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("append");
         let bytes = w.buffer_byte_count();
@@ -1307,7 +1496,7 @@ mod tests {
     #[test]
     fn test_shadow_writer_empty_buffer_flush_is_noop_ok() {
         // An empty buffer flush is a no-op Ok — no reconnect attempt, no error.
-        let mut w = ShadowCandleWriter::for_test();
+        let mut w = ShadowCandleWriter::for_test().with_keyed_for_test(&KEYED_FOR_TESTS);
         assert!(w.flush().is_ok(), "empty flush must be Ok (no-op)");
     }
 

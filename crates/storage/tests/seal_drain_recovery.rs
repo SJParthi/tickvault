@@ -26,6 +26,7 @@
 //! | 7 | `corrupt_tail_is_counted_not_silently_lost` | undecodable bytes are reported, never swallowed |
 //! | 8 | `runner_boot_drain_reports_pending_honestly_when_db_is_down` | the production `SealWriterRunner` seam, dead DB, honest reporting |
 //! | 9 | `real_rescue_path_end_to_end_is_recovered` | seals rescued by the REAL `drain_once` cascade are recovered |
+//! | 10 | `a_refused_append_keeps_the_file_staged_and_is_counted` | a seal the writer refuses is never archived as landed |
 //!
 //! No live QuestDB and no `unsafe`: the ILP side is exercised through the
 //! `SealSink` seam (`ShadowCandleWriter::for_test()` is permanently
@@ -40,7 +41,8 @@ use tickvault_storage::seal_dlq::{SealDlqRecord, SealDlqWriter};
 use tickvault_storage::seal_spill::{SealSpillWriter, SerializedSeal};
 use tickvault_storage::seal_writer_runner::SealWriterRunner;
 use tickvault_storage::seal_writer_task::{
-    SEAL_ARCHIVE_SUBDIR, SEAL_REPLAYING_SUBDIR, SealSink, drain_once, drain_recovered_seals,
+    SEAL_ARCHIVE_SUBDIR, SEAL_REFUSED_FILE_RETRY_SECS, SEAL_REPLAYING_SUBDIR, SealSink, drain_once,
+    drain_recovered_seals,
 };
 use tickvault_storage::shadow_candle_writer::ShadowCandleWriter;
 use tickvault_trading::candles::{BufferedSeal, LiveCandleState, TfIndex};
@@ -70,6 +72,8 @@ struct FakeSink {
     flushes: usize,
     /// How many times `discard_pending` was called.
     discards: usize,
+    /// When set, `append_seal` refuses the seal with this security id.
+    refuse_append_for: Option<u64>,
 }
 
 impl FakeSink {
@@ -95,6 +99,9 @@ impl FakeSink {
 
 impl SealSink for FakeSink {
     fn append_seal(&mut self, seal: &BufferedSeal) -> anyhow::Result<()> {
+        if self.refuse_append_for == Some(seal.security_id) {
+            return Err(anyhow::anyhow!("row refused by the buffer"));
+        }
         self.buffered.push((
             seal.security_id,
             seal.exchange_segment_code,
@@ -337,6 +344,80 @@ fn flush_failure_leaves_file_staged_then_recovers_next_boot() {
     assert_eq!(second.seals_left_pending, 0);
     assert_eq!(healthy.committed.len(), 10, "exactly once, not twice");
     assert_eq!(healthy.committed_keys(), expected);
+
+    cleanup(&spill, &dlq);
+}
+
+// ---------------------------------------------------------------------------
+// 10 — a refused append is never archived as if it had landed (audit PR31)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_refused_append_keeps_the_file_staged_and_is_counted() {
+    let (spill, dlq) = unique_dirs("refused");
+    let expected = spill_n(&spill, 6);
+    let refused = expected[2].0;
+
+    // Boot #1: the database is up, but the writer refuses one seal.
+    let mut sink = FakeSink {
+        refuse_append_for: Some(refused),
+        ..FakeSink::healthy()
+    };
+    let first = drain_recovered_seals(&mut sink, &spill, &dlq, 4);
+    assert_eq!(first.seals_recovered, 6);
+    assert_eq!(first.seals_reingested, 5, "the five good seals landed");
+    assert_eq!(first.seals_append_failed, 1, "the refusal is counted");
+    assert_eq!(first.files_archived, 0, "never archived as if all landed");
+    assert_eq!(first.files_left_pending, 1);
+    assert_eq!(first.seals_left_pending, 1, "the refused seal is pending");
+    assert_eq!(subdir_file_count(&spill, SEAL_REPLAYING_SUBDIR), 1);
+    assert_eq!(subdir_file_count(&spill, SEAL_ARCHIVE_SUBDIR), 0);
+
+    // Boot #2: the writer accepts it. The whole file is re-read, so every
+    // seal lands and the file is archived; the database's DEDUP key
+    // collapses the five that were sent twice.
+    let mut healthy = FakeSink::healthy();
+    let second = drain_recovered_seals(&mut healthy, &spill, &dlq, 4);
+    assert_eq!(second.seals_reingested, 6);
+    assert_eq!(second.seals_append_failed, 0);
+    assert_eq!(second.files_archived, 1);
+    assert_eq!(healthy.committed_keys(), expected);
+
+    cleanup(&spill, &dlq);
+}
+
+/// The retry is BOUNDED: a file whose seals were refused and which is older
+/// than the retry window is archived (bytes kept) instead of being re-read, and
+/// re-sent over newer bars, on every boot forever.
+#[test]
+fn a_refused_append_in_a_file_past_the_retry_window_is_archived_not_retried() {
+    let (spill, dlq) = unique_dirs("refused-old");
+    let expected = spill_n(&spill, 3);
+    let refused = expected[1].0;
+    let aged = std::time::SystemTime::now()
+        - std::time::Duration::from_secs(SEAL_REFUSED_FILE_RETRY_SECS + 3_600);
+    for entry in std::fs::read_dir(&spill).expect("spill dir") {
+        let path = entry.expect("entry").path();
+        if path.is_file() {
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .expect("open spill file")
+                .set_modified(aged)
+                .expect("age the spill file");
+        }
+    }
+
+    let mut sink = FakeSink {
+        refuse_append_for: Some(refused),
+        ..FakeSink::healthy()
+    };
+    let outcome = drain_recovered_seals(&mut sink, &spill, &dlq, 4);
+    assert_eq!(outcome.seals_reingested, 2);
+    assert_eq!(outcome.seals_append_failed, 1, "still counted");
+    assert_eq!(outcome.files_left_pending, 0, "not kept for another boot");
+    assert_eq!(outcome.files_archived, 1, "archived, bytes kept");
+    assert_eq!(subdir_file_count(&spill, SEAL_ARCHIVE_SUBDIR), 1);
 
     cleanup(&spill, &dlq);
 }

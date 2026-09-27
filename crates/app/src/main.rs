@@ -3951,8 +3951,18 @@ async fn build_shared_infra(
     // the reason the two DDLs above are. The verdict is logged inside the
     // loop (coded error on exhaustion); boot continues either way — a missing
     // key is a degraded session, a halted boot is a dark one.
-    let _live_tables_ensured =
-        tickvault_app::candle_ddl_boot::run_live_table_ddl_at_boot(&config.questdb).await;
+    //
+    // Audit PR31a (2026-09-27): when the bounded loop gives up, keep
+    // re-running the ensure in the background for this session. The
+    // `top_volume_<tf>` writer refuses to send until its tables are keyed, and
+    // a `DEDUP ENABLE` re-run is what repairs a ticks or depth table ILP
+    // auto-created without its key.
+    if !tickvault_app::candle_ddl_boot::run_live_table_ddl_at_boot(&config.questdb).await {
+        drop(tickvault_app::candle_ddl_boot::spawn_ensure_until_keyed(
+            config.questdb.clone(),
+            tickvault_app::candle_ddl_boot::DdlTables::Live,
+        ));
+    }
 
     // --- Dhan 1-minute cross-verification audit tables ---
     //
