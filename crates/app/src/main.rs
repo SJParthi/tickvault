@@ -3375,6 +3375,12 @@ const SEAL_WRITER_SHUTDOWN_BUDGET: std::time::Duration =
 static SEAL_ESCALATION_STOP: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
     std::sync::OnceLock::new();
 
+/// Seals handed to the escalation thread and not yet written (audit PR15).
+/// Read at shutdown so an abandoned queue reports how many seals it held.
+static SEAL_ESCALATION_PENDING: std::sync::OnceLock<
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+> = std::sync::OnceLock::new();
+
 /// Join handle for the `tv-seal-escalate` thread.
 static SEAL_ESCALATION_THREAD: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
     std::sync::Mutex::new(None);
@@ -3382,10 +3388,20 @@ static SEAL_ESCALATION_THREAD: std::sync::Mutex<Option<std::thread::JoinHandle<(
 /// Budget for draining the seal-escalation queue at shutdown.
 ///
 /// DERIVED, not guessed: the queue holds at most
-/// `SEAL_ESCALATION_QUEUE_DEPTH` (4,096) records of ~128 bytes, each costing
-/// one `write(2)`. On a healthy volume that is milliseconds; at a badly
-/// degraded ~1 ms/write it is ~4.1s, so 5s covers the case that actually
-/// fills the queue with a margin rather than a hairline.
+/// `SEAL_ESCALATION_QUEUE_DEPTH` records (225,000 since audit PR15, one whole
+/// close burst) of 128 bytes, written `SEAL_ESCALATION_BATCH` (1,024) per
+/// `write(2)`: ~220 writes, ~29 MB. On a healthy volume that is well under a
+/// second; at a degraded 10 ms/write it is ~2.2 s and at a degraded 20 MB/s
+/// ~1.4 s, so 5s covers both with a margin. The storage test
+/// `the_queue_depth_is_drainable_inside_the_shutdown_budget` pins both.
+///
+/// What it does NOT cover: a disk that REFUSES the batch write. Each seal of
+/// a failed batch then goes to the DLQ one record at a time (an open and a
+/// JSON line per seal), which is orders of magnitude slower, so a full queue
+/// on a failing disk does not drain in 5 s. The seals still queued at the
+/// deadline are counted on `SEAL_ESCALATION_ABANDONED_COUNTER` and named in
+/// the shutdown `error!`, never dropped silently. Unmeasured: no harness times
+/// the DLQ fallback path.
 ///
 /// Counted into the systemd `TimeoutStopSec` arithmetic by
 /// `crates/app/tests/shutdown_budget_fits_systemd_guard.rs`, which is the
@@ -3491,6 +3507,7 @@ fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConf
                      overflow will escalate inline; first installer wins"
                 );
             } else {
+                let _ = SEAL_ESCALATION_PENDING.set(sink.pending_count());
                 match std::thread::Builder::new()
                     .name("tv-seal-escalate".to_string())
                     .spawn(move || {
@@ -4680,13 +4697,22 @@ async fn run_process_runloop(
             // Reported rather than swallowed: whatever is still queued dies
             // with the process, and a loss nobody counts is the false-OK this
             // whole shutdown path was rebuilt to stop producing.
+            //
+            // Counted in SEALS since audit PR15 (the counter's own name says
+            // "seals still queued"). It used to add 1 per abandonment
+            // whatever the queue held, which read the same for one seal and
+            // for a whole 225,000-seal burst.
+            let seals_abandoned = SEAL_ESCALATION_PENDING
+                .get()
+                .map_or(0, |p| p.load(std::sync::atomic::Ordering::Relaxed));
             metrics::counter!(
                 tickvault_storage::seal_writer_runner::SEAL_ESCALATION_ABANDONED_COUNTER
             )
-            .increment(1);
+            .increment(seals_abandoned as u64);
             error!(
                 code = tickvault_common::error_code::ErrorCode::AggregatorDrop01.code_str(),
                 budget_secs = SEAL_ESCALATION_SHUTDOWN_BUDGET.as_secs(),
+                seals_abandoned,
                 "seal escalation: the queue did NOT drain within budget — exiting anyway so \
                  systemd does not SIGKILL us, but seals still queued are lost"
             );

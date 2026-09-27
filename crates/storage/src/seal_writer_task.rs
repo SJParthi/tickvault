@@ -862,6 +862,505 @@ pub fn drain_recovered_seals<S: SealSink>(
 }
 
 // ---------------------------------------------------------------------------
+// Mid-session spill replay (audit PR15, 2026-09-27)
+// ---------------------------------------------------------------------------
+//
+// ## The gap this closes
+//
+// The boot drain above is the only reader of the seal spill. A seal rescued to
+// disk at 10:05 therefore stayed out of `candles_*` until the NEXT boot, which
+// on this box is the next trading morning: a whole session of candles missing
+// from the database while the process that held them kept running. Measured
+// 2026-08-20: `spilled: 541,519` in one session.
+//
+// ## The contract
+//
+// * **Health gate.** Nothing replays until the live writer has flushed
+//   successfully and has not failed a flush for
+//   [`SEAL_REPLAY_HEALTHY_SECS`]. A failed flush — live or replay — resets the
+//   gate, so a flapping database is never fed a backlog.
+// * **Live first.** A step runs only when the live drain left the ring empty.
+//   The step itself runs on the writer's own cycle, so a live seal that
+//   arrives during a replay flush waits in the channel for at most that one
+//   flush: the replay delays the next live cycle by one bounded step, and never
+//   takes a live seal's place.
+// * **Rate cap.** At most [`SEAL_REPLAY_SEALS_PER_CYCLE`] seals per writer
+//   cycle (100 ms): ~5,000 seals a second, 541,519 in about two minutes. The
+//   figure is deliberately half the writer's measured capacity because the
+//   database's WAL apply lag was still growing on 2026-09-08 (Assumed to hold
+//   today; not re-measured).
+// * **One bad record cannot stall the file.** A replay flush that fails halves
+//   the next step (512 -> 256 -> ... -> 1) and a success doubles it back.
+//   Two failures in a row at a step of ONE record, at the same position, skip
+//   that record: it is counted as skipped, its bytes survive in `archive/`,
+//   and an `error!` names it. Each failure also resets the health gate, so
+//   isolating a poison record takes at least ten healthy minutes; a
+//   database that is merely down never reaches a step of one.
+// * **No loss while appending.** The live file is taken under the spill
+//   writer's own append lock ([`SealSpillWriter::with_appends_paused`]), so a
+//   seal appended at the same instant lands either in the staged file or in a
+//   fresh one, never in a moved inode nothing reads.
+// * **Same staging as boot.** Files move to `replaying/` and, once every
+//   record is committed, to `archive/`. A crash mid-file leaves it in
+//   `replaying/`, where the next boot (or this replay) reads it again, and the
+//   candle tables' DEDUP keys `(ts, security_id, segment, feed)` collapse the
+//   rows already written.
+// * **A failed replay flush never re-spills.** The batch is discarded and the
+//   file keeps its position, exactly as the boot drain does and for the same
+//   reason: re-spilling a replayed seal would multiply it on disk.
+//
+// ## Honest limits
+//
+// * **Last write wins.** A replayed seal UPSERTs over whatever row the tables
+//   hold for its key, exactly as the boot drain always has. If a later,
+//   amended seal for the same bar was written live before the replay reached
+//   the older one, the older one overwrites it.
+// * **The gate needs live traffic.** It opens only on clean LIVE flushes. If
+//   the last flush before the close failed, no live seal arrives afterwards
+//   to reopen it, and the spill waits for the next boot's drain.
+// * **Clock steps.** A wall clock that steps backwards restarts the gate
+//   (never opens it early), and makes a directory scan due at once.
+//
+// Only the binary spill is replayed here. The NDJSON DLQ is the last-resort
+// tier (spill itself failed) and stays with the boot drain.
+
+/// How long the live writer must flush cleanly before a replay step may run.
+pub const SEAL_REPLAY_HEALTHY_SECS: i64 = 60;
+
+/// Most spilled seals re-ingested per writer cycle (every 100 ms).
+pub const SEAL_REPLAY_SEALS_PER_CYCLE: usize = 512;
+
+/// Consecutive replay flush failures at a step of one record, at the same
+/// position, before that record is skipped as poison.
+const SEAL_REPLAY_POISON_FAILURES: u32 = 2;
+
+/// How often, while idle and healthy, the replay looks for spill files.
+pub const SEAL_REPLAY_SCAN_EVERY_SECS: i64 = 30;
+
+/// Files the replay gave up on for this process (unreadable, or the archive
+/// rename failed). Bounded so a directory of broken files cannot grow it; past
+/// the bound the replay stops looking for new files until the next boot.
+const SEAL_REPLAY_SKIP_LIMIT: usize = 64;
+
+/// What one [`MidSessionReplay::step`] did. Every field maps to a
+/// `tv_seal_replay_total{kind=...}` label emitted by the writer loop.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReplayOutcome {
+    /// Live spill files moved into `replaying/` this step.
+    pub files_staged: usize,
+    /// Spilled seals a successful flush committed to QuestDB this step.
+    pub seals_reingested: usize,
+    /// Records that could not be decoded or appended. Their bytes survive in
+    /// `archive/`.
+    pub records_skipped: usize,
+    /// Files fully replayed and moved to `archive/` this step.
+    pub files_archived: usize,
+    /// `true` when this step's flush failed. The file keeps its position and
+    /// the health gate resets.
+    pub flush_failed: bool,
+}
+
+impl ReplayOutcome {
+    /// `true` if the step did nothing at all.
+    #[must_use]
+    pub const fn is_idle(&self) -> bool {
+        self.files_staged == 0
+            && self.seals_reingested == 0
+            && self.records_skipped == 0
+            && self.files_archived == 0
+            && !self.flush_failed
+    }
+}
+
+/// The file being replayed and how far into it the database has confirmed.
+#[derive(Debug)]
+struct ReplayCursor {
+    path: PathBuf,
+    /// Byte offset of the first record not yet committed. Always a multiple
+    /// of [`SEAL_SPILL_RECORD_SIZE`].
+    offset: u64,
+    /// Records read per step, 1..=[`SEAL_REPLAY_SEALS_PER_CYCLE`]. Halved by
+    /// a failed flush, doubled by a clean one.
+    step_records: usize,
+    /// Consecutive failed flushes at a step of one record, at `offset`.
+    single_record_failures: u32,
+}
+
+impl ReplayCursor {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            offset: 0,
+            step_records: SEAL_REPLAY_SEALS_PER_CYCLE,
+            single_record_failures: 0,
+        }
+    }
+}
+
+/// Mid-session replay of the seal spill. Owned by the seal writer runner and
+/// stepped once per writer cycle, after the live drain.
+///
+/// Cold path: runs on the writer loop inside `block_in_place`, never on the
+/// frame drain. Each step opens the staged file, reads at most
+/// [`SEAL_REPLAY_SEALS_PER_CYCLE`] records into a reused buffer and flushes
+/// them once: O(records) per step, bounded by the cap.
+#[derive(Debug, Default)]
+pub struct MidSessionReplay {
+    /// Wall-clock second of the first clean live flush since the last failure.
+    healthy_since: Option<i64>,
+    /// Wall-clock second of the last directory scan.
+    last_scan: Option<i64>,
+    cursor: Option<ReplayCursor>,
+    /// Files given up on for this process. See [`SEAL_REPLAY_SKIP_LIMIT`].
+    skipped: Vec<PathBuf>,
+    /// Reused decode buffer, at most one step's worth of seals.
+    batch: Vec<BufferedSeal>,
+}
+
+impl MidSessionReplay {
+    /// Feed one live drain outcome into the health gate.
+    ///
+    /// A cycle that popped seals and did not flush them is a failure and
+    /// resets the gate. A clean flush starts the clock if it is not running.
+    /// An idle cycle says nothing about the database and changes nothing.
+    pub fn observe(&mut self, drain: &DrainOutcome, now_unix_secs: i64) {
+        // A clock that stepped backwards restarts the gate rather than
+        // leaving it shut until the clock catches up (or opening it early).
+        if self
+            .healthy_since
+            .is_some_and(|since| now_unix_secs < since)
+        {
+            self.healthy_since = Some(now_unix_secs);
+        }
+        if drain.ring_seals_popped > 0 && !drain.flushed_ok {
+            self.healthy_since = None;
+        } else if drain.flushed_ok && self.healthy_since.is_none() {
+            self.healthy_since = Some(now_unix_secs);
+        }
+    }
+
+    /// `true` once the live writer has flushed cleanly for
+    /// [`SEAL_REPLAY_HEALTHY_SECS`] with no failure since.
+    #[must_use]
+    pub fn is_healthy(&self, now_unix_secs: i64) -> bool {
+        self.healthy_since
+            .is_some_and(|since| now_unix_secs.saturating_sub(since) >= SEAL_REPLAY_HEALTHY_SECS)
+    }
+
+    /// The file currently being replayed, if any.
+    #[cfg(test)]
+    fn current_file(&self) -> Option<&Path> {
+        self.cursor.as_ref().map(|c| c.path.as_path())
+    }
+
+    /// Run one replay step.
+    ///
+    /// `ring_is_empty` is whether the live drain left the ring empty this
+    /// cycle; a step never runs behind live work.
+    pub fn step<S: SealSink>(
+        &mut self,
+        writer: &mut S,
+        spill: &crate::seal_spill::SealSpillWriter,
+        spill_dir: &Path,
+        ring_is_empty: bool,
+        now_unix_secs: i64,
+    ) -> ReplayOutcome {
+        let mut outcome = ReplayOutcome::default();
+        if !ring_is_empty || !self.is_healthy(now_unix_secs) {
+            return outcome;
+        }
+        if self.cursor.is_none() {
+            // A clock that stepped backwards makes the scan due at once.
+            let due = self.last_scan.is_none_or(|at| {
+                now_unix_secs < at
+                    || now_unix_secs.saturating_sub(at) >= SEAL_REPLAY_SCAN_EVERY_SECS
+            });
+            if !due || self.skipped.len() >= SEAL_REPLAY_SKIP_LIMIT {
+                return outcome;
+            }
+            self.last_scan = Some(now_unix_secs);
+            outcome.files_staged = stage_live_spill_files(spill, spill_dir);
+            let Some(path) = self.next_staged_file(spill_dir) else {
+                return outcome;
+            };
+            info!(
+                ?path,
+                files_staged = outcome.files_staged,
+                "seal replay: re-ingesting a spill file mid-session"
+            );
+            self.cursor = Some(ReplayCursor::new(path));
+        }
+        self.advance(writer, &mut outcome);
+        outcome
+    }
+
+    /// Oldest staged spill file not yet given up on.
+    fn next_staged_file(&self, spill_dir: &Path) -> Option<PathBuf> {
+        let replaying = spill_dir.join(SEAL_REPLAYING_SUBDIR);
+        // O(1) EXEMPT: cold directory listing, at most once per scan interval
+        let mut staged: Vec<PathBuf> = std::fs::read_dir(&replaying)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| is_seal_file(p) && staged_kind(p) == Some(StagedKind::Spill))
+            .filter(|p| !self.skipped.contains(p))
+            .collect();
+        staged.sort();
+        staged.into_iter().next()
+    }
+
+    /// Give up on the current file for this process. The next boot's drain
+    /// retries it.
+    fn skip_current(&mut self) {
+        if let Some(cursor) = self.cursor.take() {
+            self.skipped.push(cursor.path);
+            if self.skipped.len() == SEAL_REPLAY_SKIP_LIMIT {
+                error!(
+                    code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                    files_skipped = SEAL_REPLAY_SKIP_LIMIT,
+                    "seal replay: gave up on too many spill files — the replay stops for \
+                     this process and the next boot's drain retries them"
+                );
+            }
+        }
+        // Scan again at once: another file may be waiting.
+        self.last_scan = None;
+    }
+
+    /// Replay up to one step's worth of records from the cursor.
+    fn advance<S: SealSink>(&mut self, writer: &mut S, outcome: &mut ReplayOutcome) {
+        let Some(cursor) = self.cursor.as_ref() else {
+            return;
+        };
+        let path = cursor.path.clone();
+        let offset = cursor.offset;
+        let step_records = cursor.step_records;
+        let Some((records_read, at_eof)) = self.read_step(&path, offset, step_records, outcome)
+        else {
+            error!(
+                code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                ?path,
+                "seal replay: a staged spill file could not be read — left staged for the \
+                 next boot's drain"
+            );
+            self.skip_current();
+            return;
+        };
+
+        let mut appended = 0usize;
+        for seal in &self.batch {
+            if let Err(append_err) = writer.append_seal(seal) {
+                error!(
+                    code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                    ?append_err,
+                    security_id = seal.security_id,
+                    "seal replay: append failed for a spilled seal"
+                );
+                outcome.records_skipped += 1;
+                continue;
+            }
+            appended += 1;
+        }
+        if appended > 0 {
+            if let Err(flush_err) = writer.flush() {
+                writer.discard_pending();
+                outcome.flush_failed = true;
+                self.healthy_since = None;
+                self.on_replay_flush_failed(&path, offset, &flush_err, outcome);
+                return;
+            }
+            outcome.seals_reingested += appended;
+        }
+
+        let consumed =
+            u64::try_from(records_read.saturating_mul(SEAL_SPILL_RECORD_SIZE)).unwrap_or(u64::MAX);
+        if let Some(cursor) = self.cursor.as_mut() {
+            cursor.offset = cursor.offset.saturating_add(consumed);
+            cursor.single_record_failures = 0;
+            cursor.step_records = cursor
+                .step_records
+                .saturating_mul(2)
+                .min(SEAL_REPLAY_SEALS_PER_CYCLE);
+        }
+        if at_eof {
+            match archive_staged(&path) {
+                Ok(()) => {
+                    outcome.files_archived += 1;
+                    info!(?path, "seal replay: spill file re-ingested and archived");
+                    self.cursor = None;
+                    self.last_scan = None;
+                }
+                Err(err) => {
+                    // Committed but not archived. Replaying it again would
+                    // only rewrite the same rows, so leave it for the boot.
+                    warn!(?path, ?err, "seal replay: archive rename failed");
+                    self.skip_current();
+                }
+            }
+        }
+    }
+
+    /// A replay flush failed: the file keeps its position and the next step
+    /// reads half as many records, so a single record the database refuses is
+    /// isolated instead of failing every step of the file forever. At a step
+    /// of one record, [`SEAL_REPLAY_POISON_FAILURES`] failures in a row at the
+    /// same position skip that record.
+    fn on_replay_flush_failed(
+        &mut self,
+        path: &Path,
+        offset: u64,
+        flush_err: &anyhow::Error,
+        outcome: &mut ReplayOutcome,
+    ) {
+        let Some(cursor) = self.cursor.as_mut() else {
+            return;
+        };
+        if cursor.step_records > 1 {
+            cursor.step_records /= 2;
+            error!(
+                code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                ?flush_err,
+                ?path,
+                offset,
+                next_step_records = cursor.step_records,
+                "seal replay: flush failed — the file keeps its place, the next step reads \
+                 half as many records, and the replay waits for the database to be healthy \
+                 again"
+            );
+            return;
+        }
+        cursor.single_record_failures = cursor.single_record_failures.saturating_add(1);
+        if cursor.single_record_failures < SEAL_REPLAY_POISON_FAILURES {
+            error!(
+                code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                ?flush_err,
+                ?path,
+                offset,
+                "seal replay: flush of a single spilled seal failed — retrying it once more \
+                 after the database is healthy again"
+            );
+            return;
+        }
+        let record_bytes = u64::try_from(SEAL_SPILL_RECORD_SIZE).unwrap_or(u64::MAX);
+        cursor.offset = cursor.offset.saturating_add(record_bytes);
+        cursor.single_record_failures = 0;
+        outcome.records_skipped += 1;
+        error!(
+            code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+            ?flush_err,
+            ?path,
+            offset,
+            "seal replay: the database refused this one spilled seal in every attempt — \
+             skipped; its bytes stay in the file, which moves to archive/"
+        );
+    }
+
+    /// Decode up to `step_records` records starting at `offset` into
+    /// `self.batch`. Returns `(records consumed, reached end of file)`, or
+    /// `None` when the file cannot be opened, positioned or read.
+    ///
+    /// A torn trailing record (fewer than 128 bytes) ends the file, exactly as
+    /// in [`read_staged_spill`]: nothing is appended to a staged file, so a
+    /// short tail can only be a write that never completed. Any OTHER read
+    /// error is not an end of file and returns `None`, so the file is left
+    /// staged for the boot drain rather than archived half-read.
+    fn read_step(
+        &mut self,
+        path: &Path,
+        offset: u64,
+        step_records: usize,
+        outcome: &mut ReplayOutcome,
+    ) -> Option<(usize, bool)> {
+        use std::io::Seek;
+        let mut file = std::fs::File::open(path).ok()?;
+        file.seek(std::io::SeekFrom::Start(offset)).ok()?;
+        let mut reader = BufReader::new(file);
+        self.batch.clear();
+        let mut buf = [0u8; SEAL_SPILL_RECORD_SIZE];
+        let mut records_read = 0usize;
+        while records_read < step_records {
+            match reader.read_exact(&mut buf) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    return Some((records_read, true));
+                }
+                Err(err) => {
+                    warn!(
+                        ?path,
+                        ?err,
+                        "seal replay: read error in a staged spill file"
+                    );
+                    self.batch.clear();
+                    return None;
+                }
+            }
+            records_read += 1;
+            // The same format-version gate as the boot drain.
+            if buf[7] != SEAL_SPILL_FORMAT_VERSION {
+                outcome.records_skipped += 1;
+                continue;
+            }
+            match SerializedSeal::from_bytes(&buf).and_then(|s| s.try_into_buffered_seal()) {
+                Some(seal) => self.batch.push(seal),
+                None => outcome.records_skipped += 1,
+            }
+        }
+        // Exactly one step's worth read: the file may end right here, which
+        // the next step discovers with a zero-record read.
+        Some((records_read, false))
+    }
+}
+
+/// Moves every live `.bin` seal spill file in `spill_dir` into `replaying/`,
+/// with appends paused, and returns how many moved.
+///
+/// The directory is created and listed WITHOUT the append lock; only the
+/// renames run under it, so an appender waits for a handful of `rename(2)`
+/// calls at most. A file created after the listing is staged by the next scan.
+fn stage_live_spill_files(spill: &crate::seal_spill::SealSpillWriter, spill_dir: &Path) -> usize {
+    let live = live_spill_files(spill_dir);
+    if live.is_empty() {
+        return 0;
+    }
+    let replaying = spill_dir.join(SEAL_REPLAYING_SUBDIR);
+    if let Err(err) = std::fs::create_dir_all(&replaying) {
+        warn!(
+            ?replaying,
+            ?err,
+            "seal replay: cannot create the staging dir"
+        );
+        return 0;
+    }
+    spill.with_appends_paused(|| {
+        let mut moved = 0usize;
+        for path in &live {
+            let Some(name) = path.file_name() else {
+                continue;
+            };
+            let target = free_path(&replaying, name);
+            match std::fs::rename(path, &target) {
+                Ok(()) => moved += 1,
+                Err(err) => warn!(?path, ?err, "seal replay: cannot stage a spill file"),
+            }
+        }
+        moved
+    })
+}
+
+/// Every live `.bin` seal spill file directly in `spill_dir`.
+fn live_spill_files(spill_dir: &Path) -> Vec<PathBuf> {
+    // O(1) EXEMPT: cold directory listing, at most once per scan interval
+    std::fs::read_dir(spill_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| is_seal_file(p) && staged_kind(p) == Some(StagedKind::Spill))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1558,6 +2057,544 @@ mod tests {
         assert_eq!(drained[1].security_id, 13);
         assert_eq!(drained[1].exchange_segment_code, 1);
         assert_eq!(drained[1].close, 200.0);
+        cleanup(&spill, &dlq);
+    }
+
+    // -----------------------------------------------------------------------
+    // Mid-session spill replay (audit PR15)
+    // -----------------------------------------------------------------------
+
+    /// A sink that records what it committed and can be told to fail flushes.
+    #[derive(Default)]
+    struct ReplaySink {
+        pending: Vec<u32>,
+        committed: Vec<u32>,
+        fail_flushes: usize,
+        flushes: usize,
+        /// A bucket the database refuses: any flush carrying it fails.
+        poison: Option<u32>,
+    }
+
+    impl SealSink for ReplaySink {
+        fn append_seal(&mut self, seal: &BufferedSeal) -> anyhow::Result<()> {
+            self.pending.push(seal.state.bucket_start_ist_secs);
+            Ok(())
+        }
+        fn flush(&mut self) -> anyhow::Result<()> {
+            self.flushes += 1;
+            if self.fail_flushes > 0 {
+                self.fail_flushes -= 1;
+                anyhow::bail!("injected flush failure");
+            }
+            if self.poison.is_some_and(|p| self.pending.contains(&p)) {
+                anyhow::bail!("injected poison row");
+            }
+            self.committed.append(&mut self.pending);
+            Ok(())
+        }
+        fn discard_pending(&mut self) {
+            self.pending.clear();
+        }
+    }
+
+    fn healthy_drain() -> DrainOutcome {
+        DrainOutcome {
+            ring_seals_popped: 1,
+            flushed_ok: true,
+            ..DrainOutcome::default()
+        }
+    }
+
+    fn failed_drain() -> DrainOutcome {
+        DrainOutcome {
+            ring_seals_popped: 1,
+            flushed_ok: false,
+            ..DrainOutcome::default()
+        }
+    }
+
+    fn spill_n(writer: &crate::seal_spill::SealSpillWriter, n: u32, now: i64) {
+        for i in 0..n {
+            let seal = SerializedSeal::from(&mk_seal(13, 0, TfIndex::M1, i, 101.5));
+            writer.append_seal(&seal, now).expect("spill append");
+        }
+    }
+
+    fn count_bin(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .filter(|e| is_seal_file(&e.path()))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn replay_waits_for_sixty_seconds_of_clean_flushes() {
+        let (spill, dlq) = temp_pair("replay-health-gate");
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let t0 = jan1_noon_utc();
+        spill_n(&writer, 10, t0);
+        let mut replay = MidSessionReplay::default();
+        let mut sink = ReplaySink::default();
+
+        // Nothing observed yet: no clock, no replay.
+        assert!(
+            replay
+                .step(&mut sink, &writer, &spill, true, t0 + 600)
+                .is_idle()
+        );
+        replay.observe(&healthy_drain(), t0);
+        assert!(
+            replay
+                .step(
+                    &mut sink,
+                    &writer,
+                    &spill,
+                    true,
+                    t0 + SEAL_REPLAY_HEALTHY_SECS - 1
+                )
+                .is_idle(),
+            "59 healthy seconds are not 60"
+        );
+        assert_eq!(
+            count_bin(&spill),
+            1,
+            "the live file is untouched before the gate opens"
+        );
+
+        let out = replay.step(
+            &mut sink,
+            &writer,
+            &spill,
+            true,
+            t0 + SEAL_REPLAY_HEALTHY_SECS,
+        );
+        assert_eq!(out.files_staged, 1);
+        assert_eq!(out.seals_reingested, 10);
+        assert_eq!(out.files_archived, 1);
+        assert_eq!(sink.committed, (0..10).collect::<Vec<_>>());
+        assert_eq!(count_bin(&spill.join(SEAL_ARCHIVE_SUBDIR)), 1);
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn a_failed_live_flush_resets_the_health_gate() {
+        let t0 = jan1_noon_utc();
+        let mut replay = MidSessionReplay::default();
+        replay.observe(&healthy_drain(), t0);
+        assert!(replay.is_healthy(t0 + 60));
+        replay.observe(&failed_drain(), t0 + 61);
+        assert!(
+            !replay.is_healthy(t0 + 200),
+            "a failure must restart the clock"
+        );
+        // An idle cycle says nothing about the database.
+        replay.observe(&DrainOutcome::default(), t0 + 62);
+        assert!(!replay.is_healthy(t0 + 300));
+        replay.observe(&healthy_drain(), t0 + 400);
+        assert!(!replay.is_healthy(t0 + 459));
+        assert!(replay.is_healthy(t0 + 460));
+    }
+
+    #[test]
+    fn replay_never_runs_behind_live_work() {
+        let (spill, dlq) = temp_pair("replay-live-first");
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let t0 = jan1_noon_utc();
+        spill_n(&writer, 5, t0);
+        let mut replay = MidSessionReplay::default();
+        let mut sink = ReplaySink::default();
+        replay.observe(&healthy_drain(), t0);
+        assert!(
+            replay
+                .step(&mut sink, &writer, &spill, false, t0 + 120)
+                .is_idle(),
+            "a ring with live seals waiting must not be delayed by a replay"
+        );
+        assert_eq!(count_bin(&spill), 1);
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn replay_is_rate_capped_per_step() {
+        let (spill, dlq) = temp_pair("replay-rate-cap");
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let t0 = jan1_noon_utc();
+        let total = u32::try_from(SEAL_REPLAY_SEALS_PER_CYCLE * 2 + 452).expect("fits");
+        spill_n(&writer, total, t0);
+        let mut replay = MidSessionReplay::default();
+        let mut sink = ReplaySink::default();
+        replay.observe(&healthy_drain(), t0);
+        let now = t0 + 60;
+
+        let first = replay.step(&mut sink, &writer, &spill, true, now);
+        assert_eq!(first.seals_reingested, SEAL_REPLAY_SEALS_PER_CYCLE);
+        assert_eq!(first.files_archived, 0);
+        let second = replay.step(&mut sink, &writer, &spill, true, now);
+        assert_eq!(second.seals_reingested, SEAL_REPLAY_SEALS_PER_CYCLE);
+        let third = replay.step(&mut sink, &writer, &spill, true, now);
+        assert_eq!(third.seals_reingested, 452);
+        assert_eq!(third.files_archived, 1);
+        assert_eq!(sink.flushes, 3, "one flush per step");
+        assert_eq!(sink.committed, (0..total).collect::<Vec<_>>());
+        assert!(replay.current_file().is_none());
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn a_failed_replay_flush_keeps_the_position_and_waits_for_health() {
+        let (spill, dlq) = temp_pair("replay-flush-fail");
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let t0 = jan1_noon_utc();
+        let total = u32::try_from(SEAL_REPLAY_SEALS_PER_CYCLE + 10).expect("fits");
+        spill_n(&writer, total, t0);
+        let mut replay = MidSessionReplay::default();
+        let mut sink = ReplaySink::default();
+        replay.observe(&healthy_drain(), t0);
+
+        let ok = replay.step(&mut sink, &writer, &spill, true, t0 + 60);
+        assert_eq!(ok.seals_reingested, SEAL_REPLAY_SEALS_PER_CYCLE);
+        sink.fail_flushes = 1;
+        let failed = replay.step(&mut sink, &writer, &spill, true, t0 + 60);
+        assert!(failed.flush_failed);
+        assert_eq!(failed.seals_reingested, 0);
+        assert!(
+            sink.pending.is_empty(),
+            "the failed batch must be discarded, not retained"
+        );
+        assert!(!replay.is_healthy(t0 + 61));
+        assert!(
+            replay
+                .step(&mut sink, &writer, &spill, true, t0 + 100)
+                .is_idle(),
+            "no replay until the database is healthy again"
+        );
+        let staged = replay
+            .current_file()
+            .expect("the file keeps its place")
+            .to_path_buf();
+        assert!(staged.exists(), "a failed flush must leave the file staged");
+        assert_eq!(
+            count_bin(&spill),
+            0,
+            "a failed replay must never re-spill what it read"
+        );
+
+        replay.observe(&healthy_drain(), t0 + 200);
+        let resumed = replay.step(&mut sink, &writer, &spill, true, t0 + 260);
+        assert_eq!(
+            resumed.seals_reingested, 10,
+            "resumes at the first uncommitted record"
+        );
+        assert_eq!(resumed.files_archived, 1);
+        assert_eq!(
+            sink.committed,
+            (0..total).collect::<Vec<_>>(),
+            "each seal committed once"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    /// Drive the replay until it archives the file or `max_steps` run out,
+    /// reopening the health gate after every failed step exactly as a healthy
+    /// live writer would. Returns the summed outcome.
+    fn run_replay_to_end(
+        replay: &mut MidSessionReplay,
+        sink: &mut ReplaySink,
+        writer: &crate::seal_spill::SealSpillWriter,
+        spill: &Path,
+        mut now: i64,
+        max_steps: usize,
+    ) -> ReplayOutcome {
+        let mut total = ReplayOutcome::default();
+        replay.observe(&healthy_drain(), now);
+        for _ in 0..max_steps {
+            now += SEAL_REPLAY_HEALTHY_SECS;
+            let step = replay.step(sink, writer, spill, true, now);
+            total.seals_reingested += step.seals_reingested;
+            total.records_skipped += step.records_skipped;
+            total.files_archived += step.files_archived;
+            if step.flush_failed {
+                replay.observe(&healthy_drain(), now);
+            }
+            if total.files_archived > 0 {
+                break;
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn one_poison_record_is_isolated_and_skipped_and_every_other_record_lands() {
+        let (spill, dlq) = temp_pair("replay-poison");
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let t0 = jan1_noon_utc();
+        let total = u32::try_from(SEAL_REPLAY_SEALS_PER_CYCLE + 300).expect("fits");
+        spill_n(&writer, total, t0);
+        let poison = 777;
+        let mut replay = MidSessionReplay::default();
+        let mut sink = ReplaySink {
+            poison: Some(poison),
+            ..ReplaySink::default()
+        };
+
+        let sum = run_replay_to_end(&mut replay, &mut sink, &writer, &spill, t0, 200);
+
+        assert_eq!(
+            sum.files_archived, 1,
+            "the file must not stall on one bad row"
+        );
+        assert_eq!(
+            sum.records_skipped, 1,
+            "exactly the poison record is skipped"
+        );
+        let expected: Vec<u32> = (0..total).filter(|b| *b != poison).collect();
+        assert_eq!(
+            sink.committed, expected,
+            "every other record lands, in order"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn a_failed_replay_flush_halves_the_next_step_and_a_success_doubles_it() {
+        let (spill, dlq) = temp_pair("replay-step-halving");
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let t0 = jan1_noon_utc();
+        let total = u32::try_from(SEAL_REPLAY_SEALS_PER_CYCLE * 4).expect("fits");
+        spill_n(&writer, total, t0);
+        let mut replay = MidSessionReplay::default();
+        let mut sink = ReplaySink {
+            fail_flushes: 1,
+            ..ReplaySink::default()
+        };
+        replay.observe(&healthy_drain(), t0);
+        assert!(
+            replay
+                .step(&mut sink, &writer, &spill, true, t0 + 60)
+                .flush_failed
+        );
+
+        replay.observe(&healthy_drain(), t0 + 100);
+        let half = replay.step(&mut sink, &writer, &spill, true, t0 + 160);
+        assert_eq!(half.seals_reingested, SEAL_REPLAY_SEALS_PER_CYCLE / 2);
+        let full = replay.step(&mut sink, &writer, &spill, true, t0 + 160);
+        assert_eq!(full.seals_reingested, SEAL_REPLAY_SEALS_PER_CYCLE);
+        let capped = replay.step(&mut sink, &writer, &spill, true, t0 + 160);
+        assert_eq!(
+            capped.seals_reingested, SEAL_REPLAY_SEALS_PER_CYCLE,
+            "doubling never goes past the rate cap"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn a_database_that_keeps_failing_never_skips_a_record() {
+        // Every flush fails: the step halves down to one record, and the
+        // single-record failures are counted, but the gate resets on each so
+        // the file is never given up on while the writer is not healthy.
+        let (spill, dlq) = temp_pair("replay-never-skip-while-down");
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let t0 = jan1_noon_utc();
+        spill_n(&writer, 50, t0);
+        let mut replay = MidSessionReplay::default();
+        let mut sink = ReplaySink {
+            fail_flushes: usize::MAX,
+            ..ReplaySink::default()
+        };
+        replay.observe(&healthy_drain(), t0);
+        let first = replay.step(&mut sink, &writer, &spill, true, t0 + 60);
+        assert!(first.flush_failed);
+        // The live writer is failing too: no healthy drain is observed, so
+        // the replay never runs again, whatever the clock says.
+        replay.observe(&failed_drain(), t0 + 61);
+        for minute in 2..30 {
+            let step = replay.step(&mut sink, &writer, &spill, true, t0 + minute * 60);
+            assert!(step.is_idle(), "a failing database is never fed a backlog");
+        }
+        assert_eq!(sink.flushes, 1);
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn test_is_healthy_needs_a_clean_flush_and_sixty_seconds() {
+        let t0 = jan1_noon_utc();
+        let mut replay = MidSessionReplay::default();
+        assert!(!replay.is_healthy(t0), "no flush seen yet");
+        replay.observe(&healthy_drain(), t0);
+        assert!(!replay.is_healthy(t0 + SEAL_REPLAY_HEALTHY_SECS - 1));
+        assert!(replay.is_healthy(t0 + SEAL_REPLAY_HEALTHY_SECS));
+        replay.observe(&failed_drain(), t0 + SEAL_REPLAY_HEALTHY_SECS);
+        assert!(!replay.is_healthy(t0 + 10 * SEAL_REPLAY_HEALTHY_SECS));
+    }
+
+    #[test]
+    fn a_clock_that_steps_backwards_restarts_the_gate_and_makes_a_scan_due() {
+        let t0 = jan1_noon_utc();
+        let mut replay = MidSessionReplay::default();
+        replay.observe(&healthy_drain(), t0);
+        assert!(replay.is_healthy(t0 + 60));
+        // The clock jumps back an hour.
+        let back = t0 - 3_600;
+        replay.observe(&healthy_drain(), back);
+        assert!(!replay.is_healthy(back + 59), "never opens early");
+        assert!(
+            replay.is_healthy(back + 60),
+            "reopens after sixty seconds of the new clock, not after an hour"
+        );
+
+        let (spill, dlq) = temp_pair("replay-clock-back");
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let mut sink = ReplaySink::default();
+        // A scan at t0 finds nothing and records the scan time.
+        replay.observe(&healthy_drain(), t0);
+        assert!(
+            replay
+                .step(&mut sink, &writer, &spill, true, t0 + 60)
+                .is_idle()
+        );
+        spill_n(&writer, 3, t0);
+        // Back in time: the scan is due at once rather than in an hour.
+        replay.observe(&healthy_drain(), back);
+        let step = replay.step(&mut sink, &writer, &spill, true, back + 60);
+        assert_eq!(step.seals_reingested, 3);
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn replay_skips_records_from_another_format_version_and_still_archives() {
+        let (spill, dlq) = temp_pair("replay-version-gate");
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let t0 = jan1_noon_utc();
+        spill_n(&writer, 3, t0);
+        // Append a record claiming an older format, then two good ones.
+        let path = writer.spill_path(t0);
+        let mut stale = SerializedSeal::from(&mk_seal(13, 0, TfIndex::M1, 99, 1.0)).to_bytes();
+        stale[7] = SEAL_SPILL_FORMAT_VERSION.wrapping_sub(1);
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("open");
+            f.write_all(&stale).expect("write");
+        }
+        let mut replay = MidSessionReplay::default();
+        let mut sink = ReplaySink::default();
+        replay.observe(&healthy_drain(), t0);
+        let out = replay.step(&mut sink, &writer, &spill, true, t0 + 60);
+        assert_eq!(out.seals_reingested, 3);
+        assert_eq!(out.records_skipped, 1);
+        assert_eq!(out.files_archived, 1);
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn replay_treats_a_torn_tail_as_the_end_of_the_file() {
+        // Nothing appends to a staged file, so a short tail can only be a
+        // write that never completed: the whole records before it are
+        // re-ingested and the file is archived.
+        let (spill, dlq) = temp_pair("replay-torn-tail");
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let t0 = jan1_noon_utc();
+        spill_n(&writer, 3, t0);
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(writer.spill_path(t0))
+                .expect("open");
+            f.write_all(&[9u8; 50]).expect("torn bytes");
+        }
+        let mut replay = MidSessionReplay::default();
+        let mut sink = ReplaySink::default();
+        replay.observe(&healthy_drain(), t0);
+        let out = replay.step(&mut sink, &writer, &spill, true, t0 + 60);
+        assert_eq!(out.seals_reingested, 3);
+        assert_eq!(out.files_archived, 1);
+        assert_eq!(sink.committed, vec![0, 1, 2]);
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn replay_scans_at_most_once_per_interval_while_idle() {
+        let (spill, dlq) = temp_pair("replay-scan-interval");
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let t0 = jan1_noon_utc();
+        let mut replay = MidSessionReplay::default();
+        let mut sink = ReplaySink::default();
+        replay.observe(&healthy_drain(), t0);
+        // First scan finds nothing.
+        assert!(
+            replay
+                .step(&mut sink, &writer, &spill, true, t0 + 60)
+                .is_idle()
+        );
+        spill_n(&writer, 4, t0);
+        assert!(
+            replay
+                .step(
+                    &mut sink,
+                    &writer,
+                    &spill,
+                    true,
+                    t0 + 60 + SEAL_REPLAY_SCAN_EVERY_SECS - 1
+                )
+                .is_idle(),
+            "the directory is not re-read inside the scan interval"
+        );
+        let out = replay.step(
+            &mut sink,
+            &writer,
+            &spill,
+            true,
+            t0 + 60 + SEAL_REPLAY_SCAN_EVERY_SECS,
+        );
+        assert_eq!(out.seals_reingested, 4);
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn staging_the_live_file_while_appends_race_loses_no_seal() {
+        // The no-loss contract of `with_appends_paused`: an appender racing
+        // the stage lands every record either in a staged file or in the
+        // fresh live file, never in a moved inode nothing reads.
+        let (spill, dlq) = temp_pair("replay-stage-race");
+        let writer = std::sync::Arc::new(
+            crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone()),
+        );
+        let t0 = jan1_noon_utc();
+        const TOTAL: u32 = 20_000;
+        let appender = {
+            let writer = std::sync::Arc::clone(&writer);
+            std::thread::spawn(move || spill_n(&writer, TOTAL, t0))
+        };
+        let mut staged = 0usize;
+        while !appender.is_finished() {
+            staged += stage_live_spill_files(&writer, &spill);
+        }
+        appender.join().expect("appender must not panic");
+        staged += stage_live_spill_files(&writer, &spill);
+        assert!(staged >= 1);
+
+        let replaying = spill.join(SEAL_REPLAYING_SUBDIR);
+        let mut bytes = 0u64;
+        for entry in std::fs::read_dir(&replaying)
+            .expect("staging dir")
+            .flatten()
+        {
+            let len = entry.metadata().expect("meta").len();
+            assert_eq!(len % SEAL_SPILL_RECORD_SIZE as u64, 0, "no torn record");
+            bytes += len;
+        }
+        assert_eq!(count_bin(&spill), 0, "everything was staged");
+        assert_eq!(
+            bytes,
+            u64::from(TOTAL) * SEAL_SPILL_RECORD_SIZE as u64,
+            "every appended seal must be in a staged file"
+        );
         cleanup(&spill, &dlq);
     }
 }
