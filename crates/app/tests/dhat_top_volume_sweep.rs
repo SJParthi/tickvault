@@ -27,7 +27,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 use tickvault_app::top_volume_sweep::{SliceRadixSort, TOP_VOLUME_SWEEP_STEP_ROWS};
 use tickvault_app::volume_leaderboard::{
     GainerVerdict, GainerWalk, MAX_TRACKED_CONTRACTS, OptionFamily, RankedContract,
-    VolumeLeaderboard, board_order, board_radix_key,
+    VolumeLeaderboard, WindowRead, board_order, board_radix_key,
 };
 use tickvault_common::types::ExchangeSegment;
 use tickvault_storage::top_volume_rank_persistence::SnapshotCadence;
@@ -69,13 +69,40 @@ fn dhat_top_volume_sweep_begin_and_steps_zero_allocation() {
         for id in 0..CONTRACTS {
             let volume = 1_000 + *round * (1 + (id as u32 % 97));
             let _ = lb.observe(contract(id, volume), OptionFamily::Stock);
+            // The fold's seal of the window, copied into the leaderboard's
+            // sealed-window history (audit PR4c-2 review): O(1), in-place.
+            lb.record_sealed_window(
+                OptionFamily::Stock,
+                (id, ExchangeSegment::NseFno),
+                SnapshotCadence::OneSecond,
+                *round,
+                u64::from(1 + (id as u32 % 97)),
+            );
         }
         rows.clear();
+        let round_now: &u32 = round;
         let _ = lb.begin_sweep(OptionFamily::Stock, SnapshotCadence::OneSecond);
         while !lb.sweep_step(
             OptionFamily::Stock,
             SnapshotCadence::OneSecond,
             TOP_VOLUME_SWEEP_STEP_ROWS,
+            // Half the keys read as still trading in a later window, so the
+            // re-push onto the work list (audit PR4c-2) runs inside the
+            // measured region too. A third read as sealed over in the fold,
+            // so the sealed-window history lookup runs there as well.
+            |c| {
+                if c.security_id % 3 == 0 {
+                    WindowRead::Missing {
+                        later_activity: c.security_id % 2 == 0,
+                        window_open_ist_secs: *round_now,
+                    }
+                } else {
+                    WindowRead::Bar {
+                        volume: u64::from(c.volume),
+                        later_activity: c.security_id % 2 == 0,
+                    }
+                }
+            },
             |c| Some(c.lot_size.max(1)),
             |_| true,
             rows,
@@ -95,6 +122,11 @@ fn dhat_top_volume_sweep_begin_and_steps_zero_allocation() {
     // Warm: the first sweep sizes the gainer memo.
     sweep(&mut lb, &mut rows, &mut sorter, &mut walk, &mut round);
     assert_eq!(rows.len(), CONTRACTS as usize, "every contract traded");
+    assert_eq!(
+        lb.window_bars_missing(OptionFamily::Stock),
+        0,
+        "every sealed-over key was ranked from the history"
+    );
 
     let _profiler = dhat::Profiler::builder().testing().build();
     let (bytes, blocks) = dhat_support::measure_with_phantom_retry(
