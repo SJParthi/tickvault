@@ -5470,7 +5470,7 @@ mod tests {
     /// volume its seal left in the leaderboard ranks it anyway, until
     /// `SEALED_WINDOW_HISTORY` later windows have written over it.
     #[test]
-    fn test_sealed_window_history_ranks_a_contract_the_fold_sealed_over() {
+    fn test_record_sealed_window_ranks_a_contract_the_fold_sealed_over() {
         const W: u32 = 1_790_000_000;
         let mut lb = VolumeLeaderboard::new();
         observe_no_receipt(&mut lb, stock(4, 100, 1_000), OptionFamily::Stock);
