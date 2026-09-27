@@ -72,7 +72,7 @@ metrics-exporter-prometheus = "=0.18.3"
 # see .claude/plans/research/dep-decisions.md §1, dependabot PR #938 post-mortem).
 opentelemetry = "=0.32.0"
 opentelemetry_sdk = { version = "=0.32.1", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "=0.32.0", features = ["grpc-tonic"] }
+opentelemetry-otlp = { version = "=0.33.0", features = ["grpc-tonic"] }
 
 # ---- Section 5: Observability — Tracing ----
 tracing = "=0.1.44"
