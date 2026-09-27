@@ -398,7 +398,7 @@ Order of work: PR20 goes NEXT, ahead of PR15, because it can delete SEBI rows. T
 PR22 → PR15 → PR16 → PR17 → PR23 → PR24, then PR5–PR14 (with the additions folded in below),
 PR25–PR27, PR18, PR19 and the decisions. One PR open at a time, as before.
 
-- [ ] **PR20 — the operator console can never delete SEBI rows.** (`aws-lambdas`)
+- [x] **PR20 — the operator console can never delete SEBI rows.** (`aws-lambdas`)
   - Docker reset and a bare nuke delete the whole database volume, SEBI tables included, when
     QuestDB does not answer; the SEBI export is skipped with one printed line
     (operator_control_action_commands.rs:90-92, :165-167). Daily-universe Quote 25 REJECTs
@@ -407,6 +407,14 @@ PR25–PR27, PR18, PR19 and the decisions. One PR open at a time, as before.
   - The destructive-action lock is 09:15–15:40 but the rule says 09:00–15:45
     (operator_control.rs:63, :79, :166-174). Widen it to the rule's window and pin the two
     constants with a guard test.
+  - Done 2026-09-27: `DOCKER_RESET_COMMANDS` / `DOCKER_NUKE_BARE_COMMANDS` preserve step. An
+    unreachable QuestDB, or a SEBI table behind on its WAL, is copied raw off the stopped volume
+    (verified by file count and bytes, restart fingerprinted) instead of stopping the action, so
+    the action stays the remedy for a wedged QuestDB; every unproven step goes through
+    `sebi_abort` (LAMBDA-PORTAL-01, SNS page, app re-enabled). The box re-checks the lock before
+    the first deletion. `is_data_destructive_locked` + `DATA_DESTRUCTIVE_LOCK_{OPEN,CLOSE}_SECS`
+    (09:00–15:45 every day). Tests: `destructive_actions_export_the_sebi_tables_before_destroying_the_volume`,
+    `test_is_data_destructive_locked_boundaries`, `test_data_destructive_lock_window_matches_the_rule_file`.
 - [ ] **PR21 — after an 805, nothing dials another depth socket.** (`app`, `core`)
   - Only `depth_rebalance.rs:1205` checks `ROTATION_HALTED`; the morning depth attach and the
     contract top-up keep dialling, and each extra socket makes Dhan close a healthy sibling
