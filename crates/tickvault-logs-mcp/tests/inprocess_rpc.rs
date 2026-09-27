@@ -174,17 +174,23 @@ fn spawn_mock_http() -> u16 {
                 }
                 let text = String::from_utf8_lossy(&req);
                 let path = text.split_whitespace().nth(1).unwrap_or("/").to_string();
-                let (status_line, ctype, body): (&str, &str, String) = if path
-                    .starts_with("/exec?query=SELECT")
+                let (status_line, ctype, body): (&str, &str, String) = if path.contains("hugebody")
                 {
+                    // One byte over the tool's 8 MiB reply ceiling.
+                    (
+                        "200 OK",
+                        "application/json",
+                        "a".repeat(8 * 1024 * 1024 + 1),
+                    )
+                } else if path.contains("badjson") {
+                    ("200 OK", "application/json", "not-a-json-body".to_string())
+                } else if path.starts_with("/exec?query=SELECT") {
                     (
                         "200 OK",
                         "application/json",
                         r#"{"query":"SELECT 1","columns":[{"name":"1","type":"INT"}],"dataset":[[1]],"count":1}"#
                             .to_string(),
                     )
-                } else if path.starts_with("/exec?query=BADJSON") {
-                    ("200 OK", "application/json", "not-a-json-body".to_string())
                 } else if path.starts_with("/exec") {
                     (
                         "400 Bad Request",
@@ -822,10 +828,14 @@ fn questdb_sql_and_tickvault_api_against_local_mock() {
         let out = inner_result(&resp);
         assert_eq!(out["ok"], true);
         assert_eq!(out["response"]["count"], 1);
+        // The row cap reached the database; the caller's text is echoed.
+        assert_eq!(out["query"], "SELECT 1");
+        assert_eq!(out["sent_query"], "SELECT 1 LIMIT 1000");
     }
     {
         let _env = EnvGuard::set(&[("TICKVAULT_QUESTDB_URL", base.as_str())]);
-        let resp = call_tool_via_line(&ctx, 2, "questdb_sql", json!({"query": "BAD"}));
+        // Passes the gate (lowercase first word), and the mock answers 400.
+        let resp = call_tool_via_line(&ctx, 2, "questdb_sql", json!({"query": "select 400"}));
         let out = inner_result(&resp);
         assert_eq!(out["ok"], false);
         assert_eq!(out["error"], "HTTP Error 400: Bad Request");
@@ -834,10 +844,45 @@ fn questdb_sql_and_tickvault_api_against_local_mock() {
         let _env = EnvGuard::set(&[("TICKVAULT_QUESTDB_URL", base.as_str())]);
         // 200 OK with a non-JSON body must degrade to a graceful decode
         // error, never a panic.
-        let resp = call_tool_via_line(&ctx, 3, "questdb_sql", json!({"query": "BADJSON"}));
+        let resp = call_tool_via_line(&ctx, 3, "questdb_sql", json!({"query": "select badjson"}));
         let out = inner_result(&resp);
         assert_eq!(out["ok"], false);
         assert!(out["error"].is_string());
+    }
+    {
+        let _env = EnvGuard::set(&[("TICKVAULT_QUESTDB_URL", base.as_str())]);
+        // A reply one byte over the ceiling is refused, not parsed or passed on.
+        let resp = call_tool_via_line(&ctx, 6, "questdb_sql", json!({"query": "select hugebody"}));
+        let out = inner_result(&resp);
+        assert_eq!(out["ok"], false);
+        assert!(
+            out["error"]
+                .as_str()
+                .expect("error is a string")
+                .starts_with("reply larger than 8 MiB"),
+            "{out}"
+        );
+    }
+    {
+        let _env = EnvGuard::set(&[("TICKVAULT_QUESTDB_URL", base.as_str())]);
+        // Non-read statements never reach the database: the mock would
+        // answer them 400, but the gate answers first.
+        for (id, q) in [
+            (7, "BAD"),
+            (8, "drop table ticks"),
+            (9, "truncate table ticks"),
+        ] {
+            let resp = call_tool_via_line(&ctx, id, "questdb_sql", json!({"query": q}));
+            let out = inner_result(&resp);
+            assert_eq!(out["ok"], false, "{q}");
+            assert!(
+                out["error"]
+                    .as_str()
+                    .expect("error is a string")
+                    .starts_with("refused: this tool is read-only"),
+                "{q}: {out}"
+            );
+        }
     }
     {
         let dead_url = format!("http://127.0.0.1:{}", closed_port());
@@ -859,6 +904,15 @@ fn questdb_sql_and_tickvault_api_against_local_mock() {
         let _env = EnvGuard::set(&[("TICKVAULT_API_URL", base.as_str())]);
         // No leading slash -> the tool normalizes it, and a non-JSON body
         // falls back to the `text` field.
+        let resp = call_tool_via_line(&ctx, 60, "tickvault_api", json!({"path": "/hugebody"}));
+        let out = inner_result(&resp);
+        assert_eq!(out["ok"], false, "a reply over 8 MiB is refused: {out}");
+        assert!(
+            out["error"]
+                .as_str()
+                .expect("error is a string")
+                .starts_with("reply larger than 8 MiB")
+        );
         let resp = call_tool_via_line(&ctx, 6, "tickvault_api", json!({"path": "text"}));
         let out = inner_result(&resp);
         assert_eq!(out["ok"], true);
@@ -911,7 +965,7 @@ fn questdb_sql_and_tickvault_api_against_local_mock() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. cloudwatch_logs — SigV4 / portal / aws-CLI fallback chain.
+// 6. cloudwatch_logs — SigV4 / portal chain (the aws CLI fallback was removed 2026-09-27).
 // ---------------------------------------------------------------------------
 
 #[test]

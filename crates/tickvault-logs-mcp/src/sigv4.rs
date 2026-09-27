@@ -160,38 +160,6 @@ pub fn build_cloudwatch_sigv4_request(
     (url, body, headers)
 }
 
-/// legacy `build_cloudwatch_filter_args` — the aws CLI argv builder.
-pub fn build_cloudwatch_filter_args(
-    log_group: &str,
-    region: &str,
-    start_ms: i64,
-    limit: i64,
-    filter_pattern: Option<&str>,
-) -> Vec<String> {
-    let mut args: Vec<String> = vec![
-        "aws".into(),
-        "logs".into(),
-        "filter-log-events".into(),
-        "--region".into(),
-        region.into(),
-        "--log-group-name".into(),
-        log_group.into(),
-        "--start-time".into(),
-        start_ms.to_string(),
-        "--limit".into(),
-        limit.clamp(1, 10_000).to_string(),
-        "--output".into(),
-        "json".into(),
-    ];
-    if let Some(fp) = filter_pattern
-        && !fp.is_empty()
-    {
-        args.push("--filter-pattern".into());
-        args.push(fp.into());
-    }
-    args
-}
-
 /// legacy `parse_cloudwatch_events` — `aws logs filter-log-events` JSON →
 /// compact `{ts_ms, stream, message}` list (stable-sorted by ts_ms,
 /// trimmed to the newest `limit`).
@@ -422,34 +390,6 @@ mod tests {
              SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token;x-amz-target, \
              Signature=a525b3da1a9fdd6e19c5e7698be138596a1601297687faa21058bdd473c544a2"
         );
-    }
-
-    #[test]
-    fn filter_args_shape() {
-        let args = build_cloudwatch_filter_args("/g", "ap-south-1", 123, 20_000, Some("ERROR"));
-        assert_eq!(
-            args,
-            vec![
-                "aws",
-                "logs",
-                "filter-log-events",
-                "--region",
-                "ap-south-1",
-                "--log-group-name",
-                "/g",
-                "--start-time",
-                "123",
-                "--limit",
-                "10000",
-                "--output",
-                "json",
-                "--filter-pattern",
-                "ERROR",
-            ]
-        );
-        let no_filter = build_cloudwatch_filter_args("/g", "r", 1, 0, None);
-        assert!(!no_filter.contains(&"--filter-pattern".to_string()));
-        assert!(no_filter.contains(&"1".to_string())); // limit clamps up to 1
     }
 
     #[test]
