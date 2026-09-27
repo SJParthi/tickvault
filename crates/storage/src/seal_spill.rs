@@ -165,6 +165,7 @@ use chrono::{TimeZone, Utc};
 use tracing::{error, info, warn};
 
 use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
 use tickvault_trading::candles::{BufferedSeal, TfIndex};
 
@@ -1186,6 +1187,11 @@ pub struct SpillPruneOutcome {
     /// Files skipped because they are TODAY's file — the one the live writer
     /// may hold an open descriptor to. Never deleted at any age.
     pub skipped_live: usize,
+    /// Aged files deleted from `archive/` (audit PR40b). Not a loss: the
+    /// replay had finished with them. Counted apart from [`Self::deleted`],
+    /// which covers the top level and `replaying/`, where a deleted record
+    /// was never re-ingested.
+    pub archive_deleted: usize,
 }
 
 /// Deletes spill files older than `max_age_secs` — pure-testable core over an
@@ -1253,11 +1259,69 @@ pub fn prune_spill_files_at(
             .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
             .unwrap_or(0),
     );
-    // O(1) EXEMPT: periodic cold retention sweep, never the per-seal append
-    let Ok(entries) = std::fs::read_dir(spill_dir) else {
-        return outcome; // missing dir — nothing to prune
-    };
     let cutoff = std::time::Duration::from_secs(max_age_secs);
+    prune_dir(
+        spill_dir,
+        Some(live_name.as_str()),
+        PrunedKind::Unreplayed,
+        cutoff,
+        now,
+        &mut outcome,
+    );
+    // Audit PR40b: the two folders the replay moves files into. Until then
+    // neither was pruned, so every file ever staged or archived stayed on the
+    // volume for good, outside both this sweep and the `tv_seal_spill_bytes`
+    // figure. `replaying/` holds staged files NOT yet re-ingested, so an aged
+    // one there is unreplayed data exactly like an aged top-level file and is
+    // counted as lost. `archive/` holds files the replay finished with: their
+    // seals are in QuestDB, or were skipped and already paged as
+    // `seal_unrecovered` when they were skipped.
+    //
+    // No live-writer guard below: the writer only ever opens TODAY's file at
+    // the top level, and a file moved into either folder was already closed
+    // by `with_appends_paused`.
+    prune_dir(
+        &spill_dir.join(crate::seal_writer_task::SEAL_REPLAYING_SUBDIR),
+        None,
+        PrunedKind::Unreplayed,
+        cutoff,
+        now,
+        &mut outcome,
+    );
+    prune_dir(
+        &spill_dir.join(crate::seal_writer_task::SEAL_ARCHIVE_SUBDIR),
+        None,
+        PrunedKind::Archived,
+        cutoff,
+        now,
+        &mut outcome,
+    );
+    outcome
+}
+
+/// What a deleted file in a swept directory held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrunedKind {
+    /// Seals not yet re-ingested: a non-empty deletion is data loss.
+    Unreplayed,
+    /// A file the replay finished with: nothing is lost by deleting it.
+    Archived,
+}
+
+/// One directory of [`prune_spill_files_at`]. `live_name` is the file the
+/// writer may hold open, never deleted at any age.
+fn prune_dir(
+    dir: &Path,
+    live_name: Option<&str>,
+    kind: PrunedKind,
+    cutoff: std::time::Duration,
+    now: std::time::SystemTime,
+    outcome: &mut SpillPruneOutcome,
+) {
+    // O(1) EXEMPT: periodic cold retention sweep, never the per-seal append
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return; // missing dir — nothing to prune
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         // Only our own spill records. Anything else in the directory is left
@@ -1268,9 +1332,9 @@ pub fn prune_spill_files_at(
         }
         // The live-writer guard. Cheap, and it fails SAFE: an unreadable file
         // name is treated as live and kept, never deleted on uncertainty.
-        if path.file_name().and_then(|n| n.to_str()) != Some(live_name.as_str()) {
-            // not today's file — eligible, fall through to the age check
-        } else {
+        if let Some(live) = live_name
+            && path.file_name().and_then(|n| n.to_str()) == Some(live)
+        {
             outcome.skipped_live += 1;
             if let Ok(meta) = entry.metadata() {
                 outcome.bytes_after = outcome.bytes_after.saturating_add(meta.len());
@@ -1292,15 +1356,18 @@ pub fn prune_spill_files_at(
         }
         // O(1) EXEMPT: periodic cold retention sweep, never the per-seal append
         match std::fs::remove_file(&path) {
-            Ok(()) => {
-                outcome.deleted += 1;
-                if len > 0 {
-                    outcome.deleted_non_empty += 1;
-                    outcome.records_lost = outcome
-                        .records_lost
-                        .saturating_add(len / SEAL_SPILL_RECORD_SIZE as u64);
+            Ok(()) => match kind {
+                PrunedKind::Archived => outcome.archive_deleted += 1,
+                PrunedKind::Unreplayed => {
+                    outcome.deleted += 1;
+                    if len > 0 {
+                        outcome.deleted_non_empty += 1;
+                        outcome.records_lost = outcome
+                            .records_lost
+                            .saturating_add(len / SEAL_SPILL_RECORD_SIZE as u64);
+                    }
                 }
-            }
+            },
             Err(err) => {
                 outcome.failed += 1;
                 outcome.bytes_after = outcome.bytes_after.saturating_add(len);
@@ -1312,7 +1379,6 @@ pub fn prune_spill_files_at(
             }
         }
     }
-    outcome
 }
 
 /// Wall-clock wrapper over [`prune_spill_files_at`]. Cold path — called from
@@ -1328,13 +1394,18 @@ pub fn prune_spill_files_at(
 pub fn prune_spill_files(spill_dir: &Path, max_age_secs: u64) -> SpillPruneOutcome {
     let outcome = prune_spill_files_at(spill_dir, max_age_secs, std::time::SystemTime::now());
     if outcome.deleted_non_empty > 0 {
+        // Audit PR40b: this line carried the unregistered code
+        // "SPILL-RETENTION-01", which nothing filtered on, so a deleted spill
+        // file still holding seals paged nobody. It is permanent sealed-candle
+        // loss, so it is now AGGREGATOR-DROP-01, which pages.
         error!(
-            code = "SPILL-RETENTION-01",
+            code = ErrorCode::AggregatorDrop01.code_str(),
+            source = "spill_retention",
             files = outcome.deleted_non_empty,
             records_lost = outcome.records_lost,
             max_age_secs,
-            "spill files aged out while STILL HOLDING unreplayed seals — the \
-             replay path has been broken for longer than the retention window. \
+            "spill files (top level or replaying/) aged out while STILL HOLDING \
+             unreplayed seals — the replay path has been broken for longer than the retention window. \
              This is data loss, reported rather than hidden; investigate why \
              the writer never drained these."
         );
@@ -1343,6 +1414,14 @@ pub fn prune_spill_files(spill_dir: &Path, max_age_secs: u64) -> SpillPruneOutco
             deleted = outcome.deleted,
             bytes_after = outcome.bytes_after,
             "spill retention sweep: removed aged empty spill files"
+        );
+    }
+    if outcome.archive_deleted > 0 {
+        info!(
+            archive_deleted = outcome.archive_deleted,
+            bytes_after = outcome.bytes_after,
+            "spill retention sweep: removed aged files from archive/ (already re-ingested, \
+             or skipped and paged when skipped)"
         );
     }
     metrics::gauge!("tv_seal_spill_bytes").set(outcome.bytes_after as f64);
@@ -2752,6 +2831,68 @@ mod tests {
         let missing = std::env::temp_dir().join("tv-spill-does-not-exist-xyz");
         let out = prune_spill_files_at(&missing, 3_600, std::time::SystemTime::now());
         assert_eq!(out, SpillPruneOutcome::default(), "missing dir is a no-op");
+    }
+
+    #[test]
+    fn test_prune_spill_files_at_sweeps_replaying_as_loss_and_archive_as_not() {
+        // Audit PR40b: the two folders the replay moves files into were never
+        // pruned and were outside the byte figure.
+        let dir = spill_tmp("subdirs");
+        let replaying = dir.join(crate::seal_writer_task::SEAL_REPLAYING_SUBDIR);
+        let archive = dir.join(crate::seal_writer_task::SEAL_ARCHIVE_SUBDIR);
+        std::fs::create_dir_all(&replaying).expect("mkdir replaying");
+        std::fs::create_dir_all(&archive).expect("mkdir archive");
+        let old_staged = write_aged(
+            &replaying,
+            "seals_v4-20260101.bin",
+            SEAL_SPILL_RECORD_SIZE * 3,
+            10_000,
+        );
+        let fresh_staged = write_aged(&replaying, "seals_v4-20260102.bin", 256, 10);
+        let old_archived = write_aged(
+            &archive,
+            "seals_v4-20260101.bin",
+            SEAL_SPILL_RECORD_SIZE * 5,
+            10_000,
+        );
+        let fresh_archived = write_aged(&archive, "seals_v4-20260103.bin", 128, 10);
+        let foreign = write_aged(&archive, "seal-unwritten.mark", 64, 10_000);
+
+        let out = prune_spill_files_at(&dir, 3_600, std::time::SystemTime::now());
+
+        assert!(!old_staged.exists() && !old_archived.exists());
+        assert!(fresh_staged.exists() && fresh_archived.exists() && foreign.exists());
+        // An aged staged file was never re-ingested: counted as lost.
+        assert_eq!(out.deleted, 1);
+        assert_eq!(out.deleted_non_empty, 1);
+        assert_eq!(out.records_lost, 3);
+        // An aged archived file is not a loss and is counted apart.
+        assert_eq!(out.archive_deleted, 1);
+        // Both folders count against the disk figure.
+        assert_eq!(out.bytes_after, 256 + 128);
+    }
+
+    #[test]
+    fn test_prune_spill_files_at_applies_the_live_guard_only_at_the_top_level() {
+        // The writer only ever opens TODAY's file at the top level. A file of
+        // the same name that the replay moved into archive/ is closed and
+        // follows the age rule like any other.
+        let dir = spill_tmp("liveguard");
+        let now = std::time::SystemTime::now();
+        let secs = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+        let today = ist_date_filename(secs);
+        let archive = dir.join(crate::seal_writer_task::SEAL_ARCHIVE_SUBDIR);
+        std::fs::create_dir_all(&archive).expect("mkdir archive");
+        let live = write_aged(&dir, &today, 128, 10_000);
+        let archived_today = write_aged(&archive, &today, 128, 10_000);
+        let out = prune_spill_files_at(&dir, 3_600, now);
+        assert!(live.exists(), "the live file is never deleted");
+        assert!(!archived_today.exists());
+        assert_eq!(out.skipped_live, 1);
+        assert_eq!(out.archive_deleted, 1);
     }
 
     #[test]

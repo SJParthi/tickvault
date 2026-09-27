@@ -187,6 +187,7 @@ fn record_replay_observability(replay: &ReplayOutcome) {
             metrics::counter!(SEAL_REPLAY_COUNTER, "kind" => kind).increment(value as u64);
         }
     }
+    let _ = report_unrecovered_seals(UnrecoveredStage::Replay, replay.records_skipped);
 }
 
 /// Per-cycle observability fan-out (2026-07-06 exam-fix): Prometheus
@@ -321,6 +322,12 @@ fn record_boot_drain_observability(outcome: &BootDrainOutcome) {
         metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_append_failed")
             .increment(outcome.seals_append_failed as u64);
     }
+    let _ = report_unrecovered_seals(
+        UnrecoveredStage::BootDrain,
+        outcome
+            .records_undecodable
+            .saturating_add(outcome.seals_append_failed),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -597,6 +604,72 @@ pub fn report_previous_unwritten(previous: PreviousUnwritten, now_unix_secs: i64
             record.unwritten
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Unrecovered seals page (audit PR40b)
+// ---------------------------------------------------------------------------
+//
+// Two recovery paths give up on a seal for good and, until PR40b, said so only
+// at `warn!` or under AGGREGATOR-SEAL-01, which no alarm filters on:
+//
+// * the boot drain, for a record it cannot decode (most often a file written
+//   by an older build) and for a seal the writer refuses; the file moves to
+//   `archive/` and nothing retries it;
+// * the mid-session replay, for the same two cases plus a seal the database
+//   refused in every attempt; the cursor moves past it and nothing retries it.
+//
+// Each is a sealed candle that will not reach QuestDB without an operator. The
+// counters already existed (`tv_seal_writer_drain_total{kind="boot_undecodable"
+// | "boot_append_failed"}`, `tv_seal_replay_total{kind="skipped"}`); what was
+// missing was the page. It rides the EXISTING AGGREGATOR-DROP-01 errcode alarm
+// with `source = "seal_unrecovered"`, the same way PR40a's `crash_unwritten`
+// does: one ERROR line per boot drain or replay step that skipped something,
+// never per seal, and no new alarm, filter or metric.
+
+/// `source` field value on the AGGREGATOR-DROP-01 line for seals a recovery
+/// path skipped for good.
+pub const SEAL_UNRECOVERED_SOURCE: &str = "seal_unrecovered";
+
+/// Which recovery path gave up on the seals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnrecoveredStage {
+    /// The boot drain of `replaying/`.
+    BootDrain,
+    /// The mid-session spill replay.
+    Replay,
+}
+
+impl UnrecoveredStage {
+    /// The `stage` field value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BootDrain => "boot_drain",
+            Self::Replay => "replay",
+        }
+    }
+}
+
+/// Page the seals a recovery path skipped for good. Silent at zero.
+///
+/// Returns the number reported. O(1), cold path.
+pub fn report_unrecovered_seals(stage: UnrecoveredStage, unrecovered: usize) -> usize {
+    if unrecovered == 0 {
+        return 0;
+    }
+    error!(
+        code = ErrorCode::AggregatorDrop01.code_str(),
+        source = SEAL_UNRECOVERED_SOURCE,
+        stage = stage.as_str(),
+        seals_unrecovered = unrecovered,
+        "seal recovery gave up on {} sealed candle(s) for good: they could not be decoded, \
+         the writer refused them, or the database refused them in every attempt. They are \
+         NOT in QuestDB and nothing retries them. Their bytes stay in the spill archive/ \
+         folder until the retention sweep removes them; their ticks are still in the \
+         capture log.",
+        unrecovered
+    );
+    unrecovered
 }
 
 /// Returns the current UTC unix timestamp in seconds. Used to
@@ -1619,6 +1692,67 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("dir");
         assert!(mark.sample(5, 1_002));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_report_unrecovered_seals_is_silent_at_zero_and_reports_the_count() {
+        assert_eq!(report_unrecovered_seals(UnrecoveredStage::BootDrain, 0), 0);
+        assert_eq!(report_unrecovered_seals(UnrecoveredStage::Replay, 0), 0);
+        assert_eq!(report_unrecovered_seals(UnrecoveredStage::BootDrain, 4), 4);
+        assert_eq!(report_unrecovered_seals(UnrecoveredStage::Replay, 1), 1);
+        assert_eq!(UnrecoveredStage::BootDrain.as_str(), "boot_drain");
+        assert_eq!(UnrecoveredStage::Replay.as_str(), "replay");
+        assert_eq!(SEAL_UNRECOVERED_SOURCE, "seal_unrecovered");
+    }
+
+    #[test]
+    fn test_report_unrecovered_seals_is_wired_into_both_recovery_paths() {
+        // Audit PR40b: the page is only as good as its call sites. Both the
+        // boot drain and the mid-session replay must feed it every seal they
+        // give up on, and the line must carry the paging code at ERROR level.
+        // A function body ends at a closing brace alone on its line. Spelled as
+        // an escape so the banned-pattern scanner's brace counter, which reads
+        // string contents, stays balanced.
+        const FN_END: &str = "\n\u{7d}\n";
+        let src = include_str!("seal_writer_loop.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("production half");
+        let boot = prod
+            .split("fn record_boot_drain_observability")
+            .nth(1)
+            .and_then(|s| s.split(FN_END).next())
+            .expect("boot fan-out");
+        assert!(
+            boot.contains("UnrecoveredStage::BootDrain")
+                && boot.contains("records_undecodable")
+                && boot.contains("seals_append_failed"),
+            "the boot drain must page undecodable AND refused seals"
+        );
+        let replay = prod
+            .split("fn record_replay_observability")
+            .nth(1)
+            .and_then(|s| s.split(FN_END).next())
+            .expect("replay fan-out");
+        assert!(
+            replay.contains("UnrecoveredStage::Replay") && replay.contains("records_skipped"),
+            "the replay must page every skipped seal"
+        );
+        let report = prod
+            .split("pub fn report_unrecovered_seals")
+            .nth(1)
+            .and_then(|s| s.split(FN_END).next())
+            .expect("report fn");
+        assert!(
+            report.contains(concat!("error", "!("))
+                && report.contains("ErrorCode::AggregatorDrop01")
+                && report.contains("SEAL_UNRECOVERED_SOURCE"),
+            "the page must be an ERROR line with the paging code and the source tag"
+        );
+        // `record_replay_observability` returns early on an idle step, so a
+        // step that skipped a seal must never read as idle.
+        assert!(
+            include_str!("seal_writer_task.rs").contains("&& self.records_skipped == 0"),
+            "ReplayOutcome::is_idle must treat a skipped seal as activity"
+        );
     }
 
     #[test]
