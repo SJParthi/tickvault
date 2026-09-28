@@ -913,7 +913,7 @@ impl MultiTfAggregator {
             return;
         }
         let idx = if let Some(&idx) = self.index.get(&key) {
-            idx as usize
+            Some(idx as usize)
         } else {
             let capacity = self.effective_capacity();
             let proof_ceiling =
@@ -923,12 +923,9 @@ impl MultiTfAggregator {
             }
             // Below the ceiling, so `slot_index` creates the slot and never
             // reaches its exhaustion arm.
-            let Some(idx) = self.slot_index(key) else {
-                return;
-            };
-            idx
+            self.slot_index(key)
         };
-        if let Some(slot) = self.slots.get_mut(idx)
+        if let Some(slot) = idx.and_then(|idx| self.slots.get_mut(idx))
             && !slot.volume_baseline_seeded
         {
             slot.untraded_proof_ist_secs = slot.untraded_proof_ist_secs.max(proof);
@@ -2237,6 +2234,13 @@ mod tests {
             .bar_for_window(Feed::Dhan, 77, SEG_IDX, TfIndex::S1, OPEN)
             .expect("the window that just closed is still reachable");
         assert_eq!(closed.bucket_start_ist_secs, OPEN);
+
+        // The window still open is answered from the open bar itself.
+        let still_open = agg
+            .bar_for_window(Feed::Dhan, 77, SEG_IDX, TfIndex::S1, OPEN + 1)
+            .expect("the open window is reachable");
+        assert_eq!(still_open.bucket_start_ist_secs, OPEN + 1);
+        assert_eq!(still_open.volume, open.volume);
     }
 
     /// A window the cell holds NEITHER open NOR last-sealed is refused, not
@@ -3056,6 +3060,11 @@ mod tests {
             .map_or(u64::MAX, |st| st.volume)
     }
 
+    /// Feeds one Dhan tick with no override, dropping any seal.
+    fn push(agg: &mut MultiTfAggregator, t: &ParsedTick) -> ConsumeStats {
+        agg.consume_tick(Feed::Dhan, t, None, |_, _, _, _, _| {})
+    }
+
     #[test]
     fn untraded_proof_holds_only_for_a_fresh_same_day_proof() {
         const FNO: u8 = 2;
@@ -3129,48 +3138,26 @@ mod tests {
         // at 650 and both bars read 0.
         let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
         // Friday's close carried in Monday's 09:00:30 connect snapshot.
-        let stale = agg.consume_tick(
-            Feed::Dhan,
+        let stale = push(
+            &mut agg,
             &live(OPEN - 3 * 86_400 + 22_500, 12.5, 90_000, CANDLE_OPEN + 30),
-            None,
-            |_, _, _, _, _| {},
         );
         assert!(stale.stale_trading_day);
-        let first = agg.consume_tick(
-            Feed::Dhan,
-            &live(OPEN + 2, 13.0, 650, OPEN + 2),
-            None,
-            |_, _, _, _, _| {},
-        );
+        let first = push(&mut agg, &live(OPEN + 2, 13.0, 650, OPEN + 2));
         assert!(first.folded());
         assert_eq!(bar_volume(&agg, TfIndex::S5), 650, "09:15:00 5 s bar");
         assert_eq!(bar_volume(&agg, TfIndex::M1), 650, "09:15 1 m bar");
         // The next trade still counts only its own quantity.
-        let _ = agg.consume_tick(
-            Feed::Dhan,
-            &live(OPEN + 3, 13.05, 700, OPEN + 3),
-            None,
-            |_, _, _, _, _| {},
-        );
+        let _ = push(&mut agg, &live(OPEN + 3, 13.05, 700, OPEN + 3));
         assert_eq!(bar_volume(&agg, TfIndex::M1), 700);
     }
 
     #[test]
     fn a_never_traded_zero_price_is_also_proof_of_no_trade_yet() {
         let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
-        let sentinel = agg.consume_tick(
-            Feed::Dhan,
-            &live(OPEN - 86_400 + 22_000, 0.0, 0, OPEN + 1),
-            None,
-            |_, _, _, _, _| {},
-        );
+        let sentinel = push(&mut agg, &live(OPEN - 86_400 + 22_000, 0.0, 0, OPEN + 1));
         assert!(sentinel.untraded_sentinel);
-        let _ = agg.consume_tick(
-            Feed::Dhan,
-            &live(OPEN + 4, 9.0, 75, OPEN + 4),
-            None,
-            |_, _, _, _, _| {},
-        );
+        let _ = push(&mut agg, &live(OPEN + 4, 9.0, 75, OPEN + 4));
         assert_eq!(bar_volume(&agg, TfIndex::M1), 75);
     }
 
@@ -3180,18 +3167,11 @@ mod tests {
         // carries every trade of the outage, so it must not all land in the
         // 10:00 bar. It seeds, as before PR58.
         let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
-        let _ = agg.consume_tick(
-            Feed::Dhan,
+        let _ = push(
+            &mut agg,
             &live(OPEN - 86_400 + 22_000, 12.5, 90_000, CANDLE_OPEN + 30),
-            None,
-            |_, _, _, _, _| {},
         );
-        let _ = agg.consume_tick(
-            Feed::Dhan,
-            &live(OPEN + 2_700, 13.0, 48_000, OPEN + 2_700),
-            None,
-            |_, _, _, _, _| {},
-        );
+        let _ = push(&mut agg, &live(OPEN + 2_700, 13.0, 48_000, OPEN + 2_700));
         assert_eq!(bar_volume(&agg, TfIndex::M1), 0);
     }
 
@@ -3201,31 +3181,21 @@ mod tests {
         let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
         let mut no_receipt = live(OPEN - 86_400 + 22_000, 0.0, 0, OPEN + 1);
         no_receipt.received_at_nanos = 0;
-        let _ = agg.consume_tick(Feed::Dhan, &no_receipt, None, |_, _, _, _, _| {});
+        let _ = push(&mut agg, &no_receipt);
         agg.record_untraded_proof((Feed::Dhan, FIRST_SID, 2), 0);
         agg.record_untraded_proof((Feed::Dhan, FIRST_SID, 2), -1);
         assert!(
             !agg.index.contains_key(&(Feed::Dhan, FIRST_SID, 2)),
             "no receipt, no proof and no slot"
         );
-        let _ = agg.consume_tick(
-            Feed::Dhan,
-            &live(OPEN + 4, 9.0, 75, OPEN + 4),
-            None,
-            |_, _, _, _, _| {},
-        );
+        let _ = push(&mut agg, &live(OPEN + 4, 9.0, 75, OPEN + 4));
         assert_eq!(bar_volume(&agg, TfIndex::M1), 0);
     }
 
     #[test]
     fn the_day_reset_clears_the_untraded_proof() {
         let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
-        let _ = agg.consume_tick(
-            Feed::Dhan,
-            &live(OPEN - 86_400 + 22_000, 0.0, 0, OPEN + 1),
-            None,
-            |_, _, _, _, _| {},
-        );
+        let _ = push(&mut agg, &live(OPEN - 86_400 + 22_000, 0.0, 0, OPEN + 1));
         let key = (Feed::Dhan, FIRST_SID, 2);
         assert_eq!(
             agg.slots[agg.index[&key] as usize].untraded_proof_ist_secs,
@@ -3246,19 +3216,9 @@ mod tests {
     #[test]
     fn a_zero_last_trade_time_is_also_proof_of_no_trade_yet() {
         let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
-        let untraded = agg.consume_tick(
-            Feed::Dhan,
-            &live(0, 0.0, 0, OPEN + 1),
-            None,
-            |_, _, _, _, _| {},
-        );
+        let untraded = push(&mut agg, &live(0, 0.0, 0, OPEN + 1));
         assert!(untraded.untraded_timestamp);
-        let _ = agg.consume_tick(
-            Feed::Dhan,
-            &live(OPEN + 4, 9.0, 75, OPEN + 4),
-            None,
-            |_, _, _, _, _| {},
-        );
+        let _ = push(&mut agg, &live(OPEN + 4, 9.0, 75, OPEN + 4));
         assert_eq!(bar_volume(&agg, TfIndex::M1), 75);
     }
 
@@ -3269,27 +3229,12 @@ mod tests {
         // the first trade seeds as before PR58.
         let key = (Feed::Dhan, FIRST_SID, 2);
         let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
-        let zero_price_today = agg.consume_tick(
-            Feed::Dhan,
-            &live(OPEN + 1, 0.0, 0, OPEN + 1),
-            None,
-            |_, _, _, _, _| {},
-        );
+        let zero_price_today = push(&mut agg, &live(OPEN + 1, 0.0, 0, OPEN + 1));
         assert!(zero_price_today.untraded_sentinel);
-        let zero_time_priced = agg.consume_tick(
-            Feed::Dhan,
-            &live(0, 14.0, 0, OPEN + 2),
-            None,
-            |_, _, _, _, _| {},
-        );
+        let zero_time_priced = push(&mut agg, &live(0, 14.0, 0, OPEN + 2));
         assert!(zero_time_priced.untraded_timestamp);
         assert!(!agg.index.contains_key(&key));
-        let _ = agg.consume_tick(
-            Feed::Dhan,
-            &live(OPEN + 4, 9.0, 75, OPEN + 4),
-            None,
-            |_, _, _, _, _| {},
-        );
+        let _ = push(&mut agg, &live(OPEN + 4, 9.0, 75, OPEN + 4));
         assert_eq!(bar_volume(&agg, TfIndex::M1), 0);
     }
 
@@ -3301,8 +3246,8 @@ mod tests {
         // land in the 09:15 bar. It seeds, as before PR58.
         const EQ: u8 = 1;
         let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
-        let stale = agg.consume_tick(
-            Feed::Dhan,
+        let stale = push(
+            &mut agg,
             &live_seg(
                 EQ,
                 OPEN - 86_400 + 22_000,
@@ -3310,16 +3255,9 @@ mod tests {
                 900_000,
                 CANDLE_OPEN + 300,
             ),
-            None,
-            |_, _, _, _, _| {},
         );
         assert!(stale.stale_trading_day);
-        let _ = agg.consume_tick(
-            Feed::Dhan,
-            &live_seg(EQ, OPEN + 2, 812.0, 40_000, OPEN + 2),
-            None,
-            |_, _, _, _, _| {},
-        );
+        let _ = push(&mut agg, &live_seg(EQ, OPEN + 2, 812.0, 40_000, OPEN + 2));
         assert_eq!(
             agg.snapshot(Feed::Dhan, FIRST_SID, EQ, TfIndex::M1)
                 .map_or(u64::MAX, |st| st.volume),
@@ -3333,36 +3271,24 @@ mod tests {
         let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
         let mut today = live(OPEN + 10, 20.0, 100, OPEN + 10);
         today.security_id = FIRST_SID + 1;
-        assert!(
-            agg.consume_tick(Feed::Dhan, &today, None, |_, _, _, _, _| {})
-                .folded()
-        );
+        assert!(push(&mut agg, &today).folded());
         // A frame from yesterday's session, received yesterday: the receipt
         // day gate passes it and the watermark gate refuses it. No proof.
-        let replayed = agg.consume_tick(
-            Feed::Dhan,
+        let replayed = push(
+            &mut agg,
             &live(OPEN - 86_400 + 100, 12.0, 5_000, OPEN - 86_400 + 101),
-            None,
-            |_, _, _, _, _| {},
         );
         assert!(replayed.stale_trading_day);
         assert!(!replayed.receipt_day_mismatch);
         // Yesterday's never-traded packet, replayed today: no proof either.
-        let sentinel = agg.consume_tick(
-            Feed::Dhan,
+        let sentinel = push(
+            &mut agg,
             &live(OPEN - 2 * 86_400 + 100, 0.0, 0, OPEN - 86_400 + 101),
-            None,
-            |_, _, _, _, _| {},
         );
         assert!(sentinel.untraded_sentinel);
         assert!(!agg.index.contains_key(&(Feed::Dhan, FIRST_SID, 2)));
         // So today's first trade seeds.
-        let _ = agg.consume_tick(
-            Feed::Dhan,
-            &live(OPEN + 20, 13.0, 650, OPEN + 20),
-            None,
-            |_, _, _, _, _| {},
-        );
+        let _ = push(&mut agg, &live(OPEN + 20, 13.0, 650, OPEN + 20));
         assert_eq!(bar_volume(&agg, TfIndex::M1), 0);
     }
 
@@ -3385,28 +3311,15 @@ mod tests {
         for sid in 0..19_u64 {
             let mut t = live(OPEN + 1, 10.0, 10, OPEN + 1);
             t.security_id = 90_000 + sid;
-            assert!(
-                agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {})
-                    .folded()
-            );
+            assert!(push(&mut agg, &t).folded());
         }
-        let proof = agg.consume_tick(
-            Feed::Dhan,
-            &live(OPEN - 86_400 + 22_000, 0.0, 0, OPEN + 2),
-            None,
-            |_, _, _, _, _| {},
-        );
+        let proof = push(&mut agg, &live(OPEN - 86_400 + 22_000, 0.0, 0, OPEN + 2));
         assert!(proof.untraded_sentinel);
         assert!(!proof.slot_exhausted);
         assert_eq!(agg.slots.len(), 19, "the proof did not take the kept slot");
         assert_eq!(agg.slots_exhausted_total, 0);
         // The kept slot goes to a key that trades.
-        let traded = agg.consume_tick(
-            Feed::Dhan,
-            &live(OPEN + 3, 9.0, 75, OPEN + 3),
-            None,
-            |_, _, _, _, _| {},
-        );
+        let traded = push(&mut agg, &live(OPEN + 3, 9.0, 75, OPEN + 3));
         assert!(traded.folded());
         assert_eq!(agg.slots.len(), 20);
         assert_eq!(agg.slots_exhausted_total, 0);
