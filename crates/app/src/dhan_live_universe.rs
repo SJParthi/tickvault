@@ -37,6 +37,8 @@
 //! lane exposes — the connection count would simply be lower, and nobody reads
 //! a connection count expecting it to carry an error.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use tickvault_common::types::{ExchangeSegment, SecurityId};
 use tickvault_core::websocket::pool_supervisor::SubscribeInstrument;
 
@@ -599,6 +601,7 @@ pub const MASTER_SOURCING_FALLBACK_COUNTER: &str = "tv_dhan_live_universe_fallba
 /// itself is visible without parsing a log line.
 fn record_master_sourcing_fallback(reason: &'static str, fell_back_to: usize) {
     metrics::counter!(MASTER_SOURCING_FALLBACK_COUNTER, "reason" => reason).increment(1);
+    mark_live_universe_degraded(reason);
     // Cold path — once per boot at most — so the macro's key build is fine here.
     #[allow(clippy::cast_precision_loss)]
     // APPROVED: instrument counts are bounded by MAX_DAILY_UNIVERSE_SIZE, far below 2^53.
@@ -622,6 +625,80 @@ pub const MASTER_SOURCING_FALLBACK_REASONS: &[&str] = &[
 
 /// Gauge: how many instruments the live lane actually subscribed.
 pub const LIVE_UNIVERSE_SIZE_GAUGE: &str = "tv_dhan_live_universe_instruments";
+
+/// Which paged reason this session is running on, if any.
+///
+/// `0` means the session is on today's list (or an EXPECTED pre-rider
+/// fallback, which is deliberately not paged). Otherwise it is `1 +` the
+/// reason's index in [`MASTER_SOURCING_FALLBACK_REASONS`]. One atomic, set
+/// at most once per boot, read once a minute by the heartbeat.
+static LIVE_UNIVERSE_DEGRADED: AtomicUsize = AtomicUsize::new(0);
+
+fn mark_live_universe_degraded(reason: &'static str) {
+    if let Some(index) = MASTER_SOURCING_FALLBACK_REASONS
+        .iter()
+        .position(|known| *known == reason)
+    {
+        LIVE_UNIVERSE_DEGRADED.store(index + 1, Ordering::Relaxed);
+    }
+}
+
+/// The paged reason this session is running on, or `None` when it is on
+/// today's list.
+#[must_use]
+pub fn live_universe_degraded_reason() -> Option<&'static str> {
+    degraded_reason_from_slot(LIVE_UNIVERSE_DEGRADED.load(Ordering::Relaxed))
+}
+
+fn degraded_reason_from_slot(slot: usize) -> Option<&'static str> {
+    slot.checked_sub(1)
+        .and_then(|index| MASTER_SOURCING_FALLBACK_REASONS.get(index))
+        .copied()
+}
+
+/// How often a degraded session re-counts its fallback.
+pub const DEGRADED_UNIVERSE_HEARTBEAT_SECS: u64 = 60;
+
+/// Keep `tv-<env>-live-universe-fallback` fed for as long as the session runs
+/// on something other than today's list.
+///
+/// # Why (audit re-check 7, 2026-09-28)
+///
+/// The universe is resolved once, and the counter's zero seed and its one real
+/// increment happen in the same function, microseconds apart. The CloudWatch
+/// agent scrapes every 60 s and drops the FIRST sample of a series as the
+/// delta baseline, so on a fresh process that first sample is already `1` and
+/// the single event this alarm exists for is exactly the one it never sees.
+/// The index-only collapse also pages through a log filter, which has no
+/// baseline problem; the earlier-day list and the over-capacity fill page
+/// ONLY through this counter.
+///
+/// One increment a minute while degraded gives every scrape after the first a
+/// positive delta, whenever the baseline landed. The alarm has no
+/// `ok_actions`, so a session that stays degraded pages once, stays red, and
+/// clears silently after a healthy restart. Returns as soon as the session is
+/// no longer degraded.
+///
+/// O(1) per tick: one atomic load and one counter increment.
+// The slot decode is unit-tested
+// (`live_universe_degraded_reason_decodes_every_reason_and_nothing_else`) and the spawn is
+// pinned by `run_degraded_universe_heartbeat_is_spawned_by_main_while_degraded`.
+// TEST-EXEMPT: timer loop over one atomic load and one counter increment.
+pub async fn run_degraded_universe_heartbeat(reason: &'static str) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+        DEGRADED_UNIVERSE_HEARTBEAT_SECS,
+    ));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first tick completes immediately; the boot's own increment covers it.
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        if live_universe_degraded_reason().is_none() {
+            return;
+        }
+        metrics::counter!(MASTER_SOURCING_FALLBACK_COUNTER, "reason" => reason).increment(1);
+    }
+}
 
 /// Is this boot one whose index-universe fallback is EXPECTED rather than a
 /// defect?
@@ -872,6 +949,7 @@ pub fn resolve_live_universe(
                                 "reason" => failure.mapping_reason()
                             )
                             .increment(1);
+                            mark_live_universe_degraded(failure.mapping_reason());
                             tracing::error!(
                                 code = tickvault_common::error_code::ErrorCode::WsGapConnectionState
                                     .code_str(),
@@ -2887,11 +2965,110 @@ mod tests {
     fn main_passes_one_off_session_verdict_to_both_calls() {
         let main = include_str!("main.rs");
         assert_eq!(
-            main.matches("universe_collapse_expected").count(),
-            3,
-            "main.rs must compute `universe_collapse_expected` once and pass it to BOTH \
-             await_mapping_artifact and resolve_live_universe"
+            main.matches("universe_collapse_expected,").count(),
+            1,
+            "the pre-wait verdict must be passed to await_mapping_artifact only"
+        );
+        assert_eq!(
+            main.matches("universe_collapse_expected_after_wait")
+                .count(),
+            2,
+            "main.rs must re-judge the verdict once after the wait and pass THAT to \
+             resolve_live_universe"
         );
         assert!(main.contains("trading_calendar.is_trading_day_today()"));
+    }
+
+    /// Audit re-check 7: a boot between 07:10 and the rider hour waits past
+    /// the hour, so a verdict frozen before the wait would log a real miss as
+    /// the expected pre-rider warning and page nobody.
+    #[test]
+    fn main_re_judges_the_verdict_after_the_wait_and_can_only_tighten_it() {
+        let main = include_str!("main.rs");
+        let wait = main
+            .find("await_mapping_artifact(")
+            .expect("main.rs must wait for the mapping artifact");
+        let rejudge = main
+            .find("let universe_collapse_expected_after_wait = universe_collapse_expected")
+            .expect("the re-judge must AND with the pre-wait verdict");
+        let resolve = main
+            .find("resolve_live_universe(")
+            .expect("main.rs must resolve the live universe");
+        assert!(
+            wait < rejudge && rejudge < resolve,
+            "wait, then re-judge, then resolve"
+        );
+        let rejudge_block = &main[rejudge..resolve];
+        assert!(
+            rejudge_block.contains(
+                "&& tickvault_app::dhan_live_universe::collapse_is_expected_for_this_boot("
+            )
+        );
+        assert!(rejudge_block.contains("now_ist_secs_of_day()"));
+    }
+
+    #[test]
+    fn run_degraded_universe_heartbeat_is_spawned_by_main_while_degraded() {
+        let main = include_str!("main.rs");
+        let resolve = main
+            .find("resolve_live_universe(")
+            .expect("main.rs must resolve the live universe");
+        let tail = &main[resolve..];
+        let spawn = tail
+            .find("run_degraded_universe_heartbeat(reason)")
+            .expect("main.rs must spawn the degraded-universe heartbeat");
+        let reason = tail
+            .find("live_universe_degraded_reason()")
+            .expect("the heartbeat must be gated on the degraded reason");
+        assert!(reason < spawn);
+        assert!(
+            spawn < tail.find("spawn_dhan_feed_stack(").expect("lane spawn"),
+            "the heartbeat is armed right after the resolve, before the lane dials"
+        );
+    }
+
+    #[test]
+    fn live_universe_degraded_reason_decodes_every_reason_and_nothing_else() {
+        assert_eq!(degraded_reason_from_slot(0), None, "0 means today's list");
+        for (index, reason) in MASTER_SOURCING_FALLBACK_REASONS.iter().enumerate() {
+            assert_eq!(degraded_reason_from_slot(index + 1), Some(*reason));
+        }
+        assert_eq!(
+            degraded_reason_from_slot(MASTER_SOURCING_FALLBACK_REASONS.len() + 1),
+            None
+        );
+        assert_eq!(degraded_reason_from_slot(usize::MAX), None);
+    }
+
+    /// Every paged path goes through `record_master_sourcing_fallback`, so
+    /// every paged path also arms the heartbeat. Pinned in source so a new
+    /// paged arm cannot count once and go quiet.
+    #[test]
+    fn every_paged_fallback_arms_the_heartbeat() {
+        let src = include_str!("dhan_live_universe.rs");
+        let body_start = src
+            .find(concat!("fn record_master_sourcing_", "fallback(reason"))
+            .expect("the fallback recorder must exist");
+        let body_end = body_start
+            + src[body_start..]
+                .find("\n}\n")
+                .expect("the recorder body must close");
+        assert!(src[body_start..body_end].contains("mark_live_universe_degraded(reason);"));
+        // The earlier-day-list arm counts the mapping reason directly (it keeps
+        // the size gauge for the success path), so it must arm the heartbeat
+        // itself.
+        let earlier = src
+            .find(concat!("source = EARLIER_ARTIFACT_", "SOURCE"))
+            .expect("the earlier-day-list paging line must exist");
+        let armed = src[..earlier]
+            .rfind(concat!(
+                "mark_live_universe_",
+                "degraded(failure.mapping_reason());"
+            ))
+            .expect("the earlier-day-list arm must arm the heartbeat");
+        assert!(
+            earlier - armed < 1_200,
+            "the heartbeat arming must sit in the earlier-day-list arm itself"
+        );
     }
 }
