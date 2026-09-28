@@ -293,9 +293,11 @@ pub fn install_market_ram_stores(cfg: &MarketRamStoreConfig, catchup_days: u32) 
     //
     // This line used to pass a hardcoded `8` for slot_count, and that single
     // literal is why a 34.9 GB configuration read as harmless for months.
-    // Eight slots is roughly today's universe (the 4 SPOT_1M_REST_INDICES),
-    // so at `spot_days = 35` the log printed ~11 MB and every reader
-    // reasonably concluded the store was cheap. The store's real ceiling is
+    // Eight slots was roughly the universe when that literal was written (the
+    // 4 SPOT_1M_REST_INDICES; since 2026-08-12 the live lane subscribes the
+    // master-sourced set, ~870 spots plus the options), so at `spot_days = 35`
+    // the log printed ~11 MB and every reader reasonably concluded the store
+    // was cheap. The store's real ceiling is
     // `MAX_SPOT_BAR_SLOTS` (25,000) — the same number the aggregator, the
     // indicator engine and the day-OHLC tracker are all sized to — at which
     // the identical config commits **3,000× more memory**.

@@ -697,7 +697,11 @@ fn parse_constituent_csv(index_name: &str, csv: &str) -> Vec<Constituent> {
 /// written a few lines above this sweep, they are never-delete under the
 /// 2026-05-27 lock, and nothing here touches them. These JSON files are the
 /// rider-to-lane handoff.
-const ARTIFACT_RETENTION_DAYS: i64 = 7;
+///
+/// The live lane reads this same number as its lookback when today's list is
+/// missing (`dhan_live_universe`, audit D3): a file older than this has already
+/// been swept, so looking further back could only find nothing.
+pub(crate) const ARTIFACT_RETENTION_DAYS: i64 = 7;
 
 /// The artifact filename prefixes this sweep is allowed to delete.
 ///

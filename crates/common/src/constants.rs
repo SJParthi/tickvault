@@ -1174,6 +1174,16 @@ pub const MIN_DAILY_UNIVERSE_SIZE: usize = 100;
 /// correct the whole time. A doc that names the wrong mechanism does not
 /// merely fail to inform; it manufactures false findings that cost real
 /// review cycles.
+///
+/// **CHANGED 2026-09-28 (audit D3) — the paragraph above no longer describes
+/// the code.** The owner decided (2026-09-26) that an oversize set fills the
+/// 25,000 by priority with a critical page instead of collapsing to the index
+/// count. `select_live_universe` now keeps indices first, then orders by
+/// `(segment, security_id)`, truncates to the capacity, and reports the excess as
+/// `refused_over_capacity`; the page is the same fallback counter
+/// (`reason="truncated_to_capacity"`). The test named above was replaced by
+/// `over_the_envelope_fills_the_capacity_by_priority_indices_first`.
+/// `plan_pool` is still never reached with an oversize set.
 pub const MAX_DAILY_UNIVERSE_SIZE: usize = 25_000;
 
 /// CSV download body size cap (per rule file §18 hardening contract).

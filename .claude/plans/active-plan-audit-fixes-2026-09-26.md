@@ -267,6 +267,40 @@ inline (PR2, PR8, PR14).
     text and count only contracts actually subscribed (dhan_feed_stack.rs:10761-10763, :10778-10781,
     :12428-12440). Stocks with no trade by 09:30 get no options: publish the count as a gauge at
     hand-off (dhan_feed_stack.rs:12437-12448). Depth sockets are PR44's, not this item's.
+  - Owner decision recorded (2026-09-26): over 25,000, fill 25,000 by priority with a critical
+    page; no 4-index fallback. Scheduled next after PR40d on 2026-09-28 at the "4 index ids"
+    thread's request (a 04:26 IST deploy-run boot subscribed only the 4 index SIDs and never
+    widened). Split into three PRs:
+  - [x] **D3a — never 4 when a list exists.** (`app`, doc-only `common`)
+    - Done: over capacity, `select_live_universe` fills the envelope by priority (indices first,
+      then by `(segment, security_id)`, since the list has no rank and row order is not a contract), counts `refused_over_capacity`, and pages through the existing
+      live-lane fallback alarm with `reason="truncated_to_capacity"` (seeded at 0). Today's list
+      missing or unreadable: the boot takes the newest earlier day's list still on disk (lookback =
+      the rider's `ARTIFACT_RETENTION_DAYS`, 7), same NTM → F&O → full precedence, empty lists
+      skipped; paged through the same counter and reason as before when the boot should have
+      widened, `warn!` with `source=pre_rider_boot` when it could not. The collapse alarm still
+      fires only when no list is on disk at all. Stale text fixed: module doc, `main.rs`
+      comment, `market_ram_store_boot.rs`, the master-off log line, the wait-arm lines,
+      `MAX_DAILY_UNIVERSE_SIZE` doc, the alarm description.
+    - Not done here: widening a RUNNING session (D3b); the `ntm_*` reasons are still not seeded
+      and the `fno_*` widenings still count on the paging counter (pre-existing, noted for D3c).
+    - Tests: `over_the_envelope_fills_the_capacity_by_priority_indices_first`,
+      `exactly_at_the_envelope_is_not_a_truncation`,
+      `earlier_ist_dates_walks_back_across_a_month_boundary_newest_first`,
+      `the_lookback_takes_the_newest_earlier_day_and_never_rereads_today`,
+      `the_lookback_skips_an_empty_list`, `the_lookback_keeps_todays_precedence_within_a_day`,
+      `the_lookback_stops_at_the_retention_window`,
+      `resolve_looks_back_exactly_as_far_as_the_rider_keeps_files`, property
+      `an_oversized_master_fills_the_capacity_by_priority_and_reports_it`, and the extended
+      `the_expected_fallback_cannot_reach_the_collapse_alarm`.
+  - [ ] **D3b — widen a running session when today's list lands.** The lane reads the universe
+    once at boot. Reuse the late attach's machinery: the set difference on the composite key goes
+    to spare room on live sockets via `LiveSubscriptionCommand::Extend` and to new sockets via
+    `build_feed_stack_plan`; the attach task keeps the pool until the widen is done. Each Extend
+    ≤ 5,000 per socket to stay inside the 5 s top-up budget.
+  - [ ] **D3c — the rest of D3:** parked-socket reassignment, late top-up refusals counted and
+    alarmed, the top-up log text, the no-trade-by-09:30 gauge, and the fallback counter's
+    reason hygiene (seed `ntm_*`; stop widenings paging).
 - [ ] **D4 — stale-price gate on entries.** (`trading` risk, not strategy)
   - No price-age check exists (risk/engine.rs:262). Add one to `check_order_in_segment`: an ENTRY
     whose last price is older than 5 s is refused with a coded reason; exits are never gated.
