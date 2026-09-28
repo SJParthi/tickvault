@@ -293,14 +293,34 @@ inline (PR2, PR8, PR14).
       `resolve_looks_back_exactly_as_far_as_the_rider_keeps_files`, property
       `an_oversized_master_fills_the_capacity_by_priority_and_reports_it`, and the extended
       `the_expected_fallback_cannot_reach_the_collapse_alarm`.
+    - Re-check 7 folded in (2026-09-28): (a) the paging counter's zero seed and its one boot
+      increment run microseconds apart, so the agent's first sample was already 1 and was
+      dropped as the delta baseline. The earlier-list and over-capacity cases page ONLY through
+      that counter. A degraded session now re-counts once a minute
+      (`run_degraded_universe_heartbeat`, O(1) per tick), so the alarm stays red until a healthy
+      restart. (b) The pre-rider verdict is judged again after `await_mapping_artifact`; a boot
+      between 07:10 and 08:00 IST waits past the rider hour and must page if the list is still
+      missing. Tests: `live_universe_degraded_reason_decodes_every_reason_and_nothing_else`,
+      `every_paged_fallback_arms_the_heartbeat`, `run_degraded_universe_heartbeat_is_spawned_by_main_while_degraded`,
+      `main_re_judges_the_verdict_after_the_wait_and_can_only_tighten_it`.
   - [ ] **D3b — widen a running session when today's list lands.** The lane reads the universe
     once at boot. Reuse the late attach's machinery: the set difference on the composite key goes
     to spare room on live sockets via `LiveSubscriptionCommand::Extend` and to new sockets via
     `build_feed_stack_plan`; the attach task keeps the pool until the widen is done. Each Extend
     ≤ 5,000 per socket to stay inside the 5 s top-up budget.
+    - Re-check 7: the list is read once at boot, and the 08:30 boot waits only to 08:40 while
+      the rider's budget is 900 s plus retries, so a slow rider always loses the race. D3b is
+      the fix for both: keep watching for today's list after boot and widen when it lands.
+      When D3b clears the degraded state the heartbeat stops by itself.
   - [ ] **D3c — the rest of D3:** parked-socket reassignment, late top-up refusals counted and
     alarmed, the top-up log text, the no-trade-by-09:30 gauge, and the fallback counter's
     reason hygiene (seed `ntm_*`; stop widenings paging).
+    - Re-check 7 items to verify and fold in: the rider rejects the whole build when more than
+      10% of the 49 NSE list downloads fail, and its error lines carry no code
+      (`dhan_universe.rs`); the 4 fallback index ids got zero packets; depth-200 dials 0 of 5
+      sockets during a fallback or QuestDB lag and `top_volume` goes empty, with no page; the
+      universe headroom check counts spots only (~870 against 25,000) so it can never fire;
+      D8's plan text says "match by symbol" but the list files carry no symbol.
 - [ ] **D4 — stale-price gate on entries.** (`trading` risk, not strategy)
   - No price-age check exists (risk/engine.rs:262). Add one to `check_order_in_segment`: an ENTRY
     whose last price is older than 5 s is refused with a coded reason; exits are never gated.
