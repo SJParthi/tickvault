@@ -187,6 +187,13 @@ pub struct SealOverflow {
     /// `spilled: 541,519` in one session).
     queued: metrics::Counter,
     inline_fallback: metrics::Counter,
+    /// Milliseconds the caller spent inside the inline fallback (audit
+    /// PR40d). Timed on the REFUSED arm only; the queued arm reads no clock.
+    inline_wait_ms: metrics::Counter,
+    /// Inline waits of at least [`SEAL_INLINE_WAIT_PAGE_MS`].
+    inline_stall: metrics::Counter,
+    /// Throttle and window state for the `AGGREGATOR-STALL-01` line.
+    stall_report: InlineStallReport,
 }
 
 /// Bounded depth of the escalation hand-off queue.
@@ -253,14 +260,88 @@ pub const SEAL_ESCALATION_LOST_COUNTER: &str = "tv_seal_escalation_lost_total";
 /// abandoned and those seals died with the process.
 pub const SEAL_ESCALATION_ABANDONED_COUNTER: &str = "tv_seal_escalation_abandoned_total";
 
-/// Put all four escalation series on the wire at zero when the escalation
+/// Milliseconds callers spent writing a refused seal themselves (audit PR40d).
+///
+/// Only the inline fallback adds to it, so a zero means the drain never paid
+/// for a disk write; a rising value is the wait the operator chose to accept
+/// (noise-lock §2.7) instead of dropping the seal or growing memory.
+pub const SEAL_ESCALATION_INLINE_WAIT_MS_COUNTER: &str = "tv_seal_escalation_inline_wait_ms_total";
+
+/// Inline waits of at least [`SEAL_INLINE_WAIT_PAGE_MS`] (audit PR40d).
+pub const SEAL_ESCALATION_INLINE_STALL_COUNTER: &str = "tv_seal_escalation_inline_stall_total";
+
+/// An inline wait this long pages as `AGGREGATOR-STALL-01`.
+///
+/// One second of a paused socket read is ~5,000 packets at the measured
+/// envelope. NOT measured-optimal: no session has reached the inline arm since
+/// the queue was sized to a full close burst, so the value sits where a pause is
+/// unambiguously bad (noise-lock §2.7, "NOT claimed").
+pub const SEAL_INLINE_WAIT_PAGE_MS: u64 = 1_000;
+
+/// At most one `AGGREGATOR-STALL-01` line per this many seconds. A disk that
+/// stays slow would otherwise log once per refused seal — up to a whole close
+/// burst of lines, each written to the same struggling disk.
+pub const SEAL_INLINE_STALL_LOG_EVERY_SECS: i64 = 60;
+
+/// Window state for the throttled `AGGREGATOR-STALL-01` line (audit PR40d).
+///
+/// Every field is an atomic so the report stays `&self`: the overflow lives in
+/// a process-wide `OnceLock`. Waits inside one window are folded into the next
+/// line as a count and a maximum, so throttling hides no stall.
+struct InlineStallReport {
+    /// Unix seconds of the last emitted line; `i64::MIN` before the first.
+    last_logged_secs: std::sync::atomic::AtomicI64,
+    /// Stalls since the last emitted line, this one included.
+    stalls: std::sync::atomic::AtomicU64,
+    /// Longest stall since the last emitted line.
+    max_waited_ms: std::sync::atomic::AtomicU64,
+}
+
+impl InlineStallReport {
+    fn new() -> Self {
+        Self {
+            last_logged_secs: std::sync::atomic::AtomicI64::new(i64::MIN),
+            stalls: std::sync::atomic::AtomicU64::new(0),
+            max_waited_ms: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Record one stall. Returns `Some((stalls, max_waited_ms))` when this
+    /// call owns the next line, with the window's totals taken and reset.
+    ///
+    /// O(1): three atomic operations and at most one compare-exchange. The
+    /// compare-exchange makes the line single-owner if two callers stall at
+    /// once; the loser's stall stays counted for the next line.
+    fn record(&self, waited_ms: u64, now_unix_secs: i64) -> Option<(u64, u64)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.stalls.fetch_add(1, Relaxed);
+        self.max_waited_ms.fetch_max(waited_ms, Relaxed);
+        let last = self.last_logged_secs.load(Relaxed);
+        let due = last == i64::MIN
+            || now_unix_secs.saturating_sub(last) >= SEAL_INLINE_STALL_LOG_EVERY_SECS;
+        if !due
+            || self
+                .last_logged_secs
+                .compare_exchange(last, now_unix_secs, Relaxed, Relaxed)
+                .is_err()
+        {
+            return None;
+        }
+        Some((
+            self.stalls.swap(0, Relaxed),
+            self.max_waited_ms.swap(0, Relaxed),
+        ))
+    }
+}
+
+/// Put all six escalation series on the wire at zero when the escalation
 /// subsystem is installed.
 ///
 /// # Why a built handle is not enough — measured, not assumed
 ///
 /// A `cloudwatch list-metrics` sweep on 2026-08-29 compared the EMF selector
 /// against the live account: the selector names 104 metrics, the account held
-/// 86, and all four of these were among the names that had **never published a
+/// 86, and the original four of these were among the names that had **never published a
 /// single datapoint**. The CloudWatch agent computes a counter as the delta
 /// between consecutive samples and drops the first sample of a series it has
 /// never seen, so a counter that is never incremented is never published.
@@ -292,6 +373,10 @@ fn register_escalation_baseline() {
     // queued, and an absent denominator makes a zero numerator meaningless.
     metrics::counter!(SEAL_ESCALATION_QUEUED_COUNTER).increment(0);
     metrics::counter!(SEAL_ESCALATION_INLINE_FALLBACK_COUNTER).increment(0);
+    // How long the fallback made the caller wait, and how often that wait
+    // crossed the page threshold (audit PR40d).
+    metrics::counter!(SEAL_ESCALATION_INLINE_WAIT_MS_COUNTER).increment(0);
+    metrics::counter!(SEAL_ESCALATION_INLINE_STALL_COUNTER).increment(0);
 }
 
 /// One refused seal on its way to the durable tier.
@@ -516,6 +601,9 @@ impl SealOverflow {
             pending,
             queued: metrics::counter!(SEAL_ESCALATION_QUEUED_COUNTER),
             inline_fallback: metrics::counter!(SEAL_ESCALATION_INLINE_FALLBACK_COUNTER),
+            inline_wait_ms: metrics::counter!(SEAL_ESCALATION_INLINE_WAIT_MS_COUNTER),
+            inline_stall: metrics::counter!(SEAL_ESCALATION_INLINE_STALL_COUNTER),
+            stall_report: InlineStallReport::new(),
         }
     }
 
@@ -576,6 +664,33 @@ impl SealOverflow {
             return OverflowOutcome::DlqWritten;
         }
         OverflowOutcome::Lost
+    }
+
+    /// Account for one inline fallback's wait (audit PR40d, noise-lock §2.7).
+    ///
+    /// Adds the wait to [`SEAL_ESCALATION_INLINE_WAIT_MS_COUNTER`]. A wait of at
+    /// least [`SEAL_INLINE_WAIT_PAGE_MS`] also counts as a stall and, at most
+    /// once per [`SEAL_INLINE_STALL_LOG_EVERY_SECS`], logs `AGGREGATOR-STALL-01`,
+    /// which pages. The line carries the window's stall count and longest wait,
+    /// so a throttled stall is folded in, never hidden.
+    ///
+    /// Reached only from the refused arm, which has already paid a disk write;
+    /// the `error!` formatting allocates, and is throttled for that reason.
+    fn note_inline_wait(
+        &self,
+        waited: std::time::Duration,
+        outcome: OverflowOutcome,
+        now_unix_secs: i64,
+    ) {
+        let waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX);
+        self.inline_wait_ms.increment(waited_ms);
+        if waited_ms < SEAL_INLINE_WAIT_PAGE_MS {
+            return;
+        }
+        self.inline_stall.increment(1);
+        if let Some((stalls, max_waited_ms)) = self.stall_report.record(waited_ms, now_unix_secs) {
+            report_inline_stall(waited_ms, stalls, max_waited_ms, outcome);
+        }
     }
 
     /// Escalate one refused seal to the durable tier. Never blocks on the
@@ -657,17 +772,43 @@ impl SealOverflow {
                     self.pending
                         .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     self.inline_fallback.increment(1);
-                    return Self::escalate_inline(
+                    // Timed here and ONLY here (audit PR40d): this is the arm
+                    // that makes the caller wait on the disk. The queued arm
+                    // above reads no clock.
+                    let started = std::time::Instant::now();
+                    let outcome = Self::escalate_inline(
                         &self.spill,
                         &self.dlq,
                         &item.seal,
                         item.now_unix_secs,
                     );
+                    self.note_inline_wait(started.elapsed(), outcome, item.now_unix_secs);
+                    return outcome;
                 }
             }
         }
         Self::escalate_inline(&self.spill, &self.dlq, &serialised, now_unix_secs)
     }
+}
+
+/// The `AGGREGATOR-STALL-01` line itself, out of line so the refused arm's
+/// common case (a short wait) carries none of its formatting code.
+#[cold]
+#[inline(never)]
+fn report_inline_stall(waited_ms: u64, stalls: u64, max_waited_ms: u64, outcome: OverflowOutcome) {
+    tracing::error!(
+        code = tickvault_common::error_code::ErrorCode::AggregatorStall01InlineWait.code_str(),
+        waited_ms,
+        stalls,
+        max_waited_ms,
+        threshold_ms = SEAL_INLINE_WAIT_PAGE_MS,
+        outcome = ?outcome,
+        "the live feed waited on a stalled disk: the escalation queue was full or its \
+         thread had died, so the frame drain wrote a refused candle to disk itself and \
+         stopped reading the socket until the disk answered. No candle was lost unless \
+         outcome is Lost (that also fires AGGREGATOR-DROP-01); ticks during the wait may \
+         have been skipped by the exchange feed. Check df -h /data and the disk's health."
+    );
 }
 
 static GLOBAL_SEAL_OVERFLOW: std::sync::OnceLock<SealOverflow> = std::sync::OnceLock::new();
@@ -1737,6 +1878,186 @@ mod tests {
             "a dead escalation thread must not turn a rescue into a loss"
         );
         cleanup(&spill, &dlq);
+    }
+
+    /// Audit PR40d: the operator chose to accept the stalled-disk wait and
+    /// make it loud. A caller that waits on a held spill lock for longer than
+    /// the page threshold must still spill the seal, and must record the wait
+    /// as a stall that owns the next `AGGREGATOR-STALL-01` line.
+    #[test]
+    fn a_stalled_disk_on_the_fallback_is_timed_and_recorded_as_a_stall() {
+        let (spill, dlq) = temp_pair("escalate-stalled-disk");
+        let runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 16);
+        let mut overflow = runner.overflow();
+        // A dead escalation thread: every `try_send` refuses, so the caller
+        // takes the inline arm, the one that waits on the disk.
+        drop(overflow.split_escalation_offload());
+
+        let held = std::time::Duration::from_millis(SEAL_INLINE_WAIT_PAGE_MS + 200);
+        let spill_writer = std::sync::Arc::clone(&overflow.spill);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            spill_writer.with_appends_paused(|| {
+                entered_tx.send(()).expect("test channel open");
+                std::thread::sleep(held);
+            });
+        });
+        entered_rx.recv().expect("the holder took the spill lock");
+
+        let now = jan1_noon_utc();
+        let started = std::time::Instant::now();
+        let outcome = overflow.escalate(&mk_seal(25, 0, TfIndex::M1, 34_260, 99.0), now);
+        let waited = started.elapsed();
+        holder.join().expect("holder must not panic");
+
+        assert_eq!(
+            outcome,
+            OverflowOutcome::Spilled,
+            "the wait must never cost the seal"
+        );
+        assert!(
+            waited >= std::time::Duration::from_millis(SEAL_INLINE_WAIT_PAGE_MS),
+            "the test did not actually hold the caller for the page threshold: {waited:?}"
+        );
+        assert_eq!(
+            overflow
+                .stall_report
+                .last_logged_secs
+                .load(std::sync::atomic::Ordering::Relaxed),
+            now,
+            "a wait past the threshold must claim the AGGREGATOR-STALL-01 line"
+        );
+        assert_eq!(
+            overflow
+                .stall_report
+                .stalls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the line took the window's stall count, so the window restarts at zero"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    /// A short inline wait is timed but is not a stall and claims no line.
+    #[test]
+    fn a_quick_fallback_is_timed_but_never_claims_the_stall_line() {
+        let (spill, dlq) = temp_pair("escalate-quick-fallback");
+        let runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 16);
+        let mut overflow = runner.overflow();
+        drop(overflow.split_escalation_offload());
+
+        let outcome =
+            overflow.escalate(&mk_seal(25, 0, TfIndex::M1, 34_260, 99.0), jan1_noon_utc());
+        assert_eq!(outcome, OverflowOutcome::Spilled);
+        assert_eq!(
+            overflow
+                .stall_report
+                .last_logged_secs
+                .load(std::sync::atomic::Ordering::Relaxed),
+            i64::MIN,
+            "a sub-threshold wait must not page"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    /// The stall line is throttled to one per `SEAL_INLINE_STALL_LOG_EVERY_SECS`
+    /// and folds every stall inside the window into the next line, so the
+    /// throttle hides a stall's count and length from nobody.
+    #[test]
+    fn inline_stall_report_throttles_and_folds_the_window_into_the_next_line() {
+        let report = InlineStallReport::new();
+        assert_eq!(
+            report.record(1_500, 100),
+            Some((1, 1_500)),
+            "the first stall logs at once"
+        );
+        assert_eq!(
+            report.record(2_000, 110),
+            None,
+            "inside the window: folded, not logged"
+        );
+        assert_eq!(report.record(1_200, 159), None, "still inside the window");
+        assert_eq!(
+            report.record(1_100, 100 + SEAL_INLINE_STALL_LOG_EVERY_SECS),
+            Some((3, 2_000)),
+            "the next line carries the three stalls since the last and the longest of them"
+        );
+        assert_eq!(
+            report.record(1_000, 170),
+            None,
+            "a new window started at the last line"
+        );
+    }
+
+    /// A clock that steps backwards must not open a second line inside the
+    /// window, and must not wedge the report shut either.
+    #[test]
+    fn inline_stall_report_survives_a_backwards_clock_step() {
+        let report = InlineStallReport::new();
+        assert!(report.record(1_500, 1_000).is_some());
+        assert_eq!(
+            report.record(1_500, 900),
+            None,
+            "a backwards step is inside the window"
+        );
+        assert!(
+            report
+                .record(1_500, 1_000 + SEAL_INLINE_STALL_LOG_EVERY_SECS)
+                .is_some(),
+            "time moving forward again reopens the line"
+        );
+    }
+
+    /// The names and threshold the §2.7 alarm and runbook depend on.
+    #[test]
+    fn the_inline_wait_page_threshold_and_names_are_pinned() {
+        assert_eq!(SEAL_INLINE_WAIT_PAGE_MS, 1_000);
+        assert_eq!(SEAL_INLINE_STALL_LOG_EVERY_SECS, 60);
+        assert_eq!(
+            SEAL_ESCALATION_INLINE_WAIT_MS_COUNTER,
+            "tv_seal_escalation_inline_wait_ms_total"
+        );
+        assert_eq!(
+            SEAL_ESCALATION_INLINE_STALL_COUNTER,
+            "tv_seal_escalation_inline_stall_total"
+        );
+        assert_eq!(
+            tickvault_common::error_code::ErrorCode::AggregatorStall01InlineWait.code_str(),
+            "AGGREGATOR-STALL-01"
+        );
+    }
+
+    /// The clock is read on the refused inline arm only: the queued arm, the
+    /// common case, stays a channel send and one atomic add (noise-lock §2.7
+    /// REJECT row "reads the clock on the normal queued path").
+    #[test]
+    fn escalate_reads_the_clock_only_on_the_refused_arm() {
+        let src = include_str!("seal_writer_runner.rs");
+        let start = src
+            .find("pub fn escalate(&self, seal: &BufferedSeal")
+            .expect("escalate exists");
+        // Bounded at the next item, the same way the handle scan above is:
+        // a literal closing-brace marker would unbalance the brace-depth
+        // tracker the banned-pattern hook uses to skip this test module.
+        let end = src[start..]
+            .find("fn report_inline_stall(")
+            .expect("escalate must be followed by report_inline_stall");
+        let body = &src[start..start + end];
+        let clock = body
+            .find("Instant::now()")
+            .expect("the refused arm is timed");
+        let refused = body
+            .find("TrySendError::Full(item)")
+            .expect("the refused arm exists");
+        assert_eq!(
+            body.matches("Instant::now()").count(),
+            1,
+            "one clock read only"
+        );
+        assert!(
+            clock > refused,
+            "the clock read must sit inside the refused arm"
+        );
     }
 
     #[test]

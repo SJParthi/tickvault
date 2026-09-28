@@ -1102,10 +1102,28 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     `a_batch_that_straddles_ist_midnight_files_each_record_under_its_own_day`,
     `staging_with_appends_paused_sends_the_next_seal_to_a_fresh_live_file`,
     `chaos_a_database_outage_spills_every_seal_and_recovery_replays_each_once`.
-- [ ] **PR40d — the inline fallback's stalled-disk wait has an owner decision.** (`storage`)
+- [x] **PR40d — the inline fallback's stalled-disk wait has an owner decision.** (`storage`)
   Asked on 2026-09-27 with three options: accept the wait and make it loud (recommended), a
-  second disk as a third store, or a memory overflow. A new page needs a dated noise-lock
-  section with the owner's words first.
+  second disk as a third store, or a memory overflow. The owner chose "Accept the wait" on the
+  card at 23:26 UTC; recorded first as `dhan-rest-only-noise-lock-2026-07-14.md` §2.7.
+  - Done: only the refused arm of `SealOverflow::escalate` reads the clock (the queued arm reads
+    none, pinned by a source scan). Every inline wait adds its milliseconds to
+    `tv_seal_escalation_inline_wait_ms_total`; a wait of `SEAL_INLINE_WAIT_PAGE_MS` (1,000 ms) or
+    more counts on `tv_seal_escalation_inline_stall_total` and, at most once per
+    `SEAL_INLINE_STALL_LOG_EVERY_SECS` (60), writes a critical `AGGREGATOR-STALL-01` line that
+    folds the window's stall count and longest wait into it. Both counters are seeded at 0 with
+    the other escalation counters. The code pages through the errcode alarm
+    `tv-<env>-errcode-aggregator-stall-01` (one line per 300 s, `ok_recovery = false`), with its
+    phone wording, a triage rule and a runbook section.
+  - Not done: the line is written when the wait ENDS, so a disk that never returns is caught by
+    the liveness alarms, not this one. The 1,000 ms line is a judgement, not a measurement. The
+    two counters are not in the CloudWatch metric list (cost); the log line is the page.
+  - Tests: `a_stalled_disk_on_the_fallback_is_timed_and_recorded_as_a_stall` (a real 1.2 s disk
+    stall), `a_quick_fallback_is_timed_but_never_claims_the_stall_line`,
+    `inline_stall_report_throttles_and_folds_the_window_into_the_next_line`,
+    `inline_stall_report_survives_a_backwards_clock_step`,
+    `the_inline_wait_page_threshold_and_names_are_pinned`,
+    `escalate_reads_the_clock_only_on_the_refused_arm`.
 - Original PR40 text, kept as the source for 40a–40c:
   - A crash (abort, out of memory, hard kill) loses every queued seal uncounted: up to 250,000
     in the escalation queue, 750,000 across writer channel, ring and escalation queue
