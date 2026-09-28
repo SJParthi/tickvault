@@ -300,7 +300,12 @@ fn scan_corpus_exists_and_is_substantial() {
 /// budget follows the corpus down in the same change, per the rule stated at
 /// the 91 -> 83 step: a ratchet allowed to sit above the truth is a ceiling
 /// somebody padded once, and it stops ratcheting the moment it does.
-const UNCODED_ERROR_BUDGET: usize = 76;
+///
+/// 76 -> 71 (2026-09-28, audit D3c-1). Five sites CODED: the daily rider's
+/// constituent-unresolved, gate-closed, persist-failed, task-died and
+/// still-failing lines in `dhan_universe.rs` now carry `WS-GAP-03` with a
+/// `source` naming the arm.
+const UNCODED_ERROR_BUDGET: usize = 71;
 
 /// Per-crate uncoded-error budgets, for the crates the six-name list never
 /// reached.
