@@ -1507,6 +1507,93 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     ~4.2 ms in two (likely a host pause, unproven until measured on a quiet host). Correct the
     CLAUDE.md figures in the same PR.
 
+### Added 2026-09-28 (seventh re-check, main 13e405f), riskiest first
+
+Source: `/mnt/project-files/audit/recheck7-gaps.md` (15 ranked items and the per-area gap lists,
+each with file:line). "Verified" below means this thread read the code on `origin/main` at
+13e405f. Every other line is carried from the re-check and is re-verified when its item starts.
+
+Order of work: PR #1975 (D3a) finishes first. Then PR53 (it can destroy a kept table), D3b, D3c,
+PR54, PR55, PR56, then the order already set: PR41, PR31b, PR42–PR50, PR31c, PR32–PR39, PR51,
+the PR4c follow-ups, PR52. PR30b stays on or after 2026-10-01.
+
+- [ ] **PR53 — a boot never drops a kept table, and a clean-up marker means the clean-up ran.**
+  (`storage`, `app`)
+  - Verified: `drop_legacy_candle_objects` runs `DROP TABLE IF EXISTS candles_1s` (step 2,
+    shadow_persistence.rs:833-840) whenever its marker is missing, unreadable or on an older sweep
+    version. `candles_1s` is a live fold table today (`TfIndex::S1`, tf_index.rs:445), so any
+    future sweep-version bump, or a lost `data/state` marker, drops every 1-second candle.
+  - Verified: the marker is written after the sweep whatever the drops returned; a failed drop is
+    logged and the marker still says done.
+  - Fix: remove `candles_1s` from the drop list (a guard test pins that no drop list names a live
+    `TfIndex` table or a KEEP table); write each marker only when every drop in its sweep
+    returned 2xx; PR31a's background re-run waits for the database to answer before it sweeps;
+    correct the false "retry next boot" line (candle_ddl_boot.rs:119-120).
+- [ ] **PR54 — a depth socket that never sends a first frame pages.** (`app`, `core`)
+  - From re-check 7: a morning-dial depth socket that never delivers a frame pages nothing, and
+    the comment that says RISK-GAP-03 covers it is false for depth. PR44/PR45 do not cover it.
+  - Fix: a per-socket first-frame deadline (O(1) per socket) that pages through an existing
+    live-lane alarm, and the comment corrected.
+- [ ] **PR55 — no deploy input reaches a shell, and every deploy path needs main + All Green.**
+  (`.github/workflows/`, deploy terraform) Widens PR36b.
+  - Verified: `${{ github.event.inputs.confirm_market_hours }}` is pasted into `run:` in
+    deploy-aws.yml:420 and :850 (and terraform-apply.yml:454 per the re-check). Pass it through
+    `env:` in every workflow.
+  - From re-check 7: a pushed `v*` tag, a re-run of an older dispatch run, terraform-apply /
+    resize / disk-grow / log-wipe from another branch, and a PR that edits terraform-apply.yml
+    all bypass the PR36b gate; the PR36a key guard checks text only, so `--message "$TOK"`
+    passes (terraform-apply.yml:757-763). Close each; test the guards against stubs in CI.
+- [ ] **PR56 — arrival time never runs ahead after a backward clock step.** (`storage`, `app`)
+  Widens PR31c's close-clock bullet.
+  - From re-check 7: after a backward step nothing re-anchors or clamps the receipt anchor, so
+    the feed-delay gauge (a false Dhan feed-delay page at about 60 s or more), silence stamps,
+    the board close clock and depth times all skew for the rest of the process. Re-anchor, and
+    alarm on the size of the refused jump rather than on `refused_backward` (read noise).
+
+Corrections and widenings to existing items:
+
+- D3b: also the boot wait (ends 08:40, not 09:10: dhan_live_universe.rs:847, :975-989), and the
+  page says "restart" until D3b makes a restart unnecessary.
+- D3c: one failed index-member download must not reject the day's list
+  (dhan_universe.rs:879, :965); make the 50 MiB / 60 s master cap and the 0.1% bad-row skip
+  visible (constants.rs:1119, :1183); page when depth-200 dials nothing and `top_volume` stays
+  empty; the 15:41 check verifies only the 4 dead ids on a collapsed day.
+- D8: as written it keeps the dead SENSEX seed forever, because the master's index rows are
+  NSE-only (dhan_universe.rs:564). Re-scope before starting.
+- D1: verified, nothing in production calls `clear_order_halt` (engine.rs:457 has test callers
+  only), so a latched halt clears only on restart; and rate_limiter.rs:234 says the daily reset
+  clears the budget while the halt stays. Fix the comment and give the halt a production clear
+  path (paper mode; `dry_run` is not touched).
+- PR40b: the 7-day boot prune runs before the boot drain (main.rs:1819 vs the recovery further
+  down), so after 7+ days off it deletes unreplayed candles; and `.bin.N` files in `archive/`
+  and `replaying/` are never pruned or counted. Move the prune after recovery and match the
+  suffixed names.
+- PR40a follow-up (goes with PR31b): the crash marker is written clean before the escalation
+  queue drains, so a kill in the shutdown wait loses up to 250,000 queued candles and the next
+  boot reports none; a failed marker write is an uncoded warning.
+- PR40d follow-up: the once-a-minute throttle is keyed on the time the fold passes in
+  (seal_writer_runner.rs:691, fed from dhan_feed_stack.rs:9960), not the wall clock.
+- PR31b: include row 253 (crash-lost seals; the warm-up gives no candle to buckets that ended
+  before it starts).
+- PR31c: there are ten candle tables, not nine; one keyed switch per family means a single
+  top-volume column-repair refusal discards every board for the session; a refused candle while
+  tables are unkeyed goes to spill but pages as a loss; nothing keeps paging while tables stay
+  unkeyed.
+- PR39: the error-code ratchet matches `code =` as a substring (error_code_tag_guard.rs:303,
+  :309, :504), so two uncoded lines count as coded; name the seven uncoded loss warnings; the
+  SPILL-RETENTION-01 bullet is obsolete (PR40b reused AGGREGATOR-DROP-01).
+- PR46: the box role can also READ the console key and the GitHub token (main.tf:215-251);
+  narrow read as well as write. "Confine the socket to one status call" is not possible on a
+  Unix socket; name a privileged helper instead.
+- PR50: the deploy start step needs the holiday check, and every deploy re-enables and restarts
+  the app even during a console reset (deploy-aws.yml:1087-1106); deploys take the reset lock.
+- PR19: the log tool's code search reads `~/.aws`, `~/.ssh` and `environ`
+  (tickvault-logs-mcp/src/tools.rs:1683-1688); refuse out-of-repo paths. The second database
+  server in `.mcp.json` and the unpinned session servers (row 86) go with it.
+- The remaining per-area items in the gap file (ops/deploy/security, storage, feed, Dhan
+  mismatches) are folded into the item each names when that item starts; any that names no
+  item gets its own item before PR51.
+
 ## Edge Cases
 
 - PR1: log burst larger than the non-blocking buffer → lines dropped and counted, never blocking.
