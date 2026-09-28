@@ -3015,12 +3015,12 @@ async fn async_main() -> Result<()> {
             // opens; DEDUP-idempotent via the replay-stable `capture_seq`.
             // Empty on a clean boot.
             wal_replay_live_feed: std::mem::take(&mut ws_wal_replay_live_feed),
-            // DEFAULT-OFF: with `live_subscription_from_master = false` (the
-            // shipped value) this returns the same 4 hardcoded index SIDs the
-            // lane has always used, so the operator's 2026-08-11 third-quote
-            // carve-out — "re-pointing the lane… must not be smuggled in" — is
-            // honoured in substance: the live set does not move until a human
-            // flips the flag and restarts.
+            // The master-sourced set: `live_subscription_from_master` was built
+            // default-off and the operator turned it on on 2026-08-12
+            // (`config/base.toml` ships `true`). A missing list for today takes
+            // the newest earlier day's list, and an oversized one fills the
+            // envelope by priority; only with no list on disk is this the 4
+            // index SIDs (audit D3).
             main_feed_instruments: main_feed_instruments.clone(),
             // Empty by design — the stack late-attaches depth after 09:16 IST.
             depth_20_instruments: Vec::new(),

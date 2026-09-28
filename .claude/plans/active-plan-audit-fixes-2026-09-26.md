@@ -267,6 +267,40 @@ inline (PR2, PR8, PR14).
     text and count only contracts actually subscribed (dhan_feed_stack.rs:10761-10763, :10778-10781,
     :12428-12440). Stocks with no trade by 09:30 get no options: publish the count as a gauge at
     hand-off (dhan_feed_stack.rs:12437-12448). Depth sockets are PR44's, not this item's.
+  - Owner decision recorded (2026-09-26): over 25,000, fill 25,000 by priority with a critical
+    page; no 4-index fallback. Scheduled next after PR40d on 2026-09-28 at the "4 index ids"
+    thread's request (a 04:26 IST deploy-run boot subscribed only the 4 index SIDs and never
+    widened). Split into three PRs:
+  - [x] **D3a — never 4 when a list exists.** (`app`, doc-only `common`)
+    - Done: over capacity, `select_live_universe` fills the envelope by priority (indices first,
+      then by `(segment, security_id)`, since the list has no rank and row order is not a contract), counts `refused_over_capacity`, and pages through the existing
+      live-lane fallback alarm with `reason="truncated_to_capacity"` (seeded at 0). Today's list
+      missing or unreadable: the boot takes the newest earlier day's list still on disk (lookback =
+      the rider's `ARTIFACT_RETENTION_DAYS`, 7), same NTM → F&O → full precedence, empty lists
+      skipped; paged through the same counter and reason as before when the boot should have
+      widened, `warn!` with `source=pre_rider_boot` when it could not. The collapse alarm still
+      fires only when no list is on disk at all. Stale text fixed: module doc, `main.rs`
+      comment, `market_ram_store_boot.rs`, the master-off log line, the wait-arm lines,
+      `MAX_DAILY_UNIVERSE_SIZE` doc, the alarm description.
+    - Not done here: widening a RUNNING session (D3b); the `ntm_*` reasons are still not seeded
+      and the `fno_*` widenings still count on the paging counter (pre-existing, noted for D3c).
+    - Tests: `over_the_envelope_fills_the_capacity_by_priority_indices_first`,
+      `exactly_at_the_envelope_is_not_a_truncation`,
+      `earlier_ist_dates_walks_back_across_a_month_boundary_newest_first`,
+      `the_lookback_takes_the_newest_earlier_day_and_never_rereads_today`,
+      `the_lookback_skips_an_empty_list`, `the_lookback_keeps_todays_precedence_within_a_day`,
+      `the_lookback_stops_at_the_retention_window`,
+      `resolve_looks_back_exactly_as_far_as_the_rider_keeps_files`, property
+      `an_oversized_master_fills_the_capacity_by_priority_and_reports_it`, and the extended
+      `the_expected_fallback_cannot_reach_the_collapse_alarm`.
+  - [ ] **D3b — widen a running session when today's list lands.** The lane reads the universe
+    once at boot. Reuse the late attach's machinery: the set difference on the composite key goes
+    to spare room on live sockets via `LiveSubscriptionCommand::Extend` and to new sockets via
+    `build_feed_stack_plan`; the attach task keeps the pool until the widen is done. Each Extend
+    ≤ 5,000 per socket to stay inside the 5 s top-up budget.
+  - [ ] **D3c — the rest of D3:** parked-socket reassignment, late top-up refusals counted and
+    alarmed, the top-up log text, the no-trade-by-09:30 gauge, and the fallback counter's
+    reason hygiene (seed `ntm_*`; stop widenings paging).
 - [ ] **D4 — stale-price gate on entries.** (`trading` risk, not strategy)
   - No price-age check exists (risk/engine.rs:262). Add one to `check_order_in_segment`: an ENTRY
     whose last price is older than 5 s is refused with a coded reason; exits are never gated.
@@ -1102,10 +1136,28 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     `a_batch_that_straddles_ist_midnight_files_each_record_under_its_own_day`,
     `staging_with_appends_paused_sends_the_next_seal_to_a_fresh_live_file`,
     `chaos_a_database_outage_spills_every_seal_and_recovery_replays_each_once`.
-- [ ] **PR40d — the inline fallback's stalled-disk wait has an owner decision.** (`storage`)
+- [x] **PR40d — the inline fallback's stalled-disk wait has an owner decision.** (`storage`)
   Asked on 2026-09-27 with three options: accept the wait and make it loud (recommended), a
-  second disk as a third store, or a memory overflow. A new page needs a dated noise-lock
-  section with the owner's words first.
+  second disk as a third store, or a memory overflow. The owner chose "Accept the wait" on the
+  card at 23:26 UTC; recorded first as `dhan-rest-only-noise-lock-2026-07-14.md` §2.7.
+  - Done: only the refused arm of `SealOverflow::escalate` reads the clock (the queued arm reads
+    none, pinned by a source scan). Every inline wait adds its milliseconds to
+    `tv_seal_escalation_inline_wait_ms_total`; a wait of `SEAL_INLINE_WAIT_PAGE_MS` (1,000 ms) or
+    more counts on `tv_seal_escalation_inline_stall_total` and, at most once per
+    `SEAL_INLINE_STALL_LOG_EVERY_SECS` (60), writes a critical `AGGREGATOR-STALL-01` line that
+    folds the window's stall count and longest wait into it. Both counters are seeded at 0 with
+    the other escalation counters. The code pages through the errcode alarm
+    `tv-<env>-errcode-aggregator-stall-01` (one line per 300 s, `ok_recovery = false`), with its
+    phone wording, a triage rule and a runbook section.
+  - Not done: the line is written when the wait ENDS, so a disk that never returns is caught by
+    the liveness alarms, not this one. The 1,000 ms line is a judgement, not a measurement. The
+    two counters are not in the CloudWatch metric list (cost); the log line is the page.
+  - Tests: `a_stalled_disk_on_the_fallback_is_timed_and_recorded_as_a_stall` (a real 1.2 s disk
+    stall), `a_quick_fallback_is_timed_but_never_claims_the_stall_line`,
+    `inline_stall_report_throttles_and_folds_the_window_into_the_next_line`,
+    `inline_stall_report_survives_a_backwards_clock_step`,
+    `the_inline_wait_page_threshold_and_names_are_pinned`,
+    `escalate_reads_the_clock_only_on_the_refused_arm`.
 - Original PR40 text, kept as the source for 40a–40c:
   - A crash (abort, out of memory, hard kill) loses every queued seal uncounted: up to 250,000
     in the escalation queue, 750,000 across writer channel, ring and escalation queue

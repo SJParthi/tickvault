@@ -93,12 +93,15 @@ proptest! {
     ///
     /// Over the envelope, `plan_pool` refuses the WHOLE main-feed pool, so an
     /// overshoot costs the session its price feed rather than costing the
-    /// excess. This selector's own answer to that is to fall back, and the
-    /// fallback must itself fit.
+    /// excess. This selector's answer (audit D3) is to fill the envelope by
+    /// priority, and the filled set must itself fit.
     #[test]
     fn the_selection_never_exceeds_the_capacity(m in master(), capacity in 0_usize..80) {
         let got = select_live_universe(&seeds(), Some(&m), capacity);
-        if got.source == UniverseSource::MasterSourced {
+        if matches!(
+            got.source,
+            UniverseSource::MasterSourced | UniverseSource::TruncatedToCapacity
+        ) {
             prop_assert!(got.instruments.len() <= capacity);
         }
     }
@@ -181,19 +184,43 @@ proptest! {
         }
     }
 
-    /// OVER CAPACITY FALLS BACK TO EXACTLY THE SEEDS, AND SAYS SO.
+    /// OVER CAPACITY FILLS THE CAPACITY BY PRIORITY, AND SAYS SO (audit D3).
     ///
-    /// A silent partial widening would be worse than the fallback: the count
-    /// would look ordinary and nobody could tell which instruments were lost.
+    /// Owner decision 2026-09-26: never fall back to the 4 index SIDs. The
+    /// envelope is filled — indices first — and the excess is counted, so the
+    /// count of what was left out is exact.
     #[test]
-    fn an_oversized_master_falls_back_to_the_index_set_and_reports_it(m in master()) {
+    fn an_oversized_master_fills_the_capacity_by_priority_and_reports_it(
+        m in master(),
+        capacity in 0_usize..8,
+    ) {
         let seeds = seeds();
-        let got = select_live_universe(&seeds, Some(&m), 0);
-        prop_assert_eq!(got.source, UniverseSource::FellBackToIndices);
-        prop_assert_eq!(
-            got.instruments.iter().map(key).collect::<Vec<_>>(),
-            seeds.iter().map(key).collect::<Vec<_>>()
+        let unbounded = select_live_universe(&seeds, Some(&m), usize::MAX);
+        let total = unbounded.instruments.len();
+        if total <= capacity {
+            return Ok(());
+        }
+        let got = select_live_universe(&seeds, Some(&m), capacity);
+        prop_assert_eq!(got.source, UniverseSource::TruncatedToCapacity);
+        prop_assert_eq!(got.instruments.len(), capacity);
+        prop_assert_eq!(got.refused_over_capacity, total - capacity);
+        // Indices first: no non-index instrument precedes an index one.
+        let first_non_index = got
+            .instruments
+            .iter()
+            .position(|i| i.segment != ExchangeSegment::IdxI)
+            .unwrap_or(got.instruments.len());
+        prop_assert!(
+            got.instruments[first_non_index..]
+                .iter()
+                .all(|i| i.segment != ExchangeSegment::IdxI),
+            "an index was placed after a non-index instrument"
         );
+        // And the kept set is a subset of the unbounded one.
+        let all: BTreeSet<(u64, u8)> = unbounded.instruments.iter().map(key).collect();
+        for inst in &got.instruments {
+            prop_assert!(all.contains(&key(inst)));
+        }
     }
 
     /// THE REFUSAL COUNTERS DESCRIBE WHAT HAPPENED.

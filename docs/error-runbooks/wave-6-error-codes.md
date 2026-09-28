@@ -179,6 +179,42 @@ Family completeness is meta-ratcheted by 3 tests in
 merged #591). Future deletion of any single alert OR severity
 downgrade OR market-hours-gate removal fails the build.
 
+## AGGREGATOR-STALL-01 — the live feed waited on a stalled disk to write a refused candle
+
+**Severity:** Critical. **Pages:** `tv-<env>-errcode-aggregator-stall-01` (noise-lock §2.7, 2026-09-27). **No OK page.**
+
+**What happened.** A sealed candle the database writer could not take normally goes
+to the escalation queue, and the `tv-seal-escalate` thread writes it to the spill.
+That queue holds one full market-close burst. It was full (or its thread had died),
+so the frame-drain task — the one thread that reads the Dhan socket — wrote the
+candle to disk ITSELF and waited at least `SEAL_INLINE_WAIT_PAGE_MS` (1,000 ms) for
+the disk to answer.
+
+**Nothing was lost on the candle side:** the line's `outcome` says where the candle
+went (`Spilled` or `DlqWritten`; a `Lost` outcome ALSO fires `AGGREGATOR-DROP-01`).
+What stalled is the socket read. Dhan skips a slow reader forward with no sequence
+number, so ticks during the wait may never have arrived.
+
+**Fields:** `waited_ms` (this wait), `max_waited_ms` and `stalls` (the longest wait
+and the count of waits of at least 1 s since the previous line), `outcome`. At most
+one line a minute. The local counters `tv_seal_escalation_inline_wait_ms_total` and
+`tv_seal_escalation_inline_stall_total` carry the running totals.
+
+**Triage:**
+1. `df -h /data` and the disk's own health (EBS volume status, IO wait). A full or
+   failing disk is the usual cause.
+2. `ls -la data/spill/` — a growing spill means the database is also refusing
+   writes; check QuestDB health (`make doctor`).
+3. `tv_seal_escalation_inline_fallback_total` rising while this line is quiet
+   means waits shorter than 1 s: degraded, not paged.
+4. If the disk is healthy again, nothing needs replaying: the candles are on disk
+   and the normal replay puts them back. Check the tick-flow gauge for the window
+   of the wait to see how much the socket read missed.
+
+**Honest limits:** the line is written when the wait ENDS. A disk that never
+answers keeps the drain waiting and stops every file-based log with it; the lane
+liveness alarms that treat missing data as breaching own that case.
+
 ## AGGREGATOR-LATE-01 — tick arrived after its bucket sealed (discarded)
 
 > **⚠ EMIT SITES DELETED 2026-07-17 (stage-3 dead-WS sweep):** the 21-TF TICK

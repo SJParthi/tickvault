@@ -6,23 +6,36 @@
 //! reasoning for shipping DEFAULT-OFF are recorded in
 //! `.claude/rules/project/websocket-connection-scope-lock.md`.
 //!
-//! # This module changes nothing until a human turns it on
+//! # The switch, and where it stands
 //!
-//! With `[dhan_universe] live_subscription_from_master = false` — the default,
-//! and the shipped value — [`select_live_universe`] returns the same 4 hardcoded
-//! index SIDs the lane has always used. The master-sourced path is code that
-//! *can* widen the subscription, sitting behind an off switch, which is what
-//! keeps the third quote's carve-out ("re-pointing the lane… must not be
-//! smuggled in") honoured in substance rather than only in wording.
+//! `[dhan_universe] live_subscription_from_master` gates the master-sourced
+//! path. It was built DEFAULT-OFF (the third quote's carve-out, "re-pointing
+//! the lane… must not be smuggled in"), and the operator turned it ON on
+//! 2026-08-12: `config/base.toml` ships `true`. With it off,
+//! [`select_live_universe`] returns the 4 hardcoded index SIDs; with it on —
+//! every production boot today — the session subscribes the resolved list.
+//!
+//! # Never the 4 index SIDs when a list exists (audit D3, 2026-09-28)
+//!
+//! Owner, 2026-09-26: no 4-index fallback. Two arms that used to collapse the
+//! session to the 4 index SIDs no longer do:
+//!
+//! * a list larger than the authorized envelope FILLS the envelope by priority
+//!   (indices first) and pages the excess;
+//! * a missing or unreadable list for today takes the newest earlier day's list
+//!   still on disk (the rider keeps 7 days) and pages when that was not
+//!   expected.
+//!
+//! Only when no list at all is on disk does the session run on the index set.
 //!
 //! # Fallback is never silent
 //!
-//! Every path that cannot produce a trustworthy master-sourced set falls back
-//! to the index universe and says so at `error!`. That matters more here than
-//! in most places: a fallback that logged nothing would look identical to a
-//! successful widening in every metric the lane exposes — the connection count
-//! would simply be lower, and nobody reads a connection count expecting it to
-//! carry an error.
+//! Every path that cannot produce today's master-sourced set says so: at
+//! `error!` with a paging counter when the boot should have widened, at `warn!`
+//! on a boot where today's list cannot exist yet. A fallback that logged
+//! nothing would look identical to a successful widening in every metric the
+//! lane exposes — the connection count would simply be lower, and nobody reads
+//! a connection count expecting it to carry an error.
 
 use tickvault_common::types::{ExchangeSegment, SecurityId};
 use tickvault_core::websocket::pool_supervisor::SubscribeInstrument;
@@ -41,6 +54,12 @@ pub enum UniverseSource {
     /// Master sourcing was requested but could not be trusted; the index set
     /// is in use and the reason has been logged.
     FellBackToIndices,
+    /// The resolved set was larger than the authorized main-feed envelope, so
+    /// the envelope was FILLED by priority (indices first, then by
+    /// `(segment, security_id)`) and the excess was counted and paged. Owner decision
+    /// (audit D3, 2026-09-26): fill 25,000 by priority with a critical page,
+    /// never fall back to the 4 index SIDs.
+    TruncatedToCapacity,
 }
 
 impl UniverseSource {
@@ -51,6 +70,7 @@ impl UniverseSource {
             Self::HardcodedIndices => "hardcoded_indices",
             Self::MasterSourced => "master_sourced",
             Self::FellBackToIndices => "fell_back_to_indices",
+            Self::TruncatedToCapacity => "truncated_to_capacity",
         }
     }
 }
@@ -75,6 +95,10 @@ pub struct LiveUniverseSelection {
     /// Entries dropped because they duplicate an already-selected
     /// `(security_id, segment)` pair.
     pub deduped: usize,
+    /// Distinct instruments left out because the set was larger than the
+    /// authorized envelope. Non-zero only with
+    /// [`UniverseSource::TruncatedToCapacity`].
+    pub refused_over_capacity: usize,
 }
 
 /// One resolved constituent, as the daily rider wrote it.
@@ -133,12 +157,16 @@ pub fn parse_mapping_artifact(body: &str) -> Result<Vec<MasterEntry>, String> {
 /// them rather than replacing them.
 ///
 /// `capacity` is the authorized main-feed envelope (connections ×
-/// instruments-per-connection). Exceeding it is refused as a whole rather than
-/// truncated, because `plan_pool` refuses the ENTIRE pool when a set does not
-/// fit — a set one instrument too large would take the main feed down with it,
-/// so silently trimming to fit would be the wrong repair and blowing the lane
-/// up would be worse. Falling back to the index set keeps the feed alive and
-/// makes the problem loud.
+/// instruments-per-connection). `plan_pool` refuses the ENTIRE pool when a set
+/// does not fit, so an oversized set must never reach it. Until 2026-09-28 the
+/// answer was to replace the whole widened set with the 4 index SIDs — a
+/// 99.98% loss to avoid a loss of the excess. The owner's D3 decision
+/// (2026-09-26) replaces that: the envelope is FILLED by priority — indices
+/// first, then by `(segment, security_id)` — the excess is counted in
+/// `refused_over_capacity`, and the caller pages it. Nothing is trimmed
+/// silently; the set that does fit is never thrown away.
+///
+/// O(master) time and space: one hash probe per entry, one stable partition.
 #[must_use]
 pub fn select_live_universe(
     index_universe: &[SubscribeInstrument],
@@ -152,6 +180,7 @@ pub fn select_live_universe(
             refused_zero_id: 0,
             refused_unknown_segment: 0,
             deduped: 0,
+            refused_over_capacity: 0,
         };
     };
 
@@ -278,12 +307,30 @@ pub fn select_live_universe(
     }
 
     if instruments.len() > capacity {
+        // Fill by priority, never fall back to the index set (owner, audit D3).
+        // Indices first — every option and future is priced against them.
+        // The list carries no rank of its own, and its row order is not a
+        // contract (pinned by `reversing_the_master_does_not_change_the_
+        // subscribed_set`), so past the indices the order is the composite key:
+        // the same list in any row order keeps the same instruments.
+        // O(n log n) on the cold boot path, once.
+        let mut ordered = instruments;
+        ordered.sort_unstable_by_key(|i| {
+            (
+                i.segment != ExchangeSegment::IdxI,
+                i.segment.binary_code(),
+                i.security_id,
+            )
+        });
+        let refused_over_capacity = ordered.len() - capacity;
+        ordered.truncate(capacity);
         return LiveUniverseSelection {
-            instruments: index_universe.to_vec(),
-            source: UniverseSource::FellBackToIndices,
+            instruments: ordered,
+            source: UniverseSource::TruncatedToCapacity,
             refused_zero_id,
             refused_unknown_segment,
             deduped,
+            refused_over_capacity,
         };
     }
 
@@ -302,6 +349,7 @@ pub fn select_live_universe(
         refused_zero_id,
         refused_unknown_segment,
         deduped,
+        refused_over_capacity: 0,
     }
 }
 
@@ -442,6 +490,97 @@ fn read_master_artifact(path: &std::path::Path) -> Result<Vec<MasterEntry>, Arti
     parse_mapping_artifact(&body).map_err(ArtifactFailure::Unparseable)
 }
 
+/// The `days` IST dates before `date_ist`, newest first.
+///
+/// Empty when `date_ist` is not `YYYY-MM-DD`: a lookback computed from a
+/// guessed date could read the wrong day's file, and an empty lookback falls
+/// to the existing loud fallback instead.
+#[must_use]
+pub fn earlier_ist_dates(date_ist: &str, days: i64) -> Vec<String> {
+    let Ok(today) = chrono::NaiveDate::parse_from_str(date_ist, "%Y-%m-%d") else {
+        return Vec::new();
+    };
+    (1..=days.max(0))
+        .filter_map(|back| today.checked_sub_signed(chrono::TimeDelta::days(back)))
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .collect()
+}
+
+/// An earlier day's list, used in place of today's when today's cannot be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EarlierMaster {
+    /// The rows, parsed exactly as today's would be.
+    pub entries: Vec<MasterEntry>,
+    /// The IST date the file was written for.
+    pub date_ist: String,
+    /// Which of the three spot lists it is (`ntm`, `fno_underlyings`,
+    /// `full_master`), for the log line.
+    pub kind: &'static str,
+}
+
+/// `source` label on the line that reports a boot running on an earlier day's
+/// list. NOT `fell_back_to_indices`: the session is not collapsed, so the
+/// collapse alarm must not match it. The fallback COUNTER still moves (with the
+/// same `artifact_*` reason as before) and that alarm pages it.
+pub const EARLIER_ARTIFACT_SOURCE: &str = "earlier_day_artifact";
+
+/// Find the newest earlier day's spot list, trying the same kinds, in the same
+/// precedence, as today's resolve: NTM, then F&O underlyings (each only when
+/// its flag is on), then the full mapping.
+///
+/// Why an earlier list is safe to subscribe: every row is an `NSE_EQ` stock or
+/// an `IDX_I` index, and those security ids are stable from day to day — only
+/// DERIVATIVE ids are re-issued (instrument-master rule). The cost is honest
+/// and bounded: a stock that joined the list today is missing until today's
+/// list is read, and one that left it is subscribed for one more session.
+/// Both are far better than the 4 index SIDs, which is what this replaces.
+///
+/// An empty list is skipped, never returned: it would resolve to nothing and
+/// report a collapse under a different name.
+///
+/// O(days × kinds) file probes (at most 7 × 3), once per boot, cold path.
+fn newest_earlier_master_with(
+    cfg: &tickvault_common::config::DhanUniverseConfig,
+    date_ist: &str,
+    days: i64,
+    mut read: impl FnMut(&std::path::Path) -> Result<Vec<MasterEntry>, ArtifactFailure>,
+) -> Option<EarlierMaster> {
+    for date in earlier_ist_dates(date_ist, days) {
+        let kinds: [(bool, std::path::PathBuf, &'static str); 3] = [
+            (
+                cfg.spot_universe_ntm_only,
+                crate::dhan_universe::ntm_spot_artifact_path(&date),
+                "ntm",
+            ),
+            (
+                cfg.spot_universe_fno_underlyings_only,
+                crate::dhan_universe::fno_underlying_artifact_path(&date),
+                "fno_underlyings",
+            ),
+            (
+                true,
+                crate::dhan_universe::mapping_artifact_path(&date),
+                "full_master",
+            ),
+        ];
+        for (enabled, path, kind) in kinds {
+            if !enabled {
+                continue;
+            }
+            if let Ok(entries) = read(&path)
+                && !entries.is_empty()
+            {
+                return Some(EarlierMaster {
+                    entries,
+                    date_ist: date,
+                    kind,
+                });
+            }
+        }
+    }
+    None
+}
+
 /// Counter: master sourcing was REQUESTED but did not take effect, by reason.
 ///
 /// Non-zero means the live lane is subscribing the 4 hardcoded index SIDs while
@@ -478,6 +617,7 @@ pub const MASTER_SOURCING_FALLBACK_REASONS: &[&str] = &[
     "fno_artifact_unreadable",
     "fno_artifact_unparseable",
     "no_usable_widening",
+    "truncated_to_capacity",
 ];
 
 /// Gauge: how many instruments the live lane actually subscribed.
@@ -570,8 +710,8 @@ pub fn resolve_live_universe(
         tracing::info!(
             instruments = index_universe.len(),
             source = UniverseSource::HardcodedIndices.as_str(),
-            "live universe: the 4 hardcoded index SIDs (master sourcing is OFF by \
-             default; enabling it is a config change plus a restart)"
+            "live universe: the 4 hardcoded index SIDs (master sourcing is switched \
+             OFF in config; turning it on is a config change plus a restart)"
         );
         return index_universe;
     }
@@ -685,14 +825,70 @@ pub fn resolve_live_universe(
         "fno_underlyings"
     };
 
-    let master = match master {
-        Some(m) => m,
+    // Which day's list the session actually runs on. Today's in every normal
+    // boot; an earlier day's when today's cannot be read (audit D3, below).
+    let (master, artifact_date, spot_universe_label) = match master {
+        Some(m) => (m, date_ist.to_owned(), spot_universe_label),
         None => {
             let path = crate::dhan_universe::mapping_artifact_path(date_ist);
             match read_master_artifact(&path) {
-                Ok(m) => m,
+                Ok(m) => (m, date_ist.to_owned(), spot_universe_label),
                 Err(failure) => {
-                    if collapse_expected {
+                    // Audit D3 (owner, 2026-09-26: "no 4-index fallback").
+                    // Before falling to the 4 index SIDs, take the newest
+                    // earlier day's list the rider left on disk (it keeps 7
+                    // days). That turns a 99.98% collapse into, at worst, a
+                    // day-old list of stocks whose ids do not change.
+                    if let Some(earlier) = newest_earlier_master_with(
+                        cfg,
+                        date_ist,
+                        crate::dhan_universe::ARTIFACT_RETENTION_DAYS,
+                        read_master_artifact,
+                    ) {
+                        if collapse_expected {
+                            // Expected (pre-rider or non-trading-day boot):
+                            // no page, same label the collapse filter ignores.
+                            tracing::warn!(
+                                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState
+                                    .code_str(),
+                                source = PRE_RIDER_BOOT_SOURCE,
+                                detail = failure.detail(),
+                                path = %path.display(),
+                                artifact_date = %earlier.date_ist,
+                                spot_universe = earlier.kind,
+                                entries = earlier.entries.len(),
+                                "live universe: today's list does not exist yet (non-trading \
+                                 day, or before the daily rider's build hour) — subscribing \
+                                 the newest earlier list instead of the 4 index SIDs. \
+                                 Expected for this boot."
+                            );
+                        } else {
+                            // Pages through the fallback counter's alarm, with
+                            // the same reason label as before. Counted only;
+                            // the size gauge is published by the success path
+                            // below with the real subscribed number.
+                            metrics::counter!(
+                                MASTER_SOURCING_FALLBACK_COUNTER,
+                                "reason" => failure.mapping_reason()
+                            )
+                            .increment(1);
+                            tracing::error!(
+                                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState
+                                    .code_str(),
+                                source = EARLIER_ARTIFACT_SOURCE,
+                                detail = failure.detail(),
+                                path = %path.display(),
+                                artifact_date = %earlier.date_ist,
+                                spot_universe = earlier.kind,
+                                entries = earlier.entries.len(),
+                                "live universe: today's list is unusable — subscribing the \
+                                 newest earlier list instead of the 4 index SIDs. Stocks \
+                                 added today are missing and stocks removed today are still \
+                                 subscribed until today's list is read."
+                            );
+                        }
+                        (earlier.entries, earlier.date_ist, earlier.kind)
+                    } else if collapse_expected {
                         // EXPECTED fallback: a non-trading day, or a trading
                         // day before the rider's build hour — today's artifact
                         // cannot exist yet. See
@@ -711,56 +907,62 @@ pub fn resolve_live_universe(
                             detail = failure.detail(),
                             path = %path.display(),
                             "live universe: today's mapping artifact does not exist yet \
-                             (non-trading day, or before the daily rider's build hour) — \
-                             subscribing the index universe for this boot. Expected; the \
-                             scheduled morning start is the boot that widens the session."
+                             (non-trading day, or before the daily rider's build hour) and no \
+                             earlier list is on disk — subscribing the index universe for this \
+                             boot. Expected; the scheduled morning start is the boot that \
+                             widens the session."
+                        );
+                        return index_universe;
+                    } else {
+                        // No earlier list on disk either: the old fallback, still paged.
+                        record_master_sourcing_fallback(
+                            failure.mapping_reason(),
+                            index_universe.len(),
+                        );
+                        tracing::error!(
+                            code =
+                                tickvault_common::error_code::ErrorCode::WsGapConnectionState
+                                    .code_str(),
+                            // LOAD-BEARING FIELD — DO NOT REMOVE.
+                            //
+                            // `tv-<env>-errcode-ws-gap-03-universe-collapse` matches
+                            // `{ $.code = "WS-GAP-03" && $.level = "ERROR"
+                            //    && $.source = "fell_back_to_indices" }`
+                            // (`error-code-alarms.tf:708`). WS-GAP-03 has ~50 emit
+                            // sites, so the `source` term is what stops the alarm
+                            // paging on ordinary reconnect churn — and it is
+                            // therefore also what decides whether it can fire AT ALL.
+                            //
+                            // This field was MISSING here until 2026-09-06, and this
+                            // is the arm that actually runs: the sibling arm below
+                            // (master read OK, no usable widening) carried `source`
+                            // and could page; THIS arm — today's artifact absent or
+                            // unreadable, the overwhelmingly common case — could not.
+                            //
+                            // Proven on the box, 2026-09-05: the artifact was missing,
+                            // this line fired twice with fields {code, detail, path}
+                            // and no `source`, the session ran on 4 instruments
+                            // instead of ~22,996, ZERO ticks were captured all day —
+                            // and `describe-alarm-history` for the collapse alarm and
+                            // for `tv-prod-live-universe-fallback` returns EMPTY. The
+                            // operator was never paged for the failure both alarms
+                            // exist to catch.
+                            //
+                            // The module doc above stated the opposite ("the OUTCOME
+                            // is covered"), which is the false-OK class this
+                            // repository keeps paying for: an alarm that is enabled,
+                            // documented as covering the case, and structurally
+                            // unable to match it.
+                            source = UniverseSource::FellBackToIndices.as_str(),
+                            detail = failure.detail(),
+                            path = %path.display(),
+                            "live universe: today's mapping artifact is unusable — falling back \
+                             to the index universe. Master sourcing was REQUESTED and is NOT in \
+                             effect; the subscribed set is the index universe, not the widened \
+                             set."
                         );
                         return index_universe;
                     }
-                    record_master_sourcing_fallback(failure.mapping_reason(), index_universe.len());
-                    tracing::error!(
-                        code =
-                            tickvault_common::error_code::ErrorCode::WsGapConnectionState
-                                .code_str(),
-                        // LOAD-BEARING FIELD — DO NOT REMOVE.
-                        //
-                        // `tv-<env>-errcode-ws-gap-03-universe-collapse` matches
-                        // `{ $.code = "WS-GAP-03" && $.level = "ERROR"
-                        //    && $.source = "fell_back_to_indices" }`
-                        // (`error-code-alarms.tf:708`). WS-GAP-03 has ~50 emit
-                        // sites, so the `source` term is what stops the alarm
-                        // paging on ordinary reconnect churn — and it is
-                        // therefore also what decides whether it can fire AT ALL.
-                        //
-                        // This field was MISSING here until 2026-09-06, and this
-                        // is the arm that actually runs: the sibling arm below
-                        // (master read OK, no usable widening) carried `source`
-                        // and could page; THIS arm — today's artifact absent or
-                        // unreadable, the overwhelmingly common case — could not.
-                        //
-                        // Proven on the box, 2026-09-05: the artifact was missing,
-                        // this line fired twice with fields {code, detail, path}
-                        // and no `source`, the session ran on 4 instruments
-                        // instead of ~22,996, ZERO ticks were captured all day —
-                        // and `describe-alarm-history` for the collapse alarm and
-                        // for `tv-prod-live-universe-fallback` returns EMPTY. The
-                        // operator was never paged for the failure both alarms
-                        // exist to catch.
-                        //
-                        // The module doc above stated the opposite ("the OUTCOME
-                        // is covered"), which is the false-OK class this
-                        // repository keeps paying for: an alarm that is enabled,
-                        // documented as covering the case, and structurally
-                        // unable to match it.
-                        source = UniverseSource::FellBackToIndices.as_str(),
-                        detail = failure.detail(),
-                        path = %path.display(),
-                        "live universe: today's mapping artifact is unusable — falling back \
-                         to the index universe. Master sourcing was REQUESTED and is NOT in \
-                         effect; the subscribed set is the index universe, not the widened \
-                         set."
-                    );
-                    return index_universe;
                 }
             }
         }
@@ -781,28 +983,50 @@ pub fn resolve_live_universe(
                 instruments = selection.instruments.len(),
                 master_entries = master.len(),
                 spot_universe = spot_universe_label,
+                artifact_date = %artifact_date,
                 refused_zero_id = selection.refused_zero_id,
                 refused_unknown_segment = selection.refused_unknown_segment,
                 deduped = selection.deduped,
                 capacity,
                 source = selection.source.as_str(),
-                "live universe: widened from today's resolved master"
+                "live universe: widened from the resolved master"
             );
         }
-        _ => {
+        UniverseSource::TruncatedToCapacity => {
+            // Owner decision (audit D3): fill the envelope by priority and page
+            // critically. Paged by the fallback counter's alarm; the line's
+            // `source` is not the collapse filter's, because the session is
+            // full, not collapsed.
+            record_master_sourcing_fallback("truncated_to_capacity", selection.instruments.len());
+            tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                instruments = selection.instruments.len(),
+                refused_over_capacity = selection.refused_over_capacity,
+                master_entries = master.len(),
+                spot_universe = spot_universe_label,
+                artifact_date = %artifact_date,
+                capacity,
+                source = selection.source.as_str(),
+                "live universe: the resolved list is larger than the authorized main-feed \
+                 capacity — the capacity is filled by priority (indices first) and the rest \
+                 are NOT subscribed this session"
+            );
+        }
+        UniverseSource::HardcodedIndices | UniverseSource::FellBackToIndices => {
             record_master_sourcing_fallback("no_usable_widening", selection.instruments.len());
             tracing::error!(
                 code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
                 master_entries = master.len(),
                 spot_universe = spot_universe_label,
+                artifact_date = %artifact_date,
                 refused_zero_id = selection.refused_zero_id,
                 refused_unknown_segment = selection.refused_unknown_segment,
                 deduped = selection.deduped,
                 capacity,
-                source = selection.source.as_str(),
-                "live universe: master sourcing was REQUESTED but produced no usable \
-                 widening (or exceeded the authorized {capacity}-instrument envelope) — \
-                 subscribing the index universe instead. This is NOT a widened session."
+                source = UniverseSource::FellBackToIndices.as_str(),
+                "live universe: master sourcing was REQUESTED but the list produced no \
+                 usable widening — subscribing the index universe instead. This is NOT a \
+                 widened session."
             );
         }
     }
@@ -1208,7 +1432,7 @@ pub async fn await_mapping_artifact(
             path = %path.display(),
             "live universe: master sourcing is REQUESTED but [dhan_universe] enabled = false, \
              so nothing will ever write today's mapping. Not waiting — the lane will subscribe \
-             the 4 index SIDs. Enable the rider or turn master sourcing off; the two flags \
+             the newest earlier list on disk, or the 4 index SIDs if there is none. Enable the rider or turn master sourcing off; the two flags \
              disagree."
         );
         return;
@@ -1225,8 +1449,9 @@ pub async fn await_mapping_artifact(
                 rider_target_ist_secs = cfg.target_secs_of_day_ist,
                 path = %path.display(),
                 "live universe: not waiting for today's mapping — non-trading day or before \
-                 the daily rider's build hour. This boot subscribes the index universe; the \
-                 scheduled morning start widens the session."
+                 the daily rider's build hour. This boot subscribes the newest earlier list \
+                 (or the index universe if none is on disk); the scheduled morning start \
+                 widens the session."
             );
             return;
         }
@@ -1240,8 +1465,8 @@ pub async fn await_mapping_artifact(
             path = %path.display(),
             "live universe: not waiting for today's mapping — the daily rider's build hour is \
              further away than this boot may stall for, so no amount of waiting can produce the \
-             artifact. Subscribing the 4 index SIDs. This is the expected shape for an overnight \
-             or off-hours boot; the scheduled morning start is what widens the session."
+             artifact. Subscribing the newest earlier list, or the 4 index SIDs if none is on \
+             disk. This is the expected shape for an overnight or off-hours boot; the scheduled morning start is what widens the session."
         );
         return;
     };
@@ -1297,8 +1522,8 @@ pub async fn await_mapping_artifact(
             path = %path.display(),
             "live universe: stopped waiting for today's mapping at the 09:10 IST pre-open \
              cutoff — the market opens at 09:15 and dialing a partial set beats dialing \
-             nothing. This session subscribes the 4 index SIDs. It means the box booted \
-             late or the daily rider is failing; the rider keeps retrying, but the lane \
+             nothing. This session subscribes the newest earlier list, or the 4 index SIDs \
+             if none is on disk. It means the box booted late or the daily rider is failing; the rider keeps retrying, but the lane \
              reads the artifact once at boot, so only a restart widens this session."
         );
         return;
@@ -1314,9 +1539,9 @@ pub async fn await_mapping_artifact(
         end_ist_secs = end_ist,
         path = %path.display(),
         "live universe: the daily rider did not produce today's mapping within \
-         {MAPPING_WAIT_DEADLINE_SECS}s of its own build hour. Subscribing the 4 index SIDs for \
-         this session. The rider keeps retrying, but the lane reads the artifact once at boot — \
-         so this session stays at 4 instruments until a restart."
+         {MAPPING_WAIT_DEADLINE_SECS}s of its own build hour. Subscribing the newest earlier list, or the 4 \
+         index SIDs if none is on disk. The rider keeps retrying, but the lane reads the \
+         artifact once at boot — so this session stays on that list until a restart."
     );
 }
 
@@ -1686,8 +1911,8 @@ mod tests {
         );
         assert_eq!(
             src.matches("spot_universe = spot_universe_label").count(),
-            2,
-            "both the success and the fallback log line must use the SAME computed label — \
+            3,
+            "the success, the truncated and the fallback log line must use the SAME computed label — \
              two independently-written ternaries are how the NTM arm went missing"
         );
         // The exact shape that was wrong: a `narrowed` ternary choosing
@@ -2039,28 +2264,171 @@ mod tests {
         );
     }
 
-    /// Over capacity, THIS function returns the index universe — the live set
-    /// collapses to the index count rather than dialing an oversize pool.
-    /// Falling back keeps the feed alive; truncating to fit would silently
-    /// subscribe an arbitrary subset, which is the outcome this pins against.
-    ///
-    /// CORRECTED 2026-08-21: this comment used to credit `plan_pool` with
-    /// refusing the whole pool. `plan_pool` does that for sets that REACH it —
-    /// but an oversize set never does, because the arm under test returns
-    /// first. Same behaviour, wrong mechanism named, and the misattribution
-    /// (repeated in `MAX_DAILY_UNIVERSE_SIZE`'s own docs) produced a false
-    /// CRITICAL audit finding. The collapse is alarmed via
-    /// `tv_dhan_live_universe_fallback_total`.
+    /// Audit D3 (owner, 2026-09-26): over the envelope the capacity is FILLED
+    /// by priority — indices first, then by `(segment, security_id)` — and the
+    /// excess is counted. It must never fall back to the 4 index SIDs.
     #[test]
-    fn test_select_live_universe_falls_back_whole_when_over_the_envelope() {
-        let master: Vec<MasterEntry> = (1..=10).map(|i| entry(1000 + i, 1)).collect();
+    fn over_the_envelope_fills_the_capacity_by_priority_indices_first() {
+        let mut master: Vec<MasterEntry> = (1..=10).map(|i| entry(1000 + i, 1)).collect();
+        // The master's index row comes LAST in the file; priority puts it first.
+        master.push(entry(1999, 0));
         let sel = select_live_universe(&idx(), Some(&master), 5);
-        assert_eq!(sel.source, UniverseSource::FellBackToIndices);
+        assert_eq!(sel.source, UniverseSource::TruncatedToCapacity);
         assert_eq!(
+            sel.instruments.len(),
+            5,
+            "the capacity is filled, not left empty"
+        );
+        assert_ne!(
             sel.instruments,
             idx(),
-            "over-envelope must fall back whole, never truncate to fit"
+            "must never fall back to the index set"
         );
+        assert_eq!(
+            sel.instruments[0],
+            SubscribeInstrument {
+                security_id: 1999,
+                segment: ExchangeSegment::IdxI,
+            },
+            "indices come first"
+        );
+        let stocks: Vec<SecurityId> = sel.instruments[1..].iter().map(|i| i.security_id).collect();
+        assert_eq!(
+            stocks,
+            vec![1001, 1002, 1003, 1004],
+            "then by composite key, whatever the row order"
+        );
+        // 10 stocks + 1 master index (the seeds are replaced) = 11; 5 fit.
+        assert_eq!(sel.refused_over_capacity, 6);
+    }
+
+    /// Exactly at the envelope is a normal widened session, not a truncation.
+    #[test]
+    fn exactly_at_the_envelope_is_not_a_truncation() {
+        let master: Vec<MasterEntry> = (1..=3).map(|i| entry(1000 + i, 1)).collect();
+        let sel = select_live_universe(&idx(), Some(&master), 5);
+        assert_eq!(sel.source, UniverseSource::MasterSourced);
+        assert_eq!(sel.instruments.len(), 5);
+        assert_eq!(sel.refused_over_capacity, 0);
+    }
+
+    #[test]
+    fn earlier_ist_dates_walks_back_across_a_month_boundary_newest_first() {
+        assert_eq!(
+            earlier_ist_dates("2026-03-02", 3),
+            vec!["2026-03-01", "2026-02-28", "2026-02-27"]
+        );
+        assert!(earlier_ist_dates("2026-03-02", 0).is_empty());
+        assert!(
+            earlier_ist_dates("not-a-date", 7).is_empty(),
+            "never guess a date"
+        );
+    }
+
+    /// An in-memory stand-in for the artifact directory: a file is a path and
+    /// a row count; anything else reads as missing.
+    fn lookup(
+        files: &[(std::path::PathBuf, usize)],
+        path: &std::path::Path,
+    ) -> Result<Vec<MasterEntry>, ArtifactFailure> {
+        match files.iter().find(|(f, _)| f == path) {
+            Some((_, n)) => Ok((0..*n).map(|i| entry(5000 + i as u64, 1)).collect()),
+            None => Err(ArtifactFailure::Unreadable("missing".to_owned())),
+        }
+    }
+
+    fn full_cfg() -> tickvault_common::config::DhanUniverseConfig {
+        tickvault_common::config::DhanUniverseConfig::default()
+    }
+
+    /// The newest earlier day wins, and today's own file is never asked for
+    /// (the caller already failed to read it).
+    #[test]
+    fn the_lookback_takes_the_newest_earlier_day_and_never_rereads_today() {
+        let files = vec![
+            (crate::dhan_universe::mapping_artifact_path("2026-09-23"), 3),
+            (crate::dhan_universe::mapping_artifact_path("2026-09-25"), 2),
+        ];
+        let asked = std::cell::RefCell::new(Vec::new());
+        let got = newest_earlier_master_with(&full_cfg(), "2026-09-28", 7, |p| {
+            asked.borrow_mut().push(p.to_path_buf());
+            lookup(&files, p)
+        })
+        .expect("an earlier list is on disk");
+        assert_eq!(got.date_ist, "2026-09-25");
+        assert_eq!(got.kind, "full_master");
+        assert_eq!(got.entries.len(), 2);
+        assert!(
+            asked
+                .borrow()
+                .iter()
+                .all(|p| !p.to_string_lossy().contains("2026-09-28")),
+            "today's file is never re-read"
+        );
+    }
+
+    /// An empty list is skipped: it would resolve to nothing and report a
+    /// collapse under another name.
+    #[test]
+    fn the_lookback_skips_an_empty_list() {
+        let files = vec![
+            (crate::dhan_universe::mapping_artifact_path("2026-09-27"), 0),
+            (crate::dhan_universe::mapping_artifact_path("2026-09-26"), 4),
+        ];
+        let got = newest_earlier_master_with(&full_cfg(), "2026-09-28", 7, |p| lookup(&files, p))
+            .expect("the older, non-empty list is used");
+        assert_eq!(got.date_ist, "2026-09-26");
+    }
+
+    /// Within one day the same precedence as today's resolve: NTM when its
+    /// flag is on, otherwise straight to the full mapping.
+    #[test]
+    fn the_lookback_keeps_todays_precedence_within_a_day() {
+        let files = vec![
+            (
+                crate::dhan_universe::ntm_spot_artifact_path("2026-09-27"),
+                2,
+            ),
+            (crate::dhan_universe::mapping_artifact_path("2026-09-27"), 9),
+        ];
+        let with_ntm =
+            newest_earlier_master_with(&ntm_cfg(), "2026-09-28", 7, |p| lookup(&files, p))
+                .expect("found");
+        assert_eq!(with_ntm.kind, "ntm");
+        let without =
+            newest_earlier_master_with(&full_cfg(), "2026-09-28", 7, |p| lookup(&files, p))
+                .expect("found");
+        assert_eq!(
+            without.kind, "full_master",
+            "a flag that is off is never read"
+        );
+    }
+
+    /// Nothing inside the retention window is nothing: the caller then takes
+    /// the old, paged index fallback.
+    #[test]
+    fn the_lookback_stops_at_the_retention_window() {
+        let files = vec![(crate::dhan_universe::mapping_artifact_path("2026-09-20"), 5)];
+        assert!(
+            newest_earlier_master_with(&full_cfg(), "2026-09-28", 7, |p| lookup(&files, p))
+                .is_none(),
+            "eight days back is outside a seven-day window"
+        );
+        assert!(
+            newest_earlier_master_with(&full_cfg(), "2026-09-28", 8, |p| lookup(&files, p))
+                .is_some()
+        );
+    }
+
+    /// The lane's lookback and the rider's sweep use one number: a longer
+    /// lookback could only find swept files, a shorter one would miss kept ones.
+    #[test]
+    fn resolve_looks_back_exactly_as_far_as_the_rider_keeps_files() {
+        let src = include_str!("dhan_live_universe.rs");
+        let resolve = &src[src
+            .find(concat!("pub ", "fn resolve_live_universe"))
+            .expect("resolve exists")..];
+        assert!(resolve.contains("crate::dhan_universe::ARTIFACT_RETENTION_DAYS"));
     }
 
     /// A master that resolves nothing usable must not be reported as widened —
@@ -2486,11 +2854,29 @@ mod tests {
         );
         // And it must run BEFORE the paging arm, or it is unreachable.
         let paging = src[start..]
-            .find(concat!("record_master_sourcing_", "fallback(failure"))
+            .find(concat!("record_master_sourcing_", "fallback("))
             .expect("the paging arm must still exist");
         assert!(
             paging > arm_end - start,
             "expected arm must precede the paging arm"
+        );
+
+        // Audit D3: the EARLIER-list arm has an expected half too, and it must
+        // be as quiet as the index one — same source, no counter, no ERROR.
+        let early = src
+            .find("// Expected (pre-rider or non-trading-day boot):")
+            .expect("the expected half of the earlier-list arm must exist");
+        let early_end = early
+            + src[early..]
+                .find("} else {")
+                .expect("the expected half ends where the paging half starts");
+        let early_arm = &src[early..early_end];
+        assert!(early_arm.contains("PRE_RIDER_BOOT_SOURCE"));
+        assert!(!early_arm.contains("MASTER_SOURCING_FALLBACK_COUNTER"));
+        assert!(!early_arm.contains(concat!("tracing::err", "or!(")));
+        assert!(
+            !tf.contains(super::EARLIER_ARTIFACT_SOURCE),
+            "the collapse alarm must not match a session running on an earlier list"
         );
     }
 
