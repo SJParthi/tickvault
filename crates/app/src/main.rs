@@ -2949,6 +2949,18 @@ async fn async_main() -> Result<()> {
         universe_collapse_expected,
     )
     .await;
+    // Judged AGAIN after the wait (audit re-check 7). A boot between 07:10
+    // and the rider hour waits until ten minutes past it, so by the time the
+    // resolve runs the rider hour has passed and today's list SHOULD exist.
+    // Keeping the verdict frozen from before the wait would log that miss as
+    // the expected pre-rider warning and page nobody. It can only flip from
+    // expected to not expected here, never the other way.
+    let universe_collapse_expected_after_wait = universe_collapse_expected
+        && tickvault_app::dhan_live_universe::collapse_is_expected_for_this_boot(
+            trading_calendar.is_trading_day_today(),
+            tickvault_common::market_hours::now_ist_secs_of_day(),
+            config.dhan_universe.target_secs_of_day_ist,
+        );
 
     // Spot and index names for `ticks.contract` / `candles_<tf>.contract`
     // BEFORE the lane dials, so the 09:00 pre-open index ticks carry one. The
@@ -2993,8 +3005,14 @@ async fn async_main() -> Result<()> {
         tickvault_app::dhan_feed_stack::hardcoded_index_universe(),
         &universe_date_ist,
         tickvault_core::websocket::pool_budget::DhanEndpointType::MainFeed.subscription_capacity(),
-        universe_collapse_expected,
+        universe_collapse_expected_after_wait,
     );
+    // A session that did not get today's list keeps its alarm fed for as long
+    // as it stays that way (the counter's single increment above can land in
+    // the same scrape as its zero seed, which CloudWatch drops).
+    if let Some(reason) = tickvault_app::dhan_live_universe::live_universe_degraded_reason() {
+        tokio::spawn(tickvault_app::dhan_live_universe::run_degraded_universe_heartbeat(reason));
+    }
 
     let dhan_feed_stack_monitor = tickvault_app::dhan_feed_stack::spawn_dhan_feed_stack(
         tickvault_app::dhan_feed_stack::DhanFeedStackParams {
@@ -3015,12 +3033,12 @@ async fn async_main() -> Result<()> {
             // opens; DEDUP-idempotent via the replay-stable `capture_seq`.
             // Empty on a clean boot.
             wal_replay_live_feed: std::mem::take(&mut ws_wal_replay_live_feed),
-            // DEFAULT-OFF: with `live_subscription_from_master = false` (the
-            // shipped value) this returns the same 4 hardcoded index SIDs the
-            // lane has always used, so the operator's 2026-08-11 third-quote
-            // carve-out — "re-pointing the lane… must not be smuggled in" — is
-            // honoured in substance: the live set does not move until a human
-            // flips the flag and restarts.
+            // The master-sourced set: `live_subscription_from_master` was built
+            // default-off and the operator turned it on on 2026-08-12
+            // (`config/base.toml` ships `true`). A missing list for today takes
+            // the newest earlier day's list, and an oversized one fills the
+            // envelope by priority; only with no list on disk is this the 4
+            // index SIDs (audit D3).
             main_feed_instruments: main_feed_instruments.clone(),
             // Empty by design — the stack late-attaches depth after 09:16 IST.
             depth_20_instruments: Vec::new(),

@@ -267,6 +267,60 @@ inline (PR2, PR8, PR14).
     text and count only contracts actually subscribed (dhan_feed_stack.rs:10761-10763, :10778-10781,
     :12428-12440). Stocks with no trade by 09:30 get no options: publish the count as a gauge at
     hand-off (dhan_feed_stack.rs:12437-12448). Depth sockets are PR44's, not this item's.
+  - Owner decision recorded (2026-09-26): over 25,000, fill 25,000 by priority with a critical
+    page; no 4-index fallback. Scheduled next after PR40d on 2026-09-28 at the "4 index ids"
+    thread's request (a 04:26 IST deploy-run boot subscribed only the 4 index SIDs and never
+    widened). Split into three PRs:
+  - [x] **D3a — never 4 when a list exists.** (`app`, doc-only `common`)
+    - Done: over capacity, `select_live_universe` fills the envelope by priority (indices first,
+      then by `(segment, security_id)`, since the list has no rank and row order is not a contract), counts `refused_over_capacity`, and pages through the existing
+      live-lane fallback alarm with `reason="truncated_to_capacity"` (seeded at 0). Today's list
+      missing or unreadable: the boot takes the newest earlier day's list still on disk (lookback =
+      the rider's `ARTIFACT_RETENTION_DAYS`, 7), same NTM → F&O → full precedence, empty lists
+      skipped; paged through the same counter and reason as before when the boot should have
+      widened, `warn!` with `source=pre_rider_boot` when it could not. The collapse alarm still
+      fires only when no list is on disk at all. Stale text fixed: module doc, `main.rs`
+      comment, `market_ram_store_boot.rs`, the master-off log line, the wait-arm lines,
+      `MAX_DAILY_UNIVERSE_SIZE` doc, the alarm description.
+    - Not done here: widening a RUNNING session (D3b); the `ntm_*` reasons are still not seeded
+      and the `fno_*` widenings still count on the paging counter (pre-existing, noted for D3c).
+    - Tests: `over_the_envelope_fills_the_capacity_by_priority_indices_first`,
+      `exactly_at_the_envelope_is_not_a_truncation`,
+      `earlier_ist_dates_walks_back_across_a_month_boundary_newest_first`,
+      `the_lookback_takes_the_newest_earlier_day_and_never_rereads_today`,
+      `the_lookback_skips_an_empty_list`, `the_lookback_keeps_todays_precedence_within_a_day`,
+      `the_lookback_stops_at_the_retention_window`,
+      `resolve_looks_back_exactly_as_far_as_the_rider_keeps_files`, property
+      `an_oversized_master_fills_the_capacity_by_priority_and_reports_it`, and the extended
+      `the_expected_fallback_cannot_reach_the_collapse_alarm`.
+    - Re-check 7 folded in (2026-09-28): (a) the paging counter's zero seed and its one boot
+      increment run microseconds apart, so the agent's first sample was already 1 and was
+      dropped as the delta baseline. The earlier-list and over-capacity cases page ONLY through
+      that counter. A degraded session now re-counts once a minute
+      (`run_degraded_universe_heartbeat`, O(1) per tick), so the alarm stays red until a healthy
+      restart. (b) The pre-rider verdict is judged again after `await_mapping_artifact`; a boot
+      between 07:10 and 08:00 IST waits past the rider hour and must page if the list is still
+      missing. Tests: `live_universe_degraded_reason_decodes_every_reason_and_nothing_else`,
+      `every_paged_fallback_arms_the_heartbeat`, `run_degraded_universe_heartbeat_is_spawned_by_main_while_degraded`,
+      `main_re_judges_the_verdict_after_the_wait_and_can_only_tighten_it`.
+  - [ ] **D3b — widen a running session when today's list lands.** The lane reads the universe
+    once at boot. Reuse the late attach's machinery: the set difference on the composite key goes
+    to spare room on live sockets via `LiveSubscriptionCommand::Extend` and to new sockets via
+    `build_feed_stack_plan`; the attach task keeps the pool until the widen is done. Each Extend
+    ≤ 5,000 per socket to stay inside the 5 s top-up budget.
+    - Re-check 7: the list is read once at boot, and the 08:30 boot waits only to 08:40 while
+      the rider's budget is 900 s plus retries, so a slow rider always loses the race. D3b is
+      the fix for both: keep watching for today's list after boot and widen when it lands.
+      When D3b clears the degraded state the heartbeat stops by itself.
+  - [ ] **D3c — the rest of D3:** parked-socket reassignment, late top-up refusals counted and
+    alarmed, the top-up log text, the no-trade-by-09:30 gauge, and the fallback counter's
+    reason hygiene (seed `ntm_*`; stop widenings paging).
+    - Re-check 7 items to verify and fold in: the rider rejects the whole build when more than
+      10% of the 49 NSE list downloads fail, and its error lines carry no code
+      (`dhan_universe.rs`); the 4 fallback index ids got zero packets; depth-200 dials 0 of 5
+      sockets during a fallback or QuestDB lag and `top_volume` goes empty, with no page; the
+      universe headroom check counts spots only (~870 against 25,000) so it can never fire;
+      D8's plan text says "match by symbol" but the list files carry no symbol.
 - [ ] **D4 — stale-price gate on entries.** (`trading` risk, not strategy)
   - No price-age check exists (risk/engine.rs:262). Add one to `check_order_in_segment`: an ENTRY
     whose last price is older than 5 s is refused with a coded reason; exits are never gated.
@@ -1452,6 +1506,93 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     2.95 ms, stale); the sliced sweep's mean step is 7–12 µs, worst step 0.17 ms in one run and
     ~4.2 ms in two (likely a host pause, unproven until measured on a quiet host). Correct the
     CLAUDE.md figures in the same PR.
+
+### Added 2026-09-28 (seventh re-check, main 13e405f), riskiest first
+
+Source: `/mnt/project-files/audit/recheck7-gaps.md` (15 ranked items and the per-area gap lists,
+each with file:line). "Verified" below means this thread read the code on `origin/main` at
+13e405f. Every other line is carried from the re-check and is re-verified when its item starts.
+
+Order of work: PR #1975 (D3a) finishes first. Then PR53 (it can destroy a kept table), D3b, D3c,
+PR54, PR55, PR56, then the order already set: PR41, PR31b, PR42–PR50, PR31c, PR32–PR39, PR51,
+the PR4c follow-ups, PR52. PR30b stays on or after 2026-10-01.
+
+- [ ] **PR53 — a boot never drops a kept table, and a clean-up marker means the clean-up ran.**
+  (`storage`, `app`)
+  - Verified: `drop_legacy_candle_objects` runs `DROP TABLE IF EXISTS candles_1s` (step 2,
+    shadow_persistence.rs:833-840) whenever its marker is missing, unreadable or on an older sweep
+    version. `candles_1s` is a live fold table today (`TfIndex::S1`, tf_index.rs:445), so any
+    future sweep-version bump, or a lost `data/state` marker, drops every 1-second candle.
+  - Verified: the marker is written after the sweep whatever the drops returned; a failed drop is
+    logged and the marker still says done.
+  - Fix: remove `candles_1s` from the drop list (a guard test pins that no drop list names a live
+    `TfIndex` table or a KEEP table); write each marker only when every drop in its sweep
+    returned 2xx; PR31a's background re-run waits for the database to answer before it sweeps;
+    correct the false "retry next boot" line (candle_ddl_boot.rs:119-120).
+- [ ] **PR54 — a depth socket that never sends a first frame pages.** (`app`, `core`)
+  - From re-check 7: a morning-dial depth socket that never delivers a frame pages nothing, and
+    the comment that says RISK-GAP-03 covers it is false for depth. PR44/PR45 do not cover it.
+  - Fix: a per-socket first-frame deadline (O(1) per socket) that pages through an existing
+    live-lane alarm, and the comment corrected.
+- [ ] **PR55 — no deploy input reaches a shell, and every deploy path needs main + All Green.**
+  (`.github/workflows/`, deploy terraform) Widens PR36b.
+  - Verified: `${{ github.event.inputs.confirm_market_hours }}` is pasted into `run:` in
+    deploy-aws.yml:420 and :850 (and terraform-apply.yml:454 per the re-check). Pass it through
+    `env:` in every workflow.
+  - From re-check 7: a pushed `v*` tag, a re-run of an older dispatch run, terraform-apply /
+    resize / disk-grow / log-wipe from another branch, and a PR that edits terraform-apply.yml
+    all bypass the PR36b gate; the PR36a key guard checks text only, so `--message "$TOK"`
+    passes (terraform-apply.yml:757-763). Close each; test the guards against stubs in CI.
+- [ ] **PR56 — arrival time never runs ahead after a backward clock step.** (`storage`, `app`)
+  Widens PR31c's close-clock bullet.
+  - From re-check 7: after a backward step nothing re-anchors or clamps the receipt anchor, so
+    the feed-delay gauge (a false Dhan feed-delay page at about 60 s or more), silence stamps,
+    the board close clock and depth times all skew for the rest of the process. Re-anchor, and
+    alarm on the size of the refused jump rather than on `refused_backward` (read noise).
+
+Corrections and widenings to existing items:
+
+- D3b: also the boot wait (ends 08:40, not 09:10: dhan_live_universe.rs:847, :975-989), and the
+  page says "restart" until D3b makes a restart unnecessary.
+- D3c: one failed index-member download must not reject the day's list
+  (dhan_universe.rs:879, :965); make the 50 MiB / 60 s master cap and the 0.1% bad-row skip
+  visible (constants.rs:1119, :1183); page when depth-200 dials nothing and `top_volume` stays
+  empty; the 15:41 check verifies only the 4 dead ids on a collapsed day.
+- D8: as written it keeps the dead SENSEX seed forever, because the master's index rows are
+  NSE-only (dhan_universe.rs:564). Re-scope before starting.
+- D1: verified, nothing in production calls `clear_order_halt` (engine.rs:457 has test callers
+  only), so a latched halt clears only on restart; and rate_limiter.rs:234 says the daily reset
+  clears the budget while the halt stays. Fix the comment and give the halt a production clear
+  path (paper mode; `dry_run` is not touched).
+- PR40b: the 7-day boot prune runs before the boot drain (main.rs:1819 vs the recovery further
+  down), so after 7+ days off it deletes unreplayed candles; and `.bin.N` files in `archive/`
+  and `replaying/` are never pruned or counted. Move the prune after recovery and match the
+  suffixed names.
+- PR40a follow-up (goes with PR31b): the crash marker is written clean before the escalation
+  queue drains, so a kill in the shutdown wait loses up to 250,000 queued candles and the next
+  boot reports none; a failed marker write is an uncoded warning.
+- PR40d follow-up: the once-a-minute throttle is keyed on the time the fold passes in
+  (seal_writer_runner.rs:691, fed from dhan_feed_stack.rs:9960), not the wall clock.
+- PR31b: include row 253 (crash-lost seals; the warm-up gives no candle to buckets that ended
+  before it starts).
+- PR31c: there are ten candle tables, not nine; one keyed switch per family means a single
+  top-volume column-repair refusal discards every board for the session; a refused candle while
+  tables are unkeyed goes to spill but pages as a loss; nothing keeps paging while tables stay
+  unkeyed.
+- PR39: the error-code ratchet matches `code =` as a substring (error_code_tag_guard.rs:303,
+  :309, :504), so two uncoded lines count as coded; name the seven uncoded loss warnings; the
+  SPILL-RETENTION-01 bullet is obsolete (PR40b reused AGGREGATOR-DROP-01).
+- PR46: the box role can also READ the console key and the GitHub token (main.tf:215-251);
+  narrow read as well as write. "Confine the socket to one status call" is not possible on a
+  Unix socket; name a privileged helper instead.
+- PR50: the deploy start step needs the holiday check, and every deploy re-enables and restarts
+  the app even during a console reset (deploy-aws.yml:1087-1106); deploys take the reset lock.
+- PR19: the log tool's code search reads `~/.aws`, `~/.ssh` and `environ`
+  (tickvault-logs-mcp/src/tools.rs:1683-1688); refuse out-of-repo paths. The second database
+  server in `.mcp.json` and the unpinned session servers (row 86) go with it.
+- The remaining per-area items in the gap file (ops/deploy/security, storage, feed, Dhan
+  mismatches) are folded into the item each names when that item starts; any that names no
+  item gets its own item before PR51.
 
 ## Edge Cases
 

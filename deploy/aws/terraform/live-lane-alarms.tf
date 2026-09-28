@@ -323,7 +323,8 @@ resource "aws_cloudwatch_metric_alarm" "ws_ring_bytes_full" {
 # 5. Master sourcing silently collapsed the universe (2026-08-14 — audit)
 # ---------------------------------------------------------------------------
 # The worst signal in the lane, because it looks exactly like health. When the
-# resolved-master artifact is missing or unparseable, the lane falls back to the
+# resolved-master artifact is missing or unparseable and no earlier day's list is
+# on disk (audit D3: an earlier list is used first), the lane falls back to the
 # 4 hardcoded index SIDs while the config asks for the full resolved set — 4,565
 # instruments on 2026-08-12, i.e. a 99.9% collapse. Every other gauge reads
 # normal: the lane is up, ticks flow, and the gap detector reports zero
@@ -331,15 +332,18 @@ resource "aws_cloudwatch_metric_alarm" "ws_ring_bytes_full" {
 # Before this alarm the sole evidence was one uncoded error line.
 resource "aws_cloudwatch_metric_alarm" "live_universe_fallback" {
   alarm_name        = "tv-${var.environment}-live-universe-fallback"
-  alarm_description = "The live lane fell back to the 4 hardcoded index instruments while the config requested the master-sourced universe. This is a ~99.9% collapse of the subscribed set that looks HEALTHY on every other signal — the lane is up, ticks flow, and never-ticked reads zero because only the subscribed instruments are seeded. Cause is the day's resolved-mapping artifact being missing or unparseable. Triage: check that the daily universe rider ran and wrote today's artifact, then restart the app; the universe is resolved once at boot and does not re-resolve mid-session."
+  alarm_description = "The live lane is NOT subscribing today's resolved list. One of three things, named by the reason label in the app log: today's list was missing or unreadable, so the lane took the newest earlier day's list still on disk (stocks added today are missing), or fell back to the 4 hardcoded index instruments when no list was on disk at all (a ~99.9% collapse that looks HEALTHY on every other signal); or the list was larger than the 25,000 main-feed capacity and was filled by priority, indices first, with the rest left out (reason truncated_to_capacity). Triage: check that the daily universe rider ran and wrote today's list, then restart the app; the universe is resolved once at boot and does not re-resolve mid-session. A degraded session re-counts once a minute, so this alarm stays red until a restart lands on today's list."
 
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 1
   evaluation_periods  = 1
   metric_name         = "tv_dhan_live_universe_fallback_total"
   namespace           = local.app_namespace
-  # The universe is resolved ONCE per boot, so this fires at most once per
-  # restart. A 300s window with threshold 1 catches that single increment.
+  # The universe is resolved ONCE per boot. A session that is not on today's
+  # list also re-counts once a minute for as long as it stays that way (audit
+  # re-check 7: the one boot-time increment can land in the same scrape as its
+  # zero seed, which the agent drops as the delta baseline). So a degraded
+  # session keeps this window breaching, pages once, and stays red.
   period             = 300
   statistic          = "Sum"
   dimensions         = local.app_dimensions
