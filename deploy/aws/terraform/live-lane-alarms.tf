@@ -332,7 +332,7 @@ resource "aws_cloudwatch_metric_alarm" "ws_ring_bytes_full" {
 # Before this alarm the sole evidence was one uncoded error line.
 resource "aws_cloudwatch_metric_alarm" "live_universe_fallback" {
   alarm_name        = "tv-${var.environment}-live-universe-fallback"
-  alarm_description = "The live lane is NOT subscribing today's resolved list. One of three things, named by the reason label in the app log: today's list was missing or unreadable, so the lane took the newest earlier day's list still on disk (stocks added today are missing), or fell back to the 4 hardcoded index instruments when no list was on disk at all (a ~99.9% collapse that looks HEALTHY on every other signal); or the list was larger than the 25,000 main-feed capacity and was filled by priority, indices first, with the rest left out (reason truncated_to_capacity). Triage: check that the daily universe rider ran and wrote today's list, then restart the app; the universe is resolved once at boot and does not re-resolve mid-session. A degraded session re-counts once a minute, so this alarm stays red until a restart lands on today's list."
+  alarm_description = "The live lane is NOT subscribing today's resolved list. One of three things, named by the reason label in the app log: today's list was missing or unreadable, so the lane took the newest earlier day's list still on disk (stocks added today are missing), or fell back to the 4 hardcoded index instruments when no list was on disk at all (a ~99.9% collapse that looks HEALTHY on every other signal); or the list was larger than the 25,000 main-feed capacity and was filled by priority, indices first, with the rest left out (reason truncated_to_capacity). Triage: check that the daily universe rider ran and wrote today's list. The running session adds today's list by itself once it is written (checked about once a minute until 15:30) and then stops counting; restart only if today's list never appears. A degraded session re-counts once a minute, so this alarm stays red while the session is off today's list."
 
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 1
@@ -350,8 +350,9 @@ resource "aws_cloudwatch_metric_alarm" "live_universe_fallback" {
   treat_missing_data = "notBreaching"
 
   alarm_actions = local.app_alarm_actions
-  # NO ok_actions: the counter is cumulative and the session is already running
-  # on the wrong universe. Only a restart fixes it, and that is a new session.
+  # NO ok_actions: the counter is cumulative. Since audit D3b the running
+  # session adds today's list when it lands and the re-count stops, so the
+  # alarm clears silently; an OK page would only repeat what the app log says.
   ok_actions = []
 }
 
