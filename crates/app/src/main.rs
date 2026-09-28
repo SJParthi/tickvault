@@ -3063,6 +3063,18 @@ async fn async_main() -> Result<()> {
             // them. Passing the fold's real state lets the lane refuse rather
             // than let one writer silently overwrite the other.
             rest_fold_writes_dhan_candles: config.rest_candle_fold.enabled,
+            // Audit D3b: a boot that did not get today's spot list adds it
+            // once the rider writes it, without a restart. Trading days only:
+            // a holiday has no session to widen, and waiting would keep the late
+            // attach polling until 15:30 for nothing.
+            widen_universe: (tickvault_app::dhan_live_universe::live_universe_widen_pending()
+                && trading_calendar.is_trading_day_today())
+            .then(|| tickvault_app::dhan_live_universe::TodaysUniverseSource {
+                cfg: config.dhan_universe.clone(),
+                index_universe: tickvault_app::dhan_feed_stack::hardcoded_index_universe(),
+                capacity: tickvault_core::websocket::pool_budget::DhanEndpointType::MainFeed
+                    .subscription_capacity(),
+            }),
         },
     );
 

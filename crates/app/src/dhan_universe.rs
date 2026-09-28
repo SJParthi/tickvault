@@ -967,6 +967,25 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
     // see a missing list — see MAX_FAILED_INDEX_LIST_FRACTION.
     let failed_fraction = failed_list_fraction(failed_lists, INDEX_CONSTITUENCY_SLUGS.len());
     if failed_fraction > MAX_FAILED_INDEX_LIST_FRACTION {
+        // Audit D3c-1: the FULL mapping stays refused (its membership would be
+        // partial and read as complete), but the two narrowed spot sets do
+        // not depend on the lists that failed, and they are what the live
+        // lane boots on. Writing them keeps a bad niftyindices morning from
+        // costing the session today's spots. The build still fails and
+        // retries; the next success rewrites both.
+        let partial = join_constituents(&constituents, &index);
+        tokio::task::block_in_place(|| write_narrowed_spot_artifacts(date, &master, &partial));
+        error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            source = "rider_index_lists_rejected",
+            date,
+            failed = failed_lists,
+            lists = INDEX_CONSTITUENCY_SLUGS.len(),
+            "daily instrument build: too many NSE index lists failed, so the full mapping is \
+             NOT written today (it would read as complete while missing membership). The F&O \
+             and Nifty Total Market spot sets were written from the lists that did arrive; \
+             the build retries until the lists come back."
+        );
         anyhow::bail!(
             "build REJECTED: {failed_lists} of {} NSE index lists failed ({:.1}%), above the \
              {:.1}% ceiling — the surviving lists would join cleanly and report a healthy day \
@@ -987,6 +1006,8 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
     if fraction > NSE_MEMBERSHIP_TOLERANCE {
         for u in outcome.unresolved.iter().take(50) {
             error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                source = "rider_constituent_unresolved",
                 index = %u.index_name,
                 symbol = %u.symbol,
                 isin = %u.isin,
@@ -1149,6 +1170,8 @@ async fn persist_constituents(questdb: &QuestDbConfig, date: &str, outcome: &Joi
         .await
     {
         error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            source = "rider_constituency_gate_closed",
             timeout_secs = MIGRATION_GATE_WAIT_SECS,
             "index_constituency migration gate did not open — SKIPPING the persist rather than \
              writing rows a later TRUNCATE would erase"
@@ -1209,6 +1232,8 @@ async fn persist_constituents(questdb: &QuestDbConfig, date: &str, outcome: &Joi
             .await;
         }
         Err(err) => error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            source = "rider_constituency_persist_failed",
             rows = rows.len(),
             date,
             error = %err,
@@ -1316,6 +1341,27 @@ fn write_mapping_atomic(
         "instrument mapping written"
     );
 
+    write_narrowed_spot_artifacts(date, master, outcome);
+    Ok(())
+}
+
+/// The two narrowed spot artifacts (F&O underlyings, NTM), each on its own
+/// terms and neither able to fail the caller.
+///
+/// Called after the full mapping, and ALSO by the index-list reject in
+/// `build_once` (audit D3c-1): neither artifact depends on the lists that
+/// failed. The F&O set is the master alone; the NTM set is the master plus the
+/// Nifty Total Market list, and a failed NTM list resolves zero NTM rows, which
+/// the zero-constituent refusal below already turns into "not written". So a
+/// day that loses five unrelated lists no longer loses the lists the live lane
+/// actually boots on.
+///
+/// O(master + outcome), once per build attempt, cold path.
+fn write_narrowed_spot_artifacts(
+    date: &str,
+    master: &[tickvault_core::instrument::master_csv::MasterRow],
+    outcome: &JoinOutcome,
+) {
     // The F&O underlying set, written AFTER the mapping artifact has landed
     // and deliberately NOT allowed to fail this function.
     //
@@ -1394,8 +1440,6 @@ fn write_mapping_atomic(
             ),
         }
     }
-
-    Ok(())
 }
 
 /// The NTM spot universe: NSE indices PLUS the Nifty Total Market constituents.
@@ -1574,6 +1618,8 @@ pub fn spawn_dhan_universe_rider(
             let reason = tickvault_storage::disk_health_watcher::classify_join_exit(&result);
             metrics::counter!(RESPAWN_COUNTER, "reason" => reason).increment(1);
             error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                source = "rider_task_died",
                 reason,
                 backoff_secs = RESPAWN_BACKOFF_SECS,
                 "[dhan_universe] daily rider task DIED — respawning. Until this respawn \
@@ -1654,8 +1700,16 @@ async fn run_dhan_universe_rider(config: DhanUniverseConfig, questdb: QuestDbCon
                         warn!(date = %today, attempt, backoff_secs = backoff, error = %err,
                               "[dhan_universe] build failed — retrying");
                     } else {
-                        error!(date = %today, attempt, backoff_secs = backoff, error = %err,
-                               "[dhan_universe] build STILL failing — the day has no mapping yet");
+                        error!(
+                            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState
+                                .code_str(),
+                            source = "rider_build_still_failing",
+                            date = %today,
+                            attempt,
+                            backoff_secs = backoff,
+                            error = %err,
+                            "[dhan_universe] build STILL failing — the day has no full mapping yet"
+                        );
                     }
                     tokio::time::sleep(Duration::from_secs(backoff)).await;
                 }
@@ -2515,6 +2569,43 @@ mod tests {
             "NTM_INDEX_NAME {NTM_INDEX_NAME:?} is not a display name in \
              INDEX_CONSTITUENCY_SLUGS — the join stamps index_name from that table, so this \
              selector would match nothing and narrow to indices alone"
+        );
+    }
+
+    /// Audit D3c-1: the index-list reject writes the two narrowed spot sets
+    /// BEFORE it fails the build, and the normal path writes them through the
+    /// same function, so the two paths cannot drift into different sets.
+    #[test]
+    fn write_narrowed_spot_artifacts_runs_before_the_index_list_reject() {
+        // The whole file: a doc comment above mentions the test attribute, so a
+        // split on it would cut production short. `find` takes the first
+        // (production) occurrence of each needle.
+        let production = include_str!("dhan_universe.rs");
+        let gate = production
+            .find("if failed_fraction > MAX_FAILED_INDEX_LIST_FRACTION {")
+            .expect("the list-count gate exists");
+        let gate_body = &production[gate..];
+        let bail = gate_body
+            .find("anyhow::bail!(")
+            .expect("the gate still fails the build");
+        assert!(
+            gate_body[..bail].contains("write_narrowed_spot_artifacts(date, &master, &partial)"),
+            "the narrowed spot sets must be written before the reject, not after or never"
+        );
+        assert!(
+            gate_body[..bail].contains(concat!("source = \"rider_index_lists_", "rejected\"")),
+            "the reject must carry its own coded source"
+        );
+        let mapping = production
+            .find(concat!("fn write_mapping_", "atomic("))
+            .expect("mapping writer exists");
+        let narrowed = production
+            .find(concat!("fn write_narrowed_spot_", "artifacts("))
+            .expect("narrowed writer exists");
+        assert!(
+            production[mapping..narrowed]
+                .contains("write_narrowed_spot_artifacts(date, master, outcome);"),
+            "the normal path must write the narrowed sets through the same function"
         );
     }
 

@@ -10227,6 +10227,10 @@ pub struct DhanFeedStackParams {
     /// is a schema decision. Until that decision is made, running both is
     /// REFUSED rather than silently corrupted.
     pub rest_fold_writes_dhan_candles: bool,
+    /// Audit D3b: where the running session reads today's spot list when the
+    /// boot did not get it (an earlier day's list, or the 4 index ids). `None`
+    /// on a boot that resolved today's list.
+    pub widen_universe: Option<crate::dhan_live_universe::TodaysUniverseSource>,
     /// The operator-facing feed state, so the lane can report whether it is
     /// ACTUALLY running.
     ///
@@ -10919,6 +10923,69 @@ fn top_up_late_contracts_acked(
         );
         return 0;
     }
+    let placed = send_extend_chunks(&delta, sent, slots, pending, attempts);
+    let unplaced = delta.len().saturating_sub(placed);
+    if unplaced > 0 {
+        // TWO causes, one message until 2026-08-22 — and they send triage in
+        // opposite directions. An EMPTY `slots` means no connection ever
+        // registered a top-up channel at all: every dial failed, or the
+        // contract half was marked done without leaving a sender behind. That
+        // is a wiring failure with nothing to do with capacity, and blaming
+        // the 5 x 5,000 budget for it sends the operator hunting an overflow
+        // that does not exist. Found by the 2026-08-22 permutation sweep,
+        // which asked what this line says when there is nothing to send to.
+        let cause = if slots.is_empty() {
+            "no live connection ever registered a top-up channel — a WIRING failure, not a \
+             capacity one: the contract half reported done without leaving a sender behind"
+        } else {
+            "every main-feed connection is at its cap, which means the authorized universe no \
+             longer fits the 5 x 5,000 budget"
+        };
+        error!(
+            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+            attempts,
+            delta = delta.len(),
+            placed,
+            unplaced,
+            connections = slots.len(),
+            cause,
+            "late-priced contracts had no room on any live connection — they are NOT \
+             subscribed this session"
+        );
+    } else {
+        info!(
+            attempts,
+            placed,
+            "late-priced contracts subscribed on the live connections — these are the \
+             options of underlyings that had not traded when the contract half first dialed"
+        );
+    }
+    placed
+}
+
+/// Hand `delta` to live main-feed connections in chunks that fit each one's
+/// room, one acknowledged `Extend` per connection, and return how many were
+/// queued.
+///
+/// Shared by the late contract top-up and the running-session widen (audit
+/// D3b), so both mark `sent` the same way: optimistically on a queued send,
+/// corrected later by [`reconcile_pending_topups`] from the acknowledgement.
+/// The caller owns the dedup; `delta` must already be disjoint from `sent`.
+///
+/// O(delta) plus one bounded `try_send` per connection (at most 5). Never
+/// waits on a connection task.
+fn send_extend_chunks(
+    delta: &[tickvault_core::websocket::pool_supervisor::SubscribeInstrument],
+    sent: &mut std::collections::HashSet<(u64, u8)>,
+    slots: &mut [(
+        tokio::sync::mpsc::Sender<
+            tickvault_core::websocket::pool_supervisor::LiveSubscriptionCommand,
+        >,
+        usize,
+    )],
+    pending: &mut Vec<PendingTopUp>,
+    attempts: u32,
+) -> usize {
     let mut cursor = 0usize;
     let mut placed = 0usize;
     for (tx, room) in slots.iter_mut() {
@@ -10962,47 +11029,11 @@ fn top_up_late_contracts_acked(
                     attempts,
                     offered = take,
                     %err,
-                    "a live connection would not accept a late contract top-up — trying the \
-                     next connection. Nothing was marked subscribed."
+                    "a live connection would not accept a top-up (late contracts, or today's \
+                     spot list) — trying the next connection. Nothing was marked subscribed."
                 );
             }
         }
-    }
-    let unplaced = delta.len().saturating_sub(placed);
-    if unplaced > 0 {
-        // TWO causes, one message until 2026-08-22 — and they send triage in
-        // opposite directions. An EMPTY `slots` means no connection ever
-        // registered a top-up channel at all: every dial failed, or the
-        // contract half was marked done without leaving a sender behind. That
-        // is a wiring failure with nothing to do with capacity, and blaming
-        // the 5 x 5,000 budget for it sends the operator hunting an overflow
-        // that does not exist. Found by the 2026-08-22 permutation sweep,
-        // which asked what this line says when there is nothing to send to.
-        let cause = if slots.is_empty() {
-            "no live connection ever registered a top-up channel — a WIRING failure, not a \
-             capacity one: the contract half reported done without leaving a sender behind"
-        } else {
-            "every main-feed connection is at its cap, which means the authorized universe no \
-             longer fits the 5 x 5,000 budget"
-        };
-        error!(
-            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
-            attempts,
-            delta = delta.len(),
-            placed,
-            unplaced,
-            connections = slots.len(),
-            cause,
-            "late-priced contracts had no room on any live connection — they are NOT \
-             subscribed this session"
-        );
-    } else {
-        info!(
-            attempts,
-            placed,
-            "late-priced contracts subscribed on the live connections — these are the \
-             options of underlyings that had not traded when the contract half first dialed"
-        );
     }
     placed
 }
@@ -11211,6 +11242,387 @@ pub fn ymd_from_ist_date(date_ist: &str) -> u32 {
     y * 10_000 + m * 100 + d
 }
 
+/// What the late attach needs to add today's spot list to a session that booted
+/// without it (audit D3b, 2026-09-28). `None` on a normal boot.
+///
+/// # Why the attach owns this
+///
+/// The 2026-09-28 boot at 04:26 IST ran before the daily rider's 08:00 build,
+/// resolved to the 4 index ids, and was never restarted: the whole morning
+/// subscribed 4 instruments. The list is resolved once at boot, and after the
+/// boot only this task holds the pool, the live connections' top-up channels
+/// and the frame ring, so it is the one place that can add instruments.
+pub struct RunningWiden {
+    /// Where today's list is read from, and the capacity it is selected against.
+    source: crate::dhan_live_universe::TodaysUniverseSource,
+    /// Every main-feed SPOT already on the wire, by I-P1-11 composite key.
+    /// Seeded from the boot set; grows as the widen places instruments.
+    on_wire: std::collections::HashSet<(u64, u8)>,
+    /// Widen top-ups queued but not yet answered by their connection task.
+    acks: Vec<PendingTopUp>,
+    /// Edge latch for the "no room left" error: once per session.
+    no_room_reported: bool,
+    /// A widen dial opened fewer connections than it planned. Which of the
+    /// planned instruments landed on the missing ones is not known here, so
+    /// the session finishes as still degraded rather than clearing the page.
+    dial_short: bool,
+    /// Edge latch for the "today's list is overdue" page: once per session.
+    overdue_reported: bool,
+}
+
+impl RunningWiden {
+    /// Built by the stack from the boot's own main-feed set.
+    #[must_use]
+    pub fn new(
+        source: crate::dhan_live_universe::TodaysUniverseSource,
+        boot_set: &[SubscribeInstrument],
+    ) -> Self {
+        Self {
+            source,
+            on_wire: boot_set.iter().map(contract_identity).collect(),
+            acks: Vec::new(),
+            no_room_reported: false,
+            dial_short: false,
+            overdue_reported: false,
+        }
+    }
+}
+
+/// Today's instruments that are not on the wire yet, deduped, in today's
+/// priority order (indices first, as `select_live_universe` put them).
+///
+/// A set difference on the composite key, for the same reason the contract
+/// top-up uses one: a second subscribe of an instrument a socket already
+/// holds is a silent double-subscribe below the cap, and Dhan answers an
+/// over-limit subscribe with 804. Instruments on the wire but NOT on today's
+/// list stay subscribed: nothing is ever dropped without the owner's say.
+///
+/// O(today) with one hash probe each.
+#[must_use]
+fn widen_delta(
+    today: &[SubscribeInstrument],
+    on_wire: &std::collections::HashSet<(u64, u8)>,
+) -> Vec<SubscribeInstrument> {
+    let candidate: Vec<SubscribeInstrument> = today
+        .iter()
+        .filter(|instrument| !on_wire.contains(&contract_identity(instrument)))
+        .copied()
+        .collect();
+    dedup_subscribe_set(&candidate).0
+}
+
+/// The live connections a widen may extend, spot connection first.
+///
+/// The boot spot connection's room is offered only while the contract overflow
+/// has not claimed it (`spot_topup_used`); once it has, whatever it left is
+/// already in `live_topups`, and offering it twice would double-count the room.
+/// Returns the slots and whether slot 0 is the spot connection, so
+/// [`write_back_widen_rooms`] can return each room to its owner.
+fn widen_slots(
+    spot_topup: Option<&(tokio::sync::mpsc::Sender<LiveSubscriptionCommand>, usize)>,
+    spot_topup_used: bool,
+    live_topups: &[(tokio::sync::mpsc::Sender<LiveSubscriptionCommand>, usize)],
+) -> (
+    Vec<(tokio::sync::mpsc::Sender<LiveSubscriptionCommand>, usize)>,
+    bool,
+) {
+    let mut slots = Vec::with_capacity(live_topups.len().saturating_add(1));
+    let spot_first = match spot_topup {
+        Some((tx, spare)) if !spot_topup_used => {
+            slots.push((tx.clone(), *spare));
+            true
+        }
+        _ => false,
+    };
+    slots.extend(live_topups.iter().cloned());
+    (slots, spot_first)
+}
+
+/// Return each slot's remaining room to where it came from, after
+/// [`send_extend_chunks`] spent some of it.
+fn write_back_widen_rooms(
+    slots: Vec<(tokio::sync::mpsc::Sender<LiveSubscriptionCommand>, usize)>,
+    spot_first: bool,
+    spot_topup: &mut Option<(tokio::sync::mpsc::Sender<LiveSubscriptionCommand>, usize)>,
+    live_topups: &mut [(tokio::sync::mpsc::Sender<LiveSubscriptionCommand>, usize)],
+) {
+    let mut rooms = slots.into_iter().map(|(_, room)| room);
+    if spot_first && let (Some(room), Some((_, spare))) = (rooms.next(), spot_topup.as_mut()) {
+        *spare = room;
+    }
+    for (room, (_, live_room)) in rooms.zip(live_topups.iter_mut()) {
+        *live_room = room;
+    }
+}
+
+/// Everything the widen borrows from the attach for one attempt.
+struct WidenCtx<'a> {
+    pool: &'a mut PoolSupervisor,
+    frame_weak: &'a tokio::sync::mpsc::WeakSender<CapturedFrame>,
+    client_id: &'a str,
+    spill: &'a Arc<WsFrameSpill>,
+    main_feed_budget: &'a Arc<RingByteBudget>,
+    depth_budget: &'a Arc<RingByteBudget>,
+    depth200_budget: &'a Arc<RingByteBudget>,
+    ws_audit_tx:
+        &'a tokio::sync::mpsc::Sender<tickvault_core::websocket::pool_supervisor::WsLifecycleEvent>,
+    seed_tx: &'a tokio::sync::mpsc::Sender<Vec<SubscribeInstrument>>,
+    spot_topup: &'a mut Option<(tokio::sync::mpsc::Sender<LiveSubscriptionCommand>, usize)>,
+    spot_topup_used: bool,
+    live_topups: &'a mut Vec<(tokio::sync::mpsc::Sender<LiveSubscriptionCommand>, usize)>,
+    main_feed_connections_used: &'a mut usize,
+    contract_capacity: &'a mut Option<usize>,
+}
+
+/// Room for NEW main-feed connections the widen may open. Zero once Dhan has
+/// answered with 805 (too many connections) in this process: Dhan closes the
+/// OLDEST healthy socket for each extra one, so a new connection would trade a
+/// live socket for itself (the same breaker the depth dial obeys, audit PR21).
+#[must_use]
+fn widen_pool_room(main_feed_connections_used: usize) -> usize {
+    if tickvault_core::websocket::pool_supervisor::rotation_halted() {
+        0
+    } else {
+        remaining_main_feed_capacity(main_feed_connections_used)
+    }
+}
+
+/// One attempt of the running-session widen. Returns `true` when the widen is
+/// finished (today's list is on the wire, or nothing more can be placed).
+///
+/// Order, spots before contracts: spare room on the boot spot connection, then
+/// spare room on the other live connections, then new connections from the
+/// pool. The attach calls this BEFORE the contract selection, and every slot
+/// it uses is taken out of the frozen contract capacity, so the contract half
+/// never plans against room the spots already took.
+///
+/// Cold path: once per attach attempt (60 s, 15 s pre-open), never per tick.
+/// O(today) for the set difference, plus at most one pool plan and dial.
+fn widen_running_session(
+    widen: &mut RunningWiden,
+    ctx: WidenCtx<'_>,
+    date_ist: &str,
+    attempts: u32,
+) -> bool {
+    let freed = reconcile_pending_topups(&mut widen.acks, &mut widen.on_wire, attempts);
+    if freed > 0 {
+        info!(
+            attempts,
+            freed,
+            "today's spot list: a live connection did not take part of a widen top-up — \
+             re-offered this attempt"
+        );
+    }
+    let Some((today, kind)) =
+        crate::dhan_live_universe::read_todays_live_universe(&widen.source, date_ist)
+    else {
+        // Normal until the rider writes today's list. Silent until the
+        // moment a fresh boot would give up waiting and page; then page once,
+        // because an early boot's own fallback line was the expected,
+        // unpaged kind. Keep polling either way: the list can still land.
+        if !widen.overdue_reported
+            && crate::dhan_live_universe::widen_list_is_overdue(
+                ist_second_of_day_now(),
+                widen.source.cfg.target_secs_of_day_ist,
+            )
+        {
+            widen.overdue_reported = true;
+            crate::dhan_live_universe::record_widen_list_overdue(widen.on_wire.len());
+            error!(
+                code = ErrorCode::WsGapConnectionState.code_str(),
+                attempts,
+                subscribed = widen.on_wire.len(),
+                "today's spot list is still not on disk past the time a fresh boot stops \
+                 waiting for it — the session keeps running on the list it booted with and \
+                 adds today's the moment it appears. Check the daily instrument rider."
+            );
+        }
+        return false;
+    };
+    let truncated = today.source == crate::dhan_live_universe::UniverseSource::TruncatedToCapacity;
+    let delta = widen_delta(&today.instruments, &widen.on_wire);
+    let mut offered: Vec<SubscribeInstrument> = Vec::new();
+
+    if !delta.is_empty() {
+        // 1 + 2: spare room on live connections.
+        let (mut slots, spot_first) = widen_slots(
+            ctx.spot_topup.as_ref(),
+            ctx.spot_topup_used,
+            ctx.live_topups,
+        );
+        let placed_live = send_extend_chunks(
+            &delta,
+            &mut widen.on_wire,
+            &mut slots,
+            &mut widen.acks,
+            attempts,
+        );
+        write_back_widen_rooms(slots, spot_first, ctx.spot_topup, ctx.live_topups);
+        offered.extend(
+            delta
+                .iter()
+                .filter(|i| widen.on_wire.contains(&contract_identity(i)))
+                .copied(),
+        );
+
+        // 3: new connections for the rest, as far as the 5-connection cap allows.
+        let rest: Vec<SubscribeInstrument> = delta
+            .iter()
+            .filter(|i| !widen.on_wire.contains(&contract_identity(i)))
+            .copied()
+            .collect();
+        let pool_room = widen_pool_room(*ctx.main_feed_connections_used);
+        let to_pool = &rest[..rest.len().min(pool_room)];
+        let mut placed_pool = 0usize;
+        let mut pool_charged = 0usize;
+        if !to_pool.is_empty() {
+            match ctx.frame_weak.upgrade() {
+                None => warn!(
+                    code = ErrorCode::WsGapConnectionState.code_str(),
+                    attempts,
+                    waiting = to_pool.len(),
+                    "today's spot list: the frame ring has closed, so no new connection is \
+                     dialed for the rest of today's list"
+                ),
+                Some(frame_tx) => {
+                    match build_feed_stack_plan(ctx.pool, Instant::now(), to_pool, &[], &[]) {
+                        Ok(plan) => {
+                            let planned = plan.connections.len();
+                            let dialed = dial_planned_connections(
+                                plan,
+                                DialContext {
+                                    pool: ctx.pool,
+                                    client_id: ctx.client_id,
+                                    spill: ctx.spill,
+                                    frame_tx: &frame_tx,
+                                    main_feed_budget: ctx.main_feed_budget,
+                                    depth_budget: ctx.depth_budget,
+                                    depth200_budget: ctx.depth200_budget,
+                                    ws_audit_tx: Some(ctx.ws_audit_tx),
+                                    // Kept so the late contract top-up can use
+                                    // what these connections leave free.
+                                    out_topups: Some(ctx.live_topups),
+                                    out_depth_commands: None,
+                                },
+                            );
+                            report_dial_shortfall(DIAL_HALF_MAIN_FEED, planned, dialed, attempts);
+                            if dialed < planned {
+                                widen.dial_short = true;
+                            }
+                            // Slots are spent at plan time, so what the plan
+                            // took is on the wire or reported short above;
+                            // re-planning it would burn a second slot.
+                            for instrument in to_pool {
+                                widen.on_wire.insert(contract_identity(instrument));
+                            }
+                            offered.extend_from_slice(to_pool);
+                            placed_pool = to_pool.len();
+                            // `planned`, not `dialed`: `admit` spent the slots
+                            // when it planned, dialed or not.
+                            *ctx.main_feed_connections_used =
+                                ctx.main_feed_connections_used.saturating_add(planned);
+                            // A new connection takes a whole connection's room
+                            // out of the pool, not just the spots on it. What
+                            // it leaves free is in `live_topups`, where the
+                            // late contract top-up can still use it.
+                            pool_charged = pool_room.saturating_sub(remaining_main_feed_capacity(
+                                *ctx.main_feed_connections_used,
+                            ));
+                        }
+                        Err(err) => error!(
+                            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                            ?err,
+                            attempts,
+                            waiting = to_pool.len(),
+                            "today's spot list: planning new connections was refused — \
+                             retrying next attempt"
+                        ),
+                    }
+                }
+            }
+        }
+
+        // Keep the contract half honest: every slot the spots took is a slot
+        // the frozen contract capacity may not plan against.
+        if let Some(capacity) = ctx.contract_capacity.as_mut() {
+            *capacity = capacity.saturating_sub(placed_live.saturating_add(pool_charged));
+        }
+        if !offered.is_empty() {
+            let count = offered.len();
+            if let Err(err) = ctx.seed_tx.try_send(offered) {
+                warn!(
+                    %err,
+                    count,
+                    "today's spot list was subscribed but could not be seeded into the silence \
+                     detector — they tick normally, but one that goes silent is not reported"
+                );
+            }
+            info!(
+                attempts,
+                added = count,
+                placed_on_live_connections = placed_live,
+                placed_on_new_connections = placed_pool,
+                spot_universe = kind,
+                today = today.instruments.len(),
+                "today's spot list: the running session added the instruments it booted \
+                 without"
+            );
+        }
+    }
+
+    let unplaced = widen_delta(&today.instruments, &widen.on_wire).len();
+    let live_room: usize = ctx.live_topups.iter().map(|(_, room)| *room).sum::<usize>()
+        + match ctx.spot_topup.as_ref() {
+            Some((_, spare)) if !ctx.spot_topup_used => *spare,
+            _ => 0,
+        };
+    let no_room = live_room == 0 && widen_pool_room(*ctx.main_feed_connections_used) == 0;
+    if unplaced > 0 && no_room {
+        if !widen.no_room_reported {
+            widen.no_room_reported = true;
+            error!(
+                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                attempts,
+                unplaced,
+                on_wire = widen.on_wire.len(),
+                "today's spot list: every main-feed connection is full, so {unplaced} of \
+                 today's instruments are NOT subscribed this session. Nothing already \
+                 subscribed was dropped to make room."
+            );
+        }
+        crate::dhan_live_universe::finish_live_universe_widen(true, widen.on_wire.len());
+        return true;
+    }
+    if unplaced == 0 && widen.acks.is_empty() {
+        // A dial shortfall keeps the page: some of today's list may sit on a
+        // connection that never opened, and clearing here would be a false OK.
+        crate::dhan_live_universe::finish_live_universe_widen(
+            truncated || widen.dial_short,
+            widen.on_wire.len(),
+        );
+        if widen.dial_short {
+            error!(
+                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                attempts,
+                subscribed = widen.on_wire.len(),
+                "today's spot list: a new connection for it did not open, so part of the \
+                 list may not be subscribed this session — the fallback alarm stays on"
+            );
+            return true;
+        }
+        info!(
+            attempts,
+            subscribed = widen.on_wire.len(),
+            today = today.instruments.len(),
+            truncated,
+            spot_universe = kind,
+            "today's spot list is on the wire — the session no longer needs a restart"
+        );
+        return true;
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)] // APPROVED: private late-attach task over the boot scope's owned state — bundling would hide which of the two RING BUDGETS each socket gets, and that split is load-bearing (groww_contract_1m_boot precedent)
 async fn attach_depth_when_available(
     mut pool: PoolSupervisor,
@@ -11259,7 +11671,7 @@ async fn attach_depth_when_available(
     // while ATM +/- 25 needs ~23,000-23,750. Both Dhan caps (5,000 per
     // connection, 5 connections) are already at their documented maximum, so
     // the only slots that exist are the ones already paid for on this socket.
-    spot_topup: Option<(
+    mut spot_topup: Option<(
         tokio::sync::mpsc::Sender<
             tickvault_core::websocket::pool_supervisor::LiveSubscriptionCommand,
         >,
@@ -11281,6 +11693,10 @@ async fn attach_depth_when_available(
     // carried from AppConfig to the ONE place that owns the depth-200 command
     // senders. Three bools, Copy, DEFAULT OFF.
     probe_cfg: tickvault_common::config::DepthUnsubscribeProbeConfig,
+    // Audit D3b: `Some` when the boot did not get today's spot list. The
+    // attach adds it once the rider writes it, and does not return while it
+    // is still missing (until the 15:30 hard stop).
+    mut widen: Option<RunningWiden>,
 ) {
     // Publish a 0 for every contract-failure reason BEFORE the first attempt.
     //
@@ -11420,6 +11836,10 @@ async fn attach_depth_when_available(
     // `return` that used to guarantee it.
     let mut readiness_published = false;
     let mut late_topped_up = 0usize;
+    // Audit D3b: set once the depth and contract halves are finished (the
+    // rebalance was handed its channels) or given up, while today's spot list
+    // is still missing. From then on each attempt runs only the widen.
+    let mut widen_only = false;
     // How many underlyings had NO spot price at the moment contracts dialed.
     // The top-up's budget is derived from how far this figure has since
     // fallen — see `MAX_CONTRACTS_PER_LATE_UNDERLYING`.
@@ -11481,7 +11901,56 @@ async fn attach_depth_when_available(
             if !contracts_done {
                 crate::dhan_contract_universe::record_contract_give_up();
             }
+            if widen.is_some() {
+                // Already paged once the list went overdue (the rider's hour
+                // plus the boot wait), and the heartbeat keeps the alarm fed,
+                // so this is the log line, not a second page.
+                error!(
+                    code = ErrorCode::WsGapConnectionState.code_str(),
+                    attempts,
+                    "today's spot list never reached the running session before the 15:30 \
+                     IST hard stop — the session stayed on the list it booted with"
+                );
+            }
             return;
+        }
+
+        // Audit D3b: the depth and contract halves are finished and handed
+        // off; this loop now runs only to add today's spot list.
+        if widen_only {
+            let today_date = crate::dhan_universe::today_ist_date();
+            attempts = attempts.saturating_add(1);
+            let done = widen.as_mut().is_none_or(|w| {
+                widen_running_session(
+                    w,
+                    WidenCtx {
+                        pool: &mut pool,
+                        frame_weak: &frame_weak,
+                        client_id: &client_id,
+                        spill: &spill,
+                        main_feed_budget: &main_feed_budget,
+                        depth_budget: &depth_budget,
+                        depth200_budget: &depth200_budget,
+                        ws_audit_tx: &ws_audit_tx,
+                        seed_tx: &seed_tx,
+                        spot_topup: &mut spot_topup,
+                        spot_topup_used,
+                        live_topups: &mut live_topups,
+                        main_feed_connections_used: &mut main_feed_connections_used,
+                        contract_capacity: &mut contract_capacity,
+                    },
+                    &today_date,
+                    attempts,
+                )
+            });
+            if done {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(preopen_retry_secs(
+                ist_second_of_day_now(),
+            )))
+            .await;
+            continue;
         }
 
         if attempts > 0 && out_of_time && !last_had_instruments {
@@ -11510,6 +11979,13 @@ async fn attach_depth_when_available(
             // silently turn this into a false page.
             if !contracts_done {
                 crate::dhan_contract_universe::record_contract_give_up();
+            }
+            // Audit D3b: the halves are given up and paged on time, but a
+            // session still waiting for today's spot list keeps running for
+            // it, until the list lands or the 15:30 hard stop.
+            if widen.is_some() {
+                widen_only = true;
+                continue;
             }
             return;
         }
@@ -11741,6 +12217,35 @@ async fn attach_depth_when_available(
                     }
                 }
             }
+        }
+
+        // Audit D3b: today's spot list first, BEFORE the contract selection
+        // freezes or spends capacity. Spots are the underlyings the contracts
+        // are priced from, so they take the room first.
+        if let Some(w) = widen.as_mut()
+            && widen_running_session(
+                w,
+                WidenCtx {
+                    pool: &mut pool,
+                    frame_weak: &frame_weak,
+                    client_id: &client_id,
+                    spill: &spill,
+                    main_feed_budget: &main_feed_budget,
+                    depth_budget: &depth_budget,
+                    depth200_budget: &depth200_budget,
+                    ws_audit_tx: &ws_audit_tx,
+                    seed_tx: &seed_tx,
+                    spot_topup: &mut spot_topup,
+                    spot_topup_used,
+                    live_topups: &mut live_topups,
+                    main_feed_connections_used: &mut main_feed_connections_used,
+                    contract_capacity: &mut contract_capacity,
+                },
+                &today_date,
+                attempts.saturating_add(1),
+            )
+        {
+            widen = None;
         }
 
         // The contract universe rides the SAME retry loop, and that is not a
@@ -12006,6 +12511,11 @@ async fn attach_depth_when_available(
                         // per-attempt emit would page every healthy morning.
                         report_dial_shortfall(DIAL_HALF_MAIN_FEED, planned, dialed, attempts);
                         crate::dhan_contract_universe::record_contract_verdict(&contracts);
+                        // Audit D3c-1: the boot headroom saw spots only.
+                        crate::dhan_live_universe::report_spots_and_contracts_headroom(
+                            contracts.instruments.len(),
+                            remaining_main_feed_capacity(0),
+                        );
                         contracts_done = true;
                         // Only what the POOL carried. The overflow records
                         // itself at its own send site, because it can fail
@@ -12486,7 +12996,17 @@ async fn attach_depth_when_available(
                     std::mem::take(&mut depth_commands),
                     probe_cfg,
                 );
-                return;
+                if widen.is_none() {
+                    return;
+                }
+                // Audit D3b: keep the pool and the live channels until today's
+                // spot list is on the wire; only the widen runs from here.
+                widen_only = true;
+                info!(
+                    attempts,
+                    "late-attach: contracts and depth are finished; still waiting for today's \
+                     spot list to add it to the running session"
+                );
             }
         }
         // Poll fast while the open is approaching, slow the rest of the day.
@@ -15169,6 +15689,10 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             ws_audit_tx.clone(),
             seed_tx.clone(),
             params.depth_unsubscribe_probe,
+            params
+                .widen_universe
+                .clone()
+                .map(|source| RunningWiden::new(source, &params.main_feed_instruments)),
         ));
     }
 
@@ -16686,6 +17210,155 @@ mod tests {
         }
     }
 
+    // -- audit D3b: a running session adds today's spot list ---------------
+
+    /// The delta is today's list minus what is on the wire, on the composite
+    /// key, deduped, in today's order. Id 13 on NSE_EQ is a different
+    /// instrument from NIFTY (13 on IDX_I) and must still be added.
+    #[test]
+    fn widen_delta_is_the_composite_key_set_difference_in_todays_order() {
+        let on_wire: std::collections::HashSet<(u64, u8)> = [
+            inst(13, ExchangeSegment::IdxI),
+            inst(25, ExchangeSegment::IdxI),
+        ]
+        .iter()
+        .map(contract_identity)
+        .collect();
+        let today = vec![
+            inst(13, ExchangeSegment::IdxI),
+            inst(13, ExchangeSegment::NseEquity),
+            inst(2885, ExchangeSegment::NseEquity),
+            inst(2885, ExchangeSegment::NseEquity),
+            inst(25, ExchangeSegment::IdxI),
+            inst(1333, ExchangeSegment::NseEquity),
+        ];
+        assert_eq!(
+            widen_delta(&today, &on_wire),
+            vec![
+                inst(13, ExchangeSegment::NseEquity),
+                inst(2885, ExchangeSegment::NseEquity),
+                inst(1333, ExchangeSegment::NseEquity),
+            ]
+        );
+        assert!(widen_delta(&today[..1], &on_wire).is_empty());
+    }
+
+    /// Instruments on the wire but not on today's list are never offered for
+    /// removal: the widen only adds (owner rule: nothing is dropped).
+    #[test]
+    fn running_widen_new_seeds_the_wire_set_from_the_boot_set_and_only_adds() {
+        let boot = vec![
+            inst(13, ExchangeSegment::IdxI),
+            inst(500, ExchangeSegment::NseEquity),
+        ];
+        let widen = RunningWiden::new(
+            crate::dhan_live_universe::TodaysUniverseSource {
+                cfg: tickvault_common::config::DhanUniverseConfig::default(),
+                index_universe: vec![inst(13, ExchangeSegment::IdxI)],
+                capacity: 25_000,
+            },
+            &boot,
+        );
+        assert_eq!(widen.on_wire.len(), 2);
+        assert!(widen.acks.is_empty());
+        let today = vec![
+            inst(13, ExchangeSegment::IdxI),
+            inst(600, ExchangeSegment::NseEquity),
+        ];
+        assert_eq!(
+            widen_delta(&today, &widen.on_wire),
+            vec![inst(600, ExchangeSegment::NseEquity)],
+            "500 is not on today's list and is simply left alone"
+        );
+    }
+
+    /// The spot connection's room is offered first, and only while the
+    /// contract overflow has not claimed it; the rooms go back to their owners.
+    #[tokio::test]
+    async fn widen_slots_put_the_spot_connection_first_and_write_back_every_room() {
+        let (spot, mut spot_rx) = topup_slot(3);
+        let (live_a, mut rx_a) = topup_slot(2);
+        let (live_b, _rx_b) = topup_slot(10);
+        let mut spot_topup = Some(spot);
+        let mut live = vec![live_a, live_b];
+
+        let (mut slots, spot_first) = widen_slots(spot_topup.as_ref(), false, &live);
+        assert!(spot_first);
+        assert_eq!(
+            slots.iter().map(|(_, r)| *r).collect::<Vec<_>>(),
+            vec![3, 2, 10]
+        );
+
+        let delta: Vec<SubscribeInstrument> = (1..=6)
+            .map(|id| inst(id, ExchangeSegment::NseEquity))
+            .collect();
+        let mut sent = std::collections::HashSet::new();
+        let mut pending = Vec::new();
+        let placed = send_extend_chunks(&delta, &mut sent, &mut slots, &mut pending, 1);
+        assert_eq!(placed, 6);
+        assert_eq!(
+            pending.len(),
+            3,
+            "one acknowledged Extend per connection used"
+        );
+        write_back_widen_rooms(slots, spot_first, &mut spot_topup, &mut live);
+        assert_eq!(spot_topup.as_ref().map(|(_, r)| *r), Some(0));
+        assert_eq!(live.iter().map(|(_, r)| *r).collect::<Vec<_>>(), vec![0, 9]);
+        assert_eq!(
+            extended(spot_rx.recv().await.expect("spot got the head")),
+            delta[..3]
+        );
+        assert_eq!(
+            extended(rx_a.recv().await.expect("next connection")),
+            delta[3..5]
+        );
+
+        // Once the contract overflow has used the spot connection, its
+        // remainder is already in `live_topups` and is not offered twice.
+        let (slots, spot_first) = widen_slots(spot_topup.as_ref(), true, &live);
+        assert!(!spot_first);
+        assert_eq!(slots.len(), live.len());
+    }
+
+    /// The widen runs BEFORE the contract selection (spots take the room
+    /// first), and the attach does not end while it is still pending.
+    #[test]
+    fn the_widen_runs_before_contract_selection_and_holds_the_attach_open() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let attach = src
+            .find(concat!("async fn attach_depth_", "when_available("))
+            .expect("the attach must exist");
+        let body = &src[attach..];
+        let body = &body[..body.find("\n}\n").expect("attach body closes")];
+        let widen = body
+            .find(concat!("&& widen_running_", "session("))
+            .expect("the per-attempt widen must be in the attach");
+        let contracts = body
+            .find(concat!(
+                "dhan_contract_universe::load_contract_",
+                "universe("
+            ))
+            .expect("the contract selection must be in the attach");
+        assert!(
+            widen < contracts,
+            "today's spots must be placed before contracts are sized"
+        );
+        assert!(
+            body.contains(concat!(
+                "if widen.is_none() {\n",
+                "                    return;"
+            )),
+            "the success return must wait for the widen"
+        );
+        assert!(
+            body.contains(concat!(
+                "record_contract_give_up();\n            }\n",
+                "            // Audit D3b"
+            )) && body.contains("            if widen.is_some() {\n                widen_only = true;\n                continue;"),
+            "the give-up arm must page on time, then keep a session that is still waiting \
+             for today's list running for it instead of returning"
+        );
+    }
     /// The defect this exists to pin (2026-09-01): a chunk the socket only
     /// PARTLY took used to stay fully marked, so the tail was never offered
     /// again. With the ack, exactly the tail is freed and the next top-up
@@ -17784,6 +18457,7 @@ mod tests {
             // Likewise irrelevant here — the config gate is checked before any
             // of the three floors, and this test pins that ordering.
             rest_fold_writes_dhan_candles: false,
+            widen_universe: None,
             // A real state object, default-constructed: the disabled lane must
             // spawn nothing, and must therefore leave this flag untouched at
             // its `false` default. Asserted below, so this test also pins that
@@ -21998,14 +22672,14 @@ mod tests {
         let dial_sites = production.matches("dial_planned_connections(\n").count()
             + production.matches("= dial_planned_connections(").count();
         assert!(
-            dial_sites >= 3,
-            "the file must still have all three dial sites"
+            dial_sites >= 4,
+            "the file must still have all four dial sites"
         );
         assert_eq!(
             production.matches("report_dial_shortfall(").count(),
-            4,
-            "one definition plus one check at each of the three dial sites — boot, the \
-             contract half, and depth"
+            5,
+            "one definition plus one check at each of the four dial sites — boot, the \
+             contract half, depth, and the running-session widen (audit D3b)"
         );
         assert!(
             production.contains(DIAL_INCOMPLETE_COUNTER),
