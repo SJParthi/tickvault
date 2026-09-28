@@ -303,7 +303,7 @@ inline (PR2, PR8, PR14).
       missing. Tests: `live_universe_degraded_reason_decodes_every_reason_and_nothing_else`,
       `every_paged_fallback_arms_the_heartbeat`, `run_degraded_universe_heartbeat_is_spawned_by_main_while_degraded`,
       `main_re_judges_the_verdict_after_the_wait_and_can_only_tighten_it`.
-  - [ ] **D3b — widen a running session when today's list lands.** The lane reads the universe
+  - [x] **D3b — widen a running session when today's list lands.** The lane reads the universe
     once at boot. Reuse the late attach's machinery: the set difference on the composite key goes
     to spare room on live sockets via `LiveSubscriptionCommand::Extend` and to new sockets via
     `build_feed_stack_plan`; the attach task keeps the pool until the widen is done. Each Extend
@@ -312,6 +312,49 @@ inline (PR2, PR8, PR14).
       the rider's budget is 900 s plus retries, so a slow rider always loses the race. D3b is
       the fix for both: keep watching for today's list after boot and widen when it lands.
       When D3b clears the degraded state the heartbeat stops by itself.
+    - Done: `resolve_live_universe` arms `LIVE_UNIVERSE_WIDEN_PENDING` in its three off-today
+      arms (earlier-day list, expected 4-index boot, paged 4-index boot); `main.rs` hands the
+      late attach a `TodaysUniverseSource` on a trading day. Each attach attempt, BEFORE the
+      contract selection, `widen_running_session` reads today's list with the boot's own
+      precedence and selection (`read_todays_live_universe`, today only, silent on a miss),
+      takes the composite-key set difference against what is on the wire (`widen_delta`), and
+      places it on the boot spot connection's spare room, then the other live connections'
+      room (`send_extend_chunks`, split out of the contract top-up so both mark and reconcile
+      the same way), then new main-feed connections from the pool; no new connection after an
+      805. Every slot it takes comes out of the frozen contract capacity. Placed instruments
+      are seeded into the silence detector. When the delta is empty and every ack is
+      answered, `finish_live_universe_widen` clears the page (or moves it to
+      `truncated_to_capacity`, and the heartbeat now reads the current reason). With every
+      connection full it stops with one error and drops nothing. The attach keeps the pool
+      after handing depth to the rebalance, and neither the success return nor the 10:00
+      give-up ends it while the widen is pending; the 15:30 hard stop still does. Instruments
+      on the boot list but not today's stay subscribed (nothing is dropped). Log and alarm
+      text no longer tell the owner to restart. The 08:40 boot wait stays: the session now
+      widens after it, so dialing early on the earlier list beats waiting to 09:10.
+      Tests: `widen_delta_is_the_composite_key_set_difference_in_todays_order`,
+      `running_widen_new_seeds_the_wire_set_from_the_boot_set_and_only_adds`,
+      `widen_slots_put_the_spot_connection_first_and_write_back_every_room`,
+      `the_widen_runs_before_contract_selection_and_holds_the_attach_open`,
+      `todays_master_with_never_takes_an_earlier_day`, `todays_master_with_keeps_the_boot_precedence`, `read_todays_live_universe_is_none_while_no_list_is_on_disk`,
+      `finish_live_universe_widen_clears_the_page_or_moves_it_to_truncated`, `record_widen_list_overdue_pages_with_the_fresh_boot_reason`,
+      `live_universe_widen_pending_is_armed_by_every_off_today_arm`.
+    - Left for D3c (named, not done here): the 15:41 cross-verification still gets the boot
+      set (main.rs, `spawn_dhan_live_crossverify`), and the spot contract labels come from the
+      boot publish plus the contract attach, so a list that lands after contracts dial has no
+      labels for the added spots until the next boot. The contract attach already running
+      when today's list lands keeps its capacity net of the spots (not re-sized upward).
+      From the D3b review (all LOW, none drops an instrument): a top-up ack that frees
+      instruments does not give their room back, so a re-offer charges the room and the
+      contract capacity twice and can end the widen early as "full"; a list read in the
+      milliseconds between the rider writing the full mapping and the NTM file takes the
+      full mapping; an 805 halt and a dial shortfall page under `truncated_to_capacity`;
+      the widen counts `planned` connections but the older contract dial still counts
+      `dialed`.
+    - Review fixes in D3b itself: a new widen connection takes a whole connection's room
+      off the contract capacity; a widen dial shortfall keeps the page on; the contract
+      give-up still pages at 10:00 while the widen keeps running; an early boot whose list
+      never lands pages once at the rider hour plus the boot wait (08:10) and keeps the
+      alarm fed (`widen_list_is_overdue_matches_the_boot_wait_deadline`).
   - [ ] **D3c — the rest of D3:** parked-socket reassignment, late top-up refusals counted and
     alarmed, the top-up log text, the no-trade-by-09:30 gauge, and the fallback counter's
     reason hygiene (seed `ntm_*`; stop widenings paging).
@@ -1604,6 +1647,129 @@ Corrections and widenings to existing items:
 - The remaining per-area items in the gap file (ops/deploy/security, storage, feed, Dhan
   mismatches) are folded into the item each names when that item starts; any that names no
   item gets its own item before PR51.
+
+### Added 2026-09-28 (re-check 7 coverage map: every open and never-O(1) row has an owner)
+
+Source: `/mnt/project-files/audit/recheck7-plan-map.md`. It lists all 404 page rows; 83 were open
+and 45 never O(1). Of those, 66 rows had no owner in this plan or only a partial one. Each is
+assigned below. "Row N" is the page position, and "c6#N" is the re-check 6 number where one
+exists. The file:line evidence is in the map and is re-verified when the owning item starts.
+
+New items:
+
+- [ ] **PR40d-f — sub-second inline seal waits page too.** (`storage`, deploy)
+  - Row 111: a wait under 1 s never pages (seal_writer_runner.rs:279, :672-693). Page on the
+    summed inline wait per window, or alarm the shipped inline-fallback count. This item also
+    owns row 110 (the throttle is keyed on the fold's time instead of the wall clock).
+- [ ] **PR40c-f — finish the batching and append-pause proofs.** (`storage`)
+  - Row 266 (c6#235): count writes at the disk call, and test an append racing the rename
+    (seal_spill.rs:878-918, :962-968).
+- [ ] **PR40b-f — the spill prune never deletes unreplayed or refused candles.** (`storage`,
+  `app`)
+  - This item owns the PR40b corrections above: rows 187 (c6#168; `.overflow` as well as
+    `.bin.N`) and 194 (exempt refused and poison files; move the prune after recovery).
+  - Row 296: report staged-for-retry seals as pending rather than unrecovered, page once, and
+    fix the wiring test that pins the over-count (seal_writer_loop.rs:321-331, :1709-1750).
+- [ ] **OWNER-202 — exits refused at 25,000 tracked orders.** (decision only, no code)
+  - Row 202 (c6#178): the order cap also refuses cancels (engine.rs:331-381, :2543-2593). The
+    exit layer is frozen, so the owner is asked whether cancels may skip the cap. Nothing is built
+    until the owner answers.
+
+Rows folded into existing items (the fix is named here so the item carries it):
+
+- D3c: row 136 (depth-20 index legs are dark on a collapsed day; give them a price source that
+  does not depend on the main feed, or record that D3a/D3b remove the cause); row 137 (a
+  depth-only hard stop is counted, and the planning-refused error gets its alarm field); row 153
+  (ship `tv_dhan_live_universe_instruments` and chart it); row 66 (c6#66, the headroom warning
+  blames option chains, so correct its text); row 124 (c6#120, skip the mid-session master
+  rebuild when today's file is on disk).
+- PR54: row 139 (stamp depth delivery before the disk-pressure shed decision); row 140 (check a
+  slow morning's logs, and delay the steering heartbeat check until hand-off); row 318 (ship
+  `tv_dhan_dial_incomplete_total` and `tv_depth_dial_refused_after_805_total`, or add their alarm
+  field; the alarm half goes with PR39).
+- PR24: row 121 (cap the spot store's held time at the wall clock); row 101 (c6#101, count
+  contracts pushed off the 1 s board by broker clock skew, and tie the close to the measured
+  skew; the board half goes with the PR4c follow-ups).
+- PR32: row 169 (c6#150, split a refused batch so only the bad row is quarantined); row 176
+  (c6#157, order spill files by sequence, not by name).
+- PR31c: rows 172 (c6#153, top-volume boards get the spill tier during a DB outage), 193 (count
+  the refused-candle retry window from the first refusal and fold the in-session replay into
+  it), 196 (check live tables at boot and rebuild any keyless one), 224 (clear the keyed latch
+  on a table-missing error), 272 (behaviour tests for PR31a's part-way rewind, the keyed latch
+  after a refusal, and live plus replay on one key).
+- PR31b: row 299 (mark an overrun exit so the next boot does not page it again); row 192 (write
+  the crash marker from the escalation thread and code its failure).
+- PR19: rows 177 (c6#158, remove the no-capture-number spill path), 225 (the "2 s lateness"
+  note; the constant is 240 s), 273 (delete `depth20_layout` / `depth20_ranked_steer` or mark
+  their CLAUDE.md rows dormant), 335 (log-tool code search reads regular files only, with a
+  deadline), 336 (the log tool refuses a build older than the tree, or builds through cargo),
+  340 (list the IP monitor as unused code, or route its exit through shutdown), 237 (the quote
+  and stats notes as well as the board note), 370 (pin both npx servers and the CI action by
+  commit), 86 (c6#86, remove the second database server or put it behind the SQL gate, and stop
+  passing it to the unattended triage and mobile-command workflows), 270 (c6#239, the operator
+  CLI tools' stale container name).
+- PR38: rows 199 (c6#175, count and alarm updates for unknown orders), 204 (c6#180, halt trading
+  when a fill cannot enter the risk book), 201 (c6#177, persist the day's order count and reset
+  it only on the trading day), 210 (c6#186, paper order ids survive a restart).
+- D1: rows 200 (c6#176, charge the order budget after the per-second limit and the breaker) and
+  212 (order windows follow the wall clock; count a step).
+- PR25: row 250 (delete or wire the main-feed address and socket-cap settings).
+- PR37: row 341 (cap the 15:41 target list, or count data requests per day); row 116 (c6#113,
+  log the first text body on a feed socket).
+- PR51: row 274 (archive `cadence-error-codes.md`; fix the fresh-start reset view comment).
+- PR39: rows 300 (alarm or raise the medium seal-on-disk code) and 301 (the coverage guard treats
+  a source-scoped filter as covering that source only; PR51 fixes the runbook half).
+- PR46: row 369 (scope the box role's log groups and metrics to the app's own).
+- PR36 follow-up (goes with PR55): row 372 (delete the three lines that read a console key from
+  the URL); row 403 (drop the public-address link from the 08:30 ping, or point it at the tunnel).
+- PR55: row 373 (require up-to-date branches or a merge queue, and gate the push deploy on the
+  merge commit's All Green); row 395 (pin `needs: preflight`, the output condition and the step
+  order in `github_workflow_guard`); row 385 (c6#325, run the budget-latch shell and workflow
+  legs against stubs).
+- PR35: rows 398 (the watchdog skips while a deploy run is in flight), 399 (the docs-only path
+  check also covers the watchdog and the after-close cron), 400 (dispatch the deploy from the
+  merge, or alarm when the catch-up has not run for an hour), 401 (refuse a stop after a deploy
+  that finishes just before 08:30), 402 (dispatch terraform when any commit since the last apply
+  touched it).
+- PR10: row 113 (c6#110, also the depth writer's ~10 name checks per row).
+- PR43: row 127 (c6#123, also count and page the spots cut at the 250 cap).
+- PR42: row 188 (c6#169, also the order-update and position-update event writers).
+- PR41: row 36 (c6#36, replay the dead-letter file mid-session, or record boot-only replay
+  below).
+- PR7: rows 115 (c6#112, measure contention on the shared capture counter) and 267 (c6#236,
+  time a full 250,000-record shutdown drain on the production volume).
+- PR11: row 189 (c6#170, candle escalation and inline writes respect the free-space floor).
+- PR18: row 213 (the paper reconcile keeps its sets between cycles, keyed with the segment).
+- PR47: row 166 (c6#147, cap the alert tasks or record the bound from storm folding).
+- D11: row 245 (c6#215, the Muhurat flag is re-read with the trading day).
+- PR50: row 320 (the order-update socket's first dial checks the calendar).
+
+Accepted limitations (each stays as it is; recorded so it is not re-found as an open gap):
+
+| Row | Limitation | Why it stays |
+|---|---|---|
+| 14 (c6#14) | Order-book imbalance is O(levels), and its comment says O(1) | Indicator area is frozen (§28) and the code is dormant. The comment fix needs the owner's approval; the CLAUDE.md O(1) table gets a row with PR19. |
+| 75 (c6#75) | A reconnect loses the ticks in the gap | The feed has no replay; bounded by the reconnect ladder (zero-loss charter §1). |
+| 128 (c6#124) | A process alive the next day plans on yesterday's file | The box stops at 17:30 every weekday. |
+| 165 (c6#146) | Subscribe pacing pauses the reader up to 25 ms per gap | Only at boot and top-up, which is Dhan's pacing rule. |
+| 198 (c6#174) | Day volume resets only at shutdown | The box stops daily (PR23 covers the midnight case if it ever runs through). |
+| 209 (c6#185) | Cancel or modify is refused when a budget tier is used up | Matches Dhan's documented limits. |
+| 232 (c6#203) | One caller can use up the shared API rate limit | Documented at the site (public_guard.rs:61-96). |
+| 234 (c6#205) | The failed-login log names a caller-written header | Documented at the site; log text only, never used to decide anything. |
+| 313 (c6#268) | Codes 811-814 redial all day as routine drops | Accepted by the audit. PR37 decides whether to count them. |
+| 314 (c6#269) | An 805 sent as a bare reset is not recognised | No disconnect code arrives in that case. D7 re-checks it with the 805 work. |
+| 319 | A socket one 804 away from parking is not visible in the cloud | Shipping it needs a dated noise-lock quote from the owner. |
+| 329 (c6#281) | A full disk blocks the console reset | The save-first rule is deliberate: nothing is erased before its copy is safe. |
+| 337 (c6#286) | The October $150 stop depends on the cost service answering | Accepted by the audit. PR49 checks what else stops the box if the cost service is down. |
+| 36 (c6#36) | The dead-letter file is replayed only at boot, unless PR41 lifts it | Recorded here until PR41 decides. |
+
+The five never-O(1) rows that are real cost shapes (14, 115, 189, 213, 267) have owners above.
+PR19 adds a CLAUDE.md O(1)-table row for each one not already listed.
+
+Ticked items with rows still open: D3a (#1975) merged after the audited commit, so rows 149,
+151 and 154 are re-checked on main when D3b starts. PR53 closes row 226 when it merges. PR36a's
+row 371 waits on the owner typing "rotate". Row 339 is already owned by PR39; the audit's "no
+plan item" is out of date.
 
 ## Edge Cases
 

@@ -37,7 +37,7 @@
 //! lane exposes — the connection count would simply be lower, and nobody reads
 //! a connection count expecting it to carry an error.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use tickvault_common::types::{ExchangeSegment, SecurityId};
 use tickvault_core::websocket::pool_supervisor::SubscribeInstrument;
@@ -547,37 +547,51 @@ fn newest_earlier_master_with(
     days: i64,
     mut read: impl FnMut(&std::path::Path) -> Result<Vec<MasterEntry>, ArtifactFailure>,
 ) -> Option<EarlierMaster> {
-    for date in earlier_ist_dates(date_ist, days) {
-        let kinds: [(bool, std::path::PathBuf, &'static str); 3] = [
-            (
-                cfg.spot_universe_ntm_only,
-                crate::dhan_universe::ntm_spot_artifact_path(&date),
-                "ntm",
-            ),
-            (
-                cfg.spot_universe_fno_underlyings_only,
-                crate::dhan_universe::fno_underlying_artifact_path(&date),
-                "fno_underlyings",
-            ),
-            (
-                true,
-                crate::dhan_universe::mapping_artifact_path(&date),
-                "full_master",
-            ),
-        ];
-        for (enabled, path, kind) in kinds {
-            if !enabled {
-                continue;
-            }
-            if let Ok(entries) = read(&path)
-                && !entries.is_empty()
-            {
-                return Some(EarlierMaster {
-                    entries,
-                    date_ist: date,
-                    kind,
-                });
-            }
+    earlier_ist_dates(date_ist, days)
+        .into_iter()
+        .find_map(|date| master_for_date_with(cfg, date, &mut read))
+}
+
+/// The spot list for ONE date, in the resolve's precedence: NTM, then F&O
+/// underlyings (each only when its flag is on), then the full mapping. The
+/// first non-empty readable one wins; an empty list is skipped for the reason
+/// `newest_earlier_master_with` gives.
+///
+/// O(kinds) file probes, at most 3.
+fn master_for_date_with(
+    cfg: &tickvault_common::config::DhanUniverseConfig,
+    date: String,
+    read: &mut impl FnMut(&std::path::Path) -> Result<Vec<MasterEntry>, ArtifactFailure>,
+) -> Option<EarlierMaster> {
+    let kinds: [(bool, std::path::PathBuf, &'static str); 3] = [
+        (
+            cfg.spot_universe_ntm_only,
+            crate::dhan_universe::ntm_spot_artifact_path(&date),
+            "ntm",
+        ),
+        (
+            cfg.spot_universe_fno_underlyings_only,
+            crate::dhan_universe::fno_underlying_artifact_path(&date),
+            "fno_underlyings",
+        ),
+        (
+            true,
+            crate::dhan_universe::mapping_artifact_path(&date),
+            "full_master",
+        ),
+    ];
+    for (enabled, path, kind) in kinds {
+        if !enabled {
+            continue;
+        }
+        if let Ok(entries) = read(&path)
+            && !entries.is_empty()
+        {
+            return Some(EarlierMaster {
+                entries,
+                date_ist: date,
+                kind,
+            });
         }
     }
     None
@@ -656,6 +670,133 @@ fn degraded_reason_from_slot(slot: usize) -> Option<&'static str> {
         .copied()
 }
 
+/// Whether this session booted on something other than today's list (an
+/// earlier day's list, or the 4 index SIDs) while master sourcing is on.
+///
+/// Set at most once, by `resolve_live_universe`, EXPECTED boots included: a
+/// box started before the rider's build hour and left running is exactly the
+/// session that needs widening (audit D3b, 2026-09-28 — the 04:26 IST boot
+/// ran the whole morning on 4 ids). Cleared by [`finish_live_universe_widen`]
+/// once the running feed carries today's list.
+static LIVE_UNIVERSE_WIDEN_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// `true` while the running session still has to add today's list.
+///
+/// O(1): one atomic load. Read once per late-attach attempt, never per tick.
+#[must_use]
+pub fn live_universe_widen_pending() -> bool {
+    LIVE_UNIVERSE_WIDEN_PENDING.load(Ordering::Relaxed)
+}
+
+/// The running feed now carries today's list: stop asking, and stop paging.
+///
+/// `truncated` means not all of today's list is on the wire: it is larger
+/// than the authorized capacity (filled by priority, owner D3 decision), every
+/// connection is full, or a new connection for it did not open. The session
+/// stays paged under the `truncated_to_capacity` reason instead of clearing,
+/// and a heartbeat starts if the boot did not already run one.
+/// Otherwise the degraded reason clears and the heartbeat stops at its next
+/// tick; the alarm has no `ok_actions`, so it clears silently.
+pub fn finish_live_universe_widen(truncated: bool, subscribed: usize) {
+    LIVE_UNIVERSE_WIDEN_PENDING.store(false, Ordering::Relaxed);
+    if truncated {
+        record_running_fallback("truncated_to_capacity", subscribed);
+    } else {
+        LIVE_UNIVERSE_DEGRADED.store(0, Ordering::Relaxed);
+        #[allow(clippy::cast_precision_loss)]
+        // APPROVED: bounded by the capacity envelope, far below 2^53.
+        metrics::gauge!(LIVE_UNIVERSE_SIZE_GAUGE).set(subscribed as f64);
+    }
+}
+
+/// Page a running session that is short of today's list, and keep paging.
+///
+/// An expected pre-rider boot is not degraded, so no heartbeat runs for it.
+/// Start one here, or the single increment pages once and the alarm then
+/// reads quiet while the session stays short. O(1) plus at most one spawn.
+fn record_running_fallback(reason: &'static str, subscribed: usize) {
+    let heartbeat_running = LIVE_UNIVERSE_DEGRADED.load(Ordering::Relaxed) != 0;
+    record_master_sourcing_fallback(reason, subscribed);
+    if !heartbeat_running && let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(run_degraded_universe_heartbeat(reason));
+    }
+}
+
+/// Today's list is still not on disk at the second a fresh boot would stop
+/// waiting for it and page (the rider's build hour plus
+/// [`MAPPING_WAIT_DEADLINE_SECS`]), and this session booted early enough that
+/// its own boot did not page. Page now, with the same reason a fresh boot
+/// would use, and keep the widen polling: the list can still land.
+#[must_use]
+pub const fn widen_list_is_overdue(now_ist_secs: u32, rider_target_ist_secs: u32) -> bool {
+    let deadline_secs = if MAPPING_WAIT_DEADLINE_SECS > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        MAPPING_WAIT_DEADLINE_SECS as u32
+    };
+    now_ist_secs >= rider_target_ist_secs.saturating_add(deadline_secs)
+}
+
+/// Page that today's list is overdue on a running session (see
+/// [`widen_list_is_overdue`]). Idempotent in effect: the caller latches it.
+pub fn record_widen_list_overdue(subscribed: usize) {
+    if LIVE_UNIVERSE_DEGRADED.load(Ordering::Relaxed) == 0 {
+        record_running_fallback("artifact_unreadable", subscribed);
+    }
+}
+
+/// Where a running session reads today's list from. Built by `main.rs` only
+/// when [`live_universe_widen_pending`] is true, and handed to the late attach.
+#[derive(Debug, Clone)]
+pub struct TodaysUniverseSource {
+    /// The same `[dhan_universe]` config the boot resolved with.
+    pub cfg: tickvault_common::config::DhanUniverseConfig,
+    /// The 4 index SIDs `select_live_universe` puts first.
+    pub index_universe: Vec<SubscribeInstrument>,
+    /// The authorized main-feed capacity the boot resolved against.
+    pub capacity: usize,
+}
+
+/// Today's list, selected exactly as the boot would have selected it, or
+/// `None` while it is not on disk (or selects nothing usable).
+///
+/// Same precedence as the boot (NTM, then F&O underlyings, then the full
+/// mapping) and the same `select_live_universe`, so a widened session and a
+/// fresh 08:30 boot subscribe the same set. Silent on a miss: it is polled
+/// once per attach attempt and a missing file is the normal state until the
+/// rider writes it. Counters and pages stay with the boot resolve.
+///
+/// O(kinds) file probes plus one parse and one O(n) selection per call, on
+/// the attach task, cold path.
+#[must_use]
+pub fn read_todays_live_universe(
+    source: &TodaysUniverseSource,
+    date_ist: &str,
+) -> Option<(LiveUniverseSelection, &'static str)> {
+    let master = todays_master_with(&source.cfg, date_ist, read_master_artifact)?;
+    let selection = select_live_universe(
+        &source.index_universe,
+        Some(&master.entries),
+        source.capacity,
+    );
+    match selection.source {
+        UniverseSource::MasterSourced | UniverseSource::TruncatedToCapacity => {
+            Some((selection, master.kind))
+        }
+        UniverseSource::HardcodedIndices | UniverseSource::FellBackToIndices => None,
+    }
+}
+
+/// Today's list only — never an earlier day's. See
+/// [`read_todays_live_universe`].
+fn todays_master_with(
+    cfg: &tickvault_common::config::DhanUniverseConfig,
+    date_ist: &str,
+    mut read: impl FnMut(&std::path::Path) -> Result<Vec<MasterEntry>, ArtifactFailure>,
+) -> Option<EarlierMaster> {
+    master_for_date_with(cfg, date_ist.to_owned(), &mut read)
+}
+
 /// How often a degraded session re-counts its fallback.
 pub const DEGRADED_UNIVERSE_HEARTBEAT_SECS: u64 = 60;
 
@@ -691,12 +832,24 @@ pub async fn run_degraded_universe_heartbeat(reason: &'static str) {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The first tick completes immediately; the boot's own increment covers it.
     ticker.tick().await;
+    let mut last = reason;
     loop {
         ticker.tick().await;
-        if live_universe_degraded_reason().is_none() {
+        // Read each tick, not frozen at spawn: a widen that lands a list larger
+        // than capacity moves the session to `truncated_to_capacity` (D3b).
+        let Some(current) = live_universe_degraded_reason() else {
             return;
+        };
+        if current != last {
+            tracing::info!(
+                from = last,
+                to = current,
+                "live universe: the degraded reason changed while running (today's list was \
+                 added but is larger than the authorized capacity)"
+            );
+            last = current;
         }
-        metrics::counter!(MASTER_SOURCING_FALLBACK_COUNTER, "reason" => reason).increment(1);
+        metrics::counter!(MASTER_SOURCING_FALLBACK_COUNTER, "reason" => current).increment(1);
     }
 }
 
@@ -721,13 +874,12 @@ pub async fn run_degraded_universe_heartbeat(reason: &'static str) {
 /// outside the session and never once on a real collapse trains the operator
 /// to ignore the one alarm that reports a 99.98% loss of market data.
 ///
-/// # Honest residual
+/// # A pre-rider boot that stays up into the session
 ///
-/// A pre-rider boot on a trading day that stays up INTO the session would
-/// stay collapsed without a page. That shape needs the box to be started
-/// before 08:00 IST and not restarted: the start-watchdog curfew stops it
-/// outside the operating window and the 08:30 schedule starts a fresh boot,
-/// which is judged on its own clock. A boot at or after the rider hour on a
+/// It is not paged, and since audit D3b (2026-09-28) it does not need to be:
+/// the running session adds today's list once the rider writes it (the late
+/// attach checks each attempt, until 15:30). The 2026-09-28 boot at 04:26 IST
+/// is the case: started for a deploy test, never restarted, 4 ids all morning. A boot at or after the rider hour on a
 /// trading day — including every mid-session restart — still pages.
 #[must_use]
 pub const fn collapse_is_expected_for_this_boot(
@@ -937,7 +1089,7 @@ pub fn resolve_live_universe(
                                 "live universe: today's list does not exist yet (non-trading \
                                  day, or before the daily rider's build hour) — subscribing \
                                  the newest earlier list instead of the 4 index SIDs. \
-                                 Expected for this boot."
+                                 Expected for this boot; today's list is added once the rider writes it."
                             );
                         } else {
                             // Pages through the fallback counter's alarm, with
@@ -962,9 +1114,12 @@ pub fn resolve_live_universe(
                                 "live universe: today's list is unusable — subscribing the \
                                  newest earlier list instead of the 4 index SIDs. Stocks \
                                  added today are missing and stocks removed today are still \
-                                 subscribed until today's list is read."
+                                 subscribed until today's list is read, which the running session does \
+                                 by itself once the rider writes it."
                             );
                         }
+                        // Audit D3b: the running session adds today's list when it lands.
+                        LIVE_UNIVERSE_WIDEN_PENDING.store(true, Ordering::Relaxed);
                         (earlier.entries, earlier.date_ist, earlier.kind)
                     } else if collapse_expected {
                         // EXPECTED fallback: a non-trading day, or a trading
@@ -987,9 +1142,11 @@ pub fn resolve_live_universe(
                             "live universe: today's mapping artifact does not exist yet \
                              (non-trading day, or before the daily rider's build hour) and no \
                              earlier list is on disk — subscribing the index universe for this \
-                             boot. Expected; the scheduled morning start is the boot that \
-                             widens the session."
+                             boot. Expected; the running session adds today's list once the \
+                             rider writes it."
                         );
+                        // Audit D3b: a box left running from here widens itself.
+                        LIVE_UNIVERSE_WIDEN_PENDING.store(true, Ordering::Relaxed);
                         return index_universe;
                     } else {
                         // No earlier list on disk either: the old fallback, still paged.
@@ -1039,6 +1196,7 @@ pub fn resolve_live_universe(
                              effect; the subscribed set is the index universe, not the widened \
                              set."
                         );
+                        LIVE_UNIVERSE_WIDEN_PENDING.store(true, Ordering::Relaxed);
                         return index_universe;
                     }
                 }
@@ -1138,8 +1296,8 @@ pub fn resolve_live_universe(
 ///
 /// A budget measured against a 9-second build cannot describe that, and the
 /// cost of being wrong is the whole session: the lane reads the artifact ONCE
-/// at boot, so a timeout pins it to 4 index SIDs until someone restarts the
-/// process. `dhan_universe::BUILD_DEADLINE_SECS` — the build's own budget for
+/// at boot, so a timeout pinned it to 4 index SIDs until someone restarted the
+/// process (until audit D3b, 2026-09-28, made the running session add it). `dhan_universe::BUILD_DEADLINE_SECS` — the build's own budget for
 /// the same work — is 900 s, so the two numbers disagreed by 7.5×.
 ///
 /// 600 s is measured against the SLOW path rather than the fast one, and it
@@ -1601,8 +1759,9 @@ pub async fn await_mapping_artifact(
             "live universe: stopped waiting for today's mapping at the 09:10 IST pre-open \
              cutoff — the market opens at 09:15 and dialing a partial set beats dialing \
              nothing. This session subscribes the newest earlier list, or the 4 index SIDs \
-             if none is on disk. It means the box booted late or the daily rider is failing; the rider keeps retrying, but the lane \
-             reads the artifact once at boot, so only a restart widens this session."
+             if none is on disk. It means the box booted late or the daily rider is failing; the rider keeps retrying, and the running \
+             session adds today's list once it is written (checked each late-attach attempt, \
+             until 15:30)."
         );
         return;
     }
@@ -1618,8 +1777,8 @@ pub async fn await_mapping_artifact(
         path = %path.display(),
         "live universe: the daily rider did not produce today's mapping within \
          {MAPPING_WAIT_DEADLINE_SECS}s of its own build hour. Subscribing the newest earlier list, or the 4 \
-         index SIDs if none is on disk. The rider keeps retrying, but the lane reads the \
-         artifact once at boot — so this session stays on that list until a restart."
+         index SIDs if none is on disk. The rider keeps retrying, and the running session \
+         adds today's list once it is written (checked each late-attach attempt, until 15:30)."
     );
 }
 
@@ -3040,6 +3199,131 @@ mod tests {
         assert_eq!(degraded_reason_from_slot(usize::MAX), None);
     }
 
+    // -- audit D3b: the running session reads TODAY's list only -------------
+
+    /// No file for the day on disk reads `None`, the normal state until the
+    /// rider writes it: the widen keeps waiting and nothing is subscribed.
+    #[test]
+    fn read_todays_live_universe_is_none_while_no_list_is_on_disk() {
+        let source = TodaysUniverseSource {
+            cfg: full_cfg(),
+            index_universe: crate::dhan_feed_stack::hardcoded_index_universe(),
+            capacity: 25_000,
+        };
+        assert!(read_todays_live_universe(&source, "1999-01-01").is_none());
+    }
+
+    /// An earlier day's list is never "today's": the widen must keep waiting
+    /// instead of re-subscribing what the boot already has.
+    #[test]
+    fn todays_master_with_never_takes_an_earlier_day() {
+        let yesterday = vec![(crate::dhan_universe::mapping_artifact_path("2026-09-27"), 5)];
+        assert!(todays_master_with(&full_cfg(), "2026-09-28", |p| lookup(&yesterday, p)).is_none());
+        let today = vec![(crate::dhan_universe::mapping_artifact_path("2026-09-28"), 7)];
+        let got = todays_master_with(&full_cfg(), "2026-09-28", |p| lookup(&today, p))
+            .expect("today's list is read");
+        assert_eq!(got.date_ist, "2026-09-28");
+        assert_eq!(got.entries.len(), 7);
+    }
+
+    /// Same precedence as the boot, so a widened session and a fresh boot
+    /// subscribe the same list.
+    #[test]
+    fn todays_master_with_keeps_the_boot_precedence() {
+        let files = vec![
+            (
+                crate::dhan_universe::ntm_spot_artifact_path("2026-09-28"),
+                3,
+            ),
+            (crate::dhan_universe::mapping_artifact_path("2026-09-28"), 9),
+        ];
+        let ntm =
+            todays_master_with(&ntm_cfg(), "2026-09-28", |p| lookup(&files, p)).expect("found");
+        assert_eq!(ntm.kind, "ntm");
+        let full =
+            todays_master_with(&full_cfg(), "2026-09-28", |p| lookup(&files, p)).expect("found");
+        assert_eq!(full.kind, "full_master");
+    }
+
+    /// Finishing clears both flags, or moves the page to the over-capacity
+    /// reason when today's list itself is larger than the capacity.
+    /// The only test that touches these two statics.
+    #[test]
+    fn finish_live_universe_widen_clears_the_page_or_moves_it_to_truncated() {
+        LIVE_UNIVERSE_WIDEN_PENDING.store(true, Ordering::Relaxed);
+        mark_live_universe_degraded("artifact_unreadable");
+        assert!(live_universe_widen_pending());
+        finish_live_universe_widen(false, 865);
+        assert!(!live_universe_widen_pending());
+        assert_eq!(live_universe_degraded_reason(), None);
+
+        LIVE_UNIVERSE_WIDEN_PENDING.store(true, Ordering::Relaxed);
+        mark_live_universe_degraded("artifact_unreadable");
+        finish_live_universe_widen(true, 25_000);
+        assert!(!live_universe_widen_pending());
+        assert_eq!(
+            live_universe_degraded_reason(),
+            Some("truncated_to_capacity")
+        );
+        LIVE_UNIVERSE_DEGRADED.store(0, Ordering::Relaxed);
+
+        // Overdue on an expected (unpaged) boot: pages; a second call, or a
+        // session already paged for another reason, keeps the first reason.
+        record_widen_list_overdue(865);
+        assert_eq!(live_universe_degraded_reason(), Some("artifact_unreadable"));
+        mark_live_universe_degraded("no_usable_widening");
+        record_widen_list_overdue(865);
+        assert_eq!(live_universe_degraded_reason(), Some("no_usable_widening"));
+        LIVE_UNIVERSE_DEGRADED.store(0, Ordering::Relaxed);
+    }
+
+    /// The overdue page uses the reason a fresh boot uses for a missing list,
+    /// and goes through the path that starts a heartbeat. (Its effect on the
+    /// degraded slot is exercised in the `finish_live_universe_widen` test,
+    /// which owns the shared statics.)
+    #[test]
+    fn record_widen_list_overdue_pages_with_the_fresh_boot_reason() {
+        let src = include_str!("dhan_live_universe.rs");
+        let start = src
+            .find(concat!("pub ", "fn record_widen_list_overdue("))
+            .expect("fn exists");
+        let body = &src[start..];
+        let body = &body[..body.find("\n}\n").expect("fn closes")];
+        assert!(body.contains("record_running_fallback(\"artifact_unreadable\""));
+        assert!(body.contains("LIVE_UNIVERSE_DEGRADED.load(Ordering::Relaxed) == 0"));
+        assert!(MASTER_SOURCING_FALLBACK_REASONS.contains(&"artifact_unreadable"));
+    }
+
+    /// The overdue page fires at the second a fresh boot would stop waiting
+    /// (rider hour plus the boot wait), not a second earlier.
+    #[test]
+    fn widen_list_is_overdue_matches_the_boot_wait_deadline() {
+        let rider = 8 * 3_600;
+        let deadline = rider + u32::try_from(MAPPING_WAIT_DEADLINE_SECS).unwrap_or(u32::MAX);
+        assert!(!widen_list_is_overdue(4 * 3_600 + 26 * 60, rider));
+        assert!(!widen_list_is_overdue(deadline - 1, rider));
+        assert!(widen_list_is_overdue(deadline, rider));
+        assert!(widen_list_is_overdue(15 * 3_600, rider));
+        assert!(!widen_list_is_overdue(u32::MAX - 1, u32::MAX));
+    }
+
+    /// Every arm that leaves the session off today's list arms the widen:
+    /// the earlier-day arm (paged or expected) and both 4-index arms.
+    #[test]
+    fn live_universe_widen_pending_is_armed_by_every_off_today_arm() {
+        let src = include_str!("dhan_live_universe.rs");
+        let resolve = src
+            .find(concat!("pub fn resolve_live_", "universe("))
+            .expect("resolve exists");
+        let body = &src[resolve..];
+        let body = &body[..body.find("\n}\n").expect("resolve closes")];
+        assert_eq!(
+            body.matches(concat!("LIVE_UNIVERSE_WIDEN_", "PENDING.store(true"))
+                .count(),
+            3,
+            "earlier-day list, expected 4-index boot, paged 4-index boot"
+        );
+    }
     /// Every paged path goes through `record_master_sourcing_fallback`, so
     /// every paged path also arms the heartbeat. Pinned in source so a new
     /// paged arm cannot count once and go quiet.
