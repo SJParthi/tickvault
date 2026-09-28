@@ -504,6 +504,13 @@ pub enum ErrorCode {
     /// aggregator. Severity::Critical — by definition the host is OOM
     /// AND out of disk AND `data/dlq/` unwritable.
     AggregatorDrop01,
+    /// AGGREGATOR-STALL-01: the frame-drain task waited at least
+    /// `SEAL_INLINE_WAIT_PAGE_MS` on a stalled disk while writing a refused
+    /// sealed candle itself (the escalation queue was full or its thread
+    /// had died). NOT a loss: the candle reached disk. What stalled is the
+    /// socket read. Severity::Critical — the operator chose, 2026-09-27, to
+    /// accept the wait and make it loud (noise-lock §2.7).
+    AggregatorStall01InlineWait,
     /// AGGREGATOR-LATE-01: a tick arrived after its 1-minute bucket
     /// already sealed. Discarded with `error!` + counter (NOT silently
     /// merged across buckets — that would shift data across
@@ -1128,6 +1135,7 @@ impl ErrorCode {
             // PR #5 (2026-05-19): PHASE2-READY-01 retired with phase2_readiness_check.
             // Wave 6 — Multi-TF aggregator
             Self::AggregatorDrop01 => "AGGREGATOR-DROP-01",
+            Self::AggregatorStall01InlineWait => "AGGREGATOR-STALL-01",
             Self::AggregatorLate01 => "AGGREGATOR-LATE-01",
             Self::AggregatorLag01TickLagDropped => "AGGREGATOR-LAG-01",
             Self::AggregatorSeal01IlpFailed => "AGGREGATOR-SEAL-01",
@@ -1218,6 +1226,7 @@ impl ErrorCode {
             | Self::Selftest02Failed
             | Self::PrevClose03BootRoutingAssertion
             | Self::AggregatorDrop01
+            | Self::AggregatorStall01InlineWait
             | Self::Resilience01DualInstanceDetected
             | Self::Resilience03MintRefusedLockNotHeld
             | Self::OrphanPosition01Detected
@@ -1560,6 +1569,7 @@ impl ErrorCode {
             Self::PrevClose03BootRoutingAssertion
             | Self::Volume01MonotonicityBreach => "docs/error-runbooks/wave-5-error-codes.md",
             Self::AggregatorDrop01
+            | Self::AggregatorStall01InlineWait
             | Self::AggregatorLate01
             | Self::AggregatorLag01TickLagDropped
             | Self::AggregatorSeal01IlpFailed
@@ -1819,6 +1829,7 @@ impl ErrorCode {
             // PR #5 (2026-05-19): Phase2Ready01PreflightFailed retired.
             // Wave 6 — Multi-TF aggregator (Sub-PR #1)
             Self::AggregatorDrop01,
+            Self::AggregatorStall01InlineWait,
             Self::AggregatorLate01,
             Self::AggregatorLag01TickLagDropped,
             Self::AggregatorSeal01IlpFailed,

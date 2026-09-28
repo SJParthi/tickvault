@@ -167,7 +167,18 @@ because a once-daily emitter has no second datapoint to wait for.
 the day, so an OK an hour later is the datapoint ageing out, never the summary
 arriving. Nothing is LOST when it fires — the raw `ws_event_audit` and
 `feed_episode_audit` rows it folds from are unaffected and the day is
-re-rollable by hand; what is lost until then is the view**)**.
+re-rollable by hand; what is lost until then is the view**)**,
+and **AGGREGATOR-STALL-01 (added 2026-09-27** — audit PR40d, authority
+`dhan-rest-only-noise-lock-2026-07-14.md` §2.7: the operator chose to accept a
+stalled disk briefly pausing the live feed rather than add a third candle
+store, on condition that the pause is loud. When the escalation queue refuses
+a sealed candle, the frame drain writes it to spill itself and waits on the
+disk; a wait of 1 s or more is counted and logged at most once a minute, the
+window's stall count and longest wait folded into the next line. Nothing is
+lost: the candle is written. The honest limit is that the line is written when
+the wait ENDS, so a disk that never returns is caught by the liveness alarms,
+not this one. `ok_recovery = false`: a quiet window is not proof the disk is
+healthy**)**.
 **Everything else
 is log-sink-only** unless it has its own metric alarm (app-alarms.tf) or a
 typed `NotificationEvent`. Counter-side (non-errcode) pager added

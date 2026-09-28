@@ -4273,3 +4273,67 @@ No page, no EMF name, no alarm. The cost of a failed write is narrow: after a
 restart, contracts held only before the restart are not checked that evening.
 Capture itself is untouched. The §2.3m filter is scoped to
 `swap_emptied_socket` and cannot see this source, by design.
+
+## §2.7 — 2026-09-27: a stalled disk that makes the live feed WAIT gets a critical page (`AGGREGATOR-STALL-01`)
+
+**The operator's words, and exactly what kind of words they are.** Two records,
+stated separately so neither is dressed up as the other:
+
+1. **Typed, 2026-09-26 09:03 UTC, in the fix-plan thread** — the standing mandate
+   over the audit-fix plan, whose PR40 row this section serves:
+
+   > "Yes to all ensure to fix and resolve everything dude okay?"
+
+2. **A decision card, answered 2026-09-27 23:26 UTC.** The question, verbatim:
+   *"Accept a stalled disk briefly pausing the live feed, instead of a third backup
+   store for candles?"* The operator picked option A, **"Accept the wait"**, whose
+   consequence line read, verbatim: *"Nothing lost; add a counter and a critical
+   page for how long the feed waited, so a stalled disk is loud."* The other two
+   options were a second disk and an in-memory overflow.
+
+Record 2 is a TAP on an enumerated option, not typed words. It is accepted here in
+the same shape §2.6 accepts "go ahead with all of these dude okay?": a go-ahead
+that answers an ENUMERATED ask selects the enumerated work, and the enumerated work
+names this page. It authorizes this ONE page and nothing wider. This dated row is
+the §3 record, written BEFORE the terraform.
+
+**The condition.** A refused sealed candle goes to a queue that writes it to disk
+on its own thread. The queue holds one full market-close burst. When that thread is
+behind (the disk has stopped writing) AND the queue is full, the frame-drain task —
+the one thread that empties the Dhan socket — writes the next candle to disk ITSELF
+and waits until the disk answers. Nothing is lost while it waits. What stalls is
+the socket read, and Dhan skips a slow reader forward with no sequence number.
+Before this row that wait was counted (`tv_seal_escalation_inline_fallback_total`)
+but never TIMED and never paged.
+
+| Alarm | Signal | Fires when | Why this shape |
+|---|---|---|---|
+| `tv-<env>-errcode-aggregator-stall-01` | log filter `{ $.code = "AGGREGATOR-STALL-01" && $.level = "ERROR" }` | one line in one 300 s period | The line is written when ONE inline wait lasted at least `SEAL_INLINE_WAIT_PAGE_MS` (1,000 ms). At most one line a minute; it carries the longest wait and the count of such waits since the last line. |
+
+Ungated, `treat_missing_data = notBreaching`, NO `ok_actions`: a wait that has
+ended is not a repair anyone performed, and the ticks Dhan skipped during it do not
+come back. No EMF name is added: the new counters stay on the local metrics
+endpoint, and the log line carries the numbers the page needs.
+
+**Honest cost:** +1 log metric filter (free) and +1 alarm, about **$0.10/mo**.
+
+**NOT claimed:**
+- That the page fires DURING the wait. The line is written when the wait ENDS. A
+  disk that never answers keeps the drain waiting and also stops every file-based
+  log, so this page cannot see it. That case falls to the lane liveness alarms that
+  treat MISSING data as breaching (`live-lane-alarms.tf`, the market-hours
+  liveness alarm).
+- That 1,000 ms is measured-optimal. No session has ever reached the inline arm
+  with the queue sized to a full burst. It is set where a paused socket read is
+  unambiguously bad. Tightening it needs a measured baseline and its own dated row.
+- That this prevents the wait. It makes it LOUD, which is what was chosen.
+
+**What a PR that violates §2.7 looks like (REJECT):**
+- Adds `ok_actions` to the stall alarm.
+- Emits the stall line on every wait instead of at most once a minute.
+- Reads the clock on the normal queued path (the timing belongs to the refused
+  inline arm only; the queued arm stays a channel send plus one atomic add).
+- Drops the seal, or grows memory without bound, to avoid the wait. The operator
+  chose the wait over both.
+- Routes this condition through `AGGREGATOR-DROP-01`. A wait is not a loss, and
+  that page's text says candles were dropped.

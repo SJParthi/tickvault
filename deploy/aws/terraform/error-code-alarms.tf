@@ -105,10 +105,11 @@
 #   what each dated change added or retired, and it is kept for that. It is NOT
 #   the current shape, and has not been since 2026-09-16. Counted in the file
 #   rather than carried forward: 5 standalone `aws_cloudwatch_log_metric_filter`
-#   resources, 4 standalone `aws_cloudwatch_metric_alarm` resources, and 21 live
+#   resources, 4 standalone `aws_cloudwatch_metric_alarm` resources, and 22 live
 #   `error_code_alerts` map entries (was 18 on 2026-09-17; +3 on 2026-09-24,
 #   when the three `ws-gap-03-xverify-*` verdicts came back with the restored
-#   1-minute cross-verification — noise-lock §2.5). Re-count with:
+#   1-minute cross-verification — noise-lock §2.5; +1 on 2026-09-27,
+#   `aggregator-stall-01`, audit PR40d — noise-lock §2.7). Re-count with:
 #     grep -c '^resource "aws_cloudwatch_log_metric_filter"' <this file>
 #     grep -c '^resource "aws_cloudwatch_metric_alarm"'      <this file>
 #   A count in a comment is a claim, and a claim carries a date — this repo has
@@ -353,6 +354,24 @@ locals {
       dta         = 1
       ok_recovery = false # 2026-07-09: discrete permanent data loss - the dropped sealed candles do not come back when the episode ages out (Rule-11 false-recovery; PROC-01 precedent)
       desc        = "AGGREGATOR-DROP-01 = permanent sealed-candle loss; read source and fields. (a) security_id/timeframe/cause: ring, spill and DLQ all failed (throttled). Check df -h /data and data/spill/, data/dlq/. (b) refused_price/refused_timestamp/refused_slot_exhausted, every 30s: ticks never folded into a candle. (c) source=crash_unwritten, at boot: the previous process died holding seals_unwritten; find why it died. (d) source=seal_unrecovered: boot drain or replay gave up on seals (undecodable, refused); bytes in data/spill/archive/ for 7 days. (e) source=spill_retention: files older than 7 days still holding seals were deleted; the replay never drained them. NO recovered/OK page. Counter pager: tv-<env>-seal-writer-dropped. Runbook: docs/error-runbooks/wave-6-error-codes.md"
+    }
+    # AGGREGATOR-STALL-01 (added 2026-09-27, audit PR40d, noise-lock §2.7 —
+    # the operator chose "Accept the wait" over a second disk or an in-memory
+    # overflow, and asked for it to be loud). Emit site:
+    # crates/storage/src/seal_writer_runner.rs::report_inline_stall, reached
+    # only when the frame drain itself waited >= SEAL_INLINE_WAIT_PAGE_MS
+    # (1,000 ms) writing a refused candle to disk, at most once a minute.
+    # Ungated: the drain only runs in session, so the line cannot fire off
+    # hours. ok_recovery = false: a wait that has ended is not a repair, and
+    # the ticks the exchange skipped during it do not come back.
+    "aggregator-stall-01" = {
+      pattern     = "{ $.code = \"AGGREGATOR-STALL-01\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 1
+      dta         = 1
+      ok_recovery = false # 2026-09-27: the wait already ended when the line was written; an auto-OK would read as a repair nobody made
+      desc        = "AGGREGATOR-STALL-01 = the live feed stopped reading the socket for waited_ms (>= 1 s) while it wrote a refused candle to a stalled disk itself; the escalation queue was full or its thread had died. The candle reached disk unless outcome=Lost (that also fires AGGREGATOR-DROP-01). Ticks during the wait may have been skipped by the exchange. Fields: waited_ms, max_waited_ms, stalls since the last line (one line a minute at most). Check df -h /data, the EBS volume health and data/spill/. NO recovered/OK page. Runbook: docs/error-runbooks/wave-6-error-codes.md"
     }
     # WAL-SUSPEND-01 (added 2026-07-10, W2 PR#6 — audit follow-up row 10):
     # a QuestDB table's WAL apply is SUSPENDED (post disk-full / apply

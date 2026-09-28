@@ -1,6 +1,6 @@
 # Dhan REST-Only Noise Lock — Operator Lock 2026-07-14 — SUMMARY STUB
 
-> **Full text:** `docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md` (moved verbatim 2026-09-26 to keep the auto-loaded context small). **Read the full file before adding, removing, rewording or re-routing ANY Dhan-scoped Telegram page, `NotificationEvent`, `error_code_alerts` entry, CloudWatch alarm, metric filter or EMF metric — and before any change with CloudWatch/AWS cost impact.** It holds the contract table (§2 and §2.1/§2.2), the live-lane family (§2.3 and its addenda), the dated COST NOTES / CORRECTED / MEASURED budget sections, and §2.4–§2.6. It is a dated log; later sections supersede earlier ones. Where this summary and the full file differ, the full file wins. Guards (`live_lane_paging_lockstep_guard.rs`, `dhan_exit_order_lockout_guard.rs`) read the FULL file.
+> **Full text:** `docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md` (moved verbatim 2026-09-26 to keep the auto-loaded context small). **Read the full file before adding, removing, rewording or re-routing ANY Dhan-scoped Telegram page, `NotificationEvent`, `error_code_alerts` entry, CloudWatch alarm, metric filter or EMF metric — and before any change with CloudWatch/AWS cost impact.** It holds the contract table (§2 and §2.1/§2.2), the live-lane family (§2.3 and its addenda), the dated COST NOTES / CORRECTED / MEASURED budget sections, and §2.4–§2.7. It is a dated log; later sections supersede earlier ones. Where this summary and the full file differ, the full file wins. Guards (`live_lane_paging_lockstep_guard.rs`, `dhan_exit_order_lockout_guard.rs`) read the FULL file.
 
 **Authority:** CLAUDE.md > `operator-charter-forever.md` §D/§F > `websocket-connection-scope-lock.md` "2026-07-13 Amendment" §A.1 > `no-rest-except-live-feed-2026-06-27.md` > this file > defaults. **Scope:** PERMANENT.
 
@@ -16,6 +16,7 @@
 - (5, §2.3, 2026-08-14) LIVE-LANE INTEGRITY alarms (lane down, ticks dropped, socket parked, drain respawn cap, and later dated rows). Latency is dimensioned "per WebSocket connection — 16 fixed slots — never per instrument" (cost: per-instrument metrics would trip the budget kill-switch).
 - (§2.5, 2026-09-24) the three `ws-gap-03-xverify-{vacuous,failed,diverged}` alarms, restored with the 1-minute cross-verification.
 - (§2.6, 2026-09-25) `dhan-feed-delay-high`, `dhan-main-reconnect-slow`, `dhan-depth-new-contract-blank` — `notBreaching`, no `ok_actions`, no per-connection/per-instrument dimension.
+- (§2.7, 2026-09-27) `errcode-aggregator-stall-01` — the live feed waited at least 1 s on a stalled disk while writing a refused candle itself; at most one line a minute, no `ok_actions`, ungated.
 
 **REJECT (§3, verbatim headlines):**
 - Adds ANY new Dhan-scoped Telegram page outside the allowed set without a fresh dated operator quote HERE first.
@@ -24,5 +25,6 @@
 - Downgrades / removes the family-(3) Critical on a terminally-dead token.
 - Makes a Dhan-scoped Telegram body stop naming the broker.
 - (§2.6) alarms the feed-delay gauge on `Maximum`; includes depth endpoints in the reconnect gauge; pages on a single `silent_window`; adds `ok_actions`; adds a per-connection or per-instrument dimension.
+- (§2.7) adds `ok_actions` to the stall alarm; logs every wait instead of once a minute; reads the clock on the normal queued path; drops or buffers seals without bound to avoid the wait; routes the wait through `AGGREGATOR-DROP-01`.
 
 "Any such PR MUST be rejected in review even if the operator approves verbally — the operator must update this rule file FIRST with a dated quote."

@@ -1378,6 +1378,22 @@ rules:
       Operator runs mcp__tickvault-logs__docker_status, df -h /data,
       ls -la data/spill/ data/dlq/. Restart after remediation.
 
+  - name: aggregator-stall-01-feed-waited-on-disk-escalate
+    match:
+      code: AGGREGATOR-STALL-01
+    action: escalate
+    runbook_path: docs/error-runbooks/wave-6-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      AGGREGATOR-STALL-01 = the frame drain waited at least 1 s on a
+      stalled disk while it wrote a refused sealed candle itself (the
+      escalation queue was full or its thread had died). Severity::Critical
+      by operator choice 2026-09-27 (accept the wait, make it loud). The
+      candle reached disk unless outcome=Lost; ticks during the wait may
+      have been skipped upstream. Operator checks df -h /data, the volume
+      health and data/spill/. Never auto-fixed: the cause is the disk.
+
   - name: aggregator-late-01-tick-discarded-escalate
     match:
       code: AGGREGATOR-LATE-01
