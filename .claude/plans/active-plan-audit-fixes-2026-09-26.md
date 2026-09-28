@@ -364,6 +364,33 @@ inline (PR2, PR8, PR14).
       sockets during a fallback or QuestDB lag and `top_volume` goes empty, with no page; the
       universe headroom check counts spots only (~870 against 25,000) so it can never fire;
       D8's plan text says "match by symbol" but the list files carry no symbol.
+    - Split (mapped 2026-09-28 against c7e27de88), serial:
+      - **D3c-1** (`app`: `dhan_universe.rs`, `dhan_live_universe.rs`): the rider writes the
+        artifacts even when more than 10% of the index lists fail (coded error; reject only when
+        every list failed, or drop only the NTM artifact when its own lists failed); `code` on
+        the rider's uncoded error lines; the narrowed-artifact reasons (`fno_*`, `ntm_*`) move
+        to their own unpaged counter, seeded; the headroom check counts spots plus contracts
+        after the contract selection, with D3a's fill-by-priority wording.
+        **DONE 2026-09-28** (`write_narrowed_spot_artifacts`, `NARROWING_FALLBACK_COUNTER`,
+        `report_spots_and_contracts_headroom`, `HeadroomStage`). As built: the FULL mapping
+        stays refused past 10% (its membership would be partial and read as complete); the
+        F&O and NTM files are written from the lists that did download, and the NTM file is
+        still refused when its own list resolved nothing. The rider's error lines now carry
+        `code` and `source`. The combined headroom is a `warn!`, not a page, because the
+        contract selection fills its room by design and pages a shrink itself. Tests:
+        `write_narrowed_spot_artifacts_runs_before_the_index_list_reject`,
+        `narrowing_fallback_counter_is_separate_from_the_paged_counter`,
+        `report_spots_and_contracts_headroom_adds_the_contracts_to_the_published_spots`.
+      - **D3c-2** (`app` + terraform + agent config, observability only): a late top-up
+        refusal counter with an alarm, `source` on its errors, one final reconcile before the
+        attach returns, "queued" wording and counts from the `Held` ack; an unpriced-underlyings
+        gauge at the contract dial; the dial-incomplete counter and a depth-200 give-up alarm;
+        a `top_volume` rows-written counter with an alarm on zero in market hours.
+      - **D3c-3** (`core` + `app`, behaviour): a parked main-feed socket's instruments are
+        re-offered to the other live connections (never dropped silently: no room pages and
+        counts), and the top-up senders outlive the attach so a park after 09:30 is covered.
+      - D8 re-scope (text): the artifact rows do carry `symbol`; the reader drops it, and index
+        rows are NSE-only so SENSEX never matches. D8 parses `symbol` and includes BSE indices.
 - [ ] **D4 — stale-price gate on entries.** (`trading` risk, not strategy)
   - No price-age check exists (risk/engine.rs:262). Add one to `check_order_in_segment`: an ENTRY
     whose last price is older than 5 s is refused with a coded reason; exits are never gated.
@@ -1557,7 +1584,7 @@ each with file:line). "Verified" below means this thread read the code on `origi
 13e405f. Every other line is carried from the re-check and is re-verified when its item starts.
 
 Order of work: PR #1975 (D3a) finishes first. Then PR53 (it can destroy a kept table), D3b, D3c,
-PR54, PR55, PR56, then the order already set: PR41, PR31b, PR42–PR50, PR31c, PR32–PR39, PR51,
+PR54, PR55, PR56, PR57, then the order already set: PR41, PR31b, PR42–PR50, PR31c, PR32–PR39, PR51,
 the PR4c follow-ups, PR52. PR30b stays on or after 2026-10-01.
 
 - [x] **PR53 — a boot never drops a kept table, and a clean-up marker means the clean-up ran.**
@@ -1603,6 +1630,16 @@ the PR4c follow-ups, PR52. PR30b stays on or after 2026-10-01.
     the feed-delay gauge (a false Dhan feed-delay page at about 60 s or more), silence stamps,
     the board close clock and depth times all skew for the rest of the process. Re-anchor, and
     alarm on the size of the refused jump rather than on `refused_backward` (read noise).
+- [ ] **PR57 — the read-only status check proves the feed shape, not only that it ticks.**
+  (`api`, `app`, `.github/workflows/aws-control.yml`) Asked 2026-09-28 by the coordinator for
+  the owner's live proof: the 2026-09-28 live check proved about 137,000 ticks and about 3,400
+  instruments a minute, but not these three. The `status` action (read-only) also reports:
+  (1) the exact subscribed main-feed instrument count, per connection and in total, read from
+  the app's own `/health` (Rust), not recomputed in shell; (2) each depth-20 and depth-200
+  socket's state (connected / reconnecting / parked, instruments held), plus `market_depth`
+  row growth over the last minute as the cross-check; (3) every `tv-<env>-*` CloudWatch alarm
+  whose state is not OK, by name and since when. Read-only: no action, no restart, no write.
+  Any new logic goes in Rust (the `/health` payload); the workflow only prints it.
 
 Corrections and widenings to existing items:
 

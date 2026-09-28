@@ -12511,6 +12511,11 @@ async fn attach_depth_when_available(
                         // per-attempt emit would page every healthy morning.
                         report_dial_shortfall(DIAL_HALF_MAIN_FEED, planned, dialed, attempts);
                         crate::dhan_contract_universe::record_contract_verdict(&contracts);
+                        // Audit D3c-1: the boot headroom saw spots only.
+                        crate::dhan_live_universe::report_spots_and_contracts_headroom(
+                            contracts.instruments.len(),
+                            remaining_main_feed_capacity(0),
+                        );
                         contracts_done = true;
                         // Only what the POOL carried. The overflow records
                         // itself at its own send site, because it can fail
