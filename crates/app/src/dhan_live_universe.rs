@@ -370,18 +370,48 @@ pub fn select_live_universe(
 /// underlyings. One volatile expiry closes a gap that size.
 pub const UNIVERSE_HEADROOM_WARN_DIVISOR: usize = 10;
 
+/// Which count a headroom report is about (audit D3c-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadroomStage {
+    /// The spot list alone, at boot, before any contract is selected.
+    SpotsAtBoot,
+    /// Spots plus the selected contracts, once the contract half is dialed.
+    SpotsAndContracts,
+}
+
+impl HeadroomStage {
+    /// The `stage` field on the log line.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SpotsAtBoot => "spots_at_boot",
+            Self::SpotsAndContracts => "spots_and_contracts",
+        }
+    }
+}
+
 /// Warns while there is still time to act on a universe approaching the
 /// subscription ceiling.
 ///
-/// # Why this exists at all
+/// # What crossing the ceiling costs (corrected 2026-09-28, audit D3c-1)
 ///
-/// Overflow is not graceful here and must not be made graceful: `plan_pool`
-/// refuses the WHOLE pool rather than truncating it, so crossing the ceiling
-/// costs the entire session's feed rather than its excess. That fail-closed
-/// shape is correct — silently subscribing a subset would be a false-OK about
-/// coverage — but it means the only safe place to notice the problem is
-/// BEFORE it happens, and until now nothing did. The size gauge shows today's
-/// number; nothing said how close today's number was to the edge.
+/// This said the whole subscription is refused and the session runs with no
+/// feed. Since D3a that is false: the spot list is filled by priority (the
+/// priority indices first) up to the capacity, the rest is left off, and the
+/// fallback alarm pages `truncated_to_capacity`. The contract selection
+/// narrows its at-the-money window to fit and pages that shrink on its own
+/// counter. So a low headroom means instruments will be LEFT OFF, not that the
+/// feed stops.
+///
+/// # Two stages
+///
+/// At boot only the spots are known, and on the narrowed list they are ~850 of
+/// 25,000, so that check alone could never fire while the contracts took the
+/// rest. [`report_spots_and_contracts_headroom`] repeats it with the contracts
+/// added, once they are dialed. The boot stage logs an `error!` (the spots
+/// alone nearly filling the feed leaves no room for contracts); the combined
+/// stage logs a `warn!`, because the contract selection fills the room it is
+/// given by design and pages the real shortfall itself.
 ///
 /// # Why the constant is read here
 ///
@@ -395,7 +425,7 @@ pub const UNIVERSE_HEADROOM_WARN_DIVISOR: usize = 10;
 /// tree looking authoritative.
 ///
 /// Pure apart from the log/metric side effects. O(1).
-fn report_universe_headroom(instruments: usize, capacity: usize) {
+fn report_universe_headroom(instruments: usize, capacity: usize, stage: HeadroomStage) {
     let headroom = capacity.saturating_sub(instruments);
     let warn_below = capacity / UNIVERSE_HEADROOM_WARN_DIVISOR;
 
@@ -406,6 +436,7 @@ fn report_universe_headroom(instruments: usize, capacity: usize) {
         // step with it unnoticed, which is how it became decorative.
         tracing::warn!(
             capacity,
+            stage = stage.as_str(),
             documented_max = tickvault_common::constants::MAX_DAILY_UNIVERSE_SIZE,
             "the live subscription capacity and MAX_DAILY_UNIVERSE_SIZE disagree — the \
              capacity in force is the one logged here; the constant is documentation and \
@@ -414,22 +445,42 @@ fn report_universe_headroom(instruments: usize, capacity: usize) {
         );
     }
 
-    if headroom < warn_below {
-        tracing::error!(
+    if headroom >= warn_below {
+        tracing::info!(
+            instruments,
+            capacity,
+            headroom,
+            stage = stage.as_str(),
+            "live universe headroom"
+        );
+        return;
+    }
+    match stage {
+        HeadroomStage::SpotsAtBoot => tracing::error!(
             code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
             source = "universe_headroom_low",
+            stage = stage.as_str(),
             instruments,
             capacity,
             headroom,
             warn_below,
-            "live universe is within {headroom} instruments of the {capacity} ceiling. \
-             Crossing it does NOT drop the excess — the whole subscription is refused \
-             and the session runs with no feed at all. Index option chains are uncapped \
-             by design, so one volatile expiry can close a gap this size. Act before the \
-             next session: raise the ceiling or narrow the spot universe."
-        );
-    } else {
-        tracing::info!(instruments, capacity, headroom, "live universe headroom");
+            "live universe: the spot list alone is within {headroom} instruments of the \
+             {capacity} ceiling, so the option contracts have almost no room. Past the \
+             ceiling the list is filled by priority (indices first) and the rest is left \
+             off, with a page. Narrow the spot list before the next session."
+        ),
+        HeadroomStage::SpotsAndContracts => tracing::warn!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            source = "universe_headroom_low",
+            stage = stage.as_str(),
+            instruments,
+            capacity,
+            headroom,
+            warn_below,
+            "live universe: spots plus contracts are within {headroom} instruments of the \
+             {capacity} ceiling. Nothing is left off yet; if the chains grow (a volatile \
+             expiry), the contract window narrows to fit and pages that on its own counter."
+        ),
     }
 }
 
@@ -617,9 +668,7 @@ fn record_master_sourcing_fallback(reason: &'static str, fell_back_to: usize) {
     metrics::counter!(MASTER_SOURCING_FALLBACK_COUNTER, "reason" => reason).increment(1);
     mark_live_universe_degraded(reason);
     // Cold path — once per boot at most — so the macro's key build is fine here.
-    #[allow(clippy::cast_precision_loss)]
-    // APPROVED: instrument counts are bounded by MAX_DAILY_UNIVERSE_SIZE, far below 2^53.
-    metrics::gauge!(LIVE_UNIVERSE_SIZE_GAUGE).set(fell_back_to as f64);
+    publish_live_universe_size(fell_back_to);
 }
 
 /// Every `reason` label `record_master_sourcing_fallback` can emit.
@@ -631,14 +680,62 @@ fn record_master_sourcing_fallback(reason: &'static str, fell_back_to: usize) {
 pub const MASTER_SOURCING_FALLBACK_REASONS: &[&str] = &[
     "artifact_unreadable",
     "artifact_unparseable",
-    "fno_artifact_unreadable",
-    "fno_artifact_unparseable",
     "no_usable_widening",
     "truncated_to_capacity",
 ];
 
+/// Counter: a NARROWED spot set (NTM, or F&O underlyings) was asked for and
+/// could not be used, so the session fell THROUGH to a wider set.
+///
+/// Separate from [`MASTER_SOURCING_FALLBACK_COUNTER`] since audit D3c-1
+/// (2026-09-28). That counter feeds the paging fallback alarm, which sums
+/// every reason, so a widening (more instruments than asked, never fewer) was
+/// paging exactly like a collapse. This one has no alarm: the session is
+/// covered, and the coded `error!` at each site names the file.
+pub const NARROWING_FALLBACK_COUNTER: &str = "tv_dhan_live_universe_narrowing_fallback_total";
+
+/// Every `reason` label [`NARROWING_FALLBACK_COUNTER`] can emit, seeded at 0.
+pub const NARROWING_FALLBACK_REASONS: &[&str] = &[
+    "ntm_artifact_unreadable",
+    "ntm_artifact_unparseable",
+    "fno_artifact_unreadable",
+    "fno_artifact_unparseable",
+];
+
 /// Gauge: how many instruments the live lane actually subscribed.
 pub const LIVE_UNIVERSE_SIZE_GAUGE: &str = "tv_dhan_live_universe_instruments";
+
+/// The spot count behind [`LIVE_UNIVERSE_SIZE_GAUGE`], kept so the headroom
+/// check after contract selection can add the contracts to it (audit D3c-1).
+static LIVE_UNIVERSE_SPOTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Publish the subscribed spot count: the gauge, and the value the combined
+/// headroom check reads. Every site that sets the gauge goes through here, so
+/// the two cannot disagree. O(1).
+fn publish_live_universe_size(spots: usize) {
+    LIVE_UNIVERSE_SPOTS.store(spots, Ordering::Relaxed);
+    #[allow(clippy::cast_precision_loss)]
+    // APPROVED: bounded by MAX_DAILY_UNIVERSE_SIZE, far below 2^53.
+    metrics::gauge!(LIVE_UNIVERSE_SIZE_GAUGE).set(spots as f64);
+}
+
+/// Headroom once the CONTRACTS are selected: spots plus contracts against the
+/// whole main-feed capacity (audit D3c-1).
+///
+/// The boot check sees only the spots (~850 on the narrowed list), so it could
+/// never fire while the contracts take ~23,000 of the 25,000 slots. Called
+/// once, when the contract half reaches the wire. The contract selection
+/// narrows its at-the-money window to fit and pages that shrink itself
+/// (`window_shrunk`, `dropped_for_capacity`), so this is the EARLY warning,
+/// logged but not paged. O(1).
+pub fn report_spots_and_contracts_headroom(contracts: usize, capacity: usize) {
+    let spots = LIVE_UNIVERSE_SPOTS.load(Ordering::Relaxed);
+    report_universe_headroom(
+        spots.saturating_add(contracts),
+        capacity,
+        HeadroomStage::SpotsAndContracts,
+    );
+}
 
 /// Which paged reason this session is running on, if any.
 ///
@@ -703,9 +800,7 @@ pub fn finish_live_universe_widen(truncated: bool, subscribed: usize) {
         record_running_fallback("truncated_to_capacity", subscribed);
     } else {
         LIVE_UNIVERSE_DEGRADED.store(0, Ordering::Relaxed);
-        #[allow(clippy::cast_precision_loss)]
-        // APPROVED: bounded by the capacity envelope, far below 2^53.
-        metrics::gauge!(LIVE_UNIVERSE_SIZE_GAUGE).set(subscribed as f64);
+        publish_live_universe_size(subscribed);
     }
 }
 
@@ -929,10 +1024,15 @@ pub fn resolve_live_universe(
     // exactly that first sample. The one event this alarm exists for was the
     // one it could never report. Found by the 2026-08-29 adversarial sweep.
     //
-    // All five reasons, because the agent's delta is computed per LABEL SET:
-    // seeding one leaves the other four exactly as blind as before.
+    // Every reason of BOTH counters, because the agent's delta is computed per
+    // LABEL SET: seeding one leaves the others exactly as blind as before. The
+    // narrowed-artifact reasons have their own UNPAGED counter (audit D3c-1):
+    // they fall through to a wider set, which is not a collapse.
     for reason in MASTER_SOURCING_FALLBACK_REASONS {
         metrics::counter!(MASTER_SOURCING_FALLBACK_COUNTER, "reason" => *reason).increment(0);
+    }
+    for reason in NARROWING_FALLBACK_REASONS {
+        metrics::counter!(NARROWING_FALLBACK_COUNTER, "reason" => *reason).increment(0);
     }
 
     if !cfg.live_subscription_from_master {
@@ -974,7 +1074,7 @@ pub fn resolve_live_universe(
             }
             Err(failure) => {
                 metrics::counter!(
-                    MASTER_SOURCING_FALLBACK_COUNTER,
+                    NARROWING_FALLBACK_COUNTER,
                     "reason" => failure.ntm_reason()
                 )
                 .increment(1);
@@ -985,9 +1085,8 @@ pub fn resolve_live_universe(
                 // collapse alarm exists to page when the universe drops to the
                 // 4 index SIDs; firing it here would page on a session that is
                 // subscribing ~4,600 instruments instead of ~870, which is a
-                // config observation, not an outage. The fallback COUNTER
-                // (`tv_dhan_live_universe_master_fallback_total{reason}`)
-                // carries this event.
+                // config observation, not an outage. The unpaged
+                // `NARROWING_FALLBACK_COUNTER` carries this event (D3c-1).
                 tracing::error!(
                     code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
                     detail = failure.detail(),
@@ -1009,7 +1108,7 @@ pub fn resolve_live_universe(
                 // it is a widening of what was asked for, and the success path
                 // below publishes the real number.
                 metrics::counter!(
-                    MASTER_SOURCING_FALLBACK_COUNTER,
+                    NARROWING_FALLBACK_COUNTER,
                     "reason" => failure.fno_reason()
                 )
                 .increment(1);
@@ -1130,9 +1229,7 @@ pub fn resolve_live_universe(
                         // alarmed fallback COUNTER is not moved and the line
                         // carries `source = pre_rider_boot`, which the
                         // collapse alarm's filter cannot match.
-                        #[allow(clippy::cast_precision_loss)]
-                        // APPROVED: bounded by MAX_DAILY_UNIVERSE_SIZE, far below 2^53.
-                        metrics::gauge!(LIVE_UNIVERSE_SIZE_GAUGE).set(index_universe.len() as f64);
+                        publish_live_universe_size(index_universe.len());
                         tracing::warn!(
                             code = tickvault_common::error_code::ErrorCode::WsGapConnectionState
                                 .code_str(),
@@ -1211,10 +1308,12 @@ pub fn resolve_live_universe(
             // reading of the universe rather than a fallback-only tripwire. A
             // metric that only ever appears when something breaks cannot be
             // compared against a known-good value.
-            #[allow(clippy::cast_precision_loss)]
-            // APPROVED: bounded by the capacity envelope, far below 2^53.
-            metrics::gauge!(LIVE_UNIVERSE_SIZE_GAUGE).set(selection.instruments.len() as f64);
-            report_universe_headroom(selection.instruments.len(), capacity);
+            publish_live_universe_size(selection.instruments.len());
+            report_universe_headroom(
+                selection.instruments.len(),
+                capacity,
+                HeadroomStage::SpotsAtBoot,
+            );
             tracing::info!(
                 instruments = selection.instruments.len(),
                 master_entries = master.len(),
@@ -2240,9 +2339,74 @@ mod tests {
         // fallback-only-tripwire shape this file rejected for the size gauge.
         let src = include_str!("dhan_live_universe.rs");
         assert!(
-            src.contains("report_universe_headroom(selection.instruments.len(), capacity)"),
+            src.contains("publish_live_universe_size(selection.instruments.len());\n            report_universe_headroom(\n                selection.instruments.len(),\n                capacity,\n                HeadroomStage::SpotsAtBoot,"),
             "the headroom report must run on the MASTER-SOURCED success path, not only \
              on a failure branch"
+        );
+    }
+
+    /// Audit D3c-1: the boot check sees only the spots, so the same check runs
+    /// again with the contracts added. Every gauge site goes through one
+    /// helper, so the spot count it adds to is the published one.
+    #[test]
+    fn report_spots_and_contracts_headroom_adds_the_contracts_to_the_published_spots() {
+        let src = include_str!("dhan_live_universe.rs");
+        let prod = src.split("#[cfg(test)]\nmod tests").next().unwrap_or(src);
+        assert_eq!(
+            prod.matches("metrics::gauge!(LIVE_UNIVERSE_SIZE_GAUGE)")
+                .count(),
+            1,
+            "only publish_live_universe_size may set the size gauge, or the spot count \
+             the combined headroom reads can disagree with it"
+        );
+        assert!(prod.contains("spots.saturating_add(contracts),"));
+        let stack = include_str!("dhan_feed_stack.rs");
+        assert!(
+            stack.contains("report_spots_and_contracts_headroom("),
+            "the combined headroom must be reported when the contract half is dialed"
+        );
+        assert_eq!(HeadroomStage::SpotsAtBoot.as_str(), "spots_at_boot");
+        assert_eq!(
+            HeadroomStage::SpotsAndContracts.as_str(),
+            "spots_and_contracts"
+        );
+        // Safe without a recorder or a runtime.
+        report_spots_and_contracts_headroom(
+            23_000,
+            tickvault_common::constants::MAX_DAILY_UNIVERSE_SIZE,
+        );
+    }
+    /// Audit D3c-1: a narrowed list that could not be used falls THROUGH to a
+    /// wider set, which is not a collapse, so it must not move the paging
+    /// counter the fallback alarm sums over every reason.
+    #[test]
+    fn narrowing_fallback_counter_is_separate_from_the_paged_counter() {
+        assert_ne!(NARROWING_FALLBACK_COUNTER, MASTER_SOURCING_FALLBACK_COUNTER);
+        for reason in NARROWING_FALLBACK_REASONS {
+            assert!(
+                !MASTER_SOURCING_FALLBACK_REASONS.contains(reason),
+                "{reason} is on both counters"
+            );
+        }
+        let tf = include_str!("../../../deploy/aws/terraform/live-lane-alarms.tf");
+        assert!(tf.contains(MASTER_SOURCING_FALLBACK_COUNTER));
+        assert!(
+            !tf.contains(NARROWING_FALLBACK_COUNTER),
+            "the narrowing counter is deliberately unpaged"
+        );
+        let src = include_str!("dhan_live_universe.rs");
+        let prod = src.split("#[cfg(test)]\nmod tests").next().unwrap_or(src);
+        for reason in NARROWING_FALLBACK_REASONS {
+            assert!(
+                prod.contains(&format!("\"{reason}\"")),
+                "{reason} is never emitted"
+            );
+        }
+        assert_eq!(
+            prod.matches("metrics::counter!(\n                    NARROWING_FALLBACK_COUNTER,")
+                .count(),
+            2,
+            "the NTM and F&O arms both count on the narrowing counter"
         );
     }
     #[test]
