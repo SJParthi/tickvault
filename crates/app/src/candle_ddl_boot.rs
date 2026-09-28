@@ -68,8 +68,9 @@ pub const CANDLE_DDL_READINESS_BACKOFF_SECS: u64 = 5;
 /// - probe exhausted (QuestDB down) → SKIP the DDL loudly and return —
 ///   the first ILP write may then auto-create `candles_*` WITHOUT DEDUP
 ///   UPSERT KEYS (duplicate-row window until a later boot's ensure
-///   succeeds); the drop-sweep marker is not written, so the sweep also
-///   retries next boot.
+///   succeeds); the drop sweeps write their markers only when QuestDB
+///   answered every DROP, so a sweep that could not reach it re-runs in
+///   the background retry or at the next boot (audit PR53).
 // TEST-EXEMPT: network I/O orchestration — the call order + boot wiring are pinned by crates/app/tests/ensure_ddl_boot_wiring_guard.rs; the probe-bound constants are unit-tested below; the underlying DDL fns carry their own unit tests in tickvault-storage.
 pub async fn run_candle_ddl_at_boot(questdb: &QuestDbConfig) {
     let probe_url = format!(
@@ -116,8 +117,8 @@ pub async fn run_candle_ddl_at_boot(questdb: &QuestDbConfig) {
              candle DDL SKIPPED this boot. Consequence: the candle writer refuses \
              to send until the tables are confirmed keyed, so sealed candles go to \
              the disk spill meanwhile; the ensure re-runs in the background; the \
-             spill replays after the live flushes are clean again, or at the next boot. The retired-object sweep marker \
-             is not written, so the sweep retries next boot."
+             spill replays after the live flushes are clean again, or at the next boot. The drop sweeps write \
+             their markers only when QuestDB answered every DROP, so they re-run too."
         );
         // Audit PR31a: the candle writer refuses to send until these tables are
         // keyed, so re-run the skipped steps in the background rather than
@@ -159,11 +160,13 @@ pub async fn run_candle_ddl_at_boot(questdb: &QuestDbConfig) {
     // Until today this awaited the ensure ONCE and discarded the verdict —
     // the same shape `run_live_table_ddl_at_boot` was given a six-attempt loop
     // for on 2026-09-08, and this path is the one where a refusal costs most.
-    // `drop_legacy_candle_objects` runs immediately above and DROPS
-    // `candles_1s` on any boot whose sweep version moved, so between that drop
-    // and a refused CREATE the table simply does not exist: the seal writer's
-    // first ILP row auto-creates it with NO dedup key, and every replayed or
-    // re-flushed bar duplicates into it for the life of the table, silently.
+    // A candle table missing when the ensure is refused (a fresh deployment,
+    // or a table removed by hand) does not exist until the seal writer's first
+    // ILP row auto-creates it with NO dedup key, and every replayed or
+    // re-flushed bar then duplicates into it for the life of the table,
+    // silently. (Until 2026-09-28, audit PR53, `drop_legacy_candle_objects`
+    // above also DROPPED `candles_1s` on any boot whose sweep version moved;
+    // no sweep drops a kept table any more.)
     //
     // The readiness probe above cannot prevent this — it answers `SELECT 1`,
     // which a QuestDB still replaying its own WAL answers happily and then
@@ -431,9 +434,8 @@ mod tests {
 
     /// The candle ensure gets the SAME retry bound as the live-table ensure,
     /// because it answers the same question about the same database — and
-    /// because the boot DROPS `candles_1s` immediately before it, so a single
-    /// refused attempt leaves the seal writer to auto-create that table with
-    /// no dedup key for the life of the table.
+    /// because a single refused attempt leaves the seal writer to auto-create
+    /// any missing candle table with no dedup key for the life of the table.
     ///
     /// Asserted as an EQUALITY against its sibling rather than as its own
     /// literal: two bounds for one database is two things to keep true, and a

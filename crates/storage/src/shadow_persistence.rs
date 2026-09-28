@@ -336,10 +336,11 @@ pub(crate) static CANDLE_TABLES_KEYED: std::sync::atomic::AtomicBool =
 /// six-attempt loop for exactly this hazard: the readiness probe answers
 /// `SELECT 1`, which a QuestDB still replaying its own WAL answers happily and
 /// then refuses the DDL. A refused CREATE here is worse than elsewhere,
-/// because `drop_legacy_candle_objects` runs immediately BEFORE it and drops
-/// `candles_1s` on any boot whose sweep version moved: the seal writer's first
-/// ILP row then auto-creates that table with NO dedup key, and every replay
-/// duplicates into it for the life of the table, silently.
+/// because a table that is missing when the seal writer sends its first ILP row
+/// is auto-created with NO dedup key, and every replay then duplicates into it
+/// for the life of the table, silently. (Until 2026-09-28, audit PR53, the
+/// legacy drop sweep that runs just before this also dropped `candles_1s` on
+/// any boot whose sweep version moved; it no longer drops any kept table.)
 ///
 /// Requires a running QuestDB; covered by boot integration in CI and by manual
 /// `make doctor`.
@@ -711,7 +712,9 @@ fn retired_movers_object_names() -> Vec<String> {
 /// 1. Candle materialized views — every one of the 21 Engine-B
 ///    `candles_<tf>` names (a stale matview squatting the name makes
 ///    `CREATE TABLE` 400) plus the legacy sub-minute / 7-day matviews.
-/// 2. The `candles_1s` base table.
+/// 2. (Removed 2026-09-28, audit PR53: this step dropped the `candles_1s`
+///    base table, which is now a kept fold table. No sweep may drop a kept
+///    table; `no_drop_sweep_names_a_kept_candle_table` pins it.)
 /// 3. The 9 `candles_<tf>_shadow` tables.
 /// 4. The `aggregator_seal_audit` table (#T2a table cleanup).
 /// 5. The instrument / misc / greeks tables retired by #T3, #T4 and the
@@ -720,7 +723,10 @@ fn retired_movers_object_names() -> Vec<String> {
 ///    — matview drop THEN table drop per name (era-dependent object kind).
 ///
 /// Each statement is `DROP … IF EXISTS`, so this is safe to call on every
-/// boot regardless of which objects actually exist. Failures are logged at
+/// boot regardless of which objects actually exist. The one-shot marker is
+/// written only when QuestDB answered every DROP (a 2xx, or a 4xx such as a
+/// form mismatch); a transport failure or a 5xx leaves it unwritten so the
+/// sweep re-runs at the next boot. Failures are logged at
 /// `error!` level (Telegram-routable per `error_level_meta_guard.rs`
 /// Rule 5) but do NOT block boot.
 ///
@@ -807,6 +813,12 @@ pub async fn drop_legacy_candle_objects(questdb_config: &QuestDbConfig) {
         }
     };
 
+    // Every DROP below reports whether QuestDB ANSWERED it (a 2xx, or a 4xx
+    // such as a form mismatch). The marker is written only when every one
+    // was answered: a boot that runs while QuestDB is down or erroring must
+    // not record the clean-up as done (audit PR53).
+    let mut answered = true;
+
     // 1. Drop legacy candle MATERIALIZED VIEWS FIRST — before the base
     //    table they cascade from, AND before `ensure_shadow_candle_tables`
     //    runs its `CREATE TABLE` loop.
@@ -821,35 +833,36 @@ pub async fn drop_legacy_candle_objects(questdb_config: &QuestDbConfig) {
     //    21 every boot is idempotent.
     for view in candle_table_names() {
         let ddl = format!("DROP MATERIALIZED VIEW IF EXISTS {view};");
-        run_drop_ddl(&client, &base_url, view, &ddl).await;
+        answered &= run_drop_ddl(&client, &base_url, view, &ddl).await;
     }
     //    Plus the legacy sub-minute / 7-day matviews that have no
     //    Engine-B counterpart and would otherwise leak forever.
     for view in LEGACY_EXTRA_CANDLE_MATVIEW_NAMES {
         let ddl = format!("DROP MATERIALIZED VIEW IF EXISTS {view};");
-        run_drop_ddl(&client, &base_url, view, &ddl).await;
+        answered &= run_drop_ddl(&client, &base_url, view, &ddl).await;
     }
 
-    // 2. Drop the Engine-A `candles_1s` base table.
-    run_drop_ddl(
-        &client,
-        &base_url,
-        "candles_1s",
-        "DROP TABLE IF EXISTS candles_1s;",
-    )
-    .await;
+    // 2. (REMOVED 2026-09-28, audit PR53.) This step used to run
+    //    a table DROP of the Engine-A `candles_1s` base table.
+    //    `candles_1s` has been a KEPT fold table since the nine-frame
+    //    directive, so any sweep-version bump, or a lost or unreadable
+    //    marker, would have dropped every 1-second candle at the next boot.
+    //    Step 1 already frees the name from any legacy matview, and the
+    //    ensure's `ADD COLUMN IF NOT EXISTS` + `DEDUP ENABLE` bring an old
+    //    table to the current schema, so nothing needs the drop. Pinned by
+    //    `no_drop_sweep_names_a_kept_candle_table`.
 
     // 3. Drop the 9 legacy Wave-6 `candles_<tf>_shadow` tables.
     for sfx in LEGACY_CANDLE_TF_SUFFIXES {
         let table = format!("candles_{sfx}_shadow");
         let ddl = format!("DROP TABLE IF EXISTS {table};");
-        run_drop_ddl(&client, &base_url, &table, &ddl).await;
+        answered &= run_drop_ddl(&client, &base_url, &table, &ddl).await;
     }
 
     // 4. Drop the retired `aggregator_seal_audit` forensic table (#T2a —
     //    QuestDB table cleanup). The per-seal audit module is deleted; the
     //    table itself is dropped here so existing deployments converge.
-    run_drop_ddl(
+    answered &= run_drop_ddl(
         &client,
         &base_url,
         "aggregator_seal_audit",
@@ -864,7 +877,7 @@ pub async fn drop_legacy_candle_objects(questdb_config: &QuestDbConfig) {
     //    converges to the 24-table KEEP set with no manual migration.
     for table in RETIRED_QUESTDB_TABLES {
         let ddl = format!("DROP TABLE IF EXISTS {table};");
-        run_drop_ddl(&client, &base_url, table, &ddl).await;
+        answered &= run_drop_ddl(&client, &base_url, table, &ddl).await;
     }
 
     // 6. Drop the dead per-timeframe movers grid (Track A, 2026-07-18).
@@ -882,11 +895,20 @@ pub async fn drop_legacy_candle_objects(questdb_config: &QuestDbConfig) {
     //    idempotent; a form mismatch is a logged warn, never a blocker.
     for name in retired_movers_object_names() {
         let view_ddl = format!("DROP MATERIALIZED VIEW IF EXISTS {name};");
-        run_drop_ddl(&client, &base_url, &name, &view_ddl).await;
+        answered &= run_drop_ddl(&client, &base_url, &name, &view_ddl).await;
     }
     for name in retired_movers_object_names() {
         let table_ddl = format!("DROP TABLE IF EXISTS {name};");
-        run_drop_ddl(&client, &base_url, &name, &table_ddl).await;
+        answered &= run_drop_ddl(&client, &base_url, &name, &table_ddl).await;
+    }
+
+    if !answered {
+        warn!(
+            path = LEGACY_DROP_MARKER_PATH,
+            "legacy candle clean-up: QuestDB did not answer every DROP — marker NOT \
+             written, the sweep re-runs at the next boot"
+        );
+        return;
     }
 
     // PR #798 (operator-locked 2026-05-25) — write one-shot marker so
@@ -932,12 +954,13 @@ const LEGACY_DROP_MARKER_PATH: &str = "data/state/legacy_candle_objects_dropped.
 /// One-shot marker for the retired-timeframe sweep.
 ///
 /// DELIBERATELY SEPARATE from [`LEGACY_DROP_MARKER_PATH`], and the reason is
-/// the whole design of this sweep: bumping `LEGACY_DROP_SWEEP_VERSION` to
-/// re-arm the legacy loop would also re-run its step 2, which is an
-/// unconditional `DROP TABLE IF EXISTS candles_1s` — and `candles_1s` is one
-/// of the NINE tables the operator KEEPS. Re-arming the legacy sweep to drop
-/// fifteen retired tables would destroy a kept table's history as a side
-/// effect. Its own marker re-arms nothing.
+/// the whole design of this sweep: when it was written, bumping
+/// `LEGACY_DROP_SWEEP_VERSION` to re-arm the legacy loop would also have
+/// re-run its step 2, an unconditional `DROP TABLE IF EXISTS candles_1s` —
+/// and `candles_1s` is a table the operator KEEPS. That step was removed on
+/// 2026-09-28 (audit PR53), but the separate marker stays: re-arming one
+/// sweep should never re-run another. Like the legacy marker, this one is
+/// written only when QuestDB answered every DROP.
 const RETIRED_CANDLE_DROP_MARKER_PATH: &str = "data/state/retired_candle_tables_dropped.marker";
 
 /// Bump when [`retired_candle_table_names`] GAINS a name, so every deployment
@@ -1031,13 +1054,23 @@ pub async fn drop_retired_candle_tables(questdb_config: &QuestDbConfig) {
         }
     };
 
+    let mut answered = true;
     for name in &retired {
         let ddl = format!("DROP MATERIALIZED VIEW IF EXISTS {name};");
-        run_drop_ddl(&client, &base_url, name, &ddl).await;
+        answered &= run_drop_ddl(&client, &base_url, name, &ddl).await;
     }
     for name in &retired {
         let ddl = format!("DROP TABLE IF EXISTS {name};");
-        run_drop_ddl(&client, &base_url, name, &ddl).await;
+        answered &= run_drop_ddl(&client, &base_url, name, &ddl).await;
+    }
+
+    if !answered {
+        warn!(
+            path = RETIRED_CANDLE_DROP_MARKER_PATH,
+            "retired candle sweep: QuestDB did not answer every DROP — marker NOT \
+             written, the sweep re-runs at the next boot"
+        );
+        return;
     }
 
     if let Some(parent) = marker_path.parent()
@@ -1100,17 +1133,39 @@ fn marker_records_current_version(content: &str) -> bool {
 /// Same GET-based transport as [`run_ddl`]. A non-2xx response is logged
 /// at `warn!` (a missing object on a fresh deploy is benign because the
 /// statement is `IF EXISTS`); a transport error is logged at `error!`.
-async fn run_drop_ddl(client: &Client, base_url: &str, object: &str, ddl: &str) {
+///
+/// Returns whether QuestDB ANSWERED the statement, per
+/// [`drop_status_counts_as_answered`]. The sweeps write their one-shot
+/// marker only when every DROP was answered (audit PR53).
+async fn run_drop_ddl(client: &Client, base_url: &str, object: &str, ddl: &str) -> bool {
     match client.get(base_url).query(&[("query", ddl)]).send().await {
         Ok(resp) if resp.status().is_success() => {
             info!(object, "legacy candle object dropped (or already absent)");
+            true
         }
         Ok(resp) => {
             warn!(object, status = %resp.status(), "legacy candle DROP non-2xx");
+            drop_status_counts_as_answered(Some(resp.status().as_u16()))
         }
         Err(err) => {
             error!(object, ?err, "legacy candle DROP request failed");
+            drop_status_counts_as_answered(None)
         }
+    }
+}
+
+/// Whether a DROP's outcome means QuestDB answered it.
+///
+/// `None` is a transport failure (connection refused, timeout): the database
+/// never saw the statement. A 2xx is a drop or an `IF EXISTS` no-op. A 4xx is
+/// the database refusing the statement as written — the expected answer to
+/// `DROP MATERIALIZED VIEW` on a name that is a plain table — so it counts as
+/// answered, as it did before this gate existed. A 5xx means the database
+/// failed while handling it, so the object may still be there.
+fn drop_status_counts_as_answered(status: Option<u16>) -> bool {
+    match status {
+        Some(code) => code < 500,
+        None => false,
     }
 }
 
@@ -1671,5 +1726,78 @@ mod tests {
     #[test]
     fn test_legacy_drop_marker_filename_is_descriptive() {
         assert!(LEGACY_DROP_MARKER_PATH.ends_with("legacy_candle_objects_dropped.marker"));
+    }
+
+    /// Audit PR53 (2026-09-28). The legacy sweep's step 2 was an
+    /// unconditional `DROP TABLE IF EXISTS candles_1s`, a table the fold still
+    /// writes. It lay dormant behind the marker, and a sweep-version bump or a
+    /// lost marker would have fired it on the next boot.
+    ///
+    /// Asked two ways, because either alone has a gap. The NAME SETS every
+    /// sweep drops by table must not meet the live candle tables; and neither
+    /// sweep's body may carry a literal `DROP TABLE IF EXISTS candles_`
+    /// statement, which is the shape step 2 had and no name set would list.
+    #[test]
+    fn no_drop_sweep_names_a_kept_candle_table() {
+        use std::collections::BTreeSet;
+
+        let kept: BTreeSet<String> = candle_table_names()
+            .iter()
+            .chain(emitted_candle_table_names().iter())
+            .map(|name| (*name).to_string())
+            .collect();
+        assert!(
+            kept.contains("candles_1s"),
+            "the kept set must include candles_1s, the table this guard was written for"
+        );
+
+        let mut dropped: BTreeSet<String> = BTreeSet::new();
+        for sfx in LEGACY_CANDLE_TF_SUFFIXES {
+            dropped.insert(format!("candles_{sfx}_shadow"));
+        }
+        dropped.insert("aggregator_seal_audit".to_string());
+        dropped.extend(RETIRED_QUESTDB_TABLES.iter().map(|t| (*t).to_string()));
+        dropped.extend(retired_movers_object_names());
+        dropped.extend(
+            retired_candle_table_names()
+                .iter()
+                .map(|t| (*t).to_string()),
+        );
+
+        let overlap: Vec<_> = kept.intersection(&dropped).collect();
+        assert!(
+            overlap.is_empty(),
+            "a boot drop sweep names a candle table the fold still writes: {overlap:?}"
+        );
+
+        let src = include_str!("shadow_persistence.rs");
+        for sweep in [
+            concat!("pub async ", "fn drop_legacy_candle_objects("),
+            concat!("pub async ", "fn drop_retired_candle_tables("),
+        ] {
+            let start = src.find(sweep).expect("sweep fn present");
+            let body_len = src[start..].find("\n}\n").expect("sweep fn body end");
+            let body = &src[start..start + body_len];
+            let literal = concat!("DROP TABLE IF EXISTS ", "candles_");
+            assert!(
+                !body.contains(literal),
+                "{sweep} carries a literal candle-table DROP; every candle table \
+                 it may drop must come from a name set this test checks"
+            );
+        }
+    }
+
+    /// Audit PR53: a sweep marker means QuestDB answered every DROP. A
+    /// transport failure or a 5xx must not count, or a boot during an outage
+    /// records the clean-up as done and it never re-runs.
+    #[test]
+    fn drop_status_counts_as_answered_only_when_questdb_answered() {
+        assert!(!drop_status_counts_as_answered(None));
+        for answered in [200, 204, 400, 404, 409, 499] {
+            assert!(drop_status_counts_as_answered(Some(answered)), "{answered}");
+        }
+        for failed in [500, 502, 503, 504, 599] {
+            assert!(!drop_status_counts_as_answered(Some(failed)), "{failed}");
+        }
     }
 }

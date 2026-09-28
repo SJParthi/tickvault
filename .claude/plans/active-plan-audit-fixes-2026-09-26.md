@@ -1517,7 +1517,7 @@ Order of work: PR #1975 (D3a) finishes first. Then PR53 (it can destroy a kept t
 PR54, PR55, PR56, then the order already set: PR41, PR31b, PR42–PR50, PR31c, PR32–PR39, PR51,
 the PR4c follow-ups, PR52. PR30b stays on or after 2026-10-01.
 
-- [ ] **PR53 — a boot never drops a kept table, and a clean-up marker means the clean-up ran.**
+- [x] **PR53 — a boot never drops a kept table, and a clean-up marker means the clean-up ran.**
   (`storage`, `app`)
   - Verified: `drop_legacy_candle_objects` runs `DROP TABLE IF EXISTS candles_1s` (step 2,
     shadow_persistence.rs:833-840) whenever its marker is missing, unreadable or on an older sweep
@@ -1529,6 +1529,17 @@ the PR4c follow-ups, PR52. PR30b stays on or after 2026-10-01.
     `TfIndex` table or a KEEP table); write each marker only when every drop in its sweep
     returned 2xx; PR31a's background re-run waits for the database to answer before it sweeps;
     correct the false "retry next boot" line (candle_ddl_boot.rs:119-120).
+  - Done: step 2 removed (`shadow_persistence::drop_legacy_candle_objects`); both sweeps collect
+    `answered` from `run_drop_ddl` (now `-> bool`) and write their marker only when it holds;
+    `drop_status_counts_as_answered` counts 2xx AND 4xx as answered (a 4xx is QuestDB refusing
+    the form, e.g. a matview DROP on a plain table, which the sweep always treated as a no-op;
+    requiring 2xx would re-run the sweep every boot), and a transport error or 5xx as not
+    answered. That gate is what makes the background re-run safe while the database is down, so
+    no separate wait was added. Docs corrected in shadow_persistence.rs and candle_ddl_boot.rs.
+    Tests: `no_drop_sweep_names_a_kept_candle_table` (name sets vs live candle tables, plus no
+    literal candle-table DROP in either sweep body; bite-proven by re-adding the literal),
+    `drop_status_counts_as_answered_only_when_questdb_answered`. Non-candle KEEP tables stay
+    pinned by the existing `retired_drop_list_never_names_a_live_table`.
 - [ ] **PR54 — a depth socket that never sends a first frame pages.** (`app`, `core`)
   - From re-check 7: a morning-dial depth socket that never delivers a frame pages nothing, and
     the comment that says RISK-GAP-03 covers it is false for depth. PR44/PR45 do not cover it.
