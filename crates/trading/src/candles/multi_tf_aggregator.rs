@@ -327,8 +327,8 @@ struct InstrumentSlot {
     /// live process may already have closed by its periodic catch-up seal:
     /// live then carried that tick's volume into the next bucket, the replay
     /// folds it into the open one, so neither bar can be rebuilt as live
-    /// stored it. Consumed when the bucket rolls; after the hand-over it
-    /// taints the new bucket instead, since live mode ignores partial bits.
+    /// stored it. Consumed when the bucket rolls; cleared at the hand-over and
+    /// at the day boundary.
     replay_next_partial: u16,
 }
 
@@ -1677,8 +1677,11 @@ impl MultiTfAggregator {
         // ended `catch_up_margin_secs` before it may already have been closed
         // live by the periodic catch-up seal. 0 outside a replay.
         let late_bound = if replay_mode {
+            // Plus the same clock-skew allowance as the gap frontier: live's
+            // watermark comes from EXCHANGE time, which can run a little ahead
+            // of this box's receipt clock (review round 8).
             receipt_ist_secs(tick.received_at_nanos)
-                .unwrap_or(0)
+                .map_or(0, |secs| secs.saturating_add(REPLAY_FRONTIER_SKEW_SECS))
                 .max(self.watermark_secs)
         } else {
             0
@@ -1822,7 +1825,18 @@ impl MultiTfAggregator {
                 // `false` means the bucket this trade belongs to has already
                 // sealed (catch-up or rollover). Nothing is reopened and nothing
                 // is amended: the sealed bar already holds this trade.
-                let _still_open = slot.cell.refresh_repeat_quote(tf, tick, &prices, fold_secs);
+                let still_open = slot.cell.refresh_repeat_quote(tf, tick, &prices, fold_secs);
+                // A repeat that refreshed an open bucket live may already have
+                // closed by catch-up changed quote fields (open interest, the
+                // buy/sell totals, possibly the day's open) that live never
+                // wrote there. It adds no volume, so only this bucket is
+                // partial, not the next (review round 8).
+                if still_open
+                    && late_bound != 0
+                    && slot.open_bucket_may_be_closed_live(tf, late_bound, catch_up_margin)
+                {
+                    slot.replay_open_partial |= replay_tf_bit(tf);
+                }
             }
             crate::candles::fold_counters::fold_counters()
                 .repeat_quote
@@ -1938,31 +1952,31 @@ impl MultiTfAggregator {
             );
         }
 
-        for tf in TfIndex::ALL {
-            // A tick that lands in an open bucket live may already have
-            // closed by catch-up: live amended the closed bar and carried the
-            // volume into the next one, the replay folds it into the open
-            // one. Neither bar can be rebuilt as stored, so both are partial
-            // (and the last sealed bar too, for a tick older than the open
-            // bucket, which live could not have amended). Replay only; one
-            // compare per timeframe (review round 7).
-            if late_bound != 0 {
-                let open_start = slot.cell.open_bucket_start(tf);
-                if open_start != 0
-                    && open_start
-                        .saturating_add(tf.seconds_per_bucket())
-                        .saturating_add(catch_up_margin)
-                        <= late_bound
+        // A tick that lands in an open bucket live may already have closed by
+        // catch-up: live amended the closed bar and carried the volume into
+        // the next one, the replay folds it into the open one. Neither bar can
+        // be rebuilt as stored, so both are partial (and the last sealed bar
+        // too, for a tick older than the open bucket, which live could not
+        // have amended). Replay only, and outside the fold loop so live mode
+        // pays one branch per tick, not one per timeframe (review rounds 7
+        // and 8). Each timeframe reads and writes only its own bits, so doing
+        // them all before the fold is the same as doing each before its own.
+        if late_bound != 0 {
+            for tf in TfIndex::ALL {
+                if slot.open_bucket_may_be_closed_live(tf, late_bound, catch_up_margin)
                     && !slot.cell.would_seal(tf, fold_secs)
                 {
                     let bit = replay_tf_bit(tf);
                     slot.replay_open_partial |= bit;
                     slot.replay_next_partial |= bit;
-                    if fold_secs < open_start {
+                    if fold_secs < slot.cell.open_bucket_start(tf) {
                         slot.replay_sealed_partial |= bit;
                     }
                 }
             }
+        }
+
+        for tf in TfIndex::ALL {
             // A held bar becomes final the moment this tick seals the bar
             // after it: release it now, before the seal replaces it.
             if slot.replay_held & replay_tf_bit(tf) != 0 && slot.cell.would_seal(tf, fold_secs) {
@@ -2577,6 +2591,12 @@ impl MultiTfAggregator {
             // full; each one still open was marked above, so live mode
             // carries none (review round 7).
             slot.replay_gap_frontier = 0;
+            // Nor does it carry a late tick's mark on the next bucket: that
+            // bucket opens after the hand-over, where the hand-over gap
+            // already rules on it, and the previous process never stored
+            // it, so a mark could only discard a bar that exists nowhere
+            // else (review round 8).
+            slot.replay_next_partial = 0;
             slot.replay_open_partial =
                 (REPLAY_ALL_TF_MASK & !open_mask) | (slot.replay_open_partial & open_mask);
         }
@@ -2680,6 +2700,20 @@ impl InstrumentSlot {
         self.roll_replay_bits(tf, next_open_partial, replay_mode, ended_before_capture)
     }
 
+    /// Whether `tf`'s open bucket may already have been closed in live mode by
+    /// the periodic catch-up seal when a tick with this `late_bound` arrived:
+    /// the bucket ended at least `margin` seconds before it (review rounds 7
+    /// and 8). `false` with nothing open. O(1).
+    #[inline]
+    fn open_bucket_may_be_closed_live(&self, tf: TfIndex, late_bound: u32, margin: u32) -> bool {
+        let open_start = self.cell.open_bucket_start(tf);
+        open_start != 0
+            && open_start
+                .saturating_add(tf.seconds_per_bucket())
+                .saturating_add(margin)
+                <= late_bound
+    }
+
     /// Moves `tf`'s open-bucket replay bits to the sealed bucket, sets the
     /// next open bucket's partial bit to `next_open_partial` and clears its
     /// taint (a bucket opened after the hand-over holds live data). Returns
@@ -2706,9 +2740,6 @@ impl InstrumentSlot {
             bit,
             next_open_partial || forced,
         );
-        // Live mode ignores partial bits, so after the hand-over the mark
-        // taints the new bucket instead.
-        set_bit(&mut self.replay_taint_open, bit, forced && !replay_mode);
         (replay_mode && was_partial) || was_tainted || (was_partial && ended_before_capture)
     }
 
@@ -3760,7 +3791,7 @@ mod tests {
             (
                 any::<bool>(),
                 0_u32..30,
-                prop_oneof![8 => Just(0_u32), 1 => 1_u32..20],
+                prop_oneof![8 => Just(0_u32), 1 => 1_u32..20, 1 => 250_u32..900],
                 0_i32..300,
                 -3_i8..=3,
                 prop::bool::weighted(0.25),
@@ -3804,6 +3835,54 @@ mod tests {
             }
         }
 
+        /// NON-VACUITY (review rounds 7 and 8): a replay that held back every
+        /// bar would pass an equality check. For a stream with nothing
+        /// dropped, every live bar starting after the pass-start settling
+        /// (the first tick that adds volume with a known direction) and after
+        /// the pass-start gap frontier (the first tick plus the clock-skew
+        /// margin) must be rebuilt too.
+        fn rebuilt_after_settling(
+            steps: &[Step],
+            live: &Bars,
+            replay: &Bars,
+        ) -> Result<(), TestCaseError> {
+            prop_assert!(replay.len() <= live.len());
+            let (mut ts, mut px) = (OPEN + 60, 1_000.0_f32);
+            let (mut moved, mut settled_at) = (false, None);
+            for (i, s) in steps.iter().enumerate() {
+                ts += s.dt;
+                let prev = px;
+                px = (px + f32::from(s.dpx) * 0.05).max(1.0);
+                if i == 0 {
+                    continue; // the seeding tick
+                }
+                // The tick rule learns a direction only from a price change
+                // on a tick that ADDS volume (`classify_tick_volume` returns
+                // early on a zero delta without touching the carry).
+                if s.dcum > 0 {
+                    moved |= px.to_bits() != prev.to_bits();
+                }
+                if moved && s.dcum > 0 {
+                    settled_at = Some(ts);
+                    break;
+                }
+            }
+            let first_ts = OPEN + 60 + steps.first().map_or(0, |s| s.dt);
+            let frontier = first_ts + REPLAY_FRONTIER_SKEW_SECS;
+            if let Some(end) = settled_at.map(|at: u32| at.max(frontier)) {
+                for (tf, start) in live.keys() {
+                    prop_assert!(
+                        *start <= end || replay.contains_key(&(*tf, *start)),
+                        "{:?} {}: complete after settling ({}), yet not rebuilt",
+                        tf,
+                        start,
+                        end
+                    );
+                }
+            }
+            Ok(())
+        }
+
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(512))]
             #[test]
@@ -3835,42 +3914,34 @@ mod tests {
                 // With nothing dropped, the replay must reproduce the live fold
                 // except the bars the pass-start gap makes partial.
                 if steps.iter().all(|s| !s.dropped) {
-                    prop_assert!(replay.len() <= live.len());
-                    // NON-VACUITY (review round 7): a replay that held back
-                    // every bar would pass the checks above. Past the first
-                    // tick that adds volume with a known direction, which
-                    // ends the pass-start settling, and past the pass-start
-                    // gap frontier (the first tick plus the clock-skew
-                    // margin), every live bar must be rebuilt too.
-                    let (mut ts, mut px) = (OPEN + 60, 1_000.0_f32);
-                    let (mut moved, mut settled_at) = (false, None);
-                    for (i, s) in steps.iter().enumerate() {
-                        ts += s.dt;
-                        let prev = px;
-                        px = (px + f32::from(s.dpx) * 0.05).max(1.0);
-                        if i == 0 {
-                            continue; // the seeding tick
-                        }
-                        moved |= px.to_bits() != prev.to_bits();
-                        if moved && s.dcum > 0 {
-                            settled_at = Some(ts);
-                            break;
-                        }
-                    }
-                    let first_ts = OPEN + 60 + steps.first().map_or(0, |s| s.dt);
-                    let frontier = first_ts + REPLAY_FRONTIER_SKEW_SECS;
-                    if let Some(end) = settled_at.map(|at: u32| at.max(frontier)) {
-                        for (tf, start) in live.keys() {
-                            prop_assert!(
-                                *start <= end || replay.contains_key(&(*tf, *start)),
-                                "{:?} {}: complete after settling ({}), yet not rebuilt",
-                                tf,
-                                start,
-                                end
-                            );
-                        }
-                    }
+                    rebuilt_after_settling(&steps, &live, &replay)?;
                 }
+            }
+
+            /// Review round 8: the lower bound above runs only when no step
+            /// was dropped, about 2% of that property's cases. Here nothing
+            /// is ever dropped, so every case checks that a replay rebuilds
+            /// every bar live wrote once the pass-start settling is over.
+            #[test]
+            fn test_replay_with_nothing_dropped_rebuilds_every_settled_bar(
+                steps in prop::collection::vec(step(), 1..160)
+            ) {
+                let steps: Vec<Step> = steps
+                    .into_iter()
+                    .map(|s| Step { dropped: false, ..s })
+                    .collect();
+                let live = fold(&steps, false);
+                let replay = fold(&steps, true);
+                for (key, bar) in &replay {
+                    let Some(truth) = live.get(key) else {
+                        return Err(TestCaseError::fail(format!(
+                            "{key:?}: the replay emitted a bar the live fold never did"
+                        )));
+                    };
+                    prop_assert_eq!(bar.volume, truth.volume, "{:?} volume", key);
+                    prop_assert_eq!(bar.close.to_bits(), truth.close.to_bits(), "{:?} close", key);
+                }
+                rebuilt_after_settling(&steps, &live, &replay)?;
             }
 
             /// Round 6: the same contract with two contracts interleaved,
@@ -4143,6 +4214,96 @@ mod tests {
                 "mode {mode}: the minute after them is complete again: {fixed:?}"
             );
         }
+    }
+
+    /// Review round 8 (hostile review, HIGH): a REPEATED quote (same trade,
+    /// new open interest) takes an early return before the fold. Arriving
+    /// after live may have closed its bucket by catch-up, it refreshed the
+    /// replay's still-open bucket with quote fields live never wrote there.
+    /// `push` = another instrument moved the watermark far enough.
+    fn repeat_after_catch_up_minutes(push: bool) -> Vec<u32> {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        agg.set_replay_mode(true);
+        let t0 = OPEN + 600;
+        let mut m1: Vec<u32> = Vec::new();
+        let feed = |agg: &mut MultiTfAggregator, t: ParsedTick, m1: &mut Vec<u32>| {
+            agg.consume_tick(Feed::Dhan, &t, None, |_, sid, _, tf, st| {
+                if sid == GAP_SID && tf == TfIndex::M1 {
+                    m1.push(st.bucket_start_ist_secs);
+                }
+            })
+        };
+        for (ts, cum) in [
+            (t0 + 5, 1_000),
+            (t0 + 10, 1_010),
+            (t0 + 65, 1_020),
+            (t0 + 70, 1_030),
+        ] {
+            feed(&mut agg, gtick(ts, cum), &mut m1);
+        }
+        if push {
+            feed(
+                &mut agg,
+                tick(GAP_SID + 1, SEG_EQ, t0 + 420, 500.0, 5_000),
+                &mut m1,
+            );
+        }
+        let mut repeat = gtick(t0 + 70, 1_030);
+        repeat.open_interest = 5_100;
+        assert!(
+            feed(&mut agg, repeat, &mut m1).repeat_quote,
+            "the packet must take the repeat-quote path, or this tests nothing"
+        );
+        for (ts, cum) in [(t0 + 130, 1_100), (t0 + 190, 1_150)] {
+            feed(&mut agg, gtick(ts, cum), &mut m1);
+        }
+        agg.finish_replay(false, |_, sid, _, tf, st| {
+            if sid == GAP_SID && tf == TfIndex::M1 {
+                m1.push(st.bucket_start_ist_secs);
+            }
+        });
+        m1
+    }
+
+    #[test]
+    fn test_regression_repeat_quote_after_a_live_catch_up_leaves_its_minute_partial() {
+        let t0 = OPEN + 600;
+        let control = repeat_after_catch_up_minutes(false);
+        assert!(
+            control.contains(&(t0 + 60)),
+            "control: with no sign live closed it, the refreshed minute is written: {control:?}"
+        );
+        let fixed = repeat_after_catch_up_minutes(true);
+        assert!(
+            !fixed.contains(&(t0 + 60)),
+            "the minute the repeat refreshed may differ from live's: {fixed:?}"
+        );
+        assert!(
+            fixed.contains(&(t0 + 120)),
+            "a repeat adds no volume, so the next minute stays complete: {fixed:?}"
+        );
+    }
+
+    /// Review round 8: a late tick's mark on the NEXT bucket does not survive
+    /// the hand-over, where it could only discard a live bar that no previous
+    /// process ever stored.
+    #[test]
+    fn test_finish_replay_clears_the_next_bucket_mark() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        agg.set_replay_mode(true);
+        let t0 = OPEN + 600;
+        for (ts, cum) in [(t0 + 5, 1_000), (t0 + 10, 1_010), (t0 + 65, 1_020)] {
+            agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, ignore_seal);
+        }
+        let other = tick(GAP_SID + 1, SEG_EQ, t0 + 420, 500.0, 5_000);
+        agg.consume_tick(Feed::Dhan, &other, None, ignore_seal);
+        agg.consume_tick(Feed::Dhan, &gtick(t0 + 80, 1_030), None, ignore_seal);
+        assert!(agg.slots.iter().any(|s| s.replay_next_partial != 0));
+        agg.finish_replay(false, ignore_seal);
+        assert!(
+            agg.slots.iter().all(|s| s.replay_next_partial == 0),
+            "no next-bucket mark survives the hand-over"
+        );
     }
 
     /// Review round 7: a tick OLDER than the open bucket, arriving once live
