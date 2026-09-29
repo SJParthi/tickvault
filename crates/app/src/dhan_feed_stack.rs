@@ -10197,6 +10197,10 @@ pub struct DhanFeedStackParams {
     /// `(frame_seq, received_at_nanos, endpoint, frame)` — the TVW4 endpoint
     /// is what routes a replayed depth frame to the depth drain.
     pub wal_replay_live_feed: Vec<(u64, i64, WalEndpoint, bytes::Bytes)>,
+    /// Indexes into [`Self::wal_replay_live_feed`] of frames that follow a gap
+    /// in the replay (plan ITEM 47): frames before them were not replayed,
+    /// so the candle fold must not carry its volume baseline across.
+    pub wal_replay_gaps: Vec<usize>,
     /// Main-feed instruments (the hardcoded index set — see
     /// [`hardcoded_index_universe`]).
     pub main_feed_instruments: Vec<SubscribeInstrument>,
@@ -13630,6 +13634,9 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
 pub struct WalRefoldOutcome {
     /// Ticks successfully folded into the aggregator and queued for the DB.
     pub refolded: u64,
+    /// Gaps in the replayed frames at which the candle fold re-seeded its
+    /// volume baseline (plan ITEM 47).
+    pub gaps_marked: u64,
     /// Ticks parsed but REFUSED by the fold (sequence unrepresentable,
     /// aggregator refusal, write failure). Real, counted loss.
     pub lost: u64,
@@ -14028,12 +14035,20 @@ fn refold_one_tick(
 pub fn refold_wal_frames(
     ingest: &mut LiveIngest,
     frames: &[(u64, i64, WalEndpoint, bytes::Bytes)],
+    gaps: &[usize],
 ) -> WalRefoldOutcome {
     let mut out = WalRefoldOutcome::default();
     // Held for the whole backlog; cleared at the single exit below. See the
     // `replaying_wal` field for why a replayed frame must never reach the
     // volume ranking.
     ingest.replaying_wal = true;
+    // Plan ITEM 47: while replaying, a candle the replay could only partly
+    // see is counted instead of emitted, so it never overwrites the complete
+    // candle the live process already stored under the same key.
+    ingest.aggregator.set_replay_mode(true);
+    // `gaps` holds ascending indexes into `frames` of frames that follow a
+    // gap in the replay; a cursor walks it once, O(1) per frame.
+    let mut gap_cursor = 0usize;
 
     // ⚠ READ THIS FIRST — 2026-09-18. The two corrections below are kept
     // verbatim as the record of how this line reached its current shape, and
@@ -14172,7 +14187,24 @@ pub fn refold_wal_frames(
         .aggregator
         .seed_watermark_at_least(ist_day_start_secs);
 
-    for (frame_seq, wal_received_at_nanos, endpoint, bytes) in frames {
+    for (frame_idx, (frame_seq, wal_received_at_nanos, endpoint, bytes)) in
+        frames.iter().enumerate()
+    {
+        // Plan ITEM 47: frames before this one were not replayed, so no
+        // instrument's volume baseline may carry across. `while`, not `if`,
+        // so a duplicate index is consumed rather than stalling the cursor.
+        let mut gap_marked_here = false;
+        while let Some(&gap_idx) = gaps.get(gap_cursor) {
+            if gap_idx > frame_idx {
+                break;
+            }
+            if gap_idx == frame_idx && !gap_marked_here {
+                ingest.aggregator.mark_replay_gap();
+                out.gaps_marked = out.gaps_marked.saturating_add(1);
+                gap_marked_here = true;
+            }
+            gap_cursor += 1;
+        }
         // SIZE TRIGGER -- the bound this loop did not have, MEASURED biting on
         // 2026-09-02. The live drain flushes on `FLUSH_ROW_THRESHOLD` and
         // `DEPTH_FLUSH_ROW_THRESHOLD`; replay had NEITHER, so it appended the
@@ -14486,6 +14518,12 @@ pub fn refold_wal_frames(
     // here, which is why the guard is set and cleared in this function and
     // not at either caller.
     ingest.replaying_wal = false;
+    // Plan ITEM 47: the live feed resumes after frames this replay never saw
+    // (applied ones, and any downtime), so the next live tick re-seeds rather
+    // than taking that span into one bar. Undercount of one tick per
+    // instrument, never an invented volume.
+    ingest.aggregator.mark_replay_gap();
+    ingest.aggregator.set_replay_mode(false);
     out
 }
 
@@ -15029,11 +15067,13 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         } else {
             let unlanded_before =
                 tickvault_storage::wal_applied_watermark::applied_watermark().unlanded_total();
-            let outcome = refold_wal_frames(&mut ingest, &params.wal_replay_live_feed);
+            let (boot_frames, boot_gaps) = (&params.wal_replay_live_feed, &params.wal_replay_gaps);
+            let outcome = refold_wal_frames(&mut ingest, boot_frames, boot_gaps);
             if outcome.lost == 0 {
                 info!(
                     frames = params.wal_replay_live_feed.len(),
                     ticks = outcome.refolded,
+                    replay_gaps = outcome.gaps_marked,
                     "recovered live-feed frames from the write-ahead log and folded them — \
                  ticks captured by a previous session are now in the database"
                 );
@@ -15344,19 +15384,30 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             // with the boot path so one series answers "how many of these have
             // we seen", regardless of which drain saw them.
             let batch_len = batch.frames.len();
-            let staged: Vec<(u64, i64, WalEndpoint, bytes::Bytes)> = batch
-                .frames
-                .into_iter()
-                .filter(|f| f.ws_type == tickvault_storage::ws_frame_spill::WsType::LiveFeed)
-                .map(|f| {
-                    (
-                        f.frame_seq,
-                        f.received_at_nanos,
-                        f.endpoint,
-                        bytes::Bytes::from(f.frame),
-                    )
-                })
-                .collect();
+            let mut staged: Vec<(u64, i64, WalEndpoint, bytes::Bytes)> =
+                Vec::with_capacity(batch_len);
+            // Plan ITEM 47: indexes into `staged` of frames that follow a gap.
+            // A gap in front of a frame this lane does not fold carries to
+            // the next live-feed frame.
+            let mut staged_gaps: Vec<usize> = Vec::new();
+            let mut gap_carry = false;
+            // O(1) EXEMPT: begin — one pass over a catch-up batch on the boot drain, cold path
+            for f in batch.frames {
+                gap_carry |= f.after_gap;
+                if f.ws_type != tickvault_storage::ws_frame_spill::WsType::LiveFeed {
+                    continue;
+                }
+                if std::mem::replace(&mut gap_carry, false) {
+                    staged_gaps.push(staged.len());
+                }
+                staged.push((
+                    f.frame_seq,
+                    f.received_at_nanos,
+                    f.endpoint,
+                    bytes::Bytes::from(f.frame),
+                ));
+            }
+            // O(1) EXEMPT: end
             let not_folded = batch_len.saturating_sub(staged.len());
             if not_folded > 0 {
                 catchup_not_folded = catchup_not_folded.saturating_add(not_folded as u64);
@@ -15380,7 +15431,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             }
             let unlanded_before =
                 tickvault_storage::wal_applied_watermark::applied_watermark().unlanded_total();
-            let outcome = refold_wal_frames(&mut ingest, &staged);
+            let outcome = refold_wal_frames(&mut ingest, &staged, &staged_gaps);
             let flushed = blocking_flush(|| ingest.flush());
             // ACK BEFORE CONFIRMING — see `replay_rows_landed`. A timeout ends
             // the drain rather than re-offering the same batch to a sink that
@@ -18468,6 +18519,7 @@ mod tests {
             // A disabled lane never reaches the re-fold, which is exactly why
             // main.rs still drops the batch loudly when the gate is closed.
             wal_replay_live_feed: Vec::new(),
+            wal_replay_gaps: Vec::new(),
             main_feed_instruments: hardcoded_index_universe(),
             depth_20_instruments: Vec::new(),
             depth_200_instruments: Vec::new(),
@@ -22899,7 +22951,7 @@ mod wal_refold_tests {
             WalEndpoint::MainFeed,
             replay_ticker(13, yesterday_ist),
         );
-        let out = refold_wal_frames(&mut ingest(), &[snapshot]);
+        let out = refold_wal_frames(&mut ingest(), &[snapshot], &[]);
         assert_eq!(
             out.refused_wrong_day, 1,
             "the day rule refused it by design"
@@ -22918,7 +22970,7 @@ mod wal_refold_tests {
             WalEndpoint::MainFeed,
             replay_ticker(13, yesterday_ist),
         );
-        let out = refold_wal_frames(&mut ingest(), &[prior_session]);
+        let out = refold_wal_frames(&mut ingest(), &[prior_session], &[]);
         assert_eq!(
             out.lost, 0,
             "a tick received on the day it traded is real captured data — its \
@@ -22944,7 +22996,7 @@ mod wal_refold_tests {
             WalEndpoint::MainFeed,
             replay_ticker(13, yesterday_ist),
         );
-        let out = refold_wal_frames(&mut ingest(), &[no_receipt]);
+        let out = refold_wal_frames(&mut ingest(), &[no_receipt], &[]);
         assert_eq!(out.refolded, 0, "no receipt clock, no proof, no write-back");
     }
 
@@ -22996,6 +23048,26 @@ mod wal_refold_tests {
         assert!(!is_depth_socket_frame(&wrong_code));
     }
 
+    /// Plan ITEM 47: every listed gap index is marked once, an out-of-range or
+    /// duplicate index is harmless, and an empty list marks nothing.
+    #[test]
+    fn test_refold_wal_frames_with_gaps_marks_each_gap() {
+        use tickvault_common::constants::DEEP_DEPTH_FEED_CODE_ASK;
+        let frame = |seq: u64| {
+            (
+                seq,
+                WAL_RECEIPT_UNKNOWN_NANOS,
+                WalEndpoint::MainFeed,
+                bytes::Bytes::from(depth_frame(DEEP_DEPTH_FEED_CODE_ASK, 20)),
+            )
+        };
+        let frames = vec![frame(1), frame(2), frame(3), frame(4)];
+        let out = refold_wal_frames(&mut ingest(), &frames, &[0, 2, 2, 9]);
+        assert_eq!(out.gaps_marked, 2, "indexes 0 and 2, once each");
+        let none = refold_wal_frames(&mut ingest(), &frames, &[]);
+        assert_eq!(none.gaps_marked, 0);
+    }
+
     /// The 2026-09-01 finding: a depth-socket frame in the live-feed WAL was
     /// reported as `unparseable` — a corruption signal — on every replay. It
     /// is now counted as what it is, and NOT as a decode failure.
@@ -23011,7 +23083,7 @@ mod wal_refold_tests {
             WalEndpoint::MainFeed,
             bytes::Bytes::from(depth_frame(DEEP_DEPTH_FEED_CODE_ASK, 20)),
         )];
-        let out = refold_wal_frames(&mut ingest(), &frames);
+        let out = refold_wal_frames(&mut ingest(), &frames, &[]);
         assert_eq!(out.depth_frames, 1, "the frame is a depth frame");
         assert_eq!(out.unparseable, 0, "and it is NOT reported as corruption");
         assert_eq!(out.undecodable, 0);
@@ -23147,7 +23219,7 @@ mod wal_refold_tests {
             bytes::Bytes::from(depth20_wal_packet(13, DEEP_DEPTH_FEED_CODE_BID)),
         )];
         let mut with_sink = ingest().with_inline_depth(DepthIngest::for_test());
-        let out = refold_wal_frames(&mut with_sink, &frames);
+        let out = refold_wal_frames(&mut with_sink, &frames, &[]);
         assert_eq!(
             out.depth_refolded_rows, 20,
             "every level is a row — nothing is sampled"
@@ -23182,7 +23254,7 @@ mod wal_refold_tests {
             WalEndpoint::Depth20,
             bytes::Bytes::from(depth20_wal_packet(13, DEEP_DEPTH_FEED_CODE_BID)),
         )];
-        let out = refold_wal_frames(&mut ingest(), &frames);
+        let out = refold_wal_frames(&mut ingest(), &frames, &[]);
         assert_eq!(
             out.depth_frames, 1,
             "no sink: counted as an un-recovered depth frame"
@@ -23206,7 +23278,7 @@ mod wal_refold_tests {
             bytes::Bytes::from(depth200_wal_packet(72_271, DEEP_DEPTH_FEED_CODE_ASK, 7)),
         )];
         let mut with_sink = ingest().with_inline_depth(DepthIngest::for_test());
-        let out = refold_wal_frames(&mut with_sink, &frames);
+        let out = refold_wal_frames(&mut with_sink, &frames, &[]);
         assert_eq!(out.depth_refolded_rows, 7, "seven rows in, seven rows out");
         assert_eq!(out.depth_refused, 0);
         assert_eq!(out.depth_frames, 0);
@@ -23239,7 +23311,7 @@ mod wal_refold_tests {
         // The LOOP header, not the first "for " in prose — the doc comments above the
         // loop say "for why" and "for exactly" long before any frame is folded.
         let first_frame_work = body
-            .find("\n    for (frame_seq, ")
+            .find("\n    for (frame_idx, (frame_seq, ")
             .expect("the refold loops over frames");
         assert!(
             set < first_frame_work,
@@ -23388,7 +23460,7 @@ mod wal_refold_tests {
             WalEndpoint::MainFeed,
             bytes::Bytes::from(bytes),
         )];
-        let out = refold_wal_frames(&mut ingest(), &frames);
+        let out = refold_wal_frames(&mut ingest(), &frames, &[]);
 
         assert_eq!(out.refolded, 0, "an OI packet carries no tick");
         assert_eq!(out.lost, 0, "and it is NOT a loss");
@@ -23470,7 +23542,7 @@ mod wal_refold_tests {
             bytes::Bytes::from(buf),
         )];
 
-        let without = refold_wal_frames(&mut ingest(), &frames);
+        let without = refold_wal_frames(&mut ingest(), &frames, &[]);
         assert_eq!(
             without.inline_depth_rows, 0,
             "with no inline-depth sink there is nothing to append to"
@@ -23478,7 +23550,7 @@ mod wal_refold_tests {
 
         let mut with_sink = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4)
             .with_inline_depth(DepthIngest::for_test());
-        let with = refold_wal_frames(&mut with_sink, &frames);
+        let with = refold_wal_frames(&mut with_sink, &frames, &[]);
 
         assert_eq!(
             with.inline_depth_rows, 10,
@@ -23516,7 +23588,7 @@ mod wal_refold_tests {
 
     #[test]
     fn test_refold_wal_frames_empty_batch_recovers_nothing() {
-        let out = refold_wal_frames(&mut ingest(), &[]);
+        let out = refold_wal_frames(&mut ingest(), &[], &[]);
         assert_eq!(out, WalRefoldOutcome::default());
     }
 
@@ -23531,7 +23603,7 @@ mod wal_refold_tests {
             WalEndpoint::MainFeed,
             bytes::Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF]),
         )];
-        let out = refold_wal_frames(&mut ingest(), &frames);
+        let out = refold_wal_frames(&mut ingest(), &frames, &[]);
         assert_eq!(out.refolded, 0, "garbage must not produce ticks");
         assert_eq!(
             out.unparseable, 1,
@@ -23550,7 +23622,7 @@ mod wal_refold_tests {
             WalEndpoint::MainFeed,
             bytes::Bytes::from_static(&[2, 0, 0, 0]),
         )];
-        let out = refold_wal_frames(&mut ingest(), &frames);
+        let out = refold_wal_frames(&mut ingest(), &frames, &[]);
         assert_eq!(out.refolded, 0);
         assert!(out.unparseable >= 1, "a truncated packet must be counted");
     }
@@ -23560,7 +23632,7 @@ mod wal_refold_tests {
         // The arithmetic guarantee the operator relies on: a tick is folded
         // XOR lost. If both could increment for one tick, a loss report could
         // be hidden behind a success count.
-        let out = refold_wal_frames(&mut ingest(), &[]);
+        let out = refold_wal_frames(&mut ingest(), &[], &[]);
         assert_eq!(out.refolded, 0);
         assert_eq!(out.lost, 0);
         // Structural: the fold's match arms are disjoint by construction —

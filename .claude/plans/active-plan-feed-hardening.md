@@ -5941,3 +5941,27 @@ Revert the commit; the persisted tables are unchanged.
 Existing `dhan_live_crossverify_daily` columns; `missing_live_zero_volume` already persisted.
 
 Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+## ITEM 47 — DESIGN ADDENDUM (added 2026-09-29, operator: "fix and reosleve vrythignn dude okay?"): a gapped WAL replay rebuilt partial candles that overwrote full ones
+
+Measured on production (read-only): on 2026-09-28 the 1-minute candles of ~696 NSE_EQ stocks at 11:02 summed to -43,032,622 (neighbours ±1-3 million). Security 2885: `candles_1s` 11:02:48 held -733,406 in ONE tick; the stored `candles_1m` 11:02 bar held 13 ticks, open latency 49 s, volume -734,559, while the 1-second bars inside that minute held ~70 ticks. Root cause (read in code, restart confirmed in the logs at 23:44 IST): the boot refold (`dhan_feed_stack::refold_wal_frames`) folds only the UNAPPLIED frames. Segments and frames the applied watermark skipped leave gaps, and the fold carried each instrument's volume baseline across a gap: the first tick after it took the whole skipped span's volume. The rebuilt partial bars then UPSERTed over the complete live rows (candles DEDUP key `ts, security_id, segment, feed`).
+
+- [x] 47a — **The replay says where its gaps are.** `ws_frame_spill::ReplayedFrame` gains `after_gap`: `true` for the first frame of a pass, the first kept frame after a skipped segment, and the first kept frame after frames dropped as already applied. Tests: `test_replay_marks_after_gap_on_first_frame_and_after_skipped_frames`. Impl: `ws_frame_spill.rs` — `ReplayedFrame::after_gap`, `SegmentRead::trailing_gap`, `replay_all_with_report_guarded`.
+- [x] 47b — **No volume across a gap.** `MultiTfAggregator::mark_replay_gap` un-seeds every slot's volume baseline and tick-rule carry and marks every open bucket partial. O(slots), boot/refold path only. Tests: `test_regression_wal_refold_gap_dumps_skipped_volume_into_one_partial_bar`. Impl: `multi_tf_aggregator.rs::mark_replay_gap` + `replay_gap_rebase_pending` → `AggregatorCell::rebase_open_buckets`.
+- [x] 47c — **A partial replay bar never overwrites a full one.** Per slot, two `u16` bitmasks (one bit per timeframe) record whether the open and the last-sealed bucket are partial. While `set_replay_mode(true)` is on, a partial bar's seal or late amendment is suppressed and counted (`tv_candle_refold_partial_suppressed_total`); complete bars between gaps are still emitted. Live mode is unchanged. Tests: `test_mark_replay_gap_complete_bucket_after_gap_is_still_emitted`, `test_mark_replay_gap_live_mode_still_emits_partial_bars`, `test_set_replay_mode_suppresses_amendment_of_a_partial_bar`. Impl: `multi_tf_aggregator.rs::{set_replay_mode, InstrumentSlot::take_open_partial}`, `fold_counters.rs::refold_partial_suppressed`.
+- [x] 47d — **The refold applies it.** `refold_wal_frames(ingest, frames, gaps)` takes the gap indexes, calls `mark_replay_gap` at each, runs the fold in replay mode, and re-seeds once more at the end so the first live tick after boot cannot take the downtime's volume either. Boot and catch-up both pass the gaps. Tests: `test_refold_wal_frames_with_gaps_marks_each_gap`. Impl: `dhan_feed_stack.rs::refold_wal_frames`, `DhanFeedStackParams::wal_replay_gaps`, `main.rs` gap collection.
+
+### Design
+Gaps are carried as a list of frame indexes beside the existing frame list, so the frame tuple every caller and test uses is unchanged. The fold's per-tick cost is one bool read and, only on a seal, two bit operations. `mark_replay_gap` is O(slots) and runs at most once per gap on the boot path.
+### Edge Cases
+A gap before the first frame; two adjacent gaps; a bucket opened by the seeding tick; a catch-up or close seal of a partial bucket; a late amendment of a partial sealed bar; a slot first created during replay; live mode after the refold.
+### Failure Modes
+Undercount, never overcount: after a gap the first bucket loses the seeding tick's own volume and is not written during replay. For a mid-session crash, a bucket that only the refold saw has no candle row (its ticks are in `ticks`); counted, never silent.
+### Test Plan
+The tests named in 47a–47d, plus the aggregator, storage replay and refold suites.
+### Rollback
+Revert the commit. No schema change.
+### Observability
+`tv_candle_refold_partial_suppressed_total` (seeded at 0) and the refold's info line reporting gaps and suppressed bars.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
