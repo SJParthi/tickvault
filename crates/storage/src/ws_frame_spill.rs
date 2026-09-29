@@ -938,6 +938,9 @@ impl WsFrameSpill {
         // its file HERE, before the first sink can persist — otherwise the
         // first in-session persist would overwrite a good snapshot with zeros.
         crate::wal_applied_watermark::applied_watermark().bind(&wal_dir);
+        // The deferred-depth marks (item 45a) sit beside it for the same reason:
+        // a shed frame's segment must stay protected across a restart.
+        crate::wal_deferred_depth::deferred_depth().bind(&wal_dir);
         if disk_high > 0 {
             tracing::debug!(
                 wal_dir = ?wal_dir,
@@ -3694,6 +3697,18 @@ pub struct ArchivePruneOutcome {
     /// so an unknown state never raises the PROVEN-loss ERROR (2026-09-22
     /// hostile review: the kill switch made every byte-pass victim page).
     pub size_deleted_unknown: usize,
+    /// Segments kept by EITHER pass because they hold frames whose depth rows
+    /// the ingest shed skipped and that have not been written back yet
+    /// (2026-09-29, item 45a). Never deleted by age or by bytes: the segment is
+    /// the only copy of those rows.
+    pub deferred_kept: usize,
+    /// Bytes held by `deferred_kept` segments. Not counted against the byte
+    /// ceiling's reach: when the ceiling cannot be met because of them, the
+    /// pass says so loudly rather than deleting the only copy.
+    pub deferred_kept_bytes: u64,
+    /// Pinned segments deleted because free disk fell below the hard floor
+    /// (item 45a) — each one is order-book rows lost, logged as WS-SPILL-02.
+    pub size_deleted_deferred: usize,
 }
 
 /// Counter: segments the ACTIVE byte-ceiling prune deleted while the applied
@@ -3806,6 +3821,31 @@ pub fn prune_archived_segments_at<P: AsRef<Path>>(
         max_bytes,
         now,
         PruneAppliedView::AllApplied,
+        None,
+        false,
+    )
+}
+
+/// [`prune_archived_segments_at`] with the deferred-depth marks (item 45a): a
+/// segment holding shed depth that has not been written back is kept by both
+/// passes. `None` protects nothing (the pre-45a behaviour).
+#[must_use]
+pub fn prune_archived_segments_deferred_at<P: AsRef<Path>>(
+    wal_dir: P,
+    retention_secs: u64,
+    max_bytes: u64,
+    now: std::time::SystemTime,
+    deferred: Option<&crate::wal_deferred_depth::DeferredDepthSnapshot>,
+    disk_below_floor: bool,
+) -> ArchivePruneOutcome {
+    prune_wal_dir_at(
+        &wal_dir.as_ref().join(ARCHIVE_SUBDIR),
+        retention_secs,
+        max_bytes,
+        now,
+        PruneAppliedView::AllApplied,
+        deferred,
+        disk_below_floor,
     )
 }
 
@@ -3892,6 +3932,30 @@ pub fn prune_active_segments_at<P: AsRef<Path>>(
         max_bytes,
         now,
         PruneAppliedView::Watermark(applied),
+        None,
+        false,
+    )
+}
+
+/// [`prune_active_segments_at`] with the deferred-depth marks (item 45a).
+#[must_use]
+pub fn prune_active_segments_deferred_at<P: AsRef<Path>>(
+    wal_dir: P,
+    retention_secs: u64,
+    max_bytes: u64,
+    now: std::time::SystemTime,
+    applied: Option<&crate::wal_applied_watermark::AppliedSnapshot>,
+    deferred: Option<&crate::wal_deferred_depth::DeferredDepthSnapshot>,
+    disk_below_floor: bool,
+) -> ArchivePruneOutcome {
+    prune_wal_dir_at(
+        wal_dir.as_ref(),
+        retention_secs,
+        max_bytes,
+        now,
+        PruneAppliedView::Watermark(applied),
+        deferred,
+        disk_below_floor,
     )
 }
 
@@ -3906,14 +3970,41 @@ fn segment_applied_states(
 ) -> Vec<(SegmentAppliedState, u64, Option<u64>)> {
     // O(1) EXEMPT: periodic cold prune, one entry per segment
     match view {
-        PruneAppliedView::AllApplied => sorted
-            .iter()
-            .map(|_| (SegmentAppliedState::Applied, 0, None))
-            .collect(), // APPROVED: cold prune pass
-        PruneAppliedView::Watermark(None) => sorted
-            .iter()
-            .map(|_| (SegmentAppliedState::Unknown, 0, None))
-            .collect(), // APPROVED: cold prune pass
+        // `archive/` segments are applied by construction, but their RANGES
+        // are still read (2026-09-29, item 45a): a boot archives a segment the
+        // watermark has passed WITHOUT reading it, and a segment holding shed
+        // depth is exactly that, so the deferred-depth check needs its range.
+        PruneAppliedView::AllApplied => {
+            let firsts: Vec<u64> = sorted
+                .iter()
+                .map(|p| first_frame_seq_in_segment(p))
+                .collect(); // APPROVED: cold prune pass
+            firsts
+                .iter()
+                .enumerate()
+                .map(|(idx, &lo)| {
+                    let hi = firsts.get(idx + 1).and_then(|n| n.checked_sub(1));
+                    (SegmentAppliedState::Applied, lo, hi)
+                })
+                .collect() // APPROVED: cold prune pass
+        }
+        // No usable watermark: every segment is `Unknown`, but the ranges are
+        // still read (item 45a) so a deferred-depth mark keeps only the
+        // segments it covers, not the whole directory.
+        PruneAppliedView::Watermark(None) => {
+            let firsts: Vec<u64> = sorted
+                .iter()
+                .map(|p| first_frame_seq_in_segment(p))
+                .collect(); // APPROVED: cold prune pass
+            firsts
+                .iter()
+                .enumerate()
+                .map(|(idx, &lo)| {
+                    let hi = firsts.get(idx + 1).and_then(|n| n.checked_sub(1));
+                    (SegmentAppliedState::Unknown, lo, hi)
+                })
+                .collect() // APPROVED: cold prune pass
+        }
         PruneAppliedView::Watermark(Some(snap)) => {
             let firsts: Vec<u64> = sorted
                 .iter()
@@ -3959,6 +4050,8 @@ fn prune_wal_dir_at(
     max_bytes: u64,
     now: std::time::SystemTime,
     view: PruneAppliedView<'_>,
+    deferred: Option<&crate::wal_deferred_depth::DeferredDepthSnapshot>,
+    disk_below_floor: bool,
 ) -> ArchivePruneOutcome {
     let archive_dir = dir.to_path_buf();
     let mut outcome = ArchivePruneOutcome::default();
@@ -3990,6 +4083,9 @@ fn prune_wal_dir_at(
     // rule. Cold path — one allocation per prune pass, never the per-frame
     // append.
     let mut survivors: Vec<PruneSurvivor> = Vec::with_capacity(ARCHIVE_PRUNE_SURVIVOR_HINT);
+    // Segments pinned by deferred-depth marks (item 45a): never a byte
+    // candidate, taken only below the hard disk floor.
+    let mut pinned: Vec<PruneSurvivor> = Vec::with_capacity(ARCHIVE_PRUNE_SURVIVOR_HINT);
     let cutoff = std::time::Duration::from_secs(retention_secs);
     for ((path, meta), &(state, first_seq, last_seq)) in segments.into_iter().zip(states.iter()) {
         // NEVER the segment the writer currently holds open (2026-09-06).
@@ -4020,6 +4116,32 @@ fn prune_wal_dir_at(
         // six-hourly cold path.
         if is_open_segment(&path) {
             outcome.kept += 1;
+            continue;
+        }
+        // Shed depth not yet written back (2026-09-29, item 45a): this segment
+        // is the only copy of those rows. Kept by the age pass and by the
+        // byte pass — except below the hard disk floor, see after the byte
+        // pass. A segment whose start could not be read (`first_seq` 0) is
+        // kept whenever any mark exists: deleting on uncertainty would be the
+        // wrong default here too.
+        let hi = if first_seq == 0 { None } else { last_seq };
+        if deferred.is_some_and(|d| d.range_is_deferred(first_seq, hi)) {
+            outcome.kept += 1;
+            outcome.deferred_kept += 1;
+            let len = meta.as_ref().map_or(0, Metadata::len);
+            outcome.deferred_kept_bytes = outcome.deferred_kept_bytes.saturating_add(len);
+            pinned.push(PruneSurvivor {
+                mtime: meta
+                    .as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .unwrap_or(std::time::UNIX_EPOCH),
+                len,
+                path,
+                aged: false,
+                state,
+                first_seq,
+                last_seq,
+            });
             continue;
         }
         let mtime = meta.as_ref().and_then(|m| m.modified().ok());
@@ -4078,11 +4200,20 @@ fn prune_wal_dir_at(
     // counted and logged by name instead.
     //
     // Cold path, runs on the periodic prune task — never the per-frame append.
-    let total: u64 = survivors.iter().map(|s| s.len).sum();
+    // Pinned (deferred-depth) bytes COUNT toward the ceiling (item 45a), so
+    // ordinary segments go first to make room for them; they are just never
+    // taken by this loop.
+    let total: u64 = survivors
+        .iter()
+        .map(|s| s.len)
+        .sum::<u64>()
+        .saturating_add(outcome.deferred_kept_bytes);
     outcome.bytes_after = total;
     if total > max_bytes {
         // O(1) EXEMPT: periodic cold archive prune, never the per-frame append
-        survivors.sort_by_key(|s| s.mtime);
+        // Already-applied segments first, then oldest first (item 45a):
+        // an applied segment is a redundant copy, an unapplied one is not.
+        survivors.sort_by_key(|s| (s.state != SegmentAppliedState::Applied, s.mtime));
         let mut remaining = total;
         for s in &survivors {
             if remaining <= max_bytes {
@@ -4176,6 +4307,70 @@ fn prune_wal_dir_at(
              re-derive it against measured volume."
         );
     }
+    // Item 45a, THE HARD FLOOR. Segments holding shed depth are kept over the
+    // byte ceiling — but not over a disk about to fill. A full volume stops
+    // the WAL writer and the database together, and then TICKS are lost, not
+    // just order-book rows. So only when the caller has measured free space
+    // below the floor are pinned segments taken, oldest first, each one a
+    // coded, counted loss. Everything above the floor keeps them.
+    if disk_below_floor && outcome.bytes_after > max_bytes && !pinned.is_empty() {
+        // O(1) EXEMPT: cold prune pass, pinned segments only
+        pinned.sort_by_key(|s| s.mtime);
+        let mut remaining = outcome.bytes_after;
+        for s in &pinned {
+            if remaining <= max_bytes {
+                break;
+            }
+            match std::fs::remove_file(&s.path) {
+                Ok(()) => {
+                    remaining = remaining.saturating_sub(s.len);
+                    outcome.size_deleted += 1;
+                    outcome.size_deleted_deferred += 1;
+                    outcome.size_deleted_bytes = outcome.size_deleted_bytes.saturating_add(s.len);
+                    outcome.deferred_kept = outcome.deferred_kept.saturating_sub(1);
+                    outcome.deferred_kept_bytes = outcome.deferred_kept_bytes.saturating_sub(s.len);
+                    outcome.kept = outcome.kept.saturating_sub(1);
+                    error!(
+                        code = ErrorCode::WsSpill02FrameDropped.code_str(),
+                        source = "deferred_depth_deleted_under_disk_floor",
+                        segment = %s.path.display(),
+                        first_frame_seq = s.first_seq,
+                        bytes = s.len,
+                        "the disk is nearly full, so a WAL segment holding order-book rows \
+                         skipped under load was DELETED before they were written back — those \
+                         rows are lost. Taken only to keep ticks and the database alive."
+                    );
+                }
+                Err(err) => {
+                    remaining = remaining.saturating_sub(s.len);
+                    outcome.failed += 1;
+                    warn!(
+                        path = %s.path.display(),
+                        error = %err,
+                        "WAL floor prune: remove_file failed on a pinned segment"
+                    );
+                }
+            }
+        }
+        outcome.bytes_after = remaining;
+    }
+    // Pinned segments alone keeping the directory over its ceiling: the disk
+    // is being held for rows not yet written back. Said loudly, with the
+    // numbers; the after-close pass drains them and the disk alarms page if
+    // it cannot keep up.
+    if outcome.deferred_kept_bytes > 0 && outcome.bytes_after > max_bytes {
+        error!(
+            code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+            source = "deferred_depth_pinned_over_ceiling",
+            dir = %dir.display(),
+            deferred_segments = outcome.deferred_kept,
+            deferred_bytes = outcome.deferred_kept_bytes,
+            max_bytes,
+            "WAL directory is over its byte ceiling because of segments that hold order-book \
+             rows skipped under load and not yet written back. They are kept, not deleted. \
+             If the after-close pass cannot drain them, disk space will keep shrinking."
+        );
+    }
     outcome
 }
 
@@ -4199,12 +4394,18 @@ pub fn prune_archived_segments<P: AsRef<Path>>(
     retention_secs: u64,
     max_bytes: u64,
 ) -> ArchivePruneOutcome {
-    let outcome = prune_archived_segments_at(
+    // Item 45a: a segment holding shed depth not yet written back is kept.
+    let deferred = crate::wal_deferred_depth::prune_view(wal_dir.as_ref());
+    let below_floor = wal_disk_below_floor(wal_dir.as_ref());
+    let outcome = prune_archived_segments_deferred_at(
         wal_dir,
         retention_secs,
         max_bytes,
         std::time::SystemTime::now(),
+        Some(&deferred),
+        below_floor,
     );
+    publish_deferred_kept("archive", outcome.deferred_kept);
     if outcome.deleted > 0 || outcome.failed > 0 {
         metrics::counter!("tv_ws_wal_archive_pruned_total").increment(outcome.deleted as u64);
         info!(
@@ -4216,6 +4417,43 @@ pub fn prune_archived_segments<P: AsRef<Path>>(
         );
     }
     outcome
+}
+
+/// Gauge: segments a prune pass kept because they hold shed depth that has
+/// not been written back yet (item 45a), per directory.
+pub const WAL_DEFERRED_KEPT_GAUGE: &str = "tv_wal_deferred_depth_kept_segments";
+
+/// Free-space fraction below which segments pinned by deferred-depth marks
+/// may be taken by the byte pass (item 45a). Five percent: well under the
+/// ingest shed's own thresholds, so the shed and the retention ladder act
+/// first and this is the last step before a full volume.
+pub const WAL_PINNED_DISK_FLOOR_FREE_FRACTION: f64 = 0.05;
+
+/// Whether the volume holding `wal_dir` has less free space than
+/// [`WAL_PINNED_DISK_FLOOR_FREE_FRACTION`]. A failed probe reads as NOT below
+/// the floor: an unmeasured disk never justifies deleting the only copy.
+/// Cold prune path: one `df`.
+#[must_use]
+pub fn wal_disk_below_floor(wal_dir: &Path) -> bool {
+    match crate::disk_health_watcher::probe_disk_free_bytes(wal_dir) {
+        crate::disk_health_watcher::DiskHealthOutcome::Ok {
+            free_bytes,
+            total_bytes,
+        } if total_bytes > 0 => {
+            // APPROVED: cast — byte counts far below f64 precision loss that matters.
+            #[allow(clippy::cast_precision_loss)] // APPROVED: ratio of byte counts
+            let free = free_bytes as f64 / total_bytes as f64;
+            free < WAL_PINNED_DISK_FLOOR_FREE_FRACTION
+        }
+        _ => false,
+    }
+}
+
+/// Publishes [`WAL_DEFERRED_KEPT_GAUGE`] for one directory. Cold prune path.
+fn publish_deferred_kept(dir: &'static str, kept: usize) {
+    // APPROVED: cast — a per-pass segment count, far below f64 precision.
+    #[allow(clippy::cast_precision_loss)] // APPROVED: segment count
+    metrics::gauge!(WAL_DEFERRED_KEPT_GAUGE, "dir" => dir).set(kept as f64);
 }
 
 /// Wall-clock wrapper over [`prune_active_segments_at`]. Cold path — called
@@ -4236,13 +4474,18 @@ pub fn prune_active_segments<P: AsRef<Path>>(
     } else {
         None
     };
-    let outcome = prune_active_segments_at(
+    // Item 45a: a segment holding shed depth not yet written back is kept.
+    let deferred = crate::wal_deferred_depth::prune_view(wal_dir);
+    let outcome = prune_active_segments_deferred_at(
         wal_dir,
         retention_secs,
         max_bytes,
         std::time::SystemTime::now(),
         applied.as_ref(),
+        Some(&deferred),
+        wal_disk_below_floor(wal_dir),
     );
+    publish_deferred_kept("active", outcome.deferred_kept);
     // Unconditional, possibly zero: creates the series on the first pass so
     // the first real unapplied deletion is not swallowed as a baseline.
     // APPROVED: cast — a per-pass segment count, always <= u64.
@@ -4444,6 +4687,170 @@ fn replay_segment_filtered(
     path: &Path,
     applied: Option<&crate::wal_applied_watermark::AppliedSnapshot>,
 ) -> anyhow::Result<(Vec<ReplayedFrame>, u64)> {
+    replay_segment_core(path, applied, &|_, _| true, true)
+        .map(|read| (read.frames, read.dropped_as_applied))
+}
+
+/// One WAL segment and the capture-sequence range it holds, for the
+/// after-close deferred-depth pass (item 45a).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentSpan {
+    pub path: PathBuf,
+    /// First frame sequence; `0` when the first record could not be read.
+    pub lo: u64,
+    /// The next segment's first sequence minus one; `None` for the newest
+    /// segment or an unreadable successor.
+    pub hi: Option<u64>,
+    /// The writer still holds this segment open.
+    pub is_open: bool,
+}
+
+/// Every `*.wal` segment in the active directory, `replaying/` and
+/// `archive/`, in capture order (file-name order is capture order), with its
+/// sequence range. The open segment IS listed — flagged — because it still
+/// bounds its predecessor's range. Cold path: one verified header read per
+/// segment.
+///
+/// # Errors
+/// Any failure to list the ACTIVE directory, or a subdirectory for any reason
+/// other than not existing. A partial listing must never read as "those
+/// segments are gone": the caller would then treat marked rows as lost and
+/// clear their protection while the segments are still on disk.
+pub fn deferred_segment_spans(wal_dir: &Path) -> std::io::Result<Vec<SegmentSpan>> {
+    let mut paths: Vec<PathBuf> = Vec::with_capacity(ARCHIVE_PRUNE_SURVIVOR_HINT);
+    // O(1) EXEMPT: cold after-close listing, bounded by the segments on disk
+    for dir in [
+        wal_dir.to_path_buf(),
+        wal_dir.join(REPLAYING_SUBDIR),
+        wal_dir.join(ARCHIVE_SUBDIR),
+    ] {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound && dir != wal_dir => continue,
+            Err(err) => return Err(err),
+        };
+        for entry in entries {
+            let entry = entry?;
+            // Regular files only: a FIFO or device named `*.wal` would hang
+            // the header read.
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("wal") {
+                paths.push(path);
+            }
+        }
+    }
+    paths.sort_by(|a, b| a.file_name().cmp(&b.file_name())); // O(1) EXEMPT: cold listing
+    let firsts: Vec<u64> = paths
+        .iter()
+        .map(|p| first_frame_seq_in_segment(p))
+        .collect(); // APPROVED: cold listing
+    let nexts = firsts
+        .iter()
+        .skip(1)
+        .map(|&n| n.checked_sub(1))
+        .chain(std::iter::once(None));
+    Ok(paths
+        .into_iter()
+        .zip(firsts.iter().copied())
+        .zip(nexts)
+        .map(|((path, lo), hi)| SegmentSpan {
+            is_open: is_open_segment(&path),
+            path,
+            lo,
+            hi,
+        })
+        .collect()) // APPROVED: cold listing
+}
+
+/// Which segments hold frames of capture bucket `bucket_id` (shift
+/// `wal_deferred_depth::DEFERRED_BUCKET_SHIFT`), and whether the answer is
+/// complete. Cold path.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct BucketSegments {
+    pub paths: Vec<PathBuf>,
+    /// A segment still open for writing may hold more of this bucket.
+    pub touches_open: bool,
+    /// A segment whose first record is unreadable sits where it could hold
+    /// this bucket, so no set of readable segments can be called complete.
+    pub uncertain: bool,
+}
+
+/// See [`BucketSegments`].
+#[must_use]
+pub fn segments_for_bucket(spans: &[SegmentSpan], bucket_id: u64) -> BucketSegments {
+    let shift = crate::wal_deferred_depth::DEFERRED_BUCKET_SHIFT;
+    let mut out = BucketSegments::default();
+    // The start of the last readable segment seen, so an unreadable one can be
+    // placed between its neighbours.
+    let mut prev_lo_id: u64 = 0;
+    // O(1) EXEMPT: cold after-close lookup, one pass over the listing
+    for (idx, span) in spans.iter().enumerate() {
+        if span.lo == 0 {
+            let next_lo_id = spans
+                .get(idx + 1..)
+                .and_then(|rest| rest.iter().find(|s| s.lo != 0))
+                .map_or(u64::MAX, |s| s.lo >> shift);
+            if (prev_lo_id..=next_lo_id).contains(&bucket_id) {
+                out.uncertain = true;
+            }
+            continue;
+        }
+        let lo_id = span.lo >> shift;
+        prev_lo_id = lo_id;
+        let covers = lo_id <= bucket_id && span.hi.is_none_or(|hi| bucket_id <= hi >> shift);
+        if covers {
+            if span.is_open {
+                out.touches_open = true;
+            } else {
+                out.paths.push(span.path.clone());
+            }
+        }
+    }
+    out
+}
+
+/// What one CRC-verified walk of a segment produced.
+#[derive(Debug)]
+pub struct SegmentRead {
+    /// Frames that passed the applied filter AND the caller's `keep`.
+    pub frames: Vec<ReplayedFrame>,
+    /// Frames skipped because the watermark says they are applied.
+    pub dropped_as_applied: u64,
+    /// The walk stopped before the end on a bad record, or the segment is
+    /// unreadable by this binary. A torn TAIL is not damage: it is what an
+    /// interrupted writer leaves and abandons nothing beyond itself.
+    pub damaged: bool,
+}
+
+/// Reads the frames of ONE segment whose `(frame_seq, endpoint)` satisfies
+/// `keep`, without moving the file and without the replay's corruption
+/// accounting (the caller reports damage in its own terms). Used by the
+/// after-close deferred-depth pass (item 45a). Cold path: reads the whole
+/// file, returns only the kept frames.
+///
+/// # Errors
+/// The file could not be opened or read.
+pub fn read_segment_frames_matching(
+    path: &Path,
+    keep: &dyn Fn(u64, WalEndpoint) -> bool,
+) -> anyhow::Result<SegmentRead> {
+    replay_segment_core(path, None, keep, false)
+}
+
+/// The shared walk behind [`replay_segment_filtered`] and
+/// [`read_segment_frames_matching`]. `report_corruption` is `false` only for
+/// the deferred-depth pass, whose segments are NOT moved to the archive on
+/// damage — the replay's log text would say otherwise.
+fn replay_segment_core(
+    path: &Path,
+    applied: Option<&crate::wal_applied_watermark::AppliedSnapshot>,
+    keep: &dyn Fn(u64, WalEndpoint) -> bool,
+    report_corruption: bool,
+) -> anyhow::Result<SegmentRead> {
+    let mut unreadable = false;
     let mut dropped_as_applied = 0u64;
     let mut f = File::open(path)?;
     let mut buf = Vec::new(); // APPROVED: boot-time WAL replay, cold path
@@ -4485,6 +4892,7 @@ fn replay_segment_filtered(
             // manual recovery with the newer binary remains possible. That is
             // the reason this is loud-and-counted rather than fail-closed.
             if i == 0 {
+                unreadable = true;
                 metrics::counter!("tv_wal_replay_unknown_magic_total").increment(1);
                 error!(
                     code = ErrorCode::WsSpill02FrameDropped.code_str(),
@@ -4684,6 +5092,10 @@ fn replay_segment_filtered(
             i = record_end;
             continue;
         }
+        if !keep(frame_seq, endpoint) {
+            i = record_end;
+            continue;
+        }
         out.push(ReplayedFrame {
             ws_type,
             frame,
@@ -4732,7 +5144,8 @@ fn replay_segment_filtered(
     // Bytes, not records: the record count of undecodable bytes is unknowable,
     // and a fabricated number inside a counter that exists to stop fabrication
     // is worse than no number.
-    if let Some((reason, offset)) = corrupted_at {
+    let damaged = unreadable || corrupted_at.is_some();
+    if report_corruption && let Some((reason, offset)) = corrupted_at {
         let abandoned = buf.len().saturating_sub(offset);
         metrics::counter!(WAL_REPLAY_TRUNCATED_SEGMENTS_COUNTER).increment(1);
         metrics::counter!(WAL_REPLAY_ABANDONED_BYTES_COUNTER).increment(abandoned as u64);
@@ -4749,7 +5162,11 @@ fn replay_segment_filtered(
              inspection, but nothing will read them again automatically."
         );
     }
-    Ok((out, dropped_as_applied))
+    Ok(SegmentRead {
+        frames: out,
+        dropped_as_applied,
+        damaged,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -8601,6 +9018,298 @@ mod tests {
             "a is applied and aged; b is the newest (unknown)"
         );
         assert!(!a.exists() && b.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A deferred-depth marks table holding one shed frame at `seq`.
+    fn deferred_at(seq: u64) -> crate::wal_deferred_depth::DeferredDepthSnapshot {
+        let d = crate::wal_deferred_depth::DeferredDepth::new_for_tests();
+        d.note_shed(seq, crate::wal_deferred_depth::ShedDepth::Inline);
+        d.snapshot()
+    }
+
+    /// Item 45a: a segment holding shed depth that has not been written back
+    /// is the only copy of those rows. Neither the age pass nor the byte pass
+    /// may delete it, even when it is applied, aged and over the ceiling.
+    #[test]
+    fn deferred_mark_keeps_the_segment_from_both_prunes() {
+        let dir = tmp_dir("deferred-active");
+        let now = SystemTime::now();
+        let a = write_wm_segment(&dir, 0, 3, WalEndpoint::MainFeed);
+        let b = write_wm_segment(&dir, 1_000, 3, WalEndpoint::MainFeed);
+        let c = write_wm_segment(&dir, 2_000, 3, WalEndpoint::MainFeed);
+        let d = write_wm_segment(&dir, 3_000, 3, WalEndpoint::MainFeed);
+        for p in [&a, &b, &c, &d] {
+            backdate(p, now, 400_000);
+        }
+        let applied = all_applied_through(wm_seq(5_000));
+        let deferred = deferred_at(wm_seq(1_500)); // inside B only
+
+        let age = prune_active_segments_deferred_at(
+            &dir,
+            172_800,
+            u64::MAX,
+            now,
+            Some(&applied),
+            Some(&deferred),
+            false,
+        );
+        assert!(
+            !a.exists() && !c.exists(),
+            "applied, aged, not deferred: expired"
+        );
+        assert!(b.exists(), "B holds shed depth: the age pass must keep it");
+        assert_eq!(age.deferred_kept, 1);
+
+        let bytes = prune_active_segments_deferred_at(
+            &dir,
+            172_800,
+            0,
+            now,
+            Some(&applied),
+            Some(&deferred),
+            false,
+        );
+        assert!(
+            b.exists(),
+            "the byte ceiling must not reach a deferred segment either"
+        );
+        assert!(
+            !d.exists(),
+            "an undeferred survivor is still the byte pass's to take"
+        );
+        assert_eq!(bytes.deferred_kept, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Below the hard disk floor, pinned segments are the last to go — after
+    /// every ordinary segment — and each one is counted as a loss.
+    #[test]
+    fn below_the_disk_floor_pinned_segments_go_last_and_are_counted() {
+        let dir = tmp_dir("deferred-floor");
+        let now = SystemTime::now();
+        let a = write_wm_segment(&dir, 0, 3, WalEndpoint::MainFeed);
+        let b = write_wm_segment(&dir, 1_000, 3, WalEndpoint::MainFeed);
+        let c = write_wm_segment(&dir, 2_000, 3, WalEndpoint::MainFeed);
+        let _open_ended = write_wm_segment(&dir, 3_000, 3, WalEndpoint::MainFeed);
+        let applied = all_applied_through(wm_seq(5_000));
+        let deferred = deferred_at(wm_seq(100)); // A, the OLDEST, is pinned
+        let one = std::fs::metadata(&a).unwrap().len();
+
+        // Above the floor: the ceiling cannot take A, so it takes B and C and
+        // reports the pinned bytes.
+        let above = prune_active_segments_deferred_at(
+            &dir,
+            172_800,
+            one,
+            now,
+            Some(&applied),
+            Some(&deferred),
+            false,
+        );
+        assert!(a.exists(), "pinned: kept above the floor");
+        assert!(
+            !b.exists() && !c.exists(),
+            "ordinary segments go first, oldest first"
+        );
+        assert_eq!(above.size_deleted_deferred, 0);
+
+        // Below the floor with the ceiling at zero: A goes too, counted.
+        let below = prune_active_segments_deferred_at(
+            &dir,
+            172_800,
+            0,
+            now,
+            Some(&applied),
+            Some(&deferred),
+            true,
+        );
+        assert!(!a.exists(), "below the floor the pinned segment is taken");
+        assert_eq!(below.size_deleted_deferred, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bite test: the same directory with no marks loses B. Proves the test
+    /// above is not vacuous.
+    #[test]
+    fn without_a_deferred_mark_the_same_segment_is_pruned() {
+        let dir = tmp_dir("deferred-none");
+        let now = SystemTime::now();
+        let a = write_wm_segment(&dir, 0, 3, WalEndpoint::MainFeed);
+        let b = write_wm_segment(&dir, 1_000, 3, WalEndpoint::MainFeed);
+        let c = write_wm_segment(&dir, 2_000, 3, WalEndpoint::MainFeed);
+        for p in [&a, &b, &c] {
+            backdate(p, now, 400_000);
+        }
+        let applied = all_applied_through(wm_seq(5_000));
+        let empty = crate::wal_deferred_depth::DeferredDepthSnapshot::default();
+        let out = prune_active_segments_deferred_at(
+            &dir,
+            172_800,
+            u64::MAX,
+            now,
+            Some(&applied),
+            Some(&empty),
+            false,
+        );
+        assert!(!b.exists(), "no mark: B is applied and aged, so it expires");
+        assert_eq!(out.deferred_kept, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With no usable applied watermark the ranges are still read, so a mark
+    /// keeps only the segment it covers — not the whole directory.
+    #[test]
+    fn a_deferred_mark_without_a_watermark_keeps_only_its_own_segment() {
+        let dir = tmp_dir("deferred-no-wm");
+        let now = SystemTime::now();
+        let a = write_wm_segment(&dir, 0, 3, WalEndpoint::MainFeed);
+        let b = write_wm_segment(&dir, 1_000, 3, WalEndpoint::MainFeed);
+        let c = write_wm_segment(&dir, 2_000, 3, WalEndpoint::MainFeed);
+        let deferred = deferred_at(wm_seq(1_500));
+        let out =
+            prune_active_segments_deferred_at(&dir, 172_800, 0, now, None, Some(&deferred), false);
+        assert!(b.exists(), "B is deferred");
+        assert!(
+            !a.exists() && !c.exists(),
+            "the byte pass still bounds the rest"
+        );
+        assert_eq!(out.deferred_kept, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A boot archives a segment the watermark has passed WITHOUT reading it,
+    /// and a shed segment is exactly that. The archive prune must honour the
+    /// mark as well.
+    #[test]
+    fn the_archive_prune_keeps_a_deferred_segment() {
+        let dir = tmp_dir("deferred-archive");
+        let archive = dir.join(ARCHIVE_SUBDIR);
+        std::fs::create_dir_all(&archive).unwrap();
+        let now = SystemTime::now();
+        let a = write_wm_segment(&archive, 0, 3, WalEndpoint::MainFeed);
+        let b = write_wm_segment(&archive, 1_000, 3, WalEndpoint::MainFeed);
+        let c = write_wm_segment(&archive, 2_000, 3, WalEndpoint::MainFeed);
+        for p in [&a, &b, &c] {
+            backdate(p, now, 400_000);
+        }
+        let deferred = deferred_at(wm_seq(1_500));
+        let out =
+            prune_archived_segments_deferred_at(&dir, 172_800, 0, now, Some(&deferred), false);
+        assert!(b.exists(), "deferred: kept in archive/ too");
+        assert!(!a.exists() && !c.exists());
+        assert_eq!(out.deferred_kept, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The pass lists every directory a shed segment can be in, in capture
+    /// order, with each segment bounded by its successor.
+    #[test]
+    fn deferred_spans_order_across_active_replaying_archive() {
+        let dir = tmp_dir("spans");
+        let archive = dir.join(ARCHIVE_SUBDIR);
+        let replaying = dir.join(REPLAYING_SUBDIR);
+        std::fs::create_dir_all(&archive).unwrap();
+        std::fs::create_dir_all(&replaying).unwrap();
+        let a = write_wm_segment(&archive, 0, 3, WalEndpoint::MainFeed);
+        let b = write_wm_segment(&replaying, 1_000, 3, WalEndpoint::Depth20);
+        let c = write_wm_segment(&dir, 2_000, 3, WalEndpoint::MainFeed);
+        let spans = deferred_segment_spans(&dir).expect("listable");
+        let paths: Vec<&PathBuf> = spans.iter().map(|s| &s.path).collect();
+        assert_eq!(paths, vec![&a, &b, &c]);
+        assert_eq!(spans[0].lo, wm_seq(0));
+        assert_eq!(spans[0].hi, Some(wm_seq(1_000) - 1));
+        assert_eq!(spans[2].hi, None, "the newest segment is open-ended");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A bucket maps to exactly the segments that can hold it.
+    #[test]
+    fn segments_for_bucket_finds_only_the_covering_segments() {
+        let dir = tmp_dir("bucket-segs");
+        let a = write_wm_segment(&dir, 0, 3, WalEndpoint::MainFeed);
+        let b = write_wm_segment(&dir, 1_000, 3, WalEndpoint::MainFeed);
+        let _c = write_wm_segment(&dir, 2_000, 3, WalEndpoint::MainFeed);
+        let spans = deferred_segment_spans(&dir).expect("listable");
+        let shift = crate::wal_deferred_depth::DEFERRED_BUCKET_SHIFT;
+        let in_b = segments_for_bucket(&spans, wm_seq(1_500) >> shift);
+        assert_eq!(in_b.paths, vec![b.clone()]);
+        assert!(!in_b.touches_open && !in_b.uncertain);
+        let in_a = segments_for_bucket(&spans, wm_seq(100) >> shift);
+        assert_eq!(in_a.paths, vec![a]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unreadable segment between two readable ones makes every bucket in
+    /// that gap uncertain — no answer may be called complete.
+    #[test]
+    fn an_unreadable_segment_makes_its_neighbourhood_uncertain() {
+        let dir = tmp_dir("bucket-uncertain");
+        let _a = write_wm_segment(&dir, 0, 3, WalEndpoint::MainFeed);
+        std::fs::write(dir.join("ws-frames-01780000001500000000.wal"), b"garbage").unwrap();
+        let _c = write_wm_segment(&dir, 2_000, 3, WalEndpoint::MainFeed);
+        let spans = deferred_segment_spans(&dir).expect("listable");
+        let shift = crate::wal_deferred_depth::DEFERRED_BUCKET_SHIFT;
+        assert!(segments_for_bucket(&spans, wm_seq(1_600) >> shift).uncertain);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The pass's reader keeps only what it asks for and never moves the file.
+    #[test]
+    fn read_segment_frames_matching_filters_and_never_moves_the_segment() {
+        let dir = tmp_dir("read-matching");
+        let seg = write_wm_segment(&dir, 0, 5, WalEndpoint::Depth20);
+        let want = wm_seq(2);
+        let read = read_segment_frames_matching(&seg, &|seq, ep| {
+            seq == want && ep == WalEndpoint::Depth20
+        })
+        .expect("readable");
+        assert_eq!(read.frames.len(), 1);
+        assert_eq!(read.frames[0].frame_seq, want);
+        assert!(!read.damaged);
+        assert!(seg.exists(), "the segment stays where it was");
+        let none =
+            read_segment_frames_matching(&seg, &|_, ep| ep == WalEndpoint::MainFeed).unwrap();
+        assert!(none.frames.is_empty(), "endpoint filter applies");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Damage mid-file is reported to the caller.
+    #[test]
+    fn read_segment_frames_matching_reports_damage() {
+        let dir = tmp_dir("read-damaged");
+        let seg = write_wm_segment(&dir, 0, 3, WalEndpoint::MainFeed);
+        let mut bytes = std::fs::read(&seg).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        std::fs::write(&seg, &bytes).unwrap();
+        let read = read_segment_frames_matching(&seg, &|_, _| true).unwrap();
+        assert!(read.damaged);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An overflowed marks table cannot say which frames it lost, so every
+    /// segment is kept — the failure direction is "keep more".
+    #[test]
+    fn an_overflowed_marks_table_keeps_every_segment() {
+        let dir = tmp_dir("deferred-overflow");
+        let now = SystemTime::now();
+        let a = write_wm_segment(&dir, 0, 3, WalEndpoint::MainFeed);
+        let b = write_wm_segment(&dir, 1_000, 3, WalEndpoint::MainFeed);
+        let mut deferred = crate::wal_deferred_depth::DeferredDepthSnapshot::default();
+        deferred.overflowed = true;
+        deferred.overflow_high_seq = u64::MAX;
+        let out = prune_active_segments_deferred_at(
+            &dir,
+            172_800,
+            0,
+            now,
+            Some(&all_applied_through(wm_seq(5_000))),
+            Some(&deferred),
+            false,
+        );
+        assert!(a.exists() && b.exists());
+        assert_eq!(out.size_deleted, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

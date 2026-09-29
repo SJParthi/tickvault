@@ -327,7 +327,7 @@ impl AppliedSnapshot {
 /// path, or the path as given when it cannot be canonicalised (a directory
 /// that does not exist yet has no file to load anyway). Never `0`, so an
 /// unbound snapshot can never match a real directory by accident.
-fn dir_tag_of(wal_dir: &Path) -> u64 {
+pub(crate) fn dir_tag_of(wal_dir: &Path) -> u64 {
     let canonical = std::fs::canonicalize(wal_dir).unwrap_or_else(|_| wal_dir.to_path_buf()); // APPROVED: boot-time bind, cold path
     let bytes = canonical.as_os_str().as_encoded_bytes();
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -845,16 +845,20 @@ impl AppliedWatermark {
 /// path is never followed — `O_EXCL` fails on an existing symlink rather than
 /// writing through it. A stale tmp from a crashed persist is removed first;
 /// it holds nothing the live file does not.
-fn write_fresh(tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_fresh(tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
     drop(std::fs::remove_file(tmp)); // APPROVED: once-a-second persist, sink thread, cold path
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(tmp)?; // APPROVED: once-a-second persist, sink thread, cold path
-    file.write_all(bytes)
+    file.write_all(bytes)?;
+    // Durable BEFORE the caller renames it over the live file: without this a
+    // host crash can keep the rename and lose the data, leaving a file that
+    // loads as rejected (2026-09-29, item 45a security review).
+    file.sync_all()
 }
 
-fn wall_nanos() -> u64 {
+pub(crate) fn wall_nanos() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
@@ -881,7 +885,7 @@ const CRC32_TABLE: [u32; 256] = {
     table
 };
 
-fn crc32_ieee(bytes: &[u8]) -> u32 {
+pub(crate) fn crc32_ieee(bytes: &[u8]) -> u32 {
     let mut c: u32 = 0xFFFF_FFFF;
     for &b in bytes {
         c = CRC32_TABLE[((c ^ u32::from(b)) & 0xFF) as usize] ^ (c >> 8);

@@ -82,6 +82,11 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
+
+// Item 45a (2026-09-29): the after-close pass that writes back order-book rows
+// the ingest shed skipped. A child module so it reuses the drain's own packet
+// walk and depth writers rather than a second copy of either.
+mod deferred_depth_pass;
 use std::time::Instant;
 
 use secrecy::ExposeSecret;
@@ -7031,6 +7036,10 @@ async fn run_frame_drain(
                             // the capture.
                             Some(_) if !INGEST_SHED.allows_dedicated_depth() => {
                                 c.shed_dedicated_depth.increment(1);
+                                // Item 45a: keep this frame's segment until the
+                                // after-close pass writes its depth back.
+                                tickvault_storage::wal_deferred_depth::deferred_depth()
+                                    .note_shed(frame.seq, tickvault_storage::wal_deferred_depth::ShedDepth::Dedicated);
                             }
                             Some(depth) => {
                                 let outcome = drain_depth_frame(
@@ -8203,6 +8212,12 @@ pub fn drain_main_feed_frame(
                             ));
                     } else {
                         c.shed_inline_depth.increment(1);
+                        // Item 45a: keep this frame's segment until the
+                        // after-close pass writes its inline depth back.
+                        tickvault_storage::wal_deferred_depth::deferred_depth().note_shed(
+                            frame.seq,
+                            tickvault_storage::wal_deferred_depth::ShedDepth::Inline,
+                        );
                     }
                 }
                 let tick = match parsed {
@@ -15767,7 +15782,18 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // Hold the task alive with the drain so the stack's JoinHandle reflects the
     // lane's real lifetime rather than completing the instant it finished
     // dialing.
+    // Item 45a: the after-close pass that writes back order-book rows the
+    // ingest shed skipped. Its own stop flag, set below when the drain ends —
+    // never the lane's shutdown `Notify`, which wakes one waiter only.
+    let deferred_depth_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let deferred_depth_task = deferred_depth_pass::spawn_after_close_supervisor(
+        params.questdb.clone(),
+        crate::boot_helpers::ws_wal_dir(),
+        Arc::clone(&deferred_depth_cancel),
+    );
     let drain_outcome = drain.await;
+    deferred_depth_cancel.store(true, std::sync::atomic::Ordering::Release);
+    deferred_depth_task.abort();
 
     // Clear the up-gauge on EVERY exit, not just the error one.
     //
