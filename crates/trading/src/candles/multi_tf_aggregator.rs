@@ -1655,21 +1655,29 @@ impl MultiTfAggregator {
         // never received, and the fold below is what attributes it. Rare, and
         // folding it costs one tick of `tick_count` — the safe direction.
         if repeat_candidate && extremes.is_empty() {
+            let mut refreshed_open: u16 = 0;
             for tf in TfIndex::ALL {
                 // `false` means the bucket this trade belongs to has already
                 // sealed (catch-up or rollover). Nothing is reopened and nothing
                 // is amended: the sealed bar already holds this trade.
-                let still_open = slot.cell.refresh_repeat_quote(tf, tick, &prices, fold_secs);
-                // A repeat that refreshed an open bucket live may already have
-                // closed by catch-up changed quote fields (open interest, the
-                // buy/sell totals, possibly the day's open) that live never
-                // wrote there. It adds no volume, so only this bucket is
-                // partial, not the next (review round 8).
-                if still_open
-                    && late_bound != 0
-                    && slot.open_bucket_may_be_closed_live(tf, late_bound, catch_up_margin)
-                {
-                    slot.replay_open_partial |= replay_tf_bit(tf);
+                if slot.cell.refresh_repeat_quote(tf, tick, &prices, fold_secs) {
+                    refreshed_open |= replay_tf_bit(tf);
+                }
+            }
+            // A repeat that refreshed an open bucket live may already have
+            // closed by catch-up changed quote fields (open interest, the
+            // buy/sell totals, possibly the day's open) that live never wrote
+            // there. It adds no volume, so only this bucket is partial, not
+            // the next (review round 8). `late_bound` is 0 outside a replay,
+            // so live mode pays this one branch per repeat, not one per
+            // timeframe (review round 11).
+            if late_bound != 0 {
+                for tf in TfIndex::ALL {
+                    if refreshed_open & replay_tf_bit(tf) != 0
+                        && slot.open_bucket_may_be_closed_live(tf, late_bound, catch_up_margin)
+                    {
+                        slot.replay_open_partial |= replay_tf_bit(tf);
+                    }
                 }
             }
             crate::candles::fold_counters::fold_counters()
@@ -1810,10 +1818,19 @@ impl MultiTfAggregator {
             }
         }
 
+        // Bars are held only during a replay and `finish_replay` releases
+        // them all, so in live mode this is `false` and each timeframe below
+        // tests one register flag instead of a load and a mask (review round
+        // 11). Sampled once: a timeframe only sets or clears its OWN held bit,
+        // and only after its own test.
+        let any_held = slot.replay_held != 0;
         for tf in TfIndex::ALL {
             // A held bar becomes final the moment this tick seals the bar
             // after it: release it now, before the seal replaces it.
-            if slot.replay_held & replay_tf_bit(tf) != 0 && slot.cell.would_seal(tf, fold_secs) {
+            if any_held
+                && slot.replay_held & replay_tf_bit(tf) != 0
+                && slot.cell.would_seal(tf, fold_secs)
+            {
                 match release_held(slot, tf, live_from, &mut on_seal) {
                     Released::Emitted => stats.sealed_count = stats.sealed_count.saturating_add(1),
                     Released::Suppressed => {
@@ -2566,6 +2583,12 @@ impl InstrumentSlot {
         let was_tainted = self.replay_taint_open & bit != 0;
         set_bit(&mut self.replay_sealed_partial, bit, was_partial);
         set_bit(&mut self.replay_taint_sealed, bit, was_tainted);
+        // The taint belongs to the bucket open at the hand-over and moves to
+        // the sealed slot with it; the bucket opening now holds live data.
+        // Round 8 removed this clear along with the late-tick taint it used to
+        // share a line with, and every later live bar of a tainted timeframe
+        // was suppressed for the rest of the process (review round 11).
+        self.replay_taint_open &= !bit;
         // A late tick marked the bucket after this one (review round 7).
         let forced = self.replay_next_partial & bit != 0;
         self.replay_next_partial &= !bit;
@@ -2971,6 +2994,68 @@ mod tests {
                 .any(|(tf, start, _)| *tf == TfIndex::M1 && *start == t0),
             "the minute open across the gap is still suppressed: {out:?}"
         );
+    }
+
+    /// Plan ITEM 47, review round 11 (CRITICAL, reproduced by the reviewer):
+    /// the hand-over taint belongs to the ONE bucket open at the hand-over.
+    /// Round 8 removed the line in `roll_replay_bits` that cleared it on the
+    /// roll, so a tainted timeframe suppressed every later live bar of that
+    /// instrument for the rest of the process — M3 to M60 for most
+    /// instruments after any restart, and every timeframe when the replay
+    /// ended on a gap. Here three hours of live ticks follow a tainted
+    /// hand-over: only the tainted bucket may be withheld.
+    #[test]
+    fn test_regression_hand_over_taint_suppresses_only_the_bucket_open_at_the_hand_over() {
+        for ended_on_gap in [false, true] {
+            let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+            agg.set_replay_mode(true);
+            agg.mark_replay_gap();
+            for (ts, cum) in [(OPEN + 62, 1_000), (OPEN + 70, 1_050)] {
+                agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, ignore_seal);
+            }
+            agg.set_live_capture_start(OPEN + 100);
+            agg.finish_replay(ended_on_gap, ignore_seal);
+            assert!(
+                agg.slots[0].replay_taint_open != 0,
+                "ended_on_gap={ended_on_gap}: the hand-over tainted something"
+            );
+
+            let mut emitted: std::collections::HashSet<(TfIndex, u32)> =
+                std::collections::HashSet::new();
+            let mut cum = 2_000_u32;
+            let mut ts = OPEN + 120;
+            while ts < OPEN + 120 + 3 * 3_600 {
+                cum += 10;
+                agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, |_, _, _, tf, st| {
+                    emitted.insert((tf, st.bucket_start_ist_secs));
+                });
+                ts += 10;
+            }
+            agg.catch_up_seal_all(OPEN + 100_000, |_, _, _, tf, st| {
+                emitted.insert((tf, st.bucket_start_ist_secs));
+            });
+
+            for tf in TfIndex::ALL {
+                let tainted = tf.bucket_start(OPEN + 70);
+                assert!(
+                    !emitted.contains(&(tf, tainted)),
+                    "ended_on_gap={ended_on_gap} {tf:?}: the bucket open at the hand-over \
+                     is withheld"
+                );
+                let mut t = OPEN + 120;
+                while t < OPEN + 120 + 3 * 3_600 {
+                    let bucket = tf.bucket_start(t);
+                    if bucket > tainted {
+                        assert!(
+                            emitted.contains(&(tf, bucket)),
+                            "ended_on_gap={ended_on_gap} {tf:?}: live bucket {bucket} \
+                             after the tainted one {tainted} must be emitted"
+                        );
+                    }
+                    t += 10;
+                }
+            }
+        }
     }
 
     /// Review 2026-09-29, finding 1: a partial bucket still OPEN when the
