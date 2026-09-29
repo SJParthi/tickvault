@@ -3610,6 +3610,67 @@ mod tests {
             bars
         }
 
+        /// A restart (review round 11): `head` is replayed with its drops,
+        /// the replay hands over to the live feed, and `tail` then arrives
+        /// live. Returns the bars written and the fold second at which the
+        /// hand-over's reach ends: the first live tick, which re-seeds the
+        /// cumulative because a restart always has downtime.
+        fn fold_restart(head: &[Step], tail: &[Step]) -> (Bars, u32) {
+            let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+            agg.set_replay_mode(true);
+            agg.mark_replay_gap();
+            let mut bars: Bars = HashMap::new();
+            let (mut ts, mut cum, mut px) = (OPEN + 60, 10_000_i64, 1_000.0_f32);
+            let (mut hi, mut lo) = (px, px);
+            let mut gap = false;
+            let mut reach = ts;
+            for (i, step) in head.iter().chain(tail).enumerate() {
+                ts += step.dt;
+                cum = (cum + i64::from(step.dcum)).max(0);
+                px = (px + f32::from(step.dpx) * 0.05).max(1.0);
+                hi = hi.max(px);
+                lo = lo.min(px);
+                let live = i >= head.len();
+                if i == head.len() {
+                    // The new process began listening at this tick.
+                    agg.set_live_capture_start(ts);
+                    let _ = agg.finish_replay(gap, |_, _, _, tf, st| {
+                        bars.insert((tf, st.bucket_start_ist_secs), st);
+                    });
+                    // The hand-over is always a gap (a restart has downtime):
+                    // the first live tick re-seeds, so its bucket is the
+                    // last one the hand-over reaches.
+                    reach = ts;
+                    gap = false;
+                }
+                if !live && step.dropped {
+                    gap = true;
+                    continue;
+                }
+                if std::mem::replace(&mut gap, false) {
+                    agg.mark_replay_gap();
+                }
+                let t = ParsedTick {
+                    security_id: GAP_SID,
+                    exchange_segment_code: SEG_EQ,
+                    last_traded_price: px,
+                    exchange_timestamp: ts,
+                    volume: u32::try_from(cum).unwrap_or(u32::MAX),
+                    day_high: hi,
+                    day_low: lo,
+                    received_at_nanos: receipt_nanos(ts),
+                    ..ParsedTick::default()
+                };
+                agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, tf, st| {
+                    bars.insert((tf, st.bucket_start_ist_secs), st);
+                });
+            }
+            agg.catch_up_seal_all(ts + 100_000, |_, _, _, tf, st| {
+                bars.insert((tf, st.bucket_start_ist_secs), st);
+            });
+            (bars, reach)
+        }
+
         /// Steps whose cumulative may also go BACKWARDS (a stale re-send).
         fn stale_step() -> impl Strategy<Value = Step> {
             (
@@ -3860,6 +3921,46 @@ mod tests {
                     prop_assert_eq!(bar.close.to_bits(), truth.close.to_bits(), "{:?} close", key);
                 }
                 rebuilt_after_settling(&steps, &live, &replay)?;
+            }
+
+            /// Review round 11: every property above stops at the hand-over,
+            /// which is how a taint that never cleared (and suppressed every
+            /// later live bar) passed all of them. Here the replay hands over
+            /// and live ticks keep arriving for up to a few hours: every
+            /// bucket that opens after the hand-over's reach must be written,
+            /// with the same volume and prices as a process that never
+            /// restarted. (The buy/sell split is not compared: a restarted
+            /// process may not know the tick-rule direction yet, and no stored
+            /// bar exists for these buckets to disagree with.)
+            #[test]
+            fn test_live_bars_after_a_replay_hand_over_are_all_written(
+                head in prop::collection::vec(step(), 1..120),
+                tail in prop::collection::vec(step(), 1..160)
+            ) {
+                let all: Vec<Step> = head
+                    .iter()
+                    .chain(&tail)
+                    .cloned()
+                    .map(|s| Step { dropped: false, ..s })
+                    .collect();
+                let live = fold(&all, false);
+                let (restarted, reach) = fold_restart(&head, &tail);
+                for ((tf, start), truth) in &live {
+                    if *start <= tf.bucket_start(reach) {
+                        continue;
+                    }
+                    let Some(bar) = restarted.get(&(*tf, *start)) else {
+                        return Err(TestCaseError::fail(format!(
+                            "{tf:?} {start}: a live bucket after the hand-over (reach {reach}) \
+                             was never written"
+                        )));
+                    };
+                    prop_assert_eq!(bar.volume, truth.volume, "{:?} {} volume", tf, start);
+                    prop_assert_eq!(bar.open.to_bits(), truth.open.to_bits(), "{:?} {} open", tf, start);
+                    prop_assert_eq!(bar.high.to_bits(), truth.high.to_bits(), "{:?} {} high", tf, start);
+                    prop_assert_eq!(bar.low.to_bits(), truth.low.to_bits(), "{:?} {} low", tf, start);
+                    prop_assert_eq!(bar.close.to_bits(), truth.close.to_bits(), "{:?} {} close", tf, start);
+                }
             }
 
             /// Round 6: the same contract with two contracts interleaved,
